@@ -319,20 +319,56 @@ path*, file → resolve → walk → wire, proven end-to-end against a real clie
 `fcstat count <db> <table>` exposes the same path without the wire, for the
 differential's file side.
 
+### The twelfth differential — the server returns real projected rows
+
+`qa/serve-real-project.sh` widens the eleventh differential from a single
+count to real column projections. fire-crab, as a server, answers
+`SELECT <cols> FROM <table>` and `SELECT *` from the attached file: it
+resolves the columns through `RDB$RELATION_FIELDS` (`fire-crab-ods::catalog`,
+another hardcoded system-relation bootstrap), decodes each committed record
+with the format it names, and sends the projected columns typed on the wire -
+integers as BIGINT, the rest rendered as VARCHAR (the two shapes the client
+side already coerces to). For every user table, the gate projects the eligible
+columns through both the fire-crab server (node-firebird) and isql, and the
+result sets must match value-for-value; `SELECT *` is checked too. They do -
+on `EMP` (2000 rows), `DEPT`, and a purpose-built mixed-width/nullable table.
+
+The subtlety this differential exists to catch: **`RDB$FIELD_ID` is not
+`RDB$FIELD_POSITION`.** The stored record format lays columns out by field id,
+and `decode_record` returns values in that order - but when a table mixes
+column widths the engine reorders fields physically by alignment (a BIGINT
+declared after an INTEGER gets a lower field id), so field id diverges from the
+column's declared position. Projecting by position returns the wrong column,
+and a uniform-width table (every integer the same size) never shows it - the
+first pass read the position offset, passed `EMP` and `DEPT`, and only a table
+with an `INTEGER, VARCHAR, BIGINT` shape exposed the rotation. The fix reads
+the field-id offset for the decode index and the position offset for the
+`SELECT *` order; both are validated against `RDB$RELATION_FIELDS` via
+`fcstat columns`. NULLs (leading null bitmap, data omitted for null columns)
+and `SELECT *` (declaration order) are part of the same gate.
+
+Scope, stated honestly: projections cover **user tables** (system relations'
+formats are not in `RDB$FORMATS`, so they answer COUNT but not projections)
+and the exact-integer and ASCII/UTF8 char/varchar columns the decoder renders
+identically to the engine - the same exclusions `qa/diff-rows.sh` makes.
+Anything else falls back to the fixed constant. `fcstat columns <db> <table>`
+exposes the name → field-id map for the file side.
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
 suite (thousands of tests) drives a **server** through the wire protocol via
 the firebird-driver. The server side proven above is the entry to it: the
 handshake, authentication, encryption and op dispatch a real client needs are
-in place, and the first query op (`SELECT COUNT(*)`) now dispatches into the
-converted storage engine and returns a real result. What stands between here
-and running the suite is *breadth* of the SQL engine behind the pipeline -
-projections, real column types, predicates, joins, DML - which the eleventh
-differential opens the door to but does not yet cover. Until that surface is
-wide enough, fire-crab does **not** claim any firebird-qa coverage - but the
-milestone is no longer distant: the protocol server the suite talks to accepts
-real clients and answers a real query from real pages today.
+in place, and real queries - `SELECT COUNT(*)` and column projections
+(`SELECT <cols>` / `SELECT *`) - now dispatch into the converted storage engine
+and return real results, matching isql over the wire. What stands between here
+and running the suite is remaining *breadth* of the SQL engine - predicates,
+joins, the column types still rendered approximately, DML, system-table
+projections. Until that surface is wide enough, fire-crab does **not** claim
+any firebird-qa coverage - but the milestone is no longer distant: the protocol
+server the suite talks to accepts real clients and answers real queries from
+real pages today.
 
 ## Benchmarks
 
@@ -382,6 +418,12 @@ NODE_PATH="$PWD/node_modules" \\
 NODE_PATH="$PWD/node_modules" \\
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
     sh /path/to/fire-crab/qa/serve-real-query.sh /tmp/fbhandson/plans_clean.fdb 3050
+
+# server answers real column projections (SELECT <cols> / SELECT *), checked vs isql
+# (also: fcstat columns <db> <table> for the name -> field-id map)
+NODE_PATH="$PWD/node_modules" \\
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
+    sh /path/to/fire-crab/qa/serve-real-project.sh /tmp/fbhandson/plans_clean.fdb 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on

@@ -39,7 +39,9 @@ pub mod tra;
 
 pub use blr::{decode as decode_blr, BlrDecode};
 pub use btr::{walk_index_leaves, BtreePage, IndexRootPage};
-pub use catalog::{count_primary_records, list_relations, resolve_relation};
+pub use catalog::{
+    count_primary_records, list_relations, relation_columns, resolve_relation, RelationColumn,
+};
 pub use data::{DataPage, RecordHeader};
 pub use format::{decode_record, relation_formats, Descriptor, Value};
 pub use gc::{analyze as gc_analyze, version_count, GcReport};

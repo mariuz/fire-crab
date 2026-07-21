@@ -17,6 +17,9 @@
 
 use crate::crypto::Rc4;
 use crate::srp::SrpVerifier;
+use fire_crab_ods::data::DataPage;
+use fire_crab_ods::format::{decode_record, dtype, Descriptor, Value};
+use fire_crab_ods::{relation_columns, relation_data_pages, relation_formats, RelationColumn};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
@@ -159,17 +162,52 @@ fn describe_one_bigint() -> Vec<u8> {
     d
 }
 
-/// One op_response carrying the describe buffer.
-fn respond_prepare(s: &mut TcpStream, enc: &mut Option<Rc4>) -> std::io::Result<()> {
-    let describe = describe_one_bigint();
+/// One op_response carrying a describe buffer.
+fn respond_prepare(s: &mut TcpStream, enc: &mut Option<Rc4>, describe: &[u8]) -> std::io::Result<()> {
     let mut w = W::default();
     w.int(OP_RESPONSE)
         .int(0)
         .int(0)
         .int(0)
-        .bytes(&describe)
+        .bytes(describe)
         .int(0);
     w.send(s, enc)
+}
+
+/// The describe buffer for N projected columns - the reciprocal of a
+/// client's describe parser. Each column carries its SQL type, length,
+/// and its name as both the field name (16) and the alias (19); clients
+/// key result columns by the alias, so multi-column results need it.
+fn build_describe(cols: &[ProjCol]) -> Vec<u8> {
+    let mut d = Vec::new();
+    fn int_item(d: &mut Vec<u8>, code: u8, val: i32) {
+        d.push(code);
+        d.extend_from_slice(&4u16.to_le_bytes());
+        d.extend_from_slice(&val.to_le_bytes());
+    }
+    fn str_item(d: &mut Vec<u8>, code: u8, s: &str) {
+        d.push(code);
+        d.extend_from_slice(&(s.len() as u16).to_le_bytes());
+        d.extend_from_slice(s.as_bytes());
+    }
+    int_item(&mut d, 21, 1); // isc_info_sql_stmt_type = select
+    d.push(5); // isc_info_sql_bind
+    int_item(&mut d, 7, 0); // 0 params
+    d.push(8); // describe_end (params)
+    d.push(4); // isc_info_sql_select
+    int_item(&mut d, 7, cols.len() as i32); // describe_vars: N columns
+    for (i, c) in cols.iter().enumerate() {
+        int_item(&mut d, 9, (i + 1) as i32); // sqlda_seq
+        int_item(&mut d, 11, c.sql_type); // type
+        int_item(&mut d, 12, 0); // sub_type
+        int_item(&mut d, 13, 0); // scale
+        int_item(&mut d, 14, c.length); // length
+        str_item(&mut d, 16, &c.name); // field name
+        str_item(&mut d, 19, &c.name); // alias (the client's column key)
+        d.push(8); // describe_end (column)
+    }
+    d.push(1); // isc_info_end
+    d
 }
 
 /// The value the server falls back to when a query is not one it can
@@ -202,19 +240,261 @@ fn load_database(path: &str) -> Option<Database> {
     Some(Database { bytes, page_size })
 }
 
-/// Resolve a prepared query to the integer it should return. The one
-/// shape answered from real pages is `SELECT COUNT(*) FROM <table>`: the
-/// table name is resolved to a relation id through `RDB$RELATIONS`, and
-/// its committed primary records are counted straight from the data pages
-/// - the wire-level equivalent of what `qa/diff-select.sh` checks at the
-/// tool level. Anything else falls back to the fixed constant.
-fn answer_value(sql: &str, db: &Option<Database>) -> i64 {
-    if let (Some(table), Some(db)) = (parse_count_target(sql), db) {
-        if let Some(rel) = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, &table) {
-            return fire_crab_ods::count_primary_records(&db.bytes, db.page_size, rel) as i64;
+/// How a projected column is carried on the wire. Integer-family columns
+/// (SHORT/LONG/INT64, scale 0) go as SQL_INT64; everything else is
+/// rendered to text and sent as SQL_VARYING - the same two shapes the
+/// client side coerces to (see `query_rows`).
+enum Wire {
+    Int64,
+    Varying,
+}
+
+/// One column of a projection: its name, the field id that indexes the
+/// decoded record, and how it is described/encoded on the wire.
+struct ProjCol {
+    name: String,
+    field_id: usize,
+    wire: Wire,
+    sql_type: i32,
+    length: i32,
+}
+
+/// What a prepared statement resolves to. `Scalar` covers both the fixed
+/// fallback and `SELECT COUNT(*)` (a single BIGINT computed at prepare);
+/// `Project` is `SELECT <cols> FROM <table>` walked at fetch.
+enum Plan {
+    Scalar(i64),
+    Project {
+        rel: u16,
+        formats: Vec<(u8, Vec<Descriptor>)>,
+        cols: Vec<ProjCol>,
+    },
+}
+
+/// Pick the wire shape, SQL type and length for a column from its stored
+/// descriptor.
+fn wire_for(d: &Descriptor) -> (Wire, i32, i32) {
+    let is_int = matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64) && d.scale == 0;
+    if is_int {
+        (Wire::Int64, 580, 8) // SQL_INT64
+    } else {
+        (Wire::Varying, 448, 32765) // SQL_VARYING, rendered text
+    }
+}
+
+/// Build the projected-column list from a select list and the relation's
+/// columns + format descriptors. `*` expands to every column in field-id
+/// (SELECT *) order. Returns None if any named column is unknown or has no
+/// descriptor.
+fn build_projcols(
+    collist: &[String],
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+) -> Option<Vec<ProjCol>> {
+    let selected: Vec<&RelationColumn> = if collist.len() == 1 && collist[0] == "*" {
+        columns.iter().collect()
+    } else {
+        let mut v = Vec::new();
+        for name in collist {
+            v.push(columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?);
+        }
+        v
+    };
+    let mut out = Vec::new();
+    for rc in selected {
+        let d = descs.get(rc.field_id as usize)?;
+        let (wire, sql_type, length) = wire_for(d);
+        out.push(ProjCol {
+            name: rc.name.clone(),
+            field_id: rc.field_id as usize,
+            wire,
+            sql_type,
+            length,
+        });
+    }
+    Some(out)
+}
+
+/// Plan a prepared statement against the loaded database. Two shapes are
+/// answered from real pages - `SELECT COUNT(*) FROM <table>` and
+/// `SELECT <cols> FROM <table>` - both resolving the table through
+/// `RDB$RELATIONS`. Everything else (and any query with no database
+/// behind it) plans to the fixed constant.
+fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
+    if let Some(table) = parse_count_target(sql) {
+        if let Some(db) = db {
+            if let Some(rel) = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, &table) {
+                let n = fire_crab_ods::count_primary_records(&db.bytes, db.page_size, rel);
+                return Plan::Scalar(n as i64);
+            }
+        }
+        return Plan::Scalar(FIXED_ANSWER);
+    }
+    if let Some((collist, table)) = parse_select_from(sql) {
+        if let Some(db) = db {
+            if let Some(rel) = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, &table) {
+                let columns = relation_columns(&db.bytes, db.page_size, &table);
+                let formats = relation_formats(&db.bytes, db.page_size, rel);
+                let cols = {
+                    let descs = formats
+                        .iter()
+                        .max_by_key(|(n, _)| *n)
+                        .map(|(_, d)| d.as_slice())
+                        .unwrap_or(&[]);
+                    build_projcols(&collist, &columns, descs)
+                };
+                if let Some(cols) = cols {
+                    if !cols.is_empty() {
+                        return Plan::Project { rel, formats, cols };
+                    }
+                }
+            }
+        }
+        return Plan::Scalar(FIXED_ANSWER);
+    }
+    Plan::Scalar(FIXED_ANSWER)
+}
+
+/// The describe buffer for a plan: one BIGINT for `Scalar`, the projected
+/// columns for `Project`.
+fn describe_for(plan: &Plan) -> Vec<u8> {
+    match plan {
+        Plan::Scalar(_) => describe_one_bigint(),
+        Plan::Project { cols, .. } => build_describe(cols),
+    }
+}
+
+/// Emit the fetch response for a plan: a stream of
+/// op_fetch_response(status=0, messages=1) + row messages, terminated by
+/// op_fetch_response(status=100). `Scalar` emits one row; `Project` walks
+/// the relation's committed primary records, decoding each with the
+/// format it names and projecting the requested columns.
+fn emit_rows(w: &mut W, plan: &Plan, db: &Option<Database>) {
+    match plan {
+        Plan::Scalar(v) => {
+            w.int(OP_FETCH_RESPONSE).int(0).int(1);
+            w.raw(&[0u8; 4]); // null bitmap (1 col, not null), padded to 4
+            w.raw(&v.to_be_bytes());
+        }
+        Plan::Project {
+            rel,
+            formats,
+            cols,
+        } => {
+            if let Some(db) = db {
+                for dp_no in relation_data_pages(&db.bytes, db.page_size, *rel) {
+                    let start = dp_no as usize * db.page_size;
+                    let Some(dp) = db
+                        .bytes
+                        .get(start..start + db.page_size)
+                        .and_then(DataPage::decode)
+                    else {
+                        continue;
+                    };
+                    for r in dp.records() {
+                        if !r.is_primary_record() {
+                            continue;
+                        }
+                        let Some(image) = r.image() else { continue };
+                        let descs = formats
+                            .iter()
+                            .find(|(n, _)| *n == r.format)
+                            .or_else(|| formats.iter().max_by_key(|(n, _)| *n));
+                        let Some((_, descs)) = descs else { continue };
+                        let values = decode_record(&image, descs);
+                        w.int(OP_FETCH_RESPONSE).int(0).int(1);
+                        encode_row(w, cols, &values);
+                    }
+                }
+            }
         }
     }
-    FIXED_ANSWER
+    // end-of-cursor terminator
+    w.int(OP_FETCH_RESPONSE).int(100).int(0);
+}
+
+/// Encode one row message: the leading null bitmap (one bit per projected
+/// column, padded to 4 bytes) followed by the non-null column data - each
+/// INT64 as 8 big-endian bytes, each VARYING as a 4-byte length + text +
+/// 4-byte padding. Null columns contribute only their bit; the client
+/// skips their data (protocol 13+ layout).
+fn encode_row(w: &mut W, cols: &[ProjCol], values: &[Value]) {
+    let n = cols.len();
+    let nbytes = n.div_ceil(8);
+    let mut bitmap = vec![0u8; nbytes];
+    for (i, c) in cols.iter().enumerate() {
+        let is_null = values.get(c.field_id).map_or(true, |v| matches!(v, Value::Null));
+        if is_null {
+            bitmap[i / 8] |= 1 << (i % 8);
+        }
+    }
+    w.raw(&bitmap);
+    for _ in nbytes..nbytes.div_ceil(4) * 4 {
+        w.raw(&[0u8]);
+    }
+    for c in cols {
+        let Some(v) = values.get(c.field_id) else {
+            continue;
+        };
+        if matches!(v, Value::Null) {
+            continue; // null: data omitted, the bitmap bit already set
+        }
+        match c.wire {
+            Wire::Int64 => {
+                let iv = if let Value::Int(i) = v { *i } else { 0 };
+                w.raw(&iv.to_be_bytes());
+            }
+            Wire::Varying => {
+                let s = v.render();
+                let b = s.as_bytes();
+                w.int(b.len() as i32);
+                w.raw(b);
+                for _ in 0..(4 - b.len() % 4) % 4 {
+                    w.raw(&[0u8]);
+                }
+            }
+        }
+    }
+}
+
+/// Recognise `SELECT <col-list> FROM <table>` where the column list is
+/// `*` or a comma-separated list of bare identifiers and nothing follows
+/// the table name (no WHERE/JOIN/ORDER/GROUP - honouring those would mean
+/// returning different rows, so an unrecognised shape is rejected rather
+/// than silently answered wrong). Returns (columns, table).
+fn parse_select_from(sql: &str) -> Option<(Vec<String>, String)> {
+    let upper = sql.to_ascii_uppercase();
+    let compact = upper.split_whitespace().collect::<Vec<_>>().join(" ");
+    let compact = compact.trim().trim_end_matches(';').trim();
+    let rest = compact.strip_prefix("SELECT ")?;
+    let (collist_s, after) = rest.split_once(" FROM ")?;
+    // table is the sole token after FROM; anything else is an unsupported clause
+    let after = after.trim();
+    let mut it = after.splitn(2, ' ');
+    let table = it.next()?.trim_matches('"');
+    if it.next().map_or(false, |m| !m.trim().is_empty()) {
+        return None;
+    }
+    if table.is_empty() {
+        return None;
+    }
+    let cols: Vec<String> = if collist_s.trim() == "*" {
+        vec!["*".to_string()]
+    } else {
+        collist_s
+            .split(',')
+            .map(|c| c.trim().trim_matches('"').to_string())
+            .collect()
+    };
+    // only bare identifiers (letters/digits/_/$) - reject expressions,
+    // functions, qualified names, empty entries
+    let ident_ok = |s: &str| {
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+    };
+    if cols.iter().any(|c| c != "*" && !ident_ok(c)) {
+        return None;
+    }
+    Some((cols, table.to_string()))
 }
 
 /// Recognise `SELECT COUNT(*) FROM <table>`, tolerant of case and of
@@ -390,9 +670,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     }
     respond(&mut s, &mut enc, 1)?; // attachment handle 1
 
-    // The SQL text of the most recently prepared statement, resolved to a
-    // value at fetch time.
+    // The SQL text of the most recently prepared statement, and the plan
+    // it resolves to (built at prepare, executed at fetch).
     let mut stmt_sql = String::new();
+    let mut plan = Plan::Scalar(FIXED_ANSWER);
 
     // --- the op loop (encrypted) ---
     loop {
@@ -427,7 +708,9 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     read_int(&mut s, &mut dec)?; // p_sqlst_flags (FB6/proto 20+)
                 }
                 stmt_sql = String::from_utf8_lossy(&sql).into_owned();
-                respond_prepare(&mut s, &mut enc)?;
+                plan = plan_query(&stmt_sql, &database);
+                let describe = describe_for(&plan);
+                respond_prepare(&mut s, &mut enc, &describe)?;
             }
             x if x == OP_EXECUTE => {
                 read_int(&mut s, &mut dec)?; // stmt
@@ -454,19 +737,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 read_wire_bytes(&mut s, &mut dec)?; // blr
                 read_int(&mut s, &mut dec)?; // msg number
                 read_int(&mut s, &mut dec)?; // count
-                // Resolve the query against the real database (a COUNT(*) is
-                // a record walk); fall back to the fixed constant otherwise.
-                let value = answer_value(&stmt_sql, &database);
                 if std::env::var("FC_SRV_TRACE").is_ok() {
-                    eprintln!("[srv] fetch: {:?} -> {}", stmt_sql.trim(), value);
+                    eprintln!("[srv] fetch: {:?}", stmt_sql.trim());
                 }
-                // one row: op_fetch_response(status=0, messages=1, nullmap, i64)
+                // stream the plan's rows + end-of-cursor terminator
                 let mut w = W::default();
-                w.int(OP_FETCH_RESPONSE).int(0).int(1);
-                w.raw(&[0u8; 4]); // null bitmap (1 col, not null), padded to 4
-                w.raw(&value.to_be_bytes());
-                // then end-of-cursor terminator
-                w.int(OP_FETCH_RESPONSE).int(100).int(0);
+                emit_rows(&mut w, &plan, &database);
                 w.send(&mut s, &mut enc)?;
             }
             x if x == OP_FREE_STATEMENT => {
@@ -552,15 +828,19 @@ fn build_db_info(items: &[u8]) -> Vec<u8> {
 }
 
 /// Run the fire-crab wire server on `addr` (e.g. "127.0.0.1:3051"),
-/// authenticating `user`/`password`. Serves connections sequentially -
-/// enough to demonstrate the protocol against a real client.
+/// authenticating `user`/`password`. One thread per connection.
 pub fn serve(addr: &str, user: &str, password: &str) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     eprintln!("fire-crab server listening on {} (user {})", addr, user);
     for conn in listener.incoming() {
         match conn {
             Ok(s) => {
-                let _ = handle(s, user, password);
+                // one thread per connection so clients that reconnect in
+                // quick succession are not serialized behind each other
+                let (u, p) = (user.to_string(), password.to_string());
+                std::thread::spawn(move || {
+                    let _ = handle(s, &u, &p);
+                });
             }
             Err(e) => eprintln!("accept error: {}", e),
         }
@@ -596,9 +876,46 @@ mod tests {
     }
 
     #[test]
-    fn answer_falls_back_without_database() {
-        assert_eq!(answer_value("SELECT COUNT(*) FROM DEPT", &None), FIXED_ANSWER);
-        assert_eq!(answer_value("SELECT CAST(1 AS BIGINT) FROM RDB$DATABASE", &None), FIXED_ANSWER);
+    fn plan_falls_back_to_scalar_without_database() {
+        // with no database loaded, everything plans to the fixed scalar
+        assert!(matches!(plan_query("SELECT COUNT(*) FROM DEPT", &None), Plan::Scalar(FIXED_ANSWER)));
+        assert!(matches!(plan_query("SELECT ID, NAME FROM EMP", &None), Plan::Scalar(FIXED_ANSWER)));
+        assert!(matches!(plan_query("SELECT CAST(1 AS BIGINT) FROM RDB$DATABASE", &None), Plan::Scalar(FIXED_ANSWER)));
+    }
+
+    #[test]
+    fn parses_select_from_projection() {
+        let (cols, t) = parse_select_from("SELECT ID, NAME FROM EMP").unwrap();
+        assert_eq!(cols, vec!["ID", "NAME"]);
+        assert_eq!(t, "EMP");
+        // star and lowercase + trailing semicolon
+        let (cols, t) = parse_select_from("select * from dept;").unwrap();
+        assert_eq!(cols, vec!["*"]);
+        assert_eq!(t, "DEPT");
+    }
+
+    #[test]
+    fn rejects_unsupported_projections() {
+        assert!(parse_select_from("SELECT ID FROM EMP WHERE ID > 5").is_none()); // WHERE
+        assert!(parse_select_from("SELECT MAX(ID) FROM EMP").is_none()); // expression
+        assert!(parse_select_from("SELECT ID FROM EMP ORDER BY ID").is_none()); // ORDER BY
+        assert!(parse_select_from("SELECT ID, NAME FROM A JOIN B ON A.X=B.X").is_none()); // JOIN
+    }
+
+    #[test]
+    fn encodes_row_bitmap_and_values() {
+        // two INT64 cols, second null: 4-byte bitmap (bit 1 set) + one 8-byte value
+        let cols = vec![
+            ProjCol { name: "A".into(), field_id: 0, wire: Wire::Int64, sql_type: 580, length: 8 },
+            ProjCol { name: "B".into(), field_id: 1, wire: Wire::Int64, sql_type: 580, length: 8 },
+        ];
+        let values = vec![Value::Int(7), Value::Null];
+        let mut w = W::default();
+        encode_row(&mut w, &cols, &values);
+        // bitmap: byte0 = 0b10 (col1 null), 3 pad bytes, then 8-byte BE 7
+        assert_eq!(&w.buf[0..4], &[0b10, 0, 0, 0]);
+        assert_eq!(&w.buf[4..12], &7i64.to_be_bytes());
+        assert_eq!(w.buf.len(), 12); // null col contributes no data
     }
 
     #[test]

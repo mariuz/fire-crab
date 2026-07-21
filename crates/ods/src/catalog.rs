@@ -23,10 +23,38 @@ use crate::pointer::relation_data_pages;
 
 /// `RDB$RELATIONS` - the relation whose rows name every relation.
 pub const REL_RELATIONS: u16 = 6;
+/// `RDB$RELATION_FIELDS` - the relation whose rows name every column.
+pub const REL_RELATION_FIELDS: u16 = 5;
 
 const RELATION_ID_OFFSET: usize = 32;
 const RELATION_NAME_OFFSET: usize = 42;
 const RELATION_NAME_LEN: usize = 252;
+
+// Field offsets in the RDB$RELATION_FIELDS record image, hardcoded the
+// same way and for the same reason as the RDB$RELATIONS offsets above
+// (system relation, not in RDB$FORMATS). All confirmed against the live
+// engine: reading these reproduces
+//   SELECT RDB$RELATION_NAME, RDB$FIELD_NAME, RDB$FIELD_ID FROM RDB$RELATION_FIELDS
+// identically across every database tested.
+//
+//   RDB$FIELD_NAME     CHAR(252) at offset 4
+//   RDB$RELATION_NAME  CHAR(252) at offset 256    (= 4 + 252)
+//   RDB$FIELD_POSITION SHORT     at offset 1394
+//   RDB$FIELD_ID       SHORT     at offset 1410
+//
+// RDB$FIELD_ID is the index the stored record format lays columns out by,
+// and therefore the index into `decode_record`'s output. It is NOT the
+// same as RDB$FIELD_POSITION (the column's ordinal in the table): when a
+// table mixes column widths the engine reorders fields physically by
+// alignment, so a BIGINT declared after an INTEGER gets a lower field id.
+// The two coincide only for uniform-width tables - which is why the
+// distinction is easy to miss and must be got right. FIELD_POSITION
+// (offset 1394) gives the SELECT * / declaration order.
+const RF_FIELD_NAME_OFFSET: usize = 4;
+const RF_RELATION_NAME_OFFSET: usize = 256;
+const RF_FIELD_POSITION_OFFSET: usize = 1394;
+const RF_FIELD_ID_OFFSET: usize = 1410;
+const RF_NAME_LEN: usize = 252;
 
 /// Read one `RDB$RELATIONS` record image into (relation id, trimmed name).
 fn relation_row(image: &[u8]) -> Option<(u16, String)> {
@@ -78,6 +106,77 @@ pub fn resolve_relation(file: &[u8], page_size: usize, name: &str) -> Option<u16
         }
     }
     None
+}
+
+/// One column of a relation: its name, the field id that indexes the
+/// stored record format (and hence `decode_record`'s output), and its
+/// position (declaration ordinal, the SELECT * order).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelationColumn {
+    pub name: String,
+    pub field_id: u16,
+    pub position: u16,
+}
+
+fn cstr(image: &[u8], off: usize) -> Option<String> {
+    if image.len() < off + RF_NAME_LEN {
+        return None;
+    }
+    let raw = &image[off..off + RF_NAME_LEN];
+    let s = String::from_utf8_lossy(raw);
+    let s = s.trim_end_matches(|c| c == ' ' || c == '\0').to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// The columns of a relation, read from `RDB$RELATION_FIELDS` and ordered
+/// by field id (the record-format / SELECT * order). The relation is
+/// matched by name because `RDB$RELATION_FIELDS` is keyed by name, which
+/// is what a query gives us.
+pub fn relation_columns(file: &[u8], page_size: usize, relation_name: &str) -> Vec<RelationColumn> {
+    let want = relation_name.trim();
+    let mut out = Vec::new();
+    for dp_no in relation_data_pages(file, page_size, REL_RELATION_FIELDS) {
+        let start = dp_no as usize * page_size;
+        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+            continue;
+        };
+        for r in dp.records() {
+            if !r.is_primary_record() {
+                continue;
+            }
+            let Some(image) = r.image() else { continue };
+            let Some(rname) = cstr(&image, RF_RELATION_NAME_OFFSET) else {
+                continue;
+            };
+            if !rname.eq_ignore_ascii_case(want) {
+                continue;
+            }
+            let Some(name) = cstr(&image, RF_FIELD_NAME_OFFSET) else {
+                continue;
+            };
+            if image.len() < RF_FIELD_ID_OFFSET + 2 {
+                continue;
+            }
+            let field_id =
+                u16::from_le_bytes([image[RF_FIELD_ID_OFFSET], image[RF_FIELD_ID_OFFSET + 1]]);
+            let position = u16::from_le_bytes([
+                image[RF_FIELD_POSITION_OFFSET],
+                image[RF_FIELD_POSITION_OFFSET + 1],
+            ]);
+            out.push(RelationColumn {
+                name,
+                field_id,
+                position,
+            });
+        }
+    }
+    // declaration order (what SELECT * returns)
+    out.sort_by_key(|c| c.position);
+    out
 }
 
 /// Count the committed primary record versions of a relation by walking

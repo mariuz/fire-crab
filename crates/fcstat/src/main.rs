@@ -156,6 +156,18 @@ fn main() {
                 println!("{}\t{}", id, name);
             }
         }
+        "columns" => {
+            // column name -> field_id for a table, read from
+            // RDB$RELATION_FIELDS (mirrors SELECT ... ORDER BY field id).
+            let name = args.get(3).cloned().unwrap_or_else(|| {
+                eprintln!("usage: fcstat columns <db.fdb> <table-name>");
+                std::process::exit(2);
+            });
+            let h = decode_header(&data);
+            for c in fire_crab_ods::relation_columns(&data, h.page_size as usize, &name) {
+                println!("{}\t{}", c.field_id, c.name);
+            }
+        }
         "count" => {
             // COUNT(*) by table name: resolve through RDB$RELATIONS, then
             // count committed primary records from the data pages.
