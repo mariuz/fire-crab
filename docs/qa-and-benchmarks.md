@@ -390,6 +390,38 @@ rows would be a silent wrong answer, which is worse than answering nothing.
 Scope otherwise matches the projection differential: user tables, exact-integer
 and ASCII/UTF8 text columns.
 
+### The fourteenth differential — ORDER BY and aggregates
+
+`qa/serve-real-orderagg.sh` adds sorting and aggregation. fire-crab, as a
+server, answers `SELECT <cols> ... ORDER BY <cols|ordinals> [ASC|DESC]` by
+collecting the matching rows and sorting them, and `MIN/MAX/SUM(col)` /
+`COUNT(col)` / `COUNT(*)` by walking and accumulating. node-firebird drives it
+and results equal isql's - on `EMP` (2000 rows) and `DEPT`, and a nullable
+table for the NULL cases.
+
+What this converts correctly:
+
+- **NULL ordering.** Firebird places NULLs first ascending and last
+  descending; the row comparator treats NULL as the lowest value and reverses
+  for `DESC`, which reproduces both. Confirmed against
+  `ORDER BY A` / `ORDER BY A DESC` on a column with NULLs.
+- **ORDER BY is compared *in order*.** Unlike the earlier differentials (which
+  sort both sides before comparing), this gate compares the sequences
+  directly - the order *is* the thing under test - so the queries sort by a
+  total key (a unique column, or a multi-key ending in one).
+- **Aggregates ignore NULLs.** `SUM`/`MIN`/`MAX` skip NULL inputs and return
+  NULL over an empty set (sent as a row with the null bit set, no data);
+  `COUNT(col)` counts non-NULLs, `COUNT(*)` counts rows. `COUNT(*)` without a
+  filter keeps the fast path that counts record headers *without* decoding -
+  the only path that also works on system relations, whose format is not in
+  `RDB$FORMATS` (a regression the COUNT differential caught when the aggregate
+  rewrite first routed `COUNT(*)` through record decoding).
+
+Ordinals refer to the projected column (fire-crab's `ORDER BY 1` is the first
+select-list column), matching the engine. Scope otherwise matches the
+projection/WHERE differentials: user tables, exact-integer and text columns;
+`MIN`/`MAX`/`SUM` are over integers, and anything unsupported falls back.
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -397,14 +429,15 @@ suite (thousands of tests) drives a **server** through the wire protocol via
 the firebird-driver. The server side proven above is the entry to it: the
 handshake, authentication, encryption and op dispatch a real client needs are
 in place, and real queries - `SELECT COUNT(*)`, column projections
-(`SELECT <cols>` / `SELECT *`) and `WHERE` filtering - now dispatch into the
-converted storage engine and return real results, matching isql over the wire.
-What stands between here and running the suite is remaining *breadth* of the
-SQL engine - joins, `ORDER BY`, aggregates beyond COUNT, the column types still
-rendered approximately, DML, system-table projections. Until that surface is
-wide enough, fire-crab does **not** claim any firebird-qa coverage - but the
-milestone is no longer distant: the protocol server the suite talks to accepts
-real clients and answers real filtered queries from real pages today.
+(`SELECT <cols>` / `SELECT *`), `WHERE` filtering, `ORDER BY` and
+`MIN/MAX/SUM/COUNT` aggregates - now dispatch into the converted storage engine
+and return real results, matching isql over the wire. What stands between here
+and running the suite is remaining *breadth* of the SQL engine - joins,
+`GROUP BY`, the column types still rendered approximately, DML, system-table
+projections. Until that surface is wide enough, fire-crab does **not** claim
+any firebird-qa coverage - but the milestone is no longer distant: the protocol
+server the suite talks to accepts real clients and answers real filtered,
+sorted and aggregated queries from real pages today.
 
 ## Benchmarks
 
@@ -465,6 +498,11 @@ NODE_PATH="$PWD/node_modules" \\
 NODE_PATH="$PWD/node_modules" \\
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
     sh /path/to/fire-crab/qa/serve-real-where.sh /tmp/fbhandson/plans_clean.fdb 3050
+
+# server sorts (ORDER BY) and aggregates (MIN/MAX/SUM/COUNT), vs isql
+NODE_PATH="$PWD/node_modules" \\
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
+    sh /path/to/fire-crab/qa/serve-real-orderagg.sh /tmp/fbhandson/plans_clean.fdb 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on

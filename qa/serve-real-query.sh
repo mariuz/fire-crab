@@ -44,14 +44,20 @@ done
 
 fail=0
 for t in $tables; do
-    fc=$(FC_DB="$DB" FC_PORT="$PORT" FC_T="$t" FC_U="$U" FC_P="$P" node -e '
-      const F=require("node-firebird");
-      F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
-                user:process.env.FC_U,password:process.env.FC_P},(e,db)=>{
-        if(e){console.log("ATTACH_ERR");process.exit(0);}
-        db.query("SELECT COUNT(*) FROM "+process.env.FC_T,(e2,r)=>{
-          console.log(e2?"QUERY_ERR":r[0][Object.keys(r[0])[0]]);db.detach();process.exit(0);});
-      });' 2>/dev/null)
+    fc=""
+    n=0
+    while [ $n -lt 8 ]; do
+        fc=$(FC_DB="$DB" FC_PORT="$PORT" FC_T="$t" FC_U="$U" FC_P="$P" timeout 15 node -e '
+          process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(1); });
+          const F=require("node-firebird");
+          F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
+                    user:process.env.FC_U,password:process.env.FC_P},(e,db)=>{
+            if(e){console.log("CONN_ERR");process.exit(1);}
+            db.query("SELECT COUNT(*) FROM "+process.env.FC_T,(e2,r)=>{
+              console.log(e2?"CONN_ERR":r[0][Object.keys(r[0])[0]]);db.detach();process.exit(0);});
+          });' 2>/dev/null)
+        case "$fc" in *CONN_ERR*|"") n=$((n + 1)); sleep 0.3 ;; *) break ;; esac
+    done
     is=$("$ISQL" -q -b -user "$U" -pas "$P" "$DB" 2>/dev/null <<EOF | tr -d ' \n'
 SET HEADING OFF;
 SELECT COUNT(*) FROM $t;

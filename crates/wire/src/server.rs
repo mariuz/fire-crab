@@ -259,18 +259,36 @@ struct ProjCol {
     length: i32,
 }
 
-/// What a prepared statement resolves to. `Scalar` covers both the fixed
-/// fallback and `SELECT COUNT(*)` (a single BIGINT computed at prepare,
-/// honouring any WHERE); `Project` is `SELECT <cols> FROM <table>
-/// [WHERE ...]` walked at fetch, emitting only rows the filter accepts.
+/// What a prepared statement resolves to. `Scalar` is a single BIGINT
+/// computed at prepare - the fixed fallback, a `COUNT`, or a `MIN/MAX/SUM`
+/// aggregate (all honouring any WHERE); `None` is SQL NULL (an aggregate
+/// over no rows). `Project` is `SELECT <cols> FROM <table> [WHERE ...]
+/// [ORDER BY ...]` walked at fetch, emitting the rows the filter accepts,
+/// sorted by `order_by` (a list of (field id, descending) keys).
 enum Plan {
-    Scalar(i64),
+    Scalar(Option<i64>),
     Project {
         rel: u16,
         formats: Vec<(u8, Vec<Descriptor>)>,
         cols: Vec<ProjCol>,
         filter: Option<Predicate>,
+        order_by: Vec<(usize, bool)>,
     },
+}
+
+/// A scalar-returning aggregate function.
+#[derive(Clone, Copy)]
+enum AggFn {
+    Count,
+    Min,
+    Max,
+    Sum,
+}
+
+/// What an aggregate is computed over.
+enum AggTarget {
+    Star,
+    Col(String),
 }
 
 /// A comparison operator in a WHERE term.
@@ -402,13 +420,15 @@ fn build_projcols(
 /// fall back to the fixed constant rather than answer it without the
 /// filter (returning extra rows would be worse than answering nothing).
 fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
-    let fallback = Plan::Scalar(FIXED_ANSWER);
+    let fallback = Plan::Scalar(Some(FIXED_ANSWER));
     let trace = std::env::var("FC_SRV_TRACE").is_ok();
-    let Some((proj_s, table_s, where_s)) = split_query(sql) else {
+    let Some((proj_s, table_s, where_s, order_s)) = split_query(sql) else {
         if trace { eprintln!("[srv] plan: split_query failed for {:?}", sql); }
         return fallback;
     };
-    if trace { eprintln!("[srv] plan: proj={:?} table={:?} where={:?}", proj_s, table_s, where_s); }
+    if trace {
+        eprintln!("[srv] plan: proj={:?} table={:?} where={:?} order={:?}", proj_s, table_s, where_s, order_s);
+    }
     let Some(proj) = parse_projection(proj_s) else {
         if trace { eprintln!("[srv] plan: parse_projection failed"); }
         return fallback;
@@ -445,35 +465,119 @@ fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
     };
 
     match proj {
-        Proj::Count => {
-            let n = match &filter {
-                None => fire_crab_ods::count_primary_records(&db.bytes, db.page_size, rel),
-                Some(p) => count_matching(db, rel, &formats, p),
-            };
-            Plan::Scalar(n as i64)
+        Proj::Agg(func, target) => {
+            // ORDER BY on a single-row aggregate is meaningless; reject it
+            if order_s.is_some() {
+                return fallback;
+            }
+            match aggregate(db, rel, &formats, &columns, &descs, func, &target, &filter) {
+                Some(v) => Plan::Scalar(v),
+                None => fallback, // unsupported aggregate (e.g. MIN of a text column)
+            }
         }
-        Proj::Cols(collist) => match build_projcols(&collist, &columns, &descs) {
-            Some(cols) if !cols.is_empty() => Plan::Project {
+        Proj::Cols(collist) => {
+            let Some(cols) = build_projcols(&collist, &columns, &descs) else {
+                return fallback;
+            };
+            if cols.is_empty() {
+                return fallback;
+            }
+            // ORDER BY: resolve to (field id, descending) sort keys
+            let order_by = match order_s {
+                None => Vec::new(),
+                Some(os) => match parse_order_by(os, &cols, &columns) {
+                    Some(keys) => keys,
+                    None => {
+                        if trace { eprintln!("[srv] plan: ORDER BY parse failed for {:?}", os); }
+                        return fallback;
+                    }
+                },
+            };
+            Plan::Project {
                 rel,
                 formats,
                 cols,
                 filter,
-            },
-            _ => fallback,
-        },
+                order_by,
+            }
+        }
     }
 }
 
-/// Count the committed primary records that satisfy the predicate, by
-/// decoding each with the format it names and testing it.
-fn count_matching(db: &Database, rel: u16, formats: &[(u8, Vec<Descriptor>)], pred: &Predicate) -> u64 {
-    let mut n = 0u64;
-    for_each_record(db, rel, formats, |values| {
-        if pred.matches(values) {
-            n += 1;
+/// Compute a scalar aggregate over the matching rows. COUNT works on any
+/// column (and `*`); MIN/MAX/SUM require an integer column. Returns
+/// Some(None) for a NULL result (MIN/MAX/SUM over no rows), or None if the
+/// aggregate is unsupported (so the caller falls back).
+#[allow(clippy::too_many_arguments)]
+fn aggregate(
+    db: &Database,
+    rel: u16,
+    formats: &[(u8, Vec<Descriptor>)],
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    func: AggFn,
+    target: &AggTarget,
+    filter: &Option<Predicate>,
+) -> Option<Option<i64>> {
+    let matches = |vals: &[Value]| filter.as_ref().map_or(true, |p| p.matches(vals));
+
+    // COUNT(*) does not need the column values, only the row count. With no
+    // filter it counts record headers without decoding - which is also the
+    // only way it works on system relations (whose format is not in
+    // RDB$FORMATS, so for_each_record would decode nothing).
+    if let (AggFn::Count, AggTarget::Star) = (func, target) {
+        let n = match filter {
+            None => fire_crab_ods::count_primary_records(&db.bytes, db.page_size, rel) as i64,
+            Some(_) => {
+                let mut n = 0i64;
+                for_each_record(db, rel, formats, |v| {
+                    if matches(v) {
+                        n += 1;
+                    }
+                });
+                n
+            }
+        };
+        return Some(Some(n));
+    }
+
+    // every other aggregate is over a named column
+    let AggTarget::Col(name) = target else {
+        return None;
+    };
+    let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+    let fid = rc.field_id as usize;
+
+    // COUNT(col) counts non-null values; MIN/MAX/SUM need an integer column
+    if matches!(func, AggFn::Count) {
+        let mut n = 0i64;
+        for_each_record(db, rel, formats, |v| {
+            if matches(v) && matches!(v.get(fid), Some(x) if !matches!(x, Value::Null)) {
+                n += 1;
+            }
+        });
+        return Some(Some(n));
+    }
+    if !matches!(col_kind(descs.get(fid)?)?, ColKind::Int) {
+        return None; // MIN/MAX/SUM only over integers for now
+    }
+    let mut acc: Option<i64> = None;
+    for_each_record(db, rel, formats, |v| {
+        if !matches(v) {
+            return;
         }
+        let Some(Value::Int(i)) = v.get(fid) else {
+            return; // null or non-int: skipped by all three
+        };
+        acc = Some(match (func, acc) {
+            (_, None) => *i,
+            (AggFn::Min, Some(a)) => a.min(*i),
+            (AggFn::Max, Some(a)) => a.max(*i),
+            (AggFn::Sum, Some(a)) => a + *i,
+            (AggFn::Count, _) => unreachable!(),
+        });
     });
-    n
+    Some(acc)
 }
 
 /// Walk a relation's committed primary records, decoding each with the
@@ -508,6 +612,38 @@ fn for_each_record<F: FnMut(&[Value])>(
     }
 }
 
+/// Order two values for ORDER BY. NULL sorts as the lowest value (so
+/// ascending puts NULLs first), matching the engine's default; integers
+/// compare numerically, text ignoring trailing blanks, other types by
+/// their rendered text.
+fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    match (a, b) {
+        (Value::Null, Value::Null) => Equal,
+        (Value::Null, _) => Less,
+        (_, Value::Null) => Greater,
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Text(x), Value::Text(y)) => x.trim_end_matches(' ').cmp(y.trim_end_matches(' ')),
+        _ => a.render().cmp(&b.render()),
+    }
+}
+
+/// Compare two rows by a list of (field id, descending) ORDER BY keys.
+fn order_cmp(a: &[Value], b: &[Value], keys: &[(usize, bool)]) -> std::cmp::Ordering {
+    use std::cmp::Ordering::Equal;
+    let nullv = Value::Null;
+    for &(fid, desc) in keys {
+        let va = a.get(fid).unwrap_or(&nullv);
+        let vb = b.get(fid).unwrap_or(&nullv);
+        let o = value_cmp(va, vb);
+        let o = if desc { o.reverse() } else { o };
+        if o != Equal {
+            return o;
+        }
+    }
+    Equal
+}
+
 /// The describe buffer for a plan: one BIGINT for `Scalar`, the projected
 /// columns for `Project`.
 fn describe_for(plan: &Plan) -> Vec<u8> {
@@ -519,29 +655,54 @@ fn describe_for(plan: &Plan) -> Vec<u8> {
 
 /// Emit the fetch response for a plan: a stream of
 /// op_fetch_response(status=0, messages=1) + row messages, terminated by
-/// op_fetch_response(status=100). `Scalar` emits one row; `Project` walks
-/// the relation's committed primary records, decoding each with the
-/// format it names and projecting the requested columns.
+/// op_fetch_response(status=100). `Scalar` emits one row (NULL when the
+/// value is None); `Project` walks the relation, filters, and either
+/// streams the rows or - if there is an ORDER BY - collects, sorts and
+/// then emits them.
 fn emit_rows(w: &mut W, plan: &Plan, db: &Option<Database>) {
     match plan {
         Plan::Scalar(v) => {
             w.int(OP_FETCH_RESPONSE).int(0).int(1);
-            w.raw(&[0u8; 4]); // null bitmap (1 col, not null), padded to 4
-            w.raw(&v.to_be_bytes());
+            match v {
+                Some(n) => {
+                    w.raw(&[0u8; 4]); // null bitmap (1 col, not null), padded to 4
+                    w.raw(&n.to_be_bytes());
+                }
+                None => {
+                    w.raw(&[1u8, 0, 0, 0]); // null bitmap: col 0 is NULL, no data
+                }
+            }
         }
         Plan::Project {
             rel,
             formats,
             cols,
             filter,
+            order_by,
         } => {
             if let Some(db) = db {
-                for_each_record(db, *rel, formats, |values| {
-                    if filter.as_ref().map_or(true, |p| p.matches(values)) {
+                let accepts = |v: &[Value]| filter.as_ref().map_or(true, |p| p.matches(v));
+                if order_by.is_empty() {
+                    for_each_record(db, *rel, formats, |values| {
+                        if accepts(values) {
+                            w.int(OP_FETCH_RESPONSE).int(0).int(1);
+                            encode_row(w, cols, values);
+                        }
+                    });
+                } else {
+                    // collect matching rows, then sort by the ORDER BY keys
+                    let mut rows: Vec<Vec<Value>> = Vec::new();
+                    for_each_record(db, *rel, formats, |values| {
+                        if accepts(values) {
+                            rows.push(values.to_vec());
+                        }
+                    });
+                    rows.sort_by(|a, b| order_cmp(a, b, order_by));
+                    for values in &rows {
                         w.int(OP_FETCH_RESPONSE).int(0).int(1);
                         encode_row(w, cols, values);
                     }
-                });
+                }
             }
         }
     }
@@ -620,44 +781,123 @@ fn find_word(up: &str, word: &str, from: usize) -> Option<usize> {
     None
 }
 
-/// The projection part of a SELECT.
+/// The projection part of a SELECT: a column list or a scalar aggregate.
 enum Proj {
-    Count,
     Cols(Vec<String>),
+    Agg(AggFn, AggTarget),
 }
 
-/// Split `SELECT <proj> FROM <table> [WHERE <pred>]` into its three parts,
-/// case-insensitively but preserving the original case (WHERE literals are
-/// case-sensitive). ASCII uppercasing keeps byte positions, so keyword
-/// offsets found in the uppercased copy slice the original correctly.
-fn split_query(sql: &str) -> Option<(&str, &str, Option<&str>)> {
+/// Replace the contents of single-quoted string literals (and the quotes)
+/// with `X`, preserving byte length, so keyword searches never match a
+/// `WHERE`/`ORDER` that lives inside a literal. `''` is an escaped quote.
+fn mask_literals(up: &str) -> String {
+    let mut b = up.as_bytes().to_vec();
+    let mut i = 0;
+    let mut in_str = false;
+    while i < b.len() {
+        if b[i] == b'\'' {
+            b[i] = b'X';
+            in_str = !in_str;
+        } else if in_str {
+            b[i] = b'X';
+        }
+        i += 1;
+    }
+    // masked bytes are all ASCII outside literals and `X` inside
+    String::from_utf8_lossy(&b).into_owned()
+}
+
+/// Find the last `ORDER BY` in `up` (already uppercase), returning
+/// (index of `ORDER`, index where the sort column list begins). The last
+/// occurrence is taken so a string literal `'ORDER BY ...'` earlier in a
+/// WHERE clause does not shadow the real clause.
+fn find_order_by(up: &str) -> Option<(usize, usize)> {
+    let mut result = None;
+    let mut from = 0;
+    while let Some(p) = find_word(up, "ORDER", from) {
+        from = p + "ORDER".len();
+        let tail = &up[p + "ORDER".len()..];
+        let ws = tail.len() - tail.trim_start().len();
+        let t = tail.as_bytes();
+        // the next whole word must be BY
+        if t.len() >= ws + 2
+            && t[ws] == b'B'
+            && t[ws + 1] == b'Y'
+            && (t.len() == ws + 2 || !is_ident_byte(t[ws + 2]))
+        {
+            result = Some((p, p + "ORDER".len() + ws + 2));
+        }
+    }
+    result
+}
+
+/// Split `SELECT <proj> FROM <table> [WHERE <pred>] [ORDER BY <cols>]` into
+/// its parts, case-insensitively but preserving the original case (WHERE
+/// literals are case-sensitive). ASCII uppercasing keeps byte positions,
+/// so keyword offsets found in the uppercased copy slice the original.
+fn split_query(sql: &str) -> Option<(&str, &str, Option<&str>, Option<&str>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
     if find_word(&up, "SELECT", 0) != Some(0) {
         return None;
     }
     let from = find_word(&up, "FROM", "SELECT".len())?;
-    // the first token is SELECT (checked above); take what is between it
-    // and FROM, sliced by length so the original case is preserved
     let proj = s["SELECT".len()..from].trim();
     let after = from + "FROM".len();
     let rest = &s[after..];
-    match find_word(&up[after..], "WHERE", 0) {
-        Some(wp) => Some((proj, rest[..wp].trim(), Some(rest[wp + "WHERE".len()..].trim()))),
-        None => Some((proj, rest.trim(), None)),
-    }
+    // search on a copy with string literals masked out, so a WHERE/ORDER
+    // keyword inside a literal does not match; slice the original.
+    let masked = mask_literals(&up[after..]);
+
+    let where_pos = find_word(&masked, "WHERE", 0);
+    let order = find_order_by(&masked);
+    let order_kw = order.map(|(k, _)| k);
+
+    // the table name ends at the first of WHERE / ORDER BY (or the end)
+    let table_end = [where_pos, order_kw]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(rest.len());
+    let table = rest[..table_end].trim();
+
+    let where_str = where_pos.map(|wp| {
+        let end = order_kw.filter(|&o| o > wp).unwrap_or(rest.len());
+        rest[wp + "WHERE".len()..end].trim()
+    });
+    let order_str = order.map(|(_, cols)| rest[cols..].trim());
+    Some((proj, table, where_str, order_str))
 }
 
-/// Parse the projection: `COUNT(*)` (spacing-tolerant), `*`, or a
-/// comma-separated list of bare identifiers.
+/// Parse the projection: an aggregate `COUNT(*)`/`COUNT(col)`/`MIN|MAX|SUM
+/// (col)` (spacing-tolerant), `*`, or a comma-separated list of bare
+/// identifiers.
 fn parse_projection(proj: &str) -> Option<Proj> {
-    let compact: String = proj
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect::<String>()
-        .to_ascii_uppercase();
-    if compact == "COUNT(*)" {
-        return Some(Proj::Count);
+    let compact: String = proj.chars().filter(|c| !c.is_whitespace()).collect();
+    let cu = compact.to_ascii_uppercase();
+    for (kw, func) in [
+        ("COUNT(", AggFn::Count),
+        ("MIN(", AggFn::Min),
+        ("MAX(", AggFn::Max),
+        ("SUM(", AggFn::Sum),
+    ] {
+        if cu.starts_with(kw) && cu.ends_with(')') {
+            let arg = &compact[kw.len()..compact.len() - 1]; // original case
+            let target = if arg == "*" {
+                AggTarget::Star
+            } else {
+                let name = arg.trim_matches('"');
+                if !ident_ok(name) {
+                    return None;
+                }
+                AggTarget::Col(name.to_string())
+            };
+            // only COUNT accepts *
+            if matches!(target, AggTarget::Star) && !matches!(func, AggFn::Count) {
+                return None;
+            }
+            return Some(Proj::Agg(func, target));
+        }
     }
     if proj.trim() == "*" {
         return Some(Proj::Cols(vec!["*".to_string()]));
@@ -670,6 +910,49 @@ fn parse_projection(proj: &str) -> Option<Proj> {
         return None;
     }
     Some(Proj::Cols(cols))
+}
+
+/// Parse `ORDER BY` into a list of (field id, descending) keys. Each item
+/// is a column name or a 1-based projection ordinal, with optional
+/// ASC/DESC. Returns None on an unknown column, bad ordinal, or malformed
+/// item.
+fn parse_order_by(
+    order: &str,
+    cols: &[ProjCol],
+    columns: &[RelationColumn],
+) -> Option<Vec<(usize, bool)>> {
+    let mut keys = Vec::new();
+    for part in order.split(',') {
+        let toks: Vec<&str> = part.split_whitespace().collect();
+        let (name, desc) = match toks.as_slice() {
+            [n] => (*n, false),
+            [n, dir] => match dir.to_ascii_uppercase().as_str() {
+                "ASC" => (*n, false),
+                "DESC" => (*n, true),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let name = name.trim_matches('"');
+        let fid = if let Ok(ord) = name.parse::<usize>() {
+            // 1-based ordinal into the projection
+            if ord == 0 || ord > cols.len() {
+                return None;
+            }
+            cols[ord - 1].field_id
+        } else {
+            columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(name))?
+                .field_id as usize
+        };
+        keys.push((fid, desc));
+    }
+    if keys.is_empty() {
+        None
+    } else {
+        Some(keys)
+    }
 }
 
 /// A WHERE token.
@@ -1052,7 +1335,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // The SQL text of the most recently prepared statement, and the plan
     // it resolves to (built at prepare, executed at fetch).
     let mut stmt_sql = String::new();
-    let mut plan = Plan::Scalar(FIXED_ANSWER);
+    let mut plan = Plan::Scalar(Some(FIXED_ANSWER));
 
     // --- the op loop (encrypted) ---
     loop {
@@ -1242,27 +1525,29 @@ mod tests {
     fn proj_cols(p: &Proj) -> Vec<String> {
         match p {
             Proj::Cols(c) => c.clone(),
-            Proj::Count => vec!["COUNT".into()],
+            Proj::Agg(..) => vec!["<agg>".into()],
         }
     }
 
     #[test]
-    fn splits_select_from_where() {
+    fn splits_select_from_where_order() {
         // COUNT
-        let (p, t, w) = split_query("SELECT COUNT(*) FROM RDB$RELATIONS").unwrap();
-        assert!(matches!(parse_projection(p), Some(Proj::Count)));
+        let (p, t, w, o) = split_query("SELECT COUNT(*) FROM RDB$RELATIONS").unwrap();
+        assert!(matches!(parse_projection(p), Some(Proj::Agg(AggFn::Count, AggTarget::Star))));
         assert_eq!(t, "RDB$RELATIONS");
-        assert!(w.is_none());
-        // projection + WHERE, mixed case, trailing semicolon; literal case preserved
-        let (p, t, w) = split_query("select ID, NAME from Emp where NAME = 'Emp 5';").unwrap();
+        assert!(w.is_none() && o.is_none());
+        // projection + WHERE + ORDER BY, mixed case; literal case preserved
+        let (p, t, w, o) =
+            split_query("select ID, NAME from Emp where NAME = 'Emp 5' order by ID desc;").unwrap();
         assert_eq!(proj_cols(&parse_projection(p).unwrap()), vec!["ID", "NAME"]);
         assert_eq!(t, "Emp");
         assert_eq!(w, Some("NAME = 'Emp 5'"));
-        // star
-        let (p, t, w) = split_query("SELECT * FROM DEPT").unwrap();
-        assert_eq!(proj_cols(&parse_projection(p).unwrap()), vec!["*"]);
+        assert_eq!(o, Some("ID desc"));
+        // ORDER BY without WHERE
+        let (_, t, w, o) = split_query("SELECT * FROM DEPT ORDER BY 1").unwrap();
         assert_eq!(t, "DEPT");
         assert!(w.is_none());
+        assert_eq!(o, Some("1"));
     }
 
     #[test]
@@ -1271,19 +1556,55 @@ mod tests {
         assert!(split_query("SELECT X FROM T WHERE FROMAGE = 1").is_some());
         // no FROM at all
         assert!(split_query("SELECT 1").is_none());
+        // 'ORDER' inside a WHERE string literal must not start an ORDER BY
+        let (_, t, w, o) = split_query("SELECT ID FROM T WHERE NAME = 'ORDER BY X'").unwrap();
+        assert_eq!(t, "T");
+        assert_eq!(w, Some("NAME = 'ORDER BY X'"));
+        assert!(o.is_none());
     }
 
     #[test]
-    fn rejects_expression_projection() {
-        assert!(matches!(split_query("SELECT MAX(ID) FROM EMP"), Some((p, _, _)) if parse_projection(p).is_none()));
+    fn parses_aggregates_and_ordinals() {
+        assert!(matches!(parse_projection("MIN(SALARY)"), Some(Proj::Agg(AggFn::Min, AggTarget::Col(c))) if c == "SALARY"));
+        assert!(matches!(parse_projection("sum( id )"), Some(Proj::Agg(AggFn::Sum, AggTarget::Col(c))) if c == "id"));
+        assert!(matches!(parse_projection("COUNT(*)"), Some(Proj::Agg(AggFn::Count, AggTarget::Star))));
+        assert!(parse_projection("MIN(*)").is_none()); // MIN(*) invalid
+        // ORDER BY resolution: ordinal into the projection, and by name
+        let cols = vec![
+            ProjCol { name: "ID".into(), field_id: 3, wire: Wire::Int64, sql_type: 580, length: 8 },
+            ProjCol { name: "NAME".into(), field_id: 1, wire: Wire::Varying, sql_type: 448, length: 32765 },
+        ];
+        let columns = vec![
+            RelationColumn { name: "ID".into(), field_id: 3, position: 0 },
+            RelationColumn { name: "NAME".into(), field_id: 1, position: 1 },
+        ];
+        assert_eq!(parse_order_by("2 DESC, ID", &cols, &columns), Some(vec![(1, true), (3, false)]));
+        assert!(parse_order_by("3", &cols, &columns).is_none()); // ordinal out of range
+        assert!(parse_order_by("BOGUS", &cols, &columns).is_none()); // unknown column
+    }
+
+    #[test]
+    fn order_cmp_sorts_with_nulls_low() {
+        let keys = vec![(0usize, false)];
+        let mut rows = vec![
+            vec![Value::Int(3)],
+            vec![Value::Null],
+            vec![Value::Int(1)],
+        ];
+        rows.sort_by(|a, b| order_cmp(a, b, &keys));
+        assert_eq!(rows, vec![vec![Value::Null], vec![Value::Int(1)], vec![Value::Int(3)]]);
+        // descending reverses (NULLs last)
+        let keys = vec![(0usize, true)];
+        rows.sort_by(|a, b| order_cmp(a, b, &keys));
+        assert_eq!(rows, vec![vec![Value::Int(3)], vec![Value::Int(1)], vec![Value::Null]]);
     }
 
     #[test]
     fn plan_falls_back_to_scalar_without_database() {
         // with no database loaded, everything plans to the fixed scalar
-        assert!(matches!(plan_query("SELECT COUNT(*) FROM DEPT", &None), Plan::Scalar(FIXED_ANSWER)));
-        assert!(matches!(plan_query("SELECT ID, NAME FROM EMP WHERE ID > 5", &None), Plan::Scalar(FIXED_ANSWER)));
-        assert!(matches!(plan_query("SELECT CAST(1 AS BIGINT) FROM RDB$DATABASE", &None), Plan::Scalar(FIXED_ANSWER)));
+        assert!(matches!(plan_query("SELECT COUNT(*) FROM DEPT", &None), Plan::Scalar(Some(FIXED_ANSWER))));
+        assert!(matches!(plan_query("SELECT ID, NAME FROM EMP WHERE ID > 5", &None), Plan::Scalar(Some(FIXED_ANSWER))));
+        assert!(matches!(plan_query("SELECT CAST(1 AS BIGINT) FROM RDB$DATABASE", &None), Plan::Scalar(Some(FIXED_ANSWER))));
     }
 
     #[test]
