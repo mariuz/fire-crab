@@ -38,6 +38,17 @@ pub const OP_RESPONSE: i32 = 9;
 pub const OP_DETACH: i32 = 21;
 pub const OP_CONT_AUTH: i32 = 92;
 pub const OP_CRYPT: i32 = 96;
+pub const OP_TRANSACTION: i32 = 29;
+pub const OP_COMMIT: i32 = 30;
+pub const OP_ROLLBACK: i32 = 31;
+pub const OP_ALLOCATE_STATEMENT: i32 = 62;
+pub const OP_EXECUTE: i32 = 63;
+pub const OP_FETCH: i32 = 65;
+pub const OP_FETCH_RESPONSE: i32 = 66;
+pub const OP_FREE_STATEMENT: i32 = 67;
+pub const OP_PREPARE_STATEMENT: i32 = 68;
+pub const SQL_DIALECT_3: i32 = 3;
+pub const DSQL_DROP: i32 = 1;
 
 pub const CONNECT_VERSION3: i32 = 3;
 pub const ARCH_GENERIC: i32 = 1;
@@ -297,13 +308,14 @@ pub fn login(
     user: &str,
     password: &str,
     a_bytes: &[u8],
+    versions: &[i32],
 ) -> std::io::Result<Attachment> {
     let user = user.to_uppercase(); // unquoted identifiers uppercased
     let srp: SrpClient = client_start(a_bytes);
 
     // -- op_connect, presenting A --
     let uid = user_id_block(&user, srp.a_hex.as_bytes());
-    let offered = [13, 16, 17, 18, 19, 20];
+    let offered = versions;
     let mut w = XdrWriter::default();
     w.int(OP_CONNECT)
         .int(OP_ATTACH)
@@ -404,6 +416,185 @@ pub fn login(
         protocol,
         handle,
     })
+}
+
+// XSQLDA describe items requested on prepare (isc_info_sql_*). We only
+// need to know the prepare succeeded; the describe is parsed by higher
+// layers later, so a compact request suffices.
+const DESCRIBE_ITEMS: &[u8] = &[
+    21, // isc_info_sql_stmt_type
+    5,  // isc_info_sql_bind
+    7,  // isc_info_sql_describe_vars
+    8,  // isc_info_sql_describe_end
+    4,  // isc_info_sql_select
+    7,  // isc_info_sql_describe_vars
+    9,  // isc_info_sql_sqlda_seq
+    11, // isc_info_sql_type
+    12, // isc_info_sql_sub_type
+    13, // isc_info_sql_scale
+    14, // isc_info_sql_length
+    15, // isc_info_sql_null_ind
+    16, // isc_info_sql_field
+    17, // isc_info_sql_relation
+    18, // isc_info_sql_owner
+    19, // isc_info_sql_alias
+    8,  // isc_info_sql_describe_end
+];
+
+/// A read-committed, record-version, wait TPB (isc_tpb_*).
+const TPB_READ_COMMITTED: &[u8] = &[
+    3,  /*version3*/
+    8,  /*read*/
+    15, /*read_committed*/
+    17, /*rec_version*/
+    6,  /*wait*/
+];
+
+impl Attachment {
+    fn send_enc(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let ct = self.enc.transform(bytes);
+        self.stream.write_all(&ct)
+    }
+    fn recv_int(&mut self) -> std::io::Result<i32> {
+        let mut d = Some(std::mem::replace(&mut self.dec, Rc4::new(&[0])));
+        let v = read_int_maybe(&mut self.stream, d.as_mut());
+        self.dec = d.unwrap();
+        v
+    }
+    fn recv_response(&mut self) -> std::io::Result<i32> {
+        let mut d = Some(std::mem::replace(&mut self.dec, Rc4::new(&[0])));
+        let v = read_response(&mut self.stream, &mut d);
+        self.dec = d.unwrap();
+        v
+    }
+    fn recv_bytes(&mut self) -> std::io::Result<Vec<u8>> {
+        let mut d = Some(std::mem::replace(&mut self.dec, Rc4::new(&[0])));
+        let v = read_bytes_maybe(&mut self.stream, &mut d);
+        self.dec = d.unwrap();
+        v
+    }
+
+    fn expect_response(&mut self) -> std::io::Result<i32> {
+        if self.recv_int()? != OP_RESPONSE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "expected op_response",
+            ));
+        }
+        self.recv_response()
+    }
+
+    /// Run a query that returns a single BIGINT column, one row -
+    /// prepare, execute, fetch - and return the value. Proves the
+    /// statement pipeline works end-to-end; the differential compares
+    /// it to `SELECT ... FROM` through isql.
+    pub fn query_i64(&mut self, sql: &str) -> std::io::Result<i64> {
+        // op_transaction
+        let mut w = XdrWriter::default();
+        w.int(OP_TRANSACTION)
+            .int(self.handle)
+            .bytes(TPB_READ_COMMITTED);
+        self.send_enc(w.finish())?;
+        let tr = self.expect_response()?;
+
+        // op_allocate_statement (immediate response with the real handle)
+        let mut w = XdrWriter::default();
+        w.int(OP_ALLOCATE_STATEMENT).int(self.handle);
+        self.send_enc(w.finish())?;
+        let stmt = self.expect_response()?;
+
+        // op_prepare_statement with the real statement handle
+        let mut w = XdrWriter::default();
+        w.int(OP_PREPARE_STATEMENT)
+            .int(tr)
+            .int(stmt)
+            .int(SQL_DIALECT_3)
+            .str(sql)
+            .bytes(DESCRIBE_ITEMS)
+            .int(32768);
+        self.send_enc(w.finish())?;
+        self.expect_response()?; // describe info ignored
+
+        // op_execute (no input parameters)
+        let mut w = XdrWriter::default();
+        w.int(OP_EXECUTE).int(stmt).int(tr).bytes(&[]).int(0).int(0);
+        self.send_enc(w.finish())?;
+        self.expect_response()?;
+
+        // op_fetch: request 1 row, output BLR describing one INT64 column
+        // blr_version5, blr_begin, blr_message 0, len=cols*2, [INT64,scale][SHORT,scale nullind], blr_end, blr_eoc
+        let fetch_blr: &[u8] = &[5, 2, 4, 0, 2, 0, 16, 0, 7, 0, 255, 76];
+        let mut w = XdrWriter::default();
+        w.int(OP_FETCH).int(stmt).bytes(fetch_blr).int(0).int(1);
+        self.send_enc(w.finish())?;
+
+        let op = self.recv_int()?;
+        if op == OP_RESPONSE {
+            // an error came back instead of rows
+            self.recv_response()?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "fetch: unexpected op_response",
+            ));
+        }
+        if op != OP_FETCH_RESPONSE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("fetch: op {}", op),
+            ));
+        }
+        let status = self.recv_int()?;
+        let messages = self.recv_int()?;
+        if status == 100 || messages == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "fetch: no row",
+            ));
+        }
+        // protocol-13 row: null bitmap (ceil(1/8)=1 byte, padded to 4), then i64 (big-endian)
+        let mut d = Some(std::mem::replace(&mut self.dec, Rc4::new(&[0])));
+        let nullmap = {
+            let mut b = vec![0u8; 4];
+            self.stream.read_exact(&mut b)?;
+            d.as_mut().unwrap().transform(&b)
+        };
+        let value = {
+            let mut b = [0u8; 8];
+            self.stream.read_exact(&mut b)?;
+            let p = d.as_mut().unwrap().transform(&b);
+            i64::from_be_bytes([p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]])
+        };
+        self.dec = d.unwrap();
+        let is_null = nullmap[0] & 1 != 0;
+
+        // op_fetch(count=1) is followed by a terminating op_fetch_response
+        // (messages=0) marking end-of-batch; consume it so it does not leak
+        // into the next op.
+        let term = self.recv_int()?;
+        if term == OP_FETCH_RESPONSE {
+            self.recv_int()?; // status
+            self.recv_int()?; // messages (0)
+        }
+
+        // op_free_statement (drop), then commit + read both responses
+        let mut w = XdrWriter::default();
+        w.int(OP_FREE_STATEMENT).int(stmt).int(DSQL_DROP);
+        self.send_enc(w.finish())?;
+        self.expect_response()?;
+        let mut w = XdrWriter::default();
+        w.int(OP_COMMIT).int(tr);
+        self.send_enc(w.finish())?;
+        self.expect_response()?;
+
+        if is_null {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "value is null",
+            ))
+        } else {
+            Ok(value)
+        }
+    }
 }
 
 impl Attachment {

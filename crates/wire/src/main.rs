@@ -4,8 +4,10 @@ use fire_crab_wire::{login, negotiate};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 4 || (args[1] != "negotiate" && args[1] != "login") {
-        eprintln!("usage: fcwire negotiate|login <host:port> <db-path> [user] [password]");
+    if args.len() < 4 || (args[1] != "negotiate" && args[1] != "login" && args[1] != "query") {
+        eprintln!(
+            "usage: fcwire negotiate|login|query <host:port> <db-path> [user] [password] [sql]"
+        );
         std::process::exit(2);
     }
     let (host, port) = match args[2].rsplit_once(':') {
@@ -17,10 +19,44 @@ fn main() {
         use std::io::Read;
         let _ = f.read_exact(&mut rnd);
     }
+    if args[1] == "query" {
+        let user = args.get(4).cloned().unwrap_or_else(|| "SYSDBA".into());
+        let pass = args.get(5).cloned().unwrap_or_else(|| "masterkey".into());
+        let sql = args
+            .get(6)
+            .cloned()
+            .unwrap_or_else(|| "SELECT COUNT(*) FROM RDB$RELATIONS".into());
+        match login(&host, port, &args[3], &user, &pass, &rnd, &[13]) {
+            Ok(mut att) => match att.query_i64(&sql) {
+                Ok(v) => {
+                    println!("VALUE {}", v);
+                    let _ = att.detach();
+                }
+                Err(e) => {
+                    eprintln!("fcwire query: {}", e);
+                    let _ = att.detach();
+                    std::process::exit(1);
+                }
+            },
+            Err(e) => {
+                eprintln!("fcwire login: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if args[1] == "login" {
         let user = args.get(4).cloned().unwrap_or_else(|| "SYSDBA".into());
         let pass = args.get(5).cloned().unwrap_or_else(|| "masterkey".into());
-        match login(&host, port, &args[3], &user, &pass, &rnd) {
+        match login(
+            &host,
+            port,
+            &args[3],
+            &user,
+            &pass,
+            &rnd,
+            &[13, 16, 17, 18, 19, 20],
+        ) {
             Ok(mut att) => {
                 println!(
                     "logged in: protocol {}, attachment handle {}",

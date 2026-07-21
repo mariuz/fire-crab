@@ -195,10 +195,31 @@ clean discriminator); a wrong password draws isc_login (gds 335544472); a
 nonexistent user cannot log in. So the engine sees fire-crab as a genuine
 authenticated, encrypted client - not a decoder pretending.
 
-Still ahead before the firebird-qa milestone: statement allocation and
-prepare, and op_execute/op_fetch. Once those work, fire-crab can run a query
-end-to-end and the official pytest suite becomes applicable. The
-[subsystem map](subsystem-map.md) tracks the remaining sequence.
+The ninth differential closes the loop: **fire-crab runs a query end-to-end.**
+On top of the login, it converts the statement pipeline from src/remote -
+op_transaction, op_allocate_statement, op_prepare_statement, op_execute,
+op_fetch, op_free_statement, op_commit - and decodes the protocol-13 row
+message (a null bitmap padded to 4 bytes, then the column value). For a
+single-BIGINT query the value it pulls off the wire must equal what isql
+returns. `qa/diff-query.sh`: a computed constant (42), three catalog counts,
+and a MAX all match isql exactly.
+
+Three wire subtleties surfaced and were fixed, each the kind of thing only a
+live round-trip exposes: op_prepare_statement's message format differs between
+protocol 20 and 13 (the pipeline is pinned to 13, where it is well-specified
+by the reference clients; login still negotiates 20); op_fetch with count=1
+returns the row AND a trailing end-of-batch op_fetch_response that must be
+drained or it leaks into the next op; and RC4 is a stream cipher, so every
+read must consume exactly the right byte count or the decryptor desyncs. The
+describe-items request also had to carry the exact isc_info_sql_* codes - a
+guessed set left the server waiting for a packet it never got.
+
+This is the firebird-qa entry threshold: fire-crab can now attach, prepare,
+execute and fetch on the wire, which is precisely what the official pytest
+suite drives. Running the suite itself, and broadening column-type and
+statement coverage beyond the single-BIGINT path, is the work that follows -
+but the pipeline every one of those tests exercises is now proven against the
+live engine.
 
 ### Stage 3 — the Firebird QA suite (the milestone, not yet claimable)
 
