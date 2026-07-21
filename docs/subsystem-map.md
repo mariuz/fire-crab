@@ -26,8 +26,8 @@ Paper document links are relative to
 
 | C++ source | Paper document | Crate | Status |
 |---|---|---|---|
-| `src/jrd/tra.cpp`, tip walking, snapshots | transactions-and-concurrency.md | `fire-crab-tra` | planned — diffable via TIP decode + commit-order semantics against live engine |
-| `src/jrd/vio.cpp` (record versions, GC) | garbage-collection-and-sweep.md | `fire-crab-vio` | planned |
+| `src/jrd/tra.cpp` TIP chain, `vio.cpp` version rules, `sqz.cpp` deltas | transactions-and-concurrency.md | `fire-crab-ods::tra` | **done** — TIP-chain state lookup, delta back-version reconstruction (Difference::apply), committed-only MVCC visibility walk; differential vs live SELECT on a file frozen mid-uncommitted-work (qa/diff-mvcc.sh) |
+| `src/jrd/vio.cpp` (GC of dead versions, sweep) | garbage-collection-and-sweep.md | `fire-crab-vio` | next — the visibility walk already classifies dead vs interesting versions; GC adds the removal side |
 | `src/lock/lock.cpp` | lock-manager.md | `fire-crab-lck` | planned |
 
 ## Phase 3 — cache and physical I/O

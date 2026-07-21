@@ -32,6 +32,7 @@ pub mod pip;
 pub mod pointer;
 pub mod sqz;
 pub mod tip;
+pub mod tra;
 
 pub use btr::{walk_index_leaves, BtreePage, IndexRootPage};
 pub use data::{DataPage, RecordHeader};
@@ -41,6 +42,7 @@ pub use pages::{census, PageType};
 pub use pip::PipPage;
 pub use pointer::{relation_data_pages, PointerPage};
 pub use tip::{TipPage, TxState};
+pub use tra::{visible_rows, TipChain};
 
 /// Read a `u16` at `offset`, little-endian, like the engine's
 /// in-memory access to an aligned USHORT field on x86/ARM.

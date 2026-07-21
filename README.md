@@ -39,7 +39,8 @@ the converter what the C++ is *doing* before they read a line of it.
 | PIP, pointer pages, data pages + record-version walk | `fire-crab-ods` | **converted + differential-tested vs live SELECT** |
 | Record field decoding (RDB$FORMATS bootstrap, blob assembly) | `fire-crab-ods::format` | **converted + full-row differential vs live SELECT** |
 | B-tree index pages + node encoding (`btn.h`) | `fire-crab-ods::btr` | **converted + index-order differential vs live ORDER BY** |
-| Transaction system (`tra.cpp`) | `fire-crab-tra` | next |
+| Transaction system: TIP chain, delta versions, MVCC visibility (`tra.cpp`/`vio.cpp`) | `fire-crab-ods::tra` | **converted + committed-only-visibility differential vs live SELECT** |
+| Record versions and GC (`vio.cpp`) | `fire-crab-vio` | next |
 | Everything else | — | see [docs/subsystem-map.md](docs/subsystem-map.md) |
 
 Current QA state: `fcstat header` output is **byte-identical on the compared

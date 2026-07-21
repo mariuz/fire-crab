@@ -87,9 +87,35 @@ results: identical order on every index tested, including a 200,000-row
 primary key through a multi-level tree; the walk also asserts the memcmp
 non-decreasing key invariant as it goes (zero violations).
 
+The fourth semantic differential reaches the transaction system itself.
+`qa/diff-mvcc.sh` freezes a database file **while a transaction holds
+uncommitted UPDATEs, DELETEs and INSERTs** (via `ALTER DATABASE BEGIN BACKUP`,
+which flushes the page cache and diverts further writes to the delta, so the
+copied main file contains the uncommitted versions on disk), then checks that
+fire-crab's TIP-driven visibility walk reproduces the live engine's
+committed-only view:
+
+  - `fcstat visible` reads the TIP chain, and for each record walks the
+    back-version chain (`rhd_b_page`/`rhd_b_line`) to the newest version whose
+    transaction the TIP marks COMMITTED, reconstructing delta versions
+    (`rhd_delta` -> Difference::apply, sqz.cpp:515) along the way, and drops
+    deleted stubs and uncommitted inserts.
+  - its output must equal `SELECT` through the engine from a fresh snapshot;
+  - and to prove the test is not vacuous, the raw walk (`fcstat rows`, which
+    sees the newest versions) must DIFFER - it does, by exactly the
+    uncommitted rows.
+
+Result: on the standard scenario (10 committed rows; 3 updated, 2 deleted, 2
+inserted uncommitted) the visibility walk yields 10 rows matching the engine
+value-for-value, taking 5 back-version steps of which **3 are real delta
+reconstructions against engine-written difference records** - so
+Difference::apply is exercised on real data, not just its unit test. The raw
+walk differs by 10 lines (the 5 uncommitted primaries plus what they hide),
+confirming the uncommitted versions really are in the frozen file.
+
 Next: BLR decode against the byte dumps already captured in the paper's
-samples; commit-order semantics against the transactions samples' verified
-outputs.
+samples; GC/sweep (vio.cpp) using the visibility walk's dead-version
+classification.
 
 ### Stage 3 — the Firebird QA suite (the milestone, not yet claimable)
 

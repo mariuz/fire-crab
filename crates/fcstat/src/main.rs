@@ -13,6 +13,9 @@
 //!                                     RDB\$FORMATS bootstrap
 //!   fcstat indexes <db.fdb> <rel>   - the relation's index roots
 //!   fcstat index-walk <db.fdb> <rel> <index-id> - ordered leaf-level walk
+//!   fcstat tx-state <db.fdb> <tx-id> - a transaction's TIP state
+//!   fcstat visible <db.fdb> <rel>   - rows visible to a committed-only
+//!                                     reader (TIP-driven version-chain walk)
 //!   fcstat bench-census <db.fdb> <iterations>
 
 use fire_crab_ods::{
@@ -42,6 +45,20 @@ fn main() {
         "header" => header(&data),
         "census" => census_cmd(&data),
         "tip" => tip(&data),
+        "tx-state" => {
+            let id: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                eprintln!("usage: fcstat tx-state <db.fdb> <tx-id>");
+                std::process::exit(2);
+            });
+            tx_state(&data, id);
+        }
+        "visible" => {
+            let rel: u16 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                eprintln!("usage: fcstat visible <db.fdb> <relation-id>");
+                std::process::exit(2);
+            });
+            visible(&data, rel);
+        }
         "rows-recno" => {
             let rel: u16 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
                 eprintln!("usage: fcstat rows-recno <db.fdb> <relation-id>");
@@ -391,6 +408,61 @@ fn index_walk(data: &[u8], relation: u16, index_id: u8) {
     if order_violations > 0 {
         std::process::exit(1);
     }
+}
+
+fn tx_state(data: &[u8], id: u64) {
+    let h = decode_header(data);
+    let Some(tips) = fire_crab_ods::TipChain::read(data, h.page_size as usize) else {
+        eprintln!("fcstat: no TIP chain found");
+        std::process::exit(1);
+    };
+    for p in fire_crab_ods::tra::check_invariants(data, h.page_size as usize) {
+        eprintln!("invariant violated: {}", p);
+    }
+    match tips.state(id) {
+        Some(s) => println!(
+            "transaction {}: {} ({} TIP page(s), next transaction {})",
+            id,
+            s.name(),
+            tips.page_count(),
+            h.next_transaction
+        ),
+        None => {
+            eprintln!("fcstat: transaction {} beyond the TIP chain", id);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Rows visible to a committed-only reader: the TIP-driven
+/// version-chain walk, printed like `rows` (plus chain-depth stats to
+/// stderr). The differential mate is a read-committed SELECT while
+/// another transaction holds uncommitted changes.
+fn visible(data: &[u8], relation: u16) {
+    let h = decode_header(data);
+    let page_size = h.page_size as usize;
+    let formats = relation_formats(data, page_size, relation);
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else {
+        eprintln!("fcstat: no formats for relation {}", relation);
+        std::process::exit(1);
+    };
+    let Some(tips) = fire_crab_ods::TipChain::read(data, page_size) else {
+        eprintln!("fcstat: no TIP chain found");
+        std::process::exit(1);
+    };
+    let rows = fire_crab_ods::visible_rows(data, page_size, relation, descs, &tips);
+    let walked: u32 = rows.iter().map(|r| r.versions_walked).sum();
+    let deltas: u32 = rows.iter().map(|r| r.deltas_applied).sum();
+    for r in &rows {
+        let line: Vec<String> = r.values.iter().map(|v| v.render()).collect();
+        println!("{}", line.join("\t"));
+    }
+    eprintln!(
+        "{} visible rows, {} back-version steps taken ({} via delta reconstruction)",
+        rows.len(),
+        walked,
+        deltas
+    );
 }
 
 fn bench_census(data: &[u8], iters: u32) {
