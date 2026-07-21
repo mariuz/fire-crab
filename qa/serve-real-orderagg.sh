@@ -95,8 +95,10 @@ if has_table EMP; then
     compare "COUNT(NAME)"       "SELECT COUNT(NAME) FROM EMP"                 "SELECT COUNT(NAME) FROM EMP"
     # ORDER BY (total keys)
     compare "ORDER BY ID DESC"  "SELECT ID FROM EMP ORDER BY ID DESC"        "SELECT ID FROM EMP ORDER BY ID DESC"
+    # COALESCE keeps the isql concatenation from nulling the whole row on
+    # a NULL DEPT_ID (node prints such a row as id|<null>)
     compare "ORDER BY 2 key"    "SELECT ID, DEPT_ID FROM EMP WHERE ID <= 30 ORDER BY DEPT_ID DESC, ID" \
-                                "SELECT ID || '|' || DEPT_ID FROM EMP WHERE ID <= 30 ORDER BY DEPT_ID DESC, ID"
+                                "SELECT ID || '|' || COALESCE(CAST(DEPT_ID AS VARCHAR(12)),'<null>') FROM EMP WHERE ID <= 30 ORDER BY DEPT_ID DESC, ID"
     compare "ORDER BY text"     "SELECT NAME, ID FROM EMP WHERE ID <= 15 ORDER BY NAME, ID" \
                                 "SELECT TRIM(NAME) || '|' || ID FROM EMP WHERE ID <= 15 ORDER BY NAME, ID"
 fi

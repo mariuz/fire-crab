@@ -422,6 +422,47 @@ select-list column), matching the engine. Scope otherwise matches the
 projection/WHERE differentials: user tables, exact-integer and text columns;
 `MIN`/`MAX`/`SUM` are over integers, and anything unsupported falls back.
 
+### The fifteenth differential — GROUP BY
+
+`qa/serve-real-groupby.sh` adds grouping. fire-crab, as a server, answers
+`SELECT <keys and aggregates> FROM <t> [WHERE ...] GROUP BY <cols|ordinals>
+[ORDER BY ...]` - and multi-aggregate projections with no GROUP BY at all -
+by filtering, bucketing the decoded rows by the key columns, and computing
+`COUNT(*)`/`COUNT(col)`/`MIN`/`MAX`/`SUM` per bucket. node-firebird drives it
+against a database with NULL group keys and NULL aggregate inputs, and every
+result set equals isql's.
+
+What this converts correctly:
+
+- **NULL keys form one group.** Rows whose key is NULL bucket together (the
+  grouping comparator treats NULL = NULL as equal, unlike the WHERE
+  comparator, where NULL = NULL is UNKNOWN) - and that bucket orders first
+  ascending, like any NULL under ORDER BY.
+- **One global group.** `SELECT MIN(X), MAX(X), COUNT(*) FROM T` with no
+  GROUP BY emits exactly one row even over an *empty* set - `COUNT` 0, the
+  others NULL - where a grouped query over no rows emits no rows. Both match
+  the engine.
+- **ORDER BY sorts the output.** On a grouped query the sort keys resolve
+  against the *output* columns (group keys by name, anything by select-list
+  ordinal), so `ORDER BY 2 DESC` sorts by the aggregate - which is not a
+  stored column and has no record field id.
+- **A selected column must be a group key.** `SELECT A, COUNT(*) ... GROUP BY
+  B` is invalid SQL; the planner falls back rather than picking an arbitrary
+  representative row.
+- The single-aggregate `SELECT COUNT(*) FROM t` shape stays on the scalar
+  fast path (counting record headers without decoding), keeping COUNT working
+  on system relations, whose format is not in `RDB$FORMATS`.
+
+One comparison caveat the gate documents: the engine titles every aggregate
+output column by its function (`COUNT`, `MIN`, ...), and node-firebird keys
+result rows by that alias - so a query selecting both `COUNT(*)` and
+`COUNT(col)` loses one of them *client-side*, against any server. The gate
+splits such queries; fire-crab reproduces the engine's aliases.
+
+Scope matches the earlier server differentials: user tables, exact-integer
+and text columns, `MIN`/`MAX`/`SUM` over integers; no `HAVING`, no grouping
+by expressions; anything unsupported falls back.
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest

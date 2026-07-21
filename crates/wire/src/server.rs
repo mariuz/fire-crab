@@ -264,7 +264,12 @@ struct ProjCol {
 /// aggregate (all honouring any WHERE); `None` is SQL NULL (an aggregate
 /// over no rows). `Project` is `SELECT <cols> FROM <table> [WHERE ...]
 /// [ORDER BY ...]` walked at fetch, emitting the rows the filter accepts,
-/// sorted by `order_by` (a list of (field id, descending) keys).
+/// sorted by `order_by` (a list of (field id, descending) keys). `Group`
+/// is a grouped query - `GROUP BY`, or a multi-aggregate projection with
+/// no GROUP BY (one global group): the filtered rows are bucketed by the
+/// `key_fids` record fields (NULLs group together), each `gitems` output
+/// computed per group; `cols` describes the output columns (their
+/// `field_id` is the OUTPUT index, which is also what `order_by` sorts on).
 enum Plan {
     Scalar(Option<i64>),
     Project {
@@ -274,6 +279,23 @@ enum Plan {
         filter: Option<Predicate>,
         order_by: Vec<(usize, bool)>,
     },
+    Group {
+        rel: u16,
+        formats: Vec<(u8, Vec<Descriptor>)>,
+        cols: Vec<ProjCol>,
+        gitems: Vec<GItem>,
+        key_fids: Vec<usize>,
+        filter: Option<Predicate>,
+        order_by: Vec<(usize, bool)>,
+    },
+}
+
+/// One output column of a grouped query: a grouping key (carried by its
+/// record field id) or an aggregate over the group's rows (`None` fid =
+/// `COUNT(*)`).
+enum GItem {
+    Key(usize),
+    Agg(AggFn, Option<usize>),
 }
 
 /// A scalar-returning aggregate function.
@@ -413,21 +435,26 @@ fn build_projcols(
 }
 
 /// Plan a prepared statement against the loaded database. The shapes
-/// answered from real pages are `SELECT COUNT(*) FROM <table> [WHERE ...]`
-/// and `SELECT <cols> FROM <table> [WHERE ...]`, resolving the table
-/// through `RDB$RELATIONS` and columns through `RDB$RELATION_FIELDS`.
-/// A WHERE clause that cannot be parsed or resolved makes the whole query
-/// fall back to the fixed constant rather than answer it without the
-/// filter (returning extra rows would be worse than answering nothing).
+/// answered from real pages are `SELECT COUNT(*) FROM <table> [WHERE ...]`,
+/// `SELECT <cols> FROM <table> [WHERE ...] [ORDER BY ...]`, and grouped
+/// queries `SELECT <keys and aggregates> FROM <table> [WHERE ...] [GROUP
+/// BY ...] [ORDER BY ...]`, resolving the table through `RDB$RELATIONS`
+/// and columns through `RDB$RELATION_FIELDS`. A clause that cannot be
+/// parsed or resolved makes the whole query fall back to the fixed
+/// constant rather than answer it wrong (returning extra or misgrouped
+/// rows would be worse than answering nothing).
 fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
     let fallback = Plan::Scalar(Some(FIXED_ANSWER));
     let trace = std::env::var("FC_SRV_TRACE").is_ok();
-    let Some((proj_s, table_s, where_s, order_s)) = split_query(sql) else {
+    let Some((proj_s, table_s, where_s, group_s, order_s)) = split_query(sql) else {
         if trace { eprintln!("[srv] plan: split_query failed for {:?}", sql); }
         return fallback;
     };
     if trace {
-        eprintln!("[srv] plan: proj={:?} table={:?} where={:?} order={:?}", proj_s, table_s, where_s, order_s);
+        eprintln!(
+            "[srv] plan: proj={:?} table={:?} where={:?} group={:?} order={:?}",
+            proj_s, table_s, where_s, group_s, order_s
+        );
     }
     let Some(proj) = parse_projection(proj_s) else {
         if trace { eprintln!("[srv] plan: parse_projection failed"); }
@@ -464,43 +491,227 @@ fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
         },
     };
 
-    match proj {
-        Proj::Agg(func, target) => {
+    let items = match proj {
+        Proj::Star => {
+            // SELECT * is a plain projection; GROUP BY over it would need
+            // every column grouped - not a shape worth answering
+            if group_s.is_some() {
+                return fallback;
+            }
+            let Some(cols) = build_projcols(&["*".to_string()], &columns, &descs) else {
+                return fallback;
+            };
+            let order_by = match order_s {
+                None => Vec::new(),
+                Some(os) => {
+                    match parse_order_by(os, &cols, |n| {
+                        columns
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(n))
+                            .map(|c| c.field_id as usize)
+                    }) {
+                        Some(keys) => keys,
+                        None => return fallback,
+                    }
+                }
+            };
+            return Plan::Project { rel, formats, cols, filter, order_by };
+        }
+        Proj::Items(items) => items,
+    };
+
+    let has_agg = items.iter().any(|i| matches!(i, SelItem::Agg(..)));
+
+    // a single aggregate with no GROUP BY stays on the scalar path - it
+    // keeps the header-count fast path for COUNT(*), which is also the
+    // only way COUNT works on system relations (no RDB$FORMATS entry)
+    if group_s.is_none() && items.len() == 1 {
+        if let SelItem::Agg(func, target) = &items[0] {
             // ORDER BY on a single-row aggregate is meaningless; reject it
             if order_s.is_some() {
                 return fallback;
             }
-            match aggregate(db, rel, &formats, &columns, &descs, func, &target, &filter) {
+            return match aggregate(db, rel, &formats, &columns, &descs, *func, target, &filter) {
                 Some(v) => Plan::Scalar(v),
                 None => fallback, // unsupported aggregate (e.g. MIN of a text column)
-            }
-        }
-        Proj::Cols(collist) => {
-            let Some(cols) = build_projcols(&collist, &columns, &descs) else {
-                return fallback;
             };
-            if cols.is_empty() {
-                return fallback;
-            }
-            // ORDER BY: resolve to (field id, descending) sort keys
-            let order_by = match order_s {
-                None => Vec::new(),
-                Some(os) => match parse_order_by(os, &cols, &columns) {
+        }
+    }
+
+    if !has_agg && group_s.is_none() {
+        // plain projection: SELECT <cols> [WHERE] [ORDER BY]
+        let collist: Vec<String> = items
+            .iter()
+            .map(|i| match i {
+                SelItem::Col(c) => c.clone(),
+                SelItem::Agg(..) => unreachable!(),
+            })
+            .collect();
+        let Some(cols) = build_projcols(&collist, &columns, &descs) else {
+            return fallback;
+        };
+        if cols.is_empty() {
+            return fallback;
+        }
+        let order_by = match order_s {
+            None => Vec::new(),
+            Some(os) => {
+                match parse_order_by(os, &cols, |n| {
+                    columns
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(n))
+                        .map(|c| c.field_id as usize)
+                }) {
                     Some(keys) => keys,
                     None => {
                         if trace { eprintln!("[srv] plan: ORDER BY parse failed for {:?}", os); }
                         return fallback;
                     }
-                },
-            };
-            Plan::Project {
-                rel,
-                formats,
-                cols,
-                filter,
-                order_by,
+                }
+            }
+        };
+        return Plan::Project { rel, formats, cols, filter, order_by };
+    }
+
+    // grouped query: GROUP BY, or a multi-aggregate global projection
+    match plan_group(&items, group_s, order_s, rel, formats, &columns, &descs, filter) {
+        Some(p) => p,
+        None => {
+            if trace { eprintln!("[srv] plan: GROUP BY plan failed"); }
+            fallback
+        }
+    }
+}
+
+/// Build a `Plan::Group`. With a GROUP BY every bare select-list column
+/// must be one of the group keys (anything else is invalid SQL); with no
+/// GROUP BY (a multi-aggregate projection) there are no keys, the whole
+/// table is one group, and a bare column is invalid. MIN/MAX/SUM need an
+/// integer column; COUNT takes any column or `*`. Returns None on any
+/// unresolvable or invalid piece - the caller falls back.
+#[allow(clippy::too_many_arguments)]
+fn plan_group(
+    items: &[SelItem],
+    group_s: Option<&str>,
+    order_s: Option<&str>,
+    rel: u16,
+    formats: Vec<(u8, Vec<Descriptor>)>,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    filter: Option<Predicate>,
+) -> Option<Plan> {
+    let key_fids = match group_s {
+        None => Vec::new(),
+        Some(g) => parse_group_by(g, items, columns)?,
+    };
+    let mut gitems = Vec::new();
+    let mut cols = Vec::new();
+    for (out_idx, item) in items.iter().enumerate() {
+        match item {
+            SelItem::Col(name) => {
+                let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+                let fid = rc.field_id as usize;
+                if !key_fids.contains(&fid) {
+                    return None; // a selected column that is not grouped
+                }
+                let (wire, sql_type, length) = wire_for(descs.get(fid)?);
+                cols.push(ProjCol {
+                    name: rc.name.clone(),
+                    field_id: out_idx,
+                    wire,
+                    sql_type,
+                    length,
+                });
+                gitems.push(GItem::Key(fid));
+            }
+            SelItem::Agg(func, target) => {
+                let fid = match target {
+                    AggTarget::Star => None, // COUNT(*) - parse guarantees Count
+                    AggTarget::Col(name) => {
+                        let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+                        let fid = rc.field_id as usize;
+                        // MIN/MAX/SUM only over integers (COUNT counts any)
+                        if !matches!(func, AggFn::Count)
+                            && !matches!(col_kind(descs.get(fid)?)?, ColKind::Int)
+                        {
+                            return None;
+                        }
+                        Some(fid)
+                    }
+                };
+                // the engine titles aggregate output columns by function
+                let name = match func {
+                    AggFn::Count => "COUNT",
+                    AggFn::Min => "MIN",
+                    AggFn::Max => "MAX",
+                    AggFn::Sum => "SUM",
+                };
+                cols.push(ProjCol {
+                    name: name.to_string(),
+                    field_id: out_idx,
+                    wire: Wire::Int64,
+                    sql_type: 580,
+                    length: 8,
+                });
+                gitems.push(GItem::Agg(*func, fid));
             }
         }
+    }
+    // ORDER BY sorts the OUTPUT rows: names resolve to output columns
+    // (group keys by column name), ordinals to select-list positions
+    let order_by = match order_s {
+        None => Vec::new(),
+        Some(os) => parse_order_by(os, &cols, |n| {
+            cols.iter()
+                .find(|c| c.name.eq_ignore_ascii_case(n))
+                .map(|c| c.field_id)
+        })?,
+    };
+    Some(Plan::Group {
+        rel,
+        formats,
+        cols,
+        gitems,
+        key_fids,
+        filter,
+        order_by,
+    })
+}
+
+/// Parse a GROUP BY list into record field ids. Items are column names or
+/// 1-based select-list ordinals (which must name a bare column - grouping
+/// by an aggregate is invalid).
+fn parse_group_by(
+    group: &str,
+    items: &[SelItem],
+    columns: &[RelationColumn],
+) -> Option<Vec<usize>> {
+    let mut fids = Vec::new();
+    for part in group.split(',') {
+        let name = part.trim().trim_matches('"');
+        let col_name = if let Ok(ord) = name.parse::<usize>() {
+            if ord == 0 || ord > items.len() {
+                return None;
+            }
+            match &items[ord - 1] {
+                SelItem::Col(c) => c.as_str(),
+                SelItem::Agg(..) => return None,
+            }
+        } else {
+            if !ident_ok(name) {
+                return None;
+            }
+            name
+        };
+        let rc = columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(col_name))?;
+        fids.push(rc.field_id as usize);
+    }
+    if fids.is_empty() {
+        None
+    } else {
+        Some(fids)
     }
 }
 
@@ -644,12 +855,89 @@ fn order_cmp(a: &[Value], b: &[Value], keys: &[(usize, bool)]) -> std::cmp::Orde
     Equal
 }
 
+/// Compute the grouped output rows: filter, bucket by the key fields
+/// (sorting the filtered rows by them - NULLs compare equal, so they form
+/// one group), then compute each output item per bucket. With no keys the
+/// whole input is ONE group, emitted even when empty - SQL's global
+/// aggregate shape (COUNT = 0, MIN/MAX/SUM = NULL over no rows).
+fn group_output(
+    db: &Database,
+    rel: u16,
+    formats: &[(u8, Vec<Descriptor>)],
+    gitems: &[GItem],
+    key_fids: &[usize],
+    filter: &Option<Predicate>,
+) -> Vec<Vec<Value>> {
+    let mut input: Vec<Vec<Value>> = Vec::new();
+    for_each_record(db, rel, formats, |v| {
+        if filter.as_ref().map_or(true, |p| p.matches(v)) {
+            input.push(v.to_vec());
+        }
+    });
+    if key_fids.is_empty() {
+        return vec![compute_group(&input, gitems)];
+    }
+    let keys: Vec<(usize, bool)> = key_fids.iter().map(|&f| (f, false)).collect();
+    input.sort_by(|a, b| order_cmp(a, b, &keys));
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < input.len() {
+        let mut j = i + 1;
+        while j < input.len() && order_cmp(&input[i], &input[j], &keys) == std::cmp::Ordering::Equal
+        {
+            j += 1;
+        }
+        out.push(compute_group(&input[i..j], gitems));
+        i = j;
+    }
+    out
+}
+
+/// One output row for one group of input rows. Key items take the value
+/// from the first row (all rows in the group share it); COUNT(*) counts
+/// rows, COUNT(col) non-null values; MIN/MAX/SUM fold the non-null
+/// integers, NULL if there are none.
+fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Vec<Value> {
+    gitems
+        .iter()
+        .map(|gi| match gi {
+            GItem::Key(fid) => rows
+                .first()
+                .and_then(|r| r.get(*fid))
+                .cloned()
+                .unwrap_or(Value::Null),
+            GItem::Agg(AggFn::Count, None) => Value::Int(rows.len() as i64),
+            GItem::Agg(AggFn::Count, Some(fid)) => Value::Int(
+                rows.iter()
+                    .filter(|r| matches!(r.get(*fid), Some(v) if !matches!(v, Value::Null)))
+                    .count() as i64,
+            ),
+            GItem::Agg(func, Some(fid)) => {
+                let mut acc: Option<i64> = None;
+                for r in rows {
+                    let Some(Value::Int(i)) = r.get(*fid) else { continue };
+                    acc = Some(match (func, acc) {
+                        (_, None) => *i,
+                        (AggFn::Min, Some(a)) => a.min(*i),
+                        (AggFn::Max, Some(a)) => a.max(*i),
+                        (AggFn::Sum, Some(a)) => a + *i,
+                        (AggFn::Count, _) => unreachable!(),
+                    });
+                }
+                acc.map_or(Value::Null, Value::Int)
+            }
+            GItem::Agg(_, None) => Value::Null, // MIN/MAX/SUM(*): rejected at plan
+        })
+        .collect()
+}
+
 /// The describe buffer for a plan: one BIGINT for `Scalar`, the projected
-/// columns for `Project`.
+/// columns for `Project`, the output columns for `Group`.
 fn describe_for(plan: &Plan) -> Vec<u8> {
     match plan {
         Plan::Scalar(_) => describe_one_bigint(),
         Plan::Project { cols, .. } => build_describe(cols),
+        Plan::Group { cols, .. } => build_describe(cols),
     }
 }
 
@@ -702,6 +990,28 @@ fn emit_rows(w: &mut W, plan: &Plan, db: &Option<Database>) {
                         w.int(OP_FETCH_RESPONSE).int(0).int(1);
                         encode_row(w, cols, values);
                     }
+                }
+            }
+        }
+        Plan::Group {
+            rel,
+            formats,
+            cols,
+            gitems,
+            key_fids,
+            filter,
+            order_by,
+        } => {
+            if let Some(db) = db {
+                let mut rows = group_output(db, *rel, formats, gitems, key_fids, filter);
+                if !order_by.is_empty() {
+                    // order_by keys are output indexes; output rows are
+                    // aligned with gitems/cols, so order_cmp applies as-is
+                    rows.sort_by(|a, b| order_cmp(a, b, order_by));
+                }
+                for values in &rows {
+                    w.int(OP_FETCH_RESPONSE).int(0).int(1);
+                    encode_row(w, cols, values);
                 }
             }
         }
@@ -781,10 +1091,16 @@ fn find_word(up: &str, word: &str, from: usize) -> Option<usize> {
     None
 }
 
-/// The projection part of a SELECT: a column list or a scalar aggregate.
-enum Proj {
-    Cols(Vec<String>),
+/// One item of a select list: a bare column or an aggregate.
+enum SelItem {
+    Col(String),
     Agg(AggFn, AggTarget),
+}
+
+/// The projection part of a SELECT: `*`, or a list of columns/aggregates.
+enum Proj {
+    Star,
+    Items(Vec<SelItem>),
 }
 
 /// Replace the contents of single-quoted string literals (and the quotes)
@@ -807,16 +1123,17 @@ fn mask_literals(up: &str) -> String {
     String::from_utf8_lossy(&b).into_owned()
 }
 
-/// Find the last `ORDER BY` in `up` (already uppercase), returning
-/// (index of `ORDER`, index where the sort column list begins). The last
-/// occurrence is taken so a string literal `'ORDER BY ...'` earlier in a
-/// WHERE clause does not shadow the real clause.
-fn find_order_by(up: &str) -> Option<(usize, usize)> {
+/// Find the last `<kw> BY` (`kw` = `ORDER` or `GROUP`, already uppercase)
+/// in `up`, returning (index of the keyword, index where the column list
+/// begins). The last occurrence is taken so a string literal containing
+/// the phrase earlier in a WHERE clause does not shadow the real clause
+/// (the caller additionally masks literals out).
+fn find_kw_by(up: &str, kw: &str) -> Option<(usize, usize)> {
     let mut result = None;
     let mut from = 0;
-    while let Some(p) = find_word(up, "ORDER", from) {
-        from = p + "ORDER".len();
-        let tail = &up[p + "ORDER".len()..];
+    while let Some(p) = find_word(up, kw, from) {
+        from = p + kw.len();
+        let tail = &up[p + kw.len()..];
         let ws = tail.len() - tail.trim_start().len();
         let t = tail.as_bytes();
         // the next whole word must be BY
@@ -825,17 +1142,19 @@ fn find_order_by(up: &str) -> Option<(usize, usize)> {
             && t[ws + 1] == b'Y'
             && (t.len() == ws + 2 || !is_ident_byte(t[ws + 2]))
         {
-            result = Some((p, p + "ORDER".len() + ws + 2));
+            result = Some((p, p + kw.len() + ws + 2));
         }
     }
     result
 }
 
-/// Split `SELECT <proj> FROM <table> [WHERE <pred>] [ORDER BY <cols>]` into
-/// its parts, case-insensitively but preserving the original case (WHERE
-/// literals are case-sensitive). ASCII uppercasing keeps byte positions,
-/// so keyword offsets found in the uppercased copy slice the original.
-fn split_query(sql: &str) -> Option<(&str, &str, Option<&str>, Option<&str>)> {
+/// Split `SELECT <proj> FROM <table> [WHERE <pred>] [GROUP BY <cols>]
+/// [ORDER BY <cols>]` into its parts, case-insensitively but preserving
+/// the original case (WHERE literals are case-sensitive). ASCII
+/// uppercasing keeps byte positions, so keyword offsets found in the
+/// uppercased copy slice the original.
+#[allow(clippy::type_complexity)]
+fn split_query(sql: &str) -> Option<(&str, &str, Option<&str>, Option<&str>, Option<&str>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
     if find_word(&up, "SELECT", 0) != Some(0) {
@@ -845,16 +1164,18 @@ fn split_query(sql: &str) -> Option<(&str, &str, Option<&str>, Option<&str>)> {
     let proj = s["SELECT".len()..from].trim();
     let after = from + "FROM".len();
     let rest = &s[after..];
-    // search on a copy with string literals masked out, so a WHERE/ORDER
-    // keyword inside a literal does not match; slice the original.
+    // search on a copy with string literals masked out, so a WHERE/GROUP/
+    // ORDER keyword inside a literal does not match; slice the original.
     let masked = mask_literals(&up[after..]);
 
     let where_pos = find_word(&masked, "WHERE", 0);
-    let order = find_order_by(&masked);
+    let group = find_kw_by(&masked, "GROUP");
+    let order = find_kw_by(&masked, "ORDER");
+    let group_kw = group.map(|(k, _)| k);
     let order_kw = order.map(|(k, _)| k);
 
-    // the table name ends at the first of WHERE / ORDER BY (or the end)
-    let table_end = [where_pos, order_kw]
+    // the table name ends at the first of WHERE / GROUP BY / ORDER BY
+    let table_end = [where_pos, group_kw, order_kw]
         .into_iter()
         .flatten()
         .min()
@@ -862,18 +1183,27 @@ fn split_query(sql: &str) -> Option<(&str, &str, Option<&str>, Option<&str>)> {
     let table = rest[..table_end].trim();
 
     let where_str = where_pos.map(|wp| {
-        let end = order_kw.filter(|&o| o > wp).unwrap_or(rest.len());
+        let end = [group_kw, order_kw]
+            .into_iter()
+            .flatten()
+            .filter(|&o| o > wp)
+            .min()
+            .unwrap_or(rest.len());
         rest[wp + "WHERE".len()..end].trim()
     });
+    let group_str = group.map(|(_, cols)| {
+        let end = order_kw.filter(|&o| o > cols).unwrap_or(rest.len());
+        rest[cols..end].trim()
+    });
     let order_str = order.map(|(_, cols)| rest[cols..].trim());
-    Some((proj, table, where_str, order_str))
+    Some((proj, table, where_str, group_str, order_str))
 }
 
-/// Parse the projection: an aggregate `COUNT(*)`/`COUNT(col)`/`MIN|MAX|SUM
-/// (col)` (spacing-tolerant), `*`, or a comma-separated list of bare
-/// identifiers.
-fn parse_projection(proj: &str) -> Option<Proj> {
-    let compact: String = proj.chars().filter(|c| !c.is_whitespace()).collect();
+/// Parse one select-list item as an aggregate: `COUNT(*)`, `COUNT(col)`,
+/// `MIN|MAX|SUM(col)` (spacing-tolerant). None if it is not an aggregate
+/// or is malformed (`MIN(*)`).
+fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
+    let compact: String = item.chars().filter(|c| !c.is_whitespace()).collect();
     let cu = compact.to_ascii_uppercase();
     for (kw, func) in [
         ("COUNT(", AggFn::Count),
@@ -884,6 +1214,10 @@ fn parse_projection(proj: &str) -> Option<Proj> {
         if cu.starts_with(kw) && cu.ends_with(')') {
             let arg = &compact[kw.len()..compact.len() - 1]; // original case
             let target = if arg == "*" {
+                // only COUNT accepts *
+                if !matches!(func, AggFn::Count) {
+                    return None;
+                }
                 AggTarget::Star
             } else {
                 let name = arg.trim_matches('"');
@@ -892,34 +1226,49 @@ fn parse_projection(proj: &str) -> Option<Proj> {
                 }
                 AggTarget::Col(name.to_string())
             };
-            // only COUNT accepts *
-            if matches!(target, AggTarget::Star) && !matches!(func, AggFn::Count) {
-                return None;
-            }
-            return Some(Proj::Agg(func, target));
+            return Some((func, target));
         }
     }
-    if proj.trim() == "*" {
-        return Some(Proj::Cols(vec!["*".to_string()]));
-    }
-    let cols: Vec<String> = proj
-        .split(',')
-        .map(|c| c.trim().trim_matches('"').to_string())
-        .collect();
-    if cols.iter().any(|c| !ident_ok(c)) {
-        return None;
-    }
-    Some(Proj::Cols(cols))
+    None
 }
 
-/// Parse `ORDER BY` into a list of (field id, descending) keys. Each item
-/// is a column name or a 1-based projection ordinal, with optional
-/// ASC/DESC. Returns None on an unknown column, bad ordinal, or malformed
-/// item.
+/// Parse the projection: `*`, or a comma-separated list where each item
+/// is a bare identifier or an aggregate. (Aggregate arguments contain no
+/// commas, so splitting the list on commas is safe.)
+fn parse_projection(proj: &str) -> Option<Proj> {
+    if proj.trim() == "*" {
+        return Some(Proj::Star);
+    }
+    let mut items = Vec::new();
+    for part in proj.split(',') {
+        let part = part.trim();
+        if let Some((func, target)) = parse_agg_item(part) {
+            items.push(SelItem::Agg(func, target));
+        } else {
+            let name = part.trim_matches('"');
+            if !ident_ok(name) {
+                return None;
+            }
+            items.push(SelItem::Col(name.to_string()));
+        }
+    }
+    if items.is_empty() {
+        return None;
+    }
+    Some(Proj::Items(items))
+}
+
+/// Parse `ORDER BY` into a list of (sort key, descending) pairs. Each
+/// item is a column name or a 1-based projection ordinal, with optional
+/// ASC/DESC. Ordinals index `cols` (the projection) and take its
+/// `field_id`; names go through `resolve_name` - the relation's columns
+/// for a plain projection (record field ids), the output columns for a
+/// grouped one (output indexes). Returns None on an unknown column, bad
+/// ordinal, or malformed item.
 fn parse_order_by(
     order: &str,
     cols: &[ProjCol],
-    columns: &[RelationColumn],
+    resolve_name: impl Fn(&str) -> Option<usize>,
 ) -> Option<Vec<(usize, bool)>> {
     let mut keys = Vec::new();
     for part in order.split(',') {
@@ -941,10 +1290,7 @@ fn parse_order_by(
             }
             cols[ord - 1].field_id
         } else {
-            columns
-                .iter()
-                .find(|c| c.name.eq_ignore_ascii_case(name))?
-                .field_id as usize
+            resolve_name(name)?
         };
         keys.push((fid, desc));
     }
@@ -1524,30 +1870,65 @@ mod tests {
 
     fn proj_cols(p: &Proj) -> Vec<String> {
         match p {
-            Proj::Cols(c) => c.clone(),
-            Proj::Agg(..) => vec!["<agg>".into()],
+            Proj::Star => vec!["*".into()],
+            Proj::Items(items) => items
+                .iter()
+                .map(|i| match i {
+                    SelItem::Col(c) => c.clone(),
+                    SelItem::Agg(..) => "<agg>".into(),
+                })
+                .collect(),
         }
     }
 
     #[test]
     fn splits_select_from_where_order() {
         // COUNT
-        let (p, t, w, o) = split_query("SELECT COUNT(*) FROM RDB$RELATIONS").unwrap();
-        assert!(matches!(parse_projection(p), Some(Proj::Agg(AggFn::Count, AggTarget::Star))));
+        let (p, t, w, g, o) = split_query("SELECT COUNT(*) FROM RDB$RELATIONS").unwrap();
+        assert!(matches!(
+            parse_projection(p),
+            Some(Proj::Items(items))
+                if matches!(items.as_slice(), [SelItem::Agg(AggFn::Count, AggTarget::Star)])
+        ));
         assert_eq!(t, "RDB$RELATIONS");
-        assert!(w.is_none() && o.is_none());
+        assert!(w.is_none() && g.is_none() && o.is_none());
         // projection + WHERE + ORDER BY, mixed case; literal case preserved
-        let (p, t, w, o) =
+        let (p, t, w, g, o) =
             split_query("select ID, NAME from Emp where NAME = 'Emp 5' order by ID desc;").unwrap();
         assert_eq!(proj_cols(&parse_projection(p).unwrap()), vec!["ID", "NAME"]);
         assert_eq!(t, "Emp");
         assert_eq!(w, Some("NAME = 'Emp 5'"));
+        assert!(g.is_none());
         assert_eq!(o, Some("ID desc"));
         // ORDER BY without WHERE
-        let (_, t, w, o) = split_query("SELECT * FROM DEPT ORDER BY 1").unwrap();
+        let (_, t, w, g, o) = split_query("SELECT * FROM DEPT ORDER BY 1").unwrap();
         assert_eq!(t, "DEPT");
-        assert!(w.is_none());
+        assert!(w.is_none() && g.is_none());
         assert_eq!(o, Some("1"));
+    }
+
+    #[test]
+    fn splits_group_by() {
+        // WHERE + GROUP BY + ORDER BY, mixed case
+        let (p, t, w, g, o) = split_query(
+            "select DEPT_ID, count(*) from EMP where ID <= 30 group by DEPT_ID order by 1",
+        )
+        .unwrap();
+        assert_eq!(proj_cols(&parse_projection(p).unwrap()), vec!["DEPT_ID", "<agg>"]);
+        assert_eq!(t, "EMP");
+        assert_eq!(w, Some("ID <= 30"));
+        assert_eq!(g, Some("DEPT_ID"));
+        assert_eq!(o, Some("1"));
+        // GROUP BY alone ends at the statement end
+        let (_, t, w, g, o) = split_query("SELECT A, SUM(B) FROM T GROUP BY A").unwrap();
+        assert_eq!(t, "T");
+        assert!(w.is_none() && o.is_none());
+        assert_eq!(g, Some("A"));
+        // 'GROUP BY' inside a WHERE literal must not start the clause
+        let (_, t, w, g, _) = split_query("SELECT ID FROM T WHERE NAME = 'GROUP BY X'").unwrap();
+        assert_eq!(t, "T");
+        assert_eq!(w, Some("NAME = 'GROUP BY X'"));
+        assert!(g.is_none());
     }
 
     #[test]
@@ -1557,7 +1938,7 @@ mod tests {
         // no FROM at all
         assert!(split_query("SELECT 1").is_none());
         // 'ORDER' inside a WHERE string literal must not start an ORDER BY
-        let (_, t, w, o) = split_query("SELECT ID FROM T WHERE NAME = 'ORDER BY X'").unwrap();
+        let (_, t, w, _, o) = split_query("SELECT ID FROM T WHERE NAME = 'ORDER BY X'").unwrap();
         assert_eq!(t, "T");
         assert_eq!(w, Some("NAME = 'ORDER BY X'"));
         assert!(o.is_none());
@@ -1565,10 +1946,16 @@ mod tests {
 
     #[test]
     fn parses_aggregates_and_ordinals() {
-        assert!(matches!(parse_projection("MIN(SALARY)"), Some(Proj::Agg(AggFn::Min, AggTarget::Col(c))) if c == "SALARY"));
-        assert!(matches!(parse_projection("sum( id )"), Some(Proj::Agg(AggFn::Sum, AggTarget::Col(c))) if c == "id"));
-        assert!(matches!(parse_projection("COUNT(*)"), Some(Proj::Agg(AggFn::Count, AggTarget::Star))));
-        assert!(parse_projection("MIN(*)").is_none()); // MIN(*) invalid
+        assert!(matches!(parse_agg_item("MIN(SALARY)"), Some((AggFn::Min, AggTarget::Col(c))) if c == "SALARY"));
+        assert!(matches!(parse_agg_item("sum( id )"), Some((AggFn::Sum, AggTarget::Col(c))) if c == "id"));
+        assert!(matches!(parse_agg_item("COUNT(*)"), Some((AggFn::Count, AggTarget::Star))));
+        assert!(parse_agg_item("MIN(*)").is_none()); // MIN(*) invalid
+        assert!(parse_projection("MIN(*)").is_none()); // ...and not an identifier either
+        // a mixed select list parses item by item
+        assert_eq!(
+            proj_cols(&parse_projection("DEPT_ID, COUNT(*), MIN(SALARY)").unwrap()),
+            vec!["DEPT_ID", "<agg>", "<agg>"]
+        );
         // ORDER BY resolution: ordinal into the projection, and by name
         let cols = vec![
             ProjCol { name: "ID".into(), field_id: 3, wire: Wire::Int64, sql_type: 580, length: 8 },
@@ -1578,9 +1965,66 @@ mod tests {
             RelationColumn { name: "ID".into(), field_id: 3, position: 0 },
             RelationColumn { name: "NAME".into(), field_id: 1, position: 1 },
         ];
-        assert_eq!(parse_order_by("2 DESC, ID", &cols, &columns), Some(vec![(1, true), (3, false)]));
-        assert!(parse_order_by("3", &cols, &columns).is_none()); // ordinal out of range
-        assert!(parse_order_by("BOGUS", &cols, &columns).is_none()); // unknown column
+        let by_col = |n: &str| {
+            columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(n))
+                .map(|c| c.field_id as usize)
+        };
+        assert_eq!(parse_order_by("2 DESC, ID", &cols, by_col), Some(vec![(1, true), (3, false)]));
+        assert!(parse_order_by("3", &cols, by_col).is_none()); // ordinal out of range
+        assert!(parse_order_by("BOGUS", &cols, by_col).is_none()); // unknown column
+    }
+
+    #[test]
+    fn group_by_list_resolves_names_and_ordinals() {
+        let items = vec![
+            SelItem::Col("DEPT_ID".into()),
+            SelItem::Agg(AggFn::Count, AggTarget::Star),
+        ];
+        let columns = vec![
+            RelationColumn { name: "ID".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "DEPT_ID".into(), field_id: 2, position: 1 },
+        ];
+        assert_eq!(parse_group_by("DEPT_ID", &items, &columns), Some(vec![2]));
+        assert_eq!(parse_group_by("1", &items, &columns), Some(vec![2])); // ordinal = the Col item
+        assert!(parse_group_by("2", &items, &columns).is_none()); // ordinal names an aggregate
+        assert!(parse_group_by("BOGUS", &items, &columns).is_none()); // unknown column
+        assert!(parse_group_by("", &items, &columns).is_none()); // empty list
+    }
+
+    #[test]
+    fn computes_group_aggregates() {
+        // rows: (key at fid 0, value at fid 1)
+        let rows = vec![
+            vec![Value::Int(1), Value::Int(10)],
+            vec![Value::Int(1), Value::Null],
+            vec![Value::Int(1), Value::Int(4)],
+        ];
+        let gitems = vec![
+            GItem::Key(0),
+            GItem::Agg(AggFn::Count, None),
+            GItem::Agg(AggFn::Count, Some(1)),
+            GItem::Agg(AggFn::Min, Some(1)),
+            GItem::Agg(AggFn::Max, Some(1)),
+            GItem::Agg(AggFn::Sum, Some(1)),
+        ];
+        assert_eq!(
+            compute_group(&rows, &gitems),
+            vec![
+                Value::Int(1),
+                Value::Int(3),  // COUNT(*) counts the NULL row
+                Value::Int(2),  // COUNT(col) does not
+                Value::Int(4),
+                Value::Int(10),
+                Value::Int(14),
+            ]
+        );
+        // the global empty group: COUNT = 0, MIN/MAX/SUM = NULL
+        assert_eq!(
+            compute_group(&[], &gitems[1..]),
+            vec![Value::Int(0), Value::Int(0), Value::Null, Value::Null, Value::Null]
+        );
     }
 
     #[test]

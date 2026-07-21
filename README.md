@@ -48,6 +48,7 @@ the converter what the C++ is *doing* before they read a line of it.
 | Real column projections: `SELECT <cols>` / `SELECT *` from pages | `fire-crab-wire::server` + `fire-crab-ods::catalog` | **the server returns real typed rows** - columns resolved through `RDB$RELATION_FIELDS` (by field id, which reorders vs column position on mixed-width tables), records decoded with the format they name, integers sent as BIGINT and the rest as VARCHAR; node-firebird's result set matches isql value-for-value on user tables, including NULLs and `SELECT *` |
 | WHERE-clause filtering: `SELECT ... WHERE <pred>` from pages | `fire-crab-wire::server` | **the server filters rows** - comparisons (`= <> < <= > >=`) on integer and text columns, combined with `AND`/`OR`, plus `IS [NOT] NULL`; evaluated per decoded record, honouring three-valued logic; `SELECT`, `SELECT *` and `COUNT(*)` all take a WHERE, matching isql |
 | ORDER BY and aggregates | `fire-crab-wire::server` | **the server sorts and aggregates** - `ORDER BY` on columns or ordinals, ASC/DESC, multi-key, NULLs ordered as the engine does (first ascending); `MIN`/`MAX`/`SUM` over integer columns and `COUNT(col)`/`COUNT(*)`, all composable with WHERE; matches isql value-for-value including NULL results |
+| GROUP BY | `fire-crab-wire::server` | **the server groups** - `SELECT <keys and aggregates> ... GROUP BY <cols\|ordinals>`, and multi-aggregate projections with no GROUP BY (one global group, one row even over an empty set); NULL keys bucket together, aggregates computed per group, composable with WHERE and ORDER BY (which sorts the *output*, by name or ordinal); matches isql value-for-value |
 | Everything else | — | see [docs/subsystem-map.md](docs/subsystem-map.md) |
 
 **On the firebird-qa milestone, precisely.** firebird-qa drives a *server*,
@@ -96,6 +97,14 @@ a constant:
   `COUNT(col)`/`COUNT(*)` return a single value (NULL when the set is empty),
   composable with WHERE - matching isql, including that `SUM`/`MIN`/`MAX`
   ignore NULLs and `COUNT(col)` counts only non-NULLs.
+- **GROUP BY** buckets the filtered rows by the key columns (named or by
+  select-list ordinal) and computes each aggregate per bucket; NULL keys form
+  one group, as SQL requires. Every bare select-list column must be a group
+  key (anything else falls back rather than answering wrong). A projection of
+  several aggregates with *no* GROUP BY is one global group - exactly one
+  output row, even over an empty set (`COUNT` 0, the rest NULL). ORDER BY on
+  a grouped query sorts the output rows, by output column name or ordinal
+  (so `ORDER BY 2 DESC` on a `COUNT(*)` column works).
 
 The subtlety that had to be right: on a table mixing column widths the engine
 lays fields out physically by alignment, so `RDB$FIELD_ID` (the record-format
@@ -103,11 +112,12 @@ index) diverges from `RDB$FIELD_POSITION` (the declared order); projecting by
 position instead of field id silently returns the wrong column, which a
 uniform-width table never reveals.
 
-Projections, WHERE, ORDER BY and aggregates currently cover user tables (system
-relations' formats are not in `RDB$FORMATS`, so they answer COUNT but not
-projections) and the exact-integer / text column types the decoder renders and
-compares identically to the engine; other shapes fall back to the fixed value.
-Widening further (joins, the remaining column types, `GROUP BY`, DML,
+Projections, WHERE, GROUP BY, ORDER BY and aggregates currently cover user
+tables (system relations' formats are not in `RDB$FORMATS`, so they answer
+COUNT but not projections) and the exact-integer / text column types the
+decoder renders and compares identically to the engine; other shapes fall back
+to the fixed value.
+Widening further (joins, the remaining column types, `HAVING`, DML,
 system-table projections) is the work that continues - but the fixed answer is
 no longer fixed, and the protocol server it runs on is proven against a genuine
 client.
