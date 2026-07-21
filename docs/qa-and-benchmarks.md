@@ -354,21 +354,57 @@ identically to the engine - the same exclusions `qa/diff-rows.sh` makes.
 Anything else falls back to the fixed constant. `fcstat columns <db> <table>`
 exposes the name → field-id map for the file side.
 
+### The thirteenth differential — the server filters rows with WHERE
+
+`qa/serve-real-where.sh` adds predicate filtering. fire-crab, as a server,
+answers `SELECT <cols>/COUNT(*) FROM <table> WHERE <predicate>` by walking the
+relation's records, decoding each, and evaluating the predicate: comparisons
+(`= <> < <= > >=`) on integer and text columns, combined with `AND`/`OR`, plus
+`IS [NOT] NULL`. Only matching rows are returned (or counted). node-firebird
+drives it and every result set matches isql - across value tests, ranges, `<>`,
+`OR`, AND/OR precedence, text comparison, a lowercase-keyword query, and
+`COUNT(*) ... WHERE`; on a nullable table, `IS NULL`/`IS NOT NULL` and a
+comparison that must exclude NULLs.
+
+Three things this converts correctly:
+
+- **Three-valued logic.** A comparison against NULL is UNKNOWN, not false-or-
+  true - the row is excluded, and only `IS NULL` catches it. `A > 1` on a
+  column with NULLs returns exactly the non-null rows that exceed 1, matching
+  the engine.
+- **AND binds tighter than OR.** With no parentheses, `a AND b OR c` is
+  `(a AND b) OR c`; the predicate is parsed straight into that disjunctive
+  normal form (OR of AND-groups), which is all the precedence there is to get
+  right without grouping.
+- **String literals are case- and space-sensitive; keywords are not.** The
+  parser uppercases a copy to find `FROM`/`WHERE` and the keywords
+  `AND/OR/IS/NOT/NULL`, but slices the original for the literal, so
+  `WHERE NAME = 'emp 42'` keeps its case and its embedded space while
+  `select ... where ...` in any case still parses. Text comparison ignores
+  trailing blanks (CHAR padding), as Firebird does.
+
+A predicate the parser cannot handle (parentheses, functions, a column type it
+does not compare, an unknown column) makes the **whole query fall back to the
+fixed constant** rather than answer it without the filter - returning extra
+rows would be a silent wrong answer, which is worse than answering nothing.
+Scope otherwise matches the projection differential: user tables, exact-integer
+and ASCII/UTF8 text columns.
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
 suite (thousands of tests) drives a **server** through the wire protocol via
 the firebird-driver. The server side proven above is the entry to it: the
 handshake, authentication, encryption and op dispatch a real client needs are
-in place, and real queries - `SELECT COUNT(*)` and column projections
-(`SELECT <cols>` / `SELECT *`) - now dispatch into the converted storage engine
-and return real results, matching isql over the wire. What stands between here
-and running the suite is remaining *breadth* of the SQL engine - predicates,
-joins, the column types still rendered approximately, DML, system-table
-projections. Until that surface is wide enough, fire-crab does **not** claim
-any firebird-qa coverage - but the milestone is no longer distant: the protocol
-server the suite talks to accepts real clients and answers real queries from
-real pages today.
+in place, and real queries - `SELECT COUNT(*)`, column projections
+(`SELECT <cols>` / `SELECT *`) and `WHERE` filtering - now dispatch into the
+converted storage engine and return real results, matching isql over the wire.
+What stands between here and running the suite is remaining *breadth* of the
+SQL engine - joins, `ORDER BY`, aggregates beyond COUNT, the column types still
+rendered approximately, DML, system-table projections. Until that surface is
+wide enough, fire-crab does **not** claim any firebird-qa coverage - but the
+milestone is no longer distant: the protocol server the suite talks to accepts
+real clients and answers real filtered queries from real pages today.
 
 ## Benchmarks
 
@@ -424,6 +460,11 @@ NODE_PATH="$PWD/node_modules" \\
 NODE_PATH="$PWD/node_modules" \\
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
     sh /path/to/fire-crab/qa/serve-real-project.sh /tmp/fbhandson/plans_clean.fdb 3050
+
+# server filters rows with a WHERE clause (comparisons, AND/OR, IS [NOT] NULL), vs isql
+NODE_PATH="$PWD/node_modules" \\
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
+    sh /path/to/fire-crab/qa/serve-real-where.sh /tmp/fbhandson/plans_clean.fdb 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on

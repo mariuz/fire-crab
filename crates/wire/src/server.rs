@@ -260,15 +260,94 @@ struct ProjCol {
 }
 
 /// What a prepared statement resolves to. `Scalar` covers both the fixed
-/// fallback and `SELECT COUNT(*)` (a single BIGINT computed at prepare);
-/// `Project` is `SELECT <cols> FROM <table>` walked at fetch.
+/// fallback and `SELECT COUNT(*)` (a single BIGINT computed at prepare,
+/// honouring any WHERE); `Project` is `SELECT <cols> FROM <table>
+/// [WHERE ...]` walked at fetch, emitting only rows the filter accepts.
 enum Plan {
     Scalar(i64),
     Project {
         rel: u16,
         formats: Vec<(u8, Vec<Descriptor>)>,
         cols: Vec<ProjCol>,
+        filter: Option<Predicate>,
     },
+}
+
+/// A comparison operator in a WHERE term.
+#[derive(Clone, Copy, PartialEq)]
+enum Cmp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// The right-hand literal of a comparison.
+#[derive(Clone)]
+enum Rhs {
+    Int(i64),
+    Str(String),
+}
+
+/// A resolved WHERE term: a column (by field id) tested against a literal
+/// or for NULL-ness.
+enum Term {
+    Cmp(usize, Cmp, Rhs),
+    IsNull(usize),
+    IsNotNull(usize),
+}
+
+/// A resolved WHERE predicate in disjunctive normal form (OR of ANDs),
+/// which is what AND-binds-tighter-than-OR gives with no parentheses. A
+/// row matches if every term of any one group matches.
+struct Predicate(Vec<Vec<Term>>);
+
+impl Predicate {
+    fn matches(&self, values: &[Value]) -> bool {
+        self.0
+            .iter()
+            .any(|group| group.iter().all(|t| t.matches(values)))
+    }
+}
+
+fn ord_ok(o: std::cmp::Ordering, op: Cmp) -> bool {
+    use std::cmp::Ordering::*;
+    match op {
+        Cmp::Eq => o == Equal,
+        Cmp::Ne => o != Equal,
+        Cmp::Lt => o == Less,
+        Cmp::Le => o != Greater,
+        Cmp::Gt => o == Greater,
+        Cmp::Ge => o != Less,
+    }
+}
+
+impl Term {
+    fn matches(&self, values: &[Value]) -> bool {
+        match self {
+            // out-of-range / missing column reads as NULL
+            Term::IsNull(fid) => matches!(values.get(*fid), Some(Value::Null) | None),
+            Term::IsNotNull(fid) => {
+                matches!(values.get(*fid), Some(v) if !matches!(v, Value::Null))
+            }
+            // comparison with NULL, or a type that does not match the
+            // literal, is UNKNOWN - i.e. not true, the row is excluded
+            Term::Cmp(fid, op, Rhs::Int(lit)) => match values.get(*fid) {
+                Some(Value::Int(i)) => ord_ok(i.cmp(lit), *op),
+                _ => false,
+            },
+            Term::Cmp(fid, op, Rhs::Str(lit)) => match values.get(*fid) {
+                // trailing blanks are not significant in Firebird text
+                // comparisons (CHAR padding); trim both sides
+                Some(Value::Text(s)) => {
+                    ord_ok(s.trim_end_matches(' ').cmp(lit.trim_end_matches(' ')), *op)
+                }
+                _ => false,
+            },
+        }
+    }
 }
 
 /// Pick the wire shape, SQL type and length for a column from its stored
@@ -315,44 +394,118 @@ fn build_projcols(
     Some(out)
 }
 
-/// Plan a prepared statement against the loaded database. Two shapes are
-/// answered from real pages - `SELECT COUNT(*) FROM <table>` and
-/// `SELECT <cols> FROM <table>` - both resolving the table through
-/// `RDB$RELATIONS`. Everything else (and any query with no database
-/// behind it) plans to the fixed constant.
+/// Plan a prepared statement against the loaded database. The shapes
+/// answered from real pages are `SELECT COUNT(*) FROM <table> [WHERE ...]`
+/// and `SELECT <cols> FROM <table> [WHERE ...]`, resolving the table
+/// through `RDB$RELATIONS` and columns through `RDB$RELATION_FIELDS`.
+/// A WHERE clause that cannot be parsed or resolved makes the whole query
+/// fall back to the fixed constant rather than answer it without the
+/// filter (returning extra rows would be worse than answering nothing).
 fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
-    if let Some(table) = parse_count_target(sql) {
-        if let Some(db) = db {
-            if let Some(rel) = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, &table) {
-                let n = fire_crab_ods::count_primary_records(&db.bytes, db.page_size, rel);
-                return Plan::Scalar(n as i64);
-            }
-        }
-        return Plan::Scalar(FIXED_ANSWER);
+    let fallback = Plan::Scalar(FIXED_ANSWER);
+    let trace = std::env::var("FC_SRV_TRACE").is_ok();
+    let Some((proj_s, table_s, where_s)) = split_query(sql) else {
+        if trace { eprintln!("[srv] plan: split_query failed for {:?}", sql); }
+        return fallback;
+    };
+    if trace { eprintln!("[srv] plan: proj={:?} table={:?} where={:?}", proj_s, table_s, where_s); }
+    let Some(proj) = parse_projection(proj_s) else {
+        if trace { eprintln!("[srv] plan: parse_projection failed"); }
+        return fallback;
+    };
+    let table = table_s.trim_matches('"');
+    if !ident_ok(table) {
+        return fallback;
     }
-    if let Some((collist, table)) = parse_select_from(sql) {
-        if let Some(db) = db {
-            if let Some(rel) = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, &table) {
-                let columns = relation_columns(&db.bytes, db.page_size, &table);
-                let formats = relation_formats(&db.bytes, db.page_size, rel);
-                let cols = {
-                    let descs = formats
-                        .iter()
-                        .max_by_key(|(n, _)| *n)
-                        .map(|(_, d)| d.as_slice())
-                        .unwrap_or(&[]);
-                    build_projcols(&collist, &columns, descs)
-                };
-                if let Some(cols) = cols {
-                    if !cols.is_empty() {
-                        return Plan::Project { rel, formats, cols };
-                    }
-                }
+    let Some(db) = db else { return fallback };
+    let Some(rel) = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table) else {
+        return fallback;
+    };
+    let columns = relation_columns(&db.bytes, db.page_size, table);
+    let formats = relation_formats(&db.bytes, db.page_size, rel);
+    let descs = formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, d)| d.clone())
+        .unwrap_or_default();
+
+    // parse + resolve the optional WHERE clause
+    let filter = match where_s {
+        None => None,
+        Some(ws) => match tokenize(ws)
+            .and_then(|t| parse_predicate(&t))
+            .and_then(|raw| resolve_predicate(raw, &columns, &descs))
+        {
+            Some(p) => Some(p),
+            None => {
+                if trace { eprintln!("[srv] plan: WHERE parse/resolve failed for {:?}", ws); }
+                return fallback; // unsupported WHERE: do not answer wrong
             }
+        },
+    };
+
+    match proj {
+        Proj::Count => {
+            let n = match &filter {
+                None => fire_crab_ods::count_primary_records(&db.bytes, db.page_size, rel),
+                Some(p) => count_matching(db, rel, &formats, p),
+            };
+            Plan::Scalar(n as i64)
         }
-        return Plan::Scalar(FIXED_ANSWER);
+        Proj::Cols(collist) => match build_projcols(&collist, &columns, &descs) {
+            Some(cols) if !cols.is_empty() => Plan::Project {
+                rel,
+                formats,
+                cols,
+                filter,
+            },
+            _ => fallback,
+        },
     }
-    Plan::Scalar(FIXED_ANSWER)
+}
+
+/// Count the committed primary records that satisfy the predicate, by
+/// decoding each with the format it names and testing it.
+fn count_matching(db: &Database, rel: u16, formats: &[(u8, Vec<Descriptor>)], pred: &Predicate) -> u64 {
+    let mut n = 0u64;
+    for_each_record(db, rel, formats, |values| {
+        if pred.matches(values) {
+            n += 1;
+        }
+    });
+    n
+}
+
+/// Walk a relation's committed primary records, decoding each with the
+/// format it names, and hand the decoded values to `f`.
+fn for_each_record<F: FnMut(&[Value])>(
+    db: &Database,
+    rel: u16,
+    formats: &[(u8, Vec<Descriptor>)],
+    mut f: F,
+) {
+    for dp_no in relation_data_pages(&db.bytes, db.page_size, rel) {
+        let start = dp_no as usize * db.page_size;
+        let Some(dp) = db
+            .bytes
+            .get(start..start + db.page_size)
+            .and_then(DataPage::decode)
+        else {
+            continue;
+        };
+        for r in dp.records() {
+            if !r.is_primary_record() {
+                continue;
+            }
+            let Some(image) = r.image() else { continue };
+            let descs = formats
+                .iter()
+                .find(|(n, _)| *n == r.format)
+                .or_else(|| formats.iter().max_by_key(|(n, _)| *n));
+            let Some((_, descs)) = descs else { continue };
+            f(&decode_record(&image, descs));
+        }
+    }
 }
 
 /// The describe buffer for a plan: one BIGINT for `Scalar`, the projected
@@ -380,32 +533,15 @@ fn emit_rows(w: &mut W, plan: &Plan, db: &Option<Database>) {
             rel,
             formats,
             cols,
+            filter,
         } => {
             if let Some(db) = db {
-                for dp_no in relation_data_pages(&db.bytes, db.page_size, *rel) {
-                    let start = dp_no as usize * db.page_size;
-                    let Some(dp) = db
-                        .bytes
-                        .get(start..start + db.page_size)
-                        .and_then(DataPage::decode)
-                    else {
-                        continue;
-                    };
-                    for r in dp.records() {
-                        if !r.is_primary_record() {
-                            continue;
-                        }
-                        let Some(image) = r.image() else { continue };
-                        let descs = formats
-                            .iter()
-                            .find(|(n, _)| *n == r.format)
-                            .or_else(|| formats.iter().max_by_key(|(n, _)| *n));
-                        let Some((_, descs)) = descs else { continue };
-                        let values = decode_record(&image, descs);
+                for_each_record(db, *rel, formats, |values| {
+                    if filter.as_ref().map_or(true, |p| p.matches(values)) {
                         w.int(OP_FETCH_RESPONSE).int(0).int(1);
-                        encode_row(w, cols, &values);
+                        encode_row(w, cols, values);
                     }
-                }
+                });
             }
         }
     }
@@ -457,71 +593,314 @@ fn encode_row(w: &mut W, cols: &[ProjCol], values: &[Value]) {
     }
 }
 
-/// Recognise `SELECT <col-list> FROM <table>` where the column list is
-/// `*` or a comma-separated list of bare identifiers and nothing follows
-/// the table name (no WHERE/JOIN/ORDER/GROUP - honouring those would mean
-/// returning different rows, so an unrecognised shape is rejected rather
-/// than silently answered wrong). Returns (columns, table).
-fn parse_select_from(sql: &str) -> Option<(Vec<String>, String)> {
-    let upper = sql.to_ascii_uppercase();
-    let compact = upper.split_whitespace().collect::<Vec<_>>().join(" ");
-    let compact = compact.trim().trim_end_matches(';').trim();
-    let rest = compact.strip_prefix("SELECT ")?;
-    let (collist_s, after) = rest.split_once(" FROM ")?;
-    // table is the sole token after FROM; anything else is an unsupported clause
-    let after = after.trim();
-    let mut it = after.splitn(2, ' ');
-    let table = it.next()?.trim_matches('"');
-    if it.next().map_or(false, |m| !m.trim().is_empty()) {
-        return None;
-    }
-    if table.is_empty() {
-        return None;
-    }
-    let cols: Vec<String> = if collist_s.trim() == "*" {
-        vec!["*".to_string()]
-    } else {
-        collist_s
-            .split(',')
-            .map(|c| c.trim().trim_matches('"').to_string())
-            .collect()
-    };
-    // only bare identifiers (letters/digits/_/$) - reject expressions,
-    // functions, qualified names, empty entries
-    let ident_ok = |s: &str| {
-        !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
-    };
-    if cols.iter().any(|c| c != "*" && !ident_ok(c)) {
-        return None;
-    }
-    Some((cols, table.to_string()))
+/// A bare SQL identifier: letters, digits, `_`, `$`, non-empty.
+fn ident_ok(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
-/// Recognise `SELECT COUNT(*) FROM <table>`, tolerant of case and of
-/// spacing inside `COUNT(*)`, and return the table name. None for every
-/// other statement - deliberately narrow: this milestone converts one
-/// real query path, it does not pretend to be a SQL parser.
-fn parse_count_target(sql: &str) -> Option<String> {
-    let upper = sql.to_ascii_uppercase();
-    let compact = upper.split_whitespace().collect::<Vec<_>>().join(" ");
-    let compact = compact
-        .replace("COUNT ( * )", "COUNT(*)")
-        .replace("COUNT( * )", "COUNT(*)")
-        .replace("COUNT (*)", "COUNT(*)")
-        .replace("COUNT(* )", "COUNT(*)")
-        .replace("COUNT( *)", "COUNT(*)");
-    let rest = compact.strip_prefix("SELECT COUNT(*) FROM ")?;
-    let name = rest
-        .trim()
-        .split([' ', ';'])
-        .next()
-        .unwrap_or("")
-        .trim_matches('"');
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
+fn is_ident_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
+}
+
+/// Find `word` (already uppercase) occurring as a whole word (identifier
+/// boundaries on both sides) in `up`, at or after byte `from`.
+fn find_word(up: &str, word: &str, from: usize) -> Option<usize> {
+    let b = up.as_bytes();
+    let mut i = from;
+    while let Some(p) = up[i..].find(word) {
+        let idx = i + p;
+        let before = idx == 0 || !is_ident_byte(b[idx - 1]);
+        let after = idx + word.len();
+        let after_ok = after >= b.len() || !is_ident_byte(b[after]);
+        if before && after_ok {
+            return Some(idx);
+        }
+        i = idx + 1;
     }
+    None
+}
+
+/// The projection part of a SELECT.
+enum Proj {
+    Count,
+    Cols(Vec<String>),
+}
+
+/// Split `SELECT <proj> FROM <table> [WHERE <pred>]` into its three parts,
+/// case-insensitively but preserving the original case (WHERE literals are
+/// case-sensitive). ASCII uppercasing keeps byte positions, so keyword
+/// offsets found in the uppercased copy slice the original correctly.
+fn split_query(sql: &str) -> Option<(&str, &str, Option<&str>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    if find_word(&up, "SELECT", 0) != Some(0) {
+        return None;
+    }
+    let from = find_word(&up, "FROM", "SELECT".len())?;
+    // the first token is SELECT (checked above); take what is between it
+    // and FROM, sliced by length so the original case is preserved
+    let proj = s["SELECT".len()..from].trim();
+    let after = from + "FROM".len();
+    let rest = &s[after..];
+    match find_word(&up[after..], "WHERE", 0) {
+        Some(wp) => Some((proj, rest[..wp].trim(), Some(rest[wp + "WHERE".len()..].trim()))),
+        None => Some((proj, rest.trim(), None)),
+    }
+}
+
+/// Parse the projection: `COUNT(*)` (spacing-tolerant), `*`, or a
+/// comma-separated list of bare identifiers.
+fn parse_projection(proj: &str) -> Option<Proj> {
+    let compact: String = proj
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    if compact == "COUNT(*)" {
+        return Some(Proj::Count);
+    }
+    if proj.trim() == "*" {
+        return Some(Proj::Cols(vec!["*".to_string()]));
+    }
+    let cols: Vec<String> = proj
+        .split(',')
+        .map(|c| c.trim().trim_matches('"').to_string())
+        .collect();
+    if cols.iter().any(|c| !ident_ok(c)) {
+        return None;
+    }
+    Some(Proj::Cols(cols))
+}
+
+/// A WHERE token.
+enum Tok {
+    Ident(String),
+    Int(i64),
+    Str(String),
+    Cmp(Cmp),
+    And,
+    Or,
+    Is,
+    Not,
+    Null,
+}
+
+/// Tokenise a WHERE clause. Single-quoted strings ('' escapes a quote),
+/// integer literals (optionally negative), comparison operators
+/// (= <> != < <= > >=), identifiers and the keywords AND/OR/IS/NOT/NULL.
+/// Anything else (parentheses, functions, other operators) returns None,
+/// so an unsupported predicate falls back rather than answering wrong.
+fn tokenize(s: &str) -> Option<Vec<Tok>> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut out = Vec::new();
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => {
+                i += 1;
+                let mut val = Vec::new();
+                loop {
+                    if i >= b.len() {
+                        return None; // unterminated string
+                    }
+                    if b[i] == b'\'' {
+                        if i + 1 < b.len() && b[i + 1] == b'\'' {
+                            val.push(b'\'');
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    val.push(b[i]);
+                    i += 1;
+                }
+                out.push(Tok::Str(String::from_utf8_lossy(&val).into_owned()));
+            }
+            b'=' => {
+                out.push(Tok::Cmp(Cmp::Eq));
+                i += 1;
+            }
+            b'<' => {
+                if b.get(i + 1) == Some(&b'=') {
+                    out.push(Tok::Cmp(Cmp::Le));
+                    i += 2;
+                } else if b.get(i + 1) == Some(&b'>') {
+                    out.push(Tok::Cmp(Cmp::Ne));
+                    i += 2;
+                } else {
+                    out.push(Tok::Cmp(Cmp::Lt));
+                    i += 1;
+                }
+            }
+            b'>' => {
+                if b.get(i + 1) == Some(&b'=') {
+                    out.push(Tok::Cmp(Cmp::Ge));
+                    i += 2;
+                } else {
+                    out.push(Tok::Cmp(Cmp::Gt));
+                    i += 1;
+                }
+            }
+            b'!' if b.get(i + 1) == Some(&b'=') => {
+                out.push(Tok::Cmp(Cmp::Ne));
+                i += 2;
+            }
+            b'0'..=b'9' => {
+                let start = i;
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+                out.push(Tok::Int(s[start..i].parse().ok()?));
+            }
+            b'-' if b.get(i + 1).is_some_and(|c| c.is_ascii_digit()) => {
+                let start = i;
+                i += 1;
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+                out.push(Tok::Int(s[start..i].parse().ok()?));
+            }
+            _ if is_ident_byte(c) => {
+                let start = i;
+                while i < b.len() && is_ident_byte(b[i]) {
+                    i += 1;
+                }
+                let word = &s[start..i];
+                match word.to_ascii_uppercase().as_str() {
+                    "AND" => out.push(Tok::And),
+                    "OR" => out.push(Tok::Or),
+                    "IS" => out.push(Tok::Is),
+                    "NOT" => out.push(Tok::Not),
+                    "NULL" => out.push(Tok::Null),
+                    _ => out.push(Tok::Ident(word.to_string())),
+                }
+            }
+            _ => return None, // unsupported character
+        }
+    }
+    Some(out)
+}
+
+/// An unresolved WHERE term (column name not yet resolved to a field id).
+struct RawTerm {
+    col: String,
+    kind: RawKind,
+}
+enum RawKind {
+    Cmp(Cmp, Rhs),
+    IsNull,
+    IsNotNull,
+}
+
+/// Parse a token stream into DNF (OR of AND-groups of terms). With no
+/// parentheses, AND binding tighter than OR is exactly OR-of-ANDs.
+fn parse_predicate(toks: &[Tok]) -> Option<Vec<Vec<RawTerm>>> {
+    let mut groups = Vec::new();
+    for or_part in split_on(toks, |t| matches!(t, Tok::Or)) {
+        let mut terms = Vec::new();
+        for and_part in split_on(or_part, |t| matches!(t, Tok::And)) {
+            terms.push(parse_term(and_part)?);
+        }
+        if terms.is_empty() {
+            return None;
+        }
+        groups.push(terms);
+    }
+    if groups.is_empty() {
+        return None;
+    }
+    Some(groups)
+}
+
+fn split_on<'a>(toks: &'a [Tok], is_sep: impl Fn(&Tok) -> bool) -> Vec<&'a [Tok]> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    for (i, t) in toks.iter().enumerate() {
+        if is_sep(t) {
+            parts.push(&toks[start..i]);
+            start = i + 1;
+        }
+    }
+    parts.push(&toks[start..]);
+    parts
+}
+
+fn parse_term(t: &[Tok]) -> Option<RawTerm> {
+    match t {
+        [Tok::Ident(c), Tok::Cmp(op), Tok::Int(n)] => Some(RawTerm {
+            col: c.clone(),
+            kind: RawKind::Cmp(*op, Rhs::Int(*n)),
+        }),
+        [Tok::Ident(c), Tok::Cmp(op), Tok::Str(v)] => Some(RawTerm {
+            col: c.clone(),
+            kind: RawKind::Cmp(*op, Rhs::Str(v.clone())),
+        }),
+        [Tok::Ident(c), Tok::Is, Tok::Null] => Some(RawTerm {
+            col: c.clone(),
+            kind: RawKind::IsNull,
+        }),
+        [Tok::Ident(c), Tok::Is, Tok::Not, Tok::Null] => Some(RawTerm {
+            col: c.clone(),
+            kind: RawKind::IsNotNull,
+        }),
+        _ => None,
+    }
+}
+
+/// Whether a descriptor is comparable as an integer or as text (the only
+/// kinds WHERE handles); None for anything else.
+enum ColKind {
+    Int,
+    Text,
+}
+fn col_kind(d: &Descriptor) -> Option<ColKind> {
+    if matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64) && d.scale == 0 {
+        Some(ColKind::Int)
+    } else if matches!(d.dtype, dtype::TEXT | dtype::VARYING) {
+        Some(ColKind::Text)
+    } else {
+        None
+    }
+}
+
+/// Resolve every term's column name to a field id and check the literal
+/// type matches the column type. Returns None on an unknown column, an
+/// unsupported column type, or a literal/column type mismatch.
+fn resolve_predicate(
+    raw: Vec<Vec<RawTerm>>,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+) -> Option<Predicate> {
+    let mut groups = Vec::new();
+    for g in raw {
+        let mut terms = Vec::new();
+        for rt in g {
+            let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(&rt.col))?;
+            let fid = rc.field_id as usize;
+            let kind = col_kind(descs.get(fid)?)?;
+            let term = match rt.kind {
+                RawKind::Cmp(op, Rhs::Int(n)) => match kind {
+                    ColKind::Int => Term::Cmp(fid, op, Rhs::Int(n)),
+                    _ => return None,
+                },
+                RawKind::Cmp(op, Rhs::Str(v)) => match kind {
+                    ColKind::Text => Term::Cmp(fid, op, Rhs::Str(v)),
+                    _ => return None,
+                },
+                RawKind::IsNull => Term::IsNull(fid),
+                RawKind::IsNotNull => Term::IsNotNull(fid),
+            };
+            terms.push(term);
+        }
+        groups.push(terms);
+    }
+    Some(Predicate(groups))
 }
 
 /// Serve one connection to completion.
@@ -860,46 +1239,83 @@ mod tests {
         assert!(d.windows(4).any(|w| w == [4, 7, 4, 0]));
     }
 
-    #[test]
-    fn parses_count_star_target() {
-        assert_eq!(parse_count_target("SELECT COUNT(*) FROM RDB$RELATIONS").as_deref(), Some("RDB$RELATIONS"));
-        // case- and spacing-insensitive, trailing semicolon tolerated
-        assert_eq!(parse_count_target("select count( * ) from Dept;").as_deref(), Some("DEPT"));
-        assert_eq!(parse_count_target("SELECT  COUNT(*)  FROM  \"MyTab\"").as_deref(), Some("MYTAB"));
+    fn proj_cols(p: &Proj) -> Vec<String> {
+        match p {
+            Proj::Cols(c) => c.clone(),
+            Proj::Count => vec!["COUNT".into()],
+        }
     }
 
     #[test]
-    fn rejects_non_count_queries() {
-        assert_eq!(parse_count_target("SELECT CAST(42 AS BIGINT) FROM RDB$DATABASE"), None);
-        assert_eq!(parse_count_target("SELECT * FROM DEPT"), None);
-        assert_eq!(parse_count_target("SELECT COUNT(*)"), None); // no FROM
+    fn splits_select_from_where() {
+        // COUNT
+        let (p, t, w) = split_query("SELECT COUNT(*) FROM RDB$RELATIONS").unwrap();
+        assert!(matches!(parse_projection(p), Some(Proj::Count)));
+        assert_eq!(t, "RDB$RELATIONS");
+        assert!(w.is_none());
+        // projection + WHERE, mixed case, trailing semicolon; literal case preserved
+        let (p, t, w) = split_query("select ID, NAME from Emp where NAME = 'Emp 5';").unwrap();
+        assert_eq!(proj_cols(&parse_projection(p).unwrap()), vec!["ID", "NAME"]);
+        assert_eq!(t, "Emp");
+        assert_eq!(w, Some("NAME = 'Emp 5'"));
+        // star
+        let (p, t, w) = split_query("SELECT * FROM DEPT").unwrap();
+        assert_eq!(proj_cols(&parse_projection(p).unwrap()), vec!["*"]);
+        assert_eq!(t, "DEPT");
+        assert!(w.is_none());
+    }
+
+    #[test]
+    fn find_word_respects_boundaries() {
+        // FROM inside an identifier must not match
+        assert!(split_query("SELECT X FROM T WHERE FROMAGE = 1").is_some());
+        // no FROM at all
+        assert!(split_query("SELECT 1").is_none());
+    }
+
+    #[test]
+    fn rejects_expression_projection() {
+        assert!(matches!(split_query("SELECT MAX(ID) FROM EMP"), Some((p, _, _)) if parse_projection(p).is_none()));
     }
 
     #[test]
     fn plan_falls_back_to_scalar_without_database() {
         // with no database loaded, everything plans to the fixed scalar
         assert!(matches!(plan_query("SELECT COUNT(*) FROM DEPT", &None), Plan::Scalar(FIXED_ANSWER)));
-        assert!(matches!(plan_query("SELECT ID, NAME FROM EMP", &None), Plan::Scalar(FIXED_ANSWER)));
+        assert!(matches!(plan_query("SELECT ID, NAME FROM EMP WHERE ID > 5", &None), Plan::Scalar(FIXED_ANSWER)));
         assert!(matches!(plan_query("SELECT CAST(1 AS BIGINT) FROM RDB$DATABASE", &None), Plan::Scalar(FIXED_ANSWER)));
     }
 
     #[test]
-    fn parses_select_from_projection() {
-        let (cols, t) = parse_select_from("SELECT ID, NAME FROM EMP").unwrap();
-        assert_eq!(cols, vec!["ID", "NAME"]);
-        assert_eq!(t, "EMP");
-        // star and lowercase + trailing semicolon
-        let (cols, t) = parse_select_from("select * from dept;").unwrap();
-        assert_eq!(cols, vec!["*"]);
-        assert_eq!(t, "DEPT");
+    fn tokenizes_and_parses_predicate() {
+        let toks = tokenize("ID >= 5 AND NAME = 'a b' OR SALARY IS NULL").unwrap();
+        let dnf = parse_predicate(&toks).unwrap();
+        assert_eq!(dnf.len(), 2); // two OR groups
+        assert_eq!(dnf[0].len(), 2); // ID>=5 AND NAME='a b'
+        assert_eq!(dnf[1].len(), 1); // SALARY IS NULL
+        // string literal keeps embedded spaces and case
+        assert!(matches!(&dnf[0][1].kind, RawKind::Cmp(_, Rhs::Str(s)) if s == "a b"));
+        // <> and != both parse; negative ints; IS NOT NULL
+        assert!(parse_predicate(&tokenize("A <> -3").unwrap()).is_some());
+        assert!(parse_predicate(&tokenize("A != 1 AND B IS NOT NULL").unwrap()).is_some());
+        // parentheses / functions are unsupported -> tokenize fails
+        assert!(tokenize("(A = 1)").is_none());
     }
 
     #[test]
-    fn rejects_unsupported_projections() {
-        assert!(parse_select_from("SELECT ID FROM EMP WHERE ID > 5").is_none()); // WHERE
-        assert!(parse_select_from("SELECT MAX(ID) FROM EMP").is_none()); // expression
-        assert!(parse_select_from("SELECT ID FROM EMP ORDER BY ID").is_none()); // ORDER BY
-        assert!(parse_select_from("SELECT ID, NAME FROM A JOIN B ON A.X=B.X").is_none()); // JOIN
+    fn predicate_matches_rows() {
+        // col 0 int, col 1 text
+        let p = Predicate(vec![vec![
+            Term::Cmp(0, Cmp::Ge, Rhs::Int(5)),
+            Term::Cmp(1, Cmp::Eq, Rhs::Str("x".into())),
+        ]]);
+        assert!(p.matches(&[Value::Int(5), Value::Text("x   ".into())])); // trailing blanks ignored
+        assert!(!p.matches(&[Value::Int(4), Value::Text("x".into())])); // 4 < 5
+        assert!(!p.matches(&[Value::Int(9), Value::Text("y".into())])); // text differs
+        // NULL comparison is UNKNOWN (excluded); IS NULL catches it
+        assert!(!Term::Cmp(0, Cmp::Eq, Rhs::Int(1)).matches(&[Value::Null]));
+        assert!(Term::IsNull(0).matches(&[Value::Null]));
+        assert!(Term::IsNotNull(0).matches(&[Value::Int(0)]));
     }
 
     #[test]
