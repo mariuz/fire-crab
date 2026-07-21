@@ -23,13 +23,19 @@
 //! - Record compression is converted from `src/jrd/sqz.cpp` including
 //!   the Firebird 4+ extended run lengths (control bytes -1/-2).
 
+pub mod data;
 pub mod header;
 pub mod pages;
+pub mod pip;
+pub mod pointer;
 pub mod sqz;
 pub mod tip;
 
+pub use data::{DataPage, RecordHeader};
 pub use header::HeaderPage;
 pub use pages::{census, PageType};
+pub use pip::PipPage;
+pub use pointer::{relation_data_pages, PointerPage};
 pub use tip::{TipPage, TxState};
 
 /// Read a `u16` at `offset`, little-endian, like the engine's

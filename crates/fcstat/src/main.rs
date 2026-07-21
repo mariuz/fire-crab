@@ -5,12 +5,13 @@
 //! against MON$ queries on the live C++ engine. `qa/diff-gstat.sh`
 //! automates that comparison; `bench/compare.sh` times the two.
 //!
-//!   fcstat header <db.fdb>     - the header page, gstat -h style
-//!   fcstat census <db.fdb>     - whole-file page-type census
-//!   fcstat tip <db.fdb>        - transaction states from the first TIP
+//!   fcstat header <db.fdb>          - the header page, gstat -h style
+//!   fcstat census <db.fdb>          - whole-file page-type census
+//!   fcstat tip <db.fdb>             - transaction states from the first TIP
+//!   fcstat records <db.fdb> <rel>   - record-version walk of one relation
 //!   fcstat bench-census <db.fdb> <iterations>
 
-use fire_crab_ods::{census, HeaderPage, TipPage, TxState};
+use fire_crab_ods::{census, relation_data_pages, DataPage, HeaderPage, TipPage, TxState};
 use std::time::Instant;
 
 fn main() {
@@ -34,6 +35,16 @@ fn main() {
         "header" => header(&data),
         "census" => census_cmd(&data),
         "tip" => tip(&data),
+        "records" => {
+            let rel: u16 = match args.get(3).and_then(|s| s.parse().ok()) {
+                Some(r) => r,
+                None => {
+                    eprintln!("usage: fcstat records <db.fdb> <relation-id>");
+                    std::process::exit(2);
+                }
+            };
+            records(&data, rel);
+        }
         "bench-census" => {
             let iters: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
             bench_census(&data, iters);
@@ -154,6 +165,76 @@ fn tip(data: &[u8]) {
         TxState::Committed,
     ] {
         println!("  {:10} {}", s.name(), counts[s as usize]);
+    }
+}
+
+/// Walk one relation's data pages via its pointer pages and classify
+/// every record segment - the low-level mirror of SELECT COUNT(*).
+/// On a database with no uncommitted work and no pending garbage
+/// (e.g. freshly restored), `primary records` equals the row count.
+fn records(data: &[u8], relation: u16) {
+    let h = decode_header(data);
+    let page_size = h.page_size as usize;
+
+    let dp_numbers = relation_data_pages(data, page_size, relation);
+    if dp_numbers.is_empty() {
+        println!("relation {}: no pointer pages found", relation);
+        return;
+    }
+
+    let mut pages = 0u64;
+    let mut primary = 0u64;
+    let mut back = 0u64;
+    let mut fragments = 0u64;
+    let mut blobs = 0u64;
+    let mut deleted = 0u64;
+    let mut unpack_errors = 0u64;
+
+    for dp_no in dp_numbers {
+        let start = dp_no as usize * page_size;
+        let Some(page) = data.get(start..start + page_size) else {
+            eprintln!("fcstat: data page {} beyond end of file", dp_no);
+            continue;
+        };
+        let Some(dp) = DataPage::decode(page) else {
+            eprintln!("fcstat: page {} is not a data page", dp_no);
+            continue;
+        };
+        if dp.relation != relation {
+            eprintln!("fcstat: page {} belongs to relation {}", dp_no, dp.relation);
+            continue;
+        }
+        pages += 1;
+        for r in dp.records() {
+            use fire_crab_ods::data::flags;
+            if r.flags & flags::BLOB != 0 {
+                blobs += 1;
+            } else if r.flags & flags::FRAGMENT != 0 {
+                fragments += 1;
+            } else if r.flags & flags::CHAIN != 0 {
+                back += 1;
+            } else if r.flags & flags::DELETED != 0 {
+                deleted += 1;
+            } else {
+                primary += 1;
+                // every primary payload must be a well-formed sqz stream
+                if r.flags & flags::INCOMPLETE == 0
+                    && fire_crab_ods::sqz::unpack(r.packed_data).is_none()
+                {
+                    unpack_errors += 1;
+                }
+            }
+        }
+    }
+
+    println!("relation {}: {} data pages", relation, pages);
+    println!("  primary records   {}", primary);
+    println!("  back versions     {}", back);
+    println!("  fragments         {}", fragments);
+    println!("  blobs             {}", blobs);
+    println!("  deleted stubs     {}", deleted);
+    if unpack_errors > 0 {
+        println!("  UNPACK ERRORS     {}", unpack_errors);
     }
 }
 

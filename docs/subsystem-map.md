@@ -16,8 +16,9 @@ Paper document links are relative to
 |---|---|---|---|
 | `src/jrd/ods.h` (pag, header_page, tx_inv_page) | on-disk-structure.md | `fire-crab-ods` {pages, header, tip} | **done** — differential vs gstat, 123 dbs |
 | `src/jrd/sqz.cpp` (record RLE) | on-disk-structure.md § records | `fire-crab-ods::sqz` | **done** — round-trip incl. FB4 forms |
-| `src/jrd/ods.h` (page_inv_page / PIP) | on-disk-structure.md | `fire-crab-ods::pip` | next |
-| `src/jrd/ods.h` (pointer_page, data_page, rhd/rhdf) | on-disk-structure.md, transactions-and-concurrency.md | `fire-crab-ods::{pointer,data}` | next — unlocks the record walk, diffable vs SELECT |
+| `src/jrd/ods.h` (page_inv_page / PIP) | on-disk-structure.md | `fire-crab-ods::pip` | **done** — bitmap + capacity formula tested |
+| `src/jrd/ods.h` (pointer_page, data_page, rhd/rhde + flags) | on-disk-structure.md, transactions-and-concurrency.md | `fire-crab-ods::{pointer,data}` | **done** — record walk diffs vs live SELECT COUNT(*) (qa/diff-select.sh), 0 to 200k rows OK |
+| record field decode via RDB$FORMATS | on-disk-structure.md, metadata-cache.md | `fire-crab-ods::format` | next — turns walked payloads into column values, diffable vs full SELECT output |
 | `src/jrd/btr.cpp` / btree_page | indexing-and-full-text-search.md | `fire-crab-btr` | planned |
 | `src/jrd/blb.cpp` / blob_page | blob-handling.md | `fire-crab-blb` | planned |
 

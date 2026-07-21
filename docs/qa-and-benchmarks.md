@@ -29,13 +29,30 @@ Unit-level: 12 tests pin struct layouts (mirroring the C++ `static_assert`s)
 and the sqz codec (round trips, the FB4 `-1`/`-2` extended forms, truncated
 stream rejection, 50k pseudorandom bytes).
 
-### Stage 2 — semantic differentials (as the conversion climbs)
+### Stage 2 — semantic differentials (first one running today)
 
-Each next conversion step carries its oracle with it: the data-page record
-walk diffs against `SELECT` through the live engine; the B-tree walk against
-index navigation; BLR decode against the byte dumps already captured in the
-paper's samples; commit-order semantics against the transactions samples'
-verified outputs.
+Each conversion step carries its oracle with it. The first semantic
+differential is live: `qa/diff-select.sh` produces a CLEAN copy of a database
+(gbak backup/restore, which materializes exactly the committed primary record
+versions), then compares fcstat's raw record walk — pointer pages -> data
+pages -> `rhd_flags` classification (primary vs back version vs fragment vs
+blob vs deleted stub) — against `SELECT COUNT(*)` through the live engine for
+every user table. Current results across the paper's databases:
+
+```
+OK  BULK      200000 rows   (multi-pointer-page relation)
+OK  MON_WORK   10000 rows
+OK  DEPT/EMP   20/2000 rows
+OK  DOCS           3 rows   (blob-bearing table; blob segments classified out)
+OK  GCTEST         0 rows   (empty table)
+... zero DIFFs so far
+```
+
+Every primary payload is additionally required to be a well-formed sqz
+stream (`UNPACK ERRORS` would be reported); none have failed. Next: the
+B-tree walk against index navigation; BLR decode against the byte dumps
+already captured in the paper's samples; commit-order semantics against the
+transactions samples' verified outputs.
 
 ### Stage 3 — the Firebird QA suite (the milestone, not yet claimable)
 
@@ -82,6 +99,8 @@ paper's 23 MB `sorting` scratch database (2822 pages):
 cargo test
 cargo build --release
 GSTAT=/opt/firebird/bin/gstat qa/diff-gstat.sh /tmp/fbhandson/*.fdb
+ISQL=/opt/firebird/bin/isql GBAK=/opt/firebird/bin/gbak \\
+    qa/diff-select.sh localhost:/tmp/fbhandson/plans_fbcpp.fdb /tmp/fbhandson/plans_fbcpp.fdb
 GSTAT=/opt/firebird/bin/gstat bench/compare.sh /tmp/fbhandson/sorting_fbcpp.fdb 200
 ```
 
