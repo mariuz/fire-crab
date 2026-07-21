@@ -42,19 +42,34 @@ the converter what the C++ is *doing* before they read a line of it.
 | Transaction system: TIP chain, delta versions, MVCC visibility (`tra.cpp`/`vio.cpp`) | `fire-crab-ods::tra` | **converted + committed-only-visibility differential vs live SELECT** |
 | Garbage-collection / sweep analysis (`vio.cpp`) | `fire-crab-ods::gc` | **converted + prediction differential vs live `gfix -sweep`** |
 | BLR intermediate language (`par.cpp`, `blp.h`) | `fire-crab-ods::blr` | **converted + verb-token differential vs the engine's own BLR printer** |
-| Wire protocol - login + general SELECT (`src/remote/`, `src/auth/`) | `fire-crab-wire` | **fire-crab runs multi-column, multi-row SELECTs** matching isql row-for-row (integer + text). This is a CLIENT of the C++ engine, which validates the wire codec; the firebird-qa suite needs the SERVER side (see below) |
+| Wire protocol - client: login + general SELECT (`src/remote/`, `src/auth/`) | `fire-crab-wire` | **fire-crab runs multi-column, multi-row SELECTs** matching isql row-for-row (integer + text). Validates the wire codec against the real C++ server |
+| Wire protocol - server: accept + SRP-256 + attach + statement pipeline | `fire-crab-wire::server` | **a real third-party client (node-firebird) authenticates, arms Arc4 wire encryption, attaches and runs a query end-to-end against fire-crab**; the C++ `isql` authenticates and attaches too (see below). No SQL engine yet - queries answer a fixed value |
 | Everything else | — | see [docs/subsystem-map.md](docs/subsystem-map.md) |
 
-**On the firebird-qa milestone, precisely.** The `fire-crab-wire` crate is a
-wire-protocol *client* - it connects to the running C++ engine, and every
-query it runs is checked against isql. This validates the wire codec (XDR,
-SRP-256, the message/BLR formats) end-to-end against the real server. But
-firebird-qa drives a *server*: making the suite applicable requires the
-server side of the protocol (accepting connections, the server half of SRP,
-dispatching ops into the converted engine internals). The client is the
-necessary groundwork - fire-crab can now encode and decode every wire
-structure the server side will need - but it is not itself the milestone.
-That framing is corrected here from earlier notes.
+**On the firebird-qa milestone, precisely.** firebird-qa drives a *server*,
+so the suite only becomes applicable once fire-crab can *accept* connections,
+not just make them. Both halves now exist:
+
+- **Client** (`fire-crab-wire`): connects to the running C++ engine; every
+  query is checked against isql. This validated the wire codec (XDR, SRP-256,
+  the message/BLR formats) end-to-end against the real server first.
+- **Server** (`fire-crab-wire::server`): accepts TCP connections and speaks
+  the same protocol the C++ `src/remote/` server does. **node-firebird - an
+  independent, third-party client library with no fire-crab code in it -
+  negotiates protocol 20, authenticates via the server half of SRP-256
+  (no password on the wire), arms Arc4 wire encryption with the derived
+  session key, attaches, and drives the full statement pipeline
+  (transaction → allocate → prepare → execute → fetch), decoding the
+  returned value correctly.** The C++ `isql` client authenticates via
+  SRP-256 and attaches as well, then drives its richer post-attach ops
+  (op_cancel, op_info_database) until it reaches op_exec_immediate.
+
+What the server does *not* yet have is a SQL engine: prepare/execute/fetch
+answer a fixed single-BIGINT result, which is enough to prove the whole
+request/response pipeline round-trips against a genuine client. Dispatching
+ops into the converted engine internals (the `ods` crate) - so the fixed
+answer becomes a real query result - is the work that follows. The protocol
+server it will run on is proven here.
 
 Current QA state: `fcstat header` output is **byte-identical on the compared
 fields with `gstat -h` across 123 real Firebird 6 databases** (every scratch

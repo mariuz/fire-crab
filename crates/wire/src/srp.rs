@@ -141,6 +141,106 @@ impl BigUint {
     }
 }
 
+
+// ---- server side (converts the verifier + proof-check half of srp.cpp) ----
+
+/// The shared parameters a server needs to compute for a user: the salt,
+/// the verifier v = g^x mod N (x = SHA1(salt | SHA1(user:pass))), and the
+/// group. In a real server the (salt, v) pair is what RDB$AUTH stores;
+/// here it is derived on the fly for the demo user.
+pub struct SrpVerifier {
+    pub salt: Vec<u8>,
+    v: BigUint,
+    user: String,
+}
+
+fn k_param() -> BigUint {
+    let modulus = n();
+    let mut padded_g = vec![0u8; 128 - 1];
+    padded_g.push(2);
+    let mut k_in = modulus.to_bytes_be();
+    k_in.extend_from_slice(&padded_g);
+    BigUint::from_bytes_be(&sha1(&k_in))
+}
+
+fn compute_x(user: &str, password: &str, salt: &[u8]) -> BigUint {
+    let inner = sha1(format!("{}:{}", user, password).as_bytes());
+    let mut x_in = salt.to_vec();
+    x_in.extend_from_slice(&inner);
+    BigUint::from_bytes_be(&sha1(&x_in))
+}
+
+impl SrpVerifier {
+    /// Build the verifier for `user`/`password` with the given salt
+    /// (32 bytes of printable randomness, as Firebird stores).
+    pub fn new(user: &str, password: &str, salt: &[u8]) -> SrpVerifier {
+        let x = compute_x(user, password, salt);
+        let v = BigUint::modpow(&g(), &x, &n());
+        SrpVerifier {
+            salt: salt.to_vec(),
+            v,
+            user: user.to_string(),
+        }
+    }
+
+    /// Server ephemeral: pick private b, return (b_priv, B) where
+    /// B = (k*v + g^b) mod N - the value sent to the client as hex.
+    pub fn server_public(&self, b_bytes: &[u8]) -> (BigUint, String) {
+        let modulus = n();
+        let b_priv = BigUint::from_bytes_be(b_bytes).rem_pub(&modulus);
+        let gb = BigUint::modpow(&g(), &b_priv, &modulus);
+        let kv = k_param().mul_mod(&self.v, &modulus);
+        let big_b = kv.add_mod(&gb, &modulus);
+        (b_priv, bytes_to_hex_upper(&big_b.to_bytes_be()))
+    }
+
+    /// Verify the client's proof M given the client public key A (hex),
+    /// the server private b and public B (hex). Returns the session key
+    /// K on success, None if the proof does not match.
+    pub fn verify(
+        &self,
+        a_hex: &str,
+        b_priv: &BigUint,
+        b_hex: &str,
+        client_m_hex: &str,
+    ) -> Option<[u8; 20]> {
+        let modulus = n();
+        let big_a = BigUint::from_bytes_be(&hex_to_bytes(a_hex));
+        let big_b = BigUint::from_bytes_be(&hex_to_bytes(b_hex));
+
+        // u = SHA1(A | B), minimal bytes
+        let mut u_in = big_a.to_bytes_be();
+        u_in.extend_from_slice(&big_b.to_bytes_be());
+        let u = BigUint::from_bytes_be(&sha1(&u_in));
+
+        // S = (A * v^u)^b mod N
+        let vu = BigUint::modpow(&self.v, &u, &modulus);
+        let base = big_a.mul_mod(&vu, &modulus);
+        let s = BigUint::modpow(&base, b_priv, &modulus);
+        let session_key = sha1(&s.to_bytes_be());
+
+        // expected M = SHA256(n1 | n2 | salt | A | B | K)
+        let gg = g();
+        let h_n = BigUint::from_bytes_be(&sha1(&modulus.to_bytes_be()));
+        let h_g = BigUint::from_bytes_be(&sha1(&gg.to_bytes_be()));
+        let n1 = BigUint::modpow(&h_n, &h_g, &modulus);
+        let n2 = BigUint::from_bytes_be(&sha1(self.user.as_bytes()));
+        let mut m_in = n1.to_bytes_be();
+        m_in.extend_from_slice(&n2.to_bytes_be());
+        m_in.extend_from_slice(&self.salt);
+        m_in.extend_from_slice(&big_a.to_bytes_be());
+        m_in.extend_from_slice(&big_b.to_bytes_be());
+        m_in.extend_from_slice(&session_key);
+        let expected = bytes_to_hex_upper(&sha256(&m_in));
+
+        if expected == client_m_hex.to_uppercase() {
+            Some(session_key)
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +258,24 @@ mod tests {
             pr.m_hex, "C2A9B2BC58EDC171B41142A9FC93ABF7F01596D815F36780F2751B1D8C8EEE8D",
             "M"
         );
+    }
+
+    #[test]
+    fn client_and_server_agree_on_the_session_key() {
+        // full SRP loopback: the client proof the server computes for
+        // itself must equal the client's, and both must derive the same K
+        let salt = [0x5Au8; 32];
+        let verifier = SrpVerifier::new("SYSDBA", "masterkey", &salt);
+        let client = client_start(&[7u8; 128]);
+        let (b_priv, b_hex) = verifier.server_public(&[9u8; 128]);
+        let proof = client.proof("SYSDBA", "masterkey", &salt, &b_hex);
+        let k = verifier
+            .verify(&client.a_hex, &b_priv, &b_hex, &proof.m_hex)
+            .expect("server must accept the client proof");
+        assert_eq!(k, proof.session_key, "session keys must match");
+        // a wrong password must be rejected
+        let bad = client.proof("SYSDBA", "wrong", &salt, &b_hex);
+        assert!(verifier.verify(&client.a_hex, &b_priv, &b_hex, &bad.m_hex).is_none());
     }
 
     #[test]

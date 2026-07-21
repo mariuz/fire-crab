@@ -228,30 +228,73 @@ declared length in the fetch BLR or the server raises string-truncation; and
 an end-of-cursor op_fetch_response (status=100) still carries a messages field
 that must be consumed or the next op desyncs.
 
-**A framing correction, stated plainly.** `fire-crab-wire` is a wire-protocol
-*client*: it connects to the running C++ engine and every query is checked
-against isql. That is a real, strong differential - it proves fire-crab
-encodes and decodes every wire structure correctly (XDR, SRP-256, the
-message and BLR formats), against the genuine server. But firebird-qa drives
-a *server*, and fire-crab is not one yet. Making the suite applicable requires
-the server half of the protocol: accepting connections, the server side of
-SRP, and dispatching the decoded ops into the converted engine internals
-(the storage, transaction, GC and BLR layers already built). The client is
-the groundwork - it means every wire structure the server must produce is
-already understood and tested - but the server side is the honest remaining
-milestone.
+**A framing correction, stated plainly.** `fire-crab-wire` began as a
+wire-protocol *client*: it connects to the running C++ engine and every query
+is checked against isql. That is a real, strong differential - it proves
+fire-crab encodes and decodes every wire structure correctly (XDR, SRP-256,
+the message and BLR formats), against the genuine server. But firebird-qa
+drives a *server*, so the honest milestone was always the server half of the
+protocol. That half now exists (`fire-crab-wire::server`), and the tenth
+differential is the one that tests it.
 
-### Stage 3 — the Firebird QA suite (the milestone, not yet claimable)
+### The tenth differential — a real client attaches to fire-crab (server side)
+
+`qa/serve-real-client.sh` runs fire-crab as a **server** and points a genuine,
+third-party client at it - **node-firebird**, a pure-JavaScript Firebird
+driver that contains no fire-crab code and knows nothing about this project.
+The client drives the whole exchange over the wire and fire-crab answers every
+step from `crates/wire/src/server.rs`:
+
+- `op_connect` → fire-crab picks the highest offered protocol (20, FB6) and
+  replies `op_cond_accept` **with `FB_PROTOCOL_FLAG` set** in the version;
+- the **server half of SRP-256** (`SrpVerifier` in `srp.rs`): fire-crab holds
+  only the verifier `v = gˣ mod N`, sends salt + `B`, receives the client
+  proof `M`, and derives the *same* session key the client did - the password
+  never crosses the wire, and a wrong password is rejected;
+- `op_crypt` → Arc4 armed both directions with that session key (the step is
+  optional: a client that skips it attaches in cleartext, which is how the
+  C++ `isql` reaches attach);
+- `op_attach`, then the statement pipeline `op_transaction` → `op_allocate` →
+  `op_prepare` → `op_execute` → `op_fetch`, and the client **decodes the
+  returned BIGINT correctly** (4242, this milestone's fixed answer).
+
+Four server-side subtleties surfaced and were fixed, each caught only because
+a *real* client is pickier than fire-crab's own loopback:
+
+1. **`FB_PROTOCOL_FLAG` (0x8000).** The accepted version must carry the high
+   bit exactly as offered. Stripping it made the client compare `20 < 13`
+   (since its `PROTOCOL_VERSION13` also has the flag), decode the row in the
+   legacy per-field null-indicator layout, and read *every* value as null -
+   the bytes on the wire were correct the whole time.
+2. **Protocol-20 trailing fields.** `op_prepare_statement` gained a
+   `p_sqlst_flags` int at v20, and `op_execute` gained `p_sqldata_timeout`
+   (v16), `p_sqldata_cursor_flags` (v18) and `p_sqldata_inline_blob_size`
+   (v19). A newer-protocol client always sends them; not draining them
+   desyncs the encrypted stream.
+3. **`op_cancel` is one int and gets no reply.** The C++ `isql` configures
+   async cancellation right after attach; per `protocol.h` the op carries only
+   `p_co_kind`, and per `server.cpp` the server sends nothing back. Reading a
+   second int or replying desyncs.
+4. **`op_info_database`.** `isql` asks for dialect / ODS / version before it
+   will proceed; a minimal well-formed info buffer satisfies it.
+
+With these, **node-firebird completes a query end-to-end**, and the C++
+`isql` **authenticates via SRP-256 and attaches**, then drives its richer
+post-attach ops until it reaches `op_exec_immediate` - the point where a
+fixed-answer server can go no further without a real SQL engine.
+
+### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
 suite (thousands of tests) drives a **server** through the wire protocol via
-the firebird-driver. It becomes applicable to fire-crab at exactly one
-milestone: when `fire-crab-remote` can attach, prepare, execute and fetch on
-the wire. From that day the entire suite runs unmodified against both engines
-and every test is a differential test. Until then, fire-crab does **not**
-claim any firebird-qa coverage — the suite is the destination the QA ladder
-climbs toward, and the wire-protocol row of
-[subsystem-map.md](subsystem-map.md) is flagged as that milestone.
+the firebird-driver. The server side proven above is the entry to it: the
+handshake, authentication, encryption and op dispatch a real client needs are
+in place. What stands between here and running the suite is the SQL engine
+behind the pipeline - prepare/execute/fetch currently answer a fixed value
+rather than dispatching into the converted storage, transaction, GC and BLR
+layers. Until those are wired in, fire-crab does **not** claim any firebird-qa
+coverage - but the milestone is no longer a distant one: the protocol server
+the suite talks to accepts real clients today.
 
 ## Benchmarks
 
@@ -289,6 +332,12 @@ GSTAT=/opt/firebird/bin/gstat qa/diff-gstat.sh /tmp/fbhandson/*.fdb
 ISQL=/opt/firebird/bin/isql GBAK=/opt/firebird/bin/gbak \\
     qa/diff-select.sh localhost:/tmp/fbhandson/plans_fbcpp.fdb /tmp/fbhandson/plans_fbcpp.fdb
 GSTAT=/opt/firebird/bin/gstat bench/compare.sh /tmp/fbhandson/sorting_fbcpp.fdb 200
+
+# server side: a real third-party client attaches to fire-crab and queries it
+# (run from the paper's samples/nodejs so node-firebird is importable)
+NODE_PATH="$PWD/node_modules" \\
+    FCWIRE=/path/to/fire-crab/target/release/fcwire \\
+    sh /path/to/fire-crab/qa/serve-real-client.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on

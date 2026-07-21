@@ -22,6 +22,7 @@
 //! See `docs/subsystem-map.md`.
 
 pub mod crypto;
+pub mod server;
 pub mod srp;
 
 use std::io::{Read, Write};

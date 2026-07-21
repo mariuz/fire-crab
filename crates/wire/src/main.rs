@@ -1,9 +1,16 @@
 //! fcwire - the fire-crab wire-protocol client tool.
 //!   fcwire negotiate <host:port> <db-path>
-use fire_crab_wire::{login, negotiate};
+use fire_crab_wire::{login, negotiate, server::serve};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|a| a == "serve").unwrap_or(false) {
+        let addr = args.get(2).cloned().unwrap_or_else(|| "127.0.0.1:3051".into());
+        let user = args.get(3).cloned().unwrap_or_else(|| "SYSDBA".into());
+        let pass = args.get(4).cloned().unwrap_or_else(|| "masterkey".into());
+        if let Err(e) = serve(&addr, &user, &pass) { eprintln!("fcwire serve: {}", e); std::process::exit(1); }
+        return;
+    }
     if args.len() < 4
         || (args[1] != "negotiate"
             && args[1] != "login"
