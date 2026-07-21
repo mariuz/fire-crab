@@ -21,6 +21,9 @@
 //! `op_attach`, statement allocation/prepare, `op_execute`/`op_fetch`.
 //! See `docs/subsystem-map.md`.
 
+pub mod crypto;
+pub mod srp;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
@@ -31,6 +34,10 @@ pub const OP_REJECT: i32 = 4;
 pub const OP_ATTACH: i32 = 19;
 pub const OP_ACCEPT_DATA: i32 = 94;
 pub const OP_COND_ACCEPT: i32 = 98;
+pub const OP_RESPONSE: i32 = 9;
+pub const OP_DETACH: i32 = 21;
+pub const OP_CONT_AUTH: i32 = 92;
+pub const OP_CRYPT: i32 = 96;
 
 pub const CONNECT_VERSION3: i32 = 3;
 pub const ARCH_GENERIC: i32 = 1;
@@ -205,6 +212,212 @@ pub fn negotiate(
         packet_type,
         auth_data,
     })
+}
+
+use crate::crypto::Rc4;
+use crate::srp::{client_start, SrpClient};
+
+/// A live, authenticated attachment to a database over the encrypted
+/// wire - the point where fire-crab first LOGS IN to the engine.
+pub struct Attachment {
+    stream: TcpStream,
+    enc: Rc4,
+    dec: Rc4,
+    pub protocol: i32,
+    pub handle: i32,
+}
+
+/// Read one XDR int, decrypting through `dec` if present.
+fn read_int_maybe(stream: &mut TcpStream, dec: Option<&mut Rc4>) -> std::io::Result<i32> {
+    let mut b = [0u8; 4];
+    stream.read_exact(&mut b)?;
+    if let Some(d) = dec {
+        let p = d.transform(&b);
+        Ok(i32::from_be_bytes([p[0], p[1], p[2], p[3]]))
+    } else {
+        Ok(i32::from_be_bytes(b))
+    }
+}
+
+fn read_bytes_maybe(stream: &mut TcpStream, dec: &mut Option<Rc4>) -> std::io::Result<Vec<u8>> {
+    let n = read_int_maybe(stream, dec.as_mut())? as usize;
+    let mut data = vec![0u8; n];
+    stream.read_exact(&mut data)?;
+    let pad = (4 - n % 4) % 4;
+    let mut p = vec![0u8; pad];
+    stream.read_exact(&mut p)?;
+    if let Some(d) = dec.as_mut() {
+        let mut all = d.transform(&data);
+        d.transform(&p); // consume the padding keystream
+        all.truncate(n);
+        return Ok(all);
+    }
+    Ok(data)
+}
+
+/// Consume an op_response (handle, blob id, data, status vector),
+/// returning the object handle or an error carrying the status.
+fn read_response(stream: &mut TcpStream, dec: &mut Option<Rc4>) -> std::io::Result<i32> {
+    let handle = read_int_maybe(stream, dec.as_mut())?;
+    // blob id (2 ints)
+    read_int_maybe(stream, dec.as_mut())?;
+    read_int_maybe(stream, dec.as_mut())?;
+    read_bytes_maybe(stream, dec)?; // response data
+    let mut msgs = Vec::new();
+    loop {
+        let t = read_int_maybe(stream, dec.as_mut())?;
+        if t == 0 {
+            break;
+        } else if t == 1 || t == 4 || t == 19 {
+            let c = read_int_maybe(stream, dec.as_mut())?;
+            if t == 1 && c != 0 {
+                msgs.push(format!("gds {}", c));
+            }
+        } else {
+            let b = read_bytes_maybe(stream, dec)?;
+            msgs.push(String::from_utf8_lossy(&b).into_owned());
+        }
+    }
+    if !msgs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("server error: {}", msgs.join(", ")),
+        ));
+    }
+    Ok(handle)
+}
+
+/// The full login: op_connect negotiation -> SRP proof (op_cont_auth)
+/// -> op_crypt (Arc4) -> op_attach, over TCP to a live server. Returns
+/// an authenticated Attachment.
+pub fn login(
+    host: &str,
+    port: u16,
+    db_path: &str,
+    user: &str,
+    password: &str,
+    a_bytes: &[u8],
+) -> std::io::Result<Attachment> {
+    let user = user.to_uppercase(); // unquoted identifiers uppercased
+    let srp: SrpClient = client_start(a_bytes);
+
+    // -- op_connect, presenting A --
+    let uid = user_id_block(&user, srp.a_hex.as_bytes());
+    let offered = [13, 16, 17, 18, 19, 20];
+    let mut w = XdrWriter::default();
+    w.int(OP_CONNECT)
+        .int(OP_ATTACH)
+        .int(CONNECT_VERSION3)
+        .int(ARCH_GENERIC)
+        .str(db_path)
+        .int(offered.len() as i32)
+        .bytes(&uid);
+    for (i, &v) in offered.iter().enumerate() {
+        w.int(v | 0x8000)
+            .int(ARCH_GENERIC)
+            .int(PTYPE_BATCH_SEND)
+            .int(PTYPE_BATCH_SEND)
+            .int(i as i32 + 2);
+    }
+    let mut stream = TcpStream::connect((host, port))?;
+    // never block forever on an unexpected/closed response (e.g. the
+    // anti-enumeration path for a nonexistent user)
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    stream.write_all(w.finish())?;
+
+    let opcode = read_int_maybe(&mut stream, None)?;
+    if opcode == OP_REJECT {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "op_reject",
+        ));
+    }
+    let protocol = read_int_maybe(&mut stream, None)? & 0x7fff;
+    read_int_maybe(&mut stream, None)?; // arch
+    read_int_maybe(&mut stream, None)?; // ptype
+    let mut none: Option<Rc4> = None;
+    let data = read_bytes_maybe(&mut stream, &mut none)?; // salt + B
+    let _plugin = read_bytes_maybe(&mut stream, &mut none)?;
+    read_int_maybe(&mut stream, None)?; // authenticated flag
+    read_bytes_maybe(&mut stream, &mut none)?; // p_acpt_keys
+
+    // salt + B are 2-byte-LE-length-prefixed inside `data`
+    let salt_len = u16::from_le_bytes([data[0], data[1]]) as usize;
+    let salt = &data[2..2 + salt_len];
+    let key_len = u16::from_le_bytes([data[2 + salt_len], data[3 + salt_len]]) as usize;
+    let b_hex = String::from_utf8_lossy(&data[4 + salt_len..4 + salt_len + key_len]).into_owned();
+
+    // -- op_cont_auth with the proof M --
+    let proof = srp.proof(&user, password, salt, &b_hex);
+    let mut w = XdrWriter::default();
+    w.int(OP_CONT_AUTH)
+        .str(&proof.m_hex)
+        .str("Srp256")
+        .str("Srp256,Srp")
+        .str("");
+    stream.write_all(w.finish())?;
+    if read_int_maybe(&mut stream, None)? != OP_RESPONSE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "expected op_response to op_cont_auth",
+        ));
+    }
+    read_response(&mut stream, &mut none)?;
+
+    // -- op_crypt: Arc4 keyed by the session key K --
+    let mut enc = Rc4::new(&proof.session_key);
+    let mut dec_opt = Some(Rc4::new(&proof.session_key));
+    let mut w = XdrWriter::default();
+    w.int(OP_CRYPT).str("Arc4").str("Symmetric");
+    stream.write_all(w.finish())?; // sent in cleartext
+    if read_int_maybe(&mut stream, dec_opt.as_mut())? != OP_RESPONSE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "expected op_response to op_crypt",
+        ));
+    }
+    read_response(&mut stream, &mut dec_opt)?;
+
+    // -- op_attach (encrypted), minimal DPB, no credentials --
+    let mut dpb = vec![1u8]; // isc_dpb_version1
+    dpb.push(48);
+    dpb.push(4);
+    dpb.extend_from_slice(b"NONE"); // isc_dpb_lc_ctype
+    dpb.push(28);
+    dpb.push(user.len() as u8);
+    dpb.extend_from_slice(user.as_bytes()); // isc_dpb_user_name
+    let mut w = XdrWriter::default();
+    w.int(OP_ATTACH).int(0).str(db_path).bytes(&dpb);
+    stream.write_all(&enc.transform(w.finish()))?;
+    if read_int_maybe(&mut stream, dec_opt.as_mut())? != OP_RESPONSE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "expected op_response to op_attach",
+        ));
+    }
+    let handle = read_response(&mut stream, &mut dec_opt)?;
+
+    Ok(Attachment {
+        stream,
+        enc,
+        dec: dec_opt.unwrap(),
+        protocol,
+        handle,
+    })
+}
+
+impl Attachment {
+    /// op_detach: close the attachment cleanly.
+    pub fn detach(&mut self) -> std::io::Result<()> {
+        let mut w = XdrWriter::default();
+        w.int(OP_DETACH).int(self.handle);
+        self.stream.write_all(&self.enc.transform(w.finish()))?;
+        let mut dec = Some(std::mem::replace(&mut self.dec, Rc4::new(&[0])));
+        if read_int_maybe(&mut self.stream, dec.as_mut())? == OP_RESPONSE {
+            read_response(&mut self.stream, &mut dec)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

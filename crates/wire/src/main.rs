@@ -1,17 +1,45 @@
 //! fcwire - the fire-crab wire-protocol client tool.
 //!   fcwire negotiate <host:port> <db-path>
-use fire_crab_wire::negotiate;
+use fire_crab_wire::{login, negotiate};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 4 || args[1] != "negotiate" {
-        eprintln!("usage: fcwire negotiate <host:port> <db-path>");
+    if args.len() < 4 || (args[1] != "negotiate" && args[1] != "login") {
+        eprintln!("usage: fcwire negotiate|login <host:port> <db-path> [user] [password]");
         std::process::exit(2);
     }
     let (host, port) = match args[2].rsplit_once(':') {
         Some((h, p)) => (h.to_string(), p.parse().unwrap_or(3050)),
         None => (args[2].clone(), 3050u16),
     };
+    let mut rnd = vec![0u8; 128];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        let _ = f.read_exact(&mut rnd);
+    }
+    if args[1] == "login" {
+        let user = args.get(4).cloned().unwrap_or_else(|| "SYSDBA".into());
+        let pass = args.get(5).cloned().unwrap_or_else(|| "masterkey".into());
+        match login(&host, port, &args[3], &user, &pass, &rnd) {
+            Ok(mut att) => {
+                println!(
+                    "logged in: protocol {}, attachment handle {}",
+                    att.protocol, att.handle
+                );
+                println!("HANDLE {}", att.handle);
+                if let Some(secs) = args.get(6).and_then(|s| s.parse::<u64>().ok()) {
+                    std::thread::sleep(std::time::Duration::from_secs(secs));
+                }
+                let _ = att.detach();
+                println!("detached.");
+            }
+            Err(e) => {
+                eprintln!("fcwire login: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     // 128 bytes of "SRP key A" placeholder from /dev/urandom, rendered
     // as hex text (the real key is g^a mod N; negotiation does not need
     // a valid one, only well-formed specific-data)

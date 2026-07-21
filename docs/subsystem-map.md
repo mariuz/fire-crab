@@ -50,7 +50,7 @@ Paper document links are relative to
 
 | C++ source | Paper document | Crate | Status |
 |---|---|---|---|
-| wire protocol `src/remote/` - XDR framing + op_connect/op_accept negotiation | firebird-wire-protocol.md | `fire-crab-wire` | **foundation done** — XDR primitives and protocol-version negotiation over real TCP; live differential reproduces the reference clients' negotiated version exactly (qa/diff-wire.sh). Remaining, in order, to reach **the firebird-qa milestone**: SRP proof + op_cont_auth, wire crypt (ChaCha/Arc4), op_attach, allocate/prepare statement, op_execute/op_fetch. Only when attach..fetch work does the official pytest suite run unmodified. |
+| wire protocol `src/remote/` + SRP `src/auth/SecureRemotePassword/` | firebird-wire-protocol.md, security-architecture.md | `fire-crab-wire` | **fire-crab logs in** — XDR framing, op_connect negotiation, SRP-256 authentication (from-scratch SHA-1/SHA-256/bignum-modpow, proof M pinned to the reference), Arc4 wire encryption, op_attach/op_detach, all over real TCP. Differentials: negotiated version matches the reference clients (qa/diff-wire.sh); the engine records the attachment as Srp256/Arc4 and rejects wrong credentials with isc_login (qa/diff-login.sh). Remaining to **the firebird-qa milestone**: statement allocate/prepare, op_execute/op_fetch — then the pytest suite runs unmodified. |
 | services (`src/jrd/svc.cpp`) | services-api.md | `fire-crab-svc` | planned |
 | events (`src/jrd/event.cpp`) | firebird-events.md | `fire-crab-evt` | planned |
 | security (`src/auth/`) | security-architecture.md | `fire-crab-auth` | planned — Srp reference implementations exist in three languages in the paper's samples |

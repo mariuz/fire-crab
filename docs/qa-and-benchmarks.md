@@ -172,14 +172,33 @@ draws the same op_reject that confirms Firebird 6's protocol floor. Two OOM/
 infinite-read footguns were caught locally (reading `/dev/urandom` as a whole
 file; a binary named after its package).
 
-This is explicitly the FOUNDATION, not the milestone. firebird-qa drives a
-server through attach/prepare/execute/fetch; the remaining converted steps, in
-order, are: the SRP proof and op_cont_auth (needs bignum modpow against the
-1024-bit group), wire encryption (ChaCha20/Arc4), op_attach, statement
-allocation and prepare, and op_execute/op_fetch. The
-[subsystem map](subsystem-map.md) tracks the sequence. Only when attach
-through fetch work end-to-end does the official pytest suite become
-applicable - and this handshake is the step every one of those builds on.
+The eighth differential is the one that turns a reader into a client:
+**fire-crab logs in to the live engine.** Converting `src/auth/
+SecureRemotePassword/srp.cpp`, it performs a full SRP-256 authentication -
+with SHA-1, SHA-256, RC4 and a 1024-bit big-integer modpow all implemented
+from scratch and vector-tested (the crypto never leaves the dependency-free
+core) - then turns on Arc4 wire encryption keyed by the derived session key
+and sends op_attach. The password never crosses the wire; both sides derive
+the shared secret independently.
+
+The correctness argument is layered. The crypto primitives are pinned to
+published vectors (empty/`abc` for the hashes, RFC RC4, textbook modexp). The
+SRP proof M is pinned to the paper's from-scratch reference
+(samples/nodejs/srp-handshake.js) for fixed inputs by a unit test - which is
+how the one real bug was found: `sub_mod` reduced `(a+m)` back to `a`, so the
+secret S diverged while A, u and x matched; the fixed-input test localized it
+in one step. Then the live differential (`qa/diff-login.sh`): fire-crab
+authenticates as SYSDBA and op_attach returns a handle; the engine's own
+MON$ATTACHMENTS records the attachment as `MON$AUTH_METHOD = Srp256`,
+`MON$WIRE_CRYPT_PLUGIN = Arc4` (isql, the native client, shows ChaCha64 - a
+clean discriminator); a wrong password draws isc_login (gds 335544472); a
+nonexistent user cannot log in. So the engine sees fire-crab as a genuine
+authenticated, encrypted client - not a decoder pretending.
+
+Still ahead before the firebird-qa milestone: statement allocation and
+prepare, and op_execute/op_fetch. Once those work, fire-crab can run a query
+end-to-end and the official pytest suite becomes applicable. The
+[subsystem map](subsystem-map.md) tracks the remaining sequence.
 
 ### Stage 3 — the Firebird QA suite (the milestone, not yet claimable)
 

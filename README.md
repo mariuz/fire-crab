@@ -42,7 +42,7 @@ the converter what the C++ is *doing* before they read a line of it.
 | Transaction system: TIP chain, delta versions, MVCC visibility (`tra.cpp`/`vio.cpp`) | `fire-crab-ods::tra` | **converted + committed-only-visibility differential vs live SELECT** |
 | Garbage-collection / sweep analysis (`vio.cpp`) | `fire-crab-ods::gc` | **converted + prediction differential vs live `gfix -sweep`** |
 | BLR intermediate language (`par.cpp`, `blp.h`) | `fire-crab-ods::blr` | **converted + verb-token differential vs the engine's own BLR printer** |
-| Wire protocol - XDR + connect/accept negotiation (`src/remote/`) | `fire-crab-wire` | **foundation converted + live negotiation differential**; SRP/crypt/attach/DSQL remain (the road to firebird-qa) |
+| Wire protocol - handshake + SRP-256 login + attach (`src/remote/`, `src/auth/`) | `fire-crab-wire` | **fire-crab LOGS IN to the live engine** - XDR, negotiation, SRP-256 auth, Arc4 wire crypt, op_attach, all differential-tested; op_execute/op_fetch remain before the firebird-qa suite runs |
 | Everything else | — | see [docs/subsystem-map.md](docs/subsystem-map.md) |
 
 Current QA state: `fcstat header` output is **byte-identical on the compared
