@@ -155,8 +155,31 @@ must peek for `blr_end` without consuming it (the format's trailing verb
 reads it), and `op_args`/`op_parameters` loop the count set by the preceding
 byte rather than reading their own - both exactly as gds.cpp does them.
 
-Next: the wire protocol (`src/remote/`) - the firebird-qa milestone, where
-the official pytest suite becomes applicable.
+The seventh differential opens the wire-protocol chapter - the road to the
+firebird-qa milestone. This first slice is the connect/accept handshake:
+fire-crab converts the XDR framing (big-endian ints, 4-byte-padded opaque,
+`src/remote/xdr.cpp`) and the op_connect/op_accept protocol-version
+negotiation (`src/remote/protocol.h`, the p_cnct structure), opens a real TCP
+connection to the server, and reads back the negotiated version.
+
+The differential (`qa/diff-wire.sh`) uses the fact that the server always
+selects the highest offered version it supports, and that the paper's clients
+sit at known points: the pure-wire clients (node-firebird, rsfbclient's
+pure_rust backend) negotiate 13, the native fbclient (C++/fb-cpp/fbintf)
+negotiates 20. fire-crab reproduces each exactly - offer 13 -> 13, offer
+13..20 -> 20, offer 16,17 -> 17 - and offering only legacy versions (<13)
+draws the same op_reject that confirms Firebird 6's protocol floor. Two OOM/
+infinite-read footguns were caught locally (reading `/dev/urandom` as a whole
+file; a binary named after its package).
+
+This is explicitly the FOUNDATION, not the milestone. firebird-qa drives a
+server through attach/prepare/execute/fetch; the remaining converted steps, in
+order, are: the SRP proof and op_cont_auth (needs bignum modpow against the
+1024-bit group), wire encryption (ChaCha20/Arc4), op_attach, statement
+allocation and prepare, and op_execute/op_fetch. The
+[subsystem map](subsystem-map.md) tracks the sequence. Only when attach
+through fetch work end-to-end does the official pytest suite become
+applicable - and this handshake is the step every one of those builds on.
 
 ### Stage 3 — the Firebird QA suite (the milestone, not yet claimable)
 

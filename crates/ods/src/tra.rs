@@ -11,7 +11,6 @@
 use crate::data::{flags, DataPage};
 use crate::format::{decode_record, Descriptor, Value};
 use crate::pointer::relation_data_pages;
-use crate::sqz;
 use crate::tip::{TipPage, TxState};
 use crate::u16_at;
 

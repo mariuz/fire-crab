@@ -1,0 +1,17 @@
+[package]
+name = "fire-crab-wire"
+version = "0.1.0"
+description = "Firebird wire-protocol client (fire-crab) - XDR + connect/accept negotiation"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[[bin]]
+name = "fcwire"
+path = "src/main.rs"
+
+[lib]
+name = "fire_crab_wire"
+path = "src/lib.rs"
