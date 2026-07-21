@@ -26,6 +26,7 @@
 pub mod btr;
 pub mod data;
 pub mod format;
+pub mod gc;
 pub mod header;
 pub mod pages;
 pub mod pip;
@@ -37,6 +38,7 @@ pub mod tra;
 pub use btr::{walk_index_leaves, BtreePage, IndexRootPage};
 pub use data::{DataPage, RecordHeader};
 pub use format::{decode_record, relation_formats, Descriptor, Value};
+pub use gc::{analyze as gc_analyze, version_count, GcReport};
 pub use header::HeaderPage;
 pub use pages::{census, PageType};
 pub use pip::PipPage;

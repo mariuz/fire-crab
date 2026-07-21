@@ -16,6 +16,8 @@
 //!   fcstat tx-state <db.fdb> <tx-id> - a transaction's TIP state
 //!   fcstat visible <db.fdb> <rel>   - rows visible to a committed-only
 //!                                     reader (TIP-driven version-chain walk)
+//!   fcstat gc <db.fdb> <rel>        - collectable-garbage analysis
+//!   fcstat versions <db.fdb> <rel>  - raw version count (for sweep diff)
 //!   fcstat bench-census <db.fdb> <iterations>
 
 use fire_crab_ods::{
@@ -45,6 +47,24 @@ fn main() {
         "header" => header(&data),
         "census" => census_cmd(&data),
         "tip" => tip(&data),
+        "gc" => {
+            let rel: u16 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                eprintln!("usage: fcstat gc <db.fdb> <relation-id>");
+                std::process::exit(2);
+            });
+            gc(&data, rel);
+        }
+        "versions" => {
+            let rel: u16 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                eprintln!("usage: fcstat versions <db.fdb> <relation-id>");
+                std::process::exit(2);
+            });
+            let h = decode_header(&data);
+            println!(
+                "{}",
+                fire_crab_ods::version_count(&data, h.page_size as usize, rel)
+            );
+        }
         "tx-state" => {
             let id: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
                 eprintln!("usage: fcstat tx-state <db.fdb> <tx-id>");
@@ -408,6 +428,30 @@ fn index_walk(data: &[u8], relation: u16, index_id: u8) {
     if order_violations > 0 {
         std::process::exit(1);
     }
+}
+
+/// Collectable-garbage analysis against the header's oldest snapshot.
+/// The `collectable` figure is fire-crab's prediction of how many
+/// version segments `gfix -sweep` would remove; qa/diff-sweep.sh
+/// checks it against the actual before/after version counts.
+fn gc(data: &[u8], relation: u16) {
+    let h = decode_header(data);
+    let page_size = h.page_size as usize;
+    let Some(tips) = fire_crab_ods::TipChain::read(data, page_size) else {
+        eprintln!("fcstat: no TIP chain");
+        std::process::exit(1);
+    };
+    let rep = fire_crab_ods::gc_analyze(data, page_size, relation, h.oldest_snapshot, &tips);
+    println!(
+        "relation {} (oldest snapshot {}):",
+        relation, h.oldest_snapshot
+    );
+    println!("  total versions       {}", rep.total_versions);
+    println!("  collectable versions {}", rep.collectable_versions);
+    println!("  records removed      {}", rep.records_removed);
+    println!("  live records         {}", rep.live_records);
+    // machine-readable line for the differential
+    println!("COLLECTABLE {}", rep.collectable_versions);
 }
 
 fn tx_state(data: &[u8], id: u64) {

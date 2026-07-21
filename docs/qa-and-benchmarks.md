@@ -113,9 +113,30 @@ Difference::apply is exercised on real data, not just its unit test. The raw
 walk differs by 10 lines (the 5 uncommitted primaries plus what they hide),
 confirming the uncommitted versions really are in the frozen file.
 
+The fifth semantic differential is a *prediction* differential over the
+sweep. fire-crab is a read-only decoder, so it converts the classification
+half of GC: `fcstat gc` applies vio.cpp's `cannotGC` predicate
+(vio.cpp:1663) against the file's oldest-snapshot threshold to count how many
+record-version segments a sweep would remove - back versions below a
+collectable committed primary, plus expunged deleted stubs and their chains.
+`qa/diff-sweep.sh` then checks that count against what `gfix -sweep` actually
+removes.
+
+The measurement's real difficulty is keeping garbage on disk: cooperative GC
+collects old versions on any scan that passes them with an advanced snapshot.
+The script defeats that by generating the garbage (three rounds of updates
+plus a delete slice) under a HELD snapshot transaction that pins the oldest
+snapshot and blocks cooperative GC, then releasing it and advancing the
+snapshot without scanning the table (touching only RDB$DATABASE) before
+freezing the file. Result (deterministic across runs): 300 versions before,
+90 after - the engine removed 210, exactly fire-crab's prediction - spanning
+both GC paths (the surviving rows' collectable back-chains and the deleted
+rows' expunged stubs). A prediction of zero would be flagged VACUOUS (the
+cooperative-GC race lost), so a passing run is necessarily non-trivial.
+
 Next: BLR decode against the byte dumps already captured in the paper's
-samples; GC/sweep (vio.cpp) using the visibility walk's dead-version
-classification.
+samples; the commit-order snapshot semantics against the transactions
+samples' verified outputs.
 
 ### Stage 3 — the Firebird QA suite (the milestone, not yet claimable)
 
