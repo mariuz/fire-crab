@@ -134,9 +134,29 @@ both GC paths (the surviving rows' collectable back-chains and the deleted
 rows' expunged stubs). A prediction of zero would be flagged VACUOUS (the
 cooperative-GC race lost), so a passing run is necessarily non-trivial.
 
-Next: BLR decode against the byte dumps already captured in the paper's
-samples; the commit-order snapshot semantics against the transactions
-samples' verified outputs.
+The sixth semantic differential covers BLR - Firebird's compiled
+intermediate language (computed fields, view/trigger/procedure bodies,
+defaults). fire-crab converts the operand-shape table the engine's OWN BLR
+pretty-printer uses (`blr_print_table` in blp.h, the op-atom loop in
+gds.cpp) into a structural walker and a 171-verb table, so it traverses any
+BLR tree byte-exactly. The oracle is that same printer: isql's `SET BLOB ALL`
+renders BLR via gds.cpp - the very code fire-crab converts - so
+`qa/diff-blr.sh` compares the sequence of `blr_*` verb/dtype tokens
+fire-crab emits against isql's, for every BLR blob in a database.
+
+Result across the paper's databases: **10 blobs match token-for-token, zero
+diffs** - from the 8-token FULL_NAME computed field to a 102-token stored
+procedure and a 25-token BEFORE-INSERT trigger. The 4 SKIPs are all the one
+verb the grammar does not yet model, `blr_abort` (exception raise, verb 128,
+which needs the exception-condition sub-grammar); fire-crab reports it by
+name and offset rather than mis-parsing - the honest incompleteness a partial
+grammar demands. Two bugs surfaced by the differential and fixed: `op_begin`
+must peek for `blr_end` without consuming it (the format's trailing verb
+reads it), and `op_args`/`op_parameters` loop the count set by the preceding
+byte rather than reading their own - both exactly as gds.cpp does them.
+
+Next: the wire protocol (`src/remote/`) - the firebird-qa milestone, where
+the official pytest suite becomes applicable.
 
 ### Stage 3 — the Firebird QA suite (the milestone, not yet claimable)
 

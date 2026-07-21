@@ -41,7 +41,8 @@ the converter what the C++ is *doing* before they read a line of it.
 | B-tree index pages + node encoding (`btn.h`) | `fire-crab-ods::btr` | **converted + index-order differential vs live ORDER BY** |
 | Transaction system: TIP chain, delta versions, MVCC visibility (`tra.cpp`/`vio.cpp`) | `fire-crab-ods::tra` | **converted + committed-only-visibility differential vs live SELECT** |
 | Garbage-collection / sweep analysis (`vio.cpp`) | `fire-crab-ods::gc` | **converted + prediction differential vs live `gfix -sweep`** |
-| BLR intermediate language (`par.cpp`) | `fire-crab-blr` | next |
+| BLR intermediate language (`par.cpp`, `blp.h`) | `fire-crab-ods::blr` | **converted + verb-token differential vs the engine's own BLR printer** |
+| Wire protocol (`src/remote/`) - the firebird-qa milestone | `fire-crab-remote` | next |
 | Everything else | — | see [docs/subsystem-map.md](docs/subsystem-map.md) |
 
 Current QA state: `fcstat header` output is **byte-identical on the compared

@@ -18,6 +18,7 @@
 //!                                     reader (TIP-driven version-chain walk)
 //!   fcstat gc <db.fdb> <rel>        - collectable-garbage analysis
 //!   fcstat versions <db.fdb> <rel>  - raw version count (for sweep diff)
+//!   fcstat blr <blob-file>          - decode a raw BLR blob (isql style)
 //!   fcstat bench-census <db.fdb> <iterations>
 
 use fire_crab_ods::{
@@ -42,6 +43,27 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    if args[1] == "blr" {
+        // <blob-file> holds raw BLR bytes; not a database file
+        match fire_crab_ods::decode_blr(&data) {
+            Ok(d) => {
+                for l in &d.lines {
+                    println!("{}", l);
+                }
+                let fields: Vec<String> = d.fields.iter().map(|(_, n)| n.clone()).collect();
+                eprintln!("FIELDS {}", fields.join(","));
+                if !d.relations.is_empty() {
+                    eprintln!("RELATIONS {}", d.relations.join(","));
+                }
+            }
+            Err(e) => {
+                eprintln!("fcstat: BLR decode failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     match args[1].as_str() {
         "header" => header(&data),

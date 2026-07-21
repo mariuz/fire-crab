@@ -41,7 +41,7 @@ Paper document links are relative to
 
 | C++ source | Paper document | Crate | Status |
 |---|---|---|---|
-| BLR decode (`src/jrd/blr.h`, par.cpp) | blr-intermediate-language.md | `fire-crab-blr` | planned — the paper's blr samples provide byte-exact fixtures |
+| BLR decode (`par.cpp` structure, `blp.h` + gds.cpp operand table) | blr-intermediate-language.md | `fire-crab-ods::blr` | **done** — operand-atom walker + verb table (171 verbs) converted from the engine's own printer; verb-token differential vs isql `SET BLOB ALL` (qa/diff-blr.sh), every decodable blob matches token-for-token, unknown verbs reported not guessed |
 | `src/dsql/` (SQL → BLR) | grammar-and-parser.md, dsql docs | `fire-crab-dsql` | planned |
 | `src/jrd/exe.cpp`, rse execution | query-optimizer-and-execution.md, request-lifecycle-code-trace.md | `fire-crab-exe` | planned |
 | optimizer | query-optimizer-and-execution.md | `fire-crab-opt` | planned — differential via RDB$SQL.EXPLAIN output on identical statistics |

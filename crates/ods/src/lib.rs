@@ -23,6 +23,7 @@
 //! - Record compression is converted from `src/jrd/sqz.cpp` including
 //!   the Firebird 4+ extended run lengths (control bytes -1/-2).
 
+pub mod blr;
 pub mod btr;
 pub mod data;
 pub mod format;
@@ -35,6 +36,7 @@ pub mod sqz;
 pub mod tip;
 pub mod tra;
 
+pub use blr::{decode as decode_blr, BlrDecode};
 pub use btr::{walk_index_leaves, BtreePage, IndexRootPage};
 pub use data::{DataPage, RecordHeader};
 pub use format::{decode_record, relation_formats, Descriptor, Value};
