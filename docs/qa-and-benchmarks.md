@@ -214,12 +214,32 @@ read must consume exactly the right byte count or the decryptor desyncs. The
 describe-items request also had to carry the exact isc_info_sql_* codes - a
 guessed set left the server waiting for a packet it never got.
 
-This is the firebird-qa entry threshold: fire-crab can now attach, prepare,
-execute and fetch on the wire, which is precisely what the official pytest
-suite drives. Running the suite itself, and broadening column-type and
-statement coverage beyond the single-BIGINT path, is the work that follows -
-but the pipeline every one of those tests exercises is now proven against the
-live engine.
+The tenth differential widens this to **general SELECTs**: fire-crab prepares
+a query, reads the column shape from the describe buffer, and fetches rows in
+batches, decoding the two wire shapes every column is coerced to - INT64 and
+VARYING (the same coercion the reference clients apply). `qa/diff-wire-select.sh`
+runs multi-column, multi-row queries - a 62-row id scan, an id+name projection,
+a field-list join, a COUNT/MIN/MAX aggregate - and every full result set
+matches isql row-for-row. Three more wire subtleties fell out along the way:
+the prepare describe buffer mixes bare marker codes (bind, select) with
+length-prefixed items, so the parser scans for the column-section marker
+rather than skipping items uniformly; a coerced VARYING column must carry its
+declared length in the fetch BLR or the server raises string-truncation; and
+an end-of-cursor op_fetch_response (status=100) still carries a messages field
+that must be consumed or the next op desyncs.
+
+**A framing correction, stated plainly.** `fire-crab-wire` is a wire-protocol
+*client*: it connects to the running C++ engine and every query is checked
+against isql. That is a real, strong differential - it proves fire-crab
+encodes and decodes every wire structure correctly (XDR, SRP-256, the
+message and BLR formats), against the genuine server. But firebird-qa drives
+a *server*, and fire-crab is not one yet. Making the suite applicable requires
+the server half of the protocol: accepting connections, the server side of
+SRP, and dispatching the decoded ops into the converted engine internals
+(the storage, transaction, GC and BLR layers already built). The client is
+the groundwork - it means every wire structure the server must produce is
+already understood and tested - but the server side is the honest remaining
+milestone.
 
 ### Stage 3 — the Firebird QA suite (the milestone, not yet claimable)
 

@@ -42,8 +42,19 @@ the converter what the C++ is *doing* before they read a line of it.
 | Transaction system: TIP chain, delta versions, MVCC visibility (`tra.cpp`/`vio.cpp`) | `fire-crab-ods::tra` | **converted + committed-only-visibility differential vs live SELECT** |
 | Garbage-collection / sweep analysis (`vio.cpp`) | `fire-crab-ods::gc` | **converted + prediction differential vs live `gfix -sweep`** |
 | BLR intermediate language (`par.cpp`, `blp.h`) | `fire-crab-ods::blr` | **converted + verb-token differential vs the engine's own BLR printer** |
-| Wire protocol - login + statement pipeline (`src/remote/`, `src/auth/`) | `fire-crab-wire` | **fire-crab RUNS A QUERY end-to-end** - login (SRP-256/Arc4/attach) plus transaction, allocate, prepare, execute, fetch; decoded values match isql. The firebird-qa entry threshold; broadening type/statement coverage is the ongoing work |
+| Wire protocol - login + general SELECT (`src/remote/`, `src/auth/`) | `fire-crab-wire` | **fire-crab runs multi-column, multi-row SELECTs** matching isql row-for-row (integer + text). This is a CLIENT of the C++ engine, which validates the wire codec; the firebird-qa suite needs the SERVER side (see below) |
 | Everything else | — | see [docs/subsystem-map.md](docs/subsystem-map.md) |
+
+**On the firebird-qa milestone, precisely.** The `fire-crab-wire` crate is a
+wire-protocol *client* - it connects to the running C++ engine, and every
+query it runs is checked against isql. This validates the wire codec (XDR,
+SRP-256, the message/BLR formats) end-to-end against the real server. But
+firebird-qa drives a *server*: making the suite applicable requires the
+server side of the protocol (accepting connections, the server half of SRP,
+dispatching ops into the converted engine internals). The client is the
+necessary groundwork - fire-crab can now encode and decode every wire
+structure the server side will need - but it is not itself the milestone.
+That framing is corrected here from earlier notes.
 
 Current QA state: `fcstat header` output is **byte-identical on the compared
 fields with `gstat -h` across 123 real Firebird 6 databases** (every scratch

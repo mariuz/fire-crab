@@ -450,6 +450,93 @@ const TPB_READ_COMMITTED: &[u8] = &[
     6,  /*wait*/
 ];
 
+// SQL type codes (ibase). We coerce to two wire shapes at fetch time,
+// exactly as the reference clients do: integer-family (scale 0) -> INT64,
+// text-family -> VARYING. Other types are reported as unsupported.
+const SQL_VARYING: u32 = 448;
+const SQL_TEXT: u32 = 452;
+const SQL_SHORT: u32 = 500;
+const SQL_LONG: u32 = 496;
+const SQL_INT64: u32 = 580;
+
+/// A column's fetch category, decided from the prepare describe.
+#[derive(Clone, Copy, PartialEq)]
+enum ColKind {
+    Int,
+    Text(u16),
+    Unsupported,
+}
+
+/// Minimal parse of the prepare describe buffer: for each SELECT column,
+/// extract (sqltype, scale) and reduce to a ColKind. The buffer is a
+/// stream of isc_info_sql_* items, each (except terminators) carrying a
+/// 2-byte LE length then that many payload bytes.
+fn parse_describe(buf: &[u8]) -> Option<Vec<ColKind>> {
+    // Locate the column section: the marker bytes isc_info_sql_select(4),
+    // isc_info_sql_describe_vars(7), then a 2-byte length (0x0004) and the
+    // 4-byte column count. Header items before this are a mix of bare
+    // codes (bind=5, select=4) and length-prefixed ones, so we scan for
+    // the exact 4-byte marker rather than trying to skip each item.
+    let mut i = (0..buf.len().saturating_sub(3))
+        .find(|&j| buf[j] == 4 && buf[j + 1] == 7 && buf[j + 2] == 4 && buf[j + 3] == 0)?;
+    i += 8; // past marker(2) + length(2) + column-count(4)
+
+    // Column items are uniform: [code][u16 le len][payload], except the
+    // bare terminators describe_end(8) and isc_info_end(1).
+    let mut cols: Vec<ColKind> = Vec::new();
+    let mut cur_type: Option<u32> = None;
+    let mut cur_scale: i32 = 0;
+    let mut cur_len: u16 = 0;
+    while i < buf.len() {
+        let code = buf[i] as u32;
+        i += 1;
+        match code {
+            8 => {
+                if let Some(t) = cur_type.take() {
+                    let base = t & !1;
+                    cols.push(match base {
+                        // coerced text keeps its declared length (the fetch
+                        // BLR emits blr_varying with this length)
+                        SQL_TEXT | SQL_VARYING => ColKind::Text(cur_len),
+                        SQL_SHORT | SQL_LONG | SQL_INT64 if cur_scale == 0 => ColKind::Int,
+                        _ => ColKind::Unsupported,
+                    });
+                    cur_scale = 0;
+                    cur_len = 0;
+                }
+            }
+            1 => break,
+            _ => {
+                if i + 2 > buf.len() {
+                    break;
+                }
+                let plen = u16::from_le_bytes([buf[i], buf[i + 1]]) as usize;
+                let payload = buf.get(i + 2..i + 2 + plen)?;
+                match code {
+                    11 => cur_type = Some(le_i32(payload) as u32),
+                    13 => cur_scale = le_i32(payload),
+                    14 => cur_len = le_i32(payload) as u16, // isc_info_sql_length
+                    _ => {}
+                }
+                i += 2 + plen;
+            }
+        }
+    }
+    if cols.is_empty() {
+        None
+    } else {
+        Some(cols)
+    }
+}
+
+fn le_i32(b: &[u8]) -> i32 {
+    let mut v = [0u8; 4];
+    for (i, x) in b.iter().take(4).enumerate() {
+        v[i] = *x;
+    }
+    i32::from_le_bytes(v)
+}
+
 impl Attachment {
     fn send_enc(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         let ct = self.enc.transform(bytes);
@@ -594,6 +681,177 @@ impl Attachment {
         } else {
             Ok(value)
         }
+    }
+}
+
+impl Attachment {
+    /// Run a general SELECT and return every row as text columns -
+    /// prepare, learn the column shape from the describe, fetch in
+    /// batches, decode INT64 and VARYING (the coerced wire shapes),
+    /// honor the null bitmap. The broad differential: any integer/text
+    /// SELECT compared to isql.
+    pub fn query_rows(&mut self, sql: &str) -> std::io::Result<Vec<Vec<String>>> {
+        let ioerr = |m: &str| std::io::Error::new(std::io::ErrorKind::Other, m.to_string());
+
+        let mut w = XdrWriter::default();
+        w.int(OP_TRANSACTION)
+            .int(self.handle)
+            .bytes(TPB_READ_COMMITTED);
+        self.send_enc(w.finish())?;
+        let tr = self.expect_response()?;
+
+        let mut w = XdrWriter::default();
+        w.int(OP_ALLOCATE_STATEMENT).int(self.handle);
+        self.send_enc(w.finish())?;
+        let stmt = self.expect_response()?;
+
+        let mut w = XdrWriter::default();
+        w.int(OP_PREPARE_STATEMENT)
+            .int(tr)
+            .int(stmt)
+            .int(SQL_DIALECT_3)
+            .str(sql)
+            .bytes(DESCRIBE_ITEMS)
+            .int(32768);
+        self.send_enc(w.finish())?;
+        // the prepare op_response's DATA field carries the describe buffer
+        if self.recv_int()? != OP_RESPONSE {
+            return Err(ioerr("expected op_response to prepare"));
+        }
+        self.recv_int()?; // handle
+        self.recv_int()?; // blob id lo
+        self.recv_int()?; // blob id hi
+        let describe = self.recv_bytes()?;
+        // drain the status vector
+        loop {
+            let t = self.recv_int()?;
+            if t == 0 {
+                break;
+            } else if t == 1 || t == 4 || t == 19 {
+                self.recv_int()?;
+            } else {
+                self.recv_bytes()?;
+            }
+        }
+        if std::env::var("D_DUMP").is_ok() {
+            eprint!("DESCRIBE {} bytes:", describe.len());
+            for b in &describe {
+                eprint!(" {:02x}", b);
+            }
+            eprintln!();
+        }
+        let kinds = parse_describe(&describe).ok_or_else(|| ioerr("could not parse describe"))?;
+        if kinds.iter().any(|k| *k == ColKind::Unsupported) {
+            return Err(ioerr(
+                "query has a column type not yet supported (int/text only)",
+            ));
+        }
+
+        // op_execute (no params)
+        let mut w = XdrWriter::default();
+        w.int(OP_EXECUTE).int(stmt).int(tr).bytes(&[]).int(0).int(0);
+        self.send_enc(w.finish())?;
+        self.expect_response()?;
+
+        // build the fetch output BLR from the column kinds
+        let mut blr: Vec<u8> = vec![5, 2, 4, 0]; // version5, begin, message, msg#0
+        let msg_len = (kinds.len() * 2) as u16;
+        blr.extend_from_slice(&msg_len.to_le_bytes());
+        for k in &kinds {
+            match k {
+                ColKind::Int => blr.extend_from_slice(&[16, 0]), // blr_int64, scale
+                ColKind::Text(len) => {
+                    blr.push(37); // blr_varying
+                    blr.extend_from_slice(&len.to_le_bytes());
+                }
+                ColKind::Unsupported => unreachable!(),
+            }
+            blr.extend_from_slice(&[7, 0]); // blr_short nullind
+        }
+        blr.extend_from_slice(&[255, 76]); // blr_end, blr_eoc
+
+        let ncols = kinds.len();
+        let nullmap_len = {
+            let bytes = ncols.div_ceil(8);
+            if bytes % 4 == 0 {
+                bytes
+            } else {
+                bytes + 4 - bytes % 4
+            }
+        };
+
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        'outer: loop {
+            let mut w = XdrWriter::default();
+            w.int(OP_FETCH).int(stmt).bytes(&blr).int(0).int(200);
+            self.send_enc(w.finish())?;
+
+            let mut got_in_batch = 0;
+            loop {
+                let op = self.recv_int()?;
+                if op == OP_RESPONSE {
+                    self.recv_response()?;
+                    return Err(ioerr("fetch: unexpected op_response"));
+                }
+                if op != OP_FETCH_RESPONSE {
+                    return Err(ioerr("fetch: unexpected op"));
+                }
+                let status = self.recv_int()?;
+                let messages = self.recv_int()?;
+                if status == 100 {
+                    break 'outer;
+                }
+                if messages == 0 {
+                    // end of this batch; re-fetch if we saw rows
+                    if got_in_batch == 0 {
+                        break 'outer;
+                    }
+                    break;
+                }
+                // a row: null bitmap then values
+                let nullmap = self.recv_raw(nullmap_len)?;
+                let mut row = Vec::with_capacity(ncols);
+                for (ci, k) in kinds.iter().enumerate() {
+                    let is_null = nullmap[ci / 8] >> (ci % 8) & 1 != 0;
+                    if is_null {
+                        row.push("<null>".to_string());
+                        continue;
+                    }
+                    match k {
+                        ColKind::Int => {
+                            let b = self.recv_raw(8)?;
+                            let v = i64::from_be_bytes(b[..8].try_into().unwrap());
+                            row.push(v.to_string());
+                        }
+                        ColKind::Text(_) => {
+                            let d = self.recv_bytes()?;
+                            row.push(String::from_utf8_lossy(&d).trim_end().to_string());
+                        }
+                        ColKind::Unsupported => unreachable!(),
+                    }
+                }
+                rows.push(row);
+                got_in_batch += 1;
+            }
+        }
+
+        let mut w = XdrWriter::default();
+        w.int(OP_FREE_STATEMENT).int(stmt).int(DSQL_DROP);
+        self.send_enc(w.finish())?;
+        self.expect_response()?;
+        let mut w = XdrWriter::default();
+        w.int(OP_COMMIT).int(tr);
+        self.send_enc(w.finish())?;
+        self.expect_response()?;
+
+        Ok(rows)
+    }
+
+    /// Read `n` raw bytes, decrypting through the session cipher.
+    fn recv_raw(&mut self, n: usize) -> std::io::Result<Vec<u8>> {
+        let mut b = vec![0u8; n];
+        self.stream.read_exact(&mut b)?;
+        Ok(self.dec.transform(&b))
     }
 }
 

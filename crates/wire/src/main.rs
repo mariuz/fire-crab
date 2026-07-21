@@ -4,7 +4,12 @@ use fire_crab_wire::{login, negotiate};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 4 || (args[1] != "negotiate" && args[1] != "login" && args[1] != "query") {
+    if args.len() < 4
+        || (args[1] != "negotiate"
+            && args[1] != "login"
+            && args[1] != "query"
+            && args[1] != "query-rows")
+    {
         eprintln!(
             "usage: fcwire negotiate|login|query <host:port> <db-path> [user] [password] [sql]"
         );
@@ -18,6 +23,34 @@ fn main() {
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
         use std::io::Read;
         let _ = f.read_exact(&mut rnd);
+    }
+    if args[1] == "query-rows" {
+        let user = args.get(4).cloned().unwrap_or_else(|| "SYSDBA".into());
+        let pass = args.get(5).cloned().unwrap_or_else(|| "masterkey".into());
+        let sql = args
+            .get(6)
+            .cloned()
+            .unwrap_or_else(|| "SELECT RDB$RELATION_ID FROM RDB$RELATIONS".into());
+        match login(&host, port, &args[3], &user, &pass, &rnd, &[13]) {
+            Ok(mut att) => match att.query_rows(&sql) {
+                Ok(rows) => {
+                    for r in &rows {
+                        println!("{}", r.join("\t"));
+                    }
+                    let _ = att.detach();
+                }
+                Err(e) => {
+                    eprintln!("fcwire query-rows: {}", e);
+                    let _ = att.detach();
+                    std::process::exit(1);
+                }
+            },
+            Err(e) => {
+                eprintln!("fcwire login: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
     }
     if args[1] == "query" {
         let user = args.get(4).cloned().unwrap_or_else(|| "SYSDBA".into());
