@@ -1,0 +1,64 @@
+# Subsystem map: C++ engine → paper document → Rust conversion
+
+The conversion's chart. Each row links the C++ source directory, the
+companion-paper document that explains it (the recommended reading *before*
+the source), the planned crate, and the status. Order within phases is the
+planned conversion order; the criterion is always "what can be
+differential-tested next with the least new machinery" (see
+[methodology.md](methodology.md)).
+
+Paper document links are relative to
+[conceptual-architecture-for-firebird-paper](https://github.com/mariuz/conceptual-architecture-for-firebird-paper).
+
+## Phase 1 — storage, bottom-up (in progress)
+
+| C++ source | Paper document | Crate / module | Status |
+|---|---|---|---|
+| `src/jrd/ods.h` (pag, header_page, tx_inv_page) | on-disk-structure.md | `fire-crab-ods` {pages, header, tip} | **done** — differential vs gstat, 123 dbs |
+| `src/jrd/sqz.cpp` (record RLE) | on-disk-structure.md § records | `fire-crab-ods::sqz` | **done** — round-trip incl. FB4 forms |
+| `src/jrd/ods.h` (page_inv_page / PIP) | on-disk-structure.md | `fire-crab-ods::pip` | next |
+| `src/jrd/ods.h` (pointer_page, data_page, rhd/rhdf) | on-disk-structure.md, transactions-and-concurrency.md | `fire-crab-ods::{pointer,data}` | next — unlocks the record walk, diffable vs SELECT |
+| `src/jrd/btr.cpp` / btree_page | indexing-and-full-text-search.md | `fire-crab-btr` | planned |
+| `src/jrd/blb.cpp` / blob_page | blob-handling.md | `fire-crab-blb` | planned |
+
+## Phase 2 — the transaction system
+
+| C++ source | Paper document | Crate | Status |
+|---|---|---|---|
+| `src/jrd/tra.cpp`, tip walking, snapshots | transactions-and-concurrency.md | `fire-crab-tra` | planned — diffable via TIP decode + commit-order semantics against live engine |
+| `src/jrd/vio.cpp` (record versions, GC) | garbage-collection-and-sweep.md | `fire-crab-vio` | planned |
+| `src/lock/lock.cpp` | lock-manager.md | `fire-crab-lck` | planned |
+
+## Phase 3 — cache and physical I/O
+
+| C++ source | Paper document | Crate | Status |
+|---|---|---|---|
+| `src/jrd/cch.cpp` (page cache, latching) | page-cache-coherency.md, careful-writes-and-crash-safety.md | `fire-crab-cch` | planned — careful-writes precedence is THE correctness gate; crash-harness differential (kill mid-write, compare recovery) |
+| `src/jrd/pag.cpp`, `src/jrd/pio_unix.cpp` | on-disk-structure.md | `fire-crab-pio` | planned |
+
+## Phase 4 — language: BLR, DSQL, the executor
+
+| C++ source | Paper document | Crate | Status |
+|---|---|---|---|
+| BLR decode (`src/jrd/blr.h`, par.cpp) | blr-intermediate-language.md | `fire-crab-blr` | planned — the paper's blr samples provide byte-exact fixtures |
+| `src/dsql/` (SQL → BLR) | grammar-and-parser.md, dsql docs | `fire-crab-dsql` | planned |
+| `src/jrd/exe.cpp`, rse execution | query-optimizer-and-execution.md, request-lifecycle-code-trace.md | `fire-crab-exe` | planned |
+| optimizer | query-optimizer-and-execution.md | `fire-crab-opt` | planned — differential via RDB$SQL.EXPLAIN output on identical statistics |
+
+## Phase 5 — the outside faces
+
+| C++ source | Paper document | Crate | Status |
+|---|---|---|---|
+| wire protocol (`src/remote/`) | firebird-wire-protocol.md | `fire-crab-remote` | planned — **the firebird-qa milestone**: once attach/prepare/execute/fetch work on the wire, the official pytest suite runs unmodified against fire-crab |
+| services (`src/jrd/svc.cpp`) | services-api.md | `fire-crab-svc` | planned |
+| events (`src/jrd/event.cpp`) | firebird-events.md | `fire-crab-evt` | planned |
+| security (`src/auth/`) | security-architecture.md | `fire-crab-auth` | planned — Srp reference implementations exist in three languages in the paper's samples |
+
+## Reference material per row
+
+For every subsystem above, the paper repo also carries **verified hands-on
+samples in five languages** (C++ OO-API, fb-cpp, node-firebird, rsfbclient,
+fbintf) whose outputs are known-good expected values for differential tests —
+e.g. the blr samples' byte dumps, the transactions samples' conflict error
+chains, and the on-disk samples' header/census values used by this repo's QA
+today.

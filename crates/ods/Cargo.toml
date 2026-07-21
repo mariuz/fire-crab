@@ -1,0 +1,9 @@
+[package]
+name = "fire-crab-ods"
+version = "0.1.0"
+description = "Firebird on-disk structure (ODS 14) decoding in Rust - the first fire-crab conversion slice"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

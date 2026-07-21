@@ -1,0 +1,10 @@
+[package]
+name = "fcstat"
+version = "0.1.0"
+description = "gstat-like database file inspector built on fire-crab-ods"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fire-crab-ods = { path = "../ods" }

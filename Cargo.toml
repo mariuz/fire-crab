@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["crates/ods", "crates/fcstat"]
+
+[workspace.package]
+edition = "2021"
+license = "IDPL-1.0"
+repository = "https://github.com/mariuz/fire-crab"
