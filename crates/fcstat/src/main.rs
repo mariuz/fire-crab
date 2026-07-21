@@ -9,9 +9,14 @@
 //!   fcstat census <db.fdb>          - whole-file page-type census
 //!   fcstat tip <db.fdb>             - transaction states from the first TIP
 //!   fcstat records <db.fdb> <rel>   - record-version walk of one relation
+//!   fcstat rows <db.fdb> <rel>      - decoded rows (tab-separated), via the
+//!                                     RDB\$FORMATS bootstrap
 //!   fcstat bench-census <db.fdb> <iterations>
 
-use fire_crab_ods::{census, relation_data_pages, DataPage, HeaderPage, TipPage, TxState};
+use fire_crab_ods::{
+    census, decode_record, relation_data_pages, relation_formats, DataPage, HeaderPage, TipPage,
+    TxState,
+};
 use std::time::Instant;
 
 fn main() {
@@ -35,6 +40,16 @@ fn main() {
         "header" => header(&data),
         "census" => census_cmd(&data),
         "tip" => tip(&data),
+        "rows" => {
+            let rel: u16 = match args.get(3).and_then(|s| s.parse().ok()) {
+                Some(r) => r,
+                None => {
+                    eprintln!("usage: fcstat rows <db.fdb> <relation-id>");
+                    std::process::exit(2);
+                }
+            };
+            rows(&data, rel);
+        }
         "records" => {
             let rel: u16 = match args.get(3).and_then(|s| s.parse().ok()) {
                 Some(r) => r,
@@ -217,10 +232,8 @@ fn records(data: &[u8], relation: u16) {
                 deleted += 1;
             } else {
                 primary += 1;
-                // every primary payload must be a well-formed sqz stream
-                if r.flags & flags::INCOMPLETE == 0
-                    && fire_crab_ods::sqz::unpack(r.packed_data).is_none()
-                {
+                // every complete primary must yield a record image
+                if r.flags & flags::INCOMPLETE == 0 && r.image().is_none() {
                     unpack_errors += 1;
                 }
             }
@@ -235,6 +248,54 @@ fn records(data: &[u8], relation: u16) {
     println!("  deleted stubs     {}", deleted);
     if unpack_errors > 0 {
         println!("  UNPACK ERRORS     {}", unpack_errors);
+    }
+}
+
+/// Decode every primary record of a relation into column values,
+/// using the format each record names in rhd_format, obtained through
+/// the RDB\$FORMATS bootstrap (system format hardcoded, exactly like
+/// the engine's own metadata bootstrap). Output: one tab-separated
+/// line per row - the raw material for qa/diff-rows.sh.
+fn rows(data: &[u8], relation: u16) {
+    let h = decode_header(data);
+    let page_size = h.page_size as usize;
+
+    let formats = relation_formats(data, page_size, relation);
+    if formats.is_empty() {
+        eprintln!(
+            "fcstat: no formats for relation {} in RDB$FORMATS (system relation?)",
+            relation
+        );
+        std::process::exit(1);
+    }
+
+    for dp_no in relation_data_pages(data, page_size, relation) {
+        let start = dp_no as usize * page_size;
+        let Some(dp) = data
+            .get(start..start + page_size)
+            .and_then(DataPage::decode)
+        else {
+            continue;
+        };
+        for r in dp.records() {
+            if !r.is_primary_record() {
+                continue;
+            }
+            let Some(image) = r.image() else {
+                eprintln!("fcstat: sqz error at page {} slot {}", dp_no, r.slot);
+                continue;
+            };
+            let Some((_, descs)) = formats
+                .iter()
+                .find(|(n, _)| *n == r.format)
+                .or_else(|| formats.iter().max_by_key(|(n, _)| *n))
+            else {
+                continue;
+            };
+            let row = decode_record(&image, descs);
+            let line: Vec<String> = row.iter().map(|v| v.render()).collect();
+            println!("{}", line.join("\t"));
+        }
     }
 }
 

@@ -20,6 +20,7 @@ pub mod flags {
     pub const GC_ACTIVE: u16 = 256;
     pub const UK_MODIFIED: u16 = 512;
     pub const LONG_TRANUM: u16 = 1024; // 64-bit transaction id (rhde)
+    pub const NOT_PACKED: u16 = 2048; // image stored raw, no RLE (ods.h:1018)
 }
 
 pub const DPG_RPT_OFFSET: usize = 24;
@@ -60,6 +61,17 @@ impl RecordHeader<'_> {
     pub fn is_primary_record(&self) -> bool {
         self.flags & (flags::CHAIN | flags::FRAGMENT | flags::BLOB | flags::DELETED) == 0
     }
+
+    /// The unpacked record image: `NOT_PACKED` records (ods.h:1018,
+    /// stored "as is") pass through, everything else goes through the
+    /// sqz codec.
+    pub fn image(&self) -> Option<Vec<u8>> {
+        if self.flags & flags::NOT_PACKED != 0 {
+            Some(self.packed_data.to_vec())
+        } else {
+            crate::sqz::unpack(self.packed_data)
+        }
+    }
 }
 
 impl<'a> DataPage<'a> {
@@ -87,21 +99,45 @@ impl<'a> DataPage<'a> {
         Some((u16_at(self.page, at), u16_at(self.page, at + 2)))
     }
 
-    /// Decode the record header in `slot`, if the slot is occupied
-    /// and sane (offset/length inside the page).
-    pub fn record(&self, i: u16) -> Option<RecordHeader<'a>> {
+    /// The raw bytes of an occupied slot. For blob slots this is the
+    /// `blh` struct itself - dpm.epp:2491 lays the blh down IN PLACE
+    /// of a record header (`blh_flags` aliases `rhd_flags` at offset
+    /// 10), so blob slots must not be parsed as rhd.
+    pub fn slot_bytes(&self, i: u16) -> Option<&'a [u8]> {
         let (offset, length) = self.slot(i)?;
         if length == 0 {
             return None;
         }
         let start = offset as usize;
         let end = start + length as usize;
-        if start < DPG_RPT_OFFSET || end > self.page.len() || length < RHD_DATA_OFFSET as u16 {
+        if start < DPG_RPT_OFFSET || end > self.page.len() {
             return None;
         }
-        let r = &self.page[start..end];
+        Some(&self.page[start..end])
+    }
 
-        let flags = u16_at(r, 10); // rhd_flags @10
+    /// Decode the record header in `slot`, if the slot is occupied
+    /// and sane (offset/length inside the page). Blob slots (see
+    /// [DataPage::slot_bytes]) yield a header whose `packed_data` is
+    /// empty - use `slot_bytes` for the blh.
+    pub fn record(&self, i: u16) -> Option<RecordHeader<'a>> {
+        let r = self.slot_bytes(i)?;
+        if r.len() < RHD_DATA_OFFSET {
+            return None;
+        }
+
+        let flags = u16_at(r, 10); // rhd_flags @10 (= blh_flags @10)
+        if flags & flags::BLOB != 0 {
+            return Some(RecordHeader {
+                slot: i,
+                transaction: 0,
+                back_page: 0,
+                back_line: 0,
+                flags,
+                format: 0,
+                packed_data: &[],
+            });
+        }
         let (transaction, data_at) = if flags & flags::LONG_TRANUM != 0 {
             // rhde: 64-bit id split low/high (ods.h:918/923)
             let low = u32_at(r, 0) as u64;

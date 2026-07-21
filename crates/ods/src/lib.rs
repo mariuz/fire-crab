@@ -24,6 +24,7 @@
 //!   the Firebird 4+ extended run lengths (control bytes -1/-2).
 
 pub mod data;
+pub mod format;
 pub mod header;
 pub mod pages;
 pub mod pip;
@@ -32,6 +33,7 @@ pub mod sqz;
 pub mod tip;
 
 pub use data::{DataPage, RecordHeader};
+pub use format::{decode_record, relation_formats, Descriptor, Value};
 pub use header::HeaderPage;
 pub use pages::{census, PageType};
 pub use pip::PipPage;

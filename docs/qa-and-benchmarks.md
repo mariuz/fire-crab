@@ -49,10 +49,35 @@ OK  GCTEST         0 rows   (empty table)
 ```
 
 Every primary payload is additionally required to be a well-formed sqz
-stream (`UNPACK ERRORS` would be reported); none have failed. Next: the
-B-tree walk against index navigation; BLR decode against the byte dumps
-already captured in the paper's samples; commit-order semantics against the
-transactions samples' verified outputs.
+stream (`UNPACK ERRORS` would be reported); none have failed.
+
+The second semantic differential upgrades that to **full rows**:
+`qa/diff-rows.sh` decodes every row of every user table from the raw file
+(`fcstat rows`: RDB$FORMATS bootstrap with the hardcoded system format,
+blob-id resolution via the ods.cpp record-number formulas, segmented blob
+assembly, descriptor-driven field decode) and compares value-for-value
+against `SELECT` through the live engine, with both sides canonicalized and
+the mapping between format order (RDB$FIELD_ID) and SELECT order
+(RDB$FIELD_POSITION) applied explicitly - gbak restore assigns the two
+differently, which the first run caught. Current results: value-for-value
+agreement on every compared column of every table tested (SALES, DEPT/EMP,
+DOCS incl. blob/null patterns, SHOWCASE booleans, UTF8 text with accents,
+MON_WORK at 10k and BULK at 200k rows). Declared exclusions, reported
+per-table by the script rather than silently dropped: double/float (render
+formatting), DECFLOAT/INT128/TZ types (not yet decoded), and text columns in
+charsets the Rust side cannot yet transliterate (engine CASTs transliterate;
+fire-crab reads raw bytes).
+
+What the row differential taught (kept per methodology.md): records can be
+stored UNCOMPRESSED (`rhd_not_packed`, ods.h:1018) - the strict sqz check
+flagged exactly those; and a blob slot holds the `blh` struct IN PLACE of a
+record header (dpm.epp:2491, `blh_flags` aliasing `rhd_flags`), so parsing it
+as rhd reads garbage. Both were caught by differential failures, not by code
+review.
+
+Next: the B-tree walk against index navigation; BLR decode against the byte
+dumps already captured in the paper's samples; commit-order semantics against
+the transactions samples' verified outputs.
 
 ### Stage 3 — the Firebird QA suite (the milestone, not yet claimable)
 
