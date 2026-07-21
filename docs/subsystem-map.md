@@ -19,7 +19,7 @@ Paper document links are relative to
 | `src/jrd/ods.h` (page_inv_page / PIP) | on-disk-structure.md | `fire-crab-ods::pip` | **done** — bitmap + capacity formula tested |
 | `src/jrd/ods.h` (pointer_page, data_page, rhd/rhde + flags) | on-disk-structure.md, transactions-and-concurrency.md | `fire-crab-ods::{pointer,data}` | **done** — record walk diffs vs live SELECT COUNT(*) (qa/diff-select.sh), 0 to 200k rows OK |
 | record field decode via RDB$FORMATS | on-disk-structure.md, metadata-cache.md, catalog-bootstrap.md | `fire-crab-ods::format` | **done** — descriptors, null bitmap, dtype decode, blob-id resolution + level 0/1 segmented blob assembly, hardcoded system format for the bootstrap; full-row differential vs live SELECT (qa/diff-rows.sh) |
-| `src/jrd/btr.cpp` / btree_page | indexing-and-full-text-search.md | `fire-crab-btr` | planned |
+| `src/jrd/btr.cpp`, `btn.h` / index_root_page + btree_page + node encoding | indexing-and-full-text-search.md | `fire-crab-ods::btr` | **done** — leaf-level walk with prefix decompression; index-order differential vs live ORDER BY (qa/diff-index.sh), identical order at 200k rows through a multi-level tree |
 | `src/jrd/blb.cpp` / blob_page | blob-handling.md | `fire-crab-blb` | planned |
 
 ## Phase 2 — the transaction system

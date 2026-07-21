@@ -11,11 +11,13 @@
 //!   fcstat records <db.fdb> <rel>   - record-version walk of one relation
 //!   fcstat rows <db.fdb> <rel>      - decoded rows (tab-separated), via the
 //!                                     RDB\$FORMATS bootstrap
+//!   fcstat indexes <db.fdb> <rel>   - the relation's index roots
+//!   fcstat index-walk <db.fdb> <rel> <index-id> - ordered leaf-level walk
 //!   fcstat bench-census <db.fdb> <iterations>
 
 use fire_crab_ods::{
-    census, decode_record, relation_data_pages, relation_formats, DataPage, HeaderPage, TipPage,
-    TxState,
+    census, decode_record, relation_data_pages, relation_formats, walk_index_leaves, DataPage,
+    HeaderPage, TipPage, TxState,
 };
 use std::time::Instant;
 
@@ -40,6 +42,13 @@ fn main() {
         "header" => header(&data),
         "census" => census_cmd(&data),
         "tip" => tip(&data),
+        "rows-recno" => {
+            let rel: u16 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                eprintln!("usage: fcstat rows-recno <db.fdb> <relation-id>");
+                std::process::exit(2);
+            });
+            rows_inner(&data, rel, true);
+        }
         "rows" => {
             let rel: u16 = match args.get(3).and_then(|s| s.parse().ok()) {
                 Some(r) => r,
@@ -49,6 +58,24 @@ fn main() {
                 }
             };
             rows(&data, rel);
+        }
+        "indexes" => {
+            let rel: u16 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                eprintln!("usage: fcstat indexes <db.fdb> <relation-id>");
+                std::process::exit(2);
+            });
+            indexes(&data, rel);
+        }
+        "index-walk" => {
+            let rel: u16 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                eprintln!("usage: fcstat index-walk <db.fdb> <rel> <index-id>");
+                std::process::exit(2);
+            });
+            let idx: u8 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                eprintln!("usage: fcstat index-walk <db.fdb> <rel> <index-id>");
+                std::process::exit(2);
+            });
+            index_walk(&data, rel, idx);
         }
         "records" => {
             let rel: u16 = match args.get(3).and_then(|s| s.parse().ok()) {
@@ -257,6 +284,13 @@ fn records(data: &[u8], relation: u16) {
 /// the engine's own metadata bootstrap). Output: one tab-separated
 /// line per row - the raw material for qa/diff-rows.sh.
 fn rows(data: &[u8], relation: u16) {
+    rows_inner(data, relation, false)
+}
+
+/// with_recno additionally prefixes each line with the record number
+/// (dpg_sequence * maxRecsPerDP + slot) - the join key for the index
+/// differential.
+fn rows_inner(data: &[u8], relation: u16, with_recno: bool) {
     let h = decode_header(data);
     let page_size = h.page_size as usize;
 
@@ -294,8 +328,68 @@ fn rows(data: &[u8], relation: u16) {
             };
             let row = decode_record(&image, descs);
             let line: Vec<String> = row.iter().map(|v| v.render()).collect();
-            println!("{}", line.join("\t"));
+            if with_recno {
+                let recno = dp.sequence as u64 * fire_crab_ods::format::max_recs_per_dp(page_size)
+                    + r.slot as u64;
+                println!("{}\t{}", recno, line.join("\t"));
+            } else {
+                println!("{}", line.join("\t"));
+            }
         }
+    }
+}
+
+fn indexes(data: &[u8], relation: u16) {
+    let h = decode_header(data);
+    let Some(irt) = fire_crab_ods::btr::find_index_root(data, h.page_size as usize, relation)
+    else {
+        eprintln!("fcstat: no index root page for relation {}", relation);
+        std::process::exit(1);
+    };
+    println!("relation {}: {} index slots", relation, irt.count);
+    for e in irt.entries() {
+        if e.root_page != 0 {
+            println!(
+                "  index {}: root page {}, {} key(s), state {}, flags {:#x}",
+                e.id, e.root_page, e.key_count, e.state, e.flags
+            );
+        }
+    }
+}
+
+/// Ordered leaf-level walk: one line per entry - record number and the
+/// reconstructed key in hex. The key ordering invariant (memcmp
+/// non-decreasing) is checked as the walk goes; a violation means the
+/// prefix decompression is wrong.
+fn index_walk(data: &[u8], relation: u16, index_id: u8) {
+    let h = decode_header(data);
+    let Some(entries) = walk_index_leaves(data, h.page_size as usize, relation, index_id) else {
+        eprintln!(
+            "fcstat: cannot walk index {} of relation {}",
+            index_id, relation
+        );
+        std::process::exit(1);
+    };
+    let mut prev: Option<&[u8]> = None;
+    let mut order_violations = 0u64;
+    for (key, recno) in &entries {
+        if let Some(p) = prev {
+            if p > key.as_slice() {
+                order_violations += 1;
+            }
+        }
+        prev = Some(key.as_slice());
+        let hex: String = key.iter().map(|b| format!("{:02x}", b)).collect();
+        println!("{}\t{}", recno, hex);
+    }
+    eprintln!(
+        "index {}: {} entries, {} order violations",
+        index_id,
+        entries.len(),
+        order_violations
+    );
+    if order_violations > 0 {
+        std::process::exit(1);
     }
 }
 

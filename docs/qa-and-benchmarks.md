@@ -75,9 +75,21 @@ record header (dpm.epp:2491, `blh_flags` aliasing `rhd_flags`), so parsing it
 as rhd reads garbage. Both were caught by differential failures, not by code
 review.
 
-Next: the B-tree walk against index navigation; BLR decode against the byte
-dumps already captured in the paper's samples; commit-order semantics against
-the transactions samples' verified outputs.
+The third semantic differential covers the B-tree layer: `qa/diff-index.sh`
+walks each single-segment PRIMARY KEY index at leaf level from the raw file
+(root descent down the leftmost spine, sibling-chain traversal, btn.h node
+decoding with varint record numbers and prefix decompression), joins the
+walked record numbers back to decoded rows, and compares the resulting
+column-value sequence against the live engine's `SELECT ... ORDER BY` over
+the same index. PK indices keep the comparison exact (single segment, NOT
+NULL, unique - no NULL-ordering or duplicate-order ambiguity). Current
+results: identical order on every index tested, including a 200,000-row
+primary key through a multi-level tree; the walk also asserts the memcmp
+non-decreasing key invariant as it goes (zero violations).
+
+Next: BLR decode against the byte dumps already captured in the paper's
+samples; commit-order semantics against the transactions samples' verified
+outputs.
 
 ### Stage 3 — the Firebird QA suite (the milestone, not yet claimable)
 
