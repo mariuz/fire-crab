@@ -43,7 +43,8 @@ the converter what the C++ is *doing* before they read a line of it.
 | Garbage-collection / sweep analysis (`vio.cpp`) | `fire-crab-ods::gc` | **converted + prediction differential vs live `gfix -sweep`** |
 | BLR intermediate language (`par.cpp`, `blp.h`) | `fire-crab-ods::blr` | **converted + verb-token differential vs the engine's own BLR printer** |
 | Wire protocol - client: login + general SELECT (`src/remote/`, `src/auth/`) | `fire-crab-wire` | **fire-crab runs multi-column, multi-row SELECTs** matching isql row-for-row (integer + text). Validates the wire codec against the real C++ server |
-| Wire protocol - server: accept + SRP-256 + attach + statement pipeline | `fire-crab-wire::server` | **a real third-party client (node-firebird) authenticates, arms Arc4 wire encryption, attaches and runs a query end-to-end against fire-crab**; the C++ `isql` authenticates and attaches too (see below). No SQL engine yet - queries answer a fixed value |
+| Wire protocol - server: accept + SRP-256 + attach + statement pipeline | `fire-crab-wire::server` | **a real third-party client (node-firebird) authenticates, arms Arc4 wire encryption, attaches and runs a query end-to-end against fire-crab**; the C++ `isql` authenticates and attaches too (see below) |
+| Real query execution: `SELECT COUNT(*) FROM <table>` from pages | `fire-crab-wire::server` + `fire-crab-ods::catalog` | **the server answers a real query from the database file** - resolves the table name through `RDB$RELATIONS` and counts committed records from the data pages; over the wire, node-firebird's count matches isql exactly on user and system tables |
 | Everything else | — | see [docs/subsystem-map.md](docs/subsystem-map.md) |
 
 **On the firebird-qa milestone, precisely.** firebird-qa drives a *server*,
@@ -64,12 +65,16 @@ not just make them. Both halves now exist:
   SRP-256 and attaches as well, then drives its richer post-attach ops
   (op_cancel, op_info_database) until it reaches op_exec_immediate.
 
-What the server does *not* yet have is a SQL engine: prepare/execute/fetch
-answer a fixed single-BIGINT result, which is enough to prove the whole
-request/response pipeline round-trips against a genuine client. Dispatching
-ops into the converted engine internals (the `ods` crate) - so the fixed
-answer becomes a real query result - is the work that follows. The protocol
-server it will run on is proven here.
+The server now answers a **real query** from the database file the client
+attaches to: `SELECT COUNT(*) FROM <table>` resolves the table name through
+`RDB$RELATIONS` (read straight from its data pages by `fire-crab-ods::catalog`)
+and counts the committed records - and over the encrypted wire, node-firebird's
+result matches isql exactly on every user and system table tested. This is the
+first op dispatched into the converted `ods` engine internals rather than
+answered by a constant; other statement shapes still fall back to the fixed
+value. Widening the SQL surface (projections, real column types, WHERE) is the
+work that continues from here - but the fixed answer is no longer fixed. The
+protocol server it runs on is proven against a genuine client.
 
 Current QA state: `fcstat header` output is **byte-identical on the compared
 fields with `gstat -h` across 123 real Firebird 6 databases** (every scratch

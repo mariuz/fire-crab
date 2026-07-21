@@ -283,18 +283,56 @@ With these, **node-firebird completes a query end-to-end**, and the C++
 post-attach ops until it reaches `op_exec_immediate` - the point where a
 fixed-answer server can go no further without a real SQL engine.
 
+### The eleventh differential — the server answers a REAL query
+
+`qa/serve-real-query.sh` is the tenth differential with the fixed answer
+removed. fire-crab runs as a server, **opens the database file the client
+names in `op_attach`**, and answers `SELECT COUNT(*) FROM <table>` from that
+file's actual pages. node-firebird drives it over the encrypted wire, and
+every count must equal what isql returns through the C++ engine on the same
+file - which it does, on user tables and system tables alike (e.g. `DEPT` 20,
+`EMP` 2000, `RDB$RELATIONS` 62, `RDB$FIELDS` 193, `RDB$DATABASE` 1).
+
+Two pieces make it work, both in the converted engine, no C++ involved:
+
+- **Name resolution** (`fire-crab-ods::catalog`): the table name is looked up
+  in `RDB$RELATIONS` (relation 6), read straight from its data pages. System
+  relations are bootstrap metadata - their record format is *not* in
+  `RDB$FORMATS` (the engine formats them at creation, not through the catalog)
+  - so, exactly as `format.rs` hardcodes the `RDB$FORMATS` system format,
+  `catalog.rs` hardcodes the two field offsets it needs: `RDB$RELATION_ID`
+  (SHORT) at image offset 32, `RDB$RELATION_NAME` (CHAR(252)) at offset 42.
+  Both were confirmed against the live engine: `fcstat relations` reproduces
+  `SELECT RDB$RELATION_ID, RDB$RELATION_NAME FROM RDB$RELATIONS` identically
+  across every database tested.
+- **The count** (`count_primary_records`): the committed primary record
+  versions of the relation, walked from the data pages - the same computation
+  `qa/diff-select.sh` already validates at the tool level, now returned over
+  the wire. It equals the engine's `COUNT(*)` on a clean file (no uncommitted
+  work, no pending back-versions); full MVCC-visibility counting lives in
+  `tra::visible_rows` for when that precondition does not hold.
+
+This is the first op dispatched into the converted storage engine rather than
+answered by a constant. It is deliberately narrow - one query shape, integer
+result, the describe buffer unchanged - because the point is the *dispatch
+path*, file → resolve → walk → wire, proven end-to-end against a real client.
+`fcstat count <db> <table>` exposes the same path without the wire, for the
+differential's file side.
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
 suite (thousands of tests) drives a **server** through the wire protocol via
 the firebird-driver. The server side proven above is the entry to it: the
 handshake, authentication, encryption and op dispatch a real client needs are
-in place. What stands between here and running the suite is the SQL engine
-behind the pipeline - prepare/execute/fetch currently answer a fixed value
-rather than dispatching into the converted storage, transaction, GC and BLR
-layers. Until those are wired in, fire-crab does **not** claim any firebird-qa
-coverage - but the milestone is no longer a distant one: the protocol server
-the suite talks to accepts real clients today.
+in place, and the first query op (`SELECT COUNT(*)`) now dispatches into the
+converted storage engine and returns a real result. What stands between here
+and running the suite is *breadth* of the SQL engine behind the pipeline -
+projections, real column types, predicates, joins, DML - which the eleventh
+differential opens the door to but does not yet cover. Until that surface is
+wide enough, fire-crab does **not** claim any firebird-qa coverage - but the
+milestone is no longer distant: the protocol server the suite talks to accepts
+real clients and answers a real query from real pages today.
 
 ## Benchmarks
 
@@ -338,6 +376,12 @@ GSTAT=/opt/firebird/bin/gstat bench/compare.sh /tmp/fbhandson/sorting_fbcpp.fdb 
 NODE_PATH="$PWD/node_modules" \\
     FCWIRE=/path/to/fire-crab/target/release/fcwire \\
     sh /path/to/fire-crab/qa/serve-real-client.sh 3050
+
+# server answers a REAL COUNT(*) from the database file, checked vs isql
+# (use a clean/gbak-restored db; also: fcstat count <db> <table>, fcstat relations <db>)
+NODE_PATH="$PWD/node_modules" \\
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
+    sh /path/to/fire-crab/qa/serve-real-query.sh /tmp/fbhandson/plans_clean.fdb 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on

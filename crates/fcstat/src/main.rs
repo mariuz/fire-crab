@@ -146,6 +146,33 @@ fn main() {
             };
             records(&data, rel);
         }
+        "relations" => {
+            // name -> id resolution read straight from RDB$RELATIONS pages,
+            // the mirror of SELECT RDB$RELATION_ID, RDB$RELATION_NAME.
+            let h = decode_header(&data);
+            let mut rels = fire_crab_ods::list_relations(&data, h.page_size as usize);
+            rels.sort();
+            for (id, name) in rels {
+                println!("{}\t{}", id, name);
+            }
+        }
+        "count" => {
+            // COUNT(*) by table name: resolve through RDB$RELATIONS, then
+            // count committed primary records from the data pages.
+            let name = args.get(3).cloned().unwrap_or_else(|| {
+                eprintln!("usage: fcstat count <db.fdb> <table-name>");
+                std::process::exit(2);
+            });
+            let h = decode_header(&data);
+            let ps = h.page_size as usize;
+            match fire_crab_ods::resolve_relation(&data, ps, &name) {
+                Some(id) => println!("{}", fire_crab_ods::count_primary_records(&data, ps, id)),
+                None => {
+                    eprintln!("fcstat: no relation named {}", name);
+                    std::process::exit(1);
+                }
+            }
+        }
         "bench-census" => {
             let iters: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
             bench_census(&data, iters);

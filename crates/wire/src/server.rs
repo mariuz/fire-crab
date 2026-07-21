@@ -172,8 +172,77 @@ fn respond_prepare(s: &mut TcpStream, enc: &mut Option<Rc4>) -> std::io::Result<
     w.send(s, enc)
 }
 
-/// The value this milestone's server returns for every query.
+/// The value the server falls back to when a query is not one it can
+/// resolve from the database (or no database is loaded).
 const FIXED_ANSWER: i64 = 4242;
+
+/// A database file the server has opened for the current attachment: the
+/// raw bytes plus the page size read from its header. The `ods` crate
+/// decodes everything from this slice.
+struct Database {
+    bytes: Vec<u8>,
+    page_size: usize,
+}
+
+/// Open the file the client named in op_attach, if it exists and looks
+/// like a database (a decodable header page). Returns None otherwise -
+/// the server then answers the fixed constant, so a client attaching to
+/// a bare name with no file behind it still completes the pipeline.
+fn load_database(path: &str) -> Option<Database> {
+    let p = path.trim();
+    if p.is_empty() {
+        return None;
+    }
+    let bytes = std::fs::read(p).ok()?;
+    let h = fire_crab_ods::header::HeaderPage::decode(&bytes)?;
+    let page_size = h.page_size as usize;
+    if page_size == 0 {
+        return None;
+    }
+    Some(Database { bytes, page_size })
+}
+
+/// Resolve a prepared query to the integer it should return. The one
+/// shape answered from real pages is `SELECT COUNT(*) FROM <table>`: the
+/// table name is resolved to a relation id through `RDB$RELATIONS`, and
+/// its committed primary records are counted straight from the data pages
+/// - the wire-level equivalent of what `qa/diff-select.sh` checks at the
+/// tool level. Anything else falls back to the fixed constant.
+fn answer_value(sql: &str, db: &Option<Database>) -> i64 {
+    if let (Some(table), Some(db)) = (parse_count_target(sql), db) {
+        if let Some(rel) = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, &table) {
+            return fire_crab_ods::count_primary_records(&db.bytes, db.page_size, rel) as i64;
+        }
+    }
+    FIXED_ANSWER
+}
+
+/// Recognise `SELECT COUNT(*) FROM <table>`, tolerant of case and of
+/// spacing inside `COUNT(*)`, and return the table name. None for every
+/// other statement - deliberately narrow: this milestone converts one
+/// real query path, it does not pretend to be a SQL parser.
+fn parse_count_target(sql: &str) -> Option<String> {
+    let upper = sql.to_ascii_uppercase();
+    let compact = upper.split_whitespace().collect::<Vec<_>>().join(" ");
+    let compact = compact
+        .replace("COUNT ( * )", "COUNT(*)")
+        .replace("COUNT( * )", "COUNT(*)")
+        .replace("COUNT (*)", "COUNT(*)")
+        .replace("COUNT(* )", "COUNT(*)")
+        .replace("COUNT( *)", "COUNT(*)");
+    let rest = compact.strip_prefix("SELECT COUNT(*) FROM ")?;
+    let name = rest
+        .trim()
+        .split([' ', ';'])
+        .next()
+        .unwrap_or("")
+        .trim_matches('"');
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
 
 /// Serve one connection to completion.
 fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
@@ -300,12 +369,30 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
         return Ok(());
     }
     read_int(&mut s, &mut dec)?; // 0
-    read_wire_bytes(&mut s, &mut dec)?; // db path
+    let path_bytes = read_wire_bytes(&mut s, &mut dec)?; // db path
     read_wire_bytes(&mut s, &mut dec)?; // dpb
+    let db_path = String::from_utf8_lossy(&path_bytes).into_owned();
+    // Open the real file the client named, if it exists and is a database.
+    // When it does, queries answer from its pages; when it does not (the
+    // client attached to a name with no file behind it), the server falls
+    // back to the fixed constant so the pipeline still round-trips.
+    let database: Option<Database> = load_database(&db_path);
     if std::env::var("FC_SRV_TRACE").is_ok() {
-        eprintln!("[srv] op_attach ok, handle 1 ({})", if enc.is_some() { "encrypted" } else { "cleartext" });
+        eprintln!(
+            "[srv] op_attach ok, handle 1 ({}); database '{}' {}",
+            if enc.is_some() { "encrypted" } else { "cleartext" },
+            db_path,
+            match &database {
+                Some(d) => format!("loaded ({}-byte pages)", d.page_size),
+                None => "not loaded (fixed-answer fallback)".to_string(),
+            }
+        );
     }
     respond(&mut s, &mut enc, 1)?; // attachment handle 1
+
+    // The SQL text of the most recently prepared statement, resolved to a
+    // value at fetch time.
+    let mut stmt_sql = String::new();
 
     // --- the op loop (encrypted) ---
     loop {
@@ -333,12 +420,13 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 read_int(&mut s, &mut dec)?; // tr
                 read_int(&mut s, &mut dec)?; // stmt
                 read_int(&mut s, &mut dec)?; // dialect
-                read_wire_bytes(&mut s, &mut dec)?; // sql
+                let sql = read_wire_bytes(&mut s, &mut dec)?; // sql
                 read_wire_bytes(&mut s, &mut dec)?; // items
                 read_int(&mut s, &mut dec)?; // buffer length
                 if best >= 20 {
                     read_int(&mut s, &mut dec)?; // p_sqlst_flags (FB6/proto 20+)
                 }
+                stmt_sql = String::from_utf8_lossy(&sql).into_owned();
                 respond_prepare(&mut s, &mut enc)?;
             }
             x if x == OP_EXECUTE => {
@@ -366,11 +454,17 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 read_wire_bytes(&mut s, &mut dec)?; // blr
                 read_int(&mut s, &mut dec)?; // msg number
                 read_int(&mut s, &mut dec)?; // count
+                // Resolve the query against the real database (a COUNT(*) is
+                // a record walk); fall back to the fixed constant otherwise.
+                let value = answer_value(&stmt_sql, &database);
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] fetch: {:?} -> {}", stmt_sql.trim(), value);
+                }
                 // one row: op_fetch_response(status=0, messages=1, nullmap, i64)
                 let mut w = W::default();
                 w.int(OP_FETCH_RESPONSE).int(0).int(1);
                 w.raw(&[0u8; 4]); // null bitmap (1 col, not null), padded to 4
-                w.raw(&FIXED_ANSWER.to_be_bytes());
+                w.raw(&value.to_be_bytes());
                 // then end-of-cursor terminator
                 w.int(OP_FETCH_RESPONSE).int(100).int(0);
                 w.send(&mut s, &mut enc)?;
@@ -484,6 +578,27 @@ mod tests {
         let d = describe_one_bigint();
         // marker [4,7,4,0] must be present
         assert!(d.windows(4).any(|w| w == [4, 7, 4, 0]));
+    }
+
+    #[test]
+    fn parses_count_star_target() {
+        assert_eq!(parse_count_target("SELECT COUNT(*) FROM RDB$RELATIONS").as_deref(), Some("RDB$RELATIONS"));
+        // case- and spacing-insensitive, trailing semicolon tolerated
+        assert_eq!(parse_count_target("select count( * ) from Dept;").as_deref(), Some("DEPT"));
+        assert_eq!(parse_count_target("SELECT  COUNT(*)  FROM  \"MyTab\"").as_deref(), Some("MYTAB"));
+    }
+
+    #[test]
+    fn rejects_non_count_queries() {
+        assert_eq!(parse_count_target("SELECT CAST(42 AS BIGINT) FROM RDB$DATABASE"), None);
+        assert_eq!(parse_count_target("SELECT * FROM DEPT"), None);
+        assert_eq!(parse_count_target("SELECT COUNT(*)"), None); // no FROM
+    }
+
+    #[test]
+    fn answer_falls_back_without_database() {
+        assert_eq!(answer_value("SELECT COUNT(*) FROM DEPT", &None), FIXED_ANSWER);
+        assert_eq!(answer_value("SELECT CAST(1 AS BIGINT) FROM RDB$DATABASE", &None), FIXED_ANSWER);
     }
 
     #[test]
