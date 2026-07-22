@@ -699,6 +699,14 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<Plan> {
 
     let db = db.as_ref()?;
     let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
+    // index maintenance is not converted yet: writing records without
+    // their index entries would make the engine's index scans silently
+    // miss rows - DML on an indexed table is refused instead
+    if fire_crab_ods::btr::find_index_root(&db.bytes, db.page_size, rel)
+        .is_some_and(|irt| irt.count > 0)
+    {
+        return None;
+    }
     let columns = relation_columns(&db.bytes, db.page_size, table);
     let formats = relation_formats(&db.bytes, db.page_size, rel);
     let (format_no, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
@@ -852,6 +860,14 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<Plan> {
 
     let db = db.as_ref()?;
     let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
+    // index maintenance is not converted yet: writing records without
+    // their index entries would make the engine's index scans silently
+    // miss rows - DML on an indexed table is refused instead
+    if fire_crab_ods::btr::find_index_root(&db.bytes, db.page_size, rel)
+        .is_some_and(|irt| irt.count > 0)
+    {
+        return None;
+    }
     let columns = relation_columns(&db.bytes, db.page_size, table);
     let formats = relation_formats(&db.bytes, db.page_size, rel);
     let (format_no, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
@@ -907,6 +923,14 @@ fn plan_delete(sql: &str, db: &Option<Database>) -> Option<Plan> {
     }
     let db = db.as_ref()?;
     let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
+    // index maintenance is not converted yet: writing records without
+    // their index entries would make the engine's index scans silently
+    // miss rows - DML on an indexed table is refused instead
+    if fire_crab_ods::btr::find_index_root(&db.bytes, db.page_size, rel)
+        .is_some_and(|irt| irt.count > 0)
+    {
+        return None;
+    }
     let columns = relation_columns(&db.bytes, db.page_size, table);
     let formats = relation_formats(&db.bytes, db.page_size, rel);
     // a relation with no RDB$FORMATS entry (a system relation) cannot

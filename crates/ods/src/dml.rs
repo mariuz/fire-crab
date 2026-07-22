@@ -24,20 +24,30 @@
 //! and exactly what the chain walk in `tra.rs` and the engine's own
 //! garbage collector consume.
 //!
+//! When every existing data page is full, the relation GROWS: a page
+//! is allocated from the PIP (`PAG_allocate_pages`, pag.cpp - the file
+//! itself extending when the page lies past EOF), formatted as a data
+//! page, and hooked into the relation's last pointer page with its
+//! fill-bits byte (`DPM_allocate` + dpm.epp's extend path).
+//!
 //! This is an OFFLINE writer: it mutates a byte image the caller then
 //! flushes as a whole. It does not implement careful-write ordering,
-//! shadowing, crash safety, page allocation, or index maintenance - the
-//! write is atomic only because the caller rewrites the file in one
-//! piece while no engine is attached. The differential for all of this
-//! is the engine itself: after DML, `isql` must see exactly the changed
-//! rows, `gfix -v` must find nothing wrong, and `gfix -sweep` must
-//! garbage-collect the very version chains written here.
+//! shadowing, crash safety, or index maintenance (DML on indexed
+//! tables must be refused by callers until it does) - the write is
+//! atomic only because the caller rewrites the file in one piece while
+//! no engine is attached. The differential for all of this is the
+//! engine itself: after DML, `isql` must see exactly the changed rows,
+//! `gfix -v` must find nothing wrong - including the PIP and
+//! pointer-page bookkeeping allocation touches - and `gfix -sweep`
+//! must garbage-collect the very version chains written here.
 
 use crate::data::{flags, DataPage, DPG_RPT_OFFSET, RHD_DATA_OFFSET};
-use crate::pages::PageType;
+use crate::format::data_pages_per_pp;
+use crate::pages::{PageHeader, PageType};
+use crate::pip::{PipPage, PIP_BITS_OFFSET};
 use crate::pointer::relation_data_pages;
 use crate::tip::{TipPage, TIP_TRANSACTIONS_OFFSET};
-use crate::u16_at;
+use crate::{u16_at, u32_at};
 
 /// Where an insert landed - reported for tracing and tests.
 #[derive(Debug, PartialEq)]
@@ -186,14 +196,91 @@ fn rhd_bytes(tx: u32, b_page: u32, b_line: u16, rflags: u16, format: u8, data: &
     rec
 }
 
+/// Allocate one page from the first PIP (`PAG_allocate_pages`,
+/// pag.cpp): the first set bit (set = FREE, ods.h:753) is cleared,
+/// `pip_used` incremented and the `pip_min` hint advanced. The FILE
+/// GROWS when the allocated page lies beyond its current end - free
+/// bits past EOF are how the engine extends a database. Only the first
+/// PIP (page 1) is handled; a database needing its second PIP (65312
+/// pages at 8K) fails honestly.
+fn allocate_page(file: &mut Vec<u8>, page_size: usize) -> Result<u32, String> {
+    let per_pip = PipPage::pages_per_pip(page_size);
+    let base = page_size; // PIP 0 is page 1
+    let pip = PipPage::decode(file.get(base..base + page_size).ok_or("no PIP page")?)
+        .ok_or("page 1 is not a PIP")?;
+    let start = pip.min as usize;
+    let found = (start..per_pip)
+        .chain(0..start) // the hint is only a hint
+        .find(|&i| {
+            file.get(base + PIP_BITS_OFFSET + i / 8)
+                .is_some_and(|b| b & (1 << (i % 8)) != 0)
+        })
+        .ok_or("first PIP exhausted (second-PIP allocation not converted)")?;
+    file[base + PIP_BITS_OFFSET + found / 8] &= !(1 << (found % 8));
+    let used = u32_at(file, base + 24) + 1;
+    file[base + 24..base + 28].copy_from_slice(&used.to_le_bytes());
+    if found as u32 >= u32_at(file, base + 16) {
+        file[base + 16..base + 20].copy_from_slice(&((found as u32) + 1).to_le_bytes());
+    }
+    let need = (found + 1) * page_size;
+    if file.len() < need {
+        file.resize(need, 0);
+    }
+    Ok(found as u32)
+}
+
+/// Grow a relation by one data page (`DPM_allocate` + the extend half
+/// of dpm.epp's store path): allocate a page, format it as an empty
+/// data page with the next `dpg_sequence`, and hook it into the
+/// relation's LAST pointer page - the slot appended, the per-slot fill
+/// byte (ods.h:841-853, one byte after the slot vector's full
+/// `dataPagesPerPP` capacity) zeroed: the page is about to receive its
+/// first record, so it is neither full nor empty.
+fn extend_relation(file: &mut Vec<u8>, page_size: usize, rel: u16) -> Result<u32, String> {
+    let sequence = relation_data_pages(file, page_size, rel).len() as u32;
+
+    // the relation's last pointer page (highest ppg_sequence)
+    let mut last: Option<(usize, u32)> = None; // (byte offset, sequence)
+    for (i, p) in file.chunks_exact(page_size).enumerate() {
+        if p[0] == PageType::Pointer as u8
+            && PageHeader::decode(p).is_some()
+            && u16_at(p, 26) == rel
+        {
+            let seq = u32_at(p, 16);
+            if last.map_or(true, |(_, s)| seq > s) {
+                last = Some((i * page_size, seq));
+            }
+        }
+    }
+    let (pp, _) = last.ok_or("relation has no pointer page")?;
+    let capacity = data_pages_per_pp(page_size) as usize;
+    let slot = u16_at(file, pp + 24) as usize; // ppg_count
+    if slot >= capacity {
+        return Err("pointer page full (new pointer pages not converted)".into());
+    }
+
+    let page_no = allocate_page(file, page_size)?;
+    let base = page_no as usize * page_size;
+    file[base..base + page_size].fill(0); // a freed page keeps stale bytes
+    file[base] = PageType::Data as u8;
+    file[base + 12..base + 16].copy_from_slice(&page_no.to_le_bytes()); // pag_pageno @12
+    file[base + 16..base + 20].copy_from_slice(&sequence.to_le_bytes()); // dpg_sequence
+    file[base + 20..base + 22].copy_from_slice(&rel.to_le_bytes()); // dpg_relation
+                                                                    // dpg_count stays 0
+
+    file[pp + 32 + slot * 4..pp + 36 + slot * 4].copy_from_slice(&page_no.to_le_bytes());
+    file[pp + 32 + capacity * 4 + slot] = 0; // fill bits: not full, not empty
+    file[pp + 24..pp + 26].copy_from_slice(&((slot as u16) + 1).to_le_bytes());
+    Ok(page_no)
+}
+
 /// Insert one record image (uncompressed, exactly the format's image
 /// bytes: null-flag area + fields at their descriptor offsets) into the
-/// first data page of `rel` with room. The record is stored NOT_PACKED
-/// under a freshly committed transaction. Fails - changing nothing - if
-/// no existing data page has space (page allocation is not converted
-/// yet) or the transaction cannot be allocated.
+/// first data page of `rel` with room - GROWING the relation by a
+/// freshly allocated page when every existing one is full. The record
+/// is stored NOT_PACKED under a freshly committed transaction.
 pub fn insert_record(
-    file: &mut [u8],
+    file: &mut Vec<u8>,
     page_size: usize,
     rel: u16,
     format_no: u8,
@@ -205,8 +292,15 @@ pub fn insert_record(
         return Err("record larger than a page".into());
     }
     let rec_len = RHD_DATA_OFFSET + image.len();
-    let spot = find_space(file, page_size, rel, rec_len)
-        .ok_or("no data page with enough free space")?;
+    let spot = match find_space(file, page_size, rel, rec_len) {
+        Some(s) => s,
+        None => {
+            // every existing page is full: grow the relation and retry
+            extend_relation(file, page_size, rel)?;
+            find_space(file, page_size, rel, rec_len)
+                .ok_or("no room even on a fresh data page")?
+        }
+    };
 
     let tx = allocate_committed_tx(file, page_size)?;
     if tx > u32::MAX as u64 {
@@ -225,7 +319,7 @@ pub fn insert_record(
 /// version goes to a new address" half of `DPM_update`). Returns where
 /// the copy landed plus the record's format, for the caller's stub.
 fn push_back_version(
-    file: &mut [u8],
+    file: &mut Vec<u8>,
     page_size: usize,
     rel: u16,
     page_no: u32,
@@ -247,8 +341,14 @@ fn push_back_version(
     }
     let format = rec[12];
     put_u16(&mut rec, 10, rflags | flags::CHAIN);
-    let spot =
-        find_space(file, page_size, rel, rec.len()).ok_or("no room for the back version")?;
+    let spot = match find_space(file, page_size, rel, rec.len()) {
+        Some(s) => s,
+        None => {
+            extend_relation(file, page_size, rel)?;
+            find_space(file, page_size, rel, rec.len())
+                .ok_or("no room for the back version even on a fresh page")?
+        }
+    };
     write_at_spot(file, page_size, &spot, &rec);
     Ok((spot.page_no, spot.slot, format))
 }
@@ -269,6 +369,22 @@ fn rewrite_primary(
     let count = u16_at(file, base + 22) as usize; // dpg_count
     if slot as usize >= count {
         return Err("primary slot out of range".into());
+    }
+    // a new body no longer than the old reuses the old body's own
+    // space in place - which is the COMMON case (same format, same
+    // image length) and the only reusable space on a FULL page, where
+    // the freed slot sits mid-page and the bottom-of-free-space model
+    // below cannot see it
+    let dir = base + DPG_RPT_OFFSET + slot as usize * 4;
+    let (old_off, old_len) = (u16_at(file, dir) as usize, u16_at(file, dir + 2) as usize);
+    if old_len >= rec.len() && old_off != 0 {
+        write_at_spot(
+            file,
+            page_size,
+            &Spot { page_no, slot, append: false, offset: old_off },
+            rec,
+        );
+        return Ok(());
     }
     let aligned = (rec.len() + 3) & !3;
     let mut bottom = page_size;
@@ -304,7 +420,7 @@ fn rewrite_primary(
 /// error partway the file image is left inconsistent - callers work on
 /// a copy and discard it (the whole-file-flush model).
 pub fn update_records(
-    file: &mut [u8],
+    file: &mut Vec<u8>,
     page_size: usize,
     rel: u16,
     targets: &[(u32, u16, Vec<u8>)],
@@ -332,7 +448,7 @@ pub fn update_records(
 /// "row gone" and the engine's garbage collector later expunges along
 /// with the chain.
 pub fn delete_records(
-    file: &mut [u8],
+    file: &mut Vec<u8>,
     page_size: usize,
     rel: u16,
     targets: &[(u32, u16)],
@@ -473,6 +589,70 @@ mod tests {
         // versions on the page: the scratch file's own record, the
         // chain head, and the two back copies
         assert_eq!(crate::gc::version_count(&f, ps, 42), 4);
+    }
+
+    #[test]
+    fn insert_grows_the_relation_when_pages_are_full() {
+        let ps = 4096;
+        // header 0, PIP 1 (pages 0-4 used, rest free), TIP 2, pointer 3
+        // (rel 42 -> data page 4), data 4 nearly full
+        let mut f = vec![0u8; ps * 5];
+        f[0] = PageType::Header as u8;
+        f[16..18].copy_from_slice(&(ps as u16).to_le_bytes());
+        put_u64(&mut f, 40, 10);
+        let pip = ps;
+        f[pip] = PageType::PageInventory as u8;
+        put_u32(&mut f, pip + 12, 1);
+        for b in &mut f[pip + PIP_BITS_OFFSET..pip + ps] {
+            *b = 0xFF; // everything free...
+        }
+        f[pip + PIP_BITS_OFFSET] = 0b1110_0000; // ...except pages 0-4
+        put_u32(&mut f, pip + 16, 5); // pip_min
+        put_u32(&mut f, pip + 24, 5); // pip_used
+        let t = ps * 2;
+        f[t] = PageType::TransactionInventory as u8;
+        put_u32(&mut f, t + 12, 2);
+        let p = ps * 3;
+        f[p] = PageType::Pointer as u8;
+        put_u32(&mut f, p + 12, 3);
+        put_u16(&mut f, p + 24, 1); // ppg_count
+        put_u16(&mut f, p + 26, 42); // ppg_relation
+        put_u32(&mut f, p + 32, 4); // slot 0: data page 4
+        let d = ps * 4;
+        f[d] = PageType::Data as u8;
+        put_u32(&mut f, d + 12, 4);
+        put_u16(&mut f, d + 20, 42);
+        put_u16(&mut f, d + 22, 1);
+        // one record occupying almost the whole page
+        let big = ps - DPG_RPT_OFFSET - 4 - 32;
+        put_u16(&mut f, d + 24, (ps - big) as u16);
+        put_u16(&mut f, d + 26, big as u16);
+
+        // no room on page 4: the insert must allocate page 5
+        let image = vec![0u8; 64];
+        let out = insert_record(&mut f, ps, 42, 1, &image).unwrap();
+        assert_eq!((out.page_no, out.slot), (5, 0));
+        assert_eq!(f.len(), ps * 6); // the FILE grew
+        // the new page is a formatted data page with the next sequence
+        let dp = DataPage::decode(&f[ps * 5..ps * 6]).unwrap();
+        assert_eq!((dp.relation, dp.sequence, dp.count), (42, 1, 1));
+        assert_eq!(dp.pag.page_no, 5);
+        assert_eq!(dp.record(0).unwrap().image().unwrap(), image);
+        // hooked into the pointer page, fill byte clear
+        assert_eq!(u16_at(&f, p + 24), 2); // ppg_count
+        assert_eq!(u32_at(&f, p + 36), 5); // slot 1 -> page 5
+        let cap = data_pages_per_pp(ps) as usize;
+        assert_eq!(f[p + 32 + cap * 4 + 1], 0);
+        // the PIP: bit 5 cleared, hint and used advanced
+        let pip = PipPage::decode(&f[ps..ps * 2]).unwrap();
+        assert_eq!(pip.is_free(5), Some(false));
+        assert_eq!(pip.is_free(6), Some(true));
+        assert_eq!((pip.min, pip.used), (6, 6));
+        // a second insert too big for page 5's remaining space grows again
+        let big_img = vec![7u8; ps - 100];
+        let out2 = insert_record(&mut f, ps, 42, 1, &big_img).unwrap();
+        assert_eq!(out2.page_no, 6); // grew again
+        assert_eq!(f.len(), ps * 7);
     }
 
     #[test]
