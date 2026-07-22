@@ -200,7 +200,7 @@ fn build_describe(cols: &[ProjCol]) -> Vec<u8> {
         int_item(&mut d, 9, (i + 1) as i32); // sqlda_seq
         int_item(&mut d, 11, c.sql_type); // type
         int_item(&mut d, 12, 0); // sub_type
-        int_item(&mut d, 13, 0); // scale
+        int_item(&mut d, 13, c.scale); // scale (client divides scaled ints)
         int_item(&mut d, 14, c.length); // length
         str_item(&mut d, 16, &c.name); // field name
         str_item(&mut d, 19, &c.name); // alias (the client's column key)
@@ -240,23 +240,45 @@ fn load_database(path: &str) -> Option<Database> {
     Some(Database { bytes, page_size })
 }
 
-/// How a projected column is carried on the wire. Integer-family columns
-/// (SHORT/LONG/INT64, scale 0) go as SQL_INT64; everything else is
-/// rendered to text and sent as SQL_VARYING - the same two shapes the
-/// client side coerces to (see `query_rows`).
+/// How a projected column is carried on the wire (protocol 13+ XDR).
+/// Every stored type the record decoder handles exactly is sent in its
+/// native wire form; only CHAR/VARCHAR text (and anything unsupported,
+/// e.g. blobs) is rendered and sent as SQL_VARYING. The client is
+/// expected to fetch with the message format the describe announced -
+/// which is what real clients build their output BLR from.
 enum Wire {
+    /// 8-byte big-endian integer (BIGINT, and INT64-backed numerics)
     Int64,
+    /// 4-byte big-endian integer (SMALLINT/INTEGER and their numerics -
+    /// XDR carries SHORT as a 32-bit slot too)
+    Int32,
+    /// 8-byte big-endian IEEE double
+    Double,
+    /// 4-byte big-endian IEEE float
+    Float,
+    /// 4-byte big-endian day number (Modified Julian Day epoch)
+    Date,
+    /// 4-byte big-endian time of day in 1/10000 s
+    Time,
+    /// date then time, 8 bytes
+    Timestamp,
+    /// 4-byte int 0/1 (XDR pads the 1-byte boolean to a slot)
+    Bool,
+    /// 4-byte length + bytes + padding to 4
     Varying,
 }
 
 /// One column of a projection: its name, the field id that indexes the
-/// decoded record, and how it is described/encoded on the wire.
+/// decoded record, and how it is described/encoded on the wire. `scale`
+/// is announced in the describe; the raw scaled integer travels on the
+/// wire and the client divides (that is the engine's contract too).
 struct ProjCol {
     name: String,
     field_id: usize,
     wire: Wire,
     sql_type: i32,
     length: i32,
+    scale: i32,
 }
 
 /// What a prepared statement resolves to. `Scalar` is a single BIGINT
@@ -413,14 +435,23 @@ impl Term {
     }
 }
 
-/// Pick the wire shape, SQL type and length for a column from its stored
-/// descriptor.
-fn wire_for(d: &Descriptor) -> (Wire, i32, i32) {
-    let is_int = matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64) && d.scale == 0;
-    if is_int {
-        (Wire::Int64, 580, 8) // SQL_INT64
-    } else {
-        (Wire::Varying, 448, 32765) // SQL_VARYING, rendered text
+/// Pick the wire shape, SQL type, length and scale for a column from its
+/// stored descriptor - mirroring the types the engine itself describes
+/// (SQL type codes from sqlda_pub.h). Text and anything without a native
+/// mapping (blobs, INT128, DECFLOAT) is rendered and sent as SQL_VARYING.
+fn wire_for(d: &Descriptor) -> (Wire, i32, i32, i32) {
+    let scale = d.scale as i32;
+    match d.dtype {
+        dtype::SHORT => (Wire::Int32, 500, 2, scale), // SQL_SHORT
+        dtype::LONG => (Wire::Int32, 496, 4, scale),  // SQL_LONG
+        dtype::INT64 => (Wire::Int64, 580, 8, scale), // SQL_INT64
+        dtype::REAL => (Wire::Float, 482, 4, 0),      // SQL_FLOAT
+        dtype::DOUBLE => (Wire::Double, 480, 8, 0),   // SQL_DOUBLE
+        dtype::SQL_DATE => (Wire::Date, 570, 4, 0),   // SQL_TYPE_DATE
+        dtype::SQL_TIME => (Wire::Time, 560, 4, 0),   // SQL_TYPE_TIME
+        dtype::TIMESTAMP => (Wire::Timestamp, 510, 8, 0), // SQL_TIMESTAMP
+        dtype::BOOLEAN => (Wire::Bool, 32764, 1, 0),  // SQL_BOOLEAN
+        _ => (Wire::Varying, 448, 32765, 0),          // SQL_VARYING, rendered text
     }
 }
 
@@ -445,13 +476,14 @@ fn build_projcols(
     let mut out = Vec::new();
     for rc in selected {
         let d = descs.get(rc.field_id as usize)?;
-        let (wire, sql_type, length) = wire_for(d);
+        let (wire, sql_type, length, scale) = wire_for(d);
         out.push(ProjCol {
             name: rc.name.clone(),
             field_id: rc.field_id as usize,
             wire,
             sql_type,
             length,
+            scale,
         });
     }
     Some(out)
@@ -677,13 +709,14 @@ fn plan_join(
             for side in &sides {
                 for rc in &side.columns {
                     let d = side.descs.get(rc.field_id as usize)?;
-                    let (wire, sql_type, length) = wire_for(d);
+                    let (wire, sql_type, length, scale) = wire_for(d);
                     cols.push(ProjCol {
                         name: rc.name.clone(),
                         field_id: side.offset + rc.field_id as usize,
                         wire,
                         sql_type,
                         length,
+                        scale,
                     });
                 }
             }
@@ -694,13 +727,14 @@ fn plan_join(
                     return None; // aggregates over a join: fall back
                 };
                 let (idx, d, colname) = resolve_join_col(&sides, name)?;
-                let (wire, sql_type, length) = wire_for(d);
+                let (wire, sql_type, length, scale) = wire_for(d);
                 cols.push(ProjCol {
                     name: colname.to_string(),
                     field_id: idx,
                     wire,
                     sql_type,
                     length,
+                    scale,
                 });
             }
         }
@@ -971,13 +1005,14 @@ fn plan_group(
                 if !key_fids.contains(&fid) {
                     return None; // a selected column that is not grouped
                 }
-                let (wire, sql_type, length) = wire_for(descs.get(fid)?);
+                let (wire, sql_type, length, scale) = wire_for(descs.get(fid)?);
                 cols.push(ProjCol {
                     name: rc.name.clone(),
                     field_id: out_idx,
                     wire,
                     sql_type,
                     length,
+                    scale,
                 });
                 gitems.push(GItem::Key(fid));
             }
@@ -1009,6 +1044,7 @@ fn plan_group(
                     wire: Wire::Int64,
                     sql_type: 580,
                     length: 8,
+                    scale: 0,
                 });
                 gitems.push(GItem::Agg(*func, fid));
             }
@@ -1242,9 +1278,9 @@ fn join_rows(
 }
 
 /// Order two values for ORDER BY. NULL sorts as the lowest value (so
-/// ascending puts NULLs first), matching the engine's default; integers
-/// compare numerically, text ignoring trailing blanks, other types by
-/// their rendered text.
+/// ascending puts NULLs first), matching the engine's default; integers,
+/// scaled numerics, doubles and date/time types compare numerically,
+/// text ignoring trailing blanks, anything else by its rendered text.
 fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering::*;
     match (a, b) {
@@ -1253,6 +1289,19 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         (_, Value::Null) => Greater,
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
         (Value::Text(x), Value::Text(y)) => x.trim_end_matches(' ').cmp(y.trim_end_matches(' ')),
+        // same column, same declared scale - the raw values compare
+        (Value::Scaled(x, sx), Value::Scaled(y, sy)) if sx == sy => x.cmp(y),
+        (Value::Scaled(x, sx), Value::Scaled(y, sy)) => {
+            // differing scales (cross-format): align exactly in i128
+            let ax = *x as i128 * 10i128.pow(sx.saturating_sub(*sy).max(0) as u32);
+            let ay = *y as i128 * 10i128.pow(sy.saturating_sub(*sx).max(0) as u32);
+            ax.cmp(&ay)
+        }
+        (Value::Double(x), Value::Double(y)) => x.partial_cmp(y).unwrap_or(Equal),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::Date(x), Value::Date(y)) => x.cmp(y),
+        (Value::Time(x), Value::Time(y)) => x.cmp(y),
+        (Value::Timestamp(dx, tx), Value::Timestamp(dy, ty)) => (dx, tx).cmp(&(dy, ty)),
         _ => a.render().cmp(&b.render()),
     }
 }
@@ -1500,10 +1549,43 @@ fn encode_row(w: &mut W, cols: &[ProjCol], values: &[Value]) {
         if matches!(v, Value::Null) {
             continue; // null: data omitted, the bitmap bit already set
         }
+        // the raw scaled integer travels for numerics; the client
+        // divides by 10^|scale| per the describe
+        let raw_int = |v: &Value| match v {
+            Value::Int(i) => *i,
+            Value::Scaled(raw, _) => *raw,
+            _ => 0,
+        };
         match c.wire {
             Wire::Int64 => {
-                let iv = if let Value::Int(i) = v { *i } else { 0 };
-                w.raw(&iv.to_be_bytes());
+                w.raw(&raw_int(v).to_be_bytes());
+            }
+            Wire::Int32 => {
+                w.raw(&(raw_int(v) as i32).to_be_bytes());
+            }
+            Wire::Double => {
+                let d = if let Value::Double(d) = v { *d } else { 0.0 };
+                w.raw(&d.to_be_bytes());
+            }
+            Wire::Float => {
+                let d = if let Value::Double(d) = v { *d } else { 0.0 };
+                w.raw(&(d as f32).to_be_bytes());
+            }
+            Wire::Date => {
+                let d = if let Value::Date(d) = v { *d } else { 0 };
+                w.raw(&d.to_be_bytes());
+            }
+            Wire::Time => {
+                let t = if let Value::Time(t) = v { *t } else { 0 };
+                w.raw(&t.to_be_bytes());
+            }
+            Wire::Timestamp => {
+                let (d, t) = if let Value::Timestamp(d, t) = v { (*d, *t) } else { (0, 0) };
+                w.raw(&d.to_be_bytes());
+                w.raw(&t.to_be_bytes());
+            }
+            Wire::Bool => {
+                w.int(if matches!(v, Value::Bool(true)) { 1 } else { 0 });
             }
             Wire::Varying => {
                 let s = v.render();
@@ -2578,8 +2660,8 @@ mod tests {
         );
         // ORDER BY resolution: ordinal into the projection, and by name
         let cols = vec![
-            ProjCol { name: "ID".into(), field_id: 3, wire: Wire::Int64, sql_type: 580, length: 8 },
-            ProjCol { name: "NAME".into(), field_id: 1, wire: Wire::Varying, sql_type: 448, length: 32765 },
+            ProjCol { name: "ID".into(), field_id: 3, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0 },
+            ProjCol { name: "NAME".into(), field_id: 1, wire: Wire::Varying, sql_type: 448, length: 32765, scale: 0 },
         ];
         let columns = vec![
             RelationColumn { name: "ID".into(), field_id: 3, position: 0 },
@@ -2876,11 +2958,74 @@ mod tests {
     }
 
     #[test]
+    fn wire_types_mirror_the_engine() {
+        let d = |dtype, scale| Descriptor { dtype, scale, length: 0, sub_type: 0, flags: 0, offset: 0 };
+        // (dtype, scale) -> (sql_type, length, scale)
+        for (dt, sc, ty, len) in [
+            (dtype::SHORT, -2, 500, 2),
+            (dtype::LONG, 0, 496, 4),
+            (dtype::INT64, -4, 580, 8),
+            (dtype::REAL, 0, 482, 4),
+            (dtype::DOUBLE, 0, 480, 8),
+            (dtype::SQL_DATE, 0, 570, 4),
+            (dtype::SQL_TIME, 0, 560, 4),
+            (dtype::TIMESTAMP, 0, 510, 8),
+            (dtype::BOOLEAN, 0, 32764, 1),
+            (dtype::VARYING, 0, 448, 32765),
+        ] {
+            let (_, sql_type, length, scale) = wire_for(&d(dt, sc));
+            assert_eq!((sql_type, length), (ty, len), "dtype {}", dt);
+            let want = if matches!(dt, dtype::SHORT | dtype::LONG | dtype::INT64) { sc as i32 } else { 0 };
+            assert_eq!(scale, want, "dtype {} scale", dt);
+        }
+    }
+
+    #[test]
+    fn encodes_native_wire_values() {
+        let pc = |wire, sql_type, length, scale| ProjCol {
+            name: "C".into(), field_id: 0, wire, sql_type, length, scale,
+        };
+        let enc = |col: ProjCol, v: Value| {
+            let mut w = W::default();
+            encode_row(&mut w, &[col], &[v]);
+            w.buf[4..].to_vec() // skip the 4-byte null bitmap
+        };
+        // scaled numeric: the RAW integer travels (client divides)
+        assert_eq!(enc(pc(Wire::Int64, 580, 8, -2), Value::Scaled(1234, -2)), 1234i64.to_be_bytes());
+        assert_eq!(enc(pc(Wire::Int32, 500, 2, -2), Value::Scaled(-321, -2)), (-321i32).to_be_bytes());
+        // date/time/timestamp: raw day and 1/10000-s units, big-endian
+        assert_eq!(enc(pc(Wire::Date, 570, 4, 0), Value::Date(61234)), 61234i32.to_be_bytes());
+        assert_eq!(enc(pc(Wire::Time, 560, 4, 0), Value::Time(123_456_780)), 123_456_780u32.to_be_bytes());
+        let ts = enc(pc(Wire::Timestamp, 510, 8, 0), Value::Timestamp(61234, 500_000));
+        assert_eq!(&ts[0..4], &61234i32.to_be_bytes());
+        assert_eq!(&ts[4..8], &500_000u32.to_be_bytes());
+        // boolean pads to a 4-byte slot; double is 8 IEEE bytes
+        assert_eq!(enc(pc(Wire::Bool, 32764, 1, 0), Value::Bool(true)), 1i32.to_be_bytes());
+        assert_eq!(enc(pc(Wire::Double, 480, 8, 0), Value::Double(2.5)), 2.5f64.to_be_bytes());
+    }
+
+    #[test]
+    fn value_cmp_orders_new_types_numerically() {
+        use std::cmp::Ordering::*;
+        // scaled: 9.50 < 12.30 though "9.5" > "12.3" as text
+        assert_eq!(value_cmp(&Value::Scaled(950, -2), &Value::Scaled(1230, -2)), Less);
+        // cross-scale: 1.5 (-1) == 1.50 (-2)
+        assert_eq!(value_cmp(&Value::Scaled(15, -1), &Value::Scaled(150, -2)), Equal);
+        assert_eq!(value_cmp(&Value::Double(1.5), &Value::Double(2.0)), Less);
+        assert_eq!(value_cmp(&Value::Date(100), &Value::Date(99)), Greater);
+        assert_eq!(
+            value_cmp(&Value::Timestamp(100, 5), &Value::Timestamp(100, 6)),
+            Less
+        );
+        assert_eq!(value_cmp(&Value::Null, &Value::Date(0)), Less); // NULLs still lowest
+    }
+
+    #[test]
     fn encodes_row_bitmap_and_values() {
         // two INT64 cols, second null: 4-byte bitmap (bit 1 set) + one 8-byte value
         let cols = vec![
-            ProjCol { name: "A".into(), field_id: 0, wire: Wire::Int64, sql_type: 580, length: 8 },
-            ProjCol { name: "B".into(), field_id: 1, wire: Wire::Int64, sql_type: 580, length: 8 },
+            ProjCol { name: "A".into(), field_id: 0, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0 },
+            ProjCol { name: "B".into(), field_id: 1, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0 },
         ];
         let values = vec![Value::Int(7), Value::Null];
         let mut w = W::default();

@@ -552,6 +552,50 @@ by column title - the engine titles both `NAME`. That happens against any
 server; the gate's scratch tables keep join-relevant column names
 disjoint where `SELECT *` is compared.
 
+### The eighteenth differential — native wire types
+
+`qa/serve-real-types.sh` retires the biggest approximation left in the
+server: every column type the record decoder handles exactly is now
+*described and encoded in the engine's own wire form*, instead of being
+rendered to text and coerced to `SQL_VARYING`/`SQL_INT64`. node-firebird
+decodes the rows through its normal typed path - JS numbers, `Date`
+objects, booleans - and every value equals isql's rendering.
+
+What travels natively now (protocol 13+ XDR):
+
+- **Integers at their own width**: `SMALLINT`→`SQL_SHORT`,
+  `INTEGER`→`SQL_LONG` (both 4-byte XDR slots), `BIGINT`→`SQL_INT64` -
+  matching the types the engine describes, where the server previously
+  coerced everything to BIGINT.
+- **`NUMERIC`/`DECIMAL` as raw scaled integers.** The describe now
+  carries the column's scale and the wire carries the *raw* stored
+  integer; the client divides by 10^|scale| - the engine's contract. All
+  three backings are exercised (SHORT-, LONG- and INT64-backed numerics).
+- **`FLOAT`/`DOUBLE`** as 4/8 IEEE big-endian bytes.
+- **`DATE`/`TIME`/`TIMESTAMP`** as their raw units - days since the
+  Modified Julian Day epoch (1858-11-17, and the gate's data includes
+  epoch day 0 itself) and 1/10000-second time-of-day. `Value` in the ods
+  crate now stores these *raw* (rendering moved into `render()`, output
+  unchanged - the full-row storage differential re-run proves it).
+- **`BOOLEAN`** as an XDR int slot (the 1-byte value padded to 4).
+- `ORDER BY` and `GROUP BY` on the new types compare *numerically*
+  (`value_cmp` grew typed arms): 9.50 sorts before 12.30, where the old
+  rendered-text comparison would have said the opposite; dates group and
+  sort chronologically.
+
+CHAR/VARCHAR text still travels as `SQL_VARYING`, and types without an
+exact decode (blobs, `INT128`, `DECFLOAT`, TZ types) remain rendered -
+that is the remaining approximation, stated rather than hidden.
+
+The comparison itself needs canonicalisation, which the gate documents
+in-line: node `Date`s are formatted back to isql's literal shapes (a
+sentinel distinguishes DATE/TIME/TIMESTAMP values; the scratch data
+avoids the ambiguous corners like midnight timestamps), isql's
+zero-padded `DOUBLE` text is trimmed, scaled test data never ends in a
+zero decimal digit (JS numbers drop trailing zeros), and TIME data
+sticks to whole milliseconds (JS `Date` resolution; the wire carries
+1/10000 s).
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -561,14 +605,16 @@ handshake, authentication, encryption and op dispatch a real client needs are
 in place, and real queries - `SELECT COUNT(*)`, column projections
 (`SELECT <cols>` / `SELECT *`), `WHERE` filtering, `ORDER BY`,
 `MIN/MAX/SUM/COUNT` aggregates, `GROUP BY`, `HAVING` and INNER joins - now
-dispatch into the converted storage engine and return real results, matching
-isql over the wire. What stands between here and running the suite is
-remaining *breadth* of the SQL engine - the column types still rendered
-approximately, DML, outer joins, system-table projections. Until that
-surface is wide enough, fire-crab does **not** claim any firebird-qa
-coverage - but the milestone is no longer distant: the protocol server the
-suite talks to accepts real clients and answers real filtered, joined,
-grouped, sorted and aggregated queries from real pages today.
+dispatch into the converted storage engine and return real results in
+native wire types (integers at their own width, scaled numerics,
+float/double, date/time/timestamp, boolean), matching isql over the wire.
+What stands between here and running the suite is remaining *breadth* of
+the SQL engine - DML, outer joins, blob/INT128/DECFLOAT columns,
+system-table projections. Until that surface is wide enough, fire-crab
+does **not** claim any firebird-qa coverage - but the milestone is no
+longer distant: the protocol server the suite talks to accepts real
+clients and answers real typed, filtered, joined, grouped, sorted and
+aggregated queries from real pages today.
 
 ## Benchmarks
 
@@ -651,6 +697,12 @@ NODE_PATH="$PWD/node_modules" \\
 NODE_PATH="$PWD/node_modules" \\
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
     sh /path/to/fire-crab/qa/serve-real-join.sh /tmp/fbhandson/join_clean.fdb 3050
+
+# server sends native wire types (SHORT/LONG/INT64, scaled numerics, float/
+# double, date/time/timestamp, boolean), decoded by node-firebird's typed path
+NODE_PATH="$PWD/node_modules" \\
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
+    sh /path/to/fire-crab/qa/serve-real-types.sh /tmp/fbhandson/wiretypes_clean.fdb 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on

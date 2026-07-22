@@ -118,9 +118,12 @@ pub enum Value {
     Scaled(i64, i8),
     Double(f64),
     Bool(bool),
-    Date(String),
-    Time(String),
-    Timestamp(String),
+    /// SQL_DATE: days since the Modified Julian Day epoch (1858-11-17)
+    Date(i32),
+    /// SQL_TIME: units of 1/10000 second since midnight
+    Time(u32),
+    /// SQL_TIMESTAMP: (date days, time units) as above
+    Timestamp(i32, u32),
     /// blob/quad id: (relation, record number)
     Blob(u16, u64),
     /// present but not yet decodable (INT128, DECFLOAT...)
@@ -136,7 +139,9 @@ impl Value {
             Value::Scaled(raw, scale) => render_scaled(*raw, *scale),
             Value::Double(d) => format!("{}", d),
             Value::Bool(b) => if *b { "true" } else { "false" }.into(),
-            Value::Date(s) | Value::Time(s) | Value::Timestamp(s) => s.clone(),
+            Value::Date(d) => render_date(*d),
+            Value::Time(t) => render_time(*t),
+            Value::Timestamp(d, t) => format!("{} {}", render_date(*d), render_time(*t)),
             Value::Blob(rel, num) => format!("<blob {}:{}>", rel, num),
             Value::Unsupported(t) => format!("<{}>", t),
         }
@@ -217,13 +222,9 @@ pub fn decode_field(image: &[u8], desc: &Descriptor, index: usize) -> Value {
         dtype::REAL => Value::Double(f32::from_le_bytes([f[0], f[1], f[2], f[3]]) as f64),
         dtype::DOUBLE => Value::Double(f64::from_le_bytes(f[0..8].try_into().unwrap())),
         dtype::BOOLEAN => Value::Bool(f[0] != 0),
-        dtype::SQL_DATE => Value::Date(render_date(u32_at(f, 0) as i32)),
-        dtype::SQL_TIME => Value::Time(render_time(u32_at(f, 0))),
-        dtype::TIMESTAMP => Value::Timestamp(format!(
-            "{} {}",
-            render_date(u32_at(f, 0) as i32),
-            render_time(u32_at(f, 4))
-        )),
+        dtype::SQL_DATE => Value::Date(u32_at(f, 0) as i32),
+        dtype::SQL_TIME => Value::Time(u32_at(f, 0)),
+        dtype::TIMESTAMP => Value::Timestamp(u32_at(f, 0) as i32, u32_at(f, 4)),
         dtype::BLOB | dtype::QUAD => {
             // bid (RecordNumber.h:63-71, little-endian branch):
             // u16 relation, u8 reserved, u8 number_up, u32 number

@@ -51,6 +51,7 @@ the converter what the C++ is *doing* before they read a line of it.
 | GROUP BY | `fire-crab-wire::server` | **the server groups** - `SELECT <keys and aggregates> ... GROUP BY <cols\|ordinals>`, and multi-aggregate projections with no GROUP BY (one global group, one row even over an empty set); NULL keys bucket together, aggregates computed per group, composable with WHERE and ORDER BY (which sorts the *output*, by name or ordinal); matches isql value-for-value |
 | HAVING | `fire-crab-wire::server` | **the server filters groups** - the predicate (comparisons, `AND`/`OR`, `IS [NOT] NULL`) is evaluated on each group's computed output row and may name aggregates *not in the select list* (computed as hidden items) or any grouping column; a global aggregate's single row can be kept or rejected; matches isql, including zero-row results |
 | INNER JOIN | `fire-crab-wire::server` | **the server joins two relations** - `FROM t1 [a] [INNER] JOIN t2 [b] ON <col> = <col> [AND ...]` with table-qualified or unambiguous bare columns; NULL and partnerless keys drop out, text keys compare pad-insensitively (CHAR vs VARCHAR), WHERE/ORDER BY see the combined row, `SELECT *` is left columns then right, and a lone `COUNT(*)` counts the joined rows; matches isql value-for-value |
+| Native wire types | `fire-crab-wire::server` | **columns travel in the engine's own wire form** - SMALLINT/INTEGER/BIGINT at their own SQL types, NUMERIC/DECIMAL as raw scaled integers with the scale in the describe (the client divides), FLOAT/DOUBLE as IEEE bytes, DATE/TIME/TIMESTAMP as raw day/1e-4-s units, BOOLEAN as an XDR slot; ORDER BY/GROUP BY on them compare numerically; node-firebird's typed decode (numbers, `Date`s, booleans) matches isql |
 | Everything else | — | see [docs/subsystem-map.md](docs/subsystem-map.md) |
 
 **On the firebird-qa milestone, precisely.** firebird-qa drives a *server*,
@@ -128,6 +129,16 @@ a constant:
   right; a lone `SELECT COUNT(*)` counts the joined rows. Outer/cross
   joins, chained joins, comma-list FROMs and grouping over a join fall
   back.
+- **Native wire types.** Every column type the record decoder handles
+  exactly is described and encoded as the engine would: integers at their
+  own width (`SQL_SHORT`/`SQL_LONG`/`SQL_INT64`), `NUMERIC`/`DECIMAL` as
+  the raw stored integer plus the scale in the describe - the client
+  divides, which is the engine's contract - `FLOAT`/`DOUBLE` as IEEE
+  bytes, `DATE`/`TIME`/`TIMESTAMP` as raw Modified-Julian-day and
+  1/10000-second units, `BOOLEAN` as an XDR int slot. Sorting and
+  grouping on these compare numerically (9.50 before 12.30; dates
+  chronologically). node-firebird decodes them through its normal typed
+  path - JS numbers, `Date` objects, booleans - and matches isql.
 
 The subtlety that had to be right: on a table mixing column widths the engine
 lays fields out physically by alignment, so `RDB$FIELD_ID` (the record-format
@@ -137,13 +148,15 @@ uniform-width table never reveals.
 
 Projections, WHERE, joins, GROUP BY, HAVING, ORDER BY and aggregates
 currently cover user tables (system relations' formats are not in
-`RDB$FORMATS`, so they answer COUNT but not projections, grouping or joins)
-and the exact-integer / text column types the decoder renders and compares
-identically to the engine; other shapes fall back to the fixed value.
-Widening further (the remaining column types, DML, outer joins, system-table
-projections) is the work that continues - but the fixed answer is no longer
-fixed, and the protocol server it runs on is proven against a genuine
-client.
+`RDB$FORMATS`, so they answer COUNT but not projections, grouping or joins),
+with integers, scaled numerics, float/double, date/time/timestamp, boolean
+and text all travelling in native wire form; blob, `INT128`, `DECFLOAT` and
+TZ columns are still rendered as text, and other shapes fall back to the
+fixed value.
+Widening further (DML, outer joins, the remaining exotic column types,
+system-table projections) is the work that continues - but the fixed answer
+is no longer fixed, and the protocol server it runs on is proven against a
+genuine client.
 
 Current QA state: `fcstat header` output is **byte-identical on the compared
 fields with `gstat -h` across 123 real Firebird 6 databases** (every scratch

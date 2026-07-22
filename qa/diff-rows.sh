@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # Full-row differential QA: decode every row of every user table from
 # the RAW FILE (fcstat rows: RDB$FORMATS bootstrap -> record walk ->
 # field decode) and compare, value by value, against SELECT through
