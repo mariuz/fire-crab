@@ -47,6 +47,12 @@ CREATE VIEW V AS SELECT ID, NAME FROM X;
 CREATE INDEX X_NAME_IDX ON X (NAME);
 CREATE ROLE R1;
 CREATE ROLE R2;
+CREATE SEQUENCE SEQ_A;
+CREATE SEQUENCE SEQ_B START WITH 100;
+CREATE GENERATOR GEN_C;
+COMMIT;
+SET GENERATOR GEN_C TO 4242;
+ALTER SEQUENCE SEQ_A RESTART WITH 7;
 COMMIT;
 EOF
 cp "$SRC" "$WORK"
@@ -126,5 +132,18 @@ compare "SHOW COLLATIONS"   "SHOW COLLATIONS"
 compare "SHOW TABLE DEPT"   "SHOW TABLE DEPT"
 compare "SHOW TABLE X"      "SHOW TABLE X"
 compare "SHOW TABLE ALPHA"  "SHOW TABLE ALPHA"
+
+# SHOW GENERATORS: the outer request lists the generators (a blr_for over
+# RDB$GENERATORS sorted by schema/name), then per generator isql reads the
+# current value with a DSQL probe SELECT GEN_ID(name, 0) FROM RDB$DATABASE
+# - which arrives as op_exec_immediate2 and is answered from the generator
+# page - and an inner request reads its initial value and increment. The
+# named forms exercise the value-probe path for one generator; the missing
+# name exercises "no such generator".
+compare "SHOW GENERATORS"      "SHOW GENERATORS"
+compare "SHOW SEQUENCES"       "SHOW SEQUENCES"
+compare "SHOW GENERATOR SEQ_A" "SHOW GENERATOR SEQ_A"
+compare "SHOW SEQUENCE SEQ_B"  "SHOW SEQUENCE SEQ_B"
+compare "SHOW GENERATOR GEN_C" "SHOW GENERATOR GEN_C"
 
 exit $fail

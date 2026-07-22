@@ -31,6 +31,11 @@ use crate::{
 
 const OP_ALLOCATE_STATEMENT: i32 = 62;
 const OP_EXEC_IMMEDIATE: i32 = 64;
+// prepare+execute+return one output message in a single round-trip - the
+// OO client's execute()-with-output-metadata, and isql's SHOW GENERATORS
+// value probe. Its reply is an op_sql_response then a plain op_response.
+const OP_EXEC_IMMEDIATE2: i32 = 75;
+const OP_SQL_RESPONSE: i32 = 78;
 // legacy BLR request API (isql's SHOW commands)
 const OP_COMPILE: i32 = 22;
 const OP_START: i32 = 23;
@@ -2751,6 +2756,26 @@ fn plan_query_inner(
             return Some(Plan::VirtualEmpty { ncols });
         }
     }
+    // isql's SHOW GENERATORS reads each generator's current value with a
+    // DSQL probe `SELECT GEN_ID(<name>, 0) FROM [SYSTEM.]RDB$DATABASE`
+    // (show.epp:4668). Recognise that exact shape and answer it from the
+    // generator page as a single-BIGINT scalar. Only a zero step (a pure
+    // read) is answered here; a non-zero step would increment the
+    // generator (a write) and is left to fall through.
+    if where_s.is_none()
+        && group_s.is_none()
+        && having_s.is_none()
+        && order_s.is_none()
+    {
+        if let Some((gen_name, step)) = parse_gen_id_query(proj_s, table_s) {
+            if step == 0 {
+                if let Some(db) = db.as_ref() {
+                    let v = read_generator_value(db, &gen_name);
+                    return Some(Plan::Scalar(v));
+                }
+            }
+        }
+    }
     let Some(proj) = parse_projection(proj_s) else {
         if trace { eprintln!("[srv] plan: parse_projection failed"); }
         return None;
@@ -3989,6 +4014,63 @@ fn find_word(up: &str, word: &str, from: usize) -> Option<usize> {
 /// One item of a select list: a bare column, an aggregate, or a scalar
 /// expression (arithmetic over integer columns and literals). The
 /// expression carries the output column name it should be described by.
+/// Recognise isql's `SELECT GEN_ID(<name>, <step>) FROM [SYSTEM.]
+/// RDB$DATABASE` (the SHOW GENERATORS value probe, show.epp:4668).
+/// Returns the generator name with any schema/package qualifier and
+/// quotes stripped, and the integer step. Only this precise shape - one
+/// `GEN_ID` call over the one-row `RDB$DATABASE` - is recognised; every
+/// other projection returns None so the ordinary planner handles it.
+fn parse_gen_id_query(proj_s: &str, table_s: &str) -> Option<(String, i64)> {
+    // FROM must name RDB$DATABASE, optionally SYSTEM.-qualified/quoted.
+    let up = table_s.trim().to_ascii_uppercase().replace('"', "");
+    let bare = up.strip_prefix("SYSTEM.").unwrap_or(&up).trim();
+    if bare != "RDB$DATABASE" {
+        return None;
+    }
+    // Projection must be exactly GEN_ID ( <name-arg> , <step> ).
+    let p = proj_s.trim();
+    let open = p.find('(')?;
+    if !p[..open].trim().eq_ignore_ascii_case("GEN_ID") {
+        return None;
+    }
+    let close = p.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    if p[close + 1..].trim() != "" {
+        return None; // trailing text after the call
+    }
+    let args = &p[open + 1..close];
+    // The name is the first argument; the step is the last (a generator
+    // name never contains a comma). Split on the last comma.
+    let comma = args.rfind(',')?;
+    let step: i64 = args[comma + 1..].trim().parse().ok()?;
+    let name = strip_gen_name(args[..comma].trim());
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, step))
+}
+
+/// Reduce a possibly schema/package-qualified, possibly quoted generator
+/// reference (`PUBLIC.MYGEN`, `PUBLIC."MyGen"`, `MYGEN`, `"MyGen"`) to the
+/// bare object name the catalog stores.
+fn strip_gen_name(arg: &str) -> String {
+    let s = arg.trim();
+    // Drop a leading qualifier: the last '.' whose preceding qualifier is
+    // not itself quoted (isql emits bare uppercase schema/package names).
+    let obj = match s.find('.') {
+        Some(dot) if !s[..dot].contains('"') => &s[dot + 1..],
+        _ => s,
+    };
+    let obj = obj.trim();
+    if obj.len() >= 2 && obj.starts_with('"') && obj.ends_with('"') {
+        obj[1..obj.len() - 1].replace("\"\"", "\"")
+    } else {
+        obj.to_string()
+    }
+}
+
 enum SelItem {
     Col(String),
     Agg(AggFn, AggTarget),
@@ -5508,6 +5590,66 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     respond(&mut s, &mut enc, TX_HANDLE)?;
                 }
             }
+            x if x == OP_EXEC_IMMEDIATE2 => {
+                // prepare + execute + return one output message in a single
+                // round-trip (protocol.cpp op_exec_immediate2). The OO
+                // client uses this for execute()-with-output-metadata; isql
+                // reads each generator's current value this way in SHOW
+                // GENERATORS: SELECT GEN_ID(<name>, 0) FROM RDB$DATABASE.
+                // Wire order: in_blr, msg#, messages, [in msg], out_blr,
+                // out msg#, [inline blob size], then the op_exec_immediate
+                // tail (tr, stmt, dialect, sql, items, buflen, [flags]).
+                read_wire_bytes(&mut s, &mut dec)?; // in_blr
+                read_int(&mut s, &mut dec)?; // p_sqlst_message_number
+                let in_messages = read_int(&mut s, &mut dec)?;
+                if in_messages != 0 {
+                    // an input message would follow (xdr_sql_message); our
+                    // clients pass no parameters here, so this is unexpected
+                    respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                    continue;
+                }
+                read_wire_bytes(&mut s, &mut dec)?; // out_blr
+                read_int(&mut s, &mut dec)?; // p_sqlst_out_message_number
+                if best >= 20 {
+                    read_int(&mut s, &mut dec)?; // p_sqlst_inline_blob_size
+                }
+                read_int(&mut s, &mut dec)?; // tr
+                read_int(&mut s, &mut dec)?; // stmt handle
+                read_int(&mut s, &mut dec)?; // dialect
+                let sql = read_wire_bytes(&mut s, &mut dec)?;
+                read_wire_bytes(&mut s, &mut dec)?; // items
+                read_int(&mut s, &mut dec)?; // buffer length
+                if best >= 20 {
+                    read_int(&mut s, &mut dec)?; // p_sqlst_flags
+                }
+                let text = String::from_utf8_lossy(&sql).into_owned();
+                let (p, _ps) = plan_query(&text, &database);
+                // op_sql_response carries the single output message (a
+                // scalar row: 4-byte null bitmap then the BIGINT), then a
+                // plain op_response echoes the transaction handle. A
+                // non-scalar plan (should not arise from our clients) sends
+                // no message.
+                let mut w = W::default();
+                match &p {
+                    Plan::Scalar(v) => {
+                        w.int(OP_SQL_RESPONSE).int(1);
+                        match v {
+                            Some(n) => {
+                                w.raw(&[0u8; 4]); // null bitmap: 1 col, not null
+                                w.raw(&n.to_be_bytes());
+                            }
+                            None => {
+                                w.raw(&[1u8, 0, 0, 0]); // col 0 NULL, no data
+                            }
+                        }
+                    }
+                    _ => {
+                        w.int(OP_SQL_RESPONSE).int(0);
+                    }
+                }
+                w.int(OP_RESPONSE).int(TX_HANDLE).int(0).int(0).int(0).int(0);
+                w.send(&mut s, &mut enc)?;
+            }
             x if x == OP_ALLOCATE_STATEMENT => {
                 read_int(&mut s, &mut dec)?; // db handle
                 respond(&mut s, &mut enc, 3)?; // stmt handle 3 (distinct from attach 1, tr 2)
@@ -6670,11 +6812,74 @@ fn sleuth_match(value: &str, pattern: &str) -> bool {
     value == pattern
 }
 
-/// blr_gen_id reads a generator's current value. fire-crab does not yet
-/// maintain generator pages, so this reports None (the value comes back
-/// NULL); requests carrying blr_gen_id still parse and run.
-fn read_generator_value(_db: &Database, _name: &str) -> Option<i64> {
-    None
+/// Resolve a generator's numeric id from `RDB$GENERATORS` by name.
+/// `RDB$GENERATOR_ID` is the index into the generator vector on the
+/// generator pages. None if the generator does not exist.
+fn generator_id(db: &Database, name: &str) -> Option<i64> {
+    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, "RDB$GENERATORS")?;
+    let formats = select_formats(db, "RDB$GENERATORS", rel);
+    let cols = relation_columns(&db.bytes, db.page_size, "RDB$GENERATORS");
+    let field = |n: &str| {
+        cols.iter()
+            .find(|c| c.name.eq_ignore_ascii_case(n))
+            .map(|c| c.field_id as usize)
+    };
+    let name_fid = field("RDB$GENERATOR_NAME")?;
+    let id_fid = field("RDB$GENERATOR_ID")?;
+    let want = name.trim();
+    let mut found = None;
+    for_each_record(db, rel, &formats, |row| {
+        if found.is_some() {
+            return;
+        }
+        if let Some(Value::Text(n)) = row.get(name_fid) {
+            if n.trim_end_matches(' ').eq_ignore_ascii_case(want) {
+                if let Some(Value::Int(v)) = row.get(id_fid) {
+                    found = Some(*v);
+                }
+            }
+        }
+    });
+    found
+}
+
+/// blr_gen_id / `GEN_ID(name, 0)` reads a generator's current value. The
+/// value lives at slot `id % gensPerPage` of the generator page whose
+/// sequence is `id / gensPerPage` (dpm.epp:1439); `gensPerPage` is
+/// `(page_size - offsetof(generator_page, gpg_values)) / 8` = `(ps-24)/8`
+/// (ods.cpp:81). The value is a native little-endian `SINT64` the engine
+/// dereferences directly. Generator pages carry `pag_ids` (type 9), so we
+/// find the right one by scanning for that type with the matching
+/// `gpg_sequence` (@16) rather than routing through `RDB$PAGES`. A
+/// generator that exists but whose page has never been written reads 0
+/// (the engine's zero-initialised slot); an unknown name reads NULL.
+fn read_generator_value(db: &Database, name: &str) -> Option<i64> {
+    let id = generator_id(db, name)?;
+    if id < 0 {
+        return Some(0);
+    }
+    let id = id as usize;
+    let gens_per_page = (db.page_size - 24) / 8;
+    if gens_per_page == 0 {
+        return None;
+    }
+    let sequence = (id / gens_per_page) as u32;
+    let offset = id % gens_per_page;
+    for page in db.bytes.chunks_exact(db.page_size) {
+        if page[0] != fire_crab_ods::PageType::Generators as u8 {
+            continue;
+        }
+        let seq = u32::from_le_bytes([page[16], page[17], page[18], page[19]]);
+        if seq != sequence {
+            continue;
+        }
+        let base = 24 + offset * 8;
+        let raw = page.get(base..base + 8)?;
+        return Some(i64::from_le_bytes(raw.try_into().ok()?));
+    }
+    // the generator exists but its page has not been allocated yet - the
+    // engine would return 0 for such a never-used generator
+    Some(0)
 }
 
 /// Encode one output message field by field, per xdr_datum
@@ -7956,5 +8161,59 @@ mod tests {
         let (login, key) = parse_user_id(&uid);
         assert_eq!(login, "SYSDBA");
         assert_eq!(key, "ABC");
+    }
+
+    #[test]
+    fn strip_gen_name_drops_qualifier_and_quotes() {
+        // schema-qualified, bare object name
+        assert_eq!(strip_gen_name("PUBLIC.MYGEN"), "MYGEN");
+        // schema-qualified, quoted mixed-case object name
+        assert_eq!(strip_gen_name("PUBLIC.\"MyGen\""), "MyGen");
+        // bare unqualified name
+        assert_eq!(strip_gen_name("MYGEN"), "MYGEN");
+        // quoted unqualified name
+        assert_eq!(strip_gen_name("\"MyGen\""), "MyGen");
+        // a quoted name containing a dot is not split on that dot
+        assert_eq!(strip_gen_name("\"a.b\""), "a.b");
+        // an escaped double-quote inside a quoted name
+        assert_eq!(strip_gen_name("\"a\"\"b\""), "a\"b");
+    }
+
+    #[test]
+    fn parse_gen_id_query_recognises_the_show_generators_probe() {
+        // isql's exact shape (schema-qualified name, SYSTEM.RDB$DATABASE)
+        assert_eq!(
+            parse_gen_id_query("GEN_ID(PUBLIC.SEQ_A, 0)", "SYSTEM.RDB$DATABASE"),
+            Some(("SEQ_A".to_string(), 0))
+        );
+        // bare RDB$DATABASE, unqualified generator, lowercase function name
+        assert_eq!(
+            parse_gen_id_query("gen_id(GEN_C, 0)", "RDB$DATABASE"),
+            Some(("GEN_C".to_string(), 0))
+        );
+        // a non-zero step is still parsed (the caller decides not to
+        // answer it as a read)
+        assert_eq!(
+            parse_gen_id_query("GEN_ID(SEQ_B, 1)", "RDB$DATABASE"),
+            Some(("SEQ_B".to_string(), 1))
+        );
+        // negative step
+        assert_eq!(
+            parse_gen_id_query("GEN_ID(SEQ_B, -5)", "RDB$DATABASE"),
+            Some(("SEQ_B".to_string(), -5))
+        );
+        // not a GEN_ID call
+        assert_eq!(parse_gen_id_query("ID", "RDB$DATABASE"), None);
+        assert_eq!(
+            parse_gen_id_query("CAST(1 AS BIGINT)", "RDB$DATABASE"),
+            None
+        );
+        // GEN_ID over a real table is not the probe
+        assert_eq!(parse_gen_id_query("GEN_ID(SEQ_A, 0)", "EMP"), None);
+        // trailing text after the call is rejected
+        assert_eq!(
+            parse_gen_id_query("GEN_ID(SEQ_A, 0) + 1", "RDB$DATABASE"),
+            None
+        );
     }
 }
