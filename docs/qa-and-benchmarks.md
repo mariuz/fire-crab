@@ -1095,6 +1095,56 @@ place the engine validates), so a NULL into a constrained column is a
 real SQL error whether it arrives as a literal, a missing column, a
 parameter, or an UPDATE.
 
+### The thirty-third differential — the python firebird-driver, and the last mile to the suite
+
+`qa/serve-real-pydriver.sh` reaches for the milestone this project has
+aimed at from the first commit: pointing the firebird-qa pytest suite
+at `fcwire serve`. The suite's test bodies do every database operation
+through the reference PYTHON firebird-driver - the OO client built on
+the real fbclient library through its IProvider/IStatement/
+ITransaction interfaces. Making that driver work against fire-crab is
+the substance of this increment, and it exposed three protocol details
+node-firebird (pure JS, tag-driven, forgiving) never made us get right:
+
+- **op_prepare must answer the client's REQUESTED info-item list, in
+  the requested order.** The C++ client sends a specific item template
+  (stmt_type, stmt_flags, then per-variable type/sub_type/scale/length/
+  field/relation/schema/alias items) and its OO layer parses the reply
+  strictly against it; the fixed-shape describe buffer that satisfied
+  node-firebird made it raise "Unrecognized C++ exception". The server
+  now walks the item list and answers each, including the FB6 schema
+  item, closing each variable with describe_end.
+- **op_execute's response object must echo the transaction handle.**
+  The engine's `send_response` passes `transaction->rtr_id`; the OO
+  client reads that as the live transaction and NULLED its
+  ITransaction when we sent 0 - so `commit()` crashed with a null
+  vtable while the SELECT path (which never committed) looked fine.
+  The bug hid behind a working read path exactly the way the RDB$PAGES
+  system-transaction bug hid behind a working DDL write.
+- **a string parameter arrives as `blr_text2`** (a charset word then a
+  length word - the driver's value-derived representation), not the
+  plain blr_text/blr_varying node-firebird sends.
+
+With those fixed, the driver drives fire-crab across the surface:
+SELECT (including a NUMERIC column decoded to a Python `Decimal`),
+parameterised INSERT/UPDATE/DELETE with commit, CREATE TABLE with a
+PRIMARY KEY the driver's own duplicate INSERT then hits, DROP TABLE,
+and a fresh connection reading back the committed writes - all
+gfix-clean. Building the gate also caught a real DROP bug: dropping a
+table WITH an index orphaned its B-tree bucket page, because the page
+scan read `btr_relation` at offset 26 instead of 28 (the index-less
+DROP the earlier gate exercised never hit it).
+
+The full firebird-qa PLUGIN does not yet run: its `pytest_configure`
+bootstrap calls `connect_server`, which needs the Services API
+(`op_service_attach` + `op_service_info` - it reads the server
+version, home and lock directories, security database and
+architecture), and per-test database fixtures need `op_create`.
+Those - the Services manager and database creation over the wire -
+are the concrete, named next milestones. What this increment
+establishes is that the statement-level protocol the suite's tests
+actually run their SQL through works with the real driver.
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -1325,6 +1375,13 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-ddl2.sh 3050
+
+# PYTHON firebird-driver: the reference OO driver firebird-qa's tests use,
+# driving fire-crab end-to-end (SELECT, param DML, CREATE TABLE+PK, DROP),
+# engine-validated. Needs a venv with firebird-driver installed.
+FCPY=/path/to/venv/bin/python ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix FCWIRE=/path/to/fire-crab/target/release/fcwire \
+    bash /path/to/fire-crab/qa/serve-real-pydriver.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
