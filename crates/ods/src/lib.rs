@@ -35,6 +35,7 @@ pub mod pages;
 pub mod pip;
 pub mod pointer;
 pub mod sqz;
+pub mod sysfmt;
 pub mod tip;
 pub mod tra;
 
@@ -50,6 +51,7 @@ pub use gc::{analyze as gc_analyze, version_count, GcReport};
 pub use header::HeaderPage;
 pub use pages::{census, PageType};
 pub use pip::PipPage;
+pub use sysfmt::system_relation_formats;
 pub use pointer::{relation_data_pages, PointerPage};
 pub use tip::{TipPage, TxState};
 pub use tra::{visible_rows, TipChain};

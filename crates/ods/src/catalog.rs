@@ -28,7 +28,7 @@ pub const REL_RELATION_FIELDS: u16 = 5;
 
 const RELATION_ID_OFFSET: usize = 32;
 const RELATION_NAME_OFFSET: usize = 42;
-const RELATION_NAME_LEN: usize = 252;
+pub(crate) const RELATION_NAME_LEN: usize = 252;
 
 // Field offsets in the RDB$RELATION_FIELDS record image, hardcoded the
 // same way and for the same reason as the RDB$RELATIONS offsets above

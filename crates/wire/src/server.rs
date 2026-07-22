@@ -988,6 +988,21 @@ fn execute_dml(plan: &Plan, database: &mut Option<Database>) -> Result<(i32, i32
     Ok(counts)
 }
 
+/// The formats a SELECT decodes records with: `RDB$FORMATS` for user
+/// tables; for system relations - which are absent there, the engine
+/// formats them at creation - the format computed from the catalog
+/// itself (`sysfmt`, the ini.epp offset walk over the database's own
+/// `RDB$RELATION_FIELDS`/`RDB$FIELDS` rows). DML planners deliberately
+/// keep plain `relation_formats`: the fallback must never make system
+/// relations writable.
+fn select_formats(db: &Database, table: &str, rel: u16) -> Vec<(u8, Vec<Descriptor>)> {
+    let formats = relation_formats(&db.bytes, db.page_size, rel);
+    if !formats.is_empty() {
+        return formats;
+    }
+    fire_crab_ods::system_relation_formats(&db.bytes, db.page_size, table).unwrap_or_default()
+}
+
 /// One side of a FROM clause: a table name and its optional alias.
 struct TableRef<'a> {
     table: &'a str,
@@ -1200,8 +1215,8 @@ fn plan_join(
     for tr in [left, right] {
         let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, tr.table)?;
         let columns = relation_columns(&db.bytes, db.page_size, tr.table);
-        let formats = relation_formats(&db.bytes, db.page_size, rel);
-        // joining needs decodable records (see plan_group on system rels)
+        let formats = select_formats(db, tr.table, rel);
+        // joining needs decodable records
         if formats.is_empty() {
             return None;
         }
@@ -1382,7 +1397,7 @@ fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
         return fallback;
     };
     let columns = relation_columns(&db.bytes, db.page_size, table);
-    let formats = relation_formats(&db.bytes, db.page_size, rel);
+    let formats = select_formats(db, table, rel);
     let descs = formats
         .iter()
         .max_by_key(|(n, _)| *n)
