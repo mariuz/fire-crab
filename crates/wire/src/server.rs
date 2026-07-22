@@ -31,6 +31,16 @@ use crate::{
 
 const OP_ALLOCATE_STATEMENT: i32 = 62;
 const OP_EXEC_IMMEDIATE: i32 = 64;
+// legacy BLR request API (isql's SHOW commands)
+const OP_COMPILE: i32 = 22;
+const OP_START: i32 = 23;
+const OP_START_AND_SEND: i32 = 24;
+const OP_RECEIVE: i32 = 26;
+const OP_RELEASE: i32 = 28;
+const OP_SEND: i32 = 25; // the op the server replies to op_receive with
+const OP_START_AND_RECEIVE: i32 = 73;
+const OP_START_SEND_AND_RECEIVE: i32 = 74;
+const BLR_REQ_HANDLE: i32 = 5;
 const OP_COND_ACCEPT: i32 = 98;
 const OP_CANCEL: i32 = 91;
 const OP_INFO_DATABASE: i32 = 40;
@@ -119,6 +129,55 @@ fn respond(s: &mut TcpStream, enc: &mut Option<Rc4>, handle: i32) -> std::io::Re
         .int(0) // blob id
         .int(0) // response data length
         .int(0); // isc_arg_end (clean status)
+    w.send(s, enc)
+}
+
+/// Ship one batch of the legacy request API's output messages in answer
+/// to a single op_receive. The client (remote/client/interface.cpp,
+/// batch_gds_receive) reads consecutive op_send packets until one carries
+/// `p_data_messages == 0`, which marks the end of the batch - so every
+/// op_send but the last of the batch sets that field to 1, and the last
+/// sets it to 0 (mirroring the server's send_partial/send split in
+/// remote/server/server.cpp receive_msg). `batch` is how many messages
+/// the client asked for; we send at most that many of the remaining
+/// queued messages, advancing the cursor, so a result larger than one
+/// batch is drained across several op_receive round-trips. Each op_send
+/// is a P_DATA header of five shorts (request, incarnation, transaction,
+/// message number, messages-remaining flag) then the packed message.
+fn send_request_batch(
+    s: &mut TcpStream,
+    enc: &mut Option<Rc4>,
+    queue: &[(i32, Vec<u8>)],
+    cursor: &mut usize,
+    req_msgno: i32,
+    batch: i32,
+) -> std::io::Result<()> {
+    let batch = batch.max(1) as usize;
+    let remaining = queue.len().saturating_sub(*cursor);
+    let to_send = remaining.min(batch);
+    let mut w = W::default();
+    if to_send == 0 {
+        // no data left: a single terminator op_send with messages = 0
+        w.int(OP_SEND)
+            .int(BLR_REQ_HANDLE)
+            .int(0)
+            .int(TX_HANDLE)
+            .int(req_msgno)
+            .int(0);
+        return w.send(s, enc);
+    }
+    for i in 0..to_send {
+        let (msgno, msg) = &queue[*cursor];
+        *cursor += 1;
+        let last = i == to_send - 1;
+        w.int(OP_SEND)
+            .int(BLR_REQ_HANDLE)
+            .int(0) // incarnation
+            .int(TX_HANDLE)
+            .int(*msgno)
+            .int(if last { 0 } else { 1 }); // 0 ends the batch
+        w.raw(msg);
+    }
     w.send(s, enc)
 }
 
@@ -5372,6 +5431,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // then just slices it.
     let mut blobs: std::collections::HashMap<i32, (Vec<u8>, usize)> = std::collections::HashMap::new();
     let mut next_blob_handle: i32 = 7000;
+    // the legacy BLR request (isql SHOW): the compiled request, the
+    // queue of xdr-encoded output messages built at start, and the
+    // read cursor the op_receive loop advances
+    let mut blr_request: Option<BlrReq> = None;
+    let mut blr_queue: Vec<(i32, Vec<u8>)> = Vec::new();
+    let mut blr_cursor: usize = 0;
 
     // --- the op loop (encrypted) ---
     loop {
@@ -5732,10 +5797,707 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 w.int(OP_RESPONSE).int(0).int(0).int(0).bytes(&info).int(0);
                 w.send(&mut s, &mut enc)?;
             }
-            _ => break, // unhandled op: end the connection
+            x if x == OP_COMPILE => {
+                // the legacy BLR request API that isql's SHOW commands
+                // run on: compile a request (a for-loop over a system
+                // relation), then start/receive its rows.
+                read_int(&mut s, &mut dec)?; // db handle
+                let blr = read_wire_bytes(&mut s, &mut dec)?;
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] op_compile blr ({} B): {:?}", blr.len(), blr);
+                }
+                match parse_blr_request(&blr) {
+                    Some(req) => {
+                        blr_request = Some(req);
+                        blr_queue.clear();
+                        blr_cursor = 0;
+                        respond(&mut s, &mut enc, BLR_REQ_HANDLE)?;
+                    }
+                    None => {
+                        blr_request = None;
+                        respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                    }
+                }
+            }
+            x if x == OP_START_AND_SEND => {
+                read_int(&mut s, &mut dec)?; // request handle
+                read_int(&mut s, &mut dec)?; // incarnation
+                read_int(&mut s, &mut dec)?; // transaction
+                read_int(&mut s, &mut dec)?; // message number
+                read_int(&mut s, &mut dec)?; // message count
+                let input = read_request_message(&mut s, &mut dec, &blr_request)?;
+                match (&blr_request, &database) {
+                    (Some(req), Some(db)) => {
+                        blr_queue = exec_blr_request(req, &input, db);
+                        blr_cursor = 0;
+                        respond(&mut s, &mut enc, BLR_REQ_HANDLE)?; // op_receive follows
+                    }
+                    _ => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
+                }
+            }
+            x if x == OP_START => {
+                read_int(&mut s, &mut dec)?; // request handle
+                read_int(&mut s, &mut dec)?; // incarnation
+                read_int(&mut s, &mut dec)?; // transaction
+                read_int(&mut s, &mut dec)?; // message number
+                read_int(&mut s, &mut dec)?; // message count
+                match (&blr_request, &database) {
+                    (Some(req), Some(db)) => {
+                        blr_queue = exec_blr_request(req, &[], db);
+                        blr_cursor = 0;
+                        respond(&mut s, &mut enc, BLR_REQ_HANDLE)?;
+                    }
+                    _ => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
+                }
+            }
+            x if x == OP_START_SEND_AND_RECEIVE => {
+                // start + send the input message + (implicitly) receive:
+                // the client's start_and_send calls receive_response and
+                // then fetches rows with a separate op_receive, so a plain
+                // op_response acknowledging the request handle is enough -
+                // the batch is shipped when op_receive arrives.
+                read_int(&mut s, &mut dec)?; // request handle
+                read_int(&mut s, &mut dec)?; // incarnation
+                read_int(&mut s, &mut dec)?; // transaction
+                read_int(&mut s, &mut dec)?; // message number
+                read_int(&mut s, &mut dec)?; // message count
+                let input = read_request_message(&mut s, &mut dec, &blr_request)?;
+                match (&blr_request, &database) {
+                    (Some(req), Some(db)) => {
+                        blr_queue = exec_blr_request(req, &input, db);
+                        blr_cursor = 0;
+                        respond(&mut s, &mut enc, BLR_REQ_HANDLE)?;
+                    }
+                    _ => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
+                }
+            }
+            x if x == OP_START_AND_RECEIVE => {
+                read_int(&mut s, &mut dec)?; // request handle
+                read_int(&mut s, &mut dec)?; // incarnation
+                read_int(&mut s, &mut dec)?; // transaction
+                read_int(&mut s, &mut dec)?; // message number
+                read_int(&mut s, &mut dec)?; // message count
+                match (&blr_request, &database) {
+                    (Some(req), Some(db)) => {
+                        blr_queue = exec_blr_request(req, &[], db);
+                        blr_cursor = 0;
+                        respond(&mut s, &mut enc, BLR_REQ_HANDLE)?;
+                    }
+                    _ => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
+                }
+            }
+            x if x == OP_RECEIVE => {
+                read_int(&mut s, &mut dec)?; // request handle
+                read_int(&mut s, &mut dec)?; // incarnation
+                read_int(&mut s, &mut dec)?; // transaction
+                let msgno = read_int(&mut s, &mut dec)?; // message number
+                let batch = read_int(&mut s, &mut dec)?; // messages the client will take
+                send_request_batch(&mut s, &mut enc, &blr_queue, &mut blr_cursor, msgno, batch)?;
+            }
+            x if x == OP_RELEASE => {
+                read_int(&mut s, &mut dec)?; // request handle
+                blr_request = None;
+                blr_queue.clear();
+                respond(&mut s, &mut enc, 0)?;
+            }
+            other => {
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] UNHANDLED op = {}", other);
+                }
+                break; // unhandled op: end the connection
+            }
         }
     }
     Ok(())
+}
+
+// ===================================================================
+// Legacy BLR request execution (op_compile / op_start / op_receive) -
+// what isql's SHOW commands run on. A compiled request is a `for` loop
+// over a system relation with a boolean and a sort, sending each row as
+// a message. fire-crab parses the BLR into a small tree, executes it
+// against the same record-walk + system-format machinery a SELECT uses,
+// and materialises the output messages (xdr-encoded field by field, per
+// xdr_datum in common/xdr.cpp) into a queue the op_receive loop drains.
+// ===================================================================
+
+/// A message field's on-the-wire type (its xdr_datum encoding).
+#[derive(Clone, Copy)]
+enum BField {
+    Short,
+    Long,
+    Cstring(u16),
+    Text(u16),
+    Varying(u16),
+}
+
+/// A value in a BLR expression: a relation field (by name), a parameter
+/// from an input message, or a literal.
+#[derive(Clone)]
+enum BVal {
+    Field(String),
+    Param(u8, u16),
+    LitLong(i64),
+    LitStr(String),
+}
+
+/// A BLR boolean.
+enum BBool {
+    And(Box<BBool>, Box<BBool>),
+    Or(Box<BBool>, Box<BBool>),
+    Not(Box<BBool>),
+    Eql(BVal, BVal),
+    Neq(BVal, BVal),
+    Missing(BVal),
+}
+
+/// A record selection expression: one relation, an optional boolean,
+/// and a list of (field name, descending) sort keys.
+struct BRse {
+    relation: String,
+    boolean: Option<BBool>,
+    sort: Vec<(String, bool)>,
+}
+
+/// A BLR statement.
+enum BStmt {
+    Begin(Vec<BStmt>),
+    Receive(Box<BStmt>),
+    For(BRse, Box<BStmt>),
+    /// send message `msg`, assigning each source value to its parameter.
+    /// A target is (message, value-index, optional null-indicator index) -
+    /// blr_parameter2 carries a separate short that the send sets to -1
+    /// when the source is NULL, 0 otherwise.
+    Send(u8, Vec<(BVal, (u8, u16, Option<u16>))>),
+    Nop,
+}
+
+/// A compiled BLR request: the message layouts and the program.
+struct BlrReq {
+    msgs: Vec<Vec<BField>>,
+    stmt: BStmt,
+}
+
+/// A cursor over BLR bytes.
+struct BlrCur<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+impl<'a> BlrCur<'a> {
+    fn u8(&mut self) -> Option<u8> {
+        let v = *self.b.get(self.i)?;
+        self.i += 1;
+        Some(v)
+    }
+    fn peek(&self) -> Option<u8> {
+        self.b.get(self.i).copied()
+    }
+    fn u16(&mut self) -> Option<u16> {
+        let lo = self.u8()? as u16;
+        let hi = self.u8()? as u16;
+        Some(lo | (hi << 8))
+    }
+    fn name(&mut self) -> Option<String> {
+        let n = self.u8()? as usize;
+        let s: String = self.b.get(self.i..self.i + n)?.iter().map(|&c| c as char).collect();
+        self.i += n;
+        Some(s)
+    }
+}
+
+// BLR verb codes used here (blr.h)
+const BLR_ASSIGNMENT: u8 = 1;
+const BLR_BEGIN: u8 = 2;
+const BLR_MESSAGE: u8 = 4;
+const BLR_FOR: u8 = 7;
+const BLR_RECEIVE: u8 = 12;
+const BLR_SEND: u8 = 14;
+const BLR_LITERAL: u8 = 21;
+const BLR_FIELD: u8 = 23;
+const BLR_PARAMETER: u8 = 25;
+const BLR_PARAMETER2: u8 = 41;
+const BLR_EQL: u8 = 47;
+const BLR_NEQ: u8 = 48;
+const BLR_OR: u8 = 57;
+const BLR_AND: u8 = 58;
+const BLR_NOT: u8 = 59;
+const BLR_MISSING: u8 = 61;
+const BLR_RSE: u8 = 67;
+const BLR_SORT: u8 = 70;
+const BLR_BOOLEAN: u8 = 71;
+const BLR_ASCENDING: u8 = 72;
+const BLR_RELATION: u8 = 74;
+const BLR_END: u8 = 255;
+
+/// Parse a compiled BLR request. None on any shape this executor does
+/// not cover (the caller then answers an SQL error).
+fn parse_blr_request(blr: &[u8]) -> Option<BlrReq> {
+    // the first byte is the blr_version (4 or 5); the request body then
+    // opens with blr_begin
+    let mut c = BlrCur { b: blr, i: 1 };
+    if c.u8()? != BLR_BEGIN {
+        return None;
+    }
+    let mut msgs: Vec<Vec<BField>> = Vec::new();
+    let mut stmt = BStmt::Nop;
+    loop {
+        match c.peek()? {
+            BLR_MESSAGE => {
+                c.u8();
+                let mno = c.u8()? as usize;
+                let cnt = c.u16()? as usize;
+                let mut fields = Vec::with_capacity(cnt);
+                for _ in 0..cnt {
+                    fields.push(parse_blr_field(&mut c)?);
+                }
+                if msgs.len() <= mno {
+                    msgs.resize(mno + 1, Vec::new());
+                }
+                msgs[mno] = fields;
+            }
+            BLR_RECEIVE | BLR_FOR | BLR_BEGIN | BLR_SEND | BLR_ASSIGNMENT => {
+                stmt = parse_blr_stmt(&mut c)?;
+                break;
+            }
+            BLR_END => {
+                c.u8();
+                break;
+            }
+            _ => return None,
+        }
+    }
+    Some(BlrReq { msgs, stmt })
+}
+
+fn parse_blr_field(c: &mut BlrCur) -> Option<BField> {
+    Some(match c.u8()? {
+        7 => {
+            c.u8()?; // scale
+            BField::Short
+        }
+        8 => {
+            c.u8()?; // scale
+            BField::Long
+        }
+        14 => BField::Text(c.u16()?),
+        37 => BField::Varying(c.u16()?),
+        40 => BField::Cstring(c.u16()?),
+        // the *2 variants carry a 2-byte character set id before the length
+        15 => {
+            c.u16()?; // charset
+            BField::Text(c.u16()?)
+        }
+        38 => {
+            c.u16()?; // charset
+            BField::Varying(c.u16()?)
+        }
+        41 => {
+            c.u16()?; // charset
+            BField::Cstring(c.u16()?)
+        }
+        _ => return None,
+    })
+}
+
+fn parse_blr_stmt(c: &mut BlrCur) -> Option<BStmt> {
+    Some(match c.u8()? {
+        BLR_BEGIN => {
+            let mut v = Vec::new();
+            while c.peek()? != BLR_END {
+                v.push(parse_blr_stmt(c)?);
+            }
+            c.u8(); // end
+            BStmt::Begin(v)
+        }
+        BLR_RECEIVE => {
+            c.u8()?; // msgno
+            BStmt::Receive(Box::new(parse_blr_stmt(c)?))
+        }
+        BLR_FOR => {
+            let rse = parse_blr_rse(c)?;
+            let body = parse_blr_stmt(c)?;
+            BStmt::For(rse, Box::new(body))
+        }
+        BLR_SEND => {
+            let msg = c.u8()?;
+            // the body is a blr_begin of blr_assignment (value -> param)
+            let assigns = parse_blr_assignments(c)?;
+            BStmt::Send(msg, assigns)
+        }
+        BLR_ASSIGNMENT => {
+            let _ = parse_blr_val(c)?;
+            let _ = parse_blr_val(c)?;
+            BStmt::Nop
+        }
+        _ => return None,
+    })
+}
+
+/// The body of a blr_send: a single blr_assignment, or a blr_begin of
+/// several. Each assignment is `blr_assignment <value> blr_parameter
+/// <msg> <index>` - the value goes into that output parameter.
+fn parse_blr_assignments(c: &mut BlrCur) -> Option<Vec<(BVal, (u8, u16, Option<u16>))>> {
+    let mut out = Vec::new();
+    let one = |c: &mut BlrCur, out: &mut Vec<(BVal, (u8, u16, Option<u16>))>| -> Option<()> {
+        if c.u8()? != BLR_ASSIGNMENT {
+            return None;
+        }
+        let from = parse_blr_val(c)?;
+        let target = match c.u8()? {
+            BLR_PARAMETER => {
+                let m = c.u8()?;
+                let idx = c.u16()?;
+                (m, idx, None)
+            }
+            BLR_PARAMETER2 => {
+                let m = c.u8()?;
+                let idx = c.u16()?;
+                let nidx = c.u16()?;
+                (m, idx, Some(nidx))
+            }
+            _ => return None,
+        };
+        out.push((from, target));
+        Some(())
+    };
+    if c.peek()? == BLR_BEGIN {
+        c.u8();
+        while c.peek()? != BLR_END {
+            one(c, &mut out)?;
+        }
+        c.u8(); // end
+    } else {
+        one(c, &mut out)?;
+    }
+    Some(out)
+}
+
+fn parse_blr_rse(c: &mut BlrCur) -> Option<BRse> {
+    if c.u8()? != BLR_RSE {
+        return None;
+    }
+    let streams = c.u8()?;
+    if streams != 1 {
+        return None;
+    }
+    if c.u8()? != BLR_RELATION {
+        return None;
+    }
+    let relation = c.name()?;
+    c.u8()?; // context number
+    let mut boolean = None;
+    let mut sort = Vec::new();
+    loop {
+        match c.peek()? {
+            BLR_BOOLEAN => {
+                c.u8();
+                boolean = Some(parse_blr_bool(c)?);
+            }
+            BLR_SORT => {
+                c.u8();
+                let n = c.u8()?;
+                for _ in 0..n {
+                    let desc = match c.u8()? {
+                        BLR_ASCENDING => false,
+                        73 => true, // blr_descending
+                        _ => return None,
+                    };
+                    // the sort key is a blr_field
+                    if c.u8()? != BLR_FIELD {
+                        return None;
+                    }
+                    c.u8()?; // context
+                    let fname = c.name()?;
+                    sort.push((fname, desc));
+                }
+            }
+            BLR_END => {
+                c.u8();
+                break;
+            }
+            _ => return None,
+        }
+    }
+    Some(BRse { relation, boolean, sort })
+}
+
+fn parse_blr_bool(c: &mut BlrCur) -> Option<BBool> {
+    Some(match c.u8()? {
+        BLR_AND => BBool::And(Box::new(parse_blr_bool(c)?), Box::new(parse_blr_bool(c)?)),
+        BLR_OR => BBool::Or(Box::new(parse_blr_bool(c)?), Box::new(parse_blr_bool(c)?)),
+        BLR_NOT => BBool::Not(Box::new(parse_blr_bool(c)?)),
+        BLR_EQL => BBool::Eql(parse_blr_val(c)?, parse_blr_val(c)?),
+        BLR_NEQ => BBool::Neq(parse_blr_val(c)?, parse_blr_val(c)?),
+        BLR_MISSING => BBool::Missing(parse_blr_val(c)?),
+        _ => return None,
+    })
+}
+
+fn parse_blr_val(c: &mut BlrCur) -> Option<BVal> {
+    Some(match c.u8()? {
+        BLR_FIELD => {
+            c.u8()?; // context
+            BVal::Field(c.name()?)
+        }
+        BLR_PARAMETER => {
+            let m = c.u8()?;
+            let idx = c.u16()?;
+            BVal::Param(m, idx)
+        }
+        BLR_PARAMETER2 => {
+            let m = c.u8()?;
+            let idx = c.u16()?;
+            c.u16()?; // null-indicator index (unused when read as a source)
+            BVal::Param(m, idx)
+        }
+        BLR_LITERAL => match c.u8()? {
+            8 => {
+                c.u8()?; // scale
+                let v = c.u8()? as i64
+                    | (c.u8()? as i64) << 8
+                    | (c.u8()? as i64) << 16
+                    | (c.u8()? as i64) << 24;
+                BVal::LitLong(v)
+            }
+            7 => {
+                c.u8()?; // scale
+                let v = c.u8()? as i64 | (c.u8()? as i64) << 8;
+                BVal::LitLong(v)
+            }
+            14 => {
+                let n = c.u16()? as usize;
+                let s: String =
+                    c.b.get(c.i..c.i + n)?.iter().map(|&x| x as char).collect();
+                c.i += n;
+                BVal::LitStr(s)
+            }
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// Read the input message an op_start_and_send carries, per the
+/// request's message-0 layout (each field xdr-decoded). Only the
+/// field shapes SHOW uses (short/long) are needed; the values feed
+/// the request's parameters.
+fn read_request_message(
+    s: &mut TcpStream,
+    dec: &mut Option<Rc4>,
+    req: &Option<BlrReq>,
+) -> std::io::Result<Vec<i64>> {
+    let fields = req
+        .as_ref()
+        .and_then(|r| r.msgs.first())
+        .cloned()
+        .unwrap_or_default();
+    let mut vals = Vec::new();
+    for f in fields {
+        match f {
+            BField::Short | BField::Long => vals.push(read_int(s, dec)? as i64),
+            BField::Cstring(_) | BField::Text(_) | BField::Varying(_) => {
+                // a text input parameter: length then padded bytes
+                let n = read_int(s, dec)?.max(0) as usize;
+                read_n(s, dec, n.div_ceil(4) * 4)?;
+                vals.push(0);
+            }
+        }
+    }
+    Ok(vals)
+}
+
+/// Execute a compiled BLR request, returning the queue of xdr-encoded
+/// output messages (each drained by one op_receive). `input` are the
+/// values from the op_start_and_send message (the request's parameters).
+fn exec_blr_request(req: &BlrReq, input: &[i64], db: &Database) -> Vec<(i32, Vec<u8>)> {
+    let mut out = Vec::new();
+    exec_blr_stmt(&req.stmt, req, input, &[], &[], db, &mut out);
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exec_blr_stmt(
+    stmt: &BStmt,
+    req: &BlrReq,
+    input: &[i64],
+    row: &[Value],
+    columns: &[RelationColumn],
+    db: &Database,
+    out: &mut Vec<(i32, Vec<u8>)>,
+) {
+    match stmt {
+        BStmt::Nop => {}
+        BStmt::Begin(v) => {
+            for st in v {
+                exec_blr_stmt(st, req, input, row, columns, db, out);
+            }
+        }
+        BStmt::Receive(body) => exec_blr_stmt(body, req, input, row, columns, db, out),
+        BStmt::For(rse, body) => {
+            let Some(rel) = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, &rse.relation)
+            else {
+                return;
+            };
+            let cols = relation_columns(&db.bytes, db.page_size, &rse.relation);
+            let formats = select_formats(db, &rse.relation, rel);
+            if formats.is_empty() {
+                return;
+            }
+            // collect matching rows
+            let mut rows: Vec<Vec<Value>> = Vec::new();
+            for_each_record(db, rel, &formats, |values| {
+                if rse
+                    .boolean
+                    .as_ref()
+                    .map_or(true, |b| eval_blr_bool(b, values, input, &cols))
+                {
+                    rows.push(values.to_vec());
+                }
+            });
+            // sort by the named keys (NULLs last-ish: treat as lowest)
+            if !rse.sort.is_empty() {
+                let keys: Vec<(usize, bool)> = rse
+                    .sort
+                    .iter()
+                    .filter_map(|(n, d)| {
+                        cols.iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(n))
+                            .map(|c| (c.field_id as usize, *d))
+                    })
+                    .collect();
+                rows.sort_by(|a, b| order_cmp(a, b, &keys));
+            }
+            for r in rows {
+                exec_blr_stmt(body, req, input, &r, &cols, db, out);
+            }
+        }
+        BStmt::Send(msg, assigns) => {
+            let fields = req.msgs.get(*msg as usize).cloned().unwrap_or_default();
+            // gather assigned values by their parameter index
+            let mut vals: Vec<Value> = vec![Value::Null; fields.len()];
+            for (from, (_m, idx, nidx)) in assigns {
+                let v = eval_blr_val(from, row, input, columns);
+                // a blr_parameter2 carries a separate short null indicator:
+                // -1 when the value is NULL, 0 otherwise
+                if let Some(ni) = nidx {
+                    if let Some(slot) = vals.get_mut(*ni as usize) {
+                        *slot = Value::Int(if matches!(v, Value::Null) { -1 } else { 0 });
+                    }
+                }
+                if let Some(slot) = vals.get_mut(*idx as usize) {
+                    *slot = v;
+                }
+            }
+            out.push((*msg as i32, encode_request_message(&fields, &vals)));
+        }
+    }
+}
+
+fn eval_blr_val(v: &BVal, row: &[Value], input: &[i64], columns: &[RelationColumn]) -> Value {
+    match v {
+        BVal::LitLong(n) => Value::Int(*n),
+        BVal::LitStr(s) => Value::Text(s.clone()),
+        BVal::Param(_m, idx) => Value::Int(input.get(*idx as usize).copied().unwrap_or(0)),
+        BVal::Field(name) => columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .and_then(|c| row.get(c.field_id as usize))
+            .cloned()
+            .unwrap_or(Value::Null),
+    }
+}
+
+fn eval_blr_bool(b: &BBool, row: &[Value], input: &[i64], columns: &[RelationColumn]) -> bool {
+    match b {
+        BBool::And(x, y) => {
+            eval_blr_bool(x, row, input, columns) && eval_blr_bool(y, row, input, columns)
+        }
+        BBool::Or(x, y) => {
+            eval_blr_bool(x, row, input, columns) || eval_blr_bool(y, row, input, columns)
+        }
+        BBool::Not(x) => !eval_blr_bool(x, row, input, columns),
+        BBool::Missing(v) => matches!(eval_blr_val(v, row, input, columns), Value::Null),
+        BBool::Eql(x, y) => blr_val_cmp(x, y, row, input, columns) == Some(std::cmp::Ordering::Equal),
+        BBool::Neq(x, y) => {
+            !matches!(blr_val_cmp(x, y, row, input, columns), Some(std::cmp::Ordering::Equal))
+        }
+    }
+}
+
+fn blr_val_cmp(
+    x: &BVal,
+    y: &BVal,
+    row: &[Value],
+    input: &[i64],
+    columns: &[RelationColumn],
+) -> Option<std::cmp::Ordering> {
+    let a = eval_blr_val(x, row, input, columns);
+    let b = eval_blr_val(y, row, input, columns);
+    match (&a, &b) {
+        (Value::Null, _) | (_, Value::Null) => None,
+        (Value::Int(p), Value::Int(q)) => Some(p.cmp(q)),
+        (Value::Text(p), Value::Text(q)) => {
+            Some(p.trim_end_matches(' ').cmp(q.trim_end_matches(' ')))
+        }
+        _ => None,
+    }
+}
+
+/// Encode one output message field by field, per xdr_datum
+/// (common/xdr.cpp): a short/long is a 4-byte big-endian value; a
+/// cstring is a 4-byte big-endian length then that many bytes padded
+/// to a 4-byte boundary; text is the fixed bytes padded to 4.
+fn encode_request_message(fields: &[BField], vals: &[Value]) -> Vec<u8> {
+    let mut m = Vec::new();
+    let push_pad = |m: &mut Vec<u8>, bytes: &[u8]| {
+        m.extend_from_slice(bytes);
+        while m.len() % 4 != 0 {
+            m.push(0);
+        }
+    };
+    for (i, f) in fields.iter().enumerate() {
+        let v = vals.get(i).cloned().unwrap_or(Value::Null);
+        match f {
+            BField::Short | BField::Long => {
+                let n = match v {
+                    Value::Int(n) => n as i32,
+                    _ => 0,
+                };
+                m.extend_from_slice(&n.to_be_bytes());
+            }
+            BField::Cstring(_) => {
+                let text = match &v {
+                    Value::Text(s) => s.trim_end_matches(' ').to_string(),
+                    Value::Null => String::new(),
+                    other => other.render(),
+                };
+                let b = text.as_bytes();
+                m.extend_from_slice(&(b.len() as i32).to_be_bytes());
+                push_pad(&mut m, b);
+            }
+            BField::Text(len) => {
+                let text = match &v {
+                    Value::Text(s) => s.clone(),
+                    Value::Null => String::new(),
+                    other => other.render(),
+                };
+                let mut b = text.into_bytes();
+                b.resize(*len as usize, b' ');
+                push_pad(&mut m, &b);
+            }
+            BField::Varying(_) => {
+                let text = match &v {
+                    Value::Text(s) => s.trim_end_matches(' ').to_string(),
+                    Value::Null => String::new(),
+                    other => other.render(),
+                };
+                let b = text.as_bytes();
+                m.extend_from_slice(&(b.len() as i32).to_be_bytes());
+                push_pad(&mut m, b);
+            }
+        }
+    }
+    m
 }
 
 fn hex_upper(b: &[u8]) -> String {
@@ -6815,6 +7577,70 @@ mod tests {
         assert_eq!(cols("A + B AS TOTAL"), vec!["expr:TOTAL"]);
         // commas inside parens are not item separators
         assert_eq!(cols("A, (B - 1)"), vec!["col:A", "expr:SUBTRACT"]);
+    }
+
+    #[test]
+    fn parses_the_show_tables_blr_request() {
+        // the exact BLR isql compiles for SHOW TABLES (captured off the
+        // wire): blr_version, blr_begin, message 1 (the row: a short eof
+        // flag + three cstrings) and message 0 (a lone short), then a
+        // blr_for over RDB$RELATIONS filtered by system-flag = :p and
+        // view_blr IS NULL, sorted by schema/package/relation, sending
+        // each row to message 1 with the eof flag = 1 and a terminator
+        // send with eof flag = 0.
+        let blr: &[u8] = &[
+            4, 2, 4, 1, 4, 0, 7, 0, 40, 253, 0, 40, 253, 0, 40, 253, 0, 4, 0, 1, 0, 7, 0, 12,
+            0, 2, 7, 67, 1, 74, 13, 82, 68, 66, 36, 82, 69, 76, 65, 84, 73, 79, 78, 83, 0, 71,
+            58, 47, 23, 0, 15, 82, 68, 66, 36, 83, 89, 83, 84, 69, 77, 95, 70, 76, 65, 71, 25,
+            0, 0, 0, 61, 23, 0, 12, 82, 68, 66, 36, 86, 73, 69, 87, 95, 66, 76, 82, 70, 3, 72,
+            23, 0, 15, 82, 68, 66, 36, 83, 67, 72, 69, 77, 65, 95, 78, 65, 77, 69, 72, 23, 0,
+            16, 82, 68, 66, 36, 80, 65, 67, 75, 65, 71, 69, 95, 78, 65, 77, 69, 72, 23, 0, 17,
+            82, 68, 66, 36, 82, 69, 76, 65, 84, 73, 79, 78, 95, 78, 65, 77, 69, 255, 14, 1, 2,
+            1, 21, 8, 0, 1, 0, 0, 0, 25, 1, 0, 0, 1, 23, 0, 17, 82, 68, 66, 36, 82, 69, 76, 65,
+            84, 73, 79, 78, 95, 78, 65, 77, 69, 25, 1, 1, 0, 1, 23, 0, 15, 82, 68, 66, 36, 83,
+            67, 72, 69, 77, 65, 95, 78, 65, 77, 69, 25, 1, 2, 0, 1, 23, 0, 16, 82, 68, 66, 36,
+            80, 65, 67, 75, 65, 71, 69, 95, 78, 65, 77, 69, 25, 1, 3, 0, 255, 14, 1, 1, 21, 8,
+            0, 0, 0, 0, 0, 25, 1, 0, 0, 255, 255, 76,
+        ];
+        let req = parse_blr_request(blr).expect("SHOW TABLES BLR must parse");
+        // two message layouts: msg 0 is one short; msg 1 is short + 3 cstrings
+        assert_eq!(req.msgs.len(), 2);
+        assert!(matches!(req.msgs[0].as_slice(), [BField::Short]));
+        assert!(matches!(
+            req.msgs[1].as_slice(),
+            [BField::Short, BField::Cstring(_), BField::Cstring(_), BField::Cstring(_)]
+        ));
+        // the for-loop's rse targets RDB$RELATIONS with a boolean and a
+        // three-key sort
+        fn find_for(s: &BStmt) -> Option<&BRse> {
+            match s {
+                BStmt::For(rse, _) => Some(rse),
+                BStmt::Begin(v) => v.iter().find_map(find_for),
+                BStmt::Receive(b) => find_for(b),
+                _ => None,
+            }
+        }
+        let rse = find_for(&req.stmt).expect("a blr_for over a relation");
+        assert_eq!(rse.relation, "RDB$RELATIONS");
+        assert!(rse.boolean.is_some());
+        assert_eq!(rse.sort.len(), 3);
+    }
+
+    #[test]
+    fn encodes_a_request_message_field_by_field() {
+        // xdr_datum, non-symmetric path: a short is a 4-byte big-endian
+        // value; a cstring is a 4-byte big-endian length then the bytes
+        // padded to a 4-byte boundary.
+        let fields = vec![BField::Short, BField::Cstring(253)];
+        let vals = vec![Value::Int(1), Value::Text("X".into())];
+        let m = encode_request_message(&fields, &vals);
+        assert_eq!(&m[0..4], &[0, 0, 0, 1]); // short eof flag = 1
+        assert_eq!(&m[4..8], &[0, 0, 0, 1]); // cstring length = 1
+        assert_eq!(&m[8..12], &[b'X', 0, 0, 0]); // 'X' padded to 4
+        assert_eq!(m.len(), 12);
+        // a NULL text renders as a zero-length cstring
+        let m2 = encode_request_message(&[BField::Cstring(253)], &[Value::Null]);
+        assert_eq!(m2, vec![0, 0, 0, 0]);
     }
 
     #[test]
