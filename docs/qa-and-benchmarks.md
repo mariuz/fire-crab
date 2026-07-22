@@ -970,6 +970,42 @@ every record against every entry - one wrong marker, pad or
 complement byte and it reports; the engine's same-statements copy
 agrees on every table; `gbak` walks it all.
 
+### The thirtieth differential — the predicate surface, oracle-checked shape by shape
+
+`qa/serve-real-expr.sh` converts the WHERE grammar real statements are
+written in: `LIKE` (with `ESCAPE`), `BETWEEN`, `IN`, `NOT` and
+parentheses. The flat OR/AND splitter became a recursive-descent
+parser normalized to DNF, with `NOT` pushed into the leaves by De
+Morgan - which is sound in three-valued logic, because the inverse
+comparison of an UNKNOWN is still UNKNOWN (`NOT (col = 5)` on a NULL
+column excludes the row exactly as `col <> 5` does). `BETWEEN`
+desugars to `>= AND <=` (bounds NOT swapped - `BETWEEN 6 AND 3` is
+empty), `IN` to OR-of-equalities, and their negations fall out of the
+same push-down - including the classic `x NOT IN (10, NULL)` trap,
+which desugars to `x <> 10 AND x <> NULL`, whose second conjunct is
+always UNKNOWN, so the whole predicate returns no rows. The engine was
+probed for each of these shapes BEFORE implementation, and the gate
+then runs the IDENTICAL SQL through fire-crab and isql on the same
+file - the oracle for every check.
+
+LIKE matches the STORED value: CHAR padding counts (CHAR(6) 'abc'
+matches `'abc%'` and `'abc   '` but NOT `'abc'` - the pre-implementation
+probe pinned this), `_` is one character, `%` any run, and an ESCAPE
+character makes the next pattern character literal. Matching is per
+character (multi-byte `_` behaviour unit-tested under the project's
+UTF8-only exclusion; the gate's data is ASCII in a NONE-charset
+database where byte and character semantics coincide).
+
+Parameters compose with all of it - `LIKE ?`, `IN (?, ?)`,
+`BETWEEN ? AND ?` - which forced one structural fix: `?` slots are now
+numbered at PARSE time, because a leaf duplicated by the DNF
+cross-product (`(A = ? OR B = ?) AND C = ?` copies the `C = ?` leaf
+into both groups) must keep referencing its ONE slot; resolution-time
+numbering would have minted two. The gate asserts the shared-slot
+case over the wire, plus UPDATE/DELETE driven by the new predicate
+shapes with the engine applying the literal equivalents to a mirror
+copy - identical tables, `gfix -v -full` clean. 46 checks green.
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -990,9 +1026,11 @@ would have produced, `gfix -v` passes, `gfix -sweep` collects the
 chains, `gbak` backs the file up). Prepared statements now take real
 `?` parameters through the describe/execute machinery every driver
 uses. What stands between here and running the suite is remaining
-*breadth* of the SQL engine - DDL and the wider expression surface
-(compound and descending indexes are maintained now; expression and
-conditional ones still refuse DML). Until that surface is wide enough,
+*breadth* of the SQL engine - DDL, select-list expressions and
+arithmetic (the WHERE predicate surface - LIKE/BETWEEN/IN/NOT/parens -
+is done; compound and descending indexes are maintained; expression
+and conditional indexes still refuse DML). Until that surface is wide
+enough,
 fire-crab does **not** claim any firebird-qa coverage - but the milestone
 is no longer distant: the protocol server the suite talks to accepts real
 clients, answers real typed, filtered, joined, grouped, sorted and
@@ -1173,6 +1211,15 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-multiseg.sh 3050
+
+# PREDICATE SURFACE: LIKE/ESCAPE, BETWEEN, IN, NOT, parentheses - 46 checks,
+# each the identical SQL through fire-crab and isql on the same file, incl.
+# NOT IN (x, NULL) 3VL, CHAR-padding LIKE, parameterised patterns/lists.
+# Builds its own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-expr.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
