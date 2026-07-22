@@ -422,12 +422,26 @@ struct ProjCol {
 enum Plan {
     Scalar(Option<i64>),
     /// `CREATE TABLE <name> (<col defs>)`: catalog rows, format and
-    /// runtime blobs, pointer/root pages - all written at op_execute
-    /// through `fire_crab_ods::ddl`
+    /// runtime blobs, pointer/root pages, NOT NULL/PRIMARY KEY
+    /// constraint rows - all written at op_execute through
+    /// `fire_crab_ods::ddl`
     CreateTable {
         name: String,
         cols: Vec<fire_crab_ods::ddl::ColumnDef>,
+        pk: Vec<usize>,
     },
+    /// `CREATE [UNIQUE] [ASC|DESC] INDEX <name> ON <table> (cols)`:
+    /// irt slot + empty root + catalog rows + backfill of existing rows
+    CreateIndex {
+        table: String,
+        name: String,
+        cols: Vec<String>,
+        unique: bool,
+        descending: bool,
+    },
+    /// `DROP TABLE <name>`: catalog rows stubbed, RDB$PAGES rows wiped,
+    /// every owned page released
+    DropTable { name: String },
     /// `INSERT INTO <t> [(cols)] VALUES (...)`: the record image is
     /// built at prepare (nulls flagged, literal fields at their
     /// descriptor offsets); `param_fields` lists the (field id,
@@ -441,6 +455,9 @@ enum Plan {
         descs: Vec<Descriptor>,
         index_ops: Vec<IndexOp>,
         param_fields: Vec<(usize, usize)>,
+        /// field ids under a NOT NULL constraint - checked after
+        /// binding, exactly where the engine validates
+        not_null: Vec<usize>,
     },
     /// `UPDATE <t> SET col = <lit|?> [, ...] [WHERE ...]`: literal SET
     /// values are encoded at prepare, parameter ones bind at execute;
@@ -454,6 +471,7 @@ enum Plan {
         sets: Vec<(usize, SetVal)>,
         filter: Option<Predicate>,
         index_ops: Vec<IndexOp>,
+        not_null: Vec<usize>,
     },
     /// `DELETE FROM <t> [WHERE ...]`: op_execute rewrites each matching
     /// primary record as a deleted stub over its version chain
@@ -774,6 +792,49 @@ fn wire_for(d: &Descriptor) -> (Wire, i32, i32, i32, i32) {
     }
 }
 
+/// The field ids of a table's NOT NULL columns, read from
+/// RDB$RELATION_FIELDS.RDB$NULL_FLAG through the computed system
+/// format - what the engine's validation (the RSR_field_not_null
+/// runtime segment) enforces; the server checks the same at DML
+/// execute.
+fn not_null_fids(db: &Database, table: &str) -> Vec<usize> {
+    use fire_crab_ods::format::Value;
+    let Some(formats) =
+        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes, db.page_size, "RDB$RELATION_FIELDS")
+    else {
+        return Vec::new();
+    };
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else {
+        return Vec::new();
+    };
+    let cols = relation_columns(&db.bytes, db.page_size, "RDB$RELATION_FIELDS");
+    let fid_of = |name: &str| {
+        cols.iter()
+            .find(|c| c.name == name)
+            .map(|c| c.field_id as usize)
+    };
+    let (Some(rel_fid), Some(id_fid), Some(nn_fid)) = (
+        fid_of("RDB$RELATION_NAME"),
+        fid_of("RDB$FIELD_ID"),
+        fid_of("RDB$NULL_FLAG"),
+    ) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let fmts = vec![(0u8, descs.clone())];
+    for_each_record(db, 5, &fmts, |values| {
+        let is_rel = matches!(values.get(rel_fid), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(table));
+        if is_rel
+            && matches!(values.get(nn_fid), Some(Value::Int(1)))
+        {
+            if let Some(Value::Int(id)) = values.get(id_fid) {
+                out.push(*id as usize);
+            }
+        }
+    });
+    out
+}
+
 /// Build the projected-column list from a select list and the relation's
 /// columns + format descriptors. `*` expands to every column in field-id
 /// (SELECT *) order. Returns None if any named column is unknown or has no
@@ -823,7 +884,7 @@ enum InsVal {
 /// (NOT NULL, PRIMARY KEY, DEFAULT, ...) are refused - the statement
 /// then errors, it never half-creates. Returns the external
 /// RDB$FIELD_TYPE code plus the descriptor pieces (dsc.h dtypes).
-fn parse_column_def(item: &str) -> Option<fire_crab_ods::ddl::ColumnDef> {
+fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, bool)> {
     use fire_crab_ods::format::dtype;
     let item = item.trim();
     let (name, ty) = item.split_once(char::is_whitespace)?;
@@ -831,17 +892,35 @@ fn parse_column_def(item: &str) -> Option<fire_crab_ods::ddl::ColumnDef> {
     if !ident_ok(name) {
         return None;
     }
-    let ty = ty.trim().to_ascii_uppercase();
+    let mut ty = ty.trim().to_ascii_uppercase();
+    // trailing column constraints: [NOT NULL] [PRIMARY KEY]
+    let mut is_pk = false;
+    let mut not_null = false;
+    if let Some(rest) = ty.strip_suffix("PRIMARY KEY") {
+        is_pk = true;
+        ty = rest.trim_end().to_string();
+    }
+    if let Some(rest) = ty.strip_suffix("NOT NULL") {
+        not_null = true;
+        ty = rest.trim_end().to_string();
+    }
+    if is_pk {
+        not_null = true; // PRIMARY KEY implies NOT NULL
+    }
     let col = |field_type: i16, dt: u8, length: u16, scale: i8, sub_type: i16, char_len: Option<u16>| {
-        Some(fire_crab_ods::ddl::ColumnDef {
-            name: name.to_ascii_uppercase(),
-            field_type,
-            dtype: dt,
-            length,
-            scale,
-            sub_type,
-            char_len,
-        })
+        Some((
+            fire_crab_ods::ddl::ColumnDef {
+                name: name.to_ascii_uppercase(),
+                field_type,
+                dtype: dt,
+                length,
+                scale,
+                sub_type,
+                char_len,
+                not_null,
+            },
+            is_pk,
+        ))
     };
     // parenthesised argument(s), if any
     let (base, args) = match ty.find('(') {
@@ -873,17 +952,23 @@ fn parse_column_def(item: &str) -> Option<fire_crab_ods::ddl::ColumnDef> {
         // sub_type 1 = NUMERIC, 2 = DECIMAL
         ("NUMERIC" | "DECIMAL", [p]) => {
             let sub = if base == "NUMERIC" { 1 } else { 2 };
-            numeric_col(name, *p, 0, sub)
+            numeric_col(name, *p, 0, sub, not_null).map(|c| (c, is_pk))
         }
         ("NUMERIC" | "DECIMAL", [p, s]) if s <= p => {
             let sub = if base == "NUMERIC" { 1 } else { 2 };
-            numeric_col(name, *p, *s, sub)
+            numeric_col(name, *p, *s, sub, not_null).map(|c| (c, is_pk))
         }
         _ => None,
     }
 }
 
-fn numeric_col(name: &str, p: u16, s: u16, sub_type: i16) -> Option<fire_crab_ods::ddl::ColumnDef> {
+fn numeric_col(
+    name: &str,
+    p: u16,
+    s: u16,
+    sub_type: i16,
+    not_null: bool,
+) -> Option<fire_crab_ods::ddl::ColumnDef> {
     use fire_crab_ods::format::dtype;
     let (field_type, dt, length) = match p {
         1..=4 => (7i16, dtype::SHORT, 2u16),
@@ -899,6 +984,7 @@ fn numeric_col(name: &str, p: u16, s: u16, sub_type: i16) -> Option<fire_crab_od
         scale: -(s as i8),
         sub_type,
         char_len: None,
+        not_null,
     })
 }
 
@@ -927,7 +1013,7 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     }
     let body = &s[open + 1..s.len() - 1];
     // split on top-level commas (type args carry their own parens)
-    let mut cols = Vec::new();
+    let mut items: Vec<&str> = Vec::new();
     let mut depth = 0usize;
     let mut start = 0usize;
     for (i, ch) in body.char_indices() {
@@ -935,17 +1021,132 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             '(' => depth += 1,
             ')' => depth = depth.checked_sub(1)?,
             ',' if depth == 0 => {
-                cols.push(parse_column_def(&body[start..i])?);
+                items.push(&body[start..i]);
                 start = i + 1;
             }
             _ => {}
         }
     }
-    cols.push(parse_column_def(&body[start..])?);
+    items.push(&body[start..]);
+
+    let mut cols: Vec<fire_crab_ods::ddl::ColumnDef> = Vec::new();
+    let mut pk: Vec<usize> = Vec::new();
+    let mut table_pk: Option<Vec<String>> = None;
+    for item in items {
+        let up_item = item.trim().to_ascii_uppercase();
+        if let Some(rest) = up_item.strip_prefix("PRIMARY KEY") {
+            // table-level PRIMARY KEY (col, ...)
+            let rest = rest.trim();
+            if !(rest.starts_with('(') && rest.ends_with(')')) || table_pk.is_some() {
+                return None;
+            }
+            let mut names = Vec::new();
+            for n in rest[1..rest.len() - 1].split(',') {
+                let n = n.trim().trim_matches('"');
+                if !ident_ok(n) {
+                    return None;
+                }
+                names.push(n.to_string());
+            }
+            table_pk = Some(names);
+            continue;
+        }
+        let (col, is_pk) = parse_column_def(item)?;
+        if is_pk {
+            pk.push(cols.len());
+        }
+        cols.push(col);
+    }
+    if let Some(names) = table_pk {
+        if !pk.is_empty() {
+            return None; // both column-level and table-level PK
+        }
+        for n in names {
+            let i = cols.iter().position(|c| c.name.eq_ignore_ascii_case(&n))?;
+            cols[i].not_null = true;
+            pk.push(i);
+        }
+    }
     Some((
-        Plan::CreateTable { name: name.to_ascii_uppercase(), cols },
+        Plan::CreateTable { name: name.to_ascii_uppercase(), cols, pk },
         Vec::new(),
     ))
+}
+
+/// Parse `CREATE [UNIQUE] [ASC[ENDING]|DESC[ENDING]] INDEX <name> ON
+/// <table> (col, ...)`.
+fn plan_create_index(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "CREATE", 0) != Some(0) {
+        return None;
+    }
+    let index_kw = find_word(&masked, "INDEX", "CREATE".len())?;
+    // the words between CREATE and INDEX: any of UNIQUE/ASC(ENDING)/DESC(ENDING)
+    let mut unique = false;
+    let mut descending = false;
+    for w in masked["CREATE".len()..index_kw].split_whitespace() {
+        match w {
+            "UNIQUE" => unique = true,
+            "ASC" | "ASCENDING" => descending = false,
+            "DESC" | "DESCENDING" => descending = true,
+            _ => return None,
+        }
+    }
+    let on_kw = find_word(&masked, "ON", index_kw + "INDEX".len())?;
+    let name = s[index_kw + "INDEX".len()..on_kw].trim().trim_matches('"');
+    if !ident_ok(name) {
+        return None;
+    }
+    let open = s[on_kw..].find('(')? + on_kw;
+    if !s.ends_with(')') {
+        return None;
+    }
+    let table = s[on_kw + "ON".len()..open].trim().trim_matches('"');
+    if !ident_ok(table) {
+        return None;
+    }
+    let mut cols = Vec::new();
+    for n in s[open + 1..s.len() - 1].split(',') {
+        let n = n.trim().trim_matches('"');
+        if !ident_ok(n) {
+            return None;
+        }
+        cols.push(n.to_string());
+    }
+    if cols.is_empty() {
+        return None;
+    }
+    Some((
+        Plan::CreateIndex {
+            table: table.to_ascii_uppercase(),
+            name: name.to_ascii_uppercase(),
+            cols,
+            unique,
+            descending,
+        },
+        Vec::new(),
+    ))
+}
+
+/// Parse `DROP TABLE <name>`.
+fn plan_drop_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "DROP", 0) != Some(0) {
+        return None;
+    }
+    let table_kw = find_word(&masked, "TABLE", "DROP".len())?;
+    if masked[..table_kw].trim() != "DROP" {
+        return None;
+    }
+    let name = s[table_kw + "TABLE".len()..].trim().trim_matches('"');
+    if !ident_ok(name) {
+        return None;
+    }
+    Some((Plan::DropTable { name: name.to_ascii_uppercase() }, Vec::new()))
 }
 
 /// Parse `INSERT INTO <t> [(col, ...)] VALUES (val, ...)` - single row,
@@ -1052,8 +1253,9 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     }
     let params: Vec<Descriptor> = params.into_iter().collect::<Option<_>>()?;
     let descs = descs.clone();
+    let not_null = not_null_fids(db, table);
     Some((
-        Plan::Insert { rel, format_no: *format_no, image, descs, index_ops, param_fields },
+        Plan::Insert { rel, format_no: *format_no, image, descs, index_ops, param_fields, not_null },
         params,
     ))
 }
@@ -1510,7 +1712,8 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     };
     let params: Vec<Descriptor> = params.into_iter().collect::<Option<_>>()?;
     let format_no = *format_no;
-    Some((Plan::Update { rel, format_no, formats, sets, filter, index_ops }, params))
+    let not_null = not_null_fids(db, table);
+    Some((Plan::Update { rel, format_no, formats, sets, filter, index_ops, not_null }, params))
 }
 
 /// Parse `DELETE FROM <t> [WHERE <pred>]` and resolve it. Same
@@ -1609,11 +1812,21 @@ fn execute_dml(
     let db = database.as_mut().ok_or("no database attached")?;
     let mut work = db.bytes.clone();
     let counts = match plan {
-        Plan::CreateTable { name, cols } => {
-            fire_crab_ods::ddl::create_table(&mut work, db.page_size, name, cols)?;
+        Plan::CreateTable { name, cols, pk } => {
+            fire_crab_ods::ddl::create_table(&mut work, db.page_size, name, cols, pk)?;
             (0, 0, 0)
         }
-        Plan::Insert { rel, format_no, image, descs, index_ops, param_fields } => {
+        Plan::CreateIndex { table, name, cols, unique, descending } => {
+            fire_crab_ods::ddl::create_index(
+                &mut work, db.page_size, table, name, cols, *unique, *descending, false,
+            )?;
+            (0, 0, 0)
+        }
+        Plan::DropTable { name } => {
+            fire_crab_ods::ddl::drop_table(&mut work, db.page_size, name)?;
+            (0, 0, 0)
+        }
+        Plan::Insert { rel, format_no, image, descs, index_ops, param_fields, not_null } => {
             let mut image = image.clone();
             for (fid, slot) in param_fields {
                 let d = descs.get(*fid).ok_or("field beyond format")?;
@@ -1627,6 +1840,12 @@ fn execute_dml(
                         image[at..at + bytes.len()].copy_from_slice(&bytes);
                         image[fid / 8] &= !(1 << (fid % 8));
                     }
+                }
+            }
+            // NOT NULL validation, where the engine validates: at store
+            for fid in not_null {
+                if image[fid / 8] & (1 << (fid % 8)) != 0 {
+                    return Err("validation error: NOT NULL column is NULL".into());
                 }
             }
             let image = &image;
@@ -1649,7 +1868,7 @@ fn execute_dml(
             }
             (1, 0, 0)
         }
-        Plan::Update { rel, format_no, formats, sets, filter, index_ops } => {
+        Plan::Update { rel, format_no, formats, sets, filter, index_ops, not_null } => {
             let descs = formats
                 .iter()
                 .find(|(n, _)| n == format_no)
@@ -1692,6 +1911,11 @@ fn execute_dml(
                             img[at..at + b.len()].copy_from_slice(b);
                             img[fid / 8] &= !(1 << (fid % 8));
                         }
+                    }
+                }
+                for fid in not_null {
+                    if img[fid / 8] & (1 << (fid % 8)) != 0 {
+                        return Err("validation error: NOT NULL column is NULL".into());
                     }
                 }
                 old_images.push(image);
@@ -2908,7 +3132,9 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Vec<Value> {
 fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
     match plan {
         Plan::Scalar(_) => describe_one_bigint(params),
-        Plan::CreateTable { .. } => describe_dml(5, params), // isc_info_sql_stmt_ddl
+        Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. } => {
+            describe_dml(5, params) // isc_info_sql_stmt_ddl
+        }
         Plan::Insert { .. } => describe_dml(2, params), // isc_info_sql_stmt_insert
         Plan::Update { .. } => describe_dml(3, params), // isc_info_sql_stmt_update
         Plan::Delete { .. } => describe_dml(4, params), // isc_info_sql_stmt_delete
@@ -2942,7 +3168,7 @@ fn emit_rows_inner(
     match plan {
         // DML and DDL have no cursor: terminator only
         Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
-        | Plan::CreateTable { .. } => {}
+        | Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. } => {}
         Plan::Scalar(v) => {
             w.int(OP_FETCH_RESPONSE).int(0).int(1);
             match v {
@@ -4297,7 +4523,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     // DDL prepares to a real plan or to an SQL error -
                     // a client must never think its DDL succeeded when
                     // the verb is one this server does not implement
-                    match plan_create_table(&stmt_sql) {
+                    let planned = plan_create_table(&stmt_sql)
+                        .or_else(|| plan_create_index(&stmt_sql))
+                        .or_else(|| plan_drop_table(&stmt_sql));
+                    match planned {
                         Some((p, ps)) => {
                             let describe = describe_for(&p, &ps);
                             plan = p;
@@ -4390,6 +4619,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::Update { .. }
                         | Plan::Delete { .. }
                         | Plan::CreateTable { .. }
+                        | Plan::CreateIndex { .. }
+                        | Plan::DropTable { .. }
                 ) {
                     // DML and DDL execute here (not at fetch): write the
                     // new versions (or the new catalog) into a copy of

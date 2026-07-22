@@ -670,6 +670,28 @@ pub fn insert_index_entry(
     }
 }
 
+/// Write an EMPTY leaf bucket - what a freshly created index's root
+/// looks like (probe: 40 bytes of content = BTR_SIZE 39 + the single
+/// END_LEVEL marker byte). The engine reads and fills it like any
+/// bucket of its own.
+pub fn write_empty_root(
+    file: &mut [u8],
+    page_size: usize,
+    page_no: u32,
+    relation: u16,
+    index_id: u8,
+) -> Result<(), String> {
+    let c = PageContent {
+        level: 0,
+        sibling: 0,
+        left_sibling: 0,
+        nodes: Vec::new(),
+        term: Terminator::Level,
+    };
+    encode_page(file, page_size, page_no, relation, index_id, &c)
+        .map_err(|_| "empty root does not fit".to_string())
+}
+
 /// The single-segment descriptor of an index: (field id, itype), read
 /// from the irtd array the root entry points at (ods.h:437-447).
 pub fn index_segment(

@@ -380,6 +380,32 @@ fn insert_record_as(
     Ok(InsertOutcome { tx_id: tx, page_no: spot.page_no, slot: spot.slot })
 }
 
+/// Release one page back to the PIP (`PAG_release_page`): its bit set
+/// free again, `pip_used` decremented, the `pip_min` hint lowered.
+/// The page bytes are left as-is - a freed page keeps stale content,
+/// exactly like the engine (allocation zeroes on reuse).
+pub(crate) fn release_page(file: &mut [u8], page_size: usize, page_no: u32) -> Result<(), String> {
+    let per_pip = PipPage::pages_per_pip(page_size);
+    if page_no as usize >= per_pip {
+        return Err("page beyond the first PIP".into());
+    }
+    let base = page_size; // PIP 0 is page 1
+    let bit = base + PIP_BITS_OFFSET + page_no as usize / 8;
+    let mask = 1u8 << (page_no % 8);
+    if file[bit] & mask != 0 {
+        return Ok(()); // already free
+    }
+    file[bit] |= mask; // set = FREE (ods.h:753)
+    let used_at = base + 24; // pip_used @24
+    let used = u32_at(file, used_at);
+    put_u32(file, used_at, used.saturating_sub(1));
+    let min_at = base + 16; // pip_min @16
+    if u32_at(file, min_at) > page_no {
+        put_u32(file, min_at, page_no);
+    }
+    Ok(())
+}
+
 /// Write a level-0 SEGMENTED blob into `rel`'s data pages: the 32-byte
 /// blh header (ods.h:969, offsets pinned by the static_asserts there)
 /// followed by the segments, each `[u16 length][bytes]` - exactly the

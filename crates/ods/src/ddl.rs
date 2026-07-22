@@ -65,6 +65,8 @@ pub struct ColumnDef {
     pub sub_type: i16,
     /// character length, for CHAR/VARCHAR (charset NONE: == bytes)
     pub char_len: Option<u16>,
+    /// NOT NULL - explicit, or implied by PRIMARY KEY membership
+    pub not_null: bool,
 }
 
 /// Values a system-catalog row is built from, keyed by column name.
@@ -276,11 +278,16 @@ fn next_domain_number(file: &[u8], page_size: usize) -> Result<u64, String> {
 /// CREATE TABLE: the full engine sequence against the file image.
 /// Errors leave the caller's copy to be discarded - the statement
 /// failed, nothing half-created survives.
+/// The `nonnull_validation_blr` bytes DdlNodes.epp stores in the
+/// runtime blob's RSR_field_not_null segment (probe-copied verbatim).
+const NONNULL_BLR: [u8; 8] = [5, 59, 61, 24, 0, 0, 0, 76];
+
 pub fn create_table(
     file: &mut Vec<u8>,
     page_size: usize,
     name: &str,
     cols: &[ColumnDef],
+    pk: &[usize],
 ) -> Result<(), String> {
     if cols.is_empty() {
         return Err("a table needs at least one column".into());
@@ -366,6 +373,9 @@ pub fn create_table(
             runtime.push(seg(26, &cl.to_le_bytes())); // RSR_character_length
         }
         runtime.push(seg(27, &(i as u16).to_le_bytes())); // RSR_field_pos
+        if c.not_null {
+            runtime.push(seg(21, &NONNULL_BLR)); // RSR_field_not_null
+        }
     }
     let runtime_blob = dml::insert_blob(file, page_size, 6, &runtime, 5)?;
 
@@ -403,6 +413,9 @@ pub fn create_table(
         ];
         if c.char_len.is_some() {
             vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
+        }
+        if c.not_null {
+            vals.push(("RDB$NULL_FLAG", SysVal::I(1)));
         }
         sys_insert(file, page_size, "RDB$RELATION_FIELDS", 5, &vals)?;
     }
@@ -450,9 +463,588 @@ pub fn create_table(
             ],
         )?;
     }
+    // --- constraints: NOT NULL rows, and the PRIMARY KEY (probe-shaped:
+    // one INTEG_<n> 'NOT NULL' + RDB$CHECK_CONSTRAINTS row per not-null
+    // column, then INTEG_<n> 'PRIMARY KEY' naming an RDB$PRIMARY<k>
+    // unique+primary index) ----------------------------------------------
+    let mut integ = next_numeric_suffix(file, page_size, "RDB$RELATION_CONSTRAINTS",
+        "RDB$CONSTRAINT_NAME", "INTEG_")?;
+    for c in cols.iter().filter(|c| c.not_null) {
+        let cname = format!("INTEG_{}", integ);
+        integ += 1;
+        sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
+            ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
+            ("RDB$CONSTRAINT_TYPE", SysVal::S("NOT NULL")),
+            ("RDB$RELATION_NAME", SysVal::S(&name)),
+            ("RDB$DEFERRABLE", SysVal::S("NO")),
+            ("RDB$INITIALLY_DEFERRED", SysVal::S("NO")),
+            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ])?;
+        sys_row_by_name(file, page_size, "RDB$CHECK_CONSTRAINTS", &[
+            ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
+            ("RDB$TRIGGER_NAME", SysVal::S(&c.name)),
+            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ])?;
+    }
+    if !pk.is_empty() {
+        let k = next_numeric_suffix(file, page_size, "RDB$INDICES",
+            "RDB$INDEX_NAME", "RDB$PRIMARY")?;
+        let iname = format!("RDB$PRIMARY{}", k);
+        let pk_cols: Vec<String> = pk.iter().map(|&i| cols[i].name.clone()).collect();
+        create_index(file, page_size, &name, &iname, &pk_cols, true, false, true)?;
+        let cname = format!("INTEG_{}", integ);
+        sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
+            ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
+            ("RDB$CONSTRAINT_TYPE", SysVal::S("PRIMARY KEY")),
+            ("RDB$RELATION_NAME", SysVal::S(&name)),
+            ("RDB$INDEX_NAME", SysVal::S(&iname)),
+            ("RDB$DEFERRABLE", SysVal::S("NO")),
+            ("RDB$INITIALLY_DEFERRED", SysVal::S("NO")),
+            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ])?;
+    }
     advance_oldest_transactions(file, page_size)?;
     Ok(())
 }
+
+/// One past the highest numeric suffix of `<prefix><n>` names in a
+/// catalog column - the INTEG_/RDB$PRIMARY sequences (the engine's own
+/// name generators skip used names, so max+1 cannot collide later).
+fn next_numeric_suffix(
+    file: &[u8],
+    page_size: usize,
+    rel_name: &str,
+    col: &str,
+    prefix: &str,
+) -> Result<u64, String> {
+    let rel = crate::resolve_relation(file, page_size, rel_name)
+        .ok_or_else(|| format!("no {} relation", rel_name))?;
+    let formats = system_relation_formats(file, page_size, rel_name)
+        .ok_or("no computed system format")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let fid = relation_columns(file, page_size, rel_name)
+        .iter()
+        .find(|c| c.name == col)
+        .map(|c| c.field_id as usize)
+        .ok_or_else(|| format!("no {} column", col))?;
+    let mut max = 0u64;
+    walk_rows(file, page_size, rel, descs, |values| {
+        if let Some(Value::Text(t)) = values.get(fid) {
+            if let Some(num) = t.trim_end().strip_prefix(prefix)
+                .and_then(|x| x.parse::<u64>().ok())
+            {
+                max = max.max(num);
+            }
+        }
+    });
+    Ok(max + 1)
+}
+
+/// [sys_insert] with the relation id resolved by name - for catalog
+/// relations whose ids this module does not hardcode.
+fn sys_row_by_name(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    rel_name: &str,
+    values: &[(&str, SysVal<'_>)],
+) -> Result<(), String> {
+    let rel = crate::resolve_relation(file, page_size, rel_name)
+        .ok_or_else(|| format!("no {} relation", rel_name))?;
+    sys_insert(file, page_size, rel_name, rel, values)
+}
+
+/// The index key type for a stored column (`DFW_assign_index_type`,
+/// dfw.epp:1236) - None for a type this write path cannot key.
+fn index_itype(d: &Descriptor) -> Option<u16> {
+    use crate::format::dtype;
+    Some(match d.dtype {
+        dtype::SHORT | dtype::LONG | dtype::REAL | dtype::DOUBLE => btw::IDX_NUMERIC,
+        dtype::INT64 => btw::IDX_NUMERIC2,
+        dtype::TEXT | dtype::VARYING => btw::IDX_STRING,
+        dtype::SQL_DATE => 5,  // idx_sql_date
+        dtype::SQL_TIME => 6,  // idx_sql_time
+        dtype::TIMESTAMP => 7, // idx_timestamp
+        dtype::BOOLEAN => 9,   // idx_boolean
+        _ => return None,
+    })
+}
+
+/// Whether an index of `index_name` already exists (any relation).
+fn index_name_taken(file: &[u8], page_size: usize, index_name: &str) -> Result<bool, String> {
+    let irel = crate::resolve_relation(file, page_size, "RDB$INDICES")
+        .ok_or("no RDB$INDICES relation")?;
+    let formats = system_relation_formats(file, page_size, "RDB$INDICES")
+        .ok_or("no computed system format")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let name_fid = relation_columns(file, page_size, "RDB$INDICES")
+        .iter()
+        .find(|c| c.name == "RDB$INDEX_NAME")
+        .map(|c| c.field_id as usize)
+        .ok_or("no RDB$INDEX_NAME column")?;
+    let mut taken = false;
+    walk_rows(file, page_size, irel, descs, |values| {
+        if let Some(Value::Text(t)) = values.get(name_fid) {
+            if t.trim_end().eq_ignore_ascii_case(index_name) {
+                taken = true;
+            }
+        }
+    });
+    Ok(taken)
+}
+
+/// CREATE INDEX: a new irt slot (tx 0, state normal - the settled
+/// shape every long-lived index shows; a freshly engine-created one
+/// idles in state 2 until touched), the irtd segment array carved
+/// downward from the irt page's tail (the engine's own allocation,
+/// probe: slot0 at page_size-8, slot1 below it), an empty root
+/// bucket, the RDB$PAGES + RDB$INDICES + RDB$INDEX_SEGMENTS rows, and
+/// a BACKFILL: every existing committed row keyed and inserted, with
+/// unique/primary enforcement - a duplicate fails the whole statement
+/// exactly like the engine's index build does.
+#[allow(clippy::too_many_arguments)]
+pub fn create_index(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    index_name: &str,
+    col_names: &[String],
+    unique: bool,
+    descending: bool,
+    primary: bool,
+) -> Result<(), String> {
+    let rel = crate::resolve_relation(file, page_size, table)
+        .ok_or_else(|| format!("table {} not found", table))?;
+    if rel < 128 {
+        return Err("system relations are read-only".into());
+    }
+    if index_name_taken(file, page_size, index_name)? {
+        return Err(format!("index {} already exists", index_name));
+    }
+    let columns = relation_columns(file, page_size, table);
+    let formats = crate::relation_formats(file, page_size, rel);
+    let (_, descs) = formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .ok_or("relation has no format")?;
+
+    // segments: (field id, itype, scale) in key order
+    let mut segs: Vec<(u16, u16, i8)> = Vec::new();
+    for n in col_names {
+        let rc = columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(n))
+            .ok_or_else(|| format!("unknown column {}", n))?;
+        let d = descs
+            .get(rc.field_id as usize)
+            .ok_or("field beyond format")?;
+        let itype = index_itype(d).ok_or("column type cannot be indexed by this writer")?;
+        segs.push((rc.field_id, itype, d.scale));
+    }
+    if segs.is_empty() {
+        return Err("an index needs at least one column".into());
+    }
+
+    // the irt slot: first empty repeat on the relation's root page,
+    // descriptor space carved from the tail below the lowest in use
+    let irt_page = file
+        .chunks_exact(page_size)
+        .position(|p| p[0] == 6 && u16_at(p, 16) == rel)
+        .ok_or("relation has no index root page")? as u32;
+    let base = irt_page as usize * page_size;
+    let mut slot = None;
+    let mut lowest_desc = page_size;
+    for i in 0..((page_size - 24) / 24) {
+        let at = base + 24 + i * 24;
+        let root = u32_at(file, at + 8);
+        if root == 0 {
+            if slot.is_none() {
+                slot = Some(i);
+                break;
+            }
+        } else {
+            lowest_desc = lowest_desc.min(u16_at(file, at + 16) as usize);
+        }
+    }
+    let slot = slot.ok_or("no free index slot")?;
+    let desc_off = lowest_desc
+        .checked_sub(8 * segs.len())
+        .ok_or("irt page full")?;
+    if 24 + (slot + 1) * 24 > desc_off {
+        return Err("irt page full".into());
+    }
+
+    let root_page = dml::allocate_page(file, page_size)?;
+    {
+        let start = root_page as usize * page_size;
+        file[start..start + page_size].fill(0);
+    }
+    btw::write_empty_root(file, page_size, root_page, rel, slot as u8)?;
+
+    let mut iflags = 0u16;
+    if unique {
+        iflags |= btw::IRT_UNIQUE;
+    }
+    if descending {
+        iflags |= btw::IRT_DESCENDING;
+    }
+    if primary {
+        iflags |= 8; // irt_primary (ods.h:462)
+    }
+    let at = base + 24 + slot * 24;
+    file[at..at + 8].copy_from_slice(&0u64.to_le_bytes()); // irt_transaction
+    dml::put_u32(file, at + 8, root_page);
+    dml::put_u32(file, at + 12, 0); // page space
+    dml::put_u16(file, at + 16, desc_off as u16);
+    dml::put_u16(file, at + 18, iflags);
+    file[at + 20] = 3; // irt_normal
+    file[at + 21] = segs.len() as u8;
+    file[at + 22] = 0;
+    file[at + 23] = 0;
+    for (i, (field, itype, _)) in segs.iter().enumerate() {
+        let d = base + desc_off + i * 8;
+        dml::put_u16(file, d, *field);
+        dml::put_u16(file, d + 2, *itype);
+        dml::put_u32(file, d + 4, 0); // selectivity
+    }
+    let count_at = base + 18; // irt_count @18
+    let count = u16_at(file, count_at);
+    if (slot as u16) + 1 > count {
+        dml::put_u16(file, count_at, slot as u16 + 1);
+    }
+
+    // catalog rows. NOTE: the bucket page is NOT registered in
+    // RDB$PAGES - only pag_pointer/pag_root/pag_transactions/pag_ids
+    // rows are legal there (DPM_scan_pages CORRUPTs on anything else,
+    // engine-error 257 caught live); B-tree pages are reachable only
+    // through the relation's index root slots
+    let table_upper = table.to_ascii_uppercase();
+    let mut ivals: Vec<(&str, SysVal<'_>)> = vec![
+        ("RDB$INDEX_NAME", SysVal::S(index_name)),
+        ("RDB$RELATION_NAME", SysVal::S(&table_upper)),
+        ("RDB$INDEX_ID", SysVal::I(slot as i64 + 1)),
+        ("RDB$UNIQUE_FLAG", SysVal::I(if unique { 1 } else { 0 })),
+        ("RDB$SEGMENT_COUNT", SysVal::I(segs.len() as i64)),
+        ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+        ("RDB$INDEX_INACTIVE", SysVal::I(0)),
+        ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+    ];
+    // probe: a PK's RDB$INDEX_TYPE is NULL, a user index carries 0/1
+    if !primary {
+        ivals.push(("RDB$INDEX_TYPE", SysVal::I(if descending { 1 } else { 0 })));
+    }
+    sys_row_by_name(file, page_size, "RDB$INDICES", &ivals)?;
+    for (pos, n) in col_names.iter().enumerate() {
+        let upper = n.to_ascii_uppercase();
+        sys_row_by_name(file, page_size, "RDB$INDEX_SEGMENTS", &[
+            ("RDB$INDEX_NAME", SysVal::S(index_name)),
+            ("RDB$FIELD_NAME", SysVal::S(&upper)),
+            ("RDB$FIELD_POSITION", SysVal::I(pos as i64)),
+            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ])?;
+    }
+
+    // BACKFILL: key every committed primary row into the new tree
+    let recs = max_recs_per_dp(page_size);
+    for dp_no in relation_data_pages(file, page_size, rel) {
+        let start = dp_no as usize * page_size;
+        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+            continue;
+        };
+        let seq = u32_at(file, start + 16) as u64;
+        let rows: Vec<(u16, Vec<Value>)> = dp
+            .records()
+            .filter(|r| r.is_primary_record())
+            .filter_map(|r| r.image().map(|img| (r.slot, decode_record(&img, descs))))
+            .collect();
+        for (line, values) in rows {
+            let recno = seq * recs + line as u64;
+            let null = Value::Null;
+            let key_segs: Vec<btw::KeySeg<'_>> = segs
+                .iter()
+                .map(|(field, itype, scale)| btw::KeySeg {
+                    itype: *itype,
+                    value: values.get(*field as usize).unwrap_or(&null),
+                    scale: *scale,
+                })
+                .collect();
+            let (key, all_null) = btw::build_index_key(&key_segs, descending)
+                .ok_or("unsupported value for an index key")?;
+            btw::insert_index_entry(
+                file,
+                page_size,
+                rel,
+                slot as u8,
+                &key,
+                recno,
+                (unique && !all_null) || primary,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Walk a system relation like [walk_rows], also yielding each row's
+/// (data page, slot) - what [crate::dml::delete_records] targets.
+fn walk_rows_at(
+    file: &[u8],
+    page_size: usize,
+    rel: u16,
+    descs: &[Descriptor],
+    mut cb: impl FnMut(u32, u16, &[Value]),
+) {
+    for dp_no in relation_data_pages(file, page_size, rel) {
+        let start = dp_no as usize * page_size;
+        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+            continue;
+        };
+        for r in dp.records() {
+            if !r.is_primary_record() {
+                continue;
+            }
+            let Some(image) = r.image() else { continue };
+            cb(dp_no, r.slot, &decode_record(&image, descs));
+        }
+    }
+}
+
+/// Delete every row of a catalog relation the predicate accepts -
+/// normal MVCC deletion (a stub over a version chain, the engine's
+/// sweep collects both), which is also what keeps the catalog INDEX
+/// entries valid: they point at deleted stubs, exactly as after an
+/// engine-side DELETE.
+fn delete_catalog_rows(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    rel_name: &str,
+    pred: impl Fn(&[Value]) -> bool,
+) -> Result<usize, String> {
+    let rel = crate::resolve_relation(file, page_size, rel_name)
+        .ok_or_else(|| format!("no {} relation", rel_name))?;
+    let formats = system_relation_formats(file, page_size, rel_name)
+        .ok_or("no computed system format")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let mut targets: Vec<(u32, u16)> = Vec::new();
+    walk_rows_at(file, page_size, rel, descs, |page, slot, values| {
+        if pred(values) {
+            targets.push((page, slot));
+        }
+    });
+    if targets.is_empty() {
+        return Ok(0);
+    }
+    let out = dml::delete_records(file, page_size, rel, &targets)?;
+    Ok(out.affected)
+}
+
+/// The field id of a named column in a system relation's computed
+/// format.
+fn sys_fid(file: &[u8], page_size: usize, rel_name: &str, col: &str) -> Result<usize, String> {
+    relation_columns(file, page_size, rel_name)
+        .iter()
+        .find(|c| c.name == col)
+        .map(|c| c.field_id as usize)
+        .ok_or_else(|| format!("no {} column in {}", col, rel_name))
+}
+
+fn text_eq(v: Option<&Value>, want: &str) -> bool {
+    matches!(v, Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(want))
+}
+fn int_eq(v: Option<&Value>, want: i64) -> bool {
+    matches!(v, Some(Value::Int(i)) if *i == want)
+}
+
+/// DROP TABLE: the engine's `DPM_delete_relation` sequence against the
+/// file image. Catalog rows in eight relations become normal deleted
+/// stubs (the engine's own DROP does the same; its sweep collects the
+/// chains AND the blobs their back versions still reference); the
+/// RDB$PAGES rows are WIPED - they are system-transaction records with
+/// no version chains, and the post-drop engine state has them
+/// physically gone; every page the relation owned (data, pointer,
+/// index root, every B-tree bucket, level-1 blob pages) is released
+/// back to the PIP.
+pub fn drop_table(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<(), String> {
+    let name = name.trim().to_ascii_uppercase();
+    let rel = crate::resolve_relation(file, page_size, &name)
+        .ok_or_else(|| format!("table {} not found", name))?;
+    if rel < 128 {
+        return Err("system relations cannot be dropped".into());
+    }
+
+    // gather what the catalog says belongs to this table BEFORE
+    // stubbing it: index names, constraint names, auto-domain names
+    let mut index_names: Vec<String> = Vec::new();
+    {
+        let irel = crate::resolve_relation(file, page_size, "RDB$INDICES")
+            .ok_or("no RDB$INDICES")?;
+        let formats = system_relation_formats(file, page_size, "RDB$INDICES")
+            .ok_or("no computed system format")?;
+        let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+        let name_fid = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME")?;
+        let rel_fid = sys_fid(file, page_size, "RDB$INDICES", "RDB$RELATION_NAME")?;
+        walk_rows(file, page_size, irel, descs, |values| {
+            if text_eq(values.get(rel_fid), &name) {
+                if let Some(Value::Text(t)) = values.get(name_fid) {
+                    index_names.push(t.trim_end().to_string());
+                }
+            }
+        });
+    }
+    let mut constraint_names: Vec<String> = Vec::new();
+    {
+        let crel = crate::resolve_relation(file, page_size, "RDB$RELATION_CONSTRAINTS")
+            .ok_or("no RDB$RELATION_CONSTRAINTS")?;
+        let formats = system_relation_formats(file, page_size, "RDB$RELATION_CONSTRAINTS")
+            .ok_or("no computed system format")?;
+        let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+        let name_fid = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME")?;
+        let rel_fid = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$RELATION_NAME")?;
+        walk_rows(file, page_size, crel, descs, |values| {
+            if text_eq(values.get(rel_fid), &name) {
+                if let Some(Value::Text(t)) = values.get(name_fid) {
+                    constraint_names.push(t.trim_end().to_string());
+                }
+            }
+        });
+    }
+    let mut domain_names: Vec<String> = Vec::new();
+    {
+        let formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")
+            .ok_or("no computed system format")?;
+        let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+        let src_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$FIELD_SOURCE")?;
+        let rel_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$RELATION_NAME")?;
+        walk_rows(file, page_size, 5, descs, |values| {
+            if text_eq(values.get(rel_fid), &name) {
+                if let Some(Value::Text(t)) = values.get(src_fid) {
+                    let t = t.trim_end();
+                    // only auto-domains die with the table
+                    if t.strip_prefix("RDB$").is_some_and(|x| x.parse::<u64>().is_ok()) {
+                        domain_names.push(t.to_string());
+                    }
+                }
+            }
+        });
+    }
+
+    // pages the relation owns - catalog-free page-type scans, plus the
+    // page vectors of any level-1 blob slots on its data pages
+    let mut pages: Vec<u32> = Vec::new();
+    let data_pages = relation_data_pages(file, page_size, rel);
+    for &dp_no in &data_pages {
+        let start = dp_no as usize * page_size;
+        if let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) {
+            for i in 0..dp.count {
+                let Some(b) = dp.slot_bytes(i) else { continue };
+                if b.len() >= 28 && u16_at(b, 10) & crate::data::flags::BLOB != 0 && b[27] == 1 {
+                    let mut at = 28;
+                    while at + 4 <= b.len() {
+                        let pg = u32_at(b, at);
+                        if pg == 0 {
+                            break;
+                        }
+                        pages.push(pg);
+                        at += 4;
+                    }
+                }
+            }
+        }
+        pages.push(dp_no);
+    }
+    for (i, p) in file.chunks_exact(page_size).enumerate() {
+        let owned = match p[0] {
+            4 => u16_at(p, 26) == rel,  // pointer: ppg_relation
+            6 => u16_at(p, 16) == rel,  // index root: irt_relation
+            7 => u16_at(p, 26) == rel,  // B-tree bucket: btr_relation
+            _ => false,
+        };
+        if owned {
+            pages.push(i as u32);
+        }
+    }
+
+    // catalog rows -> deleted stubs (version chains the engine sweeps)
+    let idx_pred = |names: Vec<String>, fid: usize| {
+        move |values: &[Value]| {
+            names.iter().any(|n| text_eq(values.get(fid), n))
+        }
+    };
+    {
+        let fid = sys_fid(file, page_size, "RDB$INDEX_SEGMENTS", "RDB$INDEX_NAME")?;
+        delete_catalog_rows(file, page_size, "RDB$INDEX_SEGMENTS",
+            idx_pred(index_names.clone(), fid))?;
+    }
+    let name2 = name.clone();
+    {
+        let fid = sys_fid(file, page_size, "RDB$INDICES", "RDB$RELATION_NAME")?;
+        let n = name2.clone();
+        delete_catalog_rows(file, page_size, "RDB$INDICES",
+            move |values| text_eq(values.get(fid), &n))?;
+    }
+    {
+        let fid = sys_fid(file, page_size, "RDB$CHECK_CONSTRAINTS", "RDB$CONSTRAINT_NAME")?;
+        delete_catalog_rows(file, page_size, "RDB$CHECK_CONSTRAINTS",
+            idx_pred(constraint_names.clone(), fid))?;
+    }
+    {
+        let fid = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$RELATION_NAME")?;
+        let n = name2.clone();
+        delete_catalog_rows(file, page_size, "RDB$RELATION_CONSTRAINTS",
+            move |values| text_eq(values.get(fid), &n))?;
+    }
+    {
+        let fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$RELATION_NAME")?;
+        let n = name2.clone();
+        delete_catalog_rows(file, page_size, "RDB$RELATION_FIELDS",
+            move |values| text_eq(values.get(fid), &n))?;
+    }
+    {
+        let fid = sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME")?;
+        delete_catalog_rows(file, page_size, "RDB$FIELDS",
+            idx_pred(domain_names.clone(), fid))?;
+    }
+    {
+        let fid = sys_fid(file, page_size, "RDB$FORMATS", "RDB$RELATION_ID")?;
+        delete_catalog_rows(file, page_size, "RDB$FORMATS",
+            move |values| int_eq(values.get(fid), rel as i64))?;
+    }
+    {
+        let fid = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
+        let n = name2.clone();
+        delete_catalog_rows(file, page_size, "RDB$RELATIONS",
+            move |values| text_eq(values.get(fid), &n))?;
+    }
+
+    // RDB$PAGES rows: system-transaction records with no chains - wipe
+    // the slots (the post-sweep engine state); rel 0 has no indexes,
+    // so no entries dangle
+    {
+        let formats = system_relation_formats(file, page_size, "RDB$PAGES")
+            .ok_or("no computed system format")?;
+        let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+        let fid = sys_fid(file, page_size, "RDB$PAGES", "RDB$RELATION_ID")?;
+        let mut targets: Vec<(u32, u16)> = Vec::new();
+        walk_rows_at(file, page_size, 0, descs, |page, slot, values| {
+            if int_eq(values.get(fid), rel as i64) {
+                targets.push((page, slot));
+            }
+        });
+        for (page, slot) in targets {
+            let dir = page as usize * page_size + DPG_RPT_OFFSET + slot as usize * 4;
+            dml::put_u16(file, dir, 0);
+            dml::put_u16(file, dir + 2, 0);
+        }
+    }
+
+    // release every owned page back to the PIP
+    pages.sort_unstable();
+    pages.dedup();
+    for p in pages {
+        dml::release_page(file, page_size, p)?;
+    }
+    advance_oldest_transactions(file, page_size)?;
+    Ok(())
+}
+
 
 /// Advance the header's oldest-transaction markers past every
 /// transaction this DDL burned, mirroring what a clean engine detach

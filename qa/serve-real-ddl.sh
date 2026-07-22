@@ -22,6 +22,7 @@
 #     page's ppg_dp_empty fill bit, or gfix -v -full warns.
 #
 #   qa/serve-real-ddl.sh [port]
+# (CREATE INDEX / DROP TABLE / constraints: serve-real-ddl2.sh)
 #
 # Builds its own scratch database (charset NONE).
 
@@ -121,13 +122,15 @@ case "$(node_run "CREATE TABLE TDDL (X INTEGER)")" in
     ERR*) echo "OK   duplicate table name refused" ;;
     *) echo "DIFF duplicate table name refused"; fail=1 ;;
 esac
-case "$(node_run "CREATE INDEX FOO ON TDDL (ID)")" in
+# CREATE INDEX and DROP TABLE are supported since serve-real-ddl2;
+# a genuinely unsupported verb must still raise a real SQL error
+case "$(node_run "ALTER TABLE TDDL ADD Q INTEGER")" in
     ERR*) echo "OK   unsupported DDL verb raises an error" ;;
     *) echo "DIFF unsupported DDL verb raises an error"; fail=1 ;;
 esac
-case "$(node_run "DROP TABLE TDDL")" in
-    ERR*) echo "OK   unsupported DROP raises an error" ;;
-    *) echo "DIFF unsupported DROP raises an error"; fail=1 ;;
+case "$(node_run "RECREATE TABLE TDDL (X INTEGER)")" in
+    ERR*) echo "OK   unsupported RECREATE raises an error" ;;
+    *) echo "DIFF unsupported RECREATE raises an error"; fail=1 ;;
 esac
 
 # --- phase 2: the ENGINE adopts the table ------------------------------
