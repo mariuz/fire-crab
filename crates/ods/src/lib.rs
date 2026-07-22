@@ -44,7 +44,7 @@ pub use catalog::{
     count_primary_records, list_relations, relation_columns, resolve_relation, RelationColumn,
 };
 pub use data::{DataPage, RecordHeader};
-pub use dml::{insert_record, InsertOutcome};
+pub use dml::{delete_records, insert_record, update_records, DmlOutcome, InsertOutcome};
 pub use format::{decode_record, relation_formats, Descriptor, Value};
 pub use gc::{analyze as gc_analyze, version_count, GcReport};
 pub use header::HeaderPage;

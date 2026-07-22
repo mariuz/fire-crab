@@ -183,17 +183,17 @@ fn describe_one_bigint() -> Vec<u8> {
     d
 }
 
-/// The describe buffer for an INSERT: statement type
-/// isc_info_sql_stmt_insert(2), no parameters, no output columns - the
-/// client executes without fetching.
-fn describe_insert() -> Vec<u8> {
+/// The describe buffer for a DML statement: its statement type
+/// (isc_info_sql_stmt_ insert=2, update=3, delete=4), no parameters, no
+/// output columns - the client executes without fetching.
+fn describe_dml(stmt_type: i32) -> Vec<u8> {
     let mut d = Vec::new();
     let item = |d: &mut Vec<u8>, code: u8, val: i32| {
         d.push(code);
         d.extend_from_slice(&4u16.to_le_bytes());
         d.extend_from_slice(&val.to_le_bytes());
     };
-    item(&mut d, 21, 2); // isc_info_sql_stmt_type = insert(2)
+    item(&mut d, 21, stmt_type); // isc_info_sql_stmt_type
     d.push(5); // isc_info_sql_bind
     item(&mut d, 7, 0); // 0 params
     d.push(8); // describe_end
@@ -207,7 +207,7 @@ fn describe_insert() -> Vec<u8> {
 /// The op_info_sql answer for isc_info_sql_records: the per-verb row
 /// counts of the last executed statement, in the standard cluster form
 /// (code 23, 2-byte total length, nested count items, isc_info_end).
-fn build_records_info(inserted: i32) -> Vec<u8> {
+fn build_records_info(inserted: i32, updated: i32, deleted: i32) -> Vec<u8> {
     let mut inner = Vec::new();
     let item = |d: &mut Vec<u8>, code: u8, val: i32| {
         d.push(code);
@@ -216,8 +216,8 @@ fn build_records_info(inserted: i32) -> Vec<u8> {
     };
     item(&mut inner, 13, 0); // isc_info_req_select_count
     item(&mut inner, 14, inserted); // isc_info_req_insert_count
-    item(&mut inner, 15, 0); // isc_info_req_update_count
-    item(&mut inner, 16, 0); // isc_info_req_delete_count
+    item(&mut inner, 15, updated); // isc_info_req_update_count
+    item(&mut inner, 16, deleted); // isc_info_req_delete_count
     let mut d = Vec::new();
     d.push(23); // isc_info_sql_records
     d.extend_from_slice(&(inner.len() as u16).to_le_bytes());
@@ -376,6 +376,25 @@ enum Plan {
         rel: u16,
         format_no: u8,
         image: Vec<u8>,
+    },
+    /// `UPDATE <t> SET col = lit [, ...] [WHERE ...]`: the SET values
+    /// are resolved and encoded at prepare (`None` = SQL NULL, `Some` =
+    /// the field's bytes); op_execute walks the committed primary
+    /// records, patches the matching rows' images, and rewrites each as
+    /// a new version chained over its old one
+    Update {
+        rel: u16,
+        format_no: u8,
+        formats: Vec<(u8, Vec<Descriptor>)>,
+        sets: Vec<(usize, Option<Vec<u8>>)>,
+        filter: Option<Predicate>,
+    },
+    /// `DELETE FROM <t> [WHERE ...]`: op_execute rewrites each matching
+    /// primary record as a deleted stub over its version chain
+    Delete {
+        rel: u16,
+        formats: Vec<(u8, Vec<Descriptor>)>,
+        filter: Option<Predicate>,
     },
     Project {
         rel: u16,
@@ -680,53 +699,61 @@ fn build_insert_image(
     for (rc, v) in targets.iter().zip(vals) {
         let fid = rc.field_id as usize;
         let d = descs.get(fid)?;
-        let at = d.offset as usize;
-        let flen = d.length as usize;
-        match v {
-            InsVal::Null => continue, // flag already set
-            InsVal::Int(n) => {
-                if d.scale != 0 {
-                    return None; // scaled targets need scale conversion
-                }
-                match d.dtype {
-                    dtype::SHORT => {
-                        let x = i16::try_from(*n).ok()?;
-                        image[at..at + 2].copy_from_slice(&x.to_le_bytes());
-                    }
-                    dtype::LONG => {
-                        let x = i32::try_from(*n).ok()?;
-                        image[at..at + 4].copy_from_slice(&x.to_le_bytes());
-                    }
-                    dtype::INT64 => image[at..at + 8].copy_from_slice(&n.to_le_bytes()),
-                    _ => return None,
-                }
-            }
-            InsVal::Str(text) => {
-                let b = text.as_bytes();
-                match d.dtype {
-                    dtype::VARYING => {
-                        if b.len() + 2 > flen {
-                            return None;
-                        }
-                        image[at..at + 2].copy_from_slice(&(b.len() as u16).to_le_bytes());
-                        image[at + 2..at + 2 + b.len()].copy_from_slice(b);
-                    }
-                    dtype::TEXT => {
-                        if b.len() > flen {
-                            return None;
-                        }
-                        image[at..at + b.len()].copy_from_slice(b);
-                        for x in &mut image[at + b.len()..at + flen] {
-                            *x = b' '; // CHAR blank padding
-                        }
-                    }
-                    _ => return None,
-                }
+        match encode_set_value(d, v)? {
+            None => continue, // NULL - flag already set
+            Some(bytes) => {
+                let at = d.offset as usize;
+                image[at..at + bytes.len()].copy_from_slice(&bytes);
             }
         }
         image[fid / 8] &= !(1 << (fid % 8)); // provided and not null
     }
     Some(image)
+}
+
+/// Encode one SQL literal for a column: `None` = a type/width mismatch
+/// (the statement is refused), `Some(None)` = SQL NULL (set the null
+/// flag), `Some(Some(bytes))` = the field's bytes, laid at its
+/// descriptor offset. A VARYING's bytes cover only its used prefix -
+/// anything beyond the counted text is dead space on disk.
+fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
+    let flen = d.length as usize;
+    Some(match v {
+        InsVal::Null => None,
+        InsVal::Int(n) => {
+            if d.scale != 0 {
+                return None; // scaled targets need scale conversion
+            }
+            Some(match d.dtype {
+                dtype::SHORT => i16::try_from(*n).ok()?.to_le_bytes().to_vec(),
+                dtype::LONG => i32::try_from(*n).ok()?.to_le_bytes().to_vec(),
+                dtype::INT64 => n.to_le_bytes().to_vec(),
+                _ => return None,
+            })
+        }
+        InsVal::Str(text) => {
+            let b = text.as_bytes();
+            match d.dtype {
+                dtype::VARYING => {
+                    if b.len() + 2 > flen {
+                        return None;
+                    }
+                    let mut out = (b.len() as u16).to_le_bytes().to_vec();
+                    out.extend_from_slice(b);
+                    Some(out)
+                }
+                dtype::TEXT => {
+                    if b.len() > flen {
+                        return None;
+                    }
+                    let mut out = b.to_vec();
+                    out.resize(flen, b' '); // CHAR blank padding
+                    Some(out)
+                }
+                _ => return None,
+            }
+        }
+    })
 }
 
 /// The unpacked image length of an existing primary record in this
@@ -750,6 +777,200 @@ fn sample_image_len(db: &Database, rel: u16, format_no: u8) -> Option<usize> {
         }
     }
     None
+}
+
+/// Parse `UPDATE <t> SET col = lit [, ...] [WHERE <pred>]` - literal
+/// values only, no expressions or aliases - resolve it against the
+/// relation, and encode every SET value at prepare. The WHERE clause is
+/// the same grammar SELECT filters with. None = not a statement the
+/// server can honour (the caller answers an SQL error - never a silent
+/// no-op, never a wrong write).
+fn plan_update(sql: &str, db: &Option<Database>) -> Option<Plan> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "UPDATE", 0) != Some(0) {
+        return None;
+    }
+    let set_kw = find_word(&masked, "SET", "UPDATE".len())?;
+    let table = s["UPDATE".len()..set_kw].trim().trim_matches('"');
+    if !ident_ok(table) {
+        return None;
+    }
+    let where_kw = find_word(&masked, "WHERE", set_kw + "SET".len());
+
+    let db = db.as_ref()?;
+    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
+    let columns = relation_columns(&db.bytes, db.page_size, table);
+    let formats = relation_formats(&db.bytes, db.page_size, rel);
+    let (format_no, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+
+    let set_end = where_kw.unwrap_or(s.len());
+    let toks = tokenize(&s[set_kw + "SET".len()..set_end])?;
+    let mut sets: Vec<(usize, Option<Vec<u8>>)> = Vec::new();
+    for part in split_on(&toks, |t| matches!(t, Tok::Comma)) {
+        let (name, v) = match part {
+            [Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Int(n)] => (c, InsVal::Int(*n)),
+            [Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Str(t)] => (c, InsVal::Str(t.clone())),
+            [Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Null] => (c, InsVal::Null),
+            _ => return None,
+        };
+        let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+        let fid = rc.field_id as usize;
+        if sets.iter().any(|(f, _)| *f == fid) {
+            return None; // the same column set twice is invalid SQL
+        }
+        sets.push((fid, encode_set_value(descs.get(fid)?, &v)?));
+    }
+    if sets.is_empty() {
+        return None;
+    }
+    let filter = match where_kw {
+        None => None,
+        Some(w) => Some(
+            tokenize(&s[w + "WHERE".len()..])
+                .and_then(|t| parse_predicate(&t))
+                .and_then(|raw| resolve_predicate(raw, &columns, descs))?,
+        ),
+    };
+    let format_no = *format_no;
+    Some(Plan::Update { rel, format_no, formats, sets, filter })
+}
+
+/// Parse `DELETE FROM <t> [WHERE <pred>]` and resolve it. Same
+/// contract as `plan_update`: None means SQL error, never a fallback.
+fn plan_delete(sql: &str, db: &Option<Database>) -> Option<Plan> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "DELETE", 0) != Some(0) {
+        return None;
+    }
+    let from_kw = find_word(&masked, "FROM", "DELETE".len())?;
+    let where_kw = find_word(&masked, "WHERE", from_kw + "FROM".len());
+    let table = s[from_kw + "FROM".len()..where_kw.unwrap_or(s.len())]
+        .trim()
+        .trim_matches('"');
+    if !ident_ok(table) {
+        return None;
+    }
+    let db = db.as_ref()?;
+    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
+    let columns = relation_columns(&db.bytes, db.page_size, table);
+    let formats = relation_formats(&db.bytes, db.page_size, rel);
+    // a relation with no RDB$FORMATS entry (a system relation) cannot
+    // be walked by format - refuse rather than silently delete nothing
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let filter = match where_kw {
+        None => None,
+        Some(w) => Some(
+            tokenize(&s[w + "WHERE".len()..])
+                .and_then(|t| parse_predicate(&t))
+                .and_then(|raw| resolve_predicate(raw, &columns, descs))?,
+        ),
+    };
+    Some(Plan::Delete { rel, formats, filter })
+}
+
+/// The DML target walk: every committed primary record of `rel` the
+/// filter accepts, with the page/slot address the version-chain writer
+/// needs, the record's stored format, and its unpacked image (what an
+/// UPDATE patch starts from).
+fn collect_dml_targets(
+    db: &Database,
+    rel: u16,
+    formats: &[(u8, Vec<Descriptor>)],
+    filter: &Option<Predicate>,
+) -> Vec<(u32, u16, u8, Vec<u8>)> {
+    let mut out = Vec::new();
+    for dp_no in relation_data_pages(&db.bytes, db.page_size, rel) {
+        let start = dp_no as usize * db.page_size;
+        let Some(dp) = db
+            .bytes
+            .get(start..start + db.page_size)
+            .and_then(DataPage::decode)
+        else {
+            continue;
+        };
+        for r in dp.records() {
+            if !r.is_primary_record() {
+                continue;
+            }
+            let Some(image) = r.image() else { continue };
+            let descs = formats
+                .iter()
+                .find(|(n, _)| *n == r.format)
+                .or_else(|| formats.iter().max_by_key(|(n, _)| *n));
+            let Some((_, descs)) = descs else { continue };
+            let values = decode_record(&image, descs);
+            if filter.as_ref().map_or(true, |p| p.matches(&values)) {
+                out.push((dp_no, r.slot, r.format, image));
+            }
+        }
+    }
+    out
+}
+
+/// Execute a DML plan against a WORKING COPY of the database bytes - a
+/// statement that fails partway must not leave half its version chains
+/// behind - and flush the whole file back on success (the offline
+/// writer's atomicity model). Returns the per-verb affected counts
+/// (inserted, updated, deleted) for isc_info_sql_records.
+fn execute_dml(plan: &Plan, database: &mut Option<Database>) -> Result<(i32, i32, i32), String> {
+    let db = database.as_mut().ok_or("no database attached")?;
+    let mut work = db.bytes.clone();
+    let counts = match plan {
+        Plan::Insert { rel, format_no, image } => {
+            fire_crab_ods::insert_record(&mut work, db.page_size, *rel, *format_no, image)?;
+            (1, 0, 0)
+        }
+        Plan::Update { rel, format_no, formats, sets, filter } => {
+            let descs = formats
+                .iter()
+                .find(|(n, _)| n == format_no)
+                .map(|(_, d)| d)
+                .ok_or("newest format not found")?;
+            let mut targets: Vec<(u32, u16, Vec<u8>)> = Vec::new();
+            for (page, slot, fmt, image) in collect_dml_targets(db, *rel, formats, filter) {
+                // the SET offsets were resolved in the NEWEST format; a
+                // record still stored in an older one would patch wrong
+                // bytes - refuse the whole statement instead
+                if fmt != *format_no {
+                    return Err("a matching record is in an older format".into());
+                }
+                let mut img = image;
+                for (fid, bytes) in sets {
+                    match bytes {
+                        None => img[fid / 8] |= 1 << (fid % 8), // SET col = NULL
+                        Some(b) => {
+                            let at = descs.get(*fid).ok_or("field beyond format")?.offset as usize;
+                            if at + b.len() > img.len() {
+                                return Err("record image shorter than its format".into());
+                            }
+                            img[at..at + b.len()].copy_from_slice(b);
+                            img[fid / 8] &= !(1 << (fid % 8));
+                        }
+                    }
+                }
+                targets.push((page, slot, img));
+            }
+            let out =
+                fire_crab_ods::update_records(&mut work, db.page_size, *rel, &targets, *format_no)?;
+            (0, out.affected as i32, 0)
+        }
+        Plan::Delete { rel, formats, filter } => {
+            let targets: Vec<(u32, u16)> = collect_dml_targets(db, *rel, formats, filter)
+                .into_iter()
+                .map(|(page, slot, _, _)| (page, slot))
+                .collect();
+            let out = fire_crab_ods::delete_records(&mut work, db.page_size, *rel, &targets)?;
+            (0, 0, out.affected as i32)
+        }
+        _ => return Err("not a DML plan".into()),
+    };
+    db.bytes = work;
+    std::fs::write(&db.path, &db.bytes).map_err(|e| e.to_string())?;
+    Ok(counts)
 }
 
 /// One side of a FROM clause: a table name and its optional alias.
@@ -1674,7 +1895,9 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Vec<Value> {
 fn describe_for(plan: &Plan) -> Vec<u8> {
     match plan {
         Plan::Scalar(_) => describe_one_bigint(),
-        Plan::Insert { .. } => describe_insert(),
+        Plan::Insert { .. } => describe_dml(2), // isc_info_sql_stmt_insert
+        Plan::Update { .. } => describe_dml(3), // isc_info_sql_stmt_update
+        Plan::Delete { .. } => describe_dml(4), // isc_info_sql_stmt_delete
         Plan::Project { cols, .. } => build_describe(cols),
         Plan::Join { cols, .. } => build_describe(cols),
         Plan::Group { cols, .. } => build_describe(cols),
@@ -1689,7 +1912,8 @@ fn describe_for(plan: &Plan) -> Vec<u8> {
 /// then emits them.
 fn emit_rows(w: &mut W, plan: &Plan, db: &Option<Database>) {
     match plan {
-        Plan::Insert { .. } => {} // no cursor: terminator only
+        // DML has no cursor: terminator only
+        Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. } => {}
         Plan::Scalar(v) => {
             w.int(OP_FETCH_RESPONSE).int(0).int(1);
             match v {
@@ -2618,10 +2842,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     }
     respond(&mut s, &mut enc, 1)?; // attachment handle 1
 
-    // The SQL text of the most recently prepared statement, and the plan
-    // it resolves to (built at prepare, executed at fetch).
+    // The SQL text of the most recently prepared statement, the plan it
+    // resolves to (built at prepare, executed at fetch), and the last
+    // DML's per-verb affected counts (what isc_info_sql_records reports).
     let mut stmt_sql = String::new();
     let mut plan = Plan::Scalar(Some(FIXED_ANSWER));
+    let mut last_dml = (0i32, 0i32, 0i32); // (inserted, updated, deleted)
 
     // --- the op loop (encrypted) ---
     loop {
@@ -2656,15 +2882,25 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     read_int(&mut s, &mut dec)?; // p_sqlst_flags (FB6/proto 20+)
                 }
                 stmt_sql = String::from_utf8_lossy(&sql).into_owned();
+                last_dml = (0, 0, 0);
                 let up = stmt_sql.trim_start().to_ascii_uppercase();
-                if find_word(&up, "INSERT", 0) == Some(0) {
+                let dml_kw = ["INSERT", "UPDATE", "DELETE"]
+                    .into_iter()
+                    .find(|k| find_word(&up, k, 0) == Some(0));
+                if let Some(kw) = dml_kw {
                     // DML prepares to a real plan or to an SQL error -
                     // never to the fixed-answer fallback, which would
                     // let a client think its write succeeded
-                    match plan_insert(&stmt_sql, &database) {
+                    let planned = match kw {
+                        "INSERT" => plan_insert(&stmt_sql, &database),
+                        "UPDATE" => plan_update(&stmt_sql, &database),
+                        _ => plan_delete(&stmt_sql, &database),
+                    };
+                    match planned {
                         Some(p) => {
+                            let describe = describe_for(&p);
                             plan = p;
-                            respond_prepare(&mut s, &mut enc, &describe_insert())?;
+                            respond_prepare(&mut s, &mut enc, &describe)?;
                         }
                         None => {
                             plan = Plan::Scalar(Some(FIXED_ANSWER));
@@ -2695,37 +2931,28 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 if best >= 19 {
                     read_int(&mut s, &mut dec)?; // p_sqldata_inline_blob_size
                 }
-                if let Plan::Insert { rel, format_no, image } = &plan {
-                    // DML executes here (not at fetch): write the record
-                    // into the page image and flush the whole file back
-                    let result = match database.as_mut() {
-                        Some(db) => fire_crab_ods::insert_record(
-                            &mut db.bytes,
-                            db.page_size,
-                            *rel,
-                            *format_no,
-                            image,
-                        )
-                        .and_then(|out| {
-                            std::fs::write(&db.path, &db.bytes)
-                                .map(|_| out)
-                                .map_err(|e| e.to_string())
-                        }),
-                        None => Err("no database attached".into()),
-                    };
-                    match result {
-                        Ok(out) => {
+                if matches!(
+                    plan,
+                    Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
+                ) {
+                    // DML executes here (not at fetch): write the new
+                    // versions into a copy of the page image, swap it in
+                    // and flush the whole file back
+                    match execute_dml(&plan, &mut database) {
+                        Ok(counts) => {
+                            last_dml = counts;
                             if std::env::var("FC_SRV_TRACE").is_ok() {
                                 eprintln!(
-                                    "[srv] insert: tx {} page {} slot {}",
-                                    out.tx_id, out.page_no, out.slot
+                                    "[srv] dml: {} inserted, {} updated, {} deleted",
+                                    counts.0, counts.1, counts.2
                                 );
                             }
                             respond(&mut s, &mut enc, 0)?;
                         }
                         Err(e) => {
+                            last_dml = (0, 0, 0);
                             if std::env::var("FC_SRV_TRACE").is_ok() {
-                                eprintln!("[srv] insert failed: {}", e);
+                                eprintln!("[srv] dml failed: {}", e);
                             }
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
@@ -2741,9 +2968,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 read_int(&mut s, &mut dec)?; // incarnation
                 let items = read_wire_bytes(&mut s, &mut dec)?;
                 read_int(&mut s, &mut dec)?; // buffer length
-                let inserted = if matches!(plan, Plan::Insert { .. }) { 1 } else { 0 };
                 let info = if items.contains(&23u8) {
-                    build_records_info(inserted)
+                    build_records_info(last_dml.0, last_dml.1, last_dml.2)
                 } else {
                     vec![1] // isc_info_end
                 };
@@ -2877,6 +3103,39 @@ mod tests {
         let d = describe_one_bigint();
         // marker [4,7,4,0] must be present
         assert!(d.windows(4).any(|w| w == [4, 7, 4, 0]));
+    }
+
+    #[test]
+    fn set_values_encode_like_stored_fields() {
+        let d = |dt: u8, len: u16, scale: i8| Descriptor {
+            dtype: dt,
+            scale,
+            length: len,
+            sub_type: 0,
+            flags: 0,
+            offset: 0,
+        };
+        // integers by width, range-checked
+        assert_eq!(
+            encode_set_value(&d(dtype::SHORT, 2, 0), &InsVal::Int(-7)),
+            Some(Some((-7i16).to_le_bytes().to_vec()))
+        );
+        assert!(encode_set_value(&d(dtype::SHORT, 2, 0), &InsVal::Int(70000)).is_none());
+        assert_eq!(
+            encode_set_value(&d(dtype::INT64, 8, 0), &InsVal::Int(1 << 40)),
+            Some(Some((1i64 << 40).to_le_bytes().to_vec()))
+        );
+        // a scaled column refuses an unscaled literal
+        assert!(encode_set_value(&d(dtype::LONG, 4, -2), &InsVal::Int(5)).is_none());
+        // CHAR pads with blanks to the declared length, VARCHAR counts
+        let t = encode_set_value(&d(dtype::TEXT, 5, 0), &InsVal::Str("ab".into()));
+        assert_eq!(t, Some(Some(b"ab   ".to_vec())));
+        let v = encode_set_value(&d(dtype::VARYING, 7, 0), &InsVal::Str("ab".into()));
+        assert_eq!(v, Some(Some(vec![2, 0, b'a', b'b'])));
+        assert!(encode_set_value(&d(dtype::VARYING, 3, 0), &InsVal::Str("ab".into())).is_none());
+        // type mismatches are refused, NULL passes through
+        assert!(encode_set_value(&d(dtype::LONG, 4, 0), &InsVal::Str("x".into())).is_none());
+        assert_eq!(encode_set_value(&d(dtype::LONG, 4, 0), &InsVal::Null), Some(None));
     }
 
     fn proj_cols(p: &Proj) -> Vec<String> {
