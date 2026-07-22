@@ -59,6 +59,7 @@ the converter what the C++ is *doing* before they read a line of it.
 | BLOB content over the wire | `fire-crab-wire::server` + `fire-crab-ods::format` | **blob columns are first-class** - described SQL_BLOB with sub_type, the 8-byte on-disk bid travels as the quad, and the server answers `op_open_blob(2)`/`op_get_segment`/`op_close_blob` by assembling content from the pages (level 0/1, segment framing stripped per-blob via `rhd_stream_blob`); the first CONTENT differential: node-firebird's assembled text == isql on a 30000-byte multi-page blob (length/head/tail), empty and NULL blobs, and a system blob through the computed system format |
 | INT128 + DECFLOAT | `fire-crab-ods::decfloat` + `fire-crab-wire::server` | **decoded, rendered like decNumber, native on the wire** - decimal64/128 DPD decode converted from the engine's embedded decNumber (DPD2BIN table from decDPD.h), rendering per decNumberToString (cohort preserved: 100.00 keeps its zeros; the 0.000001-vs-1E-7 plain/scientific boundary exact); INT128 as a scaled i128. Wire forms exactly as xdr.cpp serializes them. Render differential: `fcstat rows` == isql text on 38-digit INT128 and 34-digit DECFLOAT; wire differential through node-firebird's typed decode; ORDER BY sorts numerically. Three node-firebird client bugs catalogued along the way (negative INT128, huge scale-0 INT128, multi-digit DECFLOAT coefficients - all broken against any server) |
 | TIME ZONE types | `fire-crab-ods::tz` + `fire-crab-wire::server` | **decoded and served** - UTC + zone id per ISC_TIME_TZ/ISC_TIMESTAMP_TZ; the 637-entry zone-name table generated from TimeZones.h, offset zones converted to local exactly as TimeZoneUtil (displacement = id - 1439 - ONE_DAY is 24*60-1, an off-by-one the render differential caught first run); named zones render with the right region name but visibly unconverted (their rules need ICU's tzdata - honest placeholder over silently wrong local time); wire forms per xdr.cpp, ORDER BY by UTC instant |
+| Write-path page allocation | `fire-crab-ods::dml` | **INSERT grows the table** - pages allocated from the PIP (first free bit, pip_used/pip_min maintained, the FILE extended past EOF), formatted and hooked into the pointer page with fill-bits; back versions grow the relation the same way. 250 inserts grow a table 1 → 8 data pages by gstat's own accounting, `gfix -v -full` accepts the bookkeeping, the engine produces the identical table from the same statements. DML on INDEXED tables refused with a real SQL error until index maintenance is converted - the last big write-path piece |
 | Everything else | — | see [docs/subsystem-map.md](docs/subsystem-map.md) |
 
 **On the firebird-qa milestone, precisely.** firebird-qa drives a *server*,
@@ -206,8 +207,8 @@ in native wire form, and blob columns are served as real blobs - the id
 in the row, the content through the blob ops; named-zone local times
 render visibly unconverted (their rules need tzdata), and other shapes
 fall back to the fixed value.
-Widening further (write-path page allocation and index maintenance,
-scaled/temporal SET values) is the
+Widening further (index maintenance - the last big write-path piece -
+and scaled/temporal SET values) is the
 work that continues - but the fixed answer is no longer fixed, the server
 writes records and version chains the real engine validates and
 garbage-collects, and the protocol server it all runs on is proven

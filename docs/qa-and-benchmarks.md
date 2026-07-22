@@ -821,6 +821,35 @@ forms through node-firebird (whose TimeTz decode discards the zone by
 design and yields the UTC instant), and ORDER BY sorting by UTC
 instant, asserted with rows whose local-time order inverts it.
 
+### The twenty-sixth differential — page allocation, validated by the engine's accounting
+
+`qa/serve-real-grow.sh` converts the write path's growth half:
+`PAG_allocate_pages` + the `DPM_allocate`/extend path. When every data
+page of a relation is full, fire-crab takes the first free bit from
+the PIP (set = free; bit cleared, `pip_used` incremented, the
+`pip_min` hint advanced), extends the file itself when the allocated
+page lies past EOF, formats the page, and hooks it into the relation's
+last pointer page - slot, count, and the per-slot fill-bits byte that
+lives after the vector's full `dataPagesPerPP` capacity. Back versions
+grow the relation the same way, so UPDATE storms over full pages work.
+
+The oracles: 250 inserts through one connection grow the table from 1
+to 8 data pages **by gstat's own accounting** (the growth teeth had to
+be page-count-based, not file-size-based - a gbak-restored file keeps
+free pages below EOF, and reusing them is exactly what the allocator
+should do); `gfix -v -full` walks the PIP bits, pointer-page slots and
+fill bytes fire-crab wrote and finds nothing wrong, before and after a
+sweep; and the engine applying the same 250 inserts + update storm to
+a second copy prints the identical 253-row table.
+
+Two catches along the way: the in-place rewrite of a primary version
+on a FULL page (the freed slot sits mid-page, invisible to the
+bottom-of-free-space model - reuse the old body's own space when the
+new body fits), and the honest boundary now enforced at plan time: DML
+on an INDEXED table answers a real SQL error, because writing a record
+without its index entries would make the engine's index scans silently
+miss rows. Index maintenance is the one remaining write-path piece.
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -839,8 +868,8 @@ pages, `UPDATE`/`DELETE` write real version chains over them, and the
 engine itself validates all of it (isql reads the same table the engine
 would have produced, `gfix -v` passes, `gfix -sweep` collects the
 chains, `gbak` backs the file up). What stands between here and running
-the suite is remaining *breadth* of the SQL engine - index maintenance
-and page allocation on the write path. Until that surface is wide
+the suite is remaining *breadth* of the SQL engine - index maintenance on
+the write path. Until that surface is wide
 enough,
 fire-crab does **not** claim any firebird-qa coverage - but the milestone
 is no longer distant: the protocol server the suite talks to accepts real
@@ -988,6 +1017,14 @@ NODE_PATH="$PWD/node_modules" \
     FCSTAT=/path/to/fire-crab/target/release/fcstat \
     ISQL=/opt/firebird/bin/isql GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-tz.sh 3050
+
+# PAGE ALLOCATION: 250 inserts grow the table 1 -> 8 data pages, gfix and
+# gstat validate the PIP/pointer bookkeeping, indexed-table DML refused.
+# Builds its own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak GSTAT=/opt/firebird/bin/gstat \
+    bash /path/to/fire-crab/qa/serve-real-grow.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
