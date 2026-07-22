@@ -1325,6 +1325,58 @@ dependency sub-queries `SHOW EXCEPTIONS`/`SHOW DOMAINS` fire after their
 first result — need join streams and `blr_matching`/`blr_gen_id` in the
 request interpreter, the next slice of breadth.
 
+### The thirty-eighth differential — the joined SHOWs, and requests that run in parallel
+
+`qa/serve-real-show.sh` grows from eight single-relation SHOWs to
+fourteen, taking in the multi-relation ones: `SHOW TABLE <name>` (the
+relation, its columns with their types, primary- and foreign-key
+constraints, indices), `SHOW INDICES`, `SHOW DOMAINS`, `SHOW
+COLLATIONS`. Two things had to grow — the request interpreter's *reach*,
+and the *protocol* around requests that stay open together.
+
+The reach: an rse is no longer one relation but a list of (context,
+relation) streams, and the for-loop walks their nested-loop product,
+keeping a frame per context that `blr_field` resolves against by its
+context number — `SHOW INDICES` is `RDB$INDICES CROSS RDB$RELATIONS`
+joined on schema/package/relation, `SHOW TABLE` joins the relation's
+fields to `RDB$FIELDS` for their types. The join and filter predicates
+brought their verbs: `blr_equiv` (the null-safe `IS NOT DISTINCT FROM`
+that joins the two streams), `blr_starting`, the ordered comparisons,
+`blr_between`, `blr_value_if` and `blr_null` (isql writes a schema match
+as `EQUIV NULLIF(:p, '')`), and `blr_matching2` — the legacy **SLEUTH**
+matcher (jrd/evl.cpp) behind GDML's `MATCHING`, which isql drives with
+the one pattern `RDB$+` (control `+=[0-9][0-9]* *`, defining `+` as
+one-or-more digits) to hide the system integer-suffixed names from `SHOW
+DOMAINS`; that one shape is recognised, the rest of the sleuth language
+is not. `blr_gen_id` parses so generator requests run, though the value
+reads back NULL until fire-crab maintains generator pages. New message
+field types travel too — `blr_quad` (an 8-byte blob id, all-zero for the
+NULL source-blob columns), `blr_bool`, `blr_int64`, and the
+charset-prefixed `*2` text variants — and a request *parameter* now
+keeps its text value, because the column sub-query filters
+`RDB$INDEX_NAME = :name` on it.
+
+The protocol: these SHOWs keep several requests open at once. `SHOW
+INDICES` drives the index request and, for each index it yields, runs a
+second request over that index's segments to print the column list;
+`SHOW TABLE` juggles half a dozen. Two laws followed. First, every
+op_compile now gets its **own handle**, and the request, its output
+queue and read cursor live under that handle in a map — a single slot
+clobbered the outer request the moment the inner one compiled, and the
+outer's next fetch returned the wrong rows. Second, and subtler: each
+op_receive is answered with exactly **one** message, its
+`p_data_messages` set to 0 so the client treats it as a complete
+one-message batch and comes back for the next. The earlier
+single-relation code shipped the whole result in one burst, which is
+fine when only one request is live; with two, the rows shipped ahead of
+demand sat on the wire and were read as the *other* request's responses,
+desyncing the stream — while shipping one message flagged `1` instead
+deadlocks, the client blocking to read the rest of a batch that never
+comes. One message per round-trip keeps each request's packets strictly
+interleaved with its own op_receives. The fourteen checks run over a
+schema with a foreign key and a user index, each `SHOW` compared
+verbatim between fire-crab and isql on the same file.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -1580,9 +1632,11 @@ NODE_PATH="$PWD/node_modules" \
     bash /path/to/fire-crab/qa/serve-real-selectexpr.sh 3050
 
 # SHOW over the legacy BLR request API (op_compile / op_start / op_receive /
-# op_release): SHOW TABLES/VIEWS/ROLES/FUNCTIONS/PROCEDURES/PACKAGES/FILTERS/
-# PUBLICATIONS run identically through fire-crab (isql -> fcwire serve) and
-# isql on the same file, output compared verbatim. Builds its own scratch db.
+# op_release): the single-relation SHOWs (TABLES/VIEWS/ROLES/FUNCTIONS/
+# PROCEDURES/PACKAGES/FILTERS/PUBLICATIONS) plus the multi-relation ones -
+# SHOW TABLE <name>, SHOW INDICES (a two-stream join), SHOW DOMAINS/COLLATIONS -
+# run identically through fire-crab (isql -> fcwire serve) and isql on the
+# same file, output compared verbatim. Builds its own scratch db.
 FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     bash /path/to/fire-crab/qa/serve-real-show.sh 3050
 ```
