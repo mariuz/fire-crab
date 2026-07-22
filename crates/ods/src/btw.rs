@@ -50,6 +50,7 @@ use crate::{u16_at, u32_at};
 // itypes, btr.h:123-136
 pub const IDX_NUMERIC: u16 = 0;
 pub const IDX_STRING: u16 = 1;
+pub const IDX_METADATA: u16 = 4;
 pub const IDX_SQL_DATE: u16 = 5;
 pub const IDX_SQL_TIME: u16 = 6;
 pub const IDX_TIMESTAMP: u16 = 7;
@@ -171,6 +172,15 @@ pub fn index_key(itype: u16, value: &Value, scale: i8) -> Option<Vec<u8>> {
             let Value::Text(s) = value else { return None };
             let trimmed = s.as_bytes().trim_ascii_end_matches();
             Some(if trimmed.is_empty() { vec![b' '] } else { trimmed.to_vec() })
+        }
+        IDX_METADATA => {
+            // INTL_string_to_key ttype_metadata (intl.cpp:949): plain
+            // bytes, trailing spaces stripped (metadata text is UTF8
+            // already); compress's empty-value pad for a non-idx_string
+            // itype is 0x00, not the blank (btr.cpp:3593)
+            let Value::Text(s) = value else { return None };
+            let trimmed = s.as_bytes().trim_ascii_end_matches();
+            Some(if trimmed.is_empty() { vec![0] } else { trimmed.to_vec() })
         }
         IDX_NUMERIC => {
             // MOV_get_double of a scaled exact numeric

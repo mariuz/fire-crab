@@ -421,6 +421,13 @@ struct ProjCol {
 /// `WHERE right.col IS NULL` the classic anti-join).
 enum Plan {
     Scalar(Option<i64>),
+    /// `CREATE TABLE <name> (<col defs>)`: catalog rows, format and
+    /// runtime blobs, pointer/root pages - all written at op_execute
+    /// through `fire_crab_ods::ddl`
+    CreateTable {
+        name: String,
+        cols: Vec<fire_crab_ods::ddl::ColumnDef>,
+    },
     /// `INSERT INTO <t> [(cols)] VALUES (...)`: the record image is
     /// built at prepare (nulls flagged, literal fields at their
     /// descriptor offsets); `param_fields` lists the (field id,
@@ -809,6 +816,136 @@ enum InsVal {
     Str(String),
     Null,
     Param(usize),
+}
+
+/// Parse one column definition of a CREATE TABLE: `<name> <type>`,
+/// where the type is one of the plain storable types. Constraints
+/// (NOT NULL, PRIMARY KEY, DEFAULT, ...) are refused - the statement
+/// then errors, it never half-creates. Returns the external
+/// RDB$FIELD_TYPE code plus the descriptor pieces (dsc.h dtypes).
+fn parse_column_def(item: &str) -> Option<fire_crab_ods::ddl::ColumnDef> {
+    use fire_crab_ods::format::dtype;
+    let item = item.trim();
+    let (name, ty) = item.split_once(char::is_whitespace)?;
+    let name = name.trim_matches('"');
+    if !ident_ok(name) {
+        return None;
+    }
+    let ty = ty.trim().to_ascii_uppercase();
+    let col = |field_type: i16, dt: u8, length: u16, scale: i8, sub_type: i16, char_len: Option<u16>| {
+        Some(fire_crab_ods::ddl::ColumnDef {
+            name: name.to_ascii_uppercase(),
+            field_type,
+            dtype: dt,
+            length,
+            scale,
+            sub_type,
+            char_len,
+        })
+    };
+    // parenthesised argument(s), if any
+    let (base, args) = match ty.find('(') {
+        Some(p) => {
+            if !ty.ends_with(')') {
+                return None;
+            }
+            let mut nums = Vec::new();
+            for part in ty[p + 1..ty.len() - 1].split(',') {
+                nums.push(part.trim().parse::<u16>().ok()?);
+            }
+            (ty[..p].trim().to_string(), nums)
+        }
+        None => (ty.clone(), Vec::new()),
+    };
+    match (base.as_str(), args.as_slice()) {
+        ("SMALLINT", []) => col(7, dtype::SHORT, 2, 0, 0, None),
+        ("INTEGER" | "INT", []) => col(8, dtype::LONG, 4, 0, 0, None),
+        ("BIGINT", []) => col(16, dtype::INT64, 8, 0, 0, None),
+        ("FLOAT", []) => col(10, dtype::REAL, 4, 0, 0, None),
+        ("DOUBLE PRECISION", []) => col(27, dtype::DOUBLE, 8, 0, 0, None),
+        ("DATE", []) => col(12, dtype::SQL_DATE, 4, 0, 0, None),
+        ("TIME", []) => col(13, dtype::SQL_TIME, 4, 0, 0, None),
+        ("TIMESTAMP", []) => col(35, dtype::TIMESTAMP, 8, 0, 0, None),
+        ("BOOLEAN", []) => col(23, dtype::BOOLEAN, 1, 0, 0, None),
+        ("CHAR" | "CHARACTER", [n]) if *n >= 1 => col(14, dtype::TEXT, *n, 0, 0, Some(*n)),
+        ("VARCHAR", [n]) if *n >= 1 => col(37, dtype::VARYING, *n + 2, 0, 0, Some(*n)),
+        // NUMERIC/DECIMAL: storage by precision (dialect-3 rule);
+        // sub_type 1 = NUMERIC, 2 = DECIMAL
+        ("NUMERIC" | "DECIMAL", [p]) => {
+            let sub = if base == "NUMERIC" { 1 } else { 2 };
+            numeric_col(name, *p, 0, sub)
+        }
+        ("NUMERIC" | "DECIMAL", [p, s]) if s <= p => {
+            let sub = if base == "NUMERIC" { 1 } else { 2 };
+            numeric_col(name, *p, *s, sub)
+        }
+        _ => None,
+    }
+}
+
+fn numeric_col(name: &str, p: u16, s: u16, sub_type: i16) -> Option<fire_crab_ods::ddl::ColumnDef> {
+    use fire_crab_ods::format::dtype;
+    let (field_type, dt, length) = match p {
+        1..=4 => (7i16, dtype::SHORT, 2u16),
+        5..=9 => (8, dtype::LONG, 4),
+        10..=18 => (16, dtype::INT64, 8),
+        _ => return None,
+    };
+    Some(fire_crab_ods::ddl::ColumnDef {
+        name: name.to_ascii_uppercase(),
+        field_type,
+        dtype: dt,
+        length,
+        scale: -(s as i8),
+        sub_type,
+        char_len: None,
+    })
+}
+
+/// Parse `CREATE TABLE <name> (<col defs>)`. Only plain column lists -
+/// constraints, options and every other CREATE verb refuse (the caller
+/// answers a real SQL error, never the fallback: a client must never
+/// think its DDL succeeded).
+fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "CREATE", 0) != Some(0) {
+        return None;
+    }
+    let table_kw = find_word(&masked, "TABLE", "CREATE".len())?;
+    if masked[..table_kw].trim() != "CREATE" {
+        return None; // CREATE <something else> TABLE
+    }
+    let open = s.find('(')?;
+    if !s.ends_with(')') {
+        return None;
+    }
+    let name = s[table_kw + "TABLE".len()..open].trim().trim_matches('"');
+    if !ident_ok(name) {
+        return None;
+    }
+    let body = &s[open + 1..s.len() - 1];
+    // split on top-level commas (type args carry their own parens)
+    let mut cols = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, ch) in body.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.checked_sub(1)?,
+            ',' if depth == 0 => {
+                cols.push(parse_column_def(&body[start..i])?);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    cols.push(parse_column_def(&body[start..])?);
+    Some((
+        Plan::CreateTable { name: name.to_ascii_uppercase(), cols },
+        Vec::new(),
+    ))
 }
 
 /// Parse `INSERT INTO <t> [(col, ...)] VALUES (val, ...)` - single row,
@@ -1472,6 +1609,10 @@ fn execute_dml(
     let db = database.as_mut().ok_or("no database attached")?;
     let mut work = db.bytes.clone();
     let counts = match plan {
+        Plan::CreateTable { name, cols } => {
+            fire_crab_ods::ddl::create_table(&mut work, db.page_size, name, cols)?;
+            (0, 0, 0)
+        }
         Plan::Insert { rel, format_no, image, descs, index_ops, param_fields } => {
             let mut image = image.clone();
             for (fid, slot) in param_fields {
@@ -2767,6 +2908,7 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Vec<Value> {
 fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
     match plan {
         Plan::Scalar(_) => describe_one_bigint(params),
+        Plan::CreateTable { .. } => describe_dml(5, params), // isc_info_sql_stmt_ddl
         Plan::Insert { .. } => describe_dml(2, params), // isc_info_sql_stmt_insert
         Plan::Update { .. } => describe_dml(3, params), // isc_info_sql_stmt_update
         Plan::Delete { .. } => describe_dml(4, params), // isc_info_sql_stmt_delete
@@ -2798,8 +2940,9 @@ fn emit_rows_inner(
     args: &[WireParam],
 ) -> Result<(), String> {
     match plan {
-        // DML has no cursor: terminator only
-        Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. } => {}
+        // DML and DDL have no cursor: terminator only
+        Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
+        | Plan::CreateTable { .. } => {}
         Plan::Scalar(v) => {
             w.int(OP_FETCH_RESPONSE).int(0).int(1);
             match v {
@@ -4144,10 +4287,30 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 last_dml = (0, 0, 0);
                 bound_args.clear();
                 let up = stmt_sql.trim_start().to_ascii_uppercase();
+                let ddl_kw = ["CREATE", "ALTER", "DROP", "RECREATE"]
+                    .into_iter()
+                    .find(|k| find_word(&up, k, 0) == Some(0));
                 let dml_kw = ["INSERT", "UPDATE", "DELETE"]
                     .into_iter()
                     .find(|k| find_word(&up, k, 0) == Some(0));
-                if let Some(kw) = dml_kw {
+                if ddl_kw.is_some() {
+                    // DDL prepares to a real plan or to an SQL error -
+                    // a client must never think its DDL succeeded when
+                    // the verb is one this server does not implement
+                    match plan_create_table(&stmt_sql) {
+                        Some((p, ps)) => {
+                            let describe = describe_for(&p, &ps);
+                            plan = p;
+                            stmt_params = ps;
+                            respond_prepare(&mut s, &mut enc, &describe)?;
+                        }
+                        None => {
+                            plan = Plan::Scalar(Some(FIXED_ANSWER));
+                            stmt_params = Vec::new();
+                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                        }
+                    }
+                } else if let Some(kw) = dml_kw {
                     // DML prepares to a real plan or to an SQL error -
                     // never to the fixed-answer fallback, which would
                     // let a client think its write succeeded
@@ -4223,11 +4386,14 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                 } else if matches!(
                     plan,
-                    Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
+                    Plan::Insert { .. }
+                        | Plan::Update { .. }
+                        | Plan::Delete { .. }
+                        | Plan::CreateTable { .. }
                 ) {
-                    // DML executes here (not at fetch): write the new
-                    // versions into a copy of the page image, swap it in
-                    // and flush the whole file back
+                    // DML and DDL execute here (not at fetch): write the
+                    // new versions (or the new catalog) into a copy of
+                    // the page image, swap it in and flush back
                     match execute_dml(&plan, &mut database, &bound_args) {
                         Ok(counts) => {
                             last_dml = counts;

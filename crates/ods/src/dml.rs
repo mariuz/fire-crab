@@ -65,10 +65,10 @@ pub struct DmlOutcome {
     pub affected: usize,
 }
 
-fn put_u16(file: &mut [u8], at: usize, v: u16) {
+pub(crate) fn put_u16(file: &mut [u8], at: usize, v: u16) {
     file[at..at + 2].copy_from_slice(&v.to_le_bytes());
 }
-fn put_u32(file: &mut [u8], at: usize, v: u32) {
+pub(crate) fn put_u32(file: &mut [u8], at: usize, v: u32) {
     file[at..at + 4].copy_from_slice(&v.to_le_bytes());
 }
 fn put_u64(file: &mut [u8], at: usize, v: u64) {
@@ -80,7 +80,7 @@ fn put_u64(file: &mut [u8], at: usize, v: u64) {
 /// it - correct whether the field holds the last id assigned or the
 /// next to assign (the allocated id is unused either way, and future
 /// engine transactions start above it).
-fn allocate_committed_tx(file: &mut [u8], page_size: usize) -> Result<u64, String> {
+pub(crate) fn allocate_committed_tx(file: &mut [u8], page_size: usize) -> Result<u64, String> {
     let tx = u64::from_le_bytes(file[40..48].try_into().unwrap()) + 1; // hdr_next_transaction @40
     // find the TIP page holding this transaction's two bits: TIP pages
     // chain via tip_next; the head is the one no other TIP points to
@@ -170,7 +170,11 @@ fn find_space(file: &[u8], page_size: usize, rel: u16, rec_len: usize) -> Option
     None
 }
 
-/// Lay `rec` down at a found spot and point the directory at it.
+/// Lay `rec` down at a found spot and point the directory at it. The
+/// owning pointer page's per-slot fill bits are updated too: a record
+/// landing on a page clears its `ppg_dp_empty` (0x10) bit - the
+/// engine's DPM keeps those in sync and `gfix -v -full` warns when a
+/// pointer page calls a non-empty data page empty.
 fn write_at_spot(file: &mut [u8], page_size: usize, spot: &Spot, rec: &[u8]) {
     let base = spot.page_no as usize * page_size;
     file[base + spot.offset..base + spot.offset + rec.len()].copy_from_slice(rec);
@@ -180,6 +184,30 @@ fn write_at_spot(file: &mut [u8], page_size: usize, spot: &Spot, rec: &[u8]) {
     if spot.append {
         let count_at = base + 22; // dpg_count @22
         put_u16(file, count_at, u16_at(file, count_at) + 1);
+    }
+    clear_fill_bits(file, page_size, spot.page_no, 0x10); // ppg_dp_empty
+}
+
+/// Find `page_no`'s slot on its relation's pointer pages and clear
+/// `mask` in the fill-bits byte (ods.h:841-853: one byte per slot
+/// after the full page-number vector capacity).
+fn clear_fill_bits(file: &mut [u8], page_size: usize, page_no: u32, mask: u8) {
+    let rel = u16_at(file, page_no as usize * page_size + 20); // dpg_relation @20
+    let capacity = data_pages_per_pp(page_size) as usize;
+    let pps: Vec<usize> = file
+        .chunks_exact(page_size)
+        .enumerate()
+        .filter(|(_, p)| p[0] == PageType::Pointer as u8 && u16_at(p, 26) == rel)
+        .map(|(i, _)| i)
+        .collect();
+    for pp in pps {
+        let base = pp * page_size;
+        for slot in 0..capacity {
+            if u32_at(file, base + 32 + slot * 4) == page_no {
+                file[base + 32 + capacity * 4 + slot] &= !mask;
+                return;
+            }
+        }
     }
 }
 
@@ -291,6 +319,33 @@ pub fn insert_record(
     {
         return Err("record larger than a page".into());
     }
+    insert_record_as(file, page_size, rel, format_no, image, None)
+}
+
+/// [insert_record] under the SYSTEM transaction (id 0, no TIP work):
+/// what `RDB$PAGES` rows require - the engine's `get_header`
+/// (dpm.epp) posts isc_wrong_page for any relation-0 record whose
+/// transaction is not 0 ("RDB$PAGES relation should be modified only
+/// by system transaction"), and its release-build error path then
+/// leaves a latched buffer behind - the attach appears to hang.
+pub fn insert_record_system(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    rel: u16,
+    format_no: u8,
+    image: &[u8],
+) -> Result<InsertOutcome, String> {
+    insert_record_as(file, page_size, rel, format_no, image, Some(0))
+}
+
+fn insert_record_as(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    rel: u16,
+    format_no: u8,
+    image: &[u8],
+    fixed_tx: Option<u32>,
+) -> Result<InsertOutcome, String> {
     let rec_len = RHD_DATA_OFFSET + image.len();
     let spot = match find_space(file, page_size, rel, rec_len) {
         Some(s) => s,
@@ -302,14 +357,79 @@ pub fn insert_record(
         }
     };
 
-    let tx = allocate_committed_tx(file, page_size)?;
-    if tx > u32::MAX as u64 {
-        return Err("64-bit transaction ids (rhde) not supported yet".into());
-    }
+    let tx = match fixed_tx {
+        Some(t) => t as u64,
+        None => {
+            let tx = allocate_committed_tx(file, page_size)?;
+            if tx > u32::MAX as u64 {
+                return Err("64-bit transaction ids (rhde) not supported yet".into());
+            }
+            tx
+        }
+    };
 
     let rec = rhd_bytes(tx as u32, 0, 0, flags::NOT_PACKED, format_no, image);
     write_at_spot(file, page_size, &spot, &rec);
+    // a primary record on the page contradicts dpg_secondary ("primary
+    // record versions not stored on this page", ods.h:370) - the engine
+    // clears it when storing a primary, and gfix -v -full checks
+    let flags_at = spot.page_no as usize * page_size + 1; // pag_flags @1
+    file[flags_at] &= !0x10; // dpg_secondary
+    // ...and the pointer page mirrors it per slot (ppg_dp_secondary)
+    clear_fill_bits(file, page_size, spot.page_no, 0x08);
     Ok(InsertOutcome { tx_id: tx, page_no: spot.page_no, slot: spot.slot })
+}
+
+/// Write a level-0 SEGMENTED blob into `rel`'s data pages: the 32-byte
+/// blh header (ods.h:969, offsets pinned by the static_asserts there)
+/// followed by the segments, each `[u16 length][bytes]` - exactly the
+/// framing `read_blob` strips. `blh_length` counts the segment
+/// PAYLOADS only (framing excluded - the engine's blb_length), the
+/// slot's directory length covers header + framed body. Charset is
+/// always 1, as the engine writes for its metadata blobs (differential
+/// probe of RDB$FORMATS/RDB$RUNTIME blobs). Returns the blob's record
+/// number - what a blob id in an owning record points at.
+pub fn insert_blob(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    rel: u16,
+    segments: &[Vec<u8>],
+    sub_type: u16,
+) -> Result<u64, String> {
+    let payload: usize = segments.iter().map(|s| s.len()).sum();
+    let max_segment = segments.iter().map(|s| s.len()).max().unwrap_or(0);
+    if max_segment > u16::MAX as usize {
+        return Err("blob segment too long".into());
+    }
+    let mut rec = Vec::with_capacity(32 + payload + segments.len() * 2);
+    rec.extend_from_slice(&0u32.to_le_bytes()); // blh_lead_page
+    rec.extend_from_slice(&0u32.to_le_bytes()); // blh_max_sequence
+    rec.extend_from_slice(&(max_segment as u16).to_le_bytes()); // blh_max_segment
+    rec.extend_from_slice(&flags::BLOB.to_le_bytes()); // blh_flags
+    rec.extend_from_slice(&(segments.len() as u32).to_le_bytes()); // blh_count
+    rec.extend_from_slice(&(payload as u64).to_le_bytes()); // blh_length
+    rec.extend_from_slice(&sub_type.to_le_bytes()); // blh_sub_type
+    rec.push(1); // blh_charset
+    rec.push(0); // blh_level: data inline
+    for seg in segments {
+        rec.extend_from_slice(&(seg.len() as u16).to_le_bytes());
+        rec.extend_from_slice(seg);
+    }
+    if rec.len() > page_size - DPG_RPT_OFFSET - 4 {
+        return Err("level-1 blob writing not supported".into());
+    }
+    let spot = match find_space(file, page_size, rel, rec.len()) {
+        Some(s) => s,
+        None => {
+            extend_relation(file, page_size, rel)?;
+            find_space(file, page_size, rel, rec.len())
+                .ok_or("no room for the blob even on a fresh data page")?
+        }
+    };
+    write_at_spot(file, page_size, &spot, &rec);
+    // the blob's record number: positional, like any record's
+    let seq = crate::u32_at(file, spot.page_no as usize * page_size + 16) as u64;
+    Ok(seq * crate::format::max_recs_per_dp(page_size) + spot.slot as u64)
 }
 
 /// Copy the live primary record at (`page_no`, `slot`) - byte for byte,

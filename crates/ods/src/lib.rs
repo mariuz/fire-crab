@@ -28,6 +28,7 @@ pub mod btr;
 pub mod btw;
 pub mod catalog;
 pub mod data;
+pub mod ddl;
 pub mod decfloat;
 pub mod dml;
 pub mod format;
