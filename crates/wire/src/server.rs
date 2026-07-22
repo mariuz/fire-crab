@@ -361,12 +361,16 @@ struct ProjCol {
 /// `having` filters the computed OUTPUT rows; it may reference `gitems`
 /// entries past `cols` - hidden items appended for aggregates or keys
 /// named only in the HAVING clause, which are computed but not emitted.
-/// `Join` is an INNER equi-join of two relations: each joined row is the
-/// left record's values followed by the right record's (so a COMBINED
-/// index < `left_width` names a left field, >= names a right field at
-/// `index - left_width`), `on` lists the (left, right) combined-index
-/// equality pairs, and `cols`/`filter`/`order_by` all speak combined
-/// indexes - `encode_row`, the predicate and the sort apply unchanged.
+/// `Join` is an equi-join of two relations - INNER, or LEFT/RIGHT/FULL
+/// OUTER per `kind`: each joined row is the left record's values followed
+/// by the right record's (so a COMBINED index < `left_width` names a left
+/// field, >= names a right field at `index - left_width`), `on` lists the
+/// (left, right) combined-index equality pairs, and `cols`/`filter`/
+/// `order_by` all speak combined indexes - `encode_row`, the predicate
+/// and the sort apply unchanged. An outer join pads the partnerless
+/// side's values with NULLs, and the WHERE filter runs on the PADDED
+/// row (SQL's order: join first, then filter - which is what makes
+/// `WHERE right.col IS NULL` the classic anti-join).
 enum Plan {
     Scalar(Option<i64>),
     /// `INSERT INTO <t> [(cols)] VALUES (...)`: the record image is
@@ -404,6 +408,7 @@ enum Plan {
         order_by: Vec<(usize, bool)>,
     },
     Join {
+        kind: JoinKind,
         left_rel: u16,
         left_formats: Vec<(u8, Vec<Descriptor>)>,
         left_width: usize,
@@ -425,6 +430,16 @@ enum Plan {
         having: Option<Predicate>,
         order_by: Vec<(usize, bool)>,
     },
+}
+
+/// How a join treats partnerless rows: INNER drops them; LEFT keeps
+/// every left row (right side NULL-padded), RIGHT the mirror, FULL both.
+#[derive(Clone, Copy, PartialEq)]
+enum JoinKind {
+    Inner,
+    Left,
+    Right,
+    Full,
 }
 
 /// One output column of a grouped query: a grouping key (carried by its
@@ -994,38 +1009,74 @@ fn parse_table_ref(s: &str) -> Option<TableRef<'_>> {
 }
 
 /// Parse a FROM clause into its left table and - if there is one - the
-/// joined table plus the raw ON condition text. Only a single INNER join
-/// is supported: `t1 [a1] [INNER] JOIN t2 [a2] ON <cond>`. Outer/cross
-/// joins, comma lists and chained joins return None (fall back).
-fn parse_from(from_s: &str) -> Option<(TableRef<'_>, Option<(TableRef<'_>, &str)>)> {
+/// join kind, the joined table and the raw ON condition text. A single
+/// join is supported: `t1 [a1] [INNER|LEFT|RIGHT|FULL [OUTER]] JOIN
+/// t2 [a2] ON <cond>`. Cross/natural joins, comma lists and chained
+/// joins return None (fall back).
+fn parse_from(from_s: &str) -> Option<(TableRef<'_>, Option<(JoinKind, TableRef<'_>, &str)>)> {
     if from_s.contains(',') {
         return None;
     }
     let up = from_s.to_ascii_uppercase();
-    for kw in ["LEFT", "RIGHT", "FULL", "OUTER", "CROSS", "NATURAL"] {
+    for kw in ["CROSS", "NATURAL"] {
         if find_word(&up, kw, 0).is_some() {
             return None;
         }
     }
     let Some(jp) = find_word(&up, "JOIN", 0) else {
+        // no JOIN: none of the join keywords may appear either
+        for kw in ["LEFT", "RIGHT", "FULL", "OUTER", "INNER"] {
+            if find_word(&up, kw, 0).is_some() {
+                return None;
+            }
+        }
         return Some((parse_table_ref(from_s)?, None));
     };
     // a second JOIN (chained) is not supported
     if find_word(&up, "JOIN", jp + "JOIN".len()).is_some() {
         return None;
     }
-    // the optional INNER keyword sits just before JOIN
-    let left_end = match find_word(&up, "INNER", 0) {
-        Some(ip) if up[ip + "INNER".len()..jp].trim().is_empty() => ip,
-        Some(_) => return None, // INNER anywhere else is malformed
-        None => jp,
+    // the join-kind keywords sit immediately before JOIN:
+    // [INNER] | LEFT [OUTER] | RIGHT [OUTER] | FULL [OUTER]
+    let prev_word = |end: usize| -> (usize, &str) {
+        let t = up[..end].trim_end();
+        let start = t.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+        (start, &t[start..])
     };
+    let (ws, w) = prev_word(jp);
+    let (mut left_end, kind) = match w {
+        "OUTER" => {
+            // OUTER requires a direction right before it
+            let (ws2, w2) = prev_word(ws);
+            match w2 {
+                "LEFT" => (ws2, JoinKind::Left),
+                "RIGHT" => (ws2, JoinKind::Right),
+                "FULL" => (ws2, JoinKind::Full),
+                _ => return None,
+            }
+        }
+        "LEFT" => (ws, JoinKind::Left),
+        "RIGHT" => (ws, JoinKind::Right),
+        "FULL" => (ws, JoinKind::Full),
+        "INNER" => (ws, JoinKind::Inner),
+        _ => (jp, JoinKind::Inner),
+    };
+    // any join keyword elsewhere (e.g. a table named OUTER) is malformed
+    for kw in ["LEFT", "RIGHT", "FULL", "OUTER", "INNER"] {
+        if find_word(&up[..left_end], kw, 0).is_some() {
+            return None;
+        }
+    }
+    if left_end == 0 {
+        return None;
+    }
+    left_end = left_end.min(jp);
     let left = parse_table_ref(&from_s[..left_end])?;
     let after = jp + "JOIN".len();
     let on = find_word(&up, "ON", after)?;
     let right = parse_table_ref(&from_s[after..on])?;
     let on_s = from_s[on + "ON".len()..].trim();
-    Some((left, Some((right, on_s))))
+    Some((left, Some((kind, right, on_s))))
 }
 
 /// Split a possibly-qualified column name into (qualifier, column), each
@@ -1128,14 +1179,16 @@ fn resolve_join_predicate(raw: Vec<Vec<RawTerm>>, sides: &[JoinSide; 2]) -> Opti
     Some(Predicate(groups))
 }
 
-/// Plan an INNER equi-join. Supported around it: a projection of bare or
-/// qualified columns (or `*` = all left columns then all right, in
-/// declared order), a WHERE over the combined row, ORDER BY, and - as the
-/// one aggregate - a lone `SELECT COUNT(*)`. GROUP BY/HAVING or other
-/// aggregates over a join fall back.
+/// Plan an equi-join (INNER or LEFT/RIGHT/FULL OUTER). Supported around
+/// it: a projection of bare or qualified columns (or `*` = all left
+/// columns then all right, in declared order), a WHERE over the combined
+/// (padded) row, ORDER BY, and - as the one aggregate - a lone
+/// `SELECT COUNT(*)`. GROUP BY/HAVING or other aggregates over a join
+/// fall back.
 #[allow(clippy::too_many_arguments)]
 fn plan_join(
     proj: &Proj,
+    kind: JoinKind,
     left: &TableRef<'_>,
     right: &TableRef<'_>,
     on_s: &str,
@@ -1236,6 +1289,7 @@ fn plan_join(
 
     let [l, r] = sides;
     Some(Plan::Join {
+        kind,
         left_rel: l.rel,
         left_formats: l.formats,
         left_width: l.descs.len(),
@@ -1280,7 +1334,7 @@ fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
         if trace { eprintln!("[srv] plan: FROM parse failed for {:?}", table_s); }
         return fallback;
     };
-    if let Some((right, on_s)) = join {
+    if let Some((kind, right, on_s)) = join {
         // a join supports projections, WHERE and ORDER BY; the one
         // aggregate shape is a lone COUNT(*), counted at prepare.
         // GROUP BY/HAVING over a join fall back.
@@ -1293,6 +1347,7 @@ fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
                     return fallback;
                 }
                 if let Some(Plan::Join {
+                    kind,
                     left_rel,
                     left_formats,
                     left_width,
@@ -1302,11 +1357,11 @@ fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
                     on,
                     filter,
                     ..
-                }) = plan_join(&Proj::Star, &left, &right, on_s, where_s, None, db)
+                }) = plan_join(&Proj::Star, kind, &left, &right, on_s, where_s, None, db)
                 {
                     let n = join_rows(
-                        db, left_rel, &left_formats, left_width, right_rel, &right_formats,
-                        right_width, &on, &filter,
+                        db, kind, left_rel, &left_formats, left_width, right_rel,
+                        &right_formats, right_width, &on, &filter,
                     )
                     .len();
                     return Plan::Scalar(Some(n as i64));
@@ -1314,7 +1369,7 @@ fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
                 return fallback;
             }
         }
-        return match plan_join(&proj, &left, &right, on_s, where_s, order_s, db) {
+        return match plan_join(&proj, kind, &left, &right, on_s, where_s, order_s, db) {
             Some(p) => p,
             None => {
                 if trace { eprintln!("[srv] plan: JOIN plan failed"); }
@@ -1710,15 +1765,19 @@ fn for_each_record<F: FnMut(&[Value])>(
     }
 }
 
-/// Compute the joined rows: a nested-loop INNER equi-join. Each side's
+/// Compute the joined rows: a nested-loop equi-join. Each side's
 /// committed records are collected (padded to the side's newest-format
 /// width, so combined indexes stay stable across formats), then every
 /// left/right pair whose `on` columns are all equal - NULL never joins,
-/// as SQL requires - produces a combined row, kept if the WHERE filter
-/// accepts it.
+/// as SQL requires - produces a combined row. An OUTER kind then emits
+/// each partnerless preserved-side row once, the other side all NULLs.
+/// The WHERE filter runs on the combined (padded) rows - SQL's order:
+/// join first, filter after - so `WHERE <right col> IS NULL` on a LEFT
+/// join is the anti-join it should be.
 #[allow(clippy::too_many_arguments)]
 fn join_rows(
     db: &Database,
+    kind: JoinKind,
     left_rel: u16,
     left_formats: &[(u8, Vec<Descriptor>)],
     left_width: usize,
@@ -1740,10 +1799,17 @@ fn join_rows(
     let lrows = collect(left_rel, left_formats, left_width);
     let rrows = collect(right_rel, right_formats, right_width);
     let mut out = Vec::new();
+    let mut keep = |row: Vec<Value>| {
+        if filter.as_ref().map_or(true, |p| p.matches(&row)) {
+            out.push(row);
+        }
+    };
+    let mut right_matched = vec![false; rrows.len()];
     for l in &lrows {
-        for r in &rrows {
-            let joined = on.iter().all(|&(li, ri)| {
-                let (a, b) = (&l[li], &r[ri - left_width]);
+        let mut matched = false;
+        for (ri, r) in rrows.iter().enumerate() {
+            let joined = on.iter().all(|&(li, rj)| {
+                let (a, b) = (&l[li], &r[rj - left_width]);
                 !matches!(a, Value::Null)
                     && !matches!(b, Value::Null)
                     && value_cmp(a, b) == std::cmp::Ordering::Equal
@@ -1751,11 +1817,26 @@ fn join_rows(
             if !joined {
                 continue;
             }
+            matched = true;
+            right_matched[ri] = true;
             let mut row = l.clone();
             row.extend(r.iter().cloned());
-            if filter.as_ref().map_or(true, |p| p.matches(&row)) {
-                out.push(row);
+            keep(row);
+        }
+        if !matched && matches!(kind, JoinKind::Left | JoinKind::Full) {
+            let mut row = l.clone();
+            row.resize(left_width + right_width, Value::Null);
+            keep(row);
+        }
+    }
+    if matches!(kind, JoinKind::Right | JoinKind::Full) {
+        for (ri, r) in rrows.iter().enumerate() {
+            if right_matched[ri] {
+                continue;
             }
+            let mut row = vec![Value::Null; left_width];
+            row.extend(r.iter().cloned());
+            keep(row);
         }
     }
     out
@@ -1959,6 +2040,7 @@ fn emit_rows(w: &mut W, plan: &Plan, db: &Option<Database>) {
             }
         }
         Plan::Join {
+            kind,
             left_rel,
             left_formats,
             left_width,
@@ -1972,8 +2054,8 @@ fn emit_rows(w: &mut W, plan: &Plan, db: &Option<Database>) {
         } => {
             if let Some(db) = db {
                 let mut rows = join_rows(
-                    db, *left_rel, left_formats, *left_width, *right_rel, right_formats,
-                    *right_width, on, filter,
+                    db, *kind, *left_rel, left_formats, *left_width, *right_rel,
+                    right_formats, *right_width, on, filter,
                 );
                 if !order_by.is_empty() {
                     rows.sort_by(|a, b| order_cmp(a, b, order_by));
@@ -3402,17 +3484,33 @@ mod tests {
         assert_eq!((l.table, l.alias), ("EMP", Some("E")));
         // JOIN with aliases and the optional INNER keyword
         let (l, j) = parse_from("EMP E JOIN DEPT D ON E.DEPT_ID = D.ID").unwrap();
-        let (r, on) = j.unwrap();
+        let (k, r, on) = j.unwrap();
+        assert!(k == JoinKind::Inner);
         assert_eq!((l.table, l.alias), ("EMP", Some("E")));
         assert_eq!((r.table, r.alias), ("DEPT", Some("D")));
         assert_eq!(on, "E.DEPT_ID = D.ID");
         let (_, j) = parse_from("EMP inner join DEPT on EMP.DEPT_ID = DEPT.ID").unwrap();
-        assert!(j.is_some());
-        // unsupported shapes fall back: outer joins, comma lists, chains
-        assert!(parse_from("EMP LEFT JOIN DEPT ON 1 = 1").is_none());
+        assert!(matches!(j, Some((JoinKind::Inner, ..))));
+        // the outer kinds, with and without the OUTER keyword, any case
+        let (l, j) = parse_from("EMP E LEFT JOIN DEPT D ON E.DEPT_ID = D.ID").unwrap();
+        assert_eq!((l.table, l.alias), ("EMP", Some("E")));
+        assert!(matches!(j, Some((JoinKind::Left, ..))));
+        let (l, j) = parse_from("EMP left outer join DEPT on EMP.DEPT_ID = DEPT.ID").unwrap();
+        assert_eq!((l.table, l.alias), ("EMP", None));
+        assert!(matches!(j, Some((JoinKind::Left, ..))));
+        let (_, j) = parse_from("EMP RIGHT JOIN DEPT ON EMP.DEPT_ID = DEPT.ID").unwrap();
+        assert!(matches!(j, Some((JoinKind::Right, ..))));
+        let (_, j) = parse_from("EMP FULL OUTER JOIN DEPT ON EMP.DEPT_ID = DEPT.ID").unwrap();
+        assert!(matches!(j, Some((JoinKind::Full, ..))));
+        // unsupported shapes fall back: comma lists, chains, cross,
+        // OUTER without a direction, join keywords out of place
         assert!(parse_from("EMP, DEPT").is_none());
         assert!(parse_from("A JOIN B ON A.X = B.X JOIN C ON B.Y = C.Y").is_none());
         assert!(parse_from("EMP JOIN DEPT").is_none()); // no ON
+        assert!(parse_from("EMP CROSS JOIN DEPT").is_none());
+        assert!(parse_from("EMP OUTER JOIN DEPT ON 1 = 1").is_none());
+        assert!(parse_from("LEFT EMP JOIN DEPT ON 1 = 1").is_none());
+        assert!(parse_from("EMP LEFT DEPT").is_none()); // stray keyword, no JOIN
     }
 
     fn join_sides() -> [JoinSide; 2] {
