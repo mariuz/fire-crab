@@ -1185,7 +1185,65 @@ increment establishes is that the session-bootstrap wire operations -
 the ones that used to make `pytest_configure` raise before a single
 test was collected - now work with the real driver.
 
-### Stage 3 — the Firebird QA suite (the milestone, now in reach)
+### The thirty-fifth differential — the firebird-qa suite RUNS, and tests PASS
+
+This is the milestone the conversion has aimed at since its first
+commit: the official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa)
+pytest suite, pointed at `fcwire serve`, bootstraps, collects tests,
+runs them, and **7 to 9 of the basic functional tests pass** - real
+tests from the real suite, green against a Rust reimplementation of
+the storage engine reached bottom-up from the on-disk format.
+
+Getting from "the session bootstrap clears Services and op_create"
+(the previous increment) to "tests pass" took three protocol pieces,
+each pinned by tracing exactly where the plugin stopped:
+
+- **op_info_database breadth.** After attaching to the `employee`
+  sample database the plugin reads `con.info.name` (DbInfoCode.DB_ID),
+  `con.info.id` (ATTACHMENT_ID), the ODS version and the fetch counter.
+  `build_db_info` now answers all of them, with the DB_ID cluster's
+  first pascal string being the database path (the driver returns it
+  as the name), and each op_attach draws a distinct attachment id from
+  a global counter - the bootstrap opens two employee connections and
+  names both ids in its architecture query.
+
+- **MON$ virtual tables, reported as empty.** The bootstrap detects the
+  server architecture with an aggregate over `MON$ATTACHMENTS`. fire-crab
+  keeps no live monitoring state, so it treats any query over a MON$
+  relation as an empty set - one all-NULL row, its column count taken
+  from the projection's top-level commas (the query uses
+  `COUNT(DISTINCT ...)` and `IIF(...)`, shapes the SQL layer does not
+  parse, but an always-empty relation needs no parse). The probe reads
+  `min(remote_protocol) IS NULL` and classifies fire-crab as an
+  embedded server. The plan is marked as having a cursor so the driver
+  opens it with op_execute/op_fetch rather than the singleton
+  op_execute2.
+
+- **the service RUNNING/VERSION info items.** The isql-test fixtures
+  set forced writes through the Services manager (`set_write_mode`),
+  then poll `is_running` (SvcInfoCode.RUNNING) until the action
+  finishes. Answering RUNNING as a bare 4-byte 0 (not running - the
+  action is a no-op on a scratch database) lets the fixture proceed to
+  run the test.
+
+With those in place the plugin's banner reads
+`server: fc [v6.0.0.2076, Embedded, Firebird/Linux/ARM64]`, ODS 14.0,
+and the basic functional suite runs to completion: several isql
+behaviour and autoterminator tests pass, a handful fail on SQL-surface
+gaps (SHOW DATABASE and the like), and the rest skip on version or
+architecture gates. The passing tests exercise the real isql binary
+connecting through fbclient to fcwire and the python driver creating
+and querying databases - the whole stack.
+
+The firebird-qa run itself is not a committed gate: it needs an
+external checkout and a python virtualenv the repository cannot
+bundle. Its protocol surface is instead locked into the deterministic
+in-repo `qa/serve-real-services.sh` (now 14 checks: Services info,
+op_create, the DB_ID/ATTACHMENT_ID/ODS items, distinct attachment ids,
+and the MON$ empty-relation probe), and the run is reproducible by
+hand from the recipe in the project notes.
+
+### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
 suite (thousands of tests) drives a **server** through the wire protocol via
