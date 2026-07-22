@@ -1006,6 +1006,52 @@ case over the wire, plus UPDATE/DELETE driven by the new predicate
 shapes with the engine applying the literal equivalents to a mirror
 copy - identical tables, `gfix -v -full` clean. 46 checks green.
 
+### The thirty-first differential — CREATE TABLE, adopted by the engine
+
+`qa/serve-real-ddl.sh` converts the first DDL: CREATE TABLE. This is
+the deepest write yet - not rows into a table, but the table ITSELF:
+catalog rows in five system relations (with every system-catalog
+index maintained - the engine resolves metadata through them), the
+RDB$FORMATS packed-descriptor blob and the RDB$RUNTIME field-summary
+blob (both byte layouts pinned by diffing two engine-created
+databases differing by exactly one CREATE TABLE), a pointer page and
+an index-root page allocated, formatted and registered in RDB$PAGES.
+The probe killed several plausible assumptions before they shipped:
+field ids are assigned in DECLARATION order (not by alignment, which
+an earlier increment had inferred from a table with a different
+history), the runtime blob needs exactly six tag kinds per plain
+column, and blob headers count payload bytes only.
+
+Three engine laws were found the hard way - the first attach of a
+fire-crab-created table HUNG the release engine, and the kill chain
+ran through strace (the attach stops reading pages mid-catalog-scan),
+the lock table (no lock waits - so an internal latch), and finally
+the DEBUG engine build in the submodule, whose fb_assert turned the
+hang into a stack trace: `get_header` (dpm.epp) refuses any RDB$PAGES
+record whose transaction is not 0 - "RDB$PAGES relation should be
+modified only by system transaction" - and the release build's error
+path leaks a page latch, which is why it hung rather than erred.
+The other two came from `gfix -v -full` running its full cross-check:
+a primary record landing on a page must clear `dpg_secondary` and the
+pointer page's per-slot fill bits, and the header's OIT/OAT/OST are
+left as a clean engine detach leaves them (OIT = next-2).
+
+The oracles, in ascending depth: fire-crab uses its own table
+(INSERT with parameters, SELECT, LIKE); the ENGINE reads it, sees the
+fields in declaration order, INSERTs a row that lands on the pointer
+page fire-crab allocated, runs its own CREATE TABLE beside it - the
+relation-id and RDB$<n> domain-name sequences must survive, which
+works because the engine's own name generator skips used names -
+then `gbak` backs up and RESTORES the database: a restore replays the
+catalog through the engine's real DDL path, the deepest possible read
+of every byte written; and finally the engine DROPs the fire-crab
+table through its own DML over our catalog rows. `gfix -v -full` is
+clean before the engine touches anything, after its writes, and
+after the drop. A duplicate CREATE refuses on the RDB$RELATIONS
+unique index exactly like any duplicate key; unsupported DDL verbs
+(CREATE INDEX, DROP, ALTER) answer real SQL errors - a client must
+never think its DDL succeeded.
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -1026,11 +1072,11 @@ would have produced, `gfix -v` passes, `gfix -sweep` collects the
 chains, `gbak` backs the file up). Prepared statements now take real
 `?` parameters through the describe/execute machinery every driver
 uses. What stands between here and running the suite is remaining
-*breadth* of the SQL engine - DDL, select-list expressions and
-arithmetic (the WHERE predicate surface - LIKE/BETWEEN/IN/NOT/parens -
-is done; compound and descending indexes are maintained; expression
-and conditional indexes still refuse DML). Until that surface is wide
-enough,
+*breadth* of the SQL engine - select-list expressions and arithmetic,
+DDL beyond plain CREATE TABLE (constraints, CREATE INDEX, DROP/ALTER)
+- with CREATE TABLE itself now engine-adopted, the WHERE predicate
+surface done, and compound/descending indexes maintained. Until that
+surface is wide enough,
 fire-crab does **not** claim any firebird-qa coverage - but the milestone
 is no longer distant: the protocol server the suite talks to accepts real
 clients, answers real typed, filtered, joined, grouped, sorted and
@@ -1220,6 +1266,14 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-expr.sh 3050
+
+# DDL: fire-crab CREATEs a table; the engine reads it, writes into it, runs
+# its own DDL beside it, gbak-restores it (catalog replayed as real DDL) and
+# DROPs it - gfix -v -full clean at every step. Builds its own scratch db.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-ddl.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
