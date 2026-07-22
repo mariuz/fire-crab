@@ -735,6 +735,32 @@ relation still refused with a real SQL error (`select_formats` falls
 back for SELECT paths only; the DML planners keep plain
 `relation_formats`).
 
+### The twenty-third differential — blob content over the wire
+
+`qa/serve-real-blob.sh` is the first differential on blob *content*
+(`diff-rows` compared only blob presence). Blob columns are now
+described `SQL_BLOB` with their sub_type, the row carries the 8-byte
+on-disk bid as the wire quad - clients treat it as opaque and echo it
+back - and the server answers the blob ops (`op_open_blob`/
+`op_open_blob2`, `op_get_segment`, `op_close_blob`) by assembling the
+content from the pages: level-0 inline data, level-1 page vectors, and
+the per-blob framing decision (`rhd_stream_blob`, ods.h:1012 - segment
+prefixes stripped for segmented blobs, raw for stream blobs).
+`op_get_segment` packs one `[u16 length][bytes]` segment per response,
+sized to the client's buffer, `resp_object = 2` signalling blob EOF -
+the C++ `server.cpp` semantics node-firebird's read loop expects.
+
+The checks that matter: a 30000-byte level-1 blob spanning multiple
+blob pages, compared by length, head *and tail* (an assembly bug at any
+page boundary breaks the tail); an empty blob (EOF on the first
+get_segment, distinguishable from NULL, which travels in the null
+bitmap); `SELECT *` expanding a blob column; and a *system* blob -
+`RDB$TRIGGERS.RDB$TRIGGER_SOURCE`, read through the computed system
+format of the previous increment. A client-API fact the gate encodes:
+node-firebird's `db.query` delivers blob cells as fetch *functions*
+(only `sequentially` auto-reads them) - the harness invokes each, which
+is exactly what drives the blob ops against fire-crab.
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -754,8 +780,8 @@ engine itself validates all of it (isql reads the same table the engine
 would have produced, `gfix -v` passes, `gfix -sweep` collects the
 chains, `gbak` backs the file up). What stands between here and running
 the suite is remaining *breadth* of the SQL engine - index maintenance
-and page allocation on the write path, blob/INT128/DECFLOAT
-columns. Until that surface is wide enough,
+and page allocation on the write path, INT128/DECFLOAT/TZ
+decode. Until that surface is wide enough,
 fire-crab does **not** claim any firebird-qa coverage - but the milestone
 is no longer distant: the protocol server the suite talks to accepts real
 clients, answers real typed, filtered, joined, grouped, sorted and
@@ -877,6 +903,14 @@ NODE_PATH="$PWD/node_modules" \\
 NODE_PATH="$PWD/node_modules" \\
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
     bash /path/to/fire-crab/qa/serve-real-syscat.sh /tmp/fbhandson/join_clean.fdb 3050
+
+# server serves BLOB CONTENT through op_open_blob/op_get_segment - the first
+# blob-content differential (multi-page level-1, empty, NULL, system blobs).
+# Builds its own scratch database.
+NODE_PATH="$PWD/node_modules" \\
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
+    GBAK=/opt/firebird/bin/gbak \\
+    bash /path/to/fire-crab/qa/serve-real-blob.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
