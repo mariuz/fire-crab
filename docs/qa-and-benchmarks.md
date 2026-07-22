@@ -887,6 +887,46 @@ sweep leaves everything clean. Multi-segment, descending and
 expression indexes still refuse DML - the guard narrowed rather than
 vanished.
 
+### The twenty-eighth differential — parameter binding, driven by a real client's encoders
+
+`qa/serve-real-params.sh` converts the statement surface every real
+driver (and the firebird-qa suite itself) actually uses: prepared
+statements with `?` parameters. Three protocol pieces had to agree
+with what third-party code expects. First, the DESCRIBE's **bind
+section** now announces each parameter's target column type - that is
+not decorative metadata: node-firebird selects its parameter encoders
+from exactly those types (a JS `Date` becomes a wire timestamp
+*because* the bind section said `SQL_TYPE_DATE`; `true` becomes a
+`blr_bool` *because* it said `SQL_BOOLEAN`). Second, op_execute's
+message is self-described by the **client's own value-derived BLR** -
+a JS integer arrives as `blr_long` even when the column is BIGINT, a
+string as `blr_text` of its byte length - so the server parses that
+BLR (value descriptor + null-indicator short per parameter, the
+proto-13 message replacing the shorts with a leading null bitmap) and
+decodes the XDR values it declares. Third, the decoded values bind
+into the plans - INSERT images, UPDATE SET bytes, WHERE comparisons -
+with the engine's CVT coercions: integers rescale exactly into NUMERIC
+targets (50 into NUMERIC(9,2) stores 5000), doubles round
+half-away-from-zero, a `blr_timestamp` truncates into DATE or TIME
+columns, and anything that cannot represent the column raises an SQL
+error at execute - never a silently unfiltered or empty answer.
+
+Two semantic corners are asserted because they are easy to get
+plausibly wrong: a NULL parameter in a comparison is SQL UNKNOWN
+(`WHERE ID = ?` with NULL returns *no* rows - it does not become `IS
+NULL`), and a lone aggregate over a parameterised WHERE cannot be
+computed at prepare (the value has not arrived yet), so it routes
+through the grouped-query machinery and computes at fetch.
+
+The oracles: one INSERT binds all seven column types at once (int,
+text, double-into-NUMERIC, timestamp, date, time-of-day, boolean)
+through node-firebird's genuine encoders; the engine then applies the
+LITERAL equivalents of every statement to a second copy of the same
+clean database and isql prints the identical final table from both
+files - timestamps, dates, times, booleans and scaled numerics
+included. The parameter-bound PRIMARY KEY makes the inserts exercise
+index maintenance too, and `gfix -v -full` cross-checks those entries.
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -904,10 +944,11 @@ DML now covers all three verbs: `INSERT` writes real records into the
 pages, `UPDATE`/`DELETE` write real version chains over them, and the
 engine itself validates all of it (isql reads the same table the engine
 would have produced, `gfix -v` passes, `gfix -sweep` collects the
-chains, `gbak` backs the file up). What stands between here and running
-the suite is remaining *breadth* of the SQL engine - now mostly parameter
-binding and the less-common index shapes. Until that surface is wide
-enough,
+chains, `gbak` backs the file up). Prepared statements now take real
+`?` parameters through the describe/execute machinery every driver
+uses. What stands between here and running the suite is remaining
+*breadth* of the SQL engine - the less-common index shapes, DDL, and
+the wider expression surface. Until that surface is wide enough,
 fire-crab does **not** claim any firebird-qa coverage - but the milestone
 is no longer distant: the protocol server the suite talks to accepts real
 clients, answers real typed, filtered, joined, grouped, sorted and
@@ -1070,6 +1111,15 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-btree.sh 3050
+
+# PARAMETER BINDING: node-firebird drives `?` statements (all seven column
+# types bound in one INSERT, SET/WHERE params, NULL-param UNKNOWN semantics,
+# type mismatch = SQL error), the engine applies the literal equivalents and
+# prints the identical table. Builds its own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-params.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
