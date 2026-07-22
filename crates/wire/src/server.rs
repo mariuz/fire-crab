@@ -166,9 +166,36 @@ fn parse_user_id(uid: &[u8]) -> (String, String) {
     (login, String::from_utf8_lossy(&specific).into_owned())
 }
 
+/// Append the isc_info_sql_bind section: how many parameters the
+/// statement takes and each one's type/scale/length (the column it
+/// targets, described exactly like an output column). Clients build
+/// their parameter encoders from this - node-firebird picks
+/// SQLParamDate/Bool/etc by these types.
+fn append_bind_section(d: &mut Vec<u8>, params: &[Descriptor]) {
+    fn int_item(d: &mut Vec<u8>, code: u8, val: i32) {
+        d.push(code);
+        d.extend_from_slice(&4u16.to_le_bytes());
+        d.extend_from_slice(&val.to_le_bytes());
+    }
+    d.push(5); // isc_info_sql_bind (bare)
+    int_item(d, 7, params.len() as i32); // describe_vars
+    for (i, pd) in params.iter().enumerate() {
+        let (_, sql_type, length, scale, sub_type) = wire_for(pd);
+        int_item(d, 9, (i + 1) as i32); // sqlda_seq
+        int_item(d, 11, sql_type);
+        int_item(d, 12, sub_type);
+        int_item(d, 13, scale);
+        int_item(d, 14, length);
+        d.push(8); // describe_end (param)
+    }
+    if params.is_empty() {
+        d.push(8); // describe_end (empty section, the historical shape)
+    }
+}
+
 /// The describe buffer describing exactly one BIGINT column - the
 /// reciprocal of the client's parse_describe.
-fn describe_one_bigint() -> Vec<u8> {
+fn describe_one_bigint(params: &[Descriptor]) -> Vec<u8> {
     let mut d = Vec::new();
     let item = |d: &mut Vec<u8>, code: u8, val: i32| {
         d.push(code);
@@ -176,9 +203,7 @@ fn describe_one_bigint() -> Vec<u8> {
         d.extend_from_slice(&val.to_le_bytes());
     };
     item(&mut d, 21, 1); // isc_info_sql_stmt_type = select(1)
-    d.push(5); // isc_info_sql_bind (bare)
-    item(&mut d, 7, 0); // describe_vars: 0 params
-    d.push(8); // describe_end (params)
+    append_bind_section(&mut d, params);
     d.push(4); // isc_info_sql_select (bare)
     item(&mut d, 7, 1); // describe_vars: 1 column
     item(&mut d, 9, 1); // sqlda_seq = 1
@@ -192,9 +217,9 @@ fn describe_one_bigint() -> Vec<u8> {
 }
 
 /// The describe buffer for a DML statement: its statement type
-/// (isc_info_sql_stmt_ insert=2, update=3, delete=4), no parameters, no
-/// output columns - the client executes without fetching.
-fn describe_dml(stmt_type: i32) -> Vec<u8> {
+/// (isc_info_sql_stmt_ insert=2, update=3, delete=4), its parameters,
+/// no output columns - the client executes without fetching.
+fn describe_dml(stmt_type: i32, params: &[Descriptor]) -> Vec<u8> {
     let mut d = Vec::new();
     let item = |d: &mut Vec<u8>, code: u8, val: i32| {
         d.push(code);
@@ -202,9 +227,7 @@ fn describe_dml(stmt_type: i32) -> Vec<u8> {
         d.extend_from_slice(&val.to_le_bytes());
     };
     item(&mut d, 21, stmt_type); // isc_info_sql_stmt_type
-    d.push(5); // isc_info_sql_bind
-    item(&mut d, 7, 0); // 0 params
-    d.push(8); // describe_end
+    append_bind_section(&mut d, params);
     d.push(4); // isc_info_sql_select
     item(&mut d, 7, 0); // 0 output columns
     d.push(8); // describe_end
@@ -250,7 +273,7 @@ fn respond_prepare(s: &mut TcpStream, enc: &mut Option<Rc4>, describe: &[u8]) ->
 /// client's describe parser. Each column carries its SQL type, length,
 /// and its name as both the field name (16) and the alias (19); clients
 /// key result columns by the alias, so multi-column results need it.
-fn build_describe(cols: &[ProjCol]) -> Vec<u8> {
+fn build_describe(cols: &[ProjCol], params: &[Descriptor]) -> Vec<u8> {
     let mut d = Vec::new();
     fn int_item(d: &mut Vec<u8>, code: u8, val: i32) {
         d.push(code);
@@ -263,9 +286,7 @@ fn build_describe(cols: &[ProjCol]) -> Vec<u8> {
         d.extend_from_slice(s.as_bytes());
     }
     int_item(&mut d, 21, 1); // isc_info_sql_stmt_type = select
-    d.push(5); // isc_info_sql_bind
-    int_item(&mut d, 7, 0); // 0 params
-    d.push(8); // describe_end (params)
+    append_bind_section(&mut d, params);
     d.push(4); // isc_info_sql_select
     int_item(&mut d, 7, cols.len() as i32); // describe_vars: N columns
     for (i, c) in cols.iter().enumerate() {
@@ -401,25 +422,29 @@ struct ProjCol {
 enum Plan {
     Scalar(Option<i64>),
     /// `INSERT INTO <t> [(cols)] VALUES (...)`: the record image is
-    /// built at prepare (nulls flagged, fields at their descriptor
-    /// offsets); op_execute writes it into the file's pages
+    /// built at prepare (nulls flagged, literal fields at their
+    /// descriptor offsets); `param_fields` lists the (field id,
+    /// parameter slot) pairs whose bytes arrive with op_execute, which
+    /// binds them into a copy of the image and writes it into the
+    /// file's pages
     Insert {
         rel: u16,
         format_no: u8,
         image: Vec<u8>,
         descs: Vec<Descriptor>,
         index_ops: Vec<IndexOp>,
+        param_fields: Vec<(usize, usize)>,
     },
-    /// `UPDATE <t> SET col = lit [, ...] [WHERE ...]`: the SET values
-    /// are resolved and encoded at prepare (`None` = SQL NULL, `Some` =
-    /// the field's bytes); op_execute walks the committed primary
-    /// records, patches the matching rows' images, and rewrites each as
-    /// a new version chained over its old one
+    /// `UPDATE <t> SET col = <lit|?> [, ...] [WHERE ...]`: literal SET
+    /// values are encoded at prepare, parameter ones bind at execute;
+    /// op_execute walks the committed primary records, patches the
+    /// matching rows' images, and rewrites each as a new version
+    /// chained over its old one
     Update {
         rel: u16,
         format_no: u8,
         formats: Vec<(u8, Vec<Descriptor>)>,
-        sets: Vec<(usize, Option<Vec<u8>>)>,
+        sets: Vec<(usize, SetVal)>,
         filter: Option<Predicate>,
         index_ops: Vec<IndexOp>,
     },
@@ -460,6 +485,13 @@ enum Plan {
         having: Option<Predicate>,
         order_by: Vec<(usize, bool)>,
     },
+}
+
+/// One UPDATE SET value: encoded at prepare (literal - `None` inside =
+/// SQL NULL), or a parameter slot bound at execute.
+enum SetVal {
+    Lit(Option<Vec<u8>>),
+    Param(usize),
 }
 
 /// How a join treats partnerless rows: INNER drops them; LEFT keeps
@@ -507,24 +539,31 @@ enum Cmp {
     Ge,
 }
 
-/// The right-hand literal of a comparison.
+/// The right-hand side of a comparison: a literal, or a `?` parameter
+/// slot (its index into the statement's parameters, plus the column
+/// kind it must bind as - checked when the value arrives at execute).
 #[derive(Clone)]
 enum Rhs {
     Int(i64),
     Str(String),
+    Param(usize, ColKind),
 }
 
 /// A resolved WHERE term: a column (by field id) tested against a literal
-/// or for NULL-ness.
+/// or for NULL-ness. `Never` is what a comparison against a NULL
+/// parameter binds to - SQL UNKNOWN, the row is excluded.
+#[derive(Clone)]
 enum Term {
     Cmp(usize, Cmp, Rhs),
     IsNull(usize),
     IsNotNull(usize),
+    Never,
 }
 
 /// A resolved WHERE predicate in disjunctive normal form (OR of ANDs),
 /// which is what AND-binds-tighter-than-OR gives with no parentheses. A
 /// row matches if every term of any one group matches.
+#[derive(Clone)]
 struct Predicate(Vec<Vec<Term>>);
 
 impl Predicate {
@@ -532,6 +571,53 @@ impl Predicate {
         self.0
             .iter()
             .any(|group| group.iter().all(|t| t.matches(values)))
+    }
+
+    /// Substitute every parameter slot with the value that arrived at
+    /// execute. A NULL parameter in a comparison binds to `Term::Never`
+    /// (comparison with NULL is UNKNOWN); a value whose wire type does
+    /// not match the column kind is an error - never a silent wrong
+    /// filter.
+    fn bind(&self, args: &[WireParam]) -> Result<Predicate, String> {
+        let mut groups = Vec::new();
+        for g in &self.0 {
+            let mut terms = Vec::new();
+            for t in g {
+                terms.push(match t {
+                    Term::Cmp(fid, op, Rhs::Param(idx, kind)) => {
+                        let arg = args.get(*idx).ok_or("missing parameter value")?;
+                        match (kind, arg) {
+                            (_, WireParam::Null) => Term::Never,
+                            (ColKind::Int, WireParam::Int(v, 0)) => {
+                                Term::Cmp(*fid, *op, Rhs::Int(*v))
+                            }
+                            (ColKind::Text, WireParam::Text(s)) => {
+                                Term::Cmp(*fid, *op, Rhs::Str(s.clone()))
+                            }
+                            _ => {
+                                return Err(
+                                    "parameter type does not match its column".into()
+                                )
+                            }
+                        }
+                    }
+                    other => other.clone(),
+                });
+            }
+            groups.push(terms);
+        }
+        Ok(Predicate(groups))
+    }
+}
+
+/// Bind an optional filter's parameters, if it has any.
+fn bind_filter(
+    filter: &Option<Predicate>,
+    args: &[WireParam],
+) -> Result<Option<Predicate>, String> {
+    match filter {
+        None => Ok(None),
+        Some(p) => p.bind(args).map(Some),
     }
 }
 
@@ -569,6 +655,10 @@ impl Term {
                 }
                 _ => false,
             },
+            // an unbound parameter never matches (the execute path binds
+            // before evaluating; this is the defensive answer)
+            Term::Cmp(_, _, Rhs::Param(..)) => false,
+            Term::Never => false,
         }
     }
 }
@@ -636,19 +726,23 @@ fn build_projcols(
     Some(out)
 }
 
-/// A literal an INSERT accepts.
+/// A value an INSERT accepts: a literal, or a `?` parameter slot bound
+/// at execute.
 enum InsVal {
     Int(i64),
     Str(String),
     Null,
+    Param(usize),
 }
 
-/// Parse `INSERT INTO <t> [(col, ...)] VALUES (lit, ...)` - single row,
-/// literal values only (integers, strings, NULL) - resolve it against
-/// the relation, and build the record image at prepare. None = the
-/// statement is not one the server can honour (the caller answers an
-/// SQL error, never a silent wrong write).
-fn plan_insert(sql: &str, db: &Option<Database>) -> Option<Plan> {
+/// Parse `INSERT INTO <t> [(col, ...)] VALUES (val, ...)` - single row,
+/// each value a literal (integer, string, NULL) or a `?` parameter -
+/// resolve it against the relation, and build the record image at
+/// prepare (parameter fields flagged NULL until execute binds them).
+/// None = the statement is not one the server can honour (the caller
+/// answers an SQL error, never a silent wrong write). The second
+/// element of the pair is the parameter target list, in VALUES order.
+fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
     let masked = mask_literals(&up);
@@ -691,11 +785,16 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<Plan> {
     }
     let toks = tokenize(&tail[1..tail.len() - 1])?;
     let mut vals: Vec<InsVal> = Vec::new();
+    let mut nparams = 0usize;
     for part in split_on(&toks, |t| matches!(t, Tok::Comma)) {
         vals.push(match part {
             [Tok::Int(n)] => InsVal::Int(*n),
             [Tok::Str(v)] => InsVal::Str(v.clone()),
             [Tok::Null] => InsVal::Null,
+            [Tok::Param] => {
+                nparams += 1;
+                InsVal::Param(nparams - 1)
+            }
             _ => return None,
         });
     }
@@ -725,8 +824,25 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<Plan> {
         return None;
     }
     let image = build_insert_image(&targets, &vals, descs, db, rel, *format_no)?;
+    // parameter targets in VALUES (= slot) order, each a bindable type
+    let mut param_fields = Vec::new();
+    let mut params = vec![None; nparams];
+    for (rc, v) in targets.iter().zip(&vals) {
+        if let InsVal::Param(slot) = v {
+            let d = descs.get(rc.field_id as usize)?;
+            if !param_target_ok(d) {
+                return None;
+            }
+            param_fields.push((rc.field_id as usize, *slot));
+            params[*slot] = Some(d.clone());
+        }
+    }
+    let params: Vec<Descriptor> = params.into_iter().collect::<Option<_>>()?;
     let descs = descs.clone();
-    Some(Plan::Insert { rel, format_no: *format_no, image, descs, index_ops })
+    Some((
+        Plan::Insert { rel, format_no: *format_no, image, descs, index_ops, param_fields },
+        params,
+    ))
 }
 
 /// Build the record image: every field NULL except the provided ones,
@@ -757,6 +873,9 @@ fn build_insert_image(
         image[i / 8] |= 1 << (i % 8);
     }
     for (rc, v) in targets.iter().zip(vals) {
+        if matches!(v, InsVal::Param(_)) {
+            continue; // stays NULL-flagged; execute binds the value
+        }
         let fid = rc.field_id as usize;
         let d = descs.get(fid)?;
         match encode_set_value(d, v)? {
@@ -774,24 +893,248 @@ fn build_insert_image(
 /// Encode one SQL literal for a column: `None` = a type/width mismatch
 /// (the statement is refused), `Some(None)` = SQL NULL (set the null
 /// flag), `Some(Some(bytes))` = the field's bytes, laid at its
-/// descriptor offset. A VARYING's bytes cover only its used prefix -
-/// anything beyond the counted text is dead space on disk.
+/// descriptor offset. Delegates to the wire-value encoder - an integer
+/// literal into a scaled NUMERIC column rescales exactly like an
+/// integer parameter does (5 into NUMERIC(9,2) stores 500).
 fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
-    let flen = d.length as usize;
-    Some(match v {
-        InsVal::Null => None,
-        InsVal::Int(n) => {
-            if d.scale != 0 {
-                return None; // scaled targets need scale conversion
+    let wp = match v {
+        InsVal::Null => WireParam::Null,
+        InsVal::Int(n) => WireParam::Int(*n, 0),
+        InsVal::Str(text) => WireParam::Text(text.clone()),
+        InsVal::Param(_) => return None, // parameters bind at execute
+    };
+    encode_wire_value(d, &wp)
+}
+
+/// One parameter value as decoded from the op_execute message, in the
+/// wire type the CLIENT chose (the input BLR is value-derived - a JS
+/// integer arrives as blr_long even when the column is BIGINT, a JS
+/// Date as blr_timestamp even for DATE/TIME columns). The scale on
+/// `Int` is the BLR-declared one.
+#[derive(Clone, Debug, PartialEq)]
+enum WireParam {
+    Null,
+    Int(i64, i8),
+    Text(String),
+    Double(f64),
+    Timestamp(i32, u32),
+    Date(i32),
+    Time(u32),
+    Bool(bool),
+}
+
+/// One field of the client's input-message BLR: how its value is laid
+/// out in the XDR message.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PSlot {
+    /// blr_text: `len` bytes, padded to 4 (no length prefix)
+    Text(usize),
+    /// blr_varying: 4-byte BE length + bytes + padding
+    Varying,
+    /// blr_short/blr_long: a 4-byte BE slot, with the declared scale
+    Int32(i8),
+    /// blr_int64: 8 BE bytes
+    Int64(i8),
+    Double,
+    Float,
+    Timestamp,
+    Date,
+    Time,
+    /// blr_bool: 1 value byte + 3 pad (xdr_datum sends the byte FIRST)
+    Bool,
+}
+
+/// Parse the client's input-message BLR from op_execute:
+/// `blr_version4|5, blr_begin, blr_message, <msg#>, <word field-count>`,
+/// then the fields IN PAIRS - each value descriptor followed by a
+/// `blr_short 0` null-indicator slot (a proto-13 message replaces those
+/// shorts with the leading null bitmap, so only the value slots carry
+/// bytes). None = a shape or dtype this server cannot decode; the
+/// caller must then drop the connection, because the message length is
+/// unknowable and the stream cannot be resynchronised.
+fn parse_param_blr(b: &[u8]) -> Option<Vec<PSlot>> {
+    if b.len() < 6 || !matches!(b[0], 4 | 5) || b[1] != 2 || b[2] != 4 {
+        return None;
+    }
+    let count = u16::from_le_bytes([b[4], b[5]]) as usize;
+    if count % 2 != 0 {
+        return None;
+    }
+    let mut slots = Vec::with_capacity(count / 2);
+    let mut i = 6;
+    for field in 0..count {
+        let dt = *b.get(i)?;
+        i += 1;
+        let slot = match dt {
+            14 => {
+                // blr_text: word length
+                let len = u16::from_le_bytes([*b.get(i)?, *b.get(i + 1)?]) as usize;
+                i += 2;
+                PSlot::Text(len)
             }
-            Some(match d.dtype {
-                dtype::SHORT => i16::try_from(*n).ok()?.to_le_bytes().to_vec(),
-                dtype::LONG => i32::try_from(*n).ok()?.to_le_bytes().to_vec(),
-                dtype::INT64 => n.to_le_bytes().to_vec(),
-                _ => return None,
-            })
+            37 => {
+                // blr_varying: word length (the message carries its own)
+                i += 2;
+                PSlot::Varying
+            }
+            7 | 8 => {
+                let scale = *b.get(i)? as i8;
+                i += 1;
+                PSlot::Int32(scale)
+            }
+            16 => {
+                let scale = *b.get(i)? as i8;
+                i += 1;
+                PSlot::Int64(scale)
+            }
+            27 | 11 => PSlot::Double, // blr_double / blr_d_float
+            10 => PSlot::Float,
+            35 => PSlot::Timestamp,
+            12 => PSlot::Date,
+            13 => PSlot::Time,
+            23 => PSlot::Bool,
+            _ => return None, // quad/blob, int128, decfloat, tz: not bindable
+        };
+        if field % 2 == 0 {
+            slots.push(slot);
+        } else if !matches!(slot, PSlot::Int32(_)) {
+            return None; // the pair's second field must be the null short
         }
-        InsVal::Str(text) => {
+    }
+    Some(slots)
+}
+
+/// Read the op_execute parameter message: the null bitmap (one bit per
+/// parameter, padded to 4 bytes), then each NON-null parameter's value
+/// in its BLR-declared XDR layout.
+fn read_param_message(
+    s: &mut TcpStream,
+    dec: &mut Option<Rc4>,
+    slots: &[PSlot],
+) -> std::io::Result<Vec<WireParam>> {
+    let n = slots.len();
+    let bitmap = read_n(s, dec, n.div_ceil(8).div_ceil(4) * 4)?;
+    let mut out = Vec::with_capacity(n);
+    for (i, slot) in slots.iter().enumerate() {
+        if bitmap[i / 8] & (1 << (i % 8)) != 0 {
+            out.push(WireParam::Null);
+            continue;
+        }
+        out.push(match slot {
+            PSlot::Text(len) => {
+                let raw = read_n(s, dec, len.div_ceil(4) * 4)?;
+                WireParam::Text(String::from_utf8_lossy(&raw[..*len]).into_owned())
+            }
+            PSlot::Varying => {
+                let len = read_int(s, dec)?.max(0) as usize;
+                let raw = read_n(s, dec, len.div_ceil(4) * 4)?;
+                WireParam::Text(String::from_utf8_lossy(&raw[..len]).into_owned())
+            }
+            PSlot::Int32(scale) => WireParam::Int(read_int(s, dec)? as i64, *scale),
+            PSlot::Int64(scale) => {
+                let raw = read_n(s, dec, 8)?;
+                WireParam::Int(i64::from_be_bytes(raw.try_into().unwrap()), *scale)
+            }
+            PSlot::Double => {
+                let raw = read_n(s, dec, 8)?;
+                WireParam::Double(f64::from_be_bytes(raw.try_into().unwrap()))
+            }
+            PSlot::Float => {
+                let raw = read_n(s, dec, 4)?;
+                WireParam::Double(f32::from_be_bytes(raw.try_into().unwrap()) as f64)
+            }
+            PSlot::Timestamp => {
+                let d = read_int(s, dec)?;
+                let t = read_n(s, dec, 4)?;
+                WireParam::Timestamp(d, u32::from_be_bytes(t.try_into().unwrap()))
+            }
+            PSlot::Date => WireParam::Date(read_int(s, dec)?),
+            PSlot::Time => {
+                let t = read_n(s, dec, 4)?;
+                WireParam::Time(u32::from_be_bytes(t.try_into().unwrap()))
+            }
+            PSlot::Bool => {
+                let raw = read_n(s, dec, 4)?;
+                WireParam::Bool(raw[0] != 0)
+            }
+        });
+    }
+    Ok(out)
+}
+
+/// Whether a column can be a parameter target: everything the wire
+/// value encoder can produce bytes for. Blob columns would need the
+/// blob-write ops, and INT128/DECFLOAT/TZ an encoder for their layouts
+/// - a plan naming one is refused, never half-supported.
+fn param_target_ok(d: &Descriptor) -> bool {
+    matches!(
+        d.dtype,
+        dtype::SHORT
+            | dtype::LONG
+            | dtype::INT64
+            | dtype::TEXT
+            | dtype::VARYING
+            | dtype::REAL
+            | dtype::DOUBLE
+            | dtype::SQL_DATE
+            | dtype::SQL_TIME
+            | dtype::TIMESTAMP
+            | dtype::BOOLEAN
+    )
+}
+
+fn pow10_i128(e: u32) -> Option<i128> {
+    10i128.checked_pow(e)
+}
+
+/// Move an integer between decimal scales exactly: the value `v * 10^from`
+/// re-expressed at scale `to` (i.e. as `x * 10^to`). Scaling up
+/// multiplies; scaling down requires exact divisibility - a lossy
+/// conversion is refused, matching what an exact client value means.
+fn rescale_int(v: i128, from: i8, to: i8) -> Option<i128> {
+    let e = from as i32 - to as i32;
+    if e >= 0 {
+        v.checked_mul(pow10_i128(e as u32)?)
+    } else {
+        let p = pow10_i128((-e) as u32)?;
+        if v % p == 0 {
+            Some(v / p)
+        } else {
+            None
+        }
+    }
+}
+
+/// Coerce one wire parameter to a column's stored bytes: `None` = the
+/// value cannot represent this column's type (the statement fails),
+/// `Some(None)` = SQL NULL, `Some(Some(bytes))` = the field bytes at
+/// descriptor layout. Conversions mirror the engine's CVT rules for
+/// the shapes clients actually send: integers rescale exactly into
+/// NUMERIC targets, doubles round half-away-from-zero (CVT adds +/-0.5
+/// then truncates), a blr_timestamp truncates into DATE or TIME
+/// targets (node sends JS Dates that way for all three temporal
+/// column types).
+fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> {
+    let flen = d.length as usize;
+    let int_bytes = |stored: i128| -> Option<Vec<u8>> {
+        Some(match d.dtype {
+            dtype::SHORT => i16::try_from(stored).ok()?.to_le_bytes().to_vec(),
+            dtype::LONG => i32::try_from(stored).ok()?.to_le_bytes().to_vec(),
+            dtype::INT64 => i64::try_from(stored).ok()?.to_le_bytes().to_vec(),
+            _ => return None,
+        })
+    };
+    Some(match wp {
+        WireParam::Null => None,
+        WireParam::Int(v, ws) => Some(match d.dtype {
+            dtype::SHORT | dtype::LONG | dtype::INT64 => {
+                int_bytes(rescale_int(*v as i128, *ws, d.scale)?)?
+            }
+            dtype::DOUBLE if *ws == 0 => (*v as f64).to_le_bytes().to_vec(),
+            dtype::REAL if *ws == 0 => (*v as f32).to_le_bytes().to_vec(),
+            _ => return None,
+        }),
+        WireParam::Text(text) => {
             let b = text.as_bytes();
             match d.dtype {
                 dtype::VARYING => {
@@ -813,6 +1156,48 @@ fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
                 _ => return None,
             }
         }
+        WireParam::Double(x) => Some(match d.dtype {
+            dtype::DOUBLE => x.to_le_bytes().to_vec(),
+            dtype::REAL => (*x as f32).to_le_bytes().to_vec(),
+            dtype::SHORT | dtype::LONG | dtype::INT64 => {
+                // engine rounding: scale to the target, then half away
+                // from zero (CVT_get_int64 adds +/-0.5 and truncates)
+                let scaled = x * 10f64.powi(-(d.scale as i32));
+                if !scaled.is_finite() || scaled.abs() >= i64::MAX as f64 {
+                    return None;
+                }
+                int_bytes(scaled.round() as i128)?
+            }
+            _ => return None,
+        }),
+        WireParam::Timestamp(dd, tt) => Some(match d.dtype {
+            dtype::TIMESTAMP => {
+                let mut out = dd.to_le_bytes().to_vec();
+                out.extend_from_slice(&tt.to_le_bytes());
+                out
+            }
+            dtype::SQL_DATE => dd.to_le_bytes().to_vec(),
+            dtype::SQL_TIME => tt.to_le_bytes().to_vec(),
+            _ => return None,
+        }),
+        WireParam::Date(dd) => Some(match d.dtype {
+            dtype::SQL_DATE => dd.to_le_bytes().to_vec(),
+            dtype::TIMESTAMP => {
+                // date -> timestamp is midnight of that day
+                let mut out = dd.to_le_bytes().to_vec();
+                out.extend_from_slice(&0u32.to_le_bytes());
+                out
+            }
+            _ => return None,
+        }),
+        WireParam::Time(tt) => Some(match d.dtype {
+            dtype::SQL_TIME => tt.to_le_bytes().to_vec(),
+            _ => return None,
+        }),
+        WireParam::Bool(v) => Some(match d.dtype {
+            dtype::BOOLEAN => vec![*v as u8],
+            _ => return None,
+        }),
     })
 }
 
@@ -839,13 +1224,14 @@ fn sample_image_len(db: &Database, rel: u16, format_no: u8) -> Option<usize> {
     None
 }
 
-/// Parse `UPDATE <t> SET col = lit [, ...] [WHERE <pred>]` - literal
-/// values only, no expressions or aliases - resolve it against the
-/// relation, and encode every SET value at prepare. The WHERE clause is
-/// the same grammar SELECT filters with. None = not a statement the
-/// server can honour (the caller answers an SQL error - never a silent
-/// no-op, never a wrong write).
-fn plan_update(sql: &str, db: &Option<Database>) -> Option<Plan> {
+/// Parse `UPDATE <t> SET col = <lit|?> [, ...] [WHERE <pred>]` - no
+/// expressions or aliases - resolve it against the relation, and encode
+/// every literal SET value at prepare. The WHERE clause is the same
+/// grammar SELECT filters with, `?` included. Parameter slots number in
+/// SQL textual order: the SET list first, then the WHERE terms. None =
+/// not a statement the server can honour (the caller answers an SQL
+/// error - never a silent no-op, never a wrong write).
+fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
     let masked = mask_literals(&up);
@@ -868,12 +1254,14 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<Plan> {
 
     let set_end = where_kw.unwrap_or(s.len());
     let toks = tokenize(&s[set_kw + "SET".len()..set_end])?;
-    let mut sets: Vec<(usize, Option<Vec<u8>>)> = Vec::new();
+    let mut params: Vec<Descriptor> = Vec::new();
+    let mut sets: Vec<(usize, SetVal)> = Vec::new();
     for part in split_on(&toks, |t| matches!(t, Tok::Comma)) {
         let (name, v) = match part {
             [Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Int(n)] => (c, InsVal::Int(*n)),
             [Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Str(t)] => (c, InsVal::Str(t.clone())),
             [Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Null] => (c, InsVal::Null),
+            [Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Param] => (c, InsVal::Param(0)),
             _ => return None,
         };
         let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
@@ -881,7 +1269,18 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<Plan> {
         if sets.iter().any(|(f, _)| *f == fid) {
             return None; // the same column set twice is invalid SQL
         }
-        sets.push((fid, encode_set_value(descs.get(fid)?, &v)?));
+        let d = descs.get(fid)?;
+        let sv = match v {
+            InsVal::Param(_) => {
+                if !param_target_ok(d) {
+                    return None;
+                }
+                params.push(d.clone());
+                SetVal::Param(params.len() - 1)
+            }
+            lit => SetVal::Lit(encode_set_value(d, &lit)?),
+        };
+        sets.push((fid, sv));
     }
     if sets.is_empty() {
         return None;
@@ -891,16 +1290,16 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<Plan> {
         Some(w) => Some(
             tokenize(&s[w + "WHERE".len()..])
                 .and_then(|t| parse_predicate(&t))
-                .and_then(|raw| resolve_predicate(raw, &columns, descs))?,
+                .and_then(|raw| resolve_predicate(raw, &columns, descs, &mut params))?,
         ),
     };
     let format_no = *format_no;
-    Some(Plan::Update { rel, format_no, formats, sets, filter, index_ops })
+    Some((Plan::Update { rel, format_no, formats, sets, filter, index_ops }, params))
 }
 
 /// Parse `DELETE FROM <t> [WHERE <pred>]` and resolve it. Same
 /// contract as `plan_update`: None means SQL error, never a fallback.
-fn plan_delete(sql: &str, db: &Option<Database>) -> Option<Plan> {
+fn plan_delete(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
     let masked = mask_literals(&up);
@@ -925,15 +1324,16 @@ fn plan_delete(sql: &str, db: &Option<Database>) -> Option<Plan> {
     // a relation with no RDB$FORMATS entry (a system relation) cannot
     // be walked by format - refuse rather than silently delete nothing
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let mut params: Vec<Descriptor> = Vec::new();
     let filter = match where_kw {
         None => None,
         Some(w) => Some(
             tokenize(&s[w + "WHERE".len()..])
                 .and_then(|t| parse_predicate(&t))
-                .and_then(|raw| resolve_predicate(raw, &columns, descs))?,
+                .and_then(|raw| resolve_predicate(raw, &columns, descs, &mut params))?,
         ),
     };
-    Some(Plan::Delete { rel, formats, filter })
+    Some((Plan::Delete { rel, formats, filter }, params))
 }
 
 /// The DML target walk: every committed primary record of `rel` the
@@ -978,13 +1378,36 @@ fn collect_dml_targets(
 /// Execute a DML plan against a WORKING COPY of the database bytes - a
 /// statement that fails partway must not leave half its version chains
 /// behind - and flush the whole file back on success (the offline
-/// writer's atomicity model). Returns the per-verb affected counts
-/// (inserted, updated, deleted) for isc_info_sql_records.
-fn execute_dml(plan: &Plan, database: &mut Option<Database>) -> Result<(i32, i32, i32), String> {
+/// writer's atomicity model). `args` are the op_execute parameter
+/// values; every parameter slot the plan carries binds here, and a
+/// value that cannot represent its column fails the whole statement.
+/// Returns the per-verb affected counts (inserted, updated, deleted)
+/// for isc_info_sql_records.
+fn execute_dml(
+    plan: &Plan,
+    database: &mut Option<Database>,
+    args: &[WireParam],
+) -> Result<(i32, i32, i32), String> {
     let db = database.as_mut().ok_or("no database attached")?;
     let mut work = db.bytes.clone();
     let counts = match plan {
-        Plan::Insert { rel, format_no, image, descs, index_ops } => {
+        Plan::Insert { rel, format_no, image, descs, index_ops, param_fields } => {
+            let mut image = image.clone();
+            for (fid, slot) in param_fields {
+                let d = descs.get(*fid).ok_or("field beyond format")?;
+                let arg = args.get(*slot).ok_or("missing parameter value")?;
+                match encode_wire_value(d, arg)
+                    .ok_or("parameter type does not match its column")?
+                {
+                    None => {} // NULL: the flag is already set
+                    Some(bytes) => {
+                        let at = d.offset as usize;
+                        image[at..at + bytes.len()].copy_from_slice(&bytes);
+                        image[fid / 8] &= !(1 << (fid % 8));
+                    }
+                }
+            }
+            let image = &image;
             let out =
                 fire_crab_ods::insert_record(&mut work, db.page_size, *rel, *format_no, image)?;
             if !index_ops.is_empty() {
@@ -1007,6 +1430,22 @@ fn execute_dml(plan: &Plan, database: &mut Option<Database>) -> Result<(i32, i32
                 .find(|(n, _)| n == format_no)
                 .map(|(_, d)| d)
                 .ok_or("newest format not found")?;
+            // bind: every SET value becomes concrete bytes (or SQL NULL)
+            let mut bound_sets: Vec<(usize, Option<Vec<u8>>)> = Vec::new();
+            for (fid, sv) in sets {
+                let bytes = match sv {
+                    SetVal::Lit(b) => b.clone(),
+                    SetVal::Param(slot) => {
+                        let d = descs.get(*fid).ok_or("field beyond format")?;
+                        let arg = args.get(*slot).ok_or("missing parameter value")?;
+                        encode_wire_value(d, arg)
+                            .ok_or("parameter type does not match its column")?
+                    }
+                };
+                bound_sets.push((*fid, bytes));
+            }
+            let sets = &bound_sets;
+            let filter = &bind_filter(filter, args)?;
             let mut targets: Vec<(u32, u16, Vec<u8>)> = Vec::new();
             let mut old_images: Vec<Vec<u8>> = Vec::new();
             for (page, slot, fmt, image) in collect_dml_targets(db, *rel, formats, filter) {
@@ -1061,6 +1500,7 @@ fn execute_dml(plan: &Plan, database: &mut Option<Database>) -> Result<(i32, i32
             (0, out.affected as i32, 0)
         }
         Plan::Delete { rel, formats, filter } => {
+            let filter = &bind_filter(filter, args)?;
             let targets: Vec<(u32, u16)> = collect_dml_targets(db, *rel, formats, filter)
                 .into_iter()
                 .map(|(page, slot, _, _)| (page, slot))
@@ -1131,6 +1571,18 @@ fn resolve_index_ops(db: &Database, rel: u16, descs: &[Descriptor]) -> Option<Ve
         });
     }
     Some(ops)
+}
+
+/// Check a parameterised SELECT's values against its plan by binding
+/// every filter now: the answer is an error at op_execute, not a wrong
+/// row set at fetch. Plans without parameters validate trivially.
+fn validate_select_bind(plan: &Plan, args: &[WireParam]) -> Result<(), String> {
+    match plan {
+        Plan::Project { filter, .. } | Plan::Group { filter, .. } | Plan::Join { filter, .. } => {
+            bind_filter(filter, args).map(|_| ())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The record number of the record at (page, slot) - the positional
@@ -1333,8 +1785,12 @@ fn parse_on(on_s: &str, sides: &[JoinSide; 2]) -> Option<Vec<(usize, usize)>> {
 
 /// Resolve a WHERE predicate against the two join sides (combined row
 /// indexes). Aggregates are invalid here, exactly as in the single-table
-/// resolver.
-fn resolve_join_predicate(raw: Vec<Vec<RawTerm>>, sides: &[JoinSide; 2]) -> Option<Predicate> {
+/// resolver; `?` terms register parameter slots the same way.
+fn resolve_join_predicate(
+    raw: Vec<Vec<RawTerm>>,
+    sides: &[JoinSide; 2],
+    params: &mut Vec<Descriptor>,
+) -> Option<Predicate> {
     let mut groups = Vec::new();
     for g in raw {
         let mut terms = Vec::new();
@@ -1343,7 +1799,7 @@ fn resolve_join_predicate(raw: Vec<Vec<RawTerm>>, sides: &[JoinSide; 2]) -> Opti
                 return None;
             };
             let (idx, d, _) = resolve_join_col(sides, col)?;
-            terms.push(typed_term(idx, col_kind(d)?, rt.kind)?);
+            terms.push(param_or_typed_term(idx, col_kind(d)?, rt.kind, d, params)?);
         }
         groups.push(terms);
     }
@@ -1366,6 +1822,7 @@ fn plan_join(
     where_s: Option<&str>,
     order_s: Option<&str>,
     db: &Database,
+    params: &mut Vec<Descriptor>,
 ) -> Option<Plan> {
     let mut sides: Vec<JoinSide> = Vec::new();
     for tr in [left, right] {
@@ -1406,7 +1863,7 @@ fn plan_join(
         Some(ws) => Some(
             tokenize(ws)
                 .and_then(|t| parse_predicate(&t))
-                .and_then(|raw| resolve_join_predicate(raw, &sides))?,
+                .and_then(|raw| resolve_join_predicate(raw, &sides, params))?,
         ),
     };
 
@@ -1485,12 +1942,27 @@ fn plan_join(
 /// parsed or resolved makes the whole query fall back to the fixed
 /// constant rather than answer it wrong (returning extra or misgrouped
 /// rows would be worse than answering nothing).
-fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
-    let fallback = Plan::Scalar(Some(FIXED_ANSWER));
+/// Plan a SELECT, returning the plan and its parameter targets. An
+/// unsupported query falls back to the fixed answer WITH NO parameters
+/// (the describe then announces none, so a client that passed some gets
+/// a visible count mismatch instead of a silently wrong answer).
+fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
+    let mut params = Vec::new();
+    match plan_query_inner(sql, db, &mut params) {
+        Some(p) => (p, params),
+        None => (Plan::Scalar(Some(FIXED_ANSWER)), Vec::new()),
+    }
+}
+
+fn plan_query_inner(
+    sql: &str,
+    db: &Option<Database>,
+    params: &mut Vec<Descriptor>,
+) -> Option<Plan> {
     let trace = std::env::var("FC_SRV_TRACE").is_ok();
     let Some((proj_s, table_s, where_s, group_s, having_s, order_s)) = split_query(sql) else {
         if trace { eprintln!("[srv] plan: split_query failed for {:?}", sql); }
-        return fallback;
+        return None;
     };
     if trace {
         eprintln!(
@@ -1500,24 +1972,24 @@ fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
     }
     let Some(proj) = parse_projection(proj_s) else {
         if trace { eprintln!("[srv] plan: parse_projection failed"); }
-        return fallback;
+        return None;
     };
-    let Some(db) = db else { return fallback };
+    let db = db.as_ref()?;
     let Some((left, join)) = parse_from(table_s) else {
         if trace { eprintln!("[srv] plan: FROM parse failed for {:?}", table_s); }
-        return fallback;
+        return None;
     };
     if let Some((kind, right, on_s)) = join {
         // a join supports projections, WHERE and ORDER BY; the one
         // aggregate shape is a lone COUNT(*), counted at prepare.
         // GROUP BY/HAVING over a join fall back.
         if group_s.is_some() || having_s.is_some() {
-            return fallback;
+            return None;
         }
         if let Proj::Items(items) = &proj {
             if let [SelItem::Agg(AggFn::Count, AggTarget::Star)] = items.as_slice() {
                 if order_s.is_some() {
-                    return fallback;
+                    return None;
                 }
                 if let Some(Plan::Join {
                     kind,
@@ -1530,30 +2002,33 @@ fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
                     on,
                     filter,
                     ..
-                }) = plan_join(&Proj::Star, kind, &left, &right, on_s, where_s, None, db)
+                }) = plan_join(&Proj::Star, kind, &left, &right, on_s, where_s, None, db, params)
                 {
+                    // counted at prepare, so a parameterised WHERE (whose
+                    // values only arrive at execute) cannot be honoured
+                    if !params.is_empty() {
+                        return None;
+                    }
                     let n = join_rows(
                         db, kind, left_rel, &left_formats, left_width, right_rel,
                         &right_formats, right_width, &on, &filter,
                     )
                     .len();
-                    return Plan::Scalar(Some(n as i64));
+                    return Some(Plan::Scalar(Some(n as i64)));
                 }
-                return fallback;
+                return None;
             }
         }
-        return match plan_join(&proj, kind, &left, &right, on_s, where_s, order_s, db) {
-            Some(p) => p,
+        return match plan_join(&proj, kind, &left, &right, on_s, where_s, order_s, db, params) {
+            Some(p) => Some(p),
             None => {
                 if trace { eprintln!("[srv] plan: JOIN plan failed"); }
-                fallback
+                None
             }
         };
     }
     let table = left.table;
-    let Some(rel) = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table) else {
-        return fallback;
-    };
+    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
     let columns = relation_columns(&db.bytes, db.page_size, table);
     let formats = select_formats(db, table, rel);
     let descs = formats
@@ -1567,12 +2042,12 @@ fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
         None => None,
         Some(ws) => match tokenize(ws)
             .and_then(|t| parse_predicate(&t))
-            .and_then(|raw| resolve_predicate(raw, &columns, &descs))
+            .and_then(|raw| resolve_predicate(raw, &columns, &descs, params))
         {
             Some(p) => Some(p),
             None => {
                 if trace { eprintln!("[srv] plan: WHERE parse/resolve failed for {:?}", ws); }
-                return fallback; // unsupported WHERE: do not answer wrong
+                return None; // unsupported WHERE: do not answer wrong
             }
         },
     };
@@ -1583,26 +2058,19 @@ fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
             // every column grouped (and HAVING needs a grouped query) -
             // not shapes worth answering
             if group_s.is_some() || having_s.is_some() {
-                return fallback;
+                return None;
             }
-            let Some(cols) = build_projcols(&["*".to_string()], &columns, &descs) else {
-                return fallback;
-            };
+            let cols = build_projcols(&["*".to_string()], &columns, &descs)?;
             let order_by = match order_s {
                 None => Vec::new(),
-                Some(os) => {
-                    match parse_order_by(os, &cols, |n| {
-                        columns
-                            .iter()
-                            .find(|c| c.name.eq_ignore_ascii_case(n))
-                            .map(|c| c.field_id as usize)
-                    }) {
-                        Some(keys) => keys,
-                        None => return fallback,
-                    }
-                }
+                Some(os) => parse_order_by(os, &cols, |n| {
+                    columns
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(n))
+                        .map(|c| c.field_id as usize)
+                })?,
             };
-            return Plan::Project { rel, formats, cols, filter, order_by };
+            return Some(Plan::Project { rel, formats, cols, filter, order_by });
         }
         Proj::Items(items) => items,
     };
@@ -1612,16 +2080,19 @@ fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
     // a single aggregate with no GROUP BY (nor HAVING, which needs the
     // grouped machinery) stays on the scalar path - it keeps the
     // header-count fast path for COUNT(*), which is also the only way
-    // COUNT works on system relations (no RDB$FORMATS entry)
-    if group_s.is_none() && having_s.is_none() && items.len() == 1 {
+    // COUNT works on system relations (no RDB$FORMATS entry). With
+    // parameters in the WHERE the value is not computable at prepare,
+    // so the query drops through to the group machinery instead (which
+    // computes at fetch, after the values arrive).
+    if group_s.is_none() && having_s.is_none() && items.len() == 1 && params.is_empty() {
         if let SelItem::Agg(func, target) = &items[0] {
             // ORDER BY on a single-row aggregate is meaningless; reject it
             if order_s.is_some() {
-                return fallback;
+                return None;
             }
             return match aggregate(db, rel, &formats, &columns, &descs, *func, target, &filter) {
-                Some(v) => Plan::Scalar(v),
-                None => fallback, // unsupported aggregate (e.g. MIN of a text column)
+                Some(v) => Some(Plan::Scalar(v)),
+                None => None, // unsupported aggregate (e.g. MIN of a text column)
             };
         }
     }
@@ -1630,7 +2101,7 @@ fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
         // HAVING with no GROUP BY makes the query one global group, where
         // a bare (ungrouped) column is invalid SQL
         if having_s.is_some() {
-            return fallback;
+            return None;
         }
         // plain projection: SELECT <cols> [WHERE] [ORDER BY]
         let collist: Vec<String> = items
@@ -1640,11 +2111,9 @@ fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
                 SelItem::Agg(..) => unreachable!(),
             })
             .collect();
-        let Some(cols) = build_projcols(&collist, &columns, &descs) else {
-            return fallback;
-        };
+        let cols = build_projcols(&collist, &columns, &descs)?;
         if cols.is_empty() {
-            return fallback;
+            return None;
         }
         let order_by = match order_s {
             None => Vec::new(),
@@ -1658,20 +2127,21 @@ fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
                     Some(keys) => keys,
                     None => {
                         if trace { eprintln!("[srv] plan: ORDER BY parse failed for {:?}", os); }
-                        return fallback;
+                        return None;
                     }
                 }
             }
         };
-        return Plan::Project { rel, formats, cols, filter, order_by };
+        return Some(Plan::Project { rel, formats, cols, filter, order_by });
     }
 
     // grouped query: GROUP BY, or a multi-aggregate global projection
+    // (including a lone parameterised aggregate, deferred to fetch)
     match plan_group(&items, group_s, having_s, order_s, rel, formats, &columns, &descs, filter) {
-        Some(p) => p,
+        Some(p) => Some(p),
         None => {
             if trace { eprintln!("[srv] plan: GROUP BY plan failed"); }
-            fallback
+            None
         }
     }
 }
@@ -2172,15 +2642,15 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Vec<Value> {
 
 /// The describe buffer for a plan: one BIGINT for `Scalar`, the projected
 /// columns for `Project`, the output columns for `Group`.
-fn describe_for(plan: &Plan) -> Vec<u8> {
+fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
     match plan {
-        Plan::Scalar(_) => describe_one_bigint(),
-        Plan::Insert { .. } => describe_dml(2), // isc_info_sql_stmt_insert
-        Plan::Update { .. } => describe_dml(3), // isc_info_sql_stmt_update
-        Plan::Delete { .. } => describe_dml(4), // isc_info_sql_stmt_delete
-        Plan::Project { cols, .. } => build_describe(cols),
-        Plan::Join { cols, .. } => build_describe(cols),
-        Plan::Group { cols, .. } => build_describe(cols),
+        Plan::Scalar(_) => describe_one_bigint(params),
+        Plan::Insert { .. } => describe_dml(2, params), // isc_info_sql_stmt_insert
+        Plan::Update { .. } => describe_dml(3, params), // isc_info_sql_stmt_update
+        Plan::Delete { .. } => describe_dml(4, params), // isc_info_sql_stmt_delete
+        Plan::Project { cols, .. } => build_describe(cols, params),
+        Plan::Join { cols, .. } => build_describe(cols, params),
+        Plan::Group { cols, .. } => build_describe(cols, params),
     }
 }
 
@@ -2190,7 +2660,21 @@ fn describe_for(plan: &Plan) -> Vec<u8> {
 /// value is None); `Project` walks the relation, filters, and either
 /// streams the rows or - if there is an ORDER BY - collects, sorts and
 /// then emits them.
-fn emit_rows(w: &mut W, plan: &Plan, db: &Option<Database>) {
+fn emit_rows(w: &mut W, plan: &Plan, db: &Option<Database>, args: &[WireParam]) {
+    // a filter bind failure emits no rows, only the terminator -
+    // op_execute already validated the bind and reported any error, so
+    // reaching fetch with a bad bind means the client ignored it
+    let _ = emit_rows_inner(w, plan, db, args);
+    // end-of-cursor terminator
+    w.int(OP_FETCH_RESPONSE).int(100).int(0);
+}
+
+fn emit_rows_inner(
+    w: &mut W,
+    plan: &Plan,
+    db: &Option<Database>,
+    args: &[WireParam],
+) -> Result<(), String> {
     match plan {
         // DML has no cursor: terminator only
         Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. } => {}
@@ -2214,6 +2698,7 @@ fn emit_rows(w: &mut W, plan: &Plan, db: &Option<Database>) {
             order_by,
         } => {
             if let Some(db) = db {
+                let filter = bind_filter(filter, args)?;
                 let accepts = |v: &[Value]| filter.as_ref().map_or(true, |p| p.matches(v));
                 if order_by.is_empty() {
                     for_each_record(db, *rel, formats, |values| {
@@ -2252,9 +2737,10 @@ fn emit_rows(w: &mut W, plan: &Plan, db: &Option<Database>) {
             order_by,
         } => {
             if let Some(db) = db {
+                let filter = bind_filter(filter, args)?;
                 let mut rows = join_rows(
                     db, *kind, *left_rel, left_formats, *left_width, *right_rel,
-                    right_formats, *right_width, on, filter,
+                    right_formats, *right_width, on, &filter,
                 );
                 if !order_by.is_empty() {
                     rows.sort_by(|a, b| order_cmp(a, b, order_by));
@@ -2276,7 +2762,9 @@ fn emit_rows(w: &mut W, plan: &Plan, db: &Option<Database>) {
             order_by,
         } => {
             if let Some(db) = db {
-                let mut rows = group_output(db, *rel, formats, gitems, key_fids, filter, having);
+                let filter = bind_filter(filter, args)?;
+                let mut rows =
+                    group_output(db, *rel, formats, gitems, key_fids, &filter, having);
                 if !order_by.is_empty() {
                     // order_by keys are output indexes; output rows are
                     // aligned with gitems/cols, so order_cmp applies as-is
@@ -2289,8 +2777,7 @@ fn emit_rows(w: &mut W, plan: &Plan, db: &Option<Database>) {
             }
         }
     }
-    // end-of-cursor terminator
-    w.int(OP_FETCH_RESPONSE).int(100).int(0);
+    Ok(())
 }
 
 /// Encode one row message: the leading null bitmap (one bit per projected
@@ -2698,6 +3185,8 @@ enum Tok {
     Is,
     Not,
     Null,
+    /// a `?` parameter placeholder - its value arrives with op_execute
+    Param,
 }
 
 /// Tokenise a WHERE/HAVING clause. Single-quoted strings ('' escapes a
@@ -2771,6 +3260,10 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
             b'!' if b.get(i + 1) == Some(&b'=') => {
                 out.push(Tok::Cmp(Cmp::Ne));
                 i += 2;
+            }
+            b'?' => {
+                out.push(Tok::Param);
+                i += 1;
             }
             b'0'..=b'9' => {
                 let start = i;
@@ -2896,6 +3389,9 @@ fn parse_term(t: &[Tok]) -> Option<RawTerm> {
     let kind = match &t[1..] {
         [Tok::Cmp(op), Tok::Int(n)] => RawKind::Cmp(*op, Rhs::Int(*n)),
         [Tok::Cmp(op), Tok::Str(v)] => RawKind::Cmp(*op, Rhs::Str(v.clone())),
+        // slot index and kind are placeholders until a resolver that
+        // supports parameters assigns them
+        [Tok::Cmp(op), Tok::Param] => RawKind::Cmp(*op, Rhs::Param(usize::MAX, ColKind::Int)),
         [Tok::Is, Tok::Null] => RawKind::IsNull,
         [Tok::Is, Tok::Not, Tok::Null] => RawKind::IsNotNull,
         _ => return None,
@@ -2905,6 +3401,7 @@ fn parse_term(t: &[Tok]) -> Option<RawTerm> {
 
 /// Whether a descriptor is comparable as an integer or as text (the only
 /// kinds WHERE handles); None for anything else.
+#[derive(Clone, Copy, PartialEq)]
 enum ColKind {
     Int,
     Text,
@@ -2921,7 +3418,9 @@ fn col_kind(d: &Descriptor) -> Option<ColKind> {
 
 /// Build one resolved term from a value index, the kind of value living
 /// there, and the raw comparison. Checks the literal type against the
-/// value type; None on a mismatch.
+/// value type; None on a mismatch. A parameter placeholder is NOT
+/// handled here - resolvers that support parameters register the slot
+/// themselves (HAVING does not, so a `?` there lands on the None).
 fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
     Some(match raw {
         RawKind::Cmp(op, Rhs::Int(n)) => match kind {
@@ -2932,6 +3431,7 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
             ColKind::Text => Term::Cmp(idx, op, Rhs::Str(v)),
             _ => return None,
         },
+        RawKind::Cmp(_, Rhs::Param(..)) => return None,
         RawKind::IsNull => Term::IsNull(idx),
         RawKind::IsNotNull => Term::IsNotNull(idx),
     })
@@ -2940,11 +3440,14 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
 /// Resolve every WHERE term's column name to a field id and check the
 /// literal type matches the column type. Returns None on an unknown
 /// column, an unsupported column type, a literal/column type mismatch, or
-/// an aggregate call (aggregates are not valid in WHERE).
+/// an aggregate call (aggregates are not valid in WHERE). A `?` term
+/// registers the column's descriptor in `params` (slot indexes run in
+/// SQL textual order, which DNF resolution preserves) and binds later.
 fn resolve_predicate(
     raw: Vec<Vec<RawTerm>>,
     columns: &[RelationColumn],
     descs: &[Descriptor],
+    params: &mut Vec<Descriptor>,
 ) -> Option<Predicate> {
     let mut groups = Vec::new();
     for g in raw {
@@ -2955,12 +3458,34 @@ fn resolve_predicate(
             };
             let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(col))?;
             let fid = rc.field_id as usize;
-            let kind = col_kind(descs.get(fid)?)?;
-            terms.push(typed_term(fid, kind, rt.kind)?);
+            let d = descs.get(fid)?;
+            let kind = col_kind(d)?;
+            terms.push(param_or_typed_term(fid, kind, rt.kind, d, params)?);
         }
         groups.push(terms);
     }
     Some(Predicate(groups))
+}
+
+/// The parameter-aware wrapper around [typed_term]: a `?` right-hand
+/// side claims the next parameter slot for the column's descriptor;
+/// anything else resolves as before.
+fn param_or_typed_term(
+    idx: usize,
+    kind: ColKind,
+    raw: RawKind,
+    d: &Descriptor,
+    params: &mut Vec<Descriptor>,
+) -> Option<Term> {
+    if let RawKind::Cmp(op, Rhs::Param(..)) = raw {
+        if !param_target_ok(d) {
+            return None;
+        }
+        let slot = params.len();
+        params.push(d.clone());
+        return Some(Term::Cmp(idx, op, Rhs::Param(slot, kind)));
+    }
+    typed_term(idx, kind, raw)
 }
 
 /// Resolve a HAVING predicate against a grouped query's OUTPUT rows. A
@@ -3179,10 +3704,14 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     respond(&mut s, &mut enc, 1)?; // attachment handle 1
 
     // The SQL text of the most recently prepared statement, the plan it
-    // resolves to (built at prepare, executed at fetch), and the last
-    // DML's per-verb affected counts (what isc_info_sql_records reports).
+    // resolves to (built at prepare, executed at fetch), its parameter
+    // targets (what the describe's bind section announced), the values
+    // the last op_execute carried for them, and the last DML's per-verb
+    // affected counts (what isc_info_sql_records reports).
     let mut stmt_sql = String::new();
     let mut plan = Plan::Scalar(Some(FIXED_ANSWER));
+    let mut stmt_params: Vec<Descriptor> = Vec::new();
+    let mut bound_args: Vec<WireParam> = Vec::new();
     let mut last_dml = (0i32, 0i32, 0i32); // (inserted, updated, deleted)
     // open blobs: handle -> (assembled content, read cursor). Content is
     // assembled at open (the whole file is in memory anyway); get_segment
@@ -3224,6 +3753,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 }
                 stmt_sql = String::from_utf8_lossy(&sql).into_owned();
                 last_dml = (0, 0, 0);
+                bound_args.clear();
                 let up = stmt_sql.trim_start().to_ascii_uppercase();
                 let dml_kw = ["INSERT", "UPDATE", "DELETE"]
                     .into_iter()
@@ -3238,28 +3768,49 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         _ => plan_delete(&stmt_sql, &database),
                     };
                     match planned {
-                        Some(p) => {
-                            let describe = describe_for(&p);
+                        Some((p, ps)) => {
+                            let describe = describe_for(&p, &ps);
                             plan = p;
+                            stmt_params = ps;
                             respond_prepare(&mut s, &mut enc, &describe)?;
                         }
                         None => {
                             plan = Plan::Scalar(Some(FIXED_ANSWER));
+                            stmt_params = Vec::new();
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
                     }
                 } else {
-                    plan = plan_query(&stmt_sql, &database);
-                    let describe = describe_for(&plan);
+                    let (p, ps) = plan_query(&stmt_sql, &database);
+                    plan = p;
+                    stmt_params = ps;
+                    let describe = describe_for(&plan, &stmt_params);
                     respond_prepare(&mut s, &mut enc, &describe)?;
                 }
             }
             x if x == OP_EXECUTE => {
                 read_int(&mut s, &mut dec)?; // stmt
                 read_int(&mut s, &mut dec)?; // tr
-                read_wire_bytes(&mut s, &mut dec)?; // input blr
+                let in_blr = read_wire_bytes(&mut s, &mut dec)?; // input blr
                 read_int(&mut s, &mut dec)?; // msg number
-                read_int(&mut s, &mut dec)?; // param count
+                let messages = read_int(&mut s, &mut dec)?; // message count
+                // With parameters, the message (null bitmap + values)
+                // follows HERE, before the version-dependent trailing
+                // fields. Its layout comes from the client's own BLR -
+                // if that BLR names a dtype this server cannot decode,
+                // the message length is unknowable and the connection
+                // must drop (a desynced stream would be worse).
+                bound_args = if messages > 0 {
+                    let slots = parse_param_blr(&in_blr).ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "undecodable input-message BLR",
+                        )
+                    })?;
+                    read_param_message(&mut s, &mut dec, &slots)?
+                } else {
+                    Vec::new()
+                };
                 // op_execute grew trailing fields across protocol versions;
                 // a client that negotiated a newer version always sends them,
                 // and not draining them desyncs the (encrypted) stream.
@@ -3272,14 +3823,23 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 if best >= 19 {
                     read_int(&mut s, &mut dec)?; // p_sqldata_inline_blob_size
                 }
-                if matches!(
+                if std::env::var("FC_SRV_TRACE").is_ok() && !bound_args.is_empty() {
+                    eprintln!("[srv] execute params: {:?}", bound_args);
+                }
+                // the client must supply exactly the parameters the
+                // describe announced - fewer or more is an error, not a
+                // guess
+                if bound_args.len() != stmt_params.len() {
+                    last_dml = (0, 0, 0);
+                    respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                } else if matches!(
                     plan,
                     Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
                 ) {
                     // DML executes here (not at fetch): write the new
                     // versions into a copy of the page image, swap it in
                     // and flush the whole file back
-                    match execute_dml(&plan, &mut database) {
+                    match execute_dml(&plan, &mut database, &bound_args) {
                         Ok(counts) => {
                             last_dml = counts;
                             if std::env::var("FC_SRV_TRACE").is_ok() {
@@ -3298,6 +3858,14 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
                     }
+                } else if let Err(e) = validate_select_bind(&plan, &bound_args) {
+                    // a parameterised SELECT whose values cannot bind
+                    // (type mismatch) fails HERE, visibly - never an
+                    // unfiltered or empty answer at fetch
+                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!("[srv] select bind failed: {}", e);
+                    }
+                    respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                 } else {
                     respond(&mut s, &mut enc, 0)?;
                 }
@@ -3328,7 +3896,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 }
                 // stream the plan's rows + end-of-cursor terminator
                 let mut w = W::default();
-                emit_rows(&mut w, &plan, &database);
+                emit_rows(&mut w, &plan, &database, &bound_args);
                 w.send(&mut s, &mut enc)?;
             }
             x if x == OP_FREE_STATEMENT => {
@@ -3502,7 +4070,7 @@ mod tests {
     #[test]
     fn describe_buffer_is_parseable() {
         // the describe the server produces must satisfy the client parser
-        let d = describe_one_bigint();
+        let d = describe_one_bigint(&[]);
         // marker [4,7,4,0] must be present
         assert!(d.windows(4).any(|w| w == [4, 7, 4, 0]));
     }
@@ -3527,8 +4095,12 @@ mod tests {
             encode_set_value(&d(dtype::INT64, 8, 0), &InsVal::Int(1 << 40)),
             Some(Some((1i64 << 40).to_le_bytes().to_vec()))
         );
-        // a scaled column refuses an unscaled literal
-        assert!(encode_set_value(&d(dtype::LONG, 4, -2), &InsVal::Int(5)).is_none());
+        // an integer literal rescales exactly into a NUMERIC target
+        // (5 into NUMERIC(9,2) stores 500), like the engine converts
+        assert_eq!(
+            encode_set_value(&d(dtype::LONG, 4, -2), &InsVal::Int(5)),
+            Some(Some(500i32.to_le_bytes().to_vec()))
+        );
         // CHAR pads with blanks to the declared length, VARCHAR counts
         let t = encode_set_value(&d(dtype::TEXT, 5, 0), &InsVal::Str("ab".into()));
         assert_eq!(t, Some(Some(b"ab   ".to_vec())));
@@ -3538,6 +4110,169 @@ mod tests {
         // type mismatches are refused, NULL passes through
         assert!(encode_set_value(&d(dtype::LONG, 4, 0), &InsVal::Str("x".into())).is_none());
         assert_eq!(encode_set_value(&d(dtype::LONG, 4, 0), &InsVal::Null), Some(None));
+    }
+
+    fn desc(dt: u8, len: u16, scale: i8) -> Descriptor {
+        Descriptor { dtype: dt, scale, length: len, sub_type: 0, flags: 0, offset: 0 }
+    }
+
+    #[test]
+    fn parses_node_style_param_blr() {
+        // what node-firebird's CalcBlr emits for (int, 'abcde', bigint):
+        // version5, begin, message 0, word 6, then pairs of value
+        // descriptor + blr_short null indicator, end, eoc
+        let blr = [
+            5u8, 2, 4, 0, 6, 0, // header, 6 fields (3 params)
+            8, 0, 7, 0, // blr_long scale 0 + null short
+            14, 5, 0, 7, 0, // blr_text len 5 + null short
+            16, 0, 7, 0, // blr_int64 scale 0 + null short
+            255, 76, // blr_end, blr_eoc
+        ];
+        assert_eq!(
+            parse_param_blr(&blr),
+            Some(vec![PSlot::Int32(0), PSlot::Text(5), PSlot::Int64(0)])
+        );
+        // timestamp/bool/double have no operands
+        let blr2 = [5u8, 2, 4, 0, 6, 0, 35, 7, 0, 23, 7, 0, 27, 7, 0, 255, 76];
+        assert_eq!(
+            parse_param_blr(&blr2),
+            Some(vec![PSlot::Timestamp, PSlot::Bool, PSlot::Double])
+        );
+        // an undecodable dtype (blr_quad = blob id) refuses the whole BLR
+        assert!(parse_param_blr(&[5u8, 2, 4, 0, 2, 0, 9, 0, 7, 0, 255, 76]).is_none());
+        // odd field count is not pairs
+        assert!(parse_param_blr(&[5u8, 2, 4, 0, 1, 0, 8, 0, 255, 76]).is_none());
+    }
+
+    #[test]
+    fn wire_values_coerce_like_the_engine() {
+        // integers rescale exactly into NUMERIC targets
+        assert_eq!(
+            encode_wire_value(&desc(dtype::INT64, 8, -2), &WireParam::Int(50, 0)),
+            Some(Some(5000i64.to_le_bytes().to_vec()))
+        );
+        // an inexact down-scale is refused, not truncated
+        assert!(encode_wire_value(&desc(dtype::LONG, 4, 1), &WireParam::Int(15, 0)).is_none());
+        // doubles round half away from zero into scaled targets (CVT)
+        assert_eq!(
+            encode_wire_value(&desc(dtype::LONG, 4, -2), &WireParam::Double(100.25)),
+            Some(Some(10025i32.to_le_bytes().to_vec()))
+        );
+        assert_eq!(
+            encode_wire_value(&desc(dtype::LONG, 4, -1), &WireParam::Double(1.25)),
+            Some(Some(13i32.to_le_bytes().to_vec()))
+        );
+        assert_eq!(
+            encode_wire_value(&desc(dtype::LONG, 4, -1), &WireParam::Double(-1.25)),
+            Some(Some((-13i32).to_le_bytes().to_vec()))
+        );
+        // a blr_timestamp truncates into DATE and TIME targets
+        let ts = WireParam::Timestamp(60000, 123_450_000);
+        assert_eq!(
+            encode_wire_value(&desc(dtype::TIMESTAMP, 8, 0), &ts),
+            Some(Some({
+                let mut b = 60000i32.to_le_bytes().to_vec();
+                b.extend_from_slice(&123_450_000u32.to_le_bytes());
+                b
+            }))
+        );
+        assert_eq!(
+            encode_wire_value(&desc(dtype::SQL_DATE, 4, 0), &ts),
+            Some(Some(60000i32.to_le_bytes().to_vec()))
+        );
+        assert_eq!(
+            encode_wire_value(&desc(dtype::SQL_TIME, 4, 0), &ts),
+            Some(Some(123_450_000u32.to_le_bytes().to_vec()))
+        );
+        // booleans only into BOOLEAN columns, as the single stored byte
+        assert_eq!(
+            encode_wire_value(&desc(dtype::BOOLEAN, 1, 0), &WireParam::Bool(true)),
+            Some(Some(vec![1]))
+        );
+        assert!(encode_wire_value(&desc(dtype::LONG, 4, 0), &WireParam::Bool(true)).is_none());
+        // text into an int column is a mismatch, never a conversion
+        assert!(
+            encode_wire_value(&desc(dtype::LONG, 4, 0), &WireParam::Text("9".into())).is_none()
+        );
+    }
+
+    #[test]
+    fn predicate_binds_params_at_execute() {
+        let p = Predicate(vec![vec![
+            Term::Cmp(3, Cmp::Eq, Rhs::Param(0, ColKind::Int)),
+            Term::Cmp(5, Cmp::Eq, Rhs::Param(1, ColKind::Text)),
+        ]]);
+        let b = p
+            .bind(&[WireParam::Int(42, 0), WireParam::Text("x".into())])
+            .unwrap();
+        assert!(b.matches(&[
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Int(42),
+            Value::Null,
+            Value::Text("x".into()),
+        ]));
+        // a NULL parameter compares as UNKNOWN - the row is excluded
+        let b = p
+            .bind(&[WireParam::Null, WireParam::Text("x".into())])
+            .unwrap();
+        assert!(!b.matches(&[
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Int(42),
+            Value::Null,
+            Value::Text("x".into()),
+        ]));
+        // a wire type that does not match the column kind is an error
+        assert!(p
+            .bind(&[WireParam::Text("42".into()), WireParam::Text("x".into())])
+            .is_err());
+        // scaled wire integers do not bind into scale-0 comparisons
+        assert!(p
+            .bind(&[WireParam::Int(42, -2), WireParam::Text("x".into())])
+            .is_err());
+    }
+
+    #[test]
+    fn where_params_register_targets_in_order() {
+        let toks = tokenize("A = ? AND B = ?").unwrap();
+        let raw = parse_predicate(&toks).unwrap();
+        let columns = vec![
+            RelationColumn { name: "A".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "B".into(), field_id: 1, position: 1 },
+        ];
+        let descs = vec![desc(dtype::LONG, 4, 0), desc(dtype::VARYING, 22, 0)];
+        let mut params = Vec::new();
+        let p = resolve_predicate(raw, &columns, &descs, &mut params).unwrap();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].dtype, dtype::LONG);
+        assert_eq!(params[1].dtype, dtype::VARYING);
+        // slots bind positionally
+        let b = p
+            .bind(&[WireParam::Int(7, 0), WireParam::Text("q".into())])
+            .unwrap();
+        assert!(b.matches(&[Value::Int(7), Value::Text("q".into())]));
+        // a parameter on an unbindable column type refuses the plan
+        let toks = tokenize("A = ?").unwrap();
+        let raw = parse_predicate(&toks).unwrap();
+        let blob_descs = vec![desc(dtype::BLOB, 8, 0)];
+        assert!(resolve_predicate(raw, &columns, &blob_descs, &mut Vec::new()).is_none());
+    }
+
+    #[test]
+    fn bind_section_describes_params() {
+        let params = vec![desc(dtype::LONG, 4, 0), desc(dtype::VARYING, 22, 0)];
+        let mut d = Vec::new();
+        append_bind_section(&mut d, &params);
+        // section marker + count 2
+        assert_eq!(&d[..7], &[5, 7, 4, 0, 2, 0, 0]);
+        // both sqlda_seq items present, each var closed with describe_end
+        assert_eq!(d.iter().filter(|&&b| b == 8).count(), 2);
+        // SQL_LONG (496) and SQL_VARYING (448) both announced
+        assert!(d.windows(7).any(|w| w == [11, 4, 0, 240, 1, 0, 0]));
+        assert!(d.windows(7).any(|w| w == [11, 4, 0, 192, 1, 0, 0]));
     }
 
     fn proj_cols(p: &Proj) -> Vec<String> {
@@ -3750,9 +4485,9 @@ mod tests {
     #[test]
     fn plan_falls_back_to_scalar_without_database() {
         // with no database loaded, everything plans to the fixed scalar
-        assert!(matches!(plan_query("SELECT COUNT(*) FROM DEPT", &None), Plan::Scalar(Some(FIXED_ANSWER))));
-        assert!(matches!(plan_query("SELECT ID, NAME FROM EMP WHERE ID > 5", &None), Plan::Scalar(Some(FIXED_ANSWER))));
-        assert!(matches!(plan_query("SELECT CAST(1 AS BIGINT) FROM RDB$DATABASE", &None), Plan::Scalar(Some(FIXED_ANSWER))));
+        assert!(matches!(plan_query("SELECT COUNT(*) FROM DEPT", &None).0, Plan::Scalar(Some(FIXED_ANSWER))));
+        assert!(matches!(plan_query("SELECT ID, NAME FROM EMP WHERE ID > 5", &None).0, Plan::Scalar(Some(FIXED_ANSWER))));
+        assert!(matches!(plan_query("SELECT CAST(1 AS BIGINT) FROM RDB$DATABASE", &None).0, Plan::Scalar(Some(FIXED_ANSWER))));
     }
 
     #[test]
@@ -3902,7 +4637,7 @@ mod tests {
     fn join_predicate_uses_combined_indexes() {
         let sides = join_sides();
         let raw = parse_predicate(&tokenize("E.ID >= 5 AND D.NAME = 'Sales'").unwrap()).unwrap();
-        let p = resolve_join_predicate(raw, &sides).unwrap();
+        let p = resolve_join_predicate(raw, &sides, &mut Vec::new()).unwrap();
         // combined row: [E.ID, E.DEPT_ID, E.NAME, D.ID, D.NAME]
         let row = |id: i64, dname: &str| {
             vec![
@@ -3918,7 +4653,7 @@ mod tests {
         assert!(!p.matches(&row(9, "Ops")));
         // an ambiguous bare column cannot resolve
         let raw = parse_predicate(&tokenize("NAME = 'x'").unwrap()).unwrap();
-        assert!(resolve_join_predicate(raw, &sides).is_none());
+        assert!(resolve_join_predicate(raw, &sides, &mut Vec::new()).is_none());
     }
 
     #[test]
@@ -3956,7 +4691,7 @@ mod tests {
         assert!(resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).is_none());
         // ...and WHERE resolution rejects aggregates outright
         let raw = parse_predicate(&tokenize("COUNT(*) > 3").unwrap()).unwrap();
-        assert!(resolve_predicate(raw, &columns, &descs).is_none());
+        assert!(resolve_predicate(raw, &columns, &descs, &mut Vec::new()).is_none());
     }
 
     #[test]
