@@ -57,6 +57,7 @@ the converter what the C++ is *doing* before they read a line of it.
 | UPDATE / DELETE (version chains) | `fire-crab-wire::server` + `fire-crab-ods::dml` | **the server writes MVCC version chains** - UPDATE copies the old version to a fresh slot flagged `rhd_chain` and rewrites the primary with a back pointer to it; DELETE leaves a header-only `rhd_deleted` stub over the chain (`VIO_modify`/`VIO_erase` + `DPM_update` on the file image); **three engine oracles**: `gfix -v -full` accepts the chains, the same statements applied by the C++ engine to a second copy produce an *identical* table, and `gfix -sweep` - the engine's own GC - collects fire-crab's chains with the version arithmetic exact (46 → 23) and the data intact |
 | System-table projections | `fire-crab-ods::sysfmt` + `fire-crab-wire::server` | **system relations answer like user tables** - their formats (absent from RDB$FORMATS) are *computed* the way ini.epp computes them at database creation, but from the database's own catalog: RDB$RELATION_FIELDS names the fields, RDB$FIELDS types them, the ini.epp offset walk (FLAG_BYTES + MET_align) lays them out. Anchored: the computation must reproduce every offset catalog.rs found by differential testing (4/256/1394/1410, 32/42) - asserted in tests and at every runtime bootstrap. Projections, WHERE, ORDER BY, aggregates, GROUP BY and system-to-system JOINs over RDB$ tables match isql; DML on system relations stays refused |
 | BLOB content over the wire | `fire-crab-wire::server` + `fire-crab-ods::format` | **blob columns are first-class** - described SQL_BLOB with sub_type, the 8-byte on-disk bid travels as the quad, and the server answers `op_open_blob(2)`/`op_get_segment`/`op_close_blob` by assembling content from the pages (level 0/1, segment framing stripped per-blob via `rhd_stream_blob`); the first CONTENT differential: node-firebird's assembled text == isql on a 30000-byte multi-page blob (length/head/tail), empty and NULL blobs, and a system blob through the computed system format |
+| INT128 + DECFLOAT | `fire-crab-ods::decfloat` + `fire-crab-wire::server` | **decoded, rendered like decNumber, native on the wire** - decimal64/128 DPD decode converted from the engine's embedded decNumber (DPD2BIN table from decDPD.h), rendering per decNumberToString (cohort preserved: 100.00 keeps its zeros; the 0.000001-vs-1E-7 plain/scientific boundary exact); INT128 as a scaled i128. Wire forms exactly as xdr.cpp serializes them. Render differential: `fcstat rows` == isql text on 38-digit INT128 and 34-digit DECFLOAT; wire differential through node-firebird's typed decode; ORDER BY sorts numerically. Three node-firebird client bugs catalogued along the way (negative INT128, huge scale-0 INT128, multi-digit DECFLOAT coefficients - all broken against any server) |
 | Everything else | — | see [docs/subsystem-map.md](docs/subsystem-map.md) |
 
 **On the firebird-qa milestone, precisely.** firebird-qa drives a *server*,
@@ -199,12 +200,12 @@ database's own catalog rows, so the file describes itself; only the two
 catalog-reading relations are compiled into `sysfmt`, and the computation
 must reproduce the offsets `catalog.rs` established empirically before it
 is trusted. Integers, scaled numerics, float/double, date/time/timestamp,
-boolean and text all travel in native wire form, and blob columns are
-served as real blobs - the id in the row, the content through the blob
-ops; `INT128`, `DECFLOAT` and TZ columns are still rendered as text, and
-other shapes fall back to the fixed value.
+boolean, text, `INT128` and `DECFLOAT` all travel in native wire form,
+and blob columns are served as real blobs - the id in the row, the
+content through the blob ops; TZ columns are still rendered as
+placeholders, and other shapes fall back to the fixed value.
 Widening further (write-path page allocation and index maintenance,
-scaled/temporal SET values, INT128/DECFLOAT/TZ decode) is the
+scaled/temporal SET values, the time-zone types) is the
 work that continues - but the fixed answer is no longer fixed, the server
 writes records and version chains the real engine validates and
 garbage-collects, and the protocol server it all runs on is proven

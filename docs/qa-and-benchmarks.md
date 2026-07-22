@@ -761,6 +761,43 @@ node-firebird's `db.query` delivers blob cells as fetch *functions*
 (only `sequentially` auto-reads them) - the harness invokes each, which
 is exactly what drives the blob ops against fire-crab.
 
+### The twenty-fourth differential — INT128 and DECFLOAT
+
+`qa/serve-real-exotic.sh` retires the oldest per-column exclusions.
+INT128 (`NUMERIC/DECIMAL(38)`) decodes as a scaled 128-bit integer;
+DECFLOAT(16)/(34) decode as IEEE 754-2008 decimal64/128 in the densely
+packed decimal encoding, converted one-way from the decNumber library
+the engine embeds - the 1024-entry `DPD2BIN` declet table transcribed
+from decDPD.h, the combination-field split per IEEE 3.5.2, and
+rendering per `decNumberToString`: plain notation while the exponent
+is <= 0 and the adjusted exponent >= -6, scientific otherwise, cohort
+preserved throughout (`100.00` keeps its zeros; `0.000001` prints
+plain, `1E-7` scientific - the exact boundary).
+
+Two differentials, because the client and the server can each be wrong
+independently:
+
+1. **render** - `fcstat rows` against isql's own text on the same
+   file: 38-digit INT128, 34-digit DECFLOAT(34), negatives, preserved
+   cohorts, both sides of the plain/scientific boundary. (The isql
+   side selects columns in *physical field-id order* - the mixed-width
+   alignment reorder of increment 14 applies to this table, biting the
+   gate itself before it bit the server.)
+2. **wire** - node-firebird's typed decode over the native forms
+   (SQL_INT128/SQL_DEC16/SQL_DEC34, serialized exactly as xdr.cpp
+   does), plus ORDER BY sorting numerically where lexicographic order
+   would invert.
+
+Three node-firebird *client* bugs were catalogued while building the
+gate - all of them wrong against any server, invisible until a server
+differential exercised the types: `readInt128` reads the high half
+unsigned (negative INT128), the scale-0 BigInt path slices at `-0`
+(huge scale-0 values), and `decodeDecimal64/128` read the DPD declets
+as plain binary (any multi-digit coefficient mis-decodes; single-digit
+declets coincide in both encodings, which is why simple values ever
+appeared to work). The gate's wire checks use values outside those
+holes; the render differential carries the full-fidelity cases.
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -780,8 +817,8 @@ engine itself validates all of it (isql reads the same table the engine
 would have produced, `gfix -v` passes, `gfix -sweep` collects the
 chains, `gbak` backs the file up). What stands between here and running
 the suite is remaining *breadth* of the SQL engine - index maintenance
-and page allocation on the write path, INT128/DECFLOAT/TZ
-decode. Until that surface is wide enough,
+and page allocation on the write path, the time-zone
+types. Until that surface is wide enough,
 fire-crab does **not** claim any firebird-qa coverage - but the milestone
 is no longer distant: the protocol server the suite talks to accepts real
 clients, answers real typed, filtered, joined, grouped, sorted and
@@ -911,6 +948,15 @@ NODE_PATH="$PWD/node_modules" \\
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
     GBAK=/opt/firebird/bin/gbak \\
     bash /path/to/fire-crab/qa/serve-real-blob.sh 3050
+
+# INT128 + DECFLOAT: fcstat's rendering == isql text (cohorts, boundaries,
+# 38/34 digits), and the native wire forms through node-firebird's decode.
+# Builds its own scratch database.
+NODE_PATH="$PWD/node_modules" \\
+    FCWIRE=/path/to/fire-crab/target/release/fcwire \\
+    FCSTAT=/path/to/fire-crab/target/release/fcstat \\
+    ISQL=/opt/firebird/bin/isql GBAK=/opt/firebird/bin/gbak \\
+    bash /path/to/fire-crab/qa/serve-real-exotic.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
