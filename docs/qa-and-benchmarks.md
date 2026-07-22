@@ -850,6 +850,43 @@ on an INDEXED table answers a real SQL error, because writing a record
 without its index entries would make the engine's index scans silently
 miss rows. Index maintenance is the one remaining write-path piece.
 
+### The twenty-seventh differential — index maintenance, read back by the engine
+
+`qa/serve-real-btree.sh` converts the last write-path piece: B-tree
+insertion. Index keys are built byte-exactly as `compress` (btr.cpp:
+3444) builds them - INTEGER/SMALLINT as sign-munged big-endian DOUBLES
+(that is what `idx_numeric` means), BIGINT as `INT64_KEY` (the
+`int64_scale_control`-normalized quotient by 10^4 as a double plus the
+remainder short), text as pad-stripped bytes - and inserted through
+btn.cpp `writeNode`'s exact prefix-compressed varint encoding, round-
+tripped in unit tests through the readNode port that increment 4
+validated against 200k engine-written keys. Full pages split exactly
+as `split_and_insert` does: the midpoint node terminates the left page
+as its END_BUCKET and opens the right page with a full key, the parent
+gains (midpoint key, recno, right page), and a root split grows a new
+root and repoints `irt_root`.
+
+The semantics are the engine's, not a rationalization: DELETE touches
+no index (`VIO_erase` does not either - entries outlive their record
+versions until garbage collection), UPDATE only ADDS entries for
+changed keys (`IDX_modify`), and unique enforcement ignores entries
+carrying our own record number - those are our older versions' keys,
+not violations.
+
+The oracles: 2000 inserts through a three-index table force leaf AND
+root splits, then the ENGINE READS THROUGH THE TREES - a point lookup
+whose PLAN output is asserted to name the primary-key index, range
+scans over both the double and INT64_KEY encodings, a text lookup, a
+navigational ORDER BY - finding exactly the rows fire-crab wrote.
+`gfix -v -full` cross-checks every record against every index entry
+(one wrong key byte and it reports); a duplicate PRIMARY KEY insert
+refuses with nothing written; an updated key is found under its new
+value and not its old; deleted rows are invisible through the index;
+the engine's same-statements copy prints the identical table; and the
+sweep leaves everything clean. Multi-segment, descending and
+expression indexes still refuse DML - the guard narrowed rather than
+vanished.
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -868,8 +905,8 @@ pages, `UPDATE`/`DELETE` write real version chains over them, and the
 engine itself validates all of it (isql reads the same table the engine
 would have produced, `gfix -v` passes, `gfix -sweep` collects the
 chains, `gbak` backs the file up). What stands between here and running
-the suite is remaining *breadth* of the SQL engine - index maintenance on
-the write path. Until that surface is wide
+the suite is remaining *breadth* of the SQL engine - now mostly parameter
+binding and the less-common index shapes. Until that surface is wide
 enough,
 fire-crab does **not** claim any firebird-qa coverage - but the milestone
 is no longer distant: the protocol server the suite talks to accepts real
@@ -1025,6 +1062,14 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak GSTAT=/opt/firebird/bin/gstat \
     bash /path/to/fire-crab/qa/serve-real-grow.sh 3050
+
+# INDEX MAINTENANCE: 2000 inserts split a 3-index tree (leaf + root splits),
+# the engine reads through it (PLAN-asserted index scans), gfix cross-checks
+# every entry. Builds its own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-btree.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
