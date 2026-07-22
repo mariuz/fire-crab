@@ -34,6 +34,14 @@ const OP_COND_ACCEPT: i32 = 98;
 const OP_CANCEL: i32 = 91;
 const OP_INFO_DATABASE: i32 = 40;
 const OP_INFO_SQL: i32 = 70;
+const OP_OPEN_BLOB: i32 = 35;
+const OP_GET_SEGMENT: i32 = 36;
+const OP_CLOSE_BLOB: i32 = 39;
+const OP_OPEN_BLOB2: i32 = 56;
+
+/// isc_bad_segstr_id - "invalid BLOB ID", answered for an op_open_blob
+/// naming a blob the file does not have.
+const GDS_BAD_BLOB_ID: i32 = 335544329;
 
 /// A tiny fixed-randomness source (no external deps); the server salt
 /// and ephemeral b only need to be per-connection, not cryptographically
@@ -263,7 +271,7 @@ fn build_describe(cols: &[ProjCol]) -> Vec<u8> {
     for (i, c) in cols.iter().enumerate() {
         int_item(&mut d, 9, (i + 1) as i32); // sqlda_seq
         int_item(&mut d, 11, c.sql_type); // type
-        int_item(&mut d, 12, 0); // sub_type
+        int_item(&mut d, 12, c.sub_type); // sub_type (blob text/binary)
         int_item(&mut d, 13, c.scale); // scale (client divides scaled ints)
         int_item(&mut d, 14, c.length); // length
         str_item(&mut d, 16, &c.name); // field name
@@ -332,6 +340,9 @@ enum Wire {
     Bool,
     /// 4-byte length + bytes + padding to 4
     Varying,
+    /// 8-byte blob id (the on-disk bid bytes); the client fetches the
+    /// content through op_open_blob/op_get_segment with this id
+    Blob,
 }
 
 /// One column of a projection: its name, the field id that indexes the
@@ -345,6 +356,9 @@ struct ProjCol {
     sql_type: i32,
     length: i32,
     scale: i32,
+    /// describe item 12 - the blob sub_type (text/binary) for blob
+    /// columns, 0 elsewhere
+    sub_type: i32,
 }
 
 /// What a prepared statement resolves to. `Scalar` is a single BIGINT
@@ -547,19 +561,22 @@ impl Term {
 /// stored descriptor - mirroring the types the engine itself describes
 /// (SQL type codes from sqlda_pub.h). Text and anything without a native
 /// mapping (blobs, INT128, DECFLOAT) is rendered and sent as SQL_VARYING.
-fn wire_for(d: &Descriptor) -> (Wire, i32, i32, i32) {
+fn wire_for(d: &Descriptor) -> (Wire, i32, i32, i32, i32) {
     let scale = d.scale as i32;
     match d.dtype {
-        dtype::SHORT => (Wire::Int32, 500, 2, scale), // SQL_SHORT
-        dtype::LONG => (Wire::Int32, 496, 4, scale),  // SQL_LONG
-        dtype::INT64 => (Wire::Int64, 580, 8, scale), // SQL_INT64
-        dtype::REAL => (Wire::Float, 482, 4, 0),      // SQL_FLOAT
-        dtype::DOUBLE => (Wire::Double, 480, 8, 0),   // SQL_DOUBLE
-        dtype::SQL_DATE => (Wire::Date, 570, 4, 0),   // SQL_TYPE_DATE
-        dtype::SQL_TIME => (Wire::Time, 560, 4, 0),   // SQL_TYPE_TIME
-        dtype::TIMESTAMP => (Wire::Timestamp, 510, 8, 0), // SQL_TIMESTAMP
-        dtype::BOOLEAN => (Wire::Bool, 32764, 1, 0),  // SQL_BOOLEAN
-        _ => (Wire::Varying, 448, 32765, 0),          // SQL_VARYING, rendered text
+        dtype::SHORT => (Wire::Int32, 500, 2, scale, 0), // SQL_SHORT
+        dtype::LONG => (Wire::Int32, 496, 4, scale, 0),  // SQL_LONG
+        dtype::INT64 => (Wire::Int64, 580, 8, scale, 0), // SQL_INT64
+        dtype::REAL => (Wire::Float, 482, 4, 0, 0),      // SQL_FLOAT
+        dtype::DOUBLE => (Wire::Double, 480, 8, 0, 0),   // SQL_DOUBLE
+        dtype::SQL_DATE => (Wire::Date, 570, 4, 0, 0),   // SQL_TYPE_DATE
+        dtype::SQL_TIME => (Wire::Time, 560, 4, 0, 0),   // SQL_TYPE_TIME
+        dtype::TIMESTAMP => (Wire::Timestamp, 510, 8, 0, 0), // SQL_TIMESTAMP
+        dtype::BOOLEAN => (Wire::Bool, 32764, 1, 0, 0),  // SQL_BOOLEAN
+        // blob: the 8-byte id travels, content via the blob ops; the
+        // describe carries the sub_type so clients know text vs binary
+        dtype::BLOB => (Wire::Blob, 520, 8, 0, d.sub_type as i32), // SQL_BLOB
+        _ => (Wire::Varying, 448, 32765, 0, 0),          // SQL_VARYING, rendered text
     }
 }
 
@@ -584,7 +601,7 @@ fn build_projcols(
     let mut out = Vec::new();
     for rc in selected {
         let d = descs.get(rc.field_id as usize)?;
-        let (wire, sql_type, length, scale) = wire_for(d);
+        let (wire, sql_type, length, scale, sub_type) = wire_for(d);
         out.push(ProjCol {
             name: rc.name.clone(),
             field_id: rc.field_id as usize,
@@ -592,6 +609,7 @@ fn build_projcols(
             sql_type,
             length,
             scale,
+            sub_type,
         });
     }
     Some(out)
@@ -1261,7 +1279,7 @@ fn plan_join(
             for side in &sides {
                 for rc in &side.columns {
                     let d = side.descs.get(rc.field_id as usize)?;
-                    let (wire, sql_type, length, scale) = wire_for(d);
+                    let (wire, sql_type, length, scale, sub_type) = wire_for(d);
                     cols.push(ProjCol {
                         name: rc.name.clone(),
                         field_id: side.offset + rc.field_id as usize,
@@ -1269,6 +1287,7 @@ fn plan_join(
                         sql_type,
                         length,
                         scale,
+                        sub_type,
                     });
                 }
             }
@@ -1279,7 +1298,7 @@ fn plan_join(
                     return None; // aggregates over a join: fall back
                 };
                 let (idx, d, colname) = resolve_join_col(&sides, name)?;
-                let (wire, sql_type, length, scale) = wire_for(d);
+                let (wire, sql_type, length, scale, sub_type) = wire_for(d);
                 cols.push(ProjCol {
                     name: colname.to_string(),
                     field_id: idx,
@@ -1287,6 +1306,7 @@ fn plan_join(
                     sql_type,
                     length,
                     scale,
+                    sub_type,
                 });
             }
         }
@@ -1559,7 +1579,7 @@ fn plan_group(
                 if !key_fids.contains(&fid) {
                     return None; // a selected column that is not grouped
                 }
-                let (wire, sql_type, length, scale) = wire_for(descs.get(fid)?);
+                let (wire, sql_type, length, scale, sub_type) = wire_for(descs.get(fid)?);
                 cols.push(ProjCol {
                     name: rc.name.clone(),
                     field_id: out_idx,
@@ -1567,6 +1587,7 @@ fn plan_group(
                     sql_type,
                     length,
                     scale,
+                    sub_type,
                 });
                 gitems.push(GItem::Key(fid));
             }
@@ -1599,6 +1620,7 @@ fn plan_group(
                     sql_type: 580,
                     length: 8,
                     scale: 0,
+                    sub_type: 0,
                 });
                 gitems.push(GItem::Agg(*func, fid));
             }
@@ -2182,8 +2204,34 @@ fn encode_row(w: &mut W, cols: &[ProjCol], values: &[Value]) {
                     w.raw(&[0u8]);
                 }
             }
+            Wire::Blob => {
+                // the on-disk bid bytes travel (RecordNumber.h:63-71
+                // layout); the client echoes them back verbatim in
+                // op_open_blob, where decode_blob_id reads them again
+                let (rel, num) = if let Value::Blob(rel, num) = v { (*rel, *num) } else { (0, 0) };
+                w.raw(&encode_blob_id(rel, num));
+            }
         }
     }
+}
+
+/// The 8 wire bytes of a blob id: the on-disk bid layout (u16 relation
+/// LE, reserved byte, the record number's high byte, then its low 32
+/// bits LE) - the same bytes `decode_field` read. Clients treat the
+/// quad as opaque and echo it in op_open_blob.
+fn encode_blob_id(rel: u16, num: u64) -> [u8; 8] {
+    let mut b = [0u8; 8];
+    b[0..2].copy_from_slice(&rel.to_le_bytes());
+    b[3] = (num >> 32) as u8;
+    b[4..8].copy_from_slice(&(num as u32).to_le_bytes());
+    b
+}
+
+/// The inverse of `encode_blob_id`: (relation, record number).
+fn decode_blob_id(b: &[u8]) -> (u16, u64) {
+    let rel = u16::from_le_bytes([b[0], b[1]]);
+    let num = ((b[3] as u64) << 32) | u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as u64;
+    (rel, num)
 }
 
 /// A bare SQL identifier: letters, digits, `_`, `$`, non-empty.
@@ -2945,6 +2993,11 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     let mut stmt_sql = String::new();
     let mut plan = Plan::Scalar(Some(FIXED_ANSWER));
     let mut last_dml = (0i32, 0i32, 0i32); // (inserted, updated, deleted)
+    // open blobs: handle -> (assembled content, read cursor). Content is
+    // assembled at open (the whole file is in memory anyway); get_segment
+    // then just slices it.
+    let mut blobs: std::collections::HashMap<i32, (Vec<u8>, usize)> = std::collections::HashMap::new();
+    let mut next_blob_handle: i32 = 7000;
 
     // --- the op loop (encrypted) ---
     loop {
@@ -3104,6 +3157,67 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 // -> cancel_operation, no send). Reading a second int or
                 // replying desyncs the stream.
                 read_int(&mut s, &mut dec)?; // p_co_kind
+            }
+            x if x == OP_OPEN_BLOB || x == OP_OPEN_BLOB2 => {
+                // p_blob: [bpb (blob2 only)], transaction, 8-byte blob id
+                if x == OP_OPEN_BLOB2 {
+                    read_wire_bytes(&mut s, &mut dec)?; // bpb, ignored
+                }
+                read_int(&mut s, &mut dec)?; // transaction handle
+                let id = read_n(&mut s, &mut dec, 8)?;
+                let (rel, num) = decode_blob_id(&id);
+                let content = database.as_ref().and_then(|db| {
+                    fire_crab_ods::read_blob_content(&db.bytes, db.page_size, rel, num)
+                });
+                match content {
+                    Some(data) => {
+                        next_blob_handle += 1;
+                        if std::env::var("FC_SRV_TRACE").is_ok() {
+                            eprintln!(
+                                "[srv] open blob {}:{} -> handle {} ({} bytes)",
+                                rel, num, next_blob_handle, data.len()
+                            );
+                        }
+                        blobs.insert(next_blob_handle, (data, 0));
+                        respond(&mut s, &mut enc, next_blob_handle)?;
+                    }
+                    None => respond_error(&mut s, &mut enc, GDS_BAD_BLOB_ID)?,
+                }
+            }
+            x if x == OP_GET_SEGMENT => {
+                let handle = read_int(&mut s, &mut dec)?;
+                let buf_len = read_int(&mut s, &mut dec)?.max(4) as usize;
+                read_int(&mut s, &mut dec)?; // p_sgmt_length, unused here
+                match blobs.get_mut(&handle) {
+                    Some((data, cursor)) => {
+                        // one [u16 LE length][bytes] segment per response,
+                        // sized to the client's buffer; resp_object = 2
+                        // signals blob EOF (server.cpp get_segment)
+                        let remaining = data.len() - *cursor;
+                        let chunk = remaining.min(buf_len - 2).min(u16::MAX as usize);
+                        let mut seg = Vec::with_capacity(chunk + 2);
+                        if chunk > 0 {
+                            seg.extend_from_slice(&(chunk as u16).to_le_bytes());
+                            seg.extend_from_slice(&data[*cursor..*cursor + chunk]);
+                            *cursor += chunk;
+                        }
+                        let object = if *cursor >= data.len() { 2 } else { 0 };
+                        let mut w = W::default();
+                        w.int(OP_RESPONSE)
+                            .int(object)
+                            .int(0)
+                            .int(0) // blob id
+                            .bytes(&seg)
+                            .int(0); // clean status
+                        w.send(&mut s, &mut enc)?;
+                    }
+                    None => respond_error(&mut s, &mut enc, GDS_BAD_BLOB_ID)?,
+                }
+            }
+            x if x == OP_CLOSE_BLOB => {
+                let handle = read_int(&mut s, &mut dec)?;
+                blobs.remove(&handle);
+                respond(&mut s, &mut enc, 0)?;
             }
             x if x == OP_INFO_DATABASE => {
                 // isql asks for dialect / ODS / server-version banner data.
@@ -3357,8 +3471,8 @@ mod tests {
         );
         // ORDER BY resolution: ordinal into the projection, and by name
         let cols = vec![
-            ProjCol { name: "ID".into(), field_id: 3, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0 },
-            ProjCol { name: "NAME".into(), field_id: 1, wire: Wire::Varying, sql_type: 448, length: 32765, scale: 0 },
+            ProjCol { name: "ID".into(), field_id: 3, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0, sub_type: 0 },
+            ProjCol { name: "NAME".into(), field_id: 1, wire: Wire::Varying, sql_type: 448, length: 32765, scale: 0, sub_type: 0 },
         ];
         let columns = vec![
             RelationColumn { name: "ID".into(), field_id: 3, position: 0 },
@@ -3686,7 +3800,7 @@ mod tests {
             (dtype::BOOLEAN, 0, 32764, 1),
             (dtype::VARYING, 0, 448, 32765),
         ] {
-            let (_, sql_type, length, scale) = wire_for(&d(dt, sc));
+            let (_, sql_type, length, scale, _) = wire_for(&d(dt, sc));
             assert_eq!((sql_type, length), (ty, len), "dtype {}", dt);
             let want = if matches!(dt, dtype::SHORT | dtype::LONG | dtype::INT64) { sc as i32 } else { 0 };
             assert_eq!(scale, want, "dtype {} scale", dt);
@@ -3696,7 +3810,7 @@ mod tests {
     #[test]
     fn encodes_native_wire_values() {
         let pc = |wire, sql_type, length, scale| ProjCol {
-            name: "C".into(), field_id: 0, wire, sql_type, length, scale,
+            name: "C".into(), field_id: 0, wire, sql_type, length, scale, sub_type: 0,
         };
         let enc = |col: ProjCol, v: Value| {
             let mut w = W::default();
@@ -3737,8 +3851,8 @@ mod tests {
     fn encodes_row_bitmap_and_values() {
         // two INT64 cols, second null: 4-byte bitmap (bit 1 set) + one 8-byte value
         let cols = vec![
-            ProjCol { name: "A".into(), field_id: 0, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0 },
-            ProjCol { name: "B".into(), field_id: 1, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0 },
+            ProjCol { name: "A".into(), field_id: 0, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0, sub_type: 0 },
+            ProjCol { name: "B".into(), field_id: 1, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0, sub_type: 0 },
         ];
         let values = vec![Value::Int(7), Value::Null];
         let mut w = W::default();

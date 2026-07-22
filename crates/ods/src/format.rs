@@ -354,6 +354,28 @@ pub fn read_blob(
     Some(out)
 }
 
+/// Read a blob's CONTENT with the right framing, decided by the blob
+/// itself: segmented blobs carry `[u16 length]` prefixes to strip,
+/// stream-mode blobs (`rhd_stream_blob`, ods.h:1012 - `blh_flags`
+/// aliases the record flags word) are raw bytes.
+pub fn read_blob_content(
+    file: &[u8],
+    page_size: usize,
+    relation: u16,
+    recno: u64,
+) -> Option<Vec<u8>> {
+    let recs = max_recs_per_dp(page_size);
+    let dp_no = *relation_data_pages(file, page_size, relation).get((recno / recs) as usize)?;
+    let start = dp_no as usize * page_size;
+    let dp = DataPage::decode(file.get(start..start + page_size)?)?;
+    let b = dp.slot_bytes((recno % recs) as u16)?;
+    if b.len() < 12 || u16_at(b, 10) & flags::BLOB == 0 {
+        return None;
+    }
+    let stream = u16_at(b, 10) & flags::STREAM_BLOB != 0;
+    read_blob(file, page_size, relation, recno, !stream)
+}
+
 /// Bootstrap: read every (relation_id, format#, descriptors) row from
 /// RDB$FORMATS using its hardcoded system format, then parse each
 /// descriptor blob. Returns matches for `relation`.

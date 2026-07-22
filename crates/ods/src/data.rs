@@ -15,6 +15,9 @@ pub mod flags {
     pub const INCOMPLETE: u16 = 8; // record continues in fragments
     pub const BLOB: u16 = 16; // a blob, not a record
     pub const DELTA: u16 = 32; // prior version stored as differences
+    /// same bit as DELTA - on a blob slot it means stream-mode (no
+    /// segment framing), ods.h:1011-1012 (`rhd_stream_blob`)
+    pub const STREAM_BLOB: u16 = 32;
     pub const LARGE: u16 = 64;
     pub const DAMAGED: u16 = 128;
     pub const GC_ACTIVE: u16 = 256;

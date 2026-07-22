@@ -46,7 +46,7 @@ pub use catalog::{
 };
 pub use data::{DataPage, RecordHeader};
 pub use dml::{delete_records, insert_record, update_records, DmlOutcome, InsertOutcome};
-pub use format::{decode_record, relation_formats, Descriptor, Value};
+pub use format::{decode_record, read_blob_content, relation_formats, Descriptor, Value};
 pub use gc::{analyze as gc_analyze, version_count, GcReport};
 pub use header::HeaderPage;
 pub use pages::{census, PageType};
