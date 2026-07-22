@@ -33,6 +33,7 @@ const OP_ALLOCATE_STATEMENT: i32 = 62;
 const OP_COND_ACCEPT: i32 = 98;
 const OP_CANCEL: i32 = 91;
 const OP_INFO_DATABASE: i32 = 40;
+const OP_INFO_SQL: i32 = 70;
 
 /// A tiny fixed-randomness source (no external deps); the server salt
 /// and ephemeral b only need to be per-connection, not cryptographically
@@ -112,6 +113,26 @@ fn respond(s: &mut TcpStream, enc: &mut Option<Rc4>, handle: i32) -> std::io::Re
     w.send(s, enc)
 }
 
+/// One op_response whose status vector carries a gds error - how the
+/// server refuses a statement (isc_arg_gds + code + isc_arg_end); the
+/// client raises it as an SQL error instead of silently proceeding.
+fn respond_error(s: &mut TcpStream, enc: &mut Option<Rc4>, gds: i32) -> std::io::Result<()> {
+    let mut w = W::default();
+    w.int(OP_RESPONSE)
+        .int(0)
+        .int(0)
+        .int(0) // blob id
+        .int(0) // response data length
+        .int(1) // isc_arg_gds
+        .int(gds)
+        .int(0); // isc_arg_end
+    w.send(s, enc)
+}
+
+/// isc_dsql_error - the generic "Dynamic SQL Error" the server answers
+/// for statements it cannot honour rather than answering them wrong.
+const GDS_DSQL_ERROR: i32 = 335544569;
+
 /// Extract the SRP client key A (specific_data chunks reassembled) and
 /// the login from a p_cnct_user_id block.
 fn parse_user_id(uid: &[u8]) -> (String, String) {
@@ -158,6 +179,49 @@ fn describe_one_bigint() -> Vec<u8> {
     item(&mut d, 13, 0); // scale
     item(&mut d, 14, 8); // length
     d.push(8); // describe_end (column)
+    d.push(1); // isc_info_end
+    d
+}
+
+/// The describe buffer for an INSERT: statement type
+/// isc_info_sql_stmt_insert(2), no parameters, no output columns - the
+/// client executes without fetching.
+fn describe_insert() -> Vec<u8> {
+    let mut d = Vec::new();
+    let item = |d: &mut Vec<u8>, code: u8, val: i32| {
+        d.push(code);
+        d.extend_from_slice(&4u16.to_le_bytes());
+        d.extend_from_slice(&val.to_le_bytes());
+    };
+    item(&mut d, 21, 2); // isc_info_sql_stmt_type = insert(2)
+    d.push(5); // isc_info_sql_bind
+    item(&mut d, 7, 0); // 0 params
+    d.push(8); // describe_end
+    d.push(4); // isc_info_sql_select
+    item(&mut d, 7, 0); // 0 output columns
+    d.push(8); // describe_end
+    d.push(1); // isc_info_end
+    d
+}
+
+/// The op_info_sql answer for isc_info_sql_records: the per-verb row
+/// counts of the last executed statement, in the standard cluster form
+/// (code 23, 2-byte total length, nested count items, isc_info_end).
+fn build_records_info(inserted: i32) -> Vec<u8> {
+    let mut inner = Vec::new();
+    let item = |d: &mut Vec<u8>, code: u8, val: i32| {
+        d.push(code);
+        d.extend_from_slice(&4u16.to_le_bytes());
+        d.extend_from_slice(&val.to_le_bytes());
+    };
+    item(&mut inner, 13, 0); // isc_info_req_select_count
+    item(&mut inner, 14, inserted); // isc_info_req_insert_count
+    item(&mut inner, 15, 0); // isc_info_req_update_count
+    item(&mut inner, 16, 0); // isc_info_req_delete_count
+    let mut d = Vec::new();
+    d.push(23); // isc_info_sql_records
+    d.extend_from_slice(&(inner.len() as u16).to_le_bytes());
+    d.extend_from_slice(&inner);
     d.push(1); // isc_info_end
     d
 }
@@ -220,6 +284,8 @@ const FIXED_ANSWER: i64 = 4242;
 struct Database {
     bytes: Vec<u8>,
     page_size: usize,
+    /// where the bytes came from - an INSERT flushes back here
+    path: String,
 }
 
 /// Open the file the client named in op_attach, if it exists and looks
@@ -237,7 +303,7 @@ fn load_database(path: &str) -> Option<Database> {
     if page_size == 0 {
         return None;
     }
-    Some(Database { bytes, page_size })
+    Some(Database { bytes, page_size, path: p.to_string() })
 }
 
 /// How a projected column is carried on the wire (protocol 13+ XDR).
@@ -303,6 +369,14 @@ struct ProjCol {
 /// indexes - `encode_row`, the predicate and the sort apply unchanged.
 enum Plan {
     Scalar(Option<i64>),
+    /// `INSERT INTO <t> [(cols)] VALUES (...)`: the record image is
+    /// built at prepare (nulls flagged, fields at their descriptor
+    /// offsets); op_execute writes it into the file's pages
+    Insert {
+        rel: u16,
+        format_no: u8,
+        image: Vec<u8>,
+    },
     Project {
         rel: u16,
         formats: Vec<(u8, Vec<Descriptor>)>,
@@ -487,6 +561,195 @@ fn build_projcols(
         });
     }
     Some(out)
+}
+
+/// A literal an INSERT accepts.
+enum InsVal {
+    Int(i64),
+    Str(String),
+    Null,
+}
+
+/// Parse `INSERT INTO <t> [(col, ...)] VALUES (lit, ...)` - single row,
+/// literal values only (integers, strings, NULL) - resolve it against
+/// the relation, and build the record image at prepare. None = the
+/// statement is not one the server can honour (the caller answers an
+/// SQL error, never a silent wrong write).
+fn plan_insert(sql: &str, db: &Option<Database>) -> Option<Plan> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "INSERT", 0) != Some(0) {
+        return None;
+    }
+    let into = find_word(&masked, "INTO", "INSERT".len())?;
+    let vals_kw = find_word(&masked, "VALUES", into + "INTO".len())?;
+    // between INTO and VALUES: the table name + optional (column list)
+    let head = s[into + "INTO".len()..vals_kw].trim();
+    let (table, collist) = match head.find('(') {
+        Some(pos) => {
+            let rest = head[pos..].trim();
+            if !rest.ends_with(')') {
+                return None;
+            }
+            let mut cols = Vec::new();
+            for part in rest[1..rest.len() - 1].split(',') {
+                let n = part.trim().trim_matches('"');
+                if !ident_ok(n) {
+                    return None;
+                }
+                cols.push(n.to_string());
+            }
+            if cols.is_empty() {
+                return None;
+            }
+            (head[..pos].trim(), Some(cols))
+        }
+        None => (head, None),
+    };
+    let table = table.trim_matches('"');
+    if !ident_ok(table) {
+        return None;
+    }
+    // after VALUES: exactly one parenthesised literal list
+    let tail = s[vals_kw + "VALUES".len()..].trim();
+    if !tail.starts_with('(') || !tail.ends_with(')') {
+        return None;
+    }
+    let toks = tokenize(&tail[1..tail.len() - 1])?;
+    let mut vals: Vec<InsVal> = Vec::new();
+    for part in split_on(&toks, |t| matches!(t, Tok::Comma)) {
+        vals.push(match part {
+            [Tok::Int(n)] => InsVal::Int(*n),
+            [Tok::Str(v)] => InsVal::Str(v.clone()),
+            [Tok::Null] => InsVal::Null,
+            _ => return None,
+        });
+    }
+
+    let db = db.as_ref()?;
+    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
+    let columns = relation_columns(&db.bytes, db.page_size, table);
+    let formats = relation_formats(&db.bytes, db.page_size, rel);
+    let (format_no, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let targets: Vec<&RelationColumn> = match &collist {
+        Some(names) => {
+            let mut v = Vec::new();
+            for n in names {
+                v.push(columns.iter().find(|c| c.name.eq_ignore_ascii_case(n))?);
+            }
+            v
+        }
+        // no column list = every column, declared order
+        None => columns.iter().collect(),
+    };
+    if targets.len() != vals.len() {
+        return None;
+    }
+    let image = build_insert_image(&targets, &vals, descs, db, rel, *format_no)?;
+    Some(Plan::Insert { rel, format_no: *format_no, image })
+}
+
+/// Build the record image: every field NULL except the provided ones,
+/// values validated against and laid at their descriptor offsets. The
+/// image length is taken from a live record of the same format when the
+/// table has one (the authoritative fmt_length); an empty table falls
+/// back to the aligned end of the last field.
+fn build_insert_image(
+    targets: &[&RelationColumn],
+    vals: &[InsVal],
+    descs: &[Descriptor],
+    db: &Database,
+    rel: u16,
+    format_no: u8,
+) -> Option<Vec<u8>> {
+    let computed = descs
+        .iter()
+        .map(|d| d.offset as usize + d.length as usize)
+        .max()?;
+    let len = sample_image_len(db, rel, format_no).unwrap_or((computed + 3) & !3);
+    if len < computed {
+        return None;
+    }
+    let mut image = vec![0u8; len];
+    // start all-NULL: descriptor index i's flag is bit i of the leading
+    // null-flag bytes (the same bit decode_field reads)
+    for i in 0..descs.len() {
+        image[i / 8] |= 1 << (i % 8);
+    }
+    for (rc, v) in targets.iter().zip(vals) {
+        let fid = rc.field_id as usize;
+        let d = descs.get(fid)?;
+        let at = d.offset as usize;
+        let flen = d.length as usize;
+        match v {
+            InsVal::Null => continue, // flag already set
+            InsVal::Int(n) => {
+                if d.scale != 0 {
+                    return None; // scaled targets need scale conversion
+                }
+                match d.dtype {
+                    dtype::SHORT => {
+                        let x = i16::try_from(*n).ok()?;
+                        image[at..at + 2].copy_from_slice(&x.to_le_bytes());
+                    }
+                    dtype::LONG => {
+                        let x = i32::try_from(*n).ok()?;
+                        image[at..at + 4].copy_from_slice(&x.to_le_bytes());
+                    }
+                    dtype::INT64 => image[at..at + 8].copy_from_slice(&n.to_le_bytes()),
+                    _ => return None,
+                }
+            }
+            InsVal::Str(text) => {
+                let b = text.as_bytes();
+                match d.dtype {
+                    dtype::VARYING => {
+                        if b.len() + 2 > flen {
+                            return None;
+                        }
+                        image[at..at + 2].copy_from_slice(&(b.len() as u16).to_le_bytes());
+                        image[at + 2..at + 2 + b.len()].copy_from_slice(b);
+                    }
+                    dtype::TEXT => {
+                        if b.len() > flen {
+                            return None;
+                        }
+                        image[at..at + b.len()].copy_from_slice(b);
+                        for x in &mut image[at + b.len()..at + flen] {
+                            *x = b' '; // CHAR blank padding
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        image[fid / 8] &= !(1 << (fid % 8)); // provided and not null
+    }
+    Some(image)
+}
+
+/// The unpacked image length of an existing primary record in this
+/// format, if the relation has one.
+fn sample_image_len(db: &Database, rel: u16, format_no: u8) -> Option<usize> {
+    for dp_no in relation_data_pages(&db.bytes, db.page_size, rel) {
+        let start = dp_no as usize * db.page_size;
+        let Some(dp) = db
+            .bytes
+            .get(start..start + db.page_size)
+            .and_then(DataPage::decode)
+        else {
+            continue;
+        };
+        for r in dp.records() {
+            if r.is_primary_record() && r.format == format_no {
+                if let Some(img) = r.image() {
+                    return Some(img.len());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// One side of a FROM clause: a table name and its optional alias.
@@ -1411,6 +1674,7 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Vec<Value> {
 fn describe_for(plan: &Plan) -> Vec<u8> {
     match plan {
         Plan::Scalar(_) => describe_one_bigint(),
+        Plan::Insert { .. } => describe_insert(),
         Plan::Project { cols, .. } => build_describe(cols),
         Plan::Join { cols, .. } => build_describe(cols),
         Plan::Group { cols, .. } => build_describe(cols),
@@ -1425,6 +1689,7 @@ fn describe_for(plan: &Plan) -> Vec<u8> {
 /// then emits them.
 fn emit_rows(w: &mut W, plan: &Plan, db: &Option<Database>) {
     match plan {
+        Plan::Insert { .. } => {} // no cursor: terminator only
         Plan::Scalar(v) => {
             w.int(OP_FETCH_RESPONSE).int(0).int(1);
             match v {
@@ -1860,9 +2125,10 @@ fn parse_order_by(
     }
 }
 
-/// A WHERE/HAVING token.
+/// A WHERE/HAVING/VALUES token.
 enum Tok {
     Ident(String),
+    Comma,
     Agg(AggFn, AggTarget),
     Int(i64),
     Str(String),
@@ -1912,6 +2178,10 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                     i += 1;
                 }
                 out.push(Tok::Str(String::from_utf8_lossy(&val).into_owned()));
+            }
+            b',' => {
+                out.push(Tok::Comma);
+                i += 1;
             }
             b'=' => {
                 out.push(Tok::Cmp(Cmp::Eq));
@@ -2334,7 +2604,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // When it does, queries answer from its pages; when it does not (the
     // client attached to a name with no file behind it), the server falls
     // back to the fixed constant so the pipeline still round-trips.
-    let database: Option<Database> = load_database(&db_path);
+    let mut database: Option<Database> = load_database(&db_path);
     if std::env::var("FC_SRV_TRACE").is_ok() {
         eprintln!(
             "[srv] op_attach ok, handle 1 ({}); database '{}' {}",
@@ -2386,9 +2656,26 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     read_int(&mut s, &mut dec)?; // p_sqlst_flags (FB6/proto 20+)
                 }
                 stmt_sql = String::from_utf8_lossy(&sql).into_owned();
-                plan = plan_query(&stmt_sql, &database);
-                let describe = describe_for(&plan);
-                respond_prepare(&mut s, &mut enc, &describe)?;
+                let up = stmt_sql.trim_start().to_ascii_uppercase();
+                if find_word(&up, "INSERT", 0) == Some(0) {
+                    // DML prepares to a real plan or to an SQL error -
+                    // never to the fixed-answer fallback, which would
+                    // let a client think its write succeeded
+                    match plan_insert(&stmt_sql, &database) {
+                        Some(p) => {
+                            plan = p;
+                            respond_prepare(&mut s, &mut enc, &describe_insert())?;
+                        }
+                        None => {
+                            plan = Plan::Scalar(Some(FIXED_ANSWER));
+                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                        }
+                    }
+                } else {
+                    plan = plan_query(&stmt_sql, &database);
+                    let describe = describe_for(&plan);
+                    respond_prepare(&mut s, &mut enc, &describe)?;
+                }
             }
             x if x == OP_EXECUTE => {
                 read_int(&mut s, &mut dec)?; // stmt
@@ -2408,7 +2695,61 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 if best >= 19 {
                     read_int(&mut s, &mut dec)?; // p_sqldata_inline_blob_size
                 }
-                respond(&mut s, &mut enc, 0)?;
+                if let Plan::Insert { rel, format_no, image } = &plan {
+                    // DML executes here (not at fetch): write the record
+                    // into the page image and flush the whole file back
+                    let result = match database.as_mut() {
+                        Some(db) => fire_crab_ods::insert_record(
+                            &mut db.bytes,
+                            db.page_size,
+                            *rel,
+                            *format_no,
+                            image,
+                        )
+                        .and_then(|out| {
+                            std::fs::write(&db.path, &db.bytes)
+                                .map(|_| out)
+                                .map_err(|e| e.to_string())
+                        }),
+                        None => Err("no database attached".into()),
+                    };
+                    match result {
+                        Ok(out) => {
+                            if std::env::var("FC_SRV_TRACE").is_ok() {
+                                eprintln!(
+                                    "[srv] insert: tx {} page {} slot {}",
+                                    out.tx_id, out.page_no, out.slot
+                                );
+                            }
+                            respond(&mut s, &mut enc, 0)?;
+                        }
+                        Err(e) => {
+                            if std::env::var("FC_SRV_TRACE").is_ok() {
+                                eprintln!("[srv] insert failed: {}", e);
+                            }
+                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                        }
+                    }
+                } else {
+                    respond(&mut s, &mut enc, 0)?;
+                }
+            }
+            x if x == OP_INFO_SQL => {
+                // the client asks for statement info - after DML it wants
+                // isc_info_sql_records (the per-verb row counts)
+                read_int(&mut s, &mut dec)?; // stmt handle
+                read_int(&mut s, &mut dec)?; // incarnation
+                let items = read_wire_bytes(&mut s, &mut dec)?;
+                read_int(&mut s, &mut dec)?; // buffer length
+                let inserted = if matches!(plan, Plan::Insert { .. }) { 1 } else { 0 };
+                let info = if items.contains(&23u8) {
+                    build_records_info(inserted)
+                } else {
+                    vec![1] // isc_info_end
+                };
+                let mut w = W::default();
+                w.int(OP_RESPONSE).int(0).int(0).int(0).bytes(&info).int(0);
+                w.send(&mut s, &mut enc)?;
             }
             x if x == OP_FETCH => {
                 read_int(&mut s, &mut dec)?; // stmt

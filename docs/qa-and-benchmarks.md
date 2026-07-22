@@ -596,6 +596,47 @@ zero decimal digit (JS numbers drop trailing zeros), and TIME data
 sticks to whole milliseconds (JS `Date` resolution; the wire carries
 1/10000 s).
 
+### The nineteenth differential — INSERT, validated by the engine itself
+
+`qa/serve-real-insert.sh` crosses the line from reading pages to
+**writing** them. fire-crab, as a server, executes `INSERT INTO <t>
+[(cols)] VALUES (...)` (single row, literal values) by doing what the
+engine's `VIO_store`/`DPM_store`/`TRA_commit` chain does for the simplest
+case: allocate a transaction id from `hdr_next_transaction` and advance
+the header, mark it committed in the transaction inventory (the same two
+bits `TipChain` reads), build the record image at prepare (null flags +
+fields at their descriptor offsets) and lay it `rhd_not_packed` into a
+data-page slot - offsets growing down from the page end, directory
+entries up, exactly dpm.epp's arithmetic in reverse.
+
+The differential oracle is **the real engine**, in three escalating
+steps after node-firebird has written through fire-crab and read its own
+writes back:
+
+1. the server is stopped and the C++ engine opens the very same file:
+   `isql` SELECTs the inserted rows (values, NULLs, the new COUNT) -
+   the engine's own record walk accepts what fire-crab wrote;
+2. `gfix -v -full` walks every page and record and must find **nothing
+   wrong** - and this check has teeth: deliberately corrupting one slot
+   directory entry makes the engine throw a consistency check
+   immediately;
+3. `gbak` backs the file up, which decompresses and re-reads every
+   record through yet another engine path.
+
+Design honesty, in the module docs and here: this is an *offline*
+writer - it mutates the file image and flushes it whole. No careful-write
+ordering, no crash safety, no page allocation (an insert needs an
+existing data page with room), no index maintenance yet (the scratch
+tables have none), 32-bit transaction ids only. The image length is
+taken from a live record of the same format when one exists - the
+authoritative `fmt_length` - rather than recomputed and possibly wrong.
+
+The refusal path is asserted too: an INSERT the server cannot honour
+(unknown column, type mismatch, expressions, subselects) answers a real
+SQL error over the wire - `plan_insert` either produces a plan or the
+prepare fails; the fixed-answer fallback is never used for DML, where
+"fallback" would mean a client believing its write succeeded.
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -608,13 +649,17 @@ in place, and real queries - `SELECT COUNT(*)`, column projections
 dispatch into the converted storage engine and return real results in
 native wire types (integers at their own width, scaled numerics,
 float/double, date/time/timestamp, boolean), matching isql over the wire.
-What stands between here and running the suite is remaining *breadth* of
-the SQL engine - DML, outer joins, blob/INT128/DECFLOAT columns,
-system-table projections. Until that surface is wide enough, fire-crab
-does **not** claim any firebird-qa coverage - but the milestone is no
-longer distant: the protocol server the suite talks to accepts real
-clients and answers real typed, filtered, joined, grouped, sorted and
-aggregated queries from real pages today.
+DML has begun: `INSERT` writes real records into the pages, and the
+engine itself validates them (isql reads them, `gfix -v` passes, `gbak`
+backs them up). What stands between here and running the suite is
+remaining *breadth* of the SQL engine - UPDATE/DELETE, index maintenance
+and page allocation on the write path, outer joins, blob/INT128/DECFLOAT
+columns, system-table projections. Until that surface is wide enough,
+fire-crab does **not** claim any firebird-qa coverage - but the milestone
+is no longer distant: the protocol server the suite talks to accepts real
+clients, answers real typed, filtered, joined, grouped, sorted and
+aggregated queries from real pages, and accepts writes the real engine
+verifies.
 
 ## Benchmarks
 
@@ -703,6 +748,13 @@ NODE_PATH="$PWD/node_modules" \\
 NODE_PATH="$PWD/node_modules" \\
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
     sh /path/to/fire-crab/qa/serve-real-types.sh /tmp/fbhandson/wiretypes_clean.fdb 3050
+
+# server WRITES: INSERT through fire-crab, then the REAL ENGINE reads the
+# rows back, gfix -v -full validates the file, gbak backs it up
+NODE_PATH="$PWD/node_modules" \\
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \\
+    sh /path/to/fire-crab/qa/serve-real-insert.sh /tmp/fbhandson/join_clean.fdb 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
