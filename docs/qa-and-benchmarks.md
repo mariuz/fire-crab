@@ -1243,6 +1243,40 @@ op_create, the DB_ID/ATTACHMENT_ID/ODS items, distinct attachment ids,
 and the MON$ empty-relation probe), and the run is reproducible by
 hand from the recipe in the project notes.
 
+### The thirty-sixth differential — select-list expressions, and isql's one-shot path
+
+`qa/serve-real-selectexpr.sh` widens the SELECT list from bare columns
+and aggregates to scalar expressions: arithmetic (`+`, `-`, `*`, unary
+minus, parentheses) over integer columns and literals, and constant
+literals - `SELECT A + B, A * 2, (A + B) * 2, -A, 1 + 1 FROM t`. Each
+projected column gains an optional expression evaluated per decoded
+row; NULL propagates through arithmetic exactly as SQL's three-valued
+rules require. Because `parse_projection` runs before the relation is
+known, expressions are parsed with column names into a raw form by a
+small recursive-descent arithmetic parser (respecting `*`-over-`+`
+precedence and parentheses), then resolved to field ids and
+type-checked at plan time - integer arithmetic types as BIGINT, a
+string literal as VARCHAR; a text column in arithmetic does not
+type-check and falls back.
+
+The differential compares more than values: an un-aliased expression
+column takes the engine's own operation name - `ADD`, `SUBTRACT`,
+`MULTIPLY`, blank for unary minus, `CONSTANT` for a bare literal -
+which the gate discovered by running the queries through isql (its
+column header for `A + B` really is `ADD`). So each of the fourteen
+checks runs the identical select through fire-crab and isql on the
+same file and compares the column header and the values together.
+
+The increment also adds `op_exec_immediate`, the prepare-and-execute
+in one round-trip that isql uses for `SET` and one-shot DDL/DML
+statements it does not fetch from - it shares op_prepare's wire layout,
+executes zero-parameter DDL/DML through the existing planners, and
+acknowledges the rest so the client does not desync. This stopped isql
+`SHOW VERSION` from dropping the connection; full `SHOW` support,
+though, runs through the legacy BLR request API (`op_compile`) - a
+request-execution engine that is a separate subsystem from DSQL, and a
+named next piece rather than part of this increment.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -1488,6 +1522,14 @@ FCPY=/path/to/venv/bin/python ISQL=/opt/firebird/bin/isql \
 FCPY=/path/to/venv/bin/python ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix FCWIRE=/path/to/fire-crab/target/release/fcwire \
     bash /path/to/fire-crab/qa/serve-real-services.sh 3050
+
+# SELECT-LIST EXPRESSIONS: arithmetic (+, -, *, unary -, parens) over integer
+# columns and literals, each query run identically through fire-crab and isql,
+# values and column names compared. Builds its own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix \
+    bash /path/to/fire-crab/qa/serve-real-selectexpr.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
