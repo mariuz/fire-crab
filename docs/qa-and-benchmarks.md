@@ -637,6 +637,45 @@ SQL error over the wire - `plan_insert` either produces a plan or the
 prepare fails; the fixed-answer fallback is never used for DML, where
 "fallback" would mean a client believing its write succeeded.
 
+### The twentieth differential — UPDATE/DELETE version chains, collected by the engine's own GC
+
+`qa/serve-real-update.sh` converts the MVCC *write* path: what
+`VIO_modify`/`VIO_erase` + `DPM_update` do to the pages. fire-crab
+executes `UPDATE <t> SET col = lit [, ...] [WHERE ...]` and `DELETE FROM
+<t> [WHERE ...]` (the WHERE is the same grammar SELECT filters with) by
+copying the current record version to a fresh slot flagged `rhd_chain`
+and rewriting the primary slot under a freshly committed transaction -
+the patched image for an update, a header-only `rhd_deleted` stub for a
+delete - with `rhd_b_page`/`rhd_b_line` pointing at the copy. Back
+versions are full images, never deltas (legal on disk: the engine
+itself writes full back versions whenever a delta would not shrink),
+repeated updates extend the chain, and every statement executes against
+a **working copy** of the file image so a failure partway leaves no
+half-written chains behind.
+
+The oracle is the engine three ways, each sharper than the last:
+
+1. **structure**: with the chains still untouched (measured *before*
+   any engine attach could cooperatively collect them), `gfix -v -full`
+   walks every chain fire-crab wrote and finds nothing wrong - and the
+   version arithmetic is asserted exactly: 30 rows and 9 statements
+   leave 23 live primaries + 7 deleted stubs + 16 back versions = **46
+   versions**;
+2. **semantics**: the same 9 statements are applied by the C++ engine
+   to a second copy of the same clean database - `isql` then prints an
+   **identical final table** from the fire-crab-written file and the
+   engine-written file;
+3. **garbage collection**: `gfix -sweep` - the engine's own GC - is run
+   on the fire-crab-written file and must *consume the chains fire-crab
+   wrote*: the version count drops to exactly the 23 live rows,
+   validation stays clean, and the data survives unchanged.
+
+The refusal path again: an UPDATE/DELETE the server cannot honour
+(unknown column or table, type mismatch, a matching record in an older
+format) raises a real SQL error and writes nothing - and
+`isc_info_sql_records` now reports the true per-verb counts of the last
+statement instead of a static guess.
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -649,10 +688,12 @@ in place, and real queries - `SELECT COUNT(*)`, column projections
 dispatch into the converted storage engine and return real results in
 native wire types (integers at their own width, scaled numerics,
 float/double, date/time/timestamp, boolean), matching isql over the wire.
-DML has begun: `INSERT` writes real records into the pages, and the
-engine itself validates them (isql reads them, `gfix -v` passes, `gbak`
-backs them up). What stands between here and running the suite is
-remaining *breadth* of the SQL engine - UPDATE/DELETE, index maintenance
+DML now covers all three verbs: `INSERT` writes real records into the
+pages, `UPDATE`/`DELETE` write real version chains over them, and the
+engine itself validates all of it (isql reads the same table the engine
+would have produced, `gfix -v` passes, `gfix -sweep` collects the
+chains, `gbak` backs the file up). What stands between here and running
+the suite is remaining *breadth* of the SQL engine - index maintenance
 and page allocation on the write path, outer joins, blob/INT128/DECFLOAT
 columns, system-table projections. Until that surface is wide enough,
 fire-crab does **not** claim any firebird-qa coverage - but the milestone
@@ -755,6 +796,15 @@ NODE_PATH="$PWD/node_modules" \\
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \\
     sh /path/to/fire-crab/qa/serve-real-insert.sh /tmp/fbhandson/join_clean.fdb 3050
+
+# server writes VERSION CHAINS: UPDATE/DELETE through fire-crab; gfix -v
+# accepts the chains, the engine applying the SAME statements produces an
+# identical table, and gfix -sweep collects the chains (46 -> 23 versions).
+# Builds its own scratch database.
+NODE_PATH="$PWD/node_modules" \\
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \\
+    bash /path/to/fire-crab/qa/serve-real-update.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on

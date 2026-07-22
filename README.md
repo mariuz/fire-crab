@@ -53,6 +53,7 @@ the converter what the C++ is *doing* before they read a line of it.
 | INNER JOIN | `fire-crab-wire::server` | **the server joins two relations** - `FROM t1 [a] [INNER] JOIN t2 [b] ON <col> = <col> [AND ...]` with table-qualified or unambiguous bare columns; NULL and partnerless keys drop out, text keys compare pad-insensitively (CHAR vs VARCHAR), WHERE/ORDER BY see the combined row, `SELECT *` is left columns then right, and a lone `COUNT(*)` counts the joined rows; matches isql value-for-value |
 | Native wire types | `fire-crab-wire::server` | **columns travel in the engine's own wire form** - SMALLINT/INTEGER/BIGINT at their own SQL types, NUMERIC/DECIMAL as raw scaled integers with the scale in the describe (the client divides), FLOAT/DOUBLE as IEEE bytes, DATE/TIME/TIMESTAMP as raw day/1e-4-s units, BOOLEAN as an XDR slot; ORDER BY/GROUP BY on them compare numerically; node-firebird's typed decode (numbers, `Date`s, booleans) matches isql |
 | INSERT (first DML) | `fire-crab-wire::server` + `fire-crab-ods::dml` | **the server writes real records into the pages** - transaction allocated from the header and committed in the TIP, image laid `rhd_not_packed` into a data-page slot; **the real engine is the oracle**: isql reads the rows back, `gfix -v -full` finds nothing wrong, `gbak` backs the file up; unsupported INSERTs answer SQL errors, never silent no-ops |
+| UPDATE / DELETE (version chains) | `fire-crab-wire::server` + `fire-crab-ods::dml` | **the server writes MVCC version chains** - UPDATE copies the old version to a fresh slot flagged `rhd_chain` and rewrites the primary with a back pointer to it; DELETE leaves a header-only `rhd_deleted` stub over the chain (`VIO_modify`/`VIO_erase` + `DPM_update` on the file image); **three engine oracles**: `gfix -v -full` accepts the chains, the same statements applied by the C++ engine to a second copy produce an *identical* table, and `gfix -sweep` - the engine's own GC - collects fire-crab's chains with the version arithmetic exact (46 → 23) and the data intact |
 | Everything else | — | see [docs/subsystem-map.md](docs/subsystem-map.md) |
 
 **On the firebird-qa milestone, precisely.** firebird-qa drives a *server*,
@@ -154,6 +155,24 @@ a constant:
   and an INSERT the server cannot honour raises a real SQL error over
   the wire - for DML, a silent fallback would mean a client believing
   its write succeeded.
+- **UPDATE/DELETE write version chains.** `UPDATE <t> SET col = lit
+  [, ...] [WHERE ...]` and `DELETE FROM <t> [WHERE ...]` (the WHERE is
+  the same grammar SELECT filters with) do what `VIO_modify`/`VIO_erase`
+  do on the page image: the current version is *copied* to a fresh slot
+  and flagged `rhd_chain`, then the primary slot is rewritten under a
+  freshly committed transaction - the new image for an update, a
+  header-only `rhd_deleted` stub for a delete - with
+  `rhd_b_page`/`rhd_b_line` pointing at the copy. Back versions are full
+  images (legal - the engine writes full back versions itself when a
+  delta would not shrink), repeated updates extend the chain, and each
+  statement executes against a working copy of the file so a failure
+  leaves no half-written chains. The oracle is the engine three ways:
+  `gfix -v -full` accepts the chains; the same statements applied by the
+  C++ engine to a second copy of the same clean database produce an
+  identical final table; and `gfix -sweep` - the engine's own garbage
+  collector - consumes the chains fire-crab wrote, the version count
+  dropping exactly as arithmetic predicts (30 rows, 9 statements → 46
+  versions, sweep → 23) with the data unchanged.
 
 The subtlety that had to be right: on a table mixing column widths the engine
 lays fields out physically by alignment, so `RDB$FIELD_ID` (the record-format
@@ -168,11 +187,12 @@ with integers, scaled numerics, float/double, date/time/timestamp, boolean
 and text all travelling in native wire form; blob, `INT128`, `DECFLOAT` and
 TZ columns are still rendered as text, and other shapes fall back to the
 fixed value.
-Widening further (UPDATE/DELETE, write-path page allocation and index
-maintenance, outer joins, the remaining exotic column types, system-table
-projections) is the work that continues - but the fixed answer is no longer
-fixed, the server writes records the real engine validates, and the protocol
-server it all runs on is proven against a genuine client.
+Widening further (write-path page allocation and index maintenance,
+scaled/temporal SET values, outer joins, the remaining exotic column types,
+system-table projections) is the work that continues - but the fixed answer
+is no longer fixed, the server writes records and version chains the real
+engine validates and garbage-collects, and the protocol server it all runs
+on is proven against a genuine client.
 
 Current QA state: `fcstat header` output is **byte-identical on the compared
 fields with `gstat -h` across 123 real Firebird 6 databases** (every scratch
