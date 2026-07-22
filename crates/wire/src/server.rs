@@ -753,6 +753,26 @@ enum Plan {
         having: Option<Predicate>,
         order_by: Vec<(usize, bool)>,
     },
+    /// `SET GENERATOR <name> TO <n>` or `ALTER SEQUENCE|GENERATOR <name>
+    /// RESTART WITH <n>`: write a new value into the generator page at
+    /// op_execute. `stmt_type` is the statement's info type (set_generator
+    /// = 13, or ddl = 5 for the ALTER form) so the describe matches the
+    /// engine and the client does not try to fetch a cursor.
+    SetGenerator {
+        name: String,
+        mode: GenWrite,
+        stmt_type: i32,
+    },
+}
+
+/// How a generator write sets its value: `Absolute(n)` stores `n` (`SET
+/// GENERATOR ... TO n`); `Restart(n)` stores `n - increment` (`ALTER
+/// SEQUENCE ... RESTART WITH n`), so the next `GEN_ID`/`NEXT VALUE FOR`
+/// yields `n` - the increment is read from the catalog at execute.
+#[derive(Clone, Copy)]
+enum GenWrite {
+    Absolute(i64),
+    Restart(i64),
 }
 
 /// One UPDATE SET value: encoded at prepare (literal - `None` inside =
@@ -1418,6 +1438,71 @@ fn plan_drop_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         return None;
     }
     Some((Plan::DropTable { name: name.to_ascii_uppercase() }, Vec::new()))
+}
+
+/// Strip a SQL identifier's optional double quotes. A quoted identifier
+/// keeps its case (and `""` is an escaped quote); an unquoted one is
+/// returned as written (the catalog stores it upper-cased, and generator
+/// lookup matches case-insensitively).
+fn unquote_ident(t: &str) -> Option<String> {
+    let t = t.trim();
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+        Some(t[1..t.len() - 1].replace("\"\"", "\""))
+    } else if !t.is_empty() && !t.contains('"') {
+        Some(t.to_string())
+    } else {
+        None
+    }
+}
+
+/// Parse `SET GENERATOR <name> TO <n>` - set a generator to an absolute
+/// value. The value may be signed. None for any other statement.
+fn plan_set_generator(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';');
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    if toks.len() != 5
+        || !toks[0].eq_ignore_ascii_case("SET")
+        || !toks[1].eq_ignore_ascii_case("GENERATOR")
+        || !toks[3].eq_ignore_ascii_case("TO")
+    {
+        return None;
+    }
+    let name = unquote_ident(toks[2])?;
+    let value: i64 = toks[4].parse().ok()?;
+    Some((
+        Plan::SetGenerator {
+            name,
+            mode: GenWrite::Absolute(value),
+            stmt_type: 13, // isc_info_sql_stmt_set_generator
+        },
+        Vec::new(),
+    ))
+}
+
+/// Parse `ALTER SEQUENCE|GENERATOR <name> RESTART WITH <n>` - restart a
+/// generator so the next value is `n` (the stored value becomes
+/// `n - increment`, computed at execute). None for any other ALTER.
+fn plan_alter_sequence(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';');
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    if toks.len() != 6
+        || !toks[0].eq_ignore_ascii_case("ALTER")
+        || !(toks[1].eq_ignore_ascii_case("SEQUENCE") || toks[1].eq_ignore_ascii_case("GENERATOR"))
+        || !toks[3].eq_ignore_ascii_case("RESTART")
+        || !toks[4].eq_ignore_ascii_case("WITH")
+    {
+        return None;
+    }
+    let name = unquote_ident(toks[2])?;
+    let value: i64 = toks[5].parse().ok()?;
+    Some((
+        Plan::SetGenerator {
+            name,
+            mode: GenWrite::Restart(value),
+            stmt_type: 5, // isc_info_sql_stmt_ddl
+        },
+        Vec::new(),
+    ))
 }
 
 /// Parse `INSERT INTO <t> [(col, ...)] VALUES (val, ...)` - single row,
@@ -2241,6 +2326,18 @@ fn execute_dml(
                 .collect();
             let out = fire_crab_ods::delete_records(&mut work, db.page_size, *rel, &targets)?;
             (0, 0, out.affected as i32)
+        }
+        Plan::SetGenerator { name, mode, .. } => {
+            // the generator's id locates its slot; its increment turns a
+            // RESTART WITH n into the stored value n - increment (so the
+            // next GEN_ID yields n) - both read from RDB$GENERATORS
+            let (id, incr) = generator_info(db, name).ok_or("no such generator")?;
+            let value = match mode {
+                GenWrite::Absolute(n) => *n,
+                GenWrite::Restart(n) => n - incr,
+            };
+            write_generator_value(&mut work, db.page_size, id, value)?;
+            (0, 0, 0)
         }
         _ => return Err("not a DML plan".into()),
     };
@@ -3489,6 +3586,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         Plan::Join { cols, .. } => build_describe(cols, params),
         Plan::Group { cols, .. } => build_describe(cols, params),
         Plan::VirtualEmpty { .. } => build_describe(&output_cols_of(plan), params),
+        Plan::SetGenerator { stmt_type, .. } => describe_dml(*stmt_type, params),
     }
 }
 
@@ -3504,6 +3602,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         Plan::Update { .. } => 3,
         Plan::Delete { .. } => 4,
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. } => 5,
+        Plan::SetGenerator { stmt_type, .. } => *stmt_type,
     }
 }
 
@@ -3733,9 +3832,10 @@ fn emit_rows_inner(
     args: &[WireParam],
 ) -> Result<(), String> {
     match plan {
-        // DML and DDL have no cursor: terminator only
+        // DML, DDL and generator writes have no cursor: terminator only
         Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
-        | Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. } => {}
+        | Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
+        | Plan::SetGenerator { .. } => {}
         Plan::Scalar(v) => {
             w.int(OP_FETCH_RESPONSE).int(0).int(1);
             match v {
@@ -5563,31 +5663,43 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 let dml_kw = ["INSERT", "UPDATE", "DELETE"]
                     .into_iter()
                     .any(|k| find_word(&up, k, 0) == Some(0));
-                if ddl_kw || dml_kw {
-                    let planned = plan_create_table(&text)
-                        .or_else(|| plan_create_index(&text))
-                        .or_else(|| plan_drop_table(&text))
-                        .or_else(|| plan_insert(&text, &database))
-                        .or_else(|| plan_update(&text, &database))
-                        .or_else(|| plan_delete(&text, &database));
-                    match planned {
-                        // execute only zero-parameter statements here
-                        // (op_exec_immediate carries no message)
-                        Some((p, ps)) if ps.is_empty() => {
-                            match execute_dml(&p, &mut database, &[]) {
-                                Ok(counts) => {
-                                    last_dml = counts;
-                                    respond(&mut s, &mut enc, TX_HANDLE)?;
-                                }
-                                Err(_) => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
-                            }
-                        }
-                        _ => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
+                // SET GENERATOR / ALTER SEQUENCE RESTART are generator
+                // writes; the ALTER form also begins with a DDL verb.
+                let planned = plan_set_generator(&text).or_else(|| {
+                    if ddl_kw {
+                        plan_create_table(&text)
+                            .or_else(|| plan_create_index(&text))
+                            .or_else(|| plan_drop_table(&text))
+                            .or_else(|| plan_alter_sequence(&text))
+                    } else if dml_kw {
+                        plan_insert(&text, &database)
+                            .or_else(|| plan_update(&text, &database))
+                            .or_else(|| plan_delete(&text, &database))
+                    } else {
+                        None
                     }
-                } else {
-                    // SET / other non-row statements: acknowledge so the
-                    // client (isql) continues rather than desyncing
-                    respond(&mut s, &mut enc, TX_HANDLE)?;
+                });
+                match planned {
+                    // execute only zero-parameter statements here
+                    // (op_exec_immediate carries no message)
+                    Some((p, ps)) if ps.is_empty() => {
+                        match execute_dml(&p, &mut database, &[]) {
+                            Ok(counts) => {
+                                last_dml = counts;
+                                respond(&mut s, &mut enc, TX_HANDLE)?;
+                            }
+                            Err(_) => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
+                        }
+                    }
+                    Some(_) => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
+                    None if ddl_kw || dml_kw => {
+                        respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
+                    }
+                    None => {
+                        // SET / other non-row statements: acknowledge so the
+                        // client (isql) continues rather than desyncing
+                        respond(&mut s, &mut enc, TX_HANDLE)?;
+                    }
                 }
             }
             x if x == OP_EXEC_IMMEDIATE2 => {
@@ -5677,13 +5789,21 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 let dml_kw = ["INSERT", "UPDATE", "DELETE"]
                     .into_iter()
                     .find(|k| find_word(&up, k, 0) == Some(0));
-                if ddl_kw.is_some() {
+                if let Some((p, ps)) = plan_set_generator(&stmt_sql) {
+                    // SET GENERATOR <name> TO <n> - a generator write, not
+                    // caught by the DDL/DML verb list (it begins with SET)
+                    let describe = answer_prepare(&prep_items, &p, &ps);
+                    plan = p;
+                    stmt_params = ps;
+                    respond_prepare(&mut s, &mut enc, &describe)?;
+                } else if ddl_kw.is_some() {
                     // DDL prepares to a real plan or to an SQL error -
                     // a client must never think its DDL succeeded when
                     // the verb is one this server does not implement
                     let planned = plan_create_table(&stmt_sql)
                         .or_else(|| plan_create_index(&stmt_sql))
-                        .or_else(|| plan_drop_table(&stmt_sql));
+                        .or_else(|| plan_drop_table(&stmt_sql))
+                        .or_else(|| plan_alter_sequence(&stmt_sql));
                     match planned {
                         Some((p, ps)) => {
                             let describe = answer_prepare(&prep_items, &p, &ps);
@@ -5782,6 +5902,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::CreateTable { .. }
                         | Plan::CreateIndex { .. }
                         | Plan::DropTable { .. }
+                        | Plan::SetGenerator { .. }
                 ) {
                     // DML and DDL execute here (not at fetch): write the
                     // new versions (or the new catalog) into a copy of
@@ -6812,10 +6933,12 @@ fn sleuth_match(value: &str, pattern: &str) -> bool {
     value == pattern
 }
 
-/// Resolve a generator's numeric id from `RDB$GENERATORS` by name.
+/// Resolve a generator's id and increment from `RDB$GENERATORS` by name.
 /// `RDB$GENERATOR_ID` is the index into the generator vector on the
-/// generator pages. None if the generator does not exist.
-fn generator_id(db: &Database, name: &str) -> Option<i64> {
+/// generator pages; `RDB$GENERATOR_INCREMENT` is the step a
+/// `RESTART WITH n` subtracts to store `n - increment`. None if the
+/// generator does not exist.
+fn generator_info(db: &Database, name: &str) -> Option<(i64, i64)> {
     let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, "RDB$GENERATORS")?;
     let formats = select_formats(db, "RDB$GENERATORS", rel);
     let cols = relation_columns(&db.bytes, db.page_size, "RDB$GENERATORS");
@@ -6826,6 +6949,7 @@ fn generator_id(db: &Database, name: &str) -> Option<i64> {
     };
     let name_fid = field("RDB$GENERATOR_NAME")?;
     let id_fid = field("RDB$GENERATOR_ID")?;
+    let incr_fid = field("RDB$GENERATOR_INCREMENT")?;
     let want = name.trim();
     let mut found = None;
     for_each_record(db, rel, &formats, |row| {
@@ -6834,13 +6958,69 @@ fn generator_id(db: &Database, name: &str) -> Option<i64> {
         }
         if let Some(Value::Text(n)) = row.get(name_fid) {
             if n.trim_end_matches(' ').eq_ignore_ascii_case(want) {
-                if let Some(Value::Int(v)) = row.get(id_fid) {
-                    found = Some(*v);
+                if let Some(Value::Int(id)) = row.get(id_fid) {
+                    let incr = match row.get(incr_fid) {
+                        Some(Value::Int(v)) => *v,
+                        _ => 1, // a plain generator has no explicit increment
+                    };
+                    found = Some((*id, incr));
                 }
             }
         }
     });
     found
+}
+
+/// Resolve a generator's numeric id (its slot in the generator vector).
+fn generator_id(db: &Database, name: &str) -> Option<i64> {
+    generator_info(db, name).map(|(id, _)| id)
+}
+
+/// Locate a generator's slot on its generator page and return the byte
+/// offset of its `SINT64` value: slot `id % gensPerPage` (8 bytes each,
+/// after the 24-byte page header) on the `pag_ids` page whose
+/// `gpg_sequence` is `id / gensPerPage`. None if that page has not been
+/// allocated (a generator whose value was never written).
+fn generator_slot_offset(bytes: &[u8], page_size: usize, id: i64) -> Option<usize> {
+    if id < 0 {
+        return None;
+    }
+    let id = id as usize;
+    let gens_per_page = (page_size - 24) / 8;
+    if gens_per_page == 0 {
+        return None;
+    }
+    let sequence = (id / gens_per_page) as u32;
+    let offset = id % gens_per_page;
+    let npages = bytes.len() / page_size;
+    for pno in 0..npages {
+        let pstart = pno * page_size;
+        let page = &bytes[pstart..pstart + page_size];
+        if page[0] != fire_crab_ods::PageType::Generators as u8 {
+            continue;
+        }
+        let seq = u32::from_le_bytes([page[16], page[17], page[18], page[19]]);
+        if seq == sequence {
+            return Some(pstart + 24 + offset * 8);
+        }
+    }
+    None
+}
+
+/// Write a generator's value into its slot on the generator page (a
+/// native little-endian `SINT64`, the way the engine dereferences it).
+/// Errs if the generator page has not been allocated - fire-crab writes
+/// to existing generators, it does not grow the generator vector.
+fn write_generator_value(
+    bytes: &mut [u8],
+    page_size: usize,
+    id: i64,
+    value: i64,
+) -> Result<(), String> {
+    let at = generator_slot_offset(bytes, page_size, id)
+        .ok_or("generator page not allocated")?;
+    bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    Ok(())
 }
 
 /// blr_gen_id / `GEN_ID(name, 0)` reads a generator's current value. The
@@ -6855,31 +7035,15 @@ fn generator_id(db: &Database, name: &str) -> Option<i64> {
 /// (the engine's zero-initialised slot); an unknown name reads NULL.
 fn read_generator_value(db: &Database, name: &str) -> Option<i64> {
     let id = generator_id(db, name)?;
-    if id < 0 {
-        return Some(0);
-    }
-    let id = id as usize;
-    let gens_per_page = (db.page_size - 24) / 8;
-    if gens_per_page == 0 {
-        return None;
-    }
-    let sequence = (id / gens_per_page) as u32;
-    let offset = id % gens_per_page;
-    for page in db.bytes.chunks_exact(db.page_size) {
-        if page[0] != fire_crab_ods::PageType::Generators as u8 {
-            continue;
+    match generator_slot_offset(&db.bytes, db.page_size, id) {
+        Some(at) => {
+            let raw = db.bytes.get(at..at + 8)?;
+            Some(i64::from_le_bytes(raw.try_into().ok()?))
         }
-        let seq = u32::from_le_bytes([page[16], page[17], page[18], page[19]]);
-        if seq != sequence {
-            continue;
-        }
-        let base = 24 + offset * 8;
-        let raw = page.get(base..base + 8)?;
-        return Some(i64::from_le_bytes(raw.try_into().ok()?));
+        // the generator exists but its page has not been allocated yet -
+        // the engine would return 0 for such a never-used generator
+        None => Some(0),
     }
-    // the generator exists but its page has not been allocated yet - the
-    // engine would return 0 for such a never-used generator
-    Some(0)
 }
 
 /// Encode one output message field by field, per xdr_datum
@@ -8215,5 +8379,59 @@ mod tests {
             parse_gen_id_query("GEN_ID(SEQ_A, 0) + 1", "RDB$DATABASE"),
             None
         );
+    }
+
+    #[test]
+    fn plan_set_generator_parses_the_absolute_set() {
+        match plan_set_generator("SET GENERATOR GEN_C TO 4242") {
+            Some((Plan::SetGenerator { name, mode, stmt_type }, ps)) => {
+                assert_eq!(name, "GEN_C");
+                assert!(matches!(mode, GenWrite::Absolute(4242)));
+                assert_eq!(stmt_type, 13);
+                assert!(ps.is_empty());
+            }
+            other => panic!("expected SetGenerator, got {:?}", other.is_some()),
+        }
+        // negative value, trailing semicolon, lowercase keywords
+        match plan_set_generator("set generator gen_c to -9;") {
+            Some((Plan::SetGenerator { name, mode, .. }, _)) => {
+                assert_eq!(name, "gen_c");
+                assert!(matches!(mode, GenWrite::Absolute(-9)));
+            }
+            _ => panic!("expected SetGenerator"),
+        }
+        // not a SET GENERATOR
+        assert!(plan_set_generator("SET AUTODDL ON").is_none());
+        assert!(plan_set_generator("SELECT 1 FROM RDB$DATABASE").is_none());
+        assert!(plan_set_generator("SET GENERATOR GEN_C TO").is_none());
+        assert!(plan_set_generator("SET GENERATOR GEN_C TO X").is_none());
+    }
+
+    #[test]
+    fn plan_alter_sequence_parses_restart_with() {
+        match plan_alter_sequence("ALTER SEQUENCE SEQ_A RESTART WITH 7") {
+            Some((Plan::SetGenerator { name, mode, stmt_type }, _)) => {
+                assert_eq!(name, "SEQ_A");
+                assert!(matches!(mode, GenWrite::Restart(7)));
+                assert_eq!(stmt_type, 5);
+            }
+            _ => panic!("expected SetGenerator"),
+        }
+        // GENERATOR spelling also accepted
+        assert!(matches!(
+            plan_alter_sequence("ALTER GENERATOR G RESTART WITH 100"),
+            Some((Plan::SetGenerator { mode: GenWrite::Restart(100), .. }, _))
+        ));
+        // other ALTER forms are not generator restarts
+        assert!(plan_alter_sequence("ALTER TABLE T ADD C INT").is_none());
+        assert!(plan_alter_sequence("ALTER SEQUENCE SEQ_A RESTART").is_none());
+    }
+
+    #[test]
+    fn unquote_ident_handles_quotes() {
+        assert_eq!(unquote_ident("GEN_C").as_deref(), Some("GEN_C"));
+        assert_eq!(unquote_ident("\"MyGen\"").as_deref(), Some("MyGen"));
+        assert_eq!(unquote_ident("\"a\"\"b\"").as_deref(), Some("a\"b"));
+        assert_eq!(unquote_ident(""), None);
     }
 }
