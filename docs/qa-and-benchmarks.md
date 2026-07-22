@@ -1145,6 +1145,46 @@ are the concrete, named next milestones. What this increment
 establishes is that the statement-level protocol the suite's tests
 actually run their SQL through works with the real driver.
 
+### The thirty-fourth differential — the Services API and op_create, the QA plugin's front door
+
+`qa/serve-real-services.sh` converts the two wire operations the
+firebird-qa pytest plugin needs before it can talk to fire-crab at
+all - the operations the last increment's blocker analysis named.
+
+The plugin's `pytest_configure` opens a Services connection
+(`connect_server`) and reads the server version, home and lock
+directories, security database and architecture. That is
+`op_service_attach` followed by `op_service_info` - a separate wire
+path from a database attach, sharing only the connect/auth prefix. The
+response byte format was captured from the real Firebird server (each
+string item is `[tag][u16 LE length][bytes]`, the cluster ending in
+`isc_info_end`; the driver's own version parser even misreads the
+2-byte length as a 1-byte pascal length and survives on the `V`/`T`
+split, so the bytes are mirrored exactly). The python driver's
+`connect_server` now reads all five items from fire-crab.
+
+`create_database` is `op_create`. fire-crab does not synthesise a valid
+ODS from nothing - that is a large separate conversion, an on-disk
+format with a header page, PIP, TIP and the entire bootstrapped system
+catalog. Instead it MATERIALISES an empty database with the engine
+(an `isql CREATE DATABASE`), then serves and mutates it - the same
+real-file basis every gate has used since increment 21. The driver
+then runs `CREATE TABLE` with a PRIMARY KEY, `INSERT`s, and a duplicate
+INSERT the key refuses, all through fire-crab against the fresh file;
+the engine opens it and reads exactly those rows, `gfix -v -full`
+clean. op_create is honestly a *composition* - the engine lays the
+empty ODS, fire-crab does everything after - and the gate says so.
+
+This is the plugin's front door, not the whole house. Past these two
+operations the bootstrap attaches to the `employee` sample database
+and runs an architecture-detection query against `MON$ATTACHMENTS`,
+reading `con.info.name`/`.id` and the ODS version along the way -
+monitoring-table emulation, more `op_info_database` items, and the
+sample database itself, which are the next frontier. What this
+increment establishes is that the session-bootstrap wire operations -
+the ones that used to make `pytest_configure` raise before a single
+test was collected - now work with the real driver.
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -1382,6 +1422,14 @@ NODE_PATH="$PWD/node_modules" \
 FCPY=/path/to/venv/bin/python ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix FCWIRE=/path/to/fire-crab/target/release/fcwire \
     bash /path/to/fire-crab/qa/serve-real-pydriver.sh 3050
+
+# SERVICES API + op_create: the firebird-qa plugin's session-bootstrap wire
+# operations - connect_server reads server version/dirs/arch, create_database
+# makes a database the driver then fills and the engine validates. Needs a
+# venv with firebird-driver installed.
+FCPY=/path/to/venv/bin/python ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix FCWIRE=/path/to/fire-crab/target/release/fcwire \
+    bash /path/to/fire-crab/qa/serve-real-services.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
