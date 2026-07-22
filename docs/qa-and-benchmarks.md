@@ -676,6 +676,29 @@ format) raises a real SQL error and writes nothing - and
 `isc_info_sql_records` now reports the true per-verb counts of the last
 statement instead of a static guess.
 
+### The twenty-first differential — outer joins
+
+`qa/serve-real-outerjoin.sh` widens the join surface to `LEFT`, `RIGHT`
+and `FULL [OUTER] JOIN`: the preserved side's partnerless rows are
+emitted once with the other side NULL-padded (FULL preserves both), and
+the WHERE filter is evaluated on the *padded* combined row - SQL's
+join-first-filter-after order, which is what makes `WHERE <right col>
+IS NULL` on a LEFT join the classic anti-join. Rows whose join key is
+NULL never match anything, so on an outer join they come back padded
+instead of vanishing - both behaviours checked against isql on data
+built to exercise them (NULL and dangling foreign keys on the left, a
+department nobody references on the right, CHAR-vs-VARCHAR text keys
+with duplicates and NULLs). The anti-join result is asserted
+*non-empty*, so the outer path is provably exercised rather than
+vacuously green, and unsupported shapes (CROSS, chained joins) still
+fall back rather than answer wrong.
+
+A client-side gotcha reconfirmed while writing the gate: node-firebird
+keys result rows by column *title*, so selecting two same-named columns
+(`E.ID` + `D.ID`) loses one client-side against any server - the gate
+selects title-distinct columns, as the INNER-join gate learned before
+it.
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -684,7 +707,8 @@ the firebird-driver. The server side proven above is the entry to it: the
 handshake, authentication, encryption and op dispatch a real client needs are
 in place, and real queries - `SELECT COUNT(*)`, column projections
 (`SELECT <cols>` / `SELECT *`), `WHERE` filtering, `ORDER BY`,
-`MIN/MAX/SUM/COUNT` aggregates, `GROUP BY`, `HAVING` and INNER joins - now
+`MIN/MAX/SUM/COUNT` aggregates, `GROUP BY`, `HAVING` and INNER and
+LEFT/RIGHT/FULL OUTER joins - now
 dispatch into the converted storage engine and return real results in
 native wire types (integers at their own width, scaled numerics,
 float/double, date/time/timestamp, boolean), matching isql over the wire.
@@ -694,7 +718,7 @@ engine itself validates all of it (isql reads the same table the engine
 would have produced, `gfix -v` passes, `gfix -sweep` collects the
 chains, `gbak` backs the file up). What stands between here and running
 the suite is remaining *breadth* of the SQL engine - index maintenance
-and page allocation on the write path, outer joins, blob/INT128/DECFLOAT
+and page allocation on the write path, blob/INT128/DECFLOAT
 columns, system-table projections. Until that surface is wide enough,
 fire-crab does **not** claim any firebird-qa coverage - but the milestone
 is no longer distant: the protocol server the suite talks to accepts real
@@ -805,6 +829,12 @@ NODE_PATH="$PWD/node_modules" \\
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \\
     bash /path/to/fire-crab/qa/serve-real-update.sh 3050
+
+# server answers OUTER joins (LEFT/RIGHT/FULL, NULL-padded partnerless rows,
+# WHERE on the padded row = anti-joins), vs isql
+NODE_PATH="$PWD/node_modules" \\
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
+    bash /path/to/fire-crab/qa/serve-real-outerjoin.sh /tmp/fbhandson/join_clean.fdb 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on

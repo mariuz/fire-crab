@@ -51,6 +51,7 @@ the converter what the C++ is *doing* before they read a line of it.
 | GROUP BY | `fire-crab-wire::server` | **the server groups** - `SELECT <keys and aggregates> ... GROUP BY <cols\|ordinals>`, and multi-aggregate projections with no GROUP BY (one global group, one row even over an empty set); NULL keys bucket together, aggregates computed per group, composable with WHERE and ORDER BY (which sorts the *output*, by name or ordinal); matches isql value-for-value |
 | HAVING | `fire-crab-wire::server` | **the server filters groups** - the predicate (comparisons, `AND`/`OR`, `IS [NOT] NULL`) is evaluated on each group's computed output row and may name aggregates *not in the select list* (computed as hidden items) or any grouping column; a global aggregate's single row can be kept or rejected; matches isql, including zero-row results |
 | INNER JOIN | `fire-crab-wire::server` | **the server joins two relations** - `FROM t1 [a] [INNER] JOIN t2 [b] ON <col> = <col> [AND ...]` with table-qualified or unambiguous bare columns; NULL and partnerless keys drop out, text keys compare pad-insensitively (CHAR vs VARCHAR), WHERE/ORDER BY see the combined row, `SELECT *` is left columns then right, and a lone `COUNT(*)` counts the joined rows; matches isql value-for-value |
+| OUTER JOIN | `fire-crab-wire::server` | **the server answers LEFT/RIGHT/FULL [OUTER] equi-joins** - partnerless preserved-side rows emitted once with the other side NULL-padded (NULL join keys never match, so they surface as padded rows), and WHERE runs on the *padded* row - SQL's join-then-filter order, making `WHERE <right col> IS NULL` the classic anti-join; COUNT(*) over any kind; matches isql value-for-value, the anti-join asserted non-empty so the outer path is provably exercised |
 | Native wire types | `fire-crab-wire::server` | **columns travel in the engine's own wire form** - SMALLINT/INTEGER/BIGINT at their own SQL types, NUMERIC/DECIMAL as raw scaled integers with the scale in the describe (the client divides), FLOAT/DOUBLE as IEEE bytes, DATE/TIME/TIMESTAMP as raw day/1e-4-s units, BOOLEAN as an XDR slot; ORDER BY/GROUP BY on them compare numerically; node-firebird's typed decode (numbers, `Date`s, booleans) matches isql |
 | INSERT (first DML) | `fire-crab-wire::server` + `fire-crab-ods::dml` | **the server writes real records into the pages** - transaction allocated from the header and committed in the TIP, image laid `rhd_not_packed` into a data-page slot; **the real engine is the oracle**: isql reads the rows back, `gfix -v -full` finds nothing wrong, `gbak` backs the file up; unsupported INSERTs answer SQL errors, never silent no-ops |
 | UPDATE / DELETE (version chains) | `fire-crab-wire::server` + `fire-crab-ods::dml` | **the server writes MVCC version chains** - UPDATE copies the old version to a fresh slot flagged `rhd_chain` and rewrites the primary with a back pointer to it; DELETE leaves a header-only `rhd_deleted` stub over the chain (`VIO_modify`/`VIO_erase` + `DPM_update` on the file image); **three engine oracles**: `gfix -v -full` accepts the chains, the same statements applied by the C++ engine to a second copy produce an *identical* table, and `gfix -sweep` - the engine's own GC - collects fire-crab's chains with the version arithmetic exact (46 → 23) and the data intact |
@@ -128,9 +129,17 @@ a constant:
   partner drop out, text keys compare with trailing blanks insignificant
   (a `CHAR(10)` key joins the same `VARCHAR` text), and duplicate keys
   yield their full cross product. `SELECT *` is all left columns then all
-  right; a lone `SELECT COUNT(*)` counts the joined rows. Outer/cross
+  right; a lone `SELECT COUNT(*)` counts the joined rows. Cross
   joins, chained joins, comma-list FROMs and grouping over a join fall
   back.
+- **Outer joins.** `LEFT`, `RIGHT` and `FULL [OUTER] JOIN`: the
+  preserved side's partnerless rows are emitted once with the other
+  side all NULLs (FULL preserves both, appending the right rows nothing
+  matched). The WHERE filter runs on the padded row - SQL evaluates the
+  join first, the filter after - so `WHERE <right col> IS NULL` on a
+  LEFT join selects exactly the rows that found no partner, the classic
+  anti-join, and rows whose join key is NULL (which never matches
+  anything) come back NULL-padded instead of vanishing.
 - **Native wire types.** Every column type the record decoder handles
   exactly is described and encoded as the engine would: integers at their
   own width (`SQL_SHORT`/`SQL_LONG`/`SQL_INT64`), `NUMERIC`/`DECIMAL` as
@@ -188,7 +197,7 @@ and text all travelling in native wire form; blob, `INT128`, `DECFLOAT` and
 TZ columns are still rendered as text, and other shapes fall back to the
 fixed value.
 Widening further (write-path page allocation and index maintenance,
-scaled/temporal SET values, outer joins, the remaining exotic column types,
+scaled/temporal SET values, the remaining exotic column types,
 system-table projections) is the work that continues - but the fixed answer
 is no longer fixed, the server writes records and version chains the real
 engine validates and garbage-collects, and the protocol server it all runs
