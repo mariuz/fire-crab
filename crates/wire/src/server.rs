@@ -273,11 +273,29 @@ struct ProjCol {
 /// `having` filters the computed OUTPUT rows; it may reference `gitems`
 /// entries past `cols` - hidden items appended for aggregates or keys
 /// named only in the HAVING clause, which are computed but not emitted.
+/// `Join` is an INNER equi-join of two relations: each joined row is the
+/// left record's values followed by the right record's (so a COMBINED
+/// index < `left_width` names a left field, >= names a right field at
+/// `index - left_width`), `on` lists the (left, right) combined-index
+/// equality pairs, and `cols`/`filter`/`order_by` all speak combined
+/// indexes - `encode_row`, the predicate and the sort apply unchanged.
 enum Plan {
     Scalar(Option<i64>),
     Project {
         rel: u16,
         formats: Vec<(u8, Vec<Descriptor>)>,
+        cols: Vec<ProjCol>,
+        filter: Option<Predicate>,
+        order_by: Vec<(usize, bool)>,
+    },
+    Join {
+        left_rel: u16,
+        left_formats: Vec<(u8, Vec<Descriptor>)>,
+        left_width: usize,
+        right_rel: u16,
+        right_formats: Vec<(u8, Vec<Descriptor>)>,
+        right_width: usize,
+        on: Vec<(usize, usize)>,
         cols: Vec<ProjCol>,
         filter: Option<Predicate>,
         order_by: Vec<(usize, bool)>,
@@ -439,6 +457,280 @@ fn build_projcols(
     Some(out)
 }
 
+/// One side of a FROM clause: a table name and its optional alias.
+struct TableRef<'a> {
+    table: &'a str,
+    alias: Option<&'a str>,
+}
+
+/// Parse a table reference: `NAME` or `NAME ALIAS`.
+fn parse_table_ref(s: &str) -> Option<TableRef<'_>> {
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    let (table, alias) = match toks.as_slice() {
+        [t] => (t.trim_matches('"'), None),
+        [t, a] => (t.trim_matches('"'), Some(a.trim_matches('"'))),
+        _ => return None,
+    };
+    if !ident_ok(table) || alias.is_some_and(|a| !ident_ok(a)) {
+        return None;
+    }
+    Some(TableRef { table, alias })
+}
+
+/// Parse a FROM clause into its left table and - if there is one - the
+/// joined table plus the raw ON condition text. Only a single INNER join
+/// is supported: `t1 [a1] [INNER] JOIN t2 [a2] ON <cond>`. Outer/cross
+/// joins, comma lists and chained joins return None (fall back).
+fn parse_from(from_s: &str) -> Option<(TableRef<'_>, Option<(TableRef<'_>, &str)>)> {
+    if from_s.contains(',') {
+        return None;
+    }
+    let up = from_s.to_ascii_uppercase();
+    for kw in ["LEFT", "RIGHT", "FULL", "OUTER", "CROSS", "NATURAL"] {
+        if find_word(&up, kw, 0).is_some() {
+            return None;
+        }
+    }
+    let Some(jp) = find_word(&up, "JOIN", 0) else {
+        return Some((parse_table_ref(from_s)?, None));
+    };
+    // a second JOIN (chained) is not supported
+    if find_word(&up, "JOIN", jp + "JOIN".len()).is_some() {
+        return None;
+    }
+    // the optional INNER keyword sits just before JOIN
+    let left_end = match find_word(&up, "INNER", 0) {
+        Some(ip) if up[ip + "INNER".len()..jp].trim().is_empty() => ip,
+        Some(_) => return None, // INNER anywhere else is malformed
+        None => jp,
+    };
+    let left = parse_table_ref(&from_s[..left_end])?;
+    let after = jp + "JOIN".len();
+    let on = find_word(&up, "ON", after)?;
+    let right = parse_table_ref(&from_s[after..on])?;
+    let on_s = from_s[on + "ON".len()..].trim();
+    Some((left, Some((right, on_s))))
+}
+
+/// Split a possibly-qualified column name into (qualifier, column), each
+/// stripped of double quotes.
+fn split_qual(name: &str) -> (Option<&str>, &str) {
+    match name.split_once('.') {
+        Some((q, c)) => (Some(q.trim_matches('"')), c.trim_matches('"')),
+        None => (None, name.trim_matches('"')),
+    }
+}
+
+/// One side of a join during planning: the name a qualifier must match
+/// (the alias when there is one, else the table name - Firebird hides the
+/// table name behind an alias), the relation's columns and newest
+/// descriptors, and this side's offset into the combined row.
+struct JoinSide {
+    key: String,
+    rel: u16,
+    formats: Vec<(u8, Vec<Descriptor>)>,
+    columns: Vec<RelationColumn>,
+    descs: Vec<Descriptor>,
+    offset: usize,
+}
+
+/// Resolve a (possibly qualified) column name against the two join sides
+/// to (combined row index, descriptor, canonical column name). A bare
+/// name must be unambiguous - present on exactly one side.
+fn resolve_join_col<'a>(
+    sides: &'a [JoinSide; 2],
+    name: &str,
+) -> Option<(usize, &'a Descriptor, &'a str)> {
+    let (qual, col) = split_qual(name);
+    let hit = |side: &'a JoinSide| -> Option<(usize, &'a Descriptor, &'a str)> {
+        let rc = side.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col))?;
+        let d = side.descs.get(rc.field_id as usize)?;
+        Some((side.offset + rc.field_id as usize, d, rc.name.as_str()))
+    };
+    match qual {
+        Some(q) => hit(sides.iter().find(|s| s.key.eq_ignore_ascii_case(q))?),
+        None => match (hit(&sides[0]), hit(&sides[1])) {
+            (Some(h), None) => Some(h),
+            (None, Some(h)) => Some(h),
+            _ => None, // ambiguous or unknown
+        },
+    }
+}
+
+/// Parse an ON condition into (left, right) combined-index equality
+/// pairs: one or more `<col> = <col>` terms joined by AND, each term
+/// naming one column from each side, both of the same comparable kind.
+fn parse_on(on_s: &str, sides: &[JoinSide; 2]) -> Option<Vec<(usize, usize)>> {
+    let toks = tokenize(on_s)?;
+    if toks.iter().any(|t| matches!(t, Tok::Or)) {
+        return None;
+    }
+    let mut on = Vec::new();
+    for part in split_on(&toks, |t| matches!(t, Tok::And)) {
+        let [Tok::Ident(a), Tok::Cmp(Cmp::Eq), Tok::Ident(b)] = part else {
+            return None;
+        };
+        let (ia, da, _) = resolve_join_col(sides, a)?;
+        let (ib, db, _) = resolve_join_col(sides, b)?;
+        // the two columns must come from opposite sides and compare as
+        // the same kind
+        let width = sides[1].offset;
+        let (l, r, dl, dr) = match (ia < width, ib < width) {
+            (true, false) => (ia, ib, da, db),
+            (false, true) => (ib, ia, db, da),
+            _ => return None,
+        };
+        match (col_kind(dl)?, col_kind(dr)?) {
+            (ColKind::Int, ColKind::Int) | (ColKind::Text, ColKind::Text) => {}
+            _ => return None,
+        }
+        on.push((l, r));
+    }
+    if on.is_empty() {
+        None
+    } else {
+        Some(on)
+    }
+}
+
+/// Resolve a WHERE predicate against the two join sides (combined row
+/// indexes). Aggregates are invalid here, exactly as in the single-table
+/// resolver.
+fn resolve_join_predicate(raw: Vec<Vec<RawTerm>>, sides: &[JoinSide; 2]) -> Option<Predicate> {
+    let mut groups = Vec::new();
+    for g in raw {
+        let mut terms = Vec::new();
+        for rt in g {
+            let RawLhs::Col(col) = &rt.lhs else {
+                return None;
+            };
+            let (idx, d, _) = resolve_join_col(sides, col)?;
+            terms.push(typed_term(idx, col_kind(d)?, rt.kind)?);
+        }
+        groups.push(terms);
+    }
+    Some(Predicate(groups))
+}
+
+/// Plan an INNER equi-join. Supported around it: a projection of bare or
+/// qualified columns (or `*` = all left columns then all right, in
+/// declared order), a WHERE over the combined row, ORDER BY, and - as the
+/// one aggregate - a lone `SELECT COUNT(*)`. GROUP BY/HAVING or other
+/// aggregates over a join fall back.
+#[allow(clippy::too_many_arguments)]
+fn plan_join(
+    proj: &Proj,
+    left: &TableRef<'_>,
+    right: &TableRef<'_>,
+    on_s: &str,
+    where_s: Option<&str>,
+    order_s: Option<&str>,
+    db: &Database,
+) -> Option<Plan> {
+    let mut sides: Vec<JoinSide> = Vec::new();
+    for tr in [left, right] {
+        let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, tr.table)?;
+        let columns = relation_columns(&db.bytes, db.page_size, tr.table);
+        let formats = relation_formats(&db.bytes, db.page_size, rel);
+        // joining needs decodable records (see plan_group on system rels)
+        if formats.is_empty() {
+            return None;
+        }
+        let descs = formats
+            .iter()
+            .max_by_key(|(n, _)| *n)
+            .map(|(_, d)| d.clone())
+            .unwrap_or_default();
+        let offset = sides.first().map_or(0, |s: &JoinSide| s.descs.len());
+        sides.push(JoinSide {
+            key: tr.alias.unwrap_or(tr.table).to_string(),
+            rel,
+            formats,
+            columns,
+            descs,
+            offset,
+        });
+    }
+    // the two sides must be distinguishable by qualifier
+    if sides[0].key.eq_ignore_ascii_case(&sides[1].key) {
+        return None;
+    }
+    let sides: [JoinSide; 2] = match <[JoinSide; 2]>::try_from(sides) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    let on = parse_on(on_s, &sides)?;
+    let filter = match where_s {
+        None => None,
+        Some(ws) => Some(
+            tokenize(ws)
+                .and_then(|t| parse_predicate(&t))
+                .and_then(|raw| resolve_join_predicate(raw, &sides))?,
+        ),
+    };
+
+    let mut cols = Vec::new();
+    match proj {
+        Proj::Star => {
+            // all left columns then all right, each in declared order
+            for side in &sides {
+                for rc in &side.columns {
+                    let d = side.descs.get(rc.field_id as usize)?;
+                    let (wire, sql_type, length) = wire_for(d);
+                    cols.push(ProjCol {
+                        name: rc.name.clone(),
+                        field_id: side.offset + rc.field_id as usize,
+                        wire,
+                        sql_type,
+                        length,
+                    });
+                }
+            }
+        }
+        Proj::Items(items) => {
+            for item in items {
+                let SelItem::Col(name) = item else {
+                    return None; // aggregates over a join: fall back
+                };
+                let (idx, d, colname) = resolve_join_col(&sides, name)?;
+                let (wire, sql_type, length) = wire_for(d);
+                cols.push(ProjCol {
+                    name: colname.to_string(),
+                    field_id: idx,
+                    wire,
+                    sql_type,
+                    length,
+                });
+            }
+        }
+    }
+    if cols.is_empty() {
+        return None;
+    }
+
+    let order_by = match order_s {
+        None => Vec::new(),
+        Some(os) => parse_order_by(os, &cols, |n| {
+            resolve_join_col(&sides, n).map(|(idx, _, _)| idx)
+        })?,
+    };
+
+    let [l, r] = sides;
+    Some(Plan::Join {
+        left_rel: l.rel,
+        left_formats: l.formats,
+        left_width: l.descs.len(),
+        right_rel: r.rel,
+        right_formats: r.formats,
+        right_width: r.descs.len(),
+        on,
+        cols,
+        filter,
+        order_by,
+    })
+}
+
 /// Plan a prepared statement against the loaded database. The shapes
 /// answered from real pages are `SELECT COUNT(*) FROM <table> [WHERE ...]`,
 /// `SELECT <cols> FROM <table> [WHERE ...] [ORDER BY ...]`, and grouped
@@ -465,11 +757,54 @@ fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
         if trace { eprintln!("[srv] plan: parse_projection failed"); }
         return fallback;
     };
-    let table = table_s.trim_matches('"');
-    if !ident_ok(table) {
-        return fallback;
-    }
     let Some(db) = db else { return fallback };
+    let Some((left, join)) = parse_from(table_s) else {
+        if trace { eprintln!("[srv] plan: FROM parse failed for {:?}", table_s); }
+        return fallback;
+    };
+    if let Some((right, on_s)) = join {
+        // a join supports projections, WHERE and ORDER BY; the one
+        // aggregate shape is a lone COUNT(*), counted at prepare.
+        // GROUP BY/HAVING over a join fall back.
+        if group_s.is_some() || having_s.is_some() {
+            return fallback;
+        }
+        if let Proj::Items(items) = &proj {
+            if let [SelItem::Agg(AggFn::Count, AggTarget::Star)] = items.as_slice() {
+                if order_s.is_some() {
+                    return fallback;
+                }
+                if let Some(Plan::Join {
+                    left_rel,
+                    left_formats,
+                    left_width,
+                    right_rel,
+                    right_formats,
+                    right_width,
+                    on,
+                    filter,
+                    ..
+                }) = plan_join(&Proj::Star, &left, &right, on_s, where_s, None, db)
+                {
+                    let n = join_rows(
+                        db, left_rel, &left_formats, left_width, right_rel, &right_formats,
+                        right_width, &on, &filter,
+                    )
+                    .len();
+                    return Plan::Scalar(Some(n as i64));
+                }
+                return fallback;
+            }
+        }
+        return match plan_join(&proj, &left, &right, on_s, where_s, order_s, db) {
+            Some(p) => p,
+            None => {
+                if trace { eprintln!("[srv] plan: JOIN plan failed"); }
+                fallback
+            }
+        };
+    }
+    let table = left.table;
     let Some(rel) = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table) else {
         return fallback;
     };
@@ -855,6 +1190,57 @@ fn for_each_record<F: FnMut(&[Value])>(
     }
 }
 
+/// Compute the joined rows: a nested-loop INNER equi-join. Each side's
+/// committed records are collected (padded to the side's newest-format
+/// width, so combined indexes stay stable across formats), then every
+/// left/right pair whose `on` columns are all equal - NULL never joins,
+/// as SQL requires - produces a combined row, kept if the WHERE filter
+/// accepts it.
+#[allow(clippy::too_many_arguments)]
+fn join_rows(
+    db: &Database,
+    left_rel: u16,
+    left_formats: &[(u8, Vec<Descriptor>)],
+    left_width: usize,
+    right_rel: u16,
+    right_formats: &[(u8, Vec<Descriptor>)],
+    right_width: usize,
+    on: &[(usize, usize)],
+    filter: &Option<Predicate>,
+) -> Vec<Vec<Value>> {
+    let collect = |rel: u16, formats: &[(u8, Vec<Descriptor>)], width: usize| {
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for_each_record(db, rel, formats, |v| {
+            let mut row = v.to_vec();
+            row.resize(width, Value::Null);
+            rows.push(row);
+        });
+        rows
+    };
+    let lrows = collect(left_rel, left_formats, left_width);
+    let rrows = collect(right_rel, right_formats, right_width);
+    let mut out = Vec::new();
+    for l in &lrows {
+        for r in &rrows {
+            let joined = on.iter().all(|&(li, ri)| {
+                let (a, b) = (&l[li], &r[ri - left_width]);
+                !matches!(a, Value::Null)
+                    && !matches!(b, Value::Null)
+                    && value_cmp(a, b) == std::cmp::Ordering::Equal
+            });
+            if !joined {
+                continue;
+            }
+            let mut row = l.clone();
+            row.extend(r.iter().cloned());
+            if filter.as_ref().map_or(true, |p| p.matches(&row)) {
+                out.push(row);
+            }
+        }
+    }
+    out
+}
+
 /// Order two values for ORDER BY. NULL sorts as the lowest value (so
 /// ascending puts NULLs first), matching the engine's default; integers
 /// compare numerically, text ignoring trailing blanks, other types by
@@ -977,6 +1363,7 @@ fn describe_for(plan: &Plan) -> Vec<u8> {
     match plan {
         Plan::Scalar(_) => describe_one_bigint(),
         Plan::Project { cols, .. } => build_describe(cols),
+        Plan::Join { cols, .. } => build_describe(cols),
         Plan::Group { cols, .. } => build_describe(cols),
     }
 }
@@ -1030,6 +1417,32 @@ fn emit_rows(w: &mut W, plan: &Plan, db: &Option<Database>) {
                         w.int(OP_FETCH_RESPONSE).int(0).int(1);
                         encode_row(w, cols, values);
                     }
+                }
+            }
+        }
+        Plan::Join {
+            left_rel,
+            left_formats,
+            left_width,
+            right_rel,
+            right_formats,
+            right_width,
+            on,
+            cols,
+            filter,
+            order_by,
+        } => {
+            if let Some(db) = db {
+                let mut rows = join_rows(
+                    db, *left_rel, left_formats, *left_width, *right_rel, right_formats,
+                    *right_width, on, filter,
+                );
+                if !order_by.is_empty() {
+                    rows.sort_by(|a, b| order_cmp(a, b, order_by));
+                }
+                for values in &rows {
+                    w.int(OP_FETCH_RESPONSE).int(0).int(1);
+                    encode_row(w, cols, values);
                 }
             }
         }
@@ -1288,8 +1701,11 @@ fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
 }
 
 /// Parse the projection: `*`, or a comma-separated list where each item
-/// is a bare identifier or an aggregate. (Aggregate arguments contain no
-/// commas, so splitting the list on commas is safe.)
+/// is a bare or table-qualified identifier or an aggregate. (Aggregate
+/// arguments contain no commas, so splitting the list on commas is safe.)
+/// Qualified names are kept whole; the join resolver splits them, and the
+/// single-table column lookup - which has no qualifiers - never matches
+/// one, so a qualified column on a single table falls back as before.
 fn parse_projection(proj: &str) -> Option<Proj> {
     if proj.trim() == "*" {
         return Some(Proj::Star);
@@ -1299,6 +1715,12 @@ fn parse_projection(proj: &str) -> Option<Proj> {
         let part = part.trim();
         if let Some((func, target)) = parse_agg_item(part) {
             items.push(SelItem::Agg(func, target));
+        } else if part.contains('.') {
+            let (q, c) = split_qual(part);
+            if !ident_ok(q.unwrap_or("")) || !ident_ok(c) {
+                return None;
+            }
+            items.push(SelItem::Col(part.to_string()));
         } else {
             let name = part.trim_matches('"');
             if !ident_ok(name) {
@@ -1457,6 +1879,19 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                 let start = i;
                 while i < b.len() && is_ident_byte(b[i]) {
                     i += 1;
+                }
+                // a qualified column IDENT.IDENT is ONE token; the
+                // resolver splits it on the dot
+                if i < b.len()
+                    && b[i] == b'.'
+                    && b.get(i + 1).is_some_and(|n| is_ident_byte(*n))
+                {
+                    i += 1;
+                    while i < b.len() && is_ident_byte(b[i]) {
+                        i += 1;
+                    }
+                    out.push(Tok::Ident(s[start..i].to_string()));
+                    continue;
                 }
                 let word = &s[start..i];
                 let upper = word.to_ascii_uppercase();
@@ -2273,6 +2708,117 @@ mod tests {
         // an aggregate name NOT followed by parens is a plain identifier
         let toks = tokenize("COUNT = 1").unwrap();
         assert!(matches!(&parse_predicate(&toks).unwrap()[0][0].lhs, RawLhs::Col(c) if c == "COUNT"));
+    }
+
+    #[test]
+    fn parses_from_clause() {
+        // plain table, with and without alias
+        let (l, j) = parse_from("EMP").unwrap();
+        assert_eq!(l.table, "EMP");
+        assert!(l.alias.is_none() && j.is_none());
+        let (l, _) = parse_from("EMP E").unwrap();
+        assert_eq!((l.table, l.alias), ("EMP", Some("E")));
+        // JOIN with aliases and the optional INNER keyword
+        let (l, j) = parse_from("EMP E JOIN DEPT D ON E.DEPT_ID = D.ID").unwrap();
+        let (r, on) = j.unwrap();
+        assert_eq!((l.table, l.alias), ("EMP", Some("E")));
+        assert_eq!((r.table, r.alias), ("DEPT", Some("D")));
+        assert_eq!(on, "E.DEPT_ID = D.ID");
+        let (_, j) = parse_from("EMP inner join DEPT on EMP.DEPT_ID = DEPT.ID").unwrap();
+        assert!(j.is_some());
+        // unsupported shapes fall back: outer joins, comma lists, chains
+        assert!(parse_from("EMP LEFT JOIN DEPT ON 1 = 1").is_none());
+        assert!(parse_from("EMP, DEPT").is_none());
+        assert!(parse_from("A JOIN B ON A.X = B.X JOIN C ON B.Y = C.Y").is_none());
+        assert!(parse_from("EMP JOIN DEPT").is_none()); // no ON
+    }
+
+    fn join_sides() -> [JoinSide; 2] {
+        let d = |dtype| Descriptor { dtype, scale: 0, length: 0, sub_type: 0, flags: 0, offset: 0 };
+        [
+            JoinSide {
+                key: "E".into(),
+                rel: 10,
+                formats: vec![(1, vec![d(dtype::LONG), d(dtype::LONG), d(dtype::VARYING)])],
+                columns: vec![
+                    RelationColumn { name: "ID".into(), field_id: 0, position: 0 },
+                    RelationColumn { name: "DEPT_ID".into(), field_id: 1, position: 1 },
+                    RelationColumn { name: "NAME".into(), field_id: 2, position: 2 },
+                ],
+                descs: vec![d(dtype::LONG), d(dtype::LONG), d(dtype::VARYING)],
+                offset: 0,
+            },
+            JoinSide {
+                key: "D".into(),
+                rel: 11,
+                formats: vec![(1, vec![d(dtype::LONG), d(dtype::VARYING)])],
+                columns: vec![
+                    RelationColumn { name: "ID".into(), field_id: 0, position: 0 },
+                    RelationColumn { name: "NAME".into(), field_id: 1, position: 1 },
+                ],
+                descs: vec![d(dtype::LONG), d(dtype::VARYING)],
+                offset: 3,
+            },
+        ]
+    }
+
+    #[test]
+    fn resolves_join_columns() {
+        let sides = join_sides();
+        // qualified: side by alias, index offset by side
+        assert_eq!(resolve_join_col(&sides, "E.ID").map(|(i, _, _)| i), Some(0));
+        assert_eq!(resolve_join_col(&sides, "D.ID").map(|(i, _, _)| i), Some(3));
+        assert_eq!(resolve_join_col(&sides, "d.name").map(|(i, _, _)| i), Some(4));
+        // bare: unique -> resolved, ambiguous (ID, NAME on both) -> None
+        assert_eq!(resolve_join_col(&sides, "DEPT_ID").map(|(i, _, _)| i), Some(1));
+        assert!(resolve_join_col(&sides, "ID").is_none());
+        assert!(resolve_join_col(&sides, "NAME").is_none());
+        // unknown qualifier or column
+        assert!(resolve_join_col(&sides, "X.ID").is_none());
+        assert!(resolve_join_col(&sides, "E.BOGUS").is_none());
+    }
+
+    #[test]
+    fn parses_on_conditions() {
+        let sides = join_sides();
+        // single equality, either operand order normalises to (left, right)
+        assert_eq!(parse_on("E.DEPT_ID = D.ID", &sides), Some(vec![(1, 3)]));
+        assert_eq!(parse_on("D.ID = E.DEPT_ID", &sides), Some(vec![(1, 3)]));
+        // AND-ed equalities; a text pair joins text columns
+        assert_eq!(
+            parse_on("E.DEPT_ID = D.ID AND E.NAME = D.NAME", &sides),
+            Some(vec![(1, 3), (2, 4)])
+        );
+        // both columns from one side, non-equality, OR, literals: all fall back
+        assert!(parse_on("E.ID = E.DEPT_ID", &sides).is_none());
+        assert!(parse_on("E.DEPT_ID > D.ID", &sides).is_none());
+        assert!(parse_on("E.DEPT_ID = D.ID OR E.NAME = D.NAME", &sides).is_none());
+        assert!(parse_on("E.DEPT_ID = 3", &sides).is_none());
+        // int/text mismatch
+        assert!(parse_on("E.DEPT_ID = D.NAME", &sides).is_none());
+    }
+
+    #[test]
+    fn join_predicate_uses_combined_indexes() {
+        let sides = join_sides();
+        let raw = parse_predicate(&tokenize("E.ID >= 5 AND D.NAME = 'Sales'").unwrap()).unwrap();
+        let p = resolve_join_predicate(raw, &sides).unwrap();
+        // combined row: [E.ID, E.DEPT_ID, E.NAME, D.ID, D.NAME]
+        let row = |id: i64, dname: &str| {
+            vec![
+                Value::Int(id),
+                Value::Int(1),
+                Value::Text("x".into()),
+                Value::Int(1),
+                Value::Text(dname.into()),
+            ]
+        };
+        assert!(p.matches(&row(5, "Sales")));
+        assert!(!p.matches(&row(4, "Sales")));
+        assert!(!p.matches(&row(9, "Ops")));
+        // an ambiguous bare column cannot resolve
+        let raw = parse_predicate(&tokenize("NAME = 'x'").unwrap()).unwrap();
+        assert!(resolve_join_predicate(raw, &sides).is_none());
     }
 
     #[test]

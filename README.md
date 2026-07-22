@@ -50,6 +50,7 @@ the converter what the C++ is *doing* before they read a line of it.
 | ORDER BY and aggregates | `fire-crab-wire::server` | **the server sorts and aggregates** - `ORDER BY` on columns or ordinals, ASC/DESC, multi-key, NULLs ordered as the engine does (first ascending); `MIN`/`MAX`/`SUM` over integer columns and `COUNT(col)`/`COUNT(*)`, all composable with WHERE; matches isql value-for-value including NULL results |
 | GROUP BY | `fire-crab-wire::server` | **the server groups** - `SELECT <keys and aggregates> ... GROUP BY <cols\|ordinals>`, and multi-aggregate projections with no GROUP BY (one global group, one row even over an empty set); NULL keys bucket together, aggregates computed per group, composable with WHERE and ORDER BY (which sorts the *output*, by name or ordinal); matches isql value-for-value |
 | HAVING | `fire-crab-wire::server` | **the server filters groups** - the predicate (comparisons, `AND`/`OR`, `IS [NOT] NULL`) is evaluated on each group's computed output row and may name aggregates *not in the select list* (computed as hidden items) or any grouping column; a global aggregate's single row can be kept or rejected; matches isql, including zero-row results |
+| INNER JOIN | `fire-crab-wire::server` | **the server joins two relations** - `FROM t1 [a] [INNER] JOIN t2 [b] ON <col> = <col> [AND ...]` with table-qualified or unambiguous bare columns; NULL and partnerless keys drop out, text keys compare pad-insensitively (CHAR vs VARCHAR), WHERE/ORDER BY see the combined row, `SELECT *` is left columns then right, and a lone `COUNT(*)` counts the joined rows; matches isql value-for-value |
 | Everything else | — | see [docs/subsystem-map.md](docs/subsystem-map.md) |
 
 **On the firebird-qa milestone, precisely.** firebird-qa drives a *server*,
@@ -115,6 +116,18 @@ a constant:
   row - so a HAVING can legitimately answer zero rows. An aggregate in a
   WHERE clause, or a non-grouped column in a HAVING, is invalid SQL and
   falls back.
+- **INNER JOIN** matches two relations' decoded records on one or more
+  AND-ed `ON` column equalities: each joined row is the left record's values
+  followed by the right's, so projections, WHERE and ORDER BY all address
+  the combined row - through table-qualified names (`E.ID`, or `EMP.ID`
+  when no alias hides the table) or bare names when exactly one side has
+  the column. NULL keys never join (`=` with NULL is UNKNOWN), keys with no
+  partner drop out, text keys compare with trailing blanks insignificant
+  (a `CHAR(10)` key joins the same `VARCHAR` text), and duplicate keys
+  yield their full cross product. `SELECT *` is all left columns then all
+  right; a lone `SELECT COUNT(*)` counts the joined rows. Outer/cross
+  joins, chained joins, comma-list FROMs and grouping over a join fall
+  back.
 
 The subtlety that had to be right: on a table mixing column widths the engine
 lays fields out physically by alignment, so `RDB$FIELD_ID` (the record-format
@@ -122,12 +135,12 @@ index) diverges from `RDB$FIELD_POSITION` (the declared order); projecting by
 position instead of field id silently returns the wrong column, which a
 uniform-width table never reveals.
 
-Projections, WHERE, GROUP BY, HAVING, ORDER BY and aggregates currently cover
-user tables (system relations' formats are not in `RDB$FORMATS`, so they
-answer COUNT but not projections or grouping) and the exact-integer / text
-column types the decoder renders and compares identically to the engine; other
-shapes fall back to the fixed value.
-Widening further (joins, the remaining column types, DML, system-table
+Projections, WHERE, joins, GROUP BY, HAVING, ORDER BY and aggregates
+currently cover user tables (system relations' formats are not in
+`RDB$FORMATS`, so they answer COUNT but not projections, grouping or joins)
+and the exact-integer / text column types the decoder renders and compares
+identically to the engine; other shapes fall back to the fixed value.
+Widening further (the remaining column types, DML, outer joins, system-table
 projections) is the work that continues - but the fixed answer is no longer
 fixed, and the protocol server it runs on is proven against a genuine
 client.

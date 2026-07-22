@@ -503,6 +503,55 @@ Grouped queries now also refuse relations with no `RDB$FORMATS` entry
 (system relations) instead of emitting empty or miscounted groups - the
 records cannot be decoded, so the planner falls back.
 
+### The seventeenth differential — INNER JOIN
+
+`qa/serve-real-join.sh` adds the first two-relation shape. fire-crab, as a
+server, answers `SELECT <cols|*> FROM t1 [a1] [INNER] JOIN t2 [a2] ON
+<col> = <col> [AND ...] [WHERE ...] [ORDER BY ...]` - plus a lone
+`COUNT(*)` over a join - by decoding both relations' committed records,
+matching every left/right pair on the ON equality columns (a nested-loop
+join; the gate's sizes make its O(n·m) irrelevant, and the differential
+tests semantics, not the join algorithm), and projecting the combined row.
+node-firebird drives it against a database whose keys include NULLs, a
+dangling foreign key, duplicates and CHAR-vs-VARCHAR text, and every
+result set equals isql's.
+
+What this converts correctly:
+
+- **NULL never joins.** An `=` between a NULL key and anything is UNKNOWN,
+  so rows with NULL join columns drop out of an INNER join - as do rows
+  whose key has no partner (the dangling `DEPT_ID`): 100 employee rows
+  join to 88.
+- **Qualified and bare columns.** `E.ID` resolves through the alias (and
+  `EMP.ID` through the table name when no alias hides it); a bare column
+  resolves only if exactly one side has it - ambiguous names (`ID`,
+  `NAME`) fall back, as does a qualifier the FROM clause does not define.
+  The combined row is left values then right values, so every projected,
+  filtered and sorted column is one index into it.
+- **Multi-key ON.** `ON E.DEPT_ID = D.ID AND E.REGION_ID = D.REGION_ID`
+  requires every pair equal (each pair one column from each side, of the
+  same comparable kind); OR, non-equality operators and literals in ON
+  fall back.
+- **Text keys pad-insensitively.** A `CHAR(10)` key equals the same
+  `VARCHAR` text despite trailing blanks, matching the engine; duplicate
+  keys on both sides produce the full mini cross product.
+- **WHERE and ORDER BY see both sides.** The filter mixes columns of
+  either table on the combined row; ORDER BY resolves qualified names,
+  bare names and ordinals - including a sort key that is *not* in the
+  select list.
+- **`SELECT *`** is all left columns then all right, each in declared
+  order.
+
+Outer/cross/natural joins, comma-list FROM clauses, chained joins, and
+GROUP BY/HAVING or aggregates (beyond the lone `COUNT(*)`) over a join
+fall back rather than risk a wrong answer.
+
+One client-side caveat the gate documents: selecting two same-named
+columns (`E.NAME, D.NAME`) loses one *in node-firebird*, which keys rows
+by column title - the engine titles both `NAME`. That happens against any
+server; the gate's scratch tables keep join-relevant column names
+disjoint where `SELECT *` is compared.
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -511,15 +560,15 @@ the firebird-driver. The server side proven above is the entry to it: the
 handshake, authentication, encryption and op dispatch a real client needs are
 in place, and real queries - `SELECT COUNT(*)`, column projections
 (`SELECT <cols>` / `SELECT *`), `WHERE` filtering, `ORDER BY`,
-`MIN/MAX/SUM/COUNT` aggregates, `GROUP BY` and `HAVING` - now dispatch into
-the converted storage engine and return real results, matching isql over the
-wire. What stands between here and running the suite is remaining *breadth*
-of the SQL engine - joins, the column types still rendered approximately,
-DML, system-table projections. Until that surface is wide enough, fire-crab
-does **not** claim any firebird-qa coverage - but the milestone is no longer
-distant: the protocol server the suite talks to accepts real clients and
-answers real filtered, grouped, sorted and aggregated queries from real
-pages today.
+`MIN/MAX/SUM/COUNT` aggregates, `GROUP BY`, `HAVING` and INNER joins - now
+dispatch into the converted storage engine and return real results, matching
+isql over the wire. What stands between here and running the suite is
+remaining *breadth* of the SQL engine - the column types still rendered
+approximately, DML, outer joins, system-table projections. Until that
+surface is wide enough, fire-crab does **not** claim any firebird-qa
+coverage - but the milestone is no longer distant: the protocol server the
+suite talks to accepts real clients and answers real filtered, joined,
+grouped, sorted and aggregated queries from real pages today.
 
 ## Benchmarks
 
@@ -596,6 +645,12 @@ NODE_PATH="$PWD/node_modules" \\
 NODE_PATH="$PWD/node_modules" \\
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
     sh /path/to/fire-crab/qa/serve-real-having.sh /tmp/fbhandson/having_clean.fdb 3050
+
+# server answers INNER equi-joins (qualified cols, multi-key ON, NULL/dangling
+# keys excluded, text keys pad-insensitive), vs isql
+NODE_PATH="$PWD/node_modules" \\
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
+    sh /path/to/fire-crab/qa/serve-real-join.sh /tmp/fbhandson/join_clean.fdb 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
