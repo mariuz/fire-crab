@@ -307,6 +307,12 @@ fn build_describe(cols: &[ProjCol], params: &[Descriptor]) -> Vec<u8> {
 /// resolve from the database (or no database is loaded).
 const FIXED_ANSWER: i64 = 4242;
 
+/// The transaction handle the server hands out (op_transaction) and
+/// echoes in op_execute responses (server.cpp send_response uses the
+/// transaction's rtr_id - the OO client reads it as the live
+/// transaction and nulls its ITransaction on a 0).
+const TX_HANDLE: i32 = 2;
+
 /// A database file the server has opened for the current attachment: the
 /// raw bytes plus the page size read from its header. The `ods` crate
 /// decodes everything from this slice.
@@ -341,6 +347,7 @@ fn load_database(path: &str) -> Option<Database> {
 /// e.g. blobs) is rendered and sent as SQL_VARYING. The client is
 /// expected to fetch with the message format the describe announced -
 /// which is what real clients build their output BLR from.
+#[derive(Clone, Copy)]
 enum Wire {
     /// 8-byte big-endian integer (BIGINT, and INT64-backed numerics)
     Int64,
@@ -383,6 +390,7 @@ enum Wire {
 /// decoded record, and how it is described/encoded on the wire. `scale`
 /// is announced in the describe; the raw scaled integer travels on the
 /// wire and the client divides (that is the engine's contract too).
+#[derive(Clone)]
 struct ProjCol {
     name: String,
     field_id: usize,
@@ -1387,9 +1395,23 @@ fn parse_param_blr(b: &[u8]) -> Option<Vec<PSlot>> {
                 i += 2;
                 PSlot::Text(len)
             }
+            15 => {
+                // blr_text2 (blr.h:46): charset word then length word.
+                // The C++/python driver sends a string param this way -
+                // a fixed TEXT of the value's own byte length.
+                i += 2; // charset
+                let len = u16::from_le_bytes([*b.get(i)?, *b.get(i + 1)?]) as usize;
+                i += 2;
+                PSlot::Text(len)
+            }
             37 => {
                 // blr_varying: word length (the message carries its own)
                 i += 2;
+                PSlot::Varying
+            }
+            38 => {
+                // blr_varying2: charset word then length word
+                i += 4;
                 PSlot::Varying
             }
             7 | 8 => {
@@ -3144,6 +3166,179 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
     }
 }
 
+/// The isc_info_sql_stmt_ type code for a plan.
+fn stmt_type_of(plan: &Plan) -> i32 {
+    match plan {
+        Plan::Scalar(_) | Plan::Project { .. } | Plan::Join { .. } | Plan::Group { .. } => 1,
+        Plan::Insert { .. } => 2,
+        Plan::Update { .. } => 3,
+        Plan::Delete { .. } => 4,
+        Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. } => 5,
+    }
+}
+
+/// The plan's output columns for describe purposes - a Scalar answers
+/// as one BIGINT column.
+fn output_cols_of(plan: &Plan) -> Vec<ProjCol> {
+    match plan {
+        Plan::Project { cols, .. } | Plan::Join { cols, .. } | Plan::Group { cols, .. } => {
+            cols.clone()
+        }
+        Plan::Scalar(_) => vec![ProjCol {
+            name: "CONSTANT".into(),
+            field_id: 0,
+            wire: Wire::Int64,
+            sql_type: 580,
+            length: 8,
+            scale: 0,
+            sub_type: 0,
+        }],
+        _ => Vec::new(),
+    }
+}
+
+/// Answer an op_prepare_statement's REQUESTED item list - what the
+/// C++ fbclient (and through it the python firebird-driver) parses
+/// STRICTLY: it asks for stmt_type(21), stmt_flags(27), and per-var
+/// items incl. field(16)/schema(33)/relation(17)/owner(18)/alias(19),
+/// and its OO API throws on answers that do not follow the requested
+/// shape (the fixed-shape buffer that satisfied node-firebird made it
+/// raise "Unrecognized C++ exception"). The var-item template follows
+/// each section tag (5 bind / 4 select) up to its describe_end(8);
+/// every var is answered with the requested items in requested order,
+/// closed by describe_end - the shape node-firebird's tag-driven
+/// parser reads equally happily.
+fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
+    fn int_item(d: &mut Vec<u8>, code: u8, val: i32) {
+        d.push(code);
+        d.extend_from_slice(&4u16.to_le_bytes());
+        d.extend_from_slice(&val.to_le_bytes());
+    }
+    fn str_item(d: &mut Vec<u8>, code: u8, s: &str) {
+        d.push(code);
+        d.extend_from_slice(&(s.len() as u16).to_le_bytes());
+        d.extend_from_slice(s.as_bytes());
+    }
+    // one described variable: (type, sub_type, scale, length, name)
+    struct Var {
+        sql_type: i32,
+        sub_type: i32,
+        scale: i32,
+        length: i32,
+        name: String,
+    }
+    let out_vars: Vec<Var> = output_cols_of(plan)
+        .into_iter()
+        .map(|c| Var {
+            sql_type: c.sql_type,
+            sub_type: c.sub_type,
+            scale: c.scale,
+            length: c.length,
+            name: c.name,
+        })
+        .collect();
+    let bind_vars: Vec<Var> = params
+        .iter()
+        .map(|pd| {
+            let (_, sql_type, length, scale, sub_type) = wire_for(pd);
+            Var { sql_type, sub_type, scale, length, name: String::new() }
+        })
+        .collect();
+    let has_cursor = matches!(
+        plan,
+        Plan::Scalar(_) | Plan::Project { .. } | Plan::Join { .. } | Plan::Group { .. }
+    );
+
+    let mut d = Vec::new();
+    let mut i = 0usize;
+    while i < items.len() {
+        match items[i] {
+            21 => int_item(&mut d, 21, stmt_type_of(plan)),
+            27 => int_item(&mut d, 27, if has_cursor { 1 } else { 0 }), // FLAG_HAS_CURSOR
+            22 => str_item(&mut d, 22, ""), // isc_info_sql_get_plan
+            6 => int_item(&mut d, 6, out_vars.len() as i32), // num_variables
+            tag @ (4 | 5) => {
+                // collect the per-var item template up to describe_end
+                let mut tmpl = Vec::new();
+                let mut j = i + 1;
+                while j < items.len() && items[j] != 8 {
+                    tmpl.push(items[j]);
+                    j += 1;
+                }
+                i = j; // the 8 is consumed by the outer i += 1
+                let vars = if tag == 5 { &bind_vars } else { &out_vars };
+                d.push(tag);
+                // describe_vars leads the section when requested
+                if tmpl.first() == Some(&7) {
+                    int_item(&mut d, 7, vars.len() as i32);
+                }
+                for (n, v) in vars.iter().enumerate() {
+                    for &t in &tmpl {
+                        match t {
+                            7 => {} // count, already answered
+                            9 => int_item(&mut d, 9, (n + 1) as i32),
+                            11 => int_item(&mut d, 11, v.sql_type),
+                            12 => int_item(&mut d, 12, v.sub_type),
+                            13 => int_item(&mut d, 13, v.scale),
+                            14 => int_item(&mut d, 14, v.length),
+                            15 => int_item(&mut d, 15, 0), // null_ind
+                            16 => str_item(&mut d, 16, &v.name), // field
+                            17 => str_item(&mut d, 17, ""),      // relation
+                            18 => str_item(&mut d, 18, ""),      // owner
+                            19 => str_item(&mut d, 19, &v.name), // alias
+                            33 => str_item(&mut d, 33, "PUBLIC"), // schema (FB6)
+                            34 => str_item(&mut d, 34, ""), // relation_alias
+                            _ => {}
+                        }
+                    }
+                    d.push(8); // describe_end closes each var
+                }
+            }
+            _ => {} // an item this server cannot answer is omitted
+        }
+        i += 1;
+    }
+    d.push(1); // isc_info_end
+    d
+}
+
+/// Answer an op_info_sql request item-by-item: records(23) with the
+/// per-verb counts, stmt_type(21), stmt_flags(27) - the item the
+/// python driver's Statement.get_flags() lives on - and the plan(22).
+fn answer_info_sql(items: &[u8], plan: &Plan, last_dml: (i32, i32, i32)) -> Vec<u8> {
+    let mut d = Vec::new();
+    let has_cursor = matches!(
+        plan,
+        Plan::Scalar(_) | Plan::Project { .. } | Plan::Join { .. } | Plan::Group { .. }
+    );
+    for &it in items {
+        match it {
+            23 => {
+                let cluster = build_records_info(last_dml.0, last_dml.1, last_dml.2);
+                // build_records_info already ends with isc_info_end
+                d.extend_from_slice(&cluster[..cluster.len() - 1]);
+            }
+            21 => {
+                d.push(21);
+                d.extend_from_slice(&4u16.to_le_bytes());
+                d.extend_from_slice(&stmt_type_of(plan).to_le_bytes());
+            }
+            27 => {
+                d.push(27);
+                d.extend_from_slice(&4u16.to_le_bytes());
+                d.extend_from_slice(&(if has_cursor { 1i32 } else { 0 }).to_le_bytes());
+            }
+            22 => {
+                d.push(22);
+                d.extend_from_slice(&0u16.to_le_bytes());
+            }
+            _ => {}
+        }
+    }
+    d.push(1);
+    d
+}
+
 /// Emit the fetch response for a plan: a stream of
 /// op_fetch_response(status=0, messages=1) + row messages, terminated by
 /// op_fetch_response(status=100). `Scalar` emits one row (NULL when the
@@ -4493,18 +4688,21 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
             x if x == OP_TRANSACTION => {
                 read_int(&mut s, &mut dec)?; // db handle
                 read_wire_bytes(&mut s, &mut dec)?; // tpb
-                respond(&mut s, &mut enc, 1)?; // tr handle 1
+                respond(&mut s, &mut enc, TX_HANDLE)?; // transaction handle (distinct from attach 1)
             }
             x if x == OP_ALLOCATE_STATEMENT => {
                 read_int(&mut s, &mut dec)?; // db handle
-                respond(&mut s, &mut enc, 1)?; // stmt handle 1
+                respond(&mut s, &mut enc, 3)?; // stmt handle 3 (distinct from attach 1, tr 2)
             }
             x if x == OP_PREPARE_STATEMENT => {
                 read_int(&mut s, &mut dec)?; // tr
                 read_int(&mut s, &mut dec)?; // stmt
                 read_int(&mut s, &mut dec)?; // dialect
                 let sql = read_wire_bytes(&mut s, &mut dec)?; // sql
-                read_wire_bytes(&mut s, &mut dec)?; // items
+                let prep_items = read_wire_bytes(&mut s, &mut dec)?; // items
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] op_prepare items: {:?}", prep_items);
+                }
                 read_int(&mut s, &mut dec)?; // buffer length
                 if best >= 20 {
                     read_int(&mut s, &mut dec)?; // p_sqlst_flags (FB6/proto 20+)
@@ -4528,7 +4726,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         .or_else(|| plan_drop_table(&stmt_sql));
                     match planned {
                         Some((p, ps)) => {
-                            let describe = describe_for(&p, &ps);
+                            let describe = answer_prepare(&prep_items, &p, &ps);
                             plan = p;
                             stmt_params = ps;
                             respond_prepare(&mut s, &mut enc, &describe)?;
@@ -4550,7 +4748,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     };
                     match planned {
                         Some((p, ps)) => {
-                            let describe = describe_for(&p, &ps);
+                            let describe = answer_prepare(&prep_items, &p, &ps);
                             plan = p;
                             stmt_params = ps;
                             respond_prepare(&mut s, &mut enc, &describe)?;
@@ -4565,7 +4763,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     let (p, ps) = plan_query(&stmt_sql, &database);
                     plan = p;
                     stmt_params = ps;
-                    let describe = describe_for(&plan, &stmt_params);
+                    let describe = answer_prepare(&prep_items, &plan, &stmt_params);
                     respond_prepare(&mut s, &mut enc, &describe)?;
                 }
             }
@@ -4575,6 +4773,9 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 let in_blr = read_wire_bytes(&mut s, &mut dec)?; // input blr
                 read_int(&mut s, &mut dec)?; // msg number
                 let messages = read_int(&mut s, &mut dec)?; // message count
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] exec in_blr ({} B): {:?} messages={}", in_blr.len(), in_blr, messages);
+                }
                 // With parameters, the message (null bitmap + values)
                 // follows HERE, before the version-dependent trailing
                 // fields. Its layout comes from the client's own BLR -
@@ -4634,7 +4835,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                     counts.0, counts.1, counts.2
                                 );
                             }
-                            respond(&mut s, &mut enc, 0)?;
+                            respond(&mut s, &mut enc, TX_HANDLE)?;
                         }
                         Err(e) => {
                             last_dml = (0, 0, 0);
@@ -4653,7 +4854,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     }
                     respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                 } else {
-                    respond(&mut s, &mut enc, 0)?;
+                    respond(&mut s, &mut enc, TX_HANDLE)?;
                 }
             }
             x if x == OP_INFO_SQL => {
@@ -4663,11 +4864,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 read_int(&mut s, &mut dec)?; // incarnation
                 let items = read_wire_bytes(&mut s, &mut dec)?;
                 read_int(&mut s, &mut dec)?; // buffer length
-                let info = if items.contains(&23u8) {
-                    build_records_info(last_dml.0, last_dml.1, last_dml.2)
-                } else {
-                    vec![1] // isc_info_end
-                };
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] op_info_sql items: {:?}", items);
+                }
+                let info = answer_info_sql(&items, &plan, last_dml);
                 let mut w = W::default();
                 w.int(OP_RESPONSE).int(0).int(0).int(0).bytes(&info).int(0);
                 w.send(&mut s, &mut enc)?;
@@ -4924,6 +5124,18 @@ mod tests {
             parse_param_blr(&blr2),
             Some(vec![PSlot::Timestamp, PSlot::Bool, PSlot::Double])
         );
+        // blr_text2 (15): charset word + length word - what the C++
+        // and python firebird-driver send for a string parameter (a
+        // fixed TEXT of the value's byte length); blr_varying2 (38) too
+        let blr3 = [
+            5u8, 2, 4, 0, 4, 0, // 2 params
+            8, 0, 7, 0, // blr_long + null short
+            15, 0, 0, 8, 0, 7, 0, // blr_text2 cs=0 len=8 + null short
+            255, 76,
+        ];
+        assert_eq!(parse_param_blr(&blr3), Some(vec![PSlot::Int32(0), PSlot::Text(8)]));
+        let blr4 = [5u8, 2, 4, 0, 2, 0, 38, 0, 0, 20, 0, 7, 0, 255, 76];
+        assert_eq!(parse_param_blr(&blr4), Some(vec![PSlot::Varying]));
         // an undecodable dtype (blr_quad = blob id) refuses the whole BLR
         assert!(parse_param_blr(&[5u8, 2, 4, 0, 2, 0, 9, 0, 7, 0, 255, 76]).is_none());
         // odd field count is not pairs

@@ -954,7 +954,7 @@ pub fn drop_table(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<()
         let owned = match p[0] {
             4 => u16_at(p, 26) == rel,  // pointer: ppg_relation
             6 => u16_at(p, 16) == rel,  // index root: irt_relation
-            7 => u16_at(p, 26) == rel,  // B-tree bucket: btr_relation
+            7 => u16_at(p, 28) == rel,  // B-tree bucket: btr_relation @28
             _ => false,
         };
         if owned {
