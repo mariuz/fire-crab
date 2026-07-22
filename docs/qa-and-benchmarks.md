@@ -1422,6 +1422,45 @@ gains two sequences and a generator (one `SET` to a value, one sequence
 (`Generator PUBLIC.GEN_C, current value: 4242, initial value: 1,
 increment: 1`).
 
+### The fortieth differential — writing the generator page
+
+Reading a generator's value was the previous slice; writing it is this
+one. Two statements set a generator: `SET GENERATOR <name> TO <n>` stores
+`n` outright, and `ALTER SEQUENCE|GENERATOR <name> RESTART WITH <n>`
+stores `n − increment` so the *next* `GEN_ID`/`NEXT VALUE FOR` yields
+`n`. The increment is not assumed to be one — it comes from
+`RDB$GENERATORS.RDB$GENERATOR_INCREMENT`, read at execute — so a sequence
+declared `INCREMENT BY 5` and restarted with 100 stores 95, exactly as
+the engine does. The write lands in the same slot the read locates (`id %
+gensPerPage` on the `pag_ids` page whose sequence is `id / gensPerPage`),
+as a native little-endian `SINT64`, at op_execute and flushed like DML —
+fire-crab writes to generators the engine already allocated a page for,
+it does not grow the generator vector.
+
+The routing took a little care. `SET GENERATOR` does not begin with a
+DDL or DML verb (it begins with `SET`, which isql also uses for its own
+session settings), so it is recognised by its own two-word prefix ahead
+of the verb dispatch and described as statement type
+`isc_info_sql_stmt_set_generator` (13); the `ALTER` form is a DDL verb,
+so it joins the `ALTER` planners and describes as ddl (5). Both describe
+with no cursor, so the client executes without trying to fetch. A `SET`
+on a name that is not a generator is an error, not a silent no-op — the
+same discipline every write path here follows.
+
+`qa/serve-real-genwrite.sh` proves it against the engine as oracle. The
+same five write statements (absolute sets, a re-set, restarts of a
+unit-increment and a five-increment sequence, a negative value) are
+applied by fire-crab to one copy of a clean database and by the engine to
+another; afterwards the engine reads byte-identical stored values from
+both, and fire-crab reads its own writes back through `SHOW GENERATORS`
+matching the engine (`current value: 999` for the last `GEN_C` set, `-3`
+for `SEQ_A`, `95` for the `INCREMENT BY 5` sequence restarted with 100).
+`gfix -v -full` finds nothing wrong with the file fire-crab wrote. What
+is deliberately left for later is the *increment during a query* —
+`GEN_ID(name, step)` with a non-zero step, or `NEXT VALUE FOR`, which
+mutates the generator mid-fetch rather than through a statement of its
+own.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -1686,6 +1725,15 @@ NODE_PATH="$PWD/node_modules" \
 # verbatim (nineteen checks). Builds its own scratch db.
 FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     bash /path/to/fire-crab/qa/serve-real-show.sh 3050
+
+# GENERATOR WRITES: SET GENERATOR <name> TO <n> and ALTER SEQUENCE <name>
+# RESTART WITH <n> write the generator page. The same statements applied by
+# fire-crab and by the engine to two copies leave byte-identical stored
+# values (the engine reads both the same), fire-crab reads its own writes
+# back through SHOW GENERATORS, and gfix is clean. Builds its own scratch db.
+FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix \
+    bash /path/to/fire-crab/qa/serve-real-genwrite.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
