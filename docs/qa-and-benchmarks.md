@@ -798,6 +798,29 @@ declets coincide in both encodings, which is why simple values ever
 appeared to work). The gate's wire checks use values outside those
 holes; the render differential carries the full-fidelity cases.
 
+### The twenty-fifth differential — the time-zone types
+
+`qa/serve-real-tz.sh` converts TIME/TIMESTAMP WITH TIME ZONE: UTC plus
+a zone id, where offset zones encode displacement = id - 1439
+(`ONE_DAY` is `24*60 - 1`, TimeZoneUtil.cpp:301 - not 1440; the render
+differential caught the off-by-one on its very first run, every time
+and zone shifted by one minute) and named zones count down from 65535
+through the 637-entry list generated from TimeZones.h. Rendering
+converts UTC to local exactly as `TimeZoneUtil::format` for the zones
+whose rules need no tzdata - offsets and GMT, with day carry across
+midnight - and renders NAMED zones with the correct region name but
+*visibly unconverted*: resolving Europe/Bucharest's actual offset
+needs ICU's tzdata rules, and a marked placeholder is honest where a
+wrong local time would not be.
+
+The gate checks the two conversions the engine's own text proves - a
+time that wraps past midnight in UTC, a timestamp whose local date
+differs from its UTC date - plus the zone-table teeth (the named row
+must carry the right name AND the unconverted marker), the native wire
+forms through node-firebird (whose TimeTz decode discards the zone by
+design and yields the UTC instant), and ORDER BY sorting by UTC
+instant, asserted with rows whose local-time order inverts it.
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -817,8 +840,8 @@ engine itself validates all of it (isql reads the same table the engine
 would have produced, `gfix -v` passes, `gfix -sweep` collects the
 chains, `gbak` backs the file up). What stands between here and running
 the suite is remaining *breadth* of the SQL engine - index maintenance
-and page allocation on the write path, the time-zone
-types. Until that surface is wide enough,
+and page allocation on the write path. Until that surface is wide
+enough,
 fire-crab does **not** claim any firebird-qa coverage - but the milestone
 is no longer distant: the protocol server the suite talks to accepts real
 clients, answers real typed, filtered, joined, grouped, sorted and
@@ -957,6 +980,14 @@ NODE_PATH="$PWD/node_modules" \\
     FCSTAT=/path/to/fire-crab/target/release/fcstat \\
     ISQL=/opt/firebird/bin/isql GBAK=/opt/firebird/bin/gbak \\
     bash /path/to/fire-crab/qa/serve-real-exotic.sh 3050
+
+# TIME/TIMESTAMP WITH TIME ZONE: offset zones converted exactly, named
+# zones honest, ORDER BY by UTC instant. Builds its own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire \
+    FCSTAT=/path/to/fire-crab/target/release/fcstat \
+    ISQL=/opt/firebird/bin/isql GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-tz.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
