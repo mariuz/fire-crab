@@ -36,8 +36,9 @@ done
 
 # node side: run <query>, print each row as its values joined by '|',
 # strings right-trimmed to match engine TRIM / CHAR padding, nulls as <null>.
-node_rows() {
-    FC_DB="$DB" FC_PORT="$PORT" FC_U="$U" FC_P="$P" FC_Q="$1" node -e '
+node_rows_once() {
+    FC_DB="$DB" FC_PORT="$PORT" FC_U="$U" FC_P="$P" FC_Q="$1" timeout 15 node -e '
+      process.on("uncaughtException", () => { console.log("ATTACH_ERR"); process.exit(1); });
       const F=require("node-firebird");
       F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
                 user:process.env.FC_U,password:process.env.FC_P},(e,db)=>{
@@ -48,7 +49,20 @@ node_rows() {
             console.log(Object.values(row).map(v=>v===null?"<null>":String(v).replace(/\s+$/,"")).join("|"));
           db.detach();process.exit(0);
         });
-      });' 2>/dev/null | sort
+      });' 2>/dev/null
+}
+# retry the occasional first-connect reset (a client-visible ECONNRESET
+# under rapid reconnects, not a server crash - the newer gates' standard)
+node_rows() {
+    n=0
+    while [ $n -lt 8 ]; do
+        r=$(node_rows_once "$1")
+        case "$r" in
+            *ATTACH_ERR*|"") n=$((n + 1)); sleep 0.3 ;;
+            *) printf '%s\n' "$r" | sort; return ;;
+        esac
+    done
+    echo ATTACH_ERR
 }
 
 compare() { # <label> <node-query> <isql-select-body>

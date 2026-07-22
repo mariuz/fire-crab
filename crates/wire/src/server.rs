@@ -539,24 +539,38 @@ enum Cmp {
     Ge,
 }
 
-/// The right-hand side of a comparison: a literal, or a `?` parameter
-/// slot (its index into the statement's parameters, plus the column
-/// kind it must bind as - checked when the value arrives at execute).
+/// The right-hand side of a comparison: a literal, a NULL literal
+/// (legal SQL - the comparison is then always UNKNOWN), or a `?`
+/// parameter slot (its index into the statement's parameters, plus
+/// the column kind it must bind as - checked when the value arrives
+/// at execute).
 #[derive(Clone)]
 enum Rhs {
     Int(i64),
     Str(String),
+    Null,
     Param(usize, ColKind),
 }
 
-/// A resolved WHERE term: a column (by field id) tested against a literal
-/// or for NULL-ness. `Never` is what a comparison against a NULL
-/// parameter binds to - SQL UNKNOWN, the row is excluded.
+/// A resolved WHERE term: a column (by field id) tested against a
+/// literal, for NULL-ness, or against a LIKE pattern. NOT is pushed
+/// all the way into the leaves at parse time (De Morgan through the
+/// DNF conversion), so a term only ever answers "definitely true" -
+/// SQL UNKNOWN and false both exclude the row, and `negated` LIKE is
+/// its own leaf state rather than a runtime NOT. `Never` is what a
+/// comparison against NULL (literal or bound parameter) becomes -
+/// always UNKNOWN, the row is excluded.
 #[derive(Clone)]
 enum Term {
     Cmp(usize, Cmp, Rhs),
     IsNull(usize),
     IsNotNull(usize),
+    /// `<col> [NOT] LIKE <pattern> [ESCAPE <c>]`: pattern is a string
+    /// literal or a text parameter; matching is per CHARACTER (`_` is
+    /// one char, `%` any run) on the STORED value - CHAR padding
+    /// counts, exactly as the engine matches (CHAR(5) 'abc' matches
+    /// 'abc  ' and 'abc%' but NOT 'abc')
+    Like(usize, Rhs, Option<char>, bool),
     Never,
 }
 
@@ -579,26 +593,28 @@ impl Predicate {
     /// not match the column kind is an error - never a silent wrong
     /// filter.
     fn bind(&self, args: &[WireParam]) -> Result<Predicate, String> {
+        let bind_rhs = |idx: &usize, kind: &ColKind| -> Result<Option<Rhs>, String> {
+            let arg = args.get(*idx).ok_or("missing parameter value")?;
+            Ok(match (kind, arg) {
+                (_, WireParam::Null) => None,
+                (ColKind::Int, WireParam::Int(v, 0)) => Some(Rhs::Int(*v)),
+                (ColKind::Text, WireParam::Text(s)) => Some(Rhs::Str(s.clone())),
+                _ => return Err("parameter type does not match its column".into()),
+            })
+        };
         let mut groups = Vec::new();
         for g in &self.0 {
             let mut terms = Vec::new();
             for t in g {
                 terms.push(match t {
-                    Term::Cmp(fid, op, Rhs::Param(idx, kind)) => {
-                        let arg = args.get(*idx).ok_or("missing parameter value")?;
-                        match (kind, arg) {
-                            (_, WireParam::Null) => Term::Never,
-                            (ColKind::Int, WireParam::Int(v, 0)) => {
-                                Term::Cmp(*fid, *op, Rhs::Int(*v))
-                            }
-                            (ColKind::Text, WireParam::Text(s)) => {
-                                Term::Cmp(*fid, *op, Rhs::Str(s.clone()))
-                            }
-                            _ => {
-                                return Err(
-                                    "parameter type does not match its column".into()
-                                )
-                            }
+                    Term::Cmp(fid, op, Rhs::Param(idx, kind)) => match bind_rhs(idx, kind)? {
+                        None => Term::Never,
+                        Some(rhs) => Term::Cmp(*fid, *op, rhs),
+                    },
+                    Term::Like(fid, Rhs::Param(idx, _), escape, negated) => {
+                        match bind_rhs(idx, &ColKind::Text)? {
+                            None => Term::Never, // LIKE NULL is UNKNOWN
+                            Some(rhs) => Term::Like(*fid, rhs, *escape, *negated),
                         }
                     }
                     other => other.clone(),
@@ -655,12 +671,72 @@ impl Term {
                 }
                 _ => false,
             },
+            // comparison against NULL is UNKNOWN - excluded either way
+            Term::Cmp(_, _, Rhs::Null) => false,
             // an unbound parameter never matches (the execute path binds
             // before evaluating; this is the defensive answer)
             Term::Cmp(_, _, Rhs::Param(..)) => false,
+            Term::Like(fid, pattern, escape, negated) => match (values.get(*fid), pattern) {
+                // NO pad trim: the engine matches the stored value,
+                // padding included (differentially confirmed)
+                (Some(Value::Text(s)), Rhs::Str(p)) => like_match(s, p, *escape) != *negated,
+                // NULL value or NULL/unbound pattern: UNKNOWN
+                _ => false,
+            },
             Term::Never => false,
         }
     }
+}
+
+/// SQL LIKE, per CHARACTER (multi-byte text: `_` is one character, not
+/// one byte): `%` matches any run, `_` exactly one, the escape
+/// character makes the next pattern character literal. Plain
+/// backtracking - WHERE patterns are short.
+fn like_match(value: &str, pattern: &str, escape: Option<char>) -> bool {
+    let v: Vec<char> = value.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    fn rec(v: &[char], vi: usize, p: &[char], pi: usize, esc: Option<char>) -> bool {
+        let mut vi = vi;
+        let mut pi = pi;
+        while pi < p.len() {
+            let c = p[pi];
+            if Some(c) == esc && pi + 1 < p.len() {
+                if vi < v.len() && v[vi] == p[pi + 1] {
+                    vi += 1;
+                    pi += 2;
+                    continue;
+                }
+                return false;
+            }
+            match c {
+                '%' => {
+                    // try every split for the rest of the pattern
+                    for k in vi..=v.len() {
+                        if rec(v, k, p, pi + 1, esc) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                '_' => {
+                    if vi >= v.len() {
+                        return false;
+                    }
+                    vi += 1;
+                    pi += 1;
+                }
+                _ => {
+                    if vi >= v.len() || v[vi] != c {
+                        return false;
+                    }
+                    vi += 1;
+                    pi += 1;
+                }
+            }
+        }
+        vi == v.len()
+    }
+    rec(&v, 0, &p, 0, escape)
 }
 
 /// Pick the wire shape, SQL type, length and scale for a column from its
@@ -1254,7 +1330,7 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
 
     let set_end = where_kw.unwrap_or(s.len());
     let toks = tokenize(&s[set_kw + "SET".len()..set_end])?;
-    let mut params: Vec<Descriptor> = Vec::new();
+    let mut params: Vec<Option<Descriptor>> = Vec::new();
     let mut sets: Vec<(usize, SetVal)> = Vec::new();
     for part in split_on(&toks, |t| matches!(t, Tok::Comma)) {
         let (name, v) = match part {
@@ -1275,7 +1351,7 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                 if !param_target_ok(d) {
                     return None;
                 }
-                params.push(d.clone());
+                params.push(Some(d.clone()));
                 SetVal::Param(params.len() - 1)
             }
             lit => SetVal::Lit(encode_set_value(d, &lit)?),
@@ -1285,14 +1361,17 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     if sets.is_empty() {
         return None;
     }
+    // WHERE `?` slots number after the SET list's
+    let mut next_param = params.len();
     let filter = match where_kw {
         None => None,
         Some(w) => Some(
             tokenize(&s[w + "WHERE".len()..])
-                .and_then(|t| parse_predicate(&t))
+                .and_then(|t| parse_predicate(&t, &mut next_param))
                 .and_then(|raw| resolve_predicate(raw, &columns, descs, &mut params))?,
         ),
     };
+    let params: Vec<Descriptor> = params.into_iter().collect::<Option<_>>()?;
     let format_no = *format_no;
     Some((Plan::Update { rel, format_no, formats, sets, filter, index_ops }, params))
 }
@@ -1324,15 +1403,17 @@ fn plan_delete(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     // a relation with no RDB$FORMATS entry (a system relation) cannot
     // be walked by format - refuse rather than silently delete nothing
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
-    let mut params: Vec<Descriptor> = Vec::new();
+    let mut params: Vec<Option<Descriptor>> = Vec::new();
+    let mut next_param = 0usize;
     let filter = match where_kw {
         None => None,
         Some(w) => Some(
             tokenize(&s[w + "WHERE".len()..])
-                .and_then(|t| parse_predicate(&t))
+                .and_then(|t| parse_predicate(&t, &mut next_param))
                 .and_then(|raw| resolve_predicate(raw, &columns, descs, &mut params))?,
         ),
     };
+    let params: Vec<Descriptor> = params.into_iter().collect::<Option<_>>()?;
     Some((Plan::Delete { rel, formats, filter }, params))
 }
 
@@ -1824,7 +1905,7 @@ fn parse_on(on_s: &str, sides: &[JoinSide; 2]) -> Option<Vec<(usize, usize)>> {
 fn resolve_join_predicate(
     raw: Vec<Vec<RawTerm>>,
     sides: &[JoinSide; 2],
-    params: &mut Vec<Descriptor>,
+    params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Predicate> {
     let mut groups = Vec::new();
     for g in raw {
@@ -1857,7 +1938,7 @@ fn plan_join(
     where_s: Option<&str>,
     order_s: Option<&str>,
     db: &Database,
-    params: &mut Vec<Descriptor>,
+    params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Plan> {
     let mut sides: Vec<JoinSide> = Vec::new();
     for tr in [left, right] {
@@ -1893,11 +1974,12 @@ fn plan_join(
     };
 
     let on = parse_on(on_s, &sides)?;
+    let mut next_param = params.len();
     let filter = match where_s {
         None => None,
         Some(ws) => Some(
             tokenize(ws)
-                .and_then(|t| parse_predicate(&t))
+                .and_then(|t| parse_predicate(&t, &mut next_param))
                 .and_then(|raw| resolve_join_predicate(raw, &sides, params))?,
         ),
     };
@@ -1983,16 +2065,17 @@ fn plan_join(
 /// a visible count mismatch instead of a silently wrong answer).
 fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
     let mut params = Vec::new();
-    match plan_query_inner(sql, db, &mut params) {
-        Some(p) => (p, params),
-        None => (Plan::Scalar(Some(FIXED_ANSWER)), Vec::new()),
+    let planned = plan_query_inner(sql, db, &mut params);
+    match (planned, params.into_iter().collect::<Option<Vec<_>>>()) {
+        (Some(p), Some(ps)) => (p, ps),
+        _ => (Plan::Scalar(Some(FIXED_ANSWER)), Vec::new()),
     }
 }
 
 fn plan_query_inner(
     sql: &str,
     db: &Option<Database>,
-    params: &mut Vec<Descriptor>,
+    params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Plan> {
     let trace = std::env::var("FC_SRV_TRACE").is_ok();
     let Some((proj_s, table_s, where_s, group_s, having_s, order_s)) = split_query(sql) else {
@@ -2073,10 +2156,11 @@ fn plan_query_inner(
         .unwrap_or_default();
 
     // parse + resolve the optional WHERE clause
+    let mut next_param = 0usize;
     let filter = match where_s {
         None => None,
         Some(ws) => match tokenize(ws)
-            .and_then(|t| parse_predicate(&t))
+            .and_then(|t| parse_predicate(&t, &mut next_param))
             .and_then(|raw| resolve_predicate(raw, &columns, &descs, params))
         {
             Some(p) => Some(p),
@@ -2269,12 +2353,15 @@ fn plan_group(
             }
         }
     }
-    // HAVING filters the computed output rows (may append hidden gitems)
+    // HAVING filters the computed output rows (may append hidden gitems);
+    // `?` in HAVING is not supported - the resolver refuses the slots
+    // (the throwaway counter just satisfies the parser)
+    let mut having_np = 0usize;
     let having = match having_s {
         None => None,
         Some(hs) => Some(
             tokenize(hs)
-                .and_then(|t| parse_predicate(&t))
+                .and_then(|t| parse_predicate(&t, &mut having_np))
                 .and_then(|raw| resolve_having(raw, &mut gitems, &key_fids, columns, descs))?,
         ),
     };
@@ -3222,6 +3309,12 @@ enum Tok {
     Null,
     /// a `?` parameter placeholder - its value arrives with op_execute
     Param,
+    LParen,
+    RParen,
+    Like,
+    Between,
+    In,
+    Escape,
 }
 
 /// Tokenise a WHERE/HAVING clause. Single-quoted strings ('' escapes a
@@ -3300,6 +3393,14 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                 out.push(Tok::Param);
                 i += 1;
             }
+            b'(' => {
+                out.push(Tok::LParen);
+                i += 1;
+            }
+            b')' => {
+                out.push(Tok::RParen);
+                i += 1;
+            }
             b'0'..=b'9' => {
                 let start = i;
                 while i < b.len() && b[i].is_ascii_digit() {
@@ -3356,6 +3457,10 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                     "IS" => out.push(Tok::Is),
                     "NOT" => out.push(Tok::Not),
                     "NULL" => out.push(Tok::Null),
+                    "LIKE" => out.push(Tok::Like),
+                    "BETWEEN" => out.push(Tok::Between),
+                    "IN" => out.push(Tok::In),
+                    "ESCAPE" => out.push(Tok::Escape),
                     _ => out.push(Tok::Ident(word.to_string())),
                 }
             }
@@ -3368,38 +3473,282 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
 /// An unresolved WHERE/HAVING term (left side not yet resolved to a value
 /// index). The left side is a column name, or - in HAVING only - an
 /// aggregate call.
+#[derive(Clone)]
 struct RawTerm {
     lhs: RawLhs,
     kind: RawKind,
 }
+#[derive(Clone)]
 enum RawLhs {
     Col(String),
     Agg(AggFn, AggTarget),
 }
+#[derive(Clone)]
 enum RawKind {
     Cmp(Cmp, Rhs),
     IsNull,
     IsNotNull,
+    Like(Rhs, Option<char>, bool),
 }
 
-/// Parse a token stream into DNF (OR of AND-groups of terms). With no
-/// parentheses, AND binding tighter than OR is exactly OR-of-ANDs.
-fn parse_predicate(toks: &[Tok]) -> Option<Vec<Vec<RawTerm>>> {
-    let mut groups = Vec::new();
-    for or_part in split_on(toks, |t| matches!(t, Tok::Or)) {
-        let mut terms = Vec::new();
-        for and_part in split_on(or_part, |t| matches!(t, Tok::And)) {
-            terms.push(parse_term(and_part)?);
-        }
-        if terms.is_empty() {
-            return None;
-        }
-        groups.push(terms);
+/// The predicate syntax tree before normalization: OR/AND/NOT over
+/// leaves. `BETWEEN` and `IN` desugar at parse time (>= AND <=, OR of
+/// =), so only comparisons, NULL tests and LIKE reach the leaves.
+enum Ast {
+    Or(Vec<Ast>),
+    And(Vec<Ast>),
+    Not(Box<Ast>),
+    Leaf(RawTerm),
+}
+
+/// Parse a WHERE/HAVING token stream into DNF (OR of AND-groups of
+/// terms). Grammar: OR over AND over unary, `NOT` and parentheses in
+/// unary position, leaves `<lhs> (= <> < <= > >=) <val>`, `IS [NOT]
+/// NULL`, `[NOT] LIKE <pat> [ESCAPE <c>]`, `[NOT] BETWEEN <val> AND
+/// <val>`, `[NOT] IN (<val>, ...)`. NOT is pushed into the leaves by
+/// De Morgan during the DNF conversion (sound in three-valued logic:
+/// the inverse comparison of UNKNOWN is still UNKNOWN). `?` markers
+/// claim parameter slots AT PARSE TIME, numbered from `*next_param` in
+/// textual order - a leaf duplicated by the DNF cross-product then
+/// still references its one slot. None = a shape this parser does not
+/// cover, or a DNF blow-up past the size cap (the caller falls back
+/// rather than answering wrong).
+fn parse_predicate(toks: &[Tok], next_param: &mut usize) -> Option<Vec<Vec<RawTerm>>> {
+    let mut pos = 0usize;
+    let ast = parse_or(toks, &mut pos, next_param)?;
+    if pos != toks.len() {
+        return None; // trailing tokens
     }
-    if groups.is_empty() {
+    let dnf = to_dnf(&ast, false)?;
+    if dnf.is_empty() || dnf.iter().any(|g| g.is_empty()) {
         return None;
     }
-    Some(groups)
+    Some(dnf)
+}
+
+fn parse_or(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
+    let mut parts = vec![parse_and(t, pos, np)?];
+    while matches!(t.get(*pos), Some(Tok::Or)) {
+        *pos += 1;
+        parts.push(parse_and(t, pos, np)?);
+    }
+    Some(if parts.len() == 1 { parts.pop().unwrap() } else { Ast::Or(parts) })
+}
+
+fn parse_and(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
+    let mut parts = vec![parse_unary(t, pos, np)?];
+    while matches!(t.get(*pos), Some(Tok::And)) {
+        *pos += 1;
+        parts.push(parse_unary(t, pos, np)?);
+    }
+    Some(if parts.len() == 1 { parts.pop().unwrap() } else { Ast::And(parts) })
+}
+
+fn parse_unary(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
+    match t.get(*pos) {
+        Some(Tok::Not) => {
+            *pos += 1;
+            Some(Ast::Not(Box::new(parse_unary(t, pos, np)?)))
+        }
+        Some(Tok::LParen) => {
+            *pos += 1;
+            let inner = parse_or(t, pos, np)?;
+            if !matches!(t.get(*pos), Some(Tok::RParen)) {
+                return None;
+            }
+            *pos += 1;
+            Some(inner)
+        }
+        _ => parse_leaf(t, pos, np),
+    }
+}
+
+/// One value position in a predicate: a literal, NULL, or a `?` that
+/// claims the next parameter slot.
+fn parse_value(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Rhs> {
+    let v = match t.get(*pos)? {
+        Tok::Int(n) => Rhs::Int(*n),
+        Tok::Str(s) => Rhs::Str(s.clone()),
+        Tok::Null => Rhs::Null,
+        Tok::Param => {
+            *np += 1;
+            // the ColKind is a placeholder until resolution knows the column
+            Rhs::Param(*np - 1, ColKind::Int)
+        }
+        _ => return None,
+    };
+    *pos += 1;
+    Some(v)
+}
+
+fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
+    let lhs = match t.get(*pos)? {
+        Tok::Ident(c) => RawLhs::Col(c.clone()),
+        Tok::Agg(f, target) => RawLhs::Agg(*f, target.clone()),
+        _ => return None,
+    };
+    *pos += 1;
+    let leaf = |kind: RawKind| Ast::Leaf(RawTerm { lhs: lhs.clone(), kind });
+    // an optional NOT immediately before LIKE/BETWEEN/IN
+    let negated = if matches!(t.get(*pos), Some(Tok::Not))
+        && matches!(t.get(*pos + 1), Some(Tok::Like | Tok::Between | Tok::In))
+    {
+        *pos += 1;
+        true
+    } else {
+        false
+    };
+    match t.get(*pos)? {
+        Tok::Cmp(op) if !negated => {
+            let op = *op;
+            *pos += 1;
+            Some(leaf(RawKind::Cmp(op, parse_value(t, pos, np)?)))
+        }
+        Tok::Is if !negated => {
+            *pos += 1;
+            match (t.get(*pos), t.get(*pos + 1)) {
+                (Some(Tok::Null), _) => {
+                    *pos += 1;
+                    Some(leaf(RawKind::IsNull))
+                }
+                (Some(Tok::Not), Some(Tok::Null)) => {
+                    *pos += 2;
+                    Some(leaf(RawKind::IsNotNull))
+                }
+                _ => None,
+            }
+        }
+        Tok::Like => {
+            *pos += 1;
+            let pattern = parse_value(t, pos, np)?;
+            if matches!(pattern, Rhs::Int(_)) {
+                return None; // a numeric LIKE pattern is not a shape we answer
+            }
+            let escape = if matches!(t.get(*pos), Some(Tok::Escape)) {
+                *pos += 1;
+                let Some(Tok::Str(e)) = t.get(*pos) else { return None };
+                let mut chars = e.chars();
+                let c = chars.next()?;
+                if chars.next().is_some() {
+                    return None; // ESCAPE must be a single character
+                }
+                *pos += 1;
+                Some(c)
+            } else {
+                None
+            };
+            Some(leaf(RawKind::Like(pattern, escape, negated)))
+        }
+        Tok::Between => {
+            *pos += 1;
+            let lo = parse_value(t, pos, np)?;
+            if !matches!(t.get(*pos), Some(Tok::And)) {
+                return None;
+            }
+            *pos += 1;
+            let hi = parse_value(t, pos, np)?;
+            // x BETWEEN lo AND hi = x >= lo AND x <= hi (bounds not swapped)
+            let body = Ast::And(vec![
+                leaf(RawKind::Cmp(Cmp::Ge, lo)),
+                leaf(RawKind::Cmp(Cmp::Le, hi)),
+            ]);
+            Some(if negated { Ast::Not(Box::new(body)) } else { body })
+        }
+        Tok::In => {
+            *pos += 1;
+            if !matches!(t.get(*pos), Some(Tok::LParen)) {
+                return None;
+            }
+            *pos += 1;
+            let mut items = vec![leaf(RawKind::Cmp(Cmp::Eq, parse_value(t, pos, np)?))];
+            while matches!(t.get(*pos), Some(Tok::Comma)) {
+                *pos += 1;
+                items.push(leaf(RawKind::Cmp(Cmp::Eq, parse_value(t, pos, np)?)));
+            }
+            if !matches!(t.get(*pos), Some(Tok::RParen)) {
+                return None;
+            }
+            *pos += 1;
+            let body = Ast::Or(items);
+            Some(if negated { Ast::Not(Box::new(body)) } else { body })
+        }
+        _ => None,
+    }
+}
+
+/// The size cap on the normalized predicate - a cross-product past
+/// this is refused (fallback), never silently truncated.
+const DNF_MAX_GROUPS: usize = 64;
+
+/// Normalize the tree to OR-of-ANDs, pushing `neg` down by De Morgan.
+fn to_dnf(ast: &Ast, neg: bool) -> Option<Vec<Vec<RawTerm>>> {
+    match ast {
+        Ast::Not(inner) => to_dnf(inner, !neg),
+        // OR of DNFs concatenates; negated it is an AND of negations
+        Ast::Or(parts) if !neg => concat_dnf(parts, neg),
+        Ast::And(parts) if neg => concat_dnf(parts, neg),
+        // AND of DNFs distributes (cross-product)
+        Ast::And(parts) if !neg => cross_dnf(parts, neg),
+        Ast::Or(parts) | Ast::And(parts) => cross_dnf(parts, neg),
+        Ast::Leaf(t) => {
+            let t = if neg { negate_term(t)? } else { t.clone() };
+            Some(vec![vec![t]])
+        }
+    }
+}
+
+fn concat_dnf(parts: &[Ast], neg: bool) -> Option<Vec<Vec<RawTerm>>> {
+    let mut out = Vec::new();
+    for p in parts {
+        out.extend(to_dnf(p, neg)?);
+        if out.len() > DNF_MAX_GROUPS {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+fn cross_dnf(parts: &[Ast], neg: bool) -> Option<Vec<Vec<RawTerm>>> {
+    let mut acc: Vec<Vec<RawTerm>> = vec![Vec::new()];
+    for p in parts {
+        let d = to_dnf(p, neg)?;
+        let mut next = Vec::with_capacity(acc.len() * d.len());
+        for a in &acc {
+            for g in &d {
+                let mut merged = a.clone();
+                merged.extend(g.iter().cloned());
+                next.push(merged);
+            }
+        }
+        if next.len() > DNF_MAX_GROUPS {
+            return None;
+        }
+        acc = next;
+    }
+    Some(acc)
+}
+
+/// The negation of one leaf, in three-valued logic: the inverse
+/// comparison (UNKNOWN stays UNKNOWN under both), the flipped NULL
+/// test (two-valued), the flipped LIKE.
+fn negate_term(t: &RawTerm) -> Option<RawTerm> {
+    let kind = match &t.kind {
+        RawKind::Cmp(op, rhs) => {
+            let inv = match op {
+                Cmp::Eq => Cmp::Ne,
+                Cmp::Ne => Cmp::Eq,
+                Cmp::Lt => Cmp::Ge,
+                Cmp::Ge => Cmp::Lt,
+                Cmp::Gt => Cmp::Le,
+                Cmp::Le => Cmp::Gt,
+            };
+            RawKind::Cmp(inv, rhs.clone())
+        }
+        RawKind::IsNull => RawKind::IsNotNull,
+        RawKind::IsNotNull => RawKind::IsNull,
+        RawKind::Like(p, e, negated) => RawKind::Like(p.clone(), *e, !negated),
+    };
+    Some(RawTerm { lhs: t.lhs.clone(), kind })
 }
 
 fn split_on<'a>(toks: &'a [Tok], is_sep: impl Fn(&Tok) -> bool) -> Vec<&'a [Tok]> {
@@ -3413,25 +3762,6 @@ fn split_on<'a>(toks: &'a [Tok], is_sep: impl Fn(&Tok) -> bool) -> Vec<&'a [Tok]
     }
     parts.push(&toks[start..]);
     parts
-}
-
-fn parse_term(t: &[Tok]) -> Option<RawTerm> {
-    let lhs = match t.first()? {
-        Tok::Ident(c) => RawLhs::Col(c.clone()),
-        Tok::Agg(f, target) => RawLhs::Agg(*f, target.clone()),
-        _ => return None,
-    };
-    let kind = match &t[1..] {
-        [Tok::Cmp(op), Tok::Int(n)] => RawKind::Cmp(*op, Rhs::Int(*n)),
-        [Tok::Cmp(op), Tok::Str(v)] => RawKind::Cmp(*op, Rhs::Str(v.clone())),
-        // slot index and kind are placeholders until a resolver that
-        // supports parameters assigns them
-        [Tok::Cmp(op), Tok::Param] => RawKind::Cmp(*op, Rhs::Param(usize::MAX, ColKind::Int)),
-        [Tok::Is, Tok::Null] => RawKind::IsNull,
-        [Tok::Is, Tok::Not, Tok::Null] => RawKind::IsNotNull,
-        _ => return None,
-    };
-    Some(RawTerm { lhs, kind })
 }
 
 /// Whether a descriptor is comparable as an integer or as text (the only
@@ -3466,23 +3796,32 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
             ColKind::Text => Term::Cmp(idx, op, Rhs::Str(v)),
             _ => return None,
         },
+        // comparison against a NULL literal: legal SQL, always UNKNOWN
+        RawKind::Cmp(_, Rhs::Null) => Term::Never,
         RawKind::Cmp(_, Rhs::Param(..)) => return None,
         RawKind::IsNull => Term::IsNull(idx),
         RawKind::IsNotNull => Term::IsNotNull(idx),
+        RawKind::Like(pattern, escape, negated) => match (kind, pattern) {
+            (ColKind::Text, Rhs::Str(p)) => Term::Like(idx, Rhs::Str(p), escape, negated),
+            // <col> LIKE NULL is UNKNOWN for every row
+            (ColKind::Text, Rhs::Null) => Term::Never,
+            _ => return None,
+        },
     })
 }
 
 /// Resolve every WHERE term's column name to a field id and check the
 /// literal type matches the column type. Returns None on an unknown
 /// column, an unsupported column type, a literal/column type mismatch, or
-/// an aggregate call (aggregates are not valid in WHERE). A `?` term
-/// registers the column's descriptor in `params` (slot indexes run in
-/// SQL textual order, which DNF resolution preserves) and binds later.
+/// an aggregate call (aggregates are not valid in WHERE). A `?` term's
+/// slot was numbered at parse time; resolution fills `params[slot]`
+/// with the column's descriptor (a leaf the DNF cross-product
+/// duplicated fills its one slot twice with the same descriptor).
 fn resolve_predicate(
     raw: Vec<Vec<RawTerm>>,
     columns: &[RelationColumn],
     descs: &[Descriptor],
-    params: &mut Vec<Descriptor>,
+    params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Predicate> {
     let mut groups = Vec::new();
     for g in raw {
@@ -3503,24 +3842,39 @@ fn resolve_predicate(
 }
 
 /// The parameter-aware wrapper around [typed_term]: a `?` right-hand
-/// side claims the next parameter slot for the column's descriptor;
+/// side fills its parse-time slot with the column's descriptor;
 /// anything else resolves as before.
 fn param_or_typed_term(
     idx: usize,
     kind: ColKind,
     raw: RawKind,
     d: &Descriptor,
-    params: &mut Vec<Descriptor>,
+    params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Term> {
-    if let RawKind::Cmp(op, Rhs::Param(..)) = raw {
+    let mut claim = |slot: usize| -> Option<()> {
         if !param_target_ok(d) {
             return None;
         }
-        let slot = params.len();
-        params.push(d.clone());
-        return Some(Term::Cmp(idx, op, Rhs::Param(slot, kind)));
+        if params.len() <= slot {
+            params.resize(slot + 1, None);
+        }
+        params[slot] = Some(d.clone());
+        Some(())
+    };
+    match raw {
+        RawKind::Cmp(op, Rhs::Param(slot, _)) => {
+            claim(slot)?;
+            Some(Term::Cmp(idx, op, Rhs::Param(slot, kind)))
+        }
+        RawKind::Like(Rhs::Param(slot, _), escape, negated) => {
+            if kind != ColKind::Text {
+                return None;
+            }
+            claim(slot)?;
+            Some(Term::Like(idx, Rhs::Param(slot, ColKind::Text), escape, negated))
+        }
+        other => typed_term(idx, kind, other),
     }
-    typed_term(idx, kind, raw)
 }
 
 /// Resolve a HAVING predicate against a grouped query's OUTPUT rows. A
@@ -4273,7 +4627,7 @@ mod tests {
     #[test]
     fn where_params_register_targets_in_order() {
         let toks = tokenize("A = ? AND B = ?").unwrap();
-        let raw = parse_predicate(&toks).unwrap();
+        let raw = parse_predicate(&toks, &mut 0).unwrap();
         let columns = vec![
             RelationColumn { name: "A".into(), field_id: 0, position: 0 },
             RelationColumn { name: "B".into(), field_id: 1, position: 1 },
@@ -4282,8 +4636,8 @@ mod tests {
         let mut params = Vec::new();
         let p = resolve_predicate(raw, &columns, &descs, &mut params).unwrap();
         assert_eq!(params.len(), 2);
-        assert_eq!(params[0].dtype, dtype::LONG);
-        assert_eq!(params[1].dtype, dtype::VARYING);
+        assert_eq!(params[0].as_ref().unwrap().dtype, dtype::LONG);
+        assert_eq!(params[1].as_ref().unwrap().dtype, dtype::VARYING);
         // slots bind positionally
         let b = p
             .bind(&[WireParam::Int(7, 0), WireParam::Text("q".into())])
@@ -4291,9 +4645,116 @@ mod tests {
         assert!(b.matches(&[Value::Int(7), Value::Text("q".into())]));
         // a parameter on an unbindable column type refuses the plan
         let toks = tokenize("A = ?").unwrap();
-        let raw = parse_predicate(&toks).unwrap();
+        let raw = parse_predicate(&toks, &mut 0).unwrap();
         let blob_descs = vec![desc(dtype::BLOB, 8, 0)];
         assert!(resolve_predicate(raw, &columns, &blob_descs, &mut Vec::new()).is_none());
+    }
+
+    #[test]
+    fn like_matches_per_character() {
+        assert!(like_match("abc", "abc", None));
+        assert!(!like_match("abc", "ab", None));
+        assert!(like_match("abc", "a%", None));
+        assert!(like_match("abc", "%c", None));
+        assert!(like_match("abc", "%b%", None));
+        assert!(like_match("abc", "a_c", None));
+        assert!(!like_match("abc", "a_d", None));
+        assert!(like_match("", "%", None));
+        assert!(!like_match("", "_", None));
+        // CHAR padding counts: the stored value is padded
+        assert!(!like_match("abc  ", "abc", None));
+        assert!(like_match("abc  ", "abc%", None));
+        assert!(like_match("abc  ", "abc  ", None));
+        // escape makes the wildcard literal
+        assert!(like_match("50%", "50\\%", Some('\\')));
+        assert!(!like_match("500", "50\\%", Some('\\')));
+        // multi-byte: `_` is one CHARACTER
+        assert!(like_match("héllo", "h_llo", None));
+        assert!(like_match("héllo", "h%o", None));
+    }
+
+    #[test]
+    fn predicate_grammar_desugars_and_negates() {
+        let dnf = |s: &str| parse_predicate(&tokenize(s).unwrap(), &mut 0).unwrap();
+        // BETWEEN = >= AND <=
+        let d = dnf("A BETWEEN 2 AND 5");
+        assert_eq!((d.len(), d[0].len()), (1, 2));
+        assert!(matches!(&d[0][0].kind, RawKind::Cmp(Cmp::Ge, Rhs::Int(2))));
+        assert!(matches!(&d[0][1].kind, RawKind::Cmp(Cmp::Le, Rhs::Int(5))));
+        // NOT BETWEEN pushes through De Morgan: < 2 OR > 5
+        let d = dnf("A NOT BETWEEN 2 AND 5");
+        assert_eq!(d.len(), 2);
+        assert!(matches!(&d[0][0].kind, RawKind::Cmp(Cmp::Lt, Rhs::Int(2))));
+        assert!(matches!(&d[1][0].kind, RawKind::Cmp(Cmp::Gt, Rhs::Int(5))));
+        // IN = OR of equalities; NOT IN = AND of inequalities
+        let d = dnf("A IN (1, 2, 3)");
+        assert_eq!(d.len(), 3);
+        let d = dnf("A NOT IN (1, 2)");
+        assert_eq!((d.len(), d[0].len()), (1, 2));
+        assert!(matches!(&d[0][0].kind, RawKind::Cmp(Cmp::Ne, Rhs::Int(1))));
+        // a NULL in a NOT IN list survives as <> NULL (resolves to
+        // Never - the whole conjunct can never pass: engine 3VL)
+        let d = dnf("A NOT IN (1, NULL)");
+        assert!(matches!(&d[0][1].kind, RawKind::Cmp(Cmp::Ne, Rhs::Null)));
+        // NOT over a parenthesized OR: De Morgan to one AND group
+        let d = dnf("NOT (A = 1 OR B = 2)");
+        assert_eq!((d.len(), d[0].len()), (1, 2));
+        assert!(matches!(&d[0][0].kind, RawKind::Cmp(Cmp::Ne, Rhs::Int(1))));
+        // parens override precedence: (A=1 OR B=2) AND C=3 cross-multiplies
+        let d = dnf("(A = 1 OR B = 2) AND C = 3");
+        assert_eq!(d.len(), 2);
+        assert_eq!(d[0].len(), 2);
+        // NOT LIKE flips the leaf flag; ESCAPE parses
+        let d = dnf("A NOT LIKE 'x%' ESCAPE '!'");
+        assert!(matches!(&d[0][0].kind, RawKind::Like(Rhs::Str(_), Some('!'), true)));
+        // double NOT cancels
+        let d = dnf("NOT NOT A = 1");
+        assert!(matches!(&d[0][0].kind, RawKind::Cmp(Cmp::Eq, Rhs::Int(1))));
+        // unsupported shapes refuse: dangling paren, bare NOT, agg call
+        let pp = |s: &str| parse_predicate(&tokenize(s).unwrap(), &mut 0);
+        assert!(pp("(A = 1").is_none());
+        assert!(pp("NOT").is_none());
+        assert!(pp("A LIKE 5").is_none());
+        assert!(pp("A BETWEEN 1").is_none());
+        assert!(pp("A IN ()").is_none());
+    }
+
+    #[test]
+    fn cross_product_keeps_one_slot_per_question_mark() {
+        // (A = ? OR B = ?) AND A = ? distributes to two groups that
+        // SHARE the third ?'s slot - three parameters, not four
+        let mut np = 0usize;
+        let raw =
+            parse_predicate(&tokenize("(A = ? OR B = ?) AND A = ?").unwrap(), &mut np).unwrap();
+        assert_eq!(np, 3);
+        assert_eq!(raw.len(), 2); // two OR groups after distribution
+        let columns = vec![
+            RelationColumn { name: "A".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "B".into(), field_id: 1, position: 1 },
+        ];
+        let descs = vec![desc(dtype::LONG, 4, 0), desc(dtype::INT64, 8, 0)];
+        let mut params: Vec<Option<Descriptor>> = Vec::new();
+        let p = resolve_predicate(raw, &columns, &descs, &mut params).unwrap();
+        assert_eq!(params.len(), 3);
+        assert!(params.iter().all(|p| p.is_some()));
+        // slot 2 binds once and satisfies BOTH groups' copies
+        let b = p
+            .bind(&[WireParam::Int(1, 0), WireParam::Int(99, 0), WireParam::Int(7, 0)])
+            .unwrap();
+        assert!(!b.matches(&[Value::Int(1), Value::Int(0)])); // A=1 but A<>7
+        assert!(b.matches(&[Value::Int(7), Value::Int(99)])); // B=99, A=7
+        // a LIKE pattern `?` registers as the text column's descriptor
+        let mut np = 0usize;
+        let raw = parse_predicate(&tokenize("B LIKE ?").unwrap(), &mut np).unwrap();
+        let text_descs = vec![desc(dtype::LONG, 4, 0), desc(dtype::VARYING, 22, 0)];
+        let mut params: Vec<Option<Descriptor>> = Vec::new();
+        let p = resolve_predicate(raw, &columns, &text_descs, &mut params).unwrap();
+        assert_eq!(params[0].as_ref().unwrap().dtype, dtype::VARYING);
+        let b = p.bind(&[WireParam::Text("q%".into())]).unwrap();
+        assert!(b.matches(&[Value::Int(0), Value::Text("quux".into())]));
+        // and a NULL pattern is UNKNOWN
+        let b = p.bind(&[WireParam::Null]).unwrap();
+        assert!(!b.matches(&[Value::Int(0), Value::Text("quux".into())]));
     }
 
     #[test]
@@ -4528,24 +4989,25 @@ mod tests {
     #[test]
     fn tokenizes_and_parses_predicate() {
         let toks = tokenize("ID >= 5 AND NAME = 'a b' OR SALARY IS NULL").unwrap();
-        let dnf = parse_predicate(&toks).unwrap();
+        let dnf = parse_predicate(&toks, &mut 0).unwrap();
         assert_eq!(dnf.len(), 2); // two OR groups
         assert_eq!(dnf[0].len(), 2); // ID>=5 AND NAME='a b'
         assert_eq!(dnf[1].len(), 1); // SALARY IS NULL
         // string literal keeps embedded spaces and case
         assert!(matches!(&dnf[0][1].kind, RawKind::Cmp(_, Rhs::Str(s)) if s == "a b"));
         // <> and != both parse; negative ints; IS NOT NULL
-        assert!(parse_predicate(&tokenize("A <> -3").unwrap()).is_some());
-        assert!(parse_predicate(&tokenize("A != 1 AND B IS NOT NULL").unwrap()).is_some());
-        // parentheses / functions are unsupported -> tokenize fails
-        assert!(tokenize("(A = 1)").is_none());
+        assert!(parse_predicate(&tokenize("A <> -3").unwrap(), &mut 0).is_some());
+        assert!(parse_predicate(&tokenize("A != 1 AND B IS NOT NULL").unwrap(), &mut 0).is_some());
+        // parentheses group (increment 32): (A = 1) is one plain leaf
+        let dnf = parse_predicate(&tokenize("(A = 1)").unwrap(), &mut 0).unwrap();
+        assert_eq!((dnf.len(), dnf[0].len()), (1, 1));
     }
 
     #[test]
     fn tokenizes_aggregate_calls() {
         // an aggregate call is ONE token, spacing-tolerant
         let toks = tokenize("count( * ) > 3 AND MIN(SALARY) >= 100").unwrap();
-        let dnf = parse_predicate(&toks).unwrap();
+        let dnf = parse_predicate(&toks, &mut 0).unwrap();
         assert_eq!(dnf.len(), 1);
         assert_eq!(dnf[0].len(), 2);
         assert!(matches!(&dnf[0][0].lhs, RawLhs::Agg(AggFn::Count, AggTarget::Star)));
@@ -4554,14 +5016,15 @@ mod tests {
         );
         // IS [NOT] NULL applies to aggregates too
         let toks = tokenize("SUM(B) IS NOT NULL").unwrap();
-        assert!(matches!(&parse_predicate(&toks).unwrap()[0][0].kind, RawKind::IsNotNull));
-        // a non-aggregate function still fails (unsupported)
-        assert!(tokenize("UPPER(NAME) = 'X'").is_none());
+        assert!(matches!(&parse_predicate(&toks, &mut 0).unwrap()[0][0].kind, RawKind::IsNotNull));
+        // a non-aggregate function call tokenizes (parens are tokens
+        // now) but the PARSER refuses it - not a supported leaf
+        assert!(parse_predicate(&tokenize("UPPER(NAME) = 'X'").unwrap(), &mut 0).is_none());
         // ...as does a malformed aggregate
         assert!(tokenize("MIN(*) > 1").is_none());
         // an aggregate name NOT followed by parens is a plain identifier
         let toks = tokenize("COUNT = 1").unwrap();
-        assert!(matches!(&parse_predicate(&toks).unwrap()[0][0].lhs, RawLhs::Col(c) if c == "COUNT"));
+        assert!(matches!(&parse_predicate(&toks, &mut 0).unwrap()[0][0].lhs, RawLhs::Col(c) if c == "COUNT"));
     }
 
     #[test]
@@ -4671,7 +5134,7 @@ mod tests {
     #[test]
     fn join_predicate_uses_combined_indexes() {
         let sides = join_sides();
-        let raw = parse_predicate(&tokenize("E.ID >= 5 AND D.NAME = 'Sales'").unwrap()).unwrap();
+        let raw = parse_predicate(&tokenize("E.ID >= 5 AND D.NAME = 'Sales'").unwrap(), &mut 0).unwrap();
         let p = resolve_join_predicate(raw, &sides, &mut Vec::new()).unwrap();
         // combined row: [E.ID, E.DEPT_ID, E.NAME, D.ID, D.NAME]
         let row = |id: i64, dname: &str| {
@@ -4687,7 +5150,7 @@ mod tests {
         assert!(!p.matches(&row(4, "Sales")));
         assert!(!p.matches(&row(9, "Ops")));
         // an ambiguous bare column cannot resolve
-        let raw = parse_predicate(&tokenize("NAME = 'x'").unwrap()).unwrap();
+        let raw = parse_predicate(&tokenize("NAME = 'x'").unwrap(), &mut 0).unwrap();
         assert!(resolve_join_predicate(raw, &sides, &mut Vec::new()).is_none());
     }
 
@@ -4707,7 +5170,7 @@ mod tests {
 
         // COUNT(*) resolves to the EXISTING item 1; SUM(SALARY) and the
         // grouped key DEPT_ID... COUNT(*) again must not duplicate
-        let raw = parse_predicate(&tokenize("COUNT(*) > 3 AND SUM(SALARY) > 100 OR DEPT_ID IS NULL").unwrap()).unwrap();
+        let raw = parse_predicate(&tokenize("COUNT(*) > 3 AND SUM(SALARY) > 100 OR DEPT_ID IS NULL").unwrap(), &mut 0).unwrap();
         let p = resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).unwrap();
         assert_eq!(gitems.len(), 3); // one hidden item appended: SUM(SALARY)
         assert!(matches!(gitems[2], GItem::Agg(AggFn::Sum, Some(5))));
@@ -4716,16 +5179,16 @@ mod tests {
         assert!(!p.matches(&[Value::Int(1), Value::Int(4), Value::Int(50)]));
         assert!(p.matches(&[Value::Null, Value::Int(1), Value::Null])); // the OR arm
         // a non-grouped column in HAVING is invalid
-        let raw = parse_predicate(&tokenize("SALARY > 1").unwrap()).unwrap();
+        let raw = parse_predicate(&tokenize("SALARY > 1").unwrap(), &mut 0).unwrap();
         assert!(resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).is_none());
         // MIN over a text column is unsupported
-        let raw = parse_predicate(&tokenize("MIN(NAME) IS NULL").unwrap()).unwrap();
+        let raw = parse_predicate(&tokenize("MIN(NAME) IS NULL").unwrap(), &mut 0).unwrap();
         assert!(resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).is_none());
         // an aggregate compared against a string literal is a type mismatch
-        let raw = parse_predicate(&tokenize("COUNT(*) = 'x'").unwrap()).unwrap();
+        let raw = parse_predicate(&tokenize("COUNT(*) = 'x'").unwrap(), &mut 0).unwrap();
         assert!(resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).is_none());
         // ...and WHERE resolution rejects aggregates outright
-        let raw = parse_predicate(&tokenize("COUNT(*) > 3").unwrap()).unwrap();
+        let raw = parse_predicate(&tokenize("COUNT(*) > 3").unwrap(), &mut 0).unwrap();
         assert!(resolve_predicate(raw, &columns, &descs, &mut Vec::new()).is_none());
     }
 
