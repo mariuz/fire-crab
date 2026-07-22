@@ -307,6 +307,12 @@ fn build_describe(cols: &[ProjCol], params: &[Descriptor]) -> Vec<u8> {
 /// resolve from the database (or no database is loaded).
 const FIXED_ANSWER: i64 = 4242;
 
+/// A monotonic attachment id, one per op_attach, so `con.info.id`
+/// (isc_info_attachment_id) is distinct per connection - the
+/// firebird-qa bootstrap opens two employee connections and names both
+/// ids in its architecture-detection query.
+static ATTACH_COUNTER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+
 /// The transaction handle the server hands out (op_transaction) and
 /// echoes in op_execute responses (server.cpp send_response uses the
 /// transaction's rtr_id - the OO client reads it as the live
@@ -321,6 +327,9 @@ struct Database {
     page_size: usize,
     /// where the bytes came from - an INSERT flushes back here
     path: String,
+    /// ODS version from the header (for op_info_database)
+    ods_major: u16,
+    ods_minor: u16,
 }
 
 /// Open the file the client named in op_attach, if it exists and looks
@@ -338,7 +347,13 @@ fn load_database(path: &str) -> Option<Database> {
     if page_size == 0 {
         return None;
     }
-    Some(Database { bytes, page_size, path: p.to_string() })
+    Some(Database {
+        bytes,
+        page_size,
+        path: p.to_string(),
+        ods_major: h.ods_major(),
+        ods_minor: h.ods_minor,
+    })
 }
 
 /// Materialise an empty real database at `path` (op_create). fire-crab
@@ -458,6 +473,12 @@ fn service_info(items: &[u8]) -> Vec<u8> {
         d.extend_from_slice(&(val.len() as u16).to_le_bytes());
         d.extend_from_slice(val.as_bytes());
     }
+    // RUNNING and VERSION are read by the driver as a bare 4-byte int
+    // (no 2-byte length prefix), unlike the string items - probe-pinned.
+    fn int_item(d: &mut Vec<u8>, tag: u8, val: i32) {
+        d.push(tag);
+        d.extend_from_slice(&val.to_le_bytes());
+    }
     let mut d = Vec::new();
     for &it in items {
         match it {
@@ -468,6 +489,8 @@ fn service_info(items: &[u8]) -> Vec<u8> {
             58 => str_item(&mut d, 58, "/opt/firebird/security6.fdb"), // USER_DBPATH
             59 => str_item(&mut d, 59, "/opt/firebird/"), // GET_ENV (home)
             60 => str_item(&mut d, 60, "/tmp/firebird/"), // GET_ENV_LOCK
+            54 => int_item(&mut d, 54, 2), // VERSION (service manager)
+            67 => int_item(&mut d, 67, 0), // RUNNING: no async action is running
             _ => {}
         }
     }
@@ -563,6 +586,10 @@ struct ProjCol {
 /// `WHERE right.col IS NULL` the classic anti-join).
 enum Plan {
     Scalar(Option<i64>),
+    /// A query over a MON$ virtual table, which fire-crab reports as
+    /// empty: one row of `ncols` NULL columns (an aggregate over no
+    /// rows). Used for the firebird-qa bootstrap's architecture probe.
+    VirtualEmpty { ncols: usize },
     /// `CREATE TABLE <name> (<col defs>)`: catalog rows, format and
     /// runtime blobs, pointer/root pages, NOT NULL/PRIMARY KEY
     /// constraint rows - all written at op_execute through
@@ -2609,6 +2636,22 @@ fn plan_query_inner(
             proj_s, table_s, where_s, group_s, having_s, order_s
         );
     }
+    // MON$ virtual tables: fire-crab keeps no live monitoring state, so
+    // it reports them as EMPTY. The firebird-qa bootstrap runs one
+    // aggregate query over MON$ATTACHMENTS to detect the server
+    // architecture; an aggregate over no rows is one all-NULL row (which
+    // makes the bootstrap classify fire-crab as an embedded server). The
+    // projection there uses shapes this server's SQL does not parse
+    // (COUNT(DISTINCT ...), IIF(...)), so the column count is taken from
+    // the top-level commas rather than a real parse - honest for an
+    // always-empty relation. Detected before projection parsing.
+    if let Some((first, _)) = parse_from(table_s).and_then(|(l, _)| Some((l.table.to_string(), ())))
+    {
+        if first.to_ascii_uppercase().starts_with("MON$") {
+            let ncols = count_top_level_cols(proj_s);
+            return Some(Plan::VirtualEmpty { ncols });
+        }
+    }
     let Some(proj) = parse_projection(proj_s) else {
         if trace { eprintln!("[srv] plan: parse_projection failed"); }
         return None;
@@ -3297,17 +3340,36 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         Plan::Project { cols, .. } => build_describe(cols, params),
         Plan::Join { cols, .. } => build_describe(cols, params),
         Plan::Group { cols, .. } => build_describe(cols, params),
+        Plan::VirtualEmpty { .. } => build_describe(&output_cols_of(plan), params),
     }
 }
 
 /// The isc_info_sql_stmt_ type code for a plan.
 fn stmt_type_of(plan: &Plan) -> i32 {
     match plan {
-        Plan::Scalar(_) | Plan::Project { .. } | Plan::Join { .. } | Plan::Group { .. } => 1,
+        Plan::Scalar(_)
+        | Plan::Project { .. }
+        | Plan::Join { .. }
+        | Plan::Group { .. }
+        | Plan::VirtualEmpty { .. } => 1,
         Plan::Insert { .. } => 2,
         Plan::Update { .. } => 3,
         Plan::Delete { .. } => 4,
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. } => 5,
+    }
+}
+
+/// One projected BIGINT column named `Cn` - what a virtual-empty query's
+/// columns describe as.
+fn bigint_col(n: usize) -> ProjCol {
+    ProjCol {
+        name: format!("C{}", n),
+        field_id: n,
+        wire: Wire::Int64,
+        sql_type: 580,
+        length: 8,
+        scale: 0,
+        sub_type: 0,
     }
 }
 
@@ -3327,8 +3389,26 @@ fn output_cols_of(plan: &Plan) -> Vec<ProjCol> {
             scale: 0,
             sub_type: 0,
         }],
+        Plan::VirtualEmpty { ncols } => (0..*ncols).map(bigint_col).collect(),
         _ => Vec::new(),
     }
+}
+
+/// Count top-level (paren-depth 0) comma-separated items in a select
+/// list - the column count of a projection this server does not fully
+/// parse (a MON$ aggregate query).
+fn count_top_level_cols(proj: &str) -> usize {
+    let mut depth = 0i32;
+    let mut n = 1usize;
+    for ch in proj.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => n += 1,
+            _ => {}
+        }
+    }
+    n.max(1)
 }
 
 /// Answer an op_prepare_statement's REQUESTED item list - what the
@@ -3380,7 +3460,11 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         .collect();
     let has_cursor = matches!(
         plan,
-        Plan::Scalar(_) | Plan::Project { .. } | Plan::Join { .. } | Plan::Group { .. }
+        Plan::Scalar(_)
+            | Plan::Project { .. }
+            | Plan::Join { .. }
+            | Plan::Group { .. }
+            | Plan::VirtualEmpty { .. }
     );
 
     let mut d = Vec::new();
@@ -3443,7 +3527,11 @@ fn answer_info_sql(items: &[u8], plan: &Plan, last_dml: (i32, i32, i32)) -> Vec<
     let mut d = Vec::new();
     let has_cursor = matches!(
         plan,
-        Plan::Scalar(_) | Plan::Project { .. } | Plan::Join { .. } | Plan::Group { .. }
+        Plan::Scalar(_)
+            | Plan::Project { .. }
+            | Plan::Join { .. }
+            | Plan::Group { .. }
+            | Plan::VirtualEmpty { .. }
     );
     for &it in items {
         match it {
@@ -3508,6 +3596,21 @@ fn emit_rows_inner(
                 None => {
                     w.raw(&[1u8, 0, 0, 0]); // null bitmap: col 0 is NULL, no data
                 }
+            }
+        }
+        Plan::VirtualEmpty { ncols } => {
+            // one row, every column NULL - an aggregate over the empty
+            // MON$ relation. The null bitmap is all-ones (padded to 4B).
+            w.int(OP_FETCH_RESPONSE).int(0).int(1);
+            let nbytes = ncols.div_ceil(8);
+            let mut bitmap = vec![0xFFu8; nbytes];
+            // clear bits past ncols in the last byte
+            if ncols % 8 != 0 {
+                bitmap[nbytes - 1] = (1u8 << (ncols % 8)) - 1;
+            }
+            w.raw(&bitmap);
+            for _ in nbytes..nbytes.div_ceil(4) * 4 {
+                w.raw(&[0u8]);
             }
         }
         Plan::Project {
@@ -4810,6 +4913,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
             }
         );
     }
+    let attach_id = ATTACH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     respond(&mut s, &mut enc, 1)?; // attachment handle 1
 
     // The SQL text of the most recently prepared statement, the plan it
@@ -5127,7 +5231,14 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 read_int(&mut s, &mut dec)?; // incarnation
                 let items = read_wire_bytes(&mut s, &mut dec)?; // requested items
                 read_int(&mut s, &mut dec)?; // buffer length
-                let info = build_db_info(&items);
+                let ctx = DbInfoCtx {
+                    db_path: db_path.clone(),
+                    attach_id,
+                    ods_major: database.as_ref().map_or(14, |d| d.ods_major),
+                    ods_minor: database.as_ref().map_or(0, |d| d.ods_minor),
+                    page_size: database.as_ref().map_or(8192, |d| d.page_size as u32),
+                };
+                let info = build_db_info(&items, &ctx);
                 let mut w = W::default();
                 w.int(OP_RESPONSE).int(0).int(0).int(0).bytes(&info).int(0);
                 w.send(&mut s, &mut enc)?;
@@ -5147,7 +5258,7 @@ fn hex_upper(b: &[u8]) -> String {
 /// code(1) + length(2 LE) + little-endian value; unknown items are
 /// skipped; the buffer ends with isc_info_end (1). Enough for isql to
 /// establish dialect/ODS/version and show its prompt.
-fn build_db_info(items: &[u8]) -> Vec<u8> {
+fn build_db_info(items: &[u8], ctx: &DbInfoCtx) -> Vec<u8> {
     let mut out = Vec::new();
     fn put_int(out: &mut Vec<u8>, code: u8, val: i32) {
         out.push(code);
@@ -5156,11 +5267,37 @@ fn build_db_info(items: &[u8]) -> Vec<u8> {
     }
     for &code in items {
         match code {
-            62 => put_int(&mut out, 62, 3),    // isc_info_db_sql_dialect
-            32 => put_int(&mut out, 32, 13),   // isc_info_ods_version (FB6)
-            33 => put_int(&mut out, 33, 0),    // isc_info_ods_minor_version
-            14 => put_int(&mut out, 14, 8192), // isc_info_page_size
-            63 => put_int(&mut out, 63, 0),    // isc_info_db_read_only
+            62 => {
+                // isc_info_db_sql_dialect: a ONE-byte value (probe-pinned)
+                out.push(62);
+                out.extend_from_slice(&1u16.to_le_bytes());
+                out.push(3);
+            }
+            32 => put_int(&mut out, 32, ctx.ods_major as i32), // isc_info_ods_version
+            33 => put_int(&mut out, 33, ctx.ods_minor as i32), // isc_info_ods_minor_version
+            14 => put_int(&mut out, 14, ctx.page_size as i32), // isc_info_page_size
+            22 => put_int(&mut out, 22, ctx.attach_id),        // isc_info_attachment_id
+            5 => put_int(&mut out, 5, 100),                    // isc_info_reads
+            6 => put_int(&mut out, 6, 0),                      // isc_info_writes
+            7 => put_int(&mut out, 7, 1000),                   // isc_info_fetches
+            8 => put_int(&mut out, 8, 0),                      // isc_info_marks
+            63 => put_int(&mut out, 63, 0),                    // isc_info_db_read_only
+            4 => {
+                // isc_info_db_id: a count byte then pascal strings; the
+                // driver returns [0] as the database name. Two strings:
+                // the file path and the host (probe-pinned layout).
+                let host = "fire-crab";
+                let path = ctx.db_path.as_bytes();
+                let mut data = Vec::new();
+                data.push(2u8); // string count
+                data.push(path.len().min(255) as u8);
+                data.extend_from_slice(&path[..path.len().min(255)]);
+                data.push(host.len() as u8);
+                data.extend_from_slice(host.as_bytes());
+                out.push(4);
+                out.extend_from_slice(&(data.len() as u16).to_le_bytes());
+                out.extend_from_slice(&data);
+            }
             13 => {
                 // isc_info_base_level: byte-count-prefixed value
                 out.push(13);
@@ -5182,6 +5319,15 @@ fn build_db_info(items: &[u8]) -> Vec<u8> {
     }
     out.push(1); // isc_info_end
     out
+}
+
+/// Context for `build_db_info`: what the per-attachment info items need.
+struct DbInfoCtx {
+    db_path: String,
+    attach_id: i32,
+    ods_major: u16,
+    ods_minor: u16,
+    page_size: u32,
 }
 
 /// Run the fire-crab wire server on `addr` (e.g. "127.0.0.1:3051"),
@@ -6052,25 +6198,75 @@ mod tests {
         assert_eq!(w.buf.len(), 12); // null col contributes no data
     }
 
+    fn dbctx() -> DbInfoCtx {
+        DbInfoCtx {
+            db_path: "/tmp/x.fdb".into(),
+            attach_id: 7,
+            ods_major: 14,
+            ods_minor: 0,
+            page_size: 8192,
+        }
+    }
+
     #[test]
     fn db_info_answers_known_items_and_ends() {
-        // isc_info_db_sql_dialect(62) + isc_info_ods_version(32),
-        // terminated by isc_info_end(1).
-        let out = build_db_info(&[62, 32, 1]);
+        // isc_info_db_sql_dialect(62) is a ONE-byte value; ods_version(32)
+        // a 4-byte int; the buffer ends with isc_info_end(1).
+        let out = build_db_info(&[62, 32, 1], &dbctx());
         assert_eq!(out[0], 62);
-        // 2-byte LE length field (= 4), then the 4-byte LE dialect value 3
-        assert_eq!(&out[1..3], &4u16.to_le_bytes());
-        assert_eq!(i32::from_le_bytes([out[3], out[4], out[5], out[6]]), 3);
-        // ODS version item follows
-        assert_eq!(out[7], 32);
-        // and the buffer ends with isc_info_end
+        assert_eq!(&out[1..3], &1u16.to_le_bytes()); // dialect length 1
+        assert_eq!(out[3], 3); // dialect value 3
+        assert_eq!(out[4], 32); // ODS version item follows
+        assert_eq!(&out[5..7], &4u16.to_le_bytes());
+        assert_eq!(i32::from_le_bytes([out[7], out[8], out[9], out[10]]), 14);
         assert_eq!(*out.last().unwrap(), 1);
+    }
+
+    #[test]
+    fn db_info_answers_bootstrap_items() {
+        // isc_info_db_id(4): count byte then the path pascal string first
+        let out = build_db_info(&[4], &dbctx());
+        assert_eq!(out[0], 4);
+        let clen = u16::from_le_bytes([out[1], out[2]]) as usize;
+        let body = &out[3..3 + clen];
+        assert_eq!(body[0], 2); // two strings
+        let plen = body[1] as usize;
+        assert_eq!(&body[2..2 + plen], b"/tmp/x.fdb");
+        // isc_info_attachment_id(22): 4-byte int = 7
+        let out = build_db_info(&[22], &dbctx());
+        assert_eq!(out[0], 22);
+        assert_eq!(i32::from_le_bytes([out[3], out[4], out[5], out[6]]), 7);
     }
 
     #[test]
     fn db_info_skips_unknown_items() {
         // an unrecognised item (200) contributes nothing but the trailer.
-        assert_eq!(build_db_info(&[200]), vec![1]);
+        assert_eq!(build_db_info(&[200], &dbctx()), vec![1]);
+    }
+
+    #[test]
+    fn service_info_mirrors_real_bytes() {
+        // string items carry a 2-byte length; RUNNING is a bare 4-byte int
+        let out = service_info(&[55, 67]);
+        assert_eq!(out[0], 55);
+        let vlen = u16::from_le_bytes([out[1], out[2]]) as usize;
+        let ver = &out[3..3 + vlen];
+        assert!(ver.starts_with(b"LI-V")); // driver splits on V/T
+        let rest = &out[3 + vlen..];
+        assert_eq!(rest[0], 67);
+        assert_eq!(i32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]), 0);
+    }
+
+    #[test]
+    fn top_level_col_count_ignores_nested_commas() {
+        // the MON$ architecture probe: 3 aggregates, commas inside iif()
+        assert_eq!(
+            count_top_level_cols(
+                "count(distinct a.x), min(a.y), max(iif(a.y is null, 1, 0))"
+            ),
+            3
+        );
+        assert_eq!(count_top_level_cols("*"), 1);
     }
 
     #[test]

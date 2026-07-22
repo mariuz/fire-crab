@@ -87,6 +87,28 @@ try:
     check("PK enforced in the created db", False)
 except Exception:
     con.rollback(); check("PK enforced in the created db", True)
+
+# 3. the op_info_database items the firebird-qa plugin bootstrap reads:
+# con.info.name (DB_ID), .id (ATTACHMENT_ID), .ods_version, and two
+# connections get distinct attachment ids
+check("con.info.name is the database path", con.info.name == os.environ['FC_NEWDB'])
+check("con.info.id is a positive int", isinstance(con.info.id, int) and con.info.id > 0)
+check("con.info.ods_version", con.info.ods_version >= 13)
+con2 = create_database('newdb', user=os.environ['FC_U'], password=os.environ['FC_P']) if False else None
+con_b = None
+from firebird.driver import connect
+con_b = connect('newdb', user=os.environ['FC_U'], password=os.environ['FC_P'])
+check("distinct attachment ids across connections", con.info.id != con_b.info.id)
+
+# 4. MON$ virtual tables report as empty - the plugin's architecture
+# probe (an aggregate over MON$ATTACHMENTS) returns one all-NULL row
+cur_b = con_b.cursor()
+cur_b.execute("""select count(distinct a.mon$server_pid), min(a.mon$remote_protocol),
+    max(iif(a.mon$remote_protocol is null, 1, 0)) from mon$attachments a
+    where a.mon$attachment_id in (%d, %d)""" % (con.info.id, con_b.info.id))
+row = cur_b.fetchone()
+check("MON$ architecture query returns one all-NULL row", row == (None, None, None))
+con_b.close()
 con.close()
 sys.exit(fail)
 PYEOF
