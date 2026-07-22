@@ -15,7 +15,8 @@
 #   - gfix -v -full cross-checks every record against every index
 #     entry: one wrong key byte and it screams;
 #   - a duplicate PRIMARY KEY insert is refused; unsupported index
-#     shapes (DESCENDING) still refuse DML entirely;
+#     shapes: DESCENDING accepts DML too (serve-real-multiseg.sh
+#     proves the engine reads those keys back);
 #   - the engine applying the SAME statements to a second copy prints
 #     the identical table, and gfix -sweep leaves everything clean.
 #
@@ -147,11 +148,11 @@ check "delete rows" \
     "$(node_run "DELETE FROM T WHERE ID > 2000")" "<no rows>"
 check "  ..count after delete" "$(node_run "SELECT COUNT(*) FROM T")" "1993"
 
-# unsupported index shapes still refuse DML
-case "$(node_run "INSERT INTO TDESC VALUES (1)")" in
-    ERR*) echo "OK   DESCENDING-index table still refuses DML" ;;
-    *) echo "DIFF DESCENDING-index table still refuses DML"; fail=1 ;;
-esac
+# DESCENDING indexes are maintained now (increment 31) - the insert
+# succeeds; qa/serve-real-multiseg.sh proves the engine reads the
+# complemented keys back
+check "DESCENDING-index table accepts DML now" \
+    "$(node_run "INSERT INTO TDESC VALUES (1)")" "<no rows>"
 
 # --- phase 2: the ENGINE reads through the indexes fire-crab wrote -----
 kill $srv 2>/dev/null; wait $srv 2>/dev/null

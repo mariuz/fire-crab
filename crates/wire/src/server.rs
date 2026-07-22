@@ -1414,11 +1414,14 @@ fn execute_dml(
                 let recno = recno_of(&work, db.page_size, out.page_no, out.slot)?;
                 let values = decode_record(image, descs);
                 for op in index_ops {
-                    let v = values.get(op.field_id).unwrap_or(&Value::Null);
-                    let key = fire_crab_ods::btw::index_key(op.itype, v, op.scale)
+                    let (key, all_null) = op
+                        .key_for(&values)
                         .ok_or("unsupported value for an index key")?;
+                    // only an ALL-NULL key is exempt from uniqueness
+                    // (btr.cpp:5629 key_all_nulls)
                     fire_crab_ods::btw::insert_index_entry(
-                        &mut work, db.page_size, *rel, op.id, &key, recno, op.unique,
+                        &mut work, db.page_size, *rel, op.id, &key, recno,
+                        op.unique && !all_null,
                     )?;
                 }
             }
@@ -1482,16 +1485,16 @@ fn execute_dml(
                     let old_values = decode_record(old_img, descs);
                     let new_values = decode_record(new_img, descs);
                     for op in index_ops {
-                        let null = Value::Null;
-                        let ov = old_values.get(op.field_id).unwrap_or(&null);
-                        let nv = new_values.get(op.field_id).unwrap_or(&null);
-                        let old_key = fire_crab_ods::btw::index_key(op.itype, ov, op.scale)
+                        let (old_key, _) = op
+                            .key_for(&old_values)
                             .ok_or("unsupported value for an index key")?;
-                        let new_key = fire_crab_ods::btw::index_key(op.itype, nv, op.scale)
+                        let (new_key, all_null) = op
+                            .key_for(&new_values)
                             .ok_or("unsupported value for an index key")?;
                         if new_key != old_key {
                             fire_crab_ods::btw::insert_index_entry(
-                                &mut work, db.page_size, *rel, op.id, &new_key, recno, op.unique,
+                                &mut work, db.page_size, *rel, op.id, &new_key, recno,
+                                op.unique && !all_null,
                             )?;
                         }
                     }
@@ -1515,22 +1518,46 @@ fn execute_dml(
     Ok(counts)
 }
 
-/// One index a DML statement must maintain: which field feeds it, how
-/// its key is built, and whether duplicates are refused. Resolved at
-/// plan time from the index root page (irt_repeat + irtd).
+/// One index a DML statement must maintain: its key segments (field,
+/// itype, scale each), key direction, and whether duplicates are
+/// refused. Resolved at plan time from the index root page
+/// (irt_repeat + the irtd array).
 struct IndexOp {
     id: u8,
-    itype: u16,
-    field_id: usize,
-    scale: i8,
+    segs: Vec<(usize, u16, i8)>,
+    descending: bool,
     unique: bool,
+}
+
+impl IndexOp {
+    /// Build this index's key for a decoded record: the full
+    /// [btw::build_index_key] shape - compound stuffing, descending
+    /// complement - plus the all-NULL marker that disables unique
+    /// enforcement (btr.cpp:5629: only a key whose EVERY segment is
+    /// NULL is exempt; a partial-NULL compound key still validates -
+    /// the live engine refused (NULL,2) twice into UNIQUE(X,Y)).
+    fn key_for(&self, values: &[Value]) -> Option<(Vec<u8>, bool)> {
+        use fire_crab_ods::btw;
+        let null = Value::Null;
+        let segs: Vec<btw::KeySeg<'_>> = self
+            .segs
+            .iter()
+            .map(|(fid, itype, scale)| btw::KeySeg {
+                itype: *itype,
+                value: values.get(*fid).unwrap_or(&null),
+                scale: *scale,
+            })
+            .collect();
+        btw::build_index_key(&segs, self.descending)
+    }
 }
 
 /// Resolve every live index of `rel` into an [IndexOp], or None when
 /// ANY of them is one the write path cannot maintain byte-exactly
-/// (multi-segment, descending, expression/conditional, or an
-/// unconverted itype) - the whole statement is then refused rather
-/// than writing records the engine's index scans would miss.
+/// (expression/conditional, or an unconverted itype) - the whole
+/// statement is then refused rather than writing records the engine's
+/// index scans would miss. Multi-segment and descending indexes are
+/// maintained.
 fn resolve_index_ops(db: &Database, rel: u16, descs: &[Descriptor]) -> Option<Vec<IndexOp>> {
     use fire_crab_ods::btw;
     let Some(irt) = fire_crab_ods::btr::find_index_root(&db.bytes, db.page_size, rel) else {
@@ -1541,32 +1568,40 @@ fn resolve_index_ops(db: &Database, rel: u16, descs: &[Descriptor]) -> Option<Ve
         if e.root_page == 0 {
             continue; // empty slot
         }
-        if e.key_count != 1 {
-            return None; // multi-segment
-        }
-        let (field, itype, iflags) =
-            btw::index_segment(&db.bytes, db.page_size, rel, e.id)?;
-        if iflags & (btw::IRT_DESCENDING | btw::IRT_EXPRESSION | btw::IRT_CONDITION) != 0 {
+        let (segs, iflags) = btw::index_segments(
+            &db.bytes,
+            db.page_size,
+            rel,
+            e.id,
+            e.key_count as usize,
+        )?;
+        if segs.is_empty() {
             return None;
         }
-        if !matches!(
-            itype,
-            btw::IDX_STRING
-                | btw::IDX_NUMERIC
-                | btw::IDX_NUMERIC2
-                | btw::IDX_SQL_DATE
-                | btw::IDX_SQL_TIME
-                | btw::IDX_TIMESTAMP
-                | btw::IDX_BOOLEAN
-        ) {
+        if iflags & (btw::IRT_EXPRESSION | btw::IRT_CONDITION) != 0 {
             return None;
         }
-        let d = descs.get(field as usize)?;
+        let mut op_segs = Vec::with_capacity(segs.len());
+        for (field, itype) in segs {
+            if !matches!(
+                itype,
+                btw::IDX_STRING
+                    | btw::IDX_NUMERIC
+                    | btw::IDX_NUMERIC2
+                    | btw::IDX_SQL_DATE
+                    | btw::IDX_SQL_TIME
+                    | btw::IDX_TIMESTAMP
+                    | btw::IDX_BOOLEAN
+            ) {
+                return None;
+            }
+            let d = descs.get(field as usize)?;
+            op_segs.push((field as usize, itype, d.scale));
+        }
         ops.push(IndexOp {
             id: e.id,
-            itype,
-            field_id: field as usize,
-            scale: d.scale,
+            segs: op_segs,
+            descending: iflags & btw::IRT_DESCENDING != 0,
             unique: iflags & btw::IRT_UNIQUE != 0,
         });
     }

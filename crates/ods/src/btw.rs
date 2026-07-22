@@ -211,6 +211,85 @@ pub fn index_key(itype: u16, value: &Value, scale: i8) -> Option<Vec<u8>> {
     }
 }
 
+/// How many data bytes each compound-key group carries between the
+/// segment-marker bytes (ods.h:631).
+pub const STUFF_COUNT: usize = 4;
+
+/// One segment of an index key: the value to encode, its itype, and
+/// the column scale (INT64_KEY normalization needs it).
+pub struct KeySeg<'a> {
+    pub itype: u16,
+    pub value: &'a Value,
+    pub scale: i8,
+}
+
+/// Compress one segment the way `compress` (btr.cpp:3444) does for a
+/// full-key build, pre-complement. Ascending NULL is zero bytes;
+/// DESCENDING NULL is one 0x00 byte (btr.cpp:3463-3479 - so that the
+/// post-complement 0xFF sorts NULLs apart from values). A descending
+/// value whose first byte is 0x00 or 0x01 gets a 0x01 prepended
+/// (btr.cpp:3603/3978: the pre-complement image of the 0xFE
+/// end-value guard, which keeps values distinguishable from the NULL
+/// marker after complement).
+fn compress_seg(itype: u16, value: &Value, scale: i8, descending: bool) -> Option<Vec<u8>> {
+    if matches!(value, Value::Null) {
+        return Some(if descending { vec![0] } else { Vec::new() });
+    }
+    let mut k = index_key(itype, value, scale)?;
+    if descending && matches!(k.first(), Some(0) | Some(1)) {
+        k.insert(0, 1);
+    }
+    Some(k)
+}
+
+/// `BTR_key` (btr.cpp:2245) for a full key - the shape every insertion
+/// builds. A single segment is the plain compressed value. A compound
+/// key interleaves each segment's bytes with marker bytes: every group
+/// is one marker byte - the number of segments REMAINING including the
+/// current one (`idx_count - n`) - followed by up to [STUFF_COUNT]
+/// data bytes, and the group left unfinished when a segment ends is
+/// zero-padded to its full width before the next segment starts its
+/// own group. A descending index complements the WHOLE assembled key
+/// (markers and padding included - `BTR_complement_key` runs after
+/// assembly). Returns the key and whether EVERY segment was NULL - the
+/// engine exempts a key from unique enforcement only when it is
+/// all-NULL (btr.cpp:5629 `key_all_nulls`); a partial-NULL compound
+/// key still validates duplicates, as the multiseg differential
+/// proved against the live engine.
+pub fn build_index_key(segs: &[KeySeg<'_>], descending: bool) -> Option<(Vec<u8>, bool)> {
+    let all_null = segs.iter().all(|s| matches!(s.value, Value::Null));
+    let mut out;
+    if segs.len() == 1 {
+        out = compress_seg(segs[0].itype, segs[0].value, segs[0].scale, descending)?;
+    } else {
+        out = Vec::new();
+        let total = segs.len();
+        let mut stuff = 0usize;
+        for (n, seg) in segs.iter().enumerate() {
+            // complete the previous segment's group with zeros
+            while stuff > 0 {
+                out.push(0);
+                stuff -= 1;
+            }
+            let temp = compress_seg(seg.itype, seg.value, seg.scale, descending)?;
+            for &b in &temp {
+                if stuff == 0 {
+                    out.push((total - n) as u8);
+                    stuff = STUFF_COUNT;
+                }
+                out.push(b);
+                stuff -= 1;
+            }
+        }
+    }
+    if descending {
+        for b in out.iter_mut() {
+            *b = !*b;
+        }
+    }
+    Some((out, all_null))
+}
+
 trait TrimAsciiEnd {
     fn trim_ascii_end_matches(&self) -> &[u8];
 }
@@ -604,9 +683,123 @@ pub fn index_segment(
     Some((field, itype, flags))
 }
 
+/// Every segment descriptor of an index: (field id, itype) per segment
+/// in key order, plus the irt_flags. `count` is the root entry's
+/// irt_keys; the irtd array (8 bytes per entry - field u16, itype u16,
+/// selectivity f32; ods.h:437-447) sits at the entry's irt_desc offset,
+/// page-relative.
+pub fn index_segments(
+    file: &[u8],
+    page_size: usize,
+    rel: u16,
+    index_id: u8,
+    count: usize,
+) -> Option<(Vec<(u16, u16)>, u16)> {
+    let start = file
+        .chunks_exact(page_size)
+        .position(|p| p[0] == PageType::IndexRoot as u8 && u16_at(p, 16) == rel)?
+        * page_size;
+    let page = &file[start..start + page_size];
+    PageHeader::decode(page)?;
+    let entry_at = 24 + index_id as usize * 24;
+    let desc_off = u16_at(page, entry_at + 16) as usize; // irt_desc @16
+    let flags = u16_at(page, entry_at + 18);
+    let mut segs = Vec::with_capacity(count);
+    for i in 0..count {
+        let at = desc_off + i * 8;
+        if at + 8 > page.len() {
+            return None;
+        }
+        segs.push((u16_at(page, at), u16_at(page, at + 2)));
+    }
+    Some((segs, flags))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compound_keys_stuff_like_btr_key() {
+        let seg = |itype, value, scale| KeySeg { itype, value, scale };
+        let ab = Value::Text("AB".into());
+        let abcde = Value::Text("ABCDE".into());
+        let one = Value::Int(1);
+        // two short segments: marker(=segments remaining incl. current),
+        // data, zero-pad to the group width, next marker, data
+        let (k, n) = build_index_key(
+            &[seg(IDX_STRING, &ab, 0), seg(IDX_NUMERIC, &one, 0)],
+            false,
+        )
+        .unwrap();
+        assert_eq!(k, vec![2, b'A', b'B', 0, 0, 1, 0xBF, 0xF0]);
+        assert!(!n);
+        // a segment longer than STUFF_COUNT repeats its marker per group
+        let (k, _) = build_index_key(
+            &[seg(IDX_STRING, &abcde, 0), seg(IDX_NUMERIC, &one, 0)],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            k,
+            vec![2, b'A', b'B', b'C', b'D', 2, b'E', 0, 0, 0, 1, 0xBF, 0xF0]
+        );
+        // an ascending NULL segment contributes nothing - not even its
+        // marker - and a PARTIAL-null key is NOT unique-exempt (the
+        // engine only exempts all-NULL keys, btr.cpp:5629; the live
+        // engine refused a duplicate (NULL,2) into UNIQUE(X,Y))
+        let (k, n) = build_index_key(
+            &[seg(IDX_STRING, &Value::Null, 0), seg(IDX_NUMERIC, &one, 0)],
+            false,
+        )
+        .unwrap();
+        assert_eq!(k, vec![1, 0xBF, 0xF0]);
+        assert!(!n);
+        // only every-segment-NULL flags the exemption
+        let (k, n) = build_index_key(
+            &[seg(IDX_STRING, &Value::Null, 0), seg(IDX_NUMERIC, &Value::Null, 0)],
+            false,
+        )
+        .unwrap();
+        assert_eq!(k, Vec::<u8>::new());
+        assert!(n);
+        // single segment: no stuffing at all
+        let (k, _) = build_index_key(&[seg(IDX_STRING, &ab, 0)], false).unwrap();
+        assert_eq!(k, b"AB".to_vec());
+    }
+
+    #[test]
+    fn descending_keys_complement_like_btr() {
+        let seg = |itype, value, scale| KeySeg { itype, value, scale };
+        let ab = Value::Text("AB".into());
+        // single descending segment = complemented ascending bytes
+        let (k, _) = build_index_key(&[seg(IDX_STRING, &ab, 0)], true).unwrap();
+        assert_eq!(k, vec![!b'A', !b'B']);
+        // descending NULL is one pre-complement 0x00 byte -> 0xFF
+        let (k, n) = build_index_key(&[seg(IDX_STRING, &Value::Null, 0)], true).unwrap();
+        assert_eq!(k, vec![0xFF]);
+        assert!(n);
+        // a value whose pre-complement image starts with 0x00/0x01 gets
+        // the 0x01 end-value guard prepended before the complement
+        // (btr.cpp:3978): a near-minimum double's munged bytes start 0x00
+        let neg = Value::Double(-1.7e308);
+        let asc = index_key(IDX_NUMERIC, &neg, 0).unwrap();
+        assert_eq!(asc[0], 0x00);
+        let (k, _) = build_index_key(&[seg(IDX_NUMERIC, &neg, 0)], true).unwrap();
+        assert_eq!(k[0], !0x01u8); // the guard byte, complemented
+        assert_eq!(k[1..], asc.iter().map(|b| !b).collect::<Vec<u8>>()[..]);
+        // compound descending: markers and pad complement too
+        let one = Value::Int(1);
+        let (k, _) = build_index_key(
+            &[seg(IDX_STRING, &ab, 0), seg(IDX_NUMERIC, &one, 0)],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            k,
+            vec![!2u8, !b'A', !b'B', !0u8, !0u8, !1u8, !0xBFu8, !0xF0u8]
+        );
+    }
 
     #[test]
     fn keys_encode_like_compress() {
