@@ -2,14 +2,22 @@
 # SHOW commands over the legacy BLR request API (op_compile / op_start /
 # op_receive / op_release). isql's SHOW does NOT use DSQL - it compiles a
 # GDML request (a blr_begin of blr_message declarations wrapping a
-# blr_for over a system relation that blr_sends each row to the client)
-# and drives it with the request ops. fire-crab now parses that BLR,
-# walks the named system relation applying the request's boolean and
-# sort, and ships the rows back as op_send messages - the whole batch per
-# op_receive, every packet but the last carrying p_data_messages = 1 and
-# the last carrying 0, which is how the client (batch_gds_receive) knows
-# the batch has ended. Nullable output columns come across as
-# blr_parameter2 (value + a separate short null indicator).
+# blr_for over one or more system relations that blr_sends each row to the
+# client) and drives it with the request ops. fire-crab parses that BLR,
+# walks the named system relations - joining them with a nested loop when
+# there is more than one stream (SHOW INDICES is RDB$INDICES CROSS
+# RDB$RELATIONS; SHOW TABLE joins RDB$RELATION_FIELDS to RDB$FIELDS) -
+# applies the request's boolean (blr_equiv null-safe joins, blr_starting,
+# blr_matching2 the legacy SLEUTH name filter, blr_value_if, comparisons)
+# and sort, and ships each row as an op_send.
+#
+# Two shapes of the protocol make the multi-request SHOWs work: each
+# op_compile gets its own handle (SHOW INDICES / SHOW TABLE keep an outer
+# request open while, per row, running an inner one - a single request
+# slot would clobber the outer), and each op_receive is answered with
+# exactly ONE message flagged p_data_messages = 0 (shipping a whole batch
+# ahead of demand would have the inner request read the outer's rows and
+# desync the stream).
 #
 # The oracle is the engine: each SHOW runs IDENTICALLY through fire-crab
 # (isql -> fcwire serve) and through isql on the same file; output
@@ -31,9 +39,12 @@ mkdir -p "$DIR"
 rm -f "$SRC" "$WORK"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF || { echo "FAIL scratch db creation"; exit 1; }
 CREATE DATABASE '$SRC' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
-CREATE TABLE X (ID INTEGER NOT NULL, NAME VARCHAR(20));
+CREATE TABLE DEPT (DID INTEGER NOT NULL PRIMARY KEY, DNAME VARCHAR(30) NOT NULL);
+CREATE TABLE X (ID INTEGER NOT NULL PRIMARY KEY, NAME VARCHAR(20), DID INTEGER,
+                FOREIGN KEY (DID) REFERENCES DEPT(DID));
 CREATE TABLE ALPHA (A INTEGER, B VARCHAR(10));
 CREATE VIEW V AS SELECT ID, NAME FROM X;
+CREATE INDEX X_NAME_IDX ON X (NAME);
 CREATE ROLE R1;
 CREATE ROLE R2;
 COMMIT;
@@ -55,7 +66,9 @@ strip() { sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$'; }
 fc_show() { # <show-command>
     n=0
     while [ $n -lt 8 ]; do
-        r=$(timeout 12 "$ISQL" -q -b -user "$U" -pas "$P" \
+        # -s KILL: isql traps SIGTERM, so a plain timeout would not stop a
+        # genuine hang - use SIGKILL so a regression fails loud, not slow
+        r=$(timeout -s KILL 15 "$ISQL" -q -b -user "$U" -pas "$P" \
               "localhost/$PORT:$WORK" 2>&1 <<EOF
 $1;
 EOF
@@ -100,5 +113,18 @@ compare "SHOW PROCEDURES"   "SHOW PROCEDURES"
 compare "SHOW PACKAGES"     "SHOW PACKAGES"
 compare "SHOW FILTERS"      "SHOW FILTERS"
 compare "SHOW PUBLICATIONS" "SHOW PUBLICATIONS"
+
+# multi-relation / joined SHOW requests
+#  - SHOW INDICES: RDB$INDICES CROSS RDB$RELATIONS (a two-stream join)
+#  - SHOW DOMAINS / SHOW COLLATIONS: blr_matching2 excludes system names
+#  - SHOW TABLE <name>: a fan of requests (relation, columns joined to
+#    RDB$FIELDS with their types, primary/foreign-key constraints, indices)
+#    all kept open at once and driven per row
+compare "SHOW INDICES"      "SHOW INDICES"
+compare "SHOW DOMAINS"      "SHOW DOMAINS"
+compare "SHOW COLLATIONS"   "SHOW COLLATIONS"
+compare "SHOW TABLE DEPT"   "SHOW TABLE DEPT"
+compare "SHOW TABLE X"      "SHOW TABLE X"
+compare "SHOW TABLE ALPHA"  "SHOW TABLE ALPHA"
 
 exit $fail
