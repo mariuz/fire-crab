@@ -49,6 +49,7 @@ the converter what the C++ is *doing* before they read a line of it.
 | WHERE-clause filtering: `SELECT ... WHERE <pred>` from pages | `fire-crab-wire::server` | **the server filters rows** - comparisons (`= <> < <= > >=`) on integer and text columns, combined with `AND`/`OR`, plus `IS [NOT] NULL`; evaluated per decoded record, honouring three-valued logic; `SELECT`, `SELECT *` and `COUNT(*)` all take a WHERE, matching isql |
 | ORDER BY and aggregates | `fire-crab-wire::server` | **the server sorts and aggregates** - `ORDER BY` on columns or ordinals, ASC/DESC, multi-key, NULLs ordered as the engine does (first ascending); `MIN`/`MAX`/`SUM` over integer columns and `COUNT(col)`/`COUNT(*)`, all composable with WHERE; matches isql value-for-value including NULL results |
 | GROUP BY | `fire-crab-wire::server` | **the server groups** - `SELECT <keys and aggregates> ... GROUP BY <cols\|ordinals>`, and multi-aggregate projections with no GROUP BY (one global group, one row even over an empty set); NULL keys bucket together, aggregates computed per group, composable with WHERE and ORDER BY (which sorts the *output*, by name or ordinal); matches isql value-for-value |
+| HAVING | `fire-crab-wire::server` | **the server filters groups** - the predicate (comparisons, `AND`/`OR`, `IS [NOT] NULL`) is evaluated on each group's computed output row and may name aggregates *not in the select list* (computed as hidden items) or any grouping column; a global aggregate's single row can be kept or rejected; matches isql, including zero-row results |
 | Everything else | — | see [docs/subsystem-map.md](docs/subsystem-map.md) |
 
 **On the firebird-qa milestone, precisely.** firebird-qa drives a *server*,
@@ -105,6 +106,15 @@ a constant:
   output row, even over an empty set (`COUNT` 0, the rest NULL). ORDER BY on
   a grouped query sorts the output rows, by output column name or ordinal
   (so `ORDER BY 2 DESC` on a `COUNT(*)` column works).
+- **HAVING** filters the groups after aggregation, where WHERE filtered the
+  rows before it: the predicate is evaluated on each group's computed output
+  row, and may reference aggregates that are *not* in the select list
+  (`SELECT DEPT_ID ... HAVING SUM(SALARY) > 190000` computes the sum as a
+  hidden item) or any grouping column (`HAVING DEPT_ID IS NULL` selects the
+  NULL-key bucket). With no GROUP BY it keeps or rejects the single global
+  row - so a HAVING can legitimately answer zero rows. An aggregate in a
+  WHERE clause, or a non-grouped column in a HAVING, is invalid SQL and
+  falls back.
 
 The subtlety that had to be right: on a table mixing column widths the engine
 lays fields out physically by alignment, so `RDB$FIELD_ID` (the record-format
@@ -112,14 +122,14 @@ index) diverges from `RDB$FIELD_POSITION` (the declared order); projecting by
 position instead of field id silently returns the wrong column, which a
 uniform-width table never reveals.
 
-Projections, WHERE, GROUP BY, ORDER BY and aggregates currently cover user
-tables (system relations' formats are not in `RDB$FORMATS`, so they answer
-COUNT but not projections) and the exact-integer / text column types the
-decoder renders and compares identically to the engine; other shapes fall back
-to the fixed value.
-Widening further (joins, the remaining column types, `HAVING`, DML,
-system-table projections) is the work that continues - but the fixed answer is
-no longer fixed, and the protocol server it runs on is proven against a genuine
+Projections, WHERE, GROUP BY, HAVING, ORDER BY and aggregates currently cover
+user tables (system relations' formats are not in `RDB$FORMATS`, so they
+answer COUNT but not projections or grouping) and the exact-integer / text
+column types the decoder renders and compares identically to the engine; other
+shapes fall back to the fixed value.
+Widening further (joins, the remaining column types, DML, system-table
+projections) is the work that continues - but the fixed answer is no longer
+fixed, and the protocol server it runs on is proven against a genuine
 client.
 
 Current QA state: `fcstat header` output is **byte-identical on the compared

@@ -270,6 +270,9 @@ struct ProjCol {
 /// `key_fids` record fields (NULLs group together), each `gitems` output
 /// computed per group; `cols` describes the output columns (their
 /// `field_id` is the OUTPUT index, which is also what `order_by` sorts on).
+/// `having` filters the computed OUTPUT rows; it may reference `gitems`
+/// entries past `cols` - hidden items appended for aggregates or keys
+/// named only in the HAVING clause, which are computed but not emitted.
 enum Plan {
     Scalar(Option<i64>),
     Project {
@@ -286,6 +289,7 @@ enum Plan {
         gitems: Vec<GItem>,
         key_fids: Vec<usize>,
         filter: Option<Predicate>,
+        having: Option<Predicate>,
         order_by: Vec<(usize, bool)>,
     },
 }
@@ -299,7 +303,7 @@ enum GItem {
 }
 
 /// A scalar-returning aggregate function.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum AggFn {
     Count,
     Min,
@@ -308,6 +312,7 @@ enum AggFn {
 }
 
 /// What an aggregate is computed over.
+#[derive(Clone)]
 enum AggTarget {
     Star,
     Col(String),
@@ -446,14 +451,14 @@ fn build_projcols(
 fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
     let fallback = Plan::Scalar(Some(FIXED_ANSWER));
     let trace = std::env::var("FC_SRV_TRACE").is_ok();
-    let Some((proj_s, table_s, where_s, group_s, order_s)) = split_query(sql) else {
+    let Some((proj_s, table_s, where_s, group_s, having_s, order_s)) = split_query(sql) else {
         if trace { eprintln!("[srv] plan: split_query failed for {:?}", sql); }
         return fallback;
     };
     if trace {
         eprintln!(
-            "[srv] plan: proj={:?} table={:?} where={:?} group={:?} order={:?}",
-            proj_s, table_s, where_s, group_s, order_s
+            "[srv] plan: proj={:?} table={:?} where={:?} group={:?} having={:?} order={:?}",
+            proj_s, table_s, where_s, group_s, having_s, order_s
         );
     }
     let Some(proj) = parse_projection(proj_s) else {
@@ -494,8 +499,9 @@ fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
     let items = match proj {
         Proj::Star => {
             // SELECT * is a plain projection; GROUP BY over it would need
-            // every column grouped - not a shape worth answering
-            if group_s.is_some() {
+            // every column grouped (and HAVING needs a grouped query) -
+            // not shapes worth answering
+            if group_s.is_some() || having_s.is_some() {
                 return fallback;
             }
             let Some(cols) = build_projcols(&["*".to_string()], &columns, &descs) else {
@@ -522,10 +528,11 @@ fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
 
     let has_agg = items.iter().any(|i| matches!(i, SelItem::Agg(..)));
 
-    // a single aggregate with no GROUP BY stays on the scalar path - it
-    // keeps the header-count fast path for COUNT(*), which is also the
-    // only way COUNT works on system relations (no RDB$FORMATS entry)
-    if group_s.is_none() && items.len() == 1 {
+    // a single aggregate with no GROUP BY (nor HAVING, which needs the
+    // grouped machinery) stays on the scalar path - it keeps the
+    // header-count fast path for COUNT(*), which is also the only way
+    // COUNT works on system relations (no RDB$FORMATS entry)
+    if group_s.is_none() && having_s.is_none() && items.len() == 1 {
         if let SelItem::Agg(func, target) = &items[0] {
             // ORDER BY on a single-row aggregate is meaningless; reject it
             if order_s.is_some() {
@@ -539,6 +546,11 @@ fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
     }
 
     if !has_agg && group_s.is_none() {
+        // HAVING with no GROUP BY makes the query one global group, where
+        // a bare (ungrouped) column is invalid SQL
+        if having_s.is_some() {
+            return fallback;
+        }
         // plain projection: SELECT <cols> [WHERE] [ORDER BY]
         let collist: Vec<String> = items
             .iter()
@@ -574,7 +586,7 @@ fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
     }
 
     // grouped query: GROUP BY, or a multi-aggregate global projection
-    match plan_group(&items, group_s, order_s, rel, formats, &columns, &descs, filter) {
+    match plan_group(&items, group_s, having_s, order_s, rel, formats, &columns, &descs, filter) {
         Some(p) => p,
         None => {
             if trace { eprintln!("[srv] plan: GROUP BY plan failed"); }
@@ -585,14 +597,18 @@ fn plan_query(sql: &str, db: &Option<Database>) -> Plan {
 
 /// Build a `Plan::Group`. With a GROUP BY every bare select-list column
 /// must be one of the group keys (anything else is invalid SQL); with no
-/// GROUP BY (a multi-aggregate projection) there are no keys, the whole
-/// table is one group, and a bare column is invalid. MIN/MAX/SUM need an
-/// integer column; COUNT takes any column or `*`. Returns None on any
-/// unresolvable or invalid piece - the caller falls back.
+/// GROUP BY (a multi-aggregate projection, or a lone aggregate with a
+/// HAVING) there are no keys, the whole table is one group, and a bare
+/// column is invalid. MIN/MAX/SUM need an integer column; COUNT takes any
+/// column or `*`. HAVING resolves against the output items, appending
+/// hidden ones for aggregates/keys it names that the select list does
+/// not. Returns None on any unresolvable or invalid piece - the caller
+/// falls back.
 #[allow(clippy::too_many_arguments)]
 fn plan_group(
     items: &[SelItem],
     group_s: Option<&str>,
+    having_s: Option<&str>,
     order_s: Option<&str>,
     rel: u16,
     formats: Vec<(u8, Vec<Descriptor>)>,
@@ -600,6 +616,12 @@ fn plan_group(
     descs: &[Descriptor],
     filter: Option<Predicate>,
 ) -> Option<Plan> {
+    // grouping decodes records, which needs the relation's formats: a
+    // relation without any (a system relation) cannot be answered here -
+    // falling back beats emitting empty or miscounted groups
+    if formats.is_empty() {
+        return None;
+    }
     let key_fids = match group_s {
         None => Vec::new(),
         Some(g) => parse_group_by(g, items, columns)?,
@@ -657,6 +679,15 @@ fn plan_group(
             }
         }
     }
+    // HAVING filters the computed output rows (may append hidden gitems)
+    let having = match having_s {
+        None => None,
+        Some(hs) => Some(
+            tokenize(hs)
+                .and_then(|t| parse_predicate(&t))
+                .and_then(|raw| resolve_having(raw, &mut gitems, &key_fids, columns, descs))?,
+        ),
+    };
     // ORDER BY sorts the OUTPUT rows: names resolve to output columns
     // (group keys by column name), ordinals to select-list positions
     let order_by = match order_s {
@@ -674,6 +705,7 @@ fn plan_group(
         gitems,
         key_fids,
         filter,
+        having,
         order_by,
     })
 }
@@ -857,9 +889,11 @@ fn order_cmp(a: &[Value], b: &[Value], keys: &[(usize, bool)]) -> std::cmp::Orde
 
 /// Compute the grouped output rows: filter, bucket by the key fields
 /// (sorting the filtered rows by them - NULLs compare equal, so they form
-/// one group), then compute each output item per bucket. With no keys the
-/// whole input is ONE group, emitted even when empty - SQL's global
-/// aggregate shape (COUNT = 0, MIN/MAX/SUM = NULL over no rows).
+/// one group), then compute each output item per bucket and keep the rows
+/// the HAVING predicate (evaluated on the OUTPUT values, hidden items
+/// included) accepts. With no keys the whole input is ONE group, emitted
+/// even when empty - SQL's global aggregate shape (COUNT = 0, MIN/MAX/SUM
+/// = NULL over no rows) - though a HAVING can still reject it.
 fn group_output(
     db: &Database,
     rel: u16,
@@ -867,6 +901,7 @@ fn group_output(
     gitems: &[GItem],
     key_fids: &[usize],
     filter: &Option<Predicate>,
+    having: &Option<Predicate>,
 ) -> Vec<Vec<Value>> {
     let mut input: Vec<Vec<Value>> = Vec::new();
     for_each_record(db, rel, formats, |v| {
@@ -874,21 +909,26 @@ fn group_output(
             input.push(v.to_vec());
         }
     });
-    if key_fids.is_empty() {
-        return vec![compute_group(&input, gitems)];
-    }
-    let keys: Vec<(usize, bool)> = key_fids.iter().map(|&f| (f, false)).collect();
-    input.sort_by(|a, b| order_cmp(a, b, &keys));
     let mut out = Vec::new();
-    let mut i = 0;
-    while i < input.len() {
-        let mut j = i + 1;
-        while j < input.len() && order_cmp(&input[i], &input[j], &keys) == std::cmp::Ordering::Equal
-        {
-            j += 1;
+    if key_fids.is_empty() {
+        out.push(compute_group(&input, gitems));
+    } else {
+        let keys: Vec<(usize, bool)> = key_fids.iter().map(|&f| (f, false)).collect();
+        input.sort_by(|a, b| order_cmp(a, b, &keys));
+        let mut i = 0;
+        while i < input.len() {
+            let mut j = i + 1;
+            while j < input.len()
+                && order_cmp(&input[i], &input[j], &keys) == std::cmp::Ordering::Equal
+            {
+                j += 1;
+            }
+            out.push(compute_group(&input[i..j], gitems));
+            i = j;
         }
-        out.push(compute_group(&input[i..j], gitems));
-        i = j;
+    }
+    if let Some(h) = having {
+        out.retain(|row| h.matches(row));
     }
     out
 }
@@ -1000,10 +1040,11 @@ fn emit_rows(w: &mut W, plan: &Plan, db: &Option<Database>) {
             gitems,
             key_fids,
             filter,
+            having,
             order_by,
         } => {
             if let Some(db) = db {
-                let mut rows = group_output(db, *rel, formats, gitems, key_fids, filter);
+                let mut rows = group_output(db, *rel, formats, gitems, key_fids, filter, having);
                 if !order_by.is_empty() {
                     // order_by keys are output indexes; output rows are
                     // aligned with gitems/cols, so order_cmp applies as-is
@@ -1149,12 +1190,14 @@ fn find_kw_by(up: &str, kw: &str) -> Option<(usize, usize)> {
 }
 
 /// Split `SELECT <proj> FROM <table> [WHERE <pred>] [GROUP BY <cols>]
-/// [ORDER BY <cols>]` into its parts, case-insensitively but preserving
-/// the original case (WHERE literals are case-sensitive). ASCII
-/// uppercasing keeps byte positions, so keyword offsets found in the
-/// uppercased copy slice the original.
+/// [HAVING <pred>] [ORDER BY <cols>]` into its parts, case-insensitively
+/// but preserving the original case (WHERE/HAVING literals are
+/// case-sensitive). ASCII uppercasing keeps byte positions, so keyword
+/// offsets found in the uppercased copy slice the original.
 #[allow(clippy::type_complexity)]
-fn split_query(sql: &str) -> Option<(&str, &str, Option<&str>, Option<&str>, Option<&str>)> {
+fn split_query(
+    sql: &str,
+) -> Option<(&str, &str, Option<&str>, Option<&str>, Option<&str>, Option<&str>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
     if find_word(&up, "SELECT", 0) != Some(0) {
@@ -1165,17 +1208,20 @@ fn split_query(sql: &str) -> Option<(&str, &str, Option<&str>, Option<&str>, Opt
     let after = from + "FROM".len();
     let rest = &s[after..];
     // search on a copy with string literals masked out, so a WHERE/GROUP/
-    // ORDER keyword inside a literal does not match; slice the original.
+    // HAVING/ORDER keyword inside a literal does not match; slice the
+    // original.
     let masked = mask_literals(&up[after..]);
 
     let where_pos = find_word(&masked, "WHERE", 0);
     let group = find_kw_by(&masked, "GROUP");
+    let having_pos = find_word(&masked, "HAVING", 0);
     let order = find_kw_by(&masked, "ORDER");
     let group_kw = group.map(|(k, _)| k);
     let order_kw = order.map(|(k, _)| k);
 
-    // the table name ends at the first of WHERE / GROUP BY / ORDER BY
-    let table_end = [where_pos, group_kw, order_kw]
+    // the table name ends at the first of WHERE / GROUP BY / HAVING /
+    // ORDER BY
+    let table_end = [where_pos, group_kw, having_pos, order_kw]
         .into_iter()
         .flatten()
         .min()
@@ -1183,7 +1229,7 @@ fn split_query(sql: &str) -> Option<(&str, &str, Option<&str>, Option<&str>, Opt
     let table = rest[..table_end].trim();
 
     let where_str = where_pos.map(|wp| {
-        let end = [group_kw, order_kw]
+        let end = [group_kw, having_pos, order_kw]
             .into_iter()
             .flatten()
             .filter(|&o| o > wp)
@@ -1192,11 +1238,20 @@ fn split_query(sql: &str) -> Option<(&str, &str, Option<&str>, Option<&str>, Opt
         rest[wp + "WHERE".len()..end].trim()
     });
     let group_str = group.map(|(_, cols)| {
-        let end = order_kw.filter(|&o| o > cols).unwrap_or(rest.len());
+        let end = [having_pos, order_kw]
+            .into_iter()
+            .flatten()
+            .filter(|&o| o > cols)
+            .min()
+            .unwrap_or(rest.len());
         rest[cols..end].trim()
     });
+    let having_str = having_pos.map(|hp| {
+        let end = order_kw.filter(|&o| o > hp).unwrap_or(rest.len());
+        rest[hp + "HAVING".len()..end].trim()
+    });
     let order_str = order.map(|(_, cols)| rest[cols..].trim());
-    Some((proj, table, where_str, group_str, order_str))
+    Some((proj, table, where_str, group_str, having_str, order_str))
 }
 
 /// Parse one select-list item as an aggregate: `COUNT(*)`, `COUNT(col)`,
@@ -1301,9 +1356,10 @@ fn parse_order_by(
     }
 }
 
-/// A WHERE token.
+/// A WHERE/HAVING token.
 enum Tok {
     Ident(String),
+    Agg(AggFn, AggTarget),
     Int(i64),
     Str(String),
     Cmp(Cmp),
@@ -1314,9 +1370,11 @@ enum Tok {
     Null,
 }
 
-/// Tokenise a WHERE clause. Single-quoted strings ('' escapes a quote),
-/// integer literals (optionally negative), comparison operators
-/// (= <> != < <= > >=), identifiers and the keywords AND/OR/IS/NOT/NULL.
+/// Tokenise a WHERE/HAVING clause. Single-quoted strings ('' escapes a
+/// quote), integer literals (optionally negative), comparison operators
+/// (= <> != < <= > >=), identifiers, the keywords AND/OR/IS/NOT/NULL, and
+/// aggregate calls `COUNT(*)`/`COUNT(col)`/`MIN|MAX|SUM(col)` as single
+/// tokens (only valid in HAVING - WHERE resolution rejects them).
 /// Anything else (parentheses, functions, other operators) returns None,
 /// so an unsupported predicate falls back rather than answering wrong.
 fn tokenize(s: &str) -> Option<Vec<Tok>> {
@@ -1401,7 +1459,23 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                     i += 1;
                 }
                 let word = &s[start..i];
-                match word.to_ascii_uppercase().as_str() {
+                let upper = word.to_ascii_uppercase();
+                // an aggregate name followed by `(...)` lexes as one
+                // aggregate-call token (spacing-tolerant, no nesting)
+                if matches!(upper.as_str(), "COUNT" | "MIN" | "MAX" | "SUM") {
+                    let mut j = i;
+                    while j < b.len() && b[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if j < b.len() && b[j] == b'(' {
+                        let close = j + s[j..].find(')')?;
+                        let (func, target) = parse_agg_item(&s[start..=close])?;
+                        out.push(Tok::Agg(func, target));
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                match upper.as_str() {
                     "AND" => out.push(Tok::And),
                     "OR" => out.push(Tok::Or),
                     "IS" => out.push(Tok::Is),
@@ -1416,10 +1490,16 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
     Some(out)
 }
 
-/// An unresolved WHERE term (column name not yet resolved to a field id).
+/// An unresolved WHERE/HAVING term (left side not yet resolved to a value
+/// index). The left side is a column name, or - in HAVING only - an
+/// aggregate call.
 struct RawTerm {
-    col: String,
+    lhs: RawLhs,
     kind: RawKind,
+}
+enum RawLhs {
+    Col(String),
+    Agg(AggFn, AggTarget),
 }
 enum RawKind {
     Cmp(Cmp, Rhs),
@@ -1461,25 +1541,19 @@ fn split_on<'a>(toks: &'a [Tok], is_sep: impl Fn(&Tok) -> bool) -> Vec<&'a [Tok]
 }
 
 fn parse_term(t: &[Tok]) -> Option<RawTerm> {
-    match t {
-        [Tok::Ident(c), Tok::Cmp(op), Tok::Int(n)] => Some(RawTerm {
-            col: c.clone(),
-            kind: RawKind::Cmp(*op, Rhs::Int(*n)),
-        }),
-        [Tok::Ident(c), Tok::Cmp(op), Tok::Str(v)] => Some(RawTerm {
-            col: c.clone(),
-            kind: RawKind::Cmp(*op, Rhs::Str(v.clone())),
-        }),
-        [Tok::Ident(c), Tok::Is, Tok::Null] => Some(RawTerm {
-            col: c.clone(),
-            kind: RawKind::IsNull,
-        }),
-        [Tok::Ident(c), Tok::Is, Tok::Not, Tok::Null] => Some(RawTerm {
-            col: c.clone(),
-            kind: RawKind::IsNotNull,
-        }),
-        _ => None,
-    }
+    let lhs = match t.first()? {
+        Tok::Ident(c) => RawLhs::Col(c.clone()),
+        Tok::Agg(f, target) => RawLhs::Agg(*f, target.clone()),
+        _ => return None,
+    };
+    let kind = match &t[1..] {
+        [Tok::Cmp(op), Tok::Int(n)] => RawKind::Cmp(*op, Rhs::Int(*n)),
+        [Tok::Cmp(op), Tok::Str(v)] => RawKind::Cmp(*op, Rhs::Str(v.clone())),
+        [Tok::Is, Tok::Null] => RawKind::IsNull,
+        [Tok::Is, Tok::Not, Tok::Null] => RawKind::IsNotNull,
+        _ => return None,
+    };
+    Some(RawTerm { lhs, kind })
 }
 
 /// Whether a descriptor is comparable as an integer or as text (the only
@@ -1498,9 +1572,28 @@ fn col_kind(d: &Descriptor) -> Option<ColKind> {
     }
 }
 
-/// Resolve every term's column name to a field id and check the literal
-/// type matches the column type. Returns None on an unknown column, an
-/// unsupported column type, or a literal/column type mismatch.
+/// Build one resolved term from a value index, the kind of value living
+/// there, and the raw comparison. Checks the literal type against the
+/// value type; None on a mismatch.
+fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
+    Some(match raw {
+        RawKind::Cmp(op, Rhs::Int(n)) => match kind {
+            ColKind::Int => Term::Cmp(idx, op, Rhs::Int(n)),
+            _ => return None,
+        },
+        RawKind::Cmp(op, Rhs::Str(v)) => match kind {
+            ColKind::Text => Term::Cmp(idx, op, Rhs::Str(v)),
+            _ => return None,
+        },
+        RawKind::IsNull => Term::IsNull(idx),
+        RawKind::IsNotNull => Term::IsNotNull(idx),
+    })
+}
+
+/// Resolve every WHERE term's column name to a field id and check the
+/// literal type matches the column type. Returns None on an unknown
+/// column, an unsupported column type, a literal/column type mismatch, or
+/// an aggregate call (aggregates are not valid in WHERE).
 fn resolve_predicate(
     raw: Vec<Vec<RawTerm>>,
     columns: &[RelationColumn],
@@ -1510,22 +1603,82 @@ fn resolve_predicate(
     for g in raw {
         let mut terms = Vec::new();
         for rt in g {
-            let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(&rt.col))?;
+            let RawLhs::Col(col) = &rt.lhs else {
+                return None; // an aggregate in WHERE is invalid SQL
+            };
+            let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(col))?;
             let fid = rc.field_id as usize;
             let kind = col_kind(descs.get(fid)?)?;
-            let term = match rt.kind {
-                RawKind::Cmp(op, Rhs::Int(n)) => match kind {
-                    ColKind::Int => Term::Cmp(fid, op, Rhs::Int(n)),
-                    _ => return None,
-                },
-                RawKind::Cmp(op, Rhs::Str(v)) => match kind {
-                    ColKind::Text => Term::Cmp(fid, op, Rhs::Str(v)),
-                    _ => return None,
-                },
-                RawKind::IsNull => Term::IsNull(fid),
-                RawKind::IsNotNull => Term::IsNotNull(fid),
+            terms.push(typed_term(fid, kind, rt.kind)?);
+        }
+        groups.push(terms);
+    }
+    Some(Predicate(groups))
+}
+
+/// Resolve a HAVING predicate against a grouped query's OUTPUT rows. A
+/// column left side must be one of the group keys (anything else is
+/// invalid SQL); an aggregate left side is any supported aggregate call,
+/// whether or not it appears in the select list. Either resolves to the
+/// index of a matching `gitems` entry - appending a HIDDEN entry (computed
+/// per group but not emitted, since `cols` does not cover it) when the
+/// select list does not carry it. Aggregate values are integers, so their
+/// literals must be too. Returns None on any unresolvable piece.
+fn resolve_having(
+    raw: Vec<Vec<RawTerm>>,
+    gitems: &mut Vec<GItem>,
+    key_fids: &[usize],
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+) -> Option<Predicate> {
+    let mut groups = Vec::new();
+    for g in raw {
+        let mut terms = Vec::new();
+        for rt in g {
+            let (idx, kind) = match &rt.lhs {
+                RawLhs::Col(col) => {
+                    let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(col))?;
+                    let fid = rc.field_id as usize;
+                    if !key_fids.contains(&fid) {
+                        return None; // HAVING on a non-grouped column
+                    }
+                    let kind = col_kind(descs.get(fid)?)?;
+                    let idx = gitems
+                        .iter()
+                        .position(|gi| matches!(gi, GItem::Key(f) if *f == fid))
+                        .unwrap_or_else(|| {
+                            gitems.push(GItem::Key(fid));
+                            gitems.len() - 1
+                        });
+                    (idx, kind)
+                }
+                RawLhs::Agg(func, target) => {
+                    let fid = match target {
+                        AggTarget::Star => None, // COUNT(*) - parse guarantees Count
+                        AggTarget::Col(name) => {
+                            let rc =
+                                columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+                            let fid = rc.field_id as usize;
+                            // MIN/MAX/SUM only over integers (COUNT counts any)
+                            if !matches!(func, AggFn::Count)
+                                && !matches!(col_kind(descs.get(fid)?)?, ColKind::Int)
+                            {
+                                return None;
+                            }
+                            Some(fid)
+                        }
+                    };
+                    let idx = gitems
+                        .iter()
+                        .position(|gi| matches!(gi, GItem::Agg(f, t) if f == func && *t == fid))
+                        .unwrap_or_else(|| {
+                            gitems.push(GItem::Agg(*func, fid));
+                            gitems.len() - 1
+                        });
+                    (idx, ColKind::Int)
+                }
             };
-            terms.push(term);
+            terms.push(typed_term(idx, kind, rt.kind)?);
         }
         groups.push(terms);
     }
@@ -1884,33 +2037,33 @@ mod tests {
     #[test]
     fn splits_select_from_where_order() {
         // COUNT
-        let (p, t, w, g, o) = split_query("SELECT COUNT(*) FROM RDB$RELATIONS").unwrap();
+        let (p, t, w, g, h, o) = split_query("SELECT COUNT(*) FROM RDB$RELATIONS").unwrap();
         assert!(matches!(
             parse_projection(p),
             Some(Proj::Items(items))
                 if matches!(items.as_slice(), [SelItem::Agg(AggFn::Count, AggTarget::Star)])
         ));
         assert_eq!(t, "RDB$RELATIONS");
-        assert!(w.is_none() && g.is_none() && o.is_none());
+        assert!(w.is_none() && g.is_none() && h.is_none() && o.is_none());
         // projection + WHERE + ORDER BY, mixed case; literal case preserved
-        let (p, t, w, g, o) =
+        let (p, t, w, g, h, o) =
             split_query("select ID, NAME from Emp where NAME = 'Emp 5' order by ID desc;").unwrap();
         assert_eq!(proj_cols(&parse_projection(p).unwrap()), vec!["ID", "NAME"]);
         assert_eq!(t, "Emp");
         assert_eq!(w, Some("NAME = 'Emp 5'"));
-        assert!(g.is_none());
+        assert!(g.is_none() && h.is_none());
         assert_eq!(o, Some("ID desc"));
         // ORDER BY without WHERE
-        let (_, t, w, g, o) = split_query("SELECT * FROM DEPT ORDER BY 1").unwrap();
+        let (_, t, w, g, h, o) = split_query("SELECT * FROM DEPT ORDER BY 1").unwrap();
         assert_eq!(t, "DEPT");
-        assert!(w.is_none() && g.is_none());
+        assert!(w.is_none() && g.is_none() && h.is_none());
         assert_eq!(o, Some("1"));
     }
 
     #[test]
     fn splits_group_by() {
         // WHERE + GROUP BY + ORDER BY, mixed case
-        let (p, t, w, g, o) = split_query(
+        let (p, t, w, g, h, o) = split_query(
             "select DEPT_ID, count(*) from EMP where ID <= 30 group by DEPT_ID order by 1",
         )
         .unwrap();
@@ -1918,17 +2071,49 @@ mod tests {
         assert_eq!(t, "EMP");
         assert_eq!(w, Some("ID <= 30"));
         assert_eq!(g, Some("DEPT_ID"));
+        assert!(h.is_none());
         assert_eq!(o, Some("1"));
         // GROUP BY alone ends at the statement end
-        let (_, t, w, g, o) = split_query("SELECT A, SUM(B) FROM T GROUP BY A").unwrap();
+        let (_, t, w, g, _, o) = split_query("SELECT A, SUM(B) FROM T GROUP BY A").unwrap();
         assert_eq!(t, "T");
         assert!(w.is_none() && o.is_none());
         assert_eq!(g, Some("A"));
         // 'GROUP BY' inside a WHERE literal must not start the clause
-        let (_, t, w, g, _) = split_query("SELECT ID FROM T WHERE NAME = 'GROUP BY X'").unwrap();
+        let (_, t, w, g, _, _) = split_query("SELECT ID FROM T WHERE NAME = 'GROUP BY X'").unwrap();
         assert_eq!(t, "T");
         assert_eq!(w, Some("NAME = 'GROUP BY X'"));
         assert!(g.is_none());
+    }
+
+    #[test]
+    fn splits_having() {
+        // the full clause chain, mixed case; HAVING ends at ORDER BY
+        let (_, t, w, g, h, o) = split_query(
+            "select DEPT_ID, count(*) from EMP where ID <= 30 group by DEPT_ID \
+             having count(*) > 3 order by 1",
+        )
+        .unwrap();
+        assert_eq!(t, "EMP");
+        assert_eq!(w, Some("ID <= 30"));
+        assert_eq!(g, Some("DEPT_ID"));
+        assert_eq!(h, Some("count(*) > 3"));
+        assert_eq!(o, Some("1"));
+        // HAVING alone ends at the statement end; GROUP BY ends at HAVING
+        let (_, _, _, g, h, o) =
+            split_query("SELECT A, SUM(B) FROM T GROUP BY A HAVING SUM(B) IS NOT NULL").unwrap();
+        assert_eq!(g, Some("A"));
+        assert_eq!(h, Some("SUM(B) IS NOT NULL"));
+        assert!(o.is_none());
+        // HAVING with no GROUP BY (one global group)
+        let (_, t, w, g, h, _) = split_query("SELECT COUNT(*) FROM T HAVING COUNT(*) > 5").unwrap();
+        assert_eq!(t, "T");
+        assert!(w.is_none() && g.is_none());
+        assert_eq!(h, Some("COUNT(*) > 5"));
+        // 'HAVING' inside a WHERE literal must not start the clause
+        let (_, t, w, _, h, _) = split_query("SELECT ID FROM T WHERE NAME = 'HAVING X'").unwrap();
+        assert_eq!(t, "T");
+        assert_eq!(w, Some("NAME = 'HAVING X'"));
+        assert!(h.is_none());
     }
 
     #[test]
@@ -1938,7 +2123,7 @@ mod tests {
         // no FROM at all
         assert!(split_query("SELECT 1").is_none());
         // 'ORDER' inside a WHERE string literal must not start an ORDER BY
-        let (_, t, w, _, o) = split_query("SELECT ID FROM T WHERE NAME = 'ORDER BY X'").unwrap();
+        let (_, t, w, _, _, o) = split_query("SELECT ID FROM T WHERE NAME = 'ORDER BY X'").unwrap();
         assert_eq!(t, "T");
         assert_eq!(w, Some("NAME = 'ORDER BY X'"));
         assert!(o.is_none());
@@ -2065,6 +2250,67 @@ mod tests {
         assert!(parse_predicate(&tokenize("A != 1 AND B IS NOT NULL").unwrap()).is_some());
         // parentheses / functions are unsupported -> tokenize fails
         assert!(tokenize("(A = 1)").is_none());
+    }
+
+    #[test]
+    fn tokenizes_aggregate_calls() {
+        // an aggregate call is ONE token, spacing-tolerant
+        let toks = tokenize("count( * ) > 3 AND MIN(SALARY) >= 100").unwrap();
+        let dnf = parse_predicate(&toks).unwrap();
+        assert_eq!(dnf.len(), 1);
+        assert_eq!(dnf[0].len(), 2);
+        assert!(matches!(&dnf[0][0].lhs, RawLhs::Agg(AggFn::Count, AggTarget::Star)));
+        assert!(
+            matches!(&dnf[0][1].lhs, RawLhs::Agg(AggFn::Min, AggTarget::Col(c)) if c == "SALARY")
+        );
+        // IS [NOT] NULL applies to aggregates too
+        let toks = tokenize("SUM(B) IS NOT NULL").unwrap();
+        assert!(matches!(&parse_predicate(&toks).unwrap()[0][0].kind, RawKind::IsNotNull));
+        // a non-aggregate function still fails (unsupported)
+        assert!(tokenize("UPPER(NAME) = 'X'").is_none());
+        // ...as does a malformed aggregate
+        assert!(tokenize("MIN(*) > 1").is_none());
+        // an aggregate name NOT followed by parens is a plain identifier
+        let toks = tokenize("COUNT = 1").unwrap();
+        assert!(matches!(&parse_predicate(&toks).unwrap()[0][0].lhs, RawLhs::Col(c) if c == "COUNT"));
+    }
+
+    #[test]
+    fn resolves_having_with_hidden_items() {
+        // relation: DEPT_ID (fid 2, int), SALARY (fid 5, int), NAME (fid 1, text)
+        let columns = vec![
+            RelationColumn { name: "NAME".into(), field_id: 1, position: 1 },
+            RelationColumn { name: "DEPT_ID".into(), field_id: 2, position: 0 },
+            RelationColumn { name: "SALARY".into(), field_id: 5, position: 2 },
+        ];
+        let d = |dtype| Descriptor { dtype, scale: 0, length: 0, sub_type: 0, flags: 0, offset: 0 };
+        let descs = vec![d(0), d(dtype::VARYING), d(dtype::LONG), d(0), d(0), d(dtype::INT64)];
+        let key_fids = vec![2usize];
+        // select list: DEPT_ID, COUNT(*)
+        let mut gitems = vec![GItem::Key(2), GItem::Agg(AggFn::Count, None)];
+
+        // COUNT(*) resolves to the EXISTING item 1; SUM(SALARY) and the
+        // grouped key DEPT_ID... COUNT(*) again must not duplicate
+        let raw = parse_predicate(&tokenize("COUNT(*) > 3 AND SUM(SALARY) > 100 OR DEPT_ID IS NULL").unwrap()).unwrap();
+        let p = resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).unwrap();
+        assert_eq!(gitems.len(), 3); // one hidden item appended: SUM(SALARY)
+        assert!(matches!(gitems[2], GItem::Agg(AggFn::Sum, Some(5))));
+        // output rows: [key, count, hidden sum]
+        assert!(p.matches(&[Value::Int(1), Value::Int(4), Value::Int(200)]));
+        assert!(!p.matches(&[Value::Int(1), Value::Int(4), Value::Int(50)]));
+        assert!(p.matches(&[Value::Null, Value::Int(1), Value::Null])); // the OR arm
+        // a non-grouped column in HAVING is invalid
+        let raw = parse_predicate(&tokenize("SALARY > 1").unwrap()).unwrap();
+        assert!(resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).is_none());
+        // MIN over a text column is unsupported
+        let raw = parse_predicate(&tokenize("MIN(NAME) IS NULL").unwrap()).unwrap();
+        assert!(resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).is_none());
+        // an aggregate compared against a string literal is a type mismatch
+        let raw = parse_predicate(&tokenize("COUNT(*) = 'x'").unwrap()).unwrap();
+        assert!(resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).is_none());
+        // ...and WHERE resolution rejects aggregates outright
+        let raw = parse_predicate(&tokenize("COUNT(*) > 3").unwrap()).unwrap();
+        assert!(resolve_predicate(raw, &columns, &descs).is_none());
     }
 
     #[test]

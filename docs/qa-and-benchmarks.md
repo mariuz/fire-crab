@@ -460,8 +460,48 @@ result rows by that alias - so a query selecting both `COUNT(*)` and
 splits such queries; fire-crab reproduces the engine's aliases.
 
 Scope matches the earlier server differentials: user tables, exact-integer
-and text columns, `MIN`/`MAX`/`SUM` over integers; no `HAVING`, no grouping
-by expressions; anything unsupported falls back.
+and text columns, `MIN`/`MAX`/`SUM` over integers; no `HAVING` (the next
+differential adds it), no grouping by expressions; anything unsupported
+falls back.
+
+### The sixteenth differential — HAVING
+
+`qa/serve-real-having.sh` adds group filtering. fire-crab, as a server,
+answers `SELECT <keys and aggregates> FROM <t> [WHERE ...] [GROUP BY <cols>]
+HAVING <pred> [ORDER BY ...]` by evaluating the predicate - the same
+comparison/`AND`/`OR`/`IS [NOT] NULL` grammar WHERE uses, plus aggregate
+calls as left-hand sides - on each group's *computed output row*, keeping
+the groups it accepts. node-firebird drives it against a database built so
+every predicate genuinely splits the groups (thresholds that keep all or no
+groups would pass vacuously), and every result set equals isql's.
+
+What this converts correctly:
+
+- **HAVING sees aggregates, WHERE sees rows.** The predicate resolves
+  against the grouped query's output items, not record fields:
+  `HAVING COUNT(*) > 13` filters buckets after aggregation, where
+  `WHERE ID <= 50` filtered the input rows before it. An aggregate call in
+  a WHERE clause is rejected (invalid SQL), falling back.
+- **Aggregates not in the select list.** `SELECT DEPT_ID, COUNT(*) ...
+  HAVING SUM(SALARY) > 190000` is legal - `SUM(SALARY)` is computed as a
+  *hidden* output item, used by the filter, never emitted. So is a HAVING
+  on a projection with no aggregate at all (`SELECT DEPT_ID ... HAVING
+  COUNT(*) >= 13`).
+- **Group keys in HAVING.** A grouping column may appear
+  (`HAVING DEPT_ID >= 2`, `HAVING DEPT_ID IS NULL` - which selects the
+  NULL-key bucket); a *non-grouped* column is invalid SQL and falls back.
+- **The global group.** `SELECT COUNT(*) FROM t HAVING COUNT(*) > n` (no
+  GROUP BY) emits the one global row or - unlike the plain global
+  aggregate, which always yields a row - rejects it: zero rows when the
+  predicate fails. `IS NULL` on an aggregate catches groups whose inputs
+  were all NULL (`SUM` over nothing but NULLs).
+- A HAVING can reject *every* group; the gate compares the zero-row result
+  via a sentinel, since an empty answer must stay distinguishable from a
+  transient connection failure.
+
+Grouped queries now also refuse relations with no `RDB$FORMATS` entry
+(system relations) instead of emitting empty or miscounted groups - the
+records cannot be decoded, so the planner falls back.
 
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
@@ -470,15 +510,16 @@ suite (thousands of tests) drives a **server** through the wire protocol via
 the firebird-driver. The server side proven above is the entry to it: the
 handshake, authentication, encryption and op dispatch a real client needs are
 in place, and real queries - `SELECT COUNT(*)`, column projections
-(`SELECT <cols>` / `SELECT *`), `WHERE` filtering, `ORDER BY` and
-`MIN/MAX/SUM/COUNT` aggregates - now dispatch into the converted storage engine
-and return real results, matching isql over the wire. What stands between here
-and running the suite is remaining *breadth* of the SQL engine - joins,
-`GROUP BY`, the column types still rendered approximately, DML, system-table
-projections. Until that surface is wide enough, fire-crab does **not** claim
-any firebird-qa coverage - but the milestone is no longer distant: the protocol
-server the suite talks to accepts real clients and answers real filtered,
-sorted and aggregated queries from real pages today.
+(`SELECT <cols>` / `SELECT *`), `WHERE` filtering, `ORDER BY`,
+`MIN/MAX/SUM/COUNT` aggregates, `GROUP BY` and `HAVING` - now dispatch into
+the converted storage engine and return real results, matching isql over the
+wire. What stands between here and running the suite is remaining *breadth*
+of the SQL engine - joins, the column types still rendered approximately,
+DML, system-table projections. Until that surface is wide enough, fire-crab
+does **not** claim any firebird-qa coverage - but the milestone is no longer
+distant: the protocol server the suite talks to accepts real clients and
+answers real filtered, grouped, sorted and aggregated queries from real
+pages today.
 
 ## Benchmarks
 
@@ -544,6 +585,17 @@ NODE_PATH="$PWD/node_modules" \\
 NODE_PATH="$PWD/node_modules" \\
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
     sh /path/to/fire-crab/qa/serve-real-orderagg.sh /tmp/fbhandson/plans_clean.fdb 3050
+
+# server groups (GROUP BY) with per-bucket aggregates, vs isql
+# (use a db with NULLable group keys - the gate's header describes the tables)
+NODE_PATH="$PWD/node_modules" \\
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
+    sh /path/to/fire-crab/qa/serve-real-groupby.sh /tmp/fbhandson/groupby_clean.fdb 3050
+
+# server filters groups (HAVING), incl. aggregates not in the select list, vs isql
+NODE_PATH="$PWD/node_modules" \\
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
+    sh /path/to/fire-crab/qa/serve-real-having.sh /tmp/fbhandson/having_clean.fdb 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
