@@ -1377,6 +1377,51 @@ interleaved with its own op_receives. The fourteen checks run over a
 schema with a foreign key and a user index, each `SHOW` compared
 verbatim between fire-crab and isql on the same file.
 
+### The thirty-ninth differential — `SHOW GENERATORS`, and the generator page
+
+`blr_gen_id` parsed in the previous slice but read back NULL, because
+fire-crab did not yet read the generator pages. `SHOW GENERATORS` closes
+that. It is a three-part command, and the missing part turned out to be a
+wire operation, not a storage one. The outer request — already handled —
+is a `blr_for` over `RDB$GENERATORS` sorted by schema and name, listing
+the generators. For each one isql then issues a *DSQL* query, `SELECT
+GEN_ID(<name>, 0) FROM SYSTEM.RDB$DATABASE` (show.epp:4668), to read its
+current value, and an inner request reads its initial value and
+increment. That per-generator value query does not arrive as
+op_prepare/op_execute/op_fetch: the OO client's `execute()`-with-output-
+metadata sends **op_exec_immediate2** (75) — prepare, execute and return
+the single output row in one round-trip — which fire-crab did not handle.
+
+Two pieces, then. The op: op_exec_immediate2 carries the input BLR,
+message number and count, an output BLR, and the op_exec_immediate tail
+(transaction, statement, dialect, SQL, items, buffer length), and its
+reply is an **op_sql_response** (78) carrying the one output message —
+here a scalar row, a four-byte null bitmap then the BIGINT — followed by
+a plain op_response echoing the transaction handle. And the value:
+`GEN_ID(<name>, 0)` reads the generator vector. The id comes from
+`RDB$GENERATORS.RDB$GENERATOR_ID`; the value lives at slot `id %
+gensPerPage` of the generator page whose sequence is `id / gensPerPage`
+(dpm.epp:1439), with `gensPerPage = (page_size − 24) / 8` (ods.cpp:81) —
+a native little-endian `SINT64` the engine dereferences directly. Since
+generator pages carry `pag_ids` (page type 9), fire-crab finds the right
+one by scanning for that type with the matching `gpg_sequence`, rather
+than routing through `RDB$PAGES`. The read is recognised as a scalar
+plan both from op_exec_immediate2 and — for a client that runs the same
+`SELECT GEN_ID(...)` through the ordinary prepare/fetch path — from
+plan_query, keyed on the `GEN_ID(<name>, <step>) FROM RDB$DATABASE`
+shape with a zero step (a non-zero step would *increment* the generator,
+a write, and is left to fall through). The generator name is reduced
+past its `PUBLIC.` schema qualifier and any quotes to the bare catalog
+name.
+
+`qa/serve-real-show.sh` grows to nineteen checks: the scratch database
+gains two sequences and a generator (one `SET` to a value, one sequence
+`RESTART`ed), and `SHOW GENERATORS`, `SHOW SEQUENCES`, and three named
+`SHOW GENERATOR <name>` forms run identically through fire-crab and isql
+— name, current value, initial value and increment matching verbatim
+(`Generator PUBLIC.GEN_C, current value: 4242, initial value: 1,
+increment: 1`).
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -1633,10 +1678,12 @@ NODE_PATH="$PWD/node_modules" \
 
 # SHOW over the legacy BLR request API (op_compile / op_start / op_receive /
 # op_release): the single-relation SHOWs (TABLES/VIEWS/ROLES/FUNCTIONS/
-# PROCEDURES/PACKAGES/FILTERS/PUBLICATIONS) plus the multi-relation ones -
+# PROCEDURES/PACKAGES/FILTERS/PUBLICATIONS), the multi-relation ones -
 # SHOW TABLE <name>, SHOW INDICES (a two-stream join), SHOW DOMAINS/COLLATIONS -
-# run identically through fire-crab (isql -> fcwire serve) and isql on the
-# same file, output compared verbatim. Builds its own scratch db.
+# and SHOW GENERATORS/SEQUENCES (the current value read from the generator
+# page via a GEN_ID op_exec_immediate2 probe) run identically through
+# fire-crab (isql -> fcwire serve) and isql on the same file, output compared
+# verbatim (nineteen checks). Builds its own scratch db.
 FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     bash /path/to/fire-crab/qa/serve-real-show.sh 3050
 ```
