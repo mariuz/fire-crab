@@ -1052,6 +1052,49 @@ unique index exactly like any duplicate key; unsupported DDL verbs
 (CREATE INDEX, DROP, ALTER) answer real SQL errors - a client must
 never think its DDL succeeded.
 
+### The thirty-second differential — constraints the engine enforces, indexes it navigates, drops it honors
+
+`qa/serve-real-ddl2.sh` widens DDL to what real schemas are made of:
+PRIMARY KEY and NOT NULL constraints, CREATE [UNIQUE] INDEX, DROP
+TABLE. The catalog shape came from the same probe method - engine
+databases diffed around each statement: a PK is an RDB$PRIMARYn index
+(unique + the irt_primary flag, its RDB$INDEX_TYPE left NULL where a
+user index carries 0) plus INTEG_n rows in RDB$RELATION_CONSTRAINTS,
+one 'NOT NULL' constraint + RDB$CHECK_CONSTRAINTS row per not-null
+column (the check row's trigger name is the COLUMN name), and the
+runtime blob grows an RSR_field_not_null segment whose eight BLR
+bytes are probe-copied verbatim. CREATE INDEX carves its irtd segment
+array downward from the index root page's tail exactly where the
+engine allocates it, writes an empty root bucket, and BACKFILLS every
+existing committed row - with unique enforcement, so a UNIQUE index
+over data that already has duplicates fails the whole statement,
+exactly like the engine's index build.
+
+The differential's high point: the ENGINE enforces what fire-crab
+wrote. Its own duplicate INSERT dies with "violation of PRIMARY or
+UNIQUE KEY constraint INTEG_2" - the engine walking the index
+fire-crab built, refusing the row, and naming the constraint row
+fire-crab stored; its NOT NULL validation fires off the runtime-blob
+segment; its point lookups PLAN through both the PK and the
+backfilled user index; and after gbak backup + restore, the RESTORED
+copy still enforces the PK - the constraint survived a full catalog
+replay. One more engine law was caught live: registering the B-tree
+bucket page in RDB$PAGES corrupts the attach (DPM_scan_pages accepts
+only pointer/root/TIP/generator rows - error 257); bucket pages are
+reachable only through the index root slots.
+
+DROP TABLE is the engine's `DPM_delete_relation` against the file
+image: rows in eight catalog relations become ordinary deleted stubs
+(the engine's own sweep collects the chains and the blobs their back
+versions reference - asserted: rows survive, gfix stays clean), the
+tx-0 RDB$PAGES rows are WIPED (no version chains to stub - the
+post-sweep engine state), and every owned page - data, pointer, index
+root, every B-tree bucket, level-1 blob pages - goes back to the PIP.
+The server-side DML paths gained NOT NULL validation at store (the
+place the engine validates), so a NULL into a constrained column is a
+real SQL error whether it arrives as a literal, a missing column, a
+parameter, or an UPDATE.
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -1073,10 +1116,10 @@ chains, `gbak` backs the file up). Prepared statements now take real
 `?` parameters through the describe/execute machinery every driver
 uses. What stands between here and running the suite is remaining
 *breadth* of the SQL engine - select-list expressions and arithmetic,
-DDL beyond plain CREATE TABLE (constraints, CREATE INDEX, DROP/ALTER)
-- with CREATE TABLE itself now engine-adopted, the WHERE predicate
-surface done, and compound/descending indexes maintained. Until that
-surface is wide enough,
+ALTER TABLE, foreign keys - with CREATE TABLE (PK/NOT NULL included),
+CREATE INDEX, DROP TABLE all engine-adopted and engine-enforced, the
+WHERE predicate surface done, and compound/descending indexes
+maintained. Until that surface is wide enough,
 fire-crab does **not** claim any firebird-qa coverage - but the milestone
 is no longer distant: the protocol server the suite talks to accepts real
 clients, answers real typed, filtered, joined, grouped, sorted and
@@ -1274,6 +1317,14 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-ddl.sh 3050
+
+# DDL BREADTH: PK/NOT NULL constraints the ENGINE then enforces (naming our
+# INTEG_n rows), CREATE INDEX with backfill the engine PLAN-navigates, DROP
+# TABLE the engine honors and sweeps. Builds its own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-ddl2.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
