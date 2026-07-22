@@ -343,6 +343,13 @@ enum Wire {
     /// 8-byte blob id (the on-disk bid bytes); the client fetches the
     /// content through op_open_blob/op_get_segment with this id
     Blob,
+    /// 16-byte big-endian 128-bit integer (xdr_int128: high hyper, low
+    /// hyper); the raw scaled value travels, the client divides
+    Int128,
+    /// IEEE 754-2008 decimal64, 8 bytes big-endian (xdr_dec64)
+    Dec16,
+    /// decimal128, 16 bytes big-endian, high half first (xdr_dec128)
+    Dec34,
 }
 
 /// One column of a projection: its name, the field id that indexes the
@@ -576,6 +583,9 @@ fn wire_for(d: &Descriptor) -> (Wire, i32, i32, i32, i32) {
         // blob: the 8-byte id travels, content via the blob ops; the
         // describe carries the sub_type so clients know text vs binary
         dtype::BLOB => (Wire::Blob, 520, 8, 0, d.sub_type as i32), // SQL_BLOB
+        dtype::INT128 => (Wire::Int128, 32752, 16, scale, 0), // SQL_INT128
+        dtype::DEC64 => (Wire::Dec16, 32760, 8, 0, 0),   // SQL_DEC16
+        dtype::DEC128 => (Wire::Dec34, 32762, 16, 0, 0), // SQL_DEC34
         _ => (Wire::Varying, 448, 32765, 0, 0),          // SQL_VARYING, rendered text
     }
 }
@@ -1899,6 +1909,26 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
             let ay = *y as i128 * 10i128.pow(sy.saturating_sub(*sx).max(0) as u32);
             ax.cmp(&ay)
         }
+        (Value::Int128(x, sx), Value::Int128(y, sy)) if sx == sy => x.cmp(y),
+        (Value::Int128(x, sx), Value::Int128(y, sy)) => {
+            // differing scales (cross-format): align, saturating on the
+            // (astronomically unlikely) overflow
+            let up = |v: i128, by: i8| {
+                10i128
+                    .checked_pow(by.max(0) as u32)
+                    .and_then(|p| v.checked_mul(p))
+                    .unwrap_or(if v < 0 { i128::MIN } else { i128::MAX })
+            };
+            up(*x, sx.saturating_sub(*sy)).cmp(&up(*y, sy.saturating_sub(*sx)))
+        }
+        (Value::DecFloat16(x), Value::DecFloat16(y)) => fire_crab_ods::decfloat::cmp(
+            &fire_crab_ods::decfloat::decode_dec64(*x),
+            &fire_crab_ods::decfloat::decode_dec64(*y),
+        ),
+        (Value::DecFloat34(x), Value::DecFloat34(y)) => fire_crab_ods::decfloat::cmp(
+            &fire_crab_ods::decfloat::decode_dec128(*x),
+            &fire_crab_ods::decfloat::decode_dec128(*y),
+        ),
         (Value::Double(x), Value::Double(y)) => x.partial_cmp(y).unwrap_or(Equal),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
@@ -2210,6 +2240,23 @@ fn encode_row(w: &mut W, cols: &[ProjCol], values: &[Value]) {
                 // op_open_blob, where decode_blob_id reads them again
                 let (rel, num) = if let Value::Blob(rel, num) = v { (*rel, *num) } else { (0, 0) };
                 w.raw(&encode_blob_id(rel, num));
+            }
+            Wire::Int128 => {
+                // xdr_int128 (xdr.cpp:437): high hyper then low hyper =
+                // the value's 16 big-endian bytes
+                let x = if let Value::Int128(x, _) = v { *x } else { 0 };
+                w.raw(&x.to_be_bytes());
+            }
+            Wire::Dec16 => {
+                // xdr_dec64 (xdr.cpp:424): the decimal64 word big-endian
+                let x = if let Value::DecFloat16(x) = v { *x } else { 0 };
+                w.raw(&x.to_be_bytes());
+            }
+            Wire::Dec34 => {
+                // xdr_dec128 (xdr.cpp:430): high half first - the
+                // decimal128's 16 big-endian bytes
+                let x = if let Value::DecFloat34(x) = v { *x } else { 0 };
+                w.raw(&x.to_be_bytes());
             }
         }
     }

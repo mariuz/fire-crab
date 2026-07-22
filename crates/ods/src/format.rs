@@ -126,7 +126,13 @@ pub enum Value {
     Timestamp(i32, u32),
     /// blob/quad id: (relation, record number)
     Blob(u16, u64),
-    /// present but not yet decodable (INT128, DECFLOAT...)
+    /// 128-bit exact numeric (raw value, scale) - NUMERIC/DECIMAL(38)
+    Int128(i128, i8),
+    /// DECFLOAT(16): the raw IEEE 754-2008 decimal64 bits (LE-loaded)
+    DecFloat16(u64),
+    /// DECFLOAT(34): the raw decimal128 bits (LE-loaded)
+    DecFloat34(u128),
+    /// present but not yet decodable (time-zone types)
     Unsupported(&'static str),
 }
 
@@ -143,19 +149,26 @@ impl Value {
             Value::Time(t) => render_time(*t),
             Value::Timestamp(d, t) => format!("{} {}", render_date(*d), render_time(*t)),
             Value::Blob(rel, num) => format!("<blob {}:{}>", rel, num),
+            Value::Int128(v, scale) => render_scaled_i128(*v, *scale),
+            Value::DecFloat16(b) => crate::decfloat::to_string(&crate::decfloat::decode_dec64(*b)),
+            Value::DecFloat34(b) => crate::decfloat::to_string(&crate::decfloat::decode_dec128(*b)),
             Value::Unsupported(t) => format!("<{}>", t),
         }
     }
 }
 
 fn render_scaled(raw: i64, scale: i8) -> String {
+    render_scaled_i128(raw as i128, scale)
+}
+
+fn render_scaled_i128(raw: i128, scale: i8) -> String {
     if scale >= 0 {
         // positive scale multiplies (rare); render plainly
-        return (raw as i128 * 10i128.pow(scale as u32)).to_string();
+        return (raw * 10i128.pow(scale as u32)).to_string();
     }
     let digits = (-scale) as usize;
     let sign = if raw < 0 { "-" } else { "" };
-    let abs = (raw as i128).unsigned_abs();
+    let abs = raw.unsigned_abs();
     let pow = 10u128.pow(digits as u32);
     format!(
         "{}{}.{:0width$}",
@@ -232,9 +245,11 @@ pub fn decode_field(image: &[u8], desc: &Descriptor, index: usize) -> Value {
             let num = ((f[3] as u64) << 32) | u32_at(f, 4) as u64;
             Value::Blob(rel, num)
         }
-        dtype::INT128 => Value::Unsupported("int128"),
-        dtype::DEC64 => Value::Unsupported("decfloat16"),
-        dtype::DEC128 => Value::Unsupported("decfloat34"),
+        dtype::INT128 => {
+            Value::Int128(i128::from_le_bytes(f[0..16].try_into().unwrap()), desc.scale)
+        }
+        dtype::DEC64 => Value::DecFloat16(u64::from_le_bytes(f[0..8].try_into().unwrap())),
+        dtype::DEC128 => Value::DecFloat34(u128::from_le_bytes(f[0..16].try_into().unwrap())),
         _ => Value::Unsupported("dtype?"),
     }
 }
