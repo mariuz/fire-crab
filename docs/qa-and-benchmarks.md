@@ -883,9 +883,10 @@ navigational ORDER BY - finding exactly the rows fire-crab wrote.
 refuses with nothing written; an updated key is found under its new
 value and not its old; deleted rows are invisible through the index;
 the engine's same-statements copy prints the identical table; and the
-sweep leaves everything clean. Multi-segment, descending and
-expression indexes still refuse DML - the guard narrowed rather than
-vanished.
+sweep leaves everything clean. At this increment multi-segment,
+descending and expression indexes still refused DML; the next
+differential converted the first two, narrowing the guard to
+expression/conditional shapes.
 
 ### The twenty-eighth differential — parameter binding, driven by a real client's encoders
 
@@ -927,6 +928,48 @@ files - timestamps, dates, times, booleans and scaled numerics
 included. The parameter-bound PRIMARY KEY makes the inserts exercise
 index maintenance too, and `gfix -v -full` cross-checks those entries.
 
+### The twenty-ninth differential — multi-segment and descending indexes, and a rule the engine corrected
+
+`qa/serve-real-multiseg.sh` converts the two index shapes real schemas
+are full of. Compound keys are assembled exactly as `BTR_key`
+(btr.cpp:2245): each segment is compressed individually, then
+interleaved into groups of one marker byte - the number of segments
+remaining, including the current one - plus up to `STUFF_COUNT` (4)
+data bytes, with the unfinished group zero-padded before the next
+segment opens its own. An ascending NULL segment contributes nothing,
+not even its marker. A DESCENDING index complements the WHOLE
+assembled key - markers and padding included, because
+`BTR_complement_key` runs after assembly - with a descending NULL
+stored as a single pre-complement 0x00 byte and the 0x01 end-value
+guard (btr.cpp:3978) prepended to values whose pre-complement image
+starts 0x00/0x01 (unreachable from INTEGER/VARCHAR data; pinned by
+unit tests instead).
+
+The increment's best moment was being WRONG: the first draft of both
+the code and this gate assumed a key with *any* NULL segment is
+exempt from unique enforcement. The live engine refused the second
+`(NULL, 2)` into a UNIQUE(X, Y) index - and btr.cpp:5629 says why:
+`validateDuplicates = (unique && !key_all_nulls) || primary` - only a
+key whose EVERY segment is NULL escapes the check (which is also
+exactly the single-column multiple-NULLs behaviour, since one NULL
+segment is then all of them). The conversion now implements the
+engine's rule, and the gate asserts both directions: `(NULL, 2)`
+twice is refused, `(NULL, NULL)` twice is accepted. That is the
+differential method working as designed - a plausible reading of the
+semantics corrected by the running engine before it could ship.
+
+The oracles: 1500 rows through a compound (INTEGER, VARCHAR) PRIMARY
+KEY - stuffed keys are ~1.9x wider than their data, so the leaves
+split repeatedly - then the ENGINE reads through the tree: a
+compound-key point lookup and a partial-key (first-segment) scan,
+both PLAN-asserted to the PK index; a descending point lookup, a
+FORCED navigational `ORDER BY ... DESC` walk of the complemented
+tree (the table is small enough that the optimizer would otherwise
+sort), and a descending-COMPOUND lookup; `gfix -v -full` cross-checks
+every record against every entry - one wrong marker, pad or
+complement byte and it reports; the engine's same-statements copy
+agrees on every table; `gbak` walks it all.
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -947,8 +990,9 @@ would have produced, `gfix -v` passes, `gfix -sweep` collects the
 chains, `gbak` backs the file up). Prepared statements now take real
 `?` parameters through the describe/execute machinery every driver
 uses. What stands between here and running the suite is remaining
-*breadth* of the SQL engine - the less-common index shapes, DDL, and
-the wider expression surface. Until that surface is wide enough,
+*breadth* of the SQL engine - DDL and the wider expression surface
+(compound and descending indexes are maintained now; expression and
+conditional ones still refuse DML). Until that surface is wide enough,
 fire-crab does **not** claim any firebird-qa coverage - but the milestone
 is no longer distant: the protocol server the suite talks to accepts real
 clients, answers real typed, filtered, joined, grouped, sorted and
@@ -1120,6 +1164,15 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-params.sh 3050
+
+# MULTI-SEGMENT + DESCENDING INDEXES: 1500 rows split a compound-PK tree the
+# engine then reads through (point/partial-key/descending/forced-navigational
+# scans, PLAN-asserted); the all-NULL-only unique exemption asserted both
+# ways. Builds its own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-multiseg.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
