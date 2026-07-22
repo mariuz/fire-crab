@@ -48,6 +48,11 @@ pub const OP_FETCH: i32 = 65;
 pub const OP_FETCH_RESPONSE: i32 = 66;
 pub const OP_FREE_STATEMENT: i32 = 67;
 pub const OP_PREPARE_STATEMENT: i32 = 68;
+pub const OP_CREATE: i32 = 20;
+pub const OP_SERVICE_ATTACH: i32 = 82;
+pub const OP_SERVICE_DETACH: i32 = 83;
+pub const OP_SERVICE_INFO: i32 = 84;
+pub const OP_SERVICE_START: i32 = 85;
 pub const SQL_DIALECT_3: i32 = 3;
 pub const DSQL_DROP: i32 = 1;
 

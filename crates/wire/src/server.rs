@@ -24,9 +24,9 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 use crate::{
-    OP_ATTACH, OP_COMMIT, OP_CONNECT, OP_CONT_AUTH, OP_CRYPT, OP_DETACH, OP_EXECUTE, OP_FETCH,
-    OP_FETCH_RESPONSE, OP_FREE_STATEMENT, OP_PREPARE_STATEMENT, OP_RESPONSE, OP_ROLLBACK,
-    OP_TRANSACTION,
+    OP_ATTACH, OP_COMMIT, OP_CONNECT, OP_CONT_AUTH, OP_CREATE, OP_CRYPT, OP_DETACH, OP_EXECUTE,
+    OP_FETCH, OP_FETCH_RESPONSE, OP_FREE_STATEMENT, OP_PREPARE_STATEMENT, OP_RESPONSE, OP_ROLLBACK,
+    OP_SERVICE_ATTACH, OP_SERVICE_DETACH, OP_SERVICE_INFO, OP_SERVICE_START, OP_TRANSACTION,
 };
 
 const OP_ALLOCATE_STATEMENT: i32 = 62;
@@ -339,6 +339,140 @@ fn load_database(path: &str) -> Option<Database> {
         return None;
     }
     Some(Database { bytes, page_size, path: p.to_string() })
+}
+
+/// Materialise an empty real database at `path` (op_create). fire-crab
+/// serves and mutates real ODS files; synthesising a valid one from
+/// nothing is a separate large conversion, so op_create has the engine
+/// create it - `isql -o /dev/null` running a CREATE DATABASE - exactly
+/// as every gate builds its scratch db. The binary is taken from
+/// $FC_ISQL, else `isql` on PATH. The client's own DDL/DML then runs
+/// through fire-crab against the file.
+fn create_database_file(path: &str) -> Result<(), String> {
+    let p = path.trim();
+    if p.is_empty() {
+        return Err("empty database path".into());
+    }
+    // an existing file with a decodable header is already a database
+    if load_database(p).is_some() {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(p);
+    let isql = std::env::var("FC_ISQL").unwrap_or_else(|_| "isql".to_string());
+    let user = std::env::var("FC_CREATE_USER").unwrap_or_else(|_| "SYSDBA".to_string());
+    let pass = std::env::var("FC_CREATE_PASSWORD").unwrap_or_else(|_| "masterkey".to_string());
+    let sql = format!(
+        "CREATE DATABASE '{}' USER '{}' PASSWORD '{}' PAGE_SIZE 8192;\n",
+        p.replace('\'', "''"),
+        user,
+        pass
+    );
+    let out = std::process::Command::new(&isql)
+        .args(["-q", "-o", "/dev/null"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(sql.as_bytes())?;
+            child.wait_with_output()
+        })
+        .map_err(|e| format!("spawn {}: {}", isql, e))?;
+    if !out.status.success() && load_database(p).is_none() {
+        return Err(format!(
+            "isql create failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    if load_database(p).is_none() {
+        return Err("created file is not a decodable database".into());
+    }
+    Ok(())
+}
+
+/// Serve the op_service_attach connection the firebird-qa plugin's
+/// connect_server opens at session start. It reads a handful of server
+/// info items (version, home/lock dirs, security db, architecture) and
+/// detaches. The exact response byte format was captured from the real
+/// Firebird server: each string item is `[tag][u16 LE len][bytes]`,
+/// the cluster ending in isc_info_end(1) (SvcInfoCode: SERVER_VERSION
+/// 55, IMPLEMENTATION 56, USER_DBPATH 58, GET_ENV 59, GET_ENV_LOCK 60).
+fn serve_service(
+    s: &mut TcpStream,
+    enc: &mut Option<Rc4>,
+    dec: &mut Option<Rc4>,
+) -> std::io::Result<()> {
+    read_int(s, dec)?; // database id (0)
+    read_wire_bytes(s, dec)?; // service name ("service_mgr")
+    read_wire_bytes(s, dec)?; // spb
+    respond(s, enc, 1)?; // service handle 1
+    if std::env::var("FC_SRV_TRACE").is_ok() {
+        eprintln!("[srv] op_service_attach ok, handle 1");
+    }
+    loop {
+        let op = match read_int(s, dec) {
+            Ok(o) => o,
+            Err(_) => break,
+        };
+        match op {
+            x if x == OP_SERVICE_INFO => {
+                read_int(s, dec)?; // object (service handle)
+                read_int(s, dec)?; // incarnation
+                read_wire_bytes(s, dec)?; // send items
+                let recv = read_wire_bytes(s, dec)?; // requested items
+                read_int(s, dec)?; // buffer length
+                let info = service_info(&recv);
+                let mut w = W::default();
+                w.int(OP_RESPONSE).int(0).int(0).int(0).bytes(&info).int(0);
+                w.send(s, enc)?;
+            }
+            x if x == OP_SERVICE_START => {
+                // service actions (backup, gstat, ...) are not converted;
+                // acknowledge so the client does not desync, and let its
+                // info-poll of the (empty) output stream complete
+                read_int(s, dec)?; // object
+                read_int(s, dec)?; // incarnation
+                read_wire_bytes(s, dec)?; // spb (the action)
+                respond(s, enc, 0)?;
+            }
+            x if x == OP_SERVICE_DETACH => {
+                read_int(s, dec)?; // handle
+                respond(s, enc, 0)?;
+                break;
+            }
+            _ => {
+                // unknown service op: reply an error rather than hang
+                respond_error(s, enc, GDS_DSQL_ERROR)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Build the op_service_info response cluster for the requested items,
+/// mirroring the real server's bytes. Unknown items are skipped.
+fn service_info(items: &[u8]) -> Vec<u8> {
+    fn str_item(d: &mut Vec<u8>, tag: u8, val: &str) {
+        d.push(tag);
+        d.extend_from_slice(&(val.len() as u16).to_le_bytes());
+        d.extend_from_slice(val.as_bytes());
+    }
+    let mut d = Vec::new();
+    for &it in items {
+        match it {
+            // SERVER_VERSION: the driver splits the first space-token on
+            // 'V'/'T', so it must look like a Firebird version banner
+            55 => str_item(&mut d, 55, "LI-V6.0.0.2076 Firebird 6.0 fire-crab"),
+            56 => str_item(&mut d, 56, "Firebird/Linux/ARM64"), // IMPLEMENTATION
+            58 => str_item(&mut d, 58, "/opt/firebird/security6.fdb"), // USER_DBPATH
+            59 => str_item(&mut d, 59, "/opt/firebird/"), // GET_ENV (home)
+            60 => str_item(&mut d, 60, "/tmp/firebird/"), // GET_ENV_LOCK
+            _ => {}
+        }
+    }
+    d.push(1); // isc_info_end
+    d
 }
 
 /// How a projected column is carried on the wire (protocol 13+ XDR).
@@ -4630,14 +4764,36 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
         cop // the op we already read IS op_attach (cleartext path)
     };
 
-    // --- op_attach (encrypted or not, depending on the branch above) ---
-    if attach_op != OP_ATTACH {
+    // --- op_service_attach: the Services manager the firebird-qa plugin
+    // bootstraps against (connect_server). It reads the server version,
+    // home/lock directories, security database and architecture, then
+    // detaches. We serve those from a small service loop and return. ---
+    if attach_op == OP_SERVICE_ATTACH {
+        return serve_service(&mut s, &mut enc, &mut dec);
+    }
+
+    // op_attach and op_create share the wire layout (database id, file,
+    // dpb). op_create additionally MATERIALISES the file first: rather
+    // than synthesise a valid ODS from nothing (a separate large
+    // conversion), fire-crab has the engine create an empty database,
+    // then serves and mutates it - the same real-file basis every gate
+    // uses. Both then run the identical attachment loop below.
+    if attach_op != OP_ATTACH && attach_op != OP_CREATE {
         return Ok(());
     }
     read_int(&mut s, &mut dec)?; // 0
     let path_bytes = read_wire_bytes(&mut s, &mut dec)?; // db path
     read_wire_bytes(&mut s, &mut dec)?; // dpb
     let db_path = String::from_utf8_lossy(&path_bytes).into_owned();
+    if attach_op == OP_CREATE {
+        if let Err(e) = create_database_file(&db_path) {
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                eprintln!("[srv] create_database failed: {}", e);
+            }
+            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+            return Ok(());
+        }
+    }
     // Open the real file the client named, if it exists and is a database.
     // When it does, queries answer from its pages; when it does not (the
     // client attached to a name with no file behind it), the server falls
