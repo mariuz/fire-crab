@@ -699,6 +699,42 @@ keys result rows by column *title*, so selecting two same-named columns
 selects title-distinct columns, as the INNER-join gate learned before
 it.
 
+### The twenty-second differential — system tables, self-described
+
+`qa/serve-real-syscat.sh` removes the longest-standing scope exclusion:
+system relations now answer projections, WHERE, ORDER BY, aggregates,
+GROUP BY and JOINs like user tables. Their formats are not in
+`RDB$FORMATS` - the engine builds them at database creation from
+compiled-in tables (ini.epp:1053-1088) - so `sysfmt` runs the same
+computation: `fmt_length` starts at `FLAG_BYTES(count)` (val.h:42) and
+each field, in field-id order, is aligned by `MET_align` (met.epp:
+530-557: text never, VARYING on its 2-byte count word, everything else
+on min(length, 8)). But where ini.epp reads compiled-in tables, sysfmt
+reads the *database's own catalog*: `RDB$RELATION_FIELDS` names every
+system relation's fields with their ids, `RDB$FIELDS` gives each
+field's external type code, and those codes map to internal dtypes
+exactly as `DSC_make_descriptor` does (dsc.cpp:1411-1523). The file
+describes itself; only the two relations needed to start reading the
+catalog are compiled in.
+
+The computation is *anchored before it is trusted*: the offsets it
+produces must reproduce every offset `catalog.rs` established
+empirically by differential testing in earlier increments -
+`RDB$RELATION_FIELDS`' FIELD_NAME @4, RELATION_NAME @256,
+FIELD_POSITION @1394, FIELD_ID @1410, and the `RDB$RELATIONS` walk
+landing RELATION_ID @32 / RELATION_NAME @42. That is asserted in unit
+tests and re-checked at every runtime bootstrap - a database whose ODS
+the pinning does not cover is refused, never answered wrong.
+
+The gate's checks include the self-referential ones: projecting the
+very tables the computation reads (`RDB$FIELDS`, `RDB$TYPES`), a
+user table's own catalog rows (declared position vs physical field id,
+the inc-14 distinction, now read back over the wire), a
+system-to-system JOIN, and - the guard that matters - DML on a system
+relation still refused with a real SQL error (`select_formats` falls
+back for SELECT paths only; the DML planners keep plain
+`relation_formats`).
+
 ### Stage 3 — the Firebird QA suite (the milestone, now in reach)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -719,7 +755,7 @@ would have produced, `gfix -v` passes, `gfix -sweep` collects the
 chains, `gbak` backs the file up). What stands between here and running
 the suite is remaining *breadth* of the SQL engine - index maintenance
 and page allocation on the write path, blob/INT128/DECFLOAT
-columns, system-table projections. Until that surface is wide enough,
+columns. Until that surface is wide enough,
 fire-crab does **not** claim any firebird-qa coverage - but the milestone
 is no longer distant: the protocol server the suite talks to accepts real
 clients, answers real typed, filtered, joined, grouped, sorted and
@@ -835,6 +871,12 @@ NODE_PATH="$PWD/node_modules" \\
 NODE_PATH="$PWD/node_modules" \\
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
     bash /path/to/fire-crab/qa/serve-real-outerjoin.sh /tmp/fbhandson/join_clean.fdb 3050
+
+# server answers SYSTEM-TABLE projections/joins/grouping - formats computed
+# from the database's own catalog by the ini.epp offset walk, vs isql
+NODE_PATH="$PWD/node_modules" \\
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \\
+    bash /path/to/fire-crab/qa/serve-real-syscat.sh /tmp/fbhandson/join_clean.fdb 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on

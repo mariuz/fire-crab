@@ -55,6 +55,7 @@ the converter what the C++ is *doing* before they read a line of it.
 | Native wire types | `fire-crab-wire::server` | **columns travel in the engine's own wire form** - SMALLINT/INTEGER/BIGINT at their own SQL types, NUMERIC/DECIMAL as raw scaled integers with the scale in the describe (the client divides), FLOAT/DOUBLE as IEEE bytes, DATE/TIME/TIMESTAMP as raw day/1e-4-s units, BOOLEAN as an XDR slot; ORDER BY/GROUP BY on them compare numerically; node-firebird's typed decode (numbers, `Date`s, booleans) matches isql |
 | INSERT (first DML) | `fire-crab-wire::server` + `fire-crab-ods::dml` | **the server writes real records into the pages** - transaction allocated from the header and committed in the TIP, image laid `rhd_not_packed` into a data-page slot; **the real engine is the oracle**: isql reads the rows back, `gfix -v -full` finds nothing wrong, `gbak` backs the file up; unsupported INSERTs answer SQL errors, never silent no-ops |
 | UPDATE / DELETE (version chains) | `fire-crab-wire::server` + `fire-crab-ods::dml` | **the server writes MVCC version chains** - UPDATE copies the old version to a fresh slot flagged `rhd_chain` and rewrites the primary with a back pointer to it; DELETE leaves a header-only `rhd_deleted` stub over the chain (`VIO_modify`/`VIO_erase` + `DPM_update` on the file image); **three engine oracles**: `gfix -v -full` accepts the chains, the same statements applied by the C++ engine to a second copy produce an *identical* table, and `gfix -sweep` - the engine's own GC - collects fire-crab's chains with the version arithmetic exact (46 → 23) and the data intact |
+| System-table projections | `fire-crab-ods::sysfmt` + `fire-crab-wire::server` | **system relations answer like user tables** - their formats (absent from RDB$FORMATS) are *computed* the way ini.epp computes them at database creation, but from the database's own catalog: RDB$RELATION_FIELDS names the fields, RDB$FIELDS types them, the ini.epp offset walk (FLAG_BYTES + MET_align) lays them out. Anchored: the computation must reproduce every offset catalog.rs found by differential testing (4/256/1394/1410, 32/42) - asserted in tests and at every runtime bootstrap. Projections, WHERE, ORDER BY, aggregates, GROUP BY and system-to-system JOINs over RDB$ tables match isql; DML on system relations stays refused |
 | Everything else | — | see [docs/subsystem-map.md](docs/subsystem-map.md) |
 
 **On the firebird-qa milestone, precisely.** firebird-qa drives a *server*,
@@ -190,18 +191,22 @@ position instead of field id silently returns the wrong column, which a
 uniform-width table never reveals.
 
 Projections, WHERE, joins, GROUP BY, HAVING, ORDER BY and aggregates
-currently cover user tables (system relations' formats are not in
-`RDB$FORMATS`, so they answer COUNT but not projections, grouping or joins),
-with integers, scaled numerics, float/double, date/time/timestamp, boolean
-and text all travelling in native wire form; blob, `INT128`, `DECFLOAT` and
-TZ columns are still rendered as text, and other shapes fall back to the
-fixed value.
+cover user tables AND system relations - the latter's formats (absent
+from `RDB$FORMATS`; the engine builds them at creation from compiled-in
+tables, ini.epp:1053-1088) are computed by the same offset walk from the
+database's own catalog rows, so the file describes itself; only the two
+catalog-reading relations are compiled into `sysfmt`, and the computation
+must reproduce the offsets `catalog.rs` established empirically before it
+is trusted. Integers, scaled numerics, float/double, date/time/timestamp,
+boolean and text all travel in native wire form; blob, `INT128`,
+`DECFLOAT` and TZ columns are still rendered as text, and other shapes
+fall back to the fixed value.
 Widening further (write-path page allocation and index maintenance,
-scaled/temporal SET values, the remaining exotic column types,
-system-table projections) is the work that continues - but the fixed answer
-is no longer fixed, the server writes records and version chains the real
-engine validates and garbage-collects, and the protocol server it all runs
-on is proven against a genuine client.
+scaled/temporal SET values, the remaining exotic column types) is the
+work that continues - but the fixed answer is no longer fixed, the server
+writes records and version chains the real engine validates and
+garbage-collects, and the protocol server it all runs on is proven
+against a genuine client.
 
 Current QA state: `fcstat header` output is **byte-identical on the compared
 fields with `gstat -h` across 123 real Firebird 6 databases** (every scratch
