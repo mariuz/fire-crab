@@ -407,6 +407,8 @@ enum Plan {
         rel: u16,
         format_no: u8,
         image: Vec<u8>,
+        descs: Vec<Descriptor>,
+        index_ops: Vec<IndexOp>,
     },
     /// `UPDATE <t> SET col = lit [, ...] [WHERE ...]`: the SET values
     /// are resolved and encoded at prepare (`None` = SQL NULL, `Some` =
@@ -419,6 +421,7 @@ enum Plan {
         formats: Vec<(u8, Vec<Descriptor>)>,
         sets: Vec<(usize, Option<Vec<u8>>)>,
         filter: Option<Predicate>,
+        index_ops: Vec<IndexOp>,
     },
     /// `DELETE FROM <t> [WHERE ...]`: op_execute rewrites each matching
     /// primary record as a deleted stub over its version chain
@@ -699,17 +702,14 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<Plan> {
 
     let db = db.as_ref()?;
     let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
-    // index maintenance is not converted yet: writing records without
-    // their index entries would make the engine's index scans silently
-    // miss rows - DML on an indexed table is refused instead
-    if fire_crab_ods::btr::find_index_root(&db.bytes, db.page_size, rel)
-        .is_some_and(|irt| irt.count > 0)
-    {
-        return None;
-    }
     let columns = relation_columns(&db.bytes, db.page_size, table);
     let formats = relation_formats(&db.bytes, db.page_size, rel);
     let (format_no, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    // every index on the relation must be maintainable (single-segment
+    // ascending on a supported type) or the statement is refused - a
+    // record without its index entries would be silently invisible to
+    // the engine's index scans
+    let index_ops = resolve_index_ops(db, rel, descs)?;
     let targets: Vec<&RelationColumn> = match &collist {
         Some(names) => {
             let mut v = Vec::new();
@@ -725,7 +725,8 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<Plan> {
         return None;
     }
     let image = build_insert_image(&targets, &vals, descs, db, rel, *format_no)?;
-    Some(Plan::Insert { rel, format_no: *format_no, image })
+    let descs = descs.clone();
+    Some(Plan::Insert { rel, format_no: *format_no, image, descs, index_ops })
 }
 
 /// Build the record image: every field NULL except the provided ones,
@@ -860,17 +861,10 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<Plan> {
 
     let db = db.as_ref()?;
     let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
-    // index maintenance is not converted yet: writing records without
-    // their index entries would make the engine's index scans silently
-    // miss rows - DML on an indexed table is refused instead
-    if fire_crab_ods::btr::find_index_root(&db.bytes, db.page_size, rel)
-        .is_some_and(|irt| irt.count > 0)
-    {
-        return None;
-    }
     let columns = relation_columns(&db.bytes, db.page_size, table);
     let formats = relation_formats(&db.bytes, db.page_size, rel);
     let (format_no, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let index_ops = resolve_index_ops(db, rel, descs)?;
 
     let set_end = where_kw.unwrap_or(s.len());
     let toks = tokenize(&s[set_kw + "SET".len()..set_end])?;
@@ -901,7 +895,7 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<Plan> {
         ),
     };
     let format_no = *format_no;
-    Some(Plan::Update { rel, format_no, formats, sets, filter })
+    Some(Plan::Update { rel, format_no, formats, sets, filter, index_ops })
 }
 
 /// Parse `DELETE FROM <t> [WHERE <pred>]` and resolve it. Same
@@ -923,14 +917,9 @@ fn plan_delete(sql: &str, db: &Option<Database>) -> Option<Plan> {
     }
     let db = db.as_ref()?;
     let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
-    // index maintenance is not converted yet: writing records without
-    // their index entries would make the engine's index scans silently
-    // miss rows - DML on an indexed table is refused instead
-    if fire_crab_ods::btr::find_index_root(&db.bytes, db.page_size, rel)
-        .is_some_and(|irt| irt.count > 0)
-    {
-        return None;
-    }
+    // no index guard here: DELETE never touches indexes - the engine's
+    // VIO_erase does not either (entries outlive their records until
+    // garbage collection removes both)
     let columns = relation_columns(&db.bytes, db.page_size, table);
     let formats = relation_formats(&db.bytes, db.page_size, rel);
     // a relation with no RDB$FORMATS entry (a system relation) cannot
@@ -995,17 +984,31 @@ fn execute_dml(plan: &Plan, database: &mut Option<Database>) -> Result<(i32, i32
     let db = database.as_mut().ok_or("no database attached")?;
     let mut work = db.bytes.clone();
     let counts = match plan {
-        Plan::Insert { rel, format_no, image } => {
-            fire_crab_ods::insert_record(&mut work, db.page_size, *rel, *format_no, image)?;
+        Plan::Insert { rel, format_no, image, descs, index_ops } => {
+            let out =
+                fire_crab_ods::insert_record(&mut work, db.page_size, *rel, *format_no, image)?;
+            if !index_ops.is_empty() {
+                let recno = recno_of(&work, db.page_size, out.page_no, out.slot)?;
+                let values = decode_record(image, descs);
+                for op in index_ops {
+                    let v = values.get(op.field_id).unwrap_or(&Value::Null);
+                    let key = fire_crab_ods::btw::index_key(op.itype, v, op.scale)
+                        .ok_or("unsupported value for an index key")?;
+                    fire_crab_ods::btw::insert_index_entry(
+                        &mut work, db.page_size, *rel, op.id, &key, recno, op.unique,
+                    )?;
+                }
+            }
             (1, 0, 0)
         }
-        Plan::Update { rel, format_no, formats, sets, filter } => {
+        Plan::Update { rel, format_no, formats, sets, filter, index_ops } => {
             let descs = formats
                 .iter()
                 .find(|(n, _)| n == format_no)
                 .map(|(_, d)| d)
                 .ok_or("newest format not found")?;
             let mut targets: Vec<(u32, u16, Vec<u8>)> = Vec::new();
+            let mut old_images: Vec<Vec<u8>> = Vec::new();
             for (page, slot, fmt, image) in collect_dml_targets(db, *rel, formats, filter) {
                 // the SET offsets were resolved in the NEWEST format; a
                 // record still stored in an older one would patch wrong
@@ -1013,7 +1016,7 @@ fn execute_dml(plan: &Plan, database: &mut Option<Database>) -> Result<(i32, i32
                 if fmt != *format_no {
                     return Err("a matching record is in an older format".into());
                 }
-                let mut img = image;
+                let mut img = image.clone();
                 for (fid, bytes) in sets {
                     match bytes {
                         None => img[fid / 8] |= 1 << (fid % 8), // SET col = NULL
@@ -1027,10 +1030,34 @@ fn execute_dml(plan: &Plan, database: &mut Option<Database>) -> Result<(i32, i32
                         }
                     }
                 }
+                old_images.push(image);
                 targets.push((page, slot, img));
             }
             let out =
                 fire_crab_ods::update_records(&mut work, db.page_size, *rel, &targets, *format_no)?;
+            // IDX_modify: an entry is ADDED for every key the update
+            // changed; the old entry stays until garbage collection
+            if !index_ops.is_empty() {
+                for ((page, slot, new_img), old_img) in targets.iter().zip(&old_images) {
+                    let recno = recno_of(&work, db.page_size, *page, *slot)?;
+                    let old_values = decode_record(old_img, descs);
+                    let new_values = decode_record(new_img, descs);
+                    for op in index_ops {
+                        let null = Value::Null;
+                        let ov = old_values.get(op.field_id).unwrap_or(&null);
+                        let nv = new_values.get(op.field_id).unwrap_or(&null);
+                        let old_key = fire_crab_ods::btw::index_key(op.itype, ov, op.scale)
+                            .ok_or("unsupported value for an index key")?;
+                        let new_key = fire_crab_ods::btw::index_key(op.itype, nv, op.scale)
+                            .ok_or("unsupported value for an index key")?;
+                        if new_key != old_key {
+                            fire_crab_ods::btw::insert_index_entry(
+                                &mut work, db.page_size, *rel, op.id, &new_key, recno, op.unique,
+                            )?;
+                        }
+                    }
+                }
+            }
             (0, out.affected as i32, 0)
         }
         Plan::Delete { rel, formats, filter } => {
@@ -1046,6 +1073,75 @@ fn execute_dml(plan: &Plan, database: &mut Option<Database>) -> Result<(i32, i32
     db.bytes = work;
     std::fs::write(&db.path, &db.bytes).map_err(|e| e.to_string())?;
     Ok(counts)
+}
+
+/// One index a DML statement must maintain: which field feeds it, how
+/// its key is built, and whether duplicates are refused. Resolved at
+/// plan time from the index root page (irt_repeat + irtd).
+struct IndexOp {
+    id: u8,
+    itype: u16,
+    field_id: usize,
+    scale: i8,
+    unique: bool,
+}
+
+/// Resolve every live index of `rel` into an [IndexOp], or None when
+/// ANY of them is one the write path cannot maintain byte-exactly
+/// (multi-segment, descending, expression/conditional, or an
+/// unconverted itype) - the whole statement is then refused rather
+/// than writing records the engine's index scans would miss.
+fn resolve_index_ops(db: &Database, rel: u16, descs: &[Descriptor]) -> Option<Vec<IndexOp>> {
+    use fire_crab_ods::btw;
+    let Some(irt) = fire_crab_ods::btr::find_index_root(&db.bytes, db.page_size, rel) else {
+        return Some(Vec::new());
+    };
+    let mut ops = Vec::new();
+    for e in irt.entries() {
+        if e.root_page == 0 {
+            continue; // empty slot
+        }
+        if e.key_count != 1 {
+            return None; // multi-segment
+        }
+        let (field, itype, iflags) =
+            btw::index_segment(&db.bytes, db.page_size, rel, e.id)?;
+        if iflags & (btw::IRT_DESCENDING | btw::IRT_EXPRESSION | btw::IRT_CONDITION) != 0 {
+            return None;
+        }
+        if !matches!(
+            itype,
+            btw::IDX_STRING
+                | btw::IDX_NUMERIC
+                | btw::IDX_NUMERIC2
+                | btw::IDX_SQL_DATE
+                | btw::IDX_SQL_TIME
+                | btw::IDX_TIMESTAMP
+                | btw::IDX_BOOLEAN
+        ) {
+            return None;
+        }
+        let d = descs.get(field as usize)?;
+        ops.push(IndexOp {
+            id: e.id,
+            itype,
+            field_id: field as usize,
+            scale: d.scale,
+            unique: iflags & btw::IRT_UNIQUE != 0,
+        });
+    }
+    Some(ops)
+}
+
+/// The record number of the record at (page, slot) - the positional
+/// identity index entries carry.
+fn recno_of(work: &[u8], page_size: usize, page_no: u32, slot: u16) -> Result<u64, String> {
+    let start = page_no as usize * page_size;
+    let dp = work
+        .get(start..start + page_size)
+        .and_then(DataPage::decode)
+        .ok_or("bad data page")?;
+    Ok(dp.sequence as u64 * fire_crab_ods::format::max_recs_per_dp(page_size) + slot as u64)
 }
 
 /// The formats a SELECT decodes records with: `RDB$FORMATS` for user

@@ -203,7 +203,7 @@ fn rhd_bytes(tx: u32, b_page: u32, b_line: u16, rflags: u16, format: u8, data: &
 /// bits past EOF are how the engine extends a database. Only the first
 /// PIP (page 1) is handled; a database needing its second PIP (65312
 /// pages at 8K) fails honestly.
-fn allocate_page(file: &mut Vec<u8>, page_size: usize) -> Result<u32, String> {
+pub(crate) fn allocate_page(file: &mut Vec<u8>, page_size: usize) -> Result<u32, String> {
     let per_pip = PipPage::pages_per_pip(page_size);
     let base = page_size; // PIP 0 is page 1
     let pip = PipPage::decode(file.get(base..base + page_size).ok_or("no PIP page")?)

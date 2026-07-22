@@ -16,10 +16,9 @@
 #     headers;
 #   - gfix -sweep collects the update storm's chains; gbak backs up.
 #
-# And the honest boundary: DML on an INDEXED table is REFUSED with a
-# real SQL error - index maintenance is not converted yet, and writing
-# a record without its index entries would make the engine's index
-# scans silently miss rows.
+# GIDX (a PRIMARY KEY table) additionally exercises the index write
+# path: its insert and delete must maintain the PK index the engine
+# then validates.
 #
 #   qa/serve-real-grow.sh [port]
 #
@@ -152,15 +151,9 @@ check "update storm (back versions need fresh pages)" \
 check "  ..all 53 updated" \
     "$(node_run "SELECT COUNT(*) FROM G WHERE PAD = 'updated'")" "53"
 
-# --- phase 3: DML on an indexed table is refused ------------------------
-case "$(node_run "INSERT INTO GIDX VALUES (2)")" in
-    ERR*) echo "OK   INSERT into an indexed table is refused" ;;
-    *) echo "DIFF INSERT into an indexed table is refused"; fail=1 ;;
-esac
-case "$(node_run "DELETE FROM GIDX WHERE ID = 1")" in
-    ERR*) echo "OK   DELETE from an indexed table is refused" ;;
-    *) echo "DIFF DELETE from an indexed table is refused"; fail=1 ;;
-esac
+# --- phase 3: DML on the indexed table (PK maintained) ------------------
+check "INSERT into the indexed table" "$(node_run "INSERT INTO GIDX VALUES (2)")" "<no rows>"
+check "DELETE from the indexed table" "$(node_run "DELETE FROM GIDX WHERE ID = 1")" "<no rows>"
 
 # --- phase 4: the REAL ENGINE mirrors and validates ---------------------
 kill $srv 2>/dev/null; wait $srv 2>/dev/null
@@ -183,8 +176,8 @@ EOF
 work_rows=$(dump "$WORK"); ref_rows=$(dump "$REF")
 [ -n "$work_rows" ] || { echo "DIFF engine read of the work file"; fail=1; }
 check "fire-crab-written == engine-written table (253 rows)" "$work_rows" "$ref_rows"
-check "GIDX untouched by the refused DML" \
-    "$(run_isql <<<'SET HEADING OFF; SELECT COUNT(*) FROM GIDX;' | tr -d ' \n')" "1"
+check "GIDX reflects the indexed DML (engine-read)" \
+    "$(run_isql <<<'SET HEADING OFF; SELECT ID FROM GIDX;' | tr -d ' \n')" "2"
 
 val=$("$GFIX" -v -full -user "$U" -pas "$P" "$WORK" 2>&1)
 check "gfix -v -full accepts the allocation bookkeeping" "$(printf '%s' "$val" | strip)" ""
