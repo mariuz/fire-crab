@@ -39,6 +39,7 @@ pub mod sqz;
 pub mod sysfmt;
 pub mod tip;
 pub mod tra;
+pub mod tz;
 
 pub use blr::{decode as decode_blr, BlrDecode};
 pub use btr::{walk_index_leaves, BtreePage, IndexRootPage};

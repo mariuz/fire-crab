@@ -35,6 +35,10 @@ pub mod dtype {
     pub const DEC64: u8 = 22;
     pub const DEC128: u8 = 23;
     pub const INT128: u8 = 24;
+    pub const SQL_TIME_TZ: u8 = 25;
+    pub const TIMESTAMP_TZ: u8 = 26;
+    pub const EX_TIME_TZ: u8 = 27;
+    pub const EX_TIMESTAMP_TZ: u8 = 28;
 }
 
 /// `Ods::Descriptor` (ods.h:1023): the on-disk field descriptor.
@@ -132,6 +136,10 @@ pub enum Value {
     DecFloat16(u64),
     /// DECFLOAT(34): the raw decimal128 bits (LE-loaded)
     DecFloat34(u128),
+    /// TIME WITH TIME ZONE: (UTC time units, zone id)
+    TimeTz(u32, u16),
+    /// TIMESTAMP WITH TIME ZONE: (UTC date days, UTC time units, zone id)
+    TimestampTz(i32, u32, u16),
     /// present but not yet decodable (time-zone types)
     Unsupported(&'static str),
 }
@@ -152,6 +160,8 @@ impl Value {
             Value::Int128(v, scale) => render_scaled_i128(*v, *scale),
             Value::DecFloat16(b) => crate::decfloat::to_string(&crate::decfloat::decode_dec64(*b)),
             Value::DecFloat34(b) => crate::decfloat::to_string(&crate::decfloat::decode_dec128(*b)),
+            Value::TimeTz(t, zone) => render_time_tz(*t, *zone),
+            Value::TimestampTz(d, t, zone) => render_timestamp_tz(*d, *t, *zone),
             Value::Unsupported(t) => format!("<{}>", t),
         }
     }
@@ -208,6 +218,47 @@ fn render_time(t: u32) -> String {
     )
 }
 
+/// One day in SQL_TIME units (1/10000 s).
+const DAY_UNITS: i64 = 24 * 60 * 60 * 10_000;
+
+/// TIME WITH TIME ZONE, as the engine prints it: the LOCAL time in the
+/// value's zone, then the zone text. Convertible zones (offsets, GMT)
+/// are exact; a named zone without tzdata rules is rendered VISIBLY
+/// unconverted - never a silently wrong local time.
+fn render_time_tz(utc: u32, zone: u16) -> String {
+    match crate::tz::displacement(zone) {
+        Some(disp) => {
+            let local = (utc as i64 + disp as i64 * 600_000).rem_euclid(DAY_UNITS);
+            format!("{} {}", render_time(local as u32), crate::tz::zone_text(zone))
+        }
+        None => format!("<tz {} {}>", render_time(utc), crate::tz::zone_text(zone)),
+    }
+}
+
+/// TIMESTAMP WITH TIME ZONE: local date and time (day carry applied),
+/// then the zone text - same conversion policy as [render_time_tz].
+fn render_timestamp_tz(date: i32, utc: u32, zone: u16) -> String {
+    match crate::tz::displacement(zone) {
+        Some(disp) => {
+            let t = utc as i64 + disp as i64 * 600_000;
+            let local_date = date as i64 + t.div_euclid(DAY_UNITS);
+            let local_time = t.rem_euclid(DAY_UNITS);
+            format!(
+                "{} {} {}",
+                render_date(local_date as i32),
+                render_time(local_time as u32),
+                crate::tz::zone_text(zone)
+            )
+        }
+        None => format!(
+            "<tz {} {} {}>",
+            render_date(date),
+            render_time(utc),
+            crate::tz::zone_text(zone)
+        ),
+    }
+}
+
 /// Decode one field from an unpacked record image.
 pub fn decode_field(image: &[u8], desc: &Descriptor, index: usize) -> Value {
     // null bitmap: bit `index`, set = NULL
@@ -244,6 +295,13 @@ pub fn decode_field(image: &[u8], desc: &Descriptor, index: usize) -> Value {
             let rel = u16_at(f, 0);
             let num = ((f[3] as u64) << 32) | u32_at(f, 4) as u64;
             Value::Blob(rel, num)
+        }
+        // TZ types store UTC + zone id (ISC_TIME_TZ/ISC_TIMESTAMP_TZ);
+        // the EX variants append an offset the engine computes at bind
+        // time - never stored, but decoded the same if ever seen
+        dtype::SQL_TIME_TZ | dtype::EX_TIME_TZ => Value::TimeTz(u32_at(f, 0), u16_at(f, 4)),
+        dtype::TIMESTAMP_TZ | dtype::EX_TIMESTAMP_TZ => {
+            Value::TimestampTz(u32_at(f, 0) as i32, u32_at(f, 4), u16_at(f, 8))
         }
         dtype::INT128 => {
             Value::Int128(i128::from_le_bytes(f[0..16].try_into().unwrap()), desc.scale)

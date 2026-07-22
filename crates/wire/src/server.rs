@@ -350,6 +350,12 @@ enum Wire {
     Dec16,
     /// decimal128, 16 bytes big-endian, high half first (xdr_dec128)
     Dec34,
+    /// TIME WITH TIME ZONE: UTC time long + zone id in a 4-byte XDR
+    /// slot (xdr.cpp:237-243)
+    TimeTz,
+    /// TIMESTAMP WITH TIME ZONE: two longs + the zone slot
+    /// (xdr.cpp:295-303)
+    TimestampTz,
 }
 
 /// One column of a projection: its name, the field id that indexes the
@@ -584,6 +590,8 @@ fn wire_for(d: &Descriptor) -> (Wire, i32, i32, i32, i32) {
         // describe carries the sub_type so clients know text vs binary
         dtype::BLOB => (Wire::Blob, 520, 8, 0, d.sub_type as i32), // SQL_BLOB
         dtype::INT128 => (Wire::Int128, 32752, 16, scale, 0), // SQL_INT128
+        dtype::SQL_TIME_TZ => (Wire::TimeTz, 32756, 8, 0, 0), // SQL_TIME_TZ
+        dtype::TIMESTAMP_TZ => (Wire::TimestampTz, 32754, 12, 0, 0), // SQL_TIMESTAMP_TZ
         dtype::DEC64 => (Wire::Dec16, 32760, 8, 0, 0),   // SQL_DEC16
         dtype::DEC128 => (Wire::Dec34, 32762, 16, 0, 0), // SQL_DEC34
         _ => (Wire::Varying, 448, 32765, 0, 0),          // SQL_VARYING, rendered text
@@ -1934,6 +1942,10 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::Time(x), Value::Time(y)) => x.cmp(y),
         (Value::Timestamp(dx, tx), Value::Timestamp(dy, ty)) => (dx, tx).cmp(&(dy, ty)),
+        // WITH TIME ZONE values order by their UTC instant - the zone
+        // is presentation, not identity
+        (Value::TimeTz(tx, _), Value::TimeTz(ty, _)) => tx.cmp(ty),
+        (Value::TimestampTz(dx, tx, _), Value::TimestampTz(dy, ty, _)) => (dx, tx).cmp(&(dy, ty)),
         _ => a.render().cmp(&b.render()),
     }
 }
@@ -2257,6 +2269,18 @@ fn encode_row(w: &mut W, cols: &[ProjCol], values: &[Value]) {
                 // decimal128's 16 big-endian bytes
                 let x = if let Value::DecFloat34(x) = v { *x } else { 0 };
                 w.raw(&x.to_be_bytes());
+            }
+            Wire::TimeTz => {
+                let (t, z) = if let Value::TimeTz(t, z) = v { (*t, *z) } else { (0, 0) };
+                w.raw(&t.to_be_bytes());
+                w.int(z as i32); // xdr_short rides a 4-byte slot
+            }
+            Wire::TimestampTz => {
+                let (d, t, z) =
+                    if let Value::TimestampTz(d, t, z) = v { (*d, *t, *z) } else { (0, 0, 0) };
+                w.raw(&d.to_be_bytes());
+                w.raw(&t.to_be_bytes());
+                w.int(z as i32);
             }
         }
     }
