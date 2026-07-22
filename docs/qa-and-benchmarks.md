@@ -1277,6 +1277,54 @@ though, runs through the legacy BLR request API (`op_compile`) - a
 request-execution engine that is a separate subsystem from DSQL, and a
 named next piece rather than part of this increment.
 
+### The thirty-seventh differential — SHOW, through the legacy BLR request engine
+
+`qa/serve-real-show.sh` takes up that named next piece. isql's `SHOW`
+commands do not run on DSQL at all — they compile a GDML **request** and
+drive it with the legacy request API: `op_compile` ships the request's
+BLR, `op_start_send_and_receive` starts it with an input message,
+`op_receive` pulls the rows, `op_release` frees it. That request is a
+`blr_begin` of `blr_message` declarations wrapping a `blr_for` over a
+system relation whose body `blr_send`s each row to the client; the rse
+carries the boolean (`SHOW TABLES` is `RDB$SYSTEM_FLAG = :p AND
+RDB$VIEW_BLR IS NULL`, the filter value passed as a request parameter)
+and a multi-key sort. So the increment adds a small BLR request
+interpreter next to the DSQL planner: it parses the message layouts, the
+for-loop's rse (relation, boolean, ascending/descending sort keys) and
+the sends' assignments, then walks the named system relation with the
+existing `for_each_record`/`select_formats` machinery, applies the
+boolean and the sort, and emits one output message per row.
+
+Two laws of the protocol had to be read out of the C++ before any of it
+worked, because the wire-crypt on the real isql↔server link made a
+capturing proxy useless — the source was the only oracle. First, nullable
+output columns cross the wire as `blr_parameter2`: a value parameter plus
+a **separate short null indicator** that the send sets to -1 when the
+source is NULL and 0 otherwise (`common/xdr.cpp` encodes each field of a
+message independently — a short as a 4-byte big-endian value, a cstring
+as a 4-byte length then bytes padded to four — because fire-crab
+advertises a generic architecture in its accept, which keeps the client
+off the symmetric opaque-blob path). Second, and the subtler one: the
+client (`remote/client/interface.cpp`, `batch_gds_receive`) asks for a
+whole **batch** of messages per `op_receive` and then reads `op_send`
+packets until one carries `p_data_messages = 0` — the end-of-batch
+marker. A server that answers a single `op_receive` with one message and
+waits deadlocks: the client, still expecting the rest of its batch on the
+wire, blocks reading and eventually cancels. So `send_request_batch`
+ships every remaining queued message in one burst, each packet but the
+last flagged `p_data_messages = 1` and the last flagged 0 — mirroring the
+server's own `send_partial`/`send` split in `receive_msg`.
+
+The gate runs eight single-relation SHOWs — `SHOW TABLES`, `VIEWS`,
+`ROLES`, `FUNCTIONS`, `PROCEDURES`, `PACKAGES`, `FILTERS`,
+`PUBLICATIONS` — identically through fire-crab (isql → fcwire serve) and
+through isql on the same file, comparing the output verbatim, including
+the empty-result forms ("There are no…"). The multi-relation SHOWs —
+`SHOW TABLE <name>` with its RDB$RELATION_FIELDS↔RDB$FIELDS join, and the
+dependency sub-queries `SHOW EXCEPTIONS`/`SHOW DOMAINS` fire after their
+first result — need join streams and `blr_matching`/`blr_gen_id` in the
+request interpreter, the next slice of breadth.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -1530,6 +1578,13 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix \
     bash /path/to/fire-crab/qa/serve-real-selectexpr.sh 3050
+
+# SHOW over the legacy BLR request API (op_compile / op_start / op_receive /
+# op_release): SHOW TABLES/VIEWS/ROLES/FUNCTIONS/PROCEDURES/PACKAGES/FILTERS/
+# PUBLICATIONS run identically through fire-crab (isql -> fcwire serve) and
+# isql on the same file, output compared verbatim. Builds its own scratch db.
+FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    bash /path/to/fire-crab/qa/serve-real-show.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
