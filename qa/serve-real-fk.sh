@@ -42,10 +42,18 @@ COMMIT;
 EOF
 DDL_P="CREATE TABLE P (PID INTEGER NOT NULL PRIMARY KEY, PNAME VARCHAR(20))"
 DDL_C="CREATE TABLE C (CID INTEGER NOT NULL PRIMARY KEY, PID INTEGER, CONSTRAINT FK_C_P FOREIGN KEY (PID) REFERENCES P(PID))"
+# a COMPOUND foreign key: a two-column FK referencing a two-column PK. The
+# FK index gets two segments, and MET_lookup_partner's IDX_check_master_
+# types requires the FK and partner segment COUNTS to match - so this
+# exercises the multi-segment partner validation, not just the schema col.
+DDL_P2="CREATE TABLE P2 (A INTEGER NOT NULL, B INTEGER NOT NULL, PNAME VARCHAR(10), PRIMARY KEY (A, B))"
+DDL_C2="CREATE TABLE C2 (CID INTEGER NOT NULL PRIMARY KEY, FA INTEGER, FB INTEGER, CONSTRAINT FK_C2_P2 FOREIGN KEY (FA, FB) REFERENCES P2 (A, B))"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF || { echo "FAIL ref db"; exit 1; }
 CREATE DATABASE '$REF' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 $DDL_P;
 $DDL_C;
+$DDL_P2;
+$DDL_C2;
 COMMIT;
 EOF
 
@@ -94,6 +102,11 @@ check "create P"            "$(node_run "$DDL_P")" "OK"
 check "create C with FK"    "$(node_run "$DDL_C")" "OK"
 check "insert parent"       "$(node_run "INSERT INTO P VALUES (1, 'a')")" "OK"
 check "insert valid child"  "$(node_run "INSERT INTO C VALUES (10, 1)")" "OK"
+# the compound-FK pair
+check "create P2 (2-col PK)"     "$(node_run "$DDL_P2")" "OK"
+check "create C2 (2-col FK)"     "$(node_run "$DDL_C2")" "OK"
+check "insert compound parent"   "$(node_run "INSERT INTO P2 VALUES (1, 100, 'x')")" "OK"
+check "insert compound child"    "$(node_run "INSERT INTO C2 VALUES (10, 1, 100)")" "OK"
 
 kill $srv 2>/dev/null; wait $srv 2>/dev/null
 
@@ -101,16 +114,16 @@ kill $srv 2>/dev/null; wait $srv 2>/dev/null
 catq() { # <file>
     "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 <<'SQL' | strip | grep -v '^$'
 SET HEADING OFF;
-SELECT 'IDX|'||TRIM(RDB$INDEX_NAME)||'|'||COALESCE(TRIM(RDB$FOREIGN_KEY),'-')||'|'
-       ||COALESCE(TRIM(RDB$FOREIGN_KEY_SCHEMA_NAME),'-')||'|'||COALESCE(RDB$UNIQUE_FLAG,-1)
-  FROM RDB$INDICES WHERE RDB$RELATION_NAME IN ('C','P') ORDER BY RDB$RELATION_NAME, RDB$INDEX_ID;
+SELECT 'IDX|'||TRIM(RDB$RELATION_NAME)||'|'||TRIM(RDB$INDEX_NAME)||'|'||COALESCE(TRIM(RDB$FOREIGN_KEY),'-')||'|'
+       ||COALESCE(TRIM(RDB$FOREIGN_KEY_SCHEMA_NAME),'-')||'|'||COALESCE(RDB$UNIQUE_FLAG,-1)||'|'||RDB$SEGMENT_COUNT
+  FROM RDB$INDICES WHERE RDB$RELATION_NAME IN ('C','P','C2','P2') ORDER BY RDB$RELATION_NAME, RDB$INDEX_ID;
 SELECT 'RC|'||TRIM(RDB$CONSTRAINT_NAME)||'|'||TRIM(RDB$CONSTRAINT_TYPE)||'|'||COALESCE(TRIM(RDB$INDEX_NAME),'-')
-  FROM RDB$RELATION_CONSTRAINTS WHERE RDB$RELATION_NAME IN ('C','P') ORDER BY RDB$CONSTRAINT_NAME;
+  FROM RDB$RELATION_CONSTRAINTS WHERE RDB$RELATION_NAME IN ('C','P','C2','P2') ORDER BY RDB$CONSTRAINT_NAME;
 SELECT 'REF|'||TRIM(RDB$CONSTRAINT_NAME)||'|'||TRIM(RDB$CONST_NAME_UQ)||'|'||TRIM(RDB$MATCH_OPTION)||'|'
        ||TRIM(RDB$UPDATE_RULE)||'|'||TRIM(RDB$DELETE_RULE)||'|'||TRIM(RDB$CONST_SCHEMA_NAME_UQ)
-  FROM RDB$REF_CONSTRAINTS;
+  FROM RDB$REF_CONSTRAINTS ORDER BY RDB$CONSTRAINT_NAME;
 SELECT 'SEG|'||TRIM(RDB$INDEX_NAME)||'|'||TRIM(RDB$FIELD_NAME)||'|'||RDB$FIELD_POSITION
-  FROM RDB$INDEX_SEGMENTS WHERE RDB$INDEX_NAME='FK_C_P';
+  FROM RDB$INDEX_SEGMENTS WHERE RDB$INDEX_NAME IN ('FK_C_P','FK_C2_P2') ORDER BY RDB$INDEX_NAME, RDB$FIELD_POSITION;
 SQL
 }
 check "FK catalog matches engine reference" "$(catq "$WORK")" "$(catq "$REF")"
@@ -143,6 +156,21 @@ INSERT INTO C VALUES (11, 1);
 SQL
 )
 check "restored db ACCEPTS a valid child" "$(printf '%s' "$valid" | strip)" ""
+# the compound FK: an orphan (a partner key that does not exist) rejected,
+# a valid compound child accepted
+corphan=$("$ISQL" -q -b -user "$U" -pas "$P" "$RST" 2>&1 <<'SQL'
+INSERT INTO C2 VALUES (98, 1, 999);
+SQL
+)
+case "$corphan" in
+    *"FOREIGN KEY"*|*"foreign key"*) echo "OK   restored db REJECTS a compound orphan" ;;
+    *) echo "DIFF compound FK enforcement (orphan not rejected)"; echo "     $corphan"; fail=1 ;;
+esac
+cvalid=$("$ISQL" -q -b -user "$U" -pas "$P" "$RST" 2>&1 <<'SQL'
+INSERT INTO C2 VALUES (11, 1, 100);
+SQL
+)
+check "restored db ACCEPTS a valid compound child" "$(printf '%s' "$cvalid" | strip)" ""
 val=$("$GFIX" -v -full -user "$U" -pas "$P" "$RST" 2>&1)
 check "gfix -v -full clean (restored)" "$(printf '%s' "$val" | strip)" ""
 
@@ -154,6 +182,14 @@ SQL
 case "$raw_orphan" in
     *"FOREIGN KEY"*|*"foreign key"*) echo "OK   engine enforces FK on fc's RAW file (orphan rejected)" ;;
     *) echo "DIFF raw-file FK enforcement"; echo "     $raw_orphan"; fail=1 ;;
+esac
+raw_corphan=$("$ISQL" -q -b -user "$U" -pas "$P" "$WORK" 2>&1 <<'SQL'
+INSERT INTO C2 VALUES (97, 5, 55555);
+SQL
+)
+case "$raw_corphan" in
+    *"FOREIGN KEY"*|*"foreign key"*) echo "OK   engine enforces compound FK on fc's RAW file" ;;
+    *) echo "DIFF raw-file compound FK enforcement"; echo "     $raw_corphan"; fail=1 ;;
 esac
 
 exit $fail

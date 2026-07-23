@@ -2133,13 +2133,27 @@ constraint, `MATCH FULL`, `RESTRICT`/`RESTRICT`); and the parser accepts
 `[CONSTRAINT <name>] FOREIGN KEY (<cols>) REFERENCES <t> [(<refcols>)]`,
 generating an `INTEG_n` name for an unnamed one.
 
-`qa/serve-real-fk.sh` proves it eleven ways with the engine as oracle: the
-FK catalog fire-crab writes matches an engine-built reference column for
-column; `gbak` backs up and restores; the restored database enforces and
-validates clean; and the engine enforces on the raw file. The discipline
-that governed the earlier reverts — *don't ship what gbak rejects* — is now
+`qa/serve-real-fk.sh` proves it with the engine as oracle: the FK catalog
+fire-crab writes matches an engine-built reference column for column;
+`gbak` backs up and restores; the restored database enforces and validates
+clean; and the engine enforces on the raw file. The discipline that
+governed the earlier reverts — *don't ship what gbak rejects* — is now
 satisfied, not by working around gbak but by giving it the one column it
 was looking for.
+
+**Compound keys come for free.** A two-column `FOREIGN KEY (FA, FB)
+REFERENCES P (A, B)` needs no new code: the referencing index is built
+with two segments by the same multi-segment index machinery, and the
+partner lookup's deeper check (`IDX_check_master_types`, idx.cpp:194)
+requires the FK and partner indexes to have *equal segment counts and
+matching per-segment types* — which a real two-column PK partner
+satisfies. The gate grows to eighteen checks with a `P2`/`C2` pair: the
+compound FK's catalog (two `RDB$INDEX_SEGMENTS` rows, `RDB$SEGMENT_COUNT`
+2) matches the engine, restores, and enforces the composite key — an
+orphan `(1, 999)` rejected, a valid `(1, 100)` accepted — both on the
+restored copy and on fire-crab's raw file. (A *named* table-level primary
+key, `CONSTRAINT PK_P PRIMARY KEY (A, B)`, is the one idiom still
+unparsed; an unnamed table-level `PRIMARY KEY (A, B)` works.)
 
 ### Stage 3 — the Firebird QA suite (reached)
 
