@@ -979,6 +979,249 @@ pub fn alter_table_alter_column_type(
     Ok(())
 }
 
+/// Whether any committed primary record of `rel` has a NULL in field
+/// `fid` - the check `SET NOT NULL` makes before it can succeed.
+fn column_has_nulls(file: &[u8], page_size: usize, rel: u16, fid: usize) -> bool {
+    let formats = crate::relation_formats(file, page_size, rel);
+    for dp_no in relation_data_pages(file, page_size, rel) {
+        let start = dp_no as usize * page_size;
+        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+            continue;
+        };
+        for r in dp.records() {
+            if !r.is_primary_record() {
+                continue;
+            }
+            let Some(image) = r.image() else { continue };
+            let descs = formats
+                .iter()
+                .find(|(n, _)| *n == r.format)
+                .or_else(|| formats.iter().max_by_key(|(n, _)| *n));
+            let Some((_, descs)) = descs else { continue };
+            let vals = decode_record(&image, descs);
+            if matches!(vals.get(fid), Some(Value::Null) | None) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Set (or clear) the `RDB$NULL_FLAG` of a column's `RDB$RELATION_FIELDS`
+/// row in place: `Some(1)` for NOT NULL, `None` to make it nullable again.
+fn patch_rf_null_flag(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    col_up: &str,
+    flag: Option<i64>,
+) -> Result<(), String> {
+    let formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")
+        .ok_or("no RDB$RELATION_FIELDS format")?;
+    let (rf_format_no, rf_descs) = {
+        let (n, d) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+        (*n, d.clone())
+    };
+    let cols = relation_columns(file, page_size, "RDB$RELATION_FIELDS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let rel_fid = fid("RDB$RELATION_NAME").ok_or("no RDB$RELATION_NAME")?;
+    let name_fid = fid("RDB$FIELD_NAME").ok_or("no RDB$FIELD_NAME")?;
+    let null_fid = fid("RDB$NULL_FLAG").ok_or("no RDB$NULL_FLAG")?;
+    let text = |v: Option<&Value>| match v {
+        Some(Value::Text(t)) => Some(t.trim_end().to_string()),
+        _ => None,
+    };
+    let pred = |vals: &[Value]| {
+        text(vals.get(rel_fid)).as_deref() == Some(table)
+            && text(vals.get(name_fid)).as_deref() == Some(col_up)
+    };
+    let (page, slot) = find_sys_row_slot(file, page_size, "RDB$RELATION_FIELDS", 5, pred)
+        .ok_or("RDB$RELATION_FIELDS row not found")?;
+    let mut image = {
+        let start = page as usize * page_size;
+        let dp = DataPage::decode(file.get(start..start + page_size).ok_or("bad page")?)
+            .ok_or("bad data page")?;
+        dp.record(slot).and_then(|r| r.image()).ok_or("no field image")?
+    };
+    let d = rf_descs.get(null_fid).ok_or("field beyond format")?;
+    let at = d.offset as usize;
+    match flag {
+        Some(v) => {
+            let bytes = encode_sys_value(d, &SysVal::I(v))?;
+            image
+                .get_mut(at..at + bytes.len())
+                .ok_or("image shorter than format")?
+                .copy_from_slice(&bytes);
+            image[null_fid / 8] &= !(1 << (null_fid % 8)); // not NULL
+        }
+        None => {
+            image[null_fid / 8] |= 1 << (null_fid % 8); // NULL
+        }
+    }
+    dml::update_records(file, page_size, 5, &[(page, slot, image)], rf_format_no)?;
+    Ok(())
+}
+
+/// Rebuild `RDB$RUNTIME` and repoint the `RDB$RELATIONS` row at it - after
+/// a change to a field's not-null status, so the engine's DSQL metadata
+/// carries the RSR_field_not_null marker. The format is NOT bumped (a
+/// NOT NULL constraint changes no record layout).
+fn refresh_runtime(file: &mut Vec<u8>, page_size: usize, table: &str) -> Result<(), String> {
+    let formats = crate::relation_formats(
+        file,
+        page_size,
+        crate::resolve_relation(file, page_size, table).ok_or("table not found")?,
+    );
+    let (_, descs) = formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .ok_or("relation has no format")?;
+    let descs = descs.clone();
+    let runtime = rebuild_runtime_blob(file, page_size, table, &descs)?;
+    let (page, slot, mut image, rec_format) =
+        find_relations_row(file, page_size, table).ok_or("RDB$RELATIONS row not found")?;
+    let sys_formats =
+        system_relation_formats(file, page_size, "RDB$RELATIONS").ok_or("no RDB$RELATIONS format")?;
+    let (_, rel_descs) = sys_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let cols = relation_columns(file, page_size, "RDB$RELATIONS");
+    let fid = cols
+        .iter()
+        .find(|c| c.name == "RDB$RUNTIME")
+        .map(|c| c.field_id as usize)
+        .ok_or("no RDB$RUNTIME")?;
+    let d = rel_descs.get(fid).ok_or("field beyond format")?;
+    let bytes = encode_sys_value(d, &SysVal::B(blob_id_bytes(6, runtime)))?;
+    let at = d.offset as usize;
+    image
+        .get_mut(at..at + bytes.len())
+        .ok_or("image shorter than format")?
+        .copy_from_slice(&bytes);
+    image[fid / 8] &= !(1 << (fid % 8));
+    dml::update_records(file, page_size, 6, &[(page, slot, image)], rec_format)?;
+    Ok(())
+}
+
+/// `ALTER TABLE <table> ALTER <column> SET NOT NULL`: add a NOT NULL
+/// constraint. No new format version (the layout is unchanged); the
+/// column's `RDB$RELATION_FIELDS.RDB$NULL_FLAG` is set, an
+/// `RDB$RELATION_CONSTRAINTS` "NOT NULL" row and its `RDB$CHECK_CONSTRAINTS`
+/// link (trigger_name = the column) are written, and `RDB$RUNTIME` is
+/// refreshed so the engine enforces it. Fails - as the engine does - if
+/// the column already holds a NULL.
+pub fn alter_table_set_not_null(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    col_name: &str,
+) -> Result<(), String> {
+    let table = table.trim().to_ascii_uppercase();
+    let col_up = col_name.trim().trim_matches('"').to_ascii_uppercase();
+    let rel = crate::resolve_relation(file, page_size, &table)
+        .ok_or_else(|| format!("table {} not found", table))?;
+    let target = relation_columns(file, page_size, &table)
+        .into_iter()
+        .find(|c| c.name.eq_ignore_ascii_case(&col_up))
+        .ok_or_else(|| format!("column {} not found", col_name))?;
+    if column_has_nulls(file, page_size, rel, target.field_id as usize) {
+        return Err(format!(
+            "cannot make field {} NOT NULL because there are NULLs present",
+            col_name
+        ));
+    }
+    patch_rf_null_flag(file, page_size, &table, &col_up, Some(1))?;
+    let integ = next_numeric_suffix(
+        file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME", "INTEG_",
+    )?;
+    let cname = format!("INTEG_{}", integ);
+    sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
+        ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
+        ("RDB$CONSTRAINT_TYPE", SysVal::S("NOT NULL")),
+        ("RDB$RELATION_NAME", SysVal::S(&table)),
+        ("RDB$DEFERRABLE", SysVal::S("NO")),
+        ("RDB$INITIALLY_DEFERRED", SysVal::S("NO")),
+        ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+    ])?;
+    sys_row_by_name(file, page_size, "RDB$CHECK_CONSTRAINTS", &[
+        ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
+        ("RDB$TRIGGER_NAME", SysVal::S(&col_up)),
+        ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+    ])?;
+    refresh_runtime(file, page_size, &table)?;
+    advance_oldest_transactions(file, page_size)?;
+    Ok(())
+}
+
+/// `ALTER TABLE <table> ALTER <column> DROP NOT NULL`: remove the NOT NULL
+/// constraint - clear the column's `RDB$NULL_FLAG`, delete the
+/// `RDB$RELATION_CONSTRAINTS`/`RDB$CHECK_CONSTRAINTS` rows, refresh runtime.
+pub fn alter_table_drop_not_null(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    col_name: &str,
+) -> Result<(), String> {
+    let table = table.trim().to_ascii_uppercase();
+    let col_up = col_name.trim().trim_matches('"').to_ascii_uppercase();
+    crate::resolve_relation(file, page_size, &table)
+        .ok_or_else(|| format!("table {} not found", table))?;
+    if !relation_columns(file, page_size, &table)
+        .iter()
+        .any(|c| c.name.eq_ignore_ascii_case(&col_up))
+    {
+        return Err(format!("column {} not found", col_name));
+    }
+
+    // the constraint name: the RDB$CHECK_CONSTRAINTS row whose
+    // RDB$TRIGGER_NAME is this column (a NOT NULL links that way)
+    let cc_formats = system_relation_formats(file, page_size, "RDB$CHECK_CONSTRAINTS")
+        .ok_or("no RDB$CHECK_CONSTRAINTS format")?;
+    let (_, cc_descs) = cc_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let cc_cols = relation_columns(file, page_size, "RDB$CHECK_CONSTRAINTS");
+    let cc_fid = |n: &str| cc_cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let cc_name = cc_fid("RDB$CONSTRAINT_NAME").ok_or("no RDB$CONSTRAINT_NAME")?;
+    let cc_trig = cc_fid("RDB$TRIGGER_NAME").ok_or("no RDB$TRIGGER_NAME")?;
+    let cc_rel = crate::resolve_relation(file, page_size, "RDB$CHECK_CONSTRAINTS")
+        .ok_or("no RDB$CHECK_CONSTRAINTS")?;
+    let text = |v: Option<&Value>| match v {
+        Some(Value::Text(t)) => Some(t.trim_end().to_string()),
+        _ => None,
+    };
+    let mut constraint: Option<String> = None;
+    walk_rows(file, page_size, cc_rel, cc_descs, |vals| {
+        if text(vals.get(cc_trig)).as_deref() == Some(col_up.as_str()) {
+            constraint = text(vals.get(cc_name));
+        }
+    });
+    let constraint = constraint
+        .ok_or_else(|| format!("column {} has no NOT NULL constraint", col_name))?;
+
+    patch_rf_null_flag(file, page_size, &table, &col_up, None)?;
+
+    // delete the RDB$CHECK_CONSTRAINTS row (by trigger = column)
+    let cc_pred = |vals: &[Value]| text(vals.get(cc_trig)).as_deref() == Some(col_up.as_str());
+    if let Some(slot) = find_sys_row_slot(file, page_size, "RDB$CHECK_CONSTRAINTS", cc_rel, cc_pred) {
+        dml::delete_records(file, page_size, cc_rel, &[slot])?;
+    }
+    // delete the RDB$RELATION_CONSTRAINTS row (by constraint name)
+    let rc_rel = crate::resolve_relation(file, page_size, "RDB$RELATION_CONSTRAINTS")
+        .ok_or("no RDB$RELATION_CONSTRAINTS")?;
+    let rc_cols = relation_columns(file, page_size, "RDB$RELATION_CONSTRAINTS");
+    let rc_name = rc_cols
+        .iter()
+        .find(|c| c.name == "RDB$CONSTRAINT_NAME")
+        .map(|c| c.field_id as usize)
+        .ok_or("no RDB$CONSTRAINT_NAME")?;
+    let rc_pred = |vals: &[Value]| text(vals.get(rc_name)).as_deref() == Some(constraint.as_str());
+    if let Some(slot) =
+        find_sys_row_slot(file, page_size, "RDB$RELATION_CONSTRAINTS", rc_rel, rc_pred)
+    {
+        dml::delete_records(file, page_size, rc_rel, &[slot])?;
+    }
+    refresh_runtime(file, page_size, &table)?;
+    advance_oldest_transactions(file, page_size)?;
+    Ok(())
+}
+
 /// CREATE TABLE: the full engine sequence against the file image.
 /// Errors leave the caller's copy to be discarded - the statement
 /// failed, nothing half-created survives.

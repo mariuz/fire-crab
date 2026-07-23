@@ -705,6 +705,13 @@ enum Plan {
         column: String,
         col: fire_crab_ods::ddl::ColumnDef,
     },
+    /// `ALTER TABLE <table> ALTER <column> SET|DROP NOT NULL`: add or
+    /// remove a NOT NULL constraint (no format change)
+    AlterColumnNull {
+        table: String,
+        column: String,
+        not_null: bool,
+    },
     /// `INSERT INTO <t> [(cols)] VALUES (...)`: the record image is
     /// built at prepare (nulls flagged, literal fields at their
     /// descriptor offsets); `param_fields` lists the (field id,
@@ -1575,6 +1582,58 @@ fn plan_alter_table_alter_type(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     ))
 }
 
+/// Parse `ALTER TABLE <table> ALTER [COLUMN] <col> SET|DROP NOT NULL` -
+/// add or remove a column's NOT NULL constraint.
+fn plan_alter_column_null(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "ALTER", 0) != Some(0) {
+        return None;
+    }
+    let table_kw = find_word(&masked, "TABLE", "ALTER".len())?;
+    if masked[..table_kw].trim() != "ALTER" {
+        return None;
+    }
+    let alter2 = find_word(&masked, "ALTER", table_kw + "TABLE".len())?;
+    let table = s[table_kw + "TABLE".len()..alter2].trim().trim_matches('"');
+    if !ident_ok(table) {
+        return None;
+    }
+    // the tail after the second ALTER: "[COLUMN] <col> (SET|DROP) NOT NULL"
+    let tail = s[alter2 + "ALTER".len()..].trim();
+    let tail_up = tail.to_ascii_uppercase();
+    let compact = tail_up.split_whitespace().collect::<Vec<_>>().join(" ");
+    let (not_null, kw) = if compact.ends_with("SET NOT NULL") {
+        (true, "SET")
+    } else if compact.ends_with("DROP NOT NULL") {
+        (false, "DROP")
+    } else {
+        return None;
+    };
+    // the column sits between the second ALTER and the SET/DROP keyword
+    let kw_pos = find_word(&tail_up, kw, 0)?;
+    let mid = tail[..kw_pos].trim();
+    let toks: Vec<&str> = mid.split_whitespace().collect();
+    let col = match toks.as_slice() {
+        [c] => *c,
+        [w, c] if w.eq_ignore_ascii_case("COLUMN") => *c,
+        _ => return None,
+    };
+    let col = col.trim_matches('"');
+    if !ident_ok(col) {
+        return None;
+    }
+    Some((
+        Plan::AlterColumnNull {
+            table: table.to_ascii_uppercase(),
+            column: col.to_ascii_uppercase(),
+            not_null,
+        },
+        Vec::new(),
+    ))
+}
+
 /// Strip a SQL identifier's optional double quotes. A quoted identifier
 /// keeps its case (and `""` is an escaped quote); an unquoted one is
 /// returned as written (the catalog stores it upper-cased, and generator
@@ -2343,6 +2402,14 @@ fn execute_dml(
             fire_crab_ods::ddl::alter_table_alter_column_type(
                 &mut work, db.page_size, table, column, col,
             )?;
+            (0, 0, 0)
+        }
+        Plan::AlterColumnNull { table, column, not_null } => {
+            if *not_null {
+                fire_crab_ods::ddl::alter_table_set_not_null(&mut work, db.page_size, table, column)?;
+            } else {
+                fire_crab_ods::ddl::alter_table_drop_not_null(&mut work, db.page_size, table, column)?;
+            }
             (0, 0, 0)
         }
         Plan::Insert { rel, format_no, image, descs, index_ops, param_fields, not_null } => {
@@ -3746,7 +3813,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         Plan::Scalar(_) => describe_one_bigint(params),
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableDrop { .. }
-        | Plan::AlterColumnType { .. } => {
+        | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } => {
             describe_dml(5, params) // isc_info_sql_stmt_ddl
         }
         Plan::Insert { .. } => describe_dml(2, params), // isc_info_sql_stmt_insert
@@ -3773,7 +3840,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         Plan::Delete { .. } => 4,
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableDrop { .. }
-        | Plan::AlterColumnType { .. } => 5,
+        | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } => 5,
         Plan::SetGenerator { stmt_type, .. } => *stmt_type,
     }
 }
@@ -4074,7 +4141,8 @@ fn emit_rows_inner(
         Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
         | Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableDrop { .. }
-        | Plan::AlterColumnType { .. } | Plan::SetGenerator { .. } => {}
+        | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. }
+        | Plan::SetGenerator { .. } => {}
         Plan::Scalar(v) => {
             w.int(OP_FETCH_RESPONSE).int(0).int(1);
             match v {
@@ -6338,6 +6406,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             .or_else(|| plan_alter_table_add(&text))
                             .or_else(|| plan_alter_table_drop(&text))
                             .or_else(|| plan_alter_table_alter_type(&text))
+                            .or_else(|| plan_alter_column_null(&text))
                             .or_else(|| plan_alter_sequence(&text))
                     } else if dml_kw {
                         plan_insert(&text, &database)
@@ -6474,6 +6543,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         .or_else(|| plan_alter_table_add(&stmt_sql))
                         .or_else(|| plan_alter_table_drop(&stmt_sql))
                         .or_else(|| plan_alter_table_alter_type(&stmt_sql))
+                        .or_else(|| plan_alter_column_null(&stmt_sql))
                         .or_else(|| plan_alter_sequence(&stmt_sql));
                     match planned {
                         Some((p, ps)) => {
@@ -6576,6 +6646,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::AlterTableAdd { .. }
                         | Plan::AlterTableDrop { .. }
                         | Plan::AlterColumnType { .. }
+                        | Plan::AlterColumnNull { .. }
                         | Plan::SetGenerator { .. }
                 ) {
                     // DML and DDL execute here (not at fetch): write the
