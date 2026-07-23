@@ -2038,6 +2038,52 @@ start. `gfix -v -full` is clean and `gbak` backs the file up. Eleven
 checks. What is still left for later is the row-returning form — one
 `NEXT VALUE FOR` per row of a `SELECT` mid-fetch.
 
+### The fifty-fourth differential — a generator advance per row, evaluated mid-fetch
+
+The fiftieth and fifty-third differentials advanced a generator once — a
+single-row `SELECT`, an `INSERT`. This one does it *per row*:
+`SELECT NEXT VALUE FOR SEQ, X FROM SRC` advances the sequence once for
+every row the query returns, and `GEN_ID(<name>, <n>)` in a select list is
+the same with an explicit step. It is the row-returning form the earlier
+slices deferred, and it is the one that pinned down *when* the advance
+happens.
+
+The engine was probed, and it corrected the naive guess. Take
+`SELECT NEXT VALUE FOR SEQ, X FROM SRC ORDER BY X` over rows stored
+`30, 10, 20`. If the generator advanced during the *scan* (in storage
+order) and the value rode along through the sort, `X = 30` would keep the
+first value and land last — the column would read `5, 6, 4`. It does not.
+It reads `4, 5, 6`: the advance happens **after** the sort, in **output**
+order, as each row is fetched. So `NEXT VALUE FOR` is a fetch-time side
+effect, not a scan-time one — the generator moves in lock-step with the
+rows the client actually receives.
+
+That is exactly how fire-crab does it. A generator select-list item parses
+to a distinct kind (not an expression — an expression is a pure function
+of the row, and this one has state and a persistent effect) and becomes an
+output column backed by a synthetic value slot. At fetch the plan
+materialises its rows, sorts them into output order, then walks them once,
+advancing a running counter per sequence — the sequence's own increment
+for `NEXT VALUE FOR`, the explicit step for `GEN_ID` — and writing each
+row's value into its slot before the row is encoded. When the cursor is
+drained, each generator's final value is persisted to its page and the
+file flushed, mirroring the engine's mid-fetch, non-transactional advance.
+A `WHERE` filters rows before any of this, so only the rows that survive
+the filter advance the generator — the count follows the output, not the
+table.
+
+`qa/serve-real-genrow.sh` proves it against the engine as oracle, the same
+query run through both fire-crab (node) and isql (a reference file) over a
+three-row table whose keys are deliberately *unsorted* so scan order and
+output order differ: `NEXT VALUE FOR` with no `ORDER BY` (scan order),
+with `ORDER BY X` (output order — the case that disproves scan-time
+evaluation), `GEN_ID(SEQ5, 5)` with `ORDER BY X DESC`, and a `GEN_ID(G, 1)`
+under a `WHERE` (only matching rows advance). Every row's value matches the
+engine value-for-value, the stored generator values match afterwards, and
+`gfix -v -full` is clean. Eight checks. The generator subsystem is now
+complete in every place a value can be minted — read, set, increment in a
+single-row query, in an `INSERT`, and now per row of a `SELECT`.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
