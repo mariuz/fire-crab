@@ -1513,6 +1513,58 @@ and fire-crab reject the row with SQLSTATE 22012 rather than answering.
 The groupby, join and where-predicate gates, which share the row-encoder
 that now carries the error path, still match the engine verbatim.
 
+### The forty-second differential — CAST(x AS type)
+
+The previous slice gave expression evaluation its first runtime error;
+this one gives it its first *explicit conversion*. `CAST(<expr> AS
+<type>)` is the SQL standard's named coercion, and it slots into the
+expression machinery already built: a new atom in the parser, a new
+`Expr` node, and — because a cast can fail — a second member of the
+per-row error type the divide added.
+
+The targets are the two families a value can usefully land in: the
+integer family (`SMALLINT` / `INTEGER` / `BIGINT`, which collapse to one
+target — fire-crab computes at `i64` width and announces BIGINT, as the
+select-list arithmetic already does), and a text width (`VARCHAR(n)` /
+`CHAR(n)`). To the integer family, an integer passes through and a
+string is trimmed and parsed — `CAST(' 55 ' AS INTEGER)` is `55`. To a
+text width, the value is rendered — `CAST(42 AS VARCHAR(20))` is `'42'`,
+an integer's decimal form — and `CHAR` pads to its declared length where
+`VARCHAR` does not. The un-aliased column takes the engine's name for
+it, `CAST`.
+
+Two ways a cast fails, and the engine posts the same status vector for
+both: a string that is not a number (`CAST('xyz' AS INTEGER)`), and a
+value too long for its target width (`CAST(42 AS VARCHAR(1))`) — both are
+`isc_convert_error`, SQLSTATE 22018, "conversion error from string". So
+the row error type grew from the single divide-by-zero into an enum, and
+the fetch loop's error `op_response` now carries whichever status vector
+the failure calls for — the divide's two-part `isc_arith_except` /
+`isc_exception_integer_divide_by_zero`, or the cast's `isc_convert_error`
+— while the mechanism (compute the row's values before writing its
+header, so a failure aborts cleanly and the engine's error stands in for
+the row) is exactly the one the divide established.
+
+The cast also flushed a latent parser bug the older grammar never
+exercised: the alias splitter treated any ` AS ` as the boundary between
+an expression and its output name, but `CAST(A AS INTEGER)` carries an
+`AS` *inside* the parentheses. The splitter now honours parenthesis
+depth — only a top-level `AS` renames — so `CAST(A AS INTEGER) AS X` is
+the cast `CAST(A AS INTEGER)` aliased `X`, not a malformed split.
+
+`qa/serve-real-selectexpr.sh` grows from twenty-nine checks to forty-two.
+Eleven new casts run identically through fire-crab and isql — integer to
+`VARCHAR` and to padded `CHAR`, a string trimmed to an integer, the
+width changes, a negative value, a cast of an arithmetic sub-expression,
+a cast composed into a concatenation, a NULL, and an aliased cast — and
+two new error forms (a non-numeric string and an over-long width) join
+the two divide-by-zero forms where *both* engine and fire-crab reject
+the row rather than answer. Deliberately left for later: casts whose
+operand is a scaled `NUMERIC` column — the engine rounds those to the
+integer target half-away-from-zero (`12.50` → `13`) and renders them
+with their decimals to text — which first needs numeric columns admitted
+as expression operands at all.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
