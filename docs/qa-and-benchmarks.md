@@ -1845,6 +1845,46 @@ catalog as real engine DDL. `ALTER TABLE` now covers `ADD`, `DROP` and
 `ALTER … TYPE`; what remains is the constraint side — changing or adding
 `NOT NULL` and keys.
 
+### The forty-ninth differential — SET / DROP NOT NULL, a constraint the engine enforces
+
+The ALTER verbs so far all reshaped storage — a new format version each
+time. `SET NOT NULL` is the first that changes nothing about the layout: a
+constraint is *metadata*, not bytes. So there is no new format version.
+fire-crab sets the column's `RDB$RELATION_FIELDS.RDB$NULL_FLAG`, writes an
+`RDB$RELATION_CONSTRAINTS` "NOT NULL" row and the `RDB$CHECK_CONSTRAINTS`
+row that links it to the column (by `RDB$TRIGGER_NAME`, the same shape
+CREATE TABLE writes for an inline `NOT NULL`), and refreshes `RDB$RUNTIME`
+so the engine's metadata carries the not-null marker. `DROP NOT NULL` is
+the exact inverse — clear the flag, delete the two constraint rows.
+
+A constraint added after the fact has to answer for the rows already
+there. `SET NOT NULL` first scans the column: if any committed record
+holds a NULL, it refuses — the same `SQLSTATE 22006`, "there are NULLs
+present", the engine raises — so the constraint is never written over data
+that would violate it.
+
+This slice earns the strongest word in the differential vocabulary:
+**enforced**. The FOREIGN KEY attempt before it could make the engine
+*display* a constraint but not *apply* it live; NOT NULL is different. The
+engine, opening fire-crab's file, reads the constraint from the catalog
+rows and rejects a `NULL` written into the column — "validation error for
+column …, value null" — with no restore or replay in between. It is the
+first constraint fire-crab writes that the engine enforces directly on the
+raw file.
+
+`qa/serve-real-notnull.sh` proves both verbs against the engine as oracle
+(the reference gets the identical `SET A`, `SET B`, `DROP B` via its own
+DDL). Ten checks: fire-crab sets and drops the constraint, a `SET` over a
+column that holds a NULL is refused, `SHOW TABLE` matches the engine's
+result, the engine **enforces** the NOT NULL (a NULL insert rejected) while
+a valid insert with the column supplied succeeds, `gfix -v -full` is clean,
+and `gbak` restores the constraint as real engine DDL onto a copy that
+still enforces it. `ALTER TABLE` now covers `ADD`, `DROP`, `ALTER … TYPE`
+and `SET`/`DROP NOT NULL`; the key constraints (`PRIMARY`/`FOREIGN KEY` as
+an ALTER, and foreign keys' referential enforcement) remain — the FOREIGN
+KEY groundwork is written up as a known gbak-restore blocker to resume
+from.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
