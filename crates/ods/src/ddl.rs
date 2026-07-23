@@ -235,36 +235,51 @@ fn sys_insert(
     let seq = u32_at(file, out.page_no as usize * page_size + 16) as u64;
     let recno = seq * max_recs_per_dp(page_size) + out.slot as u64;
 
-    // maintain every index of the relation
-    if let Some(irt) = find_index_root(file, page_size, rel) {
-        let entries: Vec<_> = irt
-            .live_entries()
-            .map(|e| (e.id, e.key_count))
+    maintain_indexes(file, page_size, rel, recno, &key_values, descs)
+}
+
+/// Key one record into every index of its relation - what the engine
+/// does on any write that changes an INDEXED value. Insertion is the
+/// obvious caller; the other is an in-place row rewrite that changes a
+/// key column (renaming an index in RDB$INDICES, say), where the old
+/// entry stays behind for garbage collection but the NEW key needs an
+/// entry of its own: `gfix` reports "Index n is corrupt {missing
+/// entries for record m}" otherwise.
+fn maintain_indexes(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    rel: u16,
+    recno: u64,
+    key_values: &[Value],
+    descs: &[Descriptor],
+) -> Result<(), String> {
+    let Some(irt) = find_index_root(file, page_size, rel) else {
+        return Ok(());
+    };
+    let entries: Vec<_> = irt.live_entries().map(|e| (e.id, e.key_count)).collect();
+    for (id, key_count) in entries {
+        let (segs, iflags) = btw::index_segments(file, page_size, rel, id, key_count as usize)
+            .ok_or("unreadable system index segments")?;
+        let null = Value::Null;
+        let key_segs: Vec<btw::KeySeg<'_>> = segs
+            .iter()
+            .map(|(field, itype)| btw::KeySeg {
+                itype: *itype,
+                value: key_values.get(*field as usize).unwrap_or(&null),
+                scale: descs.get(*field as usize).map_or(0, |d| d.scale),
+            })
             .collect();
-        for (id, key_count) in entries {
-            let (segs, iflags) = btw::index_segments(file, page_size, rel, id, key_count as usize)
-                .ok_or("unreadable system index segments")?;
-            let null = Value::Null;
-            let key_segs: Vec<btw::KeySeg<'_>> = segs
-                .iter()
-                .map(|(field, itype)| btw::KeySeg {
-                    itype: *itype,
-                    value: key_values.get(*field as usize).unwrap_or(&null),
-                    scale: descs.get(*field as usize).map_or(0, |d| d.scale),
-                })
-                .collect();
-            let (key, all_null) = btw::build_index_key(&key_segs, iflags & btw::IRT_DESCENDING != 0)
-                .ok_or("unsupported system index key")?;
-            btw::insert_index_entry(
-                file,
-                page_size,
-                rel,
-                id,
-                &key,
-                recno,
-                iflags & btw::IRT_UNIQUE != 0 && !all_null,
-            )?;
-        }
+        let (key, all_null) = btw::build_index_key(&key_segs, iflags & btw::IRT_DESCENDING != 0)
+            .ok_or("unsupported system index key")?;
+        btw::insert_index_entry(
+            file,
+            page_size,
+            rel,
+            id,
+            &key,
+            recno,
+            iflags & btw::IRT_UNIQUE != 0 && !all_null,
+        )?;
     }
     Ok(())
 }
@@ -1633,6 +1648,82 @@ pub fn alter_table_drop_constraint(
     Ok(())
 }
 
+/// `DROP INDEX <name>`: remove a standalone index - the mirror of
+/// [create_index]. An index that BACKS a constraint cannot be dropped
+/// this way; the engine posts isc_integ_index_del ("Cannot delete index
+/// used by an Integrity Constraint", DdlNodes.epp:14643) and refers the
+/// user to ALTER TABLE DROP CONSTRAINT. The removal itself is the
+/// engine's deferred one - see [deferred_drop_index].
+pub fn drop_index(file: &mut Vec<u8>, page_size: usize, index_name: &str) -> Result<(), String> {
+    let want = index_name.trim().trim_matches('"').to_ascii_uppercase();
+    let (table, system) = find_index_relation(file, page_size, &want)
+        .ok_or_else(|| format!("index {} not found", want))?;
+    if system != 0 {
+        return Err("system indices are read-only".into());
+    }
+    if let Some(constraint) = constraint_using_index(file, page_size, &want) {
+        return Err(format!(
+            "Cannot delete index used by an Integrity Constraint (constraint {})",
+            constraint
+        ));
+    }
+    let rel = crate::resolve_relation(file, page_size, &table)
+        .ok_or_else(|| format!("table {} not found", table))?;
+    if rel < 128 {
+        return Err("system relations are read-only".into());
+    }
+    deferred_drop_index(file, page_size, rel, &want)?;
+    advance_oldest_transactions(file, page_size)?;
+    Ok(())
+}
+
+/// An index's (relation name, RDB$SYSTEM_FLAG) from RDB$INDICES.
+fn find_index_relation(file: &[u8], page_size: usize, index_name: &str) -> Option<(String, i64)> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$INDICES")?;
+    let formats = system_relation_formats(file, page_size, "RDB$INDICES")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$INDICES");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (ix_f, rn_f, sf_f) = (
+        fid("RDB$INDEX_NAME")?,
+        fid("RDB$RELATION_NAME")?,
+        fid("RDB$SYSTEM_FLAG")?,
+    );
+    let mut found = None;
+    walk_rows(file, page_size, rel, descs, |values| {
+        if text_eq(values.get(ix_f), index_name) {
+            if let Some(Value::Text(t)) = values.get(rn_f) {
+                let system = match values.get(sf_f) {
+                    Some(Value::Int(i)) => *i,
+                    _ => 0,
+                };
+                found = Some((t.trim_end().to_string(), system));
+            }
+        }
+    });
+    found
+}
+
+/// The constraint (if any) an index backs - a PRIMARY KEY, UNIQUE or
+/// FOREIGN KEY row of RDB$RELATION_CONSTRAINTS naming it.
+fn constraint_using_index(file: &[u8], page_size: usize, index_name: &str) -> Option<String> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$RELATION_CONSTRAINTS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$RELATION_CONSTRAINTS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$RELATION_CONSTRAINTS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (cn_f, ix_f) = (fid("RDB$CONSTRAINT_NAME")?, fid("RDB$INDEX_NAME")?);
+    let mut found = None;
+    walk_rows(file, page_size, rel, descs, |values| {
+        if text_eq(values.get(ix_f), index_name) {
+            if let Some(Value::Text(t)) = values.get(cn_f) {
+                found = Some(t.trim_end().to_string());
+            }
+        }
+    });
+    found
+}
+
 /// A constraint's (type, index name) from RDB$RELATION_CONSTRAINTS.
 fn find_constraint(
     file: &[u8],
@@ -1762,7 +1853,14 @@ fn deferred_drop_index(
             .copy_from_slice(&bytes);
         image[fid / 8] &= !(1 << (fid % 8)); // not NULL
     }
-    dml::update_records(file, page_size, 4, &[(page, slot, image)], ix_format_no)?;
+    dml::update_records(file, page_size, 4, &[(page, slot, image.clone())], ix_format_no)?;
+    // the rename changed an INDEXED column of RDB$INDICES, so the new
+    // key needs its own entries - the rewrite keeps the record's
+    // position, so its record number is unchanged
+    let seq = u32_at(file, page as usize * page_size + 16) as u64;
+    let recno = seq * max_recs_per_dp(page_size) + slot as u64;
+    let values = decode_record(&image, &ix_descs);
+    maintain_indexes(file, page_size, 4, recno, &values, &ix_descs)?;
     let seg_fid = sys_fid(file, page_size, "RDB$INDEX_SEGMENTS", "RDB$INDEX_NAME")?;
     delete_catalog_rows(file, page_size, "RDB$INDEX_SEGMENTS", |v| {
         text_eq(v.get(seg_fid), &want)

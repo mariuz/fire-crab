@@ -66,18 +66,21 @@ impl<'a> IndexRootPage<'a> {
         })
     }
 
-    /// The relation's LIVE indexes - the ones to maintain and scan.
-    /// ods.h's index-state lifecycle splits the states in two: an index
-    /// being built or working (`irt_in_progress` 1, `irt_rollback` 2 -
-    /// where a freshly engine-created index idles until touched -,
-    /// `irt_normal` 3) is live, while one on its way out (`irt_kill` 4,
-    /// `irt_commit` 5, `irt_drop` 6) keeps its pages but is ignored by
-    /// the engine, so this writer must ignore it too - maintaining a
-    /// dropped index re-enforces a constraint that is gone, and its
-    /// segment rows are no longer there to describe the key.
+    /// The relation's indexes that carry entries - every slot with a
+    /// root page, whatever its state in ods.h's lifecycle. A DROPPED
+    /// index is one of them: its tree lives on until the index is
+    /// physically removed (`irt_commit`/`irt_drop` keep `irt_page_num`,
+    /// and `getRoot()` only reports 0 for `irt_unused`), and the
+    /// engine's own validation walks it - `gfix` reports "Index n is
+    /// corrupt {missing entries for record m}" the moment a writer adds
+    /// a record without keying it into that tree.
+    ///
+    /// What a dropped index stops doing is ENFORCING: `setDrop`
+    /// (ods.h:613) clears `irt_unique | irt_foreign | irt_primary`, so
+    /// the flags this iterator hands back turn uniqueness off by
+    /// themselves - the same mechanism the engine relies on.
     pub fn live_entries(&self) -> impl Iterator<Item = IndexRootEntry> + '_ {
-        self.entries()
-            .filter(|e| e.root_page != 0 && e.state != 0 && e.state < IRT_KILL)
+        self.entries().filter(|e| e.root_page != 0 && e.state != IRT_UNUSED)
     }
 
     pub fn entries(&self) -> impl Iterator<Item = IndexRootEntry> + '_ {
@@ -85,12 +88,12 @@ impl<'a> IndexRootPage<'a> {
     }
 }
 
+/// `irt_unused` - an empty index-root slot (ods.h:450).
+pub const IRT_UNUSED: u8 = 0;
 /// `irt_normal` - the settled working state of an index (ods.h:453).
 pub const IRT_NORMAL: u8 = 3;
-/// `irt_kill` (ods.h:454) - the first of the states an index on its way
-/// out occupies (kill/commit/drop); at or above it, the index is not
-/// maintained.
-pub const IRT_KILL: u8 = 4;
+/// `irt_drop` - a dropped index awaiting physical removal (ods.h:456).
+pub const IRT_DROP: u8 = 6;
 
 /// A b-tree bucket (`btree_page`, ods.h:296; offsets pinned by
 /// ods.h:312-324). Nodes begin after the jump table.
@@ -324,29 +327,29 @@ pub fn walk_index_leaves(
 mod tests {
     use super::*;
 
-    /// The index-state lifecycle (ods.h): only states below irt_kill
-    /// count as live. A freshly engine-created index idles in
-    /// irt_rollback (2) until touched, so the rule cannot be "normal
-    /// only" - that would stop the writer maintaining a brand-new
-    /// engine index. A dropped one (5/6) keeps its root page and must
-    /// be skipped.
+    /// Every slot with a root page carries entries, whatever its state
+    /// - a freshly engine-created index idles in irt_rollback (2) and a
+    /// dropped one sits in irt_drop (6) with its tree still validated.
+    /// Only an unused slot is skipped; a dropped index's flags come
+    /// back cleared, which is what turns its uniqueness off.
     #[test]
-    fn live_index_states_span_build_through_normal() {
+    fn every_slot_with_a_root_page_carries_entries() {
         let page_size = 1024usize;
         let mut page = vec![0u8; page_size];
         page[0] = 6; // pag_root
         page[16..18].copy_from_slice(&128u16.to_le_bytes()); // irt_relation
         page[18..20].copy_from_slice(&4u16.to_le_bytes()); // irt_count
-        for (slot, state) in [(0u8, 2u8), (1, 3), (2, 6), (3, 4)] {
+        // slot 3 is unused: no root page, state irt_unused
+        for (slot, state, root) in [(0u8, 2u8, 100u32), (1, 3, 101), (2, IRT_DROP, 102), (3, 0, 0)] {
             let at = 24 + slot as usize * 24;
-            page[at + 8..at + 12].copy_from_slice(&(100u32 + slot as u32).to_le_bytes());
+            page[at + 8..at + 12].copy_from_slice(&root.to_le_bytes());
             page[at + 20] = state;
             page[at + 21] = 1; // one key
         }
         let irt = IndexRootPage::decode(&page).expect("index root");
         let live: Vec<u8> = irt.live_entries().map(|e| e.id).collect();
-        assert_eq!(live, vec![0, 1], "irt_rollback and irt_normal are live");
-        assert_eq!(irt.entries().count(), 4, "every used slot is still visible");
+        assert_eq!(live, vec![0, 1, 2], "the dropped index's tree is maintained too");
+        assert_eq!(irt.entries().count(), 4, "every slot is still visible");
     }
 
     /// Hand-encode nodes per btn.h and decode them back.

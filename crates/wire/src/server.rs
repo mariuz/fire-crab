@@ -695,6 +695,10 @@ enum Plan {
     /// `DROP TABLE <name>`: catalog rows stubbed, RDB$PAGES rows wiped,
     /// every owned page released
     DropTable { name: String },
+    /// `DROP INDEX <name>`: the mirror of CREATE INDEX - the index
+    /// removed the engine's deferred way. An index backing a
+    /// constraint is refused (ALTER TABLE DROP CONSTRAINT does that)
+    DropIndex { name: String },
     /// `ALTER TABLE <table> ADD <column>`: a new format version, the new
     /// column's catalog rows, and a version rewrite of the RDB$RELATIONS
     /// row bumping its format and field count
@@ -1650,6 +1654,25 @@ fn plan_drop_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         return None;
     }
     Some((Plan::DropTable { name: name.to_ascii_uppercase() }, Vec::new()))
+}
+
+/// Parse `DROP INDEX <name>`.
+fn plan_drop_index(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "DROP", 0) != Some(0) {
+        return None;
+    }
+    let index_kw = find_word(&masked, "INDEX", "DROP".len())?;
+    if masked[..index_kw].trim() != "DROP" {
+        return None;
+    }
+    let name = s[index_kw + "INDEX".len()..].trim().trim_matches('"');
+    if !ident_ok(name) {
+        return None;
+    }
+    Some((Plan::DropIndex { name: name.to_ascii_uppercase() }, Vec::new()))
 }
 
 /// Parse `ALTER TABLE <table> ADD <column def>` - append one nullable
@@ -2640,6 +2663,10 @@ fn execute_dml(
         }
         Plan::DropTable { name } => {
             fire_crab_ods::ddl::drop_table(&mut work, db.page_size, name)?;
+            (0, 0, 0)
+        }
+        Plan::DropIndex { name } => {
+            fire_crab_ods::ddl::drop_index(&mut work, db.page_size, name)?;
             (0, 0, 0)
         }
         Plan::AlterTableAdd { table, col } => {
@@ -4135,6 +4162,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
     match plan {
         Plan::Scalar(_) | Plan::GenIdIncrement { .. } => describe_one_bigint(params),
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
+        | Plan::DropIndex { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -4165,6 +4193,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         Plan::Update { .. } => 3,
         Plan::Delete { .. } => 4,
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
+        | Plan::DropIndex { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -4482,6 +4511,7 @@ fn emit_rows_inner(
         // reaches fetch as itself; the arm keeps the match exhaustive.
         Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
         | Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
+        | Plan::DropIndex { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -6901,6 +6931,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         plan_create_table(&text)
                             .or_else(|| plan_create_index(&text))
                             .or_else(|| plan_drop_table(&text))
+                            .or_else(|| plan_drop_index(&text))
                             .or_else(|| plan_alter_table_add(&text))
                             .or_else(|| plan_alter_table_drop(&text))
                             .or_else(|| plan_alter_table_alter_type(&text))
@@ -7038,6 +7069,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     let planned = plan_create_table(&stmt_sql)
                         .or_else(|| plan_create_index(&stmt_sql))
                         .or_else(|| plan_drop_table(&stmt_sql))
+                        .or_else(|| plan_drop_index(&stmt_sql))
                         .or_else(|| plan_alter_table_add(&stmt_sql))
                         .or_else(|| plan_alter_table_drop(&stmt_sql))
                         .or_else(|| plan_alter_table_alter_type(&stmt_sql))
@@ -7141,6 +7173,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::CreateTable { .. }
                         | Plan::CreateIndex { .. }
                         | Plan::DropTable { .. }
+                        | Plan::DropIndex { .. }
                         | Plan::AlterTableAdd { .. }
                         | Plan::AlterTableAddFk { .. }
                         | Plan::AlterTableAddKey { .. }
@@ -10019,6 +10052,21 @@ mod tests {
             "CREATE TABLE T (A INTEGER PRIMARY KEY, B INTEGER, PRIMARY KEY (B))"
         )
         .is_none());
+    }
+
+    #[test]
+    fn parses_drop_index() {
+        match plan_drop_index("DROP INDEX IX_TB") {
+            Some((Plan::DropIndex { name }, _)) => assert_eq!(name, "IX_TB"),
+            other => panic!("expected DropIndex, got {:?}", other.is_some()),
+        }
+        assert!(matches!(
+            plan_drop_index("drop index \"ix_lower\""),
+            Some((Plan::DropIndex { .. }, _))
+        ));
+        // DROP TABLE is not a DROP INDEX, and neither is a bare DROP
+        assert!(plan_drop_index("DROP TABLE T").is_none());
+        assert!(plan_drop_index("DROP INDEX").is_none());
     }
 
     #[test]
