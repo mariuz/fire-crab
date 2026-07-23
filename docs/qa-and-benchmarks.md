@@ -2248,6 +2248,54 @@ number from the `RDB$PRIMARY` sequence alone, each make the catalog
 comparison fail. A differential that would pass with the bug still in is not
 a differential.
 
+### The fifty-eighth differential — key constraints by ALTER, and a foreign key that isn't about the primary key
+
+Two things followed directly from the previous slice. With key constraints
+modelled as a declaration-ordered list and their writing factored into one
+helper, `ALTER TABLE A1 ADD CONSTRAINT PK_A1 PRIMARY KEY (X)` and `ALTER
+TABLE A1 ADD UNIQUE (Y)` are the same helper called on an existing table —
+the index writer already backfilled and unique-checked committed rows, so
+adding a key to a populated table needs no new machinery, only the engine's
+preconditions.
+
+Those preconditions are the interesting part, and they were probed rather
+than assumed. The engine **refuses** `ADD PRIMARY KEY` over a column that is
+not *already* `NOT NULL` — "Column: X not defined as NOT NULL - cannot be
+used in PRIMARY KEY constraint definition" — it does not quietly set the
+flag for you, which is the opposite of what `CREATE TABLE (... PRIMARY KEY
+(A, B))` does at creation time. It refuses a second primary key. And it
+refuses a `UNIQUE` whose existing data already holds duplicates, failing the
+whole metadata update. fire-crab now refuses all three the same way.
+
+The second piece: `REFERENCES A1 (Y)` where `Y` carries a **UNIQUE**
+constraint rather than the primary key. The partner lookup had been reading
+"the referenced table's PRIMARY KEY" and ignoring the referenced-column list
+entirely — which happened to be right for every foreign key written so far,
+and silently wrong the moment a key pointed elsewhere. It now collects every
+`PRIMARY KEY` and `UNIQUE` constraint of the referenced table and picks the
+one whose index carries exactly the named columns in the named order
+(primary keys first when both would fit; the primary key when no columns are
+named). The engine's own catalog confirms the shape: the FK's
+`RDB$REF_CONSTRAINTS` row names the **UNIQUE** constraint, and its index's
+`RDB$FOREIGN_KEY` names the unique index.
+
+`qa/serve-real-keyalter.sh` (31 checks) builds the schema the same way on
+both sides — create the tables, insert rows, *then* alter — so what is
+compared is the ALTER path and not an end state a `CREATE TABLE` could also
+have produced. One point of honesty about the refusals: fire-crab answers
+every failed statement with the generic `isc_dsql_error`, so a client sees
+no reason text and a gate cannot assert *why* a statement was refused. The
+differential handles this in two moves: the same statement is run against
+the engine and both sides must refuse it, and then the rule is satisfied
+(`ALTER TABLE A3 ALTER N SET NOT NULL`) and the identical statement must now
+*succeed* — which pins the refusal to the NOT NULL rule and nothing else.
+
+Both new behaviours were teeth-checked by reverting them: ignoring the
+referenced-column list makes the foreign key partner with `A1`'s primary key
+instead of its unique key (catalog mismatch, and the engine then rejects a
+child row it should accept), and dropping the not-null precondition lets the
+nullable-column primary key through. Each shows up as a `DIFF`.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -2533,6 +2581,18 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-key.sh 3050
+
+# KEY CONSTRAINTS BY ALTER: ADD [CONSTRAINT n] PRIMARY KEY|UNIQUE on an
+# existing populated table (index built over the rows already there), the
+# engine's preconditions reproduced (a PK needs columns that are ALREADY
+# NOT NULL, no second PK, no UNIQUE over duplicate data), and a FOREIGN KEY
+# that references a UNIQUE key instead of the primary key. fire-crab and the
+# engine build the schema the same way - create, insert, THEN alter. Builds
+# its own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-keyalter.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
