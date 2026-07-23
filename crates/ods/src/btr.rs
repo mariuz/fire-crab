@@ -66,10 +66,31 @@ impl<'a> IndexRootPage<'a> {
         })
     }
 
+    /// The relation's LIVE indexes - the ones to maintain and scan.
+    /// ods.h's index-state lifecycle splits the states in two: an index
+    /// being built or working (`irt_in_progress` 1, `irt_rollback` 2 -
+    /// where a freshly engine-created index idles until touched -,
+    /// `irt_normal` 3) is live, while one on its way out (`irt_kill` 4,
+    /// `irt_commit` 5, `irt_drop` 6) keeps its pages but is ignored by
+    /// the engine, so this writer must ignore it too - maintaining a
+    /// dropped index re-enforces a constraint that is gone, and its
+    /// segment rows are no longer there to describe the key.
+    pub fn live_entries(&self) -> impl Iterator<Item = IndexRootEntry> + '_ {
+        self.entries()
+            .filter(|e| e.root_page != 0 && e.state != 0 && e.state < IRT_KILL)
+    }
+
     pub fn entries(&self) -> impl Iterator<Item = IndexRootEntry> + '_ {
         (0..self.count.min(255) as u8).filter_map(|i| self.entry(i))
     }
 }
+
+/// `irt_normal` - the settled working state of an index (ods.h:453).
+pub const IRT_NORMAL: u8 = 3;
+/// `irt_kill` (ods.h:454) - the first of the states an index on its way
+/// out occupies (kill/commit/drop); at or above it, the index is not
+/// maintained.
+pub const IRT_KILL: u8 = 4;
 
 /// A b-tree bucket (`btree_page`, ods.h:296; offsets pinned by
 /// ods.h:312-324). Nodes begin after the jump table.
@@ -302,6 +323,31 @@ pub fn walk_index_leaves(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The index-state lifecycle (ods.h): only states below irt_kill
+    /// count as live. A freshly engine-created index idles in
+    /// irt_rollback (2) until touched, so the rule cannot be "normal
+    /// only" - that would stop the writer maintaining a brand-new
+    /// engine index. A dropped one (5/6) keeps its root page and must
+    /// be skipped.
+    #[test]
+    fn live_index_states_span_build_through_normal() {
+        let page_size = 1024usize;
+        let mut page = vec![0u8; page_size];
+        page[0] = 6; // pag_root
+        page[16..18].copy_from_slice(&128u16.to_le_bytes()); // irt_relation
+        page[18..20].copy_from_slice(&4u16.to_le_bytes()); // irt_count
+        for (slot, state) in [(0u8, 2u8), (1, 3), (2, 6), (3, 4)] {
+            let at = 24 + slot as usize * 24;
+            page[at + 8..at + 12].copy_from_slice(&(100u32 + slot as u32).to_le_bytes());
+            page[at + 20] = state;
+            page[at + 21] = 1; // one key
+        }
+        let irt = IndexRootPage::decode(&page).expect("index root");
+        let live: Vec<u8> = irt.live_entries().map(|e| e.id).collect();
+        assert_eq!(live, vec![0, 1], "irt_rollback and irt_normal are live");
+        assert_eq!(irt.entries().count(), 4, "every used slot is still visible");
+    }
 
     /// Hand-encode nodes per btn.h and decode them back.
     #[test]

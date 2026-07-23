@@ -718,6 +718,10 @@ enum Plan {
         table: String,
         key: fire_crab_ods::ddl::KeyDef,
     },
+    /// `ALTER TABLE <table> DROP CONSTRAINT <name>`: remove a NOT NULL,
+    /// PRIMARY KEY, UNIQUE or FOREIGN KEY constraint - the catalog rows
+    /// deleted and any backing index deferred-dropped the engine's way
+    AlterTableDropConstraint { table: String, constraint: String },
     /// `ALTER TABLE <table> DROP <column>`: a new format version with the
     /// dropped field as a placeholder, the column's catalog rows deleted,
     /// RDB$RUNTIME rebuilt, RDB$RELATIONS format bumped
@@ -1713,9 +1717,24 @@ fn plan_alter_table_drop(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     if !ident_ok(table) {
         return None;
     }
-    let col = s[drop_kw + "DROP".len()..].trim().trim_matches('"');
+    let tail = s[drop_kw + "DROP".len()..].trim();
+    // DROP CONSTRAINT <name>
+    if let Some(rest) = tail.to_ascii_uppercase().strip_prefix("CONSTRAINT ") {
+        let cname = rest.trim().trim_matches('"');
+        if !ident_ok(cname) {
+            return None;
+        }
+        return Some((
+            Plan::AlterTableDropConstraint {
+                table: table.to_ascii_uppercase(),
+                constraint: cname.to_ascii_uppercase(),
+            },
+            Vec::new(),
+        ));
+    }
+    let col = tail.trim_matches('"');
     if !ident_ok(col) {
-        return None; // DROP CONSTRAINT / PRIMARY KEY / ... not a column drop
+        return None; // DROP PRIMARY KEY / ... not a column drop
     }
     Some((
         Plan::AlterTableDrop {
@@ -2631,6 +2650,12 @@ fn execute_dml(
             fire_crab_ods::ddl::alter_table_add_foreign_key(&mut work, db.page_size, table, fk)?;
             (0, 0, 0)
         }
+        Plan::AlterTableDropConstraint { table, constraint } => {
+            fire_crab_ods::ddl::alter_table_drop_constraint(
+                &mut work, db.page_size, table, constraint,
+            )?;
+            (0, 0, 0)
+        }
         Plan::AlterTableAddKey { table, key } => {
             fire_crab_ods::ddl::alter_table_add_key(&mut work, db.page_size, table, key)?;
             (0, 0, 0)
@@ -2873,10 +2898,7 @@ fn resolve_index_ops(db: &Database, rel: u16, descs: &[Descriptor]) -> Option<Ve
         return Some(Vec::new());
     };
     let mut ops = Vec::new();
-    for e in irt.entries() {
-        if e.root_page == 0 {
-            continue; // empty slot
-        }
+    for e in irt.live_entries() {
         let (segs, iflags) = btw::index_segments(
             &db.bytes,
             db.page_size,
@@ -4114,7 +4136,8 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         Plan::Scalar(_) | Plan::GenIdIncrement { .. } => describe_one_bigint(params),
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
-        | Plan::AlterTableAddKey { .. } | Plan::AlterTableDrop { .. }
+        | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
+        | Plan::AlterTableDrop { .. }
         | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } => {
             describe_dml(5, params) // isc_info_sql_stmt_ddl
         }
@@ -4143,7 +4166,8 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         Plan::Delete { .. } => 4,
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
-        | Plan::AlterTableAddKey { .. } | Plan::AlterTableDrop { .. }
+        | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
+        | Plan::AlterTableDrop { .. }
         | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } => 5,
         Plan::SetGenerator { stmt_type, .. } => *stmt_type,
     }
@@ -4459,7 +4483,8 @@ fn emit_rows_inner(
         Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
         | Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
-        | Plan::AlterTableAddKey { .. } | Plan::AlterTableDrop { .. }
+        | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
+        | Plan::AlterTableDrop { .. }
         | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. }
         | Plan::GenIdIncrement { .. } | Plan::SetGenerator { .. } => {}
         Plan::Scalar(v) => {
@@ -7119,6 +7144,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::AlterTableAdd { .. }
                         | Plan::AlterTableAddFk { .. }
                         | Plan::AlterTableAddKey { .. }
+                        | Plan::AlterTableDropConstraint { .. }
                         | Plan::AlterTableDrop { .. }
                         | Plan::AlterColumnType { .. }
                         | Plan::AlterColumnNull { .. }
@@ -9993,6 +10019,27 @@ mod tests {
             "CREATE TABLE T (A INTEGER PRIMARY KEY, B INTEGER, PRIMARY KEY (B))"
         )
         .is_none());
+    }
+
+    #[test]
+    fn plan_alter_table_drop_recognises_a_constraint() {
+        // DROP CONSTRAINT <name> routes to AlterTableDropConstraint,
+        // a bare name is still a column drop
+        match plan_alter_table_drop("ALTER TABLE U DROP CONSTRAINT UQ_U") {
+            Some((Plan::AlterTableDropConstraint { table, constraint }, _)) => {
+                assert_eq!(table, "U");
+                assert_eq!(constraint, "UQ_U");
+            }
+            other => panic!("expected AlterTableDropConstraint, got {:?}", other.is_some()),
+        }
+        assert!(matches!(
+            plan_alter_table_drop("alter table U drop constraint integ_7"),
+            Some((Plan::AlterTableDropConstraint { .. }, _))
+        ));
+        assert!(matches!(
+            plan_alter_table_drop("ALTER TABLE U DROP W"),
+            Some((Plan::AlterTableDrop { .. }, _))
+        ));
     }
 
     #[test]

@@ -238,8 +238,7 @@ fn sys_insert(
     // maintain every index of the relation
     if let Some(irt) = find_index_root(file, page_size, rel) {
         let entries: Vec<_> = irt
-            .entries()
-            .filter(|e| e.root_page != 0)
+            .live_entries()
             .map(|e| (e.id, e.key_count))
             .collect();
         for (id, key_count) in entries {
@@ -663,7 +662,7 @@ pub fn alter_table_drop_column(
     }
     // an indexed/key column would leave a dangling index - reject it
     if let Some(irt) = find_index_root(file, page_size, rel) {
-        for e in irt.entries().filter(|e| e.root_page != 0) {
+        for e in irt.live_entries() {
             let (segs, _) =
                 btw::index_segments(file, page_size, rel, e.id, e.key_count as usize)
                     .ok_or("unreadable index segments")?;
@@ -1556,6 +1555,237 @@ pub fn alter_table_add_key(
     }
     write_key(file, page_size, &name, key)?;
     advance_oldest_transactions(file, page_size)?;
+    Ok(())
+}
+
+/// `ALTER TABLE <table> DROP CONSTRAINT <name>`: remove a NOT NULL,
+/// PRIMARY KEY, UNIQUE or FOREIGN KEY constraint.
+///
+/// The key constraints take their index with them, and the engine does
+/// that in a DEFERRED way worth reproducing exactly (DdlNodes.epp:
+/// `DropIndexNode::drop`, ods.h's index-state lifecycle): the
+/// `RDB$INDICES` row is not erased but RENAMED to
+/// `RDB$TEMP_DEPEND_<relation id>_<index id>` with `RDB$INDEX_INACTIVE
+/// = MET_index_deferred_drop (4)`, its `RDB$INDEX_SEGMENTS` rows are
+/// deleted, and the index-root slot goes to state `irt_drop` (6) -
+/// "index to be removed when OAT > irt_transaction" - keeping its
+/// pages until then. gbak skips such indices (backup.epp:1676), so a
+/// restored copy carries no trace of them.
+///
+/// A PRIMARY KEY or UNIQUE that a foreign key references is refused,
+/// as the engine refuses it ("Cannot delete PRIMARY KEY being used in
+/// FOREIGN KEY definition").
+pub fn alter_table_drop_constraint(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    constraint: &str,
+) -> Result<(), String> {
+    let name = table.trim().to_ascii_uppercase();
+    let cname = constraint.trim().trim_matches('"').to_ascii_uppercase();
+    let rel = crate::resolve_relation(file, page_size, &name)
+        .ok_or_else(|| format!("table {} not found", table))?;
+    if rel < 128 {
+        return Err("system relations are read-only".into());
+    }
+    let (ctype, index_name) = find_constraint(file, page_size, &name, &cname).ok_or_else(|| {
+        format!("constraint {} on table {} not found", cname, name)
+    })?;
+    match ctype.as_str() {
+        "NOT NULL" => {
+            // the column it guards is named by its RDB$CHECK_CONSTRAINTS
+            // link; clearing NULL_FLAG and refreshing RDB$RUNTIME is what
+            // ALTER COLUMN DROP NOT NULL already does
+            let column = check_constraint_column(file, page_size, &cname)
+                .ok_or_else(|| format!("constraint {} has no column", cname))?;
+            patch_rf_null_flag(file, page_size, &name, &column, None)?;
+            let cn_fid = sys_fid(file, page_size, "RDB$CHECK_CONSTRAINTS", "RDB$CONSTRAINT_NAME")?;
+            delete_catalog_rows(file, page_size, "RDB$CHECK_CONSTRAINTS", |v| {
+                text_eq(v.get(cn_fid), &cname)
+            })?;
+            refresh_runtime(file, page_size, &name)?;
+        }
+        "PRIMARY KEY" | "UNIQUE" => {
+            if let Some(fk) = foreign_key_referencing(file, page_size, &cname) {
+                return Err(format!(
+                    "Cannot delete {} being used in FOREIGN KEY definition (constraint {})",
+                    ctype, fk
+                ));
+            }
+            let index_name = index_name.ok_or("key constraint without an index")?;
+            deferred_drop_index(file, page_size, rel, &index_name)?;
+        }
+        "FOREIGN KEY" => {
+            let cn_fid = sys_fid(file, page_size, "RDB$REF_CONSTRAINTS", "RDB$CONSTRAINT_NAME")?;
+            delete_catalog_rows(file, page_size, "RDB$REF_CONSTRAINTS", |v| {
+                text_eq(v.get(cn_fid), &cname)
+            })?;
+            let index_name = index_name.ok_or("foreign key without an index")?;
+            deferred_drop_index(file, page_size, rel, &index_name)?;
+        }
+        other => return Err(format!("cannot drop a {} constraint", other)),
+    }
+    let rc_name = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME")?;
+    delete_catalog_rows(file, page_size, "RDB$RELATION_CONSTRAINTS", |v| {
+        text_eq(v.get(rc_name), &cname)
+    })?;
+    advance_oldest_transactions(file, page_size)?;
+    Ok(())
+}
+
+/// A constraint's (type, index name) from RDB$RELATION_CONSTRAINTS.
+fn find_constraint(
+    file: &[u8],
+    page_size: usize,
+    table: &str,
+    cname: &str,
+) -> Option<(String, Option<String>)> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$RELATION_CONSTRAINTS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$RELATION_CONSTRAINTS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$RELATION_CONSTRAINTS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (cn_f, ct_f, rn_f, ix_f) = (
+        fid("RDB$CONSTRAINT_NAME")?,
+        fid("RDB$CONSTRAINT_TYPE")?,
+        fid("RDB$RELATION_NAME")?,
+        fid("RDB$INDEX_NAME")?,
+    );
+    let mut found = None;
+    walk_rows(file, page_size, rel, descs, |values| {
+        if text_eq(values.get(cn_f), cname) && text_eq(values.get(rn_f), table) {
+            let ctype = match values.get(ct_f) {
+                Some(Value::Text(t)) => t.trim_end().to_string(),
+                _ => return,
+            };
+            let index = match values.get(ix_f) {
+                Some(Value::Text(t)) => Some(t.trim_end().to_string()),
+                _ => None,
+            };
+            found = Some((ctype, index));
+        }
+    });
+    found
+}
+
+/// The column a NOT NULL constraint guards (RDB$CHECK_CONSTRAINTS'
+/// RDB$TRIGGER_NAME holds the column name for those rows).
+fn check_constraint_column(file: &[u8], page_size: usize, cname: &str) -> Option<String> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$CHECK_CONSTRAINTS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$CHECK_CONSTRAINTS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$CHECK_CONSTRAINTS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (cn_f, tr_f) = (fid("RDB$CONSTRAINT_NAME")?, fid("RDB$TRIGGER_NAME")?);
+    let mut found = None;
+    walk_rows(file, page_size, rel, descs, |values| {
+        if text_eq(values.get(cn_f), cname) {
+            if let Some(Value::Text(t)) = values.get(tr_f) {
+                found = Some(t.trim_end().to_string());
+            }
+        }
+    });
+    found
+}
+
+/// The foreign key (if any) whose RDB$REF_CONSTRAINTS row names this
+/// unique/primary constraint as its partner.
+fn foreign_key_referencing(file: &[u8], page_size: usize, cname: &str) -> Option<String> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$REF_CONSTRAINTS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$REF_CONSTRAINTS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$REF_CONSTRAINTS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (cn_f, uq_f) = (fid("RDB$CONSTRAINT_NAME")?, fid("RDB$CONST_NAME_UQ")?);
+    let mut found = None;
+    walk_rows(file, page_size, rel, descs, |values| {
+        if text_eq(values.get(uq_f), cname) {
+            if let Some(Value::Text(t)) = values.get(cn_f) {
+                found = Some(t.trim_end().to_string());
+            }
+        }
+    });
+    found
+}
+
+/// Remove an index the engine's deferred way: its RDB$INDICES row
+/// renamed to RDB$TEMP_DEPEND_<rel>_<id> and marked
+/// MET_index_deferred_drop (4), its segment rows deleted, and its
+/// index-root slot moved to irt_drop (6) with its flags cleared - the
+/// state fcstat reads back from an engine-dropped index, pages and all.
+fn deferred_drop_index(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    rel: u16,
+    index_name: &str,
+) -> Result<(), String> {
+    let formats = system_relation_formats(file, page_size, "RDB$INDICES")
+        .ok_or("no RDB$INDICES format")?;
+    let (ix_format_no, ix_descs) = {
+        let (n, d) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+        (*n, d.clone())
+    };
+    let name_fid = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME")?;
+    let id_fid = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_ID")?;
+    let inactive_fid = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_INACTIVE")?;
+    let want = index_name.trim().to_ascii_uppercase();
+    let (page, slot) = find_sys_row_slot(file, page_size, "RDB$INDICES", 4, |vals| {
+        text_eq(vals.get(name_fid), &want)
+    })
+    .ok_or_else(|| format!("index {} not found", index_name))?;
+    let mut image = {
+        let start = page as usize * page_size;
+        let dp = DataPage::decode(file.get(start..start + page_size).ok_or("bad page")?)
+            .ok_or("bad data page")?;
+        dp.record(slot).and_then(|r| r.image()).ok_or("no index image")?
+    };
+    // RDB$INDEX_ID is the irt slot + 1 (both here and in the engine)
+    let index_id = {
+        let d = ix_descs.get(id_fid).ok_or("field beyond format")?;
+        let vals = decode_record(&image, &ix_descs);
+        match vals.get(id_fid) {
+            Some(Value::Int(i)) => *i as usize,
+            _ => return Err(format!("index {} has no id (dsc {:?})", index_name, d.dtype)),
+        }
+    };
+    let temp = format!("RDB$TEMP_DEPEND_{}_{}", rel, index_id.saturating_sub(1));
+    for (fid, val) in [
+        (name_fid, SysVal::S(&temp)),
+        (inactive_fid, SysVal::I(4)), // MET_index_deferred_drop
+    ] {
+        let d = ix_descs.get(fid).ok_or("field beyond format")?;
+        let bytes = encode_sys_value(d, &val)?;
+        let at = d.offset as usize;
+        image
+            .get_mut(at..at + bytes.len())
+            .ok_or("image shorter than format")?
+            .copy_from_slice(&bytes);
+        image[fid / 8] &= !(1 << (fid % 8)); // not NULL
+    }
+    dml::update_records(file, page_size, 4, &[(page, slot, image)], ix_format_no)?;
+    let seg_fid = sys_fid(file, page_size, "RDB$INDEX_SEGMENTS", "RDB$INDEX_NAME")?;
+    delete_catalog_rows(file, page_size, "RDB$INDEX_SEGMENTS", |v| {
+        text_eq(v.get(seg_fid), &want)
+    })?;
+    // the index-root slot: irt_drop, flags cleared, root page kept
+    let irt_page = file
+        .chunks_exact(page_size)
+        .position(|p| p[0] == 6 && u16_at(p, 16) == rel)
+        .ok_or("relation has no index root page")?;
+    let at = irt_page * page_size + 24 + index_id.saturating_sub(1) * 24;
+    if at + 24 > file.len() {
+        return Err("index slot beyond the root page".into());
+    }
+    // irt_drop (6) with the flags cleared: the SETTLED shape an
+    // engine-dropped index reaches (fcstat reads exactly this back off
+    // an engine file once the dropping transaction is old). The engine
+    // passes through irt_commit (5) first because its DDL runs inside a
+    // transaction that has yet to commit; this writer's statement is
+    // already committed when it returns, so the settled state is the
+    // honest one - and it is the one gfix validates as clean, since a
+    // state-5 index is still scanned while its segment rows are gone
+    dml::put_u16(file, at + 18, 0); // irt_flags
+    file[at + 20] = 6; // irt_drop (ods.h:456)
     Ok(())
 }
 
