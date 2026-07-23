@@ -3826,7 +3826,7 @@ fn answer_info_sql(items: &[u8], plan: &Plan, last_dml: (i32, i32, i32)) -> Vec<
 /// (server.cpp:4302, `send_response(... status ...)`).
 enum EmitErr {
     Bind,
-    Eval,
+    Eval(EvalErr),
 }
 
 impl From<String> for EmitErr {
@@ -3836,8 +3836,8 @@ impl From<String> for EmitErr {
 }
 
 impl From<EvalErr> for EmitErr {
-    fn from(_: EvalErr) -> Self {
-        EmitErr::Eval
+    fn from(e: EvalErr) -> Self {
+        EmitErr::Eval(e)
     }
 }
 
@@ -3847,21 +3847,34 @@ impl From<EvalErr> for EmitErr {
 /// by zero".
 const GDS_ARITH_EXCEPT: i32 = 335544321;
 const GDS_INTEGER_DIVIDE: i32 = 335544778;
+/// isc_convert_error - the engine's "conversion error from string" for a
+/// CAST that cannot convert (SQLSTATE 22018).
+const GDS_CONVERT_ERROR: i32 = 335544334;
 
 /// Write, into the fetch reply stream, the op_response the engine sends
-/// when a row's evaluation raises the arithmetic exception - mirroring
-/// `respond_error`'s layout but carrying the two-part status vector.
-fn write_arith_error(w: &mut W) {
+/// when a row's evaluation raises `e` - mirroring `respond_error`'s layout
+/// but carrying the matching status vector, so the client raises the same
+/// SQL error the real server would (server.cpp:4302 sends the same
+/// op_response on a mid-cursor access-method error).
+fn write_eval_error(w: &mut W, e: &EvalErr) {
     w.int(OP_RESPONSE)
         .int(0)
         .int(0)
         .int(0) // blob id
-        .int(0) // response data length
-        .int(1) // isc_arg_gds
-        .int(GDS_ARITH_EXCEPT)
-        .int(1) // isc_arg_gds
-        .int(GDS_INTEGER_DIVIDE)
-        .int(0); // isc_arg_end
+        .int(0); // response data length
+    match e {
+        EvalErr::DivideByZero => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_ARITH_EXCEPT)
+                .int(1) // isc_arg_gds
+                .int(GDS_INTEGER_DIVIDE);
+        }
+        EvalErr::ConversionError => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_CONVERT_ERROR);
+        }
+    }
+    w.int(0); // isc_arg_end
 }
 
 fn emit_rows(w: &mut W, plan: &Plan, db: &Option<Database>, args: &[WireParam]) {
@@ -3875,7 +3888,7 @@ fn emit_rows(w: &mut W, plan: &Plan, db: &Option<Database>, args: &[WireParam]) 
             // end-of-cursor terminator
             w.int(OP_FETCH_RESPONSE).int(100).int(0);
         }
-        Err(EmitErr::Eval) => write_arith_error(w),
+        Err(EmitErr::Eval(e)) => write_eval_error(w, &e),
     }
 }
 
@@ -3928,19 +3941,22 @@ fn emit_rows_inner(
                 let filter = bind_filter(filter, args)?;
                 let accepts = |v: &[Value]| filter.as_ref().map_or(true, |p| p.matches(v));
                 if order_by.is_empty() {
-                    // stream matching rows; a divide-by-zero on any row
-                    // stops the walk and is reported after the loop
-                    let mut eval_err = false;
+                    // stream matching rows; an evaluation error on any row
+                    // (divide by zero, a failed cast) stops the walk and is
+                    // reported after it
+                    let mut eval_err: Option<EvalErr> = None;
                     for_each_record(db, *rel, formats, |values| {
-                        if eval_err {
+                        if eval_err.is_some() {
                             return;
                         }
-                        if accepts(values) && encode_row(w, cols, values).is_err() {
-                            eval_err = true;
+                        if accepts(values) {
+                            if let Err(e) = encode_row(w, cols, values) {
+                                eval_err = Some(e);
+                            }
                         }
                     });
-                    if eval_err {
-                        return Err(EmitErr::Eval);
+                    if let Some(e) = eval_err {
+                        return Err(EmitErr::Eval(e));
                     }
                 } else {
                     // collect matching rows, then sort by the ORDER BY keys
@@ -4264,6 +4280,19 @@ enum RawExpr {
     /// string concatenation `a || b` - a text result, distinct from the
     /// arithmetic `Bin`s (its operands coerce to text, not to integers)
     Concat(Box<RawExpr>, Box<RawExpr>),
+    /// `CAST(a AS <type>)` - convert to the target type
+    Cast(Box<RawExpr>, CastTarget),
+}
+
+/// The target of a `CAST`. Text targets carry their declared width and
+/// whether they pad (CHAR) or not (VARCHAR). The integer family
+/// (SMALLINT/INTEGER/BIGINT) collapses to one target: fire-crab computes
+/// the value at full `i64` width and announces BIGINT, exactly as the
+/// select-list arithmetic already does - the displayed value is identical.
+#[derive(Clone, Copy)]
+enum CastTarget {
+    Int,
+    Text { len: usize, pad: bool },
 }
 
 /// Parse an arithmetic expression: `+`/`-` (lowest precedence) over
@@ -4430,12 +4459,94 @@ fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
             }
             if word.eq_ignore_ascii_case("NULL") {
                 Some(RawExpr::Null)
+            } else if !quoted && word.eq_ignore_ascii_case("CAST") && {
+                skip_ws(b, pos);
+                b.get(*pos) == Some(&'(')
+            } {
+                // CAST(<expr> AS <type>): the operand at full precedence,
+                // AS, then a target type
+                *pos += 1; // '('
+                let inner = expr_add(b, pos)?;
+                skip_ws(b, pos);
+                if !take_keyword(b, pos, "AS") {
+                    return None;
+                }
+                let target = parse_cast_target(b, pos)?;
+                skip_ws(b, pos);
+                if b.get(*pos) != Some(&')') {
+                    return None;
+                }
+                *pos += 1; // ')'
+                Some(RawExpr::Cast(Box::new(inner), target))
             } else {
                 Some(RawExpr::Col(word))
             }
         }
         _ => None,
     }
+}
+
+/// Consume a whole-word keyword (case-insensitive) at `pos`, skipping
+/// leading whitespace. Returns true and advances on a match; leaves `pos`
+/// unchanged otherwise.
+fn take_keyword(b: &[char], pos: &mut usize, kw: &str) -> bool {
+    skip_ws(b, pos);
+    let kb: Vec<char> = kw.chars().collect();
+    if *pos + kb.len() > b.len() {
+        return false;
+    }
+    for (i, kc) in kb.iter().enumerate() {
+        if !b[*pos + i].eq_ignore_ascii_case(kc) {
+            return false;
+        }
+    }
+    // must end on a word boundary
+    if let Some(nc) = b.get(*pos + kb.len()) {
+        if nc.is_alphanumeric() || *nc == '_' || *nc == '$' {
+            return false;
+        }
+    }
+    *pos += kb.len();
+    true
+}
+
+/// Parse a CAST target type: SMALLINT/INTEGER/INT/BIGINT (the integer
+/// family) or VARCHAR(n)/CHAR(n)/CHARACTER(n) (a text width). None for
+/// any other type - the CAST then falls back rather than convert wrong.
+fn parse_cast_target(b: &[char], pos: &mut usize) -> Option<CastTarget> {
+    skip_ws(b, pos);
+    let start = *pos;
+    while *pos < b.len() && (b[*pos].is_alphabetic() || b[*pos] == '_') {
+        *pos += 1;
+    }
+    let kw: String = b[start..*pos].iter().collect();
+    let ku = kw.to_ascii_uppercase();
+    if matches!(ku.as_str(), "SMALLINT" | "INTEGER" | "INT" | "BIGINT") {
+        return Some(CastTarget::Int);
+    }
+    let pad = match ku.as_str() {
+        "VARCHAR" => false,
+        "CHAR" | "CHARACTER" => true,
+        _ => return None,
+    };
+    // a required (n) width
+    skip_ws(b, pos);
+    if b.get(*pos) != Some(&'(') {
+        return None;
+    }
+    *pos += 1;
+    skip_ws(b, pos);
+    let ds = *pos;
+    while *pos < b.len() && b[*pos].is_ascii_digit() {
+        *pos += 1;
+    }
+    let len: usize = b[ds..*pos].iter().collect::<String>().parse().ok()?;
+    skip_ws(b, pos);
+    if b.get(*pos) != Some(&')') {
+        return None;
+    }
+    *pos += 1;
+    Some(CastTarget::Text { len, pad })
 }
 
 /// Resolve a raw expression's column names to field ids against the
@@ -4466,6 +4577,7 @@ fn resolve_expr(
             Box::new(resolve_expr(a, columns, descs)?),
             Box::new(resolve_expr(b, columns, descs)?),
         ),
+        RawExpr::Cast(e, t) => Expr::Cast(Box::new(resolve_expr(e, columns, descs)?), *t),
     })
 }
 
@@ -4485,6 +4597,8 @@ enum Expr {
     Bin(Box<Expr>, ArithOp, Box<Expr>),
     /// `a || b` - both operands coerced to text, NULL-propagating
     Concat(Box<Expr>, Box<Expr>),
+    /// `CAST(a AS <type>)` - convert the operand to the target type
+    Cast(Box<Expr>, CastTarget),
 }
 
 #[derive(Clone, Copy)]
@@ -4497,11 +4611,19 @@ enum ArithOp {
     Div,
 }
 
-/// A per-row evaluation failure - only integer divide-by-zero today.
-/// Carries no payload; the fetch path maps it to the engine's own
-/// status vector (`isc_arith_except` / `isc_exception_integer_divide_by_zero`).
-#[derive(Debug)]
-struct EvalErr;
+/// A per-row evaluation failure. The fetch path maps each to the engine's
+/// own status vector, so a client raises the same SQL error the real
+/// server would.
+#[derive(Debug, Clone, Copy)]
+enum EvalErr {
+    /// integer divide by zero: `isc_arith_except` /
+    /// `isc_exception_integer_divide_by_zero`
+    DivideByZero,
+    /// a CAST that cannot convert - a non-numeric string to an integer, or
+    /// a value too long for the target text width: `isc_convert_error`
+    /// (SQLSTATE 22018)
+    ConversionError,
+}
 
 /// What an expression's result is typed as - which drives its wire form
 /// (BIGINT for integer arithmetic, VARCHAR for a string literal).
@@ -4550,6 +4672,15 @@ impl Expr {
                 b.type_of(descs)?;
                 Some(ExprType::Text)
             }
+            Expr::Cast(e, t) => {
+                // the operand must be typeable; the result type is the
+                // cast target
+                e.type_of(descs)?;
+                Some(match t {
+                    CastTarget::Int => ExprType::Int,
+                    CastTarget::Text { .. } => ExprType::Text,
+                })
+            }
         }
     }
 
@@ -4577,7 +4708,7 @@ impl Expr {
                     // the arithmetic exception, not a wrong answer
                     ArithOp::Div => match x.checked_div(y) {
                         Some(q) => q,
-                        None => return Err(EvalErr),
+                        None => return Err(EvalErr::DivideByZero),
                     },
                 }),
                 _ => Value::Null, // any NULL operand -> NULL
@@ -4586,6 +4717,43 @@ impl Expr {
                 (Value::Null, _) | (_, Value::Null) => Value::Null,
                 (x, y) => Value::Text(format!("{}{}", x.render(), y.render())),
             },
+            Expr::Cast(e, t) => {
+                let v = e.eval(values)?;
+                if matches!(v, Value::Null) {
+                    return Ok(Value::Null); // NULL casts to NULL of any type
+                }
+                match t {
+                    // to the integer family: an integer is kept, a string
+                    // is trimmed and parsed (a non-numeric string is the
+                    // conversion error the engine raises)
+                    CastTarget::Int => match v {
+                        Value::Int(n) => Value::Int(n),
+                        Value::Text(s) => match s.trim().parse::<i64>() {
+                            Ok(n) => Value::Int(n),
+                            Err(_) => return Err(EvalErr::ConversionError),
+                        },
+                        _ => return Err(EvalErr::ConversionError),
+                    },
+                    // to a text width: render the value, refuse if it does
+                    // not fit (the engine's convert error), pad for CHAR
+                    CastTarget::Text { len, pad } => {
+                        let s = v.render();
+                        if s.chars().count() > *len {
+                            return Err(EvalErr::ConversionError);
+                        }
+                        let out = if *pad {
+                            let mut s = s;
+                            while s.chars().count() < *len {
+                                s.push(' ');
+                            }
+                            s
+                        } else {
+                            s
+                        };
+                        Value::Text(out)
+                    }
+                }
+            }
         })
     }
 }
@@ -4825,15 +4993,30 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
 /// <alias>`. Only the explicit `AS` form is recognised (an implicit
 /// trailing alias is ambiguous with the expression itself). The search
 /// runs on a literal-masked copy so an `AS` inside a string does not
-/// match.
+/// match, and only a *top-level* `AS` counts - one inside parentheses is
+/// part of the expression (`CAST(A AS INT)`), not an alias marker.
 fn split_alias(item: &str) -> (&str, Option<&str>) {
     let masked = mask_literals(&item.to_ascii_uppercase());
-    if let Some(pos) = find_word(&masked, "AS", 0) {
-        let body = &item[..pos];
-        let alias = item[pos + "AS".len()..].trim();
-        if !alias.is_empty() {
-            return (body, Some(alias));
+    let b = masked.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'A' if depth == 0
+                && b.get(i + 1) == Some(&b'S')
+                && (i == 0 || !is_ident_byte(b[i - 1]))
+                && b.get(i + 2).map_or(true, |c| !is_ident_byte(*c)) =>
+            {
+                let alias = item[i + 2..].trim();
+                if !alias.is_empty() {
+                    return (&item[..i], Some(alias));
+                }
+            }
+            _ => {}
         }
+        i += 1;
     }
     (item, None)
 }
@@ -4849,6 +5032,7 @@ fn default_expr_name(raw: &RawExpr) -> String {
         RawExpr::Bin(_, ArithOp::Mul, _) => "MULTIPLY",
         RawExpr::Bin(_, ArithOp::Div, _) => "DIVIDE",
         RawExpr::Concat(_, _) => "CONCATENATION",
+        RawExpr::Cast(_, _) => "CAST",
         // the engine leaves a unary-minus column unnamed (blank header)
         RawExpr::Neg(_) => "",
         RawExpr::Int(_) | RawExpr::Str(_) | RawExpr::Null => "CONSTANT",
@@ -8332,6 +8516,33 @@ mod tests {
         assert!(matches!(ev_null("A + B"), Value::Null));
         assert!(matches!(ev_null("A / B"), Value::Null));
         assert!(matches!(ev_null("A || B"), Value::Null));
+        // CAST: int->text renders, text->int parses, int width change keeps
+        assert!(matches!(ev("CAST(A AS VARCHAR(5))"), Value::Text(ref s) if s == "10"));
+        assert!(matches!(ev("CAST(A AS BIGINT)"), Value::Int(10)));
+        assert!(matches!(ev("CAST(A + 1 AS VARCHAR(5))"), Value::Text(ref s) if s == "11"));
+        assert!(matches!(ev("CAST('100' AS INTEGER)"), Value::Int(100)));
+        assert!(matches!(ev("CAST(' 55 ' AS INTEGER)"), Value::Int(55)));
+        // CHAR pads to width, VARCHAR does not
+        assert!(matches!(ev("CAST(A AS CHAR(4))"), Value::Text(ref s) if s == "10  "));
+        assert!(matches!(ev("CAST(A AS VARCHAR(4))"), Value::Text(ref s) if s == "10"));
+        // a non-numeric string to an integer is the conversion error
+        {
+            let raw = parse_raw_expr("CAST(NAME AS INTEGER)").unwrap();
+            assert!(matches!(
+                resolve_expr(&raw, &columns, &descs).unwrap().eval(&row),
+                Err(EvalErr::ConversionError)
+            ));
+        }
+        // a value too long for the target text width is also the conversion error
+        {
+            let raw = parse_raw_expr("CAST(A AS VARCHAR(1))").unwrap();
+            assert!(matches!(
+                resolve_expr(&raw, &columns, &descs).unwrap().eval(&row),
+                Err(EvalErr::ConversionError)
+            ));
+        }
+        // NULL casts to NULL
+        assert!(matches!(ev_null("CAST(A AS VARCHAR(5))"), Value::Null));
         // a bare column is NOT an expression (the column path handles it)
         assert!(parse_raw_expr("A").is_none());
         // arithmetic over a text column does not type-check
@@ -8347,6 +8558,10 @@ mod tests {
         assert_eq!(
             default_expr_name(&parse_raw_expr("A || B").unwrap()),
             "CONCATENATION"
+        );
+        assert_eq!(
+            default_expr_name(&parse_raw_expr("CAST(A AS INTEGER)").unwrap()),
+            "CAST"
         );
     }
 
@@ -8367,6 +8582,10 @@ mod tests {
         assert_eq!(cols("A + B AS TOTAL"), vec!["expr:TOTAL"]);
         // commas inside parens are not item separators
         assert_eq!(cols("A, (B - 1)"), vec!["col:A", "expr:SUBTRACT"]);
+        // the `AS` inside a CAST is part of the expression, not an alias;
+        // only a top-level `AS` renames
+        assert_eq!(cols("CAST(A AS VARCHAR(20))"), vec!["expr:CAST"]);
+        assert_eq!(cols("CAST(A AS INTEGER) AS X"), vec!["expr:X"]);
     }
 
     #[test]

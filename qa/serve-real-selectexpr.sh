@@ -155,17 +155,30 @@ compare "concat coerces int" "SELECT A || 'n' FROM E WHERE ID = 1"
 compare "concat chains left" "SELECT 'a' || 'b' || 'c' FROM E WHERE ID = 1"
 compare "concat NULL"       "SELECT S || NULL FROM E WHERE ID = 1"
 
-# --- divide by zero: BOTH the engine and fire-crab reject the row with
-#     the arithmetic exception (SQLSTATE 22012), rather than answering.
-#     A constant divisor and a per-row column expression are both tried.
-errck() { # <label> <select>
+# --- CAST(x AS type): integer family and text width, over int/text -----
+compare "cast int to varchar" "SELECT CAST(A AS VARCHAR(20)) FROM E WHERE ID = 1"
+compare "cast int to char"    "SELECT CAST(A AS CHAR(5)) FROM E WHERE ID = 1"
+compare "cast string to int"  "SELECT CAST('100' AS INTEGER) FROM E WHERE ID = 1"
+compare "cast trims to int"   "SELECT CAST(' 55 ' AS INTEGER) FROM E WHERE ID = 1"
+compare "cast to bigint"      "SELECT CAST(A AS BIGINT) FROM E WHERE ID = 1"
+compare "cast to smallint"    "SELECT CAST(A AS SMALLINT) FROM E WHERE ID = 2"
+compare "cast negative"       "SELECT CAST(A AS VARCHAR(10)) FROM E WHERE ID = 4"
+compare "cast of expr"        "SELECT CAST(A + B AS VARCHAR(10)) FROM E WHERE ID = 1"
+compare "cast then concat"    "SELECT CAST(A AS VARCHAR(4)) || '!' FROM E WHERE ID = 1"
+compare "cast NULL"           "SELECT CAST(A AS VARCHAR(5)) FROM E WHERE ID = 3"
+compare "cast aliased"        "SELECT CAST(A AS INTEGER) AS X FROM E WHERE ID = 1"
+
+# --- runtime errors: BOTH the engine and fire-crab reject the row rather
+#     than answering. Divide-by-zero is the arithmetic exception (SQLSTATE
+#     22012); a bad or too-long CAST is the conversion error (22018).
+errck() { # <label> <select> <isql-error-pattern>
     fc=$(node_run "$2")
     is=$("$ISQL" -q -b -user "$U" -pas "$P" "$WORK" 2>&1 <<EOF
 $2;
 EOF
 )
     if printf '%s' "$fc" | grep -qi "ERR" \
-       && printf '%s' "$is" | grep -qi "divide by zero"; then
+       && printf '%s' "$is" | grep -qi "$3"; then
         echo "OK   $1 (both reject)"
     else
         echo "DIFF $1"
@@ -174,7 +187,9 @@ EOF
         fail=1
     fi
 }
-errck "divide by zero literal" "SELECT A / 0 FROM E WHERE ID = 1"
-errck "divide by zero column"  "SELECT A / (B - B) FROM E WHERE ID = 1"
+errck "divide by zero literal" "SELECT A / 0 FROM E WHERE ID = 1"          "divide by zero"
+errck "divide by zero column"  "SELECT A / (B - B) FROM E WHERE ID = 1"    "divide by zero"
+errck "cast bad string"        "SELECT CAST(S AS INTEGER) FROM E WHERE ID = 1"   "conversion error"
+errck "cast too long"          "SELECT CAST(A AS VARCHAR(1)) FROM E WHERE ID = 1" "conversion error"
 
 exit $fail
