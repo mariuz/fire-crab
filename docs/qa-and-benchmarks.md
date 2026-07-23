@@ -1663,6 +1663,50 @@ operator precedence, the default `MULTIPLY`/`DIVIDE` header, and NULL
 propagation. The groupby, having, join, where-predicate and wire-types
 gates all still match the engine.
 
+### The forty-fifth differential — decimal literals, and a `.` the projection splitter misread
+
+Numeric arithmetic worked over columns and integer literals, but not over
+a *decimal* literal: `N + 1.5` fell back, because the expression parser
+read only integer literals. This slice adds them, and closes the last
+loose end in the select-list arithmetic surface.
+
+The literal's scale is, again, the engine's to define — and it is the
+count of fractional digits *as written*, trailing zeros included. `1.5`
+is scale 1, `1.50` is scale 2 (they are genuinely different types:
+`N + 1.5` and `N + 1.50` both yield `14.00` here, but only because the
+finer scale wins and `N` is already scale 2). `100.0` is scale 1,
+`0.001` scale 3. The literal is parsed into a raw integer (the digits
+with the point removed) and that negative scale, then flows into the
+numeric machinery from the previous slice unchanged — `N * 1.5` widens to
+scale 3 (`18.750`), `1.5 * 2` stays scale 1 (`3.0`), `1.5 + 2.25` takes
+the finer scale 2 (`3.75`).
+
+The decimal point also exposed a latent bug in the projection splitter.
+It decided whether a select item was a qualified column `T.C` by asking
+whether the item contained a `.` at all — so `N + 1.5` looked like a
+qualified column, split into the nonsense qualifier `N + 1`, and the
+whole projection was rejected. The test now is whether the item actually
+*is* a qualified identifier: a dotted pair whose halves are identifiers
+and whose qualifier begins like one (a letter, `_`, or `$`), so a
+decimal literal — whose "qualifier" would start with a digit — is not
+mistaken for one, and an arithmetic expression that merely contains a
+decimal literal falls through to expression parsing. A real qualified
+column, the join projection's `E.ID`, still parses as it did.
+
+`qa/serve-real-selectexpr.sh` grows from sixty-five checks to seventy-two:
+seven decimal-literal checks — addition, the trailing-zero scale, a
+multiply, a divide, two literals combined, a literal against an integer,
+and a bare literal — all matching the engine. The join, groupby, having,
+outer-join and where-predicate gates, whose projections run through the
+tightened qualified-column test, still match the engine verbatim. This
+completes the select-list expression surface begun four slices ago
+(`/` and `||`, then `CAST`, then numeric operands, then numeric
+arithmetic): the arithmetic and string operators, casts, and the full
+integer/numeric operand and literal set now all evaluate against real
+rows and are checked value- and scale-for-scale against the engine. The
+one piece still explicitly deferred is a numeric result wide enough to
+need an `INT128` wire form.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
