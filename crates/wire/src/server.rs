@@ -661,6 +661,13 @@ impl ProjCol {
 /// `WHERE right.col IS NULL` the classic anti-join).
 enum Plan {
     Scalar(Option<i64>),
+    /// `SELECT GEN_ID(<name>, <step>)` with a non-zero step, or `NEXT VALUE
+    /// FOR <seq>` (step = the sequence's increment): a SELECT that WRITES.
+    /// At op_execute it reads the generator, adds the step, writes the new
+    /// value back, and becomes a `Scalar` of that new value for the fetch.
+    /// `step` is `None` for `NEXT VALUE FOR` (use the generator's own
+    /// increment) or `Some(n)` for an explicit `GEN_ID` step.
+    GenIdIncrement { name: String, step: Option<i64> },
     /// A query over a MON$ virtual table, which fire-crab reports as
     /// empty: one row of `ncols` NULL columns (an aggregate over no
     /// rows). Used for the firebird-qa bootstrap's architecture probe.
@@ -3100,11 +3107,19 @@ fn plan_query_inner(
         && order_s.is_none()
     {
         if let Some((gen_name, step)) = parse_gen_id_query(proj_s, table_s) {
-            if step == 0 {
-                if let Some(db) = db.as_ref() {
-                    let v = read_generator_value(db, &gen_name);
-                    return Some(Plan::Scalar(v));
+            if db.as_ref().is_some() {
+                // step 0 is a pure read (answered now); a non-zero step
+                // increments the generator - a WRITE deferred to execute
+                if step == 0 {
+                    return Some(Plan::Scalar(read_generator_value(db.as_ref()?, &gen_name)));
                 }
+                return Some(Plan::GenIdIncrement { name: gen_name, step: Some(step) });
+            }
+        }
+        // `NEXT VALUE FOR <seq>` bumps the sequence by its own increment
+        if db.as_ref().is_some() {
+            if let Some(seq) = parse_next_value(proj_s, table_s) {
+                return Some(Plan::GenIdIncrement { name: seq, step: None });
             }
         }
     }
@@ -3810,7 +3825,7 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Vec<Value> {
 /// columns for `Project`, the output columns for `Group`.
 fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
     match plan {
-        Plan::Scalar(_) => describe_one_bigint(params),
+        Plan::Scalar(_) | Plan::GenIdIncrement { .. } => describe_one_bigint(params),
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableDrop { .. }
         | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } => {
@@ -3831,6 +3846,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
 fn stmt_type_of(plan: &Plan) -> i32 {
     match plan {
         Plan::Scalar(_)
+        | Plan::GenIdIncrement { .. }
         | Plan::Project { .. }
         | Plan::Join { .. }
         | Plan::Group { .. }
@@ -3867,7 +3883,7 @@ fn output_cols_of(plan: &Plan) -> Vec<ProjCol> {
         Plan::Project { cols, .. } | Plan::Join { cols, .. } | Plan::Group { cols, .. } => {
             cols.clone()
         }
-        Plan::Scalar(_) => vec![ProjCol {
+        Plan::Scalar(_) | Plan::GenIdIncrement { .. } => vec![ProjCol {
             name: "CONSTANT".into(),
             field_id: 0,
             wire: Wire::Int64,
@@ -3949,6 +3965,7 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
     let has_cursor = matches!(
         plan,
         Plan::Scalar(_)
+            | Plan::GenIdIncrement { .. }
             | Plan::Project { .. }
             | Plan::Join { .. }
             | Plan::Group { .. }
@@ -4016,6 +4033,7 @@ fn answer_info_sql(items: &[u8], plan: &Plan, last_dml: (i32, i32, i32)) -> Vec<
     let has_cursor = matches!(
         plan,
         Plan::Scalar(_)
+            | Plan::GenIdIncrement { .. }
             | Plan::Project { .. }
             | Plan::Join { .. }
             | Plan::Group { .. }
@@ -4137,12 +4155,14 @@ fn emit_rows_inner(
     args: &[WireParam],
 ) -> Result<(), EmitErr> {
     match plan {
-        // DML, DDL and generator writes have no cursor: terminator only
+        // DML, DDL and generator writes have no cursor: terminator only.
+        // GenIdIncrement is replaced by a Scalar at op_execute, so it never
+        // reaches fetch as itself; the arm keeps the match exhaustive.
         Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
         | Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableDrop { .. }
         | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. }
-        | Plan::SetGenerator { .. } => {}
+        | Plan::GenIdIncrement { .. } | Plan::SetGenerator { .. } => {}
         Plan::Scalar(v) => {
             w.int(OP_FETCH_RESPONSE).int(0).int(1);
             match v {
@@ -4477,6 +4497,31 @@ fn parse_gen_id_query(proj_s: &str, table_s: &str) -> Option<(String, i64)> {
         return None;
     }
     Some((name, step))
+}
+
+/// Recognise `SELECT NEXT VALUE FOR <seq> FROM [SYSTEM.]RDB$DATABASE` and
+/// return the bare sequence name. `NEXT VALUE FOR` is `GEN_ID(seq, <the
+/// sequence's own increment>)` - the increment is read at execute.
+fn parse_next_value(proj_s: &str, table_s: &str) -> Option<String> {
+    let up = table_s.trim().to_ascii_uppercase().replace('"', "");
+    let bare = up.strip_prefix("SYSTEM.").unwrap_or(&up).trim();
+    if bare != "RDB$DATABASE" {
+        return None;
+    }
+    let toks: Vec<&str> = proj_s.split_whitespace().collect();
+    if toks.len() != 4
+        || !toks[0].eq_ignore_ascii_case("NEXT")
+        || !toks[1].eq_ignore_ascii_case("VALUE")
+        || !toks[2].eq_ignore_ascii_case("FOR")
+    {
+        return None;
+    }
+    let name = strip_gen_name(toks[3]);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
 }
 
 /// Reduce a possibly schema/package-qualified, possibly quoted generator
@@ -6671,6 +6716,25 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
                     }
+                } else if matches!(plan, Plan::GenIdIncrement { .. }) {
+                    // a generator-incrementing SELECT writes HERE, then
+                    // becomes the Scalar of its new value for the fetch
+                    let (name, step) = match &plan {
+                        Plan::GenIdIncrement { name, step } => (name.clone(), *step),
+                        _ => unreachable!(),
+                    };
+                    match gen_id_increment(&mut database, &name, step) {
+                        Ok(new_val) => {
+                            plan = Plan::Scalar(Some(new_val));
+                            respond(&mut s, &mut enc, TX_HANDLE)?;
+                        }
+                        Err(e) => {
+                            if std::env::var("FC_SRV_TRACE").is_ok() {
+                                eprintln!("[srv] gen_id increment failed: {}", e);
+                            }
+                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                        }
+                    }
                 } else if let Err(e) = validate_select_bind(&plan, &bound_args) {
                     // a parameterised SELECT whose values cannot bind
                     // (type mismatch) fails HERE, visibly - never an
@@ -7766,6 +7830,26 @@ fn write_generator_value(
         .ok_or("generator page not allocated")?;
     bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
     Ok(())
+}
+
+/// Increment a generator by `step` (or, for `NEXT VALUE FOR`, by its own
+/// declared increment when `step` is `None`), persist the new value, and
+/// return it - what `GEN_ID(name, n)`/`NEXT VALUE FOR` yields. Runs at
+/// op_execute, the one place a SELECT is allowed to write.
+fn gen_id_increment(
+    database: &mut Option<Database>,
+    name: &str,
+    step: Option<i64>,
+) -> Result<i64, String> {
+    let db = database.as_mut().ok_or("no database attached")?;
+    let (id, incr) = generator_info(db, name).ok_or("no such generator")?;
+    let current = read_generator_value(db, name).unwrap_or(0);
+    let new_val = current.wrapping_add(step.unwrap_or(incr));
+    let mut work = db.bytes.clone();
+    write_generator_value(&mut work, db.page_size, id, new_val)?;
+    db.bytes = work;
+    std::fs::write(&db.path, &db.bytes).map_err(|e| e.to_string())?;
+    Ok(new_val)
 }
 
 /// blr_gen_id / `GEN_ID(name, 0)` reads a generator's current value. The
@@ -9276,6 +9360,23 @@ mod tests {
             parse_gen_id_query("GEN_ID(SEQ_A, 0) + 1", "RDB$DATABASE"),
             None
         );
+    }
+
+    #[test]
+    fn parses_next_value_for() {
+        assert_eq!(
+            parse_next_value("NEXT VALUE FOR SEQ5", "RDB$DATABASE"),
+            Some("SEQ5".to_string())
+        );
+        // case-insensitive, schema-qualified name reduced to the bare name
+        assert_eq!(
+            parse_next_value("next value for PUBLIC.MYSEQ", "SYSTEM.RDB$DATABASE"),
+            Some("MYSEQ".to_string())
+        );
+        // not a NEXT VALUE FOR, or over a real table
+        assert_eq!(parse_next_value("A + B", "RDB$DATABASE"), None);
+        assert_eq!(parse_next_value("NEXT VALUE FOR SEQ5", "EMP"), None);
+        assert_eq!(parse_next_value("NEXT VALUE FOR", "RDB$DATABASE"), None);
     }
 
     #[test]
