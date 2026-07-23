@@ -275,6 +275,294 @@ fn next_domain_number(file: &[u8], page_size: usize) -> Result<u64, String> {
     Ok(max + 1)
 }
 
+/// Write a format descriptor blob (makeFormat): one segment of
+/// `[u16 count][count x 12B packed descriptors][u16 0 defaults]`. Stored
+/// in `RDB$FORMATS.RDB$DESCRIPTOR`; the engine reads it to lay out records
+/// of that format version.
+fn write_format_blob(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    descs: &[Descriptor],
+) -> Result<u64, String> {
+    let mut fmt_payload = Vec::with_capacity(2 + descs.len() * 12 + 2);
+    fmt_payload.extend_from_slice(&(descs.len() as u16).to_le_bytes());
+    for d in descs {
+        fmt_payload.push(d.dtype);
+        fmt_payload.push(d.scale as u8);
+        fmt_payload.extend_from_slice(&d.length.to_le_bytes());
+        fmt_payload.extend_from_slice(&(d.sub_type as u16).to_le_bytes());
+        fmt_payload.extend_from_slice(&d.flags.to_le_bytes());
+        fmt_payload.extend_from_slice(&d.offset.to_le_bytes());
+    }
+    fmt_payload.extend_from_slice(&0u16.to_le_bytes());
+    dml::insert_blob(file, page_size, 8, &[fmt_payload], 6)
+}
+
+/// Locate the `RDB$RELATIONS` primary row for `table`: its data page,
+/// slot, current record image, and record format number - what an
+/// in-place catalog update (ALTER) needs to rewrite the row.
+fn find_relations_row(
+    file: &[u8],
+    page_size: usize,
+    table: &str,
+) -> Option<(u32, u16, Vec<u8>, u8)> {
+    let formats = system_relation_formats(file, page_size, "RDB$RELATIONS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let name_fid = relation_columns(file, page_size, "RDB$RELATIONS")
+        .iter()
+        .find(|c| c.name == "RDB$RELATION_NAME")
+        .map(|c| c.field_id as usize)?;
+    for dp_no in relation_data_pages(file, page_size, 6) {
+        let start = dp_no as usize * page_size;
+        let dp = file
+            .get(start..start + page_size)
+            .and_then(DataPage::decode)?;
+        for r in dp.records() {
+            if !r.is_primary_record() {
+                continue;
+            }
+            let Some(image) = r.image() else { continue };
+            let vals = decode_record(&image, descs);
+            if let Some(Value::Text(t)) = vals.get(name_fid) {
+                if t.trim_end().eq_ignore_ascii_case(table) {
+                    return Some((dp_no, r.slot, image, r.format));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Rebuild the `RDB$RUNTIME` field summary for a table from its current
+/// `RDB$RELATION_FIELDS` rows (the engine's DSQL layer resolves columns
+/// through this blob, so after an ALTER it must list every field). Each
+/// field contributes the same segment sequence `make_version` writes:
+/// id, name, source (as the quoted `"PUBLIC"."RDB$n"`), length, character
+/// length for text, position, and a not-null marker. `descs` is the new
+/// full format, indexed by field id, for lengths.
+fn rebuild_runtime_blob(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    descs: &[Descriptor],
+) -> Result<u64, String> {
+    use crate::format::dtype;
+    let formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")
+        .ok_or("no RDB$RELATION_FIELDS format")?;
+    let (_, rf_descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let cols = relation_columns(file, page_size, "RDB$RELATION_FIELDS");
+    let fid_of = |name: &str| cols.iter().find(|c| c.name == name).map(|c| c.field_id as usize);
+    let name_fid = fid_of("RDB$FIELD_NAME").ok_or("no RDB$FIELD_NAME")?;
+    let rel_fid = fid_of("RDB$RELATION_NAME").ok_or("no RDB$RELATION_NAME")?;
+    let id_fid = fid_of("RDB$FIELD_ID").ok_or("no RDB$FIELD_ID")?;
+    let src_fid = fid_of("RDB$FIELD_SOURCE").ok_or("no RDB$FIELD_SOURCE")?;
+    let pos_fid = fid_of("RDB$FIELD_POSITION").ok_or("no RDB$FIELD_POSITION")?;
+    let null_fid = fid_of("RDB$NULL_FLAG");
+
+    // collect (field_id, name, source, position, not_null), by field id
+    let text = |v: Option<&Value>| match v {
+        Some(Value::Text(t)) => Some(t.trim_end().to_string()),
+        _ => None,
+    };
+    let int = |v: Option<&Value>| match v {
+        Some(Value::Int(n)) => Some(*n),
+        _ => None,
+    };
+    let mut fields: Vec<(u16, String, String, u16, bool)> = Vec::new();
+    walk_rows(file, page_size, 5, rf_descs, |vals| {
+        if text(vals.get(rel_fid)).as_deref() != Some(table) {
+            return;
+        }
+        let (Some(name), Some(id), Some(src), Some(pos)) = (
+            text(vals.get(name_fid)),
+            int(vals.get(id_fid)),
+            text(vals.get(src_fid)),
+            int(vals.get(pos_fid)),
+        ) else {
+            return;
+        };
+        let not_null = null_fid.and_then(|f| int(vals.get(f))) == Some(1);
+        fields.push((id as u16, name, src, pos as u16, not_null));
+    });
+    fields.sort_by_key(|f| f.0);
+
+    let seg = |tag: u8, data: &[u8]| {
+        let mut s = Vec::with_capacity(1 + data.len());
+        s.push(tag);
+        s.extend_from_slice(data);
+        s
+    };
+    let mut runtime: Vec<Vec<u8>> = Vec::new();
+    for (id, name, src, pos, not_null) in &fields {
+        let d = descs.get(*id as usize).ok_or("field beyond format")?;
+        runtime.push(seg(0, &id.to_le_bytes())); // RSR_field_id
+        runtime.push(seg(1, name.as_bytes())); // RSR_field_name
+        let qsrc = format!("\"PUBLIC\".\"{}\"", src);
+        runtime.push(seg(25, qsrc.as_bytes())); // RSR_field_source
+        runtime.push(seg(19, &d.length.to_le_bytes())); // RSR_field_length
+        let char_len = match d.dtype {
+            dtype::VARYING => Some(d.length.saturating_sub(2)),
+            dtype::TEXT => Some(d.length),
+            _ => None,
+        };
+        if let Some(cl) = char_len {
+            runtime.push(seg(26, &cl.to_le_bytes())); // RSR_character_length
+        }
+        runtime.push(seg(27, &pos.to_le_bytes())); // RSR_field_pos
+        if *not_null {
+            runtime.push(seg(21, &NONNULL_BLR)); // RSR_field_not_null
+        }
+    }
+    dml::insert_blob(file, page_size, 6, &runtime, 5)
+}
+
+/// `ALTER TABLE <table> ADD <column>`: append one column to an existing
+/// table. The engine models this as a new *format version* - existing
+/// records keep their old format (and read the new column as NULL), new
+/// records use the new one. The sequence mirrors the tail of
+/// [create_table] for the single new field, plus a version rewrite of the
+/// `RDB$RELATIONS` row to bump its `RDB$FORMAT` and field count.
+pub fn alter_table_add_column(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    col: &ColumnDef,
+) -> Result<(), String> {
+    let table = table.trim().to_ascii_uppercase();
+    let rel = crate::resolve_relation(file, page_size, &table)
+        .ok_or_else(|| format!("table {} not found", table))?;
+
+    // existing columns: reject a duplicate name, find the next field id
+    let existing = relation_columns(file, page_size, &table);
+    if existing
+        .iter()
+        .any(|c| c.name.eq_ignore_ascii_case(&col.name))
+    {
+        return Err(format!("column {} already exists", col.name));
+    }
+    let new_fid = existing.iter().map(|c| c.field_id + 1).max().unwrap_or(0);
+
+    // the new full format: existing descriptors + the new field, offsets
+    // recomputed by the same ini.epp walk (append-stable, so the existing
+    // fields keep their offsets and the new one lands at the end)
+    let cur_formats = crate::relation_formats(file, page_size, rel);
+    let (_, cur_descs) = cur_formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .ok_or("relation has no format")?;
+    let mut fields: Vec<(u8, u16, i8, i16)> = cur_descs
+        .iter()
+        .map(|d| (d.dtype, d.length, d.scale, d.sub_type))
+        .collect();
+    fields.push((col.dtype, col.length, col.scale, col.sub_type));
+    let new_descs = compute_format(&fields);
+    if new_descs.len() != fields.len() {
+        return Err("format computation failed".into());
+    }
+
+    // locate the RDB$RELATIONS row and read its current format number
+    let (rel_page, rel_slot, mut rel_image, rec_format) =
+        find_relations_row(file, page_size, &table)
+            .ok_or("RDB$RELATIONS row not found")?;
+    let sys_formats =
+        system_relation_formats(file, page_size, "RDB$RELATIONS").ok_or("no RDB$RELATIONS format")?;
+    let (_, rel_descs) = sys_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let rel_cols = relation_columns(file, page_size, "RDB$RELATIONS");
+    let rel_field = |name: &str| -> Option<usize> {
+        rel_cols
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.field_id as usize)
+    };
+    let cur_vals = decode_record(&rel_image, rel_descs);
+    let cur_format_no = match cur_vals.get(rel_field("RDB$FORMAT").ok_or("no RDB$FORMAT")?) {
+        Some(Value::Int(n)) => *n,
+        _ => return Err("RDB$FORMAT unreadable".into()),
+    };
+    let new_format_no = cur_format_no + 1;
+
+    // --- write the new format version blob + RDB$FORMATS row ----------
+    let fmt_blob = write_format_blob(file, page_size, &new_descs)?;
+    sys_insert(
+        file,
+        page_size,
+        "RDB$FORMATS",
+        8,
+        &[
+            ("RDB$RELATION_ID", SysVal::I(rel as i64)),
+            ("RDB$FORMAT", SysVal::I(new_format_no)),
+            ("RDB$DESCRIPTOR", SysVal::B(blob_id_bytes(8, fmt_blob))),
+        ],
+    )?;
+
+    // --- the new column's domain, RDB$FIELDS and RDB$RELATION_FIELDS --
+    let domain_num = next_domain_number(file, page_size)?;
+    let dom = format!("RDB${}", domain_num);
+    let mut field_vals: Vec<(&str, SysVal<'_>)> = vec![
+        ("RDB$FIELD_NAME", SysVal::S(&dom)),
+        ("RDB$FIELD_TYPE", SysVal::I(col.field_type as i64)),
+        ("RDB$FIELD_LENGTH", SysVal::I(col.length as i64)),
+        ("RDB$FIELD_SCALE", SysVal::I(col.scale as i64)),
+        ("RDB$FIELD_SUB_TYPE", SysVal::I(col.sub_type as i64)),
+        ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+        ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+    ];
+    if let Some(cl) = col.char_len {
+        field_vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(0)));
+        field_vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(cl as i64)));
+        field_vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
+    }
+    sys_insert(file, page_size, "RDB$FIELDS", 2, &field_vals)?;
+
+    let mut rf_vals: Vec<(&str, SysVal<'_>)> = vec![
+        ("RDB$FIELD_NAME", SysVal::S(&col.name)),
+        ("RDB$RELATION_NAME", SysVal::S(&table)),
+        ("RDB$FIELD_SOURCE", SysVal::S(&dom)),
+        ("RDB$FIELD_POSITION", SysVal::I(new_fid as i64)),
+        ("RDB$UPDATE_FLAG", SysVal::I(1)),
+        ("RDB$FIELD_ID", SysVal::I(new_fid as i64)),
+        ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+        ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ("RDB$FIELD_SOURCE_SCHEMA_NAME", SysVal::S("PUBLIC")),
+    ];
+    if col.char_len.is_some() {
+        rf_vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
+    }
+    sys_insert(file, page_size, "RDB$RELATION_FIELDS", 5, &rf_vals)?;
+
+    // --- rebuild RDB$RUNTIME for all fields (incl. the new one, now in
+    // RDB$RELATION_FIELDS) so DSQL resolves the added column ------------
+    let runtime = rebuild_runtime_blob(file, page_size, &table, &new_descs)?;
+
+    // --- bump RDB$RELATIONS.RDB$FORMAT, RDB$FIELD_ID and RDB$RUNTIME in
+    // place (a version rewrite of the row) -----------------------------
+    let patch = |image: &mut [u8], name: &str, v: SysVal<'_>| -> Result<(), String> {
+        let fid = rel_field(name).ok_or_else(|| format!("no {} column", name))?;
+        let d = rel_descs.get(fid).ok_or("field beyond format")?;
+        let bytes = encode_sys_value(d, &v)?;
+        let at = d.offset as usize;
+        image
+            .get_mut(at..at + bytes.len())
+            .ok_or("image shorter than format")?
+            .copy_from_slice(&bytes);
+        image[fid / 8] &= !(1 << (fid % 8)); // clear NULL bit (already set)
+        Ok(())
+    };
+    patch(&mut rel_image, "RDB$FORMAT", SysVal::I(new_format_no))?;
+    patch(&mut rel_image, "RDB$FIELD_ID", SysVal::I((new_fid + 1) as i64))?;
+    patch(&mut rel_image, "RDB$RUNTIME", SysVal::B(blob_id_bytes(6, runtime)))?;
+    dml::update_records(
+        file,
+        page_size,
+        6,
+        &[(rel_page, rel_slot, rel_image)],
+        rec_format,
+    )?;
+
+    advance_oldest_transactions(file, page_size)?;
+    Ok(())
+}
+
 /// CREATE TABLE: the full engine sequence against the file image.
 /// Errors leave the caller's copy to be discarded - the statement
 /// failed, nothing half-created survives.
@@ -337,20 +625,8 @@ pub fn create_table(
         dml::put_u16(file, base + 18, 0); // irt_count
     }
 
-    // --- the format descriptor blob (makeFormat): one segment of
-    // [u16 count][count x 12B packed descriptors][u16 0 defaults] -----
-    let mut fmt_payload = Vec::with_capacity(2 + descs.len() * 12 + 2);
-    fmt_payload.extend_from_slice(&(descs.len() as u16).to_le_bytes());
-    for d in &descs {
-        fmt_payload.push(d.dtype);
-        fmt_payload.push(d.scale as u8);
-        fmt_payload.extend_from_slice(&d.length.to_le_bytes());
-        fmt_payload.extend_from_slice(&(d.sub_type as u16).to_le_bytes());
-        fmt_payload.extend_from_slice(&d.flags.to_le_bytes());
-        fmt_payload.extend_from_slice(&d.offset.to_le_bytes());
-    }
-    fmt_payload.extend_from_slice(&0u16.to_le_bytes());
-    let fmt_blob = dml::insert_blob(file, page_size, 8, &[fmt_payload], 6)?;
+    // --- the format descriptor blob (makeFormat) ---------------------
+    let fmt_blob = write_format_blob(file, page_size, &descs)?;
 
     // --- the RDB$RUNTIME field summary (make_version): per field the
     // probe-pinned tag sequence ------------------------------------------

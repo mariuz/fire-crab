@@ -122,11 +122,12 @@ case "$(node_run "CREATE TABLE TDDL (X INTEGER)")" in
     ERR*) echo "OK   duplicate table name refused" ;;
     *) echo "DIFF duplicate table name refused"; fail=1 ;;
 esac
-# CREATE INDEX and DROP TABLE are supported since serve-real-ddl2;
-# a genuinely unsupported verb must still raise a real SQL error
-case "$(node_run "ALTER TABLE TDDL ADD Q INTEGER")" in
-    ERR*) echo "OK   unsupported DDL verb raises an error" ;;
-    *) echo "DIFF unsupported DDL verb raises an error"; fail=1 ;;
+# CREATE INDEX, DROP TABLE and ALTER TABLE ADD are supported (ddl2 /
+# serve-real-alter); a genuinely unsupported form must still raise a real
+# SQL error - ALTER TABLE ... DROP <col> is not implemented yet
+case "$(node_run "ALTER TABLE TDDL DROP F")" in
+    ERR*) echo "OK   unsupported ALTER form raises an error" ;;
+    *) echo "DIFF unsupported ALTER form raises an error"; fail=1 ;;
 esac
 case "$(node_run "RECREATE TABLE TDDL (X INTEGER)")" in
     ERR*) echo "OK   unsupported RECREATE raises an error" ;;

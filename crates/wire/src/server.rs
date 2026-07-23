@@ -686,6 +686,13 @@ enum Plan {
     /// `DROP TABLE <name>`: catalog rows stubbed, RDB$PAGES rows wiped,
     /// every owned page released
     DropTable { name: String },
+    /// `ALTER TABLE <table> ADD <column>`: a new format version, the new
+    /// column's catalog rows, and a version rewrite of the RDB$RELATIONS
+    /// row bumping its format and field count
+    AlterTableAdd {
+        table: String,
+        col: fire_crab_ods::ddl::ColumnDef,
+    },
     /// `INSERT INTO <t> [(cols)] VALUES (...)`: the record image is
     /// built at prepare (nulls flagged, literal fields at their
     /// descriptor offsets); `param_fields` lists the (field id,
@@ -1447,6 +1454,36 @@ fn plan_drop_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     Some((Plan::DropTable { name: name.to_ascii_uppercase() }, Vec::new()))
 }
 
+/// Parse `ALTER TABLE <table> ADD <column def>` - append one nullable
+/// plain column. A NOT NULL or PRIMARY KEY on the added column is a
+/// constraint over the table's existing rows and is left for later
+/// (returns None, so the statement errors rather than half-applying).
+fn plan_alter_table_add(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "ALTER", 0) != Some(0) {
+        return None;
+    }
+    let table_kw = find_word(&masked, "TABLE", "ALTER".len())?;
+    if masked[..table_kw].trim() != "ALTER" {
+        return None;
+    }
+    let add_kw = find_word(&masked, "ADD", table_kw + "TABLE".len())?;
+    let table = s[table_kw + "TABLE".len()..add_kw].trim().trim_matches('"');
+    if !ident_ok(table) {
+        return None;
+    }
+    let (col, is_pk) = parse_column_def(&s[add_kw + "ADD".len()..])?;
+    if is_pk || col.not_null {
+        return None;
+    }
+    Some((
+        Plan::AlterTableAdd { table: table.to_ascii_uppercase(), col },
+        Vec::new(),
+    ))
+}
+
 /// Strip a SQL identifier's optional double quotes. A quoted identifier
 /// keeps its case (and `""` is an escaped quote); an unquoted one is
 /// returned as written (the catalog stores it upper-cased, and generator
@@ -2201,6 +2238,10 @@ fn execute_dml(
         }
         Plan::DropTable { name } => {
             fire_crab_ods::ddl::drop_table(&mut work, db.page_size, name)?;
+            (0, 0, 0)
+        }
+        Plan::AlterTableAdd { table, col } => {
+            fire_crab_ods::ddl::alter_table_add_column(&mut work, db.page_size, table, col)?;
             (0, 0, 0)
         }
         Plan::Insert { rel, format_no, image, descs, index_ops, param_fields, not_null } => {
@@ -3602,7 +3643,8 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Vec<Value> {
 fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
     match plan {
         Plan::Scalar(_) => describe_one_bigint(params),
-        Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. } => {
+        Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
+        | Plan::AlterTableAdd { .. } => {
             describe_dml(5, params) // isc_info_sql_stmt_ddl
         }
         Plan::Insert { .. } => describe_dml(2, params), // isc_info_sql_stmt_insert
@@ -3627,7 +3669,8 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         Plan::Insert { .. } => 2,
         Plan::Update { .. } => 3,
         Plan::Delete { .. } => 4,
-        Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. } => 5,
+        Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
+        | Plan::AlterTableAdd { .. } => 5,
         Plan::SetGenerator { stmt_type, .. } => *stmt_type,
     }
 }
@@ -3927,7 +3970,7 @@ fn emit_rows_inner(
         // DML, DDL and generator writes have no cursor: terminator only
         Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
         | Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
-        | Plan::SetGenerator { .. } => {}
+        | Plan::AlterTableAdd { .. } | Plan::SetGenerator { .. } => {}
         Plan::Scalar(v) => {
             w.int(OP_FETCH_RESPONSE).int(0).int(1);
             match v {
@@ -6188,6 +6231,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         plan_create_table(&text)
                             .or_else(|| plan_create_index(&text))
                             .or_else(|| plan_drop_table(&text))
+                            .or_else(|| plan_alter_table_add(&text))
                             .or_else(|| plan_alter_sequence(&text))
                     } else if dml_kw {
                         plan_insert(&text, &database)
@@ -6321,6 +6365,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     let planned = plan_create_table(&stmt_sql)
                         .or_else(|| plan_create_index(&stmt_sql))
                         .or_else(|| plan_drop_table(&stmt_sql))
+                        .or_else(|| plan_alter_table_add(&stmt_sql))
                         .or_else(|| plan_alter_sequence(&stmt_sql));
                     match planned {
                         Some((p, ps)) => {
@@ -6420,6 +6465,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::CreateTable { .. }
                         | Plan::CreateIndex { .. }
                         | Plan::DropTable { .. }
+                        | Plan::AlterTableAdd { .. }
                         | Plan::SetGenerator { .. }
                 ) {
                     // DML and DDL execute here (not at fetch): write the
