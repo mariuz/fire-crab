@@ -701,6 +701,14 @@ enum Plan {
         table: String,
         col: fire_crab_ods::ddl::ColumnDef,
     },
+    /// `ALTER TABLE <table> ADD [CONSTRAINT <name>] FOREIGN KEY (...)
+    /// REFERENCES ...`: add a foreign key to an existing table - the FK
+    /// index built and backfilled over committed rows, the constraint
+    /// catalog rows written
+    AlterTableAddFk {
+        table: String,
+        fk: fire_crab_ods::ddl::ForeignKeyDef,
+    },
     /// `ALTER TABLE <table> DROP <column>`: a new format version with the
     /// dropped field as a placeholder, the column's catalog rows deleted,
     /// RDB$RUNTIME rebuilt, RDB$RELATIONS format bumped
@@ -1582,6 +1590,14 @@ fn plan_alter_table_add(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let table = s[table_kw + "TABLE".len()..add_kw].trim().trim_matches('"');
     if !ident_ok(table) {
         return None;
+    }
+    let tail = s[add_kw + "ADD".len()..].trim();
+    // ADD [CONSTRAINT <name>] FOREIGN KEY (...) REFERENCES ...
+    if let Some(fk) = parse_fk_clause(&tail.to_ascii_uppercase()) {
+        return Some((
+            Plan::AlterTableAddFk { table: table.to_ascii_uppercase(), fk },
+            Vec::new(),
+        ));
     }
     let (col, is_pk) = parse_column_def(&s[add_kw + "ADD".len()..])?;
     if is_pk || col.not_null {
@@ -2525,6 +2541,10 @@ fn execute_dml(
         }
         Plan::AlterTableAdd { table, col } => {
             fire_crab_ods::ddl::alter_table_add_column(&mut work, db.page_size, table, col)?;
+            (0, 0, 0)
+        }
+        Plan::AlterTableAddFk { table, fk } => {
+            fire_crab_ods::ddl::alter_table_add_foreign_key(&mut work, db.page_size, table, fk)?;
             (0, 0, 0)
         }
         Plan::AlterTableDrop { table, column } => {
@@ -4005,7 +4025,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
     match plan {
         Plan::Scalar(_) | Plan::GenIdIncrement { .. } => describe_one_bigint(params),
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
-        | Plan::AlterTableAdd { .. } | Plan::AlterTableDrop { .. }
+        | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. } | Plan::AlterTableDrop { .. }
         | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } => {
             describe_dml(5, params) // isc_info_sql_stmt_ddl
         }
@@ -4033,7 +4053,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         Plan::Update { .. } => 3,
         Plan::Delete { .. } => 4,
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
-        | Plan::AlterTableAdd { .. } | Plan::AlterTableDrop { .. }
+        | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. } | Plan::AlterTableDrop { .. }
         | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } => 5,
         Plan::SetGenerator { stmt_type, .. } => *stmt_type,
     }
@@ -4348,7 +4368,7 @@ fn emit_rows_inner(
         // reaches fetch as itself; the arm keeps the match exhaustive.
         Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
         | Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
-        | Plan::AlterTableAdd { .. } | Plan::AlterTableDrop { .. }
+        | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. } | Plan::AlterTableDrop { .. }
         | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. }
         | Plan::GenIdIncrement { .. } | Plan::SetGenerator { .. } => {}
         Plan::Scalar(v) => {
@@ -7006,6 +7026,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::CreateIndex { .. }
                         | Plan::DropTable { .. }
                         | Plan::AlterTableAdd { .. }
+                        | Plan::AlterTableAddFk { .. }
                         | Plan::AlterTableDrop { .. }
                         | Plan::AlterColumnType { .. }
                         | Plan::AlterColumnNull { .. }
@@ -9797,6 +9818,29 @@ mod tests {
         // a plain column definition and a PRIMARY KEY clause are not FKs
         assert!(parse_fk_clause("PID INTEGER").is_none());
         assert!(parse_fk_clause("PRIMARY KEY (ID)").is_none());
+    }
+
+    #[test]
+    fn plan_alter_table_add_recognises_a_foreign_key() {
+        // ADD CONSTRAINT ... FOREIGN KEY routes to AlterTableAddFk, not a
+        // column add
+        match plan_alter_table_add(
+            "ALTER TABLE C ADD CONSTRAINT FK_C_P FOREIGN KEY (PID) REFERENCES P (PID)",
+        ) {
+            Some((Plan::AlterTableAddFk { table, fk }, ps)) => {
+                assert_eq!(table, "C");
+                assert_eq!(fk.name, "FK_C_P");
+                assert_eq!(fk.columns, vec!["PID".to_string()]);
+                assert_eq!(fk.ref_table, "P");
+                assert!(ps.is_empty());
+            }
+            other => panic!("expected AlterTableAddFk, got {:?}", other.is_some()),
+        }
+        // a plain column add is still a column add
+        assert!(matches!(
+            plan_alter_table_add("ALTER TABLE C ADD NOTE VARCHAR(10)"),
+            Some((Plan::AlterTableAdd { .. }, _))
+        ));
     }
 
     #[test]

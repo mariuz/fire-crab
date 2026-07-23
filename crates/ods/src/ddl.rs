@@ -1464,33 +1464,83 @@ pub fn create_table(
         } else {
             fk.name.clone()
         };
-        let (uq_constraint, partner_index) =
-            find_primary_key(file, page_size, &fk.ref_table).ok_or_else(|| {
-                format!("referenced table {} has no primary key", fk.ref_table)
-            })?;
-        create_index(
-            file, page_size, &name, &fk_name, &fk.columns, false, false, false,
-            Some(&partner_index),
-        )?;
-        sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
-            ("RDB$CONSTRAINT_NAME", SysVal::S(&fk_name)),
-            ("RDB$CONSTRAINT_TYPE", SysVal::S("FOREIGN KEY")),
-            ("RDB$RELATION_NAME", SysVal::S(&name)),
-            ("RDB$INDEX_NAME", SysVal::S(&fk_name)),
-            ("RDB$DEFERRABLE", SysVal::S("NO")),
-            ("RDB$INITIALLY_DEFERRED", SysVal::S("NO")),
-            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
-        ])?;
-        sys_row_by_name(file, page_size, "RDB$REF_CONSTRAINTS", &[
-            ("RDB$CONSTRAINT_NAME", SysVal::S(&fk_name)),
-            ("RDB$CONST_NAME_UQ", SysVal::S(&uq_constraint)),
-            ("RDB$MATCH_OPTION", SysVal::S("FULL")),
-            ("RDB$UPDATE_RULE", SysVal::S("RESTRICT")),
-            ("RDB$DELETE_RULE", SysVal::S("RESTRICT")),
-            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
-            ("RDB$CONST_SCHEMA_NAME_UQ", SysVal::S("PUBLIC")),
-        ])?;
+        write_foreign_key(file, page_size, &name, &fk_name, fk)?;
     }
+    advance_oldest_transactions(file, page_size)?;
+    Ok(())
+}
+
+/// Write one FOREIGN KEY onto a table: the referencing index (irt_foreign,
+/// naming the partner PK index, with the partner-schema column that makes
+/// MET_lookup_partner find it - see [create_index]), the RDB$RELATION_
+/// CONSTRAINTS 'FOREIGN KEY' row, and the RDB$REF_CONSTRAINTS row linking
+/// to the referenced table's PK constraint (MATCH FULL, RESTRICT rules -
+/// referential ACTIONS like CASCADE need engine-generated BLR triggers,
+/// which this writer does not synthesise). Shared by create_table and
+/// ALTER TABLE ADD CONSTRAINT; create_index backfills existing rows, so
+/// this works on a populated table too.
+fn write_foreign_key(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    fk_name: &str,
+    fk: &ForeignKeyDef,
+) -> Result<(), String> {
+    let (uq_constraint, partner_index) =
+        find_primary_key(file, page_size, &fk.ref_table).ok_or_else(|| {
+            format!("referenced table {} has no primary key", fk.ref_table)
+        })?;
+    create_index(
+        file, page_size, table, fk_name, &fk.columns, false, false, false,
+        Some(&partner_index),
+    )?;
+    sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
+        ("RDB$CONSTRAINT_NAME", SysVal::S(fk_name)),
+        ("RDB$CONSTRAINT_TYPE", SysVal::S("FOREIGN KEY")),
+        ("RDB$RELATION_NAME", SysVal::S(table)),
+        ("RDB$INDEX_NAME", SysVal::S(fk_name)),
+        ("RDB$DEFERRABLE", SysVal::S("NO")),
+        ("RDB$INITIALLY_DEFERRED", SysVal::S("NO")),
+        ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+    ])?;
+    sys_row_by_name(file, page_size, "RDB$REF_CONSTRAINTS", &[
+        ("RDB$CONSTRAINT_NAME", SysVal::S(fk_name)),
+        ("RDB$CONST_NAME_UQ", SysVal::S(&uq_constraint)),
+        ("RDB$MATCH_OPTION", SysVal::S("FULL")),
+        ("RDB$UPDATE_RULE", SysVal::S("RESTRICT")),
+        ("RDB$DELETE_RULE", SysVal::S("RESTRICT")),
+        ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ("RDB$CONST_SCHEMA_NAME_UQ", SysVal::S("PUBLIC")),
+    ])?;
+    Ok(())
+}
+
+/// `ALTER TABLE <table> ADD [CONSTRAINT <name>] FOREIGN KEY (...)
+/// REFERENCES ...`: add a foreign key to an EXISTING table. The FK index
+/// is built and backfilled over the table's committed rows, then the
+/// constraint catalog rows are written - the same shape create_table
+/// produces, so the engine reads and gbak restores it identically.
+pub fn alter_table_add_foreign_key(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    fk: &ForeignKeyDef,
+) -> Result<(), String> {
+    let rel = crate::resolve_relation(file, page_size, table)
+        .ok_or_else(|| format!("table {} not found", table))?;
+    if rel < 128 {
+        return Err("system relations are read-only".into());
+    }
+    let name = table.trim().to_ascii_uppercase();
+    let fk_name = if fk.name.is_empty() {
+        let integ = next_numeric_suffix(
+            file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME", "INTEG_",
+        )?;
+        format!("INTEG_{}", integ)
+    } else {
+        fk.name.clone()
+    };
+    write_foreign_key(file, page_size, &name, &fk_name, fk)?;
     advance_oldest_transactions(file, page_size)?;
     Ok(())
 }
