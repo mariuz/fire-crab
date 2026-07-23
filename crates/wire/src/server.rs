@@ -767,6 +767,10 @@ enum Plan {
         cols: Vec<ProjCol>,
         filter: Option<Predicate>,
         order_by: Vec<(usize, bool)>,
+        /// generator-advancing output columns (usually empty); each is
+        /// evaluated per emitted row in output order and persisted when
+        /// the fetch completes
+        gen_cols: Vec<GenCol>,
     },
     Join {
         kind: JoinKind,
@@ -3300,12 +3304,18 @@ fn plan_query_inner(
                         .map(|c| c.field_id as usize)
                 })?,
             };
-            return Some(Plan::Project { rel, formats, cols, filter, order_by });
+            return Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols: Vec::new() });
         }
         Proj::Items(items) => items,
     };
 
     let has_agg = items.iter().any(|i| matches!(i, SelItem::Agg(..)));
+    let has_gen = items.iter().any(|i| matches!(i, SelItem::Gen(..)));
+    // a generator advance in the select list needs the row-by-row Project
+    // path; a grouped/aggregated query with one is not a shape we answer
+    if has_gen && (has_agg || group_s.is_some() || having_s.is_some()) {
+        return None;
+    }
 
     // a single aggregate with no GROUP BY (nor HAVING, which needs the
     // grouped machinery) stays on the scalar path - it keeps the
@@ -3338,7 +3348,11 @@ fn plan_query_inner(
         // per-column wire types come from build_projcols; a select list
         // containing a scalar expression is built item by item.
         let has_expr = items.iter().any(|i| matches!(i, SelItem::Expr(..)));
-        let cols = if has_expr {
+        // synthetic value slots for generator columns start past every
+        // format's real fields, so a decoded row never collides with them
+        let gen_base = formats.iter().map(|(_, d)| d.len()).max().unwrap_or(0).max(descs.len());
+        let mut gen_cols: Vec<GenCol> = Vec::new();
+        let cols = if has_expr || has_gen {
             let mut out = Vec::new();
             for it in &items {
                 match it {
@@ -3348,6 +3362,23 @@ fn plan_query_inner(
                     }
                     SelItem::Expr(e, alias) => {
                         out.push(build_expr_col(e, alias, &columns, &descs)?);
+                    }
+                    SelItem::Gen(gen, step, alias) => {
+                        // the generator must exist at prepare (else refuse
+                        // rather than fail mid-fetch)
+                        generator_info(db, gen)?;
+                        let value_index = gen_base + gen_cols.len();
+                        gen_cols.push(GenCol { name: gen.clone(), step: *step, value_index });
+                        out.push(ProjCol {
+                            name: alias.clone(),
+                            field_id: value_index,
+                            wire: Wire::Int64,
+                            sql_type: 580, // SQL_INT64 (BIGINT)
+                            length: 8,
+                            scale: 0,
+                            sub_type: 0,
+                            expr: None,
+                        });
                     }
                     SelItem::Agg(..) => return None, // aggregates route to plan_group
                 }
@@ -3383,7 +3414,7 @@ fn plan_query_inner(
                 }
             }
         };
-        return Some(Plan::Project { rel, formats, cols, filter, order_by });
+        return Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols });
     }
 
     // grouped query: GROUP BY, or a multi-aggregate global projection
@@ -3433,6 +3464,7 @@ fn plan_group(
     for (out_idx, item) in items.iter().enumerate() {
         match item {
             SelItem::Expr(..) => return None, // expressions not supported in grouped queries
+            SelItem::Gen(..) => return None,  // generator advances need the Project path
             SelItem::Col(name) => {
                 let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
                 let fid = rc.field_id as usize;
@@ -4209,13 +4241,22 @@ fn write_eval_error(w: &mut W, e: &EvalErr) {
     w.int(0); // isc_arg_end
 }
 
-fn emit_rows(w: &mut W, plan: &Plan, db: &Option<Database>, args: &[WireParam]) {
+/// Emit a cursor's rows. `gen_writes` collects the (generator name, final
+/// value) each generator column reached - the caller persists them after
+/// the fetch, mirroring the engine's mid-fetch generator advance.
+fn emit_rows(
+    w: &mut W,
+    plan: &Plan,
+    db: &Option<Database>,
+    args: &[WireParam],
+    gen_writes: &mut Vec<(String, i64)>,
+) {
     // a filter bind failure emits no rows, only the terminator -
     // op_execute already validated the bind and reported any error, so
     // reaching fetch with a bad bind means the client ignored it; an
     // arithmetic exception mid-cursor is reported like the engine, with
     // an error op_response in place of the terminator
-    match emit_rows_inner(w, plan, db, args) {
+    match emit_rows_inner(w, plan, db, args, gen_writes) {
         Ok(()) | Err(EmitErr::Bind) => {
             // end-of-cursor terminator
             w.int(OP_FETCH_RESPONSE).int(100).int(0);
@@ -4229,6 +4270,7 @@ fn emit_rows_inner(
     plan: &Plan,
     db: &Option<Database>,
     args: &[WireParam],
+    gen_writes: &mut Vec<(String, i64)>,
 ) -> Result<(), EmitErr> {
     match plan {
         // DML, DDL and generator writes have no cursor: terminator only.
@@ -4272,11 +4314,59 @@ fn emit_rows_inner(
             cols,
             filter,
             order_by,
+            gen_cols,
         } => {
             if let Some(db) = db {
                 let filter = bind_filter(filter, args)?;
                 let accepts = |v: &[Value]| filter.as_ref().map_or(true, |p| p.matches(v));
-                if order_by.is_empty() {
+                if !gen_cols.is_empty() {
+                    // a generator advance per row: materialise, sort into
+                    // OUTPUT order, then advance each generator once per row
+                    // in that order (the engine evaluates NEXT VALUE FOR /
+                    // GEN_ID mid-fetch, after the sort). The final values are
+                    // handed back for the caller to persist.
+                    let mut rows: Vec<Vec<Value>> = Vec::new();
+                    for_each_record(db, *rel, formats, |values| {
+                        if accepts(values) {
+                            rows.push(values.to_vec());
+                        }
+                    });
+                    if !order_by.is_empty() {
+                        rows.sort_by(|a, b| order_cmp(a, b, order_by));
+                    }
+                    // running value per distinct generator, from its stored
+                    // base; the increment resolves a NEXT VALUE FOR's step
+                    let mut running: std::collections::HashMap<String, i64> =
+                        std::collections::HashMap::new();
+                    let mut incr: std::collections::HashMap<String, i64> =
+                        std::collections::HashMap::new();
+                    for gc in gen_cols {
+                        let key = gc.name.to_ascii_uppercase();
+                        if !running.contains_key(&key) {
+                            let base = read_generator_value(db, &gc.name).unwrap_or(0);
+                            let gi = generator_info(db, &gc.name).map(|(_, i)| i).unwrap_or(1);
+                            running.insert(key.clone(), base);
+                            incr.insert(key, gi);
+                        }
+                    }
+                    let max_idx = gen_cols.iter().map(|g| g.value_index).max().unwrap_or(0);
+                    for mut values in rows {
+                        if values.len() <= max_idx {
+                            values.resize(max_idx + 1, Value::Null);
+                        }
+                        for gc in gen_cols {
+                            let key = gc.name.to_ascii_uppercase();
+                            let step = gc.step.unwrap_or_else(|| *incr.get(&key).unwrap_or(&1));
+                            let v = running.get_mut(&key).unwrap();
+                            *v = v.wrapping_add(step);
+                            values[gc.value_index] = Value::Int(*v);
+                        }
+                        encode_row(w, cols, &values)?;
+                    }
+                    for (key, val) in &running {
+                        gen_writes.push((key.clone(), *val));
+                    }
+                } else if order_by.is_empty() {
                     // stream matching rows; an evaluation error on any row
                     // (divide by zero, a failed cast) stops the walk and is
                     // reported after it
@@ -4600,6 +4690,39 @@ fn parse_next_value(proj_s: &str, table_s: &str) -> Option<String> {
     }
 }
 
+/// Recognise ONE select-list item that advances a generator:
+/// `NEXT VALUE FOR <seq>` (returns step None) or `GEN_ID(<name>, <n>)`
+/// (returns step Some(n)). `part` is a single projection item with any
+/// ` AS <alias>` already split off. None if it is not a generator item,
+/// so the ordinary column/expression parsing handles it.
+fn parse_gen_sel_item(part: &str) -> Option<(String, Option<i64>)> {
+    let p = part.trim();
+    // NEXT VALUE FOR <seq>
+    let toks: Vec<&str> = p.split_whitespace().collect();
+    if toks.len() == 4
+        && toks[0].eq_ignore_ascii_case("NEXT")
+        && toks[1].eq_ignore_ascii_case("VALUE")
+        && toks[2].eq_ignore_ascii_case("FOR")
+    {
+        let name = strip_gen_name(toks[3]);
+        return if name.is_empty() { None } else { Some((name, None)) };
+    }
+    // GEN_ID ( <name> , <step> )
+    let open = p.find('(')?;
+    if !p[..open].trim().eq_ignore_ascii_case("GEN_ID") {
+        return None;
+    }
+    let close = p.rfind(')')?;
+    if close <= open || p[close + 1..].trim() != "" {
+        return None;
+    }
+    let args = &p[open + 1..close];
+    let comma = args.rfind(',')?;
+    let step: i64 = args[comma + 1..].trim().parse().ok()?;
+    let name = strip_gen_name(args[..comma].trim());
+    if name.is_empty() { None } else { Some((name, Some(step))) }
+}
+
 /// Reduce a possibly schema/package-qualified, possibly quoted generator
 /// reference (`PUBLIC.MYGEN`, `PUBLIC."MyGen"`, `MYGEN`, `"MyGen"`) to the
 /// bare object name the catalog stores.
@@ -4625,6 +4748,24 @@ enum SelItem {
     /// a scalar expression (parsed with column NAMES, resolved to field
     /// ids at plan time) and the output column name it is described by
     Expr(RawExpr, String),
+    /// a generator advance in the select list - `NEXT VALUE FOR <seq>`
+    /// (step None) or `GEN_ID(<name>, <n>)` (step Some(n)) - evaluated
+    /// once per emitted row (see [GenCol]), with its output column name
+    Gen(String, Option<i64>, String),
+}
+
+/// A generator-advancing output column of a [Plan::Project]: `name` is
+/// the generator/sequence, `step` is the explicit `GEN_ID` step (or None
+/// for `NEXT VALUE FOR`, meaning the sequence's own increment), and
+/// `value_index` is the synthetic slot in a decoded row's value vector
+/// that emit fills with this column's per-row value. Advanced once per
+/// emitted row, in OUTPUT order (after any sort), each advance persisted
+/// when the fetch completes - the engine evaluates it mid-fetch.
+#[derive(Clone)]
+struct GenCol {
+    name: String,
+    step: Option<i64>,
+    value_index: usize,
 }
 
 /// A select-list expression before column names are resolved to field
@@ -5468,6 +5609,14 @@ fn parse_projection(proj: &str) -> Option<Proj> {
         // a default)
         let (body, alias) = split_alias(part);
         let body = body.trim();
+        // a generator advance (NEXT VALUE FOR / GEN_ID) in the select list
+        if let Some((gen, step)) = parse_gen_sel_item(body) {
+            let name = alias
+                .map(|a| a.trim_matches('"').to_ascii_uppercase())
+                .unwrap_or_else(|| if step.is_none() { "GEN_ID".into() } else { "GEN_ID".into() });
+            items.push(SelItem::Gen(gen, step, name));
+            continue;
+        }
         if alias.is_none() && is_qualified_col(body) {
             items.push(SelItem::Col(body.to_string()));
         } else if alias.is_none() && ident_ok(body.trim_matches('"')) {
@@ -6870,7 +7019,31 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 }
                 // stream the plan's rows + end-of-cursor terminator
                 let mut w = W::default();
-                emit_rows(&mut w, &plan, &database, &bound_args);
+                let mut gen_writes: Vec<(String, i64)> = Vec::new();
+                emit_rows(&mut w, &plan, &database, &bound_args, &mut gen_writes);
+                // a generator-advancing SELECT (NEXT VALUE FOR / GEN_ID in
+                // the select list) writes its generators' final values as
+                // the fetch completes - the engine advances them mid-fetch
+                if !gen_writes.is_empty() {
+                    if let Some(db) = database.as_mut() {
+                        let mut work = db.bytes.clone();
+                        let mut ok = true;
+                        for (name, val) in &gen_writes {
+                            match generator_id(db, name) {
+                                Some(id) => {
+                                    if write_generator_value(&mut work, db.page_size, id, *val).is_err() {
+                                        ok = false;
+                                    }
+                                }
+                                None => ok = false,
+                            }
+                        }
+                        if ok {
+                            db.bytes = work;
+                            let _ = std::fs::write(&db.path, &db.bytes);
+                        }
+                    }
+                }
                 w.send(&mut s, &mut enc)?;
             }
             x if x == OP_FREE_STATEMENT => {
@@ -8531,6 +8704,7 @@ mod tests {
                     SelItem::Col(c) => c.clone(),
                     SelItem::Agg(..) => "<agg>".into(),
                     SelItem::Expr(_, name) => format!("<expr:{}>", name),
+                    SelItem::Gen(n, s, _) => format!("<gen:{}:{:?}>", n, s),
                 })
                 .collect(),
         }
@@ -9300,6 +9474,7 @@ mod tests {
                     SelItem::Col(c) => format!("col:{}", c),
                     SelItem::Expr(_, n) => format!("expr:{}", n),
                     SelItem::Agg(..) => "agg".into(),
+                    SelItem::Gen(n, s, _) => format!("gen:{}:{:?}", n, s),
                 })
                 .collect::<Vec<_>>(),
             Proj::Star => vec!["*".into()],
@@ -9533,6 +9708,30 @@ mod tests {
         assert_eq!(parse_next_value("A + B", "RDB$DATABASE"), None);
         assert_eq!(parse_next_value("NEXT VALUE FOR SEQ5", "EMP"), None);
         assert_eq!(parse_next_value("NEXT VALUE FOR", "RDB$DATABASE"), None);
+    }
+
+    #[test]
+    fn parses_generator_select_list_items() {
+        // NEXT VALUE FOR <seq> -> step None (the sequence's own increment)
+        assert_eq!(parse_gen_sel_item("NEXT VALUE FOR SEQ"), Some(("SEQ".into(), None)));
+        assert_eq!(
+            parse_gen_sel_item("next value for PUBLIC.MYSEQ"),
+            Some(("MYSEQ".into(), None))
+        );
+        // GEN_ID(name, step) -> the explicit step, negative allowed
+        assert_eq!(parse_gen_sel_item("GEN_ID(G, 5)"), Some(("G".into(), Some(5))));
+        assert_eq!(parse_gen_sel_item("gen_id( G , -3 )"), Some(("G".into(), Some(-3))));
+        // plain columns / expressions are not generator items
+        assert_eq!(parse_gen_sel_item("X"), None);
+        assert_eq!(parse_gen_sel_item("A + B"), None);
+        assert_eq!(parse_gen_sel_item("COUNT(*)"), None);
+        // a row-returning generator projection parses to a Gen item beside
+        // a plain column (over a real table, not RDB$DATABASE)
+        let Some(Proj::Items(items)) = parse_projection("NEXT VALUE FOR SEQ, X") else {
+            panic!("expected Items");
+        };
+        assert!(matches!(items[0], SelItem::Gen(ref n, None, _) if n == "SEQ"));
+        assert!(matches!(items[1], SelItem::Col(ref c) if c == "X"));
     }
 
     #[test]
