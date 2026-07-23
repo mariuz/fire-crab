@@ -1707,6 +1707,49 @@ rows and are checked value- and scale-for-scale against the engine. The
 one piece still explicitly deferred is a numeric result wide enough to
 need an `INT128` wire form.
 
+### The forty-sixth differential — ALTER TABLE ADD, and the format version the engine reads through
+
+CREATE TABLE, its constraints, CREATE INDEX and DROP TABLE were all
+engine-adopted; the catalog had only ever been *written*, never *amended*.
+`ALTER TABLE ADD` is the first amendment, and it turns on a concept the
+earlier DDL did not need: the engine models an added column as a new
+**format version**. Existing records keep the format number they were
+written under and read the new column as NULL; new records use the new
+format. So the work is not "rewrite every row" — it is "register a second
+format and point the relation at it".
+
+The sequence mirrors the tail of CREATE TABLE for the one new field — a
+new auto-domain in `RDB$FIELDS`, a `RDB$RELATION_FIELDS` row at the next
+field id — plus three things CREATE TABLE never had to do. A new
+`RDB$FORMATS` row carries the *full* descriptor set (existing fields plus
+the new one) under the next format number. `RDB$RUNTIME` is rebuilt: the
+engine's DSQL layer resolves a `SELECT`'s column names through this
+per-relation blob, so an ALTER that updated everything *except* it
+produced the telling half-failure caught during development — `gfix` clean
+and `SHOW TABLE` listing the new column, but `SELECT C` answered "column
+unknown", because DSQL was still reading the two-field runtime. And the
+`RDB$RELATIONS` row itself is rewritten in place — a real record-version
+write, the first the catalog does to itself — to bump `RDB$FORMAT` to the
+new version and the field count, and to point `RDB$RUNTIME` at the rebuilt
+blob.
+
+`qa/serve-real-alter.sh` proves it against the engine as oracle, the same
+copy applied to a reference database by the engine's own `ALTER`.
+Fourteen checks: fire-crab adds two columns (an `INTEGER` and a
+`VARCHAR`), the pre-existing rows read the new columns as NULL, a
+new-format `INSERT` populates them, and fire-crab reads and filters on the
+added column. Then the engine adopts the file — it reads the altered
+table byte-identically to its own reference, `SHOW TABLE` matches, it
+reads fire-crab's own new-format row (`C = 99`, `D = 'pq'`), `gfix -v
+-full` is clean, the engine **writes** its own row into the altered table,
+and `gbak` backs it up and restores it — a restore that replays the whole
+catalog, added column and all, as real engine-side DDL. A duplicate column
+name and an `ALTER` of a missing table both raise real SQL errors. What
+this first ALTER slice deliberately leaves is the rest of the verb's
+surface: `DROP` of a column, `ALTER` of a column's type, and adding a
+`NOT NULL`/`PRIMARY KEY` column (a constraint over the existing rows) —
+each its own amendment, and each left to error rather than half-apply.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
