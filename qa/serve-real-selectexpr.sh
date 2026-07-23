@@ -238,6 +238,16 @@ comparen "num negate"           "SELECT -N AS R FROM E WHERE ID = 1"
 comparen "num header default"   "SELECT N * M FROM E WHERE ID = 1"
 comparen "num NULL propagates"  "SELECT N * M AS R FROM E WHERE ID = 3"
 
+# --- decimal literals: scale = written fractional digits (trailing zeros
+#     count), and they arithmetic-combine like any numeric operand -------
+comparen "declit add"          "SELECT N + 1.5 AS R FROM E WHERE ID = 1"
+comparen "declit trailing zero" "SELECT N + 1.50 AS R FROM E WHERE ID = 1"
+comparen "declit mul"          "SELECT N * 1.5 AS R FROM E WHERE ID = 1"
+comparen "declit div"          "SELECT N / 1.5 AS R FROM E WHERE ID = 1"
+comparen "declit both literals" "SELECT 1.5 + 2.25 AS R FROM E WHERE ID = 1"
+comparen "declit times int"    "SELECT 1.5 * 2 AS R FROM E WHERE ID = 1"
+comparen "declit bare"         "SELECT 1.5 AS R FROM E WHERE ID = 1"
+
 # --- runtime errors: BOTH the engine and fire-crab reject the row rather
 #     than answering. Divide-by-zero is the arithmetic exception (SQLSTATE
 #     22012); a bad or too-long CAST is the conversion error (22018).

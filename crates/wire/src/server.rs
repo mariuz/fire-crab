@@ -2581,6 +2581,25 @@ fn split_qual(name: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// Does `body` look like a qualified column `T.C` (as a join projection
+/// uses)? Both parts must be identifiers and the qualifier must *start*
+/// like one - a leading letter/`_`/`$` - so a decimal literal such as
+/// `1.5` is not mistaken for a qualified column. A body that fails this
+/// (an arithmetic expression like `N + 1.5`, a bare literal) falls through
+/// to expression parsing instead.
+fn is_qualified_col(body: &str) -> bool {
+    match body.split_once('.') {
+        Some((q, c)) => {
+            let q = q.trim_matches('"');
+            let c = c.trim_matches('"');
+            matches!(q.chars().next(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_' || ch == '$')
+                && ident_ok(q)
+                && ident_ok(c)
+        }
+        None => false,
+    }
+}
+
 /// One side of a join during planning: the name a qualifier must match
 /// (the alias when there is one, else the table name - Firebird hides the
 /// table name behind an alias), the relation's columns and newest
@@ -4279,6 +4298,10 @@ enum SelItem {
 enum RawExpr {
     Col(String),
     Int(i64),
+    /// a decimal literal `d.dd`: (raw integer, scale) - `1.5` is
+    /// `(15, -1)`, `1.50` is `(150, -2)` (trailing zeros count, as the
+    /// engine's scale does)
+    Dec(i64, i8),
     Str(String),
     Null,
     Neg(Box<RawExpr>),
@@ -4439,6 +4462,24 @@ fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
             while *pos < b.len() && b[*pos].is_ascii_digit() {
                 *pos += 1;
             }
+            // a decimal literal `d.dd` - a dot followed by at least one
+            // digit; the raw is the digits with the point removed, the
+            // scale the negative of the fractional-digit count (trailing
+            // zeros included, matching the engine)
+            if b.get(*pos) == Some(&'.') && b.get(*pos + 1).is_some_and(|c| c.is_ascii_digit()) {
+                *pos += 1; // '.'
+                let frac_start = *pos;
+                while *pos < b.len() && b[*pos].is_ascii_digit() {
+                    *pos += 1;
+                }
+                let digits: String = b[start..frac_start - 1]
+                    .iter()
+                    .chain(&b[frac_start..*pos])
+                    .collect();
+                let raw: i64 = digits.parse().ok()?;
+                let scale = -((*pos - frac_start) as i8);
+                return Some(RawExpr::Dec(raw, scale));
+            }
             let n: i64 = b[start..*pos].iter().collect::<String>().parse().ok()?;
             Some(RawExpr::Int(n))
         }
@@ -4576,6 +4617,7 @@ fn resolve_expr(
             Expr::Col(fid)
         }
         RawExpr::Int(n) => Expr::Int(*n),
+        RawExpr::Dec(raw, scale) => Expr::Dec(*raw, *scale),
         RawExpr::Str(s) => Expr::Str(s.clone()),
         RawExpr::Null => Expr::Null,
         RawExpr::Neg(e) => Expr::Neg(Box::new(resolve_expr(e, columns, descs)?)),
@@ -4602,6 +4644,8 @@ enum Expr {
     /// a scale-0 integer column, by field id
     Col(usize),
     Int(i64),
+    /// a decimal literal: (raw integer, scale)
+    Dec(i64, i8),
     Str(String),
     Null,
     Neg(Box<Expr>),
@@ -4744,6 +4788,7 @@ impl Expr {
                 }
             }
             Expr::Int(_) => Some(ExprType::Int),
+            Expr::Dec(..) => Some(ExprType::Numeric),
             Expr::Str(_) => Some(ExprType::Text),
             Expr::Null => Some(ExprType::Int),
             Expr::Neg(e) => match e.type_of(descs)? {
@@ -4798,6 +4843,7 @@ impl Expr {
                 }
             }
             Expr::Int(_) => Some(0),
+            Expr::Dec(_, scale) => Some(*scale),
             Expr::Neg(e) => e.result_scale(descs),
             Expr::Bin(a, op, b) => {
                 let s1 = a.result_scale(descs)?;
@@ -4819,6 +4865,7 @@ impl Expr {
         Ok(match self {
             Expr::Col(fid) => values.get(*fid).cloned().unwrap_or(Value::Null),
             Expr::Int(n) => Value::Int(*n),
+            Expr::Dec(raw, scale) => Value::Scaled(*raw, *scale),
             Expr::Str(s) => Value::Text(s.clone()),
             Expr::Null => Value::Null,
             Expr::Neg(e) => match e.eval(values)? {
@@ -5085,11 +5132,7 @@ fn parse_projection(proj: &str) -> Option<Proj> {
         // a default)
         let (body, alias) = split_alias(part);
         let body = body.trim();
-        if alias.is_none() && body.contains('.') {
-            let (q, c) = split_qual(body);
-            if !ident_ok(q.unwrap_or("")) || !ident_ok(c) {
-                return None;
-            }
+        if alias.is_none() && is_qualified_col(body) {
             items.push(SelItem::Col(body.to_string()));
         } else if alias.is_none() && ident_ok(body.trim_matches('"')) {
             items.push(SelItem::Col(body.trim_matches('"').to_string()));
@@ -5191,7 +5234,7 @@ fn default_expr_name(raw: &RawExpr) -> String {
         RawExpr::Cast(_, _) => "CAST",
         // the engine leaves a unary-minus column unnamed (blank header)
         RawExpr::Neg(_) => "",
-        RawExpr::Int(_) | RawExpr::Str(_) | RawExpr::Null => "CONSTANT",
+        RawExpr::Int(_) | RawExpr::Dec(..) | RawExpr::Str(_) | RawExpr::Null => "CONSTANT",
         RawExpr::Col(_) => "EXPR",
     }
     .to_string()
@@ -8740,6 +8783,18 @@ mod tests {
         assert_eq!(num("N / M"), (10125556, -6)); // dividend *10^8 // raw2, trunc
         assert_eq!(num("N / A"), (125, -2)); // 12.50 / 10 = 1.25
         assert_eq!(num("N / 4"), (312, -2)); // 12.50/4 = 3.125 -> scale -2 -> 3.12 (trunc)
+        // decimal literals: scale = written fractional digits (trailing
+        // zeros count), and they follow the same arithmetic rules
+        assert!(matches!(ev("1.5"), Value::Scaled(15, -1)));
+        assert!(matches!(ev("1.50"), Value::Scaled(150, -2))); // trailing zero counts
+        assert!(matches!(ev("100.0"), Value::Scaled(1000, -1)));
+        assert_eq!(num("N + 1.5"), (1400, -2)); // 12.50 + 1.50 (aligned) = 14.00
+        assert_eq!(num("N + 1.50"), (1400, -2)); // same, literal scale -2
+        assert_eq!(num("N * 1.5"), (18750, -3)); // scale -2 + -1 = -3, 18.750
+        assert_eq!(num("N / 1.5"), (8333, -3)); // scale -3, 8.333 (trunc)
+        assert_eq!(num("1.5 + 2.25"), (375, -2)); // finer scale -2, 3.75
+        assert_eq!(num("1.5 * 2"), (30, -1)); // literal * integer, scale -1, 3.0
+        assert_eq!(default_expr_name(&parse_raw_expr("1.5").unwrap()), "CONSTANT");
         // -N negates in place; NULL propagates through numeric arithmetic
         assert!(matches!(ev("-N"), Value::Scaled(-1250, -2)));
         let null_num = vec![
@@ -8816,6 +8871,12 @@ mod tests {
         // only a top-level `AS` renames
         assert_eq!(cols("CAST(A AS VARCHAR(20))"), vec!["expr:CAST"]);
         assert_eq!(cols("CAST(A AS INTEGER) AS X"), vec!["expr:X"]);
+        // a decimal literal in an item is an expression, not a qualified
+        // column (its `.` must not be mistaken for a `T.C` separator)
+        assert_eq!(cols("A + 1.5"), vec!["expr:ADD"]);
+        assert_eq!(cols("1.5"), vec!["expr:CONSTANT"]);
+        // a real qualified column still parses as one (the join path)
+        assert_eq!(cols("T.C"), vec!["col:T.C"]);
     }
 
     #[test]
