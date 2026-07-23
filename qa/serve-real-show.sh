@@ -54,13 +54,14 @@ CREATE TABLE Z (ID INTEGER);
 CREATE EXCEPTION E_FIRST 'the first exception message';
 CREATE EXCEPTION E_UNUSED 'nobody uses me';
 COMMIT;
--- a trigger that raises E_FIRST gives it a dependency for SHOW EXCEPTION's
--- "Used by:" list, without adding a procedure (SHOW PROCEDURES does not
--- yet render a procedure's own dependencies) and on a table this gate does
--- not SHOW TABLE, so no other check sees the trigger
+-- a procedure that raises E_FIRST and writes Z gives E_FIRST a dependency
+-- for SHOW EXCEPTION's "Used by:" list, and gives SHOW PROCEDURES a
+-- procedure with its own dependencies - Z (Table) once (its field-level
+-- and table-level rows folded by the blr_project DISTINCT) and E_FIRST
+-- (Exception). Z is not SHOW TABLE'd by this gate.
 SET TERM ^;
-CREATE TRIGGER Z_BI FOR Z BEFORE INSERT AS
-BEGIN IF (NEW.ID < 0) THEN EXCEPTION E_FIRST; END^
+CREATE PROCEDURE P_USE AS
+BEGIN EXCEPTION E_FIRST; INSERT INTO Z (ID) VALUES (1); END^
 SET TERM ;^
 COMMIT;
 SET GENERATOR GEN_C TO 4242;

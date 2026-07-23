@@ -7054,6 +7054,9 @@ struct BRse {
     streams: Vec<(u8, String)>,
     boolean: Option<BBool>,
     sort: Vec<(u8, String, bool)>,
+    /// blr_project: the DISTINCT value expressions - rows are unique on
+    /// their evaluated tuple (empty = no DISTINCT)
+    project: Vec<BVal>,
 }
 
 /// A BLR statement.
@@ -7128,6 +7131,10 @@ const BLR_AND: u8 = 58;
 const BLR_NOT: u8 = 59;
 const BLR_MISSING: u8 = 61;
 const BLR_RSE: u8 = 67;
+/// blr_project (69): the DISTINCT clause of an rse - the result is unique
+/// on the listed value expressions. SHOW PROCEDURES uses it to fold a
+/// table dependency's field-level and table-level rows into one entry.
+const BLR_PROJECT: u8 = 69;
 const BLR_SORT: u8 = 70;
 const BLR_BOOLEAN: u8 = 71;
 const BLR_ASCENDING: u8 = 72;
@@ -7305,11 +7312,19 @@ fn parse_blr_rse(c: &mut BlrCur) -> Option<BRse> {
     }
     let mut boolean = None;
     let mut sort = Vec::new();
+    let mut project = Vec::new();
     loop {
         match c.peek()? {
             BLR_BOOLEAN => {
                 c.u8();
                 boolean = Some(parse_blr_bool(c)?);
+            }
+            BLR_PROJECT => {
+                c.u8();
+                let n = c.u8()?;
+                for _ in 0..n {
+                    project.push(parse_blr_val(c)?);
+                }
             }
             BLR_SORT => {
                 c.u8();
@@ -7336,7 +7351,7 @@ fn parse_blr_rse(c: &mut BlrCur) -> Option<BRse> {
             _ => return None,
         }
     }
-    Some(BRse { streams, boolean, sort })
+    Some(BRse { streams, boolean, sort, project })
 }
 
 fn parse_blr_bool(c: &mut BlrCur) -> Option<BBool> {
@@ -7571,6 +7586,21 @@ fn exec_blr_stmt(
                     matched.into_iter().map(|c| (key_of(&c), c)).collect();
                 keyed.sort_by(|(ka, _), (kb, _)| cmp_value_keys(ka, kb, &descs));
                 matched = keyed.into_iter().map(|(_, c)| c).collect();
+            }
+            // DISTINCT (blr_project): keep the first combo of each distinct
+            // tuple of projected values - already sorted, so first == the
+            // engine's chosen representative
+            if !rse.project.is_empty() {
+                let mut seen = std::collections::HashSet::new();
+                matched.retain(|combo| {
+                    let all = build(combo);
+                    let key: Vec<String> = rse
+                        .project
+                        .iter()
+                        .map(|v| eval_blr_val(v, &all, input, db).render())
+                        .collect();
+                    seen.insert(key)
+                });
             }
             for combo in matched {
                 let all = build(&combo);
@@ -9294,6 +9324,26 @@ mod tests {
         assert!(sleuth_match("RDB$123", "RDB$+"));
         assert!(!sleuth_match("MY_DOMAIN", "RDB$+"));
         assert!(!sleuth_match("RDB$", "RDB$+")); // needs at least one digit
+    }
+
+    #[test]
+    fn parses_an_rse_with_a_project_distinct() {
+        // blr_rse over T, sorted by A ascending, DISTINCT on A - the shape
+        // SHOW PROCEDURES' dependency request uses (blr_sort then
+        // blr_project). blr_relation "T" ctx 0; blr_sort 1 [asc field A];
+        // blr_project 1 [field A]; blr_end.
+        let blr: &[u8] = &[
+            67, 1, 74, 1, b'T', 0, // rse, 1 stream, relation "T" ctx 0
+            70, 1, 72, 23, 0, 1, b'A', // sort: 1 key, ascending, field A
+            69, 1, 23, 0, 1, b'A', // project: 1 expr, field A
+            255,
+        ];
+        let mut c = BlrCur { b: blr, i: 0 };
+        let rse = parse_blr_rse(&mut c).expect("rse with project must parse");
+        assert_eq!(rse.streams, vec![(0, "T".to_string())]);
+        assert_eq!(rse.sort.len(), 1);
+        assert_eq!(rse.project.len(), 1);
+        assert!(matches!(&rse.project[0], BVal::Field(0, n) if n == "A"));
     }
 
     #[test]

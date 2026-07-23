@@ -1385,12 +1385,11 @@ worth a gate, not a differential, so `serve-real-show.sh` grows to
 twenty-two checks with `SHOW EXCEPTIONS`, a `SHOW EXCEPTION` on an
 exception a trigger raises (its dependency rendered `PUBLIC.<trigger>
 (Trigger)`, matching the engine) and one on an unused exception — locking
-in behaviour the generic interp gave for free. The dependency probe did
-surface one thing it does *not* yet handle: `SHOW PROCEDURES` runs a
-second request over `RDB$DEPENDENCIES` to print each procedure's own
-dependencies, and that BLR carries a verb the parser does not know — so a
-procedure with dependencies is left to a later slice, and the gate raises
-its exception dependency through a trigger instead.
+in behaviour the generic interp gave for free. The dependency probe also
+surfaced the one verb the request parser was missing — `blr_project` —
+which the next slice adds; with it the gate raises its exception
+dependency through a procedure, covering `SHOW PROCEDURES` dependencies
+too.
 
 ### The thirty-ninth differential — `SHOW GENERATORS`, and the generator page
 
@@ -1935,6 +1934,36 @@ reference, and `gfix -v -full` clean. What is deliberately left for later
 is `NEXT VALUE FOR`/`GEN_ID(name, n)` *inside a row-returning query* (one
 increment per row, mid-fetch) rather than the single-row `RDB$DATABASE`
 form here.
+
+### The fifty-first differential — SHOW PROCEDURES' dependencies, and the DISTINCT verb
+
+Verifying `SHOW EXCEPTIONS` (which already worked) surfaced the one thing
+the BLR request interp could not do: `SHOW PROCEDURES` runs a second
+request over `RDB$DEPENDENCIES` to print each procedure's own
+dependencies, and that request's `rse` carries a `blr_project` — the
+DISTINCT clause — a verb the parser did not know, so the whole request
+failed to compile and the command errored out. This slice adds it.
+
+`blr_project` makes an `rse` unique on a list of value expressions, and
+here it matters for correctness, not just parsing: a procedure that reads
+a table leaves *two* `RDB$DEPENDENCIES` rows — one field-level (the column
+it touches) and one table-level — and the DISTINCT on
+`(schema, type, name)` folds them into the single "`PUBLIC.T (Table)`" the
+engine prints. So the parser gains the verb and the executor gains the
+fold: after the request's filter and sort, rows are reduced to the first
+of each distinct projected tuple (already sorted, so the first is the
+engine's representative).
+
+`serve-real-show.sh` grows to twenty-two checks. Its scratch schema now
+carries a procedure that raises an exception and writes a table, so a
+single request exercises both directions of the dependency graph: `SHOW
+PROCEDURES` renders `PUBLIC.P_USE; Dependencies: PUBLIC.Z (Table),
+PUBLIC.E_FIRST (Exception)` — the table folded to one entry by the
+DISTINCT — and `SHOW EXCEPTION E_FIRST` renders the same procedure in its
+`Used by:` list, each compared verbatim against isql. What the request
+interp still cannot render is a procedure's *source text* (`SHOW PROCEDURE
+<name>`, singular), which reads the PSQL blob rather than walking the
+dependency graph.
 
 ### Stage 3 — the Firebird QA suite (reached)
 
