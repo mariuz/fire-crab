@@ -581,7 +581,16 @@ pub fn update_records(
     }
     for (page_no, slot, image) in targets {
         let (b_page, b_line, _) = push_back_version(file, page_size, rel, *page_no, *slot)?;
-        let rec = rhd_bytes(tx as u32, b_page, b_line, flags::NOT_PACKED, format_no, image);
+        // RLE-pack the new version, as the engine stores records: the
+        // primary must stay at its positional slot, so a NOT_PACKED
+        // (uncompressed) image can overflow a tight page - packed, it is
+        // the same size class as the original the slot already held
+        let packed = crate::sqz::pack(image);
+        let rec = if packed.len() < image.len() {
+            rhd_bytes(tx as u32, b_page, b_line, 0, format_no, &packed)
+        } else {
+            rhd_bytes(tx as u32, b_page, b_line, flags::NOT_PACKED, format_no, image)
+        };
         rewrite_primary(file, page_size, *page_no, *slot, &rec)?;
     }
     Ok(DmlOutcome { tx_id: tx, affected: targets.len() })

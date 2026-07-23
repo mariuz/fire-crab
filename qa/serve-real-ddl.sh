@@ -122,10 +122,11 @@ case "$(node_run "CREATE TABLE TDDL (X INTEGER)")" in
     ERR*) echo "OK   duplicate table name refused" ;;
     *) echo "DIFF duplicate table name refused"; fail=1 ;;
 esac
-# CREATE INDEX, DROP TABLE, ALTER TABLE ADD/DROP are supported (ddl2 /
-# serve-real-alter); a genuinely unsupported form must still raise a real
-# SQL error - ALTER TABLE ... ALTER <col> TYPE is not implemented yet
-case "$(node_run "ALTER TABLE TDDL ALTER F TYPE BIGINT")" in
+# CREATE INDEX, DROP TABLE, ALTER TABLE ADD/DROP/ALTER TYPE are supported
+# (ddl2 / serve-real-alter / serve-real-altertype); a genuinely unsupported
+# form must still raise a real SQL error - DROP CONSTRAINT is not a column
+# operation this server implements
+case "$(node_run "ALTER TABLE TDDL DROP CONSTRAINT NOSUCH")" in
     ERR*) echo "OK   unsupported ALTER form raises an error" ;;
     *) echo "DIFF unsupported ALTER form raises an error"; fail=1 ;;
 esac

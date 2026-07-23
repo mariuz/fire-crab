@@ -779,6 +779,206 @@ pub fn alter_table_drop_column(
     Ok(())
 }
 
+/// The storage width of an integer dtype, for the widening check.
+fn int_width(dt: u8) -> Option<u16> {
+    use crate::format::dtype;
+    match dt {
+        dtype::SHORT => Some(2),
+        dtype::LONG => Some(4),
+        dtype::INT64 => Some(8),
+        _ => None,
+    }
+}
+
+/// Whether changing a column from `old` to `new` is a conversion this
+/// write path performs. Deliberately a SUBSET of what the engine allows -
+/// only clearly loss-free widenings, so fire-crab never *succeeds* where
+/// the engine would reject (narrowing). An integer widens to a wider
+/// integer (scale 0), a CHAR/VARCHAR widens to a same-or-longer one of
+/// the same kind. Everything else errors, as the engine does for an
+/// unsupported conversion.
+fn type_change_supported(old: &Descriptor, new: &ColumnDef) -> bool {
+    use crate::format::dtype;
+    // integer family: same or wider, both scale 0
+    if let (Some(ow), Some(nw)) = (int_width(old.dtype), int_width(new.dtype)) {
+        return old.scale == 0 && new.scale == 0 && nw >= ow;
+    }
+    // text: same kind (CHAR or VARCHAR), same or longer
+    match (old.dtype, new.dtype) {
+        (dtype::TEXT, dtype::TEXT) | (dtype::VARYING, dtype::VARYING) => new.length >= old.length,
+        _ => false,
+    }
+}
+
+/// `ALTER TABLE <table> ALTER <column> TYPE <newtype>`: change a column's
+/// type. Like ADD and DROP, a new *format version* - existing records keep
+/// their old format (and their old-width value, which reads back promoted:
+/// an `INTEGER` stored 4 bytes reads as the new `BIGINT`); new records use
+/// the new format. The column keeps its field id, position and domain
+/// name; the domain's `RDB$FIELDS` row is retyped IN PLACE (the engine does
+/// the same - probe: `RDB$1` changed from type 8/len 4 to type 16/len 8),
+/// `RDB$RUNTIME` is rebuilt for the new length, and `RDB$RELATIONS.RDB$FORMAT`
+/// is bumped. Only a widening conversion (see [type_change_supported]) is
+/// performed; anything else errors.
+pub fn alter_table_alter_column_type(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    col_name: &str,
+    new_col: &ColumnDef,
+) -> Result<(), String> {
+    let table = table.trim().to_ascii_uppercase();
+    let col_up = col_name.trim().trim_matches('"').to_ascii_uppercase();
+    let rel = crate::resolve_relation(file, page_size, &table)
+        .ok_or_else(|| format!("table {} not found", table))?;
+
+    let cols = relation_columns(file, page_size, &table);
+    let target = cols
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(&col_up))
+        .ok_or_else(|| format!("column {} not found", col_name))?;
+    let fid = target.field_id as usize;
+
+    // the current descriptors, and the conversion check against the field's
+    // existing descriptor
+    let cur_formats = crate::relation_formats(file, page_size, rel);
+    let (_, cur_descs) = cur_formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .ok_or("relation has no format")?;
+    let old_desc = cur_descs.get(fid).ok_or("field beyond format")?;
+    if !type_change_supported(old_desc, new_col) {
+        return Err(format!(
+            "cannot change datatype for {}; conversion not supported",
+            col_name
+        ));
+    }
+
+    // the new format: the target field's descriptor replaced, all repacked
+    let mut fields = descs_to_fields(cur_descs);
+    fields[fid] = (new_col.dtype, new_col.length, new_col.scale, new_col.sub_type);
+    let new_descs = compute_format(&fields);
+
+    // the column's domain (RDB$FIELD_SOURCE) - retyped in place
+    let rf_formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")
+        .ok_or("no RDB$RELATION_FIELDS format")?;
+    let (_, rf_descs) = rf_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let rf_cols = relation_columns(file, page_size, "RDB$RELATION_FIELDS");
+    let rf_fid = |n: &str| rf_cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let rf_rel = rf_fid("RDB$RELATION_NAME").ok_or("no RDB$RELATION_NAME")?;
+    let rf_name = rf_fid("RDB$FIELD_NAME").ok_or("no RDB$FIELD_NAME")?;
+    let rf_src = rf_fid("RDB$FIELD_SOURCE").ok_or("no RDB$FIELD_SOURCE")?;
+    let text = |v: Option<&Value>| match v {
+        Some(Value::Text(t)) => Some(t.trim_end().to_string()),
+        _ => None,
+    };
+    let mut domain: Option<String> = None;
+    walk_rows(file, page_size, 5, rf_descs, |vals| {
+        if text(vals.get(rf_rel)).as_deref() == Some(table.as_str())
+            && text(vals.get(rf_name)).as_deref() == Some(col_up.as_str())
+        {
+            domain = text(vals.get(rf_src));
+        }
+    });
+    let domain = domain.ok_or("column domain not found")?;
+
+    // current format number
+    let (rel_page, rel_slot, mut rel_image, rec_format) =
+        find_relations_row(file, page_size, &table).ok_or("RDB$RELATIONS row not found")?;
+    let sys_formats =
+        system_relation_formats(file, page_size, "RDB$RELATIONS").ok_or("no RDB$RELATIONS format")?;
+    let (_, rel_descs) = sys_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let rel_cols = relation_columns(file, page_size, "RDB$RELATIONS");
+    let rel_field = |name: &str| rel_cols.iter().find(|c| c.name == name).map(|c| c.field_id as usize);
+    let cur_format_no = match decode_record(&rel_image, rel_descs)
+        .get(rel_field("RDB$FORMAT").ok_or("no RDB$FORMAT")?)
+    {
+        Some(Value::Int(n)) => *n,
+        _ => return Err("RDB$FORMAT unreadable".into()),
+    };
+    let new_format_no = cur_format_no + 1;
+
+    // --- new format blob + RDB$FORMATS row ----------------------------
+    let fmt_blob = write_format_blob(file, page_size, &new_descs)?;
+    sys_insert(
+        file,
+        page_size,
+        "RDB$FORMATS",
+        8,
+        &[
+            ("RDB$RELATION_ID", SysVal::I(rel as i64)),
+            ("RDB$FORMAT", SysVal::I(new_format_no)),
+            ("RDB$DESCRIPTOR", SysVal::B(blob_id_bytes(8, fmt_blob))),
+        ],
+    )?;
+
+    // --- retype the domain's RDB$FIELDS row in place ------------------
+    let f_cols = relation_columns(file, page_size, "RDB$FIELDS");
+    let f_fid = |n: &str| f_cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let f_name_fid = f_fid("RDB$FIELD_NAME").ok_or("no RDB$FIELD_NAME")?;
+    let dom_pred = {
+        let dom = domain.clone();
+        move |vals: &[Value]| text(vals.get(f_name_fid)).as_deref() == Some(dom.as_str())
+    };
+    let (fpage, fslot) = find_sys_row_slot(file, page_size, "RDB$FIELDS", 2, dom_pred)
+        .ok_or("RDB$FIELDS domain row not found")?;
+    let f_formats =
+        system_relation_formats(file, page_size, "RDB$FIELDS").ok_or("no RDB$FIELDS format")?;
+    let (f_format_no, f_descs) = {
+        let (n, d) = f_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+        (*n, d.clone())
+    };
+    let mut f_image = {
+        let start = fpage as usize * page_size;
+        let dp = DataPage::decode(file.get(start..start + page_size).ok_or("bad page")?)
+            .ok_or("bad data page")?;
+        dp.record(fslot).and_then(|r| r.image()).ok_or("no field image")?
+    };
+    let patch_field = |image: &mut [u8], name: &str, v: SysVal<'_>| -> Result<(), String> {
+        let fid = f_fid(name).ok_or_else(|| format!("no {} column", name))?;
+        let d = f_descs.get(fid).ok_or("field beyond format")?;
+        let bytes = encode_sys_value(d, &v)?;
+        let at = d.offset as usize;
+        image
+            .get_mut(at..at + bytes.len())
+            .ok_or("image shorter than format")?
+            .copy_from_slice(&bytes);
+        image[fid / 8] &= !(1 << (fid % 8));
+        Ok(())
+    };
+    patch_field(&mut f_image, "RDB$FIELD_TYPE", SysVal::I(new_col.field_type as i64))?;
+    patch_field(&mut f_image, "RDB$FIELD_LENGTH", SysVal::I(new_col.length as i64))?;
+    patch_field(&mut f_image, "RDB$FIELD_SCALE", SysVal::I(new_col.scale as i64))?;
+    patch_field(&mut f_image, "RDB$FIELD_SUB_TYPE", SysVal::I(new_col.sub_type as i64))?;
+    if let Some(cl) = new_col.char_len {
+        patch_field(&mut f_image, "RDB$CHARACTER_LENGTH", SysVal::I(cl as i64))?;
+    }
+    dml::update_records(file, page_size, 2, &[(fpage, fslot, f_image)], f_format_no)?;
+
+    // --- rebuild RDB$RUNTIME (the field's length changed) -------------
+    let runtime = rebuild_runtime_blob(file, page_size, &table, &new_descs)?;
+
+    // --- bump RDB$RELATIONS.RDB$FORMAT and RDB$RUNTIME ----------------
+    let patch = |image: &mut [u8], name: &str, v: SysVal<'_>| -> Result<(), String> {
+        let fid = rel_field(name).ok_or_else(|| format!("no {} column", name))?;
+        let d = rel_descs.get(fid).ok_or("field beyond format")?;
+        let bytes = encode_sys_value(d, &v)?;
+        let at = d.offset as usize;
+        image
+            .get_mut(at..at + bytes.len())
+            .ok_or("image shorter than format")?
+            .copy_from_slice(&bytes);
+        image[fid / 8] &= !(1 << (fid % 8));
+        Ok(())
+    };
+    patch(&mut rel_image, "RDB$FORMAT", SysVal::I(new_format_no))?;
+    patch(&mut rel_image, "RDB$RUNTIME", SysVal::B(blob_id_bytes(6, runtime)))?;
+    dml::update_records(file, page_size, 6, &[(rel_page, rel_slot, rel_image)], rec_format)?;
+
+    advance_oldest_transactions(file, page_size)?;
+    Ok(())
+}
+
 /// CREATE TABLE: the full engine sequence against the file image.
 /// Errors leave the caller's copy to be discarded - the statement
 /// failed, nothing half-created survives.
@@ -1591,5 +1791,6 @@ mod tests {
         let _ = (u16_at(&[0, 0], 0), DPG_RPT_OFFSET, RHD_DATA_OFFSET); // linkage
     }
 }
+
 
 
