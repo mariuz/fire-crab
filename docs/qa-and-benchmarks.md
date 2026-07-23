@@ -1565,6 +1565,48 @@ integer target half-away-from-zero (`12.50` → `13`) and renders them
 with their decimals to text — which first needs numeric columns admitted
 as expression operands at all.
 
+### The forty-third differential — numeric operands, and the rounding rule the engine dictated
+
+The previous slice deferred one thing: a `CAST` whose operand is a scaled
+`NUMERIC` column. The reason was structural — the expression machinery
+only admitted scale-0 integers and text as operands (`col_kind`), so a
+`NUMERIC(9,2)` column could not even be *referenced* inside an
+expression, let alone cast. This slice admits it, and closes the CAST
+surface over the numeric types that motivated it.
+
+The admission is deliberately narrow. A scaled numeric is now a third
+operand type, `ExprType::Numeric`, alongside integer and text — but it is
+only ever an *operand*: arithmetic still rejects it (a `NUMERIC` in
+`+`/`-`/`*`/`/` types as neither integer nor a shape the arithmetic
+handles, so the query falls back rather than guess a scale-propagation
+rule), and a bare numeric column is not itself an expression. What it
+unlocks is exactly the two casts the engine defines: to an integer type,
+and to text. Leaving arithmetic untouched is the honest boundary —
+`NUMERIC + NUMERIC` scale arithmetic is a separate rule set, and claiming
+it without checking it against the engine would be the kind of plausible
+guess this project avoids.
+
+The rounding was the engine's to dictate, and it was probed, not assumed.
+`CAST(NUMERIC AS INTEGER)` rounds **half away from zero**: `12.50` → `13`,
+`13.50` → `14` (not banker's rounding, which would give `12` and `14`),
+`-12.50` → `-13`, `-3.25` → `-3`. The conversion computes in `i128` (so
+it covers `INT128`-backed `NUMERIC`/`DECIMAL(38)` as well as the smaller
+scaled integers) and narrows to `i64`, an overflow there being the same
+`isc_convert_error` a bad string cast raises. To text, the numeric simply
+renders with its declared decimals — `CAST(12.50 AS VARCHAR(10))` is
+`'12.50'` — reusing the renderer the row encoder already uses.
+
+`qa/serve-real-selectexpr.sh` grows from forty-two checks to forty-eight:
+the scratch table gains a `NUMERIC(9,2)` column, and six new casts run
+identically through fire-crab and isql — the round-up (`12.50` → `13`),
+the counter-example to banker's rounding (`13.50` → `14`), a negative
+below the halfway point (`-3.25` → `-3`), the decimal renderings, and a
+NULL. The groupby, having, join and where-predicate gates, whose
+projections all run through the same operand-typing that now recognises
+numerics, still match the engine verbatim. What remains for a later slice
+is numeric *arithmetic* — the scale-propagation rules for `+`/`-`/`*`/`/`
+over `NUMERIC` operands.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
