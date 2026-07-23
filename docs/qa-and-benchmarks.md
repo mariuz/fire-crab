@@ -1750,6 +1750,53 @@ surface: `DROP` of a column, `ALTER` of a column's type, and adding a
 `NOT NULL`/`PRIMARY KEY` column (a constraint over the existing rows) —
 each its own amendment, and each left to error rather than half-apply.
 
+### The forty-seventh differential — ALTER TABLE DROP, and the field-id hole the engine keeps
+
+`DROP` is `ADD`'s mirror, and it reuses the same format-version machinery,
+but the engine's model held one thing worth probing rather than guessing:
+what happens to the *field ids* of the survivors. The answer — read off a
+file the engine dropped a middle column from — is that they do **not**
+renumber. Drop `B` from `A, B, C` and the survivors keep their ids: `A` is
+0, `C` is still 2, and id 1 is a hole. `RDB$RELATIONS.RDB$FIELD_ID`, the
+next-id high-water mark, stays 3 — the engine never reuses a dropped id.
+
+That hole shapes the new format version. The format's descriptor array is
+indexed by field id, so it keeps three entries, but the dropped one
+becomes a zero-length placeholder — `dtype 0, length 0, offset 0` in the
+engine's own blob, dumped with fire-crab's reader to be sure — while the
+surviving descriptors *repack*: with `B` gone, `C` moves from offset 16 to
+offset 8. Existing records keep their old format and still carry `B`'s
+bytes, now unreferenced; new records use the compact new format. So DROP
+writes a new `RDB$FORMATS` row with that placeholder-and-repacked
+descriptor, *deletes* the column's `RDB$RELATION_FIELDS` row and its
+auto-domain (a real catalog delete, the mirror of ADD's inserts), rebuilds
+`RDB$RUNTIME` without the field, and bumps `RDB$RELATIONS.RDB$FORMAT` —
+leaving the field-id high-water untouched.
+
+Feeding the surviving descriptors back through the format computer exposed
+a latent bug the ADD slice had quietly carried: the computer re-adds the
+VARCHAR count word, so a `VARCHAR` fed its own stored length grew two
+bytes on every ALTER. It is value-correct (a length-prefixed VARYING reads
+back the same) but not byte-faithful and, worse, *compounding*. A helper
+now strips the count word before recomputation, so a column's stored
+length is reproduced exactly, ALTER after ALTER.
+
+`qa/serve-real-alter.sh` grows to seventeen checks covering both verbs
+against the engine as oracle — the reference copy has the identical
+`ADD C`, `ADD D`, `DROP B` applied by the engine's own DDL. fire-crab adds
+two columns and drops the original one, the survivors read correctly
+(NULL for the columns older rows never had), a new-format `INSERT`
+populates them, and the engine then adopts the file: it reads the altered
+table byte-identically to its reference, `SHOW TABLE` matches (`A, C, D`,
+no `B`), `SELECT B` raises "column unknown", `gfix -v -full` is clean, the
+engine writes its own row, and `gbak` restores it — the whole amended
+catalog, dropped column and all, replayed as real engine DDL. A dropped
+column that is NOT NULL, indexed, or the table's only column each error
+rather than leave a dangling constraint or index. What ALTER still leaves
+for later is changing a column's *type*, and adding or dropping the
+constraints (`NOT NULL`, keys) that a column drop currently refuses to
+step around.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
