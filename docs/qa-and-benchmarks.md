@@ -2350,6 +2350,53 @@ surviving constraints, and `gfix -v -full` is clean on both the restored copy
 and fire-crab's raw file. Teeth: erasing the index row instead of renaming
 it, and leaving the slot in `irt_normal`, each make the gate `DIFF`.
 
+### The sixtieth differential — DROP INDEX, and two wrong ideas about a dropped index
+
+`DROP INDEX <name>` is the mirror of `CREATE INDEX` and reuses the deferred
+removal the previous slice built. An index that *backs a constraint* is
+refused — "Cannot delete index used by an Integrity Constraint"
+(DdlNodes.epp:14643), which is what `ALTER TABLE DROP CONSTRAINT` is for. The
+statement itself was small. What it cost was two corrections to the model of
+what a dropped index *is*, both found by running the engine's own validator
+over the result rather than by reasoning about it.
+
+**A dropped index is still maintained.** The previous slice concluded that a
+dropped index must be skipped by the write path, because otherwise a dropped
+UNIQUE keeps rejecting duplicates. That is the right *observation* and the
+wrong *mechanism*. `validation.cpp:3239` walks every index-root slot whose
+`getRoot()` is non-zero, and `getRoot()` returns zero only for `irt_unused` —
+so the engine validates a dropped index's tree, and a record inserted after
+the drop without a matching entry earns "Index n is corrupt {missing entries
+for record m}". The engine keeps writing into that tree; what it stops doing
+is *enforcing*, because `setDrop` (ods.h:613) clears
+`irt_unique | irt_foreign | irt_primary`. Reading the flags is the whole
+mechanism — with them cleared, the same maintenance code inserts the entry
+and checks nothing. fire-crab's rule is now that: every slot with a root page
+carries entries, and uniqueness follows the flags.
+
+**An in-place row rewrite that changes a key column needs new index
+entries.** The deferred drop renames the `RDB$INDICES` row, and
+`RDB$INDEX_NAME` is an indexed column of `RDB$INDICES` itself. fire-crab's
+system-row rewrite kept the record's position — so its record number, and
+every index entry pointing at it, stayed valid — but the *key* changed, and
+nothing keyed the new name in. `gfix` said so precisely: "Index 1 is corrupt
+{missing entries for record 511} in table RDB$INDICES". The index maintenance
+that insertion already did is now a named helper both callers share.
+
+Neither bug was visible in the catalog comparison; both were visible to
+`gfix -v -full` on fire-crab's raw file. That check has been in these gates
+since the first write increment, and this is the increment where it earned
+its place twice in a row.
+
+`qa/serve-real-dropindex.sh` (22 checks) has fire-crab and the engine drop
+the same index from the same schema, compares catalogs, index-root slots and
+rows, and then asks the engine's **optimizer** to agree: the query that
+`PLAN`ned through `IX_TB` before now reads the table `NATURAL` on fire-crab's
+file, exactly as on the engine's, while the surviving index is still chosen —
+and the gate asserts that surviving plan really is an index plan, so the
+comparison cannot pass by both sides going `NATURAL`. Then the refusals, the
+`gbak` round trip, and `gfix` on both files.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -2658,6 +2705,15 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-dropconstraint.sh 3050
+
+# DROP INDEX: the mirror of CREATE INDEX - deferred removal, a constraint's
+# index refused, and the engine's OPTIMIZER asked to agree (the query that
+# PLANned through the dropped index now reads NATURAL, the surviving index is
+# still chosen). Builds its own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-dropindex.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
