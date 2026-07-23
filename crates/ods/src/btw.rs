@@ -60,6 +60,8 @@ pub const IDX_BOOLEAN: u16 = 9;
 // irt_flags, ods.h:459-464
 pub const IRT_UNIQUE: u16 = 1;
 pub const IRT_DESCENDING: u16 = 2;
+pub const IRT_FOREIGN: u16 = 4;
+pub const IRT_PRIMARY: u16 = 8;
 pub const IRT_EXPRESSION: u16 = 16;
 pub const IRT_CONDITION: u16 = 32;
 

@@ -1229,12 +1229,23 @@ pub fn alter_table_drop_not_null(
 /// runtime blob's RSR_field_not_null segment (probe-copied verbatim).
 const NONNULL_BLR: [u8; 8] = [5, 59, 61, 24, 0, 0, 0, 76];
 
+/// One `FOREIGN KEY (<columns>) REFERENCES <ref_table> [(<ref_columns>)]`
+/// clause of a CREATE TABLE. `name` is the constraint name (also the FK
+/// index name, as the engine names them the same).
+pub struct ForeignKeyDef {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub ref_table: String,
+    pub ref_columns: Vec<String>,
+}
+
 pub fn create_table(
     file: &mut Vec<u8>,
     page_size: usize,
     name: &str,
     cols: &[ColumnDef],
     pk: &[usize],
+    fks: &[ForeignKeyDef],
 ) -> Result<(), String> {
     if cols.is_empty() {
         return Err("a table needs at least one column".into());
@@ -1426,8 +1437,9 @@ pub fn create_table(
             "RDB$INDEX_NAME", "RDB$PRIMARY")?;
         let iname = format!("RDB$PRIMARY{}", k);
         let pk_cols: Vec<String> = pk.iter().map(|&i| cols[i].name.clone()).collect();
-        create_index(file, page_size, &name, &iname, &pk_cols, true, false, true)?;
+        create_index(file, page_size, &name, &iname, &pk_cols, true, false, true, None)?;
         let cname = format!("INTEG_{}", integ);
+        integ += 1;
         sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
             ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
             ("RDB$CONSTRAINT_TYPE", SysVal::S("PRIMARY KEY")),
@@ -1438,8 +1450,86 @@ pub fn create_table(
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ])?;
     }
+    // --- FOREIGN KEY constraints: a non-unique index on the referencing
+    // columns (irt_foreign, naming the partner PK index), an RDB$RELATION_
+    // CONSTRAINTS 'FOREIGN KEY' row, and an RDB$REF_CONSTRAINTS row linking
+    // to the referenced table's PK constraint (MATCH FULL, RESTRICT rules)
+    for fk in fks {
+        // an unnamed FK is named INTEG_<n> - the same generated name for
+        // both the constraint and its index, as the engine does
+        let fk_name = if fk.name.is_empty() {
+            let n = format!("INTEG_{}", integ);
+            integ += 1;
+            n
+        } else {
+            fk.name.clone()
+        };
+        let (uq_constraint, partner_index) =
+            find_primary_key(file, page_size, &fk.ref_table).ok_or_else(|| {
+                format!("referenced table {} has no primary key", fk.ref_table)
+            })?;
+        create_index(
+            file, page_size, &name, &fk_name, &fk.columns, false, false, false,
+            Some(&partner_index),
+        )?;
+        sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
+            ("RDB$CONSTRAINT_NAME", SysVal::S(&fk_name)),
+            ("RDB$CONSTRAINT_TYPE", SysVal::S("FOREIGN KEY")),
+            ("RDB$RELATION_NAME", SysVal::S(&name)),
+            ("RDB$INDEX_NAME", SysVal::S(&fk_name)),
+            ("RDB$DEFERRABLE", SysVal::S("NO")),
+            ("RDB$INITIALLY_DEFERRED", SysVal::S("NO")),
+            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ])?;
+        sys_row_by_name(file, page_size, "RDB$REF_CONSTRAINTS", &[
+            ("RDB$CONSTRAINT_NAME", SysVal::S(&fk_name)),
+            ("RDB$CONST_NAME_UQ", SysVal::S(&uq_constraint)),
+            ("RDB$MATCH_OPTION", SysVal::S("FULL")),
+            ("RDB$UPDATE_RULE", SysVal::S("RESTRICT")),
+            ("RDB$DELETE_RULE", SysVal::S("RESTRICT")),
+            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+            ("RDB$CONST_SCHEMA_NAME_UQ", SysVal::S("PUBLIC")),
+        ])?;
+    }
     advance_oldest_transactions(file, page_size)?;
     Ok(())
+}
+
+/// The referenced table's PRIMARY KEY: (constraint name, index name),
+/// read from RDB$RELATION_CONSTRAINTS. An FK's RDB$REF_CONSTRAINTS row
+/// names the unique CONSTRAINT (INTEG_n), and its index is the partner
+/// MET_lookup_partner links to.
+fn find_primary_key(file: &[u8], page_size: usize, ref_table: &str) -> Option<(String, String)> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$RELATION_CONSTRAINTS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$RELATION_CONSTRAINTS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$RELATION_CONSTRAINTS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (cn_f, ct_f, rn_f, ix_f) = (
+        fid("RDB$CONSTRAINT_NAME")?,
+        fid("RDB$CONSTRAINT_TYPE")?,
+        fid("RDB$RELATION_NAME")?,
+        fid("RDB$INDEX_NAME")?,
+    );
+    let want = ref_table.trim().to_ascii_uppercase();
+    let mut found = None;
+    walk_rows(file, page_size, rel, descs, |values| {
+        if found.is_some() {
+            return;
+        }
+        let txt = |i: usize| match values.get(i) {
+            Some(Value::Text(t)) => Some(t.trim_end().to_string()),
+            _ => None,
+        };
+        if txt(rn_f).as_deref().map(|s| s.eq_ignore_ascii_case(&want)) == Some(true)
+            && txt(ct_f).as_deref() == Some("PRIMARY KEY")
+        {
+            if let (Some(cn), Some(ix)) = (txt(cn_f), txt(ix_f)) {
+                found = Some((cn, ix));
+            }
+        }
+    });
+    found
 }
 
 /// One past the highest numeric suffix of `<prefix><n>` names in a
@@ -1546,6 +1636,12 @@ pub fn create_index(
     unique: bool,
     descending: bool,
     primary: bool,
+    // Some(partner index) makes this a FOREIGN KEY index: the irt gets
+    // irt_foreign and RDB$INDICES names the partner (referenced) PK/unique
+    // index in RDB$FOREIGN_KEY (+ its schema). MET_lookup_partner links FK
+    // to partner purely through these two columns (met.epp:2401-2412) - the
+    // schema column is the ODS-14 field the older attempts missed.
+    foreign_key: Option<&str>,
 ) -> Result<(), String> {
     let rel = crate::resolve_relation(file, page_size, table)
         .ok_or_else(|| format!("table {} not found", table))?;
@@ -1623,7 +1719,10 @@ pub fn create_index(
         iflags |= btw::IRT_DESCENDING;
     }
     if primary {
-        iflags |= 8; // irt_primary (ods.h:462)
+        iflags |= btw::IRT_PRIMARY; // ods.h:462
+    }
+    if foreign_key.is_some() {
+        iflags |= btw::IRT_FOREIGN; // ods.h:461
     }
     let at = base + 24 + slot * 24;
     file[at..at + 8].copy_from_slice(&0u64.to_le_bytes()); // irt_transaction
@@ -1663,9 +1762,20 @@ pub fn create_index(
         ("RDB$INDEX_INACTIVE", SysVal::I(0)),
         ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
     ];
-    // probe: a PK's RDB$INDEX_TYPE is NULL, a user index carries 0/1
-    if !primary {
+    // probe: a PK's RDB$INDEX_TYPE is NULL, a user index carries 0/1; a
+    // FOREIGN KEY index also leaves RDB$INDEX_TYPE NULL (engine-probed)
+    if !primary && foreign_key.is_none() {
         ivals.push(("RDB$INDEX_TYPE", SysVal::I(if descending { 1 } else { 0 })));
+    }
+    // a foreign-key index names its partner (referenced unique) index. Both
+    // the name AND its schema are required: MET_lookup_partner's self-join
+    // matches IND.RDB$SCHEMA_NAME EQ IDX.RDB$FOREIGN_KEY_SCHEMA_NAME
+    // (met.epp:2408) - omitting the schema column leaves it NULL and the
+    // partner lookup silently fails ("Partner index does not exist") at
+    // gbak restore, which is what blocked the two earlier FK attempts.
+    if let Some(partner) = foreign_key {
+        ivals.push(("RDB$FOREIGN_KEY", SysVal::S(partner)));
+        ivals.push(("RDB$FOREIGN_KEY_SCHEMA_NAME", SysVal::S("PUBLIC")));
     }
     sys_row_by_name(file, page_size, "RDB$INDICES", &ivals)?;
     for (pos, n) in col_names.iter().enumerate() {

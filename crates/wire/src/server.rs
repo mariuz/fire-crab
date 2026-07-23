@@ -680,6 +680,7 @@ enum Plan {
         name: String,
         cols: Vec<fire_crab_ods::ddl::ColumnDef>,
         pk: Vec<usize>,
+        fks: Vec<fire_crab_ods::ddl::ForeignKeyDef>,
     },
     /// `CREATE [UNIQUE] [ASC|DESC] INDEX <name> ON <table> (cols)`:
     /// irt slot + empty root + catalog rows + backfill of existing rows
@@ -1376,8 +1377,16 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let mut cols: Vec<fire_crab_ods::ddl::ColumnDef> = Vec::new();
     let mut pk: Vec<usize> = Vec::new();
     let mut table_pk: Option<Vec<String>> = None;
+    let mut fks: Vec<fire_crab_ods::ddl::ForeignKeyDef> = Vec::new();
     for item in items {
         let up_item = item.trim().to_ascii_uppercase();
+        // a [CONSTRAINT <name>] FOREIGN KEY (cols) REFERENCES t [(refcols)]
+        // table-level constraint (names uppercased like the engine does
+        // for unquoted identifiers)
+        if let Some(fk) = parse_fk_clause(&up_item) {
+            fks.push(fk);
+            continue;
+        }
         if let Some(rest) = up_item.strip_prefix("PRIMARY KEY") {
             // table-level PRIMARY KEY (col, ...)
             let rest = rest.trim();
@@ -1412,9 +1421,70 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         }
     }
     Some((
-        Plan::CreateTable { name: name.to_ascii_uppercase(), cols, pk },
+        Plan::CreateTable { name: name.to_ascii_uppercase(), cols, pk, fks },
         Vec::new(),
     ))
+}
+
+/// Parse one table-level `[CONSTRAINT <name>] FOREIGN KEY (<cols>)
+/// REFERENCES <table> [(<refcols>)]` clause from an already-uppercased
+/// CREATE TABLE item. None if the item is not a foreign-key clause (a
+/// column definition or another constraint), so the caller keeps parsing.
+/// An unnamed FK carries an empty name - create_table generates one.
+fn parse_fk_clause(up_item: &str) -> Option<fire_crab_ods::ddl::ForeignKeyDef> {
+    let mut t = up_item.trim();
+    let mut name = String::new();
+    if let Some(rest) = t.strip_prefix("CONSTRAINT ") {
+        let rest = rest.trim_start();
+        let end = rest.find(char::is_whitespace)?;
+        name = rest[..end].trim_matches('"').to_string();
+        if !ident_ok(&name) {
+            return None;
+        }
+        t = rest[end..].trim_start();
+    }
+    let rest = t.strip_prefix("FOREIGN KEY")?.trim_start();
+    // (referencing columns)
+    if !rest.starts_with('(') {
+        return None;
+    }
+    let close = rest.find(')')?;
+    let columns = split_ident_list(&rest[1..close])?;
+    let after = rest[close + 1..].trim_start().strip_prefix("REFERENCES")?.trim_start();
+    // referenced table, optionally with an explicit (columns) list
+    let (ref_table, ref_columns) = match after.find('(') {
+        Some(p) => {
+            let rc_close = after.rfind(')')?;
+            if rc_close <= p {
+                return None;
+            }
+            let rt = after[..p].trim().trim_matches('"').to_string();
+            (rt, split_ident_list(&after[p + 1..rc_close])?)
+        }
+        None => (after.trim().trim_matches('"').to_string(), Vec::new()),
+    };
+    if !ident_ok(&ref_table) || columns.is_empty() {
+        return None;
+    }
+    Some(fire_crab_ods::ddl::ForeignKeyDef { name, columns, ref_table, ref_columns })
+}
+
+/// Split a comma-separated identifier list (`A, "B", C`), each trimmed and
+/// unquoted; None if any element is not a bare identifier.
+fn split_ident_list(s: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let n = part.trim().trim_matches('"');
+        if !ident_ok(n) {
+            return None;
+        }
+        out.push(n.to_string());
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// Parse `CREATE [UNIQUE] [ASC[ENDING]|DESC[ENDING]] INDEX <name> ON
@@ -2439,13 +2509,13 @@ fn execute_dml(
     let db = database.as_mut().ok_or("no database attached")?;
     let mut work = db.bytes.clone();
     let counts = match plan {
-        Plan::CreateTable { name, cols, pk } => {
-            fire_crab_ods::ddl::create_table(&mut work, db.page_size, name, cols, pk)?;
+        Plan::CreateTable { name, cols, pk, fks } => {
+            fire_crab_ods::ddl::create_table(&mut work, db.page_size, name, cols, pk, fks)?;
             (0, 0, 0)
         }
         Plan::CreateIndex { table, name, cols, unique, descending } => {
             fire_crab_ods::ddl::create_index(
-                &mut work, db.page_size, table, name, cols, *unique, *descending, false,
+                &mut work, db.page_size, table, name, cols, *unique, *descending, false, None,
             )?;
             (0, 0, 0)
         }
@@ -9708,6 +9778,25 @@ mod tests {
         assert_eq!(parse_next_value("A + B", "RDB$DATABASE"), None);
         assert_eq!(parse_next_value("NEXT VALUE FOR SEQ5", "EMP"), None);
         assert_eq!(parse_next_value("NEXT VALUE FOR", "RDB$DATABASE"), None);
+    }
+
+    #[test]
+    fn parses_foreign_key_clauses() {
+        // named FK with an explicit referenced-column list
+        let fk = parse_fk_clause("CONSTRAINT FK_C_P FOREIGN KEY (PID) REFERENCES P (PID)").unwrap();
+        assert_eq!(fk.name, "FK_C_P");
+        assert_eq!(fk.columns, vec!["PID".to_string()]);
+        assert_eq!(fk.ref_table, "P");
+        assert_eq!(fk.ref_columns, vec!["PID".to_string()]);
+        // unnamed FK, referenced columns omitted (default to the PK)
+        let fk = parse_fk_clause("FOREIGN KEY (A, B) REFERENCES OTHER").unwrap();
+        assert_eq!(fk.name, "");
+        assert_eq!(fk.columns, vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(fk.ref_table, "OTHER");
+        assert!(fk.ref_columns.is_empty());
+        // a plain column definition and a PRIMARY KEY clause are not FKs
+        assert!(parse_fk_clause("PID INTEGER").is_none());
+        assert!(parse_fk_clause("PRIMARY KEY (ID)").is_none());
     }
 
     #[test]
