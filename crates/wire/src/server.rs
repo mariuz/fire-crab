@@ -1117,6 +1117,11 @@ fn build_expr_col(
     let (wire, sql_type, length) = match e.type_of(descs)? {
         ExprType::Int => (Wire::Int64, 580, 8),
         ExprType::Text => (Wire::Varying, 448, 32765),
+        // a bare numeric operand never reaches here as a top-level
+        // expression (a lone column is not an "expression", and every
+        // operator either rejects a numeric operand - arithmetic - or
+        // retypes it - CAST/concat); refuse rather than guess a wire form
+        ExprType::Numeric => return None,
     };
     Some(ProjCol {
         name: name.to_string(),
@@ -4561,7 +4566,12 @@ fn resolve_expr(
         RawExpr::Col(name) => {
             let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
             let fid = rc.field_id as usize;
-            col_kind(descs.get(fid)?)?; // must be an int or text column
+            let d = descs.get(fid)?;
+            // an int, text, or scaled-numeric column (numerics are only
+            // usable as CAST/concat operands; type_of/eval enforce that)
+            if col_kind(d).is_none() && !is_numeric_col(d) {
+                return None;
+            }
             Expr::Col(fid)
         }
         RawExpr::Int(n) => Expr::Int(*n),
@@ -4627,10 +4637,42 @@ enum EvalErr {
 
 /// What an expression's result is typed as - which drives its wire form
 /// (BIGINT for integer arithmetic, VARCHAR for a string literal).
-#[derive(Clone, Copy, PartialEq)]
+/// `Numeric` is a scaled exact numeric operand (a `NUMERIC`/`DECIMAL`
+/// column): it is only ever an *operand* here - CAST retypes it, concat
+/// renders it, arithmetic rejects it - never a top-level result.
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum ExprType {
     Int,
     Text,
+    Numeric,
+}
+
+/// A scaled exact-numeric column - the operand form CAST and concat
+/// accept but the scale-0 `col_kind(Int)` does not. `SHORT`/`LONG`/`INT64`
+/// with a non-zero scale decode to `Value::Scaled`; `INT128` to
+/// `Value::Int128`.
+fn is_numeric_col(d: &Descriptor) -> bool {
+    (matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64) && d.scale != 0)
+        || d.dtype == dtype::INT128
+}
+
+/// Round a scaled exact numeric (`raw` at `scale`) to an integer, half
+/// away from zero - the engine's rule for CAST to an integer type
+/// (`12.50` -> `13`, `13.50` -> `14`, `-12.50` -> `-13`). Works in `i128`
+/// so it covers `INT128`-backed numerics; the caller narrows to `i64`.
+fn round_scaled_to_int(raw: i128, scale: i8) -> i128 {
+    if scale >= 0 {
+        return raw * 10i128.pow(scale as u32);
+    }
+    let k = (-scale) as u32;
+    let pow = 10i128.pow(k);
+    let q = raw / pow;
+    let r = raw % pow;
+    if 2 * r.unsigned_abs() >= pow as u128 {
+        q + raw.signum()
+    } else {
+        q
+    }
 }
 
 impl Expr {
@@ -4643,9 +4685,11 @@ impl Expr {
         match self {
             Expr::Col(fid) => {
                 let d = descs.get(*fid)?;
-                match col_kind(d)? {
-                    ColKind::Int => Some(ExprType::Int),
-                    ColKind::Text => Some(ExprType::Text),
+                match col_kind(d) {
+                    Some(ColKind::Int) => Some(ExprType::Int),
+                    Some(ColKind::Text) => Some(ExprType::Text),
+                    None if is_numeric_col(d) => Some(ExprType::Numeric),
+                    None => None,
                 }
             }
             Expr::Int(_) => Some(ExprType::Int),
@@ -4723,17 +4767,30 @@ impl Expr {
                     return Ok(Value::Null); // NULL casts to NULL of any type
                 }
                 match t {
-                    // to the integer family: an integer is kept, a string
-                    // is trimmed and parsed (a non-numeric string is the
-                    // conversion error the engine raises)
-                    CastTarget::Int => match v {
-                        Value::Int(n) => Value::Int(n),
-                        Value::Text(s) => match s.trim().parse::<i64>() {
-                            Ok(n) => Value::Int(n),
-                            Err(_) => return Err(EvalErr::ConversionError),
-                        },
-                        _ => return Err(EvalErr::ConversionError),
-                    },
+                    // to the integer family: an integer is kept, a scaled
+                    // numeric is rounded half away from zero, a string is
+                    // trimmed and parsed (a non-numeric string, or a value
+                    // that overflows i64, is the conversion error)
+                    CastTarget::Int => {
+                        let narrow = |x: i128| match i64::try_from(x) {
+                            Ok(n) => Ok(Value::Int(n)),
+                            Err(_) => Err(EvalErr::ConversionError),
+                        };
+                        match v {
+                            Value::Int(n) => Value::Int(n),
+                            Value::Scaled(raw, scale) => {
+                                narrow(round_scaled_to_int(raw as i128, scale))?
+                            }
+                            Value::Int128(raw, scale) => {
+                                narrow(round_scaled_to_int(raw, scale))?
+                            }
+                            Value::Text(s) => match s.trim().parse::<i64>() {
+                                Ok(n) => Value::Int(n),
+                                Err(_) => return Err(EvalErr::ConversionError),
+                            },
+                            _ => return Err(EvalErr::ConversionError),
+                        }
+                    }
                     // to a text width: render the value, refuse if it does
                     // not fit (the engine's convert error), pad for CHAR
                     CastTarget::Text { len, pad } => {
@@ -8474,15 +8531,18 @@ mod tests {
 
     #[test]
     fn parses_and_evaluates_select_expressions() {
-        // columns A(fid 0, int), B(fid 1, int), NAME(fid 2, text)
+        // columns A(fid 0, int), B(fid 1, int), NAME(fid 2, text),
+        // N(fid 3, NUMERIC(9,2) = LONG scale -2)
         let columns = vec![
             RelationColumn { name: "A".into(), field_id: 0, position: 0 },
             RelationColumn { name: "B".into(), field_id: 1, position: 1 },
             RelationColumn { name: "NAME".into(), field_id: 2, position: 2 },
+            RelationColumn { name: "N".into(), field_id: 3, position: 3 },
         ];
         let d = |dt| Descriptor { dtype: dt, scale: 0, length: 4, sub_type: 0, flags: 0, offset: 0 };
-        let descs = vec![d(dtype::LONG), d(dtype::LONG), d(dtype::VARYING)];
-        let row = vec![Value::Int(10), Value::Int(3), Value::Text("x".into())];
+        let dn = Descriptor { dtype: dtype::LONG, scale: -2, length: 4, sub_type: 0, flags: 0, offset: 0 };
+        let descs = vec![d(dtype::LONG), d(dtype::LONG), d(dtype::VARYING), dn];
+        let row = vec![Value::Int(10), Value::Int(3), Value::Text("x".into()), Value::Scaled(1250, -2)];
 
         let ev = |s: &str| -> Value {
             let raw = parse_raw_expr(s).unwrap();
@@ -8543,6 +8603,16 @@ mod tests {
         }
         // NULL casts to NULL
         assert!(matches!(ev_null("CAST(A AS VARCHAR(5))"), Value::Null));
+        // CAST over a scaled NUMERIC column: rounds to integer half away
+        // from zero, renders with its decimals to text
+        assert!(matches!(ev("CAST(N AS INTEGER)"), Value::Int(13)));
+        assert!(matches!(ev("CAST(N AS VARCHAR(10))"), Value::Text(ref s) if s == "12.50"));
+        // a bare numeric column is not a top-level expression (no wire form)
+        {
+            let raw = parse_raw_expr("CAST(N AS INTEGER)").unwrap();
+            let e = resolve_expr(&raw, &columns, &descs).unwrap();
+            assert_eq!(e.type_of(&descs), Some(ExprType::Int));
+        }
         // a bare column is NOT an expression (the column path handles it)
         assert!(parse_raw_expr("A").is_none());
         // arithmetic over a text column does not type-check
@@ -8563,6 +8633,18 @@ mod tests {
             default_expr_name(&parse_raw_expr("CAST(A AS INTEGER)").unwrap()),
             "CAST"
         );
+    }
+
+    #[test]
+    fn rounds_scaled_half_away_from_zero() {
+        // the engine's CAST(NUMERIC AS INTEGER) rule (probed against isql)
+        assert_eq!(round_scaled_to_int(1250, -2), 13); // 12.50 -> 13
+        assert_eq!(round_scaled_to_int(1350, -2), 14); // 13.50 -> 14 (not banker's)
+        assert_eq!(round_scaled_to_int(-1250, -2), -13); // -12.50 -> -13
+        assert_eq!(round_scaled_to_int(249, -2), 2); // 2.49 -> 2
+        assert_eq!(round_scaled_to_int(251, -2), 3); // 2.51 -> 3
+        assert_eq!(round_scaled_to_int(-325, -2), -3); // -3.25 -> -3
+        assert_eq!(round_scaled_to_int(1000, -2), 10); // 10.00 -> 10 exactly
     }
 
     #[test]

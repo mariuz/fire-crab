@@ -32,12 +32,12 @@ mkdir -p "$DIR"
 rm -f "$SRC" "$CLEAN" "$WORK"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF || { echo "FAIL scratch db creation"; exit 1; }
 CREATE DATABASE '$SRC' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
-CREATE TABLE E (ID INTEGER NOT NULL, A INTEGER, B INTEGER, S VARCHAR(10));
+CREATE TABLE E (ID INTEGER NOT NULL, A INTEGER, B INTEGER, S VARCHAR(10), N NUMERIC(9,2));
 COMMIT;
-INSERT INTO E VALUES (1, 10, 3, 'x');
-INSERT INTO E VALUES (2, 5, 100, 'y');
-INSERT INTO E VALUES (3, NULL, 7, 'z');
-INSERT INTO E VALUES (4, -8, 2, 'w');
+INSERT INTO E VALUES (1, 10, 3, 'x', 12.50);
+INSERT INTO E VALUES (2, 5, 100, 'y', -3.25);
+INSERT INTO E VALUES (3, NULL, 7, 'z', NULL);
+INSERT INTO E VALUES (4, -8, 2, 'w', 13.50);
 COMMIT;
 EOF
 "$ISQL" -q -b -user "$U" -pas "$P" "$SRC" >/dev/null 2>&1 <<'EOF'
@@ -167,6 +167,15 @@ compare "cast of expr"        "SELECT CAST(A + B AS VARCHAR(10)) FROM E WHERE ID
 compare "cast then concat"    "SELECT CAST(A AS VARCHAR(4)) || '!' FROM E WHERE ID = 1"
 compare "cast NULL"           "SELECT CAST(A AS VARCHAR(5)) FROM E WHERE ID = 3"
 compare "cast aliased"        "SELECT CAST(A AS INTEGER) AS X FROM E WHERE ID = 1"
+
+# --- CAST over a scaled NUMERIC column: round to int (half away from
+#     zero), render with decimals to text (the deferred item now done) ---
+compare "cast numeric round up"   "SELECT CAST(N AS INTEGER) FROM E WHERE ID = 1"
+compare "cast numeric half to 14" "SELECT CAST(N AS INTEGER) FROM E WHERE ID = 4"
+compare "cast numeric neg below"  "SELECT CAST(N AS INTEGER) FROM E WHERE ID = 2"
+compare "cast numeric to varchar" "SELECT CAST(N AS VARCHAR(10)) FROM E WHERE ID = 1"
+compare "cast numeric neg varchar" "SELECT CAST(N AS VARCHAR(10)) FROM E WHERE ID = 2"
+compare "cast numeric NULL"       "SELECT CAST(N AS INTEGER) FROM E WHERE ID = 3"
 
 # --- runtime errors: BOTH the engine and fire-crab reject the row rather
 #     than answering. Divide-by-zero is the arithmetic exception (SQLSTATE
