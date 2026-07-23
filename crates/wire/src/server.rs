@@ -732,6 +732,10 @@ enum Plan {
         descs: Vec<Descriptor>,
         index_ops: Vec<IndexOp>,
         param_fields: Vec<(usize, usize)>,
+        /// `NEXT VALUE FOR` / `GEN_ID` fields: (field id, generator name,
+        /// step). Each bumps its generator at execute and stores the new
+        /// value into the field.
+        gen_fields: Vec<(usize, String, Option<i64>)>,
         /// field ids under a NOT NULL constraint - checked after
         /// binding, exactly where the engine validates
         not_null: Vec<usize>,
@@ -1201,13 +1205,18 @@ fn build_projcols(
     Some(out)
 }
 
-/// A value an INSERT accepts: a literal, or a `?` parameter slot bound
-/// at execute.
+/// A value an INSERT accepts: a literal, a `?` parameter slot bound at
+/// execute, or a generator advance (`NEXT VALUE FOR <seq>` /
+/// `GEN_ID(<name>, <n>)`) evaluated at execute - it bumps the generator
+/// and stores the NEW value.
 enum InsVal {
     Int(i64),
     Str(String),
     Null,
     Param(usize),
+    /// `GenId(name, step)`: `None` step = `NEXT VALUE FOR` (use the
+    /// sequence's own increment), `Some(n)` = `GEN_ID(name, n)`.
+    GenId(String, Option<i64>),
 }
 
 /// Parse one column definition of a CREATE TABLE: `<name> <type>`,
@@ -1757,7 +1766,9 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     let toks = tokenize(&tail[1..tail.len() - 1])?;
     let mut vals: Vec<InsVal> = Vec::new();
     let mut nparams = 0usize;
-    for part in split_on(&toks, |t| matches!(t, Tok::Comma)) {
+    // a comma inside GEN_ID(name, n) is not a value separator: split only
+    // on top-level (paren-depth-0) commas
+    for part in split_top_commas(&toks) {
         vals.push(match part {
             [Tok::Int(n)] => InsVal::Int(*n),
             [Tok::Str(v)] => InsVal::Str(v.clone()),
@@ -1765,6 +1776,20 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
             [Tok::Param] => {
                 nparams += 1;
                 InsVal::Param(nparams - 1)
+            }
+            // NEXT VALUE FOR <seq> - advance by the sequence's own increment
+            [Tok::Ident(a), Tok::Ident(b), Tok::Ident(c), Tok::Ident(seq)]
+                if a.eq_ignore_ascii_case("NEXT")
+                    && b.eq_ignore_ascii_case("VALUE")
+                    && c.eq_ignore_ascii_case("FOR") =>
+            {
+                InsVal::GenId(seq.trim_matches('"').to_string(), None)
+            }
+            // GEN_ID(<name>, <step>) - advance by an explicit step
+            [Tok::Ident(g), Tok::LParen, Tok::Ident(name), Tok::Comma, Tok::Int(n), Tok::RParen]
+                if g.eq_ignore_ascii_case("GEN_ID") =>
+            {
+                InsVal::GenId(name.trim_matches('"').to_string(), Some(*n))
             }
             _ => return None,
         });
@@ -1795,24 +1820,50 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         return None;
     }
     let image = build_insert_image(&targets, &vals, descs, db, rel, *format_no)?;
-    // parameter targets in VALUES (= slot) order, each a bindable type
+    // parameter targets in VALUES (= slot) order, each a bindable type;
+    // generator targets, each a bump evaluated at execute
     let mut param_fields = Vec::new();
+    let mut gen_fields = Vec::new();
     let mut params = vec![None; nparams];
     for (rc, v) in targets.iter().zip(&vals) {
-        if let InsVal::Param(slot) = v {
-            let d = descs.get(rc.field_id as usize)?;
-            if !param_target_ok(d) {
-                return None;
+        match v {
+            InsVal::Param(slot) => {
+                let d = descs.get(rc.field_id as usize)?;
+                if !param_target_ok(d) {
+                    return None;
+                }
+                param_fields.push((rc.field_id as usize, *slot));
+                params[*slot] = Some(d.clone());
             }
-            param_fields.push((rc.field_id as usize, *slot));
-            params[*slot] = Some(d.clone());
+            InsVal::GenId(name, step) => {
+                let d = descs.get(rc.field_id as usize)?;
+                // a generator yields a SINT64; the column must hold an
+                // integer (the engine coerces, but we store exact)
+                if !matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64) || d.scale != 0 {
+                    return None;
+                }
+                // the generator must exist at prepare - else refuse rather
+                // than fail mid-write
+                generator_info(db, name)?;
+                gen_fields.push((rc.field_id as usize, name.clone(), *step));
+            }
+            _ => {}
         }
     }
     let params: Vec<Descriptor> = params.into_iter().collect::<Option<_>>()?;
     let descs = descs.clone();
     let not_null = not_null_fids(db, table);
     Some((
-        Plan::Insert { rel, format_no: *format_no, image, descs, index_ops, param_fields, not_null },
+        Plan::Insert {
+            rel,
+            format_no: *format_no,
+            image,
+            descs,
+            index_ops,
+            param_fields,
+            gen_fields,
+            not_null,
+        },
         params,
     ))
 }
@@ -1845,8 +1896,8 @@ fn build_insert_image(
         image[i / 8] |= 1 << (i % 8);
     }
     for (rc, v) in targets.iter().zip(vals) {
-        if matches!(v, InsVal::Param(_)) {
-            continue; // stays NULL-flagged; execute binds the value
+        if matches!(v, InsVal::Param(_) | InsVal::GenId(..)) {
+            continue; // stays NULL-flagged; execute binds/advances the value
         }
         let fid = rc.field_id as usize;
         let d = descs.get(fid)?;
@@ -1873,7 +1924,8 @@ fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
         InsVal::Null => WireParam::Null,
         InsVal::Int(n) => WireParam::Int(*n, 0),
         InsVal::Str(text) => WireParam::Text(text.clone()),
-        InsVal::Param(_) => return None, // parameters bind at execute
+        // parameters bind, generators advance, at execute - not here
+        InsVal::Param(_) | InsVal::GenId(..) => return None,
     };
     encode_wire_value(d, &wp)
 }
@@ -2419,7 +2471,7 @@ fn execute_dml(
             }
             (0, 0, 0)
         }
-        Plan::Insert { rel, format_no, image, descs, index_ops, param_fields, not_null } => {
+        Plan::Insert { rel, format_no, image, descs, index_ops, param_fields, gen_fields, not_null } => {
             let mut image = image.clone();
             for (fid, slot) in param_fields {
                 let d = descs.get(*fid).ok_or("field beyond format")?;
@@ -2428,6 +2480,30 @@ fn execute_dml(
                     .ok_or("parameter type does not match its column")?
                 {
                     None => {} // NULL: the flag is already set
+                    Some(bytes) => {
+                        let at = d.offset as usize;
+                        image[at..at + bytes.len()].copy_from_slice(&bytes);
+                        image[fid / 8] &= !(1 << (fid % 8));
+                    }
+                }
+            }
+            // generator advances: bump each generator (persisting the new
+            // value into `work`, atomic with the record) and store the new
+            // value into its field. The current value is read from `work`
+            // so two NEXT VALUE FOR of one sequence in a row bump twice.
+            for (fid, name, step) in gen_fields {
+                let (id, incr) = generator_info(db, name).ok_or("no such generator")?;
+                let current = generator_slot_offset(&work, db.page_size, id)
+                    .and_then(|at| work.get(at..at + 8))
+                    .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+                    .unwrap_or(0);
+                let new_val = current.wrapping_add(step.unwrap_or(incr));
+                write_generator_value(&mut work, db.page_size, id, new_val)?;
+                let d = descs.get(*fid).ok_or("field beyond format")?;
+                match encode_wire_value(d, &WireParam::Int(new_val, 0))
+                    .ok_or("generator value does not fit its column")?
+                {
+                    None => {}
                     Some(bytes) => {
                         let at = d.offset as usize;
                         image[at..at + bytes.len()].copy_from_slice(&bytes);
@@ -6005,6 +6081,28 @@ fn negate_term(t: &RawTerm) -> Option<RawTerm> {
         RawKind::Like(p, e, negated) => RawKind::Like(p.clone(), *e, !negated),
     };
     Some(RawTerm { lhs: t.lhs.clone(), kind })
+}
+
+/// Split a token slice on top-level commas only - commas nested inside
+/// parentheses (a `GEN_ID(name, n)` call in a VALUES list) stay with
+/// their part. Depth never goes negative for a balanced list.
+fn split_top_commas(toks: &[Tok]) -> Vec<&[Tok]> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0i32;
+    for (i, t) in toks.iter().enumerate() {
+        match t {
+            Tok::LParen => depth += 1,
+            Tok::RParen => depth -= 1,
+            Tok::Comma if depth == 0 => {
+                parts.push(&toks[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&toks[start..]);
+    parts
 }
 
 fn split_on<'a>(toks: &'a [Tok], is_sep: impl Fn(&Tok) -> bool) -> Vec<&'a [Tok]> {
