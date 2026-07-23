@@ -679,7 +679,8 @@ enum Plan {
     CreateTable {
         name: String,
         cols: Vec<fire_crab_ods::ddl::ColumnDef>,
-        pk: Vec<usize>,
+        /// PRIMARY KEY / UNIQUE constraints, in declaration order
+        keys: Vec<fire_crab_ods::ddl::KeyDef>,
         fks: Vec<fire_crab_ods::ddl::ForeignKeyDef>,
     },
     /// `CREATE [UNIQUE] [ASC|DESC] INDEX <name> ON <table> (cols)`:
@@ -1233,11 +1234,15 @@ enum InsVal {
 }
 
 /// Parse one column definition of a CREATE TABLE: `<name> <type>`,
-/// where the type is one of the plain storable types. Constraints
-/// (NOT NULL, PRIMARY KEY, DEFAULT, ...) are refused - the statement
-/// then errors, it never half-creates. Returns the external
-/// RDB$FIELD_TYPE code plus the descriptor pieces (dsc.h dtypes).
-fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, bool)> {
+/// where the type is one of the plain storable types, optionally
+/// followed by the column-level constraints this writer supports -
+/// `NOT NULL` and `[CONSTRAINT <name>] PRIMARY KEY|UNIQUE`, in either
+/// order. Anything else (DEFAULT, CHECK, ...) is refused - the
+/// statement then errors, it never half-creates. Returns the column
+/// (external RDB$FIELD_TYPE code plus the descriptor pieces, dsc.h
+/// dtypes) and its column-level key constraint, if any, as
+/// (constraint name - empty when unnamed, is-primary).
+fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option<(String, bool)>)> {
     use fire_crab_ods::format::dtype;
     let item = item.trim();
     let (name, ty) = item.split_once(char::is_whitespace)?;
@@ -1246,34 +1251,62 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, bool)>
         return None;
     }
     let mut ty = ty.trim().to_ascii_uppercase();
-    // trailing column constraints: [NOT NULL] [PRIMARY KEY]
-    let mut is_pk = false;
+    // trailing column constraints, stripped off the end in any order
+    let mut key: Option<(String, bool)> = None;
     let mut not_null = false;
-    if let Some(rest) = ty.strip_suffix("PRIMARY KEY") {
-        is_pk = true;
-        ty = rest.trim_end().to_string();
-    }
-    if let Some(rest) = ty.strip_suffix("NOT NULL") {
-        not_null = true;
-        ty = rest.trim_end().to_string();
-    }
-    if is_pk {
-        not_null = true; // PRIMARY KEY implies NOT NULL
+    loop {
+        let t = ty.trim_end();
+        let (rest, primary) = if let Some(r) = t.strip_suffix("PRIMARY KEY") {
+            (r, true)
+        } else if let Some(r) = t.strip_suffix("UNIQUE") {
+            (r, false)
+        } else if let Some(r) = t.strip_suffix("NOT NULL") {
+            not_null = true;
+            ty = r.trim_end().to_string();
+            continue;
+        } else {
+            break;
+        };
+        if key.is_some() {
+            return None; // two key constraints on one column
+        }
+        // the key words may be preceded by CONSTRAINT <name>
+        let mut head = rest.trim_end().to_string();
+        let mut cname = String::new();
+        if let Some(sp) = head.rfind(char::is_whitespace) {
+            let cand = head[sp + 1..].trim().trim_matches('"').to_string();
+            let before = head[..sp].trim_end().to_string();
+            if let Some(pre) = before.strip_suffix("CONSTRAINT") {
+                if pre.is_empty() || pre.ends_with(char::is_whitespace) {
+                    if !ident_ok(&cand) {
+                        return None;
+                    }
+                    cname = cand;
+                    head = pre.trim_end().to_string();
+                }
+            }
+        }
+        if primary {
+            not_null = true; // PRIMARY KEY implies NOT NULL
+        }
+        key = Some((cname, primary));
+        ty = head;
     }
     let col = |field_type: i16, dt: u8, length: u16, scale: i8, sub_type: i16, char_len: Option<u16>| {
-        Some((
-            fire_crab_ods::ddl::ColumnDef {
-                name: name.to_ascii_uppercase(),
-                field_type,
-                dtype: dt,
-                length,
-                scale,
-                sub_type,
-                char_len,
-                not_null,
-            },
-            is_pk,
-        ))
+        Some(fire_crab_ods::ddl::ColumnDef {
+            name: name.to_ascii_uppercase(),
+            field_type,
+            dtype: dt,
+            length,
+            scale,
+            sub_type,
+            char_len,
+            not_null,
+            // a column-level NOT NULL (explicit or from a column-level
+            // PRIMARY KEY) is the case the engine records as a
+            // constraint row
+            not_null_constraint: not_null,
+        })
     };
     // parenthesised argument(s), if any
     let (base, args) = match ty.find('(') {
@@ -1289,7 +1322,7 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, bool)>
         }
         None => (ty.clone(), Vec::new()),
     };
-    match (base.as_str(), args.as_slice()) {
+    let built = match (base.as_str(), args.as_slice()) {
         ("SMALLINT", []) => col(7, dtype::SHORT, 2, 0, 0, None),
         ("INTEGER" | "INT", []) => col(8, dtype::LONG, 4, 0, 0, None),
         ("BIGINT", []) => col(16, dtype::INT64, 8, 0, 0, None),
@@ -1305,14 +1338,15 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, bool)>
         // sub_type 1 = NUMERIC, 2 = DECIMAL
         ("NUMERIC" | "DECIMAL", [p]) => {
             let sub = if base == "NUMERIC" { 1 } else { 2 };
-            numeric_col(name, *p, 0, sub, not_null).map(|c| (c, is_pk))
+            numeric_col(name, *p, 0, sub, not_null)
         }
         ("NUMERIC" | "DECIMAL", [p, s]) if s <= p => {
             let sub = if base == "NUMERIC" { 1 } else { 2 };
-            numeric_col(name, *p, *s, sub, not_null).map(|c| (c, is_pk))
+            numeric_col(name, *p, *s, sub, not_null)
         }
         _ => None,
-    }
+    };
+    Some((built?, key))
 }
 
 fn numeric_col(
@@ -1338,6 +1372,7 @@ fn numeric_col(
         sub_type,
         char_len: None,
         not_null,
+        not_null_constraint: not_null,
     })
 }
 
@@ -1383,8 +1418,9 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     items.push(&body[start..]);
 
     let mut cols: Vec<fire_crab_ods::ddl::ColumnDef> = Vec::new();
-    let mut pk: Vec<usize> = Vec::new();
-    let mut table_pk: Option<Vec<String>> = None;
+    // key constraints in DECLARATION order - the order the engine's
+    // generated constraint and index names follow
+    let mut keys: Vec<fire_crab_ods::ddl::KeyDef> = Vec::new();
     let mut fks: Vec<fire_crab_ods::ddl::ForeignKeyDef> = Vec::new();
     for item in items {
         let up_item = item.trim().to_ascii_uppercase();
@@ -1395,43 +1431,76 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             fks.push(fk);
             continue;
         }
-        if let Some(rest) = up_item.strip_prefix("PRIMARY KEY") {
-            // table-level PRIMARY KEY (col, ...)
-            let rest = rest.trim();
-            if !(rest.starts_with('(') && rest.ends_with(')')) || table_pk.is_some() {
-                return None;
-            }
-            let mut names = Vec::new();
-            for n in rest[1..rest.len() - 1].split(',') {
-                let n = n.trim().trim_matches('"');
-                if !ident_ok(n) {
-                    return None;
-                }
-                names.push(n.to_string());
-            }
-            table_pk = Some(names);
+        // a [CONSTRAINT <name>] PRIMARY KEY|UNIQUE (cols) table-level one
+        if let Some(key) = parse_key_clause(&up_item) {
+            keys.push(key);
             continue;
         }
-        let (col, is_pk) = parse_column_def(item)?;
-        if is_pk {
-            pk.push(cols.len());
+        let (col, col_key) = parse_column_def(item)?;
+        if let Some((kname, primary)) = col_key {
+            keys.push(fire_crab_ods::ddl::KeyDef {
+                name: kname,
+                columns: vec![col.name.clone()],
+                primary,
+            });
         }
         cols.push(col);
     }
-    if let Some(names) = table_pk {
-        if !pk.is_empty() {
-            return None; // both column-level and table-level PK
+    // resolve the key columns and apply the PRIMARY KEY's implied NOT
+    // NULL. A table-level PRIMARY KEY sets its columns' NULL_FLAG but
+    // gets no NOT NULL constraint row - the engine's own shape, so
+    // not_null_constraint stays as the column declared it.
+    let mut has_pk = false;
+    for k in &keys {
+        if k.primary {
+            if has_pk {
+                return None; // more than one PRIMARY KEY
+            }
+            has_pk = true;
         }
-        for n in names {
-            let i = cols.iter().position(|c| c.name.eq_ignore_ascii_case(&n))?;
-            cols[i].not_null = true;
-            pk.push(i);
+        for n in &k.columns {
+            let i = cols.iter().position(|c| c.name.eq_ignore_ascii_case(n))?;
+            if k.primary {
+                cols[i].not_null = true;
+            }
         }
     }
     Some((
-        Plan::CreateTable { name: name.to_ascii_uppercase(), cols, pk, fks },
+        Plan::CreateTable { name: name.to_ascii_uppercase(), cols, keys, fks },
         Vec::new(),
     ))
+}
+
+/// Parse one table-level `[CONSTRAINT <name>] PRIMARY KEY|UNIQUE
+/// (<cols>)` clause from an already-uppercased CREATE TABLE item.
+/// None if the item is something else (a column definition or another
+/// constraint), so the caller keeps parsing. An unnamed key carries an
+/// empty name - create_table generates the engine's INTEG_<n>.
+fn parse_key_clause(up_item: &str) -> Option<fire_crab_ods::ddl::KeyDef> {
+    let mut t = up_item.trim();
+    let mut name = String::new();
+    if let Some(rest) = t.strip_prefix("CONSTRAINT ") {
+        let rest = rest.trim_start();
+        let end = rest.find(char::is_whitespace)?;
+        name = rest[..end].trim_matches('"').to_string();
+        if !ident_ok(&name) {
+            return None;
+        }
+        t = rest[end..].trim_start();
+    }
+    let (rest, primary) = if let Some(rest) = t.strip_prefix("PRIMARY KEY") {
+        (rest, true)
+    } else if let Some(rest) = t.strip_prefix("UNIQUE") {
+        (rest, false)
+    } else {
+        return None;
+    };
+    let rest = rest.trim();
+    if !(rest.starts_with('(') && rest.ends_with(')')) {
+        return None;
+    }
+    let columns = split_ident_list(&rest[1..rest.len() - 1])?;
+    Some(fire_crab_ods::ddl::KeyDef { name, columns, primary })
 }
 
 /// Parse one table-level `[CONSTRAINT <name>] FOREIGN KEY (<cols>)
@@ -1599,8 +1668,8 @@ fn plan_alter_table_add(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             Vec::new(),
         ));
     }
-    let (col, is_pk) = parse_column_def(&s[add_kw + "ADD".len()..])?;
-    if is_pk || col.not_null {
+    let (col, col_key) = parse_column_def(&s[add_kw + "ADD".len()..])?;
+    if col_key.is_some() || col.not_null {
         return None;
     }
     Some((
@@ -1677,7 +1746,7 @@ fn plan_alter_table_alter_type(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         return None;
     }
     let datatype = s[type_kw + "TYPE".len()..].trim();
-    let (new_col, _is_pk) = parse_column_def(&format!("C {}", datatype))?;
+    let (new_col, _col_key) = parse_column_def(&format!("C {}", datatype))?;
     Some((
         Plan::AlterColumnType {
             table: table.to_ascii_uppercase(),
@@ -2525,8 +2594,8 @@ fn execute_dml(
     let db = database.as_mut().ok_or("no database attached")?;
     let mut work = db.bytes.clone();
     let counts = match plan {
-        Plan::CreateTable { name, cols, pk, fks } => {
-            fire_crab_ods::ddl::create_table(&mut work, db.page_size, name, cols, pk, fks)?;
+        Plan::CreateTable { name, cols, keys, fks } => {
+            fire_crab_ods::ddl::create_table(&mut work, db.page_size, name, cols, keys, fks)?;
             (0, 0, 0)
         }
         Plan::CreateIndex { table, name, cols, unique, descending } => {
@@ -9818,6 +9887,89 @@ mod tests {
         // a plain column definition and a PRIMARY KEY clause are not FKs
         assert!(parse_fk_clause("PID INTEGER").is_none());
         assert!(parse_fk_clause("PRIMARY KEY (ID)").is_none());
+    }
+
+    #[test]
+    fn parses_table_level_key_constraints() {
+        // named compound PRIMARY KEY
+        let k = parse_key_clause("CONSTRAINT PK_P PRIMARY KEY (A, B)").unwrap();
+        assert_eq!(k.name, "PK_P");
+        assert_eq!(k.columns, vec!["A".to_string(), "B".to_string()]);
+        assert!(k.primary);
+        // unnamed UNIQUE
+        let k = parse_key_clause("UNIQUE (B)").unwrap();
+        assert_eq!(k.name, "");
+        assert_eq!(k.columns, vec!["B".to_string()]);
+        assert!(!k.primary);
+        // a column whose name merely starts with UNIQUE is a column def
+        assert!(parse_key_clause("UNIQUEID INTEGER").is_none());
+        assert!(parse_key_clause("FOREIGN KEY (A) REFERENCES P").is_none());
+    }
+
+    #[test]
+    fn parses_column_level_key_constraints() {
+        // a named column-level PRIMARY KEY: the key is reported and the
+        // column carries the implied NOT NULL as a CONSTRAINT-bearing one
+        let (col, key) = parse_column_def("X INTEGER CONSTRAINT PK_Q PRIMARY KEY").unwrap();
+        assert_eq!(col.name, "X");
+        assert!(col.not_null && col.not_null_constraint);
+        assert_eq!(key, Some(("PK_Q".to_string(), true)));
+        // an unnamed column-level UNIQUE implies nothing about NULLs
+        let (col, key) = parse_column_def("A INTEGER UNIQUE").unwrap();
+        assert!(!col.not_null);
+        assert_eq!(key, Some((String::new(), false)));
+        // NOT NULL and the key constraint in either order
+        let (col, key) = parse_column_def("A INTEGER NOT NULL UNIQUE").unwrap();
+        assert!(col.not_null);
+        assert_eq!(key, Some((String::new(), false)));
+        let (col, key) = parse_column_def("A VARCHAR(10) UNIQUE NOT NULL").unwrap();
+        assert_eq!(col.length, 12);
+        assert!(col.not_null);
+        assert_eq!(key, Some((String::new(), false)));
+        // a plain column has no key
+        assert_eq!(parse_column_def("A INTEGER").unwrap().1, None);
+    }
+
+    #[test]
+    fn create_table_keeps_key_constraints_in_declaration_order() {
+        // the engine numbers generated constraint and index names in
+        // declaration order, so the plan must preserve it
+        let plan = plan_create_table(
+            "CREATE TABLE M (A INTEGER NOT NULL, B INTEGER, UNIQUE(B), \
+             C INTEGER NOT NULL, PRIMARY KEY(A))",
+        )
+        .unwrap()
+        .0;
+        match plan {
+            Plan::CreateTable { cols, keys, .. } => {
+                assert_eq!(keys.len(), 2);
+                assert!(!keys[0].primary && keys[0].columns == vec!["B".to_string()]);
+                assert!(keys[1].primary && keys[1].columns == vec!["A".to_string()]);
+                // the table-level PRIMARY KEY makes A NOT NULL, but A's
+                // constraint row comes from its own NOT NULL; B stays
+                // nullable despite being UNIQUE
+                assert!(cols[0].not_null && cols[0].not_null_constraint);
+                assert!(!cols[1].not_null);
+            }
+            _ => panic!("not a CREATE TABLE plan"),
+        }
+        // a table-level PRIMARY KEY alone sets NULL_FLAG without a
+        // NOT NULL constraint row
+        let plan = plan_create_table("CREATE TABLE P (A INTEGER, B INTEGER, PRIMARY KEY (A, B))")
+            .unwrap()
+            .0;
+        match plan {
+            Plan::CreateTable { cols, .. } => {
+                assert!(cols[0].not_null && !cols[0].not_null_constraint);
+                assert!(cols[1].not_null && !cols[1].not_null_constraint);
+            }
+            _ => panic!("not a CREATE TABLE plan"),
+        }
+        // two PRIMARY KEYs are refused
+        assert!(plan_create_table(
+            "CREATE TABLE T (A INTEGER PRIMARY KEY, B INTEGER, PRIMARY KEY (B))"
+        )
+        .is_none());
     }
 
     #[test]

@@ -67,6 +67,25 @@ pub struct ColumnDef {
     pub char_len: Option<u16>,
     /// NOT NULL - explicit, or implied by PRIMARY KEY membership
     pub not_null: bool,
+    /// whether this column's NOT NULL is a COLUMN-level declaration
+    /// (`... NOT NULL` or a column-level `PRIMARY KEY`). The engine
+    /// writes an `INTEG_<n>` "NOT NULL" constraint row only for those;
+    /// a TABLE-level `PRIMARY KEY (a, b)` sets its columns' NULL_FLAG
+    /// but writes no constraint row (probed: table P vs table Q).
+    pub not_null_constraint: bool,
+}
+
+/// One table-level key constraint of a CREATE TABLE: a `PRIMARY KEY` or
+/// a `UNIQUE`, named or not. Both are backed by a unique index; the
+/// engine names that index after the constraint when the constraint is
+/// named, and generates `RDB$PRIMARY<n>` / `RDB$<n>` when it is not.
+pub struct KeyDef {
+    /// constraint name, empty when the statement did not name it
+    pub name: String,
+    /// key columns, in key order
+    pub columns: Vec<String>,
+    /// PRIMARY KEY (true) or UNIQUE (false)
+    pub primary: bool,
 }
 
 /// Values a system-catalog row is built from, keyed by column name.
@@ -1244,7 +1263,7 @@ pub fn create_table(
     page_size: usize,
     name: &str,
     cols: &[ColumnDef],
-    pk: &[usize],
+    keys: &[KeyDef],
     fks: &[ForeignKeyDef],
 ) -> Result<(), String> {
     if cols.is_empty() {
@@ -1409,13 +1428,13 @@ pub fn create_table(
             ],
         )?;
     }
-    // --- constraints: NOT NULL rows, and the PRIMARY KEY (probe-shaped:
-    // one INTEG_<n> 'NOT NULL' + RDB$CHECK_CONSTRAINTS row per not-null
-    // column, then INTEG_<n> 'PRIMARY KEY' naming an RDB$PRIMARY<k>
-    // unique+primary index) ----------------------------------------------
+    // --- constraints: NOT NULL rows first (in column order), then the
+    // key constraints in DECLARATION order - the order the engine's own
+    // INTEG_<n> and index-name sequences follow (probe: a table whose
+    // UNIQUE precedes its PRIMARY KEY numbers them in that order) ---------
     let mut integ = next_numeric_suffix(file, page_size, "RDB$RELATION_CONSTRAINTS",
         "RDB$CONSTRAINT_NAME", "INTEG_")?;
-    for c in cols.iter().filter(|c| c.not_null) {
+    for c in cols.iter().filter(|c| c.not_null_constraint) {
         let cname = format!("INTEG_{}", integ);
         integ += 1;
         sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
@@ -1432,17 +1451,30 @@ pub fn create_table(
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ])?;
     }
-    if !pk.is_empty() {
-        let k = next_numeric_suffix(file, page_size, "RDB$INDICES",
-            "RDB$INDEX_NAME", "RDB$PRIMARY")?;
-        let iname = format!("RDB$PRIMARY{}", k);
-        let pk_cols: Vec<String> = pk.iter().map(|&i| cols[i].name.clone()).collect();
-        create_index(file, page_size, &name, &iname, &pk_cols, true, false, true, None)?;
-        let cname = format!("INTEG_{}", integ);
-        integ += 1;
+    for key in keys {
+        // a named constraint names its index too; an unnamed one draws
+        // both from the engine's generated sequences (probed: ONE index
+        // number sequence feeds RDB$PRIMARY<n> and RDB$<n> alike)
+        let (cname, iname) = if key.name.is_empty() {
+            let n = next_index_number(file, page_size)?;
+            let iname = if key.primary {
+                format!("RDB$PRIMARY{}", n)
+            } else {
+                format!("RDB${}", n)
+            };
+            let cname = format!("INTEG_{}", integ);
+            integ += 1;
+            (cname, iname)
+        } else {
+            (key.name.clone(), key.name.clone())
+        };
+        create_index(
+            file, page_size, &name, &iname, &key.columns, true, false, key.primary, None,
+        )?;
         sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
             ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
-            ("RDB$CONSTRAINT_TYPE", SysVal::S("PRIMARY KEY")),
+            ("RDB$CONSTRAINT_TYPE",
+                SysVal::S(if key.primary { "PRIMARY KEY" } else { "UNIQUE" })),
             ("RDB$RELATION_NAME", SysVal::S(&name)),
             ("RDB$INDEX_NAME", SysVal::S(&iname)),
             ("RDB$DEFERRABLE", SysVal::S("NO")),
@@ -1585,6 +1617,18 @@ fn find_primary_key(file: &[u8], page_size: usize, ref_table: &str) -> Option<(S
 /// One past the highest numeric suffix of `<prefix><n>` names in a
 /// catalog column - the INTEG_/RDB$PRIMARY sequences (the engine's own
 /// name generators skip used names, so max+1 cannot collide later).
+/// The next generated index number. The engine draws the `RDB$<n>` name
+/// of an unnamed UNIQUE index and the `RDB$PRIMARY<n>` name of an
+/// unnamed PRIMARY KEY index from ONE sequence (probed: a table
+/// declaring UNIQUE then PRIMARY KEY got RDB$7 and RDB$PRIMARY8), so
+/// both spellings are scanned and the higher successor wins.
+fn next_index_number(file: &[u8], page_size: usize) -> Result<u64, String> {
+    let plain = next_numeric_suffix(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME", "RDB$")?;
+    let primary =
+        next_numeric_suffix(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME", "RDB$PRIMARY")?;
+    Ok(plain.max(primary))
+}
+
 fn next_numeric_suffix(
     file: &[u8],
     page_size: usize,
