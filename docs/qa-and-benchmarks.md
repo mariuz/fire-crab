@@ -1461,6 +1461,58 @@ is deliberately left for later is the *increment during a query* —
 mutates the generator mid-fetch rather than through a statement of its
 own.
 
+### The forty-first differential — the division and concatenation operators
+
+The select-list arithmetic was `+`, `-`, `*` and unary minus; this
+slice adds the two operators that widen it to the rest of the everyday
+surface: integer division `/` and string concatenation `||`. Both are
+oracle-checked against the engine value-for-value and header-for-header,
+and both taught something the differential had not yet had to face.
+
+Division is the arithmetic one. `a / b` over integers truncates toward
+zero — `10 / 3` is `3`, `-8 / 2` is `-4`, `2 / -8` is `0` — which is
+Rust's own `i64` division, matching ExprNodes.cpp; the un-aliased column
+takes the engine's operation name, `DIVIDE`. What division brings that
+addition never did is a *runtime error*: a zero divisor is not a value,
+it is the arithmetic exception (`isc_arith_except` /
+`isc_exception_integer_divide_by_zero`, ExprNodes.cpp:2615), and the
+server must raise it rather than answer — a bare `x / 0` would panic the
+process if evaluated naively. So expression evaluation now returns a
+`Result`: a divide-by-zero on a row aborts *before any byte of that
+row's message is written*, and the fetch loop ships the engine's own
+error `op_response` in place of the row — exactly what the real server
+does when a fetch access method errors mid-cursor
+(server.cpp:4302, `send_response(… status …)`, not an `op_fetch_response`).
+Rows that filtered out never divide, and good rows already streamed stay
+streamed; only the offending row turns into the error. The precedence
+that guards this — the header write moved *inside* row encoding, after
+the values are computed — is the kind of ordering a naive port gets
+wrong and a panic then exposes.
+
+Concatenation is the string one, and it corrected the precedence table.
+The intuition "`||` is like `+` for strings, so it binds loosely" is
+wrong for Firebird dialect 3: `parse.y:745` puts `CONCATENATE` *above*
+unary minus and the multiplicative and additive operators, so
+`1 || 2 + 3` parses as `(1 || 2) + 3` — which is why the engine then
+rejects it with "Strings cannot be added or subtracted", not as `1 ||
+5`. The recursive-descent parser gained a `||` level tighter than unary,
+left-associative, and the operator coerces each operand to text (`10 ||
+'n'` is `'10n'`, an integer rendered then joined), propagates NULL, and
+names its column `CONCATENATION`. The oracle confirmed the parse: the
+engine agrees `'a' || 'b' || 'c'` is `'abc'` and that the mixed
+`||`/`+` form is the error the precedence implies.
+
+`qa/serve-real-selectexpr.sh` grows from fourteen checks to twenty-nine.
+Fifteen new ones run identically through fire-crab (node-firebird) and
+isql on the same file — six divisions (truncation each direction, a
+literal, a NULL operand, division composed with `*`), six
+concatenations (columns, a literal, both-sided, an int coerced, a
+left-associative chain, a NULL operand), and two divide-by-zero forms (a
+constant `x / 0` and a per-row `x / (b - b)`) where *both* the engine
+and fire-crab reject the row with SQLSTATE 22012 rather than answering.
+The groupby, join and where-predicate gates, which share the row-encoder
+that now carries the error path, still match the engine verbatim.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
