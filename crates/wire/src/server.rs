@@ -625,11 +625,12 @@ struct ProjCol {
 
 impl ProjCol {
     /// The column's value for a decoded row: the expression's result if
-    /// it is one, else the record field at `field_id`.
-    fn value_of(&self, values: &[Value]) -> Value {
+    /// it is one, else the record field at `field_id`. `Err` is a per-row
+    /// arithmetic exception raised while evaluating an expression column.
+    fn value_of(&self, values: &[Value]) -> Result<Value, EvalErr> {
         match &self.expr {
             Some(e) => e.eval(values),
-            None => values.get(self.field_id).cloned().unwrap_or(Value::Null),
+            None => Ok(values.get(self.field_id).cloned().unwrap_or(Value::Null)),
         }
     }
 }
@@ -3816,13 +3817,66 @@ fn answer_info_sql(items: &[u8], plan: &Plan, last_dml: (i32, i32, i32)) -> Vec<
 /// value is None); `Project` walks the relation, filters, and either
 /// streams the rows or - if there is an ORDER BY - collects, sorts and
 /// then emits them.
+/// Why row emission stopped early. `Bind` is a filter bind failure -
+/// op_execute already reported it, so the cursor just ends (terminator
+/// only). `Eval` is a per-row arithmetic exception (divide by zero): the
+/// good rows already streamed are followed by the engine's error
+/// op_response, in place of the terminator - which is exactly what the
+/// real server sends when a fetch access method errors mid-cursor
+/// (server.cpp:4302, `send_response(... status ...)`).
+enum EmitErr {
+    Bind,
+    Eval,
+}
+
+impl From<String> for EmitErr {
+    fn from(_: String) -> Self {
+        EmitErr::Bind
+    }
+}
+
+impl From<EvalErr> for EmitErr {
+    fn from(_: EvalErr) -> Self {
+        EmitErr::Eval
+    }
+}
+
+/// isc_arith_except and isc_exception_integer_divide_by_zero - the status
+/// vector the engine posts for an integer divide by zero (ExprNodes.cpp:2615,
+/// iberror.h). isql renders it "arithmetic exception ... / Integer divide
+/// by zero".
+const GDS_ARITH_EXCEPT: i32 = 335544321;
+const GDS_INTEGER_DIVIDE: i32 = 335544778;
+
+/// Write, into the fetch reply stream, the op_response the engine sends
+/// when a row's evaluation raises the arithmetic exception - mirroring
+/// `respond_error`'s layout but carrying the two-part status vector.
+fn write_arith_error(w: &mut W) {
+    w.int(OP_RESPONSE)
+        .int(0)
+        .int(0)
+        .int(0) // blob id
+        .int(0) // response data length
+        .int(1) // isc_arg_gds
+        .int(GDS_ARITH_EXCEPT)
+        .int(1) // isc_arg_gds
+        .int(GDS_INTEGER_DIVIDE)
+        .int(0); // isc_arg_end
+}
+
 fn emit_rows(w: &mut W, plan: &Plan, db: &Option<Database>, args: &[WireParam]) {
     // a filter bind failure emits no rows, only the terminator -
     // op_execute already validated the bind and reported any error, so
-    // reaching fetch with a bad bind means the client ignored it
-    let _ = emit_rows_inner(w, plan, db, args);
-    // end-of-cursor terminator
-    w.int(OP_FETCH_RESPONSE).int(100).int(0);
+    // reaching fetch with a bad bind means the client ignored it; an
+    // arithmetic exception mid-cursor is reported like the engine, with
+    // an error op_response in place of the terminator
+    match emit_rows_inner(w, plan, db, args) {
+        Ok(()) | Err(EmitErr::Bind) => {
+            // end-of-cursor terminator
+            w.int(OP_FETCH_RESPONSE).int(100).int(0);
+        }
+        Err(EmitErr::Eval) => write_arith_error(w),
+    }
 }
 
 fn emit_rows_inner(
@@ -3830,7 +3884,7 @@ fn emit_rows_inner(
     plan: &Plan,
     db: &Option<Database>,
     args: &[WireParam],
-) -> Result<(), String> {
+) -> Result<(), EmitErr> {
     match plan {
         // DML, DDL and generator writes have no cursor: terminator only
         Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
@@ -3874,12 +3928,20 @@ fn emit_rows_inner(
                 let filter = bind_filter(filter, args)?;
                 let accepts = |v: &[Value]| filter.as_ref().map_or(true, |p| p.matches(v));
                 if order_by.is_empty() {
+                    // stream matching rows; a divide-by-zero on any row
+                    // stops the walk and is reported after the loop
+                    let mut eval_err = false;
                     for_each_record(db, *rel, formats, |values| {
-                        if accepts(values) {
-                            w.int(OP_FETCH_RESPONSE).int(0).int(1);
-                            encode_row(w, cols, values);
+                        if eval_err {
+                            return;
+                        }
+                        if accepts(values) && encode_row(w, cols, values).is_err() {
+                            eval_err = true;
                         }
                     });
+                    if eval_err {
+                        return Err(EmitErr::Eval);
+                    }
                 } else {
                     // collect matching rows, then sort by the ORDER BY keys
                     let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -3890,8 +3952,7 @@ fn emit_rows_inner(
                     });
                     rows.sort_by(|a, b| order_cmp(a, b, order_by));
                     for values in &rows {
-                        w.int(OP_FETCH_RESPONSE).int(0).int(1);
-                        encode_row(w, cols, values);
+                        encode_row(w, cols, values)?;
                     }
                 }
             }
@@ -3919,8 +3980,7 @@ fn emit_rows_inner(
                     rows.sort_by(|a, b| order_cmp(a, b, order_by));
                 }
                 for values in &rows {
-                    w.int(OP_FETCH_RESPONSE).int(0).int(1);
-                    encode_row(w, cols, values);
+                    encode_row(w, cols, values)?;
                 }
             }
         }
@@ -3944,8 +4004,7 @@ fn emit_rows_inner(
                     rows.sort_by(|a, b| order_cmp(a, b, order_by));
                 }
                 for values in &rows {
-                    w.int(OP_FETCH_RESPONSE).int(0).int(1);
-                    encode_row(w, cols, values);
+                    encode_row(w, cols, values)?;
                 }
             }
         }
@@ -3958,9 +4017,20 @@ fn emit_rows_inner(
 /// INT64 as 8 big-endian bytes, each VARYING as a 4-byte length + text +
 /// 4-byte padding. Null columns contribute only their bit; the client
 /// skips their data (protocol 13+ layout).
-fn encode_row(w: &mut W, cols: &[ProjCol], values: &[Value]) {
-    // each column's value: an expression's result, or the record field
-    let vals: Vec<Value> = cols.iter().map(|c| c.value_of(values)).collect();
+/// Emit one row - the op_fetch_response header then the message - or
+/// `Err(EvalErr)` if any expression column raised an arithmetic exception
+/// on this row, in which case NOTHING is written (the values are computed
+/// before the header, so the caller can emit the error response cleanly in
+/// place of the row, exactly as the engine does: it ships no fetch_response
+/// for the failing row, only the error op_response).
+fn encode_row(w: &mut W, cols: &[ProjCol], values: &[Value]) -> Result<(), EvalErr> {
+    // each column's value: an expression's result, or the record field.
+    // Computed up front so a divide-by-zero aborts before any byte lands.
+    let vals: Vec<Value> = cols
+        .iter()
+        .map(|c| c.value_of(values))
+        .collect::<Result<_, _>>()?;
+    w.int(OP_FETCH_RESPONSE).int(0).int(1);
     let n = cols.len();
     let nbytes = n.div_ceil(8);
     let mut bitmap = vec![0u8; nbytes];
@@ -4063,6 +4133,7 @@ fn encode_row(w: &mut W, cols: &[ProjCol], values: &[Value]) {
             }
         }
     }
+    Ok(())
 }
 
 /// The 8 wire bytes of a blob id: the on-disk bid layout (u16 relation
@@ -4190,11 +4261,18 @@ enum RawExpr {
     Null,
     Neg(Box<RawExpr>),
     Bin(Box<RawExpr>, ArithOp, Box<RawExpr>),
+    /// string concatenation `a || b` - a text result, distinct from the
+    /// arithmetic `Bin`s (its operands coerce to text, not to integers)
+    Concat(Box<RawExpr>, Box<RawExpr>),
 }
 
 /// Parse an arithmetic expression: `+`/`-` (lowest precedence) over
-/// `*` over unary `-` over atoms (integer literals, single-quoted
-/// strings, NULL, bare column names, parenthesised sub-expressions).
+/// `*`/`/` over unary `-` over `||` over atoms (integer literals,
+/// single-quoted strings, NULL, bare column names, parenthesised
+/// sub-expressions). The precedence order mirrors the engine's parser
+/// (parse.y:742-745): `||` binds tighter than unary minus and the
+/// multiplicative and additive operators, so `1 || 2 + 3` groups as
+/// `(1 || 2) + 3` exactly as Firebird dialect 3 parses it.
 /// A pure identifier is left to the caller to treat as a plain column;
 /// this returns None then, so the column path (all types) is preferred.
 fn parse_raw_expr(s: &str) -> Option<RawExpr> {
@@ -4240,13 +4318,16 @@ fn expr_mul(b: &[char], pos: &mut usize) -> Option<RawExpr> {
     let mut left = expr_unary(b, pos)?;
     loop {
         skip_ws(b, pos);
-        if b.get(*pos) == Some(&'*') {
-            *pos += 1;
-            let right = expr_unary(b, pos)?;
-            left = RawExpr::Bin(Box::new(left), ArithOp::Mul, Box::new(right));
-        } else {
-            break;
-        }
+        // a lone `*` or `/`, not the `||` operator (which `expr_concat`
+        // owns, one level tighter)
+        let op = match b.get(*pos) {
+            Some('*') => ArithOp::Mul,
+            Some('/') => ArithOp::Div,
+            _ => break,
+        };
+        *pos += 1;
+        let right = expr_unary(b, pos)?;
+        left = RawExpr::Bin(Box::new(left), op, Box::new(right));
     }
     Some(left)
 }
@@ -4261,7 +4342,25 @@ fn expr_unary(b: &[char], pos: &mut usize) -> Option<RawExpr> {
         *pos += 1;
         return expr_unary(b, pos);
     }
-    expr_atom(b, pos)
+    expr_concat(b, pos)
+}
+
+/// The `||` concatenation level - tighter than unary minus and the
+/// arithmetic operators (parse.y:745), left-associative. `a || b || c`
+/// groups as `(a || b) || c`.
+fn expr_concat(b: &[char], pos: &mut usize) -> Option<RawExpr> {
+    let mut left = expr_atom(b, pos)?;
+    loop {
+        skip_ws(b, pos);
+        if b.get(*pos) == Some(&'|') && b.get(*pos + 1) == Some(&'|') {
+            *pos += 2;
+            let right = expr_atom(b, pos)?;
+            left = RawExpr::Concat(Box::new(left), Box::new(right));
+        } else {
+            break;
+        }
+    }
+    Some(left)
 }
 
 fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
@@ -4363,6 +4462,10 @@ fn resolve_expr(
             *op,
             Box::new(resolve_expr(b, columns, descs)?),
         ),
+        RawExpr::Concat(a, b) => Expr::Concat(
+            Box::new(resolve_expr(a, columns, descs)?),
+            Box::new(resolve_expr(b, columns, descs)?),
+        ),
     })
 }
 
@@ -4380,6 +4483,8 @@ enum Expr {
     Null,
     Neg(Box<Expr>),
     Bin(Box<Expr>, ArithOp, Box<Expr>),
+    /// `a || b` - both operands coerced to text, NULL-propagating
+    Concat(Box<Expr>, Box<Expr>),
 }
 
 #[derive(Clone, Copy)]
@@ -4387,7 +4492,16 @@ enum ArithOp {
     Add,
     Sub,
     Mul,
+    /// integer division, truncating toward zero (ExprNodes.cpp); a zero
+    /// divisor raises the arithmetic exception, it never answers wrong
+    Div,
 }
+
+/// A per-row evaluation failure - only integer divide-by-zero today.
+/// Carries no payload; the fetch path maps it to the engine's own
+/// status vector (`isc_arith_except` / `isc_exception_integer_divide_by_zero`).
+#[derive(Debug)]
+struct EvalErr;
 
 /// What an expression's result is typed as - which drives its wire form
 /// (BIGINT for integer arithmetic, VARCHAR for a string literal).
@@ -4429,31 +4543,50 @@ impl Expr {
                     None // arithmetic only over integers
                 }
             }
+            Expr::Concat(a, b) => {
+                // both operands must be typeable (int or text); the
+                // engine coerces each to text, and the result is text
+                a.type_of(descs)?;
+                b.type_of(descs)?;
+                Some(ExprType::Text)
+            }
         }
     }
 
     /// Evaluate against a row's decoded values, producing a `Value`.
-    /// NULL propagates through arithmetic; a text expression is only a
-    /// literal or a text column.
-    fn eval(&self, values: &[Value]) -> Value {
-        match self {
+    /// NULL propagates through arithmetic and concatenation; a text
+    /// expression is a literal, a text column, or a concatenation.
+    /// `Err(EvalErr)` is a per-row arithmetic exception (divide by zero).
+    fn eval(&self, values: &[Value]) -> Result<Value, EvalErr> {
+        Ok(match self {
             Expr::Col(fid) => values.get(*fid).cloned().unwrap_or(Value::Null),
             Expr::Int(n) => Value::Int(*n),
             Expr::Str(s) => Value::Text(s.clone()),
             Expr::Null => Value::Null,
-            Expr::Neg(e) => match e.eval(values) {
+            Expr::Neg(e) => match e.eval(values)? {
                 Value::Int(n) => Value::Int(n.wrapping_neg()),
                 _ => Value::Null,
             },
-            Expr::Bin(a, op, b) => match (a.eval(values), b.eval(values)) {
+            Expr::Bin(a, op, b) => match (a.eval(values)?, b.eval(values)?) {
                 (Value::Int(x), Value::Int(y)) => Value::Int(match op {
                     ArithOp::Add => x.wrapping_add(y),
                     ArithOp::Sub => x.wrapping_sub(y),
                     ArithOp::Mul => x.wrapping_mul(y),
+                    // truncating integer division (Rust `/` on i64 rounds
+                    // toward zero, as the engine does); a zero divisor is
+                    // the arithmetic exception, not a wrong answer
+                    ArithOp::Div => match x.checked_div(y) {
+                        Some(q) => q,
+                        None => return Err(EvalErr),
+                    },
                 }),
                 _ => Value::Null, // any NULL operand -> NULL
             },
-        }
+            Expr::Concat(a, b) => match (a.eval(values)?, b.eval(values)?) {
+                (Value::Null, _) | (_, Value::Null) => Value::Null,
+                (x, y) => Value::Text(format!("{}{}", x.render(), y.render())),
+            },
+        })
     }
 }
 
@@ -4714,6 +4847,8 @@ fn default_expr_name(raw: &RawExpr) -> String {
         RawExpr::Bin(_, ArithOp::Add, _) => "ADD",
         RawExpr::Bin(_, ArithOp::Sub, _) => "SUBTRACT",
         RawExpr::Bin(_, ArithOp::Mul, _) => "MULTIPLY",
+        RawExpr::Bin(_, ArithOp::Div, _) => "DIVIDE",
+        RawExpr::Concat(_, _) => "CONCATENATION",
         // the engine leaves a unary-minus column unnamed (blank header)
         RawExpr::Neg(_) => "",
         RawExpr::Int(_) | RawExpr::Str(_) | RawExpr::Null => "CONSTANT",
@@ -8031,8 +8166,9 @@ mod tests {
         };
         let enc = |col: ProjCol, v: Value| {
             let mut w = W::default();
-            encode_row(&mut w, &[col], &[v]);
-            w.buf[4..].to_vec() // skip the 4-byte null bitmap
+            encode_row(&mut w, &[col], &[v]).unwrap();
+            // skip the 12-byte op_fetch_response header + 4-byte null bitmap
+            w.buf[16..].to_vec()
         };
         // scaled numeric: the RAW integer travels (client divides)
         assert_eq!(enc(pc(Wire::Int64, 580, 8, -2), Value::Scaled(1234, -2)), 1234i64.to_be_bytes());
@@ -8073,11 +8209,12 @@ mod tests {
         ];
         let values = vec![Value::Int(7), Value::Null];
         let mut w = W::default();
-        encode_row(&mut w, &cols, &values);
+        encode_row(&mut w, &cols, &values).unwrap();
+        // a 12-byte op_fetch_response header (op, status 0, count 1), then
         // bitmap: byte0 = 0b10 (col1 null), 3 pad bytes, then 8-byte BE 7
-        assert_eq!(&w.buf[0..4], &[0b10, 0, 0, 0]);
-        assert_eq!(&w.buf[4..12], &7i64.to_be_bytes());
-        assert_eq!(w.buf.len(), 12); // null col contributes no data
+        assert_eq!(&w.buf[12..16], &[0b10, 0, 0, 0]);
+        assert_eq!(&w.buf[16..24], &7i64.to_be_bytes());
+        assert_eq!(w.buf.len(), 24); // null col contributes no data
     }
 
     fn dbctx() -> DbInfoCtx {
@@ -8165,7 +8302,7 @@ mod tests {
 
         let ev = |s: &str| -> Value {
             let raw = parse_raw_expr(s).unwrap();
-            resolve_expr(&raw, &columns, &descs).unwrap().eval(&row)
+            resolve_expr(&raw, &columns, &descs).unwrap().eval(&row).unwrap()
         };
         // precedence: * binds tighter than + / -
         assert!(matches!(ev("A + B * 2"), Value::Int(16)));
@@ -8173,21 +8310,44 @@ mod tests {
         assert!(matches!(ev("A - B"), Value::Int(7)));
         assert!(matches!(ev("-A"), Value::Int(-10)));
         assert!(matches!(ev("1 + 1"), Value::Int(2)));
-        // NULL propagates through arithmetic
+        // integer division truncates toward zero (10 / 3 = 3)
+        assert!(matches!(ev("A / B"), Value::Int(3)));
+        assert!(matches!(ev("A / -B"), Value::Int(-3)));
+        // || binds tighter than +, so 1 || 2 + 3 is (1 || 2) + 3 -> "12"+3
+        // is nonsense here; test the pure-text and coercing forms instead
+        assert!(matches!(ev("NAME || NAME"), Value::Text(ref s) if s == "xx"));
+        assert!(matches!(ev("A || 'z'"), Value::Text(ref s) if s == "10z"));
+        assert!(matches!(ev("A || B"), Value::Text(ref s) if s == "103"));
+        // divide by zero is the arithmetic exception, not a wrong answer
+        {
+            let raw = parse_raw_expr("A / 0").unwrap();
+            assert!(resolve_expr(&raw, &columns, &descs).unwrap().eval(&row).is_err());
+        }
+        // NULL propagates through arithmetic and concatenation
         let null_row = vec![Value::Null, Value::Int(3), Value::Null];
-        let raw = parse_raw_expr("A + B").unwrap();
-        assert!(matches!(
-            resolve_expr(&raw, &columns, &descs).unwrap().eval(&null_row),
-            Value::Null
-        ));
+        let ev_null = |s: &str| -> Value {
+            let raw = parse_raw_expr(s).unwrap();
+            resolve_expr(&raw, &columns, &descs).unwrap().eval(&null_row).unwrap()
+        };
+        assert!(matches!(ev_null("A + B"), Value::Null));
+        assert!(matches!(ev_null("A / B"), Value::Null));
+        assert!(matches!(ev_null("A || B"), Value::Null));
         // a bare column is NOT an expression (the column path handles it)
         assert!(parse_raw_expr("A").is_none());
         // arithmetic over a text column does not type-check
         let raw = parse_raw_expr("NAME + 1").unwrap();
         assert!(build_expr_col(&raw, "X", &columns, &descs).is_none());
+        // concatenation over a text column DOES (both operands -> text)
+        let raw = parse_raw_expr("NAME || '!'").unwrap();
+        assert!(build_expr_col(&raw, "X", &columns, &descs).is_some());
         // the default output name mirrors Firebird's operation names
         assert_eq!(default_expr_name(&parse_raw_expr("A + B").unwrap()), "ADD");
         assert_eq!(default_expr_name(&parse_raw_expr("A * B").unwrap()), "MULTIPLY");
+        assert_eq!(default_expr_name(&parse_raw_expr("A / B").unwrap()), "DIVIDE");
+        assert_eq!(
+            default_expr_name(&parse_raw_expr("A || B").unwrap()),
+            "CONCATENATION"
+        );
     }
 
     #[test]

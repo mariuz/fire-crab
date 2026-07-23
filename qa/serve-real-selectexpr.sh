@@ -138,4 +138,43 @@ compare "aliased mult"      "SELECT A * B AS PROD FROM E WHERE ID = 2"
 # --- multiple expression columns + a plain column ----------------------
 compare "mixed columns"     "SELECT ID, A + B, A - B FROM E WHERE ID = 1"
 
+# --- integer division (truncates toward zero, named DIVIDE) ------------
+compare "divide columns"    "SELECT A / B FROM E WHERE ID = 1"
+compare "divide truncates"  "SELECT A / B FROM E WHERE ID = 2"
+compare "divide negative"   "SELECT A / B FROM E WHERE ID = 4"
+compare "divide toward zero" "SELECT B / A FROM E WHERE ID = 4"
+compare "divide literal"    "SELECT 7 / 2 FROM E WHERE ID = 1"
+compare "divide NULL"       "SELECT A / B FROM E WHERE ID = 3"
+compare "divide then mul"   "SELECT A / B * 2 FROM E WHERE ID = 1"
+
+# --- string concatenation (|| binds tighter, named CONCATENATION) ------
+compare "concat columns"    "SELECT S || S FROM E WHERE ID = 1"
+compare "concat literal"    "SELECT S || '!' FROM E WHERE ID = 1"
+compare "concat both sides" "SELECT '[' || S || ']' FROM E WHERE ID = 2"
+compare "concat coerces int" "SELECT A || 'n' FROM E WHERE ID = 1"
+compare "concat chains left" "SELECT 'a' || 'b' || 'c' FROM E WHERE ID = 1"
+compare "concat NULL"       "SELECT S || NULL FROM E WHERE ID = 1"
+
+# --- divide by zero: BOTH the engine and fire-crab reject the row with
+#     the arithmetic exception (SQLSTATE 22012), rather than answering.
+#     A constant divisor and a per-row column expression are both tried.
+errck() { # <label> <select>
+    fc=$(node_run "$2")
+    is=$("$ISQL" -q -b -user "$U" -pas "$P" "$WORK" 2>&1 <<EOF
+$2;
+EOF
+)
+    if printf '%s' "$fc" | grep -qi "ERR" \
+       && printf '%s' "$is" | grep -qi "divide by zero"; then
+        echo "OK   $1 (both reject)"
+    else
+        echo "DIFF $1"
+        echo "     isql: $(echo $is)"
+        echo "     fc:   $(echo $fc)"
+        fail=1
+    fi
+}
+errck "divide by zero literal" "SELECT A / 0 FROM E WHERE ID = 1"
+errck "divide by zero column"  "SELECT A / (B - B) FROM E WHERE ID = 1"
+
 exit $fail
