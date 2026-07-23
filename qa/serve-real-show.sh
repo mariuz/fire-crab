@@ -62,6 +62,8 @@ COMMIT;
 SET TERM ^;
 CREATE PROCEDURE P_USE AS
 BEGIN EXCEPTION E_FIRST; INSERT INTO Z (ID) VALUES (1); END^
+CREATE PROCEDURE P_ARGS (X INTEGER) RETURNS (Y INTEGER) AS
+BEGIN Y = X + 1; SUSPEND; END^
 SET TERM ;^
 COMMIT;
 SET GENERATOR GEN_C TO 4242;
@@ -166,5 +168,11 @@ compare "SHOW GENERATOR GEN_C" "SHOW GENERATOR GEN_C"
 compare "SHOW EXCEPTIONS"        "SHOW EXCEPTIONS"
 compare "SHOW EXCEPTION used"    "SHOW EXCEPTION E_FIRST"
 compare "SHOW EXCEPTION unused"  "SHOW EXCEPTION E_UNUSED"
+
+# the singular SHOW PROCEDURE <name> renders the PSQL source text (a blob
+# the client opens through op_open_blob) between "====" rules, and a
+# Parameters list for a procedure that has any
+compare "SHOW PROCEDURE no-args" "SHOW PROCEDURE P_USE"
+compare "SHOW PROCEDURE args"    "SHOW PROCEDURE P_ARGS"
 
 exit $fail

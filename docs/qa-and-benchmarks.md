@@ -1960,10 +1960,37 @@ single request exercises both directions of the dependency graph: `SHOW
 PROCEDURES` renders `PUBLIC.P_USE; Dependencies: PUBLIC.Z (Table),
 PUBLIC.E_FIRST (Exception)` — the table folded to one entry by the
 DISTINCT — and `SHOW EXCEPTION E_FIRST` renders the same procedure in its
-`Used by:` list, each compared verbatim against isql. What the request
-interp still cannot render is a procedure's *source text* (`SHOW PROCEDURE
-<name>`, singular), which reads the PSQL blob rather than walking the
-dependency graph.
+`Used by:` list, each compared verbatim against isql.
+
+### The fifty-second differential — SHOW PROCEDURE's source, and a blob id in the wrong shape
+
+The singular `SHOW PROCEDURE <name>` prints a procedure's PSQL source
+text. That text is not a column value the request sends inline — it is a
+*blob*: the request message carries the blob's **id**, and isql then opens
+it with `op_open_blob` and streams the source back. The request compiled
+and ran (the procedure name and its parameter list rendered), but isql
+raised "invalid BLOB ID" the moment it tried to open the source — fire-crab
+was sending the id in the wrong shape.
+
+A blob id travels as eight opaque bytes, and there are two ways to lay
+them out. The row encoder (a blob column in an ordinary `SELECT`) already
+used the on-disk `bid` layout, the one `op_open_blob` decodes back. But the
+*request-message* encoder wrote a different thing — the relation and
+record number as two plain big-endian longs. For every SHOW so far this
+never showed, because those requests' blob columns were always NULL (a
+view's BLR on a table, a plain index's expression source) and a NULL blob
+is a zero id either way. `SHOW PROCEDURE` is the first with a blob that is
+actually *there*, and the wrong layout made isql open the wrong id. The
+fix is one line: the request encoder now writes the same `encode_blob_id`
+bytes the row encoder does, so a client that opens the id reaches the
+blob's real content.
+
+`serve-real-show.sh` grows to twenty-four checks: `SHOW PROCEDURE` on a
+no-argument procedure (its source between the `====` rules) and on one
+with an input and an output parameter (source plus the `Parameters:`
+list), each compared verbatim against isql. The one thing the row and
+request encoders now genuinely share — the blob-id layout — is what turns
+a stored PSQL blob back into the text isql prints.
 
 ### Stage 3 — the Firebird QA suite (reached)
 

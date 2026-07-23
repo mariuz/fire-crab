@@ -7928,14 +7928,16 @@ fn encode_request_message(fields: &[BField], vals: &[Value]) -> Vec<u8> {
                 m.extend_from_slice(&n.to_be_bytes());
             }
             BField::Quad => {
-                // a blob id, xdr_quad = two 4-byte big-endian longs
-                // (high, low). NULL/absent blobs travel as a zero id.
-                let (hi, lo) = match v {
-                    Value::Blob(rel, num) => (rel as i32, num as i32),
-                    _ => (0, 0),
+                // a blob id: the 8-byte on-disk bid layout (encode_blob_id) -
+                // the SAME bytes the row encoder sends and op_open_blob
+                // decodes, so a client that opens the id reaches the blob's
+                // content (SHOW PROCEDURE's source). A NULL/absent blob is a
+                // zero id the client leaves unopened.
+                let id = match v {
+                    Value::Blob(rel, num) => encode_blob_id(rel, num),
+                    _ => [0u8; 8],
                 };
-                m.extend_from_slice(&hi.to_be_bytes());
-                m.extend_from_slice(&lo.to_be_bytes());
+                m.extend_from_slice(&id);
             }
             BField::Bool => {
                 // dtype_boolean: one byte (xdr_opaque length 1) padded to 4
@@ -9285,6 +9287,12 @@ mod tests {
         assert_eq!(m2, vec![0, 0, 0, 0]);
         // a quad is 8 zero bytes for a NULL blob; a bool is one byte padded
         assert_eq!(encode_request_message(&[BField::Quad], &[Value::Null]).len(), 8);
+        // a non-NULL blob travels as the on-disk bid layout (encode_blob_id),
+        // the id op_open_blob decodes back - SHOW PROCEDURE's source
+        assert_eq!(
+            encode_request_message(&[BField::Quad], &[Value::Blob(5, 0x2a)]),
+            encode_blob_id(5, 0x2a).to_vec()
+        );
         assert_eq!(
             encode_request_message(&[BField::Bool], &[Value::Bool(true)]),
             vec![1, 0, 0, 0]
