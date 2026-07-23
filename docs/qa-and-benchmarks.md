@@ -1992,6 +1992,52 @@ list), each compared verbatim against isql. The one thing the row and
 request encoders now genuinely share — the blob-id layout — is what turns
 a stored PSQL blob back into the text isql prints.
 
+### The fifty-third differential — auto-id INSERT, a generator advance that lands with the row
+
+The fiftieth differential made a *SELECT* advance a generator. This one
+makes an *INSERT* do it, in the place it matters most:
+`INSERT INTO T (ID, NAME) VALUES (NEXT VALUE FOR SEQ, 'a')` — the
+auto-incrementing primary key, the single most common way a row gets its
+id. `GEN_ID(<name>, <n>)` in the VALUES list is the same with an explicit
+step. The value is not a literal the client supplies; the server mints it.
+
+Two things had to be right. First, the *when*: the generator advance is a
+write, and it must be atomic with the record. So it happens at op_execute,
+in the same cloned page image the record insert mutates — the server reads
+the generator's current value from that in-progress image, adds the step
+(or, for `NEXT VALUE FOR`, the sequence's own increment), writes the new
+`SINT64` back onto the generator page, and stores that same value into the
+record's field before the row is laid down. Generator page and data page
+flush together or not at all; a failed insert leaves the generator
+untouched. Because the current value is read from the working image rather
+than the committed file, two `NEXT VALUE FOR` of one sequence in a single
+row would bump it twice, as the engine does. The stored id then flows into
+the primary-key index like any other value, so the engine's index scans
+find the auto-id row.
+
+Second, the *parse*: a `GEN_ID(name, n)` term sits inside the VALUES list,
+and its argument comma is **not** a value separator — splitting the list on
+every comma would tear the call in half. So the list is split only on
+top-level (paren-depth-zero) commas, and `NEXT VALUE FOR <seq>` and
+`GEN_ID(<name>, <n>)` join the integer/string/NULL/`?` value forms the
+INSERT already accepted. The generator must exist at prepare and the target
+column must be an integer — otherwise the statement is refused rather than
+failing mid-write.
+
+`qa/serve-real-geninsert.sh` proves it with the engine as oracle in the
+strongest shape available: the *same* five-insert script runs through both
+fire-crab (node → fcwire) and the C++ engine (isql on a reference file) —
+two `NEXT VALUE FOR SEQ` (ids `1`, `2`), two `GEN_ID(G, 5)` (`5`, `10`),
+and a `NEXT VALUE FOR SEQ5` on a `START WITH 100 INCREMENT BY 5` sequence —
+then the engine opens **both** files and must read identical rows and
+identical stored generator state. It also pins the concrete ids, which is
+where the engine corrected the draft: the first `NEXT VALUE FOR` of
+`SEQ5` returns `100`, not `105` — a sequence created `START WITH 100` is
+initialised to `start − increment`, so its first advance yields exactly the
+start. `gfix -v -full` is clean and `gbak` backs the file up. Eleven
+checks. What is still left for later is the row-returning form — one
+`NEXT VALUE FOR` per row of a `SELECT` mid-fetch.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
