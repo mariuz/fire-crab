@@ -32,12 +32,12 @@ mkdir -p "$DIR"
 rm -f "$SRC" "$CLEAN" "$WORK"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF || { echo "FAIL scratch db creation"; exit 1; }
 CREATE DATABASE '$SRC' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
-CREATE TABLE E (ID INTEGER NOT NULL, A INTEGER, B INTEGER, S VARCHAR(10), N NUMERIC(9,2));
+CREATE TABLE E (ID INTEGER NOT NULL, A INTEGER, B INTEGER, S VARCHAR(10), N NUMERIC(9,2), M NUMERIC(9,4));
 COMMIT;
-INSERT INTO E VALUES (1, 10, 3, 'x', 12.50);
-INSERT INTO E VALUES (2, 5, 100, 'y', -3.25);
-INSERT INTO E VALUES (3, NULL, 7, 'z', NULL);
-INSERT INTO E VALUES (4, -8, 2, 'w', 13.50);
+INSERT INTO E VALUES (1, 10, 3, 'x', 12.50, 1.2345);
+INSERT INTO E VALUES (2, 5, 100, 'y', -3.25, 4.0000);
+INSERT INTO E VALUES (3, NULL, 7, 'z', NULL, 2.0000);
+INSERT INTO E VALUES (4, -8, 2, 'w', 13.50, 0.5000);
 COMMIT;
 EOF
 "$ISQL" -q -b -user "$U" -pas "$P" "$SRC" >/dev/null 2>&1 <<'EOF'
@@ -113,6 +113,45 @@ EOF
     fi
 }
 
+# node-firebird renders a NUMERIC as a JavaScript number, dropping the
+# trailing zeros isql keeps (25.00 -> 25, 156.2500 -> 156.25). Strip
+# trailing zeros from pure-decimal fields on BOTH sides so the display
+# artifact does not fail the compare - a WRONG scale still changes the
+# significant digits and is caught (25 vs 0.25 vs 2500). Only decimal-
+# looking fields are touched, so text/CAST values stay exact.
+denum() {
+    awk -F'|' '{
+        for (i=1;i<=NF;i++) if ($i ~ /^-?[0-9]+\.[0-9]+$/) {
+            sub(/0+$/, "", $i); sub(/\.$/, "", $i)
+        }
+        s=$1; for (i=2;i<=NF;i++) s=s"|"$i; print s
+    }'
+}
+
+# a numeric-normalizing compare for the arithmetic block (values compared
+# up to trailing-zero display; column HEADERS still compared exactly)
+comparen() { # <label> <select>
+    fc=$(node_run "$2" | denum | sort)
+    is=$(run_isql <<EOF | strip | grep -v '^$'
+SET HEADING ON;
+$2;
+EOF
+)
+    is=$(printf '%s\n' "$is" | awk '
+        /^=+/ { next }
+        NR==1 { gsub(/[ \t]+/,"|"); print "H:" $0; next }
+        { gsub(/^[ \t]+|[ \t]+$/,""); gsub(/[ \t]+/,"|"); print }
+    ' | denum | sort)
+    if [ "$fc" = "$is" ]; then
+        echo "OK   $1"
+    else
+        echo "DIFF $1"
+        echo "     isql: $(echo $is)"
+        echo "     fc:   $(echo $fc)"
+        fail=1
+    fi
+}
+
 # --- arithmetic over columns -------------------------------------------
 compare "add columns"       "SELECT A + B FROM E WHERE ID = 1"
 compare "subtract columns"  "SELECT A - B FROM E WHERE ID = 2"
@@ -176,6 +215,28 @@ compare "cast numeric neg below"  "SELECT CAST(N AS INTEGER) FROM E WHERE ID = 2
 compare "cast numeric to varchar" "SELECT CAST(N AS VARCHAR(10)) FROM E WHERE ID = 1"
 compare "cast numeric neg varchar" "SELECT CAST(N AS VARCHAR(10)) FROM E WHERE ID = 2"
 compare "cast numeric NULL"       "SELECT CAST(N AS INTEGER) FROM E WHERE ID = 3"
+
+# --- numeric arithmetic: the engine's dialect-3 scale rules ------------
+#     +/- take the finer scale, * and / add the two scales (/ scales the
+#     dividend by 10^(-2*s2) then truncates). Column headers ADD/SUBTRACT/
+#     MULTIPLY/DIVIDE and values (with their decimal places) both compared.
+comparen "num add same scale"   "SELECT N + N AS R FROM E WHERE ID = 1"
+comparen "num add finer scale"  "SELECT N + M AS R FROM E WHERE ID = 1"
+comparen "num sub"              "SELECT N - M AS R FROM E WHERE ID = 1"
+comparen "num add int col"      "SELECT N + A AS R FROM E WHERE ID = 1"
+comparen "num add int literal"  "SELECT N + 1 AS R FROM E WHERE ID = 1"
+comparen "num mul same scale"   "SELECT N * N AS R FROM E WHERE ID = 1"
+comparen "num mul finer scale"  "SELECT N * M AS R FROM E WHERE ID = 1"
+comparen "num mul int"          "SELECT N * A AS R FROM E WHERE ID = 1"
+comparen "num mul literal"      "SELECT N * 2 AS R FROM E WHERE ID = 1"
+comparen "num div same scale"   "SELECT N / M AS R FROM E WHERE ID = 2"
+comparen "num div finer scale"  "SELECT N / M AS R FROM E WHERE ID = 1"
+comparen "num div int col"      "SELECT N / A AS R FROM E WHERE ID = 1"
+comparen "num div literal"      "SELECT N / 4 AS R FROM E WHERE ID = 1"
+comparen "num precedence"       "SELECT N + M * 2 AS R FROM E WHERE ID = 1"
+comparen "num negate"           "SELECT -N AS R FROM E WHERE ID = 1"
+comparen "num header default"   "SELECT N * M FROM E WHERE ID = 1"
+comparen "num NULL propagates"  "SELECT N * M AS R FROM E WHERE ID = 3"
 
 # --- runtime errors: BOTH the engine and fire-crab reject the row rather
 #     than answering. Divide-by-zero is the arithmetic exception (SQLSTATE

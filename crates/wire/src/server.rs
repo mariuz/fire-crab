@@ -1114,14 +1114,15 @@ fn build_expr_col(
     descs: &[Descriptor],
 ) -> Option<ProjCol> {
     let e = resolve_expr(raw, columns, descs)?;
-    let (wire, sql_type, length) = match e.type_of(descs)? {
-        ExprType::Int => (Wire::Int64, 580, 8),
-        ExprType::Text => (Wire::Varying, 448, 32765),
-        // a bare numeric operand never reaches here as a top-level
-        // expression (a lone column is not an "expression", and every
-        // operator either rejects a numeric operand - arithmetic - or
-        // retypes it - CAST/concat); refuse rather than guess a wire form
-        ExprType::Numeric => return None,
+    let (wire, sql_type, length, scale) = match e.type_of(descs)? {
+        ExprType::Int => (Wire::Int64, 580, 8, 0),
+        ExprType::Text => (Wire::Varying, 448, 32765, 0),
+        // a numeric arithmetic result travels as an INT64-backed scaled
+        // integer (SQL_INT64 + its scale, the raw integer on the wire and
+        // the client divides) - the scale is computed statically from the
+        // operand scales, and `eval` produces exactly that scale so the
+        // decode matches
+        ExprType::Numeric => (Wire::Int64, 580, 8, e.result_scale(descs)? as i32),
     };
     Some(ProjCol {
         name: name.to_string(),
@@ -1129,7 +1130,7 @@ fn build_expr_col(
         wire,
         sql_type,
         length,
-        scale: 0,
+        scale,
         sub_type: 0,
         expr: Some(e),
     })
@@ -4656,6 +4657,56 @@ fn is_numeric_col(d: &Descriptor) -> bool {
         || d.dtype == dtype::INT128
 }
 
+/// Decompose a numeric value into (raw integer, scale) for arithmetic:
+/// an integer is scale 0, a scaled numeric keeps its scale, an INT128
+/// likewise. Anything else (text, temporal, ...) is not a numeric operand.
+fn numeric_parts(v: &Value) -> Option<(i128, i8)> {
+    match v {
+        Value::Int(n) => Some((*n as i128, 0)),
+        Value::Scaled(r, s) => Some((*r as i128, *s)),
+        Value::Int128(r, s) => Some((*r, *s)),
+        _ => None,
+    }
+}
+
+/// Wrap a computed (raw, scale) numeric result as a `Value` - a scale of
+/// zero collapses to a plain integer, otherwise it stays scaled. Values
+/// are kept within `i64` here (the describe announces an INT64 wire form);
+/// wide-precision results that need INT128 output are a later slice.
+fn scaled_value(raw: i128, scale: i8) -> Value {
+    if scale == 0 {
+        Value::Int(raw as i64)
+    } else {
+        Value::Scaled(raw as i64, scale)
+    }
+}
+
+/// Apply a numeric arithmetic operator following the engine's dialect-3
+/// scale rules (probed against isql, then cross-checked against
+/// ExprNodes.cpp): `+`/`-` take the finer scale (the more negative, so
+/// `min`) and align both operands to it; `*` adds the two scales; `/`
+/// adds the scales too, first scaling the dividend by `10^(-2*s2)` and
+/// then doing an integer (truncating-toward-zero) division. A zero
+/// divisor is the arithmetic exception, never a wrong answer.
+fn numeric_bin(r1: i128, s1: i8, op: ArithOp, r2: i128, s2: i8) -> Result<(i128, i8), EvalErr> {
+    Ok(match op {
+        ArithOp::Add | ArithOp::Sub => {
+            let sr = s1.min(s2);
+            let a = r1 * 10i128.pow((s1 - sr) as u32);
+            let b = r2 * 10i128.pow((s2 - sr) as u32);
+            (if matches!(op, ArithOp::Add) { a + b } else { a - b }, sr)
+        }
+        ArithOp::Mul => (r1 * r2, s1 + s2),
+        ArithOp::Div => {
+            if r2 == 0 {
+                return Err(EvalErr::DivideByZero);
+            }
+            let scaled = r1 * 10i128.pow((-2 * s2 as i32) as u32);
+            (scaled / r2, s1 + s2)
+        }
+    })
+}
+
 /// Round a scaled exact numeric (`raw` at `scale`) to an integer, half
 /// away from zero - the engine's rule for CAST to an integer type
 /// (`12.50` -> `13`, `13.50` -> `14`, `-12.50` -> `-13`). Works in `i128`
@@ -4695,20 +4746,21 @@ impl Expr {
             Expr::Int(_) => Some(ExprType::Int),
             Expr::Str(_) => Some(ExprType::Text),
             Expr::Null => Some(ExprType::Int),
-            Expr::Neg(e) => {
-                if e.type_of(descs)? == ExprType::Int {
-                    Some(ExprType::Int)
-                } else {
-                    None
+            Expr::Neg(e) => match e.type_of(descs)? {
+                ExprType::Int => Some(ExprType::Int),
+                ExprType::Numeric => Some(ExprType::Numeric),
+                ExprType::Text => None,
+            },
+            Expr::Bin(a, _, b) => match (a.type_of(descs)?, b.type_of(descs)?) {
+                // pure integer arithmetic stays integer
+                (ExprType::Int, ExprType::Int) => Some(ExprType::Int),
+                // any numeric operand (with an integer or another numeric)
+                // makes the result numeric - the engine's scale rules apply
+                (ExprType::Int | ExprType::Numeric, ExprType::Int | ExprType::Numeric) => {
+                    Some(ExprType::Numeric)
                 }
-            }
-            Expr::Bin(a, _, b) => {
-                if a.type_of(descs)? == ExprType::Int && b.type_of(descs)? == ExprType::Int {
-                    Some(ExprType::Int)
-                } else {
-                    None // arithmetic only over integers
-                }
-            }
+                _ => None, // a text operand is not arithmetic
+            },
             Expr::Concat(a, b) => {
                 // both operands must be typeable (int or text); the
                 // engine coerces each to text, and the result is text
@@ -4728,6 +4780,37 @@ impl Expr {
         }
     }
 
+    /// The static scale of a `Numeric`-typed expression - what the describe
+    /// announces, and what `eval` must then produce so the client's decode
+    /// matches. Follows the same dialect-3 rules as [numeric_bin]: `+`/`-`
+    /// take the finer (more negative) scale, `*`/`/` add the scales. Only
+    /// called for an expression already typed `ExprType::Numeric`.
+    fn result_scale(&self, descs: &[Descriptor]) -> Option<i8> {
+        match self {
+            Expr::Col(fid) => {
+                let d = descs.get(*fid)?;
+                if matches!(col_kind(d), Some(ColKind::Int)) {
+                    Some(0)
+                } else if is_numeric_col(d) {
+                    Some(d.scale)
+                } else {
+                    None
+                }
+            }
+            Expr::Int(_) => Some(0),
+            Expr::Neg(e) => e.result_scale(descs),
+            Expr::Bin(a, op, b) => {
+                let s1 = a.result_scale(descs)?;
+                let s2 = b.result_scale(descs)?;
+                Some(match op {
+                    ArithOp::Add | ArithOp::Sub => s1.min(s2),
+                    ArithOp::Mul | ArithOp::Div => s1 + s2,
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// Evaluate against a row's decoded values, producing a `Value`.
     /// NULL propagates through arithmetic and concatenation; a text
     /// expression is a literal, a text column, or a concatenation.
@@ -4740,23 +4823,39 @@ impl Expr {
             Expr::Null => Value::Null,
             Expr::Neg(e) => match e.eval(values)? {
                 Value::Int(n) => Value::Int(n.wrapping_neg()),
+                Value::Scaled(r, s) => Value::Scaled(r.wrapping_neg(), s),
+                Value::Int128(r, s) => Value::Int128(-r, s),
                 _ => Value::Null,
             },
-            Expr::Bin(a, op, b) => match (a.eval(values)?, b.eval(values)?) {
-                (Value::Int(x), Value::Int(y)) => Value::Int(match op {
-                    ArithOp::Add => x.wrapping_add(y),
-                    ArithOp::Sub => x.wrapping_sub(y),
-                    ArithOp::Mul => x.wrapping_mul(y),
-                    // truncating integer division (Rust `/` on i64 rounds
-                    // toward zero, as the engine does); a zero divisor is
-                    // the arithmetic exception, not a wrong answer
-                    ArithOp::Div => match x.checked_div(y) {
-                        Some(q) => q,
-                        None => return Err(EvalErr::DivideByZero),
-                    },
-                }),
-                _ => Value::Null, // any NULL operand -> NULL
-            },
+            Expr::Bin(a, op, b) => {
+                let va = a.eval(values)?;
+                let vb = b.eval(values)?;
+                if matches!(va, Value::Null) || matches!(vb, Value::Null) {
+                    Value::Null // any NULL operand -> NULL
+                } else if let (Value::Int(x), Value::Int(y)) = (&va, &vb) {
+                    // pure integer arithmetic
+                    Value::Int(match op {
+                        ArithOp::Add => x.wrapping_add(*y),
+                        ArithOp::Sub => x.wrapping_sub(*y),
+                        ArithOp::Mul => x.wrapping_mul(*y),
+                        // truncating integer division (Rust `/` on i64 rounds
+                        // toward zero, as the engine does); a zero divisor is
+                        // the arithmetic exception, not a wrong answer
+                        ArithOp::Div => match x.checked_div(*y) {
+                            Some(q) => q,
+                            None => return Err(EvalErr::DivideByZero),
+                        },
+                    })
+                } else if let (Some((r1, s1)), Some((r2, s2))) =
+                    (numeric_parts(&va), numeric_parts(&vb))
+                {
+                    // numeric arithmetic: apply the engine's scale rules
+                    let (raw, sr) = numeric_bin(r1, s1, *op, r2, s2)?;
+                    scaled_value(raw, sr)
+                } else {
+                    Value::Null
+                }
+            }
             Expr::Concat(a, b) => match (a.eval(values)?, b.eval(values)?) {
                 (Value::Null, _) | (_, Value::Null) => Value::Null,
                 (x, y) => Value::Text(format!("{}{}", x.render(), y.render())),
@@ -8532,17 +8631,21 @@ mod tests {
     #[test]
     fn parses_and_evaluates_select_expressions() {
         // columns A(fid 0, int), B(fid 1, int), NAME(fid 2, text),
-        // N(fid 3, NUMERIC(9,2) = LONG scale -2)
+        // N(fid 3, NUMERIC(9,2)=LONG scale -2), M(fid 4, NUMERIC(9,4)=scale -4)
         let columns = vec![
             RelationColumn { name: "A".into(), field_id: 0, position: 0 },
             RelationColumn { name: "B".into(), field_id: 1, position: 1 },
             RelationColumn { name: "NAME".into(), field_id: 2, position: 2 },
             RelationColumn { name: "N".into(), field_id: 3, position: 3 },
+            RelationColumn { name: "M".into(), field_id: 4, position: 4 },
         ];
         let d = |dt| Descriptor { dtype: dt, scale: 0, length: 4, sub_type: 0, flags: 0, offset: 0 };
-        let dn = Descriptor { dtype: dtype::LONG, scale: -2, length: 4, sub_type: 0, flags: 0, offset: 0 };
-        let descs = vec![d(dtype::LONG), d(dtype::LONG), d(dtype::VARYING), dn];
-        let row = vec![Value::Int(10), Value::Int(3), Value::Text("x".into()), Value::Scaled(1250, -2)];
+        let sc = |s| Descriptor { dtype: dtype::LONG, scale: s, length: 4, sub_type: 0, flags: 0, offset: 0 };
+        let descs = vec![d(dtype::LONG), d(dtype::LONG), d(dtype::VARYING), sc(-2), sc(-4)];
+        let row = vec![
+            Value::Int(10), Value::Int(3), Value::Text("x".into()),
+            Value::Scaled(1250, -2), Value::Scaled(12345, -4),
+        ];
 
         let ev = |s: &str| -> Value {
             let raw = parse_raw_expr(s).unwrap();
@@ -8612,6 +8715,51 @@ mod tests {
             let raw = parse_raw_expr("CAST(N AS INTEGER)").unwrap();
             let e = resolve_expr(&raw, &columns, &descs).unwrap();
             assert_eq!(e.type_of(&descs), Some(ExprType::Int));
+        }
+        // numeric arithmetic - the engine's dialect-3 scale rules (probed).
+        // N=12.50 (scale -2), M=1.2345 (scale -4), A=10, B=3.
+        let num = |s: &str| -> (i64, i8) {
+            let raw = parse_raw_expr(s).unwrap();
+            let e = resolve_expr(&raw, &columns, &descs).unwrap();
+            assert_eq!(e.type_of(&descs), Some(ExprType::Numeric), "{s} not numeric");
+            let scale = e.result_scale(&descs).unwrap();
+            match e.eval(&row).unwrap() {
+                Value::Scaled(r, s) => {
+                    assert_eq!(s, scale, "{s}: eval scale != announced");
+                    (r, s)
+                }
+                other => panic!("{s} -> {other:?}"),
+            }
+        };
+        assert_eq!(num("N + M"), (137345, -4)); // 12.50 + 1.2345 = 13.7345
+        assert_eq!(num("N - A"), (250, -2)); // 12.50 - 10 = 2.50
+        assert_eq!(num("N + 1"), (1350, -2)); // 12.50 + 1 = 13.50
+        assert_eq!(num("N * M"), (15431250, -6)); // scale -2 + -4 = -6
+        assert_eq!(num("N * 2"), (2500, -2)); // 25.00
+        assert_eq!(num("N * A"), (12500, -2)); // 125.00
+        assert_eq!(num("N / M"), (10125556, -6)); // dividend *10^8 // raw2, trunc
+        assert_eq!(num("N / A"), (125, -2)); // 12.50 / 10 = 1.25
+        assert_eq!(num("N / 4"), (312, -2)); // 12.50/4 = 3.125 -> scale -2 -> 3.12 (trunc)
+        // -N negates in place; NULL propagates through numeric arithmetic
+        assert!(matches!(ev("-N"), Value::Scaled(-1250, -2)));
+        let null_num = vec![
+            Value::Null, Value::Int(3), Value::Null,
+            Value::Null, Value::Scaled(12345, -4),
+        ];
+        {
+            let raw = parse_raw_expr("N * M").unwrap();
+            assert!(matches!(
+                resolve_expr(&raw, &columns, &descs).unwrap().eval(&null_num),
+                Ok(Value::Null)
+            ));
+        }
+        // numeric divide by zero is still the arithmetic exception
+        {
+            let raw = parse_raw_expr("N / 0").unwrap();
+            assert!(matches!(
+                resolve_expr(&raw, &columns, &descs).unwrap().eval(&row),
+                Err(EvalErr::DivideByZero)
+            ));
         }
         // a bare column is NOT an expression (the column path handles it)
         assert!(parse_raw_expr("A").is_none());
