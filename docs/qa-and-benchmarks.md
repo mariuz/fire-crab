@@ -2152,8 +2152,8 @@ compound FK's catalog (two `RDB$INDEX_SEGMENTS` rows, `RDB$SEGMENT_COUNT`
 2) matches the engine, restores, and enforces the composite key — an
 orphan `(1, 999)` rejected, a valid `(1, 100)` accepted — both on the
 restored copy and on fire-crab's raw file. (A *named* table-level primary
-key, `CONSTRAINT PK_P PRIMARY KEY (A, B)`, is the one idiom still
-unparsed; an unnamed table-level `PRIMARY KEY (A, B)` works.)
+key, `CONSTRAINT PK_P PRIMARY KEY (A, B)`, was the one idiom still
+unparsed at this point; the fifty-seventh differential below closes it.)
 
 ### The fifty-sixth differential — FOREIGN KEY by ALTER, and where CASCADE stops being metadata
 
@@ -2189,6 +2189,64 @@ deeper slice. Writing the rule string without the triggers would produce a
 key that looks cascading in the catalog but silently fails to cascade: the
 exact kind of "claims what isn't validated" outcome the differential
 discipline exists to prevent. So it waits.
+
+### The fifty-seventh differential — named keys, UNIQUE, and two sequences that are one
+
+The gap the compound-foreign-key work left was small to state and useful to
+close: `CONSTRAINT PK_P PRIMARY KEY (A, B)` — a *named* table-level primary
+key — did not parse. Closing it meant asking the engine what a named
+constraint actually looks like on disk, and the answer widened the slice
+into `UNIQUE` as well, because the two share every mechanism.
+
+Three facts came out of the probe, and each one was a divergence from what
+fire-crab had been writing:
+
+**A named constraint names its index.** `CONSTRAINT PK_P PRIMARY KEY (A, B)`
+produces `RDB$INDICES.RDB$INDEX_NAME = 'PK_P'`, not the generated
+`RDB$PRIMARY<n>`. Same for `CONSTRAINT UQ_R UNIQUE (Z)` → index `UQ_R`. Only
+an *unnamed* constraint draws a generated name.
+
+**A table-level PRIMARY KEY writes no NOT NULL constraint row.** Both
+spellings make their columns not-null — `RDB$RELATION_FIELDS.RDB$NULL_FLAG`
+is 1 either way — but only a *column-level* `X INTEGER PRIMARY KEY` also
+writes the `INTEG_<n>` "NOT NULL" row and its `RDB$CHECK_CONSTRAINTS` link.
+A table-level `PRIMARY KEY (A, B)` sets the flag and stops. fire-crab wrote
+the constraint rows for every not-null column, so its table-level keys
+carried rows the engine's do not. The column definition now records whether
+its NOT NULL came from a column-level declaration, and only those get rows.
+
+**The two generated index-name sequences are one sequence.** An unnamed
+primary key's index is `RDB$PRIMARY<n>` and an unnamed unique key's is
+`RDB$<n>`, which reads like two counters — but a table declaring `UNIQUE (B)`
+before `PRIMARY KEY (A)` got `RDB$7` and `RDB$PRIMARY8`. One counter, shared,
+advanced in *declaration* order (the `INTEG_<n>` constraint names follow the
+same order). So the key constraints are now carried through the planner as a
+list in declaration order rather than a primary key plus a set, and the
+generated numbers are drawn from a scan of both spellings.
+
+With those three, `UNIQUE` came almost for free: it is a unique, non-primary
+index plus a `'UNIQUE'` constraint row, and the index writer and the DML's
+index maintenance — including the all-NULL exemption the engine corrected us
+on earlier — already did the enforcing.
+
+`qa/serve-real-key.sh` (21 checks) builds six tables through fire-crab and
+the same six, in the same order, through the engine: a named compound
+table-level PK, a named column-level PK, a named UNIQUE, a table whose
+unnamed UNIQUE precedes its unnamed PK, an unnamed column-level UNIQUE, and
+a foreign key onto the *named* compound PK (the partner lookup has to find
+`PK_KP`, not an `RDB$PRIMARY<n>`). The comparison covers constraint names
+and types, index names, unique flags, segment counts, index segments, null
+flags and check-constraint links — and then the constraints are exercised:
+fire-crab refuses a duplicate unique key and a duplicate primary key of its
+own accord, the engine refuses both on fire-crab's raw file (and refuses a
+NULL in a table-level PK column, which is the null-flag half of fact two),
+and `gbak` restores the file into a database that still refuses them.
+
+Both new behaviours were checked for teeth by reverting them one at a time:
+writing NOT NULL rows for every not-null column, and drawing the index
+number from the `RDB$PRIMARY` sequence alone, each make the catalog
+comparison fail. A differential that would pass with the bug still in is not
+a differential.
 
 ### Stage 3 — the Firebird QA suite (reached)
 
@@ -2463,6 +2521,18 @@ FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
 FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix \
     bash /path/to/fire-crab/qa/serve-real-genwrite.sh 3050
+
+# KEY CONSTRAINTS: named PRIMARY KEY constraints (the index takes the
+# constraint's name) and UNIQUE constraints, named and not - the generated
+# RDB$PRIMARY<n>/RDB$<n> index names coming from ONE sequence in declaration
+# order, and a table-level PRIMARY KEY setting NULL_FLAG without a NOT NULL
+# constraint row. Catalog compared against an engine-built reference, then
+# enforcement checked on fc's raw file and on a gbak-restored copy. Builds
+# its own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-key.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
