@@ -298,6 +298,54 @@ fn write_format_blob(
     dml::insert_blob(file, page_size, 8, &[fmt_payload], 6)
 }
 
+/// Turn a relation's current descriptors back into the `(dtype, length,
+/// scale, sub_type)` tuples `compute_format` consumes. `compute_format`
+/// re-adds the VARYING count word, so it is stripped here first - without
+/// which each ALTER would inflate every VARYING column by two more bytes.
+fn descs_to_fields(descs: &[Descriptor]) -> Vec<(u8, u16, i8, i16)> {
+    descs
+        .iter()
+        .map(|d| {
+            let gfld = if d.dtype == crate::format::dtype::VARYING {
+                d.length.saturating_sub(2)
+            } else {
+                d.length
+            };
+            (d.dtype, gfld, d.scale, d.sub_type)
+        })
+        .collect()
+}
+
+/// Locate a system relation's primary row whose decoded values satisfy
+/// `pred`: its data page and slot. For an in-place catalog update or
+/// delete (ALTER).
+fn find_sys_row_slot(
+    file: &[u8],
+    page_size: usize,
+    rel_name: &str,
+    rel: u16,
+    pred: impl Fn(&[Value]) -> bool,
+) -> Option<(u32, u16)> {
+    let formats = system_relation_formats(file, page_size, rel_name)?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    for dp_no in relation_data_pages(file, page_size, rel) {
+        let start = dp_no as usize * page_size;
+        let dp = file
+            .get(start..start + page_size)
+            .and_then(DataPage::decode)?;
+        for r in dp.records() {
+            if !r.is_primary_record() {
+                continue;
+            }
+            let Some(image) = r.image() else { continue };
+            if pred(&decode_record(&image, descs)) {
+                return Some((dp_no, r.slot));
+            }
+        }
+    }
+    None
+}
+
 /// Locate the `RDB$RELATIONS` primary row for `table`: its data page,
 /// slot, current record image, and record format number - what an
 /// in-place catalog update (ALTER) needs to rewrite the row.
@@ -450,10 +498,7 @@ pub fn alter_table_add_column(
         .iter()
         .max_by_key(|(n, _)| *n)
         .ok_or("relation has no format")?;
-    let mut fields: Vec<(u8, u16, i8, i16)> = cur_descs
-        .iter()
-        .map(|d| (d.dtype, d.length, d.scale, d.sub_type))
-        .collect();
+    let mut fields = descs_to_fields(cur_descs);
     fields.push((col.dtype, col.length, col.scale, col.sub_type));
     let new_descs = compute_format(&fields);
     if new_descs.len() != fields.len() {
@@ -558,6 +603,177 @@ pub fn alter_table_add_column(
         &[(rel_page, rel_slot, rel_image)],
         rec_format,
     )?;
+
+    advance_oldest_transactions(file, page_size)?;
+    Ok(())
+}
+
+/// `ALTER TABLE <table> DROP <column>`: remove a column. Like ADD, this is
+/// a new *format version* - existing records keep their old format (and
+/// still carry the dropped field's bytes, now unreferenced); the new
+/// format keeps the field-id indexing (the survivors are NOT renumbered -
+/// probe: dropping the middle of A/B/C leaves A=id0, C=id2, a hole at 1)
+/// but replaces the dropped field's descriptor with a zero-length
+/// placeholder and repacks the rest. The column's `RDB$RELATION_FIELDS`
+/// row and its auto-domain are deleted, `RDB$RUNTIME` is rebuilt without
+/// it, and `RDB$RELATIONS.RDB$FORMAT` is bumped (the field-id high-water,
+/// `RDB$FIELD_ID`, is left as-is - the engine does not reuse ids).
+///
+/// This first slice drops a plain nullable, unindexed column; a NOT NULL
+/// column, an indexed/key column, or the table's only column each error
+/// (they need constraint or index teardown first).
+pub fn alter_table_drop_column(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    col_name: &str,
+) -> Result<(), String> {
+    let table = table.trim().to_ascii_uppercase();
+    let col_up = col_name.trim().trim_matches('"').to_ascii_uppercase();
+    let rel = crate::resolve_relation(file, page_size, &table)
+        .ok_or_else(|| format!("table {} not found", table))?;
+
+    let cols = relation_columns(file, page_size, &table);
+    let target = cols
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(&col_up))
+        .ok_or_else(|| format!("column {} not found", col_name))?;
+    let drop_fid = target.field_id as usize;
+    if cols.len() <= 1 {
+        return Err("cannot drop the only column of a table".into());
+    }
+    // an indexed/key column would leave a dangling index - reject it
+    if let Some(irt) = find_index_root(file, page_size, rel) {
+        for e in irt.entries().filter(|e| e.root_page != 0) {
+            let (segs, _) =
+                btw::index_segments(file, page_size, rel, e.id, e.key_count as usize)
+                    .ok_or("unreadable index segments")?;
+            if segs.iter().any(|(field, _)| *field as usize == drop_fid) {
+                return Err(format!("column {} is indexed; drop the index first", col_name));
+            }
+        }
+    }
+
+    // the column's RDB$RELATION_FIELDS row: its slot, domain, null flag
+    let rf_formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")
+        .ok_or("no RDB$RELATION_FIELDS format")?;
+    let (_, rf_descs) = rf_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let rf_cols = relation_columns(file, page_size, "RDB$RELATION_FIELDS");
+    let rf_fid = |n: &str| rf_cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let rf_rel = rf_fid("RDB$RELATION_NAME").ok_or("no RDB$RELATION_NAME")?;
+    let rf_name = rf_fid("RDB$FIELD_NAME").ok_or("no RDB$FIELD_NAME")?;
+    let rf_src = rf_fid("RDB$FIELD_SOURCE").ok_or("no RDB$FIELD_SOURCE")?;
+    let rf_null = rf_fid("RDB$NULL_FLAG");
+    let text = |v: Option<&Value>| match v {
+        Some(Value::Text(t)) => Some(t.trim_end().to_string()),
+        _ => None,
+    };
+    let matches_col = |vals: &[Value]| {
+        text(vals.get(rf_rel)).as_deref() == Some(table.as_str())
+            && text(vals.get(rf_name)).as_deref() == Some(col_up.as_str())
+    };
+    // read the domain + null flag before deleting the row
+    let mut domain: Option<String> = None;
+    let mut not_null = false;
+    walk_rows(file, page_size, 5, rf_descs, |vals| {
+        if matches_col(vals) {
+            domain = text(vals.get(rf_src));
+            if let Some(nf) = rf_null {
+                not_null = matches!(vals.get(nf), Some(Value::Int(1)));
+            }
+        }
+    });
+    if not_null {
+        return Err(format!("column {} is NOT NULL; not supported", col_name));
+    }
+
+    // the new format version: existing descriptors, the dropped field
+    // replaced by a zero-length placeholder, the rest repacked
+    let cur_formats = crate::relation_formats(file, page_size, rel);
+    let (_, cur_descs) = cur_formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .ok_or("relation has no format")?;
+    let mut fields = descs_to_fields(cur_descs);
+    fields[drop_fid] = (0, 0, 0, 0); // dropped-field placeholder
+    let mut new_descs = compute_format(&fields);
+    // the placeholder itself is all-zero at offset 0 (dfw.epp), matching
+    // the engine's format blob for a dropped field
+    new_descs[drop_fid] = Descriptor {
+        dtype: 0,
+        scale: 0,
+        length: 0,
+        sub_type: 0,
+        flags: 0,
+        offset: 0,
+    };
+
+    // current format number, for the bump
+    let (rel_page, rel_slot, mut rel_image, rec_format) =
+        find_relations_row(file, page_size, &table).ok_or("RDB$RELATIONS row not found")?;
+    let sys_formats =
+        system_relation_formats(file, page_size, "RDB$RELATIONS").ok_or("no RDB$RELATIONS format")?;
+    let (_, rel_descs) = sys_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let rel_cols = relation_columns(file, page_size, "RDB$RELATIONS");
+    let rel_field = |name: &str| rel_cols.iter().find(|c| c.name == name).map(|c| c.field_id as usize);
+    let cur_vals = decode_record(&rel_image, rel_descs);
+    let cur_format_no = match cur_vals.get(rel_field("RDB$FORMAT").ok_or("no RDB$FORMAT")?) {
+        Some(Value::Int(n)) => *n,
+        _ => return Err("RDB$FORMAT unreadable".into()),
+    };
+    let new_format_no = cur_format_no + 1;
+
+    // --- new format blob + RDB$FORMATS row ----------------------------
+    let fmt_blob = write_format_blob(file, page_size, &new_descs)?;
+    sys_insert(
+        file,
+        page_size,
+        "RDB$FORMATS",
+        8,
+        &[
+            ("RDB$RELATION_ID", SysVal::I(rel as i64)),
+            ("RDB$FORMAT", SysVal::I(new_format_no)),
+            ("RDB$DESCRIPTOR", SysVal::B(blob_id_bytes(8, fmt_blob))),
+        ],
+    )?;
+
+    // --- delete the column's RDB$RELATION_FIELDS row and its domain ---
+    let rf_slot = find_sys_row_slot(file, page_size, "RDB$RELATION_FIELDS", 5, matches_col)
+        .ok_or("RDB$RELATION_FIELDS row not found")?;
+    dml::delete_records(file, page_size, 5, &[rf_slot])?;
+    if let Some(dom) = &domain {
+        let dom_pred = |vals: &[Value]| {
+            let f_fid = relation_columns(file, page_size, "RDB$FIELDS")
+                .iter()
+                .find(|c| c.name == "RDB$FIELD_NAME")
+                .map(|c| c.field_id as usize);
+            f_fid.and_then(|f| text(vals.get(f))).as_deref() == Some(dom.as_str())
+        };
+        if let Some(slot) = find_sys_row_slot(file, page_size, "RDB$FIELDS", 2, dom_pred) {
+            dml::delete_records(file, page_size, 2, &[slot])?;
+        }
+    }
+
+    // --- rebuild RDB$RUNTIME (now omits the dropped field) ------------
+    let runtime = rebuild_runtime_blob(file, page_size, &table, &new_descs)?;
+
+    // --- bump RDB$RELATIONS.RDB$FORMAT and RDB$RUNTIME (field-id high-
+    // water is left as-is: the engine does not reuse dropped ids) ------
+    let patch = |image: &mut [u8], name: &str, v: SysVal<'_>| -> Result<(), String> {
+        let fid = rel_field(name).ok_or_else(|| format!("no {} column", name))?;
+        let d = rel_descs.get(fid).ok_or("field beyond format")?;
+        let bytes = encode_sys_value(d, &v)?;
+        let at = d.offset as usize;
+        image
+            .get_mut(at..at + bytes.len())
+            .ok_or("image shorter than format")?
+            .copy_from_slice(&bytes);
+        image[fid / 8] &= !(1 << (fid % 8));
+        Ok(())
+    };
+    patch(&mut rel_image, "RDB$FORMAT", SysVal::I(new_format_no))?;
+    patch(&mut rel_image, "RDB$RUNTIME", SysVal::B(blob_id_bytes(6, runtime)))?;
+    dml::update_records(file, page_size, 6, &[(rel_page, rel_slot, rel_image)], rec_format)?;
 
     advance_oldest_transactions(file, page_size)?;
     Ok(())
@@ -1375,3 +1591,5 @@ mod tests {
         let _ = (u16_at(&[0, 0], 0), DPG_RPT_OFFSET, RHD_DATA_OFFSET); // linkage
     }
 }
+
+

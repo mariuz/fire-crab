@@ -46,10 +46,12 @@ EOF
     { echo "FAIL gbak clean copy"; exit 1; }
 cp "$CLEAN" "$WORK"; cp "$CLEAN" "$REF"
 
-# the engine applies the SAME alters to REF, as the oracle
+# the engine applies the SAME alters to REF, as the oracle: add two
+# columns then drop the original B, leaving A, C, D
 "$ISQL" -q -b -user "$U" -pas "$P" "$REF" <<EOF >/dev/null 2>&1
 ALTER TABLE T ADD C INTEGER;
 ALTER TABLE T ADD D VARCHAR(3);
+ALTER TABLE T DROP B;
 COMMIT;
 EOF
 
@@ -112,14 +114,21 @@ check "old rows read new col NULL" "$(node_run "SELECT A, B, C FROM T ORDER BY A
 "1|x|<null>
 2|yy|<null>"
 check "alter add second column"   "$(node_run "ALTER TABLE T ADD D VARCHAR(3)")" "<no rows>"
-check "insert a new-format row"    "$(node_run "INSERT INTO T (A, B, C, D) VALUES (3, ?, ?, ?)" '["zz",99,"pq"]')" \
+# --- DROP the original B: a new format version, survivors keep their
+#     field ids (A=0, C=2, D=3), B's bytes stay in old records unread -----
+check "alter drop column"          "$(node_run "ALTER TABLE T DROP B")"          "<no rows>"
+check "old rows read survivors"    "$(node_run "SELECT A, C, D FROM T ORDER BY A")" \
+"1|<null>|<null>
+2|<null>|<null>"
+check "insert a new-format row"    "$(node_run "INSERT INTO T (A, C, D) VALUES (3, ?, ?)" '[99,"pq"]')" \
     "<no rows>"
-check "fire-crab reads all fields" "$(node_run "SELECT A, B, C, D FROM T ORDER BY A")" \
-"1|x|<null>|<null>
-2|yy|<null>|<null>
-3|zz|99|pq"
-check "where on the added column"  "$(node_run "SELECT A FROM T WHERE C = 99")" "3"
-# a duplicate column name and an ALTER of a missing table both raise errors
+check "fire-crab reads survivors"  "$(node_run "SELECT A, C, D FROM T ORDER BY A")" \
+"1|<null>|<null>
+2|<null>|<null>
+3|99|pq"
+check "where on a surviving column" "$(node_run "SELECT A FROM T WHERE C = 99")" "3"
+# a duplicate column, an ALTER of a missing table, a DROP of a missing
+# column, and a DROP of the only column all raise SQL errors
 case "$(node_run "ALTER TABLE T ADD C INTEGER")" in
     ERR*) echo "OK   duplicate column refused" ;;
     *) echo "DIFF duplicate column refused"; fail=1 ;;
@@ -127,6 +136,10 @@ esac
 case "$(node_run "ALTER TABLE NOSUCH ADD X INTEGER")" in
     ERR*) echo "OK   alter of missing table refused" ;;
     *) echo "DIFF alter of missing table refused"; fail=1 ;;
+esac
+case "$(node_run "ALTER TABLE T DROP NOSUCH")" in
+    ERR*) echo "OK   drop of missing column refused" ;;
+    *) echo "DIFF drop of missing column refused"; fail=1 ;;
 esac
 
 # --- phase 2: the ENGINE adopts fire-crab's altered file ---------------
@@ -139,12 +152,12 @@ kill $srv 2>/dev/null; wait $srv 2>/dev/null
 # tabular column-width whitespace, which is a display heuristic not a value
 w12=$(run_isql "$WORK" <<EOF | strip | grep -v '^$'
 SET LIST ON;
-SELECT A, B, C, D FROM T WHERE A <= 2 ORDER BY A;
+SELECT A, C, D FROM T WHERE A <= 2 ORDER BY A;
 EOF
 )
 r12=$(run_isql "$REF" <<EOF | strip | grep -v '^$'
 SET LIST ON;
-SELECT A, B, C, D FROM T WHERE A <= 2 ORDER BY A;
+SELECT A, C, D FROM T WHERE A <= 2 ORDER BY A;
 EOF
 )
 check "engine reads WORK == engine reads REF" "$w12" "$r12"
@@ -168,7 +181,7 @@ check "gfix -v -full clean" "$(printf '%s' "$val" | strip)" ""
 
 # the engine WRITES its own row into fire-crab's altered table
 run_isql "$WORK" <<EOF >/dev/null 2>&1
-INSERT INTO T VALUES (4, 'ww', 400, 'rs');
+INSERT INTO T VALUES (4, 400, 'rs');
 COMMIT;
 EOF
 cnt=$(run_isql "$WORK" <<EOF | strip | grep -v '^$'
@@ -186,7 +199,7 @@ SET LIST ON;
 SELECT C, D FROM T WHERE A = 3;
 EOF
 )
-    check "gbak restore preserves the added columns" "$(echo $rr)" "C 99 D pq"
+    check "gbak restore preserves the altered columns" "$(echo $rr)" "C 99 D pq"
 else
     echo "DIFF gbak backup/restore"; fail=1
 fi
