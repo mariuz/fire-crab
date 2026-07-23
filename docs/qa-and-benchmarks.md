@@ -1607,6 +1607,62 @@ numerics, still match the engine verbatim. What remains for a later slice
 is numeric *arithmetic* — the scale-propagation rules for `+`/`-`/`*`/`/`
 over `NUMERIC` operands.
 
+### The forty-fourth differential — numeric arithmetic, and the scale rules probed from the engine
+
+The last slice admitted numeric columns as operands but stopped at the
+boundary it called honest: arithmetic over them, whose scale-propagation
+rules it would not guess. This slice does the probing and implements the
+rules, so `+`/`-`/`*`/`/` now work over `NUMERIC` the way they work over
+integers — and, exactly as the CAST rounding was, the rules were read off
+the engine, not derived.
+
+A short battery through isql fixed all four. For a `NUMERIC(a)` and a
+`NUMERIC(b)`, the result scale is: **addition and subtraction take the
+finer scale** (`NUMERIC(9,2) + NUMERIC(9,4)` → scale 4), both operands
+aligned to it; **multiplication adds the scales** (`(9,2) * (9,4)` →
+scale 6); and — the one worth checking rather than assuming —
+**division also adds the scales** (`(9,2) / (9,4)` → scale 6). Division's
+value is computed as the engine's own fixed-point trick
+(ExprNodes.cpp): the dividend is pre-scaled by `10^(-2·s2)` and then
+integer-divided, truncating toward zero — `12.50 / 1.2345` stored at
+scale 6 is `10.125556`, the trailing digit dropped, not rounded. An
+integer operand is simply scale 0, so `NUMERIC(9,2) / 3` keeps scale 2
+(`4.16`) while `NUMERIC(9,2) / NUMERIC(9,2)` widens to scale 4
+(`3.1250`).
+
+The scale has to be known twice, and the two must agree: once
+*statically*, at prepare, because the describe announces the result
+column's scale before any row exists; and once *dynamically*, per row, as
+`eval` produces the scaled integer. A `result_scale` walk over the
+expression tree computes the former from the operand scales, and
+`eval`'s numeric path produces exactly that scale — if they disagreed,
+the client would divide by the wrong power of ten and every value would
+be wrong. The result travels as an INT64-backed scaled integer (the raw
+integer on the wire, the announced scale in the describe, the client
+dividing), the same contract a numeric *column* already uses. A numeric
+result is still `i64`-bounded here; wide-precision arithmetic that needs
+an `INT128` result is left for later, as is numeric arithmetic against a
+decimal *literal* (the parser reads only integer literals today, so
+`N + 1.5` still falls back).
+
+The gate grew a wrinkle worth recording. node-firebird renders a
+`NUMERIC` as a JavaScript number, which drops the trailing zeros isql
+prints — `25.00` comes back `25`, `156.2500` comes back `156.25`. That is
+a client display artifact, not a value or scale error: a *wrong* scale
+changes the significant digits (`25` versus `0.25` versus `2500`), which
+the comparison still catches. So the numeric-arithmetic checks compare
+values with trailing zeros normalized on both sides, while column headers
+stay exact and every other check (text, CAST, integer arithmetic) stays
+byte-strict.
+
+`qa/serve-real-selectexpr.sh` grows from forty-eight checks to sixty-five:
+the scratch table gains a second `NUMERIC(9,4)` column, and seventeen new
+checks run identically through fire-crab and isql — every operator at
+same and mixed scales, against integer columns and literals, negation,
+operator precedence, the default `MULTIPLY`/`DIVIDE` header, and NULL
+propagation. The groupby, having, join, where-predicate and wire-types
+gates all still match the engine.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
