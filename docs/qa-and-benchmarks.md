@@ -1797,6 +1797,54 @@ for later is changing a column's *type*, and adding or dropping the
 constraints (`NOT NULL`, keys) that a column drop currently refuses to
 step around.
 
+### The forty-eighth differential — ALTER COLUMN TYPE, and the compression a full page forced
+
+The third ALTER verb changes a column's type, and it is where the
+format-version machinery pays off: a type change is another new version,
+the field's descriptor swapped for the new type while everything else
+holds. The column keeps its id, position and domain *name*; only the
+domain's `RDB$FIELDS` row is retyped — in place, as the engine does
+(probe: `RDB$1` went from type 8, length 4 to type 16, length 8) — and
+`RDB$RUNTIME` is rebuilt for the new width. Existing records need no
+rewrite: they keep their old format, and an `INTEGER` stored four bytes
+reads back through the new format's eyes as the `BIGINT` it now is, because
+fire-crab already decodes each record by the format it names and its
+values are width-agnostic.
+
+The conversion is kept to a deliberate *subset* of what the engine allows —
+only loss-free widenings (a wider integer, a longer `CHAR`/`VARCHAR`) — so
+fire-crab never succeeds where the engine would refuse. Narrowing a
+`BIGINT` back to `SMALLINT` errors on both sides ("Conversion ... is not
+supported"). Rejecting more than the engine does is a safe direction; the
+reverse would be a silent divergence.
+
+This verb also forced a problem the earlier slices had sidestepped by
+luck. Every catalog self-update rewrites a system row in place, and the
+primary version is positional — it cannot move off its page. The
+`RDB$RELATIONS` row survived because its updates rewrote a same-size image
+into the same slot; but a second type change had to rewrite an
+`RDB$FIELDS` row on a page packed tight with the hundreds of system
+domains, and the *uncompressed* image the update wrote no longer fit. The
+engine never hits this because it stores records **RLE-compressed**.
+So `update_records` now compresses too, with the packer that already had a
+decompressor: the rewritten version is the same size class as the original
+the slot held, and it fits. Records the DML path updates get smaller as a
+side benefit.
+
+`qa/serve-real-altertype.sh` proves it against the engine as oracle — the
+reference copy retyped by the engine's own `ALTER`. Fourteen checks:
+fire-crab widens `INTEGER`→`BIGINT`, `VARCHAR(5)`→`VARCHAR(10)` and
+`SMALLINT`→`INTEGER`; the pre-existing rows read back promoted; a
+new-format `INSERT` stores values the old types could not hold — an `A`
+past 32 bits (nine billion), a ten-character `B`, a `C` of forty thousand;
+a narrowing and a retype of a missing column both error. Then the engine
+adopts the file: it reads it byte-identically to its reference, `SHOW
+TABLE` matches, it reads fire-crab's wide row, `gfix -v -full` is clean,
+the engine writes its own wide row, and `gbak` restores the whole retyped
+catalog as real engine DDL. `ALTER TABLE` now covers `ADD`, `DROP` and
+`ALTER … TYPE`; what remains is the constraint side — changing or adding
+`NOT NULL` and keys.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
