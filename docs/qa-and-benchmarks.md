@@ -2155,6 +2155,41 @@ restored copy and on fire-crab's raw file. (A *named* table-level primary
 key, `CONSTRAINT PK_P PRIMARY KEY (A, B)`, is the one idiom still
 unparsed; an unnamed table-level `PRIMARY KEY (A, B)` works.)
 
+### The fifty-sixth differential — FOREIGN KEY by ALTER, and where CASCADE stops being metadata
+
+With the partner-schema column understood, a foreign key no longer has to
+be declared at `CREATE TABLE` time. `ALTER TABLE C ADD CONSTRAINT FK_C_P
+FOREIGN KEY (PID) REFERENCES P (PID)` adds one to an existing, populated
+table. The per-key writing that `create_table` used is factored into a
+shared helper, and the ALTER path reuses it wholesale — the one thing that
+differs is that `create_index` now backfills the referencing index over
+rows that are already there, which it already knew how to do. The catalog
+that results is identical to declaring the key inline, so the engine reads
+it, `gbak` restores it, and both the restored copy and fire-crab's raw file
+enforce it — an orphan rejected, a valid child accepted.
+
+`qa/serve-real-fkalter.sh` builds the schema the same way on both sides —
+create the tables, insert, *then* alter — so the twelve-check comparison is
+honest about the order the FK is added, not just the end state.
+
+**Where this stops.** The referential *actions* — `ON DELETE CASCADE`, `ON
+UPDATE CASCADE`, `SET NULL`, `SET DEFAULT` — are deliberately not here, and
+the reason is worth recording because it is the same kind of "read the
+source, not the surface" lesson the partner-schema column taught. It would
+be tempting to write `RDB$REF_CONSTRAINTS.RDB$DELETE_RULE = 'CASCADE'` and
+call it done. But probing the engine shows a cascading foreign key also
+grows two **system triggers on the parent table** (`CHECK_1`, `CHECK_2`,
+trigger types 4 and 6 — after-update and after-delete) each carrying
+*compiled BLR* that performs the cascade; deleting a parent row fires them
+and removes the children. `RESTRICT` and `NO ACTION` need no triggers (the
+internal index check enforces them, which is why every foreign key so far
+works from catalog rows alone), but `CASCADE` and its siblings would
+require fire-crab to synthesise correct trigger BLR — a genuinely separate,
+deeper slice. Writing the rule string without the triggers would produce a
+key that looks cascading in the catalog but silently fails to cascade: the
+exact kind of "claims what isn't validated" outcome the differential
+discipline exists to prevent. So it waits.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
