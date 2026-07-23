@@ -2084,6 +2084,63 @@ engine value-for-value, the stored generator values match afterwards, and
 complete in every place a value can be minted — read, set, increment in a
 single-row query, in an `INSERT`, and now per row of a `SELECT`.
 
+### The fifty-fifth differential — FOREIGN KEY, and the one ODS-14 column that hid the whole blocker
+
+A `FOREIGN KEY` in `CREATE TABLE` was attempted twice before and reverted
+both times. The tables created, the engine adopted the constraint live,
+`SHOW TABLE` and `gfix` and every catalog column matched the engine — and
+yet `gbak` restore failed with **"Cannot create foreign key constraint
+FK_C_P. Partner index does not exist or is inactive."** The metadata was,
+column for column, byte-identical to the engine's, so the failure looked
+physical: something in the data pages the `.fbk` carried. That reading was
+wrong.
+
+The answer was in the source. When the engine creates a foreign-key index
+(which is what `gbak` restore does, deferred, at the end),
+`MET_lookup_partner` finds the referenced (partner) index through a
+**self-join of `RDB$INDICES` to itself** — not, as the earlier attempts
+assumed, through `RDB$REF_CONSTRAINTS`. And that self-join's predicate
+includes a column that only exists in Firebird 6's ODS 14:
+
+```
+IND.RDB$SCHEMA_NAME  EQ  IDX.RDB$FOREIGN_KEY_SCHEMA_NAME
+```
+
+The FK-index row must carry `RDB$FOREIGN_KEY_SCHEMA_NAME = 'PUBLIC'`
+alongside the `RDB$FOREIGN_KEY = 'RDB$PRIMARY1'` it already had. Leaving
+that one column NULL makes the join match nothing, the partner lookup
+returns "not found," and the restore dies. The earlier exhaustive diffs
+had walked `RDB$RELATION_CONSTRAINTS`, `RDB$REF_CONSTRAINTS`,
+`RDB$INDEX_SEGMENTS`, `RDB$CHECK_CONSTRAINTS`, `RDB$TRIGGERS` — every table
+*except* `RDB$INDICES`, where the missing column lived. The same omission
+starved the engine's live-enforcement cache (`scanPartners`), which is why
+the earlier attempts also saw no runtime enforcement.
+
+Writing that single column turned every symptom green at once. `gbak`
+restores the file with no partner error; the restored database **enforces**
+the constraint (an orphan child is rejected, a valid one accepted) and is
+`gfix`-clean; and — the bonus the earlier attempts never reached — the
+engine now enforces the foreign key on fire-crab's **raw** file too, an
+orphan insert rejected with `violation of FOREIGN KEY constraint FK_C_P`.
+
+The rest is the ordinary constraint machinery: `create_index` gains a
+foreign-key mode (the `irt_foreign` flag plus the two `RDB$INDICES`
+columns, with `RDB$INDEX_TYPE` left NULL as the engine leaves it);
+`create_table` resolves the referenced table's primary key, writes the
+referencing index, the `RDB$RELATION_CONSTRAINTS` `FOREIGN KEY` row, and
+the `RDB$REF_CONSTRAINTS` link (`CONST_NAME_UQ` = the partner PK
+constraint, `MATCH FULL`, `RESTRICT`/`RESTRICT`); and the parser accepts
+`[CONSTRAINT <name>] FOREIGN KEY (<cols>) REFERENCES <t> [(<refcols>)]`,
+generating an `INTEG_n` name for an unnamed one.
+
+`qa/serve-real-fk.sh` proves it eleven ways with the engine as oracle: the
+FK catalog fire-crab writes matches an engine-built reference column for
+column; `gbak` backs up and restores; the restored database enforces and
+validates clean; and the engine enforces on the raw file. The discipline
+that governed the earlier reverts — *don't ship what gbak rejects* — is now
+satisfied, not by working around gbak but by giving it the one column it
+was looking for.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
