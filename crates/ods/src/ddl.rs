@@ -1452,35 +1452,7 @@ pub fn create_table(
         ])?;
     }
     for key in keys {
-        // a named constraint names its index too; an unnamed one draws
-        // both from the engine's generated sequences (probed: ONE index
-        // number sequence feeds RDB$PRIMARY<n> and RDB$<n> alike)
-        let (cname, iname) = if key.name.is_empty() {
-            let n = next_index_number(file, page_size)?;
-            let iname = if key.primary {
-                format!("RDB$PRIMARY{}", n)
-            } else {
-                format!("RDB${}", n)
-            };
-            let cname = format!("INTEG_{}", integ);
-            integ += 1;
-            (cname, iname)
-        } else {
-            (key.name.clone(), key.name.clone())
-        };
-        create_index(
-            file, page_size, &name, &iname, &key.columns, true, false, key.primary, None,
-        )?;
-        sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
-            ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
-            ("RDB$CONSTRAINT_TYPE",
-                SysVal::S(if key.primary { "PRIMARY KEY" } else { "UNIQUE" })),
-            ("RDB$RELATION_NAME", SysVal::S(&name)),
-            ("RDB$INDEX_NAME", SysVal::S(&iname)),
-            ("RDB$DEFERRABLE", SysVal::S("NO")),
-            ("RDB$INITIALLY_DEFERRED", SysVal::S("NO")),
-            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
-        ])?;
+        write_key(file, page_size, &name, key)?;
     }
     // --- FOREIGN KEY constraints: a non-unique index on the referencing
     // columns (irt_foreign, naming the partner PK index), an RDB$RELATION_
@@ -1488,11 +1460,11 @@ pub fn create_table(
     // to the referenced table's PK constraint (MATCH FULL, RESTRICT rules)
     for fk in fks {
         // an unnamed FK is named INTEG_<n> - the same generated name for
-        // both the constraint and its index, as the engine does
+        // both the constraint and its index, as the engine does. The
+        // number comes from the catalog as it now stands (the key
+        // constraints just written have already taken theirs)
         let fk_name = if fk.name.is_empty() {
-            let n = format!("INTEG_{}", integ);
-            integ += 1;
-            n
+            next_integ_name(file, page_size)?
         } else {
             fk.name.clone()
         };
@@ -1500,6 +1472,131 @@ pub fn create_table(
     }
     advance_oldest_transactions(file, page_size)?;
     Ok(())
+}
+
+/// Write one PRIMARY KEY or UNIQUE constraint onto a table: the unique
+/// index backing it (primary-flagged for a PRIMARY KEY) and the
+/// RDB$RELATION_CONSTRAINTS row. A NAMED constraint names its index too;
+/// an unnamed one draws INTEG_<n> and its index name from the engine's
+/// generated sequences (probed: ONE index-number sequence feeds
+/// RDB$PRIMARY<n> and RDB$<n> alike). Shared by create_table and
+/// ALTER TABLE ADD CONSTRAINT; create_index backfills - and unique-
+/// checks - the table's existing rows, so this works on a populated
+/// table exactly as the engine's own does.
+fn write_key(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    key: &KeyDef,
+) -> Result<(), String> {
+    let (cname, iname) = if key.name.is_empty() {
+        let n = next_index_number(file, page_size)?;
+        let iname = if key.primary {
+            format!("RDB$PRIMARY{}", n)
+        } else {
+            format!("RDB${}", n)
+        };
+        (next_integ_name(file, page_size)?, iname)
+    } else {
+        (key.name.clone(), key.name.clone())
+    };
+    create_index(
+        file, page_size, table, &iname, &key.columns, true, false, key.primary, None,
+    )?;
+    sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
+        ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
+        ("RDB$CONSTRAINT_TYPE",
+            SysVal::S(if key.primary { "PRIMARY KEY" } else { "UNIQUE" })),
+        ("RDB$RELATION_NAME", SysVal::S(table)),
+        ("RDB$INDEX_NAME", SysVal::S(&iname)),
+        ("RDB$DEFERRABLE", SysVal::S("NO")),
+        ("RDB$INITIALLY_DEFERRED", SysVal::S("NO")),
+        ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+    ])?;
+    Ok(())
+}
+
+/// `ALTER TABLE <table> ADD [CONSTRAINT <name>] PRIMARY KEY|UNIQUE
+/// (<cols>)`: add a key constraint to an EXISTING table. The index is
+/// built over the table's committed rows, so duplicate data fails the
+/// statement the way the engine's own index build does. A PRIMARY KEY
+/// requires its columns to be NOT NULL ALREADY - the engine refuses to
+/// add one over a nullable column rather than making it not-null
+/// (probed), and so does this.
+pub fn alter_table_add_key(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    key: &KeyDef,
+) -> Result<(), String> {
+    let name = table.trim().to_ascii_uppercase();
+    let rel = crate::resolve_relation(file, page_size, &name)
+        .ok_or_else(|| format!("table {} not found", table))?;
+    if rel < 128 {
+        return Err("system relations are read-only".into());
+    }
+    let columns = relation_columns(file, page_size, &name);
+    for c in &key.columns {
+        if !columns.iter().any(|rc| rc.name.eq_ignore_ascii_case(c)) {
+            return Err(format!("unknown column {}", c));
+        }
+    }
+    if key.primary {
+        if find_partner_key(file, page_size, &name, &[]).is_some() {
+            return Err(format!("table {} already has a primary key", name));
+        }
+        for c in &key.columns {
+            if !column_is_not_null(file, page_size, &name, &c.to_ascii_uppercase()) {
+                return Err(format!(
+                    "Column: {} not defined as NOT NULL - cannot be used in PRIMARY KEY constraint definition",
+                    c
+                ));
+            }
+        }
+    }
+    write_key(file, page_size, &name, key)?;
+    advance_oldest_transactions(file, page_size)?;
+    Ok(())
+}
+
+/// Whether a column's `RDB$RELATION_FIELDS.RDB$NULL_FLAG` is set.
+fn column_is_not_null(file: &[u8], page_size: usize, table: &str, col_up: &str) -> bool {
+    let Some(rel) = crate::resolve_relation(file, page_size, "RDB$RELATION_FIELDS") else {
+        return false;
+    };
+    let Some(formats) = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS") else {
+        return false;
+    };
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else {
+        return false;
+    };
+    let cols = relation_columns(file, page_size, "RDB$RELATION_FIELDS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(rn_f), Some(fn_f), Some(nf_f)) = (
+        fid("RDB$RELATION_NAME"),
+        fid("RDB$FIELD_NAME"),
+        fid("RDB$NULL_FLAG"),
+    ) else {
+        return false;
+    };
+    let mut not_null = false;
+    walk_rows(file, page_size, rel, descs, |values| {
+        if text_eq(values.get(rn_f), table) && text_eq(values.get(fn_f), col_up) {
+            not_null = int_eq(values.get(nf_f), 1);
+        }
+    });
+    not_null
+}
+
+/// The next generated `INTEG_<n>` constraint name, read from the catalog
+/// as it now stands (every writer takes its number this way, so the
+/// sequence advances across mixed constraint kinds the way the engine's
+/// does).
+fn next_integ_name(file: &[u8], page_size: usize) -> Result<String, String> {
+    let n = next_numeric_suffix(
+        file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME", "INTEG_",
+    )?;
+    Ok(format!("INTEG_{}", n))
 }
 
 /// Write one FOREIGN KEY onto a table: the referencing index (irt_foreign,
@@ -1519,8 +1616,16 @@ fn write_foreign_key(
     fk: &ForeignKeyDef,
 ) -> Result<(), String> {
     let (uq_constraint, partner_index) =
-        find_primary_key(file, page_size, &fk.ref_table).ok_or_else(|| {
-            format!("referenced table {} has no primary key", fk.ref_table)
+        find_partner_key(file, page_size, &fk.ref_table, &fk.ref_columns).ok_or_else(|| {
+            if fk.ref_columns.is_empty() {
+                format!("referenced table {} has no primary key", fk.ref_table)
+            } else {
+                format!(
+                    "referenced table {} has no primary key or unique constraint on ({})",
+                    fk.ref_table,
+                    fk.ref_columns.join(", ")
+                )
+            }
         })?;
     create_index(
         file, page_size, table, fk_name, &fk.columns, false, false, false,
@@ -1577,11 +1682,21 @@ pub fn alter_table_add_foreign_key(
     Ok(())
 }
 
-/// The referenced table's PRIMARY KEY: (constraint name, index name),
-/// read from RDB$RELATION_CONSTRAINTS. An FK's RDB$REF_CONSTRAINTS row
-/// names the unique CONSTRAINT (INTEG_n), and its index is the partner
-/// MET_lookup_partner links to.
-fn find_primary_key(file: &[u8], page_size: usize, ref_table: &str) -> Option<(String, String)> {
+/// The referenced table's key a foreign key partners with: (constraint
+/// name, index name), read from RDB$RELATION_CONSTRAINTS. An FK's
+/// RDB$REF_CONSTRAINTS row names the unique CONSTRAINT (INTEG_n or the
+/// name it was given), and its index is the partner MET_lookup_partner
+/// links to. With no referenced columns named, that is the table's
+/// PRIMARY KEY; with columns named, it is the PRIMARY KEY or UNIQUE
+/// constraint whose index carries exactly those columns in that order
+/// (probed: `REFERENCES A1 (Y)` onto a UNIQUE(Y) links the FK to the
+/// UNIQUE constraint and its index, not the table's primary key).
+fn find_partner_key(
+    file: &[u8],
+    page_size: usize,
+    ref_table: &str,
+    ref_columns: &[String],
+) -> Option<(String, String)> {
     let rel = crate::resolve_relation(file, page_size, "RDB$RELATION_CONSTRAINTS")?;
     let formats = system_relation_formats(file, page_size, "RDB$RELATION_CONSTRAINTS")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
@@ -1594,24 +1709,79 @@ fn find_primary_key(file: &[u8], page_size: usize, ref_table: &str) -> Option<(S
         fid("RDB$INDEX_NAME")?,
     );
     let want = ref_table.trim().to_ascii_uppercase();
-    let mut found = None;
+    // every PRIMARY KEY / UNIQUE constraint of the referenced table,
+    // primaries first (they win when both would fit)
+    let mut candidates: Vec<(bool, String, String)> = Vec::new();
     walk_rows(file, page_size, rel, descs, |values| {
-        if found.is_some() {
-            return;
-        }
         let txt = |i: usize| match values.get(i) {
             Some(Value::Text(t)) => Some(t.trim_end().to_string()),
             _ => None,
         };
-        if txt(rn_f).as_deref().map(|s| s.eq_ignore_ascii_case(&want)) == Some(true)
-            && txt(ct_f).as_deref() == Some("PRIMARY KEY")
-        {
-            if let (Some(cn), Some(ix)) = (txt(cn_f), txt(ix_f)) {
-                found = Some((cn, ix));
-            }
+        if txt(rn_f).as_deref().map(|s| s.eq_ignore_ascii_case(&want)) != Some(true) {
+            return;
+        }
+        let primary = match txt(ct_f).as_deref() {
+            Some("PRIMARY KEY") => true,
+            Some("UNIQUE") => false,
+            _ => return,
+        };
+        if let (Some(cn), Some(ix)) = (txt(cn_f), txt(ix_f)) {
+            candidates.push((primary, cn, ix));
         }
     });
-    found
+    candidates.sort_by_key(|(primary, _, _)| !*primary);
+    if ref_columns.is_empty() {
+        let (_, cn, ix) = candidates.into_iter().find(|(primary, _, _)| *primary)?;
+        return Some((cn, ix));
+    }
+    candidates
+        .into_iter()
+        .find(|(_, _, ix)| {
+            let segs = index_segment_names(file, page_size, ix);
+            segs.len() == ref_columns.len()
+                && segs
+                    .iter()
+                    .zip(ref_columns)
+                    .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        })
+        .map(|(_, cn, ix)| (cn, ix))
+}
+
+/// An index's columns in key order, from RDB$INDEX_SEGMENTS.
+fn index_segment_names(file: &[u8], page_size: usize, index_name: &str) -> Vec<String> {
+    let Some(rel) = crate::resolve_relation(file, page_size, "RDB$INDEX_SEGMENTS") else {
+        return Vec::new();
+    };
+    let Some(formats) = system_relation_formats(file, page_size, "RDB$INDEX_SEGMENTS") else {
+        return Vec::new();
+    };
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else {
+        return Vec::new();
+    };
+    let cols = relation_columns(file, page_size, "RDB$INDEX_SEGMENTS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(ix_f), Some(fn_f), Some(pos_f)) = (
+        fid("RDB$INDEX_NAME"),
+        fid("RDB$FIELD_NAME"),
+        fid("RDB$FIELD_POSITION"),
+    ) else {
+        return Vec::new();
+    };
+    let mut segs: Vec<(i64, String)> = Vec::new();
+    walk_rows(file, page_size, rel, descs, |values| {
+        if !text_eq(values.get(ix_f), index_name) {
+            return;
+        }
+        let pos = match values.get(pos_f) {
+            Some(Value::Int(i)) => *i,
+            _ => 0,
+        };
+        if let Some(Value::Text(t)) = values.get(fn_f) {
+            segs.push((pos, t.trim_end().to_string()));
+        }
+    });
+    segs.sort_by_key(|(pos, _)| *pos);
+    segs.into_iter().map(|(_, n)| n).collect()
 }
 
 /// One past the highest numeric suffix of `<prefix><n>` names in a

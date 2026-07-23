@@ -710,6 +710,14 @@ enum Plan {
         table: String,
         fk: fire_crab_ods::ddl::ForeignKeyDef,
     },
+    /// `ALTER TABLE <table> ADD [CONSTRAINT <name>] PRIMARY KEY|UNIQUE
+    /// (...)`: add a key constraint to an existing table - the unique
+    /// index built over the committed rows (duplicates fail the
+    /// statement), the constraint catalog row written
+    AlterTableAddKey {
+        table: String,
+        key: fire_crab_ods::ddl::KeyDef,
+    },
     /// `ALTER TABLE <table> DROP <column>`: a new format version with the
     /// dropped field as a placeholder, the column's catalog rows deleted,
     /// RDB$RUNTIME rebuilt, RDB$RELATIONS format bumped
@@ -1668,6 +1676,13 @@ fn plan_alter_table_add(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             Vec::new(),
         ));
     }
+    // ADD [CONSTRAINT <name>] PRIMARY KEY|UNIQUE (...)
+    if let Some(key) = parse_key_clause(&tail.to_ascii_uppercase()) {
+        return Some((
+            Plan::AlterTableAddKey { table: table.to_ascii_uppercase(), key },
+            Vec::new(),
+        ));
+    }
     let (col, col_key) = parse_column_def(&s[add_kw + "ADD".len()..])?;
     if col_key.is_some() || col.not_null {
         return None;
@@ -2614,6 +2629,10 @@ fn execute_dml(
         }
         Plan::AlterTableAddFk { table, fk } => {
             fire_crab_ods::ddl::alter_table_add_foreign_key(&mut work, db.page_size, table, fk)?;
+            (0, 0, 0)
+        }
+        Plan::AlterTableAddKey { table, key } => {
+            fire_crab_ods::ddl::alter_table_add_key(&mut work, db.page_size, table, key)?;
             (0, 0, 0)
         }
         Plan::AlterTableDrop { table, column } => {
@@ -4094,7 +4113,8 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
     match plan {
         Plan::Scalar(_) | Plan::GenIdIncrement { .. } => describe_one_bigint(params),
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
-        | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. } | Plan::AlterTableDrop { .. }
+        | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
+        | Plan::AlterTableAddKey { .. } | Plan::AlterTableDrop { .. }
         | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } => {
             describe_dml(5, params) // isc_info_sql_stmt_ddl
         }
@@ -4122,7 +4142,8 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         Plan::Update { .. } => 3,
         Plan::Delete { .. } => 4,
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
-        | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. } | Plan::AlterTableDrop { .. }
+        | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
+        | Plan::AlterTableAddKey { .. } | Plan::AlterTableDrop { .. }
         | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } => 5,
         Plan::SetGenerator { stmt_type, .. } => *stmt_type,
     }
@@ -4437,7 +4458,8 @@ fn emit_rows_inner(
         // reaches fetch as itself; the arm keeps the match exhaustive.
         Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
         | Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
-        | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. } | Plan::AlterTableDrop { .. }
+        | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
+        | Plan::AlterTableAddKey { .. } | Plan::AlterTableDrop { .. }
         | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. }
         | Plan::GenIdIncrement { .. } | Plan::SetGenerator { .. } => {}
         Plan::Scalar(v) => {
@@ -7096,6 +7118,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::DropTable { .. }
                         | Plan::AlterTableAdd { .. }
                         | Plan::AlterTableAddFk { .. }
+                        | Plan::AlterTableAddKey { .. }
                         | Plan::AlterTableDrop { .. }
                         | Plan::AlterColumnType { .. }
                         | Plan::AlterColumnNull { .. }
@@ -9970,6 +9993,32 @@ mod tests {
             "CREATE TABLE T (A INTEGER PRIMARY KEY, B INTEGER, PRIMARY KEY (B))"
         )
         .is_none());
+    }
+
+    #[test]
+    fn plan_alter_table_add_recognises_a_key_constraint() {
+        // ADD [CONSTRAINT ...] PRIMARY KEY|UNIQUE routes to
+        // AlterTableAddKey, not a column add
+        match plan_alter_table_add("ALTER TABLE A1 ADD CONSTRAINT PK_A1 PRIMARY KEY (X)") {
+            Some((Plan::AlterTableAddKey { table, key }, _)) => {
+                assert_eq!(table, "A1");
+                assert_eq!(key.name, "PK_A1");
+                assert!(key.primary && key.columns == vec!["X".to_string()]);
+            }
+            other => panic!("expected AlterTableAddKey, got {:?}", other.is_some()),
+        }
+        match plan_alter_table_add("alter table A1 add unique (Y, Z)") {
+            Some((Plan::AlterTableAddKey { key, .. }, _)) => {
+                assert!(key.name.is_empty() && !key.primary);
+                assert_eq!(key.columns, vec!["Y".to_string(), "Z".to_string()]);
+            }
+            other => panic!("expected AlterTableAddKey, got {:?}", other.is_some()),
+        }
+        // a plain column add is still a column add
+        assert!(matches!(
+            plan_alter_table_add("ALTER TABLE A1 ADD W INTEGER"),
+            Some((Plan::AlterTableAdd { .. }, _))
+        ));
     }
 
     #[test]
