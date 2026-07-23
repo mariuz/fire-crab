@@ -2296,6 +2296,60 @@ instead of its unique key (catalog mismatch, and the engine then rejects a
 child row it should accept), and dropping the not-null precondition lets the
 nullable-column primary key through. Each shows up as a `DIFF`.
 
+### The fifty-ninth differential — DROP CONSTRAINT, and an index that does not die at once
+
+`ALTER TABLE <t> DROP CONSTRAINT <name>` removes a NOT NULL, PRIMARY
+KEY, UNIQUE or FOREIGN KEY. The catalog side is unremarkable — delete the
+`RDB$RELATION_CONSTRAINTS` row, the `RDB$REF_CONSTRAINTS` row for a foreign
+key, the `RDB$CHECK_CONSTRAINTS` link and the `RDB$NULL_FLAG` for a NOT
+NULL — and dropping a primary key that a foreign key still references is
+refused, as the engine refuses it.
+
+What made this slice worth the source-reading is the **index**. The obvious
+implementation erases the `RDB$INDICES` row and frees the pages. The engine
+does neither. `DropIndexNode::drop` (DdlNodes.epp:14634) *renames* the row to
+`RDB$TEMP_DEPEND_<relation id>_<index id>` and sets `RDB$INDEX_INACTIVE =
+MET_index_deferred_drop` (4), deletes the segment rows, and leaves the
+index-root slot in the drop half of ods.h's state lifecycle —
+`irt_commit` (5) → `irt_normal` never again, settling to `irt_drop` (6),
+"index to be removed when OAT > irt_transaction" — with its pages still
+allocated. `gbak` skips such indices when backing up (backup.epp:1676), which
+is why a restored copy shows no trace of them and why the leftovers are
+invisible in every schema-level view. fire-crab writes that state, because
+the engine has to read the result as one of its own.
+
+Two consequences fell out, and the second was caught by a regression, not by
+design:
+
+**A dropped index must stop being maintained.** The first version left the
+irt slot alone, and fire-crab's own DML kept inserting into the dropped
+unique index — re-enforcing a constraint the user had just removed (the gate
+caught it: fire-crab refused a duplicate the engine accepted). The rule
+belongs in one place, so `IndexRootPage` grew `live_entries()`.
+
+**"Live" is not "normal".** The obvious spelling of that rule — state ==
+`irt_normal` — passed this gate and broke the B-tree gate: a *freshly
+engine-created* index idles in `irt_rollback` (2) until something touches it,
+so "normal only" silently stops maintaining brand-new engine indices, which
+showed up as an empty range scan and two index-page errors from `gfix`. The
+lifecycle splits the states in two — building/working (1, 2, 3) versus on
+the way out (4, 5, 6) — and that is the rule. A pre-existing gate found this
+within minutes; nothing in the new gate would have.
+
+`qa/serve-real-dropconstraint.sh` (26 checks) drops the same three
+constraints on both sides and compares the catalogs row for row — the
+`TEMP_DEPEND` leftovers included — then compares the index-root slots as
+`fcstat` reads them off both files, classifying states 5 and 6 together
+(they are the same lifecycle point either side of the engine's own settling,
+and the engine settles files it opens; a slot left *normal*, or erased,
+differs from both). Then the engine is asked to behave: on fire-crab's raw
+file it now accepts the former duplicate, the orphan and the NULL, still
+enforces the surviving primary key, and refuses the same referenced-PK drop
+fire-crab refused. `gbak` restores, the restored copy carries only the
+surviving constraints, and `gfix -v -full` is clean on both the restored copy
+and fire-crab's raw file. Teeth: erasing the index row instead of renaming
+it, and leaving the slot in `irt_normal`, each make the gate `DIFF`.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -2593,6 +2647,17 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-keyalter.sh 3050
+
+# DROP CONSTRAINT: NOT NULL / PRIMARY KEY / UNIQUE / FOREIGN KEY removed by
+# ALTER TABLE, with the engine's DEFERRED index removal reproduced (the
+# RDB$INDICES row renamed RDB$TEMP_DEPEND_<rel>_<id>, marked inactive 4, the
+# root slot left in the drop states with its pages) - catalogs and index-root
+# slots compared against an engine reference, enforcement checked to be GONE
+# on fc's raw file, gbak restore clean. Builds its own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-dropconstraint.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
