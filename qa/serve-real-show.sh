@@ -50,6 +50,18 @@ CREATE ROLE R2;
 CREATE SEQUENCE SEQ_A;
 CREATE SEQUENCE SEQ_B START WITH 100;
 CREATE GENERATOR GEN_C;
+CREATE TABLE Z (ID INTEGER);
+CREATE EXCEPTION E_FIRST 'the first exception message';
+CREATE EXCEPTION E_UNUSED 'nobody uses me';
+COMMIT;
+-- a trigger that raises E_FIRST gives it a dependency for SHOW EXCEPTION's
+-- "Used by:" list, without adding a procedure (SHOW PROCEDURES does not
+-- yet render a procedure's own dependencies) and on a table this gate does
+-- not SHOW TABLE, so no other check sees the trigger
+SET TERM ^;
+CREATE TRIGGER Z_BI FOR Z BEFORE INSERT AS
+BEGIN IF (NEW.ID < 0) THEN EXCEPTION E_FIRST; END^
+SET TERM ;^
 COMMIT;
 SET GENERATOR GEN_C TO 4242;
 ALTER SEQUENCE SEQ_A RESTART WITH 7;
@@ -145,5 +157,13 @@ compare "SHOW SEQUENCES"       "SHOW SEQUENCES"
 compare "SHOW GENERATOR SEQ_A" "SHOW GENERATOR SEQ_A"
 compare "SHOW SEQUENCE SEQ_B"  "SHOW SEQUENCE SEQ_B"
 compare "SHOW GENERATOR GEN_C" "SHOW GENERATOR GEN_C"
+
+# exceptions: SHOW EXCEPTIONS lists <schema>.<name>; Msg: <message>. The
+# singular SHOW EXCEPTION <name> adds a "Used by:" dependency list read
+# from RDB$DEPENDENCIES (a procedure that raises it, here) - the second
+# request the plural form does not run.
+compare "SHOW EXCEPTIONS"        "SHOW EXCEPTIONS"
+compare "SHOW EXCEPTION used"    "SHOW EXCEPTION E_FIRST"
+compare "SHOW EXCEPTION unused"  "SHOW EXCEPTION E_UNUSED"
 
 exit $fail

@@ -1377,6 +1377,21 @@ interleaved with its own op_receives. The fourteen checks run over a
 schema with a foreign key and a user index, each `SHOW` compared
 verbatim between fire-crab and isql on the same file.
 
+`SHOW EXCEPTIONS` and the singular `SHOW EXCEPTION <name>` — the latter
+with a "Used by:" dependency list read from `RDB$DEPENDENCIES` — turn out
+to need no new code: the request interp above already parses and runs
+them, exception-message stream and dependency sub-request alike. That is
+worth a gate, not a differential, so `serve-real-show.sh` grows to
+twenty-two checks with `SHOW EXCEPTIONS`, a `SHOW EXCEPTION` on an
+exception a trigger raises (its dependency rendered `PUBLIC.<trigger>
+(Trigger)`, matching the engine) and one on an unused exception — locking
+in behaviour the generic interp gave for free. The dependency probe did
+surface one thing it does *not* yet handle: `SHOW PROCEDURES` runs a
+second request over `RDB$DEPENDENCIES` to print each procedure's own
+dependencies, and that BLR carries a verb the parser does not know — so a
+procedure with dependencies is left to a later slice, and the gate raises
+its exception dependency through a trigger instead.
+
 ### The thirty-ninth differential — `SHOW GENERATORS`, and the generator page
 
 `blr_gen_id` parsed in the previous slice but read back NULL, because
