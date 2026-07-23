@@ -1885,6 +1885,42 @@ an ALTER, and foreign keys' referential enforcement) remain — the FOREIGN
 KEY groundwork is written up as a known gbak-restore blocker to resume
 from.
 
+### The fiftieth differential — GEN_ID with a step, a SELECT that writes
+
+Every SELECT fire-crab answered until now was a read. `GEN_ID(<name>, <n>)`
+with a non-zero step is the exception: it bumps the generator by `n` and
+returns the *new* value, and `NEXT VALUE FOR <seq>` is the same with `n`
+the sequence's own increment. Reading a generator (`GEN_ID(name, 0)`,
+which SHOW GENERATORS uses) was already there; this is its writing
+counterpart, and it completes the generator subsystem — read, set, and now
+increment-in-a-query.
+
+The interesting part is *when* the write happens. A generator-incrementing
+SELECT is prepared, executed, and fetched like any query, but the mutation
+must occur exactly once — at **execute**, the one point the protocol gives
+a statement to act before its rows are read. So a new plan shape,
+`GenIdIncrement`, is what prepare produces (describing a single BIGINT
+output and a cursor, so the client will fetch); at op_execute it reads the
+generator page, adds the step, writes the native little-endian `SINT64`
+back, flushes, and *becomes* a `Scalar` of the new value — which the fetch
+then emits. Prepare-time describe and execute-time write and fetch-time
+read are three separate protocol steps, and getting the value across them
+meant the plan announcing its output at prepare (a single unnamed BIGINT,
+with the cursor flag set) even though the value it will carry does not
+exist yet.
+
+`qa/serve-real-genstep.sh` proves it against the engine as oracle, every
+increment run through both fire-crab and isql: `GEN_ID(G, 1)` twice, then
+`GEN_ID(G, 10)`, `GEN_ID(G, -3)`, a `GEN_ID(G, 0)` read that must *not*
+move it, and two `NEXT VALUE FOR SEQ5` (a `START WITH 100 INCREMENT BY 5`
+sequence, so `100` then `105`) — eleven checks, the returned values
+matching the engine value-for-value, the engine afterwards reading
+identical stored values from the fire-crab-written file and its own
+reference, and `gfix -v -full` clean. What is deliberately left for later
+is `NEXT VALUE FOR`/`GEN_ID(name, n)` *inside a row-returning query* (one
+increment per row, mid-fetch) rather than the single-row `RDB$DATABASE`
+form here.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
