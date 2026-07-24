@@ -3070,6 +3070,27 @@ matched — leaving the other. `gbak` and `gfix` close it. `SET DEFAULT` and
 partial-key actions stay out of scope (they need the column's default
 expression, itself BLR).
 
+### The seventy-eighth differential — REVOKE GRANT OPTION FOR
+
+A grant made `WITH GRANT OPTION` lets the grantee pass the privilege on. `REVOKE
+GRANT OPTION FOR <privilege>` takes that ability back without taking the
+privilege itself — the grantee keeps the right, but can no longer delegate it.
+On disk the difference from a plain `REVOKE` is exact: a plain revoke deletes the
+`RDB$USER_PRIVILEGES` row; the grant-option revoke keeps the row and sets its
+`RDB$GRANT_OPTION` to 0. And because the security-class ACL records *who* may do
+*what* but not who may re-grant it, the ACL is untouched — a point worth
+checking, because a recompute that rewrote an identical ACL would be a wasted
+write the engine does not make.
+
+`qa/serve-real-grantoption.sh` (10 checks) grants two privileges `WITH GRANT
+OPTION` and then revokes the grant option for one of them, through fire-crab and
+the engine on two copies of a database. It compares the `RDB$USER_PRIVILEGES`
+rows — the revoked-option privilege still present with option 0, its sibling
+keeping option 1 — compares the ACL blob byte for byte (unchanged), and finishes
+with a `gbak` round trip and `gfix`. Teeth: deleting the row instead of clearing
+its option loses the privilege the grantee should still hold, and the row
+comparison catches it.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -3585,6 +3606,17 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-fkactions.sh 3050
+
+# REVOKE GRANT OPTION FOR: take back the ability to re-grant a privilege
+# without taking the privilege - a plain REVOKE deletes the
+# RDB$USER_PRIVILEGES row, this one keeps it and sets RDB$GRANT_OPTION to 0.
+# The ACL does not encode the grant option, so it is left as it stands
+# (compared byte for byte to prove it). gbak and gfix. Builds its own
+# scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-grantoption.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
