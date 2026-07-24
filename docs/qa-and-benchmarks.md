@@ -2726,6 +2726,41 @@ round trip and `gfix`. Teeth: an ACL that skips the `PUBLIC` union, or emits the
 grantees in grant order rather than alphabetically, leaves every privilege row
 matching while the byte-for-byte ACL check and the decode check both `DIFF`.
 
+### The sixty-eighth differential — CREATE and DROP EXCEPTION
+
+A named exception is, on disk, the same object a sequence is. `CREATE
+EXCEPTION <name> <message>` writes a `RDB$EXCEPTIONS` row, a `SQL$<n>` security
+class carrying the owner's ACL, and one `RDB$USER_PRIVILEGES` row — the owner's
+`USAGE` grant — exactly the three writes `CREATE SEQUENCE` makes, with two
+differences that matter and one that does not. The owner's ACL is byte-for-byte
+a sequence owner's (`alter, control, drop, usage`); the message, a
+`VARCHAR(1023)`, is the only payload a sequence does not have.
+
+The two differences are both about *counters*. An exception's number comes not
+from the master generator a sequence's id is drawn from but from a system
+generator of its own, the one literally named `RDB$EXCEPTIONS` — looked up by
+name, bumped by one, never rewound (a probe: drop the exception numbered 2 and
+the next `CREATE` still takes 3, then 4). Its security-class name comes, as
+every `SQL$<n>` does, from the `RDB$SECURITY_CLASS` generator, and the engine
+does not check that either name is free before it uses it — so a writer that
+invents a number or a class name without advancing the counter hands the engine
+a duplicate on its next `CREATE`. The owner's privilege is a `USAGE` grant like
+a sequence's, but under object type 7 (`obj_exception`) rather than 14. `DROP
+EXCEPTION` is the tidier inverse: the row, its security class *and* the
+privilege all go, with no orphan left behind.
+
+`qa/serve-real-exception.sh` (21 checks) creates three exceptions (one message
+carrying a `''` escape) and drops the middle one through fire-crab and the
+engine on two copies of a database, compares the `RDB$EXCEPTIONS` rows and the
+owner privileges, compares the ACL blob byte for byte, confirms the dropped
+exception's number was not reused, has the engine *continue* from fire-crab's
+file — one more `CREATE EXCEPTION`, which lands number 4 and the next `SQL$<n>`
+class only if fire-crab advanced both counters — refuses a duplicate name and a
+missing drop on both, and finishes with a `gbak` round trip (the `''` escape
+message survives) and `gfix`. Teeth: a writer that reuses a dropped number, or
+invents a class name off-counter, makes the continuation `DIFF` on the engine's
+very next statement.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -3129,6 +3164,18 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-grant.sh 3050
+
+# CREATE / DROP EXCEPTION: the same three writes CREATE SEQUENCE makes - a
+# RDB$EXCEPTIONS row, a SQL$<n> security class with the sequence-owner ACL,
+# and the owner's USAGE grant (object type 7) - but the number comes from
+# the system generator named RDB$EXCEPTIONS (its own counter, never rewound
+# on DROP) and carries a VARCHAR(1023) message. The engine continues from
+# fire-crab's file with one more CREATE. gbak and gfix. Builds its own
+# scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-exception.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
