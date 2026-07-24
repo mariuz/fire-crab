@@ -2871,6 +2871,39 @@ column grant that lands identically, and finishes with a `gbak` round trip and
 relation-before-field placement, the `PUBLIC` union — leaves the privilege rows
 matching while the byte-for-byte ACL checks `DIFF`.
 
+### The seventy-second differential — GRANT a role, and the admin option
+
+The word `GRANT` covers two different statements. `GRANT SELECT ON T TO BOB`
+grants a *privilege* on an object; `GRANT MANAGER TO BOB` grants *membership* of
+a role, and it has no `ON`. A membership is a `RDB$USER_PRIVILEGES` row like a
+privilege, but a distinctive one: its privilege letter is `M`, its object type
+is 13 (`obj_sql_role`), the role sits in `RDB$RELATION_NAME`, and it carries no
+schema. `WITH ADMIN OPTION` — a member who may grant the role onward — sets
+`RDB$GRANT_OPTION` to **2**, not the 1 a table grant's `WITH GRANT OPTION` uses.
+And, unlike a table grant, which the engine will make out to a user that does
+not exist, a role grant checks that the role does: `GRANT NOSUCH TO BOB` is
+refused.
+
+Granting a role also recompiles the role's own ACL, and here the ACL compiler
+ported for the previous differential earns its keep on a different object type.
+A role's owner holds `alter, control, drop`; a member holds nothing in the ACL
+*unless* they have the admin option, in which case the engine gives them the
+`drop` privilege alone (the membership maps, in `grant.epp`, to the `"O"` letter
+that means drop). So the role ACL is the owner then the admin-option members,
+alphabetically, each with a lone `drop` — a plain member never appears. A
+`REVOKE` removes the membership row and recompiles; the ACL follows.
+
+`qa/serve-real-rolegrant.sh` (17 checks) grants a role to a plain member, to two
+members `WITH ADMIN OPTION`, and a second role to the first member, then revokes
+one membership, through fire-crab and the engine on two copies of a database. It
+compares the `RDB$USER_PRIVILEGES` membership rows (the `M`, the object type 13,
+the 2 for admin option), compares the role's ACL blob *byte for byte* — only the
+two admin members present, alphabetically, each with `drop` — refuses a grant of
+a missing role on both, has the engine *continue* with one more admin grant that
+lands identically, and finishes with a `gbak` round trip and `gfix`. Teeth:
+putting a plain member in the ACL, or an admin member with the wrong privilege,
+`DIFF`s the byte-for-byte check while the membership rows still match.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -3319,6 +3352,17 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-colgrant.sh 3050
+
+# GRANT / REVOKE a ROLE: role membership, the no-ON grant. A membership is
+# a RDB$USER_PRIVILEGES row with privilege 'M', object type 13, the role in
+# RDB$RELATION_NAME, and grant_option = 2 for WITH ADMIN OPTION (not 1).
+# The role's ACL is recompiled to owner + the admin-option members (each
+# with drop), alphabetically. The role must exist. gbak and gfix. Builds
+# its own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-rolegrant.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
