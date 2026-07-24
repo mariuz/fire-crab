@@ -2678,6 +2678,54 @@ unknown-sequence refusals on both, and finishes with a `gbak` round trip (the
 `''` escape survives) and `gfix`. Teeth: the same charset trap as the
 sixty-fifth, on the two new relations.
 
+### The sixty-seventh differential — GRANT, REVOKE, and the ACL the engine recomputes
+
+`GRANT <privileges> ON <table> TO <grantees>` and its `REVOKE ... FROM`
+inverse are the first statements fire-crab writes that change who may touch a
+table. The sixty-third and sixty-fourth differentials had already written the
+security catalog a `CREATE TABLE` lays down — the `RDB$USER_PRIVILEGES` rows and
+the owner's ACL — so a grant reuses that machinery whole; what it adds is that
+the set of privileges is now open-ended and the ACL has to be *recomputed*, not
+written once.
+
+A grant is two writes, in the engine's order. The first is fine-grained: one
+`RDB$USER_PRIVILEGES` row per grantee per privilege letter — the same row shape
+the owner's five carry (user type 8, object type 0, a NULL field name), differing
+only in the grantee name and, under `WITH GRANT OPTION`, the grant-option flag.
+A grantee is any name at all — `PUBLIC` is stored as an ordinary `RDB$USER`
+row, and the engine never checks that the name is a real user, so neither does
+fire-crab. `REVOKE` deletes the matching rows; `GRANT ALL` expands to the five
+letters; a re-grant of a held privilege is a no-op.
+
+The second write is the whole subtlety. The relation's own security-class ACL
+— the coarse cache the security subsystem actually reads — is recomputed from
+the privilege rows and rewritten in place (a new blob; the old one is orphaned,
+as the engine leaves it). The recompute has a shape the fine-grained rows do
+not: the owner's fixed entry first, then every named grantee *alphabetically*,
+then the all-users (`PUBLIC`) entry last, and each entry's privilege bytes in a
+fixed canonical order rather than the order granted. And it folds in a rule that
+looks wrong until you see it: **a named grantee's entry is its own privileges
+unioned with whatever `PUBLIC` holds**. A user granted only `DELETE` appears in
+the ACL with delete *and* select the moment `PUBLIC` is granted select, because
+the all-users grant reaches that user too. The per-grantee truth stays in
+`RDB$USER_PRIVILEGES`; the ACL is the union-folded cache, and a writer that
+copies the fine-grained privileges into it verbatim produces a blob that reads
+back plausibly and is wrong byte for byte.
+
+`qa/serve-real-grant.sh` (22 checks) applies one sequence through fire-crab and
+the engine on two copies of a database — a plain grant, a two-privilege grant
+`WITH GRANT OPTION`, a `PUBLIC` grant (the union trigger), a second named user,
+and a `REVOKE` that leaves a user with a privilege still standing — then
+compares the `RDB$USER_PRIVILEGES` rows, compares the recomputed ACL blob byte
+for byte, checks the engine's own decode of it carries the `PUBLIC` union
+(`CAROL: delete, select` though only delete was granted her), compares `SHOW
+GRANTS` verbatim, refuses a grant on a missing table on both, has the engine
+*continue* from fire-crab's file — one more `GRANT`, which the engine can only
+land identically if fire-crab's rows were right — and finishes with a `gbak`
+round trip and `gfix`. Teeth: an ACL that skips the `PUBLIC` union, or emits the
+grantees in grant order rather than alphabetically, leaves every privilege row
+matching while the byte-for-byte ACL check and the decode check both `DIFF`.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -3070,6 +3118,17 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-comment2.sh 3050
+
+# GRANT / REVOKE: the RDB$USER_PRIVILEGES rows (one per grantee per
+# privilege) plus a recompute of the relation's security-class ACL. The
+# ACL folds in a rule the fine-grained rows do not - a grantee's entry is
+# its privileges UNION whatever PUBLIC holds - and is compared byte for
+# byte. The engine continues from fire-crab's file with one more GRANT.
+# gbak and gfix. Builds its own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-grant.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
