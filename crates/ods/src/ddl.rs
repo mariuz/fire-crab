@@ -662,6 +662,113 @@ pub fn alter_table_add_column(
     Ok(())
 }
 
+/// A field's `RDB$FIELD_LENGTH`: the byte length, which for a `VARCHAR` is
+/// the character count, not the `+2` count-word storage length a
+/// [ColumnDef]'s `length` carries. A `CHAR`'s length is already the count;
+/// a non-text type has no `char_len` and uses `length` directly.
+fn catalog_field_length(col: &ColumnDef) -> i64 {
+    col.char_len.map(|c| c as i64).unwrap_or(col.length as i64)
+}
+
+/// Whether an `RDB$FIELDS` domain of this name exists.
+fn domain_exists(file: &[u8], page_size: usize, name: &str) -> bool {
+    let (Some(rel), Some(formats)) = (
+        crate::resolve_relation(file, page_size, "RDB$FIELDS"),
+        system_relation_formats(file, page_size, "RDB$FIELDS"),
+    ) else {
+        return false;
+    };
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else {
+        return false;
+    };
+    let name_f = match relation_columns(file, page_size, "RDB$FIELDS")
+        .iter()
+        .find(|c| c.name == "RDB$FIELD_NAME")
+    {
+        Some(c) => c.field_id as usize,
+        None => return false,
+    };
+    let mut found = false;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if text_eq(v.get(name_f), name) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// The first table.column that uses a domain as its `RDB$FIELD_SOURCE`
+/// (None if the domain is unused) - a `DROP DOMAIN` is refused while it
+/// is in use.
+fn domain_user(file: &[u8], page_size: usize, name: &str) -> Option<String> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$RELATION_FIELDS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$RELATION_FIELDS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (rn_f, src_f) = (fid("RDB$RELATION_NAME")?, fid("RDB$FIELD_SOURCE")?);
+    let mut used = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if used.is_none() && text_eq(v.get(src_f), name) {
+            if let Some(Value::Text(t)) = v.get(rn_f) {
+                used = Some(t.trim_end().to_string());
+            }
+        }
+    });
+    used
+}
+
+/// `CREATE DOMAIN <name> [AS] <type> [NOT NULL]` - a standalone field
+/// definition, one `RDB$FIELDS` row named by the user (no relation link,
+/// no security class). The same row a table column's auto-domain gets,
+/// with the user's name; `NOT NULL` sets `RDB$NULL_FLAG` on the domain
+/// itself (a table column keeps its NOT NULL on `RDB$RELATION_FIELDS`).
+pub fn create_domain(file: &mut Vec<u8>, page_size: usize, col: &ColumnDef) -> Result<(), String> {
+    let name = col.name.trim().trim_matches('"').to_ascii_uppercase();
+    if name.is_empty() {
+        return Err("a domain needs a name".into());
+    }
+    if domain_exists(file, page_size, &name) {
+        return Err(format!("Domain {} already exists", name));
+    }
+    let mut vals: Vec<(&str, SysVal<'_>)> = vec![
+        ("RDB$FIELD_NAME", SysVal::S(&name)),
+        ("RDB$FIELD_TYPE", SysVal::I(col.field_type as i64)),
+        ("RDB$FIELD_LENGTH", SysVal::I(catalog_field_length(col))),
+        ("RDB$FIELD_SCALE", SysVal::I(col.scale as i64)),
+        ("RDB$FIELD_SUB_TYPE", SysVal::I(col.sub_type as i64)),
+        ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+        ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+    ];
+    if let Some(cl) = col.char_len {
+        vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(0))); // NONE
+        vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(cl as i64)));
+        vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
+    }
+    if col.not_null {
+        vals.push(("RDB$NULL_FLAG", SysVal::I(1)));
+    }
+    sys_insert(file, page_size, "RDB$FIELDS", 2, &vals)?;
+    advance_oldest_transactions(file, page_size)
+}
+
+/// `DROP DOMAIN <name>` - delete the `RDB$FIELDS` row. Refused while a
+/// table column still uses the domain as its `RDB$FIELD_SOURCE`, or when
+/// the domain does not exist.
+pub fn drop_domain(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    if !domain_exists(file, page_size, &want) {
+        return Err(format!("Domain {} not found", want));
+    }
+    if let Some(user) = domain_user(file, page_size, &want) {
+        return Err(format!("Domain {} is used in table {}", want, user));
+    }
+    let name_f = sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME")?;
+    let nm = want.clone();
+    delete_catalog_rows(file, page_size, "RDB$FIELDS", move |v| text_eq(v.get(name_f), &nm))?;
+    advance_oldest_transactions(file, page_size)
+}
+
 /// `ALTER TABLE <table> DROP <column>`: remove a column. Like ADD, this is
 /// a new *format version* - existing records keep their old format (and
 /// still carry the dropped field's bytes, now unreferenced); the new
