@@ -699,6 +699,18 @@ enum Plan {
     /// removed the engine's deferred way. An index backing a
     /// constraint is refused (ALTER TABLE DROP CONSTRAINT does that)
     DropIndex { name: String },
+    /// `CREATE SEQUENCE|GENERATOR <name> [START WITH n] [INCREMENT [BY]
+    /// n]`: the RDB$GENERATORS row with an id drawn from the master
+    /// generator, its security class and the owner's USAGE grant, and
+    /// the sequence's own slot primed to `start - increment`
+    CreateSequence {
+        name: String,
+        start: Option<i64>,
+        increment: Option<i64>,
+    },
+    /// `DROP SEQUENCE|GENERATOR <name>`: the catalog rows go, the
+    /// stored value stays behind
+    DropSequence { name: String },
     /// `ALTER TABLE <table> ADD <column>`: a new format version, the new
     /// column's catalog rows, and a version rewrite of the RDB$RELATIONS
     /// row bumping its format and field count
@@ -1673,6 +1685,57 @@ fn plan_drop_index(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         return None;
     }
     Some((Plan::DropIndex { name: name.to_ascii_uppercase() }, Vec::new()))
+}
+
+/// Parse `CREATE SEQUENCE|GENERATOR <name> [START WITH <n>]
+/// [INCREMENT [BY] <n>]`. The two options may appear in either order,
+/// as the grammar allows (parse.y's `sequence_options`); both values
+/// may be signed.
+fn plan_create_sequence(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    if toks.len() < 3 || !toks[0].eq_ignore_ascii_case("CREATE") {
+        return None;
+    }
+    if !(toks[1].eq_ignore_ascii_case("SEQUENCE") || toks[1].eq_ignore_ascii_case("GENERATOR")) {
+        return None;
+    }
+    let name = unquote_ident(toks[2])?;
+    let (mut start, mut increment) = (None, None);
+    let mut i = 3;
+    while i < toks.len() {
+        if toks[i].eq_ignore_ascii_case("START") && i + 2 < toks.len()
+            && toks[i + 1].eq_ignore_ascii_case("WITH")
+        {
+            start = Some(toks[i + 2].parse::<i64>().ok()?);
+            i += 3;
+        } else if toks[i].eq_ignore_ascii_case("INCREMENT") {
+            // INCREMENT [BY] <n>
+            let at = if i + 1 < toks.len() && toks[i + 1].eq_ignore_ascii_case("BY") {
+                i + 2
+            } else {
+                i + 1
+            };
+            increment = Some(toks.get(at)?.parse::<i64>().ok()?);
+            i = at + 1;
+        } else {
+            return None; // an option this writer does not implement
+        }
+    }
+    Some((Plan::CreateSequence { name, start, increment }, Vec::new()))
+}
+
+/// Parse `DROP SEQUENCE|GENERATOR <name>`.
+fn plan_drop_sequence(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    if toks.len() != 3 || !toks[0].eq_ignore_ascii_case("DROP") {
+        return None;
+    }
+    if !(toks[1].eq_ignore_ascii_case("SEQUENCE") || toks[1].eq_ignore_ascii_case("GENERATOR")) {
+        return None;
+    }
+    Some((Plan::DropSequence { name: unquote_ident(toks[2])? }, Vec::new()))
 }
 
 /// Parse `ALTER TABLE <table> ADD <column def>` - append one nullable
@@ -2669,6 +2732,16 @@ fn execute_dml(
             fire_crab_ods::ddl::drop_index(&mut work, db.page_size, name)?;
             (0, 0, 0)
         }
+        Plan::CreateSequence { name, start, increment } => {
+            fire_crab_ods::ddl::create_sequence(
+                &mut work, db.page_size, name, *start, *increment,
+            )?;
+            (0, 0, 0)
+        }
+        Plan::DropSequence { name } => {
+            fire_crab_ods::ddl::drop_sequence(&mut work, db.page_size, name)?;
+            (0, 0, 0)
+        }
         Plan::AlterTableAdd { table, col } => {
             fire_crab_ods::ddl::alter_table_add_column(&mut work, db.page_size, table, col)?;
             (0, 0, 0)
@@ -2727,12 +2800,8 @@ fn execute_dml(
             // so two NEXT VALUE FOR of one sequence in a row bump twice.
             for (fid, name, step) in gen_fields {
                 let (id, incr) = generator_info(db, name).ok_or("no such generator")?;
-                let current = generator_slot_offset(&work, db.page_size, id)
-                    .and_then(|at| work.get(at..at + 8))
-                    .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
-                    .unwrap_or(0);
-                let new_val = current.wrapping_add(step.unwrap_or(incr));
-                write_generator_value(&mut work, db.page_size, id, new_val)?;
+                let new_val =
+                    fire_crab_ods::gen::bump(&mut work, db.page_size, id, step.unwrap_or(incr))?;
                 let d = descs.get(*fid).ok_or("field beyond format")?;
                 match encode_wire_value(d, &WireParam::Int(new_val, 0))
                     .ok_or("generator value does not fit its column")?
@@ -4163,6 +4232,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         Plan::Scalar(_) | Plan::GenIdIncrement { .. } => describe_one_bigint(params),
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
+        | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -4194,6 +4264,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         Plan::Delete { .. } => 4,
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
+        | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -4512,6 +4583,7 @@ fn emit_rows_inner(
         Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
         | Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
+        | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -6932,6 +7004,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             .or_else(|| plan_create_index(&text))
                             .or_else(|| plan_drop_table(&text))
                             .or_else(|| plan_drop_index(&text))
+                            .or_else(|| plan_create_sequence(&text))
+                            .or_else(|| plan_drop_sequence(&text))
                             .or_else(|| plan_alter_table_add(&text))
                             .or_else(|| plan_alter_table_drop(&text))
                             .or_else(|| plan_alter_table_alter_type(&text))
@@ -7070,6 +7144,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         .or_else(|| plan_create_index(&stmt_sql))
                         .or_else(|| plan_drop_table(&stmt_sql))
                         .or_else(|| plan_drop_index(&stmt_sql))
+                        .or_else(|| plan_create_sequence(&stmt_sql))
+                        .or_else(|| plan_drop_sequence(&stmt_sql))
                         .or_else(|| plan_alter_table_add(&stmt_sql))
                         .or_else(|| plan_alter_table_drop(&stmt_sql))
                         .or_else(|| plan_alter_table_alter_type(&stmt_sql))
@@ -7174,6 +7250,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::CreateIndex { .. }
                         | Plan::DropTable { .. }
                         | Plan::DropIndex { .. }
+                        | Plan::CreateSequence { .. }
+                        | Plan::DropSequence { .. }
                         | Plan::AlterTableAdd { .. }
                         | Plan::AlterTableAddFk { .. }
                         | Plan::AlterTableAddKey { .. }
@@ -8328,37 +8406,6 @@ fn generator_id(db: &Database, name: &str) -> Option<i64> {
     generator_info(db, name).map(|(id, _)| id)
 }
 
-/// Locate a generator's slot on its generator page and return the byte
-/// offset of its `SINT64` value: slot `id % gensPerPage` (8 bytes each,
-/// after the 24-byte page header) on the `pag_ids` page whose
-/// `gpg_sequence` is `id / gensPerPage`. None if that page has not been
-/// allocated (a generator whose value was never written).
-fn generator_slot_offset(bytes: &[u8], page_size: usize, id: i64) -> Option<usize> {
-    if id < 0 {
-        return None;
-    }
-    let id = id as usize;
-    let gens_per_page = (page_size - 24) / 8;
-    if gens_per_page == 0 {
-        return None;
-    }
-    let sequence = (id / gens_per_page) as u32;
-    let offset = id % gens_per_page;
-    let npages = bytes.len() / page_size;
-    for pno in 0..npages {
-        let pstart = pno * page_size;
-        let page = &bytes[pstart..pstart + page_size];
-        if page[0] != fire_crab_ods::PageType::Generators as u8 {
-            continue;
-        }
-        let seq = u32::from_le_bytes([page[16], page[17], page[18], page[19]]);
-        if seq == sequence {
-            return Some(pstart + 24 + offset * 8);
-        }
-    }
-    None
-}
-
 /// Write a generator's value into its slot on the generator page (a
 /// native little-endian `SINT64`, the way the engine dereferences it).
 /// Errs if the generator page has not been allocated - fire-crab writes
@@ -8369,10 +8416,7 @@ fn write_generator_value(
     id: i64,
     value: i64,
 ) -> Result<(), String> {
-    let at = generator_slot_offset(bytes, page_size, id)
-        .ok_or("generator page not allocated")?;
-    bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
-    Ok(())
+    fire_crab_ods::gen::write(bytes, page_size, id, value)
 }
 
 /// Increment a generator by `step` (or, for `NEXT VALUE FOR`, by its own
@@ -8407,15 +8451,9 @@ fn gen_id_increment(
 /// (the engine's zero-initialised slot); an unknown name reads NULL.
 fn read_generator_value(db: &Database, name: &str) -> Option<i64> {
     let id = generator_id(db, name)?;
-    match generator_slot_offset(&db.bytes, db.page_size, id) {
-        Some(at) => {
-            let raw = db.bytes.get(at..at + 8)?;
-            Some(i64::from_le_bytes(raw.try_into().ok()?))
-        }
-        // the generator exists but its page has not been allocated yet -
-        // the engine would return 0 for such a never-used generator
-        None => Some(0),
-    }
+    // a generator whose page has not been allocated yet reads 0 - the
+    // engine's zero-initialised slot
+    Some(fire_crab_ods::gen::read(&db.bytes, db.page_size, id))
 }
 
 /// Encode one output message field by field, per xdr_datum
@@ -10088,6 +10126,55 @@ mod tests {
             plan_alter_table_drop("ALTER TABLE U DROP W"),
             Some((Plan::AlterTableDrop { .. }, _))
         ));
+    }
+
+    #[test]
+    fn parses_create_sequence_with_its_options() {
+        // a bare CREATE SEQUENCE takes the engine's defaults (start 1,
+        // increment 1) - carried as None so the writer applies them
+        match plan_create_sequence("CREATE SEQUENCE S1") {
+            Some((Plan::CreateSequence { name, start, increment }, _)) => {
+                assert_eq!(name, "S1");
+                assert!(start.is_none() && increment.is_none());
+            }
+            other => panic!("expected CreateSequence, got {:?}", other.is_some()),
+        }
+        // both options, either order, INCREMENT's BY optional, signed values
+        match plan_create_sequence("create sequence S2 start with 100 increment by 5") {
+            Some((Plan::CreateSequence { start, increment, .. }, _)) => {
+                assert_eq!((start, increment), (Some(100), Some(5)));
+            }
+            other => panic!("expected CreateSequence, got {:?}", other.is_some()),
+        }
+        match plan_create_sequence("CREATE SEQUENCE S3 INCREMENT -2 START WITH -5") {
+            Some((Plan::CreateSequence { start, increment, .. }, _)) => {
+                assert_eq!((start, increment), (Some(-5), Some(-2)));
+            }
+            other => panic!("expected CreateSequence, got {:?}", other.is_some()),
+        }
+        // the legacy spelling is the same statement
+        assert!(matches!(
+            plan_create_sequence("CREATE GENERATOR G1"),
+            Some((Plan::CreateSequence { .. }, _))
+        ));
+        // not a sequence, and an option this writer does not implement
+        assert!(plan_create_sequence("CREATE TABLE T (A INT)").is_none());
+        assert!(plan_create_sequence("CREATE SEQUENCE S4 RESTART WITH 3").is_none());
+    }
+
+    #[test]
+    fn parses_drop_sequence() {
+        match plan_drop_sequence("DROP SEQUENCE S1;") {
+            Some((Plan::DropSequence { name }, _)) => assert_eq!(name, "S1"),
+            other => panic!("expected DropSequence, got {:?}", other.is_some()),
+        }
+        assert!(matches!(
+            plan_drop_sequence("drop generator G1"),
+            Some((Plan::DropSequence { .. }, _))
+        ));
+        // a DROP INDEX/TABLE is not a DROP SEQUENCE, and neither is a bare one
+        assert!(plan_drop_sequence("DROP INDEX IX").is_none());
+        assert!(plan_drop_sequence("DROP SEQUENCE").is_none());
     }
 
     #[test]

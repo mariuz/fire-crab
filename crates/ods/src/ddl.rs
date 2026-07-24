@@ -44,6 +44,7 @@ use crate::catalog::{list_relations, relation_columns};
 use crate::data::{DataPage, DPG_RPT_OFFSET, RHD_DATA_OFFSET};
 use crate::dml;
 use crate::format::{decode_record, flag_bytes, max_recs_per_dp, Value};
+use crate::gen;
 use crate::pointer::relation_data_pages;
 use crate::sysfmt::{compute_format, system_relation_formats};
 use crate::{u16_at, u32_at, Descriptor};
@@ -2682,6 +2683,285 @@ pub fn drop_table(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<()
     Ok(())
 }
 
+
+/// A generator's `(RDB$GENERATOR_ID, RDB$SYSTEM_FLAG, RDB$SECURITY_CLASS)`
+/// from `RDB$GENERATORS`, by name. None when there is no such generator.
+fn find_generator(
+    file: &[u8],
+    page_size: usize,
+    name: &str,
+) -> Option<(i64, i64, Option<String>)> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$GENERATORS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$GENERATORS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$GENERATORS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (name_f, id_f, sys_f, cls_f) = (
+        fid("RDB$GENERATOR_NAME")?,
+        fid("RDB$GENERATOR_ID")?,
+        fid("RDB$SYSTEM_FLAG")?,
+        fid("RDB$SECURITY_CLASS")?,
+    );
+    let mut found = None;
+    walk_rows(file, page_size, rel, descs, |values| {
+        if found.is_some() || !text_eq(values.get(name_f), name) {
+            return;
+        }
+        let id = match values.get(id_f) {
+            Some(Value::Int(i)) => *i,
+            _ => return,
+        };
+        let sys = match values.get(sys_f) {
+            Some(Value::Int(i)) => *i,
+            _ => 0,
+        };
+        let class = match values.get(cls_f) {
+            Some(Value::Text(t)) => Some(t.trim_end().to_string()),
+            _ => None,
+        };
+        found = Some((id, sys, class));
+    });
+    found
+}
+
+/// Whether a generator id is already spoken for - the condition the
+/// engine's store loop discovers as a unique-key violation on
+/// RDB$INDEX_46 and retries (DdlNodes.epp:6624).
+fn generator_id_taken(file: &[u8], page_size: usize, id: i64) -> bool {
+    let Some(rel) = crate::resolve_relation(file, page_size, "RDB$GENERATORS") else {
+        return false;
+    };
+    let Some(formats) = system_relation_formats(file, page_size, "RDB$GENERATORS") else {
+        return false;
+    };
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else {
+        return false;
+    };
+    let Ok(id_f) = sys_fid(file, page_size, "RDB$GENERATORS", "RDB$GENERATOR_ID") else {
+        return false;
+    };
+    let mut taken = false;
+    walk_rows(file, page_size, rel, descs, |values| {
+        if int_eq(values.get(id_f), id) {
+            taken = true;
+        }
+    });
+    taken
+}
+
+/// The owner's access control list for a newly created object, in the
+/// engine's own encoding (acl.h): version 2, an id list naming the
+/// owner as a person, then the privilege list the owner of a sequence
+/// gets - alter, control, drop, usage - in the order `grant_privileges`
+/// emits them (differential probe of an engine-created sequence's
+/// `RDB$ACL`: `02 01 03 06 SYSDBA 00 02 06 01 03 0c 00 00`).
+fn owner_acl(owner: &str) -> Vec<u8> {
+    let mut acl = vec![
+        2u8, // ACL_version
+        1,   // ACL_id_list
+        3,   // id_person
+        owner.len() as u8,
+    ];
+    acl.extend_from_slice(owner.as_bytes());
+    acl.extend_from_slice(&[
+        0,  // id_end
+        2,  // ACL_priv_list
+        6,  // priv_alter
+        1,  // priv_control
+        3,  // priv_drop
+        12, // priv_usage
+        0,  // priv_end
+        0,  // ACL_end
+    ]);
+    acl
+}
+
+/// Store one `RDB$SECURITY_CLASSES` row: the ACL blob (subtype 3) into
+/// that relation's own data pages, then the row pointing at it. The
+/// class name is the caller's `SQL$<n>`.
+fn store_security_class(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    class: &str,
+    owner: &str,
+) -> Result<(), String> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$SECURITY_CLASSES")
+        .ok_or("no RDB$SECURITY_CLASSES relation")?;
+    let acl = dml::insert_blob(file, page_size, rel, &[owner_acl(owner)], 3)?;
+    sys_insert(
+        file,
+        page_size,
+        "RDB$SECURITY_CLASSES",
+        rel,
+        &[
+            ("RDB$SECURITY_CLASS", SysVal::S(class)),
+            ("RDB$ACL", SysVal::B(blob_id_bytes(rel, acl))),
+        ],
+    )
+}
+
+/// `CREATE SEQUENCE|GENERATOR <name> [START WITH <n>] [INCREMENT [BY]
+/// <n>]` - the engine's `CreateAlterSequenceNode::executeCreate`
+/// (DdlNodes.epp:6450) against the file image.
+///
+/// Three writes, in the engine's order. The id comes from the MASTER
+/// generator - slot 0 of the generator vector, the counter every
+/// metadata object id is drawn from (`DYN_UTIL_gen_unique_id(...,
+/// MASTER_GENERATOR)`), taken modulo `MAX_SSHORT + 1` with zero skipped,
+/// and retried while it collides with a live generator. Storing the row
+/// makes `vio.cpp:4657` allocate a security class name from slot 1
+/// (`RDB$SECURITY_CLASS`, the `SQL$<n>` counter), whose row carries the
+/// owner's ACL, and `storePrivileges` records the owner's USAGE grant.
+/// Finally the sequence's own slot is left holding `initial - step`, so
+/// the first `GEN_ID`/`NEXT VALUE FOR` yields `initial` exactly.
+///
+/// Creating a sequence therefore *writes generator values* - two of
+/// them - before it has a value of its own.
+pub fn create_sequence(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    name: &str,
+    start: Option<i64>,
+    increment: Option<i64>,
+) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    if want.is_empty() {
+        return Err("a sequence needs a name".into());
+    }
+    if find_generator(file, page_size, &want).is_some() {
+        return Err(format!("Sequence {} already exists", want));
+    }
+    let step = increment.unwrap_or(1);
+    if step == 0 {
+        return Err(format!(
+            "INCREMENT BY 0 is an illegal option for sequence {}",
+            want
+        ));
+    }
+    let initial = start.unwrap_or(1);
+    let rel = crate::resolve_relation(file, page_size, "RDB$GENERATORS")
+        .ok_or("no RDB$GENERATORS relation")?;
+
+    // the id: the master generator, modulo MAX_SSHORT + 1, never 0,
+    // never one already in use
+    let mut id = 0;
+    for _ in 0..=u16::MAX {
+        let next = gen::bump(file, page_size, gen::MASTER, 1)? % (i16::MAX as i64 + 1);
+        if next != 0 && !generator_id_taken(file, page_size, next) {
+            id = next;
+            break;
+        }
+    }
+    if id == 0 {
+        return Err("no free generator id".into());
+    }
+
+    let class = format!(
+        "SQL${}",
+        gen::bump(file, page_size, gen::SECURITY_CLASS, 1)?
+    );
+    store_security_class(file, page_size, &class, OWNER)?;
+    sys_insert(
+        file,
+        page_size,
+        "RDB$GENERATORS",
+        rel,
+        &[
+            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+            ("RDB$GENERATOR_NAME", SysVal::S(&want)),
+            ("RDB$GENERATOR_ID", SysVal::I(id)),
+            ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+            ("RDB$SECURITY_CLASS", SysVal::S(&class)),
+            ("RDB$OWNER_NAME", SysVal::S(OWNER)),
+            ("RDB$INITIAL_VALUE", SysVal::I(initial)),
+            ("RDB$GENERATOR_INCREMENT", SysVal::I(step)),
+        ],
+    )?;
+    store_usage_privilege(file, page_size, &want)?;
+
+    // the stored value is initial - step, so the FIRST GEN_ID yields
+    // initial (the engine's genIdCache put of `val - step`). A slot that
+    // would hold zero needs no write: an unwritten slot already reads 0.
+    let stored = initial.wrapping_sub(step);
+    if stored != 0 {
+        gen::write(file, page_size, id, stored)?;
+    }
+    advance_oldest_transactions(file, page_size)?;
+    Ok(())
+}
+
+/// The owner every fire-crab-written catalog object belongs to. The
+/// server attaches as SYSDBA; the engine writes
+/// `attachment->getEffectiveUserName()`.
+const OWNER: &str = "SYSDBA";
+
+/// The owner's `USAGE WITH GRANT OPTION` row in `RDB$USER_PRIVILEGES`
+/// for a sequence: privilege 'G' (usaGe), user type 8 (obj_user),
+/// object type 14 (obj_generator).
+fn store_usage_privilege(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<(), String> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$USER_PRIVILEGES")
+        .ok_or("no RDB$USER_PRIVILEGES relation")?;
+    sys_insert(
+        file,
+        page_size,
+        "RDB$USER_PRIVILEGES",
+        rel,
+        &[
+            ("RDB$USER", SysVal::S(OWNER)),
+            ("RDB$GRANTOR", SysVal::S(OWNER)),
+            ("RDB$PRIVILEGE", SysVal::S("G")),
+            ("RDB$GRANT_OPTION", SysVal::I(1)),
+            ("RDB$RELATION_NAME", SysVal::S(name)),
+            ("RDB$USER_TYPE", SysVal::I(8)),
+            ("RDB$OBJECT_TYPE", SysVal::I(14)),
+            ("RDB$RELATION_SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ],
+    )
+}
+
+/// `DROP SEQUENCE|GENERATOR <name>` - `DropSequenceNode::execute`
+/// (DdlNodes.epp:6665). The catalog rows go: the `RDB$GENERATORS` row,
+/// its security class, and the privileges granted on it. A system
+/// generator is refused ("Cannot delete system generator").
+///
+/// What does NOT happen is as instructive: the generator's VALUE stays
+/// in the vector. Nothing zeroes the slot and nothing reclaims the id -
+/// `delete_generator` (dfw.epp:2173) only checks dependencies - so a
+/// dropped sequence leaves its last value behind as garbage, and the
+/// next `CREATE SEQUENCE` takes a fresh id from the master generator
+/// rather than reusing the hole.
+pub fn drop_sequence(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let (_, system, class) = find_generator(file, page_size, &want)
+        .ok_or_else(|| format!("generator {} is not defined", want))?;
+    if system != 0 {
+        return Err(format!("Cannot delete system generator {}", want));
+    }
+    let name_f = sys_fid(file, page_size, "RDB$GENERATORS", "RDB$GENERATOR_NAME")?;
+    {
+        let want = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$GENERATORS", move |v| {
+            text_eq(v.get(name_f), &want)
+        })?;
+    }
+    if let Some(class) = class {
+        let cls_f = sys_fid(file, page_size, "RDB$SECURITY_CLASSES", "RDB$SECURITY_CLASS")?;
+        delete_catalog_rows(file, page_size, "RDB$SECURITY_CLASSES", move |v| {
+            text_eq(v.get(cls_f), &class)
+        })?;
+    }
+    {
+        // by name AND object type: a table may share the name (the
+        // generator namespace is its own)
+        let rel_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$RELATION_NAME")?;
+        let obj_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$OBJECT_TYPE")?;
+        delete_catalog_rows(file, page_size, "RDB$USER_PRIVILEGES", move |v| {
+            text_eq(v.get(rel_f), &want) && int_eq(v.get(obj_f), 14)
+        })?;
+    }
+    advance_oldest_transactions(file, page_size)?;
+    Ok(())
+}
 
 /// Advance the header's oldest-transaction markers past every
 /// transaction this DDL burned, mirroring what a clean engine detach

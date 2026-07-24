@@ -33,6 +33,7 @@ pub mod decfloat;
 pub mod dml;
 pub mod format;
 pub mod gc;
+pub mod gen;
 pub mod header;
 pub mod pages;
 pub mod pip;
