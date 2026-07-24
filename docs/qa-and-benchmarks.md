@@ -2562,6 +2562,43 @@ survives, has the engine continue from fire-crab's file, and finishes with
 makes 6 checks `DIFF` (every later object collides); omitting the security
 catalog entirely makes 7.
 
+### The sixty-fourth differential — SET STATISTICS, a statement made of parts already there
+
+`SET STATISTICS INDEX <name>` recomputes an index's selectivity. It is the
+smallest slice in a while, and deliberately so: the previous index slice
+taught fire-crab to compute the selectivity `1 / distinct` per key prefix and
+write it into the three places the engine keeps it, on every index build.
+This statement is that computation, on demand, and nothing else — the value
+of doing it now is that the machinery had already earned its correctness
+against the engine, so the statement is a parser and a one-line call.
+
+The engine's version has two steps that collapse to one observable. At
+execute it writes `RDB$STATISTICS = -1.0` as a "recalculate me" marker
+(DdlNodes.epp:14510); at commit a deferred work (`set_statistics`,
+dfw.epp:3575) walks the index tree with `IDX_statistics` and `DFW_update_index`
+writes the fresh numbers back. Only the committed end state is observable, and
+it is exactly what a build produces. fire-crab, an offline writer that
+computes from the committed rows rather than by scanning the tree, produces
+that end state directly — so `set_index_statistics` reuses the same
+`index_selectivity` and `write_index_statistics` the build path uses, and the
+`-1.0` marker never needs to exist.
+
+The one thing worth stating is what does *not* restrict it. `ALTER INDEX
+INACTIVE` refuses a constraint's index; `SET STATISTICS` does not — the engine
+recomputes a `PRIMARY KEY`'s selectivity happily, and so does fire-crab. The
+only failure is an index that does not exist.
+
+`qa/serve-real-setstats.sh` (15 checks) builds a table's indexes over two
+rows and then grows it to six, so the stored selectivity is *stale* (1/2), and
+has fire-crab and the engine each run `SET STATISTICS` on the same indexes —
+including the primary key's — on two copies. `RDB$INDICES` and
+`RDB$INDEX_SEGMENTS` are compared and must have *moved* to the same fresh
+values (the gate captures the stale snapshot first and asserts the numbers
+changed, so a no-op cannot pass), the `irtd_selectivity` floats are read off
+both index root pages and compared, the unknown-index refusal is checked on
+both, and `gbak`/`gfix` close it. Teeth: a `set_index_statistics` that
+recomputes nothing leaves the stale snapshot and makes 6 checks `DIFF`.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -2919,6 +2956,19 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-security.sh 3050
+
+# SET STATISTICS INDEX <name>: recompute an index's selectivity (1 /
+# distinct per key prefix over the rows as they now stand) into
+# RDB$INDICES, RDB$INDEX_SEGMENTS and the index root descriptor - the same
+# machinery every build uses, run on demand. Any index qualifies (a
+# PRIMARY KEY's too). The gate grows a table after its indexes are built
+# so the stored selectivity is STALE, then compares the recomputed values
+# and the index-root floats against the engine; gbak and gfix. Builds its
+# own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-setstats.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
