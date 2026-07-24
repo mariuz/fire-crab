@@ -4604,6 +4604,50 @@ pub fn create_exception(
     advance_oldest_transactions(file, page_size)
 }
 
+/// `ALTER EXCEPTION <name> <message>` - `CreateAlterExceptionNode` in its
+/// alter arm: the message is rewritten in place, the number and security
+/// class untouched. The exception must exist ("Exception not found").
+pub fn alter_exception(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    name: &str,
+    message: &str,
+) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    if find_exception(file, page_size, &want).is_none() {
+        return Err(format!("Exception {} not found", want));
+    }
+    let erel = crate::resolve_relation(file, page_size, "RDB$EXCEPTIONS")
+        .ok_or("no RDB$EXCEPTIONS relation")?;
+    let name_fid = sys_fid(file, page_size, "RDB$EXCEPTIONS", "RDB$EXCEPTION_NAME")?;
+    let nm = want.clone();
+    patch_sys_row(
+        file,
+        page_size,
+        "RDB$EXCEPTIONS",
+        erel,
+        move |v| text_eq(v.get(name_fid), &nm),
+        &[("RDB$MESSAGE", SysVal::S(message))],
+    )?;
+    advance_oldest_transactions(file, page_size)
+}
+
+/// `CREATE OR ALTER EXCEPTION <name> <message>`: alter it if it exists
+/// (keeping its number and class), otherwise create it.
+pub fn create_or_alter_exception(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    name: &str,
+    message: &str,
+) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    if find_exception(file, page_size, &want).is_some() {
+        alter_exception(file, page_size, name, message)
+    } else {
+        create_exception(file, page_size, name, message)
+    }
+}
+
 /// `DROP EXCEPTION <name>` - `DropExceptionNode`. The mirror of
 /// DROP SEQUENCE, but cleaner: the row, its security class *and* the
 /// owner's privilege all go (an engine probe: after the drop the

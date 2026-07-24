@@ -715,6 +715,11 @@ enum Plan {
     /// from the RDB$EXCEPTIONS generator), its security class and the
     /// owner's USAGE grant
     CreateException { name: String, message: String },
+    /// `ALTER EXCEPTION <name> <message>`: rewrite the message in place
+    AlterException { name: String, message: String },
+    /// `CREATE OR ALTER EXCEPTION <name> <message>`: alter if it exists,
+    /// else create
+    CreateOrAlterException { name: String, message: String },
     /// `DROP EXCEPTION <name>`: the row, its security class and the
     /// owner's privilege all go
     DropException { name: String },
@@ -1785,28 +1790,43 @@ fn plan_drop_sequence(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     Some((Plan::DropSequence { name: unquote_ident(toks[2])? }, Vec::new()))
 }
 
-/// Parse `CREATE EXCEPTION <name> <message>` - the name is an identifier,
-/// the message a single-quoted string literal. None for anything else
-/// (an `ALTER`/`CREATE OR ALTER`, a missing message) so the dispatcher
-/// falls back rather than accepting a form this writer does not model.
-fn plan_create_exception(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+/// Parse the `<lead> EXCEPTION <name> <message>` shape (name an
+/// identifier, message a single-quoted literal), where `<lead>` is the
+/// exact keyword sequence expected before `EXCEPTION` (e.g. `CREATE`,
+/// `ALTER`, `CREATE OR ALTER`). None if the lead does not match or the
+/// message is missing.
+fn parse_exception_stmt(sql: &str, lead: &str) -> Option<(String, String)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
     let masked = mask_literals(&up);
-    if find_word(&masked, "CREATE", 0) != Some(0) {
+    let exc = find_word(&masked, "EXCEPTION", 0)?;
+    // the words before EXCEPTION must be exactly `lead`
+    if masked[..exc].split_whitespace().ne(lead.split_whitespace()) {
         return None;
     }
-    let exc = find_word(&masked, "EXCEPTION", "CREATE".len())?;
-    if masked["CREATE".len()..exc].trim() != "" {
-        return None; // CREATE OR ALTER, etc.
-    }
     let after = exc + "EXCEPTION".len();
-    // the message is the first string literal; the name is between the
-    // EXCEPTION keyword and it
     let q = s[after..].find('\'')? + after;
     let name = unquote_ident(s[after..q].trim())?;
     let message = parse_string_literal(s[q..].trim())?;
+    Some((name, message))
+}
+
+/// Parse `CREATE EXCEPTION <name> <message>`.
+fn plan_create_exception(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let (name, message) = parse_exception_stmt(sql, "CREATE")?;
     Some((Plan::CreateException { name, message }, Vec::new()))
+}
+
+/// Parse `ALTER EXCEPTION <name> <message>`.
+fn plan_alter_exception(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let (name, message) = parse_exception_stmt(sql, "ALTER")?;
+    Some((Plan::AlterException { name, message }, Vec::new()))
+}
+
+/// Parse `CREATE OR ALTER EXCEPTION <name> <message>`.
+fn plan_create_or_alter_exception(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let (name, message) = parse_exception_stmt(sql, "CREATE OR ALTER")?;
+    Some((Plan::CreateOrAlterException { name, message }, Vec::new()))
 }
 
 /// Parse `DROP EXCEPTION <name>`.
@@ -3183,6 +3203,14 @@ fn execute_dml(
         }
         Plan::CreateException { name, message } => {
             fire_crab_ods::ddl::create_exception(&mut work, db.page_size, name, message)?;
+            (0, 0, 0)
+        }
+        Plan::AlterException { name, message } => {
+            fire_crab_ods::ddl::alter_exception(&mut work, db.page_size, name, message)?;
+            (0, 0, 0)
+        }
+        Plan::CreateOrAlterException { name, message } => {
+            fire_crab_ods::ddl::create_or_alter_exception(&mut work, db.page_size, name, message)?;
             (0, 0, 0)
         }
         Plan::DropException { name } => {
@@ -4737,6 +4765,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::DropException { .. }
+        | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
@@ -4776,6 +4805,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::DropException { .. }
+        | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
@@ -5102,6 +5132,7 @@ fn emit_rows_inner(
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::DropException { .. }
+        | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
@@ -7537,6 +7568,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             .or_else(|| plan_drop_sequence(&text))
                             .or_else(|| plan_create_exception(&text))
                             .or_else(|| plan_drop_exception(&text))
+                            .or_else(|| plan_alter_exception(&text))
+                            .or_else(|| plan_create_or_alter_exception(&text))
                             .or_else(|| plan_create_role(&text))
                             .or_else(|| plan_drop_role(&text))
                             .or_else(|| plan_alter_index(&text))
@@ -7687,6 +7720,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         .or_else(|| plan_drop_sequence(&stmt_sql))
                         .or_else(|| plan_create_exception(&stmt_sql))
                         .or_else(|| plan_drop_exception(&stmt_sql))
+                        .or_else(|| plan_alter_exception(&stmt_sql))
+                        .or_else(|| plan_create_or_alter_exception(&stmt_sql))
                         .or_else(|| plan_create_role(&stmt_sql))
                         .or_else(|| plan_drop_role(&stmt_sql))
                         .or_else(|| plan_alter_index(&stmt_sql))
@@ -7797,6 +7832,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::CreateSequence { .. }
                         | Plan::DropSequence { .. }
                         | Plan::CreateException { .. }
+                        | Plan::AlterException { .. }
+                        | Plan::CreateOrAlterException { .. }
                         | Plan::DropException { .. }
                         | Plan::CreateRole { .. }
                         | Plan::DropRole { .. }
@@ -10915,9 +10952,31 @@ mod tests {
             Some((Plan::DropException { name }, _)) => assert_eq!(name, "E_TEST"),
             other => panic!("expected DropException, got {:?}", other.is_some()),
         }
-        // forms this writer does not model
+        // ALTER and CREATE OR ALTER
+        match plan_alter_exception("ALTER EXCEPTION E_ONE 'new message'") {
+            Some((Plan::AlterException { name, message }, _)) => {
+                assert_eq!(name, "E_ONE");
+                assert_eq!(message, "new message");
+            }
+            other => panic!("expected AlterException, got {:?}", other.is_some()),
+        }
+        match plan_create_or_alter_exception("CREATE OR ALTER EXCEPTION E_ONE 'x'") {
+            Some((Plan::CreateOrAlterException { name, message }, _)) => {
+                assert_eq!(name, "E_ONE");
+                assert_eq!(message, "x");
+            }
+            other => panic!("expected CreateOrAlterException, got {:?}", other.is_some()),
+        }
+        // the three do not cross-match: CREATE is not ALTER, CREATE OR ALTER
+        // is neither plain CREATE nor plain ALTER
         assert!(plan_create_exception("CREATE OR ALTER EXCEPTION E 'x'").is_none());
-        assert!(plan_create_exception("CREATE EXCEPTION E").is_none()); // no message
+        assert!(plan_create_exception("ALTER EXCEPTION E 'x'").is_none());
+        assert!(plan_alter_exception("CREATE OR ALTER EXCEPTION E 'x'").is_none());
+        assert!(plan_alter_exception("CREATE EXCEPTION E 'x'").is_none());
+        assert!(plan_create_or_alter_exception("CREATE EXCEPTION E 'x'").is_none());
+        // no message, and non-exceptions
+        assert!(plan_create_exception("CREATE EXCEPTION E").is_none());
+        assert!(plan_alter_exception("ALTER TABLE T ADD A INT").is_none());
         assert!(plan_create_exception("CREATE TABLE T (A INT)").is_none());
         assert!(plan_drop_exception("DROP TABLE T").is_none());
     }
