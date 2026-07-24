@@ -3091,6 +3091,40 @@ with a `gbak` round trip and `gfix`. Teeth: deleting the row instead of clearing
 its option loses the privilege the grantee should still hold, and the row
 comparison catches it.
 
+### The seventy-ninth differential — a column DEFAULT, and the runtime again
+
+A column `DEFAULT <literal>` is two writes on `RDB$RELATION_FIELDS` (the
+column's own row, not its auto-domain): `RDB$DEFAULT_SOURCE`, the text
+`DEFAULT 0`, and `RDB$DEFAULT_VALUE`, the BLR that computes the value. For a
+literal that BLR is short — `blr_version5, blr_literal, <typed literal>,
+blr_eoc` — and a second small emitter beside the trigger one: an integer literal
+is a `blr_long` with a four-byte value regardless of the column's width (a
+`SMALLINT` default and a `BIGINT` default both carry a `blr_long`), a string is a
+`blr_text2`. The source blob carries charset 4, the same as a description.
+
+And then the lesson the FK cascade taught arrives a second time, in a completely
+different feature. Writing `RDB$DEFAULT_VALUE` byte-identical to the engine's is
+not enough for the default to be *applied*: a row that omits the column comes out
+NULL. The engine does not read a field's default from `RDB$RELATION_FIELDS`; it
+reads it, like a trigger name, from the relation's `RDB$RUNTIME` summary — an
+`RSR_default_value` entry carrying the same BLR. The catalog column is the record
+of the default; the runtime is what the running engine consults. Fold the BLR
+into the column's runtime entry and the default takes effect. It is the same
+shape of bug as the cascade trigger that would not fire, and the same fix, which
+is worth stating plainly: for this engine, a value fire-crab writes into a
+metadata column is inert until it also appears in the relation's runtime.
+
+`qa/serve-real-default.sh` (14 checks) has fire-crab and the engine each create
+a table with an integer default, a negative one, a string default (with a space,
+so its source is not a bare token), a `SMALLINT` default and an un-defaulted
+column, on two copies. It compares every `RDB$DEFAULT_SOURCE`, compares each
+`RDB$DEFAULT_VALUE` BLR byte for byte and one source blob byte for byte (charset
+and framing), then inserts a row that omits the defaulted columns and confirms
+the engine filled each with fire-crab's default value, and finishes with `gbak`
+and `gfix`. Teeth: omit the `RSR_default_value` runtime entry and the catalog
+still carries the default while an inserted row comes out NULL. `DEFAULT NULL`,
+expression defaults and `CURRENT_*` stay out of scope (each is different BLR).
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -3617,6 +3651,18 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-grantoption.sh 3050
+
+# column DEFAULT: RDB$DEFAULT_SOURCE (the text) and RDB$DEFAULT_VALUE (the
+# BLR - blr_long for any integer, blr_text2 for a string) on
+# RDB$RELATION_FIELDS, AND the same BLR as an RSR_default_value entry in the
+# relation's RDB$RUNTIME (the engine reads the default from the runtime, not
+# the catalog column - without it the default is never applied). The engine
+# then fills fire-crab's defaults on INSERT. gbak and gfix. Builds its own
+# scratch databases.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-default.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
