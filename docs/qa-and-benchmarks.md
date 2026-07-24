@@ -2798,6 +2798,32 @@ finishes with a `gbak` round trip and `gfix`. Teeth: writing
 while the `x'00…'` comparison `DIFF`s; inventing a class name off-counter makes
 the continuation `DIFF`.
 
+### The seventieth differential — COMMENT ON, on the objects just made
+
+The sixty-fifth and sixty-sixth differentials taught `COMMENT ON` to describe a
+table, a column, an index and a sequence — every schema object fire-crab could
+create at the time. The two increments since then added two more creatable
+objects, an exception and a role, and a description belongs on those too.
+`COMMENT ON EXCEPTION <name>` and `COMMENT ON ROLE <name>` are the same
+mechanism a fourth and fifth time: a text blob (charset 4) written into the
+object's own catalog relation — `RDB$EXCEPTIONS`, `RDB$ROLES` — with its id in
+that row's `RDB$DESCRIPTION`, and `IS NULL` / `IS ''` clearing it. The code is a
+parser keyword and a catalog-relation name apiece; the point of the increment is
+that a comment mechanism built once keeps absorbing new object kinds for the
+price of naming their relation, and that the objects the previous two
+increments made are, to the catalog, ordinary rows a description attaches to
+like any other.
+
+`qa/serve-real-comment3.sh` (18 checks) comments an exception and a role (the
+role's text carrying a `''` escape) through fire-crab and the engine on two
+copies of a database, reads every `RDB$DESCRIPTION` back as text and compares,
+reads the exception's description blob record off both files and compares it
+byte for byte and confirms its charset is 4, clears a comment each way (`IS
+NULL` and `IS ''`) and checks the descriptions go NULL, refuses an unknown
+exception and an unknown role on both, and finishes with a `gbak` round trip and
+`gfix`. Teeth: the same charset trap as the sixty-fifth, on the two new
+relations.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -3224,6 +3250,16 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-role.sh 3050
+
+# COMMENT ON EXCEPTION / ROLE: the same description mechanism, on the two
+# security objects fire-crab now creates - the blob lands in RDB$EXCEPTIONS
+# / RDB$ROLES, one shared code path names the row. Same charset-4 rule,
+# checked byte for byte on the exception's blob record. gbak and gfix.
+# Builds its own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-comment3.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
