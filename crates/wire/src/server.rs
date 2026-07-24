@@ -1333,12 +1333,41 @@ enum InsVal {
 fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option<(String, bool)>)> {
     use fire_crab_ods::format::dtype;
     let item = item.trim();
-    let (name, ty) = item.split_once(char::is_whitespace)?;
+    let (name, ty_orig) = item.split_once(char::is_whitespace)?;
     let name = name.trim_matches('"');
     if !ident_ok(name) {
         return None;
     }
-    let mut ty = ty.trim().to_ascii_uppercase();
+    // extract a DEFAULT <literal> clause from the type portion, keeping the
+    // literal's original case (a string default is case-sensitive). The
+    // rest of the type (base type + trailing NOT NULL/PRIMARY KEY) parses
+    // as before, with the DEFAULT clause removed.
+    let mut default_parsed: Option<fire_crab_ods::ddl::ColumnDefault> = None;
+    let up_ty = ty_orig.to_ascii_uppercase();
+    let mut ty = if let Some(dp) = find_word(&up_ty, "DEFAULT", 0) {
+        let after = ty_orig[dp + "DEFAULT".len()..].trim_start();
+        let (lit, rest) = if after.starts_with('\'') {
+            let end = close_quote_end(after)?;
+            (&after[..end], after[end..].trim_start())
+        } else {
+            let end = after.find(char::is_whitespace).unwrap_or(after.len());
+            (&after[..end], after[end..].trim_start())
+        };
+        let value_blr = if lit.starts_with('\'') {
+            fire_crab_ods::ddl::str_default_blr(&parse_string_literal(lit)?)
+        } else {
+            fire_crab_ods::ddl::int_default_blr(lit.parse::<i32>().ok()?)
+        };
+        default_parsed = Some(fire_crab_ods::ddl::ColumnDefault {
+            source: format!("DEFAULT {}", lit),
+            value_blr,
+        });
+        format!("{} {}", ty_orig[..dp].trim_end(), rest)
+            .trim()
+            .to_ascii_uppercase()
+    } else {
+        ty_orig.trim().to_ascii_uppercase()
+    };
     // trailing column constraints, stripped off the end in any order
     let mut key: Option<(String, bool)> = None;
     let mut not_null = false;
@@ -1394,6 +1423,7 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
             // PRIMARY KEY) is the case the engine records as a
             // constraint row
             not_null_constraint: not_null,
+            default: None,
         })
     };
     // parenthesised argument(s), if any
@@ -1434,7 +1464,30 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
         }
         _ => None,
     };
-    Some((built?, key))
+    let mut built = built?;
+    built.default = default_parsed;
+    Some((built, key))
+}
+
+/// The byte index just past the closing quote of a single-quoted string
+/// literal starting at `s[0]`, honouring `''` escapes. None if unterminated.
+fn close_quote_end(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    if b.first() != Some(&b'\'') {
+        return None;
+    }
+    let mut i = 1;
+    while i < b.len() {
+        if b[i] == b'\'' {
+            if b.get(i + 1) == Some(&b'\'') {
+                i += 2;
+                continue;
+            }
+            return Some(i + 1);
+        }
+        i += 1;
+    }
+    None
 }
 
 fn numeric_col(
@@ -1461,6 +1514,7 @@ fn numeric_col(
         char_len: None,
         not_null,
         not_null_constraint: not_null,
+        default: None,
     })
 }
 
@@ -10803,6 +10857,25 @@ mod tests {
         assert_eq!(key, Some((String::new(), false)));
         // a plain column has no key
         assert_eq!(parse_column_def("A INTEGER").unwrap().1, None);
+        // column DEFAULTs: integer, negative, string (case + spaces
+        // preserved), and a DEFAULT before a trailing NOT NULL
+        let d = parse_column_def("A INTEGER DEFAULT 0").unwrap().0.default.unwrap();
+        assert_eq!(d.source, "DEFAULT 0");
+        assert_eq!(d.value_blr, vec![5, 21, 8, 0, 0, 0, 0, 0, 76]);
+        let d = parse_column_def("N INTEGER DEFAULT -3").unwrap().0.default.unwrap();
+        assert_eq!(d.value_blr, vec![5, 21, 8, 0, 253, 255, 255, 255, 76]);
+        let (col, _) = parse_column_def("B VARCHAR(10) DEFAULT 'Hi there' NOT NULL").unwrap();
+        assert!(col.not_null);
+        let d = col.default.unwrap();
+        assert_eq!(d.source, "DEFAULT 'Hi there'");
+        assert_eq!(d.value_blr, {
+            let mut v = vec![5u8, 21, 15, 0, 0, 8, 0];
+            v.extend_from_slice(b"Hi there");
+            v.push(76);
+            v
+        });
+        // a column with no default
+        assert!(parse_column_def("D INTEGER").unwrap().0.default.is_none());
     }
 
     #[test]

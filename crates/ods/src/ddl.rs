@@ -74,6 +74,38 @@ pub struct ColumnDef {
     /// a TABLE-level `PRIMARY KEY (a, b)` sets its columns' NULL_FLAG
     /// but writes no constraint row (probed: table P vs table Q).
     pub not_null_constraint: bool,
+    /// a column `DEFAULT <literal>`, if any: the source text
+    /// (`DEFAULT 0`) and its value BLR
+    pub default: Option<ColumnDefault>,
+}
+
+/// A column (or domain) `DEFAULT <literal>`: the `RDB$DEFAULT_SOURCE` text
+/// and the `RDB$DEFAULT_VALUE` BLR.
+pub struct ColumnDefault {
+    pub source: String,
+    pub value_blr: Vec<u8>,
+}
+
+/// The BLR of an integer-literal default - `blr_version5, blr_literal,
+/// blr_long, scale 0, the 4-byte value, blr_eoc`. The engine writes a
+/// literal as `blr_long` regardless of the column width (probe: a SMALLINT
+/// and a BIGINT default both carry a 4-byte `blr_long` value).
+pub fn int_default_blr(value: i32) -> Vec<u8> {
+    let mut b = vec![5u8, 21, 8, 0]; // version5, blr_literal, blr_long, scale
+    b.extend_from_slice(&value.to_le_bytes());
+    b.push(76); // blr_eoc
+    b
+}
+
+/// The BLR of a string-literal default - `blr_version5, blr_literal,
+/// blr_text2, charset 0, the 2-byte length, the bytes, blr_eoc`. The
+/// literal carries its own length, not the column's (no padding).
+pub fn str_default_blr(text: &str) -> Vec<u8> {
+    let mut b = vec![5u8, 21, 15, 0, 0]; // version5, literal, blr_text2, charset(2 bytes)
+    b.extend_from_slice(&(text.len() as u16).to_le_bytes());
+    b.extend_from_slice(text.as_bytes());
+    b.push(76); // blr_eoc
+    b
 }
 
 /// One table-level key constraint of a CREATE TABLE: a `PRIMARY KEY` or
@@ -1544,6 +1576,13 @@ pub fn create_table(
             runtime.push(seg(26, &cl.to_le_bytes())); // RSR_character_length
         }
         runtime.push(seg(27, &(i as u16).to_le_bytes())); // RSR_field_pos
+        // the column DEFAULT (RSR_default_value = 6): the engine reads a
+        // field's default from this runtime entry, not from
+        // RDB$RELATION_FIELDS.RDB$DEFAULT_VALUE - without it the catalog
+        // default is written but never applied
+        if let Some(def) = &c.default {
+            runtime.push(seg(6, &def.value_blr));
+        }
         if c.not_null {
             runtime.push(seg(21, &NONNULL_BLR)); // RSR_field_not_null
         }
@@ -1587,6 +1626,15 @@ pub fn create_table(
         }
         if c.not_null {
             vals.push(("RDB$NULL_FLAG", SysVal::I(1)));
+        }
+        // a column DEFAULT lives on RDB$RELATION_FIELDS (not the auto-domain):
+        // the source text (subtype 1, charset 4 like a description) and the
+        // value BLR (subtype 2)
+        if let Some(def) = &c.default {
+            let src = dml::insert_blob_cs(file, page_size, 5, &[def.source.as_bytes().to_vec()], 1, 4)?;
+            let val = dml::insert_blob(file, page_size, 5, &[def.value_blr.clone()], 2)?;
+            vals.push(("RDB$DEFAULT_SOURCE", SysVal::B(blob_id_bytes(5, src))));
+            vals.push(("RDB$DEFAULT_VALUE", SysVal::B(blob_id_bytes(5, val))));
         }
         sys_insert(file, page_size, "RDB$RELATION_FIELDS", 5, &vals)?;
     }
