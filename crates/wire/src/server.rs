@@ -715,6 +715,10 @@ enum Plan {
     /// the drop states (still maintained, no longer enforcing), ACTIVE
     /// REBUILDS the index into a new slot and recomputes its selectivity
     AlterIndex { name: String, active: bool },
+    /// `SET STATISTICS INDEX <name>`: recompute the index's selectivity
+    /// (`1 / distinct` per key prefix over the current rows) into the
+    /// catalog and the index root descriptor
+    SetStatistics { name: String },
     /// `ALTER TABLE <table> ADD <column>`: a new format version, the new
     /// column's catalog rows, and a version rewrite of the RDB$RELATIONS
     /// row bumping its format and field count
@@ -1740,6 +1744,20 @@ fn plan_drop_sequence(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         return None;
     }
     Some((Plan::DropSequence { name: unquote_ident(toks[2])? }, Vec::new()))
+}
+
+/// Parse `SET STATISTICS INDEX <name>`.
+fn plan_set_statistics(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    if toks.len() != 4
+        || !toks[0].eq_ignore_ascii_case("SET")
+        || !toks[1].eq_ignore_ascii_case("STATISTICS")
+        || !toks[2].eq_ignore_ascii_case("INDEX")
+    {
+        return None;
+    }
+    Some((Plan::SetStatistics { name: unquote_ident(toks[3])? }, Vec::new()))
 }
 
 /// Parse `ALTER INDEX <name> ACTIVE|INACTIVE`.
@@ -2771,6 +2789,10 @@ fn execute_dml(
         }
         Plan::AlterIndex { name, active } => {
             fire_crab_ods::ddl::alter_index_active(&mut work, db.page_size, name, *active)?;
+            (0, 0, 0)
+        }
+        Plan::SetStatistics { name } => {
+            fire_crab_ods::ddl::set_index_statistics(&mut work, db.page_size, name)?;
             (0, 0, 0)
         }
         Plan::AlterTableAdd { table, col } => {
@@ -4265,6 +4287,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::AlterIndex { .. }
+        | Plan::SetStatistics { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -4298,6 +4321,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::AlterIndex { .. }
+        | Plan::SetStatistics { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -4618,6 +4642,7 @@ fn emit_rows_inner(
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::AlterIndex { .. }
+        | Plan::SetStatistics { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -7032,7 +7057,9 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     .any(|k| find_word(&up, k, 0) == Some(0));
                 // SET GENERATOR / ALTER SEQUENCE RESTART are generator
                 // writes; the ALTER form also begins with a DDL verb.
-                let planned = plan_set_generator(&text).or_else(|| {
+                let planned = plan_set_generator(&text)
+                    .or_else(|| plan_set_statistics(&text))
+                    .or_else(|| {
                     if ddl_kw {
                         plan_create_table(&text)
                             .or_else(|| plan_create_index(&text))
@@ -7164,9 +7191,11 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 let dml_kw = ["INSERT", "UPDATE", "DELETE"]
                     .into_iter()
                     .find(|k| find_word(&up, k, 0) == Some(0));
-                if let Some((p, ps)) = plan_set_generator(&stmt_sql) {
-                    // SET GENERATOR <name> TO <n> - a generator write, not
-                    // caught by the DDL/DML verb list (it begins with SET)
+                if let Some((p, ps)) =
+                    plan_set_generator(&stmt_sql).or_else(|| plan_set_statistics(&stmt_sql))
+                {
+                    // SET GENERATOR / SET STATISTICS - DDL that begins with
+                    // SET, so it is not caught by the DDL/DML verb list
                     let describe = answer_prepare(&prep_items, &p, &ps);
                     plan = p;
                     stmt_params = ps;
@@ -7289,6 +7318,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::CreateSequence { .. }
                         | Plan::DropSequence { .. }
                         | Plan::AlterIndex { .. }
+                        | Plan::SetStatistics { .. }
                         | Plan::AlterTableAdd { .. }
                         | Plan::AlterTableAddFk { .. }
                         | Plan::AlterTableAddKey { .. }
@@ -10212,6 +10242,22 @@ mod tests {
         // a DROP INDEX/TABLE is not a DROP SEQUENCE, and neither is a bare one
         assert!(plan_drop_sequence("DROP INDEX IX").is_none());
         assert!(plan_drop_sequence("DROP SEQUENCE").is_none());
+    }
+
+    #[test]
+    fn parses_set_statistics() {
+        match plan_set_statistics("SET STATISTICS INDEX IX_TAB") {
+            Some((Plan::SetStatistics { name }, _)) => assert_eq!(name, "IX_TAB"),
+            other => panic!("expected SetStatistics, got {:?}", other.is_some()),
+        }
+        assert!(matches!(
+            plan_set_statistics("set statistics index \"ix_lower\";"),
+            Some((Plan::SetStatistics { .. }, _))
+        ));
+        // not a SET STATISTICS, and no index name
+        assert!(plan_set_statistics("SET GENERATOR G TO 5").is_none());
+        assert!(plan_set_statistics("SET STATISTICS INDEX").is_none());
+        assert!(plan_set_statistics("SET STATISTICS TABLE T").is_none());
     }
 
     #[test]

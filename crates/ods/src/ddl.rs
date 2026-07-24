@@ -1691,6 +1691,67 @@ pub fn drop_index(file: &mut Vec<u8>, page_size: usize, index_name: &str) -> Res
     Ok(())
 }
 
+/// `SET STATISTICS INDEX <name>` - `SetStatisticsNode` (DdlNodes.epp:14475)
+/// against the file image.
+///
+/// The engine's statement is two steps: at execute it writes
+/// `RDB$STATISTICS = -1.0` as a "recalculate me" marker, and at commit a
+/// deferred work (`set_statistics`, dfw.epp:3575) walks the index tree
+/// (`IDX_statistics`) and `DFW_update_index` writes the fresh selectivity
+/// into the two catalog columns and the index root descriptor. Only the
+/// committed end state is observable, and it is exactly what a build
+/// produces: `1 / distinct` per key prefix over the rows as they now
+/// stand. fire-crab, an offline writer that computes from the committed
+/// rows rather than by scanning the tree, produces that end state
+/// directly - which is why the machinery is the same
+/// [index_selectivity]/[write_index_statistics] every build already uses.
+///
+/// Any index qualifies - a `PRIMARY KEY`'s and an inactive one included
+/// (the engine recomputes both) - so the only failure is an index that
+/// does not exist ("Index not found").
+pub fn set_index_statistics(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    index_name: &str,
+) -> Result<(), String> {
+    let want = index_name.trim().trim_matches('"').to_ascii_uppercase();
+    let (table, system) = find_index_relation(file, page_size, &want)
+        .ok_or_else(|| format!("Index not found: {}", want))?;
+    if system != 0 {
+        return Err("system indices are read-only".into());
+    }
+    let rel = crate::resolve_relation(file, page_size, &table)
+        .ok_or_else(|| format!("table {} not found", table))?;
+    if rel < 128 {
+        return Err("system relations are read-only".into());
+    }
+    let (_, _unique, descending) = index_row_state(file, page_size, &want)?;
+    let slot = index_id_of(file, page_size, &want)?.saturating_sub(1);
+    let columns = relation_columns(file, page_size, &table);
+    let formats = crate::relation_formats(file, page_size, rel);
+    let (_, descs) = formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .ok_or("relation has no format")?;
+    let descs = descs.clone();
+    let mut segs: Vec<(u16, u16, i8)> = Vec::new();
+    for n in index_segment_columns(file, page_size, &want)? {
+        let rc = columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&n))
+            .ok_or_else(|| format!("unknown column {}", n))?;
+        let d = descs.get(rc.field_id as usize).ok_or("field beyond format")?;
+        let itype = index_itype(d).ok_or("column type cannot be indexed by this writer")?;
+        segs.push((rc.field_id, itype, d.scale));
+    }
+    if segs.is_empty() {
+        return Err(format!("index {} has no segments", want));
+    }
+    let sel = index_selectivity(file, page_size, rel, &segs, descending)?;
+    write_index_statistics(file, page_size, rel, slot, &want, &sel)?;
+    advance_oldest_transactions(file, page_size)
+}
+
 /// `ALTER INDEX <name> ACTIVE|INACTIVE` - `AlterIndexNode`
 /// (DdlNodes.epp:14270) against the file image.
 ///
