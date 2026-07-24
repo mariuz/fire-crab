@@ -2995,6 +2995,49 @@ length), compares the `RDB$RUNTIME` blob *byte for byte*, and runs `gfix`. Teeth
 the storage length in either place `DIFF`s the field-length comparison and the
 byte-for-byte runtime comparison at once.
 
+### The seventy-sixth differential — FOREIGN KEY ... CASCADE, and where triggers live
+
+A plain foreign key stores `RESTRICT` rules and generates nothing. `ON DELETE
+CASCADE` / `ON UPDATE CASCADE` is different: the engine stores the rule in
+`RDB$REF_CONSTRAINTS` and *synthesises a system trigger* on the referenced
+(parent) table — `CHECK_<n>` (the number from the `RDB$TRIGGER_NAME` generator),
+`AFTER UPDATE` for update-cascade, `AFTER DELETE` for delete-cascade — whose
+`RDB$TRIGGER_BLR` is a small program that finds the child rows and rewrites or
+deletes them:
+
+    delete: FOR (child WHERE child.fk = OLD.pk) ERASE
+    update: IF OLD.pk <> NEW.pk THEN
+              FOR (child WHERE child.fk = OLD.pk) MODIFY SET child.fk = NEW.pk
+
+fire-crab emits that BLR — single-column, the parent key read through the
+trigger's `OLD`/`NEW` context, the child scanned as a third context — byte for
+byte against the engine's. It is the first BLR fire-crab *writes* rather than
+decodes, and the emitter is short because the program is.
+
+The trap that made this differential worth the wait is not the BLR. Writing the
+`RDB$TRIGGERS` row and the BLR, byte-identical to the engine's, is *not enough
+for the trigger to fire* — and everything looks right until you try to make a
+parent row cascade and nothing happens. The reason is that the engine does not
+find a relation's triggers by scanning `RDB$TRIGGERS` for its name. It loads
+them from the relation's own `RDB$RUNTIME` summary, which carries an
+`RSR_trigger_name` entry per trigger (`met.epp`, `MET_load_trigger` driven by
+`RSR_trigger_name`). A trigger absent from the parent's runtime is, to the
+running engine, not there. So creating the trigger means rebuilding the parent's
+`RDB$RUNTIME` to name it — and once it does, the whole runtime blob matches the
+engine's byte for byte, the trigger name and all.
+
+`qa/serve-real-fkcascade.sh` (13 checks) has fire-crab and the engine each create
+a master, a detail with a two-action cascade FK, and a second pair with a
+single-action one, on two copies. It compares the `RDB$TRIGGERS` rows and the
+`RDB$REF_CONSTRAINTS` rules, compares both trigger BLRs and the parent's
+`RDB$RUNTIME` blob byte for byte, then does the check the whole increment is
+about: it inserts rows and, on fire-crab's file, has the *engine execute
+fire-crab's triggers* — an `UPDATE` of a master key moves its two children, a
+`DELETE` of a master cascade-deletes its child — and finishes with a `gbak`
+round trip and `gfix`. Teeth: omit the `RSR_trigger_name` from the parent's
+runtime and every catalog row still matches while the cascade silently does
+nothing.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -3487,6 +3530,18 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix \
     bash /path/to/fire-crab/qa/serve-real-fieldlen.sh 3050
+
+# FOREIGN KEY ... ON DELETE / ON UPDATE CASCADE: the referential action
+# synthesises a system trigger (CHECK_<n>, AFTER UPDATE/DELETE) on the
+# referenced table, whose BLR fire-crab emits byte for byte, AND names it
+# in the parent's RDB$RUNTIME (the RSR_trigger_name entry the engine loads
+# triggers from - without it the trigger never fires). The engine then
+# executes fire-crab's triggers: a parent UPDATE/DELETE cascades to the
+# children. gbak and gfix. Builds its own scratch databases.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-fkcascade.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
