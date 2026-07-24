@@ -733,6 +733,12 @@ enum Plan {
     CreateDomain { col: fire_crab_ods::ddl::ColumnDef },
     /// `DROP DOMAIN <name>`: delete the RDB$FIELDS row (refused while in use)
     DropDomain { name: String },
+    /// `ALTER DOMAIN <name> SET DEFAULT <lit>` / `DROP DEFAULT`: write (or
+    /// clear) the default blobs on the domain's own RDB$FIELDS row
+    AlterDomainDefault {
+        domain: String,
+        default: Option<fire_crab_ods::ddl::ColumnDefault>,
+    },
     /// `ALTER INDEX <name> ACTIVE|INACTIVE`: INACTIVE moves the slot to
     /// the drop states (still maintained, no longer enforcing), ACTIVE
     /// REBUILDS the index into a new slot and recomputes its selectivity
@@ -1346,24 +1352,8 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
     let up_ty = ty_orig.to_ascii_uppercase();
     let mut ty = if let Some(dp) = find_word(&up_ty, "DEFAULT", 0) {
         let after = ty_orig[dp + "DEFAULT".len()..].trim_start();
-        let (lit, rest) = if after.starts_with('\'') {
-            let end = close_quote_end(after)?;
-            (&after[..end], after[end..].trim_start())
-        } else {
-            let end = after.find(char::is_whitespace).unwrap_or(after.len());
-            (&after[..end], after[end..].trim_start())
-        };
-        let value_blr = if lit.starts_with('\'') {
-            fire_crab_ods::ddl::str_default_blr(&parse_string_literal(lit)?)
-        } else if lit.eq_ignore_ascii_case("NULL") {
-            fire_crab_ods::ddl::null_default_blr()
-        } else {
-            fire_crab_ods::ddl::int_default_blr(lit.parse::<i32>().ok()?)
-        };
-        default_parsed = Some(fire_crab_ods::ddl::ColumnDefault {
-            source: format!("DEFAULT {}", lit),
-            value_blr,
-        });
+        let (def, rest) = parse_default_clause(after)?;
+        default_parsed = Some(def);
         format!("{} {}", ty_orig[..dp].trim_end(), rest)
             .trim()
             .to_ascii_uppercase()
@@ -1991,12 +1981,74 @@ fn plan_drop_role(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     Some((Plan::DropRole { name: unquote_ident(toks[2])? }, Vec::new()))
 }
 
+/// Parse a `DEFAULT <literal>` clause given the text *after* the DEFAULT
+/// keyword, in its original case. Returns the [ColumnDefault] and the text
+/// remaining after the literal. Handles an integer, a `''`-escaped string,
+/// and `NULL` - the same three a column and a domain default both accept.
+fn parse_default_clause(
+    after: &str,
+) -> Option<(fire_crab_ods::ddl::ColumnDefault, &str)> {
+    let after = after.trim_start();
+    let (lit, rest) = if after.starts_with('\'') {
+        let end = close_quote_end(after)?;
+        (&after[..end], after[end..].trim_start())
+    } else {
+        let end = after.find(char::is_whitespace).unwrap_or(after.len());
+        (&after[..end], after[end..].trim_start())
+    };
+    let value_blr = if lit.starts_with('\'') {
+        fire_crab_ods::ddl::str_default_blr(&parse_string_literal(lit)?)
+    } else if lit.eq_ignore_ascii_case("NULL") {
+        fire_crab_ods::ddl::null_default_blr()
+    } else {
+        fire_crab_ods::ddl::int_default_blr(lit.parse::<i32>().ok()?)
+    };
+    Some((
+        fire_crab_ods::ddl::ColumnDefault {
+            source: format!("DEFAULT {}", lit),
+            value_blr,
+        },
+        rest,
+    ))
+}
+
+/// Parse `ALTER DOMAIN <name> SET DEFAULT <literal>` and
+/// `ALTER DOMAIN <name> DROP DEFAULT` - the default on a domain's own
+/// `RDB$FIELDS` row, set (or replaced) or cleared. Other ALTER DOMAIN forms
+/// (SET/DROP NOT NULL, TYPE, rename, ADD CHECK) fall back to None.
+fn plan_alter_domain(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "ALTER", 0) != Some(0) {
+        return None;
+    }
+    let dom = find_word(&masked, "DOMAIN", "ALTER".len())?;
+    if masked["ALTER".len()..dom].trim() != "" {
+        return None;
+    }
+    let rest = s[dom + "DOMAIN".len()..].trim();
+    let (name, tail) = rest.split_once(char::is_whitespace)?;
+    let name = unquote_ident(name)?;
+    let tail = tail.trim();
+    let up_tail = tail.to_ascii_uppercase();
+    let default = if up_tail.starts_with("SET DEFAULT") {
+        let def_kw = find_word(&up_tail, "DEFAULT", 0)?;
+        let after = tail[def_kw + "DEFAULT".len()..].trim_start();
+        Some(parse_default_clause(after)?.0)
+    } else if up_tail == "DROP DEFAULT" {
+        None
+    } else {
+        return None; // other ALTER DOMAIN forms not modelled
+    };
+    Some((Plan::AlterDomainDefault { domain: name, default }, Vec::new()))
+}
+
 /// Parse `CREATE DOMAIN <name> [AS] <type> [NOT NULL]` - a standalone type
 /// definition. The type is parsed by the same [parse_column_def] a table
 /// column uses (a domain carries no key, so a PRIMARY KEY / UNIQUE tail
-/// falls back). Only the type surface fire-crab already models; DEFAULT,
-/// CHECK and COLLATE clauses (which the engine stores as BLR/source) parse
-/// to None.
+/// falls back). A `DEFAULT` clause is carried on the ColumnDef; CHECK and
+/// COLLATE clauses (which the engine stores as BLR/source) parse to None.
 fn plan_create_domain(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
@@ -3418,6 +3470,15 @@ fn execute_dml(
         }
         Plan::DropDomain { name } => {
             fire_crab_ods::ddl::drop_domain(&mut work, db.page_size, name)?;
+            (0, 0, 0)
+        }
+        Plan::AlterDomainDefault { domain, default } => {
+            fire_crab_ods::ddl::alter_domain_default(
+                &mut work,
+                db.page_size,
+                domain,
+                default.as_ref(),
+            )?;
             (0, 0, 0)
         }
         Plan::AlterIndex { name, active } => {
@@ -4965,6 +5026,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
+        | Plan::AlterDomainDefault { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
         | Plan::Comment { .. }
@@ -5006,6 +5068,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
+        | Plan::AlterDomainDefault { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
         | Plan::Comment { .. }
@@ -5334,6 +5397,7 @@ fn emit_rows_inner(
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
+        | Plan::AlterDomainDefault { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
         | Plan::Comment { .. }
@@ -7774,6 +7838,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             .or_else(|| plan_drop_role(&text))
                             .or_else(|| plan_create_domain(&text))
                             .or_else(|| plan_drop_domain(&text))
+                            .or_else(|| plan_alter_domain(&text))
                             .or_else(|| plan_alter_index(&text))
                             .or_else(|| plan_alter_table_add(&text))
                             .or_else(|| plan_alter_table_drop(&text))
@@ -7928,6 +7993,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         .or_else(|| plan_drop_role(&stmt_sql))
                         .or_else(|| plan_create_domain(&stmt_sql))
                         .or_else(|| plan_drop_domain(&stmt_sql))
+                        .or_else(|| plan_alter_domain(&stmt_sql))
                         .or_else(|| plan_alter_index(&stmt_sql))
                         .or_else(|| plan_alter_table_add(&stmt_sql))
                         .or_else(|| plan_alter_table_drop(&stmt_sql))
@@ -8043,6 +8109,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::DropRole { .. }
                         | Plan::CreateDomain { .. }
                         | Plan::DropDomain { .. }
+                        | Plan::AlterDomainDefault { .. }
                         | Plan::AlterIndex { .. }
                         | Plan::SetStatistics { .. }
                         | Plan::Comment { .. }
@@ -11268,6 +11335,41 @@ mod tests {
         assert!(plan_create_domain("CREATE OR ALTER DOMAIN D AS INT").is_none());
         assert!(plan_create_domain("CREATE TABLE T (A INT)").is_none());
         assert!(plan_drop_domain("DROP TABLE T").is_none());
+    }
+
+    #[test]
+    fn parses_alter_domain_default() {
+        // SET DEFAULT carries the parsed default (int)
+        match plan_alter_domain("ALTER DOMAIN DOM_A SET DEFAULT 99") {
+            Some((Plan::AlterDomainDefault { domain, default }, _)) => {
+                assert_eq!(domain, "DOM_A");
+                let d = default.expect("SET carries a default");
+                assert_eq!(d.source, "DEFAULT 99");
+                assert_eq!(d.value_blr, vec![5, 21, 8, 0, 99, 0, 0, 0, 76]);
+            }
+            other => panic!("expected AlterDomainDefault SET, got {:?}", other.is_some()),
+        }
+        // a string default keeps its original case (the name is normalised at
+        // execution, in the ods layer, not here)
+        match plan_alter_domain("alter domain dom_b set default 'Hey'") {
+            Some((Plan::AlterDomainDefault { domain, default }, _)) => {
+                assert_eq!(domain, "dom_b");
+                assert_eq!(default.unwrap().source, "DEFAULT 'Hey'");
+            }
+            other => panic!("expected AlterDomainDefault string, got {:?}", other.is_some()),
+        }
+        // DROP DEFAULT is None (the clear)
+        match plan_alter_domain("ALTER DOMAIN DOM_C DROP DEFAULT") {
+            Some((Plan::AlterDomainDefault { domain, default }, _)) => {
+                assert_eq!(domain, "DOM_C");
+                assert!(default.is_none());
+            }
+            other => panic!("expected AlterDomainDefault DROP, got {:?}", other.is_some()),
+        }
+        // unmodelled ALTER DOMAIN forms, and non-domains, fall back
+        assert!(plan_alter_domain("ALTER DOMAIN DOM_A SET NOT NULL").is_none());
+        assert!(plan_alter_domain("ALTER DOMAIN DOM_A TYPE BIGINT").is_none());
+        assert!(plan_alter_domain("ALTER TABLE T ADD A INT").is_none());
     }
 
     #[test]

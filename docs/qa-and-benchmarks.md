@@ -3266,6 +3266,28 @@ and inherit the default on an omitted column, and runs a `gbak` round trip plus
 catches a wrong blob, the other a blob that is right on disk but the engine will
 not apply.
 
+### The eighty-fifth differential — ALTER DOMAIN, SET and DROP DEFAULT
+
+Having put a default on a domain, the next thing is to change it. `ALTER DOMAIN
+DOM SET DEFAULT <lit>` writes (or replaces) the two blobs on the domain's
+`RDB$FIELDS` row; `DROP DEFAULT` patches both to NULL, leaving any prior blob
+orphaned exactly as the engine does. It is a `patch_sys_row` on `RDB$FIELDS`
+reusing the same literal-BLR emitters, and it let the `DEFAULT`-clause parser —
+until now inlined in the column parser — become a shared `parse_default_clause`
+used by columns, `CREATE DOMAIN`, and this. A column that uses the domain without
+its own default sees the change on its next insert.
+
+`qa/serve-real-alterdomaindefault.sh` (14 checks) starts both databases with the
+same three domains (written by the engine), then has fire-crab `ALTER` one copy
+and the engine the other: `SET DEFAULT` replacing an existing default, `SET
+DEFAULT` on a domain that had none, and `DROP DEFAULT`. It compares every
+`RDB$DEFAULT_SOURCE`, each `RDB$DEFAULT_VALUE` BLR byte for byte, confirms the
+dropped domain has no value blob, refuses an unknown domain on both, has the
+engine inherit fire-crab's *replaced* default on a table it creates on
+fire-crab's file, and runs a `gbak` round trip plus `gfix`. Teeth: SET-replace,
+SET-add and DROP are three different transitions, and the inheritance check
+proves the replaced value is the one the engine now applies.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest

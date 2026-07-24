@@ -885,6 +885,55 @@ pub fn drop_domain(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<(
     advance_oldest_transactions(file, page_size)
 }
 
+/// `ALTER DOMAIN <name> SET DEFAULT <lit>` / `DROP DEFAULT` - set (or
+/// replace, or clear) the default on the domain's own `RDB$FIELDS` row. A
+/// SET writes the two blobs a `CREATE DOMAIN ... DEFAULT` writes
+/// (`RDB$DEFAULT_SOURCE`, subtype 1 charset 4; `RDB$DEFAULT_VALUE`, the BLR,
+/// subtype 2) and patches them in; a DROP (`default` = None) patches both to
+/// NULL, leaving any prior blob orphaned - exactly as the engine does. A
+/// column that uses the domain without its own default sees the change on its
+/// next insert.
+pub fn alter_domain_default(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    name: &str,
+    default: Option<&ColumnDefault>,
+) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    if want.starts_with("RDB$") || want.starts_with("SQL$") {
+        return Err("system domains are read-only".into());
+    }
+    if !domain_exists(file, page_size, &want) {
+        return Err(format!("Domain {} not found", want));
+    }
+    let (src_val, val_val) = match default {
+        Some(def) => {
+            let src =
+                dml::insert_blob_cs(file, page_size, 2, &[def.source.as_bytes().to_vec()], 1, 4)?;
+            let val = dml::insert_blob(file, page_size, 2, &[def.value_blr.clone()], 2)?;
+            (
+                SysVal::B(blob_id_bytes(2, src)),
+                SysVal::B(blob_id_bytes(2, val)),
+            )
+        }
+        None => (SysVal::Null, SysVal::Null),
+    };
+    let name_f = sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME")?;
+    let nm = want.clone();
+    patch_sys_row(
+        file,
+        page_size,
+        "RDB$FIELDS",
+        2,
+        move |v| text_eq(v.get(name_f), &nm),
+        &[
+            ("RDB$DEFAULT_SOURCE", src_val),
+            ("RDB$DEFAULT_VALUE", val_val),
+        ],
+    )?;
+    advance_oldest_transactions(file, page_size)
+}
+
 /// `ALTER TABLE <table> DROP <column>`: remove a column. Like ADD, this is
 /// a new *format version* - existing records keep their old format (and
 /// still carry the dropped field's bytes, now unreferenced); the new
