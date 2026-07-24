@@ -1429,11 +1429,13 @@ const NONNULL_BLR: [u8; 8] = [5, 59, 61, 24, 0, 0, 0, 76];
 
 /// A foreign key's referential action for `ON UPDATE` / `ON DELETE`.
 /// `NO ACTION` and `RESTRICT` both store `RESTRICT` and generate no
-/// trigger, so they collapse to [RefAction::Restrict].
+/// trigger, so they collapse to [RefAction::Restrict]. `CASCADE` and
+/// `SET NULL` each synthesise a trigger.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RefAction {
     Restrict,
     Cascade,
+    SetNull,
 }
 
 impl RefAction {
@@ -1442,6 +1444,7 @@ impl RefAction {
         match self {
             RefAction::Restrict => "RESTRICT",
             RefAction::Cascade => "CASCADE",
+            RefAction::SetNull => "SET NULL",
         }
     }
 }
@@ -2573,45 +2576,82 @@ fn blr_field(b: &mut Vec<u8>, ctx: u8, name: &str) {
     b.extend_from_slice(name.as_bytes());
 }
 
-/// The BLR of the `ON DELETE CASCADE` trigger the engine synthesises on the
-/// referenced (parent) table: `FOR (child WHERE child.fk = OLD.pk) ERASE`.
-/// OLD is context 0, the child cursor context 2. Single column; probe-
-/// matched byte for byte.
-fn delete_cascade_blr(child_rel: &str, fk_col: &str, pk_col: &str) -> Vec<u8> {
-    let mut b = vec![5u8, 7, 67, 1]; // version5, for, rse, stream count 1
+/// The BLR of a referential-action trigger the engine synthesises on the
+/// referenced (parent) table, single or multi column, matched byte for
+/// byte. The child (context 2) is scanned for rows keyed on the parent
+/// row through OLD (context 0):
+///
+///   `FOR (child WHERE AND(child.fk_i = OLD.pk_i)) <action>`
+///
+/// wrapped, for the UPDATE event, in `IF OR(OLD.pk_i <> NEW.pk_i) THEN ...`.
+/// The action is `ERASE` for a delete-cascade, or a `MODIFY` that assigns
+/// each `child.fk_i` either `NEW.pk_i` (cascade) or `NULL` (set-null).
+fn fk_trigger_blr(
+    is_update: bool,
+    set_null: bool,
+    child_rel: &str,
+    fk_cols: &[String],
+    pk_cols: &[String],
+) -> Vec<u8> {
+    let mut b = vec![5u8]; // blr_version5
+    if is_update {
+        b.push(8); // blr_if
+        // OR chain of OLD.pk_i <> NEW.pk_i
+        for (i, pk) in pk_cols.iter().enumerate() {
+            if i + 1 < pk_cols.len() {
+                b.push(57); // blr_or
+            }
+            b.push(48); // blr_neq
+            blr_field(&mut b, 0, pk);
+            blr_field(&mut b, 1, pk);
+        }
+        b.push(2); // blr_begin (then branch)
+        b.push(2); // blr_begin
+    }
+    b.push(7); // blr_for
+    // the RSE: FOR (child WHERE AND(child.fk_i = OLD.pk_i))
+    b.push(67); // blr_rse
+    b.push(1); // stream count 1
     b.push(74); // blr_relation
     b.push(child_rel.len() as u8);
     b.extend_from_slice(child_rel.as_bytes());
     b.push(2); // context 2
     b.push(71); // blr_boolean
-    b.push(47); // blr_eql
-    blr_field(&mut b, 2, fk_col);
-    blr_field(&mut b, 0, pk_col);
+    for i in 0..fk_cols.len() {
+        if i + 1 < fk_cols.len() {
+            b.push(58); // blr_and
+        }
+        b.push(47); // blr_eql
+        blr_field(&mut b, 2, &fk_cols[i]);
+        blr_field(&mut b, 0, &pk_cols[i]);
+    }
     b.push(255); // blr_end (rse)
-    b.push(5); // blr_erase
-    b.push(2); // context 2
-    b.push(76); // blr_eoc
-    b
-}
 
-/// The BLR of the `ON UPDATE CASCADE` trigger: `IF OLD.pk <> NEW.pk THEN
-/// FOR (child WHERE child.fk = OLD.pk) MODIFY SET child.fk = NEW.pk`. OLD
-/// context 0, NEW context 1, child cursor context 2.
-fn update_cascade_blr(child_rel: &str, fk_col: &str, pk_col: &str) -> Vec<u8> {
-    let mut b = vec![5u8, 8, 48]; // version5, if, neq
-    blr_field(&mut b, 0, pk_col);
-    blr_field(&mut b, 1, pk_col);
-    b.extend_from_slice(&[2, 2, 7, 67, 1]); // begin, begin, for, rse, count 1
-    b.push(74); // blr_relation
-    b.push(child_rel.len() as u8);
-    b.extend_from_slice(child_rel.as_bytes());
-    b.extend_from_slice(&[2, 71, 47]); // context 2, boolean, eql
-    blr_field(&mut b, 2, fk_col);
-    blr_field(&mut b, 0, pk_col);
-    b.extend_from_slice(&[255, 10, 2, 2, 2, 1]); // end, modify from2 to2, begin, assignment
-    blr_field(&mut b, 1, pk_col); // NEW.pk (value)
-    blr_field(&mut b, 2, fk_col); // child.fk (target)
-    b.extend_from_slice(&[255, 255, 255, 255, 76]); // 4x end, eoc
+    if !is_update && !set_null {
+        // delete cascade: ERASE the child row
+        b.push(5); // blr_erase
+        b.push(2); // context 2
+    } else {
+        // MODIFY: set each child.fk_i to NEW.pk_i (cascade) or NULL
+        b.push(10); // blr_modify
+        b.push(2); // from context 2
+        b.push(2); // to context 2
+        b.push(2); // blr_begin
+        for i in 0..fk_cols.len() {
+            b.push(1); // blr_assignment
+            if set_null {
+                b.push(45); // blr_null
+            } else {
+                blr_field(&mut b, 1, &pk_cols[i]); // NEW.pk_i
+            }
+            blr_field(&mut b, 2, &fk_cols[i]); // child.fk_i (target)
+        }
+        b.push(255); // blr_end (modify's begin)
+        if is_update {
+            b.extend_from_slice(&[255, 255, 255]); // for / begin / begin
+        }
+    }
+    b.push(76); // blr_eoc
     b
 }
 
@@ -2628,8 +2668,8 @@ fn store_fk_trigger(
     page_size: usize,
     parent: &str,
     child_rel: &str,
-    fk_col: &str,
-    pk_col: &str,
+    fk_cols: &[String],
+    pk_cols: &[String],
     trigger_type: i64,
     blr: &[u8],
 ) -> Result<(), String> {
@@ -2676,9 +2716,13 @@ fn store_fk_trigger(
             .ok_or("no RDB$DEPENDENCIES relation")?;
         sys_insert(file, page_size, "RDB$DEPENDENCIES", drel, &row)
     };
-    dep(file, child_rel, Some(fk_col))?;
+    for fk_col in fk_cols {
+        dep(file, child_rel, Some(fk_col))?;
+    }
     dep(file, child_rel, None)?;
-    dep(file, parent, Some(pk_col))?;
+    for pk_col in pk_cols {
+        dep(file, parent, Some(pk_col))?;
+    }
     Ok(())
 }
 
@@ -2758,29 +2802,35 @@ fn write_foreign_key(
         ("RDB$CONST_SCHEMA_NAME_UQ", SysVal::S("PUBLIC")),
     ])?;
 
-    // a CASCADE action synthesises a system trigger on the referenced
-    // (parent) table - the update trigger first (the engine numbers it
-    // CHECK_<lower>), then delete - and the parent's RDB$RUNTIME is
-    // refreshed so the engine loads them
-    if fk.on_update == RefAction::Cascade || fk.on_delete == RefAction::Cascade {
+    // a CASCADE / SET NULL action synthesises a system trigger on the
+    // referenced (parent) table - the update trigger first (the engine
+    // numbers it CHECK_<lower>), then delete - and the parent's RDB$RUNTIME
+    // is refreshed so the engine loads them
+    if fk.on_update != RefAction::Restrict || fk.on_delete != RefAction::Restrict {
         let parent = fk.ref_table.trim().to_ascii_uppercase();
         let pk_cols = if fk.ref_columns.is_empty() {
             index_segment_columns(file, page_size, &partner_index)?
         } else {
             fk.ref_columns.clone()
         };
-        if fk.columns.len() != 1 || pk_cols.len() != 1 {
-            return Err("multi-column referential CASCADE is not supported".into());
+        if fk.columns.len() != pk_cols.len() {
+            return Err("foreign key column count does not match the referenced key".into());
         }
-        let (fk_col, pk_col) = (fk.columns[0].as_str(), pk_cols[0].as_str());
-        if fk.on_update == RefAction::Cascade {
-            let blr = update_cascade_blr(table, fk_col, pk_col);
-            store_fk_trigger(file, page_size, &parent, table, fk_col, pk_col, 4, &blr)?;
-        }
-        if fk.on_delete == RefAction::Cascade {
-            let blr = delete_cascade_blr(table, fk_col, pk_col);
-            store_fk_trigger(file, page_size, &parent, table, fk_col, pk_col, 6, &blr)?;
-        }
+        let mut make = |is_update: bool, action: RefAction, ttype: i64| -> Result<(), String> {
+            if action == RefAction::Restrict {
+                return Ok(());
+            }
+            let blr = fk_trigger_blr(
+                is_update,
+                action == RefAction::SetNull,
+                table,
+                &fk.columns,
+                &pk_cols,
+            );
+            store_fk_trigger(file, page_size, &parent, table, &fk.columns, &pk_cols, ttype, &blr)
+        };
+        make(true, fk.on_update, 4)?;
+        make(false, fk.on_delete, 6)?;
         update_relation_runtime(file, page_size, &parent)?;
     }
     Ok(())
