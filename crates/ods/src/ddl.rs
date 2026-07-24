@@ -517,7 +517,42 @@ fn rebuild_runtime_blob(
             runtime.push(seg(21, &NONNULL_BLR)); // RSR_field_not_null
         }
     }
+    // the relation's triggers (RSR_trigger_name = 9): the engine loads a
+    // relation's trigger vector from these runtime entries, NOT by scanning
+    // RDB$TRIGGERS by relation name - so a trigger absent here never fires
+    for tname in relation_trigger_names(file, page_size, table) {
+        runtime.push(seg(9, tname.as_bytes()));
+    }
     dml::insert_blob(file, page_size, 6, &runtime, 5)
+}
+
+/// The names of a relation's triggers, ascending - the order the engine
+/// lists them in the relation's `RDB$RUNTIME` summary.
+fn relation_trigger_names(file: &[u8], page_size: usize, table: &str) -> Vec<String> {
+    let (Some(rel), Some(formats)) = (
+        crate::resolve_relation(file, page_size, "RDB$TRIGGERS"),
+        system_relation_formats(file, page_size, "RDB$TRIGGERS"),
+    ) else {
+        return Vec::new();
+    };
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else {
+        return Vec::new();
+    };
+    let cols = relation_columns(file, page_size, "RDB$TRIGGERS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(name_f), Some(rn_f)) = (fid("RDB$TRIGGER_NAME"), fid("RDB$RELATION_NAME")) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    walk_rows(file, page_size, rel, descs, |v| {
+        if text_eq(v.get(rn_f), table) {
+            if let Some(Value::Text(t)) = v.get(name_f) {
+                names.push(t.trim_end().to_string());
+            }
+        }
+    });
+    names.sort();
+    names
 }
 
 /// `ALTER TABLE <table> ADD <column>`: append one column to an existing
@@ -1392,14 +1427,36 @@ pub fn alter_table_drop_not_null(
 /// runtime blob's RSR_field_not_null segment (probe-copied verbatim).
 const NONNULL_BLR: [u8; 8] = [5, 59, 61, 24, 0, 0, 0, 76];
 
-/// One `FOREIGN KEY (<columns>) REFERENCES <ref_table> [(<ref_columns>)]`
-/// clause of a CREATE TABLE. `name` is the constraint name (also the FK
-/// index name, as the engine names them the same).
+/// A foreign key's referential action for `ON UPDATE` / `ON DELETE`.
+/// `NO ACTION` and `RESTRICT` both store `RESTRICT` and generate no
+/// trigger, so they collapse to [RefAction::Restrict].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RefAction {
+    Restrict,
+    Cascade,
+}
+
+impl RefAction {
+    /// The `RDB$UPDATE_RULE` / `RDB$DELETE_RULE` string the engine stores.
+    fn rule(self) -> &'static str {
+        match self {
+            RefAction::Restrict => "RESTRICT",
+            RefAction::Cascade => "CASCADE",
+        }
+    }
+}
+
+/// One `FOREIGN KEY (<columns>) REFERENCES <ref_table> [(<ref_columns>)]
+/// [ON UPDATE <action>] [ON DELETE <action>]` clause of a CREATE TABLE.
+/// `name` is the constraint name (also the FK index name, as the engine
+/// names them the same).
 pub struct ForeignKeyDef {
     pub name: String,
     pub columns: Vec<String>,
     pub ref_table: String,
     pub ref_columns: Vec<String>,
+    pub on_update: RefAction,
+    pub on_delete: RefAction,
 }
 
 pub fn create_table(
@@ -2508,15 +2565,157 @@ fn next_integ_name(file: &[u8], page_size: usize) -> Result<String, String> {
     Ok(format!("INTEG_{}", n))
 }
 
+/// Emit a `blr_field ctx <name>` operand (blr_field, context, len, name).
+fn blr_field(b: &mut Vec<u8>, ctx: u8, name: &str) {
+    b.push(23);
+    b.push(ctx);
+    b.push(name.len() as u8);
+    b.extend_from_slice(name.as_bytes());
+}
+
+/// The BLR of the `ON DELETE CASCADE` trigger the engine synthesises on the
+/// referenced (parent) table: `FOR (child WHERE child.fk = OLD.pk) ERASE`.
+/// OLD is context 0, the child cursor context 2. Single column; probe-
+/// matched byte for byte.
+fn delete_cascade_blr(child_rel: &str, fk_col: &str, pk_col: &str) -> Vec<u8> {
+    let mut b = vec![5u8, 7, 67, 1]; // version5, for, rse, stream count 1
+    b.push(74); // blr_relation
+    b.push(child_rel.len() as u8);
+    b.extend_from_slice(child_rel.as_bytes());
+    b.push(2); // context 2
+    b.push(71); // blr_boolean
+    b.push(47); // blr_eql
+    blr_field(&mut b, 2, fk_col);
+    blr_field(&mut b, 0, pk_col);
+    b.push(255); // blr_end (rse)
+    b.push(5); // blr_erase
+    b.push(2); // context 2
+    b.push(76); // blr_eoc
+    b
+}
+
+/// The BLR of the `ON UPDATE CASCADE` trigger: `IF OLD.pk <> NEW.pk THEN
+/// FOR (child WHERE child.fk = OLD.pk) MODIFY SET child.fk = NEW.pk`. OLD
+/// context 0, NEW context 1, child cursor context 2.
+fn update_cascade_blr(child_rel: &str, fk_col: &str, pk_col: &str) -> Vec<u8> {
+    let mut b = vec![5u8, 8, 48]; // version5, if, neq
+    blr_field(&mut b, 0, pk_col);
+    blr_field(&mut b, 1, pk_col);
+    b.extend_from_slice(&[2, 2, 7, 67, 1]); // begin, begin, for, rse, count 1
+    b.push(74); // blr_relation
+    b.push(child_rel.len() as u8);
+    b.extend_from_slice(child_rel.as_bytes());
+    b.extend_from_slice(&[2, 71, 47]); // context 2, boolean, eql
+    blr_field(&mut b, 2, fk_col);
+    blr_field(&mut b, 0, pk_col);
+    b.extend_from_slice(&[255, 10, 2, 2, 2, 1]); // end, modify from2 to2, begin, assignment
+    blr_field(&mut b, 1, pk_col); // NEW.pk (value)
+    blr_field(&mut b, 2, fk_col); // child.fk (target)
+    b.extend_from_slice(&[255, 255, 255, 255, 76]); // 4x end, eoc
+    b
+}
+
+/// Store one FK-cascade system trigger on the referenced (parent) table -
+/// a `RDB$TRIGGERS` row named `CHECK_<n>` (number from the
+/// `RDB$TRIGGER_NAME` generator) plus the three `RDB$DEPENDENCIES` rows the
+/// engine records (on the child relation, the child FK column and the
+/// parent key column). `trigger_type` is 4 for AFTER UPDATE, 6 for AFTER
+/// DELETE. The caller must also refresh the parent's `RDB$RUNTIME` so the
+/// trigger is loaded ([update_relation_runtime]).
+#[allow(clippy::too_many_arguments)]
+fn store_fk_trigger(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    parent: &str,
+    child_rel: &str,
+    fk_col: &str,
+    pk_col: &str,
+    trigger_type: i64,
+    blr: &[u8],
+) -> Result<(), String> {
+    let n = {
+        let slot = generator_id_by_name(file, page_size, "RDB$TRIGGER_NAME")
+            .ok_or("no RDB$TRIGGER_NAME generator")?;
+        gen::bump(file, page_size, slot, 1)?
+    };
+    let tname = format!("CHECK_{}", n);
+    let rel = crate::resolve_relation(file, page_size, "RDB$TRIGGERS")
+        .ok_or("no RDB$TRIGGERS relation")?;
+    let blob = dml::insert_blob(file, page_size, rel, &[blr.to_vec()], 2)?; // subtype 2 = BLR
+    sys_insert(
+        file,
+        page_size,
+        "RDB$TRIGGERS",
+        rel,
+        &[
+            ("RDB$TRIGGER_NAME", SysVal::S(&tname)),
+            ("RDB$RELATION_NAME", SysVal::S(parent)),
+            ("RDB$TRIGGER_SEQUENCE", SysVal::I(0)),
+            ("RDB$TRIGGER_TYPE", SysVal::I(trigger_type)),
+            ("RDB$TRIGGER_BLR", SysVal::B(blob_id_bytes(rel, blob))),
+            ("RDB$TRIGGER_INACTIVE", SysVal::I(0)),
+            ("RDB$SYSTEM_FLAG", SysVal::I(4)),
+            ("RDB$FLAGS", SysVal::I(3)),
+            ("RDB$VALID_BLR", SysVal::I(1)),
+            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ],
+    )?;
+    let dep = |file: &mut Vec<u8>, on: &str, field: Option<&str>| -> Result<(), String> {
+        let mut row = vec![
+            ("RDB$DEPENDENT_NAME", SysVal::S(&tname)),
+            ("RDB$DEPENDED_ON_NAME", SysVal::S(on)),
+            ("RDB$DEPENDENT_TYPE", SysVal::I(2)),   // obj_trigger
+            ("RDB$DEPENDED_ON_TYPE", SysVal::I(0)), // obj_relation
+            ("RDB$DEPENDENT_SCHEMA_NAME", SysVal::S("PUBLIC")),
+            ("RDB$DEPENDED_ON_SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ];
+        if let Some(f) = field {
+            row.push(("RDB$FIELD_NAME", SysVal::S(f)));
+        }
+        let drel = crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES")
+            .ok_or("no RDB$DEPENDENCIES relation")?;
+        sys_insert(file, page_size, "RDB$DEPENDENCIES", drel, &row)
+    };
+    dep(file, child_rel, Some(fk_col))?;
+    dep(file, child_rel, None)?;
+    dep(file, parent, Some(pk_col))?;
+    Ok(())
+}
+
+/// Rebuild a relation's `RDB$RUNTIME` and patch it into the RDB$RELATIONS
+/// row in place - the way to make a newly written trigger loadable, since
+/// [rebuild_runtime_blob] now folds the relation's trigger names into the
+/// summary the engine loads triggers from.
+fn update_relation_runtime(file: &mut Vec<u8>, page_size: usize, table: &str) -> Result<(), String> {
+    let rel = crate::resolve_relation(file, page_size, table)
+        .ok_or_else(|| format!("table {} not found", table))?;
+    let formats = crate::relation_formats(file, page_size, rel);
+    let (_, descs) = formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .ok_or("relation has no format")?;
+    let descs = descs.clone();
+    let runtime = rebuild_runtime_blob(file, page_size, table, &descs)?;
+    let name_fid = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
+    let nm = table.to_string();
+    patch_sys_row(
+        file,
+        page_size,
+        "RDB$RELATIONS",
+        6,
+        move |v| text_eq(v.get(name_fid), &nm),
+        &[("RDB$RUNTIME", SysVal::B(blob_id_bytes(6, runtime)))],
+    )
+}
+
 /// Write one FOREIGN KEY onto a table: the referencing index (irt_foreign,
 /// naming the partner PK index, with the partner-schema column that makes
 /// MET_lookup_partner find it - see [create_index]), the RDB$RELATION_
-/// CONSTRAINTS 'FOREIGN KEY' row, and the RDB$REF_CONSTRAINTS row linking
-/// to the referenced table's PK constraint (MATCH FULL, RESTRICT rules -
-/// referential ACTIONS like CASCADE need engine-generated BLR triggers,
-/// which this writer does not synthesise). Shared by create_table and
-/// ALTER TABLE ADD CONSTRAINT; create_index backfills existing rows, so
-/// this works on a populated table too.
+/// CONSTRAINTS 'FOREIGN KEY' row, the RDB$REF_CONSTRAINTS row linking to the
+/// referenced table's PK constraint (MATCH FULL), and - for a CASCADE
+/// action - the system trigger(s) the engine synthesises on the referenced
+/// table (single column), refreshing that table's RDB$RUNTIME so they load.
+/// Shared by create_table and ALTER TABLE ADD CONSTRAINT.
 fn write_foreign_key(
     file: &mut Vec<u8>,
     page_size: usize,
@@ -2553,11 +2752,37 @@ fn write_foreign_key(
         ("RDB$CONSTRAINT_NAME", SysVal::S(fk_name)),
         ("RDB$CONST_NAME_UQ", SysVal::S(&uq_constraint)),
         ("RDB$MATCH_OPTION", SysVal::S("FULL")),
-        ("RDB$UPDATE_RULE", SysVal::S("RESTRICT")),
-        ("RDB$DELETE_RULE", SysVal::S("RESTRICT")),
+        ("RDB$UPDATE_RULE", SysVal::S(fk.on_update.rule())),
+        ("RDB$DELETE_RULE", SysVal::S(fk.on_delete.rule())),
         ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ("RDB$CONST_SCHEMA_NAME_UQ", SysVal::S("PUBLIC")),
     ])?;
+
+    // a CASCADE action synthesises a system trigger on the referenced
+    // (parent) table - the update trigger first (the engine numbers it
+    // CHECK_<lower>), then delete - and the parent's RDB$RUNTIME is
+    // refreshed so the engine loads them
+    if fk.on_update == RefAction::Cascade || fk.on_delete == RefAction::Cascade {
+        let parent = fk.ref_table.trim().to_ascii_uppercase();
+        let pk_cols = if fk.ref_columns.is_empty() {
+            index_segment_columns(file, page_size, &partner_index)?
+        } else {
+            fk.ref_columns.clone()
+        };
+        if fk.columns.len() != 1 || pk_cols.len() != 1 {
+            return Err("multi-column referential CASCADE is not supported".into());
+        }
+        let (fk_col, pk_col) = (fk.columns[0].as_str(), pk_cols[0].as_str());
+        if fk.on_update == RefAction::Cascade {
+            let blr = update_cascade_blr(table, fk_col, pk_col);
+            store_fk_trigger(file, page_size, &parent, table, fk_col, pk_col, 4, &blr)?;
+        }
+        if fk.on_delete == RefAction::Cascade {
+            let blr = delete_cascade_blr(table, fk_col, pk_col);
+            store_fk_trigger(file, page_size, &parent, table, fk_col, pk_col, 6, &blr)?;
+        }
+        update_relation_runtime(file, page_size, &parent)?;
+    }
     Ok(())
 }
 

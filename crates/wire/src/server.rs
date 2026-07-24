@@ -1613,22 +1613,75 @@ fn parse_fk_clause(up_item: &str) -> Option<fire_crab_ods::ddl::ForeignKeyDef> {
     let close = rest.find(')')?;
     let columns = split_ident_list(&rest[1..close])?;
     let after = rest[close + 1..].trim_start().strip_prefix("REFERENCES")?.trim_start();
+    // split the referenced table[(cols)] from any trailing ON UPDATE /
+    // ON DELETE referential-action clauses
+    let (ref_part, actions_str) = match find_word(after, "ON", 0) {
+        Some(p) => (after[..p].trim(), &after[p..]),
+        None => (after, ""),
+    };
     // referenced table, optionally with an explicit (columns) list
-    let (ref_table, ref_columns) = match after.find('(') {
+    let (ref_table, ref_columns) = match ref_part.find('(') {
         Some(p) => {
-            let rc_close = after.rfind(')')?;
+            let rc_close = ref_part.rfind(')')?;
             if rc_close <= p {
                 return None;
             }
-            let rt = after[..p].trim().trim_matches('"').to_string();
-            (rt, split_ident_list(&after[p + 1..rc_close])?)
+            let rt = ref_part[..p].trim().trim_matches('"').to_string();
+            (rt, split_ident_list(&ref_part[p + 1..rc_close])?)
         }
-        None => (after.trim().trim_matches('"').to_string(), Vec::new()),
+        None => (ref_part.trim().trim_matches('"').to_string(), Vec::new()),
     };
     if !ident_ok(&ref_table) || columns.is_empty() {
         return None;
     }
-    Some(fire_crab_ods::ddl::ForeignKeyDef { name, columns, ref_table, ref_columns })
+    let (on_update, on_delete) = parse_ref_actions(actions_str)?;
+    Some(fire_crab_ods::ddl::ForeignKeyDef {
+        name,
+        columns,
+        ref_table,
+        ref_columns,
+        on_update,
+        on_delete,
+    })
+}
+
+/// Parse the trailing `[ON UPDATE <action>] [ON DELETE <action>]` of a
+/// foreign key (already uppercased). `CASCADE`, `RESTRICT` and `NO ACTION`
+/// are modelled (the last two as RESTRICT); `SET NULL` / `SET DEFAULT`
+/// parse to None so the whole clause falls back.
+fn parse_ref_actions(s: &str) -> Option<(fire_crab_ods::ddl::RefAction, fire_crab_ods::ddl::RefAction)> {
+    use fire_crab_ods::ddl::RefAction;
+    let (mut on_update, mut on_delete) = (RefAction::Restrict, RefAction::Restrict);
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    let mut i = 0;
+    while i < toks.len() {
+        if toks[i] != "ON" {
+            return None;
+        }
+        let which = *toks.get(i + 1)?;
+        i += 2;
+        let action = match *toks.get(i)? {
+            "CASCADE" => {
+                i += 1;
+                RefAction::Cascade
+            }
+            "RESTRICT" => {
+                i += 1;
+                RefAction::Restrict
+            }
+            "NO" if toks.get(i + 1) == Some(&"ACTION") => {
+                i += 2;
+                RefAction::Restrict
+            }
+            _ => return None, // SET NULL / SET DEFAULT not modelled
+        };
+        match which {
+            "UPDATE" => on_update = action,
+            "DELETE" => on_delete = action,
+            _ => return None,
+        }
+    }
+    Some((on_update, on_delete))
 }
 
 /// Split a comma-separated identifier list (`A, "B", C`), each trimmed and
@@ -10664,6 +10717,22 @@ mod tests {
         // a plain column definition and a PRIMARY KEY clause are not FKs
         assert!(parse_fk_clause("PID INTEGER").is_none());
         assert!(parse_fk_clause("PRIMARY KEY (ID)").is_none());
+        // referential actions
+        use fire_crab_ods::ddl::RefAction;
+        let fk = parse_fk_clause(
+            "FOREIGN KEY (MID) REFERENCES MASTER (ID) ON DELETE CASCADE ON UPDATE CASCADE",
+        )
+        .unwrap();
+        assert!(fk.on_delete == RefAction::Cascade && fk.on_update == RefAction::Cascade);
+        // single action; the unspecified one defaults to RESTRICT; no
+        // explicit ref columns before the ON clause
+        let fk = parse_fk_clause("FOREIGN KEY (MID) REFERENCES MASTER ON DELETE CASCADE").unwrap();
+        assert_eq!(fk.ref_table, "MASTER");
+        assert!(fk.on_delete == RefAction::Cascade && fk.on_update == RefAction::Restrict);
+        // NO ACTION collapses to RESTRICT; SET NULL is not modelled (falls back)
+        let fk = parse_fk_clause("FOREIGN KEY (MID) REFERENCES M ON DELETE NO ACTION").unwrap();
+        assert!(fk.on_delete == RefAction::Restrict);
+        assert!(parse_fk_clause("FOREIGN KEY (MID) REFERENCES M ON DELETE SET NULL").is_none());
     }
 
     #[test]
