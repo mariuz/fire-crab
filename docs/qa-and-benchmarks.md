@@ -2599,6 +2599,43 @@ both index root pages and compared, the unknown-index refusal is checked on
 both, and `gbak`/`gfix` close it. Teeth: a `set_index_statistics` that
 recomputes nothing leaves the stale snapshot and makes 6 checks `DIFF`.
 
+### The sixty-fifth differential — COMMENT ON, and a blob's charset
+
+`COMMENT ON TABLE <t> IS <text>` and `COMMENT ON COLUMN <t>.<c> IS <text>`
+attach a description to a schema object. A comment is a text blob written into
+the commented object's own catalog relation — `RDB$RELATIONS` for a table,
+`RDB$RELATION_FIELDS` for a column — with its id stored in that row's
+`RDB$DESCRIPTION`. `IS NULL`, and (an engine probe confirms) `IS ''`, clears
+the column to NULL, orphaning the old blob exactly as the engine does. This is
+the first fire-crab statement that rewrites a *user* catalog row in place to
+point at a new blob, and it needed a small generalisation on both sides: an
+in-place patch that can set a column to NULL (the clear), and a blob writer
+that takes an explicit charset.
+
+That charset is the whole subtlety. fire-crab has written blobs since the
+first `CREATE TABLE` — format and runtime descriptors, then ACLs — and always
+with `blh_charset` = 1, which is what the engine writes for those *binary*
+metadata blobs. A `RDB$DESCRIPTION` text blob is different: it carries charset
+4, the metadata UTF8 charset. The trap is that it does not show up in the
+obvious test. `CAST(RDB$DESCRIPTION AS VARCHAR)` decodes through the blob's own
+charset, and for ASCII text charset 1 and charset 4 produce the same
+characters — so a comment written with the wrong charset *reads back
+correctly* and only a non-ASCII comment, or a byte-for-byte look at the blob
+record, reveals the divergence. The gate does the byte-for-byte look, and it
+is exactly the check that fails when the charset is wrong while the text
+read-back still passes.
+
+`qa/serve-real-comment.sh` (20 checks) applies the same comments — a table's,
+two columns', one with a `''` escape — through fire-crab and the engine on two
+copies, reads every `RDB$DESCRIPTION` back as text and compares, reads the
+description blob record off both files and compares it byte for byte (header,
+charset and segment framing), clears a comment each way (`IS NULL` and `IS
+''`) and confirms the columns go NULL while an untouched one survives, checks
+the unknown-table and unknown-column refusals on both, and finishes with a
+`gbak` round trip (the `''` escape survives it) and `gfix`. Teeth: writing the
+description blob with charset 1 instead of 4 leaves the text reading back fine
+but makes the two byte-for-byte blob checks `DIFF`.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -2969,6 +3006,17 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-setstats.sh 3050
+
+# COMMENT ON TABLE / COLUMN: a description text blob written into the
+# object's own catalog relation, its id stored in RDB$DESCRIPTION; IS NULL
+# / IS '' clears it. A RDB$DESCRIPTION text blob carries blh_charset = 4
+# (UTF8), not the 1 the binary metadata blobs use - the gate compares the
+# blob record byte for byte, since ASCII text reads back the same either
+# way. gbak and gfix. Builds its own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-comment.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
