@@ -2051,7 +2051,7 @@ fn plan_comment(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     // the object kind - the first word after ON. TABLE / COLUMN /
     // INDEX / SEQUENCE / GENERATOR (the last two synonyms)
     let first = first_word_at(&masked, kind_start)?;
-    let kind = ["TABLE", "COLUMN", "INDEX", "SEQUENCE", "GENERATOR", "EXCEPTION", "ROLE"]
+    let kind = ["TABLE", "COLUMN", "INDEX", "SEQUENCE", "GENERATOR", "EXCEPTION", "ROLE", "DOMAIN"]
         .into_iter()
         .find(|k| find_word(&masked, k, kind_start) == Some(first))?;
     let after_kind = kind_start + masked[kind_start..].find(kind)? + kind.len();
@@ -2087,6 +2087,10 @@ fn plan_comment(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         "ROLE" => {
             let name = unquote_ident(target_str)?;
             fire_crab_ods::ddl::CommentTarget::Role(name)
+        }
+        "DOMAIN" => {
+            let name = unquote_ident(target_str)?;
+            fire_crab_ods::ddl::CommentTarget::Domain(name)
         }
         _ => {
             // <table>.<column> - split on the first dot outside quotes

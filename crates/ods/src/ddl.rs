@@ -1969,6 +1969,8 @@ pub enum CommentTarget {
     Exception(String),
     /// `COMMENT ON ROLE <name>` - the `RDB$ROLES` row
     Role(String),
+    /// `COMMENT ON DOMAIN <name>` - the `RDB$FIELDS` row
+    Domain(String),
 }
 
 /// A `RDB$DESCRIPTION` cell value from comment text: a text blob written
@@ -2109,6 +2111,25 @@ pub fn comment_on(
             let name_fid = sys_fid(file, page_size, "RDB$ROLES", "RDB$ROLE_NAME")?;
             let nm = name.clone();
             patch_sys_row(file, page_size, "RDB$ROLES", rrel,
+                move |v| text_eq(v.get(name_fid), &nm),
+                &[("RDB$DESCRIPTION", value)])?;
+        }
+        CommentTarget::Domain(name) => {
+            let name = name.trim().trim_matches('"').to_ascii_uppercase();
+            // a domain is a user RDB$FIELDS row; the built-in RDB$/SQL$
+            // fields the engine synthesises are read-only
+            if name.starts_with("RDB$") || name.starts_with("SQL$") {
+                return Err("system domains are read-only".into());
+            }
+            if !domain_exists(file, page_size, &name) {
+                return Err(format!("Domain {} not found", name));
+            }
+            let frel = crate::resolve_relation(file, page_size, "RDB$FIELDS")
+                .ok_or("RDB$FIELDS not found")?;
+            let value = description_blob(file, page_size, frel, text)?;
+            let name_fid = sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME")?;
+            let nm = name.clone();
+            patch_sys_row(file, page_size, "RDB$FIELDS", frel,
                 move |v| text_eq(v.get(name_fid), &nm),
                 &[("RDB$DESCRIPTION", value)])?;
         }

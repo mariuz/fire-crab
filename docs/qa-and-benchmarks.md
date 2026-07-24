@@ -3188,6 +3188,30 @@ byte for byte, then reads back a row fire-crab wrote into those columns, then
 engine emits for `VARCHAR(6)` carries `dsc_length` eight, and a build that
 double-counts writes ten — a difference invisible to every other test.
 
+### The eighty-second differential — COMMENT ON DOMAIN
+
+The comment mechanism now writes a description blob into seven different catalog
+relations: a table's into `RDB$RELATIONS`, a column's into `RDB$RELATION_FIELDS`,
+and an index's, a sequence's, an exception's and a role's each into their own.
+`COMMENT ON DOMAIN` is the seventh, and it lands where the domain itself lives —
+`RDB$FIELDS`, the same relation `CREATE DOMAIN` writes and `DROP DOMAIN` deletes
+from. So there is no new machinery: the blob (charset 4, the metadata UTF8, as
+always) goes into `RDB$FIELDS`, its id into the domain row's `RDB$DESCRIPTION`,
+keyed by `RDB$FIELD_NAME`; `IS NULL` and `IS ''` clear it; a name that starts
+`RDB$` or `SQL$` — the engine's own built-in field templates — is refused as
+read-only. The whole change is one `CommentTarget` variant, one arm that resolves
+`RDB$FIELDS` and reuses the shared `description_blob` helper, and `DOMAIN` added
+to the parser's kind list.
+
+`qa/serve-real-comment4.sh` (16 checks) has fire-crab and the engine comment two
+domains — a `VARCHAR` one and an `INTEGER` one, the text carrying a `''` escape —
+on two copies of one database, compares every `RDB$DESCRIPTION` read back as
+text, compares the description blob RECORD byte for byte (framing and the
+`blh_charset` = 4), clears both (`IS NULL` and `IS ''`) and confirms the columns
+go NULL on both, refuses an unknown domain on both, and runs a `gbak` round trip
+plus `gfix`. Teeth: the byte-for-byte blob compare and the charset check make the
+text comparison non-vacuous.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
