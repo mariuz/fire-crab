@@ -3960,6 +3960,130 @@ pub fn drop_sequence(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result
     Ok(())
 }
 
+/// An exception's `(RDB$EXCEPTION_NUMBER, RDB$SYSTEM_FLAG,
+/// RDB$SECURITY_CLASS)` from `RDB$EXCEPTIONS`, by name. None when there is
+/// no such exception.
+fn find_exception(
+    file: &[u8],
+    page_size: usize,
+    name: &str,
+) -> Option<(i64, i64, Option<String>)> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$EXCEPTIONS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$EXCEPTIONS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$EXCEPTIONS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (name_f, num_f, sys_f, cls_f) = (
+        fid("RDB$EXCEPTION_NAME")?,
+        fid("RDB$EXCEPTION_NUMBER")?,
+        fid("RDB$SYSTEM_FLAG")?,
+        fid("RDB$SECURITY_CLASS")?,
+    );
+    let mut found = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if found.is_some() || !text_eq(v.get(name_f), name) {
+            return;
+        }
+        let number = match v.get(num_f) {
+            Some(Value::Int(i)) => *i,
+            _ => return,
+        };
+        let sys = match v.get(sys_f) {
+            Some(Value::Int(i)) => *i,
+            _ => 0,
+        };
+        let class = match v.get(cls_f) {
+            Some(Value::Text(t)) => Some(t.trim_end().to_string()),
+            _ => None,
+        };
+        found = Some((number, sys, class));
+    });
+    found
+}
+
+/// `CREATE EXCEPTION <name> <message>` - `CreateAlterExceptionNode`
+/// (DdlNodes.epp) against the file image. The mirror of CREATE SEQUENCE:
+/// a `RDB$EXCEPTIONS` row whose number comes from the system generator
+/// *named* `RDB$EXCEPTIONS` (exceptions have their own counter, not the
+/// master generator), a `SQL$<n>` security class carrying the owner's ACL
+/// - the same alter/control/drop/usage a sequence owner holds - and the
+/// owner's USAGE grant (object type 7, `obj_exception`). Unlike a
+/// sequence there is no value of its own to store.
+pub fn create_exception(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    name: &str,
+    message: &str,
+) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    if want.is_empty() {
+        return Err("an exception needs a name".into());
+    }
+    if find_exception(file, page_size, &want).is_some() {
+        return Err(format!("Exception {} already exists", want));
+    }
+    let rel = crate::resolve_relation(file, page_size, "RDB$EXCEPTIONS")
+        .ok_or("no RDB$EXCEPTIONS relation")?;
+    // the number: the system generator named RDB$EXCEPTIONS, one per
+    // exception (1, 2, ...); DROP does not give it back
+    let slot = generator_id_by_name(file, page_size, "RDB$EXCEPTIONS")
+        .ok_or("no RDB$EXCEPTIONS generator")?;
+    let number = gen::bump(file, page_size, slot, 1)?;
+    let class = next_security_class(file, page_size, ACL_SEQUENCE_OWNER)?;
+    sys_insert(
+        file,
+        page_size,
+        "RDB$EXCEPTIONS",
+        rel,
+        &[
+            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+            ("RDB$EXCEPTION_NAME", SysVal::S(&want)),
+            ("RDB$EXCEPTION_NUMBER", SysVal::I(number)),
+            ("RDB$MESSAGE", SysVal::S(message)),
+            ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+            ("RDB$SECURITY_CLASS", SysVal::S(&class)),
+            ("RDB$OWNER_NAME", SysVal::S(OWNER)),
+        ],
+    )?;
+    store_privileges(file, page_size, &want, 7, &["G"])?;
+    advance_oldest_transactions(file, page_size)
+}
+
+/// `DROP EXCEPTION <name>` - `DropExceptionNode`. The mirror of
+/// DROP SEQUENCE, but cleaner: the row, its security class *and* the
+/// owner's privilege all go (an engine probe: after the drop the
+/// `SQL$<n>` class row is gone, no orphan). The number counter is not
+/// rewound - the next exception takes the following number.
+pub fn drop_exception(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let (_, system, class) = find_exception(file, page_size, &want)
+        .ok_or_else(|| format!("Exception {} not found", want))?;
+    if system != 0 {
+        return Err(format!("Cannot delete system exception {}", want));
+    }
+    let name_f = sys_fid(file, page_size, "RDB$EXCEPTIONS", "RDB$EXCEPTION_NAME")?;
+    {
+        let want = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$EXCEPTIONS", move |v| {
+            text_eq(v.get(name_f), &want)
+        })?;
+    }
+    if let Some(class) = class {
+        let cls_f = sys_fid(file, page_size, "RDB$SECURITY_CLASSES", "RDB$SECURITY_CLASS")?;
+        delete_catalog_rows(file, page_size, "RDB$SECURITY_CLASSES", move |v| {
+            text_eq(v.get(cls_f), &class)
+        })?;
+    }
+    {
+        let rel_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$RELATION_NAME")?;
+        let obj_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$OBJECT_TYPE")?;
+        delete_catalog_rows(file, page_size, "RDB$USER_PRIVILEGES", move |v| {
+            text_eq(v.get(rel_f), &want) && int_eq(v.get(obj_f), 7)
+        })?;
+    }
+    advance_oldest_transactions(file, page_size)
+}
+
 /// Advance the header's oldest-transaction markers past every
 /// transaction this DDL burned, mirroring what a clean engine detach
 /// leaves behind (probe: fresh db OIT/OAT/OST/next = 8/9/9/10,

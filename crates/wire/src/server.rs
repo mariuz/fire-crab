@@ -711,6 +711,13 @@ enum Plan {
     /// `DROP SEQUENCE|GENERATOR <name>`: the catalog rows go, the
     /// stored value stays behind
     DropSequence { name: String },
+    /// `CREATE EXCEPTION <name> <message>`: a RDB$EXCEPTIONS row (number
+    /// from the RDB$EXCEPTIONS generator), its security class and the
+    /// owner's USAGE grant
+    CreateException { name: String, message: String },
+    /// `DROP EXCEPTION <name>`: the row, its security class and the
+    /// owner's privilege all go
+    DropException { name: String },
     /// `ALTER INDEX <name> ACTIVE|INACTIVE`: INACTIVE moves the slot to
     /// the drop states (still maintained, no longer enforcing), ACTIVE
     /// REBUILDS the index into a new slot and recomputes its selectivity
@@ -1760,6 +1767,43 @@ fn plan_drop_sequence(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         return None;
     }
     Some((Plan::DropSequence { name: unquote_ident(toks[2])? }, Vec::new()))
+}
+
+/// Parse `CREATE EXCEPTION <name> <message>` - the name is an identifier,
+/// the message a single-quoted string literal. None for anything else
+/// (an `ALTER`/`CREATE OR ALTER`, a missing message) so the dispatcher
+/// falls back rather than accepting a form this writer does not model.
+fn plan_create_exception(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "CREATE", 0) != Some(0) {
+        return None;
+    }
+    let exc = find_word(&masked, "EXCEPTION", "CREATE".len())?;
+    if masked["CREATE".len()..exc].trim() != "" {
+        return None; // CREATE OR ALTER, etc.
+    }
+    let after = exc + "EXCEPTION".len();
+    // the message is the first string literal; the name is between the
+    // EXCEPTION keyword and it
+    let q = s[after..].find('\'')? + after;
+    let name = unquote_ident(s[after..q].trim())?;
+    let message = parse_string_literal(s[q..].trim())?;
+    Some((Plan::CreateException { name, message }, Vec::new()))
+}
+
+/// Parse `DROP EXCEPTION <name>`.
+fn plan_drop_exception(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    if toks.len() != 3
+        || !toks[0].eq_ignore_ascii_case("DROP")
+        || !toks[1].eq_ignore_ascii_case("EXCEPTION")
+    {
+        return None;
+    }
+    Some((Plan::DropException { name: unquote_ident(toks[2])? }, Vec::new()))
 }
 
 /// Parse `COMMENT ON TABLE <t> IS <text>` and
@@ -3008,6 +3052,14 @@ fn execute_dml(
         }
         Plan::DropSequence { name } => {
             fire_crab_ods::ddl::drop_sequence(&mut work, db.page_size, name)?;
+            (0, 0, 0)
+        }
+        Plan::CreateException { name, message } => {
+            fire_crab_ods::ddl::create_exception(&mut work, db.page_size, name, message)?;
+            (0, 0, 0)
+        }
+        Plan::DropException { name } => {
+            fire_crab_ods::ddl::drop_exception(&mut work, db.page_size, name)?;
             (0, 0, 0)
         }
         Plan::AlterIndex { name, active } => {
@@ -4531,6 +4583,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
+        | Plan::CreateException { .. } | Plan::DropException { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
         | Plan::Comment { .. }
@@ -4567,6 +4620,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
+        | Plan::CreateException { .. } | Plan::DropException { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
         | Plan::Comment { .. }
@@ -4890,6 +4944,7 @@ fn emit_rows_inner(
         | Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
+        | Plan::CreateException { .. } | Plan::DropException { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
         | Plan::Comment { .. }
@@ -7320,6 +7375,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             .or_else(|| plan_drop_index(&text))
                             .or_else(|| plan_create_sequence(&text))
                             .or_else(|| plan_drop_sequence(&text))
+                            .or_else(|| plan_create_exception(&text))
+                            .or_else(|| plan_drop_exception(&text))
                             .or_else(|| plan_alter_index(&text))
                             .or_else(|| plan_alter_table_add(&text))
                             .or_else(|| plan_alter_table_drop(&text))
@@ -7465,6 +7522,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         .or_else(|| plan_drop_index(&stmt_sql))
                         .or_else(|| plan_create_sequence(&stmt_sql))
                         .or_else(|| plan_drop_sequence(&stmt_sql))
+                        .or_else(|| plan_create_exception(&stmt_sql))
+                        .or_else(|| plan_drop_exception(&stmt_sql))
                         .or_else(|| plan_alter_index(&stmt_sql))
                         .or_else(|| plan_alter_table_add(&stmt_sql))
                         .or_else(|| plan_alter_table_drop(&stmt_sql))
@@ -7572,6 +7631,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::DropIndex { .. }
                         | Plan::CreateSequence { .. }
                         | Plan::DropSequence { .. }
+                        | Plan::CreateException { .. }
+                        | Plan::DropException { .. }
                         | Plan::AlterIndex { .. }
                         | Plan::SetStatistics { .. }
                         | Plan::Comment { .. }
@@ -10598,6 +10659,34 @@ mod tests {
         assert!(plan_grant("GRANT MYROLE TO BOB").is_none()); // no ON - a role grant
         assert!(plan_grant("GRANT SELECT (A) ON T TO BOB").is_none()); // column-level
         assert!(plan_grant("CREATE TABLE T (A INT)").is_none());
+    }
+
+    #[test]
+    fn parses_create_drop_exception() {
+        match plan_create_exception("CREATE EXCEPTION E_TEST 'something went wrong'") {
+            Some((Plan::CreateException { name, message }, _)) => {
+                assert_eq!(name, "E_TEST");
+                assert_eq!(message, "something went wrong");
+            }
+            other => panic!("expected CreateException, got {:?}", other.is_some()),
+        }
+        // a '' escape in the message, lowercase keywords
+        match plan_create_exception("create exception e2 'it''s bad'") {
+            Some((Plan::CreateException { name, message }, _)) => {
+                assert_eq!(name, "e2");
+                assert_eq!(message, "it's bad");
+            }
+            other => panic!("expected CreateException, got {:?}", other.is_some()),
+        }
+        match plan_drop_exception("DROP EXCEPTION E_TEST") {
+            Some((Plan::DropException { name }, _)) => assert_eq!(name, "E_TEST"),
+            other => panic!("expected DropException, got {:?}", other.is_some()),
+        }
+        // forms this writer does not model
+        assert!(plan_create_exception("CREATE OR ALTER EXCEPTION E 'x'").is_none());
+        assert!(plan_create_exception("CREATE EXCEPTION E").is_none()); // no message
+        assert!(plan_create_exception("CREATE TABLE T (A INT)").is_none());
+        assert!(plan_drop_exception("DROP TABLE T").is_none());
     }
 
     #[test]
