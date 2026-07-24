@@ -1403,6 +1403,12 @@ pub fn create_table(
         }
         sys_insert(file, page_size, "RDB$RELATION_FIELDS", 5, &vals)?;
     }
+    // the security catalog: the relation's own class and the class its
+    // fields default to, each with the owner's ACL, then the owner's
+    // five privileges. Both class NAMES come from counters the engine
+    // does not re-check, so they are taken by advancing them.
+    let class = next_security_class(file, page_size, ACL_TABLE_OWNER)?;
+    let default_class = next_default_class(file, page_size)?;
     sys_insert(
         file,
         page_size,
@@ -1419,9 +1425,12 @@ pub fn create_table(
             ("RDB$FLAGS", SysVal::I(1)), // REL_sql
             ("RDB$RELATION_TYPE", SysVal::I(0)), // persistent
             ("RDB$OWNER_NAME", SysVal::S("SYSDBA")),
+            ("RDB$SECURITY_CLASS", SysVal::S(&class)),
+            ("RDB$DEFAULT_CLASS", SysVal::S(&default_class)),
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ],
     )?;
+    store_privileges(file, page_size, &name, 0, TABLE_OWNER_PRIVILEGES)?;
     sys_insert(
         file,
         page_size,
@@ -2823,6 +2832,27 @@ pub fn drop_table(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<()
         });
     }
 
+    // the relation's OWN security class, which dies with it. Its
+    // RDB$DEFAULT_CLASS does NOT: the engine leaves the SQL$DEFAULT<n>
+    // row behind (probe: after DROP TABLE only the SQL$<n> row is gone),
+    // and so does this.
+    let security_class = {
+        let formats = system_relation_formats(file, page_size, "RDB$RELATIONS")
+            .ok_or("no computed system format")?;
+        let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+        let cls_fid = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$SECURITY_CLASS")?;
+        let rel_fid = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
+        let mut class = None;
+        walk_rows(file, page_size, 6, descs, |values| {
+            if text_eq(values.get(rel_fid), &name) {
+                if let Some(Value::Text(t)) = values.get(cls_fid) {
+                    class = Some(t.trim_end().to_string());
+                }
+            }
+        });
+        class
+    };
+
     // pages the relation owns - catalog-free page-type scans, plus the
     // page vectors of any level-1 blob slots on its data pages
     let mut pages: Vec<u32> = Vec::new();
@@ -2909,6 +2939,21 @@ pub fn drop_table(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<()
         let n = name2.clone();
         delete_catalog_rows(file, page_size, "RDB$RELATIONS",
             move |values| text_eq(values.get(fid), &n))?;
+    }
+    // the security catalog: the relation's class row and every privilege
+    // granted ON the relation (object type 0 - a sequence of the same
+    // name keeps its own)
+    if let Some(class) = security_class {
+        let fid = sys_fid(file, page_size, "RDB$SECURITY_CLASSES", "RDB$SECURITY_CLASS")?;
+        delete_catalog_rows(file, page_size, "RDB$SECURITY_CLASSES",
+            move |values| text_eq(values.get(fid), &class))?;
+    }
+    {
+        let rel_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$RELATION_NAME")?;
+        let obj_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$OBJECT_TYPE")?;
+        let n = name2.clone();
+        delete_catalog_rows(file, page_size, "RDB$USER_PRIVILEGES",
+            move |values| text_eq(values.get(rel_f), &n) && int_eq(values.get(obj_f), 0))?;
     }
 
     // RDB$PAGES rows: system-transaction records with no chains - wipe
@@ -3171,13 +3216,22 @@ fn generator_id_taken(file: &[u8], page_size: usize, id: i64) -> bool {
     taken
 }
 
-/// The owner's access control list for a newly created object, in the
+/// The privileges the owner of a SEQUENCE holds, in the order
+/// `grant_privileges` emits them (acl.h): alter, control, drop, usage.
+/// Differential probe of an engine-created sequence's `RDB$ACL`:
+/// `02 01 03 06 SYSDBA 00 02 06 01 03 0c 00 00`.
+const ACL_SEQUENCE_OWNER: &[u8] = &[6, 1, 3, 12];
+
+/// The privileges the owner of a TABLE holds: the same three object
+/// privileges - alter, control, drop - then insert, update, delete,
+/// select and references. Probe of an engine-created table's `RDB$ACL`:
+/// `02 01 03 06 SYSDBA 00 02 06 01 03 07 09 08 04 0a 00 00`.
+const ACL_TABLE_OWNER: &[u8] = &[6, 1, 3, 7, 9, 8, 4, 10];
+
+/// An owner's access control list for a newly created object, in the
 /// engine's own encoding (acl.h): version 2, an id list naming the
-/// owner as a person, then the privilege list the owner of a sequence
-/// gets - alter, control, drop, usage - in the order `grant_privileges`
-/// emits them (differential probe of an engine-created sequence's
-/// `RDB$ACL`: `02 01 03 06 SYSDBA 00 02 06 01 03 0c 00 00`).
-fn owner_acl(owner: &str) -> Vec<u8> {
+/// owner as a person, then the privilege list for that kind of object.
+fn owner_acl(owner: &str, privileges: &[u8]) -> Vec<u8> {
     let mut acl = vec![
         2u8, // ACL_version
         1,   // ACL_id_list
@@ -3185,16 +3239,11 @@ fn owner_acl(owner: &str) -> Vec<u8> {
         owner.len() as u8,
     ];
     acl.extend_from_slice(owner.as_bytes());
-    acl.extend_from_slice(&[
-        0,  // id_end
-        2,  // ACL_priv_list
-        6,  // priv_alter
-        1,  // priv_control
-        3,  // priv_drop
-        12, // priv_usage
-        0,  // priv_end
-        0,  // ACL_end
-    ]);
+    acl.push(0); // id_end
+    acl.push(2); // ACL_priv_list
+    acl.extend_from_slice(privileges);
+    acl.push(0); // priv_end
+    acl.push(0); // ACL_end
     acl
 }
 
@@ -3206,10 +3255,11 @@ fn store_security_class(
     page_size: usize,
     class: &str,
     owner: &str,
+    privileges: &[u8],
 ) -> Result<(), String> {
     let rel = crate::resolve_relation(file, page_size, "RDB$SECURITY_CLASSES")
         .ok_or("no RDB$SECURITY_CLASSES relation")?;
-    let acl = dml::insert_blob(file, page_size, rel, &[owner_acl(owner)], 3)?;
+    let acl = dml::insert_blob(file, page_size, rel, &[owner_acl(owner, privileges)], 3)?;
     sys_insert(
         file,
         page_size,
@@ -3278,11 +3328,7 @@ pub fn create_sequence(
         return Err("no free generator id".into());
     }
 
-    let class = format!(
-        "SQL${}",
-        gen::bump(file, page_size, gen::SECURITY_CLASS, 1)?
-    );
-    store_security_class(file, page_size, &class, OWNER)?;
+    let class = next_security_class(file, page_size, ACL_SEQUENCE_OWNER)?;
     sys_insert(
         file,
         page_size,
@@ -3299,7 +3345,7 @@ pub fn create_sequence(
             ("RDB$GENERATOR_INCREMENT", SysVal::I(step)),
         ],
     )?;
-    store_usage_privilege(file, page_size, &want)?;
+    store_privileges(file, page_size, &want, 14, &["G"])?;
 
     // the stored value is initial - step, so the FIRST GEN_ID yields
     // initial (the engine's genIdCache put of `val - step`). A slot that
@@ -3317,28 +3363,83 @@ pub fn create_sequence(
 /// `attachment->getEffectiveUserName()`.
 const OWNER: &str = "SYSDBA";
 
-/// The owner's `USAGE WITH GRANT OPTION` row in `RDB$USER_PRIVILEGES`
-/// for a sequence: privilege 'G' (usaGe), user type 8 (obj_user),
-/// object type 14 (obj_generator).
-fn store_usage_privilege(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<(), String> {
+/// The owner's `WITH GRANT OPTION` rows in `RDB$USER_PRIVILEGES` - one
+/// per privilege letter, user type 8 (obj_user) and the object's own
+/// type: 14 (obj_generator) for a sequence, 0 (obj_relation) for a
+/// table. A sequence's owner gets 'G' (usaGe); a table's owner gets
+/// S/I/U/D/R (select, insert, update, delete, references), the five
+/// rows an engine-created table carries.
+fn store_privileges(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    name: &str,
+    object_type: i64,
+    privileges: &[&str],
+) -> Result<(), String> {
     let rel = crate::resolve_relation(file, page_size, "RDB$USER_PRIVILEGES")
         .ok_or("no RDB$USER_PRIVILEGES relation")?;
-    sys_insert(
-        file,
-        page_size,
-        "RDB$USER_PRIVILEGES",
-        rel,
-        &[
-            ("RDB$USER", SysVal::S(OWNER)),
-            ("RDB$GRANTOR", SysVal::S(OWNER)),
-            ("RDB$PRIVILEGE", SysVal::S("G")),
-            ("RDB$GRANT_OPTION", SysVal::I(1)),
-            ("RDB$RELATION_NAME", SysVal::S(name)),
-            ("RDB$USER_TYPE", SysVal::I(8)),
-            ("RDB$OBJECT_TYPE", SysVal::I(14)),
-            ("RDB$RELATION_SCHEMA_NAME", SysVal::S("PUBLIC")),
-        ],
-    )
+    for p in privileges {
+        sys_insert(
+            file,
+            page_size,
+            "RDB$USER_PRIVILEGES",
+            rel,
+            &[
+                ("RDB$USER", SysVal::S(OWNER)),
+                ("RDB$GRANTOR", SysVal::S(OWNER)),
+                ("RDB$PRIVILEGE", SysVal::S(p)),
+                ("RDB$GRANT_OPTION", SysVal::I(1)),
+                ("RDB$RELATION_NAME", SysVal::S(name)),
+                ("RDB$USER_TYPE", SysVal::I(8)),
+                ("RDB$OBJECT_TYPE", SysVal::I(object_type)),
+                ("RDB$RELATION_SCHEMA_NAME", SysVal::S("PUBLIC")),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// The privileges an engine-created table's owner holds, in the order
+/// the engine stores them: select, insert, update, delete, references.
+const TABLE_OWNER_PRIVILEGES: &[&str] = &["S", "I", "U", "D", "R"];
+
+/// Take the next `SQL$<n>` security class name from generator slot 1
+/// (`RDB$SECURITY_CLASS`) and store its row with the owner's ACL. The
+/// engine draws this name from the counter WITHOUT checking whether it
+/// is free - unlike the generated INTEG_/RDB$ names, which skip what is
+/// taken - and `RDB$SECURITY_CLASSES` has a unique index on the column
+/// (RDB$INDEX_7). A writer that invented a name here without advancing
+/// the counter would hand the engine a duplicate-key error on its next
+/// DDL.
+fn next_security_class(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    privileges: &[u8],
+) -> Result<String, String> {
+    let class = format!(
+        "SQL${}",
+        gen::bump(file, page_size, gen::SECURITY_CLASS, 1)?
+    );
+    store_security_class(file, page_size, &class, OWNER, privileges)?;
+    Ok(class)
+}
+
+/// The same for a relation's `RDB$DEFAULT_CLASS`, whose `SQL$DEFAULT<n>`
+/// names come from their own counter - generator slot 2, the system
+/// generator actually named `SQL$DEFAULT`. It carries the same ACL as
+/// the relation's own class.
+fn next_default_class(file: &mut Vec<u8>, page_size: usize) -> Result<String, String> {
+    let id = generator_id_by_name(file, page_size, "SQL$DEFAULT")
+        .ok_or("no SQL$DEFAULT generator")?;
+    let class = format!("SQL$DEFAULT{}", gen::bump(file, page_size, id, 1)?);
+    store_security_class(file, page_size, &class, OWNER, ACL_TABLE_OWNER)?;
+    Ok(class)
+}
+
+/// A system generator's id by name - the counters the DDL draws names
+/// from live in `RDB$GENERATORS` like any other.
+fn generator_id_by_name(file: &[u8], page_size: usize, name: &str) -> Option<i64> {
+    find_generator(file, page_size, name).map(|(id, _, _)| id)
 }
 
 /// `DROP SEQUENCE|GENERATOR <name>` - `DropSequenceNode::execute`
