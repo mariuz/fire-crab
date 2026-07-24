@@ -2964,6 +2964,37 @@ and of a missing one on both, and finishes with a `gbak` round trip and `gfix`.
 Teeth: writing the storage length in `RDB$FIELD_LENGTH` `DIFF`s the row
 comparison the moment it is checked against the engine.
 
+### The seventy-fifth differential — the field length, everywhere it was wrong
+
+The previous differential fixed `RDB$FIELD_LENGTH` on the domain path and left a
+note: the same off-by-the-count-word sits in `CREATE TABLE`. This one closes it.
+The storage length — a `VARCHAR(20)`'s 22, character count plus the two-byte
+count word — belongs in exactly one place, the format descriptor that governs
+how the record is packed. fire-crab had also been putting it in three catalog
+places it does not belong: the `RDB$FIELDS.RDB$FIELD_LENGTH` a `CREATE TABLE` and
+an `ALTER TABLE ADD` write, and the `RSR_field_length` tag inside the
+`RDB$RUNTIME` summary both of them (and every other `ALTER`, through the shared
+runtime rebuild) emit. All three should carry the byte length, 20; all three now
+do, sharing the domain path's `catalog_field_length`.
+
+What makes the fix worth a gate of its own is that fixing the field length makes
+fire-crab's `RDB$RUNTIME` blob *byte-identical* to the engine's — the field
+length was the last divergence in it. That is a stronger statement than any
+single-column check: the whole runtime summary, every tag for every field, now
+matches. The reason it had gone unnoticed is that the existing `CREATE TABLE`
+gate is a *the-engine-reads-what-fire-crab-wrote* gate — the engine attaches,
+selects, inserts, backs up, restores — and the engine tolerates the storage
+length in `RDB$FIELD_LENGTH` perfectly well. Only a gate that compares the two
+side by side sees it.
+
+`qa/serve-real-fieldlen.sh` (5 checks) has fire-crab and the engine each create
+the same table — `INTEGER`, `VARCHAR(20)`, `CHAR(5)`, `NUMERIC(9,2)`, `BIGINT`,
+`VARCHAR(1)` — on two copies of a database, compares every column's
+`RDB$FIELD_LENGTH` (the `VARCHAR` and `CHAR` are the char count, not the storage
+length), compares the `RDB$RUNTIME` blob *byte for byte*, and runs `gfix`. Teeth:
+the storage length in either place `DIFF`s the field-length comparison and the
+byte-for-byte runtime comparison at once.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -3444,6 +3475,18 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-domain.sh 3050
+
+# RDB$FIELD_LENGTH (the byte length): CREATE TABLE / ALTER TABLE ADD and
+# the RDB$RUNTIME summary must carry a field's declared byte length (20 for
+# VARCHAR(20)), not the +2 storage length the format descriptor carries.
+# Fixing it makes fire-crab's RDB$RUNTIME blob byte-identical to the
+# engine's. fire-crab and the engine build the same table on two copies and
+# the field lengths and the runtime blob are compared. Builds its own
+# scratch databases.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix \
+    bash /path/to/fire-crab/qa/serve-real-fieldlen.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
