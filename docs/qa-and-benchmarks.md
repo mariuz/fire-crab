@@ -3125,6 +3125,33 @@ and `gfix`. Teeth: omit the `RSR_default_value` runtime entry and the catalog
 still carries the default while an inserted row comes out NULL. `DEFAULT NULL`,
 expression defaults and `CURRENT_*` stay out of scope (each is different BLR).
 
+### The eightieth differential — a default that survives ALTER
+
+The previous differential put a column's default BLR into the relation's
+`RDB$RUNTIME` so the engine applies it. But `ALTER TABLE ADD` rebuilds that
+runtime from scratch — the engine's DSQL layer resolves every column through it,
+so an added column has to appear there — and the first version of that rebuild
+listed each field's id, name, source, length, position and not-null flag, and
+stopped. It never re-emitted the `RSR_default_value` entry, so adding any column
+to a table quietly stripped every existing column's default: the catalog kept
+`RDB$DEFAULT_VALUE`, but the runtime the engine reads no longer named it, and an
+insert came out NULL. A feature that worked at `CREATE` decayed at the next
+`ALTER`.
+
+The fix is to have the rebuild read each field's `RDB$DEFAULT_VALUE` blob back
+and fold it into the runtime entry exactly where `CREATE` puts it — a small use
+of the blob reader, and a reminder that anything the runtime carries has to be
+regenerated every time the runtime is, not just written once.
+
+`qa/serve-real-alterdefault.sh` (6 checks) has fire-crab and the engine each
+create a table with two integer defaults and then `ALTER TABLE ADD` a column, on
+two copies. It compares the rebuilt `RDB$RUNTIME` blob byte for byte (the default
+entries survive), confirms the runtime still carries them, inserts a row that
+omits the defaulted columns and confirms each still takes its default after the
+`ALTER`, and runs `gfix`. Teeth: a rebuild that forgets `RSR_default_value`
+matches on every other field attribute while the post-`ALTER` insert comes out
+NULL.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -3663,6 +3690,17 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-default.sh 3050
+
+# a DEFAULT survives an ALTER: ALTER TABLE ADD rebuilds RDB$RUNTIME, which
+# must re-emit each column's RSR_default_value (read back from
+# RDB$DEFAULT_VALUE) or the ALTER strips every existing column's default and
+# an insert comes out NULL. The runtime is compared byte for byte after the
+# ALTER and the default confirmed still applied. Builds its own scratch
+# databases.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix \
+    bash /path/to/fire-crab/qa/serve-real-alterdefault.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
