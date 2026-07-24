@@ -853,6 +853,17 @@ pub fn create_domain(file: &mut Vec<u8>, page_size: usize, col: &ColumnDef) -> R
     if col.not_null {
         vals.push(("RDB$NULL_FLAG", SysVal::I(1)));
     }
+    // a domain DEFAULT lives on the domain's own RDB$FIELDS row (the source
+    // text, subtype 1 charset 4 like a description, and the value BLR,
+    // subtype 2) - the same two blobs a table column's default gets, but on
+    // RDB$FIELDS (2) rather than RDB$RELATION_FIELDS (5). A column that then
+    // uses the domain without its own default inherits this at insert time.
+    if let Some(def) = &col.default {
+        let src = dml::insert_blob_cs(file, page_size, 2, &[def.source.as_bytes().to_vec()], 1, 4)?;
+        let val = dml::insert_blob(file, page_size, 2, &[def.value_blr.clone()], 2)?;
+        vals.push(("RDB$DEFAULT_SOURCE", SysVal::B(blob_id_bytes(2, src))));
+        vals.push(("RDB$DEFAULT_VALUE", SysVal::B(blob_id_bytes(2, val))));
+    }
     sys_insert(file, page_size, "RDB$FIELDS", 2, &vals)?;
     advance_oldest_transactions(file, page_size)
 }

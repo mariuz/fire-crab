@@ -3236,6 +3236,36 @@ integer default is applied, and runs a `gbak` round trip plus `gfix`. Teeth: the
 value-blob and runtime comparisons distinguish `DEFAULT NULL` from no default,
 which the insert result alone cannot.
 
+### The eighty-fourth differential — a default on the domain itself
+
+A `DEFAULT` can sit on a domain rather than a column, and then every column of
+that domain inherits it. The catalog side is the default machinery once more,
+one relation over: the two blobs — `RDB$DEFAULT_SOURCE` (the text, charset 4)
+and `RDB$DEFAULT_VALUE` (the literal BLR, `blr_long` / `blr_text2` / `blr_null`
+exactly as a column default) — go on the domain's own `RDB$FIELDS` row instead
+of a column's `RDB$RELATION_FIELDS` row. Since `CREATE DOMAIN` already parsed its
+type through the same path a column does, it already carried the parsed default;
+the whole change is `create_domain` writing those two blobs.
+
+Proving it *works* needs a turn of the tables. fire-crab does not yet declare a
+table column with a user domain type — every column it creates gets an
+auto-domain — so it cannot itself insert through the domain. But the engine can,
+on fire-crab's own file: a `CREATE TABLE ... (X DOM_I)` run by `isql` against the
+database fire-crab wrote, then an `INSERT` that omits `X`, takes the domain's
+default. The engine reads fire-crab's domain default and resolves it into a real
+row — a stronger statement than any byte compare, because it exercises the value
+the way the engine will in production.
+
+`qa/serve-real-domaindefault.sh` (15 checks) has fire-crab and the engine create
+four domains — integer, string, `DEFAULT NULL`, and one with no default — on two
+copies, compares every `RDB$DEFAULT_SOURCE`, compares each `RDB$DEFAULT_VALUE`
+BLR byte for byte and one source blob byte for byte, confirms the no-default
+domain has no value blob, has the engine create a table using fire-crab's domain
+and inherit the default on an omitted column, and runs a `gbak` round trip plus
+`gfix`. Teeth: the byte compares and the inheritance check are independent — one
+catches a wrong blob, the other a blob that is right on disk but the engine will
+not apply.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
