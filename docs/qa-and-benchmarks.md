@@ -3212,6 +3212,30 @@ go NULL on both, refuses an unknown domain on both, and runs a `gbak` round trip
 plus `gfix`. Teeth: the byte-for-byte blob compare and the charset check make the
 text comparison non-vacuous.
 
+### The eighty-third differential — DEFAULT NULL, which is not no default
+
+A column declared `DEFAULT NULL` and a column with no default clause behave
+identically on insert — both land NULL — but they are not the same catalog
+state. The engine records the intent: `DEFAULT NULL` writes the source text
+`DEFAULT NULL`, a `RDB$DEFAULT_VALUE` BLR of `blr_version5, blr_null, blr_eoc`
+(bytes `5 45 76`), and — the runtime lesson once more — an `RSR_default_value`
+entry in the relation's `RDB$RUNTIME` carrying that same BLR (`6 5 45 76`). A
+column with no default has none of the three. The previous default work parsed
+integer and string literals and fell back to "no default" for anything else,
+`NULL` included; this restores the distinction with one more BLR emitter and one
+parser branch (`NULL` before the integer parse).
+
+`qa/serve-real-defaultnull.sh` (13 checks) has fire-crab and the engine create a
+table with a `DEFAULT NULL` column, an integer-default column and a no-default
+column on two copies, compares every `RDB$DEFAULT_SOURCE`, compares the
+`DEFAULT NULL` value BLR byte for byte (and confirms the no-default column has no
+value blob at all), compares the rebuilt `RDB$RUNTIME` byte for byte (the null
+entry present, the no-default column absent), inserts a row omitting the columns
+and confirms the `DEFAULT NULL` and no-default columns land NULL while the
+integer default is applied, and runs a `gbak` round trip plus `gfix`. Teeth: the
+value-blob and runtime comparisons distinguish `DEFAULT NULL` from no default,
+which the insert result alone cannot.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest

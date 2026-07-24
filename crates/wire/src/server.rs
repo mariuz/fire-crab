@@ -1355,6 +1355,8 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
         };
         let value_blr = if lit.starts_with('\'') {
             fire_crab_ods::ddl::str_default_blr(&parse_string_literal(lit)?)
+        } else if lit.eq_ignore_ascii_case("NULL") {
+            fire_crab_ods::ddl::null_default_blr()
         } else {
             fire_crab_ods::ddl::int_default_blr(lit.parse::<i32>().ok()?)
         };
@@ -10878,6 +10880,11 @@ mod tests {
             v.push(76);
             v
         });
+        // DEFAULT NULL - stored explicitly (blr_version5, blr_null, blr_eoc),
+        // distinct from a column with no default at all
+        let d = parse_column_def("A INTEGER DEFAULT NULL").unwrap().0.default.unwrap();
+        assert_eq!(d.source, "DEFAULT NULL");
+        assert_eq!(d.value_blr, vec![5, 45, 76]);
         // a column with no default
         assert!(parse_column_def("D INTEGER").unwrap().0.default.is_none());
     }

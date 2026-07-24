@@ -108,6 +108,14 @@ pub fn str_default_blr(text: &str) -> Vec<u8> {
     b
 }
 
+/// The BLR of a `DEFAULT NULL` - `blr_version5, blr_null, blr_eoc`. The
+/// engine stores this explicitly (source `DEFAULT NULL`), distinct from a
+/// column with no default at all (which has neither source nor value); the
+/// applied result is the same NULL, but the catalog records the intent.
+pub fn null_default_blr() -> Vec<u8> {
+    vec![5u8, 45, 76] // version5, blr_null, blr_eoc
+}
+
 /// One table-level key constraint of a CREATE TABLE: a `PRIMARY KEY` or
 /// a `UNIQUE`, named or not. Both are backed by a unique index; the
 /// engine names that index after the constraint when the constraint is
