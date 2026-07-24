@@ -749,6 +749,15 @@ enum Plan {
         grant_option: bool,
         revoke: bool,
     },
+    /// `GRANT|REVOKE <role> TO|FROM <grantees> [WITH ADMIN OPTION]`: role
+    /// membership (RDB$USER_PRIVILEGES M rows) and a recompute of the
+    /// role's ACL
+    GrantRole {
+        role: String,
+        grantees: Vec<String>,
+        admin_option: bool,
+        revoke: bool,
+    },
     /// `ALTER TABLE <table> ADD <column>`: a new format version, the new
     /// column's catalog rows, and a version rewrite of the RDB$RELATIONS
     /// row bumping its format and field count
@@ -2034,6 +2043,55 @@ fn plan_grant(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     ))
 }
 
+/// Parse `GRANT <role> TO <grantees> [WITH ADMIN OPTION]` / `REVOKE <role>
+/// FROM <grantees>` - role membership, the no-`ON` form. A privilege grant
+/// (which has `ON`) is left to [plan_grant]; a multi-word or multi-role
+/// name falls back.
+fn plan_grant_role(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let revoke = if find_word(&up, "GRANT", 0) == Some(0) {
+        false
+    } else if find_word(&up, "REVOKE", 0) == Some(0) {
+        true
+    } else {
+        return None;
+    };
+    let verb_len = if revoke { "REVOKE".len() } else { "GRANT".len() };
+    let sep_kw = if revoke { "FROM" } else { "TO" };
+    let sep = find_word(&up, sep_kw, verb_len)?;
+    // an ON before the separator means this is a privilege grant, not a role
+    if let Some(on) = find_word(&up, "ON", verb_len) {
+        if on < sep {
+            return None;
+        }
+    }
+    let role = unquote_ident(s[verb_len..sep].trim())?;
+    if role.contains(char::is_whitespace) {
+        return None; // a multi-word or multi-role list this writer does not model
+    }
+    let mut tail_end = s.len();
+    let mut admin_option = false;
+    if !revoke {
+        if let Some(w) = find_word(&up, "WITH", sep) {
+            let a = find_word(&up, "ADMIN", w + "WITH".len())?;
+            find_word(&up, "OPTION", a + "ADMIN".len())?;
+            admin_option = true;
+            tail_end = w;
+        }
+    }
+    let grantees = parse_grantee_list(s[sep + sep_kw.len()..tail_end].trim())?;
+    Some((
+        Plan::GrantRole {
+            role,
+            grantees,
+            admin_option,
+            revoke,
+        },
+        Vec::new(),
+    ))
+}
+
 /// The byte offset of the first non-space character at or after `from`.
 fn first_word_at(s: &str, from: usize) -> Option<usize> {
     s[from..].find(|c: char| !c.is_whitespace()).map(|i| from + i)
@@ -3167,6 +3225,22 @@ fn execute_dml(
                 privileges,
                 fields,
                 *grant_option,
+                *revoke,
+            )?;
+            (0, 0, 0)
+        }
+        Plan::GrantRole {
+            role,
+            grantees,
+            admin_option,
+            revoke,
+        } => {
+            fire_crab_ods::ddl::grant_role(
+                &mut work,
+                db.page_size,
+                role,
+                grantees,
+                *admin_option,
                 *revoke,
             )?;
             (0, 0, 0)
@@ -4668,6 +4742,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         | Plan::SetStatistics { .. }
         | Plan::Comment { .. }
         | Plan::Grant { .. }
+        | Plan::GrantRole { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -4706,6 +4781,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::SetStatistics { .. }
         | Plan::Comment { .. }
         | Plan::Grant { .. }
+        | Plan::GrantRole { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -5031,6 +5107,7 @@ fn emit_rows_inner(
         | Plan::SetStatistics { .. }
         | Plan::Comment { .. }
         | Plan::Grant { .. }
+        | Plan::GrantRole { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -7451,6 +7528,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     if ddl_kw {
                         plan_comment(&text)
                             .or_else(|| plan_grant(&text))
+                            .or_else(|| plan_grant_role(&text))
                             .or_else(|| plan_create_table(&text))
                             .or_else(|| plan_create_index(&text))
                             .or_else(|| plan_drop_table(&text))
@@ -7600,6 +7678,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     // the verb is one this server does not implement
                     let planned = plan_comment(&stmt_sql)
                         .or_else(|| plan_grant(&stmt_sql))
+                        .or_else(|| plan_grant_role(&stmt_sql))
                         .or_else(|| plan_create_table(&stmt_sql))
                         .or_else(|| plan_create_index(&stmt_sql))
                         .or_else(|| plan_drop_table(&stmt_sql))
@@ -7725,6 +7804,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::SetStatistics { .. }
                         | Plan::Comment { .. }
                         | Plan::Grant { .. }
+                        | Plan::GrantRole { .. }
                         | Plan::AlterTableAdd { .. }
                         | Plan::AlterTableAddFk { .. }
                         | Plan::AlterTableAddKey { .. }
@@ -10780,6 +10860,38 @@ mod tests {
         assert!(plan_grant("GRANT MYROLE TO BOB").is_none()); // no ON - a role grant
         assert!(plan_grant("GRANT SELECT (A) ON T TO BOB").is_none()); // column-level
         assert!(plan_grant("CREATE TABLE T (A INT)").is_none());
+    }
+
+    #[test]
+    fn parses_grant_role() {
+        match plan_grant_role("GRANT MANAGER TO BOB") {
+            Some((Plan::GrantRole { role, grantees, admin_option, revoke }, _)) => {
+                assert_eq!(role, "MANAGER");
+                assert_eq!(grantees, vec!["BOB".to_string()]);
+                assert!(!admin_option);
+                assert!(!revoke);
+            }
+            other => panic!("expected GrantRole, got {:?}", other.is_some()),
+        }
+        // WITH ADMIN OPTION, two grantees
+        match plan_grant_role("grant manager to alice, bob with admin option") {
+            Some((Plan::GrantRole { grantees, admin_option, .. }, _)) => {
+                assert_eq!(grantees, vec!["alice".to_string(), "bob".to_string()]);
+                assert!(admin_option);
+            }
+            other => panic!("expected GrantRole admin, got {:?}", other.is_some()),
+        }
+        // REVOKE
+        match plan_grant_role("REVOKE MANAGER FROM BOB") {
+            Some((Plan::GrantRole { role, revoke, .. }, _)) => {
+                assert_eq!(role, "MANAGER");
+                assert!(revoke);
+            }
+            other => panic!("expected GrantRole revoke, got {:?}", other.is_some()),
+        }
+        // a privilege grant (has ON) is NOT a role grant, nor a multi-word name
+        assert!(plan_grant_role("GRANT SELECT ON T TO BOB").is_none());
+        assert!(plan_grant_role("GRANT MANAGER, CLERK TO BOB").is_none());
     }
 
     #[test]

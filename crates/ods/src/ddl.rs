@@ -4263,6 +4263,175 @@ pub fn grant_table(
     advance_oldest_transactions(file, page_size)
 }
 
+/// A role's `(RDB$OWNER_NAME, RDB$SECURITY_CLASS)` from `RDB$ROLES`.
+fn role_owner_class(file: &[u8], page_size: usize, role: &str) -> Option<(String, String)> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$ROLES")?;
+    let formats = system_relation_formats(file, page_size, "RDB$ROLES")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$ROLES");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (name_f, own_f, sc_f) = (
+        fid("RDB$ROLE_NAME")?,
+        fid("RDB$OWNER_NAME")?,
+        fid("RDB$SECURITY_CLASS")?,
+    );
+    let mut out = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if out.is_none() && text_eq(v.get(name_f), role) {
+            let own = match v.get(own_f) {
+                Some(Value::Text(t)) => t.trim_end().to_string(),
+                _ => OWNER.to_string(),
+            };
+            let sc = match v.get(sc_f) {
+                Some(Value::Text(t)) => t.trim_end().to_string(),
+                _ => return,
+            };
+            out = Some((own, sc));
+        }
+    });
+    out
+}
+
+/// Whether a user already holds membership of a role (an `M` /
+/// object-type-13 row in `RDB$USER_PRIVILEGES`).
+fn role_member_present(file: &[u8], page_size: usize, role: &str, grantee: &str) -> bool {
+    let (Some(rel), Some(formats)) = (
+        crate::resolve_relation(file, page_size, "RDB$USER_PRIVILEGES"),
+        system_relation_formats(file, page_size, "RDB$USER_PRIVILEGES"),
+    ) else {
+        return false;
+    };
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else {
+        return false;
+    };
+    let cols = relation_columns(file, page_size, "RDB$USER_PRIVILEGES");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(u_f), Some(rn_f), Some(p_f), Some(ot_f)) = (
+        fid("RDB$USER"),
+        fid("RDB$RELATION_NAME"),
+        fid("RDB$PRIVILEGE"),
+        fid("RDB$OBJECT_TYPE"),
+    ) else {
+        return false;
+    };
+    let mut present = false;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if text_eq(v.get(rn_f), role)
+            && text_eq(v.get(u_f), grantee)
+            && text_eq(v.get(p_f), "M")
+            && int_eq(v.get(ot_f), 13)
+        {
+            present = true;
+        }
+    });
+    present
+}
+
+/// Recompute a role's own security-class ACL: the owner (alter, control,
+/// drop), then each member holding the role `WITH ADMIN OPTION`
+/// (grant_option = 2) alphabetically, with the `drop` privilege the engine
+/// gives an admin member (grant.epp maps a role membership to `"O"` =
+/// drop). A member without the admin option is not in the ACL.
+fn recompute_role_acl(file: &mut Vec<u8>, page_size: usize, role: &str) -> Result<(), String> {
+    use std::collections::BTreeSet;
+    let (owner, class) = role_owner_class(file, page_size, role)
+        .ok_or_else(|| format!("role {} has no security class", role))?;
+    let mut admins: BTreeSet<String> = BTreeSet::new();
+    if let (Some(rel), Some(formats)) = (
+        crate::resolve_relation(file, page_size, "RDB$USER_PRIVILEGES"),
+        system_relation_formats(file, page_size, "RDB$USER_PRIVILEGES"),
+    ) {
+        if let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) {
+            let cols = relation_columns(file, page_size, "RDB$USER_PRIVILEGES");
+            let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+            if let (Some(u_f), Some(rn_f), Some(p_f), Some(ot_f), Some(go_f)) = (
+                fid("RDB$USER"),
+                fid("RDB$RELATION_NAME"),
+                fid("RDB$PRIVILEGE"),
+                fid("RDB$OBJECT_TYPE"),
+                fid("RDB$GRANT_OPTION"),
+            ) {
+                walk_rows(file, page_size, rel, descs, |v| {
+                    if text_eq(v.get(rn_f), role)
+                        && text_eq(v.get(p_f), "M")
+                        && int_eq(v.get(ot_f), 13)
+                        && int_eq(v.get(go_f), 2)
+                    {
+                        if let Some(Value::Text(t)) = v.get(u_f) {
+                            let u = t.trim_end().to_string();
+                            if !u.eq_ignore_ascii_case(&owner) {
+                                admins.insert(u);
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+    let mut acl: AclList = vec![(Some(owner), SCL_ALTER | SCL_CONTROL | SCL_DROP)];
+    for user in &admins {
+        acl.push((Some(user.clone()), SCL_DROP));
+    }
+    write_class_acl(file, page_size, &class, &acl_serialize(&acl))
+}
+
+/// `GRANT <role> TO <grantees> [WITH ADMIN OPTION]` and its `REVOKE ...
+/// FROM` inverse - role membership, `GrantRevokeNode` for `obj_sql_role`.
+/// A membership is a `RDB$USER_PRIVILEGES` row: privilege `M`, object type
+/// 13 (`obj_sql_role`), the role in `RDB$RELATION_NAME`, no schema, and
+/// `RDB$GRANT_OPTION` = 2 for `WITH ADMIN OPTION` (not 1). Granting a role
+/// recomputes the role's ACL - every admin-option member gets a `drop`
+/// ACE. Unlike a table grant, the role must exist.
+pub fn grant_role(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    role: &str,
+    grantees: &[String],
+    admin_option: bool,
+    revoke: bool,
+) -> Result<(), String> {
+    let role = role.trim().trim_matches('"').to_ascii_uppercase();
+    if find_role(file, page_size, &role).is_none() {
+        return Err(format!("SQL role \"{}\" does not exist", role));
+    }
+    let upriv = crate::resolve_relation(file, page_size, "RDB$USER_PRIVILEGES")
+        .ok_or("no RDB$USER_PRIVILEGES relation")?;
+    for grantee in grantees {
+        let grantee = grantee.trim().trim_matches('"').to_ascii_uppercase();
+        if revoke {
+            let (g, r) = (grantee.clone(), role.clone());
+            let rn_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$RELATION_NAME")?;
+            let u_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$USER")?;
+            let p_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$PRIVILEGE")?;
+            let ot_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$OBJECT_TYPE")?;
+            delete_catalog_rows(file, page_size, "RDB$USER_PRIVILEGES", move |v| {
+                text_eq(v.get(rn_f), &r)
+                    && text_eq(v.get(u_f), &g)
+                    && text_eq(v.get(p_f), "M")
+                    && int_eq(v.get(ot_f), 13)
+            })?;
+        } else if !role_member_present(file, page_size, &role, &grantee) {
+            sys_insert(
+                file,
+                page_size,
+                "RDB$USER_PRIVILEGES",
+                upriv,
+                &[
+                    ("RDB$USER", SysVal::S(&grantee)),
+                    ("RDB$GRANTOR", SysVal::S(OWNER)),
+                    ("RDB$PRIVILEGE", SysVal::S("M")),
+                    ("RDB$GRANT_OPTION", SysVal::I(if admin_option { 2 } else { 0 })),
+                    ("RDB$RELATION_NAME", SysVal::S(&role)),
+                    ("RDB$USER_TYPE", SysVal::I(8)),
+                    ("RDB$OBJECT_TYPE", SysVal::I(13)),
+                ],
+            )?;
+        }
+    }
+    recompute_role_acl(file, page_size, &role)?;
+    advance_oldest_transactions(file, page_size)
+}
+
 /// Take the next `SQL$<n>` security class name from generator slot 1
 /// (`RDB$SECURITY_CLASS`) and store its row with the owner's ACL. The
 /// engine draws this name from the counter WITHOUT checking whether it
