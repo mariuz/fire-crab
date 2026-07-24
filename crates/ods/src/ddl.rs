@@ -1718,6 +1718,10 @@ pub enum CommentTarget {
     Index(String),
     /// `COMMENT ON SEQUENCE|GENERATOR <name>` - the `RDB$GENERATORS` row
     Sequence(String),
+    /// `COMMENT ON EXCEPTION <name>` - the `RDB$EXCEPTIONS` row
+    Exception(String),
+    /// `COMMENT ON ROLE <name>` - the `RDB$ROLES` row
+    Role(String),
 }
 
 /// A `RDB$DESCRIPTION` cell value from comment text: a text blob written
@@ -1830,6 +1834,34 @@ pub fn comment_on(
             let name_fid = sys_fid(file, page_size, "RDB$GENERATORS", "RDB$GENERATOR_NAME")?;
             let nm = name.clone();
             patch_sys_row(file, page_size, "RDB$GENERATORS", grel,
+                move |v| text_eq(v.get(name_fid), &nm),
+                &[("RDB$DESCRIPTION", value)])?;
+        }
+        CommentTarget::Exception(name) => {
+            let name = name.trim().trim_matches('"').to_ascii_uppercase();
+            if find_exception(file, page_size, &name).is_none() {
+                return Err(format!("Exception {} not found", name));
+            }
+            let erel = crate::resolve_relation(file, page_size, "RDB$EXCEPTIONS")
+                .ok_or("RDB$EXCEPTIONS not found")?;
+            let value = description_blob(file, page_size, erel, text)?;
+            let name_fid = sys_fid(file, page_size, "RDB$EXCEPTIONS", "RDB$EXCEPTION_NAME")?;
+            let nm = name.clone();
+            patch_sys_row(file, page_size, "RDB$EXCEPTIONS", erel,
+                move |v| text_eq(v.get(name_fid), &nm),
+                &[("RDB$DESCRIPTION", value)])?;
+        }
+        CommentTarget::Role(name) => {
+            let name = name.trim().trim_matches('"').to_ascii_uppercase();
+            if find_role(file, page_size, &name).is_none() {
+                return Err(format!("Role {} not found", name));
+            }
+            let rrel = crate::resolve_relation(file, page_size, "RDB$ROLES")
+                .ok_or("RDB$ROLES not found")?;
+            let value = description_blob(file, page_size, rrel, text)?;
+            let name_fid = sys_fid(file, page_size, "RDB$ROLES", "RDB$ROLE_NAME")?;
+            let nm = name.clone();
+            patch_sys_row(file, page_size, "RDB$ROLES", rrel,
                 move |v| text_eq(v.get(name_fid), &nm),
                 &[("RDB$DESCRIPTION", value)])?;
         }

@@ -1856,7 +1856,7 @@ fn plan_comment(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     // the object kind - the first word after ON. TABLE / COLUMN /
     // INDEX / SEQUENCE / GENERATOR (the last two synonyms)
     let first = first_word_at(&masked, kind_start)?;
-    let kind = ["TABLE", "COLUMN", "INDEX", "SEQUENCE", "GENERATOR"]
+    let kind = ["TABLE", "COLUMN", "INDEX", "SEQUENCE", "GENERATOR", "EXCEPTION", "ROLE"]
         .into_iter()
         .find(|k| find_word(&masked, k, kind_start) == Some(first))?;
     let after_kind = kind_start + masked[kind_start..].find(kind)? + kind.len();
@@ -1884,6 +1884,14 @@ fn plan_comment(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         "SEQUENCE" | "GENERATOR" => {
             let name = unquote_ident(target_str)?;
             fire_crab_ods::ddl::CommentTarget::Sequence(name)
+        }
+        "EXCEPTION" => {
+            let name = unquote_ident(target_str)?;
+            fire_crab_ods::ddl::CommentTarget::Exception(name)
+        }
+        "ROLE" => {
+            let name = unquote_ident(target_str)?;
+            fire_crab_ods::ddl::CommentTarget::Role(name)
         }
         _ => {
             // <table>.<column> - split on the first dot outside quotes
@@ -10657,6 +10665,21 @@ mod tests {
                 assert!(text.is_none());
             }
             other => panic!("expected Comment/Sequence, got {:?}", other.is_some()),
+        }
+        // an exception and a role
+        match plan_comment("COMMENT ON EXCEPTION E_ONE IS 'the exception'") {
+            Some((Plan::Comment { target: CommentTarget::Exception(n), text }, _)) => {
+                assert_eq!(n, "E_ONE");
+                assert_eq!(text.as_deref(), Some("the exception"));
+            }
+            other => panic!("expected Comment/Exception, got {:?}", other.is_some()),
+        }
+        match plan_comment("comment on role manager is null") {
+            Some((Plan::Comment { target: CommentTarget::Role(n), text }, _)) => {
+                assert_eq!(n, "manager");
+                assert!(text.is_none());
+            }
+            other => panic!("expected Comment/Role, got {:?}", other.is_some()),
         }
         // a kind this writer does not implement, and a non-comment
         assert!(plan_comment("COMMENT ON PROCEDURE P IS 'x'").is_none());
