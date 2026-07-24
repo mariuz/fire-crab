@@ -2824,6 +2824,53 @@ exception and an unknown role on both, and finishes with a `gbak` round trip and
 `gfix`. Teeth: the same charset trap as the sixty-fifth, on the two new
 relations.
 
+### The seventy-first differential — per-column GRANT, and the engine's ACL compiler
+
+The sixty-seventh differential granted privileges on a whole table and matched
+the recomputed ACL byte for byte. But a grant can name columns —
+`GRANT UPDATE (A, B) ON T TO BOB` — and that turned out to be a much deeper
+thing than the table case. A column grant writes a `RDB$USER_PRIVILEGES` row per
+column (with `RDB$FIELD_NAME` set) and gives each granted column *its own*
+`SQL$GRANT<n>` security class, but it also rewrites the *relation's* ACL to fold
+the field grantees in — and the order it folds them in is not one that can be
+read off the final rows by any simple rule. A grantee named on two columns lands
+in the relation ACL after their *last* column, out of alphabetical order.
+
+The sixty-seventh differential deferred this precisely because that order looked
+non-deterministic. It is not; it is an artifact of *how* the engine walks the
+rows, and the only way to reproduce it byte for byte is to reproduce the walk.
+So this increment ports the engine's ACL compiler — `GRANT_privileges`,
+`get_user_privs` and `save_field_privileges` from `grant.epp`, with
+`squeeze_acl`, `grant_user` and the `p_names` privilege order from `scl.epp` —
+as a faithful simulation over the committed privilege rows. The relation ACL is
+built owner-first, then the relation-level grantees alphabetically (each unioned
+with `PUBLIC`), then the field grantees folded in with a *squeeze-and-reappend*:
+each time a grantee is flushed at a column boundary their existing ACE is
+removed and a fresh one appended at the end, so a grantee on several columns
+ends up positioned by their last one. Each column's own class is the relation's
+base ACL plus that column's grantees; and when field grants introduce a grantee
+the relation did not already have, the relation's *default* class
+(`RDB$DEFAULT_CLASS`, which columns without their own class inherit) is rebuilt
+*without* the field grantees — the engine's `restrct` step. This unified compiler
+replaces the sixty-seventh's simpler table-only recompute, which the table-grant
+gate confirms still passes.
+
+`qa/serve-real-colgrant.sh` (20 checks) runs a sequence chosen to exercise the
+hard parts — a relation grant (`ZARA`), a two-column grant that makes one
+grantee span columns (`BOB` on A and B, the reorder trigger), two more column
+grantees, a `PUBLIC` grant (the union), and a `REVOKE` that empties one column —
+through fire-crab and the engine on two copies of a database. It compares the
+`RDB$USER_PRIVILEGES` rows and every column's `RDB$SECURITY_CLASS`, compares the
+relation ACL, the default class ACL and the granted column's class ACL *byte for
+byte*, confirms the emptied column's `SQL$GRANT<n>` class was dropped and its
+column class cleared to NULL, checks the relation ACL is genuinely out of
+alphabetical order (the relation grantee precedes the field grantees), refuses a
+grant on a missing column on both, has the engine *continue* with one more
+column grant that lands identically, and finishes with a `gbak` round trip and
+`gfix`. Teeth: any deviation in the fold order — the reappend, the
+relation-before-field placement, the `PUBLIC` union — leaves the privilege rows
+matching while the byte-for-byte ACL checks `DIFF`.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -3260,6 +3307,18 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-comment3.sh 3050
+
+# per-column GRANT / REVOKE: GRANT UPDATE|REFERENCES (<cols>) writes a
+# RDB$USER_PRIVILEGES row per column and a SQL$GRANT<n> class per column,
+# and folds the field grantees into the relation ACL with the engine's
+# own squeeze-and-reappend order (a grantee on two columns lands after
+# their last one). A faithful port of grant.epp's GRANT_privileges; the
+# relation, default and column-class ACLs are compared byte for byte.
+# gbak and gfix. Builds its own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-colgrant.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
