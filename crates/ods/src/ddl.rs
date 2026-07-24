@@ -1702,11 +1702,36 @@ pub enum CommentTarget {
     Table(String),
     /// `COMMENT ON COLUMN <table>.<column>` - the `RDB$RELATION_FIELDS` row
     Column(String, String),
+    /// `COMMENT ON INDEX <name>` - the `RDB$INDICES` row
+    Index(String),
+    /// `COMMENT ON SEQUENCE|GENERATOR <name>` - the `RDB$GENERATORS` row
+    Sequence(String),
 }
 
-/// `COMMENT ON TABLE <t> IS <text>` / `COMMENT ON COLUMN <t>.<c> IS
-/// <text>` - `CommentOnNode` against the file image. The comment is a
-/// text blob written into the owning relation's data pages and its id
+/// A `RDB$DESCRIPTION` cell value from comment text: a text blob written
+/// into `owner_rel`'s own data pages (charset 4, UTF8 - the metadata
+/// charset, not the 1 the binary metadata blobs carry), or NULL when the
+/// comment is being cleared.
+fn description_blob(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    owner_rel: u16,
+    text: Option<&str>,
+) -> Result<SysVal<'static>, String> {
+    match text {
+        Some(t) => {
+            let id = dml::insert_blob_cs(file, page_size, owner_rel, &[t.as_bytes().to_vec()], 1, 4)?;
+            Ok(SysVal::B(blob_id_bytes(owner_rel, id)))
+        }
+        None => Ok(SysVal::Null),
+    }
+}
+
+/// `COMMENT ON <kind> <name> IS <text>` - `CommentOnNode` against the
+/// file image, for a table, a column, an index or a sequence. The comment
+/// is a text blob written into the owning catalog relation's data pages
+/// (`RDB$RELATIONS` for a table, `RDB$RELATION_FIELDS` for a column,
+/// `RDB$INDICES` for an index, `RDB$GENERATORS` for a sequence) and its id
 /// stored in the target row's `RDB$DESCRIPTION`; `IS NULL` (and, the
 /// engine's probe shows, `IS ''`) clears the column to NULL, leaving the
 /// old blob orphaned exactly as the engine does.
@@ -1732,13 +1757,7 @@ pub fn comment_on(
             if rel < 128 {
                 return Err("system relations are read-only".into());
             }
-            let value = match text {
-                Some(t) => {
-                    let id = dml::insert_blob_cs(file, page_size, 6, &[t.as_bytes().to_vec()], 1, 4)?;
-                    SysVal::B(blob_id_bytes(6, id))
-                }
-                None => SysVal::Null,
-            };
+            let value = description_blob(file, page_size, 6, text)?;
             let name_fid = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
             let nm = name.clone();
             patch_sys_row(file, page_size, "RDB$RELATIONS", 6,
@@ -1762,18 +1781,44 @@ pub fn comment_on(
                     column, table
                 ));
             }
-            let value = match text {
-                Some(t) => {
-                    let id = dml::insert_blob_cs(file, page_size, 5, &[t.as_bytes().to_vec()], 1, 4)?;
-                    SysVal::B(blob_id_bytes(5, id))
-                }
-                None => SysVal::Null,
-            };
+            let value = description_blob(file, page_size, 5, text)?;
             let rel_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$RELATION_NAME")?;
             let name_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$FIELD_NAME")?;
             let (t, c) = (table.clone(), column.clone());
             patch_sys_row(file, page_size, "RDB$RELATION_FIELDS", 5,
                 move |v| text_eq(v.get(rel_fid), &t) && text_eq(v.get(name_fid), &c),
+                &[("RDB$DESCRIPTION", value)])?;
+        }
+        CommentTarget::Index(name) => {
+            let name = name.trim().trim_matches('"').to_ascii_uppercase();
+            let (_table, system) = find_index_relation(file, page_size, &name)
+                .ok_or_else(|| format!("index {} not found", name))?;
+            if system != 0 {
+                return Err("system indices are read-only".into());
+            }
+            let irel = crate::resolve_relation(file, page_size, "RDB$INDICES")
+                .ok_or("RDB$INDICES not found")?;
+            let value = description_blob(file, page_size, irel, text)?;
+            let name_fid = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME")?;
+            let nm = name.clone();
+            patch_sys_row(file, page_size, "RDB$INDICES", irel,
+                move |v| text_eq(v.get(name_fid), &nm),
+                &[("RDB$DESCRIPTION", value)])?;
+        }
+        CommentTarget::Sequence(name) => {
+            let name = name.trim().trim_matches('"').to_ascii_uppercase();
+            let (_, system, _) = find_generator(file, page_size, &name)
+                .ok_or_else(|| format!("generator {} not found", name))?;
+            if system != 0 {
+                return Err("system generators are read-only".into());
+            }
+            let grel = crate::resolve_relation(file, page_size, "RDB$GENERATORS")
+                .ok_or("RDB$GENERATORS not found")?;
+            let value = description_blob(file, page_size, grel, text)?;
+            let name_fid = sys_fid(file, page_size, "RDB$GENERATORS", "RDB$GENERATOR_NAME")?;
+            let nm = name.clone();
+            patch_sys_row(file, page_size, "RDB$GENERATORS", grel,
+                move |v| text_eq(v.get(name_fid), &nm),
                 &[("RDB$DESCRIPTION", value)])?;
         }
     }

@@ -1766,15 +1766,12 @@ fn plan_comment(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     }
     let on = find_word(&masked, "ON", "COMMENT".len())?;
     let kind_start = on + "ON".len();
-    // the object kind: TABLE or COLUMN (only these two here)
-    let kind = if find_word(&masked, "TABLE", kind_start) == Some(first_word_at(&masked, kind_start)?)
-    {
-        "TABLE"
-    } else if find_word(&masked, "COLUMN", kind_start) == Some(first_word_at(&masked, kind_start)?) {
-        "COLUMN"
-    } else {
-        return None;
-    };
+    // the object kind - the first word after ON. TABLE / COLUMN /
+    // INDEX / SEQUENCE / GENERATOR (the last two synonyms)
+    let first = first_word_at(&masked, kind_start)?;
+    let kind = ["TABLE", "COLUMN", "INDEX", "SEQUENCE", "GENERATOR"]
+        .into_iter()
+        .find(|k| find_word(&masked, k, kind_start) == Some(first))?;
     let after_kind = kind_start + masked[kind_start..].find(kind)? + kind.len();
     // IS separates the target from the text; find it on the masked copy
     // so an 'IS' inside the string literal cannot shadow it
@@ -1792,6 +1789,14 @@ fn plan_comment(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         "TABLE" => {
             let name = unquote_ident(target_str)?;
             fire_crab_ods::ddl::CommentTarget::Table(name)
+        }
+        "INDEX" => {
+            let name = unquote_ident(target_str)?;
+            fire_crab_ods::ddl::CommentTarget::Index(name)
+        }
+        "SEQUENCE" | "GENERATOR" => {
+            let name = unquote_ident(target_str)?;
+            fire_crab_ods::ddl::CommentTarget::Sequence(name)
         }
         _ => {
             // <table>.<column> - split on the first dot outside quotes
@@ -10380,6 +10385,29 @@ mod tests {
         match plan_comment("COMMENT ON TABLE T IS NULL") {
             Some((Plan::Comment { text, .. }, _)) => assert!(text.is_none()),
             other => panic!("expected Comment, got {:?}", other.is_some()),
+        }
+        // an index
+        match plan_comment("COMMENT ON INDEX IX_T IS 'the index'") {
+            Some((Plan::Comment { target: CommentTarget::Index(n), text }, _)) => {
+                assert_eq!(n, "IX_T");
+                assert_eq!(text.as_deref(), Some("the index"));
+            }
+            other => panic!("expected Comment/Index, got {:?}", other.is_some()),
+        }
+        // a sequence, and its GENERATOR synonym - both map to Sequence
+        match plan_comment("comment on sequence S is 'a counter'") {
+            Some((Plan::Comment { target: CommentTarget::Sequence(n), text }, _)) => {
+                assert_eq!(n, "S");
+                assert_eq!(text.as_deref(), Some("a counter"));
+            }
+            other => panic!("expected Comment/Sequence, got {:?}", other.is_some()),
+        }
+        match plan_comment("COMMENT ON GENERATOR G IS NULL") {
+            Some((Plan::Comment { target: CommentTarget::Sequence(n), text }, _)) => {
+                assert_eq!(n, "G");
+                assert!(text.is_none());
+            }
+            other => panic!("expected Comment/Sequence, got {:?}", other.is_some()),
         }
         // a kind this writer does not implement, and a non-comment
         assert!(plan_comment("COMMENT ON PROCEDURE P IS 'x'").is_none());
