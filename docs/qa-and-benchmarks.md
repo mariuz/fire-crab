@@ -2514,6 +2514,54 @@ deactivated, an unknown name errors, a reactivation over duplicates fails —
 and `gbak` plus `gfix`. Teeth: leaving the irt flags alone on deactivation
 makes 8 checks `DIFF`; not computing the selectivity makes 3.
 
+### The sixty-third differential — the security catalog a table carries
+
+The sequence slice (the sixty-first) noted a gap in passing: it was the first
+fire-crab DDL to write the security catalog, and `CREATE TABLE` still left
+those columns null. This closes it, and the gap turned out to be wider than
+one column.
+
+**Creating a table is five catalog relations, not three.** Beside
+`RDB$RELATIONS`, `RDB$RELATION_FIELDS` and `RDB$FORMATS`, the engine writes
+*two* `RDB$SECURITY_CLASSES` rows — the relation's own class (`SQL$<n>`,
+`RDB$RELATIONS.RDB$SECURITY_CLASS`) and a default class (`SQL$DEFAULT<n>`,
+`RDB$DEFAULT_CLASS`, the one its fields inherit) — each carrying the owner's
+ACL, plus *five* `RDB$USER_PRIVILEGES` rows: the owner's `SELECT`, `INSERT`,
+`UPDATE`, `DELETE` and `REFERENCES`, each `WITH GRANT OPTION`. The ACL is the
+same acl.h encoding the sequence slice decoded, with the table owner's eight
+privileges where the sequence had four: `02 01 03 06 SYSDBA 00 02 06 01 03 07
+09 08 04 0a 00 00`.
+
+**The two class names come from two different counters, and the engine does
+not check them.** `SQL$<n>` is drawn from generator slot 1
+(`RDB$SECURITY_CLASS`); `SQL$DEFAULT<n>` from slot 2, the system generator
+actually *named* `SQL$DEFAULT`. Unlike the generated `INTEG_`/`RDB$<n>` names
+— which the engine's helpers advance *past* whatever is already taken —
+these are taken straight off the counter with no free-name check, and
+`RDB$SECURITY_CLASSES` has a unique index on the column. So the counters are
+the whole correctness story again, exactly as for the sequence's id: a writer
+that invented a name without advancing the counter would hand the engine a
+duplicate-key violation on its next `CREATE TABLE`. The gate proves this the
+same way the sequence gate did — it has the engine *continue* from
+fire-crab's file, and its next table must land on the same two class names.
+
+**`DROP TABLE` is asymmetric, and the engine's asymmetry is reproduced.** The
+relation's own `SQL$<n>` class and all five privilege rows go; the
+`SQL$DEFAULT<n>` row is *left behind* — a probe of an engine `DROP TABLE`
+shows only the `SQL$<n>` row removed. fire-crab leaves the same orphan, and
+the gate asserts it: the dropped table's privileges are gone on both files,
+and there is a default-class row pointing at no relation on both.
+
+`qa/serve-real-security.sh` (20 checks) creates the same tables through
+fire-crab and the engine on two copies of one database, compares the class
+columns of `RDB$RELATIONS`, both `RDB$SECURITY_CLASSES` rows and all the
+`RDB$USER_PRIVILEGES` rows, compares the ACL blob byte for byte and the
+engine's own `SHOW GRANTS` verbatim, drops a table and compares what
+survives, has the engine continue from fire-crab's file, and finishes with
+`gbak` and `gfix`. Teeth: taking a class name without advancing its counter
+makes 6 checks `DIFF` (every later object collides); omitting the security
+catalog entirely makes 7.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -2858,6 +2906,19 @@ NODE_PATH="$PWD/node_modules" \
     FCSTAT=/path/to/fire-crab/target/release/fcstat ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-alterindex.sh 3050
+
+# THE SECURITY CATALOG OF A TABLE: CREATE TABLE writes two
+# RDB$SECURITY_CLASSES rows (the relation's own SQL$<n> class and its
+# SQL$DEFAULT<n> default class, each with the owner's ACL) and five
+# RDB$USER_PRIVILEGES rows (S/I/U/D/R WITH GRANT OPTION); the two class
+# names come from two counters the engine does not re-check, so the gate
+# has the engine CONTINUE from fire-crab's file. DROP TABLE removes the
+# class and privileges but LEAVES the default class. ACL bytes and SHOW
+# GRANTS compared; gbak and gfix. Builds its own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-security.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
