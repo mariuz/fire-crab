@@ -3602,6 +3602,281 @@ fn store_privileges(
 /// the engine stores them: select, insert, update, delete, references.
 const TABLE_OWNER_PRIVILEGES: &[&str] = &["S", "I", "U", "D", "R"];
 
+/// The table DML privilege letters a `GRANT` / `REVOKE` accepts, in the
+/// order the ACL emits their codes (see [priv_acl_code]): insert, update,
+/// delete, select, references. `ALL [PRIVILEGES]` expands to all five.
+const GRANTABLE_PRIVILEGES: &[char] = &['I', 'U', 'D', 'S', 'R'];
+
+/// A privilege letter's ACL code (acl.h): the byte that stands for it in
+/// a `RDB$ACL` privilege list. Probe of an engine-recomputed table ACL:
+/// insert 0x07, update 0x09, delete 0x08, select 0x04, references 0x0a
+/// (the owner also carries alter 0x06, control 0x01, drop 0x03).
+fn priv_acl_code(letter: char) -> Option<u8> {
+    Some(match letter {
+        'I' => 0x07,
+        'U' => 0x09,
+        'D' => 0x08,
+        'S' => 0x04,
+        'R' => 0x0a,
+        _ => return None,
+    })
+}
+
+/// The ACL privilege bytes for a grantee holding `letters`, in the fixed
+/// canonical order the engine emits them (insert, update, delete, select,
+/// references) - not the order they were granted.
+fn grantee_priv_codes(letters: &std::collections::BTreeSet<char>) -> Vec<u8> {
+    GRANTABLE_PRIVILEGES
+        .iter()
+        .filter(|c| letters.contains(c))
+        .filter_map(|c| priv_acl_code(*c))
+        .collect()
+}
+
+/// A `RDB$ACL` blob from a list of access-control entries, in the engine's
+/// acl.h version-2 encoding: the version byte, then for each entry an id
+/// list (`ACL_id_list`, `id_person` + name, or nothing for all-users) and
+/// a privilege list (`ACL_priv_list` + the codes), each terminated; a
+/// final `ACL_end`. A `None` person is the all-users (`*.*`) entry.
+fn build_acl(entries: &[(Option<String>, Vec<u8>)]) -> Vec<u8> {
+    let mut acl = vec![2u8]; // ACL_version
+    for (person, privs) in entries {
+        acl.push(1); // ACL_id_list
+        if let Some(name) = person {
+            acl.push(3); // id_person
+            acl.push(name.len() as u8);
+            acl.extend_from_slice(name.as_bytes());
+        }
+        acl.push(0); // id_end
+        acl.push(2); // ACL_priv_list
+        acl.extend_from_slice(privs);
+        acl.push(0); // priv_end
+    }
+    acl.push(0); // ACL_end
+    acl
+}
+
+/// A relation's `(RDB$SECURITY_CLASS, RDB$OWNER_NAME)` from RDB$RELATIONS.
+fn relation_security(file: &[u8], page_size: usize, table: &str) -> Option<(String, String)> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$RELATIONS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$RELATIONS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$RELATIONS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (name_f, sc_f, own_f) = (
+        fid("RDB$RELATION_NAME")?,
+        fid("RDB$SECURITY_CLASS")?,
+        fid("RDB$OWNER_NAME")?,
+    );
+    let mut found = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if found.is_none() && text_eq(v.get(name_f), table) {
+            let sc = match v.get(sc_f) {
+                Some(Value::Text(t)) => t.trim_end().to_string(),
+                _ => return,
+            };
+            let own = match v.get(own_f) {
+                Some(Value::Text(t)) => t.trim_end().to_string(),
+                _ => OWNER.to_string(),
+            };
+            found = Some((sc, own));
+        }
+    });
+    found
+}
+
+/// The table-level privileges a relation currently carries, per grantee:
+/// a walk of `RDB$USER_PRIVILEGES` for the relation, keeping the rows with
+/// a NULL `RDB$FIELD_NAME` (a column grant is a different ACL story) and a
+/// grantable letter. Maps grantee name to the set of letters it holds.
+fn relation_grantees(
+    file: &[u8],
+    page_size: usize,
+    table: &str,
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<char>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut out: BTreeMap<String, BTreeSet<char>> = BTreeMap::new();
+    let Some(rel) = crate::resolve_relation(file, page_size, "RDB$USER_PRIVILEGES") else {
+        return out;
+    };
+    let Some(formats) = system_relation_formats(file, page_size, "RDB$USER_PRIVILEGES") else {
+        return out;
+    };
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else {
+        return out;
+    };
+    let cols = relation_columns(file, page_size, "RDB$USER_PRIVILEGES");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(u_f), Some(p_f), Some(rn_f), Some(fn_f)) = (
+        fid("RDB$USER"),
+        fid("RDB$PRIVILEGE"),
+        fid("RDB$RELATION_NAME"),
+        fid("RDB$FIELD_NAME"),
+    ) else {
+        return out;
+    };
+    walk_rows(file, page_size, rel, descs, |v| {
+        if !text_eq(v.get(rn_f), table) {
+            return;
+        }
+        // a column grant (FIELD_NAME set) is not a whole-relation ACE
+        if !matches!(v.get(fn_f), None | Some(Value::Null)) {
+            return;
+        }
+        let user = match v.get(u_f) {
+            Some(Value::Text(t)) => t.trim_end().to_string(),
+            _ => return,
+        };
+        let letter = match v.get(p_f) {
+            Some(Value::Text(t)) => t.trim_end().chars().next(),
+            _ => None,
+        };
+        if let Some(c) = letter {
+            let c = c.to_ascii_uppercase();
+            if GRANTABLE_PRIVILEGES.contains(&c) {
+                out.entry(user).or_default().insert(c);
+            }
+        }
+    });
+    out
+}
+
+/// Recompute a relation's own security-class ACL from the privileges now
+/// in `RDB$USER_PRIVILEGES` and rewrite the class row's `RDB$ACL` in place
+/// (a new blob; the old one is orphaned, as the engine leaves it). This is
+/// the engine's `SCL_recompute_access`: the owner's fixed ACE first, then
+/// every named grantee alphabetically, then the all-users (`PUBLIC`) ACE.
+///
+/// The subtlety the engine bakes in: a named grantee's ACE is its direct
+/// privileges UNION whatever `PUBLIC` holds - a user granted only DELETE
+/// shows delete AND select once `PUBLIC` has select, because the all-users
+/// grant applies to that user too. `RDB$USER_PRIVILEGES` keeps the
+/// fine-grained per-grantee rows; the ACL is the coarser cache.
+fn recompute_relation_acl(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+) -> Result<(), String> {
+    use std::collections::BTreeSet;
+    let (class, owner) = relation_security(file, page_size, table)
+        .ok_or_else(|| format!("relation {} has no security class", table))?;
+    let grantees = relation_grantees(file, page_size, table);
+    let public: BTreeSet<char> = grantees.get("PUBLIC").cloned().unwrap_or_default();
+
+    let mut entries: Vec<(Option<String>, Vec<u8>)> = Vec::new();
+    entries.push((Some(owner.clone()), ACL_TABLE_OWNER.to_vec()));
+    for (user, direct) in &grantees {
+        if user.eq_ignore_ascii_case(&owner) || user == "PUBLIC" {
+            continue;
+        }
+        let eff: BTreeSet<char> = direct.union(&public).cloned().collect();
+        entries.push((Some(user.clone()), grantee_priv_codes(&eff)));
+    }
+    if !public.is_empty() {
+        entries.push((None, grantee_priv_codes(&public)));
+    }
+    let acl = build_acl(&entries);
+
+    let screl = crate::resolve_relation(file, page_size, "RDB$SECURITY_CLASSES")
+        .ok_or("no RDB$SECURITY_CLASSES relation")?;
+    let blob = dml::insert_blob(file, page_size, screl, &[acl], 3)?;
+    let name_fid = sys_fid(file, page_size, "RDB$SECURITY_CLASSES", "RDB$SECURITY_CLASS")?;
+    let cl = class.clone();
+    patch_sys_row(
+        file,
+        page_size,
+        "RDB$SECURITY_CLASSES",
+        screl,
+        move |v| text_eq(v.get(name_fid), &cl),
+        &[("RDB$ACL", SysVal::B(blob_id_bytes(screl, blob)))],
+    )
+}
+
+/// Whether `RDB$USER_PRIVILEGES` already holds a table-level row for this
+/// grantee and privilege letter (NULL `RDB$FIELD_NAME`) - so a re-`GRANT`
+/// does not duplicate it.
+fn privilege_present(
+    file: &[u8],
+    page_size: usize,
+    table: &str,
+    grantee: &str,
+    letter: char,
+) -> bool {
+    relation_grantees(file, page_size, table)
+        .get(grantee)
+        .is_some_and(|s| s.contains(&letter))
+}
+
+/// `GRANT <privileges> ON [TABLE] <table> TO <grantees> [WITH GRANT
+/// OPTION]` and its `REVOKE ... FROM` inverse - `GrantRevokeNode` against
+/// the file image. Two effects in the engine's order: the fine-grained
+/// rows of `RDB$USER_PRIVILEGES` (one per grantee per privilege letter),
+/// and a recompute of the relation's own security-class ACL
+/// ([recompute_relation_acl]).
+///
+/// A grantee is any name (`PUBLIC` included, stored as an ordinary
+/// `RDB$USER` row, user type 8); it need not be an existing user, exactly
+/// as the engine allows. `GRANT` inserts a missing row (a re-grant of a
+/// held privilege is a no-op here); `REVOKE` deletes the matching rows,
+/// silently where there is nothing to remove.
+#[allow(clippy::too_many_arguments)]
+pub fn grant_table(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    grantees: &[String],
+    privileges: &[char],
+    grant_option: bool,
+    revoke: bool,
+) -> Result<(), String> {
+    let table = table.trim().trim_matches('"').to_ascii_uppercase();
+    let rel = crate::resolve_relation(file, page_size, &table)
+        .ok_or_else(|| format!("Table \"{}\" not found", table))?;
+    if rel < 128 {
+        return Err("system relations are read-only".into());
+    }
+    let upriv = crate::resolve_relation(file, page_size, "RDB$USER_PRIVILEGES")
+        .ok_or("no RDB$USER_PRIVILEGES relation")?;
+    for grantee in grantees {
+        let grantee = grantee.trim().trim_matches('"').to_ascii_uppercase();
+        for &letter in privileges {
+            if revoke {
+                let (g, t, l) = (grantee.clone(), table.clone(), letter.to_string());
+                let rn_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$RELATION_NAME")?;
+                let u_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$USER")?;
+                let p_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$PRIVILEGE")?;
+                let fn_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$FIELD_NAME")?;
+                delete_catalog_rows(file, page_size, "RDB$USER_PRIVILEGES", move |v| {
+                    text_eq(v.get(rn_f), &t)
+                        && text_eq(v.get(u_f), &g)
+                        && text_eq(v.get(p_f), &l)
+                        && matches!(v.get(fn_f), None | Some(Value::Null))
+                })?;
+            } else if !privilege_present(file, page_size, &table, &grantee, letter) {
+                let letter = letter.to_string();
+                sys_insert(
+                    file,
+                    page_size,
+                    "RDB$USER_PRIVILEGES",
+                    upriv,
+                    &[
+                        ("RDB$USER", SysVal::S(&grantee)),
+                        ("RDB$GRANTOR", SysVal::S(OWNER)),
+                        ("RDB$PRIVILEGE", SysVal::S(&letter)),
+                        ("RDB$GRANT_OPTION", SysVal::I(if grant_option { 1 } else { 0 })),
+                        ("RDB$RELATION_NAME", SysVal::S(&table)),
+                        ("RDB$USER_TYPE", SysVal::I(8)),
+                        ("RDB$OBJECT_TYPE", SysVal::I(0)),
+                        ("RDB$RELATION_SCHEMA_NAME", SysVal::S("PUBLIC")),
+                    ],
+                )?;
+            }
+        }
+    }
+    recompute_relation_acl(file, page_size, &table)?;
+    advance_oldest_transactions(file, page_size)
+}
+
 /// Take the next `SQL$<n>` security class name from generator slot 1
 /// (`RDB$SECURITY_CLASS`) and store its row with the owner's ACL. The
 /// engine draws this name from the counter WITHOUT checking whether it

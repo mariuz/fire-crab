@@ -725,6 +725,16 @@ enum Plan {
         target: fire_crab_ods::ddl::CommentTarget,
         text: Option<String>,
     },
+    /// `GRANT|REVOKE <privileges> ON [TABLE] <table> TO|FROM <grantees>
+    /// [WITH GRANT OPTION]`: write (or delete) the RDB$USER_PRIVILEGES rows
+    /// and recompute the relation's security-class ACL
+    Grant {
+        table: String,
+        grantees: Vec<String>,
+        privileges: Vec<char>,
+        grant_option: bool,
+        revoke: bool,
+    },
     /// `ALTER TABLE <table> ADD <column>`: a new format version, the new
     /// column's catalog rows, and a version rewrite of the RDB$RELATIONS
     /// row bumping its format and field count
@@ -1805,6 +1815,110 @@ fn plan_comment(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         }
     };
     Some((Plan::Comment { target, text }, Vec::new()))
+}
+
+/// Parse a privilege list: `ALL [PRIVILEGES]`, or a comma-separated list
+/// of SELECT / INSERT / UPDATE / DELETE / REFERENCES. None for anything
+/// else (EXECUTE, USAGE, a column-level `SELECT (col)`, a role) so the
+/// caller falls back rather than answering a grant it did not model.
+fn parse_priv_list(s: &str) -> Option<Vec<char>> {
+    let t = s.trim().to_ascii_uppercase();
+    if t == "ALL" || t == "ALL PRIVILEGES" {
+        return Some(vec!['S', 'I', 'U', 'D', 'R']);
+    }
+    let mut out = Vec::new();
+    for part in t.split(',') {
+        let c = match part.trim() {
+            "SELECT" => 'S',
+            "INSERT" => 'I',
+            "UPDATE" => 'U',
+            "DELETE" => 'D',
+            "REFERENCES" => 'R',
+            _ => return None,
+        };
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Parse a grantee list - `[USER|ROLE|GROUP] <name>` items separated by
+/// commas, `PUBLIC` included. None for an unmodelled shape (a `GRANTED BY`
+/// tail, a multi-word token).
+fn parse_grantee_list(s: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let mut p = part.trim();
+        for kw in ["USER ", "ROLE ", "GROUP "] {
+            if p.len() >= kw.len() && p[..kw.len()].eq_ignore_ascii_case(kw) {
+                p = p[kw.len()..].trim();
+            }
+        }
+        if p.is_empty() || p.contains(char::is_whitespace) {
+            return None;
+        }
+        out.push(unquote_ident(p)?);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// `GRANT <privileges> ON [TABLE] <table> TO <grantees> [WITH GRANT
+/// OPTION]` / `REVOKE <privileges> ON [TABLE] <table> FROM <grantees>` -
+/// the table-privilege forms of GrantRevokeNode. Only these forms are
+/// modelled: table DML privileges (or `ALL`) to named users or `PUBLIC`.
+/// A role grant (no `ON`), an `EXECUTE ON PROCEDURE`, a column-level or
+/// `GRANTED BY` form parses to None so the dispatcher reports an SQL error
+/// rather than silently accepting an unmodelled grant.
+fn plan_grant(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let revoke = if find_word(&up, "GRANT", 0) == Some(0) {
+        false
+    } else if find_word(&up, "REVOKE", 0) == Some(0) {
+        true
+    } else {
+        return None;
+    };
+    let verb_len = if revoke { "REVOKE".len() } else { "GRANT".len() };
+    let on = find_word(&up, "ON", verb_len)?;
+    let privileges = parse_priv_list(up[verb_len..on].trim())?;
+
+    // after ON: an optional TABLE keyword, then the table name up to the
+    // TO (grant) / FROM (revoke) separator
+    let mut pos = on + "ON".len();
+    if let Some(tk) = find_word(&up, "TABLE", pos) {
+        if up[pos..tk].trim().is_empty() {
+            pos = tk + "TABLE".len();
+        }
+    }
+    let sep_kw = if revoke { "FROM" } else { "TO" };
+    let sep = find_word(&up, sep_kw, pos)?;
+    let table = s[pos..sep].trim();
+
+    // grantees run to the end, or to a WITH GRANT OPTION tail (grant only)
+    let mut tail_end = s.len();
+    let mut grant_option = false;
+    if !revoke {
+        if let Some(w) = find_word(&up, "WITH", sep) {
+            let g = find_word(&up, "GRANT", w + "WITH".len())?;
+            find_word(&up, "OPTION", g + "GRANT".len())?;
+            grant_option = true;
+            tail_end = w;
+        }
+    }
+    let grantees = parse_grantee_list(s[sep + sep_kw.len()..tail_end].trim())?;
+
+    Some((
+        Plan::Grant {
+            table: unquote_ident(table)?,
+            grantees,
+            privileges,
+            grant_option,
+            revoke,
+        },
+        Vec::new(),
+    ))
 }
 
 /// The byte offset of the first non-space character at or after `from`.
@@ -2906,6 +3020,24 @@ fn execute_dml(
         }
         Plan::Comment { target, text } => {
             fire_crab_ods::ddl::comment_on(&mut work, db.page_size, target, text.as_deref())?;
+            (0, 0, 0)
+        }
+        Plan::Grant {
+            table,
+            grantees,
+            privileges,
+            grant_option,
+            revoke,
+        } => {
+            fire_crab_ods::ddl::grant_table(
+                &mut work,
+                db.page_size,
+                table,
+                grantees,
+                privileges,
+                *grant_option,
+                *revoke,
+            )?;
             (0, 0, 0)
         }
         Plan::AlterTableAdd { table, col } => {
@@ -4402,6 +4534,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
         | Plan::Comment { .. }
+        | Plan::Grant { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -4437,6 +4570,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
         | Plan::Comment { .. }
+        | Plan::Grant { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -4759,6 +4893,7 @@ fn emit_rows_inner(
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
         | Plan::Comment { .. }
+        | Plan::Grant { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -7165,7 +7300,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 }
                 let text = String::from_utf8_lossy(&sql).into_owned();
                 let up = text.trim_start().to_ascii_uppercase();
-                let ddl_kw = ["CREATE", "ALTER", "DROP", "RECREATE", "COMMENT"]
+                let ddl_kw = ["CREATE", "ALTER", "DROP", "RECREATE", "COMMENT", "GRANT", "REVOKE"]
                     .into_iter()
                     .any(|k| find_word(&up, k, 0) == Some(0));
                 let dml_kw = ["INSERT", "UPDATE", "DELETE"]
@@ -7178,6 +7313,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     .or_else(|| {
                     if ddl_kw {
                         plan_comment(&text)
+                            .or_else(|| plan_grant(&text))
                             .or_else(|| plan_create_table(&text))
                             .or_else(|| plan_create_index(&text))
                             .or_else(|| plan_drop_table(&text))
@@ -7302,7 +7438,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 last_dml = (0, 0, 0);
                 bound_args.clear();
                 let up = stmt_sql.trim_start().to_ascii_uppercase();
-                let ddl_kw = ["CREATE", "ALTER", "DROP", "RECREATE", "COMMENT"]
+                let ddl_kw = ["CREATE", "ALTER", "DROP", "RECREATE", "COMMENT", "GRANT", "REVOKE"]
                     .into_iter()
                     .find(|k| find_word(&up, k, 0) == Some(0));
                 let dml_kw = ["INSERT", "UPDATE", "DELETE"]
@@ -7322,6 +7458,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     // a client must never think its DDL succeeded when
                     // the verb is one this server does not implement
                     let planned = plan_comment(&stmt_sql)
+                        .or_else(|| plan_grant(&stmt_sql))
                         .or_else(|| plan_create_table(&stmt_sql))
                         .or_else(|| plan_create_index(&stmt_sql))
                         .or_else(|| plan_drop_table(&stmt_sql))
@@ -7438,6 +7575,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::AlterIndex { .. }
                         | Plan::SetStatistics { .. }
                         | Plan::Comment { .. }
+                        | Plan::Grant { .. }
                         | Plan::AlterTableAdd { .. }
                         | Plan::AlterTableAddFk { .. }
                         | Plan::AlterTableAddKey { .. }
@@ -10412,6 +10550,54 @@ mod tests {
         // a kind this writer does not implement, and a non-comment
         assert!(plan_comment("COMMENT ON PROCEDURE P IS 'x'").is_none());
         assert!(plan_comment("CREATE TABLE T (A INT)").is_none());
+    }
+
+    #[test]
+    fn parses_grant_revoke() {
+        // a single privilege to a named user
+        match plan_grant("GRANT SELECT ON T TO BOB") {
+            Some((Plan::Grant { table, grantees, privileges, grant_option, revoke }, _)) => {
+                assert_eq!(table, "T");
+                assert_eq!(grantees, vec!["BOB".to_string()]);
+                assert_eq!(privileges, vec!['S']);
+                assert!(!grant_option);
+                assert!(!revoke);
+            }
+            other => panic!("expected Grant, got {:?}", other.is_some()),
+        }
+        // a list of privileges, the optional TABLE keyword, WITH GRANT OPTION
+        match plan_grant("grant insert, update on table t to user alice with grant option") {
+            Some((Plan::Grant { table, grantees, privileges, grant_option, revoke }, _)) => {
+                assert_eq!(table, "t");
+                assert_eq!(grantees, vec!["alice".to_string()]);
+                assert_eq!(privileges, vec!['I', 'U']);
+                assert!(grant_option);
+                assert!(!revoke);
+            }
+            other => panic!("expected Grant list, got {:?}", other.is_some()),
+        }
+        // ALL PRIVILEGES to PUBLIC and a second grantee
+        match plan_grant("GRANT ALL PRIVILEGES ON T TO PUBLIC, CAROL") {
+            Some((Plan::Grant { grantees, privileges, .. }, _)) => {
+                assert_eq!(grantees, vec!["PUBLIC".to_string(), "CAROL".to_string()]);
+                assert_eq!(privileges, vec!['S', 'I', 'U', 'D', 'R']);
+            }
+            other => panic!("expected Grant ALL, got {:?}", other.is_some()),
+        }
+        // REVOKE
+        match plan_grant("REVOKE DELETE ON T FROM BOB") {
+            Some((Plan::Grant { grantees, privileges, revoke, .. }, _)) => {
+                assert_eq!(grantees, vec!["BOB".to_string()]);
+                assert_eq!(privileges, vec!['D']);
+                assert!(revoke);
+            }
+            other => panic!("expected Revoke, got {:?}", other.is_some()),
+        }
+        // forms this writer does not model, and a non-grant
+        assert!(plan_grant("GRANT EXECUTE ON PROCEDURE P TO BOB").is_none());
+        assert!(plan_grant("GRANT MYROLE TO BOB").is_none()); // no ON - a role grant
+        assert!(plan_grant("GRANT SELECT (A) ON T TO BOB").is_none()); // column-level
+        assert!(plan_grant("CREATE TABLE T (A INT)").is_none());
     }
 
     #[test]
