@@ -3038,6 +3038,38 @@ round trip and `gfix`. Teeth: omit the `RSR_trigger_name` from the parent's
 runtime and every catalog row still matches while the cascade silently does
 nothing.
 
+### The seventy-seventh differential — SET NULL, and more than one column
+
+The previous differential did single-column cascade; the trigger BLR it emitted
+was a straight-line program. The rest of the referential-action surface — `SET
+NULL`, and any of it over a multi-column key — is the same program with three
+generalisations, each a single BLR verb, so the emitter grows from two
+hand-written shapes to one that folds over the key columns.
+
+A multi-column key turns the trigger's single equality into a conjunction:
+`WHERE child.fk = OLD.pk` becomes `WHERE AND(child.fk_i = OLD.pk_i)` — an
+`blr_and` chain across the columns — and the update trigger's `IF OLD.pk <>
+NEW.pk` guard becomes an `blr_or` chain of the per-column inequalities (any key
+column changing fires the cascade). `SET NULL` changes only what the `MODIFY`
+assigns: where cascade sets each `child.fk_i` to `NEW.pk_i`, set-null assigns
+`blr_null`; and a set-null delete is a `MODIFY` where a cascade delete was an
+`ERASE`. Three verbs — `blr_and`, `blr_or`, `blr_null` — turn the two
+single-column emitters into one that handles `ON DELETE`/`ON UPDATE` ×
+`CASCADE`/`SET NULL` over one or many columns, still byte for byte against the
+engine's.
+
+`qa/serve-real-fkactions.sh` (13 checks) creates a `SET NULL` foreign key (on
+both events) and a two-column `CASCADE` one, through fire-crab and the engine on
+two copies. It compares the rules and trigger rows, compares all three trigger
+BLRs byte for byte (the update-set-null with its `blr_or` guard, the delete-set-
+null, the two-column cascade with its `blr_and` where-clause), and then has the
+engine execute them on fire-crab's file: deleting and updating the `SET NULL`
+parent leaves the children present with their foreign key `NULL`, and deleting
+one row of the two-column parent cascade-deletes exactly the child whose `(X, Y)`
+matched — leaving the other. `gbak` and `gfix` close it. `SET DEFAULT` and
+partial-key actions stay out of scope (they need the column's default
+expression, itself BLR).
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -3542,6 +3574,17 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-fkcascade.sh 3050
+
+# FOREIGN KEY SET NULL and multi-column actions: the same trigger BLR
+# generalised - blr_and across the key columns in the WHERE, blr_or in the
+# ON UPDATE guard, and blr_null in a MODIFY where cascade uses NEW.pk. Both
+# the SET NULL trigger and the two-column cascade trigger are emitted byte
+# for byte, and the engine executes them. gbak and gfix. Builds its own
+# scratch databases.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-fkactions.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
