@@ -744,6 +744,8 @@ enum Plan {
         table: String,
         grantees: Vec<String>,
         privileges: Vec<char>,
+        /// the columns of a per-column grant; empty for a relation grant
+        fields: Vec<String>,
         grant_option: bool,
         revoke: bool,
     },
@@ -1928,6 +1930,31 @@ fn parse_priv_list(s: &str) -> Option<Vec<char>> {
     (!out.is_empty()).then_some(out)
 }
 
+/// Parse the privilege section, which is either a relation-level list
+/// (returns the letters and no fields) or a single column-level privilege
+/// `UPDATE (<cols>)` / `REFERENCES (<cols>)` (returns that letter and the
+/// column list). Column-level SELECT and mixed forms are not modelled -
+/// the engine rejects `SELECT (col)` anyway - so they parse to None.
+fn parse_priv_and_fields(s: &str) -> Option<(Vec<char>, Vec<String>)> {
+    let t = s.trim();
+    if let Some(open) = t.find('(') {
+        if !t.ends_with(')') {
+            return None;
+        }
+        let letter = match t[..open].trim().to_ascii_uppercase().as_str() {
+            "UPDATE" => 'U',
+            "REFERENCES" => 'R',
+            _ => return None,
+        };
+        let mut fields = Vec::new();
+        for c in t[open + 1..t.len() - 1].split(',') {
+            fields.push(unquote_ident(c.trim())?);
+        }
+        return (!fields.is_empty()).then_some((vec![letter], fields));
+    }
+    parse_priv_list(t).map(|p| (p, Vec::new()))
+}
+
 /// Parse a grantee list - `[USER|ROLE|GROUP] <name>` items separated by
 /// commas, `PUBLIC` included. None for an unmodelled shape (a `GRANTED BY`
 /// tail, a multi-word token).
@@ -1967,7 +1994,7 @@ fn plan_grant(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     };
     let verb_len = if revoke { "REVOKE".len() } else { "GRANT".len() };
     let on = find_word(&up, "ON", verb_len)?;
-    let privileges = parse_priv_list(up[verb_len..on].trim())?;
+    let (privileges, fields) = parse_priv_and_fields(s[verb_len..on].trim())?;
 
     // after ON: an optional TABLE keyword, then the table name up to the
     // TO (grant) / FROM (revoke) separator
@@ -1999,6 +2026,7 @@ fn plan_grant(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             table: unquote_ident(table)?,
             grantees,
             privileges,
+            fields,
             grant_option,
             revoke,
         },
@@ -3127,6 +3155,7 @@ fn execute_dml(
             table,
             grantees,
             privileges,
+            fields,
             grant_option,
             revoke,
         } => {
@@ -3136,6 +3165,7 @@ fn execute_dml(
                 table,
                 grantees,
                 privileges,
+                fields,
                 *grant_option,
                 *revoke,
             )?;
@@ -10690,10 +10720,11 @@ mod tests {
     fn parses_grant_revoke() {
         // a single privilege to a named user
         match plan_grant("GRANT SELECT ON T TO BOB") {
-            Some((Plan::Grant { table, grantees, privileges, grant_option, revoke }, _)) => {
+            Some((Plan::Grant { table, grantees, privileges, fields, grant_option, revoke }, _)) => {
                 assert_eq!(table, "T");
                 assert_eq!(grantees, vec!["BOB".to_string()]);
                 assert_eq!(privileges, vec!['S']);
+                assert!(fields.is_empty());
                 assert!(!grant_option);
                 assert!(!revoke);
             }
@@ -10701,7 +10732,7 @@ mod tests {
         }
         // a list of privileges, the optional TABLE keyword, WITH GRANT OPTION
         match plan_grant("grant insert, update on table t to user alice with grant option") {
-            Some((Plan::Grant { table, grantees, privileges, grant_option, revoke }, _)) => {
+            Some((Plan::Grant { table, grantees, privileges, grant_option, revoke, .. }, _)) => {
                 assert_eq!(table, "t");
                 assert_eq!(grantees, vec!["alice".to_string()]);
                 assert_eq!(privileges, vec!['I', 'U']);
@@ -10709,6 +10740,23 @@ mod tests {
                 assert!(!revoke);
             }
             other => panic!("expected Grant list, got {:?}", other.is_some()),
+        }
+        // a column grant: UPDATE (A, B) - one privilege, a field list
+        match plan_grant("GRANT UPDATE (A, B) ON T TO BOB") {
+            Some((Plan::Grant { privileges, fields, .. }, _)) => {
+                assert_eq!(privileges, vec!['U']);
+                assert_eq!(fields, vec!["A".to_string(), "B".to_string()]);
+            }
+            other => panic!("expected column Grant, got {:?}", other.is_some()),
+        }
+        // REVOKE REFERENCES (A)
+        match plan_grant("REVOKE REFERENCES (A) ON T FROM CAROL") {
+            Some((Plan::Grant { privileges, fields, revoke, .. }, _)) => {
+                assert_eq!(privileges, vec!['R']);
+                assert_eq!(fields, vec!["A".to_string()]);
+                assert!(revoke);
+            }
+            other => panic!("expected column Revoke, got {:?}", other.is_some()),
         }
         // ALL PRIVILEGES to PUBLIC and a second grantee
         match plan_grant("GRANT ALL PRIVILEGES ON T TO PUBLIC, CAROL") {
