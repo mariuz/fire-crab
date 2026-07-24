@@ -3152,6 +3152,42 @@ omits the defaulted columns and confirms each still takes its default after the
 matches on every other field attribute while the post-`ALTER` insert comes out
 NULL.
 
+### The eighty-first differential — a VARCHAR that was two bytes too wide
+
+Building the previous gate turned up a diff no earlier gate could have: a
+`VARCHAR(6)` column, after an `ALTER`, reported a character length of eight. The
+runtime the engine reads carried the wrong number, and following that thread led
+to something latent since the very first `CREATE TABLE`.
+
+A relation's format is a packed array of descriptors — one `(dtype, dsc_length,
+scale, sub_type)` tuple per column — and for a `VARYING` the descriptor length
+*includes* the two-byte count word: `VARCHAR(6)` is `dsc_length` eight, two for
+the length prefix and six for the characters. fire-crab was writing ten. A
+`ColumnDef`'s declared length already folds the `+2` in (`VARCHAR(n)` becomes
+`n+2`), and `compute_format` — correct for the round-tripped `ALTER` path, which
+strips it back off first — added the two again on top. So every VARCHAR
+fire-crab ever created had a format descriptor two bytes too wide, and the same
+inflated number flowed into `RDB$RUNTIME`'s field- and character-length entries.
+
+Nothing caught it because nothing had to: the engine reads a `VARYING` by its
+own length prefix, so an over-wide field is harmless to read; `gbak` round-trips
+it; queries return the right characters. It was pure byte-fidelity — the kind of
+divergence that only a byte-for-byte comparison of the *format blob itself* can
+see, and no gate had compared that blob. The fix is one shared helper at the
+three sites that turn a declared column into a `compute_format` tuple, mirroring
+what the `ALTER` path already did off descriptors: strip the count word so
+`compute_format` can add it back exactly once. That one change corrected both the
+descriptor and, through it, the runtime the previous differential was about.
+
+`qa/serve-real-varcharfmt.sh` (10 checks) has fire-crab and the engine each
+create a mixed-type table — `INTEGER`, `VARCHAR(6)`, `CHAR(4)`, `VARCHAR(20)`, so
+the pack exercises alignment *after* a VARYING — and compares the `RDB$FORMATS`
+descriptor blob byte for byte, then the rebuilt `RDB$RUNTIME` after an `ALTER`
+byte for byte, then reads back a row fire-crab wrote into those columns, then
+`gbak` round-trips and `gfix` checks the raw file. Teeth: the descriptor the
+engine emits for `VARCHAR(6)` carries `dsc_length` eight, and a build that
+double-counts writes ten — a difference invisible to every other test.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest

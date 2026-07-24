@@ -402,6 +402,20 @@ fn descs_to_fields(descs: &[Descriptor]) -> Vec<(u8, u16, i8, i16)> {
         .collect()
 }
 
+/// The `compute_format` input tuple for a *declared* column. A ColumnDef's
+/// `length` for VARYING already carries the 2-byte count word (VARCHAR(n) =>
+/// n+2), but `compute_format` re-adds it, so strip it here - the mirror of
+/// `descs_to_fields`. Without this the descriptor double-counts the count word
+/// (VARCHAR(6) => dsc_length 10 where the engine writes 8).
+fn col_field(dtype: u8, length: u16, scale: i8, sub_type: i16) -> (u8, u16, i8, i16) {
+    let gfld = if dtype == crate::format::dtype::VARYING {
+        length.saturating_sub(2)
+    } else {
+        length
+    };
+    (dtype, gfld, scale, sub_type)
+}
+
 /// Locate a system relation's primary row whose decoded values satisfy
 /// `pred`: its data page and slot. For an in-place catalog update or
 /// delete (ALTER).
@@ -636,7 +650,7 @@ pub fn alter_table_add_column(
         .max_by_key(|(n, _)| *n)
         .ok_or("relation has no format")?;
     let mut fields = descs_to_fields(cur_descs);
-    fields.push((col.dtype, col.length, col.scale, col.sub_type));
+    fields.push(col_field(col.dtype, col.length, col.scale, col.sub_type));
     let new_descs = compute_format(&fields);
     if new_descs.len() != fields.len() {
         return Err("format computation failed".into());
@@ -1100,7 +1114,7 @@ pub fn alter_table_alter_column_type(
 
     // the new format: the target field's descriptor replaced, all repacked
     let mut fields = descs_to_fields(cur_descs);
-    fields[fid] = (new_col.dtype, new_col.length, new_col.scale, new_col.sub_type);
+    fields[fid] = col_field(new_col.dtype, new_col.length, new_col.scale, new_col.sub_type);
     let new_descs = compute_format(&fields);
 
     // the column's domain (RDB$FIELD_SOURCE) - retyped in place
@@ -1537,7 +1551,7 @@ pub fn create_table(
     // offsets by the ini.epp walk sysfmt already implements
     let fields: Vec<(u8, u16, i8, i16)> = cols
         .iter()
-        .map(|c| (c.dtype, c.length, c.scale, c.sub_type))
+        .map(|c| col_field(c.dtype, c.length, c.scale, c.sub_type))
         .collect();
     let descs = compute_format(&fields);
     if descs.len() != cols.len() {
