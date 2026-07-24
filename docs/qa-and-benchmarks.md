@@ -2397,6 +2397,65 @@ and the gate asserts that surviving plan really is an index plan, so the
 comparison cannot pass by both sides going `NATURAL`. Then the refusals, the
 `gbak` round trip, and `gfix` on both files.
 
+### The sixty-first differential — CREATE SEQUENCE, and the counters behind a counter
+
+fire-crab could already *set* a generator (`SET GENERATOR`, `ALTER SEQUENCE
+RESTART WITH`) and *advance* one (`GEN_ID`, `NEXT VALUE FOR`). What it could
+not do is make one. `CREATE SEQUENCE`/`CREATE GENERATOR`, with `START WITH`
+and `INCREMENT BY`, and `DROP SEQUENCE`, close that arc — and the statement
+turns out to be a small catalog row wrapped around a much more interesting
+fact about where object identity comes from.
+
+**A sequence's id is drawn from another sequence.** `RDB$GENERATOR_ID` is not
+a max-plus-one over the catalog: `CreateAlterSequenceNode::store`
+(DdlNodes.epp:6597) calls `DYN_UTIL_gen_unique_id(..., MASTER_GENERATOR)`,
+takes the result modulo `MAX_SSHORT + 1`, skips zero, and retries while the
+`RDB$INDEX_46` unique index rejects it. `MASTER_GENERATOR` is the empty name
+in the system schema (constants.h:134, special-cased in ExprNodes.cpp:7168) —
+slot 0 of the generator vector, the counter every metadata object id in the
+database comes from. Storing the row then makes `vio.cpp:4657` draw a
+security class name from slot 1, `RDB$SECURITY_CLASS`, the counter behind
+`SQL$<n>`. So *creating* a sequence writes two generator values before the
+new sequence has one of its own, and a writer that assigns ids by any other
+rule diverges from the engine on the very next statement the engine runs.
+
+**The row is three rows.** Beside `RDB$GENERATORS` the engine writes an
+`RDB$SECURITY_CLASSES` row carrying the owner's ACL and an
+`RDB$USER_PRIVILEGES` row for the owner's `USAGE WITH GRANT OPTION`
+(privilege `G`, user type 8, object type 14). The ACL is eighteen bytes of
+the encoding in acl.h — version 2, an id list naming the owner as a person,
+then the privilege list `alter, control, drop, usage` — and fire-crab writes
+it byte for byte. This is the first fire-crab DDL that writes the *security*
+catalog at all; `CREATE TABLE` still leaves those columns null, which is a
+gap now visible and worth closing the same way.
+
+**The stored value is `start - increment`.** Not `start`. The engine's
+`genIdCache` is primed with `val - step` so that the *first* `NEXT VALUE FOR`
+lands exactly on `START WITH`. `SEQ_B START WITH 100 INCREMENT BY 5` sits on
+disk holding 95.
+
+**Dropping leaves the value behind.** `DropSequenceNode` erases the catalog
+rows; `delete_generator` (dfw.epp:2173) only checks dependencies. Nothing
+zeroes the slot and nothing reclaims the id, so a dropped sequence's last
+value stays in the vector as garbage and the next `CREATE SEQUENCE` takes a
+fresh id rather than the hole. fire-crab reproduces the garbage, because the
+garbage is the observable.
+
+`qa/serve-real-sequence.sh` (35 checks) runs the same eight statements
+through fire-crab and through the engine on two copies of one database, then
+compares the catalogs (generators, security classes, privileges), the ACL
+blob byte for byte, and the **generator page itself** — its value area
+compared byte for byte, which covers both counters, every sequence's stored
+value, and the orphan the dropped sequence left. Then it asks the engine to
+*continue* from fire-crab's file: one more `CREATE SEQUENCE`, run by the
+engine on each copy, must land the same id and the same `SQL$<n>` class —
+which it can only do if fire-crab advanced the master and security-class
+counters exactly as the engine would have. The four refusals (duplicate name,
+unknown drop, system generator, `INCREMENT BY 0`) are refused by both, the
+first `NEXT VALUE FOR` yields the declared start on both, and `gbak` and
+`gfix` close it out. Teeth: assigning ids without advancing the master
+generator makes 15 checks `DIFF`; omitting the security class makes 3.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -2714,6 +2773,19 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-dropindex.sh 3050
+
+# CREATE SEQUENCE / DROP SEQUENCE: the statements that MAKE a generator -
+# the id drawn from the MASTER generator (slot 0) and the security class
+# from slot 1, so creating a sequence writes two generator values before
+# it has one of its own; the stored value is start - increment; dropping
+# leaves the value behind. Catalogs, the ACL blob and the generator page
+# compared byte for byte, and the engine asked to CONTINUE from
+# fire-crab's file (its next CREATE SEQUENCE must land the same id).
+# Builds its own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-sequence.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
