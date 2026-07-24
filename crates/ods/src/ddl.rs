@@ -492,6 +492,7 @@ fn rebuild_runtime_blob(
     let src_fid = fid_of("RDB$FIELD_SOURCE").ok_or("no RDB$FIELD_SOURCE")?;
     let pos_fid = fid_of("RDB$FIELD_POSITION").ok_or("no RDB$FIELD_POSITION")?;
     let null_fid = fid_of("RDB$NULL_FLAG");
+    let default_fid = fid_of("RDB$DEFAULT_VALUE");
 
     // collect (field_id, name, source, position, not_null), by field id
     let text = |v: Option<&Value>| match v {
@@ -502,7 +503,8 @@ fn rebuild_runtime_blob(
         Some(Value::Int(n)) => Some(*n),
         _ => None,
     };
-    let mut fields: Vec<(u16, String, String, u16, bool)> = Vec::new();
+    #[allow(clippy::type_complexity)]
+    let mut fields: Vec<(u16, String, String, u16, bool, Option<(u16, u64)>)> = Vec::new();
     walk_rows(file, page_size, 5, rf_descs, |vals| {
         if text(vals.get(rel_fid)).as_deref() != Some(table) {
             return;
@@ -516,7 +518,12 @@ fn rebuild_runtime_blob(
             return;
         };
         let not_null = null_fid.and_then(|f| int(vals.get(f))) == Some(1);
-        fields.push((id as u16, name, src, pos as u16, not_null));
+        // the column's DEFAULT blob, if any, to re-emit as RSR_default_value
+        let default = default_fid.and_then(|f| match vals.get(f) {
+            Some(Value::Blob(r, n)) => Some((*r, *n)),
+            _ => None,
+        });
+        fields.push((id as u16, name, src, pos as u16, not_null, default));
     });
     fields.sort_by_key(|f| f.0);
 
@@ -527,7 +534,7 @@ fn rebuild_runtime_blob(
         s
     };
     let mut runtime: Vec<Vec<u8>> = Vec::new();
-    for (id, name, src, pos, not_null) in &fields {
+    for (id, name, src, pos, not_null, default) in &fields {
         let d = descs.get(*id as usize).ok_or("field beyond format")?;
         runtime.push(seg(0, &id.to_le_bytes())); // RSR_field_id
         runtime.push(seg(1, name.as_bytes())); // RSR_field_name
@@ -545,6 +552,13 @@ fn rebuild_runtime_blob(
             runtime.push(seg(26, &cl.to_le_bytes())); // RSR_character_length
         }
         runtime.push(seg(27, &pos.to_le_bytes())); // RSR_field_pos
+        // re-emit the column DEFAULT (RSR_default_value = 6) so an ALTER
+        // does not drop it from the summary the engine applies defaults from
+        if let Some((r, n)) = default {
+            if let Some(blr) = crate::format::read_blob_content(file, page_size, *r, *n) {
+                runtime.push(seg(6, &blr));
+            }
+        }
         if *not_null {
             runtime.push(seg(21, &NONNULL_BLR)); // RSR_field_not_null
         }
