@@ -2761,6 +2761,43 @@ message survives) and `gfix`. Teeth: a writer that reuses a dropped number, or
 invents a class name off-counter, makes the continuation `DIFF` on the engine's
 very next statement.
 
+### The sixty-ninth differential — CREATE and DROP ROLE, and a column that pads with zeros
+
+A role is the leanest of the security objects. `CREATE ROLE <name>` writes a
+`RDB$ROLES` row and a `SQL$<n>` security class, and — unlike a sequence or an
+exception — *nothing else*: no number (a role has none), and no
+`RDB$USER_PRIVILEGES` row, because creating a role does not grant anyone a
+privilege *on* it. Even the owner's ACL is leaner: `alter, control, drop` with
+no `usage`, a third distinct owner-ACL constant beside the table's and the
+sequence's. The `SQL$<n>` class name still comes off the shared
+`RDB$SECURITY_CLASS` counter the engine does not re-check, so the same
+continuation argument applies — the engine's next `CREATE` lands the same name
+only if fire-crab advanced the counter.
+
+The one new thing a role taught is a column encoding. `RDB$ROLES` carries
+`RDB$SYSTEM_PRIVILEGES`, a `CHAR(8) CHARACTER SET OCTETS` holding a
+system-privilege bitmask, and `CREATE ROLE` writes it as **eight zero bytes** —
+an empty mask. That is neither of the two things fire-crab already knew how to
+write into a catalog column: it is not NULL, and it is not the *space* padding a
+text `CHAR` gets. A binary `OCTETS` column pads with `0x00`, so writing it
+needed a new catalog-value kind that lays bytes down and zero-fills to the
+column width. The trap is quiet — an all-spaces field and an all-zeros field
+both read back as an eight-character string that prints as blank, so only a
+comparison that distinguishes the bytes (the gate tests `RDB$SYSTEM_PRIVILEGES =
+x'0000000000000000'`) catches a writer that padded with spaces.
+
+`qa/serve-real-role.sh` (20 checks) creates three roles and drops one through
+fire-crab and the engine on two copies of a database, compares the `RDB$ROLES`
+rows, confirms `RDB$SYSTEM_PRIVILEGES` is eight zero bytes on both and that no
+role carries a privilege row, compares the ACL blob byte for byte (the
+`alter/control/drop` owner encoding), has the engine *continue* from
+fire-crab's file — one more `CREATE ROLE` lands the next `SQL$<n>` class only if
+the counter advanced — refuses a duplicate name and a missing drop on both, and
+finishes with a `gbak` round trip and `gfix`. Teeth: writing
+`RDB$SYSTEM_PRIVILEGES` as spaces leaves every text read-back looking right
+while the `x'00…'` comparison `DIFF`s; inventing a class name off-counter makes
+the continuation `DIFF`.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -3176,6 +3213,17 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-exception.sh 3050
+
+# CREATE / DROP ROLE: the leanest security object - a RDB$ROLES row and a
+# SQL$<n> class, no number and no privileges, an alter/control/drop owner
+# ACL (no usage). RDB$SYSTEM_PRIVILEGES is a CHAR(8) OCTETS written as
+# eight ZERO bytes (not NULL, not the spaces a text CHAR pads with). The
+# engine continues from fire-crab's file. gbak and gfix. Builds its own
+# scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-role.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
