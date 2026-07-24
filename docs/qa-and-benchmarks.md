@@ -2636,6 +2636,48 @@ the unknown-table and unknown-column refusals on both, and finishes with a
 description blob with charset 1 instead of 4 leaves the text reading back fine
 but makes the two byte-for-byte blob checks `DIFF`.
 
+### The sixty-sixth differential — the same comment, on an index and a sequence
+
+The sixty-fifth wrote a description onto a table and a column. `COMMENT ON`
+takes a longer list of object kinds, and the next two are the ones fire-crab
+can already *create*: `COMMENT ON INDEX <name>` and `COMMENT ON SEQUENCE
+<name>` (with `GENERATOR` as the accepted synonym for the latter). Nothing
+about the mechanism changes — a comment is still a text blob written into the
+commented object's own catalog relation with its id stored in that row's
+`RDB$DESCRIPTION`, and `IS NULL` / `IS ''` still clears it — only the relation
+does: `RDB$INDICES` for an index, `RDB$GENERATORS` for a sequence, where the
+sixty-fifth wrote to `RDB$RELATIONS` and `RDB$RELATION_FIELDS`. The whole point
+of this differential is that a mechanism built for one object kind should
+generalise to the others for the price of naming the row, and it does: the
+blob writer that takes an explicit charset, the in-place patch that can set a
+column to NULL, and the charset-4 rule are all reused untouched. On the code
+side it is a `description_blob` helper (the blob-or-NULL value, parameterised
+by the owning relation) shared across all four kinds, two more `CommentTarget`
+variants, and a parser that now reads the object kind as *the first word after
+`ON`* against a small keyword set rather than special-casing two.
+
+The one thing worth stating is what the byte-for-byte check now proves. Writing
+the description into `RDB$INDICES` rather than `RDB$RELATIONS` means allocating
+the blob on a *different* system relation's data pages and stamping that
+relation's id into the blob id; that the engine then reads the comment back
+through its own `CAST(RDB$DESCRIPTION AS VARCHAR)` — and that the whole 30-byte
+blob record ahead of the text matches the engine's byte for byte — is the
+evidence that the generalisation is real and not just a parser that accepts
+more words.
+
+`qa/serve-real-comment2.sh` (20 checks) is the sixty-fifth's gate pointed at the
+new kinds: it creates a table with an index and two sequences, comments the
+index and both sequences (one through the `GENERATOR` synonym, one carrying a
+`''` escape) through fire-crab and the engine on two copies, reads every
+`RDB$DESCRIPTION` back as text and compares, reads the index's description blob
+record off both files and compares it byte for byte (header, charset and
+segment framing), confirms the charset is 4, clears a comment each way (`IS
+NULL` on the index and `IS ''` on a sequence) and checks the columns go NULL
+while an untouched sequence's comment survives, checks the unknown-index and
+unknown-sequence refusals on both, and finishes with a `gbak` round trip (the
+`''` escape survives) and `gfix`. Teeth: the same charset trap as the
+sixty-fifth, on the two new relations.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -3017,6 +3059,17 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-comment.sh 3050
+
+# COMMENT ON INDEX / SEQUENCE: the same description mechanism, on the
+# other objects fire-crab can create - the blob lands in RDB$INDICES /
+# RDB$GENERATORS instead of RDB$RELATIONS, one shared code path names the
+# row. SEQUENCE and GENERATOR are synonyms. Same charset-4 rule, checked
+# byte for byte on the index's blob record. gbak and gfix. Builds its own
+# scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-comment2.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
