@@ -2456,6 +2456,64 @@ first `NEXT VALUE FOR` yields the declared start on both, and `gbak` and
 `gfix` close it out. Teeth: assigning ids without advancing the master
 generator makes 15 checks `DIFF`; omitting the security class makes 3.
 
+### The sixty-second differential — ALTER INDEX, and the number nobody had written
+
+`ALTER INDEX <name> ACTIVE | INACTIVE` is the third user of the engine's
+deferred index removal, and the first statement that *rebuilds* an index.
+
+**Deactivating is the deferred drop minus the catalog teardown.** The
+index-root slot moves into the drop states with its pages; the `RDB$INDICES`
+row keeps its name, its id and its segment rows, and only
+`RDB$INDEX_INACTIVE` moves to 1. Everything that makes this behave correctly
+was already there, and it came from the previous index slice: a slot with a
+root page is still *maintained*, and `setDrop` clearing
+`irt_unique | irt_primary | irt_foreign` is what stops it *enforcing*. So an
+inactive `UNIQUE` index quietly accepts duplicates — engine-probed, and the
+gate inserts one through fire-crab and has the engine accept it on its own
+copy too — while the tree keeps taking entries for every row inserted
+meanwhile.
+
+**Reactivating rebuilds.** `AlterIndexNode::step2` tries to *undo* the delete
+first, but once the deactivating transaction has committed that undo is
+refused and the index is built from scratch. The engine probe is blunt: even
+inside a single isql session, `ALTER INDEX ... INACTIVE; ALTER INDEX ...
+ACTIVE` moves `RDB$INDEX_ID` on, leaves the old slot in the drop state with
+its pages, and gives the index a fresh tree. So fire-crab takes a new slot,
+backfills every committed row — a duplicate admitted while the index was
+inactive fails the statement, exactly as the engine's rebuild does — and the
+row inserted *during* the deactivation is in the rebuilt tree, which the gate
+checks by asking the engine's optimizer to find it through that very index.
+
+**And a rebuild recomputes the selectivity — which fire-crab had never
+written at all.** The engine keeps it in three places at once: the
+`irtd_selectivity` float of each segment descriptor on the index root page,
+`RDB$INDEX_SEGMENTS.RDB$STATISTICS` per key *prefix*, and
+`RDB$INDICES.RDB$STATISTICS` for the whole key. The value is `1 / distinct`
+over the committed rows, with a NULL key counting as a key (two all-NULL rows
+give 1.0) and an empty relation giving 0.0 rather than a division by zero.
+Every fire-crab index build now computes it, `CREATE INDEX` included — an
+index built over an empty table carries 0 on both sides, one built over rows
+carries the same fraction the engine computes, and a two-segment index
+carries a different number per prefix (1/3 then 1/4 in the gate). That is a
+column of the catalog that used to be silently null on fire-crab's files and
+is now compared.
+
+One boundary is stated rather than hidden: *which* slot a reactivation takes
+is the engine's own timing. If its background cleanup has already released
+the deactivated slot, the engine reuses it and `RDB$INDEX_ID` comes back
+unchanged; if not, it takes the next free one. fire-crab, an offline writer
+that never garbage-collects, always takes the next free slot. So
+`qa/serve-real-alterindex.sh` (38 checks) compares the *live* slots — one per
+index the engine will actually use — and normalises that one id, while
+comparing everything else exactly: both catalogs with their statistics, the
+rows, the optimizer's plans on fire-crab's raw file (`INDEX` through the
+reactivated index, `NATURAL` over the deactivated one), enforcement (the
+inactive `UNIQUE` lets a duplicate in on both files, the primary key refuses
+one on both), the three refusals — a constraint's index cannot be
+deactivated, an unknown name errors, a reactivation over duplicates fails —
+and `gbak` plus `gfix`. Teeth: leaving the irt flags alone on deactivation
+makes 8 checks `DIFF`; not computing the selectivity makes 3.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -2786,6 +2844,20 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-sequence.sh 3050
+
+# ALTER INDEX ACTIVE/INACTIVE: deactivation is the deferred drop minus the
+# catalog teardown (still maintained, no longer enforcing - an inactive
+# UNIQUE index accepts a duplicate on both files); reactivation REBUILDS
+# into a new slot and recomputes the SELECTIVITY the engine keeps in three
+# places (irtd_selectivity, per-prefix segment statistics, the index's own)
+# - which every fire-crab index build now writes. Catalogs, live index-root
+# slots, the optimizer's plans and the refusals compared; gbak and gfix.
+# Builds its own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire \
+    FCSTAT=/path/to/fire-crab/target/release/fcstat ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-alterindex.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
