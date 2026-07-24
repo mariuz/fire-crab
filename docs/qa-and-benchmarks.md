@@ -2928,6 +2928,42 @@ missing exception on both, and finishes with a `gbak` round trip (the `''`
 escape survives) and `gfix`. Teeth: an alter that reallocated the number, or one
 that touched the class, `DIFF`s the row comparison.
 
+### The seventy-fourth differential — CREATE DOMAIN, and a length that was wrong
+
+A domain is a named, reusable type. On disk it is the leanest object yet: a
+single `RDB$FIELDS` row named by the user — the very row a table column's
+anonymous `RDB$<n>` auto-domain already gets, only with a chosen name and no
+relation to link it to. `CREATE DOMAIN <name> [AS] <type> [NOT NULL]` writes the
+type columns (`RDB$FIELD_TYPE`, length, scale, sub-type, and for text a charset,
+collation and character length), and `NOT NULL` sets `RDB$NULL_FLAG` on the
+domain itself — where a table column instead keeps its NOT NULL on
+`RDB$RELATION_FIELDS`. `DROP DOMAIN` deletes the row, and is refused while a
+table column still names it as its `RDB$FIELD_SOURCE`.
+
+Reusing the column parser to read the type surfaced a bug that had been sitting
+in `CREATE TABLE` unnoticed. `RDB$FIELD_LENGTH` is the *byte* length of a field;
+for a `VARCHAR(20)` over the default charset that is 20. fire-crab's column path
+had been writing the field's *storage* length there — 22, the character count
+plus the two-byte count word a `VARYING` carries on disk. The two are different
+numbers, and the engine writes 20; the storage length belongs in the format
+descriptor (where fire-crab does put it, correctly), not in the catalog's
+`RDB$FIELD_LENGTH`. No earlier gate had compared that column against the engine's
+own value, so the 22 had passed. The domain path writes the byte length, and its
+gate compares it to the engine — which is what catches it. (The same off-by-the-
+count-word sits in `CREATE TABLE`'s auto-domain row and is noted for a
+follow-up; a domain and a table column of the same `VARCHAR` should agree.)
+
+`qa/serve-real-domain.sh` (17 checks) creates four domains — an integer, a
+`VARCHAR(20)`, a `NOT NULL` integer and a `NUMERIC(9,2)` — and drops one, through
+fire-crab and the engine on two copies of a database (a fifth domain and a table
+that uses it come from the shared scratch database, so it is in use on both). It
+compares every `RDB$FIELDS` row — type, length, char length, scale, sub-type,
+null flag, charset and collation — confirms the `VARCHAR` length is the char
+count and the `NOT NULL` set `RDB$NULL_FLAG`, refuses a drop of the in-use domain
+and of a missing one on both, and finishes with a `gbak` round trip and `gfix`.
+Teeth: writing the storage length in `RDB$FIELD_LENGTH` `DIFF`s the row
+comparison the moment it is checked against the engine.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -3397,6 +3433,17 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-altexception.sh 3050
+
+# CREATE / DROP DOMAIN: a standalone type - one RDB$FIELDS row named by
+# the user (the row a table column's auto-domain gets). NOT NULL sets
+# RDB$NULL_FLAG on the domain; RDB$FIELD_LENGTH is the BYTE length (a
+# VARCHAR(20) is 20, not the +2 storage length). DROP is refused while a
+# table column uses the domain. gbak and gfix. Builds its own scratch
+# database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-domain.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
