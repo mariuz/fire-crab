@@ -711,6 +711,10 @@ enum Plan {
     /// `DROP SEQUENCE|GENERATOR <name>`: the catalog rows go, the
     /// stored value stays behind
     DropSequence { name: String },
+    /// `ALTER INDEX <name> ACTIVE|INACTIVE`: INACTIVE moves the slot to
+    /// the drop states (still maintained, no longer enforcing), ACTIVE
+    /// REBUILDS the index into a new slot and recomputes its selectivity
+    AlterIndex { name: String, active: bool },
     /// `ALTER TABLE <table> ADD <column>`: a new format version, the new
     /// column's catalog rows, and a version rewrite of the RDB$RELATIONS
     /// row bumping its format and field count
@@ -1738,6 +1742,29 @@ fn plan_drop_sequence(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     Some((Plan::DropSequence { name: unquote_ident(toks[2])? }, Vec::new()))
 }
 
+/// Parse `ALTER INDEX <name> ACTIVE|INACTIVE`.
+fn plan_alter_index(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    if toks.len() != 4
+        || !toks[0].eq_ignore_ascii_case("ALTER")
+        || !toks[1].eq_ignore_ascii_case("INDEX")
+    {
+        return None;
+    }
+    let active = if toks[3].eq_ignore_ascii_case("ACTIVE") {
+        true
+    } else if toks[3].eq_ignore_ascii_case("INACTIVE") {
+        false
+    } else {
+        return None;
+    };
+    Some((
+        Plan::AlterIndex { name: unquote_ident(toks[2])?, active },
+        Vec::new(),
+    ))
+}
+
 /// Parse `ALTER TABLE <table> ADD <column def>` - append one nullable
 /// plain column. A NOT NULL or PRIMARY KEY on the added column is a
 /// constraint over the table's existing rows and is left for later
@@ -2740,6 +2767,10 @@ fn execute_dml(
         }
         Plan::DropSequence { name } => {
             fire_crab_ods::ddl::drop_sequence(&mut work, db.page_size, name)?;
+            (0, 0, 0)
+        }
+        Plan::AlterIndex { name, active } => {
+            fire_crab_ods::ddl::alter_index_active(&mut work, db.page_size, name, *active)?;
             (0, 0, 0)
         }
         Plan::AlterTableAdd { table, col } => {
@@ -4233,6 +4264,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
+        | Plan::AlterIndex { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -4265,6 +4297,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
+        | Plan::AlterIndex { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -4584,6 +4617,7 @@ fn emit_rows_inner(
         | Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
+        | Plan::AlterIndex { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -7006,6 +7040,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             .or_else(|| plan_drop_index(&text))
                             .or_else(|| plan_create_sequence(&text))
                             .or_else(|| plan_drop_sequence(&text))
+                            .or_else(|| plan_alter_index(&text))
                             .or_else(|| plan_alter_table_add(&text))
                             .or_else(|| plan_alter_table_drop(&text))
                             .or_else(|| plan_alter_table_alter_type(&text))
@@ -7146,6 +7181,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         .or_else(|| plan_drop_index(&stmt_sql))
                         .or_else(|| plan_create_sequence(&stmt_sql))
                         .or_else(|| plan_drop_sequence(&stmt_sql))
+                        .or_else(|| plan_alter_index(&stmt_sql))
                         .or_else(|| plan_alter_table_add(&stmt_sql))
                         .or_else(|| plan_alter_table_drop(&stmt_sql))
                         .or_else(|| plan_alter_table_alter_type(&stmt_sql))
@@ -7252,6 +7288,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::DropIndex { .. }
                         | Plan::CreateSequence { .. }
                         | Plan::DropSequence { .. }
+                        | Plan::AlterIndex { .. }
                         | Plan::AlterTableAdd { .. }
                         | Plan::AlterTableAddFk { .. }
                         | Plan::AlterTableAddKey { .. }
@@ -10175,6 +10212,28 @@ mod tests {
         // a DROP INDEX/TABLE is not a DROP SEQUENCE, and neither is a bare one
         assert!(plan_drop_sequence("DROP INDEX IX").is_none());
         assert!(plan_drop_sequence("DROP SEQUENCE").is_none());
+    }
+
+    #[test]
+    fn parses_alter_index_active_and_inactive() {
+        match plan_alter_index("ALTER INDEX IX_TB INACTIVE") {
+            Some((Plan::AlterIndex { name, active }, _)) => {
+                assert_eq!(name, "IX_TB");
+                assert!(!active);
+            }
+            other => panic!("expected AlterIndex, got {:?}", other.is_some()),
+        }
+        match plan_alter_index("alter index \"ix_lower\" active;") {
+            Some((Plan::AlterIndex { name, active }, _)) => {
+                assert_eq!(name, "ix_lower");
+                assert!(active);
+            }
+            other => panic!("expected AlterIndex, got {:?}", other.is_some()),
+        }
+        // not an ALTER INDEX, and no state given
+        assert!(plan_alter_index("ALTER TABLE T ADD X INT").is_none());
+        assert!(plan_alter_index("ALTER INDEX IX_TB").is_none());
+        assert!(plan_alter_index("ALTER INDEX IX_TB REBUILD").is_none());
     }
 
     #[test]

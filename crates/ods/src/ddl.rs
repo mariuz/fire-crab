@@ -93,6 +93,8 @@ pub struct KeyDef {
 enum SysVal<'a> {
     I(i64),
     S(&'a str),
+    /// a DOUBLE PRECISION catalog column (index selectivity)
+    F(f64),
     /// the 8 on-disk blob-id bytes
     B([u8; 8]),
 }
@@ -175,6 +177,7 @@ fn encode_sys_value(d: &Descriptor, v: &SysVal<'_>) -> Result<Vec<u8>, String> {
             out.extend_from_slice(b);
             out
         }
+        (SysVal::F(v), dtype::DOUBLE) => v.to_le_bytes().to_vec(),
         (SysVal::B(id), dtype::BLOB) => id.to_vec(),
         _ => return Err("catalog value/type mismatch".into()),
     })
@@ -222,7 +225,8 @@ fn sys_insert(
         key_values[fid] = match v {
             SysVal::I(n) => Value::Int(*n),
             SysVal::S(s) => Value::Text((*s).to_string()),
-            SysVal::B(_) => Value::Null, // no catalog index covers a blob
+            // no catalog index covers a blob or a selectivity
+            SysVal::B(_) | SysVal::F(_) => Value::Null,
         };
     }
 
@@ -1678,6 +1682,223 @@ pub fn drop_index(file: &mut Vec<u8>, page_size: usize, index_name: &str) -> Res
     Ok(())
 }
 
+/// `ALTER INDEX <name> ACTIVE|INACTIVE` - `AlterIndexNode`
+/// (DdlNodes.epp:14270) against the file image.
+///
+/// INACTIVE is the deferred index drop again, minus the catalog
+/// teardown: the index-root slot goes to the drop states with its pages,
+/// which (per the DROP INDEX slice) means the tree keeps being
+/// MAINTAINED while `setDrop`'s cleared `irt_unique|irt_primary|
+/// irt_foreign` stop it being ENFORCED - an inactive UNIQUE index
+/// accepts duplicates, engine-probed. The `RDB$INDICES` row keeps its
+/// name, its id and its segment rows; only `RDB$INDEX_INACTIVE` moves to
+/// 1 (`MET_index_inactive`, Relation.h:449).
+///
+/// ACTIVE REBUILDS. `AlterIndexNode::step2` tries `IDX_activate_index`
+/// first, but once the deactivating transaction has committed that undo
+/// is refused and the index is built from scratch (engine probe: even in
+/// the same isql session, `RDB$INDEX_ID` moves 1 -> 2, the old slot stays
+/// in the drop state with its pages, the new slot is a fresh tree). So
+/// this takes a NEW slot, backfills every committed row - a duplicate
+/// under a unique index fails the statement, exactly as the engine's
+/// rebuild does - and recomputes the selectivity.
+///
+/// An index backing a constraint cannot be deactivated at all
+/// ("Cannot deactivate index used by a PRIMARY/UNIQUE constraint" /
+/// "... by an integrity constraint").
+pub fn alter_index_active(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    index_name: &str,
+    active: bool,
+) -> Result<(), String> {
+    let want = index_name.trim().trim_matches('"').to_ascii_uppercase();
+    let (table, system) = find_index_relation(file, page_size, &want)
+        .ok_or_else(|| format!("Index not found: {}", want))?;
+    if system != 0 {
+        return Err("system indices are read-only".into());
+    }
+    let rel = crate::resolve_relation(file, page_size, &table)
+        .ok_or_else(|| format!("table {} not found", table))?;
+    if rel < 128 {
+        return Err("system relations are read-only".into());
+    }
+    let (inactive, unique, descending) = index_row_state(file, page_size, &want)?;
+    if (inactive == 0) == active {
+        return Ok(()); // already in the desired state: the engine does nothing
+    }
+    if !active {
+        if let Some(constraint) = constraint_using_index(file, page_size, &want) {
+            return Err(format!(
+                "Cannot deactivate index used by an integrity constraint (constraint {})",
+                constraint
+            ));
+        }
+        let id = index_id_of(file, page_size, &want)?;
+        mark_index_slot_dropped(file, page_size, rel, id.saturating_sub(1))?;
+        let ix_name = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME")?;
+        patch_sys_row(
+            file,
+            page_size,
+            "RDB$INDICES",
+            4,
+            |v| text_eq(v.get(ix_name), &want),
+            &[("RDB$INDEX_INACTIVE", SysVal::I(1))], // MET_index_inactive
+        )?;
+        advance_oldest_transactions(file, page_size)?;
+        return Ok(());
+    }
+
+    // ACTIVE: a rebuild into a new slot
+    let columns = relation_columns(file, page_size, &table);
+    let formats = crate::relation_formats(file, page_size, rel);
+    let (_, descs) = formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .ok_or("relation has no format")?;
+    let descs = descs.clone();
+    let mut segs: Vec<(u16, u16, i8)> = Vec::new();
+    for n in index_segment_columns(file, page_size, &want)? {
+        let rc = columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&n))
+            .ok_or_else(|| format!("unknown column {}", n))?;
+        let d = descs
+            .get(rc.field_id as usize)
+            .ok_or("field beyond format")?;
+        let itype = index_itype(d).ok_or("column type cannot be indexed by this writer")?;
+        segs.push((rc.field_id, itype, d.scale));
+    }
+    if segs.is_empty() {
+        return Err(format!("index {} has no segments", want));
+    }
+    let mut iflags = 0u16;
+    if unique {
+        iflags |= btw::IRT_UNIQUE;
+    }
+    if descending {
+        iflags |= btw::IRT_DESCENDING;
+    }
+    let slot = allocate_index_slot(file, page_size, rel, &segs, iflags)?;
+    backfill_index(
+        file, page_size, rel, slot, &segs, &descs, unique, descending, false,
+    )?;
+    let ix_name = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME")?;
+    patch_sys_row(
+        file,
+        page_size,
+        "RDB$INDICES",
+        4,
+        |v| text_eq(v.get(ix_name), &want),
+        &[
+            ("RDB$INDEX_INACTIVE", SysVal::I(0)), // MET_index_active
+            ("RDB$INDEX_ID", SysVal::I(slot as i64 + 1)),
+        ],
+    )?;
+    let sel = index_selectivity(file, page_size, rel, &segs, descending)?;
+    write_index_statistics(file, page_size, rel, slot, &want, &sel)?;
+    advance_oldest_transactions(file, page_size)
+}
+
+/// An index's `(RDB$INDEX_INACTIVE, unique, descending)` from
+/// RDB$INDICES. A NULL `RDB$INDEX_INACTIVE` counts as active (0), the
+/// way `MetadataCache::getIndexStatus` reads it.
+fn index_row_state(file: &[u8], page_size: usize, name: &str) -> Result<(i64, bool, bool), String> {
+    let formats = system_relation_formats(file, page_size, "RDB$INDICES")
+        .ok_or("no RDB$INDICES format")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let name_f = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME")?;
+    let inact_f = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_INACTIVE")?;
+    let uniq_f = sys_fid(file, page_size, "RDB$INDICES", "RDB$UNIQUE_FLAG")?;
+    let type_f = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_TYPE")?;
+    let mut found = None;
+    walk_rows(file, page_size, 4, descs, |values| {
+        if text_eq(values.get(name_f), name) {
+            let int = |v: Option<&Value>| match v {
+                Some(Value::Int(i)) => *i,
+                _ => 0,
+            };
+            found = Some((
+                int(values.get(inact_f)),
+                int(values.get(uniq_f)) == 1,
+                int(values.get(type_f)) == 1,
+            ));
+        }
+    });
+    found.ok_or_else(|| format!("Index not found: {}", name))
+}
+
+/// An index's `RDB$INDEX_ID` (the index-root slot plus one).
+fn index_id_of(file: &[u8], page_size: usize, name: &str) -> Result<usize, String> {
+    let formats = system_relation_formats(file, page_size, "RDB$INDICES")
+        .ok_or("no RDB$INDICES format")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let name_f = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME")?;
+    let id_f = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_ID")?;
+    let mut found = None;
+    walk_rows(file, page_size, 4, descs, |values| {
+        if text_eq(values.get(name_f), name) {
+            if let Some(Value::Int(i)) = values.get(id_f) {
+                found = Some(*i as usize);
+            }
+        }
+    });
+    found.ok_or_else(|| format!("index {} has no id", name))
+}
+
+/// An index's column names, in key order, from RDB$INDEX_SEGMENTS.
+fn index_segment_columns(
+    file: &[u8],
+    page_size: usize,
+    name: &str,
+) -> Result<Vec<String>, String> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$INDEX_SEGMENTS")
+        .ok_or("no RDB$INDEX_SEGMENTS relation")?;
+    let formats = system_relation_formats(file, page_size, "RDB$INDEX_SEGMENTS")
+        .ok_or("no RDB$INDEX_SEGMENTS format")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let name_f = sys_fid(file, page_size, "RDB$INDEX_SEGMENTS", "RDB$INDEX_NAME")?;
+    let field_f = sys_fid(file, page_size, "RDB$INDEX_SEGMENTS", "RDB$FIELD_NAME")?;
+    let pos_f = sys_fid(file, page_size, "RDB$INDEX_SEGMENTS", "RDB$FIELD_POSITION")?;
+    let mut segs: Vec<(i64, String)> = Vec::new();
+    walk_rows(file, page_size, rel, descs, |values| {
+        if text_eq(values.get(name_f), name) {
+            if let Some(Value::Text(t)) = values.get(field_f) {
+                let pos = match values.get(pos_f) {
+                    Some(Value::Int(i)) => *i,
+                    _ => 0,
+                };
+                segs.push((pos, t.trim_end().to_string()));
+            }
+        }
+    });
+    segs.sort_by_key(|(p, _)| *p);
+    Ok(segs.into_iter().map(|(_, n)| n).collect())
+}
+
+/// Move one index-root slot into the drop states with its pages kept -
+/// `setDrop` (ods.h:613), which also clears
+/// `irt_unique|irt_foreign|irt_primary`, so the tree is still maintained
+/// but no longer enforces anything.
+fn mark_index_slot_dropped(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    rel: u16,
+    slot: usize,
+) -> Result<(), String> {
+    let irt_page = file
+        .chunks_exact(page_size)
+        .position(|p| p[0] == 6 && u16_at(p, 16) == rel)
+        .ok_or("relation has no index root page")?;
+    let at = irt_page * page_size + 24 + slot * 24;
+    if at + 24 > file.len() {
+        return Err("index slot beyond the root page".into());
+    }
+    dml::put_u16(file, at + 18, 0); // irt_flags
+    file[at + 20] = 6; // irt_drop (ods.h:456)
+    Ok(())
+}
+
 /// An index's (relation name, RDB$SYSTEM_FLAG) from RDB$INDICES.
 fn find_index_relation(file: &[u8], page_size: usize, index_name: &str) -> Option<(String, i64)> {
     let rel = crate::resolve_relation(file, page_size, "RDB$INDICES")?;
@@ -2268,42 +2489,6 @@ pub fn create_index(
         return Err("an index needs at least one column".into());
     }
 
-    // the irt slot: first empty repeat on the relation's root page,
-    // descriptor space carved from the tail below the lowest in use
-    let irt_page = file
-        .chunks_exact(page_size)
-        .position(|p| p[0] == 6 && u16_at(p, 16) == rel)
-        .ok_or("relation has no index root page")? as u32;
-    let base = irt_page as usize * page_size;
-    let mut slot = None;
-    let mut lowest_desc = page_size;
-    for i in 0..((page_size - 24) / 24) {
-        let at = base + 24 + i * 24;
-        let root = u32_at(file, at + 8);
-        if root == 0 {
-            if slot.is_none() {
-                slot = Some(i);
-                break;
-            }
-        } else {
-            lowest_desc = lowest_desc.min(u16_at(file, at + 16) as usize);
-        }
-    }
-    let slot = slot.ok_or("no free index slot")?;
-    let desc_off = lowest_desc
-        .checked_sub(8 * segs.len())
-        .ok_or("irt page full")?;
-    if 24 + (slot + 1) * 24 > desc_off {
-        return Err("irt page full".into());
-    }
-
-    let root_page = dml::allocate_page(file, page_size)?;
-    {
-        let start = root_page as usize * page_size;
-        file[start..start + page_size].fill(0);
-    }
-    btw::write_empty_root(file, page_size, root_page, rel, slot as u8)?;
-
     let mut iflags = 0u16;
     if unique {
         iflags |= btw::IRT_UNIQUE;
@@ -2317,27 +2502,7 @@ pub fn create_index(
     if foreign_key.is_some() {
         iflags |= btw::IRT_FOREIGN; // ods.h:461
     }
-    let at = base + 24 + slot * 24;
-    file[at..at + 8].copy_from_slice(&0u64.to_le_bytes()); // irt_transaction
-    dml::put_u32(file, at + 8, root_page);
-    dml::put_u32(file, at + 12, 0); // page space
-    dml::put_u16(file, at + 16, desc_off as u16);
-    dml::put_u16(file, at + 18, iflags);
-    file[at + 20] = 3; // irt_normal
-    file[at + 21] = segs.len() as u8;
-    file[at + 22] = 0;
-    file[at + 23] = 0;
-    for (i, (field, itype, _)) in segs.iter().enumerate() {
-        let d = base + desc_off + i * 8;
-        dml::put_u16(file, d, *field);
-        dml::put_u16(file, d + 2, *itype);
-        dml::put_u32(file, d + 4, 0); // selectivity
-    }
-    let count_at = base + 18; // irt_count @18
-    let count = u16_at(file, count_at);
-    if (slot as u16) + 1 > count {
-        dml::put_u16(file, count_at, slot as u16 + 1);
-    }
+    let slot = allocate_index_slot(file, page_size, rel, &segs, iflags)?;
 
     // catalog rows. NOTE: the bucket page is NOT registered in
     // RDB$PAGES - only pag_pointer/pag_root/pag_transactions/pag_ids
@@ -2381,7 +2546,101 @@ pub fn create_index(
         ])?;
     }
 
-    // BACKFILL: key every committed primary row into the new tree
+    backfill_index(
+        file, page_size, rel, slot, &segs, descs, unique, descending, primary,
+    )?;
+    // the selectivity the engine computes at build time and keeps in
+    // three places
+    let sel = index_selectivity(file, page_size, rel, &segs, descending)?;
+    write_index_statistics(file, page_size, rel, slot, index_name, &sel)
+}
+
+/// Take the first free index-root slot for a new index of `rel`: the
+/// first repeat with no root page, its segment descriptors carved from
+/// the page tail below the lowest in use, an empty root bucket
+/// allocated, the repeat written `irt_normal`. Returns the slot -
+/// `RDB$INDEX_ID - 1`.
+fn allocate_index_slot(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    rel: u16,
+    segs: &[(u16, u16, i8)],
+    iflags: u16,
+) -> Result<usize, String> {
+    let irt_page = file
+        .chunks_exact(page_size)
+        .position(|p| p[0] == 6 && u16_at(p, 16) == rel)
+        .ok_or("relation has no index root page")? as u32;
+    let base = irt_page as usize * page_size;
+    let mut slot = None;
+    let mut lowest_desc = page_size;
+    for i in 0..((page_size - 24) / 24) {
+        let at = base + 24 + i * 24;
+        let root = u32_at(file, at + 8);
+        if root == 0 {
+            if slot.is_none() {
+                slot = Some(i);
+                break;
+            }
+        } else {
+            lowest_desc = lowest_desc.min(u16_at(file, at + 16) as usize);
+        }
+    }
+    let slot = slot.ok_or("no free index slot")?;
+    let desc_off = lowest_desc
+        .checked_sub(8 * segs.len())
+        .ok_or("irt page full")?;
+    if 24 + (slot + 1) * 24 > desc_off {
+        return Err("irt page full".into());
+    }
+
+    let root_page = dml::allocate_page(file, page_size)?;
+    {
+        let start = root_page as usize * page_size;
+        file[start..start + page_size].fill(0);
+    }
+    btw::write_empty_root(file, page_size, root_page, rel, slot as u8)?;
+
+    let at = base + 24 + slot * 24;
+    file[at..at + 8].copy_from_slice(&0u64.to_le_bytes()); // irt_transaction
+    dml::put_u32(file, at + 8, root_page);
+    dml::put_u32(file, at + 12, 0); // page space
+    dml::put_u16(file, at + 16, desc_off as u16);
+    dml::put_u16(file, at + 18, iflags);
+    file[at + 20] = 3; // irt_normal
+    file[at + 21] = segs.len() as u8;
+    file[at + 22] = 0;
+    file[at + 23] = 0;
+    for (i, (field, itype, _)) in segs.iter().enumerate() {
+        let d = base + desc_off + i * 8;
+        dml::put_u16(file, d, *field);
+        dml::put_u16(file, d + 2, *itype);
+        dml::put_u32(file, d + 4, 0); // selectivity, computed after the build
+    }
+    let count_at = base + 18; // irt_count @18
+    let count = u16_at(file, count_at);
+    if (slot as u16) + 1 > count {
+        dml::put_u16(file, count_at, slot as u16 + 1);
+    }
+    Ok(slot)
+}
+
+/// Key every committed primary row of `rel` into the tree at `slot` -
+/// what an index build (CREATE INDEX, ALTER INDEX ACTIVE, a key
+/// constraint over existing rows) does. A duplicate under a unique or
+/// primary index fails the whole statement, as the engine's build does.
+#[allow(clippy::too_many_arguments)]
+fn backfill_index(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    rel: u16,
+    slot: usize,
+    segs: &[(u16, u16, i8)],
+    descs: &[Descriptor],
+    unique: bool,
+    descending: bool,
+    primary: bool,
+) -> Result<(), String> {
     let recs = max_recs_per_dp(page_size);
     for dp_no in relation_data_pages(file, page_size, rel) {
         let start = dp_no as usize * page_size;
@@ -2683,6 +2942,169 @@ pub fn drop_table(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<()
     Ok(())
 }
 
+
+/// Rewrite named columns of ONE system-relation row in place, at its
+/// current format. The row keeps its position (so its record number,
+/// and every index entry pointing at it, stay valid) - which is only
+/// safe for columns no index of the relation keys; a keyed column needs
+/// [maintain_indexes] afterwards, as the deferred index drop does.
+fn patch_sys_row(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    rel_name: &str,
+    rel: u16,
+    pred: impl Fn(&[Value]) -> bool,
+    values: &[(&str, SysVal<'_>)],
+) -> Result<(), String> {
+    let formats =
+        system_relation_formats(file, page_size, rel_name).ok_or("no computed system format")?;
+    let (format_no, descs) = {
+        let (n, d) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+        (*n, d.clone())
+    };
+    let (page, slot) = find_sys_row_slot(file, page_size, rel_name, rel, pred)
+        .ok_or_else(|| format!("no matching {} row", rel_name))?;
+    let mut image = {
+        let start = page as usize * page_size;
+        let dp = DataPage::decode(file.get(start..start + page_size).ok_or("bad page")?)
+            .ok_or("bad data page")?;
+        dp.record(slot).and_then(|r| r.image()).ok_or("no row image")?
+    };
+    let columns = relation_columns(file, page_size, rel_name);
+    for (name, v) in values {
+        let fid = columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| format!("unknown catalog column {}", name))?
+            .field_id as usize;
+        let d = descs.get(fid).ok_or("field beyond computed format")?;
+        let bytes = encode_sys_value(d, v)?;
+        let at = d.offset as usize;
+        image
+            .get_mut(at..at + bytes.len())
+            .ok_or("image shorter than its format")?
+            .copy_from_slice(&bytes);
+        image[fid / 8] &= !(1 << (fid % 8)); // not NULL
+    }
+    dml::update_records(file, page_size, rel, &[(page, slot, image)], format_no)?;
+    Ok(())
+}
+
+/// An index's selectivity, per key prefix: `1 / distinct` over the
+/// relation's committed primary rows, counting a NULL key as a key
+/// (engine probe: two all-NULL rows give 1.0). Prefix `i` covers
+/// segments `0..=i`, so the last entry is the whole key's selectivity -
+/// which is what `RDB$INDICES.RDB$STATISTICS` carries, while
+/// `RDB$INDEX_SEGMENTS.RDB$STATISTICS` carries one per prefix. An empty
+/// relation is 0.0, not 1/0.
+///
+/// The engine stores these as 4-byte floats both on the index root page
+/// (`irtd_selectivity`) and in the catalog, so they are computed as f32.
+fn index_selectivity(
+    file: &[u8],
+    page_size: usize,
+    rel: u16,
+    segs: &[(u16, u16, i8)],
+    descending: bool,
+) -> Result<Vec<f32>, String> {
+    let formats = crate::relation_formats(file, page_size, rel);
+    let (_, descs) = formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .ok_or("relation has no format")?;
+    let mut distinct: Vec<std::collections::BTreeSet<Vec<u8>>> =
+        vec![std::collections::BTreeSet::new(); segs.len()];
+    let mut rows = 0usize;
+    for dp_no in relation_data_pages(file, page_size, rel) {
+        let start = dp_no as usize * page_size;
+        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+            continue;
+        };
+        for r in dp.records() {
+            if !r.is_primary_record() {
+                continue;
+            }
+            let Some(image) = r.image() else { continue };
+            let values = decode_record(&image, descs);
+            rows += 1;
+            let null = Value::Null;
+            for prefix in 0..segs.len() {
+                let key_segs: Vec<btw::KeySeg<'_>> = segs[..=prefix]
+                    .iter()
+                    .map(|(field, itype, scale)| btw::KeySeg {
+                        itype: *itype,
+                        value: values.get(*field as usize).unwrap_or(&null),
+                        scale: *scale,
+                    })
+                    .collect();
+                let (key, _) = btw::build_index_key(&key_segs, descending)
+                    .ok_or("unsupported value for an index key")?;
+                distinct[prefix].insert(key);
+            }
+        }
+    }
+    Ok(distinct
+        .iter()
+        .map(|d| {
+            if rows == 0 || d.is_empty() {
+                0.0
+            } else {
+                1.0 / d.len() as f32
+            }
+        })
+        .collect())
+}
+
+/// Write an index's computed selectivity where the engine keeps it:
+/// the `irtd_selectivity` float of each segment descriptor on the index
+/// root page, `RDB$INDEX_SEGMENTS.RDB$STATISTICS` per segment, and
+/// `RDB$INDICES.RDB$STATISTICS` (the whole key's, i.e. the last prefix).
+fn write_index_statistics(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    rel: u16,
+    slot: usize,
+    index_name: &str,
+    selectivity: &[f32],
+) -> Result<(), String> {
+    let irt_page = file
+        .chunks_exact(page_size)
+        .position(|p| p[0] == 6 && u16_at(p, 16) == rel)
+        .ok_or("relation has no index root page")?;
+    let base = irt_page * page_size;
+    let at = base + 24 + slot * 24;
+    let desc_off = u16_at(file, at + 16) as usize;
+    for (i, sel) in selectivity.iter().enumerate() {
+        let d = base + desc_off + i * 8 + 4;
+        file.get_mut(d..d + 4)
+            .ok_or("segment descriptor beyond the root page")?
+            .copy_from_slice(&sel.to_le_bytes());
+    }
+    let seg_name = sys_fid(file, page_size, "RDB$INDEX_SEGMENTS", "RDB$INDEX_NAME")?;
+    let seg_pos = sys_fid(file, page_size, "RDB$INDEX_SEGMENTS", "RDB$FIELD_POSITION")?;
+    let seg_rel = crate::resolve_relation(file, page_size, "RDB$INDEX_SEGMENTS")
+        .ok_or("no RDB$INDEX_SEGMENTS relation")?;
+    for (i, sel) in selectivity.iter().enumerate() {
+        patch_sys_row(
+            file,
+            page_size,
+            "RDB$INDEX_SEGMENTS",
+            seg_rel,
+            |v| text_eq(v.get(seg_name), index_name) && int_eq(v.get(seg_pos), i as i64),
+            &[("RDB$STATISTICS", SysVal::F(*sel as f64))],
+        )?;
+    }
+    let ix_name = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME")?;
+    let whole = *selectivity.last().unwrap_or(&0.0);
+    patch_sys_row(
+        file,
+        page_size,
+        "RDB$INDICES",
+        4,
+        |v| text_eq(v.get(ix_name), index_name),
+        &[("RDB$STATISTICS", SysVal::F(whole as f64))],
+    )
+}
 
 /// A generator's `(RDB$GENERATOR_ID, RDB$SYSTEM_FLAG, RDB$SECURITY_CLASS)`
 /// from `RDB$GENERATORS`, by name. None when there is no such generator.
