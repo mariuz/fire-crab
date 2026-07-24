@@ -2904,6 +2904,30 @@ lands identically, and finishes with a `gbak` round trip and `gfix`. Teeth:
 putting a plain member in the ACL, or an admin member with the wrong privilege,
 `DIFF`s the byte-for-byte check while the membership rows still match.
 
+### The seventy-third differential — ALTER EXCEPTION, and create-or-alter
+
+The sixty-eighth differential created and dropped an exception; this one changes
+one. `ALTER EXCEPTION <name> <message>` rewrites the `RDB$MESSAGE` in place and
+leaves everything else — the number, the security class — untouched, and it
+refuses a name that does not exist. `CREATE OR ALTER EXCEPTION` is the same
+statement wearing both hats: it alters the exception when it exists, *keeping its
+number*, and creates it (allocating the next number from the `RDB$EXCEPTIONS`
+generator) when it does not. The distinction the parser has to keep straight is
+that `CREATE`, `ALTER` and `CREATE OR ALTER` are three different leads on the
+same `EXCEPTION <name> <message>` tail, and none may be mistaken for another —
+so the exception parser now matches the words before `EXCEPTION` against the
+exact lead it expects.
+
+`qa/serve-real-altexception.sh` (13 checks) alters one exception, create-or-alters
+an existing one (its message carrying a `''` escape) and create-or-alters a fresh
+one, through fire-crab and the engine on two copies of a database. It compares
+every `RDB$EXCEPTIONS` row — message, number and class — confirms the altered
+exceptions kept their original numbers (an alter is not a drop-and-recreate)
+while the create-or-altered fresh one took the next, refuses an alter of a
+missing exception on both, and finishes with a `gbak` round trip (the `''`
+escape survives) and `gfix`. Teeth: an alter that reallocated the number, or one
+that touched the class, `DIFF`s the row comparison.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
@@ -3363,6 +3387,16 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
     bash /path/to/fire-crab/qa/serve-real-rolegrant.sh 3050
+
+# ALTER / CREATE OR ALTER EXCEPTION: change an exception's message.
+# ALTER rewrites RDB$MESSAGE in place, keeping the number and class (the
+# exception must exist); CREATE OR ALTER alters it when it exists (keeping
+# its number) and creates it (next number) when it does not. gbak and
+# gfix. Builds its own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    GFIX=/opt/firebird/bin/gfix GBAK=/opt/firebird/bin/gbak \
+    bash /path/to/fire-crab/qa/serve-real-altexception.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
