@@ -4567,6 +4567,7 @@ fn priv_row_present(
 /// no-op); `REVOKE` deletes the matching rows, silently where there is
 /// nothing to remove.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn grant_table(
     file: &mut Vec<u8>,
     page_size: usize,
@@ -4576,6 +4577,7 @@ pub fn grant_table(
     fields: &[String],
     grant_option: bool,
     revoke: bool,
+    option_only: bool,
 ) -> Result<(), String> {
     let table = table.trim().trim_matches('"').to_ascii_uppercase();
     let rel = crate::resolve_relation(file, page_size, &table)
@@ -4616,7 +4618,7 @@ pub fn grant_table(
                     let u_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$USER")?;
                     let p_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$PRIVILEGE")?;
                     let fn_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$FIELD_NAME")?;
-                    delete_catalog_rows(file, page_size, "RDB$USER_PRIVILEGES", move |v| {
+                    let matches_row = move |v: &[Value]| {
                         text_eq(v.get(rn_f), &t)
                             && text_eq(v.get(u_f), &g)
                             && text_eq(v.get(p_f), &l)
@@ -4624,7 +4626,22 @@ pub fn grant_table(
                                 Some(f) => text_eq(v.get(fn_f), f),
                                 None => matches!(v.get(fn_f), None | Some(Value::Null)),
                             }
-                    })?;
+                    };
+                    if option_only {
+                        // REVOKE GRANT OPTION FOR: keep the privilege, clear
+                        // its grant option (the ACL does not carry it, so it
+                        // is not recomputed)
+                        patch_sys_row(
+                            file,
+                            page_size,
+                            "RDB$USER_PRIVILEGES",
+                            upriv,
+                            matches_row,
+                            &[("RDB$GRANT_OPTION", SysVal::I(0))],
+                        )?;
+                    } else {
+                        delete_catalog_rows(file, page_size, "RDB$USER_PRIVILEGES", matches_row)?;
+                    }
                 } else if !priv_row_present(file, page_size, &table, &grantee, letter, field) {
                     let letter = letter.to_string();
                     let mut row = vec![
@@ -4645,7 +4662,11 @@ pub fn grant_table(
             }
         }
     }
-    recompute_relation_acl(file, page_size, &table)?;
+    // REVOKE GRANT OPTION FOR touches only RDB$GRANT_OPTION, which the ACL
+    // does not encode - so the ACL is left as it stands
+    if !option_only {
+        recompute_relation_acl(file, page_size, &table)?;
+    }
     advance_oldest_transactions(file, page_size)
 }
 

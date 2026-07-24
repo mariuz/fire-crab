@@ -758,6 +758,9 @@ enum Plan {
         fields: Vec<String>,
         grant_option: bool,
         revoke: bool,
+        /// `REVOKE GRANT OPTION FOR ...`: clear the grant option but keep
+        /// the privilege (only meaningful with `revoke`)
+        option_only: bool,
     },
     /// `GRANT|REVOKE <role> TO|FROM <grantees> [WITH ADMIN OPTION]`: role
     /// membership (RDB$USER_PRIVILEGES M rows) and a recompute of the
@@ -2130,7 +2133,23 @@ fn plan_grant(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     };
     let verb_len = if revoke { "REVOKE".len() } else { "GRANT".len() };
     let on = find_word(&up, "ON", verb_len)?;
-    let (privileges, fields) = parse_priv_and_fields(s[verb_len..on].trim())?;
+    // REVOKE GRANT OPTION FOR <privs> ...: keep the privilege, clear only
+    // the grant option
+    let mut priv_start = verb_len;
+    let mut option_only = false;
+    if revoke {
+        if let Some(g) = find_word(&up, "GRANT", verb_len) {
+            if up[verb_len..g].trim().is_empty() {
+                let o = find_word(&up, "OPTION", g + "GRANT".len())?;
+                let f = find_word(&up, "FOR", o + "OPTION".len())?;
+                if f < on {
+                    option_only = true;
+                    priv_start = f + "FOR".len();
+                }
+            }
+        }
+    }
+    let (privileges, fields) = parse_priv_and_fields(s[priv_start..on].trim())?;
 
     // after ON: an optional TABLE keyword, then the table name up to the
     // TO (grant) / FROM (revoke) separator
@@ -2165,6 +2184,7 @@ fn plan_grant(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             fields,
             grant_option,
             revoke,
+            option_only,
         },
         Vec::new(),
     ))
@@ -3359,6 +3379,7 @@ fn execute_dml(
             fields,
             grant_option,
             revoke,
+            option_only,
         } => {
             fire_crab_ods::ddl::grant_table(
                 &mut work,
@@ -3369,6 +3390,7 @@ fn execute_dml(
                 fields,
                 *grant_option,
                 *revoke,
+                *option_only,
             )?;
             (0, 0, 0)
         }
@@ -10980,15 +11002,24 @@ mod tests {
     fn parses_grant_revoke() {
         // a single privilege to a named user
         match plan_grant("GRANT SELECT ON T TO BOB") {
-            Some((Plan::Grant { table, grantees, privileges, fields, grant_option, revoke }, _)) => {
+            Some((Plan::Grant { table, grantees, privileges, fields, grant_option, revoke, option_only }, _)) => {
                 assert_eq!(table, "T");
                 assert_eq!(grantees, vec!["BOB".to_string()]);
                 assert_eq!(privileges, vec!['S']);
                 assert!(fields.is_empty());
                 assert!(!grant_option);
                 assert!(!revoke);
+                assert!(!option_only);
             }
             other => panic!("expected Grant, got {:?}", other.is_some()),
+        }
+        // REVOKE GRANT OPTION FOR: keep the privilege, clear only the option
+        match plan_grant("REVOKE GRANT OPTION FOR SELECT ON T FROM BOB") {
+            Some((Plan::Grant { privileges, revoke, option_only, .. }, _)) => {
+                assert_eq!(privileges, vec!['S']);
+                assert!(revoke && option_only);
+            }
+            other => panic!("expected Grant option-only, got {:?}", other.is_some()),
         }
         // a list of privileges, the optional TABLE keyword, WITH GRANT OPTION
         match plan_grant("grant insert, update on table t to user alice with grant option") {
