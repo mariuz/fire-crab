@@ -718,6 +718,11 @@ enum Plan {
     /// `DROP EXCEPTION <name>`: the row, its security class and the
     /// owner's privilege all go
     DropException { name: String },
+    /// `CREATE ROLE <name>`: a RDB$ROLES row and its security class, no
+    /// number and no privileges
+    CreateRole { name: String },
+    /// `DROP ROLE <name>`: the row and its security class go
+    DropRole { name: String },
     /// `ALTER INDEX <name> ACTIVE|INACTIVE`: INACTIVE moves the slot to
     /// the drop states (still maintained, no longer enforcing), ACTIVE
     /// REBUILDS the index into a new slot and recomputes its selectivity
@@ -1804,6 +1809,34 @@ fn plan_drop_exception(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         return None;
     }
     Some((Plan::DropException { name: unquote_ident(toks[2])? }, Vec::new()))
+}
+
+/// Parse `CREATE ROLE <name>`. Not `CREATE ROLE <name> SET SYSTEM
+/// PRIVILEGES ...` (that would set a non-empty bitmask this writer does
+/// not model) - a trailing clause makes it fall back.
+fn plan_create_role(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    if toks.len() != 3
+        || !toks[0].eq_ignore_ascii_case("CREATE")
+        || !toks[1].eq_ignore_ascii_case("ROLE")
+    {
+        return None;
+    }
+    Some((Plan::CreateRole { name: unquote_ident(toks[2])? }, Vec::new()))
+}
+
+/// Parse `DROP ROLE <name>`.
+fn plan_drop_role(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    if toks.len() != 3
+        || !toks[0].eq_ignore_ascii_case("DROP")
+        || !toks[1].eq_ignore_ascii_case("ROLE")
+    {
+        return None;
+    }
+    Some((Plan::DropRole { name: unquote_ident(toks[2])? }, Vec::new()))
 }
 
 /// Parse `COMMENT ON TABLE <t> IS <text>` and
@@ -3060,6 +3093,14 @@ fn execute_dml(
         }
         Plan::DropException { name } => {
             fire_crab_ods::ddl::drop_exception(&mut work, db.page_size, name)?;
+            (0, 0, 0)
+        }
+        Plan::CreateRole { name } => {
+            fire_crab_ods::ddl::create_role(&mut work, db.page_size, name)?;
+            (0, 0, 0)
+        }
+        Plan::DropRole { name } => {
+            fire_crab_ods::ddl::drop_role(&mut work, db.page_size, name)?;
             (0, 0, 0)
         }
         Plan::AlterIndex { name, active } => {
@@ -4584,6 +4625,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::DropException { .. }
+        | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
         | Plan::Comment { .. }
@@ -4621,6 +4663,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::DropException { .. }
+        | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
         | Plan::Comment { .. }
@@ -4945,6 +4988,7 @@ fn emit_rows_inner(
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::DropException { .. }
+        | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
         | Plan::Comment { .. }
@@ -7377,6 +7421,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             .or_else(|| plan_drop_sequence(&text))
                             .or_else(|| plan_create_exception(&text))
                             .or_else(|| plan_drop_exception(&text))
+                            .or_else(|| plan_create_role(&text))
+                            .or_else(|| plan_drop_role(&text))
                             .or_else(|| plan_alter_index(&text))
                             .or_else(|| plan_alter_table_add(&text))
                             .or_else(|| plan_alter_table_drop(&text))
@@ -7524,6 +7570,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         .or_else(|| plan_drop_sequence(&stmt_sql))
                         .or_else(|| plan_create_exception(&stmt_sql))
                         .or_else(|| plan_drop_exception(&stmt_sql))
+                        .or_else(|| plan_create_role(&stmt_sql))
+                        .or_else(|| plan_drop_role(&stmt_sql))
                         .or_else(|| plan_alter_index(&stmt_sql))
                         .or_else(|| plan_alter_table_add(&stmt_sql))
                         .or_else(|| plan_alter_table_drop(&stmt_sql))
@@ -7633,6 +7681,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::DropSequence { .. }
                         | Plan::CreateException { .. }
                         | Plan::DropException { .. }
+                        | Plan::CreateRole { .. }
+                        | Plan::DropRole { .. }
                         | Plan::AlterIndex { .. }
                         | Plan::SetStatistics { .. }
                         | Plan::Comment { .. }
@@ -10687,6 +10737,26 @@ mod tests {
         assert!(plan_create_exception("CREATE EXCEPTION E").is_none()); // no message
         assert!(plan_create_exception("CREATE TABLE T (A INT)").is_none());
         assert!(plan_drop_exception("DROP TABLE T").is_none());
+    }
+
+    #[test]
+    fn parses_create_drop_role() {
+        match plan_create_role("CREATE ROLE MANAGER") {
+            Some((Plan::CreateRole { name }, _)) => assert_eq!(name, "MANAGER"),
+            other => panic!("expected CreateRole, got {:?}", other.is_some()),
+        }
+        match plan_create_role("create role \"MixedCase\";") {
+            Some((Plan::CreateRole { name }, _)) => assert_eq!(name, "MixedCase"),
+            other => panic!("expected CreateRole, got {:?}", other.is_some()),
+        }
+        match plan_drop_role("DROP ROLE MANAGER") {
+            Some((Plan::DropRole { name }, _)) => assert_eq!(name, "MANAGER"),
+            other => panic!("expected DropRole, got {:?}", other.is_some()),
+        }
+        // a form this writer does not model (a system-privileges clause), and non-roles
+        assert!(plan_create_role("CREATE ROLE R SET SYSTEM PRIVILEGES TO X").is_none());
+        assert!(plan_create_role("CREATE TABLE T (A INT)").is_none());
+        assert!(plan_drop_role("DROP TABLE T").is_none());
     }
 
     #[test]

@@ -97,6 +97,10 @@ enum SysVal<'a> {
     F(f64),
     /// the 8 on-disk blob-id bytes
     B([u8; 8]),
+    /// a binary CHAR (CHARACTER SET OCTETS) column - the bytes verbatim,
+    /// zero-padded (not space-padded) to the column length. `RDB$ROLES`'s
+    /// `RDB$SYSTEM_PRIVILEGES` is a CHAR(8) OCTETS of eight zero bytes.
+    O(&'a [u8]),
     /// set the column's NULL bit (an in-place patch only - `sys_insert`
     /// starts every field NULL already)
     Null,
@@ -182,6 +186,14 @@ fn encode_sys_value(d: &Descriptor, v: &SysVal<'_>) -> Result<Vec<u8>, String> {
         }
         (SysVal::F(v), dtype::DOUBLE) => v.to_le_bytes().to_vec(),
         (SysVal::B(id), dtype::BLOB) => id.to_vec(),
+        (SysVal::O(b), dtype::TEXT) => {
+            if b.len() > d.length as usize {
+                return Err("octets too long for catalog column".into());
+            }
+            let mut out = b.to_vec();
+            out.resize(d.length as usize, 0); // OCTETS pad byte is 0, not space
+            out
+        }
         (SysVal::Null, _) => return Err("SysVal::Null has no encoding".into()),
         _ => return Err("catalog value/type mismatch".into()),
     })
@@ -230,7 +242,7 @@ fn sys_insert(
             SysVal::I(n) => Value::Int(*n),
             SysVal::S(s) => Value::Text((*s).to_string()),
             // no catalog index covers a blob, a selectivity or a NULL
-            SysVal::B(_) | SysVal::F(_) | SysVal::Null => Value::Null,
+            SysVal::B(_) | SysVal::F(_) | SysVal::O(_) | SysVal::Null => Value::Null,
         };
     }
 
@@ -3427,6 +3439,12 @@ const ACL_SEQUENCE_OWNER: &[u8] = &[6, 1, 3, 12];
 /// `02 01 03 06 SYSDBA 00 02 06 01 03 07 09 08 04 0a 00 00`.
 const ACL_TABLE_OWNER: &[u8] = &[6, 1, 3, 7, 9, 8, 4, 10];
 
+/// The privileges the owner of a ROLE holds: only the three object
+/// privileges - alter, control, drop - with no usage (a role is not
+/// something one holds a runtime privilege *on*). Probe of an
+/// engine-created role's `RDB$ACL`: `02 01 03 06 SYSDBA 00 02 06 01 03 00 00`.
+const ACL_ROLE_OWNER: &[u8] = &[6, 1, 3];
+
 /// An owner's access control list for a newly created object, in the
 /// engine's own encoding (acl.h): version 2, an id list naming the
 /// owner as a person, then the privilege list for that kind of object.
@@ -4079,6 +4097,101 @@ pub fn drop_exception(file: &mut Vec<u8>, page_size: usize, name: &str) -> Resul
         let obj_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$OBJECT_TYPE")?;
         delete_catalog_rows(file, page_size, "RDB$USER_PRIVILEGES", move |v| {
             text_eq(v.get(rel_f), &want) && int_eq(v.get(obj_f), 7)
+        })?;
+    }
+    advance_oldest_transactions(file, page_size)
+}
+
+/// A role's `(RDB$SYSTEM_FLAG, RDB$SECURITY_CLASS)` from `RDB$ROLES`, by
+/// name. None when there is no such role.
+fn find_role(file: &[u8], page_size: usize, name: &str) -> Option<(i64, Option<String>)> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$ROLES")?;
+    let formats = system_relation_formats(file, page_size, "RDB$ROLES")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$ROLES");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (name_f, sys_f, cls_f) = (
+        fid("RDB$ROLE_NAME")?,
+        fid("RDB$SYSTEM_FLAG")?,
+        fid("RDB$SECURITY_CLASS")?,
+    );
+    let mut found = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if found.is_some() || !text_eq(v.get(name_f), name) {
+            return;
+        }
+        let sys = match v.get(sys_f) {
+            Some(Value::Int(i)) => *i,
+            _ => 0,
+        };
+        let class = match v.get(cls_f) {
+            Some(Value::Text(t)) => Some(t.trim_end().to_string()),
+            _ => None,
+        };
+        found = Some((sys, class));
+    });
+    found
+}
+
+/// `CREATE ROLE <name>` - `CreateRoleNode` (DdlNodes.epp) against the file
+/// image. The leanest of the security objects: a `RDB$ROLES` row and a
+/// `SQL$<n>` security class, and nothing else - no number generator (a
+/// role has no number), no `RDB$USER_PRIVILEGES` rows (a role is not
+/// something one is granted a privilege *on* by creating it). The owner's
+/// ACL is alter/control/drop only, no usage ([ACL_ROLE_OWNER]).
+///
+/// The one on-disk subtlety: `RDB$SYSTEM_PRIVILEGES` is a CHAR(8) OCTETS,
+/// and CREATE ROLE writes it as eight ZERO bytes (an empty system-privilege
+/// bitmask) - not NULL, and not the spaces a text CHAR would pad with, so
+/// it needs [SysVal::O].
+pub fn create_role(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    if want.is_empty() {
+        return Err("a role needs a name".into());
+    }
+    if find_role(file, page_size, &want).is_some() {
+        return Err(format!("SQL role {} already exists", want));
+    }
+    let rel = crate::resolve_relation(file, page_size, "RDB$ROLES")
+        .ok_or("no RDB$ROLES relation")?;
+    let class = next_security_class(file, page_size, ACL_ROLE_OWNER)?;
+    sys_insert(
+        file,
+        page_size,
+        "RDB$ROLES",
+        rel,
+        &[
+            ("RDB$ROLE_NAME", SysVal::S(&want)),
+            ("RDB$OWNER_NAME", SysVal::S(OWNER)),
+            ("RDB$SECURITY_CLASS", SysVal::S(&class)),
+            ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+            ("RDB$SYSTEM_PRIVILEGES", SysVal::O(&[])),
+        ],
+    )?;
+    advance_oldest_transactions(file, page_size)
+}
+
+/// `DROP ROLE <name>` - `DropRoleNode`. The row and its security class go
+/// (an engine probe: after the drop the `SQL$<n>` class is gone, no
+/// orphan); a role owns no privileges of its own to remove.
+pub fn drop_role(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let (system, class) = find_role(file, page_size, &want)
+        .ok_or_else(|| format!("Role {} not found", want))?;
+    if system != 0 {
+        return Err(format!("Cannot delete system role {}", want));
+    }
+    let name_f = sys_fid(file, page_size, "RDB$ROLES", "RDB$ROLE_NAME")?;
+    {
+        let want = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$ROLES", move |v| {
+            text_eq(v.get(name_f), &want)
+        })?;
+    }
+    if let Some(class) = class {
+        let cls_f = sys_fid(file, page_size, "RDB$SECURITY_CLASSES", "RDB$SECURITY_CLASS")?;
+        delete_catalog_rows(file, page_size, "RDB$SECURITY_CLASSES", move |v| {
+            text_eq(v.get(cls_f), &class)
         })?;
     }
     advance_oldest_transactions(file, page_size)
