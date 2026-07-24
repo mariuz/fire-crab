@@ -501,12 +501,14 @@ fn rebuild_runtime_blob(
         runtime.push(seg(1, name.as_bytes())); // RSR_field_name
         let qsrc = format!("\"PUBLIC\".\"{}\"", src);
         runtime.push(seg(25, qsrc.as_bytes())); // RSR_field_source
-        runtime.push(seg(19, &d.length.to_le_bytes())); // RSR_field_length
         let char_len = match d.dtype {
             dtype::VARYING => Some(d.length.saturating_sub(2)),
             dtype::TEXT => Some(d.length),
             _ => None,
         };
+        // RSR_field_length is the byte (declared) length, not the storage
+        // length - a VARYING's is d.length minus its 2-byte count word
+        runtime.push(seg(19, &char_len.unwrap_or(d.length).to_le_bytes()));
         if let Some(cl) = char_len {
             runtime.push(seg(26, &cl.to_le_bytes())); // RSR_character_length
         }
@@ -600,7 +602,7 @@ pub fn alter_table_add_column(
     let mut field_vals: Vec<(&str, SysVal<'_>)> = vec![
         ("RDB$FIELD_NAME", SysVal::S(&dom)),
         ("RDB$FIELD_TYPE", SysVal::I(col.field_type as i64)),
-        ("RDB$FIELD_LENGTH", SysVal::I(col.length as i64)),
+        ("RDB$FIELD_LENGTH", SysVal::I(catalog_field_length(col))),
         ("RDB$FIELD_SCALE", SysVal::I(col.scale as i64)),
         ("RDB$FIELD_SUB_TYPE", SysVal::I(col.sub_type as i64)),
         ("RDB$SYSTEM_FLAG", SysVal::I(0)),
@@ -1475,7 +1477,9 @@ pub fn create_table(
         runtime.push(seg(1, c.name.as_bytes())); // RSR_field_name
         let src = format!("\"PUBLIC\".\"{}\"", dom);
         runtime.push(seg(25, src.as_bytes())); // RSR_field_source
-        runtime.push(seg(19, &c.length.to_le_bytes())); // RSR_field_length
+        // RSR_field_length is the byte (declared) length, not the storage
+        // length a VARYING carries in the format descriptor
+        runtime.push(seg(19, &(catalog_field_length(c) as u16).to_le_bytes()));
         if let Some(cl) = c.char_len {
             runtime.push(seg(26, &cl.to_le_bytes())); // RSR_character_length
         }
@@ -1492,7 +1496,7 @@ pub fn create_table(
         let mut vals: Vec<(&str, SysVal<'_>)> = vec![
             ("RDB$FIELD_NAME", SysVal::S(&dom)),
             ("RDB$FIELD_TYPE", SysVal::I(c.field_type as i64)),
-            ("RDB$FIELD_LENGTH", SysVal::I(c.length as i64)),
+            ("RDB$FIELD_LENGTH", SysVal::I(catalog_field_length(c))),
             ("RDB$FIELD_SCALE", SysVal::I(c.scale as i64)),
             ("RDB$FIELD_SUB_TYPE", SysVal::I(c.sub_type as i64)),
             ("RDB$SYSTEM_FLAG", SysVal::I(0)),
