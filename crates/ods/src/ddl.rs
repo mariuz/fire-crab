@@ -97,6 +97,9 @@ enum SysVal<'a> {
     F(f64),
     /// the 8 on-disk blob-id bytes
     B([u8; 8]),
+    /// set the column's NULL bit (an in-place patch only - `sys_insert`
+    /// starts every field NULL already)
+    Null,
 }
 
 /// The 8 wire/disk bytes of a blob id (RecordNumber.h:63-71) - also in
@@ -179,6 +182,7 @@ fn encode_sys_value(d: &Descriptor, v: &SysVal<'_>) -> Result<Vec<u8>, String> {
         }
         (SysVal::F(v), dtype::DOUBLE) => v.to_le_bytes().to_vec(),
         (SysVal::B(id), dtype::BLOB) => id.to_vec(),
+        (SysVal::Null, _) => return Err("SysVal::Null has no encoding".into()),
         _ => return Err("catalog value/type mismatch".into()),
     })
 }
@@ -225,8 +229,8 @@ fn sys_insert(
         key_values[fid] = match v {
             SysVal::I(n) => Value::Int(*n),
             SysVal::S(s) => Value::Text((*s).to_string()),
-            // no catalog index covers a blob or a selectivity
-            SysVal::B(_) | SysVal::F(_) => Value::Null,
+            // no catalog index covers a blob, a selectivity or a NULL
+            SysVal::B(_) | SysVal::F(_) | SysVal::Null => Value::Null,
         };
     }
 
@@ -1691,6 +1695,91 @@ pub fn drop_index(file: &mut Vec<u8>, page_size: usize, index_name: &str) -> Res
     Ok(())
 }
 
+/// What a `COMMENT ON` targets - the object whose `RDB$DESCRIPTION`
+/// column is written.
+pub enum CommentTarget {
+    /// `COMMENT ON TABLE <name>` - the `RDB$RELATIONS` row
+    Table(String),
+    /// `COMMENT ON COLUMN <table>.<column>` - the `RDB$RELATION_FIELDS` row
+    Column(String, String),
+}
+
+/// `COMMENT ON TABLE <t> IS <text>` / `COMMENT ON COLUMN <t>.<c> IS
+/// <text>` - `CommentOnNode` against the file image. The comment is a
+/// text blob written into the owning relation's data pages and its id
+/// stored in the target row's `RDB$DESCRIPTION`; `IS NULL` (and, the
+/// engine's probe shows, `IS ''`) clears the column to NULL, leaving the
+/// old blob orphaned exactly as the engine does.
+///
+/// The one on-disk detail that matters: a `RDB$DESCRIPTION` text blob
+/// carries `blh_charset` = 4 (UTF8, the metadata charset), not the 1 the
+/// binary metadata blobs use - `CAST(RDB$DESCRIPTION AS VARCHAR)` decodes
+/// through the blob's own charset, so it must match (see
+/// [crate::dml::insert_blob_cs]).
+pub fn comment_on(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    target: &CommentTarget,
+    text: Option<&str>,
+) -> Result<(), String> {
+    // an empty comment is a NULL comment (engine probe: IS '' clears it)
+    let text = text.filter(|t| !t.is_empty());
+    match target {
+        CommentTarget::Table(name) => {
+            let name = name.trim().trim_matches('"').to_ascii_uppercase();
+            let rel = crate::resolve_relation(file, page_size, &name)
+                .ok_or_else(|| format!("Table \"{}\" not found", name))?;
+            if rel < 128 {
+                return Err("system relations are read-only".into());
+            }
+            let value = match text {
+                Some(t) => {
+                    let id = dml::insert_blob_cs(file, page_size, 6, &[t.as_bytes().to_vec()], 1, 4)?;
+                    SysVal::B(blob_id_bytes(6, id))
+                }
+                None => SysVal::Null,
+            };
+            let name_fid = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
+            let nm = name.clone();
+            patch_sys_row(file, page_size, "RDB$RELATIONS", 6,
+                move |v| text_eq(v.get(name_fid), &nm),
+                &[("RDB$DESCRIPTION", value)])?;
+        }
+        CommentTarget::Column(table, column) => {
+            let table = table.trim().trim_matches('"').to_ascii_uppercase();
+            let column = column.trim().trim_matches('"').to_ascii_uppercase();
+            let rel = crate::resolve_relation(file, page_size, &table)
+                .ok_or_else(|| format!("Table \"{}\" not found", table))?;
+            if rel < 128 {
+                return Err("system relations are read-only".into());
+            }
+            if !relation_columns(file, page_size, &table)
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(&column))
+            {
+                return Err(format!(
+                    "column {} does not exist in table/view \"{}\"",
+                    column, table
+                ));
+            }
+            let value = match text {
+                Some(t) => {
+                    let id = dml::insert_blob_cs(file, page_size, 5, &[t.as_bytes().to_vec()], 1, 4)?;
+                    SysVal::B(blob_id_bytes(5, id))
+                }
+                None => SysVal::Null,
+            };
+            let rel_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$RELATION_NAME")?;
+            let name_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$FIELD_NAME")?;
+            let (t, c) = (table.clone(), column.clone());
+            patch_sys_row(file, page_size, "RDB$RELATION_FIELDS", 5,
+                move |v| text_eq(v.get(rel_fid), &t) && text_eq(v.get(name_fid), &c),
+                &[("RDB$DESCRIPTION", value)])?;
+        }
+    }
+    advance_oldest_transactions(file, page_size)
+}
+
 /// `SET STATISTICS INDEX <name>` - `SetStatisticsNode` (DdlNodes.epp:14475)
 /// against the file image.
 ///
@@ -3083,6 +3172,10 @@ fn patch_sys_row(
             .find(|c| c.name.eq_ignore_ascii_case(name))
             .ok_or_else(|| format!("unknown catalog column {}", name))?
             .field_id as usize;
+        if let SysVal::Null = v {
+            image[fid / 8] |= 1 << (fid % 8); // NULL
+            continue;
+        }
         let d = descs.get(fid).ok_or("field beyond computed format")?;
         let bytes = encode_sys_value(d, v)?;
         let at = d.offset as usize;

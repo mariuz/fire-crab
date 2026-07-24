@@ -422,6 +422,23 @@ pub fn insert_blob(
     segments: &[Vec<u8>],
     sub_type: u16,
 ) -> Result<u64, String> {
+    // charset 1 is what the engine writes for its binary metadata blobs
+    // (RDB$FORMATS/RDB$RUNTIME, ACLs) - probe-confirmed
+    insert_blob_cs(file, page_size, rel, segments, sub_type, 1)
+}
+
+/// [insert_blob] with an explicit `blh_charset`. A subtype-1 TEXT blob -
+/// a `COMMENT ON` description - carries charset 4 (UTF8, the metadata
+/// charset), not 1; the engine's `CAST(RDB$DESCRIPTION AS VARCHAR)`
+/// decodes through the blob's own charset, so it must match.
+pub fn insert_blob_cs(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    rel: u16,
+    segments: &[Vec<u8>],
+    sub_type: u16,
+    charset: u8,
+) -> Result<u64, String> {
     let payload: usize = segments.iter().map(|s| s.len()).sum();
     let max_segment = segments.iter().map(|s| s.len()).max().unwrap_or(0);
     if max_segment > u16::MAX as usize {
@@ -435,7 +452,7 @@ pub fn insert_blob(
     rec.extend_from_slice(&(segments.len() as u32).to_le_bytes()); // blh_count
     rec.extend_from_slice(&(payload as u64).to_le_bytes()); // blh_length
     rec.extend_from_slice(&sub_type.to_le_bytes()); // blh_sub_type
-    rec.push(1); // blh_charset
+    rec.push(charset); // blh_charset
     rec.push(0); // blh_level: data inline
     for seg in segments {
         rec.extend_from_slice(&(seg.len() as u16).to_le_bytes());

@@ -719,6 +719,12 @@ enum Plan {
     /// (`1 / distinct` per key prefix over the current rows) into the
     /// catalog and the index root descriptor
     SetStatistics { name: String },
+    /// `COMMENT ON TABLE|COLUMN <target> IS <text>`: write (or clear) the
+    /// target row's RDB$DESCRIPTION text blob
+    Comment {
+        target: fire_crab_ods::ddl::CommentTarget,
+        text: Option<String>,
+    },
     /// `ALTER TABLE <table> ADD <column>`: a new format version, the new
     /// column's catalog rows, and a version rewrite of the RDB$RELATIONS
     /// row bumping its format and field count
@@ -1744,6 +1750,104 @@ fn plan_drop_sequence(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         return None;
     }
     Some((Plan::DropSequence { name: unquote_ident(toks[2])? }, Vec::new()))
+}
+
+/// Parse `COMMENT ON TABLE <t> IS <text>` and
+/// `COMMENT ON COLUMN <t>.<c> IS <text>`, where `<text>` is a
+/// single-quoted string (with `''` escapes) or `NULL`. Other COMMENT ON
+/// object kinds return None (the statement then errors rather than
+/// silently doing nothing).
+fn plan_comment(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "COMMENT", 0) != Some(0) {
+        return None;
+    }
+    let on = find_word(&masked, "ON", "COMMENT".len())?;
+    let kind_start = on + "ON".len();
+    // the object kind: TABLE or COLUMN (only these two here)
+    let kind = if find_word(&masked, "TABLE", kind_start) == Some(first_word_at(&masked, kind_start)?)
+    {
+        "TABLE"
+    } else if find_word(&masked, "COLUMN", kind_start) == Some(first_word_at(&masked, kind_start)?) {
+        "COLUMN"
+    } else {
+        return None;
+    };
+    let after_kind = kind_start + masked[kind_start..].find(kind)? + kind.len();
+    // IS separates the target from the text; find it on the masked copy
+    // so an 'IS' inside the string literal cannot shadow it
+    let is_kw = find_word(&masked, "IS", after_kind)?;
+    let target_str = s[after_kind..is_kw].trim();
+    let text_str = s[is_kw + "IS".len()..].trim();
+
+    let text = if text_str.eq_ignore_ascii_case("NULL") {
+        None
+    } else {
+        Some(parse_string_literal(text_str)?)
+    };
+
+    let target = match kind {
+        "TABLE" => {
+            let name = unquote_ident(target_str)?;
+            fire_crab_ods::ddl::CommentTarget::Table(name)
+        }
+        _ => {
+            // <table>.<column> - split on the first dot outside quotes
+            let (t, c) = split_qualified(target_str)?;
+            fire_crab_ods::ddl::CommentTarget::Column(unquote_ident(&t)?, unquote_ident(&c)?)
+        }
+    };
+    Some((Plan::Comment { target, text }, Vec::new()))
+}
+
+/// The byte offset of the first non-space character at or after `from`.
+fn first_word_at(s: &str, from: usize) -> Option<usize> {
+    s[from..].find(|c: char| !c.is_whitespace()).map(|i| from + i)
+}
+
+/// Parse a single-quoted SQL string literal, turning `''` into `'`. None
+/// if the text is not a well-formed quoted literal.
+fn parse_string_literal(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    if b.len() < 2 || b[0] != b'\'' || b[b.len() - 1] != b'\'' {
+        return None;
+    }
+    let inner = &s[1..s.len() - 1];
+    // a lone (unescaped) quote inside would end the literal early
+    let mut out = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            if chars.peek() == Some(&'\'') {
+                chars.next();
+                out.push('\'');
+            } else {
+                return None; // unbalanced quote
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
+/// Split `<table>.<column>`, honouring double-quoted identifiers (a dot
+/// inside quotes is part of the name, not the separator).
+fn split_qualified(s: &str) -> Option<(String, String)> {
+    let bytes = s.as_bytes();
+    let mut in_quote = false;
+    for (i, &c) in bytes.iter().enumerate() {
+        match c {
+            b'"' => in_quote = !in_quote,
+            b'.' if !in_quote => {
+                return Some((s[..i].trim().to_string(), s[i + 1..].trim().to_string()));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Parse `SET STATISTICS INDEX <name>`.
@@ -2793,6 +2897,10 @@ fn execute_dml(
         }
         Plan::SetStatistics { name } => {
             fire_crab_ods::ddl::set_index_statistics(&mut work, db.page_size, name)?;
+            (0, 0, 0)
+        }
+        Plan::Comment { target, text } => {
+            fire_crab_ods::ddl::comment_on(&mut work, db.page_size, target, text.as_deref())?;
             (0, 0, 0)
         }
         Plan::AlterTableAdd { table, col } => {
@@ -4288,6 +4396,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
+        | Plan::Comment { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -4322,6 +4431,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
+        | Plan::Comment { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -4643,6 +4753,7 @@ fn emit_rows_inner(
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
+        | Plan::Comment { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -7049,7 +7160,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 }
                 let text = String::from_utf8_lossy(&sql).into_owned();
                 let up = text.trim_start().to_ascii_uppercase();
-                let ddl_kw = ["CREATE", "ALTER", "DROP", "RECREATE"]
+                let ddl_kw = ["CREATE", "ALTER", "DROP", "RECREATE", "COMMENT"]
                     .into_iter()
                     .any(|k| find_word(&up, k, 0) == Some(0));
                 let dml_kw = ["INSERT", "UPDATE", "DELETE"]
@@ -7061,7 +7172,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     .or_else(|| plan_set_statistics(&text))
                     .or_else(|| {
                     if ddl_kw {
-                        plan_create_table(&text)
+                        plan_comment(&text)
+                            .or_else(|| plan_create_table(&text))
                             .or_else(|| plan_create_index(&text))
                             .or_else(|| plan_drop_table(&text))
                             .or_else(|| plan_drop_index(&text))
@@ -7185,7 +7297,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 last_dml = (0, 0, 0);
                 bound_args.clear();
                 let up = stmt_sql.trim_start().to_ascii_uppercase();
-                let ddl_kw = ["CREATE", "ALTER", "DROP", "RECREATE"]
+                let ddl_kw = ["CREATE", "ALTER", "DROP", "RECREATE", "COMMENT"]
                     .into_iter()
                     .find(|k| find_word(&up, k, 0) == Some(0));
                 let dml_kw = ["INSERT", "UPDATE", "DELETE"]
@@ -7204,7 +7316,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     // DDL prepares to a real plan or to an SQL error -
                     // a client must never think its DDL succeeded when
                     // the verb is one this server does not implement
-                    let planned = plan_create_table(&stmt_sql)
+                    let planned = plan_comment(&stmt_sql)
+                        .or_else(|| plan_create_table(&stmt_sql))
                         .or_else(|| plan_create_index(&stmt_sql))
                         .or_else(|| plan_drop_table(&stmt_sql))
                         .or_else(|| plan_drop_index(&stmt_sql))
@@ -7319,6 +7432,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::DropSequence { .. }
                         | Plan::AlterIndex { .. }
                         | Plan::SetStatistics { .. }
+                        | Plan::Comment { .. }
                         | Plan::AlterTableAdd { .. }
                         | Plan::AlterTableAddFk { .. }
                         | Plan::AlterTableAddKey { .. }
@@ -10242,6 +10356,34 @@ mod tests {
         // a DROP INDEX/TABLE is not a DROP SEQUENCE, and neither is a bare one
         assert!(plan_drop_sequence("DROP INDEX IX").is_none());
         assert!(plan_drop_sequence("DROP SEQUENCE").is_none());
+    }
+
+    #[test]
+    fn parses_comment_on() {
+        use fire_crab_ods::ddl::CommentTarget;
+        match plan_comment("COMMENT ON TABLE T IS 'a table comment'") {
+            Some((Plan::Comment { target: CommentTarget::Table(n), text }, _)) => {
+                assert_eq!(n, "T");
+                assert_eq!(text.as_deref(), Some("a table comment"));
+            }
+            other => panic!("expected Comment/Table, got {:?}", other.is_some()),
+        }
+        // a column, with a '' escape in the text
+        match plan_comment("comment on column T.A is 'it''s A'") {
+            Some((Plan::Comment { target: CommentTarget::Column(t, c), text }, _)) => {
+                assert_eq!((t.as_str(), c.as_str()), ("T", "A"));
+                assert_eq!(text.as_deref(), Some("it's A"));
+            }
+            other => panic!("expected Comment/Column, got {:?}", other.is_some()),
+        }
+        // IS NULL clears
+        match plan_comment("COMMENT ON TABLE T IS NULL") {
+            Some((Plan::Comment { text, .. }, _)) => assert!(text.is_none()),
+            other => panic!("expected Comment, got {:?}", other.is_some()),
+        }
+        // a kind this writer does not implement, and a non-comment
+        assert!(plan_comment("COMMENT ON PROCEDURE P IS 'x'").is_none());
+        assert!(plan_comment("CREATE TABLE T (A INT)").is_none());
     }
 
     #[test]
