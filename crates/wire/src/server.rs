@@ -739,6 +739,9 @@ enum Plan {
         domain: String,
         default: Option<fire_crab_ods::ddl::ColumnDefault>,
     },
+    /// `ALTER DOMAIN <name> SET NOT NULL` / `DROP NOT NULL`: set the domain's
+    /// RDB$NULL_FLAG to 1 (SET) or 0 (DROP)
+    AlterDomainNotNull { domain: String, not_null: bool },
     /// `ALTER INDEX <name> ACTIVE|INACTIVE`: INACTIVE moves the slot to
     /// the drop states (still maintained, no longer enforcing), ACTIVE
     /// REBUILDS the index into a new slot and recomputes its selectivity
@@ -2012,10 +2015,10 @@ fn parse_default_clause(
     ))
 }
 
-/// Parse `ALTER DOMAIN <name> SET DEFAULT <literal>` and
-/// `ALTER DOMAIN <name> DROP DEFAULT` - the default on a domain's own
-/// `RDB$FIELDS` row, set (or replaced) or cleared. Other ALTER DOMAIN forms
-/// (SET/DROP NOT NULL, TYPE, rename, ADD CHECK) fall back to None.
+/// Parse the modelled `ALTER DOMAIN` forms: `SET DEFAULT <literal>` /
+/// `DROP DEFAULT` (the default on the domain's `RDB$FIELDS` row) and
+/// `SET NOT NULL` / `DROP NOT NULL` (its `RDB$NULL_FLAG`). Other forms
+/// (TYPE, rename, ADD CHECK) fall back to None.
 fn plan_alter_domain(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
@@ -2031,17 +2034,26 @@ fn plan_alter_domain(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let (name, tail) = rest.split_once(char::is_whitespace)?;
     let name = unquote_ident(name)?;
     let tail = tail.trim();
-    let up_tail = tail.to_ascii_uppercase();
-    let default = if up_tail.starts_with("SET DEFAULT") {
-        let def_kw = find_word(&up_tail, "DEFAULT", 0)?;
+    // a whitespace-normalised uppercase copy, so "SET  NOT   NULL" matches
+    let norm = tail
+        .to_ascii_uppercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if norm.starts_with("SET DEFAULT") {
+        let def_kw = find_word(&tail.to_ascii_uppercase(), "DEFAULT", 0)?;
         let after = tail[def_kw + "DEFAULT".len()..].trim_start();
-        Some(parse_default_clause(after)?.0)
-    } else if up_tail == "DROP DEFAULT" {
-        None
+        let default = Some(parse_default_clause(after)?.0);
+        Some((Plan::AlterDomainDefault { domain: name, default }, Vec::new()))
+    } else if norm == "DROP DEFAULT" {
+        Some((Plan::AlterDomainDefault { domain: name, default: None }, Vec::new()))
+    } else if norm == "SET NOT NULL" {
+        Some((Plan::AlterDomainNotNull { domain: name, not_null: true }, Vec::new()))
+    } else if norm == "DROP NOT NULL" {
+        Some((Plan::AlterDomainNotNull { domain: name, not_null: false }, Vec::new()))
     } else {
-        return None; // other ALTER DOMAIN forms not modelled
-    };
-    Some((Plan::AlterDomainDefault { domain: name, default }, Vec::new()))
+        None // other ALTER DOMAIN forms not modelled
+    }
 }
 
 /// Parse `CREATE DOMAIN <name> [AS] <type> [NOT NULL]` - a standalone type
@@ -3479,6 +3491,10 @@ fn execute_dml(
                 domain,
                 default.as_ref(),
             )?;
+            (0, 0, 0)
+        }
+        Plan::AlterDomainNotNull { domain, not_null } => {
+            fire_crab_ods::ddl::alter_domain_not_null(&mut work, db.page_size, domain, *not_null)?;
             (0, 0, 0)
         }
         Plan::AlterIndex { name, active } => {
@@ -5027,6 +5043,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
         | Plan::AlterDomainDefault { .. }
+        | Plan::AlterDomainNotNull { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
         | Plan::Comment { .. }
@@ -5069,6 +5086,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
         | Plan::AlterDomainDefault { .. }
+        | Plan::AlterDomainNotNull { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
         | Plan::Comment { .. }
@@ -5398,6 +5416,7 @@ fn emit_rows_inner(
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
         | Plan::AlterDomainDefault { .. }
+        | Plan::AlterDomainNotNull { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
         | Plan::Comment { .. }
@@ -8110,6 +8129,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::CreateDomain { .. }
                         | Plan::DropDomain { .. }
                         | Plan::AlterDomainDefault { .. }
+                        | Plan::AlterDomainNotNull { .. }
                         | Plan::AlterIndex { .. }
                         | Plan::SetStatistics { .. }
                         | Plan::Comment { .. }
@@ -11366,9 +11386,21 @@ mod tests {
             }
             other => panic!("expected AlterDomainDefault DROP, got {:?}", other.is_some()),
         }
+        // SET / DROP NOT NULL (whitespace-tolerant) map to AlterDomainNotNull
+        match plan_alter_domain("ALTER DOMAIN DOM_A SET  NOT   NULL") {
+            Some((Plan::AlterDomainNotNull { domain, not_null }, _)) => {
+                assert_eq!(domain, "DOM_A");
+                assert!(not_null);
+            }
+            other => panic!("expected AlterDomainNotNull SET, got {:?}", other.is_some()),
+        }
+        match plan_alter_domain("alter domain dom_a drop not null") {
+            Some((Plan::AlterDomainNotNull { not_null, .. }, _)) => assert!(!not_null),
+            other => panic!("expected AlterDomainNotNull DROP, got {:?}", other.is_some()),
+        }
         // unmodelled ALTER DOMAIN forms, and non-domains, fall back
-        assert!(plan_alter_domain("ALTER DOMAIN DOM_A SET NOT NULL").is_none());
         assert!(plan_alter_domain("ALTER DOMAIN DOM_A TYPE BIGINT").is_none());
+        assert!(plan_alter_domain("ALTER DOMAIN DOM_A DROP CONSTRAINT").is_none());
         assert!(plan_alter_domain("ALTER TABLE T ADD A INT").is_none());
     }
 

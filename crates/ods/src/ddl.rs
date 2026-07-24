@@ -934,6 +934,42 @@ pub fn alter_domain_default(
     advance_oldest_transactions(file, page_size)
 }
 
+/// `ALTER DOMAIN <name> SET NOT NULL` / `DROP NOT NULL` - the nullability of a
+/// domain, on its own `RDB$FIELDS` row. SET writes `RDB$NULL_FLAG` = 1, DROP
+/// writes 0 (probe: a dropped constraint leaves the flag at 0, distinct from a
+/// domain that never had one, whose flag is NULL). A column that uses the
+/// domain inherits the constraint; the engine enforces it on the next insert.
+///
+/// This is the catalog write only: the engine additionally validates that no
+/// existing row of any column using the domain is NULL before a SET, which an
+/// offline writer over freshly-created (unused) domains never has to.
+pub fn alter_domain_not_null(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    name: &str,
+    not_null: bool,
+) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    if want.starts_with("RDB$") || want.starts_with("SQL$") {
+        return Err("system domains are read-only".into());
+    }
+    if !domain_exists(file, page_size, &want) {
+        return Err(format!("Domain {} not found", want));
+    }
+    let flag: i64 = if not_null { 1 } else { 0 };
+    let name_f = sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME")?;
+    let nm = want.clone();
+    patch_sys_row(
+        file,
+        page_size,
+        "RDB$FIELDS",
+        2,
+        move |v| text_eq(v.get(name_f), &nm),
+        &[("RDB$NULL_FLAG", SysVal::I(flag))],
+    )?;
+    advance_oldest_transactions(file, page_size)
+}
+
 /// `ALTER TABLE <table> DROP <column>`: remove a column. Like ADD, this is
 /// a new *format version* - existing records keep their old format (and
 /// still carry the dropped field's bytes, now unreferenced); the new

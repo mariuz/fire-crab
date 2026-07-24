@@ -3288,6 +3288,32 @@ fire-crab's file, and runs a `gbak` round trip plus `gfix`. Teeth: SET-replace,
 SET-add and DROP are three different transitions, and the inheritance check
 proves the replaced value is the one the engine now applies.
 
+### The eighty-sixth differential — ALTER DOMAIN, SET and DROP NOT NULL
+
+The other thing an `ALTER DOMAIN` changes is nullability, and it is a one-column
+patch: `SET NOT NULL` writes `RDB$NULL_FLAG` = 1 on the domain's `RDB$FIELDS`
+row, `DROP NOT NULL` writes 0. The 0 matters — the engine leaves a *dropped*
+constraint at 0, distinct from a domain that never had one, whose flag is NULL,
+and a byte-faithful writer has to reproduce that difference rather than clearing
+to NULL. The parser gained the two forms beside the two default forms it already
+handled (with whitespace normalised, so `SET  NOT   NULL` still matches).
+
+As with the domain default, the enforcement runs through the engine on
+fire-crab's own file, and it cuts both ways: a `CREATE TABLE` using a domain
+fire-crab set `NOT NULL` refuses a NULL insert, and one using a domain fire-crab
+*dropped* the constraint from accepts it. This is the catalog write only — the
+engine additionally scans existing rows of every column using the domain before a
+`SET`, which an offline writer over freshly-created domains never confronts.
+
+`qa/serve-real-alterdomainnull.sh` (11 checks) starts both databases with three
+domains (plain, to-be-set, created-NOT NULL-to-be-dropped), has fire-crab `ALTER`
+one copy and the engine the other, compares every `RDB$NULL_FLAG` (SET→1, DROP→0,
+untouched→NULL), then on fire-crab's file has the engine refuse a NULL into the
+NOT NULL domain and accept one into the dropped domain, refuses an unknown domain
+on both, and runs a `gbak` round trip plus `gfix`. Teeth: the flag compare pins
+the 0/1/NULL three-way, and the two insert checks prove the flag is the one the
+engine reads.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
