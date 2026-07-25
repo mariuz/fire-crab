@@ -3341,6 +3341,30 @@ now-BIGINT domain, and runs a `gbak` round trip plus `gfix`. Teeth: the type-row
 compare pins each widening, and the BIGINT insert proves the retype is the type
 the engine now uses.
 
+### The eighty-eighth differential — a column's default, set and dropped
+
+The domain path had `ALTER DOMAIN SET/DROP DEFAULT`; the column path is its
+mirror. `ALTER TABLE T ALTER COLUMN A SET DEFAULT <lit>` writes (or replaces) the
+two default blobs on the column's `RDB$RELATION_FIELDS` row, `DROP DEFAULT`
+clears both — and then, because the default the engine actually applies lives in
+the relation's `RDB$RUNTIME` and not the catalog column (the lesson from the
+column-default and FK-trigger work), the runtime is rebuilt. There is no new
+format version: the row layout does not move, only the summary the engine reads
+does. The parser reuses the shared `parse_default_clause`, and the write reuses
+`update_relation_runtime`, so the whole thing is a `patch_sys_row` plus a runtime
+refresh.
+
+`qa/serve-real-altercolumndefault.sh` (14 checks) starts both databases with the
+same table, has fire-crab ALTER one copy and the engine the other — `SET DEFAULT`
+replacing an existing default, `SET DEFAULT` on a column that had none, `DROP
+DEFAULT`, and a string default. It compares every `RDB$DEFAULT_SOURCE`, compares
+the rebuilt `RDB$RUNTIME` byte for byte, inserts a row that omits the columns and
+confirms it takes the new defaults (and the dropped one is NULL), refuses an
+unknown column and an unknown table on both, and runs a `gbak` round trip plus
+`gfix`. Teeth: the byte-for-byte runtime compare is the one that matters — a
+default written to the catalog but not folded into the runtime would pass the
+source compare and fail the insert.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest

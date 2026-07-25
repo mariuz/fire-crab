@@ -1477,6 +1477,66 @@ pub fn alter_table_alter_column_type(
     Ok(())
 }
 
+/// `ALTER TABLE <t> ALTER [COLUMN] <c> SET DEFAULT <lit>` / `DROP DEFAULT` -
+/// set, replace, or clear a column's default. Two blobs on the column's
+/// `RDB$RELATION_FIELDS` row (`RDB$DEFAULT_SOURCE`, subtype 1 charset 4;
+/// `RDB$DEFAULT_VALUE`, the literal BLR, subtype 2), then the relation's
+/// `RDB$RUNTIME` is rebuilt so the engine applies (or stops applying) it -
+/// the default the engine reads lives in that summary, not in the catalog
+/// column ([rebuild_runtime_blob] re-reads `RDB$DEFAULT_VALUE`). No new
+/// format version (the probe shows `RDB$FORMAT` unchanged); the row layout
+/// does not move.
+pub fn alter_column_default(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    column: &str,
+    default: Option<&ColumnDefault>,
+) -> Result<(), String> {
+    let table = table.trim().to_ascii_uppercase();
+    let column = column.trim().trim_matches('"').to_ascii_uppercase();
+    let rel = crate::resolve_relation(file, page_size, &table)
+        .ok_or_else(|| format!("table {} not found", table))?;
+    if rel < 128 {
+        return Err("system relations are read-only".into());
+    }
+    if !relation_columns(file, page_size, &table)
+        .iter()
+        .any(|c| c.name.eq_ignore_ascii_case(&column))
+    {
+        return Err(format!("column {} not found in table {}", column, table));
+    }
+    let (src_val, val_val) = match default {
+        Some(def) => {
+            let src =
+                dml::insert_blob_cs(file, page_size, 5, &[def.source.as_bytes().to_vec()], 1, 4)?;
+            let val = dml::insert_blob(file, page_size, 5, &[def.value_blr.clone()], 2)?;
+            (
+                SysVal::B(blob_id_bytes(5, src)),
+                SysVal::B(blob_id_bytes(5, val)),
+            )
+        }
+        None => (SysVal::Null, SysVal::Null),
+    };
+    let rel_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$RELATION_NAME")?;
+    let name_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$FIELD_NAME")?;
+    let (t, c) = (table.clone(), column.clone());
+    patch_sys_row(
+        file,
+        page_size,
+        "RDB$RELATION_FIELDS",
+        5,
+        move |v| text_eq(v.get(rel_fid), &t) && text_eq(v.get(name_fid), &c),
+        &[
+            ("RDB$DEFAULT_SOURCE", src_val),
+            ("RDB$DEFAULT_VALUE", val_val),
+        ],
+    )?;
+    // rebuild the runtime so the engine applies (or stops applying) the default
+    update_relation_runtime(file, page_size, &table)?;
+    advance_oldest_transactions(file, page_size)
+}
+
 /// Whether any committed primary record of `rel` has a NULL in field
 /// `fid` - the check `SET NOT NULL` makes before it can succeed.
 fn column_has_nulls(file: &[u8], page_size: usize, rel: u16, fid: usize) -> bool {
