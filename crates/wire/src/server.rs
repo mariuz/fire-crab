@@ -1420,6 +1420,59 @@ fn computed_sources(db: &Database, table: &str) -> std::collections::HashMap<usi
     out
 }
 
+/// Which DML statement the trigger walk of [check_predicates] guards.
+/// An FK referential-action trigger (system_flag 4) lives on the PARENT
+/// table and fires on UPDATE (trigger_type 4) or DELETE (type 6) of the
+/// parent row - the guard must refuse exactly the statements that would
+/// fire a trigger this server cannot execute.
+enum DmlGuard<'a> {
+    Insert,
+    /// UPDATE, with the SET-target column names: an AFTER UPDATE action
+    /// trigger only acts when a guarded parent-key column changes, so an
+    /// UPDATE that never touches one is safe to run.
+    Update(&'a [String]),
+    Delete,
+}
+
+/// The parent-key column names an FK action trigger guards: its
+/// RDB$DEPENDENCIES rows that point at the parent relation itself (the
+/// rows naming the child relation and its FK columns are distinct).
+/// None when the dependency catalog cannot be read - the caller must
+/// refuse, never bypass.
+fn fk_trigger_parent_cols(db: &Database, table: &str, trigs: &[String]) -> Option<Vec<String>> {
+    use fire_crab_ods::format::Value;
+    let formats = fire_crab_ods::sysfmt::system_relation_formats(
+        &db.bytes,
+        db.page_size,
+        "RDB$DEPENDENCIES",
+    )?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(&db.bytes, db.page_size, "RDB$DEPENDENCIES");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (dep_f, on_f, fld_f) = (
+        fid("RDB$DEPENDENT_NAME")?,
+        fid("RDB$DEPENDED_ON_NAME")?,
+        fid("RDB$FIELD_NAME")?,
+    );
+    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, "RDB$DEPENDENCIES")?;
+    let fmts = vec![(0u8, descs.clone())];
+    let mut out: Vec<String> = Vec::new();
+    for_each_record(db, rel, &fmts, |values| {
+        let Some(Value::Text(dep)) = values.get(dep_f) else { return };
+        if !trigs.iter().any(|t| t.eq_ignore_ascii_case(dep.trim_end())) {
+            return;
+        }
+        let Some(Value::Text(on)) = values.get(on_f) else { return };
+        if !on.trim_end().eq_ignore_ascii_case(table) {
+            return;
+        }
+        if let Some(Value::Text(f)) = values.get(fld_f) {
+            out.push(f.trim_end().to_string());
+        }
+    });
+    Some(out)
+}
+
 /// The CHECK constraints of a table as NEGATED, parameter-free
 /// predicates: each stored `CHECK (<cond>)` source (from the check
 /// triggers' RDB$TRIGGER_SOURCE, system_flag 3) is re-parsed by the
@@ -1431,11 +1484,22 @@ fn computed_sources(db: &Database, table: &str) -> std::collections::HashMap<usi
 /// check this server cannot evaluate (a column-vs-column comparison, an
 /// operator outside the WHERE surface) - DML must then refuse, never
 /// bypass the constraint.
+///
+/// The same walk is the TRIGGER GUARD: a trigger this server cannot
+/// execute but the engine would fire on `dml` also returns None. That
+/// is every user trigger (system_flag 0, any statement kind - the
+/// established coarse rule), and an FK referential-action trigger
+/// (system_flag 4) when the statement would fire it: AFTER DELETE
+/// (type 6) on any DELETE, AFTER UPDATE (type 4) on an UPDATE whose SET
+/// list touches a guarded parent-key column (from the trigger's own
+/// RDB$DEPENDENCIES rows). A DELETE evaluates no checks - the guard is
+/// the only thing [plan_delete] needs from here.
 fn check_predicates(
     db: &Database,
     table: &str,
     columns: &[RelationColumn],
     descs: &[Descriptor],
+    dml: DmlGuard,
 ) -> Option<Vec<Predicate>> {
     use fire_crab_ods::format::Value;
     let t_formats =
@@ -1443,14 +1507,19 @@ fn check_predicates(
     let (_, t_descs) = t_formats.iter().max_by_key(|(n, _)| *n)?;
     let tcols = relation_columns(&db.bytes, db.page_size, "RDB$TRIGGERS");
     let tfid = |n: &str| tcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
-    let (rel_f, src_f, sys_f) = (
+    let (rel_f, src_f, sys_f, name_f, typ_f) = (
         tfid("RDB$RELATION_NAME")?,
         tfid("RDB$TRIGGER_SOURCE")?,
         tfid("RDB$SYSTEM_FLAG")?,
+        tfid("RDB$TRIGGER_NAME")?,
+        tfid("RDB$TRIGGER_TYPE")?,
     );
     let trel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, "RDB$TRIGGERS")?;
     let mut blobs: Vec<(u16, u64)> = Vec::new();
     let mut user_trigger = false;
+    let mut fk_on_delete = false;
+    let mut fk_unknown = false;
+    let mut fk_update_trigs: Vec<String> = Vec::new();
     let fmts = vec![(0u8, t_descs.clone())];
     for_each_record(db, trel, &fmts, |values| {
         let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(table));
@@ -1463,6 +1532,21 @@ fn check_predicates(
         if matches!(values.get(sys_f), Some(Value::Int(0))) {
             user_trigger = true;
         }
+        // fb_sysflag_referential_constraint = 4: an FK action trigger
+        // on this (parent) table - note which statement kind fires it
+        if matches!(values.get(sys_f), Some(Value::Int(4))) {
+            match values.get(typ_f) {
+                Some(Value::Int(6)) => fk_on_delete = true,
+                Some(Value::Int(4)) => {
+                    if let Some(Value::Text(n)) = values.get(name_f) {
+                        fk_update_trigs.push(n.trim_end().to_string());
+                    }
+                }
+                // an unrecognised action-trigger shape: treat it as
+                // firing on everything, refuse below
+                _ => fk_unknown = true,
+            }
+        }
         // fb_sysflag_check_constraint = 3
         if !matches!(values.get(sys_f), Some(Value::Int(3))) {
             return;
@@ -1471,8 +1555,34 @@ fn check_predicates(
             blobs.push((*r, *n));
         }
     });
-    if user_trigger {
+    if user_trigger || fk_unknown {
         return None;
+    }
+    match dml {
+        DmlGuard::Insert => {} // no FK action trigger fires on parent INSERT
+        DmlGuard::Delete => {
+            if fk_on_delete {
+                return None; // the engine would cascade; we cannot
+            }
+            // a DELETE evaluates no CHECK constraints
+            return Some(Vec::new());
+        }
+        DmlGuard::Update(set_cols) => {
+            if !fk_update_trigs.is_empty() {
+                let guarded = fk_trigger_parent_cols(db, table, &fk_update_trigs)?;
+                // no readable key columns for a live action trigger:
+                // cannot prove the UPDATE safe - refuse
+                if guarded.is_empty() {
+                    return None;
+                }
+                if set_cols
+                    .iter()
+                    .any(|s| guarded.iter().any(|g| g.eq_ignore_ascii_case(s)))
+                {
+                    return None; // would change a referenced key; the engine would cascade
+                }
+            }
+        }
     }
     // the two triggers of a pair carry the SAME source - dedup by text
     let mut sources: Vec<String> = Vec::new();
@@ -4954,7 +5064,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     let params: Vec<Descriptor> = params.into_iter().collect::<Option<_>>()?;
     // the table's CHECK constraints; a check this server cannot
     // evaluate refuses the whole statement - never bypass
-    let checks = check_predicates(db, table, &columns, descs)?;
+    let checks = check_predicates(db, table, &columns, descs, DmlGuard::Insert)?;
     let descs = descs.clone();
     let not_null = not_null_fids(db, table);
     Some((
@@ -5448,8 +5558,19 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         ),
     };
     let params: Vec<Descriptor> = params.into_iter().collect::<Option<_>>()?;
-    // the table's CHECK constraints; an unevaluatable one refuses
-    let checks = check_predicates(db, table, &columns, descs)?;
+    // the table's CHECK constraints (an unevaluatable one refuses) and
+    // the trigger guard: the SET column names let an FK-parent table
+    // take updates that never touch a referenced key column
+    let set_names: Vec<String> = sets
+        .iter()
+        .filter_map(|(fid, _)| {
+            columns
+                .iter()
+                .find(|c| c.field_id as usize == *fid)
+                .map(|c| c.name.clone())
+        })
+        .collect();
+    let checks = check_predicates(db, table, &columns, descs, DmlGuard::Update(&set_names))?;
     let format_no = *format_no;
     let not_null = not_null_fids(db, table);
     Some((Plan::Update { rel, format_no, formats, sets, filter, index_ops, not_null, checks }, params))
@@ -5493,6 +5614,10 @@ fn plan_delete(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         ),
     };
     let params: Vec<Descriptor> = params.into_iter().collect::<Option<_>>()?;
+    // the trigger guard: an FK AFTER DELETE action trigger (the engine
+    // would cascade to the children) or a user trigger would fire on
+    // this DELETE - this server cannot execute trigger BLR, refuse
+    check_predicates(db, table, &columns, descs, DmlGuard::Delete)?;
     Some((Plan::Delete { rel, formats, filter }, params))
 }
 
