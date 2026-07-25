@@ -737,7 +737,11 @@ enum Plan {
     DropDomain { name: String },
     /// `ALTER DOMAIN <name> SET DEFAULT <lit>` / `DROP DEFAULT`: write (or
     /// clear) the default blobs on the domain's own RDB$FIELDS row
-    AlterDomainDefault {
+AlterDomainRename {
+        domain: String,
+        new_name: String,
+    },
+        AlterDomainDefault {
         domain: String,
         default: Option<fire_crab_ods::ddl::ColumnDefault>,
     },
@@ -3432,6 +3436,11 @@ fn plan_alter_domain(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         Some((Plan::AlterDomainDefault { domain: name, default }, Vec::new()))
     } else if norm == "DROP DEFAULT" {
         Some((Plan::AlterDomainDefault { domain: name, default: None }, Vec::new()))
+    } else if norm.starts_with("TO ") {
+        // ALTER DOMAIN <name> TO <new> - rename
+        let to_kw = find_word(&tail.to_ascii_uppercase(), "TO", 0)?;
+        let new_name = unquote_ident(tail[to_kw + "TO".len()..].trim())?;
+        Some((Plan::AlterDomainRename { domain: name, new_name }, Vec::new()))
     } else if norm == "SET NOT NULL" {
         Some((Plan::AlterDomainNotNull { domain: name, not_null: true }, Vec::new()))
     } else if norm == "DROP NOT NULL" {
@@ -5406,6 +5415,10 @@ fn execute_dml(
             fire_crab_ods::ddl::drop_domain(&mut work, db.page_size, name)?;
             (0, 0, 0)
         }
+        Plan::AlterDomainRename { domain, new_name } => {
+            fire_crab_ods::ddl::rename_domain(&mut work, db.page_size, domain, new_name)?;
+            (0, 0, 0)
+        }
         Plan::AlterDomainDefault { domain, default } => {
             fire_crab_ods::ddl::alter_domain_default(
                 &mut work,
@@ -7134,7 +7147,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
-        | Plan::AlterDomainDefault { .. }
+        | Plan::AlterDomainDefault { .. } | Plan::AlterDomainRename { .. }
         | Plan::AlterDomainNotNull { .. }
         | Plan::AlterDomainType { .. }
         | Plan::AlterIndex { .. }
@@ -7180,7 +7193,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
-        | Plan::AlterDomainDefault { .. }
+        | Plan::AlterDomainDefault { .. } | Plan::AlterDomainRename { .. }
         | Plan::AlterDomainNotNull { .. }
         | Plan::AlterDomainType { .. }
         | Plan::AlterIndex { .. }
@@ -7513,7 +7526,7 @@ fn emit_rows_inner(
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
-        | Plan::AlterDomainDefault { .. }
+        | Plan::AlterDomainDefault { .. } | Plan::AlterDomainRename { .. }
         | Plan::AlterDomainNotNull { .. }
         | Plan::AlterDomainType { .. }
         | Plan::AlterIndex { .. }
@@ -10257,7 +10270,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::DropRole { .. }
                         | Plan::CreateDomain { .. }
                         | Plan::DropDomain { .. }
-                        | Plan::AlterDomainDefault { .. }
+                        | Plan::AlterDomainDefault { .. } | Plan::AlterDomainRename { .. }
                         | Plan::AlterDomainNotNull { .. }
                         | Plan::AlterDomainType { .. }
                         | Plan::AlterIndex { .. }

@@ -726,25 +726,35 @@ fn rebuild_runtime_blob(
     });
     fields.sort_by_key(|f| f.0);
 
-    // a COMPUTED field re-emits its expression BLR (RSR_computed_blr = 4,
-    // between the length and position segments - probed order); the blob
-    // lives on the field source's RDB$FIELDS row
+    // per field SOURCE, from its RDB$FIELDS row: a COMPUTED field's
+    // expression BLR (re-emitted as RSR_computed_blr = 4, between the
+    // length and position segments - probed order), and a DOMAIN's
+    // DEFAULT (a domain column with no column-level default INHERITS
+    // the domain's, and the engine's rebuilt summary carries it -
+    // probed on ALTER DOMAIN rename, where the engine's runtime kept
+    // the RSR_default_value segment this rebuild used to drop)
     let mut computed_blobs: Vec<(String, (u16, u64))> = Vec::new();
+    let mut domain_defaults: Vec<(String, (u16, u64))> = Vec::new();
     if let Some(f_formats) = system_relation_formats(file, page_size, "RDB$FIELDS") {
         if let Some((_, f_descs)) = f_formats.iter().max_by_key(|(n, _)| *n) {
             let fcols = relation_columns(file, page_size, "RDB$FIELDS");
             let ffid =
                 |n: &str| fcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
-            if let (Some(fname_f), Some(cblr_f)) =
-                (ffid("RDB$FIELD_NAME"), ffid("RDB$COMPUTED_BLR"))
-            {
+            if let (Some(fname_f), Some(cblr_f), dval_f) = (
+                ffid("RDB$FIELD_NAME"),
+                ffid("RDB$COMPUTED_BLR"),
+                ffid("RDB$DEFAULT_VALUE"),
+            ) {
                 walk_rows(file, page_size, 2, f_descs, |vals| {
                     let Some(fname) = text(vals.get(fname_f)) else { return };
                     if !fields.iter().any(|f| f.2 == fname) {
                         return;
                     }
                     if let Some(Value::Blob(r, n)) = vals.get(cblr_f) {
-                        computed_blobs.push((fname, (*r, *n)));
+                        computed_blobs.push((fname.clone(), (*r, *n)));
+                    }
+                    if let Some(Some(Value::Blob(r, n))) = dval_f.map(|f| vals.get(f)) {
+                        domain_defaults.push((fname, (*r, *n)));
                     }
                 });
             }
@@ -783,9 +793,14 @@ fn rebuild_runtime_blob(
         }
         runtime.push(seg(27, &pos.to_le_bytes())); // RSR_field_pos
         // re-emit the column DEFAULT (RSR_default_value = 6) so an ALTER
-        // does not drop it from the summary the engine applies defaults from
-        if let Some((r, n)) = default {
-            if let Some(blr) = crate::format::read_blob_content(file, page_size, *r, *n) {
+        // does not drop it from the summary the engine applies defaults
+        // from; a domain column with no column-level default inherits
+        // the DOMAIN's
+        let effective_default = default
+            .map(|(r, n)| (r, n))
+            .or_else(|| domain_defaults.iter().find(|(s, _)| s == src).map(|(_, b)| *b));
+        if let Some((r, n)) = effective_default {
+            if let Some(blr) = crate::format::read_blob_content(file, page_size, r, n) {
                 runtime.push(seg(6, &blr));
             }
         }
@@ -1038,6 +1053,144 @@ pub fn alter_table_add_column(
 /// a non-text type has no `char_len` and uses `length` directly.
 fn catalog_field_length(col: &ColumnDef) -> i64 {
     col.char_len.map(|c| c as i64).unwrap_or(col.length as i64)
+}
+
+/// `ALTER DOMAIN <old> TO <new>`: rename the domain's RDB$FIELDS row IN
+/// PLACE and key the NEW name into the catalog's name index - the old
+/// entry stays behind pointing at the live row with a stale key, the
+/// same shape every engine update leaves until garbage collection, and
+/// what validation demands is that the CURRENT key be findable
+/// ([maintain_indexes]'s second caller). Every column using the domain
+/// gets its RDB$FIELD_SOURCE patched (not an indexed column) and its
+/// table's RDB$RUNTIME rebuilt - the summary quotes the source name, so
+/// without the rebuild the engine would still resolve columns through
+/// the OLD name (probed: the engine updates both on rename, and the
+/// domain's DEFAULT keeps applying afterwards).
+pub fn rename_domain(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    old: &str,
+    new: &str,
+) -> Result<(), String> {
+    let old = old.trim().trim_matches('"').to_ascii_uppercase();
+    let new = new.trim().trim_matches('"').to_ascii_uppercase();
+    if old.starts_with("RDB$") || new.starts_with("RDB$") {
+        return Err("system domains cannot be renamed".into());
+    }
+    if !domain_exists(file, page_size, &old) {
+        return Err(format!("domain {} not found", old));
+    }
+    if domain_exists(file, page_size, &new) {
+        return Err(format!("domain {} already exists", new));
+    }
+
+    // the RDB$FIELDS row: patch RDB$FIELD_NAME in place
+    let formats =
+        system_relation_formats(file, page_size, "RDB$FIELDS").ok_or("no RDB$FIELDS format")?;
+    let (_, f_descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let f_descs = f_descs.clone();
+    let f_cols = relation_columns(file, page_size, "RDB$FIELDS");
+    let name_fid = f_cols
+        .iter()
+        .find(|c| c.name == "RDB$FIELD_NAME")
+        .map(|c| c.field_id as usize)
+        .ok_or("no RDB$FIELD_NAME")?;
+    let mut hit: Option<(u32, u16, Vec<u8>, u8)> = None;
+    for dp_no in relation_data_pages(file, page_size, 2) {
+        let start = dp_no as usize * page_size;
+        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+            continue;
+        };
+        for r in dp.records() {
+            if !r.is_primary_record() {
+                continue;
+            }
+            let Some(image) = r.image() else { continue };
+            let vals = decode_record(&image, &f_descs);
+            if text_eq(vals.get(name_fid), &old) {
+                hit = Some((dp_no, r.slot, image, r.format));
+            }
+        }
+    }
+    let (page, slot, mut image, rec_format) = hit.ok_or("domain row not found")?;
+    let d = f_descs.get(name_fid).ok_or("field beyond format")?;
+    let bytes = encode_sys_value(d, &SysVal::S(&new))?;
+    let at = d.offset as usize;
+    image
+        .get_mut(at..at + bytes.len())
+        .ok_or("image shorter than format")?
+        .copy_from_slice(&bytes);
+    // key the RENAMED row into the catalog's indexes from its FULL
+    // patched image - the name index is compound ((schema, name) at ODS
+    // 14), so a name-only key would insert an entry the engine's DDL
+    // lookup never finds (caught live: SELECT ... WHERE RDB$FIELD_NAME
+    // found the row through the index while CREATE TABLE <domain> said
+    // the domain did not exist)
+    let key_values = decode_record(&image, &f_descs);
+    dml::update_records(file, page_size, 2, &[(page, slot, image)], rec_format)?;
+
+    let seq = u32_at(file, page as usize * page_size + 16) as u64;
+    let recno = seq * max_recs_per_dp(page_size) + slot as u64;
+    maintain_indexes(file, page_size, 2, recno, &key_values, &f_descs)?;
+
+    // every column whose RDB$FIELD_SOURCE is the domain: patch the source
+    // (not an indexed column) and remember its table for a runtime rebuild
+    let rf_formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")
+        .ok_or("no RDB$RELATION_FIELDS format")?;
+    let (_, rf_descs) = rf_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let rf_descs = rf_descs.clone();
+    let rf_cols = relation_columns(file, page_size, "RDB$RELATION_FIELDS");
+    let rf_fid = |n: &str| rf_cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let src_fid = rf_fid("RDB$FIELD_SOURCE").ok_or("no RDB$FIELD_SOURCE")?;
+    let rel_fid = rf_fid("RDB$RELATION_NAME").ok_or("no RDB$RELATION_NAME")?;
+    let mut patches: Vec<(u32, u16, Vec<u8>, u8)> = Vec::new();
+    let mut tables: Vec<String> = Vec::new();
+    for dp_no in relation_data_pages(file, page_size, 5) {
+        let start = dp_no as usize * page_size;
+        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+            continue;
+        };
+        for r in dp.records() {
+            if !r.is_primary_record() {
+                continue;
+            }
+            let Some(image) = r.image() else { continue };
+            let vals = decode_record(&image, &rf_descs);
+            if !text_eq(vals.get(src_fid), &old) {
+                continue;
+            }
+            if let Some(Value::Text(t)) = vals.get(rel_fid) {
+                let t = t.trim_end().to_string();
+                if !tables.contains(&t) {
+                    tables.push(t);
+                }
+            }
+            patches.push((dp_no, r.slot, image, r.format));
+        }
+    }
+    let sd = rf_descs.get(src_fid).ok_or("field beyond format")?;
+    let sbytes = encode_sys_value(sd, &SysVal::S(&new))?;
+    for (dp_no, slot, mut image, fmt) in patches {
+        let at = sd.offset as usize;
+        image
+            .get_mut(at..at + sbytes.len())
+            .ok_or("image shorter than format")?
+            .copy_from_slice(&sbytes);
+        // RDB$FIELD_SOURCE is INDEXED at ODS 14 (RDB$INDEX_3, and the
+        // schema-qualified RDB$INDEX_61) - the patched row's new source
+        // needs entries under its new key, like the rel-2 row above
+        // (gfix: "missing entries for record n" otherwise, caught live)
+        let key_values = decode_record(&image, &rf_descs);
+        dml::update_records(file, page_size, 5, &[(dp_no, slot, image)], fmt)?;
+        let seq = u32_at(file, dp_no as usize * page_size + 16) as u64;
+        let recno = seq * max_recs_per_dp(page_size) + slot as u64;
+        maintain_indexes(file, page_size, 5, recno, &key_values, &rf_descs)?;
+    }
+    for t in &tables {
+        update_relation_runtime(file, page_size, t)?;
+    }
+    advance_oldest_transactions(file, page_size)?;
+    Ok(())
 }
 
 /// Whether an `RDB$FIELDS` domain of this name exists.
