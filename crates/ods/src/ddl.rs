@@ -3039,6 +3039,40 @@ fn write_check(
     Ok(())
 }
 
+/// `ALTER TABLE <table> ADD [CONSTRAINT <name>] CHECK (<condition>)`:
+/// the same trigger pair and catalog rows a CREATE-time CHECK writes
+/// ([write_check]), plus a refresh of the relation's RDB$RUNTIME so the
+/// new triggers load. The engine does NOT validate existing rows
+/// (probed: a violating row survives the ALTER untouched; only future
+/// DML is checked) - so neither does this.
+pub fn alter_table_add_check(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    check: &CheckDef,
+) -> Result<(), String> {
+    let table = table.trim().to_ascii_uppercase();
+    let rel = crate::resolve_relation(file, page_size, &table)
+        .ok_or_else(|| format!("table {} not found", table))?;
+    if rel < 128 {
+        return Err("system relations are read-only".into());
+    }
+    let slot = generator_id_by_name(file, page_size, "RDB$TRIGGER_NAME")
+        .ok_or("no RDB$TRIGGER_NAME generator")?;
+    let a = gen::bump(file, page_size, slot, 1)?;
+    let b = gen::bump(file, page_size, slot, 1)?;
+    write_check(
+        file,
+        page_size,
+        &table,
+        check,
+        &(format!("CHECK_{}", a), format!("CHECK_{}", b)),
+    )?;
+    update_relation_runtime(file, page_size, &table)?;
+    advance_oldest_transactions(file, page_size)?;
+    Ok(())
+}
+
 /// `ALTER TABLE <table> ADD [CONSTRAINT <name>] PRIMARY KEY|UNIQUE
 /// (<cols>)`: add a key constraint to an EXISTING table. The index is
 /// built over the table's committed rows, so duplicate data fails the
@@ -3146,6 +3180,30 @@ pub fn alter_table_drop_constraint(
             })?;
             let index_name = index_name.ok_or("foreign key without an index")?;
             deferred_drop_index(file, page_size, rel, &index_name)?;
+        }
+        "CHECK" => {
+            // the pair of CHECK_<n> triggers, their dependency rows and
+            // the link rows all go, and the runtime refresh drops the
+            // trigger names - the engine leaves nothing and the
+            // condition stops enforcing (probed)
+            let tnames = check_constraint_trigger_names(file, page_size, &cname);
+            let cn_fid = sys_fid(file, page_size, "RDB$CHECK_CONSTRAINTS", "RDB$CONSTRAINT_NAME")?;
+            delete_catalog_rows(file, page_size, "RDB$CHECK_CONSTRAINTS", |v| {
+                text_eq(v.get(cn_fid), &cname)
+            })?;
+            let tn_fid = sys_fid(file, page_size, "RDB$TRIGGERS", "RDB$TRIGGER_NAME")?;
+            let dn_fid = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+            for t in &tnames {
+                let t = t.clone();
+                delete_catalog_rows(file, page_size, "RDB$TRIGGERS", {
+                    let t = t.clone();
+                    move |v| text_eq(v.get(tn_fid), &t)
+                })?;
+                delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
+                    text_eq(v.get(dn_fid), &t)
+                })?;
+            }
+            refresh_runtime(file, page_size, &name)?;
         }
         other => return Err(format!("cannot drop a {} constraint", other)),
     }
@@ -3764,6 +3822,38 @@ fn check_constraint_column(file: &[u8], page_size: usize, cname: &str) -> Option
         }
     });
     found
+}
+
+/// EVERY trigger name a check constraint's RDB$CHECK_CONSTRAINTS rows
+/// link to - a CHECK has a pair, where a NOT NULL has its single column
+/// name in the same place ([check_constraint_column]).
+fn check_constraint_trigger_names(file: &[u8], page_size: usize, cname: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let (Some(rel), Some(formats)) = (
+        crate::resolve_relation(file, page_size, "RDB$CHECK_CONSTRAINTS"),
+        system_relation_formats(file, page_size, "RDB$CHECK_CONSTRAINTS"),
+    ) else {
+        return names;
+    };
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else {
+        return names;
+    };
+    let cols = relation_columns(file, page_size, "RDB$CHECK_CONSTRAINTS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(cn_f), Some(tr_f)) = (fid("RDB$CONSTRAINT_NAME"), fid("RDB$TRIGGER_NAME")) else {
+        return names;
+    };
+    walk_rows(file, page_size, rel, descs, |values| {
+        if text_eq(values.get(cn_f), cname) {
+            if let Some(Value::Text(t)) = values.get(tr_f) {
+                let t = t.trim_end().to_string();
+                if !names.contains(&t) {
+                    names.push(t);
+                }
+            }
+        }
+    });
+    names
 }
 
 /// The foreign key (if any) whose RDB$REF_CONSTRAINTS row names this

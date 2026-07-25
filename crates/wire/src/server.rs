@@ -827,6 +827,13 @@ enum Plan {
     /// (...)`: add a key constraint to an existing table - the unique
     /// index built over the committed rows (duplicates fail the
     /// statement), the constraint catalog row written
+    /// `ALTER TABLE <t> ADD [CONSTRAINT <n>] CHECK (<cond>)`: the same
+    /// trigger pair a CREATE-time CHECK writes, plus a runtime refresh.
+    /// Existing rows are NOT validated (the engine's own rule).
+    AlterTableAddCheck {
+        table: String,
+        check: fire_crab_ods::ddl::CheckDef,
+    },
     AlterTableAddKey {
         table: String,
         key: fire_crab_ods::ddl::KeyDef,
@@ -3619,6 +3626,46 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
             Vec::new(),
         ));
     }
+    // ADD [CONSTRAINT <name>] CHECK (<condition>) - compiled against the
+    // CATALOG's columns (needs the attached database)
+    if let Some((cname, source)) = parse_check_clause(tail) {
+        let db = db.as_ref()?;
+        let columns = relation_columns(&db.bytes, db.page_size, table);
+        let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
+        let formats = relation_formats(&db.bytes, db.page_size, rel);
+        let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+        let cond = parse_cond(&source["CHECK".len()..])?;
+        let field_rank = |name: &str| {
+            let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+            let d = descs.get(rc.field_id as usize)?;
+            if (d.offset == 0 && d.length != 0) || d.scale != 0 || d.sub_type != 0 {
+                return None;
+            }
+            dtype_rank(d.dtype)
+        };
+        let mut fields: Vec<String> = Vec::new();
+        for e in cond.operands() {
+            infer_int_rank(e, &field_rank)?;
+            for f in e.field_refs() {
+                if !fields.iter().any(|n| n == &f) {
+                    fields.push(f);
+                }
+            }
+        }
+        let blr = fire_crab_ods::expr::check_trigger_blr(&cond_with_context(&cond, 1));
+        return Some((
+            Plan::AlterTableAddCheck {
+                table: table.to_ascii_uppercase(),
+                check: fire_crab_ods::ddl::CheckDef {
+                    name: cname,
+                    source,
+                    trigger_blr: blr,
+                    fields,
+                },
+            },
+            Vec::new(),
+        ));
+    }
     // ADD <name> COMPUTED [BY] (<expr>) / GENERATED ALWAYS AS (<expr>):
     // the result type is inferred from the CATALOG's existing columns
     // (needs the attached database - the statement's text has no types)
@@ -5107,6 +5154,10 @@ fn execute_dml(
             fire_crab_ods::ddl::alter_table_drop_constraint(
                 &mut work, db.page_size, table, constraint,
             )?;
+            (0, 0, 0)
+        }
+        Plan::AlterTableAddCheck { table, check } => {
+            fire_crab_ods::ddl::alter_table_add_check(&mut work, db.page_size, table, check)?;
             (0, 0, 0)
         }
         Plan::AlterTableAddKey { table, key } => {
@@ -6703,7 +6754,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         | Plan::GrantProcedure { .. }
         | Plan::GrantUsage { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
-        | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
+        | Plan::AlterTableAddKey { .. } | Plan::AlterTableAddCheck { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
         | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. } | Plan::AlterColumnDropIdentity { .. } | Plan::AlterColumnPosition { .. } => {
             describe_dml(5, params) // isc_info_sql_stmt_ddl
@@ -6749,7 +6800,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::GrantProcedure { .. }
         | Plan::GrantUsage { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
-        | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
+        | Plan::AlterTableAddKey { .. } | Plan::AlterTableAddCheck { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
         | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. } | Plan::AlterColumnDropIdentity { .. } | Plan::AlterColumnPosition { .. } => 5,
         Plan::SetGenerator { stmt_type, .. } => *stmt_type,
@@ -7082,7 +7133,7 @@ fn emit_rows_inner(
         | Plan::GrantProcedure { .. }
         | Plan::GrantUsage { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
-        | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
+        | Plan::AlterTableAddKey { .. } | Plan::AlterTableAddCheck { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
         | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. } | Plan::AlterColumnDropIdentity { .. } | Plan::AlterColumnPosition { .. }
         | Plan::GenIdIncrement { .. } | Plan::SetGenerator { .. } => {}
@@ -9826,6 +9877,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::AlterTableAdd { .. }
                         | Plan::AlterTableAddFk { .. }
                         | Plan::AlterTableAddKey { .. }
+                        | Plan::AlterTableAddCheck { .. }
                         | Plan::AlterTableDropConstraint { .. }
                         | Plan::AlterTableDrop { .. }
                         | Plan::AlterColumnType { .. }
