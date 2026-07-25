@@ -3597,6 +3597,25 @@ insert (`ID` 1, 2; `C` 100, 105, honouring the increment); and runs a `gbak` rou
 trip plus `gfix`. Every table-creating gate still passes — with no identity
 column the paths are unchanged.
 
+### The ninety-ninth differential — RESTART an identity
+
+Having created identity columns, the next thing is to reposition one.
+`ALTER TABLE T ALTER COLUMN ID RESTART WITH 100` primes the column's generator to
+yield 100 next — its stored value becomes `100 - increment` — and a bare
+`RESTART` primes it from the generator's `RDB$INITIAL_VALUE` instead. Neither
+touches the catalog: `RDB$INITIAL_VALUE` and the increment are unchanged, only the
+generator's stored value moves, so the whole operation is a single generator
+write once the column's generator name and increment are read back. A `RESTART` on
+a non-identity column is refused.
+
+`qa/serve-real-identityrestart.sh` (12 checks) starts both databases with the same
+identity table and a plain table; fire-crab `RESTART`s one copy and the engine the
+other. It compares the generator row and its stored value after `RESTART WITH 100`
+(and confirms the initial value and increment are unchanged), refuses a `RESTART`
+on a non-identity column on both, has the engine take the restarted value on the
+next insert (`ID` = 100), then compares a bare `RESTART` (stored back to
+`start - increment`), and runs a `gbak` round trip plus `gfix`.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest

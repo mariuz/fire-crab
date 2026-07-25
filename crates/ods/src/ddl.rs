@@ -1683,6 +1683,88 @@ pub fn alter_column_default(
     advance_oldest_transactions(file, page_size)
 }
 
+/// The identity generator backing a column - its `RDB$GENERATOR_NAME` when
+/// `RDB$IDENTITY_TYPE` is set - or None if the column is not an identity column.
+fn column_identity_generator(
+    file: &[u8],
+    page_size: usize,
+    table: &str,
+    column: &str,
+) -> Option<String> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$RELATION_FIELDS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$RELATION_FIELDS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (rel_f, name_f, gen_f, idt_f) = (
+        fid("RDB$RELATION_NAME")?,
+        fid("RDB$FIELD_NAME")?,
+        fid("RDB$GENERATOR_NAME")?,
+        fid("RDB$IDENTITY_TYPE")?,
+    );
+    let mut out = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if out.is_none() && text_eq(v.get(rel_f), table) && text_eq(v.get(name_f), column) {
+            if matches!(v.get(idt_f), Some(Value::Int(_))) {
+                if let Some(Value::Text(g)) = v.get(gen_f) {
+                    out = Some(g.trim_end().to_string());
+                }
+            }
+        }
+    });
+    out
+}
+
+/// A generator's `(RDB$GENERATOR_ID, RDB$GENERATOR_INCREMENT,
+/// RDB$INITIAL_VALUE)`.
+fn generator_incr_init(file: &[u8], page_size: usize, name: &str) -> Option<(i64, i64, i64)> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$GENERATORS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$GENERATORS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$GENERATORS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (name_f, id_f, inc_f, init_f) = (
+        fid("RDB$GENERATOR_NAME")?,
+        fid("RDB$GENERATOR_ID")?,
+        fid("RDB$GENERATOR_INCREMENT")?,
+        fid("RDB$INITIAL_VALUE")?,
+    );
+    let mut out = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if out.is_none() && text_eq(v.get(name_f), name) {
+            let geti = |f: usize| match v.get(f) {
+                Some(Value::Int(i)) => *i,
+                _ => 0,
+            };
+            out = Some((geti(id_f), geti(inc_f), geti(init_f)));
+        }
+    });
+    out
+}
+
+/// `ALTER TABLE <t> ALTER [COLUMN] <c> RESTART [WITH <n>]` - reposition an
+/// identity column's generator. `RESTART WITH n` primes it to yield `n` next
+/// (stored `n - increment`); a bare `RESTART` uses the generator's
+/// `RDB$INITIAL_VALUE`. Neither changes the catalog (`RDB$INITIAL_VALUE` and
+/// the increment stay); only the generator's stored value moves.
+pub fn alter_column_restart(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    column: &str,
+    with_value: Option<i64>,
+) -> Result<(), String> {
+    let table = table.trim().to_ascii_uppercase();
+    let column = column.trim().trim_matches('"').to_ascii_uppercase();
+    let gen = column_identity_generator(file, page_size, &table, &column)
+        .ok_or_else(|| format!("column {} is not an identity column", column))?;
+    let (id, increment, initial) = generator_incr_init(file, page_size, &gen)
+        .ok_or_else(|| format!("identity generator {} not found", gen))?;
+    let target = with_value.unwrap_or(initial);
+    gen::write(file, page_size, id, target.wrapping_sub(increment))?;
+    advance_oldest_transactions(file, page_size)
+}
+
 /// Whether any committed primary record of `rel` has a NULL in field
 /// `fid` - the check `SET NOT NULL` makes before it can succeed.
 fn column_has_nulls(file: &[u8], page_size: usize, rel: u16, fid: usize) -> bool {

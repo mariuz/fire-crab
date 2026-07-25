@@ -859,6 +859,13 @@ enum Plan {
         column: String,
         default: Option<fire_crab_ods::ddl::ColumnDefault>,
     },
+    /// `ALTER TABLE <t> ALTER <c> RESTART [WITH <n>]`: reposition an identity
+    /// column's generator (its stored value only)
+    AlterColumnRestart {
+        table: String,
+        column: String,
+        with_value: Option<i64>,
+    },
     /// `INSERT INTO <t> [(cols)] VALUES (...)`: the record image is
     /// built at prepare (nulls flagged, literal fields at their
     /// descriptor offsets); `param_fields` lists the (field id,
@@ -2970,6 +2977,62 @@ fn plan_alter_column_default(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     ))
 }
 
+/// Parse `ALTER TABLE <t> ALTER [COLUMN] <c> RESTART [WITH <n>]` - reposition
+/// an identity column's generator.
+fn plan_alter_column_restart(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "ALTER", 0) != Some(0) {
+        return None;
+    }
+    let table_kw = find_word(&masked, "TABLE", "ALTER".len())?;
+    if masked[..table_kw].trim() != "ALTER" {
+        return None;
+    }
+    let alter2 = find_word(&masked, "ALTER", table_kw + "TABLE".len())?;
+    let table = s[table_kw + "TABLE".len()..alter2].trim().trim_matches('"');
+    if !ident_ok(table) {
+        return None;
+    }
+    let tail = s[alter2 + "ALTER".len()..].trim();
+    let tail_up = tail.to_ascii_uppercase();
+    let rp = find_word(&tail_up, "RESTART", 0)?;
+    // the column sits between the second ALTER and RESTART
+    let mid = tail[..rp].trim();
+    let toks: Vec<&str> = mid.split_whitespace().collect();
+    let col = match toks.as_slice() {
+        [c] => *c,
+        [w, c] if w.eq_ignore_ascii_case("COLUMN") => *c,
+        _ => return None,
+    };
+    let col = col.trim_matches('"');
+    if !ident_ok(col) {
+        return None;
+    }
+    // RESTART, optionally WITH <n>
+    let after = tail_up[rp + "RESTART".len()..].trim();
+    let with_value = if after.is_empty() {
+        None
+    } else if let Some(wp) = find_word(&tail_up, "WITH", rp + "RESTART".len()) {
+        if tail_up[rp + "RESTART".len()..wp].trim().is_empty() {
+            Some(tail[wp + "WITH".len()..].trim().parse::<i64>().ok()?)
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+    Some((
+        Plan::AlterColumnRestart {
+            table: table.to_ascii_uppercase(),
+            column: col.to_ascii_uppercase(),
+            with_value,
+        },
+        Vec::new(),
+    ))
+}
+
 /// Strip a SQL identifier's optional double quotes. A quoted identifier
 /// keeps its case (and `""` is an escaped quote); an unquoted one is
 /// returned as written (the catalog stores it upper-cased, and generator
@@ -3981,6 +4044,16 @@ fn execute_dml(
                 table,
                 column,
                 default.as_ref(),
+            )?;
+            (0, 0, 0)
+        }
+        Plan::AlterColumnRestart { table, column, with_value } => {
+            fire_crab_ods::ddl::alter_column_restart(
+                &mut work,
+                db.page_size,
+                table,
+                column,
+                *with_value,
             )?;
             (0, 0, 0)
         }
@@ -5456,7 +5529,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
-        | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } => {
+        | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } => {
             describe_dml(5, params) // isc_info_sql_stmt_ddl
         }
         Plan::Insert { .. } => describe_dml(2, params), // isc_info_sql_stmt_insert
@@ -5502,7 +5575,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
-        | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } => 5,
+        | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } => 5,
         Plan::SetGenerator { stmt_type, .. } => *stmt_type,
     }
 }
@@ -5835,7 +5908,7 @@ fn emit_rows_inner(
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
-        | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. }
+        | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. }
         | Plan::GenIdIncrement { .. } | Plan::SetGenerator { .. } => {}
         Plan::Scalar(v) => {
             w.int(OP_FETCH_RESPONSE).int(0).int(1);
@@ -8276,6 +8349,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             .or_else(|| plan_alter_table_alter_type(&text))
                             .or_else(|| plan_alter_column_null(&text))
                             .or_else(|| plan_alter_column_default(&text))
+                            .or_else(|| plan_alter_column_restart(&text))
                             .or_else(|| plan_alter_sequence(&text))
                     } else if dml_kw {
                         plan_insert(&text, &database)
@@ -8434,6 +8508,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         .or_else(|| plan_alter_table_alter_type(&stmt_sql))
                         .or_else(|| plan_alter_column_null(&stmt_sql))
                         .or_else(|| plan_alter_column_default(&stmt_sql))
+                        .or_else(|| plan_alter_column_restart(&stmt_sql))
                         .or_else(|| plan_alter_sequence(&stmt_sql));
                     match planned {
                         Some((p, ps)) => {
@@ -8562,6 +8637,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::AlterColumnType { .. }
                         | Plan::AlterColumnNull { .. }
                         | Plan::AlterColumnDefault { .. }
+                        | Plan::AlterColumnRestart { .. }
                         | Plan::SetGenerator { .. }
                 ) {
                     // DML and DDL execute here (not at fetch): write the
@@ -11796,6 +11872,22 @@ mod tests {
         assert!(plan_create_domain("CREATE OR ALTER DOMAIN D AS INT").is_none());
         assert!(plan_create_domain("CREATE TABLE T (A INT)").is_none());
         assert!(plan_drop_domain("DROP TABLE T").is_none());
+    }
+
+    #[test]
+    fn parses_alter_column_restart() {
+        match plan_alter_column_restart("ALTER TABLE T ALTER COLUMN ID RESTART WITH 100") {
+            Some((Plan::AlterColumnRestart { table, column, with_value }, _)) => {
+                assert_eq!((table.as_str(), column.as_str()), ("T", "ID"));
+                assert_eq!(with_value, Some(100));
+            }
+            other => panic!("expected AlterColumnRestart WITH, got {:?}", other.is_some()),
+        }
+        match plan_alter_column_restart("alter table t alter id restart") {
+            Some((Plan::AlterColumnRestart { with_value, .. }, _)) => assert_eq!(with_value, None),
+            other => panic!("expected bare AlterColumnRestart, got {:?}", other.is_some()),
+        }
+        assert!(plan_alter_column_restart("ALTER TABLE T ALTER COLUMN A SET DEFAULT 1").is_none());
     }
 
     #[test]
