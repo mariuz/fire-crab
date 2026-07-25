@@ -926,6 +926,9 @@ AlterDomainRename {
         /// the table's CHECK constraints as NEGATED predicates - a match
         /// on the final row is a violation ([check_predicates])
         checks: Vec<Predicate>,
+        /// the FOREIGN KEYS on this table: the bound row's key must
+        /// reference an existing parent row ([fk_check_child_row])
+        fk_refs: Vec<FkPartner>,
     },
     /// `UPDATE <t> SET col = <lit|?> [, ...] [WHERE ...]`: literal SET
     /// values are encoded at prepare, parameter ones bind at execute;
@@ -942,6 +945,12 @@ AlterDomainRename {
         not_null: Vec<usize>,
         /// NEGATED check predicates, evaluated on each PATCHED row
         checks: Vec<Predicate>,
+        /// FKs ON this table whose columns the SET list touches - the
+        /// patched row's key must still reference an existing parent
+        fk_refs: Vec<FkPartner>,
+        /// FKs REFERENCING this table whose key columns the SET list
+        /// touches - a changed key must not leave child rows behind
+        fk_children: Vec<FkPartner>,
     },
     /// `DELETE FROM <t> [WHERE ...]`: op_execute rewrites each matching
     /// primary record as a deleted stub over its version chain
@@ -949,6 +958,10 @@ AlterDomainRename {
         rel: u16,
         formats: Vec<(u8, Vec<Descriptor>)>,
         filter: Option<Predicate>,
+        /// FKs REFERENCING this table: a deleted row's key must not be
+        /// referenced by any child row (NO ACTION - the action rules
+        /// are refused at plan time by the flag-4 trigger guard)
+        fk_children: Vec<FkPartner>,
     },
     Project {
         rel: u16,
@@ -1471,6 +1484,229 @@ fn fk_trigger_parent_cols(db: &Database, table: &str, trigs: &[String]) -> Optio
         }
     });
     Some(out)
+}
+
+/// One FOREIGN KEY partnership a DML statement must respect, resolved
+/// at plan time from RDB$INDICES - an FK index names its partner unique
+/// index in RDB$FOREIGN_KEY, the same self-join the engine's
+/// MET_lookup_partner walks. `my_fids` are the key fields in the DML
+/// target table, `other_fids` the partner relation's, segment by
+/// segment in RDB$FIELD_POSITION order.
+struct FkPartner {
+    other_rel: u16,
+    other_formats: Vec<(u8, Vec<Descriptor>)>,
+    other_fids: Vec<usize>,
+    my_fids: Vec<usize>,
+}
+
+/// The FOREIGN KEY partnerships `table` participates in, as
+/// `(as_child, as_parent)`: the FKs ON the table (its rows must
+/// reference an existing parent key) and the FKs REFERENCING it (its
+/// keys must not be deleted or changed away while a child row points at
+/// them - the NO ACTION/RESTRICT rule the engine enforces with partner
+/// INDEX checks, not triggers, so the flag-4 trigger guard never sees
+/// them). None when the catalog cannot be resolved - the DML planner
+/// must refuse, never bypass.
+fn fk_partners(
+    db: &Database,
+    table: &str,
+    columns: &[RelationColumn],
+) -> Option<(Vec<FkPartner>, Vec<FkPartner>)> {
+    // every index row: (index name, relation name, partner index name)
+    let i_formats =
+        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes, db.page_size, "RDB$INDICES")?;
+    let (_, i_descs) = i_formats.iter().max_by_key(|(n, _)| *n)?;
+    let icols = relation_columns(&db.bytes, db.page_size, "RDB$INDICES");
+    let ifid = |n: &str| icols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (ix_f, rn_f, fk_f) = (
+        ifid("RDB$INDEX_NAME")?,
+        ifid("RDB$RELATION_NAME")?,
+        ifid("RDB$FOREIGN_KEY")?,
+    );
+    let irel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, "RDB$INDICES")?;
+    let ifmts = vec![(0u8, i_descs.clone())];
+    let mut rows: Vec<(String, String, Option<String>)> = Vec::new();
+    for_each_record(db, irel, &ifmts, |values| {
+        let Some(Value::Text(ix)) = values.get(ix_f) else { return };
+        let Some(Value::Text(rn)) = values.get(rn_f) else { return };
+        let fk = match values.get(fk_f) {
+            Some(Value::Text(t)) if !t.trim_end().is_empty() => Some(t.trim_end().to_string()),
+            _ => None,
+        };
+        rows.push((ix.trim_end().to_string(), rn.trim_end().to_string(), fk));
+    });
+    if !rows.iter().any(|(_, _, fk)| fk.is_some()) {
+        return Some((Vec::new(), Vec::new())); // no FK anywhere - skip the segment walk
+    }
+    // every segment row: (index name, position, column name)
+    let s_formats = fire_crab_ods::sysfmt::system_relation_formats(
+        &db.bytes,
+        db.page_size,
+        "RDB$INDEX_SEGMENTS",
+    )?;
+    let (_, s_descs) = s_formats.iter().max_by_key(|(n, _)| *n)?;
+    let scols = relation_columns(&db.bytes, db.page_size, "RDB$INDEX_SEGMENTS");
+    let sfid = |n: &str| scols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (sn_f, sc_f, sp_f) = (
+        sfid("RDB$INDEX_NAME")?,
+        sfid("RDB$FIELD_NAME")?,
+        sfid("RDB$FIELD_POSITION")?,
+    );
+    let srel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, "RDB$INDEX_SEGMENTS")?;
+    let sfmts = vec![(0u8, s_descs.clone())];
+    let mut segrows: Vec<(String, i64, String)> = Vec::new();
+    for_each_record(db, srel, &sfmts, |values| {
+        let Some(Value::Text(ix)) = values.get(sn_f) else { return };
+        let Some(Value::Text(col)) = values.get(sc_f) else { return };
+        let pos = match values.get(sp_f) {
+            Some(Value::Int(i)) => *i,
+            _ => 0,
+        };
+        segrows.push((ix.trim_end().to_string(), pos, col.trim_end().to_string()));
+    });
+    let segs_of = |name: &str| -> Vec<String> {
+        let mut s: Vec<(i64, String)> = segrows
+            .iter()
+            .filter(|(ix, _, _)| ix.eq_ignore_ascii_case(name))
+            .map(|(_, p, c)| (*p, c.clone()))
+            .collect();
+        s.sort_by_key(|(p, _)| *p);
+        s.into_iter().map(|(_, c)| c).collect()
+    };
+    let my_fid = |n: &String| {
+        columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(n))
+            .map(|c| c.field_id as usize)
+    };
+    let other_side = |name: &str, key_cols: &[String]| -> Option<FkPartner> {
+        let orel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, name)?;
+        let ocols = relation_columns(&db.bytes, db.page_size, name);
+        let other_fids: Vec<usize> = key_cols
+            .iter()
+            .map(|c| {
+                ocols
+                    .iter()
+                    .find(|rc| rc.name.eq_ignore_ascii_case(c))
+                    .map(|rc| rc.field_id as usize)
+            })
+            .collect::<Option<_>>()?;
+        Some(FkPartner {
+            other_rel: orel,
+            other_formats: relation_formats(&db.bytes, db.page_size, orel),
+            other_fids,
+            my_fids: Vec::new(), // the caller fills its own side
+        })
+    };
+    let mut as_child = Vec::new();
+    let mut as_parent = Vec::new();
+    for (ix, rn, fkp) in &rows {
+        let Some(pname) = fkp else { continue };
+        // the partner (unique, parent-side) index row must resolve
+        let (p_ix, p_rn, _) = rows.iter().find(|(n, _, _)| n.eq_ignore_ascii_case(pname))?;
+        if rn.eq_ignore_ascii_case(table) {
+            // `table` is the child: its FK columns reference p_rn
+            let my_fids: Vec<usize> = segs_of(ix).iter().map(my_fid).collect::<Option<_>>()?;
+            let mut p = other_side(p_rn, &segs_of(p_ix))?;
+            if my_fids.is_empty() || my_fids.len() != p.other_fids.len() {
+                return None;
+            }
+            p.my_fids = my_fids;
+            as_child.push(p);
+        }
+        if p_rn.eq_ignore_ascii_case(table) {
+            // `table` is the parent: rows of rn reference its key
+            let my_fids: Vec<usize> = segs_of(p_ix).iter().map(my_fid).collect::<Option<_>>()?;
+            let mut c = other_side(rn, &segs_of(ix))?;
+            if my_fids.is_empty() || my_fids.len() != c.other_fids.len() {
+                return None;
+            }
+            c.my_fids = my_fids;
+            as_parent.push(c);
+        }
+    }
+    Some((as_child, as_parent))
+}
+
+/// TRUE when the partner relation holds a row matching `key` on the
+/// partnership's other-side columns - all non-NULL and equal under
+/// [value_cmp], the pad-insensitive equality the join machinery uses
+/// (the engine compares partner INDEX keys, equally pad-insensitive).
+fn fk_partner_has(db: &Database, fk: &FkPartner, key: &[&Value]) -> bool {
+    let mut found = false;
+    for_each_record(db, fk.other_rel, &fk.other_formats, |v| {
+        if !found
+            && fk.other_fids.iter().zip(key).all(|(of, k)| {
+                let o = v.get(*of).unwrap_or(&Value::Null);
+                !matches!(o, Value::Null) && value_cmp(o, k) == std::cmp::Ordering::Equal
+            })
+        {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Child-side partner check at store time: every FK on the row's table
+/// whose key is fully non-NULL must reference an existing parent row
+/// (MATCH SIMPLE - a NULL component passes the check, as the engine's
+/// idx.epp does).
+fn fk_check_child_row(db: &Database, fks: &[FkPartner], row: &[Value]) -> Result<(), String> {
+    for fk in fks {
+        let key: Vec<&Value> = fk
+            .my_fids
+            .iter()
+            .map(|f| row.get(*f).unwrap_or(&Value::Null))
+            .collect();
+        if key.iter().any(|v| matches!(v, Value::Null)) {
+            continue;
+        }
+        if !fk_partner_has(db, fk, &key) {
+            return Err(
+                "violation of FOREIGN KEY constraint: Foreign key reference target does not exist"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Parent-side (NO ACTION/RESTRICT) partner check: the key of a row
+/// being deleted (`new_row` None) or updated must not be referenced by
+/// any child row. An UPDATE that leaves the key equal never fires the
+/// check; a NULL key component cannot be referenced at all.
+fn fk_check_parent_row(
+    db: &Database,
+    fks: &[FkPartner],
+    old_row: &[Value],
+    new_row: Option<&[Value]>,
+) -> Result<(), String> {
+    for fk in fks {
+        let key: Vec<&Value> = fk
+            .my_fids
+            .iter()
+            .map(|f| old_row.get(*f).unwrap_or(&Value::Null))
+            .collect();
+        if key.iter().any(|v| matches!(v, Value::Null)) {
+            continue;
+        }
+        if let Some(new) = new_row {
+            let unchanged = fk.my_fids.iter().zip(&key).all(|(f, k)| {
+                let n = new.get(*f).unwrap_or(&Value::Null);
+                !matches!(n, Value::Null) && value_cmp(n, k) == std::cmp::Ordering::Equal
+            });
+            if unchanged {
+                continue;
+            }
+        }
+        if fk_partner_has(db, fk, &key) {
+            return Err(
+                "violation of FOREIGN KEY constraint: Foreign key references are present for the record"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The CHECK constraints of a table as NEGATED, parameter-free
@@ -5067,6 +5303,9 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     let checks = check_predicates(db, table, &columns, descs, DmlGuard::Insert)?;
     let descs = descs.clone();
     let not_null = not_null_fids(db, table);
+    // the FKs on this table: the stored row must reference existing
+    // parent keys; an unresolvable FK catalog refuses, never bypasses
+    let (fk_refs, _) = fk_partners(db, table, &columns)?;
     Some((
         Plan::Insert {
             rel,
@@ -5078,6 +5317,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
             gen_fields,
             checks,
             not_null,
+            fk_refs,
         },
         params,
     ))
@@ -5573,7 +5813,29 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     let checks = check_predicates(db, table, &columns, descs, DmlGuard::Update(&set_names))?;
     let format_no = *format_no;
     let not_null = not_null_fids(db, table);
-    Some((Plan::Update { rel, format_no, formats, sets, filter, index_ops, not_null, checks }, params))
+    // the FK partner checks, both directions, narrowed to the FKs whose
+    // key columns this SET list touches - an update leaving a key
+    // untouched can violate nothing
+    let set_fids: Vec<usize> = sets.iter().map(|(f, _)| *f).collect();
+    let (fk_refs, fk_children) = fk_partners(db, table, &columns)?;
+    let touched = |fk: &FkPartner| fk.my_fids.iter().any(|f| set_fids.contains(f));
+    let fk_refs: Vec<FkPartner> = fk_refs.into_iter().filter(|fk| touched(fk)).collect();
+    let fk_children: Vec<FkPartner> = fk_children.into_iter().filter(|fk| touched(fk)).collect();
+    Some((
+        Plan::Update {
+            rel,
+            format_no,
+            formats,
+            sets,
+            filter,
+            index_ops,
+            not_null,
+            checks,
+            fk_refs,
+            fk_children,
+        },
+        params,
+    ))
 }
 
 /// Parse `DELETE FROM <t> [WHERE <pred>]` and resolve it. Same
@@ -5618,7 +5880,10 @@ fn plan_delete(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     // would cascade to the children) or a user trigger would fire on
     // this DELETE - this server cannot execute trigger BLR, refuse
     check_predicates(db, table, &columns, descs, DmlGuard::Delete)?;
-    Some((Plan::Delete { rel, formats, filter }, params))
+    // NO ACTION FKs referencing this table: each deleted row's key must
+    // be checked for child references at execute
+    let (_, fk_children) = fk_partners(db, table, &columns)?;
+    Some((Plan::Delete { rel, formats, filter, fk_children }, params))
 }
 
 /// The DML target walk: every committed primary record of `rel` the
@@ -5959,7 +6224,7 @@ fn execute_dml(
             )?;
             (0, 0, 0)
         }
-        Plan::Insert { rel, format_no, image, descs, index_ops, param_fields, gen_fields, not_null, checks } => {
+        Plan::Insert { rel, format_no, image, descs, index_ops, param_fields, gen_fields, not_null, checks, fk_refs } => {
             let mut image = image.clone();
             for (fid, slot) in param_fields {
                 let d = descs.get(*fid).ok_or("field beyond format")?;
@@ -6010,6 +6275,13 @@ fn execute_dml(
                     return Err("Operation violates CHECK constraint".into());
                 }
             }
+            // FOREIGN KEY child-side partner check, where the engine
+            // checks at store: the bound row's key must reference an
+            // existing parent row (a NULL component passes)
+            if !fk_refs.is_empty() {
+                let values = decode_record(&image, descs);
+                fk_check_child_row(db, fk_refs, &values)?;
+            }
             let image = &image;
             let out =
                 fire_crab_ods::insert_record(&mut work, db.page_size, *rel, *format_no, image)?;
@@ -6030,7 +6302,7 @@ fn execute_dml(
             }
             (1, 0, 0)
         }
-        Plan::Update { rel, format_no, formats, sets, filter, index_ops, not_null, checks } => {
+        Plan::Update { rel, format_no, formats, sets, filter, index_ops, not_null, checks, fk_refs, fk_children } => {
             let descs = formats
                 .iter()
                 .find(|(n, _)| n == format_no)
@@ -6088,6 +6360,16 @@ fn execute_dml(
                         return Err("Operation violates CHECK constraint".into());
                     }
                 }
+                // FOREIGN KEY partner checks, both directions: the
+                // patched row's own FK key must still have a parent,
+                // and a changed key of THIS row must not strand
+                // children pointing at the old value
+                if !fk_refs.is_empty() || !fk_children.is_empty() {
+                    let old_values = decode_record(&image, descs);
+                    let new_values = decode_record(&img, descs);
+                    fk_check_child_row(db, fk_refs, &new_values)?;
+                    fk_check_parent_row(db, fk_children, &old_values, Some(&new_values))?;
+                }
                 old_images.push(image);
                 targets.push((page, slot, img));
             }
@@ -6118,12 +6400,25 @@ fn execute_dml(
             }
             (0, out.affected as i32, 0)
         }
-        Plan::Delete { rel, formats, filter } => {
+        Plan::Delete { rel, formats, filter, fk_children } => {
             let filter = &bind_filter(filter, args)?;
-            let targets: Vec<(u32, u16)> = collect_dml_targets(db, *rel, formats, filter)
-                .into_iter()
-                .map(|(page, slot, _, _)| (page, slot))
-                .collect();
+            let mut targets: Vec<(u32, u16)> = Vec::new();
+            for (page, slot, fmt, image) in collect_dml_targets(db, *rel, formats, filter) {
+                // NO ACTION partner check, per deleted row: its key
+                // must not be referenced by any child (the row's own
+                // stored format decodes it, like the target walk did)
+                if !fk_children.is_empty() {
+                    let descs = formats
+                        .iter()
+                        .find(|(n, _)| *n == fmt)
+                        .or_else(|| formats.iter().max_by_key(|(n, _)| *n))
+                        .map(|(_, d)| d)
+                        .ok_or("no format for a matching record")?;
+                    let values = decode_record(&image, descs);
+                    fk_check_parent_row(db, fk_children, &values, None)?;
+                }
+                targets.push((page, slot));
+            }
             let out = fire_crab_ods::delete_records(&mut work, db.page_size, *rel, &targets)?;
             (0, 0, out.affected as i32)
         }
