@@ -3484,6 +3484,31 @@ the inherited `NOT NULL`, and runs a `gbak` round trip plus `gfix`. Every
 table-creating gate still passes, since with no domain columns the source names
 and rows are byte-identical to before.
 
+### The ninety-fourth differential — a domain column that overrides the domain
+
+The previous differential refused a domain column with its own `NOT NULL` or
+`DEFAULT`. Those are the override cases, and they turn out to unify with the
+built-in path rather than fork from it. A column-level `NOT NULL` sets the
+column's `RDB$NULL_FLAG` and writes an `INTEG_<n>` constraint — the very same
+constraint a built-in `NOT NULL` column already produced (keyed by the column
+name, so the existing loop wrote it for a domain column too, untouched) — and
+folds the not-null marker into the runtime. A column-level `DEFAULT` writes the
+column's own `RDB$DEFAULT_SOURCE`/`VALUE` and puts its BLR in the runtime in
+place of the domain's. A plain domain column, with neither, still inherits both.
+
+So the rule collapses to: a column-level attribute lands on the
+`RDB$RELATION_FIELDS` row and wins in the runtime, whether the column is built-in
+or domain; a domain column with none inherits the domain's. Removing the refusal
+and dropping the `is_domain` guard from those two writes was the whole change.
+
+`qa/serve-real-domaincoloverride.sh` (10 checks) creates a table whose domain
+columns carry a `NOT NULL`, a `DEFAULT` override, and neither, plus a built-in
+column, and compares every `RDB$RELATION_FIELDS` row, the `RDB$RUNTIME` byte for
+byte (the override default present, the plain column's inherited), and the
+`INTEG` constraint, then has the engine apply the override (`B` = 7) and the
+inherited default (`C` = 42) and enforce the column `NOT NULL`, and runs `gbak`
+plus `gfix`.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest

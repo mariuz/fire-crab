@@ -1951,12 +1951,6 @@ pub fn create_table(
     for c in cols {
         if let Some(dname) = &c.domain {
             let dname = dname.trim().trim_matches('"').to_ascii_uppercase();
-            if c.not_null || c.default.is_some() {
-                return Err(format!(
-                    "column-level constraints on a domain column ({}) are not supported",
-                    c.name
-                ));
-            }
             let dt = resolve_domain_type(file, page_size, &dname)
                 .ok_or_else(|| format!("Domain {} is not defined", dname))?;
             let mut rc = c.clone();
@@ -2034,17 +2028,19 @@ pub fn create_table(
         runtime.push(seg(27, &(i as u16).to_le_bytes())); // RSR_field_pos
         // the field DEFAULT (RSR_default_value = 6): the engine reads a
         // field's default from this runtime entry, not from the catalog
-        // column. A domain column inherits the domain's default here.
-        let default_blr: Option<&[u8]> = if *is_domain {
-            dom_default.as_deref()
-        } else {
-            c.default.as_ref().map(|d| d.value_blr.as_slice())
-        };
+        // column. A column-level default wins; a domain column with none
+        // inherits the domain's.
+        let default_blr: Option<&[u8]> = c
+            .default
+            .as_ref()
+            .map(|d| d.value_blr.as_slice())
+            .or(if *is_domain { dom_default.as_deref() } else { None });
         if let Some(blr) = default_blr {
             runtime.push(seg(6, blr));
         }
-        // NOT NULL, likewise inherited from the domain for a domain column
-        let not_null = if *is_domain { *dom_not_null } else { c.not_null };
+        // NOT NULL: a column-level NOT NULL, or (for a domain column) the
+        // domain's own NOT NULL
+        let not_null = c.not_null || (*is_domain && *dom_not_null);
         if not_null {
             runtime.push(seg(21, &NONNULL_BLR)); // RSR_field_not_null
         }
@@ -2095,20 +2091,19 @@ pub fn create_table(
         if !is_domain {
             vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
         }
-        // a domain column inherits NOT NULL and DEFAULT from the domain, so
-        // its RDB$RELATION_FIELDS row carries neither (the engine keeps them
-        // on the domain's RDB$FIELDS row); a built-in column carries its own
-        if !is_domain {
-            if c.not_null {
-                vals.push(("RDB$NULL_FLAG", SysVal::I(1)));
-            }
-            if let Some(def) = &c.default {
-                let src =
-                    dml::insert_blob_cs(file, page_size, 5, &[def.source.as_bytes().to_vec()], 1, 4)?;
-                let val = dml::insert_blob(file, page_size, 5, &[def.value_blr.clone()], 2)?;
-                vals.push(("RDB$DEFAULT_SOURCE", SysVal::B(blob_id_bytes(5, src))));
-                vals.push(("RDB$DEFAULT_VALUE", SysVal::B(blob_id_bytes(5, val))));
-            }
+        // a COLUMN-level NOT NULL / DEFAULT lands on the RDB$RELATION_FIELDS
+        // row (for a built-in or a domain column alike); a domain column with
+        // neither inherits them from the domain, so its row carries neither -
+        // the engine keeps those on the domain's RDB$FIELDS row
+        if c.not_null {
+            vals.push(("RDB$NULL_FLAG", SysVal::I(1)));
+        }
+        if let Some(def) = &c.default {
+            let src =
+                dml::insert_blob_cs(file, page_size, 5, &[def.source.as_bytes().to_vec()], 1, 4)?;
+            let val = dml::insert_blob(file, page_size, 5, &[def.value_blr.clone()], 2)?;
+            vals.push(("RDB$DEFAULT_SOURCE", SysVal::B(blob_id_bytes(5, src))));
+            vals.push(("RDB$DEFAULT_VALUE", SysVal::B(blob_id_bytes(5, val))));
         }
         sys_insert(file, page_size, "RDB$RELATION_FIELDS", 5, &vals)?;
     }
