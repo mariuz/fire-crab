@@ -1787,6 +1787,37 @@ pub fn alter_column_restart(
     advance_oldest_transactions(file, page_size)
 }
 
+/// `ALTER TABLE <t> ALTER [COLUMN] <c> SET GENERATED { ALWAYS | BY DEFAULT }` -
+/// change an identity column's `RDB$IDENTITY_TYPE` (0 ALWAYS / 1 BY DEFAULT).
+/// The generator and its value are untouched; the relation's `RDB$RUNTIME` is
+/// rebuilt so the runtime's identity-type segment (23) follows.
+pub fn alter_column_set_generated(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    column: &str,
+    identity_type: i16,
+) -> Result<(), String> {
+    let table = table.trim().to_ascii_uppercase();
+    let column = column.trim().trim_matches('"').to_ascii_uppercase();
+    if column_identity_generator(file, page_size, &table, &column).is_none() {
+        return Err(format!("column {} is not an identity column", column));
+    }
+    let rel_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$RELATION_NAME")?;
+    let name_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$FIELD_NAME")?;
+    let (t, c) = (table.clone(), column.clone());
+    patch_sys_row(
+        file,
+        page_size,
+        "RDB$RELATION_FIELDS",
+        5,
+        move |v| text_eq(v.get(rel_fid), &t) && text_eq(v.get(name_fid), &c),
+        &[("RDB$IDENTITY_TYPE", SysVal::I(identity_type as i64))],
+    )?;
+    update_relation_runtime(file, page_size, &table)?;
+    advance_oldest_transactions(file, page_size)
+}
+
 /// Whether any committed primary record of `rel` has a NULL in field
 /// `fid` - the check `SET NOT NULL` makes before it can succeed.
 fn column_has_nulls(file: &[u8], page_size: usize, rel: u16, fid: usize) -> bool {
