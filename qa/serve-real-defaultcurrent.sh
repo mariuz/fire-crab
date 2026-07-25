@@ -2,7 +2,8 @@
 # Column DEFAULT with a context value - CURRENT_DATE / TIMESTAMP / TIME / USER.
 #
 # These defaults are single-opcode BLR (blr_version5, <op>, blr_eoc):
-# CURRENT_DATE 160, CURRENT_TIMESTAMP 161, CURRENT_TIME 162, CURRENT_USER 44
+# CURRENT_DATE 160, TIMESTAMP 161, TIME 162, USER/CURRENT_USER 44, ROLE 174,
+# LOCALTIMESTAMP/LOCALTIME (with a precision byte), CONNECTION/TRANSACTION (177)
 # (blr_user_name) - not the variable/message machinery an expression default
 # needs. The source text is the canonical uppercase keyword, and the BLR is
 # folded into the relation's RDB$RUNTIME like any default, so the engine
@@ -33,7 +34,7 @@ FBK="$D/fc-cur-work.fbk"; RST="$D/fc-cur-rst.fdb"
 command -v node >/dev/null 2>&1 || { echo "SKIP node not found"; exit 0; }
 mkdir -p "$D"; rm -f "$WORK" "$REF" "$FBK" "$RST"
 
-DDL="CREATE TABLE T (A DATE DEFAULT CURRENT_DATE, B TIMESTAMP DEFAULT CURRENT_TIMESTAMP, C VARCHAR(40) DEFAULT CURRENT_USER, D TIME DEFAULT CURRENT_TIME, E INTEGER)"
+DDL="CREATE TABLE T (A DATE DEFAULT CURRENT_DATE, B TIMESTAMP DEFAULT CURRENT_TIMESTAMP, C VARCHAR(40) DEFAULT CURRENT_USER, D TIME DEFAULT CURRENT_TIME, R VARCHAR(40) DEFAULT CURRENT_ROLE, US VARCHAR(40) DEFAULT USER, LT TIMESTAMP DEFAULT LOCALTIMESTAMP, LM TIME DEFAULT LOCALTIME, CC INTEGER DEFAULT CURRENT_CONNECTION, CT INTEGER DEFAULT CURRENT_TRANSACTION, E INTEGER)"
 
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF || { echo "FAIL ref db"; exit 1; }
 CREATE DATABASE '$REF' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
@@ -92,7 +93,7 @@ SQL
 }
 work_src=$(srcq "$WORK")
 check "every RDB\$DEFAULT_SOURCE matches the engine" "$work_src" "$(srcq "$REF")"
-case "$work_src" in *"A|DEFAULT CURRENT_DATE"*"C|DEFAULT CURRENT_USER"*"D|DEFAULT CURRENT_TIME"*)
+case "$work_src" in *"A|DEFAULT CURRENT_DATE"*"C|DEFAULT CURRENT_USER"*"R|DEFAULT CURRENT_ROLE"*"US|DEFAULT USER"*"LT|DEFAULT LOCALTIMESTAMP"*)
     echo "OK   the sources carry the canonical CURRENT_* keywords" ;;
     *) echo "DIFF vacuous"; echo "     $work_src"; fail=1 ;; esac
 
@@ -102,11 +103,14 @@ SQL
 ); [ -n "$bid" ] || { echo "(none)"; return; }
     rm -f /tmp/fc-cur-blob.bin; printf 'BLOBDUMP %s /tmp/fc-cur-blob.bin;\n' "$bid" | "$ISQL" -q -user "$U" -pas "$P" "$1" >/dev/null 2>&1
     od -An -tu1 -v /tmp/fc-cur-blob.bin | tr '\n' ' ' | tr -s ' ' | strip; }
-for c in A B C D; do
+for c in A B C D R US LT LM CC CT; do
     check "$c: RDB\$DEFAULT_VALUE BLR byte for byte" "$(blob_bytes "$WORK" "$c")" "$(blob_bytes "$REF" "$c")"
 done
 case "$(blob_bytes "$WORK" A)" in "5 160 76") echo "OK   CURRENT_DATE is blr_version5, 160, blr_eoc" ;;
     *) echo "DIFF CURRENT_DATE BLR"; fail=1 ;; esac
+case "$(blob_bytes "$WORK" LT)/$(blob_bytes "$WORK" CC)" in "5 214 3 76/5 177 21 8 0 1 0 0 0 76")
+    echo "OK   LOCALTIMESTAMP carries its precision byte; CURRENT_CONNECTION is blr_internal_info" ;;
+    *) echo "DIFF LOCALTIMESTAMP/CURRENT_CONNECTION BLR"; fail=1 ;; esac
 
 rtq() { b=$("$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>/dev/null <<'SQL' | grep -oE '[0-9a-f]+:[0-9a-f]+' | head -1
 SET LIST ON; SELECT RDB$RUNTIME FROM RDB$RELATIONS WHERE RDB$RELATION_NAME = 'T';

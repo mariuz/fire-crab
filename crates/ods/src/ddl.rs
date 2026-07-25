@@ -127,19 +127,26 @@ pub fn str_default_blr(text: &str) -> Vec<u8> {
     b
 }
 
-/// The BLR of a `DEFAULT <keyword>` - the context values whose BLR is a
-/// single opcode: `blr_version5, <op>, blr_eoc`. `CURRENT_DATE` = 160,
-/// `CURRENT_TIMESTAMP` = 161, `CURRENT_TIME` = 162, `CURRENT_USER` = 44
-/// (blr_user_name). None for anything else.
+/// The BLR of a `DEFAULT <context-value-keyword>` - each a fixed byte
+/// sequence (probed): the date/time/user values are one opcode
+/// (`blr_version5, <op>, blr_eoc`); LOCALTIME/LOCALTIMESTAMP carry a
+/// default-precision byte; CURRENT_CONNECTION/TRANSACTION are
+/// `blr_internal_info` (177) with an info-code literal. None for anything a
+/// full expression compiler would be needed for.
 pub fn keyword_default_blr(keyword: &str) -> Option<Vec<u8>> {
-    let op: u8 = match keyword.trim().to_ascii_uppercase().as_str() {
-        "CURRENT_DATE" => 160,
-        "CURRENT_TIMESTAMP" => 161,
-        "CURRENT_TIME" => 162,
-        "CURRENT_USER" => 44,
+    Some(match keyword.trim().to_ascii_uppercase().as_str() {
+        "CURRENT_DATE" => vec![5, 160, 76],
+        "CURRENT_TIMESTAMP" => vec![5, 161, 76],
+        "CURRENT_TIME" => vec![5, 162, 76],
+        "CURRENT_USER" | "USER" => vec![5, 44, 76], // blr_user_name
+        "CURRENT_ROLE" => vec![5, 174, 76],
+        "LOCALTIMESTAMP" => vec![5, 214, 3, 76], // default precision 3
+        "LOCALTIME" => vec![5, 215, 0, 76],      // default precision 0
+        // blr_internal_info, blr_literal blr_long <info-code>, blr_eoc
+        "CURRENT_CONNECTION" => vec![5, 177, 21, 8, 0, 1, 0, 0, 0, 76],
+        "CURRENT_TRANSACTION" => vec![5, 177, 21, 8, 0, 2, 0, 0, 0, 76],
         _ => return None,
-    };
-    Some(vec![5u8, op, 76])
+    })
 }
 
 /// The BLR of a `DEFAULT NULL` - `blr_version5, blr_null, blr_eoc`. The

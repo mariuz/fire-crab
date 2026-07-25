@@ -11684,6 +11684,10 @@ mod tests {
         let d = parse_column_def("c varchar(30) default current_user").unwrap().0.default.unwrap();
         assert_eq!(d.source, "DEFAULT CURRENT_USER");
         assert_eq!(d.value_blr, vec![5, 44, 76]);
+        // USER is an alias for CURRENT_USER; the multi-byte ones too
+        assert_eq!(parse_column_def("f varchar(30) default USER").unwrap().0.default.unwrap().value_blr, vec![5, 44, 76]);
+        assert_eq!(parse_column_def("t timestamp default LOCALTIMESTAMP").unwrap().0.default.unwrap().value_blr, vec![5, 214, 3, 76]);
+        assert_eq!(parse_column_def("c integer default CURRENT_CONNECTION").unwrap().0.default.unwrap().value_blr, vec![5, 177, 21, 8, 0, 1, 0, 0, 0, 76]);
         // DEFAULT NULL - stored explicitly (blr_version5, blr_null, blr_eoc),
         // distinct from a column with no default at all
         let d = parse_column_def("A INTEGER DEFAULT NULL").unwrap().0.default.unwrap();

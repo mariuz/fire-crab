@@ -3717,6 +3717,25 @@ a table whose columns default to each of the four on two copies, compares every
 the defaults — the `CURRENT_DATE` column equals today, the `CURRENT_USER` column
 equals `SYSDBA` — and runs a `gbak` round trip plus `gfix`.
 
+### The hundred-and-fifth differential — the rest of the context defaults
+
+The previous differential did the four common context values; the same probe,
+run wider, showed the rest are fixed byte sequences too — just not all a single
+opcode. `CURRENT_ROLE` (174) and bare `USER` (44, the same `blr_user_name` as
+`CURRENT_USER`) are one opcode. `LOCALTIMESTAMP` and `LOCALTIME` carry a
+default-precision byte (`5 214 3 76`, `5 215 0 76`). `CURRENT_CONNECTION` and
+`CURRENT_TRANSACTION` are `blr_internal_info` (177) followed by a `blr_long`
+literal that selects which counter (1 or 2). None of them need an expression
+compiler, so they are more entries in the same `keyword_default_blr` table.
+
+The `qa/serve-real-defaultcurrent.sh` gate grew to cover all nine keywords —
+every `RDB$DEFAULT_VALUE` BLR byte for byte, with teeth on the precision byte and
+the `blr_internal_info` shape, and the `RDB$RUNTIME` still byte-identical. The
+genuinely thick case that remains is a default that is an arbitrary *expression*,
+which needs the variable-and-message BLR a full compiler emits — the same
+machinery a `CHECK` constraint, a computed column, and `FOREIGN KEY … SET
+DEFAULT` all wait on.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
