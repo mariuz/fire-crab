@@ -3509,6 +3509,32 @@ byte (the override default present, the plain column's inherited), and the
 inherited default (`C` = 42) and enforce the column `NOT NULL`, and runs `gbak`
 plus `gfix`.
 
+### The ninety-fifth differential — the security catalog a domain was missing
+
+Reaching for `GRANT USAGE ON DOMAIN` turned up that fire-crab's `CREATE DOMAIN`
+had been writing an unowned domain. The engine makes a domain an owned object,
+exactly as it does a sequence: the `RDB$FIELDS` row gets an `RDB$OWNER_NAME` and
+an `RDB$SECURITY_CLASS` (`SQL$<n>`), that class holds the owner's
+alter/control/drop/usage ACL (`6 1 3 12`), and the owner takes a `USAGE` (`G`,
+object type 9) privilege row. fire-crab wrote none of it — a gap the domain
+type, default, and constraint gates never compared, because none looked at the
+security columns.
+
+The fix reuses the sequence's machinery verbatim: `create_domain` calls the same
+`next_security_class` with the same owner ACL, sets the class and owner on the
+row, and writes the owner privilege with object type 9; `drop_domain` removes the
+class and the privilege rows, as the engine does. Because the security-class
+counter is shared, a domain now consumes an `SQL$<n>` just as the engine's does,
+so two databases created from the same fresh state still match number for number.
+
+`qa/serve-real-domainsecurity.sh` (12 checks) has fire-crab and the engine each
+create a domain, and compares the `RDB$FIELDS` owner and security class, the
+owner's privilege row, and the security-class ACL blob byte for byte; then drops
+it on both and confirms the class and privilege rows are gone with no orphans;
+then re-creates one, `gbak` round trips, and `gfix` checks the raw file. The
+`GRANT USAGE ON DOMAIN` syntax itself the server rejects, as this engine build
+does.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest

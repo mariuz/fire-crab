@@ -842,6 +842,10 @@ pub fn create_domain(file: &mut Vec<u8>, page_size: usize, col: &ColumnDef) -> R
     if domain_exists(file, page_size, &name) {
         return Err(format!("Domain {} already exists", name));
     }
+    // a user domain carries a security class and owner, like a sequence: the
+    // SQL$<n> class holds the owner's alter/control/drop/usage ACL, and the
+    // owner takes a USAGE ('G', object type 9) privilege row
+    let class = next_security_class(file, page_size, ACL_SEQUENCE_OWNER)?;
     let mut vals: Vec<(&str, SysVal<'_>)> = vec![
         ("RDB$FIELD_NAME", SysVal::S(&name)),
         ("RDB$FIELD_TYPE", SysVal::I(col.field_type as i64)),
@@ -849,6 +853,8 @@ pub fn create_domain(file: &mut Vec<u8>, page_size: usize, col: &ColumnDef) -> R
         ("RDB$FIELD_SCALE", SysVal::I(col.scale as i64)),
         ("RDB$FIELD_SUB_TYPE", SysVal::I(col.sub_type as i64)),
         ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+        ("RDB$SECURITY_CLASS", SysVal::S(&class)),
+        ("RDB$OWNER_NAME", SysVal::S(OWNER)),
         ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
     ];
     if let Some(cl) = col.char_len {
@@ -871,6 +877,7 @@ pub fn create_domain(file: &mut Vec<u8>, page_size: usize, col: &ColumnDef) -> R
         vals.push(("RDB$DEFAULT_VALUE", SysVal::B(blob_id_bytes(2, val))));
     }
     sys_insert(file, page_size, "RDB$FIELDS", 2, &vals)?;
+    store_privileges(file, page_size, &name, 9, &["G"])?;
     advance_oldest_transactions(file, page_size)
 }
 
@@ -885,10 +892,45 @@ pub fn drop_domain(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<(
     if let Some(user) = domain_user(file, page_size, &want) {
         return Err(format!("Domain {} is used in table {}", want, user));
     }
+    // the domain's security class and its owner privilege go with it (the
+    // engine drops both), then the RDB$FIELDS row
+    let class = domain_security_class(file, page_size, &want);
     let name_f = sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME")?;
     let nm = want.clone();
     delete_catalog_rows(file, page_size, "RDB$FIELDS", move |v| text_eq(v.get(name_f), &nm))?;
+    if let Some(class) = class {
+        let cls_f = sys_fid(file, page_size, "RDB$SECURITY_CLASSES", "RDB$SECURITY_CLASS")?;
+        delete_catalog_rows(file, page_size, "RDB$SECURITY_CLASSES", move |v| {
+            text_eq(v.get(cls_f), &class)
+        })?;
+    }
+    let rn_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$RELATION_NAME")?;
+    let ot_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$OBJECT_TYPE")?;
+    let dn = want.clone();
+    delete_catalog_rows(file, page_size, "RDB$USER_PRIVILEGES", move |v| {
+        text_eq(v.get(rn_f), &dn) && matches!(v.get(ot_f), Some(Value::Int(9)))
+    })?;
     advance_oldest_transactions(file, page_size)
+}
+
+/// A domain's `RDB$SECURITY_CLASS` off its `RDB$FIELDS` row (None if unset).
+fn domain_security_class(file: &[u8], page_size: usize, dname: &str) -> Option<String> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$FIELDS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$FIELDS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$FIELDS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let name_f = fid("RDB$FIELD_NAME")?;
+    let sc_f = fid("RDB$SECURITY_CLASS")?;
+    let mut out = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if out.is_none() && text_eq(v.get(name_f), dname) {
+            if let Some(Value::Text(t)) = v.get(sc_f) {
+                out = Some(t.trim_end().to_string());
+            }
+        }
+    });
+    out
 }
 
 /// `ALTER DOMAIN <name> SET DEFAULT <lit>` / `DROP DEFAULT` - set (or
