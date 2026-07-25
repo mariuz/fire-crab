@@ -2454,6 +2454,8 @@ pub enum CommentTarget {
     Role(String),
     /// `COMMENT ON DOMAIN <name>` - the `RDB$FIELDS` row
     Domain(String),
+    /// `COMMENT ON DATABASE` - the single `RDB$DATABASE` row (no name)
+    Database,
 }
 
 /// A `RDB$DESCRIPTION` cell value from comment text: a text blob written
@@ -2614,6 +2616,16 @@ pub fn comment_on(
             let nm = name.clone();
             patch_sys_row(file, page_size, "RDB$FIELDS", frel,
                 move |v| text_eq(v.get(name_fid), &nm),
+                &[("RDB$DESCRIPTION", value)])?;
+        }
+        CommentTarget::Database => {
+            // the singleton RDB$DATABASE row - the description blob is owned
+            // by RDB$DATABASE itself, and the one row is patched in place
+            let drel = crate::resolve_relation(file, page_size, "RDB$DATABASE")
+                .ok_or("RDB$DATABASE not found")?;
+            let value = description_blob(file, page_size, drel, text)?;
+            patch_sys_row(file, page_size, "RDB$DATABASE", drel,
+                |_| true,
                 &[("RDB$DESCRIPTION", value)])?;
         }
     }

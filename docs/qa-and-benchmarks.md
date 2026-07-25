@@ -3535,6 +3535,20 @@ then re-creates one, `gbak` round trips, and `gfix` checks the raw file. The
 `GRANT USAGE ON DOMAIN` syntax itself the server rejects, as this engine build
 does.
 
+### The ninety-sixth differential — COMMENT ON DATABASE
+
+The comment mechanism now serves eight object kinds; `COMMENT ON DATABASE` is the
+one with no object name at all. It writes the same charset-4 description blob
+into the singleton `RDB$DATABASE` row's `RDB$DESCRIPTION`, and `IS NULL` / `IS ''`
+clear it. The only new code is a nameless `CommentTarget::Database` that patches
+the one row in place (an always-true predicate — there is exactly one) and a
+parser arm that accepts the missing name.
+
+`qa/serve-real-commentdb.sh` (11 checks) comments the database (the text carrying
+a `''` escape) on two copies, compares the `RDB$DATABASE` description read back as
+text and the description blob record byte for byte (framing and `blh_charset` 4),
+clears it and confirms NULL on both, and runs a `gbak` round trip plus `gfix`.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest

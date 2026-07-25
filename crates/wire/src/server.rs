@@ -2178,9 +2178,12 @@ fn plan_comment(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     // the object kind - the first word after ON. TABLE / COLUMN /
     // INDEX / SEQUENCE / GENERATOR (the last two synonyms)
     let first = first_word_at(&masked, kind_start)?;
-    let kind = ["TABLE", "COLUMN", "INDEX", "SEQUENCE", "GENERATOR", "EXCEPTION", "ROLE", "DOMAIN"]
-        .into_iter()
-        .find(|k| find_word(&masked, k, kind_start) == Some(first))?;
+    let kind = [
+        "TABLE", "COLUMN", "INDEX", "SEQUENCE", "GENERATOR", "EXCEPTION", "ROLE", "DOMAIN",
+        "DATABASE",
+    ]
+    .into_iter()
+    .find(|k| find_word(&masked, k, kind_start) == Some(first))?;
     let after_kind = kind_start + masked[kind_start..].find(kind)? + kind.len();
     // IS separates the target from the text; find it on the masked copy
     // so an 'IS' inside the string literal cannot shadow it
@@ -2218,6 +2221,13 @@ fn plan_comment(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         "DOMAIN" => {
             let name = unquote_ident(target_str)?;
             fire_crab_ods::ddl::CommentTarget::Domain(name)
+        }
+        "DATABASE" => {
+            // COMMENT ON DATABASE has no object name
+            if !target_str.is_empty() {
+                return None;
+            }
+            fire_crab_ods::ddl::CommentTarget::Database
         }
         _ => {
             // <table>.<column> - split on the first dot outside quotes
@@ -11505,6 +11515,12 @@ mod tests {
             other => panic!("expected Comment/Role, got {:?}", other.is_some()),
         }
         // a kind this writer does not implement, and a non-comment
+        match plan_comment("COMMENT ON DATABASE IS 'the db'") {
+            Some((Plan::Comment { target, .. }, _)) => {
+                assert!(matches!(target, fire_crab_ods::ddl::CommentTarget::Database));
+            }
+            other => panic!("expected Comment DATABASE, got {:?}", other.is_some()),
+        }
         assert!(plan_comment("COMMENT ON PROCEDURE P IS 'x'").is_none());
         assert!(plan_comment("CREATE TABLE T (A INT)").is_none());
     }
