@@ -1565,34 +1565,19 @@ enum IntRank {
 
 fn infer_int_rank(
     e: &fire_crab_ods::expr::Expr,
-    cols: &[fire_crab_ods::ddl::ColumnDef],
+    field_rank: &dyn Fn(&str) -> Option<IntRank>,
 ) -> Option<IntRank> {
     use fire_crab_ods::expr::Expr;
-    use fire_crab_ods::format::dtype;
     match e {
-        Expr::Field { name, .. } => {
-            let c = cols.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
-            // only a plain exact-integer stored column: no domain (its
-            // type is unresolved here), no other computed column, no
-            // NUMERIC scale/sub_type
-            if c.domain.is_some() || c.computed.is_some() || c.scale != 0 || c.sub_type != 0 {
-                return None;
-            }
-            match c.dtype {
-                dtype::SHORT => Some(IntRank::Short),
-                dtype::LONG => Some(IntRank::Long),
-                dtype::INT64 => Some(IntRank::Int64),
-                _ => None,
-            }
-        }
+        Expr::Field { name, .. } => field_rank(name),
         Expr::IntLiteral(_) => Some(IntRank::Long),
         Expr::Add(l, r) | Expr::Subtract(l, r) => {
-            infer_int_rank(l, cols)?;
-            infer_int_rank(r, cols)?;
+            infer_int_rank(l, field_rank)?;
+            infer_int_rank(r, field_rank)?;
             Some(IntRank::Int64)
         }
         Expr::Multiply(l, r) | Expr::Divide(l, r) => {
-            let (lr, rr) = (infer_int_rank(l, cols)?, infer_int_rank(r, cols)?);
+            let (lr, rr) = (infer_int_rank(l, field_rank)?, infer_int_rank(r, field_rank)?);
             if lr == IntRank::Int64 || rr == IntRank::Int64 {
                 return None; // the engine promotes to INT128 - deferred
             }
@@ -1601,15 +1586,29 @@ fn infer_int_rank(
     }
 }
 
+/// The exact-integer rank of a plain stored dsc dtype (no NUMERIC
+/// scale/sub_type - the caller checks those).
+fn dtype_rank(dt: u8) -> Option<IntRank> {
+    use fire_crab_ods::format::dtype;
+    match dt {
+        dtype::SHORT => Some(IntRank::Short),
+        dtype::LONG => Some(IntRank::Long),
+        dtype::INT64 => Some(IntRank::Int64),
+        _ => None,
+    }
+}
+
 /// The catalog type of a computed column: `(RDB$FIELD_TYPE, dsc dtype,
 /// length, RDB$FIELD_PRECISION)` for the expression's result rank.
 /// The precisions are the engine's (probed: SHORT 4, LONG 9, INT64 18).
+/// `field_rank` types the expression's field references - from the
+/// statement's own columns (CREATE TABLE) or the catalog (ALTER ADD).
 fn infer_computed_type(
     e: &fire_crab_ods::expr::Expr,
-    cols: &[fire_crab_ods::ddl::ColumnDef],
+    field_rank: &dyn Fn(&str) -> Option<IntRank>,
 ) -> Option<(i16, u8, u16, i16)> {
     use fire_crab_ods::format::dtype;
-    Some(match infer_int_rank(e, cols)? {
+    Some(match infer_int_rank(e, field_rank)? {
         IntRank::Short => (7, dtype::SHORT, 2, 4),
         IntRank::Long => (8, dtype::LONG, 4, 9),
         IntRank::Int64 => (16, dtype::INT64, 8, 18),
@@ -2039,7 +2038,17 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     // the whole statement - the client gets an error, never a wrong type.
     for (idx, src) in &computed_items {
         let expr = parse_expr(src)?;
-        let (field_type, dt, length, precision) = infer_computed_type(&expr, &cols)?;
+        // a reference types as a plain exact-integer stored column: no
+        // domain (unresolved here), no other computed column, no NUMERIC
+        // scale/sub_type
+        let field_rank = |name: &str| {
+            let c = cols.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+            if c.domain.is_some() || c.computed.is_some() || c.scale != 0 || c.sub_type != 0 {
+                return None;
+            }
+            dtype_rank(c.dtype)
+        };
+        let (field_type, dt, length, precision) = infer_computed_type(&expr, &field_rank)?;
         let c = &mut cols[*idx];
         c.field_type = field_type;
         c.dtype = dt;
@@ -3243,7 +3252,7 @@ fn plan_alter_index(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
 /// plain column. A NOT NULL or PRIMARY KEY on the added column is a
 /// constraint over the table's existing rows and is left for later
 /// (returns None, so the statement errors rather than half-applying).
-fn plan_alter_table_add(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
     let masked = mask_literals(&up);
@@ -3271,6 +3280,51 @@ fn plan_alter_table_add(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     if let Some(key) = parse_key_clause(&tail.to_ascii_uppercase()) {
         return Some((
             Plan::AlterTableAddKey { table: table.to_ascii_uppercase(), key },
+            Vec::new(),
+        ));
+    }
+    // ADD <name> COMPUTED [BY] (<expr>) / GENERATED ALWAYS AS (<expr>):
+    // the result type is inferred from the CATALOG's existing columns
+    // (needs the attached database - the statement's text has no types)
+    if let Some((cname, src)) = parse_computed_item(tail) {
+        let db = db.as_ref()?;
+        let columns = relation_columns(&db.bytes, db.page_size, table);
+        let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
+        let formats = relation_formats(&db.bytes, db.page_size, rel);
+        let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+        let expr = parse_expr(&src)?;
+        // a reference types as a plain stored exact-integer column: not
+        // another computed one (offset 0), no NUMERIC scale/sub_type
+        let field_rank = |name: &str| {
+            let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+            let d = descs.get(rc.field_id as usize)?;
+            if (d.offset == 0 && d.length != 0) || d.scale != 0 || d.sub_type != 0 {
+                return None;
+            }
+            dtype_rank(d.dtype)
+        };
+        let (field_type, dt, length, precision) = infer_computed_type(&expr, &field_rank)?;
+        let col = fire_crab_ods::ddl::ColumnDef {
+            name: cname,
+            field_type,
+            dtype: dt,
+            length,
+            scale: 0,
+            sub_type: 0,
+            char_len: None,
+            not_null: false,
+            not_null_constraint: false,
+            default: None,
+            domain: None,
+            identity: None,
+            computed: Some(fire_crab_ods::ddl::ComputedCol {
+                source: src,
+                blr: expr.to_blr(),
+                precision,
+            }),
+        };
+        return Some((
+            Plan::AlterTableAdd { table: table.to_ascii_uppercase(), col },
             Vec::new(),
         ));
     }
@@ -9119,7 +9173,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             .or_else(|| plan_drop_domain(&text))
                             .or_else(|| plan_alter_domain(&text))
                             .or_else(|| plan_alter_index(&text))
-                            .or_else(|| plan_alter_table_add(&text))
+                            .or_else(|| plan_alter_table_add(&text, &database))
                             .or_else(|| plan_alter_table_drop(&text))
                             .or_else(|| plan_alter_table_alter_type(&text))
                             .or_else(|| plan_alter_column_null(&text))
@@ -9281,7 +9335,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         .or_else(|| plan_drop_domain(&stmt_sql))
                         .or_else(|| plan_alter_domain(&stmt_sql))
                         .or_else(|| plan_alter_index(&stmt_sql))
-                        .or_else(|| plan_alter_table_add(&stmt_sql))
+                        .or_else(|| plan_alter_table_add(&stmt_sql, &database))
                         .or_else(|| plan_alter_table_drop(&stmt_sql))
                         .or_else(|| plan_alter_table_alter_type(&stmt_sql))
                         .or_else(|| plan_alter_column_null(&stmt_sql))
@@ -13051,7 +13105,7 @@ mod tests {
     fn plan_alter_table_add_recognises_a_key_constraint() {
         // ADD [CONSTRAINT ...] PRIMARY KEY|UNIQUE routes to
         // AlterTableAddKey, not a column add
-        match plan_alter_table_add("ALTER TABLE A1 ADD CONSTRAINT PK_A1 PRIMARY KEY (X)") {
+        match plan_alter_table_add("ALTER TABLE A1 ADD CONSTRAINT PK_A1 PRIMARY KEY (X)", &None) {
             Some((Plan::AlterTableAddKey { table, key }, _)) => {
                 assert_eq!(table, "A1");
                 assert_eq!(key.name, "PK_A1");
@@ -13059,7 +13113,7 @@ mod tests {
             }
             other => panic!("expected AlterTableAddKey, got {:?}", other.is_some()),
         }
-        match plan_alter_table_add("alter table A1 add unique (Y, Z)") {
+        match plan_alter_table_add("alter table A1 add unique (Y, Z)", &None) {
             Some((Plan::AlterTableAddKey { key, .. }, _)) => {
                 assert!(key.name.is_empty() && !key.primary);
                 assert_eq!(key.columns, vec!["Y".to_string(), "Z".to_string()]);
@@ -13068,9 +13122,15 @@ mod tests {
         }
         // a plain column add is still a column add
         assert!(matches!(
-            plan_alter_table_add("ALTER TABLE A1 ADD W INTEGER"),
+            plan_alter_table_add("ALTER TABLE A1 ADD W INTEGER", &None),
             Some((Plan::AlterTableAdd { .. }, _))
         ));
+        // a computed ADD types its expression from the CATALOG - with no
+        // attached database there is nothing to infer from, so it refuses
+        // (the plain-column path above needs no database)
+        assert!(
+            plan_alter_table_add("ALTER TABLE A1 ADD C COMPUTED BY (W+1)", &None).is_none()
+        );
     }
 
     #[test]
@@ -13079,6 +13139,7 @@ mod tests {
         // column add
         match plan_alter_table_add(
             "ALTER TABLE C ADD CONSTRAINT FK_C_P FOREIGN KEY (PID) REFERENCES P (PID)",
+            &None,
         ) {
             Some((Plan::AlterTableAddFk { table, fk }, ps)) => {
                 assert_eq!(table, "C");
@@ -13091,7 +13152,7 @@ mod tests {
         }
         // a plain column add is still a column add
         assert!(matches!(
-            plan_alter_table_add("ALTER TABLE C ADD NOTE VARCHAR(10)"),
+            plan_alter_table_add("ALTER TABLE C ADD NOTE VARCHAR(10)", &None),
             Some((Plan::AlterTableAdd { .. }, _))
         ));
     }

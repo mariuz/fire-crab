@@ -568,15 +568,6 @@ fn rebuild_runtime_blob(
     descs: &[Descriptor],
 ) -> Result<u64, String> {
     use crate::format::dtype;
-    // a COMPUTED column carries an RSR_computed_blr segment this rebuild
-    // does not re-emit; regenerating the summary without it would silently
-    // stop the column computing. Refuse the ALTER instead.
-    if has_computed_field(descs) {
-        return Err(format!(
-            "table {} has a computed column - not alterable yet",
-            table
-        ));
-    }
     let formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")
         .ok_or("no RDB$RELATION_FIELDS format")?;
     let (_, rf_descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
@@ -639,6 +630,31 @@ fn rebuild_runtime_blob(
     });
     fields.sort_by_key(|f| f.0);
 
+    // a COMPUTED field re-emits its expression BLR (RSR_computed_blr = 4,
+    // between the length and position segments - probed order); the blob
+    // lives on the field source's RDB$FIELDS row
+    let mut computed_blobs: Vec<(String, (u16, u64))> = Vec::new();
+    if let Some(f_formats) = system_relation_formats(file, page_size, "RDB$FIELDS") {
+        if let Some((_, f_descs)) = f_formats.iter().max_by_key(|(n, _)| *n) {
+            let fcols = relation_columns(file, page_size, "RDB$FIELDS");
+            let ffid =
+                |n: &str| fcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+            if let (Some(fname_f), Some(cblr_f)) =
+                (ffid("RDB$FIELD_NAME"), ffid("RDB$COMPUTED_BLR"))
+            {
+                walk_rows(file, page_size, 2, f_descs, |vals| {
+                    let Some(fname) = text(vals.get(fname_f)) else { return };
+                    if !fields.iter().any(|f| f.2 == fname) {
+                        return;
+                    }
+                    if let Some(Value::Blob(r, n)) = vals.get(cblr_f) {
+                        computed_blobs.push((fname, (*r, *n)));
+                    }
+                });
+            }
+        }
+    }
+
     let seg = |tag: u8, data: &[u8]| {
         let mut s = Vec::with_capacity(1 + data.len());
         s.push(tag);
@@ -662,6 +678,12 @@ fn rebuild_runtime_blob(
         runtime.push(seg(19, &char_len.unwrap_or(d.length).to_le_bytes()));
         if let Some(cl) = char_len {
             runtime.push(seg(26, &cl.to_le_bytes())); // RSR_character_length
+        }
+        // the computed expression (RSR_computed_blr = 4) before the position
+        if let Some((_, (r, n))) = computed_blobs.iter().find(|(s, _)| s == src) {
+            if let Some(blr) = crate::format::read_blob_content(file, page_size, *r, *n) {
+                runtime.push(seg(4, &blr));
+            }
         }
         runtime.push(seg(27, &pos.to_le_bytes())); // RSR_field_pos
         // re-emit the column DEFAULT (RSR_default_value = 6) so an ALTER
@@ -753,14 +775,24 @@ pub fn alter_table_add_column(
         .iter()
         .max_by_key(|(n, _)| *n)
         .ok_or("relation has no format")?;
-    // descs_to_fields cannot carry a COMPUTED field (offset 0) through the
-    // recompute - the walk would hand it storage. Refuse the ALTER.
-    if has_computed_field(cur_descs) {
-        return Err(format!("table {} has a computed column - not alterable yet", table));
+    // a computed column has no storage to constrain or default into
+    if col.computed.is_some() && (col.not_null || col.default.is_some() || col.identity.is_some())
+    {
+        return Err(format!("computed column {} cannot carry constraints", col.name));
     }
-    let mut fields = descs_to_fields(cur_descs);
-    fields.push(col_field(col.dtype, col.length, col.scale, col.sub_type));
-    let new_descs = compute_format(&fields);
+    // existing COMPUTED fields (descriptor at offset 0) keep their
+    // offset-0 descriptors through the recompute; the stored-offset walk
+    // skips them, so existing stored fields keep their offsets and a new
+    // stored field lands after the last stored one (probed: adding a
+    // BIGINT to `(A INTEGER, C COMPUTED BY (A))` lands it at offset 8)
+    let mut fields: Vec<(u8, u16, i8, i16, bool)> = descs_to_fields(cur_descs)
+        .into_iter()
+        .zip(cur_descs.iter())
+        .map(|((dt, l, s, st), d)| (dt, l, s, st, d.offset == 0 && d.length != 0))
+        .collect();
+    let (dt, l, s, st) = col_field(col.dtype, col.length, col.scale, col.sub_type);
+    fields.push((dt, l, s, st, col.computed.is_some()));
+    let new_descs = compute_format_mixed(&fields);
     if new_descs.len() != fields.len() {
         return Err("format computation failed".into());
     }
@@ -819,22 +851,39 @@ pub fn alter_table_add_column(
         field_vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(cl as i64)));
         field_vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
     }
+    // a computed column: the verbatim `(expr)` source + compiled BLR +
+    // the result type's precision, exactly as create_table writes them
+    let computed_blobs = match &col.computed {
+        Some(cp) => {
+            let src =
+                dml::insert_blob_cs(file, page_size, 2, &[cp.source.as_bytes().to_vec()], 1, 4)?;
+            let blr = dml::insert_blob(file, page_size, 2, &[cp.blr.clone()], 2)?;
+            Some((src, blr, cp.precision))
+        }
+        None => None,
+    };
+    if let Some((src, blr, precision)) = computed_blobs {
+        field_vals.push(("RDB$COMPUTED_SOURCE", SysVal::B(blob_id_bytes(2, src))));
+        field_vals.push(("RDB$COMPUTED_BLR", SysVal::B(blob_id_bytes(2, blr))));
+        field_vals.push(("RDB$FIELD_PRECISION", SysVal::I(precision as i64)));
+    }
     sys_insert(file, page_size, "RDB$FIELDS", 2, &field_vals)?;
 
-    let mut rf_vals: Vec<(&str, SysVal<'_>)> = vec![
+    let rf_vals: Vec<(&str, SysVal<'_>)> = vec![
         ("RDB$FIELD_NAME", SysVal::S(&col.name)),
         ("RDB$RELATION_NAME", SysVal::S(&table)),
         ("RDB$FIELD_SOURCE", SysVal::S(&dom)),
         ("RDB$FIELD_POSITION", SysVal::I(new_fid as i64)),
-        ("RDB$UPDATE_FLAG", SysVal::I(1)),
+        // a computed column is read-only: RDB$UPDATE_FLAG 0 (probed)
+        ("RDB$UPDATE_FLAG", SysVal::I(if col.computed.is_some() { 0 } else { 1 })),
         ("RDB$FIELD_ID", SysVal::I(new_fid as i64)),
         ("RDB$SYSTEM_FLAG", SysVal::I(0)),
         ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ("RDB$FIELD_SOURCE_SCHEMA_NAME", SysVal::S("PUBLIC")),
+        // every built-in-typed column gets RDB$COLLATION_ID 0, text or not
+        // (probed - the same as create_table's non-domain columns)
+        ("RDB$COLLATION_ID", SysVal::I(0)),
     ];
-    if col.char_len.is_some() {
-        rf_vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
-    }
     sys_insert(file, page_size, "RDB$RELATION_FIELDS", 5, &rf_vals)?;
 
     // --- rebuild RDB$RUNTIME for all fields (incl. the new one, now in
