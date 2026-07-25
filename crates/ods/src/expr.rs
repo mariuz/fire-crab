@@ -32,6 +32,7 @@ const BLR_LSS: u8 = 51;
 const BLR_LEQ: u8 = 52;
 const BLR_OR: u8 = 57;
 const BLR_AND: u8 = 58;
+const BLR_VARIABLE: u8 = 26;
 const BLR_ABORT: u8 = 128;
 const BLR_GDS_CODE: u8 = 0;
 const BLR_END: u8 = 255;
@@ -42,6 +43,9 @@ pub enum Expr {
     /// `blr_field`: a row column named within a context (0 for a computed
     /// field's own relation).
     Field { context: u8, name: String },
+    /// `blr_variable`: a PSQL local variable by number (a trigger's
+    /// DECLARE VARIABLE slot).
+    Variable(u16),
     /// `blr_literal blr_long`: a 32-bit integer, scale 0.
     IntLiteral(i32),
     Add(Box<Expr>, Box<Expr>),
@@ -60,6 +64,10 @@ impl Expr {
                 out.push(*context);
                 out.push(name.len() as u8);
                 out.extend_from_slice(name.as_bytes());
+            }
+            Expr::Variable(n) => {
+                out.push(BLR_VARIABLE);
+                out.extend_from_slice(&n.to_le_bytes());
             }
             Expr::IntLiteral(v) => {
                 out.push(BLR_LITERAL);
@@ -104,7 +112,7 @@ impl Expr {
                     refs.push(name.clone());
                 }
             }
-            Expr::IntLiteral(_) => {}
+            Expr::IntLiteral(_) | Expr::Variable(_) => {}
             Expr::Add(l, r)
             | Expr::Subtract(l, r)
             | Expr::Multiply(l, r)

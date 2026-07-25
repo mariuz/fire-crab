@@ -1679,6 +1679,7 @@ fn infer_int_rank(
     use fire_crab_ods::expr::Expr;
     match e {
         Expr::Field { name, .. } => field_rank(name),
+        Expr::Variable(_) => None, // no variables outside a trigger body
         Expr::IntLiteral(_) => Some(IntRank::Long),
         Expr::Add(l, r) | Expr::Subtract(l, r) => {
             infer_int_rank(l, field_rank)?;
@@ -2004,20 +2005,91 @@ fn numeric_col(
     })
 }
 
+/// An assignment target in a trigger body: a NEW-row column, or a
+/// DECLAREd local variable by slot.
+enum TrigTarget {
+    Field(String),
+    Var(u16),
+}
+
 /// One statement of a user trigger's body, with its byte offset in the
 /// ORIGINAL statement text (the debug map records it).
 enum TrigStmt {
-    /// `NEW.<col> = <expr>;`
-    Assign { target: String, expr: fire_crab_ods::expr::Expr, src_off: usize },
-    /// `IF (<cond>) THEN <stmt>`
-    If { cond: fire_crab_ods::expr::Cond, then: Box<TrigStmt>, src_off: usize },
+    /// `NEW.<col> = <expr>;` or `<var> = <expr>;`
+    Assign { target: TrigTarget, expr: fire_crab_ods::expr::Expr, src_off: usize },
+    /// `IF (<cond>) THEN <stmt> [ELSE <stmt>]` - the ELSE arrives as the
+    /// NEXT semicolon segment and is attached by the caller
+    If {
+        cond: fire_crab_ods::expr::Cond,
+        then: Box<TrigStmt>,
+        otherwise: Option<Box<TrigStmt>>,
+        src_off: usize,
+    },
 }
 
-/// Parse the trigger body between BEGIN and END: `NEW.<col> = <expr>;`
-/// assignments and `IF (<cond>) THEN <stmt>`, each carrying its offset
-/// in `s` for the debug map. `at` is the body's start offset.
-fn parse_trigger_stmts(s: &str, at: usize, end: usize) -> Option<Vec<TrigStmt>> {
-    let mut out = Vec::new();
+/// Rewrite unqualified field references that name a DECLAREd variable
+/// into [fire_crab_ods::expr::Expr::Variable] slots; other references
+/// keep their contexts for the caller's validation.
+fn expr_resolve_vars(
+    e: &fire_crab_ods::expr::Expr,
+    vars: &[String],
+) -> fire_crab_ods::expr::Expr {
+    use fire_crab_ods::expr::Expr;
+    match e {
+        Expr::Field { context, name } if *context == CTX_PLAIN => {
+            match vars.iter().position(|v| v == name) {
+                Some(i) => Expr::Variable(i as u16),
+                None => e.clone(),
+            }
+        }
+        Expr::Field { .. } | Expr::Variable(_) | Expr::IntLiteral(_) => e.clone(),
+        Expr::Add(l, r) => Expr::Add(
+            Box::new(expr_resolve_vars(l, vars)),
+            Box::new(expr_resolve_vars(r, vars)),
+        ),
+        Expr::Subtract(l, r) => Expr::Subtract(
+            Box::new(expr_resolve_vars(l, vars)),
+            Box::new(expr_resolve_vars(r, vars)),
+        ),
+        Expr::Multiply(l, r) => Expr::Multiply(
+            Box::new(expr_resolve_vars(l, vars)),
+            Box::new(expr_resolve_vars(r, vars)),
+        ),
+        Expr::Divide(l, r) => Expr::Divide(
+            Box::new(expr_resolve_vars(l, vars)),
+            Box::new(expr_resolve_vars(r, vars)),
+        ),
+    }
+}
+
+fn cond_resolve_vars(
+    c: &fire_crab_ods::expr::Cond,
+    vars: &[String],
+) -> fire_crab_ods::expr::Cond {
+    use fire_crab_ods::expr::Cond;
+    match c {
+        Cond::Cmp(op, l, r) => {
+            Cond::Cmp(*op, expr_resolve_vars(l, vars), expr_resolve_vars(r, vars))
+        }
+        Cond::And(a, b) => Cond::And(
+            Box::new(cond_resolve_vars(a, vars)),
+            Box::new(cond_resolve_vars(b, vars)),
+        ),
+        Cond::Or(a, b) => Cond::Or(
+            Box::new(cond_resolve_vars(a, vars)),
+            Box::new(cond_resolve_vars(b, vars)),
+        ),
+        Cond::Not(inner) => Cond::Not(Box::new(cond_resolve_vars(inner, vars))),
+    }
+}
+
+/// Parse the trigger body between BEGIN and END: `NEW.<col> = <expr>;` /
+/// `<var> = <expr>;` assignments and `IF (<cond>) THEN <stmt> [ELSE
+/// <stmt>]`, each carrying its offset in `s` for the debug map. `at` is
+/// the body's start offset; `vars` the DECLAREd variable names in slot
+/// order.
+fn parse_trigger_stmts(s: &str, at: usize, end: usize, vars: &[String]) -> Option<Vec<TrigStmt>> {
+    let mut out: Vec<TrigStmt> = Vec::new();
     let mut pos = at;
     while pos < end {
         let rest = &s[pos..end];
@@ -2027,7 +2099,23 @@ fn parse_trigger_stmts(s: &str, at: usize, end: usize) -> Option<Vec<TrigStmt>> 
             break;
         }
         let semi = s[start..end].find(';')? + start;
-        out.push(parse_trigger_stmt(s, start, semi)?);
+        // `ELSE <stmt>;` is its own semicolon segment - it attaches to
+        // the IF the previous segment parsed
+        let seg_up = s[start..semi].to_ascii_uppercase();
+        if find_word(&seg_up, "ELSE", 0) == Some(0) {
+            let inner = &s[start + "ELSE".len()..semi];
+            let inner_lead = inner.len() - inner.trim_start().len();
+            let stmt = parse_trigger_stmt(s, start + "ELSE".len() + inner_lead, semi, vars)?;
+            match out.last_mut() {
+                Some(TrigStmt::If { otherwise, .. }) if otherwise.is_none() => {
+                    *otherwise = Some(Box::new(stmt));
+                }
+                _ => return None, // ELSE without a matching IF
+            }
+            pos = semi + 1;
+            continue;
+        }
+        out.push(parse_trigger_stmt(s, start, semi, vars)?);
         pos = semi + 1;
     }
     if out.is_empty() {
@@ -2037,7 +2125,7 @@ fn parse_trigger_stmts(s: &str, at: usize, end: usize) -> Option<Vec<TrigStmt>> 
     }
 }
 
-fn parse_trigger_stmt(s: &str, start: usize, end: usize) -> Option<TrigStmt> {
+fn parse_trigger_stmt(s: &str, start: usize, end: usize, vars: &[String]) -> Option<TrigStmt> {
     let text = &s[start..end];
     let up = text.to_ascii_uppercase();
     if let Some(0) = find_word(&up, "IF", 0) {
@@ -2059,7 +2147,7 @@ fn parse_trigger_stmt(s: &str, start: usize, end: usize) -> Option<TrigStmt> {
             }
         }
         let close = close?;
-        let cond = parse_cond(&s[open..=close])?;
+        let cond = cond_resolve_vars(&parse_cond(&s[open..=close])?, vars);
         if cond.has_not() {
             return None; // the engine emits blr_not there; we do not
         }
@@ -2072,31 +2160,62 @@ fn parse_trigger_stmt(s: &str, start: usize, end: usize) -> Option<TrigStmt> {
         let inner_rel = close + 1 + then_kw + "THEN".len();
         let inner = &s[inner_rel..end];
         let inner_lead = inner.len() - inner.trim_start().len();
-        let then = parse_trigger_stmt(s, inner_rel + inner_lead, end)?;
-        return Some(TrigStmt::If { cond, then: Box::new(then), src_off: start });
+        let then = parse_trigger_stmt(s, inner_rel + inner_lead, end, vars)?;
+        return Some(TrigStmt::If {
+            cond,
+            then: Box::new(then),
+            otherwise: None,
+            src_off: start,
+        });
     }
-    // NEW.<col> = <expr>
+    // NEW.<col> = <expr>  or  <var> = <expr> (resolved against the
+    // declares by the caller - parsed as a Field target for now)
     let eq = text.find('=')?;
     let lhs = text[..eq].trim().to_ascii_uppercase();
-    let target = lhs.strip_prefix("NEW.")?.trim().trim_matches('"').to_string();
-    if !ident_ok(&target) {
-        return None;
-    }
-    let expr = parse_expr(text[eq + 1..].trim())?;
+    let target = if let Some(col) = lhs.strip_prefix("NEW.") {
+        let col = col.trim().trim_matches('"').to_string();
+        if !ident_ok(&col) {
+            return None;
+        }
+        TrigTarget::Field(col)
+    } else {
+        // a bare target must name a DECLAREd variable
+        let name = lhs.trim().trim_matches('"').to_string();
+        let slot = vars.iter().position(|v| v == &name)?;
+        TrigTarget::Var(slot as u16)
+    };
+    let expr = expr_resolve_vars(&parse_expr(text[eq + 1..].trim())?, vars);
     Some(TrigStmt::Assign { target, expr, src_off: start })
 }
 
-/// Emit a user trigger's BLR - `version5, begin, label 0, begin, begin,
-/// <statements>, end, end, end, eoc` (probed) - recording (source
-/// offset, BLR offset) pairs for the debug map: one for the BEGIN (the
-/// probed entries point at the begin AFTER the label), then one per
-/// statement in source order, nested ones included.
+/// Emit a user trigger's BLR (probed): `version5, begin,` then for a
+/// body WITH declares `blr_dcl_variable` per variable (ALL declares
+/// first) followed by a NULL-init assignment per variable (each is the
+/// DECLARE statement's debug entry), then `label 0, begin, begin,
+/// <statements>, end, end, end, eoc`. The debug map's BEGIN entry
+/// points at the begin AFTER the label; every statement - nested and
+/// ELSE-branch ones included - gets its own entry in source order.
 fn emit_trigger_blr(
     stmts: &[TrigStmt],
+    declares: &[(String, u8, usize)], // (name, blr dtype, DECLARE src offset)
     begin_off: usize,
     dbg: &mut Vec<(usize, usize)>,
 ) -> Vec<u8> {
-    let mut b = vec![5u8, 2, 17, 0]; // version5, begin, label 0
+    let mut b = vec![5u8, 2]; // version5, begin
+    for (i, (_, dtype, _)) in declares.iter().enumerate() {
+        b.push(3); // blr_dcl_variable
+        b.extend_from_slice(&(i as u16).to_le_bytes());
+        b.push(*dtype);
+        b.push(0); // scale
+    }
+    for (i, (_, _, src_off)) in declares.iter().enumerate() {
+        dbg.push((*src_off, b.len()));
+        b.push(1); // blr_assignment: NULL -> the variable
+        b.push(45); // blr_null
+        b.push(26); // blr_variable
+        b.extend_from_slice(&(i as u16).to_le_bytes());
+    }
+    b.extend_from_slice(&[17, 0]); // blr_label 0
     dbg.push((begin_off, b.len()));
     b.push(2); // begin (the one the debug map points at)
     b.push(2); // begin
@@ -2113,17 +2232,28 @@ fn emit_trigger_stmt(st: &TrigStmt, b: &mut Vec<u8>, dbg: &mut Vec<(usize, usize
             dbg.push((*src_off, b.len()));
             b.push(1); // blr_assignment
             expr.emit(b);
-            b.push(23); // blr_field: NEW.<target>
-            b.push(1);
-            b.push(target.len() as u8);
-            b.extend_from_slice(target.as_bytes());
+            match target {
+                TrigTarget::Field(col) => {
+                    b.push(23); // blr_field: NEW.<col>
+                    b.push(1);
+                    b.push(col.len() as u8);
+                    b.extend_from_slice(col.as_bytes());
+                }
+                TrigTarget::Var(slot) => {
+                    b.push(26); // blr_variable
+                    b.extend_from_slice(&slot.to_le_bytes());
+                }
+            }
         }
-        TrigStmt::If { cond, then, src_off } => {
+        TrigStmt::If { cond, then, otherwise, src_off } => {
             dbg.push((*src_off, b.len()));
             b.push(8); // blr_if
             cond.emit_positive(b);
             emit_trigger_stmt(then, b, dbg);
-            b.push(255); // no else branch
+            match otherwise {
+                Some(e) => emit_trigger_stmt(e, b, dbg),
+                None => b.push(255), // no else branch
+            }
         }
     }
 }
@@ -2133,8 +2263,19 @@ fn emit_trigger_stmt(st: &TrigStmt, b: &mut Vec<u8>, dbg: &mut Vec<(usize, usize
 /// per recorded statement, then `FF` - the byte form the engine writes
 /// (probed). Lines and columns are both 1-based, against the ORIGINAL
 /// statement text.
-fn trigger_debug_blob(sql: &str, entries: &[(usize, usize)]) -> Vec<u8> {
+fn trigger_debug_blob(
+    sql: &str,
+    vars: &[(String, u8, usize)],
+    entries: &[(usize, usize)],
+) -> Vec<u8> {
     let mut d = vec![1u8, 2];
+    // fb_dbg_map_varname items first: `03 <slot u16 LE> <len u8> <name>`
+    for (i, (name, _, _)) in vars.iter().enumerate() {
+        d.push(3);
+        d.extend_from_slice(&(i as u16).to_le_bytes());
+        d.push(name.len() as u8);
+        d.extend_from_slice(name.as_bytes());
+    }
     for (src, blr) in entries {
         let before = &sql.as_bytes()[..*src];
         let line = 1 + before.iter().filter(|&&c| c == b'\n').count() as u32;
@@ -2191,16 +2332,22 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     if words.get(w) == Some(&"ACTIVE") {
         w += 1;
     }
-    if words.get(w) != Some(&"BEFORE") {
-        return None; // AFTER triggers: nothing our surface can express
-    }
-    w += 1;
-    let trigger_type: i64 = match words.get(w) {
-        Some(&"INSERT") => 1,
-        Some(&"UPDATE") => 3,
-        _ => return None, // DELETE: NEW does not exist there
+    let before = match words.get(w) {
+        Some(&"BEFORE") => true,
+        Some(&"AFTER") => false,
+        _ => return None,
     };
-    let is_insert = trigger_type == 1;
+    w += 1;
+    // RDB$TRIGGER_TYPE: BI 1, AI 2, BU 3, AU 4, BD 5, AD 6 (probed)
+    let trigger_type: i64 = match (words.get(w), before) {
+        (Some(&"INSERT"), true) => 1,
+        (Some(&"INSERT"), false) => 2,
+        (Some(&"UPDATE"), true) => 3,
+        (Some(&"UPDATE"), false) => 4,
+        (Some(&"DELETE"), true) => 5,
+        (Some(&"DELETE"), false) => 6,
+        _ => return None,
+    };
     w += 1;
     let sequence: i64 = if words.get(w) == Some(&"POSITION") {
         let n = words.get(w + 1)?.parse().ok()?;
@@ -2215,18 +2362,49 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     // the verbatim source, from AS on - what the engine stores
     let source = s[as_kw..].to_string();
     let begin_kw = find_word(&masked, "BEGIN", as_kw + "AS".len())?;
-    if !masked[as_kw + "AS".len()..begin_kw].trim().is_empty() {
-        return None;
+    // between AS and BEGIN: `DECLARE VARIABLE <name> <int type>;`*
+    // (name, blr dtype, DECLARE keyword offset) in slot order
+    let mut declares: Vec<(String, u8, usize)> = Vec::new();
+    let mut dpos = as_kw + "AS".len();
+    loop {
+        let rest = masked[dpos..begin_kw].trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        let at = dpos + (masked[dpos..begin_kw].len() - masked[dpos..begin_kw].trim_start().len());
+        if find_word(&masked[at..begin_kw], "DECLARE", 0) != Some(0) {
+            return None;
+        }
+        let semi = s[at..begin_kw].find(';')? + at;
+        let words: Vec<&str> = masked[at..semi].split_whitespace().collect();
+        let dtype = match words.as_slice() {
+            ["DECLARE", "VARIABLE", _, ty] => match *ty {
+                "SMALLINT" => 7u8,       // blr_short
+                "INTEGER" | "INT" => 8,  // blr_long
+                "BIGINT" => 16,          // blr_int64
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let name = s[at..semi].split_whitespace().nth(2)?.trim_matches('"').to_ascii_uppercase();
+        if !ident_ok(&name) || declares.iter().any(|(n, _, _)| *n == name) {
+            return None;
+        }
+        declares.push((name, dtype, at));
+        dpos = semi + 1;
     }
     let end_kw = masked.rfind("END")?;
     if find_word(&masked, "END", end_kw) != Some(end_kw) || !masked[end_kw + "END".len()..].trim().is_empty() {
         return None;
     }
-    let stmts = parse_trigger_stmts(s, begin_kw + "BEGIN".len(), end_kw)?;
+    let var_names: Vec<String> = declares.iter().map(|(n, _, _)| n.clone()).collect();
+    let stmts = parse_trigger_stmts(s, begin_kw + "BEGIN".len(), end_kw, &var_names)?;
 
-    // validate every reference against the CATALOG: qualified (NEW/OLD),
-    // an existing plain integer stored column; an INSERT trigger has no
-    // OLD row to read
+    // validate every reference against the CATALOG: qualified (NEW/OLD)
+    // or a DECLAREd variable, columns being plain integer stored ones;
+    // the event decides which contexts exist - an INSERT trigger has no
+    // OLD row, a DELETE trigger no NEW, and only a BEFORE INSERT/UPDATE
+    // may ASSIGN to NEW (the engine's rules)
     let db = db.as_ref()?;
     let columns = relation_columns(&db.bytes, db.page_size, table);
     let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
@@ -2249,16 +2427,24 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     fn stmt_exprs<'a>(st: &'a TrigStmt, out: &mut Vec<&'a fire_crab_ods::expr::Expr>) {
         match st {
             TrigStmt::Assign { expr, .. } => out.push(expr),
-            TrigStmt::If { cond, then, .. } => {
+            TrigStmt::If { cond, then, otherwise, .. } => {
                 out.extend(cond.operands());
                 stmt_exprs(then, out);
+                if let Some(e) = otherwise {
+                    stmt_exprs(e, out);
+                }
             }
         }
     }
-    fn stmt_targets<'a>(st: &'a TrigStmt, out: &mut Vec<&'a str>) {
+    fn stmt_targets<'a>(st: &'a TrigStmt, out: &mut Vec<&'a TrigTarget>) {
         match st {
             TrigStmt::Assign { target, .. } => out.push(target),
-            TrigStmt::If { then, .. } => stmt_targets(then, out),
+            TrigStmt::If { then, otherwise, .. } => {
+                stmt_targets(then, out);
+                if let Some(e) = otherwise {
+                    stmt_targets(e, out);
+                }
+            }
         }
     }
     let mut exprs = Vec::new();
@@ -2271,7 +2457,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         use fire_crab_ods::expr::Expr;
         match e {
             Expr::Field { context, name } => out.push((*context, name.clone())),
-            Expr::IntLiteral(_) => {}
+            Expr::Variable(_) | Expr::IntLiteral(_) => {}
             Expr::Add(l, r) | Expr::Subtract(l, r) | Expr::Multiply(l, r) | Expr::Divide(l, r) => {
                 expr_fields(l, out);
                 expr_fields(r, out);
@@ -2282,25 +2468,41 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     for e in &exprs {
         expr_fields(e, &mut refs);
     }
+    // which contexts this event has: (OLD readable, NEW readable)
+    let (old_ok, new_ok) = match trigger_type {
+        1 | 2 => (false, true), // INSERT: no OLD row
+        3 | 4 => (true, true),  // UPDATE: both
+        _ => (true, false),     // DELETE: no NEW row
+    };
     for (ctx, fname) in &refs {
         if *ctx == CTX_PLAIN {
-            return None; // a trigger body must qualify with NEW./OLD.
+            return None; // neither a variable nor NEW./OLD.-qualified
         }
-        if is_insert && *ctx == 0 {
-            return None; // no OLD row in an INSERT trigger
+        if (*ctx == 0 && !old_ok) || (*ctx == 1 && !new_ok) {
+            return None;
         }
         col_ok(fname)?;
         add_field(fname);
     }
+    // NEW is assignable only in a BEFORE INSERT/UPDATE trigger
+    let new_assignable = trigger_type == 1 || trigger_type == 3;
     for t in &targets {
-        col_ok(t)?;
-        add_field(t);
+        match t {
+            TrigTarget::Field(col) => {
+                if !new_assignable {
+                    return None;
+                }
+                col_ok(col)?;
+                add_field(col);
+            }
+            TrigTarget::Var(_) => {}
+        }
     }
     fields.sort();
 
     let mut dbg_entries = Vec::new();
-    let blr = emit_trigger_blr(&stmts, begin_kw, &mut dbg_entries);
-    let debug = trigger_debug_blob(s, &dbg_entries);
+    let blr = emit_trigger_blr(&stmts, &declares, begin_kw, &mut dbg_entries);
+    let debug = trigger_debug_blob(s, &declares, &dbg_entries);
     Some((
         Plan::CreateTrigger {
             table: table.to_ascii_uppercase(),
@@ -3208,6 +3410,7 @@ fn expr_with_context(e: &fire_crab_ods::expr::Expr, context: u8) -> fire_crab_od
     use fire_crab_ods::expr::Expr;
     match e {
         Expr::Field { name, .. } => Expr::Field { context, name: name.clone() },
+        Expr::Variable(n) => Expr::Variable(*n),
         Expr::IntLiteral(v) => Expr::IntLiteral(*v),
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_with_context(l, context)),
@@ -3255,6 +3458,7 @@ fn expr_all_plain(e: &fire_crab_ods::expr::Expr) -> bool {
     use fire_crab_ods::expr::Expr;
     match e {
         Expr::Field { context, .. } => *context == CTX_PLAIN,
+        Expr::Variable(_) => false, // only a trigger body has variables
         Expr::IntLiteral(_) => true,
         Expr::Add(l, r) | Expr::Subtract(l, r) | Expr::Multiply(l, r) | Expr::Divide(l, r) => {
             expr_all_plain(l) && expr_all_plain(r)
@@ -13243,10 +13447,10 @@ mod tests {
             let up = sql.to_ascii_uppercase();
             let begin = find_word(&up, "BEGIN", 0).unwrap();
             let end = up.rfind("END").unwrap();
-            let stmts = parse_trigger_stmts(sql, begin + "BEGIN".len(), end).unwrap();
+            let stmts = parse_trigger_stmts(sql, begin + "BEGIN".len(), end, &[]).unwrap();
             let mut dbg = Vec::new();
-            let blr = emit_trigger_blr(&stmts, begin, &mut dbg);
-            (blr, trigger_debug_blob(sql, &dbg))
+            let blr = emit_trigger_blr(&stmts, &[], begin, &mut dbg);
+            (blr, trigger_debug_blob(sql, &[], &dbg))
         };
         // TR1: NEW.B = NEW.A * 2
         let (blr, dbg) =
@@ -13275,7 +13479,63 @@ mod tests {
         // NOT in the IF refuses (the engine would emit blr_not)
         let up = "CREATE TRIGGER T FOR T1 BEFORE INSERT AS BEGIN IF (NOT (NEW.A > 1)) THEN NEW.B = 0; END";
         let begin = find_word(&up.to_ascii_uppercase(), "BEGIN", 0).unwrap();
-        assert!(parse_trigger_stmts(up, begin + "BEGIN".len(), up.rfind("END").unwrap()).is_none());
+        assert!(parse_trigger_stmts(up, begin + "BEGIN".len(), up.rfind("END").unwrap(), &[]).is_none());
+    }
+
+    /// Inc-116 golden bytes: DECLARE VARIABLE (all declares first, then
+    /// a NULL-init per variable - each init is its DECLARE's debug
+    /// entry), variable reads/writes as blr_variable, IF..ELSE (the else
+    /// statement replaces the blr_end and gets its own debug entry), and
+    /// the fb_dbg_map_varname items ahead of the source map - all against
+    /// the engine's own TA/TG/TD/TH trigger and debug blobs.
+    #[test]
+    fn trigger_declare_else_blr_and_debug_match_engine() {
+        let hex = |h: &str| -> Vec<u8> {
+            (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect()
+        };
+        let compile = |sql: &str, declares: &[(String, u8, usize)]| {
+            let up = sql.to_ascii_uppercase();
+            let begin = find_word(&up, "BEGIN", 0).unwrap();
+            let end = up.rfind("END").unwrap();
+            let vars: Vec<String> = declares.iter().map(|(n, _, _)| n.clone()).collect();
+            let stmts = parse_trigger_stmts(sql, begin + "BEGIN".len(), end, &vars).unwrap();
+            let mut dbg = Vec::new();
+            let blr = emit_trigger_blr(&stmts, declares, begin, &mut dbg);
+            (blr, trigger_debug_blob(sql, declares, &dbg))
+        };
+        let v = |name: &str, dtype: u8, off: usize| (name.to_string(), dtype, off);
+        // TA: AFTER INSERT, one INTEGER variable, V = NEW.A
+        let sql = "CREATE TRIGGER TA FOR T1 AFTER INSERT AS DECLARE VARIABLE V INTEGER; BEGIN V = NEW.A; END";
+        let (blr, dbg) = compile(sql, &[v("V", 8, 41)]);
+        assert_eq!(blr, hex("05020300000800012D1A00001100020201170101411A0000FFFFFF4C"));
+        assert_eq!(dbg, hex("0102030000015602010000002A000000070000000201000000460000000E00000002010000004C00000010000000FF"));
+        // TD: IF..ELSE - the else replaces the end marker
+        let sql = "CREATE TRIGGER TD FOR T1 BEFORE INSERT POSITION 2 AS BEGIN IF (NEW.A > 10) THEN NEW.B = 1; ELSE NEW.B = 2; END";
+        let (blr, dbg) = compile(sql, &[]);
+        assert_eq!(
+            blr,
+            hex("0502110002020831170101411508000A000000011508000100000017010142011508000200000017010142FFFFFF4C")
+        );
+        assert_eq!(
+            dbg,
+            hex("01020201000000360000000400000002010000003C00000006000000020100000051000000130000000201000000610000001F000000FF")
+        );
+        // TG: MULTILINE source, two variables (INTEGER + BIGINT), reads
+        // and writes of both, all declares before all inits
+        let sql = "CREATE TRIGGER TG FOR T1 BEFORE INSERT POSITION 3 AS\nDECLARE VARIABLE V INTEGER;\nDECLARE VARIABLE W BIGINT;\nBEGIN V = 1; W = NEW.A; NEW.B = V; END";
+        let (blr, dbg) = compile(sql, &[v("V", 8, 53), v("W", 16, 81)]);
+        assert_eq!(
+            blr,
+            hex("050203000008000301001000012D1A0000012D1A01001100020201150800010000001A000001170101411A0100011A000017010142FFFFFF4C")
+        );
+        assert_eq!(
+            dbg,
+            hex("0102030000015603010001570202000000010000000C00000002030000000100000011000000020400000001000000180000000204000000070000001A00000002040000000E000000250000000204000000190000002D000000FF")
+        );
+        // TH: a SMALLINT variable declares as blr_short
+        let sql = "CREATE TRIGGER TH FOR T1 BEFORE INSERT POSITION 4 AS DECLARE VARIABLE S SMALLINT; BEGIN S = 3; END";
+        let (blr, _) = compile(sql, &[v("S", 7, 53)]);
+        assert_eq!(blr, hex("05020300000700012D1A00001100020201150800030000001A0000FFFFFF4C"));
     }
 
     /// Engine-probed golden facts (inc 111): a CHECK constraint compiles
