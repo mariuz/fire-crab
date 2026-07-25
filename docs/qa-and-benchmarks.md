@@ -3365,6 +3365,30 @@ unknown column and an unknown table on both, and runs a `gbak` round trip plus
 default written to the catalog but not folded into the runtime would pass the
 source compare and fail the insert.
 
+### The eighty-ninth differential — GRANT EXECUTE, on a procedure
+
+Every grant so far has been on a table (or a role). `GRANT EXECUTE ON PROCEDURE`
+is the same machinery one object type over. The two effects are unchanged: an
+`RDB$USER_PRIVILEGES` row per grantee — privilege `X`, object type 5 rather than
+0 — and a recompute of the object's security-class ACL. And the ACL is the very
+same acl.h version-2 format the table grants already emit: the owner ACE first,
+its privilege bytes `6 1 3 11` (alter, control, drop, execute), then each grantee
+with `execute` (11) alphabetically, `PUBLIC` (the all-users wildcard, an ACE with
+no identity) last. So the whole increment is one `SCL_EXECUTE` flag added to the
+privilege order, a procedure owner mask, and a `grant_procedure` that reads the
+procedure's owner and class and reuses `acl_serialize` and `write_class_acl`.
+
+fire-crab does not create procedures, so the engine writes the procedure into
+both databases; fire-crab grants on one copy and the engine on the other.
+
+`qa/serve-real-grantprocedure.sh` (16 checks) grants `EXECUTE` to two users (one
+`WITH GRANT OPTION`) and to `PUBLIC`, compares every `RDB$USER_PRIVILEGES` row
+(user, grant option, grantor) and the procedure's security-class `RDB$ACL` byte
+for byte, then revokes one grantee and confirms the row is gone and the ACL is
+recomputed to match, refuses an unknown procedure on both, and runs a `gbak`
+round trip plus `gfix`. Teeth: the byte-for-byte ACL over three grantees pins the
+owner ACE, the execute privilege byte, and the alphabetical-then-PUBLIC order.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest

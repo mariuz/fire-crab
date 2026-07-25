@@ -4486,6 +4486,7 @@ const SCL_INSERT: u32 = 64;
 const SCL_DELETE: u32 = 128;
 const SCL_UPDATE: u32 = 256;
 const SCL_REFERENCES: u32 = 512;
+const SCL_EXECUTE: u32 = 1024;
 
 /// A relation owner's privilege mask (grant.epp:121-128): control, drop,
 /// alter, then the four DML and references.
@@ -4497,6 +4498,10 @@ const OWNER_RELATION_PRIVS: u32 = SCL_CONTROL
     | SCL_INSERT
     | SCL_UPDATE
     | SCL_DELETE;
+
+/// A procedure owner's privilege mask: alter, control, drop, execute (probe:
+/// the owner ACE bytes are 6 1 3 11).
+const OWNER_PROCEDURE_PRIVS: u32 = SCL_ALTER | SCL_CONTROL | SCL_DROP | SCL_EXECUTE;
 
 /// A SQL privilege letter to its SCL flag (grant.epp `trans_sql_priv`, the
 /// letters a relation/field grant uses).
@@ -4524,6 +4529,7 @@ fn move_priv(mask: u32) -> Vec<u8> {
         (SCL_DELETE, 8),
         (SCL_SELECT, 4),
         (SCL_REFERENCES, 10),
+        (SCL_EXECUTE, 11),
     ];
     ORDER
         .iter()
@@ -5064,6 +5070,136 @@ pub fn grant_table(
     if !option_only {
         recompute_relation_acl(file, page_size, &table)?;
     }
+    advance_oldest_transactions(file, page_size)
+}
+
+/// A procedure's `(RDB$OWNER_NAME, RDB$SECURITY_CLASS)` from `RDB$PROCEDURES`.
+fn procedure_owner_class(file: &[u8], page_size: usize, proc: &str) -> Option<(String, String)> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$PROCEDURES")?;
+    let formats = system_relation_formats(file, page_size, "RDB$PROCEDURES")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$PROCEDURES");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (name_f, own_f, sc_f) = (
+        fid("RDB$PROCEDURE_NAME")?,
+        fid("RDB$OWNER_NAME")?,
+        fid("RDB$SECURITY_CLASS")?,
+    );
+    let mut out = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if out.is_none() && text_eq(v.get(name_f), proc) {
+            let own = match v.get(own_f) {
+                Some(Value::Text(t)) => t.trim_end().to_string(),
+                _ => OWNER.to_string(),
+            };
+            let sc = match v.get(sc_f) {
+                Some(Value::Text(t)) => t.trim_end().to_string(),
+                _ => return,
+            };
+            out = Some((own, sc));
+        }
+    });
+    out
+}
+
+/// The procedure's security-class ACL from the `EXECUTE` grants now in
+/// `RDB$USER_PRIVILEGES`: the owner ACE (alter/control/drop/execute), then
+/// every other grantee with `EXECUTE`, alphabetically, with `PUBLIC` (the
+/// all-users wildcard) last - the relation ordering, applied to a procedure.
+fn build_procedure_acl(file: &[u8], page_size: usize, proc: &str, owner: &str) -> Vec<u8> {
+    use std::collections::BTreeSet;
+    let mut named: BTreeSet<String> = BTreeSet::new();
+    let mut has_public = false;
+    if let (Some(rel), Some(formats)) = (
+        crate::resolve_relation(file, page_size, "RDB$USER_PRIVILEGES"),
+        system_relation_formats(file, page_size, "RDB$USER_PRIVILEGES"),
+    ) {
+        if let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) {
+            let cols = relation_columns(file, page_size, "RDB$USER_PRIVILEGES");
+            let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+            if let (Some(u_f), Some(rn_f), Some(p_f), Some(ot_f)) = (
+                fid("RDB$USER"),
+                fid("RDB$RELATION_NAME"),
+                fid("RDB$PRIVILEGE"),
+                fid("RDB$OBJECT_TYPE"),
+            ) {
+                walk_rows(file, page_size, rel, descs, |v| {
+                    if text_eq(v.get(rn_f), proc)
+                        && text_eq(v.get(p_f), "X")
+                        && matches!(v.get(ot_f), Some(Value::Int(5)))
+                    {
+                        if let Some(Value::Text(u)) = v.get(u_f) {
+                            let u = u.trim_end();
+                            if u.eq_ignore_ascii_case(owner) {
+                                // the owner's implicit full-privilege ACE
+                            } else if u.eq_ignore_ascii_case("PUBLIC") {
+                                has_public = true;
+                            } else {
+                                named.insert(u.to_string());
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+    let mut acl: AclList = vec![(Some(owner.to_string()), OWNER_PROCEDURE_PRIVS)];
+    for u in named {
+        acl_grant_user(&mut acl, Some(u), SCL_EXECUTE);
+    }
+    if has_public {
+        acl_grant_user(&mut acl, None, SCL_EXECUTE);
+    }
+    acl_serialize(&acl)
+}
+
+/// `GRANT EXECUTE ON PROCEDURE <p> TO <grantees> [WITH GRANT OPTION]` and its
+/// `REVOKE ... FROM` inverse - the procedure analogue of [grant_table]. Two
+/// effects: an `RDB$USER_PRIVILEGES` row per grantee (privilege `X`,
+/// object type 5) and a recompute of the procedure's security-class ACL.
+pub fn grant_procedure(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    proc: &str,
+    grantees: &[String],
+    grant_option: bool,
+    revoke: bool,
+) -> Result<(), String> {
+    let proc = proc.trim().trim_matches('"').to_ascii_uppercase();
+    let (owner, class) = procedure_owner_class(file, page_size, &proc)
+        .ok_or_else(|| format!("Procedure {} not found", proc))?;
+    let upriv = crate::resolve_relation(file, page_size, "RDB$USER_PRIVILEGES")
+        .ok_or("no RDB$USER_PRIVILEGES relation")?;
+    for grantee in grantees {
+        let grantee = grantee.trim().trim_matches('"').to_ascii_uppercase();
+        if revoke {
+            let (g, p) = (grantee.clone(), proc.clone());
+            let u_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$USER")?;
+            let rn_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$RELATION_NAME")?;
+            let pr_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$PRIVILEGE")?;
+            let ot_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$OBJECT_TYPE")?;
+            delete_catalog_rows(file, page_size, "RDB$USER_PRIVILEGES", move |v| {
+                text_eq(v.get(u_f), &g)
+                    && text_eq(v.get(rn_f), &p)
+                    && text_eq(v.get(pr_f), "X")
+                    && matches!(v.get(ot_f), Some(Value::Int(5)))
+            })?;
+        } else if !priv_row_present(file, page_size, &proc, &grantee, 'X', None) {
+            let row = vec![
+                ("RDB$USER", SysVal::S(&grantee)),
+                ("RDB$GRANTOR", SysVal::S(&owner)),
+                ("RDB$PRIVILEGE", SysVal::S("X")),
+                ("RDB$GRANT_OPTION", SysVal::I(if grant_option { 1 } else { 0 })),
+                ("RDB$RELATION_NAME", SysVal::S(&proc)),
+                ("RDB$USER_TYPE", SysVal::I(8)),
+                ("RDB$OBJECT_TYPE", SysVal::I(5)),
+                ("RDB$RELATION_SCHEMA_NAME", SysVal::S("PUBLIC")),
+            ];
+            sys_insert(file, page_size, "RDB$USER_PRIVILEGES", upriv, &row)?;
+        }
+    }
+    let acl = build_procedure_acl(file, page_size, &proc, &owner);
+    write_class_acl(file, page_size, &class, &acl)?;
     advance_oldest_transactions(file, page_size)
 }
 
