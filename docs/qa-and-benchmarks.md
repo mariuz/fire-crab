@@ -3449,6 +3449,41 @@ confirms the recompute, refuses an unknown exception, and runs a `gbak` round
 trip plus `gfix`. All four prior grant-object gates still pass over the shared
 core.
 
+### The ninety-third differential — a column typed by a domain
+
+The domain thread has built create, drop, comment, and three ALTERs — but until
+now fire-crab could not *use* a domain as a column's type, which is the whole
+point of a domain. `CREATE TABLE T (X DOM_I)` closes that: it is where the
+domain's default and NOT NULL, written in earlier differentials, finally reach a
+row through fire-crab rather than through the engine reading fire-crab's file.
+
+A domain column is not an auto-domain, and getting it byte-exact means undoing
+several of the auto-domain assumptions `create_table` was built on. Its
+`RDB$FIELD_SOURCE` is the domain's own name, not a fresh `RDB$<n>`; no
+`RDB$FIELDS` row is written for it (the domain already is one); the per-table
+auto-domain counter skips it, so a table of three domain columns and one
+built-in still numbers that built-in `RDB$1`. Its `RDB$RELATION_FIELDS` row
+carries neither the null flag nor the default — those live on the domain — and,
+a detail only the byte compare surfaced, its `RDB$COLLATION_ID` is NULL where a
+built-in column's is 0 (for an integer built-in too, which had been latently
+wrong and is now fixed). The format descriptor takes the domain's type, and the
+domain's default and NOT NULL are folded into the relation's `RDB$RUNTIME`, which
+is the summary the engine reads them from.
+
+The parser change is small: an unrecognised single-identifier type is taken as a
+domain reference, its `ColumnDef` a placeholder that `create_table` fills from the
+domain's `RDB$FIELDS` row. (A domain column with its own column-level `NOT NULL`
+or `DEFAULT` — an override, not the plain case — is refused for now.)
+
+`qa/serve-real-domaincolumn.sh` (11 checks) creates the same three domains and a
+four-column table (three domain columns, one built-in) on two copies, compares
+the `RDB$FORMATS` descriptor and the `RDB$RUNTIME` byte for byte, compares every
+`RDB$RELATION_FIELDS` row, confirms exactly one auto-domain is written, has the
+engine apply the inherited default (`X` = 42 on a row that omits it) and enforce
+the inherited `NOT NULL`, and runs a `gbak` round trip plus `gfix`. Every
+table-creating gate still passes, since with no domain columns the source names
+and rows are byte-identical to before.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest

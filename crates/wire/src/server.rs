@@ -1452,6 +1452,7 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
             // constraint row
             not_null_constraint: not_null,
             default: None,
+            domain: None,
         })
     };
     // parenthesised argument(s), if any
@@ -1490,6 +1491,22 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
             let sub = if base == "NUMERIC" { 1 } else { 2 };
             numeric_col(name, *p, *s, sub, not_null)
         }
+        // an unrecognised single-identifier type with no arguments is taken
+        // as a user domain reference; its type is a placeholder here and is
+        // resolved from the domain's RDB$FIELDS row at create_table
+        (dom, []) if ident_ok(dom) => Some(fire_crab_ods::ddl::ColumnDef {
+            name: name.to_ascii_uppercase(),
+            field_type: 0,
+            dtype: 0,
+            length: 0,
+            scale: 0,
+            sub_type: 0,
+            char_len: None,
+            not_null,
+            not_null_constraint: not_null,
+            default: None,
+            domain: Some(dom.to_string()),
+        }),
         _ => None,
     };
     let mut built = built?;
@@ -1543,6 +1560,7 @@ fn numeric_col(
         not_null,
         not_null_constraint: not_null,
         default: None,
+        domain: None,
     })
 }
 
@@ -11290,6 +11308,12 @@ mod tests {
         assert_eq!(d.value_blr, vec![5, 45, 76]);
         // a column with no default
         assert!(parse_column_def("D INTEGER").unwrap().0.default.is_none());
+        // a domain-typed column: type is a placeholder, domain names it
+        let (c, _) = parse_column_def("X DOM_I").unwrap();
+        assert_eq!(c.domain.as_deref(), Some("DOM_I"));
+        assert_eq!(c.field_type, 0);
+        // a built-in column has no domain
+        assert!(parse_column_def("A INTEGER").unwrap().0.domain.is_none());
     }
 
     #[test]

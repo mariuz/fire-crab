@@ -51,6 +51,7 @@ use crate::{u16_at, u32_at, Descriptor};
 
 /// One column of a CREATE TABLE: its name, the external catalog type
 /// code (`RDB$FIELD_TYPE`), and the storage descriptor pieces.
+#[derive(Clone)]
 pub struct ColumnDef {
     pub name: String,
     /// RDB$FIELD_TYPE: 7 smallint, 8 integer, 16 int64, 14 text,
@@ -77,10 +78,15 @@ pub struct ColumnDef {
     /// a column `DEFAULT <literal>`, if any: the source text
     /// (`DEFAULT 0`) and its value BLR
     pub default: Option<ColumnDefault>,
+    /// when the column's type is a user domain (`X DOM_I`), the domain's
+    /// name; the type fields above are placeholders, resolved from the
+    /// domain's `RDB$FIELDS` row at [create_table]. `None` for a built-in type.
+    pub domain: Option<String>,
 }
 
 /// A column (or domain) `DEFAULT <literal>`: the `RDB$DEFAULT_SOURCE` text
 /// and the `RDB$DEFAULT_VALUE` BLR.
+#[derive(Clone)]
 pub struct ColumnDefault {
     pub source: String,
     pub value_blr: Vec<u8>,
@@ -978,6 +984,12 @@ fn field_type_to_dtype(ft: i16) -> Option<u8> {
         7 => dtype::SHORT,
         8 => dtype::LONG,
         16 => dtype::INT64,
+        10 => dtype::REAL,
+        27 => dtype::DOUBLE,
+        12 => dtype::SQL_DATE,
+        13 => dtype::SQL_TIME,
+        35 => dtype::TIMESTAMP,
+        23 => dtype::BOOLEAN,
         14 => dtype::TEXT,
         37 => dtype::VARYING,
         _ => return None,
@@ -1013,6 +1025,83 @@ fn domain_type_info(file: &[u8], page_size: usize, name: &str) -> Option<(i16, u
         }
     });
     out
+}
+
+/// A user domain's full resolved type, for a column declared with it. The
+/// descriptor pieces (dtype, dsc_length, scale, sub_type, char_len), plus the
+/// domain's own `NOT NULL` and `DEFAULT` (which a column of the domain
+/// inherits) - read once off the domain's `RDB$FIELDS` row.
+pub struct DomainType {
+    pub field_type: i16,
+    pub dtype: u8,
+    pub length: u16,
+    pub scale: i8,
+    pub sub_type: i16,
+    pub char_len: Option<u16>,
+    pub not_null: bool,
+    pub default_blr: Option<Vec<u8>>,
+}
+
+fn resolve_domain_type(file: &[u8], page_size: usize, dname: &str) -> Option<DomainType> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$FIELDS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$FIELDS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$FIELDS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let name_f = fid("RDB$FIELD_NAME")?;
+    let ft_f = fid("RDB$FIELD_TYPE")?;
+    let len_f = fid("RDB$FIELD_LENGTH")?;
+    let sc_f = fid("RDB$FIELD_SCALE")?;
+    let sub_f = fid("RDB$FIELD_SUB_TYPE")?;
+    let cl_f = fid("RDB$CHARACTER_LENGTH");
+    let nf_f = fid("RDB$NULL_FLAG");
+    let dv_f = fid("RDB$DEFAULT_VALUE");
+    let mut found: Option<(i16, u16, i8, i16, Option<u16>, bool, Option<(u16, u64)>)> = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if found.is_none() && text_eq(v.get(name_f), dname) {
+            let geti = |f: usize| match v.get(f) {
+                Some(Value::Int(i)) => *i,
+                _ => 0,
+            };
+            let char_len = cl_f.and_then(|f| match v.get(f) {
+                Some(Value::Int(i)) => Some(*i as u16),
+                _ => None,
+            });
+            let not_null = nf_f.map_or(false, |f| matches!(v.get(f), Some(Value::Int(1))));
+            let def = dv_f.and_then(|f| match v.get(f) {
+                Some(Value::Blob(r, n)) => Some((*r, *n)),
+                _ => None,
+            });
+            found = Some((
+                geti(ft_f) as i16,
+                geti(len_f) as u16,
+                geti(sc_f) as i8,
+                geti(sub_f) as i16,
+                char_len,
+                not_null,
+                def,
+            ));
+        }
+    });
+    let (field_type, byte_len, scale, sub_type, char_len, not_null, def) = found?;
+    let dtype = field_type_to_dtype(field_type)?;
+    // dsc_length: a VARYING carries its 2-byte count word, other types do not
+    let length = if dtype == crate::format::dtype::VARYING {
+        byte_len + 2
+    } else {
+        byte_len
+    };
+    let default_blr = def.and_then(|(r, n)| crate::format::read_blob_content(file, page_size, r, n));
+    Some(DomainType {
+        field_type,
+        dtype,
+        length,
+        scale,
+        sub_type,
+        char_len,
+        not_null,
+        default_blr,
+    })
 }
 
 /// `ALTER DOMAIN <name> TYPE <newtype>` - retype a domain in place on its
@@ -1847,6 +1936,46 @@ pub fn create_table(
     let rel_id_u16 = rels.iter().map(|(id, _)| *id).max().unwrap_or(127).max(127) + 1;
     let rel_id = rel_id_u16 as i64;
 
+    // resolve each column's source (its RDB$FIELD_SOURCE): a per-table
+    // auto-domain RDB$<n> for a built-in type, or the user domain it names.
+    // A domain column's type is filled from the domain's RDB$FIELDS row, and
+    // it inherits the domain's DEFAULT and NOT NULL (both applied via the
+    // runtime, not the column's own catalog row). The auto-domain counter
+    // advances only for built-in columns, so with no domain columns the
+    // source names are byte-identical to before.
+    let domain_base = next_domain_number(file, page_size)?;
+    let mut resolved: Vec<ColumnDef> = Vec::with_capacity(cols.len());
+    // per column: (source name, is_domain, inherited default BLR, inherited not_null)
+    let mut src_meta: Vec<(String, bool, Option<Vec<u8>>, bool)> = Vec::with_capacity(cols.len());
+    let mut auto_idx: u64 = 0;
+    for c in cols {
+        if let Some(dname) = &c.domain {
+            let dname = dname.trim().trim_matches('"').to_ascii_uppercase();
+            if c.not_null || c.default.is_some() {
+                return Err(format!(
+                    "column-level constraints on a domain column ({}) are not supported",
+                    c.name
+                ));
+            }
+            let dt = resolve_domain_type(file, page_size, &dname)
+                .ok_or_else(|| format!("Domain {} is not defined", dname))?;
+            let mut rc = c.clone();
+            rc.field_type = dt.field_type;
+            rc.dtype = dt.dtype;
+            rc.length = dt.length;
+            rc.scale = dt.scale;
+            rc.sub_type = dt.sub_type;
+            rc.char_len = dt.char_len;
+            resolved.push(rc);
+            src_meta.push((dname, true, dt.default_blr, dt.not_null));
+        } else {
+            resolved.push(c.clone());
+            src_meta.push((format!("RDB${}", domain_base + auto_idx), false, None, false));
+            auto_idx += 1;
+        }
+    }
+    let cols: &[ColumnDef] = &resolved;
+
     // the physical format: field ids in declaration order (probe-pinned),
     // offsets by the ini.epp walk sysfmt already implements
     let fields: Vec<(u8, u16, i8, i16)> = cols
@@ -1883,7 +2012,6 @@ pub fn create_table(
 
     // --- the RDB$RUNTIME field summary (make_version): per field the
     // probe-pinned tag sequence ------------------------------------------
-    let domain_base = next_domain_number(file, page_size)?;
     let mut runtime: Vec<Vec<u8>> = Vec::new();
     let seg = |tag: u8, data: &[u8]| {
         let mut s = Vec::with_capacity(1 + data.len());
@@ -1892,10 +2020,10 @@ pub fn create_table(
         s
     };
     for (i, c) in cols.iter().enumerate() {
-        let dom = format!("RDB${}", domain_base + i as u64);
+        let (source, is_domain, dom_default, dom_not_null) = &src_meta[i];
         runtime.push(seg(0, &(i as u16).to_le_bytes())); // RSR_field_id
         runtime.push(seg(1, c.name.as_bytes())); // RSR_field_name
-        let src = format!("\"PUBLIC\".\"{}\"", dom);
+        let src = format!("\"PUBLIC\".\"{}\"", source);
         runtime.push(seg(25, src.as_bytes())); // RSR_field_source
         // RSR_field_length is the byte (declared) length, not the storage
         // length a VARYING carries in the format descriptor
@@ -1904,24 +2032,35 @@ pub fn create_table(
             runtime.push(seg(26, &cl.to_le_bytes())); // RSR_character_length
         }
         runtime.push(seg(27, &(i as u16).to_le_bytes())); // RSR_field_pos
-        // the column DEFAULT (RSR_default_value = 6): the engine reads a
-        // field's default from this runtime entry, not from
-        // RDB$RELATION_FIELDS.RDB$DEFAULT_VALUE - without it the catalog
-        // default is written but never applied
-        if let Some(def) = &c.default {
-            runtime.push(seg(6, &def.value_blr));
+        // the field DEFAULT (RSR_default_value = 6): the engine reads a
+        // field's default from this runtime entry, not from the catalog
+        // column. A domain column inherits the domain's default here.
+        let default_blr: Option<&[u8]> = if *is_domain {
+            dom_default.as_deref()
+        } else {
+            c.default.as_ref().map(|d| d.value_blr.as_slice())
+        };
+        if let Some(blr) = default_blr {
+            runtime.push(seg(6, blr));
         }
-        if c.not_null {
+        // NOT NULL, likewise inherited from the domain for a domain column
+        let not_null = if *is_domain { *dom_not_null } else { c.not_null };
+        if not_null {
             runtime.push(seg(21, &NONNULL_BLR)); // RSR_field_not_null
         }
     }
     let runtime_blob = dml::insert_blob(file, page_size, 6, &runtime, 5)?;
 
     // --- catalog rows, each with its indexes maintained ---------------
+    // the auto-domain RDB$FIELDS row - only for a built-in-typed column; a
+    // domain column's RDB$FIELDS row already exists (the domain itself)
     for (i, c) in cols.iter().enumerate() {
-        let dom = format!("RDB${}", domain_base + i as u64);
+        let (source, is_domain, _, _) = &src_meta[i];
+        if *is_domain {
+            continue;
+        }
         let mut vals: Vec<(&str, SysVal<'_>)> = vec![
-            ("RDB$FIELD_NAME", SysVal::S(&dom)),
+            ("RDB$FIELD_NAME", SysVal::S(source)),
             ("RDB$FIELD_TYPE", SysVal::I(c.field_type as i64)),
             ("RDB$FIELD_LENGTH", SysVal::I(catalog_field_length(c))),
             ("RDB$FIELD_SCALE", SysVal::I(c.scale as i64)),
@@ -1937,11 +2076,11 @@ pub fn create_table(
         sys_insert(file, page_size, "RDB$FIELDS", 2, &vals)?;
     }
     for (i, c) in cols.iter().enumerate() {
-        let dom = format!("RDB${}", domain_base + i as u64);
+        let (source, is_domain, _, _) = &src_meta[i];
         let mut vals: Vec<(&str, SysVal<'_>)> = vec![
             ("RDB$FIELD_NAME", SysVal::S(&c.name)),
             ("RDB$RELATION_NAME", SysVal::S(&name)),
-            ("RDB$FIELD_SOURCE", SysVal::S(&dom)),
+            ("RDB$FIELD_SOURCE", SysVal::S(source)),
             ("RDB$FIELD_POSITION", SysVal::I(i as i64)),
             ("RDB$UPDATE_FLAG", SysVal::I(1)),
             ("RDB$FIELD_ID", SysVal::I(i as i64)),
@@ -1949,20 +2088,27 @@ pub fn create_table(
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
             ("RDB$FIELD_SOURCE_SCHEMA_NAME", SysVal::S("PUBLIC")),
         ];
-        if c.char_len.is_some() {
+        // RDB$COLLATION_ID on the RELATION_FIELDS row: 0 for a built-in
+        // column (its collation is the relation field's own), NULL for a
+        // domain column (the collation is the domain's) - probe: an INTEGER
+        // built-in column has 0 too, so this is not a text-only attribute
+        if !is_domain {
             vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
         }
-        if c.not_null {
-            vals.push(("RDB$NULL_FLAG", SysVal::I(1)));
-        }
-        // a column DEFAULT lives on RDB$RELATION_FIELDS (not the auto-domain):
-        // the source text (subtype 1, charset 4 like a description) and the
-        // value BLR (subtype 2)
-        if let Some(def) = &c.default {
-            let src = dml::insert_blob_cs(file, page_size, 5, &[def.source.as_bytes().to_vec()], 1, 4)?;
-            let val = dml::insert_blob(file, page_size, 5, &[def.value_blr.clone()], 2)?;
-            vals.push(("RDB$DEFAULT_SOURCE", SysVal::B(blob_id_bytes(5, src))));
-            vals.push(("RDB$DEFAULT_VALUE", SysVal::B(blob_id_bytes(5, val))));
+        // a domain column inherits NOT NULL and DEFAULT from the domain, so
+        // its RDB$RELATION_FIELDS row carries neither (the engine keeps them
+        // on the domain's RDB$FIELDS row); a built-in column carries its own
+        if !is_domain {
+            if c.not_null {
+                vals.push(("RDB$NULL_FLAG", SysVal::I(1)));
+            }
+            if let Some(def) = &c.default {
+                let src =
+                    dml::insert_blob_cs(file, page_size, 5, &[def.source.as_bytes().to_vec()], 1, 4)?;
+                let val = dml::insert_blob(file, page_size, 5, &[def.value_blr.clone()], 2)?;
+                vals.push(("RDB$DEFAULT_SOURCE", SysVal::B(blob_id_bytes(5, src))));
+                vals.push(("RDB$DEFAULT_VALUE", SysVal::B(blob_id_bytes(5, val))));
+            }
         }
         sys_insert(file, page_size, "RDB$RELATION_FIELDS", 5, &vals)?;
     }
