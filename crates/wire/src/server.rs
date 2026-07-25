@@ -742,6 +742,12 @@ enum Plan {
     /// `ALTER DOMAIN <name> SET NOT NULL` / `DROP NOT NULL`: set the domain's
     /// RDB$NULL_FLAG to 1 (SET) or 0 (DROP)
     AlterDomainNotNull { domain: String, not_null: bool },
+    /// `ALTER DOMAIN <name> TYPE <newtype>`: retype the domain's RDB$FIELDS
+    /// row in place (widening only)
+    AlterDomainType {
+        domain: String,
+        new_col: fire_crab_ods::ddl::ColumnDef,
+    },
     /// `ALTER INDEX <name> ACTIVE|INACTIVE`: INACTIVE moves the slot to
     /// the drop states (still maintained, no longer enforcing), ACTIVE
     /// REBUILDS the index into a new slot and recomputes its selectivity
@@ -2051,6 +2057,16 @@ fn plan_alter_domain(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         Some((Plan::AlterDomainNotNull { domain: name, not_null: true }, Vec::new()))
     } else if norm == "DROP NOT NULL" {
         Some((Plan::AlterDomainNotNull { domain: name, not_null: false }, Vec::new()))
+    } else if norm.starts_with("TYPE ") {
+        // ALTER DOMAIN <name> TYPE <newtype> - parse the new type through the
+        // same column parser (a dummy name, no default/key), keep the ColumnDef
+        let type_kw = find_word(&tail.to_ascii_uppercase(), "TYPE", 0)?;
+        let new_type = tail[type_kw + "TYPE".len()..].trim();
+        let (col, key) = parse_column_def(&format!("X {}", new_type))?;
+        if key.is_some() || col.default.is_some() {
+            return None;
+        }
+        Some((Plan::AlterDomainType { domain: name, new_col: col }, Vec::new()))
     } else {
         None // other ALTER DOMAIN forms not modelled
     }
@@ -3495,6 +3511,10 @@ fn execute_dml(
         }
         Plan::AlterDomainNotNull { domain, not_null } => {
             fire_crab_ods::ddl::alter_domain_not_null(&mut work, db.page_size, domain, *not_null)?;
+            (0, 0, 0)
+        }
+        Plan::AlterDomainType { domain, new_col } => {
+            fire_crab_ods::ddl::alter_domain_type(&mut work, db.page_size, domain, new_col)?;
             (0, 0, 0)
         }
         Plan::AlterIndex { name, active } => {
@@ -5044,6 +5064,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
         | Plan::AlterDomainDefault { .. }
         | Plan::AlterDomainNotNull { .. }
+        | Plan::AlterDomainType { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
         | Plan::Comment { .. }
@@ -5087,6 +5108,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
         | Plan::AlterDomainDefault { .. }
         | Plan::AlterDomainNotNull { .. }
+        | Plan::AlterDomainType { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
         | Plan::Comment { .. }
@@ -5417,6 +5439,7 @@ fn emit_rows_inner(
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
         | Plan::AlterDomainDefault { .. }
         | Plan::AlterDomainNotNull { .. }
+        | Plan::AlterDomainType { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
         | Plan::Comment { .. }
@@ -8130,6 +8153,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::DropDomain { .. }
                         | Plan::AlterDomainDefault { .. }
                         | Plan::AlterDomainNotNull { .. }
+                        | Plan::AlterDomainType { .. }
                         | Plan::AlterIndex { .. }
                         | Plan::SetStatistics { .. }
                         | Plan::Comment { .. }
@@ -11398,8 +11422,22 @@ mod tests {
             Some((Plan::AlterDomainNotNull { not_null, .. }, _)) => assert!(!not_null),
             other => panic!("expected AlterDomainNotNull DROP, got {:?}", other.is_some()),
         }
+        // TYPE parses the new type into a ColumnDef
+        match plan_alter_domain("ALTER DOMAIN DOM_A TYPE BIGINT") {
+            Some((Plan::AlterDomainType { domain, new_col }, _)) => {
+                assert_eq!(domain, "DOM_A");
+                assert_eq!(new_col.field_type, 16); // INT64
+            }
+            other => panic!("expected AlterDomainType, got {:?}", other.is_some()),
+        }
+        match plan_alter_domain("alter domain dom_v type varchar(20)") {
+            Some((Plan::AlterDomainType { new_col, .. }, _)) => {
+                assert_eq!(new_col.field_type, 37); // VARYING
+                assert_eq!(new_col.char_len, Some(20));
+            }
+            other => panic!("expected AlterDomainType varchar, got {:?}", other.is_some()),
+        }
         // unmodelled ALTER DOMAIN forms, and non-domains, fall back
-        assert!(plan_alter_domain("ALTER DOMAIN DOM_A TYPE BIGINT").is_none());
         assert!(plan_alter_domain("ALTER DOMAIN DOM_A DROP CONSTRAINT").is_none());
         assert!(plan_alter_domain("ALTER TABLE T ADD A INT").is_none());
     }

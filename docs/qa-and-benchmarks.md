@@ -3314,6 +3314,33 @@ on both, and runs a `gbak` round trip plus `gfix`. Teeth: the flag compare pins
 the 0/1/NULL three-way, and the two insert checks prove the flag is the one the
 engine reads.
 
+### The eighty-seventh differential — ALTER DOMAIN, TYPE
+
+The last of the in-place `ALTER DOMAIN` forms retypes the domain. A domain *is* a
+`RDB$FIELDS` row, and a table column's type already lives on an `RDB$FIELDS` row
+(its auto-domain), so this is the column `ALTER TYPE` retype — `RDB$FIELD_TYPE`,
+`LENGTH`, `SCALE`, `SUB_TYPE`, and `CHARACTER_LENGTH` for text — minus the table
+format and runtime a domain does not have. It reuses the same widening test the
+column path does: an integer to a wider integer, a CHAR or VARCHAR to a
+same-or-longer one; a narrowing or a cross-family change errors, exactly where
+the engine answers "must be at least N characters" or "cannot change datatype …
+from a character type to a non-character type".
+
+The one wrinkle is that `type_change_supported` compares descriptors, and a
+domain row gives a `RDB$FIELD_TYPE` (8 for INTEGER) rather than a dsc dtype (9
+for LONG); a small `field_type_to_dtype` bridges them, and the old descriptor is
+built in the same length convention the new one uses (a VARYING's length carries
+its count word) so the comparison is apples to apples.
+
+`qa/serve-real-alterdomaintype.sh` (12 checks) starts both databases with the
+same four domains, has fire-crab retype three (INTEGER→BIGINT, SMALLINT→INTEGER,
+VARCHAR(6)→VARCHAR(20)) and the engine the same, compares every domain's type row
+(type, length, character length), refuses a narrowing and a cross-family change
+on both, has the engine store a value past the old INTEGER range in fire-crab's
+now-BIGINT domain, and runs a `gbak` round trip plus `gfix`. Teeth: the type-row
+compare pins each widening, and the BIGINT insert proves the retype is the type
+the engine now uses.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest

@@ -970,6 +970,142 @@ pub fn alter_domain_not_null(
     advance_oldest_transactions(file, page_size)
 }
 
+/// `RDB$FIELD_TYPE` -> dsc dtype, for the int and text families
+/// [type_change_supported] understands (enough to widen a domain).
+fn field_type_to_dtype(ft: i16) -> Option<u8> {
+    use crate::format::dtype;
+    Some(match ft {
+        7 => dtype::SHORT,
+        8 => dtype::LONG,
+        16 => dtype::INT64,
+        14 => dtype::TEXT,
+        37 => dtype::VARYING,
+        _ => return None,
+    })
+}
+
+/// A domain's current `(field_type, byte length, scale, sub_type)` off its
+/// `RDB$FIELDS` row.
+fn domain_type_info(file: &[u8], page_size: usize, name: &str) -> Option<(i16, u16, i8, i16)> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$FIELDS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$FIELDS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$FIELDS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let name_f = fid("RDB$FIELD_NAME")?;
+    let ft_f = fid("RDB$FIELD_TYPE")?;
+    let len_f = fid("RDB$FIELD_LENGTH")?;
+    let sc_f = fid("RDB$FIELD_SCALE")?;
+    let sub_f = fid("RDB$FIELD_SUB_TYPE")?;
+    let mut out = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if text_eq(v.get(name_f), name) {
+            let geti = |f: usize| match v.get(f) {
+                Some(Value::Int(i)) => *i,
+                _ => 0,
+            };
+            out = Some((
+                geti(ft_f) as i16,
+                geti(len_f) as u16,
+                geti(sc_f) as i8,
+                geti(sub_f) as i16,
+            ));
+        }
+    });
+    out
+}
+
+/// `ALTER DOMAIN <name> TYPE <newtype>` - retype a domain in place on its
+/// `RDB$FIELDS` row (`RDB$FIELD_TYPE` / `LENGTH` / `SCALE` / `SUB_TYPE`, and
+/// `RDB$CHARACTER_LENGTH` for text). Only a widening this write path performs
+/// (see [type_change_supported]) - a SMALLINT to a wider integer, a CHAR or
+/// VARCHAR to a same-or-longer one; a narrowing errors, as the engine's does
+/// ("must be at least N characters"). This is the unused-domain case:
+/// fire-crab does not yet declare a domain-typed column, so there is no table
+/// format to carry along.
+pub fn alter_domain_type(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    name: &str,
+    new_col: &ColumnDef,
+) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    if want.starts_with("RDB$") || want.starts_with("SQL$") {
+        return Err("system domains are read-only".into());
+    }
+    let (old_ft, old_len, old_scale, old_sub) = domain_type_info(file, page_size, &want)
+        .ok_or_else(|| format!("Domain {} not found", want))?;
+    let old_dtype = field_type_to_dtype(old_ft)
+        .ok_or("the domain's current type is not one this path retypes")?;
+    // the old descriptor, in the same length convention new_col uses
+    // (a VARYING's dsc_length carries the 2-byte count word)
+    let old_dsc_len = if old_dtype == crate::format::dtype::VARYING {
+        old_len + 2
+    } else {
+        old_len
+    };
+    let old_desc = Descriptor {
+        dtype: old_dtype,
+        scale: old_scale,
+        length: old_dsc_len,
+        sub_type: old_sub,
+        flags: 0,
+        offset: 0,
+    };
+    if !type_change_supported(&old_desc, new_col) {
+        return Err(format!(
+            "cannot change datatype for domain {}; conversion not supported",
+            want
+        ));
+    }
+    // patch the domain's RDB$FIELDS row in place (mirror of the column
+    // ALTER TYPE retype, minus the table format/runtime it does not have)
+    let f_cols = relation_columns(file, page_size, "RDB$FIELDS");
+    let f_fid = |n: &str| f_cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let f_name_fid = f_fid("RDB$FIELD_NAME").ok_or("no RDB$FIELD_NAME")?;
+    let dom_pred = {
+        let dom = want.clone();
+        move |vals: &[Value]| text_eq(vals.get(f_name_fid), &dom)
+    };
+    let (fpage, fslot) = find_sys_row_slot(file, page_size, "RDB$FIELDS", 2, dom_pred)
+        .ok_or("RDB$FIELDS domain row not found")?;
+    let f_formats =
+        system_relation_formats(file, page_size, "RDB$FIELDS").ok_or("no RDB$FIELDS format")?;
+    let (f_format_no, f_descs) = {
+        let (n, d) = f_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+        (*n, d.clone())
+    };
+    let mut f_image = {
+        let start = fpage as usize * page_size;
+        let dp = DataPage::decode(file.get(start..start + page_size).ok_or("bad page")?)
+            .ok_or("bad data page")?;
+        dp.record(fslot)
+            .and_then(|r| r.image())
+            .ok_or("no field image")?
+    };
+    let patch_field = |image: &mut [u8], nm: &str, v: SysVal<'_>| -> Result<(), String> {
+        let fid = f_fid(nm).ok_or_else(|| format!("no {} column", nm))?;
+        let d = f_descs.get(fid).ok_or("field beyond format")?;
+        let bytes = encode_sys_value(d, &v)?;
+        let at = d.offset as usize;
+        image
+            .get_mut(at..at + bytes.len())
+            .ok_or("image shorter than format")?
+            .copy_from_slice(&bytes);
+        image[fid / 8] &= !(1 << (fid % 8));
+        Ok(())
+    };
+    patch_field(&mut f_image, "RDB$FIELD_TYPE", SysVal::I(new_col.field_type as i64))?;
+    patch_field(&mut f_image, "RDB$FIELD_LENGTH", SysVal::I(catalog_field_length(new_col)))?;
+    patch_field(&mut f_image, "RDB$FIELD_SCALE", SysVal::I(new_col.scale as i64))?;
+    patch_field(&mut f_image, "RDB$FIELD_SUB_TYPE", SysVal::I(new_col.sub_type as i64))?;
+    if let Some(cl) = new_col.char_len {
+        patch_field(&mut f_image, "RDB$CHARACTER_LENGTH", SysVal::I(cl as i64))?;
+    }
+    dml::update_records(file, page_size, 2, &[(fpage, fslot, f_image)], f_format_no)?;
+    advance_oldest_transactions(file, page_size)
+}
+
 /// `ALTER TABLE <table> DROP <column>`: remove a column. Like ADD, this is
 /// a new *format version* - existing records keep their old format (and
 /// still carry the dropped field's bytes, now unreferenced); the new
