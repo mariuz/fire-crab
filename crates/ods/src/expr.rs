@@ -101,6 +101,42 @@ impl Expr {
     }
 }
 
+/// The distinct field names a stored computed-column BLR references - the
+/// decoder mirror of [Expr::field_refs], over exactly the opcode surface
+/// [Expr::emit] writes (binary arithmetic, field references, `blr_long`
+/// literals). None on ANY other opcode: the expression then references
+/// who-knows-what, and a caller deciding whether a column may be dropped
+/// must refuse rather than guess.
+pub fn field_names_of_blr(b: &[u8]) -> Option<Vec<String>> {
+    if b.first() != Some(&BLR_VERSION5) || b.last() != Some(&BLR_EOC) || b.len() < 2 {
+        return None;
+    }
+    let mut names: Vec<String> = Vec::new();
+    let mut i = 1;
+    let end = b.len() - 1;
+    while i < end {
+        match b[i] {
+            BLR_ADD | BLR_SUBTRACT | BLR_MULTIPLY | BLR_DIVIDE => i += 1,
+            BLR_FIELD => {
+                let len = *b.get(i + 2)? as usize;
+                let name = std::str::from_utf8(b.get(i + 3..i + 3 + len)?).ok()?;
+                if !names.iter().any(|n| n == name) {
+                    names.push(name.to_string());
+                }
+                i += 3 + len;
+            }
+            BLR_LITERAL => {
+                if b.get(i + 1) != Some(&BLR_LONG) {
+                    return None;
+                }
+                i += 7; // literal, long, scale, 4 value bytes
+            }
+            _ => return None,
+        }
+    }
+    Some(names)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +186,26 @@ mod tests {
     fn field_refs_are_distinct_and_ordered() {
         let e = Expr::Add(f("A"), Box::new(Expr::Multiply(f("A"), f("B"))));
         assert_eq!(e.field_refs(), vec!["A".to_string(), "B".to_string()]);
+    }
+
+    /// Decoding a compiled expression's BLR must recover exactly the
+    /// names [Expr::field_refs] reports; any opcode outside the emitted
+    /// surface must return None, never a partial (wrong) answer.
+    #[test]
+    fn field_names_round_trip_and_refuse_unknown_opcodes() {
+        let e = Expr::Multiply(
+            Box::new(Expr::Add(f("A"), i(10))),
+            Box::new(Expr::Subtract(f("LONG_NAME"), f("A"))),
+        );
+        assert_eq!(
+            field_names_of_blr(&e.to_blr()),
+            Some(vec!["A".to_string(), "LONG_NAME".to_string()])
+        );
+        assert_eq!(field_names_of_blr(&Expr::IntLiteral(5).to_blr()), Some(vec![]));
+        // blr_user_name (44) is outside the emitted surface
+        assert_eq!(field_names_of_blr(&[5, 44, 76]), None);
+        // a literal that is not blr_long
+        assert_eq!(field_names_of_blr(&[5, 21, 15, 0, 0, 1, 0, 65, 76]), None);
+        assert_eq!(field_names_of_blr(&[]), None);
     }
 }

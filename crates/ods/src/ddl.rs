@@ -489,6 +489,79 @@ pub fn has_computed_field(descs: &[Descriptor]) -> bool {
     descs.iter().any(|d| d.offset == 0 && d.length != 0)
 }
 
+/// Every COMPUTED column of a table, with the field names its stored
+/// expression references: `(column name, Some(referenced names))`, or
+/// `None` names when the BLR is outside the surface
+/// [crate::expr::field_names_of_blr] can read - the caller must then
+/// assume it references anything.
+fn computed_dependencies(
+    file: &[u8],
+    page_size: usize,
+    table: &str,
+) -> Vec<(String, Option<Vec<String>>)> {
+    let text = |v: Option<&Value>| match v {
+        Some(Value::Text(t)) => Some(t.trim_end().to_string()),
+        _ => None,
+    };
+    // (column name, field source) of the table's columns
+    let Some(rf_formats) = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")
+    else {
+        return Vec::new();
+    };
+    let Some((_, rf_descs)) = rf_formats.iter().max_by_key(|(n, _)| *n) else {
+        return Vec::new();
+    };
+    let rf_cols = relation_columns(file, page_size, "RDB$RELATION_FIELDS");
+    let rf_fid = |n: &str| rf_cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(rf_rel), Some(rf_name), Some(rf_src)) = (
+        rf_fid("RDB$RELATION_NAME"),
+        rf_fid("RDB$FIELD_NAME"),
+        rf_fid("RDB$FIELD_SOURCE"),
+    ) else {
+        return Vec::new();
+    };
+    let mut members: Vec<(String, String)> = Vec::new();
+    walk_rows(file, page_size, 5, rf_descs, |vals| {
+        if text(vals.get(rf_rel)).as_deref() != Some(table) {
+            return;
+        }
+        if let (Some(name), Some(src)) = (text(vals.get(rf_name)), text(vals.get(rf_src))) {
+            members.push((name, src));
+        }
+    });
+    // each source's RDB$COMPUTED_BLR, decoded to its field names
+    let Some(f_formats) = system_relation_formats(file, page_size, "RDB$FIELDS") else {
+        return Vec::new();
+    };
+    let Some((_, f_descs)) = f_formats.iter().max_by_key(|(n, _)| *n) else {
+        return Vec::new();
+    };
+    let fcols = relation_columns(file, page_size, "RDB$FIELDS");
+    let ffid = |n: &str| fcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(fname_f), Some(cblr_f)) = (ffid("RDB$FIELD_NAME"), ffid("RDB$COMPUTED_BLR"))
+    else {
+        return Vec::new();
+    };
+    let mut blobs: Vec<(String, u16, u64)> = Vec::new();
+    walk_rows(file, page_size, 2, f_descs, |vals| {
+        let Some(fname) = text(vals.get(fname_f)) else { return };
+        let Some((col, _)) = members.iter().find(|(_, s)| *s == fname) else {
+            return;
+        };
+        if let Some(Value::Blob(r, n)) = vals.get(cblr_f) {
+            blobs.push((col.clone(), *r, *n));
+        }
+    });
+    blobs
+        .into_iter()
+        .map(|(col, r, n)| {
+            let names = crate::format::read_blob_content(file, page_size, r, n)
+                .and_then(|b| crate::expr::field_names_of_blr(&b));
+            (col, names)
+        })
+        .collect()
+}
+
 /// Locate a system relation's primary row whose decoded values satisfy
 /// `pred`: its data page and slot. For an in-place catalog update or
 /// delete (ALTER).
@@ -1414,8 +1487,39 @@ pub fn alter_table_drop_column(
         .find(|c| c.name.eq_ignore_ascii_case(&col_up))
         .ok_or_else(|| format!("column {} not found", col_name))?;
     let drop_fid = target.field_id as usize;
-    if cols.len() <= 1 {
-        return Err("cannot drop the only column of a table".into());
+    let cur_formats = crate::relation_formats(file, page_size, rel);
+    let (_, cur_descs) = cur_formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .ok_or("relation has no format")?;
+    let is_computed =
+        |fid: usize| matches!(cur_descs.get(fid), Some(d) if d.offset == 0 && d.length != 0);
+    // the engine refuses a drop that leaves no STORED column - "can't
+    // have relation with only computed fields or constraints" (probed;
+    // subsumes the old only-column check)
+    let stored_left = cols
+        .iter()
+        .filter(|c| c.field_id as usize != drop_fid && !is_computed(c.field_id as usize))
+        .count();
+    if stored_left == 0 {
+        return Err("cannot drop: a table cannot have only computed fields".into());
+    }
+    // a stored column some computed expression references cannot go -
+    // the engine counts dependencies and refuses (probed). An expression
+    // whose BLR this writer cannot read is assumed to reference anything.
+    if !is_computed(drop_fid) {
+        for (cname, deps) in computed_dependencies(file, page_size, &table) {
+            let depends = match deps {
+                None => true,
+                Some(names) => names.iter().any(|n| n.eq_ignore_ascii_case(&col_up)),
+            };
+            if depends {
+                return Err(format!(
+                    "cannot drop {}: computed column {} depends on it",
+                    col_name, cname
+                ));
+            }
+        }
     }
     // an indexed/key column would leave a dangling index - reject it
     if let Some(irt) = find_index_root(file, page_size, rel) {
@@ -1463,18 +1567,17 @@ pub fn alter_table_drop_column(
     }
 
     // the new format version: existing descriptors, the dropped field
-    // replaced by a zero-length placeholder, the rest repacked
-    let cur_formats = crate::relation_formats(file, page_size, rel);
-    let (_, cur_descs) = cur_formats
-        .iter()
-        .max_by_key(|(n, _)| *n)
-        .ok_or("relation has no format")?;
-    if has_computed_field(cur_descs) {
-        return Err(format!("table {} has a computed column - not alterable yet", table));
-    }
-    let mut fields = descs_to_fields(cur_descs);
-    fields[drop_fid] = (0, 0, 0, 0); // dropped-field placeholder
-    let mut new_descs = compute_format(&fields);
+    // replaced by a zero-length placeholder, the rest repacked. A
+    // surviving COMPUTED field keeps its offset-0 descriptor (the walk
+    // skips it); dropping the computed field itself leaves the same
+    // all-zero placeholder a stored field would.
+    let mut fields: Vec<(u8, u16, i8, i16, bool)> = descs_to_fields(cur_descs)
+        .into_iter()
+        .zip(cur_descs.iter())
+        .map(|((dt, l, s, st), d)| (dt, l, s, st, d.offset == 0 && d.length != 0))
+        .collect();
+    fields[drop_fid] = (0, 0, 0, 0, false); // dropped-field placeholder
+    let mut new_descs = compute_format_mixed(&fields);
     // the placeholder itself is all-zero at offset 0 (dfw.epp), matching
     // the engine's format blob for a dropped field
     new_descs[drop_fid] = Descriptor {
@@ -1485,6 +1588,14 @@ pub fn alter_table_drop_column(
         flags: 0,
         offset: 0,
     };
+    // ... except at the TAIL: the engine truncates trailing dropped
+    // placeholders from the new format (probed: dropping the LAST field
+    // shrinks the descriptor count; only a mid-table hole keeps its
+    // placeholder). RDB$RELATIONS.RDB$FIELD_ID - the next-id counter -
+    // stays where it was either way.
+    while matches!(new_descs.last(), Some(d) if d.dtype == 0 && d.length == 0) {
+        new_descs.pop();
+    }
 
     // current format number, for the bump
     let (rel_page, rel_slot, mut rel_image, rec_format) =
@@ -1632,13 +1743,24 @@ pub fn alter_table_alter_column_type(
         ));
     }
 
-    // the new format: the target field's descriptor replaced, all repacked
-    if has_computed_field(cur_descs) {
-        return Err(format!("table {} has a computed column - not alterable yet", table));
+    // a computed column's type is its expression's - "cannot add or
+    // remove COMPUTED from column" (probed refusal). Retyping a STORED
+    // column is allowed even when a computed expression references it:
+    // the engine keeps the computed column's declared type UNCHANGED
+    // (probed: A INTEGER -> BIGINT leaves C COMPUTED BY (A) a LONG).
+    if matches!(cur_descs.get(fid), Some(d) if d.offset == 0 && d.length != 0) {
+        return Err(format!("cannot change the type of computed column {}", col_up));
     }
-    let mut fields = descs_to_fields(cur_descs);
-    fields[fid] = col_field(new_col.dtype, new_col.length, new_col.scale, new_col.sub_type);
-    let new_descs = compute_format(&fields);
+    // the new format: the target field's descriptor replaced, all
+    // repacked; a COMPUTED field keeps its offset-0 descriptor
+    let mut fields: Vec<(u8, u16, i8, i16, bool)> = descs_to_fields(cur_descs)
+        .into_iter()
+        .zip(cur_descs.iter())
+        .map(|((dt, l, s, st), d)| (dt, l, s, st, d.offset == 0 && d.length != 0))
+        .collect();
+    let (dt, l, s, st) = col_field(new_col.dtype, new_col.length, new_col.scale, new_col.sub_type);
+    fields[fid] = (dt, l, s, st, false);
+    let new_descs = compute_format_mixed(&fields);
 
     // the column's domain (RDB$FIELD_SOURCE) - retyped in place
     let rf_formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")
