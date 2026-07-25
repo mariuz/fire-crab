@@ -3616,6 +3616,32 @@ on a non-identity column on both, has the engine take the restarted value on the
 next insert (`ID` = 100), then compares a bare `RESTART` (stored back to
 `start - increment`), and runs a `gbak` round trip plus `gfix`.
 
+### The hundredth differential — an identity that survives ALTER
+
+This is the third time the same lesson has surfaced, and it is worth naming as a
+law: **anything the engine reads from `RDB$RUNTIME` must be regenerated every time
+the runtime is, not just written once.** Foreign-key triggers taught it, column
+defaults taught it again, and now identity columns. `ALTER TABLE` rebuilds a
+relation's runtime from its fields, and the first rebuild emitted id, name,
+source, length, position, not-null and default — but not the identity's generator
+name (tag 22) or type (tag 23). So adding any column to a table with an identity
+stripped the identity from the summary the engine draws next values from: the
+catalog still held `RDB$GENERATOR_NAME`, but the runtime no longer named it, and
+the next insert failed on the not-null the rebuild *did* keep. A feature that
+worked at `CREATE` decayed at the next `ALTER`, exactly as the default once did.
+
+The fix is the same shape as before: have the rebuild read each field's
+`RDB$IDENTITY_TYPE` and `RDB$GENERATOR_NAME` back and re-emit the two segments
+where `CREATE` puts them.
+
+`qa/serve-real-identityalter.sh` (8 checks) has fire-crab and the engine each
+create an identity table (with a non-default `START WITH`/`INCREMENT BY`) and
+`ALTER TABLE ADD` a column, on two copies; it compares the rebuilt `RDB$RUNTIME`
+byte for byte (the identity segments survive), inserts two rows and confirms the
+identity still auto-generates (5, then 7), and runs a `gbak` round trip plus
+`gfix`. Teeth: a rebuild that forgets the identity matches on every other field
+attribute while the post-`ALTER` insert fails.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest

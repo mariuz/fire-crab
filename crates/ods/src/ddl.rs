@@ -534,6 +534,8 @@ fn rebuild_runtime_blob(
     let pos_fid = fid_of("RDB$FIELD_POSITION").ok_or("no RDB$FIELD_POSITION")?;
     let null_fid = fid_of("RDB$NULL_FLAG");
     let default_fid = fid_of("RDB$DEFAULT_VALUE");
+    let gen_fid = fid_of("RDB$GENERATOR_NAME");
+    let idt_fid = fid_of("RDB$IDENTITY_TYPE");
 
     // collect (field_id, name, source, position, not_null), by field id
     let text = |v: Option<&Value>| match v {
@@ -545,7 +547,15 @@ fn rebuild_runtime_blob(
         _ => None,
     };
     #[allow(clippy::type_complexity)]
-    let mut fields: Vec<(u16, String, String, u16, bool, Option<(u16, u64)>)> = Vec::new();
+    let mut fields: Vec<(
+        u16,
+        String,
+        String,
+        u16,
+        bool,
+        Option<(u16, u64)>,
+        Option<(String, i16)>,
+    )> = Vec::new();
     walk_rows(file, page_size, 5, rf_descs, |vals| {
         if text(vals.get(rel_fid)).as_deref() != Some(table) {
             return;
@@ -564,7 +574,13 @@ fn rebuild_runtime_blob(
             Some(Value::Blob(r, n)) => Some((*r, *n)),
             _ => None,
         });
-        fields.push((id as u16, name, src, pos as u16, not_null, default));
+        // an identity column's generator name and type, to re-emit (tags 22/23)
+        let identity = idt_fid.and_then(|f| int(vals.get(f))).and_then(|t| {
+            gen_fid
+                .and_then(|g| text(vals.get(g)))
+                .map(|g| (g, t as i16))
+        });
+        fields.push((id as u16, name, src, pos as u16, not_null, default, identity));
     });
     fields.sort_by_key(|f| f.0);
 
@@ -575,7 +591,7 @@ fn rebuild_runtime_blob(
         s
     };
     let mut runtime: Vec<Vec<u8>> = Vec::new();
-    for (id, name, src, pos, not_null, default) in &fields {
+    for (id, name, src, pos, not_null, default, identity) in &fields {
         let d = descs.get(*id as usize).ok_or("field beyond format")?;
         runtime.push(seg(0, &id.to_le_bytes())); // RSR_field_id
         runtime.push(seg(1, name.as_bytes())); // RSR_field_name
@@ -602,6 +618,12 @@ fn rebuild_runtime_blob(
         }
         if *not_null {
             runtime.push(seg(21, &NONNULL_BLR)); // RSR_field_not_null
+        }
+        // re-emit an identity field's generator (22) and type (23) so an ALTER
+        // does not strip it - without them the column stops auto-generating
+        if let Some((gen_name, itype)) = identity {
+            runtime.push(seg(22, gen_name.as_bytes()));
+            runtime.push(seg(23, &(*itype as u16).to_le_bytes()));
         }
     }
     // the relation's triggers (RSR_trigger_name = 9): the engine loads a
