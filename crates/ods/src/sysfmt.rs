@@ -138,14 +138,38 @@ fn met_align(dt: u8, dsc_length: u16, offset: u32) -> u32 {
 /// VARYING lengths grow by the 2-byte count word here, exactly where
 /// ini.epp does it.
 pub fn compute_format(fields: &[(u8, u16, i8, i16)]) -> Vec<Descriptor> {
+    let mixed: Vec<(u8, u16, i8, i16, bool)> =
+        fields.iter().map(|&(d, l, s, st)| (d, l, s, st, false)).collect();
+    compute_format_mixed(&mixed)
+}
+
+/// [compute_format] for a field list that may contain COMPUTED fields
+/// (the trailing bool). A computed field gets a full descriptor - its
+/// expression's result type - but no storage: its offset is 0 and the
+/// walk does not advance past it. It still counts toward the null-flag
+/// bytes (probed: a 2-stored + 1-computed table starts its first stored
+/// field at offset 4, the flag bytes of THREE fields, and the computed
+/// descriptor reads `dtype 19, length 8, offset 0`).
+pub fn compute_format_mixed(fields: &[(u8, u16, i8, i16, bool)]) -> Vec<Descriptor> {
     let mut offset = flag_bytes(fields.len()) as u32;
     let mut out = Vec::with_capacity(fields.len());
-    for &(dt, gfld_length, scale, sub_type) in fields {
+    for &(dt, gfld_length, scale, sub_type, computed) in fields {
         let dsc_length = if dt == dtype::VARYING {
             gfld_length + 2
         } else {
             gfld_length
         };
+        if computed {
+            out.push(Descriptor {
+                dtype: dt,
+                scale,
+                length: dsc_length,
+                sub_type,
+                flags: 0,
+                offset: 0,
+            });
+            continue;
+        }
         offset = met_align(dt, dsc_length, offset);
         out.push(Descriptor {
             dtype: dt,
@@ -352,6 +376,42 @@ mod tests {
         let descs = compute_format(&fields);
         assert_eq!(descs[3].offset, 32);
         assert_eq!(descs[8].offset, 42);
+    }
+
+    /// Golden offsets from engine-created tables with computed columns
+    /// (probed via RDB$FORMATS.RDB$DESCRIPTOR): `(A INTEGER, B INTEGER,
+    /// C COMPUTED BY (A+B))` lays out LONG@4, LONG@8, INT64@0; a computed
+    /// column in the MIDDLE - `(A INTEGER, C COMPUTED BY (A+1), B BIGINT)`
+    /// - does not disturb the stored walk: LONG@4, INT64@0, INT64@8.
+    #[test]
+    fn computed_fields_get_descriptors_but_no_storage() {
+        let tc = compute_format_mixed(&[
+            (dtype::LONG, 4, 0, 0, false),
+            (dtype::LONG, 4, 0, 0, false),
+            (dtype::INT64, 8, 0, 0, true),
+        ]);
+        assert_eq!(
+            tc.iter().map(|d| (d.dtype, d.length, d.offset)).collect::<Vec<_>>(),
+            vec![(dtype::LONG, 4, 4), (dtype::LONG, 4, 8), (dtype::INT64, 8, 0)]
+        );
+        let tf = compute_format_mixed(&[
+            (dtype::LONG, 4, 0, 0, false),
+            (dtype::INT64, 8, 0, 0, true),
+            (dtype::INT64, 8, 0, 0, false),
+        ]);
+        assert_eq!(
+            tf.iter().map(|d| (d.dtype, d.length, d.offset)).collect::<Vec<_>>(),
+            vec![(dtype::LONG, 4, 4), (dtype::INT64, 8, 0), (dtype::INT64, 8, 8)]
+        );
+        // a computed SMALLINT passthrough: descriptor SHORT/2 at offset 0
+        let td = compute_format_mixed(&[
+            (dtype::SHORT, 2, 0, 0, false),
+            (dtype::SHORT, 2, 0, 0, true),
+        ]);
+        assert_eq!(
+            td.iter().map(|d| (d.dtype, d.length, d.offset)).collect::<Vec<_>>(),
+            vec![(dtype::SHORT, 2, 4), (dtype::SHORT, 2, 0)]
+        );
     }
 
     #[test]

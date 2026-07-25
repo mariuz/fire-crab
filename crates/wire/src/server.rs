@@ -1306,6 +1306,97 @@ fn not_null_fids(db: &Database, table: &str) -> Vec<usize> {
     out
 }
 
+/// Whether a table column is COMPUTED: its descriptor sits at offset 0
+/// with a real type. No stored field can live at offset 0 (the null
+/// flags do), and a DROPPED-field placeholder there is all-zero. A
+/// computed field has no record bytes - any path that would read them
+/// through the descriptor must refuse (or evaluate the expression, as
+/// build_projcols does).
+fn is_computed_fid(descs: &[Descriptor], fid: usize) -> bool {
+    matches!(descs.get(fid), Some(d) if d.offset == 0 && d.length != 0)
+}
+
+/// The COMPUTED columns of a table: field id -> the verbatim
+/// `RDB$COMPUTED_SOURCE` text (`(expr)`), read through
+/// `RDB$RELATION_FIELDS` -> `RDB$FIELDS`. The SELECT path parses each
+/// as the scalar expression it is and evaluates it per fetched row.
+fn computed_sources(db: &Database, table: &str) -> std::collections::HashMap<usize, String> {
+    use fire_crab_ods::format::Value;
+    let mut out = std::collections::HashMap::new();
+    let Some(rf_formats) = fire_crab_ods::sysfmt::system_relation_formats(
+        &db.bytes,
+        db.page_size,
+        "RDB$RELATION_FIELDS",
+    ) else {
+        return out;
+    };
+    let Some((_, rf_descs)) = rf_formats.iter().max_by_key(|(n, _)| *n) else {
+        return out;
+    };
+    let cols = relation_columns(&db.bytes, db.page_size, "RDB$RELATION_FIELDS");
+    let fid_of = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(rel_f), Some(id_f), Some(src_f)) = (
+        fid_of("RDB$RELATION_NAME"),
+        fid_of("RDB$FIELD_ID"),
+        fid_of("RDB$FIELD_SOURCE"),
+    ) else {
+        return out;
+    };
+    // (field id, field source) of the table's columns
+    let mut members: Vec<(usize, String)> = Vec::new();
+    let fmts = vec![(0u8, rf_descs.clone())];
+    for_each_record(db, 5, &fmts, |values| {
+        let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(table));
+        if !is_rel {
+            return;
+        }
+        if let (Some(Value::Int(id)), Some(Value::Text(src))) =
+            (values.get(id_f), values.get(src_f))
+        {
+            members.push((*id as usize, src.trim_end().to_string()));
+        }
+    });
+    if members.is_empty() {
+        return out;
+    }
+    // each source's RDB$COMPUTED_SOURCE blob, if it has one
+    let Some(f_formats) =
+        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes, db.page_size, "RDB$FIELDS")
+    else {
+        return out;
+    };
+    let Some((_, f_descs)) = f_formats.iter().max_by_key(|(n, _)| *n) else {
+        return out;
+    };
+    let fcols = relation_columns(&db.bytes, db.page_size, "RDB$FIELDS");
+    let ffid = |n: &str| fcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(name_f), Some(csrc_f)) = (ffid("RDB$FIELD_NAME"), ffid("RDB$COMPUTED_SOURCE"))
+    else {
+        return out;
+    };
+    let mut blobs: Vec<(usize, u16, u64)> = Vec::new();
+    let fmts2 = vec![(0u8, f_descs.clone())];
+    for_each_record(db, 2, &fmts2, |values| {
+        let Some(Value::Text(fname)) = values.get(name_f) else { return };
+        let fname = fname.trim_end();
+        for (id, src) in &members {
+            if src.eq_ignore_ascii_case(fname) {
+                if let Some(Value::Blob(r, n)) = values.get(csrc_f) {
+                    blobs.push((*id, *r, *n));
+                }
+            }
+        }
+    });
+    for (id, r, n) in blobs {
+        if let Some(bytes) = fire_crab_ods::read_blob_content(&db.bytes, db.page_size, r, n) {
+            if let Ok(text) = String::from_utf8(bytes) {
+                out.insert(id, text);
+            }
+        }
+    }
+    out
+}
+
 /// Build the projected-column list from a select list and the relation's
 /// columns + format descriptors. `*` expands to every column in field-id
 /// (SELECT *) order. Returns None if any named column is unknown or has no
@@ -1347,6 +1438,7 @@ fn build_projcols(
     collist: &[String],
     columns: &[RelationColumn],
     descs: &[Descriptor],
+    computed: &std::collections::HashMap<usize, RawExpr>,
 ) -> Option<Vec<ProjCol>> {
     let selected: Vec<&RelationColumn> = if collist.len() == 1 && collist[0] == "*" {
         columns.iter().collect()
@@ -1360,6 +1452,16 @@ fn build_projcols(
     let mut out = Vec::new();
     for rc in selected {
         let d = descs.get(rc.field_id as usize)?;
+        // a computed column evaluates its stored expression per row,
+        // named after itself; one whose expression is not in the map
+        // (unparsable source) refuses rather than reading garbage
+        if let Some(raw) = computed.get(&(rc.field_id as usize)) {
+            out.push(build_expr_col(raw, &rc.name, columns, descs)?);
+            continue;
+        }
+        if is_computed_fid(descs, rc.field_id as usize) {
+            return None;
+        }
         let (wire, sql_type, length, scale, sub_type) = wire_for(d);
         out.push(ProjCol {
             name: rc.name.clone(),
@@ -1387,6 +1489,131 @@ enum InsVal {
     /// `GenId(name, step)`: `None` step = `NEXT VALUE FOR` (use the
     /// sequence's own increment), `Some(n)` = `GEN_ID(name, n)`.
     GenId(String, Option<i64>),
+}
+
+/// Strip a leading keyword (case-insensitive) from `s`, which must be
+/// followed by whitespace or an opening paren - `COMPUTED(A+B)` is as
+/// valid as `COMPUTED (A+B)`.
+fn strip_kw<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
+    let t = s.trim_start();
+    if t.len() > kw.len()
+        && t[..kw.len()].eq_ignore_ascii_case(kw)
+        && t[kw.len()..].starts_with(|c: char| c.is_whitespace() || c == '(')
+    {
+        Some(&t[kw.len()..])
+    } else {
+        None
+    }
+}
+
+/// A computed-column item of a CREATE TABLE: `<name> COMPUTED [BY]
+/// (<expr>)` or `<name> GENERATED ALWAYS AS (<expr>)` (the same catalog,
+/// probed). Returns the column name and the parenthesised expression
+/// text VERBATIM - the engine stores that text as `RDB$COMPUTED_SOURCE`.
+/// The parens must end the item: a computed column takes no trailing
+/// constraints. None = not a computed item (a plain column parses next;
+/// `GENERATED ALWAYS AS IDENTITY` falls through to the identity path).
+fn parse_computed_item(item: &str) -> Option<(String, String)> {
+    let item = item.trim();
+    let (name, rest) = item.split_once(char::is_whitespace)?;
+    let name = name.trim_matches('"');
+    if !ident_ok(name) {
+        return None;
+    }
+    let tail = if let Some(t) = strip_kw(rest, "COMPUTED") {
+        strip_kw(t, "BY").unwrap_or(t)
+    } else {
+        let t = strip_kw(rest, "GENERATED")?;
+        let t = strip_kw(t, "ALWAYS")?;
+        strip_kw(t, "AS")?
+    };
+    let tail = tail.trim();
+    if !tail.starts_with('(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (i, ch) in tail.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    // the matching close paren must end the item
+                    if i + 1 != tail.len() {
+                        return None;
+                    }
+                    return Some((name.to_ascii_uppercase(), tail.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The exact-integer rank of a computed expression, by the engine's
+/// dialect-3 arithmetic rules (all probed): `+`/`-` of exact ints yield
+/// INT64; `*` and `/` yield INT64 unless either operand is already
+/// INT64 - then INT128, which this server does not write yet (refused);
+/// a bare field keeps its column's type; a bare literal is INTEGER.
+#[derive(Clone, Copy, PartialEq)]
+enum IntRank {
+    Short,
+    Long,
+    Int64,
+}
+
+fn infer_int_rank(
+    e: &fire_crab_ods::expr::Expr,
+    cols: &[fire_crab_ods::ddl::ColumnDef],
+) -> Option<IntRank> {
+    use fire_crab_ods::expr::Expr;
+    use fire_crab_ods::format::dtype;
+    match e {
+        Expr::Field { name, .. } => {
+            let c = cols.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+            // only a plain exact-integer stored column: no domain (its
+            // type is unresolved here), no other computed column, no
+            // NUMERIC scale/sub_type
+            if c.domain.is_some() || c.computed.is_some() || c.scale != 0 || c.sub_type != 0 {
+                return None;
+            }
+            match c.dtype {
+                dtype::SHORT => Some(IntRank::Short),
+                dtype::LONG => Some(IntRank::Long),
+                dtype::INT64 => Some(IntRank::Int64),
+                _ => None,
+            }
+        }
+        Expr::IntLiteral(_) => Some(IntRank::Long),
+        Expr::Add(l, r) | Expr::Subtract(l, r) => {
+            infer_int_rank(l, cols)?;
+            infer_int_rank(r, cols)?;
+            Some(IntRank::Int64)
+        }
+        Expr::Multiply(l, r) | Expr::Divide(l, r) => {
+            let (lr, rr) = (infer_int_rank(l, cols)?, infer_int_rank(r, cols)?);
+            if lr == IntRank::Int64 || rr == IntRank::Int64 {
+                return None; // the engine promotes to INT128 - deferred
+            }
+            Some(IntRank::Int64)
+        }
+    }
+}
+
+/// The catalog type of a computed column: `(RDB$FIELD_TYPE, dsc dtype,
+/// length, RDB$FIELD_PRECISION)` for the expression's result rank.
+/// The precisions are the engine's (probed: SHORT 4, LONG 9, INT64 18).
+fn infer_computed_type(
+    e: &fire_crab_ods::expr::Expr,
+    cols: &[fire_crab_ods::ddl::ColumnDef],
+) -> Option<(i16, u8, u16, i16)> {
+    use fire_crab_ods::format::dtype;
+    Some(match infer_int_rank(e, cols)? {
+        IntRank::Short => (7, dtype::SHORT, 2, 4),
+        IntRank::Long => (8, dtype::LONG, 4, 9),
+        IntRank::Int64 => (16, dtype::INT64, 8, 18),
+    })
 }
 
 /// Parse one column definition of a CREATE TABLE: `<name> <type>`,
@@ -1518,6 +1745,7 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
             default: None,
             domain: None,
             identity: None,
+            computed: None,
         })
     };
     // parenthesised argument(s), if any
@@ -1572,6 +1800,7 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
             default: None,
             domain: Some(dom.to_string()),
             identity: None,
+            computed: None,
         }),
         _ => None,
     };
@@ -1663,6 +1892,7 @@ fn numeric_col(
         default: None,
         domain: None,
         identity: None,
+            computed: None,
     })
 }
 
@@ -1750,6 +1980,8 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     // generated constraint and index names follow
     let mut keys: Vec<fire_crab_ods::ddl::KeyDef> = Vec::new();
     let mut fks: Vec<fire_crab_ods::ddl::ForeignKeyDef> = Vec::new();
+    // computed columns: (index into cols, verbatim `(expr)` source text)
+    let mut computed_items: Vec<(usize, String)> = Vec::new();
     for item in items {
         let up_item = item.trim().to_ascii_uppercase();
         // a [CONSTRAINT <name>] FOREIGN KEY (cols) REFERENCES t [(refcols)]
@@ -1764,6 +1996,33 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             keys.push(key);
             continue;
         }
+        // a COMPUTED BY column: pushed as a placeholder now (so it keeps
+        // its declaration-order field id/position); its result type is
+        // inferred below, once every stored column's type is known -
+        // the expression may reference columns declared after it
+        if let Some((cname, src)) = parse_computed_item(item) {
+            computed_items.push((cols.len(), src.clone()));
+            cols.push(fire_crab_ods::ddl::ColumnDef {
+                name: cname,
+                field_type: 0,
+                dtype: 0,
+                length: 0,
+                scale: 0,
+                sub_type: 0,
+                char_len: None,
+                not_null: false,
+                not_null_constraint: false,
+                default: None,
+                domain: None,
+                identity: None,
+                computed: Some(fire_crab_ods::ddl::ComputedCol {
+                    source: src,
+                    blr: Vec::new(),
+                    precision: 0,
+                }),
+            });
+            continue;
+        }
         let (col, col_key) = parse_column_def(item)?;
         if let Some((kname, primary)) = col_key {
             keys.push(fire_crab_ods::ddl::KeyDef {
@@ -1773,6 +2032,23 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             });
         }
         cols.push(col);
+    }
+    // infer each computed column's result type, now that every stored
+    // column's type is known. An expression that cannot be compiled or
+    // typed faithfully (a non-integer operand, an INT128 result) refuses
+    // the whole statement - the client gets an error, never a wrong type.
+    for (idx, src) in &computed_items {
+        let expr = parse_expr(src)?;
+        let (field_type, dt, length, precision) = infer_computed_type(&expr, &cols)?;
+        let c = &mut cols[*idx];
+        c.field_type = field_type;
+        c.dtype = dt;
+        c.length = length;
+        c.computed = Some(fire_crab_ods::ddl::ComputedCol {
+            source: src.clone(),
+            blr: expr.to_blr(),
+            precision,
+        });
     }
     // resolve the key columns and apply the PRIMARY KEY's implied NOT
     // NULL. A table-level PRIMARY KEY sets its columns' NULL_FLAG but
@@ -1788,8 +2064,23 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         }
         for n in &k.columns {
             let i = cols.iter().position(|c| c.name.eq_ignore_ascii_case(n))?;
+            // a computed column has no stored bytes to key on
+            if cols[i].computed.is_some() {
+                return None;
+            }
             if k.primary {
                 cols[i].not_null = true;
+            }
+        }
+    }
+    // nor can a FOREIGN KEY reference through one
+    for fk in &fks {
+        for n in &fk.columns {
+            if cols
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(n) && c.computed.is_some())
+            {
+                return None;
             }
         }
     }
@@ -3572,12 +3863,22 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         Some(names) => {
             let mut v = Vec::new();
             for n in names {
-                v.push(columns.iter().find(|c| c.name.eq_ignore_ascii_case(n))?);
+                let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(n))?;
+                // a computed column is read-only (the engine errors:
+                // "attempted update of read-only column") - refuse
+                if is_computed_fid(descs, rc.field_id as usize) {
+                    return None;
+                }
+                v.push(rc);
             }
             v
         }
-        // no column list = every column, declared order
-        None => columns.iter().collect(),
+        // no column list = every column, declared order - MINUS computed
+        // columns, which the engine's implicit list excludes too
+        None => columns
+            .iter()
+            .filter(|c| !is_computed_fid(descs, c.field_id as usize))
+            .collect(),
     };
     if targets.len() != vals.len() {
         return None;
@@ -3644,12 +3945,16 @@ fn build_insert_image(
     rel: u16,
     format_no: u8,
 ) -> Option<Vec<u8>> {
-    let computed = descs
+    // record length = the end of the last stored field; a COMPUTED
+    // field's descriptor (offset 0, no storage) must not count or it
+    // would inflate a fresh table's images past the engine's layout
+    let stored_end = descs
         .iter()
+        .filter(|d| !(d.offset == 0 && d.length != 0))
         .map(|d| d.offset as usize + d.length as usize)
         .max()?;
-    let len = sample_image_len(db, rel, format_no).unwrap_or((computed + 3) & !3);
-    if len < computed {
+    let len = sample_image_len(db, rel, format_no).unwrap_or((stored_end + 3) & !3);
+    if len < stored_end {
         return None;
     }
     let mut image = vec![0u8; len];
@@ -4069,6 +4374,11 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         let fid = rc.field_id as usize;
         if sets.iter().any(|(f, _)| *f == fid) {
             return None; // the same column set twice is invalid SQL
+        }
+        // a computed column is read-only - refuse rather than write
+        // into the null-flag area its offset-0 descriptor points at
+        if is_computed_fid(descs, fid) {
+            return None;
         }
         let d = descs.get(fid)?;
         let sv = match v {
@@ -4906,6 +5216,10 @@ fn resolve_join_col<'a>(
     let (qual, col) = split_qual(name);
     let hit = |side: &'a JoinSide| -> Option<(usize, &'a Descriptor, &'a str)> {
         let rc = side.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col))?;
+        // a computed column has no record bytes in the joined row
+        if is_computed_fid(&side.descs, rc.field_id as usize) {
+            return None;
+        }
         let d = side.descs.get(rc.field_id as usize)?;
         Some((side.offset + rc.field_id as usize, d, rc.name.as_str()))
     };
@@ -5046,6 +5360,11 @@ fn plan_join(
             // all left columns then all right, each in declared order
             for side in &sides {
                 for rc in &side.columns {
+                    // a computed column would need per-side expression
+                    // evaluation the join path does not do - refuse
+                    if is_computed_fid(&side.descs, rc.field_id as usize) {
+                        return None;
+                    }
                     let d = side.descs.get(rc.field_id as usize)?;
                     let (wire, sql_type, length, scale, sub_type) = wire_for(d);
                     cols.push(ProjCol {
@@ -5256,6 +5575,19 @@ fn plan_query_inner(
         .max_by_key(|(n, _)| *n)
         .map(|(_, d)| d.clone())
         .unwrap_or_default();
+    // computed columns, parsed from their stored `(expr)` source - the
+    // same scalar-expression surface a select list already evaluates.
+    // Any computed column NOT in this map (an expression this server
+    // cannot parse) makes every reference to it refuse.
+    let computed: std::collections::HashMap<usize, RawExpr> =
+        if fire_crab_ods::ddl::has_computed_field(&descs) {
+            computed_sources(db, table)
+                .into_iter()
+                .filter_map(|(fid, src)| parse_raw_expr(&src).map(|r| (fid, r)))
+                .collect()
+        } else {
+            Default::default()
+        };
 
     // parse + resolve the optional WHERE clause
     let mut next_param = 0usize;
@@ -5281,7 +5613,7 @@ fn plan_query_inner(
             if group_s.is_some() || having_s.is_some() {
                 return None;
             }
-            let cols = build_projcols(&["*".to_string()], &columns, &descs)?;
+            let cols = build_projcols(&["*".to_string()], &columns, &descs, &computed)?;
             let order_by = match order_s {
                 None => Vec::new(),
                 Some(os) => parse_order_by(os, &cols, |n| {
@@ -5289,6 +5621,7 @@ fn plan_query_inner(
                         .iter()
                         .find(|c| c.name.eq_ignore_ascii_case(n))
                         .map(|c| c.field_id as usize)
+                        .filter(|fid| !is_computed_fid(&descs, *fid))
                 })?,
             };
             return Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols: Vec::new() });
@@ -5344,7 +5677,7 @@ fn plan_query_inner(
             for it in &items {
                 match it {
                     SelItem::Col(name) => {
-                        let one = build_projcols(&[name.clone()], &columns, &descs)?;
+                        let one = build_projcols(&[name.clone()], &columns, &descs, &computed)?;
                         out.push(one.into_iter().next()?);
                     }
                     SelItem::Expr(e, alias) => {
@@ -5379,7 +5712,7 @@ fn plan_query_inner(
                     _ => unreachable!(),
                 })
                 .collect();
-            build_projcols(&collist, &columns, &descs)?
+            build_projcols(&collist, &columns, &descs, &computed)?
         };
         if cols.is_empty() {
             return None;
@@ -5392,6 +5725,7 @@ fn plan_query_inner(
                         .iter()
                         .find(|c| c.name.eq_ignore_ascii_case(n))
                         .map(|c| c.field_id as usize)
+                        .filter(|fid| !is_computed_fid(&descs, *fid))
                 }) {
                     Some(keys) => keys,
                     None => {
@@ -5444,7 +5778,7 @@ fn plan_group(
     }
     let key_fids = match group_s {
         None => Vec::new(),
-        Some(g) => parse_group_by(g, items, columns)?,
+        Some(g) => parse_group_by(g, items, columns, descs)?,
     };
     let mut gitems = Vec::new();
     let mut cols = Vec::new();
@@ -5455,6 +5789,10 @@ fn plan_group(
             SelItem::Col(name) => {
                 let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
                 let fid = rc.field_id as usize;
+                // a computed column has no record bytes to group over
+                if is_computed_fid(descs, fid) {
+                    return None;
+                }
                 if !key_fids.contains(&fid) {
                     return None; // a selected column that is not grouped
                 }
@@ -5477,6 +5815,10 @@ fn plan_group(
                     AggTarget::Col(name) => {
                         let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
                         let fid = rc.field_id as usize;
+                        // no record bytes to aggregate over
+                        if is_computed_fid(descs, fid) {
+                            return None;
+                        }
                         // MIN/MAX/SUM only over integers (COUNT counts any)
                         if !matches!(func, AggFn::Count)
                             && !matches!(col_kind(descs.get(fid)?)?, ColKind::Int)
@@ -5548,6 +5890,7 @@ fn parse_group_by(
     group: &str,
     items: &[SelItem],
     columns: &[RelationColumn],
+    descs: &[Descriptor],
 ) -> Option<Vec<usize>> {
     let mut fids = Vec::new();
     for part in group.split(',') {
@@ -5569,6 +5912,10 @@ fn parse_group_by(
         let rc = columns
             .iter()
             .find(|c| c.name.eq_ignore_ascii_case(col_name))?;
+        // a computed column has no record bytes to bucket rows by
+        if is_computed_fid(descs, rc.field_id as usize) {
+            return None;
+        }
         fids.push(rc.field_id as usize);
     }
     if fids.is_empty() {
@@ -5621,6 +5968,10 @@ fn aggregate(
     };
     let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
     let fid = rc.field_id as usize;
+    // a computed column has no record bytes to aggregate over
+    if is_computed_fid(descs, fid) {
+        return None;
+    }
 
     // COUNT(col) counts non-null values; MIN/MAX/SUM need an integer column
     if matches!(func, AggFn::Count) {
@@ -7126,6 +7477,10 @@ fn resolve_expr(
         RawExpr::Col(name) => {
             let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
             let fid = rc.field_id as usize;
+            // a computed column has no record bytes to evaluate from
+            if is_computed_fid(descs, fid) {
+                return None;
+            }
             let d = descs.get(fid)?;
             // an int, text, or scaled-numeric column (numerics are only
             // usable as CAST/concat operands; type_of/eval enforce that)
@@ -8376,6 +8731,10 @@ fn resolve_predicate(
             };
             let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(col))?;
             let fid = rc.field_id as usize;
+            // a computed column has no record bytes for the filter to read
+            if is_computed_fid(descs, fid) {
+                return None;
+            }
             let d = descs.get(fid)?;
             let kind = col_kind(d)?;
             terms.push(param_or_typed_term(fid, kind, rt.kind, d, params)?);
@@ -8464,6 +8823,10 @@ fn resolve_having(
                             let rc =
                                 columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
                             let fid = rc.field_id as usize;
+                            // no record bytes to aggregate over
+                            if is_computed_fid(descs, fid) {
+                                return None;
+                            }
                             // MIN/MAX/SUM only over integers (COUNT counts any)
                             if !matches!(func, AggFn::Count)
                                 && !matches!(col_kind(descs.get(fid)?)?, ColKind::Int)
@@ -10494,7 +10857,11 @@ mod tests {
     }
 
     fn desc(dt: u8, len: u16, scale: i8) -> Descriptor {
-        Descriptor { dtype: dt, scale, length: len, sub_type: 0, flags: 0, offset: 0 }
+        // a stored field never sits at offset 0 (the null flags do; offset
+        // 0 with a nonzero length marks a COMPUTED column) - these tests
+        // resolve against already-decoded values, so any stored-looking
+        // offset serves
+        Descriptor { dtype: dt, scale, length: len, sub_type: 0, flags: 0, offset: 4 }
     }
 
     #[test]
@@ -10927,11 +11294,13 @@ mod tests {
             RelationColumn { name: "ID".into(), field_id: 0, position: 0 },
             RelationColumn { name: "DEPT_ID".into(), field_id: 2, position: 1 },
         ];
-        assert_eq!(parse_group_by("DEPT_ID", &items, &columns), Some(vec![2]));
-        assert_eq!(parse_group_by("1", &items, &columns), Some(vec![2])); // ordinal = the Col item
-        assert!(parse_group_by("2", &items, &columns).is_none()); // ordinal names an aggregate
-        assert!(parse_group_by("BOGUS", &items, &columns).is_none()); // unknown column
-        assert!(parse_group_by("", &items, &columns).is_none()); // empty list
+        let d = |offset| Descriptor { dtype: dtype::LONG, scale: 0, length: 4, sub_type: 0, flags: 0, offset };
+        let descs = vec![d(4), d(8), d(12)];
+        assert_eq!(parse_group_by("DEPT_ID", &items, &columns, &descs), Some(vec![2]));
+        assert_eq!(parse_group_by("1", &items, &columns, &descs), Some(vec![2])); // ordinal = the Col item
+        assert!(parse_group_by("2", &items, &columns, &descs).is_none()); // ordinal names an aggregate
+        assert!(parse_group_by("BOGUS", &items, &columns, &descs).is_none()); // unknown column
+        assert!(parse_group_by("", &items, &columns, &descs).is_none()); // empty list
     }
 
     #[test]
@@ -11377,8 +11746,9 @@ mod tests {
             RelationColumn { name: "N".into(), field_id: 3, position: 3 },
             RelationColumn { name: "M".into(), field_id: 4, position: 4 },
         ];
-        let d = |dt| Descriptor { dtype: dt, scale: 0, length: 4, sub_type: 0, flags: 0, offset: 0 };
-        let sc = |s| Descriptor { dtype: dtype::LONG, scale: s, length: 4, sub_type: 0, flags: 0, offset: 0 };
+        // stored-looking offsets: offset 0 with a length marks COMPUTED
+        let d = |dt| Descriptor { dtype: dt, scale: 0, length: 4, sub_type: 0, flags: 0, offset: 4 };
+        let sc = |s| Descriptor { dtype: dtype::LONG, scale: s, length: 4, sub_type: 0, flags: 0, offset: 4 };
         let descs = vec![d(dtype::LONG), d(dtype::LONG), d(dtype::VARYING), sc(-2), sc(-4)];
         let row = vec![
             Value::Int(10), Value::Int(3), Value::Text("x".into()),
@@ -11972,6 +12342,60 @@ mod tests {
             "CREATE TABLE T (A INTEGER PRIMARY KEY, B INTEGER, PRIMARY KEY (B))"
         )
         .is_none());
+    }
+
+    /// Engine-probed golden facts (inc 108): COMPUTED BY columns' result
+    /// types, precisions and BLR from an engine-created database's
+    /// RDB$FIELDS/RDB$COMPUTED_BLR.
+    #[test]
+    fn computed_columns_infer_engine_types_and_compile_blr() {
+        let cols_of = |sql: &str| match plan_create_table(sql) {
+            Some((Plan::CreateTable { cols, .. }, _)) => cols,
+            _ => panic!("expected CreateTable for {}", sql),
+        };
+        // INTEGER + INTEGER -> INT64 (type 16, len 8, precision 18)
+        let cols = cols_of("CREATE TABLE TC (A INTEGER, B INTEGER, C COMPUTED BY (A+B))");
+        let c = &cols[2];
+        assert_eq!((c.field_type, c.dtype, c.length), (16, dtype::INT64, 8));
+        let cp = c.computed.as_ref().unwrap();
+        assert_eq!(cp.precision, 18);
+        assert_eq!(cp.source, "(A+B)"); // verbatim, parens kept
+        assert_eq!(cp.blr, vec![5, 34, 23, 0, 1, 65, 23, 0, 1, 66, 76]);
+        // a bare field reference keeps its column's type, with the real
+        // precision a plain declared column does not get (SHORT -> 4)
+        let cols = cols_of("CREATE TABLE TD (S SMALLINT, D COMPUTED BY (S))");
+        let d = &cols[1];
+        assert_eq!((d.field_type, d.dtype, d.length), (7, dtype::SHORT, 2));
+        let dp = d.computed.as_ref().unwrap();
+        assert_eq!(dp.precision, 4);
+        assert_eq!(dp.blr, vec![5, 23, 0, 1, 83, 76]);
+        // a bare literal is INTEGER (precision 9); * of LONGs is INT64
+        let cols = cols_of("CREATE TABLE TG (A INTEGER, W COMPUTED BY (5), E COMPUTED BY (A*2))");
+        assert_eq!(cols[1].computed.as_ref().unwrap().precision, 9);
+        assert_eq!((cols[1].field_type, cols[1].length), (8, 4));
+        assert_eq!(cols[2].computed.as_ref().unwrap().precision, 18);
+        // GENERATED ALWAYS AS is the same catalog (probed); COMPUTED
+        // may also skip BY. A computed column may reference a column
+        // declared AFTER it (two-phase inference)
+        let cols = cols_of("CREATE TABLE TJ (C GENERATED ALWAYS AS (A+1), A INTEGER)");
+        assert_eq!(cols[0].computed.as_ref().unwrap().source, "(A+1)");
+        assert_eq!(cols[0].field_type, 16);
+        assert!(cols_of("CREATE TABLE TK (A INTEGER, C COMPUTED (A))")[1].computed.is_some());
+        // * or / with an INT64 operand promotes to INT128 - deferred, so
+        // the statement refuses (never a wrong type); + of INT64 is fine
+        assert!(plan_create_table("CREATE TABLE TH (B BIGINT, X COMPUTED BY (B*2))").is_none());
+        assert!(plan_create_table("CREATE TABLE TH (B BIGINT, X COMPUTED BY (B/2))").is_none());
+        assert!(plan_create_table("CREATE TABLE TH (A INTEGER, B INTEGER, X COMPUTED BY ((A+B)*2))").is_none());
+        let cols = cols_of("CREATE TABLE TH (B BIGINT, X COMPUTED BY (B-1))");
+        assert_eq!(cols[1].computed.as_ref().unwrap().precision, 18);
+        // non-integer operands, keys on computed columns, and trailing
+        // constraints all refuse
+        assert!(plan_create_table("CREATE TABLE TT (T VARCHAR(5), X COMPUTED BY (T))").is_none());
+        assert!(plan_create_table("CREATE TABLE TT (A INTEGER, X COMPUTED BY (A), PRIMARY KEY (X))").is_none());
+        assert!(plan_create_table("CREATE TABLE TT (A INTEGER, X COMPUTED BY (A) NOT NULL)").is_none());
+        // GENERATED ALWAYS AS IDENTITY still parses as an identity column
+        let cols = cols_of("CREATE TABLE TI (A INTEGER GENERATED ALWAYS AS IDENTITY)");
+        assert!(cols[0].identity.is_some() && cols[0].computed.is_none());
     }
 
     #[test]

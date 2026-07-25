@@ -46,7 +46,7 @@ use crate::dml;
 use crate::format::{decode_record, flag_bytes, max_recs_per_dp, Value};
 use crate::gen;
 use crate::pointer::relation_data_pages;
-use crate::sysfmt::{compute_format, system_relation_formats};
+use crate::sysfmt::{compute_format, compute_format_mixed, system_relation_formats};
 use crate::{u16_at, u32_at, Descriptor};
 
 /// One column of a CREATE TABLE: its name, the external catalog type
@@ -85,6 +85,22 @@ pub struct ColumnDef {
     /// a `GENERATED ... AS IDENTITY` clause: an implicit generator backs the
     /// column and its next value fills it. `None` for an ordinary column.
     pub identity: Option<IdentityDef>,
+    /// a `COMPUTED BY (<expr>)` column: the expression, compiled. The
+    /// ColumnDef's type fields carry the expression's RESULT type - inferred
+    /// by the caller from the engine's dialect-3 rules, not declared.
+    pub computed: Option<ComputedCol>,
+}
+
+/// The pieces of a `COMPUTED BY (<expr>)` column the catalog stores: the
+/// verbatim parenthesised source text (`RDB$COMPUTED_SOURCE`), the
+/// compiled expression BLR (`RDB$COMPUTED_BLR`), and the result type's
+/// `RDB$FIELD_PRECISION` (the engine writes it for a computed field where
+/// a plain declared column gets 0/NULL: SHORT 4, LONG 9, INT64 18).
+#[derive(Clone)]
+pub struct ComputedCol {
+    pub source: String,
+    pub blr: Vec<u8>,
+    pub precision: i16,
 }
 
 /// A column's `GENERATED {ALWAYS | BY DEFAULT} AS IDENTITY
@@ -465,6 +481,14 @@ fn col_field(dtype: u8, length: u16, scale: i8, sub_type: i16) -> (u8, u16, i8, 
     (dtype, gfld, scale, sub_type)
 }
 
+/// Whether a format contains a COMPUTED field: a descriptor at offset 0
+/// with a real type. No stored field can live at offset 0 (the null
+/// flags do), and a DROPPED-field placeholder there is all-zero - a
+/// nonzero length at offset 0 can only be a computed column.
+pub fn has_computed_field(descs: &[Descriptor]) -> bool {
+    descs.iter().any(|d| d.offset == 0 && d.length != 0)
+}
+
 /// Locate a system relation's primary row whose decoded values satisfy
 /// `pred`: its data page and slot. For an in-place catalog update or
 /// delete (ALTER).
@@ -544,6 +568,15 @@ fn rebuild_runtime_blob(
     descs: &[Descriptor],
 ) -> Result<u64, String> {
     use crate::format::dtype;
+    // a COMPUTED column carries an RSR_computed_blr segment this rebuild
+    // does not re-emit; regenerating the summary without it would silently
+    // stop the column computing. Refuse the ALTER instead.
+    if has_computed_field(descs) {
+        return Err(format!(
+            "table {} has a computed column - not alterable yet",
+            table
+        ));
+    }
     let formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")
         .ok_or("no RDB$RELATION_FIELDS format")?;
     let (_, rf_descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
@@ -720,6 +753,11 @@ pub fn alter_table_add_column(
         .iter()
         .max_by_key(|(n, _)| *n)
         .ok_or("relation has no format")?;
+    // descs_to_fields cannot carry a COMPUTED field (offset 0) through the
+    // recompute - the walk would hand it storage. Refuse the ALTER.
+    if has_computed_field(cur_descs) {
+        return Err(format!("table {} has a computed column - not alterable yet", table));
+    }
     let mut fields = descs_to_fields(cur_descs);
     fields.push(col_field(col.dtype, col.length, col.scale, col.sub_type));
     let new_descs = compute_format(&fields);
@@ -1382,6 +1420,9 @@ pub fn alter_table_drop_column(
         .iter()
         .max_by_key(|(n, _)| *n)
         .ok_or("relation has no format")?;
+    if has_computed_field(cur_descs) {
+        return Err(format!("table {} has a computed column - not alterable yet", table));
+    }
     let mut fields = descs_to_fields(cur_descs);
     fields[drop_fid] = (0, 0, 0, 0); // dropped-field placeholder
     let mut new_descs = compute_format(&fields);
@@ -1543,6 +1584,9 @@ pub fn alter_table_alter_column_type(
     }
 
     // the new format: the target field's descriptor replaced, all repacked
+    if has_computed_field(cur_descs) {
+        return Err(format!("table {} has a computed column - not alterable yet", table));
+    }
     let mut fields = descs_to_fields(cur_descs);
     fields[fid] = col_field(new_col.dtype, new_col.length, new_col.scale, new_col.sub_type);
     let new_descs = compute_format(&fields);
@@ -2253,6 +2297,16 @@ pub fn create_table(
     if cols.is_empty() {
         return Err("a table needs at least one column".into());
     }
+    // a computed column has no storage to constrain, default or generate
+    // into - the parser refuses these combinations; this is the writer's
+    // own line of defence
+    for c in cols {
+        if c.computed.is_some()
+            && (c.not_null || c.default.is_some() || c.identity.is_some() || c.domain.is_some())
+        {
+            return Err(format!("computed column {} cannot carry constraints", c.name));
+        }
+    }
     let name = name.trim().to_ascii_uppercase();
 
     // relation id: one past the highest in RDB$RELATIONS (user ids
@@ -2318,12 +2372,17 @@ pub fn create_table(
     let cols: &[ColumnDef] = &resolved;
 
     // the physical format: field ids in declaration order (probe-pinned),
-    // offsets by the ini.epp walk sysfmt already implements
-    let fields: Vec<(u8, u16, i8, i16)> = cols
+    // offsets by the ini.epp walk sysfmt already implements. A computed
+    // column keeps its declaration-order field id but no storage - its
+    // descriptor carries the result type at offset 0.
+    let fields: Vec<(u8, u16, i8, i16, bool)> = cols
         .iter()
-        .map(|c| col_field(c.dtype, c.length, c.scale, c.sub_type))
+        .map(|c| {
+            let (dt, l, s, st) = col_field(c.dtype, c.length, c.scale, c.sub_type);
+            (dt, l, s, st, c.computed.is_some())
+        })
         .collect();
-    let descs = compute_format(&fields);
+    let descs = compute_format_mixed(&fields);
     if descs.len() != cols.len() {
         return Err("format computation failed".into());
     }
@@ -2371,6 +2430,11 @@ pub fn create_table(
         runtime.push(seg(19, &(catalog_field_length(c) as u16).to_le_bytes()));
         if let Some(cl) = c.char_len {
             runtime.push(seg(26, &cl.to_le_bytes())); // RSR_character_length
+        }
+        // a computed field's expression BLR (RSR_computed_blr = 4) sits
+        // between the length and position segments (probed byte order)
+        if let Some(cp) = &c.computed {
+            runtime.push(seg(4, &cp.blr));
         }
         runtime.push(seg(27, &(i as u16).to_le_bytes())); // RSR_field_pos
         // the field DEFAULT (RSR_default_value = 6): the engine reads a
@@ -2425,6 +2489,24 @@ pub fn create_table(
             vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(cl as i64)));
             vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
         }
+        // a computed field: the verbatim `(expr)` source, the compiled
+        // BLR, and the result type's precision (source before value, the
+        // DEFAULT blob order). The blobs belong to RDB$FIELDS (rel 2)
+        let computed_blobs = match &c.computed {
+            Some(cp) => {
+                let src = dml::insert_blob_cs(
+                    file, page_size, 2, &[cp.source.as_bytes().to_vec()], 1, 4,
+                )?;
+                let blr = dml::insert_blob(file, page_size, 2, &[cp.blr.clone()], 2)?;
+                Some((src, blr, cp.precision))
+            }
+            None => None,
+        };
+        if let Some((src, blr, precision)) = computed_blobs {
+            vals.push(("RDB$COMPUTED_SOURCE", SysVal::B(blob_id_bytes(2, src))));
+            vals.push(("RDB$COMPUTED_BLR", SysVal::B(blob_id_bytes(2, blr))));
+            vals.push(("RDB$FIELD_PRECISION", SysVal::I(precision as i64)));
+        }
         sys_insert(file, page_size, "RDB$FIELDS", 2, &vals)?;
     }
     for (i, c) in cols.iter().enumerate() {
@@ -2434,7 +2516,8 @@ pub fn create_table(
             ("RDB$RELATION_NAME", SysVal::S(&name)),
             ("RDB$FIELD_SOURCE", SysVal::S(source)),
             ("RDB$FIELD_POSITION", SysVal::I(i as i64)),
-            ("RDB$UPDATE_FLAG", SysVal::I(1)),
+            // a computed column is read-only: RDB$UPDATE_FLAG 0 (probed)
+            ("RDB$UPDATE_FLAG", SysVal::I(if c.computed.is_some() { 0 } else { 1 })),
             ("RDB$FIELD_ID", SysVal::I(i as i64)),
             ("RDB$SYSTEM_FLAG", SysVal::I(0)),
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
@@ -3104,6 +3187,11 @@ pub fn alter_index_active(
         let d = descs
             .get(rc.field_id as usize)
             .ok_or("field beyond format")?;
+        // a COMPUTED column has no stored bytes to key on - the build
+        // would index the null-flag area
+        if d.offset == 0 && d.length != 0 {
+            return Err(format!("column {} is computed - not indexable", n));
+        }
         let itype = index_itype(d).ok_or("column type cannot be indexed by this writer")?;
         segs.push((rc.field_id, itype, d.scale));
     }
@@ -4035,6 +4123,11 @@ pub fn create_index(
         let d = descs
             .get(rc.field_id as usize)
             .ok_or("field beyond format")?;
+        // a COMPUTED column has no stored bytes to key on - the build
+        // would index the null-flag area
+        if d.offset == 0 && d.length != 0 {
+            return Err(format!("column {} is computed - not indexable", n));
+        }
         let itype = index_itype(d).ok_or("column type cannot be indexed by this writer")?;
         segs.push((rc.field_id, itype, d.scale));
     }
