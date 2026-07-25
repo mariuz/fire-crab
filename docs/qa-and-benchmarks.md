@@ -3566,6 +3566,37 @@ against the engine, then `gbak` round trips and `gfix` checks the file. Teeth:
 the auto-domains are owned by `SYSDBA` with a NULL security class, the
 `ALTER`-added one included.
 
+### The ninety-eighth differential — IDENTITY columns
+
+An identity column — `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` — is where
+several threads meet: a table, an implicit generator, a security class, and the
+runtime the engine applies defaults from. Creating one writes an `RDB$GENERATORS`
+row named `RDB$<n>` (from a counter over `RDB$GENERATORS`, distinct from the
+auto-domain one) with `RDB$SYSTEM_FLAG` 6, its own `SQL$<n>` security class and
+owner `USAGE` privilege, and its slot primed to `start - increment` — exactly the
+sequence machinery, factored into a shared `write_generator`. The column's
+`RDB$RELATION_FIELDS` row takes `RDB$IDENTITY_TYPE` (0 / 1) and `RDB$GENERATOR_NAME`
+and is implicitly `NOT NULL` (the flag, but no `INTEG` constraint — the not-null
+is intrinsic, not declared). And the relation's `RDB$RUNTIME` carries three more
+segments for the field: the not-null marker, the generator name (tag 22) and the
+identity type (tag 23) — the summary the engine draws the next value from on
+insert. The generator's class is allocated after the table's own, so the
+`SQL$<n>` numbers still match.
+
+The parser had to learn to pull the `GENERATED … AS IDENTITY [(START WITH n
+INCREMENT BY n)]` clause out first, before the `DEFAULT` clause — its `BY DEFAULT`
+must not be mistaken for one — splicing it out while keeping the base type and any
+trailing `PRIMARY KEY`.
+
+`qa/serve-real-identity.sh` (11 checks) creates a table with two identity columns
+(one `ALWAYS` with `START WITH`/`INCREMENT BY`) on two copies and compares every
+`RDB$RELATION_FIELDS` identity attribute, every identity `RDB$GENERATORS` row, the
+`RDB$RUNTIME` byte for byte, and the generators' primed values; confirms no `INTEG`
+row for the implicit not-null; has the engine auto-generate the identities on
+insert (`ID` 1, 2; `C` 100, 105, honouring the increment); and runs a `gbak` round
+trip plus `gfix`. Every table-creating gate still passes — with no identity
+column the paths are unchanged.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
