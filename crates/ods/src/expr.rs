@@ -20,6 +20,21 @@ const BLR_ADD: u8 = 34;
 const BLR_SUBTRACT: u8 = 35;
 const BLR_MULTIPLY: u8 = 36;
 const BLR_DIVIDE: u8 = 37;
+// boolean opcodes, confirmed against RDB$TRIGGER_BLR of engine-created
+// CHECK constraints
+const BLR_BEGIN: u8 = 2;
+const BLR_IF: u8 = 8;
+const BLR_EQL: u8 = 47;
+const BLR_NEQ: u8 = 48;
+const BLR_GTR: u8 = 49;
+const BLR_GEQ: u8 = 50;
+const BLR_LSS: u8 = 51;
+const BLR_LEQ: u8 = 52;
+const BLR_OR: u8 = 57;
+const BLR_AND: u8 = 58;
+const BLR_ABORT: u8 = 128;
+const BLR_GDS_CODE: u8 = 0;
+const BLR_END: u8 = 255;
 
 /// A compiled scalar-expression tree.
 #[derive(Clone, Debug, PartialEq)]
@@ -99,6 +114,151 @@ impl Expr {
             }
         }
     }
+}
+
+/// A comparison operator of a boolean condition.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CmpOp {
+    Eql,
+    Neq,
+    Gtr,
+    Geq,
+    Lss,
+    Leq,
+}
+
+impl CmpOp {
+    fn blr(self) -> u8 {
+        match self {
+            CmpOp::Eql => BLR_EQL,
+            CmpOp::Neq => BLR_NEQ,
+            CmpOp::Gtr => BLR_GTR,
+            CmpOp::Geq => BLR_GEQ,
+            CmpOp::Lss => BLR_LSS,
+            CmpOp::Leq => BLR_LEQ,
+        }
+    }
+    /// The comparison whose result is this one's logical NOT (two-valued;
+    /// an UNKNOWN operand stays UNKNOWN either way, which is exactly why
+    /// the negated form keeps SQL's "NULL passes a CHECK" semantics).
+    pub fn inverted(self) -> CmpOp {
+        match self {
+            CmpOp::Eql => CmpOp::Neq,
+            CmpOp::Neq => CmpOp::Eql,
+            CmpOp::Gtr => CmpOp::Leq,
+            CmpOp::Leq => CmpOp::Gtr,
+            CmpOp::Geq => CmpOp::Lss,
+            CmpOp::Lss => CmpOp::Geq,
+        }
+    }
+}
+
+/// A boolean condition tree - what a CHECK constraint's search condition
+/// compiles from.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Cond {
+    Cmp(CmpOp, Expr, Expr),
+    And(Box<Cond>, Box<Cond>),
+    Or(Box<Cond>, Box<Cond>),
+    Not(Box<Cond>),
+}
+
+impl Cond {
+    /// The logical negation, with every NOT pushed down to the
+    /// comparisons (De Morgan) - the form the ENGINE stores a CHECK
+    /// condition in: the trigger tests "the check FAILED", and an
+    /// engine-written RDB$TRIGGER_BLR carries inverted comparison
+    /// opcodes with no blr_not at all (probed: `CHECK (A = 1 OR
+    /// NOT (A >= 10))` stores `blr_and(blr_neq, blr_geq)`).
+    pub fn negated(&self) -> Cond {
+        match self {
+            Cond::Cmp(op, l, r) => Cond::Cmp(op.inverted(), l.clone(), r.clone()),
+            Cond::And(a, b) => Cond::Or(Box::new(a.negated()), Box::new(b.negated())),
+            Cond::Or(a, b) => Cond::And(Box::new(a.negated()), Box::new(b.negated())),
+            Cond::Not(c) => c.normalized(),
+        }
+    }
+
+    /// The same tree with every NOT pushed down (no Not nodes remain).
+    fn normalized(&self) -> Cond {
+        match self {
+            Cond::Cmp(..) => self.clone(),
+            Cond::And(a, b) => Cond::And(Box::new(a.normalized()), Box::new(b.normalized())),
+            Cond::Or(a, b) => Cond::Or(Box::new(a.normalized()), Box::new(b.normalized())),
+            Cond::Not(c) => c.negated(),
+        }
+    }
+
+    /// Emit this condition's BLR (must be NOT-free - emit after
+    /// [Cond::negated]/normalisation).
+    fn emit(&self, out: &mut Vec<u8>) {
+        match self {
+            Cond::Cmp(op, l, r) => {
+                out.push(op.blr());
+                l.emit(out);
+                r.emit(out);
+            }
+            Cond::And(a, b) => {
+                out.push(BLR_AND);
+                a.emit(out);
+                b.emit(out);
+            }
+            Cond::Or(a, b) => {
+                out.push(BLR_OR);
+                a.emit(out);
+                b.emit(out);
+            }
+            Cond::Not(_) => unreachable!("emit is called on a normalised condition"),
+        }
+    }
+
+    /// Every [Expr] operand of the condition's comparisons, for the
+    /// caller to type-check field references against its columns.
+    pub fn operands(&self) -> Vec<&Expr> {
+        let mut out = Vec::new();
+        self.collect_operands(&mut out);
+        out
+    }
+
+    fn collect_operands<'a>(&'a self, out: &mut Vec<&'a Expr>) {
+        match self {
+            Cond::Cmp(_, l, r) => {
+                out.push(l);
+                out.push(r);
+            }
+            Cond::And(a, b) | Cond::Or(a, b) => {
+                a.collect_operands(out);
+                b.collect_operands(out);
+            }
+            Cond::Not(c) => c.collect_operands(out),
+        }
+    }
+}
+
+/// The BLR of a CHECK constraint's trigger (both the before-insert and
+/// the before-update trigger carry the same one, probed byte-for-byte):
+///
+///   blr_version5, blr_begin,
+///     blr_if, <NEGATED search condition>,
+///       blr_begin, blr_abort, blr_gds_code, 16, "check_constraint",
+///       blr_end,
+///     blr_end,   (no else branch)
+///   blr_end, blr_eoc
+///
+/// i.e. "if the check FAILED, raise check_constraint". The stored
+/// condition is [Cond::negated] - inverted comparisons, no blr_not -
+/// so an UNKNOWN (NULL-operand) check does not raise, SQL's rule.
+pub fn check_trigger_blr(cond: &Cond) -> Vec<u8> {
+    let mut out = vec![BLR_VERSION5, BLR_BEGIN, BLR_IF];
+    cond.negated().emit(&mut out);
+    out.push(BLR_BEGIN);
+    out.push(BLR_ABORT);
+    out.push(BLR_GDS_CODE);
+    let code = b"check_constraint";
+    out.push(code.len() as u8);
+    out.extend_from_slice(code);
+    out.extend_from_slice(&[BLR_END, BLR_END, BLR_END, BLR_EOC]);
+    out
 }
 
 /// The distinct field names a stored computed-column BLR references - the
@@ -186,6 +346,76 @@ mod tests {
     fn field_refs_are_distinct_and_ordered() {
         let e = Expr::Add(f("A"), Box::new(Expr::Multiply(f("A"), f("B"))));
         assert_eq!(e.field_refs(), vec!["A".to_string(), "B".to_string()]);
+    }
+
+    fn nf(n: &str) -> Expr {
+        // a CHECK trigger references its fields in context 1 (NEW)
+        Expr::Field {
+            context: 1,
+            name: n.into(),
+        }
+    }
+
+    /// Golden bytes probed from engine-created CHECK constraints'
+    /// RDB$TRIGGER_BLR (tables CK1..CK4): the stored condition is the
+    /// NEGATION, De Morgan pushed to inverted comparisons, wrapped as
+    /// if-failed-then-abort.
+    #[test]
+    fn check_trigger_blr_matches_engine() {
+        let tail: Vec<u8> = {
+            let mut t = vec![2, 128, 0, 16];
+            t.extend_from_slice(b"check_constraint");
+            t.extend_from_slice(&[255, 255, 255, 76]);
+            t
+        };
+        let blr = |cond_bytes: &[u8]| {
+            let mut b = vec![5, 2, 8];
+            b.extend_from_slice(cond_bytes);
+            b.extend_from_slice(&tail);
+            b
+        };
+        // CHECK (A > 0) -> if A <= 0 (blr_leq 52)
+        assert_eq!(
+            check_trigger_blr(&Cond::Cmp(CmpOp::Gtr, nf("A"), Expr::IntLiteral(0))),
+            blr(&[52, 23, 1, 1, 65, 21, 8, 0, 0, 0, 0, 0])
+        );
+        // CHECK (A < B) -> if A >= B (blr_geq 50)
+        assert_eq!(
+            check_trigger_blr(&Cond::Cmp(CmpOp::Lss, nf("A"), nf("B"))),
+            blr(&[50, 23, 1, 1, 65, 23, 1, 1, 66])
+        );
+        // CHECK (A <> 0 AND A <= 100) -> if A = 0 OR A > 100
+        let c3 = Cond::And(
+            Box::new(Cond::Cmp(CmpOp::Neq, nf("A"), Expr::IntLiteral(0))),
+            Box::new(Cond::Cmp(CmpOp::Leq, nf("A"), Expr::IntLiteral(100))),
+        );
+        assert_eq!(
+            check_trigger_blr(&c3),
+            blr(&[57, 47, 23, 1, 1, 65, 21, 8, 0, 0, 0, 0, 0, 49, 23, 1, 1, 65, 21, 8, 0, 100, 0, 0, 0])
+        );
+        // CHECK (A = 1 OR NOT (A >= 10)) -> if A <> 1 AND A >= 10
+        let c4 = Cond::Or(
+            Box::new(Cond::Cmp(CmpOp::Eql, nf("A"), Expr::IntLiteral(1))),
+            Box::new(Cond::Not(Box::new(Cond::Cmp(
+                CmpOp::Geq,
+                nf("A"),
+                Expr::IntLiteral(10),
+            )))),
+        );
+        assert_eq!(
+            check_trigger_blr(&c4),
+            blr(&[58, 48, 23, 1, 1, 65, 21, 8, 0, 1, 0, 0, 0, 50, 23, 1, 1, 65, 21, 8, 0, 10, 0, 0, 0])
+        );
+        // double negation normalises away
+        let c5 = Cond::Not(Box::new(Cond::Not(Box::new(Cond::Cmp(
+            CmpOp::Gtr,
+            nf("A"),
+            Expr::IntLiteral(0),
+        )))));
+        assert_eq!(
+            check_trigger_blr(&c5),
+            check_trigger_blr(&Cond::Cmp(CmpOp::Gtr, nf("A"), Expr::IntLiteral(0)))
+        );
     }
 
     /// Decoding a compiled expression's BLR must recover exactly the

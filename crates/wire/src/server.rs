@@ -679,8 +679,8 @@ enum Plan {
     CreateTable {
         name: String,
         cols: Vec<fire_crab_ods::ddl::ColumnDef>,
-        /// PRIMARY KEY / UNIQUE constraints, in declaration order
-        keys: Vec<fire_crab_ods::ddl::KeyDef>,
+        /// PRIMARY KEY / UNIQUE / CHECK constraints, in declaration order
+        constraints: Vec<fire_crab_ods::ddl::TableConstraint>,
         fks: Vec<fire_crab_ods::ddl::ForeignKeyDef>,
         /// RDB$RELATION_TYPE: 0 persistent, 4 GTT preserve, 5 GTT delete
         relation_type: i64,
@@ -905,6 +905,9 @@ enum Plan {
         /// field ids under a NOT NULL constraint - checked after
         /// binding, exactly where the engine validates
         not_null: Vec<usize>,
+        /// the table's CHECK constraints as NEGATED predicates - a match
+        /// on the final row is a violation ([check_predicates])
+        checks: Vec<Predicate>,
     },
     /// `UPDATE <t> SET col = <lit|?> [, ...] [WHERE ...]`: literal SET
     /// values are encoded at prepare, parameter ones bind at execute;
@@ -919,6 +922,8 @@ enum Plan {
         filter: Option<Predicate>,
         index_ops: Vec<IndexOp>,
         not_null: Vec<usize>,
+        /// NEGATED check predicates, evaluated on each PATCHED row
+        checks: Vec<Predicate>,
     },
     /// `DELETE FROM <t> [WHERE ...]`: op_execute rewrites each matching
     /// primary record as a deleted stub over its version chain
@@ -1395,6 +1400,79 @@ fn computed_sources(db: &Database, table: &str) -> std::collections::HashMap<usi
         }
     }
     out
+}
+
+/// The CHECK constraints of a table as NEGATED, parameter-free
+/// predicates: each stored `CHECK (<cond>)` source (from the check
+/// triggers' RDB$TRIGGER_SOURCE, system_flag 3) is re-parsed by the
+/// WHERE machinery as `NOT (<cond>)`, so `matches` is TRUE exactly when
+/// a row VIOLATES the check. The parse-time De Morgan keeps SQL's
+/// three-valued rule for free: an UNKNOWN (NULL-operand) check does not
+/// match its negation either, so it passes - the engine's own stored
+/// trigger encodes the same negation. Returns None when the table has a
+/// check this server cannot evaluate (a column-vs-column comparison, an
+/// operator outside the WHERE surface) - DML must then refuse, never
+/// bypass the constraint.
+fn check_predicates(
+    db: &Database,
+    table: &str,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+) -> Option<Vec<Predicate>> {
+    use fire_crab_ods::format::Value;
+    let t_formats =
+        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes, db.page_size, "RDB$TRIGGERS")?;
+    let (_, t_descs) = t_formats.iter().max_by_key(|(n, _)| *n)?;
+    let tcols = relation_columns(&db.bytes, db.page_size, "RDB$TRIGGERS");
+    let tfid = |n: &str| tcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (rel_f, src_f, sys_f) = (
+        tfid("RDB$RELATION_NAME")?,
+        tfid("RDB$TRIGGER_SOURCE")?,
+        tfid("RDB$SYSTEM_FLAG")?,
+    );
+    let trel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, "RDB$TRIGGERS")?;
+    let mut blobs: Vec<(u16, u64)> = Vec::new();
+    let fmts = vec![(0u8, t_descs.clone())];
+    for_each_record(db, trel, &fmts, |values| {
+        let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(table));
+        // fb_sysflag_check_constraint = 3
+        if !is_rel || !matches!(values.get(sys_f), Some(Value::Int(3))) {
+            return;
+        }
+        if let Some(Value::Blob(r, n)) = values.get(src_f) {
+            blobs.push((*r, *n));
+        }
+    });
+    // the two triggers of a pair carry the SAME source - dedup by text
+    let mut sources: Vec<String> = Vec::new();
+    for (r, n) in blobs {
+        let bytes = fire_crab_ods::read_blob_content(&db.bytes, db.page_size, r, n)?;
+        let text = String::from_utf8(bytes).ok()?;
+        if !sources.contains(&text) {
+            sources.push(text);
+        }
+    }
+    let mut out = Vec::new();
+    for src in sources {
+        let t = src.trim_start();
+        if t.len() < 5 || !t[..5].eq_ignore_ascii_case("CHECK") {
+            return None; // a check trigger whose source is not CHECK (...)
+        }
+        let negated = format!("NOT {}", &t[5..]);
+        let toks = tokenize(&negated)?;
+        let mut np = 0usize;
+        let raw = parse_predicate(&toks, &mut np)?;
+        if np != 0 {
+            return None; // a '?' in a stored check cannot happen; refuse
+        }
+        let mut params: Vec<Option<Descriptor>> = Vec::new();
+        let p = resolve_predicate(raw, columns, descs, &mut params)?;
+        if !params.is_empty() {
+            return None;
+        }
+        out.push(p);
+    }
+    Some(out)
 }
 
 /// Build the projected-column list from a select list and the relation's
@@ -1975,12 +2053,17 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     items.push(&body[start..]);
 
     let mut cols: Vec<fire_crab_ods::ddl::ColumnDef> = Vec::new();
-    // key constraints in DECLARATION order - the order the engine's
-    // generated constraint and index names follow
-    let mut keys: Vec<fire_crab_ods::ddl::KeyDef> = Vec::new();
+    // table constraints (keys AND checks) in DECLARATION order - the
+    // order the engine's generated INTEG_<n> names follow (probed: a
+    // CHECK declared between a NOT NULL column and the PRIMARY KEY
+    // numbers between them)
+    let mut constraints: Vec<fire_crab_ods::ddl::TableConstraint> = Vec::new();
     let mut fks: Vec<fire_crab_ods::ddl::ForeignKeyDef> = Vec::new();
     // computed columns: (index into cols, verbatim `(expr)` source text)
     let mut computed_items: Vec<(usize, String)> = Vec::new();
+    // CHECK constraints: (index into constraints, verbatim source) -
+    // compiled below, once every column's type is known
+    let mut check_items: Vec<(usize, String)> = Vec::new();
     for item in items {
         let up_item = item.trim().to_ascii_uppercase();
         // a [CONSTRAINT <name>] FOREIGN KEY (cols) REFERENCES t [(refcols)]
@@ -1992,7 +2075,21 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         }
         // a [CONSTRAINT <name>] PRIMARY KEY|UNIQUE (cols) table-level one
         if let Some(key) = parse_key_clause(&up_item) {
-            keys.push(key);
+            constraints.push(fire_crab_ods::ddl::TableConstraint::Key(key));
+            continue;
+        }
+        // a [CONSTRAINT <name>] CHECK (<condition>), compiled after the
+        // column loop (it may reference columns declared after it)
+        if let Some((cname, source)) = parse_check_clause(item) {
+            check_items.push((constraints.len(), source.clone()));
+            constraints.push(fire_crab_ods::ddl::TableConstraint::Check(
+                fire_crab_ods::ddl::CheckDef {
+                    name: cname,
+                    source,
+                    trigger_blr: Vec::new(),
+                    fields: Vec::new(),
+                },
+            ));
             continue;
         }
         // a COMPUTED BY column: pushed as a placeholder now (so it keeps
@@ -2024,11 +2121,13 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         }
         let (col, col_key) = parse_column_def(item)?;
         if let Some((kname, primary)) = col_key {
-            keys.push(fire_crab_ods::ddl::KeyDef {
-                name: kname,
-                columns: vec![col.name.clone()],
-                primary,
-            });
+            constraints.push(fire_crab_ods::ddl::TableConstraint::Key(
+                fire_crab_ods::ddl::KeyDef {
+                    name: kname,
+                    columns: vec![col.name.clone()],
+                    primary,
+                },
+            ));
         }
         cols.push(col);
     }
@@ -2059,12 +2158,45 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             precision,
         });
     }
+    // compile each CHECK's search condition, every column now typed:
+    // parse, type-check the comparison operands (int surface only),
+    // rewrite field references to context 1 (NEW - the trigger's), and
+    // build the if-failed-raise trigger BLR
+    for (idx, source) in &check_items {
+        let cond = parse_cond(&source["CHECK".len()..])?;
+        let field_rank = |name: &str| {
+            let c = cols.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+            if c.domain.is_some() || c.computed.is_some() || c.scale != 0 || c.sub_type != 0 {
+                return None;
+            }
+            dtype_rank(c.dtype)
+        };
+        let mut fields: Vec<String> = Vec::new();
+        for e in cond.operands() {
+            infer_int_rank(e, &field_rank)?;
+            for f in e.field_refs() {
+                if !fields.iter().any(|n| n == &f) {
+                    fields.push(f);
+                }
+            }
+        }
+        let blr =
+            fire_crab_ods::expr::check_trigger_blr(&cond_with_context(&cond, 1));
+        let fire_crab_ods::ddl::TableConstraint::Check(ck) = &mut constraints[*idx] else {
+            return None;
+        };
+        ck.trigger_blr = blr;
+        ck.fields = fields;
+    }
     // resolve the key columns and apply the PRIMARY KEY's implied NOT
     // NULL. A table-level PRIMARY KEY sets its columns' NULL_FLAG but
     // gets no NOT NULL constraint row - the engine's own shape, so
     // not_null_constraint stays as the column declared it.
     let mut has_pk = false;
-    for k in &keys {
+    for tc in &constraints {
+        let fire_crab_ods::ddl::TableConstraint::Key(k) = tc else {
+            continue;
+        };
         if k.primary {
             if has_pk {
                 return None; // more than one PRIMARY KEY
@@ -2077,7 +2209,15 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             if cols[i].computed.is_some() {
                 return None;
             }
-            if k.primary {
+        }
+    }
+    for tc in &constraints {
+        let fire_crab_ods::ddl::TableConstraint::Key(k) = tc else {
+            continue;
+        };
+        if k.primary {
+            for n in &k.columns {
+                let i = cols.iter().position(|c| c.name.eq_ignore_ascii_case(n))?;
                 cols[i].not_null = true;
             }
         }
@@ -2094,7 +2234,7 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         }
     }
     Some((
-        Plan::CreateTable { name: name.to_ascii_uppercase(), cols, keys, fks, relation_type },
+        Plan::CreateTable { name: name.to_ascii_uppercase(), cols, constraints, fks, relation_type },
         Vec::new(),
     ))
 }
@@ -2517,7 +2657,7 @@ fn parse_default_clause(
     ))
 }
 
-/// A token of a scalar arithmetic expression.
+/// A token of a scalar arithmetic expression or a boolean condition.
 enum ETok {
     Num(i32),
     Id(String),
@@ -2527,6 +2667,9 @@ enum ETok {
     Slash,
     LParen,
     RParen,
+    /// a comparison operator (`= <> < <= > >=`) - only a boolean
+    /// condition accepts these; the arithmetic parsers stop before them
+    Cmp(fire_crab_ods::expr::CmpOp),
 }
 
 /// Tokenise a scalar arithmetic expression: identifiers (field names,
@@ -2549,6 +2692,24 @@ fn tokenize_expr(s: &str) -> Option<Vec<ETok>> {
             b'/' => out.push(ETok::Slash),
             b'(' => out.push(ETok::LParen),
             b')' => out.push(ETok::RParen),
+            b'=' => out.push(ETok::Cmp(fire_crab_ods::expr::CmpOp::Eql)),
+            b'<' => {
+                let (t, adv) = match b.get(i + 1) {
+                    Some(b'=') => (fire_crab_ods::expr::CmpOp::Leq, 1),
+                    Some(b'>') => (fire_crab_ods::expr::CmpOp::Neq, 1),
+                    _ => (fire_crab_ods::expr::CmpOp::Lss, 0),
+                };
+                out.push(ETok::Cmp(t));
+                i += adv;
+            }
+            b'>' => {
+                let (t, adv) = match b.get(i + 1) {
+                    Some(b'=') => (fire_crab_ods::expr::CmpOp::Geq, 1),
+                    _ => (fire_crab_ods::expr::CmpOp::Gtr, 0),
+                };
+                out.push(ETok::Cmp(t));
+                i += adv;
+            }
             b'0'..=b'9' => {
                 let st = i;
                 while i < b.len() && b[i].is_ascii_digit() {
@@ -2598,6 +2759,178 @@ fn parse_expr(s: &str) -> Option<fire_crab_ods::expr::Expr> {
         return None; // trailing tokens
     }
     Some(e)
+}
+
+/// Parse a boolean search condition - a CHECK constraint's body:
+/// arithmetic comparisons (`= <> < <= > >=`) over the scalar-expression
+/// surface, combined with AND/OR/NOT and parentheses. None on anything
+/// else (BETWEEN, IS NULL, strings, ...) so the statement refuses
+/// rather than mis-compiles.
+fn parse_cond(s: &str) -> Option<fire_crab_ods::expr::Cond> {
+    let toks = tokenize_expr(s)?;
+    let mut p = 0;
+    let c = cond_or(&toks, &mut p)?;
+    if p != toks.len() {
+        return None; // trailing tokens
+    }
+    Some(c)
+}
+
+fn cond_or(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Cond> {
+    use fire_crab_ods::expr::Cond;
+    let mut left = cond_and(t, p)?;
+    while matches!(t.get(*p), Some(ETok::Id(w)) if w == "OR") {
+        *p += 1;
+        left = Cond::Or(Box::new(left), Box::new(cond_and(t, p)?));
+    }
+    Some(left)
+}
+
+fn cond_and(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Cond> {
+    use fire_crab_ods::expr::Cond;
+    let mut left = cond_unary(t, p)?;
+    while matches!(t.get(*p), Some(ETok::Id(w)) if w == "AND") {
+        *p += 1;
+        left = Cond::And(Box::new(left), Box::new(cond_unary(t, p)?));
+    }
+    Some(left)
+}
+
+fn cond_unary(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Cond> {
+    use fire_crab_ods::expr::Cond;
+    if matches!(t.get(*p), Some(ETok::Id(w)) if w == "NOT") {
+        *p += 1;
+        return Some(Cond::Not(Box::new(cond_unary(t, p)?)));
+    }
+    // a '(' is ambiguous: an arithmetic group (`(A+1) > 0`) or a nested
+    // condition (`(A > 0)`). Try the comparison first - the arithmetic
+    // parser consumes the parens itself; on failure rewind and take it
+    // as a parenthesised condition.
+    let save = *p;
+    if let Some(c) = cond_cmp(t, p) {
+        return Some(c);
+    }
+    *p = save;
+    if matches!(t.get(*p), Some(ETok::LParen)) {
+        *p += 1;
+        let c = cond_or(t, p)?;
+        if !matches!(t.get(*p), Some(ETok::RParen)) {
+            return None;
+        }
+        *p += 1;
+        return Some(c);
+    }
+    None
+}
+
+fn cond_cmp(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Cond> {
+    use fire_crab_ods::expr::Cond;
+    let l = blr_expr_add(t, p)?;
+    let ETok::Cmp(op) = t.get(*p)? else {
+        return None;
+    };
+    let op = *op;
+    *p += 1;
+    let r = blr_expr_add(t, p)?;
+    Some(Cond::Cmp(op, l, r))
+}
+
+/// Rewrite every field reference of an expression to `context` - a CHECK
+/// trigger references its fields in context 1 (NEW), where the scalar
+/// parser produces context 0 (a computed column's own relation).
+fn expr_with_context(e: &fire_crab_ods::expr::Expr, context: u8) -> fire_crab_ods::expr::Expr {
+    use fire_crab_ods::expr::Expr;
+    match e {
+        Expr::Field { name, .. } => Expr::Field { context, name: name.clone() },
+        Expr::IntLiteral(v) => Expr::IntLiteral(*v),
+        Expr::Add(l, r) => Expr::Add(
+            Box::new(expr_with_context(l, context)),
+            Box::new(expr_with_context(r, context)),
+        ),
+        Expr::Subtract(l, r) => Expr::Subtract(
+            Box::new(expr_with_context(l, context)),
+            Box::new(expr_with_context(r, context)),
+        ),
+        Expr::Multiply(l, r) => Expr::Multiply(
+            Box::new(expr_with_context(l, context)),
+            Box::new(expr_with_context(r, context)),
+        ),
+        Expr::Divide(l, r) => Expr::Divide(
+            Box::new(expr_with_context(l, context)),
+            Box::new(expr_with_context(r, context)),
+        ),
+    }
+}
+
+fn cond_with_context(c: &fire_crab_ods::expr::Cond, context: u8) -> fire_crab_ods::expr::Cond {
+    use fire_crab_ods::expr::Cond;
+    match c {
+        Cond::Cmp(op, l, r) => Cond::Cmp(
+            *op,
+            expr_with_context(l, context),
+            expr_with_context(r, context),
+        ),
+        Cond::And(a, b) => Cond::And(
+            Box::new(cond_with_context(a, context)),
+            Box::new(cond_with_context(b, context)),
+        ),
+        Cond::Or(a, b) => Cond::Or(
+            Box::new(cond_with_context(a, context)),
+            Box::new(cond_with_context(b, context)),
+        ),
+        Cond::Not(inner) => Cond::Not(Box::new(cond_with_context(inner, context))),
+    }
+}
+
+/// Parse one table-level `[CONSTRAINT <name>] CHECK (<condition>)` item
+/// of a CREATE TABLE, in ORIGINAL case. Returns the constraint name
+/// (empty when unnamed) and the source text VERBATIM from the CHECK
+/// keyword through the matching close paren, which must end the item -
+/// exactly what the engine stores as RDB$TRIGGER_SOURCE.
+fn parse_check_clause(item: &str) -> Option<(String, String)> {
+    let item = item.trim();
+    let up = item.to_ascii_uppercase();
+    let (name, at) = if let Some(rest) = up.strip_prefix("CONSTRAINT") {
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let name_start = "CONSTRAINT".len() + (rest.len() - rest.trim_start().len());
+        let rest = &item[name_start..];
+        let end = rest.find(char::is_whitespace)?;
+        let name = rest[..end].trim_matches('"').to_ascii_uppercase();
+        if !ident_ok(&name) {
+            return None;
+        }
+        (name, name_start + end)
+    } else {
+        (String::new(), 0)
+    };
+    let tail = item[at..].trim_start();
+    let tail_up = tail.to_ascii_uppercase();
+    if !tail_up.starts_with("CHECK") {
+        return None;
+    }
+    let after = &tail["CHECK".len()..];
+    if !after.trim_start().starts_with('(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (i, ch) in tail.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    if i + 1 != tail.len() {
+                        return None; // trailing text after the condition
+                    }
+                    return Some((name, tail.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn blr_expr_add(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Expr> {
@@ -3969,6 +4302,9 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         }
     }
     let params: Vec<Descriptor> = params.into_iter().collect::<Option<_>>()?;
+    // the table's CHECK constraints; a check this server cannot
+    // evaluate refuses the whole statement - never bypass
+    let checks = check_predicates(db, table, &columns, descs)?;
     let descs = descs.clone();
     let not_null = not_null_fids(db, table);
     Some((
@@ -3980,6 +4316,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
             index_ops,
             param_fields,
             gen_fields,
+            checks,
             not_null,
         },
         params,
@@ -4461,9 +4798,11 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         ),
     };
     let params: Vec<Descriptor> = params.into_iter().collect::<Option<_>>()?;
+    // the table's CHECK constraints; an unevaluatable one refuses
+    let checks = check_predicates(db, table, &columns, descs)?;
     let format_no = *format_no;
     let not_null = not_null_fids(db, table);
-    Some((Plan::Update { rel, format_no, formats, sets, filter, index_ops, not_null }, params))
+    Some((Plan::Update { rel, format_no, formats, sets, filter, index_ops, not_null, checks }, params))
 }
 
 /// Parse `DELETE FROM <t> [WHERE <pred>]` and resolve it. Same
@@ -4562,13 +4901,13 @@ fn execute_dml(
     let db = database.as_mut().ok_or("no database attached")?;
     let mut work = db.bytes.clone();
     let counts = match plan {
-        Plan::CreateTable { name, cols, keys, fks, relation_type } => {
+        Plan::CreateTable { name, cols, constraints, fks, relation_type } => {
             fire_crab_ods::ddl::create_table(
                 &mut work,
                 db.page_size,
                 name,
                 cols,
-                keys,
+                constraints,
                 fks,
                 *relation_type,
             )?;
@@ -4833,7 +5172,7 @@ fn execute_dml(
             )?;
             (0, 0, 0)
         }
-        Plan::Insert { rel, format_no, image, descs, index_ops, param_fields, gen_fields, not_null } => {
+        Plan::Insert { rel, format_no, image, descs, index_ops, param_fields, gen_fields, not_null, checks } => {
             let mut image = image.clone();
             for (fid, slot) in param_fields {
                 let d = descs.get(*fid).ok_or("field beyond format")?;
@@ -4875,6 +5214,15 @@ fn execute_dml(
                     return Err("validation error: NOT NULL column is NULL".into());
                 }
             }
+            // CHECK constraints, where the engine's triggers fire: the
+            // stored predicate is the NEGATED condition, so a match is a
+            // violation; an UNKNOWN (NULL-operand) check passes
+            if !checks.is_empty() {
+                let values = decode_record(&image, descs);
+                if checks.iter().any(|c| c.matches(&values)) {
+                    return Err("Operation violates CHECK constraint".into());
+                }
+            }
             let image = &image;
             let out =
                 fire_crab_ods::insert_record(&mut work, db.page_size, *rel, *format_no, image)?;
@@ -4895,7 +5243,7 @@ fn execute_dml(
             }
             (1, 0, 0)
         }
-        Plan::Update { rel, format_no, formats, sets, filter, index_ops, not_null } => {
+        Plan::Update { rel, format_no, formats, sets, filter, index_ops, not_null, checks } => {
             let descs = formats
                 .iter()
                 .find(|(n, _)| n == format_no)
@@ -4943,6 +5291,14 @@ fn execute_dml(
                 for fid in not_null {
                     if img[fid / 8] & (1 << (fid % 8)) != 0 {
                         return Err("validation error: NOT NULL column is NULL".into());
+                    }
+                }
+                // CHECK constraints on the PATCHED row (negated - a
+                // match is a violation, an UNKNOWN check passes)
+                if !checks.is_empty() {
+                    let new_values = decode_record(&img, descs);
+                    if checks.iter().any(|c| c.matches(&new_values)) {
+                        return Err("Operation violates CHECK constraint".into());
                     }
                 }
                 old_images.push(image);
@@ -12354,7 +12710,14 @@ mod tests {
         .unwrap()
         .0;
         match plan {
-            Plan::CreateTable { cols, keys, .. } => {
+            Plan::CreateTable { cols, constraints, .. } => {
+                let keys: Vec<_> = constraints
+                    .iter()
+                    .filter_map(|tc| match tc {
+                        fire_crab_ods::ddl::TableConstraint::Key(k) => Some(k),
+                        _ => None,
+                    })
+                    .collect();
                 assert_eq!(keys.len(), 2);
                 assert!(!keys[0].primary && keys[0].columns == vec!["B".to_string()]);
                 assert!(keys[1].primary && keys[1].columns == vec!["A".to_string()]);
@@ -12396,6 +12759,49 @@ mod tests {
             "CREATE TABLE T (A INTEGER PRIMARY KEY, B INTEGER, PRIMARY KEY (B))"
         )
         .is_none());
+    }
+
+    /// Engine-probed golden facts (inc 111): a CHECK constraint compiles
+    /// to the if-failed-raise trigger BLR with the NEGATED condition
+    /// (fields in context 1), keeps its verbatim source, and slots into
+    /// the declaration-ordered constraint list.
+    #[test]
+    fn check_constraints_compile_to_engine_trigger_blr() {
+        use fire_crab_ods::ddl::TableConstraint;
+        let plan = |sql: &str| match plan_create_table(sql) {
+            Some((Plan::CreateTable { constraints, .. }, _)) => constraints,
+            _ => panic!("expected CreateTable for {}", sql),
+        };
+        let cs = plan("CREATE TABLE CK1 (A INTEGER, B INTEGER, CHECK (A > 0))");
+        let TableConstraint::Check(ck) = &cs[0] else { panic!("expected Check") };
+        assert_eq!(ck.source, "CHECK (A > 0)");
+        assert_eq!(ck.fields, vec!["A".to_string()]);
+        let mut want = vec![5u8, 2, 8, 52, 23, 1, 1, 65, 21, 8, 0, 0, 0, 0, 0, 2, 128, 0, 16];
+        want.extend_from_slice(b"check_constraint");
+        want.extend_from_slice(&[255, 255, 255, 76]);
+        assert_eq!(ck.trigger_blr, want); // CK1's probed RDB$TRIGGER_BLR
+        // AND/OR/NOT push De Morgan down to inverted comparisons; a
+        // named check keeps its name; declaration order interleaves
+        // checks with keys
+        let cs = plan(
+            "CREATE TABLE CK5 (A INTEGER NOT NULL, B INTEGER, CHECK (B > 0), \
+             PRIMARY KEY (A), CONSTRAINT CHK_HI CHECK (B < 100))",
+        );
+        assert!(matches!(&cs[0], TableConstraint::Check(c) if c.name.is_empty()));
+        assert!(matches!(&cs[1], TableConstraint::Key(k) if k.primary));
+        assert!(matches!(&cs[2], TableConstraint::Check(c) if c.name == "CHK_HI"));
+        // engine-probed: CHECK (A = 1 OR NOT (A >= 10)) stores
+        // blr_and(blr_neq, blr_geq) - no blr_not survives
+        let cs = plan("CREATE TABLE CK4 (A INTEGER, CHECK (A = 1 OR NOT (A >= 10)))");
+        let TableConstraint::Check(ck) = &cs[0] else { panic!("expected Check") };
+        assert_eq!(
+            &ck.trigger_blr[3..8],
+            &[58, 48, 23, 1, 1] // blr_and, blr_neq, blr_field ctx 1 ...
+        );
+        // out-of-surface conditions refuse the whole statement
+        assert!(plan_create_table("CREATE TABLE T (A VARCHAR(5), CHECK (A > 'x'))").is_none());
+        assert!(plan_create_table("CREATE TABLE T (A INTEGER, CHECK (A IS NOT NULL))").is_none());
+        assert!(plan_create_table("CREATE TABLE T (A INTEGER, CHECK (A > 0) NOT NULL)").is_none());
     }
 
     /// Engine-probed golden facts (inc 108): COMPUTED BY columns' result

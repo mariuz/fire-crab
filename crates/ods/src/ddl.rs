@@ -186,6 +186,29 @@ pub struct KeyDef {
     pub primary: bool,
 }
 
+/// One `[CONSTRAINT <name>] CHECK (<condition>)` of a CREATE TABLE: the
+/// verbatim source text from the CHECK keyword on (`RDB$TRIGGER_SOURCE`),
+/// the compiled trigger BLR (the NEGATED condition inside the
+/// if-failed-raise wrapper - [crate::expr::check_trigger_blr]), and the
+/// fields the condition references, first-seen order (the trigger's
+/// `RDB$DEPENDENCIES` rows).
+pub struct CheckDef {
+    /// constraint name, empty when the statement did not name it
+    pub name: String,
+    pub source: String,
+    pub trigger_blr: Vec<u8>,
+    pub fields: Vec<String>,
+}
+
+/// A table-level constraint of a CREATE TABLE, in DECLARATION order -
+/// the order the engine's generated INTEG_<n> names follow (probed: a
+/// CHECK declared between a NOT NULL column and the PRIMARY KEY numbers
+/// between them).
+pub enum TableConstraint {
+    Key(KeyDef),
+    Check(CheckDef),
+}
+
 /// Values a system-catalog row is built from, keyed by column name.
 enum SysVal<'a> {
     I(i64),
@@ -2461,7 +2484,7 @@ pub fn create_table(
     page_size: usize,
     name: &str,
     cols: &[ColumnDef],
-    keys: &[KeyDef],
+    constraints: &[TableConstraint],
     fks: &[ForeignKeyDef],
     relation_type: i64,
 ) -> Result<(), String> {
@@ -2581,6 +2604,27 @@ pub fn create_table(
     // --- the format descriptor blob (makeFormat) ---------------------
     let fmt_blob = write_format_blob(file, page_size, &descs)?;
 
+    // CHECK constraints: each takes a PAIR of CHECK_<n> triggers
+    // (before-insert, before-update), numbered from the engine's
+    // RDB$TRIGGER_NAME generator NOW so the runtime summary below can
+    // name them - a trigger absent from RDB$RUNTIME never fires
+    let mut check_names: Vec<(String, String)> = Vec::new();
+    {
+        let n_checks = constraints
+            .iter()
+            .filter(|c| matches!(c, TableConstraint::Check(_)))
+            .count();
+        if n_checks > 0 {
+            let slot = generator_id_by_name(file, page_size, "RDB$TRIGGER_NAME")
+                .ok_or("no RDB$TRIGGER_NAME generator")?;
+            for _ in 0..n_checks {
+                let a = gen::bump(file, page_size, slot, 1)?;
+                let b = gen::bump(file, page_size, slot, 1)?;
+                check_names.push((format!("CHECK_{}", a), format!("CHECK_{}", b)));
+            }
+        }
+    }
+
     // --- the RDB$RUNTIME field summary (make_version): per field the
     // probe-pinned tag sequence ------------------------------------------
     let mut runtime: Vec<Vec<u8>> = Vec::new();
@@ -2633,6 +2677,16 @@ pub fn create_table(
             runtime.push(seg(22, gen_name.as_bytes()));
             runtime.push(seg(23, &(id.identity_type as u16).to_le_bytes()));
         }
+    }
+    // the CHECK triggers' names (RSR_trigger_name = 9), sorted - the
+    // engine loads a relation's trigger vector from these entries
+    let mut tnames: Vec<&str> = check_names
+        .iter()
+        .flat_map(|(a, b)| [a.as_str(), b.as_str()])
+        .collect();
+    tnames.sort();
+    for t in &tnames {
+        runtime.push(seg(9, t.as_bytes()));
     }
     let runtime_blob = dml::insert_blob(file, page_size, 6, &runtime, 5)?;
 
@@ -2806,8 +2860,15 @@ pub fn create_table(
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ])?;
     }
-    for key in keys {
-        write_key(file, page_size, &name, key)?;
+    let mut check_i = 0usize;
+    for tc in constraints {
+        match tc {
+            TableConstraint::Key(key) => write_key(file, page_size, &name, key)?,
+            TableConstraint::Check(ck) => {
+                write_check(file, page_size, &name, ck, &check_names[check_i])?;
+                check_i += 1;
+            }
+        }
     }
     // --- FOREIGN KEY constraints: a non-unique index on the referencing
     // columns (irt_foreign, naming the partner PK index), an RDB$RELATION_
@@ -2868,6 +2929,92 @@ fn write_key(
         ("RDB$INITIALLY_DEFERRED", SysVal::S("NO")),
         ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
     ])?;
+    Ok(())
+}
+
+/// Write one CHECK constraint onto a table: the PAIR of CHECK_<n>
+/// triggers (before-insert type 1, before-update type 3 - both carrying
+/// the SAME if-failed-raise BLR and the verbatim source, probed), their
+/// per-referenced-field RDB$DEPENDENCIES rows, the
+/// RDB$RELATION_CONSTRAINTS 'CHECK' row (no index), and the two
+/// RDB$CHECK_CONSTRAINTS rows linking constraint to triggers. The
+/// trigger names come pre-assigned from the RDB$TRIGGER_NAME generator
+/// (create_table draws them before building the runtime summary, which
+/// must already name them).
+fn write_check(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    check: &CheckDef,
+    tnames: &(String, String),
+) -> Result<(), String> {
+    let cname = if check.name.is_empty() {
+        next_integ_name(file, page_size)?
+    } else {
+        check.name.clone()
+    };
+    let trel = crate::resolve_relation(file, page_size, "RDB$TRIGGERS")
+        .ok_or("no RDB$TRIGGERS relation")?;
+    for (tname, ttype) in [(&tnames.0, 1i64), (&tnames.1, 3i64)] {
+        let src =
+            dml::insert_blob_cs(file, page_size, trel, &[check.source.as_bytes().to_vec()], 1, 4)?;
+        let blr = dml::insert_blob(file, page_size, trel, &[check.trigger_blr.clone()], 2)?;
+        sys_insert(
+            file,
+            page_size,
+            "RDB$TRIGGERS",
+            trel,
+            &[
+                ("RDB$TRIGGER_NAME", SysVal::S(tname)),
+                ("RDB$RELATION_NAME", SysVal::S(table)),
+                ("RDB$TRIGGER_SEQUENCE", SysVal::I(0)),
+                ("RDB$TRIGGER_TYPE", SysVal::I(ttype)),
+                ("RDB$TRIGGER_SOURCE", SysVal::B(blob_id_bytes(trel, src))),
+                ("RDB$TRIGGER_BLR", SysVal::B(blob_id_bytes(trel, blr))),
+                ("RDB$TRIGGER_INACTIVE", SysVal::I(0)),
+                // fb_sysflag_check_constraint
+                ("RDB$SYSTEM_FLAG", SysVal::I(3)),
+                ("RDB$FLAGS", SysVal::I(1)),
+                ("RDB$VALID_BLR", SysVal::I(1)),
+                ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+            ],
+        )?;
+        // one dependency row per referenced field, first-seen order
+        for f in &check.fields {
+            let drel = crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES")
+                .ok_or("no RDB$DEPENDENCIES relation")?;
+            sys_insert(
+                file,
+                page_size,
+                "RDB$DEPENDENCIES",
+                drel,
+                &[
+                    ("RDB$DEPENDENT_NAME", SysVal::S(tname)),
+                    ("RDB$DEPENDED_ON_NAME", SysVal::S(table)),
+                    ("RDB$FIELD_NAME", SysVal::S(f)),
+                    ("RDB$DEPENDENT_TYPE", SysVal::I(2)),   // obj_trigger
+                    ("RDB$DEPENDED_ON_TYPE", SysVal::I(0)), // obj_relation
+                    ("RDB$DEPENDENT_SCHEMA_NAME", SysVal::S("PUBLIC")),
+                    ("RDB$DEPENDED_ON_SCHEMA_NAME", SysVal::S("PUBLIC")),
+                ],
+            )?;
+        }
+    }
+    sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
+        ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
+        ("RDB$CONSTRAINT_TYPE", SysVal::S("CHECK")),
+        ("RDB$RELATION_NAME", SysVal::S(table)),
+        ("RDB$DEFERRABLE", SysVal::S("NO")),
+        ("RDB$INITIALLY_DEFERRED", SysVal::S("NO")),
+        ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+    ])?;
+    for tname in [&tnames.0, &tnames.1] {
+        sys_row_by_name(file, page_size, "RDB$CHECK_CONSTRAINTS", &[
+            ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
+            ("RDB$TRIGGER_NAME", SysVal::S(tname)),
+            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ])?;
+    }
     Ok(())
 }
 
