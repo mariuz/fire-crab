@@ -682,6 +682,8 @@ enum Plan {
         /// PRIMARY KEY / UNIQUE constraints, in declaration order
         keys: Vec<fire_crab_ods::ddl::KeyDef>,
         fks: Vec<fire_crab_ods::ddl::ForeignKeyDef>,
+        /// RDB$RELATION_TYPE: 0 persistent, 4 GTT preserve, 5 GTT delete
+        relation_type: i64,
     },
     /// `CREATE [UNIQUE] [ASC|DESC] INDEX <name> ON <table> (cols)`:
     /// irt slot + empty root + catalog rows + backfill of existing rows
@@ -1676,18 +1678,56 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         return None;
     }
     let table_kw = find_word(&masked, "TABLE", "CREATE".len())?;
-    if masked[..table_kw].trim() != "CREATE" {
-        return None; // CREATE <something else> TABLE
-    }
+    // between CREATE and TABLE: nothing (persistent) or GLOBAL TEMPORARY (a GTT)
+    let between = masked["CREATE".len()..table_kw].trim();
+    let is_gtt = match between {
+        "" => false,
+        "GLOBAL TEMPORARY" => true,
+        _ => return None, // CREATE <something else> TABLE
+    };
     let open = s.find('(')?;
-    if !s.ends_with(')') {
-        return None;
+    // the matching close paren of the column list (the body may hold nested
+    // parens for type args); a trailing ON COMMIT clause follows it for a GTT
+    let mut depth = 0i32;
+    let mut close = None;
+    for (i, ch) in s[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
     }
+    let close = close?;
+    // whatever follows the column list: an ON COMMIT clause (GTT) or nothing
+    let tail = s[close + 1..].trim();
+    let relation_type: i64 = if is_gtt {
+        let compact = tail
+            .to_ascii_uppercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        match compact.as_str() {
+            "" | "ON COMMIT DELETE ROWS" => 5,
+            "ON COMMIT PRESERVE ROWS" => 4,
+            _ => return None,
+        }
+    } else {
+        if !tail.is_empty() {
+            return None; // a persistent table has nothing after the column list
+        }
+        0
+    };
     let name = s[table_kw + "TABLE".len()..open].trim().trim_matches('"');
     if !ident_ok(name) {
         return None;
     }
-    let body = &s[open + 1..s.len() - 1];
+    let body = &s[open + 1..close];
     // split on top-level commas (type args carry their own parens)
     let mut items: Vec<&str> = Vec::new();
     let mut depth = 0usize;
@@ -1754,7 +1794,7 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         }
     }
     Some((
-        Plan::CreateTable { name: name.to_ascii_uppercase(), cols, keys, fks },
+        Plan::CreateTable { name: name.to_ascii_uppercase(), cols, keys, fks, relation_type },
         Vec::new(),
     ))
 }
@@ -3999,8 +4039,16 @@ fn execute_dml(
     let db = database.as_mut().ok_or("no database attached")?;
     let mut work = db.bytes.clone();
     let counts = match plan {
-        Plan::CreateTable { name, cols, keys, fks } => {
-            fire_crab_ods::ddl::create_table(&mut work, db.page_size, name, cols, keys, fks)?;
+        Plan::CreateTable { name, cols, keys, fks, relation_type } => {
+            fire_crab_ods::ddl::create_table(
+                &mut work,
+                db.page_size,
+                name,
+                cols,
+                keys,
+                fks,
+                *relation_type,
+            )?;
             (0, 0, 0)
         }
         Plan::CreateIndex { table, name, cols, unique, descending } => {
@@ -11737,6 +11785,19 @@ mod tests {
         }
         // a table-level PRIMARY KEY alone sets NULL_FLAG without a
         // NOT NULL constraint row
+        // GLOBAL TEMPORARY TABLE carries a relation type (5 delete, 4 preserve)
+        match plan_create_table("CREATE GLOBAL TEMPORARY TABLE G (A INTEGER) ON COMMIT PRESERVE ROWS").unwrap().0 {
+            Plan::CreateTable { relation_type, .. } => assert_eq!(relation_type, 4),
+            _ => panic!("expected CreateTable"),
+        }
+        match plan_create_table("CREATE GLOBAL TEMPORARY TABLE G (A INTEGER)").unwrap().0 {
+            Plan::CreateTable { relation_type, .. } => assert_eq!(relation_type, 5),
+            _ => panic!("expected CreateTable"),
+        }
+        match plan_create_table("CREATE TABLE R (A INTEGER)").unwrap().0 {
+            Plan::CreateTable { relation_type, .. } => assert_eq!(relation_type, 0),
+            _ => panic!("expected CreateTable"),
+        }
         let plan = plan_create_table("CREATE TABLE P (A INTEGER, B INTEGER, PRIMARY KEY (A, B))")
             .unwrap()
             .0;

@@ -3736,6 +3736,27 @@ which needs the variable-and-message BLR a full compiler emits — the same
 machinery a `CHECK` constraint, a computed column, and `FOREIGN KEY … SET
 DEFAULT` all wait on.
 
+### The hundred-and-sixth differential — a global temporary table
+
+A `GLOBAL TEMPORARY TABLE` is a persistent table's catalog with one field
+different: `RDB$RELATION_TYPE` is 5 for `ON COMMIT DELETE ROWS` (the default) and
+4 for `ON COMMIT PRESERVE ROWS`, where a persistent table is 0. Everything else —
+the fields, the format, the runtime, the security catalog, even the pointer and
+index-root pages — is written exactly as an ordinary `CREATE TABLE`; the rows
+themselves live in per-connection temporary space at runtime, which is not part
+of what an offline writer produces. So the whole feature is threading one
+relation-type value from the parser into the one place `create_table` had
+hard-coded 0, plus teaching the parser to accept the `GLOBAL TEMPORARY` between
+`CREATE` and `TABLE` and the trailing `ON COMMIT` clause (which meant finding the
+column list's matching close paren rather than assuming the statement ends at it).
+
+`qa/serve-real-gtt.sh` (11 checks) has fire-crab and the engine create three GTTs
+(`DELETE`, `PRESERVE`, and no clause) and one persistent table on two copies,
+compares every `RDB$RELATION_TYPE`, compares one GTT's `RDB$FORMATS` descriptor
+byte for byte (its layout is a regular table's), confirms the engine can insert
+into a GTT fire-crab wrote, and runs a `gbak` round trip plus `gfix`. Every
+persistent-table gate still passes, since the default type stays 0.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest

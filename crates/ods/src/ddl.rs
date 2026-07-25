@@ -2248,6 +2248,7 @@ pub fn create_table(
     cols: &[ColumnDef],
     keys: &[KeyDef],
     fks: &[ForeignKeyDef],
+    relation_type: i64,
 ) -> Result<(), String> {
     if cols.is_empty() {
         return Err("a table needs at least one column".into());
@@ -2488,7 +2489,8 @@ pub fn create_table(
             ("RDB$FIELD_ID", SysVal::I(cols.len() as i64)),
             ("RDB$SYSTEM_FLAG", SysVal::I(0)),
             ("RDB$FLAGS", SysVal::I(1)), // REL_sql
-            ("RDB$RELATION_TYPE", SysVal::I(0)), // persistent
+            // 0 persistent, 4 GTT ON COMMIT PRESERVE, 5 GTT ON COMMIT DELETE
+            ("RDB$RELATION_TYPE", SysVal::I(relation_type)),
             ("RDB$OWNER_NAME", SysVal::S("SYSDBA")),
             ("RDB$SECURITY_CLASS", SysVal::S(&class)),
             ("RDB$DEFAULT_CLASS", SysVal::S(&default_class)),
