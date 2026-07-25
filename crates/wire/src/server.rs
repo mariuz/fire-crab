@@ -786,11 +786,12 @@ enum Plan {
         admin_option: bool,
         revoke: bool,
     },
-    /// `GRANT EXECUTE ON PROCEDURE <p> TO <grantees>` / `REVOKE ... FROM`:
-    /// RDB$USER_PRIVILEGES 'X' rows (object type 5) + the procedure's
-    /// security-class ACL recompute
+    /// `GRANT EXECUTE ON PROCEDURE|FUNCTION <p> TO <grantees>` /
+    /// `REVOKE ... FROM`: RDB$USER_PRIVILEGES 'X' rows (object type 5 for a
+    /// procedure, 15 for a function) + the object's security-class ACL recompute
     GrantProcedure {
         procedure: String,
+        is_function: bool,
         grantees: Vec<String>,
         grant_option: bool,
         revoke: bool,
@@ -2346,10 +2347,10 @@ fn plan_grant(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     ))
 }
 
-/// Parse `GRANT EXECUTE ON PROCEDURE <p> TO <grantees> [WITH GRANT OPTION]`
-/// and `REVOKE EXECUTE ON PROCEDURE <p> FROM <grantees>` - the procedure
-/// analogue of [plan_grant]. Only the `EXECUTE` privilege is modelled;
-/// anything else falls back.
+/// Parse `GRANT EXECUTE ON PROCEDURE|FUNCTION <p> TO <grantees>
+/// [WITH GRANT OPTION]` and `REVOKE EXECUTE ON PROCEDURE|FUNCTION <p>
+/// FROM <grantees>` - the procedure/function analogue of [plan_grant]. Only
+/// the `EXECUTE` privilege is modelled; anything else falls back.
 fn plan_grant_procedure(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
@@ -2366,12 +2367,20 @@ fn plan_grant_procedure(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     if up[verb_len..on].trim() != "EXECUTE" {
         return None;
     }
-    // ON PROCEDURE <name>
-    let proc_kw = find_word(&up, "PROCEDURE", on + "ON".len())?;
-    if up[on + "ON".len()..proc_kw].trim() != "" {
+    // ON PROCEDURE <name> or ON FUNCTION <name>
+    let after_on = on + "ON".len();
+    let (kw, is_function) = if let Some(p) = find_word(&up, "PROCEDURE", after_on) {
+        (p, false)
+    } else if let Some(p) = find_word(&up, "FUNCTION", after_on) {
+        (p, true)
+    } else {
+        return None;
+    };
+    if up[after_on..kw].trim() != "" {
         return None;
     }
-    let pos = proc_kw + "PROCEDURE".len();
+    let kw_len = if is_function { "FUNCTION".len() } else { "PROCEDURE".len() };
+    let pos = kw + kw_len;
     let sep_kw = if revoke { "FROM" } else { "TO" };
     let sep = find_word(&up, sep_kw, pos)?;
     let proc = s[pos..sep].trim();
@@ -2390,6 +2399,7 @@ fn plan_grant_procedure(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     Some((
         Plan::GrantProcedure {
             procedure: unquote_ident(proc)?,
+            is_function,
             grantees,
             grant_option,
             revoke,
@@ -3702,18 +3712,30 @@ fn execute_dml(
         }
         Plan::GrantProcedure {
             procedure,
+            is_function,
             grantees,
             grant_option,
             revoke,
         } => {
-            fire_crab_ods::ddl::grant_procedure(
-                &mut work,
-                db.page_size,
-                procedure,
-                grantees,
-                *grant_option,
-                *revoke,
-            )?;
+            if *is_function {
+                fire_crab_ods::ddl::grant_function(
+                    &mut work,
+                    db.page_size,
+                    procedure,
+                    grantees,
+                    *grant_option,
+                    *revoke,
+                )?;
+            } else {
+                fire_crab_ods::ddl::grant_procedure(
+                    &mut work,
+                    db.page_size,
+                    procedure,
+                    grantees,
+                    *grant_option,
+                    *revoke,
+                )?;
+            }
             (0, 0, 0)
         }
         Plan::AlterTableAdd { table, col } => {
@@ -11552,13 +11574,23 @@ mod tests {
     #[test]
     fn parses_grant_procedure() {
         match plan_grant_procedure("GRANT EXECUTE ON PROCEDURE P1 TO BOB") {
-            Some((Plan::GrantProcedure { procedure, grantees, grant_option, revoke }, _)) => {
+            Some((Plan::GrantProcedure { procedure, is_function, grantees, grant_option, revoke }, _)) => {
                 assert_eq!(procedure, "P1");
+                assert!(!is_function);
                 assert_eq!(grantees, vec!["BOB".to_string()]);
                 assert!(!grant_option);
                 assert!(!revoke);
             }
             other => panic!("expected GrantProcedure, got {:?}", other.is_some()),
+        }
+        // ON FUNCTION sets is_function
+        match plan_grant_procedure("REVOKE EXECUTE ON FUNCTION F1 FROM CAROL") {
+            Some((Plan::GrantProcedure { procedure, is_function, revoke, .. }, _)) => {
+                assert_eq!(procedure, "F1");
+                assert!(is_function);
+                assert!(revoke);
+            }
+            other => panic!("expected GrantProcedure function, got {:?}", other.is_some()),
         }
         match plan_grant_procedure("grant execute on procedure p1 to alice with grant option") {
             Some((Plan::GrantProcedure { grant_option, .. }, _)) => assert!(grant_option),

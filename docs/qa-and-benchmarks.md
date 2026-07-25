@@ -3389,6 +3389,26 @@ recomputed to match, refuses an unknown procedure on both, and runs a `gbak`
 round trip plus `gfix`. Teeth: the byte-for-byte ACL over three grantees pins the
 owner ACE, the execute privilege byte, and the alphabetical-then-PUBLIC order.
 
+### The ninetieth differential — GRANT EXECUTE, on a function
+
+A function's `EXECUTE` grant is the procedure's, one field different: the
+`RDB$USER_PRIVILEGES` row carries object type 15 instead of 5, and the owner and
+class come from `RDB$FUNCTIONS` instead of `RDB$PROCEDURES`. The ACL — owner ACE
+`6 1 3 11`, grantees with `execute`, `PUBLIC` last — is byte-for-byte the same.
+So the previous increment's `grant_procedure` factored cleanly into a
+`grant_executable` core taking the object type, with `grant_procedure` and
+`grant_function` as two-line wrappers over their respective owner/class lookups;
+the parser gained one `FUNCTION` keyword beside `PROCEDURE`. (The lookup skips
+packaged functions — a standalone function is the one with a NULL
+`RDB$PACKAGE_NAME` — so a package's same-named routine is not mistaken for it.)
+
+`qa/serve-real-grantfunction.sh` (16 checks) is the procedure gate on a function:
+grant `EXECUTE` to two users (one `WITH GRANT OPTION`) and `PUBLIC`, compare every
+`RDB$USER_PRIVILEGES` row and the function's security-class `RDB$ACL` byte for
+byte, revoke one and confirm the recompute, refuse an unknown function, and run a
+`gbak` round trip plus `gfix`. The procedure gate still passes unchanged, so the
+shared core serves both.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest

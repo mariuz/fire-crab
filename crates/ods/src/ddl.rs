@@ -5102,11 +5102,18 @@ fn procedure_owner_class(file: &[u8], page_size: usize, proc: &str) -> Option<(S
     out
 }
 
-/// The procedure's security-class ACL from the `EXECUTE` grants now in
-/// `RDB$USER_PRIVILEGES`: the owner ACE (alter/control/drop/execute), then
-/// every other grantee with `EXECUTE`, alphabetically, with `PUBLIC` (the
-/// all-users wildcard) last - the relation ordering, applied to a procedure.
-fn build_procedure_acl(file: &[u8], page_size: usize, proc: &str, owner: &str) -> Vec<u8> {
+/// An executable's (procedure or function) security-class ACL from the
+/// `EXECUTE` grants now in `RDB$USER_PRIVILEGES`: the owner ACE
+/// (alter/control/drop/execute), then every other grantee with `EXECUTE`,
+/// alphabetically, with `PUBLIC` (the all-users wildcard) last - the relation
+/// ordering. `object_type` selects procedure (5) or function (15) rows.
+fn build_executable_acl(
+    file: &[u8],
+    page_size: usize,
+    name: &str,
+    object_type: i64,
+    owner: &str,
+) -> Vec<u8> {
     use std::collections::BTreeSet;
     let mut named: BTreeSet<String> = BTreeSet::new();
     let mut has_public = false;
@@ -5124,9 +5131,9 @@ fn build_procedure_acl(file: &[u8], page_size: usize, proc: &str, owner: &str) -
                 fid("RDB$OBJECT_TYPE"),
             ) {
                 walk_rows(file, page_size, rel, descs, |v| {
-                    if text_eq(v.get(rn_f), proc)
+                    if text_eq(v.get(rn_f), name)
                         && text_eq(v.get(p_f), "X")
-                        && matches!(v.get(ot_f), Some(Value::Int(5)))
+                        && matches!(v.get(ot_f), Some(Value::Int(t)) if *t == object_type)
                     {
                         if let Some(Value::Text(u)) = v.get(u_f) {
                             let u = u.trim_end();
@@ -5153,10 +5160,92 @@ fn build_procedure_acl(file: &[u8], page_size: usize, proc: &str, owner: &str) -
     acl_serialize(&acl)
 }
 
+/// A function's `(RDB$OWNER_NAME, RDB$SECURITY_CLASS)` from `RDB$FUNCTIONS`
+/// (the packaged-function rows carry a package name; a standalone function's
+/// `RDB$PACKAGE_NAME` is NULL, which is the one this grants on).
+fn function_owner_class(file: &[u8], page_size: usize, func: &str) -> Option<(String, String)> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$FUNCTIONS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$FUNCTIONS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$FUNCTIONS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (name_f, own_f, sc_f) = (
+        fid("RDB$FUNCTION_NAME")?,
+        fid("RDB$OWNER_NAME")?,
+        fid("RDB$SECURITY_CLASS")?,
+    );
+    let pkg_f = fid("RDB$PACKAGE_NAME");
+    let mut out = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        let standalone = pkg_f.map_or(true, |f| matches!(v.get(f), None | Some(Value::Null)));
+        if out.is_none() && standalone && text_eq(v.get(name_f), func) {
+            let own = match v.get(own_f) {
+                Some(Value::Text(t)) => t.trim_end().to_string(),
+                _ => OWNER.to_string(),
+            };
+            let sc = match v.get(sc_f) {
+                Some(Value::Text(t)) => t.trim_end().to_string(),
+                _ => return,
+            };
+            out = Some((own, sc));
+        }
+    });
+    out
+}
+
+/// The shared core of `GRANT EXECUTE ON PROCEDURE|FUNCTION`: write (or delete)
+/// the `RDB$USER_PRIVILEGES` `X` rows for the object (`object_type` 5 for a
+/// procedure, 15 for a function), then recompute its security-class ACL. The
+/// procedure/function analogue of [grant_table].
+#[allow(clippy::too_many_arguments)]
+fn grant_executable(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    name: &str,
+    object_type: i64,
+    owner: &str,
+    class: &str,
+    grantees: &[String],
+    grant_option: bool,
+    revoke: bool,
+) -> Result<(), String> {
+    let upriv = crate::resolve_relation(file, page_size, "RDB$USER_PRIVILEGES")
+        .ok_or("no RDB$USER_PRIVILEGES relation")?;
+    for grantee in grantees {
+        let grantee = grantee.trim().trim_matches('"').to_ascii_uppercase();
+        if revoke {
+            let (g, p) = (grantee.clone(), name.to_string());
+            let u_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$USER")?;
+            let rn_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$RELATION_NAME")?;
+            let pr_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$PRIVILEGE")?;
+            let ot_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$OBJECT_TYPE")?;
+            delete_catalog_rows(file, page_size, "RDB$USER_PRIVILEGES", move |v| {
+                text_eq(v.get(u_f), &g)
+                    && text_eq(v.get(rn_f), &p)
+                    && text_eq(v.get(pr_f), "X")
+                    && matches!(v.get(ot_f), Some(Value::Int(t)) if *t == object_type)
+            })?;
+        } else if !priv_row_present(file, page_size, name, &grantee, 'X', None) {
+            let row = vec![
+                ("RDB$USER", SysVal::S(&grantee)),
+                ("RDB$GRANTOR", SysVal::S(owner)),
+                ("RDB$PRIVILEGE", SysVal::S("X")),
+                ("RDB$GRANT_OPTION", SysVal::I(if grant_option { 1 } else { 0 })),
+                ("RDB$RELATION_NAME", SysVal::S(name)),
+                ("RDB$USER_TYPE", SysVal::I(8)),
+                ("RDB$OBJECT_TYPE", SysVal::I(object_type)),
+                ("RDB$RELATION_SCHEMA_NAME", SysVal::S("PUBLIC")),
+            ];
+            sys_insert(file, page_size, "RDB$USER_PRIVILEGES", upriv, &row)?;
+        }
+    }
+    let acl = build_executable_acl(file, page_size, name, object_type, owner);
+    write_class_acl(file, page_size, class, &acl)?;
+    advance_oldest_transactions(file, page_size)
+}
+
 /// `GRANT EXECUTE ON PROCEDURE <p> TO <grantees> [WITH GRANT OPTION]` and its
-/// `REVOKE ... FROM` inverse - the procedure analogue of [grant_table]. Two
-/// effects: an `RDB$USER_PRIVILEGES` row per grantee (privilege `X`,
-/// object type 5) and a recompute of the procedure's security-class ACL.
+/// `REVOKE ... FROM` inverse (object type 5).
 pub fn grant_procedure(
     file: &mut Vec<u8>,
     page_size: usize,
@@ -5168,39 +5257,27 @@ pub fn grant_procedure(
     let proc = proc.trim().trim_matches('"').to_ascii_uppercase();
     let (owner, class) = procedure_owner_class(file, page_size, &proc)
         .ok_or_else(|| format!("Procedure {} not found", proc))?;
-    let upriv = crate::resolve_relation(file, page_size, "RDB$USER_PRIVILEGES")
-        .ok_or("no RDB$USER_PRIVILEGES relation")?;
-    for grantee in grantees {
-        let grantee = grantee.trim().trim_matches('"').to_ascii_uppercase();
-        if revoke {
-            let (g, p) = (grantee.clone(), proc.clone());
-            let u_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$USER")?;
-            let rn_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$RELATION_NAME")?;
-            let pr_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$PRIVILEGE")?;
-            let ot_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$OBJECT_TYPE")?;
-            delete_catalog_rows(file, page_size, "RDB$USER_PRIVILEGES", move |v| {
-                text_eq(v.get(u_f), &g)
-                    && text_eq(v.get(rn_f), &p)
-                    && text_eq(v.get(pr_f), "X")
-                    && matches!(v.get(ot_f), Some(Value::Int(5)))
-            })?;
-        } else if !priv_row_present(file, page_size, &proc, &grantee, 'X', None) {
-            let row = vec![
-                ("RDB$USER", SysVal::S(&grantee)),
-                ("RDB$GRANTOR", SysVal::S(&owner)),
-                ("RDB$PRIVILEGE", SysVal::S("X")),
-                ("RDB$GRANT_OPTION", SysVal::I(if grant_option { 1 } else { 0 })),
-                ("RDB$RELATION_NAME", SysVal::S(&proc)),
-                ("RDB$USER_TYPE", SysVal::I(8)),
-                ("RDB$OBJECT_TYPE", SysVal::I(5)),
-                ("RDB$RELATION_SCHEMA_NAME", SysVal::S("PUBLIC")),
-            ];
-            sys_insert(file, page_size, "RDB$USER_PRIVILEGES", upriv, &row)?;
-        }
-    }
-    let acl = build_procedure_acl(file, page_size, &proc, &owner);
-    write_class_acl(file, page_size, &class, &acl)?;
-    advance_oldest_transactions(file, page_size)
+    grant_executable(
+        file, page_size, &proc, 5, &owner, &class, grantees, grant_option, revoke,
+    )
+}
+
+/// `GRANT EXECUTE ON FUNCTION <f> TO <grantees> [WITH GRANT OPTION]` and its
+/// `REVOKE ... FROM` inverse (object type 15).
+pub fn grant_function(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    func: &str,
+    grantees: &[String],
+    grant_option: bool,
+    revoke: bool,
+) -> Result<(), String> {
+    let func = func.trim().trim_matches('"').to_ascii_uppercase();
+    let (owner, class) = function_owner_class(file, page_size, &func)
+        .ok_or_else(|| format!("Function {} not found", func))?;
+    grant_executable(
+        file, page_size, &func, 15, &owner, &class, grantees, grant_option, revoke,
+    )
 }
 
 /// A role's `(RDB$OWNER_NAME, RDB$SECURITY_CLASS)` from `RDB$ROLES`.
