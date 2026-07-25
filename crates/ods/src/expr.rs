@@ -212,6 +212,25 @@ impl Cond {
         }
     }
 
+    /// Whether the tree contains a NOT node. A user trigger's IF emits
+    /// its condition AS WRITTEN (the engine uses blr_not there, which
+    /// this compiler does not emit) - a caller supporting only the
+    /// NOT-free positive form must refuse when this is true.
+    pub fn has_not(&self) -> bool {
+        match self {
+            Cond::Cmp(..) => false,
+            Cond::And(a, b) | Cond::Or(a, b) => a.has_not() || b.has_not(),
+            Cond::Not(_) => true,
+        }
+    }
+
+    /// Emit the condition POSITIVELY (as written - a user trigger's IF,
+    /// unlike a CHECK's stored negation). The tree must be NOT-free
+    /// ([Cond::has_not]).
+    pub fn emit_positive(&self, out: &mut Vec<u8>) {
+        self.emit(out);
+    }
+
     /// Every [Expr] operand of the condition's comparisons, for the
     /// caller to type-check field references against its columns.
     pub fn operands(&self) -> Vec<&Expr> {

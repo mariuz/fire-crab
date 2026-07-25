@@ -808,8 +808,12 @@ fn rebuild_runtime_blob(
     dml::insert_blob(file, page_size, 6, &runtime, 5)
 }
 
-/// The names of a relation's triggers, ascending - the order the engine
-/// lists them in the relation's `RDB$RUNTIME` summary.
+/// The names of a relation's triggers in the order the engine lists
+/// them in the relation's `RDB$RUNTIME` summary: by (RDB$TRIGGER_
+/// SEQUENCE, then name LEXICALLY) - probed three ways: user triggers at
+/// positions 0/1/5 list in position order regardless of name or event;
+/// same-position triggers list lexically (CHECK_10 before CHECK_7); the
+/// event type does not participate.
 fn relation_trigger_names(file: &[u8], page_size: usize, table: &str) -> Vec<String> {
     let (Some(rel), Some(formats)) = (
         crate::resolve_relation(file, page_size, "RDB$TRIGGERS"),
@@ -822,19 +826,32 @@ fn relation_trigger_names(file: &[u8], page_size: usize, table: &str) -> Vec<Str
     };
     let cols = relation_columns(file, page_size, "RDB$TRIGGERS");
     let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
-    let (Some(name_f), Some(rn_f)) = (fid("RDB$TRIGGER_NAME"), fid("RDB$RELATION_NAME")) else {
+    let (Some(name_f), Some(rn_f), Some(type_f), Some(seq_f)) = (
+        fid("RDB$TRIGGER_NAME"),
+        fid("RDB$RELATION_NAME"),
+        fid("RDB$TRIGGER_TYPE"),
+        fid("RDB$TRIGGER_SEQUENCE"),
+    ) else {
         return Vec::new();
     };
-    let mut names = Vec::new();
+    let mut trigs: Vec<(i64, i64, String)> = Vec::new();
     walk_rows(file, page_size, rel, descs, |v| {
         if text_eq(v.get(rn_f), table) {
             if let Some(Value::Text(t)) = v.get(name_f) {
-                names.push(t.trim_end().to_string());
+                let ttype = match v.get(type_f) {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let seq = match v.get(seq_f) {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                trigs.push((ttype, seq, t.trim_end().to_string()));
             }
         }
     });
-    names.sort();
-    names
+    trigs.sort_by(|(_, s1, n1), (_, s2, n2)| s1.cmp(s2).then_with(|| n1.cmp(n2)));
+    trigs.into_iter().map(|(_, _, n)| n).collect()
 }
 
 /// `ALTER TABLE <table> ADD <column>`: append one column to an existing
@@ -2699,8 +2716,9 @@ pub fn create_table(
             runtime.push(seg(23, &(id.identity_type as u16).to_le_bytes()));
         }
     }
-    // the CHECK triggers' names (RSR_trigger_name = 9), sorted - the
-    // engine loads a relation's trigger vector from these entries
+    // the CHECK triggers' names (RSR_trigger_name = 9) in the engine's
+    // runtime order: (sequence, then name lexically) - check triggers
+    // are all sequence 0, so lexically
     let mut tnames: Vec<&str> = check_names
         .iter()
         .flat_map(|(a, b)| [a.as_str(), b.as_str()])
@@ -3036,6 +3054,96 @@ fn write_check(
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ])?;
     }
+    Ok(())
+}
+
+/// A user `CREATE TRIGGER`, compiled: the catalog values plus the three
+/// blobs (verbatim source from `AS` on, the body BLR, and the
+/// `RDB$DEBUG_INFO` source-to-BLR map the engine writes for PSQL).
+pub struct UserTriggerDef {
+    pub name: String,
+    /// 1 = BEFORE INSERT, 3 = BEFORE UPDATE (the slice this writer
+    /// compiles; AFTER/DELETE bodies have nothing our surface can say)
+    pub trigger_type: i64,
+    /// POSITION <n> - RDB$TRIGGER_SEQUENCE, the firing order
+    pub sequence: i64,
+    pub source: String,
+    pub blr: Vec<u8>,
+    pub debug: Vec<u8>,
+    /// referenced fields (reads and assignment targets, deduplicated,
+    /// sorted) - one RDB$DEPENDENCIES row each
+    pub fields: Vec<String>,
+}
+
+/// `CREATE TRIGGER <name> FOR <table> ...`: the RDB$TRIGGERS row (user
+/// trigger: system_flag 0, flags 1), its source / BLR / debug-info blobs
+/// (the last with the declared sub_type 9), one RDB$DEPENDENCIES row per
+/// referenced field, and a refresh of the relation's RDB$RUNTIME - a
+/// trigger absent from the summary never fires.
+pub fn create_user_trigger(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    def: &UserTriggerDef,
+) -> Result<(), String> {
+    let table = table.trim().to_ascii_uppercase();
+    let rel = crate::resolve_relation(file, page_size, &table)
+        .ok_or_else(|| format!("table {} not found", table))?;
+    if rel < 128 {
+        return Err("system relations are read-only".into());
+    }
+    if relation_trigger_names(file, page_size, &table)
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case(&def.name))
+    {
+        return Err(format!("trigger {} already exists", def.name));
+    }
+    let trel = crate::resolve_relation(file, page_size, "RDB$TRIGGERS")
+        .ok_or("no RDB$TRIGGERS relation")?;
+    let src = dml::insert_blob_cs(file, page_size, trel, &[def.source.as_bytes().to_vec()], 1, 4)?;
+    let blr = dml::insert_blob(file, page_size, trel, &[def.blr.clone()], 2)?;
+    let dbg = dml::insert_blob(file, page_size, trel, &[def.debug.clone()], 9)?;
+    sys_insert(
+        file,
+        page_size,
+        "RDB$TRIGGERS",
+        trel,
+        &[
+            ("RDB$TRIGGER_NAME", SysVal::S(&def.name)),
+            ("RDB$RELATION_NAME", SysVal::S(&table)),
+            ("RDB$TRIGGER_SEQUENCE", SysVal::I(def.sequence)),
+            ("RDB$TRIGGER_TYPE", SysVal::I(def.trigger_type)),
+            ("RDB$TRIGGER_SOURCE", SysVal::B(blob_id_bytes(trel, src))),
+            ("RDB$TRIGGER_BLR", SysVal::B(blob_id_bytes(trel, blr))),
+            ("RDB$DEBUG_INFO", SysVal::B(blob_id_bytes(trel, dbg))),
+            ("RDB$TRIGGER_INACTIVE", SysVal::I(0)),
+            ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+            ("RDB$FLAGS", SysVal::I(1)),
+            ("RDB$VALID_BLR", SysVal::I(1)),
+            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ],
+    )?;
+    for f in &def.fields {
+        let drel = crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES")
+            .ok_or("no RDB$DEPENDENCIES relation")?;
+        sys_insert(
+            file,
+            page_size,
+            "RDB$DEPENDENCIES",
+            drel,
+            &[
+                ("RDB$DEPENDENT_NAME", SysVal::S(&def.name)),
+                ("RDB$DEPENDED_ON_NAME", SysVal::S(&table)),
+                ("RDB$FIELD_NAME", SysVal::S(f)),
+                ("RDB$DEPENDENT_TYPE", SysVal::I(2)),   // obj_trigger
+                ("RDB$DEPENDED_ON_TYPE", SysVal::I(0)), // obj_relation
+                ("RDB$DEPENDENT_SCHEMA_NAME", SysVal::S("PUBLIC")),
+                ("RDB$DEPENDED_ON_SCHEMA_NAME", SysVal::S("PUBLIC")),
+            ],
+        )?;
+    }
+    update_relation_runtime(file, page_size, &table)?;
+    advance_oldest_transactions(file, page_size)?;
     Ok(())
 }
 
