@@ -3430,6 +3430,25 @@ and the sequence's security-class `RDB$ACL` byte for byte (teeth on the owner's
 and runs a `gbak` round trip plus `gfix`. The procedure and function gates still
 pass unchanged over the shared core.
 
+### The ninety-second differential — GRANT USAGE, on an exception
+
+An exception is granted `USAGE` too — the right to `RAISE` it — and by now the
+machinery absorbs it almost for free. It is the sequence grant with object type 7
+instead of 14 and the owner and class read from `RDB$EXCEPTIONS`; the privilege
+letter (`G`), the owner ACE (`6 1 3 12`), and the whole `grant_object` core are
+unchanged. The addition is an `exception_owner_class` lookup, a `grant_exception`
+wrapper, and one `EXCEPTION` keyword in the usage parser (the plan variant, now
+`GrantUsage`, carries an `is_exception` flag beside the sequence's `GENERATOR`
+synonym).
+
+Like the sequence gate, this is self-contained — fire-crab creates exceptions.
+`qa/serve-real-grantexception.sh` (16 checks) grants `USAGE` to two users (one
+`WITH GRANT OPTION`) and `PUBLIC`, compares every `RDB$USER_PRIVILEGES` `G` row
+and the exception's security-class `RDB$ACL` byte for byte, revokes one and
+confirms the recompute, refuses an unknown exception, and runs a `gbak` round
+trip plus `gfix`. All four prior grant-object gates still pass over the shared
+core.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest

@@ -796,11 +796,12 @@ enum Plan {
         grant_option: bool,
         revoke: bool,
     },
-    /// `GRANT USAGE ON SEQUENCE <s> TO <grantees>` / `REVOKE ... FROM`:
-    /// RDB$USER_PRIVILEGES 'G' rows (object type 14) + the sequence's
-    /// security-class ACL recompute
-    GrantSequence {
-        sequence: String,
+    /// `GRANT USAGE ON SEQUENCE|EXCEPTION <o> TO <grantees>` /
+    /// `REVOKE ... FROM`: RDB$USER_PRIVILEGES 'G' rows (object type 14 for a
+    /// sequence, 7 for an exception) + the object's security-class ACL recompute
+    GrantUsage {
+        name: String,
+        is_exception: bool,
         grantees: Vec<String>,
         grant_option: bool,
         revoke: bool,
@@ -2417,9 +2418,9 @@ fn plan_grant_procedure(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     ))
 }
 
-/// Parse `GRANT USAGE ON SEQUENCE|GENERATOR <s> TO <grantees>
-/// [WITH GRANT OPTION]` and `REVOKE USAGE ON SEQUENCE|GENERATOR <s>
-/// FROM <grantees>`. Only the `USAGE` privilege on a sequence is modelled.
+/// Parse `GRANT USAGE ON SEQUENCE|GENERATOR|EXCEPTION <o> TO <grantees>
+/// [WITH GRANT OPTION]` and its `REVOKE ... FROM` inverse. `USAGE` on a
+/// sequence (object type 14) or an exception (7); other objects fall back.
 fn plan_grant_usage(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
@@ -2436,10 +2437,12 @@ fn plan_grant_usage(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         return None;
     }
     let after_on = on + "ON".len();
-    let (kw, kw_len) = if let Some(p) = find_word(&up, "SEQUENCE", after_on) {
-        (p, "SEQUENCE".len())
+    let (kw, kw_len, is_exception) = if let Some(p) = find_word(&up, "SEQUENCE", after_on) {
+        (p, "SEQUENCE".len(), false)
     } else if let Some(p) = find_word(&up, "GENERATOR", after_on) {
-        (p, "GENERATOR".len())
+        (p, "GENERATOR".len(), false)
+    } else if let Some(p) = find_word(&up, "EXCEPTION", after_on) {
+        (p, "EXCEPTION".len(), true)
     } else {
         return None;
     };
@@ -2449,7 +2452,7 @@ fn plan_grant_usage(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let pos = kw + kw_len;
     let sep_kw = if revoke { "FROM" } else { "TO" };
     let sep = find_word(&up, sep_kw, pos)?;
-    let seq = s[pos..sep].trim();
+    let name = s[pos..sep].trim();
     let mut tail_end = s.len();
     let mut grant_option = false;
     if !revoke {
@@ -2462,8 +2465,9 @@ fn plan_grant_usage(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     }
     let grantees = parse_grantee_list(s[sep + sep_kw.len()..tail_end].trim())?;
     Some((
-        Plan::GrantSequence {
-            sequence: unquote_ident(seq)?,
+        Plan::GrantUsage {
+            name: unquote_ident(name)?,
+            is_exception,
             grantees,
             grant_option,
             revoke,
@@ -3802,20 +3806,32 @@ fn execute_dml(
             }
             (0, 0, 0)
         }
-        Plan::GrantSequence {
-            sequence,
+        Plan::GrantUsage {
+            name,
+            is_exception,
             grantees,
             grant_option,
             revoke,
         } => {
-            fire_crab_ods::ddl::grant_sequence(
-                &mut work,
-                db.page_size,
-                sequence,
-                grantees,
-                *grant_option,
-                *revoke,
-            )?;
+            if *is_exception {
+                fire_crab_ods::ddl::grant_exception(
+                    &mut work,
+                    db.page_size,
+                    name,
+                    grantees,
+                    *grant_option,
+                    *revoke,
+                )?;
+            } else {
+                fire_crab_ods::ddl::grant_sequence(
+                    &mut work,
+                    db.page_size,
+                    name,
+                    grantees,
+                    *grant_option,
+                    *revoke,
+                )?;
+            }
             (0, 0, 0)
         }
         Plan::AlterTableAdd { table, col } => {
@@ -5332,7 +5348,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         | Plan::Grant { .. }
         | Plan::GrantRole { .. }
         | Plan::GrantProcedure { .. }
-        | Plan::GrantSequence { .. }
+        | Plan::GrantUsage { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -5378,7 +5394,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::Grant { .. }
         | Plan::GrantRole { .. }
         | Plan::GrantProcedure { .. }
-        | Plan::GrantSequence { .. }
+        | Plan::GrantUsage { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -5711,7 +5727,7 @@ fn emit_rows_inner(
         | Plan::Grant { .. }
         | Plan::GrantRole { .. }
         | Plan::GrantProcedure { .. }
-        | Plan::GrantSequence { .. }
+        | Plan::GrantUsage { .. }
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
@@ -8433,7 +8449,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::Grant { .. }
                         | Plan::GrantRole { .. }
                         | Plan::GrantProcedure { .. }
-                        | Plan::GrantSequence { .. }
+                        | Plan::GrantUsage { .. }
                         | Plan::AlterTableAdd { .. }
                         | Plan::AlterTableAddFk { .. }
                         | Plan::AlterTableAddKey { .. }
@@ -11695,21 +11711,30 @@ mod tests {
     #[test]
     fn parses_grant_usage_sequence() {
         match plan_grant_usage("GRANT USAGE ON SEQUENCE S1 TO BOB") {
-            Some((Plan::GrantSequence { sequence, grantees, revoke, .. }, _)) => {
-                assert_eq!(sequence, "S1");
+            Some((Plan::GrantUsage { name, is_exception, grantees, revoke, .. }, _)) => {
+                assert_eq!(name, "S1");
+                assert!(!is_exception);
                 assert_eq!(grantees, vec!["BOB".to_string()]);
                 assert!(!revoke);
             }
-            other => panic!("expected GrantSequence, got {:?}", other.is_some()),
+            other => panic!("expected GrantUsage, got {:?}", other.is_some()),
         }
         // GENERATOR is a synonym; WITH GRANT OPTION and REVOKE parse
         match plan_grant_usage("grant usage on generator s1 to alice with grant option") {
-            Some((Plan::GrantSequence { grant_option, .. }, _)) => assert!(grant_option),
+            Some((Plan::GrantUsage { grant_option, .. }, _)) => assert!(grant_option),
             other => panic!("expected GrantSequence generator, got {:?}", other.is_some()),
         }
         match plan_grant_usage("REVOKE USAGE ON SEQUENCE S1 FROM BOB") {
-            Some((Plan::GrantSequence { revoke, .. }, _)) => assert!(revoke),
+            Some((Plan::GrantUsage { revoke, .. }, _)) => assert!(revoke),
             other => panic!("expected GrantSequence revoke, got {:?}", other.is_some()),
+        }
+        // USAGE ON EXCEPTION sets is_exception
+        match plan_grant_usage("GRANT USAGE ON EXCEPTION E1 TO BOB") {
+            Some((Plan::GrantUsage { name, is_exception, .. }, _)) => {
+                assert_eq!(name, "E1");
+                assert!(is_exception);
+            }
+            other => panic!("expected GrantUsage exception, got {:?}", other.is_some()),
         }
         // EXECUTE / a table grant fall back
         assert!(plan_grant_usage("GRANT EXECUTE ON PROCEDURE P1 TO BOB").is_none());

@@ -4504,9 +4504,9 @@ const OWNER_RELATION_PRIVS: u32 = SCL_CONTROL
 /// (probe: the owner ACE bytes are 6 1 3 11).
 const OWNER_PROCEDURE_PRIVS: u32 = SCL_ALTER | SCL_CONTROL | SCL_DROP | SCL_EXECUTE;
 
-/// A sequence owner's privilege mask: alter, control, drop, usage (probe: the
-/// owner ACE bytes are 6 1 3 12).
-const OWNER_SEQUENCE_PRIVS: u32 = SCL_ALTER | SCL_CONTROL | SCL_DROP | SCL_USAGE;
+/// A usage-object (sequence, exception) owner's privilege mask: alter,
+/// control, drop, usage (probe: the owner ACE bytes are 6 1 3 12).
+const OWNER_USAGE_PRIVS: u32 = SCL_ALTER | SCL_CONTROL | SCL_DROP | SCL_USAGE;
 
 /// A SQL privilege letter to its SCL flag (grant.epp `trans_sql_priv`, the
 /// letters a relation/field grant uses).
@@ -5355,7 +5355,58 @@ pub fn grant_sequence(
     let (owner, class) = generator_owner_class(file, page_size, &seq)
         .ok_or_else(|| format!("Sequence {} has no security class", seq))?;
     grant_object(
-        file, page_size, &seq, 14, "G", &owner, &class, OWNER_SEQUENCE_PRIVS, SCL_USAGE,
+        file, page_size, &seq, 14, "G", &owner, &class, OWNER_USAGE_PRIVS, SCL_USAGE,
+        grantees, grant_option, revoke,
+    )
+}
+
+/// An exception's `(RDB$OWNER_NAME, RDB$SECURITY_CLASS)` from `RDB$EXCEPTIONS`.
+fn exception_owner_class(file: &[u8], page_size: usize, exc: &str) -> Option<(String, String)> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$EXCEPTIONS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$EXCEPTIONS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$EXCEPTIONS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (name_f, own_f, sc_f) = (
+        fid("RDB$EXCEPTION_NAME")?,
+        fid("RDB$OWNER_NAME")?,
+        fid("RDB$SECURITY_CLASS")?,
+    );
+    let mut out = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if out.is_none() && text_eq(v.get(name_f), exc) {
+            let own = match v.get(own_f) {
+                Some(Value::Text(t)) => t.trim_end().to_string(),
+                _ => OWNER.to_string(),
+            };
+            let sc = match v.get(sc_f) {
+                Some(Value::Text(t)) => t.trim_end().to_string(),
+                _ => return,
+            };
+            out = Some((own, sc));
+        }
+    });
+    out
+}
+
+/// `GRANT USAGE ON EXCEPTION <e> TO <grantees> [WITH GRANT OPTION]` and its
+/// `REVOKE ... FROM` inverse (object type 7, privilege `G`).
+pub fn grant_exception(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    exc: &str,
+    grantees: &[String],
+    grant_option: bool,
+    revoke: bool,
+) -> Result<(), String> {
+    let exc = exc.trim().trim_matches('"').to_ascii_uppercase();
+    if find_exception(file, page_size, &exc).is_none() {
+        return Err(format!("Exception {} not found", exc));
+    }
+    let (owner, class) = exception_owner_class(file, page_size, &exc)
+        .ok_or_else(|| format!("Exception {} has no security class", exc))?;
+    grant_object(
+        file, page_size, &exc, 7, "G", &owner, &class, OWNER_USAGE_PRIVS, SCL_USAGE,
         grantees, grant_option, revoke,
     )
 }
