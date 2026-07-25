@@ -1873,6 +1873,67 @@ pub fn alter_column_drop_identity(
     advance_oldest_transactions(file, page_size)
 }
 
+/// `ALTER TABLE <t> ALTER [COLUMN] <c> POSITION <n>` - move a column to the
+/// 1-based display position `n`. Only `RDB$FIELD_POSITION` moves (and the
+/// runtime's positions follow); the field ids, the record format and the
+/// stored bytes are untouched - reordering is a display change, not a storage
+/// one.
+pub fn alter_column_position(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    column: &str,
+    new_pos: i64,
+) -> Result<(), String> {
+    let table = table.trim().to_ascii_uppercase();
+    let column = column.trim().trim_matches('"').to_ascii_uppercase();
+    let rel = crate::resolve_relation(file, page_size, &table)
+        .ok_or_else(|| format!("table {} not found", table))?;
+    if rel < 128 {
+        return Err("system relations are read-only".into());
+    }
+    let cols = relation_columns(file, page_size, &table);
+    let ncols = cols.len();
+    // the engine errors on a position below 1, but a position past the last
+    // column is clamped to the last (the column moves to the end)
+    if new_pos < 1 {
+        return Err(format!("column position {} is out of range", new_pos));
+    }
+    let to = ((new_pos - 1) as usize).min(ncols - 1);
+    // the current order, by position; move the target to `to`
+    let mut order: Vec<(String, u16)> =
+        cols.iter().map(|c| (c.name.clone(), c.position)).collect();
+    order.sort_by_key(|(_, p)| *p);
+    let from = order
+        .iter()
+        .position(|(n, _)| n.eq_ignore_ascii_case(&column))
+        .ok_or_else(|| format!("column {} not found in table {}", column, table))?;
+    if from == to {
+        return advance_oldest_transactions(file, page_size);
+    }
+    let item = order.remove(from);
+    order.insert(to, item);
+    // patch the RDB$FIELD_POSITION of each column whose position moved
+    let rel_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$RELATION_NAME")?;
+    let name_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$FIELD_NAME")?;
+    for (new_p, (name, old_p)) in order.iter().enumerate() {
+        if new_p as u16 == *old_p {
+            continue;
+        }
+        let (t, c) = (table.clone(), name.clone());
+        patch_sys_row(
+            file,
+            page_size,
+            "RDB$RELATION_FIELDS",
+            5,
+            move |v| text_eq(v.get(rel_fid), &t) && text_eq(v.get(name_fid), &c),
+            &[("RDB$FIELD_POSITION", SysVal::I(new_p as i64))],
+        )?;
+    }
+    update_relation_runtime(file, page_size, &table)?;
+    advance_oldest_transactions(file, page_size)
+}
+
 /// Whether any committed primary record of `rel` has a NULL in field
 /// `fid` - the check `SET NOT NULL` makes before it can succeed.
 fn column_has_nulls(file: &[u8], page_size: usize, rel: u16, fid: usize) -> bool {

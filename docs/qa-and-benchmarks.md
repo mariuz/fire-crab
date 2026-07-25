@@ -3676,6 +3676,27 @@ rows gone; compares the `RDB$RUNTIME` byte for byte; confirms the column is stil
 refuses a `DROP IDENTITY` on a non-identity column on both; and runs a `gbak`
 round trip plus `gfix`.
 
+### The hundred-and-third differential — reorder a column
+
+`ALTER TABLE T ALTER COLUMN C POSITION 1` moves a column in the display order and
+nothing else: `RDB$FIELD_POSITION` shifts for the affected columns (and the
+runtime's positions follow), while the field ids, the record format and the
+stored bytes stay exactly where they were — the runtime still lists the fields in
+field-id order, each carrying its new position. So a reorder is a catalog patch
+plus a runtime rebuild, never a data rewrite.
+
+The one behaviour the byte compare pinned down is the edge: a position *below* 1
+errors, but a position *past* the last column is clamped to the last (the column
+moves to the end), silently — fire-crab now clamps the same way rather than
+refusing, which is what the engine does.
+
+`qa/serve-real-columnposition.sh` (12 checks) has fire-crab and the engine apply
+three moves — a column to the front, another to the back, and a third with an
+out-of-range position that clamps to last — on two copies, and compares every
+`RDB$FIELD_POSITION` / field-id pair and the `RDB$RUNTIME` byte for byte; it
+confirms `SELECT` returns the columns in the new order with the original data,
+refuses a position below 1 on both, and runs a `gbak` round trip plus `gfix`.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
