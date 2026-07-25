@@ -31,6 +31,7 @@ pub mod data;
 pub mod ddl;
 pub mod decfloat;
 pub mod dml;
+pub mod expr;
 pub mod format;
 pub mod gc;
 pub mod gen;

@@ -3757,6 +3757,30 @@ byte for byte (its layout is a regular table's), confirms the engine can insert
 into a GTT fire-crab wrote, and runs a `gbak` round trip plus `gfix`. Every
 persistent-table gate still passes, since the default type stays 0.
 
+### The hundred-and-seventh differential — an expression compiler, first slice
+
+Everything left that fire-crab could not write — a `CHECK` constraint, a computed
+column, a `FOREIGN KEY … SET DEFAULT`, a user trigger body — reduces to one
+missing piece: a compiler from a SQL scalar expression to BLR. `crates/ods/expr.rs`
+is its first slice. An `Expr` tree (field reference, integer literal, the four
+arithmetic operators) emits BLR in the engine's own prefix order — an operator's
+byte, then its operands — wrapped as `blr_version5, <expr>, blr_eoc`. A field is
+`blr_field, <context>, <len>, <name>`; a literal is `blr_literal, blr_long, <scale>,
+<4 bytes>`; add/subtract/multiply/divide are 34/35/36/37. A precedence-climbing
+parser on the wire side turns the SQL text into that tree, falling back to None on
+anything it does not yet model rather than mis-compiling.
+
+Because a computed column stores exactly this BLR in `RDB$COMPUTED_BLR`, the whole
+slice is validated against the engine without any catalog wiring yet: the unit
+tests assert the compiler's output byte-for-byte against BLR read out of an
+engine-created table — `A + B` is `5 34 23 0 1 65 23 0 1 66 76`, `A + B * 2` keeps
+precedence, `(A + B) * 2` overrides it, `A + 10` carries the literal, and a
+malformed expression compiles to nothing. This is the encoder counterpart to the
+BLR *decoder* the earlier tooling already had; the next slices — comparison and
+boolean operators, then the trigger and constraint machinery that wraps a
+condition — build on this same tree, and each will carry its own engine gate as it
+reaches a byte fire-crab writes.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest

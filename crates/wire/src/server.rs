@@ -2217,6 +2217,165 @@ fn parse_default_clause(
     ))
 }
 
+/// A token of a scalar arithmetic expression.
+enum ETok {
+    Num(i32),
+    Id(String),
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    LParen,
+    RParen,
+}
+
+/// Tokenise a scalar arithmetic expression: identifiers (field names,
+/// upper-cased; `"..."` keeps case), non-negative integer literals, the four
+/// operators and parentheses. None on any other character.
+fn tokenize_expr(s: &str) -> Option<Vec<ETok>> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut out = Vec::new();
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        match c {
+            b'+' => out.push(ETok::Plus),
+            b'-' => out.push(ETok::Minus),
+            b'*' => out.push(ETok::Star),
+            b'/' => out.push(ETok::Slash),
+            b'(' => out.push(ETok::LParen),
+            b')' => out.push(ETok::RParen),
+            b'0'..=b'9' => {
+                let st = i;
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+                out.push(ETok::Num(std::str::from_utf8(&b[st..i]).ok()?.parse().ok()?));
+                continue;
+            }
+            b'"' => {
+                i += 1;
+                let st = i;
+                while i < b.len() && b[i] != b'"' {
+                    i += 1;
+                }
+                if i >= b.len() {
+                    return None;
+                }
+                out.push(ETok::Id(std::str::from_utf8(&b[st..i]).ok()?.to_string()));
+            }
+            _ if c.is_ascii_alphabetic() || c == b'_' => {
+                let st = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$')
+                {
+                    i += 1;
+                }
+                out.push(ETok::Id(
+                    std::str::from_utf8(&b[st..i]).ok()?.to_ascii_uppercase(),
+                ));
+                continue;
+            }
+            _ => return None,
+        }
+        i += 1;
+    }
+    Some(out)
+}
+
+/// Precedence-climb a scalar arithmetic expression into an
+/// [fire_crab_ods::expr::Expr]: field references, integer literals, `+ - * /`
+/// and parentheses; a leading `-` folds into an integer literal. None on
+/// anything else, so a caller can fall back rather than mis-compile.
+fn parse_expr(s: &str) -> Option<fire_crab_ods::expr::Expr> {
+    let toks = tokenize_expr(s)?;
+    let mut p = 0;
+    let e = blr_expr_add(&toks, &mut p)?;
+    if p != toks.len() {
+        return None; // trailing tokens
+    }
+    Some(e)
+}
+
+fn blr_expr_add(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Expr> {
+    use fire_crab_ods::expr::Expr;
+    let mut left = blr_expr_mul(t, p)?;
+    while let Some(op) = t.get(*p) {
+        match op {
+            ETok::Plus => {
+                *p += 1;
+                left = Expr::Add(Box::new(left), Box::new(blr_expr_mul(t, p)?));
+            }
+            ETok::Minus => {
+                *p += 1;
+                left = Expr::Subtract(Box::new(left), Box::new(blr_expr_mul(t, p)?));
+            }
+            _ => break,
+        }
+    }
+    Some(left)
+}
+
+fn blr_expr_mul(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Expr> {
+    use fire_crab_ods::expr::Expr;
+    let mut left = blr_expr_factor(t, p)?;
+    while let Some(op) = t.get(*p) {
+        match op {
+            ETok::Star => {
+                *p += 1;
+                left = Expr::Multiply(Box::new(left), Box::new(blr_expr_factor(t, p)?));
+            }
+            ETok::Slash => {
+                *p += 1;
+                left = Expr::Divide(Box::new(left), Box::new(blr_expr_factor(t, p)?));
+            }
+            _ => break,
+        }
+    }
+    Some(left)
+}
+
+fn blr_expr_factor(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Expr> {
+    use fire_crab_ods::expr::Expr;
+    match t.get(*p)? {
+        ETok::Minus => {
+            // unary minus, only on an integer literal (folded into its value)
+            *p += 1;
+            match t.get(*p)? {
+                ETok::Num(n) => {
+                    let v = -*n;
+                    *p += 1;
+                    Some(Expr::IntLiteral(v))
+                }
+                _ => None,
+            }
+        }
+        ETok::Num(n) => {
+            let v = *n;
+            *p += 1;
+            Some(Expr::IntLiteral(v))
+        }
+        ETok::Id(name) => {
+            let name = name.clone();
+            *p += 1;
+            Some(Expr::Field { context: 0, name })
+        }
+        ETok::LParen => {
+            *p += 1;
+            let e = blr_expr_add(t, p)?;
+            if !matches!(t.get(*p)?, ETok::RParen) {
+                return None;
+            }
+            *p += 1;
+            Some(e)
+        }
+        _ => None,
+    }
+}
+
 /// Parse the modelled `ALTER DOMAIN` forms: `SET DEFAULT <literal>` /
 /// `DROP DEFAULT` (the default on the domain's `RDB$FIELDS` row) and
 /// `SET NOT NULL` / `DROP NOT NULL` (its `RDB$NULL_FLAG`). Other forms
@@ -12219,6 +12378,31 @@ mod tests {
             other => panic!("expected bare AlterColumnPosition, got {:?}", other.is_some()),
         }
         assert!(plan_alter_column_position("ALTER TABLE T ALTER COLUMN A DROP IDENTITY").is_none());
+    }
+
+    #[test]
+    fn parse_expr_compiles_to_engine_blr() {
+        // parser + compiler together, against golden bytes probed from
+        // RDB$COMPUTED_BLR of an engine-created table
+        assert_eq!(parse_expr("A + B").unwrap().to_blr(), vec![5, 34, 23, 0, 1, 65, 23, 0, 1, 66, 76]);
+        assert_eq!(parse_expr("A * B").unwrap().to_blr(), vec![5, 36, 23, 0, 1, 65, 23, 0, 1, 66, 76]);
+        assert_eq!(parse_expr("A - B").unwrap().to_blr(), vec![5, 35, 23, 0, 1, 65, 23, 0, 1, 66, 76]);
+        assert_eq!(parse_expr("A / B").unwrap().to_blr(), vec![5, 37, 23, 0, 1, 65, 23, 0, 1, 66, 76]);
+        assert_eq!(parse_expr("A + 10").unwrap().to_blr(), vec![5, 34, 23, 0, 1, 65, 21, 8, 0, 10, 0, 0, 0, 76]);
+        // precedence: A + B * 2 = A + (B * 2)
+        assert_eq!(parse_expr("A + B * 2").unwrap().to_blr(),
+                   vec![5, 34, 23, 0, 1, 65, 36, 23, 0, 1, 66, 21, 8, 0, 2, 0, 0, 0, 76]);
+        // parens override precedence: (A + B) * 2
+        assert_eq!(parse_expr("(A + B) * 2").unwrap().to_blr(),
+                   vec![5, 36, 34, 23, 0, 1, 65, 23, 0, 1, 66, 21, 8, 0, 2, 0, 0, 0, 76]);
+        // lowercase field names upper-case; quoted keep case
+        assert!(matches!(parse_expr("mixed").unwrap(),
+                         fire_crab_ods::expr::Expr::Field { ref name, .. } if name == "MIXED"));
+        // malformed expressions return None (fall back, never mis-compile)
+        assert!(parse_expr("A +").is_none());
+        assert!(parse_expr("A @ B").is_none());
+        assert!(parse_expr("(A + B").is_none());
+        assert!(parse_expr("A B").is_none());
     }
 
     #[test]
