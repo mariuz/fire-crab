@@ -3697,6 +3697,26 @@ out-of-range position that clamps to last — on two copies, and compares every
 confirms `SELECT` returns the columns in the new order with the original data,
 refuses a position below 1 on both, and runs a `gbak` round trip plus `gfix`.
 
+### The hundred-and-fourth differential — DEFAULT CURRENT_DATE and friends
+
+The context-value defaults — `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `CURRENT_TIME`,
+`CURRENT_USER` — looked like they belonged with the deferred expression defaults,
+which need the variable-and-message BLR machinery. They do not: each is a single
+BLR opcode (`blr_version5, <op>, blr_eoc`, three bytes) — `CURRENT_DATE` is 160,
+`CURRENT_TIMESTAMP` 161, `CURRENT_TIME` 162, `CURRENT_USER` 44 (`blr_user_name`).
+So they slot straight into the literal-default path beside the integer, string and
+`NULL` cases: one `keyword_default_blr` emitter and one branch in the shared
+`parse_default_clause`, which canonicalises the source to the uppercase keyword
+the way the engine stores it. The BLR folds into `RDB$RUNTIME` like any default,
+so the engine evaluates it per inserted row.
+
+`qa/serve-real-defaultcurrent.sh` (13 checks) has fire-crab and the engine create
+a table whose columns default to each of the four on two copies, compares every
+`RDB$DEFAULT_SOURCE`, each `RDB$DEFAULT_VALUE` BLR byte for byte and the
+`RDB$RUNTIME` byte for byte, then inserts a row and confirms the engine evaluated
+the defaults — the `CURRENT_DATE` column equals today, the `CURRENT_USER` column
+equals `SYSDBA` — and runs a `gbak` round trip plus `gfix`.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest

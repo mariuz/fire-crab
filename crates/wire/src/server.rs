@@ -2150,6 +2150,17 @@ fn parse_default_clause(
         let end = after.find(char::is_whitespace).unwrap_or(after.len());
         (&after[..end], after[end..].trim_start())
     };
+    // a context-value keyword default (CURRENT_DATE, ...) canonicalises its
+    // source to the uppercase keyword, as the engine stores it
+    if let Some(value_blr) = fire_crab_ods::ddl::keyword_default_blr(lit) {
+        return Some((
+            fire_crab_ods::ddl::ColumnDefault {
+                source: format!("DEFAULT {}", lit.to_ascii_uppercase()),
+                value_blr,
+            },
+            rest,
+        ));
+    }
     let value_blr = if lit.starts_with('\'') {
         fire_crab_ods::ddl::str_default_blr(&parse_string_literal(lit)?)
     } else if lit.eq_ignore_ascii_case("NULL") {
@@ -11666,6 +11677,13 @@ mod tests {
             v.push(76);
             v
         });
+        // context-value defaults: single-opcode BLR, canonical uppercase source
+        let d = parse_column_def("A DATE DEFAULT CURRENT_DATE").unwrap().0.default.unwrap();
+        assert_eq!(d.source, "DEFAULT CURRENT_DATE");
+        assert_eq!(d.value_blr, vec![5, 160, 76]);
+        let d = parse_column_def("c varchar(30) default current_user").unwrap().0.default.unwrap();
+        assert_eq!(d.source, "DEFAULT CURRENT_USER");
+        assert_eq!(d.value_blr, vec![5, 44, 76]);
         // DEFAULT NULL - stored explicitly (blr_version5, blr_null, blr_eoc),
         // distinct from a column with no default at all
         let d = parse_column_def("A INTEGER DEFAULT NULL").unwrap().0.default.unwrap();

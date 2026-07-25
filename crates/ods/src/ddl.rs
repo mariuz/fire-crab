@@ -127,6 +127,21 @@ pub fn str_default_blr(text: &str) -> Vec<u8> {
     b
 }
 
+/// The BLR of a `DEFAULT <keyword>` - the context values whose BLR is a
+/// single opcode: `blr_version5, <op>, blr_eoc`. `CURRENT_DATE` = 160,
+/// `CURRENT_TIMESTAMP` = 161, `CURRENT_TIME` = 162, `CURRENT_USER` = 44
+/// (blr_user_name). None for anything else.
+pub fn keyword_default_blr(keyword: &str) -> Option<Vec<u8>> {
+    let op: u8 = match keyword.trim().to_ascii_uppercase().as_str() {
+        "CURRENT_DATE" => 160,
+        "CURRENT_TIMESTAMP" => 161,
+        "CURRENT_TIME" => 162,
+        "CURRENT_USER" => 44,
+        _ => return None,
+    };
+    Some(vec![5u8, op, 76])
+}
+
 /// The BLR of a `DEFAULT NULL` - `blr_version5, blr_null, blr_eoc`. The
 /// engine stores this explicitly (source `DEFAULT NULL`), distinct from a
 /// column with no default at all (which has neither source nor value); the
