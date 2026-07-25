@@ -4487,6 +4487,7 @@ const SCL_DELETE: u32 = 128;
 const SCL_UPDATE: u32 = 256;
 const SCL_REFERENCES: u32 = 512;
 const SCL_EXECUTE: u32 = 1024;
+const SCL_USAGE: u32 = 2048;
 
 /// A relation owner's privilege mask (grant.epp:121-128): control, drop,
 /// alter, then the four DML and references.
@@ -4499,9 +4500,13 @@ const OWNER_RELATION_PRIVS: u32 = SCL_CONTROL
     | SCL_UPDATE
     | SCL_DELETE;
 
-/// A procedure owner's privilege mask: alter, control, drop, execute (probe:
-/// the owner ACE bytes are 6 1 3 11).
+/// A procedure/function owner's privilege mask: alter, control, drop, execute
+/// (probe: the owner ACE bytes are 6 1 3 11).
 const OWNER_PROCEDURE_PRIVS: u32 = SCL_ALTER | SCL_CONTROL | SCL_DROP | SCL_EXECUTE;
+
+/// A sequence owner's privilege mask: alter, control, drop, usage (probe: the
+/// owner ACE bytes are 6 1 3 12).
+const OWNER_SEQUENCE_PRIVS: u32 = SCL_ALTER | SCL_CONTROL | SCL_DROP | SCL_USAGE;
 
 /// A SQL privilege letter to its SCL flag (grant.epp `trans_sql_priv`, the
 /// letters a relation/field grant uses).
@@ -4530,6 +4535,7 @@ fn move_priv(mask: u32) -> Vec<u8> {
         (SCL_SELECT, 4),
         (SCL_REFERENCES, 10),
         (SCL_EXECUTE, 11),
+        (SCL_USAGE, 12),
     ];
     ORDER
         .iter()
@@ -5102,17 +5108,21 @@ fn procedure_owner_class(file: &[u8], page_size: usize, proc: &str) -> Option<(S
     out
 }
 
-/// An executable's (procedure or function) security-class ACL from the
-/// `EXECUTE` grants now in `RDB$USER_PRIVILEGES`: the owner ACE
-/// (alter/control/drop/execute), then every other grantee with `EXECUTE`,
-/// alphabetically, with `PUBLIC` (the all-users wildcard) last - the relation
-/// ordering. `object_type` selects procedure (5) or function (15) rows.
-fn build_executable_acl(
+/// A non-relation object's (procedure, function, sequence) security-class ACL
+/// from the grants now in `RDB$USER_PRIVILEGES`: the owner ACE (`owner_mask`),
+/// then every other grantee with `grantee_flag`, alphabetically, with `PUBLIC`
+/// (the all-users wildcard) last - the relation ordering. `object_type` and
+/// `priv_letter` select the object's rows (procedure 5/`X`, function 15/`X`,
+/// sequence 14/`G`).
+fn build_object_acl(
     file: &[u8],
     page_size: usize,
     name: &str,
     object_type: i64,
+    priv_letter: &str,
     owner: &str,
+    owner_mask: u32,
+    grantee_flag: u32,
 ) -> Vec<u8> {
     use std::collections::BTreeSet;
     let mut named: BTreeSet<String> = BTreeSet::new();
@@ -5132,7 +5142,7 @@ fn build_executable_acl(
             ) {
                 walk_rows(file, page_size, rel, descs, |v| {
                     if text_eq(v.get(rn_f), name)
-                        && text_eq(v.get(p_f), "X")
+                        && text_eq(v.get(p_f), priv_letter)
                         && matches!(v.get(ot_f), Some(Value::Int(t)) if *t == object_type)
                     {
                         if let Some(Value::Text(u)) = v.get(u_f) {
@@ -5150,12 +5160,12 @@ fn build_executable_acl(
             }
         }
     }
-    let mut acl: AclList = vec![(Some(owner.to_string()), OWNER_PROCEDURE_PRIVS)];
+    let mut acl: AclList = vec![(Some(owner.to_string()), owner_mask)];
     for u in named {
-        acl_grant_user(&mut acl, Some(u), SCL_EXECUTE);
+        acl_grant_user(&mut acl, Some(u), grantee_flag);
     }
     if has_public {
-        acl_grant_user(&mut acl, None, SCL_EXECUTE);
+        acl_grant_user(&mut acl, None, grantee_flag);
     }
     acl_serialize(&acl)
 }
@@ -5193,28 +5203,33 @@ fn function_owner_class(file: &[u8], page_size: usize, func: &str) -> Option<(St
     out
 }
 
-/// The shared core of `GRANT EXECUTE ON PROCEDURE|FUNCTION`: write (or delete)
-/// the `RDB$USER_PRIVILEGES` `X` rows for the object (`object_type` 5 for a
-/// procedure, 15 for a function), then recompute its security-class ACL. The
-/// procedure/function analogue of [grant_table].
+/// The shared core of a `GRANT` on a non-relation object (procedure,
+/// function, sequence): write (or delete) the `RDB$USER_PRIVILEGES` rows for
+/// the object (`priv_letter`/`object_type`), then recompute its security-class
+/// ACL from `owner_mask` and `grantee_flag`. The procedure/function/sequence
+/// analogue of [grant_table].
 #[allow(clippy::too_many_arguments)]
-fn grant_executable(
+fn grant_object(
     file: &mut Vec<u8>,
     page_size: usize,
     name: &str,
     object_type: i64,
+    priv_letter: &str,
     owner: &str,
     class: &str,
+    owner_mask: u32,
+    grantee_flag: u32,
     grantees: &[String],
     grant_option: bool,
     revoke: bool,
 ) -> Result<(), String> {
     let upriv = crate::resolve_relation(file, page_size, "RDB$USER_PRIVILEGES")
         .ok_or("no RDB$USER_PRIVILEGES relation")?;
+    let letter = priv_letter.chars().next().unwrap_or('X');
     for grantee in grantees {
         let grantee = grantee.trim().trim_matches('"').to_ascii_uppercase();
         if revoke {
-            let (g, p) = (grantee.clone(), name.to_string());
+            let (g, p, pl) = (grantee.clone(), name.to_string(), priv_letter.to_string());
             let u_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$USER")?;
             let rn_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$RELATION_NAME")?;
             let pr_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$PRIVILEGE")?;
@@ -5222,14 +5237,14 @@ fn grant_executable(
             delete_catalog_rows(file, page_size, "RDB$USER_PRIVILEGES", move |v| {
                 text_eq(v.get(u_f), &g)
                     && text_eq(v.get(rn_f), &p)
-                    && text_eq(v.get(pr_f), "X")
+                    && text_eq(v.get(pr_f), &pl)
                     && matches!(v.get(ot_f), Some(Value::Int(t)) if *t == object_type)
             })?;
-        } else if !priv_row_present(file, page_size, name, &grantee, 'X', None) {
+        } else if !priv_row_present(file, page_size, name, &grantee, letter, None) {
             let row = vec![
                 ("RDB$USER", SysVal::S(&grantee)),
                 ("RDB$GRANTOR", SysVal::S(owner)),
-                ("RDB$PRIVILEGE", SysVal::S("X")),
+                ("RDB$PRIVILEGE", SysVal::S(priv_letter)),
                 ("RDB$GRANT_OPTION", SysVal::I(if grant_option { 1 } else { 0 })),
                 ("RDB$RELATION_NAME", SysVal::S(name)),
                 ("RDB$USER_TYPE", SysVal::I(8)),
@@ -5239,13 +5254,22 @@ fn grant_executable(
             sys_insert(file, page_size, "RDB$USER_PRIVILEGES", upriv, &row)?;
         }
     }
-    let acl = build_executable_acl(file, page_size, name, object_type, owner);
+    let acl = build_object_acl(
+        file,
+        page_size,
+        name,
+        object_type,
+        priv_letter,
+        owner,
+        owner_mask,
+        grantee_flag,
+    );
     write_class_acl(file, page_size, class, &acl)?;
     advance_oldest_transactions(file, page_size)
 }
 
 /// `GRANT EXECUTE ON PROCEDURE <p> TO <grantees> [WITH GRANT OPTION]` and its
-/// `REVOKE ... FROM` inverse (object type 5).
+/// `REVOKE ... FROM` inverse (object type 5, privilege `X`).
 pub fn grant_procedure(
     file: &mut Vec<u8>,
     page_size: usize,
@@ -5257,13 +5281,14 @@ pub fn grant_procedure(
     let proc = proc.trim().trim_matches('"').to_ascii_uppercase();
     let (owner, class) = procedure_owner_class(file, page_size, &proc)
         .ok_or_else(|| format!("Procedure {} not found", proc))?;
-    grant_executable(
-        file, page_size, &proc, 5, &owner, &class, grantees, grant_option, revoke,
+    grant_object(
+        file, page_size, &proc, 5, "X", &owner, &class, OWNER_PROCEDURE_PRIVS, SCL_EXECUTE,
+        grantees, grant_option, revoke,
     )
 }
 
 /// `GRANT EXECUTE ON FUNCTION <f> TO <grantees> [WITH GRANT OPTION]` and its
-/// `REVOKE ... FROM` inverse (object type 15).
+/// `REVOKE ... FROM` inverse (object type 15, privilege `X`).
 pub fn grant_function(
     file: &mut Vec<u8>,
     page_size: usize,
@@ -5275,8 +5300,63 @@ pub fn grant_function(
     let func = func.trim().trim_matches('"').to_ascii_uppercase();
     let (owner, class) = function_owner_class(file, page_size, &func)
         .ok_or_else(|| format!("Function {} not found", func))?;
-    grant_executable(
-        file, page_size, &func, 15, &owner, &class, grantees, grant_option, revoke,
+    grant_object(
+        file, page_size, &func, 15, "X", &owner, &class, OWNER_PROCEDURE_PRIVS, SCL_EXECUTE,
+        grantees, grant_option, revoke,
+    )
+}
+
+/// A sequence's `(RDB$OWNER_NAME, RDB$SECURITY_CLASS)` from `RDB$GENERATORS`.
+fn generator_owner_class(file: &[u8], page_size: usize, seq: &str) -> Option<(String, String)> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$GENERATORS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$GENERATORS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$GENERATORS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (name_f, own_f, sc_f) = (
+        fid("RDB$GENERATOR_NAME")?,
+        fid("RDB$OWNER_NAME")?,
+        fid("RDB$SECURITY_CLASS")?,
+    );
+    let mut out = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if out.is_none() && text_eq(v.get(name_f), seq) {
+            let own = match v.get(own_f) {
+                Some(Value::Text(t)) => t.trim_end().to_string(),
+                _ => OWNER.to_string(),
+            };
+            let sc = match v.get(sc_f) {
+                Some(Value::Text(t)) => t.trim_end().to_string(),
+                _ => return,
+            };
+            out = Some((own, sc));
+        }
+    });
+    out
+}
+
+/// `GRANT USAGE ON SEQUENCE|GENERATOR <s> TO <grantees> [WITH GRANT OPTION]`
+/// and its `REVOKE ... FROM` inverse (object type 14, privilege `G`). The
+/// owner ACE is alter/control/drop/usage; a grantee gets usage.
+pub fn grant_sequence(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    seq: &str,
+    grantees: &[String],
+    grant_option: bool,
+    revoke: bool,
+) -> Result<(), String> {
+    let seq = seq.trim().trim_matches('"').to_ascii_uppercase();
+    let (_, system, _) = find_generator(file, page_size, &seq)
+        .ok_or_else(|| format!("Sequence {} not found", seq))?;
+    if system != 0 {
+        return Err("system generators are read-only".into());
+    }
+    let (owner, class) = generator_owner_class(file, page_size, &seq)
+        .ok_or_else(|| format!("Sequence {} has no security class", seq))?;
+    grant_object(
+        file, page_size, &seq, 14, "G", &owner, &class, OWNER_SEQUENCE_PRIVS, SCL_USAGE,
+        grantees, grant_option, revoke,
     )
 }
 

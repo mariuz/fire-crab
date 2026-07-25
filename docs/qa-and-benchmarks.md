@@ -3409,6 +3409,27 @@ byte, revoke one and confirm the recompute, refuse an unknown function, and run 
 `gbak` round trip plus `gfix`. The procedure gate still passes unchanged, so the
 shared core serves both.
 
+### The ninety-first differential — GRANT USAGE, on a sequence
+
+Procedures and functions took `EXECUTE`; a sequence takes `USAGE`, the right to
+draw its next value. It is the same object grant with two more parameters lifted
+out: the privilege letter (`G`, not `X`), object type 14, and an owner ACE of
+alter/control/drop/**usage** (bytes `6 1 3 12`, where a routine's were `…11`). So
+the `grant_procedure`/`grant_function` core generalised once more into a
+`grant_object` taking the privilege letter, owner mask, and grantee flag, with
+`grant_sequence` the third thin wrapper — and `SCL_USAGE` (code 12) joined the
+privilege order. `SEQUENCE` and `GENERATOR` are the two spellings the parser
+accepts.
+
+This one is fully self-contained: fire-crab creates sequences, so no engine setup
+is needed beyond making both databases identical. `qa/serve-real-grantsequence.sh`
+(16 checks) grants `USAGE` to two users (one `WITH GRANT OPTION`) and — through
+the `GENERATOR` synonym — `PUBLIC`, compares every `RDB$USER_PRIVILEGES` `G` row
+and the sequence's security-class `RDB$ACL` byte for byte (teeth on the owner's
+`6 1 3 12`), revokes one and confirms the recompute, refuses an unknown sequence,
+and runs a `gbak` round trip plus `gfix`. The procedure and function gates still
+pass unchanged over the shared core.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest
