@@ -3657,6 +3657,25 @@ an identity column to `ALWAYS` and back to `BY DEFAULT` on two copies, comparing
 byte after each; refuses a `SET GENERATED` on a non-identity column on both; and
 runs a `gbak` round trip plus `gfix`.
 
+### The hundred-and-second differential — DROP IDENTITY
+
+The inverse of creating an identity column. `DROP IDENTITY` clears the column's
+`RDB$IDENTITY_TYPE` and `RDB$GENERATOR_NAME`, drops the implicit generator and its
+security class and privilege rows (the same teardown `DROP SEQUENCE` and `DROP
+DOMAIN` do), and rebuilds the runtime — which, because the rebuild reads those RF
+columns, now emits the field without its identity segments while keeping the
+not-null. And it *does* keep the not-null: the column's `RDB$NULL_FLAG` stays 1,
+so a former identity column stays `NOT NULL` after the identity is gone, exactly
+as the engine leaves it. A `DROP IDENTITY` on a non-identity column is refused.
+
+`qa/serve-real-identitydrop.sh` (11 checks) has fire-crab and the engine drop an
+identity on two copies and compares the `RDB$RELATION_FIELDS` row (identity type
+and generator cleared, null flag kept) with the generator, class and privilege
+rows gone; compares the `RDB$RUNTIME` byte for byte; confirms the column is still
+`NOT NULL` (a NULL insert fails, a value inserts, with no auto-generation);
+refuses a `DROP IDENTITY` on a non-identity column on both; and runs a `gbak`
+round trip plus `gfix`.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest

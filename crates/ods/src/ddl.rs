@@ -1818,6 +1818,61 @@ pub fn alter_column_set_generated(
     advance_oldest_transactions(file, page_size)
 }
 
+/// `ALTER TABLE <t> ALTER [COLUMN] <c> DROP IDENTITY` - make an identity
+/// column an ordinary one. The column's `RDB$IDENTITY_TYPE` and
+/// `RDB$GENERATOR_NAME` are cleared (its `RDB$NULL_FLAG` stays - the column
+/// remains NOT NULL), the implicit generator and its security class and
+/// privilege rows are dropped, and the runtime is rebuilt (which drops the
+/// identity segments 22/23 but keeps the not-null, since the RF row still
+/// carries the flag).
+pub fn alter_column_drop_identity(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    column: &str,
+) -> Result<(), String> {
+    let table = table.trim().to_ascii_uppercase();
+    let column = column.trim().trim_matches('"').to_ascii_uppercase();
+    let gen = column_identity_generator(file, page_size, &table, &column)
+        .ok_or_else(|| format!("column {} is not an identity column", column))?;
+    let class = find_generator(file, page_size, &gen).and_then(|(_, _, c)| c);
+    // clear the column's identity metadata (leave RDB$NULL_FLAG as-is)
+    let rel_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$RELATION_NAME")?;
+    let name_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$FIELD_NAME")?;
+    let (t, c) = (table.clone(), column.clone());
+    patch_sys_row(
+        file,
+        page_size,
+        "RDB$RELATION_FIELDS",
+        5,
+        move |v| text_eq(v.get(rel_fid), &t) && text_eq(v.get(name_fid), &c),
+        &[
+            ("RDB$IDENTITY_TYPE", SysVal::Null),
+            ("RDB$GENERATOR_NAME", SysVal::Null),
+        ],
+    )?;
+    // drop the generator, its security class and its privilege rows
+    let gname_f = sys_fid(file, page_size, "RDB$GENERATORS", "RDB$GENERATOR_NAME")?;
+    let g = gen.clone();
+    delete_catalog_rows(file, page_size, "RDB$GENERATORS", move |v| {
+        text_eq(v.get(gname_f), &g)
+    })?;
+    if let Some(class) = class {
+        let cls_f = sys_fid(file, page_size, "RDB$SECURITY_CLASSES", "RDB$SECURITY_CLASS")?;
+        delete_catalog_rows(file, page_size, "RDB$SECURITY_CLASSES", move |v| {
+            text_eq(v.get(cls_f), &class)
+        })?;
+    }
+    let rn_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$RELATION_NAME")?;
+    let ot_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$OBJECT_TYPE")?;
+    let g2 = gen.clone();
+    delete_catalog_rows(file, page_size, "RDB$USER_PRIVILEGES", move |v| {
+        text_eq(v.get(rn_f), &g2) && matches!(v.get(ot_f), Some(Value::Int(14)))
+    })?;
+    update_relation_runtime(file, page_size, &table)?;
+    advance_oldest_transactions(file, page_size)
+}
+
 /// Whether any committed primary record of `rel` has a NULL in field
 /// `fid` - the check `SET NOT NULL` makes before it can succeed.
 fn column_has_nulls(file: &[u8], page_size: usize, rel: u16, fid: usize) -> bool {

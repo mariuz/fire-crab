@@ -873,6 +873,9 @@ enum Plan {
         column: String,
         identity_type: i16,
     },
+    /// `ALTER TABLE <t> ALTER <c> DROP IDENTITY`: make an identity column
+    /// ordinary (dropping its generator, class and privileges)
+    AlterColumnDropIdentity { table: String, column: String },
     /// `INSERT INTO <t> [(cols)] VALUES (...)`: the record image is
     /// built at prepare (nulls flagged, literal fields at their
     /// descriptor offsets); `param_fields` lists the (field id,
@@ -3099,6 +3102,57 @@ fn plan_alter_column_generated(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     ))
 }
 
+/// Parse `ALTER TABLE <t> ALTER [COLUMN] <c> DROP IDENTITY` - make an identity
+/// column ordinary.
+fn plan_alter_column_drop_identity(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "ALTER", 0) != Some(0) {
+        return None;
+    }
+    let table_kw = find_word(&masked, "TABLE", "ALTER".len())?;
+    if masked[..table_kw].trim() != "ALTER" {
+        return None;
+    }
+    let alter2 = find_word(&masked, "ALTER", table_kw + "TABLE".len())?;
+    let table = s[table_kw + "TABLE".len()..alter2].trim().trim_matches('"');
+    if !ident_ok(table) {
+        return None;
+    }
+    let tail = s[alter2 + "ALTER".len()..].trim();
+    let norm = tail
+        .to_ascii_uppercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let dp = norm.find("DROP IDENTITY")?;
+    // must be the tail
+    if norm[dp..].trim() != "DROP IDENTITY" {
+        return None;
+    }
+    let tail_up = tail.to_ascii_uppercase();
+    let drop_pos = find_word(&tail_up, "DROP", 0)?;
+    let mid = tail[..drop_pos].trim();
+    let toks: Vec<&str> = mid.split_whitespace().collect();
+    let col = match toks.as_slice() {
+        [c] => *c,
+        [w, c] if w.eq_ignore_ascii_case("COLUMN") => *c,
+        _ => return None,
+    };
+    let col = col.trim_matches('"');
+    if !ident_ok(col) {
+        return None;
+    }
+    Some((
+        Plan::AlterColumnDropIdentity {
+            table: table.to_ascii_uppercase(),
+            column: col.to_ascii_uppercase(),
+        },
+        Vec::new(),
+    ))
+}
+
 /// Strip a SQL identifier's optional double quotes. A quoted identifier
 /// keeps its case (and `""` is an escaped quote); an unquoted one is
 /// returned as written (the catalog stores it upper-cased, and generator
@@ -4131,6 +4185,10 @@ fn execute_dml(
                 column,
                 *identity_type,
             )?;
+            (0, 0, 0)
+        }
+        Plan::AlterColumnDropIdentity { table, column } => {
+            fire_crab_ods::ddl::alter_column_drop_identity(&mut work, db.page_size, table, column)?;
             (0, 0, 0)
         }
         Plan::Insert { rel, format_no, image, descs, index_ops, param_fields, gen_fields, not_null } => {
@@ -5605,7 +5663,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
-        | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. } => {
+        | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. } | Plan::AlterColumnDropIdentity { .. } => {
             describe_dml(5, params) // isc_info_sql_stmt_ddl
         }
         Plan::Insert { .. } => describe_dml(2, params), // isc_info_sql_stmt_insert
@@ -5651,7 +5709,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
-        | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. } => 5,
+        | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. } | Plan::AlterColumnDropIdentity { .. } => 5,
         Plan::SetGenerator { stmt_type, .. } => *stmt_type,
     }
 }
@@ -5984,7 +6042,7 @@ fn emit_rows_inner(
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
-        | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. }
+        | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. } | Plan::AlterColumnDropIdentity { .. }
         | Plan::GenIdIncrement { .. } | Plan::SetGenerator { .. } => {}
         Plan::Scalar(v) => {
             w.int(OP_FETCH_RESPONSE).int(0).int(1);
@@ -8427,6 +8485,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             .or_else(|| plan_alter_column_default(&text))
                             .or_else(|| plan_alter_column_restart(&text))
                             .or_else(|| plan_alter_column_generated(&text))
+                            .or_else(|| plan_alter_column_drop_identity(&text))
                             .or_else(|| plan_alter_sequence(&text))
                     } else if dml_kw {
                         plan_insert(&text, &database)
@@ -8587,6 +8646,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         .or_else(|| plan_alter_column_default(&stmt_sql))
                         .or_else(|| plan_alter_column_restart(&stmt_sql))
                         .or_else(|| plan_alter_column_generated(&stmt_sql))
+                        .or_else(|| plan_alter_column_drop_identity(&stmt_sql))
                         .or_else(|| plan_alter_sequence(&stmt_sql));
                     match planned {
                         Some((p, ps)) => {
@@ -8717,6 +8777,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::AlterColumnDefault { .. }
                         | Plan::AlterColumnRestart { .. }
                         | Plan::AlterColumnGenerated { .. }
+                        | Plan::AlterColumnDropIdentity { .. }
                         | Plan::SetGenerator { .. }
                 ) {
                     // DML and DDL execute here (not at fetch): write the
@@ -11982,6 +12043,19 @@ mod tests {
             other => panic!("expected AlterColumnGenerated BY DEFAULT, got {:?}", other.is_some()),
         }
         assert!(plan_alter_column_generated("ALTER TABLE T ALTER COLUMN ID RESTART").is_none());
+    }
+
+    #[test]
+    fn parses_alter_column_drop_identity() {
+        match plan_alter_column_drop_identity("ALTER TABLE T ALTER COLUMN ID DROP IDENTITY") {
+            Some((Plan::AlterColumnDropIdentity { table, column }, _)) => {
+                assert_eq!((table.as_str(), column.as_str()), ("T", "ID"));
+            }
+            other => panic!("expected AlterColumnDropIdentity, got {:?}", other.is_some()),
+        }
+        assert!(plan_alter_column_drop_identity("alter table t alter id drop identity").is_some());
+        assert!(plan_alter_column_drop_identity("ALTER TABLE T DROP CONSTRAINT C").is_none());
+        assert!(plan_alter_column_drop_identity("ALTER TABLE T ALTER COLUMN A DROP DEFAULT").is_none());
     }
 
     #[test]
