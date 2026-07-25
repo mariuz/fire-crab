@@ -3549,6 +3549,23 @@ a `''` escape) on two copies, compares the `RDB$DATABASE` description read back 
 text and the description blob record byte for byte (framing and `blh_charset` 4),
 clears it and confirms NULL on both, and runs a `gbak` round trip plus `gfix`.
 
+### The ninety-seventh differential — an auto-domain has an owner
+
+The domain security fix raised the neighbouring question: a built-in column's
+auto-domain (`RDB$<n>`) is a row in the same `RDB$FIELDS`, so does *it* carry an
+owner? The engine's answer is yes to the owner and no to the security class — an
+auto-domain has `RDB$OWNER_NAME` set to the table's owner but no
+`RDB$SECURITY_CLASS` (it is internal, not independently grantable). fire-crab had
+been leaving the owner NULL, in both `CREATE TABLE` and `ALTER TABLE ADD`, which
+create auto-domains — a latent gap the type and format gates never looked at.
+
+The fix is one field on two writes. `qa/serve-real-autodomain.sh` (7 checks)
+creates a table and `ALTER`s a column onto it on two copies, and compares every
+auto-domain `RDB$FIELDS` row — name, type, length, owner and security class —
+against the engine, then `gbak` round trips and `gfix` checks the file. Teeth:
+the auto-domains are owned by `SYSDBA` with a NULL security class, the
+`ALTER`-added one included.
+
 ### Stage 3 — the Firebird QA suite (reached)
 
 The official [firebird-qa](https://github.com/FirebirdSQL/firebird-qa) pytest

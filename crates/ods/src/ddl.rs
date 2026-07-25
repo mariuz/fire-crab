@@ -715,6 +715,8 @@ pub fn alter_table_add_column(
         ("RDB$FIELD_SCALE", SysVal::I(col.scale as i64)),
         ("RDB$FIELD_SUB_TYPE", SysVal::I(col.sub_type as i64)),
         ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+        // an auto-domain is owned by the table's owner (no security class)
+        ("RDB$OWNER_NAME", SysVal::S(OWNER)),
         ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
     ];
     if let Some(cl) = col.char_len {
@@ -2104,6 +2106,8 @@ pub fn create_table(
             ("RDB$FIELD_SCALE", SysVal::I(c.scale as i64)),
             ("RDB$FIELD_SUB_TYPE", SysVal::I(c.sub_type as i64)),
             ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+            // an auto-domain is owned by the table's owner (no security class)
+            ("RDB$OWNER_NAME", SysVal::S(OWNER)),
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ];
         if let Some(cl) = c.char_len {
