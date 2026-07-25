@@ -2329,9 +2329,8 @@ fn parse_fk_clause(up_item: &str) -> Option<fire_crab_ods::ddl::ForeignKeyDef> {
 }
 
 /// Parse the trailing `[ON UPDATE <action>] [ON DELETE <action>]` of a
-/// foreign key (already uppercased). `CASCADE`, `SET NULL`, `RESTRICT` and
-/// `NO ACTION` are modelled (the last two as RESTRICT); `SET DEFAULT`
-/// parses to None so the whole clause falls back.
+/// foreign key (already uppercased). `CASCADE`, `SET NULL`, `SET DEFAULT`,
+/// `RESTRICT` and `NO ACTION` are modelled (the last two as RESTRICT).
 fn parse_ref_actions(s: &str) -> Option<(fire_crab_ods::ddl::RefAction, fire_crab_ods::ddl::RefAction)> {
     use fire_crab_ods::ddl::RefAction;
     let (mut on_update, mut on_delete) = (RefAction::Restrict, RefAction::Restrict);
@@ -2360,7 +2359,11 @@ fn parse_ref_actions(s: &str) -> Option<(fire_crab_ods::ddl::RefAction, fire_cra
                 i += 2;
                 RefAction::SetNull
             }
-            _ => return None, // SET DEFAULT not modelled
+            "SET" if toks.get(i + 1) == Some(&"DEFAULT") => {
+                i += 2;
+                RefAction::SetDefault
+            }
+            _ => return None,
         };
         match which {
             "UPDATE" => on_update = action,
@@ -12605,7 +12608,14 @@ mod tests {
         assert!(fk.on_delete == RefAction::Restrict);
         let fk = parse_fk_clause("FOREIGN KEY (MID) REFERENCES M ON DELETE SET NULL").unwrap();
         assert!(fk.on_delete == RefAction::SetNull && fk.on_update == RefAction::Restrict);
-        assert!(parse_fk_clause("FOREIGN KEY (MID) REFERENCES M ON DELETE SET DEFAULT").is_none());
+        // SET DEFAULT is modelled since inc 112
+        match parse_fk_clause("FOREIGN KEY (MID) REFERENCES M ON DELETE SET DEFAULT") {
+            Some(fk) => {
+                assert!(fk.on_delete == fire_crab_ods::ddl::RefAction::SetDefault);
+                assert!(fk.on_update == fire_crab_ods::ddl::RefAction::Restrict);
+            }
+            None => panic!("SET DEFAULT should parse"),
+        }
     }
 
     #[test]

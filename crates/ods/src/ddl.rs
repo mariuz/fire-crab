@@ -1928,11 +1928,30 @@ pub fn alter_column_default(
     if rel < 128 {
         return Err("system relations are read-only".into());
     }
-    if !relation_columns(file, page_size, &table)
+    let col_fid = relation_columns(file, page_size, &table)
         .iter()
-        .any(|c| c.name.eq_ignore_ascii_case(&column))
-    {
-        return Err(format!("column {} not found in table {}", column, table));
+        .find(|c| c.name.eq_ignore_ascii_case(&column))
+        .map(|c| c.field_id)
+        .ok_or_else(|| format!("column {} not found in table {}", column, table))?;
+    // the engine refuses a default change on a column inside a FOREIGN
+    // KEY index ("cannot modify index used by an integrity constraint",
+    // probed - a SET DEFAULT referential action reads the default
+    // through that index's constraint; PK, UNIQUE and plain-indexed
+    // columns all accept the change)
+    if let Some(irt) = find_index_root(file, page_size, rel) {
+        for e in irt.live_entries() {
+            if e.flags & btw::IRT_FOREIGN == 0 {
+                continue;
+            }
+            let (segs, _) = btw::index_segments(file, page_size, rel, e.id, e.key_count as usize)
+                .ok_or("unreadable index segments")?;
+            if segs.iter().any(|(field, _)| *field == col_fid) {
+                return Err(format!(
+                    "column {} is part of a FOREIGN KEY - its default cannot change",
+                    column
+                ));
+            }
+        }
     }
     let (src_val, val_val) = match default {
         Some(def) => {
@@ -2453,6 +2472,7 @@ pub enum RefAction {
     Restrict,
     Cascade,
     SetNull,
+    SetDefault,
 }
 
 impl RefAction {
@@ -2462,6 +2482,7 @@ impl RefAction {
             RefAction::Restrict => "RESTRICT",
             RefAction::Cascade => "CASCADE",
             RefAction::SetNull => "SET NULL",
+            RefAction::SetDefault => "SET DEFAULT",
         }
     }
 }
@@ -3913,12 +3934,57 @@ fn blr_field(b: &mut Vec<u8>, ctx: u8, name: &str) {
 /// each `child.fk_i` either `NEW.pk_i` (cascade) or `NULL` (set-null).
 fn fk_trigger_blr(
     is_update: bool,
-    set_null: bool,
+    action: RefAction,
     child_rel: &str,
     fk_cols: &[String],
     pk_cols: &[String],
 ) -> Vec<u8> {
+    let set_null = action == RefAction::SetNull;
+    let set_default = action == RefAction::SetDefault;
     let mut b = vec![5u8]; // blr_version5
+    if set_default {
+        // SET DEFAULT declares variables, so the whole trigger sits in a
+        // begin..end; the default is fetched at RUNTIME, per column: a
+        // PAIR of variables typed as the child column itself
+        // (blr_column_name - flag 1 also carries the column's DEFAULT),
+        // var2i := NULL, then a fault-swallowing block that initialises
+        // var2i+1 (init_variable evaluates the declared default) and
+        // copies it into var2i. A column with no default - or one whose
+        // default fails to evaluate - leaves var2i NULL. Probed
+        // byte-for-byte from the engine's own SET DEFAULT triggers.
+        b.push(2); // blr_begin
+        for (i, col) in fk_cols.iter().enumerate() {
+            let v0 = (2 * i) as u16;
+            let v1 = (2 * i + 1) as u16;
+            for (v, flag) in [(v0, 0u8), (v1, 1u8)] {
+                b.push(3); // blr_dcl_variable
+                b.extend_from_slice(&v.to_le_bytes());
+                b.push(21); // blr_column_name (dtype by column reference)
+                b.push(flag);
+                b.push(child_rel.len() as u8);
+                b.extend_from_slice(child_rel.as_bytes());
+                b.push(col.len() as u8);
+                b.extend_from_slice(col.as_bytes());
+            }
+            b.push(1); // blr_assignment: NULL -> var2i
+            b.push(45); // blr_null
+            b.push(26); // blr_variable
+            b.extend_from_slice(&v0.to_le_bytes());
+            b.push(129); // blr_block
+            b.push(2); // blr_begin
+            b.push(184); // blr_init_variable var2i+1 (evaluates the default)
+            b.extend_from_slice(&v1.to_le_bytes());
+            b.push(1); // blr_assignment: var2i+1 -> var2i
+            b.push(26);
+            b.extend_from_slice(&v1.to_le_bytes());
+            b.push(26);
+            b.extend_from_slice(&v0.to_le_bytes());
+            b.push(255); // blr_end (the block's begin)
+            // blr_error_handler, 1 condition (any error), empty body
+            b.extend_from_slice(&[130, 1, 0, 4, 2]);
+            b.extend_from_slice(&[255, 255]); // end handler, end block
+        }
+    }
     if is_update {
         b.push(8); // blr_if
         // OR chain of OLD.pk_i <> NEW.pk_i
@@ -3952,12 +4018,13 @@ fn fk_trigger_blr(
     }
     b.push(255); // blr_end (rse)
 
-    if !is_update && !set_null {
+    if !is_update && action == RefAction::Cascade {
         // delete cascade: ERASE the child row
         b.push(5); // blr_erase
         b.push(2); // context 2
     } else {
-        // MODIFY: set each child.fk_i to NEW.pk_i (cascade) or NULL
+        // MODIFY: set each child.fk_i to NEW.pk_i (cascade), NULL
+        // (set-null), or the runtime-fetched default in var2i
         b.push(10); // blr_modify
         b.push(2); // from context 2
         b.push(2); // to context 2
@@ -3966,6 +4033,9 @@ fn fk_trigger_blr(
             b.push(1); // blr_assignment
             if set_null {
                 b.push(45); // blr_null
+            } else if set_default {
+                b.push(26); // blr_variable var2i
+                b.extend_from_slice(&((2 * i) as u16).to_le_bytes());
             } else {
                 blr_field(&mut b, 1, &pk_cols[i]); // NEW.pk_i
             }
@@ -3975,6 +4045,9 @@ fn fk_trigger_blr(
         if is_update {
             b.extend_from_slice(&[255, 255, 255]); // for / begin / begin
         }
+    }
+    if set_default {
+        b.push(255); // blr_end (the outer begin)
     }
     b.push(76); // blr_eoc
     b
@@ -4145,13 +4218,7 @@ fn write_foreign_key(
             if action == RefAction::Restrict {
                 return Ok(());
             }
-            let blr = fk_trigger_blr(
-                is_update,
-                action == RefAction::SetNull,
-                table,
-                &fk.columns,
-                &pk_cols,
-            );
+            let blr = fk_trigger_blr(is_update, action, table, &fk.columns, &pk_cols);
             store_fk_trigger(file, page_size, &parent, table, &fk.columns, &pk_cols, ttype, &blr)
         };
         make(true, fk.on_update, 4)?;
@@ -6931,6 +6998,47 @@ mod tests {
         let b = blob_id_bytes(8, 5);
         assert_eq!(&b[0..2], &8u16.to_le_bytes());
         assert_eq!(&b[4..8], &5u32.to_le_bytes());
+    }
+
+    /// Golden bytes probed from the engine's own SET DEFAULT triggers
+    /// (RDB$TRIGGER_BLR of `FOREIGN KEY (X) REFERENCES P (ID) ON DELETE
+    /// SET DEFAULT` and friends): the variable preamble that fetches the
+    /// child column's default at RUNTIME, then the SET NULL skeleton
+    /// assigning the variables, all inside an outer begin.
+    #[test]
+    fn set_default_trigger_blr_matches_engine() {
+        let one = |s: &str| vec![s.to_string()];
+        // ON DELETE SET DEFAULT, single column (probe table C1)
+        let del = fk_trigger_blr(false, RefAction::SetDefault, "C1", &one("X"), &one("ID"));
+        let want_hex = "05020300001500024331015803010015010243310158012D1A00008102B80100011A01001A0000FF8201000402FFFF0743014A02433102472F170201581700024944FF0A020202011A000017020158FFFF4C";
+        let want: Vec<u8> = (0..want_hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&want_hex[i..i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(del, want);
+        // ON UPDATE SET DEFAULT, single column (probe table C2)
+        let upd = fk_trigger_blr(true, RefAction::SetDefault, "C2", &one("X"), &one("ID"));
+        let want_hex = "05020300001500024332015803010015010243320158012D1A00008102B80100011A01001A0000FF8201000402FFFF08301700024944170102494402020743014A02433202472F170201581700024944FF0A020202011A000017020158FFFFFFFFFF4C";
+        let want: Vec<u8> = (0..want_hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&want_hex[i..i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(upd, want);
+        // ON DELETE SET DEFAULT, TWO columns (probe table C3): per-column
+        // variable pairs (0,1) and (2,3), AND-chained match, both assigned
+        let del2 = fk_trigger_blr(
+            false,
+            RefAction::SetDefault,
+            "C3",
+            &["X".to_string(), "Y".to_string()],
+            &["A".to_string(), "B".to_string()],
+        );
+        let want_hex = "05020300001500024333015803010015010243330158012D1A00008102B80100011A01001A0000FF8201000402FFFF0302001500024333015903030015010243330159012D1A02008102B80300011A03001A0200FF8201000402FFFF0743014A02433302473A2F17020158170001412F1702015917000142FF0A020202011A000017020158011A020017020159FFFF4C";
+        let want: Vec<u8> = (0..want_hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&want_hex[i..i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(del2, want);
     }
 
     #[test]
