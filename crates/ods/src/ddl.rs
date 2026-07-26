@@ -1240,6 +1240,93 @@ fn domain_exists(file: &[u8], page_size: usize, name: &str) -> bool {
     found
 }
 
+/// Give `table` a NEW FORMAT VERSION with the fields at `fids` retyped
+/// to `new_col`'s storage - the per-dependent-table half of an in-use
+/// `ALTER DOMAIN TYPE` (the engine bumps every dependent table's format
+/// by exactly one per statement, however many of its columns use the
+/// domain - probed). The same repack-insert-rebuild-bump sequence the
+/// column ALTER TYPE performs after its own guards: existing records
+/// keep their old format and read back promoted.
+fn reformat_for_retype(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    table: &str,
+    fids: &[usize],
+    new_col: &ColumnDef,
+) -> Result<(), String> {
+    let rel = crate::resolve_relation(file, page_size, table)
+        .ok_or_else(|| format!("table {} not found", table))?;
+    let cur_formats = crate::relation_formats(file, page_size, rel);
+    let (_, cur_descs) = cur_formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .ok_or("relation has no format")?;
+    // the new format: each dependent field's descriptor replaced, all
+    // repacked; a COMPUTED field keeps its offset-0 descriptor
+    let mut fields: Vec<(u8, u16, i8, i16, bool)> = descs_to_fields(cur_descs)
+        .into_iter()
+        .zip(cur_descs.iter())
+        .map(|((dt, l, s, st), d)| (dt, l, s, st, d.offset == 0 && d.length != 0))
+        .collect();
+    let (dt, l, s, st) = col_field(new_col.dtype, new_col.length, new_col.scale, new_col.sub_type);
+    for fid in fids {
+        let f = fields
+            .get_mut(*fid)
+            .ok_or("dependent field beyond the format")?;
+        if f.4 {
+            return Err(format!("cannot retype a computed field of {}", table));
+        }
+        *f = (dt, l, s, st, false);
+    }
+    let new_descs = compute_format_mixed(&fields);
+
+    let (rel_page, rel_slot, mut rel_image, rec_format) =
+        find_relations_row(file, page_size, table).ok_or("RDB$RELATIONS row not found")?;
+    let sys_formats = system_relation_formats(file, page_size, "RDB$RELATIONS")
+        .ok_or("no RDB$RELATIONS format")?;
+    let (_, rel_descs) = sys_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let rel_cols = relation_columns(file, page_size, "RDB$RELATIONS");
+    let rel_field =
+        |name: &str| rel_cols.iter().find(|c| c.name == name).map(|c| c.field_id as usize);
+    let cur_format_no = match decode_record(&rel_image, rel_descs)
+        .get(rel_field("RDB$FORMAT").ok_or("no RDB$FORMAT")?)
+    {
+        Some(Value::Int(n)) => *n,
+        _ => return Err("RDB$FORMAT unreadable".into()),
+    };
+    let new_format_no = cur_format_no + 1;
+
+    let fmt_blob = write_format_blob(file, page_size, &new_descs)?;
+    sys_insert(
+        file,
+        page_size,
+        "RDB$FORMATS",
+        8,
+        &[
+            ("RDB$RELATION_ID", SysVal::I(rel as i64)),
+            ("RDB$FORMAT", SysVal::I(new_format_no)),
+            ("RDB$DESCRIPTOR", SysVal::B(blob_id_bytes(8, fmt_blob))),
+        ],
+    )?;
+    let runtime = rebuild_runtime_blob(file, page_size, table, &new_descs)?;
+    let patch = |image: &mut [u8], name: &str, v: SysVal<'_>| -> Result<(), String> {
+        let fid = rel_field(name).ok_or_else(|| format!("no {} column", name))?;
+        let d = rel_descs.get(fid).ok_or("field beyond format")?;
+        let bytes = encode_sys_value(d, &v)?;
+        let at = d.offset as usize;
+        image
+            .get_mut(at..at + bytes.len())
+            .ok_or("image shorter than format")?
+            .copy_from_slice(&bytes);
+        image[fid / 8] &= !(1 << (fid % 8));
+        Ok(())
+    };
+    patch(&mut rel_image, "RDB$FORMAT", SysVal::I(new_format_no))?;
+    patch(&mut rel_image, "RDB$RUNTIME", SysVal::B(blob_id_bytes(6, runtime)))?;
+    dml::update_records(file, page_size, 6, &[(rel_page, rel_slot, rel_image)], rec_format)?;
+    Ok(())
+}
+
 /// Every table.column that uses a domain as its `RDB$FIELD_SOURCE`,
 /// as (relation name, column name) pairs - what the ALTER DOMAIN TYPE
 /// dependents guard walks.
@@ -1658,23 +1745,28 @@ pub fn alter_domain_type(
     // the dependents guard, before any write. The engine's rule
     // (probed): a dependent column inside a FOREIGN KEY index refuses -
     // "Cannot modify index used by an Integrity Constraint" - while
-    // PK/UNIQUE and plain-indexed dependents retype fine there, the
-    // engine writing a NEW FORMAT VERSION for every dependent table
-    // (probed: 7 formats on a much-altered table). This path does not
-    // write those format bumps yet, so any OTHER dependent refuses
-    // conservatively - never a catalog-vs-format mismatch - with the
-    // FK case reporting the engine's own message first.
+    // PK/UNIQUE and plain-indexed dependents retype fine, each
+    // dependent TABLE getting one new format version below.
     let deps = domain_dependents(file, page_size, &want)?;
     for (t, c) in &deps {
         if indices_containing(file, page_size, t, c)?.iter().any(|(_, fk)| *fk) {
             return Err("Cannot modify index used by an Integrity Constraint".into());
         }
     }
-    if let Some((t, c)) = deps.first() {
-        return Err(format!(
-            "domain {} is in use (by {}.{}); the dependent-format rewrite is not written yet",
-            want, t, c
-        ));
+    // group the dependents by table and resolve their field ids now
+    // (pure reads) - any unresolvable dependent refuses before a write
+    let mut by_table: Vec<(String, Vec<usize>)> = Vec::new();
+    for (t, c) in &deps {
+        let cols = relation_columns(file, page_size, t);
+        let fid = cols
+            .iter()
+            .find(|rc| rc.name.eq_ignore_ascii_case(c))
+            .map(|rc| rc.field_id as usize)
+            .ok_or_else(|| format!("dependent column {}.{} not found", t, c))?;
+        match by_table.iter_mut().find(|(name, _)| name == t) {
+            Some((_, fids)) => fids.push(fid),
+            None => by_table.push((t.clone(), vec![fid])),
+        }
     }
     // patch the domain's RDB$FIELDS row in place (mirror of the column
     // ALTER TYPE retype, minus the table format/runtime it does not have)
@@ -1726,6 +1818,12 @@ pub fn alter_domain_type(
         patch_field(&mut f_image, "RDB$CHARACTER_LENGTH", SysVal::I(cl as i64))?;
     }
     dml::update_records(file, page_size, 2, &[(fpage, fslot, f_image)], f_format_no)?;
+    // every dependent table gets ONE new format version with all its
+    // domain-typed fields retyped (probed: one bump per table per
+    // statement, old rows read back promoted)
+    for (t, fids) in &by_table {
+        reformat_for_retype(file, page_size, t, fids, new_col)?;
+    }
     advance_oldest_transactions(file, page_size)
 }
 

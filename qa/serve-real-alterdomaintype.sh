@@ -57,6 +57,8 @@ done
 "$ISQL" -q -b -user "$U" -pas "$P" "$REF" >/dev/null 2>&1 <<EOF
 $I_BIG; $S_INT; $V_WIDE;
 COMMIT;
+ALTER DOMAIN DOM_PU TYPE BIGINT;
+COMMIT;
 EOF
 eng_narrow=$("$ISQL" -q -b -user "$U" -pas "$P" "$REF" 2>&1 <<EOF
 $NARROW;
@@ -126,9 +128,11 @@ case "$eng_narrow$eng_incompat" in *[Ff]ailed*|*[Ee]rror*|*unsuccessful*) echo "
 r=$(node_run "ALTER DOMAIN DOM_FK TYPE BIGINT")
 case "$r" in ERR*) echo "OK   an FK-child domain is refused (engine parity)" ;;
     *) echo "DIFF FK-child domain guard"; echo "     $r"; fail=1 ;; esac
+# an in-use (non-FK) domain retypes WITH a dependent format bump since
+# inc 124 (deep differential: serve-real-domainretype)
 r=$(node_run "ALTER DOMAIN DOM_PU TYPE BIGINT")
-case "$r" in ERR*) echo "OK   any other IN-USE domain refuses (conservative - no format bump yet)" ;;
-    *) echo "DIFF in-use domain guard"; echo "     $r"; fail=1 ;; esac
+case "$r" in OK) echo "OK   an IN-USE domain retypes (dependent format bump, inc 124)" ;;
+    *) echo "DIFF in-use domain retype"; echo "     $r"; fail=1 ;; esac
 
 # --- 1. the retyped domain type rows -----------------------------------
 infoq() { # <file>
