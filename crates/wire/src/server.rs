@@ -2027,14 +2027,17 @@ fn parse_computed_item(item: &str) -> Option<(String, String)> {
 
 /// The exact-integer rank of a computed expression, by the engine's
 /// dialect-3 arithmetic rules (all probed): `+`/`-` of exact ints yield
-/// INT64; `*` and `/` yield INT64 unless either operand is already
-/// INT64 - then INT128, which this server does not write yet (refused);
-/// a bare field keeps its column's type; a bare literal is INTEGER.
-#[derive(Clone, Copy, PartialEq)]
+/// INT64 - unless an operand is already INT128, then INT128; `*` and
+/// `/` promote to INT128 as soon as either operand ranks INT64 or wider
+/// (the same DSC_multiply_result rule the select-list expressions
+/// follow); a bare field keeps its column's type; a bare literal is
+/// INTEGER (the parser's literals are `i32`-bound).
+#[derive(Clone, Copy, PartialEq, PartialOrd)]
 enum IntRank {
     Short,
     Long,
     Int64,
+    Int128,
 }
 
 fn infer_int_rank(
@@ -2047,16 +2050,20 @@ fn infer_int_rank(
         Expr::Variable(_) => None, // no variables outside a trigger body
         Expr::IntLiteral(_) => Some(IntRank::Long),
         Expr::Add(l, r) | Expr::Subtract(l, r) => {
-            infer_int_rank(l, field_rank)?;
-            infer_int_rank(r, field_rank)?;
-            Some(IntRank::Int64)
+            let (lr, rr) = (infer_int_rank(l, field_rank)?, infer_int_rank(r, field_rank)?);
+            Some(if lr == IntRank::Int128 || rr == IntRank::Int128 {
+                IntRank::Int128
+            } else {
+                IntRank::Int64
+            })
         }
         Expr::Multiply(l, r) | Expr::Divide(l, r) => {
             let (lr, rr) = (infer_int_rank(l, field_rank)?, infer_int_rank(r, field_rank)?);
-            if lr == IntRank::Int64 || rr == IntRank::Int64 {
-                return None; // the engine promotes to INT128 - deferred
-            }
-            Some(IntRank::Int64)
+            Some(if lr >= IntRank::Int64 || rr >= IntRank::Int64 {
+                IntRank::Int128 // the engine's dtype-driven promotion
+            } else {
+                IntRank::Int64
+            })
         }
     }
 }
@@ -2075,7 +2082,8 @@ fn dtype_rank(dt: u8) -> Option<IntRank> {
 
 /// The catalog type of a computed column: `(RDB$FIELD_TYPE, dsc dtype,
 /// length, RDB$FIELD_PRECISION)` for the expression's result rank.
-/// The precisions are the engine's (probed: SHORT 4, LONG 9, INT64 18).
+/// The precisions are the engine's (probed: SHORT 4, LONG 9, INT64 18,
+/// INT128 38 - field type 26, 16 bytes).
 /// `field_rank` types the expression's field references - from the
 /// statement's own columns (CREATE TABLE) or the catalog (ALTER ADD).
 fn infer_computed_type(
@@ -2087,6 +2095,7 @@ fn infer_computed_type(
         IntRank::Short => (7, dtype::SHORT, 2, 4),
         IntRank::Long => (8, dtype::LONG, 4, 9),
         IntRank::Int64 => (16, dtype::INT64, 8, 18),
+        IntRank::Int128 => (26, dtype::INT128, 16, 38),
     })
 }
 
@@ -4654,12 +4663,18 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
         let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
         let expr = parse_expr(&src)?;
         // a reference types as a plain stored exact-integer column: not
-        // another computed one (offset 0), no NUMERIC scale/sub_type
+        // another computed one (offset 0), no NUMERIC scale/sub_type.
+        // A plain INT128 column ranks Int128 here (the computed surface
+        // carries it since inc 121); the CHECK paths keep the narrower
+        // dtype_rank and still refuse INT128 references.
         let field_rank = |name: &str| {
             let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
             let d = descs.get(rc.field_id as usize)?;
             if (d.offset == 0 && d.length != 0) || d.scale != 0 || d.sub_type != 0 {
                 return None;
+            }
+            if d.dtype == fire_crab_ods::format::dtype::INT128 {
+                return Some(IntRank::Int128);
             }
             dtype_rank(d.dtype)
         };
@@ -7110,7 +7125,7 @@ fn plan_query_inner(
         if fire_crab_ods::ddl::has_computed_field(&descs) {
             computed_sources(db, table)
                 .into_iter()
-                .filter_map(|(fid, src)| parse_raw_expr(&src).map(|r| (fid, r)))
+                .filter_map(|(fid, src)| parse_raw_expr_any(&src).map(|r| (fid, r)))
                 .collect()
         } else {
             Default::default()
@@ -8750,18 +8765,26 @@ enum CastTarget {
 /// A pure identifier is left to the caller to treat as a plain column;
 /// this returns None then, so the column path (all types) is preferred.
 fn parse_raw_expr(s: &str) -> Option<RawExpr> {
+    let e = parse_raw_expr_any(s)?;
+    // a bare column or a bare literal is NOT an "expression" for
+    // projection purposes - the column path handles all column types,
+    // and a lone literal is uncommon; require at least one operator
+    if matches!(e, RawExpr::Col(_)) {
+        return None;
+    }
+    Some(e)
+}
+
+/// [parse_raw_expr] without the bare-column rejection - what a stored
+/// COMPUTED BY source needs: `COMPUTED BY (S)` is a legitimate bare
+/// field reference (the engine keeps the referenced column's type).
+fn parse_raw_expr_any(s: &str) -> Option<RawExpr> {
     let b: Vec<char> = s.chars().collect();
     let mut pos = 0usize;
     let e = expr_add(&b, &mut pos)?;
     skip_ws(&b, &mut pos);
     if pos != b.len() {
         return None; // trailing tokens
-    }
-    // a bare column or a bare literal is NOT an "expression" for
-    // projection purposes - the column path handles all column types,
-    // and a lone literal is uncommon; require at least one operator
-    if matches!(e, RawExpr::Col(_)) {
-        return None;
     }
     Some(e)
 }
@@ -14298,11 +14321,19 @@ mod tests {
         assert_eq!(cols[0].computed.as_ref().unwrap().source, "(A+1)");
         assert_eq!(cols[0].field_type, 16);
         assert!(cols_of("CREATE TABLE TK (A INTEGER, C COMPUTED (A))")[1].computed.is_some());
-        // * or / with an INT64 operand promotes to INT128 - deferred, so
-        // the statement refuses (never a wrong type); + of INT64 is fine
-        assert!(plan_create_table("CREATE TABLE TH (B BIGINT, X COMPUTED BY (B*2))").is_none());
-        assert!(plan_create_table("CREATE TABLE TH (B BIGINT, X COMPUTED BY (B/2))").is_none());
-        assert!(plan_create_table("CREATE TABLE TH (A INTEGER, B INTEGER, X COMPUTED BY ((A+B)*2))").is_none());
+        // * or / with an INT64-ranked operand promotes to INT128 - the
+        // engine's dtype-driven rule (probed: type 26, len 16, p38);
+        // + of INT64 stays INT64 unless an operand is already INT128
+        for sql in [
+            "CREATE TABLE TH (B BIGINT, X COMPUTED BY (B*2))",
+            "CREATE TABLE TH (B BIGINT, X COMPUTED BY (B/2))",
+            "CREATE TABLE TH (A INTEGER, B INTEGER, X COMPUTED BY ((A+B)*2))",
+        ] {
+            let cols = cols_of(sql);
+            let x = cols.last().unwrap();
+            assert_eq!((x.field_type, x.dtype, x.length), (26, dtype::INT128, 16), "{}", sql);
+            assert_eq!(x.computed.as_ref().unwrap().precision, 38, "{}", sql);
+        }
         let cols = cols_of("CREATE TABLE TH (B BIGINT, X COMPUTED BY (B-1))");
         assert_eq!(cols[1].computed.as_ref().unwrap().precision, 18);
         // non-integer operands, keys on computed columns, and trailing

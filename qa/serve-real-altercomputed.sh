@@ -46,6 +46,7 @@ INSERT INTO AT2 (A) VALUES (4);
 COMMIT;"
 A1="ALTER TABLE AT1 ADD C COMPUTED BY (A+B)"
 A2="ALTER TABLE AT2 ADD B BIGINT"
+A4="ALTER TABLE AT2 ADD X COMPUTED BY (B*2)"
 A3="ALTER TABLE AT2 ALTER COLUMN A SET DEFAULT 5"
 
 for db in "$REF" "$WORK"; do
@@ -55,7 +56,7 @@ $BASE
 EOF
 done
 "$ISQL" -q -b -user "$U" -pas "$P" "$REF" <<EOF || { echo "FAIL ref alters"; exit 1; }
-$A1; $A2; COMMIT; $A3; COMMIT;
+$A1; $A2; COMMIT; $A4; COMMIT; $A3; COMMIT;
 EOF
 
 "$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >/tmp/fc-serve-altcomp.log 2>&1 &
@@ -99,9 +100,10 @@ check() { if [ "$2" = "$3" ]; then echo "OK   $1"; else
 
 check "fire-crab: ALTER ADD a computed column" "$(node_run "$A1")" "OK"
 check "fire-crab: ALTER ADD a plain BIGINT to a computed table" "$(node_run "$A2")" "OK"
-case "$(node_run 'ALTER TABLE AT2 ADD X COMPUTED BY (B*2)')" in
-    ERR*) echo "OK   an INT128 result is REFUSED in ALTER too" ;;
-    *) echo "DIFF ALTER INT128 refusal"; fail=1 ;; esac
+# an INT128 result (BIGINT * 2) promotes since inc 121 - the deep
+# differential is serve-real-computed128; here it rides the catalog
+# and format comparisons below
+check "fire-crab: ALTER ADD an INT128-promoted computed column" "$(node_run "$A4")" "OK"
 case "$(node_run 'ALTER TABLE AT1 ADD Y COMPUTED BY (C+1)')" in
     ERR*) echo "OK   computed-over-computed is refused (not typed wrong)" ;;
     *) echo "DIFF computed-over-computed refusal"; fail=1 ;; esac

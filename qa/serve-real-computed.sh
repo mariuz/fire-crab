@@ -104,9 +104,11 @@ check "fire-crab: computed from two columns (A+B)" "$(node_run "$T1")" "OK"
 check "fire-crab: computed passthrough of a SMALLINT" "$(node_run "$T2")" "OK"
 check "fire-crab: computed column mid-table" "$(node_run "$T3")" "OK"
 check "fire-crab: literal, *, GENERATED ALWAYS AS spellings" "$(node_run "$T4")" "OK"
+# an INT128 result (BIGINT * 2) promotes since inc 121 (deep
+# differential: serve-real-computed128) - here just prove it creates
 case "$(node_run 'CREATE TABLE TH (B BIGINT, X COMPUTED BY (B*2))')" in
-    ERR*) echo "OK   an INT128 result (BIGINT * 2) is REFUSED, not mis-typed" ;;
-    *) echo "DIFF INT128 refusal"; fail=1 ;; esac
+    OK) echo "OK   an INT128 result (BIGINT * 2) now CREATES (promoted, inc 121)" ;;
+    *) echo "DIFF INT128 promotion"; fail=1 ;; esac
 
 # fire-crab serves the computed columns itself (evaluated per row from
 # the stored source text), and its implicit INSERT list excludes them
