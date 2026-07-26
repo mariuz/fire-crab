@@ -2713,6 +2713,21 @@ enum TrigStmt {
         exprs: Vec<fire_crab_ods::expr::Expr>,
         src_off: usize,
     },
+    /// `BEGIN <stmts> [WHEN ... DO <stmt>]... END` - every block, the
+    /// trigger body included, is the same two-node shape (probed): a
+    /// wrapper (`begin`, or `blr_handler` when it has handlers) holding
+    /// the statement-list begin, each closed by its own end; handlers
+    /// chain inside the wrapper. The debug entry points at the wrapper
+    /// byte, at the BEGIN keyword's source position. No semicolon may
+    /// follow the END (an engine syntax error, probed). An EXCEPTION
+    /// raise brackets in savepoints exactly when a LEXICALLY enclosing
+    /// block carries handlers (probed: an outer raise stays plain when
+    /// only an inner block has one).
+    Block {
+        stmts: Vec<TrigStmt>,
+        handlers: Vec<(Vec<HandlerCond>, TrigStmt)>,
+        src_off: usize,
+    },
 }
 
 /// Rewrite unqualified field references that name a DECLAREd variable
@@ -2851,56 +2866,74 @@ fn cond_resolve_vars(
     }
 }
 
-/// Parse the trigger body between BEGIN and END: `NEW.<col> = <expr>;` /
-/// `<var> = <expr>;` assignments and `IF (<cond>) THEN <stmt> [ELSE
-/// <stmt>]`, each carrying its offset in `s` for the debug map. `at` is
-/// the body's start offset; `vars` the DECLAREd variable names in slot
-/// order.
-fn parse_trigger_stmts(
+/// Parse a trigger body: the offset of its `BEGIN` keyword and the
+/// hard limit just past the final `END`. The whole body is one
+/// [TrigStmt::Block]; nested blocks recurse, each may carry its own
+/// trailing `WHEN ... DO` handlers. None = anything outside the
+/// surface - the statement errors, never half-compiles.
+fn parse_trigger_body(
     s: &str,
-    at: usize,
-    end: usize,
+    begin_at: usize,
+    limit: usize,
     vars: &[String],
-) -> Option<(Vec<TrigStmt>, Vec<(Vec<HandlerCond>, TrigStmt)>)> {
-    let mut out: Vec<TrigStmt> = Vec::new();
-    // the block's error handlers, in source order: each is (condition
-    // exception names - empty = WHEN ANY) and its statement
+) -> Option<TrigStmt> {
+    let mut pos = begin_at + "BEGIN".len();
+    let body = parse_trig_block(s, &mut pos, limit, vars, begin_at)?;
+    skip_trig_ws(s, &mut pos, limit);
+    if pos != limit {
+        return None; // trailing text after the body's END
+    }
+    Some(body)
+}
+
+fn skip_trig_ws(s: &str, pos: &mut usize, limit: usize) {
+    let b = s.as_bytes();
+    while *pos < limit && b[*pos].is_ascii_whitespace() {
+        *pos += 1;
+    }
+}
+
+/// The identifier-shaped word at `pos` (uppercased), if any.
+fn peek_trig_word(s: &str, pos: usize, limit: usize) -> Option<String> {
+    let b = s.as_bytes();
+    let mut j = pos;
+    while j < limit && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] == b'$') {
+        j += 1;
+    }
+    if j == pos {
+        None
+    } else {
+        Some(s[pos..j].to_ascii_uppercase())
+    }
+}
+
+/// Parse the statements of a block whose `BEGIN` is already consumed,
+/// through its matching `END`. Handlers must be the trailing segments.
+fn parse_trig_block(
+    s: &str,
+    pos: &mut usize,
+    limit: usize,
+    vars: &[String],
+    begin_off: usize,
+) -> Option<TrigStmt> {
+    let mut stmts: Vec<TrigStmt> = Vec::new();
     let mut handlers: Vec<(Vec<HandlerCond>, TrigStmt)> = Vec::new();
-    let mut pos = at;
-    while pos < end {
-        let rest = &s[pos..end];
-        let lead = rest.len() - rest.trim_start().len();
-        let start = pos + lead;
-        if start >= end {
+    loop {
+        skip_trig_ws(s, pos, limit);
+        if *pos >= limit {
+            return None; // unterminated block
+        }
+        let word = peek_trig_word(s, *pos, limit)?;
+        if word == "END" {
+            *pos += "END".len();
             break;
         }
-        let semi = s[start..end].find(';')? + start;
-        let seg_up0 = s[start..semi].to_ascii_uppercase();
-        if !handlers.is_empty() && find_word(&seg_up0, "WHEN", 0) != Some(0) {
-            return None; // once a WHEN appears, only WHENs may follow
-        }
-        // `ELSE <stmt>;` is its own semicolon segment - it attaches to
-        // the IF the previous segment parsed
-        let seg_up = s[start..semi].to_ascii_uppercase();
-        if find_word(&seg_up, "ELSE", 0) == Some(0) {
-            let inner = &s[start + "ELSE".len()..semi];
-            let inner_lead = inner.len() - inner.trim_start().len();
-            let stmt = parse_trigger_stmt(s, start + "ELSE".len() + inner_lead, semi, vars)?;
-            match out.last_mut() {
-                Some(TrigStmt::If { otherwise, .. }) if otherwise.is_none() => {
-                    *otherwise = Some(Box::new(stmt));
-                }
-                _ => return None, // ELSE without a matching IF
-            }
-            pos = semi + 1;
-            continue;
-        }
-        // `WHEN ANY DO <stmt>;` or `WHEN EXCEPTION <n>[, EXCEPTION
-        // <n>]... DO <stmt>;` - the block's error handlers, trailing
-        if find_word(&seg_up, "WHEN", 0) == Some(0) {
-            let after = &seg_up["WHEN".len()..];
-            let do_kw = find_word(after, "DO", 0)?;
-            let conds_txt = after[..do_kw].trim();
+        if word == "WHEN" {
+            // WHEN ANY | <cond>[, <cond>]... DO <stmt>
+            let after_when = *pos + "WHEN".len();
+            let up_rest = s[after_when..limit].to_ascii_uppercase();
+            let do_kw = find_word(&up_rest, "DO", 0)?;
+            let conds_txt = up_rest[..do_kw].trim();
             let mut names: Vec<HandlerCond> = Vec::new();
             if conds_txt != "ANY" {
                 for part in conds_txt.split(',') {
@@ -2930,33 +2963,48 @@ fn parse_trigger_stmts(
                     return None;
                 }
             }
-            let inner_rel = start + "WHEN".len() + do_kw + "DO".len();
-            let inner = &s[inner_rel..semi];
-            let inner_lead = inner.len() - inner.trim_start().len();
-            let stmt = parse_trigger_stmt(s, inner_rel + inner_lead, semi, vars)?;
+            *pos = after_when + do_kw + "DO".len();
+            let stmt = parse_trig_stmt(s, pos, limit, vars)?;
             handlers.push((names, stmt));
-            pos = semi + 1;
             continue;
         }
-        out.push(parse_trigger_stmt(s, start, semi, vars)?);
-        pos = semi + 1;
+        if !handlers.is_empty() {
+            return None; // once a WHEN appears, only WHENs may follow
+        }
+        stmts.push(parse_trig_stmt(s, pos, limit, vars)?);
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some((out, handlers))
+    if stmts.is_empty() {
+        return None;
     }
+    Some(TrigStmt::Block { stmts, handlers, src_off: begin_off })
 }
 
-fn parse_trigger_stmt(s: &str, start: usize, end: usize, vars: &[String]) -> Option<TrigStmt> {
-    let text = &s[start..end];
-    let up = text.to_ascii_uppercase();
-    if let Some(0) = find_word(&up, "IF", 0) {
-        // IF (<cond>) THEN <stmt>
-        let open = text.find('(')? + start;
+/// One statement at the cursor: a nested block, IF/WHILE (whose inner
+/// statement may itself be a block - no semicolon after an END), or a
+/// semicolon-terminated simple statement.
+fn parse_trig_stmt(
+    s: &str,
+    pos: &mut usize,
+    limit: usize,
+    vars: &[String],
+) -> Option<TrigStmt> {
+    skip_trig_ws(s, pos, limit);
+    let start = *pos;
+    let word = peek_trig_word(s, start, limit)?;
+    if word == "BEGIN" {
+        *pos = start + "BEGIN".len();
+        return parse_trig_block(s, pos, limit, vars, start);
+    }
+    if word == "IF" || word == "WHILE" {
+        *pos = start + word.len();
+        skip_trig_ws(s, pos, limit);
+        if s.as_bytes().get(*pos) != Some(&b'(') {
+            return None;
+        }
+        let open = *pos;
         let mut depth = 0i32;
         let mut close = None;
-        for (i, ch) in s[open..end].char_indices() {
+        for (i, ch) in s[open..limit].char_indices() {
             match ch {
                 '(' => depth += 1,
                 ')' => {
@@ -2973,56 +3021,35 @@ fn parse_trigger_stmt(s: &str, start: usize, end: usize, vars: &[String]) -> Opt
         // fold NOT exactly as the engine's DSQL pass does: inverted
         // comparisons and De Morgan; IS NULL keeps its blr_not form
         let cond = cond_resolve_vars(&parse_cond(&s[open..=close])?, vars).normalized();
-        let after = &s[close + 1..end];
-        let after_up = after.to_ascii_uppercase();
-        let then_kw = find_word(&after_up, "THEN", 0)?;
-        if !after_up[..then_kw].trim().is_empty() {
+        *pos = close + 1;
+        skip_trig_ws(s, pos, limit);
+        let kw = if word == "IF" { "THEN" } else { "DO" };
+        if peek_trig_word(s, *pos, limit)? != kw {
             return None;
         }
-        let inner_rel = close + 1 + then_kw + "THEN".len();
-        let inner = &s[inner_rel..end];
-        let inner_lead = inner.len() - inner.trim_start().len();
-        let then = parse_trigger_stmt(s, inner_rel + inner_lead, end, vars)?;
-        return Some(TrigStmt::If {
-            cond,
-            then: Box::new(then),
-            otherwise: None,
-            src_off: start,
-        });
-    }
-    if let Some(0) = find_word(&up, "WHILE", 0) {
-        // WHILE (<cond>) DO <stmt>
-        let open = text.find('(')? + start;
-        let mut depth = 0i32;
-        let mut close = None;
-        for (i, ch) in s[open..end].char_indices() {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        close = Some(open + i);
-                        break;
-                    }
-                }
-                _ => {}
-            }
+        *pos += kw.len();
+        let inner = parse_trig_stmt(s, pos, limit, vars)?;
+        if word == "WHILE" {
+            return Some(TrigStmt::While { cond, body: Box::new(inner), src_off: start });
         }
-        let close = close?;
-        let cond = cond_resolve_vars(&parse_cond(&s[open..=close])?, vars).normalized();
-        let after = &s[close + 1..end];
-        let after_up = after.to_ascii_uppercase();
-        let do_kw = find_word(&after_up, "DO", 0)?;
-        if !after_up[..do_kw].trim().is_empty() {
-            return None;
-        }
-        let inner_rel = close + 1 + do_kw + "DO".len();
-        let inner = &s[inner_rel..end];
-        let inner_lead = inner.len() - inner.trim_start().len();
-        let body = parse_trigger_stmt(s, inner_rel + inner_lead, end, vars)?;
-        return Some(TrigStmt::While { cond, body: Box::new(body), src_off: start });
+        // an optional ELSE branch
+        let save = *pos;
+        skip_trig_ws(s, pos, limit);
+        let otherwise = if peek_trig_word(s, *pos, limit).as_deref() == Some("ELSE") {
+            *pos += "ELSE".len();
+            Some(Box::new(parse_trig_stmt(s, pos, limit, vars)?))
+        } else {
+            *pos = save;
+            None
+        };
+        return Some(TrigStmt::If { cond, then: Box::new(inner), otherwise, src_off: start });
     }
-    if let Some(0) = find_word(&up, "EXCEPTION", 0) {
+    // simple statements run to the next semicolon
+    let semi = s[start..limit].find(';')? + start;
+    let text = &s[start..semi];
+    let up = text.to_ascii_uppercase();
+    *pos = semi + 1;
+    if find_word(&up, "EXCEPTION", 0) == Some(0) {
         // EXCEPTION <name>
         let name = text["EXCEPTION".len()..].trim().trim_matches('"').to_ascii_uppercase();
         if !ident_ok(&name) {
@@ -3030,7 +3057,7 @@ fn parse_trigger_stmt(s: &str, start: usize, end: usize, vars: &[String]) -> Opt
         }
         return Some(TrigStmt::Raise { name, src_off: start });
     }
-    if let Some(0) = find_word(&up, "INSERT", 0) {
+    if find_word(&up, "INSERT", 0) == Some(0) {
         // INSERT INTO <t> (<cols>) VALUES (<exprs>)
         let into_kw = find_word(&up, "INTO", "INSERT".len())?;
         if !up["INSERT".len()..into_kw].trim().is_empty() {
@@ -3097,8 +3124,7 @@ fn parse_trigger_stmt(s: &str, start: usize, end: usize, vars: &[String]) -> Opt
         }
         return Some(TrigStmt::Store { table, cols, exprs, src_off: start });
     }
-    // NEW.<col> = <expr>  or  <var> = <expr> (resolved against the
-    // declares by the caller - parsed as a Field target for now)
+    // NEW.<col> = <expr>  or  <var> = <expr>
     let eq = text.find('=')?;
     let lhs = text[..eq].trim().to_ascii_uppercase();
     let target = if let Some(col) = lhs.strip_prefix("NEW.") {
@@ -3120,15 +3146,12 @@ fn parse_trigger_stmt(s: &str, start: usize, end: usize, vars: &[String]) -> Opt
 /// Emit a user trigger's BLR (probed): `version5, begin,` then for a
 /// body WITH declares `blr_dcl_variable` per variable (ALL declares
 /// first) followed by a NULL-init assignment per variable (each is the
-/// DECLARE statement's debug entry), then `label 0, begin, begin,
-/// <statements>, end, end, end, eoc`. The debug map's BEGIN entry
-/// points at the begin AFTER the label; every statement - nested and
-/// ELSE-branch ones included - gets its own entry in source order.
+/// DECLARE statement's debug entry), then `label 0`, the BODY BLOCK
+/// ([TrigStmt::Block] - wrapper + statement list, handlers chained
+/// inside), `end, eoc`.
 fn emit_trigger_blr(
-    stmts: &[TrigStmt],
-    handlers: &[(Vec<HandlerCond>, TrigStmt)],
+    body: &TrigStmt,
     declares: &[(String, u8, usize)], // (name, blr dtype, DECLARE src offset)
-    begin_off: usize,
     dbg: &mut Vec<(usize, usize)>,
 ) -> Vec<u8> {
     let mut b = vec![5u8, 2]; // version5, begin
@@ -3146,63 +3169,12 @@ fn emit_trigger_blr(
         b.extend_from_slice(&(i as u16).to_le_bytes());
     }
     b.extend_from_slice(&[17, 0]); // blr_label 0
-    dbg.push((begin_off, b.len()));
     // WHILE labels number from 1 (0 is the body's own); each blr_store
     // takes the next relation context after OLD (0) and NEW (1)
     let mut next_label = 1u8;
     let mut next_ctx = 2u8;
-    // with any handler present, every EXCEPTION raise brackets itself
-    // in begin/start_savepoint/.../end_savepoint (probed - protected
-    // part AND handler statements alike)
-    let bracket = !handlers.is_empty();
-    if handlers.is_empty() {
-        b.push(2); // begin (the one the debug map points at)
-        b.push(2); // begin
-        for st in stmts {
-            emit_trigger_stmt(st, &mut b, dbg, &mut next_label, &mut next_ctx, bracket);
-        }
-        b.extend_from_slice(&[255, 255, 255, 76]);
-    } else {
-        // blr_handler wraps the protected begin; each `WHEN ... DO`
-        // is one blr_error_handler with its condition list - `4` is
-        // ANY, a named exception is `9, 0, <len>, <name>` (probed)
-        b.push(129); // blr_handler (the debug map's begin entry)
-        b.push(2); // begin (protected statements)
-        for st in stmts {
-            emit_trigger_stmt(st, &mut b, dbg, &mut next_label, &mut next_ctx, bracket);
-        }
-        b.push(255); // end of the protected begin
-        for (names, h) in handlers {
-            b.push(130); // blr_error_handler
-            let count = if names.is_empty() { 1u16 } else { names.len() as u16 };
-            b.extend_from_slice(&count.to_le_bytes());
-            if names.is_empty() {
-                b.push(4); // ANY
-            } else {
-                for c in names {
-                    match c {
-                        HandlerCond::Exception(n) => {
-                            b.push(9);
-                            b.push(0);
-                            b.push(n.len() as u8);
-                            b.extend_from_slice(n.as_bytes());
-                        }
-                        HandlerCond::Gds(n) => {
-                            b.push(0);
-                            b.push(n.len() as u8);
-                            b.extend_from_slice(n.as_bytes());
-                        }
-                        HandlerCond::Sql(v) => {
-                            b.push(1);
-                            b.extend_from_slice(&v.to_le_bytes());
-                        }
-                    }
-                }
-            }
-            emit_trigger_stmt(h, &mut b, dbg, &mut next_label, &mut next_ctx, bracket);
-        }
-        b.extend_from_slice(&[255, 255, 76]);
-    }
+    emit_trigger_stmt(body, &mut b, dbg, &mut next_label, &mut next_ctx, false);
+    b.extend_from_slice(&[255, 76]); // end (the version5 begin), eoc
     b
 }
 
@@ -3297,6 +3269,59 @@ fn emit_trigger_stmt(
                 b.extend_from_slice(c.as_bytes());
             }
             b.push(255);
+        }
+        TrigStmt::Block { stmts, handlers, src_off } => {
+            // every block is a wrapper node (begin, or blr_handler with
+            // handlers) holding the statement-list begin; the debug
+            // entry points at the wrapper (probed). Raises bracket in
+            // savepoints exactly within handler-carrying scopes.
+            dbg.push((*src_off, b.len()));
+            if handlers.is_empty() {
+                b.push(2); // the block wrapper
+                b.push(2); // the statement list
+                for st in stmts {
+                    emit_trigger_stmt(st, b, dbg, next_label, next_ctx, bracket_raises);
+                }
+                b.push(255); // end of the list
+                b.push(255); // end of the wrapper
+            } else {
+                b.push(129); // blr_handler (the wrapper)
+                b.push(2); // the protected statement list
+                for st in stmts {
+                    emit_trigger_stmt(st, b, dbg, next_label, next_ctx, true);
+                }
+                b.push(255); // end of the protected list
+                for (names, h) in handlers {
+                    b.push(130); // blr_error_handler
+                    let count = if names.is_empty() { 1u16 } else { names.len() as u16 };
+                    b.extend_from_slice(&count.to_le_bytes());
+                    if names.is_empty() {
+                        b.push(4); // ANY
+                    } else {
+                        for c in names {
+                            match c {
+                                HandlerCond::Exception(n) => {
+                                    b.push(9);
+                                    b.push(0);
+                                    b.push(n.len() as u8);
+                                    b.extend_from_slice(n.as_bytes());
+                                }
+                                HandlerCond::Gds(n) => {
+                                    b.push(0);
+                                    b.push(n.len() as u8);
+                                    b.extend_from_slice(n.as_bytes());
+                                }
+                                HandlerCond::Sql(v) => {
+                                    b.push(1);
+                                    b.extend_from_slice(&v.to_le_bytes());
+                                }
+                            }
+                        }
+                    }
+                    emit_trigger_stmt(h, b, dbg, next_label, next_ctx, true);
+                }
+                b.push(255); // end of the handler wrapper
+            }
         }
     }
 }
@@ -3457,7 +3482,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         return None;
     }
     let var_names: Vec<String> = declares.iter().map(|(n, _, _)| n.clone()).collect();
-    let (stmts, handlers) = parse_trigger_stmts(s, begin_kw + "BEGIN".len(), end_kw, &var_names)?;
+    let body = parse_trigger_body(s, begin_kw, end_kw + "END".len(), &var_names)?;
 
     // validate every reference against the CATALOG: qualified (NEW/OLD)
     // or a DECLAREd variable, columns being plain integer stored ones;
@@ -3499,6 +3524,11 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             }
             TrigStmt::Raise { .. } => {}
             TrigStmt::Store { exprs, .. } => out.extend(exprs.iter()),
+            TrigStmt::Block { stmts, handlers, .. } => {
+                for st in stmts.iter().chain(handlers.iter().map(|(_, h)| h)) {
+                    stmt_exprs(st, out);
+                }
+            }
         }
     }
     fn stmt_targets<'a>(st: &'a TrigStmt, out: &mut Vec<&'a TrigTarget>) {
@@ -3514,31 +3544,52 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             // a store's targets are the OTHER table's columns,
             // validated separately below
             TrigStmt::Raise { .. } | TrigStmt::Store { .. } => {}
+            TrigStmt::Block { stmts, handlers, .. } => {
+                for st in stmts.iter().chain(handlers.iter().map(|(_, h)| h)) {
+                    stmt_targets(st, out);
+                }
+            }
         }
     }
-    fn stmt_specials<'a>(st: &'a TrigStmt, stores: &mut Vec<&'a TrigStmt>, raises: &mut Vec<&'a str>) {
+    fn stmt_specials<'a>(
+        st: &'a TrigStmt,
+        stores: &mut Vec<&'a TrigStmt>,
+        raises: &mut Vec<&'a str>,
+        hexcs: &mut Vec<&'a str>,
+    ) {
         match st {
             TrigStmt::Assign { .. } => {}
             TrigStmt::If { then, otherwise, .. } => {
-                stmt_specials(then, stores, raises);
+                stmt_specials(then, stores, raises, hexcs);
                 if let Some(e) = otherwise {
-                    stmt_specials(e, stores, raises);
+                    stmt_specials(e, stores, raises, hexcs);
                 }
             }
-            TrigStmt::While { body, .. } => stmt_specials(body, stores, raises),
+            TrigStmt::While { body, .. } => stmt_specials(body, stores, raises, hexcs),
             TrigStmt::Raise { name, .. } => raises.push(name),
             TrigStmt::Store { .. } => stores.push(st),
+            TrigStmt::Block { stmts, handlers, .. } => {
+                for st in stmts.iter().chain(handlers.iter().map(|(_, h)| h)) {
+                    stmt_specials(st, stores, raises, hexcs);
+                }
+                for (names, _) in handlers {
+                    for c in names {
+                        if let HandlerCond::Exception(n) = c {
+                            hexcs.push(n);
+                        }
+                    }
+                }
+            }
         }
     }
     let mut exprs = Vec::new();
     let mut targets = Vec::new();
     let mut stores = Vec::new();
     let mut raises = Vec::new();
-    for st in stmts.iter().chain(handlers.iter().map(|(_, h)| h)) {
-        stmt_exprs(st, &mut exprs);
-        stmt_targets(st, &mut targets);
-        stmt_specials(st, &mut stores, &mut raises);
-    }
+    let mut hexcs = Vec::new();
+    stmt_exprs(&body, &mut exprs);
+    stmt_targets(&body, &mut targets);
+    stmt_specials(&body, &mut stores, &mut raises, &mut hexcs);
     fn expr_fields(e: &fire_crab_ods::expr::Expr, out: &mut Vec<(u8, String)>) {
         use fire_crab_ods::expr::Expr;
         match e {
@@ -3623,12 +3674,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     // one dependency row (type 7 - a handled-only one gets it too,
     // probed)
     let mut exceptions: Vec<String> = Vec::new();
-    for r in raises.iter().copied().chain(handlers.iter().flat_map(|(names, _)| {
-        names.iter().filter_map(|c| match c {
-            HandlerCond::Exception(n) => Some(n.as_str()),
-            _ => None,
-        })
-    })) {
+    for r in raises.iter().copied().chain(hexcs.iter().copied()) {
         if !exception_exists(db, r) {
             return None;
         }
@@ -3638,7 +3684,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     }
 
     let mut dbg_entries = Vec::new();
-    let blr = emit_trigger_blr(&stmts, &handlers, &declares, begin_kw, &mut dbg_entries);
+    let blr = emit_trigger_blr(&body, &declares, &mut dbg_entries);
     let debug = trigger_debug_blob(s, &declares, &dbg_entries);
     Some((
         Plan::CreateTrigger {
@@ -14409,6 +14455,59 @@ mod tests {
     }
 
 
+
+    #[test]
+    fn nested_blocks_blr_matches_engine() {
+        // the engine's own N1/N3/N5/N6 blobs (probed): every BEGIN..END
+        // is wrapper+list (02 02 ... FF FF), a handler block swaps the
+        // wrapper for blr_handler, the block's debug entry sits on the
+        // wrapper byte, and raise-bracketing is LEXICAL (N6's outer
+        // raise stays plain while its inner block holds a handler)
+        let hex = |h: &str| -> Vec<u8> {
+            (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect()
+        };
+        let compile = |sql: &str, declares: &[(String, u8, usize)]| {
+            let up = sql.to_ascii_uppercase();
+            let begin = find_word(&up, "BEGIN", 0).unwrap();
+            let end = up.rfind("END").unwrap();
+            let vars: Vec<String> = declares.iter().map(|(n, _, _)| n.clone()).collect();
+            let body = parse_trigger_body(sql, begin, end + "END".len(), &vars).unwrap();
+            let mut dbg = Vec::new();
+            let blr = emit_trigger_blr(&body, declares, &mut dbg);
+            (blr, trigger_debug_blob(sql, declares, &dbg))
+        };
+        // N1: IF THEN BEGIN two statements END
+        let (blr, dbg) = compile(
+            "CREATE TRIGGER N1 FOR T1 BEFORE INSERT AS BEGIN IF (NEW.A > 1) THEN BEGIN NEW.B = 1; NEW.C = 2; END END",
+            &[],
+        );
+        assert_eq!(blr, hex("050211000202083117010141150800010000000202011508000100000017010142011508000200000017010143FFFFFFFFFFFF4C"));
+        assert_eq!(dbg, hex("40010202010000002B00000004000000020100000031000000060000000201000000450000001300000002010000004B0000001500000002010000005600000021000000FF".trim_start_matches("40")));
+        // N3: WHILE DO BEGIN..END with a statement after the block
+        let v = ("V".to_string(), 8u8, 41usize);
+        let (blr, _) = compile(
+            "CREATE TRIGGER N3 FOR T1 BEFORE INSERT AS DECLARE VARIABLE V INTEGER; BEGIN V = 0; WHILE (V < NEW.A) DO BEGIN V = V + 1; NEW.B = V; END NEW.C = 9; END",
+            &[v],
+        );
+        assert_eq!(blr, hex("05020300000800012D1A00001100020201150800000000001A00001101090208331A000017010141020201221A0000150800010000001A0000011A000017010142FFFF1201FF011508000900000017010143FFFFFF4C"));
+        // N5: a NESTED block with its own WHEN ANY handler
+        let (blr, _) = compile(
+            "CREATE TRIGGER N5 FOR T1 BEFORE INSERT AS BEGIN BEGIN NEW.B = 100 / NEW.A; WHEN ANY DO NEW.B = -1; END NEW.C = 8; END",
+            &[],
+        );
+        assert_eq!(blr, hex("05021100020281020125150800640000001701014117010142FF8201000401150800FFFFFFFF17010142FF011508000800000017010143FFFFFF4C"));
+        // N6: the raise OUTSIDE the handler-carrying block stays plain
+        let (blr, _) = compile(
+            "CREATE TRIGGER N6 FOR T1 BEFORE INSERT AS BEGIN EXCEPTION EX1; BEGIN NEW.B = 1; WHEN ANY DO NEW.B = -2; END END",
+            &[],
+        );
+        assert_eq!(blr, hex("0502110002028002034558318102011508000100000017010142FF8201000401150800FEFFFFFF17010142FFFFFFFF4C"));
+        // a semicolon after END is the engine's syntax error - refused
+        let up = "CREATE TRIGGER N8 FOR T1 BEFORE INSERT AS BEGIN BEGIN NEW.B = 6; END; NEW.C = 7; END";
+        let begin = find_word(&up.to_ascii_uppercase(), "BEGIN", 0).unwrap();
+        assert!(parse_trigger_body(up, begin, up.rfind("END").unwrap() + "END".len(), &[]).is_none());
+    }
+
     #[test]
     fn named_when_handlers_blr_matches_engine() {
         // the engine's own W1/W3/W6 blobs (probed): a named condition is
@@ -14422,10 +14521,9 @@ mod tests {
             let up = sql.to_ascii_uppercase();
             let begin = find_word(&up, "BEGIN", 0).unwrap();
             let end = up.rfind("END").unwrap();
-            let (stmts, handlers) =
-                parse_trigger_stmts(sql, begin + "BEGIN".len(), end, &[]).unwrap();
+            let body = parse_trigger_body(sql, begin, end + "END".len(), &[]).unwrap();
             let mut dbg = Vec::new();
-            let blr = emit_trigger_blr(&stmts, &handlers, &[], begin, &mut dbg);
+            let blr = emit_trigger_blr(&body, &[], &mut dbg);
             (blr, trigger_debug_blob(sql, &[], &dbg))
         };
         // W1: raise inside IF, one NAMED handler
@@ -14453,7 +14551,7 @@ mod tests {
         // "status code @1 unknown" does
         let up = "CREATE TRIGGER WB FOR T1 BEFORE INSERT AS BEGIN NEW.B = 1; WHEN GDSCODE NO_SUCH_CODE DO NEW.B = 0; END";
         let begin = find_word(&up.to_ascii_uppercase(), "BEGIN", 0).unwrap();
-        assert!(parse_trigger_stmts(up, begin + "BEGIN".len(), up.rfind("END").unwrap(), &[]).is_none());
+        assert!(parse_trigger_body(up, begin, up.rfind("END").unwrap() + "END".len(), &[]).is_none());
         // W6: a TOP-LEVEL raise still brackets when a handler exists
         let (blr, dbg) = compile(
             "CREATE TRIGGER W6 FOR T1 BEFORE INSERT AS BEGIN EXCEPTION EX1; WHEN ANY DO NEW.B = -7; END",
@@ -15240,10 +15338,9 @@ mod tests {
             let up = sql.to_ascii_uppercase();
             let begin = find_word(&up, "BEGIN", 0).unwrap();
             let end = up.rfind("END").unwrap();
-            let (stmts, handlers) =
-                parse_trigger_stmts(sql, begin + "BEGIN".len(), end, &[]).unwrap();
+            let body = parse_trigger_body(sql, begin, end + "END".len(), &[]).unwrap();
             let mut dbg = Vec::new();
-            let blr = emit_trigger_blr(&stmts, &handlers, &[], begin, &mut dbg);
+            let blr = emit_trigger_blr(&body, &[], &mut dbg);
             (blr, trigger_debug_blob(sql, &[], &dbg))
         };
         // TR1: NEW.B = NEW.A * 2
@@ -15276,10 +15373,10 @@ mod tests {
         // slice flipped the old refusal into the engine's own bytes
         let up = "CREATE TRIGGER T FOR T1 BEFORE INSERT AS BEGIN IF (NOT (NEW.A > 1)) THEN NEW.B = 0; END";
         let begin = find_word(&up.to_ascii_uppercase(), "BEGIN", 0).unwrap();
-        let (stmts, handlers) =
-            parse_trigger_stmts(up, begin + "BEGIN".len(), up.rfind("END").unwrap(), &[]).unwrap();
+        let body =
+            parse_trigger_body(up, begin, up.rfind("END").unwrap() + "END".len(), &[]).unwrap();
         let mut dbg = Vec::new();
-        let blr = emit_trigger_blr(&stmts, &handlers, &[], begin, &mut dbg);
+        let blr = emit_trigger_blr(&body, &[], &mut dbg);
         let hex = |h: &str| -> Vec<u8> {
             (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect()
         };
@@ -15305,10 +15402,9 @@ mod tests {
             let begin = find_word(&up, "BEGIN", 0).unwrap();
             let end = up.rfind("END").unwrap();
             let vars: Vec<String> = declares.iter().map(|(n, _, _)| n.clone()).collect();
-            let (stmts, handlers) =
-                parse_trigger_stmts(sql, begin + "BEGIN".len(), end, &vars).unwrap();
+            let body = parse_trigger_body(sql, begin, end + "END".len(), &vars).unwrap();
             let mut dbg = Vec::new();
-            let blr = emit_trigger_blr(&stmts, &handlers, declares, begin, &mut dbg);
+            let blr = emit_trigger_blr(&body, declares, &mut dbg);
             (blr, trigger_debug_blob(sql, declares, &dbg))
         };
         let v = |name: &str, dtype: u8, off: usize| (name.to_string(), dtype, off);
