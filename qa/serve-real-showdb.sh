@@ -20,13 +20,6 @@
 # setup: a plain database, one with publication ENABLED, and one turned
 # into a READ_ONLY replica by gfix.
 #
-# KNOWN FLAKE (server bug, not a surface gap): fire-crab's SRP path
-# rejects roughly 1 in 20 attaches with SQLSTATE 28000, and every check
-# here opens a fresh isql connection - so a run fails spuriously about
-# one time in five even though each query retries. Re-run; when the
-# checks are reached they are exact. Fixing that auth path is tracked
-# separately (it also costs the firebird-qa suite 0-2 errors per run).
-#
 #   qa/serve-real-showdb.sh [port]
 
 set -u
