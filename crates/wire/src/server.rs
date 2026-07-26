@@ -1545,9 +1545,8 @@ fn fk_trigger_parent_cols(db: &Database, table: &str, trigs: &[String]) -> Optio
 /// A column DEFAULT this server can apply on its OWN INSERT - decoded
 /// from the stored `RDB$DEFAULT_VALUE` BLR. The engine fills omitted
 /// defaulted columns from the runtime summary at store; fire-crab
-/// evaluates the same default at execute. Session-dependent defaults
-/// (USER/ROLE/CONNECTION/TRANSACTION) are not decodable here - an
-/// INSERT omitting such a column refuses, never writes a wrong value.
+/// evaluates the same default at execute, the session-dependent ones
+/// from the attachment ([SessionCtx]) and the file header.
 #[derive(Clone, Debug, PartialEq)]
 enum DefaultVal {
     /// an integer literal at a scale: `blr_short`/`blr_long`/`blr_int64`
@@ -1565,11 +1564,32 @@ enum DefaultVal {
     CurrentDate,
     CurrentTime,
     CurrentTimestamp,
+    /// `DEFAULT USER` / `CURRENT_USER` (blr_user_name) - the
+    /// attachment's validated login, upper-cased as the engine stores it
+    User,
+    /// `DEFAULT CURRENT_ROLE` - 'NONE' (this server accepts no roles,
+    /// exactly what the engine stores for a role-less attachment)
+    Role,
+    /// `DEFAULT CURRENT_CONNECTION` (blr_internal_info 1) - the
+    /// attachment id
+    Connection,
+    /// `DEFAULT CURRENT_TRANSACTION` (blr_internal_info 2) - the id
+    /// the row's own insert will allocate (hdr_next_transaction + 1;
+    /// each fire-crab DML row commits under its own transaction)
+    Transaction,
+}
+
+/// What the session-dependent DEFAULTs evaluate from: the attachment's
+/// validated login and its id (the transaction id is read off the file
+/// header at the moment of the insert).
+struct SessionCtx<'a> {
+    user: &'a str,
+    attach_id: i32,
 }
 
 /// Decode a stored `RDB$DEFAULT_VALUE` BLR into a [DefaultVal]. None =
-/// a shape this server cannot evaluate (a session id, an expression) -
-/// the INSERT then refuses when the column is omitted.
+/// a shape this server cannot evaluate (a full expression) - the
+/// INSERT then refuses when the column is omitted.
 fn decode_default_blr(b: &[u8]) -> Option<DefaultVal> {
     if b.first() != Some(&5) {
         return None; // not blr_version5
@@ -1607,6 +1627,18 @@ fn decode_default_blr(b: &[u8]) -> Option<DefaultVal> {
         162 => DefaultVal::CurrentTime,
         214 => DefaultVal::CurrentTimestamp, // LOCALTIMESTAMP <precision>
         215 => DefaultVal::CurrentTime,      // LOCALTIME <precision>
+        44 => DefaultVal::User,              // blr_user_name
+        174 => DefaultVal::Role,             // blr_current_role
+        // blr_internal_info with a blr_long literal info code:
+        // 1 = CURRENT_CONNECTION, 2 = CURRENT_TRANSACTION
+        177 => match (b.get(2..5)?, b.get(5..9)?) {
+            ([21, 8, 0], code) => match i32::from_le_bytes(code.try_into().ok()?) {
+                1 => DefaultVal::Connection,
+                2 => DefaultVal::Transaction,
+                _ => return None,
+            },
+            _ => return None,
+        },
         _ => return None,
     })
 }
@@ -6239,6 +6271,7 @@ fn execute_dml(
     plan: &Plan,
     database: &mut Option<Database>,
     args: &[WireParam],
+    ctx: &SessionCtx,
 ) -> Result<(i32, i32, i32), String> {
     let db = database.as_mut().ok_or("no database attached")?;
     let mut work = db.bytes.clone();
@@ -6577,6 +6610,20 @@ fn execute_dml(
                         let (dd, tt) = now_date_time();
                         WireParam::Timestamp(dd, tt)
                     }
+                    DefaultVal::User => WireParam::Text(ctx.user.to_ascii_uppercase()),
+                    DefaultVal::Role => WireParam::Text("NONE".into()),
+                    DefaultVal::Connection => WireParam::Int(ctx.attach_id as i64, 0),
+                    // the id this row's own insert_record will allocate
+                    // (hdr_next_transaction @40, +1 - nothing else
+                    // allocates between here and the store)
+                    DefaultVal::Transaction => WireParam::Int(
+                        (u64::from_le_bytes(
+                            work.get(40..48)
+                                .and_then(|b| b.try_into().ok())
+                                .ok_or("header unreadable")?,
+                        ) + 1) as i64,
+                        0,
+                    ),
                 };
                 match encode_wire_value(d, &wp)
                     .ok_or("default value does not fit its column")?
@@ -11185,7 +11232,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     // execute only zero-parameter statements here
                     // (op_exec_immediate carries no message)
                     Some((p, ps)) if ps.is_empty() => {
-                        match execute_dml(&p, &mut database, &[]) {
+                        match execute_dml(&p, &mut database, &[], &SessionCtx { user, attach_id }) {
                             Ok(counts) => {
                                 last_dml = counts;
                                 respond(&mut s, &mut enc, TX_HANDLE)?;
@@ -11474,7 +11521,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     // DML and DDL execute here (not at fetch): write the
                     // new versions (or the new catalog) into a copy of
                     // the page image, swap it in and flush back
-                    match execute_dml(&plan, &mut database, &bound_args) {
+                    match execute_dml(&plan, &mut database, &bound_args, &SessionCtx { user, attach_id }) {
                         Ok(counts) => {
                             last_dml = counts;
                             if std::env::var("FC_SRV_TRACE").is_ok() {
@@ -13858,9 +13905,19 @@ mod tests {
         assert_eq!(decode_default_blr(&[5, 160, 76]), Some(DefaultVal::CurrentDate));
         assert_eq!(decode_default_blr(&[5, 214, 3, 76]), Some(DefaultVal::CurrentTimestamp));
         assert_eq!(decode_default_blr(&[5, 215, 0, 76]), Some(DefaultVal::CurrentTime));
-        // session-dependent defaults are not evaluatable here - refuse
-        assert_eq!(decode_default_blr(&[5, 177, 21, 8, 0, 1, 0, 0, 0, 76]), None);
-        assert_eq!(decode_default_blr(&[5, 44, 76]), None); // blr_user_name
+        // session-dependent defaults evaluate from the attachment
+        assert_eq!(decode_default_blr(&[5, 44, 76]), Some(DefaultVal::User));
+        assert_eq!(decode_default_blr(&[5, 174, 76]), Some(DefaultVal::Role));
+        assert_eq!(
+            decode_default_blr(&[5, 177, 21, 8, 0, 1, 0, 0, 0, 76]),
+            Some(DefaultVal::Connection)
+        );
+        assert_eq!(
+            decode_default_blr(&[5, 177, 21, 8, 0, 2, 0, 0, 0, 76]),
+            Some(DefaultVal::Transaction)
+        );
+        // a full expression stays undecodable - refuse when omitted
+        assert_eq!(decode_default_blr(&[5, 34, 21, 8, 0, 1, 0, 0, 0, 76]), None);
     }
 
     #[test]

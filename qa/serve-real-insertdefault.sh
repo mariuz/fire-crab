@@ -11,8 +11,11 @@
 # scale byte (DEFAULT 1.5 = blr_long scale -1 value 15, DEFAULT -3 a
 # negative literal), blr_text/text2, DEFAULT NULL, and the clock
 # keywords (CURRENT_DATE/TIME/TIMESTAMP, LOCAL*). Session-dependent
-# defaults (USER/ROLE/CONNECTION/TRANSACTION) REFUSE when the column is
-# omitted - never a wrong value (the engine fills them; conservative).
+# defaults evaluate from the attachment (inc 129): USER is the
+# validated login upper-cased, CURRENT_ROLE is 'NONE' (no roles here,
+# same as a role-less engine attachment), CURRENT_CONNECTION the
+# attachment id, CURRENT_TRANSACTION the id the row's own insert
+# allocates.
 #
 # The differential is the engine, four ways:
 #   1. fire-crab INSERTs omitting defaulted columns on one engine-made
@@ -20,7 +23,8 @@
 #      match (clock columns compared by date/non-null);
 #   2. explicit values still override, DEFAULT NULL stays NULL, a
 #      domain default applies and a column default overrides it;
-#   3. the session-dependent refusal holds, explicit supply works;
+#   3. session defaults fill: USER/ROLE match the engine exactly,
+#      distinct connections store distinct CURRENT_CONNECTION ids;
 #   4. gbak round trip and gfix -v -full.
 #
 #   qa/serve-real-insertdefault.sh [port]
@@ -48,6 +52,7 @@ CREATE DOMAIN DO2 AS INTEGER DEFAULT 10;
 CREATE TABLE U (X DD, Y DO2 DEFAULT 20, Z VARCHAR(3));
 CREATE TABLE V (S INTEGER, TS TIMESTAMP DEFAULT CURRENT_TIMESTAMP, DT DATE DEFAULT CURRENT_DATE);
 CREATE TABLE W (S INTEGER, CN BIGINT DEFAULT CURRENT_CONNECTION);
+CREATE TABLE SS (ID INTEGER, UU VARCHAR(31) DEFAULT USER, RR VARCHAR(31) DEFAULT CURRENT_ROLE, TX BIGINT DEFAULT CURRENT_TRANSACTION);
 COMMIT;"
 
 for f in "$REF" "$WORK"; do
@@ -109,11 +114,17 @@ check "fc: domain default applies, column default overrides the domain" \
       "$(node_run "INSERT INTO U (Z) VALUES ('q')")" "OK"
 check "fc: clock defaults (CURRENT_TIMESTAMP / CURRENT_DATE)" \
       "$(node_run 'INSERT INTO V (S) VALUES (1)')" "OK"
-case "$(node_run 'INSERT INTO W (S) VALUES (1)')" in
-    ERR*) echo "OK   a session-dependent default (CURRENT_CONNECTION) refuses when omitted" ;;
-    *) echo "DIFF session-default refusal"; fail=1 ;; esac
-check "fc: supplying the session-defaulted column explicitly works" \
+# session defaults evaluate from the attachment (inc 129): each
+# node_run is its OWN connection, so two omitted-CN inserts must land
+# DISTINCT attachment ids
+check "fc: CURRENT_CONNECTION default fills (first connection)" \
+      "$(node_run 'INSERT INTO W (S) VALUES (1)')" "OK"
+check "fc: CURRENT_CONNECTION default fills (second connection)" \
+      "$(node_run 'INSERT INTO W (S) VALUES (3)')" "OK"
+check "fc: supplying the session-defaulted column explicitly still overrides" \
       "$(node_run 'INSERT INTO W (S, CN) VALUES (2, 77)')" "OK"
+check "fc: USER / CURRENT_ROLE / CURRENT_TRANSACTION defaults fill" \
+      "$(node_run 'INSERT INTO SS (ID) VALUES (1)')" "OK"
 check "fc reads its defaulted row back" \
       "$(node_run 'SELECT A, C, E, F, K, NN FROM T WHERE ID = 1')" \
       "7|5000000000|-3|hi|<null>|9"
@@ -127,7 +138,10 @@ INSERT INTO T (ID) VALUES (1);
 INSERT INTO T (ID, A, H) VALUES (2, 100, 55);
 INSERT INTO U (Z) VALUES ('q');
 INSERT INTO V (S) VALUES (1);
+INSERT INTO W (S) VALUES (1);
+INSERT INTO W (S) VALUES (3);
 INSERT INTO W (S, CN) VALUES (2, 77);
+INSERT INTO SS (ID) VALUES (1);
 COMMIT;
 SQL
 
@@ -139,7 +153,8 @@ SELECT 'T|'||ID||'|'||COALESCE(A,-1)||'|'||COALESCE(B,-1)||'|'||COALESCE(C,-1)||
        ||'|'||NN||'|'||COALESCE(I128,-1) FROM T ORDER BY ID;
 SELECT 'U|'||X||'|'||Y||'|'||Z FROM U;
 SELECT 'V|'||S||'|'||DT||'|'||IIF(TS IS NULL, 'NULL', 'SET') FROM V;
-SELECT 'W|'||S||'|'||CN FROM W ORDER BY S;
+SELECT 'W|'||S||'|'||IIF(S = 2, CN, IIF(CN > 0, -7, -8)) FROM W ORDER BY S;
+SELECT 'S|'||ID||'|'||TRIM(UU)||'|'||TRIM(RR)||'|'||IIF(TX > 0, 'TX+', 'TX?') FROM SS ORDER BY ID;
 SQL
 }
 work_d=$(dump "$WORK")
@@ -150,6 +165,14 @@ case "$work_d" in
         echo "OK   the teeth bite: 1.50 scaled, -3 negative, NULL default stayed NULL, domain 42 vs override 20" ;;
     *) echo "DIFF the dump comparison was vacuous"; echo "     $work_d"; fail=1 ;;
 esac
+
+# the two omitted-CN rows carry DISTINCT attachment ids on fc's file
+dcn=$("$ISQL" -q -b -user "$U" -pas "$P" "$WORK" 2>&1 <<'SQL' | strip | grep -v '^$'
+SET HEADING OFF;
+SELECT 'DCN|'||COUNT(DISTINCT CN) FROM W WHERE S IN (1, 3);
+SQL
+)
+check "distinct connections stored distinct CURRENT_CONNECTION ids" "$dcn" "DCN|2"
 
 # --- 3. gbak and gfix ---------------------------------------------------
 if "$GBAK" -b -g -user "$U" -pas "$P" "$WORK" "$FBK" >/tmp/fc-insdef-backup.log 2>&1; then
