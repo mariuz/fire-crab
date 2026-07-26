@@ -939,6 +939,9 @@ AlterDomainRename {
         /// the FOREIGN KEYS on this table: the bound row's key must
         /// reference an existing parent row ([fk_check_child_row])
         fk_refs: Vec<FkPartner>,
+        /// the DEFAULTs of the columns the INSERT list omits, applied
+        /// at execute exactly where the engine fills them
+        default_fields: Vec<(usize, DefaultVal)>,
     },
     /// `UPDATE <t> SET col = <lit|?> [, ...] [WHERE ...]`: literal SET
     /// values are encoded at prepare, parameter ones bind at execute;
@@ -1493,6 +1496,191 @@ fn fk_trigger_parent_cols(db: &Database, table: &str, trigs: &[String]) -> Optio
             out.push(f.trim_end().to_string());
         }
     });
+    Some(out)
+}
+
+/// A column DEFAULT this server can apply on its OWN INSERT - decoded
+/// from the stored `RDB$DEFAULT_VALUE` BLR. The engine fills omitted
+/// defaulted columns from the runtime summary at store; fire-crab
+/// evaluates the same default at execute. Session-dependent defaults
+/// (USER/ROLE/CONNECTION/TRANSACTION) are not decodable here - an
+/// INSERT omitting such a column refuses, never writes a wrong value.
+#[derive(Clone, Debug, PartialEq)]
+enum DefaultVal {
+    /// an integer literal at a scale: `blr_short`/`blr_long`/`blr_int64`
+    /// (the engine stores `DEFAULT 1.5` as `blr_long` scale -1 value 15,
+    /// `DEFAULT -3` as a negative literal, no negate node - probed)
+    Int(i64, i8),
+    /// a text literal (`blr_text`/`blr_text2`)
+    Text(String),
+    /// `DEFAULT NULL` - stored explicitly, applied as the NULL the
+    /// omitted column would get anyway
+    Null,
+    /// CURRENT_DATE, and the TIME/TIMESTAMP forms below - evaluated
+    /// from the system clock at execute (LOCAL* forms map here too;
+    /// this server's locale is the box's UTC)
+    CurrentDate,
+    CurrentTime,
+    CurrentTimestamp,
+}
+
+/// Decode a stored `RDB$DEFAULT_VALUE` BLR into a [DefaultVal]. None =
+/// a shape this server cannot evaluate (a session id, an expression) -
+/// the INSERT then refuses when the column is omitted.
+fn decode_default_blr(b: &[u8]) -> Option<DefaultVal> {
+    if b.first() != Some(&5) {
+        return None; // not blr_version5
+    }
+    Some(match *b.get(1)? {
+        21 => match *b.get(2)? {
+            // integer literals carry a SIGNED scale byte then the value
+            7 => DefaultVal::Int(
+                i16::from_le_bytes(b.get(4..6)?.try_into().ok()?) as i64,
+                *b.get(3)? as i8,
+            ),
+            8 => DefaultVal::Int(
+                i32::from_le_bytes(b.get(4..8)?.try_into().ok()?) as i64,
+                *b.get(3)? as i8,
+            ),
+            16 => DefaultVal::Int(
+                i64::from_le_bytes(b.get(4..12)?.try_into().ok()?),
+                *b.get(3)? as i8,
+            ),
+            // blr_text: u16 length + bytes
+            14 => {
+                let n = u16::from_le_bytes(b.get(3..5)?.try_into().ok()?) as usize;
+                DefaultVal::Text(String::from_utf8(b.get(5..5 + n)?.to_vec()).ok()?)
+            }
+            // blr_text2: u16 charset + u16 length + bytes
+            15 => {
+                let n = u16::from_le_bytes(b.get(5..7)?.try_into().ok()?) as usize;
+                DefaultVal::Text(String::from_utf8(b.get(7..7 + n)?.to_vec()).ok()?)
+            }
+            _ => return None,
+        },
+        45 => DefaultVal::Null,
+        160 => DefaultVal::CurrentDate,
+        161 => DefaultVal::CurrentTimestamp,
+        162 => DefaultVal::CurrentTime,
+        214 => DefaultVal::CurrentTimestamp, // LOCALTIMESTAMP <precision>
+        215 => DefaultVal::CurrentTime,      // LOCALTIME <precision>
+        _ => return None,
+    })
+}
+
+/// The system clock as engine values: the Modified-Julian day number
+/// and the 1/10000-second time units a DATE/TIME/TIMESTAMP field
+/// stores - what the CURRENT_* defaults evaluate to.
+fn now_date_time() -> (i32, u32) {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = d.as_secs();
+    let days = (secs / 86400) as i32 + 40587; // MJD of 1970-01-01
+    let units = ((secs % 86400) * 10_000) as u32 + d.subsec_millis() * 10;
+    (days, units)
+}
+
+/// The DEFAULTs an INSERT must apply for the columns its list omits:
+/// each omitted stored column's `RDB$DEFAULT_VALUE` - the column's own
+/// (RDB$RELATION_FIELDS), else its domain's (RDB$FIELDS) - decoded.
+/// None = an omitted column carries a default this server cannot
+/// evaluate; the statement must refuse, never insert a wrong NULL.
+fn insert_defaults(
+    db: &Database,
+    table: &str,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    targeted: &[usize],
+) -> Option<Vec<(usize, DefaultVal)>> {
+    let rf_formats = fire_crab_ods::sysfmt::system_relation_formats(
+        &db.bytes,
+        db.page_size,
+        "RDB$RELATION_FIELDS",
+    )?;
+    let (_, rf_descs) = rf_formats.iter().max_by_key(|(n, _)| *n)?;
+    let rf_cols = relation_columns(&db.bytes, db.page_size, "RDB$RELATION_FIELDS");
+    let rfid = |n: &str| rf_cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (rel_f, name_f, src_f, def_f) = (
+        rfid("RDB$RELATION_NAME")?,
+        rfid("RDB$FIELD_NAME")?,
+        rfid("RDB$FIELD_SOURCE")?,
+        rfid("RDB$DEFAULT_VALUE")?,
+    );
+    let rf_fmts = vec![(0u8, rf_descs.clone())];
+    // (fid, column default blob, domain source name)
+    let mut omitted: Vec<(usize, Option<(u16, u64)>, String)> = Vec::new();
+    for_each_record(db, 5, &rf_fmts, |values| {
+        let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(table));
+        if !is_rel {
+            return;
+        }
+        let Some(Value::Text(cname)) = values.get(name_f) else { return };
+        let Some(rc) = columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(cname.trim_end()))
+        else {
+            return;
+        };
+        let fid = rc.field_id as usize;
+        if targeted.contains(&fid) || is_computed_fid(descs, fid) {
+            return;
+        }
+        let blob = match values.get(def_f) {
+            Some(Value::Blob(r, n)) => Some((*r, *n)),
+            _ => None,
+        };
+        let src = match values.get(src_f) {
+            Some(Value::Text(t)) => t.trim_end().to_string(),
+            _ => String::new(),
+        };
+        omitted.push((fid, blob, src));
+    });
+    let mut out = Vec::new();
+    let mut pending: Vec<(usize, String)> = Vec::new();
+    for (fid, blob, src) in omitted {
+        match blob {
+            Some((r, n)) => {
+                let bytes = fire_crab_ods::read_blob_content(&db.bytes, db.page_size, r, n)?;
+                match decode_default_blr(&bytes)? {
+                    DefaultVal::Null => {} // same as no default
+                    dv => out.push((fid, dv)),
+                }
+            }
+            None => pending.push((fid, src)), // the domain may carry one
+        }
+    }
+    if !pending.is_empty() {
+        let f_formats = fire_crab_ods::sysfmt::system_relation_formats(
+            &db.bytes,
+            db.page_size,
+            "RDB$FIELDS",
+        )?;
+        let (_, f_descs) = f_formats.iter().max_by_key(|(n, _)| *n)?;
+        let f_cols = relation_columns(&db.bytes, db.page_size, "RDB$FIELDS");
+        let ffid = |n: &str| f_cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+        let (fname_f, fdef_f) = (ffid("RDB$FIELD_NAME")?, ffid("RDB$DEFAULT_VALUE")?);
+        let f_fmts = vec![(0u8, f_descs.clone())];
+        let mut blobs: Vec<(usize, u16, u64)> = Vec::new();
+        for_each_record(db, 2, &f_fmts, |values| {
+            let Some(Value::Text(fname)) = values.get(fname_f) else { return };
+            let fname = fname.trim_end();
+            for (fid, src) in &pending {
+                if src.eq_ignore_ascii_case(fname) {
+                    if let Some(Value::Blob(r, n)) = values.get(fdef_f) {
+                        blobs.push((*fid, *r, *n));
+                    }
+                }
+            }
+        });
+        for (fid, r, n) in blobs {
+            let bytes = fire_crab_ods::read_blob_content(&db.bytes, db.page_size, r, n)?;
+            match decode_default_blr(&bytes)? {
+                DefaultVal::Null => {}
+                dv => out.push((fid, dv)),
+            }
+        }
+    }
     Some(out)
 }
 
@@ -5363,6 +5551,10 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     // the FKs on this table: the stored row must reference existing
     // parent keys; an unresolvable FK catalog refuses, never bypasses
     let (fk_refs, _) = fk_partners(db, table, &columns)?;
+    // the omitted columns' DEFAULTs - an unevaluatable one (a session
+    // id, an expression) refuses rather than writing a wrong NULL
+    let targeted: Vec<usize> = targets.iter().map(|rc| rc.field_id as usize).collect();
+    let default_fields = insert_defaults(db, table, &columns, &descs, &targeted)?;
     Some((
         Plan::Insert {
             rel,
@@ -5375,6 +5567,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
             checks,
             not_null,
             fk_refs,
+            default_fields,
         },
         params,
     ))
@@ -6283,7 +6476,7 @@ fn execute_dml(
             )?;
             (0, 0, 0)
         }
-        Plan::Insert { rel, format_no, image, descs, index_ops, param_fields, gen_fields, not_null, checks, fk_refs } => {
+        Plan::Insert { rel, format_no, image, descs, index_ops, param_fields, gen_fields, not_null, checks, fk_refs, default_fields } => {
             let mut image = image.clone();
             for (fid, slot) in param_fields {
                 let d = descs.get(*fid).ok_or("field beyond format")?;
@@ -6310,6 +6503,33 @@ fn execute_dml(
                 let d = descs.get(*fid).ok_or("field beyond format")?;
                 match encode_wire_value(d, &WireParam::Int(new_val, 0))
                     .ok_or("generator value does not fit its column")?
+                {
+                    None => {}
+                    Some(bytes) => {
+                        let at = d.offset as usize;
+                        image[at..at + bytes.len()].copy_from_slice(&bytes);
+                        image[fid / 8] &= !(1 << (fid % 8));
+                    }
+                }
+            }
+            // the omitted columns' DEFAULTs, where the engine fills
+            // them: before validation, so a NOT NULL column with a
+            // default passes exactly as it does there
+            for (fid, dv) in default_fields {
+                let d = descs.get(*fid).ok_or("field beyond format")?;
+                let wp = match dv {
+                    DefaultVal::Int(v, s) => WireParam::Int(*v, *s),
+                    DefaultVal::Text(t) => WireParam::Text(t.clone()),
+                    DefaultVal::Null => continue,
+                    DefaultVal::CurrentDate => WireParam::Date(now_date_time().0),
+                    DefaultVal::CurrentTime => WireParam::Time(now_date_time().1),
+                    DefaultVal::CurrentTimestamp => {
+                        let (dd, tt) = now_date_time();
+                        WireParam::Timestamp(dd, tt)
+                    }
+                };
+                match encode_wire_value(d, &wp)
+                    .ok_or("default value does not fit its column")?
                 {
                     None => {}
                     Some(bytes) => {
@@ -13423,6 +13643,40 @@ mod tests {
         let rest = &out[3 + vlen..];
         assert_eq!(rest[0], 67);
         assert_eq!(i32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]), 0);
+    }
+
+    #[test]
+    fn decodes_stored_default_blr_shapes() {
+        // the probed engine blobs: DEFAULT 1.5 (blr_long scale -1),
+        // 5000000000 (blr_int64), -3 (negative literal, no negate
+        // node), 7, 'hi' (blr_text2 charset 0)
+        let hex = |s: &str| -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        };
+        assert_eq!(
+            decode_default_blr(&hex("051508FF0F0000004C")),
+            Some(DefaultVal::Int(15, -1))
+        );
+        assert_eq!(
+            decode_default_blr(&hex("0515100000F2052A010000004C")),
+            Some(DefaultVal::Int(5_000_000_000, 0))
+        );
+        assert_eq!(decode_default_blr(&hex("05150800FDFFFFFF4C")), Some(DefaultVal::Int(-3, 0)));
+        assert_eq!(decode_default_blr(&hex("05150800070000004C")), Some(DefaultVal::Int(7, 0)));
+        assert_eq!(
+            decode_default_blr(&hex("05150F0000020068694C")),
+            Some(DefaultVal::Text("hi".into()))
+        );
+        assert_eq!(decode_default_blr(&[5, 45, 76]), Some(DefaultVal::Null));
+        assert_eq!(decode_default_blr(&[5, 160, 76]), Some(DefaultVal::CurrentDate));
+        assert_eq!(decode_default_blr(&[5, 214, 3, 76]), Some(DefaultVal::CurrentTimestamp));
+        assert_eq!(decode_default_blr(&[5, 215, 0, 76]), Some(DefaultVal::CurrentTime));
+        // session-dependent defaults are not evaluatable here - refuse
+        assert_eq!(decode_default_blr(&[5, 177, 21, 8, 0, 1, 0, 0, 0, 76]), None);
+        assert_eq!(decode_default_blr(&[5, 44, 76]), None); // blr_user_name
     }
 
     #[test]

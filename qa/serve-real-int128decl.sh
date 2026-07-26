@@ -110,10 +110,10 @@ check "fc reads old rows promoted to INT128" \
 200|y"
 check "fc INSERT into H (INT128 + scaled literals)" \
       "$(node_run "INSERT INTO H (ID, I, N, M, D, J) VALUES (1, 42, 7, 3, 9, 11)")" "OK"
-# (D given explicitly: fc's own INSERT does not APPLY defaults yet -
-# the engine would fill D with 5; a known gap, its own future slice)
-check "fc INSERT with a PARAMETER into INT128" \
-      "$(node_run 'INSERT INTO H (ID, I, D) VALUES (2, ?, 5)' '[4000000000]')" "OK"
+# D omitted: fc applies the INT128 DEFAULT 5 itself (the insertdefault
+# slice), exactly as the engine mirror below does
+check "fc INSERT with a PARAMETER into INT128 (DEFAULT fills D)" \
+      "$(node_run 'INSERT INTO H (ID, I) VALUES (2, ?)' '[4000000000]')" "OK"
 check "fc UPDATE SET on an INT128 column" \
       "$(node_run 'UPDATE H SET I = 77 WHERE ID = 2')" "OK"
 check "fc reads its INT128 rows back (scaled render via isql below)" \
@@ -139,7 +139,7 @@ COMMIT;
 ALTER TABLE H2 ALTER A TYPE INT128;
 COMMIT;
 INSERT INTO H (ID, I, N, M, D, J) VALUES (1, 42, 7, 3, 9, 11);
-INSERT INTO H (ID, I, D) VALUES (2, 4000000000, 5);
+INSERT INTO H (ID, I) VALUES (2, 4000000000);
 UPDATE H SET I = 77 WHERE ID = 2;
 COMMIT;
 EOF
