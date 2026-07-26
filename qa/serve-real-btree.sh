@@ -113,16 +113,23 @@ check() { # <label> <got> <want>
 }
 
 # --- phase 1: 2000 inserts - three indexes maintained, PK root splits --
-bulk=$(FC_DB="$WORK" FC_PORT="$PORT" FC_U="$U" FC_P="$P" timeout 240 node -e '
+bulk=$(FC_DB="$WORK" FC_PORT="$PORT" FC_U="$U" FC_P="$P" timeout 400 node -e '
   process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(1); });
   const F=require("node-firebird");
   F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
             user:process.env.FC_U,password:process.env.FC_P},(e,db)=>{
     if(e){console.log("CONN_ERR");process.exit(1);}
     const Q="\u0027";
+    const t0=Date.now();
     let i=10;
     const next=()=>{
       if(i>=2010){console.log("DONE "+(i-10));db.detach();process.exit(0);}
+      // self-limit BEFORE the outer timeout kills us, so a slow box
+      // reports how far it got instead of an empty result
+      if(Date.now()-t0>330000){
+        console.log("SLOW "+(i-10)+" inserts in "+((Date.now()-t0)/1000).toFixed(0)+"s");
+        process.exit(0);
+      }
       i++;
       db.query("INSERT INTO T VALUES ("+i+", "+Q+"row "+i+Q+", "+(i*1000000)+")",(e2)=>{
         if(e2){console.log("ERR at "+i+": "+(e2.message||"").split("\n")[0]);process.exit(0);}
@@ -131,7 +138,18 @@ bulk=$(FC_DB="$WORK" FC_PORT="$PORT" FC_U="$U" FC_P="$P" timeout 240 node -e '
     };
     next();
   });' 2>/dev/null)
-check "2000 inserts into a 3-index table" "$bulk" "DONE 2000"
+case "$bulk" in
+    SLOW*)
+        # not a correctness failure: fire-crab rewrites the whole file per
+        # statement, so this gate is throughput-sensitive. ~20 inserts/s on
+        # an idle box (2000 in ~100s); stray load starves it. Say so, with
+        # the load average, instead of failing mutely.
+        echo "DIFF 2000 inserts into a 3-index table - TOO SLOW, not wrong"
+        echo "     $bulk (load:$(uptime | sed 's/.*load average://'))"
+        echo "     check for stray clients: ps -eo pcpu,args --sort=-pcpu | head"
+        fail=1 ;;
+    *) check "2000 inserts into a 3-index table" "$bulk" "DONE 2000" ;;
+esac
 check "fire-crab count" "$(node_run "SELECT COUNT(*) FROM T")" "2003"
 
 # duplicate PRIMARY KEY refused, nothing written
