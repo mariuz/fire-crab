@@ -35,6 +35,9 @@ rm -f "$SRC" "$CLEAN" "$WORK" "$REF" "$RESTORED"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF || { echo "FAIL scratch db creation"; exit 1; }
 CREATE DATABASE '$SRC' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE T (A INTEGER, B VARCHAR(5), C SMALLINT);
+CREATE TABLE G (PK INTEGER NOT NULL PRIMARY KEY, UQ INTEGER CONSTRAINT GU UNIQUE, PI INTEGER, K1 INTEGER NOT NULL, K2 INTEGER NOT NULL, CONSTRAINT GK UNIQUE (K1, K2));
+CREATE TABLE GC (FK INTEGER REFERENCES G (PK));
+CREATE INDEX GPI ON G (PI);
 COMMIT;
 INSERT INTO T VALUES (1000000, 'xy', 42);
 INSERT INTO T VALUES (2000000, 'zz', 7);
@@ -51,6 +54,7 @@ cp "$CLEAN" "$WORK"; cp "$CLEAN" "$REF"
 ALTER TABLE T ALTER A TYPE BIGINT;
 ALTER TABLE T ALTER B TYPE VARCHAR(10);
 ALTER TABLE T ALTER C TYPE INTEGER;
+ALTER TABLE G ALTER PI TYPE BIGINT;
 COMMIT;
 EOF
 
@@ -130,9 +134,32 @@ case "$(node_run "ALTER TABLE T ALTER NOSUCH TYPE BIGINT")" in
     ERR*) echo "OK   retype of missing column refused" ;;
     *) echo "DIFF retype of missing column refused"; fail=1 ;;
 esac
+# a column whose index enforces an integrity constraint cannot be
+# retyped - "Cannot update index segment used by an Integrity
+# Constraint" (probed: PK, UNIQUE and FK-child segments refuse, ANY
+# segment of a multi-column key; a plain CREATE INDEX column is fine)
+for stmt in "ALTER TABLE G ALTER PK TYPE BIGINT" \
+            "ALTER TABLE G ALTER UQ TYPE BIGINT" \
+            "ALTER TABLE GC ALTER FK TYPE BIGINT" \
+            "ALTER TABLE G ALTER K2 TYPE BIGINT"; do
+    case "$(node_run "$stmt")" in
+        ERR*) echo "OK   constraint-index column refused: ${stmt#ALTER TABLE }" ;;
+        *) echo "DIFF constraint refusal: $stmt"; fail=1 ;;
+    esac
+done
+check "a PLAIN-indexed column still retypes" \
+    "$(node_run 'ALTER TABLE G ALTER PI TYPE BIGINT')" "<no rows>"
 
 # --- phase 2: the ENGINE adopts fire-crab's retyped file ---------------
 kill $srv 2>/dev/null; wait $srv 2>/dev/null
+
+# the engine refuses the same constrained retype on fc's file - the
+# constraint metadata fc preserved is what makes it refuse
+engref=$("$ISQL" -q -user "$U" -pas "$P" "$WORK" 2>&1 <<< "ALTER TABLE G ALTER PK TYPE BIGINT;")
+case "$engref" in
+    *"Integrity Constraint"*) echo "OK   the engine refuses the same retype on fc's file" ;;
+    *) echo "DIFF engine-side constraint refusal"; echo "     $engref"; fail=1 ;;
+esac
 
 # rows 1-2 exist on both WORK and REF (same ALTERs); compare via SET LIST
 w12=$(run_isql "$WORK" <<EOF | strip | grep -v '^$'

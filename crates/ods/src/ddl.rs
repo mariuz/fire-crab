@@ -1911,6 +1911,67 @@ fn int_width(dt: u8) -> Option<u16> {
 /// integer (scale 0), a CHAR/VARCHAR widens to a same-or-longer one of
 /// the same kind. Everything else errors, as the engine does for an
 /// unsupported conversion.
+/// TRUE when `col` is a segment of an index that an
+/// `RDB$RELATION_CONSTRAINTS` row names - a PRIMARY KEY / UNIQUE /
+/// FOREIGN KEY enforcement index. The engine refuses retyping such a
+/// column: "Cannot update index segment used by an Integrity
+/// Constraint" (probed: PK, UNIQUE-constraint and FK-child segments all
+/// refuse, ANY segment of a multi-column key included, while a plain
+/// CREATE INDEX column retypes fine).
+fn column_in_constraint_index(
+    file: &[u8],
+    page_size: usize,
+    table: &str,
+    col: &str,
+) -> Result<bool, String> {
+    // the relation's index names
+    let irel =
+        crate::resolve_relation(file, page_size, "RDB$INDICES").ok_or("no RDB$INDICES")?;
+    let formats = system_relation_formats(file, page_size, "RDB$INDICES")
+        .ok_or("no RDB$INDICES format")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let ix_f = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME")?;
+    let rn_f = sys_fid(file, page_size, "RDB$INDICES", "RDB$RELATION_NAME")?;
+    let mut names: Vec<String> = Vec::new();
+    walk_rows(file, page_size, irel, descs, |values| {
+        if text_eq(values.get(rn_f), table) {
+            if let Some(Value::Text(t)) = values.get(ix_f) {
+                names.push(t.trim_end().to_string());
+            }
+        }
+    });
+    // ...those the column is a segment of
+    let mut mine: Vec<String> = Vec::new();
+    for n in names {
+        if index_segment_columns(file, page_size, &n)?
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(col))
+        {
+            mine.push(n);
+        }
+    }
+    if mine.is_empty() {
+        return Ok(false);
+    }
+    // ...and whether any of those backs a constraint
+    let crel = crate::resolve_relation(file, page_size, "RDB$RELATION_CONSTRAINTS")
+        .ok_or("no RDB$RELATION_CONSTRAINTS")?;
+    let cformats = system_relation_formats(file, page_size, "RDB$RELATION_CONSTRAINTS")
+        .ok_or("no RDB$RELATION_CONSTRAINTS format")?;
+    let (_, cdescs) = cformats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let cix_f = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$INDEX_NAME")?;
+    let mut hit = false;
+    walk_rows(file, page_size, crel, cdescs, |values| {
+        if let Some(Value::Text(t)) = values.get(cix_f) {
+            let t = t.trim_end();
+            if mine.iter().any(|m| m.eq_ignore_ascii_case(t)) {
+                hit = true;
+            }
+        }
+    });
+    Ok(hit)
+}
+
 fn type_change_supported(old: &Descriptor, new: &ColumnDef) -> bool {
     use crate::format::dtype;
     // integer family: same or wider, both scale 0
@@ -1965,6 +2026,14 @@ pub fn alter_table_alter_column_type(
         return Err(format!(
             "cannot change datatype for {}; conversion not supported",
             col_name
+        ));
+    }
+    // a column whose index enforces a PRIMARY KEY / UNIQUE / FOREIGN KEY
+    // cannot be retyped - the engine's own refusal, mirrored
+    if column_in_constraint_index(file, page_size, &table, &col_up)? {
+        return Err(format!(
+            "Cannot update index segment used by an Integrity Constraint ({})",
+            col_up
         ));
     }
 
