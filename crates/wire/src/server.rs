@@ -2849,9 +2849,11 @@ fn parse_trigger_stmts(
     at: usize,
     end: usize,
     vars: &[String],
-) -> Option<(Vec<TrigStmt>, Option<TrigStmt>)> {
+) -> Option<(Vec<TrigStmt>, Vec<(Vec<String>, TrigStmt)>)> {
     let mut out: Vec<TrigStmt> = Vec::new();
-    let mut handler: Option<TrigStmt> = None;
+    // the block's error handlers, in source order: each is (condition
+    // exception names - empty = WHEN ANY) and its statement
+    let mut handlers: Vec<(Vec<String>, TrigStmt)> = Vec::new();
     let mut pos = at;
     while pos < end {
         let rest = &s[pos..end];
@@ -2861,8 +2863,9 @@ fn parse_trigger_stmts(
             break;
         }
         let semi = s[start..end].find(';')? + start;
-        if handler.is_some() {
-            return None; // WHEN must be the block's LAST segment
+        let seg_up0 = s[start..semi].to_ascii_uppercase();
+        if !handlers.is_empty() && find_word(&seg_up0, "WHEN", 0) != Some(0) {
+            return None; // once a WHEN appears, only WHENs may follow
         }
         // `ELSE <stmt>;` is its own semicolon segment - it attaches to
         // the IF the previous segment parsed
@@ -2880,21 +2883,34 @@ fn parse_trigger_stmts(
             pos = semi + 1;
             continue;
         }
-        // `WHEN ANY DO <stmt>;` - the block's error handler
+        // `WHEN ANY DO <stmt>;` or `WHEN EXCEPTION <n>[, EXCEPTION
+        // <n>]... DO <stmt>;` - the block's error handlers, trailing
         if find_word(&seg_up, "WHEN", 0) == Some(0) {
             let after = &seg_up["WHEN".len()..];
-            let any = find_word(after, "ANY", 0)?;
-            if !after[..any].trim().is_empty() {
-                return None; // only WHEN ANY (no named conditions yet)
-            }
-            let do_kw = find_word(after, "DO", any + "ANY".len())?;
-            if !after[any + "ANY".len()..do_kw].trim().is_empty() {
-                return None;
+            let do_kw = find_word(after, "DO", 0)?;
+            let conds_txt = after[..do_kw].trim();
+            let mut names: Vec<String> = Vec::new();
+            if conds_txt != "ANY" {
+                for part in conds_txt.split(',') {
+                    let words: Vec<&str> = part.split_whitespace().collect();
+                    let ["EXCEPTION", n] = words.as_slice() else {
+                        return None; // GDSCODE/SQLCODE conditions: not yet
+                    };
+                    let n = n.trim_matches('"').to_string();
+                    if !ident_ok(&n) {
+                        return None;
+                    }
+                    names.push(n);
+                }
+                if names.is_empty() {
+                    return None;
+                }
             }
             let inner_rel = start + "WHEN".len() + do_kw + "DO".len();
             let inner = &s[inner_rel..semi];
             let inner_lead = inner.len() - inner.trim_start().len();
-            handler = Some(parse_trigger_stmt(s, inner_rel + inner_lead, semi, vars)?);
+            let stmt = parse_trigger_stmt(s, inner_rel + inner_lead, semi, vars)?;
+            handlers.push((names, stmt));
             pos = semi + 1;
             continue;
         }
@@ -2904,7 +2920,7 @@ fn parse_trigger_stmts(
     if out.is_empty() {
         None
     } else {
-        Some((out, handler))
+        Some((out, handlers))
     }
 }
 
@@ -3086,7 +3102,7 @@ fn parse_trigger_stmt(s: &str, start: usize, end: usize, vars: &[String]) -> Opt
 /// ELSE-branch ones included - gets its own entry in source order.
 fn emit_trigger_blr(
     stmts: &[TrigStmt],
-    handler: Option<&TrigStmt>,
+    handlers: &[(Vec<String>, TrigStmt)],
     declares: &[(String, u8, usize)], // (name, blr dtype, DECLARE src offset)
     begin_off: usize,
     dbg: &mut Vec<(usize, usize)>,
@@ -3111,28 +3127,44 @@ fn emit_trigger_blr(
     // takes the next relation context after OLD (0) and NEW (1)
     let mut next_label = 1u8;
     let mut next_ctx = 2u8;
-    match handler {
-        None => {
-            b.push(2); // begin (the one the debug map points at)
-            b.push(2); // begin
-            for st in stmts {
-                emit_trigger_stmt(st, &mut b, dbg, &mut next_label, &mut next_ctx);
-            }
-            b.extend_from_slice(&[255, 255, 255, 76]);
+    // with any handler present, every EXCEPTION raise brackets itself
+    // in begin/start_savepoint/.../end_savepoint (probed - protected
+    // part AND handler statements alike)
+    let bracket = !handlers.is_empty();
+    if handlers.is_empty() {
+        b.push(2); // begin (the one the debug map points at)
+        b.push(2); // begin
+        for st in stmts {
+            emit_trigger_stmt(st, &mut b, dbg, &mut next_label, &mut next_ctx, bracket);
         }
-        // `WHEN ANY DO <stmt>`: blr_handler wraps the protected begin,
-        // then blr_error_handler with ONE condition, 4 = ANY (probed)
-        Some(h) => {
-            b.push(129); // blr_handler (the debug map's begin entry)
-            b.push(2); // begin (protected statements)
-            for st in stmts {
-                emit_trigger_stmt(st, &mut b, dbg, &mut next_label, &mut next_ctx);
-            }
-            b.push(255); // end of the protected begin
-            b.extend_from_slice(&[130, 1, 0, 4]); // blr_error_handler, 1 cond, ANY
-            emit_trigger_stmt(h, &mut b, dbg, &mut next_label, &mut next_ctx);
-            b.extend_from_slice(&[255, 255, 76]);
+        b.extend_from_slice(&[255, 255, 255, 76]);
+    } else {
+        // blr_handler wraps the protected begin; each `WHEN ... DO`
+        // is one blr_error_handler with its condition list - `4` is
+        // ANY, a named exception is `9, 0, <len>, <name>` (probed)
+        b.push(129); // blr_handler (the debug map's begin entry)
+        b.push(2); // begin (protected statements)
+        for st in stmts {
+            emit_trigger_stmt(st, &mut b, dbg, &mut next_label, &mut next_ctx, bracket);
         }
+        b.push(255); // end of the protected begin
+        for (names, h) in handlers {
+            b.push(130); // blr_error_handler
+            let count = if names.is_empty() { 1u16 } else { names.len() as u16 };
+            b.extend_from_slice(&count.to_le_bytes());
+            if names.is_empty() {
+                b.push(4); // ANY
+            } else {
+                for n in names {
+                    b.push(9);
+                    b.push(0);
+                    b.push(n.len() as u8);
+                    b.extend_from_slice(n.as_bytes());
+                }
+            }
+            emit_trigger_stmt(h, &mut b, dbg, &mut next_label, &mut next_ctx, bracket);
+        }
+        b.extend_from_slice(&[255, 255, 76]);
     }
     b
 }
@@ -3143,6 +3175,7 @@ fn emit_trigger_stmt(
     dbg: &mut Vec<(usize, usize)>,
     next_label: &mut u8,
     next_ctx: &mut u8,
+    bracket_raises: bool,
 ) {
     match st {
         TrigStmt::Assign { target, expr, src_off } => {
@@ -3166,9 +3199,9 @@ fn emit_trigger_stmt(
             dbg.push((*src_off, b.len()));
             b.push(8); // blr_if
             cond.emit_positive(b);
-            emit_trigger_stmt(then, b, dbg, next_label, next_ctx);
+            emit_trigger_stmt(then, b, dbg, next_label, next_ctx, bracket_raises);
             match otherwise {
-                Some(e) => emit_trigger_stmt(e, b, dbg, next_label, next_ctx),
+                Some(e) => emit_trigger_stmt(e, b, dbg, next_label, next_ctx, bracket_raises),
                 None => b.push(255), // no else branch
             }
         }
@@ -3185,17 +3218,28 @@ fn emit_trigger_stmt(
             dbg.push((*src_off, b.len()));
             b.push(8); // blr_if
             cond.emit_positive(b);
-            emit_trigger_stmt(body, b, dbg, next_label, next_ctx);
+            emit_trigger_stmt(body, b, dbg, next_label, next_ctx, bracket_raises);
             b.push(18); // blr_leave (the else branch: condition false)
             b.push(n);
             b.push(255); // end of the loop's begin
         }
         TrigStmt::Raise { name, src_off } => {
             dbg.push((*src_off, b.len()));
+            if bracket_raises {
+                // begin / start_savepoint / abort / end_savepoint / end
+                // - the shape every raise takes once the block has a
+                // handler (probed; the debug entry points at the begin)
+                b.push(2);
+                b.push(134); // blr_start_savepoint
+            }
             b.push(128); // blr_abort
             b.push(2); // condition kind: exception, by name
             b.push(name.len() as u8);
             b.extend_from_slice(name.as_bytes());
+            if bracket_raises {
+                b.push(135); // blr_end_savepoint
+                b.push(255); // end
+            }
         }
         TrigStmt::Store { table, cols, exprs, src_off } => {
             dbg.push((*src_off, b.len()));
@@ -3376,7 +3420,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         return None;
     }
     let var_names: Vec<String> = declares.iter().map(|(n, _, _)| n.clone()).collect();
-    let (stmts, handler) = parse_trigger_stmts(s, begin_kw + "BEGIN".len(), end_kw, &var_names)?;
+    let (stmts, handlers) = parse_trigger_stmts(s, begin_kw + "BEGIN".len(), end_kw, &var_names)?;
 
     // validate every reference against the CATALOG: qualified (NEW/OLD)
     // or a DECLAREd variable, columns being plain integer stored ones;
@@ -3453,7 +3497,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     let mut targets = Vec::new();
     let mut stores = Vec::new();
     let mut raises = Vec::new();
-    for st in stmts.iter().chain(handler.iter()) {
+    for st in stmts.iter().chain(handlers.iter().map(|(_, h)| h)) {
         stmt_exprs(st, &mut exprs);
         stmt_targets(st, &mut targets);
         stmt_specials(st, &mut stores, &mut raises);
@@ -3538,9 +3582,15 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             None => store_deps.push((stab.clone(), cols.clone())),
         }
     }
-    // raised exceptions must exist; each is one dependency (type 7)
+    // raised AND handled exceptions must exist; each distinct name is
+    // one dependency row (type 7 - a handled-only one gets it too,
+    // probed)
     let mut exceptions: Vec<String> = Vec::new();
-    for r in &raises {
+    for r in raises
+        .iter()
+        .copied()
+        .chain(handlers.iter().flat_map(|(names, _)| names.iter().map(|n| n.as_str())))
+    {
         if !exception_exists(db, r) {
             return None;
         }
@@ -3550,7 +3600,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     }
 
     let mut dbg_entries = Vec::new();
-    let blr = emit_trigger_blr(&stmts, handler.as_ref(), &declares, begin_kw, &mut dbg_entries);
+    let blr = emit_trigger_blr(&stmts, &handlers, &declares, begin_kw, &mut dbg_entries);
     let debug = trigger_debug_blob(s, &declares, &dbg_entries);
     Some((
         Plan::CreateTrigger {
@@ -14320,6 +14370,45 @@ mod tests {
         assert!(!p.bind(&[WireParam::Null]).unwrap().matches(&row));
     }
 
+
+    #[test]
+    fn named_when_handlers_blr_matches_engine() {
+        // the engine's own W1/W3/W6 blobs (probed): a named condition is
+        // 9, 0, <len>, <name>; handlers chain as separate
+        // blr_error_handler nodes; once a handler exists every raise
+        // brackets in begin/start_savepoint/abort/end_savepoint/end
+        let hex = |h: &str| -> Vec<u8> {
+            (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect()
+        };
+        let compile = |sql: &str| {
+            let up = sql.to_ascii_uppercase();
+            let begin = find_word(&up, "BEGIN", 0).unwrap();
+            let end = up.rfind("END").unwrap();
+            let (stmts, handlers) =
+                parse_trigger_stmts(sql, begin + "BEGIN".len(), end, &[]).unwrap();
+            let mut dbg = Vec::new();
+            let blr = emit_trigger_blr(&stmts, &handlers, &[], begin, &mut dbg);
+            (blr, trigger_debug_blob(sql, &[], &dbg))
+        };
+        // W1: raise inside IF, one NAMED handler
+        let (blr, dbg) = compile(
+            "CREATE TRIGGER W1 FOR T1 BEFORE INSERT AS BEGIN IF (NEW.A = 1) THEN EXCEPTION EX1; WHEN EXCEPTION EX1 DO NEW.B = -1; END",
+        );
+        assert_eq!(blr, hex("0502110081020 82F1701014115080001000000028680020345583187FFFFFF82010009000345583101150800FFFFFFFF17010142FFFF4C".replace(' ', "").as_str()));
+        assert_eq!(dbg, hex("40010202010000002B00000004000000020100000031000000060000000201000000450000001300000002010000006A00000028000000FF".trim_start_matches("40")));
+        // W3: a named handler THEN an ANY handler
+        let (blr, _) = compile(
+            "CREATE TRIGGER W3 FOR T1 BEFORE INSERT AS BEGIN NEW.B = 2; WHEN EXCEPTION EX1 DO NEW.B = -3; WHEN ANY DO NEW.B = -4; END",
+        );
+        assert_eq!(blr, hex("05021100 8102 011508000200000017010142 FF 82010009000345583101150800FDFFFFFF17010142 820100 0401150800FCFFFFFF17010142 FFFF4C".replace(' ', "").as_str()));
+        // W6: a TOP-LEVEL raise still brackets when a handler exists
+        let (blr, dbg) = compile(
+            "CREATE TRIGGER W6 FOR T1 BEFORE INSERT AS BEGIN EXCEPTION EX1; WHEN ANY DO NEW.B = -7; END",
+        );
+        assert_eq!(blr, hex("05021100 8102 028680020345583187 FF FF 8201000401150800F9FFFFFF17010142 FFFF4C".replace(' ', "").as_str()));
+        assert_eq!(dbg, hex("010202010000002B000000040000000201000000310000000600000002010000004C00000015000000FF"));
+    }
+
     #[test]
     fn decodes_stored_default_blr_shapes() {
         // the probed engine blobs: DEFAULT 1.5 (blr_long scale -1),
@@ -15098,10 +15187,10 @@ mod tests {
             let up = sql.to_ascii_uppercase();
             let begin = find_word(&up, "BEGIN", 0).unwrap();
             let end = up.rfind("END").unwrap();
-            let (stmts, handler) =
+            let (stmts, handlers) =
                 parse_trigger_stmts(sql, begin + "BEGIN".len(), end, &[]).unwrap();
             let mut dbg = Vec::new();
-            let blr = emit_trigger_blr(&stmts, handler.as_ref(), &[], begin, &mut dbg);
+            let blr = emit_trigger_blr(&stmts, &handlers, &[], begin, &mut dbg);
             (blr, trigger_debug_blob(sql, &[], &dbg))
         };
         // TR1: NEW.B = NEW.A * 2
@@ -15134,10 +15223,10 @@ mod tests {
         // slice flipped the old refusal into the engine's own bytes
         let up = "CREATE TRIGGER T FOR T1 BEFORE INSERT AS BEGIN IF (NOT (NEW.A > 1)) THEN NEW.B = 0; END";
         let begin = find_word(&up.to_ascii_uppercase(), "BEGIN", 0).unwrap();
-        let (stmts, handler) =
+        let (stmts, handlers) =
             parse_trigger_stmts(up, begin + "BEGIN".len(), up.rfind("END").unwrap(), &[]).unwrap();
         let mut dbg = Vec::new();
-        let blr = emit_trigger_blr(&stmts, handler.as_ref(), &[], begin, &mut dbg);
+        let blr = emit_trigger_blr(&stmts, &handlers, &[], begin, &mut dbg);
         let hex = |h: &str| -> Vec<u8> {
             (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect()
         };
@@ -15163,10 +15252,10 @@ mod tests {
             let begin = find_word(&up, "BEGIN", 0).unwrap();
             let end = up.rfind("END").unwrap();
             let vars: Vec<String> = declares.iter().map(|(n, _, _)| n.clone()).collect();
-            let (stmts, handler) =
+            let (stmts, handlers) =
                 parse_trigger_stmts(sql, begin + "BEGIN".len(), end, &vars).unwrap();
             let mut dbg = Vec::new();
-            let blr = emit_trigger_blr(&stmts, handler.as_ref(), declares, begin, &mut dbg);
+            let blr = emit_trigger_blr(&stmts, &handlers, declares, begin, &mut dbg);
             (blr, trigger_debug_blob(sql, declares, &dbg))
         };
         let v = |name: &str, dtype: u8, off: usize| (name.to_string(), dtype, off);
