@@ -32,12 +32,12 @@ mkdir -p "$DIR"
 rm -f "$SRC" "$CLEAN" "$WORK"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF || { echo "FAIL scratch db creation"; exit 1; }
 CREATE DATABASE '$SRC' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
-CREATE TABLE E (ID INTEGER NOT NULL, A INTEGER, B INTEGER, S VARCHAR(10), N NUMERIC(9,2), M NUMERIC(9,4));
+CREATE TABLE E (ID INTEGER NOT NULL, A INTEGER, B INTEGER, S VARCHAR(10), N NUMERIC(9,2), M NUMERIC(9,4), K BIGINT, U NUMERIC(10,2), I INT128);
 COMMIT;
-INSERT INTO E VALUES (1, 10, 3, 'x', 12.50, 1.2345);
-INSERT INTO E VALUES (2, 5, 100, 'y', -3.25, 4.0000);
-INSERT INTO E VALUES (3, NULL, 7, 'z', NULL, 2.0000);
-INSERT INTO E VALUES (4, -8, 2, 'w', 13.50, 0.5000);
+INSERT INTO E VALUES (1, 10, 3, 'x', 12.50, 1.2345, 4000000000, 9.75, 900000000000);
+INSERT INTO E VALUES (2, 5, 100, 'y', -3.25, 4.0000, 5, -2.50, 7);
+INSERT INTO E VALUES (3, NULL, 7, 'z', NULL, 2.0000, NULL, NULL, NULL);
+INSERT INTO E VALUES (4, -8, 2, 'w', 13.50, 0.5000, 3100000000, 100.00, 123456);
 COMMIT;
 EOF
 "$ISQL" -q -b -user "$U" -pas "$P" "$SRC" >/dev/null 2>&1 <<'EOF'
@@ -248,6 +248,31 @@ comparen "declit both literals" "SELECT 1.5 + 2.25 AS R FROM E WHERE ID = 1"
 comparen "declit times int"    "SELECT 1.5 * 2 AS R FROM E WHERE ID = 1"
 comparen "declit bare"         "SELECT 1.5 AS R FROM E WHERE ID = 1"
 
+# --- INT128-width results: the engine's dtype-driven widening (probed
+#     via SQLDA + getDescDialect3/DSC_multiply_result): * and / promote
+#     to INT128 with ANY INT64-ranked operand (BIGINT, NUMERIC(10..18),
+#     a past-i32 literal, CAST AS BIGINT, a +'s INT64 result); + and -
+#     widen only when an operand already IS INT128. The value comparison
+#     doubles as the describe check: node decodes by the announced type,
+#     so a wrong width or scale would garble every value. Known
+#     node-firebird INT128 decode bugs (inc 26) are dodged: negatives and
+#     past-2^53 magnitudes go through CAST AS VARCHAR instead.
+comparen "wide mul: BIGINT * literal"   "SELECT ID, K * 2 FROM E ORDER BY ID"
+comparen "wide mul: NUMERIC(10,2) * N"  "SELECT ID, U * N FROM E ORDER BY ID"
+comparen "wide div: NUMERIC(10,2) / 2"  "SELECT ID, U / 2 FROM E WHERE ID <> 2 ORDER BY ID"
+comparen "narrow add: BIGINT + BIGINT"  "SELECT ID, K + K FROM E ORDER BY ID"
+comparen "narrow sub: NUMERIC(10,2)-N"  "SELECT ID, U - N FROM E ORDER BY ID"
+comparen "wide add: INT128 + 1"         "SELECT ID, I + 1 FROM E ORDER BY ID"
+comparen "wide div: INT128 / 2"         "SELECT ID, I / 2 FROM E ORDER BY ID"
+comparen "wide declit: 1.5 + INT128"    "SELECT ID, 1.5 + I FROM E ORDER BY ID"
+comparen "wide int literal rank"        "SELECT ID, N * 2147483648 FROM E WHERE ID <> 2 ORDER BY ID"
+comparen "wide dec literal rank"        "SELECT ID, N * 1234567890.5 FROM E WHERE ID <> 2 ORDER BY ID"
+comparen "wide nested add rank"         "SELECT ID, (N + M) * A FROM E WHERE ID <> 4 ORDER BY ID"
+comparen "wide cast rank"               "SELECT ID, CAST(N AS BIGINT) * B FROM E WHERE ID <> 2 ORDER BY ID"
+comparen "narrow cast rank stays"       "SELECT ID, CAST(N AS INT) * B FROM E WHERE ID <> 2 ORDER BY ID"
+comparen "past-i64 value via text"      "SELECT ID, CAST(K * K AS VARCHAR(30)) AS T FROM E ORDER BY ID"
+comparen "negative wide via text"       "SELECT ID, CAST(-I * 3 AS VARCHAR(45)) AS T FROM E ORDER BY ID"
+
 # --- runtime errors: BOTH the engine and fire-crab reject the row rather
 #     than answering. Divide-by-zero is the arithmetic exception (SQLSTATE
 #     22012); a bad or too-long CAST is the conversion error (22018).
@@ -271,5 +296,7 @@ errck "divide by zero literal" "SELECT A / 0 FROM E WHERE ID = 1"          "divi
 errck "divide by zero column"  "SELECT A / (B - B) FROM E WHERE ID = 1"    "divide by zero"
 errck "cast bad string"        "SELECT CAST(S AS INTEGER) FROM E WHERE ID = 1"   "conversion error"
 errck "cast too long"          "SELECT CAST(A AS VARCHAR(1)) FROM E WHERE ID = 1" "conversion error"
+# an INT64-announced sum past i64 is the runtime integer overflow (22003)
+errck "int64 add overflow"     "SELECT K + 9223372036854775807 FROM E WHERE ID = 1" "Integer overflow"
 
 exit $fail

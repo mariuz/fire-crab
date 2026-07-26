@@ -629,7 +629,17 @@ impl ProjCol {
     /// arithmetic exception raised while evaluating an expression column.
     fn value_of(&self, values: &[Value]) -> Result<Value, EvalErr> {
         match &self.expr {
-            Some(e) => e.eval(values),
+            Some(e) => {
+                let v = e.eval(values)?;
+                // the describe is the contract: an INT64-announced
+                // expression whose exact value left the i64 range is the
+                // engine's runtime integer overflow (SQLSTATE 22003) -
+                // never truncated bytes
+                if !matches!(self.wire, Wire::Int128) && matches!(v, Value::Int128(..)) {
+                    return Err(EvalErr::IntegerOverflow);
+                }
+                Ok(v)
+            }
             None => Ok(values.get(self.field_id).cloned().unwrap_or(Value::Null)),
         }
     }
@@ -1867,15 +1877,24 @@ fn build_expr_col(
     descs: &[Descriptor],
 ) -> Option<ProjCol> {
     let e = resolve_expr(raw, columns, descs)?;
+    // an exact-numeric result travels as a scaled integer - INT64-backed
+    // (SQL_INT64, the raw integer on the wire, the client divides), or
+    // INT128-backed (SQL_INT128, 16 bytes) when the engine's dtype rules
+    // promote it ([Expr::rank_of]): any INT128 operand, or a `*`/`/`
+    // around an INT64-ranked one. The scale is computed statically from
+    // the operand scales, and `eval` produces exactly that scale so the
+    // decode matches.
+    let num_form = |scale: i32| {
+        if e.is_wide(descs) {
+            (Wire::Int128, 32752, 16, scale)
+        } else {
+            (Wire::Int64, 580, 8, scale)
+        }
+    };
     let (wire, sql_type, length, scale) = match e.type_of(descs)? {
-        ExprType::Int => (Wire::Int64, 580, 8, 0),
+        ExprType::Int => num_form(0),
         ExprType::Text => (Wire::Varying, 448, 32765, 0),
-        // a numeric arithmetic result travels as an INT64-backed scaled
-        // integer (SQL_INT64 + its scale, the raw integer on the wire and
-        // the client divides) - the scale is computed statically from the
-        // operand scales, and `eval` produces exactly that scale so the
-        // decode matches
-        ExprType::Numeric => (Wire::Int64, 580, 8, e.result_scale(descs)? as i32),
+        ExprType::Numeric => num_form(e.result_scale(descs)? as i32),
     };
     Some(ProjCol {
         name: name.to_string(),
@@ -8081,6 +8100,11 @@ const GDS_INTEGER_DIVIDE: i32 = 335544778;
 /// CAST that cannot convert (SQLSTATE 22018).
 const GDS_CONVERT_ERROR: i32 = 335544334;
 
+/// isc_exception_integer_overflow - "Integer overflow. The result of an
+/// integer operation caused the most significant bit of the result to
+/// carry" (SQLSTATE 22003).
+const GDS_INTEGER_OVERFLOW: i32 = 335544779;
+
 /// Write, into the fetch reply stream, the op_response the engine sends
 /// when a row's evaluation raises `e` - mirroring `respond_error`'s layout
 /// but carrying the matching status vector, so the client raises the same
@@ -8102,6 +8126,10 @@ fn write_eval_error(w: &mut W, e: &EvalErr) {
         EvalErr::ConversionError => {
             w.int(1) // isc_arg_gds
                 .int(GDS_CONVERT_ERROR);
+        }
+        EvalErr::IntegerOverflow => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_INTEGER_OVERFLOW);
         }
     }
     w.int(0); // isc_arg_end
@@ -8430,8 +8458,16 @@ fn encode_row(w: &mut W, cols: &[ProjCol], values: &[Value]) -> Result<(), EvalE
             }
             Wire::Int128 => {
                 // xdr_int128 (xdr.cpp:437): high hyper then low hyper =
-                // the value's 16 big-endian bytes
-                let x = if let Value::Int128(x, _) = v { *x } else { 0 };
+                // the value's 16 big-endian bytes. An INT128-announced
+                // EXPRESSION column widens here: eval keeps a result that
+                // fits i64 in its narrow Value form, but the slot is
+                // always 16 bytes
+                let x = match v {
+                    Value::Int128(x, _) => *x,
+                    Value::Int(n) => *n as i128,
+                    Value::Scaled(r, _) => *r as i128,
+                    _ => 0,
+                };
                 w.raw(&x.to_be_bytes());
             }
             Wire::Dec16 => {
@@ -8681,7 +8717,10 @@ enum RawExpr {
 /// select-list arithmetic already does - the displayed value is identical.
 #[derive(Clone, Copy)]
 enum CastTarget {
-    Int,
+    /// an integer-family target; `wide` marks BIGINT, whose int64 rank
+    /// promotes a multiplication or division around it to INT128 (the
+    /// engine's DSC_multiply_result), while SMALLINT/INTEGER stay long
+    Int { wide: bool },
     Text { len: usize, pad: bool },
 }
 
@@ -8930,7 +8969,7 @@ fn parse_cast_target(b: &[char], pos: &mut usize) -> Option<CastTarget> {
     let kw: String = b[start..*pos].iter().collect();
     let ku = kw.to_ascii_uppercase();
     if matches!(ku.as_str(), "SMALLINT" | "INTEGER" | "INT" | "BIGINT") {
-        return Some(CastTarget::Int);
+        return Some(CastTarget::Int { wide: ku == "BIGINT" });
     }
     let pad = match ku.as_str() {
         "VARCHAR" => false,
@@ -9043,6 +9082,10 @@ enum EvalErr {
     /// a value too long for the target text width: `isc_convert_error`
     /// (SQLSTATE 22018)
     ConversionError,
+    /// an exact-numeric result that left its announced range - an INT64
+    /// sum past `i64`, or an operation past `i128`:
+    /// `isc_exception_integer_overflow` (SQLSTATE 22003)
+    IntegerOverflow,
 }
 
 /// What an expression's result is typed as - which drives its wire form
@@ -9078,15 +9121,32 @@ fn numeric_parts(v: &Value) -> Option<(i128, i8)> {
     }
 }
 
+/// The storage width of an exact-numeric operand - what decides INT128
+/// promotion, exactly as the engine's descriptor dtypes do (dsc.cpp
+/// `DSC_multiply_result` + ExprNodes.cpp `getDescDialect3`): a
+/// multiplication or division with any `I64` or `I128` operand is
+/// INT128, addition and subtraction only widen past INT64 when an
+/// operand already IS `I128`.
+#[derive(Clone, Copy, PartialEq, PartialOrd, Debug)]
+enum NumRank {
+    /// SMALLINT/INTEGER storage, and literals within `i32`
+    Long,
+    /// BIGINT / NUMERIC(10..18) storage, and wider literals
+    I64,
+    /// INT128 / NUMERIC(19..38) storage
+    I128,
+}
+
 /// Wrap a computed (raw, scale) numeric result as a `Value` - a scale of
-/// zero collapses to a plain integer, otherwise it stays scaled. Values
-/// are kept within `i64` here (the describe announces an INT64 wire form);
-/// wide-precision results that need INT128 output are a later slice.
+/// zero collapses to a plain integer, otherwise it stays scaled. A value
+/// past `i64` becomes an `Int128`: the caller's describe decides whether
+/// that is the announced wide form ([ProjCol::value_of] raises the
+/// engine's integer overflow when an INT64-announced column produced it).
 fn scaled_value(raw: i128, scale: i8) -> Value {
-    if scale == 0 {
-        Value::Int(raw as i64)
-    } else {
-        Value::Scaled(raw as i64, scale)
+    match i64::try_from(raw) {
+        Ok(n) if scale == 0 => Value::Int(n),
+        Ok(n) => Value::Scaled(n, scale),
+        Err(_) => Value::Int128(raw, scale),
     }
 }
 
@@ -9098,19 +9158,30 @@ fn scaled_value(raw: i128, scale: i8) -> Value {
 /// then doing an integer (truncating-toward-zero) division. A zero
 /// divisor is the arithmetic exception, never a wrong answer.
 fn numeric_bin(r1: i128, s1: i8, op: ArithOp, r2: i128, s2: i8) -> Result<(i128, i8), EvalErr> {
+    // every step checked: past-i128 intermediates are the engine's
+    // integer overflow (SQLSTATE 22003), never a wrapped wrong answer
+    let pow = |k: u32| 10i128.checked_pow(k).ok_or(EvalErr::IntegerOverflow);
+    let align = |r: i128, k: u32| -> Result<i128, EvalErr> {
+        r.checked_mul(pow(k)?).ok_or(EvalErr::IntegerOverflow)
+    };
     Ok(match op {
         ArithOp::Add | ArithOp::Sub => {
             let sr = s1.min(s2);
-            let a = r1 * 10i128.pow((s1 - sr) as u32);
-            let b = r2 * 10i128.pow((s2 - sr) as u32);
-            (if matches!(op, ArithOp::Add) { a + b } else { a - b }, sr)
+            let a = align(r1, (s1 - sr) as u32)?;
+            let b = align(r2, (s2 - sr) as u32)?;
+            let r = if matches!(op, ArithOp::Add) {
+                a.checked_add(b)
+            } else {
+                a.checked_sub(b)
+            };
+            (r.ok_or(EvalErr::IntegerOverflow)?, sr)
         }
-        ArithOp::Mul => (r1 * r2, s1 + s2),
+        ArithOp::Mul => (r1.checked_mul(r2).ok_or(EvalErr::IntegerOverflow)?, s1 + s2),
         ArithOp::Div => {
             if r2 == 0 {
                 return Err(EvalErr::DivideByZero);
             }
-            let scaled = r1 * 10i128.pow((-2 * s2 as i32) as u32);
+            let scaled = align(r1, (-2 * s2 as i32) as u32)?;
             (scaled / r2, s1 + s2)
         }
     })
@@ -9183,7 +9254,7 @@ impl Expr {
                 // cast target
                 e.type_of(descs)?;
                 Some(match t {
-                    CastTarget::Int => ExprType::Int,
+                    CastTarget::Int { .. } => ExprType::Int,
                     CastTarget::Text { .. } => ExprType::Text,
                 })
             }
@@ -9211,8 +9282,14 @@ impl Expr {
             Expr::Dec(_, scale) => Some(*scale),
             Expr::Neg(e) => e.result_scale(descs),
             Expr::Bin(a, op, b) => {
-                let s1 = a.result_scale(descs)?;
-                let s2 = b.result_scale(descs)?;
+                // a NULL literal operand mirrors its sibling - the engine's
+                // getDesc copies the non-null side's desc, scale included
+                let (s1, s2) = match (a.result_scale(descs), b.result_scale(descs)) {
+                    (Some(x), Some(y)) => (x, y),
+                    (Some(x), None) if matches!(**b, Expr::Null) => (x, x),
+                    (None, Some(y)) if matches!(**a, Expr::Null) => (y, y),
+                    _ => return None,
+                };
                 Some(match op {
                     ArithOp::Add | ArithOp::Sub => s1.min(s2),
                     ArithOp::Mul | ArithOp::Div => s1 + s2,
@@ -9220,6 +9297,76 @@ impl Expr {
             }
             _ => None,
         }
+    }
+
+    /// The storage rank of an exact-numeric expression - the engine's
+    /// dtype-driven INT128 promotion input. A column ranks by its stored
+    /// dtype, a literal by whether it fits `i32` (the engine types wider
+    /// literals INT64), CAST-to-BIGINT is `I64` while the narrower int
+    /// targets stay `Long`, and an operator result ranks as its describe
+    /// does: `+`/`-` yield INT64 unless an operand is already INT128,
+    /// `*`/`/` yield INT128 as soon as any operand is INT64 or wider
+    /// (DSC_multiply_result). A NULL operand mirrors its sibling, as the
+    /// engine's getDesc copies the non-null side. None = not numeric.
+    fn rank_of(&self, descs: &[Descriptor]) -> Option<NumRank> {
+        match self {
+            Expr::Col(fid) => {
+                let d = descs.get(*fid)?;
+                match d.dtype {
+                    dtype::SHORT | dtype::LONG => Some(NumRank::Long),
+                    dtype::INT64 => Some(NumRank::I64),
+                    dtype::INT128 => Some(NumRank::I128),
+                    _ => None,
+                }
+            }
+            Expr::Int(n) => Some(if i32::try_from(*n).is_ok() {
+                NumRank::Long
+            } else {
+                NumRank::I64
+            }),
+            Expr::Dec(raw, _) => Some(if i32::try_from(*raw).is_ok() {
+                NumRank::Long
+            } else {
+                NumRank::I64
+            }),
+            Expr::Null => None, // takes the sibling's rank in Bin below
+            Expr::Neg(e) => e.rank_of(descs),
+            Expr::Bin(a, op, b) => {
+                let (ra, rb) = match (a.rank_of(descs), b.rank_of(descs)) {
+                    (Some(x), Some(y)) => (x, y),
+                    (Some(r), None) | (None, Some(r)) => (r, r),
+                    (None, None) => (NumRank::Long, NumRank::Long),
+                };
+                Some(match op {
+                    ArithOp::Add | ArithOp::Sub => {
+                        if ra == NumRank::I128 || rb == NumRank::I128 {
+                            NumRank::I128
+                        } else {
+                            NumRank::I64
+                        }
+                    }
+                    ArithOp::Mul | ArithOp::Div => {
+                        if ra >= NumRank::I64 || rb >= NumRank::I64 {
+                            NumRank::I128
+                        } else {
+                            NumRank::I64
+                        }
+                    }
+                })
+            }
+            Expr::Cast(_, t) => match t {
+                CastTarget::Int { wide } => Some(if *wide { NumRank::I64 } else { NumRank::Long }),
+                CastTarget::Text { .. } => None,
+            },
+            Expr::Str(_) | Expr::Concat(..) => None,
+        }
+    }
+
+    /// TRUE when this expression's announced wire form is INT128 -
+    /// [build_expr_col] then describes 32752/16 bytes, and the encoder
+    /// widens the evaluated value into the 16-byte slot.
+    fn is_wide(&self, descs: &[Descriptor]) -> bool {
+        matches!(self.rank_of(descs), Some(NumRank::I128))
     }
 
     /// Evaluate against a row's decoded values, producing a `Value`.
@@ -9245,19 +9392,30 @@ impl Expr {
                 if matches!(va, Value::Null) || matches!(vb, Value::Null) {
                     Value::Null // any NULL operand -> NULL
                 } else if let (Value::Int(x), Value::Int(y)) = (&va, &vb) {
-                    // pure integer arithmetic
-                    Value::Int(match op {
-                        ArithOp::Add => x.wrapping_add(*y),
-                        ArithOp::Sub => x.wrapping_sub(*y),
-                        ArithOp::Mul => x.wrapping_mul(*y),
-                        // truncating integer division (Rust `/` on i64 rounds
-                        // toward zero, as the engine does); a zero divisor is
-                        // the arithmetic exception, not a wrong answer
-                        ArithOp::Div => match x.checked_div(*y) {
-                            Some(q) => q,
-                            None => return Err(EvalErr::DivideByZero),
-                        },
-                    })
+                    // pure integer arithmetic. `+`/`-` are INT64-typed
+                    // (their describe): past-i64 is the engine's runtime
+                    // integer overflow. `*`/`/` compute in i128 - their
+                    // describe widens to INT128 whenever they could
+                    // exceed i64 (an INT64-ranked operand), and a result
+                    // that fits stays a plain integer either way.
+                    match op {
+                        ArithOp::Add => Value::Int(
+                            x.checked_add(*y).ok_or(EvalErr::IntegerOverflow)?,
+                        ),
+                        ArithOp::Sub => Value::Int(
+                            x.checked_sub(*y).ok_or(EvalErr::IntegerOverflow)?,
+                        ),
+                        ArithOp::Mul => scaled_value((*x as i128) * (*y as i128), 0),
+                        // truncating integer division (i128 `/` rounds
+                        // toward zero, as the engine does); a zero divisor
+                        // is the arithmetic exception, not a wrong answer
+                        ArithOp::Div => {
+                            if *y == 0 {
+                                return Err(EvalErr::DivideByZero);
+                            }
+                            scaled_value((*x as i128) / (*y as i128), 0)
+                        }
+                    }
                 } else if let (Some((r1, s1)), Some((r2, s2))) =
                     (numeric_parts(&va), numeric_parts(&vb))
                 {
@@ -9282,7 +9440,7 @@ impl Expr {
                     // numeric is rounded half away from zero, a string is
                     // trimmed and parsed (a non-numeric string, or a value
                     // that overflows i64, is the conversion error)
-                    CastTarget::Int => {
+                    CastTarget::Int { .. } => {
                         let narrow = |x: i128| match i64::try_from(x) {
                             Ok(n) => Ok(Value::Int(n)),
                             Err(_) => Err(EvalErr::ConversionError),
@@ -13217,6 +13375,92 @@ mod tests {
         let rest = &out[3 + vlen..];
         assert_eq!(rest[0], 67);
         assert_eq!(i32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]), 0);
+    }
+
+    #[test]
+    fn int128_width_promotion_mirrors_the_engine() {
+        // engine-probed (SQLDA_DISPLAY + getDescDialect3/DSC_multiply_result):
+        // `*`//`/` promote to INT128 with ANY INT64-ranked operand, `+`/`-`
+        // only widen when an operand already IS INT128; literals rank long
+        // within i32, INT64 beyond; NULL mirrors its sibling's rank
+        let columns = vec![
+            RelationColumn { name: "A".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "N".into(), field_id: 1, position: 1 },
+            RelationColumn { name: "K".into(), field_id: 2, position: 2 },
+            RelationColumn { name: "U".into(), field_id: 3, position: 3 },
+            RelationColumn { name: "I".into(), field_id: 4, position: 4 },
+        ];
+        let d = |dt: u8, s: i8, len: u16| Descriptor {
+            dtype: dt, scale: s, length: len, sub_type: 0, flags: 0, offset: 4,
+        };
+        let descs = vec![
+            d(dtype::LONG, 0, 4),    // A INTEGER
+            d(dtype::LONG, -2, 4),   // N NUMERIC(9,2)
+            d(dtype::INT64, 0, 8),   // K BIGINT
+            d(dtype::INT64, -2, 8),  // U NUMERIC(10,2)
+            d(dtype::INT128, 0, 16), // I INT128
+        ];
+        let form = |s: &str| {
+            let raw = parse_raw_expr(s).unwrap();
+            let c = build_expr_col(&raw, "X", &columns, &descs).unwrap();
+            (c.sql_type, c.length, c.scale)
+        };
+        // multiplication/division: any INT64-ranked operand -> INT128
+        assert_eq!(form("K * K"), (32752, 16, 0));
+        assert_eq!(form("K * 2"), (32752, 16, 0));
+        assert_eq!(form("U * N"), (32752, 16, -4));
+        assert_eq!(form("U / 2"), (32752, 16, -2));
+        assert_eq!(form("CAST(N AS BIGINT) * A"), (32752, 16, 0));
+        assert_eq!(form("N * 2147483648"), (32752, 16, -2)); // wide int literal
+        assert_eq!(form("N * 1234567890.5"), (32752, 16, -3)); // wide dec literal
+        assert_eq!(form("(N + N) * A"), (32752, 16, -2)); // +'s result ranks INT64
+        assert_eq!(form("K * NULL"), (32752, 16, 0)); // NULL mirrors K
+        // ...but both-long stays INT64-backed
+        assert_eq!(form("N * N"), (580, 8, -4));
+        assert_eq!(form("A * A"), (580, 8, 0));
+        assert_eq!(form("CAST(N AS INT) * A"), (580, 8, 0));
+        // addition/subtraction: only an INT128 operand widens
+        assert_eq!(form("K + K"), (580, 8, 0));
+        assert_eq!(form("U - N"), (580, 8, -2));
+        assert_eq!(form("N + NULL"), (580, 8, -2));
+        assert_eq!(form("I + 1"), (32752, 16, 0));
+        assert_eq!(form("1.5 + I"), (32752, 16, -1));
+        assert_eq!(form("-I * 3"), (32752, 16, 0));
+        assert_eq!(form("I / 2"), (32752, 16, 0));
+
+        // eval: exact wide values; a result that fits i64 keeps its narrow
+        // Value form (the INT128 encoder widens it into the 16-byte slot)
+        let row = vec![
+            Value::Int(10),
+            Value::Scaled(1250, -2),
+            Value::Int(4_000_000_000),
+            Value::Scaled(975, -2),
+            Value::Int128(900_000_000_000, 0),
+        ];
+        let ev = |s: &str| {
+            let raw = parse_raw_expr(s).unwrap();
+            resolve_expr(&raw, &columns, &descs).unwrap().eval(&row).unwrap()
+        };
+        // K*K = 1.6e19 > i64::MAX: the wide value is exact, never wrapped
+        assert!(matches!(ev("K * K"), Value::Int128(16_000_000_000_000_000_000, 0)));
+        assert!(matches!(ev("K * 2"), Value::Int(8_000_000_000)));
+        assert!(matches!(ev("U * N"), Value::Scaled(1_218_750, -4)));
+        assert!(matches!(ev("I / 2"), Value::Int(450_000_000_000)));
+        assert!(matches!(ev("1.5 + I"), Value::Scaled(9_000_000_000_015, -1)));
+        assert!(matches!(ev("-I * 3"), Value::Int(-2_700_000_000_000)));
+        // an INT64-announced result past i64 is the engine's runtime
+        // integer overflow (SQLSTATE 22003), raised through value_of
+        let raw = parse_raw_expr("K + 9223372036854775807").unwrap();
+        assert!(matches!(
+            resolve_expr(&raw, &columns, &descs).unwrap().eval(&row),
+            Err(EvalErr::IntegerOverflow)
+        ));
+        let pc = build_expr_col(
+            &parse_raw_expr("U + 9223372036854775807").unwrap(), "X", &columns, &descs,
+        )
+        .unwrap();
+        assert_eq!(pc.sql_type, 580);
+        assert!(matches!(pc.value_of(&row), Err(EvalErr::IntegerOverflow)));
     }
 
     #[test]
