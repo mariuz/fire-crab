@@ -4027,6 +4027,43 @@ FCPY=/path/to/venv/bin/python ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix FCWIRE=/path/to/fire-crab/target/release/fcwire \
     bash /path/to/fire-crab/qa/serve-real-services.sh 3050
 
+# RUNNING THE EXTERNAL firebird-qa SUITE against fcwire (not an in-repo
+# gate - needs a checkout of firebird-qa and a venv). Two things the
+# recipe must carry, both learned the hard way:
+#
+#   * --forked. libfbclient calls a NULL function pointer during Python
+#     teardown in some tests (gdb: frame #0 at 0x0, reached from ctypes
+#     via Py_FinalizeEx; no symbols, and NOT reproducible standalone
+#     against fire-crab OR the real engine - it needs the plugin's
+#     fixture context). Unforked, that SIGSEGV kills the whole session
+#     mid-run and the results are lost; with pytest-forked each test runs
+#     in its own process, so a client crash fails one test instead of the
+#     run. The batch that used to abort completes 22 passed / 4 failed.
+#   * the `employee` alias must point at a WRITABLE copy of the sample
+#     database. fire-crab reports resolved paths like the engine, and the
+#     plugin mkdirs a `qa` subdirectory beside whatever `employee`
+#     resolves to - /opt/firebird/examples/empbuild is not writable.
+#
+# Afterwards, CHECK FOR STRAY CLIENTS: orphaned `isql -i .../work_script
+# .sql` processes SPIN at ~9% CPU each and starve later runs (a load
+# average of 8 made serve-real-btree.sh fail on time, not on behaviour):
+#   ps -eo pid,etimes,pcpu,args --sort=-pcpu | head
+#   pkill -9 -f 'isql -i /tmp/pytest'
+#
+cat > /tmp/fc-databases.conf <<'CONF'
+employee = /writable/copy/employee.fdb
+employee.fdb = /writable/copy/employee.fdb
+CONF
+FC_DATABASES_CONF=/tmp/fc-databases.conf FC_ISQL=/opt/firebird/bin/isql \
+    /path/to/fire-crab/target/release/fcwire serve 127.0.0.1:4299 SYSDBA masterkey &
+# driver config: [fc] needs host/port AND user/password (the plugin reads
+# the credentials from the SERVER SECTION - omit them and the SRP key
+# arrives empty, which surfaces only as "connection rejected")
+pytest -p firebird.qa.plugin --server fc --driver-config /tmp/fc-driver.conf \
+    --forked --timeout=20 --timeout-method=signal \
+    --deselect tests/bugs/core_0733_test.py \
+    tests/functional/basic
+
 # SELECT-LIST EXPRESSIONS: arithmetic (+, -, *, unary -, parens) over integer
 # columns and literals, each query run identically through fire-crab and isql,
 # values and column names compared. Builds its own scratch database.
