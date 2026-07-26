@@ -2671,6 +2671,18 @@ enum TrigTarget {
 
 /// One statement of a user trigger's body, with its byte offset in the
 /// ORIGINAL statement text (the debug map records it).
+/// One condition of a `WHEN ... DO` handler (an empty condition list
+/// is WHEN ANY). Byte shapes probed: exception `9, 0, <len>, <name>`;
+/// GDSCODE `0, <len>, <NAME>` (the name uppercased, validated against
+/// the engine's own symbol table - an unknown one refuses at CREATE,
+/// as the engine's "status code @1 unknown"); SQLCODE `1, <i16 LE>`.
+#[derive(Clone)]
+enum HandlerCond {
+    Exception(String),
+    Gds(String),
+    Sql(i16),
+}
+
 enum TrigStmt {
     /// `NEW.<col> = <expr>;` or `<var> = <expr>;`
     Assign { target: TrigTarget, expr: fire_crab_ods::expr::Expr, src_off: usize },
@@ -2849,11 +2861,11 @@ fn parse_trigger_stmts(
     at: usize,
     end: usize,
     vars: &[String],
-) -> Option<(Vec<TrigStmt>, Vec<(Vec<String>, TrigStmt)>)> {
+) -> Option<(Vec<TrigStmt>, Vec<(Vec<HandlerCond>, TrigStmt)>)> {
     let mut out: Vec<TrigStmt> = Vec::new();
     // the block's error handlers, in source order: each is (condition
     // exception names - empty = WHEN ANY) and its statement
-    let mut handlers: Vec<(Vec<String>, TrigStmt)> = Vec::new();
+    let mut handlers: Vec<(Vec<HandlerCond>, TrigStmt)> = Vec::new();
     let mut pos = at;
     while pos < end {
         let rest = &s[pos..end];
@@ -2889,18 +2901,30 @@ fn parse_trigger_stmts(
             let after = &seg_up["WHEN".len()..];
             let do_kw = find_word(after, "DO", 0)?;
             let conds_txt = after[..do_kw].trim();
-            let mut names: Vec<String> = Vec::new();
+            let mut names: Vec<HandlerCond> = Vec::new();
             if conds_txt != "ANY" {
                 for part in conds_txt.split(',') {
                     let words: Vec<&str> = part.split_whitespace().collect();
-                    let ["EXCEPTION", n] = words.as_slice() else {
-                        return None; // GDSCODE/SQLCODE conditions: not yet
-                    };
-                    let n = n.trim_matches('"').to_string();
-                    if !ident_ok(&n) {
-                        return None;
-                    }
-                    names.push(n);
+                    names.push(match words.as_slice() {
+                        ["EXCEPTION", n] => {
+                            let n = n.trim_matches('"').to_string();
+                            if !ident_ok(&n) {
+                                return None;
+                            }
+                            HandlerCond::Exception(n)
+                        }
+                        ["GDSCODE", n] => {
+                            // the BLR stores the name UPPERCASED; an
+                            // unknown symbol refuses like the engine
+                            let n = n.to_ascii_uppercase();
+                            if !crate::gdscodes::is_gds_code(&n) {
+                                return None;
+                            }
+                            HandlerCond::Gds(n)
+                        }
+                        ["SQLCODE", n] => HandlerCond::Sql(n.parse().ok()?),
+                        _ => return None,
+                    });
                 }
                 if names.is_empty() {
                     return None;
@@ -3102,7 +3126,7 @@ fn parse_trigger_stmt(s: &str, start: usize, end: usize, vars: &[String]) -> Opt
 /// ELSE-branch ones included - gets its own entry in source order.
 fn emit_trigger_blr(
     stmts: &[TrigStmt],
-    handlers: &[(Vec<String>, TrigStmt)],
+    handlers: &[(Vec<HandlerCond>, TrigStmt)],
     declares: &[(String, u8, usize)], // (name, blr dtype, DECLARE src offset)
     begin_off: usize,
     dbg: &mut Vec<(usize, usize)>,
@@ -3155,11 +3179,24 @@ fn emit_trigger_blr(
             if names.is_empty() {
                 b.push(4); // ANY
             } else {
-                for n in names {
-                    b.push(9);
-                    b.push(0);
-                    b.push(n.len() as u8);
-                    b.extend_from_slice(n.as_bytes());
+                for c in names {
+                    match c {
+                        HandlerCond::Exception(n) => {
+                            b.push(9);
+                            b.push(0);
+                            b.push(n.len() as u8);
+                            b.extend_from_slice(n.as_bytes());
+                        }
+                        HandlerCond::Gds(n) => {
+                            b.push(0);
+                            b.push(n.len() as u8);
+                            b.extend_from_slice(n.as_bytes());
+                        }
+                        HandlerCond::Sql(v) => {
+                            b.push(1);
+                            b.extend_from_slice(&v.to_le_bytes());
+                        }
+                    }
                 }
             }
             emit_trigger_stmt(h, &mut b, dbg, &mut next_label, &mut next_ctx, bracket);
@@ -3586,11 +3623,12 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     // one dependency row (type 7 - a handled-only one gets it too,
     // probed)
     let mut exceptions: Vec<String> = Vec::new();
-    for r in raises
-        .iter()
-        .copied()
-        .chain(handlers.iter().flat_map(|(names, _)| names.iter().map(|n| n.as_str())))
-    {
+    for r in raises.iter().copied().chain(handlers.iter().flat_map(|(names, _)| {
+        names.iter().filter_map(|c| match c {
+            HandlerCond::Exception(n) => Some(n.as_str()),
+            _ => None,
+        })
+    })) {
         if !exception_exists(db, r) {
             return None;
         }
@@ -14401,6 +14439,21 @@ mod tests {
             "CREATE TRIGGER W3 FOR T1 BEFORE INSERT AS BEGIN NEW.B = 2; WHEN EXCEPTION EX1 DO NEW.B = -3; WHEN ANY DO NEW.B = -4; END",
         );
         assert_eq!(blr, hex("05021100 8102 011508000200000017010142 FF 82010009000345583101150800FDFFFFFF17010142 820100 0401150800FCFFFFFF17010142 FFFF4C".replace(' ', "").as_str()));
+        // W4/W5: GDSCODE (code 0 + UPPERCASED name text) and SQLCODE
+        // (code 1 + i16 LE) conditions - engine bytes probed
+        let (blr, _) = compile(
+            "CREATE TRIGGER W4 FOR T1 BEFORE INSERT AS BEGIN NEW.B = 3; WHEN GDSCODE arith_except DO NEW.B = -5; END",
+        );
+        assert_eq!(blr, hex("05021100 8102 011508000300000017010142 FF 820100 000C41524954485F455843455054 01150800FBFFFFFF17010142 FFFF4C".replace(' ', "").as_str()));
+        let (blr, _) = compile(
+            "CREATE TRIGGER W5 FOR T1 BEFORE INSERT AS BEGIN NEW.B = 4; WHEN SQLCODE -802 DO NEW.B = -6; END",
+        );
+        assert_eq!(blr, hex("05021100 8102 011508000400000017010142 FF 820100 01DEFC 01150800FAFFFFFF17010142 FFFF4C".replace(' ', "").as_str()));
+        // an unknown GDSCODE symbol refuses, as the engine's
+        // "status code @1 unknown" does
+        let up = "CREATE TRIGGER WB FOR T1 BEFORE INSERT AS BEGIN NEW.B = 1; WHEN GDSCODE NO_SUCH_CODE DO NEW.B = 0; END";
+        let begin = find_word(&up.to_ascii_uppercase(), "BEGIN", 0).unwrap();
+        assert!(parse_trigger_stmts(up, begin + "BEGIN".len(), up.rfind("END").unwrap(), &[]).is_none());
         // W6: a TOP-LEVEL raise still brackets when a handler exists
         let (blr, dbg) = compile(
             "CREATE TRIGGER W6 FOR T1 BEFORE INSERT AS BEGIN EXCEPTION EX1; WHEN ANY DO NEW.B = -7; END",

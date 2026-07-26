@@ -22,6 +22,7 @@
 //! See `docs/subsystem-map.md`.
 
 pub mod crypto;
+pub mod gdscodes;
 pub mod server;
 pub mod srp;
 
