@@ -11906,6 +11906,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     let session_key = match verifier.verify(&a_hex, &b_priv, &b_hex, &m_hex) {
         Some(k) => k,
         None => {
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                eprintln!(
+                    "[srv] AUTH FAIL keylen={} mlen={} a_hex={} m={}",
+                    a_hex.len(), m_hex.len(), a_hex, m_hex
+                );
+            }
             // isc_login (335544472) as a gds status
             let mut w = W::default();
             w.int(OP_RESPONSE)
@@ -11920,7 +11926,9 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
             return Ok(());
         }
     };
-    if std::env::var("FC_SRV_TRACE").is_ok() { eprintln!("[srv] proof verified, auth accepted"); }
+    if std::env::var("FC_SRV_TRACE").is_ok() {
+        eprintln!("[srv] proof verified, auth accepted (mlen={})", m_hex.len());
+    }
     respond(&mut s, &mut none, 0)?; // auth accepted
 
     // --- op_crypt is OPTIONAL. A client that asked for wire encryption

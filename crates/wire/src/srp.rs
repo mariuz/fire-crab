@@ -29,6 +29,18 @@ fn g() -> BigUint {
     BigUint::from_bytes_be(&[2])
 }
 
+/// Whether the client's proof hex denotes the same NUMBER as `expected`
+/// (a fixed-width hash). Leading zeros on either side are insignificant:
+/// the client writes minimal hex digits, we hold zero-padded bytes.
+pub fn proof_matches(expected: &[u8], client_m_hex: &str) -> bool {
+    let got = hex_to_bytes(client_m_hex);
+    let trim = |b: &[u8]| -> Vec<u8> {
+        let at = b.iter().position(|x| *x != 0).unwrap_or(b.len());
+        b[at..].to_vec()
+    };
+    trim(expected) == trim(&got)
+}
+
 pub fn hex_to_bytes(h: &str) -> Vec<u8> {
     let h = if h.len() % 2 == 1 {
         format!("0{}", h)
@@ -231,9 +243,13 @@ impl SrpVerifier {
         m_in.extend_from_slice(&big_a.to_bytes_be());
         m_in.extend_from_slice(&big_b.to_bytes_be());
         m_in.extend_from_slice(&session_key);
-        let expected = bytes_to_hex_upper(&sha256(&m_in));
-
-        if expected == client_m_hex.to_uppercase() {
+        // Compare the proof by VALUE, not as text. The client sends M as
+        // BigInteger::getText - MINIMAL hex digits - so a proof whose top
+        // nibble is zero arrives 63 chars (or 62, ...) where our own hex
+        // is always the zero-padded 64. A string compare then rejects a
+        // perfectly good proof once every ~16 attaches; the engine
+        // compares BigIntegers, in which leading zeros do not exist.
+        if proof_matches(&sha256(&m_in), client_m_hex) {
             Some(session_key)
         } else {
             None
@@ -243,6 +259,26 @@ impl SrpVerifier {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn proof_compare_ignores_leading_zeros() {
+        use super::proof_matches;
+        // the engine's client sends its proof as MINIMAL hex digits
+        // (BigInteger::getText), so a hash whose leading nibble(s) are
+        // zero arrives shorter than our zero-padded 64 - the ~1-in-16
+        // auth rejection this replaces
+        let expected = [0x0a, 0xbc, 0xde];
+        assert!(proof_matches(&expected, "0ABCDE")); // padded form
+        assert!(proof_matches(&expected, "ABCDE")); // nibble trimmed
+        assert!(proof_matches(&expected, "abcde")); // lower case
+        let two_zero = [0x00, 0x0a, 0xbc];
+        assert!(proof_matches(&two_zero, "000ABC"));
+        assert!(proof_matches(&two_zero, "ABC")); // whole byte + nibble gone
+        // a genuinely different proof still fails
+        assert!(!proof_matches(&expected, "ABCDF"));
+        assert!(!proof_matches(&expected, ""));
+        assert!(!proof_matches(&expected, "0ABCDE00"));
+    }
+
     use super::*;
 
     #[test]
