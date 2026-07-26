@@ -202,6 +202,87 @@ fn respond_error(s: &mut TcpStream, enc: &mut Option<Rc4>, gds: i32) -> std::io:
 /// for statements it cannot honour rather than answering them wrong.
 const GDS_DSQL_ERROR: i32 = 335544569;
 
+/// Resolve a database name the client attached to through
+/// `databases.conf`, the way the engine does: a name that matches an
+/// alias entry becomes that entry's path, anything else is used as
+/// given. The conf file is `FC_DATABASES_CONF`, else
+/// `$FIREBIRD/databases.conf`, else `/opt/firebird/databases.conf`.
+///
+/// Alias lines are the top-level `name = path` entries (a `{ ... }`
+/// block after an entry holds per-database settings, not aliases), and
+/// their paths may carry the engine's `$(dir_*)` macros, expanded
+/// against the install root exactly as common/utils.cpp lays the
+/// install out. An alias whose path holds a macro this server does not
+/// know is NOT resolved - better to fail the attach than to open the
+/// wrong file.
+fn resolve_db_alias(name: &str) -> Option<String> {
+    let conf = std::env::var("FC_DATABASES_CONF").ok().unwrap_or_else(|| {
+        let root = std::env::var("FIREBIRD").unwrap_or_else(|_| "/opt/firebird".into());
+        format!("{}/databases.conf", root)
+    });
+    let text = std::fs::read_to_string(&conf).ok()?;
+    // The install root the macros expand against comes from the
+    // INSTALLATION - `FIREBIRD`, else the built-in prefix - never from
+    // where the conf file happens to live, exactly as the engine
+    // resolves them (so a conf handed over via FC_DATABASES_CONF still
+    // expands `$(dir_sampleDb)` to the real sample directory).
+    let root = std::env::var("FIREBIRD").unwrap_or_else(|_| "/opt/firebird".into());
+    let mut depth = 0i32;
+    for line in text.lines() {
+        let l = line.split('#').next().unwrap_or("").trim();
+        if l.is_empty() {
+            continue;
+        }
+        // a per-database settings block: its contents are not aliases
+        depth += l.matches('{').count() as i32 - l.matches('}').count() as i32;
+        if depth > 0 && !l.contains('{') {
+            continue;
+        }
+        let body = l.split('{').next().unwrap_or("").trim();
+        let Some((alias, path)) = body.split_once('=') else { continue };
+        if !alias.trim().eq_ignore_ascii_case(name.trim()) {
+            continue;
+        }
+        return expand_conf_macros(path.trim(), &root);
+    }
+    None
+}
+
+/// Expand the `$(...)` macros a databases.conf path may carry. The
+/// directory table is the engine's own (common/utils.cpp:995-1080):
+/// conf/log/guard/secDb live at the root, bin under `bin`, the sample
+/// database under `examples/empbuild`, and so on. None = an unknown
+/// macro, which must not be guessed at.
+fn expand_conf_macros(path: &str, root: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = path;
+    while let Some(at) = rest.find("$(") {
+        out.push_str(&rest[..at]);
+        let close = rest[at..].find(')')? + at;
+        let macro_name = &rest[at + 2..close];
+        let dir = match macro_name.to_ascii_lowercase().as_str() {
+            "root" | "install" => "".to_string(),
+            "dir_conf" | "dir_log" | "dir_guard" | "dir_secdb" | "dir_msg" => "".to_string(),
+            "dir_bin" | "dir_sbin" => "bin".to_string(),
+            "dir_lib" => "lib".to_string(),
+            "dir_plugins" => "plugins".to_string(),
+            "dir_udf" => "UDF".to_string(),
+            "dir_sample" => "examples".to_string(),
+            "dir_sampledb" => "examples/empbuild".to_string(),
+            "dir_intl" => "intl".to_string(),
+            _ => return None, // an unknown macro: refuse the alias
+        };
+        out.push_str(root.trim_end_matches('/'));
+        if !dir.is_empty() {
+            out.push('/');
+            out.push_str(&dir);
+        }
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
 /// Extract the SRP client key A (specific_data chunks reassembled) and
 /// the login from a p_cnct_user_id block.
 fn parse_user_id(uid: &[u8]) -> (String, String) {
@@ -11975,7 +12056,20 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     read_int(&mut s, &mut dec)?; // 0
     let path_bytes = read_wire_bytes(&mut s, &mut dec)?; // db path
     read_wire_bytes(&mut s, &mut dec)?; // dpb
-    let db_path = String::from_utf8_lossy(&path_bytes).into_owned();
+    // the name the client attached to, then the FILE it denotes: a name
+    // matching a databases.conf alias resolves to that alias's path,
+    // exactly as the engine resolves it (so `employee` reaches the
+    // sample database, and a QA alias reaches its configured file)
+    let attach_name = String::from_utf8_lossy(&path_bytes).into_owned();
+    let db_path = match resolve_db_alias(&attach_name) {
+        Some(p) => {
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                eprintln!("[srv] alias '{}' -> '{}'", attach_name, p);
+            }
+            p
+        }
+        None => attach_name.clone(),
+    };
     if attach_op == OP_CREATE {
         if let Err(e) = create_database_file(&db_path) {
             if std::env::var("FC_SRV_TRACE").is_ok() {
