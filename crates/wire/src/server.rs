@@ -572,6 +572,9 @@ fn serve_service(
             Ok(o) => o,
             Err(_) => break,
         };
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] service op = {}", op);
+        }
         match op {
             x if x == OP_SERVICE_INFO => {
                 read_int(s, dec)?; // object (service handle)
@@ -1433,6 +1436,19 @@ fn wire_for(d: &Descriptor) -> (Wire, i32, i32, i32, i32) {
         dtype::TIMESTAMP_TZ => (Wire::TimestampTz, 32754, 12, 0, 0), // SQL_TIMESTAMP_TZ
         dtype::DEC64 => (Wire::Dec16, 32760, 8, 0, 0),   // SQL_DEC16
         dtype::DEC128 => (Wire::Dec34, 32762, 16, 0, 0), // SQL_DEC34
+        // Text columns travel as SQL_VARYING, but with their REAL
+        // declared width: a client renders a column at the width the
+        // describe announces, so the maximum below made isql pad every
+        // value to 32765 characters - a few thousand rows then weigh
+        // hundreds of megabytes, which is what made firebird-qa's isql
+        // init scripts look like hangs. A VARYING descriptor's length
+        // carries the 2-byte count word; a TEXT (CHAR) one does not.
+        // (Byte length == character length here: charset NONE.)
+        dtype::TEXT => (Wire::Varying, 448, d.length as i32, 0, 0),
+        dtype::VARYING => (Wire::Varying, 448, (d.length as i32 - 2).max(0), 0, 0),
+        // anything with no native mapping is RENDERED to text, and the
+        // rendered width is not known from the descriptor - the maximum
+        // is the only safe declaration there
         _ => (Wire::Varying, 448, 32765, 0, 0),          // SQL_VARYING, rendered text
     }
 }
@@ -14709,13 +14725,23 @@ mod tests {
             (dtype::SQL_TIME, 0, 560, 4),
             (dtype::TIMESTAMP, 0, 510, 8),
             (dtype::BOOLEAN, 0, 32764, 1),
-            (dtype::VARYING, 0, 448, 32765),
         ] {
             let (_, sql_type, length, scale, _) = wire_for(&d(dt, sc));
             assert_eq!((sql_type, length), (ty, len), "dtype {}", dt);
             let want = if matches!(dt, dtype::SHORT | dtype::LONG | dtype::INT64) { sc as i32 } else { 0 };
             assert_eq!(scale, want, "dtype {} scale", dt);
         }
+        // text carries its REAL declared width (a client renders the
+        // column that wide): a VARYING descriptor's length includes the
+        // 2-byte count word, a TEXT (CHAR) one does not
+        let td = |dtype, length| Descriptor { dtype, scale: 0, length, sub_type: 0, flags: 0, offset: 0 };
+        let (_, ty, len, _, _) = wire_for(&td(dtype::VARYING, 12));
+        assert_eq!((ty, len), (448, 10)); // VARCHAR(10)
+        let (_, ty, len, _, _) = wire_for(&td(dtype::TEXT, 5));
+        assert_eq!((ty, len), (448, 5)); // CHAR(5)
+        // a dtype with no native mapping is rendered, width unknown
+        let (_, ty, len, _, _) = wire_for(&td(dtype::QUAD, 8));
+        assert_eq!((ty, len), (448, 32765));
     }
 
     #[test]
