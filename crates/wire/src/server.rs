@@ -2713,6 +2713,24 @@ enum TrigStmt {
         exprs: Vec<fire_crab_ods::expr::Expr>,
         src_off: usize,
     },
+    /// `UPDATE <t> SET <col> = <expr>[, ...] [WHERE <cond>];` -
+    /// blr_for + blr_marks(1,4) + a one-stream rse over the target
+    /// (which takes TWO contexts: the assign-to context first, the rse
+    /// stream second - blr_modify rse->assign, probed), unqualified
+    /// field references riding the rse context
+    Update {
+        table: String,
+        sets: Vec<(String, fire_crab_ods::expr::Expr)>,
+        wher: Option<fire_crab_ods::expr::Cond>,
+        src_off: usize,
+    },
+    /// `DELETE FROM <t> [WHERE <cond>];` - the same FOR loop over ONE
+    /// context, closed by blr_erase
+    Delete {
+        table: String,
+        wher: Option<fire_crab_ods::expr::Cond>,
+        src_off: usize,
+    },
     /// `BEGIN <stmts> [WHEN ... DO <stmt>]... END` - every block, the
     /// trigger body included, is the same two-node shape (probed): a
     /// wrapper (`begin`, or `blr_handler` when it has handlers) holding
@@ -2772,6 +2790,16 @@ fn expr_resolve_vars(
 /// resolve to variable slots; an unmarked name stays a plain field
 /// reference for the caller's validation to refuse.
 fn parse_store_expr(text: &str, vars: &[String]) -> Option<fire_crab_ods::expr::Expr> {
+    let (cleaned, marked) = colon_clean(text, vars)?;
+    let e = parse_expr(cleaned.trim())?;
+    Some(expr_resolve_marked(&e, vars, &marked))
+}
+
+/// The `:variable` marker pass shared by every expression position
+/// inside an embedded DML statement: collect the marked names (each
+/// must be a DECLAREd variable), blank the colons out for the plain
+/// parsers.
+fn colon_clean(text: &str, vars: &[String]) -> Option<(String, Vec<String>)> {
     let bytes = text.as_bytes();
     let mut marked: Vec<String> = Vec::new();
     let mut cleaned = String::with_capacity(text.len());
@@ -2803,8 +2831,90 @@ fn parse_store_expr(text: &str, vars: &[String]) -> Option<fire_crab_ods::expr::
             i += 1;
         }
     }
-    let e = parse_expr(cleaned.trim())?;
-    Some(expr_resolve_marked(&e, vars, &marked))
+    Some((cleaned, marked))
+}
+
+/// A WHERE condition inside an embedded UPDATE/DELETE: the same colon
+/// discipline, then the usual parse + NOT fold; unqualified names stay
+/// CTX_PLAIN (the TARGET table's columns - the emitter rewrites them
+/// to the rse context).
+fn parse_dml_cond(text: &str, vars: &[String]) -> Option<fire_crab_ods::expr::Cond> {
+    let (cleaned, marked) = colon_clean(text, vars)?;
+    let c = parse_cond(&cleaned)?;
+    Some(cond_resolve_marked(&c, vars, &marked).normalized())
+}
+
+fn cond_resolve_marked(
+    c: &fire_crab_ods::expr::Cond,
+    vars: &[String],
+    marked: &[String],
+) -> fire_crab_ods::expr::Cond {
+    use fire_crab_ods::expr::Cond;
+    match c {
+        Cond::Cmp(op, l, r) => Cond::Cmp(
+            *op,
+            expr_resolve_marked(l, vars, marked),
+            expr_resolve_marked(r, vars, marked),
+        ),
+        Cond::And(a, b) => Cond::And(
+            Box::new(cond_resolve_marked(a, vars, marked)),
+            Box::new(cond_resolve_marked(b, vars, marked)),
+        ),
+        Cond::Or(a, b) => Cond::Or(
+            Box::new(cond_resolve_marked(a, vars, marked)),
+            Box::new(cond_resolve_marked(b, vars, marked)),
+        ),
+        Cond::Not(inner) => Cond::Not(Box::new(cond_resolve_marked(inner, vars, marked))),
+        Cond::Missing(e) => Cond::Missing(expr_resolve_marked(e, vars, marked)),
+        Cond::NotMissing(e) => Cond::NotMissing(expr_resolve_marked(e, vars, marked)),
+    }
+}
+
+/// Rewrite ONLY the CTX_PLAIN field references to `ctx` - what an
+/// embedded UPDATE/DELETE's unqualified names (the target table's own
+/// columns) become once the rse context is allocated at emission.
+fn expr_plain_ctx(e: &fire_crab_ods::expr::Expr, ctx: u8) -> fire_crab_ods::expr::Expr {
+    use fire_crab_ods::expr::Expr;
+    match e {
+        Expr::Field { context, name } if *context == CTX_PLAIN => {
+            Expr::Field { context: ctx, name: name.clone() }
+        }
+        Expr::Field { .. } | Expr::Variable(_) | Expr::IntLiteral(_) => e.clone(),
+        Expr::Add(l, r) => Expr::Add(
+            Box::new(expr_plain_ctx(l, ctx)),
+            Box::new(expr_plain_ctx(r, ctx)),
+        ),
+        Expr::Subtract(l, r) => Expr::Subtract(
+            Box::new(expr_plain_ctx(l, ctx)),
+            Box::new(expr_plain_ctx(r, ctx)),
+        ),
+        Expr::Multiply(l, r) => Expr::Multiply(
+            Box::new(expr_plain_ctx(l, ctx)),
+            Box::new(expr_plain_ctx(r, ctx)),
+        ),
+        Expr::Divide(l, r) => Expr::Divide(
+            Box::new(expr_plain_ctx(l, ctx)),
+            Box::new(expr_plain_ctx(r, ctx)),
+        ),
+    }
+}
+
+fn cond_plain_ctx(c: &fire_crab_ods::expr::Cond, ctx: u8) -> fire_crab_ods::expr::Cond {
+    use fire_crab_ods::expr::Cond;
+    match c {
+        Cond::Cmp(op, l, r) => Cond::Cmp(*op, expr_plain_ctx(l, ctx), expr_plain_ctx(r, ctx)),
+        Cond::And(a, b) => Cond::And(
+            Box::new(cond_plain_ctx(a, ctx)),
+            Box::new(cond_plain_ctx(b, ctx)),
+        ),
+        Cond::Or(a, b) => Cond::Or(
+            Box::new(cond_plain_ctx(a, ctx)),
+            Box::new(cond_plain_ctx(b, ctx)),
+        ),
+        Cond::Not(inner) => Cond::Not(Box::new(cond_plain_ctx(inner, ctx))),
+        Cond::Missing(e) => Cond::Missing(expr_plain_ctx(e, ctx)),
+        Cond::NotMissing(e) => Cond::NotMissing(expr_plain_ctx(e, ctx)),
+    }
 }
 
 /// [expr_resolve_vars], but only for the `:`-marked names - everything
@@ -3057,6 +3167,67 @@ fn parse_trig_stmt(
         }
         return Some(TrigStmt::Raise { name, src_off: start });
     }
+    if find_word(&up, "UPDATE", 0) == Some(0) {
+        // UPDATE <t> SET <col> = <expr>[, ...] [WHERE <cond>]
+        let set_kw = find_word(&up, "SET", "UPDATE".len())?;
+        let table = text["UPDATE".len()..set_kw].trim().trim_matches('"').to_ascii_uppercase();
+        if !ident_ok(&table) {
+            return None;
+        }
+        let where_kw = find_word(&up, "WHERE", set_kw + "SET".len());
+        let set_end = where_kw.unwrap_or(text.len());
+        let mut sets: Vec<(String, fire_crab_ods::expr::Expr)> = Vec::new();
+        let body = &text[set_kw + "SET".len()..set_end];
+        let mut depth = 0i32;
+        let mut seg = 0usize;
+        let mut parts: Vec<&str> = Vec::new();
+        for (i, ch) in body.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => {
+                    parts.push(&body[seg..i]);
+                    seg = i + 1;
+                }
+                _ => {}
+            }
+        }
+        parts.push(&body[seg..]);
+        for part in parts {
+            let eq = part.find('=')?;
+            let col = part[..eq].trim().trim_matches('"').to_ascii_uppercase();
+            if !ident_ok(&col) || sets.iter().any(|(c, _)| *c == col) {
+                return None;
+            }
+            sets.push((col, parse_store_expr(part[eq + 1..].trim(), vars)?));
+        }
+        if sets.is_empty() {
+            return None;
+        }
+        let wher = match where_kw {
+            None => None,
+            Some(w) => Some(parse_dml_cond(&text[w + "WHERE".len()..], vars)?),
+        };
+        return Some(TrigStmt::Update { table, sets, wher, src_off: start });
+    }
+    if find_word(&up, "DELETE", 0) == Some(0) {
+        // DELETE FROM <t> [WHERE <cond>]
+        let from_kw = find_word(&up, "FROM", "DELETE".len())?;
+        if !up["DELETE".len()..from_kw].trim().is_empty() {
+            return None;
+        }
+        let where_kw = find_word(&up, "WHERE", from_kw + "FROM".len());
+        let t_end = where_kw.unwrap_or(text.len());
+        let table = text[from_kw + "FROM".len()..t_end].trim().trim_matches('"').to_ascii_uppercase();
+        if !ident_ok(&table) {
+            return None;
+        }
+        let wher = match where_kw {
+            None => None,
+            Some(w) => Some(parse_dml_cond(&text[w + "WHERE".len()..], vars)?),
+        };
+        return Some(TrigStmt::Delete { table, wher, src_off: start });
+    }
     if find_word(&up, "INSERT", 0) == Some(0) {
         // INSERT INTO <t> (<cols>) VALUES (<exprs>)
         let into_kw = find_word(&up, "INTO", "INSERT".len())?;
@@ -3269,6 +3440,59 @@ fn emit_trigger_stmt(
                 b.extend_from_slice(c.as_bytes());
             }
             b.push(255);
+        }
+        TrigStmt::Update { table, sets, wher, src_off } => {
+            // FOR + marks + one-stream rse; the assign-to context is
+            // allocated FIRST, the rse stream second (probed 3->2);
+            // unqualified fields ride the rse context
+            dbg.push((*src_off, b.len()));
+            let new_ctx = *next_ctx;
+            let rse_ctx = *next_ctx + 1;
+            *next_ctx += 2;
+            b.extend_from_slice(&[7, 217, 1, 4]); // blr_for, blr_marks 1: 4
+            b.push(67); // blr_rse
+            b.push(1); // one stream
+            b.push(74); // blr_relation
+            b.push(table.len() as u8);
+            b.extend_from_slice(table.as_bytes());
+            b.push(rse_ctx);
+            if let Some(c) = wher {
+                b.push(71); // blr_boolean
+                cond_plain_ctx(c, rse_ctx).emit_positive(b);
+            }
+            b.push(255); // end of the rse
+            b.push(10); // blr_modify
+            b.push(rse_ctx);
+            b.push(new_ctx);
+            b.push(2); // begin: one assignment per SET
+            for (col, e) in sets {
+                b.push(1); // blr_assignment
+                expr_plain_ctx(e, rse_ctx).emit(b);
+                b.push(23); // blr_field in the assign-to context
+                b.push(new_ctx);
+                b.push(col.len() as u8);
+                b.extend_from_slice(col.as_bytes());
+            }
+            b.push(255);
+        }
+        TrigStmt::Delete { table, wher, src_off } => {
+            dbg.push((*src_off, b.len()));
+            let ctx = *next_ctx;
+            *next_ctx += 1;
+            b.extend_from_slice(&[7, 217, 1, 4]); // blr_for, blr_marks 1: 4
+            b.push(67); // blr_rse
+            b.push(1);
+            b.push(74); // blr_relation
+            b.push(table.len() as u8);
+            b.extend_from_slice(table.as_bytes());
+            b.push(ctx);
+            if let Some(c) = wher {
+                b.push(71); // blr_boolean
+                cond_plain_ctx(c, ctx).emit_positive(b);
+            }
+            b.push(255); // end of the rse
+            b.push(5); // blr_erase
+            b.push(ctx);
         }
         TrigStmt::Block { stmts, handlers, src_off } => {
             // every block is a wrapper node (begin, or blr_handler with
@@ -3524,6 +3748,9 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             }
             TrigStmt::Raise { .. } => {}
             TrigStmt::Store { exprs, .. } => out.extend(exprs.iter()),
+            // an Update/Delete's expressions hold TARGET-table plain
+            // references - validated against the target separately
+            TrigStmt::Update { .. } | TrigStmt::Delete { .. } => {}
             TrigStmt::Block { stmts, handlers, .. } => {
                 for st in stmts.iter().chain(handlers.iter().map(|(_, h)| h)) {
                     stmt_exprs(st, out);
@@ -3542,8 +3769,11 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             }
             TrigStmt::While { body, .. } => stmt_targets(body, out),
             // a store's targets are the OTHER table's columns,
-            // validated separately below
-            TrigStmt::Raise { .. } | TrigStmt::Store { .. } => {}
+            // validated separately below - an Update/Delete's too
+            TrigStmt::Raise { .. }
+            | TrigStmt::Store { .. }
+            | TrigStmt::Update { .. }
+            | TrigStmt::Delete { .. } => {}
             TrigStmt::Block { stmts, handlers, .. } => {
                 for st in stmts.iter().chain(handlers.iter().map(|(_, h)| h)) {
                     stmt_targets(st, out);
@@ -3556,21 +3786,23 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         stores: &mut Vec<&'a TrigStmt>,
         raises: &mut Vec<&'a str>,
         hexcs: &mut Vec<&'a str>,
+        dmls: &mut Vec<&'a TrigStmt>,
     ) {
         match st {
             TrigStmt::Assign { .. } => {}
             TrigStmt::If { then, otherwise, .. } => {
-                stmt_specials(then, stores, raises, hexcs);
+                stmt_specials(then, stores, raises, hexcs, dmls);
                 if let Some(e) = otherwise {
-                    stmt_specials(e, stores, raises, hexcs);
+                    stmt_specials(e, stores, raises, hexcs, dmls);
                 }
             }
-            TrigStmt::While { body, .. } => stmt_specials(body, stores, raises, hexcs),
+            TrigStmt::While { body, .. } => stmt_specials(body, stores, raises, hexcs, dmls),
             TrigStmt::Raise { name, .. } => raises.push(name),
             TrigStmt::Store { .. } => stores.push(st),
+            TrigStmt::Update { .. } | TrigStmt::Delete { .. } => dmls.push(st),
             TrigStmt::Block { stmts, handlers, .. } => {
                 for st in stmts.iter().chain(handlers.iter().map(|(_, h)| h)) {
-                    stmt_specials(st, stores, raises, hexcs);
+                    stmt_specials(st, stores, raises, hexcs, dmls);
                 }
                 for (names, _) in handlers {
                     for c in names {
@@ -3587,9 +3819,10 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     let mut stores = Vec::new();
     let mut raises = Vec::new();
     let mut hexcs = Vec::new();
+    let mut dmls = Vec::new();
     stmt_exprs(&body, &mut exprs);
     stmt_targets(&body, &mut targets);
-    stmt_specials(&body, &mut stores, &mut raises, &mut hexcs);
+    stmt_specials(&body, &mut stores, &mut raises, &mut hexcs, &mut dmls);
     fn expr_fields(e: &fire_crab_ods::expr::Expr, out: &mut Vec<(u8, String)>) {
         use fire_crab_ods::expr::Expr;
         match e {
@@ -3636,8 +3869,6 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             TrigTarget::Var(_) => {}
         }
     }
-    fields.sort();
-
     // blr_store targets: the table and every stored column must exist,
     // the columns plain integer-family ones (the value surface); each
     // store contributes its dependency rows
@@ -3670,6 +3901,78 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             None => store_deps.push((stab.clone(), cols.clone())),
         }
     }
+    // embedded UPDATE/DELETE targets: table + columns must exist, the
+    // columns plain integer-family ones; unqualified references are the
+    // TARGET's, NEW./OLD. ones the trigger table's (event-gated); each
+    // statement adds its target's dependency rows like a store does
+    for st in &dmls {
+        let (dtab, dsets, dwher): (&String, Option<&Vec<(String, fire_crab_ods::expr::Expr)>>, &Option<fire_crab_ods::expr::Cond>) =
+            match st {
+                TrigStmt::Update { table, sets, wher, .. } => (table, Some(sets), wher),
+                TrigStmt::Delete { table, wher, .. } => (table, None, wher),
+                _ => continue,
+            };
+        let dcols = relation_columns(&db.bytes, db.page_size, dtab);
+        let drel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, dtab)?;
+        if drel < 128 {
+            return None; // system relations are not DML targets
+        }
+        let dformats = relation_formats(&db.bytes, db.page_size, drel);
+        let (_, ddescs) = dformats.iter().max_by_key(|(n, _)| *n)?;
+        let target_col_ok = |n: &str| -> Option<()> {
+            let rc = dcols.iter().find(|rc| rc.name.eq_ignore_ascii_case(n))?;
+            let d = ddescs.get(rc.field_id as usize)?;
+            if (d.offset == 0 && d.length != 0) || d.scale != 0 || d.sub_type != 0 {
+                return None;
+            }
+            dtype_rank(d.dtype)?;
+            Some(())
+        };
+        let mut tcols: Vec<String> = Vec::new();
+        let mut dexprs: Vec<&fire_crab_ods::expr::Expr> = Vec::new();
+        if let Some(sets) = dsets {
+            for (c, e) in sets {
+                target_col_ok(c)?;
+                if !tcols.contains(c) {
+                    tcols.push(c.clone());
+                }
+                dexprs.push(e);
+            }
+        }
+        if let Some(c) = dwher {
+            dexprs.extend(c.operands());
+        }
+        let mut drefs: Vec<(u8, String)> = Vec::new();
+        for e in &dexprs {
+            expr_fields(e, &mut drefs);
+        }
+        for (ctx, fname) in &drefs {
+            if *ctx == CTX_PLAIN {
+                // an unqualified name is the TARGET table's column
+                target_col_ok(fname)?;
+                if !tcols.iter().any(|c| c == fname) {
+                    tcols.push(fname.clone());
+                }
+            } else {
+                if (*ctx == 0 && !old_ok) || (*ctx == 1 && !new_ok) {
+                    return None;
+                }
+                col_ok(fname)?;
+                add_field(fname);
+            }
+        }
+        match store_deps.iter_mut().find(|(t, _)| t == dtab) {
+            Some((_, cs)) => {
+                for c in tcols {
+                    if !cs.contains(&c) {
+                        cs.push(c);
+                    }
+                }
+            }
+            None => store_deps.push((dtab.clone(), tcols)),
+        }
+    }
+
     // raised AND handled exceptions must exist; each distinct name is
     // one dependency row (type 7 - a handled-only one gets it too,
     // probed)
@@ -3682,6 +3985,8 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             exceptions.push(r.to_string());
         }
     }
+
+    fields.sort();
 
     let mut dbg_entries = Vec::new();
     let blr = emit_trigger_blr(&body, &declares, &mut dbg_entries);
@@ -14455,6 +14760,63 @@ mod tests {
     }
 
 
+
+
+    #[test]
+    fn embedded_update_delete_blr_matches_engine() {
+        // the engine's own U1/U2/U4/U5/U7 blobs (probed): FOR +
+        // blr_marks(1,4) + one-stream rse; DELETE erases its single
+        // context, UPDATE allocates the assign-to context FIRST and the
+        // rse stream second (modify rse->assign); unqualified names ride
+        // the rse context, variables need ':', and the context counter
+        // runs across store/delete/update in statement order
+        let hex = |h: &str| -> Vec<u8> {
+            (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect()
+        };
+        let compile = |sql: &str, declares: &[(String, u8, usize)]| {
+            let up = sql.to_ascii_uppercase();
+            let begin = find_word(&up, "BEGIN", 0).unwrap();
+            let end = up.rfind("END").unwrap();
+            let vars: Vec<String> = declares.iter().map(|(n, _, _)| n.clone()).collect();
+            let body = parse_trigger_body(sql, begin, end + "END".len(), &vars).unwrap();
+            let mut dbg = Vec::new();
+            let blr = emit_trigger_blr(&body, declares, &mut dbg);
+            (blr, trigger_debug_blob(sql, declares, &dbg))
+        };
+        // U1: DELETE with a WHERE against NEW
+        let (blr, dbg) = compile(
+            "CREATE TRIGGER U1 FOR T1 AFTER INSERT AS BEGIN DELETE FROM LOG WHERE X = NEW.A; END",
+            &[],
+        );
+        assert_eq!(blr, hex("05021100020207D9010443014A034C4F4702472F1702015817010141FF0502FFFFFF4C"));
+        assert_eq!(dbg, hex("010202010000002A0000000400000002010000003000000006000000FF"));
+        // U2: UPDATE - the modify runs rse(3) -> assign(2)
+        let (blr, _) = compile(
+            "CREATE TRIGGER U2 FOR T1 AFTER INSERT AS BEGIN UPDATE LOG SET Y = 5 WHERE X = NEW.A; END",
+            &[],
+        );
+        assert_eq!(blr, hex("05021100020207D9010443014A034C4F4703472F1703015817010141FF0A030202011508000500000017020159FFFFFFFF4C"));
+        // U4: no WHERE, two SETs, an expression value
+        let (blr, _) = compile(
+            "CREATE TRIGGER U4 FOR T1 AFTER INSERT AS BEGIN UPDATE LOG SET X = NEW.A + 1, Y = 2; END",
+            &[],
+        );
+        assert_eq!(blr, hex("05021100020207D9010443014A034C4F4703FF0A0302020122170101411508000100000017020158011508000200000017020159FFFFFFFF4C"));
+        // U5: ':' variables in the SET and the WHERE
+        let v = ("V".to_string(), 8u8, 43usize);
+        let (blr, _) = compile(
+            "CREATE TRIGGER U5 FOR T1 AFTER INSERT AS DECLARE VARIABLE V INTEGER; BEGIN V = NEW.A; UPDATE LOG SET Y = :V WHERE X > :V; END",
+            &[v],
+        );
+        assert_eq!(blr, hex("05020300000800012D1A00001100020201170101411A000007D9010443014A034C4F47034731170301581A0000FF0A030202011A000017020159FFFFFFFF4C"));
+        // U7: store(2), delete(3), update(4 assign, 5 rse) - the one
+        // context counter runs across every embedded DML kind
+        let (blr, _) = compile(
+            "CREATE TRIGGER U7 FOR T1 AFTER INSERT AS BEGIN INSERT INTO LOG (X, Y) VALUES (1, 2); DELETE FROM LOG WHERE X = 9; UPDATE LOG SET Y = 3; END",
+            &[],
+        );
+        assert_eq!(blr, hex("0502110002020F4A034C4F470202011508000100000017020158011508000200000017020159FF07D9010443014A034C4F4703472F1703015815080009000000FF050307D9010443014A034C4F4705FF0A050402011508000300000017040159FFFFFFFF4C"));
+    }
 
     #[test]
     fn nested_blocks_blr_matches_engine() {
