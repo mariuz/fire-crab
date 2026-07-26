@@ -5053,6 +5053,7 @@ fn index_itype(d: &Descriptor) -> Option<u16> {
     Some(match d.dtype {
         dtype::SHORT | dtype::LONG | dtype::REAL | dtype::DOUBLE => btw::IDX_NUMERIC,
         dtype::INT64 => btw::IDX_NUMERIC2,
+        dtype::INT128 => btw::IDX_BCD, // ODS >= 13.1 (dfw.epp)
         dtype::TEXT | dtype::VARYING => btw::IDX_STRING,
         dtype::SQL_DATE => 5,  // idx_sql_date
         dtype::SQL_TIME => 6,  // idx_sql_time

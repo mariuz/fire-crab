@@ -119,15 +119,12 @@ check "fc UPDATE SET on an INT128 column" \
 check "fc reads its INT128 rows back (scaled render via isql below)" \
       "$(node_run 'SELECT ID, I, J FROM H ORDER BY ID')" "1|42|11
 2|77|<null>"
-# keys/indexes over INT128 refuse - fc has no INT128 index itype yet
-# (the ENGINE allows them; a wrongly-encoded index would corrupt, a
-# refusal cannot)
-case "$(node_run 'CREATE TABLE BAD (K INT128 NOT NULL PRIMARY KEY)')" in
-    ERR*) echo "OK   a PRIMARY KEY over INT128 refuses (no itype yet)" ;;
-    *) echo "DIFF INT128 PK fence"; fail=1 ;; esac
-case "$(node_run 'CREATE INDEX HIX ON H (I)')" in
-    ERR*) echo "OK   CREATE INDEX over INT128 refuses" ;;
-    *) echo "DIFF INT128 index fence"; fail=1 ;; esac
+# keys/indexes over INT128 work since the idx_bcd slice (deep
+# differential: serve-real-int128index)
+check "a PRIMARY KEY over INT128 creates (idx_bcd keys)" \
+      "$(node_run 'CREATE TABLE BAD (K INT128 NOT NULL PRIMARY KEY)')" "OK"
+check "CREATE INDEX over INT128 builds from the existing rows" \
+      "$(node_run 'CREATE INDEX HIX ON H (I)')" "OK"
 kill $srv 2>/dev/null; wait $srv 2>/dev/null
 
 # --- 2. the engine runs the identical DDL + DML on the ref -------------
@@ -137,6 +134,9 @@ INSERT INTO H2 (A, B) VALUES (100, 'x');
 INSERT INTO H2 (A, B) VALUES (200, 'y');
 COMMIT;
 ALTER TABLE H2 ALTER A TYPE INT128;
+COMMIT;
+CREATE TABLE BAD (K INT128 NOT NULL PRIMARY KEY);
+CREATE INDEX HIX ON H (I);
 COMMIT;
 INSERT INTO H (ID, I, N, M, D, J) VALUES (1, 42, 7, 3, 9, 11);
 INSERT INTO H (ID, I) VALUES (2, 4000000000);

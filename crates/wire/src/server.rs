@@ -6791,6 +6791,7 @@ fn resolve_index_ops(db: &Database, rel: u16, descs: &[Descriptor]) -> Option<Ve
                     | btw::IDX_SQL_TIME
                     | btw::IDX_TIMESTAMP
                     | btw::IDX_BOOLEAN
+                    | btw::IDX_BCD
             ) {
                 return None;
             }

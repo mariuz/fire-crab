@@ -56,6 +56,9 @@ pub const IDX_SQL_TIME: u16 = 6;
 pub const IDX_TIMESTAMP: u16 = 7;
 pub const IDX_NUMERIC2: u16 = 8;
 pub const IDX_BOOLEAN: u16 = 9;
+/// 128-bit integer keys at ODS >= 13.1 (btr.h:136, dfw.epp picks it
+/// for `dtype_int128`)
+pub const IDX_BCD: u16 = 13;
 
 // irt_flags, ods.h:459-464
 pub const IRT_UNIQUE: u16 = 1;
@@ -219,8 +222,104 @@ pub fn index_key(itype: u16, value: &Value, scale: i8) -> Option<Vec<u8>> {
             let Value::Bool(b) = value else { return None };
             Some(vec![if *b { 0x81 } else { 0x80 }])
         }
+        IDX_BCD => {
+            let (raw, s) = match value {
+                Value::Int(v) => (*v as i128, scale),
+                Value::Scaled(raw, s) => (*raw as i128, *s),
+                Value::Int128(raw, s) => (*raw, *s),
+                _ => return None,
+            };
+            Some(int128_bcd_key(raw, s as i32))
+        }
         _ => None,
     }
+}
+
+/// `Int128::makeIndexKey` (Int128.cpp:656) + `Decimal128::makeBcdKey`
+/// (DecFloat.cpp:1068), ported byte for byte: the value's decimal
+/// digits, normalized (leading zeros shifted out with the exponent
+/// compensated, trailing zeros trimmed), behind a 2-byte biased
+/// sign-folded exponent; a negative value nine's-complements its
+/// digits (last digit pre-decremented) and negates the exponent so
+/// the whole key stays order-preserving under unsigned byte compare;
+/// the digits pack 3-per-10-bits, the trailing partial byte kept only
+/// when nonzero. BIAS 128 and PMAX 39 - Int128.h declares TWO Int128
+/// classes and the built one uses 39 (an i128's 39 digits fill the
+/// coefficient exactly; the PMAX-38 twin would not survive the live
+/// engine's own 39-digit inserts, which it does). At most 19 bytes.
+pub fn int128_bcd_key(v: i128, mut exp: i32) -> Vec<u8> {
+    const PMAX: usize = 39;
+    const BIAS: i32 = 128;
+    let mut coeff = [0u8; PMAX + 2];
+    let mut u = v.unsigned_abs();
+    let mut c = PMAX;
+    while u > 0 {
+        c -= 1;
+        coeff[c] = (u % 10) as u8;
+        u /= 10;
+    }
+    // digits(): shift out leading zeros (exponent compensated by the
+    // implied trailing zeros the shift creates), trim trailing zeros
+    let mut dig = 0usize;
+    for i in 0..PMAX {
+        if coeff[i] != 0 {
+            if i > 0 {
+                coeff.copy_within(i..PMAX, 0);
+                for z in &mut coeff[PMAX - i..PMAX] {
+                    *z = 0;
+                }
+                exp -= i as i32;
+            }
+            let mut n = PMAX - i;
+            while coeff[n - 1] == 0 {
+                n -= 1;
+            }
+            dig = n;
+            break;
+        }
+    }
+    let neg = v < 0;
+    let mut e = exp + (BIAS + 1);
+    if dig == 0 {
+        e = 0;
+    }
+    if neg {
+        e = -e;
+    }
+    e += 2 * (BIAS + 1); // make it positive
+    let mut out = vec![(e >> 8) as u8, (e & 0xff) as u8];
+    if neg && dig > 0 {
+        coeff[dig - 1] -= 1;
+        for d in &mut coeff[..dig] {
+            *d = 9 - *d;
+        }
+    }
+    coeff[dig] = 0;
+    coeff[dig + 1] = 0;
+    // compress: 3 decimal digits (999) per 10 bits, via the shift table
+    let table: [(u32, u32); 4] = [(2, 6), (4, 4), (6, 2), (8, 0)];
+    let mut cur = 0u8;
+    let mut t = 0usize;
+    let mut p = 0usize;
+    while p < dig {
+        let val =
+            (coeff[p] as u16) * 100 + (coeff[p + 1] as u16) * 10 + (coeff[p + 2] as u16);
+        cur |= (val >> table[t].0) as u8;
+        out.push(cur);
+        cur = ((val as u32) << table[t].1) as u8;
+        if table[t].1 == 0 {
+            out.push(cur);
+            cur = 0;
+            t = 0;
+        } else {
+            t += 1;
+        }
+        p += 3;
+    }
+    if cur != 0 {
+        out.push(cur);
+    }
+    out
 }
 
 /// How many data bytes each compound-key group carries between the
@@ -900,5 +999,43 @@ mod tests {
         let n = read_node(&out, 0, true).unwrap();
         assert!(n.is_end_bucket);
         assert_eq!((n.prefix, n.length, n.record_number), (2, 1, 99));
+    }
+
+    #[test]
+    fn int128_bcd_keys_are_order_preserving() {
+        // zero: no digits, just the folded exponent 2*(BIAS+1) = 258
+        assert_eq!(int128_bcd_key(0, 0), vec![1, 2]);
+        // equal VALUES at different declared scales share one key -
+        // the normalization makeIndexKey performs (5 = 5.0 = 5.00)
+        assert_eq!(int128_bcd_key(5, 0), int128_bcd_key(50, -1));
+        assert_eq!(int128_bcd_key(5, 0), int128_bcd_key(500, -2));
+        // strictly increasing values give strictly increasing keys
+        // under the tree's unsigned byte compare - negatives (nine's
+        // complement + negated exponent), scale boundaries, extremes
+        let samples: [i128; 15] = [
+            i128::MIN,
+            -1_000_000_000_000_000_000_000_000_000_000,
+            -5_000_000_000,
+            -11,
+            -10,
+            -3,
+            -1,
+            0,
+            1,
+            2,
+            9,
+            10,
+            5_000_000_000,
+            1_000_000_000_000_000_000_000_000_000_000,
+            i128::MAX,
+        ];
+        let keys: Vec<Vec<u8>> = samples.iter().map(|v| int128_bcd_key(*v, 0)).collect();
+        for w in keys.windows(2) {
+            assert!(w[0] < w[1], "{:?} !< {:?}", w[0], w[1]);
+        }
+        // never past the engine's 19-byte cap (getIndexKeyLength)
+        for k in &keys {
+            assert!(k.len() <= 19, "key too long: {}", k.len());
+        }
     }
 }
