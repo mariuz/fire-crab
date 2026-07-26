@@ -2211,6 +2211,14 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
             scale,
             sub_type,
             char_len,
+            // the plain exact-int family carries RDB$FIELD_PRECISION 0
+            // (probed); NUMERIC/DECIMAL come through numeric_col with
+            // their declared p; every other type stays NULL
+            precision: if matches!(field_type, 7 | 8 | 16 | 26) {
+                Some(0)
+            } else {
+                None
+            },
             not_null,
             // a column-level NOT NULL (explicit or from a column-level
             // PRIMARY KEY) is the case the engine records as a
@@ -2269,6 +2277,7 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
             scale: 0,
             sub_type: 0,
             char_len: None,
+            precision: None, // the domain's own row carries it
             not_null,
             not_null_constraint: not_null,
             default: None,
@@ -2348,8 +2357,11 @@ fn numeric_col(
 ) -> Option<fire_crab_ods::ddl::ColumnDef> {
     use fire_crab_ods::format::dtype;
     let (field_type, dt, length) = match p {
-        1..=4 => (7i16, dtype::SHORT, 2u16),
-        5..=9 => (8, dtype::LONG, 4),
+        // DECIMAL(1..4) stores as LONG, only NUMERIC(1..4) as SHORT
+        // (probed: DECIMAL(3) -> type 8, NUMERIC(4,1) -> type 7 - the
+        // dialect-3 rule DECIMAL may hold MORE digits than declared)
+        1..=4 if sub_type == 1 => (7i16, dtype::SHORT, 2u16),
+        1..=9 => (8, dtype::LONG, 4),
         10..=18 => (16, dtype::INT64, 8),
         _ => return None,
     };
@@ -2361,6 +2373,8 @@ fn numeric_col(
         scale: -(s as i8),
         sub_type,
         char_len: None,
+        // a NUMERIC/DECIMAL column's RDB$FIELD_PRECISION is its declared p
+        precision: Some(p as i16),
         not_null,
         not_null_constraint: not_null,
         default: None,
@@ -3018,6 +3032,7 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
                 scale: 0,
                 sub_type: 0,
                 char_len: None,
+                precision: None, // computed: ComputedCol carries it
                 not_null: false,
                 not_null_constraint: false,
                 default: None,
@@ -4660,6 +4675,7 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
             scale: 0,
             sub_type: 0,
             char_len: None,
+            precision: None, // computed: ComputedCol carries it
             not_null: false,
             not_null_constraint: false,
             default: None,

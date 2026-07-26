@@ -49,6 +49,14 @@ use crate::pointer::relation_data_pages;
 use crate::sysfmt::{compute_format, compute_format_mixed, system_relation_formats};
 use crate::{u16_at, u32_at, Descriptor};
 
+/// Whether a type's `RDB$FIELD_SUB_TYPE` is written at all: the engine
+/// stores one (0 or the declared NUMERIC/DECIMAL code) only for the
+/// exact-int family and text; FLOAT/DOUBLE/DATE/TIME/TIMESTAMP/BOOLEAN
+/// rows keep it NULL (probed).
+fn subtype_carried(field_type: i16) -> bool {
+    matches!(field_type, 7 | 8 | 16 | 26 | 14 | 37)
+}
+
 /// One column of a CREATE TABLE: its name, the external catalog type
 /// code (`RDB$FIELD_TYPE`), and the storage descriptor pieces.
 #[derive(Clone)]
@@ -65,6 +73,13 @@ pub struct ColumnDef {
     pub scale: i8,
     /// RDB$FIELD_SUB_TYPE (1/2 for NUMERIC/DECIMAL, else 0)
     pub sub_type: i16,
+    /// RDB$FIELD_PRECISION as the engine writes it for a declared column
+    /// (probed, incl domains and ALTER ADD): `Some(0)` for the plain
+    /// exact-int family (SMALLINT/INTEGER/BIGINT/INT128), the declared
+    /// `p` for NUMERIC/DECIMAL(p,s), `None` (SQL NULL) for every other
+    /// type. A computed column ignores this - its result precision
+    /// travels in [ComputedCol::precision].
+    pub precision: Option<i16>,
     /// character length, for CHAR/VARCHAR (charset NONE: == bytes)
     pub char_len: Option<u16>,
     /// NOT NULL - explicit, or implied by PRIMARY KEY membership
@@ -968,12 +983,14 @@ pub fn alter_table_add_column(
         ("RDB$FIELD_TYPE", SysVal::I(col.field_type as i64)),
         ("RDB$FIELD_LENGTH", SysVal::I(catalog_field_length(col))),
         ("RDB$FIELD_SCALE", SysVal::I(col.scale as i64)),
-        ("RDB$FIELD_SUB_TYPE", SysVal::I(col.sub_type as i64)),
         ("RDB$SYSTEM_FLAG", SysVal::I(0)),
         // an auto-domain is owned by the table's owner (no security class)
         ("RDB$OWNER_NAME", SysVal::S(OWNER)),
         ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
     ];
+    if subtype_carried(col.field_type) {
+        field_vals.push(("RDB$FIELD_SUB_TYPE", SysVal::I(col.sub_type as i64)));
+    }
     if let Some(cl) = col.char_len {
         field_vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(0)));
         field_vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(cl as i64)));
@@ -994,6 +1011,9 @@ pub fn alter_table_add_column(
         field_vals.push(("RDB$COMPUTED_SOURCE", SysVal::B(blob_id_bytes(2, src))));
         field_vals.push(("RDB$COMPUTED_BLR", SysVal::B(blob_id_bytes(2, blr))));
         field_vals.push(("RDB$FIELD_PRECISION", SysVal::I(precision as i64)));
+    } else if let Some(p) = col.precision {
+        // a plain added column's precision, same rule as create_table
+        field_vals.push(("RDB$FIELD_PRECISION", SysVal::I(p as i64)));
     }
     sys_insert(file, page_size, "RDB$FIELDS", 2, &field_vals)?;
 
@@ -1263,16 +1283,23 @@ pub fn create_domain(file: &mut Vec<u8>, page_size: usize, col: &ColumnDef) -> R
         ("RDB$FIELD_TYPE", SysVal::I(col.field_type as i64)),
         ("RDB$FIELD_LENGTH", SysVal::I(catalog_field_length(col))),
         ("RDB$FIELD_SCALE", SysVal::I(col.scale as i64)),
-        ("RDB$FIELD_SUB_TYPE", SysVal::I(col.sub_type as i64)),
         ("RDB$SYSTEM_FLAG", SysVal::I(0)),
         ("RDB$SECURITY_CLASS", SysVal::S(&class)),
         ("RDB$OWNER_NAME", SysVal::S(OWNER)),
         ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
     ];
+    if subtype_carried(col.field_type) {
+        vals.push(("RDB$FIELD_SUB_TYPE", SysVal::I(col.sub_type as i64)));
+    }
     if let Some(cl) = col.char_len {
         vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(0))); // NONE
         vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(cl as i64)));
         vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
+    }
+    if let Some(p) = col.precision {
+        // same rule as a table column's auto-domain: 0 for plain exact
+        // ints, the declared p for NUMERIC/DECIMAL (probed on domains)
+        vals.push(("RDB$FIELD_PRECISION", SysVal::I(p as i64)));
     }
     if col.not_null {
         vals.push(("RDB$NULL_FLAG", SysVal::I(1)));
@@ -1642,6 +1669,11 @@ pub fn alter_domain_type(
     patch_field(&mut f_image, "RDB$FIELD_LENGTH", SysVal::I(catalog_field_length(new_col)))?;
     patch_field(&mut f_image, "RDB$FIELD_SCALE", SysVal::I(new_col.scale as i64))?;
     patch_field(&mut f_image, "RDB$FIELD_SUB_TYPE", SysVal::I(new_col.sub_type as i64))?;
+    if let Some(p) = new_col.precision {
+        // the engine retypes precision too (probed: INTEGER ->
+        // NUMERIC(12) sets 12; int -> int keeps 0)
+        patch_field(&mut f_image, "RDB$FIELD_PRECISION", SysVal::I(p as i64))?;
+    }
     if let Some(cl) = new_col.char_len {
         patch_field(&mut f_image, "RDB$CHARACTER_LENGTH", SysVal::I(cl as i64))?;
     }
@@ -2046,6 +2078,11 @@ pub fn alter_table_alter_column_type(
     patch_field(&mut f_image, "RDB$FIELD_LENGTH", SysVal::I(new_col.length as i64))?;
     patch_field(&mut f_image, "RDB$FIELD_SCALE", SysVal::I(new_col.scale as i64))?;
     patch_field(&mut f_image, "RDB$FIELD_SUB_TYPE", SysVal::I(new_col.sub_type as i64))?;
+    if let Some(p) = new_col.precision {
+        // the engine retypes precision too (probed: INTEGER ->
+        // NUMERIC(12) sets 12; int -> int keeps 0)
+        patch_field(&mut f_image, "RDB$FIELD_PRECISION", SysVal::I(p as i64))?;
+    }
     if let Some(cl) = new_col.char_len {
         patch_field(&mut f_image, "RDB$CHARACTER_LENGTH", SysVal::I(cl as i64))?;
     }
@@ -2895,12 +2932,14 @@ pub fn create_table(
             ("RDB$FIELD_TYPE", SysVal::I(c.field_type as i64)),
             ("RDB$FIELD_LENGTH", SysVal::I(catalog_field_length(c))),
             ("RDB$FIELD_SCALE", SysVal::I(c.scale as i64)),
-            ("RDB$FIELD_SUB_TYPE", SysVal::I(c.sub_type as i64)),
             ("RDB$SYSTEM_FLAG", SysVal::I(0)),
             // an auto-domain is owned by the table's owner (no security class)
             ("RDB$OWNER_NAME", SysVal::S(OWNER)),
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ];
+        if subtype_carried(c.field_type) {
+            vals.push(("RDB$FIELD_SUB_TYPE", SysVal::I(c.sub_type as i64)));
+        }
         if let Some(cl) = c.char_len {
             vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(0))); // NONE
             vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(cl as i64)));
@@ -2923,6 +2962,10 @@ pub fn create_table(
             vals.push(("RDB$COMPUTED_SOURCE", SysVal::B(blob_id_bytes(2, src))));
             vals.push(("RDB$COMPUTED_BLR", SysVal::B(blob_id_bytes(2, blr))));
             vals.push(("RDB$FIELD_PRECISION", SysVal::I(precision as i64)));
+        } else if let Some(p) = c.precision {
+            // a plain declared column's precision: 0 for the exact-int
+            // family, the declared p for NUMERIC/DECIMAL (probed)
+            vals.push(("RDB$FIELD_PRECISION", SysVal::I(p as i64)));
         }
         sys_insert(file, page_size, "RDB$FIELDS", 2, &vals)?;
     }
