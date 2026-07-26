@@ -169,6 +169,12 @@ pub enum Cond {
     And(Box<Cond>, Box<Cond>),
     Or(Box<Cond>, Box<Cond>),
     Not(Box<Cond>),
+    /// `<expr> IS NULL` - `blr_missing` (61)
+    Missing(Expr),
+    /// `<expr> IS NOT NULL` - the ONE place the engine emits `blr_not`
+    /// (59) in a trigger condition: `blr_not(blr_missing(x))` (probed;
+    /// every other NOT folds into inverted comparisons / De Morgan)
+    NotMissing(Expr),
 }
 
 impl Cond {
@@ -184,16 +190,23 @@ impl Cond {
             Cond::And(a, b) => Cond::Or(Box::new(a.negated()), Box::new(b.negated())),
             Cond::Or(a, b) => Cond::And(Box::new(a.negated()), Box::new(b.negated())),
             Cond::Not(c) => c.normalized(),
+            Cond::Missing(e) => Cond::NotMissing(e.clone()),
+            Cond::NotMissing(e) => Cond::Missing(e.clone()),
         }
     }
 
-    /// The same tree with every NOT pushed down (no Not nodes remain).
-    fn normalized(&self) -> Cond {
+    /// The same tree with every NOT pushed down (no Not nodes remain) -
+    /// public since the trigger compiler folds its IF/WHILE conditions
+    /// exactly as the engine's DSQL pass does (probed: `NOT (A > 1 AND
+    /// A < 5)` stores `blr_or(blr_leq, blr_geq)`; only IS NULL keeps a
+    /// blr_not, as [Cond::NotMissing]).
+    pub fn normalized(&self) -> Cond {
         match self {
             Cond::Cmp(..) => self.clone(),
             Cond::And(a, b) => Cond::And(Box::new(a.normalized()), Box::new(b.normalized())),
             Cond::Or(a, b) => Cond::Or(Box::new(a.normalized()), Box::new(b.normalized())),
             Cond::Not(c) => c.negated(),
+            Cond::Missing(_) | Cond::NotMissing(_) => self.clone(),
         }
     }
 
@@ -216,6 +229,15 @@ impl Cond {
                 a.emit(out);
                 b.emit(out);
             }
+            Cond::Missing(e) => {
+                out.push(61); // blr_missing
+                e.emit(out);
+            }
+            Cond::NotMissing(e) => {
+                out.push(59); // blr_not
+                out.push(61); // blr_missing
+                e.emit(out);
+            }
             Cond::Not(_) => unreachable!("emit is called on a normalised condition"),
         }
     }
@@ -226,7 +248,7 @@ impl Cond {
     /// NOT-free positive form must refuse when this is true.
     pub fn has_not(&self) -> bool {
         match self {
-            Cond::Cmp(..) => false,
+            Cond::Cmp(..) | Cond::Missing(_) | Cond::NotMissing(_) => false,
             Cond::And(a, b) | Cond::Or(a, b) => a.has_not() || b.has_not(),
             Cond::Not(_) => true,
         }
@@ -258,6 +280,7 @@ impl Cond {
                 b.collect_operands(out);
             }
             Cond::Not(c) => c.collect_operands(out),
+            Cond::Missing(e) | Cond::NotMissing(e) => out.push(e),
         }
     }
 }

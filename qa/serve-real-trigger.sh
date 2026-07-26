@@ -51,6 +51,7 @@ T="CREATE TABLE T1 (A INTEGER, B INTEGER)"
 TR1="CREATE TRIGGER TR1 FOR T1 BEFORE INSERT AS BEGIN NEW.B = NEW.A * 2; END"
 TR2="CREATE TRIGGER TR2 FOR T1 BEFORE UPDATE POSITION 5 AS BEGIN NEW.B = OLD.B + 1; END"
 TR3="CREATE TRIGGER TR3 FOR T1 BEFORE INSERT POSITION 1 AS BEGIN IF (NEW.A > 10) THEN NEW.B = 0; END"
+TR4="CREATE TRIGGER TR4 FOR T1 BEFORE INSERT POSITION 7 AS BEGIN IF (NOT (NEW.A > 1)) THEN NEW.B = 0; END"
 
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF || { echo "FAIL ref db"; exit 1; }
 CREATE DATABASE '$REF' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
@@ -60,6 +61,7 @@ SET TERM ^ ;
 $TR1^
 $TR2^
 $TR3^
+$TR4^
 SET TERM ; ^
 COMMIT;
 EOF
@@ -118,9 +120,10 @@ case "$(node_run 'CREATE TRIGGER TX FOR T1 BEFORE DELETE AS BEGIN NEW.B = 1; END
 case "$(node_run 'CREATE TRIGGER TX FOR T1 BEFORE INSERT AS BEGIN B = 1; END')" in
     ERR*) echo "OK   an unqualified reference refuses" ;;
     *) echo "DIFF unqualified refusal"; fail=1 ;; esac
-case "$(node_run 'CREATE TRIGGER TX FOR T1 BEFORE INSERT AS BEGIN IF (NOT (NEW.A > 1)) THEN NEW.B = 0; END')" in
-    ERR*) echo "OK   NOT in the IF refuses (the engine would emit blr_not)" ;;
-    *) echo "DIFF not refusal"; fail=1 ;; esac
+# NOT folds since the trigger-surface slice - byte-compared below
+case "$(node_run "$TR4")" in
+    OK) echo "OK   NOT in the IF compiles (folded to blr_leq, as the engine does)" ;;
+    *) echo "DIFF NOT fold"; fail=1 ;; esac
 case "$(node_run 'CREATE TRIGGER TX FOR T1 BEFORE INSERT AS BEGIN NEW.NOPE = 1; END')" in
     ERR*) echo "OK   an unknown target column refuses" ;;
     *) echo "DIFF unknown-col refusal"; fail=1 ;; esac

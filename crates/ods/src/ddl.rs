@@ -3503,6 +3503,12 @@ pub struct UserTriggerDef {
     /// referenced fields (reads and assignment targets, deduplicated,
     /// sorted) - one RDB$DEPENDENCIES row each
     pub fields: Vec<String>,
+    /// INSERT-INTO (blr_store) target relations: one relation-level
+    /// dependency row (no field) plus one per stored column - what the
+    /// engine records for a store inside a trigger body (probed)
+    pub store_deps: Vec<(String, Vec<String>)>,
+    /// raised EXCEPTIONs: one dependency row each, object type 7
+    pub exceptions: Vec<String>,
 }
 
 /// `CREATE TRIGGER <name> FOR <table> ...`: the RDB$TRIGGERS row (user
@@ -3553,24 +3559,35 @@ pub fn create_user_trigger(
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ],
     )?;
-    for f in &def.fields {
+    let dep = |file: &mut Vec<u8>, on: &str, field: Option<&str>, otype: i64| -> Result<(), String> {
         let drel = crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES")
             .ok_or("no RDB$DEPENDENCIES relation")?;
-        sys_insert(
-            file,
-            page_size,
-            "RDB$DEPENDENCIES",
-            drel,
-            &[
-                ("RDB$DEPENDENT_NAME", SysVal::S(&def.name)),
-                ("RDB$DEPENDED_ON_NAME", SysVal::S(&table)),
-                ("RDB$FIELD_NAME", SysVal::S(f)),
-                ("RDB$DEPENDENT_TYPE", SysVal::I(2)),   // obj_trigger
-                ("RDB$DEPENDED_ON_TYPE", SysVal::I(0)), // obj_relation
-                ("RDB$DEPENDENT_SCHEMA_NAME", SysVal::S("PUBLIC")),
-                ("RDB$DEPENDED_ON_SCHEMA_NAME", SysVal::S("PUBLIC")),
-            ],
-        )?;
+        let mut row = vec![
+            ("RDB$DEPENDENT_NAME", SysVal::S(&def.name)),
+            ("RDB$DEPENDED_ON_NAME", SysVal::S(on)),
+            ("RDB$DEPENDENT_TYPE", SysVal::I(2)), // obj_trigger
+            ("RDB$DEPENDED_ON_TYPE", SysVal::I(otype)),
+            ("RDB$DEPENDENT_SCHEMA_NAME", SysVal::S("PUBLIC")),
+            ("RDB$DEPENDED_ON_SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ];
+        if let Some(f) = field {
+            row.push(("RDB$FIELD_NAME", SysVal::S(f)));
+        }
+        sys_insert(file, page_size, "RDB$DEPENDENCIES", drel, &row)
+    };
+    for f in &def.fields {
+        dep(file, &table, Some(f), 0)?;
+    }
+    // a blr_store's target: the relation itself plus each stored column
+    for (srel_name, scols) in &def.store_deps {
+        dep(file, srel_name, None, 0)?;
+        for c in scols {
+            dep(file, srel_name, Some(c), 0)?;
+        }
+    }
+    // a raised exception: object type 7 (probed)
+    for e in &def.exceptions {
+        dep(file, e, None, 7)?;
     }
     update_relation_runtime(file, page_size, &table)?;
     advance_oldest_transactions(file, page_size)?;
