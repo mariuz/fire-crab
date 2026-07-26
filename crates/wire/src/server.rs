@@ -25,7 +25,7 @@ use std::net::{TcpListener, TcpStream};
 
 use crate::{
     OP_ATTACH, OP_COMMIT, OP_CONNECT, OP_CONT_AUTH, OP_CREATE, OP_CRYPT, OP_DETACH,
-    OP_DROP_DATABASE, OP_EXECUTE,
+    OP_DISCONNECT, OP_DROP_DATABASE, OP_EXECUTE, OP_EXECUTE2,
     OP_FETCH, OP_FETCH_RESPONSE, OP_FREE_STATEMENT, OP_PREPARE_STATEMENT, OP_RESPONSE, OP_ROLLBACK,
     OP_SERVICE_ATTACH, OP_SERVICE_DETACH, OP_SERVICE_INFO, OP_SERVICE_START, OP_TRANSACTION,
 };
@@ -12831,11 +12831,69 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 blr_slots.remove(&handle);
                 respond(&mut s, &mut enc, 0)?;
             }
+            // `op_disconnect` - the client's one-way goodbye. It is NOT
+            // waiting for a reply, so the connection just ends. Treating
+            // it as an unknown op (and dropping mid-protocol) is what
+            // made libfbclient dump core during the firebird-qa run.
+            x if x == OP_DISCONNECT => {
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] op_disconnect - closing");
+                }
+                break;
+            }
+            // `op_execute2` - execute expecting a singleton OUTPUT
+            // message, which is what a client sends for EXECUTE
+            // PROCEDURE (firebird-driver's callproc). This server has no
+            // PSQL interpreter, so the honest answer is a SQL error -
+            // but the WHOLE request must be consumed first, or the
+            // stream desyncs. Leaving this op unhandled used to end the
+            // connection mid-request, and libfbclient SEGFAULTS on that
+            // (it took the whole firebird-qa run down with it).
+            x if x == OP_EXECUTE2 => {
+                read_int(&mut s, &mut dec)?; // stmt
+                read_int(&mut s, &mut dec)?; // tr
+                let in_blr = read_wire_bytes(&mut s, &mut dec)?; // input blr
+                read_int(&mut s, &mut dec)?; // msg number
+                let messages = read_int(&mut s, &mut dec)?; // message count
+                if messages > 0 {
+                    // the input message follows, laid out by the client's
+                    // own BLR; an undecodable BLR makes its length
+                    // unknowable, so the connection must drop rather
+                    // than desync (the same rule op_execute follows)
+                    let slots = parse_param_blr(&in_blr).ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "undecodable input-message BLR",
+                        )
+                    })?;
+                    read_param_message(&mut s, &mut dec, &slots)?;
+                }
+                read_wire_bytes(&mut s, &mut dec)?; // OUT blr
+                read_int(&mut s, &mut dec)?; // out message number
+                if best >= 16 {
+                    read_int(&mut s, &mut dec)?; // p_sqldata_timeout
+                }
+                if best >= 18 {
+                    read_int(&mut s, &mut dec)?; // p_sqldata_cursor_flags
+                }
+                if best >= 19 {
+                    read_int(&mut s, &mut dec)?; // p_sqldata_inline_blob_size
+                }
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] op_execute2 (singleton) - answering a SQL error");
+                }
+                respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+            }
             other => {
                 if std::env::var("FC_SRV_TRACE").is_ok() {
                     eprintln!("[srv] UNHANDLED op = {}", other);
                 }
-                break; // unhandled op: end the connection
+                // An unknown op's payload cannot be consumed, so the
+                // stream is unusable either way - but say so before
+                // going, since a bare disconnect mid-request is what
+                // libfbclient crashes on.
+                respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                break;
             }
         }
     }

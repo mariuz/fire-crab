@@ -44,7 +44,14 @@ pub const OP_TRANSACTION: i32 = 29;
 pub const OP_COMMIT: i32 = 30;
 pub const OP_ROLLBACK: i32 = 31;
 pub const OP_ALLOCATE_STATEMENT: i32 = 62;
+/// `op_disconnect` (protocol.h) - the client's ONE-WAY notice that it is
+/// closing the connection. No response is expected or wanted.
+pub const OP_DISCONNECT: i32 = 6;
 pub const OP_EXECUTE: i32 = 63;
+/// `op_execute2` (protocol.h) - execute with an OUTPUT message: what a
+/// client uses for a singleton, notably `EXECUTE PROCEDURE`. Its wire
+/// form is op_execute's plus an output BLR and message number.
+pub const OP_EXECUTE2: i32 = 76;
 pub const OP_FETCH: i32 = 65;
 pub const OP_FETCH_RESPONSE: i32 = 66;
 pub const OP_FREE_STATEMENT: i32 = 67;
