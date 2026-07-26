@@ -2257,6 +2257,7 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
         ("SMALLINT", []) => col(7, dtype::SHORT, 2, 0, 0, None),
         ("INTEGER" | "INT", []) => col(8, dtype::LONG, 4, 0, 0, None),
         ("BIGINT", []) => col(16, dtype::INT64, 8, 0, 0, None),
+        ("INT128", []) => col(26, dtype::INT128, 16, 0, 0, None),
         ("FLOAT", []) => col(10, dtype::REAL, 4, 0, 0, None),
         ("DOUBLE PRECISION", []) => col(27, dtype::DOUBLE, 8, 0, 0, None),
         ("DATE", []) => col(12, dtype::SQL_DATE, 4, 0, 0, None),
@@ -2372,6 +2373,7 @@ fn numeric_col(
         1..=4 if sub_type == 1 => (7i16, dtype::SHORT, 2u16),
         1..=9 => (8, dtype::LONG, 4),
         10..=18 => (16, dtype::INT64, 8),
+        19..=38 => (26, dtype::INT128, 16),
         _ => return None,
     };
     Some(fire_crab_ods::ddl::ColumnDef {
@@ -3080,6 +3082,11 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             let c = cols.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
             if c.domain.is_some() || c.computed.is_some() || c.scale != 0 || c.sub_type != 0 {
                 return None;
+            }
+            // a declared INT128 column ranks Int128 (the CHECK closures
+            // keep the narrower dtype_rank, like the ALTER ADD one)
+            if c.dtype == fire_crab_ods::format::dtype::INT128 {
+                return Some(IntRank::Int128);
             }
             dtype_rank(c.dtype)
         };
@@ -5619,6 +5626,7 @@ fn param_target_ok(d: &Descriptor) -> bool {
         dtype::SHORT
             | dtype::LONG
             | dtype::INT64
+            | dtype::INT128
             | dtype::TEXT
             | dtype::VARYING
             | dtype::REAL
@@ -5668,13 +5676,14 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
             dtype::SHORT => i16::try_from(stored).ok()?.to_le_bytes().to_vec(),
             dtype::LONG => i32::try_from(stored).ok()?.to_le_bytes().to_vec(),
             dtype::INT64 => i64::try_from(stored).ok()?.to_le_bytes().to_vec(),
+            dtype::INT128 => stored.to_le_bytes().to_vec(),
             _ => return None,
         })
     };
     Some(match wp {
         WireParam::Null => None,
         WireParam::Int(v, ws) => Some(match d.dtype {
-            dtype::SHORT | dtype::LONG | dtype::INT64 => {
+            dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128 => {
                 int_bytes(rescale_int(*v as i128, *ws, d.scale)?)?
             }
             dtype::DOUBLE if *ws == 0 => (*v as f64).to_le_bytes().to_vec(),

@@ -1579,6 +1579,7 @@ fn field_type_to_dtype(ft: i16) -> Option<u8> {
         7 => dtype::SHORT,
         8 => dtype::LONG,
         16 => dtype::INT64,
+        26 => dtype::INT128,
         10 => dtype::REAL,
         27 => dtype::DOUBLE,
         12 => dtype::SQL_DATE,
@@ -2046,6 +2047,7 @@ fn int_width(dt: u8) -> Option<u16> {
         dtype::SHORT => Some(2),
         dtype::LONG => Some(4),
         dtype::INT64 => Some(8),
+        dtype::INT128 => Some(16),
         _ => None,
     }
 }
