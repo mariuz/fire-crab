@@ -12618,6 +12618,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     ods_major: database.as_ref().map_or(14, |d| d.ods_major),
                     ods_minor: database.as_ref().map_or(0, |d| d.ods_minor),
                     page_size: database.as_ref().map_or(8192, |d| d.page_size as u32),
+                    replica_mode: database
+                        .as_ref()
+                        .and_then(|d| d.bytes.get(26).copied())
+                        .unwrap_or(0),
                 };
                 let info = build_db_info(&items, &ctx);
                 let mut w = W::default();
@@ -13735,6 +13739,11 @@ fn build_db_info(items: &[u8], ctx: &DbInfoCtx) -> Vec<u8> {
             7 => put_int(&mut out, 7, 1000),                   // isc_info_fetches
             8 => put_int(&mut out, 8, 0),                      // isc_info_marks
             63 => put_int(&mut out, 63, 0),                    // isc_info_db_read_only
+            // fb_info_replica_mode (inf_pub.h:174): isql reads it with
+            // getBigInt and prints NONE / READ_ONLY / READ_WRITE; the
+            // value is the header's own replica byte, so a replica file
+            // reports what the engine reports for it
+            146 => put_int(&mut out, 146, ctx.replica_mode as i32),
             4 => {
                 // isc_info_db_id: a count byte then pascal strings; the
                 // driver returns [0] as the database name. Two strings:
@@ -13781,6 +13790,10 @@ struct DbInfoCtx {
     ods_major: u16,
     ods_minor: u16,
     page_size: u32,
+    /// `hdr_replica_mode` (ods.h:648, header byte 26): 0 none,
+    /// 1 read-only, 2 read-write - what `fb_info_replica_mode` answers
+    /// and isql's SHOW DATABASE prints as its "Replica mode:" line
+    replica_mode: u8,
 }
 
 /// Run the fire-crab wire server on `addr` (e.g. "127.0.0.1:3051"),
@@ -14668,6 +14681,24 @@ mod tests {
             ods_major: 14,
             ods_minor: 0,
             page_size: 8192,
+            replica_mode: 0,
+        }
+    }
+
+    #[test]
+    fn db_info_answers_replica_mode() {
+        // fb_info_replica_mode (146): isql's SHOW DATABASE prints
+        // NONE/READ_ONLY/READ_WRITE from this value, which is the
+        // header's hdr_replica_mode byte (ods.h:648, offset 26)
+        for (mode, want) in [(0u8, 0i32), (1, 1), (2, 2)] {
+            let mut ctx = dbctx();
+            ctx.replica_mode = mode;
+            let out = build_db_info(&[146], &ctx);
+            // code(1) + len(2 LE = 4) + i32 LE value, then isc_info_end
+            assert_eq!(out[0], 146);
+            assert_eq!(u16::from_le_bytes([out[1], out[2]]), 4);
+            assert_eq!(i32::from_le_bytes([out[3], out[4], out[5], out[6]]), want);
+            assert_eq!(*out.last().unwrap(), 1); // isc_info_end
         }
     }
 
