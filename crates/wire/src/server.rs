@@ -1092,6 +1092,9 @@ enum Cmp {
 #[derive(Clone)]
 enum Rhs {
     Int(i64),
+    /// an exact-numeric literal as (raw, scale) - what a decimal
+    /// literal or an integer against a scaled/INT128 column becomes
+    Num(i64, i8),
     Str(String),
     Null,
     Param(usize, ColKind),
@@ -1108,6 +1111,11 @@ enum Rhs {
 #[derive(Clone)]
 enum Term {
     Cmp(usize, Cmp, Rhs),
+    /// an exact-numeric comparison: the column may be a plain integer,
+    /// a scaled NUMERIC/DECIMAL or an INT128 - the sides decompose via
+    /// [numeric_parts] and align scales in i128 ([num_cmp]), the
+    /// engine's dialect-3 exact compare
+    NumCmp(usize, Cmp, Rhs),
     IsNull(usize),
     IsNotNull(usize),
     /// `<col> [NOT] LIKE <pattern> [ESCAPE <c>]`: pattern is a string
@@ -1144,6 +1152,9 @@ impl Predicate {
                 (_, WireParam::Null) => None,
                 (ColKind::Int, WireParam::Int(v, 0)) => Some(Rhs::Int(*v)),
                 (ColKind::Text, WireParam::Text(s)) => Some(Rhs::Str(s.clone())),
+                // a numeric column's parameter keeps its wire scale -
+                // num_cmp aligns it against the stored value exactly
+                (ColKind::Numeric, WireParam::Int(v, ws)) => Some(Rhs::Num(*v, *ws)),
                 _ => return Err("parameter type does not match its column".into()),
             })
         };
@@ -1155,6 +1166,10 @@ impl Predicate {
                     Term::Cmp(fid, op, Rhs::Param(idx, kind)) => match bind_rhs(idx, kind)? {
                         None => Term::Never,
                         Some(rhs) => Term::Cmp(*fid, *op, rhs),
+                    },
+                    Term::NumCmp(fid, op, Rhs::Param(idx, kind)) => match bind_rhs(idx, kind)? {
+                        None => Term::Never,
+                        Some(rhs) => Term::NumCmp(*fid, *op, rhs),
                     },
                     Term::Like(fid, Rhs::Param(idx, _), escape, negated) => {
                         match bind_rhs(idx, &ColKind::Text)? {
@@ -1180,6 +1195,23 @@ fn bind_filter(
         None => Ok(None),
         Some(p) => p.bind(args).map(Some),
     }
+}
+
+/// Compare two exact-numeric values: decompose via [numeric_parts] and
+/// align the scales in i128, saturating on the (astronomically
+/// unlikely) overflow - the same alignment [value_cmp] applies within
+/// one shape, here across Int/Scaled/Int128. None when either side is
+/// not exact-numeric (the comparison is then UNKNOWN).
+fn num_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    let (ra, sa) = numeric_parts(a)?;
+    let (rb, sb) = numeric_parts(b)?;
+    let up = |v: i128, by: i8| {
+        10i128
+            .checked_pow(by.max(0) as u32)
+            .and_then(|p| v.checked_mul(p))
+            .unwrap_or(if v < 0 { i128::MIN } else { i128::MAX })
+    };
+    Some(up(ra, sa.saturating_sub(sb)).cmp(&up(rb, sb.saturating_sub(sa))))
 }
 
 fn ord_ok(o: std::cmp::Ordering, op: Cmp) -> bool {
@@ -1221,6 +1253,17 @@ impl Term {
             // an unbound parameter never matches (the execute path binds
             // before evaluating; this is the defensive answer)
             Term::Cmp(_, _, Rhs::Param(..)) => false,
+            Term::Cmp(_, _, Rhs::Num(..)) => false, // Num travels in NumCmp
+            // exact numeric compare, any exact shape on either side;
+            // NULL or a non-numeric value is UNKNOWN
+            Term::NumCmp(fid, op, Rhs::Num(r, s)) => {
+                let rhs = if *s == 0 { Value::Int(*r) } else { Value::Scaled(*r, *s) };
+                match values.get(*fid).and_then(|v| num_cmp(v, &rhs)) {
+                    Some(o) => ord_ok(o, *op),
+                    None => false,
+                }
+            }
+            Term::NumCmp(..) => false, // unbound parameter / wrong shape
             Term::Like(fid, pattern, escape, negated) => match (values.get(*fid), pattern) {
                 // NO pad trim: the engine matches the stored value,
                 // padding included (differentially confirmed)
@@ -2145,6 +2188,10 @@ fn build_projcols(
 /// and stores the NEW value.
 enum InsVal {
     Int(i64),
+    /// a decimal literal as (raw, scale): rescales exactly into the
+    /// target column or refuses (1.5 fits NUMERIC(9,2) as 1.50; it
+    /// does not fit an INTEGER)
+    Dec(i64, i8),
     Str(String),
     Null,
     Param(usize),
@@ -5453,6 +5500,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     for part in split_top_commas(&toks) {
         vals.push(match part {
             [Tok::Int(n)] => InsVal::Int(*n),
+            [Tok::Dec(r, s)] => InsVal::Dec(*r, *s),
             [Tok::Str(v)] => InsVal::Str(v.clone()),
             [Tok::Null] => InsVal::Null,
             [Tok::Param] => {
@@ -5632,6 +5680,7 @@ fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
     let wp = match v {
         InsVal::Null => WireParam::Null,
         InsVal::Int(n) => WireParam::Int(*n, 0),
+        InsVal::Dec(r, s) => WireParam::Int(*r, *s),
         InsVal::Str(text) => WireParam::Text(text.clone()),
         // parameters bind, generators advance, at execute - not here
         InsVal::Param(_) | InsVal::GenId(..) => return None,
@@ -6008,6 +6057,7 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     for part in split_on(&toks, |t| matches!(t, Tok::Comma)) {
         let (name, v) = match part {
             [Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Int(n)] => (c, InsVal::Int(*n)),
+            [Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Dec(r, s)] => (c, InsVal::Dec(*r, *s)),
             [Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Str(t)] => (c, InsVal::Str(t.clone())),
             [Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Null] => (c, InsVal::Null),
             [Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Param] => (c, InsVal::Param(0)),
@@ -9488,6 +9538,9 @@ impl Expr {
                 match col_kind(d) {
                     Some(ColKind::Int) => Some(ExprType::Int),
                     Some(ColKind::Text) => Some(ExprType::Text),
+                    // col_kind never returns Numeric (predicate-only
+                    // marker); numeric columns classify from the desc
+                    Some(ColKind::Numeric) => None,
                     None if is_numeric_col(d) => Some(ExprType::Numeric),
                     None => None,
                 }
@@ -10096,6 +10149,9 @@ enum Tok {
     Comma,
     Agg(AggFn, AggTarget),
     Int(i64),
+    /// a decimal literal as (raw digits, scale): `12.50` is (1250, -2)
+    /// - trailing zeros count, like the expression parser's literals
+    Dec(i64, i8),
     Str(String),
     Cmp(Cmp),
     And,
@@ -10111,6 +10167,24 @@ enum Tok {
     Between,
     In,
     Escape,
+}
+
+/// Finish an integer-or-decimal literal whose integer digits end at
+/// `*i`: a `.` followed by digits extends it into a [Tok::Dec] with the
+/// written fraction length as its (negative) scale, trailing zeros
+/// counting; otherwise it is a plain [Tok::Int].
+fn numeric_tok(s: &str, b: &[u8], start: usize, i: &mut usize) -> Option<Tok> {
+    if b.get(*i) == Some(&b'.') && b.get(*i + 1).is_some_and(|c| c.is_ascii_digit()) {
+        *i += 1;
+        let fs = *i;
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        let digits: String = s[start..*i].chars().filter(|c| *c != '.').collect();
+        Some(Tok::Dec(digits.parse().ok()?, -((*i - fs) as i8)))
+    } else {
+        Some(Tok::Int(s[start..*i].parse().ok()?))
+    }
 }
 
 /// Tokenise a WHERE/HAVING clause. Single-quoted strings ('' escapes a
@@ -10202,7 +10276,7 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                 while i < b.len() && b[i].is_ascii_digit() {
                     i += 1;
                 }
-                out.push(Tok::Int(s[start..i].parse().ok()?));
+                out.push(numeric_tok(s, b, start, &mut i)?);
             }
             b'-' if b.get(i + 1).is_some_and(|c| c.is_ascii_digit()) => {
                 let start = i;
@@ -10210,7 +10284,7 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                 while i < b.len() && b[i].is_ascii_digit() {
                     i += 1;
                 }
-                out.push(Tok::Int(s[start..i].parse().ok()?));
+                out.push(numeric_tok(s, b, start, &mut i)?);
             }
             _ if is_ident_byte(c) => {
                 let start = i;
@@ -10364,6 +10438,7 @@ fn parse_unary(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
 fn parse_value(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Rhs> {
     let v = match t.get(*pos)? {
         Tok::Int(n) => Rhs::Int(*n),
+        Tok::Dec(r, s) => Rhs::Num(*r, *s),
         Tok::Str(s) => Rhs::Str(s.clone()),
         Tok::Null => Rhs::Null,
         Tok::Param => {
@@ -10588,6 +10663,11 @@ fn split_on<'a>(toks: &'a [Tok], is_sep: impl Fn(&Tok) -> bool) -> Vec<&'a [Tok]
 enum ColKind {
     Int,
     Text,
+    /// a scaled NUMERIC/DECIMAL or INT128 column - constructed ONLY by
+    /// the predicate resolver as a parameter-binding marker;
+    /// [col_kind] itself never returns it (the shared bind/expr paths
+    /// keep their narrower classification)
+    Numeric,
 }
 fn col_kind(d: &Descriptor) -> Option<ColKind> {
     if matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64) && d.scale == 0 {
@@ -10608,6 +10688,12 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
     Some(match raw {
         RawKind::Cmp(op, Rhs::Int(n)) => match kind {
             ColKind::Int => Term::Cmp(idx, op, Rhs::Int(n)),
+            _ => return None,
+        },
+        // a decimal literal against an integer column compares exactly
+        // (A > 1.5 is meaningful, A = 1.5 simply never matches)
+        RawKind::Cmp(op, Rhs::Num(r, s)) => match kind {
+            ColKind::Int => Term::NumCmp(idx, op, Rhs::Num(r, s)),
             _ => return None,
         },
         RawKind::Cmp(op, Rhs::Str(v)) => match kind {
@@ -10655,12 +10741,50 @@ fn resolve_predicate(
                 return None;
             }
             let d = descs.get(fid)?;
-            let kind = col_kind(d)?;
-            terms.push(param_or_typed_term(fid, kind, rt.kind, d, params)?);
+            let term = match col_kind(d) {
+                Some(kind) => param_or_typed_term(fid, kind, rt.kind, d, params)?,
+                // scaled NUMERIC/DECIMAL and INT128 columns: the exact
+                // numeric comparison surface
+                None if is_numeric_col(d) => numeric_term(fid, rt.kind, d, params)?,
+                None => return None,
+            };
+            terms.push(term);
         }
         groups.push(terms);
     }
     Some(Predicate(groups))
+}
+
+/// [typed_term] for a scaled NUMERIC/DECIMAL or INT128 column - the
+/// kinds [col_kind] does not classify. Comparisons take integer and
+/// decimal literals (exact, scale-aligned - the engine's dialect-3
+/// compare), the NULL tests work as anywhere, LIKE stays text-only,
+/// and a `?` claims its slot binding as [ColKind::Numeric].
+fn numeric_term(
+    idx: usize,
+    raw: RawKind,
+    d: &Descriptor,
+    params: &mut Vec<Option<Descriptor>>,
+) -> Option<Term> {
+    Some(match raw {
+        RawKind::Cmp(op, Rhs::Int(n)) => Term::NumCmp(idx, op, Rhs::Num(n, 0)),
+        RawKind::Cmp(op, Rhs::Num(r, s)) => Term::NumCmp(idx, op, Rhs::Num(r, s)),
+        RawKind::Cmp(_, Rhs::Null) => Term::Never,
+        RawKind::Cmp(op, Rhs::Param(slot, _)) => {
+            if !param_target_ok(d) {
+                return None;
+            }
+            if params.len() <= slot {
+                params.resize(slot + 1, None);
+            }
+            params[slot] = Some(d.clone());
+            Term::NumCmp(idx, op, Rhs::Param(slot, ColKind::Numeric))
+        }
+        RawKind::Cmp(_, Rhs::Str(_)) => return None, // no text coercion here
+        RawKind::IsNull => Term::IsNull(idx),
+        RawKind::IsNotNull => Term::IsNotNull(idx),
+        RawKind::Like(..) => return None,
+    })
 }
 
 /// The parameter-aware wrapper around [typed_term]: a `?` right-hand
@@ -13644,6 +13768,65 @@ mod tests {
         let rest = &out[3 + vlen..];
         assert_eq!(rest[0], 67);
         assert_eq!(i32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]), 0);
+    }
+
+    #[test]
+    fn numeric_where_terms_compare_exactly() {
+        // A INT (fid 0), N NUMERIC(9,2) (fid 1), I INT128 (fid 2)
+        let columns = vec![
+            RelationColumn { name: "A".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "N".into(), field_id: 1, position: 1 },
+            RelationColumn { name: "I".into(), field_id: 2, position: 2 },
+        ];
+        let d = |dt: u8, s: i8, len: u16| Descriptor {
+            dtype: dt, scale: s, length: len, sub_type: 0, flags: 0, offset: 4,
+        };
+        let descs = vec![d(dtype::LONG, 0, 4), d(dtype::LONG, -2, 4), d(dtype::INT128, 0, 16)];
+        let row = vec![Value::Int(10), Value::Scaled(1250, -2), Value::Int128(42, 0)];
+        let resolve = |s: &str| -> Option<Predicate> {
+            let toks = tokenize(s)?;
+            let mut np = 0usize;
+            let raw = parse_predicate(&toks, &mut np)?;
+            let mut params = Vec::new();
+            resolve_predicate(raw, &columns, &descs, &mut params)
+        };
+        let hits = |s: &str| resolve(s).unwrap().matches(&row);
+        // scaled column vs integer and decimal literals, exact compare
+        assert!(hits("N = 12.50"));
+        assert!(hits("N = 12.5")); // trailing zeros are display, not value
+        assert!(!hits("N = 12.49"));
+        assert!(hits("N > 3"));
+        assert!(hits("N <= 12.5"));
+        assert!(!hits("N < 12.5"));
+        assert!(hits("N BETWEEN 1 AND 20"));
+        assert!(hits("N IN (99, 12.50)"));
+        assert!(hits("N IS NOT NULL"));
+        assert!(hits("NOT (N < 5)"));
+        // INT128 column
+        assert!(hits("I = 42"));
+        assert!(hits("I > -5"));
+        assert!(!hits("I <> 42"));
+        // decimal literal against a plain INT column
+        assert!(hits("A > 9.5"));
+        assert!(!hits("A = 9.5"));
+        // NULL semantics: UNKNOWN excludes, IS NULL selects
+        let null_row = vec![Value::Int(10), Value::Null, Value::Int128(42, 0)];
+        assert!(!resolve("N = 12.50").unwrap().matches(&null_row));
+        assert!(resolve("N IS NULL").unwrap().matches(&null_row));
+        // out of surface: text against numerics, LIKE on numerics
+        assert!(resolve("N = 'x'").is_none());
+        assert!(resolve("N LIKE '1%'").is_none());
+        // a parameter claims the numeric column's descriptor and binds
+        // with its wire scale (12.5 arriving as raw 125 scale -1)
+        let toks = tokenize("N = ?").unwrap();
+        let mut np = 0usize;
+        let raw = parse_predicate(&toks, &mut np).unwrap();
+        let mut params = Vec::new();
+        let p = resolve_predicate(raw, &columns, &descs, &mut params).unwrap();
+        assert_eq!(params.len(), 1);
+        assert!(p.bind(&[WireParam::Int(125, -1)]).unwrap().matches(&row));
+        assert!(!p.bind(&[WireParam::Int(126, -1)]).unwrap().matches(&row));
+        assert!(!p.bind(&[WireParam::Null]).unwrap().matches(&row));
     }
 
     #[test]
