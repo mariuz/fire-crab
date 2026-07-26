@@ -1240,6 +1240,33 @@ fn domain_exists(file: &[u8], page_size: usize, name: &str) -> bool {
     found
 }
 
+/// Every table.column that uses a domain as its `RDB$FIELD_SOURCE`,
+/// as (relation name, column name) pairs - what the ALTER DOMAIN TYPE
+/// dependents guard walks.
+fn domain_dependents(
+    file: &[u8],
+    page_size: usize,
+    name: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$RELATION_FIELDS")
+        .ok_or("no RDB$RELATION_FIELDS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")
+        .ok_or("no RDB$RELATION_FIELDS format")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let rn_f = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$RELATION_NAME")?;
+    let fn_f = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$FIELD_NAME")?;
+    let src_f = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$FIELD_SOURCE")?;
+    let mut out = Vec::new();
+    walk_rows(file, page_size, rel, descs, |v| {
+        if text_eq(v.get(src_f), name) {
+            if let (Some(Value::Text(t)), Some(Value::Text(c))) = (v.get(rn_f), v.get(fn_f)) {
+                out.push((t.trim_end().to_string(), c.trim_end().to_string()));
+            }
+        }
+    });
+    Ok(out)
+}
+
 /// The first table.column that uses a domain as its `RDB$FIELD_SOURCE`
 /// (None if the domain is unused) - a `DROP DOMAIN` is refused while it
 /// is in use.
@@ -1628,6 +1655,27 @@ pub fn alter_domain_type(
             want
         ));
     }
+    // the dependents guard, before any write. The engine's rule
+    // (probed): a dependent column inside a FOREIGN KEY index refuses -
+    // "Cannot modify index used by an Integrity Constraint" - while
+    // PK/UNIQUE and plain-indexed dependents retype fine there, the
+    // engine writing a NEW FORMAT VERSION for every dependent table
+    // (probed: 7 formats on a much-altered table). This path does not
+    // write those format bumps yet, so any OTHER dependent refuses
+    // conservatively - never a catalog-vs-format mismatch - with the
+    // FK case reporting the engine's own message first.
+    let deps = domain_dependents(file, page_size, &want)?;
+    for (t, c) in &deps {
+        if indices_containing(file, page_size, t, c)?.iter().any(|(_, fk)| *fk) {
+            return Err("Cannot modify index used by an Integrity Constraint".into());
+        }
+    }
+    if let Some((t, c)) = deps.first() {
+        return Err(format!(
+            "domain {} is in use (by {}.{}); the dependent-format rewrite is not written yet",
+            want, t, c
+        ));
+    }
     // patch the domain's RDB$FIELDS row in place (mirror of the column
     // ALTER TYPE retype, minus the table format/runtime it does not have)
     let f_cols = relation_columns(file, page_size, "RDB$FIELDS");
@@ -1911,6 +1959,45 @@ fn int_width(dt: u8) -> Option<u16> {
 /// integer (scale 0), a CHAR/VARCHAR widens to a same-or-longer one of
 /// the same kind. Everything else errors, as the engine does for an
 /// unsupported conversion.
+/// The indices of `table` that have `col` among their segments, each as
+/// (index name, is-a-FOREIGN-KEY index - its RDB$FOREIGN_KEY names a
+/// partner).
+fn indices_containing(
+    file: &[u8],
+    page_size: usize,
+    table: &str,
+    col: &str,
+) -> Result<Vec<(String, bool)>, String> {
+    let irel =
+        crate::resolve_relation(file, page_size, "RDB$INDICES").ok_or("no RDB$INDICES")?;
+    let formats = system_relation_formats(file, page_size, "RDB$INDICES")
+        .ok_or("no RDB$INDICES format")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let ix_f = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME")?;
+    let rn_f = sys_fid(file, page_size, "RDB$INDICES", "RDB$RELATION_NAME")?;
+    let fk_f = sys_fid(file, page_size, "RDB$INDICES", "RDB$FOREIGN_KEY")?;
+    let mut names: Vec<(String, bool)> = Vec::new();
+    walk_rows(file, page_size, irel, descs, |values| {
+        if text_eq(values.get(rn_f), table) {
+            if let Some(Value::Text(t)) = values.get(ix_f) {
+                let fk = matches!(values.get(fk_f),
+                    Some(Value::Text(p)) if !p.trim_end().is_empty());
+                names.push((t.trim_end().to_string(), fk));
+            }
+        }
+    });
+    let mut out = Vec::new();
+    for (n, fk) in names {
+        if index_segment_columns(file, page_size, &n)?
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(col))
+        {
+            out.push((n, fk));
+        }
+    }
+    Ok(out)
+}
+
 /// TRUE when `col` is a segment of an index that an
 /// `RDB$RELATION_CONSTRAINTS` row names - a PRIMARY KEY / UNIQUE /
 /// FOREIGN KEY enforcement index. The engine refuses retyping such a
@@ -1924,32 +2011,10 @@ fn column_in_constraint_index(
     table: &str,
     col: &str,
 ) -> Result<bool, String> {
-    // the relation's index names
-    let irel =
-        crate::resolve_relation(file, page_size, "RDB$INDICES").ok_or("no RDB$INDICES")?;
-    let formats = system_relation_formats(file, page_size, "RDB$INDICES")
-        .ok_or("no RDB$INDICES format")?;
-    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
-    let ix_f = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME")?;
-    let rn_f = sys_fid(file, page_size, "RDB$INDICES", "RDB$RELATION_NAME")?;
-    let mut names: Vec<String> = Vec::new();
-    walk_rows(file, page_size, irel, descs, |values| {
-        if text_eq(values.get(rn_f), table) {
-            if let Some(Value::Text(t)) = values.get(ix_f) {
-                names.push(t.trim_end().to_string());
-            }
-        }
-    });
-    // ...those the column is a segment of
-    let mut mine: Vec<String> = Vec::new();
-    for n in names {
-        if index_segment_columns(file, page_size, &n)?
-            .iter()
-            .any(|c| c.eq_ignore_ascii_case(col))
-        {
-            mine.push(n);
-        }
-    }
+    let mine: Vec<String> = indices_containing(file, page_size, table, col)?
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
     if mine.is_empty() {
         return Ok(false);
     }

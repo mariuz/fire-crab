@@ -37,7 +37,10 @@ FBK="$D/fc-adt-work.fbk"; RST="$D/fc-adt-rst.fdb"
 command -v node >/dev/null 2>&1 || { echo "SKIP node not found"; exit 0; }
 mkdir -p "$D"; rm -f "$WORK" "$REF" "$FBK" "$RST"
 
-SETUP="CREATE DOMAIN DOM_I AS INTEGER; CREATE DOMAIN DOM_S AS SMALLINT; CREATE DOMAIN DOM_V AS VARCHAR(6); CREATE DOMAIN DOM_N AS VARCHAR(20);"
+SETUP="CREATE DOMAIN DOM_I AS INTEGER; CREATE DOMAIN DOM_S AS SMALLINT; CREATE DOMAIN DOM_V AS VARCHAR(6); CREATE DOMAIN DOM_N AS VARCHAR(20);
+CREATE DOMAIN DOM_FK AS INTEGER; CREATE DOMAIN DOM_PU AS INTEGER;
+CREATE TABLE GM (Q INTEGER NOT NULL PRIMARY KEY, P DOM_PU);
+CREATE TABLE GC (R DOM_FK REFERENCES GM (Q));"
 I_BIG="ALTER DOMAIN DOM_I TYPE BIGINT"
 S_INT="ALTER DOMAIN DOM_S TYPE INTEGER"
 V_WIDE="ALTER DOMAIN DOM_V TYPE VARCHAR(20)"
@@ -114,6 +117,18 @@ case "$r" in ERR*) echo "OK   an incompatible VARCHAR->INTEGER is refused" ;;
     *) echo "DIFF incompatible change accepted"; echo "     $r"; fail=1 ;; esac
 case "$eng_narrow$eng_incompat" in *[Ff]ailed*|*[Ee]rror*|*unsuccessful*) echo "OK   the engine refuses both too" ;;
     *) echo "DIFF engine did not refuse"; echo "     $eng_narrow / $eng_incompat"; fail=1 ;; esac
+# the dependents guard (probed): a domain whose column sits in a
+# FOREIGN KEY index refuses - "Cannot modify index used by an
+# Integrity Constraint" - exactly as the engine does; any OTHER in-use
+# domain refuses CONSERVATIVELY (the engine allows it, writing a new
+# format version per dependent table - a slice fc does not write yet,
+# so it refuses rather than leave catalog and formats disagreeing)
+r=$(node_run "ALTER DOMAIN DOM_FK TYPE BIGINT")
+case "$r" in ERR*) echo "OK   an FK-child domain is refused (engine parity)" ;;
+    *) echo "DIFF FK-child domain guard"; echo "     $r"; fail=1 ;; esac
+r=$(node_run "ALTER DOMAIN DOM_PU TYPE BIGINT")
+case "$r" in ERR*) echo "OK   any other IN-USE domain refuses (conservative - no format bump yet)" ;;
+    *) echo "DIFF in-use domain guard"; echo "     $r"; fail=1 ;; esac
 
 # --- 1. the retyped domain type rows -----------------------------------
 infoq() { # <file>
@@ -148,6 +163,15 @@ check "the engine stores a value past the old INTEGER range in the BIGINT domain
 
 # --- 4. gbak and gfix --------------------------------------------------
 kill $srv 2>/dev/null; wait $srv 2>/dev/null
+
+# the engine refuses the same FK-child domain retype on fc's file - the
+# partner metadata fc preserves is what makes it refuse
+engref=$("$ISQL" -q -user "$U" -pas "$P" "$WORK" 2>&1 <<< "ALTER DOMAIN DOM_FK TYPE BIGINT;")
+case "$engref" in
+    *"Integrity Constraint"*) echo "OK   the engine refuses the FK-child domain on fc's file" ;;
+    *) echo "DIFF engine-side FK-domain refusal"; echo "     $engref"; fail=1 ;;
+esac
+
 if "$GBAK" -b -g -user "$U" -pas "$P" "$WORK" "$FBK" >/tmp/fc-adt-backup.log 2>&1; then
     echo "OK   gbak backs up the database fire-crab wrote"
 else
