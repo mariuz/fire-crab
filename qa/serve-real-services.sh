@@ -109,7 +109,21 @@ cur_b.execute("""select count(distinct a.mon$server_pid), min(a.mon$remote_proto
 row = cur_b.fetchone()
 check("MON$ architecture query returns one all-NULL row", row == (None, None, None))
 con_b.close()
-con.close()
+
+# 5. op_drop_database: the SAME operation firebird-qa's per-test
+# teardown issues (db.drop()) - the file must be GONE afterwards, and
+# a fresh create at that path must then succeed (the cascade that
+# blocked the suite when the op was unhandled)
+path = os.environ['FC_NEWDB']
+con.drop_database()
+check("drop_database removes the file", not os.path.exists(path))
+con2 = create_database('newdb', user=os.environ['FC_U'], password=os.environ['FC_P'])
+cur2 = con2.cursor()
+cur2.execute("CREATE TABLE T2 (ID INTEGER)"); con2.commit()
+cur2.execute("INSERT INTO T2 VALUES (7)"); con2.commit()
+cur2.execute("SELECT ID FROM T2")
+check("re-create at the dropped path works", cur2.fetchall() == [(7,)])
+con2.close()
 sys.exit(fail)
 PYEOF
 py_rc=$?
@@ -119,10 +133,10 @@ kill $srv 2>/dev/null; wait $srv 2>/dev/null
 if [ -f "$NEWDB" ]; then
     rows=$("$ISQL" -q -b -user "$U" -pas "$P" "$NEWDB" <<'EOF' 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$'
 SET HEADING OFF;
-SELECT ID || '|' || TRIM(NAME) FROM T ORDER BY ID;
+SELECT ID FROM T2;
 EOF
 )
-    want=$(printf '1|created\n2|second')
+    want="7"
     if [ "$rows" = "$want" ]; then echo "OK   ENGINE reads the driver-created database"; else
         echo "DIFF ENGINE reads the driver-created database"; echo "     got: $rows"; py_rc=1; fi
     val=$("$GFIX" -v -full -user "$U" -pas "$P" "$NEWDB" 2>&1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')

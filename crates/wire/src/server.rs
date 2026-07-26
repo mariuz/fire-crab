@@ -24,7 +24,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 use crate::{
-    OP_ATTACH, OP_COMMIT, OP_CONNECT, OP_CONT_AUTH, OP_CREATE, OP_CRYPT, OP_DETACH, OP_EXECUTE,
+    OP_ATTACH, OP_COMMIT, OP_CONNECT, OP_CONT_AUTH, OP_CREATE, OP_CRYPT, OP_DETACH,
+    OP_DROP_DATABASE, OP_EXECUTE,
     OP_FETCH, OP_FETCH_RESPONSE, OP_FREE_STATEMENT, OP_PREPARE_STATEMENT, OP_RESPONSE, OP_ROLLBACK,
     OP_SERVICE_ATTACH, OP_SERVICE_DETACH, OP_SERVICE_INFO, OP_SERVICE_START, OP_TRANSACTION,
 };
@@ -12037,6 +12038,25 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
             x if x == OP_DETACH => {
                 read_int(&mut s, &mut dec)?; // handle
                 respond(&mut s, &mut enc, 0)?;
+                break;
+            }
+            // `DROP DATABASE`: the attached file is deleted and the
+            // attachment ends (the engine's isc_drop_database). The
+            // client sends no further op on this connection - it detaches
+            // by closing - so the loop breaks either way.
+            x if x == OP_DROP_DATABASE => {
+                read_int(&mut s, &mut dec)?; // db handle
+                let gone = std::fs::remove_file(&db_path).is_ok();
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] op_drop_database '{}' {}", db_path,
+                        if gone { "removed" } else { "FAILED" });
+                }
+                if gone {
+                    database = None;
+                    respond(&mut s, &mut enc, 0)?;
+                } else {
+                    respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                }
                 break;
             }
             x if x == OP_TRANSACTION => {

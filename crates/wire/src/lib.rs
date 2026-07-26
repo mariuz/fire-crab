@@ -50,6 +50,9 @@ pub const OP_FETCH_RESPONSE: i32 = 66;
 pub const OP_FREE_STATEMENT: i32 = 67;
 pub const OP_PREPARE_STATEMENT: i32 = 68;
 pub const OP_CREATE: i32 = 20;
+/// `op_drop_database` (protocol.h:286) - the attached database's file is
+/// deleted and the attachment ends
+pub const OP_DROP_DATABASE: i32 = 81;
 pub const OP_SERVICE_ATTACH: i32 = 82;
 pub const OP_SERVICE_DETACH: i32 = 83;
 pub const OP_SERVICE_INFO: i32 = 84;
