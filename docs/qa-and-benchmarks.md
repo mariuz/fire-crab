@@ -3877,6 +3877,38 @@ modifiers gate:
   projection. Sorting the projected row silently orders by the wrong
   column whenever the two differ.
 
+### The fixed-answer fallback never reaches a client
+
+When the server cannot plan a statement it used to answer
+`Plan::Scalar(FIXED_ANSWER)` — one row, one column, the value 4242. That
+exists so the wire pipeline round-trips during development, but as an
+*answer* it is the worst possible outcome: a client cannot tell it from a
+real result, so an unsupported query looks like it succeeded and returned
+nonsense.
+
+The hazard had to be cut off five times, once per surface — procedures,
+views, unions, result modifiers, conditional expressions — and every one
+of those was found by accident. It is now closed at the root: a query the
+server cannot plan raises, and the fixed-answer plan survives only for a
+connection with no database behind it, where the pipeline must still
+round-trip.
+
+`qa/serve-real-nofallback.sh` looks for the leak on purpose. It runs
+~24 supported queries spanning every surface and asserts none of their
+answers contains 4242, then runs ~12 deliberately unsupported ones and
+asserts each *raises* rather than answering. Anything that answers 4242
+fails whichever list it is in. Writing it found five leaks that the
+per-surface gates had all missed, including a correlated `EXISTS` whose
+outer column is qualified (`U2.ID = T.ID`): the matcher stripped the
+qualifier, found `ID` in both tables, called it ambiguous and declined —
+so the query silently returned 4242. A qualifier now settles which side
+is which, and only an *unqualified* name present in both tables is
+ambiguous.
+
+The lesson worth generalising: a per-feature gate proves the feature
+works, and says nothing about what the server does with the queries just
+outside it. One gate aimed at the fallback covers all of them at once.
+
 ### Statement type codes are load-bearing
 
 A client *dispatches* on `isc_info_sql_stmt_type`, so announcing the

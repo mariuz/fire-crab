@@ -8731,6 +8731,18 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
     let planned = plan_query_inner(sql, db, &mut params);
     match (planned, params.into_iter().collect::<Option<Vec<_>>>()) {
         (Some(p), Some(ps)) => (p, ps),
+        // A QUERY THIS SERVER CANNOT PLAN RAISES. It used to answer
+        // Plan::Scalar(FIXED_ANSWER) - one row, one column, 4242 - which
+        // a client cannot tell from a real result, so an unsupported
+        // query looked like it had succeeded and returned nonsense. That
+        // hazard had to be cut off surface by surface (procedures, views,
+        // unions, modifiers, conditionals), each time after it was found
+        // by accident; refusing HERE closes the whole class at once.
+        //
+        // The fixed-answer plan still exists for the one case that wants
+        // it: a connection with no database behind it, where the wire
+        // pipeline must still round-trip.
+        _ if db.is_some() => (Plan::Refused, Vec::new()),
         _ => (Plan::Scalar(Some(FIXED_ANSWER)), Vec::new()),
     }
 }
@@ -9447,7 +9459,12 @@ fn plan_query_inner(
         // a `?` argument would have to arrive with op_execute; this
         // slice takes literals only
         let args: Vec<Value> = pargs.into_iter().collect::<Option<Vec<_>>>()?;
-        let meta = load_procedure(db, &pname)?;
+        let Some(meta) = load_procedure(db, &pname) else {
+            if trace {
+                eprintln!("[srv] plan: no such procedure {:?}", pname);
+            }
+            return Some(Plan::Refused);
+        };
         // one output column per declared output parameter, named after it
         let cols: Vec<ProjCol> = meta
             .outs
@@ -12808,12 +12825,35 @@ fn eval_subquery(
             // exactly `<ident> = <ident>`, one side inner, one side outer
             if let [Tok::Ident(a), Tok::Cmp(Cmp::Eq), Tok::Ident(b)] = p.as_slice() {
                 let name_of = |q: &str| q.rsplit('.').next().unwrap_or(q).to_string();
+                let qual_of = |q: &str| -> Option<String> {
+                    let mut it = q.rsplitn(2, '.');
+                    it.next();
+                    it.next().map(|s| s.to_string())
+                };
                 let (an, bn) = (name_of(a), name_of(b));
-                let a_in = columns.iter().any(|c| c.name.eq_ignore_ascii_case(&an));
-                let b_in = columns.iter().any(|c| c.name.eq_ignore_ascii_case(&bn));
-                let a_out = outer_cols.iter().any(|c| c.name.eq_ignore_ascii_case(&an));
-                let b_out = outer_cols.iter().any(|c| c.name.eq_ignore_ascii_case(&bn));
-                // an unqualified name present in BOTH tables is
+                let in_tbl = |q: &str| -> bool {
+                    // A QUALIFIER SETTLES IT. `U2.ID = T.ID` names the
+                    // same column in two tables, so stripping the
+                    // qualifier and asking which table has "ID" finds
+                    // BOTH and calls it ambiguous - which is how a
+                    // correlated EXISTS over tables sharing a column name
+                    // came to refuse.
+                    match qual_of(q) {
+                        Some(t) => t.eq_ignore_ascii_case(table),
+                        None => false,
+                    }
+                };
+                let a_in = in_tbl(a)
+                    || (qual_of(a).is_none()
+                        && columns.iter().any(|c| c.name.eq_ignore_ascii_case(&an)));
+                let b_in = in_tbl(b)
+                    || (qual_of(b).is_none()
+                        && columns.iter().any(|c| c.name.eq_ignore_ascii_case(&bn)));
+                let a_out = !in_tbl(a)
+                    && outer_cols.iter().any(|c| c.name.eq_ignore_ascii_case(&an));
+                let b_out = !in_tbl(b)
+                    && outer_cols.iter().any(|c| c.name.eq_ignore_ascii_case(&bn));
+                // an UNQUALIFIED name present in both tables is still
                 // ambiguous - refuse rather than pick a side
                 let inner_name = match (a_in && !a_out, b_in && !b_out) {
                     (true, false) => Some(an.clone()),
@@ -13083,13 +13123,26 @@ fn correlated_outer_col(
     for p in split_top_and(&tokenize(where_s?)?) {
         if let [Tok::Ident(a), Tok::Cmp(Cmp::Eq), Tok::Ident(b)] = p.as_slice() {
             let name_of = |q: &str| q.rsplit('.').next().unwrap_or(q).to_string();
+            let qual_of = |q: &str| -> Option<String> {
+                let mut it = q.rsplitn(2, '.');
+                it.next();
+                it.next().map(|s| s.to_string())
+            };
             let (an, bn) = (name_of(a), name_of(b));
-            let inner = |n: &str| columns.iter().any(|c| c.name.eq_ignore_ascii_case(n));
-            let outer = |n: &str| outer_cols.iter().any(|c| c.name.eq_ignore_ascii_case(n));
-            if inner(&an) && !outer(&an) && outer(&bn) {
+            // a qualifier naming the INNER table settles which side is
+            // which - see eval_subquery
+            let is_inner = |q: &str, n: &str| match qual_of(q) {
+                Some(t) => t.eq_ignore_ascii_case(from.table),
+                None => columns.iter().any(|c| c.name.eq_ignore_ascii_case(n)),
+            };
+            let is_outer = |q: &str, n: &str| {
+                qual_of(q).is_none_or(|t| !t.eq_ignore_ascii_case(from.table))
+                    && outer_cols.iter().any(|c| c.name.eq_ignore_ascii_case(n))
+            };
+            if is_inner(a, &an) && is_outer(b, &bn) {
                 return Some(bn);
             }
-            if inner(&bn) && !outer(&bn) && outer(&an) {
+            if is_inner(b, &bn) && is_outer(a, &an) {
                 return Some(an);
             }
         }
