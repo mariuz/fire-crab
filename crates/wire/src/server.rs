@@ -1214,6 +1214,9 @@ enum Term {
     /// counts, exactly as the engine matches (CHAR(5) 'abc' matches
     /// 'abc  ' and 'abc%' but NOT 'abc')
     Like(usize, Rhs, Option<char>, bool),
+    /// A row-independent decision - an evaluated subquery's verdict.
+    /// See [RawKind::Const].
+    Const(bool),
     Never,
 }
 
@@ -1361,6 +1364,7 @@ impl Term {
                 // NULL value or NULL/unbound pattern: UNKNOWN
                 _ => false,
             },
+            Term::Const(b) => *b,
             Term::Never => false,
         }
     }
@@ -8155,6 +8159,10 @@ fn resolve_join_predicate(
     for g in raw {
         let mut terms = Vec::new();
         for rt in g {
+            if let RawKind::Const(b) = rt.kind {
+                terms.push(Term::Const(b));
+                continue;
+            }
             let RawLhs::Col(col) = &rt.lhs else {
                 return None;
             };
@@ -8467,7 +8475,18 @@ fn plan_query_inner(
     let mut next_param = 0usize;
     let filter = match where_s {
         None => None,
-        Some(ws) => match tokenize(ws)
+        // a WHERE may carry subqueries: lift them out of the text, then
+        // fold each one's answer back in as ordinary tokens BEFORE the
+        // predicate parser ever sees it (see SUBQ_MARK above)
+        Some(ws) => match extract_subqueries(ws)
+            .and_then(|(rewritten, subs)| {
+                let toks = tokenize(&rewritten)?;
+                if subs.is_empty() {
+                    Some(toks)
+                } else {
+                    resolve_subqueries(&toks, &subs, db, &columns)
+                }
+            })
             .and_then(|t| parse_predicate(&t, &mut next_param))
             .and_then(|raw| resolve_predicate(raw, &columns, &descs, params))
         {
@@ -10915,6 +10934,530 @@ fn find_kw_by(up: &str, kw: &str) -> Option<(usize, usize)> {
 /// case-sensitive). ASCII uppercasing keeps byte positions, so keyword
 /// offsets found in the uppercased copy slice the original.
 #[allow(clippy::type_complexity)]
+// ===================================================================
+// SUBQUERIES IN WHERE
+//
+// The engine compiles a subquery into a nested `blr_rse` wrapped in
+// `blr_any` (EXISTS / IN), `blr_unique`, or `blr_via` (a scalar), and
+// evaluates it inside the outer stream's loop. This server has no
+// nested-stream executor, so it takes the route a planner takes when
+// it can: it EVALUATES the inner query up front and folds the answer
+// into the outer WHERE as ordinary tokens.
+//
+//   <col> [NOT] IN (SELECT c FROM t [WHERE ...])
+//        -> <col> [NOT] IN (v1, v2, ...)          the values it returned
+//   [NOT] EXISTS (SELECT ... FROM t WHERE t.c = <outer col> ...)
+//        -> <outer col> [NOT] IN (v1, v2, ...)    a SEMI-JOIN: the set of
+//                                                 outer keys with a partner
+//   [NOT] EXISTS (SELECT ... uncorrelated ...)
+//        -> TRUE / FALSE                          it cannot vary per row
+//   <col> <cmp> (SELECT <agg-or-col> ...)
+//        -> <col> <cmp> <value>                   one row, one column
+//
+// Equality correlation becomes a set membership test, which is exactly
+// what a semi-join is, so the common `EXISTS (... WHERE inner.fk =
+// outer.pk)` works without a nested loop. NULL semantics fall out of
+// the existing three-valued leaves: `IN` desugars to OR-of-equals and
+// `NOT IN` to AND-of-not-equals, so a NULL among the values makes the
+// NOT IN row UNKNOWN (excluded) - the trap the engine is the oracle for.
+//
+// NOT covered, and REFUSED rather than answered wrongly: correlation on
+// anything but `=`, more than one correlation pair, a subquery in the
+// select list or over a join, a parameter inside a subquery, GROUP BY /
+// ORDER BY inside one, and ALL/ANY/SOME.
+
+/// The placeholder identifier a lifted subquery leaves in the WHERE text.
+const SUBQ_MARK: &str = "FC$SUBQ";
+
+/// Lift every `( SELECT ... )` out of `where_text`, replacing it with a
+/// `FC$SUBQ<n>` placeholder. Quotes are honoured (a paren inside a
+/// string literal is text) and nesting is counted, so the group ends at
+/// its own matching paren. Returns the rewritten text and the lifted
+/// SELECT bodies in order. No subquery = the text unchanged.
+fn extract_subqueries(where_text: &str) -> Option<(String, Vec<String>)> {
+    let b = where_text.as_bytes();
+    let mut out = String::with_capacity(where_text.len());
+    let mut subs: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        // a string literal passes through untouched
+        if b[i] == b'\'' {
+            let start = i;
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'\'' {
+                    if i + 1 < b.len() && b[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&where_text[start..i]);
+            continue;
+        }
+        if b[i] == b'(' {
+            // does the word after the paren start a SELECT?
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let is_select = where_text[j..]
+                .get(..6)
+                .map(|w| w.eq_ignore_ascii_case("SELECT"))
+                .unwrap_or(false)
+                && where_text[j..]
+                    .as_bytes()
+                    .get(6)
+                    .map(|c| c.is_ascii_whitespace() || *c == b'(')
+                    .unwrap_or(false);
+            if is_select {
+                // find the matching close paren, minding quotes/nesting
+                let mut depth = 1i32;
+                let mut k = i + 1;
+                while k < b.len() && depth > 0 {
+                    match b[k] {
+                        b'\'' => {
+                            k += 1;
+                            while k < b.len() {
+                                if b[k] == b'\'' {
+                                    if k + 1 < b.len() && b[k + 1] == b'\'' {
+                                        k += 2;
+                                        continue;
+                                    }
+                                    break;
+                                }
+                                k += 1;
+                            }
+                        }
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                if depth != 0 {
+                    return None; // unbalanced
+                }
+                subs.push(where_text[i + 1..k - 1].trim().to_string());
+                out.push(' ');
+                out.push_str(SUBQ_MARK);
+                out.push_str(&(subs.len() - 1).to_string());
+                out.push(' ');
+                i = k;
+                continue;
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    Some((out, subs))
+}
+
+/// Split a token slice into top-level `AND` parts (depth-0 `AND` only).
+fn split_top_and(toks: &[Tok]) -> Vec<Vec<Tok>> {
+    let mut parts = vec![Vec::new()];
+    let mut depth = 0i32;
+    for t in toks {
+        match t {
+            Tok::LParen => depth += 1,
+            Tok::RParen => depth -= 1,
+            Tok::And if depth == 0 => {
+                parts.push(Vec::new());
+                continue;
+            }
+            _ => {}
+        }
+        parts.last_mut().unwrap().push(t.clone());
+    }
+    parts
+}
+
+/// Turn a decoded value into the token a WHERE leaf would have parsed
+/// from a literal. Types this server cannot write as a literal (blobs,
+/// DECFLOAT, timezone-bearing temporals) refuse, so the subquery falls
+/// back rather than comparing something it invented.
+fn value_to_tok(v: &Value) -> Option<Tok> {
+    Some(match v {
+        Value::Null => Tok::Null,
+        Value::Int(n) => Tok::Int(*n),
+        Value::Scaled(raw, scale) => Tok::Dec(*raw, *scale),
+        Value::Text(s) => Tok::Str(s.clone()),
+        Value::Bool(b) => Tok::Int(if *b { 1 } else { 0 }),
+        _ => return None,
+    })
+}
+
+/// One column of every row an inner SELECT returns, plus whether the
+/// query matched any row at all.
+struct SubqRows {
+    /// the projected column's values, in scan order (NULLs included -
+    /// they decide NOT IN)
+    values: Vec<Value>,
+    /// the inner query matched at least one row
+    any: bool,
+}
+
+/// Evaluate an inner `SELECT <one item> FROM <one table> [WHERE ...]`.
+///
+/// `corr` optionally names an OUTER column: when set, the inner WHERE is
+/// searched for a top-level `<inner col> = <that outer column>` leaf,
+/// that leaf is REMOVED, and the projection is replaced by the inner
+/// correlation column - which turns the whole thing into "the set of
+/// outer key values that have a partner", i.e. a semi-join.
+///
+/// Returns None for any shape outside the supported surface, and for a
+/// subquery carrying a `?` parameter (its slot numbering belongs to the
+/// outer statement).
+fn eval_subquery(
+    sql: &str,
+    db: &Database,
+    corr: Option<&[RelationColumn]>,
+    existence_only: bool,
+) -> Option<SubqRows> {
+    let (proj_s, table_s, where_s, group_s, having_s, order_s) = split_query(sql)?;
+    if group_s.is_some() || having_s.is_some() || order_s.is_some() {
+        return None;
+    }
+    let (from, join) = parse_from(table_s)?;
+    if join.is_some() {
+        return None; // a subquery over a join
+    }
+    let table = from.table;
+    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
+    let columns = relation_columns(&db.bytes, db.page_size, table);
+    let formats = select_formats(db, table, rel);
+    let descs = formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, d)| d.clone())
+        .unwrap_or_default();
+    if descs.is_empty() {
+        return None;
+    }
+
+    // the WHERE, minus the correlation leaf if there is one
+    let mut corr_inner_fid: Option<usize> = None;
+    let mut where_toks: Option<Vec<Tok>> = match where_s {
+        None => None,
+        Some(ws) => {
+            // a nested subquery inside a subquery is out of scope
+            if extract_subqueries(ws)?.1.len() != 0 {
+                return None;
+            }
+            Some(tokenize(ws)?)
+        }
+    };
+    if let Some(outer_cols) = corr {
+        let toks = where_toks.take()?; // correlated EXISTS needs a WHERE
+        let parts = split_top_and(&toks);
+        let mut kept: Vec<Vec<Tok>> = Vec::new();
+        for p in parts {
+            // exactly `<ident> = <ident>`, one side inner, one side outer
+            if let [Tok::Ident(a), Tok::Cmp(Cmp::Eq), Tok::Ident(b)] = p.as_slice() {
+                let name_of = |q: &str| q.rsplit('.').next().unwrap_or(q).to_string();
+                let (an, bn) = (name_of(a), name_of(b));
+                let a_in = columns.iter().any(|c| c.name.eq_ignore_ascii_case(&an));
+                let b_in = columns.iter().any(|c| c.name.eq_ignore_ascii_case(&bn));
+                let a_out = outer_cols.iter().any(|c| c.name.eq_ignore_ascii_case(&an));
+                let b_out = outer_cols.iter().any(|c| c.name.eq_ignore_ascii_case(&bn));
+                // an unqualified name present in BOTH tables is
+                // ambiguous - refuse rather than pick a side
+                let inner_name = match (a_in && !a_out, b_in && !b_out) {
+                    (true, false) => Some(an.clone()),
+                    (false, true) => Some(bn.clone()),
+                    _ => None,
+                };
+                if let Some(inner) = inner_name {
+                    if corr_inner_fid.is_some() {
+                        return None; // more than one correlation pair
+                    }
+                    corr_inner_fid = Some(
+                        columns
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(&inner))?
+                            .field_id as usize,
+                    );
+                    continue; // drop this leaf
+                }
+            }
+            kept.push(p);
+        }
+        corr_inner_fid?; // no correlation leaf found - not a semi-join
+        let mut rejoined: Vec<Tok> = Vec::new();
+        for (i, p) in kept.into_iter().enumerate() {
+            if i > 0 {
+                rejoined.push(Tok::And);
+            }
+            rejoined.extend(p);
+        }
+        where_toks = if rejoined.is_empty() { None } else { Some(rejoined) };
+    }
+
+    // which column the rows are collected from: the correlation column
+    // for a semi-join, otherwise the projection's single item
+    let mut agg: Option<(AggFn, AggTarget)> = None;
+    let want_fid: Option<usize> = match corr_inner_fid {
+        Some(fid) => Some(fid),
+        // EXISTS asks only whether a row survives the WHERE, so the
+        // projection is irrelevant - and it is usually `SELECT 1`,
+        // which is not a column at all
+        None if existence_only => None,
+        None => match parse_projection(proj_s)? {
+            Proj::Items(items) if items.len() == 1 => match &items[0] {
+                SelItem::Col(name) => Some(
+                    columns
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(name))?
+                        .field_id as usize,
+                ),
+                SelItem::Agg(f, t) => {
+                    agg = Some((*f, t.clone()));
+                    None
+                }
+                _ => return None,
+            },
+            _ => return None, // `*` or several items
+        },
+    };
+    if let Some(fid) = want_fid {
+        if is_computed_fid(&descs, fid) {
+            return None;
+        }
+    }
+
+    // resolve the remaining WHERE; a `?` inside claims no outer slot, so
+    // any parameter here refuses
+    let filter = match &where_toks {
+        None => None,
+        Some(toks) => {
+            if toks.iter().any(|t| matches!(t, Tok::Param)) {
+                return None;
+            }
+            let mut np = 0usize;
+            let raw = parse_predicate(toks, &mut np)?;
+            if np != 0 {
+                return None;
+            }
+            let mut sink: Vec<Option<Descriptor>> = Vec::new();
+            Some(resolve_predicate(raw, &columns, &descs, &mut sink)?)
+        }
+    };
+
+    // an aggregate subquery answers one value through the same path a
+    // top-level aggregate takes
+    if let Some((func, target)) = agg {
+        let got = aggregate(db, rel, &formats, &columns, &descs, func, &target, &filter)?;
+        return Some(SubqRows {
+            values: vec![got.map_or(Value::Null, Value::Int)],
+            any: true,
+        });
+    }
+
+    if existence_only && want_fid.is_none() {
+        let mut any = false;
+        for_each_record(db, rel, &formats, |v| {
+            if !any && filter.as_ref().map_or(true, |p| p.matches(v)) {
+                any = true;
+            }
+        });
+        return Some(SubqRows { values: Vec::new(), any });
+    }
+    let fid = want_fid?;
+    let mut values = Vec::new();
+    let mut any = false;
+    for_each_record(db, rel, &formats, |v| {
+        if filter.as_ref().map_or(true, |p| p.matches(v)) {
+            any = true;
+            values.push(v.get(fid).cloned().unwrap_or(Value::Null));
+        }
+    });
+    Some(SubqRows { values, any })
+}
+
+/// Replace every [Tok::Subq] in a WHERE token stream with the tokens its
+/// answer folds into. See the module comment above for the rewrites.
+/// None whenever a subquery's shape or context is outside the surface -
+/// the caller then falls back instead of answering wrongly.
+fn resolve_subqueries(
+    toks: &[Tok],
+    subs: &[String],
+    db: &Database,
+    outer_cols: &[RelationColumn],
+) -> Option<Vec<Tok>> {
+    // a set of values becomes the body of an IN list
+    let list_tokens = |vals: &[Value]| -> Option<Vec<Tok>> {
+        let mut out = vec![Tok::LParen];
+        // duplicates change nothing for membership and cost time
+        let mut seen: Vec<Tok> = Vec::new();
+        for v in vals {
+            let t = value_to_tok(v)?;
+            if !seen.iter().any(|s| tok_eq(s, &t)) {
+                seen.push(t);
+            }
+        }
+        for (i, t) in seen.iter().enumerate() {
+            if i > 0 {
+                out.push(Tok::Comma);
+            }
+            out.push(t.clone());
+        }
+        out.push(Tok::RParen);
+        Some(out)
+    };
+
+    let mut out: Vec<Tok> = Vec::new();
+    let mut i = 0usize;
+    while i < toks.len() {
+        match &toks[i] {
+            // [NOT] EXISTS <subq>
+            Tok::Exists => {
+                let Some(Tok::Subq(n)) = toks.get(i + 1) else {
+                    return None;
+                };
+                let sql = subs.get(*n)?;
+                // was the preceding token a NOT that belongs to us?
+                let negated = matches!(out.last(), Some(Tok::Not));
+                if negated {
+                    out.pop();
+                }
+                // try the correlated (semi-join) reading first
+                match eval_subquery(sql, db, Some(outer_cols), true) {
+                    Some(rows) => {
+                        // the outer column the correlation named: recover
+                        // it from the inner WHERE the same way
+                        let outer = correlated_outer_col(sql, db, outer_cols)?;
+                        // NULLs must NOT reach the IN list here. A semi-
+                        // join asks "is there an inner row with inner.c =
+                        // outer.c", and `NULL = anything` is UNKNOWN, so
+                        // an inner NULL matches nothing and contributes
+                        // nothing. Left in, it would poison the NOT IN
+                        // this rewrites to and make NOT EXISTS return no
+                        // rows at all - the classic NOT IN / NOT EXISTS
+                        // divergence. (A literal `NOT IN (SELECT ...)`
+                        // is the opposite case: there the NULL genuinely
+                        // does poison, and it is kept.)
+                        let vals: Vec<Value> = rows
+                            .values
+                            .into_iter()
+                            .filter(|v| !matches!(v, Value::Null))
+                            .collect();
+                        if vals.is_empty() {
+                            // no partner for any row
+                            out.push(Tok::Const(negated));
+                        } else {
+                            out.push(Tok::Ident(outer));
+                            if negated {
+                                out.push(Tok::Not);
+                            }
+                            out.push(Tok::In);
+                            out.extend(list_tokens(&vals)?);
+                        }
+                    }
+                    // uncorrelated: the verdict is the same for every row
+                    None => {
+                        let rows = eval_subquery(sql, db, None, true)?;
+                        out.push(Tok::Const(rows.any != negated));
+                    }
+                }
+                i += 2;
+            }
+            // <col> [NOT] IN <subq>
+            Tok::In => {
+                let Some(Tok::Subq(n)) = toks.get(i + 1) else {
+                    out.push(toks[i].clone());
+                    i += 1;
+                    continue;
+                };
+                let rows = eval_subquery(subs.get(*n)?, db, None, false)?;
+                if rows.values.is_empty() {
+                    // `x IN (nothing)` is FALSE, `x NOT IN (nothing)`
+                    // TRUE - and the column reference must go too
+                    let negated = matches!(out.last(), Some(Tok::Not));
+                    if negated {
+                        out.pop();
+                    }
+                    // drop the LHS column token this IN belonged to
+                    if matches!(out.last(), Some(Tok::Ident(_))) {
+                        out.pop();
+                    } else {
+                        return None;
+                    }
+                    out.push(Tok::Const(negated));
+                } else {
+                    out.push(Tok::In);
+                    out.extend(list_tokens(&rows.values)?);
+                }
+                i += 2;
+            }
+            // <col> <cmp> <subq> - a scalar subquery
+            Tok::Cmp(op) => {
+                let Some(Tok::Subq(n)) = toks.get(i + 1) else {
+                    out.push(toks[i].clone());
+                    i += 1;
+                    continue;
+                };
+                let rows = eval_subquery(subs.get(*n)?, db, None, false)?;
+                // more than one row is a runtime error in the engine;
+                // refuse rather than pick one
+                if rows.values.len() != 1 {
+                    return None;
+                }
+                out.push(Tok::Cmp(*op));
+                out.push(value_to_tok(&rows.values[0])?);
+                i += 2;
+            }
+            // a subquery anywhere else (bare, or as an LHS) is unsupported
+            Tok::Subq(_) => return None,
+            other => {
+                out.push(other.clone());
+                i += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The OUTER column an inner query's correlation leaf names - the key a
+/// correlated EXISTS turns into a membership test against.
+fn correlated_outer_col(
+    sql: &str,
+    db: &Database,
+    outer_cols: &[RelationColumn],
+) -> Option<String> {
+    let (_, table_s, where_s, _, _, _) = split_query(sql)?;
+    let (from, _) = parse_from(table_s)?;
+    let columns = relation_columns(&db.bytes, db.page_size, from.table);
+    for p in split_top_and(&tokenize(where_s?)?) {
+        if let [Tok::Ident(a), Tok::Cmp(Cmp::Eq), Tok::Ident(b)] = p.as_slice() {
+            let name_of = |q: &str| q.rsplit('.').next().unwrap_or(q).to_string();
+            let (an, bn) = (name_of(a), name_of(b));
+            let inner = |n: &str| columns.iter().any(|c| c.name.eq_ignore_ascii_case(n));
+            let outer = |n: &str| outer_cols.iter().any(|c| c.name.eq_ignore_ascii_case(n));
+            if inner(&an) && !outer(&an) && outer(&bn) {
+                return Some(bn);
+            }
+            if inner(&bn) && !outer(&bn) && outer(&an) {
+                return Some(an);
+            }
+        }
+    }
+    None
+}
+
+/// Token equality, enough to de-duplicate an IN list.
+fn tok_eq(a: &Tok, b: &Tok) -> bool {
+    match (a, b) {
+        (Tok::Int(x), Tok::Int(y)) => x == y,
+        (Tok::Dec(x, sx), Tok::Dec(y, sy)) => x == y && sx == sy,
+        (Tok::Str(x), Tok::Str(y)) => x == y,
+        (Tok::Null, Tok::Null) => true,
+        _ => false,
+    }
+}
+
 fn split_query(
     sql: &str,
 ) -> Option<(&str, &str, Option<&str>, Option<&str>, Option<&str>, Option<&str>)> {
@@ -11196,6 +11739,7 @@ fn parse_order_by(
 }
 
 /// A WHERE/HAVING/VALUES token.
+#[derive(Clone)]
 enum Tok {
     Ident(String),
     Comma,
@@ -11218,6 +11762,15 @@ enum Tok {
     Like,
     Between,
     In,
+    /// `EXISTS` - always followed by a subquery
+    Exists,
+    /// a parenthesised subquery, lifted out of the WHERE text before
+    /// tokenizing and referenced by index into the lifted list
+    /// ([extract_subqueries]); it is REPLACED by ordinary tokens once
+    /// evaluated ([resolve_subqueries]), so no later stage sees one
+    Subq(usize),
+    /// a decided leaf - see [RawKind::Const]
+    Const(bool),
     Escape,
 }
 
@@ -11383,6 +11936,12 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                     "BETWEEN" => out.push(Tok::Between),
                     "IN" => out.push(Tok::In),
                     "ESCAPE" => out.push(Tok::Escape),
+                    "EXISTS" => out.push(Tok::Exists),
+                    // the placeholder [extract_subqueries] left behind
+                    _ if word.to_ascii_uppercase().starts_with(SUBQ_MARK) => {
+                        let n = word[SUBQ_MARK.len()..].parse::<usize>().ok()?;
+                        out.push(Tok::Subq(n));
+                    }
                     _ => out.push(Tok::Ident(word.to_string())),
                 }
             }
@@ -11411,6 +11970,12 @@ enum RawKind {
     IsNull,
     IsNotNull,
     Like(Rhs, Option<char>, bool),
+    /// A leaf whose truth is already decided and does not depend on the
+    /// row: what a subquery collapses to once it has been evaluated
+    /// (`EXISTS` over an uncorrelated inner query, or an `IN` whose
+    /// inner query returned no rows at all). It carries no column, so
+    /// every resolver answers it before looking at the LHS.
+    Const(bool),
 }
 
 /// The predicate syntax tree before normalization: OR/AND/NOT over
@@ -11480,6 +12045,16 @@ fn parse_unary(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
             }
             *pos += 1;
             Some(inner)
+        }
+        // a subquery already decided by [resolve_subqueries] - it carries
+        // no column, so it stands alone as a leaf
+        Some(Tok::Const(b)) => {
+            let b = *b;
+            *pos += 1;
+            Some(Ast::Leaf(RawTerm {
+                lhs: RawLhs::Col(String::new()),
+                kind: RawKind::Const(b),
+            }))
         }
         _ => parse_leaf(t, pos, np),
     }
@@ -11670,6 +12245,9 @@ fn negate_term(t: &RawTerm) -> Option<RawTerm> {
         RawKind::IsNull => RawKind::IsNotNull,
         RawKind::IsNotNull => RawKind::IsNull,
         RawKind::Like(p, e, negated) => RawKind::Like(p.clone(), *e, !negated),
+        // a decided leaf negates to the opposite decision - no
+        // three-valued subtlety, it is TRUE or FALSE, never UNKNOWN
+        RawKind::Const(b) => RawKind::Const(!b),
     };
     Some(RawTerm { lhs: t.lhs.clone(), kind })
 }
@@ -11738,6 +12316,9 @@ fn col_kind(d: &Descriptor) -> Option<ColKind> {
 /// themselves (HAVING does not, so a `?` there lands on the None).
 fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
     Some(match raw {
+        // the resolvers answer a decided subquery leaf before they get
+        // here; reaching this arm at all would mean one slipped past
+        RawKind::Const(b) => Term::Const(b),
         RawKind::Cmp(op, Rhs::Int(n)) => match kind {
             ColKind::Int => Term::Cmp(idx, op, Rhs::Int(n)),
             _ => return None,
@@ -11783,6 +12364,11 @@ fn resolve_predicate(
     for g in raw {
         let mut terms = Vec::new();
         for rt in g {
+            // a decided subquery leaf carries no column
+            if let RawKind::Const(b) = rt.kind {
+                terms.push(Term::Const(b));
+                continue;
+            }
             let RawLhs::Col(col) = &rt.lhs else {
                 return None; // an aggregate in WHERE is invalid SQL
             };
@@ -11819,6 +12405,7 @@ fn numeric_term(
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Term> {
     Some(match raw {
+        RawKind::Const(b) => Term::Const(b),
         RawKind::Cmp(op, Rhs::Int(n)) => Term::NumCmp(idx, op, Rhs::Num(n, 0)),
         RawKind::Cmp(op, Rhs::Num(r, s)) => Term::NumCmp(idx, op, Rhs::Num(r, s)),
         RawKind::Cmp(_, Rhs::Null) => Term::Never,
@@ -11894,6 +12481,10 @@ fn resolve_having(
     for g in raw {
         let mut terms = Vec::new();
         for rt in g {
+            if let RawKind::Const(b) = rt.kind {
+                terms.push(Term::Const(b));
+                continue;
+            }
             let (idx, kind) = match &rt.lhs {
                 RawLhs::Col(col) => {
                     let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(col))?;
