@@ -27,6 +27,8 @@
 set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
 ISQL="${ISQL:-isql}"
+GFIX="${GFIX:-gfix}"
+GBAK="${GBAK:-gbak}"
 PORT="${1:-4352}"
 U="${ISC_USER:-SYSDBA}"; P="${ISC_PASSWORD:-masterkey}"
 D=/tmp/fbhandson
@@ -83,6 +85,43 @@ CREATE PROCEDURE NULLCHK (A INTEGER) RETURNS (R INTEGER, W INTEGER) AS
 BEGIN
   R = A + 1;
   IF (A IS NULL) THEN W = 1; ELSE W = 0;
+END^
+CREATE PROCEDURE PUTROW (I INTEGER, V INTEGER) AS
+BEGIN
+  INSERT INTO T (ID, N) VALUES (:I, :V);
+END^
+CREATE PROCEDURE BUMP (I INTEGER, DELTA INTEGER) AS
+BEGIN
+  UPDATE T SET N = N + :DELTA WHERE ID = :I;
+END^
+CREATE PROCEDURE ZAP (I INTEGER) AS
+BEGIN
+  DELETE FROM T WHERE ID = :I;
+END^
+CREATE PROCEDURE FILLN (FROMID INTEGER, HOWMANY INTEGER) AS
+DECLARE VARIABLE K INTEGER;
+BEGIN
+  K = 0;
+  WHILE (K < HOWMANY) DO
+  BEGIN
+    INSERT INTO T (ID, N) VALUES (:FROMID + :K, :K * 10);
+    K = K + 1;
+  END
+END^
+CREATE PROCEDURE COND_WRITE (I INTEGER) AS
+BEGIN
+  IF (I > 0) THEN INSERT INTO T (ID, N) VALUES (:I, 1);
+  ELSE DELETE FROM T WHERE ID = 1;
+END^
+CREATE PROCEDURE DUPKEY (I INTEGER) AS
+BEGIN
+  INSERT INTO T (ID, N) VALUES (:I, 1);
+  INSERT INTO T (ID, N) VALUES (:I, 2);
+END^
+CREATE PROCEDURE SUSPENDER RETURNS (R INTEGER) AS
+BEGIN
+  R = 1;
+  SUSPEND;
 END^
 SET TERM ;^
 COMMIT;
@@ -168,32 +207,116 @@ case "$n" in
     *) echo "DIFF a NULL column rendered as [$n]"; fail=1 ;;
 esac
 
-# 3. an unsupported body must FAIL, not answer something invented. A
-#    procedure with DML in it is outside the interpreter.
-"$ISQL" -q -b -user "$U" -pas "$P" "$DB" >/dev/null 2>&1 <<'SQL'
-SET TERM ^;
-CREATE PROCEDURE HASDML (A INTEGER) RETURNS (R INTEGER) AS
-BEGIN
-  INSERT INTO T (ID, N) VALUES (:A, :A);
-  R = A;
-END^
-SET TERM ;^
-COMMIT;
-SQL
-out=$(printf 'SET HEADING OFF;\nEXECUTE PROCEDURE HASDML(50);\n' |
+# 3. a body this slice still does NOT interpret must FAIL, not answer
+#    something invented. SUSPEND (a selectable procedure) is the case.
+out=$(printf 'SET HEADING OFF;\nEXECUTE PROCEDURE SUSPENDER;\n' |
       "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
 case "$out" in
     *"Statement failed"*|*error*|*ERROR*)
-        echo "OK   teeth: a body with DML is refused, not half-run" ;;
-    *) echo "DIFF an unsupported body answered [$out] instead of failing"; fail=1 ;;
+        echo "OK   teeth: an uninterpreted body (SUSPEND) is refused" ;;
+    *) echo "DIFF an uninterpreted body answered [$out] instead of failing"; fail=1 ;;
 esac
-# ...and it must not have written the row it refused to run
-rows=$(printf 'SET HEADING OFF;\nSELECT COUNT(*) FROM T WHERE ID = 50;\n' |
-       "$ISQL" -q -user "$U" -pas "$P" "$DB" 2>&1 | tr -d ' \n')
-if [ "$rows" = "0" ]; then
-    echo "OK   teeth: the refused body wrote nothing"
+
+# --- DML INSIDE A BODY -------------------------------------------------
+# A body's write goes through the ordinary INSERT/UPDATE/DELETE planners,
+# so index maintenance, defaults, NOT NULL, CHECK and FK enforcement all
+# apply. The differential is the strongest one available: fire-crab
+# writes ITS OWN copy of the file, the engine applies the SAME procedure
+# calls to a reference copy, and then the ENGINE reads both back and the
+# tables must be identical - plus gfix must accept what fire-crab wrote.
+WORK=/tmp/fc-psql-work.fdb
+REF=/tmp/fc-psql-ref.fdb
+rm -f "$WORK" "$REF"; cp "$DB" "$WORK"; cp "$DB" "$REF"
+trap 'kill $srv 2>/dev/null; rm -f "$DB" "$WORK" "$REF" /tmp/fc-psql-work.fbk' EXIT
+
+# the same calls, one set through fire-crab, one through the engine
+CALLS="EXECUTE PROCEDURE PUTROW(10, 100);
+EXECUTE PROCEDURE PUTROW(11, 110);
+EXECUTE PROCEDURE ZAP(11);
+EXECUTE PROCEDURE FILLN(20, 4);
+EXECUTE PROCEDURE COND_WRITE(30);
+EXECUTE PROCEDURE COND_WRITE(-1);"
+# all of them down ONE connection, which is also the test that the
+# statement type is right: announcing SELECT for EXECUTE PROCEDURE made
+# a client open a cursor over it, and the next statement then desynced
+printf '%s\nCOMMIT;\n' "$CALLS" |
+    "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$WORK" >/tmp/fc-psql-fc.log 2>&1
+printf '%s\nCOMMIT;\n' "$CALLS" |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$REF" >/tmp/fc-psql-en.log 2>&1
+
+dump() { printf 'SET HEADING OFF;\nSELECT ID, COALESCE(N, -999) FROM T ORDER BY ID;\n' |
+         "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 | tr -s ' \n' ' '; }
+# the ENGINE reads both files - fire-crab's own write is what it parses
+ours=$(dump "$WORK"); theirs=$(dump "$REF")
+if [ "$ours" = "$theirs" ]; then
+    echo "OK   a body's INSERT/UPDATE/DELETE leave the engine the same table"
 else
-    echo "DIFF the refused body left $rows row(s) behind"; fail=1
+    echo "DIFF the tables differ"; echo "     engine-written: [$theirs]";
+    echo "     fc-written:     [$ours]"; fail=1
+fi
+# non-vacuity: the writes must actually have happened
+case "$ours" in
+    *"10 100"*) echo "OK   teeth: the body's INSERT landed (10 -> 100)" ;;
+    *) echo "DIFF expected id 10 to hold 100, got [$ours]"; fail=1 ;;
+esac
+case "$ours" in
+    *" 11 "*) echo "DIFF the body's DELETE did not remove id 11"; fail=1 ;;
+    *) echo "OK   teeth: the body's DELETE removed id 11" ;;
+esac
+case "$ours" in
+    *"20 0"*"21 10"*"22 20"*"23 30"*)
+        echo "OK   teeth: the WHILE loop inserted all four rows" ;;
+    *) echo "DIFF the loop's rows are wrong: [$ours]"; fail=1 ;;
+esac
+
+# the engine must find nothing wrong with the file fire-crab wrote
+val=$("$GFIX" -v -full -user "$U" -pas "$P" "$WORK" 2>&1 | tr -d ' \n')
+if [ -z "$val" ]; then
+    echo "OK   gfix -v -full accepts what the body wrote"
+else
+    echo "DIFF gfix on fc's file: $val"; fail=1
+fi
+if "$GBAK" -b -g -user "$U" -pas "$P" "$WORK" /tmp/fc-psql-work.fbk >/dev/null 2>&1; then
+    echo "OK   gbak walks what the body wrote"
+else
+    echo "DIFF gbak failed on fc's file"; fail=1
+fi
+
+# a failing statement mid-body stops it: the second INSERT duplicates the
+# primary key, so the call must fail
+out=$(printf 'EXECUTE PROCEDURE DUPKEY(77);\n' |
+      "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$WORK" 2>&1 | tr -s ' \n' ' ')
+case "$out" in
+    *"Statement failed"*|*error*|*ERROR*)
+        echo "OK   teeth: a duplicate key inside a body fails the call" ;;
+    *) echo "DIFF a duplicate key inside a body reported [$out]"; fail=1 ;;
+esac
+# and the engine still accepts the file afterwards
+val=$("$GFIX" -v -full -user "$U" -pas "$P" "$WORK" 2>&1 | tr -d ' \n')
+if [ -z "$val" ]; then
+    echo "OK   teeth: the file is still valid after the failed body"
+else
+    echo "DIFF gfix after the failed body: $val"; fail=1
+fi
+
+# A body whose UPDATE sets a column from an EXPRESSION OVER COLUMNS
+# (`SET N = N + :d`) is refused - not by the interpreter, but because
+# this server's UPDATE does not take a SET expression at all (plain
+# `UPDATE T SET N = N + 5` is refused the same way). It must fail rather
+# than write something else.
+out=$(printf 'EXECUTE PROCEDURE BUMP(10, 5);\n' |
+      "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$WORK" 2>&1 | tr -s ' \n' ' ')
+before=$(printf 'SET HEADING OFF;\nSELECT N FROM T WHERE ID = 10;\n' |
+         "$ISQL" -q -user "$U" -pas "$P" "$WORK" 2>&1 | tr -d ' \n')
+case "$out" in
+    *"Statement failed"*|*error*|*ERROR*)
+        echo "OK   teeth: a SET-from-expression body fails (fc's UPDATE limit)" ;;
+    *) echo "DIFF a SET-from-expression body reported [$out]"; fail=1 ;;
+esac
+if [ "$before" = "100" ]; then
+    echo "OK   teeth: the refused UPDATE changed nothing (still 100)"
+else
+    echo "DIFF the refused UPDATE left N = $before"; fail=1
 fi
 
 exit $fail

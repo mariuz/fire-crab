@@ -773,6 +773,15 @@ enum Plan {
         cols: Vec<ProjCol>,
         values: Vec<Value>,
     },
+    /// `EXECUTE PROCEDURE` before it has run: the body may WRITE (DML
+    /// inside it), so it executes at op_execute and is then replaced by
+    /// the `ProcCall` its output parameters make - the same deferral
+    /// `GenIdIncrement` uses for a generator-advancing SELECT.
+    ProcInvoke {
+        name: String,
+        args: Vec<Value>,
+        cols: Vec<ProjCol>,
+    },
     /// An `EXECUTE PROCEDURE` this server will not run - the procedure
     /// does not exist, or its body is outside the interpreted surface.
     /// It exists so the statement raises a SQL ERROR: falling back to
@@ -8383,17 +8392,6 @@ fn plan_query_inner(
         // slice takes literals only
         let args: Vec<Value> = pargs.into_iter().collect::<Option<Vec<_>>>()?;
         let meta = load_procedure(db, &pname)?;
-        let outs = meta.outs.len();
-        let values = match run_procedure(db, &pname, &args) {
-            Ok(v) => v,
-            Err(e) => {
-                if trace {
-                    eprintln!("[srv] plan: EXECUTE PROCEDURE refused: {}", e);
-                }
-                // a SQL error, NOT the fixed-answer fallback
-                return Some(Plan::ProcError);
-            }
-        };
         // one output column per declared output parameter, named after it
         let cols: Vec<ProjCol> = meta
             .outs
@@ -8410,12 +8408,8 @@ fn plan_query_inner(
                 expr: None,
             })
             .collect();
-        if outs == 0 {
-            // nothing to return: an EXECUTE PROCEDURE with no outputs is
-            // still a statement that ran, described as no columns
-            return Some(Plan::ProcCall { cols: Vec::new(), values: Vec::new() });
-        }
-        return Some(Plan::ProcCall { cols, values });
+        // the body runs at EXECUTE, not here: it may write
+        return Some(Plan::ProcInvoke { name: pname, args, cols });
     }
     let Some((proj_s, table_s, where_s, group_s, having_s, order_s)) = split_query(sql) else {
         if trace { eprintln!("[srv] plan: split_query failed for {:?}", sql); }
@@ -9246,7 +9240,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
     match plan {
         Plan::Scalar(_) | Plan::GenIdIncrement { .. } => describe_one_bigint(params),
         // the procedure's output parameters, described like a projection
-        Plan::ProcCall { cols, .. } => build_describe(cols, params),
+        Plan::ProcCall { cols, .. } | Plan::ProcInvoke { cols, .. } => build_describe(cols, params),
         Plan::ProcError => build_describe(&[], params),
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
@@ -9285,12 +9279,18 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
 /// The isc_info_sql_stmt_ type code for a plan.
 fn stmt_type_of(plan: &Plan) -> i32 {
     match plan {
+        // isc_info_sql_stmt_exec_procedure (8). Announcing SELECT here
+        // makes a client open a CURSOR over EXECUTE PROCEDURE, and one
+        // with no output parameters then has nothing to fetch - isql
+        // reports "request synchronization error" AFTER the body has
+        // already run. 8 makes it a singleton: op_execute2 carries the
+        // output message back, or plain op_execute when there is none.
+        Plan::ProcCall { .. } | Plan::ProcInvoke { .. } => 8,
         Plan::Scalar(_)
         | Plan::GenIdIncrement { .. }
         | Plan::Project { .. }
         | Plan::Join { .. }
         | Plan::Group { .. }
-        | Plan::ProcCall { .. }
         | Plan::ProcError
         | Plan::VirtualEmpty { .. } => 1,
         Plan::Insert { .. } => 2,
@@ -9354,7 +9354,7 @@ fn output_cols_of(plan: &Plan) -> Vec<ProjCol> {
             expr: None,
         }],
         Plan::VirtualEmpty { ncols } => (0..*ncols).map(bigint_col).collect(),
-        Plan::ProcCall { cols, .. } => cols.clone(),
+        Plan::ProcCall { cols, .. } | Plan::ProcInvoke { cols, .. } => cols.clone(),
         _ => Vec::new(),
     }
 }
@@ -9675,7 +9675,11 @@ fn emit_rows_inner(
         }
         // the refusal is raised as the fetch's error response, the same
         // way a mid-cursor evaluation error is
-        Plan::ProcError => return Err(EmitErr::Eval(EvalErr::ConversionError)),
+        // ProcInvoke is replaced at op_execute; reaching a fetch still
+        // holding one means the statement was never executed
+        Plan::ProcError | Plan::ProcInvoke { .. } => {
+            return Err(EmitErr::Eval(EvalErr::ConversionError))
+        }
         Plan::ProcCall { cols, values } => {
             // one row: the procedure's output parameters, already
             // computed. ProjCol.field_id is the index into `values`.
@@ -9864,6 +9868,14 @@ fn encode_row(w: &mut W, cols: &[ProjCol], values: &[Value]) -> Result<(), EvalE
         .map(|c| c.value_of(values))
         .collect::<Result<_, _>>()?;
     w.int(OP_FETCH_RESPONSE).int(0).int(1);
+    encode_row_body(w, cols, &vals);
+    Ok(())
+}
+
+/// The message itself - null bitmap then values - with no framing op in
+/// front. A fetch prefixes op_fetch_response; op_execute2's singleton
+/// reply prefixes op_sql_response instead.
+fn encode_row_body(w: &mut W, cols: &[ProjCol], vals: &[Value]) {
     let n = cols.len();
     let nbytes = n.div_ceil(8);
     let mut bitmap = vec![0u8; nbytes];
@@ -9876,7 +9888,7 @@ fn encode_row(w: &mut W, cols: &[ProjCol], values: &[Value]) -> Result<(), EvalE
     for _ in nbytes..nbytes.div_ceil(4) * 4 {
         w.raw(&[0u8]);
     }
-    for (c, v) in cols.iter().zip(&vals) {
+    for (c, v) in cols.iter().zip(vals.iter()) {
         let v = &*v;
         if matches!(v, Value::Null) {
             continue; // null: data omitted, the bitmap bit already set
@@ -9974,7 +9986,6 @@ fn encode_row(w: &mut W, cols: &[ProjCol], values: &[Value]) -> Result<(), EvalE
             }
         }
     }
-    Ok(())
 }
 
 /// The 8 wire bytes of a blob id: the on-disk bid layout (u16 relation
@@ -12555,6 +12566,9 @@ enum PsqlStop {
     /// a construct the interpreter does not implement; the statement
     /// fails whole rather than half-running
     Unsupported,
+    /// a statement inside the body failed (a constraint, a duplicate
+    /// key): the body stops there
+    Failed(String),
 }
 
 /// Evaluate a PSQL expression against the frame. Integer arithmetic,
@@ -12627,12 +12641,125 @@ fn eval_psql_cond(
     })
 }
 
+/// Which planner a body's DML statement belongs to.
+enum DmlKind {
+    Insert,
+    Update,
+    Delete,
+}
+
+/// Plan and execute one statement a body rendered. A statement the
+/// planners refuse, or a write that fails (a constraint, a duplicate
+/// key), stops the body - it never runs on and never reports success.
+fn run_body_dml(
+    sql: &str,
+    db: &mut Option<Database>,
+    ctx: &SessionCtx,
+    kind: DmlKind,
+) -> Result<(), PsqlStop> {
+    if std::env::var("FC_SRV_TRACE").is_ok() {
+        eprintln!("[srv] psql dml: {}", sql);
+    }
+    let planned = match kind {
+        DmlKind::Insert => plan_insert(sql, db),
+        DmlKind::Update => plan_update(sql, db),
+        DmlKind::Delete => plan_delete(sql, db),
+    };
+    let (plan, _params) = planned.ok_or(PsqlStop::Unsupported)?;
+    match execute_dml(&plan, db, &[], ctx) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                eprintln!("[srv] psql dml failed: {}", e);
+            }
+            Err(PsqlStop::Failed(e))
+        }
+    }
+}
+
+/// A value as the SQL literal that names it. Types this server cannot
+/// write as a literal refuse, so a DML statement is never built around
+/// an invented value.
+fn psql_literal(v: &Value) -> Option<String> {
+    Some(match v {
+        Value::Null => "NULL".to_string(),
+        Value::Int(n) => n.to_string(),
+        Value::Scaled(raw, scale) => {
+            // a scaled exact numeric prints with its decimals
+            let neg = *raw < 0;
+            let digits = raw.unsigned_abs().to_string();
+            let places = (-*scale) as usize;
+            let padded = format!("{:0>width$}", digits, width = places + 1);
+            let cut = padded.len() - places;
+            format!("{}{}.{}", if neg { "-" } else { "" }, &padded[..cut], &padded[cut..])
+        }
+        // '' doubles inside a SQL string literal
+        Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
+        Value::Bool(b) => (if *b { "TRUE" } else { "FALSE" }).to_string(),
+        _ => return None,
+    })
+}
+
+/// Render a body expression as SQL text: a variable becomes the literal
+/// it currently holds, a field reference stays a column name, so the
+/// statement can go through the ordinary INSERT/UPDATE/DELETE planners
+/// and pick up index maintenance, defaults, NOT NULL, CHECK and FK
+/// enforcement rather than a second, divergent write path.
+fn render_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Option<String> {
+    use fire_crab_ods::expr::Expr as E;
+    // FOLD FIRST: an expression with no field reference in it has a value
+    // right now, and one literal is something every planner accepts where
+    // an arithmetic expression may not. `VALUES (:FROM + :K)` becomes
+    // `VALUES (24)`, which is exactly what the interpreter would compute.
+    if let Ok(v) = eval_psql_expr(e, f) {
+        if let Some(lit) = psql_literal(&v) {
+            return Some(lit);
+        }
+    }
+    Some(match e {
+        E::IntLiteral(v) => v.to_string(),
+        E::Variable(n) => psql_literal(f.vars.get(*n as usize).unwrap_or(&Value::Null))?,
+        E::Field { name, .. } => name.clone(),
+        E::Add(a, b) => format!("({} + {})", render_psql_expr(a, f)?, render_psql_expr(b, f)?),
+        E::Subtract(a, b) => format!("({} - {})", render_psql_expr(a, f)?, render_psql_expr(b, f)?),
+        E::Multiply(a, b) => format!("({} * {})", render_psql_expr(a, f)?, render_psql_expr(b, f)?),
+        E::Divide(a, b) => format!("({} / {})", render_psql_expr(a, f)?, render_psql_expr(b, f)?),
+    })
+}
+
+/// Render a body condition as a SQL WHERE clause.
+fn render_psql_cond(c: &fire_crab_ods::expr::Cond, f: &PsqlFrame) -> Option<String> {
+    use fire_crab_ods::expr::{Cond as C, CmpOp};
+    Some(match c {
+        C::Cmp(op, l, r) => {
+            let sym = match op {
+                CmpOp::Eql => "=",
+                CmpOp::Neq => "<>",
+                CmpOp::Lss => "<",
+                CmpOp::Leq => "<=",
+                CmpOp::Gtr => ">",
+                CmpOp::Geq => ">=",
+            };
+            format!("{} {} {}", render_psql_expr(l, f)?, sym, render_psql_expr(r, f)?)
+        }
+        C::And(a, b) => format!("({} AND {})", render_psql_cond(a, f)?, render_psql_cond(b, f)?),
+        C::Or(a, b) => format!("({} OR {})", render_psql_cond(a, f)?, render_psql_cond(b, f)?),
+        C::Missing(e) => format!("{} IS NULL", render_psql_expr(e, f)?),
+        C::NotMissing(e) => format!("{} IS NOT NULL", render_psql_expr(e, f)?),
+        // NOT folds into the comparisons everywhere else this server
+        // builds a Cond; a surviving one is not worth guessing at
+        C::Not(_) => return None,
+    })
+}
+
 /// Run one statement of a body. A loop is bounded so a runaway WHILE
 /// cannot hang the connection.
 fn exec_psql_stmt(
     s: &TrigStmt,
     f: &mut PsqlFrame,
     steps: &mut u32,
+    db: &mut Option<Database>,
+    ctx: &SessionCtx,
 ) -> Result<(), PsqlStop> {
     *steps += 1;
     if *steps > 1_000_000 {
@@ -12656,16 +12783,16 @@ fn exec_psql_stmt(
         }
         TrigStmt::If { cond, then, otherwise, .. } => {
             if eval_psql_cond(cond, f)? == Some(true) {
-                exec_psql_stmt(then, f, steps)
+                exec_psql_stmt(then, f, steps, db, ctx)
             } else if let Some(e) = otherwise {
-                exec_psql_stmt(e, f, steps)
+                exec_psql_stmt(e, f, steps, db, ctx)
             } else {
                 Ok(())
             }
         }
         TrigStmt::While { cond, body, .. } => {
             while eval_psql_cond(cond, f)? == Some(true) {
-                exec_psql_stmt(body, f, steps)?;
+                exec_psql_stmt(body, f, steps, db, ctx)?;
                 *steps += 1;
                 if *steps > 1_000_000 {
                     return Err(PsqlStop::Unsupported);
@@ -12680,7 +12807,7 @@ fn exec_psql_stmt(
         TrigStmt::Block { stmts, handlers, .. } => {
             let mut run = || -> Result<(), PsqlStop> {
                 for st in stmts {
-                    exec_psql_stmt(st, f, steps)?;
+                    exec_psql_stmt(st, f, steps, db, ctx)?;
                 }
                 Ok(())
             };
@@ -12692,7 +12819,7 @@ fn exec_psql_stmt(
                     // the raise's identity compared against it
                     for (conds, body) in handlers {
                         if conds.is_empty() {
-                            return exec_psql_stmt(body, f, steps);
+                            return exec_psql_stmt(body, f, steps, db, ctx);
                         }
                     }
                     Err(PsqlStop::Raise(ex))
@@ -12700,8 +12827,52 @@ fn exec_psql_stmt(
                 Err(e) => Err(e),
             }
         }
-        // every other statement kind - DML, SUSPEND, cursors, nested
-        // calls - is outside this slice
+        // --- DML -----------------------------------------------------
+        // Rendered back to SQL with the frame's values substituted and
+        // run through the ORDINARY planners, so a body's write goes down
+        // exactly the path a client's INSERT/UPDATE/DELETE does: index
+        // maintenance, column defaults, NOT NULL, CHECK constraints and
+        // FK enforcement all apply, with no second write path to keep in
+        // step.
+        TrigStmt::Store { table, cols, exprs, .. } => {
+            if cols.len() != exprs.len() {
+                return Err(PsqlStop::Unsupported);
+            }
+            let vals = exprs
+                .iter()
+                .map(|e| render_psql_expr(e, f))
+                .collect::<Option<Vec<_>>>()
+                .ok_or(PsqlStop::Unsupported)?;
+            let sql = format!(
+                "INSERT INTO {} ({}) VALUES ({})",
+                table,
+                cols.join(", "),
+                vals.join(", ")
+            );
+            run_body_dml(&sql, db, ctx, DmlKind::Insert)
+        }
+        TrigStmt::Update { table, sets, wher, .. } => {
+            let assigns = sets
+                .iter()
+                .map(|(c, e)| render_psql_expr(e, f).map(|v| format!("{} = {}", c, v)))
+                .collect::<Option<Vec<_>>>()
+                .ok_or(PsqlStop::Unsupported)?;
+            let mut sql = format!("UPDATE {} SET {}", table, assigns.join(", "));
+            if let Some(c) = wher {
+                sql.push_str(" WHERE ");
+                sql.push_str(&render_psql_cond(c, f).ok_or(PsqlStop::Unsupported)?);
+            }
+            run_body_dml(&sql, db, ctx, DmlKind::Update)
+        }
+        TrigStmt::Delete { table, wher, .. } => {
+            let mut sql = format!("DELETE FROM {}", table);
+            if let Some(c) = wher {
+                sql.push_str(" WHERE ");
+                sql.push_str(&render_psql_cond(c, f).ok_or(PsqlStop::Unsupported)?);
+            }
+            run_body_dml(&sql, db, ctx, DmlKind::Delete)
+        }
+        // SUSPEND, cursors, FOR SELECT, EXECUTE STATEMENT, nested calls
         _ => Err(PsqlStop::Unsupported),
     }
 }
@@ -12713,10 +12884,12 @@ fn exec_psql_stmt(
 /// statement text, or bound `?` parameters). Errors carry the SQLSTATE
 /// the caller turns into an op_response.
 fn run_procedure(
-    db: &Database,
+    database: &mut Option<Database>,
     name: &str,
     args: &[Value],
+    ctx: &SessionCtx,
 ) -> Result<Vec<Value>, String> {
+    let db = database.as_ref().ok_or("no database attached")?;
     let meta = load_procedure(db, name)
         .ok_or_else(|| format!("procedure {} is not one this server can run", name))?;
     if args.len() != meta.ins.len() {
@@ -12749,9 +12922,10 @@ fn run_procedure(
     frame.vars.resize(names.len(), Value::Null);
 
     let mut steps = 0u32;
-    match exec_psql_stmt(&body, &mut frame, &mut steps) {
+    match exec_psql_stmt(&body, &mut frame, &mut steps, database, ctx) {
         Ok(()) => {}
         Err(PsqlStop::Raise(ex)) => return Err(format!("exception {}", ex)),
+        Err(PsqlStop::Failed(e)) => return Err(e),
         Err(PsqlStop::Unsupported) => {
             return Err(format!(
                 "procedure {} uses PSQL this server does not interpret",
@@ -13810,6 +13984,29 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
                     }
+                } else if matches!(plan, Plan::ProcInvoke { .. }) {
+                    // EXECUTE PROCEDURE runs HERE, because a body may
+                    // WRITE, and becomes the row its output parameters
+                    // make for the fetch
+                    let (pname, pargs, pcols) = match &plan {
+                        Plan::ProcInvoke { name, args, cols } => {
+                            (name.clone(), args.clone(), cols.clone())
+                        }
+                        _ => unreachable!(),
+                    };
+                    let ctx = SessionCtx { user, attach_id };
+                    match run_procedure(&mut database, &pname, &pargs, &ctx) {
+                        Ok(values) => {
+                            plan = Plan::ProcCall { cols: pcols, values };
+                            respond(&mut s, &mut enc, TX_HANDLE)?;
+                        }
+                        Err(e) => {
+                            if std::env::var("FC_SRV_TRACE").is_ok() {
+                                eprintln!("[srv] execute procedure failed: {}", e);
+                            }
+                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                        }
+                    }
                 } else if matches!(plan, Plan::GenIdIncrement { .. }) {
                     // a generator-incrementing SELECT writes HERE, then
                     // becomes the Scalar of its new value for the fetch
@@ -14191,10 +14388,54 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 if best >= 19 {
                     read_int(&mut s, &mut dec)?; // p_sqldata_inline_blob_size
                 }
-                if std::env::var("FC_SRV_TRACE").is_ok() {
-                    eprintln!("[srv] op_execute2 (singleton) - answering a SQL error");
+                // A singleton execute: EXECUTE PROCEDURE with output
+                // parameters comes here (the statement announces
+                // isc_info_sql_stmt_exec_procedure, so the client uses
+                // this rather than opening a cursor). Run the body, send
+                // the outputs as op_sql_response, then the op_response.
+                if matches!(plan, Plan::ProcInvoke { .. }) {
+                    let (pname, pargs, pcols) = match &plan {
+                        Plan::ProcInvoke { name, args, cols } => {
+                            (name.clone(), args.clone(), cols.clone())
+                        }
+                        _ => unreachable!(),
+                    };
+                    let ctx = SessionCtx { user, attach_id };
+                    match run_procedure(&mut database, &pname, &pargs, &ctx) {
+                        Ok(values) => {
+                            if std::env::var("FC_SRV_TRACE").is_ok() {
+                                eprintln!("[srv] op_execute2 {} -> {:?}", pname, values);
+                            }
+                            let mut w = W::default();
+                            if pcols.is_empty() {
+                                w.int(OP_SQL_RESPONSE).int(0); // no message
+                            } else {
+                                w.int(OP_SQL_RESPONSE).int(1);
+                                encode_row_body(&mut w, &pcols, &values);
+                            }
+                            // the op_response that closes the execute
+                            w.int(OP_RESPONSE)
+                                .int(TX_HANDLE)
+                                .int(0)
+                                .int(0)
+                                .int(0)
+                                .int(0);
+                            w.send(&mut s, &mut enc)?;
+                            plan = Plan::ProcCall { cols: pcols, values };
+                        }
+                        Err(e) => {
+                            if std::env::var("FC_SRV_TRACE").is_ok() {
+                                eprintln!("[srv] op_execute2 procedure failed: {}", e);
+                            }
+                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                        }
+                    }
+                } else {
+                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!("[srv] op_execute2 (singleton) - answering a SQL error");
+                    }
+                    respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                 }
-                respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
             }
             other => {
                 if std::env::var("FC_SRV_TRACE").is_ok() {
