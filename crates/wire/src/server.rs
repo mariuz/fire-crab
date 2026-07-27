@@ -6652,15 +6652,34 @@ fn build_insert_image(
     rel: u16,
     format_no: u8,
 ) -> Option<Vec<u8>> {
-    // record length = the end of the last stored field; a COMPUTED
-    // field's descriptor (offset 0, no storage) must not count or it
-    // would inflate a fresh table's images past the engine's layout
-    let stored_end = descs
-        .iter()
-        .filter(|d| !(d.offset == 0 && d.length != 0))
-        .map(|d| d.offset as usize + d.length as usize)
-        .max()?;
-    let len = sample_image_len(db, rel, format_no).unwrap_or((stored_end + 3) & !3);
+    // record length, exactly as met.epp:1071 derives fmt_length from the
+    // format blob:
+    //
+    //     if (odsDesc->dsc_offset)
+    //         format->fmt_length = odsDesc->dsc_offset + desc->dsc_length;
+    //
+    // the LAST descriptor with a nonzero offset wins, and there is NO
+    // trailing rounding. A COMPUTED field carries offset 0 and no
+    // storage, so it drops out on its own (a stored field cannot sit at
+    // offset 0 - the null-flag bytes are there).
+    //
+    // Rounding this up to a multiple of 4 used to make every image whose
+    // last field did not end on a 4-boundary ONE-TO-THREE BYTES too long
+    // (PT's trailing BOOLEAN: 55 -> 56). The engine tolerates that in a
+    // NOT_PACKED record, but the moment an UPDATE stores the same image
+    // RLE-packed, decompression runs past fmt_length and the engine
+    // BUGCHECKs - "decompression overran buffer (179), sqz.cpp:502" -
+    // and gfix reports record-level errors.
+    let mut stored_end = 0usize;
+    for d in descs.iter() {
+        if d.offset != 0 {
+            stored_end = d.offset as usize + d.length as usize;
+        }
+    }
+    if stored_end == 0 {
+        return None;
+    }
+    let len = sample_image_len(db, rel, format_no).unwrap_or(stored_end);
     if len < stored_end {
         return None;
     }

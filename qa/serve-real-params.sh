@@ -207,4 +207,53 @@ if "$GBAK" -b -g -user "$U" -pas "$P" "$WORK" /tmp/fc-params-work.fbk >/dev/null
 else
     echo "DIFF gbak backs the file up"; fail=1
 fi
+
+# --- phase 5: the RECORD IMAGE LENGTH itself ---------------------------
+# gfix above catches an over-long image only once an UPDATE stores it
+# PACKED (decompression then runs past fmt_length and the engine
+# BUGCHECKs 179, sqz.cpp:502). Compare the length directly against the
+# engine's own file, so a NOT_PACKED-only regression cannot hide: the
+# image must be exactly met.epp:1071's fmt_length - the last descriptor's
+# offset + length, with NO rounding. PT's last field is a BOOLEAN, so its
+# 55 bytes do not end on a 4-boundary; rounding up to 56 was the bug.
+if command -v python3 >/dev/null 2>&1; then
+    lens() { # <file> -> sorted unique unpacked image lengths of relation 128
+        python3 - "$1" <<'PYEOF'
+import sys, struct
+b = open(sys.argv[1], 'rb').read(); ps = 8192; out = set()
+def unrle(d):
+    o = 0; i = 0
+    while i < len(d):
+        c = struct.unpack_from('b', d, i)[0]; i += 1
+        if c >= 0: o += c; i += c
+        else:
+            n = -c
+            if c == -1: n = struct.unpack_from('<H', d, i)[0]; i += 2
+            elif c == -2: n = struct.unpack_from('<I', d, i)[0]; i += 4
+            o += n; i += 1
+    return o
+for p in range(len(b)//ps):
+    pg = b[p*ps:(p+1)*ps]
+    if pg[0] != 5 or struct.unpack_from('<H', pg, 20)[0] != 128: continue
+    for s in range(struct.unpack_from('<H', pg, 22)[0]):
+        off, ln = struct.unpack_from('<HH', pg, 24+s*4)
+        if ln == 0: continue
+        rh = pg[off:off+ln]
+        flags = struct.unpack_from('<H', rh, 10)[0]
+        data = rh[13:]
+        if flags & 1: continue                      # deleted stub, header only
+        out.add(len(data) if flags & 2048 else unrle(data))
+print(' '.join(str(x) for x in sorted(out)))
+PYEOF
+    }
+    fclen=$(lens "$WORK"); englen=$(lens "$REF")
+    check "record image length matches the engine's fmt_length" "$fclen" "$englen"
+    # non-vacuity: both sides must actually have found records
+    case "$fclen" in
+        "") echo "DIFF no records found to measure - the check is vacuous"; fail=1 ;;
+        *) echo "OK   teeth: measured real record images ($fclen bytes)" ;;
+    esac
+else
+    echo "SKIP python3 not found for the record-image-length check"
+fi
 exit $fail
