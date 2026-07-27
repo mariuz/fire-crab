@@ -782,6 +782,16 @@ enum Plan {
         args: Vec<Value>,
         cols: Vec<ProjCol>,
     },
+    /// `<select> UNION [ALL] <select> [...]` - each branch's rows are
+    /// collected and concatenated, then de-duplicated unless ALL. The
+    /// FIRST branch's columns name and type the result. `order_by` is an
+    /// output ordinal (zero-based) and its descending flag.
+    Union {
+        cols: Vec<ProjCol>,
+        branches: Vec<Plan>,
+        distinct: bool,
+        order_by: Option<(usize, bool)>,
+    },
     /// A statement this server will not answer, kept as a plan so it
     /// raises a SQL ERROR. Falling back to the fixed-answer plan would
     /// return 4242 - a wrong answer dressed as a result. Two uses so
@@ -8711,12 +8721,225 @@ fn expand_view(sql: &str, db: &Database) -> Option<String> {
     Some(out)
 }
 
+// ===================================================================
+// UNION / UNION ALL
+//
+// The engine compiles a set operation into an RSE union node whose
+// branches feed one stream. This server materialises instead: each
+// branch is planned on its own, its rows are collected, the lists are
+// concatenated, and a plain UNION then removes duplicates (UNION ALL
+// keeps them - the ALL is the whole difference).
+//
+// The FIRST branch names the result: its column names and types are what
+// the describe announces, exactly as the engine does. Every branch must
+// project the same NUMBER of columns; a mismatch is refused rather than
+// padded.
+//
+// Covered: two or more branches, each a single-table projection of
+// columns or expressions, each with its own optional WHERE, plus a
+// trailing ORDER BY on an output ordinal. Refused: an aggregate or
+// GROUP BY inside a branch, a join, a branch over a view, and ORDER BY
+// naming a column rather than an ordinal (the engine allows the name;
+// resolving it across branches with different names is not worth
+// guessing at).
+
+/// Split a query on TOP-LEVEL `UNION` keywords, returning each branch's
+/// text and whether the union is ALL (duplicates kept). None when there
+/// is no top-level UNION, or when the ALL-ness is inconsistent between
+/// separators - mixing them changes the answer and is not worth a guess.
+fn split_union(sql: &str) -> Option<(Vec<String>, bool)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = mask_literals(&s.to_ascii_uppercase());
+    // find depth-0 UNION keywords
+    let b: Vec<char> = up.chars().collect();
+    let mut depth = 0i32;
+    let mut cuts: Vec<(usize, usize, bool)> = Vec::new(); // (start, end, all)
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && up[i..].starts_with("UNION") {
+            let before_ok = i == 0 || !(b[i - 1].is_alphanumeric() || b[i - 1] == '_');
+            let after = i + "UNION".len();
+            let after_ok = after >= b.len() || !(b[after].is_alphanumeric() || b[after] == '_');
+            if before_ok && after_ok {
+                // an optional ALL follows
+                let mut j = after;
+                while j < b.len() && b[j].is_whitespace() {
+                    j += 1;
+                }
+                let is_all = up[j..].starts_with("ALL")
+                    && (j + 3 >= b.len() && true || !(b[j + 3].is_alphanumeric() || b[j + 3] == '_'));
+                let end = if is_all { j + 3 } else { after };
+                cuts.push((i, end, is_all));
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    if cuts.iter().any(|(_, _, a)| *a != cuts[0].2) {
+        return None; // UNION and UNION ALL mixed
+    }
+    let mut parts = Vec::new();
+    let mut at = 0usize;
+    for (start, end, _) in &cuts {
+        parts.push(s[at..*start].trim().to_string());
+        at = *end;
+    }
+    parts.push(s[at..].trim().to_string());
+    if parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    Some((parts, cuts[0].2))
+}
+
+/// Collect a planned branch's rows as PROJECTED values - one Value per
+/// output column, in output order. Only a single-table projection is
+/// supported (what a union branch is allowed to be here).
+fn branch_rows(
+    plan: &Plan,
+    db: &Database,
+    args: &[WireParam],
+) -> Option<Vec<Vec<Value>>> {
+    let Plan::Project { rel, formats, cols, filter, .. } = plan else {
+        return None;
+    };
+    let filter = bind_filter(filter, args).ok()?;
+    let mut out = Vec::new();
+    let mut bad = false;
+    for_each_record(db, *rel, formats, |values| {
+        if bad || !filter.as_ref().map_or(true, |p| p.matches(values)) {
+            return;
+        }
+        let mut row = Vec::with_capacity(cols.len());
+        for c in cols {
+            match c.value_of(values) {
+                Ok(v) => row.push(v),
+                Err(_) => {
+                    bad = true;
+                    return;
+                }
+            }
+        }
+        out.push(row);
+    });
+    if bad {
+        return None;
+    }
+    Some(out)
+}
+
+/// Two projected rows are the same row for UNION's set semantics -
+/// compared column by column, with NULL equal to NULL (a set operation
+/// treats them as the same value, unlike `= NULL` in a predicate).
+fn rows_equal(a: &[Value], b: &[Value]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|(x, y)| match (x, y) {
+            (Value::Null, Value::Null) => true,
+            (Value::Null, _) | (_, Value::Null) => false,
+            _ => value_cmp(x, y) == std::cmp::Ordering::Equal,
+        })
+}
+
+/// Plan `<select> UNION [ALL] <select> [...] [ORDER BY <n>]`.
+fn plan_union(
+    sql: &str,
+    db: &Option<Database>,
+    params: &mut Vec<Option<Descriptor>>,
+) -> Option<Plan> {
+    let (mut parts, all) = split_union(sql)?;
+    // a trailing ORDER BY belongs to the WHOLE union, not the last branch
+    let last = parts.pop()?;
+    let up = mask_literals(&last.to_ascii_uppercase());
+    let mut order_ordinal: Option<(usize, bool)> = None;
+    let last_body = match find_kw_by(&up, "ORDER") {
+        Some((kw, cols_at)) => {
+            let spec = last[cols_at..].trim();
+            let mut it = spec.split_whitespace();
+            let n: usize = it.next()?.parse().ok()?;
+            let desc = match it.next() {
+                None => false,
+                Some(w) if w.eq_ignore_ascii_case("DESC") => true,
+                Some(w) if w.eq_ignore_ascii_case("ASC") => false,
+                _ => return None,
+            };
+            if it.next().is_some() || n == 0 {
+                return None;
+            }
+            order_ordinal = Some((n - 1, desc));
+            last[..kw].trim().to_string()
+        }
+        None => last.clone(),
+    };
+    parts.push(last_body);
+
+    let mut branches: Vec<Plan> = Vec::new();
+    for p in &parts {
+        // a branch claims no parameter slots in this slice
+        let mut sink: Vec<Option<Descriptor>> = Vec::new();
+        let plan = plan_query_inner(p, db, &mut sink)?;
+        if !sink.is_empty() {
+            return None;
+        }
+        if !matches!(plan, Plan::Project { .. }) {
+            return None; // aggregate/group/join branch
+        }
+        branches.push(plan);
+    }
+    // the first branch names and types the result; every branch must be
+    // the same width
+    let first_cols = output_cols_of(branches.first()?);
+    if first_cols.is_empty() {
+        return None;
+    }
+    for b in &branches {
+        if output_cols_of(b).len() != first_cols.len() {
+            return None;
+        }
+    }
+    // the output columns read the already-projected row positionally
+    let cols: Vec<ProjCol> = first_cols
+        .iter()
+        .enumerate()
+        .map(|(i, c)| ProjCol { field_id: i, expr: None, ..c.clone() })
+        .collect();
+    if let Some((idx, _)) = order_ordinal {
+        if idx >= cols.len() {
+            return None;
+        }
+    }
+    params.clear();
+    Some(Plan::Union { cols, branches, distinct: !all, order_by: order_ordinal })
+}
+
 fn plan_query_inner(
     sql: &str,
     db: &Option<Database>,
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Plan> {
     let trace = std::env::var("FC_SRV_TRACE").is_ok();
+    // a top-level UNION splits into branches before anything else looks
+    // at the text (see UNION / UNION ALL)
+    if split_union(sql).is_some() {
+        match plan_union(sql, db, params) {
+            Some(p) => return Some(p),
+            None => {
+                if trace {
+                    eprintln!("[srv] plan: UNION shape not supported");
+                }
+                // a SQL error, not the fixed-answer fallback: 4242 in
+                // answer to a set operation is a wrong answer
+                return Some(Plan::Refused);
+            }
+        }
+    }
     // EXECUTE PROCEDURE is not a SELECT, but isql prepares and FETCHES
     // it like one, so it resolves to a plan here (see PSQL EXECUTION).
     if let Some((pname, pargs)) = parse_execute_procedure(sql) {
@@ -9602,6 +9825,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         Plan::Scalar(_) | Plan::GenIdIncrement { .. } => describe_one_bigint(params),
         // the procedure's output parameters, described like a projection
         Plan::ProcCall { cols, .. } | Plan::ProcInvoke { cols, .. } => build_describe(cols, params),
+        Plan::Union { cols, .. } => build_describe(cols, params),
         Plan::Refused => build_describe(&[], params),
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
@@ -9647,6 +9871,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         // already run. 8 makes it a singleton: op_execute2 carries the
         // output message back, or plain op_execute when there is none.
         Plan::ProcCall { .. } | Plan::ProcInvoke { .. } => 8,
+        Plan::Union { .. } => 1,
         Plan::Scalar(_)
         | Plan::GenIdIncrement { .. }
         | Plan::Project { .. }
@@ -9716,6 +9941,7 @@ fn output_cols_of(plan: &Plan) -> Vec<ProjCol> {
         }],
         Plan::VirtualEmpty { ncols } => (0..*ncols).map(bigint_col).collect(),
         Plan::ProcCall { cols, .. } | Plan::ProcInvoke { cols, .. } => cols.clone(),
+        Plan::Union { cols, .. } => cols.clone(),
         _ => Vec::new(),
     }
 }
@@ -10040,6 +10266,42 @@ fn emit_rows_inner(
         // holding one means the statement was never executed
         Plan::Refused | Plan::ProcInvoke { .. } => {
             return Err(EmitErr::Eval(EvalErr::ConversionError))
+        }
+        Plan::Union { cols, branches, distinct, order_by } => {
+            if let Some(db) = db {
+                let mut rows: Vec<Vec<Value>> = Vec::new();
+                for b in branches {
+                    match branch_rows(b, db, args) {
+                        Some(mut r) => rows.append(&mut r),
+                        None => return Err(EmitErr::Eval(EvalErr::ConversionError)),
+                    }
+                }
+                // UNION removes duplicates; UNION ALL is the whole
+                // difference and keeps them. Comparison is on the whole
+                // projected row, NULLs included - two all-NULL rows are
+                // duplicates of each other here (SQL's set semantics),
+                // unlike `= NULL` in a predicate.
+                if *distinct {
+                    let mut seen: Vec<Vec<Value>> = Vec::new();
+                    rows.retain(|r| {
+                        if seen.iter().any(|s| rows_equal(s, r)) {
+                            false
+                        } else {
+                            seen.push(r.clone());
+                            true
+                        }
+                    });
+                }
+                if let Some((idx, desc)) = order_by {
+                    rows.sort_by(|a, b| {
+                        let o = value_cmp(&a[*idx], &b[*idx]);
+                        if *desc { o.reverse() } else { o }
+                    });
+                }
+                for r in &rows {
+                    encode_row(w, cols, r)?;
+                }
+            }
         }
         Plan::ProcCall { cols, values } => {
             // one row: the procedure's output parameters, already
