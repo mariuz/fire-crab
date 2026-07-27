@@ -100,6 +100,85 @@ same "rollback with nothing to undo" "ROLLBACK;"
 same "an UPDATE with a SET expression, undone" "UPDATE T SET A = A + 5;
 ROLLBACK;"
 
+# --- SAVEPOINTS --------------------------------------------------------
+# A savepoint marks a point inside the transaction. ROLLBACK TO undoes
+# the work after the mark and KEEPS the mark; RELEASE forgets the mark
+# and keeps the work. Both discard the marks made after the named one.
+#
+# These announce isc_info_sql_stmt_savepoint (14). The code is not
+# cosmetic: a client DISPATCHES on the statement type, and announcing 6
+# (get_segment) made isql abandon the statement and issue a real
+# op_rollback, silently throwing the whole transaction away.
+same "ROLLBACK TO a savepoint"     "INSERT INTO T VALUES (3, 30, 'z');
+SAVEPOINT SP1;
+INSERT INTO T VALUES (4, 40, 'w');
+ROLLBACK TO SP1;
+COMMIT;"
+same "RELEASE keeps the work"      "INSERT INTO T VALUES (3, 30, 'z');
+SAVEPOINT SP1;
+INSERT INTO T VALUES (4, 40, 'w');
+RELEASE SAVEPOINT SP1;
+COMMIT;"
+same "ROLLBACK TO SAVEPOINT spelled out" "INSERT INTO T VALUES (3, 30, 'z');
+SAVEPOINT SP1;
+INSERT INTO T VALUES (4, 40, 'w');
+ROLLBACK TO SAVEPOINT SP1;
+COMMIT;"
+same "nested marks, undo to the outer" "SAVEPOINT A;
+INSERT INTO T VALUES (3, 30, 'z');
+SAVEPOINT B;
+INSERT INTO T VALUES (4, 40, 'w');
+ROLLBACK TO A;
+COMMIT;"
+same "nested marks, undo to the inner" "SAVEPOINT A;
+INSERT INTO T VALUES (3, 30, 'z');
+SAVEPOINT B;
+INSERT INTO T VALUES (4, 40, 'w');
+ROLLBACK TO B;
+COMMIT;"
+same "the mark survives its own rollback" "INSERT INTO T VALUES (3, 30, 'z');
+SAVEPOINT S;
+INSERT INTO T VALUES (4, 40, 'w');
+ROLLBACK TO S;
+INSERT INTO T VALUES (5, 50, 'v');
+ROLLBACK TO S;
+COMMIT;"
+same "work after rolling back to a mark" "INSERT INTO T VALUES (3, 30, 'z');
+SAVEPOINT S;
+INSERT INTO T VALUES (4, 40, 'w');
+ROLLBACK TO S;
+INSERT INTO T VALUES (5, 50, 'v');
+COMMIT;"
+same "a full ROLLBACK beats every mark" "INSERT INTO T VALUES (3, 30, 'z');
+SAVEPOINT S;
+INSERT INTO T VALUES (4, 40, 'w');
+ROLLBACK;"
+same "re-using a name re-marks"    "INSERT INTO T VALUES (3, 30, 'z');
+SAVEPOINT S;
+INSERT INTO T VALUES (4, 40, 'w');
+SAVEPOINT S;
+INSERT INTO T VALUES (5, 50, 'v');
+ROLLBACK TO S;
+COMMIT;"
+same "a mark around an UPDATE"     "SAVEPOINT S;
+UPDATE T SET A = 99;
+ROLLBACK TO S;
+COMMIT;"
+same "a mark around a DELETE"      "SAVEPOINT S;
+DELETE FROM T;
+ROLLBACK TO S;
+COMMIT;"
+
+# rolling back to a mark that was never set must FAIL, not silently do
+# nothing or undo the whole transaction
+out=$(printf 'INSERT INTO T VALUES (3, 30, %s);\nROLLBACK TO NOSUCH;\n' "'z'" |
+      "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$W" 2>&1 | tr -s ' \n' ' ')
+case "$out" in
+    *"Statement failed"*|*error*|*ERROR*)
+        echo "OK   teeth: rolling back to an unknown savepoint fails" ;;
+    *) echo "DIFF an unknown savepoint reported [$out]"; fail=1 ;;
+esac
+
 # --- teeth -------------------------------------------------------------
 # 1. the rollback must really undo: without it the row would be there
 rm -f "$W"; cp "$SRC" "$W"

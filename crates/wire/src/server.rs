@@ -759,6 +759,17 @@ impl ProjCol {
 /// side's values with NULLs, and the WHERE filter runs on the PADDED
 /// row (SQL's order: join first, then filter - which is what makes
 /// `WHERE right.col IS NULL` the classic anti-join).
+/// What a savepoint statement does.
+#[derive(Clone, Copy, PartialEq)]
+enum SavepointOp {
+    /// mark this point (re-using a name replaces the old mark)
+    Set,
+    /// undo everything since the mark, KEEPING the mark
+    RollbackTo,
+    /// forget the mark (and every mark after it); the work stays
+    Release,
+}
+
 enum Plan {
     Scalar(Option<i64>),
     /// `EXECUTE PROCEDURE <name> [(args)]` - the procedure's OUTPUT
@@ -799,6 +810,13 @@ enum Plan {
     /// 31 on the wire at all), so transaction control has to be a plan.
     TxControl {
         rollback: bool,
+    },
+    /// `SAVEPOINT <n>` / `ROLLBACK TO [SAVEPOINT] <n>` / `RELEASE
+    /// SAVEPOINT <n>`. Like COMMIT/ROLLBACK these arrive as PREPARED
+    /// STATEMENTS, never as a wire op.
+    Savepoint {
+        kind: SavepointOp,
+        name: String,
     },
     /// `INSERT INTO <t> [(cols)] SELECT ...` - a write fed by a query.
     /// The query is planned by the ORDINARY planner at execute, its rows
@@ -9165,7 +9183,46 @@ fn plan_query_inner(
         // transaction open and is not this slice
         if !up.contains("RETAIN") {
             if find_word(&up, "ROLLBACK", 0) == Some(0) {
+                // ROLLBACK TO [SAVEPOINT] <name> before plain ROLLBACK
+                if let Some(to) = find_word(&up, "TO", "ROLLBACK".len()) {
+                    let rest = up[to + "TO".len()..].trim();
+                    let name = rest.strip_prefix("SAVEPOINT").unwrap_or(rest).trim();
+                    if trace {
+                        eprintln!("[srv] plan: ROLLBACK TO {:?}", name);
+                    }
+                    if ident_ok(name) {
+                        return Some(Plan::Savepoint {
+                            kind: SavepointOp::RollbackTo,
+                            name: name.to_string(),
+                        });
+                    }
+                    return Some(Plan::Refused);
+                }
                 return Some(Plan::TxControl { rollback: true });
+            }
+            if find_word(&up, "SAVEPOINT", 0) == Some(0) {
+                let name = up["SAVEPOINT".len()..].trim();
+                if trace {
+                    eprintln!("[srv] plan: SAVEPOINT {:?} ident_ok={}", name, ident_ok(name));
+                }
+                if ident_ok(name) {
+                    return Some(Plan::Savepoint {
+                        kind: SavepointOp::Set,
+                        name: name.to_string(),
+                    });
+                }
+                return Some(Plan::Refused);
+            }
+            if find_word(&up, "RELEASE", 0) == Some(0) {
+                let rest = up["RELEASE".len()..].trim();
+                let name = rest.strip_prefix("SAVEPOINT").unwrap_or(rest).trim();
+                if ident_ok(name) {
+                    return Some(Plan::Savepoint {
+                        kind: SavepointOp::Release,
+                        name: name.to_string(),
+                    });
+                }
+                return Some(Plan::Refused);
             }
             if find_word(&up, "COMMIT", 0) == Some(0) {
                 return Some(Plan::TxControl { rollback: false });
@@ -10174,7 +10231,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         Plan::SetGenerator { stmt_type, .. } => describe_dml(*stmt_type, params),
         Plan::InsertSelect { .. } => describe_dml(2, params), // isc_info_sql_stmt_insert
         // isc_info_sql_stmt_commit (?) - no columns either way
-        Plan::TxControl { .. } => build_describe(&[], params),
+        Plan::TxControl { .. } | Plan::Savepoint { .. } => build_describe(&[], params),
     }
 }
 
@@ -10190,7 +10247,13 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         Plan::ProcCall { .. } | Plan::ProcInvoke { .. } => 8,
         Plan::InsertSelect { .. } => 2, // isc_info_sql_stmt_insert
         // isc_info_sql_stmt_commit = 5, rollback = 6
-        Plan::TxControl { rollback } => if *rollback { 6 } else { 5 },
+        // inf_pub.h:524-527 - commit 10, rollback 11, savepoint 14.
+        // Getting these wrong is not cosmetic: a client DISPATCHES on the
+        // statement type. Announcing 6 (get_segment) for a savepoint made
+        // isql abandon the statement and issue a real op_rollback, which
+        // silently threw the whole transaction away.
+        Plan::TxControl { rollback } => if *rollback { 11 } else { 10 },
+        Plan::Savepoint { .. } => 14,
         Plan::Union { .. } | Plan::ProcSelect { .. } | Plan::ProcRows { .. } => 1,
         Plan::Scalar(_)
         | Plan::GenIdIncrement { .. }
@@ -10548,6 +10611,7 @@ fn emit_rows_inner(
         // GenIdIncrement is replaced by a Scalar at op_execute, so it never
         // reaches fetch as itself; the arm keeps the match exhaustive.
         Plan::TxControl { .. }
+        | Plan::Savepoint { .. }
         | Plan::InsertSelect { .. }
         | Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
         | Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
@@ -14670,6 +14734,11 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // One clone per transaction - the same cost model statement-level
     // rollback already runs on.
     let mut tx_snapshot: Option<Vec<u8>> = None;
+    // Named marks inside the transaction, oldest first: the image as it
+    // stood when each mark was made. ROLLBACK TO puts that image back and
+    // KEEPS the mark; RELEASE forgets the mark but keeps the work. Both
+    // discard the marks made AFTER the named one.
+    let mut savepoints: Vec<(String, Vec<u8>)> = Vec::new();
     let mut stmts: std::collections::HashMap<i32, StmtSlot> = std::collections::HashMap::new();
     let mut cur_stmt: i32 = 3;
     // handles run 3, 4, 5, ... - starting at 3 keeps the first one the
@@ -14925,6 +14994,9 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     read_int(&mut s, &mut dec)?; // p_sqlst_flags (FB6/proto 20+)
                 }
                 stmt_sql = String::from_utf8_lossy(&sql).into_owned();
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] prepare sql = {:?}", stmt_sql);
+                }
                 last_dml = (0, 0, 0);
                 bound_args.clear();
                 let up = stmt_sql.trim_start().to_ascii_uppercase();
@@ -15075,6 +15147,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     Plan::Insert { .. }
                         | Plan::InsertSelect { .. }
                         | Plan::TxControl { .. }
+                        | Plan::Savepoint { .. }
                         | Plan::Update { .. }
                         | Plan::Delete { .. }
                         | Plan::CreateTable { .. }
@@ -15125,7 +15198,50 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     // path so defaults, NOT NULL, CHECK, FK and index
                     // maintenance all apply. Done here rather than inside
                     // execute_dml because each row re-enters it.
-                    if let Plan::TxControl { rollback } = &plan {
+                    if let Plan::Savepoint { kind, name } = &plan {
+                        let pos = savepoints.iter().position(|(n, _)| n.eq_ignore_ascii_case(name));
+                        if std::env::var("FC_SRV_TRACE").is_ok() {
+                            eprintln!("[srv] savepoint op on {:?}, known={:?}", name, pos);
+                        }
+                        let ok = match kind {
+                            SavepointOp::Set => {
+                                if let Some(i) = pos {
+                                    savepoints.remove(i);
+                                }
+                                match snapshot_db(&database) {
+                                    Some(img) => {
+                                        savepoints.push((name.clone(), img));
+                                        true
+                                    }
+                                    None => false,
+                                }
+                            }
+                            SavepointOp::RollbackTo => match pos {
+                                Some(i) => {
+                                    let img = savepoints[i].1.clone();
+                                    savepoints.truncate(i + 1);
+                                    restore_db(&mut database, Some(img));
+                                    true
+                                }
+                                None => false,
+                            },
+                            SavepointOp::Release => match pos {
+                                Some(i) => {
+                                    savepoints.truncate(i);
+                                    true
+                                }
+                                None => false,
+                            },
+                        };
+                        last_dml = (0, 0, 0);
+                        if ok {
+                            respond(&mut s, &mut enc, TX_HANDLE)?;
+                        } else {
+                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                        }
+                    } else if let Plan::TxControl { rollback } = &plan {
+                        // ending the transaction discards every mark
+                        savepoints.clear();
                         if *rollback {
                             let snap = tx_snapshot.take();
                             let undone = snap.is_some();
