@@ -761,6 +761,24 @@ impl ProjCol {
 /// `WHERE right.col IS NULL` the classic anti-join).
 enum Plan {
     Scalar(Option<i64>),
+    /// `EXECUTE PROCEDURE <name> [(args)]` - the procedure's OUTPUT
+    /// parameters as one row. isql prepares this like any other
+    /// statement and then FETCHES it (probed: op_prepare, op_execute,
+    /// op_fetch), so it is a plan rather than an op_execute2 special
+    /// case. See the PSQL EXECUTION comment: every body this slice
+    /// interprets is side-effect free, so it runs at prepare; the moment
+    /// DML inside a body lands, this must move to execute like
+    /// GenIdIncrement does.
+    ProcCall {
+        cols: Vec<ProjCol>,
+        values: Vec<Value>,
+    },
+    /// An `EXECUTE PROCEDURE` this server will not run - the procedure
+    /// does not exist, or its body is outside the interpreted surface.
+    /// It exists so the statement raises a SQL ERROR: falling back to
+    /// the fixed-answer plan would answer 4242 for a procedure call,
+    /// which is a wrong answer rather than a refusal.
+    ProcError,
     /// `SELECT GEN_ID(<name>, <step>)` with a non-zero step, or `NEXT VALUE
     /// FOR <seq>` (step = the sequence's increment): a SELECT that WRITES.
     /// At op_execute it reads the generator, adds the step, writes the new
@@ -1425,6 +1443,22 @@ fn like_match(value: &str, pattern: &str, escape: Option<char>) -> bool {
 /// stored descriptor - mirroring the types the engine itself describes
 /// (SQL type codes from sqlda_pub.h). Text and anything without a native
 /// mapping (blobs, INT128, DECFLOAT) is rendered and sent as SQL_VARYING.
+/// THE LOW BIT OF sql_type IS "NULLABLE" (the engine's SQL_x + 1 forms).
+/// A client reads it to decide whether a value can be absent, and
+/// libfbclient IGNORES the row's null indicator for a column announced
+/// NOT NULL - it renders the raw buffer instead, so every NULL this
+/// server returned came out of isql as 0 (or blanks). Output columns are
+/// therefore announced NULLABLE: this server cannot prove a column never
+/// holds NULL, and the announcement costs a client one indicator byte.
+///
+/// This applies to RESULT columns only. The BIND section (input `?`
+/// parameters) keeps the plain even form, because a nullable parameter
+/// changes what the client SENDS - it would add an indicator to every
+/// parameter message, which the message decoder here does not expect.
+fn nullable(sql_type: i32) -> i32 {
+    sql_type | 1
+}
+
 fn wire_for(d: &Descriptor) -> (Wire, i32, i32, i32, i32) {
     let scale = d.scale as i32;
     match d.dtype {
@@ -2254,16 +2288,20 @@ fn build_expr_col(
     // around an INT64-ranked one. The scale is computed statically from
     // the operand scales, and `eval` produces exactly that scale so the
     // decode matches.
+    // every announcement here is NULLABLE (the odd form): an expression
+    // over a nullable column is itself nullable, and libfbclient renders
+    // the raw buffer instead of <null> for a NOT NULL announcement - see
+    // [nullable]
     let num_form = |scale: i32| {
         if e.is_wide(descs) {
-            (Wire::Int128, 32752, 16, scale)
+            (Wire::Int128, nullable(32752), 16, scale)
         } else {
-            (Wire::Int64, 580, 8, scale)
+            (Wire::Int64, nullable(580), 8, scale)
         }
     };
     let (wire, sql_type, length, scale) = match e.type_of(descs)? {
         ExprType::Int => num_form(0),
-        ExprType::Text => (Wire::Varying, 448, 32765, 0),
+        ExprType::Text => (Wire::Varying, nullable(448), 32765, 0),
         ExprType::Numeric => num_form(e.result_scale(descs)? as i32),
     };
     Some(ProjCol {
@@ -2311,7 +2349,7 @@ fn build_projcols(
             name: rc.name.clone(),
             field_id: rc.field_id as usize,
             wire,
-            sql_type,
+            sql_type: nullable(sql_type),
             length,
             scale,
             sub_type,
@@ -8253,7 +8291,7 @@ fn plan_join(
                         name: rc.name.clone(),
                         field_id: side.offset + rc.field_id as usize,
                         wire,
-                        sql_type,
+                        sql_type: nullable(sql_type),
                         length,
                         scale,
                         sub_type,
@@ -8273,7 +8311,7 @@ fn plan_join(
                     name: colname.to_string(),
                     field_id: idx,
                     wire,
-                    sql_type,
+                    sql_type: nullable(sql_type),
                     length,
                     scale,
                     sub_type,
@@ -8337,6 +8375,48 @@ fn plan_query_inner(
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Plan> {
     let trace = std::env::var("FC_SRV_TRACE").is_ok();
+    // EXECUTE PROCEDURE is not a SELECT, but isql prepares and FETCHES
+    // it like one, so it resolves to a plan here (see PSQL EXECUTION).
+    if let Some((pname, pargs)) = parse_execute_procedure(sql) {
+        let db = db.as_ref()?;
+        // a `?` argument would have to arrive with op_execute; this
+        // slice takes literals only
+        let args: Vec<Value> = pargs.into_iter().collect::<Option<Vec<_>>>()?;
+        let meta = load_procedure(db, &pname)?;
+        let outs = meta.outs.len();
+        let values = match run_procedure(db, &pname, &args) {
+            Ok(v) => v,
+            Err(e) => {
+                if trace {
+                    eprintln!("[srv] plan: EXECUTE PROCEDURE refused: {}", e);
+                }
+                // a SQL error, NOT the fixed-answer fallback
+                return Some(Plan::ProcError);
+            }
+        };
+        // one output column per declared output parameter, named after it
+        let cols: Vec<ProjCol> = meta
+            .outs
+            .iter()
+            .enumerate()
+            .map(|(i, p)| ProjCol {
+                name: p.name.clone(),
+                field_id: i,
+                wire: Wire::Int64,
+                sql_type: 581, // nullable - see wire_for
+                length: 8,
+                scale: 0,
+                sub_type: 0,
+                expr: None,
+            })
+            .collect();
+        if outs == 0 {
+            // nothing to return: an EXECUTE PROCEDURE with no outputs is
+            // still a statement that ran, described as no columns
+            return Some(Plan::ProcCall { cols: Vec::new(), values: Vec::new() });
+        }
+        return Some(Plan::ProcCall { cols, values });
+    }
     let Some((proj_s, table_s, where_s, group_s, having_s, order_s)) = split_query(sql) else {
         if trace { eprintln!("[srv] plan: split_query failed for {:?}", sql); }
         return None;
@@ -8586,7 +8666,7 @@ fn plan_query_inner(
                             name: alias.clone(),
                             field_id: value_index,
                             wire: Wire::Int64,
-                            sql_type: 580, // SQL_INT64 (BIGINT)
+                            sql_type: 581, // SQL_INT64 (BIGINT)
                             length: 8,
                             scale: 0,
                             sub_type: 0,
@@ -8694,7 +8774,7 @@ fn plan_group(
                     name: rc.name.clone(),
                     field_id: out_idx,
                     wire,
-                    sql_type,
+                    sql_type: nullable(sql_type),
                     length,
                     scale,
                     sub_type,
@@ -8732,7 +8812,7 @@ fn plan_group(
                     name: name.to_string(),
                     field_id: out_idx,
                     wire: Wire::Int64,
-                    sql_type: 580,
+                    sql_type: 581,
                     length: 8,
                     scale: 0,
                     sub_type: 0,
@@ -9165,6 +9245,9 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Vec<Value> {
 fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
     match plan {
         Plan::Scalar(_) | Plan::GenIdIncrement { .. } => describe_one_bigint(params),
+        // the procedure's output parameters, described like a projection
+        Plan::ProcCall { cols, .. } => build_describe(cols, params),
+        Plan::ProcError => build_describe(&[], params),
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
@@ -9207,6 +9290,8 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::Project { .. }
         | Plan::Join { .. }
         | Plan::Group { .. }
+        | Plan::ProcCall { .. }
+        | Plan::ProcError
         | Plan::VirtualEmpty { .. } => 1,
         Plan::Insert { .. } => 2,
         Plan::Update { .. } => 3,
@@ -9243,7 +9328,7 @@ fn bigint_col(n: usize) -> ProjCol {
         name: format!("C{}", n),
         field_id: n,
         wire: Wire::Int64,
-        sql_type: 580,
+        sql_type: 581, // nullable - see wire_for
         length: 8,
         scale: 0,
         sub_type: 0,
@@ -9262,13 +9347,14 @@ fn output_cols_of(plan: &Plan) -> Vec<ProjCol> {
             name: "CONSTANT".into(),
             field_id: 0,
             wire: Wire::Int64,
-            sql_type: 580,
+            sql_type: 581,
             length: 8,
             scale: 0,
             sub_type: 0,
             expr: None,
         }],
         Plan::VirtualEmpty { ncols } => (0..*ncols).map(bigint_col).collect(),
+        Plan::ProcCall { cols, .. } => cols.clone(),
         _ => Vec::new(),
     }
 }
@@ -9585,6 +9671,17 @@ fn emit_rows_inner(
                 None => {
                     w.raw(&[1u8, 0, 0, 0]); // null bitmap: col 0 is NULL, no data
                 }
+            }
+        }
+        // the refusal is raised as the fetch's error response, the same
+        // way a mid-cursor evaluation error is
+        Plan::ProcError => return Err(EmitErr::Eval(EvalErr::ConversionError)),
+        Plan::ProcCall { cols, values } => {
+            // one row: the procedure's output parameters, already
+            // computed. ProjCol.field_id is the index into `values`.
+            // encode_row writes its own op_fetch_response header.
+            if encode_row(w, cols, values).is_err() {
+                return Err(EmitErr::Eval(EvalErr::ConversionError));
             }
         }
         Plan::VirtualEmpty { ncols } => {
@@ -12299,6 +12396,443 @@ enum ColKind {
     /// keep their narrower classification)
     Numeric,
 }
+// ===================================================================
+// PSQL EXECUTION
+//
+// The engine compiles a procedure body to BLR at CREATE time, stores it
+// in RDB$PROCEDURES.RDB$PROCEDURE_BLR, and its PSQL virtual machine
+// (exe.cpp) walks that BLR. fire-crab goes the other way: it reads the
+// procedure's SOURCE TEXT - RDB$PROCEDURE_SOURCE, which the engine
+// stores alongside the BLR and which holds exactly the `BEGIN ... END`
+// body - reuses the PSQL PARSER the trigger compiler already has, and
+// INTERPRETS the resulting statement tree.
+//
+// Reading the source rather than the BLR is what makes this work on
+// procedures fire-crab did not create: a firebird-qa test builds its
+// procedures with isql (the engine) in its init script, and the source
+// is right there in the catalog.
+//
+// Covered: input parameters, output parameters, `<var> = <expr>`,
+// IF/THEN/ELSE, WHILE, EXCEPTION, and nested BEGIN..END blocks - over
+// integer arithmetic, which is what `Expr`/`Cond` carry.
+//
+// NOT covered, and refused rather than half-run: DML inside a body
+// (INSERT/UPDATE/DELETE - they need the page-write path and a
+// transaction of their own), SUSPEND and selectable procedures, cursors,
+// FOR SELECT, EXECUTE STATEMENT, calling another procedure, and
+// non-integer parameter types. A refusal is an SQL error, never a
+// partly-executed body.
+
+/// One procedure parameter: its name (what the body refers to) and the
+/// descriptor its declared domain resolves to.
+struct ProcParam {
+    name: String,
+    desc: Descriptor,
+}
+
+/// A procedure as the catalog describes it.
+struct ProcMeta {
+    ins: Vec<ProcParam>,
+    outs: Vec<ProcParam>,
+    /// the `BEGIN ... END` body text
+    source: String,
+}
+
+/// Read one system relation's (columns, newest descriptors) pair - the
+/// preamble every catalog walk here needs.
+fn sys_rel(db: &Database, name: &str) -> Option<(Vec<RelationColumn>, Vec<Descriptor>)> {
+    let formats = fire_crab_ods::sysfmt::system_relation_formats(&db.bytes, db.page_size, name)?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    Some((relation_columns(&db.bytes, db.page_size, name), descs.clone()))
+}
+
+/// Load a procedure's parameters and body source from the catalog.
+/// None when the procedure does not exist, or when a parameter's type is
+/// outside the interpreter's surface.
+fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
+    use fire_crab_ods::format::Value;
+
+    // --- RDB$PROCEDURES (26): the body source blob -------------------
+    let (pcols, pdescs) = sys_rel(db, "RDB$PROCEDURES")?;
+    let pfid = |n: &str| pcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (name_f, src_f) = (pfid("RDB$PROCEDURE_NAME")?, pfid("RDB$PROCEDURE_SOURCE")?);
+    let pfmts = vec![(0u8, pdescs)];
+    let mut source: Option<String> = None;
+    for_each_record(db, 26, &pfmts, |v| {
+        let hit = matches!(v.get(name_f),
+            Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
+        if !hit || source.is_some() {
+            return;
+        }
+        if let Some(Value::Blob(r, n)) = v.get(src_f) {
+            if let Some(bytes) = fire_crab_ods::read_blob_content(&db.bytes, db.page_size, *r, *n) {
+                source = Some(String::from_utf8_lossy(&bytes).into_owned());
+            }
+        }
+    });
+    let source = source?;
+
+    // --- RDB$PROCEDURE_PARAMETERS (27) + RDB$FIELDS for the types ----
+    let (ccols, cdescs) = sys_rel(db, "RDB$PROCEDURE_PARAMETERS")?;
+    let cfid = |n: &str| ccols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (pn_f, num_f, typ_f, fs_f) = (
+        cfid("RDB$PROCEDURE_NAME")?,
+        cfid("RDB$PARAMETER_NUMBER")?,
+        cfid("RDB$PARAMETER_TYPE")?,
+        cfid("RDB$FIELD_SOURCE")?,
+    );
+    // (parameter type 0=in/1=out, number, name, field source)
+    let mut raw: Vec<(i64, i64, String, String)> = Vec::new();
+    let pname_f = cfid("RDB$PARAMETER_NAME")?;
+    let cfmts = vec![(0u8, cdescs)];
+    for_each_record(db, 27, &cfmts, |v| {
+        let hit = matches!(v.get(pn_f),
+            Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
+        if !hit {
+            return;
+        }
+        if let (
+            Some(Value::Int(num)),
+            Some(Value::Int(typ)),
+            Some(Value::Text(pnm)),
+            Some(Value::Text(fs)),
+        ) = (v.get(num_f), v.get(typ_f), v.get(pname_f), v.get(fs_f))
+        {
+            raw.push((
+                *typ as i64,
+                *num as i64,
+                pnm.trim_end().to_string(),
+                fs.trim_end().to_string(),
+            ));
+        }
+    });
+
+    // each parameter's domain, resolved to a descriptor off its
+    // RDB$FIELDS row (the same walk the DDL side uses)
+    let domain_desc = |dom: &str| -> Option<Descriptor> {
+        let (ft, len, scale, sub) =
+            fire_crab_ods::ddl::domain_type_info(&db.bytes, db.page_size, dom)?;
+        Some(Descriptor {
+            dtype: fire_crab_ods::ddl::field_type_to_dtype(ft)?,
+            scale,
+            length: len,
+            sub_type: sub,
+            flags: 0,
+            offset: 0,
+        })
+    };
+    let mut ins: Vec<ProcParam> = Vec::new();
+    let mut outs: Vec<ProcParam> = Vec::new();
+    raw.sort_by_key(|(t, n, _, _)| (*t, *n));
+    for (typ, _, pnm, fs) in raw {
+        let desc = domain_desc(&fs)?;
+        // integer parameters only - the interpreter's Expr is integer
+        // arithmetic, and a silently coerced text parameter would be a
+        // wrong answer rather than a refusal
+        if !matches!(col_kind(&desc), Some(ColKind::Int)) {
+            return None;
+        }
+        let p = ProcParam { name: pnm, desc };
+        if typ == 0 {
+            ins.push(p)
+        } else {
+            outs.push(p)
+        }
+    }
+    Some(ProcMeta { ins, outs, source })
+}
+
+/// The interpreter's variable frame: one slot per parameter, in the
+/// order the body's parser numbered them (inputs then outputs).
+struct PsqlFrame {
+    vars: Vec<Value>,
+}
+
+/// What stopped a body early.
+enum PsqlStop {
+    /// `EXCEPTION <name>` - the message is looked up like the engine's
+    Raise(String),
+    /// a construct the interpreter does not implement; the statement
+    /// fails whole rather than half-running
+    Unsupported,
+}
+
+/// Evaluate a PSQL expression against the frame. Integer arithmetic,
+/// NULL-propagating (the engine's rule: any NULL operand gives NULL).
+fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value, PsqlStop> {
+    use fire_crab_ods::expr::Expr as E;
+    let bin = |a: &E, b: &E, op: fn(i64, i64) -> Option<i64>| -> Result<Value, PsqlStop> {
+        match (eval_psql_expr(a, f)?, eval_psql_expr(b, f)?) {
+            (Value::Int(x), Value::Int(y)) => {
+                Ok(op(x, y).map_or(Value::Null, Value::Int))
+            }
+            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+            _ => Err(PsqlStop::Unsupported),
+        }
+    };
+    match e {
+        E::IntLiteral(v) => Ok(Value::Int(*v as i64)),
+        E::Variable(n) => Ok(f.vars.get(*n as usize).cloned().unwrap_or(Value::Null)),
+        // a bare column reference has no row to read inside a procedure
+        E::Field { .. } => Err(PsqlStop::Unsupported),
+        E::Add(a, b) => bin(a, b, |x, y| x.checked_add(y)),
+        E::Subtract(a, b) => bin(a, b, |x, y| x.checked_sub(y)),
+        E::Multiply(a, b) => bin(a, b, |x, y| x.checked_mul(y)),
+        // division by zero is an error in SQL, not a NULL
+        E::Divide(a, b) => match (eval_psql_expr(a, f)?, eval_psql_expr(b, f)?) {
+            (Value::Int(_), Value::Int(0)) => Err(PsqlStop::Unsupported),
+            (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x / y)),
+            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+            _ => Err(PsqlStop::Unsupported),
+        },
+    }
+}
+
+/// Evaluate a PSQL condition - three-valued, None being UNKNOWN, which
+/// an IF treats as false exactly as the engine does.
+fn eval_psql_cond(
+    c: &fire_crab_ods::expr::Cond,
+    f: &PsqlFrame,
+) -> Result<Option<bool>, PsqlStop> {
+    use fire_crab_ods::expr::{Cond as C, CmpOp};
+    Ok(match c {
+        C::Missing(e) => Some(matches!(eval_psql_expr(e, f)?, Value::Null)),
+        C::NotMissing(e) => Some(!matches!(eval_psql_expr(e, f)?, Value::Null)),
+        C::Not(inner) => eval_psql_cond(inner, f)?.map(|b| !b),
+        C::And(a, b) => match (eval_psql_cond(a, f)?, eval_psql_cond(b, f)?) {
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            (Some(true), Some(true)) => Some(true),
+            _ => None,
+        },
+        C::Or(a, b) => match (eval_psql_cond(a, f)?, eval_psql_cond(b, f)?) {
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            (Some(false), Some(false)) => Some(false),
+            _ => None,
+        },
+        C::Cmp(op, l, r) => {
+            let (a, b) = (eval_psql_expr(l, f)?, eval_psql_expr(r, f)?);
+            match (a, b) {
+                (Value::Null, _) | (_, Value::Null) => None,
+                (Value::Int(x), Value::Int(y)) => Some(match op {
+                    CmpOp::Eql => x == y,
+                    CmpOp::Neq => x != y,
+                    CmpOp::Lss => x < y,
+                    CmpOp::Leq => x <= y,
+                    CmpOp::Gtr => x > y,
+                    CmpOp::Geq => x >= y,
+                }),
+                _ => return Err(PsqlStop::Unsupported),
+            }
+        }
+    })
+}
+
+/// Run one statement of a body. A loop is bounded so a runaway WHILE
+/// cannot hang the connection.
+fn exec_psql_stmt(
+    s: &TrigStmt,
+    f: &mut PsqlFrame,
+    steps: &mut u32,
+) -> Result<(), PsqlStop> {
+    *steps += 1;
+    if *steps > 1_000_000 {
+        return Err(PsqlStop::Unsupported); // runaway body
+    }
+    match s {
+        TrigStmt::Assign { target, expr, .. } => {
+            let v = eval_psql_expr(expr, f)?;
+            match target {
+                TrigTarget::Var(n) => {
+                    let n = *n as usize;
+                    if n >= f.vars.len() {
+                        f.vars.resize(n + 1, Value::Null);
+                    }
+                    f.vars[n] = v;
+                    Ok(())
+                }
+                // NEW./OLD. exist only in a trigger
+                TrigTarget::Field(_) => Err(PsqlStop::Unsupported),
+            }
+        }
+        TrigStmt::If { cond, then, otherwise, .. } => {
+            if eval_psql_cond(cond, f)? == Some(true) {
+                exec_psql_stmt(then, f, steps)
+            } else if let Some(e) = otherwise {
+                exec_psql_stmt(e, f, steps)
+            } else {
+                Ok(())
+            }
+        }
+        TrigStmt::While { cond, body, .. } => {
+            while eval_psql_cond(cond, f)? == Some(true) {
+                exec_psql_stmt(body, f, steps)?;
+                *steps += 1;
+                if *steps > 1_000_000 {
+                    return Err(PsqlStop::Unsupported);
+                }
+            }
+            Ok(())
+        }
+        TrigStmt::Raise { name, .. } => Err(PsqlStop::Raise(name.clone())),
+        // a BEGIN..END block - which every body is, and which nests.
+        // A WHEN handler catches a raise from inside its own block, the
+        // way the engine's error_handler does.
+        TrigStmt::Block { stmts, handlers, .. } => {
+            let mut run = || -> Result<(), PsqlStop> {
+                for st in stmts {
+                    exec_psql_stmt(st, f, steps)?;
+                }
+                Ok(())
+            };
+            match run() {
+                Ok(()) => Ok(()),
+                Err(PsqlStop::Raise(ex)) if !handlers.is_empty() => {
+                    // this slice matches a handler only when it is a
+                    // catch-all (WHEN ANY); a named condition would need
+                    // the raise's identity compared against it
+                    for (conds, body) in handlers {
+                        if conds.is_empty() {
+                            return exec_psql_stmt(body, f, steps);
+                        }
+                    }
+                    Err(PsqlStop::Raise(ex))
+                }
+                Err(e) => Err(e),
+            }
+        }
+        // every other statement kind - DML, SUSPEND, cursors, nested
+        // calls - is outside this slice
+        _ => Err(PsqlStop::Unsupported),
+    }
+}
+
+/// Execute `EXECUTE PROCEDURE <name> [(<args>)]` and return the output
+/// parameter values in declaration order.
+///
+/// `args` are the input values already decoded (literals parsed from the
+/// statement text, or bound `?` parameters). Errors carry the SQLSTATE
+/// the caller turns into an op_response.
+fn run_procedure(
+    db: &Database,
+    name: &str,
+    args: &[Value],
+) -> Result<Vec<Value>, String> {
+    let meta = load_procedure(db, name)
+        .ok_or_else(|| format!("procedure {} is not one this server can run", name))?;
+    if args.len() != meta.ins.len() {
+        return Err(format!(
+            "procedure {} expects {} input parameter(s), got {}",
+            name,
+            meta.ins.len(),
+            args.len()
+        ));
+    }
+    // the parser numbers variables in the order it is given them:
+    // inputs, then outputs - the same order the body's identifiers
+    // resolve against
+    let mut names: Vec<String> = meta.ins.iter().map(|p| p.name.clone()).collect();
+    names.extend(meta.outs.iter().map(|p| p.name.clone()));
+
+    let up = meta.source.to_ascii_uppercase();
+    let begin_at = find_word(&up, "BEGIN", 0)
+        .ok_or_else(|| "procedure body does not start with BEGIN".to_string())?;
+    // A procedure DECLAREs its local variables BEFORE the body's BEGIN
+    // (a trigger declares them inside it), so they are collected here and
+    // appended to the name list: the parser numbers variables by their
+    // position in that list, and the frame is indexed the same way.
+    names.extend(declared_var_names(&meta.source[..begin_at]));
+    let body = parse_trigger_body(&meta.source, begin_at, meta.source.trim_end().len(), &names)
+        .ok_or_else(|| format!("procedure {}'s body is outside this server's PSQL surface", name))?;
+
+    let mut frame = PsqlFrame { vars: Vec::new() };
+    frame.vars.extend(args.iter().cloned());
+    frame.vars.resize(names.len(), Value::Null);
+
+    let mut steps = 0u32;
+    match exec_psql_stmt(&body, &mut frame, &mut steps) {
+        Ok(()) => {}
+        Err(PsqlStop::Raise(ex)) => return Err(format!("exception {}", ex)),
+        Err(PsqlStop::Unsupported) => {
+            return Err(format!(
+                "procedure {} uses PSQL this server does not interpret",
+                name
+            ))
+        }
+    }
+    Ok((0..meta.outs.len())
+        .map(|i| frame.vars.get(meta.ins.len() + i).cloned().unwrap_or(Value::Null))
+        .collect())
+}
+
+/// The names a procedure's `DECLARE [VARIABLE] <name> <type>;` header
+/// declares, in order. Anything that is not a DECLARE is skipped, so a
+/// comment or blank line between them is harmless.
+fn declared_var_names(header: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let up = header.to_ascii_uppercase();
+    let mut at = 0usize;
+    while let Some(d) = find_word(&up, "DECLARE", at) {
+        let mut rest = header[d + "DECLARE".len()..].trim_start();
+        // the VARIABLE keyword is optional
+        if rest.len() >= "VARIABLE".len()
+            && rest[.."VARIABLE".len()].eq_ignore_ascii_case("VARIABLE")
+        {
+            rest = rest["VARIABLE".len()..].trim_start();
+        }
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == ';' || c == ',')
+            .unwrap_or(rest.len());
+        let name = rest[..end].trim().trim_matches('"');
+        if !name.is_empty() {
+            out.push(name.to_string());
+        }
+        at = d + "DECLARE".len();
+    }
+    out
+}
+
+/// Parse `EXECUTE PROCEDURE <name> [(<v>, ...)]` / `EXECUTE PROCEDURE
+/// <name> <v>, ...` into the procedure name and its literal arguments.
+/// A `?` argument yields None for that slot, to be filled from the
+/// execute message.
+fn parse_execute_procedure(sql: &str) -> Option<(String, Vec<Option<Value>>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    if find_word(&up, "EXECUTE", 0) != Some(0) {
+        return None;
+    }
+    let p = find_word(&up, "PROCEDURE", "EXECUTE".len())?;
+    let rest = s[p + "PROCEDURE".len()..].trim();
+    // the name runs to whitespace or '('
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '(')
+        .unwrap_or(rest.len());
+    let name = rest[..end].trim().trim_matches('"').to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let mut arg_text = rest[end..].trim();
+    if let Some(inner) = arg_text.strip_prefix('(') {
+        arg_text = inner.strip_suffix(')')?.trim();
+    }
+    let mut args = Vec::new();
+    if !arg_text.is_empty() {
+        for part in arg_text.split(',') {
+            let t = part.trim();
+            args.push(if t == "?" {
+                None
+            } else if t.eq_ignore_ascii_case("NULL") {
+                Some(Value::Null)
+            } else if let Ok(n) = t.parse::<i64>() {
+                Some(Value::Int(n))
+            } else {
+                return None; // integer literals and NULL in this slice
+            });
+        }
+    }
+    Some((name, args))
+}
+
 fn col_kind(d: &Descriptor) -> Option<ColKind> {
     if matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64) && d.scale == 0 {
         Some(ColKind::Int)
@@ -16009,28 +16543,30 @@ mod tests {
             let c = build_expr_col(&raw, "X", &columns, &descs).unwrap();
             (c.sql_type, c.length, c.scale)
         };
+        // the announced sql_types are the NULLABLE (odd) forms - see
+        // [nullable]: 32753 = SQL_INT128 nullable, 581 = SQL_INT64
         // multiplication/division: any INT64-ranked operand -> INT128
-        assert_eq!(form("K * K"), (32752, 16, 0));
-        assert_eq!(form("K * 2"), (32752, 16, 0));
-        assert_eq!(form("U * N"), (32752, 16, -4));
-        assert_eq!(form("U / 2"), (32752, 16, -2));
-        assert_eq!(form("CAST(N AS BIGINT) * A"), (32752, 16, 0));
-        assert_eq!(form("N * 2147483648"), (32752, 16, -2)); // wide int literal
-        assert_eq!(form("N * 1234567890.5"), (32752, 16, -3)); // wide dec literal
-        assert_eq!(form("(N + N) * A"), (32752, 16, -2)); // +'s result ranks INT64
-        assert_eq!(form("K * NULL"), (32752, 16, 0)); // NULL mirrors K
+        assert_eq!(form("K * K"), (32753, 16, 0));
+        assert_eq!(form("K * 2"), (32753, 16, 0));
+        assert_eq!(form("U * N"), (32753, 16, -4));
+        assert_eq!(form("U / 2"), (32753, 16, -2));
+        assert_eq!(form("CAST(N AS BIGINT) * A"), (32753, 16, 0));
+        assert_eq!(form("N * 2147483648"), (32753, 16, -2)); // wide int literal
+        assert_eq!(form("N * 1234567890.5"), (32753, 16, -3)); // wide dec literal
+        assert_eq!(form("(N + N) * A"), (32753, 16, -2)); // +'s result ranks INT64
+        assert_eq!(form("K * NULL"), (32753, 16, 0)); // NULL mirrors K
         // ...but both-long stays INT64-backed
-        assert_eq!(form("N * N"), (580, 8, -4));
-        assert_eq!(form("A * A"), (580, 8, 0));
-        assert_eq!(form("CAST(N AS INT) * A"), (580, 8, 0));
+        assert_eq!(form("N * N"), (581, 8, -4));
+        assert_eq!(form("A * A"), (581, 8, 0));
+        assert_eq!(form("CAST(N AS INT) * A"), (581, 8, 0));
         // addition/subtraction: only an INT128 operand widens
-        assert_eq!(form("K + K"), (580, 8, 0));
-        assert_eq!(form("U - N"), (580, 8, -2));
-        assert_eq!(form("N + NULL"), (580, 8, -2));
-        assert_eq!(form("I + 1"), (32752, 16, 0));
-        assert_eq!(form("1.5 + I"), (32752, 16, -1));
-        assert_eq!(form("-I * 3"), (32752, 16, 0));
-        assert_eq!(form("I / 2"), (32752, 16, 0));
+        assert_eq!(form("K + K"), (581, 8, 0));
+        assert_eq!(form("U - N"), (581, 8, -2));
+        assert_eq!(form("N + NULL"), (581, 8, -2));
+        assert_eq!(form("I + 1"), (32753, 16, 0));
+        assert_eq!(form("1.5 + I"), (32753, 16, -1));
+        assert_eq!(form("-I * 3"), (32753, 16, 0));
+        assert_eq!(form("I / 2"), (32753, 16, 0));
 
         // eval: exact wide values; a result that fits i64 keeps its narrow
         // Value form (the INT128 encoder widens it into the 16-byte slot)
@@ -16063,7 +16599,7 @@ mod tests {
             &parse_raw_expr("U + 9223372036854775807").unwrap(), "X", &columns, &descs,
         )
         .unwrap();
-        assert_eq!(pc.sql_type, 580);
+        assert_eq!(pc.sql_type, 581); // nullable - see [nullable]
         assert!(matches!(pc.value_of(&row), Err(EvalErr::IntegerOverflow)));
     }
 

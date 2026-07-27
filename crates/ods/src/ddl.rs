@@ -1573,7 +1573,7 @@ pub fn alter_domain_not_null(
 
 /// `RDB$FIELD_TYPE` -> dsc dtype, for the int and text families
 /// [type_change_supported] understands (enough to widen a domain).
-fn field_type_to_dtype(ft: i16) -> Option<u8> {
+pub fn field_type_to_dtype(ft: i16) -> Option<u8> {
     use crate::format::dtype;
     Some(match ft {
         7 => dtype::SHORT,
@@ -1594,7 +1594,7 @@ fn field_type_to_dtype(ft: i16) -> Option<u8> {
 
 /// A domain's current `(field_type, byte length, scale, sub_type)` off its
 /// `RDB$FIELDS` row.
-fn domain_type_info(file: &[u8], page_size: usize, name: &str) -> Option<(i16, u16, i8, i16)> {
+pub fn domain_type_info(file: &[u8], page_size: usize, name: &str) -> Option<(i16, u16, i8, i16)> {
     let rel = crate::resolve_relation(file, page_size, "RDB$FIELDS")?;
     let formats = system_relation_formats(file, page_size, "RDB$FIELDS")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
