@@ -793,6 +793,17 @@ enum Plan {
         /// which output parameter each projected column reads
         picks: Vec<usize>,
     },
+    /// `INSERT INTO <t> [(cols)] SELECT ...` - a write fed by a query.
+    /// The query is planned by the ORDINARY planner at execute, its rows
+    /// are materialised, and each one is then inserted through the
+    /// ordinary INSERT path, so column defaults, NOT NULL, CHECK, FK
+    /// enforcement and index maintenance all apply exactly as they do to
+    /// a client's own INSERT - no second write path.
+    InsertSelect {
+        table: String,
+        cols: Vec<String>,
+        query: String,
+    },
     /// The rows a selectable procedure SUSPENDed, ready to serve.
     ProcRows {
         cols: Vec<ProjCol>,
@@ -6664,6 +6675,33 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         return None;
     }
     let into = find_word(&masked, "INTO", "INSERT".len())?;
+    // `INSERT ... SELECT` instead of `INSERT ... VALUES`
+    if let Some(sel) = find_word(&masked, "SELECT", into + "INTO".len()) {
+        let vals = find_word(&masked, "VALUES", into + "INTO".len());
+        if vals.is_none_or(|v| sel < v) {
+            let head = s[into + "INTO".len()..sel].trim();
+            let (table, collist) = match head.find('(') {
+                Some(pos) => (head[..pos].trim(), Some(head[pos..].trim())),
+                None => (head, None),
+            };
+            let table = table.trim().trim_matches('"');
+            if !ident_ok(table) {
+                return None;
+            }
+            let cols: Vec<String> = match collist {
+                None => Vec::new(), // every column, in field order
+                Some(l) => split_ident_list(l.trim_start_matches('(').trim_end_matches(')'))?,
+            };
+            return Some((
+                Plan::InsertSelect {
+                    table: table.to_string(),
+                    cols,
+                    query: s[sel..].trim().to_string(),
+                },
+                Vec::new(),
+            ));
+        }
+    }
     let vals_kw = find_word(&masked, "VALUES", into + "INTO".len())?;
     // between INTO and VALUES: the table name + optional (column list)
     let head = s[into + "INTO".len()..vals_kw].trim();
@@ -8966,6 +9004,37 @@ fn branch_rows(
     db: &Database,
     args: &[WireParam],
 ) -> Option<Vec<Vec<Value>>> {
+    // a UNION is a row source too - and so is a nested one, since this
+    // recurses. Everything that materialises rows (INSERT ... SELECT, a
+    // FOR SELECT loop, a union branch) goes through here, so they all
+    // gain the same sources at once.
+    if let Plan::Union { branches, distinct, order_by, .. } = plan {
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for b in branches {
+            rows.append(&mut branch_rows(b, db, args)?);
+        }
+        if *distinct {
+            let mut seen: Vec<Vec<Value>> = Vec::new();
+            rows.retain(|r| {
+                if seen.iter().any(|s| rows_equal(s, r)) {
+                    false
+                } else {
+                    seen.push(r.clone());
+                    true
+                }
+            });
+        }
+        if let Some((idx, desc)) = order_by {
+            rows.sort_by(|a, b| {
+                let o = value_cmp(&a[*idx], &b[*idx]);
+                if *desc { o.reverse() } else { o }
+            });
+        }
+        return Some(rows);
+    }
+    if let Plan::ProcRows { rows, .. } = plan {
+        return Some(rows.clone());
+    }
     let Plan::Project { rel, formats, cols, filter, .. } = plan else {
         return None;
     };
@@ -10083,6 +10152,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         Plan::Group { cols, .. } => build_describe(cols, params),
         Plan::VirtualEmpty { .. } => build_describe(&output_cols_of(plan), params),
         Plan::SetGenerator { stmt_type, .. } => describe_dml(*stmt_type, params),
+        Plan::InsertSelect { .. } => describe_dml(2, params), // isc_info_sql_stmt_insert
     }
 }
 
@@ -10096,6 +10166,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         // already run. 8 makes it a singleton: op_execute2 carries the
         // output message back, or plain op_execute when there is none.
         Plan::ProcCall { .. } | Plan::ProcInvoke { .. } => 8,
+        Plan::InsertSelect { .. } => 2, // isc_info_sql_stmt_insert
         Plan::Union { .. } | Plan::ProcSelect { .. } | Plan::ProcRows { .. } => 1,
         Plan::Scalar(_)
         | Plan::GenIdIncrement { .. }
@@ -10452,7 +10523,8 @@ fn emit_rows_inner(
         // DML, DDL and generator writes have no cursor: terminator only.
         // GenIdIncrement is replaced by a Scalar at op_execute, so it never
         // reaches fetch as itself; the arm keeps the match exhaustive.
-        Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
+        Plan::InsertSelect { .. }
+        | Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
         | Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
@@ -13546,6 +13618,69 @@ fn run_body_dml(
     }
 }
 
+/// Run `INSERT INTO <t> [(cols)] SELECT ...`: plan the query with the
+/// ordinary planner, materialise its rows, then insert each one as a
+/// literal INSERT through the ordinary path. Returns the row count.
+///
+/// A row that fails (a duplicate key, a CHECK, a NOT NULL) stops the
+/// statement where it is - the rows already written stay written, which
+/// is what this server's whole-file-per-statement model gives; the
+/// engine would roll the statement back.
+fn insert_select(
+    table: &str,
+    cols: &[String],
+    query: &str,
+    database: &mut Option<Database>,
+    ctx: &SessionCtx,
+) -> Result<i32, String> {
+    // the target's column names, when the statement did not list them
+    let target: Vec<String> = if cols.is_empty() {
+        let db = database.as_ref().ok_or("no database attached")?;
+        let mut c: Vec<(u16, String)> = relation_columns(&db.bytes, db.page_size, table)
+            .into_iter()
+            .map(|c| (c.field_id, c.name))
+            .collect();
+        c.sort_by_key(|(f, _)| *f);
+        c.into_iter().map(|(_, n)| n).collect()
+    } else {
+        cols.to_vec()
+    };
+
+    let rows = {
+        let mut sink: Vec<Option<Descriptor>> = Vec::new();
+        let plan = plan_query_inner(query, &*database, &mut sink)
+            .ok_or("the SELECT feeding this INSERT is not one this server can run")?;
+        if !sink.is_empty() {
+            return Err("a parameter inside INSERT ... SELECT is not supported".into());
+        }
+        let db = database.as_ref().ok_or("no database attached")?;
+        branch_rows(&plan, db, &[])
+            .ok_or("the SELECT feeding this INSERT is not one this server can run")?
+    };
+
+    let mut n = 0i32;
+    for row in rows {
+        if row.len() != target.len() {
+            return Err("the SELECT's column count does not match the INSERT's".into());
+        }
+        let vals: Vec<String> = row
+            .iter()
+            .map(psql_literal)
+            .collect::<Option<Vec<_>>>()
+            .ok_or("a selected value cannot be written as a literal")?;
+        let sql = format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            table,
+            target.join(", "),
+            vals.join(", ")
+        );
+        let (plan, _) = plan_insert(&sql, database).ok_or("row insert refused")?;
+        execute_dml(&plan, database, &[], ctx)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
 /// A value as the SQL literal that names it. Types this server cannot
 /// write as a literal refuse, so a DML statement is never built around
 /// an invented value.
@@ -14858,6 +14993,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 } else if matches!(
                     plan,
                     Plan::Insert { .. }
+                        | Plan::InsertSelect { .. }
                         | Plan::Update { .. }
                         | Plan::Delete { .. }
                         | Plan::CreateTable { .. }
@@ -14903,6 +15039,30 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     // DML and DDL execute here (not at fetch): write the
                     // new versions (or the new catalog) into a copy of
                     // the page image, swap it in and flush back
+                    // INSERT ... SELECT: materialise the query's rows,
+                    // then insert each one through the ORDINARY insert
+                    // path so defaults, NOT NULL, CHECK, FK and index
+                    // maintenance all apply. Done here rather than inside
+                    // execute_dml because each row re-enters it.
+                    if let Plan::InsertSelect { table, cols, query } = &plan {
+                        let ctx = SessionCtx { user, attach_id };
+                        match insert_select(table, cols, query, &mut database, &ctx) {
+                            Ok(n) => {
+                                last_dml = (n, 0, 0);
+                                if std::env::var("FC_SRV_TRACE").is_ok() {
+                                    eprintln!("[srv] insert-select: {} inserted", n);
+                                }
+                                respond(&mut s, &mut enc, TX_HANDLE)?;
+                            }
+                            Err(e) => {
+                                last_dml = (0, 0, 0);
+                                if std::env::var("FC_SRV_TRACE").is_ok() {
+                                    eprintln!("[srv] insert-select failed: {}", e);
+                                }
+                                respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                            }
+                        }
+                    } else {
                     match execute_dml(&plan, &mut database, &bound_args, &SessionCtx { user, attach_id }) {
                         Ok(counts) => {
                             last_dml = counts;
@@ -14921,6 +15081,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             }
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
+                    }
                     }
                 } else if matches!(plan, Plan::ProcSelect { .. }) {
                     // a selectable procedure: run the body HERE (it may
