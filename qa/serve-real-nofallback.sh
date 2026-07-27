@@ -169,4 +169,37 @@ for weird in "SELECT CASE WHEN A > 1 THEN 1 ELSE 0 END FROM T" \
     esac
 done
 
+# --- a refusal must be a CLEAN error, and must not kill the session ----
+# A refusal used to be raised mid-cursor: the prepare was answered and the
+# error arrived during the fetch, which some clients report as
+# "request synchronization error" and follow by dropping the connection -
+# and a dropped connection is what libfbclient segfaults on. A refused
+# statement now fails at PREPARE, which is where the engine fails an
+# unsupported one, so the client gets a plain SQL error and carries on.
+out=$(printf 'SET HEADING OFF;\nSELECT UPPER(S) FROM T;\nSELECT A FROM T ORDER BY ID;\nSELECT COUNT(*) FROM T;\n' |
+      "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1)
+flat=$(printf '%s' "$out" | tr -s ' \n' ' ')
+case "$flat" in
+    *"synchronization error"*)
+        echo "DIFF a refusal desynced the connection: [$flat]"; fail=1 ;;
+    *"Statement failed"*) echo "OK   a refusal is a clean SQL error" ;;
+    *) echo "DIFF a refusal produced [$flat]"; fail=1 ;;
+esac
+# the two statements AFTER the refusal must still have been answered
+# the values from the two statements AFTER the refusal must be there -
+# checked as a count of answered rows rather than a brittle glob
+after=$(printf 'SET HEADING OFF;\nSELECT UPPER(S) FROM T;\nSELECT A FROM T WHERE A IS NOT NULL ORDER BY ID;\n' |
+        "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 |
+        grep -cE '^ *[0-9]+ *$')
+if [ "$after" -ge 2 ]; then
+    echo "OK   teeth: the session survived the refusal and answered $after more rows"
+else
+    echo "DIFF the session answered $after rows after a refusal, want 2 or more"; fail=1
+fi
+# and the refusal must carry a SQL error code, not a protocol one
+case "$flat" in
+    *"SQLSTATE = 42000"*) echo "OK   teeth: the refusal carries SQLSTATE 42000 (a SQL error)" ;;
+    *) echo "DIFF the refusal's SQLSTATE is not 42000: [$flat]"; fail=1 ;;
+esac
+
 exit $fail

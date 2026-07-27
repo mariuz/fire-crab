@@ -3905,6 +3905,16 @@ so the query silently returned 4242. A qualifier now settles which side
 is which, and only an *unqualified* name present in both tables is
 ambiguous.
 
+A refusal fails at **prepare**, which is where the engine fails an
+unsupported statement too. That matters beyond tidiness: answering the
+prepare and then raising during the fetch left the error mid-cursor, and
+some clients report that as `request synchronization error` and follow it
+by dropping the connection — and a dropped connection is what libfbclient
+segfaults on, which is the failure that took whole firebird-qa runs down.
+Refusing at prepare gives the client a plain `SQLSTATE 42000` and leaves
+the session usable; the gate asserts both, and that the statements after a
+refusal still answer.
+
 The lesson worth generalising: a per-feature gate proves the feature
 works, and says nothing about what the server does with the queries just
 outside it. One gate aimed at the fallback covers all of them at once.

@@ -15663,10 +15663,26 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     }
                 } else {
                     let (p, ps) = plan_query(&stmt_sql, &database);
-                    plan = p;
-                    stmt_params = ps;
-                    let describe = answer_prepare(&prep_items, &plan, &stmt_params);
-                    respond_prepare(&mut s, &mut enc, &describe)?;
+                    // A REFUSED STATEMENT FAILS AT PREPARE, which is where
+                    // the engine fails an unsupported one too. Answering
+                    // the prepare and then raising at fetch left the error
+                    // mid-cursor: some clients report it as
+                    // "request synchronization error" and drop the
+                    // connection instead of showing a SQL error, and a
+                    // dropped connection is what libfbclient segfaults on.
+                    if matches!(p, Plan::Refused) {
+                        if std::env::var("FC_SRV_TRACE").is_ok() {
+                            eprintln!("[srv] prepare refused: {:?}", stmt_sql);
+                        }
+                        plan = Plan::Refused;
+                        stmt_params = Vec::new();
+                        respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                    } else {
+                        plan = p;
+                        stmt_params = ps;
+                        let describe = answer_prepare(&prep_items, &plan, &stmt_params);
+                        respond_prepare(&mut s, &mut enc, &describe)?;
+                    }
                 }
             }
             x if x == OP_EXECUTE => {
