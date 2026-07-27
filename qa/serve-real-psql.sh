@@ -232,6 +232,7 @@ trap 'kill $srv 2>/dev/null; rm -f "$DB" "$WORK" "$REF" /tmp/fc-psql-work.fbk' E
 # the same calls, one set through fire-crab, one through the engine
 CALLS="EXECUTE PROCEDURE PUTROW(10, 100);
 EXECUTE PROCEDURE PUTROW(11, 110);
+EXECUTE PROCEDURE BUMP(10, 5);
 EXECUTE PROCEDURE ZAP(11);
 EXECUTE PROCEDURE FILLN(20, 4);
 EXECUTE PROCEDURE COND_WRITE(30);
@@ -256,8 +257,8 @@ else
 fi
 # non-vacuity: the writes must actually have happened
 case "$ours" in
-    *"10 100"*) echo "OK   teeth: the body's INSERT landed (10 -> 100)" ;;
-    *) echo "DIFF expected id 10 to hold 100, got [$ours]"; fail=1 ;;
+    *"10 105"*) echo "OK   teeth: the body's INSERT and UPDATE both landed (10 -> 105)" ;;
+    *) echo "DIFF expected id 10 to hold 105, got [$ours]"; fail=1 ;;
 esac
 case "$ours" in
     *" 11 "*) echo "DIFF the body's DELETE did not remove id 11"; fail=1 ;;
@@ -300,23 +301,22 @@ else
 fi
 
 # A body whose UPDATE sets a column from an EXPRESSION OVER COLUMNS
-# (`SET N = N + :d`) is refused - not by the interpreter, but because
-# this server's UPDATE does not take a SET expression at all (plain
-# `UPDATE T SET N = N + 5` is refused the same way). It must fail rather
-# than write something else.
-out=$(printf 'EXECUTE PROCEDURE BUMP(10, 5);\n' |
-      "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$WORK" 2>&1 | tr -s ' \n' ' ')
-before=$(printf 'SET HEADING OFF;\nSELECT N FROM T WHERE ID = 10;\n' |
-         "$ISQL" -q -user "$U" -pas "$P" "$WORK" 2>&1 | tr -d ' \n')
-case "$out" in
-    *"Statement failed"*|*error*|*ERROR*)
-        echo "OK   teeth: a SET-from-expression body fails (fc's UPDATE limit)" ;;
-    *) echo "DIFF a SET-from-expression body reported [$out]"; fail=1 ;;
-esac
-if [ "$before" = "100" ]; then
-    echo "OK   teeth: the refused UPDATE changed nothing (still 100)"
+# (`SET N = N + :d`) used to be refused, because this server's UPDATE took
+# no SET expression at all. It does now (serve-real-setexpr.sh), so the
+# body must WRITE - and write what the engine writes.
+rm -f "$WORK" "$REF"; cp "$DB" "$WORK"; cp "$DB" "$REF"
+printf 'EXECUTE PROCEDURE BUMP(1, 7);\nCOMMIT;\n' |
+    "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$WORK" >/dev/null 2>&1
+printf 'EXECUTE PROCEDURE BUMP(1, 7);\nCOMMIT;\n' |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$REF" >/dev/null 2>&1
+o=$(printf 'SET HEADING OFF;\nSELECT N FROM T WHERE ID = 1;\n' |
+    "$ISQL" -q -user "$U" -pas "$P" "$WORK" 2>&1 | tr -d ' \n')
+e=$(printf 'SET HEADING OFF;\nSELECT N FROM T WHERE ID = 1;\n' |
+    "$ISQL" -q -user "$U" -pas "$P" "$REF" 2>&1 | tr -d ' \n')
+if [ "$o" = "$e" ] && [ "$o" = "17" ]; then
+    echo "OK   a body's UPDATE ... SET col = col + :var matches the engine ($o)"
 else
-    echo "DIFF the refused UPDATE left N = $before"; fail=1
+    echo "DIFF body UPDATE gave fc=[$o] engine=[$e], want 17"; fail=1
 fi
 
 exit $fail

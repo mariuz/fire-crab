@@ -1154,6 +1154,11 @@ enum GenWrite {
 enum SetVal {
     Lit(Option<Vec<u8>>),
     Param(usize),
+    /// `SET <col> = <expression>` - evaluated PER ROW against that row's
+    /// own values, so `SET N = N + 5` reads the N it is replacing. A
+    /// literal or parameter is bound once before the scan; an expression
+    /// cannot be, which is why it is its own arm.
+    Expr(Expr),
 }
 
 /// How a join treats partnerless rows: INNER drops them; LEFT keeps
@@ -7110,6 +7115,54 @@ fn sample_image_len(db: &Database, rel: u16, format_no: u8) -> Option<usize> {
     None
 }
 
+/// Split an UPDATE's SET list on TOP-LEVEL commas: a comma inside
+/// parentheses (a function call) or inside a string literal belongs to
+/// its part. Each part keeps its text verbatim, so the right-hand side
+/// can go to the expression parser unchanged.
+fn split_set_list(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_str {
+            cur.push(c);
+            if c == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    cur.push(chars.next().unwrap());
+                } else {
+                    in_str = false;
+                }
+            }
+            continue;
+        }
+        match c {
+            '\'' => {
+                in_str = true;
+                cur.push(c);
+            }
+            '(' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                cur.push(c);
+            }
+            ',' if depth == 0 => {
+                out.push(cur.trim().to_string());
+                cur = String::new();
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
+}
+
 /// Parse `UPDATE <t> SET col = <lit|?> [, ...] [WHERE <pred>]` - no
 /// expressions or aliases - resolve it against the relation, and encode
 /// every literal SET value at prepare. The WHERE clause is the same
@@ -7139,18 +7192,70 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     let index_ops = resolve_index_ops(db, rel, descs)?;
 
     let set_end = where_kw.unwrap_or(s.len());
-    let toks = tokenize(&s[set_kw + "SET".len()..set_end])?;
+    let set_text = &s[set_kw + "SET".len()..set_end];
     let mut params: Vec<Option<Descriptor>> = Vec::new();
     let mut sets: Vec<(usize, SetVal)> = Vec::new();
-    for part in split_on(&toks, |t| matches!(t, Tok::Comma)) {
-        let (name, v) = match part {
-            [Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Int(n)] => (c, InsVal::Int(*n)),
-            [Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Dec(r, s)] => (c, InsVal::Dec(*r, *s)),
-            [Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Str(t)] => (c, InsVal::Str(t.clone())),
-            [Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Null] => (c, InsVal::Null),
-            [Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Param] => (c, InsVal::Param(0)),
-            _ => return None,
+    // split on TOP-LEVEL commas in the text (not the token stream), so
+    // each assignment keeps its right-hand side verbatim - an expression
+    // is parsed from that text by the same parser a select list uses
+    for part_text in split_set_list(set_text) {
+        // the predicate tokenizer does not know `+`, `||` and friends, so
+        // a failure to tokenize is itself a sign this is an expression -
+        // it must NOT abort the whole statement
+        let toks = tokenize(&part_text);
+        let simple = match toks.as_ref().map(|v| v.as_slice()) {
+            Some([Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Int(n)]) => {
+                Some((c.clone(), InsVal::Int(*n)))
+            }
+            Some([Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Dec(r, sc)]) => {
+                Some((c.clone(), InsVal::Dec(*r, *sc)))
+            }
+            Some([Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Str(t)]) => {
+                Some((c.clone(), InsVal::Str(t.clone())))
+            }
+            Some([Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Null]) => {
+                Some((c.clone(), InsVal::Null))
+            }
+            Some([Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Param]) => {
+                Some((c.clone(), InsVal::Param(0)))
+            }
+            _ => None,
         };
+        let (name, v) = match simple {
+            Some(x) => x,
+            // `<col> = <expression>`
+            None => {
+                let eq = part_text.find('=')?;
+                let col = part_text[..eq].trim().trim_matches('"').to_string();
+                if !ident_ok(&col) {
+                    return None;
+                }
+                let rhs = part_text[eq + 1..].trim();
+                // a `?` inside an expression would need a slot bound
+                // mid-evaluation; refuse rather than mis-number
+                if rhs.contains('?') {
+                    return None;
+                }
+                // `_any` also accepts a BARE column reference, which
+                // `parse_raw_expr` refuses (it exists for select-list
+                // expressions, where a bare column is a plain column).
+                // `SET A = B` needs it - and so does the swap
+                // `SET A = B, B = A`.
+                let raw = parse_raw_expr_any(rhs)?;
+                let e = resolve_expr(&raw, &columns, descs)?;
+                let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(&col))?;
+                let fid = rc.field_id as usize;
+                if sets.iter().any(|(f, _)| *f == fid) {
+                    return None;
+                }
+                if is_computed_fid(descs, fid) {
+                    return None;
+                }
+                sets.push((fid, SetVal::Expr(e)));
+                continue;
+            }
+        };
+        let name = &name;
         let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
         let fid = rc.field_id as usize;
         if sets.iter().any(|(f, _)| *f == fid) {
@@ -7741,7 +7846,11 @@ fn execute_dml(
                 .map(|(_, d)| d)
                 .ok_or("newest format not found")?;
             // bind: every SET value becomes concrete bytes (or SQL NULL)
+            // literals and parameters bind ONCE, here; an expression
+            // depends on the row it is replacing, so it is evaluated
+            // inside the scan instead
             let mut bound_sets: Vec<(usize, Option<Vec<u8>>)> = Vec::new();
+            let mut expr_sets: Vec<(usize, &Expr)> = Vec::new();
             for (fid, sv) in sets {
                 let bytes = match sv {
                     SetVal::Lit(b) => b.clone(),
@@ -7750,6 +7859,10 @@ fn execute_dml(
                         let arg = args.get(*slot).ok_or("missing parameter value")?;
                         encode_wire_value(d, arg)
                             .ok_or("parameter type does not match its column")?
+                    }
+                    SetVal::Expr(e) => {
+                        expr_sets.push((*fid, e));
+                        continue;
                     }
                 };
                 bound_sets.push((*fid, bytes));
@@ -7776,6 +7889,40 @@ fn execute_dml(
                             }
                             img[at..at + b.len()].copy_from_slice(b);
                             img[fid / 8] &= !(1 << (fid % 8));
+                        }
+                    }
+                }
+                // per-row expressions, evaluated against the row as it
+                // was BEFORE this statement - `SET N = N + 5` reads the
+                // N it replaces, and two assignments in one SET list
+                // both see the old row (SQL's simultaneous assignment)
+                if !expr_sets.is_empty() {
+                    let old_values = decode_record(&image, descs);
+                    for (fid, e) in &expr_sets {
+                        let d = descs.get(*fid).ok_or("field beyond format")?;
+                        let v = e
+                            .eval(&old_values)
+                            .map_err(|_| "expression failed".to_string())?;
+                        let wp = match &v {
+                            Value::Null => WireParam::Null,
+                            Value::Int(n) => WireParam::Int(*n, 0),
+                            Value::Scaled(r, sc) => WireParam::Int(*r, *sc),
+                            Value::Text(t) => WireParam::Text(t.clone()),
+                            Value::Double(f) => WireParam::Double(*f),
+                            _ => return Err("expression type cannot be stored".into()),
+                        };
+                        match encode_wire_value(d, &wp)
+                            .ok_or("expression result does not fit the column")?
+                        {
+                            None => img[fid / 8] |= 1 << (fid % 8),
+                            Some(b) => {
+                                let at = d.offset as usize;
+                                if at + b.len() > img.len() {
+                                    return Err("record image shorter than its format".into());
+                                }
+                                img[at..at + b.len()].copy_from_slice(&b);
+                                img[fid / 8] &= !(1 << (fid % 8));
+                            }
                         }
                     }
                 }
