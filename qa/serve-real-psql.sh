@@ -123,6 +123,30 @@ BEGIN
   R = 1;
   SUSPEND;
 END^
+CREATE PROCEDURE GEN3 (N INTEGER) RETURNS (K INTEGER, SQ INTEGER) AS
+DECLARE VARIABLE I INTEGER;
+BEGIN
+  I = 1;
+  WHILE (I <= N) DO
+  BEGIN
+    K = I; SQ = I * I;
+    SUSPEND;
+    I = I + 1;
+  END
+END^
+CREATE PROCEDURE ONEROW RETURNS (R INTEGER) AS
+BEGIN
+  R = 42;
+  SUSPEND;
+END^
+CREATE PROCEDURE NOROWS (N INTEGER) RETURNS (R INTEGER) AS
+BEGIN
+  IF (N > 0) THEN
+  BEGIN
+    R = N;
+    SUSPEND;
+  END
+END^
 SET TERM ;^
 COMMIT;
 EOF
@@ -209,13 +233,40 @@ esac
 
 # 3. a body this slice still does NOT interpret must FAIL, not answer
 #    something invented. SUSPEND (a selectable procedure) is the case.
-out=$(printf 'SET HEADING OFF;\nEXECUTE PROCEDURE SUSPENDER;\n' |
-      "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
+# --- SELECTABLE PROCEDURES: a body that SUSPENDs is a row source -------
+# The engine runs the body as a stream, restarting it for the cursor;
+# fire-crab runs it once and serves the rows SUSPEND emitted. Every one
+# of these procedures is created by the ENGINE.
+same "a selectable procedure's rows"   "SELECT K, SQ FROM GEN3(4)"
+same "SELECT * over a procedure"       "SELECT * FROM GEN3(3)"
+same "one column of a procedure"       "SELECT SQ FROM GEN3(5)"
+same "a column out of order"           "SELECT SQ, K FROM GEN3(3)"
+same "a procedure that suspends NO rows" "SELECT K FROM GEN3(0)"
+same "a conditional SUSPEND, taken"    "SELECT R FROM NOROWS(7)"
+same "a conditional SUSPEND, not taken" "SELECT R FROM NOROWS(0)"
+same "a no-argument selectable procedure" "SELECT R FROM ONEROW"
+same "EXECUTE PROCEDURE on a selectable one" "EXECUTE PROCEDURE SUSPENDER"
+same "COUNT is not supported over a call, but must agree" "SELECT R FROM ONEROW"
+
+# a WHERE over a procedure call is outside this slice - it must fail
+# rather than silently ignore the filter
+out=$(printf 'SELECT K FROM GEN3(4) WHERE K > 2;\n' |
+      "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
 case "$out" in
     *"Statement failed"*|*error*|*ERROR*)
-        echo "OK   teeth: an uninterpreted body (SUSPEND) is refused" ;;
-    *) echo "DIFF an uninterpreted body answered [$out] instead of failing"; fail=1 ;;
+        echo "OK   teeth: a WHERE over a procedure call is refused, not ignored" ;;
+    *) echo "DIFF a WHERE over a procedure call answered [$out]"; fail=1 ;;
 esac
+# and the row count must really follow the argument
+a=$(printf 'SET HEADING OFF;\nSELECT K FROM GEN3(2);\n' |
+    "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ' | wc -w)
+b=$(printf 'SET HEADING OFF;\nSELECT K FROM GEN3(5);\n' |
+    "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ' | wc -w)
+if [ "$a" = "2" ] && [ "$b" = "5" ]; then
+    echo "OK   teeth: the loop suspends one row per iteration ($a and $b)"
+else
+    echo "DIFF GEN3(2) gave $a rows and GEN3(5) gave $b"; fail=1
+fi
 
 # --- DML INSIDE A BODY -------------------------------------------------
 # A body's write goes through the ordinary INSERT/UPDATE/DELETE planners,

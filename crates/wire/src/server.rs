@@ -782,6 +782,22 @@ enum Plan {
         args: Vec<Value>,
         cols: Vec<ProjCol>,
     },
+    /// `SELECT ... FROM <proc>(args)` before the body has run - a
+    /// SELECTABLE procedure as a row source. Like ProcInvoke it executes
+    /// at op_execute (the body may write) and is then replaced by the
+    /// Union-shaped plan its SUSPENDed rows make.
+    ProcSelect {
+        name: String,
+        args: Vec<Value>,
+        cols: Vec<ProjCol>,
+        /// which output parameter each projected column reads
+        picks: Vec<usize>,
+    },
+    /// The rows a selectable procedure SUSPENDed, ready to serve.
+    ProcRows {
+        cols: Vec<ProjCol>,
+        rows: Vec<Vec<Value>>,
+    },
     /// `<select> UNION [ALL] <select> [...]` - each branch's rows are
     /// collected and concatenated, then de-duplicated unless ALL. The
     /// FIRST branch's columns name and type the result. `order_by` is an
@@ -2912,6 +2928,10 @@ enum TrigStmt {
     /// raise brackets in savepoints exactly when a LEXICALLY enclosing
     /// block carries handlers (probed: an outer raise stays plain when
     /// only an inner block has one).
+    /// `SUSPEND;` - emit the output parameters as a row and carry on.
+    /// Only a SELECTABLE PROCEDURE can contain one; a trigger cannot, so
+    /// the BLR emitter refuses it and only the interpreter acts on it.
+    Suspend { src_off: usize },
     Block {
         stmts: Vec<TrigStmt>,
         handlers: Vec<(Vec<HandlerCond>, TrigStmt)>,
@@ -3330,6 +3350,9 @@ fn parse_trig_stmt(
     let text = &s[start..semi];
     let up = text.to_ascii_uppercase();
     *pos = semi + 1;
+    if find_word(&up, "SUSPEND", 0) == Some(0) && text.trim().len() == "SUSPEND".len() {
+        return Some(TrigStmt::Suspend { src_off: start });
+    }
     if find_word(&up, "EXCEPTION", 0) == Some(0) {
         // EXCEPTION <name>
         let name = text["EXCEPTION".len()..].trim().trim_matches('"').to_ascii_uppercase();
@@ -3529,6 +3552,9 @@ fn emit_trigger_stmt(
     bracket_raises: bool,
 ) {
     match st {
+        // a trigger cannot contain SUSPEND - only a selectable procedure
+        // can, and that path is interpreted, never compiled to BLR
+        TrigStmt::Suspend { .. } => {}
         TrigStmt::Assign { target, expr, src_off } => {
             dbg.push((*src_off, b.len()));
             b.push(1); // blr_assignment
@@ -3905,6 +3931,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     };
     fn stmt_exprs<'a>(st: &'a TrigStmt, out: &mut Vec<&'a fire_crab_ods::expr::Expr>) {
         match st {
+            TrigStmt::Suspend { .. } => {}
             TrigStmt::Assign { expr, .. } => out.push(expr),
             TrigStmt::If { cond, then, otherwise, .. } => {
                 out.extend(cond.operands());
@@ -3931,6 +3958,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     }
     fn stmt_targets<'a>(st: &'a TrigStmt, out: &mut Vec<&'a TrigTarget>) {
         match st {
+            TrigStmt::Suspend { .. } => {}
             TrigStmt::Assign { target, .. } => out.push(target),
             TrigStmt::If { then, otherwise, .. } => {
                 stmt_targets(then, out);
@@ -3960,6 +3988,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         dmls: &mut Vec<&'a TrigStmt>,
     ) {
         match st {
+            TrigStmt::Suspend { .. } => {}
             TrigStmt::Assign { .. } => {}
             TrigStmt::If { then, otherwise, .. } => {
                 stmt_specials(then, stores, raises, hexcs, dmls);
@@ -8563,6 +8592,45 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
 // join or another view, an expression or aggregate in the view's select
 // list, `*`, and GROUP BY/HAVING/ORDER BY inside the view.
 
+/// Split a FROM item that is a procedure call: `P` or `P(1, 2)`.
+/// Returns the name and the argument text, if any.
+fn split_proc_call(table_s: &str) -> Option<(String, Option<String>)> {
+    let t = table_s.trim();
+    match t.find('(') {
+        None => {
+            let n = t.trim_matches('"');
+            if ident_ok(n) { Some((n.to_string(), None)) } else { None }
+        }
+        Some(at) => {
+            let name = t[..at].trim().trim_matches('"');
+            let rest = t[at + 1..].trim();
+            let inner = rest.strip_suffix(')')?;
+            if !ident_ok(name) {
+                return None;
+            }
+            Some((name.to_string(), Some(inner.trim().to_string())))
+        }
+    }
+}
+
+/// Literal procedure arguments: integers and NULL, as the EXECUTE
+/// PROCEDURE parser takes them.
+fn parse_proc_args(text: &str) -> Option<Vec<Value>> {
+    if text.is_empty() {
+        return Some(Vec::new());
+    }
+    text.split(',')
+        .map(|p| {
+            let t = p.trim();
+            if t.eq_ignore_ascii_case("NULL") {
+                Some(Value::Null)
+            } else {
+                t.parse::<i64>().ok().map(Value::Int)
+            }
+        })
+        .collect()
+}
+
 /// A view's source text and its own column names, in field-id order.
 struct ViewDef {
     source: String,
@@ -9018,6 +9086,71 @@ fn plan_query_inner(
         if db.as_ref().is_some() {
             if let Some(seq) = parse_next_value(proj_s, table_s) {
                 return Some(Plan::GenIdIncrement { name: seq, step: None });
+            }
+        }
+    }
+    // A SELECTABLE PROCEDURE in the FROM: `SELECT ... FROM p(args)`.
+    // The engine runs the body as a stream, restarting it for the cursor;
+    // this server runs it once at execute and serves the rows it
+    // SUSPENDed. Checked before views, since both look like a table here.
+    if let Some(dbr) = db.as_ref() {
+        if let Some((_, table_s, w_s, g_s, h_s, o_s)) = split_query(sql) {
+            if let Some((pname, pargs_text)) = split_proc_call(table_s) {
+                if let Some(meta) = load_procedure(dbr, &pname) {
+                    // no WHERE/GROUP/HAVING/ORDER over the call in this
+                    // slice - refuse rather than answer a wrong row set
+                    if w_s.is_some() || g_s.is_some() || h_s.is_some() || o_s.is_some() {
+                        return Some(Plan::Refused);
+                    }
+                    let args: Vec<Value> = match pargs_text {
+                        None => Vec::new(),
+                        Some(t) => match parse_proc_args(&t) {
+                            Some(a) => a,
+                            None => return Some(Plan::Refused),
+                        },
+                    };
+                    if args.len() != meta.ins.len() || meta.outs.is_empty() {
+                        return Some(Plan::Refused);
+                    }
+                    // the projection picks output parameters by name
+                    let out_names: Vec<String> =
+                        meta.outs.iter().map(|p| p.name.clone()).collect();
+                    let picks: Vec<usize> = match parse_projection(split_query(sql)?.0)? {
+                        Proj::Star => (0..out_names.len()).collect(),
+                        Proj::Items(items) => {
+                            let mut v = Vec::new();
+                            for it in &items {
+                                match it {
+                                    SelItem::Col(c) => match out_names
+                                        .iter()
+                                        .position(|n| n.eq_ignore_ascii_case(c))
+                                    {
+                                        Some(i) => v.push(i),
+                                        None => return Some(Plan::Refused),
+                                    },
+                                    _ => return Some(Plan::Refused),
+                                }
+                            }
+                            v
+                        }
+                    };
+                    let cols: Vec<ProjCol> = picks
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| ProjCol {
+                            name: out_names[*p].clone(),
+                            field_id: i,
+                            wire: Wire::Int64,
+                            sql_type: 581,
+                            length: 8,
+                            scale: 0,
+                            sub_type: 0,
+                            expr: None,
+                        })
+                        .collect();
+                    params.clear();
+                    return Some(Plan::ProcSelect { name: pname, args, cols, picks });
+                }
             }
         }
     }
@@ -9825,7 +9958,9 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         Plan::Scalar(_) | Plan::GenIdIncrement { .. } => describe_one_bigint(params),
         // the procedure's output parameters, described like a projection
         Plan::ProcCall { cols, .. } | Plan::ProcInvoke { cols, .. } => build_describe(cols, params),
-        Plan::Union { cols, .. } => build_describe(cols, params),
+        Plan::Union { cols, .. }
+        | Plan::ProcSelect { cols, .. }
+        | Plan::ProcRows { cols, .. } => build_describe(cols, params),
         Plan::Refused => build_describe(&[], params),
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
@@ -9871,7 +10006,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         // already run. 8 makes it a singleton: op_execute2 carries the
         // output message back, or plain op_execute when there is none.
         Plan::ProcCall { .. } | Plan::ProcInvoke { .. } => 8,
-        Plan::Union { .. } => 1,
+        Plan::Union { .. } | Plan::ProcSelect { .. } | Plan::ProcRows { .. } => 1,
         Plan::Scalar(_)
         | Plan::GenIdIncrement { .. }
         | Plan::Project { .. }
@@ -9941,7 +10076,9 @@ fn output_cols_of(plan: &Plan) -> Vec<ProjCol> {
         }],
         Plan::VirtualEmpty { ncols } => (0..*ncols).map(bigint_col).collect(),
         Plan::ProcCall { cols, .. } | Plan::ProcInvoke { cols, .. } => cols.clone(),
-        Plan::Union { cols, .. } => cols.clone(),
+        Plan::Union { cols, .. }
+        | Plan::ProcSelect { cols, .. }
+        | Plan::ProcRows { cols, .. } => cols.clone(),
         _ => Vec::new(),
     }
 }
@@ -10266,6 +10403,14 @@ fn emit_rows_inner(
         // holding one means the statement was never executed
         Plan::Refused | Plan::ProcInvoke { .. } => {
             return Err(EmitErr::Eval(EvalErr::ConversionError))
+        }
+        // ProcSelect is replaced at op_execute; reaching a fetch still
+        // holding one means the statement never executed
+        Plan::ProcSelect { .. } => return Err(EmitErr::Eval(EvalErr::ConversionError)),
+        Plan::ProcRows { cols, rows } => {
+            for r in rows {
+                encode_row(w, cols, r)?;
+            }
         }
         Plan::Union { cols, branches, distinct, order_by } => {
             if let Some(db) = db {
@@ -13180,6 +13325,13 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
 /// order the body's parser numbered them (inputs then outputs).
 struct PsqlFrame {
     vars: Vec<Value>,
+    /// where the output parameters start in `vars` (inputs come first)
+    out_at: usize,
+    /// how many output parameters there are
+    out_len: usize,
+    /// the rows SUSPEND has emitted so far - a selectable procedure's
+    /// result set, in the order the body produced them
+    suspended: Vec<Vec<Value>>,
 }
 
 /// What stopped a body early.
@@ -13424,6 +13576,16 @@ fn exec_psql_stmt(
             Ok(())
         }
         TrigStmt::Raise { name, .. } => Err(PsqlStop::Raise(name.clone())),
+        // SUSPEND takes a SNAPSHOT of the output parameters as they are
+        // now and carries on; the body may assign them again and suspend
+        // more rows. This is what makes a procedure selectable.
+        TrigStmt::Suspend { .. } => {
+            let row: Vec<Value> = (0..f.out_len)
+                .map(|i| f.vars.get(f.out_at + i).cloned().unwrap_or(Value::Null))
+                .collect();
+            f.suspended.push(row);
+            Ok(())
+        }
         // a BEGIN..END block - which every body is, and which nests.
         // A WHEN handler catches a raise from inside its own block, the
         // way the engine's error_handler does.
@@ -13511,7 +13673,7 @@ fn run_procedure(
     name: &str,
     args: &[Value],
     ctx: &SessionCtx,
-) -> Result<Vec<Value>, String> {
+) -> Result<(Vec<Value>, Vec<Vec<Value>>), String> {
     let db = database.as_ref().ok_or("no database attached")?;
     let meta = load_procedure(db, name)
         .ok_or_else(|| format!("procedure {} is not one this server can run", name))?;
@@ -13540,7 +13702,12 @@ fn run_procedure(
     let body = parse_trigger_body(&meta.source, begin_at, meta.source.trim_end().len(), &names)
         .ok_or_else(|| format!("procedure {}'s body is outside this server's PSQL surface", name))?;
 
-    let mut frame = PsqlFrame { vars: Vec::new() };
+    let mut frame = PsqlFrame {
+        vars: Vec::new(),
+        out_at: meta.ins.len(),
+        out_len: meta.outs.len(),
+        suspended: Vec::new(),
+    };
     frame.vars.extend(args.iter().cloned());
     frame.vars.resize(names.len(), Value::Null);
 
@@ -13556,9 +13723,19 @@ fn run_procedure(
             ))
         }
     }
-    Ok((0..meta.outs.len())
+    // a SELECTABLE procedure's result is what SUSPEND emitted; a plain
+    // one's is its output parameters as the body left them (which is also
+    // what EXECUTE PROCEDURE reports for a selectable one - the engine
+    // gives the FIRST suspended row there)
+    let final_row: Vec<Value> = (0..meta.outs.len())
         .map(|i| frame.vars.get(meta.ins.len() + i).cloned().unwrap_or(Value::Null))
-        .collect())
+        .collect();
+    if frame.suspended.is_empty() {
+        Ok((final_row, Vec::new()))
+    } else {
+        let first = frame.suspended[0].clone();
+        Ok((first, frame.suspended))
+    }
 }
 
 /// The names a procedure's `DECLARE [VARIABLE] <name> <type>;` header
@@ -14607,6 +14784,39 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
                     }
+                } else if matches!(plan, Plan::ProcSelect { .. }) {
+                    // a selectable procedure: run the body HERE (it may
+                    // write) and keep the rows it SUSPENDed for the fetch
+                    let (pname, pargs, pcols, picks) = match &plan {
+                        Plan::ProcSelect { name, args, cols, picks } => {
+                            (name.clone(), args.clone(), cols.clone(), picks.clone())
+                        }
+                        _ => unreachable!(),
+                    };
+                    let ctx = SessionCtx { user, attach_id };
+                    match run_procedure(&mut database, &pname, &pargs, &ctx) {
+                        Ok((_, suspended)) => {
+                            // project each suspended row down to the
+                            // columns the select list asked for
+                            let rows: Vec<Vec<Value>> = suspended
+                                .iter()
+                                .map(|r| {
+                                    picks
+                                        .iter()
+                                        .map(|p| r.get(*p).cloned().unwrap_or(Value::Null))
+                                        .collect()
+                                })
+                                .collect();
+                            plan = Plan::ProcRows { cols: pcols, rows };
+                            respond(&mut s, &mut enc, TX_HANDLE)?;
+                        }
+                        Err(e) => {
+                            if std::env::var("FC_SRV_TRACE").is_ok() {
+                                eprintln!("[srv] select from procedure failed: {}", e);
+                            }
+                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                        }
+                    }
                 } else if matches!(plan, Plan::ProcInvoke { .. }) {
                     // EXECUTE PROCEDURE runs HERE, because a body may
                     // WRITE, and becomes the row its output parameters
@@ -14619,7 +14829,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     };
                     let ctx = SessionCtx { user, attach_id };
                     match run_procedure(&mut database, &pname, &pargs, &ctx) {
-                        Ok(values) => {
+                        Ok((values, _rows)) => {
                             plan = Plan::ProcCall { cols: pcols, values };
                             respond(&mut s, &mut enc, TX_HANDLE)?;
                         }
@@ -15025,7 +15235,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     };
                     let ctx = SessionCtx { user, attach_id };
                     match run_procedure(&mut database, &pname, &pargs, &ctx) {
-                        Ok(values) => {
+                        Ok((values, _rows)) => {
                             if std::env::var("FC_SRV_TRACE").is_ok() {
                                 eprintln!("[srv] op_execute2 {} -> {:?}", pname, values);
                             }
