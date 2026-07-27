@@ -139,6 +139,30 @@ BEGIN
   R = 42;
   SUSPEND;
 END^
+CREATE PROCEDURE SUMALL RETURNS (TOT INTEGER) AS
+DECLARE VARIABLE V INTEGER;
+BEGIN
+  TOT = 0;
+  FOR SELECT N FROM T INTO :V DO
+    IF (V IS NOT NULL) THEN TOT = TOT + V;
+END^
+CREATE PROCEDURE LISTIT RETURNS (I2 INTEGER, N2 INTEGER) AS
+BEGIN
+  FOR SELECT ID, N FROM T INTO :I2, :N2 DO
+    SUSPEND;
+END^
+CREATE PROCEDURE FILTERED (LO INTEGER) RETURNS (N3 INTEGER) AS
+BEGIN
+  FOR SELECT N FROM T WHERE N > :LO INTO :N3 DO
+    SUSPEND;
+END^
+CREATE PROCEDURE COPYROWS AS
+DECLARE VARIABLE I4 INTEGER;
+DECLARE VARIABLE N4 INTEGER;
+BEGIN
+  FOR SELECT ID, N FROM T WHERE ID < 3 INTO :I4, :N4 DO
+    INSERT INTO T (ID, N) VALUES (:I4 + 500, :N4);
+END^
 CREATE PROCEDURE NOROWS (N INTEGER) RETURNS (R INTEGER) AS
 BEGIN
   IF (N > 0) THEN
@@ -369,5 +393,59 @@ if [ "$o" = "$e" ] && [ "$o" = "17" ]; then
 else
     echo "DIFF body UPDATE gave fc=[$o] engine=[$e], want 17"; fail=1
 fi
+
+# --- FOR SELECT: a cursor loop ----------------------------------------
+# The loop's query is planned by the ORDINARY planner, so it sees
+# everything a client SELECT does. A `:var` inside it is PSQL, not SQL, so
+# it is substituted with the variable's value before planning.
+same "FOR SELECT accumulating into a variable" "EXECUTE PROCEDURE SUMALL"
+same "FOR SELECT feeding SUSPEND"     "SELECT I2, N2 FROM LISTIT"
+same "a :var inside the loop's WHERE" "SELECT N3 FROM FILTERED(15)"
+same "the same loop, everything matches" "SELECT N3 FROM FILTERED(0)"
+same "the same loop, nothing matches"  "SELECT N3 FROM FILTERED(9999)"
+
+# a loop that WRITES, compared through the engine on both files
+rm -f "$WORK" "$REF"; cp "$DB" "$WORK"; cp "$DB" "$REF"
+for f in "$WORK" "$REF"; do
+    case "$f" in
+        "$WORK") dsn="127.0.0.1/$PORT:$WORK" ;;
+        *) dsn="$REF" ;;
+    esac
+    printf 'EXECUTE PROCEDURE COPYROWS;\nCOMMIT;\n' |
+        "$ISQL" -q -b -user "$U" -pas "$P" "$dsn" >/dev/null 2>&1
+done
+d2() { printf 'SET HEADING OFF;\nSELECT ID, COALESCE(N,-9) FROM T ORDER BY ID;\n' |
+       "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 | tr -s ' \n' ' '; }
+o=$(d2 "$WORK"); e=$(d2 "$REF")
+if [ "$o" = "$e" ]; then
+    echo "OK   a FOR SELECT loop that INSERTs matches the engine"
+else
+    echo "DIFF loop-insert differs"; echo "     engine: [$e]"; echo "     fc:     [$o]"; fail=1
+fi
+case "$o" in
+    *"501 10"*"502"*) echo "OK   teeth: the loop inserted one row per source row" ;;
+    *) echo "DIFF the loop's inserted rows are wrong: [$o]"; fail=1 ;;
+esac
+
+# THE TRIGGER GUARD: the PSQL parser is shared with the trigger compiler,
+# so a trigger whose body contains an interpreted-only statement must be
+# REFUSED at CREATE - storing it as BLR would silently drop the statement
+# and leave a trigger that does not do what its source says.
+out=$("$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 <<'SQL'
+SET TERM ^;
+CREATE TRIGGER T_BAD FOR T BEFORE INSERT AS
+DECLARE VARIABLE Z INTEGER;
+BEGIN
+  FOR SELECT ID FROM T INTO :Z DO
+    NEW.N = Z;
+END^
+SET TERM ;^
+SQL
+)
+case "$out" in
+    *"Statement failed"*|*error*|*ERROR*)
+        echo "OK   teeth: a trigger body with FOR SELECT is refused, not silently emitted" ;;
+    *) echo "DIFF a trigger with FOR SELECT was accepted: [$out]"; fail=1 ;;
+esac
 
 exit $fail

@@ -2928,6 +2928,17 @@ enum TrigStmt {
     /// raise brackets in savepoints exactly when a LEXICALLY enclosing
     /// block carries handlers (probed: an outer raise stays plain when
     /// only an inner block has one).
+    /// `FOR SELECT <cols> FROM ... [WHERE ...] INTO :v[, ...] DO <stmt>`
+    /// - a cursor loop. The query text is kept verbatim and planned by
+    /// the ordinary planner when the loop runs, so a FOR SELECT sees
+    /// everything a client SELECT does (views, subqueries, expressions).
+    /// `into` names the variable slot each projected column lands in.
+    ForSelect {
+        query: String,
+        into: Vec<u16>,
+        body: Box<TrigStmt>,
+        src_off: usize,
+    },
     /// `SUSPEND;` - emit the output parameters as a row and carry on.
     /// Only a SELECTABLE PROCEDURE can contain one; a trigger cannot, so
     /// the BLR emitter refuses it and only the interpreter acts on it.
@@ -3280,6 +3291,29 @@ fn parse_trig_block(
     Some(TrigStmt::Block { stmts, handlers, src_off: begin_off })
 }
 
+/// Does this body contain a statement the BLR emitter cannot compile?
+/// SUSPEND and FOR SELECT are interpreted-only: the PSQL parser is shared
+/// with the trigger compiler, so a trigger whose source contains one
+/// would otherwise be stored as BLR with that statement SILENTLY MISSING
+/// - a trigger that does not do what its own source says. CREATE TRIGGER
+/// refuses instead. (The engine rejects SUSPEND in a trigger outright;
+/// FOR SELECT it accepts, so this is a real limit, honestly refused.)
+fn body_has_uninterpretable_blr(st: &TrigStmt) -> bool {
+    match st {
+        TrigStmt::Suspend { .. } | TrigStmt::ForSelect { .. } => true,
+        TrigStmt::If { then, otherwise, .. } => {
+            body_has_uninterpretable_blr(then)
+                || otherwise.as_ref().is_some_and(|e| body_has_uninterpretable_blr(e))
+        }
+        TrigStmt::While { body, .. } => body_has_uninterpretable_blr(body),
+        TrigStmt::Block { stmts, handlers, .. } => {
+            stmts.iter().any(body_has_uninterpretable_blr)
+                || handlers.iter().any(|(_, h)| body_has_uninterpretable_blr(h))
+        }
+        _ => false,
+    }
+}
+
 /// One statement at the cursor: a nested block, IF/WHILE (whose inner
 /// statement may itself be a block - no semicolon after an END), or a
 /// semicolon-terminated simple statement.
@@ -3295,6 +3329,57 @@ fn parse_trig_stmt(
     if word == "BEGIN" {
         *pos = start + "BEGIN".len();
         return parse_trig_block(s, pos, limit, vars, start);
+    }
+    if word == "FOR" {
+        // FOR SELECT <query> INTO :v[, ...] DO <stmt>
+        let after_for = start + "FOR".len();
+        let up_all = s[..limit].to_ascii_uppercase();
+        if find_word(&up_all, "SELECT", after_for)? != after_for + 1
+            && s[after_for..].trim_start().to_ascii_uppercase().find("SELECT") != Some(0)
+        {
+            return None;
+        }
+        // the INTO that belongs to THIS loop, then its DO
+        let masked = mask_literals(&up_all);
+        let into_kw = find_word(&masked, "INTO", after_for)?;
+        let do_kw = find_word(&masked, "DO", into_kw + "INTO".len())?;
+        // A `:var` reference inside the loop's query is PSQL, not SQL, so
+        // the ordinary planner cannot see it. Rewrite each one to a slot
+        // marker here; the interpreter substitutes the variable's current
+        // value as a literal just before planning (the same trick the
+        // body's DML rendering uses).
+        let raw_query = s[after_for..into_kw].trim();
+        let mut query = String::with_capacity(raw_query.len());
+        let qb: Vec<char> = raw_query.chars().collect();
+        let mut qi = 0usize;
+        while qi < qb.len() {
+            if qb[qi] == ':' {
+                let mut j = qi + 1;
+                while j < qb.len() && (qb[j].is_alphanumeric() || qb[j] == '_' || qb[j] == '$') {
+                    j += 1;
+                }
+                let nm: String = qb[qi + 1..j].iter().collect();
+                let slot = vars.iter().position(|v| v.eq_ignore_ascii_case(&nm))?;
+                query.push_str(&format!("{}{}", PSQL_VAR_MARK, slot));
+                qi = j;
+                continue;
+            }
+            query.push(qb[qi]);
+            qi += 1;
+        }
+        let into_text = s[into_kw + "INTO".len()..do_kw].trim();
+        let mut into = Vec::new();
+        for part in into_text.split(',') {
+            let name = part.trim().trim_start_matches(':').trim().trim_matches('"');
+            let slot = vars.iter().position(|v| v.eq_ignore_ascii_case(name))?;
+            into.push(slot as u16);
+        }
+        if into.is_empty() {
+            return None;
+        }
+        *pos = do_kw + "DO".len();
+        let body = parse_trig_stmt(s, pos, limit, vars)?;
+        return Some(TrigStmt::ForSelect { query, into, body: Box::new(body), src_off: start });
     }
     if word == "IF" || word == "WHILE" {
         *pos = start + word.len();
@@ -3554,7 +3639,7 @@ fn emit_trigger_stmt(
     match st {
         // a trigger cannot contain SUSPEND - only a selectable procedure
         // can, and that path is interpreted, never compiled to BLR
-        TrigStmt::Suspend { .. } => {}
+        TrigStmt::Suspend { .. } | TrigStmt::ForSelect { .. } => {}
         TrigStmt::Assign { target, expr, src_off } => {
             dbg.push((*src_off, b.len()));
             b.push(1); // blr_assignment
@@ -3904,6 +3989,11 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     }
     let var_names: Vec<String> = declares.iter().map(|(n, _, _)| n.clone()).collect();
     let body = parse_trigger_body(s, begin_kw, end_kw + "END".len(), &var_names)?;
+    // a trigger body must be fully compilable to BLR - see
+    // [body_has_uninterpretable_blr]
+    if body_has_uninterpretable_blr(&body) {
+        return None;
+    }
 
     // validate every reference against the CATALOG: qualified (NEW/OLD)
     // or a DECLAREd variable, columns being plain integer stored ones;
@@ -3931,7 +4021,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     };
     fn stmt_exprs<'a>(st: &'a TrigStmt, out: &mut Vec<&'a fire_crab_ods::expr::Expr>) {
         match st {
-            TrigStmt::Suspend { .. } => {}
+            TrigStmt::Suspend { .. } | TrigStmt::ForSelect { .. } => {}
             TrigStmt::Assign { expr, .. } => out.push(expr),
             TrigStmt::If { cond, then, otherwise, .. } => {
                 out.extend(cond.operands());
@@ -3958,7 +4048,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     }
     fn stmt_targets<'a>(st: &'a TrigStmt, out: &mut Vec<&'a TrigTarget>) {
         match st {
-            TrigStmt::Suspend { .. } => {}
+            TrigStmt::Suspend { .. } | TrigStmt::ForSelect { .. } => {}
             TrigStmt::Assign { target, .. } => out.push(target),
             TrigStmt::If { then, otherwise, .. } => {
                 stmt_targets(then, out);
@@ -3988,7 +4078,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         dmls: &mut Vec<&'a TrigStmt>,
     ) {
         match st {
-            TrigStmt::Suspend { .. } => {}
+            TrigStmt::Suspend { .. } | TrigStmt::ForSelect { .. } => {}
             TrigStmt::Assign { .. } => {}
             TrigStmt::If { then, otherwise, .. } => {
                 stmt_specials(then, stores, raises, hexcs, dmls);
@@ -11842,6 +11932,10 @@ fn find_kw_by(up: &str, kw: &str) -> Option<(usize, usize)> {
 // select list or over a join, a parameter inside a subquery, GROUP BY /
 // ORDER BY inside one, and ALL/ANY/SOME.
 
+/// The placeholder a PSQL variable reference leaves in a FOR SELECT's
+/// query text, numbered by variable slot.
+const PSQL_VAR_MARK: &str = "FC$V";
+
 /// The placeholder identifier a lifted subquery leaves in the WHERE text.
 const SUBQ_MARK: &str = "FC$SUBQ";
 
@@ -13576,6 +13670,50 @@ fn exec_psql_stmt(
             Ok(())
         }
         TrigStmt::Raise { name, .. } => Err(PsqlStop::Raise(name.clone())),
+        // FOR SELECT: plan the query with the ORDINARY planner, collect
+        // its rows, then run the body once per row with the projected
+        // values assigned into the INTO variables. Planning it the normal
+        // way means a loop sees everything a client SELECT does - views,
+        // subqueries, expressions - for free.
+        TrigStmt::ForSelect { query, into, body, .. } => {
+            // put each variable's current value into the query text
+            let mut q = query.clone();
+            for (i, v) in f.vars.iter().enumerate().rev() {
+                let mark = format!("{}{}", PSQL_VAR_MARK, i);
+                if q.contains(&mark) {
+                    let lit = psql_literal(v).ok_or(PsqlStop::Unsupported)?;
+                    q = q.replace(&mark, &lit);
+                }
+            }
+            let rows = {
+                let mut sink: Vec<Option<Descriptor>> = Vec::new();
+                let plan = plan_query_inner(&q, &*db, &mut sink)
+                    .ok_or(PsqlStop::Unsupported)?;
+                if !sink.is_empty() {
+                    return Err(PsqlStop::Unsupported); // a `?` in a loop query
+                }
+                let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
+                branch_rows(&plan, dbr, &[]).ok_or(PsqlStop::Unsupported)?
+            };
+            for row in rows {
+                if row.len() != into.len() {
+                    return Err(PsqlStop::Unsupported);
+                }
+                for (slot, v) in into.iter().zip(row.into_iter()) {
+                    let n = *slot as usize;
+                    if n >= f.vars.len() {
+                        f.vars.resize(n + 1, Value::Null);
+                    }
+                    f.vars[n] = v;
+                }
+                exec_psql_stmt(body, f, steps, db, ctx)?;
+                *steps += 1;
+                if *steps > 1_000_000 {
+                    return Err(PsqlStop::Unsupported);
+                }
+            }
+            Ok(())
+        }
         // SUSPEND takes a SNAPSHOT of the output parameters as they are
         // now and carries on; the body may assign them again and suspend
         // more rows. This is what makes a procedure selectable.
