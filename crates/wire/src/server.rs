@@ -782,12 +782,14 @@ enum Plan {
         args: Vec<Value>,
         cols: Vec<ProjCol>,
     },
-    /// An `EXECUTE PROCEDURE` this server will not run - the procedure
-    /// does not exist, or its body is outside the interpreted surface.
-    /// It exists so the statement raises a SQL ERROR: falling back to
-    /// the fixed-answer plan would answer 4242 for a procedure call,
-    /// which is a wrong answer rather than a refusal.
-    ProcError,
+    /// A statement this server will not answer, kept as a plan so it
+    /// raises a SQL ERROR. Falling back to the fixed-answer plan would
+    /// return 4242 - a wrong answer dressed as a result. Two uses so
+    /// far: an EXECUTE PROCEDURE whose procedure is missing or whose
+    /// body is outside the interpreted surface, and a query over a VIEW
+    /// this server cannot expand (a view has a relation id but no
+    /// records, so a scan would answer zero rows just as wrongly).
+    Refused,
     /// `SELECT GEN_ID(<name>, <step>)` with a non-zero step, or `NEXT VALUE
     /// FOR <seq>` (step = the sequence's increment): a SELECT that WRITES.
     /// At op_execute it reads the generator, adds the step, writes the new
@@ -8525,6 +8527,190 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
     }
 }
 
+// ===================================================================
+// VIEWS
+//
+// The engine stores a view twice: as BLR in RDB$RELATIONS.RDB$VIEW_BLR,
+// which its RSE machinery merges into the outer request, and as the
+// SELECT TEXT in RDB$VIEW_SOURCE. This server reads the TEXT and
+// EXPANDS it - the same choice PSQL execution makes, and for the same
+// reason: it works on views this server did not create, which is the
+// case that matters (a firebird-qa test builds its views with isql).
+//
+// A view's own column names come from RDB$RELATION_FIELDS and line up
+// POSITIONALLY with its source's select list, which is where a renaming
+// view (`CREATE VIEW V (K, VAL) AS SELECT ID, A FROM T`) keeps the
+// mapping - the source text has no trace of K or VAL.
+//
+// Expansion rewrites the outer query: the view name becomes the base
+// table, view column names become base column names, and the view's own
+// WHERE is ANDed with the outer one. The result goes back through the
+// planner, so everything a plain table query supports works over a view.
+//
+// Covered: a view over ONE table projecting bare columns, with or
+// without renaming and with or without its own WHERE. Refused (the
+// caller answers a SQL error rather than a wrong row set): a view over a
+// join or another view, an expression or aggregate in the view's select
+// list, `*`, and GROUP BY/HAVING/ORDER BY inside the view.
+
+/// A view's source text and its own column names, in field-id order.
+struct ViewDef {
+    source: String,
+    cols: Vec<String>,
+}
+
+/// Read `<name>` as a view. None when it is an ordinary table (no
+/// RDB$VIEW_SOURCE) or the blob cannot be read.
+fn view_of(db: &Database, name: &str) -> Option<ViewDef> {
+    let (rcols, rdescs) = sys_rel(db, "RDB$RELATIONS")?;
+    let fid = |n: &str| rcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (name_f, src_f) = (fid("RDB$RELATION_NAME")?, fid("RDB$VIEW_SOURCE")?);
+    let fmts = vec![(0u8, rdescs)];
+    let mut source: Option<String> = None;
+    for_each_record(db, 6, &fmts, |v| {
+        let hit = matches!(v.get(name_f),
+            Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
+        if !hit || source.is_some() {
+            return;
+        }
+        if let Some(Value::Blob(r, n)) = v.get(src_f) {
+            if let Some(b) = fire_crab_ods::read_blob_content(&db.bytes, db.page_size, *r, *n) {
+                source = Some(String::from_utf8_lossy(&b).into_owned());
+            }
+        }
+    });
+    let source = source?;
+    // the view's own columns, in field-id order
+    let mut cols: Vec<(u16, String)> = relation_columns(&db.bytes, db.page_size, name)
+        .into_iter()
+        .map(|c| (c.field_id, c.name))
+        .collect();
+    cols.sort_by_key(|(f, _)| *f);
+    Some(ViewDef { source, cols: cols.into_iter().map(|(_, n)| n).collect() })
+}
+
+/// Replace whole-word identifiers using `map` (case-insensitive), leaving
+/// string literals alone. Used to turn a view's column names into the
+/// base table's inside the outer query's clauses.
+fn replace_idents(text: &str, map: &[(String, String)]) -> String {
+    let b: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == '\'' {
+            out.push(b[i]);
+            i += 1;
+            while i < b.len() {
+                out.push(b[i]);
+                if b[i] == '\'' {
+                    i += 1;
+                    if i < b.len() && b[i] == '\'' {
+                        out.push(b[i]);
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$' {
+            let start = i;
+            while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$') {
+                i += 1;
+            }
+            let word: String = b[start..i].iter().collect();
+            match map.iter().find(|(from, _)| from.eq_ignore_ascii_case(&word)) {
+                Some((_, to)) => out.push_str(to),
+                None => out.push_str(&word),
+            }
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+/// If `sql`'s FROM names a VIEW, rewrite the query against the view's
+/// base table and return it for the planner to re-plan. None when the
+/// FROM is an ordinary table or the view is outside the supported shape.
+fn expand_view(sql: &str, db: &Database) -> Option<String> {
+    let (proj_s, table_s, where_s, group_s, having_s, order_s) = split_query(sql)?;
+    let (from, join) = parse_from(table_s)?;
+    if join.is_some() {
+        return None; // a join over a view: not this slice
+    }
+    let vd = view_of(db, from.table)?;
+    // the view's own source must be a single-table projection of bare
+    // columns; anything else would need real RSE merging
+    let (vproj, vtable, vwhere, vgroup, vhaving, vorder) = split_query(&vd.source)?;
+    if vgroup.is_some() || vhaving.is_some() || vorder.is_some() {
+        return None;
+    }
+    let (vfrom, vjoin) = parse_from(vtable)?;
+    if vjoin.is_some() {
+        return None;
+    }
+    // the base must be a TABLE, not another view
+    if view_of(db, vfrom.table).is_some() {
+        return None;
+    }
+    let base_cols: Vec<String> = match parse_projection(vproj)? {
+        Proj::Items(items) => items
+            .iter()
+            .map(|it| match it {
+                SelItem::Col(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?,
+        Proj::Star => return None, // `SELECT *` in a view: the positional
+                                   // mapping would have to be inferred
+    };
+    if base_cols.len() != vd.cols.len() {
+        return None;
+    }
+    // view column name -> base column name, skipping the identity pairs
+    let map: Vec<(String, String)> = vd
+        .cols
+        .iter()
+        .zip(base_cols.iter())
+        .filter(|(v, b)| !v.eq_ignore_ascii_case(b))
+        .map(|(v, b)| (v.clone(), b.clone()))
+        .collect();
+    let sub = |t: &str| -> String {
+        if map.is_empty() { t.to_string() } else { replace_idents(t, &map) }
+    };
+
+    // `SELECT *` over the view lists the view's columns explicitly, so
+    // the outer projection keeps naming what the client asked for
+    let proj_out = match parse_projection(proj_s)? {
+        Proj::Star => base_cols.join(", "),
+        _ => sub(proj_s),
+    };
+    let mut out = format!("SELECT {} FROM {}", proj_out, vfrom.table);
+    // the view's WHERE and the outer one both apply
+    match (vwhere, where_s) {
+        (Some(a), Some(b)) => {
+            out.push_str(&format!(" WHERE ({}) AND ({})", a, sub(b)));
+        }
+        (Some(a), None) => out.push_str(&format!(" WHERE {}", a)),
+        (None, Some(b)) => out.push_str(&format!(" WHERE {}", sub(b))),
+        (None, None) => {}
+    }
+    if let Some(g) = group_s {
+        out.push_str(&format!(" GROUP BY {}", sub(g)));
+    }
+    if let Some(h) = having_s {
+        out.push_str(&format!(" HAVING {}", sub(h)));
+    }
+    if let Some(o) = order_s {
+        out.push_str(&format!(" ORDER BY {}", sub(o)));
+    }
+    Some(out)
+}
+
 fn plan_query_inner(
     sql: &str,
     db: &Option<Database>,
@@ -8609,6 +8795,34 @@ fn plan_query_inner(
         if db.as_ref().is_some() {
             if let Some(seq) = parse_next_value(proj_s, table_s) {
                 return Some(Plan::GenIdIncrement { name: seq, step: None });
+            }
+        }
+    }
+    // a VIEW in the FROM: rewrite the query against the view's base
+    // table and re-plan it (see VIEWS). Done before anything else is
+    // resolved, so the rewritten text goes through the whole planner.
+    if let Some(dbr) = db.as_ref() {
+        if let Some(rewritten) = expand_view(sql, dbr) {
+            if trace {
+                eprintln!("[srv] plan: view expanded to {:?}", rewritten);
+            }
+            // parameter slots number in the REWRITTEN text's order
+            params.clear();
+            return plan_query_inner(&rewritten, db, params);
+        }
+        // A view this server cannot expand must REFUSE here. A view is a
+        // relation with a relation id but NO records of its own, so
+        // falling through would scan its empty storage and answer ZERO
+        // ROWS - a wrong answer that looks like a legitimately empty
+        // result.
+        if let Some((_, table_s, _, _, _, _)) = split_query(sql) {
+            if let Some((from, _)) = parse_from(table_s) {
+                if view_of(dbr, from.table).is_some() {
+                    if trace {
+                        eprintln!("[srv] plan: view {} is not expandable", from.table);
+                    }
+                    return Some(Plan::Refused);
+                }
             }
         }
     }
@@ -9388,7 +9602,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         Plan::Scalar(_) | Plan::GenIdIncrement { .. } => describe_one_bigint(params),
         // the procedure's output parameters, described like a projection
         Plan::ProcCall { cols, .. } | Plan::ProcInvoke { cols, .. } => build_describe(cols, params),
-        Plan::ProcError => build_describe(&[], params),
+        Plan::Refused => build_describe(&[], params),
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
@@ -9438,7 +9652,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::Project { .. }
         | Plan::Join { .. }
         | Plan::Group { .. }
-        | Plan::ProcError
+        | Plan::Refused
         | Plan::VirtualEmpty { .. } => 1,
         Plan::Insert { .. } => 2,
         Plan::Update { .. } => 3,
@@ -9824,7 +10038,7 @@ fn emit_rows_inner(
         // way a mid-cursor evaluation error is
         // ProcInvoke is replaced at op_execute; reaching a fetch still
         // holding one means the statement was never executed
-        Plan::ProcError | Plan::ProcInvoke { .. } => {
+        Plan::Refused | Plan::ProcInvoke { .. } => {
             return Err(EmitErr::Eval(EvalErr::ConversionError))
         }
         Plan::ProcCall { cols, values } => {
