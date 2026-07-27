@@ -145,18 +145,17 @@ both_fail "SKIP before FIRST is a syntax error"     "SELECT SKIP 1 FIRST 2 ID FR
 # --- combined with the other components --------------------------------
 same "a modifier over a VIEW"        "SELECT FIRST 2 ID FROM V ORDER BY ID"
 same "DISTINCT over a VIEW"          "SELECT DISTINCT A FROM V ORDER BY 1"
-# KNOWN LIMIT, stated rather than hidden: a modifier over a SELECTABLE
-# PROCEDURE is refused. The engine supports `SELECT FIRST 3 K FROM
-# GEN(10)`; fire-crab does not, because the procedure plan is deferred
-# (the body runs at execute) and wrapping it in a modifier needs the
-# execute hook to unwrap a level. It must FAIL rather than half-work.
-out=$(printf 'SELECT FIRST 3 K FROM GEN(10);\n' |
-      "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
-case "$out" in
-    *"Statement failed"*|*error*|*ERROR*)
-        echo "OK   a modifier over a procedure is refused (engine supports it - known limit)" ;;
-    *) echo "DIFF a modifier over a procedure answered [$out]"; fail=1 ;;
-esac
+# A modifier over a SELECTABLE PROCEDURE. The procedure plan is deferred
+# - the body runs at execute, because there are no rows to slice until it
+# has - so the modifier is rebuilt around the rows SUSPEND produced. The
+# body still runs in full; the modifier slices the result, it does not
+# stop the loop early.
+same "FIRST over a procedure"        "SELECT FIRST 3 K FROM GEN(10)"
+same "SKIP over a procedure"         "SELECT SKIP 7 K FROM GEN(10)"
+same "FIRST and SKIP over a procedure" "SELECT FIRST 2 SKIP 3 K FROM GEN(10)"
+same "DISTINCT over a procedure"     "SELECT DISTINCT K FROM GEN(3)"
+same "a modifier over an empty procedure" "SELECT FIRST 3 K FROM GEN(0)"
+same "ROWS over a procedure"         "SELECT K FROM GEN(10) ROWS 2 TO 4"
 same "DISTINCT over a UNION"         "SELECT DISTINCT A FROM T UNION SELECT A FROM T ORDER BY 1"
 
 # --- teeth -------------------------------------------------------------

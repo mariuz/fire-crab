@@ -3843,9 +3843,15 @@ Both are converted to a common `(skip, take)` so they cannot drift apart.
 semantics, the same rule `UNION` uses, and the opposite of `= NULL` in a
 predicate. Two all-NULL rows collapse to one rather than vanishing.
 
-Refused: a modifier over a selectable procedure (the engine supports it;
-the procedure plan is deferred and wrapping it needs the execute hook to
-unwrap a level), `FIRST ?`, and `FIRST (expr)`.
+A modifier over a **selectable procedure** works too, and is the one case
+that needs more than wrapping. The procedure plan is *deferred* — the
+body runs at `op_execute`, because there are no rows to slice until it
+has — so the execute hook unwraps one level, runs the body, and rebuilds
+the modifier around the rows `SUSPEND` produced. The body still runs in
+full: the modifier slices the result, it does not stop the loop early.
+
+Refused: `FIRST ?` and `FIRST (expr)` — a limit that is a parameter or an
+expression rather than a literal.
 
 ### One materialising path, and the ordering bug it hid
 

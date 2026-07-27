@@ -9403,15 +9403,15 @@ fn plan_query_inner(
         let Some(plan) = plan_query_inner(&inner_sql, db, params) else {
             return Some(Plan::Refused);
         };
-        // KNOWN LIMIT: a modifier over a SELECTABLE PROCEDURE is
-        // REFUSED. ProcSelect is the deferred form - the body runs at
-        // op_execute and the plan becomes ProcRows - so wrapping it needs
-        // the execute hook to unwrap a level. That was wired and still
-        // failed at fetch, so it is refused deliberately rather than left
-        // half-working. The engine supports it; this does not.
+        // ProcSelect is the DEFERRED form of a selectable procedure: the
+        // body runs at op_execute and the plan becomes ProcRows, so a
+        // modifier may wrap one and the execute hook unwraps a level.
         if !matches!(
             plan,
-            Plan::Project { .. } | Plan::Union { .. } | Plan::ProcRows { .. }
+            Plan::Project { .. }
+                | Plan::Union { .. }
+                | Plan::ProcRows { .. }
+                | Plan::ProcSelect { .. }
         ) {
             return Some(Plan::Refused);
         }
@@ -15515,6 +15515,58 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
                     }
+                    }
+                } else if matches!(&plan, Plan::Modified { inner, .. }
+                    if matches!(**inner, Plan::ProcSelect { .. }))
+                {
+                    // A MODIFIER OVER A SELECTABLE PROCEDURE. The inner
+                    // plan is deferred - the body has to run before there
+                    // are any rows to slice - so it runs HERE and the
+                    // modifier is rebuilt around the rows it SUSPENDed.
+                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!("[srv] modifier over a procedure: running the body");
+                    }
+                    let (pname, pargs, icols, picks, outer) = match &plan {
+                        Plan::Modified { inner, cols, distinct, skip, take } => match &**inner {
+                            Plan::ProcSelect { name, args, cols: ic, picks } => (
+                                name.clone(),
+                                args.clone(),
+                                ic.clone(),
+                                picks.clone(),
+                                (cols.clone(), *distinct, *skip, *take),
+                            ),
+                            _ => unreachable!(),
+                        },
+                        _ => unreachable!(),
+                    };
+                    let ctx = SessionCtx { user, attach_id };
+                    match run_procedure(&mut database, &pname, &pargs, &ctx) {
+                        Ok((_, suspended)) => {
+                            let rows: Vec<Vec<Value>> = suspended
+                                .iter()
+                                .map(|r| {
+                                    picks
+                                        .iter()
+                                        .map(|p| r.get(*p).cloned().unwrap_or(Value::Null))
+                                        .collect()
+                                })
+                                .collect();
+                            let (mcols, distinct, skip, take) = outer;
+                            plan = Plan::Modified {
+                                inner: Box::new(Plan::ProcRows { cols: icols, rows }),
+                                cols: mcols,
+                                distinct,
+                                skip,
+                                take,
+                            };
+                            respond(&mut s, &mut enc, TX_HANDLE)?;
+                        }
+                        Err(e) => {
+                            if std::env::var("FC_SRV_TRACE").is_ok() {
+                                eprintln!("[srv] modified procedure failed: {}", e);
+                            }
+                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                        }
                     }
                 } else if matches!(plan, Plan::ProcSelect { .. }) {
                     // a selectable procedure: run the body HERE (it may
