@@ -50,6 +50,11 @@ const BLR_REQ_HANDLE: i32 = 5;
 const OP_COND_ACCEPT: i32 = 98;
 const OP_CANCEL: i32 = 91;
 const OP_INFO_DATABASE: i32 = 40;
+/// `op_info_transaction` (protocol.h) - isc_transaction_info. A client
+/// asks a live transaction about itself (its id, its isolation, its
+/// snapshot number). Leaving it unhandled used to END THE CONNECTION,
+/// which libfbclient turns into a teardown SEGFAULT.
+const OP_INFO_TRANSACTION: i32 = 42;
 const OP_INFO_SQL: i32 = 70;
 const OP_OPEN_BLOB: i32 = 35;
 const OP_GET_SEGMENT: i32 = 36;
@@ -11925,6 +11930,77 @@ fn resolve_having(
 }
 
 /// Serve one connection to completion.
+// ===================================================================
+// PER-STATEMENT STATE
+//
+// A client may keep SEVERAL statements open on ONE connection: two
+// cursors over different tables, or a cursor left open while an
+// EXECUTE PROCEDURE runs beside it. This server used to answer every
+// op_allocate_statement with the same handle (3) and keep a single
+// working set, so the SECOND prepare silently clobbered the first and
+// a fetch on the first served the SECOND statement's rows. A client
+// cannot parse another statement's row into its output buffer, so it
+// declares the connection corrupt and shuts it down - and libfbclient
+// then SEGFAULTS in its own teardown, which is what took whole
+// firebird-qa runs down (and, quieter but worse, could hand back the
+// wrong rows without erroring at all).
+//
+// Each handle now owns its working set. The op-loop keeps ONE set live
+// in locals - every arm reads them directly, unchanged - and swaps it
+// against this map whenever an op names a different statement.
+struct StmtSlot {
+    sql: String,
+    plan: Plan,
+    params: Vec<Descriptor>,
+    bound: Vec<WireParam>,
+    last_dml: (i32, i32, i32),
+}
+
+/// Make `to` the live statement, parking whatever was live before.
+#[allow(clippy::too_many_arguments)]
+fn switch_stmt(
+    to: i32,
+    cur: &mut i32,
+    slots: &mut std::collections::HashMap<i32, StmtSlot>,
+    sql: &mut String,
+    plan: &mut Plan,
+    params: &mut Vec<Descriptor>,
+    bound: &mut Vec<WireParam>,
+    last_dml: &mut (i32, i32, i32),
+) {
+    if to == *cur {
+        return;
+    }
+    slots.insert(
+        *cur,
+        StmtSlot {
+            sql: std::mem::take(sql),
+            plan: std::mem::replace(plan, Plan::Scalar(Some(FIXED_ANSWER))),
+            params: std::mem::take(params),
+            bound: std::mem::take(bound),
+            last_dml: *last_dml,
+        },
+    );
+    match slots.remove(&to) {
+        Some(sl) => {
+            *sql = sl.sql;
+            *plan = sl.plan;
+            *params = sl.params;
+            *bound = sl.bound;
+            *last_dml = sl.last_dml;
+        }
+        // a handle the client allocated but never prepared
+        None => {
+            sql.clear();
+            *plan = Plan::Scalar(Some(FIXED_ANSWER));
+            params.clear();
+            bound.clear();
+            *last_dml = (0, 0, 0);
+        }
+    }
+    *cur = to;
+}
+
 fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     let mut none: Option<Rc4> = None;
 
@@ -12124,6 +12200,30 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     let mut stmt_params: Vec<Descriptor> = Vec::new();
     let mut bound_args: Vec<WireParam> = Vec::new();
     let mut last_dml = (0i32, 0i32, 0i32); // (inserted, updated, deleted)
+    // The five locals above are the LIVE statement's working set;
+    // every other open statement's set is parked here. `cur_stmt` says
+    // which handle the locals currently belong to. See StmtSlot.
+    let mut stmts: std::collections::HashMap<i32, StmtSlot> = std::collections::HashMap::new();
+    let mut cur_stmt: i32 = 3;
+    // handles run 3, 4, 5, ... - starting at 3 keeps the first one the
+    // value every existing gate already expects, and they stay well
+    // below the blob range (7000+) so the two never collide.
+    let mut next_stmt_handle: i32 = 2;
+    // Park/restore the working set when an op names another statement.
+    macro_rules! use_stmt {
+        ($h:expr) => {
+            switch_stmt(
+                $h,
+                &mut cur_stmt,
+                &mut stmts,
+                &mut stmt_sql,
+                &mut plan,
+                &mut stmt_params,
+                &mut bound_args,
+                &mut last_dml,
+            )
+        };
+    }
     // open blobs: handle -> (assembled content, read cursor). Content is
     // assembled at open (the whole file is in memory anyway); get_segment
     // then just slices it.
@@ -12334,11 +12434,15 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
             }
             x if x == OP_ALLOCATE_STATEMENT => {
                 read_int(&mut s, &mut dec)?; // db handle
-                respond(&mut s, &mut enc, 3)?; // stmt handle 3 (distinct from attach 1, tr 2)
+                // a FRESH handle per allocation (3, 4, 5, ...) - one
+                // handle for every statement the client keeps open
+                next_stmt_handle += 1;
+                respond(&mut s, &mut enc, next_stmt_handle)?;
             }
             x if x == OP_PREPARE_STATEMENT => {
                 read_int(&mut s, &mut dec)?; // tr
-                read_int(&mut s, &mut dec)?; // stmt
+                let h = read_int(&mut s, &mut dec)?; // stmt
+                use_stmt!(h);
                 read_int(&mut s, &mut dec)?; // dialect
                 let sql = read_wire_bytes(&mut s, &mut dec)?; // sql
                 let prep_items = read_wire_bytes(&mut s, &mut dec)?; // items
@@ -12448,7 +12552,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 }
             }
             x if x == OP_EXECUTE => {
-                read_int(&mut s, &mut dec)?; // stmt
+                let h = read_int(&mut s, &mut dec)?; // stmt
+                use_stmt!(h);
                 read_int(&mut s, &mut dec)?; // tr
                 let in_blr = read_wire_bytes(&mut s, &mut dec)?; // input blr
                 read_int(&mut s, &mut dec)?; // msg number
@@ -12595,7 +12700,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
             x if x == OP_INFO_SQL => {
                 // the client asks for statement info - after DML it wants
                 // isc_info_sql_records (the per-verb row counts)
-                read_int(&mut s, &mut dec)?; // stmt handle
+                let h = read_int(&mut s, &mut dec)?; // stmt handle
+                use_stmt!(h);
                 read_int(&mut s, &mut dec)?; // incarnation
                 let items = read_wire_bytes(&mut s, &mut dec)?;
                 read_int(&mut s, &mut dec)?; // buffer length
@@ -12608,7 +12714,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 w.send(&mut s, &mut enc)?;
             }
             x if x == OP_FETCH => {
-                read_int(&mut s, &mut dec)?; // stmt
+                let h = read_int(&mut s, &mut dec)?; // stmt
+                use_stmt!(h);
                 read_wire_bytes(&mut s, &mut dec)?; // blr
                 read_int(&mut s, &mut dec)?; // msg number
                 read_int(&mut s, &mut dec)?; // count
@@ -12645,8 +12752,21 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 w.send(&mut s, &mut enc)?;
             }
             x if x == OP_FREE_STATEMENT => {
-                read_int(&mut s, &mut dec)?; // stmt
-                read_int(&mut s, &mut dec)?; // op
+                let h = read_int(&mut s, &mut dec)?; // stmt
+                let how = read_int(&mut s, &mut dec)?; // 1 close, 2 drop, 4 unprepare
+                // DROP retires the handle for good; CLOSE only ends the
+                // cursor and leaves the statement prepared for another
+                // execute, so its working set must survive.
+                if how == 2 {
+                    stmts.remove(&h);
+                    if h == cur_stmt {
+                        stmt_sql.clear();
+                        plan = Plan::Scalar(Some(FIXED_ANSWER));
+                        stmt_params.clear();
+                        bound_args.clear();
+                        last_dml = (0, 0, 0);
+                    }
+                }
                 respond(&mut s, &mut enc, 0)?;
             }
             x if x == OP_COMMIT || x == OP_ROLLBACK => {
@@ -12742,6 +12862,53 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         .unwrap_or(0),
                 };
                 let info = build_db_info(&items, &ctx);
+                let mut w = W::default();
+                w.int(OP_RESPONSE).int(0).int(0).int(0).bytes(&info).int(0);
+                w.send(&mut s, &mut enc)?;
+            }
+            x if x == OP_INFO_TRANSACTION => {
+                // isc_transaction_info - a client asking a live
+                // transaction about itself. This server runs one
+                // transaction per attachment and has no snapshot
+                // machinery, so it answers the items it can mean
+                // honestly and SKIPS the rest (build_db_info's rule for
+                // an unknown item). Answering at all is the point: the
+                // arm exists so an info request never ends the
+                // connection, because libfbclient SEGFAULTS on that.
+                read_int(&mut s, &mut dec)?; // tr handle
+                read_int(&mut s, &mut dec)?; // incarnation
+                let items = read_wire_bytes(&mut s, &mut dec)?;
+                read_int(&mut s, &mut dec)?; // buffer length
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] op_info_transaction items: {:?}", items);
+                }
+                // the header's next-transaction counter is the id this
+                // attachment's work carries (the same value the
+                // CURRENT_TRANSACTION session default resolves to)
+                let tra_id = database
+                    .as_ref()
+                    .and_then(|d| d.bytes.get(40..44))
+                    .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]).wrapping_add(1))
+                    .unwrap_or(1);
+                let mut info: Vec<u8> = Vec::new();
+                for &code in items.iter() {
+                    match code {
+                        4 => {
+                            // isc_info_tra_id
+                            info.push(4);
+                            info.extend_from_slice(&4u16.to_le_bytes());
+                            info.extend_from_slice(&tra_id.to_le_bytes());
+                        }
+                        1 => break, // isc_info_end already in the request
+                        // everything else - oldest_interesting/snapshot/
+                        // active, isolation, access, lock_timeout, dbpath
+                        // and fb_info_tra_snapshot_number - would be a
+                        // GUESS, and a wrong snapshot number reads as a
+                        // real answer. Skipped rather than invented.
+                        _ => {}
+                    }
+                }
+                info.push(1); // isc_info_end
                 let mut w = W::default();
                 w.int(OP_RESPONSE).int(0).int(0).int(0).bytes(&info).int(0);
                 w.send(&mut s, &mut enc)?;
@@ -12850,7 +13017,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
             // connection mid-request, and libfbclient SEGFAULTS on that
             // (it took the whole firebird-qa run down with it).
             x if x == OP_EXECUTE2 => {
-                read_int(&mut s, &mut dec)?; // stmt
+                let h = read_int(&mut s, &mut dec)?; // stmt
+                use_stmt!(h);
                 read_int(&mut s, &mut dec)?; // tr
                 let in_blr = read_wire_bytes(&mut s, &mut dec)?; // input blr
                 read_int(&mut s, &mut dec)?; // msg number
