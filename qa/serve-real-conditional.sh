@@ -27,19 +27,20 @@
 # and against fire-crab, and the values must match - NULLs included,
 # which is the point.
 #
-# TWO KNOWN GAPS, stated rather than asserted away:
+# Two wrong-answer paths that this surface used to have, both now closed
+# and asserted below:
 #
-#   * a conditional over a SCALED NUMERIC column mixed with a decimal
-#     literal (`COALESCE(N, 0.00)`) is not typed yet and falls back to the
-#     fixed-answer plan rather than refusing - the same 4242 hazard that
-#     has had to be cut off for procedures, views and unions, not yet cut
-#     off here;
-#   * a wrong-arity call (`COALESCE(A)`, `NULLIF(A)`) does the same. The
-#     parse declines, the word is then read as a column name, and the
-#     query falls back instead of raising.
-#
-# Both are wrong-answer paths, not merely missing features, and are the
-# first thing to fix on this surface.
+#   * a conditional mixing a SCALED NUMERIC column with a decimal literal
+#     (`COALESCE(N, 0.00)`) typed as Numeric but could not SIZE itself,
+#     because result_scale had no arm for a conditional. A conditional's
+#     scale is its WIDEST branch's - and scales are negative, so widest is
+#     the MINIMUM; anything narrower truncates a branch's value into a
+#     column that cannot hold it.
+#   * a wrong-arity call (`COALESCE(A)`) had its parse decline, the text
+#     read as a column name, and the whole query fall back to the
+#     fixed-answer plan - 4242 in reply to a broken function call. Any
+#     failure to resolve a select list that NAMES a conditional now
+#     raises instead.
 #
 #   qa/serve-real-conditional.sh [port]
 
@@ -98,6 +99,10 @@ same "COALESCE where all are NULL"  "SELECT COALESCE(A, N) FROM T WHERE ID = 3"
 same "COALESCE picks the first non-NULL" "SELECT COALESCE(B, A, 42) FROM T ORDER BY ID"
 same "COALESCE over text"           "SELECT COALESCE(S, 'none') FROM T ORDER BY ID"
 same "COALESCE with a literal first" "SELECT COALESCE(7, A) FROM T ORDER BY ID"
+same "COALESCE over a scaled NUMERIC"  "SELECT COALESCE(N, 0.00) FROM T ORDER BY ID"
+same "COALESCE, NUMERIC and an integer literal" "SELECT COALESCE(N, 0) FROM T ORDER BY ID"
+same "NULLIF over a scaled NUMERIC"    "SELECT NULLIF(N, 12.50) FROM T ORDER BY ID"
+same "IIF returning a scaled NUMERIC"  "SELECT IIF(N IS NULL, 0.00, N) FROM T ORDER BY ID"
 same "COALESCE over a BIGINT"       "SELECT COALESCE(K, 0) FROM T ORDER BY ID"
 
 # --- NULLIF ------------------------------------------------------------
@@ -152,5 +157,26 @@ if [ "$v" = "222" ]; then
 else
     echo "DIFF IIF with an UNKNOWN condition gave [$v], want 222"; fail=1
 fi
+
+# a wrong-arity call must RAISE, not answer the fixed-answer constant
+for bad in "SELECT COALESCE(A) FROM T" "SELECT NULLIF(A) FROM T" \
+           "SELECT NULLIF(A, 1, 2) FROM T" "SELECT IIF(A > 1) FROM T"; do
+    out=$(printf '%s;\n' "$bad" |
+          "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
+    case "$out" in
+        *"Statement failed"*|*error*|*ERROR*)
+            echo "OK   teeth: [$bad] is refused" ;;
+        *) echo "DIFF [$bad] answered [$out] instead of raising"; fail=1 ;;
+    esac
+done
+# ...and the fixed-answer constant must appear NOWHERE in this gate's
+# answers, since every query here is one the server should either answer
+# correctly or refuse
+out=$(printf 'SET HEADING OFF;\nSELECT COALESCE(A, 0) FROM T;\nSELECT NULLIF(A, 10) FROM T;\n' |
+      "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1)
+case "$out" in
+    *4242*) echo "DIFF the fixed-answer constant 4242 leaked into a conditional's result"; fail=1 ;;
+    *) echo "OK   teeth: no fixed-answer constant in any conditional result" ;;
+esac
 
 exit $fail

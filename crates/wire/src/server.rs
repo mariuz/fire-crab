@@ -9614,10 +9614,39 @@ fn plan_query_inner(
             }
         }
     }
+    // Does the select list name a conditional function? If so, ANY
+    // failure to resolve it must RAISE rather than fall through: the
+    // fallback answers 4242, and 4242 in reply to a broken function call
+    // is a wrong answer dressed as a result.
+    let names_conditional = {
+        let up = proj_s.to_ascii_uppercase();
+        ["COALESCE(", "NULLIF(", "IIF("].iter().any(|f| up.contains(f))
+    };
     let Some(proj) = parse_projection(proj_s) else {
         if trace { eprintln!("[srv] plan: parse_projection failed"); }
-        return None;
+        return if names_conditional { Some(Plan::Refused) } else { None };
     };
+    // A MALFORMED CONDITIONAL CALL MUST RAISE. When the expression
+    // parser declines `COALESCE(A)` - one operand where two are needed -
+    // the text falls through to the column resolver, which looks for a
+    // column literally named `COALESCE(A)`, fails, and takes the whole
+    // query to the fixed-answer plan: 4242 in answer to a broken
+    // function call. Catch it here instead.
+    if names_conditional {
+        if let Proj::Items(items) = &proj {
+            for it in items {
+                if let SelItem::Col(name) = it {
+                    let up = name.to_ascii_uppercase();
+                    if ["COALESCE(", "NULLIF(", "IIF("].iter().any(|f| up.contains(f)) {
+                        if trace {
+                            eprintln!("[srv] plan: malformed conditional call {:?}", name);
+                        }
+                        return Some(Plan::Refused);
+                    }
+                }
+            }
+        }
+    }
     let db = db.as_ref()?;
     let Some((left, join)) = parse_from(table_s) else {
         if trace { eprintln!("[srv] plan: FROM parse failed for {:?}", table_s); }
@@ -12226,6 +12255,22 @@ impl Expr {
             }
             Expr::Int(_) => Some(0),
             Expr::Dec(_, scale) => Some(*scale),
+            // A CONDITIONAL'S SCALE IS ITS WIDEST BRANCH'S. Scales are
+            // negative (12.50 is scale -2), so "widest" is the MINIMUM -
+            // taking anything narrower would truncate a branch's value
+            // into a column that cannot hold it. Missing these arms was
+            // why a conditional mixing a NUMERIC column with a decimal
+            // literal typed as Numeric and then failed to size itself,
+            // falling back to the fixed-answer plan.
+            Expr::Coalesce(args) => args.iter().filter_map(|a| a.result_scale(descs)).min(),
+            Expr::NullIf(a, b) => [a.result_scale(descs), b.result_scale(descs)]
+                .into_iter()
+                .flatten()
+                .min(),
+            Expr::Iif(_, a, b) => [a.result_scale(descs), b.result_scale(descs)]
+                .into_iter()
+                .flatten()
+                .min(),
             Expr::Neg(e) => e.result_scale(descs),
             Expr::Bin(a, op, b) => {
                 // a NULL literal operand mirrors its sibling - the engine's
