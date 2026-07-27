@@ -11440,6 +11440,26 @@ enum RawExpr {
     Concat(Box<RawExpr>, Box<RawExpr>),
     /// `CAST(a AS <type>)` - convert to the target type
     Cast(Box<RawExpr>, CastTarget),
+    /// `COALESCE(a, b, ...)` - the first operand that is not NULL, or
+    /// NULL when they all are. Two or more operands.
+    Coalesce(Vec<RawExpr>),
+    /// `NULLIF(a, b)` - NULL when the two are equal, otherwise `a`.
+    NullIf(Box<RawExpr>, Box<RawExpr>),
+    /// `IIF(<cond>, a, b)` - `a` when the condition is TRUE, `b` when it
+    /// is false OR UNKNOWN (the engine's rule: only TRUE takes the
+    /// then-branch, so a NULL comparison takes the else).
+    Iif(Box<RawCond>, Box<RawExpr>, Box<RawExpr>),
+}
+
+/// The condition inside an `IIF` - a comparison of two expressions, or a
+/// NULL test. Kept separate from the WHERE predicate machinery because
+/// this one lives INSIDE an expression and evaluates per row to a value,
+/// not to a filter.
+#[derive(Clone)]
+enum RawCond {
+    Cmp(Box<RawExpr>, Cmp, Box<RawExpr>),
+    IsNull(Box<RawExpr>),
+    IsNotNull(Box<RawExpr>),
 }
 
 /// The target of a `CAST`. Text targets carry their declared width and
@@ -11479,6 +11499,53 @@ fn parse_raw_expr(s: &str) -> Option<RawExpr> {
 /// [parse_raw_expr] without the bare-column rejection - what a stored
 /// COMPUTED BY source needs: `COMPUTED BY (S)` is a legitimate bare
 /// field reference (the engine keeps the referenced column's type).
+/// Parse the condition inside an `IIF`: `<expr> <cmp> <expr>` or
+/// `<expr> IS [NOT] NULL`.
+fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
+    let left = expr_add(b, pos)?;
+    skip_ws(b, pos);
+    if take_keyword(b, pos, "IS") {
+        skip_ws(b, pos);
+        let negated = take_keyword(b, pos, "NOT");
+        skip_ws(b, pos);
+        if !take_keyword(b, pos, "NULL") {
+            return None;
+        }
+        return Some(if negated {
+            RawCond::IsNotNull(Box::new(left))
+        } else {
+            RawCond::IsNull(Box::new(left))
+        });
+    }
+    // a comparison operator, longest match first
+    let two: String = b.get(*pos..*pos + 2).map(|c| c.iter().collect()).unwrap_or_default();
+    let op = match two.as_str() {
+        "<>" => Some(Cmp::Ne),
+        "!=" => Some(Cmp::Ne),
+        "<=" => Some(Cmp::Le),
+        ">=" => Some(Cmp::Ge),
+        _ => None,
+    };
+    let op = match op {
+        Some(o) => {
+            *pos += 2;
+            o
+        }
+        None => {
+            let one = *b.get(*pos)?;
+            *pos += 1;
+            match one {
+                '=' => Cmp::Eq,
+                '<' => Cmp::Lt,
+                '>' => Cmp::Gt,
+                _ => return None,
+            }
+        }
+    };
+    let right = expr_add(b, pos)?;
+    Some(RawCond::Cmp(Box::new(left), op, Box::new(right)))
+}
+
 fn parse_raw_expr_any(s: &str) -> Option<RawExpr> {
     let b: Vec<char> = s.chars().collect();
     let mut pos = 0usize;
@@ -11665,6 +11732,64 @@ fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                 }
                 *pos += 1; // ')'
                 Some(RawExpr::Cast(Box::new(inner), target))
+            } else if !quoted
+                && (word.eq_ignore_ascii_case("COALESCE")
+                    || word.eq_ignore_ascii_case("NULLIF")
+                    || word.eq_ignore_ascii_case("IIF"))
+                && {
+                    skip_ws(b, pos);
+                    b.get(*pos) == Some(&'(')
+                }
+            {
+                *pos += 1; // '('
+                let up = word.to_ascii_uppercase();
+                let node = if up == "IIF" {
+                    // IIF(<cond>, <then>, <else>)
+                    let cond = parse_raw_cond(b, pos)?;
+                    skip_ws(b, pos);
+                    if b.get(*pos) != Some(&',') {
+                        return None;
+                    }
+                    *pos += 1;
+                    let a = expr_add(b, pos)?;
+                    skip_ws(b, pos);
+                    if b.get(*pos) != Some(&',') {
+                        return None;
+                    }
+                    *pos += 1;
+                    let c = expr_add(b, pos)?;
+                    RawExpr::Iif(Box::new(cond), Box::new(a), Box::new(c))
+                } else {
+                    let mut args = vec![expr_add(b, pos)?];
+                    loop {
+                        skip_ws(b, pos);
+                        if b.get(*pos) != Some(&',') {
+                            break;
+                        }
+                        *pos += 1;
+                        args.push(expr_add(b, pos)?);
+                    }
+                    if up == "NULLIF" {
+                        if args.len() != 2 {
+                            return None;
+                        }
+                        let bb = args.pop()?;
+                        let aa = args.pop()?;
+                        RawExpr::NullIf(Box::new(aa), Box::new(bb))
+                    } else {
+                        // COALESCE needs at least two operands
+                        if args.len() < 2 {
+                            return None;
+                        }
+                        RawExpr::Coalesce(args)
+                    }
+                };
+                skip_ws(b, pos);
+                if b.get(*pos) != Some(&')') {
+                    return None;
+                }
+                *pos += 1; // ')'
+                Some(node)
             } else {
                 Some(RawExpr::Col(word))
             }
@@ -11739,6 +11864,22 @@ fn parse_cast_target(b: &[char], pos: &mut usize) -> Option<CastTarget> {
 /// Resolve a raw expression's column names to field ids against the
 /// relation, producing a typed [Expr]. None on an unknown column or an
 /// unsupported column type (the caller then falls back).
+fn resolve_raw_cond(
+    c: &RawCond,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+) -> Option<Cond2> {
+    Some(match c {
+        RawCond::Cmp(a, op, b) => Cond2::Cmp(
+            Box::new(resolve_expr(a, columns, descs)?),
+            *op,
+            Box::new(resolve_expr(b, columns, descs)?),
+        ),
+        RawCond::IsNull(a) => Cond2::IsNull(Box::new(resolve_expr(a, columns, descs)?)),
+        RawCond::IsNotNull(a) => Cond2::IsNotNull(Box::new(resolve_expr(a, columns, descs)?)),
+    })
+}
+
 fn resolve_expr(
     raw: &RawExpr,
     columns: &[RelationColumn],
@@ -11775,6 +11916,20 @@ fn resolve_expr(
             Box::new(resolve_expr(b, columns, descs)?),
         ),
         RawExpr::Cast(e, t) => Expr::Cast(Box::new(resolve_expr(e, columns, descs)?), *t),
+        RawExpr::Coalesce(args) => Expr::Coalesce(
+            args.iter()
+                .map(|a| resolve_expr(a, columns, descs))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        RawExpr::NullIf(a, b) => Expr::NullIf(
+            Box::new(resolve_expr(a, columns, descs)?),
+            Box::new(resolve_expr(b, columns, descs)?),
+        ),
+        RawExpr::Iif(c, a, b) => Expr::Iif(
+            Box::new(resolve_raw_cond(c, columns, descs)?),
+            Box::new(resolve_expr(a, columns, descs)?),
+            Box::new(resolve_expr(b, columns, descs)?),
+        ),
     })
 }
 
@@ -11798,6 +11953,47 @@ enum Expr {
     Concat(Box<Expr>, Box<Expr>),
     /// `CAST(a AS <type>)` - convert the operand to the target type
     Cast(Box<Expr>, CastTarget),
+    /// `COALESCE(a, b, ...)` - the first non-NULL operand
+    Coalesce(Vec<Expr>),
+    /// `NULLIF(a, b)` - NULL when equal, else `a`
+    NullIf(Box<Expr>, Box<Expr>),
+    /// `IIF(<cond>, a, b)` - only a TRUE condition takes `a`
+    Iif(Box<Cond2>, Box<Expr>, Box<Expr>),
+}
+
+/// A resolved [RawCond].
+#[derive(Clone)]
+enum Cond2 {
+    Cmp(Box<Expr>, Cmp, Box<Expr>),
+    IsNull(Box<Expr>),
+    IsNotNull(Box<Expr>),
+}
+
+impl Cond2 {
+    /// Three-valued: None is UNKNOWN, which an IIF treats as false.
+    fn eval(&self, values: &[Value]) -> Result<Option<bool>, EvalErr> {
+        Ok(match self {
+            Cond2::IsNull(a) => Some(matches!(a.eval(values)?, Value::Null)),
+            Cond2::IsNotNull(a) => Some(!matches!(a.eval(values)?, Value::Null)),
+            Cond2::Cmp(a, op, b) => {
+                let (x, y) = (a.eval(values)?, b.eval(values)?);
+                if matches!(x, Value::Null) || matches!(y, Value::Null) {
+                    None
+                } else {
+                    // exact numeric alignment first (see NullIf)
+                    let o = num_cmp(&x, &y).unwrap_or_else(|| value_cmp(&x, &y));
+                    Some(match op {
+                        Cmp::Eq => o == std::cmp::Ordering::Equal,
+                        Cmp::Ne => o != std::cmp::Ordering::Equal,
+                        Cmp::Lt => o == std::cmp::Ordering::Less,
+                        Cmp::Le => o != std::cmp::Ordering::Greater,
+                        Cmp::Gt => o == std::cmp::Ordering::Greater,
+                        Cmp::Ge => o != std::cmp::Ordering::Less,
+                    })
+                }
+            }
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -11867,7 +12063,7 @@ fn numeric_parts(v: &Value) -> Option<(i128, i8)> {
 /// multiplication or division with any `I64` or `I128` operand is
 /// INT128, addition and subtraction only widen past INT64 when an
 /// operand already IS `I128`.
-#[derive(Clone, Copy, PartialEq, PartialOrd, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum NumRank {
     /// SMALLINT/INTEGER storage, and literals within `i32`
     Long,
@@ -11954,6 +12150,13 @@ impl Expr {
     /// then falls back rather than answering wrong).
     fn type_of(&self, descs: &[Descriptor]) -> Option<ExprType> {
         match self {
+            // a conditional's type is its branches': the first one that
+            // types wins, and a NULL branch is untyped so it defers to
+            // its sibling (the engine takes the same view of a CASE's
+            // result type)
+            Expr::Coalesce(args) => args.iter().find_map(|a| a.type_of(descs)),
+            Expr::NullIf(a, b) => a.type_of(descs).or_else(|| b.type_of(descs)),
+            Expr::Iif(_, a, b) => a.type_of(descs).or_else(|| b.type_of(descs)),
             Expr::Col(fid) => {
                 let d = descs.get(*fid)?;
                 match col_kind(d) {
@@ -12053,6 +12256,15 @@ impl Expr {
     /// engine's getDesc copies the non-null side. None = not numeric.
     fn rank_of(&self, descs: &[Descriptor]) -> Option<NumRank> {
         match self {
+            // the widest branch decides the width, so a value from any
+            // branch fits the announced column
+            Expr::Coalesce(args) => args.iter().filter_map(|a| a.rank_of(descs)).max(),
+            Expr::NullIf(a, b) => {
+                [a.rank_of(descs), b.rank_of(descs)].into_iter().flatten().max()
+            }
+            Expr::Iif(_, a, b) => {
+                [a.rank_of(descs), b.rank_of(descs)].into_iter().flatten().max()
+            }
             Expr::Col(fid) => {
                 let d = descs.get(*fid)?;
                 match d.dtype {
@@ -12118,6 +12330,45 @@ impl Expr {
     /// `Err(EvalErr)` is a per-row arithmetic exception (divide by zero).
     fn eval(&self, values: &[Value]) -> Result<Value, EvalErr> {
         Ok(match self {
+            // the first operand that is not NULL; NULL when all are
+            Expr::Coalesce(args) => {
+                let mut out = Value::Null;
+                for a in args {
+                    let v = a.eval(values)?;
+                    if !matches!(v, Value::Null) {
+                        out = v;
+                        break;
+                    }
+                }
+                out
+            }
+            // NULL when the two are equal, otherwise the first. A NULL
+            // operand makes the comparison UNKNOWN, which is not equal,
+            // so the first operand comes through (and is NULL if it was).
+            Expr::NullIf(a, b) => {
+                let (x, y) = (a.eval(values)?, b.eval(values)?);
+                // MIXED NUMERIC SHAPES MUST ALIGN EXACTLY: value_cmp
+                // compares within one shape, so Int(0) against
+                // Scaled(0, -2) is NOT equal to it - num_cmp is the
+                // exact i128 alignment the engine's dialect-3 compare
+                // uses. `NULLIF(0, 0.00)` is NULL in the engine.
+                let equal = !matches!(x, Value::Null)
+                    && !matches!(y, Value::Null)
+                    && match num_cmp(&x, &y) {
+                        Some(o) => o == std::cmp::Ordering::Equal,
+                        None => value_cmp(&x, &y) == std::cmp::Ordering::Equal,
+                    };
+                if equal { Value::Null } else { x }
+            }
+            // ONLY a TRUE condition takes the then-branch: false and
+            // UNKNOWN both take the else, which is the engine's rule
+            Expr::Iif(c, a, b) => {
+                if c.eval(values)? == Some(true) {
+                    a.eval(values)?
+                } else {
+                    b.eval(values)?
+                }
+            }
             Expr::Col(fid) => values.get(*fid).cloned().unwrap_or(Value::Null),
             Expr::Int(n) => Value::Int(*n),
             Expr::Dec(raw, scale) => Value::Scaled(*raw, *scale),
@@ -13034,6 +13285,9 @@ fn default_expr_name(raw: &RawExpr) -> String {
         RawExpr::Bin(_, ArithOp::Div, _) => "DIVIDE",
         RawExpr::Concat(_, _) => "CONCATENATION",
         RawExpr::Cast(_, _) => "CAST",
+        RawExpr::Coalesce(_) => "COALESCE",
+        RawExpr::NullIf(_, _) => "NULLIF",
+        RawExpr::Iif(_, _, _) => "IIF",
         // the engine leaves a unary-minus column unnamed (blank header)
         RawExpr::Neg(_) => "",
         RawExpr::Int(_) | RawExpr::Dec(..) | RawExpr::Str(_) | RawExpr::Null => "CONSTANT",
