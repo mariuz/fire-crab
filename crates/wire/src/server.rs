@@ -829,6 +829,22 @@ enum Plan {
         cols: Vec<String>,
         query: String,
     },
+    /// A query with RESULT MODIFIERS: `FIRST n` / `SKIP n` / `DISTINCT`
+    /// (in that order, which is the engine's grammar) and the trailing
+    /// `ROWS n [TO m]`. The inner plan is materialised through
+    /// `branch_rows`, so a modifier works over anything that
+    /// materialises - a table, a VIEW, a UNION, a selectable procedure -
+    /// and a modified query can in turn feed FOR SELECT or
+    /// INSERT ... SELECT.
+    Modified {
+        inner: Box<Plan>,
+        cols: Vec<ProjCol>,
+        distinct: bool,
+        /// rows to drop from the front
+        skip: usize,
+        /// rows to keep after the skip; None = all of them
+        take: Option<usize>,
+    },
     /// The rows a selectable procedure SUSPENDed, ready to serve.
     ProcRows {
         cols: Vec<ProjCol>,
@@ -8964,6 +8980,121 @@ fn expand_view(sql: &str, db: &Database) -> Option<String> {
 // resolving it across branches with different names is not worth
 // guessing at).
 
+/// Pull the result modifiers off a SELECT.
+///
+/// THE ENGINE'S GRAMMAR IS `SELECT [FIRST m] [SKIP n] [DISTINCT|ALL]
+/// <select list> ... [ROWS n [TO m]]` - IN THAT ORDER. `SELECT DISTINCT
+/// FIRST 2 ...` and `SELECT SKIP 1 FIRST 2 ...` are SYNTAX ERRORS there,
+/// not alternative spellings, so they are refused here rather than
+/// quietly accepted (getting this backwards is what made the first
+/// attempt at this disagree with the engine on five cases).
+///
+/// `ROWS n` keeps the first n rows; `ROWS n TO m` keeps rows n..=m
+/// counting from ONE - a different convention from SKIP/FIRST, which is
+/// why both are converted to a common (skip, take) here so the two
+/// cannot drift apart.
+///
+/// Returns (query without the modifiers, distinct, skip, take), or None
+/// when there is nothing to strip. `Err` shape: an out-of-order head
+/// yields Some with `bad` set so the caller can raise.
+fn strip_modifiers(sql: &str) -> Option<(String, bool, usize, Option<usize>, bool)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = mask_literals(&s.to_ascii_uppercase());
+    if find_word(&up, "SELECT", 0) != Some(0) {
+        return None;
+    }
+    let (mut distinct, mut skip, mut take) = (false, 0usize, None);
+    let mut found = false;
+    let mut at = "SELECT".len();
+
+    // strictly FIRST, then SKIP, then DISTINCT/ALL
+    let word_at = |from: usize| -> (String, usize) {
+        let rest = up[from..].trim_start();
+        let lead = up.len() - rest.len();
+        let w: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        (w, lead)
+    };
+    let num_after = |from: usize| -> Option<(usize, usize)> {
+        let rest = up[from..].trim_start();
+        let lead = up.len() - rest.len();
+        let d: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if d.is_empty() {
+            return None; // FIRST ? / FIRST (expr) are not this slice
+        }
+        Some((d.parse().ok()?, lead + d.len()))
+    };
+    let (mut w, mut lead) = word_at(at);
+    if w == "FIRST" {
+        let (n, end) = num_after(lead + w.len())?;
+        take = Some(n);
+        found = true;
+        at = end;
+        let nx = word_at(at);
+        w = nx.0;
+        lead = nx.1;
+    }
+    if w == "SKIP" {
+        let (n, end) = num_after(lead + w.len())?;
+        skip = n;
+        found = true;
+        at = end;
+        let nx = word_at(at);
+        w = nx.0;
+        lead = nx.1;
+    }
+    if w == "DISTINCT" {
+        distinct = true;
+        found = true;
+        at = lead + w.len();
+        let nx = word_at(at);
+        w = nx.0;
+    } else if w == "ALL" {
+        // the default, but it must still be consumed
+        found = true;
+        at = lead + w.len();
+        let nx = word_at(at);
+        w = nx.0;
+    }
+    // anything of ours appearing AFTER its slot is out of order
+    let out_of_order = matches!(w.as_str(), "FIRST" | "SKIP" | "DISTINCT");
+    let head_end = at;
+
+    // a trailing ROWS n [TO m] - one word, so find_word not find_kw_by
+    let mut tail_end = s.len();
+    if let Some(kw) = find_word(&up, "ROWS", 0) {
+        let spec = s[kw + "ROWS".len()..].trim();
+        let mut it = spec.split_whitespace();
+        let n: usize = it.next()?.parse().ok()?;
+        match it.next() {
+            None => {
+                skip = 0;
+                take = Some(n);
+            }
+            Some(t) if t.eq_ignore_ascii_case("TO") => {
+                let m: usize = it.next()?.parse().ok()?;
+                if it.next().is_some() || n == 0 || m < n {
+                    return None;
+                }
+                skip = n - 1;
+                take = Some(m - n + 1);
+            }
+            _ => return None,
+        }
+        found = true;
+        tail_end = kw;
+    }
+    if !found && !out_of_order {
+        return None;
+    }
+    Some((
+        format!("SELECT {}", s[head_end..tail_end].trim()),
+        distinct,
+        skip,
+        take,
+        out_of_order,
+    ))
+}
+
 /// Split a query on TOP-LEVEL `UNION` keywords, returning each branch's
 /// text and whether the union is ALL (duplicates kept). None when there
 /// is no top-level UNION, or when the ALL-ness is inconsistent between
@@ -9060,11 +9191,31 @@ fn branch_rows(
     if let Plan::ProcRows { rows, .. } = plan {
         return Some(rows.clone());
     }
+    // a modified plan is a row source too, so DISTINCT/FIRST can feed a
+    // FOR SELECT loop or an INSERT ... SELECT
+    if let Plan::Modified { inner, distinct, skip, take, .. } = plan {
+        let mut rows = branch_rows(inner, db, args)?;
+        if *distinct {
+            let mut seen: Vec<Vec<Value>> = Vec::new();
+            rows.retain(|r| {
+                if seen.iter().any(|s| rows_equal(s, r)) {
+                    false
+                } else {
+                    seen.push(r.clone());
+                    true
+                }
+            });
+        }
+        return Some(rows.into_iter().skip(*skip).take(take.unwrap_or(usize::MAX)).collect());
+    }
     let Plan::Project { rel, formats, cols, filter, .. } = plan else {
         return None;
     };
     let filter = bind_filter(filter, args).ok()?;
-    let mut out = Vec::new();
+    // the RECORD is kept beside the projected row: ORDER BY indexes the
+    // record's fields, not the projection, so the sort has to happen on
+    // the record and carry the projected row with it
+    let mut out: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
     let mut bad = false;
     for_each_record(db, *rel, formats, |values| {
         if bad || !filter.as_ref().map_or(true, |p| p.matches(values)) {
@@ -9080,12 +9231,22 @@ fn branch_rows(
                 }
             }
         }
-        out.push(row);
+        out.push((values.to_vec(), row));
     });
     if bad {
         return None;
     }
-    Some(out)
+    // THE INNER PLAN'S ORDER BY MUST BE APPLIED HERE. Without it a
+    // materialising caller loses the ordering the query asked for -
+    // invisible for INSERT ... SELECT, where order rarely matters, but
+    // wrong the moment a modifier slices: `FIRST 2 ... ORDER BY x` would
+    // otherwise take two ARBITRARY rows.
+    if let Plan::Project { order_by, .. } = plan {
+        if !order_by.is_empty() {
+            out.sort_by(|a, b| order_cmp(&a.0, &b.0, order_by));
+        }
+    }
+    Some(out.into_iter().map(|(_, row)| row).collect())
 }
 
 /// Two projected rows are the same row for UNION's set semantics -
@@ -9228,6 +9389,41 @@ fn plan_query_inner(
                 return Some(Plan::TxControl { rollback: false });
             }
         }
+    }
+    // RESULT MODIFIERS - see strip_modifiers for the grammar order
+    if let Some((inner_sql, distinct, skip, take, bad_order)) = strip_modifiers(sql) {
+        if bad_order {
+            if trace {
+                eprintln!("[srv] plan: modifiers out of order (FIRST, SKIP, DISTINCT)");
+            }
+            return Some(Plan::Refused);
+        }
+        // an inner query this server cannot plan must RAISE - falling
+        // through would answer 4242 to a DISTINCT/FIRST query
+        let Some(plan) = plan_query_inner(&inner_sql, db, params) else {
+            return Some(Plan::Refused);
+        };
+        // KNOWN LIMIT: a modifier over a SELECTABLE PROCEDURE is
+        // REFUSED. ProcSelect is the deferred form - the body runs at
+        // op_execute and the plan becomes ProcRows - so wrapping it needs
+        // the execute hook to unwrap a level. That was wired and still
+        // failed at fetch, so it is refused deliberately rather than left
+        // half-working. The engine supports it; this does not.
+        if !matches!(
+            plan,
+            Plan::Project { .. } | Plan::Union { .. } | Plan::ProcRows { .. }
+        ) {
+            return Some(Plan::Refused);
+        }
+        let cols: Vec<ProjCol> = output_cols_of(&plan)
+            .iter()
+            .enumerate()
+            .map(|(i, c)| ProjCol { field_id: i, expr: None, ..c.clone() })
+            .collect();
+        if cols.is_empty() {
+            return Some(Plan::Refused);
+        }
+        return Some(Plan::Modified { inner: Box::new(plan), cols, distinct, skip, take });
     }
     // a top-level UNION splits into branches before anything else looks
     // at the text (see UNION / UNION ALL)
@@ -10196,7 +10392,8 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         Plan::ProcCall { cols, .. } | Plan::ProcInvoke { cols, .. } => build_describe(cols, params),
         Plan::Union { cols, .. }
         | Plan::ProcSelect { cols, .. }
-        | Plan::ProcRows { cols, .. } => build_describe(cols, params),
+        | Plan::ProcRows { cols, .. }
+        | Plan::Modified { cols, .. } => build_describe(cols, params),
         Plan::Refused => build_describe(&[], params),
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
@@ -10254,7 +10451,10 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         // silently threw the whole transaction away.
         Plan::TxControl { rollback } => if *rollback { 11 } else { 10 },
         Plan::Savepoint { .. } => 14,
-        Plan::Union { .. } | Plan::ProcSelect { .. } | Plan::ProcRows { .. } => 1,
+        Plan::Union { .. }
+        | Plan::ProcSelect { .. }
+        | Plan::ProcRows { .. }
+        | Plan::Modified { .. } => 1,
         Plan::Scalar(_)
         | Plan::GenIdIncrement { .. }
         | Plan::Project { .. }
@@ -10326,7 +10526,8 @@ fn output_cols_of(plan: &Plan) -> Vec<ProjCol> {
         Plan::ProcCall { cols, .. } | Plan::ProcInvoke { cols, .. } => cols.clone(),
         Plan::Union { cols, .. }
         | Plan::ProcSelect { cols, .. }
-        | Plan::ProcRows { cols, .. } => cols.clone(),
+        | Plan::ProcRows { cols, .. }
+        | Plan::Modified { cols, .. } => cols.clone(),
         _ => Vec::new(),
     }
 }
@@ -10658,6 +10859,28 @@ fn emit_rows_inner(
         // ProcSelect is replaced at op_execute; reaching a fetch still
         // holding one means the statement never executed
         Plan::ProcSelect { .. } => return Err(EmitErr::Eval(EvalErr::ConversionError)),
+        Plan::Modified { inner, cols, distinct, skip, take } => {
+            if let Some(db) = db {
+                let mut rows = branch_rows(inner, db, args)
+                    .ok_or(EmitErr::Eval(EvalErr::ConversionError))?;
+                // DISTINCT compares whole projected rows with NULL equal
+                // to NULL - the same set semantics UNION uses
+                if *distinct {
+                    let mut seen: Vec<Vec<Value>> = Vec::new();
+                    rows.retain(|r| {
+                        if seen.iter().any(|s| rows_equal(s, r)) {
+                            false
+                        } else {
+                            seen.push(r.clone());
+                            true
+                        }
+                    });
+                }
+                for r in rows.iter().skip(*skip).take(take.unwrap_or(usize::MAX)) {
+                    encode_row(w, cols, r)?;
+                }
+            }
+        }
         Plan::ProcRows { cols, rows } => {
             for r in rows {
                 encode_row(w, cols, r)?;

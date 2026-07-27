@@ -3812,6 +3812,82 @@ clients, answers real typed, filtered, joined, grouped, sorted and
 aggregated queries from real pages, and accepts writes the real engine
 verifies.
 
+## Query surface: what the server answers, and what it refuses
+
+Everything below is verified by a differential gate under `qa/` — the
+same `isql` runs the same statement against the real engine and against
+`fcwire`, and the answers must match. A feature is listed as *refused*
+only when refusing is deliberate and a gate asserts the failure; a
+refusal is always a SQL error, never a wrong answer dressed as a result.
+
+### Result modifiers (`qa/serve-real-modifiers.sh`, 36 checks)
+
+The grammar order is the engine's, and it is not negotiable:
+
+```
+SELECT [FIRST m] [SKIP n] [DISTINCT|ALL] <select list> ... [ROWS n [TO m]]
+```
+
+`SELECT DISTINCT FIRST 2 ...` and `SELECT SKIP 1 FIRST 2 ...` are SYNTAX
+ERRORS in the engine, not alternative spellings — the gate asserts both
+sides reject them. An earlier attempt at this feature accepted them and
+disagreed with the engine on five cases, and the gate asserting they
+*should* work was itself wrong. When a gate and the engine disagree,
+the engine is right.
+
+`ROWS` uses a different convention from `SKIP`/`FIRST`: `ROWS n` keeps
+the first n rows, but `ROWS n TO m` keeps rows n..=m counting from ONE.
+Both are converted to a common `(skip, take)` so they cannot drift apart.
+
+`DISTINCT` compares whole projected rows with NULL equal to NULL — set
+semantics, the same rule `UNION` uses, and the opposite of `= NULL` in a
+predicate. Two all-NULL rows collapse to one rather than vanishing.
+
+Refused: a modifier over a selectable procedure (the engine supports it;
+the procedure plan is deferred and wrapping it needs the execute hook to
+unwrap a level), `FIRST ?`, and `FIRST (expr)`.
+
+### One materialising path, and the ordering bug it hid
+
+`DISTINCT`, `FIRST`/`SKIP`/`ROWS`, `UNION`, `INSERT ... SELECT` and PSQL
+`FOR SELECT` all obtain their rows from **one** function. That is
+deliberate: each feature that materialises rows gains every source the
+others support, so `FOR SELECT` can loop over a `UNION` and an `INSERT`
+can be fed by a view, a subquery-filtered query or a modified query,
+without any of those combinations being written out.
+
+It also concentrates the bugs. Two worth recording, both found by the
+modifiers gate:
+
+* The materialiser **dropped the inner query's `ORDER BY`**. Invisible
+  for `INSERT ... SELECT`, where order rarely matters — and fatal the
+  moment a modifier slices the result, because `FIRST 2 ... ORDER BY x`
+  then returns two *arbitrary* rows. The gate pins it with a case whose
+  sort order differs from the scan order (`ORDER BY A DESC` must give
+  the two largest, not the first two stored).
+* The fix has to sort on the **record**, not the projected row.
+  `ORDER BY` indexes the record's fields, so the materialiser keeps
+  `(record, projected)` pairs, sorts on the record and then maps to the
+  projection. Sorting the projected row silently orders by the wrong
+  column whenever the two differ.
+
+### Statement type codes are load-bearing
+
+A client *dispatches* on `isc_info_sql_stmt_type`, so announcing the
+wrong one does not merely mislabel a statement — it changes what the
+client does next. Announcing 6 (`get_segment`) for `SAVEPOINT` made isql
+abandon the statement and issue a real `op_rollback`, silently throwing
+the transaction away; every savepoint case then failed identically,
+which reads exactly like a parse bug and sends you looking in the wrong
+place. The codes (`inf_pub.h:515-527`): 1 select, 2 insert, 3 update,
+4 delete, 5 ddl, 6 get_segment, 7 put_segment, 8 exec_procedure,
+9 start_trans, 10 commit, 11 rollback, 12 select_for_upd,
+13 set_generator, 14 savepoint.
+
+Related: a typed `ROLLBACK;` never reaches `op_rollback` at all. isql
+*prepares and executes the word as DSQL* — there is no op 31 on the wire
+— so transaction control has to be a plan, not just a wire op.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
