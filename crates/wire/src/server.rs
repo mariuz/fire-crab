@@ -13618,6 +13618,34 @@ fn run_body_dml(
     }
 }
 
+// STATEMENT-LEVEL ATOMICITY
+//
+// execute_dml is atomic on its own: it works on a CLONE of the page
+// image and swaps it in only once the whole statement succeeded. But a
+// statement that writes ROW BY ROW - INSERT ... SELECT, or a PSQL body
+// running several DML statements - re-enters it once per row, so a
+// failure partway used to leave the earlier rows written. The engine
+// rolls the whole statement back.
+//
+// These take a snapshot of the image before such a statement starts and
+// put it back if any part fails, which gives the same all-or-nothing
+// result. It costs one clone of the file per multi-row statement, which
+// is the cost model this server already runs on.
+
+/// The page image as it stands, to be restored if a statement fails.
+fn snapshot_db(database: &Option<Database>) -> Option<Vec<u8>> {
+    database.as_ref().map(|d| d.bytes.clone())
+}
+
+/// Put a snapshot back and flush it, undoing everything a failed
+/// statement wrote.
+fn restore_db(database: &mut Option<Database>, snap: Option<Vec<u8>>) {
+    if let (Some(db), Some(bytes)) = (database.as_mut(), snap) {
+        db.bytes = bytes;
+        let _ = std::fs::write(&db.path, &db.bytes);
+    }
+}
+
 /// Run `INSERT INTO <t> [(cols)] SELECT ...`: plan the query with the
 /// ordinary planner, materialise its rows, then insert each one as a
 /// literal INSERT through the ordinary path. Returns the row count.
@@ -13658,24 +13686,33 @@ fn insert_select(
             .ok_or("the SELECT feeding this INSERT is not one this server can run")?
     };
 
+    // all-or-nothing: any row that fails undoes the ones before it
+    let snap = snapshot_db(database);
     let mut n = 0i32;
     for row in rows {
-        if row.len() != target.len() {
-            return Err("the SELECT's column count does not match the INSERT's".into());
+        let step = (|| -> Result<(), String> {
+            if row.len() != target.len() {
+                return Err("the SELECT's column count does not match the INSERT's".into());
+            }
+            let vals: Vec<String> = row
+                .iter()
+                .map(psql_literal)
+                .collect::<Option<Vec<_>>>()
+                .ok_or("a selected value cannot be written as a literal")?;
+            let sql = format!(
+                "INSERT INTO {} ({}) VALUES ({})",
+                table,
+                target.join(", "),
+                vals.join(", ")
+            );
+            let (plan, _) = plan_insert(&sql, database).ok_or("row insert refused")?;
+            execute_dml(&plan, database, &[], ctx)?;
+            Ok(())
+        })();
+        if let Err(e) = step {
+            restore_db(database, snap);
+            return Err(e);
         }
-        let vals: Vec<String> = row
-            .iter()
-            .map(psql_literal)
-            .collect::<Option<Vec<_>>>()
-            .ok_or("a selected value cannot be written as a literal")?;
-        let sql = format!(
-            "INSERT INTO {} ({}) VALUES ({})",
-            table,
-            target.join(", "),
-            vals.join(", ")
-        );
-        let (plan, _) = plan_insert(&sql, database).ok_or("row insert refused")?;
-        execute_dml(&plan, database, &[], ctx)?;
         n += 1;
     }
     Ok(n)
@@ -13984,8 +14021,15 @@ fn run_procedure(
     frame.vars.extend(args.iter().cloned());
     frame.vars.resize(names.len(), Value::Null);
 
+    // a body is ALL-OR-NOTHING: a statement that fails partway undoes
+    // everything the body wrote before it, as the engine does
+    let snap = snapshot_db(database);
     let mut steps = 0u32;
-    match exec_psql_stmt(&body, &mut frame, &mut steps, database, ctx) {
+    let outcome = exec_psql_stmt(&body, &mut frame, &mut steps, database, ctx);
+    if outcome.is_err() {
+        restore_db(database, snap);
+    }
+    match outcome {
         Ok(()) => {}
         Err(PsqlStop::Raise(ex)) => return Err(format!("exception {}", ex)),
         Err(PsqlStop::Failed(e)) => return Err(e),

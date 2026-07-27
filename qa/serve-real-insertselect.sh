@@ -35,7 +35,7 @@ CREATE DATABASE '$SRC' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE S (ID INTEGER NOT NULL PRIMARY KEY, A INTEGER, T VARCHAR(10), N NUMERIC(9,2));
 CREATE TABLE D (ID INTEGER NOT NULL PRIMARY KEY, A INTEGER, T VARCHAR(10), N NUMERIC(9,2));
 CREATE TABLE DFLT (ID INTEGER NOT NULL PRIMARY KEY, A INTEGER DEFAULT 77, T VARCHAR(10));
-CREATE TABLE CHK (ID INTEGER NOT NULL PRIMARY KEY, A INTEGER CHECK (A < 100));
+CREATE TABLE CHK (ID INTEGER NOT NULL PRIMARY KEY, A INTEGER CHECK (A < 250));
 CREATE INDEX D_A ON D (A);
 COMMIT;
 INSERT INTO S VALUES (1, 10, 'x', 12.50);
@@ -130,9 +130,11 @@ else
 fi
 
 # 3. a CHECK violation in a selected row must FAIL the statement
-rm -f "$W"; cp "$SRC" "$W"
+rm -f "$W" "$R"; cp "$SRC" "$W"; cp "$SRC" "$R"
 out=$(printf 'INSERT INTO CHK (ID, A) SELECT ID, A * 10 FROM S WHERE A IS NOT NULL;\nCOMMIT;\n' |
       "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$W" 2>&1 | tr -s ' \n' ' ')
+printf 'INSERT INTO CHK (ID, A) SELECT ID, A * 10 FROM S WHERE A IS NOT NULL;\nCOMMIT;\n' |
+      "$ISQL" -q -b -user "$U" -pas "$P" "$R" >/dev/null 2>&1
 case "$out" in
     *"Statement failed"*|*error*|*ERROR*)
         echo "OK   teeth: a CHECK violation in a selected row fails the statement" ;;
@@ -143,6 +145,20 @@ if [ -z "$val" ]; then
     echo "OK   teeth: the file is still valid after the failed statement"
 else
     echo "DIFF gfix after the failed statement: $val"; fail=1
+fi
+# ...and the statement is ALL-OR-NOTHING: the rows that succeeded before
+# the violation must be gone too. CHECK (A < 250) lets the first two rows
+# through (10*10 = 100, 20*10 = 200) and fails the third (30*10 = 300), so
+# a non-atomic implementation leaves TWO rows behind - which is exactly
+# what this server did before statement-level rollback.
+left=$(printf 'SET HEADING OFF;\nSELECT COUNT(*) FROM CHK;\n' |
+       "$ISQL" -q -user "$U" -pas "$P" "$W" 2>&1 | tr -d ' \n')
+eng_left=$(printf 'SET HEADING OFF;\nSELECT COUNT(*) FROM CHK;\n' |
+       "$ISQL" -q -user "$U" -pas "$P" "$R" 2>&1 | tr -d ' \n')
+if [ "$left" = "0" ]; then
+    echo "OK   teeth: the failed statement rolled back completely ($left rows left)"
+else
+    echo "DIFF the failed statement left $left row(s) behind (engine leaves $eng_left)"; fail=1
 fi
 
 # 4. a column-count mismatch must be refused, not padded

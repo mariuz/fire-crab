@@ -113,6 +113,12 @@ BEGIN
   IF (I > 0) THEN INSERT INTO T (ID, N) VALUES (:I, 1);
   ELSE DELETE FROM T WHERE ID = 1;
 END^
+CREATE PROCEDURE PARTIAL (I INTEGER) AS
+BEGIN
+  INSERT INTO T (ID, N) VALUES (:I, 1);
+  INSERT INTO T (ID, N) VALUES (:I + 1, 2);
+  INSERT INTO T (ID, N) VALUES (:I, 3);
+END^
 CREATE PROCEDURE DUPKEY (I INTEGER) AS
 BEGIN
   INSERT INTO T (ID, N) VALUES (:I, 1);
@@ -447,5 +453,30 @@ case "$out" in
         echo "OK   teeth: a trigger body with FOR SELECT is refused, not silently emitted" ;;
     *) echo "DIFF a trigger with FOR SELECT was accepted: [$out]"; fail=1 ;;
 esac
+
+# --- STATEMENT-LEVEL ATOMICITY ----------------------------------------
+# A body is all-or-nothing. PARTIAL inserts two rows successfully and
+# then violates the primary key on its third statement, so a non-atomic
+# implementation leaves those two rows behind. The engine leaves none.
+rm -f "$WORK" "$REF"; cp "$DB" "$WORK"; cp "$DB" "$REF"
+printf 'EXECUTE PROCEDURE PARTIAL(800);\nCOMMIT;\n' |
+    "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$WORK" >/dev/null 2>&1
+printf 'EXECUTE PROCEDURE PARTIAL(800);\nCOMMIT;\n' |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$REF" >/dev/null 2>&1
+o=$(printf 'SET HEADING OFF;\nSELECT COUNT(*) FROM T WHERE ID >= 800;\n' |
+    "$ISQL" -q -user "$U" -pas "$P" "$WORK" 2>&1 | tr -d ' \n')
+e=$(printf 'SET HEADING OFF;\nSELECT COUNT(*) FROM T WHERE ID >= 800;\n' |
+    "$ISQL" -q -user "$U" -pas "$P" "$REF" 2>&1 | tr -d ' \n')
+if [ "$o" = "$e" ] && [ "$o" = "0" ]; then
+    echo "OK   a body that fails partway rolls back completely (fc $o, engine $e)"
+else
+    echo "DIFF fc left $o row(s), engine left $e"; fail=1
+fi
+val=$("$GFIX" -v -full -user "$U" -pas "$P" "$WORK" 2>&1 | tr -d ' \n')
+if [ -z "$val" ]; then
+    echo "OK   teeth: the file is valid after the rolled-back body"
+else
+    echo "DIFF gfix after the rolled-back body: $val"; fail=1
+fi
 
 exit $fail
