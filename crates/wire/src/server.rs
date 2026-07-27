@@ -793,6 +793,13 @@ enum Plan {
         /// which output parameter each projected column reads
         picks: Vec<usize>,
     },
+    /// `COMMIT` / `ROLLBACK` arriving as a PREPARED STATEMENT. isql does
+    /// not send op_rollback for a typed `ROLLBACK;` - it prepares and
+    /// executes the word as DSQL (probed: op_prepare/op_execute, no op
+    /// 31 on the wire at all), so transaction control has to be a plan.
+    TxControl {
+        rollback: bool,
+    },
     /// `INSERT INTO <t> [(cols)] SELECT ...` - a write fed by a query.
     /// The query is planned by the ORDINARY planner at execute, its rows
     /// are materialised, and each one is then inserted through the
@@ -9152,6 +9159,19 @@ fn plan_query_inner(
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Plan> {
     let trace = std::env::var("FC_SRV_TRACE").is_ok();
+    {
+        let up = sql.trim().trim_end_matches(';').trim().to_ascii_uppercase();
+        // COMMIT / ROLLBACK [WORK] [RETAIN ...]: RETAIN keeps the
+        // transaction open and is not this slice
+        if !up.contains("RETAIN") {
+            if find_word(&up, "ROLLBACK", 0) == Some(0) {
+                return Some(Plan::TxControl { rollback: true });
+            }
+            if find_word(&up, "COMMIT", 0) == Some(0) {
+                return Some(Plan::TxControl { rollback: false });
+            }
+        }
+    }
     // a top-level UNION splits into branches before anything else looks
     // at the text (see UNION / UNION ALL)
     if split_union(sql).is_some() {
@@ -10153,6 +10173,8 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         Plan::VirtualEmpty { .. } => build_describe(&output_cols_of(plan), params),
         Plan::SetGenerator { stmt_type, .. } => describe_dml(*stmt_type, params),
         Plan::InsertSelect { .. } => describe_dml(2, params), // isc_info_sql_stmt_insert
+        // isc_info_sql_stmt_commit (?) - no columns either way
+        Plan::TxControl { .. } => build_describe(&[], params),
     }
 }
 
@@ -10167,6 +10189,8 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         // output message back, or plain op_execute when there is none.
         Plan::ProcCall { .. } | Plan::ProcInvoke { .. } => 8,
         Plan::InsertSelect { .. } => 2, // isc_info_sql_stmt_insert
+        // isc_info_sql_stmt_commit = 5, rollback = 6
+        Plan::TxControl { rollback } => if *rollback { 6 } else { 5 },
         Plan::Union { .. } | Plan::ProcSelect { .. } | Plan::ProcRows { .. } => 1,
         Plan::Scalar(_)
         | Plan::GenIdIncrement { .. }
@@ -10523,7 +10547,8 @@ fn emit_rows_inner(
         // DML, DDL and generator writes have no cursor: terminator only.
         // GenIdIncrement is replaced by a Scalar at op_execute, so it never
         // reaches fetch as itself; the arm keeps the match exhaustive.
-        Plan::InsertSelect { .. }
+        Plan::TxControl { .. }
+        | Plan::InsertSelect { .. }
         | Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
         | Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
@@ -14638,6 +14663,13 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // The five locals above are the LIVE statement's working set;
     // every other open statement's set is parked here. `cur_stmt` says
     // which handle the locals currently belong to. See StmtSlot.
+    // TRANSACTION ROLLBACK. This server writes each statement straight
+    // into the file, so undoing a whole transaction means putting back
+    // the image as it stood when the transaction began: op_transaction
+    // takes the snapshot, op_rollback restores it, op_commit drops it.
+    // One clone per transaction - the same cost model statement-level
+    // rollback already runs on.
+    let mut tx_snapshot: Option<Vec<u8>> = None;
     let mut stmts: std::collections::HashMap<i32, StmtSlot> = std::collections::HashMap::new();
     let mut cur_stmt: i32 = 3;
     // handles run 3, 4, 5, ... - starting at 3 keeps the first one the
@@ -14713,6 +14745,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 break;
             }
             x if x == OP_TRANSACTION => {
+                // the image as the transaction found it
+                if tx_snapshot.is_none() {
+                    tx_snapshot = snapshot_db(&database);
+                }
                 read_int(&mut s, &mut dec)?; // db handle
                 read_wire_bytes(&mut s, &mut dec)?; // tpb
                 respond(&mut s, &mut enc, TX_HANDLE)?; // transaction handle (distinct from attach 1)
@@ -15038,6 +15074,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     plan,
                     Plan::Insert { .. }
                         | Plan::InsertSelect { .. }
+                        | Plan::TxControl { .. }
                         | Plan::Update { .. }
                         | Plan::Delete { .. }
                         | Plan::CreateTable { .. }
@@ -15088,7 +15125,20 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     // path so defaults, NOT NULL, CHECK, FK and index
                     // maintenance all apply. Done here rather than inside
                     // execute_dml because each row re-enters it.
-                    if let Plan::InsertSelect { table, cols, query } = &plan {
+                    if let Plan::TxControl { rollback } = &plan {
+                        if *rollback {
+                            let snap = tx_snapshot.take();
+                            let undone = snap.is_some();
+                            restore_db(&mut database, snap);
+                            if std::env::var("FC_SRV_TRACE").is_ok() {
+                                eprintln!("[srv] ROLLBACK - transaction undone: {}", undone);
+                            }
+                        } else {
+                            tx_snapshot = snapshot_db(&database);
+                        }
+                        last_dml = (0, 0, 0);
+                        respond(&mut s, &mut enc, TX_HANDLE)?;
+                    } else if let Plan::InsertSelect { table, cols, query } = &plan {
                         let ctx = SessionCtx { user, attach_id };
                         match insert_select(table, cols, query, &mut database, &ctx) {
                             Ok(n) => {
@@ -15288,6 +15338,18 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
             }
             x if x == OP_COMMIT || x == OP_ROLLBACK => {
                 read_int(&mut s, &mut dec)?; // tr
+                if x == OP_ROLLBACK {
+                    // put the file back as the transaction found it
+                    let snap = tx_snapshot.take();
+                    let undone = snap.is_some();
+                    restore_db(&mut database, snap);
+                    if undone && std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!("[srv] op_rollback - transaction undone");
+                    }
+                } else {
+                    // committed: this image is the new starting point
+                    tx_snapshot = snapshot_db(&database);
+                }
                 respond(&mut s, &mut enc, 0)?;
             }
             x if x == OP_CANCEL => {
