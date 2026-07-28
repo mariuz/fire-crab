@@ -13,6 +13,42 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 22: cursors completed - aliases, aggregates, positioned DML
+
+### Converted
+- **WHEN SQLSTATE '<s>'**: handler code 8 + counted string — flip
+  thirteen.
+- **Handlers carrying handlers**: a handler's block body with its
+  OWN WHEN nests `blr_block` again WITH its own error-handler
+  section — the slice-20 refusal flipped (fourteen) by one probe.
+- **Cursor table aliases + qualified columns**: with `FROM T A` the
+  relation2 alias string becomes `"CX" "A"` — cursor name + table
+  alias — replacing the schema-qualified table; qualified columns,
+  WHERE and ORDER BY refs resolve through the one visible stream
+  (flip fifteen).
+- **AGGREGATE cursors**: `blr_aggregate` nests inside the
+  dcl_cursor rse at ctx+1 — claiming a SECOND context slot (probed
+  on a two-cursor body) — with the WHERE inside the inner rse,
+  group_by + map as in FOR SELECT, and the outputs and
+  fetch-sources as BARE `blr_fid` slots: no blr_derived_expr
+  wrapper (flip sixteen). The engine itself demands AS names for
+  aggregate columns — the parser requires them too.
+- **Positioned DML**: `DELETE ... WHERE CURRENT OF` is `blr_erase`
+  at the CURSOR's own context — no fresh slot — with
+  `blr_marks(1, 1)` (MARK_POSITIONED) TRAILING the erase, where a
+  DML loop's marks(1, 4) LEAD its rse. `UPDATE ... WHERE CURRENT
+  OF` is `blr_modify` from the cursor's context to ONE fresh slot,
+  marks(1, 1), then the assignments — SET sources read the
+  cursor's context (probed: `SALARY = SALARY + 1`). The INTO-less
+  `FETCH` that positions them carries an empty begin/end.
+
+### Guarded
+- DISTINCT aggregates, HAVING and ORDER BY in aggregate cursors;
+  positioned DML against the wrong table or an aggregate cursor.
+  Gate: `qa/dsql-proc-blr.sh` grew to 98 checks (11 fresh — among
+  them a WHILE-driven sweep pairing FETCH INTO with a multi-column
+  positioned UPDATE, never probed directly); 247 unit byte-pins.
+
 ## 2026-07-28 — fire-crab-dsql slice 21: autonomous transactions and cursors
 
 ### Converted

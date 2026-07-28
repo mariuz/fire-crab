@@ -4666,6 +4666,37 @@ WHEN, and a BLOCK as a handler's body nests blr_block again with no
 handler section of its own - the battery runs a handler block
 containing an EXIT.
 
+Slice 22 completed the cursor surface, flipping every refusal the
+two slices before it had named. WHEN SQLSTATE is handler code 8
+plus a counted string (flip thirteen); a handler's block body
+carrying its OWN handlers nests blr_block again WITH its
+error-handler section (flip fourteen) - slice 20's plain-block law
+and this one differ by exactly the presence of WHEN, nothing else.
+A cursor over an ALIASED table swaps its relation2 alias string:
+`"CX" "A"` - cursor name + table alias - where the unaliased form
+carries the schema-qualified table (flip fifteen); qualified
+columns, WHERE and ORDER BY refs then resolve through the one
+visible stream with the machinery the field resolver already had.
+An AGGREGATE cursor nests blr_aggregate inside the dcl_cursor rse
+at ctx+1 - and the aggregate CLAIMS that slot: a two-cursor probe
+put the second cursor's aggregate at context 2 over its stream's
+1. Its outputs and fetch-sources are BARE blr_fid slots, no
+blr_derived_expr wrapper - and the engine itself refuses an
+unnamed aggregate column, so the parser demands the AS alias too.
+Positioned DML closed the loop: DELETE ... WHERE CURRENT OF is
+blr_erase at the CURSOR's own context - no fresh slot - and
+UPDATE is blr_modify from the cursor's context to ONE fresh slot,
+both stamped blr_marks(1, 1) - MARK_POSITIONED - TRAILING the
+verb, where a DML loop's marks(1, 4) LEAD its rse (the engine's
+own genBlr puts erase-context first, marks after; read straight
+from EraseNode before the probe confirmed it). SET sources read
+the cursor's context - SALARY = SALARY + 1 kept its source field
+at the org - and the INTO-less FETCH that positions both carries
+an empty begin/end. The battery's closer was never probed at all:
+a WHILE-driven sweep pairing FETCH INTO with a multi-column
+positioned UPDATE and a ROW_COUNT exit - eleven fresh checks and
+the gate stayed green on composition alone.
+
 Slice 21 rounded out the PSQL surface: IN AUTONOMOUS TRANSACTION DO
 (blr_auto_trans + sub-code 0), multi-column MATCHING (equivs
 left-nested under blr_and), WHEN SQLCODE (code 1 + i16 - flip

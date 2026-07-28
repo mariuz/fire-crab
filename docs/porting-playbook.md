@@ -307,6 +307,12 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # a marker byte can sit on EITHER side of its verb: positioned
+    # DML trails its marks where loop DML leads them - and the same
+    # SELECT machinery you built for FOR-loops (aggregates, maps,
+    # alias resolution) transplants into a declaration verb with only
+    # its OUTPUT convention changed (bare fids vs derived_expr); when
+    # the reference demands a name (aggregate columns), demand it too
     # a NAME can ride in an ALIAS SLOT (cursors reuse the derived-
     # table alias convention) - and DECLARATION SECTIONS have their
     # own ordering laws (inits defer past cursor decls): when a gate
