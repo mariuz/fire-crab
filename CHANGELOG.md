@@ -13,6 +13,43 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 3: outer joins, chains, functions
+
+### Converted
+- **Outer joins**: `blr_join_type` follows the join's streams and
+  precedes its ON boolean, carrying 1=LEFT, 2=RIGHT, 3=FULL — and is
+  ABSENT for INNER (probed). `LEFT OUTER JOIN` compiles byte-identical
+  to `LEFT JOIN`.
+- **Join chains**: each ON binds to its LEFT, so the chain nests left —
+  the second join's `blr_join` node holds the first join's node as its
+  first stream slot (probed on a three-table chain), and a type byte
+  sits only on its own node in a mixed inner/outer chain.
+- **INT64 literals**: a literal past blr_long's 32 bits emits
+  `blr_int64` (dtype 0x10, one scale byte, 8 little-endian bytes); the
+  sign still folds into the literal.
+- **The first built-in functions in compiled BLR**: `blr_upcase` /
+  `blr_lowcase` (one operand); `blr_strlen` with its length-type byte
+  (CHAR_LENGTH=1, OCTET_LENGTH=2 — probed, not assumed); `blr_substring`
+  whose start is 0-BASED and compiled as `blr_subtract(<from>, 1)`
+  UNFOLDED (probed: `FROM 1` stores subtract(1,1), not literal 0);
+  `blr_trim` with a where byte (0=BOTH, 1=LEADING, 2=TRAILING) and a
+  spec byte (0=spaces, 1=explicit <what>); a bare `TRIM('a' FROM s)`
+  is BOTH. Functions compose (UPPER(TRIM(x)), functions inside ON).
+
+### Fixed
+- A hand-written expected pin for `A = -5000000000` was WRONG — the
+  compiler was right and the pin invented. The engine probe settled
+  it (the pinned bytes now come from RDB$VIEW_BLR, per the project
+  rule: never pin what was not probed).
+
+### Guarded
+- An unknown name followed by `(` — a UDF or an unconverted built-in —
+  refuses instead of falling back to a field read; `SUBSTRING` without
+  `FOR` and `CROSS JOIN` refuse as unprobed layouts. Gate:
+  `qa/dsql-view-blr.sh` grew to 62 checks (19 fresh slice-3 battery
+  statements incl. UPPER-inside-ON and a NULL-hunting outer join);
+  52 unit byte-pins.
+
 ## 2026-07-28 — fire-crab-dsql slice 2: expressions, IN, streams
 
 ### Converted

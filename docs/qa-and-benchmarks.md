@@ -4278,7 +4278,7 @@ dropped from the view so an expression naming one refuses rather than
 guessing a side (qualified names in join expressions are the named
 remainder).
 
-### SQL → BLR against the engine's own compiler (`qa/dsql-view-blr.sh`, 26 checks)
+### SQL → BLR against the engine's own compiler (`qa/dsql-view-blr.sh`, 62 checks)
 
 The `fire-crab-dsql` crate opens Phase 4 with the purest differential
 in the project: the oracle is the exact artifact under conversion,
@@ -4315,13 +4315,39 @@ stream's context id; a BARE field in a multi-stream statement refuses
 - the engine resolves those through the catalog, and a catalog-free
 compiler that guessed a context would compile a DIFFERENT QUERY.
 
+Slice 3 grew it again: OUTER JOINS (blr_join_type carries 1=LEFT,
+2=RIGHT, 3=FULL after the join's streams and before its ON boolean -
+and is ABSENT for INNER; `LEFT OUTER JOIN` compiles byte-identical to
+`LEFT JOIN`), JOIN CHAINS (each ON binds to its left, so the chain
+NESTS LEFT - the second join's node holds the first join's node as
+its first stream slot, probed on a three-table chain, and in a mixed
+inner/outer chain the type byte sits only on its own node), INT64
+literals (blr_int64: one scale byte, 8 little-endian bytes; the sign
+still folds in), and the first BUILT-IN FUNCTIONS in compiled BLR:
+blr_upcase/blr_lowcase, blr_strlen with its length-type byte
+(CHAR_LENGTH=1, OCTET_LENGTH=2), blr_substring - whose start is
+0-BASED and compiled as `blr_subtract(<from>, 1)` UNFOLDED, so
+`FROM 1` stores subtract(1,1) rather than the literal 0 - and
+blr_trim with a where byte (0=BOTH, 1=LEADING, 2=TRAILING) plus a
+spec byte (0=spaces, 1=an explicit <what> operand). Functions
+compose: the battery runs UPPER(TRIM(x)) and UPPER on both sides of
+a join's ON.
+
 The battery deliberately goes BEYOND the probe pins - fresh field
 names, fresh combinations, double negation, NOT over mixed OR, join
-ON with two conditions - so the gate exercises the COMPILER, not the
-probe notebook (41 checks). Refusals (ORDER BY, aggregates, LEFT
-JOIN, bare multi-stream fields, past-blr_long literals) must answer
+ON with two conditions, a NULL-hunting LEFT JOIN ... IS NULL, a
+three-table mixed chain - so the gate exercises the COMPILER, not the
+probe notebook (62 checks). Refusals (ORDER BY, aggregates, bare
+multi-stream fields, unknown names before `(` - a UDF must never
+become a field read - FOR-less SUBSTRING, CROSS JOIN) must answer
 REFUSED: outside the converted surface this crate never guesses a
 byte.
+
+One slice-3 pin earned its place in the changelog's Fixed column: the
+expected bytes for `A = -5000000000` were first written BY HAND and
+were wrong - the compiler was right. The engine probe settled it.
+The rule it re-taught: NEVER pin bytes that did not come out of
+RDB$VIEW_BLR.
 
 ## Benchmarks
 

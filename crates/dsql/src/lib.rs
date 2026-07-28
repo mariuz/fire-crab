@@ -48,6 +48,24 @@
 //! stream's context id; in a multi-stream statement every field must
 //! be QUALIFIED (the engine resolves bare names through the catalog;
 //! this catalog-free slice refuses them rather than guess a context).
+//!
+//! Slice 3 (same oracle) added OUTER JOINS (blr_join_type after the
+//! streams, before the ON boolean: 1=LEFT, 2=RIGHT, 3=FULL - absent
+//! for INNER; `LEFT OUTER JOIN` compiles byte-identical to `LEFT
+//! JOIN`), JOIN CHAINS (each ON binds LEFT, so the second join's node
+//! holds the first join's node as its first stream slot - the chain
+//! nests left, and a type byte sits only on its own node), INT64
+//! LITERALS (blr_int64: dtype 0x10, one scale byte, 8 little-endian
+//! bytes - the sign still folds in), and the first BUILT-IN FUNCTIONS:
+//! blr_upcase/blr_lowcase (one operand), blr_strlen with a length-type
+//! byte (CHAR_LENGTH=1, OCTET_LENGTH=2), blr_substring whose start is
+//! 0-BASED and compiled as `blr_subtract(<from>, 1)` UNFOLDED (probed:
+//! `FROM 1` stores subtract(1,1), not literal 0), and blr_trim with a
+//! where byte (0=BOTH, 1=LEADING, 2=TRAILING) and a spec byte (0=trim
+//! spaces, 1=an explicit <what> operand follows; a bare
+//! `TRIM('a' FROM s)` is BOTH). An unknown name followed by `(` is a
+//! UDF or an unconverted built-in and REFUSES - it must never fall
+//! back to being read as a field.
 
 /// The BLR bytes this slice emits, every constant read back from the
 /// engine's own stored view BLR (see the module doc).
@@ -87,6 +105,24 @@ mod blr {
     /// a relation WITH AN ALIAS: counted name, counted alias (the
     /// alias travels UPPERCASED IN DOUBLE QUOTES - probed), context
     pub const RELATION2: u8 = 0x92;
+    /// join-type sub-clause inside blr_join: absent for INNER,
+    /// 1=LEFT, 2=RIGHT, 3=FULL (probed)
+    pub const JOIN_TYPE: u8 = 0x50;
+    /// 64-bit literal dtype: one scale byte, 8 little-endian bytes
+    pub const INT64: u8 = 0x10;
+    pub const UPCASE: u8 = 0x67;
+    pub const LOWCASE: u8 = 0xB5;
+    /// blr_strlen with a length-type byte: CHAR_LENGTH=1,
+    /// OCTET_LENGTH=2 (probed)
+    pub const STRLEN: u8 = 0xB6;
+    /// blr_substring: source, 0-BASED start, length - the engine
+    /// compiles `FROM 1` as blr_subtract(literal 1, literal 1),
+    /// UNFOLDED (probed)
+    pub const SUBSTRING: u8 = 0x28;
+    /// blr_trim: where byte (0=BOTH, 1=LEADING, 2=TRAILING), spec
+    /// byte (0=spaces, 1=an explicit <what> operand follows), [what],
+    /// source (probed)
+    pub const TRIM: u8 = 0xB7;
     pub const EQL: u8 = 0x2F;
     pub const NEQ: u8 = 0x30;
     pub const GTR: u8 = 0x31;
@@ -114,6 +150,18 @@ enum Val {
     /// the literal 0xFFFFFFFF, no negate verb)
     Neg(Box<Val>),
     Concat(Box<Val>, Box<Val>),
+    /// a literal past blr_long's 32 bits: blr_int64
+    Int64(i64),
+    Upper(Box<Val>),
+    Lower(Box<Val>),
+    /// blr_strlen with its length-type byte (1=CHAR, 2=OCTET)
+    StrLen(u8, Box<Val>),
+    /// blr_substring(source, start, length) - START IS 0-BASED and the
+    /// engine emits `subtract(<from>, 1)` unfolded, so the parser
+    /// builds exactly that Sub node
+    Substring(Box<Val>, Box<Val>, Box<Val>),
+    /// blr_trim(where, [what], source)
+    Trim(u8, Option<Box<Val>>, Box<Val>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -428,6 +476,7 @@ impl<'a> P<'a> {
             // before anything else, blr_negate survives
             return Some(match self.val_unary()? {
                 Val::Int(n) => Val::Int(n.checked_neg()?),
+                Val::Int64(n) => Val::Int64(n.checked_neg()?),
                 Val::Dec(r, sc) => Val::Dec(r.checked_neg()?, sc),
                 other => Val::Neg(Box::new(other)),
             });
@@ -453,6 +502,12 @@ impl<'a> P<'a> {
             Tok::Ident(x) if !is_keyword(x) => {
                 let first = x.clone();
                 self.i += 1;
+                if matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                    // a call: only the probed built-ins compile; an
+                    // unknown name followed by '(' REFUSES (a UDF or
+                    // unconverted function must never become a field)
+                    return self.func(&first);
+                }
                 // a qualified field: IDENT . IDENT
                 if matches!(self.t.get(self.i), Some(Tok::Dot)) {
                     self.i += 1;
@@ -465,7 +520,10 @@ impl<'a> P<'a> {
                 }
                 return self.field(None, &first);
             }
-            Tok::Int(n) => Val::Int(i32::try_from(*n).ok()?),
+            Tok::Int(n) => match i32::try_from(*n) {
+                Ok(v) => Val::Int(v),
+                Err(_) => Val::Int64(*n),
+            },
             Tok::Dec(r, s) => Val::Dec(i32::try_from(*r).ok()?, *s),
             Tok::Str(s) => Val::Str(s.clone()),
             Tok::LParen => {
@@ -479,6 +537,79 @@ impl<'a> P<'a> {
             }
             _ => return None,
         };
+        self.i += 1;
+        Some(v)
+    }
+
+    /// the built-in functions whose compiled BLR was probed; self.i
+    /// sits ON the opening paren
+    fn func(&mut self, name: &str) -> Option<Val> {
+        self.i += 1; // (
+        let v = match name {
+            "UPPER" => Val::Upper(Box::new(self.val()?)),
+            "LOWER" => Val::Lower(Box::new(self.val()?)),
+            // blr_strlen's length-type byte: CHAR_LENGTH=1,
+            // OCTET_LENGTH=2 (probed)
+            "CHAR_LENGTH" | "CHARACTER_LENGTH" => {
+                Val::StrLen(1, Box::new(self.val()?))
+            }
+            "OCTET_LENGTH" => Val::StrLen(2, Box::new(self.val()?)),
+            "SUBSTRING" => {
+                // SUBSTRING(src FROM a FOR b): blr_substring's start
+                // is 0-BASED and the engine emits subtract(<a>, 1)
+                // UNFOLDED (probed: FROM 1 stores subtract(1, 1),
+                // not the literal 0) - build exactly that Sub node
+                let src = self.val()?;
+                if !self.kw("FROM") {
+                    return None;
+                }
+                let from = self.val()?;
+                if !self.kw("FOR") {
+                    return None; // FOR-less substring: not yet probed
+                }
+                let len = self.val()?;
+                Val::Substring(
+                    Box::new(src),
+                    Box::new(Val::Sub(Box::new(from), Box::new(Val::Int(1)))),
+                    Box::new(len),
+                )
+            }
+            "TRIM" => {
+                // where byte 0=BOTH 1=LEADING 2=TRAILING; a bare
+                // `TRIM('a' FROM s)` is BOTH (probed byte-identical)
+                let (wher, explicit) = if self.kw("LEADING") {
+                    (1u8, true)
+                } else if self.kw("TRAILING") {
+                    (2u8, true)
+                } else if self.kw("BOTH") {
+                    (0u8, true)
+                } else {
+                    (0u8, false)
+                };
+                if self.kw("FROM") {
+                    // TRIM(LEADING FROM s): a where-spec, no what
+                    if !explicit {
+                        return None;
+                    }
+                    Val::Trim(wher, None, Box::new(self.val()?))
+                } else {
+                    let v1 = self.val()?;
+                    if self.kw("FROM") {
+                        Val::Trim(wher, Some(Box::new(v1)), Box::new(self.val()?))
+                    } else {
+                        // plain TRIM(s) - a where-spec demands FROM
+                        if explicit {
+                            return None;
+                        }
+                        Val::Trim(0, None, Box::new(v1))
+                    }
+                }
+            }
+            _ => return None,
+        };
+        if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+            return None;
+        }
         self.i += 1;
         Some(v)
     }
@@ -602,6 +733,14 @@ fn is_keyword(w: &str) -> bool {
             | "JOIN"
             | "INNER"
             | "ON"
+            | "LEFT"
+            | "RIGHT"
+            | "FULL"
+            | "OUTER"
+            | "FOR"
+            | "LEADING"
+            | "TRAILING"
+            | "BOTH"
     )
 }
 
@@ -643,6 +782,43 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
             out.push(blr::CONCATENATE);
             emit_val(out, a);
             emit_val(out, b);
+        }
+        Val::Int64(n) => {
+            out.push(blr::LITERAL);
+            out.push(blr::INT64);
+            out.push(0); // scale
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        Val::Upper(a) => {
+            out.push(blr::UPCASE);
+            emit_val(out, a);
+        }
+        Val::Lower(a) => {
+            out.push(blr::LOWCASE);
+            emit_val(out, a);
+        }
+        Val::StrLen(kind, a) => {
+            out.push(blr::STRLEN);
+            out.push(*kind);
+            emit_val(out, a);
+        }
+        Val::Substring(src, start, len) => {
+            out.push(blr::SUBSTRING);
+            emit_val(out, src);
+            emit_val(out, start);
+            emit_val(out, len);
+        }
+        Val::Trim(wher, what, src) => {
+            out.push(blr::TRIM);
+            out.push(*wher);
+            match what {
+                None => out.push(0),
+                Some(w) => {
+                    out.push(1);
+                    emit_val(out, w);
+                }
+            }
+            emit_val(out, src);
         }
         Val::Int(n) => {
             out.push(blr::LITERAL);
@@ -757,8 +933,11 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
             _ => return None,
         }
     }
-    // FROM: `T [alias]` , comma-list `T [a], U [b], ...` or a single
-    // `T [a] [INNER] JOIN U [b] ON <bool>`
+    // FROM: `T [alias]`, a comma-list `T [a], U [b], ...`, or a JOIN
+    // chain `T [a] j U [b] ON <bool> j V [c] ON <bool> ...` where j is
+    // [INNER] JOIN | LEFT/RIGHT/FULL [OUTER] JOIN - each ON binds the
+    // join to its LEFT, so the chain nests left (probed: the second
+    // join's node contains the first as its first stream slot)
     let mut stream = |p: &mut P| -> Option<Stream> {
         let Some(Tok::Ident(name)) = p.t.get(p.i) else {
             return None;
@@ -780,7 +959,9 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
     };
     let first = stream(&mut p)?;
     p.streams.push(first);
-    let mut join_on: Option<Bool> = None;
+    // each chained join: (join-type byte - 0 for INNER, which emits NO
+    // blr_join_type sub-clause; 1/2/3 for LEFT/RIGHT/FULL - and its ON)
+    let mut joins: Vec<(u8, Bool)> = Vec::new();
     if matches!(p.t.get(p.i), Some(Tok::Comma)) {
         // the comma list: streams side by side in the rse
         while matches!(p.t.get(p.i), Some(Tok::Comma)) {
@@ -788,19 +969,34 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
             let st = stream(&mut p)?;
             p.streams.push(st);
         }
-    } else if matches!(p.t.get(p.i), Some(Tok::Ident(w)) if w == "JOIN" || w == "INNER") {
-        // one INNER JOIN: blr_join nests the two streams and carries
-        // the ON clause as its own boolean sub-clause (probed)
-        let _ = p.kw("INNER");
-        if !p.kw("JOIN") {
-            return None;
+    } else {
+        loop {
+            let jt = if p.kw("LEFT") {
+                1u8
+            } else if p.kw("RIGHT") {
+                2u8
+            } else if p.kw("FULL") {
+                3u8
+            } else if matches!(p.t.get(p.i), Some(Tok::Ident(w)) if w == "JOIN" || w == "INNER")
+            {
+                let _ = p.kw("INNER");
+                0u8
+            } else {
+                break;
+            };
+            if jt != 0 {
+                let _ = p.kw("OUTER"); // LEFT OUTER JOIN == LEFT JOIN (probed)
+            }
+            if !p.kw("JOIN") {
+                return None;
+            }
+            let st = stream(&mut p)?;
+            p.streams.push(st);
+            if !p.kw("ON") {
+                return None;
+            }
+            joins.push((jt, p.bool_or()?));
         }
-        let st = stream(&mut p)?;
-        p.streams.push(st);
-        if !p.kw("ON") {
-            return None;
-        }
-        join_on = Some(p.bool_or()?);
     }
     let boolean = if p.kw("WHERE") {
         Some(p.bool_or()?)
@@ -812,27 +1008,43 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
     }
 
     let mut out = vec![blr::VERSION5, blr::RSE];
-    match &join_on {
-        None => {
-            // plain streams, side by side
-            out.push(p.streams.len() as u8);
-            for (i, st) in p.streams.iter().enumerate() {
-                emit_stream(&mut out, st, (i + 1) as u8);
-            }
+    if joins.is_empty() {
+        // plain streams, side by side
+        out.push(p.streams.len() as u8);
+        for (i, st) in p.streams.iter().enumerate() {
+            emit_stream(&mut out, st, (i + 1) as u8);
         }
-        Some(on) => {
-            // one rse stream holding the join; the ON clause is the
-            // JOIN's boolean, ended by its own blr_end
-            out.push(1);
+    } else {
+        // one rse stream holding the join chain, nested LEFT: join k's
+        // node holds join k-1's node as its first stream slot, then
+        // the new stream, then blr_join_type for an outer join (probed
+        // absent for INNER), then its ON as a boolean sub-clause, then
+        // its own blr_end
+        out.push(1);
+        fn emit_join_chain(
+            out: &mut Vec<u8>,
+            streams: &[Stream],
+            joins: &[(u8, Bool)],
+            k: usize,
+        ) {
+            if k == 0 {
+                emit_stream(out, &streams[0], 1);
+                return;
+            }
+            let (jt, on) = &joins[k - 1];
             out.push(blr::JOIN);
-            out.push(p.streams.len() as u8);
-            for (i, st) in p.streams.iter().enumerate() {
-                emit_stream(&mut out, st, (i + 1) as u8);
+            out.push(2);
+            emit_join_chain(out, streams, joins, k - 1);
+            emit_stream(out, &streams[k], (k + 1) as u8);
+            if *jt != 0 {
+                out.push(blr::JOIN_TYPE);
+                out.push(*jt);
             }
             out.push(blr::BOOLEAN);
-            emit_bool(&mut out, on);
+            emit_bool(out, on);
             out.push(blr::END);
         }
+        emit_join_chain(&mut out, &p.streams, &joins, joins.len());
     }
     if let Some(b) = &boolean {
         out.push(blr::BOOLEAN);
@@ -1018,19 +1230,126 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_three_shapes_byte_for_byte() {
+        // outer joins: blr_join_type (absent for INNER) carries
+        // 1=LEFT, 2=RIGHT, 3=FULL after the streams, before the ON
+        pin(
+            "SELECT T.ID FROM T LEFT JOIN U2 ON T.ID = U2.UID",
+            "05430177024A0154014A025532025001472F1701024944170203554944FFFF4C",
+        );
+        pin(
+            "SELECT T.ID FROM T RIGHT JOIN U2 ON T.ID = U2.UID",
+            "05430177024A0154014A025532025002472F1701024944170203554944FFFF4C",
+        );
+        pin(
+            "SELECT T.ID FROM T FULL JOIN U2 ON T.ID = U2.UID",
+            "05430177024A0154014A025532025003472F1701024944170203554944FFFF4C",
+        );
+        // LEFT OUTER JOIN compiles to the same bytes as LEFT JOIN
+        pin(
+            "SELECT T.ID FROM T LEFT OUTER JOIN U2 ON T.ID = U2.UID",
+            "05430177024A0154014A025532025001472F1701024944170203554944FFFF4C",
+        );
+        // a chained join NESTS LEFT: the second join's node holds the
+        // first join's node as its first stream slot (probed)
+        pin(
+            "SELECT T.ID FROM T JOIN U2 ON T.ID = U2.UID JOIN V3T ON U2.UA = V3T.VID",
+            "054301770277024A0154014A02553202472F1701024944170203554944FF4A0356335403472F1702025541170303564944FFFF4C",
+        );
+        // a mixed chain: the type byte sits on ITS OWN node only
+        pin(
+            "SELECT T.ID FROM T JOIN U2 ON T.ID = U2.UID LEFT JOIN V3T ON U2.UA = V3T.VID",
+            "054301770277024A0154014A02553202472F1701024944170203554944FF4A03563354035001472F1702025541170303564944FFFF4C",
+        );
+        // an outer join plus WHERE: the rse's own boolean follows the
+        // join node - the classic find-the-unmatched-rows shape
+        pin(
+            "SELECT T.ID FROM T LEFT JOIN U2 ON T.ID = U2.UID WHERE U2.UA IS NULL",
+            "05430177024A0154014A025532025001472F1701024944170203554944FF473D1702025541FF4C",
+        );
+        // a literal past blr_long's 32 bits: blr_int64, one scale
+        // byte, 8 little-endian bytes
+        pin(
+            "SELECT ID FROM T WHERE A = 5000000000",
+            "0543014A015401472F1701014115100000F2052A01000000FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE A = -5000000000",
+            "0543014A015401472F17010141151000000EFAD5FEFFFFFFFF4C",
+        );
+        // built-ins: blr_upcase / blr_lowcase take one operand
+        pin(
+            "SELECT ID FROM T WHERE UPPER(S) = 'X'",
+            "0543014A015401472F6717010153150F0000010058FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE LOWER(S) = 'x'",
+            "0543014A015401472FB517010153150F0000010078FF4C",
+        );
+        // blr_strlen's length-type byte: CHAR_LENGTH=1, OCTET_LENGTH=2
+        pin(
+            "SELECT ID FROM T WHERE CHAR_LENGTH(S) > 3",
+            "0543014A0154014731B6011701015315080003000000FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE OCTET_LENGTH(S) > 3",
+            "0543014A0154014731B6021701015315080003000000FF4C",
+        );
+        // blr_substring's start is 0-BASED and the engine emits
+        // subtract(<from>, 1) UNFOLDED - FROM 1 stores subtract(1, 1)
+        pin(
+            "SELECT ID FROM T WHERE SUBSTRING(S FROM 1 FOR 2) = 'ab'",
+            "0543014A015401472F281701015323150800010000001508000100000015080002000000150F000002006162FF4C",
+        );
+        // blr_trim: where byte (0=BOTH 1=LEADING 2=TRAILING), spec
+        // byte (0=spaces, 1=an explicit what operand)
+        pin(
+            "SELECT ID FROM T WHERE TRIM(S) = 'x'",
+            "0543014A015401472FB7000017010153150F0000010078FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE TRIM(LEADING 'a' FROM S) = 'x'",
+            "0543014A015401472FB70101150F000001006117010153150F0000010078FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE TRIM(TRAILING 'a' FROM S) = 'x'",
+            "0543014A015401472FB70201150F000001006117010153150F0000010078FF4C",
+        );
+        // a bare `TRIM('a' FROM s)` is BOTH - byte-identical to the
+        // explicit form
+        pin(
+            "SELECT ID FROM T WHERE TRIM('a' FROM S) = 'x'",
+            "0543014A015401472FB70001150F000001006117010153150F0000010078FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE TRIM(BOTH 'a' FROM S) = 'x'",
+            "0543014A015401472FB70001150F000001006117010153150F0000010078FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE TRIM(LEADING FROM S) = 'x'",
+            "0543014A015401472FB7010017010153150F0000010078FF4C",
+        );
+    }
+
+    #[test]
     fn refuses_outside_the_surface() {
         // shapes this slice has NOT verified against the engine refuse
         // rather than guess
         for sql in [
             "SELECT ID FROM T ORDER BY ID",          // trailing clause
-            "SELECT ID FROM T WHERE A = 5000000000", // past blr_long
             "UPDATE T SET A = 1",                    // not a SELECT
             "SELECT COUNT(*) FROM T",                // aggregates
             // a BARE field in a multi-stream statement: the engine
             // resolves it through the catalog; catalog-free, we refuse
             "SELECT T.ID FROM T, U2 WHERE ID = 1",
-            "SELECT T.ID FROM T LEFT JOIN U2 ON T.ID = U2.UID", // outer
             "SELECT T.ID FROM T, U2, T WHERE T.ID = 1 AND X.A = 2", // bad qualifier
+            // an unknown name followed by '(' is a UDF or an
+            // unconverted built-in - never a field
+            "SELECT ID FROM T WHERE FOO(A) = 1",
+            "SELECT ID FROM T WHERE DECODE(A, 1, 2) = 1",
+            // SUBSTRING without FOR: layout not yet probed
+            "SELECT ID FROM T WHERE SUBSTRING(S FROM 1) = 'a'",
+            "SELECT ID FROM T CROSS JOIN U2",        // no ON clause
         ] {
             assert!(compile_view_select(sql).is_none(), "{sql} was compiled");
         }

@@ -267,6 +267,18 @@ them.
     # the docs); NEVER guess a bare field's context in a multi-stream
     # statement without the catalog - a wrong context compiles a
     # DIFFERENT query that still executes
+    # join CHAINS nest LEFT (join2's node holds join1's node as its
+    # first stream slot); the OUTER-join type marker is a sub-clause
+    # on its own node only, and INNER emits NO marker at all - probe
+    # which variants are byte-identical (LEFT == LEFT OUTER)
+    # functions: probe every operand-layout byte - a length-kind byte
+    # (CHAR vs OCTET), a trim-where byte, a spec byte; SUBSTRING's
+    # start is 0-based and the reference compiler emits the -1
+    # arithmetic UNFOLDED (subtract(from,1), not a folded constant) -
+    # match the tree it builds, not the value it means
+    # an unknown name before '(' is a function you have NOT converted:
+    # REFUSE - falling back to 'it must be a field' compiles garbage
+    # that parses
 
 ## Traps that cost real time (all found the hard way)
 
