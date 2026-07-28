@@ -4423,6 +4423,38 @@ expressions, and alias-less derived tables refuse. The slice-5
 refusal of scalar subselects became a feature; its gate slot flipped
 to a positive check, the fifth such flip in the project.
 
+### SQL → BLR, oracle number two (`qa/dsql-proc-blr.sh`, 17 checks)
+
+Views cannot hold ORDER BY - but a procedure's `FOR SELECT ... DO
+SUSPEND` body can, and `RDB$PROCEDURE_BLR` stores ITS compiled BLR
+verbatim just like `RDB$VIEW_BLR` stores a view's. Slice 7 opened
+that second oracle: `compile_procedure` emits the WHOLE body and the
+gate compares it byte for byte - wrapper and all.
+
+The wrapper, read from the engine's own disassembly (`SET BLOB ALL`
+prints BLR symbolically - the same verb table fire-crab-ods::blr
+converted): blr_message 1 carries 2n+1 descriptors - each output
+parameter's dsc FOLLOWED BY a null-flag blr_short, then one final
+blr_short, the EOF flag; the dsc encodings are the CAST ones from
+slice 4, byte for byte, reused in blr_declare too. Each parameter
+gets a variable declared and initialised to NULL; then blr_stall,
+two blr_labels, and blr_for over the rse. Two laws surfaced: the FOR
+stream is CONTEXT 0 - procedure bodies number streams from 0 where
+view BLR numbers from 1, so the parser carries a context base - and
+ORDER BY is blr_sort AFTER the boolean, a count byte then
+blr_ascending or blr_descending per key (mixed directions probed).
+The loop body assigns each selected field to its variable (the INTO
+names pick WHICH variable - the battery includes an out-of-order
+INTO) and sends message 1: every variable through blr_parameter2
+(value slot 2i, null slot 2i+1) plus the EOF flag as literal short 1;
+after the loop the same send fires with EOF 0.
+
+The body's WHERE reuses the whole converted expression surface at
+context 0 - the battery runs UPPER/LIKE, CASE, IN-lists and
+arithmetic inside procedure bodies. Refusals: input parameters (a
+second message), subqueries in bodies, aliased FOR streams, ORDER BY
+positions, INTO mismatches, multi-statement bodies.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
@@ -5053,6 +5085,7 @@ NODE_PATH="$PWD/node_modules" \
 # Builds its own scratch database.
 FCDSQL=/path/to/fire-crab/target/release/fcdsql ISQL=/opt/firebird/bin/isql \
     bash /path/to/fire-crab/qa/dsql-view-blr.sh
+    bash /path/to/fire-crab/qa/dsql-proc-blr.sh
 ```
 
 The scratch databases are produced by running the companion paper's hands-on

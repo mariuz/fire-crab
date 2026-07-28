@@ -1,0 +1,99 @@
+#!/bin/bash
+# SQL -> BLR, oracle number TWO: RDB$PROCEDURE_BLR. Views cannot hold
+# ORDER BY - a procedure's FOR SELECT ... DO SUSPEND body can, and the
+# engine stores ITS compiled BLR verbatim too. For every statement in
+# the battery: the ENGINE runs the CREATE PROCEDURE and fire-crab-dsql
+# compiles the identical text. THE BYTES MUST MATCH - the whole body,
+# wrapper and all: message layout, declares, stall, labels, the FOR
+# loop, both sends.
+#
+# The battery goes beyond the unit-test probe pins - fresh parameter
+# types, fresh sort keys - so the gate tests the COMPILER, not the
+# probe notebook. Refusals must answer REFUSED.
+#
+#   qa/dsql-proc-blr.sh
+#
+# Builds its own scratch database.
+
+set -u
+FCDSQL="${FCDSQL:-$(dirname "$0")/../target/release/fcdsql}"
+ISQL="${ISQL:-isql}"
+U="${ISC_USER:-SYSDBA}"; P="${ISC_PASSWORD:-masterkey}"
+D=/tmp/fbhandson
+DB="$D/fc-dsqlproc.fdb"
+
+mkdir -p "$D"; rm -f "$DB"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || { echo "FAIL create"; exit 1; }
+CREATE DATABASE '$DB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE EMPLOYEE (
+  EMP_NO INTEGER NOT NULL,
+  DEPT_ID INTEGER,
+  SALARY INTEGER,
+  FIRST_NAME VARCHAR(20),
+  RATE NUMERIC(9,2),
+  HIRED DATE
+);
+COMMIT;
+EOF
+
+fail=0
+n=0
+check() { # <create procedure statement>
+    n=$((n + 1))
+    name="GP$n"
+    stmt="CREATE PROCEDURE $name ${1}"
+    got=$("$FCDSQL" "$stmt")
+    "$ISQL" -q -b -user "$U" -pas "$P" "$DB" >/dev/null 2>&1 <<SQL
+SET TERM ^ ;
+$stmt^
+SET TERM ; ^
+COMMIT;
+SQL
+    want=$("$ISQL" -q -b -user "$U" -pas "$P" "$DB" 2>/dev/null <<SQL | tr -d ' \n'
+SET HEADING OFF;
+SELECT CAST(CAST(RDB\$PROCEDURE_BLR AS BLOB SUB_TYPE 0) AS VARCHAR(900) CHARACTER SET OCTETS) FROM RDB\$PROCEDURES WHERE RDB\$PROCEDURE_NAME = '$name';
+SQL
+)
+    if [ -z "$want" ]; then
+        echo "DIFF [$stmt] - the engine did not store a procedure (bad battery statement?)"
+        fail=1
+    elif [ "$got" = "$want" ]; then
+        echo "OK   $stmt"
+    else
+        echo "DIFF $stmt"
+        echo "     engine: $want"
+        echo "     fcdsql: $got"
+        fail=1
+    fi
+}
+refuse() {
+    if [ "$("$FCDSQL" "$1")" = "REFUSED" ]; then
+        echo "OK   refused: $1"
+    else
+        echo "DIFF [$1] compiled instead of refusing"; fail=1
+    fi
+}
+
+# --- the battery -------------------------------------------------------
+check "RETURNS (R1 INTEGER) AS BEGIN FOR SELECT EMP_NO FROM EMPLOYEE INTO :R1 DO SUSPEND; END"
+check "RETURNS (R1 INTEGER) AS BEGIN FOR SELECT EMP_NO FROM EMPLOYEE ORDER BY EMP_NO INTO :R1 DO SUSPEND; END"
+check "RETURNS (R1 INTEGER) AS BEGIN FOR SELECT EMP_NO FROM EMPLOYEE ORDER BY SALARY DESC INTO :R1 DO SUSPEND; END"
+check "RETURNS (R1 INTEGER) AS BEGIN FOR SELECT EMP_NO FROM EMPLOYEE WHERE SALARY > 1000 ORDER BY EMP_NO INTO :R1 DO SUSPEND; END"
+check "RETURNS (R1 INTEGER, R2 VARCHAR(20)) AS BEGIN FOR SELECT EMP_NO, FIRST_NAME FROM EMPLOYEE ORDER BY FIRST_NAME, EMP_NO DESC INTO :R1, :R2 DO SUSPEND; END"
+check "RETURNS (R1 NUMERIC(9,2)) AS BEGIN FOR SELECT RATE FROM EMPLOYEE WHERE RATE IS NOT NULL INTO :R1 DO SUSPEND; END"
+check "RETURNS (R1 DATE) AS BEGIN FOR SELECT HIRED FROM EMPLOYEE ORDER BY HIRED INTO :R1 DO SUSPEND; END"
+check "RETURNS (R1 SMALLINT, R2 BIGINT) AS BEGIN FOR SELECT DEPT_ID, SALARY FROM EMPLOYEE WHERE SALARY BETWEEN 1 AND 90000 INTO :R1, :R2 DO SUSPEND; END"
+check "RETURNS (R1 INTEGER) AS BEGIN FOR SELECT EMP_NO FROM EMPLOYEE WHERE UPPER(FIRST_NAME) LIKE 'R%' ORDER BY EMP_NO INTO :R1 DO SUSPEND; END"
+check "RETURNS (R1 CHAR(5)) AS BEGIN FOR SELECT FIRST_NAME FROM EMPLOYEE WHERE CASE WHEN SALARY > 100 THEN 1 ELSE 0 END = 1 INTO :R1 DO SUSPEND; END"
+check "RETURNS (R1 INTEGER) AS BEGIN FOR SELECT EMP_NO FROM EMPLOYEE WHERE DEPT_ID IN (100, 600) AND SALARY + 1 > 500 ORDER BY DEPT_ID, EMP_NO INTO :R1 DO SUSPEND; END"
+# INTO in a different order than RETURNS: variables follow the NAMES
+check "RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT DEPT_ID, EMP_NO FROM EMPLOYEE INTO :R2, :R1 DO SUSPEND; END"
+
+# --- refusals ----------------------------------------------------------
+refuse "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT EMP_NO FROM EMPLOYEE ORDER BY 1 INTO :R1 DO SUSPEND; END"
+refuse "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT EMP_NO FROM EMPLOYEE INTO :WRONG DO SUSPEND; END"
+refuse "CREATE PROCEDURE X (I1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT EMP_NO FROM EMPLOYEE INTO :R1 DO SUSPEND; END"
+refuse "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT EMP_NO FROM EMPLOYEE E INTO :R1 DO SUSPEND; END"
+refuse "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN SELECT EMP_NO FROM EMPLOYEE INTO :R1; END"
+
+exit $fail

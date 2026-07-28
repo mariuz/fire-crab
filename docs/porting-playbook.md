@@ -298,6 +298,15 @@ them.
     # UNION claims its OWN context BEFORE any branch stream - scan
     # for it before assigning contexts; each branch is rse + a map of
     # field numbers; only the DISTINCT form projects (over fid)
+    # when the FIRST oracle runs dry (views cannot hold ORDER BY or
+    # parameters), find the SECOND: procedure bodies are compiled by
+    # the same DSQL and stored verbatim too - and the engine's own
+    # BLR disassembler (isql SET BLOB ALL) reads the wrapper for you
+    # procedure-body laws: contexts number from 0 (views from 1!) -
+    # carry a context BASE, not two parsers; message = per-param dsc
+    # + null-flag short + one trailing EOF short; ORDER BY = a sort
+    # clause after the boolean with a direction marker per key; the
+    # INTO names choose the VARIABLE per column - order matters
     # subquery predicates come in TWO shapes: existence (one verb +
     # one rse, the subquery WHERE as its boolean) and quantified (a
     # DOUBLE-nested rse: the outer rse's single stream IS the

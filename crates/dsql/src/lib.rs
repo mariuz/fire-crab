@@ -193,6 +193,34 @@ mod blr {
     /// blr_fid: context byte, u16 field id - how the distinct-union's
     /// project addresses the union's OWN columns (probed)
     pub const FID: u8 = 0x18;
+    /// the procedure-body wrapper verbs (probed via the engine's own
+    /// disassembly of RDB$PROCEDURE_BLR)
+    pub const BEGIN: u8 = 0x02;
+    /// blr_message: message number byte, u16 count, dscs - one dsc
+    /// per output parameter EACH FOLLOWED BY a null-flag blr_short,
+    /// then one final blr_short: the EOF flag
+    pub const MESSAGE: u8 = 0x04;
+    /// blr_declare: u16 variable number, dsc
+    pub const DECLARE: u8 = 0x03;
+    pub const ASSIGNMENT: u8 = 0x01;
+    /// blr_variable: u16 number
+    pub const VARIABLE: u8 = 0x1A;
+    pub const STALL: u8 = 0x9B;
+    /// blr_label: label number byte, statement
+    pub const LABEL: u8 = 0x11;
+    pub const FOR: u8 = 0x07;
+    /// blr_send: message number byte, statement
+    pub const SEND: u8 = 0x0E;
+    /// blr_parameter: message byte, u16 parameter
+    pub const PARAMETER: u8 = 0x19;
+    /// blr_parameter2: message byte, u16 parameter, u16 null-flag
+    /// parameter
+    pub const PARAMETER2: u8 = 0x29;
+    /// ORDER BY: an rse sub-clause after the boolean - count byte,
+    /// then per key blr_ascending/blr_descending and the value
+    pub const SORT: u8 = 0x46;
+    pub const ASCENDING: u8 = 0x48;
+    pub const DESCENDING: u8 = 0x49;
     pub const EQL: u8 = 0x2F;
     pub const NEQ: u8 = 0x30;
     pub const GTR: u8 = 0x31;
@@ -491,6 +519,8 @@ enum Tok {
     Slash,
     Concat,
     Dot,
+    Colon,
+    Semi,
 }
 
 fn lex(sql: &str) -> Option<Vec<Tok>> {
@@ -538,6 +568,14 @@ fn lex(sql: &str) -> Option<Vec<Tok>> {
             }
             '.' => {
                 out.push(Tok::Dot);
+                i += 1;
+            }
+            ':' => {
+                out.push(Tok::Colon);
+                i += 1;
+            }
+            ';' => {
+                out.push(Tok::Semi);
                 i += 1;
             }
             '=' => {
@@ -649,6 +687,9 @@ struct P<'a> {
     t: &'a [Tok],
     i: usize,
     streams: Vec<Stream>,
+    /// context of stream index 0: 1 in view BLR, 0 in procedure
+    /// bodies (probed - the FOR SELECT stream is context 0)
+    base: u8,
     /// how many of `streams` belong to the OUTER FROM (set when the
     /// WHERE begins); subquery streams keep their context ids but
     /// never become visible to outer-scope bare names
@@ -696,15 +737,15 @@ impl<'a> P<'a> {
                         self.sub
                             .filter(|&si| hit(&self.streams[si]))
                     })?;
-                (idx + 1) as u8
+                idx as u8 + self.base
             }
             None => match self.sub {
-                Some(si) => (si + 1) as u8,
+                Some(si) => si as u8 + self.base,
                 None => {
                     if n_outer != 1 {
                         return None;
                     }
-                    1
+                    self.base
                 }
             },
         };
@@ -918,6 +959,9 @@ impl<'a> P<'a> {
         }
         if !self.kw("FROM") {
             return None;
+        }
+        if self.base != 1 {
+            return None; // subqueries in procedure bodies: unprobed
         }
         let stream = self.stream_item()?;
         self.streams.push(stream.clone());
@@ -1489,6 +1533,17 @@ fn is_keyword(w: &str) -> bool {
             | "ALL"
             | "DISTINCT"
             | "UNION"
+            | "ORDER"
+            | "BY"
+            | "ASC"
+            | "DESC"
+            | "INTO"
+            | "DO"
+            | "SUSPEND"
+            | "CREATE"
+            | "PROCEDURE"
+            | "RETURNS"
+            | "BEGIN"
     )
 }
 
@@ -1778,6 +1833,7 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
         t: &toks,
         i: 0,
         streams: Vec::new(),
+        base: 1,
         outer: None,
         sub: None,
     };
@@ -2038,6 +2094,280 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
     out.push(blr::END);
     out.push(blr::EOC);
     Some(out)
+}
+
+/// Compile a single-FOR-SELECT procedure to the BLR the engine's DSQL
+/// stores in `RDB$PROCEDURE_BLR` - byte for byte. The accepted shape:
+///
+///   CREATE PROCEDURE <name> RETURNS (p1 TYPE [, ...]) AS
+///   BEGIN
+///     FOR SELECT <cols> FROM <table> [WHERE ...]
+///         [ORDER BY key [ASC|DESC] [, ...]]
+///         INTO :p1 [, ...]
+///     DO SUSPEND;
+///   END
+///
+/// The wrapper, read from the engine's own disassembly: blr_begin;
+/// blr_message 1 with 2n+1 dscs (each parameter's dsc FOLLOWED BY a
+/// null-flag blr_short, then one final blr_short - the EOF flag); a
+/// begin declaring one variable per parameter and initialising each
+/// to NULL; blr_stall; two labels; blr_for over the rse - whose
+/// STREAM IS CONTEXT 0 (procedure bodies number from 0 where views
+/// number from 1) and whose ORDER BY is blr_sort after the boolean
+/// (count, then blr_ascending/blr_descending per key); the DO body
+/// assigning each selected field to its variable and blr_send-ing
+/// message 1 with every variable copied to its blr_parameter2 (value
+/// slot, null slot) and the EOF flag set to literal short 1; then,
+/// after the loop, the same send with EOF 0. All probed.
+pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
+    let toks = lex(sql.trim().trim_end_matches(';'))?;
+    let mut p = P {
+        t: &toks,
+        i: 0,
+        streams: Vec::new(),
+        base: 0,
+        outer: None,
+        sub: None,
+    };
+    if !(p.kw("CREATE") && p.kw("PROCEDURE")) {
+        return None;
+    }
+    // the procedure name leaves no trace in the BLR
+    match p.t.get(p.i)? {
+        Tok::Ident(w) if !is_keyword(w) => p.i += 1,
+        _ => return None,
+    }
+    if !p.kw("RETURNS") || !matches!(p.t.get(p.i), Some(Tok::LParen)) {
+        return None;
+    }
+    p.i += 1;
+    // RETURNS (name TYPE, ...) - the types reuse the probed cast-dsc
+    // encodings (identical bytes in blr_message and blr_declare)
+    let mut params: Vec<(String, Dsc)> = Vec::new();
+    loop {
+        let Some(Tok::Ident(name)) = p.t.get(p.i) else {
+            return None;
+        };
+        if is_keyword(name) {
+            return None;
+        }
+        let name = name.clone();
+        p.i += 1;
+        let dsc = p.cast_target()?;
+        params.push((name, dsc));
+        match p.t.get(p.i)? {
+            Tok::Comma => p.i += 1,
+            Tok::RParen => {
+                p.i += 1;
+                break;
+            }
+            _ => return None,
+        }
+    }
+    if !(p.kw("AS") && p.kw("BEGIN") && p.kw("FOR") && p.kw("SELECT")) {
+        return None;
+    }
+    let cols = p.select_list()??;
+    if cols.is_empty() || cols.len() != params.len() {
+        return None;
+    }
+    // one plain stream - context 0
+    let st = p.stream_item()?;
+    if st.alias.is_some() || st.derived.is_some() {
+        return None; // aliased / derived FOR streams: unprobed
+    }
+    p.streams.push(st);
+    p.outer = Some(1);
+    let col_vals: Vec<Val> = {
+        let mut v = Vec::with_capacity(cols.len());
+        for (q, n) in &cols {
+            v.push(p.field(q.as_deref(), n)?);
+        }
+        v
+    };
+    let boolean = if p.kw("WHERE") {
+        Some(p.bool_or()?)
+    } else {
+        None
+    };
+    let mut sort: Vec<(bool, Val)> = Vec::new();
+    if p.kw("ORDER") {
+        if !p.kw("BY") {
+            return None;
+        }
+        loop {
+            // sort keys: plain columns (ORDER BY <n> and expressions
+            // are unprobed)
+            let key = match p.t.get(p.i)? {
+                Tok::Ident(w) if !is_keyword(w) => {
+                    let a = w.clone();
+                    p.i += 1;
+                    if matches!(p.t.get(p.i), Some(Tok::Dot)) {
+                        p.i += 1;
+                        let Some(Tok::Ident(b)) = p.t.get(p.i) else {
+                            return None;
+                        };
+                        let b = b.clone();
+                        p.i += 1;
+                        p.field(Some(&a), &b)?
+                    } else {
+                        p.field(None, &a)?
+                    }
+                }
+                _ => return None,
+            };
+            let descending = if p.kw("DESC") {
+                true
+            } else {
+                let _ = p.kw("ASC");
+                false
+            };
+            sort.push((descending, key));
+            if matches!(p.t.get(p.i), Some(Tok::Comma)) {
+                p.i += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    if !p.kw("INTO") {
+        return None;
+    }
+    // INTO :p, :q - each names a RETURNS parameter; column i assigns
+    // to the variable of the i-th INTO name
+    let mut into: Vec<usize> = Vec::new();
+    loop {
+        if !matches!(p.t.get(p.i), Some(Tok::Colon)) {
+            return None;
+        }
+        p.i += 1;
+        let Some(Tok::Ident(name)) = p.t.get(p.i) else {
+            return None;
+        };
+        let vi = params.iter().position(|(n, _)| n == name)?;
+        p.i += 1;
+        into.push(vi);
+        if matches!(p.t.get(p.i), Some(Tok::Comma)) {
+            p.i += 1;
+        } else {
+            break;
+        }
+    }
+    if into.len() != cols.len() {
+        return None;
+    }
+    if !(p.kw("DO") && p.kw("SUSPEND")) {
+        return None;
+    }
+    let _ = matches!(p.t.get(p.i), Some(Tok::Semi)) && {
+        p.i += 1;
+        true
+    };
+    if !p.kw("END") || p.i != p.t.len() {
+        return None;
+    }
+
+    let n = params.len();
+    let mut out = vec![blr::VERSION5, blr::BEGIN];
+    // message 1: per parameter dsc + null-flag short, then EOF short
+    out.push(blr::MESSAGE);
+    out.push(1);
+    out.extend_from_slice(&((2 * n + 1) as u16).to_le_bytes());
+    for (_, d) in &params {
+        emit_dsc(&mut out, *d);
+        out.push(blr::SHORT);
+        out.push(0);
+    }
+    out.push(blr::SHORT);
+    out.push(0);
+    out.push(blr::BEGIN);
+    // one variable per parameter, initialised to NULL
+    for (vi, (_, d)) in params.iter().enumerate() {
+        out.push(blr::DECLARE);
+        out.extend_from_slice(&(vi as u16).to_le_bytes());
+        emit_dsc(&mut out, *d);
+        out.push(blr::ASSIGNMENT);
+        out.push(blr::NULL);
+        out.push(blr::VARIABLE);
+        out.extend_from_slice(&(vi as u16).to_le_bytes());
+    }
+    out.push(blr::STALL);
+    out.push(blr::LABEL);
+    out.push(0);
+    out.push(blr::BEGIN);
+    out.push(blr::BEGIN);
+    out.push(blr::LABEL);
+    out.push(1);
+    out.push(blr::FOR);
+    out.push(blr::RSE);
+    out.push(1);
+    emit_stream(&mut out, &p.streams[0], 0);
+    if let Some(b) = &boolean {
+        out.push(blr::BOOLEAN);
+        emit_bool(&mut out, b);
+    }
+    if !sort.is_empty() {
+        out.push(blr::SORT);
+        out.push(sort.len() as u8);
+        for (desc, key) in &sort {
+            out.push(if *desc {
+                blr::DESCENDING
+            } else {
+                blr::ASCENDING
+            });
+            emit_val(&mut out, key);
+        }
+    }
+    out.push(blr::END);
+    out.push(blr::BEGIN);
+    for (ci, v) in col_vals.iter().enumerate() {
+        out.push(blr::ASSIGNMENT);
+        emit_val(&mut out, v);
+        out.push(blr::VARIABLE);
+        out.extend_from_slice(&(into[ci] as u16).to_le_bytes());
+    }
+    let send = |out: &mut Vec<u8>, eof: u16| {
+        out.push(blr::SEND);
+        out.push(1);
+        out.push(blr::BEGIN);
+        for vi in 0..n {
+            out.push(blr::ASSIGNMENT);
+            out.push(blr::VARIABLE);
+            out.extend_from_slice(&(vi as u16).to_le_bytes());
+            out.push(blr::PARAMETER2);
+            out.push(1);
+            out.extend_from_slice(&((2 * vi) as u16).to_le_bytes());
+            out.extend_from_slice(&((2 * vi + 1) as u16).to_le_bytes());
+        }
+        out.push(blr::ASSIGNMENT);
+        out.push(blr::LITERAL);
+        out.push(blr::SHORT);
+        out.push(0);
+        out.extend_from_slice(&eof.to_le_bytes());
+        out.push(blr::PARAMETER);
+        out.push(1);
+        out.extend_from_slice(&((2 * n) as u16).to_le_bytes());
+        out.push(blr::END);
+    };
+    send(&mut out, 1);
+    out.push(blr::END);
+    out.push(blr::END);
+    out.push(blr::END);
+    out.push(blr::END);
+    send(&mut out, 0);
+    out.push(blr::END);
+    out.push(blr::EOC);
+    Some(out)
+}
+
+/// `compile_procedure` as uppercase hex.
+pub fn compile_procedure_hex(sql: &str) -> Option<String> {
+    Some(
+        compile_procedure(sql)?
+            .iter()
+            .map(|b| format!("{:02X}", b))
+            .collect(),
+    )
 }
 
 /// The emitted BLR as uppercase hex - what the gate compares against
@@ -2628,6 +2958,77 @@ mod tests {
             "SELECT A FROM T UNION ALL SELECT UA FROM U2 UNION ALL SELECT VID FROM V3T",
             "0543014C010343014A015402FF4D010000001702014143014A02553203FF4D01000000170302554143014A0356335404FF4D01000000170403564944FF4C",
         );
+    }
+
+    /// every expected string read back from RDB$PROCEDURE_BLR (the
+    /// SECOND oracle - procedure bodies hold what views cannot:
+    /// ORDER BY); the gate re-verifies against a live engine
+    fn pin_proc(sql: &str, want_hex: &str) {
+        assert_eq!(
+            compile_procedure_hex(sql).as_deref(),
+            Some(want_hex),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn compiles_slice_seven_procedures_byte_for_byte() {
+        // the minimal wrapper: message 1 with dsc+null-flag per param
+        // plus the EOF short; declare+null-init per param; stall; two
+        // labels; for over the rse - STREAM CONTEXT 0 (procedures
+        // number from 0, views from 1); assignments; twin sends
+        pin_proc(
+            "CREATE PROCEDURE QP1 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014A015400FF020117000249441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ORDER BY: blr_sort after the boolean - count byte, then
+        // blr_ascending/blr_descending per key
+        pin_proc(
+            "CREATE PROCEDURE QP2 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T ORDER BY ID INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014A0154004601481700024944FF020117000249441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE QP3 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE A > 0 ORDER BY ID DESC INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014A015400473117000141150800000000004601491700024944FF020117000249441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // two parameters: interleaved dsc/null-flag message, two
+        // declares, ordered assignments, parameter2 slots 0/1 and 2/3
+        // and the EOF at 4
+        pin_proc(
+            "CREATE PROCEDURE QP4 RETURNS (R1 INTEGER, R2 VARCHAR(10)) AS BEGIN FOR SELECT ID, S FROM T ORDER BY S, ID INTO :R1, :R2 DO SUSPEND; END",
+            "050204010500080007002600000A0007000700020300000800012D1A00000301002600000A00012D1A01009B1100020211010743014A01540046024817000153481700024944FF020117000249441A000001170001531A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        // the dsc encodings are the CAST ones, byte for byte - here
+        // NUMERIC(9,2) in message and declare; expressions work in
+        // the body's WHERE (context 0)
+        pin_proc(
+            "CREATE PROCEDURE QP5 RETURNS (R1 NUMERIC(9,2)) AS BEGIN FOR SELECT N FROM T WHERE UPPER(S) = 'X' INTO :R1 DO SUSPEND; END",
+            "05020401030008FE070007000203000008FE012D1A00009B1100020211010743014A015400472F6717000153150F0000010058FF02011700014E1A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // mixed directions: DESC then ASC, each key marked
+        pin_proc(
+            "CREATE PROCEDURE QP6 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT ID, A FROM T ORDER BY A DESC, ID ASC INTO :R1, :R2 DO SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B1100020211010743014A01540046024917000141481700024944FF020117000249441A000001170001411A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+    }
+
+    #[test]
+    fn procedure_refusals() {
+        for sql in [
+            // ORDER BY <position> and expressions: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T ORDER BY 1 INTO :R1 DO SUSPEND; END",
+            // INTO must name RETURNS parameters, one per column
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T INTO :NOPE DO SUSPEND; END",
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID, A FROM T INTO :R1 DO SUSPEND; END",
+            // subqueries inside procedure bodies: contexts unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM U2 WHERE U2.UID = T.ID) INTO :R1 DO SUSPEND; END",
+            // input parameters add a second message: unprobed
+            "CREATE PROCEDURE X (I1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T INTO :R1 DO SUSPEND; END",
+            // aliased FOR streams: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T E INTO :R1 DO SUSPEND; END",
+        ] {
+            assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
+        }
     }
 
     #[test]

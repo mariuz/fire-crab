@@ -8,7 +8,13 @@ fn main() {
         eprintln!("usage: fcdsql <select statement>");
         std::process::exit(2);
     }
-    match fire_crab_dsql::compile_view_select_hex(&sql) {
+    let is_proc = sql.trim_start().to_uppercase().starts_with("CREATE PROCEDURE");
+    let compiled = if is_proc {
+        fire_crab_dsql::compile_procedure_hex(&sql)
+    } else {
+        fire_crab_dsql::compile_view_select_hex(&sql)
+    };
+    match compiled {
         Some(hex) => println!("{}", hex),
         None => {
             println!("REFUSED");

@@ -13,6 +13,39 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 7: the second oracle — procedures and ORDER BY
+
+### Converted
+- **Oracle number two: `RDB$PROCEDURE_BLR`.** A procedure's
+  `FOR SELECT ... DO SUSPEND` body holds what a view cannot — ORDER
+  BY — and the engine stores its compiled BLR verbatim too.
+  `compile_procedure` emits the WHOLE body byte-identically:
+  blr_message 1 with 2n+1 dscs (each parameter's dsc FOLLOWED BY a
+  null-flag blr_short, then one final blr_short — the EOF flag; the
+  dsc encodings are the CAST ones, byte for byte), a blr_declare +
+  NULL-init per parameter, blr_stall, two blr_labels, blr_for over
+  the rse, field→variable assignments (INTO names pick the
+  variables — an out-of-order INTO is in the battery), and twin
+  blr_sends: each variable through blr_parameter2 (value slot 2i,
+  null slot 2i+1), the EOF flag (parameter 2n) literal short 1
+  inside the loop and 0 after it.
+- **ORDER BY**: `blr_sort` after the rse's boolean — a count byte,
+  then per key blr_ascending or blr_descending and the value. Mixed
+  directions probed (DESC, ASC on one statement).
+- **The context-base law**: procedure bodies number streams from
+  CONTEXT 0 where view BLR numbers from 1 (probed: the FOR stream is
+  `blr_relation 'T' 0`). One parser serves both — `P.base` is 1 for
+  views, 0 for procedures. The body's WHERE reuses the whole
+  converted expression surface (functions, CASE, IN — all at ctx 0).
+
+### Guarded
+- Input parameters (they add a second message), subqueries inside
+  procedure bodies (contexts unprobed), aliased FOR streams,
+  `ORDER BY <position>`, sort expressions, INTO names that miss the
+  RETURNS list or miscount the columns, and multi-statement bodies
+  all refuse. New gate: `qa/dsql-proc-blr.sh` — 17 checks, every
+  battery statement fresh; 121 unit byte-pins across both oracles.
+
 ## 2026-07-28 — fire-crab-dsql slice 6: DISTINCT, scalar subselects, derived tables, UNION
 
 ### Converted
