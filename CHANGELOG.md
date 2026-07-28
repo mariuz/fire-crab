@@ -13,6 +13,33 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — the temporal expression surface
+
+### Converted
+- **`EXTRACT`**, temporal literals (`DATE '...'`, `TIME '...'`,
+  `TIMESTAMP '...'`), the clock keywords (`CURRENT_DATE`, `LOCALTIME`,
+  `LOCALTIMESTAMP`), and DATE/TIME/TIMESTAMP columns as expression
+  operands — through conditionals, concatenation, arithmetic on
+  extracted parts, and WHERE predicates. Probed conventions: WEEKDAY
+  0 = Sunday, YEARDAY 0-based, ISO 8601 week, SECOND at NUMERIC(9,4),
+  MILLISECOND at NUMERIC(9,1); wrong parts fail at prepare; DATE vs
+  TIMESTAMP converts as midnight. Gate: `qa/serve-real-extract.sh`,
+  42 checks.
+- **`docs/porting-playbook.md`** — tips for the next agent porting to
+  another language: the method (probe first, engine as oracle, refuse
+  loudly, diversify fixtures, prove gates fail pre-fix), the core
+  algorithms in language-agnostic pseudocode (expression pipeline and
+  its emit invariant, dialect-3 scale arithmetic, three-valued logic,
+  DNF predicates with the no-raise fence, civil-date math, LIKE), the
+  traps that cost real time, and the porting order that worked.
+
+### Guarded
+- Mixed temporal kinds (or a temporal beside a number) in a
+  conditional refuse at prepare — the wire form could not carry both.
+  `CURRENT_TIME`/`CURRENT_TIMESTAMP` (TIME ZONE types) refuse; the
+  clock capture happens at plan time, a documented divergence for
+  prepare-once-execute-many clients.
+
 ## 2026-07-28 — CASE, and the conditional typing law
 
 ### Converted

@@ -2449,6 +2449,11 @@ fn build_expr_col(
         ExprType::Int => num_form(0),
         ExprType::Text => (Wire::Varying, nullable(448), 32765, 0),
         ExprType::Numeric => num_form(e.result_scale(descs)? as i32),
+        // a temporal result travels exactly like a stored temporal
+        // column (the same wire forms wire_for announces)
+        ExprType::Temporal(TKind::Date) => (Wire::Date, nullable(570), 4, 0),
+        ExprType::Temporal(TKind::Time) => (Wire::Time, nullable(560), 4, 0),
+        ExprType::Temporal(TKind::Timestamp) => (Wire::Timestamp, nullable(510), 8, 0),
     };
     Some(ProjCol {
         name: name.to_string(),
@@ -10380,6 +10385,10 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::Time(x), Value::Time(y)) => x.cmp(y),
         (Value::Timestamp(dx, tx), Value::Timestamp(dy, ty)) => (dx, tx).cmp(&(dy, ty)),
+        // a DATE against a TIMESTAMP converts as midnight - the
+        // engine's comparison rule
+        (Value::Date(x), Value::Timestamp(dy, ty)) => (*x, 0u32).cmp(&(*dy, *ty)),
+        (Value::Timestamp(dx, tx), Value::Date(y)) => (*dx, *tx).cmp(&(*y, 0u32)),
         // WITH TIME ZONE values order by their UTC instant - the zone
         // is presentation, not identity
         (Value::TimeTz(tx, _), Value::TimeTz(ty, _)) => tx.cmp(ty),
@@ -11602,6 +11611,22 @@ enum RawExpr {
     /// matches, because `x = NULL` is UNKNOWN (probed). The engine
     /// parses IIF into this same node (its un-aliased header is CASE).
     Case(Vec<(RawCond, RawExpr)>, Option<Box<RawExpr>>),
+    /// `DATE 'yyyy-mm-dd'` - days since the MJD epoch (1858-11-17)
+    DateLit(i32),
+    /// `TIME 'hh:mm[:ss[.ffff]]'` - units of 1/10000 s since midnight
+    TimeLit(u32),
+    /// `TIMESTAMP '<date> <time>'`
+    TsLit(i32, u32),
+    /// `CURRENT_DATE` / `LOCALTIME` / `LOCALTIMESTAMP` - captured at
+    /// PLAN time (the engine fixes them per statement execution; a
+    /// prepare-once-execute-many client would see the plan's clock -
+    /// an accepted divergence, noted in docs/expression-surface.md).
+    /// LOCALTIME truncates the fractional second (probed: the engine
+    /// answers hh:mm:ss.0000); CURRENT_TIME / CURRENT_TIMESTAMP are
+    /// TIME ZONE types and stay refusals for now.
+    CurrentDate,
+    LocalTime,
+    LocalTimestamp,
 }
 
 /// The built-in scalar functions this server evaluates. Two engine
@@ -11642,6 +11667,46 @@ enum SysFn {
     Sign,
     Lpad,
     Rpad,
+    /// `EXTRACT(<part> FROM <temporal>)` - one operand, the part in the
+    /// variant. A part invalid for the operand's kind fails the TYPE
+    /// CHECK, so the refusal lands at prepare exactly where the engine
+    /// raises its -105 "part does not exist in input datatype" (probed).
+    /// SECOND answers NUMERIC(9,4) (12.3456), MILLISECOND NUMERIC(9,1)
+    /// (345.6) - both probed; the other parts are integers.
+    Extract(ExtractPart),
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ExtractPart {
+    Year,
+    Month,
+    Day,
+    /// 0 = Sunday (probed: 2024-02-29 -> 4, Thursday)
+    Weekday,
+    /// 0-based (probed: Jan 1st -> 0, 2024-02-29 -> 59)
+    Yearday,
+    /// ISO 8601 week number (probed: 1999-01-01 -> 53, of 1998)
+    Week,
+    Hour,
+    Minute,
+    Second,
+    Millisecond,
+}
+
+impl ExtractPart {
+    /// which temporal kinds carry this part - the engine's prepare-time
+    /// "-105 part does not exist in input datatype" check
+    fn valid_for(&self, k: TKind) -> bool {
+        use ExtractPart::*;
+        match self {
+            Year | Month | Day | Weekday | Yearday | Week => {
+                matches!(k, TKind::Date | TKind::Timestamp)
+            }
+            Hour | Minute | Second | Millisecond => {
+                matches!(k, TKind::Time | TKind::Timestamp)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -11673,6 +11738,7 @@ impl SysFn {
             SysFn::Sign => "SIGN",
             SysFn::Lpad => "LPAD",
             SysFn::Rpad => "RPAD",
+            SysFn::Extract(_) => "EXTRACT",
         }
     }
 }
@@ -11986,6 +12052,41 @@ fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
             }
             if word.eq_ignore_ascii_case("NULL") {
                 Some(RawExpr::Null)
+            } else if !quoted && word.eq_ignore_ascii_case("CURRENT_DATE") {
+                Some(RawExpr::CurrentDate)
+            } else if !quoted && word.eq_ignore_ascii_case("LOCALTIME") {
+                Some(RawExpr::LocalTime)
+            } else if !quoted && word.eq_ignore_ascii_case("LOCALTIMESTAMP") {
+                Some(RawExpr::LocalTimestamp)
+            } else if !quoted
+                && (word.eq_ignore_ascii_case("DATE")
+                    || word.eq_ignore_ascii_case("TIME")
+                    || word.eq_ignore_ascii_case("TIMESTAMP"))
+                && {
+                    skip_ws(b, pos);
+                    b.get(*pos) == Some(&'\'')
+                }
+            {
+                // a temporal literal: the keyword followed by a
+                // single-quoted string (ISO forms only)
+                *pos += 1; // opening quote
+                let start = *pos;
+                while *pos < b.len() && b[*pos] != '\'' {
+                    *pos += 1;
+                }
+                if b.get(*pos) != Some(&'\'') {
+                    return None;
+                }
+                let text: String = b[start..*pos].iter().collect();
+                *pos += 1; // closing quote
+                if word.eq_ignore_ascii_case("DATE") {
+                    Some(RawExpr::DateLit(parse_date_lit(&text)?))
+                } else if word.eq_ignore_ascii_case("TIME") {
+                    Some(RawExpr::TimeLit(parse_time_lit(&text)?))
+                } else {
+                    let (ds, ts) = text.trim().split_once(' ')?;
+                    Some(RawExpr::TsLit(parse_date_lit(ds)?, parse_time_lit(ts.trim())?))
+                }
             } else if !quoted && word.eq_ignore_ascii_case("CAST") && {
                 skip_ws(b, pos);
                 b.get(*pos) == Some(&'(')
@@ -12125,7 +12226,13 @@ fn raw_bad_substring_len(e: &RawExpr) -> Option<i64> {
         | RawExpr::Int(_)
         | RawExpr::Dec(..)
         | RawExpr::Str(_)
-        | RawExpr::Null => None,
+        | RawExpr::Null
+        | RawExpr::DateLit(_)
+        | RawExpr::TimeLit(_)
+        | RawExpr::TsLit(..)
+        | RawExpr::CurrentDate
+        | RawExpr::LocalTime
+        | RawExpr::LocalTimestamp => None,
     }
 }
 
@@ -12153,7 +12260,7 @@ fn names_expr_call(s: &str) -> bool {
         "COALESCE(", "NULLIF(", "IIF(", "UPPER(", "LOWER(", "CHAR_LENGTH(",
         "CHARACTER_LENGTH(", "OCTET_LENGTH(", "SUBSTRING(", "TRIM(", "LEFT(",
         "RIGHT(", "REPLACE(", "POSITION(", "REVERSE(", "ABS(", "MOD(",
-        "SIGN(", "LPAD(", "RPAD(",
+        "SIGN(", "LPAD(", "RPAD(", "EXTRACT(",
     ]
     .iter()
     .any(|f| up.contains(f))
@@ -12179,6 +12286,9 @@ fn sysfn_named(word: &str) -> Option<SysFn> {
         "SIGN" => SysFn::Sign,
         "LPAD" => SysFn::Lpad,
         "RPAD" => SysFn::Rpad,
+        // the part in the variant is a placeholder for the NAME check;
+        // parse_sysfn_call reads the real one
+        "EXTRACT" => SysFn::Extract(ExtractPart::Year),
         _ => return None,
     })
 }
@@ -12191,6 +12301,33 @@ fn sysfn_named(word: &str) -> Option<SysFn> {
 /// would otherwise be read as a column name).
 fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
     let f = sysfn_named(up)?;
+    // EXTRACT(<part> FROM <temporal>)
+    if matches!(f, SysFn::Extract(_)) {
+        skip_ws(b, pos);
+        let start = *pos;
+        while *pos < b.len() && (b[*pos].is_alphanumeric() || b[*pos] == '_') {
+            *pos += 1;
+        }
+        let word: String = b[start..*pos].iter().collect();
+        let part = match word.to_ascii_uppercase().as_str() {
+            "YEAR" => ExtractPart::Year,
+            "MONTH" => ExtractPart::Month,
+            "DAY" => ExtractPart::Day,
+            "WEEKDAY" => ExtractPart::Weekday,
+            "YEARDAY" => ExtractPart::Yearday,
+            "WEEK" => ExtractPart::Week,
+            "HOUR" => ExtractPart::Hour,
+            "MINUTE" => ExtractPart::Minute,
+            "SECOND" => ExtractPart::Second,
+            "MILLISECOND" => ExtractPart::Millisecond,
+            _ => return None, // TIMEZONE_HOUR etc.: refuse
+        };
+        if !take_keyword(b, pos, "FROM") {
+            return None;
+        }
+        let operand = expr_add(b, pos)?;
+        return Some(RawExpr::Func(SysFn::Extract(part), vec![operand]));
+    }
     // SUBSTRING(<s> FROM <start> [FOR <len>])
     if matches!(f, SysFn::Substring) {
         let src = expr_add(b, pos)?;
@@ -12275,7 +12412,9 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         SysFn::Left | SysFn::Right | SysFn::Mod => (2, 2),
         SysFn::Replace => (3, 3),
         SysFn::Lpad | SysFn::Rpad => (2, 3),
-        SysFn::Substring | SysFn::Trim(_) | SysFn::Position => unreachable!(),
+        SysFn::Substring | SysFn::Trim(_) | SysFn::Position | SysFn::Extract(_) => {
+            unreachable!()
+        }
     };
     if args.len() < min || args.len() > max {
         return None;
@@ -12441,9 +12580,9 @@ fn resolve_expr(
                 return None;
             }
             let d = descs.get(fid)?;
-            // an int, text, or scaled-numeric column (numerics are only
-            // usable as CAST/concat operands; type_of/eval enforce that)
-            if col_kind(d).is_none() && !is_numeric_col(d) {
+            // an int, text, scaled-numeric or temporal column
+            // (type_of/eval decide what each may do)
+            if col_kind(d).is_none() && !is_numeric_col(d) && temporal_kind(d).is_none() {
                 return None;
             }
             Expr::Col(fid)
@@ -12498,6 +12637,20 @@ fn resolve_expr(
                 None => None,
             },
         ),
+        RawExpr::DateLit(d) => Expr::DateLit(*d),
+        RawExpr::TimeLit(t) => Expr::TimeLit(*t),
+        RawExpr::TsLit(d, t) => Expr::TsLit(*d, *t),
+        // the plan-time clock capture (see the RawExpr variant docs);
+        // LOCALTIME truncates the fractional second, as probed
+        RawExpr::CurrentDate => Expr::DateLit(now_date_time().0),
+        RawExpr::LocalTime => {
+            let (_, t) = now_date_time();
+            Expr::TimeLit(t - t % 10_000)
+        }
+        RawExpr::LocalTimestamp => {
+            let (d, t) = now_date_time();
+            Expr::TsLit(d, t)
+        }
     })
 }
 
@@ -12532,6 +12685,11 @@ enum Expr {
     /// `CASE`: the first branch whose condition is TRUE answers; false
     /// and UNKNOWN move on; no branch -> ELSE, no ELSE -> NULL
     Case(Vec<(Cond2, Expr)>, Option<Box<Expr>>),
+    /// a temporal literal - also what CURRENT_DATE / LOCALTIME /
+    /// LOCALTIMESTAMP resolve into (the plan-time clock capture)
+    DateLit(i32),
+    TimeLit(u32),
+    TsLit(i32, u32),
 }
 
 /// A resolved [RawCond].
@@ -12643,6 +12801,16 @@ enum ExprType {
     Int,
     Text,
     Numeric,
+    /// a DATE/TIME/TIMESTAMP result - travels in its own wire form
+    /// exactly like a stored temporal column
+    Temporal(TKind),
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum TKind {
+    Date,
+    Time,
+    Timestamp,
 }
 
 /// A conditional's result type from all its branches: the first branch
@@ -12658,6 +12826,8 @@ fn conditional_type<'a>(
     let mut first = None;
     let mut any_numeric = false;
     let mut any_text = false;
+    let mut temporal: Option<TKind> = None;
+    let mut any_other = false;
     for t in branches.filter_map(|e| e.type_of(descs)) {
         if first.is_none() {
             first = Some(t);
@@ -12665,13 +12835,39 @@ fn conditional_type<'a>(
         match t {
             ExprType::Numeric => any_numeric = true,
             ExprType::Text => any_text = true,
-            ExprType::Int => {}
+            ExprType::Int => any_other = true,
+            ExprType::Temporal(k) => match temporal {
+                None => temporal = Some(k),
+                // two different temporal kinds cannot share a describe
+                Some(prev) if prev != k => return None,
+                Some(_) => {}
+            },
         }
+    }
+    // a temporal branch must not mix with any other family: the wire
+    // form could not carry both (the engine errors at prepare too)
+    if temporal.is_some() {
+        return if any_numeric || any_text || any_other {
+            None
+        } else {
+            first
+        };
     }
     if any_numeric && !any_text {
         return Some(ExprType::Numeric);
     }
     first
+}
+
+/// A plain temporal column - DATE/TIME/TIMESTAMP (the TIME ZONE types
+/// stay outside the expression surface for now).
+fn temporal_kind(d: &Descriptor) -> Option<TKind> {
+    match d.dtype {
+        dtype::SQL_DATE => Some(TKind::Date),
+        dtype::SQL_TIME => Some(TKind::Time),
+        dtype::TIMESTAMP => Some(TKind::Timestamp),
+        _ => None,
+    }
 }
 
 /// A scaled exact-numeric column - the operand form CAST and concat
@@ -12778,6 +12974,99 @@ fn round_scaled_to_int(raw: i128, scale: i8) -> i128 {
     } else {
         q
     }
+}
+
+/// Civil date from an MJD day number (day 0 = 1858-11-17) - Howard
+/// Hinnant's civil-from-days, the same math the ods renderer uses.
+fn civil_of(days: i32) -> (i32, u32, u32) {
+    let z = days as i64 - 40587 + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y } as i32, m, d)
+}
+
+/// The inverse: MJD day number from a civil date (days-from-civil).
+fn days_of_civil(y: i32, m: u32, d: u32) -> i32 {
+    let y = y as i64 - if m <= 2 { 1 } else { 0 };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era * 146097 + doe - 719468 + 40587) as i32
+}
+
+/// Day of week for an MJD day number, 0 = Sunday - the engine's
+/// EXTRACT(WEEKDAY) convention (probed: 2024-02-29 is 4). Day 0
+/// (1858-11-17) was a Wednesday, index 3.
+fn weekday_of(days: i32) -> i32 {
+    (days + 3).rem_euclid(7)
+}
+
+/// ISO 8601 week number (probed: 1999-01-01 -> 53, 2024-02-29 -> 9,
+/// 2001-09-09 -> 36): the week containing this date's Thursday,
+/// week 1 = the week with the year's first Thursday.
+fn iso_week_of(days: i32) -> i32 {
+    // shift to this week's Thursday, then count weeks in ITS year
+    let thursday = days + 3 - (weekday_of(days) + 6).rem_euclid(7);
+    let (y, _, _) = civil_of(thursday);
+    let jan1 = days_of_civil(y, 1, 1);
+    (thursday - jan1) / 7 + 1
+}
+
+/// Parse `yyyy-mm-dd` into an MJD day number. ISO form only - the
+/// engine accepts more spellings; anything else refuses at parse.
+fn parse_date_lit(s: &str) -> Option<i32> {
+    let parts: Vec<&str> = s.trim().split('-').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let y: i32 = parts[0].parse().ok()?;
+    let m: u32 = parts[1].parse().ok()?;
+    let d: u32 = parts[2].parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    // round-trip to reject impossible dates (Feb 30)
+    let days = days_of_civil(y, m, d);
+    if civil_of(days) != (y, m, d) {
+        return None;
+    }
+    Some(days)
+}
+
+/// Parse `hh:mm[:ss[.ffff]]` into 1/10000-second units since midnight.
+fn parse_time_lit(s: &str) -> Option<u32> {
+    let parts: Vec<&str> = s.trim().split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return None;
+    }
+    let h: u32 = parts[0].parse().ok()?;
+    let m: u32 = parts[1].parse().ok()?;
+    let (sec, frac) = match parts.get(2) {
+        None => (0u32, 0u32),
+        Some(sp) => match sp.split_once('.') {
+            None => (sp.parse().ok()?, 0),
+            Some((sw, fw)) => {
+                if fw.is_empty() || fw.len() > 4 || !fw.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                // pad the written fraction to 4 digits of 1/10000 s
+                let f: u32 = fw.parse().ok()?;
+                (sw.parse().ok()?, f * 10u32.pow(4 - fw.len() as u32))
+            }
+        },
+    };
+    if h > 23 || m > 59 || sec > 59 {
+        return None;
+    }
+    Some(((h * 3600 + m * 60 + sec) * 10_000) + frac)
 }
 
 /// A function argument as text - the engine's CVT string coercion:
@@ -12923,17 +13212,20 @@ impl Expr {
                     // marker); numeric columns classify from the desc
                     Some(ColKind::Numeric) => None,
                     None if is_numeric_col(d) => Some(ExprType::Numeric),
-                    None => None,
+                    None => temporal_kind(d).map(ExprType::Temporal),
                 }
             }
             Expr::Int(_) => Some(ExprType::Int),
             Expr::Dec(..) => Some(ExprType::Numeric),
             Expr::Str(_) => Some(ExprType::Text),
             Expr::Null => Some(ExprType::Int),
+            Expr::DateLit(_) => Some(ExprType::Temporal(TKind::Date)),
+            Expr::TimeLit(_) => Some(ExprType::Temporal(TKind::Time)),
+            Expr::TsLit(..) => Some(ExprType::Temporal(TKind::Timestamp)),
             Expr::Neg(e) => match e.type_of(descs)? {
                 ExprType::Int => Some(ExprType::Int),
                 ExprType::Numeric => Some(ExprType::Numeric),
-                ExprType::Text => None,
+                ExprType::Text | ExprType::Temporal(_) => None,
             },
             Expr::Bin(a, _, b) => match (a.type_of(descs)?, b.type_of(descs)?) {
                 // pure integer arithmetic stays integer
@@ -12971,6 +13263,19 @@ impl Expr {
                     .map(|a| a.type_of(descs))
                     .collect::<Option<Vec<_>>>()?;
                 match f {
+                    // the part must exist in the operand's kind - this
+                    // is where the engine's prepare-time -105 lands
+                    SysFn::Extract(part) => match ts[0] {
+                        ExprType::Temporal(k) if part.valid_for(k) => {
+                            Some(match part {
+                                ExtractPart::Second | ExtractPart::Millisecond => {
+                                    ExprType::Numeric
+                                }
+                                _ => ExprType::Int,
+                            })
+                        }
+                        _ => None,
+                    },
                     SysFn::Upper
                     | SysFn::Lower
                     | SysFn::Substring
@@ -12999,7 +13304,7 @@ impl Expr {
                     SysFn::Abs => match ts[0] {
                         ExprType::Int => Some(ExprType::Int),
                         ExprType::Numeric => Some(ExprType::Numeric),
-                        ExprType::Text => None,
+                        ExprType::Text | ExprType::Temporal(_) => None,
                     },
                 }
             }
@@ -13065,6 +13370,10 @@ impl Expr {
             // ABS is the one function that can be Numeric-typed, and it
             // keeps its operand's scale
             Expr::Func(SysFn::Abs, args) => args.first()?.result_scale(descs),
+            // EXTRACT's fractional parts: SECOND is NUMERIC(9,4),
+            // MILLISECOND NUMERIC(9,1) - both probed
+            Expr::Func(SysFn::Extract(ExtractPart::Second), _) => Some(-4),
+            Expr::Func(SysFn::Extract(ExtractPart::Millisecond), _) => Some(-1),
             _ => None,
         }
     }
@@ -13150,12 +13459,18 @@ impl Expr {
                 // a MOD result's magnitude is below its divisor's, but
                 // an INT128 divisor can still put it past i64
                 SysFn::Mod => args.iter().filter_map(|a| a.rank_of(descs)).max(),
-                SysFn::CharLength | SysFn::OctetLength | SysFn::Position | SysFn::Sign => {
-                    Some(NumRank::Long)
-                }
+                SysFn::CharLength
+                | SysFn::OctetLength
+                | SysFn::Position
+                | SysFn::Sign
+                | SysFn::Extract(_) => Some(NumRank::Long),
                 _ => None, // the text-valued functions
             },
-            Expr::Str(_) | Expr::Concat(..) => None,
+            Expr::Str(_)
+            | Expr::Concat(..)
+            | Expr::DateLit(_)
+            | Expr::TimeLit(_)
+            | Expr::TsLit(..) => None,
         }
     }
 
@@ -13230,6 +13545,9 @@ impl Expr {
             Expr::Dec(raw, scale) => Value::Scaled(*raw, *scale),
             Expr::Str(s) => Value::Text(s.clone()),
             Expr::Null => Value::Null,
+            Expr::DateLit(d) => Value::Date(*d),
+            Expr::TimeLit(t) => Value::Time(*t),
+            Expr::TsLit(d, t) => Value::Timestamp(*d, *t),
             Expr::Neg(e) => match e.eval(values)? {
                 Value::Int(n) => Value::Int(n.wrapping_neg()),
                 Value::Scaled(r, s) => Value::Scaled(r.wrapping_neg(), s),
@@ -13342,6 +13660,45 @@ impl Expr {
                     vs.push(v);
                 }
                 match f {
+                    // EXTRACT: pull the part from the decoded temporal
+                    // value; the conventions are the probed ones on the
+                    // helpers (WEEKDAY 0=Sunday, YEARDAY 0-based, ISO
+                    // week, SECOND at scale -4, MILLISECOND at -1)
+                    SysFn::Extract(part) => {
+                        let (days, units) = match vs[0] {
+                            Value::Date(d) => (Some(d), None),
+                            Value::Time(t) => (None, Some(t)),
+                            Value::Timestamp(d, t) => (Some(d), Some(t)),
+                            _ => return Ok(Value::Null), // type-checked away
+                        };
+                        use ExtractPart::*;
+                        match (part, days, units) {
+                            (Year, Some(d), _) => Value::Int(civil_of(d).0 as i64),
+                            (Month, Some(d), _) => Value::Int(civil_of(d).1 as i64),
+                            (Day, Some(d), _) => Value::Int(civil_of(d).2 as i64),
+                            (Weekday, Some(d), _) => Value::Int(weekday_of(d) as i64),
+                            (Yearday, Some(d), _) => {
+                                let (y, _, _) = civil_of(d);
+                                Value::Int((d - days_of_civil(y, 1, 1)) as i64)
+                            }
+                            (Week, Some(d), _) => Value::Int(iso_week_of(d) as i64),
+                            (Hour, _, Some(t)) => Value::Int((t / 36_000_000) as i64),
+                            (Minute, _, Some(t)) => {
+                                Value::Int((t / 600_000 % 60) as i64)
+                            }
+                            // seconds INCLUDING the fraction, raw units
+                            // at scale -4 (12.3456)
+                            (Second, _, Some(t)) => {
+                                Value::Scaled((t % 600_000) as i64, -4)
+                            }
+                            // the fractional-second part in ms, scale -1
+                            // (345.6)
+                            (Millisecond, _, Some(t)) => {
+                                Value::Scaled((t % 10_000) as i64, -1)
+                            }
+                            _ => Value::Null, // type-checked away
+                        }
+                    }
                     // Unicode case mapping. Exact for a UTF8 database
                     // (the engine goes through ICU); a NONE-charset
                     // column's non-ASCII bytes were already lossy at
@@ -14199,6 +14556,20 @@ fn parse_projection(proj: &str) -> Option<Proj> {
             items.push(SelItem::Gen(gen, step, name));
             continue;
         }
+        // the bare clock keywords LOOK like column names but are
+        // expressions - route them to the expression parser before the
+        // ident path reads them as a (nonexistent) column
+        let clock_kw = ["CURRENT_DATE", "LOCALTIME", "LOCALTIMESTAMP"]
+            .iter()
+            .any(|k| body.trim().eq_ignore_ascii_case(k));
+        if clock_kw {
+            let raw = parse_raw_expr_any(body.trim())?;
+            let name = alias
+                .map(|a| a.trim_matches('"').to_ascii_uppercase())
+                .unwrap_or_else(|| default_expr_name(&raw));
+            items.push(SelItem::Expr(raw, name));
+            continue;
+        }
         if alias.is_none() && is_qualified_col(body) {
             items.push(SelItem::Col(body.to_string()));
         } else if alias.is_none() && ident_ok(body.trim_matches('"')) {
@@ -14306,6 +14677,10 @@ fn default_expr_name(raw: &RawExpr) -> String {
         RawExpr::Iif(_, _, _) => "CASE",
         RawExpr::Case(..) => "CASE",
         RawExpr::Func(f, _) => return f.header().to_string(),
+        RawExpr::CurrentDate => "CURRENT_DATE",
+        RawExpr::LocalTime => "LOCALTIME",
+        RawExpr::LocalTimestamp => "LOCALTIMESTAMP",
+        RawExpr::DateLit(_) | RawExpr::TimeLit(_) | RawExpr::TsLit(..) => "CONSTANT",
         // the engine leaves a unary-minus column unnamed (blank header)
         RawExpr::Neg(_) => "",
         RawExpr::Int(_) | RawExpr::Dec(..) | RawExpr::Str(_) | RawExpr::Null => "CONSTANT",
@@ -15997,7 +16372,14 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
             && a.rank_of(descs) != Some(NumRank::I128)
     };
     match e {
-        Expr::Col(_) | Expr::Int(_) | Expr::Dec(..) | Expr::Str(_) | Expr::Null => true,
+        Expr::Col(_)
+        | Expr::Int(_)
+        | Expr::Dec(..)
+        | Expr::Str(_)
+        | Expr::Null
+        | Expr::DateLit(_)
+        | Expr::TimeLit(_)
+        | Expr::TsLit(..) => true,
         Expr::Neg(x) => expr_no_raise(x, descs),
         // arithmetic can overflow / divide by zero; CAST can fail
         Expr::Bin(..) | Expr::Cast(..) => false,
@@ -16024,7 +16406,8 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
                 | SysFn::OctetLength
                 | SysFn::Trim(_)
                 | SysFn::Replace
-                | SysFn::Reverse => true,
+                | SysFn::Reverse
+                | SysFn::Extract(_) => true,
                 // a negative length raises - admit only a literal that
                 // is visibly non-negative; the start may be any
                 // non-text value (clipping handles every magnitude)
@@ -20435,6 +20818,161 @@ mod tests {
         assert!(matches!(ev("ABS(A) * 2"), Value::Int(14)));
         txt("IIF(CHAR_LENGTH(NAME) > 3, 'long', 'short')", "long");
         txt("COALESCE(SUBSTRING(NAME FROM 99), 'gone')", "");
+    }
+
+    #[test]
+    fn temporal_expressions_extract_and_literals() {
+        // civil math round-trips across eras and leap days
+        for (y, m, d) in [
+            (1858, 11, 17), (1970, 1, 1), (2000, 2, 29), (2024, 2, 29),
+            (1999, 12, 31), (1600, 3, 1), (2400, 2, 29),
+        ] {
+            let days = days_of_civil(y, m, d);
+            assert_eq!(civil_of(days), (y, m, d), "{y}-{m}-{d}");
+        }
+        assert_eq!(days_of_civil(1858, 11, 17), 0); // the MJD epoch
+
+        // the probed conventions: WEEKDAY 0=Sunday, YEARDAY 0-based,
+        // ISO week (each value below came from the live engine)
+        let d_2024_02_29 = days_of_civil(2024, 2, 29);
+        let d_1999_01_01 = days_of_civil(1999, 1, 1);
+        let d_2001_09_09 = days_of_civil(2001, 9, 9);
+        assert_eq!(weekday_of(d_2024_02_29), 4); // Thursday
+        assert_eq!(weekday_of(d_1999_01_01), 5); // Friday
+        assert_eq!(weekday_of(d_2001_09_09), 0); // Sunday
+        assert_eq!(iso_week_of(d_2024_02_29), 9);
+        assert_eq!(iso_week_of(d_1999_01_01), 53); // of 1998
+        assert_eq!(iso_week_of(d_2001_09_09), 36);
+
+        // literal parsing: ISO forms only, impossible dates refused,
+        // written fractions pad to 1/10000 s
+        assert_eq!(parse_date_lit("2024-02-29"), Some(d_2024_02_29));
+        assert_eq!(parse_date_lit("2024-02-30"), None);
+        assert_eq!(parse_date_lit("2024-13-01"), None);
+        assert_eq!(parse_date_lit("29.02.2024"), None);
+        assert_eq!(parse_time_lit("14:35:12.3456"), Some(((14 * 3600 + 35 * 60 + 12) * 10_000 + 3456)));
+        assert_eq!(parse_time_lit("14:35"), Some((14 * 3600 + 35 * 60) * 10_000));
+        assert_eq!(parse_time_lit("00:00:00.5"), Some(5000)); // .5 pads to 5000
+        assert_eq!(parse_time_lit("24:00"), None);
+        assert_eq!(parse_time_lit("14:60"), None);
+
+        // EXTRACT end to end against decoded values: D DATE, TM TIME,
+        // TS TIMESTAMP - the same rows the probe used
+        let columns = vec![
+            RelationColumn { name: "D".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "TM".into(), field_id: 1, position: 1 },
+            RelationColumn { name: "TS".into(), field_id: 2, position: 2 },
+            RelationColumn { name: "S".into(), field_id: 3, position: 3 },
+        ];
+        let dd = |dt, len| Descriptor {
+            dtype: dt, scale: 0, length: len, sub_type: 0, flags: 0, offset: 4,
+        };
+        let descs = vec![
+            dd(dtype::SQL_DATE, 4),
+            dd(dtype::SQL_TIME, 4),
+            dd(dtype::TIMESTAMP, 8),
+            dd(dtype::VARYING, 10),
+        ];
+        let row = vec![
+            Value::Date(d_2024_02_29),
+            Value::Time((14 * 3600 + 35 * 60 + 12) * 10_000 + 3456),
+            Value::Timestamp(d_2001_09_09, (1 * 3600 + 46 * 60 + 40) * 10_000 + 1234),
+            Value::Text("x".into()),
+        ];
+        let ev = |s: &str| -> Value {
+            let raw = parse_raw_expr(s).unwrap_or_else(|| panic!("{s} did not parse"));
+            resolve_expr(&raw, &columns, &descs).unwrap().eval(&row).unwrap()
+        };
+        assert!(matches!(ev("EXTRACT(YEAR FROM D)"), Value::Int(2024)));
+        assert!(matches!(ev("EXTRACT(MONTH FROM D)"), Value::Int(2)));
+        assert!(matches!(ev("EXTRACT(DAY FROM D)"), Value::Int(29)));
+        assert!(matches!(ev("EXTRACT(WEEKDAY FROM D)"), Value::Int(4)));
+        assert!(matches!(ev("EXTRACT(YEARDAY FROM D)"), Value::Int(59)));
+        assert!(matches!(ev("EXTRACT(WEEK FROM D)"), Value::Int(9)));
+        assert!(matches!(ev("EXTRACT(HOUR FROM TM)"), Value::Int(14)));
+        assert!(matches!(ev("EXTRACT(MINUTE FROM TM)"), Value::Int(35)));
+        // SECOND keeps its fraction at scale -4 (12.3456); MILLISECOND
+        // is the fraction in ms at scale -1 (345.6) - probed forms
+        assert!(matches!(ev("EXTRACT(SECOND FROM TM)"), Value::Scaled(123456, -4)));
+        assert!(matches!(ev("EXTRACT(MILLISECOND FROM TM)"), Value::Scaled(3456, -1)));
+        assert!(matches!(ev("EXTRACT(YEAR FROM TS)"), Value::Int(2001)));
+        assert!(matches!(ev("EXTRACT(WEEKDAY FROM TS)"), Value::Int(0)));
+        assert!(matches!(ev("EXTRACT(SECOND FROM TS)"), Value::Scaled(401234, -4)));
+        // EXTRACT nests into arithmetic
+        assert!(matches!(ev("EXTRACT(DAY FROM D) * 100 + EXTRACT(MONTH FROM D)"), Value::Int(2902)));
+
+        // temporal literals evaluate, and compare against columns in
+        // conditions (value_cmp date arms; DATE vs TIMESTAMP converts)
+        assert!(matches!(ev("DATE '2024-02-29'"), Value::Date(d) if d == d_2024_02_29));
+        assert!(matches!(ev("TIME '09:00:00'"), Value::Time(324_000_000)));
+        assert!(matches!(
+            ev("CASE WHEN D = DATE '2024-02-29' THEN 'leap' ELSE 'no' END"),
+            Value::Text(ref t) if t == "leap"
+        ));
+        assert!(matches!(
+            ev("IIF(TS > TIMESTAMP '2001-01-01 00:00:00', 'after', 'before')"),
+            Value::Text(ref t) if t == "after"
+        ));
+        assert!(matches!(
+            ev("COALESCE(D, DATE '2000-01-01')"),
+            Value::Date(d) if d == d_2024_02_29
+        ));
+
+        // the announces: temporal results use the stored-column wire
+        // forms; EXTRACT ints are INT64-backed, SECOND is scale -4
+        let pc = |s: &str| {
+            build_expr_col(&parse_raw_expr_any(s).unwrap(), "X", &columns, &descs).unwrap()
+        };
+        assert_eq!(pc("COALESCE(D, DATE '2000-01-01')").sql_type, 571); // DATE nullable
+        assert_eq!(pc("COALESCE(TM, TIME '09:00:00')").sql_type, 561);
+        assert_eq!((pc("EXTRACT(SECOND FROM TM)").sql_type, pc("EXTRACT(SECOND FROM TM)").scale), (581, -4));
+        assert_eq!(pc("EXTRACT(MILLISECOND FROM TM)").scale, -1);
+        assert_eq!(pc("DATE '2000-01-01'").sql_type, 571);
+
+        // a part that does not exist in the operand's kind fails the
+        // TYPE CHECK - the refusal lands at prepare like the engine's
+        // -105 - and so does EXTRACT over a non-temporal
+        let ty = |s: &str| {
+            let raw = parse_raw_expr(s).unwrap();
+            resolve_expr(&raw, &columns, &descs).unwrap().type_of(&descs)
+        };
+        assert_eq!(ty("EXTRACT(HOUR FROM D)"), None);
+        assert_eq!(ty("EXTRACT(YEAR FROM TM)"), None);
+        assert_eq!(ty("EXTRACT(YEAR FROM S)"), None);
+        // mixed temporal kinds (or temporal beside a number) cannot
+        // share a describe - the conditional refuses
+        assert!(build_expr_col(
+            &parse_raw_expr("COALESCE(D, TIME '09:00:00')").unwrap(), "X", &columns, &descs
+        ).is_none());
+        assert!(build_expr_col(
+            &parse_raw_expr("COALESCE(D, 1)").unwrap(), "X", &columns, &descs
+        ).is_none());
+        // unknown part and malformed forms do not parse
+        assert!(parse_raw_expr("EXTRACT(QUARTER FROM D)").is_none());
+        assert!(parse_raw_expr("EXTRACT(YEAR, D)").is_none());
+        assert!(parse_raw_expr("DATE '2024-2'").is_none());
+
+        // NULL propagates
+        let null_row = vec![Value::Null; 4];
+        let raw = parse_raw_expr("EXTRACT(YEAR FROM D)").unwrap();
+        assert!(matches!(
+            resolve_expr(&raw, &columns, &descs).unwrap().eval(&null_row),
+            Ok(Value::Null)
+        ));
+
+        // headers: EXTRACT, and the clock keywords under their own names
+        assert_eq!(default_expr_name(&parse_raw_expr("EXTRACT(YEAR FROM D)").unwrap()), "EXTRACT");
+        assert_eq!(default_expr_name(&parse_raw_expr_any("CURRENT_DATE").unwrap()), "CURRENT_DATE");
+        assert_eq!(default_expr_name(&parse_raw_expr_any("LOCALTIME").unwrap()), "LOCALTIME");
+        assert_eq!(default_expr_name(&parse_raw_expr_any("LOCALTIMESTAMP").unwrap()), "LOCALTIMESTAMP");
+        // LOCALTIME truncates the fractional second (probed)
+        if let Expr::TimeLit(t) =
+            resolve_expr(&parse_raw_expr_any("LOCALTIME").unwrap(), &columns, &descs).unwrap()
+        {
+            assert_eq!(t % 10_000, 0);
+        } else {
+            panic!("LOCALTIME did not resolve to a time literal");
+        }
     }
 
     #[test]

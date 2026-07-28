@@ -4086,6 +4086,33 @@ the nofallback gate taught: a gate proves its cases and says nothing
 about the queries just outside them — diversity of shapes in the
 fixture is what catches the class.
 
+### The temporal expression surface (`qa/serve-real-extract.sh`, 42 checks)
+
+`EXTRACT(<part> FROM <temporal>)`, temporal literals, the clock
+keywords, and DATE/TIME/TIMESTAMP columns as ordinary expression
+operands. The conventions are the content, each probed before
+implementation: `WEEKDAY` 0 = Sunday, `YEARDAY` 0-based, `WEEK` ISO
+8601 (1999-01-01 answers 53 — the last week of 1998), `SECOND` keeps
+its written fraction as NUMERIC(9,4), `MILLISECOND` answers the
+fraction in milliseconds as NUMERIC(9,1). The civil-date math (Howard
+Hinnant's algorithms over the MJD epoch, day 0 = 1858-11-17, a
+Wednesday) is round-tripped in unit tests across leap days and era
+boundaries, and the teeth checks pin the convention triple
+(weekday 5 / yearday 0 / week 53 for 1999-01-01) to VALUES, not just
+to engine agreement.
+
+A part that does not exist in the operand's kind fails at PREPARE —
+the engine's -105 — and fire-crab refuses at prepare too (with the
+generic Dynamic SQL Error; the -105 detail text is a noted difference,
+not a silent one). Mixed temporal kinds in a conditional refuse: the
+describe could not carry both. The clock keywords are captured at PLAN
+time where the engine fixes them per execution — identical for isql,
+divergent for a prepare-once-execute-many client, documented in
+[expression-surface.md](expression-surface.md); the gate's clock
+checks are day-safe only (`CURRENT_DATE`, `EXTRACT(YEAR FROM ...)`,
+and describes proven over zero-row results so nothing races the
+clock).
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
@@ -4665,6 +4692,13 @@ FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
 # Builds its own scratch database.
 FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     bash /path/to/fire-crab/qa/serve-real-case.sh 3050
+
+# the temporal expression surface: EXTRACT (WEEKDAY 0=Sunday, YEARDAY
+# 0-based, ISO week, SECOND at scale -4), temporal literals, CURRENT_DATE/
+# LOCALTIME/LOCALTIMESTAMP (day-safe checks), temporal columns through
+# conditionals and WHERE. Builds its own scratch database.
+FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    bash /path/to/fire-crab/qa/serve-real-extract.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on

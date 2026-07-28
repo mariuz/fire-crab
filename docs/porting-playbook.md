@@ -1,0 +1,202 @@
+# Porting playbook: tips for the next agent, in any language
+
+fire-crab is Rust, but nothing about the METHOD is. This document is
+for the next agent (human or machine) porting Firebird's behavior into
+another language — or continuing this conversion — written as the list
+of things we wish we had known on day one, with the core algorithms in
+language-agnostic pseudocode. The Rust is the reference implementation;
+the engine's C++ is the specification; this file is the map between
+them.
+
+## The method, before any code
+
+1. **Probe before you implement.** Every semantic here was established
+   by running SQL through `isql` against the live engine FIRST, and the
+   probe's output went into the code comments and the tests. If you
+   cannot state the expected output before writing the function, you
+   are about to guess — and the engine has thirty years of decisions
+   you will guess wrong. (Examples that would have been guessed wrong:
+   `MOD(12.50, 5) = 3`; `CHAR_LENGTH` of a `CHAR(5)` counts padding;
+   `POSITION('', s, 99) = 0` but at 3 it is 3; an un-aliased IIF
+   headers as `CASE`; `EXTRACT(YEARDAY ...)` is 0-based.)
+
+2. **The engine is the oracle, differentially.** A gate is a script
+   that runs IDENTICAL input through your port and the real engine on
+   the SAME database file and compares outputs exactly. Value-for-value
+   beats "looks right". Where the engine can validate your WRITES, let
+   it: have `gfix -v -full` check the file, have the engine read your
+   tables, have its own GC collect your version chains.
+
+3. **Never answer wrong; refuse loudly.** The worst outcome is not a
+   missing feature — it is a plausible wrong answer. Every unsupported
+   shape must RAISE a clean SQL error at prepare. This project shipped
+   a fixed placeholder answer (4242) early on, and closing the paths by
+   which it could leak took six separate fixes; do not have a fixed
+   answer at all if you can avoid it.
+
+4. **A gate proves its cases and says nothing about the queries just
+   outside them.** Two standing bugs survived dozens of green gates
+   because the fixtures were too uniform: conditionals typed from their
+   first branch alone (`COALESCE(A, 0.5)` — every gate had written the
+   literal at the column's own scale), and the query splitter took the
+   first `FROM` in the statement (no gate had put `SUBSTRING(x FROM 1)`
+   in a select list). Diversify fixture SHAPES, not just values.
+
+5. **Prove a new gate fails on the old binary.** A gate that passes
+   before the fix is vacuous. Stash, build the pre-change binary, run
+   the gate, expect red; then apply the change and expect green.
+
+## The core algorithms, in pseudocode
+
+### Expression pipeline (two-stage AST)
+
+    # Stage 1: parse against NAMES (no schema yet)
+    RawExpr := Col(name) | Int(n) | Dec(raw, scale) | Str(s) | Null
+             | Neg(e) | Bin(a, op, b) | Concat(a, b) | Cast(e, target)
+             | Coalesce([e]) | NullIf(a, b) | Iif(cond, a, b)
+             | Case([(cond, e)], else?) | Func(kind, [e])
+             | DateLit(days) | TimeLit(units) | TsLit(days, units)
+
+    # Stage 2: resolve against a relation -> typed Expr
+    resolve(raw, columns, descriptors):
+        Col(name) -> look up field id; REFUSE unknown, computed,
+                     unsupported-dtype columns
+        every other node -> resolve children
+
+    # Four functions on the resolved tree; keep them CONSISTENT:
+    type_of(e)      -> Int | Text | Numeric | Temporal(kind) | REFUSE
+    result_scale(e) -> the scale the describe announces (numerics only)
+    rank_of(e)      -> storage width (long / int64 / int128) for the
+                       describe's INT128 promotion
+    eval(e, row)    -> Value | NULL | Error(engine_status_vector)
+
+    # THE INVARIANT THE WIRE DEPENDS ON: whatever type_of/result_scale
+    # announced, the emitted value must match. Align at the emit point:
+    emit(col, row):
+        v = eval(col.expr, row)
+        if v is numeric and scale(v) != col.announced_scale:
+            v.raw *= 10^(scale(v) - col.announced_scale)   # min-scale
+                          # announce means this only ever multiplies
+        if v does not fit the announced width: raise integer-overflow
+        encode(v, col.wire_form)
+
+### Dialect-3 numeric arithmetic (scales are NEGATIVE: 12.50 is -2)
+
+    add/sub(a@sa, b@sb): s = min(sa, sb)
+                         align both raws to s (multiply by powers of 10)
+                         result = a ± b @ s          # checked, no wrap
+    mul(a@sa, b@sb):     result = a*b @ (sa+sb)
+    div(a@sa, b@sb):     if b == 0: raise divide-by-zero
+                         result = (a * 10^(-2*sb)) / b @ (sa+sb)
+                         # integer division truncating toward zero
+
+    # conditionals (COALESCE/IIF/CASE): result scale = MIN over branch
+    # scales (the widest); result type = Numeric if ANY branch is
+    # exact-numeric and none is text; refuse mixed temporal kinds
+
+### Three-valued logic (the whole predicate surface hangs on this)
+
+    # a condition evaluates to TRUE | FALSE | UNKNOWN
+    cmp(a, b):    UNKNOWN if either is NULL, else compare
+                  (numerics align exactly in wide integers; text
+                  ignores TRAILING blanks; LIKE does NOT)
+    NOT u:        UNKNOWN stays UNKNOWN
+    AND:          FALSE dominates, then UNKNOWN, then TRUE
+    OR:           TRUE dominates, then UNKNOWN, then FALSE
+    WHERE keeps a row only on TRUE
+    IIF/CASE take a branch only on TRUE (false AND unknown move on)
+    NOT pushed into comparison leaves flips the operator - sound,
+    because the inverse of UNKNOWN is still UNKNOWN
+    simple CASE desugars to '=' conditions -> WHEN NULL never matches
+
+### Predicate normalization
+
+    parse WHERE into: OR over AND over NOT/parens over leaves
+    desugar: BETWEEN -> (>= AND <=); IN -> OR of '='; their NOT forms
+             fall out of De Morgan
+    normalize to DNF (OR of AND-groups), pushing NOT into leaves
+    CAP the group count (cross-products explode); past the cap REFUSE
+    parameter slots are claimed at PARSE time in textual order, so a
+    leaf duplicated by the DNF cross-product keeps its one slot
+
+    # function calls in predicates: lex the WHOLE call as one token
+    # (scan to the MATCHING paren, skipping string literals), parse it
+    # with the expression parser, and admit it only if evaluation can
+    # NEVER raise (a WHERE term answers true/false and cannot carry a
+    # mid-cursor error):
+    no_raise(e):
+        literals, columns, case-mapping/length/trim/replace: yes
+        arithmetic, CAST: no
+        MOD: only with a literal non-zero divisor
+        length/count arguments: only non-negative literals
+        conditionals: all children
+
+### Civil-date math (MJD epoch: day 0 = 1858-11-17)
+
+    # Howard Hinnant's algorithms; verify with round-trip tests over
+    # leap days and era boundaries
+    civil_of(days)  -> (y, m, d)        # via the 400-year era cycle
+    days_of_civil(y, m, d) -> days      # the exact inverse
+    weekday(days)   = (days + 3) mod 7  # day 0 was a Wednesday;
+                                        # 0 = Sunday, the engine's rule
+    yearday(days)   = days - days_of_civil(year, 1, 1)     # 0-BASED
+    iso_week(days):
+        thursday = days + 3 - ((weekday(days) + 6) mod 7)  # Mon-based
+        return (thursday - days_of_civil(year_of(thursday), 1, 1)) / 7 + 1
+    # time of day travels as units of 1/10000 second
+    EXTRACT(SECOND)      = units mod 600000 @ scale -4     # 12.3456
+    EXTRACT(MILLISECOND) = units mod 10000  @ scale -1     # 345.6
+
+### SQL LIKE (character-based, backtracking)
+
+    match(value_chars, pattern_chars, escape?):
+        '%'  try every split point (recurse)
+        '_'  exactly one character
+        esc  next pattern char is literal
+        else exact character
+    # multi-byte text: per CHARACTER, never per byte
+    # comparisons pad-trim; LIKE matches the STORED value, padding
+    # included (a CHAR(5) 'abc' matches 'abc  ' and 'abc%', NOT 'abc')
+
+## Traps that cost real time (all found the hard way)
+
+- **FIELD_ID is not FIELD_POSITION.** Catalog rows order columns by
+  position; records store by field id; DROP COLUMN leaves ID HOLES.
+- **The clause splitter must be paren- and literal-aware.** `FROM`
+  appears inside `SUBSTRING(x FROM 1)` and inside string literals;
+  `AS` appears inside `CAST(x AS INT)`; `WHERE`/`ORDER` can sit inside
+  literals. Mask literals, count parens, then search.
+- **Clients DISPATCH on metadata you might think is cosmetic.** The
+  statement-type code decides whether a client opens a cursor
+  (announcing 6 for SAVEPOINT made isql roll back the transaction);
+  the nullable bit decides whether NULL renders (its absence rendered
+  every NULL as 0); the prepare must answer the client's REQUESTED
+  info items in order.
+- **Refuse at PREPARE, not mid-cursor.** A refusal after the describe
+  reads as "request synchronization error" and some clients drop the
+  connection — which is what libfbclient segfaults on. Runtime data
+  errors (divide by zero on row 7) ARE mid-cursor; unsupported
+  statements are NOT.
+- **One statement handle per statement.** Serving every prepare from
+  one slot works until a client interleaves two statements, then it
+  reads the WRONG statement's rows.
+- **Comparing mixed numeric shapes needs exact alignment.** `0` vs
+  `0.00` differ in raw form; align raws in a wide integer before
+  comparing. Text-comparing rendered forms is the tempting wrong
+  answer.
+- **Case mapping, week numbers, and NULL rules are where "obvious"
+  implementations diverge.** When your answer and the engine's differ,
+  THE ENGINE WINS — even when your gate asserted otherwise (then the
+  gate is wrong; fix the gate).
+
+## Suggested porting order
+
+The order that worked here, each stage differentially testable with
+the tools of the previous one: on-disk structures against `gstat` →
+record decoding against live SELECTs → transactions/MVCC against a
+frozen file → the wire protocol as a CLIENT of the real server (this
+validates your codec before you serve) → a server answering COUNT(*)
+→ projections → predicates → sorting/grouping → writes (with the
+engine validating the file) → DDL → expressions → PSQL. At every
+stage there is a real differential; no stage trusts the previous one's
+unproven parts.

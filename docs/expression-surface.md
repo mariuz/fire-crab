@@ -12,7 +12,8 @@ Companion gates: `qa/serve-real-selectexpr.sh` (arithmetic, `||`, CAST,
 numeric scale rules), `qa/serve-real-conditional.sh` (COALESCE/NULLIF/
 IIF), `qa/serve-real-functions.sh` (the built-in scalar functions),
 `qa/serve-real-wherefn.sh` (function calls in WHERE),
-`qa/serve-real-case.sh` (CASE, and cross-branch typing). Each check in
+`qa/serve-real-case.sh` (CASE, and cross-branch typing),
+`qa/serve-real-extract.sh` (the temporal surface). Each check in
 those gates runs identical SQL through fire-crab and `isql` against the
 same database file.
 
@@ -34,6 +35,9 @@ same database file.
 | three-valued booleans (Kleene AND/OR/NOT) in conditions | `src/jrd/evl.cpp` boolean evaluation | `Cond2::{And, Or, Not}` |
 | negative SUBSTRING length: `isc_bad_substring_length` (22011), the value as a message argument; a LITERAL one fails while the describe is computed | `msg/jrd.h:534`, `StrNodes` describe | `EvalErr::InvalidLength`, `Plan::RefusedEval` at prepare, `raw_bad_substring_len` |
 | DECFLOAT rendering (cohort preserved, plain/scientific boundary) | the engine's embedded decNumber (`decNumberToString`) | `fire-crab-ods::decfloat` |
+| `EXTRACT` parts and result types (SECOND = NUMERIC(9,4), MILLISECOND = NUMERIC(9,1)); a part invalid for the operand's kind fails at prepare (-105) | `src/jrd/ExprNodes.cpp` (`ExtractNode`), probed | `SysFn::Extract(ExtractPart)`, `ExtractPart::valid_for` |
+| civil-date math (MJD day 0 = 1858-11-17); WEEKDAY 0 = Sunday, YEARDAY 0-based, ISO 8601 week | `src/common/TimeStamp.cpp`, probed conventions | `civil_of`, `days_of_civil`, `weekday_of`, `iso_week_of` |
+| temporal literals `DATE '...'` / `TIME '...'` / `TIMESTAMP '...'`; the clock keywords fixed per statement | `parse.y`, `src/jrd/CurrentDateNode` et al. | `RawExpr::{DateLit, TimeLit, TsLit, CurrentDate, LocalTime, LocalTimestamp}` |
 
 ## Laws probed against the live engine
 
@@ -86,6 +90,21 @@ usually a unit test too:
   `COALESCE`, `NULLIF`, `CASE` (for CASE *and* IIF), the function's own
   name for calls (`CHARACTER_LENGTH` headers as `CHAR_LENGTH`), blank
   for unary minus, `CONSTANT` for a bare literal.
+- **EXTRACT's conventions.** `WEEKDAY` is 0 = Sunday (2024-02-29 → 4);
+  `YEARDAY` is 0-based (Jan 1st → 0); `WEEK` is the ISO 8601 week
+  number (1999-01-01 → 53, of 1998); `SECOND` keeps its fraction at
+  scale -4 (12.3456); `MILLISECOND` is the fraction in ms at scale -1
+  (345.6). A part that does not exist in the operand's kind fails at
+  PREPARE (the engine's -105); so does EXTRACT over a non-temporal.
+- **A DATE against a TIMESTAMP converts as midnight.** And a temporal
+  branch must not mix with any other family in a conditional - the
+  wire form could not carry both (the engine refuses at prepare too).
+- **The clock keywords are fixed per statement.** `CURRENT_DATE`,
+  `LOCALTIME` (fractional second truncated - probed), `LOCALTIMESTAMP`.
+  fire-crab captures them at PLAN time - identical for a client that
+  executes right after preparing (isql does), divergent for
+  prepare-once-execute-many; an accepted, documented difference.
+  `CURRENT_TIME`/`CURRENT_TIMESTAMP` are TIME ZONE types and refuse.
 - **Text comparisons ignore trailing blanks; LIKE does not.** A
   comparison pad-trims both sides (CHAR vs VARCHAR equality); LIKE
   matches the STORED value, padding included — `CHAR(5) 'abc'` matches
