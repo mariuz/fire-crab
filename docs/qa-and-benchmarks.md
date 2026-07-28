@@ -4278,7 +4278,7 @@ dropped from the view so an expression naming one refuses rather than
 guessing a side (qualified names in join expressions are the named
 remainder).
 
-### SQL → BLR against the engine's own compiler (`qa/dsql-view-blr.sh`, 90 checks)
+### SQL → BLR against the engine's own compiler (`qa/dsql-view-blr.sh`, 108 checks)
 
 The `fire-crab-dsql` crate opens Phase 4 with the purest differential
 in the project: the oracle is the exact artifact under conversion,
@@ -4373,6 +4373,32 @@ scale ZERO, and the battery's NULLIF('x', FIRST_NAME) compiles even
 though a FIELD as the first argument refuses). That refusal is the
 slice's honest edge: a field branch under a cast wrapper needs the
 catalog's descriptor, and this compiler never guesses one.
+
+Slice 5 converted the SUBQUERY PREDICATES, and their compiled shapes
+split beautifully in two. EXISTS and SINGULAR are one verb (blr_any,
+blr_unique) over ONE rse: the subquery's WHERE becomes that rse's
+boolean and its select list compiles away exactly like a view's -
+SELECT 1 and SELECT * are byte-identical. NOT keeps a real blr_not
+over both, the no-inverse rule again. IN (SELECT ...) and the
+quantified comparisons (= ANY, > ALL, >= SOME) are blr_ansi_any /
+blr_ansi_all with a DOUBLE-NESTED rse - the outer rse's single
+STREAM IS the subquery's rse, which carries the subquery's own
+WHERE, and the quantified comparison sits as the OUTER rse's
+boolean. = ANY compiles byte-identical to IN. The negation law is
+the slice's jewel: the quantifier FLIPS and the comparison INVERTS -
+NOT IN stores ansi_all with neq, NOT (A > ALL ...) stores ansi_any
+with leq; probed, then folded in negate() alongside De Morgan.
+Scoping is where the catalog-free line runs: subquery streams JOIN
+the statement's context numbering (a join query's subquery relation
+takes context 3) but stay invisible to outer bare names, and inside
+a subquery a bare name binds to the subquery's OWN stream - the
+innermost-scope-first rule, the one every SQL implementation agrees
+on - while an outer reference must be qualified. The battery runs
+subqueries under AND/OR, inside a CASE condition, against an
+expression left-hand side (UPPER(FIRST_NAME) IN (SELECT ...)), and
+correlated through blr_relation2 aliases. Scalar subselects as
+values, subqueries inside ON clauses (they would interleave the
+join chain's stream numbering) and multi-stream subqueries refuse.
 
 ## Benchmarks
 

@@ -13,6 +13,38 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 5: subquery predicates
+
+### Converted
+- **EXISTS / SINGULAR**: `blr_any` / `blr_unique` over ONE rse — the
+  subquery's WHERE is that rse's boolean and its select list leaves
+  no trace, exactly like a view's (`SELECT 1` ≡ `SELECT *`, probed).
+  NOT keeps a REAL `blr_not` over both: no inverse verbs.
+- **IN (SELECT ...) and the quantified comparisons**: `blr_ansi_any`
+  / `blr_ansi_all` with a DOUBLE-NESTED rse — the outer rse's single
+  STREAM IS the subquery's rse (which carries the subquery's own
+  WHERE), and the quantified comparison is the OUTER rse's boolean.
+  `= ANY` compiles byte-identical to IN; SOME to ANY; ALL keeps the
+  WRITTEN comparison.
+- **The negation law**: the quantifier FLIPS and the comparison
+  INVERTS — `NOT IN` is ansi_all + neq, `NOT (A = ANY ...)` the
+  same, `NOT (A > ALL ...)` is ansi_any + leq (all probed).
+- **Scoping**: subquery streams JOIN the statement's context
+  numbering (T=1, U2=2, a subquery's V3T takes 3 — probed) but stay
+  INVISIBLE to outer bare names; inside a subquery a bare name binds
+  to the subquery's OWN stream (innermost-scope-first; an outer
+  reference must be qualified). Aliased subquery streams are
+  blr_relation2. Subqueries compose: under AND/OR, inside CASE
+  conditions, with expression left-hand sides.
+
+### Guarded
+- Scalar subselects as VALUES (`A = (SELECT ...)`), subqueries inside
+  ON clauses (they would interleave the join chain's stream
+  numbering), multi-stream subqueries and multi-column select lists
+  refuse as unconverted. Gate: `qa/dsql-view-blr.sh` grew to 108
+  checks (16 fresh slice-5 battery statements; 4 new refusal slots);
+  101 unit byte-pins.
+
 ## 2026-07-28 — fire-crab-dsql slice 4: CAST and the conditionals
 
 ### Converted

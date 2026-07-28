@@ -164,6 +164,18 @@ mod blr {
     pub const DATE: u8 = 0x0C;
     pub const TIME: u8 = 0x0D;
     pub const TIMESTAMP: u8 = 0x23;
+    /// blr_any - EXISTS: the verb and ONE rse, the subquery's WHERE
+    /// as that rse's boolean (probed; the subquery's select list
+    /// leaves no trace, like a view's)
+    pub const ANY: u8 = 0x3C;
+    /// blr_unique - SINGULAR, same single-rse shape as EXISTS
+    pub const UNIQUE: u8 = 0x3E;
+    /// blr_ansi_any / blr_ansi_all - IN (SELECT ...) and quantified
+    /// comparisons: the verb, an rse whose SINGLE STREAM IS ANOTHER
+    /// RSE (the subquery, carrying its own WHERE), then the
+    /// quantified comparison as the OUTER rse's boolean (probed)
+    pub const ANSI_ANY: u8 = 0x97;
+    pub const ANSI_ALL: u8 = 0x9E;
     pub const EQL: u8 = 0x2F;
     pub const NEQ: u8 = 0x30;
     pub const GTR: u8 = 0x31;
@@ -392,6 +404,27 @@ enum Bool {
     /// blr_in_list: value, u16 count, values (FB5+); NOT IN keeps a
     /// real blr_not over it (probed)
     InList(Val, Vec<Val>),
+    /// EXISTS - blr_any over the subquery's rse
+    Any(SubQ),
+    /// SINGULAR - blr_unique, same shape
+    Unique(SubQ),
+    /// `<left> <cmp> ANY/SOME (SELECT <col> ...)` and IN (SELECT) -
+    /// blr_ansi_any; the comparison is the outer rse's boolean
+    AnsiAny(CmpOp, Val, SubQ),
+    /// `<left> <cmp> ALL (SELECT ...)` and NOT IN - blr_ansi_all
+    AnsiAll(CmpOp, Val, SubQ),
+}
+
+/// A single-stream subquery: its stream (already holding a context id
+/// in the statement's numbering, which CONTINUES across subqueries -
+/// probed), its own WHERE, and for the quantified forms the selected
+/// column.
+#[derive(Clone, Debug, PartialEq)]
+struct SubQ {
+    stream: Stream,
+    ctx: u8,
+    wher: Option<Box<Bool>>,
+    col: Option<Val>,
 }
 
 /// Push a negation down the tree the way the engine's DSQL does
@@ -411,6 +444,13 @@ fn negate(b: Bool) -> Bool {
         keep @ (Bool::Missing(_) | Bool::Like(..) | Bool::InList(..)) => {
             Bool::Not(Box::new(keep))
         }
+        // the quantifier FLIPS and the comparison INVERTS (probed:
+        // NOT (A = ANY ...) stores ansi_all/neq - the NOT IN shape -
+        // and NOT (A > ALL ...) stores ansi_any/leq)
+        Bool::AnsiAny(op, l, s) => Bool::AnsiAll(op.inverse(), l, s),
+        Bool::AnsiAll(op, l, s) => Bool::AnsiAny(op.inverse(), l, s),
+        // EXISTS and SINGULAR have no inverse verb - blr_not survives
+        keep @ (Bool::Any(_) | Bool::Unique(_)) => Bool::Not(Box::new(keep)),
     }
 }
 
@@ -569,6 +609,7 @@ fn lex(sql: &str) -> Option<Vec<Tok>> {
 // --------------------------------------------------------------- parser
 
 /// One FROM stream: relation name, optional alias, 1-based context.
+#[derive(Clone, Debug, PartialEq)]
 struct Stream {
     name: String,
     alias: Option<String>,
@@ -578,6 +619,15 @@ struct P<'a> {
     t: &'a [Tok],
     i: usize,
     streams: Vec<Stream>,
+    /// how many of `streams` belong to the OUTER FROM (set when the
+    /// WHERE begins); subquery streams keep their context ids but
+    /// never become visible to outer-scope bare names
+    outer: Option<usize>,
+    /// the stream index of the subquery currently being parsed - a
+    /// bare name inside a subquery binds to the subquery's OWN stream
+    /// (the innermost-scope-first rule; an outer reference must be
+    /// qualified)
+    sub: Option<usize>,
 }
 
 impl<'a> P<'a> {
@@ -591,25 +641,144 @@ impl<'a> P<'a> {
     }
 
     /// Resolve a field's stream context. Qualified names match a
-    /// stream's ALIAS (which shadows the table name) or its table
-    /// name; bare names are legal only with ONE stream - the engine
-    /// resolves bare multi-stream names through the catalog, which
-    /// this catalog-free compiler refuses rather than guessing.
+    /// VISIBLE stream's ALIAS (which shadows the table name) or its
+    /// table name - visible means the outer FROM streams plus, inside
+    /// a subquery, that subquery's own stream. A bare name inside a
+    /// subquery binds to the subquery's OWN stream (the
+    /// innermost-scope-first rule; an outer reference must be
+    /// qualified); a bare name in the outer scope is legal only with
+    /// ONE outer stream - the engine resolves bare multi-stream names
+    /// through the catalog, which this catalog-free compiler refuses
+    /// rather than guessing.
     fn field(&self, qualifier: Option<&str>, name: &str) -> Option<Val> {
+        let n_outer = self.outer.unwrap_or(self.streams.len());
         let ctx = match qualifier {
             Some(q) => {
-                (self.streams.iter().position(|st| {
+                let hit = |st: &Stream| {
                     st.alias.as_deref().map_or(st.name == q, |a| a == q)
-                })? + 1) as u8
+                };
+                let idx = self
+                    .streams
+                    .iter()
+                    .take(n_outer)
+                    .position(hit)
+                    .or_else(|| {
+                        self.sub
+                            .filter(|&si| hit(&self.streams[si]))
+                    })?;
+                (idx + 1) as u8
             }
-            None => {
-                if self.streams.len() != 1 {
-                    return None;
+            None => match self.sub {
+                Some(si) => (si + 1) as u8,
+                None => {
+                    if n_outer != 1 {
+                        return None;
+                    }
+                    1
                 }
-                1
-            }
+            },
         };
         Some(Val::Field(ctx, name.to_string()))
+    }
+
+    /// `TABLE [alias]` in a FROM clause or a subquery
+    fn stream_item(&mut self) -> Option<Stream> {
+        let Some(Tok::Ident(name)) = self.t.get(self.i) else {
+            return None;
+        };
+        if is_keyword(name) {
+            return None;
+        }
+        let name = name.clone();
+        self.i += 1;
+        let alias = match self.t.get(self.i) {
+            Some(Tok::Ident(a)) if !is_keyword(a) => {
+                let a = a.clone();
+                self.i += 1;
+                Some(a)
+            }
+            _ => None,
+        };
+        Some(Stream { name, alias })
+    }
+
+    /// `(SELECT <one column | anything> FROM TABLE [alias]
+    /// [WHERE <bool>])`, self.i ON the opening paren. The subquery's
+    /// stream JOINS the statement's context numbering; with
+    /// `need_col` the single select-list column is resolved (bare -
+    /// against the subquery's own stream), without it the list
+    /// compiles away exactly like a view's (probed: SELECT 1 and
+    /// SELECT * leave no trace).
+    fn subselect(&mut self, need_col: bool) -> Option<SubQ> {
+        if self.outer.is_none() {
+            // a subquery inside an ON clause would interleave the
+            // join chain's stream numbering: unprobed, refuse
+            return None;
+        }
+        if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
+            return None;
+        }
+        self.i += 1;
+        if !self.kw("SELECT") {
+            return None;
+        }
+        // capture the select list positionally; resolve after the
+        // stream exists
+        let mut col: Option<(Option<String>, String)> = None;
+        if need_col {
+            let Some(Tok::Ident(a)) = self.t.get(self.i) else {
+                return None;
+            };
+            if is_keyword(a) {
+                return None;
+            }
+            let a = a.clone();
+            self.i += 1;
+            if matches!(self.t.get(self.i), Some(Tok::Dot)) {
+                self.i += 1;
+                let Some(Tok::Ident(b)) = self.t.get(self.i) else {
+                    return None;
+                };
+                col = Some((Some(a), b.clone()));
+                self.i += 1;
+            } else {
+                col = Some((None, a));
+            }
+        } else {
+            // EXISTS/SINGULAR: skip a traceless select list
+            loop {
+                match self.t.get(self.i)? {
+                    Tok::Ident(w) if w == "FROM" => break,
+                    Tok::Ident(w) if !is_keyword(w) => self.i += 1,
+                    Tok::Int(_) | Tok::Comma | Tok::Dot | Tok::Star => self.i += 1,
+                    _ => return None,
+                }
+            }
+        }
+        if !self.kw("FROM") {
+            return None;
+        }
+        let stream = self.stream_item()?;
+        self.streams.push(stream.clone());
+        let si = self.streams.len() - 1;
+        let ctx = (si + 1) as u8;
+        // the subquery scope: bare names bind to ITS stream
+        let saved = self.sub.replace(si);
+        let col = match col {
+            None => None,
+            Some((q, n)) => Some(self.field(q.as_deref(), &n)?),
+        };
+        let wher = if self.kw("WHERE") {
+            Some(Box::new(self.bool_or()?))
+        } else {
+            None
+        };
+        self.sub = saved;
+        if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+            return None; // joins, comma-FROM etc. in a subquery: unconverted
+        }
+        self.i += 1;
+        Some(SubQ { stream, ctx, wher, col })
     }
 
     /// expression grammar mirroring the engine's precedence:
@@ -1033,6 +1202,12 @@ impl<'a> P<'a> {
     }
 
     fn leaf(&mut self) -> Option<Bool> {
+        if self.kw("EXISTS") {
+            return Some(Bool::Any(self.subselect(false)?));
+        }
+        if self.kw("SINGULAR") {
+            return Some(Bool::Unique(self.subselect(false)?));
+        }
         let left = self.val()?;
         if self.kw("IS") {
             let negated = self.kw("NOT");
@@ -1065,6 +1240,13 @@ impl<'a> P<'a> {
             if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
                 return None;
             }
+            // IN (SELECT ...) is blr_ansi_any with an EQL boolean;
+            // NOT IN negates to blr_ansi_all with NEQ (probed)
+            if matches!(self.t.get(self.i + 1), Some(Tok::Ident(w)) if w == "SELECT") {
+                let sub = self.subselect(true)?;
+                let body = Bool::AnsiAny(CmpOp::Eql, left, sub);
+                return Some(if negated { negate(body) } else { body });
+            }
             self.i += 1;
             let mut items = vec![self.val()?];
             while matches!(self.t.get(self.i), Some(Tok::Comma)) {
@@ -1088,6 +1270,14 @@ impl<'a> P<'a> {
         if let Some(Tok::Cmp(op)) = self.t.get(self.i) {
             let op = *op;
             self.i += 1;
+            // a quantifier keeps the WRITTEN comparison as the outer
+            // rse's boolean; ANY and SOME are the same verb (probed)
+            if self.kw("ANY") || self.kw("SOME") {
+                return Some(Bool::AnsiAny(op, left, self.subselect(true)?));
+            }
+            if self.kw("ALL") {
+                return Some(Bool::AnsiAll(op, left, self.subselect(true)?));
+            }
             let right = self.val()?;
             return Some(Bool::Cmp(op, left, right));
         }
@@ -1126,6 +1316,11 @@ fn is_keyword(w: &str) -> bool {
             | "ELSE"
             | "END"
             | "AS"
+            | "EXISTS"
+            | "SINGULAR"
+            | "ANY"
+            | "SOME"
+            | "ALL"
     )
 }
 
@@ -1302,6 +1497,49 @@ fn emit_bool(out: &mut Vec<u8>, b: &Bool) {
                 emit_val(out, it);
             }
         }
+        Bool::Any(sub) | Bool::Unique(sub) => {
+            out.push(if matches!(b, Bool::Any(_)) {
+                blr::ANY
+            } else {
+                blr::UNIQUE
+            });
+            out.push(blr::RSE);
+            out.push(1);
+            emit_stream(out, &sub.stream, sub.ctx);
+            if let Some(w) = &sub.wher {
+                out.push(blr::BOOLEAN);
+                emit_bool(out, w);
+            }
+            out.push(blr::END);
+        }
+        Bool::AnsiAny(op, left, sub) | Bool::AnsiAll(op, left, sub) => {
+            out.push(if matches!(b, Bool::AnsiAny(..)) {
+                blr::ANSI_ANY
+            } else {
+                blr::ANSI_ALL
+            });
+            // the outer rse's single stream IS the subquery's rse -
+            // which carries the subquery's own WHERE; the quantified
+            // comparison is the OUTER rse's boolean (probed)
+            out.push(blr::RSE);
+            out.push(1);
+            out.push(blr::RSE);
+            out.push(1);
+            emit_stream(out, &sub.stream, sub.ctx);
+            if let Some(w) = &sub.wher {
+                out.push(blr::BOOLEAN);
+                emit_bool(out, w);
+            }
+            out.push(blr::END);
+            out.push(blr::BOOLEAN);
+            out.push(op.verb());
+            emit_val(out, left);
+            emit_val(
+                out,
+                sub.col.as_ref().expect("quantified subquery has a column"),
+            );
+            out.push(blr::END);
+        }
     }
 }
 
@@ -1331,7 +1569,13 @@ fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
 /// converted surface (the caller refuses; this crate never guesses).
 pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
     let toks = lex(sql.trim().trim_end_matches(';'))?;
-    let mut p = P { t: &toks, i: 0, streams: Vec::new() };
+    let mut p = P {
+        t: &toks,
+        i: 0,
+        streams: Vec::new(),
+        outer: None,
+        sub: None,
+    };
     if !p.kw("SELECT") {
         return None;
     }
@@ -1354,26 +1598,7 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
     // [INNER] JOIN | LEFT/RIGHT/FULL [OUTER] JOIN - each ON binds the
     // join to its LEFT, so the chain nests left (probed: the second
     // join's node contains the first as its first stream slot)
-    let mut stream = |p: &mut P| -> Option<Stream> {
-        let Some(Tok::Ident(name)) = p.t.get(p.i) else {
-            return None;
-        };
-        if is_keyword(name) {
-            return None;
-        }
-        let name = name.clone();
-        p.i += 1;
-        let alias = match p.t.get(p.i) {
-            Some(Tok::Ident(a)) if !is_keyword(a) => {
-                let a = a.clone();
-                p.i += 1;
-                Some(a)
-            }
-            _ => None,
-        };
-        Some(Stream { name, alias })
-    };
-    let first = stream(&mut p)?;
+    let first = p.stream_item()?;
     p.streams.push(first);
     // each chained join: (join-type byte - 0 for INNER, which emits NO
     // blr_join_type sub-clause; 1/2/3 for LEFT/RIGHT/FULL - and its ON)
@@ -1382,7 +1607,7 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
         // the comma list: streams side by side in the rse
         while matches!(p.t.get(p.i), Some(Tok::Comma)) {
             p.i += 1;
-            let st = stream(&mut p)?;
+            let st = p.stream_item()?;
             p.streams.push(st);
         }
     } else {
@@ -1406,7 +1631,7 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
             if !p.kw("JOIN") {
                 return None;
             }
-            let st = stream(&mut p)?;
+            let st = p.stream_item()?;
             p.streams.push(st);
             if !p.kw("ON") {
                 return None;
@@ -1414,6 +1639,10 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
             joins.push((jt, p.bool_or()?));
         }
     }
+    // everything pushed so far is the outer FROM; subquery streams
+    // keep joining `streams` for context numbering but stay invisible
+    // to outer bare names
+    p.outer = Some(p.streams.len());
     let boolean = if p.kw("WHERE") {
         Some(p.bool_or()?)
     } else {
@@ -1423,11 +1652,13 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
         return None; // trailing clauses are outside this slice
     }
 
+    let n_outer = p.outer.unwrap_or(p.streams.len());
     let mut out = vec![blr::VERSION5, blr::RSE];
     if joins.is_empty() {
-        // plain streams, side by side
-        out.push(p.streams.len() as u8);
-        for (i, st) in p.streams.iter().enumerate() {
+        // plain OUTER streams, side by side (subquery streams live
+        // inside their own rses)
+        out.push(n_outer as u8);
+        for (i, st) in p.streams.iter().take(n_outer).enumerate() {
             emit_stream(&mut out, st, (i + 1) as u8);
         }
     } else {
@@ -1900,6 +2131,92 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_five_shapes_byte_for_byte() {
+        // EXISTS is blr_any over ONE rse; the subquery's WHERE is
+        // that rse's boolean and its select list leaves no trace
+        pin(
+            "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM U2 WHERE U2.UID = T.ID)",
+            "0543014A015401473C43014A02553202472F1702035549441701024944FFFF4C",
+        );
+        // SELECT * compiles identically
+        pin(
+            "SELECT ID FROM T WHERE EXISTS (SELECT * FROM U2 WHERE U2.UID = T.ID)",
+            "0543014A015401473C43014A02553202472F1702035549441701024944FFFF4C",
+        );
+        // NOT EXISTS keeps a REAL blr_not (no inverse verb)
+        pin(
+            "SELECT ID FROM T WHERE NOT EXISTS (SELECT 1 FROM U2 WHERE U2.UID = T.ID)",
+            "0543014A015401473B3C43014A02553202472F1702035549441701024944FFFF4C",
+        );
+        // SINGULAR is blr_unique, same single-rse shape
+        pin(
+            "SELECT ID FROM T WHERE SINGULAR (SELECT 1 FROM U2 WHERE U2.UID = T.ID)",
+            "0543014A015401473E43014A02553202472F1702035549441701024944FFFF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE NOT SINGULAR (SELECT 1 FROM U2 WHERE U2.UID = T.ID)",
+            "0543014A015401473B3E43014A02553202472F1702035549441701024944FFFF4C",
+        );
+        // IN (SELECT ...) is blr_ansi_any: an rse whose single STREAM
+        // IS THE SUBQUERY'S RSE, then the comparison as the OUTER
+        // rse's boolean; = ANY compiles byte-identical
+        pin(
+            "SELECT ID FROM T WHERE A IN (SELECT UA FROM U2)",
+            "0543014A0154014797430143014A02553202FF472F170101411702025541FFFF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE A = ANY (SELECT UA FROM U2)",
+            "0543014A0154014797430143014A02553202FF472F170101411702025541FFFF4C",
+        );
+        // NOT IN: the quantifier FLIPS to ansi_all, the comparison
+        // INVERTS to neq
+        pin(
+            "SELECT ID FROM T WHERE A NOT IN (SELECT UA FROM U2)",
+            "0543014A015401479E430143014A02553202FF4730170101411702025541FFFF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE NOT (A = ANY (SELECT UA FROM U2))",
+            "0543014A015401479E430143014A02553202FF4730170101411702025541FFFF4C",
+        );
+        // ALL keeps the WRITTEN comparison; NOT (> ALL) flips back to
+        // ansi_any with the INVERSE (leq)
+        pin(
+            "SELECT ID FROM T WHERE A > ALL (SELECT UA FROM U2)",
+            "0543014A015401479E430143014A02553202FF4731170101411702025541FFFF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE NOT (A > ALL (SELECT UA FROM U2))",
+            "0543014A0154014797430143014A02553202FF4734170101411702025541FFFF4C",
+        );
+        // SOME == ANY; a correlated WHERE sits inside the INNER rse
+        pin(
+            "SELECT ID FROM T WHERE A = SOME (SELECT UA FROM U2 WHERE U2.UID = T.ID)",
+            "0543014A0154014797430143014A02553202472F1702035549441701024944FF472F170101411702025541FFFF4C",
+        );
+        // an aliased subquery stream is blr_relation2, and a bare
+        // select column binds to the subquery's OWN stream
+        pin(
+            "SELECT ID FROM T WHERE A IN (SELECT UA FROM U2 X WHERE X.UA > 0)",
+            "0543014A0154014797430143019202553203225822024731170202554115080000000000FF472F170101411702025541FFFF4C",
+        );
+        // context numbering CONTINUES across subqueries: T=1, U2=2,
+        // then the subquery's V3T takes 3
+        pin(
+            "SELECT T.ID FROM T JOIN U2 ON T.ID = U2.UID WHERE EXISTS (SELECT 1 FROM V3T WHERE V3T.VID = T.A)",
+            "05430177024A0154014A02553202472F1701024944170203554944FF473C43014A0356335403472F17030356494417010141FFFF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM U2 WHERE U2.UID = T.ID) OR EXISTS (SELECT 1 FROM V3T WHERE V3T.VID = T.ID)",
+            "0543014A01540147393C43014A02553202472F1702035549441701024944FF3C43014A0356335403472F1703035649441701024944FFFF4C",
+        );
+        // subqueries compose with plain terms
+        pin(
+            "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM U2 WHERE U2.UID = T.ID) AND A > 0",
+            "0543014A015401473A3C43014A02553202472F1702035549441701024944FF311701014115080000000000FF4C",
+        );
+    }
+
+    #[test]
     fn refuses_outside_the_surface() {
         // shapes this slice has NOT verified against the engine refuse
         // rather than guess
@@ -1929,6 +2246,14 @@ mod tests {
             "SELECT ID FROM T WHERE CAST(A AS NUMERIC(30)) = 1",
             "SELECT ID FROM T WHERE CASE WHEN A > 5 THEN NULL ELSE NULL END IS NULL",
             "SELECT ID FROM T WHERE CASE WHEN A > 5 THEN 'x' ELSE 0 END = 'x'",
+            // a scalar subselect as a VALUE: unconverted
+            "SELECT ID FROM T WHERE A = (SELECT UA FROM U2)",
+            // a subquery inside an ON clause would interleave the
+            // join chain's stream numbering: unprobed
+            "SELECT T.ID FROM T JOIN U2 ON EXISTS (SELECT 1 FROM V3T WHERE V3T.VID = T.ID)",
+            // multi-stream subqueries and multi-column select lists
+            "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM U2 JOIN V3T ON U2.UID = V3T.VID)",
+            "SELECT ID FROM T WHERE A IN (SELECT UA, UID FROM U2)",
         ] {
             assert!(compile_view_select(sql).is_none(), "{sql} was compiled");
         }

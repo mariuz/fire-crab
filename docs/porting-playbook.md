@@ -289,6 +289,15 @@ them.
     # branches (NULLIF's comparand does not)
     # cast targets do not follow the obvious table: NUMERIC(4) and
     # DECIMAL(4) compile to DIFFERENT dtypes - probe every target
+    # subquery predicates come in TWO shapes: existence (one verb +
+    # one rse, the subquery WHERE as its boolean) and quantified (a
+    # DOUBLE-nested rse: the outer rse's single stream IS the
+    # subquery's rse, the comparison the outer boolean) - and
+    # negation FLIPS the quantifier while INVERTING the comparison
+    # (NOT IN == <> ALL); subquery streams take the NEXT context ids
+    # in the statement's numbering but must stay INVISIBLE to outer
+    # bare names - and inside the subquery a bare name binds to the
+    # innermost scope, the one rule you may assume without a catalog
 
 ## Traps that cost real time (all found the hard way)
 
