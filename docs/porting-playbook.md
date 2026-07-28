@@ -279,6 +279,16 @@ them.
     # an unknown name before '(' is a function you have NOT converted:
     # REFUSE - falling back to 'it must be a field' compiles garbage
     # that parses
+    # conditionals carry the reference compiler's TYPE ALGEBRA: the
+    # searched CASE compiles as cast(unify(branches), value_if chain)
+    # - probe the unification law (ignored NULLs, max text width, max
+    # int-digits + min scale with the dtype that FITS: two longs can
+    # unify to an int64) and REFUSE any branch whose descriptor you
+    # cannot know without the catalog (fields); sugar forms (IIF,
+    # NULLIF) reuse the same nodes - probe WHICH operands count as
+    # branches (NULLIF's comparand does not)
+    # cast targets do not follow the obvious table: NUMERIC(4) and
+    # DECIMAL(4) compile to DIFFERENT dtypes - probe every target
 
 ## Traps that cost real time (all found the hard way)
 

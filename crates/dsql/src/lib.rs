@@ -66,6 +66,26 @@
 //! `TRIM('a' FROM s)` is BOTH). An unknown name followed by `(` is a
 //! UDF or an unconverted built-in and REFUSES - it must never fall
 //! back to being read as a field.
+//!
+//! Slice 4 (same oracle) added CAST (blr_cast + a dsc whose layouts
+//! were probed target by target: NUMERIC(p<=4) is SHORT but
+//! DECIMAL(p<=9) is ALWAYS LONG, p 10..=18 is INT64, texts carry a
+//! charset word and a length word, temporals are a bare dtype) and
+//! the CONDITIONALS with their two compiled shapes: the searched CASE
+//! and IIF (byte-identical sugar) are ONE blr_cast over a blr_value_if
+//! chain - each further WHEN nests in the ELSE slot, a missing ELSE is
+//! blr_null - where the cast's descriptor is the branches' UNIFIED
+//! type; the simple CASE is blr_decode (count byte, comparands, count
+//! byte, results; the ELSE is one extra result) and COALESCE is
+//! blr_coalesce (count byte, values), both WITHOUT a cast wrapper.
+//! NULLIF(a, b) is cast(value_if(a = b, NULL, a)) - its dsc comes from
+//! the BRANCHES (NULL and a), never from b. The unification law,
+//! probed: NULL branches are ignored, text branches take blr_text2 at
+//! the MAX length, exact numerics take MAX integer digits + MIN scale
+//! and the dtype that FITS the total (<=4 short, <=9 long, else
+//! int64) - so long(0) united with long(-1) WIDENS to int64. A FIELD
+//! branch under a cast wrapper refuses: its descriptor lives in the
+//! catalog, and this compiler never guesses one.
 
 /// The BLR bytes this slice emits, every constant read back from the
 /// engine's own stored view BLR (see the module doc).
@@ -123,6 +143,27 @@ mod blr {
     /// byte (0=spaces, 1=an explicit <what> operand follows), [what],
     /// source (probed)
     pub const TRIM: u8 = 0xB7;
+    /// blr_cast: a dsc (dtype byte + its parameters), then the value
+    pub const CAST: u8 = 0x83;
+    /// blr_value_if: condition, then-value, else-value; the DSQL wraps
+    /// the OUTERMOST value_if of a searched CASE / IIF / NULLIF in a
+    /// blr_cast to the branches' UNIFIED descriptor (probed)
+    pub const VALUE_IF: u8 = 0x69;
+    /// blr_decode - the simple CASE: value, count byte, comparands,
+    /// count byte, results (the ELSE is one extra result; without it
+    /// the result count simply equals the comparand count). No cast
+    /// wrapper (probed)
+    pub const DECODE: u8 = 0xCB;
+    /// blr_coalesce: count byte, values. No cast wrapper (probed)
+    pub const COALESCE: u8 = 0xCA;
+    /// blr_null - also the missing ELSE of a searched CASE
+    pub const NULL: u8 = 0x2D;
+    /// dsc dtypes seen only inside blr_cast
+    pub const SHORT: u8 = 0x07;
+    pub const VARYING2: u8 = 0x26;
+    pub const DATE: u8 = 0x0C;
+    pub const TIME: u8 = 0x0D;
+    pub const TIMESTAMP: u8 = 0x23;
     pub const EQL: u8 = 0x2F;
     pub const NEQ: u8 = 0x30;
     pub const GTR: u8 = 0x31;
@@ -162,6 +203,145 @@ enum Val {
     Substring(Box<Val>, Box<Val>, Box<Val>),
     /// blr_trim(where, [what], source)
     Trim(u8, Option<Box<Val>>, Box<Val>),
+    Null,
+    /// blr_cast to an explicit target descriptor
+    Cast(Dsc, Box<Val>),
+    /// blr_value_if(condition, then, else) - built by searched CASE,
+    /// IIF and NULLIF, always under a Cast to the unified branch dsc
+    ValueIf(Box<Bool>, Box<Val>, Box<Val>),
+    /// blr_decode - the simple CASE: selector, comparands, results
+    /// (the ELSE, when present, is the extra last result)
+    Decode(Box<Val>, Vec<Val>, Vec<Val>),
+    /// blr_coalesce
+    Coalesce(Vec<Val>),
+}
+
+/// A cast target descriptor, exactly the dsc bytes blr_cast carries
+/// (each layout probed: numerics are dtype + scale, texts carry a
+/// 2-byte charset then a 2-byte length, temporals are the dtype alone)
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Dsc {
+    /// blr_short / blr_long / blr_int64 with a scale byte
+    Num(u8, i8),
+    /// blr_text2, charset 0 (a NONE-charset database), length
+    Text(u16),
+    /// blr_varying2, charset 0, length
+    Varying(u16),
+    Date,
+    Time,
+    Timestamp,
+}
+
+fn emit_dsc(out: &mut Vec<u8>, d: Dsc) {
+    match d {
+        Dsc::Num(dt, sc) => {
+            out.push(dt);
+            out.push(sc as u8);
+        }
+        Dsc::Text(l) => {
+            out.push(blr::TEXT2);
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&l.to_le_bytes());
+        }
+        Dsc::Varying(l) => {
+            out.push(blr::VARYING2);
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&l.to_le_bytes());
+        }
+        Dsc::Date => out.push(blr::DATE),
+        Dsc::Time => out.push(blr::TIME),
+        Dsc::Timestamp => out.push(blr::TIMESTAMP),
+    }
+}
+
+/// A branch's contribution to the unified descriptor of a value_if
+/// chain. Only literals and explicit CASTs contribute - a FIELD
+/// branch's descriptor lives in the catalog, so it REFUSES (same
+/// principle as bare multi-stream fields: never guess a descriptor).
+enum BranchDsc {
+    /// exact-numeric: (integer digits, scale<=0)
+    Num(i32, i8),
+    Text(u16),
+    /// NULL - ignored by unification (probed: the missing-ELSE null
+    /// leaves the dsc to the real branches)
+    Skip,
+}
+
+fn branch_dsc(v: &Val) -> Option<BranchDsc> {
+    Some(match v {
+        Val::Int(_) => BranchDsc::Num(9, 0),
+        Val::Int64(_) => BranchDsc::Num(18, 0),
+        // a decimal literal is blr_long at its written scale (the
+        // stored scale is ALREADY negative: 1.5 is (15, -1)): 9
+        // digits of precision, |scale| of them fractional
+        Val::Dec(_, sc) => BranchDsc::Num(9 + *sc as i32, *sc),
+        Val::Str(t) => BranchDsc::Text(u16::try_from(t.len()).ok()?),
+        Val::Null => BranchDsc::Skip,
+        Val::Cast(d, _) => match d {
+            Dsc::Num(dt, sc) => {
+                let prec = match *dt {
+                    blr::SHORT => 4,
+                    blr::LONG => 9,
+                    blr::INT64 => 18,
+                    _ => return None,
+                };
+                BranchDsc::Num(prec + *sc as i32, *sc)
+            }
+            Dsc::Text(l) => BranchDsc::Text(*l),
+            // varying / temporal branches: unification not yet probed
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// The UNIFIED descriptor the engine's DSQL computes for a value_if
+/// chain, probed law by law: NULL branches are ignored; all-text
+/// branches unify to blr_text2 at the MAXIMUM length ('yes'/'no' ->
+/// CHAR(3)); exact numerics take the MAXIMUM integer-digit count and
+/// the MINIMUM scale, then the dtype that FITS the total digit count
+/// (<=4 short, <=9 long, else int64) - which is why long(scale 0)
+/// united with long(scale -1) WIDENS to int64: 9 + 1 = 10 digits
+fn unify_branches(branches: &[&Val]) -> Option<Dsc> {
+    let mut num: Option<(i32, i8)> = None;
+    let mut text: Option<u16> = None;
+    let mut seen = false;
+    for b in branches {
+        match branch_dsc(b)? {
+            BranchDsc::Skip => continue,
+            BranchDsc::Num(ints, sc) => {
+                if text.is_some() {
+                    return None; // text/numeric mixtures: unprobed
+                }
+                let (i0, s0) = num.unwrap_or((ints, sc));
+                num = Some((i0.max(ints), s0.min(sc)));
+                seen = true;
+            }
+            BranchDsc::Text(l) => {
+                if num.is_some() {
+                    return None;
+                }
+                text = Some(text.unwrap_or(0).max(l));
+                seen = true;
+            }
+        }
+    }
+    if !seen {
+        return None; // all-NULL: the engine's choice is unprobed
+    }
+    if let Some(l) = text {
+        return Some(Dsc::Text(l));
+    }
+    let (ints, sc) = num?;
+    let needed = ints - sc as i32;
+    let dt = if needed <= 4 {
+        blr::SHORT
+    } else if needed <= 9 {
+        blr::LONG
+    } else {
+        blr::INT64
+    };
+    Some(Dsc::Num(dt, sc))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -199,7 +379,7 @@ impl CmpOp {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum Bool {
     And(Box<Bool>, Box<Bool>),
     Or(Box<Bool>, Box<Bool>),
@@ -499,6 +679,11 @@ impl<'a> P<'a> {
 
     fn val_atom(&mut self) -> Option<Val> {
         let v = match self.t.get(self.i)? {
+            Tok::Ident(x) if x == "CASE" => {
+                self.i += 1;
+                return self.case_tail();
+            }
+            Tok::Ident(x) if x == "NULL" => Val::Null,
             Tok::Ident(x) if !is_keyword(x) => {
                 let first = x.clone();
                 self.i += 1;
@@ -605,6 +790,67 @@ impl<'a> P<'a> {
                     }
                 }
             }
+            "CAST" => {
+                let v = self.val()?;
+                if !self.kw("AS") {
+                    return None;
+                }
+                Val::Cast(self.cast_target()?, Box::new(v))
+            }
+            "COALESCE" => {
+                // blr_coalesce with its count byte; a single argument
+                // is a syntax error IN THE ENGINE, so it refuses here
+                let mut vs = vec![self.val()?];
+                while matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                    self.i += 1;
+                    vs.push(self.val()?);
+                }
+                if vs.len() < 2 {
+                    return None;
+                }
+                Val::Coalesce(vs)
+            }
+            "NULLIF" => {
+                // NULLIF(a, b) compiles as cast(value_if(a = b, NULL,
+                // a)) - and the unified dsc comes from the BRANCHES
+                // (NULL and a), so b never shapes it (probed:
+                // NULLIF(1, 2.55) casts to long scale 0)
+                let a = self.val()?;
+                if !matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                    return None;
+                }
+                self.i += 1;
+                let b = self.val()?;
+                let dsc = unify_branches(&[&Val::Null, &a])?;
+                Val::Cast(
+                    dsc,
+                    Box::new(Val::ValueIf(
+                        Box::new(Bool::Cmp(CmpOp::Eql, a.clone(), b)),
+                        Box::new(Val::Null),
+                        Box::new(a),
+                    )),
+                )
+            }
+            "IIF" => {
+                // IIF is pure sugar: byte-identical to the searched
+                // CASE WHEN c THEN a ELSE b END (probed)
+                let c = self.bool_or()?;
+                if !matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                    return None;
+                }
+                self.i += 1;
+                let a = self.val()?;
+                if !matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                    return None;
+                }
+                self.i += 1;
+                let b = self.val()?;
+                let dsc = unify_branches(&[&a, &b])?;
+                Val::Cast(
+                    dsc,
+                    Box::new(Val::ValueIf(Box::new(c), Box::new(a), Box::new(b))),
+                )
+            }
             _ => return None,
         };
         if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
@@ -612,6 +858,139 @@ impl<'a> P<'a> {
         }
         self.i += 1;
         Some(v)
+    }
+
+    /// CASE ... END, self.i past the CASE keyword. The searched form
+    /// compiles to a value_if CHAIN (each further WHEN nests in the
+    /// ELSE slot) under ONE cast to the branches' unified dsc; a
+    /// missing ELSE is blr_null. The simple form compiles to
+    /// blr_decode with NO cast wrapper (probed).
+    fn case_tail(&mut self) -> Option<Val> {
+        if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "WHEN") {
+            // searched CASE
+            let mut arms: Vec<(Bool, Val)> = Vec::new();
+            while self.kw("WHEN") {
+                let c = self.bool_or()?;
+                if !self.kw("THEN") {
+                    return None;
+                }
+                arms.push((c, self.val()?));
+            }
+            let els = if self.kw("ELSE") {
+                self.val()?
+            } else {
+                Val::Null
+            };
+            if !self.kw("END") {
+                return None;
+            }
+            let mut branches: Vec<&Val> = arms.iter().map(|(_, v)| v).collect();
+            branches.push(&els);
+            let dsc = unify_branches(&branches)?;
+            let mut tree = els;
+            for (c, v) in arms.into_iter().rev() {
+                tree = Val::ValueIf(Box::new(c), Box::new(v), Box::new(tree));
+            }
+            return Some(Val::Cast(dsc, Box::new(tree)));
+        }
+        // simple CASE: blr_decode(selector, comparands, results); the
+        // ELSE is one extra result and NOTHING marks its absence
+        let sel = self.val()?;
+        let mut comparands = Vec::new();
+        let mut results = Vec::new();
+        while self.kw("WHEN") {
+            comparands.push(self.val()?);
+            if !self.kw("THEN") {
+                return None;
+            }
+            results.push(self.val()?);
+        }
+        if comparands.is_empty() {
+            return None;
+        }
+        if self.kw("ELSE") {
+            results.push(self.val()?);
+        }
+        if !self.kw("END") {
+            return None;
+        }
+        Some(Val::Decode(Box::new(sel), comparands, results))
+    }
+
+    /// the cast targets whose dsc bytes were probed; anything else -
+    /// FLOAT, BLOB, DECFLOAT, INT128, zones, explicit charsets -
+    /// refuses
+    fn cast_target(&mut self) -> Option<Dsc> {
+        let Some(Tok::Ident(name)) = self.t.get(self.i) else {
+            return None;
+        };
+        let name = name.clone();
+        self.i += 1;
+        let paren_num = |p: &mut Self| -> Option<(i64, i8)> {
+            if !matches!(p.t.get(p.i), Some(Tok::LParen)) {
+                return None;
+            }
+            p.i += 1;
+            let Some(Tok::Int(prec)) = p.t.get(p.i) else {
+                return None;
+            };
+            let prec = *prec;
+            p.i += 1;
+            let mut sc = 0i8;
+            if matches!(p.t.get(p.i), Some(Tok::Comma)) {
+                p.i += 1;
+                let Some(Tok::Int(x)) = p.t.get(p.i) else {
+                    return None;
+                };
+                sc = i8::try_from(*x).ok()?;
+                p.i += 1;
+            }
+            if !matches!(p.t.get(p.i), Some(Tok::RParen)) {
+                return None;
+            }
+            p.i += 1;
+            Some((prec, sc))
+        };
+        Some(match name.as_str() {
+            "SMALLINT" => Dsc::Num(blr::SHORT, 0),
+            "INTEGER" | "INT" => Dsc::Num(blr::LONG, 0),
+            "BIGINT" => Dsc::Num(blr::INT64, 0),
+            // NUMERIC(p<=4) is short; DECIMAL(p<=9) is ALWAYS long -
+            // DECIMAL(4,1) probed as blr_long (SQL's "at least p")
+            "NUMERIC" | "DECIMAL" => match paren_num(self) {
+                None => Dsc::Num(blr::LONG, 0),
+                Some((p, sc)) => {
+                    let dt = if p <= 4 && name == "NUMERIC" {
+                        blr::SHORT
+                    } else if p <= 9 {
+                        blr::LONG
+                    } else if p <= 18 {
+                        blr::INT64
+                    } else {
+                        return None; // INT128 territory: unprobed
+                    };
+                    Dsc::Num(dt, -sc)
+                }
+            },
+            "VARCHAR" => {
+                let (l, sc) = paren_num(self)?;
+                if sc != 0 {
+                    return None;
+                }
+                Dsc::Varying(u16::try_from(l).ok()?)
+            }
+            "CHAR" | "CHARACTER" => {
+                let (l, sc) = paren_num(self)?;
+                if sc != 0 {
+                    return None;
+                }
+                Dsc::Text(u16::try_from(l).ok()?)
+            }
+            "DATE" => Dsc::Date,
+            "TIME" => Dsc::Time,
+            "TIMESTAMP" => Dsc::Timestamp,
+            _ => return None,
+        })
     }
 
     fn bool_or(&mut self) -> Option<Bool> {
@@ -741,6 +1120,12 @@ fn is_keyword(w: &str) -> bool {
             | "LEADING"
             | "TRAILING"
             | "BOTH"
+            | "CASE"
+            | "WHEN"
+            | "THEN"
+            | "ELSE"
+            | "END"
+            | "AS"
     )
 }
 
@@ -819,6 +1204,37 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
                 }
             }
             emit_val(out, src);
+        }
+        Val::Null => out.push(blr::NULL),
+        Val::Cast(d, v) => {
+            out.push(blr::CAST);
+            emit_dsc(out, *d);
+            emit_val(out, v);
+        }
+        Val::ValueIf(c, t, e) => {
+            out.push(blr::VALUE_IF);
+            emit_bool(out, c);
+            emit_val(out, t);
+            emit_val(out, e);
+        }
+        Val::Decode(sel, comparands, results) => {
+            out.push(blr::DECODE);
+            emit_val(out, sel);
+            out.push(comparands.len() as u8);
+            for c in comparands {
+                emit_val(out, c);
+            }
+            out.push(results.len() as u8);
+            for r in results {
+                emit_val(out, r);
+            }
+        }
+        Val::Coalesce(vs) => {
+            out.push(blr::COALESCE);
+            out.push(vs.len() as u8);
+            for v in vs {
+                emit_val(out, v);
+            }
         }
         Val::Int(n) => {
             out.push(blr::LITERAL);
@@ -1332,6 +1748,158 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_four_shapes_byte_for_byte() {
+        // blr_cast: dsc bytes per target - numerics carry dtype +
+        // scale; NUMERIC(p<=4) is SHORT but DECIMAL(p<=9) is ALWAYS
+        // LONG; p in 10..=18 is INT64; texts carry charset + length;
+        // temporals are the dtype alone
+        pin(
+            "SELECT ID FROM T WHERE CAST(A AS BIGINT) = 5",
+            "0543014A015401472F8310001701014115080005000000FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE CAST(A AS SMALLINT) = 5",
+            "0543014A015401472F8307001701014115080005000000FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE CAST(S AS INTEGER) = 5",
+            "0543014A015401472F8308001701015315080005000000FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE CAST(A AS NUMERIC(9,2)) = 1.50",
+            "0543014A015401472F8308FE170101411508FE96000000FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE CAST(A AS NUMERIC(4,1)) = 1.5",
+            "0543014A015401472F8307FF170101411508FF0F000000FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE CAST(A AS DECIMAL(4,1)) = 1.5",
+            "0543014A015401472F8308FF170101411508FF0F000000FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE CAST(A AS NUMERIC(18,2)) = 1.5",
+            "0543014A015401472F8310FE170101411508FF0F000000FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE CAST(A AS NUMERIC(10)) = 1",
+            "0543014A015401472F8310001701014115080001000000FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE CAST(ID AS VARCHAR(10)) = '5'",
+            "0543014A015401472F832600000A001701024944150F0000010035FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE CAST(S AS CHAR(5)) = 'x'",
+            "0543014A015401472F830F0000050017010153150F0000010078FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE CAST(S AS DATE) = S",
+            "0543014A015401472F830C1701015317010153FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE CAST(S AS TIME) = S",
+            "0543014A015401472F830D1701015317010153FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE CAST(S AS TIMESTAMP) = S",
+            "0543014A015401472F83231701015317010153FF4C",
+        );
+        // the searched CASE: ONE cast wrapper over a value_if chain,
+        // the unified dsc from the branches (NULL ignored)
+        pin(
+            "SELECT ID FROM T WHERE CASE WHEN A > 5 THEN 1 ELSE 0 END = 1",
+            "0543014A015401472F83080069311701014115080005000000150800010000001508000000000015080001000000FF4C",
+        );
+        // IIF is byte-identical sugar for it
+        pin(
+            "SELECT ID FROM T WHERE IIF(A > 5, 1, 0) = 1",
+            "0543014A015401472F83080069311701014115080005000000150800010000001508000000000015080001000000FF4C",
+        );
+        // a missing ELSE is blr_null - and does not shape the dsc
+        pin(
+            "SELECT ID FROM T WHERE CASE WHEN A > 5 THEN 1 END = 1",
+            "0543014A015401472F83080069311701014115080005000000150800010000002D15080001000000FF4C",
+        );
+        // further WHENs nest in the ELSE slot; still ONE cast on top
+        pin(
+            "SELECT ID FROM T WHERE CASE WHEN A > 5 THEN 1 WHEN A > 2 THEN 2 ELSE 3 END = 1",
+            "0543014A015401472F830800693117010141150800050000001508000100000069311701014115080002000000150800020000001508000300000015080001000000FF4C",
+        );
+        // text branches unify to blr_text2 at the MAXIMUM length
+        pin(
+            "SELECT ID FROM T WHERE CASE WHEN A > 5 THEN 'yes' ELSE 'no' END = 'yes'",
+            "0543014A015401472F830F0000030069311701014115080005000000150F00000300796573150F000002006E6F150F00000300796573FF4C",
+        );
+        // THE WIDENING LAW: long(0) with long(-1) needs 10 digits -
+        // the unified dsc is INT64 scale -1, not long
+        pin(
+            "SELECT ID FROM T WHERE CASE WHEN A > 5 THEN 1.5 ELSE 0 END = 1",
+            "0543014A015401472F8310FF693117010141150800050000001508FF0F0000001508000000000015080001000000FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE CASE WHEN A > 5 THEN 1.23 ELSE 0.5 END = 1",
+            "0543014A015401472F8310FE693117010141150800050000001508FE7B0000001508FF0500000015080001000000FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE CASE WHEN A > 5 THEN 5000000000 ELSE 0 END = 1",
+            "0543014A015401472F8310006931170101411508000500000015100000F2052A010000001508000000000015080001000000FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE CASE WHEN A > 5 THEN 5000000000 ELSE 0.5 END = 1",
+            "0543014A015401472F8310FF6931170101411508000500000015100000F2052A010000001508FF0500000015080001000000FF4C",
+        );
+        // CAST branches contribute their EXPLICIT dsc: two SMALLINT
+        // casts stay short; short with long-0 is long
+        pin(
+            "SELECT ID FROM T WHERE CASE WHEN A > 5 THEN CAST(A AS SMALLINT) ELSE CAST(ID AS SMALLINT) END = 1",
+            "0543014A015401472F8307006931170101411508000500000083070017010141830700170102494415080001000000FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE CASE WHEN A > 5 THEN CAST(A AS SMALLINT) ELSE 0 END = 1",
+            "0543014A015401472F83080069311701014115080005000000830700170101411508000000000015080001000000FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE CASE WHEN A > 5 THEN CAST(A AS BIGINT) ELSE 0 END = 1",
+            "0543014A015401472F83100069311701014115080005000000831000170101411508000000000015080001000000FF4C",
+        );
+        // the simple CASE is blr_decode - NO cast wrapper; the ELSE
+        // is one extra result, its absence unmarked
+        pin(
+            "SELECT ID FROM T WHERE CASE ID WHEN 1 THEN 'a' WHEN 2 THEN 'b' ELSE 'c' END = 'a'",
+            "0543014A015401472FCB170102494402150800010000001508000200000003150F0000010061150F0000010062150F0000010063150F0000010061FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE CASE ID WHEN 1 THEN 'a' WHEN 2 THEN 'b' END = 'a'",
+            "0543014A015401472FCB170102494402150800010000001508000200000002150F0000010061150F0000010062150F0000010061FF4C",
+        );
+        // COALESCE: a count byte and the values, NO cast wrapper -
+        // field arguments are fine here (no dsc to compute)
+        pin(
+            "SELECT ID FROM T WHERE COALESCE(A, 0) = 5",
+            "0543014A015401472FCA02170101411508000000000015080005000000FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE COALESCE(A, ID, 0) = 5",
+            "0543014A015401472FCA031701014117010249441508000000000015080005000000FF4C",
+        );
+        // NULLIF(a, b) is cast(value_if(a = b, NULL, a)) - the dsc
+        // from the BRANCHES (NULL, a), so b never shapes it
+        pin(
+            "SELECT ID FROM T WHERE NULLIF(1, 2.55) = 1",
+            "0543014A015401472F830800692F150800010000001508FEFF0000002D1508000100000015080001000000FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE NULLIF('ab', 'cd') = 'ab'",
+            "0543014A015401472F830F00000200692F150F000002006162150F0000020063642D150F000002006162150F000002006162FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE NULLIF('abc', 'z') = 'a'",
+            "0543014A015401472F830F00000300692F150F00000300616263150F000001007A2D150F00000300616263150F0000010061FF4C",
+        );
+    }
+
+    #[test]
     fn refuses_outside_the_surface() {
         // shapes this slice has NOT verified against the engine refuse
         // rather than guess
@@ -1350,6 +1918,17 @@ mod tests {
             // SUBSTRING without FOR: layout not yet probed
             "SELECT ID FROM T WHERE SUBSTRING(S FROM 1) = 'a'",
             "SELECT ID FROM T CROSS JOIN U2",        // no ON clause
+            // a FIELD branch in a cast-wrapped conditional: its dsc
+            // lives in the catalog - never guess a descriptor
+            "SELECT ID FROM T WHERE CASE WHEN A > 5 THEN A ELSE 0 END = 1",
+            "SELECT ID FROM T WHERE NULLIF(A, 0) = 5",
+            // single-argument COALESCE is a syntax error IN THE ENGINE
+            "SELECT ID FROM T WHERE COALESCE(A) = 5",
+            // unprobed cast targets and unprobed unifications
+            "SELECT ID FROM T WHERE CAST(A AS FLOAT) = 1",
+            "SELECT ID FROM T WHERE CAST(A AS NUMERIC(30)) = 1",
+            "SELECT ID FROM T WHERE CASE WHEN A > 5 THEN NULL ELSE NULL END IS NULL",
+            "SELECT ID FROM T WHERE CASE WHEN A > 5 THEN 'x' ELSE 0 END = 'x'",
         ] {
             assert!(compile_view_select(sql).is_none(), "{sql} was compiled");
         }

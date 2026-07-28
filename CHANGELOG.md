@@ -13,6 +13,40 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 4: CAST and the conditionals
+
+### Converted
+- **CAST**: `blr_cast` + a dsc, each target's layout probed:
+  SMALLINT/INTEGER/BIGINT are dtype + scale; NUMERIC(p≤4) is SHORT
+  but DECIMAL(p≤9) is ALWAYS LONG (SQL's "at least p"); p 10..=18 is
+  INT64 and beyond refuses; VARCHAR/CHAR carry a charset word and a
+  length word; DATE/TIME/TIMESTAMP are a bare dtype.
+- **Searched CASE and IIF** (byte-identical sugar): ONE `blr_cast`
+  over a `blr_value_if` chain — each further WHEN nests in the ELSE
+  slot, a missing ELSE is `blr_null`. The cast's descriptor is the
+  branches' UNIFIED type, law probed case by case: NULL branches are
+  ignored; text branches take blr_text2 at the MAX length
+  ('yes'/'no' → CHAR(3)); exact numerics take MAX integer digits +
+  MIN scale and the dtype that FITS the total (≤4 short, ≤9 long,
+  else int64) — so long(0) ∪ long(-1) WIDENS to int64 (9+1=10
+  digits): `CASE ... THEN 1.5 ELSE 0 END` casts to int64 scale -1.
+- **Simple CASE**: `blr_decode` — count byte, comparands, count byte,
+  results; the ELSE is one extra result and its absence is unmarked.
+  NO cast wrapper (probed). **COALESCE**: `blr_coalesce`, count byte
+  + values, also wrapper-free — so field arguments are fine there.
+- **NULLIF(a, b)**: `cast(value_if(a = b, NULL, a))` — the dsc comes
+  from the BRANCHES (NULL and a); b NEVER shapes it (probed:
+  NULLIF(1, 2.55) casts to long scale 0).
+
+### Guarded
+- A FIELD branch under a cast wrapper refuses — its descriptor lives
+  in the catalog and this compiler never guesses one (COALESCE and
+  decode take fields freely: no descriptor to compute). Single-arg
+  COALESCE (an engine syntax error), FLOAT/NUMERIC(>18) casts,
+  all-NULL branch lists and text/numeric mixtures refuse as unprobed.
+  Gate: `qa/dsql-view-blr.sh` grew to 90 checks (24 fresh slice-4
+  battery statements; 4 new refusal slots); 85 unit byte-pins.
+
 ## 2026-07-28 — fire-crab-dsql slice 3: outer joins, chains, functions
 
 ### Converted

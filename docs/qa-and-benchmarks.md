@@ -4278,7 +4278,7 @@ dropped from the view so an expression naming one refuses rather than
 guessing a side (qualified names in join expressions are the named
 remainder).
 
-### SQL → BLR against the engine's own compiler (`qa/dsql-view-blr.sh`, 62 checks)
+### SQL → BLR against the engine's own compiler (`qa/dsql-view-blr.sh`, 90 checks)
 
 The `fire-crab-dsql` crate opens Phase 4 with the purest differential
 in the project: the oracle is the exact artifact under conversion,
@@ -4348,6 +4348,31 @@ expected bytes for `A = -5000000000` were first written BY HAND and
 were wrong - the compiler was right. The engine probe settled it.
 The rule it re-taught: NEVER pin bytes that did not come out of
 RDB$VIEW_BLR.
+
+Slice 4 converted CAST and the conditionals, and with them the first
+piece of the DSQL's TYPE ALGEBRA. blr_cast carries a dsc whose layout
+was probed target by target - and the targets do not follow the
+"obvious" table: NUMERIC(4,1) casts to SHORT but DECIMAL(4,1) to
+LONG (SQL's "at least p digits"), NUMERIC(10) to INT64, VARCHAR and
+CHAR carry a charset word before their length, DATE/TIME/TIMESTAMP
+are a bare dtype byte. The searched CASE (and IIF, which compiles
+byte-identical) is ONE blr_cast over a blr_value_if chain - each
+extra WHEN nests in the ELSE slot, a missing ELSE is blr_null - and
+the cast's descriptor is the branches' UNIFIED type. That unification
+law was probed case by case: NULL branches are ignored; text branches
+unify to blr_text2 at the MAXIMUM length ('yes'/'no' -> CHAR(3));
+exact numerics take the MAXIMUM integer-digit count and the MINIMUM
+scale, then the dtype that FITS the total - which is why
+`CASE WHEN c THEN 1.5 ELSE 0 END` casts to INT64 scale -1: nine
+integer digits plus one fractional digit no longer fit blr_long. The
+simple CASE compiles to blr_decode and COALESCE to blr_coalesce, both
+WITHOUT a wrapper - so both take field arguments freely - and
+NULLIF(a, b) is cast(value_if(a = b, NULL, a)) whose dsc comes from
+the BRANCHES alone: b never shapes it (NULLIF(1, 2.55) casts to long
+scale ZERO, and the battery's NULLIF('x', FIRST_NAME) compiles even
+though a FIELD as the first argument refuses). That refusal is the
+slice's honest edge: a field branch under a cast wrapper needs the
+catalog's descriptor, and this compiler never guesses one.
 
 ## Benchmarks
 
