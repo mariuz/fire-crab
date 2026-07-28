@@ -35,6 +35,19 @@
 //!     a string literal is blr_text2 with a 2-byte charset and a
 //!     2-byte length (charset 0 in a NONE-charset database)
 //!   * AND/OR chains nest LEFT-associatively
+//!
+//! Slice 2 (same oracle) added VALUE EXPRESSIONS (blr_add/subtract/
+//! multiply/divide/negate/concatenate - a sign before a numeric
+//! literal FOLDS into it, blr_negate survives only before fields),
+//! IN lists (blr_in_list with a little-endian u16 count; NOT IN keeps
+//! a real blr_not), and MULTI-STREAM RSEs: comma-FROM lists and INNER
+//! JOIN ... ON (blr_join nesting like an rse, its ON clause a
+//! boolean sub-clause), with aliases stored as blr_relation2 whose
+//! alias text is the UPPERCASED name in DOUBLE QUOTES (probed:
+//! `FROM T x` stores alias "X", quotes included). Fields carry their
+//! stream's context id; in a multi-stream statement every field must
+//! be QUALIFIED (the engine resolves bare names through the catalog;
+//! this catalog-free slice refuses them rather than guess a context).
 
 /// The BLR bytes this slice emits, every constant read back from the
 /// engine's own stored view BLR (see the module doc).
@@ -60,6 +73,20 @@ mod blr {
     pub const MISSING: u8 = 0x3D;
     pub const BETWEEN: u8 = 0x38;
     pub const LIKE: u8 = 0x3F;
+    pub const ADD: u8 = 0x22;
+    pub const SUBTRACT: u8 = 0x23;
+    pub const MULTIPLY: u8 = 0x24;
+    pub const DIVIDE: u8 = 0x25;
+    pub const NEGATE: u8 = 0x26;
+    pub const CONCATENATE: u8 = 0x27;
+    /// FB5+'s dedicated IN-list verb: value, u16 count, values
+    pub const IN_LIST: u8 = 0x40;
+    /// an explicit join: stream count, streams, sub-clauses, blr_end -
+    /// nested inside the rse like a stream
+    pub const JOIN: u8 = 0x77;
+    /// a relation WITH AN ALIAS: counted name, counted alias (the
+    /// alias travels UPPERCASED IN DOUBLE QUOTES - probed), context
+    pub const RELATION2: u8 = 0x92;
     pub const EQL: u8 = 0x2F;
     pub const NEQ: u8 = 0x30;
     pub const GTR: u8 = 0x31;
@@ -68,16 +95,25 @@ mod blr {
     pub const LEQ: u8 = 0x34;
 }
 
-/// A value position in a boolean leaf.
+/// A value expression in a boolean leaf.
 #[derive(Clone, Debug, PartialEq)]
 enum Val {
-    /// an unquoted identifier, stored UPPERCASED like the engine does
-    Field(String),
+    /// a field with its stream CONTEXT id and UPPERCASED name
+    Field(u8, String),
     /// integer literal - blr_long holds 32 bits; wider refuses
     Int(i32),
     /// decimal literal as (raw, scale): 12.50 is (1250, -2)
     Dec(i32, i8),
     Str(String),
+    Add(Box<Val>, Box<Val>),
+    Sub(Box<Val>, Box<Val>),
+    Mul(Box<Val>, Box<Val>),
+    Div(Box<Val>, Box<Val>),
+    /// blr_negate - survives only before a FIELD; a sign before a
+    /// numeric literal folds into it at parse (probed: A = -1 stores
+    /// the literal 0xFFFFFFFF, no negate verb)
+    Neg(Box<Val>),
+    Concat(Box<Val>, Box<Val>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -125,6 +161,9 @@ enum Bool {
     Missing(Val),
     Between(Val, Val, Val),
     Like(Val, Val),
+    /// blr_in_list: value, u16 count, values (FB5+); NOT IN keeps a
+    /// real blr_not over it (probed)
+    InList(Val, Vec<Val>),
 }
 
 /// Push a negation down the tree the way the engine's DSQL does
@@ -141,7 +180,9 @@ fn negate(b: Bool) -> Bool {
             Box::new(Bool::Cmp(CmpOp::Lss, v.clone(), lo)),
             Box::new(Bool::Cmp(CmpOp::Gtr, v, hi)),
         ),
-        keep @ (Bool::Missing(_) | Bool::Like(..)) => Bool::Not(Box::new(keep)),
+        keep @ (Bool::Missing(_) | Bool::Like(..) | Bool::InList(..)) => {
+            Bool::Not(Box::new(keep))
+        }
     }
 }
 
@@ -157,6 +198,12 @@ enum Tok {
     RParen,
     Cmp(CmpOp),
     Comma,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Concat,
+    Dot,
 }
 
 fn lex(sql: &str) -> Option<Vec<Tok>> {
@@ -180,6 +227,30 @@ fn lex(sql: &str) -> Option<Vec<Tok>> {
             }
             ',' => {
                 out.push(Tok::Comma);
+                i += 1;
+            }
+            '+' => {
+                out.push(Tok::Plus);
+                i += 1;
+            }
+            '-' => {
+                out.push(Tok::Minus);
+                i += 1;
+            }
+            '*' => {
+                out.push(Tok::Star);
+                i += 1;
+            }
+            '/' => {
+                out.push(Tok::Slash);
+                i += 1;
+            }
+            '|' if b.get(i + 1) == Some(&'|') => {
+                out.push(Tok::Concat);
+                i += 2;
+            }
+            '.' => {
+                out.push(Tok::Dot);
                 i += 1;
             }
             '=' => {
@@ -269,9 +340,16 @@ fn lex(sql: &str) -> Option<Vec<Tok>> {
 
 // --------------------------------------------------------------- parser
 
+/// One FROM stream: relation name, optional alias, 1-based context.
+struct Stream {
+    name: String,
+    alias: Option<String>,
+}
+
 struct P<'a> {
     t: &'a [Tok],
     i: usize,
+    streams: Vec<Stream>,
 }
 
 impl<'a> P<'a> {
@@ -284,12 +362,121 @@ impl<'a> P<'a> {
         }
     }
 
+    /// Resolve a field's stream context. Qualified names match a
+    /// stream's ALIAS (which shadows the table name) or its table
+    /// name; bare names are legal only with ONE stream - the engine
+    /// resolves bare multi-stream names through the catalog, which
+    /// this catalog-free compiler refuses rather than guessing.
+    fn field(&self, qualifier: Option<&str>, name: &str) -> Option<Val> {
+        let ctx = match qualifier {
+            Some(q) => {
+                (self.streams.iter().position(|st| {
+                    st.alias.as_deref().map_or(st.name == q, |a| a == q)
+                })? + 1) as u8
+            }
+            None => {
+                if self.streams.len() != 1 {
+                    return None;
+                }
+                1
+            }
+        };
+        Some(Val::Field(ctx, name.to_string()))
+    }
+
+    /// expression grammar mirroring the engine's precedence:
+    /// `+`/`-` over `*`/`/` over unary `-` over `||` over atoms
     fn val(&mut self) -> Option<Val> {
+        let mut left = self.val_mul()?;
+        loop {
+            match self.t.get(self.i) {
+                Some(Tok::Plus) => {
+                    self.i += 1;
+                    left = Val::Add(Box::new(left), Box::new(self.val_mul()?));
+                }
+                Some(Tok::Minus) => {
+                    self.i += 1;
+                    left = Val::Sub(Box::new(left), Box::new(self.val_mul()?));
+                }
+                _ => return Some(left),
+            }
+        }
+    }
+
+    fn val_mul(&mut self) -> Option<Val> {
+        let mut left = self.val_unary()?;
+        loop {
+            match self.t.get(self.i) {
+                Some(Tok::Star) => {
+                    self.i += 1;
+                    left = Val::Mul(Box::new(left), Box::new(self.val_unary()?));
+                }
+                Some(Tok::Slash) => {
+                    self.i += 1;
+                    left = Val::Div(Box::new(left), Box::new(self.val_unary()?));
+                }
+                _ => return Some(left),
+            }
+        }
+    }
+
+    fn val_unary(&mut self) -> Option<Val> {
+        if matches!(self.t.get(self.i), Some(Tok::Minus)) {
+            self.i += 1;
+            // a sign before a NUMERIC LITERAL folds into it (probed:
+            // A = -1 stores the negative literal, no blr_negate);
+            // before anything else, blr_negate survives
+            return Some(match self.val_unary()? {
+                Val::Int(n) => Val::Int(n.checked_neg()?),
+                Val::Dec(r, sc) => Val::Dec(r.checked_neg()?, sc),
+                other => Val::Neg(Box::new(other)),
+            });
+        }
+        if matches!(self.t.get(self.i), Some(Tok::Plus)) {
+            self.i += 1;
+            return self.val_unary();
+        }
+        self.val_concat()
+    }
+
+    fn val_concat(&mut self) -> Option<Val> {
+        let mut left = self.val_atom()?;
+        while matches!(self.t.get(self.i), Some(Tok::Concat)) {
+            self.i += 1;
+            left = Val::Concat(Box::new(left), Box::new(self.val_atom()?));
+        }
+        Some(left)
+    }
+
+    fn val_atom(&mut self) -> Option<Val> {
         let v = match self.t.get(self.i)? {
-            Tok::Ident(x) if !is_keyword(x) => Val::Field(x.clone()),
+            Tok::Ident(x) if !is_keyword(x) => {
+                let first = x.clone();
+                self.i += 1;
+                // a qualified field: IDENT . IDENT
+                if matches!(self.t.get(self.i), Some(Tok::Dot)) {
+                    self.i += 1;
+                    let Some(Tok::Ident(f)) = self.t.get(self.i) else {
+                        return None;
+                    };
+                    let f = f.clone();
+                    self.i += 1;
+                    return self.field(Some(&first), &f);
+                }
+                return self.field(None, &first);
+            }
             Tok::Int(n) => Val::Int(i32::try_from(*n).ok()?),
             Tok::Dec(r, s) => Val::Dec(i32::try_from(*r).ok()?, *s),
             Tok::Str(s) => Val::Str(s.clone()),
+            Tok::LParen => {
+                self.i += 1;
+                let inner = self.val()?;
+                if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                    return None;
+                }
+                self.i += 1;
+                return Some(inner);
+            }
             _ => return None,
         };
         self.i += 1;
@@ -319,15 +506,18 @@ impl<'a> P<'a> {
             return Some(negate(self.bool_not()?));
         }
         if matches!(self.t.get(self.i), Some(Tok::LParen)) {
-            // a parenthesised boolean group; leaves carry no parens in
-            // this slice, so no backtracking is needed
+            // a paren opens a boolean group OR a parenthesised value
+            // ((A + 1) * 2 = 8): try the group on a saved position,
+            // fall through to the leaf parser otherwise
+            let save = self.i;
             self.i += 1;
-            let inner = self.bool_or()?;
-            if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
-                return None;
+            if let Some(inner) = self.bool_or() {
+                if matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                    self.i += 1;
+                    return Some(inner);
+                }
             }
-            self.i += 1;
-            return Some(inner);
+            self.i = save;
         }
         self.leaf()
     }
@@ -361,6 +551,27 @@ impl<'a> P<'a> {
                 body
             });
         }
+        if self.kw("IN") {
+            if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                return None;
+            }
+            self.i += 1;
+            let mut items = vec![self.val()?];
+            while matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                self.i += 1;
+                items.push(self.val()?);
+            }
+            if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                return None;
+            }
+            self.i += 1;
+            let body = Bool::InList(left, items);
+            return Some(if negated {
+                Bool::Not(Box::new(body))
+            } else {
+                body
+            });
+        }
         if negated {
             return None;
         }
@@ -377,7 +588,20 @@ impl<'a> P<'a> {
 fn is_keyword(w: &str) -> bool {
     matches!(
         w,
-        "AND" | "OR" | "NOT" | "IS" | "NULL" | "BETWEEN" | "LIKE" | "WHERE" | "FROM" | "SELECT"
+        "AND"
+            | "OR"
+            | "NOT"
+            | "IS"
+            | "NULL"
+            | "BETWEEN"
+            | "LIKE"
+            | "IN"
+            | "WHERE"
+            | "FROM"
+            | "SELECT"
+            | "JOIN"
+            | "INNER"
+            | "ON"
     )
 }
 
@@ -385,11 +609,40 @@ fn is_keyword(w: &str) -> bool {
 
 fn emit_val(out: &mut Vec<u8>, v: &Val) {
     match v {
-        Val::Field(name) => {
+        Val::Field(ctx, name) => {
             out.push(blr::FIELD);
-            out.push(1); // context id: the single stream
+            out.push(*ctx);
             out.push(name.len() as u8);
             out.extend_from_slice(name.as_bytes());
+        }
+        Val::Add(a, b) => {
+            out.push(blr::ADD);
+            emit_val(out, a);
+            emit_val(out, b);
+        }
+        Val::Sub(a, b) => {
+            out.push(blr::SUBTRACT);
+            emit_val(out, a);
+            emit_val(out, b);
+        }
+        Val::Mul(a, b) => {
+            out.push(blr::MULTIPLY);
+            emit_val(out, a);
+            emit_val(out, b);
+        }
+        Val::Div(a, b) => {
+            out.push(blr::DIVIDE);
+            emit_val(out, a);
+            emit_val(out, b);
+        }
+        Val::Neg(a) => {
+            out.push(blr::NEGATE);
+            emit_val(out, a);
+        }
+        Val::Concat(a, b) => {
+            out.push(blr::CONCATENATE);
+            emit_val(out, a);
+            emit_val(out, b);
         }
         Val::Int(n) => {
             out.push(blr::LITERAL);
@@ -449,7 +702,36 @@ fn emit_bool(out: &mut Vec<u8>, b: &Bool) {
             emit_val(out, v);
             emit_val(out, p);
         }
+        Bool::InList(v, items) => {
+            out.push(blr::IN_LIST);
+            emit_val(out, v);
+            out.extend_from_slice(&(items.len() as u16).to_le_bytes());
+            for it in items {
+                emit_val(out, it);
+            }
+        }
     }
+}
+
+/// One relation stream: plain (blr_relation) or aliased
+/// (blr_relation2, the alias UPPERCASED IN DOUBLE QUOTES - probed).
+fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
+    match &st.alias {
+        None => {
+            out.push(blr::RELATION);
+            out.push(st.name.len() as u8);
+            out.extend_from_slice(st.name.as_bytes());
+        }
+        Some(a) => {
+            out.push(blr::RELATION2);
+            out.push(st.name.len() as u8);
+            out.extend_from_slice(st.name.as_bytes());
+            let quoted = format!("\"{}\"", a);
+            out.push(quoted.len() as u8);
+            out.extend_from_slice(quoted.as_bytes());
+        }
+    }
+    out.push(ctx);
 }
 
 /// Compile a view-shaped SELECT to the BLR the engine's DSQL stores in
@@ -457,13 +739,13 @@ fn emit_bool(out: &mut Vec<u8>, b: &Bool) {
 /// converted surface (the caller refuses; this crate never guesses).
 pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
     let toks = lex(sql.trim().trim_end_matches(';'))?;
-    let mut p = P { t: &toks, i: 0 };
+    let mut p = P { t: &toks, i: 0, streams: Vec::new() };
     if !p.kw("SELECT") {
         return None;
     }
     // the select list leaves NO trace in the view BLR (probed) - skip
     // to FROM, but refuse list shapes this slice has not verified
-    // (only bare columns and `*` are known to compile away)
+    // (bare and qualified columns and `*` are known to compile away)
     loop {
         match p.t.get(p.i)? {
             Tok::Ident(w) if w == "FROM" => {
@@ -471,19 +753,55 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
                 break;
             }
             Tok::Ident(w) if !is_keyword(w) => p.i += 1,
-            Tok::Comma => p.i += 1,
-            Tok::Cmp(CmpOp::Gtr) => return None, // not reachable; guard
+            Tok::Comma | Tok::Dot | Tok::Star => p.i += 1,
             _ => return None,
         }
     }
-    let Some(Tok::Ident(table)) = p.t.get(p.i) else {
-        return None;
+    // FROM: `T [alias]` , comma-list `T [a], U [b], ...` or a single
+    // `T [a] [INNER] JOIN U [b] ON <bool>`
+    let mut stream = |p: &mut P| -> Option<Stream> {
+        let Some(Tok::Ident(name)) = p.t.get(p.i) else {
+            return None;
+        };
+        if is_keyword(name) {
+            return None;
+        }
+        let name = name.clone();
+        p.i += 1;
+        let alias = match p.t.get(p.i) {
+            Some(Tok::Ident(a)) if !is_keyword(a) => {
+                let a = a.clone();
+                p.i += 1;
+                Some(a)
+            }
+            _ => None,
+        };
+        Some(Stream { name, alias })
     };
-    if is_keyword(table) {
-        return None;
+    let first = stream(&mut p)?;
+    p.streams.push(first);
+    let mut join_on: Option<Bool> = None;
+    if matches!(p.t.get(p.i), Some(Tok::Comma)) {
+        // the comma list: streams side by side in the rse
+        while matches!(p.t.get(p.i), Some(Tok::Comma)) {
+            p.i += 1;
+            let st = stream(&mut p)?;
+            p.streams.push(st);
+        }
+    } else if matches!(p.t.get(p.i), Some(Tok::Ident(w)) if w == "JOIN" || w == "INNER") {
+        // one INNER JOIN: blr_join nests the two streams and carries
+        // the ON clause as its own boolean sub-clause (probed)
+        let _ = p.kw("INNER");
+        if !p.kw("JOIN") {
+            return None;
+        }
+        let st = stream(&mut p)?;
+        p.streams.push(st);
+        if !p.kw("ON") {
+            return None;
+        }
+        join_on = Some(p.bool_or()?);
     }
-    let table = table.clone();
-    p.i += 1;
     let boolean = if p.kw("WHERE") {
         Some(p.bool_or()?)
     } else {
@@ -493,10 +811,29 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
         return None; // trailing clauses are outside this slice
     }
 
-    let mut out = vec![blr::VERSION5, blr::RSE, 1, blr::RELATION];
-    out.push(table.len() as u8);
-    out.extend_from_slice(table.as_bytes());
-    out.push(1); // context id
+    let mut out = vec![blr::VERSION5, blr::RSE];
+    match &join_on {
+        None => {
+            // plain streams, side by side
+            out.push(p.streams.len() as u8);
+            for (i, st) in p.streams.iter().enumerate() {
+                emit_stream(&mut out, st, (i + 1) as u8);
+            }
+        }
+        Some(on) => {
+            // one rse stream holding the join; the ON clause is the
+            // JOIN's boolean, ended by its own blr_end
+            out.push(1);
+            out.push(blr::JOIN);
+            out.push(p.streams.len() as u8);
+            for (i, st) in p.streams.iter().enumerate() {
+                emit_stream(&mut out, st, (i + 1) as u8);
+            }
+            out.push(blr::BOOLEAN);
+            emit_bool(&mut out, on);
+            out.push(blr::END);
+        }
+    }
     if let Some(b) = &boolean {
         out.push(blr::BOOLEAN);
         emit_bool(&mut out, b);
@@ -602,16 +939,98 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_two_shapes_byte_for_byte() {
+        // value expressions: add/sub/mul/div with plain precedence
+        pin(
+            "SELECT ID FROM T WHERE A + 1 > 5",
+            "0543014A015401473122170101411508000100000015080005000000FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE A * 2 - 1 = 9",
+            "0543014A015401472F232417010141150800020000001508000100000015080009000000FF4C",
+        );
+        // blr_negate survives only before a field...
+        pin(
+            "SELECT ID FROM T WHERE -A = 5",
+            "0543014A015401472F261701014115080005000000FF4C",
+        );
+        // ...while a sign before a numeric literal FOLDS into it
+        pin(
+            "SELECT ID FROM T WHERE A = -1",
+            "0543014A015401472F17010141150800FFFFFFFFFF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE A = -1.5",
+            "0543014A015401472F170101411508FFF1FFFFFFFF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE A / 2 = 3",
+            "0543014A015401472F25170101411508000200000015080003000000FF4C",
+        );
+        // parens reshape the tree
+        pin(
+            "SELECT ID FROM T WHERE (A + 1) * 2 = 8",
+            "0543014A015401472F242217010141150800010000001508000200000015080008000000FF4C",
+        );
+        // concatenation
+        pin(
+            "SELECT ID FROM T WHERE S = 'a' || 'b'",
+            "0543014A015401472F1701015327150F0000010061150F0000010062FF4C",
+        );
+        // IN is blr_in_list with a u16 count; NOT IN keeps blr_not
+        pin(
+            "SELECT ID FROM T WHERE A IN (1, 2, 3)",
+            "0543014A0154014740170101410300150800010000001508000200000015080003000000FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE A NOT IN (1, 2)",
+            "0543014A015401473B401701014102001508000100000015080002000000FF4C",
+        );
+        // comma-FROM: two streams side by side, fields by context
+        pin(
+            "SELECT T.ID FROM T, U2 WHERE T.ID = U2.UID",
+            "0543024A0154014A02553202472F1701024944170203554944FF4C",
+        );
+        // an alias becomes blr_relation2, UPPERCASED IN DOUBLE QUOTES
+        pin(
+            "SELECT X.ID FROM T X WHERE X.A > 1",
+            "054301920154032258220147311701014115080001000000FF4C",
+        );
+        pin(
+            "SELECT AB.ID FROM T AB WHERE AB.A > 1",
+            "05430192015404224142220147311701014115080001000000FF4C",
+        );
+        // a lowercase alias uppercases before quoting
+        pin(
+            "SELECT x.ID FROM T x WHERE x.A > 1",
+            "054301920154032258220147311701014115080001000000FF4C",
+        );
+        // INNER JOIN: blr_join nests like an rse, the ON clause is its
+        // boolean, and a WHERE is the rse's own boolean after it
+        pin(
+            "SELECT T.ID FROM T JOIN U2 ON T.ID = U2.UID WHERE U2.UA > 0",
+            "05430177024A0154014A02553202472F1701024944170203554944FF4731170202554115080000000000FF4C",
+        );
+        pin(
+            "SELECT E.ID FROM T E JOIN U2 D ON E.ID = D.UID",
+            "05430177029201540322452201920255320322442202472F1701024944170203554944FFFF4C",
+        );
+    }
+
+    #[test]
     fn refuses_outside_the_surface() {
         // shapes this slice has NOT verified against the engine refuse
         // rather than guess
         for sql in [
-            "SELECT ID FROM T ORDER BY ID",       // trailing clause
-            "SELECT ID FROM T WHERE A + 1 > 5",   // arithmetic value
-            "SELECT ID FROM T, U",                // two streams
-            "SELECT ID FROM T WHERE A IN (1, 2)", // IN not probed
+            "SELECT ID FROM T ORDER BY ID",          // trailing clause
             "SELECT ID FROM T WHERE A = 5000000000", // past blr_long
-            "UPDATE T SET A = 1",                 // not a SELECT
+            "UPDATE T SET A = 1",                    // not a SELECT
+            "SELECT COUNT(*) FROM T",                // aggregates
+            // a BARE field in a multi-stream statement: the engine
+            // resolves it through the catalog; catalog-free, we refuse
+            "SELECT T.ID FROM T, U2 WHERE ID = 1",
+            "SELECT T.ID FROM T LEFT JOIN U2 ON T.ID = U2.UID", // outer
+            "SELECT T.ID FROM T, U2, T WHERE T.ID = 1 AND X.A = 2", // bad qualifier
         ] {
             assert!(compile_view_select(sql).is_none(), "{sql} was compiled");
         }

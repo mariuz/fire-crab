@@ -258,6 +258,15 @@ them.
         like, missing -> keep a real NOT node
     # literals: integers little-endian at their storage width; decimals
     # keep the WRITTEN scale; strings carry charset + length words
+    # a SIGN before a numeric literal FOLDS into it - emit blr_negate
+    # only before non-literals; IN compiles to a dedicated list verb
+    # with a count word, and NOT IN keeps a real NOT node
+    # joins NEST: an explicit JOIN is a stream-like node inside the
+    # rse, carrying its ON clause as its own boolean sub-clause;
+    # aliases store UPPERCASED IN DOUBLE QUOTES (read the bytes, not
+    # the docs); NEVER guess a bare field's context in a multi-stream
+    # statement without the catalog - a wrong context compiles a
+    # DIFFERENT query that still executes
 
 ## Traps that cost real time (all found the hard way)
 

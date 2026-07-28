@@ -4302,12 +4302,26 @@ are little-endian blr_long, decimals keep their written scale
 (12.50 -> raw 1250 at -2), strings are blr_text2 with charset and
 length words; AND/OR chains nest left-associatively.
 
+Slice 2 grew the compiled surface: VALUE EXPRESSIONS (blr_add /
+subtract / multiply / divide / negate / concatenate, with the probed
+law that a sign before a numeric literal FOLDS into it while
+blr_negate survives only before fields), IN lists (FB5's blr_in_list
+with a little-endian u16 count - NOT IN keeps a real blr_not),
+comma-FROM multi-stream rses, INNER JOIN ... ON (blr_join nests like
+an rse and carries the ON clause as its own boolean sub-clause), and
+aliases (blr_relation2, whose alias travels UPPERCASED IN DOUBLE
+QUOTES - `FROM T x` stores the three bytes `"X"`). Fields carry their
+stream's context id; a BARE field in a multi-stream statement refuses
+- the engine resolves those through the catalog, and a catalog-free
+compiler that guessed a context would compile a DIFFERENT QUERY.
+
 The battery deliberately goes BEYOND the probe pins - fresh field
-names, fresh combinations, double negation, NOT over mixed OR - so
-the gate exercises the COMPILER, not the probe notebook. Refusals
-(ORDER BY, arithmetic in values, IN lists, aggregates, joins) must
-answer REFUSED: outside the converted surface this crate never
-guesses a byte.
+names, fresh combinations, double negation, NOT over mixed OR, join
+ON with two conditions - so the gate exercises the COMPILER, not the
+probe notebook (41 checks). Refusals (ORDER BY, aggregates, LEFT
+JOIN, bare multi-stream fields, past-blr_long literals) must answer
+REFUSED: outside the converted surface this crate never guesses a
+byte.
 
 ## Benchmarks
 

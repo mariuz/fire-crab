@@ -13,6 +13,29 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 2: expressions, IN, streams
+
+### Converted
+- **Value expressions** in the compiled BLR: blr_add / subtract /
+  multiply / divide / negate / concatenate with the engine's
+  precedence; a sign before a NUMERIC LITERAL folds into it (probed:
+  `A = -1` stores the negative literal, no negate verb) while
+  blr_negate survives before fields; parens reshape the tree.
+- **IN lists**: FB5's dedicated `blr_in_list` (value, little-endian
+  u16 count, values); `NOT IN` keeps a real blr_not — and the De
+  Morgan folder treats InList like LIKE/MISSING.
+- **Multi-stream RSEs**: comma-FROM lists emit streams side by side
+  with 1-based contexts; `[INNER] JOIN ... ON` emits `blr_join`
+  nesting like an rse with the ON clause as its own boolean
+  sub-clause; aliases emit `blr_relation2` with the alias UPPERCASED
+  IN DOUBLE QUOTES (probed: `FROM T x` stores `"X"`). Qualified
+  fields resolve to their stream's context; a BARE field in a
+  multi-stream statement refuses — the engine resolves those through
+  the catalog, and this catalog-free compiler never guesses a
+  context. Gate: `qa/dsql-view-blr.sh` grew to 41 checks (15 fresh
+  slice-2 battery statements; LEFT JOIN and bare multi-stream fields
+  hold refusal slots); 31 unit byte-pins.
+
 ## 2026-07-28 — fire-crab-dsql: SQL → BLR, first slice
 
 ### Converted
