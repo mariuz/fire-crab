@@ -4508,7 +4508,7 @@ distinctness cannot change a minimum. Two prior refusals became
 features (COUNT(DISTINCT ...) and the bare SELECT INTO body): flips
 seven and eight.
 
-### SQL → BLR, oracle number three (`qa/dsql-trig-blr.sh`, 24 checks)
+### SQL → BLR, oracle number three (`qa/dsql-trig-blr.sh`, 34 checks)
 
 Slice 11 opened the trigger oracle: RDB$TRIGGER_BLR stores a compiled
 trigger body verbatim, and its wrapper is the leanest of the three -
@@ -4550,6 +4550,26 @@ name binds to the DML's own stream (innermost scope, engine-agreed
 in the battery), contexts keep counting across multiple DML
 statements, and DML composes under IF. Refused: list-less INSERTs,
 column/value miscounts, INSERT ... SELECT.
+
+Slice 13 added PSQL CONTROL - the shapes that make bodies programs.
+DECLARE [VARIABLE] sits between the outer begin and label 0, each
+variable null-initialised unless an initialiser replaces the null -
+and a two-variable probe exposed an asymmetry: TRIGGERS group all
+declares first and then all inits, while PROCEDURES interleave
+declare/init per variable. Read the bytes, not the symmetry. A bare
+name resolves to a local variable FIRST (before any stream), and
+`v = expr;` assigns to blr_variable. WHILE (c) DO stmt compiles to
+blr_label N, blr_loop, begin, blr_if(c, body, blr_leave N), end -
+the loop leaves itself when the condition fails - with labels
+numbered in ENCOUNTER order after the wrapper's 0 (nested loops:
+outer 1, inner 2, each leave matching its own). The trigger
+predicates INSERTING/UPDATING/DELETING turn out to be sugar for
+eql(blr_internal_info(literal 6), literal 1/2/3) - which means NOT
+INSERTING folds to neq through the same inverse law as every other
+comparison, and the predicates compose under AND/OR (the battery
+runs UPDATING OR DELETING and UPDATING AND v > 100). Multi-event
+headers leave no trace. Refused: assignments to undeclared names,
+bare LEAVE.
 
 ## Benchmarks
 

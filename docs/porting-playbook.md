@@ -307,6 +307,12 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # PSQL control is MORE compiled sugar: a WHILE is a labelled
+    # loop whose body IF leaves on failure; event predicates
+    # (INSERTING) are comparisons against an internal-info call, so
+    # your negation law already handles NOT INSERTING; and the SAME
+    # declare section can be grouped or interleaved DEPENDING ON THE
+    # BODY KIND - probe each wrapper separately, symmetry lies
     # the DML verbs split one statement across TWO contexts: UPDATE
     # reads the org stream and writes a new-record context that was
     # allocated FIRST - probe the allocation order, not just the

@@ -13,6 +13,31 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 13: PSQL control
+
+### Converted
+- **DECLARE [VARIABLE]**: declares sit between the outer begin and
+  label 0, each null-initialised UNLESS an initialiser replaces the
+  null. With several variables, **triggers group ALL declares first,
+  THEN the inits — where procedures interleave per variable** (both
+  probed: read the bytes, not the symmetry). Bare names resolve to
+  local variables FIRST; `v = expr;` assigns to blr_variable.
+- **WHILE (c) DO stmt**: blr_label N, blr_loop, begin, blr_if(c,
+  body, blr_leave N), end — labels number in ENCOUNTER order after
+  the wrapper's 0; nested loops probed (outer 1, inner 2, leaves
+  matching).
+- **INSERTING / UPDATING / DELETING**: eql(blr_internal_info(literal
+  6), literal 1/2/3) — so NOT INSERTING folds to neq through the
+  ordinary inverse law, and the predicates compose under AND/OR
+  (battery: UPDATING OR DELETING, UPDATING AND v > 100). Multi-event
+  headers (BEFORE INSERT OR UPDATE OR DELETE) leave no trace like
+  the rest of the header.
+
+### Guarded
+- Assignments to undeclared names, bare LEAVE (loop control beyond
+  WHILE's own is unconverted). Gate: `qa/dsql-trig-blr.sh` grew to
+  34 checks (8 fresh PSQL battery statements); 174 unit byte-pins.
+
 ## 2026-07-28 — fire-crab-dsql slice 12: the DML verbs
 
 ### Converted

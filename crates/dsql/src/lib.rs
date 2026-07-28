@@ -262,6 +262,13 @@ mod blr {
     /// blr_marks: count byte, mark byte - the DSQL stamps its
     /// UPDATE/DELETE loops with marks(1, 4) (probed)
     pub const MARKS: u8 = 0xD9;
+    /// WHILE: blr_label N, blr_loop, begin, blr_if(cond, body,
+    /// blr_leave N), end (probed)
+    pub const LOOP: u8 = 0x09;
+    pub const LEAVE: u8 = 0x12;
+    /// INSERTING/UPDATING/DELETING: eql(blr_internal_info(literal 6),
+    /// literal 1/2/3) (probed)
+    pub const INTERNAL_INFO: u8 = 0xB1;
     pub const EQL: u8 = 0x2F;
     pub const NEQ: u8 = 0x30;
     pub const GTR: u8 = 0x31;
@@ -319,6 +326,11 @@ enum Val {
     /// message 0 as blr_parameter2 (value slot 2i, null slot 2i+1);
     /// no variable is declared for inputs (probed)
     InParam(u16),
+    /// a local variable declared in the body - blr_variable
+    LocalVar(u16),
+    /// blr_internal_info(literal 6) - the trigger-action code the
+    /// INSERTING/UPDATING/DELETING predicates compare against
+    TrigAction,
     /// blr_coalesce
     Coalesce(Vec<Val>),
 }
@@ -754,6 +766,11 @@ struct P<'a> {
     /// the procedure's INPUT parameter names, in message-0 order;
     /// `:name` in an expression resolves against this
     in_params: Vec<String>,
+    /// local variable names declared in a trigger body, in
+    /// declaration order; a bare name resolves here FIRST
+    local_vars: Vec<String>,
+    /// the next free label number (0 is the body wrapper's)
+    next_label: u8,
     /// context of stream index 0: 1 in view BLR, 0 in procedure
     /// bodies (probed - the FOR SELECT stream is context 0)
     base: u8,
@@ -1142,6 +1159,14 @@ impl<'a> P<'a> {
                     // unknown name followed by '(' REFUSES (a UDF or
                     // unconverted function must never become a field)
                     return self.func(&first);
+                }
+                // a bare name resolves against LOCAL VARIABLES first
+                if !matches!(self.t.get(self.i), Some(Tok::Dot)) {
+                    if let Some(vi) =
+                        self.local_vars.iter().position(|n| n == &first)
+                    {
+                        return Some(Val::LocalVar(vi as u16));
+                    }
                 }
                 // a qualified field: IDENT . IDENT
                 if matches!(self.t.get(self.i), Some(Tok::Dot)) {
@@ -1538,6 +1563,15 @@ impl<'a> P<'a> {
     }
 
     fn leaf(&mut self) -> Option<Bool> {
+        for (kw, code) in [("INSERTING", 1), ("UPDATING", 2), ("DELETING", 3)] {
+            if self.kw(kw) {
+                return Some(Bool::Cmp(
+                    CmpOp::Eql,
+                    Val::TrigAction,
+                    Val::Int(code),
+                ));
+            }
+        }
         if self.kw("EXISTS") {
             return Some(Bool::Any(self.subselect(false)?));
         }
@@ -1682,6 +1716,11 @@ fn is_keyword(w: &str) -> bool {
             | "UPDATE"
             | "VALUES"
             | "SET"
+            | "DECLARE"
+            | "WHILE"
+            | "INSERTING"
+            | "UPDATING"
+            | "DELETING"
     )
 }
 
@@ -1802,6 +1841,14 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
             out.push(0);
             out.extend_from_slice(&(2 * i).to_le_bytes());
             out.extend_from_slice(&(2 * i + 1).to_le_bytes());
+        }
+        Val::LocalVar(i) => {
+            out.push(blr::VARIABLE);
+            out.extend_from_slice(&i.to_le_bytes());
+        }
+        Val::TrigAction => {
+            out.push(blr::INTERNAL_INFO);
+            emit_val(out, &Val::Int(6));
         }
         Val::ScalarSub(sub) => {
             out.push(blr::VIA);
@@ -1988,6 +2035,8 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
         agg_map: Vec::new(),
         agg_mode: false,
         in_params: Vec::new(),
+        local_vars: Vec::new(),
+        next_label: 1,
     };
     // a top-level UNION restructures the whole statement: the union
     // node takes context 1 BEFORE any branch stream, so it must be
@@ -2340,6 +2389,8 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         agg_map: Vec::new(),
         agg_mode: false,
         in_params: Vec::new(),
+        local_vars: Vec::new(),
+        next_label: 1,
     };
     if !(p.kw("CREATE") && p.kw("PROCEDURE")) {
         return None;
@@ -2894,6 +2945,9 @@ enum TrigStmt {
     /// UPDATE rel SET ... [WHERE ...] - for(marks(1,4), rse),
     /// modify(org, new, assignments)
     Update(Stream, u8, u8, Vec<(Val, Val)>, Option<Bool>),
+    /// WHILE (cond) DO stmt - blr_label N, blr_loop, begin,
+    /// blr_if(cond, body, blr_leave N), end (probed)
+    While(u8, Bool, Box<TrigStmt>),
 }
 
 fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
@@ -2951,6 +3005,18 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
             out.push(blr::END);
             out.push(blr::ERASE);
             out.push(*ctx);
+        }
+        TrigStmt::While(label, cond, body) => {
+            out.push(blr::LABEL);
+            out.push(*label);
+            out.push(blr::LOOP);
+            out.push(blr::BEGIN);
+            out.push(blr::IF);
+            emit_bool(out, cond);
+            emit_trig_stmt(out, body);
+            out.push(blr::LEAVE);
+            out.push(*label);
+            out.push(blr::END);
         }
         TrigStmt::Update(rel, org, new, sets, wher) => {
             out.push(blr::FOR);
@@ -3013,6 +3079,38 @@ impl<'a> P<'a> {
                 None
             };
             return Some(TrigStmt::If(cond, then, els));
+        }
+        if self.kw("WHILE") {
+            if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                return None;
+            }
+            self.i += 1;
+            let cond = self.bool_or()?;
+            if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                return None;
+            }
+            self.i += 1;
+            if !self.kw("DO") {
+                return None;
+            }
+            let label = self.next_label;
+            self.next_label += 1;
+            let body = Box::new(self.trig_stmt()?);
+            return Some(TrigStmt::While(label, cond, body));
+        }
+        // <var> = <value>; - a local-variable assignment
+        if let Some(Tok::Ident(name)) = self.t.get(self.i) {
+            if let Some(vi) = self.local_vars.iter().position(|n| n == name) {
+                if matches!(self.t.get(self.i + 1), Some(Tok::Cmp(CmpOp::Eql))) {
+                    self.i += 2;
+                    let src = self.val()?;
+                    if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                        return None;
+                    }
+                    self.i += 1;
+                    return Some(TrigStmt::Assign(src, Val::LocalVar(vi as u16)));
+                }
+            }
         }
         if self.kw("INSERT") {
             // INSERT INTO rel (cols) VALUES (vals); - the column
@@ -3247,6 +3345,8 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
         agg_map: Vec::new(),
         agg_mode: false,
         in_params: Vec::new(),
+        local_vars: Vec::new(),
+        next_label: 1,
     };
     if !(p.kw("CREATE") && p.kw("TRIGGER")) {
         return None;
@@ -3265,11 +3365,20 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
     if !(p.kw("BEFORE") || p.kw("AFTER")) {
         return None;
     }
-    match p.t.get(p.i)? {
-        Tok::Ident(w) if matches!(w.as_str(), "INSERT" | "UPDATE" | "DELETE") => {
-            p.i += 1
+    // one or more events: INSERT [OR UPDATE [OR DELETE]] - the event
+    // list, like the rest of the header, leaves no BLR trace
+    loop {
+        match p.t.get(p.i)? {
+            Tok::Ident(w)
+                if matches!(w.as_str(), "INSERT" | "UPDATE" | "DELETE") =>
+            {
+                p.i += 1
+            }
+            _ => return None,
         }
-        _ => return None,
+        if !p.kw("OR") {
+            break;
+        }
     }
     if p.kw("POSITION") {
         let Some(Tok::Int(_)) = p.t.get(p.i) else {
@@ -3277,7 +3386,38 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
         };
         p.i += 1;
     }
-    if !(p.kw("AS") && p.kw("BEGIN")) {
+    if !p.kw("AS") {
+        return None;
+    }
+    // DECLARE [VARIABLE] name TYPE [= <value>]; ... - declares sit
+    // between the outer begin and label 0, each null-initialised
+    // UNLESS an initialiser replaces the null (probed)
+    let mut declares: Vec<(Dsc, Option<Val>)> = Vec::new();
+    while p.kw("DECLARE") {
+        let _ = p.kw("VARIABLE");
+        let Some(Tok::Ident(name)) = p.t.get(p.i) else {
+            return None;
+        };
+        if is_keyword(name) {
+            return None;
+        }
+        let name = name.clone();
+        p.i += 1;
+        let dsc = p.cast_target()?;
+        p.local_vars.push(name);
+        let init = if matches!(p.t.get(p.i), Some(Tok::Cmp(CmpOp::Eql))) {
+            p.i += 1;
+            Some(p.val()?)
+        } else {
+            None
+        };
+        declares.push((dsc, init));
+        if !matches!(p.t.get(p.i), Some(Tok::Semi)) {
+            return None;
+        }
+        p.i += 1;
+    }
+    if !p.kw("BEGIN") {
         return None;
     }
     let mut stmts = Vec::new();
@@ -3287,7 +3427,25 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
     if p.i != p.t.len() || stmts.is_empty() {
         return None;
     }
-    let mut out = vec![blr::VERSION5, blr::BEGIN, blr::LABEL, 0, blr::BEGIN, blr::BEGIN];
+    let mut out = vec![blr::VERSION5, blr::BEGIN];
+    // TRIGGERS group ALL declares first, THEN all init assignments -
+    // unlike procedures, which interleave declare/init per variable
+    // (both probed; read the bytes, not the symmetry)
+    for (vi, (dsc, _)) in declares.iter().enumerate() {
+        out.push(blr::DECLARE);
+        out.extend_from_slice(&(vi as u16).to_le_bytes());
+        emit_dsc(&mut out, *dsc);
+    }
+    for (vi, (_, init)) in declares.iter().enumerate() {
+        out.push(blr::ASSIGNMENT);
+        match init {
+            Some(v) => emit_val(&mut out, v),
+            None => out.push(blr::NULL),
+        }
+        out.push(blr::VARIABLE);
+        out.extend_from_slice(&(vi as u16).to_le_bytes());
+    }
+    out.extend_from_slice(&[blr::LABEL, 0, blr::BEGIN, blr::BEGIN]);
     for st in &stmts {
         emit_trig_stmt(&mut out, st);
     }
@@ -4217,6 +4375,68 @@ mod tests {
             "CREATE TRIGGER QV_D FOR T BEFORE INSERT AS BEGIN UPDATE U2 SET UA = 1, UID = 2 WHERE U2.ID = 3; END",
             "05021100020207D9010443014A02553203472F170302494415080003000000FF0A030202011508000100000017020255410115080002000000170203554944FFFFFFFF4C",
         );
+    }
+
+    #[test]
+    fn compiles_slice_thirteen_psql_byte_for_byte() {
+        // DECLARE: the declares sit between the outer begin and
+        // label 0; a bare name resolves to the variable; assignment
+        // targets blr_variable
+        pin_trig(
+            "CREATE TRIGGER QW_A FOR T BEFORE INSERT AS DECLARE V1 INTEGER; BEGIN V1 = 5; NEW.A = V1; END",
+            "05020300000800012D1A00001100020201150800050000001A0000011A000017010141FFFFFF4C",
+        );
+        // an initialiser REPLACES the null-init
+        pin_trig(
+            "CREATE TRIGGER QW_B FOR T BEFORE INSERT AS DECLARE V1 INTEGER = 0; BEGIN NEW.A = V1; END",
+            "0502030000080001150800000000001A000011000202011A000017010141FFFFFF4C",
+        );
+        // with several: TRIGGERS group ALL declares first, THEN the
+        // inits - unlike procedures, which interleave (both probed)
+        pin_trig(
+            "CREATE TRIGGER QX_C FOR T BEFORE INSERT AS DECLARE VARIABLE V1 INTEGER; DECLARE V2 SMALLINT = 1; BEGIN WHILE (V2 < 3) DO BEGIN V1 = V2; V2 = V2 + 1; END NEW.A = V1; END",
+            "050203000008000301000700012D1A000001150800010000001A0100110002021101090208331A0100150800030000000202011A01001A000001221A0100150800010000001A0100FFFF1201FF011A000017010141FFFFFF4C",
+        );
+        // WHILE: blr_label N, blr_loop, begin, blr_if(cond, body,
+        // blr_leave N), end - labels number in ENCOUNTER order after
+        // the wrapper's 0
+        pin_trig(
+            "CREATE TRIGGER QW_C FOR T BEFORE INSERT AS DECLARE V1 INTEGER; BEGIN V1 = 0; WHILE (V1 < 5) DO V1 = V1 + 1; NEW.A = V1; END",
+            "05020300000800012D1A00001100020201150800000000001A00001101090208331A00001508000500000001221A0000150800010000001A00001201FF011A000017010141FFFFFF4C",
+        );
+        // nested WHILEs: outer label 1, inner label 2, leaves match
+        pin_trig(
+            "CREATE TRIGGER QX_D FOR T BEFORE INSERT AS DECLARE V1 INTEGER = 0; BEGIN WHILE (V1 < 3) DO WHILE (V1 < 2) DO V1 = V1 + 1; END",
+            "0502030000080001150800000000001A0000110002021101090208331A0000150800030000001102090208331A00001508000200000001221A0000150800010000001A00001202FF1201FFFFFFFF4C",
+        );
+        // INSERTING/UPDATING/DELETING: eql(blr_internal_info(6),
+        // 1/2/3); the multi-event header still leaves no trace
+        pin_trig(
+            "CREATE TRIGGER QW_D FOR T BEFORE INSERT OR UPDATE AS BEGIN IF (INSERTING) THEN NEW.A = 1; ELSE NEW.A = 2; END",
+            "050211000202082FB11508000600000015080001000000011508000100000017010141011508000200000017010141FFFFFF4C",
+        );
+        pin_trig(
+            "CREATE TRIGGER QX_A FOR T BEFORE INSERT OR UPDATE OR DELETE AS BEGIN IF (UPDATING) THEN NEW.A = 2; IF (DELETING) THEN NEW.A = 3; END",
+            "050211000202082FB11508000600000015080002000000011508000200000017010141FF082FB11508000600000015080003000000011508000300000017010141FFFFFFFF4C",
+        );
+        // NOT INSERTING folds to neq - the inverse-comparison law
+        // reaches the trigger predicates
+        pin_trig(
+            "CREATE TRIGGER QX_B FOR T BEFORE INSERT AS BEGIN IF (NOT INSERTING) THEN NEW.A = 0; END",
+            "0502110002020830B11508000600000015080001000000011508000000000017010141FFFFFFFF4C",
+        );
+    }
+
+    #[test]
+    fn psql_refusals() {
+        for sql in [
+            // an assignment to an undeclared name is not a variable
+            "CREATE TRIGGER X FOR T BEFORE INSERT AS DECLARE V1 INTEGER; BEGIN V2 = 5; END",
+            // bare LEAVE/loop control: unconverted
+            "CREATE TRIGGER X FOR T BEFORE INSERT AS BEGIN WHILE (1 = 1) DO LEAVE; END",
+        ] {
+            assert!(compile_trigger(sql).is_none(), "{sql} was compiled");
+        }
     }
 
     #[test]
