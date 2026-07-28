@@ -8,9 +8,11 @@ fn main() {
         eprintln!("usage: fcdsql <select statement>");
         std::process::exit(2);
     }
-    let is_proc = sql.trim_start().to_uppercase().starts_with("CREATE PROCEDURE");
-    let compiled = if is_proc {
+    let upper = sql.trim_start().to_uppercase();
+    let compiled = if upper.starts_with("CREATE PROCEDURE") {
         fire_crab_dsql::compile_procedure_hex(&sql)
+    } else if upper.starts_with("CREATE TRIGGER") {
+        fire_crab_dsql::compile_trigger_hex(&sql)
     } else {
         fire_crab_dsql::compile_view_select_hex(&sql)
     };

@@ -13,6 +13,33 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 11: the third oracle — triggers
+
+### Converted
+- **Oracle number three: `RDB$TRIGGER_BLR`.** A trigger body is
+  compiled by the same DSQL and stored verbatim — with the leanest
+  wrapper of the three oracles: blr_begin, blr_label 0, a DOUBLE
+  blr_begin holding the statements, three ends, eoc. The HEADER
+  (table, BEFORE/AFTER, event, POSITION) leaves NO trace — catalog
+  data, like a view's select list.
+- **OLD is CONTEXT 0, NEW is CONTEXT 1** — modelled as two
+  pseudo-streams, so qualified fields resolve through the ordinary
+  path and bare names refuse (ambiguous between the two records).
+- **Statements**: `NEW.col = <value>;` is blr_assignment(value,
+  field); `IF (cond) THEN stmt [ELSE stmt]` is blr_if — with a bare
+  blr_end byte in a MISSING else slot (probed); a nested BEGIN..END
+  block is a DOUBLE blr_begin (probed); statements concatenate. The
+  whole converted expression surface rides on trigger fields — the
+  battery runs UPPER, SUBSTRING, CHAR_LENGTH, a cast-wrapped CASE
+  and IN lists against OLD/NEW columns.
+
+### Guarded
+- OLD targets (read-only in the engine), bare column names, empty
+  bodies, database-level triggers (ON CONNECT — a different
+  wrapper). New gate: `qa/dsql-trig-blr.sh` — 14 checks, all
+  byte-identical on the first run; 158 unit byte-pins across three
+  oracles.
+
 ## 2026-07-28 — fire-crab-dsql slice 10: SELECT INTO, FIRST/SKIP, DISTINCT aggregates
 
 ### Converted

@@ -4508,6 +4508,30 @@ distinctness cannot change a minimum. Two prior refusals became
 features (COUNT(DISTINCT ...) and the bare SELECT INTO body): flips
 seven and eight.
 
+### SQL → BLR, oracle number three (`qa/dsql-trig-blr.sh`, 14 checks)
+
+Slice 11 opened the trigger oracle: RDB$TRIGGER_BLR stores a compiled
+trigger body verbatim, and its wrapper is the leanest of the three -
+blr_begin, blr_label 0, a DOUBLE blr_begin holding the statements,
+three ends, eoc. The header (table, BEFORE/AFTER, the event,
+POSITION) leaves NO trace: catalog data, like a view's select list -
+probed by compiling POSITION 3 and plain variants to identical
+bytes. OLD is CONTEXT 0 and NEW is CONTEXT 1; fire-crab models them
+as two pseudo-streams named OLD and NEW, so qualified fields resolve
+through the ordinary context machinery and bare names refuse
+(ambiguous between the two records). `NEW.col = <value>;` compiles
+to blr_assignment(value, field); IF (cond) THEN ... [ELSE ...] to
+blr_if - whose MISSING else slot holds a bare blr_end byte - and a
+nested BEGIN..END block to a DOUBLE blr_begin, one of those
+read-the-bytes discoveries. The whole converted expression surface
+rides on trigger fields: the battery runs UPPER, SUBSTRING,
+CHAR_LENGTH, a cast-wrapped CASE and IN lists against OLD/NEW
+columns, plus compound conditions and an IF THEN BEGIN..END block.
+All 14 checks were byte-identical on the gate's first run. Refusals:
+OLD targets (the engine holds them read-only), bare column names,
+empty bodies, database-level triggers (ON CONNECT - a different
+wrapper).
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
@@ -5139,6 +5163,7 @@ NODE_PATH="$PWD/node_modules" \
 FCDSQL=/path/to/fire-crab/target/release/fcdsql ISQL=/opt/firebird/bin/isql \
     bash /path/to/fire-crab/qa/dsql-view-blr.sh
     bash /path/to/fire-crab/qa/dsql-proc-blr.sh
+    bash /path/to/fire-crab/qa/dsql-trig-blr.sh
 ```
 
 The scratch databases are produced by running the companion paper's hands-on

@@ -247,6 +247,9 @@ mod blr {
     pub const AGG_COUNT_DISTINCT: u8 = 0x5E;
     pub const AGG_TOTAL_DISTINCT: u8 = 0x5F;
     pub const AGG_AVERAGE_DISTINCT: u8 = 0x60;
+    /// blr_if: condition, then-statement, else-statement - a MISSING
+    /// else is a bare blr_end byte in the else slot (probed)
+    pub const IF: u8 = 0x08;
     pub const EQL: u8 = 0x2F;
     pub const NEQ: u8 = 0x30;
     pub const GTR: u8 = 0x31;
@@ -1657,6 +1660,11 @@ fn is_keyword(w: &str) -> bool {
             | "BEGIN"
             | "GROUP"
             | "HAVING"
+            | "TRIGGER"
+            | "BEFORE"
+            | "AFTER"
+            | "POSITION"
+            | "IF"
     )
 }
 
@@ -2852,6 +2860,210 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// A trigger-body statement.
+enum TrigStmt {
+    /// `NEW.col = <value>;` - blr_assignment(value, field). Only NEW
+    /// fields are writable (the engine rejects OLD targets, and NEW
+    /// in AFTER triggers - catalog-time errors, not BLR shapes)
+    Assign(Val, Val),
+    /// IF (<cond>) THEN <stmt> [ELSE <stmt>]
+    If(Bool, Box<TrigStmt>, Option<Box<TrigStmt>>),
+    /// BEGIN ... END - compiles as a DOUBLE blr_begin (probed)
+    Block(Vec<TrigStmt>),
+}
+
+fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
+    match st {
+        TrigStmt::Assign(src, target) => {
+            out.push(blr::ASSIGNMENT);
+            emit_val(out, src);
+            emit_val(out, target);
+        }
+        TrigStmt::If(cond, then, els) => {
+            out.push(blr::IF);
+            emit_bool(out, cond);
+            emit_trig_stmt(out, then);
+            match els {
+                Some(e) => emit_trig_stmt(out, e),
+                // a missing ELSE is a bare blr_end in the else slot
+                None => out.push(blr::END),
+            }
+        }
+        TrigStmt::Block(stmts) => {
+            out.push(blr::BEGIN);
+            out.push(blr::BEGIN);
+            for st in stmts {
+                emit_trig_stmt(out, st);
+            }
+            out.push(blr::END);
+            out.push(blr::END);
+        }
+    }
+}
+
+impl<'a> P<'a> {
+    /// one trigger-body statement; self.i past any leading keyword
+    fn trig_stmt(&mut self) -> Option<TrigStmt> {
+        if self.kw("BEGIN") {
+            let mut stmts = Vec::new();
+            while !self.kw("END") {
+                stmts.push(self.trig_stmt()?);
+            }
+            // an optional ; after END
+            if matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                self.i += 1;
+            }
+            return Some(TrigStmt::Block(stmts));
+        }
+        if self.kw("IF") {
+            if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                return None;
+            }
+            self.i += 1;
+            let cond = self.bool_or()?;
+            if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                return None;
+            }
+            self.i += 1;
+            if !self.kw("THEN") {
+                return None;
+            }
+            let then = Box::new(self.trig_stmt()?);
+            let els = if self.kw("ELSE") {
+                Some(Box::new(self.trig_stmt()?))
+            } else {
+                None
+            };
+            return Some(TrigStmt::If(cond, then, els));
+        }
+        // NEW.col = <value>;
+        let Some(Tok::Ident(q)) = self.t.get(self.i) else {
+            return None;
+        };
+        if q != "NEW" {
+            return None; // OLD targets are read-only in the engine
+        }
+        self.i += 1;
+        if !matches!(self.t.get(self.i), Some(Tok::Dot)) {
+            return None;
+        }
+        self.i += 1;
+        let Some(Tok::Ident(col)) = self.t.get(self.i) else {
+            return None;
+        };
+        let col = col.clone();
+        self.i += 1;
+        let target = self.field(Some("NEW"), &col)?;
+        if !matches!(self.t.get(self.i), Some(Tok::Cmp(CmpOp::Eql))) {
+            return None;
+        }
+        self.i += 1;
+        let src = self.val()?;
+        if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+            return None;
+        }
+        self.i += 1;
+        Some(TrigStmt::Assign(src, target))
+    }
+}
+
+/// Compile a CREATE TRIGGER to the BLR the engine stores in
+/// `RDB$TRIGGER_BLR` - oracle number THREE, and the leanest wrapper
+/// of all (probed): blr_begin, blr_label 0, then a DOUBLE blr_begin
+/// holding the statements, three blr_ends, blr_eoc. OLD is CONTEXT 0
+/// and NEW is CONTEXT 1 - modelled as two pseudo-streams, so
+/// qualified fields resolve through the ordinary path and bare names
+/// refuse. The trigger HEADER (table, BEFORE/AFTER, INSERT/UPDATE/
+/// DELETE, POSITION) leaves NO trace in the BLR - it is catalog data,
+/// like a view's select list.
+///
+///   CREATE TRIGGER <name> FOR <table>
+///     BEFORE|AFTER INSERT|UPDATE|DELETE [POSITION <n>] AS
+///   BEGIN <statements> END
+pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
+    let toks = lex(sql.trim().trim_end_matches(';'))?;
+    let mut p = P {
+        t: &toks,
+        i: 0,
+        streams: vec![
+            Stream {
+                name: "OLD".to_string(),
+                alias: None,
+                derived: None,
+            },
+            Stream {
+                name: "NEW".to_string(),
+                alias: None,
+                derived: None,
+            },
+        ],
+        base: 0,
+        outer: Some(2),
+        sub: None,
+        agg_map: Vec::new(),
+        agg_mode: false,
+        in_params: Vec::new(),
+    };
+    if !(p.kw("CREATE") && p.kw("TRIGGER")) {
+        return None;
+    }
+    match p.t.get(p.i)? {
+        Tok::Ident(w) if !is_keyword(w) => p.i += 1,
+        _ => return None,
+    }
+    if !p.kw("FOR") {
+        return None;
+    }
+    match p.t.get(p.i)? {
+        Tok::Ident(w) if !is_keyword(w) => p.i += 1,
+        _ => return None,
+    }
+    if !(p.kw("BEFORE") || p.kw("AFTER")) {
+        return None;
+    }
+    match p.t.get(p.i)? {
+        Tok::Ident(w) if matches!(w.as_str(), "INSERT" | "UPDATE" | "DELETE") => {
+            p.i += 1
+        }
+        _ => return None,
+    }
+    if p.kw("POSITION") {
+        let Some(Tok::Int(_)) = p.t.get(p.i) else {
+            return None;
+        };
+        p.i += 1;
+    }
+    if !(p.kw("AS") && p.kw("BEGIN")) {
+        return None;
+    }
+    let mut stmts = Vec::new();
+    while !p.kw("END") {
+        stmts.push(p.trig_stmt()?);
+    }
+    if p.i != p.t.len() || stmts.is_empty() {
+        return None;
+    }
+    let mut out = vec![blr::VERSION5, blr::BEGIN, blr::LABEL, 0, blr::BEGIN, blr::BEGIN];
+    for st in &stmts {
+        emit_trig_stmt(&mut out, st);
+    }
+    out.push(blr::END);
+    out.push(blr::END);
+    out.push(blr::END);
+    out.push(blr::EOC);
+    Some(out)
+}
+
+/// `compile_trigger` as uppercase hex.
+pub fn compile_trigger_hex(sql: &str) -> Option<String> {
+    Some(
+        compile_trigger(sql)?
+            .iter()
+            .map(|b| format!("{:02X}", b))
+            .collect(),
+    )
+}
+
 /// `compile_procedure` as uppercase hex.
 pub fn compile_procedure_hex(sql: &str) -> Option<String> {
     Some(
@@ -3657,6 +3869,79 @@ mod tests {
             "CREATE PROCEDURE QF3 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT MIN(DISTINCT A) FROM T INTO :R1 DO SUSPEND; END",
             "050204010300080007000700020300000800012D1A00009B1100020211010743014F0143014A015400FF4E004D010000005517000141FF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
         );
+    }
+
+    /// every expected string read back from RDB$TRIGGER_BLR - the
+    /// THIRD oracle, and the leanest wrapper of all
+    fn pin_trig(sql: &str, want_hex: &str) {
+        assert_eq!(compile_trigger_hex(sql).as_deref(), Some(want_hex), "{sql}");
+    }
+
+    #[test]
+    fn compiles_slice_eleven_triggers_byte_for_byte() {
+        // the wrapper: begin, label 0, DOUBLE begin, statements,
+        // three ends, eoc; the header (table, BEFORE/AFTER, event,
+        // POSITION) leaves NO trace - catalog data
+        pin_trig(
+            "CREATE TRIGGER QT_A FOR T BEFORE INSERT AS BEGIN NEW.A = 5; END",
+            "050211000202011508000500000017010141FFFFFF4C",
+        );
+        // OLD is CONTEXT 0, NEW is CONTEXT 1
+        pin_trig(
+            "CREATE TRIGGER QT_B FOR T BEFORE UPDATE AS BEGIN NEW.A = OLD.A + 1; END",
+            "0502110002020122170001411508000100000017010141FFFFFF4C",
+        );
+        // IF: condition, then-statement, and a bare blr_end in the
+        // MISSING else slot
+        pin_trig(
+            "CREATE TRIGGER QT_C FOR T BEFORE INSERT AS BEGIN IF (NEW.A IS NULL) THEN NEW.A = 0; END",
+            "050211000202083D17010141011508000000000017010141FFFFFFFF4C",
+        );
+        // a present ELSE fills the slot instead
+        pin_trig(
+            "CREATE TRIGGER QT_D FOR T BEFORE UPDATE AS BEGIN IF (NEW.A > OLD.A) THEN NEW.S = 'up'; ELSE NEW.S = 'down'; END",
+            "0502110002020831170101411700014101150F0000020075701701015301150F00000400646F776E17010153FFFFFF4C",
+        );
+        // statements concatenate inside the double begin
+        pin_trig(
+            "CREATE TRIGGER QT_E FOR T BEFORE INSERT AS BEGIN NEW.A = 1; NEW.S = 'x'; END",
+            "05021100020201150800010000001701014101150F000001007817010153FFFFFF4C",
+        );
+        // a nested BEGIN..END block is a DOUBLE blr_begin (probed)
+        pin_trig(
+            "CREATE TRIGGER QT_F FOR T BEFORE INSERT AS BEGIN IF (NEW.A IS NULL) THEN BEGIN NEW.A = 0; NEW.S = 'def'; END END",
+            "050211000202083D17010141020201150800000000001701014101150F0000030064656617010153FFFFFFFFFFFF4C",
+        );
+        // POSITION leaves no trace either
+        pin_trig(
+            "CREATE TRIGGER QT_G FOR T BEFORE UPDATE POSITION 5 AS BEGIN IF (OLD.S = NEW.S) THEN NEW.A = 9; END",
+            "050211000202082F1700015317010153011508000900000017010141FFFFFFFF4C",
+        );
+        // the converted expression surface rides on trigger fields
+        pin_trig(
+            "CREATE TRIGGER QT_H FOR T BEFORE INSERT AS BEGIN NEW.S = UPPER(NEW.S); END",
+            "05021100020201671701015317010153FFFFFF4C",
+        );
+        pin_trig(
+            "CREATE TRIGGER QT_I FOR T BEFORE INSERT AS BEGIN IF (NEW.A > 0 AND NEW.S IS NOT NULL) THEN NEW.A = NEW.A * 2; ELSE NEW.A = 0; END",
+            "050211000202083A3117010141150800000000003B3D170101530124170101411508000200000017010141011508000000000017010141FFFFFF4C",
+        );
+    }
+
+    #[test]
+    fn trigger_refusals() {
+        for sql in [
+            // OLD targets are read-only in the engine
+            "CREATE TRIGGER X FOR T BEFORE INSERT AS BEGIN OLD.A = 5; END",
+            // bare column names are ambiguous between OLD and NEW
+            "CREATE TRIGGER X FOR T BEFORE INSERT AS BEGIN A = 5; END",
+            // an empty body stores nothing worth comparing
+            "CREATE TRIGGER X FOR T BEFORE INSERT AS BEGIN END",
+            // database-level triggers: a different wrapper, unprobed
+            "CREATE TRIGGER X FOR T ON CONNECT AS BEGIN NEW.A = 1; END",
+        ] {
+            assert!(compile_trigger(sql).is_none(), "{sql} was compiled");
+        }
     }
 
     #[test]

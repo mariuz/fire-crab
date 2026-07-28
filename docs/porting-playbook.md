@@ -307,6 +307,12 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # the THIRD oracle (triggers) is the leanest: record contexts
+    # (OLD/NEW) are just STREAMS by another name - model them as
+    # pseudo-streams and the whole field machinery carries over; the
+    # trigger header compiles to NOTHING; a missing ELSE is a bare
+    # end-marker byte in the else slot; a nested block DOUBLES the
+    # begin - read the bytes, not the grammar
     # a singular select is the SAME loop verb over a singular-wrapped
     # rse - and the row-send is NOT part of the loop: SUSPEND is its
     # own statement, sibling to the for; probe what a missing SUSPEND
