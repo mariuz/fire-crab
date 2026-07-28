@@ -221,6 +221,20 @@ mod blr {
     pub const SORT: u8 = 0x46;
     pub const ASCENDING: u8 = 0x48;
     pub const DESCENDING: u8 = 0x49;
+    /// the aggregate STREAM: its own context byte, a source rse,
+    /// blr_group_by (count byte + key values - present even with 0
+    /// keys), and a blr_map whose entries are the group keys and the
+    /// aggregate functions in SELECT-LIST order; HAVING is the outer
+    /// rse's boolean over blr_fid refs, ORDER BY its sort (probed)
+    pub const AGGREGATE: u8 = 0x4F;
+    pub const GROUP_BY: u8 = 0x4E;
+    pub const AGG_COUNT: u8 = 0x53;
+    pub const AGG_MAX: u8 = 0x54;
+    pub const AGG_MIN: u8 = 0x55;
+    pub const AGG_TOTAL: u8 = 0x56;
+    pub const AGG_AVERAGE: u8 = 0x57;
+    /// COUNT(<value>) - counts non-null values
+    pub const AGG_COUNT2: u8 = 0x5D;
     pub const EQL: u8 = 0x2F;
     pub const NEQ: u8 = 0x30;
     pub const GTR: u8 = 0x31;
@@ -271,6 +285,9 @@ enum Val {
     Decode(Box<Val>, Vec<Val>, Vec<Val>),
     /// a scalar subselect: blr_via(blr_singular(rse), value, null)
     ScalarSub(Box<SubQ>),
+    /// blr_fid - a stream's own column by number; how HAVING, ORDER
+    /// BY and the DO body address an aggregate's output
+    Fid(u8, u16),
     /// blr_coalesce
     Coalesce(Vec<Val>),
 }
@@ -683,10 +700,26 @@ struct Derived {
     wher: Option<Bool>,
 }
 
+/// One slot of an aggregate's blr_map: a group-key value or an
+/// aggregate function (verb + optional operand).
+#[derive(Clone, Debug, PartialEq)]
+enum MapEntry {
+    Key(Val),
+    Agg(u8, Option<Val>),
+}
+
 struct P<'a> {
     t: &'a [Tok],
     i: usize,
     streams: Vec<Stream>,
+    /// the aggregate map under construction (procedure aggregate
+    /// mode); HAVING's aggregate calls dedup against it - a
+    /// structurally equal entry REUSES its slot (probed) - and new
+    /// ones append
+    agg_map: Vec<MapEntry>,
+    /// set while parsing HAVING: aggregate calls in func() resolve
+    /// to blr_fid slots against agg_map
+    agg_mode: bool,
     /// context of stream index 0: 1 in view BLR, 0 in procedure
     /// bodies (probed - the FOR SELECT stream is context 0)
     base: u8,
@@ -1108,6 +1141,14 @@ impl<'a> P<'a> {
     /// the built-in functions whose compiled BLR was probed; self.i
     /// sits ON the opening paren
     fn func(&mut self, name: &str) -> Option<Val> {
+        if self.agg_mode
+            && matches!(name, "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
+        {
+            // inside HAVING: an aggregate resolves to its map slot
+            let (verb, arg) = self.parse_agg(name)?;
+            let slot = self.agg_slot(verb, arg);
+            return Some(Val::Fid(1, slot));
+        }
         self.i += 1; // (
         let v = match name {
             "UPPER" => Val::Upper(Box::new(self.val()?)),
@@ -1372,6 +1413,42 @@ impl<'a> P<'a> {
         })
     }
 
+    /// `COUNT(*)`, `COUNT(v)`, `SUM(v)`, `AVG(v)`, `MIN(v)`,
+    /// `MAX(v)` - self.i ON the opening paren. DISTINCT inside an
+    /// aggregate is unprobed and refuses.
+    fn parse_agg(&mut self, name: &str) -> Option<(u8, Option<Val>)> {
+        self.i += 1; // (
+        let out = match name {
+            "COUNT" if matches!(self.t.get(self.i), Some(Tok::Star)) => {
+                self.i += 1;
+                (blr::AGG_COUNT, None)
+            }
+            "COUNT" => (blr::AGG_COUNT2, Some(self.val()?)),
+            "SUM" => (blr::AGG_TOTAL, Some(self.val()?)),
+            "AVG" => (blr::AGG_AVERAGE, Some(self.val()?)),
+            "MIN" => (blr::AGG_MIN, Some(self.val()?)),
+            "MAX" => (blr::AGG_MAX, Some(self.val()?)),
+            _ => return None,
+        };
+        if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+            return None;
+        }
+        self.i += 1;
+        Some(out)
+    }
+
+    /// dedup-or-append an aggregate into the map; the slot index
+    /// becomes a blr_fid on the aggregate's context (probed: HAVING
+    /// COUNT(*) beside SELECT COUNT(*) REUSES slot 1)
+    fn agg_slot(&mut self, verb: u8, arg: Option<Val>) -> u16 {
+        let entry = MapEntry::Agg(verb, arg);
+        if let Some(idx) = self.agg_map.iter().position(|e| *e == entry) {
+            return idx as u16;
+        }
+        self.agg_map.push(entry);
+        (self.agg_map.len() - 1) as u16
+    }
+
     fn bool_or(&mut self) -> Option<Bool> {
         let mut left = self.bool_and()?;
         while self.kw("OR") {
@@ -1544,6 +1621,8 @@ fn is_keyword(w: &str) -> bool {
             | "PROCEDURE"
             | "RETURNS"
             | "BEGIN"
+            | "GROUP"
+            | "HAVING"
     )
 }
 
@@ -1653,6 +1732,11 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
             for v in vs {
                 emit_val(out, v);
             }
+        }
+        Val::Fid(ctx, id) => {
+            out.push(blr::FID);
+            out.push(*ctx);
+            out.extend_from_slice(&id.to_le_bytes());
         }
         Val::ScalarSub(sub) => {
             out.push(blr::VIA);
@@ -1836,6 +1920,8 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
         base: 1,
         outer: None,
         sub: None,
+        agg_map: Vec::new(),
+        agg_mode: false,
     };
     // a top-level UNION restructures the whole statement: the union
     // node takes context 1 BEFORE any branch stream, so it must be
@@ -2096,6 +2182,63 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Rewrite a HAVING/ORDER-BY value against the aggregate's map: a
+/// group-key column becomes blr_fid(1, its slot); fids (from
+/// aggregate calls) pass through; literals and expressions over them
+/// recurse. A column that is not a group key refuses.
+fn map_val_to_fid(map: &[MapEntry], v: &Val) -> Option<Val> {
+    match v {
+        Val::Field(..) => {
+            let idx = map
+                .iter()
+                .position(|e| matches!(e, MapEntry::Key(k) if k == v))?;
+            Some(Val::Fid(1, idx as u16))
+        }
+        Val::Fid(..) | Val::Int(_) | Val::Int64(_) | Val::Dec(..) | Val::Str(_) | Val::Null => {
+            Some(v.clone())
+        }
+        Val::Add(a, b) | Val::Sub(a, b) | Val::Mul(a, b) | Val::Div(a, b)
+        | Val::Concat(a, b) => {
+            let (a, b) = (map_val_to_fid(map, a)?, map_val_to_fid(map, b)?);
+            Some(match v {
+                Val::Add(..) => Val::Add(Box::new(a), Box::new(b)),
+                Val::Sub(..) => Val::Sub(Box::new(a), Box::new(b)),
+                Val::Mul(..) => Val::Mul(Box::new(a), Box::new(b)),
+                Val::Div(..) => Val::Div(Box::new(a), Box::new(b)),
+                _ => Val::Concat(Box::new(a), Box::new(b)),
+            })
+        }
+        Val::Neg(a) => Some(Val::Neg(Box::new(map_val_to_fid(map, a)?))),
+        // anything richer over an aggregate's output: unprobed
+        _ => None,
+    }
+}
+
+fn map_bool_to_fids(map: &[MapEntry], b: Bool) -> Option<Bool> {
+    Some(match b {
+        Bool::And(l, r) => Bool::And(
+            Box::new(map_bool_to_fids(map, *l)?),
+            Box::new(map_bool_to_fids(map, *r)?),
+        ),
+        Bool::Or(l, r) => Bool::Or(
+            Box::new(map_bool_to_fids(map, *l)?),
+            Box::new(map_bool_to_fids(map, *r)?),
+        ),
+        Bool::Not(inner) => Bool::Not(Box::new(map_bool_to_fids(map, *inner)?)),
+        Bool::Cmp(op, a, c) => {
+            Bool::Cmp(op, map_val_to_fid(map, &a)?, map_val_to_fid(map, &c)?)
+        }
+        Bool::Missing(v) => Bool::Missing(map_val_to_fid(map, &v)?),
+        Bool::Between(v, lo, hi) => Bool::Between(
+            map_val_to_fid(map, &v)?,
+            map_val_to_fid(map, &lo)?,
+            map_val_to_fid(map, &hi)?,
+        ),
+        // LIKE / IN / subqueries over aggregate output: unprobed
+        _ => return None,
+    })
+}
+
 /// Compile a single-FOR-SELECT procedure to the BLR the engine's DSQL
 /// stores in `RDB$PROCEDURE_BLR` - byte for byte. The accepted shape:
 ///
@@ -2128,6 +2271,8 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         base: 0,
         outer: None,
         sub: None,
+        agg_map: Vec::new(),
+        agg_mode: false,
     };
     if !(p.kw("CREATE") && p.kw("PROCEDURE")) {
         return None;
@@ -2167,10 +2312,25 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
     if !(p.kw("AS") && p.kw("BEGIN") && p.kw("FOR") && p.kw("SELECT")) {
         return None;
     }
-    let cols = p.select_list()??;
-    if cols.is_empty() || cols.len() != params.len() {
-        return None;
-    }
+    // two-phase select list: fields need the stream's context, so
+    // scan past the list to FROM, parse the stream, then come back
+    let list_start = p.i;
+    let mut depth = 0i32;
+    let list_end = loop {
+        match p.t.get(p.i)? {
+            Tok::LParen => {
+                depth += 1;
+                p.i += 1;
+            }
+            Tok::RParen => {
+                depth -= 1;
+                p.i += 1;
+            }
+            Tok::Ident(w) if w == "FROM" && depth == 0 => break p.i,
+            _ => p.i += 1,
+        }
+    };
+    p.i = list_end + 1;
     // one plain stream - context 0
     let st = p.stream_item()?;
     if st.alias.is_some() || st.derived.is_some() {
@@ -2178,26 +2338,71 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
     }
     p.streams.push(st);
     p.outer = Some(1);
-    let col_vals: Vec<Val> = {
-        let mut v = Vec::with_capacity(cols.len());
-        for (q, n) in &cols {
-            v.push(p.field(q.as_deref(), n)?);
+    let after_from = p.i;
+    // the select list: plain columns and/or aggregate calls
+    p.i = list_start;
+    enum Item {
+        Col(Val),
+        Agg(u8, Option<Val>),
+    }
+    let mut items: Vec<Item> = Vec::new();
+    loop {
+        match p.t.get(p.i)? {
+            Tok::Ident(w)
+                if matches!(w.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
+                    && matches!(p.t.get(p.i + 1), Some(Tok::LParen)) =>
+            {
+                let w = w.clone();
+                p.i += 1;
+                let (verb, arg) = p.parse_agg(&w)?;
+                items.push(Item::Agg(verb, arg));
+            }
+            Tok::Ident(w) if !is_keyword(w) => {
+                let a = w.clone();
+                p.i += 1;
+                let v = if matches!(p.t.get(p.i), Some(Tok::Dot)) {
+                    p.i += 1;
+                    let Some(Tok::Ident(b)) = p.t.get(p.i) else {
+                        return None;
+                    };
+                    let b = b.clone();
+                    p.i += 1;
+                    p.field(Some(&a), &b)?
+                } else {
+                    p.field(None, &a)?
+                };
+                items.push(Item::Col(v));
+            }
+            _ => return None,
         }
-        v
-    };
+        if p.i == list_end {
+            break;
+        }
+        if !matches!(p.t.get(p.i), Some(Tok::Comma)) {
+            return None;
+        }
+        p.i += 1;
+    }
+    p.i = after_from;
+    let cols_n = items.len();
+    if cols_n == 0 || cols_n != params.len() {
+        return None;
+    }
+    let has_aggs = items.iter().any(|it| matches!(it, Item::Agg(..)));
     let boolean = if p.kw("WHERE") {
         Some(p.bool_or()?)
     } else {
         None
     };
-    let mut sort: Vec<(bool, Val)> = Vec::new();
-    if p.kw("ORDER") {
+    // GROUP BY: keys in CLAUSE order (the map keeps select-list
+    // order - probed to differ)
+    let mut group_keys: Vec<Val> = Vec::new();
+    let grouped = p.kw("GROUP");
+    if grouped {
         if !p.kw("BY") {
             return None;
         }
         loop {
-            // sort keys: plain columns (ORDER BY <n> and expressions
-            // are unprobed)
             let key = match p.t.get(p.i)? {
                 Tok::Ident(w) if !is_keyword(w) => {
                     let a = w.clone();
@@ -2216,6 +2421,81 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
                 }
                 _ => return None,
             };
+            group_keys.push(key);
+            if matches!(p.t.get(p.i), Some(Tok::Comma)) {
+                p.i += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    let aggregate = has_aggs || grouped;
+    if aggregate {
+        // every plain select column must be a group key; a grouped
+        // query without aggregates is unprobed
+        if !has_aggs {
+            return None;
+        }
+        for it in &items {
+            if let Item::Col(v) = it {
+                if !group_keys.contains(v) {
+                    return None;
+                }
+            }
+        }
+        // the map: select-list order
+        p.agg_map = items
+            .iter()
+            .map(|it| match it {
+                Item::Col(v) => MapEntry::Key(v.clone()),
+                Item::Agg(verb, arg) => MapEntry::Agg(*verb, arg.clone()),
+            })
+            .collect();
+    }
+    // HAVING: a boolean over the aggregate's output - aggregates
+    // dedup into map slots, group-key columns become their slot's fid
+    let having = if p.kw("HAVING") {
+        if !aggregate {
+            return None;
+        }
+        p.agg_mode = true;
+        let b = p.bool_or()?;
+        p.agg_mode = false;
+        Some(map_bool_to_fids(&p.agg_map, b)?)
+    } else {
+        None
+    };
+    let mut sort: Vec<(bool, Val)> = Vec::new();
+    if p.kw("ORDER") {
+        if !p.kw("BY") {
+            return None;
+        }
+        loop {
+            // sort keys: plain columns (ORDER BY <n> and expressions
+            // are unprobed); over an aggregate they become fid slots
+            let key = match p.t.get(p.i)? {
+                Tok::Ident(w) if !is_keyword(w) => {
+                    let a = w.clone();
+                    p.i += 1;
+                    if matches!(p.t.get(p.i), Some(Tok::Dot)) {
+                        p.i += 1;
+                        let Some(Tok::Ident(b)) = p.t.get(p.i) else {
+                            return None;
+                        };
+                        let b = b.clone();
+                        p.i += 1;
+                        p.field(Some(&a), &b)?
+                    } else {
+                        p.field(None, &a)?
+                    }
+                }
+                _ => return None,
+            };
+            let key = if aggregate {
+                map_val_to_fid(&p.agg_map, &key)?
+            } else {
+                key
+            };
             let descending = if p.kw("DESC") {
                 true
             } else {
@@ -2230,6 +2510,18 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
             }
         }
     }
+    // the DO body's sources: plain fields, or the aggregate's fids
+    let col_vals: Vec<Val> = if aggregate {
+        (0..cols_n).map(|i| Val::Fid(1, i as u16)).collect()
+    } else {
+        items
+            .iter()
+            .map(|it| match it {
+                Item::Col(v) => Some(v.clone()),
+                Item::Agg(..) => None,
+            })
+            .collect::<Option<Vec<_>>>()?
+    };
     if !p.kw("INTO") {
         return None;
     }
@@ -2253,7 +2545,7 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
             break;
         }
     }
-    if into.len() != cols.len() {
+    if into.len() != cols_n {
         return None;
     }
     if !(p.kw("DO") && p.kw("SUSPEND")) {
@@ -2301,10 +2593,50 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
     out.push(blr::FOR);
     out.push(blr::RSE);
     out.push(1);
-    emit_stream(&mut out, &p.streams[0], 0);
-    if let Some(b) = &boolean {
-        out.push(blr::BOOLEAN);
-        emit_bool(&mut out, b);
+    if aggregate {
+        // the aggregate stream: its own context (1), the source rse
+        // (with the WHERE as ITS boolean), the group keys in clause
+        // order, the map in select-list order; HAVING and ORDER BY
+        // belong to the OUTER rse, over fids
+        out.push(blr::AGGREGATE);
+        out.push(1);
+        out.push(blr::RSE);
+        out.push(1);
+        emit_stream(&mut out, &p.streams[0], 0);
+        if let Some(b) = &boolean {
+            out.push(blr::BOOLEAN);
+            emit_bool(&mut out, b);
+        }
+        out.push(blr::END);
+        out.push(blr::GROUP_BY);
+        out.push(group_keys.len() as u8);
+        for k in &group_keys {
+            emit_val(&mut out, k);
+        }
+        out.push(blr::MAP);
+        out.extend_from_slice(&(p.agg_map.len() as u16).to_le_bytes());
+        for (fi, e) in p.agg_map.iter().enumerate() {
+            out.extend_from_slice(&(fi as u16).to_le_bytes());
+            match e {
+                MapEntry::Key(v) => emit_val(&mut out, v),
+                MapEntry::Agg(verb, arg) => {
+                    out.push(*verb);
+                    if let Some(a) = arg {
+                        emit_val(&mut out, a);
+                    }
+                }
+            }
+        }
+        if let Some(h) = &having {
+            out.push(blr::BOOLEAN);
+            emit_bool(&mut out, h);
+        }
+    } else {
+        emit_stream(&mut out, &p.streams[0], 0);
+        if let Some(b) = &boolean {
+            out.push(blr::BOOLEAN);
+            emit_bool(&mut out, b);
+        }
     }
     if !sort.is_empty() {
         out.push(blr::SORT);
@@ -3010,6 +3342,96 @@ mod tests {
             "CREATE PROCEDURE QP6 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT ID, A FROM T ORDER BY A DESC, ID ASC INTO :R1, :R2 DO SUSPEND; END",
             "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B1100020211010743014A01540046024917000141481700024944FF020117000249441A000001170001411A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
         );
+    }
+
+    #[test]
+    fn compiles_slice_eight_aggregates_byte_for_byte() {
+        // the aggregate is a STREAM: blr_aggregate with its own
+        // context (1) wrapping the source rse (ctx 0), blr_group_by
+        // (present even with ZERO keys), and a blr_map; the DO body
+        // reads the output through blr_fid(1, slot)
+        pin_proc(
+            "CREATE PROCEDURE QA1 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT COUNT(*) FROM T INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014F0143014A015400FF4E004D0100000053FF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // the aggregate verbs: total, min, average, count-of-values
+        pin_proc(
+            "CREATE PROCEDURE QA2 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT SUM(A) FROM T INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014F0143014A015400FF4E004D010000005617000141FF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE QA6 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT COUNT(A) FROM T INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014F0143014A015400FF4E004D010000005D17000141FF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE QA7 RETURNS (R1 NUMERIC(9,2)) AS BEGIN FOR SELECT AVG(A) FROM T INTO :R1 DO SUSPEND; END",
+            "05020401030008FE070007000203000008FE012D1A00009B1100020211010743014F0143014A015400FF4E004D010000005717000141FF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // the WHERE belongs to the SOURCE rse, inside the aggregate
+        pin_proc(
+            "CREATE PROCEDURE QA4 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT MIN(A) FROM T WHERE A > 0 INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014F0143014A01540047311700014115080000000000FF4E004D010000005517000141FF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // an aggregate over an EXPRESSION
+        pin_proc(
+            "CREATE PROCEDURE QB4 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT SUM(ID + 1) FROM T INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014F0143014A015400FF4E004D010000005622170002494415080001000000FF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // GROUP BY: keys in CLAUSE order, the map in SELECT-LIST
+        // order (probed to differ: GROUP BY S, A vs SELECT A, S)
+        pin_proc(
+            "CREATE PROCEDURE QA3 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT A, COUNT(*) FROM T GROUP BY A INTO :R1, :R2 DO SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B1100020211010743014F0143014A015400FF4E01170001414D0200000017000141010053FF0201180100001A000001180101001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE QB1 RETURNS (R1 INTEGER, R2 VARCHAR(10), R3 INTEGER) AS BEGIN FOR SELECT A, S, COUNT(*) FROM T GROUP BY S, A INTO :R1, :R2, :R3 DO SUSPEND; END",
+            "050204010700080007002600000A000700080007000700020300000800012D1A00000301002600000A00012D1A01000302000800012D1A02009B1100020211010743014F0143014A015400FF4E0217000153170001414D0300000017000141010017000153020053FF0201180100001A000001180101001A010001180102001A02000E0102011A0000290100000100011A0100290102000300011A020029010400050001150700010019010600FFFFFFFFFF0E0102011A0000290100000100011A0100290102000300011A020029010400050001150700000019010600FFFF4C",
+        );
+        // WHERE + GROUP BY: the boolean stays in the source rse
+        pin_proc(
+            "CREATE PROCEDURE QB5 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT A, SUM(ID) FROM T WHERE ID > 0 GROUP BY A INTO :R1, :R2 DO SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B1100020211010743014F0143014A0154004731170002494415080000000000FF4E01170001414D02000000170001410100561700024944FF0201180100001A000001180101001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        // HAVING is the OUTER rse's boolean over blr_fid slots: a
+        // fresh aggregate APPENDS a map slot...
+        pin_proc(
+            "CREATE PROCEDURE QA5 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT A, MAX(ID) FROM T GROUP BY A HAVING COUNT(*) > 1 INTO :R1, :R2 DO SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B1100020211010743014F0143014A015400FF4E01170001414D0300000017000141010054170002494402005347311801020015080001000000FF0201180100001A000001180101001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        // ...while a structurally EQUAL one REUSES the select-list's
+        // slot (probed: fid 1,1 - no third map entry)
+        pin_proc(
+            "CREATE PROCEDURE QB2 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT A, COUNT(*) FROM T GROUP BY A HAVING COUNT(*) > 1 INTO :R1, :R2 DO SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B1100020211010743014F0143014A015400FF4E01170001414D020000001700014101005347311801010015080001000000FF0201180100001A000001180101001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        // a group-key column in HAVING becomes ITS slot's fid
+        pin_proc(
+            "CREATE PROCEDURE QB3 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT A, COUNT(*) FROM T GROUP BY A HAVING A > 0 INTO :R1, :R2 DO SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B1100020211010743014F0143014A015400FF4E01170001414D020000001700014101005347311801000015080000000000FF0201180100001A000001180101001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        // ORDER BY over an aggregate sorts fids
+        pin_proc(
+            "CREATE PROCEDURE QA8 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT A, SUM(ID) FROM T GROUP BY A ORDER BY A DESC INTO :R1, :R2 DO SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B1100020211010743014F0143014A015400FF4E01170001414D0200000017000141010056170002494446014918010000FF0201180100001A000001180101001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+    }
+
+    #[test]
+    fn aggregate_refusals() {
+        for sql in [
+            // a plain column beside an aggregate NEEDS a GROUP BY
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT A, COUNT(*) FROM T INTO :R1, :R2 DO SUSPEND; END",
+            // GROUP BY without aggregates: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT A FROM T GROUP BY A INTO :R1 DO SUSPEND; END",
+            // a select column missing from GROUP BY
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT S, COUNT(*) FROM T GROUP BY A INTO :R1, :R2 DO SUSPEND; END",
+            // COUNT(DISTINCT ...): the distinct agg verbs are unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT COUNT(DISTINCT A) FROM T INTO :R1 DO SUSPEND; END",
+            // a non-grouped column in HAVING
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT A, COUNT(*) FROM T GROUP BY A HAVING S > 0 INTO :R1, :R2 DO SUSPEND; END",
+        ] {
+            assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
+        }
     }
 
     #[test]

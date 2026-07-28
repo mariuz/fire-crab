@@ -13,6 +13,37 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 8: aggregates and GROUP BY
+
+### Converted
+- **The aggregate is a STREAM**: `blr_aggregate` with its OWN context
+  (1) wrapping the source rse (ctx 0) — and the WHERE stays the
+  SOURCE rse's boolean, inside the aggregate. Then `blr_group_by`
+  (count byte + keys — present even with ZERO keys) and `blr_map`.
+- **The verbs**: agg_count (COUNT(*)), agg_count2 (COUNT(v) — counts
+  non-null values, a DIFFERENT verb), agg_max/min/total/average.
+  Arguments take full value expressions (`SUM(SALARY * 12)` in the
+  battery).
+- **Two order laws**: the group_by list follows the GROUP BY CLAUSE
+  order while the map follows the SELECT-LIST order — probed to
+  differ on one statement (`SELECT A, S ... GROUP BY S, A`).
+- **Everything downstream speaks blr_fid(1, slot)**: the DO body's
+  assignments, ORDER BY's sort keys, and HAVING — the OUTER rse's
+  boolean — where a group-key column becomes its slot's fid and an
+  aggregate call DEDUPS against the map: a structurally equal
+  aggregate REUSES its select-list slot (probed: HAVING COUNT(*)
+  beside SELECT COUNT(*) stores fid 1,1 — no third slot) while a
+  fresh one APPENDS (HAVING COUNT(*) beside SELECT MAX adds slot 2).
+
+### Guarded
+- A plain column beside an aggregate without GROUP BY, GROUP BY
+  without aggregates, select columns missing from GROUP BY,
+  `COUNT(DISTINCT ...)` (the distinct agg verbs), non-grouped columns
+  in HAVING, and LIKE/IN/subqueries over aggregate output refuse.
+  Gate: `qa/dsql-proc-blr.sh` grew to 29 checks (10 fresh aggregate
+  battery statements incl. a compound HAVING with AND); 134 unit
+  byte-pins.
+
 ## 2026-07-28 — fire-crab-dsql slice 7: the second oracle — procedures and ORDER BY
 
 ### Converted

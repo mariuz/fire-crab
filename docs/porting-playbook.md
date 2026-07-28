@@ -307,6 +307,14 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # aggregation RECASTS the query: the aggregate is a STREAM with
+    # its own context; the WHERE belongs to the SOURCE rse inside it,
+    # and everything after the aggregation (loop body, HAVING, ORDER
+    # BY) addresses OUTPUT SLOTS, not source fields - HAVING is just
+    # the outer boolean over slot refs; probe the TWO orders (group
+    # list = clause order, map = select order) and the slot DEDUP
+    # rule (an equal aggregate reuses its slot); count-star and
+    # count-of-values are DIFFERENT verbs
     # subquery predicates come in TWO shapes: existence (one verb +
     # one rse, the subquery WHERE as its boolean) and quantified (a
     # DOUBLE-nested rse: the outer rse's single stream IS the

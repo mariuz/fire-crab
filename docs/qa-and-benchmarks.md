@@ -4423,7 +4423,7 @@ expressions, and alias-less derived tables refuse. The slice-5
 refusal of scalar subselects became a feature; its gate slot flipped
 to a positive check, the fifth such flip in the project.
 
-### SQL → BLR, oracle number two (`qa/dsql-proc-blr.sh`, 17 checks)
+### SQL → BLR, oracle number two (`qa/dsql-proc-blr.sh`, 29 checks)
 
 Views cannot hold ORDER BY - but a procedure's `FOR SELECT ... DO
 SUSPEND` body can, and `RDB$PROCEDURE_BLR` stores ITS compiled BLR
@@ -4454,6 +4454,26 @@ context 0 - the battery runs UPPER/LIKE, CASE, IN-lists and
 arithmetic inside procedure bodies. Refusals: input parameters (a
 second message), subqueries in bodies, aliased FOR streams, ORDER BY
 positions, INTO mismatches, multi-statement bodies.
+
+Slice 8 brought the last big SELECT family through this oracle:
+AGGREGATES and GROUP BY. The compiled shape recasts the query: the
+aggregate is a STREAM - blr_aggregate with its OWN context wrapping
+the source rse, so the WHERE stays the SOURCE's boolean while
+everything downstream of the aggregation speaks blr_fid(agg_ctx,
+slot): the DO body's assignments, ORDER BY's keys, and HAVING, which
+is simply the OUTER rse's boolean over fids. The verb split matters:
+COUNT(*) is agg_count but COUNT(col) is agg_count2 - a different
+verb that counts non-null values. Two order laws were probed on one
+deliberately-crossed statement (SELECT A, S ... GROUP BY S, A): the
+group_by list follows the CLAUSE order, the map follows the
+SELECT-LIST order. And the map DEDUPS: HAVING COUNT(*) beside
+SELECT COUNT(*) reuses the select-list's slot (fid 1,1 - no third
+entry) while HAVING COUNT(*) beside SELECT MAX(ID) appends slot 2 -
+both pinned. Aggregate arguments take full value expressions
+(SUM(SALARY * 12) runs in the battery). Refusals hold the edge:
+COUNT(DISTINCT ...) (the distinct verbs are unprobed), plain columns
+beside aggregates without GROUP BY, GROUP BY without aggregates,
+non-grouped columns in HAVING.
 
 ## Benchmarks
 
