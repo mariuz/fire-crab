@@ -274,6 +274,10 @@ mod blr {
     pub const EXEC_PROC: u8 = 0x78;
     /// EXCEPTION <name>: blr_abort, 2, counted name (probed)
     pub const ABORT: u8 = 0x80;
+    /// the niladic context functions (probed in DEFAULT clauses)
+    pub const CURRENT_DATE: u8 = 0xA0;
+    pub const CURRENT_TIMESTAMP: u8 = 0xA1;
+    pub const CURRENT_TIME: u8 = 0xA2;
     pub const EQL: u8 = 0x2F;
     pub const NEQ: u8 = 0x30;
     pub const GTR: u8 = 0x31;
@@ -336,6 +340,11 @@ enum Val {
     /// blr_internal_info(literal 6) - the trigger-action code the
     /// INSERTING/UPDATING/DELETING predicates compare against
     TrigAction,
+    /// CURRENT_DATE / CURRENT_TIME / CURRENT_TIMESTAMP - one niladic
+    /// verb each (probed)
+    CurrentDate,
+    CurrentTime,
+    CurrentTimestamp,
     /// blr_coalesce
     Coalesce(Vec<Val>),
 }
@@ -1153,6 +1162,9 @@ impl<'a> P<'a> {
                 return self.case_tail();
             }
             Tok::Ident(x) if x == "NULL" => Val::Null,
+            Tok::Ident(x) if x == "CURRENT_DATE" => Val::CurrentDate,
+            Tok::Ident(x) if x == "CURRENT_TIME" => Val::CurrentTime,
+            Tok::Ident(x) if x == "CURRENT_TIMESTAMP" => Val::CurrentTimestamp,
             Tok::Colon => {
                 // `:name` - an input parameter (message 0) or, in a
                 // body, a local variable / output parameter
@@ -1755,6 +1767,8 @@ fn is_keyword(w: &str) -> bool {
             | "EXECUTE"
             | "EXCEPTION"
             | "EXIT"
+            | "DEFAULT"
+            | "COMPUTED"
     )
 }
 
@@ -1884,6 +1898,9 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
             out.push(blr::INTERNAL_INFO);
             emit_val(out, &Val::Int(6));
         }
+        Val::CurrentDate => out.push(blr::CURRENT_DATE),
+        Val::CurrentTime => out.push(blr::CURRENT_TIME),
+        Val::CurrentTimestamp => out.push(blr::CURRENT_TIMESTAMP),
         Val::ScalarSub(sub) => {
             out.push(blr::VIA);
             out.push(blr::SINGULAR);
@@ -3574,6 +3591,123 @@ impl<'a> P<'a> {
     }
 }
 
+/// Compile a column DEFAULT clause to the BLR the engine stores in
+/// `RDB$RELATION_FIELDS.RDB$DEFAULT_VALUE` - oracle number FOUR, and
+/// the smallest wrapper possible: blr_version5, the value, blr_eoc.
+/// The engine's own grammar restricts defaults to literals, NULL and
+/// the niladic context functions - anything else refuses here too.
+pub fn compile_default(sql: &str) -> Option<Vec<u8>> {
+    let toks = lex(sql.trim().trim_end_matches(';'))?;
+    let mut p = P {
+        t: &toks,
+        i: 0,
+        streams: Vec::new(),
+        base: 0,
+        outer: Some(0),
+        sub: None,
+        agg_map: Vec::new(),
+        agg_mode: false,
+        in_params: Vec::new(),
+        local_vars: Vec::new(),
+        next_label: 1,
+        proc: None,
+        agg_fid_ctx: 1,
+    };
+    if !p.kw("DEFAULT") {
+        return None;
+    }
+    let v = p.val()?;
+    if p.i != p.t.len() {
+        return None;
+    }
+    if !matches!(
+        v,
+        Val::Int(_)
+            | Val::Int64(_)
+            | Val::Dec(..)
+            | Val::Str(_)
+            | Val::Null
+            | Val::CurrentDate
+            | Val::CurrentTime
+            | Val::CurrentTimestamp
+    ) {
+        return None; // the engine's DEFAULT grammar is this narrow
+    }
+    let mut out = vec![blr::VERSION5];
+    emit_val(&mut out, &v);
+    out.push(blr::EOC);
+    Some(out)
+}
+
+/// `compile_default` as uppercase hex.
+pub fn compile_default_hex(sql: &str) -> Option<String> {
+    Some(
+        compile_default(sql)?
+            .iter()
+            .map(|b| format!("{:02X}", b))
+            .collect(),
+    )
+}
+
+/// Compile a COMPUTED BY clause to the BLR the engine stores in
+/// `RDB$FIELDS.RDB$COMPUTED_BLR`: blr_version5, the expression,
+/// blr_eoc - with the table's columns as bare fields at CONTEXT 0
+/// (probed). The whole converted expression surface rides inside
+/// (arithmetic, functions, cast-wrapped CASE).
+pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
+    let toks = lex(sql.trim().trim_end_matches(';'))?;
+    let mut p = P {
+        t: &toks,
+        i: 0,
+        // one anonymous stream: the table itself, context 0 - bare
+        // names bind to it, qualified names refuse
+        streams: vec![Stream {
+            name: String::new(),
+            alias: None,
+            derived: None,
+        }],
+        base: 0,
+        outer: Some(1),
+        sub: None,
+        agg_map: Vec::new(),
+        agg_mode: false,
+        in_params: Vec::new(),
+        local_vars: Vec::new(),
+        next_label: 1,
+        proc: None,
+        agg_fid_ctx: 1,
+    };
+    if !(p.kw("COMPUTED") && p.kw("BY")) {
+        return None;
+    }
+    if !matches!(p.t.get(p.i), Some(Tok::LParen)) {
+        return None;
+    }
+    p.i += 1;
+    let v = p.val()?;
+    if !matches!(p.t.get(p.i), Some(Tok::RParen)) {
+        return None;
+    }
+    p.i += 1;
+    if p.i != p.t.len() {
+        return None;
+    }
+    let mut out = vec![blr::VERSION5];
+    emit_val(&mut out, &v);
+    out.push(blr::EOC);
+    Some(out)
+}
+
+/// `compile_computed` as uppercase hex.
+pub fn compile_computed_hex(sql: &str) -> Option<String> {
+    Some(
+        compile_computed(sql)?
+            .iter()
+            .map(|b| format!("{:02X}", b))
+            .collect(),
+    )
+}
+
 /// Compile a CREATE TRIGGER to the BLR the engine stores in
 /// `RDB$TRIGGER_BLR` - oracle number THREE, and the leanest wrapper
 /// of all (probed): blr_begin, blr_label 0, then a DOUBLE blr_begin
@@ -4762,6 +4896,54 @@ mod tests {
             "CREATE TRIGGER QI_T FOR T BEFORE INSERT AS DECLARE V1 INTEGER; BEGIN FOR SELECT UA FROM U2 INTO :V1 DO NEW.A = V1; END",
             "05020300000800012D1A00001100020211010743014A02553202FF020117020255411A0000011A000017010141FFFFFFFF4C",
         );
+    }
+
+    /// oracle number FOUR: RDB$RELATION_FIELDS.RDB$DEFAULT_VALUE and
+    /// RDB$FIELDS.RDB$COMPUTED_BLR - the smallest wrappers of all
+    fn pin_default(sql: &str, want_hex: &str) {
+        assert_eq!(compile_default_hex(sql).as_deref(), Some(want_hex), "{sql}");
+    }
+    fn pin_computed(sql: &str, want_hex: &str) {
+        assert_eq!(compile_computed_hex(sql).as_deref(), Some(want_hex), "{sql}");
+    }
+
+    #[test]
+    fn compiles_slice_sixteen_field_blr_byte_for_byte() {
+        // a DEFAULT is blr_version5, the value, blr_eoc - nothing else
+        pin_default("DEFAULT 0", "05150800000000004C");
+        pin_default("DEFAULT 'none'", "05150F000004006E6F6E654C");
+        pin_default("DEFAULT NULL", "052D4C");
+        // the sign still folds into the literal
+        pin_default("DEFAULT -5", "05150800FBFFFFFF4C");
+        // the niladic context functions, one verb each
+        pin_default("DEFAULT CURRENT_DATE", "05A04C");
+        pin_default("DEFAULT CURRENT_TIME", "05A24C");
+        pin_default("DEFAULT CURRENT_TIMESTAMP", "05A14C");
+        // COMPUTED BY: the expression with the table's columns as
+        // bare fields at CONTEXT 0
+        pin_computed("COMPUTED BY (C1 + C6)", "0522170002433117000243364C");
+        pin_computed("COMPUTED BY (UPPER(C2))", "056717000243324C");
+        pin_computed(
+            "COMPUTED BY (C1 * 2 + 1)",
+            "052224170002433115080002000000150800010000004C",
+        );
+        // the whole expression surface rides inside - a cast-wrapped
+        // CASE, byte-identical to the probe
+        pin_computed(
+            "COMPUTED BY (CASE WHEN C3 > 0 THEN 1 ELSE 0 END)",
+            "05830800693117000243331508000000000015080001000000150800000000004C",
+        );
+    }
+
+    #[test]
+    fn field_blr_refusals() {
+        // the engine's DEFAULT grammar allows literals, NULL and the
+        // context functions - NOTHING else; qualified names in a
+        // computed refuse (the stream is anonymous)
+        for sql in ["DEFAULT 3 + 4", "DEFAULT A", "DEFAULT UPPER('x')"] {
+            assert!(compile_default(sql).is_none(), "{sql} was compiled");
+        }
+        assert!(compile_computed("COMPUTED BY (T.C1)").is_none());
     }
 
     #[test]

@@ -4604,6 +4604,27 @@ runs UPDATING OR DELETING and UPDATING AND v > 100). Multi-event
 headers leave no trace. Refused: assignments to undeclared names,
 bare LEAVE.
 
+### SQL → BLR, oracle number four (`qa/dsql-field-blr.sh`, 22 checks)
+
+Slice 16 found the fourth place the engine stores its compiler's
+output: COLUMN BLR. A DEFAULT clause lands verbatim in
+RDB$RELATION_FIELDS.RDB$DEFAULT_VALUE and a COMPUTED BY expression
+in RDB$FIELDS.RDB$COMPUTED_BLR - both wrapped in nothing but
+blr_version5 and blr_eoc, the smallest frames of the four oracles.
+Defaults mirror the engine's own grammar exactly: literals (with
+signs folding), NULL, and the niladic context functions -
+CURRENT_DATE, CURRENT_TIME, CURRENT_TIMESTAMP, one verb each -
+because DEFAULT 3 + 4 is a syntax error IN THE ENGINE, fcdsql
+refuses it too. COMPUTED BY is the opposite: the whole converted
+expression surface rides inside, with the table's columns as bare
+fields at an anonymous CONTEXT 0 - the battery runs arithmetic,
+UPPER, concatenation, COALESCE, CAST, SUBSTRING and a cast-wrapped
+CASE. One refusal marks the catalog-free line sharply: a CASE with
+FIELD branches (CASE WHEN A > B THEN A ELSE B END) compiles fine in
+the engine - which KNOWS the columns' types for the cast wrapper -
+but a catalog-free compiler cannot know the descriptor, and refuses
+rather than guess.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

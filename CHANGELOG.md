@@ -13,6 +13,34 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 16: the fourth oracle — column BLR
+
+### Converted
+- **Oracle number four: column BLR.** A DEFAULT clause is stored
+  verbatim in `RDB$RELATION_FIELDS.RDB$DEFAULT_VALUE`, a COMPUTED BY
+  expression in `RDB$FIELDS.RDB$COMPUTED_BLR` — both with the
+  SMALLEST wrapper of the four oracles: `blr_version5, the value,
+  blr_eoc`.
+- **Defaults are as narrow as the engine's own grammar**: literals
+  (signs folding), NULL, and the niladic context functions —
+  CURRENT_DATE 0xA0, CURRENT_TIME 0xA2, CURRENT_TIMESTAMP 0xA1, one
+  verb each (`DEFAULT 3 + 4` is an ENGINE syntax error, so fcdsql
+  refuses it too).
+- **COMPUTED BY takes the whole converted expression surface** with
+  the table's columns as bare fields at CONTEXT 0 — arithmetic,
+  functions, concatenation, COALESCE, CAST, SUBSTRING, a
+  cast-wrapped CASE — the stream is anonymous, so qualified names
+  refuse.
+- The context functions are Val variants now, usable everywhere the
+  expression surface reaches.
+
+### Guarded
+- Non-grammar defaults, qualified names in computed expressions, and
+  a CASE with FIELD branches in a computed — the engine compiles it,
+  but its cast descriptor needs the CATALOG's column types, so the
+  catalog-free line holds. New gate: `qa/dsql-field-blr.sh` — 22
+  checks; 200 unit byte-pins across four oracles.
+
 ## 2026-07-28 — fire-crab-dsql slice 15: calls, exceptions, exit
 
 ### Converted

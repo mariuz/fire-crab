@@ -13,6 +13,10 @@ fn main() {
         fire_crab_dsql::compile_procedure_hex(&sql)
     } else if upper.starts_with("CREATE TRIGGER") {
         fire_crab_dsql::compile_trigger_hex(&sql)
+    } else if upper.starts_with("DEFAULT") {
+        fire_crab_dsql::compile_default_hex(&sql)
+    } else if upper.starts_with("COMPUTED") {
+        fire_crab_dsql::compile_computed_hex(&sql)
     } else {
         fire_crab_dsql::compile_view_select_hex(&sql)
     };

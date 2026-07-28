@@ -307,6 +307,12 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # keep hunting oracles: the reference system stores compiled
+    # output in MORE places than the obvious ones (views, procedures,
+    # triggers, COLUMN defaults and computed expressions) - each new
+    # store is free differential coverage; and when the reference
+    # grammar is NARROW (defaults), mirror the narrowness - accepting
+    # more than the reference is as wrong as accepting less
     # calls are counted lists (name, in-count+values, out-count+
     # targets); EXIT is just leave-the-outermost-label - control
     # verbs COMPOSE from what you already have; and when a refusal
