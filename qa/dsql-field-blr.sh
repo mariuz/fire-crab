@@ -108,6 +108,75 @@ check_c "COMPUTED BY (CAST(A AS BIGINT))"
 check_c "COMPUTED BY (SUBSTRING(S FROM 1 FOR 3))"
 check_c "COMPUTED BY (CHAR_LENGTH(S) + A)"
 
+# --- slice 17: domain defaults, expression indexes, CHECKs -------------
+check_dom() { # <type> <default clause> - domain defaults live on RDB$FIELDS
+    n=$((n + 1))
+    dom="GDOM$n"
+    got=$("$FCDSQL" "$2")
+    "$ISQL" -q -b -user "$U" -pas "$P" "$DB" >/dev/null 2>&1 <<SQL
+CREATE DOMAIN $dom AS $1 $2;
+COMMIT;
+SQL
+    want=$("$ISQL" -q -b -user "$U" -pas "$P" "$DB" 2>/dev/null <<SQL | tr -d ' \n'
+SET HEADING OFF;
+SELECT CAST(CAST(RDB\$DEFAULT_VALUE AS BLOB SUB_TYPE 0) AS VARCHAR(200) CHARACTER SET OCTETS) FROM RDB\$FIELDS WHERE RDB\$FIELD_NAME = '$dom';
+SQL
+)
+    if [ -z "$want" ]; then echo "DIFF [$1 $2] - no domain default stored"; fail=1
+    elif [ "$got" = "$want" ]; then echo "OK   DOMAIN $1 $2"
+    else echo "DIFF DOMAIN $1 $2"; echo "     engine: $want"; echo "     fcdsql: $got"; fail=1; fi
+}
+check_ix() { # <computed by clause> - expression indexes on GI(A,B,S)
+    n=$((n + 1))
+    ix="GIX$n"
+    got=$("$FCDSQL" "$1")
+    "$ISQL" -q -b -user "$U" -pas "$P" "$DB" >/dev/null 2>&1 <<SQL
+CREATE INDEX $ix ON GIBASE $1;
+COMMIT;
+SQL
+    want=$("$ISQL" -q -b -user "$U" -pas "$P" "$DB" 2>/dev/null <<SQL | tr -d ' \n'
+SET HEADING OFF;
+SELECT CAST(CAST(RDB\$EXPRESSION_BLR AS BLOB SUB_TYPE 0) AS VARCHAR(200) CHARACTER SET OCTETS) FROM RDB\$INDICES WHERE RDB\$INDEX_NAME = '$ix';
+SQL
+)
+    if [ -z "$want" ]; then echo "DIFF [$1] - no index expression stored"; fail=1
+    elif [ "$got" = "$want" ]; then echo "OK   INDEX $1"
+    else echo "DIFF INDEX $1"; echo "     engine: $want"; echo "     fcdsql: $got"; fail=1; fi
+}
+check_ck() { # <check clause> - the constraint's system trigger on GK(A,B,S)
+    n=$((n + 1))
+    tbl="GK$n"
+    got=$("$FCDSQL" "$1")
+    "$ISQL" -q -b -user "$U" -pas "$P" "$DB" >/dev/null 2>&1 <<SQL
+CREATE TABLE $tbl (A INTEGER, B INTEGER, S VARCHAR(10), CONSTRAINT ${tbl}_C $1);
+COMMIT;
+SQL
+    want=$("$ISQL" -q -b -user "$U" -pas "$P" "$DB" 2>/dev/null <<SQL | tr -d ' \n'
+SET HEADING OFF;
+SELECT FIRST 1 CAST(CAST(RDB\$TRIGGER_BLR AS BLOB SUB_TYPE 0) AS VARCHAR(300) CHARACTER SET OCTETS) FROM RDB\$TRIGGERS WHERE RDB\$RELATION_NAME = '$tbl';
+SQL
+)
+    if [ -z "$want" ]; then echo "DIFF [$1] - no check trigger stored"; fail=1
+    elif [ "$got" = "$want" ]; then echo "OK   $1"
+    else echo "DIFF $1"; echo "     engine: $want"; echo "     fcdsql: $got"; fail=1; fi
+}
+"$ISQL" -q -b -user "$U" -pas "$P" "$DB" >/dev/null 2>&1 <<SQL
+CREATE TABLE GIBASE (A INTEGER, B INTEGER, S VARCHAR(10));
+COMMIT;
+SQL
+
+check_dom "INTEGER" "DEFAULT 7"
+check_dom "VARCHAR(5)" "DEFAULT 'x'"
+check_dom "TIMESTAMP" "DEFAULT CURRENT_TIMESTAMP"
+check_ix "COMPUTED BY (UPPER(S))"
+check_ix "COMPUTED BY (A + B)"
+check_ix "COMPUTED BY (A * 2 - B)"
+check_ck "CHECK (A < B)"
+check_ck "CHECK (A > 0)"
+check_ck "CHECK (A IS NOT NULL)"
+check_ck "CHECK (A BETWEEN 1 AND 100)"
+check_ck "CHECK (A > 0 AND B > 0)"
+
 # --- refusals ----------------------------------------------------------
 refuse "DEFAULT 3 + 4"
 refuse "DEFAULT SOMECOLUMN"
@@ -116,5 +185,8 @@ refuse "COMPUTED BY (T.C1)"
 # column descriptor - the engine compiles it, a catalog-free compiler
 # refuses rather than guess
 refuse "COMPUTED BY (CASE WHEN A > B THEN A ELSE B END)"
+# non-integer IN items are cast to the column's CATALOG type by the
+# engine (probed) - catalog-free refuses
+refuse "CHECK (S IN ('a', 'b'))"
 
 exit $fail

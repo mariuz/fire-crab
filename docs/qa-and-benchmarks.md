@@ -4604,7 +4604,7 @@ runs UPDATING OR DELETING and UPDATING AND v > 100). Multi-event
 headers leave no trace. Refused: assignments to undeclared names,
 bare LEAVE.
 
-### SQL → BLR, oracle number four (`qa/dsql-field-blr.sh`, 22 checks)
+### SQL → BLR, oracle number four (`qa/dsql-field-blr.sh`, 34 checks)
 
 Slice 16 found the fourth place the engine stores its compiler's
 output: COLUMN BLR. A DEFAULT clause lands verbatim in
@@ -4624,6 +4624,28 @@ FIELD branches (CASE WHEN A > B THEN A ELSE B END) compiles fine in
 the engine - which KNOWS the columns' types for the cast wrapper -
 but a catalog-free compiler cannot know the descriptor, and refuses
 rather than guess.
+
+Slice 17 added three more stores to the same gate. Domain defaults
+live in RDB$FIELDS.RDB$DEFAULT_VALUE (the column-default frame,
+different catalog row); expression indexes store their COMPUTED BY
+in RDB$INDICES.RDB$EXPRESSION_BLR, byte-shaped like computed
+columns; and CHECK constraints turn out to be the engine's OWN
+system triggers - RDB$TRIGGERS types 1 and 3, byte-identical - with
+begin, blr_if over the NEGATED condition (CHECK (A < B) stores
+blr_geq: the NOT fold, reused by the engine itself), blr_abort with
+blr_gds_code 'check_constraint', and fields at CONTEXT 1.
+
+The slice's best find was a FIX. The CHECK battery ran
+S IN ('a','b') and the engine's bytes carried a surprise: EACH item
+wrapped in blr_cast varying2(10) - the COLUMN'S declared type,
+straight from the catalog. A view probe confirmed the same law in
+RDB$VIEW_BLR - meaning fire-crab's view compiler, which had only
+ever been pinned on integer IN-lists, would have emitted UNCAST
+bytes for a string IN-list: a latent wrong-bytes path that sixteen
+slices of batteries never hit. It is closed now - integer literals
+and input parameters (both probed uncast) compile, everything else
+refuses - with a refusal slot in the view gate beside the fix. The
+lesson: a NEW battery angle on an OLD surface is still a probe.
 
 ## Benchmarks
 

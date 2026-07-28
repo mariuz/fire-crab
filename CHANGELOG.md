@@ -13,6 +13,39 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 17: constraints and two more stores
+
+### Converted
+- **Domain defaults**: `RDB$FIELDS.RDB$DEFAULT_VALUE` — the same
+  minimal frame as column defaults, read from the domain's catalog
+  row (`compile_default` unchanged; the gate grew a domain section).
+- **Expression indexes**: `RDB$INDICES.RDB$EXPRESSION_BLR` — a
+  COMPUTED BY expression byte-shaped exactly like a computed
+  column's (`compile_computed` unchanged; new gate section).
+- **CHECK constraints**: the engine's OWN system triggers
+  (RDB$TRIGGERS types 1 and 3 — byte-identical): begin, blr_if over
+  the NEGATED condition — `CHECK (A < B)` stores blr_geq, the NOT
+  fold reused — whose then-branch is blr_abort with blr_gds_code
+  'check_constraint', a bare-end else, fields at CONTEXT 1 (the NEW
+  record). `compile_check` handles the clause.
+
+### Fixed
+- **The CHECK battery exposed a LATENT VIEW-COMPILER GAP**: the
+  engine CASTS non-integer IN-list items to the left side's CATALOG
+  type — `S IN ('a','b')` stores blr_cast varying2(10) per item, the
+  column's declared type, in views and CHECKs alike — and fire-crab
+  had only ever pinned integer IN-lists, so a string IN-list would
+  have emitted UNCAST bytes. Probed in both stores, then closed:
+  integer literals and input parameters (both probed uncast) stay;
+  everything else refuses. A refusal slot went into the view gate
+  beside the fix.
+
+### Guarded
+- String and decimal IN-list items (catalog casts), CHECKs with
+  string IN-lists. Gate: `qa/dsql-field-blr.sh` grew to 34 checks
+  (12 fresh: 3 domains, 3 indexes, 5 CHECKs incl. BETWEEN and
+  compound AND); 207 unit byte-pins.
+
 ## 2026-07-28 — fire-crab-dsql slice 16: the fourth oracle — column BLR
 
 ### Converted

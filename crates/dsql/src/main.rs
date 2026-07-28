@@ -17,6 +17,8 @@ fn main() {
         fire_crab_dsql::compile_default_hex(&sql)
     } else if upper.starts_with("COMPUTED") {
         fire_crab_dsql::compile_computed_hex(&sql)
+    } else if upper.starts_with("CHECK") {
+        fire_crab_dsql::compile_check_hex(&sql)
     } else {
         fire_crab_dsql::compile_view_select_hex(&sql)
     };

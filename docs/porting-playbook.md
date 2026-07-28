@@ -307,6 +307,14 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # a NEW battery angle on an OLD surface is still a probe: the
+    # CHECK batteries exposed that IN-list items get CAST to the
+    # column's catalog type - a law sixteen slices of view batteries
+    # never hit because they only listed integers; when a new gate
+    # contradicts an old assumption, probe the OLD oracle again
+    # constraint checks are the reference compiler EATING ITS OWN
+    # DOG FOOD: the CHECK condition compiles NEGATED through the same
+    # fold your NOT uses, into a system trigger you can byte-compare
     # keep hunting oracles: the reference system stores compiled
     # output in MORE places than the obvious ones (views, procedures,
     # triggers, COLUMN defaults and computed expressions) - each new

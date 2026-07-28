@@ -1670,6 +1670,17 @@ impl<'a> P<'a> {
                 return None;
             }
             self.i += 1;
+            // the engine CASTS non-integer IN-list items to the
+            // LEFT SIDE's catalog type (probed: S IN ('a','b') stores
+            // each item under blr_cast varying2(10) - the column's
+            // declared type, in views and CHECKs alike). Integer
+            // literals and input parameters are the probed UNCAST
+            // cases; anything else needs the catalog and refuses.
+            if items.iter().any(|it| {
+                !matches!(it, Val::Int(_) | Val::Int64(_) | Val::InParam(_))
+            }) {
+                return None;
+            }
             let body = Bool::InList(left, items);
             return Some(if negated {
                 Bool::Not(Box::new(body))
@@ -1769,6 +1780,7 @@ fn is_keyword(w: &str) -> bool {
             | "EXIT"
             | "DEFAULT"
             | "COMPUTED"
+            | "CHECK"
     )
 }
 
@@ -3698,6 +3710,82 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Compile a CHECK constraint to the BLR the engine stores as its
+/// system trigger (`RDB$TRIGGERS`, types 1 and 3 - byte-identical):
+/// blr_begin, blr_if over the NEGATED condition whose then-branch is
+/// blr_abort with blr_gds_code 'check_constraint', a bare blr_end in
+/// the else slot, blr_end, blr_eoc. Fields sit at CONTEXT 1 (the NEW
+/// record). The negation reuses the same fold as NOT (probed:
+/// CHECK (A < B) stores blr_geq).
+pub fn compile_check(sql: &str) -> Option<Vec<u8>> {
+    let toks = lex(sql.trim().trim_end_matches(';'))?;
+    let mut p = P {
+        t: &toks,
+        i: 0,
+        // two anonymous slots so bare fields bind to context 1
+        streams: vec![
+            Stream {
+                name: String::new(),
+                alias: None,
+                derived: None,
+            },
+            Stream {
+                name: String::new(),
+                alias: None,
+                derived: None,
+            },
+        ],
+        base: 0,
+        outer: Some(0),
+        sub: Some(1),
+        agg_map: Vec::new(),
+        agg_mode: false,
+        in_params: Vec::new(),
+        local_vars: Vec::new(),
+        next_label: 1,
+        proc: None,
+        agg_fid_ctx: 1,
+    };
+    if !p.kw("CHECK") {
+        return None;
+    }
+    if !matches!(p.t.get(p.i), Some(Tok::LParen)) {
+        return None;
+    }
+    p.i += 1;
+    let cond = p.bool_or()?;
+    if !matches!(p.t.get(p.i), Some(Tok::RParen)) {
+        return None;
+    }
+    p.i += 1;
+    if p.i != p.t.len() {
+        return None;
+    }
+    let mut out = vec![blr::VERSION5, blr::BEGIN, blr::IF];
+    emit_bool(&mut out, &negate(cond));
+    out.push(blr::BEGIN);
+    out.push(blr::ABORT);
+    out.push(0); // blr_gds_code
+    let msg = b"check_constraint";
+    out.push(msg.len() as u8);
+    out.extend_from_slice(msg);
+    out.push(blr::END);
+    out.push(blr::END); // the missing else
+    out.push(blr::END);
+    out.push(blr::EOC);
+    Some(out)
+}
+
+/// `compile_check` as uppercase hex.
+pub fn compile_check_hex(sql: &str) -> Option<String> {
+    Some(
+        compile_check(sql)?
+            .iter()
+            .map(|b| format!("{:02X}", b))
+            .collect(),
+    )
+}
+
 /// `compile_computed` as uppercase hex.
 pub fn compile_computed_hex(sql: &str) -> Option<String> {
     Some(
@@ -4936,6 +5024,26 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_seventeen_constraints_byte_for_byte() {
+        // a CHECK constraint is the engine's own system trigger:
+        // begin, if over the NEGATED condition (CHECK (A < B) stores
+        // blr_geq - the NOT fold again), abort with blr_gds_code
+        // 'check_constraint', bare-end else, end, eoc; fields at
+        // CONTEXT 1 (the NEW record)
+        assert_eq!(
+            compile_check_hex("CHECK (A < B)").as_deref(),
+            Some("05020832170101411701014202800010636865636B5F636F6E73747261696E74FFFFFF4C"),
+        );
+        // a domain default is the same minimal frame as a column's,
+        // read from RDB$FIELDS instead (probed: DEFAULT 7)
+        pin_default("DEFAULT 7", "05150800070000004C");
+        // an expression index is the same frame as a computed column,
+        // read from RDB$INDICES.RDB$EXPRESSION_BLR (probed)
+        pin_computed("COMPUTED BY (UPPER(S))", "0567170001534C");
+        pin_computed("COMPUTED BY (A + B)", "052217000141170001424C");
+    }
+
+    #[test]
     fn field_blr_refusals() {
         // the engine's DEFAULT grammar allows literals, NULL and the
         // context functions - NOTHING else; qualified names in a
@@ -5100,6 +5208,11 @@ mod tests {
             // multi-stream subqueries and multi-column select lists
             "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM U2 JOIN V3T ON U2.UID = V3T.VID)",
             "SELECT ID FROM T WHERE A IN (SELECT UA, UID FROM U2)",
+            // non-integer IN-list items: the engine casts each to the
+            // left side's CATALOG type (probed: S IN ('a','b') stores
+            // blr_cast varying2(10) per item) - catalog-free refuses
+            "SELECT ID FROM T WHERE S IN ('a', 'b')",
+            "SELECT ID FROM T WHERE N IN (1.5, 2.5)",
             // mixed UNION / UNION ALL chains bind by their own
             // precedence rules: unprobed
             "SELECT A FROM T UNION SELECT UA FROM U2 UNION ALL SELECT VID FROM V3T",
