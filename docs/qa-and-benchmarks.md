@@ -4278,7 +4278,7 @@ dropped from the view so an expression naming one refuses rather than
 guessing a side (qualified names in join expressions are the named
 remainder).
 
-### SQL → BLR against the engine's own compiler (`qa/dsql-view-blr.sh`, 108 checks)
+### SQL → BLR against the engine's own compiler (`qa/dsql-view-blr.sh`, 127 checks)
 
 The `fire-crab-dsql` crate opens Phase 4 with the purest differential
 in the project: the oracle is the exact artifact under conversion,
@@ -4396,9 +4396,32 @@ innermost-scope-first rule, the one every SQL implementation agrees
 on - while an outer reference must be qualified. The battery runs
 subqueries under AND/OR, inside a CASE condition, against an
 expression left-hand side (UPPER(FIRST_NAME) IN (SELECT ...)), and
-correlated through blr_relation2 aliases. Scalar subselects as
-values, subqueries inside ON clauses (they would interleave the
-join chain's stream numbering) and multi-stream subqueries refuse.
+correlated through blr_relation2 aliases. Subqueries inside ON clauses (they would interleave the join
+chain's stream numbering) and multi-stream subqueries refuse.
+
+Slice 6 finished what the view oracle can express of the SELECT
+itself. DISTINCT turns out to be the ONE place the select list
+leaves a trace: blr_project after the boolean, a count byte and the
+listed columns - everywhere else the list compiles away to catalog
+data. A scalar subselect is blr_via(blr_singular(rse), value,
+blr_null) and works anywhere a value does - the battery runs it on
+both comparison sides and inside arithmetic. A derived table is an
+rse IN THE STREAM SLOT, and its relation2 alias text carries a
+surprise: `(SELECT ID FROM T) X` stores the alias as
+`"X" "PUBLIC"."T"` - alias plus the schema-qualified underlying
+table - where a plain `FROM T X` stores just `"X"`; the whole
+derived table has ONE context shared by inner and outer references,
+and it rides anywhere a stream can (the battery joins one to a real
+table). UNION restructures the statement: the rse's single stream is
+blr_union with its OWN context claimed BEFORE any branch stream -
+which is why the compiler pre-scans the token stream for a top-level
+UNION - then per branch an rse (branch WHERE inside) and a blr_map
+of u16 field numbers; a distinct UNION appends blr_project over
+blr_fid(1, 0..n) while UNION ALL does not. Mixed UNION/UNION ALL
+chains, column-count mismatches, DISTINCT in branches and over
+expressions, and alias-less derived tables refuse. The slice-5
+refusal of scalar subselects became a feature; its gate slot flipped
+to a positive check, the fifth such flip in the project.
 
 ## Benchmarks
 

@@ -289,6 +289,15 @@ them.
     # branches (NULLIF's comparand does not)
     # cast targets do not follow the obvious table: NUMERIC(4) and
     # DECIMAL(4) compile to DIFFERENT dtypes - probe every target
+    # DISTINCT is the ONE select-list trace: a projection clause
+    # AFTER the boolean; a scalar subselect is via(singular(rse),
+    # value, null); a derived table is an rse IN A STREAM SLOT with
+    # ONE context shared by inner and outer references - and its
+    # alias text carries the schema-qualified table (read the bytes:
+    # a plain alias does not)
+    # UNION claims its OWN context BEFORE any branch stream - scan
+    # for it before assigning contexts; each branch is rse + a map of
+    # field numbers; only the DISTINCT form projects (over fid)
     # subquery predicates come in TWO shapes: existence (one verb +
     # one rse, the subquery WHERE as its boolean) and quantified (a
     # DOUBLE-nested rse: the outer rse's single stream IS the

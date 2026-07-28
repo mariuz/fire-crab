@@ -13,6 +13,41 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 6: DISTINCT, scalar subselects, derived tables, UNION
+
+### Converted
+- **DISTINCT**: `blr_project` after the boolean — a count byte and
+  the SELECT LIST's columns. The one place the select list leaves a
+  trace in view BLR (everywhere else it compiles away).
+- **Scalar subselects as values**: `blr_via(blr_singular(rse),
+  value, blr_null)` — usable anywhere a value is: both comparison
+  sides, inside arithmetic (`SALARY + (SELECT ...)`), beside other
+  subquery predicates.
+- **Derived tables**: an rse IN THE STREAM SLOT whose relation2
+  alias text is `"ALIAS" "PUBLIC"."TABLE"` — the schema-qualified
+  underlying table rides along in the alias (probed; a PLAIN alias
+  stays short `"X"`). The whole derived table has ONE context,
+  shared by inner and outer references. Rides anywhere a stream can
+  (probed as a join's left side). Pass-through column lists only;
+  the alias is required.
+- **UNION [ALL]**: the statement rse's single stream is `blr_union`
+  — its own context byte (1, claimed BEFORE any branch stream, which
+  is why the compiler pre-scans for a top-level UNION), a branch
+  count, then per branch an rse (branch WHERE inside) and a
+  `blr_map` (u16 count, then u16-field-number/value pairs). The
+  DISTINCT form appends `blr_project` over `blr_fid(1, 0..n)`;
+  UNION ALL does not. Three-branch chains probed (contexts 2, 3, 4).
+
+### Guarded
+- Mixed `UNION`/`UNION ALL` chains (they bind by precedence rules
+  not yet probed), column-count mismatches (an engine error),
+  DISTINCT inside union branches, `DISTINCT *`, DISTINCT over
+  expressions, alias-less derived tables and derived union branches
+  all refuse. The slice-5 refusal of scalar subselects became a
+  feature — its gate slot flipped to a positive check. Gate:
+  `qa/dsql-view-blr.sh` grew to 127 checks (17 fresh slice-6 battery
+  statements; 3 new refusal slots); 115 unit byte-pins.
+
 ## 2026-07-28 — fire-crab-dsql slice 5: subquery predicates
 
 ### Converted

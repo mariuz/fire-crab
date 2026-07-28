@@ -176,6 +176,23 @@ mod blr {
     /// quantified comparison as the OUTER rse's boolean (probed)
     pub const ANSI_ANY: u8 = 0x97;
     pub const ANSI_ALL: u8 = 0x9E;
+    /// DISTINCT - an rse sub-clause after the boolean: count byte,
+    /// then the SELECT LIST's values (the one place the list leaves
+    /// a trace - probed)
+    pub const PROJECT: u8 = 0x45;
+    /// a scalar subselect as a value: blr_via(blr_singular(rse),
+    /// selected value, blr_null) (probed)
+    pub const VIA: u8 = 0x2B;
+    pub const SINGULAR: u8 = 0x7F;
+    /// blr_union as an rse STREAM: context byte, branch count, then
+    /// per branch an rse and a blr_map. Same byte as EOC - position
+    /// disambiguates (probed)
+    pub const UNION: u8 = 0x4C;
+    /// blr_map: u16 count, then (u16 field number, value) pairs
+    pub const MAP: u8 = 0x4D;
+    /// blr_fid: context byte, u16 field id - how the distinct-union's
+    /// project addresses the union's OWN columns (probed)
+    pub const FID: u8 = 0x18;
     pub const EQL: u8 = 0x2F;
     pub const NEQ: u8 = 0x30;
     pub const GTR: u8 = 0x31;
@@ -224,6 +241,8 @@ enum Val {
     /// blr_decode - the simple CASE: selector, comparands, results
     /// (the ELSE, when present, is the extra last result)
     Decode(Box<Val>, Vec<Val>, Vec<Val>),
+    /// a scalar subselect: blr_via(blr_singular(rse), value, null)
+    ScalarSub(Box<SubQ>),
     /// blr_coalesce
     Coalesce(Vec<Val>),
 }
@@ -613,6 +632,17 @@ fn lex(sql: &str) -> Option<Vec<Tok>> {
 struct Stream {
     name: String,
     alias: Option<String>,
+    /// a derived table `(SELECT cols FROM name [WHERE ...]) alias`:
+    /// emitted as an rse-within-a-stream-slot whose relation2 alias
+    /// text is `"ALIAS" "PUBLIC"."NAME"` - the schema-qualified
+    /// underlying table rides along (probed); the WHOLE derived table
+    /// has ONE context, shared by inner and outer references
+    derived: Option<Box<Derived>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Derived {
+    wher: Option<Bool>,
 }
 
 struct P<'a> {
@@ -681,8 +711,14 @@ impl<'a> P<'a> {
         Some(Val::Field(ctx, name.to_string()))
     }
 
-    /// `TABLE [alias]` in a FROM clause or a subquery
+    /// `TABLE [alias]` in a FROM clause or a subquery, or a derived
+    /// table `(SELECT cols FROM TABLE [WHERE ...]) ALIAS`
     fn stream_item(&mut self) -> Option<Stream> {
+        if matches!(self.t.get(self.i), Some(Tok::LParen))
+            && matches!(self.t.get(self.i + 1), Some(Tok::Ident(w)) if w == "SELECT")
+        {
+            return self.derived_item();
+        }
         let Some(Tok::Ident(name)) = self.t.get(self.i) else {
             return None;
         };
@@ -699,7 +735,132 @@ impl<'a> P<'a> {
             }
             _ => None,
         };
-        Some(Stream { name, alias })
+        Some(Stream { name, alias, derived: None })
+    }
+
+    /// A derived table: pass-through column list, ONE underlying
+    /// table, an optional inner WHERE (whose bare names bind to the
+    /// derived stream - it has the only visible context), a REQUIRED
+    /// alias. The stream is pushed while the inner WHERE parses (its
+    /// fields need the context id) and popped for the caller to
+    /// re-push at the same index.
+    fn derived_item(&mut self) -> Option<Stream> {
+        self.i += 1; // (
+        if !self.kw("SELECT") {
+            return None;
+        }
+        // the pass-through list: bare columns only (they leave no
+        // trace; outer references go by NAME through the shared
+        // context, which is exactly the pass-through case)
+        loop {
+            match self.t.get(self.i)? {
+                Tok::Ident(w) if w == "FROM" => {
+                    self.i += 1;
+                    break;
+                }
+                Tok::Ident(w) if !is_keyword(w) => self.i += 1,
+                Tok::Comma => self.i += 1,
+                _ => return None, // *, expressions, quals: unprobed
+            }
+        }
+        let Some(Tok::Ident(name)) = self.t.get(self.i) else {
+            return None;
+        };
+        if is_keyword(name) {
+            return None;
+        }
+        let name = name.clone();
+        self.i += 1;
+        self.streams.push(Stream {
+            name: name.clone(),
+            alias: None,
+            derived: None,
+        });
+        let si = self.streams.len() - 1;
+        let saved = self.sub.replace(si);
+        let wher = if self.kw("WHERE") {
+            Some(self.bool_or()?)
+        } else {
+            None
+        };
+        self.sub = saved;
+        self.streams.pop();
+        if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+            return None;
+        }
+        self.i += 1;
+        let Some(Tok::Ident(alias)) = self.t.get(self.i) else {
+            return None; // an alias-less derived table: unprobed
+        };
+        if is_keyword(alias) {
+            return None;
+        }
+        let alias = alias.clone();
+        self.i += 1;
+        Some(Stream {
+            name,
+            alias: Some(alias),
+            derived: Some(Box::new(Derived { wher })),
+        })
+    }
+
+    /// The select list up to FROM. `Some(cols)` when every item is a
+    /// plain (possibly qualified) column - the shape DISTINCT and
+    /// UNION need; `None` when the list contains `*` or other
+    /// traceless-only shapes.
+    fn select_list(&mut self) -> Option<Option<Vec<(Option<String>, String)>>> {
+        let mut cols: Option<Vec<(Option<String>, String)>> = Some(Vec::new());
+        let mut expect_item = true;
+        loop {
+            match self.t.get(self.i)? {
+                Tok::Ident(w) if w == "FROM" => {
+                    self.i += 1;
+                    return Some(cols);
+                }
+                Tok::Ident(w) if !is_keyword(w) => {
+                    let a = w.clone();
+                    self.i += 1;
+                    if !expect_item {
+                        // a bare column alias: traceless only
+                        cols = None;
+                        continue;
+                    }
+                    if matches!(self.t.get(self.i), Some(Tok::Dot)) {
+                        self.i += 1;
+                        match self.t.get(self.i) {
+                            Some(Tok::Ident(b)) if !is_keyword(b) => {
+                                let b = b.clone();
+                                self.i += 1;
+                                if let Some(c) = &mut cols {
+                                    c.push((Some(a), b));
+                                }
+                            }
+                            Some(Tok::Star) => {
+                                self.i += 1;
+                                cols = None;
+                            }
+                            _ => return None,
+                        }
+                    } else if let Some(c) = &mut cols {
+                        c.push((None, a));
+                    }
+                    expect_item = false;
+                }
+                Tok::Comma => {
+                    if expect_item {
+                        return None;
+                    }
+                    self.i += 1;
+                    expect_item = true;
+                }
+                Tok::Star => {
+                    self.i += 1;
+                    cols = None;
+                    expect_item = false;
+                }
+                _ => return None,
+            }
+        }
     }
 
     /// `(SELECT <one column | anything> FROM TABLE [alias]
@@ -881,6 +1042,11 @@ impl<'a> P<'a> {
             Tok::Dec(r, s) => Val::Dec(i32::try_from(*r).ok()?, *s),
             Tok::Str(s) => Val::Str(s.clone()),
             Tok::LParen => {
+                // a scalar subselect as a value: blr_via(singular)
+                if matches!(self.t.get(self.i + 1), Some(Tok::Ident(w)) if w == "SELECT")
+                {
+                    return Some(Val::ScalarSub(Box::new(self.subselect(true)?)));
+                }
                 self.i += 1;
                 let inner = self.val()?;
                 if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
@@ -1321,6 +1487,8 @@ fn is_keyword(w: &str) -> bool {
             | "ANY"
             | "SOME"
             | "ALL"
+            | "DISTINCT"
+            | "UNION"
     )
 }
 
@@ -1430,6 +1598,20 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
             for v in vs {
                 emit_val(out, v);
             }
+        }
+        Val::ScalarSub(sub) => {
+            out.push(blr::VIA);
+            out.push(blr::SINGULAR);
+            out.push(blr::RSE);
+            out.push(1);
+            emit_stream(out, &sub.stream, sub.ctx);
+            if let Some(w) = &sub.wher {
+                out.push(blr::BOOLEAN);
+                emit_bool(out, w);
+            }
+            out.push(blr::END);
+            emit_val(out, sub.col.as_ref().expect("scalar subselect has a column"));
+            out.push(blr::NULL);
         }
         Val::Int(n) => {
             out.push(blr::LITERAL);
@@ -1546,6 +1728,29 @@ fn emit_bool(out: &mut Vec<u8>, b: &Bool) {
 /// One relation stream: plain (blr_relation) or aliased
 /// (blr_relation2, the alias UPPERCASED IN DOUBLE QUOTES - probed).
 fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
+    if let Some(d) = &st.derived {
+        // a derived table is an rse in the stream slot; its relation2
+        // alias text carries the alias AND the schema-qualified
+        // underlying table (probed: `(SELECT ID FROM T) X` stores
+        // `"X" "PUBLIC"."T"`); inner and outer references share the
+        // ONE context
+        out.push(blr::RSE);
+        out.push(1);
+        out.push(blr::RELATION2);
+        out.push(st.name.len() as u8);
+        out.extend_from_slice(st.name.as_bytes());
+        let alias = st.alias.as_deref().unwrap_or("");
+        let text = format!("\"{}\" \"PUBLIC\".\"{}\"", alias, st.name);
+        out.push(text.len() as u8);
+        out.extend_from_slice(text.as_bytes());
+        out.push(ctx);
+        if let Some(w) = &d.wher {
+            out.push(blr::BOOLEAN);
+            emit_bool(out, w);
+        }
+        out.push(blr::END);
+        return;
+    }
     match &st.alias {
         None => {
             out.push(blr::RELATION);
@@ -1576,22 +1781,32 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
         outer: None,
         sub: None,
     };
+    // a top-level UNION restructures the whole statement: the union
+    // node takes context 1 BEFORE any branch stream, so it must be
+    // known before parsing begins
+    let mut depth = 0i32;
+    let mut has_union = false;
+    for t in toks.iter() {
+        match t {
+            Tok::LParen => depth += 1,
+            Tok::RParen => depth -= 1,
+            Tok::Ident(w) if w == "UNION" && depth == 0 => has_union = true,
+            _ => {}
+        }
+    }
+    if has_union {
+        return compile_union(&mut p);
+    }
     if !p.kw("SELECT") {
         return None;
     }
-    // the select list leaves NO trace in the view BLR (probed) - skip
-    // to FROM, but refuse list shapes this slice has not verified
-    // (bare and qualified columns and `*` are known to compile away)
-    loop {
-        match p.t.get(p.i)? {
-            Tok::Ident(w) if w == "FROM" => {
-                p.i += 1;
-                break;
-            }
-            Tok::Ident(w) if !is_keyword(w) => p.i += 1,
-            Tok::Comma | Tok::Dot | Tok::Star => p.i += 1,
-            _ => return None,
-        }
+    // the select list leaves NO trace in the view BLR (probed) -
+    // EXCEPT under DISTINCT, which projects it; capture plain columns
+    // when the list has them
+    let distinct = p.kw("DISTINCT");
+    let sel_cols = p.select_list()?;
+    if distinct && sel_cols.as_ref().map_or(true, |c| c.is_empty()) {
+        return None; // DISTINCT needs a concrete column list
     }
     // FROM: `T [alias]`, a comma-list `T [a], U [b], ...`, or a JOIN
     // chain `T [a] j U [b] ON <bool> j V [c] ON <bool> ...` where j is
@@ -1643,6 +1858,18 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
     // keep joining `streams` for context numbering but stay invisible
     // to outer bare names
     p.outer = Some(p.streams.len());
+    // DISTINCT's projection: the select list resolved in the outer
+    // scope (blr_project is the ONE place the list leaves a trace)
+    let project = if distinct {
+        let cols = sel_cols.as_ref()?;
+        let mut vals = Vec::with_capacity(cols.len());
+        for (q, n) in cols {
+            vals.push(p.field(q.as_deref(), n)?);
+        }
+        Some(vals)
+    } else {
+        None
+    };
     let boolean = if p.kw("WHERE") {
         Some(p.bool_or()?)
     } else {
@@ -1696,6 +1923,117 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
     if let Some(b) = &boolean {
         out.push(blr::BOOLEAN);
         emit_bool(&mut out, b);
+    }
+    // probed order: the boolean first, then the projection
+    if let Some(vals) = &project {
+        out.push(blr::PROJECT);
+        out.push(vals.len() as u8);
+        for v in vals {
+            emit_val(&mut out, v);
+        }
+    }
+    out.push(blr::END);
+    out.push(blr::EOC);
+    Some(out)
+}
+
+/// `SELECT cols FROM t [WHERE ...] UNION [ALL] SELECT ...` - the
+/// statement rse's single STREAM is blr_union: its own context byte
+/// (1 - claimed BEFORE any branch stream), a branch count, then per
+/// branch an rse (with the branch's WHERE as its boolean) and a
+/// blr_map assigning the branch's select columns to the union's field
+/// numbers. A DISTINCT union (no ALL) appends a blr_project over
+/// blr_fid(1, 0..n) as the statement rse's sub-clause; UNION ALL does
+/// not. All probed.
+fn compile_union(p: &mut P) -> Option<Vec<u8>> {
+    // the union claims context 1
+    p.streams.push(Stream {
+        name: String::new(),
+        alias: None,
+        derived: None,
+    });
+    // no outer scope: qualified names resolve only through the
+    // current branch's stream, bare names bind to it
+    p.outer = Some(0);
+    struct Branch {
+        cols: Vec<Val>,
+        wher: Option<Bool>,
+    }
+    let mut branches: Vec<Branch> = Vec::new();
+    let mut all: Option<bool> = None;
+    loop {
+        if !p.kw("SELECT") {
+            return None;
+        }
+        if p.kw("DISTINCT") {
+            return None; // DISTINCT inside a union branch: unprobed
+        }
+        let cols = p.select_list()??;
+        if cols.is_empty() {
+            return None;
+        }
+        let st = p.stream_item()?;
+        if st.derived.is_some() {
+            return None; // derived branches: unprobed
+        }
+        p.streams.push(st);
+        let si = p.streams.len() - 1;
+        let saved = p.sub.replace(si);
+        let mut vals = Vec::with_capacity(cols.len());
+        for (q, n) in &cols {
+            vals.push(p.field(q.as_deref(), n)?);
+        }
+        let wher = if p.kw("WHERE") {
+            Some(p.bool_or()?)
+        } else {
+            None
+        };
+        p.sub = saved;
+        branches.push(Branch { cols: vals, wher });
+        if p.i == p.t.len() {
+            break;
+        }
+        if !p.kw("UNION") {
+            return None;
+        }
+        let this_all = p.kw("ALL");
+        // mixed UNION / UNION ALL chains bind by their own precedence
+        // rules: unprobed, refuse
+        if *all.get_or_insert(this_all) != this_all {
+            return None;
+        }
+    }
+    let n = branches[0].cols.len();
+    if branches.iter().any(|b| b.cols.len() != n) {
+        return None;
+    }
+    let mut out = vec![blr::VERSION5, blr::RSE, 1, blr::UNION, 1];
+    out.push(branches.len() as u8);
+    for (bi, b) in branches.iter().enumerate() {
+        out.push(blr::RSE);
+        out.push(1);
+        emit_stream(&mut out, &p.streams[bi + 1], (bi + 2) as u8);
+        if let Some(w) = &b.wher {
+            out.push(blr::BOOLEAN);
+            emit_bool(&mut out, w);
+        }
+        out.push(blr::END);
+        out.push(blr::MAP);
+        out.extend_from_slice(&(n as u16).to_le_bytes());
+        for (fi, v) in b.cols.iter().enumerate() {
+            out.extend_from_slice(&(fi as u16).to_le_bytes());
+            emit_val(&mut out, v);
+        }
+    }
+    if all == Some(false) {
+        // the distinct union: project the union's own fields
+        out.push(blr::PROJECT);
+        out.push(n as u8);
+        for fi in 0..n {
+            out.push(blr::FID);
+            out.push(1);
+            out.extend_from_slice(&(fi as u16).to_le_bytes());
+        }
     }
     out.push(blr::END);
     out.push(blr::EOC);
@@ -2217,6 +2555,82 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_six_shapes_byte_for_byte() {
+        // DISTINCT is blr_project - the ONE place the select list
+        // leaves a trace: count byte, then the listed columns
+        pin("SELECT DISTINCT A FROM T", "0543014A015401450117010141FF4C");
+        pin(
+            "SELECT DISTINCT A, S FROM T",
+            "0543014A01540145021701014117010153FF4C",
+        );
+        // probed order: the boolean first, then the projection
+        pin(
+            "SELECT DISTINCT A FROM T WHERE A > 0",
+            "0543014A01540147311701014115080000000000450117010141FF4C",
+        );
+        // a scalar subselect is blr_via(blr_singular(rse), value,
+        // blr_null) - usable anywhere a value is
+        pin(
+            "SELECT ID FROM T WHERE A = (SELECT UA FROM U2 WHERE U2.UID = T.ID)",
+            "0543014A015401472F170101412B7F43014A02553202472F1702035549441701024944FF17020255412DFF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE (SELECT UA FROM U2 WHERE U2.UID = T.ID) > 5",
+            "0543014A01540147312B7F43014A02553202472F1702035549441701024944FF17020255412D15080005000000FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE S = (SELECT X.UA FROM U2 X)",
+            "0543014A015401472F170101532B7F4301920255320322582202FF17020255412DFF4C",
+        );
+        // a derived table is an rse in the stream slot; the relation2
+        // alias text carries the alias AND the schema-qualified
+        // table: `(SELECT ID FROM T) X` stores `\"X\" \"PUBLIC\".\"T\"`
+        pin(
+            "SELECT X.ID FROM (SELECT ID FROM T) X",
+            "05430143019201541022582220225055424C4943222E22542201FFFF4C",
+        );
+        // ONE shared context: the inner WHERE and the outer WHERE both
+        // address context 1
+        pin(
+            "SELECT X.ID FROM (SELECT ID FROM T WHERE A > 0) X WHERE X.ID > 1",
+            "05430143019201541022582220225055424C4943222E2254220147311701014115080000000000FF4731170102494415080001000000FF4C",
+        );
+        // a derived table rides anywhere a stream can - here as the
+        // left side of a join
+        pin(
+            "SELECT X.ID FROM (SELECT ID FROM T) X JOIN U2 ON X.ID = U2.UID",
+            "054301770243019201541022582220225055424C4943222E22542201FF4A02553202472F1701024944170203554944FFFF4C",
+        );
+        // UNION: the statement rse's single stream is blr_union - its
+        // own context (1, claimed BEFORE any branch), a branch count,
+        // then per branch an rse and a blr_map; the DISTINCT form
+        // appends blr_project over blr_fid, UNION ALL does not
+        pin(
+            "SELECT A FROM T UNION SELECT UA FROM U2",
+            "0543014C010243014A015402FF4D010000001702014143014A02553203FF4D010000001703025541450118010000FF4C",
+        );
+        pin(
+            "SELECT A FROM T UNION ALL SELECT UA FROM U2",
+            "0543014C010243014A015402FF4D010000001702014143014A02553203FF4D010000001703025541FF4C",
+        );
+        // two columns: map field numbers are little-endian words
+        pin(
+            "SELECT A, ID FROM T UNION SELECT UA, UID FROM U2",
+            "0543014C010243014A015402FF4D02000000170201410100170202494443014A02553203FF4D020000001703025541010017030355494445021801000018010100FF4C",
+        );
+        // branch WHEREs sit inside the branch rses
+        pin(
+            "SELECT A FROM T WHERE A > 0 UNION ALL SELECT UA FROM U2 WHERE U2.UA < 9",
+            "0543014C010243014A01540247311702014115080000000000FF4D010000001702014143014A025532034733170302554115080009000000FF4D010000001703025541FF4C",
+        );
+        // three branches: contexts 2, 3, 4 after the union's 1
+        pin(
+            "SELECT A FROM T UNION ALL SELECT UA FROM U2 UNION ALL SELECT VID FROM V3T",
+            "0543014C010343014A015402FF4D010000001702014143014A02553203FF4D01000000170302554143014A0356335404FF4D01000000170403564944FF4C",
+        );
+    }
+
+    #[test]
     fn refuses_outside_the_surface() {
         // shapes this slice has NOT verified against the engine refuse
         // rather than guess
@@ -2246,14 +2660,26 @@ mod tests {
             "SELECT ID FROM T WHERE CAST(A AS NUMERIC(30)) = 1",
             "SELECT ID FROM T WHERE CASE WHEN A > 5 THEN NULL ELSE NULL END IS NULL",
             "SELECT ID FROM T WHERE CASE WHEN A > 5 THEN 'x' ELSE 0 END = 'x'",
-            // a scalar subselect as a VALUE: unconverted
-            "SELECT ID FROM T WHERE A = (SELECT UA FROM U2)",
             // a subquery inside an ON clause would interleave the
             // join chain's stream numbering: unprobed
             "SELECT T.ID FROM T JOIN U2 ON EXISTS (SELECT 1 FROM V3T WHERE V3T.VID = T.ID)",
             // multi-stream subqueries and multi-column select lists
             "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM U2 JOIN V3T ON U2.UID = V3T.VID)",
             "SELECT ID FROM T WHERE A IN (SELECT UA, UID FROM U2)",
+            // mixed UNION / UNION ALL chains bind by their own
+            // precedence rules: unprobed
+            "SELECT A FROM T UNION SELECT UA FROM U2 UNION ALL SELECT VID FROM V3T",
+            // column-count mismatch is an engine error
+            "SELECT A FROM T UNION SELECT UA, UID FROM U2",
+            // DISTINCT in union branches, DISTINCT *, DISTINCT over
+            // expressions: unprobed shapes
+            "SELECT DISTINCT A FROM T UNION SELECT UA FROM U2",
+            "SELECT DISTINCT * FROM T",
+            "SELECT DISTINCT UPPER(S) FROM T",
+            // derived tables need an alias; derived union branches
+            // are unprobed
+            "SELECT X.ID FROM (SELECT ID FROM T)",
+            "SELECT A FROM T UNION SELECT X.ID FROM (SELECT ID FROM T) X",
         ] {
             assert!(compile_view_select(sql).is_none(), "{sql} was compiled");
         }
