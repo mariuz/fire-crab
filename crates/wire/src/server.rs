@@ -1415,6 +1415,12 @@ enum Term {
     /// result (rendered to text, as the engine coerces) against the
     /// pattern. A NULL result is UNKNOWN.
     ExprLike(Box<Expr>, String, Option<char>, bool),
+    /// an expression side compared against a `?` parameter -
+    /// `WHERE UPPER(S) = ?`. The bind target descriptor is SYNTHESIZED
+    /// from the expression's type (what the client builds its encoder
+    /// from); at execute, [Predicate::bind] substitutes the arrived
+    /// value as a literal and the term becomes an ordinary [ExprCond].
+    ExprParam(Box<Expr>, Cmp, usize, ColKind),
 }
 
 /// A resolved WHERE predicate in disjunctive normal form (OR of ANDs),
@@ -1480,6 +1486,27 @@ impl Predicate {
                         match bind_rhs(idx, &ColKind::Text)? {
                             None => Term::Never, // LIKE NULL is UNKNOWN
                             Some(rhs) => Term::Like(*fid, rhs, *escape, *negated),
+                        }
+                    }
+                    // an expression side against a parameter: the value
+                    // becomes a literal expression and the term an
+                    // ordinary three-valued comparison
+                    Term::ExprParam(lhs, op, idx, kind) => {
+                        match bind_rhs(idx, kind)? {
+                            None => Term::Never, // compared with NULL: UNKNOWN
+                            Some(rhs) => {
+                                let lit = match rhs {
+                                    Rhs::Int(n) => Expr::Int(n),
+                                    Rhs::Num(r, sc) => Expr::Dec(r, sc),
+                                    Rhs::Str(t) => Expr::Str(t),
+                                    Rhs::Null | Rhs::Param(..) => Expr::Null,
+                                };
+                                Term::ExprCond(Box::new(Cond2::Cmp(
+                                    lhs.clone(),
+                                    *op,
+                                    Box::new(lit),
+                                )))
+                            }
                         }
                     }
                     other => other.clone(),
@@ -1586,6 +1613,9 @@ impl Term {
                 Value::Null => false,
                 v => like_match(&v.render(), pattern, *escape) != *negated,
             },
+            // an unbound parameter never matches (the execute path
+            // binds before evaluating; this is the defensive answer)
+            Term::ExprParam(..) => false,
         })
     }
 }
@@ -8718,12 +8748,51 @@ fn resolve_join_predicate(
     sides: &[JoinSide; 2],
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Predicate> {
+    // a SYNTHETIC single-relation view of the combined row, for the
+    // expression-term resolver: each side's columns at their combined
+    // indexes (bare names only - an AMBIGUOUS name is dropped from the
+    // view, so an expression naming it refuses rather than guessing a
+    // side; qualified names in join expressions are a later slice),
+    // and the descriptors laid out by combined index
+    let mut comb_cols: Vec<RelationColumn> = Vec::new();
+    let mut comb_descs: Vec<Descriptor> = Vec::new();
+    for side in sides.iter() {
+        for rc in &side.columns {
+            let idx = side.offset + rc.field_id as usize;
+            if comb_descs.len() <= idx {
+                comb_descs.resize(
+                    idx + 1,
+                    Descriptor { dtype: 0, scale: 0, length: 0, sub_type: 0, flags: 0, offset: 0 },
+                );
+            }
+            if let Some(d) = side.descs.get(rc.field_id as usize) {
+                comb_descs[idx] = d.clone();
+            }
+            if let Some(prev) = comb_cols
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(&rc.name))
+            {
+                comb_cols.remove(prev); // ambiguous: drop both
+            } else {
+                comb_cols.push(RelationColumn {
+                    name: rc.name.clone(),
+                    field_id: idx as u16,
+                    position: idx as u16,
+                });
+            }
+        }
+    }
     let mut groups = Vec::new();
     for g in raw {
         let mut terms = Vec::new();
         for rt in g {
             if let RawKind::Const(b) = rt.kind {
                 terms.push(Term::Const(b));
+                continue;
+            }
+            // an expression side resolves against the combined view
+            if matches!(rt.lhs, RawLhs::Expr(_)) || matches!(rt.kind, RawKind::CmpExpr(..)) {
+                terms.push(resolve_expr_term(&rt, &comb_cols, &comb_descs, params)?);
                 continue;
             }
             let RawLhs::Col(col) = &rt.lhs else {
@@ -15928,6 +15997,15 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                 // hand the whole call to the expression parser. A call
                 // that does not parse fails the tokenize - the statement
                 // then refuses, exactly like a malformed select-list call.
+                // a CASE expression spans to its balancing END - lexed
+                // whole and handed to the expression parser, like a call
+                if upper == "CASE" {
+                    let close = matching_case_end(b, start)?;
+                    let raw = parse_raw_expr_any(&s[start..close])?;
+                    out.push(Tok::FnExpr(raw));
+                    i = close;
+                    continue;
+                }
                 if sysfn_named(&upper).is_some()
                     || matches!(upper.as_str(), "CAST" | "COALESCE" | "NULLIF" | "IIF")
                 {
@@ -15966,6 +16044,61 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
         }
     }
     Some(out)
+}
+
+/// The byte index just past the END that balances the CASE whose
+/// keyword starts at `case_at` - nested CASEs nest, string literals
+/// are skipped, and both keywords match on word boundaries only.
+fn matching_case_end(b: &[u8], case_at: usize) -> Option<usize> {
+    let is_word = |i: usize| i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_');
+    let word_at = |i: usize, w: &[u8]| -> bool {
+        if i + w.len() > b.len() {
+            return false;
+        }
+        if i > 0 && is_word(i - 1) {
+            return false;
+        }
+        if is_word(i + w.len()) {
+            return false;
+        }
+        b[i..i + w.len()].eq_ignore_ascii_case(w)
+    };
+    let mut depth = 0i32;
+    let mut i = case_at;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                i += 1;
+                loop {
+                    if i >= b.len() {
+                        return None;
+                    }
+                    if b[i] == b'\'' {
+                        if b.get(i + 1) == Some(&b'\'') {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ if word_at(i, b"CASE") => {
+                depth += 1;
+                i += 3;
+            }
+            _ if word_at(i, b"END") => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 3);
+                }
+                i += 2;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// The index of the parenthesis matching the one at `open`, skipping
@@ -17371,7 +17504,7 @@ fn resolve_predicate(
             // an EXPRESSION on either side takes the expression-predicate
             // path (Cond2 evaluation per row)
             if matches!(rt.lhs, RawLhs::Expr(_)) || matches!(rt.kind, RawKind::CmpExpr(..)) {
-                terms.push(resolve_expr_term(&rt, columns, descs)?);
+                terms.push(resolve_expr_term(&rt, columns, descs, params)?);
                 continue;
             }
             let RawLhs::Col(col) = &rt.lhs else {
@@ -17399,15 +17532,16 @@ fn resolve_predicate(
 }
 
 /// Resolve a term with an EXPRESSION on either side into a
-/// [Term::ExprCond] / [Term::ExprLike], refusing anything that could
-/// RAISE per row ([expr_no_raise]) and any `?` parameter against an
-/// expression side (the describe would need a synthesized bind target -
-/// a later slice). The comparison itself is [Cond2]'s: three-valued,
-/// exact numeric alignment, pad-insensitive text.
+/// [Term::ExprCond] / [Term::ExprLike] / [Term::ExprParam]. The
+/// comparison itself is [Cond2]'s: three-valued, exact numeric
+/// alignment, pad-insensitive text. A `?` against the expression side
+/// claims its slot with a descriptor SYNTHESIZED from the expression's
+/// own type - what the client builds its encoder from.
 fn resolve_expr_term(
     rt: &RawTerm,
     columns: &[RelationColumn],
     descs: &[Descriptor],
+    params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Term> {
     // the left side as a resolved expression: the call itself, or the
     // plain column a CmpExpr right side compares against
@@ -17427,6 +17561,32 @@ fn resolve_expr_term(
         })
     };
     let term = match &rt.kind {
+        // a `?` against the expression side: synthesize the bind
+        // target from the expression's type and defer to bind()
+        RawKind::Cmp(op, Rhs::Param(slot, _)) => {
+            let d = |dt: u8, len: u16, sc: i8| Descriptor {
+                dtype: dt,
+                scale: sc,
+                length: len,
+                sub_type: 0,
+                flags: 0,
+                offset: 4,
+            };
+            let (desc, kind) = match lhs.type_of(descs)? {
+                ExprType::Int => (d(dtype::INT64, 8, 0), ColKind::Int),
+                ExprType::Numeric => {
+                    (d(dtype::INT64, 8, lhs.result_scale(descs)?), ColKind::Numeric)
+                }
+                ExprType::Text => (d(dtype::VARYING, 32765, 0), ColKind::Text),
+                // no temporal parameter path yet - refuse
+                ExprType::Temporal(_) => return None,
+            };
+            if params.len() <= *slot {
+                params.resize(*slot + 1, None);
+            }
+            params[*slot] = Some(desc);
+            return Some(Term::ExprParam(Box::new(lhs), *op, *slot, kind));
+        }
         RawKind::Cmp(op, rhs) => Term::ExprCond(Box::new(Cond2::Cmp(
             Box::new(lhs),
             *op,
@@ -22782,13 +22942,49 @@ mod tests {
         assert!(build("MOD(A, ID) = 0").is_none() || true); // ID absent here
         // CAST is admitted now and evaluates
         assert!(build("CAST(A AS VARCHAR(5)) = '-7'").unwrap().matches(&row).unwrap());
-        // type refusals and parameters-against-expressions REMAIN fences
-        for refused in [
-            "MOD(NAME, 2) = 0", // text operand under MOD
-            "UPPER(NAME) = ?",  // param against an expression side
-        ] {
-            assert!(build(refused).is_none(), "{refused} was admitted");
+        // the type refusal REMAINS a fence
+        assert!(build("MOD(NAME, 2) = 0").is_none());
+        // a parameter against an expression side binds now: the slot's
+        // descriptor synthesizes from the expression's type, and the
+        // arrived value substitutes as a literal at bind()
+        {
+            let toks = tokenize("UPPER(NAME) = ?").unwrap();
+            let mut np = 0usize;
+            let raw = parse_predicate(&toks, &mut np).unwrap();
+            assert_eq!(np, 1);
+            let mut params: Vec<Option<Descriptor>> = Vec::new();
+            let p = resolve_predicate(raw, &columns, &descs, &mut params).unwrap();
+            let d = params[0].as_ref().unwrap();
+            assert_eq!(d.dtype, dtype::VARYING); // text expression -> text bind
+            let bound = p.bind(&[WireParam::Text("HELLO".into())]).unwrap();
+            assert!(bound.matches(&row).unwrap());
+            let bound = p.bind(&[WireParam::Text("NOPE".into())]).unwrap();
+            assert!(!bound.matches(&row).unwrap());
+            // a NULL parameter makes the comparison UNKNOWN
+            let bound = p.bind(&[WireParam::Null]).unwrap();
+            assert!(!bound.matches(&row).unwrap());
         }
+        // an integer expression synthesizes an integer bind target
+        {
+            let toks = tokenize("CHAR_LENGTH(NAME) + 1 = ?").unwrap();
+            let mut np = 0usize;
+            let raw = parse_predicate(&toks, &mut np).unwrap();
+            let mut params: Vec<Option<Descriptor>> = Vec::new();
+            let p = resolve_predicate(raw, &columns, &descs, &mut params).unwrap();
+            assert_eq!(params[0].as_ref().unwrap().dtype, dtype::INT64);
+            let bound = p.bind(&[WireParam::Int(6, 0)]).unwrap();
+            assert!(bound.matches(&row).unwrap());
+        }
+        // CASE spans lex to their balancing END - nested CASEs nest,
+        // and an 'end' inside a string literal does not close the span
+        let toks = tokenize("CASE WHEN A > 1 THEN 1 ELSE 0 END = 1").unwrap();
+        assert!(matches!(toks[0], Tok::FnExpr(RawExpr::Case(..))));
+        assert_eq!(toks.len(), 3);
+        assert!(hit("CASE WHEN A < 0 THEN 1 ELSE 0 END = 1"));
+        assert!(hit("CASE WHEN A > 0 THEN 0 ELSE CASE WHEN A < -5 THEN 2 ELSE 1 END END = 2"));
+        assert!(hit("CASE NAME WHEN 'Hello' THEN 'y' ELSE 'n' END = 'y'"));
+        assert!(hit("CASE WHEN NAME = 'the end' THEN 1 ELSE 0 END = 0"));
+
         // ARITHMETIC comparison sides - the shapes the token-level
         // expression parser opened up
         assert!(hit("A + 1 = -6"));

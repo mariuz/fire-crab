@@ -132,6 +132,13 @@ them.
     # exactly the row the engine raises on. A closure that cannot
     # propagate captures the first error and the caller re-raises it
     # after the walk.
+    # keyword-span lexing: CASE has no parens - balance the KEYWORDS
+    # (CASE opens, END closes, word boundaries only, string literals
+    # skipped) and hand the whole span to the expression parser
+    # parameters against expression sides: synthesize the BIND TARGET
+    # from the expression's type (the client encodes against it), then
+    # substitute the arrived value as a LITERAL and re-resolve the term
+    # - binding machinery stays in one place, evaluation in another
     # ERRORS ARE VALUES WITH PAYLOADS: the conversion error carries the
     # offending STRING (the client's message formatter needs it as a
     # vector argument - a code alone prints a placeholder), and every

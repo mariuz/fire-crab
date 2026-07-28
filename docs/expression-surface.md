@@ -19,7 +19,8 @@ IIF), `qa/serve-real-functions.sh` (the built-in scalar functions),
 `qa/serve-real-groupexpr.sh` (GROUP BY expressions, HAVING breadth),
 `qa/serve-real-datemath.sh` (temporal arithmetic),
 `qa/serve-real-wherexpr.sh` (expression predicate sides, the fallible
-fold). Each check in
+fold), `qa/serve-real-predfull.sh` (CASE in WHERE, expression-side
+parameters, join-predicate expressions). Each check in
 those gates runs identical SQL through fire-crab and `isql` against the
 same database file.
 
@@ -51,6 +52,9 @@ same database file.
 | DATEADD/DATEDIFF (both syntaxes each); month-end clamping; TIME wraps midnight; DATEDIFF components vs boundary crossings; MILLISECOND at NUMERIC(18,1) | `src/jrd/SysFunction.cpp` (`makeDateAdd`/`makeDateDiff`), probed | `SysFn::DateAdd`/`DateDiff`, `dateadd_impl`, `datediff_impl` |
 | native temporal operators: DATE ± n (numeric addend CVT-rounds), DATE−DATE = days, TIME−TIME = seconds @ −4, TIMESTAMP diff = days @ −9 truncating | `ExprNodes.cpp` arithmetic over temporal descs, probed | the temporal arms of `Expr::Bin` typing/scale/eval |
 | WHERE comparison sides are full expressions (arithmetic, functions, CAST, conditionals, column vs column); per-row eval errors raise mid-statement with the engine's vector | `src/jrd/evl.cpp` boolean evaluation over expression nodes, probed | `texpr` (token-level sides), the fallible `Predicate::matches` |
+| CASE inside WHERE - the span lexes to its balancing END, keyword-matched (nested CASEs nest, literals skipped) | `parse.y` (CASE is an expression production; the predicate grammar just holds it) | `matching_case_end`, the CASE arm of `tokenize` |
+| `?` against an expression side - the bind target descriptor synthesizes from the expression's TYPE (text → VARCHAR, int → BIGINT, numeric → BIGINT at the scale); the arrived value substitutes as a literal | the engine describes parameters from the comparison's other side | `Term::ExprParam`, the param arm of `resolve_expr_term`, `Predicate::bind` |
+| expressions in JOIN predicates evaluate against the combined row through a synthetic single-relation view (bare unambiguous names; ambiguous names refuse) | the engine's joined-stream contexts | `resolve_join_predicate`'s combined view |
 | GROUP BY takes expression keys, computed per row; a select-list expression must BE one of them (else the engine's -104 "not contained..."); NULL keys share a bucket; `GROUP BY <ordinal>` may name an expression item | `src/jrd/AggNodes.cpp` / DSQL grouping validation, probed | `parse_group_by` (synthetic key slots), `normalize_raw` structural matching |
 | HAVING compares numeric aggregates through exact scale alignment, text MIN/MAX through the pad-trimming compare, and takes expression aggregates as hidden folds | `AggNodes.cpp`, probed (AVG(N) > 0 works; MIN(D) has no literal to meet here) | `resolve_having` (`HKind`), `Term::NumCmp` |
 
@@ -202,11 +206,11 @@ mechanisms:
 
 Known refusals that the engine supports (named next slices, each a
 refusal today rather than a silent gap): `LIST` (its result is a
-blob, which an expression cannot serve yet), `CASE` inside WHERE (no
-parens to lex the span by), `?` parameters against expression sides,
-function calls in JOIN predicates, temporal aggregates in HAVING,
-`DECODE`, `TIME + n`, and `CURRENT_TIME`/`CURRENT_TIMESTAMP` (TIME
-ZONE results).
+blob, which an expression cannot serve yet), `?` parameters INSIDE an
+expression (only a bare `?` on a comparison side binds), QUALIFIED
+names in join-predicate expressions, temporal aggregates in HAVING,
+temporal parameters against expression sides, `DECODE`, `TIME + n`,
+and `CURRENT_TIME`/`CURRENT_TIMESTAMP` (TIME ZONE results).
 
 ## The evaluator's shape
 

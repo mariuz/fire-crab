@@ -13,6 +13,25 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — predicate-surface completion
+
+### Converted
+- **CASE inside WHERE**: the tokenizer lexes the `CASE .. END` span by
+  balancing the KEYWORDS (nested CASEs nest, an 'end' inside a string
+  literal is skipped) and hands it whole to the expression parser —
+  searched, simple, and nested forms as filters.
+- **`?` against expression sides**: `WHERE UPPER(S) = ?` claims its
+  slot with a bind descriptor SYNTHESIZED from the expression's type;
+  at execute the value substitutes as a literal and the term evaluates
+  three-valued (`Term::ExprParam` → `ExprCond` at bind).
+- **Expressions in JOIN predicates**: arithmetic, functions, CASE and
+  column-vs-column over the combined row, through a synthetic
+  single-relation view (bare unambiguous names; ambiguous names
+  refuse rather than guess a side). Gate:
+  `qa/serve-real-predfull.sh`, 20 checks (node-firebird drives the
+  parameter phase); wherexpr/nofallback stale refusals flipped
+  (36 / 54).
+
 ## 2026-07-28 — status-vector fidelity
 
 ### Fixed

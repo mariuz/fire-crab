@@ -136,6 +136,7 @@ answers "SELECT UPPER(S) FROM T ORDER BY ID"
 answers "SELECT SUBSTRING(S FROM 1 FOR 1) FROM T ORDER BY ID"
 answers "SELECT ID FROM T WHERE UPPER(S) = 'X' ORDER BY ID"
 answers "SELECT CASE WHEN A > 1 THEN 1 ELSE 0 END FROM T ORDER BY ID"
+answers "SELECT A FROM T WHERE CASE WHEN A > 1 THEN 1 ELSE 0 END = 1 ORDER BY ID"
 answers "SELECT EXTRACT(YEAR FROM CURRENT_DATE) FROM T WHERE ID = 1"
 answers "SELECT AVG(A) FROM T"
 answers "SELECT COUNT(DISTINCT A) FROM T"
@@ -171,7 +172,7 @@ refuses "ROLLBACK TO NOSUCHPOINT"
 # --- teeth -------------------------------------------------------------
 # the fallback must be reachable AT ALL for this gate to mean anything:
 # a shape far outside the surface should still not answer 4242
-for weird in "SELECT A FROM T WHERE CASE WHEN A > 1 THEN 1 ELSE 0 END = 1" \
+for weird in "SELECT A FROM T WHERE DECODE(A, 1, 2) = 2" \
              "SELECT A FROM T WHERE CAST(A AS VARCHAR(5)) = '1'" \
              "SELECT CURRENT_TIME FROM T" \
              "SELECT A FROM T GROUP BY A HAVING COUNT(*) > 99 ORDER BY 1 ROWS 1 TO 2"; do

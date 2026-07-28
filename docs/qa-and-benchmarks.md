@@ -4255,6 +4255,29 @@ documented not silent: the engine surfaces some cursor errors at
 EXECUTE where fire-crab surfaces them at first FETCH (one leading
 blank line in isql's output).
 
+### Predicate-surface completion (`qa/serve-real-predfull.sh`, 20 checks)
+
+The three refusals the fallible-fold slice left named, closed in one
+slice. CASE INSIDE WHERE: a CASE has no parentheses to lex its span
+by, so the tokenizer balances the KEYWORDS - CASE opens, END closes,
+word boundaries only, string literals skipped - and hands the span to
+the expression parser whole; the teeth pin the trap (a literal
+'the end' inside the CASE must not close it). PARAMETERS AGAINST
+EXPRESSION SIDES: `WHERE UPPER(S) = ?` claims its slot with a bind
+descriptor SYNTHESIZED from the expression's type - text expressions
+announce VARCHAR, integer ones BIGINT, numerics BIGINT at their scale
+- which is what the binding client builds its encoder from; at
+execute the arrived value substitutes as a LITERAL expression and the
+term evaluates through the ordinary three-valued comparison (a NULL
+parameter is UNKNOWN - zero rows, checked). The parameter phase is
+driven by node-firebird and compared against the engine running the
+literal-substituted statement. EXPRESSIONS IN JOIN PREDICATES:
+resolve against a synthetic single-relation view of the combined row
+- each side's columns at their combined indexes, AMBIGUOUS bare names
+dropped from the view so an expression naming one refuses rather than
+guessing a side (qualified names in join expressions are the named
+remainder).
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
@@ -4872,6 +4895,13 @@ FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
 # propagate. Builds its own scratch database.
 FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     bash /path/to/fire-crab/qa/serve-real-wherexpr.sh 3050
+
+# predicate completion: CASE-in-WHERE (keyword-balanced spans), ? against
+# expression sides (synthesized bind targets, node-firebird binds), and
+# join-predicate expressions. Builds its own scratch database.
+NODE_PATH="$PWD/node_modules" \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    bash /path/to/fire-crab/qa/serve-real-predfull.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on

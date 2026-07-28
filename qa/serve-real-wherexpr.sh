@@ -134,9 +134,13 @@ same "DELETE with expr WHERE"       "DELETE FROM T WHERE A * 2 = 999999"
 # a DML whose WHERE raises answers the engine's own 22012 vector now
 same "DML with a raising WHERE"     "UPDATE T SET B = B WHERE A / 0 = 1"
 
+# CASE-in-WHERE and ?-against-expressions joined the surface with the
+# predfull slice (its gate covers them); what remains refused:
+same "CASE in WHERE answers now"    "SELECT ID FROM T WHERE CASE WHEN A > 1 THEN 1 ELSE 0 END = 1 ORDER BY ID"
+
 # --- refusals that REMAIN ----------------------------------------------
-for bad in "SELECT ID FROM T WHERE UPPER(S) = ?" \
-           "SELECT ID FROM T WHERE CASE WHEN A > 1 THEN 1 ELSE 0 END = 1"; do
+for bad in "SELECT ID FROM T WHERE DECODE(A, 1, 2) = 2" \
+           "SELECT ID FROM T WHERE A = ? + 1"; do
     out=$(printf '%s;\n' "$bad" |
           "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
     case "$out" in
