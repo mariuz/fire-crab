@@ -7,19 +7,13 @@
 # per row through the same expression machinery the select list uses,
 # with the same three-valued logic the predicate surface always had.
 #
-# What the design REFUSES is as much the content as what it answers. A
-# WHERE term answers only true/false - it cannot carry the engine's
-# mid-cursor error - so any expression whose per-row evaluation could
-# RAISE is refused at prepare (a clean SQL error), never admitted to
-# silently exclude the row the engine would have raised on:
-#
-#   * MOD with a non-literal or zero divisor (divide by zero)
-#   * a length/count argument that is not a non-negative literal
-#     (LEFT(S, A) - a column could be negative, which raises 22011)
-#   * a text operand under MOD/SIGN/ABS (string-to-number conversion)
-#   * CAST inside a predicate (conversion errors)
-#   * a `?` parameter against an expression side (its bind target would
-#     need a synthesized describe - a later slice)
+# HISTORY NOTE: this gate originally enforced a "no-raise fence" -
+# could-raise shapes refused at prepare, because a WHERE term answered
+# only true/false. The wherexpr slice made predicates FALLIBLE (an
+# eval error propagates with the engine's vector), so those shapes are
+# ADMITTED now and checked differentially below; the fences that
+# remain are the TYPE check (a text operand under MOD/SIGN/ABS) and
+# the `?`-parameter-against-expression-side refusal.
 #
 # THE DIFFERENTIAL: the same isql runs the same SELECT against the
 # engine and fire-crab on the same file; row sets must match exactly -
@@ -138,12 +132,24 @@ u1=$(printf 'UPDATE T SET A = 1000 WHERE UPPER(S) = %s;\nCOMMIT;\n' "'HELLO'" |
      "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1)
 same "rows the UPDATE touched"         "SELECT ID, A FROM T ORDER BY ID"
 
-# --- refusals: could-raise shapes fail at prepare, cleanly -------------
-for bad in "SELECT ID FROM T WHERE MOD(A, N) = 0" \
-           "SELECT ID FROM T WHERE MOD(A, 0) = 0" \
-           "SELECT ID FROM T WHERE LEFT(S, A) = 'x'" \
-           "SELECT ID FROM T WHERE SUBSTRING(S FROM 1 FOR A) = 'x'" \
-           "SELECT ID FROM T WHERE CAST(A AS VARCHAR(5)) = '1'" \
+# --- the once-fenced shapes now ANSWER (the fallible fold admitted
+# --- them; serve-real-wherexpr.sh is their gate) - compared to the
+# --- engine here, empty results and runtime errors alike
+# the runtime divisor hits row 4's 0.00 and raises the same 22012 on
+# both sides; the engine surfaces it at EXECUTE, fire-crab at first
+# FETCH - one leading blank in isql (a documented difference)
+out=$(printf 'SET HEADING OFF;\nSELECT ID FROM T WHERE MOD(A, N) = 0 ORDER BY ID;\n' |
+      "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
+case "$out" in
+    *"SQLSTATE = 22012"*) echo "OK   runtime MOD divisor raises 22012" ;;
+    *) echo "DIFF runtime MOD divisor gave [$out]"; fail=1 ;;
+esac
+same "column LEFT length"           "SELECT ID FROM T WHERE LEFT(S, A) = 'x'"
+same "column SUBSTRING length"      "SELECT ID FROM T WHERE SUBSTRING(S FROM 1 FOR A) = 'x'"
+same "CAST in a predicate"          "SELECT ID FROM T WHERE CAST(A AS VARCHAR(5)) = '1'"
+
+# --- refusals that remain, plus the raising divisor --------------------
+for bad in "SELECT ID FROM T WHERE MOD(A, 0) = 0" \
            "SELECT ID FROM T WHERE UPPER(S, 2) = 'X'"; do
     out=$(printf '%s;\n' "$bad" |
           "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')

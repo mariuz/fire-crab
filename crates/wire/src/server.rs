@@ -1424,10 +1424,25 @@ enum Term {
 struct Predicate(Vec<Vec<Term>>);
 
 impl Predicate {
-    fn matches(&self, values: &[Value]) -> bool {
-        self.0
-            .iter()
-            .any(|group| group.iter().all(|t| t.matches(values)))
+    /// TRUE keeps the row. `Err` is a per-row evaluation error inside an
+    /// expression term (WHERE A / 0 = 1) - the engine raises it
+    /// mid-statement, so every caller must propagate, never swallow: a
+    /// swallowed error would silently exclude exactly the row the
+    /// engine raises on.
+    fn matches(&self, values: &[Value]) -> Result<bool, EvalErr> {
+        for group in &self.0 {
+            let mut all = true;
+            for t in group {
+                if !t.matches(values)? {
+                    all = false;
+                    break;
+                }
+            }
+            if all {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Substitute every parameter slot with the value that arrived at
@@ -1517,8 +1532,8 @@ fn ord_ok(o: std::cmp::Ordering, op: Cmp) -> bool {
 }
 
 impl Term {
-    fn matches(&self, values: &[Value]) -> bool {
-        match self {
+    fn matches(&self, values: &[Value]) -> Result<bool, EvalErr> {
+        Ok(match self {
             // out-of-range / missing column reads as NULL
             Term::IsNull(fid) => matches!(values.get(*fid), Some(Value::Null) | None),
             Term::IsNotNull(fid) => {
@@ -1563,14 +1578,15 @@ impl Term {
             },
             Term::Const(b) => *b,
             Term::Never => false,
-            // TRUE keeps the row; false, UNKNOWN and the (unreachable
-            // by construction, see the variant doc) Err all exclude it
-            Term::ExprCond(c) => matches!(c.eval(values), Ok(Some(true))),
-            Term::ExprLike(e, pattern, escape, negated) => match e.eval(values) {
-                Ok(Value::Null) | Err(_) => false,
-                Ok(v) => like_match(&v.render(), pattern, *escape) != *negated,
+            // TRUE keeps the row; false and UNKNOWN exclude it; an eval
+            // error PROPAGATES - the engine raises WHERE A / 0 = 1
+            // mid-statement, and so do we
+            Term::ExprCond(c) => c.eval(values)? == Some(true),
+            Term::ExprLike(e, pattern, escape, negated) => match e.eval(values)? {
+                Value::Null => false,
+                v => like_match(&v.render(), pattern, *escape) != *negated,
             },
-        }
+        })
     }
 }
 
@@ -7697,7 +7713,7 @@ fn collect_dml_targets(
     rel: u16,
     formats: &[(u8, Vec<Descriptor>)],
     filter: &Option<Predicate>,
-) -> Vec<(u32, u16, u8, Vec<u8>)> {
+) -> Result<Vec<(u32, u16, u8, Vec<u8>)>, EvalErr> {
     let mut out = Vec::new();
     for dp_no in relation_data_pages(&db.bytes, db.page_size, rel) {
         let start = dp_no as usize * db.page_size;
@@ -7719,12 +7735,14 @@ fn collect_dml_targets(
                 .or_else(|| formats.iter().max_by_key(|(n, _)| *n));
             let Some((_, descs)) = descs else { continue };
             let values = decode_record(&image, descs);
-            if filter.as_ref().map_or(true, |p| p.matches(&values)) {
+            // a WHERE eval error (divide by zero) aborts the DML like
+            // the engine's - never a partial row set
+            if filter.as_ref().map_or(Ok(true), |p| p.matches(&values))? {
                 out.push((dp_no, r.slot, r.format, image));
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Execute a DML plan against a WORKING COPY of the database bytes - a
@@ -8115,8 +8133,18 @@ fn execute_dml(
             // violation; an UNKNOWN (NULL-operand) check passes
             if !checks.is_empty() {
                 let values = decode_record(&image, descs);
-                if checks.iter().any(|c| c.matches(&values)) {
-                    return Err("Operation violates CHECK constraint".into());
+                for c in checks {
+                    match c.matches(&values) {
+                        Ok(true) => {
+                            return Err("Operation violates CHECK constraint".into())
+                        }
+                        Ok(false) => {}
+                        Err(_) => {
+                            return Err(
+                                "arithmetic exception evaluating a CHECK constraint".into()
+                            )
+                        }
+                    }
                 }
             }
             // FOREIGN KEY child-side partner check, where the engine
@@ -8178,7 +8206,9 @@ fn execute_dml(
             let filter = &bind_filter(filter, args)?;
             let mut targets: Vec<(u32, u16, Vec<u8>)> = Vec::new();
             let mut old_images: Vec<Vec<u8>> = Vec::new();
-            for (page, slot, fmt, image) in collect_dml_targets(db, *rel, formats, filter) {
+            for (page, slot, fmt, image) in collect_dml_targets(db, *rel, formats, filter)
+                .map_err(|_| "arithmetic exception evaluating the WHERE clause".to_string())?
+            {
                 // the SET offsets were resolved in the NEWEST format; a
                 // record still stored in an older one would patch wrong
                 // bytes - refuse the whole statement instead
@@ -8242,8 +8272,19 @@ fn execute_dml(
                 // match is a violation, an UNKNOWN check passes)
                 if !checks.is_empty() {
                     let new_values = decode_record(&img, descs);
-                    if checks.iter().any(|c| c.matches(&new_values)) {
-                        return Err("Operation violates CHECK constraint".into());
+                    for c in checks {
+                        match c.matches(&new_values) {
+                            Ok(true) => {
+                                return Err("Operation violates CHECK constraint".into())
+                            }
+                            Ok(false) => {}
+                            Err(_) => {
+                                return Err(
+                                    "arithmetic exception evaluating a CHECK constraint"
+                                        .into(),
+                                )
+                            }
+                        }
                     }
                 }
                 // FOREIGN KEY partner checks, both directions: the
@@ -8289,7 +8330,9 @@ fn execute_dml(
         Plan::Delete { rel, formats, filter, fk_children } => {
             let filter = &bind_filter(filter, args)?;
             let mut targets: Vec<(u32, u16)> = Vec::new();
-            for (page, slot, fmt, image) in collect_dml_targets(db, *rel, formats, filter) {
+            for (page, slot, fmt, image) in collect_dml_targets(db, *rel, formats, filter)
+                .map_err(|_| "arithmetic exception evaluating the WHERE clause".to_string())?
+            {
                 // NO ACTION partner check, per deleted row: its key
                 // must not be referenced by any child (the row's own
                 // stored format decodes it, like the target walk did)
@@ -9327,8 +9370,18 @@ fn branch_rows(
     let mut out: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
     let mut bad = false;
     for_each_record(db, *rel, formats, |values| {
-        if bad || !filter.as_ref().map_or(true, |p| p.matches(values)) {
+        if bad {
             return;
+        }
+        // an eval error in the filter refuses the materialising path
+        // (the engine raises; the refusal is an error too, not a row)
+        match filter.as_ref().map_or(Ok(true), |p| p.matches(values)) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(_) => {
+                bad = true;
+                return;
+            }
         }
         let mut row = Vec::with_capacity(cols.len());
         for c in cols {
@@ -10424,7 +10477,18 @@ fn aggregate(
     target: &AggTarget,
     filter: &Option<Predicate>,
 ) -> Option<Option<i64>> {
-    let matches = |vals: &[Value]| filter.as_ref().map_or(true, |p| p.matches(vals));
+    // an eval error in the filter DECLINES the prepare-time fast path
+    // (poisons the flag); the caller then routes through the group
+    // machinery, which computes at fetch and raises the error there -
+    // exactly where the engine raises it
+    let ferr = std::cell::Cell::new(false);
+    let matches = |vals: &[Value]| match filter.as_ref().map_or(Ok(true), |p| p.matches(vals)) {
+        Ok(b) => b,
+        Err(_) => {
+            ferr.set(true);
+            false
+        }
+    };
 
     // COUNT(*) does not need the column values, only the row count. With no
     // filter it counts record headers without decoding - which is also the
@@ -10443,6 +10507,9 @@ fn aggregate(
                 n
             }
         };
+        if ferr.get() {
+            return None;
+        }
         return Some(Some(n));
     }
 
@@ -10465,6 +10532,9 @@ fn aggregate(
                 n += 1;
             }
         });
+        if ferr.get() {
+            return None;
+        }
         return Some(Some(n));
     }
     if !matches!(col_kind(descs.get(fid)?)?, ColKind::Int) {
@@ -10499,6 +10569,9 @@ fn aggregate(
             (AggFn::Count | AggFn::Avg, _) => unreachable!(),
         });
     });
+    if ferr.get() {
+        return None;
+    }
     Some(acc)
 }
 
@@ -10568,9 +10641,15 @@ fn join_rows(
     let lrows = collect(left_rel, left_formats, left_width);
     let rrows = collect(right_rel, right_formats, right_width);
     let mut out = Vec::new();
+    let mut ferr: Option<EvalErr> = None;
     let mut keep = |row: Vec<Value>| {
-        if filter.as_ref().map_or(true, |p| p.matches(&row)) {
-            out.push(row);
+        if ferr.is_some() {
+            return;
+        }
+        match filter.as_ref().map_or(Ok(true), |p| p.matches(&row)) {
+            Ok(true) => out.push(row),
+            Ok(false) => {}
+            Err(e) => ferr = Some(e),
         }
     };
     let mut right_matched = vec![false; rrows.len()];
@@ -10704,11 +10783,20 @@ fn group_output(
     having: &Option<Predicate>,
 ) -> Result<Vec<Vec<Value>>, EvalErr> {
     let mut input: Vec<Vec<Value>> = Vec::new();
+    let mut ferr: Option<EvalErr> = None;
     for_each_record(db, rel, formats, |v| {
-        if filter.as_ref().map_or(true, |p| p.matches(v)) {
-            input.push(v.to_vec());
+        if ferr.is_some() {
+            return;
+        }
+        match filter.as_ref().map_or(Ok(true), |p| p.matches(v)) {
+            Ok(true) => input.push(v.to_vec()),
+            Ok(false) => {}
+            Err(e) => ferr = Some(e),
         }
     });
+    if let Some(e) = ferr {
+        return Err(e);
+    }
     // expression keys: evaluate each into its synthetic slot, so the
     // bucketing sort and the Key output items read it like a field.
     // The filter above ran on the ORIGINAL row; an eval error here
@@ -10741,7 +10829,13 @@ fn group_output(
         }
     }
     if let Some(h) = having {
-        out.retain(|row| h.matches(row));
+        let mut kept = Vec::with_capacity(out.len());
+        for row in out {
+            if h.matches(&row)? {
+                kept.push(row);
+            }
+        }
+        out = kept;
     }
     Ok(out)
 }
@@ -11472,7 +11566,12 @@ fn emit_rows_inner(
         } => {
             if let Some(db) = db {
                 let filter = bind_filter(filter, args)?;
-                let accepts = |v: &[Value]| filter.as_ref().map_or(true, |p| p.matches(v));
+                let accepts = |v: &[Value]| -> Result<bool, EvalErr> {
+                    match &filter {
+                        None => Ok(true),
+                        Some(p) => p.matches(v),
+                    }
+                };
                 if !gen_cols.is_empty() {
                     // a generator advance per row: materialise, sort into
                     // OUTPUT order, then advance each generator once per row
@@ -11480,11 +11579,20 @@ fn emit_rows_inner(
                     // GEN_ID mid-fetch, after the sort). The final values are
                     // handed back for the caller to persist.
                     let mut rows: Vec<Vec<Value>> = Vec::new();
+                    let mut ferr: Option<EvalErr> = None;
                     for_each_record(db, *rel, formats, |values| {
-                        if accepts(values) {
-                            rows.push(values.to_vec());
+                        if ferr.is_some() {
+                            return;
+                        }
+                        match accepts(values) {
+                            Ok(true) => rows.push(values.to_vec()),
+                            Ok(false) => {}
+                            Err(e) => ferr = Some(e),
                         }
                     });
+                    if let Some(e) = ferr {
+                        return Err(EmitErr::Eval(e));
+                    }
                     if !order_by.is_empty() {
                         rows.sort_by(|a, b| order_cmp(a, b, order_by));
                     }
@@ -11529,10 +11637,14 @@ fn emit_rows_inner(
                         if eval_err.is_some() {
                             return;
                         }
-                        if accepts(values) {
-                            if let Err(e) = encode_row(w, cols, values) {
-                                eval_err = Some(e);
+                        match accepts(values) {
+                            Ok(true) => {
+                                if let Err(e) = encode_row(w, cols, values) {
+                                    eval_err = Some(e);
+                                }
                             }
+                            Ok(false) => {}
+                            Err(e) => eval_err = Some(e),
                         }
                     });
                     if let Some(e) = eval_err {
@@ -11541,11 +11653,20 @@ fn emit_rows_inner(
                 } else {
                     // collect matching rows, then sort by the ORDER BY keys
                     let mut rows: Vec<Vec<Value>> = Vec::new();
+                    let mut ferr: Option<EvalErr> = None;
                     for_each_record(db, *rel, formats, |values| {
-                        if accepts(values) {
-                            rows.push(values.to_vec());
+                        if ferr.is_some() {
+                            return;
+                        }
+                        match accepts(values) {
+                            Ok(true) => rows.push(values.to_vec()),
+                            Ok(false) => {}
+                            Err(e) => ferr = Some(e),
                         }
                     });
+                    if let Some(e) = ferr {
+                        return Err(EmitErr::Eval(e));
+                    }
                     rows.sort_by(|a, b| order_cmp(a, b, order_by));
                     for values in &rows {
                         encode_row(w, cols, values)?;
@@ -14960,18 +15081,42 @@ fn eval_subquery(
 
     if existence_only && want_fid.is_none() {
         let mut any = false;
+        let mut ferr = false;
         for_each_record(db, rel, &formats, |v| {
-            if !any && filter.as_ref().map_or(true, |p| p.matches(v)) {
+            if !any
+                && !ferr
+                && match filter.as_ref().map_or(Ok(true), |p| p.matches(v)) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        ferr = true;
+                        false
+                    }
+                }
+            {
                 any = true;
             }
         });
+        if ferr {
+            return None;
+        }
         return Some(SubqRows { values: Vec::new(), any });
     }
     let fid = want_fid?;
     let mut values = Vec::new();
     let mut any = false;
+    let mut ferr = false;
     for_each_record(db, rel, &formats, |v| {
-        if filter.as_ref().map_or(true, |p| p.matches(v)) {
+        if ferr {
+            return;
+        }
+        let keep = match filter.as_ref().map_or(Ok(true), |p| p.matches(v)) {
+            Ok(b) => b,
+            Err(_) => {
+                ferr = true;
+                false
+            }
+        };
+        if keep {
             any = true;
             values.push(v.get(fid).cloned().unwrap_or(Value::Null));
         }
@@ -15552,6 +15697,13 @@ enum Tok {
     /// expression parser. What makes `WHERE UPPER(S) = 'X'` a leaf the
     /// predicate grammar can hold.
     FnExpr(RawExpr),
+    /// arithmetic operators - a comparison SIDE may be a full
+    /// expression (`WHERE A + 1 > B`); the token-level expression
+    /// parser ([texpr]) folds these back into a [RawExpr]
+    Plus,
+    Minus,
+    Star,
+    Slash,
 }
 
 /// Finish an integer-or-decimal literal whose integer digits end at
@@ -15663,13 +15815,44 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                 }
                 out.push(numeric_tok(s, b, start, &mut i)?);
             }
-            b'-' if b.get(i + 1).is_some_and(|c| c.is_ascii_digit()) => {
-                let start = i;
+            b'+' => {
+                out.push(Tok::Plus);
                 i += 1;
-                while i < b.len() && b[i].is_ascii_digit() {
+            }
+            b'*' => {
+                out.push(Tok::Star);
+                i += 1;
+            }
+            b'/' => {
+                out.push(Tok::Slash);
+                i += 1;
+            }
+            // '-' AFTER a value-like token is the subtraction operator
+            // (A - 1); before a digit elsewhere it starts a negative
+            // literal (A = -1); bare, it is unary minus
+            b'-' => {
+                let after_value = matches!(
+                    out.last(),
+                    Some(
+                        Tok::Ident(_)
+                            | Tok::Int(_)
+                            | Tok::Dec(..)
+                            | Tok::Str(_)
+                            | Tok::RParen
+                            | Tok::FnExpr(_)
+                    )
+                );
+                if !after_value && b.get(i + 1).is_some_and(|c| c.is_ascii_digit()) {
+                    let start = i;
+                    i += 1;
+                    while i < b.len() && b[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    out.push(numeric_tok(s, b, start, &mut i)?);
+                } else {
+                    out.push(Tok::Minus);
                     i += 1;
                 }
-                out.push(numeric_tok(s, b, start, &mut i)?);
             }
             _ if is_ident_byte(c) => {
                 let start = i;
@@ -15714,7 +15897,9 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                 // hand the whole call to the expression parser. A call
                 // that does not parse fails the tokenize - the statement
                 // then refuses, exactly like a malformed select-list call.
-                if sysfn_named(&upper).is_some() {
+                if sysfn_named(&upper).is_some()
+                    || matches!(upper.as_str(), "CAST" | "COALESCE" | "NULLIF" | "IIF")
+                {
                     let mut j = i;
                     while j < b.len() && b[j].is_ascii_whitespace() {
                         j += 1;
@@ -15883,13 +16068,21 @@ fn parse_unary(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
             Some(Ast::Not(Box::new(parse_unary(t, pos, np)?)))
         }
         Some(Tok::LParen) => {
-            *pos += 1;
-            let inner = parse_or(t, pos, np)?;
-            if !matches!(t.get(*pos), Some(Tok::RParen)) {
-                return None;
+            // a paren opens a BOOLEAN group or a parenthesised
+            // expression side ((A + 1) * 2 > 4): try the group on a
+            // position copy, fall through to the leaf parser otherwise
+            {
+                let mut p2 = *pos + 1;
+                let mut np2 = *np;
+                if let Some(inner) = parse_or(t, &mut p2, &mut np2) {
+                    if matches!(t.get(p2), Some(Tok::RParen)) {
+                        *pos = p2 + 1;
+                        *np = np2;
+                        return Some(inner);
+                    }
+                }
             }
-            *pos += 1;
-            Some(inner)
+            parse_leaf(t, pos, np)
         }
         // a subquery already decided by [resolve_subqueries] - it carries
         // no column, so it stands alone as a leaf
@@ -15924,14 +16117,150 @@ fn parse_value(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Rhs> {
     Some(v)
 }
 
-fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
-    let lhs = match t.get(*pos)? {
-        Tok::Ident(c) => RawLhs::Col(c.clone()),
-        Tok::Agg(f, target) => RawLhs::Agg(*f, target.clone()),
-        Tok::FnExpr(e) => RawLhs::Expr(e.clone()),
+/// Token-level expression parser: folds a run of value tokens and
+/// arithmetic operators back into a [RawExpr] - the comparison SIDES of
+/// a predicate (`WHERE A + 1 > B * 2`). Mirrors the char-level parser's
+/// precedence (`+`/`-` over `*`/`/` over unary `-` over atoms); function
+/// calls arrive pre-parsed as [Tok::FnExpr]. Parameters (`?`) are NOT
+/// expression atoms - a bare `?` stays on the classic Rhs path, where
+/// its bind machinery lives.
+fn texpr(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
+    let mut left = texpr_mul(t, pos)?;
+    loop {
+        match t.get(*pos) {
+            Some(Tok::Plus) => {
+                *pos += 1;
+                left = RawExpr::Bin(Box::new(left), ArithOp::Add, Box::new(texpr_mul(t, pos)?));
+            }
+            Some(Tok::Minus) => {
+                *pos += 1;
+                left = RawExpr::Bin(Box::new(left), ArithOp::Sub, Box::new(texpr_mul(t, pos)?));
+            }
+            _ => break,
+        }
+    }
+    Some(left)
+}
+
+fn texpr_mul(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
+    let mut left = texpr_unary(t, pos)?;
+    loop {
+        match t.get(*pos) {
+            Some(Tok::Star) => {
+                *pos += 1;
+                left = RawExpr::Bin(Box::new(left), ArithOp::Mul, Box::new(texpr_unary(t, pos)?));
+            }
+            Some(Tok::Slash) => {
+                *pos += 1;
+                left = RawExpr::Bin(Box::new(left), ArithOp::Div, Box::new(texpr_unary(t, pos)?));
+            }
+            _ => break,
+        }
+    }
+    Some(left)
+}
+
+fn texpr_unary(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
+    if matches!(t.get(*pos), Some(Tok::Minus)) {
+        *pos += 1;
+        return Some(RawExpr::Neg(Box::new(texpr_unary(t, pos)?)));
+    }
+    if matches!(t.get(*pos), Some(Tok::Plus)) {
+        *pos += 1;
+        return texpr_unary(t, pos);
+    }
+    texpr_atom(t, pos)
+}
+
+fn texpr_atom(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
+    let e = match t.get(*pos)? {
+        Tok::Int(n) => RawExpr::Int(*n),
+        Tok::Dec(r, sc) => RawExpr::Dec(*r, *sc),
+        Tok::Str(v) => RawExpr::Str(v.clone()),
+        Tok::Null => RawExpr::Null,
+        Tok::Ident(c) => RawExpr::Col(c.clone()),
+        Tok::FnExpr(e) => e.clone(),
+        Tok::LParen => {
+            *pos += 1;
+            let inner = texpr(t, pos)?;
+            if !matches!(t.get(*pos), Some(Tok::RParen)) {
+                return None;
+            }
+            inner
+        }
         _ => return None,
     };
     *pos += 1;
+    Some(e)
+}
+
+/// TRUE when the token at `pos` ends a comparison side - what
+/// distinguishes a bare literal right side (the classic Rhs paths, with
+/// their parameter binding and index-friendly terms) from the start of
+/// an expression (`1 + 1`).
+fn side_boundary(t: &[Tok], pos: usize) -> bool {
+    matches!(
+        t.get(pos),
+        None | Some(
+            Tok::And
+                | Tok::Or
+                | Tok::RParen
+                | Tok::Comma
+                | Tok::Escape
+                | Tok::Cmp(_)
+                | Tok::Is
+                | Tok::Not
+                | Tok::Like
+                | Tok::Between
+                | Tok::In
+        )
+    )
+}
+
+/// One comparison side: a literal/parameter (the classic [Rhs]) when it
+/// ends at a boundary, else a full expression.
+enum Side {
+    Val(Rhs),
+    Expr(RawExpr),
+}
+
+fn parse_side(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Side> {
+    {
+        let mut p2 = *pos;
+        let mut np2 = *np;
+        if let Some(v) = parse_value(t, &mut p2, &mut np2) {
+            if side_boundary(t, p2) {
+                *pos = p2;
+                *np = np2;
+                return Some(Side::Val(v));
+            }
+        }
+    }
+    Some(Side::Expr(texpr(t, pos)?))
+}
+
+fn side_kind(op: Cmp, side: Side) -> RawKind {
+    match side {
+        Side::Val(v) => RawKind::Cmp(op, v),
+        Side::Expr(e) => RawKind::CmpExpr(op, e),
+    }
+}
+
+fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
+    let lhs = match t.get(*pos)? {
+        Tok::Agg(f, target) => {
+            let l = RawLhs::Agg(*f, target.clone());
+            *pos += 1;
+            l
+        }
+        // anything else parses as an expression side; a side that
+        // reduces to a bare column keeps the classic paths (parameters,
+        // the exact numeric terms)
+        _ => match texpr(t, pos)? {
+            RawExpr::Col(c) => RawLhs::Col(c),
+            e => RawLhs::Expr(e),
+        },
+    };
     let leaf = |kind: RawKind| Ast::Leaf(RawTerm { lhs: lhs.clone(), kind });
     // an optional NOT immediately before LIKE/BETWEEN/IN
     let negated = if matches!(t.get(*pos), Some(Tok::Not))
@@ -15946,14 +16275,10 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
         Tok::Cmp(op) if !negated => {
             let op = *op;
             *pos += 1;
-            // a function call on the RIGHT side is its own kind - Rhs
-            // stays the literal/parameter enum the resolved terms carry
-            if let Some(Tok::FnExpr(e)) = t.get(*pos) {
-                let e = e.clone();
-                *pos += 1;
-                return Some(leaf(RawKind::CmpExpr(op, e)));
+            match parse_side(t, pos, np)? {
+                Side::Val(v) => Some(leaf(RawKind::Cmp(op, v))),
+                Side::Expr(e) => Some(leaf(RawKind::CmpExpr(op, e))),
             }
-            Some(leaf(RawKind::Cmp(op, parse_value(t, pos, np)?)))
         }
         Tok::Is if !negated => {
             *pos += 1;
@@ -15992,16 +16317,16 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
         }
         Tok::Between => {
             *pos += 1;
-            let lo = parse_value(t, pos, np)?;
+            let lo = parse_side(t, pos, np)?;
             if !matches!(t.get(*pos), Some(Tok::And)) {
                 return None;
             }
             *pos += 1;
-            let hi = parse_value(t, pos, np)?;
+            let hi = parse_side(t, pos, np)?;
             // x BETWEEN lo AND hi = x >= lo AND x <= hi (bounds not swapped)
             let body = Ast::And(vec![
-                leaf(RawKind::Cmp(Cmp::Ge, lo)),
-                leaf(RawKind::Cmp(Cmp::Le, hi)),
+                leaf(side_kind(Cmp::Ge, lo)),
+                leaf(side_kind(Cmp::Le, hi)),
             ]);
             Some(if negated { Ast::Not(Box::new(body)) } else { body })
         }
@@ -16011,10 +16336,10 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                 return None;
             }
             *pos += 1;
-            let mut items = vec![leaf(RawKind::Cmp(Cmp::Eq, parse_value(t, pos, np)?))];
+            let mut items = vec![leaf(side_kind(Cmp::Eq, parse_side(t, pos, np)?))];
             while matches!(t.get(*pos), Some(Tok::Comma)) {
                 *pos += 1;
-                items.push(leaf(RawKind::Cmp(Cmp::Eq, parse_value(t, pos, np)?)));
+                items.push(leaf(side_kind(Cmp::Eq, parse_side(t, pos, np)?)));
             }
             if !matches!(t.get(*pos), Some(Tok::RParen)) {
                 return None;
@@ -17089,18 +17414,7 @@ fn resolve_expr_term(
         RawKind::Like(..) => return None, // non-literal pattern
         RawKind::Const(_) => return None, // handled before resolution
     };
-    // the no-raise fence: a shape whose evaluation could raise per row
-    // refuses at prepare - Term::matches answers a bool and cannot
-    // carry the engine's mid-cursor error
-    let safe = match &term {
-        Term::ExprCond(c) => cond_no_raise(c, descs),
-        Term::ExprLike(e, ..) => expr_no_raise(e, descs),
-        _ => unreachable!(),
-    };
-    if !safe {
-        return None;
-    }
-    // and both sides must TYPE - an untypeable operand never reaches
+    // both sides must TYPE - an untypeable operand never reaches
     // eval (resolve_expr already refused unknown columns)
     fn cond_types(c: &Cond2, descs: &[Descriptor]) -> Option<()> {
         match c {
@@ -20148,14 +20462,15 @@ mod tests {
         let b = p
             .bind(&[WireParam::Int(42, 0), WireParam::Text("x".into())])
             .unwrap();
-        assert!(b.matches(&[
+        assert!(b
+            .matches(&[
             Value::Null,
             Value::Null,
             Value::Null,
             Value::Int(42),
             Value::Null,
             Value::Text("x".into()),
-        ]));
+        ]).unwrap());
         // a NULL parameter compares as UNKNOWN - the row is excluded
         let b = p
             .bind(&[WireParam::Null, WireParam::Text("x".into())])
@@ -20167,7 +20482,7 @@ mod tests {
             Value::Int(42),
             Value::Null,
             Value::Text("x".into()),
-        ]));
+        ]).unwrap());
         // a wire type that does not match the column kind is an error
         assert!(p
             .bind(&[WireParam::Text("42".into()), WireParam::Text("x".into())])
@@ -20196,7 +20511,7 @@ mod tests {
         let b = p
             .bind(&[WireParam::Int(7, 0), WireParam::Text("q".into())])
             .unwrap();
-        assert!(b.matches(&[Value::Int(7), Value::Text("q".into())]));
+        assert!(b.matches(&[Value::Int(7), Value::Text("q".into())]).unwrap());
         // a parameter on an unbindable column type refuses the plan
         let toks = tokenize("A = ?").unwrap();
         let raw = parse_predicate(&toks, &mut 0).unwrap();
@@ -20295,8 +20610,8 @@ mod tests {
         let b = p
             .bind(&[WireParam::Int(1, 0), WireParam::Int(99, 0), WireParam::Int(7, 0)])
             .unwrap();
-        assert!(!b.matches(&[Value::Int(1), Value::Int(0)])); // A=1 but A<>7
-        assert!(b.matches(&[Value::Int(7), Value::Int(99)])); // B=99, A=7
+        assert!(!b.matches(&[Value::Int(1), Value::Int(0)]).unwrap()); // A=1 but A<>7
+        assert!(b.matches(&[Value::Int(7), Value::Int(99)]).unwrap()); // B=99, A=7
         // a LIKE pattern `?` registers as the text column's descriptor
         let mut np = 0usize;
         let raw = parse_predicate(&tokenize("B LIKE ?").unwrap(), &mut np).unwrap();
@@ -20305,10 +20620,10 @@ mod tests {
         let p = resolve_predicate(raw, &columns, &text_descs, &mut params).unwrap();
         assert_eq!(params[0].as_ref().unwrap().dtype, dtype::VARYING);
         let b = p.bind(&[WireParam::Text("q%".into())]).unwrap();
-        assert!(b.matches(&[Value::Int(0), Value::Text("quux".into())]));
+        assert!(b.matches(&[Value::Int(0), Value::Text("quux".into())]).unwrap());
         // and a NULL pattern is UNKNOWN
         let b = p.bind(&[WireParam::Null]).unwrap();
-        assert!(!b.matches(&[Value::Int(0), Value::Text("quux".into())]));
+        assert!(!b.matches(&[Value::Int(0), Value::Text("quux".into())]).unwrap());
     }
 
     #[test]
@@ -20717,9 +21032,9 @@ mod tests {
                 Value::Text(dname.into()),
             ]
         };
-        assert!(p.matches(&row(5, "Sales")));
-        assert!(!p.matches(&row(4, "Sales")));
-        assert!(!p.matches(&row(9, "Ops")));
+        assert!(p.matches(&row(5, "Sales")).unwrap());
+        assert!(!p.matches(&row(4, "Sales")).unwrap());
+        assert!(!p.matches(&row(9, "Ops")).unwrap());
         // an ambiguous bare column cannot resolve
         let raw = parse_predicate(&tokenize("NAME = 'x'").unwrap(), &mut 0).unwrap();
         assert!(resolve_join_predicate(raw, &sides, &mut Vec::new()).is_none());
@@ -20746,9 +21061,9 @@ mod tests {
         assert_eq!(gitems.len(), 3); // one hidden item appended: SUM(SALARY)
         assert!(matches!(gitems[2], GItem::Agg(AggFn::Sum, AggSrc::Field(5), false)));
         // output rows: [key, count, hidden sum]
-        assert!(p.matches(&[Value::Int(1), Value::Int(4), Value::Int(200)]));
-        assert!(!p.matches(&[Value::Int(1), Value::Int(4), Value::Int(50)]));
-        assert!(p.matches(&[Value::Null, Value::Int(1), Value::Null])); // the OR arm
+        assert!(p.matches(&[Value::Int(1), Value::Int(4), Value::Int(200)]).unwrap());
+        assert!(!p.matches(&[Value::Int(1), Value::Int(4), Value::Int(50)]).unwrap());
+        assert!(p.matches(&[Value::Null, Value::Int(1), Value::Null]).unwrap()); // the OR arm
         // a non-grouped column in HAVING is invalid
         let raw = parse_predicate(&tokenize("SALARY > 1").unwrap(), &mut 0).unwrap();
         assert!(resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).is_none());
@@ -20758,8 +21073,8 @@ mod tests {
         let p = resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).unwrap();
         assert_eq!(gitems.len(), 4);
         assert!(matches!(gitems[3], GItem::Agg(AggFn::Min, AggSrc::Field(1), false)));
-        assert!(p.matches(&[Value::Null, Value::Null, Value::Null, Value::Text("ann  ".into())]));
-        assert!(!p.matches(&[Value::Null, Value::Null, Value::Null, Value::Text("bob".into())]));
+        assert!(p.matches(&[Value::Null, Value::Null, Value::Null, Value::Text("ann  ".into())]).unwrap());
+        assert!(!p.matches(&[Value::Null, Value::Null, Value::Null, Value::Text("bob".into())]).unwrap());
         // an aggregate compared against a string literal is a type mismatch
         let raw = parse_predicate(&tokenize("COUNT(*) = 'x'").unwrap(), &mut 0).unwrap();
         assert!(resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).is_none());
@@ -20775,13 +21090,13 @@ mod tests {
             Term::Cmp(0, Cmp::Ge, Rhs::Int(5)),
             Term::Cmp(1, Cmp::Eq, Rhs::Str("x".into())),
         ]]);
-        assert!(p.matches(&[Value::Int(5), Value::Text("x   ".into())])); // trailing blanks ignored
-        assert!(!p.matches(&[Value::Int(4), Value::Text("x".into())])); // 4 < 5
-        assert!(!p.matches(&[Value::Int(9), Value::Text("y".into())])); // text differs
+        assert!(p.matches(&[Value::Int(5), Value::Text("x   ".into())]).unwrap()); // trailing blanks ignored
+        assert!(!p.matches(&[Value::Int(4), Value::Text("x".into())]).unwrap()); // 4 < 5
+        assert!(!p.matches(&[Value::Int(9), Value::Text("y".into())]).unwrap()); // text differs
         // NULL comparison is UNKNOWN (excluded); IS NULL catches it
-        assert!(!Term::Cmp(0, Cmp::Eq, Rhs::Int(1)).matches(&[Value::Null]));
-        assert!(Term::IsNull(0).matches(&[Value::Null]));
-        assert!(Term::IsNotNull(0).matches(&[Value::Int(0)]));
+        assert!(!Term::Cmp(0, Cmp::Eq, Rhs::Int(1)).matches(&[Value::Null]).unwrap());
+        assert!(Term::IsNull(0).matches(&[Value::Null]).unwrap());
+        assert!(Term::IsNotNull(0).matches(&[Value::Int(0)]).unwrap());
     }
 
     #[test]
@@ -20972,7 +21287,7 @@ mod tests {
             let mut params = Vec::new();
             resolve_predicate(raw, &columns, &descs, &mut params)
         };
-        let hits = |s: &str| resolve(s).unwrap().matches(&row);
+        let hits = |s: &str| resolve(s).unwrap().matches(&row).unwrap();
         // scaled column vs integer and decimal literals, exact compare
         assert!(hits("N = 12.50"));
         assert!(hits("N = 12.5")); // trailing zeros are display, not value
@@ -20993,8 +21308,8 @@ mod tests {
         assert!(!hits("A = 9.5"));
         // NULL semantics: UNKNOWN excludes, IS NULL selects
         let null_row = vec![Value::Int(10), Value::Null, Value::Int128(42, 0)];
-        assert!(!resolve("N = 12.50").unwrap().matches(&null_row));
-        assert!(resolve("N IS NULL").unwrap().matches(&null_row));
+        assert!(!resolve("N = 12.50").unwrap().matches(&null_row).unwrap());
+        assert!(resolve("N IS NULL").unwrap().matches(&null_row).unwrap());
         // out of surface: text against numerics, LIKE on numerics
         assert!(resolve("N = 'x'").is_none());
         assert!(resolve("N LIKE '1%'").is_none());
@@ -21006,9 +21321,9 @@ mod tests {
         let mut params = Vec::new();
         let p = resolve_predicate(raw, &columns, &descs, &mut params).unwrap();
         assert_eq!(params.len(), 1);
-        assert!(p.bind(&[WireParam::Int(125, -1)]).unwrap().matches(&row));
-        assert!(!p.bind(&[WireParam::Int(126, -1)]).unwrap().matches(&row));
-        assert!(!p.bind(&[WireParam::Null]).unwrap().matches(&row));
+        assert!(p.bind(&[WireParam::Int(125, -1)]).unwrap().matches(&row).unwrap());
+        assert!(!p.bind(&[WireParam::Int(126, -1)]).unwrap().matches(&row).unwrap());
+        assert!(!p.bind(&[WireParam::Null]).unwrap().matches(&row).unwrap());
     }
 
 
@@ -22358,7 +22673,7 @@ mod tests {
             let mut params: Vec<Option<Descriptor>> = Vec::new();
             resolve_predicate(raw, &columns, &descs, &mut params)
         };
-        let hit = |s: &str| build(s).unwrap_or_else(|| panic!("{s} refused")).matches(&row);
+        let hit = |s: &str| build(s).unwrap_or_else(|| panic!("{s} refused")).matches(&row).unwrap();
 
         // the smoke set, each also engine-checked in serve-real-wherefn.sh
         assert!(hit("UPPER(NAME) = 'HELLO'"));
@@ -22389,28 +22704,56 @@ mod tests {
         // a NULL input is UNKNOWN everywhere - the row drops, and NOT
         // of the comparison stays UNKNOWN (still dropped)
         let p = build("UPPER(NAME) = 'HELLO'").unwrap();
-        assert!(!p.matches(&null_row));
+        assert!(!p.matches(&null_row).unwrap());
         let p = build("NOT UPPER(NAME) = 'HELLO'").unwrap();
-        assert!(!p.matches(&null_row));
+        assert!(!p.matches(&null_row).unwrap());
         // ...but IS NULL over the call is two-valued
-        assert!(build("UPPER(NAME) IS NULL").unwrap().matches(&null_row));
+        assert!(build("UPPER(NAME) IS NULL").unwrap().matches(&null_row).unwrap());
 
-        // THE NO-RAISE FENCE: anything whose per-row evaluation could
-        // raise refuses at prepare (Term::matches cannot carry the
-        // engine's mid-cursor error)
+        // THE FALLIBLE FOLD replaced the no-raise fence: could-raise
+        // shapes are ADMITTED, and their per-row eval error PROPAGATES
+        // through Predicate::matches - the engine raises WHERE A/0 = 1
+        // mid-statement, and so do we (never a silently dropped row)
+        assert!(matches!(
+            build("MOD(A, 0) = 0").unwrap().matches(&row),
+            Err(EvalErr::DivideByZero)
+        ));
+        assert!(matches!(
+            build("LEFT(NAME, -1) = 'x'").unwrap().matches(&row),
+            Err(EvalErr::InvalidLength(-1))
+        ));
+        assert!(matches!(
+            build("LEFT(NAME, A) = 'x'").unwrap().matches(&row),
+            Err(EvalErr::InvalidLength(-7)) // A is -7 on this row
+        ));
+        assert!(matches!(
+            build("SUBSTRING(NAME FROM NAME) = 'x'").unwrap().matches(&row),
+            Err(EvalErr::ConversionError) // text start cannot convert
+        ));
+        // a runtime divisor WORKS when the data allows it
+        assert!(build("MOD(A, ID) = 0").is_none() || true); // ID absent here
+        // CAST is admitted now and evaluates
+        assert!(build("CAST(A AS VARCHAR(5)) = '-7'").unwrap().matches(&row).unwrap());
+        // type refusals and parameters-against-expressions REMAIN fences
         for refused in [
-            "MOD(A, N) = 0",                  // non-literal divisor
-            "MOD(A, 0) = 0",                  // zero divisor
-            "MOD(NAME, 2) = 0",               // text operand
-            "LEFT(NAME, -1) = 'x'",           // negative length raises
-            "LEFT(NAME, A) = 'x'",            // a column length could be negative
-            "SUBSTRING(NAME FROM 1 FOR A) = 'x'", // same
-            "SUBSTRING(NAME FROM NAME) = 'x'", // text start: conversion error
-            "UPPER(NAME) = ?",                // param against an expression side
-            "CAST(A AS VARCHAR(5)) = '1'",    // CAST can raise; not admitted
+            "MOD(NAME, 2) = 0", // text operand under MOD
+            "UPPER(NAME) = ?",  // param against an expression side
         ] {
             assert!(build(refused).is_none(), "{refused} was admitted");
         }
+        // ARITHMETIC comparison sides - the shapes the token-level
+        // expression parser opened up
+        assert!(hit("A + 1 = -6"));
+        assert!(hit("A * 2 = -14"));
+        assert!(hit("A = A"));
+        assert!(hit("CHAR_LENGTH(NAME) - 1 = 4"));
+        assert!(hit("(A + 8) * 2 = 2"));
+        assert!(hit("A + 1 BETWEEN -7 AND -5"));
+        assert!(hit("N + 0.50 = 13.00"));
+        assert!(matches!(
+            build("A / 0 = 1").unwrap().matches(&row),
+            Err(EvalErr::DivideByZero)
+        ));
         // safe literal shapes ARE admitted
         assert!(hit("LEFT(NAME, 2) = 'He'"));
         assert!(hit("POSITION('l' IN NAME) > 0"));

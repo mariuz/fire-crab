@@ -17,7 +17,9 @@ IIF), `qa/serve-real-functions.sh` (the built-in scalar functions),
 `qa/serve-real-aggfn.sh` (the aggregate surface),
 `qa/serve-real-aggexpr.sh` (aggregates over expressions),
 `qa/serve-real-groupexpr.sh` (GROUP BY expressions, HAVING breadth),
-`qa/serve-real-datemath.sh` (temporal arithmetic). Each check in
+`qa/serve-real-datemath.sh` (temporal arithmetic),
+`qa/serve-real-wherexpr.sh` (expression predicate sides, the fallible
+fold). Each check in
 those gates runs identical SQL through fire-crab and `isql` against the
 same database file.
 
@@ -48,6 +50,7 @@ same database file.
 | a lone aggregate's output column is NAMED by its function (COUNT/MIN/MAX/SUM/AVG); a bare literal is CONSTANT, a generator read GEN_ID | probed via isql headers | `Plan::Scalar(value, name)`, `output_cols_of` |
 | DATEADD/DATEDIFF (both syntaxes each); month-end clamping; TIME wraps midnight; DATEDIFF components vs boundary crossings; MILLISECOND at NUMERIC(18,1) | `src/jrd/SysFunction.cpp` (`makeDateAdd`/`makeDateDiff`), probed | `SysFn::DateAdd`/`DateDiff`, `dateadd_impl`, `datediff_impl` |
 | native temporal operators: DATE ± n (numeric addend CVT-rounds), DATE−DATE = days, TIME−TIME = seconds @ −4, TIMESTAMP diff = days @ −9 truncating | `ExprNodes.cpp` arithmetic over temporal descs, probed | the temporal arms of `Expr::Bin` typing/scale/eval |
+| WHERE comparison sides are full expressions (arithmetic, functions, CAST, conditionals, column vs column); per-row eval errors raise mid-statement with the engine's vector | `src/jrd/evl.cpp` boolean evaluation over expression nodes, probed | `texpr` (token-level sides), the fallible `Predicate::matches` |
 | GROUP BY takes expression keys, computed per row; a select-list expression must BE one of them (else the engine's -104 "not contained..."); NULL keys share a bucket; `GROUP BY <ordinal>` may name an expression item | `src/jrd/AggNodes.cpp` / DSQL grouping validation, probed | `parse_group_by` (synthetic key slots), `normalize_raw` structural matching |
 | HAVING compares numeric aggregates through exact scale alignment, text MIN/MAX through the pad-trimming compare, and takes expression aggregates as hidden folds | `AggNodes.cpp`, probed (AVG(N) > 0 works; MIN(D) has no literal to meet here) | `resolve_having` (`HKind`), `Term::NumCmp` |
 
@@ -178,14 +181,20 @@ mechanisms:
    conditional or function call (`names_expr_call`), any failure to
    resolve it refuses — a broken `UPPER()` must never be read as a
    column named "UPPER()".
-3. **Predicate expressions pass a no-raise fence** (`expr_no_raise`): a
-   WHERE term answers only true/false and cannot carry the engine's
-   mid-cursor error, so anything whose per-row evaluation could raise
-   (MOD by a non-literal or zero divisor, a length read from a column,
-   a text operand under a numeric function, CAST) refuses at prepare.
-   The select list has no such fence — there an eval error IS reported
-   mid-cursor with the engine's own status vector, which is what the
-   engine does too.
+3. **Predicates are FALLIBLE** (`Predicate::matches` returns a
+   result): a per-row evaluation error inside a WHERE term — `A / 0`,
+   a negative length from a column, a failed CAST — PROPAGATES through
+   every predicate consumer (the row walk, DML target collection,
+   CHECK enforcement, HAVING, group input filters) and reaches the
+   client with the engine's own status vector, exactly where the
+   engine raises it. This replaced an earlier "no-raise fence" that
+   refused could-raise shapes at prepare; the fence's one survivor is
+   the type check (a text operand under MOD still refuses) and the
+   `?`-parameter-against-expression-side refusal. Known differences,
+   documented not silent: the engine surfaces some of these errors at
+   EXECUTE where fire-crab surfaces them at first FETCH (one leading
+   blank line in isql), and a DML statement's WHERE error answers a
+   generic SQL error (the DML channel is text, not a vector).
 
 Known refusals that the engine supports (named next slices, each a
 refusal today rather than a silent gap): `EXTRACT` and the date/time

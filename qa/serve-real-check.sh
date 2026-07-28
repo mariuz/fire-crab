@@ -128,12 +128,15 @@ case "$(node_run 'INSERT INTO CK3 (A) VALUES (101)')" in
 case "$(node_run 'INSERT INTO CK3 (A) VALUES (0)')" in
     ERR*) echo "OK   fire-crab rejects the AND check's other arm" ;;
     *) echo "DIFF fc AND zero"; fail=1 ;; esac
-# a column-vs-column check is outside fc's evaluation surface: DML on
-# that table REFUSES (never bypasses); the ENGINE still enforces it on
-# fc's file below
-case "$(node_run 'INSERT INTO CK2 (A, B) VALUES (1, 2)')" in
-    ERR*) echo "OK   fire-crab REFUSES DML it cannot check (column-vs-column)" ;;
-    *) echo "DIFF fc refusal"; fail=1 ;; esac
+# column-vs-column checks: once outside fc's evaluation surface (DML
+# refused), ENFORCED since the fallible-predicate slice made A < B an
+# evaluable term - a passing insert goes through, a violating one
+# rejects, exactly like the engine
+check "fire-crab enforces the column-vs-column check (pass)" \
+    "$(node_run 'INSERT INTO CK2 (A, B) VALUES (1, 2)')" "OK"
+case "$(node_run 'INSERT INTO CK2 (A, B) VALUES (9, 2)')" in
+    ERR*) echo "OK   fire-crab rejects the column-vs-column violation" ;;
+    *) echo "DIFF fc col-vs-col violation"; fail=1 ;; esac
 kill $srv 2>/dev/null; wait $srv 2>/dev/null
 
 # the ENGINE executes fire-crab's triggers from the raw file
@@ -146,13 +149,16 @@ check "the engine RAISES fc's check trigger on a violating insert" \
     "$work_e" "$(viol "$REF" 'INSERT INTO CK1 (A, B) VALUES (-3, 4)')"
 case "$work_e" in *23000*) echo "OK   vacuous-guard: the violation is SQLSTATE 23000" ;;
     *) echo "DIFF vacuous 23000"; echo "     $work_e"; fail=1 ;; esac
-check "the engine raises the column-vs-column check fc refused to evaluate" \
+check "the engine raises the column-vs-column check fc also enforces" \
     "$(viol "$WORK" 'INSERT INTO CK2 (A, B) VALUES (5, 2)')" \
     "$(viol "$REF" 'INSERT INTO CK2 (A, B) VALUES (5, 2)')"
-# a VALID engine-side insert into the col-vs-col table goes through
-# fc's trigger on both files
-ins() { "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 <<'SQL'
+# mirror fc's accepted CK2 row on the reference (fc already wrote it
+# into the working file above), then the shared CK5 insert on both
+"$ISQL" -q -b -user "$U" -pas "$P" "$REF" >/dev/null 2>&1 <<'SQL'
 INSERT INTO CK2 (A, B) VALUES (1, 2);
+COMMIT;
+SQL
+ins() { "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 <<'SQL'
 INSERT INTO CK5 (A, B) VALUES (1, 50);
 COMMIT;
 SQL

@@ -119,17 +119,19 @@ them.
     parameter slots are claimed at PARSE time in textual order, so a
     leaf duplicated by the DNF cross-product keeps its one slot
 
-    # function calls in predicates: lex the WHOLE call as one token
-    # (scan to the MATCHING paren, skipping string literals), parse it
-    # with the expression parser, and admit it only if evaluation can
-    # NEVER raise (a WHERE term answers true/false and cannot carry a
-    # mid-cursor error):
-    no_raise(e):
-        literals, columns, case-mapping/length/trim/replace: yes
-        arithmetic, CAST: no
-        MOD: only with a literal non-zero divisor
-        length/count arguments: only non-negative literals
-        conditionals: all children
+    # expression sides in predicates: lex calls as single tokens (scan
+    # to the MATCHING paren, skipping string literals); fold arithmetic
+    # operator tokens back into expression trees with a token-level
+    # precedence parser; a side that reduces to a bare column or
+    # literal keeps the fast paths (parameter binding, index-friendly
+    # terms)
+    # MAKE THE PREDICATE FALLIBLE: matches(row) -> TRUE | FALSE | Error
+    # and PROPAGATE the error through every consumer - the row walk,
+    # DML target collection, CHECK enforcement, HAVING, group filters.
+    # The tempting alternative (skip the erroring row) silently drops
+    # exactly the row the engine raises on. A closure that cannot
+    # propagate captures the first error and the caller re-raises it
+    # after the walk.
 
 ### Civil-date math (MJD epoch: day 0 = 1858-11-17)
 

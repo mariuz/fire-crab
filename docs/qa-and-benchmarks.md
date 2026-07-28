@@ -4220,6 +4220,39 @@ the valid date range at runtime, so it refuses in predicates - the
 refusal checks pin both choices, and TM + 1 (TIME plus a number)
 stays a refusal too, unprobed rather than guessed.
 
+### Fallible predicates, expressions everywhere in WHERE (`qa/serve-real-wherexpr.sh`, 35 checks)
+
+The deepest change since the fixed-answer fallback was closed:
+`Predicate::matches` returns a RESULT. A WHERE term used to answer
+only true/false, which forced the "no-raise fence" - any expression
+whose evaluation could raise was refused at prepare, because a
+swallowed error would silently exclude exactly the row the engine
+raises on. Making the fold fallible dissolved the fence: a per-row
+eval error now propagates through every predicate consumer - the row
+walk, DML target collection, CHECK enforcement, HAVING, the group
+input filter, the join filter - and reaches the client as the engine's
+own status vector. The teeth check pins the distinction: WHERE
+100 / B > 10 over a table where one row's B is zero must RAISE 22012,
+not return the other rows with the zero row silently dropped.
+
+On top of it, comparison sides became full expressions: a token-level
+precedence parser folds `+ - * /` tokens back into the same expression
+trees the select list uses, so `A + 1 > B`, column vs column,
+parenthesised sides and arithmetic BETWEEN/IN bounds all evaluate
+per row - while a side that reduces to a bare column or literal keeps
+the classic paths (parameter binding, the exact numeric terms). The
+'-' token is context-sensitive: an operator after a value-like token,
+a negative literal elsewhere. CAST and the conditionals lex as call
+tokens in predicates now too.
+
+The previously-fenced wherefn entries flipped to differential checks
+(51). Documented differences, not silent ones: the engine surfaces
+some of these errors at EXECUTE where fire-crab surfaces them at
+first FETCH (one leading blank line in isql's output); a DML whose
+WHERE raises answers a generic SQL error (the DML error channel
+carries text, not a vector); and 22018 still lacks its
+offending-string argument.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
@@ -4831,6 +4864,12 @@ FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
 # the engine's exact scales. Builds its own scratch database.
 FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     bash /path/to/fire-crab/qa/serve-real-datemath.sh 3050
+
+# fallible predicates + WHERE expressions: arithmetic sides, col vs col,
+# raising rows RAISE (never silently dropped), DML/CHECK/HAVING all
+# propagate. Builds its own scratch database.
+FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    bash /path/to/fire-crab/qa/serve-real-wherexpr.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on

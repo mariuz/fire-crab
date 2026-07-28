@@ -13,6 +13,34 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fallible predicates, expressions everywhere in WHERE
+
+### Converted
+- **Full expression comparison sides in WHERE**: `A + 1 > B`, column
+  vs column, parenthesised sides, `(A + B) * 2 = 6`, arithmetic
+  BETWEEN/IN bounds, CAST/COALESCE/NULLIF/IIF as predicate sides —
+  a token-level precedence parser folds operator tokens back into
+  expression trees; bare columns and literals keep the classic fast
+  paths (parameters, exact numeric terms). Gate:
+  `qa/serve-real-wherexpr.sh`, 35 checks.
+
+### Fixed
+- **`Predicate::matches` became FALLIBLE** — the architectural change
+  under the feature. A per-row eval error (`WHERE A / 0 = 1`, a
+  negative length from a column, a failed CAST) now PROPAGATES through
+  every predicate consumer and reaches the client with the engine's
+  own vector, mid-statement. The "no-raise fence" is gone: previously
+  fenced shapes (runtime MOD divisors, column lengths, CAST, DATEADD
+  in WHERE) are admitted; the wherefn gate's refusal entries moved to
+  differential checks (51).
+
+### Guarded
+- Type fences remain (text under MOD/SIGN/ABS), as does the
+  `?`-against-expression-side refusal and CASE-in-WHERE. Documented
+  differences: some errors surface at EXECUTE in the engine vs first
+  FETCH here (one leading blank in isql); a DML WHERE error answers a
+  generic SQL error (text channel, not a vector).
+
 ## 2026-07-28 — temporal arithmetic
 
 ### Converted
