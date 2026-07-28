@@ -177,6 +177,30 @@ check_ck "CHECK (A IS NOT NULL)"
 check_ck "CHECK (A BETWEEN 1 AND 100)"
 check_ck "CHECK (A > 0 AND B > 0)"
 
+# --- slice 18: domain validation ---------------------------------------
+check_val() { # <type> <check clause> - RDB$VALIDATION_BLR
+    n=$((n + 1))
+    dom="GVD$n"
+    got=$("$FCDSQL" "$2")
+    "$ISQL" -q -b -user "$U" -pas "$P" "$DB" >/dev/null 2>&1 <<SQL
+CREATE DOMAIN $dom AS $1 $2;
+COMMIT;
+SQL
+    want=$("$ISQL" -q -b -user "$U" -pas "$P" "$DB" 2>/dev/null <<SQL | tr -d ' \n'
+SET HEADING OFF;
+SELECT CAST(CAST(RDB\$VALIDATION_BLR AS BLOB SUB_TYPE 0) AS VARCHAR(300) CHARACTER SET OCTETS) FROM RDB\$FIELDS WHERE RDB\$FIELD_NAME = '$dom';
+SQL
+)
+    if [ -z "$want" ]; then echo "DIFF [$1 $2] - no validation stored"; fail=1
+    elif [ "$got" = "$want" ]; then echo "OK   DOMAIN $1 $2"
+    else echo "DIFF DOMAIN $1 $2"; echo "     engine: $want"; echo "     fcdsql: $got"; fail=1; fi
+}
+check_val "INTEGER" "CHECK (VALUE > 0)"
+check_val "INTEGER" "CHECK (VALUE BETWEEN 1 AND 12)"
+check_val "VARCHAR(10)" "CHECK (VALUE IS NOT NULL)"
+check_val "VARCHAR(10)" "CHECK (CHAR_LENGTH(VALUE) > 2 AND UPPER(VALUE) LIKE 'A%')"
+check_val "INTEGER" "CHECK (VALUE IN (1, 2, 3))"
+
 # --- refusals ----------------------------------------------------------
 refuse "DEFAULT 3 + 4"
 refuse "DEFAULT SOMECOLUMN"

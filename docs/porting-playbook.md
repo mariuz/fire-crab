@@ -307,6 +307,12 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # the SAME source clause can compile to DIFFERENT shapes in
+    # different stores (a domain CHECK is the raw boolean; a table
+    # CHECK is a negated if-abort trigger) - and the SAME concept can
+    # take different verbs by syntax alone (GEN_ID vs NEXT VALUE FOR)
+    # - probe every store separately, never assume shape follows
+    # meaning
     # a NEW battery angle on an OLD surface is still a probe: the
     # CHECK batteries exposed that IN-list items get CAST to the
     # column's catalog type - a law sixteen slices of view batteries

@@ -18,7 +18,12 @@ fn main() {
     } else if upper.starts_with("COMPUTED") {
         fire_crab_dsql::compile_computed_hex(&sql)
     } else if upper.starts_with("CHECK") {
-        fire_crab_dsql::compile_check_hex(&sql)
+        // a domain's CHECK speaks of VALUE; a table's names columns
+        if upper.contains("VALUE") {
+            fire_crab_dsql::compile_validation_hex(&sql)
+        } else {
+            fire_crab_dsql::compile_check_hex(&sql)
+        }
     } else {
         fire_crab_dsql::compile_view_select_hex(&sql)
     };

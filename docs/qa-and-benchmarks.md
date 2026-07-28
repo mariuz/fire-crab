@@ -4604,7 +4604,7 @@ runs UPDATING OR DELETING and UPDATING AND v > 100). Multi-event
 headers leave no trace. Refused: assignments to undeclared names,
 bare LEAVE.
 
-### SQL → BLR, oracle number four (`qa/dsql-field-blr.sh`, 34 checks)
+### SQL → BLR, oracle number four (`qa/dsql-field-blr.sh`, 39 checks)
 
 Slice 16 found the fourth place the engine stores its compiler's
 output: COLUMN BLR. A DEFAULT clause lands verbatim in
@@ -4646,6 +4646,21 @@ slices of batteries never hit. It is closed now - integer literals
 and input parameters (both probed uncast) compile, everything else
 refuses - with a refusal slot in the view gate beside the fix. The
 lesson: a NEW battery angle on an OLD surface is still a probe.
+
+Slice 18 added the SEVENTH store: domain validation. A DOMAIN's
+CHECK lands in RDB$FIELDS.RDB$VALIDATION_BLR - and its shape DIFFERS
+from the table CHECK's system trigger in every particular: the RAW
+boolean, NOT negated, no abort wrapper, just blr_version5 and
+blr_eoc around it, with VALUE compiling to blr_fid(0, 0). One clause
+keyword, two stores, two shapes - fcdsql routes by whether the
+clause speaks of VALUE. The battery runs BETWEEN, IS NOT NULL, a
+compound with CHAR_LENGTH and LIKE, and VALUE IN (1, 2, 3) - where
+the integer-items-stay-uncast law held even against a fid left side.
+The sequences came with a nicety: GEN_ID(seq, inc) and NEXT VALUE
+FOR seq are TWO verbs for one concept (blr_gen_id with an increment
+value, blr_gen_id2 with the name alone) - the verb chosen by the
+SYNTAX the writer used, not the semantics. POST_EVENT is blr_post
+plus the event-name value, a statement in either body kind.
 
 ## Benchmarks
 

@@ -274,6 +274,12 @@ mod blr {
     pub const EXEC_PROC: u8 = 0x78;
     /// EXCEPTION <name>: blr_abort, 2, counted name (probed)
     pub const ABORT: u8 = 0x80;
+    /// GEN_ID(seq, inc): counted name + increment value; NEXT VALUE
+    /// FOR seq is blr_gen_id2 with the name alone (probed)
+    pub const GEN_ID: u8 = 0x65;
+    pub const GEN_ID2: u8 = 0xD2;
+    /// POST_EVENT: blr_post + the event-name value (probed)
+    pub const POST: u8 = 0x14;
     /// the niladic context functions (probed in DEFAULT clauses)
     pub const CURRENT_DATE: u8 = 0xA0;
     pub const CURRENT_TIMESTAMP: u8 = 0xA1;
@@ -345,6 +351,10 @@ enum Val {
     CurrentDate,
     CurrentTime,
     CurrentTimestamp,
+    /// GEN_ID(sequence, increment)
+    GenId(String, Box<Val>),
+    /// NEXT VALUE FOR sequence - blr_gen_id2, the name alone
+    GenId2(String),
     /// blr_coalesce
     Coalesce(Vec<Val>),
 }
@@ -791,6 +801,8 @@ struct P<'a> {
     /// the current select's aggregate context (stream ctx + 1) -
     /// what HAVING/ORDER BY fids address
     agg_fid_ctx: u8,
+    /// domain-validation mode: VALUE means blr_fid(0, 0)
+    domain_value: bool,
     /// context of stream index 0: 1 in view BLR, 0 in procedure
     /// bodies (probed - the FOR SELECT stream is context 0)
     base: u8,
@@ -1162,6 +1174,22 @@ impl<'a> P<'a> {
                 return self.case_tail();
             }
             Tok::Ident(x) if x == "NULL" => Val::Null,
+            Tok::Ident(x) if x == "VALUE" && self.domain_value => Val::Fid(0, 0),
+            Tok::Ident(x) if x == "NEXT" => {
+                self.i += 1;
+                if !(self.kw("VALUE") && self.kw("FOR")) {
+                    return None;
+                }
+                let Some(Tok::Ident(name)) = self.t.get(self.i) else {
+                    return None;
+                };
+                if is_keyword(name) {
+                    return None;
+                }
+                let name = name.clone();
+                self.i += 1;
+                return Some(Val::GenId2(name));
+            }
             Tok::Ident(x) if x == "CURRENT_DATE" => Val::CurrentDate,
             Tok::Ident(x) if x == "CURRENT_TIME" => Val::CurrentTime,
             Tok::Ident(x) if x == "CURRENT_TIMESTAMP" => Val::CurrentTimestamp,
@@ -1319,6 +1347,23 @@ impl<'a> P<'a> {
                         Val::Trim(0, None, Box::new(v1))
                     }
                 }
+            }
+            "GEN_ID" => {
+                // GEN_ID(sequence, increment) - the first argument is
+                // a NAME, not a value
+                let Some(Tok::Ident(name)) = self.t.get(self.i) else {
+                    return None;
+                };
+                if is_keyword(name) {
+                    return None;
+                }
+                let name = name.clone();
+                self.i += 1;
+                if !matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                    return None;
+                }
+                self.i += 1;
+                Val::GenId(name, Box::new(self.val()?))
             }
             "CAST" => {
                 let v = self.val()?;
@@ -1781,6 +1826,9 @@ fn is_keyword(w: &str) -> bool {
             | "DEFAULT"
             | "COMPUTED"
             | "CHECK"
+            | "NEXT"
+            | "VALUE"
+            | "POST_EVENT"
     )
 }
 
@@ -1913,6 +1961,17 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
         Val::CurrentDate => out.push(blr::CURRENT_DATE),
         Val::CurrentTime => out.push(blr::CURRENT_TIME),
         Val::CurrentTimestamp => out.push(blr::CURRENT_TIMESTAMP),
+        Val::GenId(name, inc) => {
+            out.push(blr::GEN_ID);
+            out.push(name.len() as u8);
+            out.extend_from_slice(name.as_bytes());
+            emit_val(out, inc);
+        }
+        Val::GenId2(name) => {
+            out.push(blr::GEN_ID2);
+            out.push(name.len() as u8);
+            out.extend_from_slice(name.as_bytes());
+        }
         Val::ScalarSub(sub) => {
             out.push(blr::VIA);
             out.push(blr::SINGULAR);
@@ -2102,6 +2161,7 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
         next_label: 1,
         proc: None,
         agg_fid_ctx: 1,
+        domain_value: false,
     };
     // a top-level UNION restructures the whole statement: the union
     // node takes context 1 BEFORE any branch stream, so it must be
@@ -2465,6 +2525,7 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         next_label: 1,
         proc: None,
         agg_fid_ctx: 1,
+        domain_value: false,
     };
     if !(p.kw("CREATE") && p.kw("PROCEDURE")) {
         return None;
@@ -2682,6 +2743,8 @@ enum TrigStmt {
     ExceptionRaise(String),
     /// EXIT; - blr_leave 0: leaves the wrapper label
     Exit,
+    /// POST_EVENT <value>; - blr_post
+    PostEvent(Val),
     /// (FOR) SELECT - the whole probed select machinery as ONE
     /// statement inside a body
     ForSel(Box<ForSel>),
@@ -2814,6 +2877,10 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
         TrigStmt::Exit => {
             out.push(blr::LEAVE);
             out.push(0);
+        }
+        TrigStmt::PostEvent(v) => {
+            out.push(blr::POST);
+            emit_val(out, v);
         }
         TrigStmt::ForSel(f) => {
             match f.label {
@@ -3374,6 +3441,14 @@ impl<'a> P<'a> {
             self.i += 1;
             return Some(TrigStmt::Exit);
         }
+        if self.kw("POST_EVENT") {
+            let v = self.val()?;
+            if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                return None;
+            }
+            self.i += 1;
+            return Some(TrigStmt::PostEvent(v));
+        }
         if self.kw("WHILE") {
             if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
                 return None;
@@ -3624,6 +3699,7 @@ pub fn compile_default(sql: &str) -> Option<Vec<u8>> {
         next_label: 1,
         proc: None,
         agg_fid_ctx: 1,
+        domain_value: false,
     };
     if !p.kw("DEFAULT") {
         return None;
@@ -3688,6 +3764,7 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
         next_label: 1,
         proc: None,
         agg_fid_ctx: 1,
+        domain_value: false,
     };
     if !(p.kw("COMPUTED") && p.kw("BY")) {
         return None;
@@ -3745,6 +3822,7 @@ pub fn compile_check(sql: &str) -> Option<Vec<u8>> {
         next_label: 1,
         proc: None,
         agg_fid_ctx: 1,
+        domain_value: false,
     };
     if !p.kw("CHECK") {
         return None;
@@ -3780,6 +3858,60 @@ pub fn compile_check(sql: &str) -> Option<Vec<u8>> {
 pub fn compile_check_hex(sql: &str) -> Option<String> {
     Some(
         compile_check(sql)?
+            .iter()
+            .map(|b| format!("{:02X}", b))
+            .collect(),
+    )
+}
+
+/// Compile a DOMAIN's CHECK to the BLR the engine stores in
+/// `RDB$FIELDS.RDB$VALIDATION_BLR` - the SEVENTH catalog store. The
+/// shape differs from a table CHECK's system trigger: the RAW boolean
+/// (NOT negated, no abort wrapper) between blr_version5 and blr_eoc,
+/// with VALUE compiling to blr_fid(0, 0) (probed).
+pub fn compile_validation(sql: &str) -> Option<Vec<u8>> {
+    let toks = lex(sql.trim().trim_end_matches(';'))?;
+    let mut p = P {
+        t: &toks,
+        i: 0,
+        streams: Vec::new(),
+        base: 0,
+        outer: Some(0),
+        sub: None,
+        agg_map: Vec::new(),
+        agg_mode: false,
+        in_params: Vec::new(),
+        local_vars: Vec::new(),
+        next_label: 1,
+        proc: None,
+        agg_fid_ctx: 1,
+        domain_value: true,
+    };
+    if !p.kw("CHECK") {
+        return None;
+    }
+    if !matches!(p.t.get(p.i), Some(Tok::LParen)) {
+        return None;
+    }
+    p.i += 1;
+    let cond = p.bool_or()?;
+    if !matches!(p.t.get(p.i), Some(Tok::RParen)) {
+        return None;
+    }
+    p.i += 1;
+    if p.i != p.t.len() {
+        return None;
+    }
+    let mut out = vec![blr::VERSION5];
+    emit_bool(&mut out, &cond);
+    out.push(blr::EOC);
+    Some(out)
+}
+
+/// `compile_validation` as uppercase hex.
+pub fn compile_validation_hex(sql: &str) -> Option<String> {
+    Some(
+        compile_validation(sql)?
             .iter()
             .map(|b| format!("{:02X}", b))
             .collect(),
@@ -3836,6 +3968,7 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
         next_label: 1,
         proc: None,
         agg_fid_ctx: 1,
+        domain_value: false,
     };
     if !(p.kw("CREATE") && p.kw("TRIGGER")) {
         return None;
@@ -5041,6 +5174,39 @@ mod tests {
         // read from RDB$INDICES.RDB$EXPRESSION_BLR (probed)
         pin_computed("COMPUTED BY (UPPER(S))", "0567170001534C");
         pin_computed("COMPUTED BY (A + B)", "052217000141170001424C");
+    }
+
+    #[test]
+    fn compiles_slice_eighteen_shapes_byte_for_byte() {
+        // a DOMAIN's CHECK is RDB$VALIDATION_BLR - the RAW boolean
+        // (NOT negated, unlike a table CHECK's system trigger), with
+        // VALUE compiling to blr_fid(0, 0)
+        assert_eq!(
+            compile_validation_hex("CHECK (VALUE > 0)").as_deref(),
+            Some("053118000000150800000000004C"),
+        );
+        assert_eq!(
+            compile_validation_hex(
+                "CHECK (VALUE IS NOT NULL AND CHAR_LENGTH(VALUE) > 2)"
+            )
+            .as_deref(),
+            Some("053A3B3D1800000031B60118000000150800020000004C"),
+        );
+        // GEN_ID(seq, inc): blr_gen_id, counted name, increment value
+        pin_trig(
+            "CREATE TRIGGER QGT_A FOR T BEFORE INSERT AS BEGIN NEW.A = GEN_ID(QSEQ1, 1); END",
+            "05021100020201650551534551311508000100000017010141FFFFFF4C",
+        );
+        // NEXT VALUE FOR: blr_gen_id2, the name alone
+        pin_trig(
+            "CREATE TRIGGER QGT_B FOR T BEFORE INSERT AS BEGIN NEW.A = NEXT VALUE FOR QSEQ1; END",
+            "05021100020201D205515345513117010141FFFFFF4C",
+        );
+        // POST_EVENT: blr_post + the event-name value
+        pin_trig(
+            "CREATE TRIGGER QGT_C FOR T AFTER INSERT AS BEGIN POST_EVENT 'row_added'; END",
+            "05021100020214150F00000900726F775F6164646564FFFFFF4C",
+        );
     }
 
     #[test]

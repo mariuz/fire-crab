@@ -13,6 +13,30 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 18: domain validation, sequences, events
+
+### Converted
+- **The SEVENTH catalog store: domain validation.** A DOMAIN's CHECK
+  lands in `RDB$FIELDS.RDB$VALIDATION_BLR` — and its shape DIFFERS
+  from a table CHECK's system trigger: the RAW boolean, NOT negated,
+  no abort wrapper, between blr_version5 and blr_eoc, with VALUE
+  compiling to `blr_fid(0, 0)`. The same clause keyword, two stores,
+  two shapes — routed by whether the clause speaks of VALUE.
+- **Sequences, two verbs for one concept**: `GEN_ID(seq, inc)` is
+  blr_gen_id (counted name + increment value) while
+  `NEXT VALUE FOR seq` is blr_gen_id2 (the name alone) — the verb
+  chosen by SYNTAX, not semantics.
+- **POST_EVENT <value>;**: blr_post + the event-name value, a
+  statement in either body kind (a conditional POST_EVENT under IF
+  is in the battery).
+
+### Guarded
+- (nothing new — the surface grew cleanly.) Gates:
+  `qa/dsql-field-blr.sh` grew to 39 checks (5 validations incl.
+  VALUE IN (1,2,3) — integer items stay uncast even against a fid)
+  and `qa/dsql-trig-blr.sh` to 42; 214 unit byte-pins across seven
+  stores.
+
 ## 2026-07-28 — fire-crab-dsql slice 17: constraints and two more stores
 
 ### Converted
