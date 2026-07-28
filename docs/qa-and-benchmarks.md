@@ -3936,6 +3936,80 @@ Related: a typed `ROLLBACK;` never reaches `op_rollback` at all. isql
 *prepares and executes the word as DSQL* — there is no op 31 on the wire
 — so transaction control has to be a plan, not just a wire op.
 
+### Built-in scalar functions (`qa/serve-real-functions.sh`, 80 checks)
+
+The engine's scalar function surface, two sources joined into the one
+expression evaluator: the parser's string intrinsics that compile to
+their own BLR verbs (`UPPER` → `blr_upcase`, `LOWER` → `blr_lowcase`,
+`SUBSTRING` → `blr_substring`, `TRIM` → `blr_trim`, `CHAR_LENGTH` →
+`blr_strlen`) and the `SysFunction.cpp` table for the rest (`ABS`,
+`MOD`, `SIGN`, `LEFT`, `RIGHT`, `REPLACE`, `REVERSE`, `LPAD`, `RPAD`,
+`POSITION`, `OCTET_LENGTH`). They nest with everything the expression
+surface already had — arithmetic, `||`, CAST, COALESCE/NULLIF/IIF,
+computed columns — because they are ordinary `RawExpr`/`Expr` nodes.
+
+Every semantic was probed against the live engine BEFORE the Rust was
+written, and the probes are the gate's content — the edges, not the
+happy path:
+
+- **`CHAR_LENGTH` counts characters, padding included.** A `CHAR(5)`
+  holding `'ab'` answers 5; `CHAR_LENGTH(TRIM(C))` answers 2. The pair
+  proves the padding travels *through* the functions, which it must,
+  because fire-crab decodes CHAR fields padded exactly as stored.
+- **A number under a string function renders first.** `UPPER(A)` with
+  `A = -7` is `'-7'`, `CHAR_LENGTH(A)` is 2, `LPAD(A, 6, '0')` is
+  `'0000-7'` — the engine's CVT string coercion, mirrored by `fn_text`.
+- **`SUBSTRING` is a window, not a bounds check.** `FROM 0 FOR 3` on
+  `'Hello'` is `'He'` (the start eats into the length), `FROM 10` is
+  empty, `FOR 0` is empty. Only a NEGATIVE length raises
+  (`isc_bad_substring_length`, SQLSTATE 22011, the value in the
+  vector) — an error `LEFT` and `RIGHT` raise too, naming SUBSTRING,
+  because the engine routes them through it.
+- **A literal negative `FOR` fails at PREPARE.** The engine computes the
+  result's declared width from the literal while building the describe,
+  so `SUBSTRING(S FROM 2 FOR -1)` errors before any row - with no blank
+  line in isql's output where a cursor would have opened. The
+  differential caught fire-crab raising it mid-cursor instead (one
+  leading space of difference in the squeezed output); `Plan::RefusedEval`
+  now carries the eval vector to the prepare response. The same value in
+  a column or parameter can only be checked per row, and both servers
+  then raise mid-cursor alike.
+- **`TRIM` strips repetitions of the whole `<what>` string.**
+  `TRIM(BOTH 'ab' FROM 'ababXab')` is `'X'`; an empty `<what>` strips
+  nothing.
+- **`MOD` rounds non-integer operands half away from zero first.**
+  `MOD(12.50, 5)` is 3 (12.50 → 13); `MOD` by zero is the same
+  divide-by-zero vector the arithmetic surface raises (22012).
+- **`POSITION`'s empty needle answers its start while a match could
+  still begin there.** `POSITION('', 'Hello', 3)` is 3; at 99 it is 0.
+- **`LPAD`/`RPAD` truncate a past-length value** (`LPAD('Hello', 3)` =
+  `'Hel'`), cycle a multi-character pad (`LPAD('Hello', 9, 'ab')` =
+  `'ababHello'`), and leave a short string alone under an empty pad.
+- **Headers are part of the differential.** An un-aliased call columns
+  under the engine's canonical name — `CHARACTER_LENGTH` headers as
+  `CHAR_LENGTH` — and probing headers found a standing naming bug: an
+  un-aliased `IIF` headers as `CASE` (the engine parses IIF into a
+  searched CASE); fire-crab had said `IIF` since the conditionals slice,
+  invisibly, because that gate compares with headings off.
+
+One parser fix carried the feature: the clause splitter took the FIRST
+`FROM` in the statement as the table clause, and `SUBSTRING(S FROM 2)` /
+`TRIM(x FROM y)` carry their own `FROM` *inside the select list's
+parentheses*. The splitter now takes the first `FROM` at paren depth
+zero on a literal-masked copy — which also stops a `' FROM '` inside a
+string literal from splitting the query, a latent bug the new tests pin.
+
+A wrong-arity or broken-keyword call (`UPPER()`, `LEFT(S)`,
+`TRIM(LEADING S)`) does not parse, and the `names_expr_call` guard —
+the conditionals' malformed-call refusal, extended to every function
+name — turns it into a clean refusal at prepare rather than a read of a
+column named `UPPER()`. The nofallback gate moved `UPPER`/`SUBSTRING`
+from its unsupported list to its answered list, and its
+refusal-survival check now uses `CASE WHEN`, which stays outside the
+surface. WHERE-clause function calls (`WHERE UPPER(S) = 'X'`) remain
+refusals — the predicate tokenizer does not know calls yet; that is a
+named next slice, not a silent gap.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
@@ -4491,6 +4565,15 @@ NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     GFIX=/opt/firebird/bin/gfix \
     bash /path/to/fire-crab/qa/serve-real-alterdefault.sh 3050
+
+# built-in scalar functions: UPPER/LOWER/CHAR_LENGTH/OCTET_LENGTH/SUBSTRING/
+# TRIM/LEFT/RIGHT/REPLACE/POSITION/REVERSE/ABS/MOD/SIGN/LPAD/RPAD - the same
+# isql runs identical SELECTs against the engine and fire-crab on the same
+# file: values, NULL propagation, headers, and the error vectors (22011 for a
+# negative length - at PREPARE when literal - and 22012 for MOD by zero).
+# Builds its own scratch database.
+FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    bash /path/to/fire-crab/qa/serve-real-functions.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on

@@ -868,6 +868,13 @@ enum Plan {
     /// this server cannot expand (a view has a relation id but no
     /// records, so a scan would answer zero rows just as wrongly).
     Refused,
+    /// A statement refused at PREPARE with a SPECIFIC status vector
+    /// rather than the generic Dynamic SQL Error. The engine catches a
+    /// LITERAL negative SUBSTRING length while it computes the describe
+    /// (the result's declared width depends on the FOR value), so the
+    /// error must arrive at prepare to match it - the same check on a
+    /// COLUMN's value can only happen per row, mid-cursor, and does.
+    RefusedEval(EvalErr),
     /// `SELECT GEN_ID(<name>, <step>)` with a non-zero step, or `NEXT VALUE
     /// FOR <seq>` (step = the sequence's increment): a SELECT that WRITES.
     /// At op_execute it reads the generator, adds the step, writes the new
@@ -9631,14 +9638,11 @@ fn plan_query_inner(
             }
         }
     }
-    // Does the select list name a conditional function? If so, ANY
-    // failure to resolve it must RAISE rather than fall through: the
-    // fallback answers 4242, and 4242 in reply to a broken function call
-    // is a wrong answer dressed as a result.
-    let names_conditional = {
-        let up = proj_s.to_ascii_uppercase();
-        ["COALESCE(", "NULLIF(", "IIF("].iter().any(|f| up.contains(f))
-    };
+    // Does the select list name a conditional or built-in function? If
+    // so, ANY failure to resolve it must RAISE rather than fall through:
+    // the fallback answers 4242, and 4242 in reply to a broken function
+    // call is a wrong answer dressed as a result.
+    let names_conditional = names_expr_call(proj_s);
     let Some(proj) = parse_projection(proj_s) else {
         if trace { eprintln!("[srv] plan: parse_projection failed"); }
         return if names_conditional { Some(Plan::Refused) } else { None };
@@ -9653,13 +9657,23 @@ fn plan_query_inner(
         if let Proj::Items(items) = &proj {
             for it in items {
                 if let SelItem::Col(name) = it {
-                    let up = name.to_ascii_uppercase();
-                    if ["COALESCE(", "NULLIF(", "IIF("].iter().any(|f| up.contains(f)) {
+                    if names_expr_call(name) {
                         if trace {
-                            eprintln!("[srv] plan: malformed conditional call {:?}", name);
+                            eprintln!("[srv] plan: malformed function call {:?}", name);
                         }
                         return Some(Plan::Refused);
                     }
+                }
+            }
+        }
+    }
+    // a LITERAL negative SUBSTRING length fails the engine's DESCRIBE, so
+    // it must fail this prepare too - with the engine's own status vector
+    if let Proj::Items(items) = &proj {
+        for it in items {
+            if let SelItem::Expr(raw, _) = it {
+                if let Some(n) = raw_bad_substring_len(raw) {
+                    return Some(Plan::RefusedEval(EvalErr::InvalidLength(n)));
                 }
             }
         }
@@ -10440,7 +10454,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         | Plan::ProcSelect { cols, .. }
         | Plan::ProcRows { cols, .. }
         | Plan::Modified { cols, .. } => build_describe(cols, params),
-        Plan::Refused => build_describe(&[], params),
+        Plan::Refused | Plan::RefusedEval(_) => build_describe(&[], params),
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
@@ -10507,6 +10521,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::Join { .. }
         | Plan::Group { .. }
         | Plan::Refused
+        | Plan::RefusedEval(_)
         | Plan::VirtualEmpty { .. } => 1,
         Plan::Insert { .. } => 2,
         Plan::Update { .. } => 3,
@@ -10792,6 +10807,13 @@ const GDS_CONVERT_ERROR: i32 = 335544334;
 /// carry" (SQLSTATE 22003).
 const GDS_INTEGER_OVERFLOW: i32 = 335544779;
 
+/// isc_bad_substring_length - "Invalid length parameter @1 to SUBSTRING.
+/// Negative integers are not allowed." (SQLSTATE 22011, msg/jrd.h:534);
+/// the length travels as an isc_arg_number so the client's message
+/// formatter fills the @1.
+const GDS_BAD_SUBSTRING_LENGTH: i32 = 335544853;
+const ISC_ARG_NUMBER: i32 = 4;
+
 /// Write, into the fetch reply stream, the op_response the engine sends
 /// when a row's evaluation raises `e` - mirroring `respond_error`'s layout
 /// but carrying the matching status vector, so the client raises the same
@@ -10803,6 +10825,13 @@ fn write_eval_error(w: &mut W, e: &EvalErr) {
         .int(0)
         .int(0) // blob id
         .int(0); // response data length
+    eval_status_vector(w, e);
+}
+
+/// The status vector for an eval error, appended to an op_response
+/// header - shared by the mid-cursor path above and the prepare-time
+/// refusal ([Plan::RefusedEval]).
+fn eval_status_vector(w: &mut W, e: &EvalErr) {
     match e {
         EvalErr::DivideByZero => {
             w.int(1) // isc_arg_gds
@@ -10818,8 +10847,28 @@ fn write_eval_error(w: &mut W, e: &EvalErr) {
             w.int(1) // isc_arg_gds
                 .int(GDS_INTEGER_OVERFLOW);
         }
+        EvalErr::InvalidLength(n) => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_BAD_SUBSTRING_LENGTH)
+                .int(ISC_ARG_NUMBER)
+                .int(*n as i32);
+        }
     }
     w.int(0); // isc_arg_end
+}
+
+/// [respond_error], but with an eval error's full status vector - how a
+/// prepare refuses with the engine's SPECIFIC error rather than the
+/// generic Dynamic SQL Error.
+fn respond_eval_error(s: &mut TcpStream, enc: &mut Option<Rc4>, e: &EvalErr) -> std::io::Result<()> {
+    let mut w = W::default();
+    w.int(OP_RESPONSE)
+        .int(0)
+        .int(0)
+        .int(0) // blob id
+        .int(0); // response data length
+    eval_status_vector(&mut w, e);
+    w.send(s, enc)
 }
 
 /// Emit a cursor's rows. `gen_writes` collects the (generator name, final
@@ -10899,7 +10948,7 @@ fn emit_rows_inner(
         // way a mid-cursor evaluation error is
         // ProcInvoke is replaced at op_execute; reaching a fetch still
         // holding one means the statement was never executed
-        Plan::Refused | Plan::ProcInvoke { .. } => {
+        Plan::Refused | Plan::RefusedEval(_) | Plan::ProcInvoke { .. } => {
             return Err(EmitErr::Eval(EvalErr::ConversionError))
         }
         // ProcSelect is replaced at op_execute; reaching a fetch still
@@ -11495,6 +11544,85 @@ enum RawExpr {
     /// is false OR UNKNOWN (the engine's rule: only TRUE takes the
     /// then-branch, so a NULL comparison takes the else).
     Iif(Box<RawCond>, Box<RawExpr>, Box<RawExpr>),
+    /// a built-in scalar function call - the engine's SysFunction.cpp
+    /// entries (ABS, MOD, LPAD, ...) and the parser's string intrinsics
+    /// (UPPER, SUBSTRING, TRIM, ...). Argument order is positional;
+    /// the special syntaxes normalize into it (SUBSTRING(s FROM p FOR n)
+    /// -> [s, p, n]; TRIM([side] [what FROM] s) -> [what, s]).
+    Func(SysFn, Vec<RawExpr>),
+}
+
+/// The built-in scalar functions this server evaluates. Two engine
+/// sources: `src/dsql/parse.y`'s intrinsics that compile to their own BLR
+/// verbs (UPPER -> blr_upcase, SUBSTRING -> blr_substring, TRIM ->
+/// blr_trim, CHAR_LENGTH -> blr_strlen), and `src/jrd/SysFunction.cpp`'s
+/// table for the rest (ABS, MOD, SIGN, LEFT, RIGHT, REPLACE, REVERSE,
+/// LPAD, RPAD, POSITION). Every semantic here was probed against the
+/// live engine before it was written down - see qa/serve-real-functions.sh.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SysFn {
+    Upper,
+    Lower,
+    /// CHAR_LENGTH / CHARACTER_LENGTH - CHARACTERS, so a CHAR(5) counts
+    /// its blank padding (probed: CHAR_LENGTH of CHAR(5) 'ab' is 5)
+    CharLength,
+    OctetLength,
+    /// SUBSTRING(s FROM start [FOR len]) - args [s, start] or
+    /// [s, start, len]; start may be < 1 (the window clips), a negative
+    /// len raises isc_bad_substring_length
+    Substring,
+    /// TRIM([side] [what FROM] s) - args [what, s]; the default `what`
+    /// is one space, and a multi-character `what` strips REPETITIONS of
+    /// the whole string (probed: TRIM(BOTH 'ab' FROM 'ababXab') = 'X')
+    Trim(TrimSide),
+    Left,
+    Right,
+    Replace,
+    /// POSITION(sub IN s) / POSITION(sub, s [, start]) - args
+    /// [sub, s] or [sub, s, start]; 0 when absent, an empty `sub`
+    /// answers `start` while it still fits (probed)
+    Position,
+    Reverse,
+    Abs,
+    /// MOD(a, b) - non-integer operands round half away from zero FIRST
+    /// (probed: MOD(12.50, 5) = 3), then a truncated `%`
+    Mod,
+    Sign,
+    Lpad,
+    Rpad,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum TrimSide {
+    Both,
+    Leading,
+    Trailing,
+}
+
+impl SysFn {
+    /// The engine's output-column name for an un-aliased call - the
+    /// canonical function name (CHARACTER_LENGTH headers as CHAR_LENGTH,
+    /// probed against isql).
+    fn header(&self) -> &'static str {
+        match self {
+            SysFn::Upper => "UPPER",
+            SysFn::Lower => "LOWER",
+            SysFn::CharLength => "CHAR_LENGTH",
+            SysFn::OctetLength => "OCTET_LENGTH",
+            SysFn::Substring => "SUBSTRING",
+            SysFn::Trim(_) => "TRIM",
+            SysFn::Left => "LEFT",
+            SysFn::Right => "RIGHT",
+            SysFn::Replace => "REPLACE",
+            SysFn::Position => "POSITION",
+            SysFn::Reverse => "REVERSE",
+            SysFn::Abs => "ABS",
+            SysFn::Mod => "MOD",
+            SysFn::Sign => "SIGN",
+            SysFn::Lpad => "LPAD",
+            SysFn::Rpad => "RPAD",
+        }
+    }
 }
 
 /// The condition inside an `IIF` - a comparison of two expressions, or a
@@ -11836,12 +11964,209 @@ fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                 }
                 *pos += 1; // ')'
                 Some(node)
+            } else if !quoted && sysfn_named(&word).is_some() && {
+                skip_ws(b, pos);
+                b.get(*pos) == Some(&'(')
+            } {
+                *pos += 1; // '('
+                let node = parse_sysfn_call(&word.to_ascii_uppercase(), b, pos)?;
+                skip_ws(b, pos);
+                if b.get(*pos) != Some(&')') {
+                    return None;
+                }
+                *pos += 1; // ')'
+                Some(node)
             } else {
                 Some(RawExpr::Col(word))
             }
         }
         _ => None,
     }
+}
+
+/// A LITERAL negative SUBSTRING length anywhere in this raw expression -
+/// `SUBSTRING(s FROM p FOR -1)`. The engine raises this while computing
+/// the DESCRIBE (the result's declared width depends on the literal), so
+/// the matching refusal must happen at prepare; a negative length that
+/// only materialises per row (a column, a parameter) raises mid-cursor
+/// instead, which is also what the engine does then.
+fn raw_bad_substring_len(e: &RawExpr) -> Option<i64> {
+    let neg_literal = |a: &RawExpr| match a {
+        RawExpr::Neg(inner) => match **inner {
+            RawExpr::Int(n) => Some(-n),
+            _ => None,
+        },
+        _ => None,
+    };
+    let walk_all = |args: &[RawExpr]| args.iter().find_map(raw_bad_substring_len);
+    match e {
+        RawExpr::Func(SysFn::Substring, args) => args
+            .get(2)
+            .and_then(neg_literal)
+            .filter(|n| *n < 0)
+            .or_else(|| walk_all(args)),
+        RawExpr::Func(_, args) | RawExpr::Coalesce(args) => walk_all(args),
+        RawExpr::Neg(a) | RawExpr::Cast(a, _) => raw_bad_substring_len(a),
+        RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => {
+            raw_bad_substring_len(a).or_else(|| raw_bad_substring_len(b))
+        }
+        RawExpr::Iif(c, a, b) => {
+            let in_cond = match &**c {
+                RawCond::Cmp(x, _, y) => {
+                    raw_bad_substring_len(x).or_else(|| raw_bad_substring_len(y))
+                }
+                RawCond::IsNull(x) | RawCond::IsNotNull(x) => raw_bad_substring_len(x),
+            };
+            in_cond
+                .or_else(|| raw_bad_substring_len(a))
+                .or_else(|| raw_bad_substring_len(b))
+        }
+        RawExpr::Col(_)
+        | RawExpr::Int(_)
+        | RawExpr::Dec(..)
+        | RawExpr::Str(_)
+        | RawExpr::Null => None,
+    }
+}
+
+/// Does this select-list text NAME an expression-function call - a
+/// conditional or a built-in? Used at plan time: once a query names one,
+/// any failure to resolve it must REFUSE rather than fall through, or a
+/// broken call reads as a column name and the query answers wrong.
+fn names_expr_call(s: &str) -> bool {
+    let up = s.to_ascii_uppercase();
+    [
+        "COALESCE(", "NULLIF(", "IIF(", "UPPER(", "LOWER(", "CHAR_LENGTH(",
+        "CHARACTER_LENGTH(", "OCTET_LENGTH(", "SUBSTRING(", "TRIM(", "LEFT(",
+        "RIGHT(", "REPLACE(", "POSITION(", "REVERSE(", "ABS(", "MOD(",
+        "SIGN(", "LPAD(", "RPAD(",
+    ]
+    .iter()
+    .any(|f| up.contains(f))
+}
+
+/// The built-in function this (unquoted, any-case) word names, if any. A
+/// quoted `"LEFT"` stays a column - only the bare word is a call.
+fn sysfn_named(word: &str) -> Option<SysFn> {
+    Some(match word.to_ascii_uppercase().as_str() {
+        "UPPER" => SysFn::Upper,
+        "LOWER" => SysFn::Lower,
+        "CHAR_LENGTH" | "CHARACTER_LENGTH" => SysFn::CharLength,
+        "OCTET_LENGTH" => SysFn::OctetLength,
+        "SUBSTRING" => SysFn::Substring,
+        "TRIM" => SysFn::Trim(TrimSide::Both),
+        "LEFT" => SysFn::Left,
+        "RIGHT" => SysFn::Right,
+        "REPLACE" => SysFn::Replace,
+        "POSITION" => SysFn::Position,
+        "REVERSE" => SysFn::Reverse,
+        "ABS" => SysFn::Abs,
+        "MOD" => SysFn::Mod,
+        "SIGN" => SysFn::Sign,
+        "LPAD" => SysFn::Lpad,
+        "RPAD" => SysFn::Rpad,
+        _ => return None,
+    })
+}
+
+/// Parse a built-in call's argument list, `pos` just past the opening
+/// paren, leaving the closing paren for the caller. SUBSTRING, TRIM and
+/// POSITION carry the standard's keyword syntaxes; everything else is
+/// comma-separated with a fixed arity - a wrong arity returns None, which
+/// the planner turns into a REFUSAL, never a fallback (the call text
+/// would otherwise be read as a column name).
+fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
+    let f = sysfn_named(up)?;
+    // SUBSTRING(<s> FROM <start> [FOR <len>])
+    if matches!(f, SysFn::Substring) {
+        let src = expr_add(b, pos)?;
+        if !take_keyword(b, pos, "FROM") {
+            return None;
+        }
+        let start = expr_add(b, pos)?;
+        let mut args = vec![src, start];
+        if take_keyword(b, pos, "FOR") {
+            args.push(expr_add(b, pos)?);
+        }
+        return Some(RawExpr::Func(SysFn::Substring, args));
+    }
+    // TRIM([LEADING|TRAILING|BOTH] [<what>] FROM <s>) or TRIM(<s>)
+    if matches!(f, SysFn::Trim(_)) {
+        let side = if take_keyword(b, pos, "LEADING") {
+            Some(TrimSide::Leading)
+        } else if take_keyword(b, pos, "TRAILING") {
+            Some(TrimSide::Trailing)
+        } else if take_keyword(b, pos, "BOTH") {
+            Some(TrimSide::Both)
+        } else {
+            None
+        };
+        let space = RawExpr::Str(" ".into());
+        // `TRIM(<side> FROM s)` - no <what>, the default single space
+        if side.is_some() && take_keyword(b, pos, "FROM") {
+            let src = expr_add(b, pos)?;
+            return Some(RawExpr::Func(SysFn::Trim(side?), vec![space, src]));
+        }
+        let first = expr_add(b, pos)?;
+        if take_keyword(b, pos, "FROM") {
+            let src = expr_add(b, pos)?;
+            return Some(RawExpr::Func(
+                SysFn::Trim(side.unwrap_or(TrimSide::Both)),
+                vec![first, src],
+            ));
+        }
+        // a bare TRIM(s) - but a side keyword demands a FROM
+        if side.is_some() {
+            return None;
+        }
+        return Some(RawExpr::Func(SysFn::Trim(TrimSide::Both), vec![space, first]));
+    }
+    // POSITION(<sub> IN <s>), or the comma form with an optional start
+    if matches!(f, SysFn::Position) {
+        let sub = expr_add(b, pos)?;
+        if take_keyword(b, pos, "IN") {
+            let s = expr_add(b, pos)?;
+            return Some(RawExpr::Func(SysFn::Position, vec![sub, s]));
+        }
+        let mut args = vec![sub];
+        while {
+            skip_ws(b, pos);
+            b.get(*pos) == Some(&',')
+        } {
+            *pos += 1;
+            args.push(expr_add(b, pos)?);
+        }
+        if args.len() < 2 || args.len() > 3 {
+            return None;
+        }
+        return Some(RawExpr::Func(SysFn::Position, args));
+    }
+    // the comma-argument functions, arity checked
+    let mut args = vec![expr_add(b, pos)?];
+    while {
+        skip_ws(b, pos);
+        b.get(*pos) == Some(&',')
+    } {
+        *pos += 1;
+        args.push(expr_add(b, pos)?);
+    }
+    let (min, max) = match f {
+        SysFn::Upper
+        | SysFn::Lower
+        | SysFn::CharLength
+        | SysFn::OctetLength
+        | SysFn::Reverse
+        | SysFn::Abs
+        | SysFn::Sign => (1, 1),
+        SysFn::Left | SysFn::Right | SysFn::Mod => (2, 2),
+        SysFn::Replace => (3, 3),
+        SysFn::Lpad | SysFn::Rpad => (2, 3),
+        SysFn::Substring | SysFn::Trim(_) | SysFn::Position => unreachable!(),
+    };
+    if args.len() < min || args.len() > max {
+        return None;
+    }
+    Some(RawExpr::Func(f, args))
 }
 
 /// Consume a whole-word keyword (case-insensitive) at `pos`, skipping
@@ -11976,6 +12301,12 @@ fn resolve_expr(
             Box::new(resolve_expr(a, columns, descs)?),
             Box::new(resolve_expr(b, columns, descs)?),
         ),
+        RawExpr::Func(f, args) => Expr::Func(
+            *f,
+            args.iter()
+                .map(|a| resolve_expr(a, columns, descs))
+                .collect::<Option<Vec<_>>>()?,
+        ),
     })
 }
 
@@ -12005,6 +12336,8 @@ enum Expr {
     NullIf(Box<Expr>, Box<Expr>),
     /// `IIF(<cond>, a, b)` - only a TRUE condition takes `a`
     Iif(Box<Cond2>, Box<Expr>, Box<Expr>),
+    /// a built-in scalar function over resolved arguments
+    Func(SysFn, Vec<Expr>),
 }
 
 /// A resolved [RawCond].
@@ -12068,6 +12401,13 @@ enum EvalErr {
     /// sum past `i64`, or an operation past `i128`:
     /// `isc_exception_integer_overflow` (SQLSTATE 22003)
     IntegerOverflow,
+    /// a negative length given to SUBSTRING/LEFT/RIGHT (the engine routes
+    /// LEFT and RIGHT through SUBSTRING, so all three name it):
+    /// `isc_bad_substring_length` (SQLSTATE 22011), the offending value
+    /// carried as the message argument. Also stands in for the engine's
+    /// 42000 "must be zero or positive" on LPAD/RPAD/POSITION bounds -
+    /// an error either way, never a wrong row
+    InvalidLength(i64),
 }
 
 /// What an expression's result is typed as - which drives its wire form
@@ -12188,6 +12528,114 @@ fn round_scaled_to_int(raw: i128, scale: i8) -> i128 {
     }
 }
 
+/// A function argument as text - the engine's CVT string coercion:
+/// text stays itself (CHAR padding included), a number renders
+/// (CHAR_LENGTH(A) with A = -7 is 2, probed).
+fn fn_text(v: &Value) -> String {
+    v.render()
+}
+
+/// A function argument as an integer - CVT the other way: a scaled
+/// numeric rounds half away from zero (MOD(12.50, 5) = 3, probed), a
+/// string trims and parses, a non-numeric string is the conversion error.
+fn fn_int(v: &Value) -> Result<i64, EvalErr> {
+    if let Some((raw, scale)) = numeric_parts(v) {
+        return i64::try_from(round_scaled_to_int(raw, scale))
+            .map_err(|_| EvalErr::IntegerOverflow);
+    }
+    match v {
+        Value::Text(s) => s.trim().parse::<i64>().map_err(|_| EvalErr::ConversionError),
+        _ => Err(EvalErr::ConversionError),
+    }
+}
+
+/// Strip repetitions of `what` (a whole string, possibly multi-character)
+/// from the chosen side(s) of `s` - blr_trim's rule, probed:
+/// TRIM(BOTH 'ab' FROM 'ababXab') = 'X'. An empty `what` strips nothing.
+fn trim_impl(side: TrimSide, what: &str, s: &str) -> String {
+    if what.is_empty() {
+        return s.to_string();
+    }
+    let mut out = s;
+    if matches!(side, TrimSide::Both | TrimSide::Leading) {
+        while let Some(rest) = out.strip_prefix(what) {
+            out = rest;
+        }
+    }
+    if matches!(side, TrimSide::Both | TrimSide::Trailing) {
+        while let Some(rest) = out.strip_suffix(what) {
+            out = rest;
+        }
+    }
+    out.to_string()
+}
+
+/// SUBSTRING(s FROM start [FOR len]) - the standard's window semantics,
+/// characters 1-based: the result is the intersection of [start,
+/// start+len) with the string, so a start below 1 eats into the length
+/// (FROM -2 FOR 4 on 'Hello' is 'H', probed) and a window past the end is
+/// empty, not an error. A negative len raises isc_bad_substring_length.
+fn substring_impl(s: &str, start: i64, len: Option<i64>) -> Result<String, EvalErr> {
+    let chars: Vec<char> = s.chars().collect();
+    let end: i128 = match len {
+        Some(n) if n < 0 => return Err(EvalErr::InvalidLength(n)),
+        Some(n) => start as i128 + n as i128,
+        None => i128::MAX,
+    };
+    let lo = ((start.max(1) as i128 - 1).clamp(0, chars.len() as i128)) as usize;
+    let hi = ((end - 1).clamp(0, chars.len() as i128)) as usize;
+    Ok(chars[lo..hi.max(lo)].iter().collect())
+}
+
+/// POSITION(sub, s, start) - 1-based first occurrence at or after
+/// `start`, 0 when there is none. An empty `sub` answers `start` while a
+/// match could still begin there (POSITION('', 'Hello', 3) = 3 but at 99
+/// it is 0, probed); a start below 1 is the engine's "must be positive"
+/// argument error.
+fn position_impl(sub: &str, s: &str, start: i64) -> Result<i64, EvalErr> {
+    if start < 1 {
+        return Err(EvalErr::InvalidLength(start));
+    }
+    let sc: Vec<char> = s.chars().collect();
+    let nc: Vec<char> = sub.chars().collect();
+    let from = (start - 1) as usize;
+    if from + nc.len() > sc.len() {
+        return Ok(0);
+    }
+    for i in from..=(sc.len() - nc.len()) {
+        if sc[i..i + nc.len()] == nc[..] {
+            return Ok(i as i64 + 1);
+        }
+    }
+    Ok(0)
+}
+
+/// LPAD/RPAD - pad `s` with `pad` (cycled character by character) out to
+/// `n` characters, or TRUNCATE it to `n` when it is already longer
+/// (LPAD('Hello', 3) = 'Hel', probed). An empty `pad` leaves a short
+/// string as it stands (probed); a negative `n` is the engine's "must be
+/// zero or positive" argument error.
+fn pad_impl(left: bool, s: &str, n: i64, pad: &str) -> Result<String, EvalErr> {
+    if n < 0 {
+        return Err(EvalErr::InvalidLength(n));
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let n = n as usize;
+    if chars.len() >= n {
+        return Ok(chars[..n].iter().collect());
+    }
+    let pc: Vec<char> = pad.chars().collect();
+    if pc.is_empty() {
+        return Ok(s.to_string());
+    }
+    let fill: String = (0..n - chars.len()).map(|i| pc[i % pc.len()]).collect();
+    Ok(if left {
+        format!("{}{}", fill, s)
+    } else {
+        format!("{}{}", s, fill)
+    })
+}
+
 impl Expr {
     /// Type-check the expression against the relation's descriptors:
     /// integer arithmetic needs integer operands, a string literal is
@@ -12250,6 +12698,48 @@ impl Expr {
                     CastTarget::Text { .. } => ExprType::Text,
                 })
             }
+            Expr::Func(f, args) => {
+                // every argument must be typeable; the arguments the
+                // engine converts (a number under UPPER renders to its
+                // text, a text length parses to its integer) convert in
+                // eval with the engine's own CVT errors on failure
+                let ts = args
+                    .iter()
+                    .map(|a| a.type_of(descs))
+                    .collect::<Option<Vec<_>>>()?;
+                match f {
+                    SysFn::Upper
+                    | SysFn::Lower
+                    | SysFn::Substring
+                    | SysFn::Trim(_)
+                    | SysFn::Left
+                    | SysFn::Right
+                    | SysFn::Replace
+                    | SysFn::Reverse
+                    | SysFn::Lpad
+                    | SysFn::Rpad => Some(ExprType::Text),
+                    SysFn::CharLength | SysFn::OctetLength | SysFn::Position => {
+                        Some(ExprType::Int)
+                    }
+                    // MOD and SIGN take numbers; a text operand would go
+                    // through a string-to-number conversion this server
+                    // has not pinned against the engine - refuse it
+                    SysFn::Mod | SysFn::Sign => {
+                        if ts.iter().all(|t| *t != ExprType::Text) {
+                            Some(ExprType::Int)
+                        } else {
+                            None
+                        }
+                    }
+                    // ABS keeps its operand's numeric type (and scale:
+                    // ABS(12.50) is 12.50, probed)
+                    SysFn::Abs => match ts[0] {
+                        ExprType::Int => Some(ExprType::Int),
+                        ExprType::Numeric => Some(ExprType::Numeric),
+                        ExprType::Text => None,
+                    },
+                }
+            }
         }
     }
 
@@ -12303,6 +12793,9 @@ impl Expr {
                     ArithOp::Mul | ArithOp::Div => s1 + s2,
                 })
             }
+            // ABS is the one function that can be Numeric-typed, and it
+            // keeps its operand's scale
+            Expr::Func(SysFn::Abs, args) => args.first()?.result_scale(descs),
             _ => None,
         }
     }
@@ -12374,6 +12867,18 @@ impl Expr {
             Expr::Cast(_, t) => match t {
                 CastTarget::Int { wide } => Some(if *wide { NumRank::I64 } else { NumRank::Long }),
                 CastTarget::Text { .. } => None,
+            },
+            Expr::Func(f, args) => match f {
+                // ABS ranks (and so widens) as its operand does - ABS
+                // over an INT128 column announces INT128
+                SysFn::Abs => args.first()?.rank_of(descs),
+                // a MOD result's magnitude is below its divisor's, but
+                // an INT128 divisor can still put it past i64
+                SysFn::Mod => args.iter().filter_map(|a| a.rank_of(descs)).max(),
+                SysFn::CharLength | SysFn::OctetLength | SysFn::Position | SysFn::Sign => {
+                    Some(NumRank::Long)
+                }
+                _ => None, // the text-valued functions
             },
             Expr::Str(_) | Expr::Concat(..) => None,
         }
@@ -12533,6 +13038,110 @@ impl Expr {
                             s
                         };
                         Value::Text(out)
+                    }
+                }
+            }
+            Expr::Func(f, args) => {
+                // every function here propagates NULL: any NULL argument
+                // makes the result NULL (probed for each one)
+                let mut vs = Vec::with_capacity(args.len());
+                for a in args {
+                    let v = a.eval(values)?;
+                    if matches!(v, Value::Null) {
+                        return Ok(Value::Null);
+                    }
+                    vs.push(v);
+                }
+                match f {
+                    // Unicode case mapping. Exact for a UTF8 database
+                    // (the engine goes through ICU); a NONE-charset
+                    // column's non-ASCII bytes were already lossy at
+                    // decode, so ASCII - where the two agree - is what
+                    // actually reaches here either way.
+                    SysFn::Upper => Value::Text(fn_text(&vs[0]).to_uppercase()),
+                    SysFn::Lower => Value::Text(fn_text(&vs[0]).to_lowercase()),
+                    SysFn::CharLength => {
+                        Value::Int(fn_text(&vs[0]).chars().count() as i64)
+                    }
+                    SysFn::OctetLength => Value::Int(fn_text(&vs[0]).len() as i64),
+                    SysFn::Substring => {
+                        let len = vs.get(2).map(fn_int).transpose()?;
+                        Value::Text(substring_impl(&fn_text(&vs[0]), fn_int(&vs[1])?, len)?)
+                    }
+                    SysFn::Trim(side) => {
+                        Value::Text(trim_impl(*side, &fn_text(&vs[0]), &fn_text(&vs[1])))
+                    }
+                    // LEFT/RIGHT go through the engine's SUBSTRING (their
+                    // negative-length error NAMES it, probed) - so they
+                    // share substring_impl here
+                    SysFn::Left => {
+                        let n = fn_int(&vs[1])?;
+                        Value::Text(substring_impl(&fn_text(&vs[0]), 1, Some(n))?)
+                    }
+                    SysFn::Right => {
+                        let s = fn_text(&vs[0]);
+                        let n = fn_int(&vs[1])?;
+                        if n < 0 {
+                            return Err(EvalErr::InvalidLength(n));
+                        }
+                        let count = s.chars().count() as i64;
+                        Value::Text(substring_impl(&s, (count - n + 1).max(1), None)?)
+                    }
+                    SysFn::Replace => {
+                        let (s, find, repl) =
+                            (fn_text(&vs[0]), fn_text(&vs[1]), fn_text(&vs[2]));
+                        // an empty search string leaves the value as it
+                        // stands (probed) - str::replace would loop it in
+                        // at every boundary
+                        Value::Text(if find.is_empty() {
+                            s
+                        } else {
+                            s.replace(&find, &repl)
+                        })
+                    }
+                    SysFn::Position => {
+                        let start = vs.get(2).map(fn_int).transpose()?.unwrap_or(1);
+                        Value::Int(position_impl(&fn_text(&vs[0]), &fn_text(&vs[1]), start)?)
+                    }
+                    SysFn::Reverse => {
+                        Value::Text(fn_text(&vs[0]).chars().rev().collect())
+                    }
+                    SysFn::Abs => {
+                        let (raw, scale) =
+                            numeric_parts(&vs[0]).ok_or(EvalErr::ConversionError)?;
+                        scaled_value(
+                            raw.checked_abs().ok_or(EvalErr::IntegerOverflow)?,
+                            scale,
+                        )
+                    }
+                    // round each operand to an integer first (the
+                    // engine's rule, probed: MOD(12.50, 5) = 3), then a
+                    // truncated `%` - C's and Rust's share the sign rule
+                    SysFn::Mod => {
+                        let to_int = |v: &Value| -> Result<i128, EvalErr> {
+                            let (raw, scale) =
+                                numeric_parts(v).ok_or(EvalErr::ConversionError)?;
+                            Ok(round_scaled_to_int(raw, scale))
+                        };
+                        let (a, b) = (to_int(&vs[0])?, to_int(&vs[1])?);
+                        if b == 0 {
+                            return Err(EvalErr::DivideByZero);
+                        }
+                        scaled_value(a % b, 0)
+                    }
+                    SysFn::Sign => {
+                        let (raw, _) =
+                            numeric_parts(&vs[0]).ok_or(EvalErr::ConversionError)?;
+                        Value::Int(raw.signum() as i64)
+                    }
+                    SysFn::Lpad | SysFn::Rpad => {
+                        let pad = vs.get(2).map(fn_text).unwrap_or_else(|| " ".into());
+                        Value::Text(pad_impl(
+                            matches!(f, SysFn::Lpad),
+                            &fn_text(&vs[0]),
+                            fn_int(&vs[1])?,
+                            &pad,
+                        )?)
                     }
                 }
             }
@@ -13169,7 +13778,25 @@ fn split_query(
     if find_word(&up, "SELECT", 0) != Some(0) {
         return None;
     }
-    let from = find_word(&up, "FROM", "SELECT".len())?;
+    // the clause FROM is the first one at paren depth 0 - SUBSTRING(S
+    // FROM 2) and TRIM(x FROM y) carry their own FROM keyword INSIDE the
+    // select list's parentheses, and a literal's is masked out entirely
+    let masked_up = mask_literals(&up);
+    let from = {
+        let mut cand = find_word(&masked_up, "FROM", "SELECT".len());
+        loop {
+            let Some(p) = cand else { break None };
+            let depth = masked_up[..p].bytes().fold(0i32, |d, c| match c {
+                b'(' => d + 1,
+                b')' => d - 1,
+                _ => d,
+            });
+            if depth == 0 {
+                break Some(p);
+            }
+            cand = find_word(&masked_up, "FROM", p + "FROM".len());
+        }
+    }?;
     let proj = s["SELECT".len()..from].trim();
     let after = from + "FROM".len();
     let rest = &s[after..];
@@ -13385,7 +14012,10 @@ fn default_expr_name(raw: &RawExpr) -> String {
         RawExpr::Cast(_, _) => "CAST",
         RawExpr::Coalesce(_) => "COALESCE",
         RawExpr::NullIf(_, _) => "NULLIF",
-        RawExpr::Iif(_, _, _) => "IIF",
+        // the engine parses IIF into a searched CASE, and the header
+        // says so (probed: an un-aliased IIF columns as CASE)
+        RawExpr::Iif(_, _, _) => "CASE",
+        RawExpr::Func(f, _) => return f.header().to_string(),
         // the engine leaves a unary-minus column unnamed (blank header)
         RawExpr::Neg(_) => "",
         RawExpr::Int(_) | RawExpr::Dec(..) | RawExpr::Str(_) | RawExpr::Null => "CONSTANT",
@@ -15677,6 +16307,16 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         plan = Plan::Refused;
                         stmt_params = Vec::new();
                         respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                    } else if let Plan::RefusedEval(e) = p {
+                        // refused with the engine's own vector - a
+                        // literal negative SUBSTRING length fails the
+                        // engine's describe, so it fails this prepare
+                        if std::env::var("FC_SRV_TRACE").is_ok() {
+                            eprintln!("[srv] prepare refused ({:?}): {:?}", e, stmt_sql);
+                        }
+                        plan = Plan::Refused;
+                        stmt_params = Vec::new();
+                        respond_eval_error(&mut s, &mut enc, &e)?;
                     } else {
                         plan = p;
                         stmt_params = ps;
@@ -19019,6 +19659,243 @@ mod tests {
             default_expr_name(&parse_raw_expr("CAST(A AS INTEGER)").unwrap()),
             "CAST"
         );
+    }
+
+    #[test]
+    fn parses_and_evaluates_builtin_functions() {
+        // every expected value here was PROBED against the live engine
+        // before it was written down (see qa/serve-real-functions.sh for
+        // the standing differential): A=-7 (int), NAME='Hello'
+        // VARCHAR(10), C=CHAR(5) 'ab' (decoded WITH its blank padding),
+        // N=NUMERIC(9,2)=12.50, I=INT128
+        let columns = vec![
+            RelationColumn { name: "A".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "NAME".into(), field_id: 1, position: 1 },
+            RelationColumn { name: "C".into(), field_id: 2, position: 2 },
+            RelationColumn { name: "N".into(), field_id: 3, position: 3 },
+            RelationColumn { name: "I".into(), field_id: 4, position: 4 },
+        ];
+        let d = |dt, len, s| Descriptor {
+            dtype: dt, scale: s, length: len, sub_type: 0, flags: 0, offset: 4,
+        };
+        let descs = vec![
+            d(dtype::LONG, 4, 0),
+            d(dtype::VARYING, 10, 0),
+            d(dtype::TEXT, 5, 0),
+            d(dtype::LONG, 4, -2),
+            d(dtype::INT128, 16, 0),
+        ];
+        let row = vec![
+            Value::Int(-7),
+            Value::Text("Hello".into()),
+            Value::Text("ab   ".into()),
+            Value::Scaled(1250, -2),
+            Value::Int128(-(1i128 << 70), 0),
+        ];
+        let ev = |s: &str| -> Value {
+            let raw = parse_raw_expr(s).unwrap_or_else(|| panic!("{s} did not parse"));
+            resolve_expr(&raw, &columns, &descs).unwrap().eval(&row).unwrap()
+        };
+        let ev_err = |s: &str| -> EvalErr {
+            let raw = parse_raw_expr(s).unwrap();
+            resolve_expr(&raw, &columns, &descs).unwrap().eval(&row).unwrap_err()
+        };
+        let txt = |s: &str, want: &str| {
+            assert!(matches!(ev(s), Value::Text(ref t) if t == want), "{s} != {want:?}");
+        };
+
+        // case mapping and the length family. CHAR counts its padding;
+        // a numeric argument renders to text first (both probed)
+        txt("UPPER(NAME)", "HELLO");
+        txt("LOWER(NAME)", "hello");
+        txt("UPPER(C)", "AB   ");
+        txt("UPPER(A)", "-7");
+        txt("LOWER(N)", "12.50");
+        assert!(matches!(ev("CHAR_LENGTH(NAME)"), Value::Int(5)));
+        assert!(matches!(ev("CHARACTER_LENGTH(NAME)"), Value::Int(5)));
+        assert!(matches!(ev("CHAR_LENGTH(C)"), Value::Int(5)));
+        assert!(matches!(ev("CHAR_LENGTH(TRIM(C))"), Value::Int(2)));
+        assert!(matches!(ev("CHAR_LENGTH(A)"), Value::Int(2)));
+        assert!(matches!(ev("OCTET_LENGTH(C)"), Value::Int(5)));
+
+        // SUBSTRING's window semantics: clipping at both ends, never an
+        // error for an out-of-range START - only for a negative length
+        txt("SUBSTRING(NAME FROM 2)", "ello");
+        txt("SUBSTRING(NAME FROM 2 FOR 3)", "ell");
+        txt("SUBSTRING(NAME FROM 0 FOR 3)", "He");
+        txt("SUBSTRING(NAME FROM -2 FOR 4)", "H");
+        txt("SUBSTRING(NAME FROM 10 FOR 2)", "");
+        txt("SUBSTRING(NAME FROM 2 FOR 0)", "");
+        assert!(matches!(
+            ev_err("SUBSTRING(NAME FROM 2 FOR -1)"),
+            EvalErr::InvalidLength(-1)
+        ));
+
+        // TRIM: default is BOTH one-space; a multi-character <what>
+        // strips whole-string repetitions; an empty <what> strips nothing
+        txt("TRIM('  x  ')", "x");
+        txt("TRIM(LEADING FROM '  x  ')", "x  ");
+        txt("TRIM(TRAILING 'o' FROM NAME)", "Hell");
+        txt("TRIM(BOTH 'ab' FROM 'ababXab')", "X");
+        txt("TRIM('ab' FROM 'ababXab')", "X");
+        txt("TRIM('' FROM NAME)", "Hello");
+        txt("TRIM(C)", "ab");
+
+        // LEFT/RIGHT clip like SUBSTRING (whose error they raise, as the
+        // engine's do - both delegate to it)
+        txt("LEFT(NAME, 2)", "He");
+        txt("LEFT(NAME, 0)", "");
+        txt("LEFT(NAME, 99)", "Hello");
+        txt("RIGHT(NAME, 3)", "llo");
+        txt("RIGHT(NAME, 99)", "Hello");
+        assert!(matches!(ev_err("LEFT(NAME, -1)"), EvalErr::InvalidLength(-1)));
+        assert!(matches!(ev_err("RIGHT(NAME, -2)"), EvalErr::InvalidLength(-2)));
+
+        // REPLACE: left-to-right, and an empty search string is a no-op
+        txt("REPLACE(NAME, 'l', 'L')", "HeLLo");
+        txt("REPLACE(NAME, '', 'x')", "Hello");
+        txt("REPLACE(NAME, 'Hello', '')", "");
+
+        // POSITION: 1-based, 0 when absent; the empty needle answers the
+        // start while a match could still begin there; both syntaxes
+        assert!(matches!(ev("POSITION('ll' IN NAME)"), Value::Int(3)));
+        assert!(matches!(ev("POSITION('z' IN NAME)"), Value::Int(0)));
+        assert!(matches!(ev("POSITION('l', NAME)"), Value::Int(3)));
+        assert!(matches!(ev("POSITION('l', NAME, 4)"), Value::Int(4)));
+        assert!(matches!(ev("POSITION('l', NAME, 99)"), Value::Int(0)));
+        assert!(matches!(ev("POSITION('', NAME, 3)"), Value::Int(3)));
+        assert!(matches!(ev("POSITION('', NAME, 99)"), Value::Int(0)));
+        assert!(matches!(ev_err("POSITION('l', NAME, 0)"), EvalErr::InvalidLength(0)));
+
+        txt("REVERSE(NAME)", "olleH");
+        txt("REVERSE(A)", "7-");
+
+        // ABS keeps the operand's numeric type, scale and rank
+        assert!(matches!(ev("ABS(A)"), Value::Int(7)));
+        assert!(matches!(ev("ABS(N)"), Value::Scaled(1250, -2)));
+        assert!(matches!(ev("ABS(I)"), Value::Int128(v, 0) if v == 1i128 << 70));
+        {
+            let raw = parse_raw_expr("ABS(N)").unwrap();
+            let e = resolve_expr(&raw, &columns, &descs).unwrap();
+            assert_eq!(e.type_of(&descs), Some(ExprType::Numeric));
+            assert_eq!(e.result_scale(&descs), Some(-2));
+            let pc = build_expr_col(&raw, "X", &columns, &descs).unwrap();
+            assert_eq!((pc.sql_type, pc.scale), (581, -2)); // INT64-backed
+            // ...and over an INT128 column the announce widens
+            let wide = parse_raw_expr("ABS(I)").unwrap();
+            let pc = build_expr_col(&wide, "X", &columns, &descs).unwrap();
+            assert_eq!((pc.sql_type, pc.length), (32753, 16));
+        }
+
+        // MOD: operands round half away from zero FIRST (probed:
+        // MOD(12.50, 5) = 3), then a truncated `%` with C's sign rule
+        assert!(matches!(ev("MOD(A, 3)"), Value::Int(-1)));
+        assert!(matches!(ev("MOD(7, -3)"), Value::Int(1)));
+        assert!(matches!(ev("MOD(N, 5)"), Value::Int(3)));
+        assert!(matches!(ev_err("MOD(A, 0)"), EvalErr::DivideByZero));
+
+        assert!(matches!(ev("SIGN(A)"), Value::Int(-1)));
+        assert!(matches!(ev("SIGN(0)"), Value::Int(0)));
+        assert!(matches!(ev("SIGN(N)"), Value::Int(1)));
+
+        // LPAD/RPAD: cycle the pad, TRUNCATE past-length values, leave a
+        // short string alone under an empty pad (all probed)
+        txt("LPAD(NAME, 8, '*')", "***Hello");
+        txt("RPAD(NAME, 8, '*')", "Hello***");
+        txt("LPAD(NAME, 3)", "Hel");
+        txt("LPAD(NAME, 8)", "   Hello");
+        txt("LPAD(NAME, 9, 'ab')", "ababHello"); // the pad cycles (probed)
+        txt("LPAD(NAME, 8, 'ab')", "abaHello");
+        txt("RPAD(NAME, 9, 'ab')", "Helloabab");
+        txt("LPAD('ab', 5, '')", "ab");
+        txt("LPAD(A, 6, '0')", "0000-7");
+        assert!(matches!(ev_err("LPAD(NAME, -1)"), EvalErr::InvalidLength(-1)));
+
+        // NULL propagates through every one of them
+        let null_row = vec![Value::Null; 5];
+        let evn = |s: &str| {
+            let raw = parse_raw_expr(s).unwrap();
+            resolve_expr(&raw, &columns, &descs).unwrap().eval(&null_row).unwrap()
+        };
+        for q in [
+            "UPPER(NAME)", "CHAR_LENGTH(NAME)", "SUBSTRING(NAME FROM 1)",
+            "TRIM(NAME)", "LEFT(NAME, 2)", "REPLACE(NAME, 'a', 'b')",
+            "POSITION('a' IN NAME)", "REVERSE(NAME)", "ABS(A)", "MOD(A, 3)",
+            "SIGN(A)", "LPAD(NAME, 3)",
+        ] {
+            assert!(matches!(evn(q), Value::Null), "{q} did not propagate NULL");
+        }
+
+        // the announced type: text functions type Text, the counting ones
+        // Int; MOD/SIGN/ABS refuse a text operand rather than guess at
+        // the engine's string-to-number path
+        let ty = |s: &str| {
+            let raw = parse_raw_expr(s).unwrap();
+            resolve_expr(&raw, &columns, &descs).unwrap().type_of(&descs)
+        };
+        assert_eq!(ty("UPPER(NAME)"), Some(ExprType::Text));
+        assert_eq!(ty("CHAR_LENGTH(NAME)"), Some(ExprType::Int));
+        assert_eq!(ty("POSITION('a' IN NAME)"), Some(ExprType::Int));
+        assert_eq!(ty("MOD(NAME, 2)"), None);
+        assert_eq!(ty("ABS(NAME)"), None);
+        assert_eq!(ty("SIGN(NAME)"), None);
+
+        // un-aliased headers carry the engine's names - CHARACTER_LENGTH
+        // canonicalizes, IIF headers as CASE (both probed)
+        for (q, h) in [
+            ("UPPER(NAME)", "UPPER"),
+            ("CHARACTER_LENGTH(NAME)", "CHAR_LENGTH"),
+            ("SUBSTRING(NAME FROM 1)", "SUBSTRING"),
+            ("TRIM(NAME)", "TRIM"),
+            ("POSITION('a' IN NAME)", "POSITION"),
+            ("MOD(A, 2)", "MOD"),
+            ("IIF(A > 1, 1, 0)", "CASE"),
+        ] {
+            assert_eq!(default_expr_name(&parse_raw_expr(q).unwrap()), h, "{q}");
+        }
+
+        // a wrong arity or a broken keyword form does not parse - the
+        // planner then REFUSES the query (names_expr_call), never
+        // misreads the call as a column name
+        for bad in [
+            "UPPER()", "UPPER(NAME, 2)", "LEFT(NAME)", "MOD(A)",
+            "REPLACE(NAME, 'a')", "SUBSTRING(NAME)", "SUBSTRING(NAME, 2)",
+            "TRIM(LEADING NAME)", "POSITION(NAME)", "LPAD(NAME)",
+        ] {
+            assert!(parse_raw_expr(bad).is_none(), "{bad} parsed");
+            assert!(names_expr_call(bad), "{bad} not flagged as a call");
+        }
+        // ...while a quoted identifier that merely LOOKS like one stays a
+        // column reference
+        assert!(matches!(
+            parse_raw_expr_any("\"LEFT\"").unwrap(),
+            RawExpr::Col(ref c) if c == "LEFT"
+        ));
+
+        // functions nest into the rest of the expression surface
+        txt("UPPER(LEFT(NAME, 3)) || '-' || LOWER(RIGHT(NAME, 2))", "HEL-lo");
+        assert!(matches!(ev("CHAR_LENGTH(NAME) + 10"), Value::Int(15)));
+        assert!(matches!(ev("ABS(A) * 2"), Value::Int(14)));
+        txt("IIF(CHAR_LENGTH(NAME) > 3, 'long', 'short')", "long");
+        txt("COALESCE(SUBSTRING(NAME FROM 99), 'gone')", "");
+    }
+
+    #[test]
+    fn split_query_skips_function_from_keywords() {
+        // SUBSTRING/TRIM carry a FROM keyword INSIDE the select list's
+        // parentheses - the clause splitter must take the first one at
+        // depth 0, and never one inside a string literal
+        let (proj, table, wh, ..) =
+            split_query("SELECT SUBSTRING(S FROM 2 FOR 3) FROM T WHERE ID = 1").unwrap();
+        assert_eq!(proj, "SUBSTRING(S FROM 2 FOR 3)");
+        assert_eq!(table, "T");
+        assert_eq!(wh, Some("ID = 1"));
+        let (proj, table, ..) =
+            split_query("SELECT TRIM(BOTH 'ab' FROM S), LEFT(S, 2) FROM T2").unwrap();
+        assert_eq!(proj, "TRIM(BOTH 'ab' FROM S), LEFT(S, 2)");
+        assert_eq!(table, "T2");
+        let (_, table, ..) = split_query("SELECT ' FROM X ' FROM T3").unwrap();
+        assert_eq!(table, "T3");
     }
 
     #[test]
