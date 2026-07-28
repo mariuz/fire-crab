@@ -13,6 +13,32 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 15: calls, exceptions, exit
+
+### Converted
+- **EXECUTE PROCEDURE**: `blr_exec_proc` — a counted name, u16 input
+  count + values, u16 output count + blr_variable targets
+  (`RETURNING_VALUES :v, ...`). Arg-less calls carry two zero words.
+- **EXCEPTION <name>**: `blr_abort, 2, counted name`. **EXIT**:
+  `blr_leave 0` — it leaves the WRAPPER's label, the same leave verb
+  WHILE uses.
+- **(FOR) SELECT inside TRIGGER bodies**: the stream takes the next
+  context after OLD/NEW, labels share the numbering, and the DO body
+  is any statement (no row-send — that is SUSPEND's, and SUSPEND is
+  procedure-only).
+- **The aggregate-context law GENERALISED**: the aggregate node takes
+  stream ctx + 1 wherever the stream lands — probed at 1-over-0
+  (slice 8), 3-over-2 (a trigger's singular aggregate select) and
+  2-over-1 (an aggregate after a DML). The slice-14 refusal of
+  aggregates at nonzero contexts fell to a probe — flip nine — and
+  HAVING/ORDER-BY fids now carry the right context everywhere.
+
+### Guarded
+- (nothing new — the slice REMOVED a refusal). Gates:
+  `qa/dsql-proc-blr.sh` grew to 67 checks, `qa/dsql-trig-blr.sh` to
+  38 (12 fresh battery statements incl. RETURNING_VALUES into a
+  local and EXCEPTION raised from a trigger); 189 unit byte-pins.
+
 ## 2026-07-28 — fire-crab-dsql slice 14: general procedure bodies
 
 ### Converted

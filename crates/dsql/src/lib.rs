@@ -269,6 +269,11 @@ mod blr {
     /// INSERTING/UPDATING/DELETING: eql(blr_internal_info(literal 6),
     /// literal 1/2/3) (probed)
     pub const INTERNAL_INFO: u8 = 0xB1;
+    /// EXECUTE PROCEDURE: counted name, u16 input count + values,
+    /// u16 output count + variable targets (probed)
+    pub const EXEC_PROC: u8 = 0x78;
+    /// EXCEPTION <name>: blr_abort, 2, counted name (probed)
+    pub const ABORT: u8 = 0x80;
     pub const EQL: u8 = 0x2F;
     pub const NEQ: u8 = 0x30;
     pub const GTR: u8 = 0x31;
@@ -774,6 +779,9 @@ struct P<'a> {
     /// procedure-body mode: SUSPEND and (FOR) SELECT become
     /// statements; the number of output parameters shapes the sends
     proc: Option<usize>,
+    /// the current select's aggregate context (stream ctx + 1) -
+    /// what HAVING/ORDER BY fids address
+    agg_fid_ctx: u8,
     /// context of stream index 0: 1 in view BLR, 0 in procedure
     /// bodies (probed - the FOR SELECT stream is context 0)
     base: u8,
@@ -1237,7 +1245,7 @@ impl<'a> P<'a> {
             // inside HAVING: an aggregate resolves to its map slot
             let (verb, arg) = self.parse_agg(name)?;
             let slot = self.agg_slot(verb, arg);
-            return Some(Val::Fid(1, slot));
+            return Some(Val::Fid(self.agg_fid_ctx, slot));
         }
         self.i += 1; // (
         let v = match name {
@@ -1537,6 +1545,7 @@ impl<'a> P<'a> {
     /// becomes a blr_fid on the aggregate's context (probed: HAVING
     /// COUNT(*) beside SELECT COUNT(*) REUSES slot 1)
     fn agg_slot(&mut self, verb: u8, arg: Option<Val>) -> u16 {
+        // (the fid context is self.agg_fid_ctx - set by the select)
         let entry = MapEntry::Agg(verb, arg);
         if let Some(idx) = self.agg_map.iter().position(|e| *e == entry) {
             return idx as u16;
@@ -1743,6 +1752,9 @@ fn is_keyword(w: &str) -> bool {
             | "INSERTING"
             | "UPDATING"
             | "DELETING"
+            | "EXECUTE"
+            | "EXCEPTION"
+            | "EXIT"
     )
 }
 
@@ -2060,6 +2072,7 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
         local_vars: Vec::new(),
         next_label: 1,
         proc: None,
+        agg_fid_ctx: 1,
     };
     // a top-level UNION restructures the whole statement: the union
     // node takes context 1 BEFORE any branch stream, so it must be
@@ -2324,20 +2337,23 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
 /// group-key column becomes blr_fid(1, its slot); fids (from
 /// aggregate calls) pass through; literals and expressions over them
 /// recurse. A column that is not a group key refuses.
-fn map_val_to_fid(map: &[MapEntry], v: &Val) -> Option<Val> {
+fn map_val_to_fid(map: &[MapEntry], v: &Val, fid_ctx: u8) -> Option<Val> {
     match v {
         Val::Field(..) => {
             let idx = map
                 .iter()
                 .position(|e| matches!(e, MapEntry::Key(k) if k == v))?;
-            Some(Val::Fid(1, idx as u16))
+            Some(Val::Fid(fid_ctx, idx as u16))
         }
         Val::Fid(..) | Val::Int(_) | Val::Int64(_) | Val::Dec(..) | Val::Str(_) | Val::Null => {
             Some(v.clone())
         }
         Val::Add(a, b) | Val::Sub(a, b) | Val::Mul(a, b) | Val::Div(a, b)
         | Val::Concat(a, b) => {
-            let (a, b) = (map_val_to_fid(map, a)?, map_val_to_fid(map, b)?);
+            let (a, b) = (
+                map_val_to_fid(map, a, fid_ctx)?,
+                map_val_to_fid(map, b, fid_ctx)?,
+            );
             Some(match v {
                 Val::Add(..) => Val::Add(Box::new(a), Box::new(b)),
                 Val::Sub(..) => Val::Sub(Box::new(a), Box::new(b)),
@@ -2346,31 +2362,35 @@ fn map_val_to_fid(map: &[MapEntry], v: &Val) -> Option<Val> {
                 _ => Val::Concat(Box::new(a), Box::new(b)),
             })
         }
-        Val::Neg(a) => Some(Val::Neg(Box::new(map_val_to_fid(map, a)?))),
+        Val::Neg(a) => Some(Val::Neg(Box::new(map_val_to_fid(map, a, fid_ctx)?))),
         // anything richer over an aggregate's output: unprobed
         _ => None,
     }
 }
 
-fn map_bool_to_fids(map: &[MapEntry], b: Bool) -> Option<Bool> {
+fn map_bool_to_fids(map: &[MapEntry], b: Bool, fid_ctx: u8) -> Option<Bool> {
     Some(match b {
         Bool::And(l, r) => Bool::And(
-            Box::new(map_bool_to_fids(map, *l)?),
-            Box::new(map_bool_to_fids(map, *r)?),
+            Box::new(map_bool_to_fids(map, *l, fid_ctx)?),
+            Box::new(map_bool_to_fids(map, *r, fid_ctx)?),
         ),
         Bool::Or(l, r) => Bool::Or(
-            Box::new(map_bool_to_fids(map, *l)?),
-            Box::new(map_bool_to_fids(map, *r)?),
+            Box::new(map_bool_to_fids(map, *l, fid_ctx)?),
+            Box::new(map_bool_to_fids(map, *r, fid_ctx)?),
         ),
-        Bool::Not(inner) => Bool::Not(Box::new(map_bool_to_fids(map, *inner)?)),
-        Bool::Cmp(op, a, c) => {
-            Bool::Cmp(op, map_val_to_fid(map, &a)?, map_val_to_fid(map, &c)?)
+        Bool::Not(inner) => {
+            Bool::Not(Box::new(map_bool_to_fids(map, *inner, fid_ctx)?))
         }
-        Bool::Missing(v) => Bool::Missing(map_val_to_fid(map, &v)?),
+        Bool::Cmp(op, a, c) => Bool::Cmp(
+            op,
+            map_val_to_fid(map, &a, fid_ctx)?,
+            map_val_to_fid(map, &c, fid_ctx)?,
+        ),
+        Bool::Missing(v) => Bool::Missing(map_val_to_fid(map, &v, fid_ctx)?),
         Bool::Between(v, lo, hi) => Bool::Between(
-            map_val_to_fid(map, &v)?,
-            map_val_to_fid(map, &lo)?,
-            map_val_to_fid(map, &hi)?,
+            map_val_to_fid(map, &v, fid_ctx)?,
+            map_val_to_fid(map, &lo, fid_ctx)?,
+            map_val_to_fid(map, &hi, fid_ctx)?,
         ),
         // LIKE / IN / subqueries over aggregate output: unprobed
         _ => return None,
@@ -2415,6 +2435,7 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         local_vars: Vec::new(),
         next_label: 1,
         proc: None,
+        agg_fid_ctx: 1,
     };
     if !(p.kw("CREATE") && p.kw("PROCEDURE")) {
         return None;
@@ -2626,6 +2647,12 @@ enum TrigStmt {
     /// SUSPEND; - the row send: every output variable to its
     /// blr_parameter2 pair plus the EOF flag as literal short 1
     Suspend(usize),
+    /// EXECUTE PROCEDURE name [(inputs)] [RETURNING_VALUES :v, ...]
+    ExecProc(String, Vec<Val>, Vec<u16>),
+    /// EXCEPTION name; - blr_abort by name
+    ExceptionRaise(String),
+    /// EXIT; - blr_leave 0: leaves the wrapper label
+    Exit,
     /// (FOR) SELECT - the whole probed select machinery as ONE
     /// statement inside a body
     ForSel(Box<ForSel>),
@@ -2735,6 +2762,30 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
             out.push(*ctx);
         }
         TrigStmt::Suspend(n) => emit_send(out, *n, 1),
+        TrigStmt::ExecProc(name, ins, outs) => {
+            out.push(blr::EXEC_PROC);
+            out.push(name.len() as u8);
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&(ins.len() as u16).to_le_bytes());
+            for v in ins {
+                emit_val(out, v);
+            }
+            out.extend_from_slice(&(outs.len() as u16).to_le_bytes());
+            for vi in outs {
+                out.push(blr::VARIABLE);
+                out.extend_from_slice(&vi.to_le_bytes());
+            }
+        }
+        TrigStmt::ExceptionRaise(name) => {
+            out.push(blr::ABORT);
+            out.push(2);
+            out.push(name.len() as u8);
+            out.extend_from_slice(name.as_bytes());
+        }
+        TrigStmt::Exit => {
+            out.push(blr::LEAVE);
+            out.push(0);
+        }
         TrigStmt::ForSel(f) => {
             match f.label {
                 Some(l) => {
@@ -3007,14 +3058,21 @@ impl<'a> P<'a> {
         }
         let aggregate = has_aggs || grouped;
         if aggregate {
-            if !has_aggs || ctx != 0 {
-                // grouped-without-aggs and aggregates after other
-                // stream-claiming statements: unprobed
-                return None;
+            if !has_aggs {
+                return None; // grouped-without-aggs: unprobed
             }
             if first.is_some() || skip.is_some() {
                 return None;
             }
+            // the aggregate node takes the NEXT context (stream + 1,
+            // probed at 1-over-0 and 3-over-2); claim its slot so
+            // later statements keep counting correctly
+            self.agg_fid_ctx = ctx + 1;
+            self.streams.push(Stream {
+                name: String::new(),
+                alias: None,
+                derived: None,
+            });
             for it in &items {
                 if let Item::Col(v) = it {
                     if !group_keys.contains(v) {
@@ -3037,7 +3095,7 @@ impl<'a> P<'a> {
             self.agg_mode = true;
             let b = self.bool_or()?;
             self.agg_mode = false;
-            Some(map_bool_to_fids(&self.agg_map, b)?)
+            Some(map_bool_to_fids(&self.agg_map, b, ctx + 1)?)
         } else {
             None
         };
@@ -3066,7 +3124,7 @@ impl<'a> P<'a> {
                     _ => return None,
                 };
                 let key = if aggregate {
-                    map_val_to_fid(&self.agg_map, &key)?
+                    map_val_to_fid(&self.agg_map, &key, ctx + 1)?
                 } else {
                     key
                 };
@@ -3197,16 +3255,95 @@ impl<'a> P<'a> {
                 self.i += 1;
                 return Some(TrigStmt::Suspend(n));
             }
-            if self.kw("FOR") {
-                if !self.kw("SELECT") {
-                    return None;
-                }
-                return self.select_stmt(true);
+        }
+        // (FOR) SELECT works in BOTH body kinds - a trigger's FOR
+        // stream takes the next context after OLD/NEW (probed)
+        if self.kw("FOR") {
+            if !self.kw("SELECT") {
+                return None;
             }
-            if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "SELECT") {
+            return self.select_stmt(true);
+        }
+        if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "SELECT") {
+            self.i += 1;
+            return self.select_stmt(false);
+        }
+        if self.kw("EXECUTE") {
+            if !self.kw("PROCEDURE") {
+                return None;
+            }
+            let Some(Tok::Ident(name)) = self.t.get(self.i) else {
+                return None;
+            };
+            if is_keyword(name) {
+                return None;
+            }
+            let name = name.clone();
+            self.i += 1;
+            let mut ins = Vec::new();
+            if matches!(self.t.get(self.i), Some(Tok::LParen)) {
                 self.i += 1;
-                return self.select_stmt(false);
+                loop {
+                    ins.push(self.val()?);
+                    match self.t.get(self.i)? {
+                        Tok::Comma => self.i += 1,
+                        Tok::RParen => {
+                            self.i += 1;
+                            break;
+                        }
+                        _ => return None,
+                    }
+                }
             }
+            let mut outs = Vec::new();
+            if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "RETURNING_VALUES")
+            {
+                self.i += 1;
+                loop {
+                    if !matches!(self.t.get(self.i), Some(Tok::Colon)) {
+                        return None;
+                    }
+                    self.i += 1;
+                    let Some(Tok::Ident(v)) = self.t.get(self.i) else {
+                        return None;
+                    };
+                    let vi = self.local_vars.iter().position(|n| n == v)?;
+                    outs.push(vi as u16);
+                    self.i += 1;
+                    if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                        self.i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                return None;
+            }
+            self.i += 1;
+            return Some(TrigStmt::ExecProc(name, ins, outs));
+        }
+        if self.kw("EXCEPTION") {
+            let Some(Tok::Ident(name)) = self.t.get(self.i) else {
+                return None;
+            };
+            if is_keyword(name) {
+                return None;
+            }
+            let name = name.clone();
+            self.i += 1;
+            if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                return None;
+            }
+            self.i += 1;
+            return Some(TrigStmt::ExceptionRaise(name));
+        }
+        if self.kw("EXIT") {
+            if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                return None;
+            }
+            self.i += 1;
+            return Some(TrigStmt::Exit);
         }
         if self.kw("WHILE") {
             if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
@@ -3476,6 +3613,7 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
         local_vars: Vec::new(),
         next_label: 1,
         proc: None,
+        agg_fid_ctx: 1,
     };
     if !(p.kw("CREATE") && p.kw("TRIGGER")) {
         return None;
@@ -4587,13 +4725,50 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_fifteen_calls_byte_for_byte() {
+        // EXECUTE PROCEDURE: blr_exec_proc - counted name, u16 input
+        // count + values, u16 output count (+ variable targets)
+        pin_proc(
+            "CREATE PROCEDURE QI1 AS BEGIN EXECUTE PROCEDURE QI0(5); END",
+            "0502040101000700029B1100020278035149300100150800050000000000FFFFFF0E010201150700000019010000FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE QJ2 AS BEGIN EXECUTE PROCEDURE QJ0; END",
+            "0502040101000700029B110002027803514A3000000000FFFFFF0E010201150700000019010000FFFF4C",
+        );
+        // RETURNING_VALUES fills the output slots with variables
+        pin_proc(
+            "CREATE PROCEDURE QJ3 RETURNS (R1 INTEGER) AS BEGIN EXECUTE PROCEDURE QJ1 RETURNING_VALUES :R1; SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B110002027803514A31000001001A00000E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // EXCEPTION name: blr_abort, 2, counted name
+        pin_proc(
+            "CREATE PROCEDURE QI2 RETURNS (R1 INTEGER) AS BEGIN IF (R1 IS NULL) THEN EXCEPTION QEX1; SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B11000202083D1A000080020451455831FF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // EXIT is blr_leave 0 - it leaves the WRAPPER's label
+        pin_proc(
+            "CREATE PROCEDURE QI3 RETURNS (R1 INTEGER) AS BEGIN R1 = 1; IF (R1 > 0) THEN EXIT; SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020201150800010000001A000008311A0000150800000000001200FF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE QJ0 AS BEGIN EXIT; END",
+            "0502040101000700029B110002021200FFFFFF0E010201150700000019010000FFFF4C",
+        );
+        // FOR SELECT inside a TRIGGER: the stream takes the next
+        // context after OLD/NEW (2), labels share the numbering, and
+        // the DO body is any statement - no row-send
+        pin_trig(
+            "CREATE TRIGGER QI_T FOR T BEFORE INSERT AS DECLARE V1 INTEGER; BEGIN FOR SELECT UA FROM U2 INTO :V1 DO NEW.A = V1; END",
+            "05020300000800012D1A00001100020211010743014A02553202FF020117020255411A0000011A000017010141FFFFFFFF4C",
+        );
+    }
+
+    #[test]
     fn general_body_refusals() {
         for sql in [
             // SUSPEND without outputs: unprobed
             "CREATE PROCEDURE X (I1 INTEGER) AS BEGIN SUSPEND; END",
-            // an aggregate select after a stream-claiming statement:
-            // the aggregate context law is probed only at 0
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN DELETE FROM U2; SELECT COUNT(*) FROM T INTO :R1; END",
         ] {
             assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
         }

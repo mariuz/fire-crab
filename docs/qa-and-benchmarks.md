@@ -4423,7 +4423,7 @@ expressions, and alias-less derived tables refuse. The slice-5
 refusal of scalar subselects became a feature; its gate slot flipped
 to a positive check, the fifth such flip in the project.
 
-### SQL → BLR, oracle number two (`qa/dsql-proc-blr.sh`, 59 checks)
+### SQL → BLR, oracle number two (`qa/dsql-proc-blr.sh`, 67 checks)
 
 Views cannot hold ORDER BY - but a procedure's `FOR SELECT ... DO
 SUSPEND` body can, and `RDB$PROCEDURE_BLR` stores ITS compiled BLR
@@ -4526,7 +4526,22 @@ stays a COLUMN and variables need their colon (`:name` reaches
 locals and outputs as blr_variable). Bodies now mix FOR SELECT
 loops, singular SELECT INTOs, DML, IF, WHILE and SUSPEND freely.
 
-### SQL → BLR, oracle number three (`qa/dsql-trig-blr.sh`, 34 checks)
+Slice 15 added the CALL surface. EXECUTE PROCEDURE compiles to
+blr_exec_proc - a counted name, a u16 input count with the values,
+a u16 output count with blr_variable targets (RETURNING_VALUES) -
+arg-less calls carrying two zero words. EXCEPTION <name> is
+blr_abort, 2, counted name; EXIT is blr_leave 0, leaving the
+WRAPPER's label with the same verb WHILE's loops use. (FOR) SELECT
+turned out to work inside TRIGGER bodies with no new machinery: the
+stream takes the next context after OLD/NEW and the DO body is any
+statement. And a trigger battery statement TAUGHT a law: a singular
+aggregate select in a trigger put the aggregate at context 3 over
+its stream's 2, generalising slice 8's 1-over-0 to STREAM + 1
+ANYWHERE - the slice-14 refusal of aggregates at nonzero contexts
+fell to that probe (flip nine), and a third data point (2-over-1,
+an aggregate after a DML) went straight into the battery.
+
+### SQL → BLR, oracle number three (`qa/dsql-trig-blr.sh`, 38 checks)
 
 Slice 11 opened the trigger oracle: RDB$TRIGGER_BLR stores a compiled
 trigger body verbatim, and its wrapper is the leanest of the three -

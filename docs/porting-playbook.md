@@ -307,6 +307,11 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # calls are counted lists (name, in-count+values, out-count+
+    # targets); EXIT is just leave-the-outermost-label - control
+    # verbs COMPOSE from what you already have; and when a refusal
+    # falls to a new probe, GENERALISE the law (aggregate ctx =
+    # stream+1 anywhere) instead of special-casing the new point
     # unify statement machines EARLY: the single-statement wrapper
     # you converted first is a special case of the general body -
     # refactor toward one machine and let the accumulated byte-pins
