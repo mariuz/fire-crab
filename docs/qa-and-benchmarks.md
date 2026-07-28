@@ -4423,7 +4423,7 @@ expressions, and alias-less derived tables refuse. The slice-5
 refusal of scalar subselects became a feature; its gate slot flipped
 to a positive check, the fifth such flip in the project.
 
-### SQL → BLR, oracle number two (`qa/dsql-proc-blr.sh`, 67 checks)
+### SQL → BLR, oracle number two (`qa/dsql-proc-blr.sh`, 73 checks)
 
 Views cannot hold ORDER BY - but a procedure's `FOR SELECT ... DO
 SUSPEND` body can, and `RDB$PROCEDURE_BLR` stores ITS compiled BLR
@@ -4634,6 +4634,22 @@ system triggers - RDB$TRIGGERS types 1 and 3, byte-identical - with
 begin, blr_if over the NEGATED condition (CHECK (A < B) stores
 blr_geq: the NOT fold, reused by the engine itself), blr_abort with
 blr_gds_code 'check_constraint', and fields at CONTEXT 1.
+
+Slice 19 added ERROR HANDLING through this oracle. A BEGIN..END
+carrying WHEN compiles to blr_block: a begin holding the guarded
+statements, blr_error_handler with a u16 code count and the code,
+then the handler STATEMENT, then blr_end closing the block. The
+three probed code kinds: WHEN ANY is blr_default_code; WHEN
+EXCEPTION <name> is 9, 0 and the counted name; WHEN GDSCODE <name>
+is 0 and the counted UPPERCASED name. A deliberate probe settled the
+plain-block question the handler shapes raised: a nested BEGIN..END
+WITHOUT handlers stays a DOUBLE begin in both body kinds - blr_block
+belongs to handler-carrying blocks alone - while a block AS a
+handler's body nests blr_block differently and refuses. ROW_COUNT
+joined as blr_internal_info(5), one family with the trigger-action
+code, and UPDATE OR INSERT gave up its shape to a probe (a
+modify-loop plus a row_count-guarded store, blr_equiv for MATCHING)
+but holds a named refusal until converted.
 
 The slice's best find was a FIX. The CHECK battery ran
 S IN ('a','b') and the engine's bytes carried a surprise: EACH item

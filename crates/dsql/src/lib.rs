@@ -280,6 +280,17 @@ mod blr {
     pub const GEN_ID2: u8 = 0xD2;
     /// POST_EVENT: blr_post + the event-name value (probed)
     pub const POST: u8 = 0x14;
+    /// a BEGIN..END carrying WHEN handlers: blr_block, a begin with
+    /// the guarded statements, then per handler blr_error_handler +
+    /// u16 code count + codes + the handler statement, then blr_end
+    /// closing the block (probed)
+    pub const BLOCK: u8 = 0x81;
+    pub const ERROR_HANDLER: u8 = 0x82;
+    /// handler codes: WHEN ANY = blr_default_code; WHEN EXCEPTION =
+    /// 9, 0, counted name; WHEN GDSCODE = 0, counted UPPERCASED name
+    pub const DEFAULT_CODE: u8 = 0x04;
+    pub const EXCEPTION_CODE: u8 = 0x09;
+    pub const GDS_CODE: u8 = 0x00;
     /// the niladic context functions (probed in DEFAULT clauses)
     pub const CURRENT_DATE: u8 = 0xA0;
     pub const CURRENT_TIMESTAMP: u8 = 0xA1;
@@ -351,6 +362,8 @@ enum Val {
     CurrentDate,
     CurrentTime,
     CurrentTimestamp,
+    /// ROW_COUNT - blr_internal_info(literal 5) (probed)
+    RowCount,
     /// GEN_ID(sequence, increment)
     GenId(String, Box<Val>),
     /// NEXT VALUE FOR sequence - blr_gen_id2, the name alone
@@ -1175,6 +1188,7 @@ impl<'a> P<'a> {
             }
             Tok::Ident(x) if x == "NULL" => Val::Null,
             Tok::Ident(x) if x == "VALUE" && self.domain_value => Val::Fid(0, 0),
+            Tok::Ident(x) if x == "ROW_COUNT" => Val::RowCount,
             Tok::Ident(x) if x == "NEXT" => {
                 self.i += 1;
                 if !(self.kw("VALUE") && self.kw("FOR")) {
@@ -1829,6 +1843,8 @@ fn is_keyword(w: &str) -> bool {
             | "NEXT"
             | "VALUE"
             | "POST_EVENT"
+            | "ROW_COUNT"
+            | "GDSCODE"
     )
 }
 
@@ -1961,6 +1977,10 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
         Val::CurrentDate => out.push(blr::CURRENT_DATE),
         Val::CurrentTime => out.push(blr::CURRENT_TIME),
         Val::CurrentTimestamp => out.push(blr::CURRENT_TIMESTAMP),
+        Val::RowCount => {
+            out.push(blr::INTERNAL_INFO);
+            emit_val(out, &Val::Int(5));
+        }
         Val::GenId(name, inc) => {
             out.push(blr::GEN_ID);
             out.push(name.len() as u8);
@@ -2745,9 +2765,22 @@ enum TrigStmt {
     Exit,
     /// POST_EVENT <value>; - blr_post
     PostEvent(Val),
+    /// BEGIN ... WHEN <code> DO <stmt> END - blr_block with an
+    /// error handler (probed); ONE handler with ONE code
+    HandledBlock(Vec<TrigStmt>, HandlerCode, Box<TrigStmt>),
     /// (FOR) SELECT - the whole probed select machinery as ONE
     /// statement inside a body
     ForSel(Box<ForSel>),
+}
+
+/// What a WHEN clause catches.
+enum HandlerCode {
+    /// WHEN ANY - blr_default_code
+    Any,
+    /// WHEN EXCEPTION <name> - 9, 0, counted name
+    Exception(String),
+    /// WHEN GDSCODE <name> - 0, counted name (uppercased)
+    Gds(String),
 }
 
 /// A FOR SELECT / SELECT INTO inside a body: `label` is Some for the
@@ -2881,6 +2914,32 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
         TrigStmt::PostEvent(v) => {
             out.push(blr::POST);
             emit_val(out, v);
+        }
+        TrigStmt::HandledBlock(stmts, code, handler) => {
+            out.push(blr::BLOCK);
+            out.push(blr::BEGIN);
+            for st in stmts {
+                emit_trig_stmt(out, st);
+            }
+            out.push(blr::END);
+            out.push(blr::ERROR_HANDLER);
+            out.extend_from_slice(&1u16.to_le_bytes());
+            match code {
+                HandlerCode::Any => out.push(blr::DEFAULT_CODE),
+                HandlerCode::Exception(name) => {
+                    out.push(blr::EXCEPTION_CODE);
+                    out.push(0);
+                    out.push(name.len() as u8);
+                    out.extend_from_slice(name.as_bytes());
+                }
+                HandlerCode::Gds(name) => {
+                    out.push(blr::GDS_CODE);
+                    out.push(name.len() as u8);
+                    out.extend_from_slice(name.as_bytes());
+                }
+            }
+            emit_trig_stmt(out, handler);
+            out.push(blr::END);
         }
         TrigStmt::ForSel(f) => {
             match f.label {
@@ -3313,14 +3372,60 @@ impl<'a> P<'a> {
     fn trig_stmt(&mut self) -> Option<TrigStmt> {
         if self.kw("BEGIN") {
             let mut stmts = Vec::new();
-            while !self.kw("END") {
+            loop {
+                if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "END" || w == "WHEN")
+                {
+                    break;
+                }
                 stmts.push(self.trig_stmt()?);
+            }
+            // WHEN <code> DO <stmt>: the block becomes blr_block with
+            // an error handler (ONE handler, ONE code - more are
+            // unprobed layouts)
+            let handled = if self.kw("WHEN") {
+                let code = if self.kw("ANY") {
+                    HandlerCode::Any
+                } else if self.kw("EXCEPTION") {
+                    let Some(Tok::Ident(n)) = self.t.get(self.i) else {
+                        return None;
+                    };
+                    let n = n.clone();
+                    self.i += 1;
+                    HandlerCode::Exception(n)
+                } else if self.kw("GDSCODE") {
+                    let Some(Tok::Ident(n)) = self.t.get(self.i) else {
+                        return None;
+                    };
+                    let n = n.clone();
+                    self.i += 1;
+                    HandlerCode::Gds(n)
+                } else {
+                    return None; // WHEN SQLCODE/SQLSTATE: unprobed
+                };
+                if !self.kw("DO") {
+                    return None;
+                }
+                let h = self.trig_stmt()?;
+                if matches!(h, TrigStmt::Block(_) | TrigStmt::HandledBlock(..)) {
+                    // a BLOCK as a handler body nests blr_block
+                    // differently: unprobed, refuse
+                    return None;
+                }
+                Some((code, Box::new(h)))
+            } else {
+                None
+            };
+            if !self.kw("END") {
+                return None;
             }
             // an optional ; after END
             if matches!(self.t.get(self.i), Some(Tok::Semi)) {
                 self.i += 1;
             }
-            return Some(TrigStmt::Block(stmts));
+            return Some(match handled {
+                Some((code, h)) => TrigStmt::HandledBlock(stmts, code, h),
+                None => TrigStmt::Block(stmts),
+            });
         }
         if self.kw("IF") {
             if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
@@ -5207,6 +5312,61 @@ mod tests {
             "CREATE TRIGGER QGT_C FOR T AFTER INSERT AS BEGIN POST_EVENT 'row_added'; END",
             "05021100020214150F00000900726F775F6164646564FFFFFF4C",
         );
+    }
+
+    #[test]
+    fn compiles_slice_nineteen_handlers_byte_for_byte() {
+        // a BEGIN..END with WHEN becomes blr_block: a begin with the
+        // guarded statements, blr_error_handler + u16 code count +
+        // the code, the handler STATEMENT, blr_end. WHEN ANY is
+        // blr_default_code
+        pin_proc(
+            "CREATE PROCEDURE QK1 RETURNS (R1 INTEGER) AS BEGIN BEGIN R1 = 1 / 0; WHEN ANY DO R1 = -1; END SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B110002028102012515080001000000150800000000001A0000FF8201000401150800FFFFFFFF1A0000FF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // WHEN EXCEPTION <name>: code 9, 0, counted name
+        pin_proc(
+            "CREATE PROCEDURE QK2 RETURNS (R1 INTEGER) AS BEGIN BEGIN R1 = 1; WHEN EXCEPTION QEX1 DO R1 = -2; END SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B11000202810201150800010000001A0000FF8201000900045145583101150800FEFFFFFF1A0000FF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // WHEN GDSCODE <name>: code 0, counted UPPERCASED name
+        pin_proc(
+            "CREATE PROCEDURE QL4 RETURNS (R1 INTEGER) AS BEGIN BEGIN R1 = 1; WHEN GDSCODE arith_except DO R1 = -3; END SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B11000202810201150800010000001A0000FF820100000C41524954485F45584345505401150800FDFFFFFF1A0000FF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // handlers work in triggers too - same blr_block shape
+        pin_trig(
+            "CREATE TRIGGER QM3 FOR T BEFORE INSERT AS BEGIN BEGIN NEW.A = 1; WHEN ANY DO NEW.A = -1; END END",
+            "0502110002028102011508000100000017010141FF8201000401150800FFFFFFFF17010141FFFFFFFF4C",
+        );
+        // ROW_COUNT is blr_internal_info(5) - beside trigger-action's
+        // 6, one family of context codes
+        pin_proc(
+            "CREATE PROCEDURE QK3 RETURNS (R1 INTEGER) AS BEGIN DELETE FROM U2 WHERE U2.UID = 0; R1 = ROW_COUNT; SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020207D9010443014A02553200472F17000355494415080000000000FF050001B1150800050000001A00000E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // and a PLAIN nested block in a procedure stays a DOUBLE
+        // begin - blr_block belongs to handler-carrying blocks only
+        pin_proc(
+            "CREATE PROCEDURE QM1 (I1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN IF (I1 > 0) THEN BEGIN R1 = 1; R1 = R1 + 1; END SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B11000202083129000000010015080000000000020201150800010000001A000001221A0000150800010000001A0000FFFFFF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+    }
+
+    #[test]
+    fn handler_refusals() {
+        for sql in [
+            // a BLOCK as a handler body nests blr_block differently:
+            // unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN BEGIN R1 = 1; WHEN ANY DO BEGIN R1 = 0; END END SUSPEND; END",
+            // WHEN SQLCODE / SQLSTATE: unprobed code layouts
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN BEGIN R1 = 1; WHEN SQLCODE 100 DO R1 = 0; END SUSPEND; END",
+            // UPDATE OR INSERT: a probed-but-unconverted composite
+            // (modify-loop + row_count-guarded store) - next slice
+            "CREATE PROCEDURE X (I1 INTEGER) AS BEGIN UPDATE OR INSERT INTO U2 (UID) VALUES (:I1) MATCHING (UID); END",
+        ] {
+            assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
+        }
     }
 
     #[test]

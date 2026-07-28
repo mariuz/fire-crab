@@ -13,6 +13,34 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 19: error handling
+
+### Converted
+- **WHEN handlers**: a BEGIN..END carrying WHEN becomes `blr_block`
+  — a begin with the guarded statements, `blr_error_handler` with a
+  u16 code count and the code, the handler STATEMENT, blr_end. Three
+  code kinds probed: WHEN ANY = blr_default_code (4); WHEN EXCEPTION
+  <name> = 9, 0, counted name; WHEN GDSCODE <name> = 0, counted
+  UPPERCASED name. Handlers work in procedures and triggers alike.
+- **The plain-block law confirmed**: a nested BEGIN..END WITHOUT
+  handlers stays a DOUBLE begin in both body kinds — blr_block
+  belongs to handler-carrying blocks only (a proc IF-block probe
+  settled it).
+- **ROW_COUNT**: blr_internal_info(5) — beside the trigger-action
+  code 6, one family of context codes. The battery feeds it from
+  UPDATE and DELETE and guards an EXCEPTION with it.
+- **UPDATE OR INSERT probed**, not yet converted: a modify-loop plus
+  a row_count-guarded store, with blr_equiv (0x2E — null-safe
+  equality) for MATCHING. It holds a named refusal until the next
+  slice.
+
+### Guarded
+- A BLOCK as a handler body (blr_block nests differently there),
+  WHEN SQLCODE/SQLSTATE, multiple handlers per block, UPDATE OR
+  INSERT. Gate: `qa/dsql-proc-blr.sh` grew to 73 checks (6 fresh:
+  WHEN ANY DO EXIT, division guarded by a parameter, ROW_COUNT into
+  IF/EXCEPTION); 220 unit byte-pins.
+
 ## 2026-07-28 — fire-crab-dsql slice 18: domain validation, sequences, events
 
 ### Converted

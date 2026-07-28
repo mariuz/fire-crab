@@ -307,6 +307,11 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # error handlers change the BLOCK's whole shape (a guarded block
+    # is a different verb than a plain one) - and the same brace pair
+    # compiles differently by POSITION (handler bodies nest the block
+    # verb again); when one probe raises a question about an OLD
+    # shape, spend the next probe settling it
     # the SAME source clause can compile to DIFFERENT shapes in
     # different stores (a domain CHECK is the raw boolean; a table
     # CHECK is a negated if-abort trigger) - and the SAME concept can
