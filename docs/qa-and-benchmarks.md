@@ -4195,6 +4195,31 @@ source's scale, num_cmp aligns whatever the literal wrote); and text
 MIN/MAX compare pad-trimmed. Temporal aggregates in HAVING stay
 refusals - no temporal literal reaches that tokenizer yet.
 
+### Temporal arithmetic (`qa/serve-real-datemath.sh`, 40 checks)
+
+DATEADD and DATEDIFF in both their syntaxes, and the native operators
+over temporal operands. The gate's content is the law set probed
+before implementation: MONTH/YEAR adds CLAMP to the target month's end
+(the teeth pin +1 MONTH on Jan 31 to the leap day); a TIME wraps
+around midnight while a DATE absorbs clock units by truncation (+2
+HOUR leaves the day, +25 HOUR moves one); DATEDIFF is b−a SIGNED, with
+YEAR/MONTH as calendar-COMPONENT differences (01-31 to 03-01 is 2
+months - not a duration), WEEK as the truncating day-diff over 7, and
+the clock units counting BOUNDARY CROSSINGS (SECOND across .1234 →
+.0000 is 1); MILLISECOND answers NUMERIC(18,1), keeping its 0.1-ms
+digit. The native differences carry fixed shapes: DATE−DATE integer
+days, TIME−TIME seconds at scale −4, and any TIMESTAMP pair as days
+at scale −9 - nanodays computed as unit_diff × 1e9 / units_per_day
+TRUNCATING, which the second teeth check pins to the engine's 9 exact
+digits. A numeric addend CVT-rounds half away first: D + 0.5 moves a
+day (probed - not floor, not an error).
+
+The WHERE admission is asymmetric by design: DATEDIFF cannot raise,
+so it passes the no-raise fence and filters rows; DATEADD can leave
+the valid date range at runtime, so it refuses in predicates - the
+refusal checks pin both choices, and TM + 1 (TIME plus a number)
+stays a refusal too, unprobed rather than guessed.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
@@ -4800,6 +4825,12 @@ FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
 # aggregates. Builds its own scratch database.
 FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     bash /path/to/fire-crab/qa/serve-real-groupexpr.sh 3050
+
+# temporal arithmetic: DATEADD/DATEDIFF both syntaxes, month clamping,
+# boundary-crossing diffs, native DATE/TIME/TIMESTAMP operators with
+# the engine's exact scales. Builds its own scratch database.
+FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    bash /path/to/fire-crab/qa/serve-real-datemath.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on

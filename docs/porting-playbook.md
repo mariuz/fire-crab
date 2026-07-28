@@ -147,6 +147,26 @@ them.
     EXTRACT(SECOND)      = units mod 600000 @ scale -4     # 12.3456
     EXTRACT(MILLISECOND) = units mod 10000  @ scale -1     # 345.6
 
+    # DATEADD: calendar units move the CIVIL date with month-end
+    # CLAMPING (Jan 31 +1 MONTH = Feb 29/28); clock units move the
+    # (days, units) total with euclidean carry; project back onto the
+    # operand's kind - a DATE drops the time (so +25 HOUR moves one
+    # day), a TIME drops the days (the midnight wrap)
+    dateadd(unit, n, d, u, kind):
+        YEAR|MONTH: idx = y*12 + (m-1) + months(n)
+                    y,m = idx divmod 12;  day = min(day, last_of(y,m))
+        WEEK|DAY:   d += n * (7|1)
+        clock:      total = d*UNITS_PER_DAY + u + n*per_unit
+                    d, u = total divmod UNITS_PER_DAY   # euclidean!
+    # DATEDIFF is b - a SIGNED: YEAR/MONTH diff calendar COMPONENTS
+    # (not durations); WEEK = day_diff / 7 truncating; clock units
+    # count BOUNDARY CROSSINGS: floor(total/per_unit) each side, then
+    # subtract; MILLISECOND keeps the sub-ms digit at scale -1
+    # native operators: DATE-DATE = days (int); TIME-TIME = unit diff
+    # @ -4 (seconds); TIMESTAMP diff = unit_diff * 1e9 / UNITS_PER_DAY
+    # truncating, @ -9 (nanodays); date ± number rounds the number
+    # half away from zero FIRST (CVT), then adds days
+
 ### Aggregates (one fold per function, NULL rules first)
 
     # every fold SKIPS NULLs; empty/all-NULL input -> NULL

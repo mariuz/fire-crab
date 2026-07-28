@@ -12040,6 +12040,21 @@ enum SysFn {
     Sign,
     Lpad,
     Rpad,
+    /// `DATEADD(<n> <unit> TO <t>)` / `DATEADD(<unit>, <n>, <t>)` -
+    /// args [amount, operand]. Months clamp to the target month's end
+    /// (probed: +1 MONTH on 2024-01-31 is 2024-02-29; +1 YEAR on a
+    /// leap day is 02-28); a TIME wraps around midnight; time units on
+    /// a DATE are legal (the fraction truncates away); a NUMERIC
+    /// amount rounds half away from zero first (probed: D + 0.5 moves
+    /// a day). An out-of-range result raises.
+    DateAdd(ExtractPart),
+    /// `DATEDIFF(<unit>, <a>, <b>)` / `DATEDIFF(<unit> FROM a TO b)` -
+    /// args [a, b], answering b - a SIGNED. YEAR/MONTH diff calendar
+    /// COMPONENTS (probed: MONTH from 01-31 to 03-01 is 2); WEEK is
+    /// the day diff over 7 truncating; the clock units count BOUNDARY
+    /// CROSSINGS (probed: SECOND across .1234 -> next .0000 is 1);
+    /// MILLISECOND answers NUMERIC(18,1) (probed: 567.8).
+    DateDiff(ExtractPart),
     /// `EXTRACT(<part> FROM <temporal>)` - one operand, the part in the
     /// variant. A part invalid for the operand's kind fails the TYPE
     /// CHECK, so the refusal lands at prepare exactly where the engine
@@ -12112,6 +12127,8 @@ impl SysFn {
             SysFn::Lpad => "LPAD",
             SysFn::Rpad => "RPAD",
             SysFn::Extract(_) => "EXTRACT",
+            SysFn::DateAdd(_) => "DATEADD",
+            SysFn::DateDiff(_) => "DATEDIFF",
         }
     }
 }
@@ -12633,7 +12650,7 @@ fn names_expr_call(s: &str) -> bool {
         "COALESCE(", "NULLIF(", "IIF(", "UPPER(", "LOWER(", "CHAR_LENGTH(",
         "CHARACTER_LENGTH(", "OCTET_LENGTH(", "SUBSTRING(", "TRIM(", "LEFT(",
         "RIGHT(", "REPLACE(", "POSITION(", "REVERSE(", "ABS(", "MOD(",
-        "SIGN(", "LPAD(", "RPAD(", "EXTRACT(",
+        "SIGN(", "LPAD(", "RPAD(", "EXTRACT(", "DATEADD(", "DATEDIFF(",
     ]
     .iter()
     .any(|f| up.contains(f))
@@ -12662,6 +12679,8 @@ fn sysfn_named(word: &str) -> Option<SysFn> {
         // the part in the variant is a placeholder for the NAME check;
         // parse_sysfn_call reads the real one
         "EXTRACT" => SysFn::Extract(ExtractPart::Year),
+        "DATEADD" => SysFn::DateAdd(ExtractPart::Year),
+        "DATEDIFF" => SysFn::DateDiff(ExtractPart::Year),
         _ => return None,
     })
 }
@@ -12672,8 +12691,90 @@ fn sysfn_named(word: &str) -> Option<SysFn> {
 /// comma-separated with a fixed arity - a wrong arity returns None, which
 /// the planner turns into a REFUSAL, never a fallback (the call text
 /// would otherwise be read as a column name).
+/// Read a DATEADD/DATEDIFF unit keyword at `pos` (whole word). The
+/// calendar-position parts (WEEKDAY/YEARDAY) are not units.
+fn take_dd_unit(b: &[char], pos: &mut usize) -> Option<ExtractPart> {
+    skip_ws(b, pos);
+    let start = *pos;
+    while *pos < b.len() && (b[*pos].is_alphanumeric() || b[*pos] == '_') {
+        *pos += 1;
+    }
+    let word: String = b[start..*pos].iter().collect();
+    let unit = match word.to_ascii_uppercase().as_str() {
+        "YEAR" => ExtractPart::Year,
+        "MONTH" => ExtractPart::Month,
+        "WEEK" => ExtractPart::Week,
+        "DAY" => ExtractPart::Day,
+        "HOUR" => ExtractPart::Hour,
+        "MINUTE" => ExtractPart::Minute,
+        "SECOND" => ExtractPart::Second,
+        "MILLISECOND" => ExtractPart::Millisecond,
+        _ => {
+            *pos = start;
+            return None;
+        }
+    };
+    Some(unit)
+}
+
 fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
     let f = sysfn_named(up)?;
+    // DATEADD(<unit>, <amount>, <t>) | DATEADD(<amount> <unit> TO <t>)
+    if matches!(f, SysFn::DateAdd(_)) {
+        // the comma form leads with the unit keyword; disambiguated by
+        // the comma that must follow it (a COLUMN named YEAR would sit
+        // in an amount expression instead)
+        {
+            let mut p2 = *pos;
+            if let Some(unit) = take_dd_unit(b, &mut p2) {
+                skip_ws(b, &mut p2);
+                if b.get(p2) == Some(&',') {
+                    p2 += 1;
+                    let amount = expr_add(b, &mut p2)?;
+                    skip_ws(b, &mut p2);
+                    if b.get(p2) != Some(&',') {
+                        return None;
+                    }
+                    p2 += 1;
+                    let operand = expr_add(b, &mut p2)?;
+                    *pos = p2;
+                    return Some(RawExpr::Func(SysFn::DateAdd(unit), vec![amount, operand]));
+                }
+            }
+        }
+        let amount = expr_add(b, pos)?;
+        let unit = take_dd_unit(b, pos)?;
+        if !take_keyword(b, pos, "TO") {
+            return None;
+        }
+        let operand = expr_add(b, pos)?;
+        return Some(RawExpr::Func(SysFn::DateAdd(unit), vec![amount, operand]));
+    }
+    // DATEDIFF(<unit>, <a>, <b>) | DATEDIFF(<unit> FROM <a> TO <b>)
+    if matches!(f, SysFn::DateDiff(_)) {
+        let unit = take_dd_unit(b, pos)?;
+        skip_ws(b, pos);
+        if b.get(*pos) == Some(&',') {
+            *pos += 1;
+            let a = expr_add(b, pos)?;
+            skip_ws(b, pos);
+            if b.get(*pos) != Some(&',') {
+                return None;
+            }
+            *pos += 1;
+            let bb = expr_add(b, pos)?;
+            return Some(RawExpr::Func(SysFn::DateDiff(unit), vec![a, bb]));
+        }
+        if !take_keyword(b, pos, "FROM") {
+            return None;
+        }
+        let a = expr_add(b, pos)?;
+        if !take_keyword(b, pos, "TO") {
+            return None;
+        }
+        let bb = expr_add(b, pos)?;
+        return Some(RawExpr::Func(SysFn::DateDiff(unit), vec![a, bb]));
+    }
     // EXTRACT(<part> FROM <temporal>)
     if matches!(f, SysFn::Extract(_)) {
         skip_ws(b, pos);
@@ -12785,9 +12886,12 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         SysFn::Left | SysFn::Right | SysFn::Mod => (2, 2),
         SysFn::Replace => (3, 3),
         SysFn::Lpad | SysFn::Rpad => (2, 3),
-        SysFn::Substring | SysFn::Trim(_) | SysFn::Position | SysFn::Extract(_) => {
-            unreachable!()
-        }
+        SysFn::Substring
+        | SysFn::Trim(_)
+        | SysFn::Position
+        | SysFn::Extract(_)
+        | SysFn::DateAdd(_)
+        | SysFn::DateDiff(_) => unreachable!(),
     };
     if args.len() < min || args.len() > max {
         return None;
@@ -13393,6 +13497,123 @@ fn iso_week_of(days: i32) -> i32 {
     (thursday - jan1) / 7 + 1
 }
 
+/// Days in a civil month, leap years included.
+fn last_day_of_month(y: i32, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+    }
+}
+
+/// 1/10000-second units per day.
+const UNITS_PER_DAY: i128 = 864_000_000;
+
+/// DATEADD's arithmetic over (days, units): calendar units move the
+/// civil date with MONTH-END CLAMPING (probed: 2024-01-31 +1 MONTH is
+/// 2024-02-29); clock units carry across days. The result projects
+/// back onto the operand's kind - a DATE drops the time (so +2 HOUR
+/// leaves the day, probed), a TIME drops the days (the midnight wrap,
+/// probed). Out of the engine's date range (0001..9999) raises.
+fn dateadd_impl(
+    unit: ExtractPart,
+    amount: i64,
+    days: i32,
+    units: u32,
+    kind: TKind,
+) -> Result<Value, EvalErr> {
+    use ExtractPart::*;
+    let (mut d, mut u) = (days as i64, units as i64);
+    match unit {
+        Year | Month => {
+            let (y, m, dom) = civil_of(days);
+            let months = amount * if matches!(unit, Year) { 12 } else { 1 };
+            let idx = y as i64 * 12 + (m as i64 - 1) + months;
+            let (ny, nm) = (idx.div_euclid(12) as i32, (idx.rem_euclid(12) + 1) as u32);
+            let nd = dom.min(last_day_of_month(ny, nm));
+            d = days_of_civil(ny, nm, nd) as i64;
+        }
+        Week | Day => {
+            d += amount * if matches!(unit, Week) { 7 } else { 1 };
+        }
+        Hour | Minute | Second | Millisecond => {
+            let per: i128 = match unit {
+                Hour => 36_000_000,
+                Minute => 600_000,
+                Second => 10_000,
+                _ => 10,
+            };
+            let total = d as i128 * UNITS_PER_DAY + u as i128 + amount as i128 * per;
+            d = total.div_euclid(UNITS_PER_DAY) as i64;
+            u = total.rem_euclid(UNITS_PER_DAY) as i64;
+        }
+        Weekday | Yearday => return Err(EvalErr::ConversionError), // parse refuses
+    }
+    // the engine's valid date range
+    if !matches!(kind, TKind::Time) {
+        let (y, _, _) = civil_of(d as i32);
+        if !(1..=9999).contains(&y) || i32::try_from(d).is_err() {
+            return Err(EvalErr::ConversionError);
+        }
+    }
+    Ok(match kind {
+        TKind::Date => Value::Date(d as i32),
+        TKind::Time => Value::Time(u as u32),
+        TKind::Timestamp => Value::Timestamp(d as i32, u as u32),
+    })
+}
+
+/// DATEDIFF's arithmetic: b - a, SIGNED. YEAR and MONTH difference
+/// calendar COMPONENTS; WEEK is the day difference over 7 truncating
+/// toward zero; DAY differences the civil days; the clock units count
+/// BOUNDARY CROSSINGS (both operands truncate to the unit, then
+/// subtract - probed: SECOND across .1234 -> .0000 is 1, MINUTE across
+/// :59:59 -> :00:01 is 1); MILLISECOND keeps the 0.1-ms fraction as a
+/// scale -1 value (probed: 567.8).
+fn datediff_impl(
+    unit: ExtractPart,
+    a: (i64, i64),
+    b: (i64, i64),
+) -> Option<Value> {
+    use ExtractPart::*;
+    let total = |(d, u): (i64, i64)| d as i128 * UNITS_PER_DAY + u as i128;
+    Some(match unit {
+        Year => {
+            let (y1, ..) = civil_of(a.0 as i32);
+            let (y2, ..) = civil_of(b.0 as i32);
+            Value::Int((y2 - y1) as i64)
+        }
+        Month => {
+            let (y1, m1, _) = civil_of(a.0 as i32);
+            let (y2, m2, _) = civil_of(b.0 as i32);
+            Value::Int((y2 as i64 - y1 as i64) * 12 + (m2 as i64 - m1 as i64))
+        }
+        Week => Value::Int((b.0 - a.0) / 7),
+        Day => Value::Int(b.0 - a.0),
+        Hour | Minute | Second => {
+            let per: i128 = match unit {
+                Hour => 36_000_000,
+                Minute => 600_000,
+                _ => 10_000,
+            };
+            let idx = |t: i128| t.div_euclid(per);
+            Value::Int((idx(total(b)) - idx(total(a))) as i64)
+        }
+        Millisecond => {
+            // raw unit diff at scale -1 IS the millisecond value with
+            // its 0.1-ms digit (10 units per ms)
+            Value::Scaled((total(b) - total(a)) as i64, -1)
+        }
+        Weekday | Yearday => return None,
+    })
+}
+
 /// Parse `yyyy-mm-dd` into an MJD day number. ISO form only - the
 /// engine accepts more spellings; anything else refuses at parse.
 fn parse_date_lit(s: &str) -> Option<i32> {
@@ -13600,13 +13821,40 @@ impl Expr {
                 ExprType::Numeric => Some(ExprType::Numeric),
                 ExprType::Text | ExprType::Temporal(_) => None,
             },
-            Expr::Bin(a, _, b) => match (a.type_of(descs)?, b.type_of(descs)?) {
+            Expr::Bin(a, op, b) => match (a.type_of(descs)?, b.type_of(descs)?) {
                 // pure integer arithmetic stays integer
                 (ExprType::Int, ExprType::Int) => Some(ExprType::Int),
                 // any numeric operand (with an integer or another numeric)
                 // makes the result numeric - the engine's scale rules apply
                 (ExprType::Int | ExprType::Numeric, ExprType::Int | ExprType::Numeric) => {
                     Some(ExprType::Numeric)
+                }
+                // DATE/TIMESTAMP plus-or-minus a number of days (the
+                // amount rounds half away, probed: D + 0.5 moves a
+                // day); a number + temporal commutes for Add
+                (ExprType::Temporal(k), ExprType::Int | ExprType::Numeric)
+                    if !matches!(k, TKind::Time)
+                        && matches!(op, ArithOp::Add | ArithOp::Sub) =>
+                {
+                    Some(ExprType::Temporal(k))
+                }
+                (ExprType::Int | ExprType::Numeric, ExprType::Temporal(k))
+                    if !matches!(k, TKind::Time) && matches!(op, ArithOp::Add) =>
+                {
+                    Some(ExprType::Temporal(k))
+                }
+                // temporal difference: DATE - DATE is integer days;
+                // TIME - TIME is seconds at scale -4; any pair with a
+                // TIMESTAMP is days at scale -9 (all probed)
+                (ExprType::Temporal(x), ExprType::Temporal(y))
+                    if matches!(op, ArithOp::Sub) =>
+                {
+                    match (x, y) {
+                        (TKind::Date, TKind::Date) => Some(ExprType::Int),
+                        (TKind::Time, TKind::Time) => Some(ExprType::Numeric),
+                        (TKind::Time, _) | (_, TKind::Time) => None,
+                        _ => Some(ExprType::Numeric),
+                    }
                 }
                 _ => None, // a text operand is not arithmetic
             },
@@ -13636,6 +13884,49 @@ impl Expr {
                     .map(|a| a.type_of(descs))
                     .collect::<Option<Vec<_>>>()?;
                 match f {
+                    // amount (Int/Numeric) + temporal operand -> the
+                    // operand's kind; a TIME takes only clock units
+                    SysFn::DateAdd(unit) => match (ts[0], ts[1]) {
+                        (
+                            ExprType::Int | ExprType::Numeric,
+                            ExprType::Temporal(k),
+                        ) => {
+                            use ExtractPart::*;
+                            let ok = match k {
+                                TKind::Time => {
+                                    matches!(unit, Hour | Minute | Second | Millisecond)
+                                }
+                                _ => !matches!(unit, Weekday | Yearday),
+                            };
+                            if ok { Some(ExprType::Temporal(k)) } else { None }
+                        }
+                        _ => None,
+                    },
+                    // two temporals -> BIGINT (MILLISECOND: a scale -1
+                    // numeric, probed); a TIME pairs only with a TIME
+                    SysFn::DateDiff(unit) => match (ts[0], ts[1]) {
+                        (ExprType::Temporal(a), ExprType::Temporal(b)) => {
+                            use ExtractPart::*;
+                            let time_pair =
+                                matches!(a, TKind::Time) && matches!(b, TKind::Time);
+                            let datey = |k| !matches!(k, TKind::Time);
+                            let valid = if time_pair {
+                                matches!(unit, Hour | Minute | Second | Millisecond)
+                            } else if datey(a) && datey(b) {
+                                !matches!(unit, Weekday | Yearday)
+                            } else {
+                                false
+                            };
+                            if !valid {
+                                None
+                            } else if matches!(unit, Millisecond) {
+                                Some(ExprType::Numeric)
+                            } else {
+                                Some(ExprType::Int)
+                            }
+                        }
+                        _ => None,
+                    },
                     // the part must exist in the operand's kind - this
                     // is where the engine's prepare-time -105 lands
                     SysFn::Extract(part) => match ts[0] {
@@ -13727,6 +14018,20 @@ impl Expr {
                 .min(),
             Expr::Neg(e) => e.result_scale(descs),
             Expr::Bin(a, op, b) => {
+                // temporal differences carry fixed scales (probed):
+                // TIME - TIME is seconds at -4, a TIMESTAMP difference
+                // is days at -9
+                if matches!(op, ArithOp::Sub) {
+                    if let (Some(ExprType::Temporal(x)), Some(ExprType::Temporal(y))) =
+                        (a.type_of(descs), b.type_of(descs))
+                    {
+                        return match (x, y) {
+                            (TKind::Time, TKind::Time) => Some(-4),
+                            (TKind::Date, TKind::Date) => Some(0),
+                            _ => Some(-9),
+                        };
+                    }
+                }
                 // a NULL literal operand mirrors its sibling - the engine's
                 // getDesc copies the non-null side's desc, scale included
                 let (s1, s2) = match (a.result_scale(descs), b.result_scale(descs)) {
@@ -13747,6 +14052,7 @@ impl Expr {
             // MILLISECOND NUMERIC(9,1) - both probed
             Expr::Func(SysFn::Extract(ExtractPart::Second), _) => Some(-4),
             Expr::Func(SysFn::Extract(ExtractPart::Millisecond), _) => Some(-1),
+            Expr::Func(SysFn::DateDiff(ExtractPart::Millisecond), _) => Some(-1),
             _ => None,
         }
     }
@@ -13964,7 +14270,61 @@ impl Expr {
                     let (raw, sr) = numeric_bin(r1, s1, *op, r2, s2)?;
                     scaled_value(raw, sr)
                 } else {
-                    Value::Null
+                    // temporal arithmetic (all probed): date/timestamp
+                    // plus-or-minus days (numbers round half away),
+                    // and the temporal differences
+                    let dt = |v: &Value| match v {
+                        Value::Date(d) => Some((*d as i64, 0i64, TKind::Date)),
+                        Value::Time(t) => Some((0, *t as i64, TKind::Time)),
+                        Value::Timestamp(d, t) => {
+                            Some((*d as i64, *t as i64, TKind::Timestamp))
+                        }
+                        _ => None,
+                    };
+                    match (dt(&va), dt(&vb), *op) {
+                        // temporal - temporal
+                        (Some((d1, u1, k1)), Some((d2, u2, k2)), ArithOp::Sub) => {
+                            match (k1, k2) {
+                                (TKind::Date, TKind::Date) => Value::Int(d1 - d2),
+                                (TKind::Time, TKind::Time) => {
+                                    Value::Scaled(u1 - u2, -4)
+                                }
+                                (TKind::Time, _) | (_, TKind::Time) => Value::Null,
+                                _ => {
+                                    let total = |d: i64, u: i64| {
+                                        d as i128 * UNITS_PER_DAY + u as i128
+                                    };
+                                    let diff = total(d1, u1) - total(d2, u2);
+                                    // nanodays, truncating exactly as the
+                                    // engine renders (probed to 9 digits)
+                                    let raw = diff * 1_000_000_000 / UNITS_PER_DAY;
+                                    Value::Scaled(raw as i64, -9)
+                                }
+                            }
+                        }
+                        // temporal ± number of days / number + temporal
+                        (Some((d, u, k)), None, ArithOp::Add | ArithOp::Sub)
+                            if !matches!(k, TKind::Time) =>
+                        {
+                            let mut n = fn_int(&vb)?;
+                            if matches!(op, ArithOp::Sub) {
+                                n = -n;
+                            }
+                            dateadd_impl(ExtractPart::Day, n, d as i32, u as u32, k)?
+                        }
+                        (None, Some((d, u, k)), ArithOp::Add)
+                            if !matches!(k, TKind::Time) =>
+                        {
+                            dateadd_impl(
+                                ExtractPart::Day,
+                                fn_int(&va)?,
+                                d as i32,
+                                u as u32,
+                                k,
+                            )?
+                        }
+                        _ => Value::Null,
+                    }
                 }
             }
             Expr::Concat(a, b) => match (a.eval(values)?, b.eval(values)?) {
@@ -14033,6 +14393,30 @@ impl Expr {
                     vs.push(v);
                 }
                 match f {
+                    SysFn::DateAdd(unit) => {
+                        let amount = fn_int(&vs[0])?;
+                        let (d, u, kind) = match vs[1] {
+                            Value::Date(d) => (d, 0, TKind::Date),
+                            Value::Time(t) => (0, t, TKind::Time),
+                            Value::Timestamp(d, t) => (d, t, TKind::Timestamp),
+                            _ => return Ok(Value::Null), // type-checked away
+                        };
+                        dateadd_impl(*unit, amount, d, u, kind)?
+                    }
+                    SysFn::DateDiff(unit) => {
+                        let dt = |v: &Value| match v {
+                            Value::Date(d) => Some((*d as i64, 0i64)),
+                            Value::Time(t) => Some((0, *t as i64)),
+                            Value::Timestamp(d, t) => Some((*d as i64, *t as i64)),
+                            _ => None,
+                        };
+                        match (dt(&vs[0]), dt(&vs[1])) {
+                            (Some(a), Some(b)) => {
+                                datediff_impl(*unit, a, b).unwrap_or(Value::Null)
+                            }
+                            _ => Value::Null, // type-checked away
+                        }
+                    }
                     // EXTRACT: pull the part from the decoded temporal
                     // value; the conventions are the probed ones on the
                     // helpers (WEEKDAY 0=Sunday, YEARDAY 0-based, ISO
@@ -16799,7 +17183,10 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
                 | SysFn::Trim(_)
                 | SysFn::Replace
                 | SysFn::Reverse
-                | SysFn::Extract(_) => true,
+                | SysFn::Extract(_)
+                | SysFn::DateDiff(_) => true,
+                // DATEADD can leave the valid date range at runtime
+                SysFn::DateAdd(_) => false,
                 // a negative length raises - admit only a literal that
                 // is visibly non-negative; the start may be any
                 // non-text value (clipping handles every magnitude)
@@ -21489,6 +21876,150 @@ mod tests {
         let m1 = normalize_raw(&parse_raw_expr_any("MOD(A, 2)").unwrap());
         let m2 = normalize_raw(&parse_raw_expr_any("MOD(a,2)").unwrap());
         assert!(m1 == m2);
+    }
+
+    #[test]
+    fn temporal_arithmetic_dateadd_datediff() {
+        let day = |y, m, d| days_of_civil(y, m, d);
+        // month-end clamping (probed): +1 MONTH on Jan 31 lands on the
+        // leap day; +1 YEAR on the leap day clamps to Feb 28
+        assert!(matches!(
+            dateadd_impl(ExtractPart::Month, 1, day(2024, 1, 31), 0, TKind::Date),
+            Ok(Value::Date(d)) if d == day(2024, 2, 29)
+        ));
+        assert!(matches!(
+            dateadd_impl(ExtractPart::Year, 1, day(2024, 2, 29), 0, TKind::Date),
+            Ok(Value::Date(d)) if d == day(2025, 2, 28)
+        ));
+        assert!(matches!(
+            dateadd_impl(ExtractPart::Day, -1, day(2024, 3, 1), 0, TKind::Date),
+            Ok(Value::Date(d)) if d == day(2024, 2, 29)
+        ));
+        // a TIME wraps around midnight; a DATE absorbs clock units by
+        // truncation (25 hours moves one day)
+        assert!(matches!(
+            dateadd_impl(ExtractPart::Hour, 2, 0, 23 * 3_600 * 10_000 + 30 * 60 * 10_000, TKind::Time),
+            Ok(Value::Time(t)) if t == 3_600 * 10_000 + 30 * 60 * 10_000
+        ));
+        assert!(matches!(
+            dateadd_impl(ExtractPart::Hour, 25, day(2024, 1, 1), 0, TKind::Date),
+            Ok(Value::Date(d)) if d == day(2024, 1, 2)
+        ));
+        // out of the engine's date range raises
+        assert!(dateadd_impl(ExtractPart::Year, 9000, day(2024, 1, 1), 0, TKind::Date).is_err());
+
+        // DATEDIFF: calendar components for YEAR/MONTH, truncating
+        // day-diff/7 for WEEK, boundary crossings for the clock units,
+        // all SIGNED (probed values)
+        let dd = |u, a: (i64, i64), b: (i64, i64)| datediff_impl(u, a, b).unwrap();
+        let d99 = day(1999, 1, 1) as i64;
+        let d24 = day(2024, 2, 29) as i64;
+        assert!(matches!(dd(ExtractPart::Day, (d99, 0), (d24, 0)), Value::Int(9190)));
+        assert!(matches!(dd(ExtractPart::Day, (d24, 0), (d99, 0)), Value::Int(-9190)));
+        assert!(matches!(
+            dd(ExtractPart::Year, (day(1999, 6, 1) as i64, 0), (day(2024, 1, 15) as i64, 0)),
+            Value::Int(25) // component diff: the months do not matter
+        ));
+        assert!(matches!(
+            dd(ExtractPart::Month, (day(2024, 1, 31) as i64, 0), (day(2024, 3, 1) as i64, 0)),
+            Value::Int(2)
+        ));
+        assert!(matches!(
+            dd(ExtractPart::Week, (day(2024, 1, 1) as i64, 0), (d24, 0)),
+            Value::Int(8) // 59 days / 7 truncating
+        ));
+        // SECOND counts boundary crossings: .1234 -> next .0000 is 1
+        let t1 = (1 * 3600 + 46 * 60 + 40) * 10_000 + 1_234;
+        let t2 = (1 * 3600 + 46 * 60 + 41) * 10_000;
+        assert!(matches!(dd(ExtractPart::Second, (0, t1), (0, t2)), Value::Int(1)));
+        // MINUTE across :59:59 -> :00:01
+        let m1 = (10 * 3600 + 59 * 60 + 59) * 10_000;
+        let m2 = (11 * 3600 + 1) * 10_000;
+        assert!(matches!(dd(ExtractPart::Minute, (0, m1), (0, m2)), Value::Int(1)));
+        // MILLISECOND keeps the 0.1-ms digit at scale -1 (probed 567.8)
+        assert!(matches!(
+            dd(ExtractPart::Millisecond, (0, 0), (0, 5_678)),
+            Value::Scaled(5678, -1)
+        ));
+
+        // the native operators, end to end through resolve/eval
+        let columns = vec![
+            RelationColumn { name: "D".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "TM".into(), field_id: 1, position: 1 },
+            RelationColumn { name: "TS".into(), field_id: 2, position: 2 },
+        ];
+        let dsc = |dt, len| Descriptor {
+            dtype: dt, scale: 0, length: len, sub_type: 0, flags: 0, offset: 4,
+        };
+        let descs = vec![
+            dsc(dtype::SQL_DATE, 4),
+            dsc(dtype::SQL_TIME, 4),
+            dsc(dtype::TIMESTAMP, 8),
+        ];
+        let row = vec![
+            Value::Date(day(2024, 2, 29)),
+            Value::Time((14 * 3600 + 35 * 60 + 12) * 10_000 + 3_456),
+            Value::Timestamp(day(2001, 9, 9), (3600 + 46 * 60 + 40) * 10_000 + 1_234),
+        ];
+        let ev = |s: &str| -> Value {
+            let raw = parse_raw_expr(s).unwrap_or_else(|| panic!("{s} did not parse"));
+            resolve_expr(&raw, &columns, &descs).unwrap().eval(&row).unwrap()
+        };
+        assert!(matches!(ev("D + 7"), Value::Date(d) if d == day(2024, 3, 7)));
+        assert!(matches!(ev("D - 7"), Value::Date(d) if d == day(2024, 2, 22)));
+        assert!(matches!(ev("7 + D"), Value::Date(d) if d == day(2024, 3, 7)));
+        // a numeric addend rounds half away (probed: D + 0.5 moves a day)
+        assert!(matches!(ev("D + 0.5"), Value::Date(d) if d == day(2024, 3, 1)));
+        assert!(matches!(
+            ev("D - DATE '1999-01-01'"),
+            Value::Int(9190)
+        ));
+        // TS - TS: nanodays, truncating to 9 digits (probed 0.074075502)
+        assert!(matches!(
+            ev("TS - TIMESTAMP '2001-09-09 00:00:00'"),
+            Value::Scaled(74_075_502, -9)
+        ));
+        // TM - TM: seconds at scale -4 (probed 16512.3456)
+        assert!(matches!(
+            ev("TM - TIME '10:00:00'"),
+            Value::Scaled(165_123_456, -4)
+        ));
+        // both DATEADD syntaxes parse to the same tree
+        let a = parse_raw_expr("DATEADD(1 MONTH TO D)").unwrap();
+        let b = parse_raw_expr("DATEADD(MONTH, 1, D)").unwrap();
+        assert!(normalize_raw(&a) == normalize_raw(&b));
+        let a = parse_raw_expr("DATEDIFF(DAY, D, TS)").unwrap();
+        let b = parse_raw_expr("DATEDIFF(DAY FROM D TO TS)").unwrap();
+        assert!(normalize_raw(&a) == normalize_raw(&b));
+        // typing refusals: TIME takes only clock units; TIME cannot
+        // pair with a date in DATEDIFF; WEEKDAY is not a unit
+        let ty = |s: &str| {
+            let raw = parse_raw_expr(s).unwrap();
+            resolve_expr(&raw, &columns, &descs).unwrap().type_of(&descs)
+        };
+        assert_eq!(ty("DATEADD(1 MONTH TO TM)"), None);
+        assert_eq!(ty("DATEDIFF(DAY, TM, D)"), None);
+        assert!(parse_raw_expr("DATEADD(1 WEEKDAY TO D)").is_none());
+        // the announces: DATEADD keeps the operand's kind, DATEDIFF is
+        // BIGINT (MILLISECOND: scale -1)
+        let pc = |s: &str| {
+            build_expr_col(&parse_raw_expr(s).unwrap(), "X", &columns, &descs).unwrap()
+        };
+        assert_eq!(pc("DATEADD(1 DAY TO D)").sql_type, 571);
+        assert_eq!(pc("DATEDIFF(DAY, D, D)").sql_type, 581);
+        assert_eq!(pc("DATEDIFF(MILLISECOND, TM, TM)").scale, -1);
+        assert_eq!(pc("TS - TS").scale, -9);
+        assert_eq!(pc("TM - TM").scale, -4);
+        // NULL propagates
+        let null_row = vec![Value::Null; 3];
+        let raw = parse_raw_expr("DATEADD(1 DAY TO D)").unwrap();
+        assert!(matches!(
+            resolve_expr(&raw, &columns, &descs).unwrap().eval(&null_row),
+            Ok(Value::Null)
+        ));
+        // headers
+        assert_eq!(default_expr_name(&parse_raw_expr("DATEADD(1 DAY TO D)").unwrap()), "DATEADD");
+        assert_eq!(default_expr_name(&parse_raw_expr("DATEDIFF(DAY, D, D)").unwrap()), "DATEDIFF");
     }
 
     #[test]

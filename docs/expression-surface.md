@@ -16,7 +16,8 @@ IIF), `qa/serve-real-functions.sh` (the built-in scalar functions),
 `qa/serve-real-extract.sh` (the temporal surface),
 `qa/serve-real-aggfn.sh` (the aggregate surface),
 `qa/serve-real-aggexpr.sh` (aggregates over expressions),
-`qa/serve-real-groupexpr.sh` (GROUP BY expressions, HAVING breadth). Each check in
+`qa/serve-real-groupexpr.sh` (GROUP BY expressions, HAVING breadth),
+`qa/serve-real-datemath.sh` (temporal arithmetic). Each check in
 those gates runs identical SQL through fire-crab and `isql` against the
 same database file.
 
@@ -45,6 +46,8 @@ same database file.
 | AVG = SUM/COUNT with TRUNCATING division toward zero; folds skip NULLs; empty/all-NULL input is NULL; COUNT(DISTINCT) counts distinct non-NULLs | `src/jrd/AggNodes.cpp` (`AvgAggNode::execute` et al.), probed | `compute_group`, `aggregate` |
 | aggregates take EXPRESSION arguments, evaluated per row before the fold; an eval error in the argument raises mid-fetch; SUM widens ONE step (LONG source → BIGINT, INT64-ranked → INT128), AVG keeps its width unless the source is INT128 | `AggNodes.cpp` + the expression nodes, probed | `AggTarget::Expr`, `AggSrc::Expr`, the fallible `compute_group` |
 | a lone aggregate's output column is NAMED by its function (COUNT/MIN/MAX/SUM/AVG); a bare literal is CONSTANT, a generator read GEN_ID | probed via isql headers | `Plan::Scalar(value, name)`, `output_cols_of` |
+| DATEADD/DATEDIFF (both syntaxes each); month-end clamping; TIME wraps midnight; DATEDIFF components vs boundary crossings; MILLISECOND at NUMERIC(18,1) | `src/jrd/SysFunction.cpp` (`makeDateAdd`/`makeDateDiff`), probed | `SysFn::DateAdd`/`DateDiff`, `dateadd_impl`, `datediff_impl` |
+| native temporal operators: DATE ± n (numeric addend CVT-rounds), DATE−DATE = days, TIME−TIME = seconds @ −4, TIMESTAMP diff = days @ −9 truncating | `ExprNodes.cpp` arithmetic over temporal descs, probed | the temporal arms of `Expr::Bin` typing/scale/eval |
 | GROUP BY takes expression keys, computed per row; a select-list expression must BE one of them (else the engine's -104 "not contained..."); NULL keys share a bucket; `GROUP BY <ordinal>` may name an expression item | `src/jrd/AggNodes.cpp` / DSQL grouping validation, probed | `parse_group_by` (synthetic key slots), `normalize_raw` structural matching |
 | HAVING compares numeric aggregates through exact scale alignment, text MIN/MAX through the pad-trimming compare, and takes expression aggregates as hidden folds | `AggNodes.cpp`, probed (AVG(N) > 0 works; MIN(D) has no literal to meet here) | `resolve_having` (`HKind`), `Term::NumCmp` |
 
@@ -144,6 +147,18 @@ usually a unit test too:
   case-insensitively, string literals exactly - so `GROUP BY
   upper( s )` matches `SELECT UPPER(S)` while `SELECT LOWER(S)` is
   the engine's -104. `GROUP BY 1` may name an expression select item.
+- **Temporal arithmetic laws.** MONTH/YEAR adds CLAMP to the target
+  month's end (2024-01-31 +1 MONTH → 2024-02-29; the leap day +1 YEAR
+  → 02-28). A TIME wraps around midnight; a DATE absorbs clock units
+  by truncation (+25 HOUR moves one day). DATEDIFF is b−a signed:
+  YEAR/MONTH difference calendar COMPONENTS, WEEK truncates the day
+  difference over 7, the clock units count BOUNDARY CROSSINGS, and
+  MILLISECOND keeps its 0.1-ms digit (NUMERIC(18,1)). The native
+  differences: DATE−DATE integer days, TIME−TIME seconds at −4, any
+  TIMESTAMP pair days at −9 (truncating to 9 exact digits). A numeric
+  addend on a date CVT-rounds half away first (D + 0.5 moves a day).
+  DATEDIFF is admitted to WHERE (it cannot raise); DATEADD is not (an
+  out-of-range result raises).
 - **Text comparisons ignore trailing blanks; LIKE does not.** A
   comparison pad-trims both sides (CHAR vs VARCHAR equality); LIKE
   matches the STORED value, padding included — `CHAR(5) 'abc'` matches

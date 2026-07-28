@@ -13,6 +13,21 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — temporal arithmetic
+
+### Converted
+- **`DATEADD` / `DATEDIFF`** (both syntaxes each) and the **native
+  temporal operators** (`D + 7`, `7 + D`, `TS + 1`, `DATE − DATE`,
+  `TS − TS`, `TIME − TIME`). Probed laws: month-end clamping, TIME
+  wrapping midnight, DATE absorbing clock units by truncation,
+  DATEDIFF's calendar-component YEAR/MONTH vs boundary-crossing clock
+  units (signed), MILLISECOND at NUMERIC(18,1), TIME−TIME seconds at
+  −4, TIMESTAMP differences as nanodays truncating to 9 exact digits,
+  and numeric addends CVT-rounding (D + 0.5 moves a day). DATEDIFF is
+  admitted to WHERE (it cannot raise); DATEADD refuses there (range
+  errors are mid-cursor). Composes with EXTRACT, CASE, aggregates and
+  GROUP BY expressions. Gate: `qa/serve-real-datemath.sh`, 40 checks.
+
 ## 2026-07-28 — GROUP BY expressions
 
 ### Converted
