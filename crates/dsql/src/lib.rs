@@ -250,6 +250,18 @@ mod blr {
     /// blr_if: condition, then-statement, else-statement - a MISSING
     /// else is a bare blr_end byte in the else slot (probed)
     pub const IF: u8 = 0x08;
+    /// INSERT: blr_store(relation, statement) - the assignments in
+    /// column-list order, no FOR wrapper (probed)
+    pub const STORE: u8 = 0x0F;
+    /// UPDATE: blr_modify(org context, new context, statement) -
+    /// inside a blr_for; the NEW context is allocated BEFORE the
+    /// rse's stream context (probed: modify 3,2 with the rse at 3)
+    pub const MODIFY: u8 = 0x0A;
+    /// DELETE: blr_erase(context), inside a blr_for (probed)
+    pub const ERASE: u8 = 0x05;
+    /// blr_marks: count byte, mark byte - the DSQL stamps its
+    /// UPDATE/DELETE loops with marks(1, 4) (probed)
+    pub const MARKS: u8 = 0xD9;
     pub const EQL: u8 = 0x2F;
     pub const NEQ: u8 = 0x30;
     pub const GTR: u8 = 0x31;
@@ -1665,6 +1677,11 @@ fn is_keyword(w: &str) -> bool {
             | "AFTER"
             | "POSITION"
             | "IF"
+            | "INSERT"
+            | "DELETE"
+            | "UPDATE"
+            | "VALUES"
+            | "SET"
     )
 }
 
@@ -2870,6 +2887,13 @@ enum TrigStmt {
     If(Bool, Box<TrigStmt>, Option<Box<TrigStmt>>),
     /// BEGIN ... END - compiles as a DOUBLE blr_begin (probed)
     Block(Vec<TrigStmt>),
+    /// INSERT INTO rel (cols) VALUES (vals) - blr_store
+    Insert(Stream, u8, Vec<(String, Val)>),
+    /// DELETE FROM rel [WHERE ...] - for(marks(1,4), rse), erase
+    Delete(Stream, u8, Option<Bool>),
+    /// UPDATE rel SET ... [WHERE ...] - for(marks(1,4), rse),
+    /// modify(org, new, assignments)
+    Update(Stream, u8, u8, Vec<(Val, Val)>, Option<Bool>),
 }
 
 fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
@@ -2896,6 +2920,60 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 emit_trig_stmt(out, st);
             }
             out.push(blr::END);
+            out.push(blr::END);
+        }
+        TrigStmt::Insert(rel, ctx, sets) => {
+            out.push(blr::STORE);
+            emit_stream(out, rel, *ctx);
+            out.push(blr::BEGIN);
+            for (col, v) in sets {
+                out.push(blr::ASSIGNMENT);
+                emit_val(out, v);
+                out.push(blr::FIELD);
+                out.push(*ctx);
+                out.push(col.len() as u8);
+                out.extend_from_slice(col.as_bytes());
+            }
+            out.push(blr::END);
+        }
+        TrigStmt::Delete(rel, ctx, wher) => {
+            out.push(blr::FOR);
+            out.push(blr::MARKS);
+            out.push(1);
+            out.push(4);
+            out.push(blr::RSE);
+            out.push(1);
+            emit_stream(out, rel, *ctx);
+            if let Some(b) = wher {
+                out.push(blr::BOOLEAN);
+                emit_bool(out, b);
+            }
+            out.push(blr::END);
+            out.push(blr::ERASE);
+            out.push(*ctx);
+        }
+        TrigStmt::Update(rel, org, new, sets, wher) => {
+            out.push(blr::FOR);
+            out.push(blr::MARKS);
+            out.push(1);
+            out.push(4);
+            out.push(blr::RSE);
+            out.push(1);
+            emit_stream(out, rel, *org);
+            if let Some(b) = wher {
+                out.push(blr::BOOLEAN);
+                emit_bool(out, b);
+            }
+            out.push(blr::END);
+            out.push(blr::MODIFY);
+            out.push(*org);
+            out.push(*new);
+            out.push(blr::BEGIN);
+            for (target, v) in sets {
+                out.push(blr::ASSIGNMENT);
+                emit_val(out, v);
+                emit_val(out, target);
+            }
             out.push(blr::END);
         }
     }
@@ -2935,6 +3013,172 @@ impl<'a> P<'a> {
                 None
             };
             return Some(TrigStmt::If(cond, then, els));
+        }
+        if self.kw("INSERT") {
+            // INSERT INTO rel (cols) VALUES (vals); - the column
+            // list is REQUIRED (without it the mapping needs the
+            // catalog); values may read OLD/NEW but not the target
+            if !self.kw("INTO") {
+                return None;
+            }
+            let Some(Tok::Ident(rel)) = self.t.get(self.i) else {
+                return None;
+            };
+            if is_keyword(rel) {
+                return None;
+            }
+            let rel = rel.clone();
+            self.i += 1;
+            if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                return None;
+            }
+            self.i += 1;
+            let mut cols = Vec::new();
+            loop {
+                let Some(Tok::Ident(c)) = self.t.get(self.i) else {
+                    return None;
+                };
+                if is_keyword(c) {
+                    return None;
+                }
+                cols.push(c.clone());
+                self.i += 1;
+                match self.t.get(self.i)? {
+                    Tok::Comma => self.i += 1,
+                    Tok::RParen => {
+                        self.i += 1;
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+            if !self.kw("VALUES") || !matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                return None;
+            }
+            self.i += 1;
+            let mut vals = Vec::new();
+            loop {
+                vals.push(self.val()?);
+                match self.t.get(self.i)? {
+                    Tok::Comma => self.i += 1,
+                    Tok::RParen => {
+                        self.i += 1;
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+            if vals.len() != cols.len() {
+                return None;
+            }
+            if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                return None;
+            }
+            self.i += 1;
+            let st = Stream {
+                name: rel,
+                alias: None,
+                derived: None,
+            };
+            self.streams.push(st.clone());
+            let ctx = (self.streams.len() - 1) as u8 + self.base;
+            return Some(TrigStmt::Insert(
+                st,
+                ctx,
+                cols.into_iter().zip(vals).collect(),
+            ));
+        }
+        if self.kw("DELETE") {
+            // DELETE FROM rel [WHERE ...]; - inside the WHERE a bare
+            // name binds to the DML's own stream (innermost scope)
+            if !self.kw("FROM") {
+                return None;
+            }
+            let st = self.stream_item()?;
+            if st.alias.is_some() || st.derived.is_some() {
+                return None;
+            }
+            self.streams.push(st.clone());
+            let idx = self.streams.len() - 1;
+            let ctx = idx as u8 + self.base;
+            let saved = self.sub.replace(idx);
+            let wher = if self.kw("WHERE") {
+                Some(self.bool_or()?)
+            } else {
+                None
+            };
+            self.sub = saved;
+            if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                return None;
+            }
+            self.i += 1;
+            return Some(TrigStmt::Delete(st, ctx, wher));
+        }
+        if self.kw("UPDATE") {
+            // UPDATE rel SET col = v [, ...] [WHERE ...]; - the NEW
+            // record's context is allocated BEFORE the rse stream's
+            // (probed: modify 3,2 with the rse at 3); SET sources and
+            // the WHERE read the ORG stream
+            let Some(Tok::Ident(rel)) = self.t.get(self.i) else {
+                return None;
+            };
+            if is_keyword(rel) {
+                return None;
+            }
+            let rel = rel.clone();
+            self.i += 1;
+            // the new-record placeholder is unnameable: SET targets
+            // are built directly against its context
+            self.streams.push(Stream {
+                name: String::new(),
+                alias: None,
+                derived: None,
+            });
+            let new_ctx = (self.streams.len() - 1) as u8 + self.base;
+            let st = Stream {
+                name: rel,
+                alias: None,
+                derived: None,
+            };
+            self.streams.push(st.clone());
+            let org_idx = self.streams.len() - 1;
+            let org_ctx = org_idx as u8 + self.base;
+            if !self.kw("SET") {
+                return None;
+            }
+            let saved = self.sub.replace(org_idx);
+            let mut sets = Vec::new();
+            loop {
+                let Some(Tok::Ident(col)) = self.t.get(self.i) else {
+                    return None;
+                };
+                if is_keyword(col) {
+                    return None;
+                }
+                let target = Val::Field(new_ctx, col.clone());
+                self.i += 1;
+                if !matches!(self.t.get(self.i), Some(Tok::Cmp(CmpOp::Eql))) {
+                    return None;
+                }
+                self.i += 1;
+                sets.push((target, self.val()?));
+                if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                    self.i += 1;
+                } else {
+                    break;
+                }
+            }
+            let wher = if self.kw("WHERE") {
+                Some(self.bool_or()?)
+            } else {
+                None
+            };
+            self.sub = saved;
+            if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                return None;
+            }
+            self.i += 1;
+            return Some(TrigStmt::Update(st, org_ctx, new_ctx, sets, wher));
         }
         // NEW.col = <value>;
         let Some(Tok::Ident(q)) = self.t.get(self.i) else {
@@ -3926,6 +4170,67 @@ mod tests {
             "CREATE TRIGGER QT_I FOR T BEFORE INSERT AS BEGIN IF (NEW.A > 0 AND NEW.S IS NOT NULL) THEN NEW.A = NEW.A * 2; ELSE NEW.A = 0; END",
             "050211000202083A3117010141150800000000003B3D170101530124170101411508000200000017010141011508000000000017010141FFFFFF4C",
         );
+    }
+
+    #[test]
+    fn compiles_slice_twelve_dml_byte_for_byte() {
+        // INSERT is blr_store(relation, assignments) - no FOR
+        // wrapper; the target claims the next context (2 after
+        // OLD/NEW) and assignments follow the column list's order
+        pin_trig(
+            "CREATE TRIGGER QU_A FOR T BEFORE INSERT AS BEGIN INSERT INTO U2 (UID, UA) VALUES (1, 2); END",
+            "0502110002020F4A0255320202011508000100000017020355494401150800020000001702025541FFFFFFFF4C",
+        );
+        // VALUES read OLD/NEW freely
+        pin_trig(
+            "CREATE TRIGGER QU_B FOR T BEFORE INSERT AS BEGIN INSERT INTO U2 (UID) VALUES (NEW.A); END",
+            "0502110002020F4A02553202020117010141170203554944FFFFFFFF4C",
+        );
+        // DELETE is blr_for over a marks(1,4)-stamped rse, then
+        // blr_erase(ctx)
+        pin_trig(
+            "CREATE TRIGGER QU_C FOR T BEFORE INSERT AS BEGIN DELETE FROM U2 WHERE U2.UID = NEW.A; END",
+            "05021100020207D9010443014A02553202472F17020355494417010141FF0502FFFFFF4C",
+        );
+        pin_trig(
+            "CREATE TRIGGER QV_C FOR T BEFORE INSERT AS BEGIN DELETE FROM U2; END",
+            "05021100020207D9010443014A02553202FF0502FFFFFF4C",
+        );
+        // UPDATE: the NEW-record context is allocated BEFORE the rse
+        // stream's (modify 3,2 with the rse at 3); SET targets write
+        // the new context...
+        pin_trig(
+            "CREATE TRIGGER QU_D FOR T BEFORE INSERT AS BEGIN UPDATE U2 SET UA = 5 WHERE U2.UID = NEW.A; END",
+            "05021100020207D9010443014A02553203472F17030355494417010141FF0A03020201150800050000001702025541FFFFFFFF4C",
+        );
+        // ...while SET sources and the WHERE read the ORG stream
+        // (probed: SET UA = UA + 1 reads ctx 3, writes ctx 2)
+        pin_trig(
+            "CREATE TRIGGER QV_A FOR T BEFORE INSERT AS BEGIN UPDATE U2 SET UA = UA + 1 WHERE U2.UID = NEW.A; END",
+            "05021100020207D9010443014A02553203472F17030355494417010141FF0A03020201221703025541150800010000001702025541FFFFFFFF4C",
+        );
+        pin_trig(
+            "CREATE TRIGGER QV_B FOR T BEFORE INSERT AS BEGIN UPDATE U2 SET UA = 0; END",
+            "05021100020207D9010443014A02553203FF0A03020201150800000000001702025541FFFFFFFF4C",
+        );
+        pin_trig(
+            "CREATE TRIGGER QV_D FOR T BEFORE INSERT AS BEGIN UPDATE U2 SET UA = 1, UID = 2 WHERE U2.ID = 3; END",
+            "05021100020207D9010443014A02553203472F170302494415080003000000FF0A030202011508000100000017020255410115080002000000170203554944FFFFFFFF4C",
+        );
+    }
+
+    #[test]
+    fn dml_refusals() {
+        for sql in [
+            // INSERT without a column list needs the catalog
+            "CREATE TRIGGER X FOR T BEFORE INSERT AS BEGIN INSERT INTO U2 VALUES (1); END",
+            // column/value count mismatch is an engine error
+            "CREATE TRIGGER X FOR T BEFORE INSERT AS BEGIN INSERT INTO U2 (UID) VALUES (1, 2); END",
+            // INSERT ... SELECT: unprobed
+            "CREATE TRIGGER X FOR T BEFORE INSERT AS BEGIN INSERT INTO U2 (UID) SELECT ID FROM T; END",
+        ] {
+            assert!(compile_trigger(sql).is_none(), "{sql} was compiled");
+        }
     }
 
     #[test]

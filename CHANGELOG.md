@@ -13,6 +13,33 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 12: the DML verbs
+
+### Converted
+- **INSERT is `blr_store`(relation, assignments)** — no for-wrapper;
+  the target claims the next context and assignments follow the
+  column list's order. The list is REQUIRED (without it the mapping
+  needs the catalog). VALUES read OLD/NEW freely.
+- **DELETE is `blr_for` over a `blr_marks(1, 4)`-stamped rse, then
+  `blr_erase(ctx)`** — blr_marks is the DSQL's loop stamp, probed on
+  every UPDATE/DELETE and absent on store.
+- **UPDATE is the same loop with `blr_modify(org, new,
+  assignments)`** — and the NEW-record context is allocated BEFORE
+  the rse stream's (probed: modify 3,2 with the rse at 3). SET
+  targets write the new context; SET sources and the WHERE read the
+  ORG stream (`SET UA = UA + 1` reads ctx 3, writes ctx 2 — pinned).
+- Inside a DML's WHERE a bare name binds to the DML's own stream —
+  the innermost-scope rule again (battery: `WHERE DEPT_ID =
+  OLD.DEPT_ID AND SALARY = 0`, engine-agreed). Contexts keep
+  counting across multiple DML statements (a two-DML trigger is in
+  the battery); DML composes under IF.
+
+### Guarded
+- INSERT without a column list, column/value miscounts (an engine
+  error), INSERT ... SELECT (unprobed). Gate: `qa/dsql-trig-blr.sh`
+  grew to 24 checks (8 fresh DML battery statements); 166 unit
+  byte-pins.
+
 ## 2026-07-28 — fire-crab-dsql slice 11: the third oracle — triggers
 
 ### Converted

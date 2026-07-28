@@ -307,6 +307,12 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # the DML verbs split one statement across TWO contexts: UPDATE
+    # reads the org stream and writes a new-record context that was
+    # allocated FIRST - probe the allocation order, not just the
+    # verbs; the reference compiler STAMPS its own DML loops (marks)
+    # - emit the stamp, don't reason about it; an INSERT without a
+    # column list is a catalog lookup in disguise: refuse it
     # the THIRD oracle (triggers) is the leanest: record contexts
     # (OLD/NEW) are just STREAMS by another name - model them as
     # pseudo-streams and the whole field machinery carries over; the

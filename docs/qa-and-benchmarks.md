@@ -4508,7 +4508,7 @@ distinctness cannot change a minimum. Two prior refusals became
 features (COUNT(DISTINCT ...) and the bare SELECT INTO body): flips
 seven and eight.
 
-### SQL → BLR, oracle number three (`qa/dsql-trig-blr.sh`, 14 checks)
+### SQL → BLR, oracle number three (`qa/dsql-trig-blr.sh`, 24 checks)
 
 Slice 11 opened the trigger oracle: RDB$TRIGGER_BLR stores a compiled
 trigger body verbatim, and its wrapper is the leanest of the three -
@@ -4531,6 +4531,25 @@ All 14 checks were byte-identical on the gate's first run. Refusals:
 OLD targets (the engine holds them read-only), bare column names,
 empty bodies, database-level triggers (ON CONNECT - a different
 wrapper).
+
+Slice 12 brought THE DML VERBS through this oracle - the first
+statements that WRITE. INSERT compiles to blr_store(relation,
+assignments): no for-wrapper, the target claiming the next context,
+assignments in column-list order - and the column list is REQUIRED,
+because without it the column mapping lives in the catalog. DELETE
+and UPDATE are both blr_for loops over an rse stamped with
+blr_marks(1, 4) - the DSQL marks its own DML loops - ending in
+blr_erase(ctx) and blr_modify(org, new, assignments) respectively.
+The UPDATE shape hides two laws: the NEW-record context is allocated
+BEFORE the rse stream's (modify 3,2 with the rse at 3 - the reserved
+slot predates the stream), and the two contexts split the statement
+down the middle - SET targets write the new context while SET
+sources and the WHERE read the org stream, so SET UA = UA + 1 reads
+ctx 3 and writes ctx 2, byte-pinned. Inside a DML's WHERE a bare
+name binds to the DML's own stream (innermost scope, engine-agreed
+in the battery), contexts keep counting across multiple DML
+statements, and DML composes under IF. Refused: list-less INSERTs,
+column/value miscounts, INSERT ... SELECT.
 
 ## Benchmarks
 
