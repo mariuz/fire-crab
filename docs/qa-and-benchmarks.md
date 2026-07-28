@@ -4423,7 +4423,7 @@ expressions, and alias-less derived tables refuse. The slice-5
 refusal of scalar subselects became a feature; its gate slot flipped
 to a positive check, the fifth such flip in the project.
 
-### SQL → BLR, oracle number two (`qa/dsql-proc-blr.sh`, 29 checks)
+### SQL → BLR, oracle number two (`qa/dsql-proc-blr.sh`, 37 checks)
 
 Views cannot hold ORDER BY - but a procedure's `FOR SELECT ... DO
 SUSPEND` body can, and `RDB$PROCEDURE_BLR` stores ITS compiled BLR
@@ -4474,6 +4474,22 @@ both pinned. Aggregate arguments take full value expressions
 COUNT(DISTINCT ...) (the distinct verbs are unprobed), plain columns
 beside aggregates without GROUP BY, GROUP BY without aggregates,
 non-grouped columns in HAVING.
+
+Slice 9 added INPUT PARAMETERS - the shape every parameterized query
+rests on. Inputs are MESSAGE 0: one dsc + null-flag short per
+parameter and NO EOF slot (the outputs' message 1 carries one); the
+whole loop block sits under blr_receive 0, whose single-statement
+operand needs no end of its own - the begin's blr_end doubles as it -
+and the final EOF send stays OUTSIDE the receive. `:name` compiles to
+blr_parameter2(0, 2i, 2i+1) used STRAIGHT as a value: no variable is
+ever declared for an input, unlike outputs. The battery rides inputs
+through comparisons, arithmetic, IN lists, and BETWEEN two inputs
+inside an aggregate's source WHERE - beside ORDER BY and GROUP BY -
+and checks that an UNUSED input still shapes message 0 and the
+receive wrapper. The slice-7 refusal of input parameters became this
+feature (the sixth refusal-to-feature flip); what still refuses:
+`:name` missing from the input list, inputs inside HAVING (crossing
+the aggregate boundary is unprobed), `:name` outside a procedure.
 
 ## Benchmarks
 

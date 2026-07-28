@@ -13,6 +13,32 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 9: input parameters
+
+### Converted
+- **Input parameters are MESSAGE 0**: one dsc + null-flag blr_short
+  per parameter and NO EOF slot (outputs' message 1 has one); the
+  whole loop block sits under `blr_receive 0` — its begin's own
+  blr_end doubles as the receive's end, and the final EOF send stays
+  outside it (probed).
+- **`:name` is a direct message reference**: blr_parameter2(0, 2i,
+  2i+1) used STRAIGHT as a value — no variable is declared for
+  inputs, unlike outputs. Inputs ride anywhere a value does in the
+  FOR select: comparisons, arithmetic (`A + :I1`), IN lists,
+  BETWEEN two inputs inside an aggregate's source WHERE — all in
+  the battery, beside ORDER BY and GROUP BY.
+- The slice-7 refusal of input parameters became this feature; its
+  gate slot flipped to a positive check (an UNUSED input still
+  shapes message 0 and the receive wrapper — checked
+  differentially). The sixth refusal-to-feature flip.
+
+### Guarded
+- `:name` that misses the input list, inputs inside HAVING (they
+  would cross the aggregate boundary — unprobed), and `:name`
+  outside a procedure body refuse. Gate: `qa/dsql-proc-blr.sh` grew
+  to 37 checks (7 fresh input battery statements); 138 unit
+  byte-pins.
+
 ## 2026-07-28 — fire-crab-dsql slice 8: aggregates and GROUP BY
 
 ### Converted

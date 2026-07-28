@@ -235,6 +235,9 @@ mod blr {
     pub const AGG_AVERAGE: u8 = 0x57;
     /// COUNT(<value>) - counts non-null values
     pub const AGG_COUNT2: u8 = 0x5D;
+    /// blr_receive: message number byte, one statement - wraps the
+    /// whole loop when the procedure has INPUT parameters (probed)
+    pub const RECEIVE: u8 = 0x0C;
     pub const EQL: u8 = 0x2F;
     pub const NEQ: u8 = 0x30;
     pub const GTR: u8 = 0x31;
@@ -288,6 +291,10 @@ enum Val {
     /// blr_fid - a stream's own column by number; how HAVING, ORDER
     /// BY and the DO body address an aggregate's output
     Fid(u8, u16),
+    /// `:name` - an INPUT parameter, referenced straight out of
+    /// message 0 as blr_parameter2 (value slot 2i, null slot 2i+1);
+    /// no variable is declared for inputs (probed)
+    InParam(u16),
     /// blr_coalesce
     Coalesce(Vec<Val>),
 }
@@ -720,6 +727,9 @@ struct P<'a> {
     /// set while parsing HAVING: aggregate calls in func() resolve
     /// to blr_fid slots against agg_map
     agg_mode: bool,
+    /// the procedure's INPUT parameter names, in message-0 order;
+    /// `:name` in an expression resolves against this
+    in_params: Vec<String>,
     /// context of stream index 0: 1 in view BLR, 0 in procedure
     /// bodies (probed - the FOR SELECT stream is context 0)
     base: u8,
@@ -1091,6 +1101,15 @@ impl<'a> P<'a> {
                 return self.case_tail();
             }
             Tok::Ident(x) if x == "NULL" => Val::Null,
+            Tok::Colon => {
+                self.i += 1;
+                let Some(Tok::Ident(name)) = self.t.get(self.i) else {
+                    return None;
+                };
+                let idx = self.in_params.iter().position(|n| n == name)?;
+                self.i += 1;
+                return Some(Val::InParam(idx as u16));
+            }
             Tok::Ident(x) if !is_keyword(x) => {
                 let first = x.clone();
                 self.i += 1;
@@ -1738,6 +1757,12 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
             out.push(*ctx);
             out.extend_from_slice(&id.to_le_bytes());
         }
+        Val::InParam(i) => {
+            out.push(blr::PARAMETER2);
+            out.push(0);
+            out.extend_from_slice(&(2 * i).to_le_bytes());
+            out.extend_from_slice(&(2 * i + 1).to_le_bytes());
+        }
         Val::ScalarSub(sub) => {
             out.push(blr::VIA);
             out.push(blr::SINGULAR);
@@ -1922,6 +1947,7 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
         sub: None,
         agg_map: Vec::new(),
         agg_mode: false,
+        in_params: Vec::new(),
     };
     // a top-level UNION restructures the whole statement: the union
     // node takes context 1 BEFORE any branch stream, so it must be
@@ -2273,6 +2299,7 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         sub: None,
         agg_map: Vec::new(),
         agg_mode: false,
+        in_params: Vec::new(),
     };
     if !(p.kw("CREATE") && p.kw("PROCEDURE")) {
         return None;
@@ -2282,6 +2309,33 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         Tok::Ident(w) if !is_keyword(w) => p.i += 1,
         _ => return None,
     }
+    // optional INPUT parameters: message 0, one dsc + null-flag short
+    // per parameter, NO EOF slot
+    let mut inputs: Vec<(String, Dsc)> = Vec::new();
+    if matches!(p.t.get(p.i), Some(Tok::LParen)) {
+        p.i += 1;
+        loop {
+            let Some(Tok::Ident(name)) = p.t.get(p.i) else {
+                return None;
+            };
+            if is_keyword(name) {
+                return None;
+            }
+            let name = name.clone();
+            p.i += 1;
+            let dsc = p.cast_target()?;
+            inputs.push((name, dsc));
+            match p.t.get(p.i)? {
+                Tok::Comma => p.i += 1,
+                Tok::RParen => {
+                    p.i += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+    }
+    p.in_params = inputs.iter().map(|(n, _)| n.clone()).collect();
     if !p.kw("RETURNS") || !matches!(p.t.get(p.i), Some(Tok::LParen)) {
         return None;
     }
@@ -2561,6 +2615,17 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
 
     let n = params.len();
     let mut out = vec![blr::VERSION5, blr::BEGIN];
+    if !inputs.is_empty() {
+        // message 0: the inputs - dsc + null-flag short each, no EOF
+        out.push(blr::MESSAGE);
+        out.push(0);
+        out.extend_from_slice(&((2 * inputs.len()) as u16).to_le_bytes());
+        for (_, d) in &inputs {
+            emit_dsc(&mut out, *d);
+            out.push(blr::SHORT);
+            out.push(0);
+        }
+    }
     // message 1: per parameter dsc + null-flag short, then EOF short
     out.push(blr::MESSAGE);
     out.push(1);
@@ -2572,6 +2637,13 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
     }
     out.push(blr::SHORT);
     out.push(0);
+    if !inputs.is_empty() {
+        // with inputs, the WHOLE loop block sits under blr_receive 0;
+        // the begin's own blr_end doubles as the receive's end and
+        // the final EOF send stays outside it (probed)
+        out.push(blr::RECEIVE);
+        out.push(0);
+    }
     out.push(blr::BEGIN);
     // one variable per parameter, initialised to NULL
     for (vi, (_, d)) in params.iter().enumerate() {
@@ -3417,6 +3489,52 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_nine_input_params_byte_for_byte() {
+        // inputs are MESSAGE 0: dsc + null-flag short per parameter,
+        // NO EOF slot; the whole loop block sits under blr_receive 0
+        // and `:name` compiles to blr_parameter2(0, 2i, 2i+1) used
+        // straight as a value - no variable is declared for inputs
+        pin_proc(
+            "CREATE PROCEDURE QC1 (I1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE A > :I1 INTO :R1 DO SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B1100020211010743014A015400473117000141290000000100FF020117000249441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // two inputs: slots 0/1 and 2/3
+        pin_proc(
+            "CREATE PROCEDURE QC2 (I1 INTEGER, I2 VARCHAR(10)) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE A > :I1 AND S = :I2 INTO :R1 DO SUSPEND; END",
+            "050204000400080007002600000A000700040103000800070007000C00020300000800012D1A00009B1100020211010743014A015400473A31170001412900000001002F17000153290002000300FF020117000249441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // inputs ride inside expressions, beside ORDER BY
+        pin_proc(
+            "CREATE PROCEDURE QD1 (I1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE A + :I1 > 0 ORDER BY ID INTO :R1 DO SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B1100020211010743014A01540047312217000141290000000100150800000000004601481700024944FF020117000249441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // and inside an aggregate's source rse (BETWEEN two inputs)
+        pin_proc(
+            "CREATE PROCEDURE QD2 (LO INTEGER, HI INTEGER) RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT A, SUM(ID) FROM T WHERE ID BETWEEN :LO AND :HI GROUP BY A INTO :R1, :R2 DO SUSPEND; END",
+            "050204000400080007000800070004010500080007000800070007000C00020300000800012D1A00000301000800012D1A01009B1100020211010743014F0143014A01540047381700024944290000000100290002000300FF4E01170001414D02000000170001410100561700024944FF0201180100001A000001180101001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+    }
+
+    #[test]
+    fn input_param_refusals() {
+        for sql in [
+            // `:name` must name an input parameter
+            "CREATE PROCEDURE X (I1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE A > :MISSING INTO :R1 DO SUSPEND; END",
+            // an input inside HAVING crosses the aggregate boundary:
+            // unprobed
+            "CREATE PROCEDURE X (I1 INTEGER) RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT A, COUNT(*) FROM T GROUP BY A HAVING COUNT(*) > :I1 INTO :R1, :R2 DO SUSPEND; END",
+            // `:name` outside a procedure body means nothing
+            "SELECT ID FROM T WHERE A > :I1",
+        ] {
+            assert!(
+                compile_procedure(sql).is_none()
+                    && compile_view_select(sql).is_none(),
+                "{sql} was compiled"
+            );
+        }
+    }
+
+    #[test]
     fn aggregate_refusals() {
         for sql in [
             // a plain column beside an aggregate NEEDS a GROUP BY
@@ -3444,8 +3562,6 @@ mod tests {
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID, A FROM T INTO :R1 DO SUSPEND; END",
             // subqueries inside procedure bodies: contexts unprobed
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM U2 WHERE U2.UID = T.ID) INTO :R1 DO SUSPEND; END",
-            // input parameters add a second message: unprobed
-            "CREATE PROCEDURE X (I1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T INTO :R1 DO SUSPEND; END",
             // aliased FOR streams: unprobed
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T E INTO :R1 DO SUSPEND; END",
         ] {

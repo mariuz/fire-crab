@@ -307,6 +307,11 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # input parameters are a MESSAGE, not variables: references
+    # compile straight to message slots (value slot, null slot), the
+    # loop waits under a RECEIVE, and the messages differ - inputs
+    # have no EOF slot, outputs do; probe which sends sit inside vs
+    # outside the receive
     # aggregation RECASTS the query: the aggregate is a STREAM with
     # its own context; the WHERE belongs to the SOURCE rse inside it,
     # and everything after the aggregation (loop body, HAVING, ORDER
