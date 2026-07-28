@@ -238,6 +238,27 @@ them.
     # comparisons pad-trim; LIKE matches the STORED value, padding
     # included (a CHAR(5) 'abc' matches 'abc  ' and 'abc%', NOT 'abc')
 
+### SQL -> BLR (the compiler itself, when you get there)
+
+    # THE ORACLE IS FREE: CREATE VIEW makes the original compiler run
+    # on your exact input and store its output in the catalog
+    # (RDB$VIEW_BLR) - compare BYTES, never structure descriptions
+    compile(select):
+        emit version, rse, stream-count
+        emit relation(counted-name, context-id)   # names UPPERCASED
+        if where: emit boolean-clause, tree
+        emit end, eoc
+    # the select list compiles to NOTHING in a view - resist emitting
+    # a projection; the mapping is positional catalog data
+    negate(tree):          # the compiler folds NOT at compile time
+        cmp     -> inverse verb          # NOT (a > b)  =>  a <= b
+        and/or  -> De Morgan on negated children
+        between -> or(lss(lo), gtr(hi))
+        not     -> cancel
+        like, missing -> keep a real NOT node
+    # literals: integers little-endian at their storage width; decimals
+    # keep the WRITTEN scale; strings carry charset + length words
+
 ## Traps that cost real time (all found the hard way)
 
 - **FIELD_ID is not FIELD_POSITION.** Catalog rows order columns by

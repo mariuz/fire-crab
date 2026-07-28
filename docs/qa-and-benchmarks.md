@@ -4278,6 +4278,37 @@ dropped from the view so an expression naming one refuses rather than
 guessing a side (qualified names in join expressions are the named
 remainder).
 
+### SQL → BLR against the engine's own compiler (`qa/dsql-view-blr.sh`, 26 checks)
+
+The `fire-crab-dsql` crate opens Phase 4 with the purest differential
+in the project: the oracle is the exact artifact under conversion,
+produced by the original compiler on demand. `CREATE VIEW v AS
+<select>` makes the engine's DSQL compile the SELECT and store the
+resulting BLR verbatim in `RDB$VIEW_BLR`; the gate creates a view per
+battery statement, reads the bytes back through isql's OCTETS
+rendering, and compares them against `fcdsql`'s output for the
+identical statement. Byte for byte, no normalisation.
+
+The compilation laws the probes established (each a unit-test pin AND
+a battery check): the select list leaves NO trace in the view BLR -
+`SELECT ID` and `SELECT ID, A` compile identically, because the
+column mapping lives positionally in RDB$RELATION_FIELDS; NOT is
+compiled AWAY where an inverse exists - `NOT (A > 5)` stores blr_leq,
+and De Morgan pushes through AND/OR (`NOT (x OR y)` stores blr_and of
+the negations) - with blr_not surviving only over LIKE and MISSING;
+`NOT BETWEEN` expands to `blr_or(blr_lss, blr_gtr)` while plain
+BETWEEN keeps blr_between; IS NULL is blr_missing; integer literals
+are little-endian blr_long, decimals keep their written scale
+(12.50 -> raw 1250 at -2), strings are blr_text2 with charset and
+length words; AND/OR chains nest left-associatively.
+
+The battery deliberately goes BEYOND the probe pins - fresh field
+names, fresh combinations, double negation, NOT over mixed OR - so
+the gate exercises the COMPILER, not the probe notebook. Refusals
+(ORDER BY, arithmetic in values, IN lists, aggregates, joins) must
+answer REFUSED: outside the converted surface this crate never
+guesses a byte.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
@@ -4902,6 +4933,12 @@ FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
 NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     bash /path/to/fire-crab/qa/serve-real-predfull.sh 3050
+
+# SQL -> BLR against the engine's own compiler: fcdsql's bytes vs the
+# RDB$VIEW_BLR the engine stores for the identical SELECT.
+# Builds its own scratch database.
+FCDSQL=/path/to/fire-crab/target/release/fcdsql ISQL=/opt/firebird/bin/isql \
+    bash /path/to/fire-crab/qa/dsql-view-blr.sh
 ```
 
 The scratch databases are produced by running the companion paper's hands-on

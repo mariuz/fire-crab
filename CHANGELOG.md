@@ -13,6 +13,27 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql: SQL → BLR, first slice
+
+### Converted
+- **The `fire-crab-dsql` crate** — the beginning of `src/dsql/`'s
+  conversion, with the purest oracle in the project: `CREATE VIEW`
+  makes the ENGINE's DSQL compile the SELECT and store the BLR
+  verbatim in `RDB$VIEW_BLR`, so fire-crab-dsql's output is compared
+  BYTE FOR BYTE against the original compiler's for the identical
+  statement. First slice: the view-shaped single-relation SELECT with
+  WHERE booleans. Probed compilation laws, each pinned: the select
+  list leaves NO trace (mapping is positional catalog data); NOT
+  compiles away — inverse verbs for comparisons, De Morgan through
+  AND/OR — surviving only over LIKE and MISSING; `NOT BETWEEN`
+  expands to `lss OR gtr` while BETWEEN stays `blr_between`; IS NULL
+  is `blr_missing`; decimal literals keep their written scale; text
+  literals are `blr_text2` with charset and length words; AND/OR
+  chains nest left. Gate: `qa/dsql-view-blr.sh`, 26 checks — a
+  battery deliberately beyond the unit-test pins, plus refusals
+  (ORDER BY, arithmetic values, IN, aggregates, joins) that must
+  refuse rather than guess.
+
 ## 2026-07-28 — predicate-surface completion
 
 ### Converted
