@@ -13,6 +13,38 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 25: MERGE branch chains, parameterized EXECUTE STATEMENT, WITH LOCK
+
+### Converted
+- **Multi-branch MERGE** (flip twenty-three): branches of one kind
+  form an if-else CHAIN in SQL order — each conditional branch
+  `if(cond, action, <next>)` where the next if fills the else slot
+  BY POSITION, the last conditional getting a bare end, an
+  unconditional LAST branch filling the else directly. The rse
+  boolean ORs kind-terms built from left-nested or-chains:
+  `and(not(missing), or(c1, c2, ...))` matched /
+  `and(missing, or-chain)` not-matched, each simplified to its bare
+  missing-test when the kind has an unconditional branch. Contexts
+  allocate BY KIND in branch order — every matched UPDATE claims a
+  new-record slot, then every INSERT its store slot. A branch after
+  its kind's unconditional one refuses (unreachable — one else slot).
+- **Parameterized EXECUTE STATEMENT** (flip twenty-four):
+  `('<sql>') (vals)` compiles the FULL `blr_exec_stmt` — tag-prefixed
+  clauses in fixed order: 1 in-count, 2 out-count, 3 sql, 4 the FOR
+  form's DO statement, 11 input values, 13 output variables,
+  blr_end. The literal no-param forms keep their compact verbs
+  (exec_sql / exec_into).
+- **WITH LOCK** (flip twenty-five): `blr_writelock` between the
+  stream and the boolean — in FOR SELECT, DECLAREd cursors and AS
+  CURSOR loops alike; the battery drives locked cursors through
+  positioned UPDATEs in both cursor forms.
+
+### Guarded
+- WITH LOCK over aggregates or beside ORDER BY (unprobed emission
+  order), named EXECUTE STATEMENT parameters (`a := :v`), branches
+  after an unconditional one. Gate: `qa/dsql-proc-blr.sh` grew to
+  135 checks (12 fresh); 279 unit byte-pins.
+
 ## 2026-07-28 — fire-crab-dsql slice 24: conditional MERGE, scroll fetch, RETURNING, EXECUTE STATEMENT
 
 ### Converted

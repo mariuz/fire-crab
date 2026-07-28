@@ -332,6 +332,14 @@ mod blr {
     /// sql, flag (1 = singleton; 0 = loop + the DO statement),
     /// then the variables (probed both flags)
     pub const EXEC_INTO: u8 = 0xA4;
+    /// the PARAMETERIZED forms: blr_exec_stmt + tag-prefixed
+    /// clauses - 1 in-count, 2 out-count, 3 sql, 4 the loop's DO
+    /// statement, 11 input values, 13 output variables, blr_end
+    /// (probed; tag order fixed)
+    pub const EXEC_STMT: u8 = 0xBD;
+    /// WITH LOCK: blr_writelock, an rse sub-clause between the
+    /// stream and the boolean (probed)
+    pub const WRITELOCK: u8 = 0xB3;
     pub const EQL: u8 = 0x2F;
     pub const NEQ: u8 = 0x30;
     pub const GTR: u8 = 0x31;
@@ -1923,6 +1931,8 @@ fn is_keyword(w: &str) -> bool {
             | "USING"
             | "MATCHED"
             | "RETURNING"
+            | "WITH"
+            | "LOCK"
     )
 }
 
@@ -2645,6 +2655,9 @@ fn emit_cursor_decl(out: &mut Vec<u8>, d: &CursorDecl) {
     out.push(alias.len() as u8);
     out.extend_from_slice(alias.as_bytes());
     out.push(d.ctx);
+    if d.lock {
+        out.push(blr::WRITELOCK);
+    }
     if let Some(b) = &d.boolean {
         out.push(blr::BOOLEAN);
         emit_bool(out, b);
@@ -3041,28 +3054,40 @@ enum TrigStmt {
         vars: Vec<u16>,
         run: Option<(u8, Box<TrigStmt>)>,
     },
-    /// MERGE INTO tgt USING src ON <bool>, one MATCHED branch
-    /// (UPDATE SET or DELETE) and/or one NOT MATCHED (INSERT): a
-    /// marks(1, 6)-stamped for-loop over a JOIN of source and target
-    /// - LEFT when the INSERT branch needs unmatched rows, INNER
-    /// otherwise - branching on missing(dbkey(target)) (probed)
+    /// the PARAMETERIZED [FOR] EXECUTE STATEMENT ('<sql>') (vals)
+    /// [INTO ...]: blr_exec_stmt with tag-prefixed clauses in fixed
+    /// order - in-count, out-count, sql, [the loop's DO statement],
+    /// input values, output variables, blr_end (probed)
+    ExecStmtFull {
+        sql: String,
+        ins: Vec<Val>,
+        vars: Vec<u16>,
+        run: Option<(u8, Box<TrigStmt>)>,
+    },
+    /// MERGE INTO tgt USING src ON <bool>: a marks(1, 6)-stamped
+    /// for-loop over a JOIN of source and target - LEFT when a NOT
+    /// MATCHED branch needs unmatched rows, INNER otherwise -
+    /// branching on missing(dbkey(target)). Branches of one kind
+    /// form an if-else CHAIN in SQL order; each conditional branch
+    /// is if(cond, action, <next>), the last conditional one gets a
+    /// bare end, an unconditional LAST branch fills the else slot
+    /// directly. The rse boolean ORs the two kind-terms - matched
+    /// first: [and(]not(missing)[, or-chain of conds)] and
+    /// [and(]missing[, or-chain)] - each simplified to its bare
+    /// missing-test when any branch of the kind is unconditional,
+    /// and OMITTED entirely for an unconditional matched-only merge
+    /// (all probed)
     Merge {
         src: Stream,
         src_ctx: u8,
         tgt: Stream,
         tgt_ctx: u8,
         on: Bool,
-        /// WHEN MATCHED THEN UPDATE: the new-record ctx + SET pairs
-        upd: Option<(u8, Vec<(String, Val)>)>,
-        /// WHEN MATCHED THEN DELETE
-        del: bool,
-        /// WHEN NOT MATCHED THEN INSERT: store ctx, columns, values
-        ins: Option<(u8, Vec<String>, Vec<Val>)>,
-        /// WHEN MATCHED AND <cond>: joins the rse boolean's matched
-        /// term and wraps the action in if(cond, action, bare end)
-        mat_cond: Option<Bool>,
-        /// WHEN NOT MATCHED AND <cond>: same for the insert half
-        ins_cond: Option<Bool>,
+        /// WHEN MATCHED [AND cond] THEN <action>, in SQL order
+        matched: Vec<(Option<Bool>, MergeAct)>,
+        /// WHEN NOT MATCHED [AND cond] THEN INSERT: (cond, store
+        /// ctx, columns, values), in SQL order
+        notmatched: Vec<(Option<Bool>, u8, Vec<String>, Vec<Val>)>,
     },
     /// DELETE ... WHERE CURRENT OF c - blr_erase at the CURSOR's
     /// context, then marks(1, 1) - MARK_POSITIONED trails the erase
@@ -3071,6 +3096,13 @@ enum TrigStmt {
     /// UPDATE ... SET ... WHERE CURRENT OF c - blr_modify from the
     /// cursor's context to a FRESH one, marks(1, 1), the assignments
     PosUpdate(u8, u8, Vec<(Val, Val)>),
+}
+
+/// A MERGE matched-branch action: UPDATE SET (each branch claims
+/// its OWN new-record context, in branch order) or DELETE.
+enum MergeAct {
+    Upd(u8, Vec<(String, Val)>),
+    Del,
 }
 
 /// A DECLARE ... CURSOR FOR (SELECT ...): the rse's relation2 alias
@@ -3085,6 +3117,8 @@ struct CursorDecl {
     /// DECLARE ... SCROLL CURSOR - blr_scrollable before the rse;
     /// backward/positioned fetch directions demand it
     scroll: bool,
+    /// (SELECT ... WITH LOCK) - blr_writelock in the cursor's rse
+    lock: bool,
     table: String,
     alias: Option<String>,
     ctx: u8,
@@ -3124,6 +3158,8 @@ struct ForSel {
     /// into-assign sources wrap in blr_derived_expr, and positioned
     /// DML in the DO body may target it (probed)
     cursor: Option<String>,
+    /// WITH LOCK: blr_writelock between the stream and the boolean
+    lock: bool,
     aggregate: bool,
     map: Vec<MapEntry>,
     group_keys: Vec<Val>,
@@ -3385,25 +3421,54 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 out.extend_from_slice(&vi.to_le_bytes());
             }
         }
+        TrigStmt::ExecStmtFull { sql, ins, vars, run } => {
+            if let Some((label, _)) = run {
+                out.push(blr::LABEL);
+                out.push(*label);
+            }
+            out.push(blr::EXEC_STMT);
+            if !ins.is_empty() {
+                out.push(1); // blr_exec_stmt_inputs
+                out.extend_from_slice(&(ins.len() as u16).to_le_bytes());
+            }
+            if !vars.is_empty() {
+                out.push(2); // blr_exec_stmt_outputs
+                out.extend_from_slice(&(vars.len() as u16).to_le_bytes());
+            }
+            out.push(3); // blr_exec_stmt_sql
+            emit_val(out, &Val::Str(sql.clone()));
+            if let Some((_, body)) = run {
+                out.push(4); // blr_exec_stmt_proc_block
+                emit_trig_stmt(out, body);
+            }
+            if !ins.is_empty() {
+                out.push(11); // blr_exec_stmt_in_params
+                for v in ins {
+                    emit_val(out, v);
+                }
+            }
+            if !vars.is_empty() {
+                out.push(13); // blr_exec_stmt_out_params
+                for vi in vars {
+                    out.push(blr::VARIABLE);
+                    out.extend_from_slice(&vi.to_le_bytes());
+                }
+            }
+            out.push(blr::END);
+        }
         TrigStmt::Merge {
             src,
             src_ctx,
             tgt,
             tgt_ctx,
             on,
-            upd,
-            del,
-            ins,
-            mat_cond,
-            ins_cond,
+            matched,
+            notmatched,
         } => {
             // one probed sentence: for(marks(1, MERGE|FOR_UPDATE),
             // rse(join2(source, target, [left], ON), [branch-union
-            // boolean]), if(<matched test>, ...)). The rse boolean
-            // ORs the branch conditions - matched first - and is
-            // OMITTED for matched-only merges (their INNER join
-            // already filters); branch order in the SQL leaves no
-            // trace.
+            // boolean]), if(<matched test>, ...)). Branch chains and
+            // union terms per the header comment on the variant.
             out.push(blr::FOR);
             out.push(blr::MARKS);
             out.push(1);
@@ -3414,65 +3479,68 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
             out.push(2);
             emit_stream(out, src, *src_ctx);
             emit_stream(out, tgt, *tgt_ctx);
-            if ins.is_some() {
+            if !notmatched.is_empty() {
                 out.push(blr::JOIN_TYPE);
                 out.push(1);
             }
             out.push(blr::BOOLEAN);
             emit_bool(out, on);
             out.push(blr::END); // closes the join
-            let matched = upd.is_some() || *del;
             let miss = |out: &mut Vec<u8>| {
                 out.push(blr::MISSING);
                 out.push(blr::DBKEY);
                 out.push(*tgt_ctx);
             };
-            // the rse boolean ORs the branch terms - matched first.
-            // A branch's AND joins its term: and(not(missing), cond)
-            // / and(missing, cond); a matched-ONLY merge's term is
-            // the bare cond (its INNER join already filters), or
-            // nothing at all without one (probed)
-            if ins.is_some() {
-                out.push(blr::BOOLEAN);
-                if matched {
+            // or-chain of a kind's branch conditions: left-nested 39s
+            let orchain = |out: &mut Vec<u8>, conds: &[&Bool]| {
+                for _ in 1..conds.len() {
                     out.push(blr::OR);
-                    if let Some(c) = mat_cond {
+                }
+                for c in conds {
+                    emit_bool(out, c);
+                }
+            };
+            let m_conds: Vec<&Bool> =
+                matched.iter().filter_map(|(c, _)| c.as_ref()).collect();
+            let m_uncond = matched.iter().any(|(c, _)| c.is_none());
+            let nm_conds: Vec<&Bool> =
+                notmatched.iter().filter_map(|(c, ..)| c.as_ref()).collect();
+            let nm_uncond = notmatched.iter().any(|(c, ..)| c.is_none());
+            // the rse boolean - matched term first, each term
+            // simplified to its bare missing-test when the kind has
+            // an unconditional branch; a matched-only merge drops
+            // even the not(missing) (its INNER join already filters)
+            // and with an unconditional branch has NO boolean at all
+            if notmatched.is_empty() {
+                if !m_uncond {
+                    out.push(blr::BOOLEAN);
+                    orchain(out, &m_conds);
+                }
+            } else {
+                out.push(blr::BOOLEAN);
+                if !matched.is_empty() {
+                    out.push(blr::OR);
+                    if m_uncond {
+                        out.push(blr::NOT);
+                        miss(out);
+                    } else {
                         out.push(blr::AND);
                         out.push(blr::NOT);
                         miss(out);
-                        emit_bool(out, c);
-                    } else {
-                        out.push(blr::NOT);
-                        miss(out);
+                        orchain(out, &m_conds);
                     }
                 }
-                if let Some(c) = ins_cond {
+                if nm_uncond {
+                    miss(out);
+                } else {
                     out.push(blr::AND);
                     miss(out);
-                    emit_bool(out, c);
-                } else {
-                    miss(out);
+                    orchain(out, &nm_conds);
                 }
-            } else if let Some(c) = mat_cond {
-                out.push(blr::BOOLEAN);
-                emit_bool(out, c);
             }
             out.push(blr::END); // closes the rse
-            out.push(blr::IF);
-            if ins.is_some() {
-                miss(out);
-            } else {
-                out.push(blr::NOT);
-                miss(out);
-            }
-            let emit_matched = |out: &mut Vec<u8>| {
-                // a conditional branch nests if(cond, action, bare
-                // end) inside its slot (probed)
-                if let Some(c) = mat_cond {
-                    out.push(blr::IF);
-                    emit_bool(out, c);
-                }
-                if let Some((new_ctx, sets)) = upd {
+            let emit_m_act = |out: &mut Vec<u8>, act: &MergeAct| match act {
+                MergeAct::Upd(new_ctx, sets) => {
                     out.push(blr::MODIFY);
                     out.push(*tgt_ctx);
                     out.push(*new_ctx);
@@ -3489,25 +3557,42 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                         out.extend_from_slice(col.as_bytes());
                     }
                     out.push(blr::END);
-                } else {
+                }
+                MergeAct::Del => {
                     out.push(blr::ERASE);
                     out.push(*tgt_ctx);
                     out.push(blr::MARKS);
                     out.push(1);
                     out.push(2);
                 }
-                if mat_cond.is_some() {
-                    out.push(blr::END); // the nested if's bare else
-                }
             };
-            match ins {
-                Some((store_ctx, cols, vals)) => {
-                    // the store re-emits the TARGET stream - alias
-                    // and all - at its own context (probed); a
-                    // conditional insert nests if(cond, store, end)
-                    if let Some(c) = ins_cond {
+            // a kind's branches chain if(cond, action, <next>) in SQL
+            // order; the last conditional branch gets a bare end, an
+            // unconditional last branch fills the else slot directly
+            // each intermediate if's else slot IS the next if by
+            // position - only the innermost conditional needs the
+            // bare end
+            let emit_m_chain = |out: &mut Vec<u8>| {
+                let mut has_cond = false;
+                for (cond, act) in matched {
+                    if let Some(c) = cond {
                         out.push(blr::IF);
                         emit_bool(out, c);
+                        has_cond = true;
+                    }
+                    emit_m_act(out, act);
+                }
+                if !m_uncond && has_cond {
+                    out.push(blr::END); // innermost bare else
+                }
+            };
+            let emit_nm_chain = |out: &mut Vec<u8>| {
+                let mut has_cond = false;
+                for (cond, store_ctx, cols, vals) in notmatched {
+                    if let Some(c) = cond {
+                        out.push(blr::IF);
+                        emit_bool(out, c);
+                        has_cond = true;
                     }
                     out.push(blr::STORE);
                     emit_stream(out, tgt, *store_ctx);
@@ -3521,18 +3606,24 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                         out.extend_from_slice(c.as_bytes());
                     }
                     out.push(blr::END);
-                    if ins_cond.is_some() {
-                        out.push(blr::END); // the nested if's bare else
-                    }
-                    if matched {
-                        emit_matched(out);
-                    } else {
-                        out.push(blr::END); // the if's missing else
-                    }
                 }
-                None => {
-                    emit_matched(out);
-                    out.push(blr::END); // the if's missing else
+                if !nm_uncond && has_cond {
+                    out.push(blr::END); // innermost bare else
+                }
+            };
+            out.push(blr::IF);
+            if notmatched.is_empty() {
+                out.push(blr::NOT);
+                miss(out);
+                emit_m_chain(out);
+                out.push(blr::END); // the outer if's bare else
+            } else {
+                miss(out);
+                emit_nm_chain(out);
+                if matched.is_empty() {
+                    out.push(blr::END); // the outer if's bare else
+                } else {
+                    emit_m_chain(out);
                 }
             }
         }
@@ -3683,12 +3774,18 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 out.push(alias.len() as u8);
                 out.extend_from_slice(alias.as_bytes());
                 out.push(f.ctx);
+                if f.lock {
+                    out.push(blr::WRITELOCK);
+                }
                 if let Some(b) = &f.boolean {
                     out.push(blr::BOOLEAN);
                     emit_bool(out, b);
                 }
             } else {
                 emit_stream(out, &f.stream, f.ctx);
+                if f.lock {
+                    out.push(blr::WRITELOCK);
+                }
                 if let Some(v) = &f.first {
                     out.push(blr::FIRST);
                     emit_val(out, v);
@@ -4027,6 +4124,21 @@ impl<'a> P<'a> {
                 })
                 .collect::<Option<Vec<_>>>()?
         };
+        // WITH LOCK - probed beside a WHERE and alone; the shapes
+        // beyond the probes (aggregates, FIRST/SKIP, ORDER BY) refuse
+        let lock = if self.kw("WITH") {
+            if !self.kw("LOCK")
+                || aggregate
+                || first.is_some()
+                || skip.is_some()
+                || !sort.is_empty()
+            {
+                return None;
+            }
+            true
+        } else {
+            false
+        };
         // INTO :v, ... - output parameters and locals are ONE
         // variable space (outputs first); with AS CURSOR the INTO
         // clause is OPTIONAL (probed both ways)
@@ -4109,6 +4221,7 @@ impl<'a> P<'a> {
             stream,
             ctx,
             cursor,
+            lock,
             aggregate,
             map,
             group_keys,
@@ -4121,6 +4234,39 @@ impl<'a> P<'a> {
             into,
             do_stmt,
         })))
+    }
+
+
+    /// The parameterized EXECUTE STATEMENT head: ('<literal sql>')
+    /// (val [, ...]) - self.i at the opening paren of the sql.
+    fn exec_stmt_head(&mut self) -> Option<(String, Vec<Val>)> {
+        self.i += 1; // (
+        let Some(Tok::Str(sql)) = self.t.get(self.i) else {
+            return None;
+        };
+        let sql = sql.clone();
+        self.i += 1;
+        if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+            return None;
+        }
+        self.i += 1;
+        if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
+            return None;
+        }
+        self.i += 1;
+        let mut ins = Vec::new();
+        loop {
+            ins.push(self.val()?);
+            match self.t.get(self.i)? {
+                Tok::Comma => self.i += 1,
+                Tok::RParen => {
+                    self.i += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        Some((sql, ins))
     }
 
     /// An optional RETURNING col [, ...] INTO :v [, ...] tail on a
@@ -4418,6 +4564,15 @@ impl<'a> P<'a> {
             }
         }
         self.sub = saved;
+        // WITH LOCK - refused over aggregates and sorts (unprobed)
+        let lock = if self.kw("WITH") {
+            if !self.kw("LOCK") || aggregate || !sort.is_empty() {
+                return None;
+            }
+            true
+        } else {
+            false
+        };
         if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
             return None;
         }
@@ -4432,6 +4587,7 @@ impl<'a> P<'a> {
             name,
             num,
             scroll,
+            lock,
             table: tbl,
             alias,
             ctx,
@@ -4638,6 +4794,48 @@ impl<'a> P<'a> {
                 if !self.kw("STATEMENT") {
                     return None;
                 }
+                // parenthesized = parameterized: the full form with
+                // the DO statement under tag 4
+                if matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                    let (sql, ins) = self.exec_stmt_head()?;
+                    if !self.kw("INTO") {
+                        return None;
+                    }
+                    let mut vars = Vec::new();
+                    loop {
+                        if !matches!(self.t.get(self.i), Some(Tok::Colon)) {
+                            return None;
+                        }
+                        self.i += 1;
+                        let Some(Tok::Ident(v)) = self.t.get(self.i) else {
+                            return None;
+                        };
+                        let vi = self
+                            .local_vars
+                            .iter()
+                            .position(|n| n == v)?
+                            as u16;
+                        vars.push(vi);
+                        self.i += 1;
+                        if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                            self.i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    let label = self.next_label;
+                    self.next_label += 1;
+                    if !self.kw("DO") {
+                        return None;
+                    }
+                    let body = Box::new(self.trig_stmt()?);
+                    return Some(TrigStmt::ExecStmtFull {
+                        sql,
+                        ins,
+                        vars,
+                        run: Some((label, body)),
+                    });
+                }
                 let Some(Tok::Str(sql)) = self.t.get(self.i) else {
                     return None;
                 };
@@ -4690,6 +4888,55 @@ impl<'a> P<'a> {
             // EXECUTE STATEMENT '<literal sql>' [INTO :v, ...]; -
             // expression sql, USING, external data sources: unprobed
             if self.kw("STATEMENT") {
+                // the parenthesized head carries INPUT parameters -
+                // the full blr_exec_stmt form
+                if matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                    let (sql, ins) = self.exec_stmt_head()?;
+                    if matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                        self.i += 1;
+                        return Some(TrigStmt::ExecStmtFull {
+                            sql,
+                            ins,
+                            vars: Vec::new(),
+                            run: None,
+                        });
+                    }
+                    if !self.kw("INTO") {
+                        return None;
+                    }
+                    let mut vars = Vec::new();
+                    loop {
+                        if !matches!(self.t.get(self.i), Some(Tok::Colon)) {
+                            return None;
+                        }
+                        self.i += 1;
+                        let Some(Tok::Ident(v)) = self.t.get(self.i) else {
+                            return None;
+                        };
+                        let vi = self
+                            .local_vars
+                            .iter()
+                            .position(|n| n == v)?
+                            as u16;
+                        vars.push(vi);
+                        self.i += 1;
+                        if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                            self.i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                        return None;
+                    }
+                    self.i += 1;
+                    return Some(TrigStmt::ExecStmtFull {
+                        sql,
+                        ins,
+                        vars,
+                        run: None,
+                    });
+                }
                 let Some(Tok::Str(sql)) = self.t.get(self.i) else {
                     return None;
                 };
@@ -5160,19 +5407,29 @@ impl<'a> P<'a> {
             }
             self.merge_scope = Some((src_idx, tgt_idx));
             let on = self.bool_or()?;
-            let mut upd_sets: Option<Vec<(String, Val)>> = None;
-            let mut del = false;
-            let mut ins_cv: Option<(Vec<String>, Vec<Val>)> = None;
-            let mut mat_cond: Option<Bool> = None;
-            let mut ins_cond: Option<Bool> = None;
+            // branches in SQL order; an UNCONDITIONAL branch must be
+            // its kind's LAST (later ones would be unreachable - and
+            // the chain has one else slot to fill)
+            let mut mat_raw: Vec<(Option<Bool>, MatRaw)> = Vec::new();
+            let mut nm_raw: Vec<(Option<Bool>, Vec<String>, Vec<Val>)> =
+                Vec::new();
+            enum MatRaw {
+                Upd(Vec<(String, Val)>),
+                Del,
+            }
             while self.kw("WHEN") {
                 if self.kw("NOT") {
-                    if !self.kw("MATCHED") || ins_cv.is_some() {
+                    if !self.kw("MATCHED") {
                         return None;
                     }
-                    if self.kw("AND") {
-                        ins_cond = Some(self.bool_or()?);
+                    if matches!(nm_raw.last(), Some((None, ..))) {
+                        return None; // after an unconditional branch
                     }
+                    let cond = if self.kw("AND") {
+                        Some(self.bool_or()?)
+                    } else {
+                        None
+                    };
                     if !(self.kw("THEN") && self.kw("INSERT"))
                         || !matches!(self.t.get(self.i), Some(Tok::LParen))
                     {
@@ -5219,14 +5476,19 @@ impl<'a> P<'a> {
                     if vals.len() != cols.len() {
                         return None;
                     }
-                    ins_cv = Some((cols, vals));
+                    nm_raw.push((cond, cols, vals));
                 } else {
-                    if !self.kw("MATCHED") || upd_sets.is_some() || del {
+                    if !self.kw("MATCHED") {
                         return None;
                     }
-                    if self.kw("AND") {
-                        mat_cond = Some(self.bool_or()?);
+                    if matches!(mat_raw.last(), Some((None, _))) {
+                        return None; // after an unconditional branch
                     }
+                    let cond = if self.kw("AND") {
+                        Some(self.bool_or()?)
+                    } else {
+                        None
+                    };
                     if !self.kw("THEN") {
                         return None;
                     }
@@ -5259,52 +5521,74 @@ impl<'a> P<'a> {
                                 break;
                             }
                         }
-                        upd_sets = Some(sets);
+                        mat_raw.push((cond, MatRaw::Upd(sets)));
                     } else if self.kw("DELETE") {
-                        del = true;
+                        mat_raw.push((cond, MatRaw::Del));
                     } else {
                         return None;
                     }
                 }
             }
             self.merge_scope = None;
-            if upd_sets.is_none() && !del && ins_cv.is_none() {
+            if mat_raw.is_empty() && nm_raw.is_empty() {
                 return None;
             }
             if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
                 return None;
             }
             self.i += 1;
-            // branch contexts allocate UPDATE's new record first,
-            // then INSERT's store - independent of SQL branch order
-            // (probed: update+insert = 2,3; anything-else+insert = 2)
-            let upd = upd_sets.map(|sets| {
-                self.streams.push(Stream {
-                    name: String::new(),
-                    alias: None,
-                    derived: None,
-                });
-                ((self.streams.len() - 1) as u8 + self.base, sets)
-            });
-            let ins = ins_cv.map(|(c, v)| {
-                self.streams.push(Stream {
-                    name: String::new(),
-                    alias: None,
-                    derived: None,
-                });
-                ((self.streams.len() - 1) as u8 + self.base, c, v)
-            });
+            // branch contexts allocate BY KIND, branch order within:
+            // every matched UPDATE claims a new-record slot, then
+            // every INSERT its store slot - independent of the SQL's
+            // matched/not-matched interleaving (probed)
+            let matched: Vec<(Option<Bool>, MergeAct)> = mat_raw
+                .into_iter()
+                .map(|(c, r)| {
+                    (
+                        c,
+                        match r {
+                            MatRaw::Upd(sets) => {
+                                self.streams.push(Stream {
+                                    name: String::new(),
+                                    alias: None,
+                                    derived: None,
+                                });
+                                MergeAct::Upd(
+                                    (self.streams.len() - 1) as u8
+                                        + self.base,
+                                    sets,
+                                )
+                            }
+                            MatRaw::Del => MergeAct::Del,
+                        },
+                    )
+                })
+                .collect();
+            let notmatched: Vec<(Option<Bool>, u8, Vec<String>, Vec<Val>)> =
+                nm_raw
+                    .into_iter()
+                    .map(|(c, cols, vals)| {
+                        self.streams.push(Stream {
+                            name: String::new(),
+                            alias: None,
+                            derived: None,
+                        });
+                        (
+                            c,
+                            (self.streams.len() - 1) as u8 + self.base,
+                            cols,
+                            vals,
+                        )
+                    })
+                    .collect();
             return Some(TrigStmt::Merge {
                 src,
                 src_ctx,
                 tgt,
                 tgt_ctx,
                 on,
-                upd,
-                del,
-                ins,
-                mat_cond,
-                ins_cond,
+                matched,
+                notmatched,
             });
         }
         if self.kw("UPDATE") {
@@ -7377,9 +7661,64 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_twenty_five_shapes_byte_for_byte() {
+        // multi-branch MERGE: branches of one kind form an if-else
+        // CHAIN in SQL order, each conditional branch if(cond,
+        // action, <next>), an unconditional LAST filling the else;
+        // the rse boolean ORs kind-terms built from or-chains of the
+        // branch conds; contexts allocate BY KIND in branch order
+        // (flip twenty-three - slice 23/24's multi-branch refusal)
+        pin_proc(
+            "CREATE PROCEDURE QT1 (P1 INTEGER, P2 INTEGER) AS BEGIN MERGE INTO U2 USING T ON U2.UID = T.ID WHEN MATCHED AND U2.UA > :P1 THEN UPDATE SET UA = :P2 WHEN MATCHED AND U2.UA < 0 THEN DELETE WHEN NOT MATCHED AND T.ID > 0 THEN INSERT (UID) VALUES (T.ID) WHEN NOT MATCHED THEN INSERT (UID, UA) VALUES (T.ID, :P2); END",
+            "05020400040008000700080007000401010007000C00029B1100020207D90106430177024A0154004A025532015001472F1701035549441700024944FF47393A3B3D160139311701025541290000000100331701025541150800000000003D1601FF083D160108311700024944150800000000000F4A0255320302011700024944170303554944FF0F4A0255320402011700024944170403554944012900020003001704025541FF083117010255412900000001000A0102D9010202012900020003001702025541FF08331701025541150800000000000501D90102FFFFFFFF0E010201150700000019010000FFFF4C",
+        );
+        // parameterized EXECUTE STATEMENT ('sql') (vals) INTO: the
+        // full blr_exec_stmt with tag-prefixed clauses - in-count,
+        // out-count, sql, input values, output variables, blr_end
+        // (flip twenty-four)
+        pin_proc(
+            "CREATE PROCEDURE QT2 (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN EXECUTE STATEMENT ('select ua from u2 where uid = ?') (:P1) INTO :R1; SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B11000202BD01010002010003150F00001F0073656C6563742075612066726F6D20753220776865726520756964203D203F0B2900000001000D1A0000FF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // the FOR form slots its DO statement under tag 4, BETWEEN
+        // the sql and the input values
+        pin_proc(
+            "CREATE PROCEDURE QT3 (P1 INTEGER, P2 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR EXECUTE STATEMENT ('select uid from u2 where ua between ? and ?') (:P1, :P2) INTO :R1 DO SUSPEND; END",
+            "0502040004000800070008000700040103000800070007000C00020300000800012D1A00009B110002021101BD01020002010003150F00002B0073656C656374207569642066726F6D207532207768657265207561206265747765656E203F20616E64203F040E0102011A000029010000010001150700010019010200FF0B2900000001002900020003000D1A0000FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // WITH LOCK: blr_writelock between the stream and the
+        // boolean - here in a DECLAREd cursor feeding a positioned
+        // UPDATE (flip twenty-five)
+        pin_proc(
+            "CREATE PROCEDURE QT4 RETURNS (R1 INTEGER) AS DECLARE CX CURSOR FOR (SELECT UID FROM U2 WHERE UA > 0 WITH LOCK); BEGIN OPEN CX; FETCH CX INTO :R1; UPDATE U2 SET UA = 0 WHERE CURRENT OF CX; CLOSE CX; SUSPEND; END",
+            "050204010300080007000700020300000800012D1A0000A60000430192025532122243582220225055424C4943222E2255322200B34731170002554115080000000000FF0100BF01001700035549449B11000202A7000000A702000002011700035549441A0000FF0A0001D901010201150800000000001701025541FFA70100000E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... and in an AS CURSOR loop's rse, beside its WHERE
+        pin_proc(
+            "CREATE PROCEDURE QT5 (P1 INTEGER) AS BEGIN FOR SELECT UID FROM U2 WHERE UA < :P1 WITH LOCK AS CURSOR CU DO DELETE FROM U2 WHERE CURRENT OF CU; END",
+            "050204000200080007000401010007000C00029B11000202110107430192025532122243552220225055424C4943222E2255322200B347331700025541290000000100FF020500D90101FFFFFFFF0E010201150700000019010000FFFF4C",
+        );
+    }
+
+    #[test]
+    fn slice_twenty_five_refusals() {
+        for sql in [
+            // WITH LOCK over an aggregate: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT COUNT(*) FROM U2 WITH LOCK INTO :R1 DO SUSPEND; END",
+            // WITH LOCK beside ORDER BY: unprobed emission order
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT UID FROM U2 ORDER BY UID WITH LOCK INTO :R1 DO SUSPEND; END",
+            // named EXECUTE STATEMENT parameters: unprobed
+            "CREATE PROCEDURE X (P1 INTEGER) AS BEGIN EXECUTE STATEMENT ('delete from u2 where uid = :a') (a := :P1); END",
+        ] {
+            assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
+        }
+    }
+
+    #[test]
     fn merge_refusals() {
         for sql in [
-            // two MATCHED branches (an if-else chain): unprobed
+            // a branch AFTER its kind's unconditional one is
+            // unreachable - the chain has one else slot to fill
             "CREATE PROCEDURE X (P1 INTEGER) AS BEGIN MERGE INTO U2 USING T ON U2.UID = T.ID WHEN MATCHED THEN DELETE WHEN MATCHED THEN UPDATE SET UA = :P1; END",
             // bare names in the ON clause need the catalog
             "CREATE PROCEDURE X AS BEGIN MERGE INTO U2 USING T ON UID = ID WHEN MATCHED THEN DELETE; END",

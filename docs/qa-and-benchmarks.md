@@ -4666,6 +4666,31 @@ WHEN, and a BLOCK as a handler's body nests blr_block again with no
 handler section of its own - the battery runs a handler block
 containing an EXIT.
 
+Slice 25 generalized MERGE to its full branch surface. Branches of
+one kind form an if-else CHAIN in SQL order - and the chain is
+written BY POSITION: each conditional branch emits if(cond, action)
+and the NEXT if simply lands in the else slot, no separator, no
+count; only the innermost conditional needs a bare end, and an
+unconditional LAST branch fills the else directly (a branch after
+an unconditional one refuses - the chain has one else slot). The
+rse boolean generalized the slice-24 terms: each kind contributes
+and(<missing-test>, or(c1, c2, ...)) with the or-chain left-nested
+like the AND law, simplified to the bare missing-test when any
+branch of the kind is unconditional. Contexts allocate BY KIND in
+branch order - every matched UPDATE claims its own new-record slot
+(probed: a three-branch chain's second update modified into ctx 3),
+then every INSERT its store. Parameterized EXECUTE STATEMENT
+switched verbs entirely: ('sql') (vals) compiles the FULL
+blr_exec_stmt with tag-prefixed clauses in fixed order - in-count,
+out-count, sql, the FOR form's DO statement under tag 4, the input
+VALUES, the output variables, blr_end - while the literal no-param
+forms keep their compact exec_sql/exec_into verbs: the same source
+keyword, three verbs, chosen by what the statement carries. And
+WITH LOCK is blr_writelock BETWEEN the stream and the boolean - in
+FOR SELECT, DECLAREd cursors and AS CURSOR loops alike; the
+battery drives locked cursors through positioned UPDATEs in both
+cursor forms, compositions no probe ever ran.
+
 Slice 24 finished what 23 started. WHEN [NOT] MATCHED AND <cond>
 flipped from slice 23's own refusal list: the condition joins the
 rse boolean's branch term - and(not(missing), cond) for matched,

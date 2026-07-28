@@ -307,6 +307,11 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # branch chains nest BY POSITION: an if's else slot is simply
+    # the next if, unmarked - only the innermost needs its bare end;
+    # and one keyword can pick between THREE verbs by what the
+    # statement CARRIES (EXECUTE STATEMENT: exec_sql, exec_into,
+    # exec_stmt) - convert the dispatch, not just the shapes
     # ONE source clause can take THREE shapes by verb (RETURNING:
     # store2's second begin, modify2 under a singular rse, delete's
     # begin-wrapped PLAIN erase) - and a clause can change the verb
