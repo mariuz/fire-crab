@@ -754,7 +754,15 @@ impl ProjCol {
                 }
                 Ok(v)
             }
-            None => Ok(values.get(self.field_id).cloned().unwrap_or(Value::Null)),
+            None => {
+                let v = values.get(self.field_id).cloned().unwrap_or(Value::Null);
+                // same contract as above: a value wider than the
+                // announced wire form raises, never encodes wrong
+                if !matches!(self.wire, Wire::Int128) && matches!(v, Value::Int128(..)) {
+                    return Err(EvalErr::IntegerOverflow);
+                }
+                Ok(v)
+            }
         }
     }
 }
@@ -1287,7 +1295,8 @@ enum JoinKind {
 /// `COUNT(*)`).
 enum GItem {
     Key(usize),
-    Agg(AggFn, Option<usize>),
+    /// (function, source field, distinct) - distinct only with COUNT
+    Agg(AggFn, Option<usize>, bool),
 }
 
 /// A scalar-returning aggregate function.
@@ -1297,6 +1306,11 @@ enum AggFn {
     Min,
     Max,
     Sum,
+    /// AVG = SUM / COUNT-of-non-nulls, the division TRUNCATING toward
+    /// zero at the operand's scale (probed: AVG over 1,2 is 1; over
+    /// four NUMERIC(9,2) values summing 10.80 it is 2.70) - NULL over
+    /// an empty or all-NULL input like the other folds
+    Avg,
 }
 
 /// What an aggregate is computed over.
@@ -1304,6 +1318,9 @@ enum AggFn {
 enum AggTarget {
     Star,
     Col(String),
+    /// `COUNT(DISTINCT col)` - distinct non-NULL values (probed: NULL
+    /// is not a value); only COUNT accepts it here
+    Distinct(String),
 }
 
 /// A comparison operator in a WHERE term.
@@ -9876,10 +9893,14 @@ fn plan_query_inner(
             if order_s.is_some() {
                 return None;
             }
-            return match aggregate(db, rel, &formats, &columns, &descs, *func, target, &filter) {
-                Some(v) => Some(Plan::Scalar(v)),
-                None => None, // unsupported aggregate (e.g. MIN of a text column)
-            };
+            // the integer fast path computes at prepare; the shapes it
+            // declines (MIN/MAX over text or temporal, SUM/AVG over
+            // scaled numerics, COUNT(DISTINCT)) fall THROUGH to the
+            // group machinery, which types and computes them at fetch
+            if let Some(v) = aggregate(db, rel, &formats, &columns, &descs, *func, target, &filter)
+            {
+                return Some(Plan::Scalar(v));
+            }
         }
     }
 
@@ -10036,42 +10057,74 @@ fn plan_group(
                 gitems.push(GItem::Key(fid));
             }
             SelItem::Agg(func, target) => {
-                let fid = match target {
-                    AggTarget::Star => None, // COUNT(*) - parse guarantees Count
-                    AggTarget::Col(name) => {
+                let (fid, distinct) = match target {
+                    AggTarget::Star => (None, false), // COUNT(*) - parse guarantees Count
+                    AggTarget::Col(name) | AggTarget::Distinct(name) => {
                         let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
                         let fid = rc.field_id as usize;
                         // no record bytes to aggregate over
                         if is_computed_fid(descs, fid) {
                             return None;
                         }
-                        // MIN/MAX/SUM only over integers (COUNT counts any)
-                        if !matches!(func, AggFn::Count)
-                            && !matches!(col_kind(descs.get(fid)?)?, ColKind::Int)
+                        (Some(fid), matches!(target, AggTarget::Distinct(_)))
+                    }
+                };
+                // the OUTPUT TYPE follows the function and the column
+                // (probed): COUNT is BIGINT; MIN/MAX keep the column's
+                // own type and wire form; SUM/AVG take the column's
+                // SCALE at BIGINT width - or INT128 width over an
+                // INT128 column - the engine's NUMERIC(18,s) widening
+                let d = fid.map(|f| descs.get(f)).unwrap_or(None);
+                let (wire, sql_type, length, scale, sub_type) = match func {
+                    AggFn::Count => (Wire::Int64, 581, 8, 0, 0),
+                    AggFn::Min | AggFn::Max => {
+                        let d = d?;
+                        // comparable kinds only: int/text/scaled/temporal
+                        if col_kind(d).is_none()
+                            && !is_numeric_col(d)
+                            && temporal_kind(d).is_none()
                         {
                             return None;
                         }
-                        Some(fid)
+                        let (w, t, l, sc, st) = wire_for(d);
+                        (w, t, l, sc, st)
+                    }
+                    AggFn::Sum | AggFn::Avg => {
+                        let d = d?;
+                        let ok = matches!(col_kind(d), Some(ColKind::Int))
+                            || is_numeric_col(d);
+                        if !ok {
+                            return None;
+                        }
+                        if d.dtype == dtype::INT128 {
+                            (Wire::Int128, 32752, 16, d.scale as i32, 0)
+                        } else {
+                            (Wire::Int64, 580, 8, d.scale as i32, 0)
+                        }
                     }
                 };
+                if distinct && !matches!(func, AggFn::Count) {
+                    return None; // only COUNT(DISTINCT) is answered
+                }
                 // the engine titles aggregate output columns by function
                 let name = match func {
                     AggFn::Count => "COUNT",
                     AggFn::Min => "MIN",
                     AggFn::Max => "MAX",
                     AggFn::Sum => "SUM",
+                    AggFn::Avg => "AVG",
                 };
                 cols.push(ProjCol {
                     name: name.to_string(),
                     field_id: out_idx,
-                    wire: Wire::Int64,
-                    sql_type: 581,
-                    length: 8,
-                    scale: 0,
-                    sub_type: 0,
+                    wire,
+                    sql_type: nullable(sql_type),
+                    length,
+                    scale,
+                    sub_type,
                     expr: None,
                 });
-                gitems.push(GItem::Agg(*func, fid));
+                gitems.push(GItem::Agg(*func, fid, distinct));
             }
         }
     }
@@ -10210,7 +10263,20 @@ fn aggregate(
         return Some(Some(n));
     }
     if !matches!(col_kind(descs.get(fid)?)?, ColKind::Int) {
-        return None; // MIN/MAX/SUM only over integers for now
+        // MIN/MAX over text/temporal, SUM/AVG over scaled numerics:
+        // the GROUP machinery types and computes those (the caller
+        // falls through to it)
+        return None;
+    }
+    // AVG always takes the GROUP path (decline here): the scalar
+    // plan's describe headers the column CONSTANT, and the engine says
+    // AVG - the group machinery describes aggregates by function name.
+    // (The lone COUNT/MIN/MAX/SUM header keeps the scalar path's
+    // CONSTANT for now - a standing difference this slice made visible;
+    // flipping those means touching the COUNT(*) fast path that system
+    // relations depend on, a later slice.)
+    if matches!(func, AggFn::Avg) {
+        return None;
     }
     let mut acc: Option<i64> = None;
     for_each_record(db, rel, formats, |v| {
@@ -10225,7 +10291,7 @@ fn aggregate(
             (AggFn::Min, Some(a)) => a.min(*i),
             (AggFn::Max, Some(a)) => a.max(*i),
             (AggFn::Sum, Some(a)) => a + *i,
-            (AggFn::Count, _) => unreachable!(),
+            (AggFn::Count | AggFn::Avg, _) => unreachable!(),
         });
     });
     Some(acc)
@@ -10472,27 +10538,81 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Vec<Value> {
                 .and_then(|r| r.get(*fid))
                 .cloned()
                 .unwrap_or(Value::Null),
-            GItem::Agg(AggFn::Count, None) => Value::Int(rows.len() as i64),
-            GItem::Agg(AggFn::Count, Some(fid)) => Value::Int(
+            GItem::Agg(AggFn::Count, None, _) => Value::Int(rows.len() as i64),
+            GItem::Agg(AggFn::Count, Some(fid), false) => Value::Int(
                 rows.iter()
                     .filter(|r| matches!(r.get(*fid), Some(v) if !matches!(v, Value::Null)))
                     .count() as i64,
             ),
-            GItem::Agg(func, Some(fid)) => {
-                let mut acc: Option<i64> = None;
+            // COUNT(DISTINCT col): distinct NON-NULL values (probed:
+            // NULL is not a value). Groups are small; a linear seen-list
+            // with the exact comparison keeps numeric shapes aligned.
+            GItem::Agg(AggFn::Count, Some(fid), true) => {
+                let mut seen: Vec<&Value> = Vec::new();
                 for r in rows {
-                    let Some(Value::Int(i)) = r.get(*fid) else { continue };
-                    acc = Some(match (func, acc) {
-                        (_, None) => *i,
-                        (AggFn::Min, Some(a)) => a.min(*i),
-                        (AggFn::Max, Some(a)) => a.max(*i),
-                        (AggFn::Sum, Some(a)) => a + *i,
-                        (AggFn::Count, _) => unreachable!(),
+                    let Some(v) = r.get(*fid) else { continue };
+                    if matches!(v, Value::Null) {
+                        continue;
+                    }
+                    let dup = seen.iter().any(|s| {
+                        num_cmp(s, v)
+                            .unwrap_or_else(|| value_cmp(s, v))
+                            == std::cmp::Ordering::Equal
+                    });
+                    if !dup {
+                        seen.push(v);
+                    }
+                }
+                Value::Int(seen.len() as i64)
+            }
+            // MIN/MAX keep the winning VALUE - one comparison rule for
+            // every comparable kind (exact numeric alignment, trailing-
+            // blank-insensitive text, temporal order)
+            GItem::Agg(func @ (AggFn::Min | AggFn::Max), Some(fid), _) => {
+                let mut best: Option<&Value> = None;
+                for r in rows {
+                    let Some(v) = r.get(*fid) else { continue };
+                    if matches!(v, Value::Null) {
+                        continue;
+                    }
+                    best = Some(match best {
+                        None => v,
+                        Some(b) => {
+                            let ord =
+                                num_cmp(b, v).unwrap_or_else(|| value_cmp(b, v));
+                            let keep_b = if matches!(func, AggFn::Min) {
+                                ord != std::cmp::Ordering::Greater
+                            } else {
+                                ord != std::cmp::Ordering::Less
+                            };
+                            if keep_b { b } else { v }
+                        }
                     });
                 }
-                acc.map_or(Value::Null, Value::Int)
+                best.cloned().unwrap_or(Value::Null)
             }
-            GItem::Agg(_, None) => Value::Null, // MIN/MAX/SUM(*): rejected at plan
+            // SUM and AVG fold exact numerics wide at the column's
+            // scale; AVG divides by the non-NULL count truncating
+            // toward zero (probed) - NULL over an empty input
+            GItem::Agg(func @ (AggFn::Sum | AggFn::Avg), Some(fid), _) => {
+                let (mut sum, mut scale, mut n) = (0i128, None::<i8>, 0i64);
+                for r in rows {
+                    let Some(v) = r.get(*fid) else { continue };
+                    let Some((raw, sc)) = numeric_parts(v) else { continue };
+                    // one column, one scale - the first value pins it
+                    scale.get_or_insert(sc);
+                    sum = sum.saturating_add(raw);
+                    n += 1;
+                }
+                if n == 0 {
+                    Value::Null
+                } else if matches!(func, AggFn::Sum) {
+                    scaled_value(sum, scale.unwrap_or(0))
+                } else {
+                    scaled_value(sum / n as i128, scale.unwrap_or(0))
+                }
+            }
+            GItem::Agg(..) => Value::Null, // MIN/MAX/SUM(*): rejected at plan
         })
         .collect()
 }
@@ -14497,33 +14617,50 @@ fn split_query(
 /// `MIN|MAX|SUM(col)` (spacing-tolerant). None if it is not an aggregate
 /// or is malformed (`MIN(*)`).
 fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
-    let compact: String = item.chars().filter(|c| !c.is_whitespace()).collect();
-    let cu = compact.to_ascii_uppercase();
-    for (kw, func) in [
-        ("COUNT(", AggFn::Count),
-        ("MIN(", AggFn::Min),
-        ("MAX(", AggFn::Max),
-        ("SUM(", AggFn::Sum),
-    ] {
-        if cu.starts_with(kw) && cu.ends_with(')') {
-            let arg = &compact[kw.len()..compact.len() - 1]; // original case
-            let target = if arg == "*" {
-                // only COUNT accepts *
-                if !matches!(func, AggFn::Count) {
-                    return None;
-                }
-                AggTarget::Star
-            } else {
-                let name = arg.trim_matches('"');
-                if !ident_ok(name) {
-                    return None;
-                }
-                AggTarget::Col(name.to_string())
-            };
-            return Some((func, target));
-        }
+    let t = item.trim();
+    let open = t.find('(')?;
+    if !t.ends_with(')') {
+        return None;
     }
-    None
+    let func = match t[..open].trim().to_ascii_uppercase().as_str() {
+        "COUNT" => AggFn::Count,
+        "MIN" => AggFn::Min,
+        "MAX" => AggFn::Max,
+        "SUM" => AggFn::Sum,
+        "AVG" => AggFn::Avg,
+        _ => return None,
+    };
+    let arg = t[open + 1..t.len() - 1].trim();
+    // COUNT(DISTINCT col) - the keyword must stand as its own word
+    if let Some(rest) = arg
+        .get(..8)
+        .filter(|w| w.eq_ignore_ascii_case("DISTINCT"))
+        .and(arg.get(8..))
+        .filter(|r| r.starts_with(char::is_whitespace))
+    {
+        if !matches!(func, AggFn::Count) {
+            return None; // SUM/AVG/MIN/MAX DISTINCT: not answered
+        }
+        let name = rest.trim().trim_matches('"');
+        if !ident_ok(name) {
+            return None;
+        }
+        return Some((func, AggTarget::Distinct(name.to_string())));
+    }
+    let target = if arg == "*" {
+        // only COUNT accepts *
+        if !matches!(func, AggFn::Count) {
+            return None;
+        }
+        AggTarget::Star
+    } else {
+        let name = arg.trim_matches('"');
+        if !ident_ok(name) {
+            return None;
+        }
+        AggTarget::Col(name.to_string())
+    };
+    Some((func, target))
 }
 
 /// Parse the projection: `*`, or a comma-separated list where each item
@@ -14919,7 +15056,7 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                 let upper = word.to_ascii_uppercase();
                 // an aggregate name followed by `(...)` lexes as one
                 // aggregate-call token (spacing-tolerant, no nesting)
-                if matches!(upper.as_str(), "COUNT" | "MIN" | "MAX" | "SUM") {
+                if matches!(upper.as_str(), "COUNT" | "MIN" | "MAX" | "SUM" | "AVG") {
                     let mut j = i;
                     while j < b.len() && b[j].is_ascii_whitespace() {
                         j += 1;
@@ -16561,9 +16698,9 @@ fn resolve_having(
                     (idx, kind)
                 }
                 RawLhs::Agg(func, target) => {
-                    let fid = match target {
-                        AggTarget::Star => None, // COUNT(*) - parse guarantees Count
-                        AggTarget::Col(name) => {
+                    let (fid, distinct) = match target {
+                        AggTarget::Star => (None, false), // COUNT(*) - parse guarantees Count
+                        AggTarget::Col(name) | AggTarget::Distinct(name) => {
                             let rc =
                                 columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
                             let fid = rc.field_id as usize;
@@ -16571,20 +16708,30 @@ fn resolve_having(
                             if is_computed_fid(descs, fid) {
                                 return None;
                             }
-                            // MIN/MAX/SUM only over integers (COUNT counts any)
+                            // a HAVING comparison term is integer-typed:
+                            // MIN/MAX/SUM/AVG here keep the integer-only
+                            // guard (COUNT counts any column); the
+                            // non-integer aggregate kinds in HAVING are
+                            // a later slice - refusal, not a wrong row
                             if !matches!(func, AggFn::Count)
                                 && !matches!(col_kind(descs.get(fid)?)?, ColKind::Int)
                             {
                                 return None;
                             }
-                            Some(fid)
+                            (Some(fid), matches!(target, AggTarget::Distinct(_)))
                         }
                     };
+                    if distinct && !matches!(func, AggFn::Count) {
+                        return None;
+                    }
                     let idx = gitems
                         .iter()
-                        .position(|gi| matches!(gi, GItem::Agg(f, t) if f == func && *t == fid))
+                        .position(|gi| matches!(
+                            gi,
+                            GItem::Agg(f, t, dq) if f == func && *t == fid && *dq == distinct
+                        ))
                         .unwrap_or_else(|| {
-                            gitems.push(GItem::Agg(*func, fid));
+                            gitems.push(GItem::Agg(*func, fid, distinct));
                             gitems.len() - 1
                         });
                     (idx, ColKind::Int)
@@ -19628,11 +19775,11 @@ mod tests {
         ];
         let gitems = vec![
             GItem::Key(0),
-            GItem::Agg(AggFn::Count, None),
-            GItem::Agg(AggFn::Count, Some(1)),
-            GItem::Agg(AggFn::Min, Some(1)),
-            GItem::Agg(AggFn::Max, Some(1)),
-            GItem::Agg(AggFn::Sum, Some(1)),
+            GItem::Agg(AggFn::Count, None, false),
+            GItem::Agg(AggFn::Count, Some(1), false),
+            GItem::Agg(AggFn::Min, Some(1), false),
+            GItem::Agg(AggFn::Max, Some(1), false),
+            GItem::Agg(AggFn::Sum, Some(1), false),
         ];
         assert_eq!(
             compute_group(&rows, &gitems),
@@ -19857,14 +20004,14 @@ mod tests {
         let descs = vec![d(0), d(dtype::VARYING), d(dtype::LONG), d(0), d(0), d(dtype::INT64)];
         let key_fids = vec![2usize];
         // select list: DEPT_ID, COUNT(*)
-        let mut gitems = vec![GItem::Key(2), GItem::Agg(AggFn::Count, None)];
+        let mut gitems = vec![GItem::Key(2), GItem::Agg(AggFn::Count, None, false)];
 
         // COUNT(*) resolves to the EXISTING item 1; SUM(SALARY) and the
         // grouped key DEPT_ID... COUNT(*) again must not duplicate
         let raw = parse_predicate(&tokenize("COUNT(*) > 3 AND SUM(SALARY) > 100 OR DEPT_ID IS NULL").unwrap(), &mut 0).unwrap();
         let p = resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).unwrap();
         assert_eq!(gitems.len(), 3); // one hidden item appended: SUM(SALARY)
-        assert!(matches!(gitems[2], GItem::Agg(AggFn::Sum, Some(5))));
+        assert!(matches!(gitems[2], GItem::Agg(AggFn::Sum, Some(5), false)));
         // output rows: [key, count, hidden sum]
         assert!(p.matches(&[Value::Int(1), Value::Int(4), Value::Int(200)]));
         assert!(!p.matches(&[Value::Int(1), Value::Int(4), Value::Int(50)]));
@@ -20818,6 +20965,107 @@ mod tests {
         assert!(matches!(ev("ABS(A) * 2"), Value::Int(14)));
         txt("IIF(CHAR_LENGTH(NAME) > 3, 'long', 'short')", "long");
         txt("COALESCE(SUBSTRING(NAME FROM 99), 'gone')", "");
+    }
+
+    #[test]
+    fn aggregates_beyond_integers() {
+        // rows: (G, A int, N NUMERIC(9,2), S text, D date) - the same
+        // shapes the serve-real-aggfn gate probes against the engine
+        let day = |y, m, d| days_of_civil(y, m, d);
+        let rows: Vec<Vec<Value>> = vec![
+            vec![Value::Int(1), Value::Int(1), Value::Scaled(1250, -2),
+                 Value::Text("pear".into()), Value::Date(day(2024, 1, 15))],
+            vec![Value::Int(1), Value::Int(2), Value::Scaled(125, -2),
+                 Value::Text("Apple".into()), Value::Date(day(1999, 6, 1))],
+            vec![Value::Int(2), Value::Int(10), Value::Scaled(-300, -2),
+                 Value::Text("fig".into()), Value::Null],
+            vec![Value::Int(2), Value::Null, Value::Null, Value::Null,
+                 Value::Date(day(2024, 1, 15))],
+            vec![Value::Null, Value::Int(7), Value::Scaled(5, -2),
+                 Value::Text("apple".into()), Value::Date(day(1858, 11, 17))],
+        ];
+        let one = |gi: GItem| -> Value {
+            compute_group(&rows, &[gi]).pop().unwrap()
+        };
+        // AVG over ints: SUM / COUNT truncating toward zero (probed:
+        // 20/4 = 5); over scaled numerics at the column scale
+        assert!(matches!(one(GItem::Agg(AggFn::Avg, Some(1), false)), Value::Int(5)));
+        assert!(matches!(
+            one(GItem::Agg(AggFn::Avg, Some(2), false)),
+            Value::Scaled(270, -2) // 10.80 / 4 = 2.70
+        ));
+        // truncation is TOWARD ZERO: (-3.00 + 0.05)/2 = -1.475 -> -1.47
+        let neg: Vec<Vec<Value>> = vec![
+            vec![Value::Scaled(-300, -2)],
+            vec![Value::Scaled(5, -2)],
+        ];
+        assert!(matches!(
+            compute_group(&neg, &[GItem::Agg(AggFn::Avg, Some(0), false)]).pop().unwrap(),
+            Value::Scaled(-147, -2)
+        ));
+        // SUM keeps the scale; MIN/MAX keep the winning VALUE for text
+        // (byte order: 'Apple' < 'apple') and dates
+        assert!(matches!(one(GItem::Agg(AggFn::Sum, Some(2), false)), Value::Scaled(1080, -2)));
+        assert!(matches!(one(GItem::Agg(AggFn::Min, Some(2), false)), Value::Scaled(-300, -2)));
+        assert!(matches!(one(GItem::Agg(AggFn::Max, Some(2), false)), Value::Scaled(1250, -2)));
+        assert!(matches!(
+            one(GItem::Agg(AggFn::Min, Some(3), false)),
+            Value::Text(ref t) if t == "Apple"
+        ));
+        assert!(matches!(
+            one(GItem::Agg(AggFn::Max, Some(3), false)),
+            Value::Text(ref t) if t == "pear"
+        ));
+        assert!(matches!(
+            one(GItem::Agg(AggFn::Min, Some(4), false)),
+            Value::Date(d) if d == day(1858, 11, 17)
+        ));
+        assert!(matches!(
+            one(GItem::Agg(AggFn::Max, Some(4), false)),
+            Value::Date(d) if d == day(2024, 1, 15)
+        ));
+        // COUNT(DISTINCT col): distinct non-NULL values - G has 1,1,2,2,NULL
+        assert!(matches!(one(GItem::Agg(AggFn::Count, Some(0), true)), Value::Int(2)));
+        // ...and DISTINCT over text distinguishes 'Apple' from 'apple'
+        assert!(matches!(one(GItem::Agg(AggFn::Count, Some(3), true)), Value::Int(4)));
+        // empty and all-NULL inputs are NULL for the folds
+        assert!(matches!(
+            compute_group(&[], &[GItem::Agg(AggFn::Avg, Some(1), false)]).pop().unwrap(),
+            Value::Null
+        ));
+        let nulls: Vec<Vec<Value>> = vec![vec![Value::Null], vec![Value::Null]];
+        for f in [AggFn::Min, AggFn::Max, AggFn::Sum, AggFn::Avg] {
+            assert!(matches!(
+                compute_group(&nulls, &[GItem::Agg(f, Some(0), false)]).pop().unwrap(),
+                Value::Null
+            ));
+        }
+        // ...while COUNT over them is 0, and COUNT(*) counts rows
+        assert!(matches!(
+            compute_group(&nulls, &[GItem::Agg(AggFn::Count, Some(0), false)]).pop().unwrap(),
+            Value::Int(0)
+        ));
+        assert!(matches!(
+            compute_group(&nulls, &[GItem::Agg(AggFn::Count, None, false)]).pop().unwrap(),
+            Value::Int(2)
+        ));
+
+        // the parser: AVG joins the family, DISTINCT only under COUNT,
+        // and the keyword must stand as its own word
+        assert!(matches!(parse_agg_item("AVG(N)"), Some((AggFn::Avg, AggTarget::Col(c))) if c == "N"));
+        assert!(matches!(
+            parse_agg_item("COUNT(DISTINCT G)"),
+            Some((AggFn::Count, AggTarget::Distinct(c))) if c == "G"
+        ));
+        assert!(matches!(
+            parse_agg_item("count( distinct  g )"),
+            Some((AggFn::Count, AggTarget::Distinct(c))) if c == "g"
+        ));
+        assert!(parse_agg_item("SUM(DISTINCT A)").is_none());
+        assert!(parse_agg_item("COUNT(DISTINCTG)").is_none() ||
+                matches!(parse_agg_item("COUNT(DISTINCTG)"),
+                         Some((AggFn::Count, AggTarget::Col(c))) if c == "DISTINCTG"));
+        assert!(parse_agg_item("AVG(*)").is_none());
     }
 
     #[test]

@@ -4113,6 +4113,32 @@ checks are day-safe only (`CURRENT_DATE`, `EXTRACT(YEAR FROM ...)`,
 and describes proven over zero-row results so nothing races the
 clock).
 
+### The aggregate surface beyond integers (`qa/serve-real-aggfn.sh`, 36 checks)
+
+AVG, MIN/MAX over text and temporal columns, SUM/AVG over scaled
+numerics, COUNT(DISTINCT col) — in lone aggregates, under WHERE (the
+function and EXTRACT filters compose), in GROUP BY buckets with NULL
+keys, and in HAVING including hidden AVG items. The probed laws: AVG
+is SUM / COUNT-of-non-NULLs with the division TRUNCATING TOWARD ZERO
+at the operand's scale (AVG of 1,2 is 1; -2.95 over two rows is
+-1.47, where floor would say -1.48 — the teeth pin both to values);
+SUM/AVG over NUMERIC(p,s) announce the engine's NUMERIC(18,s)
+widening; MIN/MAX keep the COLUMN's own type and wire form; every
+fold skips NULLs and answers NULL over an empty or all-NULL input
+(COUNT answers 0); COUNT(DISTINCT) counts distinct NON-NULL values
+under the same exact equality the predicates use.
+
+Two design notes the slice surfaced. A group's SUM accumulates wide,
+and a result past the announced BIGINT now RAISES at emit on the
+plain-output path too — the encoder would otherwise have written zero
+bytes for a value shape it did not know. And the lone-aggregate fast
+path (which computes COUNT/MIN/MAX/SUM over integers at prepare, and
+is what COUNT(*) on system relations depends on) headers its column
+CONSTANT where the engine names the function — a standing difference
+this gate's header checks made visible; AVG therefore routes through
+the group machinery, which describes by function name, and the fast
+path's header stays a named later slice.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
@@ -4699,6 +4725,12 @@ FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
 # conditionals and WHERE. Builds its own scratch database.
 FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     bash /path/to/fire-crab/qa/serve-real-extract.sh 3050
+
+# the aggregate surface: AVG (truncating toward zero), MIN/MAX over
+# text/temporal, SUM/AVG over scaled numerics, COUNT(DISTINCT) - lone,
+# WHERE-filtered, grouped, and in HAVING. Builds its own scratch database.
+FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    bash /path/to/fire-crab/qa/serve-real-aggfn.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on

@@ -13,6 +13,32 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — the aggregate surface beyond integers
+
+### Converted
+- **`AVG`** (SUM/COUNT with truncating-toward-zero division at the
+  operand's scale — probed: AVG(1,2)=1, AVG(-3.00, 0.05)=-1.47),
+  **MIN/MAX over text and temporal columns** (the column's own type and
+  wire form on the wire), **SUM/AVG over scaled numerics** (the
+  engine's NUMERIC(18,s) widening), and **`COUNT(DISTINCT col)`**
+  (distinct non-NULLs, compared with the predicates' exact equality).
+  All of it in lone aggregates, WHERE-filtered, GROUP BY buckets and
+  HAVING (including hidden AVG items). Gate: `qa/serve-real-aggfn.sh`,
+  36 checks.
+
+### Fixed
+- A value wider than its announced wire form now RAISES at emit on the
+  plain-output path too (a group's SUM spilling past BIGINT would have
+  encoded zero bytes).
+
+### Guarded
+- `SUM/AVG/MIN/MAX(DISTINCT ...)`, `AVG` over text, `SUM` over dates
+  refuse at prepare. The lone COUNT/MIN/MAX/SUM fast path still headers
+  its column `CONSTANT` where the engine names the function — made
+  visible by this slice's header checks, kept for now (the COUNT(*)
+  fast path is what system relations depend on), AVG routes through
+  the group machinery and headers correctly.
+
 ## 2026-07-28 — the temporal expression surface
 
 ### Converted

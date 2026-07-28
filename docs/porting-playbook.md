@@ -147,6 +147,32 @@ them.
     EXTRACT(SECOND)      = units mod 600000 @ scale -4     # 12.3456
     EXTRACT(MILLISECOND) = units mod 10000  @ scale -1     # 345.6
 
+### Aggregates (one fold per function, NULL rules first)
+
+    # every fold SKIPS NULLs; empty/all-NULL input -> NULL
+    # (COUNT -> 0; COUNT(*) counts rows regardless)
+    COUNT(col):          count of non-NULL values
+    COUNT(DISTINCT col): distinct non-NULL values - compare with the
+                         SAME equality the predicates use (exact
+                         numeric alignment, pad-trimmed text), never
+                         a hash of the raw bytes
+    MIN/MAX(col):        keep the winning VALUE under the one shared
+                         comparison; result type = the COLUMN's type
+    SUM(col):            fold numeric raws WIDE (128-bit) at the
+                         column's scale; announce the engine's
+                         NUMERIC(18, scale) widening
+    AVG(col):            SUM and non-NULL count in one pass, then
+                         divide TRUNCATING TOWARD ZERO at the
+                         operand's scale (ints: AVG(1,2) = 1;
+                         negatives: -2.95/2 = -1.47, not -1.48)
+
+    # GROUP BY: bucket rows by key values (NULL keys share a bucket),
+    # run every fold per bucket; HAVING filters the COMPUTED output
+    # rows and may reference aggregates NOT in the select list -
+    # append them as hidden outputs, computed but never emitted.
+    # A value wider than the announced wire form must RAISE at emit,
+    # never encode truncated bytes.
+
 ### SQL LIKE (character-based, backtracking)
 
     match(value_chars, pattern_chars, escape?):

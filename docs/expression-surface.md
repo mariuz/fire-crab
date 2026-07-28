@@ -13,7 +13,8 @@ numeric scale rules), `qa/serve-real-conditional.sh` (COALESCE/NULLIF/
 IIF), `qa/serve-real-functions.sh` (the built-in scalar functions),
 `qa/serve-real-wherefn.sh` (function calls in WHERE),
 `qa/serve-real-case.sh` (CASE, and cross-branch typing),
-`qa/serve-real-extract.sh` (the temporal surface). Each check in
+`qa/serve-real-extract.sh` (the temporal surface),
+`qa/serve-real-aggfn.sh` (the aggregate surface). Each check in
 those gates runs identical SQL through fire-crab and `isql` against the
 same database file.
 
@@ -38,6 +39,8 @@ same database file.
 | `EXTRACT` parts and result types (SECOND = NUMERIC(9,4), MILLISECOND = NUMERIC(9,1)); a part invalid for the operand's kind fails at prepare (-105) | `src/jrd/ExprNodes.cpp` (`ExtractNode`), probed | `SysFn::Extract(ExtractPart)`, `ExtractPart::valid_for` |
 | civil-date math (MJD day 0 = 1858-11-17); WEEKDAY 0 = Sunday, YEARDAY 0-based, ISO 8601 week | `src/common/TimeStamp.cpp`, probed conventions | `civil_of`, `days_of_civil`, `weekday_of`, `iso_week_of` |
 | temporal literals `DATE '...'` / `TIME '...'` / `TIMESTAMP '...'`; the clock keywords fixed per statement | `parse.y`, `src/jrd/CurrentDateNode` et al. | `RawExpr::{DateLit, TimeLit, TsLit, CurrentDate, LocalTime, LocalTimestamp}` |
+| aggregate result types: AVG/SUM widen to NUMERIC(18,s) (BIGINT width at the operand scale), MIN/MAX keep the column's type, COUNT is BIGINT | `src/jrd/AggNodes.cpp` (`makeDesc`), probed | the `SelItem::Agg` arm of `plan_group` |
+| AVG = SUM/COUNT with TRUNCATING division toward zero; folds skip NULLs; empty/all-NULL input is NULL; COUNT(DISTINCT) counts distinct non-NULLs | `src/jrd/AggNodes.cpp` (`AvgAggNode::execute` et al.), probed | `compute_group`, `aggregate` |
 
 ## Laws probed against the live engine
 
@@ -105,6 +108,14 @@ usually a unit test too:
   executes right after preparing (isql does), divergent for
   prepare-once-execute-many; an accepted, documented difference.
   `CURRENT_TIME`/`CURRENT_TIMESTAMP` are TIME ZONE types and refuse.
+- **AVG divides truncating toward zero at the operand's scale.**
+  AVG over integers 1, 2 is 1; over NUMERIC(9,2) values summing -2.95
+  across two rows it is -1.47 (floor would say -1.48). SUM and AVG
+  over NUMERIC(p,s) announce the engine's NUMERIC(18,s) widening;
+  MIN/MAX keep the COLUMN's own type and wire form (a VARCHAR stays a
+  VARCHAR, a DATE a DATE). Every fold skips NULLs; an empty or
+  all-NULL input answers NULL (COUNT answers 0). `COUNT(DISTINCT col)`
+  counts distinct NON-NULL values - NULL is not a value.
 - **Text comparisons ignore trailing blanks; LIKE does not.** A
   comparison pad-trims both sides (CHAR vs VARCHAR equality); LIKE
   matches the STORED value, padding included — `CHAR(5) 'abc'` matches

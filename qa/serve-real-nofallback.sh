@@ -137,6 +137,9 @@ answers "SELECT SUBSTRING(S FROM 1 FOR 1) FROM T ORDER BY ID"
 answers "SELECT ID FROM T WHERE UPPER(S) = 'X' ORDER BY ID"
 answers "SELECT CASE WHEN A > 1 THEN 1 ELSE 0 END FROM T ORDER BY ID"
 answers "SELECT EXTRACT(YEAR FROM CURRENT_DATE) FROM T WHERE ID = 1"
+answers "SELECT AVG(A) FROM T"
+answers "SELECT COUNT(DISTINCT A) FROM T"
+answers "SELECT MIN(S) FROM T"
 
 # --- NOT supported: each must raise ------------------------------------
 # a view over a join (the view has a relation id but no records, so a
@@ -186,7 +189,7 @@ done
 # and a dropped connection is what libfbclient segfaults on. A refused
 # statement now fails at PREPARE, which is where the engine fails an
 # unsupported one, so the client gets a plain SQL error and carries on.
-out=$(printf 'SET HEADING OFF;\nSELECT AVG(A) FROM T;\nSELECT A FROM T ORDER BY ID;\nSELECT COUNT(*) FROM T;\n' |
+out=$(printf 'SET HEADING OFF;\nSELECT LIST(S) FROM T;\nSELECT A FROM T ORDER BY ID;\nSELECT COUNT(*) FROM T;\n' |
       "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1)
 flat=$(printf '%s' "$out" | tr -s ' \n' ' ')
 case "$flat" in
@@ -198,7 +201,7 @@ esac
 # the two statements AFTER the refusal must still have been answered
 # the values from the two statements AFTER the refusal must be there -
 # checked as a count of answered rows rather than a brittle glob
-after=$(printf 'SET HEADING OFF;\nSELECT AVG(A) FROM T;\nSELECT A FROM T WHERE A IS NOT NULL ORDER BY ID;\n' |
+after=$(printf 'SET HEADING OFF;\nSELECT LIST(S) FROM T;\nSELECT A FROM T WHERE A IS NOT NULL ORDER BY ID;\n' |
         "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 |
         grep -cE '^ *[0-9]+ *$')
 if [ "$after" -ge 2 ]; then
