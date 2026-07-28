@@ -314,6 +314,9 @@ mod blr {
     pub const SQLCODE_CODE: u8 = 0x01;
     /// WHEN SQLSTATE '<s>': handler code 8 + counted string (probed)
     pub const SQLSTATE_CODE: u8 = 0x08;
+    /// blr_dbkey + context byte - MERGE's matched test is
+    /// missing(dbkey(target)) on the left-joined row (probed)
+    pub const DBKEY: u8 = 0x16;
     pub const EQL: u8 = 0x2F;
     pub const NEQ: u8 = 0x30;
     pub const GTR: u8 = 0x31;
@@ -842,6 +845,13 @@ struct P<'a> {
     /// declared cursor names in declaration order (their numbers)
     cursors: Vec<String>,
     cursor_decls: Vec<CursorDecl>,
+    /// FOR SELECT ... AS CURSOR names in scope: (name, ctx, table) -
+    /// pushed around the DO body, targets for WHERE CURRENT OF
+    for_cursors: Vec<(String, u8, String)>,
+    /// while parsing a MERGE's ON/SET/VALUES: the (source, target)
+    /// stream indexes - the ONLY two streams qualified names may
+    /// bind to there, and bare column names refuse
+    merge_scope: Option<(usize, usize)>,
     /// context of stream index 0: 1 in view BLR, 0 in procedure
     /// bodies (probed - the FOR SELECT stream is context 0)
     base: u8,
@@ -877,6 +887,19 @@ impl<'a> P<'a> {
     /// through the catalog, which this catalog-free compiler refuses
     /// rather than guessing.
     fn field(&self, qualifier: Option<&str>, name: &str) -> Option<Val> {
+        // inside a MERGE's ON/SET/VALUES only the source and target
+        // streams are visible, and bare names refuse (catalog-free -
+        // the engine resolves them through column lists)
+        if let Some((si, ti)) = self.merge_scope {
+            let q = qualifier?;
+            let hit = |st: &Stream| {
+                st.alias.as_deref().map_or(st.name == q, |a| a == q)
+            };
+            let idx = [si, ti]
+                .into_iter()
+                .find(|&i| hit(&self.streams[i]))?;
+            return Some(Val::Field(idx as u8 + self.base, name.to_string()));
+        }
         let n_outer = self.outer.unwrap_or(self.streams.len());
         let ctx = match qualifier {
             Some(q) => {
@@ -1881,6 +1904,9 @@ fn is_keyword(w: &str) -> bool {
             | "OPEN"
             | "FETCH"
             | "CLOSE"
+            | "MERGE"
+            | "USING"
+            | "MATCHED"
     )
 }
 
@@ -2228,6 +2254,8 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
         domain_value: false,
         cursors: Vec::new(),
         cursor_decls: Vec::new(),
+        for_cursors: Vec::new(),
+        merge_scope: None,
     };
     // a top-level UNION restructures the whole statement: the union
     // node takes context 1 BEFORE any branch stream, so it must be
@@ -2673,6 +2701,8 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         domain_value: false,
         cursors: Vec::new(),
         cursor_decls: Vec::new(),
+        for_cursors: Vec::new(),
+        merge_scope: None,
     };
     if !(p.kw("CREATE") && p.kw("PROCEDURE")) {
         return None;
@@ -2771,260 +2801,11 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         }
         let name = name.clone();
         p.i += 1;
-        // DECLARE <name> CURSOR FOR (SELECT cols FROM tbl [alias]
-        // [WHERE] [GROUP BY] [ORDER BY]); - the rse's relation2 alias
-        // carries the CURSOR NAME; columns may be qualified by the
-        // table alias or name; aggregate selects (their columns
-        // AS-aliased - the engine demands a name) nest blr_aggregate
-        // and consume a SECOND context slot (all probed)
+        // DECLARE <name> CURSOR FOR (SELECT ...); - shared with
+        // trigger bodies (the numbering continues past OLD/NEW there)
         if p.kw("CURSOR") {
-            if !p.kw("FOR") || !matches!(p.t.get(p.i), Some(Tok::LParen)) {
-                return None;
-            }
-            p.i += 1;
-            if !p.kw("SELECT") {
-                return None;
-            }
-            // a select item: [qual.]col or COUNT(*)/COUNT/SUM/AVG/
-            // MIN/MAX([qual.]col), each with an optional traceless
-            // AS alias
-            enum RawItem {
-                Col(Option<String>, String),
-                Agg(u8, Option<(Option<String>, String)>),
-            }
-            let qual_name = |p: &mut P| -> Option<(Option<String>, String)> {
-                let Some(Tok::Ident(a)) = p.t.get(p.i) else {
-                    return None;
-                };
-                if is_keyword(a) {
-                    return None;
-                }
-                let a = a.clone();
-                p.i += 1;
-                if matches!(p.t.get(p.i), Some(Tok::Dot)) {
-                    p.i += 1;
-                    let Some(Tok::Ident(b)) = p.t.get(p.i) else {
-                        return None;
-                    };
-                    if is_keyword(b) {
-                        return None;
-                    }
-                    let b = b.clone();
-                    p.i += 1;
-                    Some((Some(a), b))
-                } else {
-                    Some((None, a))
-                }
-            };
-            let mut items: Vec<RawItem> = Vec::new();
-            loop {
-                let agg = match p.t.get(p.i) {
-                    Some(Tok::Ident(f))
-                        if matches!(
-                            f.as_str(),
-                            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
-                        ) && matches!(p.t.get(p.i + 1), Some(Tok::LParen)) =>
-                    {
-                        Some(f.clone())
-                    }
-                    _ => None,
-                };
-                if let Some(f) = agg {
-                    p.i += 2;
-                    // DISTINCT / expression arguments: unprobed
-                    let (verb, arg) = if f == "COUNT"
-                        && matches!(p.t.get(p.i), Some(Tok::Star))
-                    {
-                        p.i += 1;
-                        (blr::AGG_COUNT, None)
-                    } else {
-                        let a = qual_name(&mut p)?;
-                        let verb = match f.as_str() {
-                            "COUNT" => blr::AGG_COUNT2,
-                            "SUM" => blr::AGG_TOTAL,
-                            "AVG" => blr::AGG_AVERAGE,
-                            "MIN" => blr::AGG_MIN,
-                            _ => blr::AGG_MAX,
-                        };
-                        (verb, Some(a))
-                    };
-                    if !matches!(p.t.get(p.i), Some(Tok::RParen)) {
-                        return None;
-                    }
-                    p.i += 1;
-                    items.push(RawItem::Agg(verb, arg));
-                } else {
-                    let (q, n) = qual_name(&mut p)?;
-                    items.push(RawItem::Col(q, n));
-                }
-                // an AS alias names the derived column - traceless,
-                // but REQUIRED on an aggregate (the engine demands a
-                // column name for it)
-                if p.kw("AS") {
-                    let Some(Tok::Ident(a)) = p.t.get(p.i) else {
-                        return None;
-                    };
-                    if is_keyword(a) {
-                        return None;
-                    }
-                    p.i += 1;
-                } else if matches!(items.last(), Some(RawItem::Agg(..))) {
-                    return None;
-                }
-                match p.t.get(p.i)? {
-                    Tok::Comma => p.i += 1,
-                    _ => break,
-                }
-            }
-            if items.is_empty() || !p.kw("FROM") {
-                return None;
-            }
-            let Some(Tok::Ident(tbl)) = p.t.get(p.i) else {
-                return None;
-            };
-            if is_keyword(tbl) {
-                return None;
-            }
-            let tbl = tbl.clone();
-            p.i += 1;
-            let alias = match p.t.get(p.i) {
-                Some(Tok::Ident(a)) if !is_keyword(a) => {
-                    let a = a.clone();
-                    p.i += 1;
-                    Some(a)
-                }
-                _ => None,
-            };
-            p.streams.push(Stream {
-                name: tbl.clone(),
-                alias: alias.clone(),
-                derived: None,
-            });
-            let sidx = p.streams.len() - 1;
-            let ctx = sidx as u8 + p.base;
-            let aggregate = items
-                .iter()
-                .any(|it| matches!(it, RawItem::Agg(..)));
-            // the aggregate claims the NEXT context slot (probed:
-            // a second cursor's aggregate sat at ctx 2 over its
-            // stream's 1)
-            let agg = if aggregate {
-                p.streams.push(Stream {
-                    name: String::new(),
-                    alias: None,
-                    derived: None,
-                });
-                Some((p.streams.len() - 1) as u8 + p.base)
-            } else {
-                None
-            };
-            let resolve = |q: &Option<String>, n: &str| -> Option<Val> {
-                if let Some(q) = q {
-                    let hit = alias.as_deref().map_or(tbl == *q, |a| a == q);
-                    if !hit {
-                        return None;
-                    }
-                }
-                Some(Val::Field(ctx, n.to_string()))
-            };
-            let mut map: Vec<MapEntry> = Vec::new();
-            let mut group_keys: Vec<Val> = Vec::new();
-            let mut outs: Vec<Val> = Vec::new();
-            if let Some(agg_ctx) = agg {
-                // map slots in SELECT-LIST order: group keys as
-                // blr_map keys, aggregates as their verbs; outputs
-                // are bare fids on the aggregate context
-                for it in &items {
-                    match it {
-                        RawItem::Col(q, n) => {
-                            map.push(MapEntry::Key(resolve(q, n)?))
-                        }
-                        RawItem::Agg(verb, arg) => map.push(MapEntry::Agg(
-                            *verb,
-                            match arg {
-                                Some((q, n)) => Some(resolve(q, n)?),
-                                None => None,
-                            },
-                        )),
-                    }
-                    outs.push(Val::Fid(agg_ctx, (outs.len()) as u16));
-                }
-            } else {
-                for it in &items {
-                    let RawItem::Col(q, n) = it else {
-                        return None;
-                    };
-                    outs.push(resolve(q, n)?);
-                }
-            }
-            let saved = p.sub.replace(sidx);
-            let boolean = if p.kw("WHERE") {
-                Some(p.bool_or()?)
-            } else {
-                None
-            };
-            if p.kw("GROUP") {
-                if !aggregate || !p.kw("BY") {
-                    return None;
-                }
-                loop {
-                    let (q, n) = qual_name(&mut p)?;
-                    group_keys.push(resolve(&q, &n)?);
-                    if matches!(p.t.get(p.i), Some(Tok::Comma)) {
-                        p.i += 1;
-                    } else {
-                        break;
-                    }
-                }
-            }
-            let mut sort: Vec<(bool, Val)> = Vec::new();
-            if p.kw("ORDER") {
-                // over an aggregate: unprobed
-                if aggregate || !p.kw("BY") {
-                    return None;
-                }
-                loop {
-                    let (q, k) = qual_name(&mut p)?;
-                    let key = resolve(&q, &k)?;
-                    let descending = if p.kw("DESC") {
-                        true
-                    } else {
-                        let _ = p.kw("ASC");
-                        false
-                    };
-                    sort.push((descending, key));
-                    if matches!(p.t.get(p.i), Some(Tok::Comma)) {
-                        p.i += 1;
-                    } else {
-                        break;
-                    }
-                }
-            }
-            p.sub = saved;
-            if !matches!(p.t.get(p.i), Some(Tok::RParen)) {
-                return None;
-            }
-            p.i += 1;
-            if !matches!(p.t.get(p.i), Some(Tok::Semi)) {
-                return None;
-            }
-            p.i += 1;
-            let num = p.cursors.len() as u16;
             decl_seq.push(DeclItem::Cur(p.cursor_decls.len()));
-            p.cursors.push(name.clone());
-            p.cursor_decls.push(CursorDecl {
-                name,
-                num,
-                table: tbl,
-                alias,
-                ctx,
-                agg,
-                map,
-                group_keys,
-                outs,
-                boolean,
-                sort,
-            });
+            p.cursor_decl(name)?;
             continue;
         }
         let dsc = p.cast_target()?;
@@ -3203,6 +2984,24 @@ enum TrigStmt {
     /// FETCH c [INTO :v, ...]; - sub-verb 2 + the into-assignments
     /// (an INTO-less fetch carries an empty begin/end)
     CursorFetch(u16, Vec<(Val, u16)>),
+    /// MERGE INTO tgt USING src ON <bool>, one MATCHED branch
+    /// (UPDATE SET or DELETE) and/or one NOT MATCHED (INSERT): a
+    /// marks(1, 6)-stamped for-loop over a JOIN of source and target
+    /// - LEFT when the INSERT branch needs unmatched rows, INNER
+    /// otherwise - branching on missing(dbkey(target)) (probed)
+    Merge {
+        src: Stream,
+        src_ctx: u8,
+        tgt: Stream,
+        tgt_ctx: u8,
+        on: Bool,
+        /// WHEN MATCHED THEN UPDATE: the new-record ctx + SET pairs
+        upd: Option<(u8, Vec<(String, Val)>)>,
+        /// WHEN MATCHED THEN DELETE
+        del: bool,
+        /// WHEN NOT MATCHED THEN INSERT: store ctx, columns, values
+        ins: Option<(u8, Vec<String>, Vec<Val>)>,
+    },
     /// DELETE ... WHERE CURRENT OF c - blr_erase at the CURSOR's
     /// context, then marks(1, 1) - MARK_POSITIONED trails the erase
     /// where a DML loop's marks lead its rse (probed)
@@ -3255,6 +3054,11 @@ struct ForSel {
     label: Option<u8>,
     stream: Stream,
     ctx: u8,
+    /// FOR SELECT ... AS CURSOR <name>: the name rides the rse's
+    /// relation2 alias exactly like a DECLAREd cursor's, the
+    /// into-assign sources wrap in blr_derived_expr, and positioned
+    /// DML in the DO body may target it (probed)
+    cursor: Option<String>,
     aggregate: bool,
     map: Vec<MapEntry>,
     group_keys: Vec<Val>,
@@ -3453,6 +3257,117 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
             }
             out.push(blr::END);
         }
+        TrigStmt::Merge {
+            src,
+            src_ctx,
+            tgt,
+            tgt_ctx,
+            on,
+            upd,
+            del,
+            ins,
+        } => {
+            // one probed sentence: for(marks(1, MERGE|FOR_UPDATE),
+            // rse(join2(source, target, [left], ON), [branch-union
+            // boolean]), if(<matched test>, ...)). The rse boolean
+            // ORs the branch conditions - matched first - and is
+            // OMITTED for matched-only merges (their INNER join
+            // already filters); branch order in the SQL leaves no
+            // trace.
+            out.push(blr::FOR);
+            out.push(blr::MARKS);
+            out.push(1);
+            out.push(6);
+            out.push(blr::RSE);
+            out.push(1);
+            out.push(blr::JOIN);
+            out.push(2);
+            emit_stream(out, src, *src_ctx);
+            emit_stream(out, tgt, *tgt_ctx);
+            if ins.is_some() {
+                out.push(blr::JOIN_TYPE);
+                out.push(1);
+            }
+            out.push(blr::BOOLEAN);
+            emit_bool(out, on);
+            out.push(blr::END); // closes the join
+            let matched = upd.is_some() || *del;
+            let miss = |out: &mut Vec<u8>| {
+                out.push(blr::MISSING);
+                out.push(blr::DBKEY);
+                out.push(*tgt_ctx);
+            };
+            if ins.is_some() {
+                out.push(blr::BOOLEAN);
+                if matched {
+                    out.push(blr::OR);
+                    out.push(blr::NOT);
+                    miss(out);
+                }
+                miss(out);
+            }
+            out.push(blr::END); // closes the rse
+            out.push(blr::IF);
+            if ins.is_some() {
+                miss(out);
+            } else {
+                out.push(blr::NOT);
+                miss(out);
+            }
+            let emit_matched = |out: &mut Vec<u8>| {
+                if let Some((new_ctx, sets)) = upd {
+                    out.push(blr::MODIFY);
+                    out.push(*tgt_ctx);
+                    out.push(*new_ctx);
+                    out.push(blr::MARKS);
+                    out.push(1);
+                    out.push(2);
+                    out.push(blr::BEGIN);
+                    for (col, v) in sets {
+                        out.push(blr::ASSIGNMENT);
+                        emit_val(out, v);
+                        out.push(blr::FIELD);
+                        out.push(*new_ctx);
+                        out.push(col.len() as u8);
+                        out.extend_from_slice(col.as_bytes());
+                    }
+                    out.push(blr::END);
+                } else {
+                    out.push(blr::ERASE);
+                    out.push(*tgt_ctx);
+                    out.push(blr::MARKS);
+                    out.push(1);
+                    out.push(2);
+                }
+            };
+            match ins {
+                Some((store_ctx, cols, vals)) => {
+                    // the store re-emits the TARGET stream - alias
+                    // and all - at its own context (probed)
+                    out.push(blr::STORE);
+                    emit_stream(out, tgt, *store_ctx);
+                    out.push(blr::BEGIN);
+                    for (c, v) in cols.iter().zip(vals) {
+                        out.push(blr::ASSIGNMENT);
+                        emit_val(out, v);
+                        out.push(blr::FIELD);
+                        out.push(*store_ctx);
+                        out.push(c.len() as u8);
+                        out.extend_from_slice(c.as_bytes());
+                    }
+                    out.push(blr::END);
+                    if matched {
+                        emit_matched(out);
+                    } else {
+                        out.push(blr::END); // the if's missing else
+                    }
+                }
+                None => {
+                    emit_matched(out);
+                    out.push(blr::END); // the if's missing else
+                }
+            }
+        }
         TrigStmt::PosDelete(ctx) => {
             out.push(blr::ERASE);
             out.push(*ctx);
@@ -3589,6 +3504,21 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                     out.push(blr::BOOLEAN);
                     emit_bool(out, h);
                 }
+            } else if let Some(cn) = &f.cursor {
+                // AS CURSOR: the name rides the relation2 alias
+                // exactly like a DECLAREd cursor's (probed)
+                out.push(blr::RELATION2);
+                out.push(f.stream.name.len() as u8);
+                out.extend_from_slice(f.stream.name.as_bytes());
+                let alias =
+                    format!("\"{}\" \"PUBLIC\".\"{}\"", cn, f.stream.name);
+                out.push(alias.len() as u8);
+                out.extend_from_slice(alias.as_bytes());
+                out.push(f.ctx);
+                if let Some(b) = &f.boolean {
+                    out.push(blr::BOOLEAN);
+                    emit_bool(out, b);
+                }
             } else {
                 emit_stream(out, &f.stream, f.ctx);
                 if let Some(v) = &f.first {
@@ -3618,11 +3548,19 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
             }
             out.push(blr::END);
             out.push(blr::BEGIN);
-            for (ci, v) in f.col_vals.iter().enumerate() {
+            // an INTO-less AS CURSOR loop has no assignments at all
+            for (v, vi) in f.col_vals.iter().zip(&f.into) {
                 out.push(blr::ASSIGNMENT);
+                // an AS CURSOR loop wraps its into-assign sources in
+                // blr_derived_expr, like a DECLAREd cursor's outputs
+                if f.cursor.is_some() {
+                    out.push(blr::DERIVED_EXPR);
+                    out.push(1);
+                    out.push(f.ctx);
+                }
                 emit_val(out, v);
                 out.push(blr::VARIABLE);
-                out.extend_from_slice(&f.into[ci].to_le_bytes());
+                out.extend_from_slice(&vi.to_le_bytes());
             }
             if let Some(d) = &f.do_stmt {
                 emit_trig_stmt(out, d);
@@ -3909,30 +3847,55 @@ impl<'a> P<'a> {
                 })
                 .collect::<Option<Vec<_>>>()?
         };
-        if !self.kw("INTO") {
-            return None;
-        }
         // INTO :v, ... - output parameters and locals are ONE
-        // variable space (outputs first)
+        // variable space (outputs first); with AS CURSOR the INTO
+        // clause is OPTIONAL (probed both ways)
         let mut into: Vec<u16> = Vec::new();
-        loop {
-            if !matches!(self.t.get(self.i), Some(Tok::Colon)) {
+        if self.kw("INTO") {
+            loop {
+                if !matches!(self.t.get(self.i), Some(Tok::Colon)) {
+                    return None;
+                }
+                self.i += 1;
+                let Some(Tok::Ident(name)) = self.t.get(self.i) else {
+                    return None;
+                };
+                let vi = self.local_vars.iter().position(|n| n == name)?;
+                self.i += 1;
+                into.push(vi as u16);
+                if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                    self.i += 1;
+                } else {
+                    break;
+                }
+            }
+            if into.len() != cols_n {
                 return None;
             }
-            self.i += 1;
-            let Some(Tok::Ident(name)) = self.t.get(self.i) else {
+        }
+        // AS CURSOR <name> - looping form only; the shapes beyond
+        // the probes (aggregates, FIRST/SKIP, ORDER BY) refuse
+        let cursor = if self.kw("AS") {
+            if !self.kw("CURSOR") || !is_for {
+                return None;
+            }
+            if aggregate || first.is_some() || skip.is_some() || !sort.is_empty()
+            {
+                return None;
+            }
+            let Some(Tok::Ident(cn)) = self.t.get(self.i) else {
                 return None;
             };
-            let vi = self.local_vars.iter().position(|n| n == name)?;
-            self.i += 1;
-            into.push(vi as u16);
-            if matches!(self.t.get(self.i), Some(Tok::Comma)) {
-                self.i += 1;
-            } else {
-                break;
+            if is_keyword(cn) {
+                return None;
             }
-        }
-        if into.len() != cols_n {
+            let cn = cn.clone();
+            self.i += 1;
+            Some(cn)
+        } else {
+            None
+        };
+        if cursor.is_none() && into.is_empty() {
             return None;
         }
         let (label, do_stmt) = if is_for {
@@ -3941,8 +3904,19 @@ impl<'a> P<'a> {
             if !self.kw("DO") {
                 return None;
             }
-            (Some(label), Some(Box::new(self.trig_stmt()?)))
+            if let Some(cn) = &cursor {
+                self.for_cursors
+                    .push((cn.clone(), ctx, stream.name.clone()));
+            }
+            let body = self.trig_stmt()?;
+            if cursor.is_some() {
+                self.for_cursors.pop();
+            }
+            (Some(label), Some(Box::new(body)))
         } else {
+            if cursor.is_some() {
+                return None; // AS CURSOR on the singular form
+            }
             if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
                 return None;
             }
@@ -3954,6 +3928,7 @@ impl<'a> P<'a> {
             label,
             stream,
             ctx,
+            cursor,
             aggregate,
             map,
             group_keys,
@@ -3966,6 +3941,282 @@ impl<'a> P<'a> {
             into,
             do_stmt,
         })))
+    }
+
+    /// A cursor WHERE CURRENT OF may target: a DECLAREd cursor
+    /// (plain - the engine refuses positioned DML on aggregates) or
+    /// an in-scope FOR SELECT ... AS CURSOR loop. Answers the
+    /// cursor's context and table.
+    fn find_pos_cursor(&self, name: &str) -> Option<(u8, String)> {
+        if let Some(d) = self.cursor_decls.iter().find(|d| d.name == name) {
+            if d.agg.is_some() {
+                return None;
+            }
+            return Some((d.ctx, d.table.clone()));
+        }
+        // innermost scope first
+        self.for_cursors
+            .iter()
+            .rev()
+            .find(|(n, ..)| n == name)
+            .map(|(_, ctx, tbl)| (*ctx, tbl.clone()))
+    }
+
+    /// DECLARE <name> CURSOR FOR (SELECT cols FROM tbl [alias]
+    /// [WHERE] [GROUP BY] [ORDER BY]); - self.i past the CURSOR
+    /// keyword. The rse's relation2 alias carries the CURSOR NAME;
+    /// columns may be qualified by the table alias or name; aggregate
+    /// selects (their columns AS-aliased - the engine demands a name)
+    /// nest blr_aggregate and consume a SECOND context slot (all
+    /// probed). Shared by procedure and trigger declaration sections.
+    fn cursor_decl(&mut self, name: String) -> Option<()> {
+        if !self.kw("FOR") || !matches!(self.t.get(self.i), Some(Tok::LParen)) {
+            return None;
+        }
+        self.i += 1;
+        if !self.kw("SELECT") {
+            return None;
+        }
+        // a select item: [qual.]col or COUNT(*)/COUNT/SUM/AVG/
+        // MIN/MAX([qual.]col), each with an optional traceless
+        // AS alias
+        enum RawItem {
+            Col(Option<String>, String),
+            Agg(u8, Option<(Option<String>, String)>),
+        }
+        let qual_name = |p: &mut P| -> Option<(Option<String>, String)> {
+            let Some(Tok::Ident(a)) = p.t.get(p.i) else {
+                return None;
+            };
+            if is_keyword(a) {
+                return None;
+            }
+            let a = a.clone();
+            p.i += 1;
+            if matches!(p.t.get(p.i), Some(Tok::Dot)) {
+                p.i += 1;
+                let Some(Tok::Ident(b)) = p.t.get(p.i) else {
+                    return None;
+                };
+                if is_keyword(b) {
+                    return None;
+                }
+                let b = b.clone();
+                p.i += 1;
+                Some((Some(a), b))
+            } else {
+                Some((None, a))
+            }
+        };
+        let mut items: Vec<RawItem> = Vec::new();
+        loop {
+            let agg = match self.t.get(self.i) {
+                Some(Tok::Ident(f))
+                    if matches!(
+                        f.as_str(),
+                        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+                    ) && matches!(self.t.get(self.i + 1), Some(Tok::LParen)) =>
+                {
+                    Some(f.clone())
+                }
+                _ => None,
+            };
+            if let Some(f) = agg {
+                self.i += 2;
+                // DISTINCT / expression arguments: unprobed
+                let (verb, arg) = if f == "COUNT"
+                    && matches!(self.t.get(self.i), Some(Tok::Star))
+                {
+                    self.i += 1;
+                    (blr::AGG_COUNT, None)
+                } else {
+                    let a = qual_name(self)?;
+                    let verb = match f.as_str() {
+                        "COUNT" => blr::AGG_COUNT2,
+                        "SUM" => blr::AGG_TOTAL,
+                        "AVG" => blr::AGG_AVERAGE,
+                        "MIN" => blr::AGG_MIN,
+                        _ => blr::AGG_MAX,
+                    };
+                    (verb, Some(a))
+                };
+                if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                    return None;
+                }
+                self.i += 1;
+                items.push(RawItem::Agg(verb, arg));
+            } else {
+                let (q, n) = qual_name(self)?;
+                items.push(RawItem::Col(q, n));
+            }
+            // an AS alias names the derived column - traceless,
+            // but REQUIRED on an aggregate (the engine demands a
+            // column name for it)
+            if self.kw("AS") {
+                let Some(Tok::Ident(a)) = self.t.get(self.i) else {
+                    return None;
+                };
+                if is_keyword(a) {
+                    return None;
+                }
+                self.i += 1;
+            } else if matches!(items.last(), Some(RawItem::Agg(..))) {
+                return None;
+            }
+            match self.t.get(self.i)? {
+                Tok::Comma => self.i += 1,
+                _ => break,
+            }
+        }
+        if items.is_empty() || !self.kw("FROM") {
+            return None;
+        }
+        let Some(Tok::Ident(tbl)) = self.t.get(self.i) else {
+            return None;
+        };
+        if is_keyword(tbl) {
+            return None;
+        }
+        let tbl = tbl.clone();
+        self.i += 1;
+        let alias = match self.t.get(self.i) {
+            Some(Tok::Ident(a)) if !is_keyword(a) => {
+                let a = a.clone();
+                self.i += 1;
+                Some(a)
+            }
+            _ => None,
+        };
+        self.streams.push(Stream {
+            name: tbl.clone(),
+            alias: alias.clone(),
+            derived: None,
+        });
+        let sidx = self.streams.len() - 1;
+        let ctx = sidx as u8 + self.base;
+        let aggregate = items
+            .iter()
+            .any(|it| matches!(it, RawItem::Agg(..)));
+        // the aggregate claims the NEXT context slot (probed:
+        // a second cursor's aggregate sat at ctx 2 over its
+        // stream's 1)
+        let agg = if aggregate {
+            self.streams.push(Stream {
+                name: String::new(),
+                alias: None,
+                derived: None,
+            });
+            Some((self.streams.len() - 1) as u8 + self.base)
+        } else {
+            None
+        };
+        let resolve = |q: &Option<String>, n: &str| -> Option<Val> {
+            if let Some(q) = q {
+                let hit = alias.as_deref().map_or(tbl == *q, |a| a == q);
+                if !hit {
+                    return None;
+                }
+            }
+            Some(Val::Field(ctx, n.to_string()))
+        };
+        let mut map: Vec<MapEntry> = Vec::new();
+        let mut group_keys: Vec<Val> = Vec::new();
+        let mut outs: Vec<Val> = Vec::new();
+        if let Some(agg_ctx) = agg {
+            // map slots in SELECT-LIST order: group keys as
+            // blr_map keys, aggregates as their verbs; outputs
+            // are bare fids on the aggregate context
+            for it in &items {
+                match it {
+                    RawItem::Col(q, n) => {
+                        map.push(MapEntry::Key(resolve(q, n)?))
+                    }
+                    RawItem::Agg(verb, arg) => map.push(MapEntry::Agg(
+                        *verb,
+                        match arg {
+                            Some((q, n)) => Some(resolve(q, n)?),
+                            None => None,
+                        },
+                    )),
+                }
+                outs.push(Val::Fid(agg_ctx, (outs.len()) as u16));
+            }
+        } else {
+            for it in &items {
+                let RawItem::Col(q, n) = it else {
+                    return None;
+                };
+                outs.push(resolve(q, n)?);
+            }
+        }
+        let saved = self.sub.replace(sidx);
+        let boolean = if self.kw("WHERE") {
+            Some(self.bool_or()?)
+        } else {
+            None
+        };
+        if self.kw("GROUP") {
+            if !aggregate || !self.kw("BY") {
+                return None;
+            }
+            loop {
+                let (q, n) = qual_name(self)?;
+                group_keys.push(resolve(&q, &n)?);
+                if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                    self.i += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        let mut sort: Vec<(bool, Val)> = Vec::new();
+        if self.kw("ORDER") {
+            // over an aggregate: unprobed
+            if aggregate || !self.kw("BY") {
+                return None;
+            }
+            loop {
+                let (q, k) = qual_name(self)?;
+                let key = resolve(&q, &k)?;
+                let descending = if self.kw("DESC") {
+                    true
+                } else {
+                    let _ = self.kw("ASC");
+                    false
+                };
+                sort.push((descending, key));
+                if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                    self.i += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        self.sub = saved;
+        if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+            return None;
+        }
+        self.i += 1;
+        if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+            return None;
+        }
+        self.i += 1;
+        let num = self.cursors.len() as u16;
+        self.cursors.push(name.clone());
+        self.cursor_decls.push(CursorDecl {
+            name,
+            num,
+            table: tbl,
+            alias,
+            ctx,
+            agg,
+            map,
+            group_keys,
+            outs,
+            boolean,
+            sort,
+        });
+        Some(())
     }
 
     /// UPDATE rel SET ... WHERE CURRENT OF cur; - self.i past the
@@ -3995,11 +4246,10 @@ impl<'a> P<'a> {
                 _ => j += 1,
             }
         };
-        let decl = self.cursor_decls.iter().find(|d| d.name == cur)?;
-        if decl.table != rel || decl.agg.is_some() {
+        let (org_ctx, ctbl) = self.find_pos_cursor(&cur)?;
+        if ctbl != rel {
             return None;
         }
-        let org_ctx = decl.ctx;
         let org_idx = (org_ctx - self.base) as usize;
         self.streams.push(Stream {
             name: String::new(),
@@ -4461,13 +4711,12 @@ impl<'a> P<'a> {
                 let Some(Tok::Ident(cur)) = self.t.get(self.i) else {
                     return None;
                 };
-                let decl = self.cursor_decls.iter().find(|d| &d.name == cur)?;
                 // the erased table must be the cursor's (and a plain,
                 // non-aggregate cursor - the engine refuses the rest)
-                if decl.table != st.name || decl.agg.is_some() {
+                let (ctx, ctbl) = self.find_pos_cursor(cur)?;
+                if ctbl != st.name {
                     return None;
                 }
-                let ctx = decl.ctx;
                 self.i += 1;
                 if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
                     return None;
@@ -4490,6 +4739,193 @@ impl<'a> P<'a> {
             }
             self.i += 1;
             return Some(TrigStmt::Delete(st, ctx, wher));
+        }
+        if self.kw("MERGE") {
+            // MERGE INTO tgt [alias] USING src [alias] ON <bool>
+            // WHEN [NOT] MATCHED THEN ... - one MATCHED branch
+            // (UPDATE SET / DELETE) and one NOT MATCHED (INSERT) at
+            // most; AND-qualified branches, sub-selects as source
+            // and RETURNING are unprobed and refuse
+            if !self.kw("INTO") {
+                return None;
+            }
+            let named = |p: &mut P| -> Option<Stream> {
+                let Some(Tok::Ident(n)) = p.t.get(p.i) else {
+                    return None;
+                };
+                if is_keyword(n) {
+                    return None;
+                }
+                let n = n.clone();
+                p.i += 1;
+                let alias = match p.t.get(p.i) {
+                    Some(Tok::Ident(a)) if !is_keyword(a) => {
+                        let a = a.clone();
+                        p.i += 1;
+                        Some(a)
+                    }
+                    _ => None,
+                };
+                Some(Stream {
+                    name: n,
+                    alias,
+                    derived: None,
+                })
+            };
+            let tgt = named(self)?;
+            if !self.kw("USING") {
+                return None;
+            }
+            let src = named(self)?;
+            // contexts: the SOURCE stream numbers first (probed:
+            // source 0, target 1)
+            self.streams.push(src.clone());
+            let src_idx = self.streams.len() - 1;
+            let src_ctx = src_idx as u8 + self.base;
+            self.streams.push(tgt.clone());
+            let tgt_idx = self.streams.len() - 1;
+            let tgt_ctx = tgt_idx as u8 + self.base;
+            if !self.kw("ON") {
+                return None;
+            }
+            self.merge_scope = Some((src_idx, tgt_idx));
+            let on = self.bool_or()?;
+            let mut upd_sets: Option<Vec<(String, Val)>> = None;
+            let mut del = false;
+            let mut ins_cv: Option<(Vec<String>, Vec<Val>)> = None;
+            while self.kw("WHEN") {
+                if self.kw("NOT") {
+                    if !(self.kw("MATCHED")
+                        && self.kw("THEN")
+                        && self.kw("INSERT"))
+                        || ins_cv.is_some()
+                        || !matches!(self.t.get(self.i), Some(Tok::LParen))
+                    {
+                        return None;
+                    }
+                    self.i += 1;
+                    let mut cols = Vec::new();
+                    loop {
+                        let Some(Tok::Ident(c)) = self.t.get(self.i) else {
+                            return None;
+                        };
+                        if is_keyword(c) {
+                            return None;
+                        }
+                        cols.push(c.clone());
+                        self.i += 1;
+                        match self.t.get(self.i)? {
+                            Tok::Comma => self.i += 1,
+                            Tok::RParen => {
+                                self.i += 1;
+                                break;
+                            }
+                            _ => return None,
+                        }
+                    }
+                    if !self.kw("VALUES")
+                        || !matches!(self.t.get(self.i), Some(Tok::LParen))
+                    {
+                        return None;
+                    }
+                    self.i += 1;
+                    let mut vals = Vec::new();
+                    loop {
+                        vals.push(self.val()?);
+                        match self.t.get(self.i)? {
+                            Tok::Comma => self.i += 1,
+                            Tok::RParen => {
+                                self.i += 1;
+                                break;
+                            }
+                            _ => return None,
+                        }
+                    }
+                    if vals.len() != cols.len() {
+                        return None;
+                    }
+                    ins_cv = Some((cols, vals));
+                } else {
+                    if !(self.kw("MATCHED") && self.kw("THEN"))
+                        || upd_sets.is_some()
+                        || del
+                    {
+                        return None;
+                    }
+                    if self.kw("UPDATE") {
+                        if !self.kw("SET") {
+                            return None;
+                        }
+                        let mut sets = Vec::new();
+                        loop {
+                            let Some(Tok::Ident(col)) = self.t.get(self.i)
+                            else {
+                                return None;
+                            };
+                            if is_keyword(col) {
+                                return None;
+                            }
+                            let col = col.clone();
+                            self.i += 1;
+                            if !matches!(
+                                self.t.get(self.i),
+                                Some(Tok::Cmp(CmpOp::Eql))
+                            ) {
+                                return None;
+                            }
+                            self.i += 1;
+                            sets.push((col, self.val()?));
+                            if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                                self.i += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        upd_sets = Some(sets);
+                    } else if self.kw("DELETE") {
+                        del = true;
+                    } else {
+                        return None;
+                    }
+                }
+            }
+            self.merge_scope = None;
+            if upd_sets.is_none() && !del && ins_cv.is_none() {
+                return None;
+            }
+            if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                return None;
+            }
+            self.i += 1;
+            // branch contexts allocate UPDATE's new record first,
+            // then INSERT's store - independent of SQL branch order
+            // (probed: update+insert = 2,3; anything-else+insert = 2)
+            let upd = upd_sets.map(|sets| {
+                self.streams.push(Stream {
+                    name: String::new(),
+                    alias: None,
+                    derived: None,
+                });
+                ((self.streams.len() - 1) as u8 + self.base, sets)
+            });
+            let ins = ins_cv.map(|(c, v)| {
+                self.streams.push(Stream {
+                    name: String::new(),
+                    alias: None,
+                    derived: None,
+                });
+                ((self.streams.len() - 1) as u8 + self.base, c, v)
+            });
+            return Some(TrigStmt::Merge {
+                src,
+                src_ctx,
+                tgt,
+                tgt_ctx,
+                on,
+                upd,
+                del,
+                ins,
+            });
         }
         if self.kw("UPDATE") {
             if self.kw("OR") {
@@ -4751,6 +5187,8 @@ pub fn compile_default(sql: &str) -> Option<Vec<u8>> {
         domain_value: false,
         cursors: Vec::new(),
         cursor_decls: Vec::new(),
+        for_cursors: Vec::new(),
+        merge_scope: None,
     };
     if !p.kw("DEFAULT") {
         return None;
@@ -4818,6 +5256,8 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
         domain_value: false,
         cursors: Vec::new(),
         cursor_decls: Vec::new(),
+        for_cursors: Vec::new(),
+        merge_scope: None,
     };
     if !(p.kw("COMPUTED") && p.kw("BY")) {
         return None;
@@ -4878,6 +5318,8 @@ pub fn compile_check(sql: &str) -> Option<Vec<u8>> {
         domain_value: false,
         cursors: Vec::new(),
         cursor_decls: Vec::new(),
+        for_cursors: Vec::new(),
+        merge_scope: None,
     };
     if !p.kw("CHECK") {
         return None;
@@ -4943,6 +5385,8 @@ pub fn compile_validation(sql: &str) -> Option<Vec<u8>> {
         domain_value: true,
         cursors: Vec::new(),
         cursor_decls: Vec::new(),
+        for_cursors: Vec::new(),
+        merge_scope: None,
     };
     if !p.kw("CHECK") {
         return None;
@@ -5028,6 +5472,8 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
         domain_value: false,
         cursors: Vec::new(),
         cursor_decls: Vec::new(),
+        for_cursors: Vec::new(),
+        merge_scope: None,
     };
     if !(p.kw("CREATE") && p.kw("TRIGGER")) {
         return None;
@@ -5072,8 +5518,16 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
     }
     // DECLARE [VARIABLE] name TYPE [= <value>]; ... - declares sit
     // between the outer begin and label 0, each null-initialised
-    // UNLESS an initialiser replaces the null (probed)
+    // UNLESS an initialiser replaces the null; cursor declarations
+    // hold their SOURCE position among the declares while the inits
+    // stay grouped at the end (probed - the trigger flavor of the
+    // procedure's deferral law)
     let mut declares: Vec<(Dsc, Option<Val>)> = Vec::new();
+    enum TDecl {
+        Var(usize),
+        Cur(usize),
+    }
+    let mut decl_seq: Vec<TDecl> = Vec::new();
     while p.kw("DECLARE") {
         let _ = p.kw("VARIABLE");
         let Some(Tok::Ident(name)) = p.t.get(p.i) else {
@@ -5084,6 +5538,11 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
         }
         let name = name.clone();
         p.i += 1;
+        if p.kw("CURSOR") {
+            decl_seq.push(TDecl::Cur(p.cursor_decls.len()));
+            p.cursor_decl(name)?;
+            continue;
+        }
         let dsc = p.cast_target()?;
         p.local_vars.push(name);
         let init = if matches!(p.t.get(p.i), Some(Tok::Cmp(CmpOp::Eql))) {
@@ -5092,6 +5551,7 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
         } else {
             None
         };
+        decl_seq.push(TDecl::Var(declares.len()));
         declares.push((dsc, init));
         if !matches!(p.t.get(p.i), Some(Tok::Semi)) {
             return None;
@@ -5109,13 +5569,19 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = vec![blr::VERSION5, blr::BEGIN];
-    // TRIGGERS group ALL declares first, THEN all init assignments -
+    // TRIGGERS group ALL declares first (cursor declarations in
+    // their source slots among them), THEN all init assignments -
     // unlike procedures, which interleave declare/init per variable
     // (both probed; read the bytes, not the symmetry)
-    for (vi, (dsc, _)) in declares.iter().enumerate() {
-        out.push(blr::DECLARE);
-        out.extend_from_slice(&(vi as u16).to_le_bytes());
-        emit_dsc(&mut out, *dsc);
+    for d in &decl_seq {
+        match d {
+            TDecl::Var(vi) => {
+                out.push(blr::DECLARE);
+                out.extend_from_slice(&(*vi as u16).to_le_bytes());
+                emit_dsc(&mut out, declares[*vi].0);
+            }
+            TDecl::Cur(ci) => emit_cursor_decl(&mut out, &p.cursor_decls[*ci]),
+        }
     }
     for (vi, (_, init)) in declares.iter().enumerate() {
         out.push(blr::ASSIGNMENT);
@@ -6429,6 +6895,85 @@ mod tests {
             "CREATE PROCEDURE QQ6 (P1 INTEGER) AS DECLARE C1 CURSOR FOR (SELECT UID, UA FROM U2); BEGIN OPEN C1; FETCH C1; UPDATE U2 SET UA = :P1 WHERE CURRENT OF C1; CLOSE C1; END",
             "050204000200080007000401010007000C0002A60000430192025532122243312220225055424C4943222E2255322200FF0200BF0100170003554944BF010017000255419B11000202A7000000A702000002FF0A0001D9010102012900000001001701025541FFA7010000FFFFFF0E010201150700000019010000FFFF4C",
         );
+    }
+
+    #[test]
+    fn compiles_slice_twenty_three_shapes_byte_for_byte() {
+        // MERGE, both branches: for(marks(1,6), rse(join2(source@0,
+        // target@1, LEFT, ON), or(not(missing(dbkey tgt)),
+        // missing(dbkey tgt))), if(missing, store@3, modify 1->2
+        // marks(1,2))) - the INSERT half branches on the LEFT join's
+        // missing target dbkey (flip seventeen)
+        pin_proc(
+            "CREATE PROCEDURE QR1 (P1 INTEGER) AS BEGIN MERGE INTO U2 USING T ON U2.UID = T.ID WHEN MATCHED THEN UPDATE SET UA = :P1 WHEN NOT MATCHED THEN INSERT (UID, UA) VALUES (T.ID, 0); END",
+            "050204000200080007000401010007000C00029B1100020207D90106430177024A0154004A025532015001472F1701035549441700024944FF47393B3D16013D1601FF083D16010F4A025532030201170002494417030355494401150800000000001703025541FF0A0102D9010202012900000001001702025541FFFFFFFF0E010201150700000019010000FFFF4C",
+        );
+        // matched-only MERGE: an INNER join (no join_type), NO rse
+        // boolean, if(not(missing), erase(tgt) marks(1,2), bare end)
+        pin_proc(
+            "CREATE PROCEDURE QR2 AS BEGIN MERGE INTO U2 USING T ON U2.UID = T.ID WHEN MATCHED THEN DELETE; END",
+            "0502040101000700029B1100020207D90106430177024A0154004A02553201472F1701035549441700024944FFFF083B3D16010501D90102FFFFFFFF0E010201150700000019010000FFFF4C",
+        );
+        // insert-only MERGE with aliases: LEFT join, rse boolean =
+        // missing alone, store re-emits the ALIASED target at its
+        // own context (2 - no modify branch to claim it first)
+        pin_proc(
+            "CREATE PROCEDURE QR3 AS BEGIN MERGE INTO U2 B USING T A ON B.UID = A.ID WHEN NOT MATCHED THEN INSERT (UID) VALUES (A.ID); END",
+            "0502040101000700029B1100020207D901064301770292015403224122009202553203224222015001472F1701035549441700024944FF473D1601FF083D16010F92025532032242220202011700024944170203554944FFFFFFFFFF0E010201150700000019010000FFFF4C",
+        );
+        // FOR SELECT ... AS CURSOR: the name rides the relation2
+        // alias like a DECLAREd cursor's, into-assign sources wrap
+        // in blr_derived_expr, positioned DML hits the FOR's context
+        // (flip eighteen)
+        pin_proc(
+            "CREATE PROCEDURE QR4 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T INTO :R1 AS CURSOR CU DO BEGIN UPDATE T SET ID = ID + 1 WHERE CURRENT OF CU; SUSPEND; END END",
+            "050204010300080007000700020300000800012D1A00009B110002021101074301920154112243552220225055424C4943222E22542200FF0201BF010017000249441A000002020A0001D901010201221700024944150800010000001701024944FF0E0102011A000029010000010001150700010019010200FFFFFFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // the INTO-less AS CURSOR loop: no assignments at all in the
+        // body begin, just the positioned statement
+        pin_proc(
+            "CREATE PROCEDURE QR5 AS BEGIN FOR SELECT ID FROM T WHERE ID < 0 AS CURSOR CU DO DELETE FROM T WHERE CURRENT OF CU; END",
+            "0502040101000700029B110002021101074301920154112243552220225055424C4943222E225422004733170002494415080000000000FF020500D90101FFFFFFFF0E010201150700000019010000FFFF4C",
+        );
+        // cursors in TRIGGERS: the declaration keeps its SOURCE slot
+        // among the grouped declares (trigger flavor of the deferral
+        // law), the cursor numbering past OLD/NEW (flip nineteen)
+        pin_trig(
+            "CREATE TRIGGER TRQ6 FOR U2 BEFORE UPDATE AS DECLARE CX CURSOR FOR (SELECT ID FROM T ORDER BY ID DESC); DECLARE V1 INTEGER; BEGIN OPEN CX; FETCH CX INTO :V1; CLOSE CX; NEW.UA = V1; END",
+            "0502A600004301920154112243582220225055424C4943222E225422024601491702024944FF0100BF010217020249440300000800012D1A000011000202A7000000A7020000020117020249441A0000FFA7010000011A00001701025541FFFFFF4C",
+        );
+    }
+
+    #[test]
+    fn merge_refusals() {
+        for sql in [
+            // WHEN MATCHED AND <cond>: unprobed
+            "CREATE PROCEDURE X AS BEGIN MERGE INTO U2 USING T ON U2.UID = T.ID WHEN MATCHED AND U2.UA > 0 THEN DELETE; END",
+            // two MATCHED branches: unprobed
+            "CREATE PROCEDURE X (P1 INTEGER) AS BEGIN MERGE INTO U2 USING T ON U2.UID = T.ID WHEN MATCHED THEN DELETE WHEN MATCHED THEN UPDATE SET UA = :P1; END",
+            // bare names in the ON clause need the catalog
+            "CREATE PROCEDURE X AS BEGIN MERGE INTO U2 USING T ON UID = ID WHEN MATCHED THEN DELETE; END",
+            // a sub-select source: unprobed
+            "CREATE PROCEDURE X AS BEGIN MERGE INTO U2 USING (SELECT ID FROM T) A ON U2.UID = A.ID WHEN MATCHED THEN DELETE; END",
+        ] {
+            assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
+        }
+    }
+
+    #[test]
+    fn for_cursor_refusals() {
+        for sql in [
+            // ORDER BY on an AS CURSOR loop: unprobed
+            "CREATE PROCEDURE X AS BEGIN FOR SELECT ID FROM T ORDER BY ID AS CURSOR CU DO DELETE FROM T WHERE CURRENT OF CU; END",
+            // OPEN/FETCH/CLOSE address DECLAREd cursors only
+            "CREATE PROCEDURE X AS BEGIN FOR SELECT ID FROM T AS CURSOR CU DO OPEN CU; END",
+            // an AS CURSOR name is OUT OF SCOPE after its loop
+            "CREATE PROCEDURE X AS BEGIN FOR SELECT ID FROM T AS CURSOR CU DO EXIT; DELETE FROM T WHERE CURRENT OF CU; END",
+            // positioned DML against the wrong table
+            "CREATE PROCEDURE X AS BEGIN FOR SELECT ID FROM T AS CURSOR CU DO DELETE FROM U2 WHERE CURRENT OF CU; END",
+        ] {
+            assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
+        }
     }
 
     #[test]

@@ -4666,6 +4666,36 @@ WHEN, and a BLOCK as a handler's body nests blr_block again with no
 handler section of its own - the battery runs a handler block
 containing an EXIT.
 
+Slice 23 converted MERGE - and MERGE turned out to be one probed
+sentence, not a statement family. The engine compiles every merge
+to for(marks(1, 6) - MERGE|FOR_UPDATE - rse(join2(source at ctx 0,
+target at ctx 1, [LEFT], the ON boolean), [branch-union boolean]),
+if(missing(dbkey(target)), <insert half>, <matched half>)): the
+matched test is the LEFT JOIN's missing target dbkey, nothing
+else. Three laws fell out of the variants. The join is LEFT only
+when a NOT MATCHED branch needs the unmatched rows - a
+matched-only merge compiles an INNER join with NO rse boolean at
+all. The rse boolean ORs the branch conditions in CANONICAL order
+- matched's not(missing) first - and the SQL's own branch order
+leaves no trace (a reversed-branch probe compiled byte-identical).
+Branch contexts allocate UPDATE's new record first, then INSERT's
+store: update+insert = 2 and 3, anything-else+insert = 2 - the
+slice-20 lesson again, the context order records the compile
+order. The UPDATE half is blr_modify + marks(1, 2) - MARK_MERGE -
+DELETE is the positioned-erase shape with merge marks, and the
+INSERT half re-emits the TARGET stream, alias and all, under
+blr_store. FOR SELECT ... AS CURSOR closed the cursor story from
+the other end: it is the ordinary labeled FOR loop whose relation2
+alias carries the cursor name exactly the way DECLAREd cursors
+carry theirs - no dcl_cursor, no outputs section - with INTO now
+OPTIONAL and its assign-sources wrapped in blr_derived_expr, and
+WHERE CURRENT OF targeting the FOR's own context, in scope for the
+DO body only. And cursors reached TRIGGER bodies: the declaration
+keeps its SOURCE slot among the trigger's grouped declares - the
+trigger flavor of the deferral law - numbering past OLD/NEW. The
+trigger gate's closers were never probed at all: a trigger MERGE
+and a trigger AS-CURSOR positioned update, green on composition.
+
 Slice 22 completed the cursor surface, flipping every refusal the
 two slices before it had named. WHEN SQLSTATE is handler code 8
 plus a counted string (flip thirteen); a handler's block body

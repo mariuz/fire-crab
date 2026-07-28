@@ -13,6 +13,42 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 23: MERGE, AS CURSOR, cursors in triggers
+
+### Converted
+- **MERGE**: one probed sentence — `for(marks(1, 6), rse(join2(
+  source@0, target@1, [LEFT], ON-boolean), [branch-union boolean]),
+  if(<matched test>, ...))`, branching on `missing(dbkey(target))`.
+  The join is LEFT only when a NOT MATCHED branch needs unmatched
+  rows — matched-only merges compile an INNER join with NO rse
+  boolean. The rse boolean ORs the branch conditions in canonical
+  order (matched first); SQL branch order leaves NO trace. Branch
+  contexts allocate UPDATE's new record first, then INSERT's store
+  (update+insert = 2,3; anything-else+insert = 2). The UPDATE half
+  is `blr_modify(target, new) + marks(1, 2)` (MARK_MERGE), DELETE is
+  the positioned-erase shape with marks(1, 2), INSERT re-emits the
+  TARGET stream — alias and all — under `blr_store`. Sources read
+  ctx 0, target-org fields ctx 1; bare names refuse (catalog-free).
+- **FOR SELECT ... [INTO ...] AS CURSOR name**: the ordinary labeled
+  FOR loop whose relation2 alias carries the CURSOR NAME exactly
+  like a DECLAREd cursor's — no dcl_cursor, no outputs section. The
+  INTO clause becomes OPTIONAL; its assign-sources wrap in
+  blr_derived_expr. WHERE CURRENT OF in the DO body targets the
+  FOR's own context, in scope for the body only.
+- **Cursors in TRIGGER bodies**: DECLARE CURSOR works in triggers —
+  the declaration keeps its SOURCE slot among the grouped declares
+  (the trigger flavor of the deferral law), numbering past OLD/NEW
+  (probed at ctx 2). MERGE and AS CURSOR loops ride along.
+
+### Guarded
+- WHEN MATCHED AND <cond>, multiple same-kind MERGE branches,
+  sub-select sources, bare names in MERGE scope; ORDER BY on an AS
+  CURSOR loop; OPEN/FETCH/CLOSE against a FOR cursor; a FOR cursor
+  named outside its loop. Gate: `qa/dsql-proc-blr.sh` grew to 110
+  checks (12 fresh), `qa/dsql-trig-blr.sh` to 46 (4 fresh — among
+  them a trigger MERGE and a trigger AS-CURSOR positioned update,
+  neither probed directly); 261 unit byte-pins.
+
 ## 2026-07-28 — fire-crab-dsql slice 22: cursors completed - aliases, aggregates, positioned DML
 
 ### Converted

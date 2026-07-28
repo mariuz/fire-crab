@@ -307,6 +307,12 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # a composite verb (MERGE) may be ONE probed sentence: a join,
+    # a dbkey-missing test, an if - with LAWS where you'd expect
+    # options (join type follows the branch SET, the rse boolean is
+    # the branch-union in canonical order, SQL branch order is
+    # traceless, branch contexts allocate by KIND not position);
+    # probe the variants until the sentence stops changing
     # a marker byte can sit on EITHER side of its verb: positioned
     # DML trails its marks where loop DML leads them - and the same
     # SELECT machinery you built for FOR-loops (aggregates, maps,
