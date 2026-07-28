@@ -4006,9 +4006,49 @@ name — turns it into a clean refusal at prepare rather than a read of a
 column named `UPPER()`. The nofallback gate moved `UPPER`/`SUBSTRING`
 from its unsupported list to its answered list, and its
 refusal-survival check now uses `CASE WHEN`, which stays outside the
-surface. WHERE-clause function calls (`WHERE UPPER(S) = 'X'`) remain
-refusals — the predicate tokenizer does not know calls yet; that is a
-named next slice, not a silent gap.
+surface.
+
+### Function calls in WHERE (`qa/serve-real-wherefn.sh`, 51 checks)
+
+The slice the one above named next: the predicate surface meets the
+scalar functions. `WHERE UPPER(S) = 'X'`, `WHERE CHAR_LENGTH(S) > 3`,
+`WHERE MOD(A, 2) = 0` — a call on either side of a comparison, under
+`IS [NOT] NULL`, as a `LIKE` subject, inside `BETWEEN`/`IN` (which
+desugar to comparisons, so the expression leaf rides through), under
+`AND`/`OR`/`NOT` with the DNF conversion's three-valued De Morgan, in
+SELECT and in UPDATE/DELETE WHERE alike.
+
+Mechanically the call becomes ONE token: the tokenizer scans to the
+MATCHING close paren (nested calls nest, string literals with parens
+inside are skipped) and hands the whole span to the expression parser —
+`Tok::FnExpr`. The predicate grammar takes that token as a leaf side
+(`RawLhs::Expr` / `RawKind::CmpExpr`), and resolution builds a
+[`Cond2`] — the same three-valued expression comparison IIF uses — so
+evaluation, exact numeric alignment and pad-insensitive text compare
+are all the machinery that already existed. `UPPER(C) = 'AB'` on a
+`CHAR(5)` works BECAUSE both halves hold: the function's result keeps
+the padding ('AB   '), and the compare trims it — each pinned by its
+own gate check.
+
+**The refusals are half the design.** A WHERE term answers only
+true/false — it cannot carry the engine's mid-cursor error the way a
+select-list expression can — so admission runs through a no-raise walk
+(`expr_no_raise`): any shape whose per-row evaluation could RAISE
+refuses at prepare with a clean SQL error. Concretely: `MOD` with a
+non-literal or zero divisor (divide by zero), a length/count argument
+that is not a non-negative literal (`LEFT(S, A)` — a column could go
+negative, which raises 22011), a text operand under `MOD`/`SIGN`/`ABS`
+(string-to-number conversion), `CAST` anywhere in a predicate, and a
+`?` parameter against an expression side (its bind target needs a
+synthesized describe — a named later slice, with HAVING calls and
+arithmetic in predicates). The alternative — swallowing the error and
+excluding the row — would be a silently wrong row set on exactly the
+row the engine raises on.
+
+The gate's teeth: `WHERE UPPER(S) = 'Q' OR NOT UPPER(S) = 'Q'` counts
+every NON-NULL row and drops the NULL one — UNKNOWN excludes through
+both the comparison and its pushed-in negation — and the count is
+pinned to the value, not just compared.
 
 ## Benchmarks
 
@@ -4574,6 +4614,14 @@ NODE_PATH="$PWD/node_modules" \
 # Builds its own scratch database.
 FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     bash /path/to/fire-crab/qa/serve-real-functions.sh 3050
+
+# function calls in WHERE: a call on either side of a comparison, IS NULL,
+# LIKE, BETWEEN/IN, AND/OR/NOT, in SELECT and DML - row sets must match
+# exactly, NULL-row exclusion included; could-raise shapes (MOD by a
+# non-literal divisor, a column length, CAST) must REFUSE at prepare.
+# Builds its own scratch database.
+FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    bash /path/to/fire-crab/qa/serve-real-wherefn.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on

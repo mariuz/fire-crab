@@ -134,6 +134,7 @@ answers "EXECUTE PROCEDURE GEN 1"
 # is their gate; these two used to sit in the unsupported list below)
 answers "SELECT UPPER(S) FROM T ORDER BY ID"
 answers "SELECT SUBSTRING(S FROM 1 FOR 1) FROM T ORDER BY ID"
+answers "SELECT ID FROM T WHERE UPPER(S) = 'X' ORDER BY ID"
 
 # --- NOT supported: each must raise ------------------------------------
 # a view over a join (the view has a relation id but no records, so a
@@ -166,7 +167,7 @@ refuses "ROLLBACK TO NOSUCHPOINT"
 # the fallback must be reachable AT ALL for this gate to mean anything:
 # a shape far outside the surface should still not answer 4242
 for weird in "SELECT CASE WHEN A > 1 THEN 1 ELSE 0 END FROM T" \
-             "SELECT A FROM T WHERE UPPER(S) = 'X'" \
+             "SELECT A FROM T WHERE CAST(A AS VARCHAR(5)) = '1'" \
              "SELECT EXTRACT(YEAR FROM CURRENT_DATE) FROM T" \
              "SELECT A FROM T GROUP BY A HAVING COUNT(*) > 99 ORDER BY 1 ROWS 1 TO 2"; do
     out=$(ask "$weird")

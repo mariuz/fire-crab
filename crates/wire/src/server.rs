@@ -1337,6 +1337,20 @@ enum Term {
     /// See [RawKind::Const].
     Const(bool),
     Never,
+    /// An EXPRESSION predicate - a built-in function call on either
+    /// side, evaluated per row through the select-list expression
+    /// machinery ([Cond2]: three-valued, exact numeric alignment,
+    /// pad-insensitive text). Only TRUE keeps the row. Resolution
+    /// admits ONLY expressions the no-raise walk clears
+    /// ([expr_no_raise]), so the Err arm of the eval is unreachable
+    /// by construction - a shape that could raise per row refuses at
+    /// prepare instead, because this bool cannot carry the engine's
+    /// mid-cursor error.
+    ExprCond(Box<Cond2>),
+    /// `<function call> [NOT] LIKE <literal pattern>` - the evaluated
+    /// result (rendered to text, as the engine coerces) against the
+    /// pattern. A NULL result is UNKNOWN.
+    ExprLike(Box<Expr>, String, Option<char>, bool),
 }
 
 /// A resolved WHERE predicate in disjunctive normal form (OR of ANDs),
@@ -1485,6 +1499,13 @@ impl Term {
             },
             Term::Const(b) => *b,
             Term::Never => false,
+            // TRUE keeps the row; false, UNKNOWN and the (unreachable
+            // by construction, see the variant doc) Err all exclude it
+            Term::ExprCond(c) => matches!(c.eval(values), Ok(Some(true))),
+            Term::ExprLike(e, pattern, escape, negated) => match e.eval(values) {
+                Ok(Value::Null) | Err(_) => false,
+                Ok(v) => like_match(&v.render(), pattern, *escape) != *negated,
+            },
         }
     }
 }
@@ -14108,6 +14129,11 @@ enum Tok {
     /// a decided leaf - see [RawKind::Const]
     Const(bool),
     Escape,
+    /// a built-in function call lexed as ONE token - the whole call
+    /// (balanced parens, string literals skipped) parsed by the
+    /// expression parser. What makes `WHERE UPPER(S) = 'X'` a leaf the
+    /// predicate grammar can hold.
+    FnExpr(RawExpr),
 }
 
 /// Finish an integer-or-decimal literal whose integer digits end at
@@ -14262,6 +14288,25 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                         continue;
                     }
                 }
+                // a built-in function name followed by `(...)` lexes as
+                // one expression token: scan to the MATCHING close paren
+                // (nested calls nest, string literals are skipped) and
+                // hand the whole call to the expression parser. A call
+                // that does not parse fails the tokenize - the statement
+                // then refuses, exactly like a malformed select-list call.
+                if sysfn_named(&upper).is_some() {
+                    let mut j = i;
+                    while j < b.len() && b[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if j < b.len() && b[j] == b'(' {
+                        let close = matching_paren(b, j)?;
+                        let raw = parse_raw_expr_any(&s[start..=close])?;
+                        out.push(Tok::FnExpr(raw));
+                        i = close + 1;
+                        continue;
+                    }
+                }
                 match upper.as_str() {
                     "AND" => out.push(Tok::And),
                     "OR" => out.push(Tok::Or),
@@ -14287,6 +14332,44 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
     Some(out)
 }
 
+/// The index of the parenthesis matching the one at `open`, skipping
+/// single-quoted string literals ('' is an escaped quote inside one).
+/// None when the parens never balance.
+fn matching_paren(b: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                i += 1;
+                loop {
+                    if i >= b.len() {
+                        return None; // unterminated literal
+                    }
+                    if b[i] == b'\'' {
+                        if b.get(i + 1) == Some(&b'\'') {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// An unresolved WHERE/HAVING term (left side not yet resolved to a value
 /// index). The left side is a column name, or - in HAVING only - an
 /// aggregate call.
@@ -14299,10 +14382,16 @@ struct RawTerm {
 enum RawLhs {
     Col(String),
     Agg(AggFn, AggTarget),
+    /// a built-in function call ([Tok::FnExpr]) as the tested side:
+    /// `WHERE UPPER(S) = 'X'`, `WHERE CHAR_LENGTH(S) > 3`
+    Expr(RawExpr),
 }
 #[derive(Clone)]
 enum RawKind {
     Cmp(Cmp, Rhs),
+    /// a comparison whose RIGHT side is a function call:
+    /// `WHERE S = UPPER(T)`, `WHERE CHAR_LENGTH(A) = CHAR_LENGTH(B)`
+    CmpExpr(Cmp, RawExpr),
     IsNull,
     IsNotNull,
     Like(Rhs, Option<char>, bool),
@@ -14419,6 +14508,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
     let lhs = match t.get(*pos)? {
         Tok::Ident(c) => RawLhs::Col(c.clone()),
         Tok::Agg(f, target) => RawLhs::Agg(*f, target.clone()),
+        Tok::FnExpr(e) => RawLhs::Expr(e.clone()),
         _ => return None,
     };
     *pos += 1;
@@ -14436,6 +14526,13 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
         Tok::Cmp(op) if !negated => {
             let op = *op;
             *pos += 1;
+            // a function call on the RIGHT side is its own kind - Rhs
+            // stays the literal/parameter enum the resolved terms carry
+            if let Some(Tok::FnExpr(e)) = t.get(*pos) {
+                let e = e.clone();
+                *pos += 1;
+                return Some(leaf(RawKind::CmpExpr(op, e)));
+            }
             Some(leaf(RawKind::Cmp(op, parse_value(t, pos, np)?)))
         }
         Tok::Is if !negated => {
@@ -14562,22 +14659,26 @@ fn cross_dnf(parts: &[Ast], neg: bool) -> Option<Vec<Vec<RawTerm>>> {
     Some(acc)
 }
 
+/// The inverse comparison operator - sound in three-valued logic
+/// (UNKNOWN stays UNKNOWN under both directions).
+fn inverse_cmp(op: &Cmp) -> Cmp {
+    match op {
+        Cmp::Eq => Cmp::Ne,
+        Cmp::Ne => Cmp::Eq,
+        Cmp::Lt => Cmp::Ge,
+        Cmp::Ge => Cmp::Lt,
+        Cmp::Gt => Cmp::Le,
+        Cmp::Le => Cmp::Gt,
+    }
+}
+
 /// The negation of one leaf, in three-valued logic: the inverse
 /// comparison (UNKNOWN stays UNKNOWN under both), the flipped NULL
 /// test (two-valued), the flipped LIKE.
 fn negate_term(t: &RawTerm) -> Option<RawTerm> {
     let kind = match &t.kind {
-        RawKind::Cmp(op, rhs) => {
-            let inv = match op {
-                Cmp::Eq => Cmp::Ne,
-                Cmp::Ne => Cmp::Eq,
-                Cmp::Lt => Cmp::Ge,
-                Cmp::Ge => Cmp::Lt,
-                Cmp::Gt => Cmp::Le,
-                Cmp::Le => Cmp::Gt,
-            };
-            RawKind::Cmp(inv, rhs.clone())
-        }
+        RawKind::Cmp(op, rhs) => RawKind::Cmp(inverse_cmp(op), rhs.clone()),
+        RawKind::CmpExpr(op, e) => RawKind::CmpExpr(inverse_cmp(op), e.clone()),
         RawKind::IsNull => RawKind::IsNotNull,
         RawKind::IsNotNull => RawKind::IsNull,
         RawKind::Like(p, e, negated) => RawKind::Like(p.clone(), *e, !negated),
@@ -15438,6 +15539,9 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
         // the resolvers answer a decided subquery leaf before they get
         // here; reaching this arm at all would mean one slipped past
         RawKind::Const(b) => Term::Const(b),
+        // an expression right side is resolve_expr_term's business - a
+        // resolver without that path (HAVING, joins) refuses it
+        RawKind::CmpExpr(..) => return None,
         RawKind::Cmp(op, Rhs::Int(n)) => match kind {
             ColKind::Int => Term::Cmp(idx, op, Rhs::Int(n)),
             _ => return None,
@@ -15488,6 +15592,12 @@ fn resolve_predicate(
                 terms.push(Term::Const(b));
                 continue;
             }
+            // an EXPRESSION on either side takes the expression-predicate
+            // path (Cond2 evaluation per row)
+            if matches!(rt.lhs, RawLhs::Expr(_)) || matches!(rt.kind, RawKind::CmpExpr(..)) {
+                terms.push(resolve_expr_term(&rt, columns, descs)?);
+                continue;
+            }
             let RawLhs::Col(col) = &rt.lhs else {
                 return None; // an aggregate in WHERE is invalid SQL
             };
@@ -15512,6 +15622,160 @@ fn resolve_predicate(
     Some(Predicate(groups))
 }
 
+/// Resolve a term with an EXPRESSION on either side into a
+/// [Term::ExprCond] / [Term::ExprLike], refusing anything that could
+/// RAISE per row ([expr_no_raise]) and any `?` parameter against an
+/// expression side (the describe would need a synthesized bind target -
+/// a later slice). The comparison itself is [Cond2]'s: three-valued,
+/// exact numeric alignment, pad-insensitive text.
+fn resolve_expr_term(
+    rt: &RawTerm,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+) -> Option<Term> {
+    // the left side as a resolved expression: the call itself, or the
+    // plain column a CmpExpr right side compares against
+    let lhs = match &rt.lhs {
+        RawLhs::Expr(e) => resolve_expr(e, columns, descs)?,
+        RawLhs::Col(name) => resolve_expr(&RawExpr::Col(name.clone()), columns, descs)?,
+        RawLhs::Agg(..) => return None,
+    };
+    // a literal right side becomes the matching literal expression
+    let rhs_expr = |rhs: &Rhs| -> Option<Expr> {
+        Some(match rhs {
+            Rhs::Int(n) => Expr::Int(*n),
+            Rhs::Num(r, s) => Expr::Dec(*r, *s),
+            Rhs::Str(s) => Expr::Str(s.clone()),
+            Rhs::Null => Expr::Null,
+            Rhs::Param(..) => return None,
+        })
+    };
+    let term = match &rt.kind {
+        RawKind::Cmp(op, rhs) => Term::ExprCond(Box::new(Cond2::Cmp(
+            Box::new(lhs),
+            *op,
+            Box::new(rhs_expr(rhs)?),
+        ))),
+        RawKind::CmpExpr(op, e) => Term::ExprCond(Box::new(Cond2::Cmp(
+            Box::new(lhs),
+            *op,
+            Box::new(resolve_expr(e, columns, descs)?),
+        ))),
+        RawKind::IsNull => Term::ExprCond(Box::new(Cond2::IsNull(Box::new(lhs)))),
+        RawKind::IsNotNull => Term::ExprCond(Box::new(Cond2::IsNotNull(Box::new(lhs)))),
+        RawKind::Like(Rhs::Str(p), escape, negated) => {
+            Term::ExprLike(Box::new(lhs), p.clone(), *escape, *negated)
+        }
+        RawKind::Like(..) => return None, // non-literal pattern
+        RawKind::Const(_) => return None, // handled before resolution
+    };
+    // the no-raise fence: a shape whose evaluation could raise per row
+    // refuses at prepare - Term::matches answers a bool and cannot
+    // carry the engine's mid-cursor error
+    let safe = match &term {
+        Term::ExprCond(c) => cond_no_raise(c, descs),
+        Term::ExprLike(e, ..) => expr_no_raise(e, descs),
+        _ => unreachable!(),
+    };
+    if !safe {
+        return None;
+    }
+    // and both sides must TYPE - an untypeable operand never reaches
+    // eval (resolve_expr already refused unknown columns)
+    match &term {
+        Term::ExprCond(c) => match &**c {
+            Cond2::Cmp(a, _, b) => {
+                a.type_of(descs)?;
+                b.type_of(descs)?;
+            }
+            Cond2::IsNull(a) | Cond2::IsNotNull(a) => {
+                a.type_of(descs)?;
+            }
+        },
+        Term::ExprLike(e, ..) => {
+            e.type_of(descs)?;
+        }
+        _ => {}
+    }
+    Some(term)
+}
+
+/// TRUE when evaluating this expression can NEVER raise, whatever the
+/// row holds - the admission fence for expression predicates. The
+/// select-list surface reports an eval error mid-cursor exactly as the
+/// engine does; a WHERE term answers only true/false, so anything that
+/// could raise (divide by zero, a negative length from a column, a
+/// string-to-number conversion, an overflow) must refuse at prepare
+/// instead of silently excluding the row the engine would have raised
+/// on.
+fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
+    // a non-negative integer literal in a length/count position
+    let nonneg_lit = |a: &Expr, min: i64| matches!(a, Expr::Int(n) if *n >= min);
+    // an operand fn_int/numeric_parts cannot fail on: statically not
+    // text, and not INT128-ranked (whose i64 narrowing can overflow)
+    let safe_num = |a: &Expr| {
+        !matches!(a.type_of(descs), Some(ExprType::Text) | None)
+            && a.rank_of(descs) != Some(NumRank::I128)
+    };
+    match e {
+        Expr::Col(_) | Expr::Int(_) | Expr::Dec(..) | Expr::Str(_) | Expr::Null => true,
+        Expr::Neg(x) => expr_no_raise(x, descs),
+        // arithmetic can overflow / divide by zero; CAST can fail
+        Expr::Bin(..) | Expr::Cast(..) => false,
+        Expr::Concat(a, b) => expr_no_raise(a, descs) && expr_no_raise(b, descs),
+        Expr::Coalesce(args) => args.iter().all(|a| expr_no_raise(a, descs)),
+        Expr::NullIf(a, b) => expr_no_raise(a, descs) && expr_no_raise(b, descs),
+        Expr::Iif(c, a, b) => {
+            cond_no_raise(c, descs) && expr_no_raise(a, descs) && expr_no_raise(b, descs)
+        }
+        Expr::Func(f, args) => {
+            if !args.iter().all(|a| expr_no_raise(a, descs)) {
+                return false;
+            }
+            match f {
+                SysFn::Upper
+                | SysFn::Lower
+                | SysFn::CharLength
+                | SysFn::OctetLength
+                | SysFn::Trim(_)
+                | SysFn::Replace
+                | SysFn::Reverse => true,
+                // a negative length raises - admit only a literal that
+                // is visibly non-negative; the start may be any
+                // non-text value (clipping handles every magnitude)
+                SysFn::Substring => {
+                    safe_num(&args[1])
+                        && args.get(2).map_or(true, |l| nonneg_lit(l, 0))
+                }
+                SysFn::Left | SysFn::Right | SysFn::Lpad | SysFn::Rpad => {
+                    nonneg_lit(&args[1], 0)
+                }
+                SysFn::Position => args.get(2).map_or(true, |s| nonneg_lit(s, 1)),
+                // divisor must be a visibly non-zero literal (a bare or
+                // negated integer - the parser makes `-3` a Neg(Int(3)))
+                SysFn::Mod => {
+                    let divisor_ok = match &args[1] {
+                        Expr::Int(n) => *n != 0,
+                        Expr::Neg(inner) => matches!(&**inner, Expr::Int(n) if *n != 0),
+                        _ => false,
+                    };
+                    safe_num(&args[0]) && divisor_ok
+                }
+                SysFn::Sign => safe_num(&args[0]),
+                // ABS of i128::MIN cannot negate - fence INT128 out
+                SysFn::Abs => safe_num(&args[0]),
+            }
+        }
+    }
+}
+
+fn cond_no_raise(c: &Cond2, descs: &[Descriptor]) -> bool {
+    match c {
+        Cond2::Cmp(a, _, b) => expr_no_raise(a, descs) && expr_no_raise(b, descs),
+        Cond2::IsNull(a) | Cond2::IsNotNull(a) => expr_no_raise(a, descs),
+    }
+}
+
 /// [typed_term] for a scaled NUMERIC/DECIMAL or INT128 column - the
 /// kinds [col_kind] does not classify. Comparisons take integer and
 /// decimal literals (exact, scale-aligned - the engine's dialect-3
@@ -15525,6 +15789,7 @@ fn numeric_term(
 ) -> Option<Term> {
     Some(match raw {
         RawKind::Const(b) => Term::Const(b),
+        RawKind::CmpExpr(..) => return None, // see typed_term
         RawKind::Cmp(op, Rhs::Int(n)) => Term::NumCmp(idx, op, Rhs::Num(n, 0)),
         RawKind::Cmp(op, Rhs::Num(r, s)) => Term::NumCmp(idx, op, Rhs::Num(r, s)),
         RawKind::Cmp(_, Rhs::Null) => Term::Never,
@@ -15605,6 +15870,8 @@ fn resolve_having(
                 continue;
             }
             let (idx, kind) = match &rt.lhs {
+                // a function call in HAVING is a later slice - refuse
+                RawLhs::Expr(_) => return None,
                 RawLhs::Col(col) => {
                     let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(col))?;
                     let fid = rc.field_id as usize;
@@ -18768,9 +19035,10 @@ mod tests {
         // IS [NOT] NULL applies to aggregates too
         let toks = tokenize("SUM(B) IS NOT NULL").unwrap();
         assert!(matches!(&parse_predicate(&toks, &mut 0).unwrap()[0][0].kind, RawKind::IsNotNull));
-        // a non-aggregate function call tokenizes (parens are tokens
-        // now) but the PARSER refuses it - not a supported leaf
-        assert!(parse_predicate(&tokenize("UPPER(NAME) = 'X'").unwrap(), &mut 0).is_none());
+        // a built-in function call is a leaf of its own now: one
+        // FnExpr token, an expression left side
+        let dnf = parse_predicate(&tokenize("UPPER(NAME) = 'X'").unwrap(), &mut 0).unwrap();
+        assert!(matches!(&dnf[0][0].lhs, RawLhs::Expr(RawExpr::Func(SysFn::Upper, _))));
         // ...as does a malformed aggregate
         assert!(tokenize("MIN(*) > 1").is_none());
         // an aggregate name NOT followed by parens is a plain identifier
@@ -19878,6 +20146,109 @@ mod tests {
         assert!(matches!(ev("ABS(A) * 2"), Value::Int(14)));
         txt("IIF(CHAR_LENGTH(NAME) > 3, 'long', 'short')", "long");
         txt("COALESCE(SUBSTRING(NAME FROM 99), 'gone')", "");
+    }
+
+    #[test]
+    fn resolves_and_evaluates_function_predicates() {
+        // A(int), NAME VARCHAR(10), C CHAR(5) (padded), N NUMERIC(9,2)
+        let columns = vec![
+            RelationColumn { name: "A".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "NAME".into(), field_id: 1, position: 1 },
+            RelationColumn { name: "C".into(), field_id: 2, position: 2 },
+            RelationColumn { name: "N".into(), field_id: 3, position: 3 },
+        ];
+        let d = |dt, len, s| Descriptor {
+            dtype: dt, scale: s, length: len, sub_type: 0, flags: 0, offset: 4,
+        };
+        let descs = vec![
+            d(dtype::LONG, 4, 0),
+            d(dtype::VARYING, 10, 0),
+            d(dtype::TEXT, 5, 0),
+            d(dtype::LONG, 4, -2),
+        ];
+        let row = vec![
+            Value::Int(-7),
+            Value::Text("Hello".into()),
+            Value::Text("ab   ".into()),
+            Value::Scaled(1250, -2),
+        ];
+        let null_row = vec![Value::Null; 4];
+        let build = |s: &str| -> Option<Predicate> {
+            let toks = tokenize(s)?;
+            let mut np = 0usize;
+            let raw = parse_predicate(&toks, &mut np)?;
+            let mut params: Vec<Option<Descriptor>> = Vec::new();
+            resolve_predicate(raw, &columns, &descs, &mut params)
+        };
+        let hit = |s: &str| build(s).unwrap_or_else(|| panic!("{s} refused")).matches(&row);
+
+        // the smoke set, each also engine-checked in serve-real-wherefn.sh
+        assert!(hit("UPPER(NAME) = 'HELLO'"));
+        assert!(!hit("UPPER(NAME) = 'HELLOX'"));
+        assert!(hit("CHAR_LENGTH(NAME) > 3"));
+        assert!(hit("MOD(A, 2) <> 0"));
+        assert!(hit("MOD(A, -2) = -1"));
+        // CHAR padding travels through the call; the compare pad-trims
+        assert!(hit("UPPER(C) = 'AB'"));
+        assert!(hit("TRIM(C) = 'ab'"));
+        assert!(hit("SUBSTRING(NAME FROM 1 FOR 1) = 'H'"));
+        assert!(hit("UPPER(NAME) LIKE 'H%'"));
+        assert!(!hit("UPPER(NAME) NOT LIKE 'H%'"));
+        // desugared forms carry the expression leaf through BETWEEN/IN
+        assert!(hit("CHAR_LENGTH(NAME) BETWEEN 2 AND 5"));
+        assert!(hit("UPPER(NAME) IN ('HELLO', 'X')"));
+        assert!(!hit("UPPER(NAME) NOT IN ('HELLO', 'X')"));
+        // NOT pushes into the leaf as the inverse comparison
+        assert!(!hit("NOT UPPER(NAME) = 'HELLO'"));
+        // an expression on the RIGHT side (plain column left), and on both
+        assert!(hit("NAME = TRIM(' Hello ')"));
+        assert!(!hit("NAME = UPPER('hello')")); // 'Hello' != 'HELLO'
+        assert!(hit("CHAR_LENGTH(NAME) = CHAR_LENGTH(NAME)"));
+        assert!(hit("REVERSE(NAME) = 'olleH'"));
+        // IS [NOT] NULL over a call
+        assert!(hit("UPPER(NAME) IS NOT NULL"));
+        assert!(!hit("UPPER(NAME) IS NULL"));
+        // a NULL input is UNKNOWN everywhere - the row drops, and NOT
+        // of the comparison stays UNKNOWN (still dropped)
+        let p = build("UPPER(NAME) = 'HELLO'").unwrap();
+        assert!(!p.matches(&null_row));
+        let p = build("NOT UPPER(NAME) = 'HELLO'").unwrap();
+        assert!(!p.matches(&null_row));
+        // ...but IS NULL over the call is two-valued
+        assert!(build("UPPER(NAME) IS NULL").unwrap().matches(&null_row));
+
+        // THE NO-RAISE FENCE: anything whose per-row evaluation could
+        // raise refuses at prepare (Term::matches cannot carry the
+        // engine's mid-cursor error)
+        for refused in [
+            "MOD(A, N) = 0",                  // non-literal divisor
+            "MOD(A, 0) = 0",                  // zero divisor
+            "MOD(NAME, 2) = 0",               // text operand
+            "LEFT(NAME, -1) = 'x'",           // negative length raises
+            "LEFT(NAME, A) = 'x'",            // a column length could be negative
+            "SUBSTRING(NAME FROM 1 FOR A) = 'x'", // same
+            "SUBSTRING(NAME FROM NAME) = 'x'", // text start: conversion error
+            "UPPER(NAME) = ?",                // param against an expression side
+            "CAST(A AS VARCHAR(5)) = '1'",    // CAST can raise; not admitted
+        ] {
+            assert!(build(refused).is_none(), "{refused} was admitted");
+        }
+        // safe literal shapes ARE admitted
+        assert!(hit("LEFT(NAME, 2) = 'He'"));
+        assert!(hit("POSITION('l' IN NAME) > 0"));
+        assert!(hit("LPAD(NAME, 3, '*') = 'Hel'"));
+
+        // the tokenizer lexes a whole call - nested calls, parens and
+        // commas inside string literals included - as ONE token
+        let toks = tokenize("REPLACE(NAME, '(', ')') = 'x'").unwrap();
+        assert!(matches!(toks[0], Tok::FnExpr(_)));
+        assert_eq!(toks.len(), 3); // call, =, literal
+        let toks = tokenize("UPPER(LEFT(NAME, 2)) = 'HE'").unwrap();
+        assert!(matches!(
+            &toks[0],
+            Tok::FnExpr(RawExpr::Func(SysFn::Upper, args))
+                if matches!(args[0], RawExpr::Func(SysFn::Left, _))
+        ));
     }
 
     #[test]
