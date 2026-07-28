@@ -13,6 +13,35 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 21: autonomous transactions and cursors
+
+### Converted
+- **IN AUTONOMOUS TRANSACTION DO**: `blr_auto_trans`, a sub-code
+  byte (0), the statement — composing with blocks and POST_EVENT in
+  the battery.
+- **Multi-column MATCHING**: one `blr_equiv` per column, left-nested
+  under `blr_and` (probed on two, batteried on a three-column upsert
+  matching two).
+- **WHEN SQLCODE <n>**: handler code 1 + i16 little-endian — flip
+  twelve.
+- **CURSORS**: `DECLARE name CURSOR FOR (SELECT ...)` is
+  `blr_dcl_cursor` — u16 number, the rse whose relation2 alias
+  carries the CURSOR NAME like a derived table's, u16 output count,
+  `blr_derived_expr`-wrapped outputs. OPEN/CLOSE/FETCH are
+  `blr_cursor_stmt` sub-verbs 0/1/2, fetch carrying its
+  into-assignments. The battery drives a cursor through a WHILE loop
+  guarded by ROW_COUNT.
+- **A new ordering law, pinned three ways**: a variable's INIT is
+  DEFERRED past cursor declarations that follow it — flushing before
+  the next variable's declare or at the section end. Found by the
+  gate (a cursor-after-variable battery statement), settled by two
+  targeted probes.
+
+### Guarded
+- WHEN SQLSTATE (unprobed layout), qualified cursor columns,
+  aggregate cursor selects. Gate: `qa/dsql-proc-blr.sh` grew to 87
+  checks; 236 unit byte-pins.
+
 ## 2026-07-28 — fire-crab-dsql slice 20: UPDATE OR INSERT and settled probes
 
 ### Converted

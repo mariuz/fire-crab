@@ -297,6 +297,21 @@ mod blr {
     pub const CURRENT_TIME: u8 = 0xA2;
     /// blr_equiv - null-safe equality, MATCHING's comparator (probed)
     pub const EQUIV: u8 = 0x2E;
+    /// IN AUTONOMOUS TRANSACTION DO: blr_auto_trans, a sub-code byte
+    /// (0), the statement (probed)
+    pub const AUTO_TRANS: u8 = 0xBB;
+    /// DECLARE ... CURSOR: blr_dcl_cursor, u16 number, the rse (whose
+    /// relation2 alias carries the CURSOR NAME like a derived
+    /// table's), u16 output count, blr_derived_expr-wrapped outputs
+    pub const DCL_CURSOR: u8 = 0xA6;
+    /// blr_derived_expr: count byte, stream byte, value (probed
+    /// wrapping cursor outputs)
+    pub const DERIVED_EXPR: u8 = 0xBF;
+    /// OPEN/CLOSE/FETCH: blr_cursor_stmt, sub-verb (0=open, 1=close,
+    /// 2=fetch + into-assignments), u16 cursor number (probed)
+    pub const CURSOR_STMT: u8 = 0xA7;
+    /// WHEN SQLCODE <n>: handler code 1 + i16 little-endian (probed)
+    pub const SQLCODE_CODE: u8 = 0x01;
     pub const EQL: u8 = 0x2F;
     pub const NEQ: u8 = 0x30;
     pub const GTR: u8 = 0x31;
@@ -822,6 +837,9 @@ struct P<'a> {
     agg_fid_ctx: u8,
     /// domain-validation mode: VALUE means blr_fid(0, 0)
     domain_value: bool,
+    /// declared cursor names in declaration order (their numbers)
+    cursors: Vec<String>,
+    cursor_decls: Vec<CursorDecl>,
     /// context of stream index 0: 1 in view BLR, 0 in procedure
     /// bodies (probed - the FOR SELECT stream is context 0)
     base: u8,
@@ -1854,6 +1872,13 @@ fn is_keyword(w: &str) -> bool {
             | "ROW_COUNT"
             | "GDSCODE"
             | "MATCHING"
+            | "AUTONOMOUS"
+            | "TRANSACTION"
+            | "SQLCODE"
+            | "CURSOR"
+            | "OPEN"
+            | "FETCH"
+            | "CLOSE"
     )
 }
 
@@ -2199,6 +2224,8 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
         proc: None,
         agg_fid_ctx: 1,
         domain_value: false,
+        cursors: Vec::new(),
+        cursor_decls: Vec::new(),
     };
     // a top-level UNION restructures the whole statement: the union
     // node takes context 1 BEFORE any branch stream, so it must be
@@ -2523,6 +2550,49 @@ fn map_bool_to_fids(map: &[MapEntry], b: Bool, fid_ctx: u8) -> Option<Bool> {
     })
 }
 
+/// blr_dcl_cursor: number, the rse (relation2 alias carrying the
+/// CURSOR NAME), u16 output count, blr_derived_expr-wrapped outputs.
+fn emit_cursor_decl(out: &mut Vec<u8>, d: &CursorDecl) {
+    out.push(blr::DCL_CURSOR);
+    out.extend_from_slice(&d.num.to_le_bytes());
+    out.push(blr::RSE);
+    out.push(1);
+    out.push(blr::RELATION2);
+    out.push(d.table.len() as u8);
+    out.extend_from_slice(d.table.as_bytes());
+    let alias = format!("\"{}\" \"PUBLIC\".\"{}\"", d.name, d.table);
+    out.push(alias.len() as u8);
+    out.extend_from_slice(alias.as_bytes());
+    out.push(d.ctx);
+    if let Some(b) = &d.boolean {
+        out.push(blr::BOOLEAN);
+        emit_bool(out, b);
+    }
+    if !d.sort.is_empty() {
+        out.push(blr::SORT);
+        out.push(d.sort.len() as u8);
+        for (desc, key) in &d.sort {
+            out.push(if *desc {
+                blr::DESCENDING
+            } else {
+                blr::ASCENDING
+            });
+            emit_val(out, key);
+        }
+    }
+    out.push(blr::END);
+    out.extend_from_slice(&(d.cols.len() as u16).to_le_bytes());
+    for c in &d.cols {
+        out.push(blr::DERIVED_EXPR);
+        out.push(1);
+        out.push(d.ctx);
+        out.push(blr::FIELD);
+        out.push(d.ctx);
+        out.push(c.len() as u8);
+        out.extend_from_slice(c.as_bytes());
+    }
+}
+
 /// Compile a single-FOR-SELECT procedure to the BLR the engine's DSQL
 /// stores in `RDB$PROCEDURE_BLR` - byte for byte. The accepted shape:
 ///
@@ -2563,6 +2633,8 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         proc: None,
         agg_fid_ctx: 1,
         domain_value: false,
+        cursors: Vec::new(),
+        cursor_decls: Vec::new(),
     };
     if !(p.kw("CREATE") && p.kw("PROCEDURE")) {
         return None;
@@ -2642,6 +2714,15 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
     // procedures INTERLEAVE declare/init per variable (probed - where
     // triggers group)
     let mut locals: Vec<(Dsc, Option<Val>)> = Vec::new();
+    // source order of the declaration section: a variable's INIT is
+    // DEFERRED past any cursor declarations that follow it, flushing
+    // before the next variable's declare or at the section end
+    // (probed on var-then-cursor, cursor-then-var, explicit inits)
+    enum DeclItem {
+        Var(usize),
+        Cur(usize),
+    }
+    let mut decl_seq: Vec<DeclItem> = Vec::new();
     while p.kw("DECLARE") {
         let _ = p.kw("VARIABLE");
         let Some(Tok::Ident(name)) = p.t.get(p.i) else {
@@ -2652,6 +2733,100 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         }
         let name = name.clone();
         p.i += 1;
+        // DECLARE <name> CURSOR FOR (SELECT cols FROM tbl [WHERE]
+        // [ORDER BY]); - the rse's relation2 alias carries the
+        // CURSOR NAME, outputs wrap in blr_derived_expr (probed)
+        if p.kw("CURSOR") {
+            if !p.kw("FOR") || !matches!(p.t.get(p.i), Some(Tok::LParen)) {
+                return None;
+            }
+            p.i += 1;
+            if !p.kw("SELECT") {
+                return None;
+            }
+            let cols_raw = p.select_list()??;
+            if cols_raw.is_empty() {
+                return None;
+            }
+            let Some(Tok::Ident(tbl)) = p.t.get(p.i) else {
+                return None;
+            };
+            if is_keyword(tbl) {
+                return None;
+            }
+            let tbl = tbl.clone();
+            p.i += 1;
+            p.streams.push(Stream {
+                name: tbl.clone(),
+                alias: None,
+                derived: None,
+            });
+            let sidx = p.streams.len() - 1;
+            let ctx = sidx as u8 + p.base;
+            let saved = p.sub.replace(sidx);
+            let mut cols = Vec::with_capacity(cols_raw.len());
+            for (q, n) in &cols_raw {
+                if q.is_some() {
+                    return None; // qualified cursor columns: unprobed
+                }
+                cols.push(n.clone());
+            }
+            let boolean = if p.kw("WHERE") {
+                Some(p.bool_or()?)
+            } else {
+                None
+            };
+            let mut sort: Vec<(bool, Val)> = Vec::new();
+            if p.kw("ORDER") {
+                if !p.kw("BY") {
+                    return None;
+                }
+                loop {
+                    let Some(Tok::Ident(k)) = p.t.get(p.i) else {
+                        return None;
+                    };
+                    if is_keyword(k) {
+                        return None;
+                    }
+                    let key = Val::Field(ctx, k.clone());
+                    p.i += 1;
+                    let descending = if p.kw("DESC") {
+                        true
+                    } else {
+                        let _ = p.kw("ASC");
+                        false
+                    };
+                    sort.push((descending, key));
+                    if matches!(p.t.get(p.i), Some(Tok::Comma)) {
+                        p.i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            p.sub = saved;
+            if !matches!(p.t.get(p.i), Some(Tok::RParen)) {
+                return None;
+            }
+            p.i += 1;
+            if !matches!(p.t.get(p.i), Some(Tok::Semi)) {
+                return None;
+            }
+            p.i += 1;
+            let num = p.cursors.len() as u16;
+            decl_seq.push(DeclItem::Cur(p.cursor_decls.len()));
+            p.cursors.push(name.clone());
+            p.cursor_decls.push(CursorDecl {
+                name,
+                num,
+                table: tbl,
+                ctx,
+                cols,
+                boolean,
+                sort,
+            });
+            continue;
+        }
         let dsc = p.cast_target()?;
         p.local_vars.push(name);
         let init = if matches!(p.t.get(p.i), Some(Tok::Cmp(CmpOp::Eql))) {
@@ -2660,6 +2835,7 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         } else {
             None
         };
+        decl_seq.push(DeclItem::Var(locals.len()));
         locals.push((dsc, init));
         if !matches!(p.t.get(p.i), Some(Tok::Semi)) {
             return None;
@@ -2721,18 +2897,37 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         out.push(blr::VARIABLE);
         out.extend_from_slice(&(vi as u16).to_le_bytes());
     }
-    for (li, (d, init)) in locals.iter().enumerate() {
-        let vi = n + li;
-        out.push(blr::DECLARE);
-        out.extend_from_slice(&(vi as u16).to_le_bytes());
-        emit_dsc(&mut out, *d);
+    // the declaration section in SOURCE order, with each variable's
+    // init deferred past following cursor declarations (probed)
+    let emit_init = |out: &mut Vec<u8>, vi: usize, init: &Option<Val>| {
         out.push(blr::ASSIGNMENT);
         match init {
-            Some(v) => emit_val(&mut out, v),
+            Some(v) => emit_val(out, v),
             None => out.push(blr::NULL),
         }
         out.push(blr::VARIABLE);
         out.extend_from_slice(&(vi as u16).to_le_bytes());
+    };
+    let mut pending: Option<usize> = None;
+    for item in &decl_seq {
+        match item {
+            DeclItem::Var(li) => {
+                if let Some(pli) = pending.take() {
+                    emit_init(&mut out, n + pli, &locals[pli].1);
+                }
+                let vi = n + li;
+                out.push(blr::DECLARE);
+                out.extend_from_slice(&(vi as u16).to_le_bytes());
+                emit_dsc(&mut out, locals[*li].0);
+                pending = Some(*li);
+            }
+            DeclItem::Cur(ci) => {
+                emit_cursor_decl(&mut out, &p.cursor_decls[*ci]);
+            }
+        }
+    }
+    if let Some(pli) = pending.take() {
+        emit_init(&mut out, n + pli, &locals[pli].1);
     }
     out.push(blr::STALL);
     out.push(blr::LABEL);
@@ -2796,12 +2991,30 @@ enum TrigStmt {
         org_ctx: u8,
         cols: Vec<String>,
         vals: Vec<Val>,
-        mcol: String,
-        midx: usize,
+        matching: Vec<(String, usize)>,
     },
     /// (FOR) SELECT - the whole probed select machinery as ONE
     /// statement inside a body
     ForSel(Box<ForSel>),
+    /// IN AUTONOMOUS TRANSACTION DO <stmt>
+    AutoTrans(Box<TrigStmt>),
+    /// OPEN c; / CLOSE c; - blr_cursor_stmt sub-verbs 0 and 1
+    CursorOp(u8, u16),
+    /// FETCH c INTO :v, ...; - sub-verb 2 + the into-assignments
+    CursorFetch(u16, Vec<(Val, u16)>),
+}
+
+/// A DECLARE ... CURSOR FOR (SELECT ...): the rse's relation2 alias
+/// carries the CURSOR NAME (like a derived table's), outputs wrap in
+/// blr_derived_expr.
+struct CursorDecl {
+    name: String,
+    num: u16,
+    table: String,
+    ctx: u8,
+    cols: Vec<String>,
+    boolean: Option<Bool>,
+    sort: Vec<(bool, Val)>,
 }
 
 /// What a WHEN clause catches.
@@ -2812,6 +3025,8 @@ enum HandlerCode {
     Exception(String),
     /// WHEN GDSCODE <name> - 0, counted name (uppercased)
     Gds(String),
+    /// WHEN SQLCODE <n> - 1, i16 little-endian
+    SqlCode(i16),
 }
 
 /// A FOR SELECT / SELECT INTO inside a body: `label` is Some for the
@@ -2969,6 +3184,10 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                         out.push(name.len() as u8);
                         out.extend_from_slice(name.as_bytes());
                     }
+                    HandlerCode::SqlCode(n) => {
+                        out.push(blr::SQLCODE_CODE);
+                        out.extend_from_slice(&n.to_le_bytes());
+                    }
                 }
                 // a BLOCK as the handler's body nests blr_block AGAIN
                 // with no handler section of its own (probed)
@@ -2987,6 +3206,29 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
             }
             out.push(blr::END);
         }
+        TrigStmt::AutoTrans(inner) => {
+            out.push(blr::AUTO_TRANS);
+            out.push(0);
+            emit_trig_stmt(out, inner);
+        }
+        TrigStmt::CursorOp(sub, num) => {
+            out.push(blr::CURSOR_STMT);
+            out.push(*sub);
+            out.extend_from_slice(&num.to_le_bytes());
+        }
+        TrigStmt::CursorFetch(num, assigns) => {
+            out.push(blr::CURSOR_STMT);
+            out.push(2);
+            out.extend_from_slice(&num.to_le_bytes());
+            out.push(blr::BEGIN);
+            for (src, vi) in assigns {
+                out.push(blr::ASSIGNMENT);
+                emit_val(out, src);
+                out.push(blr::VARIABLE);
+                out.extend_from_slice(&vi.to_le_bytes());
+            }
+            out.push(blr::END);
+        }
         TrigStmt::UpdateOrInsert {
             rel,
             store_ctx,
@@ -2994,8 +3236,7 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
             org_ctx,
             cols,
             vals,
-            mcol,
-            midx,
+            matching,
         } => {
             out.push(blr::BEGIN);
             out.push(blr::FOR);
@@ -3006,12 +3247,20 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
             out.push(1);
             emit_stream(out, rel, *org_ctx);
             out.push(blr::BOOLEAN);
-            out.push(blr::EQUIV);
-            out.push(blr::FIELD);
-            out.push(*org_ctx);
-            out.push(mcol.len() as u8);
-            out.extend_from_slice(mcol.as_bytes());
-            emit_val(out, &vals[*midx]);
+            // one blr_equiv per MATCHING column, left-nested under
+            // blr_and (probed on two columns)
+            for _ in 1..matching.len() {
+                out.push(blr::AND);
+            }
+            for (mi, (mcol, midx)) in matching.iter().enumerate() {
+                out.push(blr::EQUIV);
+                out.push(blr::FIELD);
+                out.push(*org_ctx);
+                out.push(mcol.len() as u8);
+                out.extend_from_slice(mcol.as_bytes());
+                emit_val(out, &vals[*midx]);
+                let _ = mi;
+            }
             out.push(blr::END);
             out.push(blr::MODIFY);
             out.push(*org_ctx);
@@ -3505,8 +3754,19 @@ impl<'a> P<'a> {
                     let n = n.clone();
                     self.i += 1;
                     HandlerCode::Gds(n)
+                } else if self.kw("SQLCODE") {
+                    let neg = matches!(self.t.get(self.i), Some(Tok::Minus));
+                    if neg {
+                        self.i += 1;
+                    }
+                    let Some(Tok::Int(v)) = self.t.get(self.i) else {
+                        return None;
+                    };
+                    let v = i16::try_from(*v).ok()?;
+                    self.i += 1;
+                    HandlerCode::SqlCode(if neg { -v } else { v })
                 } else {
-                    return None; // WHEN SQLCODE/SQLSTATE: unprobed
+                    return None; // WHEN SQLSTATE: unprobed
                 };
                 if !self.kw("DO") {
                     return None;
@@ -3648,6 +3908,82 @@ impl<'a> P<'a> {
             }
             self.i += 1;
             return Some(TrigStmt::Exit);
+        }
+        if self.kw("IN") {
+            if !(self.kw("AUTONOMOUS") && self.kw("TRANSACTION") && self.kw("DO")) {
+                return None;
+            }
+            return Some(TrigStmt::AutoTrans(Box::new(self.trig_stmt()?)));
+        }
+        if self.kw("OPEN") || matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "CLOSE")
+        {
+            // (the OPEN kw was consumed above; CLOSE is consumed here)
+            let sub = if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "CLOSE")
+            {
+                self.i += 1;
+                1u8
+            } else {
+                0u8
+            };
+            let Some(Tok::Ident(name)) = self.t.get(self.i) else {
+                return None;
+            };
+            let num = self.cursors.iter().position(|n| n == name)? as u16;
+            self.i += 1;
+            if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                return None;
+            }
+            self.i += 1;
+            return Some(TrigStmt::CursorOp(sub, num));
+        }
+        if self.kw("FETCH") {
+            let Some(Tok::Ident(name)) = self.t.get(self.i) else {
+                return None;
+            };
+            let num = self.cursors.iter().position(|n| n == name)? as u16;
+            let name = name.clone();
+            self.i += 1;
+            if !self.kw("INTO") {
+                return None;
+            }
+            let mut vars = Vec::new();
+            loop {
+                if !matches!(self.t.get(self.i), Some(Tok::Colon)) {
+                    return None;
+                }
+                self.i += 1;
+                let Some(Tok::Ident(v)) = self.t.get(self.i) else {
+                    return None;
+                };
+                let vi = self.local_vars.iter().position(|n| n == v)? as u16;
+                vars.push(vi);
+                self.i += 1;
+                if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                    self.i += 1;
+                } else {
+                    break;
+                }
+            }
+            if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                return None;
+            }
+            self.i += 1;
+            // the fetch's assignments read the cursor's OUTPUT
+            // columns as fields at the cursor's context
+            let decl = self
+                .cursor_decls
+                .iter()
+                .find(|d| d.name == name)?;
+            if vars.len() != decl.cols.len() {
+                return None;
+            }
+            let assigns = decl
+                .cols
+                .iter()
+                .zip(&vars)
+                .map(|(c, vi)| (Val::Field(decl.ctx, c.clone()), *vi))
+                .collect();
+            return Some(TrigStmt::CursorFetch(num, assigns));
         }
         if self.kw("POST_EVENT") {
             let v = self.val()?;
@@ -3855,20 +4191,28 @@ impl<'a> P<'a> {
                     return None;
                 }
                 self.i += 1;
-                let Some(Tok::Ident(mcol)) = self.t.get(self.i) else {
-                    return None;
-                };
-                let mcol = mcol.clone();
-                self.i += 1;
-                if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
-                    return None; // multiple MATCHING columns: unprobed
+                let mut matching: Vec<(String, usize)> = Vec::new();
+                loop {
+                    let Some(Tok::Ident(mcol)) = self.t.get(self.i) else {
+                        return None;
+                    };
+                    let mcol = mcol.clone();
+                    self.i += 1;
+                    let midx = cols.iter().position(|c| c == &mcol)?;
+                    matching.push((mcol, midx));
+                    match self.t.get(self.i)? {
+                        Tok::Comma => self.i += 1,
+                        Tok::RParen => {
+                            self.i += 1;
+                            break;
+                        }
+                        _ => return None,
+                    }
                 }
-                self.i += 1;
                 if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
                     return None;
                 }
                 self.i += 1;
-                let midx = cols.iter().position(|c| c == &mcol)?;
                 let st = Stream {
                     name: rel,
                     alias: None,
@@ -3897,8 +4241,7 @@ impl<'a> P<'a> {
                     org_ctx,
                     cols,
                     vals,
-                    mcol,
-                    midx,
+                    matching,
                 });
             }
             // UPDATE rel SET col = v [, ...] [WHERE ...]; - the NEW
@@ -4019,6 +4362,8 @@ pub fn compile_default(sql: &str) -> Option<Vec<u8>> {
         proc: None,
         agg_fid_ctx: 1,
         domain_value: false,
+        cursors: Vec::new(),
+        cursor_decls: Vec::new(),
     };
     if !p.kw("DEFAULT") {
         return None;
@@ -4084,6 +4429,8 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
         proc: None,
         agg_fid_ctx: 1,
         domain_value: false,
+        cursors: Vec::new(),
+        cursor_decls: Vec::new(),
     };
     if !(p.kw("COMPUTED") && p.kw("BY")) {
         return None;
@@ -4142,6 +4489,8 @@ pub fn compile_check(sql: &str) -> Option<Vec<u8>> {
         proc: None,
         agg_fid_ctx: 1,
         domain_value: false,
+        cursors: Vec::new(),
+        cursor_decls: Vec::new(),
     };
     if !p.kw("CHECK") {
         return None;
@@ -4205,6 +4554,8 @@ pub fn compile_validation(sql: &str) -> Option<Vec<u8>> {
         proc: None,
         agg_fid_ctx: 1,
         domain_value: true,
+        cursors: Vec::new(),
+        cursor_decls: Vec::new(),
     };
     if !p.kw("CHECK") {
         return None;
@@ -4288,6 +4639,8 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
         proc: None,
         agg_fid_ctx: 1,
         domain_value: false,
+        cursors: Vec::new(),
+        cursor_decls: Vec::new(),
     };
     if !(p.kw("CREATE") && p.kw("TRIGGER")) {
         return None;
@@ -5603,10 +5956,54 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_twenty_one_shapes_byte_for_byte() {
+        // IN AUTONOMOUS TRANSACTION DO: blr_auto_trans, sub-code 0,
+        // the statement
+        pin_proc(
+            "CREATE PROCEDURE QO1 AS BEGIN IN AUTONOMOUS TRANSACTION DO INSERT INTO U2 (UID) VALUES (1); END",
+            "0502040101000700029B11000202BB000F4A02553200020115080001000000170003554944FFFFFFFF0E010201150700000019010000FFFF4C",
+        );
+        // multi-column MATCHING: one blr_equiv per column, left-nested
+        // under blr_and (flip of the single-column restriction)
+        pin_proc(
+            "CREATE PROCEDURE QO2 (I1 INTEGER, I2 INTEGER) AS BEGIN UPDATE OR INSERT INTO U2 (UID, UA) VALUES (:I1, :I2) MATCHING (UID, UA); END",
+            "05020400040008000700080007000401010007000C00029B110002020207D9010443014A02553202473A2E1702035549442900000001002E1702025541290002000300FF0A02010201290000000100170103554944012900020003001701025541FF082FB115080005000000150800000000000F4A025532000201290000000100170003554944012900020003001700025541FFFFFFFFFFFF0E010201150700000019010000FFFF4C",
+        );
+        // WHEN SQLCODE <n>: code 1 + i16 little-endian (flip twelve)
+        pin_proc(
+            "CREATE PROCEDURE QO3 RETURNS (R1 INTEGER) AS BEGIN BEGIN R1 = 1; WHEN SQLCODE -802 DO R1 = -1; END SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B11000202810201150800010000001A0000FF82010001DEFC01150800FFFFFFFF1A0000FF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // CURSORS: blr_dcl_cursor(num, rse, out-count, derived_exprs)
+        // - the cursor NAME rides in the relation2 alias like a
+        // derived table's; OPEN/CLOSE/FETCH are blr_cursor_stmt
+        // sub-verbs 0/1/2, fetch carrying its into-assignments
+        pin_proc(
+            "CREATE PROCEDURE QO4 RETURNS (R1 INTEGER) AS DECLARE C1 CURSOR FOR (SELECT ID FROM T); BEGIN OPEN C1; FETCH C1 INTO :R1; CLOSE C1; SUSPEND; END",
+            "050204010300080007000700020300000800012D1A0000A600004301920154112243312220225055424C4943222E22542200FF0100BF010017000249449B11000202A7000000A7020000020117000249441A0000FFA70100000E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+    }
+
+    #[test]
+    fn declaration_order_law() {
+        // a variable's INIT is DEFERRED past cursor declarations that
+        // follow it, flushing before the next variable's declare or
+        // at the section end (probed three ways)
+        pin_proc(
+            "CREATE PROCEDURE QP_A RETURNS (R1 INTEGER) AS DECLARE CX CURSOR FOR (SELECT ID FROM T); DECLARE V1 INTEGER; BEGIN OPEN CX; FETCH CX INTO :V1; R1 = V1; CLOSE CX; SUSPEND; END",
+            "050204010300080007000700020300000800012D1A0000A600004301920154112243582220225055424C4943222E22542200FF0100BF010017000249440301000800012D1A01009B11000202A7000000A7020000020117000249441A0100FF011A01001A0000A70100000E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE QP_B RETURNS (R1 INTEGER) AS DECLARE V1 INTEGER = 5; DECLARE CX CURSOR FOR (SELECT ID FROM T); BEGIN OPEN CX; FETCH CX INTO :V1; R1 = V1; CLOSE CX; SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00000301000800A600004301920154112243582220225055424C4943222E22542200FF0100BF0100170002494401150800050000001A01009B11000202A7000000A7020000020117000249441A0100FF011A01001A0000A70100000E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+    }
+
+    #[test]
     fn handler_refusals() {
         for sql in [
-            // WHEN SQLCODE / SQLSTATE: unprobed code layouts
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN BEGIN R1 = 1; WHEN SQLCODE 100 DO R1 = 0; END SUSPEND; END",
+            // WHEN SQLSTATE: unprobed code layout
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN BEGIN R1 = 1; WHEN SQLSTATE '22012' DO R1 = 0; END SUSPEND; END",
             // UPDATE OR INSERT without MATCHING needs the primary key
             "CREATE PROCEDURE X (I1 INTEGER) AS BEGIN UPDATE OR INSERT INTO U2 (UID) VALUES (:I1); END",
         ] {

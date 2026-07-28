@@ -307,6 +307,11 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # a NAME can ride in an ALIAS SLOT (cursors reuse the derived-
+    # table alias convention) - and DECLARATION SECTIONS have their
+    # own ordering laws (inits defer past cursor decls): when a gate
+    # entry diffs on ORDER, pin the order with targeted probes before
+    # touching the emitter
     # composite statements (upsert) are TRANSCRIPTS of their
     # execution plan: try-update, test row_count, store - and the
     # CONTEXT ORDER records the COMPILE order, not the run order

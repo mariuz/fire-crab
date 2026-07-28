@@ -4423,7 +4423,7 @@ expressions, and alias-less derived tables refuse. The slice-5
 refusal of scalar subselects became a feature; its gate slot flipped
 to a positive check, the fifth such flip in the project.
 
-### SQL → BLR, oracle number two (`qa/dsql-proc-blr.sh`, 80 checks)
+### SQL → BLR, oracle number two (`qa/dsql-proc-blr.sh`, 87 checks)
 
 Views cannot hold ORDER BY - but a procedure's `FOR SELECT ... DO
 SUSPEND` body can, and `RDB$PROCEDURE_BLR` stores ITS compiled BLR
@@ -4665,6 +4665,21 @@ multiple handlers emit one sequential error-handler section per
 WHEN, and a BLOCK as a handler's body nests blr_block again with no
 handler section of its own - the battery runs a handler block
 containing an EXIT.
+
+Slice 21 rounded out the PSQL surface: IN AUTONOMOUS TRANSACTION DO
+(blr_auto_trans + sub-code 0), multi-column MATCHING (equivs
+left-nested under blr_and), WHEN SQLCODE (code 1 + i16 - flip
+twelve), and CURSORS - blr_dcl_cursor carrying the cursor NAME in
+its rse's relation2 alias exactly the way derived tables carry
+theirs, blr_derived_expr around each output, and blr_cursor_stmt
+sub-verbs for OPEN/CLOSE/FETCH with the fetch's into-assignments
+reading the cursor's columns at the cursor's context. The battery
+drives one cursor through a WHILE/ROW_COUNT/EXIT loop. And the gate
+FOUND a law before any probe did: a cursor-after-variable battery
+statement diffed, and two targeted probes pinned the rule - a
+variable's INIT is DEFERRED past cursor declarations that follow
+it, flushing before the next variable's declare or at the section
+end. The gate is a probe that runs itself.
 
 The slice's best find was a FIX. The CHECK battery ran
 S IN ('a','b') and the engine's bytes carried a surprise: EACH item
