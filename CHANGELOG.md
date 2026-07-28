@@ -13,6 +13,34 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — CASE, and the conditional typing law
+
+### Converted
+- **CASE expressions**, searched and simple, with full boolean
+  conditions (`OR`/`AND`/`NOT`/parenthesised groups, three-valued
+  Kleene) — and `IIF` upgraded to the same condition grammar (the
+  engine parses IIF into a searched CASE; both header as `CASE`). The
+  simple form desugars to `=` conditions, so `WHEN NULL` never matches
+  — the engine's rule, for free. Gate: `qa/serve-real-case.sh`,
+  44 checks.
+- **`docs/expression-surface.md`** — the converted expression subsystem
+  documented against its engine sources (`parse.y` precedence,
+  `ExprNodes.cpp` scale/promotion laws, `SysFunction.cpp`, CVT
+  coercions, the IIF→CASE lowering), with every probed law and the
+  refusal policy in one place.
+
+### Fixed
+- **The conditional typing law**: a conditional typed from its FIRST
+  branch alone, so `COALESCE(A, 0.5)` — integer first, scaled second —
+  announced scale 0 and the scaled branch's raw value could not decode
+  (0.5 read as 0.05, or an overflow refusal). Probed: the engine
+  announces scale −1 and prints `-7.0`. Two rules close it: any
+  exact-numeric branch beside integer ones types the conditional
+  Numeric at the branches' minimum scale, and every branch value is
+  ALIGNED to the announced scale at emit (`value_of`). A latent bug in
+  ALL the older conditionals, exposed by the new gate's mixed-scale
+  branches.
+
 ## 2026-07-28 — the scalar-function surface
 
 ### Converted

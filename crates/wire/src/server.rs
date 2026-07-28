@@ -720,11 +720,35 @@ impl ProjCol {
     fn value_of(&self, values: &[Value]) -> Result<Value, EvalErr> {
         match &self.expr {
             Some(e) => {
-                let v = e.eval(values)?;
-                // the describe is the contract: an INT64-announced
-                // expression whose exact value left the i64 range is the
-                // engine's runtime integer overflow (SQLSTATE 22003) -
-                // never truncated bytes
+                let mut v = e.eval(values)?;
+                // THE DESCRIBE'S SCALE IS THE CONTRACT. A conditional's
+                // branches each carry their OWN scale (CASE WHEN ... THEN
+                // N ELSE 0.5), while the describe announced the WIDEST
+                // (result_scale, the minimum). The client divides the raw
+                // integer by 10^announced, so a value still at its
+                // branch's scale decodes WRONG (0.5 announced at -2 read
+                // as 0.05) - align it exactly here. The announced scale
+                // is the min, so alignment only ever multiplies.
+                if let Some((raw, vs)) = numeric_parts(&v) {
+                    let announced = self.scale as i8;
+                    if vs != announced && !matches!(v, Value::Null) {
+                        if vs < announced {
+                            // the announce is the branch minimum, so a
+                            // FINER value cannot appear; refuse loudly
+                            // rather than truncate digits
+                            return Err(EvalErr::IntegerOverflow);
+                        }
+                        let pow = 10i128
+                            .checked_pow((vs - announced) as u32)
+                            .ok_or(EvalErr::IntegerOverflow)?;
+                        let raw = raw.checked_mul(pow).ok_or(EvalErr::IntegerOverflow)?;
+                        v = scaled_value(raw, announced);
+                    }
+                }
+                // the describe is the contract, part two: an INT64-
+                // announced expression whose exact value left the i64
+                // range is the engine's runtime integer overflow
+                // (SQLSTATE 22003) - never truncated bytes
                 if !matches!(self.wire, Wire::Int128) && matches!(v, Value::Int128(..)) {
                     return Err(EvalErr::IntegerOverflow);
                 }
@@ -11571,6 +11595,13 @@ enum RawExpr {
     /// the special syntaxes normalize into it (SUBSTRING(s FROM p FOR n)
     /// -> [s, p, n]; TRIM([side] [what FROM] s) -> [what, s]).
     Func(SysFn, Vec<RawExpr>),
+    /// `CASE [WHEN <cond> THEN <expr>]... [ELSE <expr>] END` - the
+    /// searched form; the SIMPLE form (`CASE <operand> WHEN <value>
+    /// ...`) desugars at parse into `<operand> = <value>` conditions,
+    /// which carries the engine's rule for free: `WHEN NULL` never
+    /// matches, because `x = NULL` is UNKNOWN (probed). The engine
+    /// parses IIF into this same node (its un-aliased header is CASE).
+    Case(Vec<(RawCond, RawExpr)>, Option<Box<RawExpr>>),
 }
 
 /// The built-in scalar functions this server evaluates. Two engine
@@ -11646,15 +11677,19 @@ impl SysFn {
     }
 }
 
-/// The condition inside an `IIF` - a comparison of two expressions, or a
-/// NULL test. Kept separate from the WHERE predicate machinery because
-/// this one lives INSIDE an expression and evaluates per row to a value,
-/// not to a filter.
+/// The condition inside an `IIF` or a searched `CASE WHEN` - a boolean
+/// over expression comparisons and NULL tests, with `AND`/`OR`/`NOT`
+/// and parenthesised groups. Kept separate from the WHERE predicate
+/// machinery because this one lives INSIDE an expression and evaluates
+/// per row to a value, not to a filter.
 #[derive(Clone)]
 enum RawCond {
     Cmp(Box<RawExpr>, Cmp, Box<RawExpr>),
     IsNull(Box<RawExpr>),
     IsNotNull(Box<RawExpr>),
+    Not(Box<RawCond>),
+    And(Vec<RawCond>),
+    Or(Vec<RawCond>),
 }
 
 /// The target of a `CAST`. Text targets carry their declared width and
@@ -11689,6 +11724,49 @@ fn parse_raw_expr(s: &str) -> Option<RawExpr> {
         return None;
     }
     Some(e)
+}
+
+/// Parse a full boolean condition - `OR` over `AND` over `NOT` /
+/// parenthesised groups / comparison leaves - the condition grammar
+/// `IIF(...)` and a searched `CASE WHEN` take (probed: the engine
+/// accepts `IIF(A > 0 AND B > 1, ...)` and
+/// `CASE WHEN (A > 0 OR A < -5) AND S = 'x' THEN ...`).
+fn parse_cond_or(b: &[char], pos: &mut usize) -> Option<RawCond> {
+    let mut parts = vec![parse_cond_and(b, pos)?];
+    while take_keyword(b, pos, "OR") {
+        parts.push(parse_cond_and(b, pos)?);
+    }
+    Some(if parts.len() == 1 { parts.pop()? } else { RawCond::Or(parts) })
+}
+
+fn parse_cond_and(b: &[char], pos: &mut usize) -> Option<RawCond> {
+    let mut parts = vec![parse_cond_unary(b, pos)?];
+    while take_keyword(b, pos, "AND") {
+        parts.push(parse_cond_unary(b, pos)?);
+    }
+    Some(if parts.len() == 1 { parts.pop()? } else { RawCond::And(parts) })
+}
+
+fn parse_cond_unary(b: &[char], pos: &mut usize) -> Option<RawCond> {
+    if take_keyword(b, pos, "NOT") {
+        return Some(RawCond::Not(Box::new(parse_cond_unary(b, pos)?)));
+    }
+    skip_ws(b, pos);
+    // an opening paren is ambiguous: a boolean group `(A > 1 OR B > 2)`
+    // or a parenthesised expression `(A + 1) > 2`. Try the group on a
+    // POSITION COPY; fall back to the comparison parser (whose
+    // expression atoms consume their own parens) when it does not close.
+    if b.get(*pos) == Some(&'(') {
+        let mut p2 = *pos + 1;
+        if let Some(c) = parse_cond_or(b, &mut p2) {
+            skip_ws(b, &mut p2);
+            if b.get(p2) == Some(&')') {
+                *pos = p2 + 1;
+                return Some(c);
+            }
+        }
+    }
+    parse_raw_cond(b, pos)
 }
 
 /// [parse_raw_expr] without the bare-column rejection - what a stored
@@ -11939,8 +12017,9 @@ fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                 *pos += 1; // '('
                 let up = word.to_ascii_uppercase();
                 let node = if up == "IIF" {
-                    // IIF(<cond>, <then>, <else>)
-                    let cond = parse_raw_cond(b, pos)?;
+                    // IIF(<cond>, <then>, <else>) - a full boolean
+                    // condition, exactly what a searched CASE takes
+                    let cond = parse_cond_or(b, pos)?;
                     skip_ws(b, pos);
                     if b.get(*pos) != Some(&',') {
                         return None;
@@ -11985,6 +12064,8 @@ fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                 }
                 *pos += 1; // ')'
                 Some(node)
+            } else if !quoted && word.eq_ignore_ascii_case("CASE") {
+                parse_case_tail(b, pos)
             } else if !quoted && sysfn_named(&word).is_some() && {
                 skip_ws(b, pos);
                 b.get(*pos) == Some(&'(')
@@ -12031,22 +12112,34 @@ fn raw_bad_substring_len(e: &RawExpr) -> Option<i64> {
         RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => {
             raw_bad_substring_len(a).or_else(|| raw_bad_substring_len(b))
         }
-        RawExpr::Iif(c, a, b) => {
-            let in_cond = match &**c {
-                RawCond::Cmp(x, _, y) => {
-                    raw_bad_substring_len(x).or_else(|| raw_bad_substring_len(y))
-                }
-                RawCond::IsNull(x) | RawCond::IsNotNull(x) => raw_bad_substring_len(x),
-            };
-            in_cond
-                .or_else(|| raw_bad_substring_len(a))
-                .or_else(|| raw_bad_substring_len(b))
-        }
+        RawExpr::Iif(c, a, b) => raw_cond_bad_substring_len(c)
+            .or_else(|| raw_bad_substring_len(a))
+            .or_else(|| raw_bad_substring_len(b)),
+        RawExpr::Case(branches, else_) => branches
+            .iter()
+            .find_map(|(c, t)| {
+                raw_cond_bad_substring_len(c).or_else(|| raw_bad_substring_len(t))
+            })
+            .or_else(|| else_.as_ref().and_then(|e| raw_bad_substring_len(e))),
         RawExpr::Col(_)
         | RawExpr::Int(_)
         | RawExpr::Dec(..)
         | RawExpr::Str(_)
         | RawExpr::Null => None,
+    }
+}
+
+/// [raw_bad_substring_len] through a condition's expression sides.
+fn raw_cond_bad_substring_len(c: &RawCond) -> Option<i64> {
+    match c {
+        RawCond::Cmp(x, _, y) => {
+            raw_bad_substring_len(x).or_else(|| raw_bad_substring_len(y))
+        }
+        RawCond::IsNull(x) | RawCond::IsNotNull(x) => raw_bad_substring_len(x),
+        RawCond::Not(inner) => raw_cond_bad_substring_len(inner),
+        RawCond::And(parts) | RawCond::Or(parts) => {
+            parts.iter().find_map(raw_cond_bad_substring_len)
+        }
     }
 }
 
@@ -12190,6 +12283,55 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
     Some(RawExpr::Func(f, args))
 }
 
+/// Parse the tail of a `CASE` expression, `pos` just past the CASE
+/// keyword. Both forms:
+///
+///   CASE WHEN <cond> THEN <expr> [WHEN ...] [ELSE <expr>] END
+///   CASE <operand> WHEN <value> THEN <expr> [WHEN ...] [ELSE <expr>] END
+///
+/// The simple form desugars into searched conditions `<operand> =
+/// <value>` - which is the engine's own semantics: only a TRUE
+/// comparison takes a branch, so a NULL operand (or `WHEN NULL`) never
+/// matches and falls to ELSE (probed). Missing ELSE is NULL.
+fn parse_case_tail(b: &[char], pos: &mut usize) -> Option<RawExpr> {
+    // the simple form's operand: whatever sits between CASE and the
+    // first WHEN (peeked with a position copy)
+    let operand = {
+        let mut p2 = *pos;
+        if take_keyword(b, &mut p2, "WHEN") {
+            None
+        } else {
+            Some(expr_add(b, pos)?)
+        }
+    };
+    let mut branches = Vec::new();
+    while take_keyword(b, pos, "WHEN") {
+        let cond = match &operand {
+            Some(op) => {
+                let v = expr_add(b, pos)?;
+                RawCond::Cmp(Box::new(op.clone()), Cmp::Eq, Box::new(v))
+            }
+            None => parse_cond_or(b, pos)?,
+        };
+        if !take_keyword(b, pos, "THEN") {
+            return None;
+        }
+        branches.push((cond, expr_add(b, pos)?));
+    }
+    if branches.is_empty() {
+        return None; // CASE with no WHEN is a syntax error
+    }
+    let else_ = if take_keyword(b, pos, "ELSE") {
+        Some(Box::new(expr_add(b, pos)?))
+    } else {
+        None
+    };
+    if !take_keyword(b, pos, "END") {
+        return None;
+    }
+    Some(RawExpr::Case(branches, else_))
+}
+
 /// Consume a whole-word keyword (case-insensitive) at `pos`, skipping
 /// leading whitespace. Returns true and advances on a match; leaves `pos`
 /// unchanged otherwise.
@@ -12269,6 +12411,19 @@ fn resolve_raw_cond(
         ),
         RawCond::IsNull(a) => Cond2::IsNull(Box::new(resolve_expr(a, columns, descs)?)),
         RawCond::IsNotNull(a) => Cond2::IsNotNull(Box::new(resolve_expr(a, columns, descs)?)),
+        RawCond::Not(inner) => Cond2::Not(Box::new(resolve_raw_cond(inner, columns, descs)?)),
+        RawCond::And(parts) => Cond2::And(
+            parts
+                .iter()
+                .map(|p| resolve_raw_cond(p, columns, descs))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        RawCond::Or(parts) => Cond2::Or(
+            parts
+                .iter()
+                .map(|p| resolve_raw_cond(p, columns, descs))
+                .collect::<Option<Vec<_>>>()?,
+        ),
     })
 }
 
@@ -12328,6 +12483,21 @@ fn resolve_expr(
                 .map(|a| resolve_expr(a, columns, descs))
                 .collect::<Option<Vec<_>>>()?,
         ),
+        RawExpr::Case(branches, else_) => Expr::Case(
+            branches
+                .iter()
+                .map(|(c, t)| {
+                    Some((
+                        resolve_raw_cond(c, columns, descs)?,
+                        resolve_expr(t, columns, descs)?,
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?,
+            match else_ {
+                Some(e) => Some(Box::new(resolve_expr(e, columns, descs)?)),
+                None => None,
+            },
+        ),
     })
 }
 
@@ -12359,6 +12529,9 @@ enum Expr {
     Iif(Box<Cond2>, Box<Expr>, Box<Expr>),
     /// a built-in scalar function over resolved arguments
     Func(SysFn, Vec<Expr>),
+    /// `CASE`: the first branch whose condition is TRUE answers; false
+    /// and UNKNOWN move on; no branch -> ELSE, no ELSE -> NULL
+    Case(Vec<(Cond2, Expr)>, Option<Box<Expr>>),
 }
 
 /// A resolved [RawCond].
@@ -12367,14 +12540,43 @@ enum Cond2 {
     Cmp(Box<Expr>, Cmp, Box<Expr>),
     IsNull(Box<Expr>),
     IsNotNull(Box<Expr>),
+    Not(Box<Cond2>),
+    And(Vec<Cond2>),
+    Or(Vec<Cond2>),
 }
 
 impl Cond2 {
     /// Three-valued: None is UNKNOWN, which an IIF treats as false.
+    /// AND/OR are Kleene: a decided dominant value (false for AND, true
+    /// for OR) wins over UNKNOWN, UNKNOWN wins over the recessive one;
+    /// NOT of UNKNOWN stays UNKNOWN.
     fn eval(&self, values: &[Value]) -> Result<Option<bool>, EvalErr> {
         Ok(match self {
             Cond2::IsNull(a) => Some(matches!(a.eval(values)?, Value::Null)),
             Cond2::IsNotNull(a) => Some(!matches!(a.eval(values)?, Value::Null)),
+            Cond2::Not(c) => c.eval(values)?.map(|b| !b),
+            Cond2::And(parts) => {
+                let mut unknown = false;
+                for p in parts {
+                    match p.eval(values)? {
+                        Some(false) => return Ok(Some(false)),
+                        None => unknown = true,
+                        Some(true) => {}
+                    }
+                }
+                if unknown { None } else { Some(true) }
+            }
+            Cond2::Or(parts) => {
+                let mut unknown = false;
+                for p in parts {
+                    match p.eval(values)? {
+                        Some(true) => return Ok(Some(true)),
+                        None => unknown = true,
+                        Some(false) => {}
+                    }
+                }
+                if unknown { None } else { Some(false) }
+            }
             Cond2::Cmp(a, op, b) => {
                 let (x, y) = (a.eval(values)?, b.eval(values)?);
                 if matches!(x, Value::Null) || matches!(y, Value::Null) {
@@ -12441,6 +12643,35 @@ enum ExprType {
     Int,
     Text,
     Numeric,
+}
+
+/// A conditional's result type from all its branches: the first branch
+/// type stands, EXCEPT that an exact-numeric branch anywhere beside
+/// integer ones widens the whole result to Numeric (the branch scales
+/// then merge through [Expr::result_scale]'s minimum). A text branch
+/// keeps the first-typed rule - the coercion cases are the render-based
+/// ones the eval already handles.
+fn conditional_type<'a>(
+    branches: impl Iterator<Item = &'a Expr>,
+    descs: &[Descriptor],
+) -> Option<ExprType> {
+    let mut first = None;
+    let mut any_numeric = false;
+    let mut any_text = false;
+    for t in branches.filter_map(|e| e.type_of(descs)) {
+        if first.is_none() {
+            first = Some(t);
+        }
+        match t {
+            ExprType::Numeric => any_numeric = true,
+            ExprType::Text => any_text = true,
+            ExprType::Int => {}
+        }
+    }
+    if any_numeric && !any_text {
+        return Some(ExprType::Numeric);
+    }
+    first
 }
 
 /// A scaled exact-numeric column - the operand form CAST and concat
@@ -12665,13 +12896,24 @@ impl Expr {
     /// then falls back rather than answering wrong).
     fn type_of(&self, descs: &[Descriptor]) -> Option<ExprType> {
         match self {
-            // a conditional's type is its branches': the first one that
-            // types wins, and a NULL branch is untyped so it defers to
-            // its sibling (the engine takes the same view of a CASE's
-            // result type)
-            Expr::Coalesce(args) => args.iter().find_map(|a| a.type_of(descs)),
+            // a conditional's type comes from its branches TOGETHER: a
+            // NULL branch is untyped and defers to its siblings, and ANY
+            // exact-numeric branch beside integer ones makes the whole
+            // conditional Numeric - the engine announces COALESCE(A, 0.5)
+            // at scale -1 (probed: it prints -7.0), so typing from the
+            // first branch alone would announce scale 0 and the scaled
+            // branch's value could not decode
+            Expr::Coalesce(args) => conditional_type(args.iter(), descs),
+            Expr::Case(branches, else_) => conditional_type(
+                branches.iter().map(|(_, t)| t).chain(else_.iter().map(|e| &**e)),
+                descs,
+            ),
+            // NULLIF only ever ANSWERS its first operand (or NULL), so
+            // its type is the first operand's - no cross-branch widening
             Expr::NullIf(a, b) => a.type_of(descs).or_else(|| b.type_of(descs)),
-            Expr::Iif(_, a, b) => a.type_of(descs).or_else(|| b.type_of(descs)),
+            Expr::Iif(_, a, b) => {
+                conditional_type([&**a, &**b].into_iter(), descs)
+            }
             Expr::Col(fid) => {
                 let d = descs.get(*fid)?;
                 match col_kind(d) {
@@ -12791,6 +13033,12 @@ impl Expr {
             // literal typed as Numeric and then failed to size itself,
             // falling back to the fixed-answer plan.
             Expr::Coalesce(args) => args.iter().filter_map(|a| a.result_scale(descs)).min(),
+            Expr::Case(branches, else_) => branches
+                .iter()
+                .map(|(_, t)| t)
+                .chain(else_.iter().map(|e| &**e))
+                .filter_map(|t| t.result_scale(descs))
+                .min(),
             Expr::NullIf(a, b) => [a.result_scale(descs), b.result_scale(descs)]
                 .into_iter()
                 .flatten()
@@ -12835,6 +13083,12 @@ impl Expr {
             // the widest branch decides the width, so a value from any
             // branch fits the announced column
             Expr::Coalesce(args) => args.iter().filter_map(|a| a.rank_of(descs)).max(),
+            Expr::Case(branches, else_) => branches
+                .iter()
+                .map(|(_, t)| t)
+                .chain(else_.iter().map(|e| &**e))
+                .filter_map(|t| t.rank_of(descs))
+                .max(),
             Expr::NullIf(a, b) => {
                 [a.rank_of(descs), b.rank_of(descs)].into_iter().flatten().max()
             }
@@ -12955,6 +13209,20 @@ impl Expr {
                     a.eval(values)?
                 } else {
                     b.eval(values)?
+                }
+            }
+            // the first branch whose condition is TRUE answers; false
+            // and UNKNOWN both move on; no branch left -> ELSE, and a
+            // missing ELSE is NULL (probed)
+            Expr::Case(branches, else_) => {
+                for (c, t) in branches {
+                    if c.eval(values)? == Some(true) {
+                        return t.eval(values);
+                    }
+                }
+                match else_ {
+                    Some(e) => e.eval(values)?,
+                    None => Value::Null,
                 }
             }
             Expr::Col(fid) => values.get(*fid).cloned().unwrap_or(Value::Null),
@@ -14036,6 +14304,7 @@ fn default_expr_name(raw: &RawExpr) -> String {
         // the engine parses IIF into a searched CASE, and the header
         // says so (probed: an un-aliased IIF columns as CASE)
         RawExpr::Iif(_, _, _) => "CASE",
+        RawExpr::Case(..) => "CASE",
         RawExpr::Func(f, _) => return f.header().to_string(),
         // the engine leaves a unary-minus column unnamed (blank header)
         RawExpr::Neg(_) => "",
@@ -15682,8 +15951,8 @@ fn resolve_expr_term(
     }
     // and both sides must TYPE - an untypeable operand never reaches
     // eval (resolve_expr already refused unknown columns)
-    match &term {
-        Term::ExprCond(c) => match &**c {
+    fn cond_types(c: &Cond2, descs: &[Descriptor]) -> Option<()> {
+        match c {
             Cond2::Cmp(a, _, b) => {
                 a.type_of(descs)?;
                 b.type_of(descs)?;
@@ -15691,7 +15960,17 @@ fn resolve_expr_term(
             Cond2::IsNull(a) | Cond2::IsNotNull(a) => {
                 a.type_of(descs)?;
             }
-        },
+            Cond2::Not(inner) => cond_types(inner, descs)?,
+            Cond2::And(parts) | Cond2::Or(parts) => {
+                for p in parts {
+                    cond_types(p, descs)?;
+                }
+            }
+        }
+        Some(())
+    }
+    match &term {
+        Term::ExprCond(c) => cond_types(c, descs)?,
         Term::ExprLike(e, ..) => {
             e.type_of(descs)?;
         }
@@ -15727,6 +16006,12 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
         Expr::NullIf(a, b) => expr_no_raise(a, descs) && expr_no_raise(b, descs),
         Expr::Iif(c, a, b) => {
             cond_no_raise(c, descs) && expr_no_raise(a, descs) && expr_no_raise(b, descs)
+        }
+        Expr::Case(branches, else_) => {
+            branches
+                .iter()
+                .all(|(c, t)| cond_no_raise(c, descs) && expr_no_raise(t, descs))
+                && else_.as_ref().map_or(true, |e| expr_no_raise(e, descs))
         }
         Expr::Func(f, args) => {
             if !args.iter().all(|a| expr_no_raise(a, descs)) {
@@ -15773,6 +16058,10 @@ fn cond_no_raise(c: &Cond2, descs: &[Descriptor]) -> bool {
     match c {
         Cond2::Cmp(a, _, b) => expr_no_raise(a, descs) && expr_no_raise(b, descs),
         Cond2::IsNull(a) | Cond2::IsNotNull(a) => expr_no_raise(a, descs),
+        Cond2::Not(inner) => cond_no_raise(inner, descs),
+        Cond2::And(parts) | Cond2::Or(parts) => {
+            parts.iter().all(|p| cond_no_raise(p, descs))
+        }
     }
 }
 
@@ -20146,6 +20435,155 @@ mod tests {
         assert!(matches!(ev("ABS(A) * 2"), Value::Int(14)));
         txt("IIF(CHAR_LENGTH(NAME) > 3, 'long', 'short')", "long");
         txt("COALESCE(SUBSTRING(NAME FROM 99), 'gone')", "");
+    }
+
+    #[test]
+    fn parses_and_evaluates_case_expressions() {
+        // A(int -7), NAME('Hello'), N(NUMERIC(9,2) 12.50), K(BIGINT)
+        let columns = vec![
+            RelationColumn { name: "A".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "NAME".into(), field_id: 1, position: 1 },
+            RelationColumn { name: "N".into(), field_id: 2, position: 2 },
+            RelationColumn { name: "K".into(), field_id: 3, position: 3 },
+        ];
+        let d = |dt, len, s| Descriptor {
+            dtype: dt, scale: s, length: len, sub_type: 0, flags: 0, offset: 4,
+        };
+        let descs = vec![
+            d(dtype::LONG, 4, 0),
+            d(dtype::VARYING, 10, 0),
+            d(dtype::LONG, 4, -2),
+            d(dtype::INT64, 8, 0),
+        ];
+        let row = vec![
+            Value::Int(-7),
+            Value::Text("Hello".into()),
+            Value::Scaled(1250, -2),
+            Value::Int(4_000_000_000),
+        ];
+        let null_row = vec![Value::Null; 4];
+        let ev_on = |s: &str, r: &[Value]| -> Value {
+            let raw = parse_raw_expr(s).unwrap_or_else(|| panic!("{s} did not parse"));
+            resolve_expr(&raw, &columns, &descs).unwrap().eval(r).unwrap()
+        };
+        let ev = |s: &str| ev_on(s, &row);
+        let txt = |s: &str, want: &str| {
+            assert!(matches!(ev(s), Value::Text(ref t) if t == want), "{s} != {want:?}");
+        };
+
+        // searched CASE: first TRUE branch answers, in order
+        txt("CASE WHEN A > 0 THEN 'pos' WHEN A < 0 THEN 'neg' ELSE 'zero' END", "neg");
+        txt("CASE WHEN A < 0 THEN 'first' WHEN A = -7 THEN 'second' END", "first");
+        // missing ELSE is NULL; an UNTAKEN branch list falls through
+        assert!(matches!(ev("CASE WHEN A > 0 THEN 'pos' END"), Value::Null));
+        // UNKNOWN conditions move on (NULL row: every cond UNKNOWN -> ELSE)
+        assert!(matches!(
+            ev_on("CASE WHEN A > 0 THEN 'p' WHEN A < 0 THEN 'n' ELSE 'e' END", &null_row),
+            Value::Text(ref t) if t == "e"
+        ));
+        // ...and a missing ELSE under all-UNKNOWN is NULL
+        assert!(matches!(
+            ev_on("CASE WHEN A > 0 THEN 'p' WHEN A < 0 THEN 'n' END", &null_row),
+            Value::Null
+        ));
+
+        // simple CASE desugars to = conditions - so WHEN NULL NEVER
+        // matches (x = NULL is UNKNOWN), the engine's rule (probed)
+        txt("CASE A WHEN -7 THEN 'minus7' WHEN 42 THEN 'answer' ELSE 'other' END", "minus7");
+        txt("CASE NAME WHEN NULL THEN 'isnull' ELSE 'notnull' END", "notnull");
+        assert!(matches!(
+            ev_on("CASE NAME WHEN NULL THEN 'isnull' ELSE 'notnull' END", &null_row),
+            Value::Text(ref t) if t == "notnull"
+        ));
+        // a NULL operand matches nothing -> ELSE
+        assert!(matches!(
+            ev_on("CASE A WHEN 1 THEN 'one' ELSE 'other' END", &null_row),
+            Value::Text(ref t) if t == "other"
+        ));
+
+        // boolean conditions: Kleene AND/OR/NOT, parenthesised groups,
+        // with the UNKNOWN-dominance cases pinned
+        txt("CASE WHEN A < 0 AND N > 1 THEN 'both' ELSE 'no' END", "both");
+        txt("CASE WHEN A > 0 OR N > 1 THEN 'either' ELSE 'no' END", "either");
+        txt("CASE WHEN NOT A > 0 THEN 'notpos' ELSE 'pos' END", "notpos");
+        txt("CASE WHEN (A > 0 OR A < -5) AND NAME = 'Hello' THEN 'yes' ELSE 'no' END", "yes");
+        // UNKNOWN OR TRUE is TRUE; UNKNOWN AND FALSE is FALSE;
+        // UNKNOWN AND TRUE is UNKNOWN (takes ELSE); NOT UNKNOWN too
+        let semi = vec![Value::Null, Value::Text("Hello".into()), Value::Null, Value::Null];
+        let evs = |s: &str| ev_on(s, &semi);
+        assert!(matches!(
+            evs("CASE WHEN A > 0 OR NAME = 'Hello' THEN 'or-wins' ELSE 'no' END"),
+            Value::Text(ref t) if t == "or-wins"
+        ));
+        assert!(matches!(
+            evs("CASE WHEN A > 0 AND NAME <> 'Hello' THEN 'x' ELSE 'and-false' END"),
+            Value::Text(ref t) if t == "and-false"
+        ));
+        assert!(matches!(
+            evs("CASE WHEN A > 0 AND NAME = 'Hello' THEN 'x' ELSE 'unknown' END"),
+            Value::Text(ref t) if t == "unknown"
+        ));
+        assert!(matches!(
+            evs("CASE WHEN NOT A > 0 THEN 'x' ELSE 'unknown' END"),
+            Value::Text(ref t) if t == "unknown"
+        ));
+        // IIF takes the same boolean grammar now
+        txt("IIF(A < 0 AND N > 1, 'both', 'no')", "both");
+        txt("IIF(NOT (A > 0 OR N < 0), 'neither', 'some')", "neither");
+
+        // nesting: CASE in a branch, functions in conds and branches,
+        // CASE under arithmetic and concatenation
+        assert!(matches!(
+            ev("CASE WHEN A > 0 THEN A ELSE CASE WHEN NAME = 'Hello' THEN -1 ELSE -2 END END"),
+            Value::Int(-1)
+        ));
+        txt("CASE WHEN CHAR_LENGTH(NAME) > 3 THEN UPPER(NAME) ELSE LOWER(NAME) END", "HELLO");
+        assert!(matches!(ev("CASE WHEN A < 0 THEN 1 ELSE 0 END + 10"), Value::Int(11)));
+        txt("'r: ' || CASE WHEN A < 0 THEN 'n' ELSE 'p' END", "r: n");
+
+        // TYPING ACROSS BRANCHES. An exact-numeric branch beside integer
+        // ones widens the conditional to Numeric with the MINIMUM scale
+        // (the engine announces COALESCE(A, 0.5) at -1: it prints -7.0)
+        // - and value_of ALIGNS each branch's value to that announce
+        // (0.5 at an announced -2 would otherwise decode as 0.05).
+        let pc = |s: &str| {
+            build_expr_col(&parse_raw_expr(s).unwrap(), "X", &columns, &descs).unwrap()
+        };
+        let c = pc("CASE WHEN A > 0 THEN N ELSE 0.5 END");
+        assert_eq!((c.sql_type, c.scale), (581, -2));
+        assert!(matches!(c.value_of(&row), Ok(Value::Scaled(50, -2)))); // 0.50 aligned
+        let c = pc("CASE WHEN A < 0 THEN 1 ELSE 0.5 END");
+        assert_eq!(c.scale, -1);
+        assert!(matches!(c.value_of(&row), Ok(Value::Scaled(10, -1)))); // 1 -> 1.0
+        let c = pc("COALESCE(A, 0.5)");
+        assert_eq!(c.scale, -1);
+        assert!(matches!(c.value_of(&row), Ok(Value::Scaled(-70, -1)))); // -7.0
+        // a BIGINT-ranked branch keeps the INT64 announce; INT128 would widen
+        let c = pc("CASE WHEN A > 0 THEN K ELSE A END");
+        assert_eq!((c.sql_type, c.scale), (581, 0));
+        // text branches keep the first-typed rule
+        let c = pc("CASE WHEN A > 0 THEN 'y' ELSE 'n' END");
+        assert_eq!(c.sql_type, 449); // nullable VARCHAR
+
+        // the header is CASE - for both forms and for IIF (probed)
+        for q in [
+            "CASE WHEN A > 0 THEN 1 ELSE 0 END",
+            "CASE A WHEN 1 THEN 1 ELSE 0 END",
+            "IIF(A > 0, 1, 0)",
+        ] {
+            assert_eq!(default_expr_name(&parse_raw_expr(q).unwrap()), "CASE", "{q}");
+        }
+
+        // malformed forms do not parse - the planner then refuses
+        for bad in [
+            "CASE END",
+            "CASE WHEN A > 0 END",
+            "CASE WHEN A > 0 THEN 1",
+            "CASE A WHEN THEN 1 END",
+            "CASE WHEN A > 0 THEN 1 ELSE END",
+        ] {
+            assert!(parse_raw_expr(bad).is_none(), "{bad} parsed");
+        }
     }
 
     #[test]

@@ -4050,6 +4050,42 @@ every NON-NULL row and drops the NULL one — UNKNOWN excludes through
 both the comparison and its pushed-in negation — and the count is
 pinned to the value, not just compared.
 
+### CASE expressions (`qa/serve-real-case.sh`, 44 checks)
+
+Searched and simple `CASE`, on the same expression surface as
+everything above, plus the condition grammar both CASE and IIF now
+share: `OR` over `AND` over `NOT` over parenthesised groups over
+comparisons and NULL tests, three-valued throughout (FALSE dominates
+AND, TRUE dominates OR, UNKNOWN dominates the recessive value, NOT of
+UNKNOWN stays UNKNOWN). Only a TRUE condition takes a branch — false
+and UNKNOWN move on — the ELSE takes the rest, a missing ELSE is NULL.
+The simple form desugars into `<operand> = <value>` searched
+conditions, which carries the engine's famous rule for free:
+`CASE x WHEN NULL THEN ...` never fires even when x IS NULL, because
+`x = NULL` is UNKNOWN (probed, and gated on the row where it bites).
+The engine parses IIF into this same node — an un-aliased IIF headers
+as `CASE`, which the previous slice discovered and this one inherits.
+
+**Writing the gate found a standing bug in every older conditional.**
+A conditional's TYPE came from its first branch alone, so
+`COALESCE(A, 0.5)` — integer first, scaled second — announced scale 0,
+and the scaled branch's value could not decode against the announce.
+The engine's law, probed: ANY exact-numeric branch beside integer ones
+types the whole conditional Numeric at the branches' MINIMUM (widest)
+scale — `COALESCE(A, 0.5)` announces −1 and prints `-7.0`. And the
+second half, which the first fix exposed: each branch's value carries
+its OWN scale at eval, so `value_of` now ALIGNS it to the announced
+scale at emit — `0.5` announced at −2 travels as raw 50. The teeth
+check pins the exact wrong answer the bug produced: the raw-5 path
+would have printed 0.05.
+
+Why the older gates never saw it: their mixed-type cases wrote the
+literal at the SAME scale as the column (`COALESCE(N, 0.00)`), so
+announce and value agreed by coincidence. The lesson is the same one
+the nofallback gate taught: a gate proves its cases and says nothing
+about the queries just outside them — diversity of shapes in the
+fixture is what catches the class.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
@@ -4622,6 +4658,13 @@ FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
 # Builds its own scratch database.
 FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     bash /path/to/fire-crab/qa/serve-real-wherefn.sh 3050
+
+# CASE expressions: searched + simple (WHEN NULL never matches), boolean
+# conditions shared with IIF (Kleene AND/OR/NOT), cross-branch typing at
+# the minimum scale with values ALIGNED to the announce, headers CASE.
+# Builds its own scratch database.
+FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    bash /path/to/fire-crab/qa/serve-real-case.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on
