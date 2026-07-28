@@ -295,6 +295,8 @@ mod blr {
     pub const CURRENT_DATE: u8 = 0xA0;
     pub const CURRENT_TIMESTAMP: u8 = 0xA1;
     pub const CURRENT_TIME: u8 = 0xA2;
+    /// blr_equiv - null-safe equality, MATCHING's comparator (probed)
+    pub const EQUIV: u8 = 0x2E;
     pub const EQL: u8 = 0x2F;
     pub const NEQ: u8 = 0x30;
     pub const GTR: u8 = 0x31;
@@ -364,6 +366,10 @@ enum Val {
     CurrentTimestamp,
     /// ROW_COUNT - blr_internal_info(literal 5) (probed)
     RowCount,
+    /// CURRENT_CONNECTION / CURRENT_TRANSACTION -
+    /// blr_internal_info(1) / (2) (probed)
+    CurrentConnection,
+    CurrentTransaction,
     /// GEN_ID(sequence, increment)
     GenId(String, Box<Val>),
     /// NEXT VALUE FOR sequence - blr_gen_id2, the name alone
@@ -1189,6 +1195,8 @@ impl<'a> P<'a> {
             Tok::Ident(x) if x == "NULL" => Val::Null,
             Tok::Ident(x) if x == "VALUE" && self.domain_value => Val::Fid(0, 0),
             Tok::Ident(x) if x == "ROW_COUNT" => Val::RowCount,
+            Tok::Ident(x) if x == "CURRENT_CONNECTION" => Val::CurrentConnection,
+            Tok::Ident(x) if x == "CURRENT_TRANSACTION" => Val::CurrentTransaction,
             Tok::Ident(x) if x == "NEXT" => {
                 self.i += 1;
                 if !(self.kw("VALUE") && self.kw("FOR")) {
@@ -1845,6 +1853,7 @@ fn is_keyword(w: &str) -> bool {
             | "POST_EVENT"
             | "ROW_COUNT"
             | "GDSCODE"
+            | "MATCHING"
     )
 }
 
@@ -1980,6 +1989,14 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
         Val::RowCount => {
             out.push(blr::INTERNAL_INFO);
             emit_val(out, &Val::Int(5));
+        }
+        Val::CurrentConnection => {
+            out.push(blr::INTERNAL_INFO);
+            emit_val(out, &Val::Int(1));
+        }
+        Val::CurrentTransaction => {
+            out.push(blr::INTERNAL_INFO);
+            emit_val(out, &Val::Int(2));
         }
         Val::GenId(name, inc) => {
             out.push(blr::GEN_ID);
@@ -2765,9 +2782,23 @@ enum TrigStmt {
     Exit,
     /// POST_EVENT <value>; - blr_post
     PostEvent(Val),
-    /// BEGIN ... WHEN <code> DO <stmt> END - blr_block with an
-    /// error handler (probed); ONE handler with ONE code
-    HandledBlock(Vec<TrigStmt>, HandlerCode, Box<TrigStmt>),
+    /// BEGIN ... WHEN <code> DO <stmt> ... END - blr_block with one
+    /// error-handler section PER WHEN (probed sequential)
+    HandledBlock(Vec<TrigStmt>, Vec<(HandlerCode, TrigStmt)>),
+    /// UPDATE OR INSERT INTO rel (cols) VALUES (vals) MATCHING (m) -
+    /// a begin holding a modify-loop (blr_equiv on the matching
+    /// column) and a row_count==0-guarded store; contexts allocated
+    /// store, modify-new, rse-org IN THAT ORDER (probed)
+    UpdateOrInsert {
+        rel: Stream,
+        store_ctx: u8,
+        new_ctx: u8,
+        org_ctx: u8,
+        cols: Vec<String>,
+        vals: Vec<Val>,
+        mcol: String,
+        midx: usize,
+    },
     /// (FOR) SELECT - the whole probed select machinery as ONE
     /// statement inside a body
     ForSel(Box<ForSel>),
@@ -2915,31 +2946,105 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
             out.push(blr::POST);
             emit_val(out, v);
         }
-        TrigStmt::HandledBlock(stmts, code, handler) => {
+        TrigStmt::HandledBlock(stmts, handlers) => {
             out.push(blr::BLOCK);
             out.push(blr::BEGIN);
             for st in stmts {
                 emit_trig_stmt(out, st);
             }
             out.push(blr::END);
-            out.push(blr::ERROR_HANDLER);
-            out.extend_from_slice(&1u16.to_le_bytes());
-            match code {
-                HandlerCode::Any => out.push(blr::DEFAULT_CODE),
-                HandlerCode::Exception(name) => {
-                    out.push(blr::EXCEPTION_CODE);
-                    out.push(0);
-                    out.push(name.len() as u8);
-                    out.extend_from_slice(name.as_bytes());
+            for (code, handler) in handlers {
+                out.push(blr::ERROR_HANDLER);
+                out.extend_from_slice(&1u16.to_le_bytes());
+                match code {
+                    HandlerCode::Any => out.push(blr::DEFAULT_CODE),
+                    HandlerCode::Exception(name) => {
+                        out.push(blr::EXCEPTION_CODE);
+                        out.push(0);
+                        out.push(name.len() as u8);
+                        out.extend_from_slice(name.as_bytes());
+                    }
+                    HandlerCode::Gds(name) => {
+                        out.push(blr::GDS_CODE);
+                        out.push(name.len() as u8);
+                        out.extend_from_slice(name.as_bytes());
+                    }
                 }
-                HandlerCode::Gds(name) => {
-                    out.push(blr::GDS_CODE);
-                    out.push(name.len() as u8);
-                    out.extend_from_slice(name.as_bytes());
+                // a BLOCK as the handler's body nests blr_block AGAIN
+                // with no handler section of its own (probed)
+                match handler {
+                    TrigStmt::Block(inner) => {
+                        out.push(blr::BLOCK);
+                        out.push(blr::BEGIN);
+                        for st in inner {
+                            emit_trig_stmt(out, st);
+                        }
+                        out.push(blr::END);
+                        out.push(blr::END);
+                    }
+                    other => emit_trig_stmt(out, other),
                 }
             }
-            emit_trig_stmt(out, handler);
             out.push(blr::END);
+        }
+        TrigStmt::UpdateOrInsert {
+            rel,
+            store_ctx,
+            new_ctx,
+            org_ctx,
+            cols,
+            vals,
+            mcol,
+            midx,
+        } => {
+            out.push(blr::BEGIN);
+            out.push(blr::FOR);
+            out.push(blr::MARKS);
+            out.push(1);
+            out.push(4);
+            out.push(blr::RSE);
+            out.push(1);
+            emit_stream(out, rel, *org_ctx);
+            out.push(blr::BOOLEAN);
+            out.push(blr::EQUIV);
+            out.push(blr::FIELD);
+            out.push(*org_ctx);
+            out.push(mcol.len() as u8);
+            out.extend_from_slice(mcol.as_bytes());
+            emit_val(out, &vals[*midx]);
+            out.push(blr::END);
+            out.push(blr::MODIFY);
+            out.push(*org_ctx);
+            out.push(*new_ctx);
+            out.push(blr::BEGIN);
+            for (c, v) in cols.iter().zip(vals) {
+                out.push(blr::ASSIGNMENT);
+                emit_val(out, v);
+                out.push(blr::FIELD);
+                out.push(*new_ctx);
+                out.push(c.len() as u8);
+                out.extend_from_slice(c.as_bytes());
+            }
+            out.push(blr::END);
+            out.push(blr::IF);
+            out.push(blr::EQL);
+            out.push(blr::INTERNAL_INFO);
+            emit_val(out, &Val::Int(5));
+            emit_val(out, &Val::Int(0));
+            out.push(blr::STORE);
+            emit_stream(out, rel, *store_ctx);
+            out.push(blr::BEGIN);
+            for (c, v) in cols.iter().zip(vals) {
+                out.push(blr::ASSIGNMENT);
+                emit_val(out, v);
+                out.push(blr::FIELD);
+                out.push(*store_ctx);
+                out.push(c.len() as u8);
+                out.extend_from_slice(c.as_bytes());
+            }
+            out.push(blr::END);
+            out.push(blr::END); // the if's missing else
+            out.push(blr::END); // closes the wrapping begin
         }
         TrigStmt::ForSel(f) => {
             match f.label {
@@ -3379,10 +3484,11 @@ impl<'a> P<'a> {
                 }
                 stmts.push(self.trig_stmt()?);
             }
-            // WHEN <code> DO <stmt>: the block becomes blr_block with
-            // an error handler (ONE handler, ONE code - more are
-            // unprobed layouts)
-            let handled = if self.kw("WHEN") {
+            // WHEN <code> DO <stmt>, repeatable: one error-handler
+            // section per WHEN (probed sequential); a handler's body
+            // may be a plain statement or a BEGIN..END block
+            let mut handlers: Vec<(HandlerCode, TrigStmt)> = Vec::new();
+            while self.kw("WHEN") {
                 let code = if self.kw("ANY") {
                     HandlerCode::Any
                 } else if self.kw("EXCEPTION") {
@@ -3406,15 +3512,11 @@ impl<'a> P<'a> {
                     return None;
                 }
                 let h = self.trig_stmt()?;
-                if matches!(h, TrigStmt::Block(_) | TrigStmt::HandledBlock(..)) {
-                    // a BLOCK as a handler body nests blr_block
-                    // differently: unprobed, refuse
-                    return None;
+                if matches!(h, TrigStmt::HandledBlock(..)) {
+                    return None; // a handler with its OWN handlers: unprobed
                 }
-                Some((code, Box::new(h)))
-            } else {
-                None
-            };
+                handlers.push((code, h));
+            }
             if !self.kw("END") {
                 return None;
             }
@@ -3422,9 +3524,10 @@ impl<'a> P<'a> {
             if matches!(self.t.get(self.i), Some(Tok::Semi)) {
                 self.i += 1;
             }
-            return Some(match handled {
-                Some((code, h)) => TrigStmt::HandledBlock(stmts, code, h),
-                None => TrigStmt::Block(stmts),
+            return Some(if handlers.is_empty() {
+                TrigStmt::Block(stmts)
+            } else {
+                TrigStmt::HandledBlock(stmts, handlers)
             });
         }
         if self.kw("IF") {
@@ -3687,6 +3790,117 @@ impl<'a> P<'a> {
             return Some(TrigStmt::Delete(st, ctx, wher));
         }
         if self.kw("UPDATE") {
+            if self.kw("OR") {
+                // UPDATE OR INSERT INTO rel (cols) VALUES (vals)
+                // MATCHING (mcol); - contexts allocated store,
+                // modify-new, rse-org IN THAT ORDER (probed); the
+                // MATCHING clause is REQUIRED (default matching needs
+                // the primary key - the catalog)
+                if !(self.kw("INSERT") && self.kw("INTO")) {
+                    return None;
+                }
+                let Some(Tok::Ident(rel)) = self.t.get(self.i) else {
+                    return None;
+                };
+                if is_keyword(rel) {
+                    return None;
+                }
+                let rel = rel.clone();
+                self.i += 1;
+                if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                    return None;
+                }
+                self.i += 1;
+                let mut cols = Vec::new();
+                loop {
+                    let Some(Tok::Ident(c)) = self.t.get(self.i) else {
+                        return None;
+                    };
+                    if is_keyword(c) {
+                        return None;
+                    }
+                    cols.push(c.clone());
+                    self.i += 1;
+                    match self.t.get(self.i)? {
+                        Tok::Comma => self.i += 1,
+                        Tok::RParen => {
+                            self.i += 1;
+                            break;
+                        }
+                        _ => return None,
+                    }
+                }
+                if !self.kw("VALUES") || !matches!(self.t.get(self.i), Some(Tok::LParen))
+                {
+                    return None;
+                }
+                self.i += 1;
+                let mut vals = Vec::new();
+                loop {
+                    vals.push(self.val()?);
+                    match self.t.get(self.i)? {
+                        Tok::Comma => self.i += 1,
+                        Tok::RParen => {
+                            self.i += 1;
+                            break;
+                        }
+                        _ => return None,
+                    }
+                }
+                if vals.len() != cols.len() {
+                    return None;
+                }
+                if !self.kw("MATCHING") || !matches!(self.t.get(self.i), Some(Tok::LParen))
+                {
+                    return None;
+                }
+                self.i += 1;
+                let Some(Tok::Ident(mcol)) = self.t.get(self.i) else {
+                    return None;
+                };
+                let mcol = mcol.clone();
+                self.i += 1;
+                if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                    return None; // multiple MATCHING columns: unprobed
+                }
+                self.i += 1;
+                if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                    return None;
+                }
+                self.i += 1;
+                let midx = cols.iter().position(|c| c == &mcol)?;
+                let st = Stream {
+                    name: rel,
+                    alias: None,
+                    derived: None,
+                };
+                // contexts: store, modify-new, rse-org - in order
+                let base = self.base;
+                self.streams.push(st.clone());
+                let store_ctx = (self.streams.len() - 1) as u8 + base;
+                self.streams.push(Stream {
+                    name: String::new(),
+                    alias: None,
+                    derived: None,
+                });
+                let new_ctx = (self.streams.len() - 1) as u8 + base;
+                self.streams.push(Stream {
+                    name: String::new(),
+                    alias: None,
+                    derived: None,
+                });
+                let org_ctx = (self.streams.len() - 1) as u8 + base;
+                return Some(TrigStmt::UpdateOrInsert {
+                    rel: st,
+                    store_ctx,
+                    new_ctx,
+                    org_ctx,
+                    cols,
+                    vals,
+                    mcol,
+                    midx,
+                });
+            }
             // UPDATE rel SET col = v [, ...] [WHERE ...]; - the NEW
             // record's context is allocated BEFORE the rse stream's
             // (probed: modify 3,2 with the rse at 3); SET sources and
@@ -5354,16 +5568,47 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_twenty_shapes_byte_for_byte() {
+        // UPDATE OR INSERT: a begin holding a modify-loop (blr_equiv
+        // on the MATCHING column) and a row_count==0-guarded store;
+        // contexts allocated store(0), modify-new(1), rse-org(2) IN
+        // THAT ORDER
+        pin_proc(
+            "CREATE PROCEDURE QL1 (I1 INTEGER) AS BEGIN UPDATE OR INSERT INTO U2 (UID, UA) VALUES (:I1, 0) MATCHING (UID); END",
+            "050204000200080007000401010007000C00029B110002020207D9010443014A02553202472E170203554944290000000100FF0A0201020129000000010017010355494401150800000000001701025541FF082FB115080005000000150800000000000F4A02553200020129000000010017000355494401150800000000001700025541FFFFFFFFFFFF0E010201150700000019010000FFFF4C",
+        );
+        // CURRENT_CONNECTION / CURRENT_TRANSACTION: internal_info
+        // codes 1 and 2 - one family with ROW_COUNT's 5 and the
+        // trigger-action 6
+        pin_proc(
+            "CREATE PROCEDURE QN1 RETURNS (R1 BIGINT) AS BEGIN R1 = CURRENT_CONNECTION; SUSPEND; END",
+            "050204010300100007000700020300001000012D1A00009B1100020201B1150800010000001A00000E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE QN2 RETURNS (R1 BIGINT) AS BEGIN R1 = CURRENT_TRANSACTION; SUSPEND; END",
+            "050204010300100007000700020300001000012D1A00009B1100020201B1150800020000001A00000E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // MULTIPLE handlers: one error-handler section per WHEN,
+        // sequential (flip ten's probe)
+        pin_proc(
+            "CREATE PROCEDURE QN3 RETURNS (R1 INTEGER) AS BEGIN BEGIN R1 = 1; WHEN EXCEPTION QEX1 DO R1 = -1; WHEN ANY DO R1 = -2; END SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B11000202810201150800010000001A0000FF8201000900045145583101150800FFFFFFFF1A00008201000401150800FEFFFFFF1A0000FF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // a BLOCK as a handler's body nests blr_block AGAIN with no
+        // handler section of its own (flip eleven's probe)
+        pin_proc(
+            "CREATE PROCEDURE QN4 RETURNS (R1 INTEGER) AS BEGIN BEGIN R1 = 1; WHEN ANY DO BEGIN R1 = -1; END END SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B11000202810201150800010000001A0000FF82010004810201150800FFFFFFFF1A0000FFFFFF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+    }
+
+    #[test]
     fn handler_refusals() {
         for sql in [
-            // a BLOCK as a handler body nests blr_block differently:
-            // unprobed
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN BEGIN R1 = 1; WHEN ANY DO BEGIN R1 = 0; END END SUSPEND; END",
             // WHEN SQLCODE / SQLSTATE: unprobed code layouts
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN BEGIN R1 = 1; WHEN SQLCODE 100 DO R1 = 0; END SUSPEND; END",
-            // UPDATE OR INSERT: a probed-but-unconverted composite
-            // (modify-loop + row_count-guarded store) - next slice
-            "CREATE PROCEDURE X (I1 INTEGER) AS BEGIN UPDATE OR INSERT INTO U2 (UID) VALUES (:I1) MATCHING (UID); END",
+            // UPDATE OR INSERT without MATCHING needs the primary key
+            "CREATE PROCEDURE X (I1 INTEGER) AS BEGIN UPDATE OR INSERT INTO U2 (UID) VALUES (:I1); END",
         ] {
             assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
         }

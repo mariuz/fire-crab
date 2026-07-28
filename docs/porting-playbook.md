@@ -307,6 +307,11 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # composite statements (upsert) are TRANSCRIPTS of their
+    # execution plan: try-update, test row_count, store - and the
+    # CONTEXT ORDER records the COMPILE order, not the run order
+    # (the insert half claims its slot first); convert composites
+    # from their probed transcript, never from their semantics
     # error handlers change the BLOCK's whole shape (a guarded block
     # is a different verb than a plain one) - and the same brace pair
     # compiles differently by POSITION (handler bodies nest the block

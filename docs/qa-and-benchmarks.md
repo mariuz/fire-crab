@@ -4423,7 +4423,7 @@ expressions, and alias-less derived tables refuse. The slice-5
 refusal of scalar subselects became a feature; its gate slot flipped
 to a positive check, the fifth such flip in the project.
 
-### SQL → BLR, oracle number two (`qa/dsql-proc-blr.sh`, 73 checks)
+### SQL → BLR, oracle number two (`qa/dsql-proc-blr.sh`, 80 checks)
 
 Views cannot hold ORDER BY - but a procedure's `FOR SELECT ... DO
 SUSPEND` body can, and `RDB$PROCEDURE_BLR` stores ITS compiled BLR
@@ -4650,6 +4650,21 @@ joined as blr_internal_info(5), one family with the trigger-action
 code, and UPDATE OR INSERT gave up its shape to a probe (a
 modify-loop plus a row_count-guarded store, blr_equiv for MATCHING)
 but holds a named refusal until converted.
+
+Slice 20 converted it. UPDATE OR INSERT compiles to a begin holding
+a marks-stamped modify-loop whose boolean is blr_equiv - 0x2E,
+null-safe equality, MATCHING's comparator - then if(row_count = 0,
+store): try the update, and if no row moved, insert. The context
+allocation tells the compile order: store 0, modify-new 1, rse-org
+2 - the INSERT half claims its slot FIRST even though it runs
+second. MATCHING is required (the default match needs the primary
+key, a catalog lookup) and single-column. CURRENT_CONNECTION and
+CURRENT_TRANSACTION joined the internal_info family as codes 1 and
+2. And slice 19's two named probes settled as flips ten and eleven:
+multiple handlers emit one sequential error-handler section per
+WHEN, and a BLOCK as a handler's body nests blr_block again with no
+handler section of its own - the battery runs a handler block
+containing an EXIT.
 
 The slice's best find was a FIX. The CHECK battery ran
 S IN ('a','b') and the engine's bytes carried a surprise: EACH item

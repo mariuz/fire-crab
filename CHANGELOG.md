@@ -13,6 +13,31 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 20: UPDATE OR INSERT and settled probes
+
+### Converted
+- **UPDATE OR INSERT**, from the shape slice 19 probed: a begin
+  holding a marks-stamped modify-loop whose boolean is `blr_equiv`
+  (0x2E — null-safe equality) on the MATCHING column, then
+  `if(row_count = 0, store)`. Contexts allocated store, modify-new,
+  rse-org IN THAT ORDER — the INSERT half claims its slot first.
+  MATCHING is REQUIRED (the default needs the primary key — the
+  catalog) and single-column (more are unprobed). The battery runs
+  one with an expression VALUES (`:P1 * 10`).
+- **CURRENT_CONNECTION / CURRENT_TRANSACTION**: internal_info(1) and
+  (2) — the context-code family grows (5=ROW_COUNT, 6=trigger
+  action).
+- **Slice 19's named probes settled — flips ten and eleven**:
+  MULTIPLE handlers per block emit one error-handler section per
+  WHEN, sequential; a BLOCK as a handler's body nests blr_block
+  AGAIN with no handler section of its own. Both pinned.
+
+### Guarded
+- UPDATE OR INSERT without MATCHING (a primary-key catalog lookup),
+  multi-column MATCHING, handlers that carry their own handlers.
+  Gate: `qa/dsql-proc-blr.sh` grew to 80 checks (6 fresh); 225 unit
+  byte-pins.
+
 ## 2026-07-28 — fire-crab-dsql slice 19: error handling
 
 ### Converted
