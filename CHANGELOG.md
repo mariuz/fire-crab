@@ -13,6 +13,32 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 10: SELECT INTO, FIRST/SKIP, DISTINCT aggregates
+
+### Converted
+- **The SINGULAR `SELECT ... INTO`** (no FOR): `blr_for` over
+  `blr_singular(rse)` with NO label 1; the for's body holds only the
+  assignments, and a trailing `SUSPEND;` compiles as a SIBLING send
+  after the for — without it only the final EOF send remains (both
+  probed). The whole rse surface (WHERE, aggregates, inputs) rides
+  inside.
+- **FIRST <n> / SKIP <n>**: rse sub-clauses carrying one value each;
+  probed order stream, FIRST, SKIP, boolean, sort.
+- **The DISTINCT aggregate verbs**: COUNT/SUM/AVG get dedicated
+  verbs (agg_count_distinct 0x5E, agg_total_distinct 0x5F,
+  agg_average_distinct 0x60) while **MIN(DISTINCT) and MAX(DISTINCT)
+  FOLD to the plain verbs** — probed byte-identical. Two prior
+  refusals became features (COUNT(DISTINCT), the bare SELECT INTO
+  body) — flips seven and eight.
+
+### Guarded
+- `FIRST :param` without parens (an ENGINE syntax error),
+  parenthesised FIRST expressions, FIRST/SKIP over aggregate streams
+  or in the singular form (unprobed placements). Gate:
+  `qa/dsql-proc-blr.sh` grew to 48 checks (11 fresh battery
+  statements incl. singular+input+aggregate and a grouped
+  COUNT(DISTINCT) with an input); 149 unit byte-pins.
+
 ## 2026-07-28 — fire-crab-dsql slice 9: input parameters
 
 ### Converted

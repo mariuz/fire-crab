@@ -238,6 +238,15 @@ mod blr {
     /// blr_receive: message number byte, one statement - wraps the
     /// whole loop when the procedure has INPUT parameters (probed)
     pub const RECEIVE: u8 = 0x0C;
+    /// FIRST <n> / SKIP <n>: rse sub-clauses between the streams and
+    /// the boolean, each carrying one value (probed)
+    pub const FIRST: u8 = 0x44;
+    pub const SKIP: u8 = 0xAF;
+    /// the DISTINCT aggregate verbs; MIN/MAX(DISTINCT) FOLD to the
+    /// plain verbs (probed)
+    pub const AGG_COUNT_DISTINCT: u8 = 0x5E;
+    pub const AGG_TOTAL_DISTINCT: u8 = 0x5F;
+    pub const AGG_AVERAGE_DISTINCT: u8 = 0x60;
     pub const EQL: u8 = 0x2F;
     pub const NEQ: u8 = 0x30;
     pub const GTR: u8 = 0x31;
@@ -1437,13 +1446,19 @@ impl<'a> P<'a> {
     /// aggregate is unprobed and refuses.
     fn parse_agg(&mut self, name: &str) -> Option<(u8, Option<Val>)> {
         self.i += 1; // (
+        // COUNT/SUM/AVG get dedicated DISTINCT verbs; MIN and MAX
+        // fold DISTINCT away (probed byte-identical to the plain form)
+        let distinct = self.kw("DISTINCT");
         let out = match name {
-            "COUNT" if matches!(self.t.get(self.i), Some(Tok::Star)) => {
+            "COUNT" if !distinct && matches!(self.t.get(self.i), Some(Tok::Star)) => {
                 self.i += 1;
                 (blr::AGG_COUNT, None)
             }
+            "COUNT" if distinct => (blr::AGG_COUNT_DISTINCT, Some(self.val()?)),
             "COUNT" => (blr::AGG_COUNT2, Some(self.val()?)),
+            "SUM" if distinct => (blr::AGG_TOTAL_DISTINCT, Some(self.val()?)),
             "SUM" => (blr::AGG_TOTAL, Some(self.val()?)),
+            "AVG" if distinct => (blr::AGG_AVERAGE_DISTINCT, Some(self.val()?)),
             "AVG" => (blr::AGG_AVERAGE, Some(self.val()?)),
             "MIN" => (blr::AGG_MIN, Some(self.val()?)),
             "MAX" => (blr::AGG_MAX, Some(self.val()?)),
@@ -2363,8 +2378,33 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
             _ => return None,
         }
     }
-    if !(p.kw("AS") && p.kw("BEGIN") && p.kw("FOR") && p.kw("SELECT")) {
+    if !(p.kw("AS") && p.kw("BEGIN")) {
         return None;
+    }
+    // FOR SELECT ... DO SUSPEND loops; a bare SELECT ... INTO is the
+    // SINGULAR form - blr_for over blr_singular(rse), no label 1
+    let is_for = p.kw("FOR");
+    if !p.kw("SELECT") {
+        return None;
+    }
+    // FIRST <n> / SKIP <n>: integer literals only (FIRST :param is a
+    // syntax error IN THE ENGINE without parens; parenthesised
+    // expressions are unprobed)
+    let mut first: Option<Val> = None;
+    let mut skip: Option<Val> = None;
+    if p.kw("FIRST") {
+        let Some(Tok::Int(v)) = p.t.get(p.i) else {
+            return None;
+        };
+        first = Some(Val::Int(i32::try_from(*v).ok()?));
+        p.i += 1;
+    }
+    if p.kw("SKIP") {
+        let Some(Tok::Int(v)) = p.t.get(p.i) else {
+            return None;
+        };
+        skip = Some(Val::Int(i32::try_from(*v).ok()?));
+        p.i += 1;
     }
     // two-phase select list: fields need the stream's context, so
     // scan past the list to FROM, parse the stream, then come back
@@ -2602,15 +2642,38 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
     if into.len() != cols_n {
         return None;
     }
-    if !(p.kw("DO") && p.kw("SUSPEND")) {
-        return None;
-    }
-    let _ = matches!(p.t.get(p.i), Some(Tok::Semi)) && {
+    let suspend;
+    if is_for {
+        if !(p.kw("DO") && p.kw("SUSPEND")) {
+            return None;
+        }
+        suspend = true;
+        let _ = matches!(p.t.get(p.i), Some(Tok::Semi)) && {
+            p.i += 1;
+            true
+        };
+    } else {
+        // SELECT ... INTO ...; [SUSPEND;]
+        if !matches!(p.t.get(p.i), Some(Tok::Semi)) {
+            return None;
+        }
         p.i += 1;
-        true
-    };
+        suspend = p.kw("SUSPEND");
+        if suspend {
+            if !matches!(p.t.get(p.i), Some(Tok::Semi)) {
+                return None;
+            }
+            p.i += 1;
+        }
+    }
     if !p.kw("END") || p.i != p.t.len() {
         return None;
+    }
+    if !is_for && (first.is_some() || skip.is_some()) {
+        return None; // FIRST/SKIP in the singular form: unprobed
+    }
+    if aggregate && (first.is_some() || skip.is_some()) {
+        return None; // FIRST/SKIP over an aggregate stream: unprobed
     }
 
     let n = params.len();
@@ -2660,9 +2723,15 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
     out.push(0);
     out.push(blr::BEGIN);
     out.push(blr::BEGIN);
-    out.push(blr::LABEL);
-    out.push(1);
-    out.push(blr::FOR);
+    if is_for {
+        out.push(blr::LABEL);
+        out.push(1);
+        out.push(blr::FOR);
+    } else {
+        // the singular form: blr_for over blr_singular, NO label 1
+        out.push(blr::FOR);
+        out.push(blr::SINGULAR);
+    }
     out.push(blr::RSE);
     out.push(1);
     if aggregate {
@@ -2705,6 +2774,15 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         }
     } else {
         emit_stream(&mut out, &p.streams[0], 0);
+        // probed order: stream, FIRST, SKIP, boolean, sort
+        if let Some(f) = &first {
+            out.push(blr::FIRST);
+            emit_val(&mut out, f);
+        }
+        if let Some(k) = &skip {
+            out.push(blr::SKIP);
+            emit_val(&mut out, k);
+        }
         if let Some(b) = &boolean {
             out.push(blr::BOOLEAN);
             emit_bool(&mut out, b);
@@ -2753,8 +2831,18 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         out.extend_from_slice(&((2 * n) as u16).to_le_bytes());
         out.push(blr::END);
     };
-    send(&mut out, 1);
-    out.push(blr::END);
+    if is_for {
+        // the row send lives INSIDE the loop body
+        send(&mut out, 1);
+        out.push(blr::END);
+    } else {
+        // the singular form closes its assignment block first; a
+        // SUSPEND compiles as a SIBLING send after the for (probed)
+        out.push(blr::END);
+        if suspend {
+            send(&mut out, 1);
+        }
+    }
     out.push(blr::END);
     out.push(blr::END);
     out.push(blr::END);
@@ -3516,6 +3604,76 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_ten_shapes_byte_for_byte() {
+        // the SINGULAR form: blr_for over blr_singular(rse), NO label
+        // 1; the for's body holds only the assignments and a SUSPEND
+        // compiles as a SIBLING send after the for
+        pin_proc(
+            "CREATE PROCEDURE QE1 RETURNS (R1 INTEGER) AS BEGIN SELECT COUNT(*) FROM T INTO :R1; SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B11000202077F43014F0143014A015400FF4E004D0100000053FF0201180100001A0000FF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE QG6 RETURNS (R1 INTEGER) AS BEGIN SELECT ID FROM T WHERE A = 1 INTO :R1; SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B11000202077F43014A015400472F1700014115080001000000FF020117000249441A0000FF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // without SUSPEND, only the final EOF send remains
+        pin_proc(
+            "CREATE PROCEDURE QF4 RETURNS (R1 INTEGER) AS BEGIN SELECT MAX(ID) FROM T INTO :R1; END",
+            "050204010300080007000700020300000800012D1A00009B11000202077F43014F0143014A015400FF4E004D01000000541700024944FF0201180100001A0000FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // FIRST/SKIP: rse sub-clauses between the streams and the
+        // boolean (probed order: stream, FIRST, SKIP, boolean, sort)
+        pin_proc(
+            "CREATE PROCEDURE QE2 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT FIRST 5 ID FROM T ORDER BY ID INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014A01540044150800050000004601481700024944FF020117000249441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE QE3 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT FIRST 5 SKIP 2 ID FROM T INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014A0154004415080005000000AF15080002000000FF020117000249441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE QE4 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT SKIP 3 ID FROM T INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014A015400AF15080003000000FF020117000249441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE QF1 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT FIRST 2 ID FROM T WHERE A > 0 ORDER BY ID INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014A0154004415080002000000473117000141150800000000004601481700024944FF020117000249441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // the DISTINCT aggregate verbs: COUNT/SUM/AVG get their own;
+        // MIN(DISTINCT) FOLDS to plain agg_min (byte-identical)
+        pin_proc(
+            "CREATE PROCEDURE QE5 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT COUNT(DISTINCT A) FROM T INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014F0143014A015400FF4E004D010000005E17000141FF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE QE6 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT SUM(DISTINCT A) FROM T INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014F0143014A015400FF4E004D010000005F17000141FF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE QF2 RETURNS (R1 NUMERIC(9,2)) AS BEGIN FOR SELECT AVG(DISTINCT A) FROM T INTO :R1 DO SUSPEND; END",
+            "05020401030008FE070007000203000008FE012D1A00009B1100020211010743014F0143014A015400FF4E004D010000006017000141FF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE QF3 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT MIN(DISTINCT A) FROM T INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014F0143014A015400FF4E004D010000005517000141FF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+    }
+
+    #[test]
+    fn slice_ten_refusals() {
+        for sql in [
+            // FIRST :param without parens is an ENGINE syntax error
+            "CREATE PROCEDURE X (I1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT FIRST :I1 ID FROM T INTO :R1 DO SUSPEND; END",
+            // FIRST/SKIP in the singular form and over aggregates:
+            // unprobed placements
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN SELECT FIRST 1 ID FROM T INTO :R1; END",
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT FIRST 2 COUNT(*) FROM T INTO :R1 DO SUSPEND; END",
+        ] {
+            assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
+        }
+    }
+
+    #[test]
     fn input_param_refusals() {
         for sql in [
             // `:name` must name an input parameter
@@ -3543,8 +3701,6 @@ mod tests {
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT A FROM T GROUP BY A INTO :R1 DO SUSPEND; END",
             // a select column missing from GROUP BY
             "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT S, COUNT(*) FROM T GROUP BY A INTO :R1, :R2 DO SUSPEND; END",
-            // COUNT(DISTINCT ...): the distinct agg verbs are unprobed
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT COUNT(DISTINCT A) FROM T INTO :R1 DO SUSPEND; END",
             // a non-grouped column in HAVING
             "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT A, COUNT(*) FROM T GROUP BY A HAVING S > 0 INTO :R1, :R2 DO SUSPEND; END",
         ] {

@@ -307,6 +307,13 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # a singular select is the SAME loop verb over a singular-wrapped
+    # rse - and the row-send is NOT part of the loop: SUSPEND is its
+    # own statement, sibling to the for; probe what a missing SUSPEND
+    # removes
+    # row limits are rse sub-clauses with a probed ORDER (stream,
+    # first, skip, boolean, sort); some DISTINCT aggregates get their
+    # own verbs while MIN/MAX fold it away - probe each one
     # input parameters are a MESSAGE, not variables: references
     # compile straight to message slots (value slot, null slot), the
     # loop waits under a RECEIVE, and the messages differ - inputs

@@ -4423,7 +4423,7 @@ expressions, and alias-less derived tables refuse. The slice-5
 refusal of scalar subselects became a feature; its gate slot flipped
 to a positive check, the fifth such flip in the project.
 
-### SQL → BLR, oracle number two (`qa/dsql-proc-blr.sh`, 37 checks)
+### SQL → BLR, oracle number two (`qa/dsql-proc-blr.sh`, 48 checks)
 
 Views cannot hold ORDER BY - but a procedure's `FOR SELECT ... DO
 SUSPEND` body can, and `RDB$PROCEDURE_BLR` stores ITS compiled BLR
@@ -4490,6 +4490,23 @@ receive wrapper. The slice-7 refusal of input parameters became this
 feature (the sixth refusal-to-feature flip); what still refuses:
 `:name` missing from the input list, inputs inside HAVING (crossing
 the aggregate boundary is unprobed), `:name` outside a procedure.
+
+Slice 10 rounded out the procedure surface with three shapes. The
+SINGULAR `SELECT ... INTO` (no FOR) compiles as blr_for over
+blr_singular(rse) with NO label 1 - the for's body holds only the
+assignments, and a trailing `SUSPEND;` turns out to be a SIBLING
+send after the for, so a body without one keeps only the final EOF
+send; the whole converted rse surface (WHERE, aggregates, input
+parameters) rides inside the singular rse and the battery runs all
+three. FIRST and SKIP are rse sub-clauses carrying one value each,
+in the probed order stream, FIRST, SKIP, boolean, sort - and
+`FIRST :param` without parentheses is a syntax error IN THE ENGINE,
+so fcdsql refuses it too. The DISTINCT aggregates split: COUNT, SUM
+and AVG get dedicated verbs (0x5E, 0x5F, 0x60) while MIN(DISTINCT)
+and MAX(DISTINCT) FOLD to the plain verbs, probed byte-identical -
+distinctness cannot change a minimum. Two prior refusals became
+features (COUNT(DISTINCT ...) and the bare SELECT INTO body): flips
+seven and eight.
 
 ## Benchmarks
 
