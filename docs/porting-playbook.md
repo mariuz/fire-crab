@@ -166,6 +166,13 @@ them.
                          operand's scale (ints: AVG(1,2) = 1;
                          negatives: -2.95/2 = -1.47, not -1.48)
 
+    # aggregate ARGUMENTS are expressions: evaluate per row BEFORE the
+    # fold, and let an eval error ABORT the fetch with the engine's
+    # vector (SUM(A/0) is the divide-by-zero, not a wrong sum) - so
+    # the fold must be fallible, not a silent skip
+    # SUM's result widens ONE step over the source's storage width;
+    # AVG keeps the width; both keep the source's scale
+
     # GROUP BY: bucket rows by key values (NULL keys share a bucket),
     # run every fold per bucket; HAVING filters the COMPUTED output
     # rows and may reference aggregates NOT in the select list -

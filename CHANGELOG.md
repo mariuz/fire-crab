@@ -13,6 +13,35 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — aggregates over expressions
+
+### Converted
+- **Expression arguments in every aggregate**: `SUM(A + ID)`,
+  `AVG(N * 2)`, `MIN(UPPER(S))`, `MAX(S || '!')`,
+  `COUNT(NULLIF(G, 1))`, `SUM(IIF(...))`, `SUM(CASE ... END)`,
+  `MIN(EXTRACT(YEAR FROM D))` — evaluated per row before the fold,
+  lone and grouped. The group fold became FALLIBLE: an eval error in
+  the argument (`SUM(A / 0)`) aborts the fetch with the engine's own
+  vector. SUM widens one step (probed: LONG → BIGINT, INT64-ranked →
+  INT128 — `SUM(K)` and `SUM(A + ID)` both describe INT128); AVG keeps
+  its width. Gate: `qa/serve-real-aggexpr.sh`, 37 checks.
+
+### Fixed
+- A lone aggregate's output column was headed `CONSTANT`; the engine
+  names it by FUNCTION. `Plan::Scalar` now carries its header name
+  (COUNT/MIN/MAX/SUM, GEN_ID for generator reads, CONSTANT for the
+  bare-literal case) — the standing difference the previous slice
+  documented.
+- `GEN_ID(<missing generator>, 0)` answered NULL where the engine
+  raises "generator is not defined" — caught by this slice's header
+  probes; it now refuses.
+
+### Guarded
+- Expression aggregates in HAVING refuse (a later slice); the
+  conversion error inside an aggregate raises with the matching
+  SQLSTATE 22018 but without the engine's offending-string argument —
+  a documented difference, not a silent one.
+
 ## 2026-07-28 — the aggregate surface beyond integers
 
 ### Converted

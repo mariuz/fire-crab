@@ -4139,6 +4139,30 @@ this gate's header checks made visible; AVG therefore routes through
 the group machinery, which describes by function name, and the fast
 path's header stays a named later slice.
 
+### Aggregates over expressions (`qa/serve-real-aggexpr.sh`, 37 checks)
+
+The expression evaluator meets the aggregate folds: any typeable
+expression as the argument - arithmetic, functions, conditionals,
+CASE, EXTRACT - evaluated per row BEFORE the fold, in lone aggregates
+and GROUP BY buckets. Three design points. The group fold became
+FALLIBLE: `SUM(A / 0)` must raise the divide-by-zero mid-fetch exactly
+as the engine does, never fold a wrong sum, so `compute_group` returns
+a result the emit path converts to the engine's status vector. SUM
+WIDENS ONE STEP over its source's storage width (probed: a LONG source
+announces BIGINT, an INT64-ranked source - a BIGINT column, or
+`A + ID` which types BIGINT - announces INT128; the fix also corrected
+the standing `SUM(bigint column)` announce), while AVG keeps its
+width. And the slice closed the describe difference its predecessor
+documented: `Plan::Scalar` now carries its output-column NAME, so a
+lone COUNT/MIN/MAX/SUM headers by function like the engine (GEN_ID for
+generator reads, CONSTANT for the wire-pipeline fallback) - plus a
+bonus the header probes caught: `GEN_ID(<missing>, 0)` answered NULL
+where the engine raises; it now refuses.
+
+Known difference, documented not silent: the conversion error inside
+an aggregate raises SQLSTATE 22018 without the engine's
+offending-string vector argument.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
@@ -4731,6 +4755,13 @@ FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
 # WHERE-filtered, grouped, and in HAVING. Builds its own scratch database.
 FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     bash /path/to/fire-crab/qa/serve-real-aggfn.sh 3050
+
+# aggregates over expressions: SUM(A+ID), MIN(UPPER(S)), COUNT(NULLIF),
+# SUM(IIF/CASE), the fallible fold (SUM(A/0) raises mid-fetch), SUM's
+# one-step widening, and the lone-aggregate function-name headers.
+# Builds its own scratch database.
+FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    bash /path/to/fire-crab/qa/serve-real-aggexpr.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on

@@ -14,7 +14,8 @@ IIF), `qa/serve-real-functions.sh` (the built-in scalar functions),
 `qa/serve-real-wherefn.sh` (function calls in WHERE),
 `qa/serve-real-case.sh` (CASE, and cross-branch typing),
 `qa/serve-real-extract.sh` (the temporal surface),
-`qa/serve-real-aggfn.sh` (the aggregate surface). Each check in
+`qa/serve-real-aggfn.sh` (the aggregate surface),
+`qa/serve-real-aggexpr.sh` (aggregates over expressions). Each check in
 those gates runs identical SQL through fire-crab and `isql` against the
 same database file.
 
@@ -41,6 +42,8 @@ same database file.
 | temporal literals `DATE '...'` / `TIME '...'` / `TIMESTAMP '...'`; the clock keywords fixed per statement | `parse.y`, `src/jrd/CurrentDateNode` et al. | `RawExpr::{DateLit, TimeLit, TsLit, CurrentDate, LocalTime, LocalTimestamp}` |
 | aggregate result types: AVG/SUM widen to NUMERIC(18,s) (BIGINT width at the operand scale), MIN/MAX keep the column's type, COUNT is BIGINT | `src/jrd/AggNodes.cpp` (`makeDesc`), probed | the `SelItem::Agg` arm of `plan_group` |
 | AVG = SUM/COUNT with TRUNCATING division toward zero; folds skip NULLs; empty/all-NULL input is NULL; COUNT(DISTINCT) counts distinct non-NULLs | `src/jrd/AggNodes.cpp` (`AvgAggNode::execute` et al.), probed | `compute_group`, `aggregate` |
+| aggregates take EXPRESSION arguments, evaluated per row before the fold; an eval error in the argument raises mid-fetch; SUM widens ONE step (LONG source → BIGINT, INT64-ranked → INT128), AVG keeps its width unless the source is INT128 | `AggNodes.cpp` + the expression nodes, probed | `AggTarget::Expr`, `AggSrc::Expr`, the fallible `compute_group` |
+| a lone aggregate's output column is NAMED by its function (COUNT/MIN/MAX/SUM/AVG); a bare literal is CONSTANT, a generator read GEN_ID | probed via isql headers | `Plan::Scalar(value, name)`, `output_cols_of` |
 
 ## Laws probed against the live engine
 
@@ -116,6 +119,20 @@ usually a unit test too:
   VARCHAR, a DATE a DATE). Every fold skips NULLs; an empty or
   all-NULL input answers NULL (COUNT answers 0). `COUNT(DISTINCT col)`
   counts distinct NON-NULL values - NULL is not a value.
+- **Aggregate arguments are expressions, folded per row.**
+  `SUM(A + ID)`, `MIN(UPPER(S))`, `COUNT(NULLIF(G, 1))`,
+  `SUM(IIF(cond, 1, 0))` (the conditional counter). An eval error in
+  the argument - `SUM(A / 0)` - raises MID-FETCH with the engine's own
+  vector, which is why the group fold is fallible. SUM widens one step
+  (a LONG source announces BIGINT, an INT64-ranked one INT128 - probed:
+  `SUM(K BIGINT)` and `SUM(A + ID)` both describe INT128-wide); AVG
+  keeps BIGINT width unless the source is already INT128; both keep the
+  source's scale.
+- **Known difference:** the conversion error (22018) raises with the
+  matching SQLSTATE but WITHOUT the offending string as a vector
+  argument (the engine prints `conversion error from string "pear"`;
+  fire-crab's client prints a missing-argument placeholder). Carrying
+  the string means a non-Copy error payload - a named later slice.
 - **Text comparisons ignore trailing blanks; LIKE does not.** A
   comparison pad-trims both sides (CHAR vs VARCHAR equality); LIKE
   matches the STORED value, padding included — `CHAR(5) 'abc'` matches
