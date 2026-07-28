@@ -4423,7 +4423,7 @@ expressions, and alias-less derived tables refuse. The slice-5
 refusal of scalar subselects became a feature; its gate slot flipped
 to a positive check, the fifth such flip in the project.
 
-### SQL → BLR, oracle number two (`qa/dsql-proc-blr.sh`, 48 checks)
+### SQL → BLR, oracle number two (`qa/dsql-proc-blr.sh`, 59 checks)
 
 Views cannot hold ORDER BY - but a procedure's `FOR SELECT ... DO
 SUSPEND` body can, and `RDB$PROCEDURE_BLR` stores ITS compiled BLR
@@ -4507,6 +4507,24 @@ and MAX(DISTINCT) FOLD to the plain verbs, probed byte-identical -
 distinctness cannot change a minimum. Two prior refusals became
 features (COUNT(DISTINCT ...) and the bare SELECT INTO body): flips
 seven and eight.
+
+Slice 14 UNIFIED the statement surfaces: a procedure body is now the
+same statement machine as a trigger body, and the single-FOR-SELECT
+shapes of slices 7-10 fall out as one-statement special cases - the
+174 existing byte-pins re-verified the refactor emitted every prior
+shape identically. What the general model adds: outputs ARE
+variables (R1 = 5; assigns variable 0; locals continue the
+numbering), SUSPEND is a statement (the row send, wherever it
+appears - a two-SUSPEND body is in the battery), RETURNS is optional
+(a no-output procedure carries a one-slot message 1, just the EOF
+short, and a flag-only final send), and name resolution splits by
+scope: OUTSIDE stream scopes a bare name resolves local variables
+first and then input parameters - IF (I1 > 0) compiles the message
+reference bare, a law found when the refactor's first run refused
+it - while INSIDE selects, subqueries and DML WHEREs a bare name
+stays a COLUMN and variables need their colon (`:name` reaches
+locals and outputs as blr_variable). Bodies now mix FOR SELECT
+loops, singular SELECT INTOs, DML, IF, WHILE and SUSPEND freely.
 
 ### SQL → BLR, oracle number three (`qa/dsql-trig-blr.sh`, 34 checks)
 

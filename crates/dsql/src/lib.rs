@@ -771,6 +771,9 @@ struct P<'a> {
     local_vars: Vec<String>,
     /// the next free label number (0 is the body wrapper's)
     next_label: u8,
+    /// procedure-body mode: SUSPEND and (FOR) SELECT become
+    /// statements; the number of output parameters shapes the sends
+    proc: Option<usize>,
     /// context of stream index 0: 1 in view BLR, 0 in procedure
     /// bodies (probed - the FOR SELECT stream is context 0)
     base: u8,
@@ -1143,13 +1146,19 @@ impl<'a> P<'a> {
             }
             Tok::Ident(x) if x == "NULL" => Val::Null,
             Tok::Colon => {
+                // `:name` - an input parameter (message 0) or, in a
+                // body, a local variable / output parameter
                 self.i += 1;
                 let Some(Tok::Ident(name)) = self.t.get(self.i) else {
                     return None;
                 };
-                let idx = self.in_params.iter().position(|n| n == name)?;
+                if let Some(idx) = self.in_params.iter().position(|n| n == name) {
+                    self.i += 1;
+                    return Some(Val::InParam(idx as u16));
+                }
+                let vi = self.local_vars.iter().position(|n| n == name)?;
                 self.i += 1;
-                return Some(Val::InParam(idx as u16));
+                return Some(Val::LocalVar(vi as u16));
             }
             Tok::Ident(x) if !is_keyword(x) => {
                 let first = x.clone();
@@ -1161,11 +1170,24 @@ impl<'a> P<'a> {
                     return self.func(&first);
                 }
                 // a bare name resolves against LOCAL VARIABLES first
-                if !matches!(self.t.get(self.i), Some(Tok::Dot)) {
+                // - but only OUTSIDE stream scopes: inside a select,
+                // subquery or DML WHERE a bare name is a COLUMN and
+                // a variable needs its colon
+                if self.sub.is_none()
+                    && !matches!(self.t.get(self.i), Some(Tok::Dot))
+                {
                     if let Some(vi) =
                         self.local_vars.iter().position(|n| n == &first)
                     {
                         return Some(Val::LocalVar(vi as u16));
+                    }
+                    // bare input parameters work outside stream
+                    // scopes too (probed: IF (I1 > 0) compiles the
+                    // message reference)
+                    if let Some(pi) =
+                        self.in_params.iter().position(|n| n == &first)
+                    {
+                        return Some(Val::InParam(pi as u16));
                     }
                 }
                 // a qualified field: IDENT . IDENT
@@ -2037,6 +2059,7 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
         in_params: Vec::new(),
         local_vars: Vec::new(),
         next_label: 1,
+        proc: None,
     };
     // a top-level UNION restructures the whole statement: the union
     // node takes context 1 BEFORE any branch stream, so it must be
@@ -2391,6 +2414,7 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         in_params: Vec::new(),
         local_vars: Vec::new(),
         next_label: 1,
+        proc: None,
     };
     if !(p.kw("CREATE") && p.kw("PROCEDURE")) {
         return None;
@@ -2427,14 +2451,51 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         }
     }
     p.in_params = inputs.iter().map(|(n, _)| n.clone()).collect();
-    if !p.kw("RETURNS") || !matches!(p.t.get(p.i), Some(Tok::LParen)) {
+    // RETURNS (name TYPE, ...) is OPTIONAL - the types reuse the
+    // probed cast-dsc encodings (identical bytes in blr_message and
+    // blr_declare)
+    let mut params: Vec<(String, Dsc)> = Vec::new();
+    if p.kw("RETURNS") {
+        if !matches!(p.t.get(p.i), Some(Tok::LParen)) {
+            return None;
+        }
+        p.i += 1;
+        loop {
+            let Some(Tok::Ident(name)) = p.t.get(p.i) else {
+                return None;
+            };
+            if is_keyword(name) {
+                return None;
+            }
+            let name = name.clone();
+            p.i += 1;
+            let dsc = p.cast_target()?;
+            params.push((name, dsc));
+            match p.t.get(p.i)? {
+                Tok::Comma => p.i += 1,
+                Tok::RParen => {
+                    p.i += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+    }
+    // RETURNS is OPTIONAL: a procedure with no outputs carries a
+    // one-slot message 1 (just the EOF short - probed)
+    let outs_start = params.len(); // placeholder, replaced below
+    let _ = outs_start;
+    p.local_vars = params.iter().map(|(n, _)| n.clone()).collect();
+    p.proc = Some(params.len());
+    if !p.kw("AS") {
         return None;
     }
-    p.i += 1;
-    // RETURNS (name TYPE, ...) - the types reuse the probed cast-dsc
-    // encodings (identical bytes in blr_message and blr_declare)
-    let mut params: Vec<(String, Dsc)> = Vec::new();
-    loop {
+    // local DECLAREs: variable numbering CONTINUES after the outputs;
+    // procedures INTERLEAVE declare/init per variable (probed - where
+    // triggers group)
+    let mut locals: Vec<(Dsc, Option<Val>)> = Vec::new();
+    while p.kw("DECLARE") {
+        let _ = p.kw("VARIABLE");
         let Some(Tok::Ident(name)) = p.t.get(p.i) else {
             return None;
         };
@@ -2444,312 +2505,29 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         let name = name.clone();
         p.i += 1;
         let dsc = p.cast_target()?;
-        params.push((name, dsc));
-        match p.t.get(p.i)? {
-            Tok::Comma => p.i += 1,
-            Tok::RParen => {
-                p.i += 1;
-                break;
-            }
-            _ => return None,
-        }
-    }
-    if !(p.kw("AS") && p.kw("BEGIN")) {
-        return None;
-    }
-    // FOR SELECT ... DO SUSPEND loops; a bare SELECT ... INTO is the
-    // SINGULAR form - blr_for over blr_singular(rse), no label 1
-    let is_for = p.kw("FOR");
-    if !p.kw("SELECT") {
-        return None;
-    }
-    // FIRST <n> / SKIP <n>: integer literals only (FIRST :param is a
-    // syntax error IN THE ENGINE without parens; parenthesised
-    // expressions are unprobed)
-    let mut first: Option<Val> = None;
-    let mut skip: Option<Val> = None;
-    if p.kw("FIRST") {
-        let Some(Tok::Int(v)) = p.t.get(p.i) else {
-            return None;
-        };
-        first = Some(Val::Int(i32::try_from(*v).ok()?));
-        p.i += 1;
-    }
-    if p.kw("SKIP") {
-        let Some(Tok::Int(v)) = p.t.get(p.i) else {
-            return None;
-        };
-        skip = Some(Val::Int(i32::try_from(*v).ok()?));
-        p.i += 1;
-    }
-    // two-phase select list: fields need the stream's context, so
-    // scan past the list to FROM, parse the stream, then come back
-    let list_start = p.i;
-    let mut depth = 0i32;
-    let list_end = loop {
-        match p.t.get(p.i)? {
-            Tok::LParen => {
-                depth += 1;
-                p.i += 1;
-            }
-            Tok::RParen => {
-                depth -= 1;
-                p.i += 1;
-            }
-            Tok::Ident(w) if w == "FROM" && depth == 0 => break p.i,
-            _ => p.i += 1,
-        }
-    };
-    p.i = list_end + 1;
-    // one plain stream - context 0
-    let st = p.stream_item()?;
-    if st.alias.is_some() || st.derived.is_some() {
-        return None; // aliased / derived FOR streams: unprobed
-    }
-    p.streams.push(st);
-    p.outer = Some(1);
-    let after_from = p.i;
-    // the select list: plain columns and/or aggregate calls
-    p.i = list_start;
-    enum Item {
-        Col(Val),
-        Agg(u8, Option<Val>),
-    }
-    let mut items: Vec<Item> = Vec::new();
-    loop {
-        match p.t.get(p.i)? {
-            Tok::Ident(w)
-                if matches!(w.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
-                    && matches!(p.t.get(p.i + 1), Some(Tok::LParen)) =>
-            {
-                let w = w.clone();
-                p.i += 1;
-                let (verb, arg) = p.parse_agg(&w)?;
-                items.push(Item::Agg(verb, arg));
-            }
-            Tok::Ident(w) if !is_keyword(w) => {
-                let a = w.clone();
-                p.i += 1;
-                let v = if matches!(p.t.get(p.i), Some(Tok::Dot)) {
-                    p.i += 1;
-                    let Some(Tok::Ident(b)) = p.t.get(p.i) else {
-                        return None;
-                    };
-                    let b = b.clone();
-                    p.i += 1;
-                    p.field(Some(&a), &b)?
-                } else {
-                    p.field(None, &a)?
-                };
-                items.push(Item::Col(v));
-            }
-            _ => return None,
-        }
-        if p.i == list_end {
-            break;
-        }
-        if !matches!(p.t.get(p.i), Some(Tok::Comma)) {
-            return None;
-        }
-        p.i += 1;
-    }
-    p.i = after_from;
-    let cols_n = items.len();
-    if cols_n == 0 || cols_n != params.len() {
-        return None;
-    }
-    let has_aggs = items.iter().any(|it| matches!(it, Item::Agg(..)));
-    let boolean = if p.kw("WHERE") {
-        Some(p.bool_or()?)
-    } else {
-        None
-    };
-    // GROUP BY: keys in CLAUSE order (the map keeps select-list
-    // order - probed to differ)
-    let mut group_keys: Vec<Val> = Vec::new();
-    let grouped = p.kw("GROUP");
-    if grouped {
-        if !p.kw("BY") {
-            return None;
-        }
-        loop {
-            let key = match p.t.get(p.i)? {
-                Tok::Ident(w) if !is_keyword(w) => {
-                    let a = w.clone();
-                    p.i += 1;
-                    if matches!(p.t.get(p.i), Some(Tok::Dot)) {
-                        p.i += 1;
-                        let Some(Tok::Ident(b)) = p.t.get(p.i) else {
-                            return None;
-                        };
-                        let b = b.clone();
-                        p.i += 1;
-                        p.field(Some(&a), &b)?
-                    } else {
-                        p.field(None, &a)?
-                    }
-                }
-                _ => return None,
-            };
-            group_keys.push(key);
-            if matches!(p.t.get(p.i), Some(Tok::Comma)) {
-                p.i += 1;
-            } else {
-                break;
-            }
-        }
-    }
-    let aggregate = has_aggs || grouped;
-    if aggregate {
-        // every plain select column must be a group key; a grouped
-        // query without aggregates is unprobed
-        if !has_aggs {
-            return None;
-        }
-        for it in &items {
-            if let Item::Col(v) = it {
-                if !group_keys.contains(v) {
-                    return None;
-                }
-            }
-        }
-        // the map: select-list order
-        p.agg_map = items
-            .iter()
-            .map(|it| match it {
-                Item::Col(v) => MapEntry::Key(v.clone()),
-                Item::Agg(verb, arg) => MapEntry::Agg(*verb, arg.clone()),
-            })
-            .collect();
-    }
-    // HAVING: a boolean over the aggregate's output - aggregates
-    // dedup into map slots, group-key columns become their slot's fid
-    let having = if p.kw("HAVING") {
-        if !aggregate {
-            return None;
-        }
-        p.agg_mode = true;
-        let b = p.bool_or()?;
-        p.agg_mode = false;
-        Some(map_bool_to_fids(&p.agg_map, b)?)
-    } else {
-        None
-    };
-    let mut sort: Vec<(bool, Val)> = Vec::new();
-    if p.kw("ORDER") {
-        if !p.kw("BY") {
-            return None;
-        }
-        loop {
-            // sort keys: plain columns (ORDER BY <n> and expressions
-            // are unprobed); over an aggregate they become fid slots
-            let key = match p.t.get(p.i)? {
-                Tok::Ident(w) if !is_keyword(w) => {
-                    let a = w.clone();
-                    p.i += 1;
-                    if matches!(p.t.get(p.i), Some(Tok::Dot)) {
-                        p.i += 1;
-                        let Some(Tok::Ident(b)) = p.t.get(p.i) else {
-                            return None;
-                        };
-                        let b = b.clone();
-                        p.i += 1;
-                        p.field(Some(&a), &b)?
-                    } else {
-                        p.field(None, &a)?
-                    }
-                }
-                _ => return None,
-            };
-            let key = if aggregate {
-                map_val_to_fid(&p.agg_map, &key)?
-            } else {
-                key
-            };
-            let descending = if p.kw("DESC") {
-                true
-            } else {
-                let _ = p.kw("ASC");
-                false
-            };
-            sort.push((descending, key));
-            if matches!(p.t.get(p.i), Some(Tok::Comma)) {
-                p.i += 1;
-            } else {
-                break;
-            }
-        }
-    }
-    // the DO body's sources: plain fields, or the aggregate's fids
-    let col_vals: Vec<Val> = if aggregate {
-        (0..cols_n).map(|i| Val::Fid(1, i as u16)).collect()
-    } else {
-        items
-            .iter()
-            .map(|it| match it {
-                Item::Col(v) => Some(v.clone()),
-                Item::Agg(..) => None,
-            })
-            .collect::<Option<Vec<_>>>()?
-    };
-    if !p.kw("INTO") {
-        return None;
-    }
-    // INTO :p, :q - each names a RETURNS parameter; column i assigns
-    // to the variable of the i-th INTO name
-    let mut into: Vec<usize> = Vec::new();
-    loop {
-        if !matches!(p.t.get(p.i), Some(Tok::Colon)) {
-            return None;
-        }
-        p.i += 1;
-        let Some(Tok::Ident(name)) = p.t.get(p.i) else {
-            return None;
-        };
-        let vi = params.iter().position(|(n, _)| n == name)?;
-        p.i += 1;
-        into.push(vi);
-        if matches!(p.t.get(p.i), Some(Tok::Comma)) {
+        p.local_vars.push(name);
+        let init = if matches!(p.t.get(p.i), Some(Tok::Cmp(CmpOp::Eql))) {
             p.i += 1;
+            Some(p.val()?)
         } else {
-            break;
-        }
-    }
-    if into.len() != cols_n {
-        return None;
-    }
-    let suspend;
-    if is_for {
-        if !(p.kw("DO") && p.kw("SUSPEND")) {
-            return None;
-        }
-        suspend = true;
-        let _ = matches!(p.t.get(p.i), Some(Tok::Semi)) && {
-            p.i += 1;
-            true
+            None
         };
-    } else {
-        // SELECT ... INTO ...; [SUSPEND;]
+        locals.push((dsc, init));
         if !matches!(p.t.get(p.i), Some(Tok::Semi)) {
             return None;
         }
         p.i += 1;
-        suspend = p.kw("SUSPEND");
-        if suspend {
-            if !matches!(p.t.get(p.i), Some(Tok::Semi)) {
-                return None;
-            }
-            p.i += 1;
-        }
     }
-    if !p.kw("END") || p.i != p.t.len() {
+    if !p.kw("BEGIN") {
         return None;
     }
-    if !is_for && (first.is_some() || skip.is_some()) {
-        return None; // FIRST/SKIP in the singular form: unprobed
+    p.outer = Some(0);
+    let mut stmts: Vec<TrigStmt> = Vec::new();
+    while !p.kw("END") {
+        stmts.push(p.trig_stmt()?);
     }
-    if aggregate && (first.is_some() || skip.is_some()) {
-        return None; // FIRST/SKIP over an aggregate stream: unprobed
+    if p.i != p.t.len() || stmts.is_empty() {
+        return None;
     }
 
     let n = params.len();
@@ -2765,7 +2543,7 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
             out.push(0);
         }
     }
-    // message 1: per parameter dsc + null-flag short, then EOF short
+    // message 1: per output dsc + null-flag short, then the EOF short
     out.push(blr::MESSAGE);
     out.push(1);
     out.extend_from_slice(&((2 * n + 1) as u16).to_le_bytes());
@@ -2777,14 +2555,15 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
     out.push(blr::SHORT);
     out.push(0);
     if !inputs.is_empty() {
-        // with inputs, the WHOLE loop block sits under blr_receive 0;
-        // the begin's own blr_end doubles as the receive's end and
-        // the final EOF send stays outside it (probed)
+        // with inputs, the WHOLE block sits under blr_receive 0; the
+        // begin's own blr_end doubles as the receive's end and the
+        // final EOF send stays outside it (probed)
         out.push(blr::RECEIVE);
         out.push(0);
     }
     out.push(blr::BEGIN);
-    // one variable per parameter, initialised to NULL
+    // outputs then locals, ONE variable space, INTERLEAVED
+    // declare/init per variable (probed procedure style)
     for (vi, (_, d)) in params.iter().enumerate() {
         out.push(blr::DECLARE);
         out.extend_from_slice(&(vi as u16).to_le_bytes());
@@ -2794,135 +2573,31 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         out.push(blr::VARIABLE);
         out.extend_from_slice(&(vi as u16).to_le_bytes());
     }
+    for (li, (d, init)) in locals.iter().enumerate() {
+        let vi = n + li;
+        out.push(blr::DECLARE);
+        out.extend_from_slice(&(vi as u16).to_le_bytes());
+        emit_dsc(&mut out, *d);
+        out.push(blr::ASSIGNMENT);
+        match init {
+            Some(v) => emit_val(&mut out, v),
+            None => out.push(blr::NULL),
+        }
+        out.push(blr::VARIABLE);
+        out.extend_from_slice(&(vi as u16).to_le_bytes());
+    }
     out.push(blr::STALL);
     out.push(blr::LABEL);
     out.push(0);
     out.push(blr::BEGIN);
     out.push(blr::BEGIN);
-    if is_for {
-        out.push(blr::LABEL);
-        out.push(1);
-        out.push(blr::FOR);
-    } else {
-        // the singular form: blr_for over blr_singular, NO label 1
-        out.push(blr::FOR);
-        out.push(blr::SINGULAR);
-    }
-    out.push(blr::RSE);
-    out.push(1);
-    if aggregate {
-        // the aggregate stream: its own context (1), the source rse
-        // (with the WHERE as ITS boolean), the group keys in clause
-        // order, the map in select-list order; HAVING and ORDER BY
-        // belong to the OUTER rse, over fids
-        out.push(blr::AGGREGATE);
-        out.push(1);
-        out.push(blr::RSE);
-        out.push(1);
-        emit_stream(&mut out, &p.streams[0], 0);
-        if let Some(b) = &boolean {
-            out.push(blr::BOOLEAN);
-            emit_bool(&mut out, b);
-        }
-        out.push(blr::END);
-        out.push(blr::GROUP_BY);
-        out.push(group_keys.len() as u8);
-        for k in &group_keys {
-            emit_val(&mut out, k);
-        }
-        out.push(blr::MAP);
-        out.extend_from_slice(&(p.agg_map.len() as u16).to_le_bytes());
-        for (fi, e) in p.agg_map.iter().enumerate() {
-            out.extend_from_slice(&(fi as u16).to_le_bytes());
-            match e {
-                MapEntry::Key(v) => emit_val(&mut out, v),
-                MapEntry::Agg(verb, arg) => {
-                    out.push(*verb);
-                    if let Some(a) = arg {
-                        emit_val(&mut out, a);
-                    }
-                }
-            }
-        }
-        if let Some(h) = &having {
-            out.push(blr::BOOLEAN);
-            emit_bool(&mut out, h);
-        }
-    } else {
-        emit_stream(&mut out, &p.streams[0], 0);
-        // probed order: stream, FIRST, SKIP, boolean, sort
-        if let Some(f) = &first {
-            out.push(blr::FIRST);
-            emit_val(&mut out, f);
-        }
-        if let Some(k) = &skip {
-            out.push(blr::SKIP);
-            emit_val(&mut out, k);
-        }
-        if let Some(b) = &boolean {
-            out.push(blr::BOOLEAN);
-            emit_bool(&mut out, b);
-        }
-    }
-    if !sort.is_empty() {
-        out.push(blr::SORT);
-        out.push(sort.len() as u8);
-        for (desc, key) in &sort {
-            out.push(if *desc {
-                blr::DESCENDING
-            } else {
-                blr::ASCENDING
-            });
-            emit_val(&mut out, key);
-        }
-    }
-    out.push(blr::END);
-    out.push(blr::BEGIN);
-    for (ci, v) in col_vals.iter().enumerate() {
-        out.push(blr::ASSIGNMENT);
-        emit_val(&mut out, v);
-        out.push(blr::VARIABLE);
-        out.extend_from_slice(&(into[ci] as u16).to_le_bytes());
-    }
-    let send = |out: &mut Vec<u8>, eof: u16| {
-        out.push(blr::SEND);
-        out.push(1);
-        out.push(blr::BEGIN);
-        for vi in 0..n {
-            out.push(blr::ASSIGNMENT);
-            out.push(blr::VARIABLE);
-            out.extend_from_slice(&(vi as u16).to_le_bytes());
-            out.push(blr::PARAMETER2);
-            out.push(1);
-            out.extend_from_slice(&((2 * vi) as u16).to_le_bytes());
-            out.extend_from_slice(&((2 * vi + 1) as u16).to_le_bytes());
-        }
-        out.push(blr::ASSIGNMENT);
-        out.push(blr::LITERAL);
-        out.push(blr::SHORT);
-        out.push(0);
-        out.extend_from_slice(&eof.to_le_bytes());
-        out.push(blr::PARAMETER);
-        out.push(1);
-        out.extend_from_slice(&((2 * n) as u16).to_le_bytes());
-        out.push(blr::END);
-    };
-    if is_for {
-        // the row send lives INSIDE the loop body
-        send(&mut out, 1);
-        out.push(blr::END);
-    } else {
-        // the singular form closes its assignment block first; a
-        // SUSPEND compiles as a SIBLING send after the for (probed)
-        out.push(blr::END);
-        if suspend {
-            send(&mut out, 1);
-        }
+    for st in &stmts {
+        emit_trig_stmt(&mut out, st);
     }
     out.push(blr::END);
     out.push(blr::END);
     out.push(blr::END);
-    send(&mut out, 0);
+    emit_send(&mut out, n, 0);
     out.push(blr::END);
     out.push(blr::EOC);
     Some(out)
@@ -2948,6 +2623,59 @@ enum TrigStmt {
     /// WHILE (cond) DO stmt - blr_label N, blr_loop, begin,
     /// blr_if(cond, body, blr_leave N), end (probed)
     While(u8, Bool, Box<TrigStmt>),
+    /// SUSPEND; - the row send: every output variable to its
+    /// blr_parameter2 pair plus the EOF flag as literal short 1
+    Suspend(usize),
+    /// (FOR) SELECT - the whole probed select machinery as ONE
+    /// statement inside a body
+    ForSel(Box<ForSel>),
+}
+
+/// A FOR SELECT / SELECT INTO inside a body: `label` is Some for the
+/// looping form (blr_label N + blr_for) and None for the singular
+/// (blr_for over blr_singular, no label).
+struct ForSel {
+    label: Option<u8>,
+    stream: Stream,
+    ctx: u8,
+    aggregate: bool,
+    map: Vec<MapEntry>,
+    group_keys: Vec<Val>,
+    boolean: Option<Bool>,
+    having: Option<Bool>,
+    sort: Vec<(bool, Val)>,
+    first: Option<Val>,
+    skip: Option<Val>,
+    col_vals: Vec<Val>,
+    into: Vec<u16>,
+    do_stmt: Option<Box<TrigStmt>>,
+}
+
+/// The row/EOF send of a procedure: message 1, every output variable
+/// through blr_parameter2 (value slot 2i, null slot 2i+1), the EOF
+/// flag (parameter 2n) as a literal short.
+fn emit_send(out: &mut Vec<u8>, n: usize, eof: u16) {
+    out.push(blr::SEND);
+    out.push(1);
+    out.push(blr::BEGIN);
+    for vi in 0..n {
+        out.push(blr::ASSIGNMENT);
+        out.push(blr::VARIABLE);
+        out.extend_from_slice(&(vi as u16).to_le_bytes());
+        out.push(blr::PARAMETER2);
+        out.push(1);
+        out.extend_from_slice(&((2 * vi) as u16).to_le_bytes());
+        out.extend_from_slice(&((2 * vi + 1) as u16).to_le_bytes());
+    }
+    out.push(blr::ASSIGNMENT);
+    out.push(blr::LITERAL);
+    out.push(blr::SHORT);
+    out.push(0);
+    out.extend_from_slice(&eof.to_le_bytes());
+    out.push(blr::PARAMETER);
+    out.push(1);
+    out.extend_from_slice(&((2 * n) as u16).to_le_bytes());
+    out.push(blr::END);
 }
 
 fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
@@ -3006,6 +2734,95 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
             out.push(blr::ERASE);
             out.push(*ctx);
         }
+        TrigStmt::Suspend(n) => emit_send(out, *n, 1),
+        TrigStmt::ForSel(f) => {
+            match f.label {
+                Some(l) => {
+                    out.push(blr::LABEL);
+                    out.push(l);
+                    out.push(blr::FOR);
+                }
+                None => {
+                    out.push(blr::FOR);
+                    out.push(blr::SINGULAR);
+                }
+            }
+            out.push(blr::RSE);
+            out.push(1);
+            if f.aggregate {
+                out.push(blr::AGGREGATE);
+                out.push(f.ctx + 1);
+                out.push(blr::RSE);
+                out.push(1);
+                emit_stream(out, &f.stream, f.ctx);
+                if let Some(b) = &f.boolean {
+                    out.push(blr::BOOLEAN);
+                    emit_bool(out, b);
+                }
+                out.push(blr::END);
+                out.push(blr::GROUP_BY);
+                out.push(f.group_keys.len() as u8);
+                for k in &f.group_keys {
+                    emit_val(out, k);
+                }
+                out.push(blr::MAP);
+                out.extend_from_slice(&(f.map.len() as u16).to_le_bytes());
+                for (fi, e) in f.map.iter().enumerate() {
+                    out.extend_from_slice(&(fi as u16).to_le_bytes());
+                    match e {
+                        MapEntry::Key(v) => emit_val(out, v),
+                        MapEntry::Agg(verb, arg) => {
+                            out.push(*verb);
+                            if let Some(a) = arg {
+                                emit_val(out, a);
+                            }
+                        }
+                    }
+                }
+                if let Some(h) = &f.having {
+                    out.push(blr::BOOLEAN);
+                    emit_bool(out, h);
+                }
+            } else {
+                emit_stream(out, &f.stream, f.ctx);
+                if let Some(v) = &f.first {
+                    out.push(blr::FIRST);
+                    emit_val(out, v);
+                }
+                if let Some(v) = &f.skip {
+                    out.push(blr::SKIP);
+                    emit_val(out, v);
+                }
+                if let Some(b) = &f.boolean {
+                    out.push(blr::BOOLEAN);
+                    emit_bool(out, b);
+                }
+            }
+            if !f.sort.is_empty() {
+                out.push(blr::SORT);
+                out.push(f.sort.len() as u8);
+                for (desc, key) in &f.sort {
+                    out.push(if *desc {
+                        blr::DESCENDING
+                    } else {
+                        blr::ASCENDING
+                    });
+                    emit_val(out, key);
+                }
+            }
+            out.push(blr::END);
+            out.push(blr::BEGIN);
+            for (ci, v) in f.col_vals.iter().enumerate() {
+                out.push(blr::ASSIGNMENT);
+                emit_val(out, v);
+                out.push(blr::VARIABLE);
+                out.extend_from_slice(&f.into[ci].to_le_bytes());
+            }
+            if let Some(d) = &f.do_stmt {
+                emit_trig_stmt(out, d);
+            }
+            out.push(blr::END);
+        }
         TrigStmt::While(label, cond, body) => {
             out.push(blr::LABEL);
             out.push(*label);
@@ -3046,6 +2863,298 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
 }
 
 impl<'a> P<'a> {
+    /// (FOR) SELECT as a body statement, self.i past SELECT. The
+    /// whole probed select machinery: FIRST/SKIP, aggregates,
+    /// GROUP BY/HAVING, ORDER BY, INTO variables, and for the FOR
+    /// form a DO statement (its label numbers with the WHILEs).
+    fn select_stmt(&mut self, is_for: bool) -> Option<TrigStmt> {
+        let mut first: Option<Val> = None;
+        let mut skip: Option<Val> = None;
+        if self.kw("FIRST") {
+            let Some(Tok::Int(v)) = self.t.get(self.i) else {
+                return None;
+            };
+            first = Some(Val::Int(i32::try_from(*v).ok()?));
+            self.i += 1;
+        }
+        if self.kw("SKIP") {
+            let Some(Tok::Int(v)) = self.t.get(self.i) else {
+                return None;
+            };
+            skip = Some(Val::Int(i32::try_from(*v).ok()?));
+            self.i += 1;
+        }
+        if !is_for && (first.is_some() || skip.is_some()) {
+            return None; // FIRST/SKIP in the singular form: unprobed
+        }
+        // two-phase select list: fields need the stream's context
+        let list_start = self.i;
+        let mut depth = 0i32;
+        let list_end = loop {
+            match self.t.get(self.i)? {
+                Tok::LParen => {
+                    depth += 1;
+                    self.i += 1;
+                }
+                Tok::RParen => {
+                    depth -= 1;
+                    self.i += 1;
+                }
+                Tok::Ident(w) if w == "FROM" && depth == 0 => break self.i,
+                _ => self.i += 1,
+            }
+        };
+        self.i = list_end + 1;
+        let stream = self.stream_item()?;
+        if stream.alias.is_some() || stream.derived.is_some() {
+            return None; // aliased / derived FOR streams: unprobed
+        }
+        self.streams.push(stream.clone());
+        let sidx = self.streams.len() - 1;
+        let ctx = sidx as u8 + self.base;
+        let after_from = self.i;
+        self.i = list_start;
+        enum Item {
+            Col(Val),
+            Agg(u8, Option<Val>),
+        }
+        let saved_sub = self.sub.replace(sidx);
+        let mut items: Vec<Item> = Vec::new();
+        loop {
+            match self.t.get(self.i)? {
+                Tok::Ident(w)
+                    if matches!(
+                        w.as_str(),
+                        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+                    ) && matches!(self.t.get(self.i + 1), Some(Tok::LParen)) =>
+                {
+                    let w = w.clone();
+                    self.i += 1;
+                    let (verb, arg) = self.parse_agg(&w)?;
+                    items.push(Item::Agg(verb, arg));
+                }
+                Tok::Ident(w) if !is_keyword(w) => {
+                    let a = w.clone();
+                    self.i += 1;
+                    let v = if matches!(self.t.get(self.i), Some(Tok::Dot)) {
+                        self.i += 1;
+                        let Some(Tok::Ident(b)) = self.t.get(self.i) else {
+                            return None;
+                        };
+                        let b = b.clone();
+                        self.i += 1;
+                        self.field(Some(&a), &b)?
+                    } else {
+                        // a select column, NOT a variable: resolve as
+                        // a field of the select's own stream
+                        Val::Field(ctx, a)
+                    };
+                    items.push(Item::Col(v));
+                }
+                _ => return None,
+            }
+            if self.i == list_end {
+                break;
+            }
+            if !matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                return None;
+            }
+            self.i += 1;
+        }
+        self.i = after_from;
+        let cols_n = items.len();
+        if cols_n == 0 {
+            return None;
+        }
+        let has_aggs = items.iter().any(|it| matches!(it, Item::Agg(..)));
+        let boolean = if self.kw("WHERE") {
+            Some(self.bool_or()?)
+        } else {
+            None
+        };
+        let mut group_keys: Vec<Val> = Vec::new();
+        let grouped = self.kw("GROUP");
+        if grouped {
+            if !self.kw("BY") {
+                return None;
+            }
+            loop {
+                let key = match self.t.get(self.i)? {
+                    Tok::Ident(w) if !is_keyword(w) => {
+                        let a = w.clone();
+                        self.i += 1;
+                        if matches!(self.t.get(self.i), Some(Tok::Dot)) {
+                            self.i += 1;
+                            let Some(Tok::Ident(b)) = self.t.get(self.i) else {
+                                return None;
+                            };
+                            let b = b.clone();
+                            self.i += 1;
+                            self.field(Some(&a), &b)?
+                        } else {
+                            Val::Field(ctx, a)
+                        }
+                    }
+                    _ => return None,
+                };
+                group_keys.push(key);
+                if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                    self.i += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        let aggregate = has_aggs || grouped;
+        if aggregate {
+            if !has_aggs || ctx != 0 {
+                // grouped-without-aggs and aggregates after other
+                // stream-claiming statements: unprobed
+                return None;
+            }
+            if first.is_some() || skip.is_some() {
+                return None;
+            }
+            for it in &items {
+                if let Item::Col(v) = it {
+                    if !group_keys.contains(v) {
+                        return None;
+                    }
+                }
+            }
+            self.agg_map = items
+                .iter()
+                .map(|it| match it {
+                    Item::Col(v) => MapEntry::Key(v.clone()),
+                    Item::Agg(verb, arg) => MapEntry::Agg(*verb, arg.clone()),
+                })
+                .collect();
+        }
+        let having = if self.kw("HAVING") {
+            if !aggregate {
+                return None;
+            }
+            self.agg_mode = true;
+            let b = self.bool_or()?;
+            self.agg_mode = false;
+            Some(map_bool_to_fids(&self.agg_map, b)?)
+        } else {
+            None
+        };
+        let mut sort: Vec<(bool, Val)> = Vec::new();
+        if self.kw("ORDER") {
+            if !self.kw("BY") {
+                return None;
+            }
+            loop {
+                let key = match self.t.get(self.i)? {
+                    Tok::Ident(w) if !is_keyword(w) => {
+                        let a = w.clone();
+                        self.i += 1;
+                        if matches!(self.t.get(self.i), Some(Tok::Dot)) {
+                            self.i += 1;
+                            let Some(Tok::Ident(b)) = self.t.get(self.i) else {
+                                return None;
+                            };
+                            let b = b.clone();
+                            self.i += 1;
+                            self.field(Some(&a), &b)?
+                        } else {
+                            Val::Field(ctx, a)
+                        }
+                    }
+                    _ => return None,
+                };
+                let key = if aggregate {
+                    map_val_to_fid(&self.agg_map, &key)?
+                } else {
+                    key
+                };
+                let descending = if self.kw("DESC") {
+                    true
+                } else {
+                    let _ = self.kw("ASC");
+                    false
+                };
+                sort.push((descending, key));
+                if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                    self.i += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        self.sub = saved_sub;
+        let col_vals: Vec<Val> = if aggregate {
+            (0..cols_n).map(|i| Val::Fid(ctx + 1, i as u16)).collect()
+        } else {
+            items
+                .iter()
+                .map(|it| match it {
+                    Item::Col(v) => Some(v.clone()),
+                    Item::Agg(..) => None,
+                })
+                .collect::<Option<Vec<_>>>()?
+        };
+        if !self.kw("INTO") {
+            return None;
+        }
+        // INTO :v, ... - output parameters and locals are ONE
+        // variable space (outputs first)
+        let mut into: Vec<u16> = Vec::new();
+        loop {
+            if !matches!(self.t.get(self.i), Some(Tok::Colon)) {
+                return None;
+            }
+            self.i += 1;
+            let Some(Tok::Ident(name)) = self.t.get(self.i) else {
+                return None;
+            };
+            let vi = self.local_vars.iter().position(|n| n == name)?;
+            self.i += 1;
+            into.push(vi as u16);
+            if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+        if into.len() != cols_n {
+            return None;
+        }
+        let (label, do_stmt) = if is_for {
+            let label = self.next_label;
+            self.next_label += 1;
+            if !self.kw("DO") {
+                return None;
+            }
+            (Some(label), Some(Box::new(self.trig_stmt()?)))
+        } else {
+            if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                return None;
+            }
+            self.i += 1;
+            (None, None)
+        };
+        let map = std::mem::take(&mut self.agg_map);
+        Some(TrigStmt::ForSel(Box::new(ForSel {
+            label,
+            stream,
+            ctx,
+            aggregate,
+            map,
+            group_keys,
+            boolean,
+            having,
+            sort,
+            first,
+            skip,
+            col_vals,
+            into,
+            do_stmt,
+        })))
+    }
+
     /// one trigger-body statement; self.i past any leading keyword
     fn trig_stmt(&mut self) -> Option<TrigStmt> {
         if self.kw("BEGIN") {
@@ -3079,6 +3188,25 @@ impl<'a> P<'a> {
                 None
             };
             return Some(TrigStmt::If(cond, then, els));
+        }
+        if let Some(n) = self.proc {
+            if self.kw("SUSPEND") {
+                if n == 0 || !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                    return None; // SUSPEND without outputs: unprobed
+                }
+                self.i += 1;
+                return Some(TrigStmt::Suspend(n));
+            }
+            if self.kw("FOR") {
+                if !self.kw("SELECT") {
+                    return None;
+                }
+                return self.select_stmt(true);
+            }
+            if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "SELECT") {
+                self.i += 1;
+                return self.select_stmt(false);
+            }
         }
         if self.kw("WHILE") {
             if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
@@ -3347,6 +3475,7 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
         in_params: Vec::new(),
         local_vars: Vec::new(),
         next_label: 1,
+        proc: None,
     };
     if !(p.kw("CREATE") && p.kw("TRIGGER")) {
         return None;
@@ -4425,6 +4554,49 @@ mod tests {
             "CREATE TRIGGER QX_B FOR T BEFORE INSERT AS BEGIN IF (NOT INSERTING) THEN NEW.A = 0; END",
             "0502110002020830B11508000600000015080001000000011508000000000017010141FFFFFFFF4C",
         );
+    }
+
+    #[test]
+    fn compiles_slice_fourteen_general_bodies_byte_for_byte() {
+        // output parameters ARE variables: R1 = 5; assigns var 0, and
+        // SUSPEND anywhere is the row send
+        pin_proc(
+            "CREATE PROCEDURE QH1 RETURNS (R1 INTEGER) AS BEGIN R1 = 5; SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020201150800050000001A00000E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // locals continue the variable numbering after the outputs,
+        // INTERLEAVED declare/init (procedure style); WHILE works in
+        // procedure bodies with the same label machinery
+        pin_proc(
+            "CREATE PROCEDURE QH2 RETURNS (R1 INTEGER) AS DECLARE V1 INTEGER = 0; BEGIN WHILE (V1 < 5) DO V1 = V1 + 1; R1 = V1; SUSPEND; END",
+            "050204010300080007000700020300000800012D1A0000030100080001150800000000001A01009B110002021101090208331A01001508000500000001221A0100150800010000001A01001201FF011A01001A00000E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // bare input parameters resolve outside stream scopes:
+        // IF (I1 > 0) compiles the message reference
+        pin_proc(
+            "CREATE PROCEDURE QH3 (I1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN IF (I1 > 0) THEN R1 = 1; ELSE R1 = 0; SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B1100020208312900000001001508000000000001150800010000001A000001150800000000001A00000E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // a procedure with NO outputs: message 1 is the one-slot EOF
+        // form and the final send carries only the flag; DML works in
+        // procedure bodies at context 0 with :params
+        pin_proc(
+            "CREATE PROCEDURE QH4 (I1 INTEGER) AS BEGIN DELETE FROM U2 WHERE U2.UID = :I1; END",
+            "050204000200080007000401010007000C00029B1100020207D9010443014A02553200472F170003554944290000000100FF0500FFFFFF0E010201150700000019010000FFFF4C",
+        );
+    }
+
+    #[test]
+    fn general_body_refusals() {
+        for sql in [
+            // SUSPEND without outputs: unprobed
+            "CREATE PROCEDURE X (I1 INTEGER) AS BEGIN SUSPEND; END",
+            // an aggregate select after a stream-claiming statement:
+            // the aggregate context law is probed only at 0
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN DELETE FROM U2; SELECT COUNT(*) FROM T INTO :R1; END",
+        ] {
+            assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
+        }
     }
 
     #[test]

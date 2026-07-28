@@ -13,6 +13,36 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 14: general procedure bodies
+
+### Converted
+- **The statement surfaces UNIFIED**: procedure bodies now run the
+  same statement machine as triggers — bodies mix FOR SELECT loops,
+  singular SELECT INTOs (into locals too), DML, IF/WHILE and
+  SUSPENDs freely, with FOR labels numbering alongside the WHILEs.
+  Every prior single-statement shape re-emits byte-identically
+  through the general machine (the 174 existing pins are the
+  regression net that proved it).
+- **Outputs ARE variables**: `R1 = 5;` assigns variable 0; locals
+  continue the numbering (interleaved declare/init in procedures
+  where triggers group). SUSPEND anywhere is the row send.
+- **RETURNS is OPTIONAL**: a no-output procedure carries a ONE-SLOT
+  message 1 — just the EOF short — and a flag-only final send
+  (probed).
+- **Name resolution split**: outside stream scopes a bare name
+  resolves local variables FIRST, then input parameters (probed:
+  `IF (I1 > 0)` compiles the message reference bare); inside
+  selects, subqueries and DML WHEREs a bare name stays a COLUMN —
+  variables need their colon — and `:name` reaches locals and
+  outputs as blr_variable.
+
+### Guarded
+- SUSPEND without outputs, aggregate selects after stream-claiming
+  statements (the aggregate-context law is probed only at 0). Gate:
+  `qa/dsql-proc-blr.sh` grew to 59 checks (10 fresh multi-statement
+  battery statements incl. two-SUSPEND bodies and IF THEN INSERT
+  ELSE DELETE); 182 unit byte-pins.
+
 ## 2026-07-28 — fire-crab-dsql slice 13: PSQL control
 
 ### Converted

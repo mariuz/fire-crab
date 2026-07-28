@@ -307,6 +307,14 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # unify statement machines EARLY: the single-statement wrapper
+    # you converted first is a special case of the general body -
+    # refactor toward one machine and let the accumulated byte-pins
+    # prove the refactor emits every old shape identically
+    # name resolution SPLITS BY SCOPE: outside stream scopes bare
+    # names are variables-then-parameters; inside a select or DML
+    # WHERE they are COLUMNS and variables need their marker - one
+    # resolver with a scope flag, not two resolvers
     # PSQL control is MORE compiled sugar: a WHILE is a labelled
     # loop whose body IF leaves on failure; event predicates
     # (INSERTING) are comparisons against an internal-info call, so
