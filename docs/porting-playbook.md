@@ -180,6 +180,18 @@ them.
     # A value wider than the announced wire form must RAISE at emit,
     # never encode truncated bytes.
 
+    # EXPRESSION keys: evaluate each key expression per input row into
+    # a SYNTHETIC value slot past every real field - bucketing and
+    # output then read it like a field, and nothing else changes.
+    # Match select-list expressions to keys STRUCTURALLY: parse both,
+    # normalize column names (uppercase them - string literals keep
+    # their case), compare the trees. Text comparison of raw SQL is
+    # the tempting wrong answer (spacing, case, comments).
+    # HAVING terms compare by the aggregate's OUTPUT shape: integers
+    # directly, numerics through exact scale alignment, text through
+    # the pad-trimming compare; expression aggregates fold as hidden
+    # output items.
+
 ### SQL LIKE (character-based, backtracking)
 
     match(value_chars, pattern_chars, escape?):

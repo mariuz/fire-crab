@@ -4163,6 +4163,38 @@ Known difference, documented not silent: the conversion error inside
 an aggregate raises SQLSTATE 22018 without the engine's
 offending-string vector argument.
 
+### GROUP BY expressions (`qa/serve-real-groupexpr.sh`, 30 checks)
+
+Grouping keys that are computed per row: `GROUP BY UPPER(S)` merges
+'Apple' and 'apple' into one bucket (the teeth pin the merged count),
+`EXTRACT(YEAR FROM D)` buckets by calendar year, `MOD(A, 2)` by parity
+- whose argument comma exposed that the GROUP BY list split on every
+comma - `CASE ... END` by condition, and `GROUP BY 1` may name an
+expression select item. Each key evaluates into a SYNTHETIC value slot
+past every real field (the gen_base convention), so bucketing, output
+items and ORDER BY read it exactly like a field and nothing else in
+the grouped machinery changed.
+
+The matching rule is the design decision worth recording: a
+select-list expression must BE one of the group's expression keys, and
+the match is STRUCTURAL - both sides parse and the trees compare, with
+column names normalized case-insensitively and string literals kept
+exact - so `GROUP BY upper( s )` matches `SELECT UPPER(S)` while
+`SELECT LOWER(S)` refuses with the engine's -104 shape. Comparing raw
+SQL text is the tempting wrong answer (spacing, case); comparing
+resolved trees would lose the distinction between quoted and unquoted
+identifiers.
+
+HAVING completed alongside: EXPRESSION aggregates fold as hidden
+output items (`HAVING SUM(A + ID) > 5` with or without the aggregate
+in the select list - and the aggregate LEXER had to learn to scan to
+the MATCHING paren, or `COUNT(NULLIF(A, 1))` broke at NULLIF's close);
+NUMERIC aggregates compare through the exact scale alignment
+(`HAVING AVG(N) > 0`, `SUM(N) > 0.10` - the output value carries the
+source's scale, num_cmp aligns whatever the literal wrote); and text
+MIN/MAX compare pad-trimmed. Temporal aggregates in HAVING stay
+refusals - no temporal literal reaches that tokenizer yet.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
@@ -4762,6 +4794,12 @@ FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
 # Builds its own scratch database.
 FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     bash /path/to/fire-crab/qa/serve-real-aggexpr.sh 3050
+
+# GROUP BY expressions: UPPER/EXTRACT/MOD/CASE keys in synthetic slots,
+# structural select-list matching, HAVING expression/numeric/text
+# aggregates. Builds its own scratch database.
+FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
+    bash /path/to/fire-crab/qa/serve-real-groupexpr.sh 3050
 ```
 
 The scratch databases are produced by running the companion paper's hands-on

@@ -13,6 +13,31 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — GROUP BY expressions
+
+### Converted
+- **Expression grouping keys**: `GROUP BY UPPER(S)` /
+  `EXTRACT(YEAR FROM D)` / `MOD(A, 2)` / `CASE ... END`, and
+  `GROUP BY <ordinal>` naming an expression select item — each key
+  computed per row into a synthetic value slot, bucketed like a field
+  (NULL keys share a bucket). Select-list expressions match group keys
+  STRUCTURALLY (parsed trees compare; column names case-insensitive,
+  literals exact), so `GROUP BY upper( s )` matches `SELECT UPPER(S)`.
+- **HAVING breadth**: expression aggregates (`HAVING SUM(A + ID) > 5`,
+  `COUNT(NULLIF(A, 1))`, `SUM(IIF(...))`) fold as hidden items;
+  NUMERIC aggregates compare through exact scale alignment
+  (`HAVING AVG(N) > 0`, `SUM(N) > 0.10`); text MIN/MAX compare
+  pad-trimmed (`HAVING MIN(S) = 'apple'`). Gate:
+  `qa/serve-real-groupexpr.sh`, 30 checks; the aggexpr gate's HAVING
+  refusal moved to its answered list (38 checks).
+
+### Fixed
+- The HAVING aggregate lexer scanned to the FIRST close paren, so a
+  nested call (`COUNT(NULLIF(A, 1))`) broke the token; it scans to the
+  MATCHING paren now.
+- `GROUP BY` split its list on every comma, so `MOD(A, 2)`'s argument
+  comma broke the key; top-level commas only now.
+
 ## 2026-07-28 — aggregates over expressions
 
 ### Converted

@@ -1245,6 +1245,11 @@ AlterDomainRename {
         cols: Vec<ProjCol>,
         gitems: Vec<GItem>,
         key_fids: Vec<usize>,
+        /// expression grouping keys, evaluated per input row into the
+        /// synthetic value slots starting at `synth_base` - bucketing
+        /// and Key items then read them like fields
+        key_exprs: Vec<Expr>,
+        synth_base: usize,
         filter: Option<Predicate>,
         having: Option<Predicate>,
         order_by: Vec<(usize, bool)>,
@@ -10058,15 +10063,47 @@ fn plan_group(
     if formats.is_empty() {
         return None;
     }
-    let key_fids = match group_s {
-        None => Vec::new(),
-        Some(g) => parse_group_by(g, items, columns, descs)?,
+    // synthetic value slots for expression keys start past every
+    // format's real fields (the gen_base convention)
+    let synth_base = formats
+        .iter()
+        .map(|(_, d)| d.len())
+        .max()
+        .unwrap_or(0)
+        .max(descs.len());
+    let (key_fids, key_exprs) = match group_s {
+        None => (Vec::new(), Vec::new()),
+        Some(g) => parse_group_by(g, items, columns, descs, synth_base)?,
     };
     let mut gitems = Vec::new();
     let mut cols = Vec::new();
     for (out_idx, item) in items.iter().enumerate() {
         match item {
-            SelItem::Expr(..) => return None, // expressions not supported in grouped queries
+            // an expression select item must BE one of the group's
+            // expression keys (matched structurally); anything else is
+            // the engine's "not contained in an aggregate or the GROUP
+            // BY clause" - refuse
+            SelItem::Expr(raw, name) => {
+                let pos = {
+                    let n = normalize_raw(raw);
+                    key_exprs.iter().position(|(r, _)| *r == n)?
+                };
+                // the describe comes from the expression's own typing;
+                // the VALUE comes from the group's computed key slot,
+                // so the output column reads plainly (expr: None)
+                let pc = build_expr_col(raw, name, columns, descs)?;
+                cols.push(ProjCol {
+                    name: pc.name,
+                    field_id: out_idx,
+                    wire: pc.wire,
+                    sql_type: pc.sql_type,
+                    length: pc.length,
+                    scale: pc.scale,
+                    sub_type: pc.sub_type,
+                    expr: None,
+                });
+                gitems.push(GItem::Key(synth_base + pos));
+            }
             SelItem::Gen(..) => return None,  // generator advances need the Project path
             SelItem::Col(name) => {
                 let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
@@ -10246,6 +10283,8 @@ fn plan_group(
         cols,
         gitems,
         key_fids,
+        key_exprs: key_exprs.into_iter().map(|(_, e)| e).collect(),
+        synth_base,
         filter,
         having,
         order_by,
@@ -10255,14 +10294,79 @@ fn plan_group(
 /// Parse a GROUP BY list into record field ids. Items are column names or
 /// 1-based select-list ordinals (which must name a bare column - grouping
 /// by an aggregate is invalid).
+/// Uppercase every COLUMN NAME in a raw expression - and nothing else
+/// (string literals keep their case) - so two spellings of the same
+/// tree compare equal: `GROUP BY upper( s )` matches `SELECT UPPER(S)`.
+fn normalize_raw(e: &RawExpr) -> RawExpr {
+    let nb = |b: &RawExpr| Box::new(normalize_raw(b));
+    let nv = |v: &[RawExpr]| v.iter().map(normalize_raw).collect();
+    match e {
+        RawExpr::Col(c) => RawExpr::Col(c.to_ascii_uppercase()),
+        RawExpr::Neg(a) => RawExpr::Neg(nb(a)),
+        RawExpr::Bin(a, op, b) => RawExpr::Bin(nb(a), *op, nb(b)),
+        RawExpr::Concat(a, b) => RawExpr::Concat(nb(a), nb(b)),
+        RawExpr::Cast(a, t) => RawExpr::Cast(nb(a), *t),
+        RawExpr::Coalesce(v) => RawExpr::Coalesce(nv(v)),
+        RawExpr::NullIf(a, b) => RawExpr::NullIf(nb(a), nb(b)),
+        RawExpr::Iif(c, a, b) => RawExpr::Iif(Box::new(normalize_cond(c)), nb(a), nb(b)),
+        RawExpr::Func(f, v) => RawExpr::Func(*f, nv(v)),
+        RawExpr::Case(branches, else_) => RawExpr::Case(
+            branches
+                .iter()
+                .map(|(c, t)| (normalize_cond(c), normalize_raw(t)))
+                .collect(),
+            else_.as_ref().map(|e| Box::new(normalize_raw(e))),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn normalize_cond(c: &RawCond) -> RawCond {
+    let nb = |b: &RawExpr| Box::new(normalize_raw(b));
+    match c {
+        RawCond::Cmp(a, op, b) => RawCond::Cmp(nb(a), *op, nb(b)),
+        RawCond::IsNull(a) => RawCond::IsNull(nb(a)),
+        RawCond::IsNotNull(a) => RawCond::IsNotNull(nb(a)),
+        RawCond::Not(inner) => RawCond::Not(Box::new(normalize_cond(inner))),
+        RawCond::And(v) => RawCond::And(v.iter().map(normalize_cond).collect()),
+        RawCond::Or(v) => RawCond::Or(v.iter().map(normalize_cond).collect()),
+    }
+}
+
 fn parse_group_by(
     group: &str,
     items: &[SelItem],
     columns: &[RelationColumn],
     descs: &[Descriptor],
-) -> Option<Vec<usize>> {
+    synth_base: usize,
+) -> Option<(Vec<usize>, Vec<(RawExpr, Expr)>)> {
     let mut fids = Vec::new();
-    for part in group.split(',') {
+    let mut key_exprs: Vec<(RawExpr, Expr)> = Vec::new();
+    // an EXPRESSION key gets a SYNTHETIC value slot past every real
+    // field (the gen_base pattern): group_output evaluates it per row
+    // into that slot, and bucketing/output read it like a field
+    let mut push_expr = |raw: RawExpr,
+                         key_exprs: &mut Vec<(RawExpr, Expr)>,
+                         fids: &mut Vec<usize>|
+     -> Option<()> {
+        let raw = normalize_raw(&raw);
+        // the same expression named twice groups once
+        if let Some(pos) = key_exprs.iter().position(|(r, _)| *r == raw) {
+            fids.push(synth_base + pos);
+            return Some(());
+        }
+        let e = resolve_expr(&raw, columns, descs)?;
+        // bucketing compares evaluated values, so the expression must
+        // TYPE; a could-raise shape aborts the fetch like an aggregate
+        // argument does (group_output is fallible)
+        e.type_of(descs)?;
+        fids.push(synth_base + key_exprs.len());
+        key_exprs.push((raw, e));
+        Some(())
+    };
+    // top-level commas only: an expression key's own argument commas
+    // (GROUP BY MOD(A, 2)) stay inside their parens
+    for part in split_top_level_commas(group) {
         let name = part.trim().trim_matches('"');
         let col_name = if let Ok(ord) = name.parse::<usize>() {
             if ord == 0 || ord > items.len() {
@@ -10270,13 +10374,24 @@ fn parse_group_by(
             }
             match &items[ord - 1] {
                 SelItem::Col(c) => c.as_str(),
+                // GROUP BY <ordinal> may name an EXPRESSION select item
+                // (probed: GROUP BY 1 over SELECT UPPER(S), COUNT(*))
+                SelItem::Expr(raw, _) => {
+                    push_expr(raw.clone(), &mut key_exprs, &mut fids)?;
+                    continue;
+                }
                 _ => return None,
             }
-        } else {
-            if !ident_ok(name) {
-                return None;
-            }
+        } else if ident_ok(name) {
             name
+        } else {
+            // not a bare column: an expression key - GROUP BY UPPER(S),
+            // GROUP BY EXTRACT(YEAR FROM D). Matched to select items
+            // STRUCTURALLY (the parsed trees compare, so spacing and
+            // case differences do not matter).
+            let raw = parse_raw_expr_any(part.trim())?;
+            push_expr(raw, &mut key_exprs, &mut fids)?;
+            continue;
         };
         let rc = columns
             .iter()
@@ -10290,7 +10405,7 @@ fn parse_group_by(
     if fids.is_empty() {
         None
     } else {
-        Some(fids)
+        Some((fids, key_exprs))
     }
 }
 
@@ -10576,12 +10691,15 @@ fn order_cmp(a: &[Value], b: &[Value], keys: &[(usize, bool)]) -> std::cmp::Orde
 /// included) accepts. With no keys the whole input is ONE group, emitted
 /// even when empty - SQL's global aggregate shape (COUNT = 0, MIN/MAX/SUM
 /// = NULL over no rows) - though a HAVING can still reject it.
+#[allow(clippy::too_many_arguments)]
 fn group_output(
     db: &Database,
     rel: u16,
     formats: &[(u8, Vec<Descriptor>)],
     gitems: &[GItem],
     key_fids: &[usize],
+    key_exprs: &[Expr],
+    synth_base: usize,
     filter: &Option<Predicate>,
     having: &Option<Predicate>,
 ) -> Result<Vec<Vec<Value>>, EvalErr> {
@@ -10591,6 +10709,19 @@ fn group_output(
             input.push(v.to_vec());
         }
     });
+    // expression keys: evaluate each into its synthetic slot, so the
+    // bucketing sort and the Key output items read it like a field.
+    // The filter above ran on the ORIGINAL row; an eval error here
+    // aborts the fetch like an aggregate argument's would.
+    if !key_exprs.is_empty() {
+        for row in &mut input {
+            row.resize(synth_base, Value::Null);
+            for e in key_exprs {
+                let v = e.eval(row)?;
+                row.push(v);
+            }
+        }
+    }
     let mut out = Vec::new();
     if key_fids.is_empty() {
         out.push(compute_group(&input, gitems)?);
@@ -11455,15 +11586,19 @@ fn emit_rows_inner(
             cols,
             gitems,
             key_fids,
+            key_exprs,
+            synth_base,
             filter,
             having,
             order_by,
         } => {
             if let Some(db) = db {
                 let filter = bind_filter(filter, args)?;
-                let mut rows =
-                    group_output(db, *rel, formats, gitems, key_fids, &filter, having)
-                        .map_err(EmitErr::Eval)?;
+                let mut rows = group_output(
+                    db, *rel, formats, gitems, key_fids, key_exprs, *synth_base,
+                    &filter, having,
+                )
+                .map_err(EmitErr::Eval)?;
                 if !order_by.is_empty() {
                     // order_by keys are output indexes; output rows are
                     // aligned with gitems/cols, so order_cmp applies as-is
@@ -11810,7 +11945,7 @@ struct GenCol {
 /// A select-list expression before column names are resolved to field
 /// ids - what `parse_projection` produces (it runs before the relation
 /// is known).
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 enum RawExpr {
     Col(String),
     Int(i64),
@@ -11986,7 +12121,7 @@ impl SysFn {
 /// and parenthesised groups. Kept separate from the WHERE predicate
 /// machinery because this one lives INSIDE an expression and evaluates
 /// per row to a value, not to a filter.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 enum RawCond {
     Cmp(Box<RawExpr>, Cmp, Box<RawExpr>),
     IsNull(Box<RawExpr>),
@@ -12001,7 +12136,7 @@ enum RawCond {
 /// (SMALLINT/INTEGER/BIGINT) collapses to one target: fire-crab computes
 /// the value at full `i64` width and announces BIGINT, exactly as the
 /// select-list arithmetic already does - the displayed value is identical.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum CastTarget {
     /// an integer-family target; `wide` marks BIGINT, whose int64 rank
     /// promotes a multiplication or division around it to INT128 (the
@@ -12994,7 +13129,7 @@ impl Cond2 {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum ArithOp {
     Add,
     Sub,
@@ -15180,7 +15315,9 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                         j += 1;
                     }
                     if j < b.len() && b[j] == b'(' {
-                        let close = j + s[j..].find(')')?;
+                        // the MATCHING close paren: an expression
+                        // argument (COUNT(NULLIF(A, 1))) nests its own
+                        let close = matching_paren(b, j)?;
                         let (func, target) = parse_agg_item(&s[start..=close])?;
                         out.push(Tok::Agg(func, target));
                         i = close + 1;
@@ -16816,11 +16953,20 @@ fn resolve_having(
                     (idx, kind)
                 }
                 RawLhs::Agg(func, target) => {
-                    let (fid, distinct) = match target {
-                        // an expression aggregate in HAVING is a later
-                        // slice - refuse, never a wrong row
-                        AggTarget::Expr(_) => return None,
-                        AggTarget::Star => (None, false), // COUNT(*) - parse guarantees Count
+                    // the aggregate's OUTPUT shape decides how the
+                    // HAVING comparison resolves: COUNT and integer
+                    // sources compare as integers, numeric sources
+                    // through the exact NumCmp alignment, text MIN/MAX
+                    // as text; temporal aggregates in HAVING refuse
+                    // (no temporal literal reaches this tokenizer)
+                    #[derive(Clone, Copy, PartialEq)]
+                    enum HKind {
+                        Int,
+                        Numeric,
+                        Text,
+                    }
+                    let (fid, src_expr, hkind, distinct) = match target {
+                        AggTarget::Star => (None, None, HKind::Int, false),
                         AggTarget::Col(name) | AggTarget::Distinct(name) => {
                             let rc =
                                 columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
@@ -16829,42 +16975,100 @@ fn resolve_having(
                             if is_computed_fid(descs, fid) {
                                 return None;
                             }
-                            // a HAVING comparison term is integer-typed:
-                            // MIN/MAX/SUM/AVG here keep the integer-only
-                            // guard (COUNT counts any column); the
-                            // non-integer aggregate kinds in HAVING are
-                            // a later slice - refusal, not a wrong row
-                            if !matches!(func, AggFn::Count)
-                                && !matches!(col_kind(descs.get(fid)?)?, ColKind::Int)
+                            let d = descs.get(fid)?;
+                            let hk = if matches!(func, AggFn::Count) {
+                                HKind::Int
+                            } else if matches!(col_kind(d), Some(ColKind::Int)) {
+                                HKind::Int
+                            } else if is_numeric_col(d) {
+                                HKind::Numeric
+                            } else if matches!(col_kind(d), Some(ColKind::Text))
+                                && matches!(func, AggFn::Min | AggFn::Max)
                             {
+                                HKind::Text
+                            } else {
                                 return None;
-                            }
-                            (Some(fid), matches!(target, AggTarget::Distinct(_)))
+                            };
+                            (Some(fid), None, hk, matches!(target, AggTarget::Distinct(_)))
+                        }
+                        // an EXPRESSION aggregate: resolve it, type it,
+                        // and fold it as a HIDDEN output item
+                        AggTarget::Expr(raw) => {
+                            let e = resolve_expr(raw, columns, descs)?;
+                            let hk = if matches!(func, AggFn::Count) {
+                                HKind::Int
+                            } else {
+                                match e.type_of(descs)? {
+                                    ExprType::Int => HKind::Int,
+                                    ExprType::Numeric => HKind::Numeric,
+                                    ExprType::Text
+                                        if matches!(func, AggFn::Min | AggFn::Max) =>
+                                    {
+                                        HKind::Text
+                                    }
+                                    _ => return None,
+                                }
+                            };
+                            (None, Some(e), hk, false)
                         }
                     };
                     if distinct && !matches!(func, AggFn::Count) {
                         return None;
                     }
-                    let idx = gitems
-                        .iter()
-                        .position(|gi| match gi {
-                            GItem::Agg(f, AggSrc::Star, dq) => {
-                                f == func && fid.is_none() && *dq == distinct
-                            }
-                            GItem::Agg(f, AggSrc::Field(t), dq) => {
-                                f == func && Some(*t) == fid && *dq == distinct
-                            }
-                            _ => false,
-                        })
-                        .unwrap_or_else(|| {
-                            let src = match fid {
-                                Some(f) => AggSrc::Field(f),
-                                None => AggSrc::Star,
-                            };
-                            gitems.push(GItem::Agg(*func, src, distinct));
+                    let idx = match (&src_expr, fid) {
+                        // field/star aggregates dedup against existing
+                        // output items; expression ones always append
+                        // (structural identity is not tracked past
+                        // resolution - a duplicate fold is just work)
+                        (None, fid) => gitems
+                            .iter()
+                            .position(|gi| match gi {
+                                GItem::Agg(f, AggSrc::Star, dq) => {
+                                    f == func && fid.is_none() && *dq == distinct
+                                }
+                                GItem::Agg(f, AggSrc::Field(t), dq) => {
+                                    f == func && Some(*t) == fid && *dq == distinct
+                                }
+                                _ => false,
+                            })
+                            .unwrap_or_else(|| {
+                                let src = match fid {
+                                    Some(f) => AggSrc::Field(f),
+                                    None => AggSrc::Star,
+                                };
+                                gitems.push(GItem::Agg(*func, src, distinct));
+                                gitems.len() - 1
+                            }),
+                        (Some(_), _) => {
+                            gitems.push(GItem::Agg(
+                                *func,
+                                AggSrc::Expr(src_expr.clone()?),
+                                false,
+                            ));
                             gitems.len() - 1
-                        });
-                    (idx, ColKind::Int)
+                        }
+                    };
+                    // numeric aggregates compare through the exact
+                    // alignment (the output value carries the source's
+                    // scale; num_cmp aligns whatever the literal wrote)
+                    if hkind == HKind::Numeric {
+                        let term = match rt.kind {
+                            RawKind::Cmp(op, Rhs::Int(n)) => {
+                                Term::NumCmp(idx, op, Rhs::Num(n, 0))
+                            }
+                            RawKind::Cmp(op, Rhs::Num(r, sc)) => {
+                                Term::NumCmp(idx, op, Rhs::Num(r, sc))
+                            }
+                            RawKind::Cmp(_, Rhs::Null) => Term::Never,
+                            RawKind::IsNull => Term::IsNull(idx),
+                            RawKind::IsNotNull => Term::IsNotNull(idx),
+                            _ => return None,
+                        };
+                        terms.push(term);
+                        continue;
+                    }
+                    let kind = if hkind == HKind::Text { ColKind::Text } else { ColKind::Int };
+                    (idx, kind)
                 }
             };
             terms.push(typed_term(idx, kind, rt.kind)?);
@@ -19888,11 +20092,23 @@ mod tests {
         ];
         let d = |offset| Descriptor { dtype: dtype::LONG, scale: 0, length: 4, sub_type: 0, flags: 0, offset };
         let descs = vec![d(4), d(8), d(12)];
-        assert_eq!(parse_group_by("DEPT_ID", &items, &columns, &descs), Some(vec![2]));
-        assert_eq!(parse_group_by("1", &items, &columns, &descs), Some(vec![2])); // ordinal = the Col item
-        assert!(parse_group_by("2", &items, &columns, &descs).is_none()); // ordinal names an aggregate
-        assert!(parse_group_by("BOGUS", &items, &columns, &descs).is_none()); // unknown column
-        assert!(parse_group_by("", &items, &columns, &descs).is_none()); // empty list
+        let keys = |g: &str| parse_group_by(g, &items, &columns, &descs, 100).map(|(k, _)| k);
+        assert_eq!(keys("DEPT_ID"), Some(vec![2]));
+        assert_eq!(keys("1"), Some(vec![2])); // ordinal = the Col item
+        assert!(keys("2").is_none()); // ordinal names an aggregate
+        assert!(keys("BOGUS").is_none()); // unknown column
+        assert!(keys("").is_none()); // empty list
+        // an expression key takes a SYNTHETIC slot past the real fields,
+        // argument commas stay inside their parens, and naming the same
+        // tree twice groups once
+        let (k, ke) = parse_group_by("MOD(ID, 2)", &items, &columns, &descs, 100).unwrap();
+        assert_eq!(k, vec![100]);
+        assert_eq!(ke.len(), 1);
+        let (k, ke) =
+            parse_group_by("MOD(ID, 2), DEPT_ID, mod( id , 2 )", &items, &columns, &descs, 100)
+                .unwrap();
+        assert_eq!(k, vec![100, 2, 100]);
+        assert_eq!(ke.len(), 1);
     }
 
     #[test]
@@ -20149,9 +20365,14 @@ mod tests {
         // a non-grouped column in HAVING is invalid
         let raw = parse_predicate(&tokenize("SALARY > 1").unwrap(), &mut 0).unwrap();
         assert!(resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).is_none());
-        // MIN over a text column is unsupported
-        let raw = parse_predicate(&tokenize("MIN(NAME) IS NULL").unwrap(), &mut 0).unwrap();
-        assert!(resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).is_none());
+        // MIN over a text column resolves now (a hidden text item) -
+        // and its comparison is the pad-trimming text compare
+        let raw = parse_predicate(&tokenize("MIN(NAME) = 'ann'").unwrap(), &mut 0).unwrap();
+        let p = resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).unwrap();
+        assert_eq!(gitems.len(), 4);
+        assert!(matches!(gitems[3], GItem::Agg(AggFn::Min, AggSrc::Field(1), false)));
+        assert!(p.matches(&[Value::Null, Value::Null, Value::Null, Value::Text("ann  ".into())]));
+        assert!(!p.matches(&[Value::Null, Value::Null, Value::Null, Value::Text("bob".into())]));
         // an aggregate compared against a string literal is a type mismatch
         let raw = parse_predicate(&tokenize("COUNT(*) = 'x'").unwrap(), &mut 0).unwrap();
         assert!(resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).is_none());
@@ -21251,6 +21472,23 @@ mod tests {
             Some((AggFn::Min, AggTarget::Expr(_)))
         ));
         assert!(parse_agg_item("SUM()").is_none());
+
+        // GROUP BY expression keys: structural matching is spacing- and
+        // case-insensitive on COLUMN names, never on string literals
+        let a = normalize_raw(&parse_raw_expr_any("UPPER(S)").unwrap());
+        let b = normalize_raw(&parse_raw_expr_any("upper( s )").unwrap());
+        assert!(a == b);
+        let c = normalize_raw(&parse_raw_expr_any("UPPER(T)").unwrap());
+        assert!(a != c);
+        let l1 = normalize_raw(&parse_raw_expr_any("S || 'x'").unwrap());
+        let l2 = normalize_raw(&parse_raw_expr_any("s || 'X'").unwrap());
+        assert!(l1 != l2); // literal case is significant
+        let e1 = normalize_raw(&parse_raw_expr_any("EXTRACT(YEAR FROM D)").unwrap());
+        let e2 = normalize_raw(&parse_raw_expr_any("extract(year from d)").unwrap());
+        assert!(e1 == e2);
+        let m1 = normalize_raw(&parse_raw_expr_any("MOD(A, 2)").unwrap());
+        let m2 = normalize_raw(&parse_raw_expr_any("MOD(a,2)").unwrap());
+        assert!(m1 == m2);
     }
 
     #[test]

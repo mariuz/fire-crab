@@ -128,6 +128,9 @@ same "AVG of BIGINT stays BIGINT"   "SELECT AVG(K) FROM T"
 same "expr agg + WHERE function"    "SELECT SUM(A + ID) FROM T WHERE CHAR_LENGTH(S) > 3"
 same "expr agg over empty set"      "SELECT SUM(A + ID), COUNT(A + ID) FROM T WHERE ID > 90"
 same "expr agg + plain agg + WHERE" "SELECT COUNT(*), MIN(A), SUM(A) FROM T WHERE ID > 90"
+# HAVING over an expression aggregate joined the surface with the
+# groupexpr slice - it moved here from the refusal list
+same "HAVING expr aggregate"        "SELECT G FROM T GROUP BY G HAVING SUM(A + ID) > 5 ORDER BY 1"
 
 # --- the eval-error conduit: SUM(A / 0) raises MID-FETCH ---------------
 same "divide by zero inside SUM"    "SELECT SUM(A / 0) FROM T"
@@ -154,7 +157,7 @@ for bad in "SELECT SUM(UPPER(S)) FROM T" \
            "SELECT AVG(S || '!') FROM T" \
            "SELECT SUM(NOSUCHCOL + 1) FROM T" \
            "SELECT GEN_ID(NOSUCHGEN, 0) FROM RDB\$DATABASE" \
-           "SELECT G FROM T GROUP BY G HAVING SUM(A + ID) > 5"; do
+           "SELECT AVG(D) FROM T"; do
     out=$(printf '%s;\n' "$bad" |
           "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
     case "$out" in

@@ -15,7 +15,8 @@ IIF), `qa/serve-real-functions.sh` (the built-in scalar functions),
 `qa/serve-real-case.sh` (CASE, and cross-branch typing),
 `qa/serve-real-extract.sh` (the temporal surface),
 `qa/serve-real-aggfn.sh` (the aggregate surface),
-`qa/serve-real-aggexpr.sh` (aggregates over expressions). Each check in
+`qa/serve-real-aggexpr.sh` (aggregates over expressions),
+`qa/serve-real-groupexpr.sh` (GROUP BY expressions, HAVING breadth). Each check in
 those gates runs identical SQL through fire-crab and `isql` against the
 same database file.
 
@@ -44,6 +45,8 @@ same database file.
 | AVG = SUM/COUNT with TRUNCATING division toward zero; folds skip NULLs; empty/all-NULL input is NULL; COUNT(DISTINCT) counts distinct non-NULLs | `src/jrd/AggNodes.cpp` (`AvgAggNode::execute` et al.), probed | `compute_group`, `aggregate` |
 | aggregates take EXPRESSION arguments, evaluated per row before the fold; an eval error in the argument raises mid-fetch; SUM widens ONE step (LONG source → BIGINT, INT64-ranked → INT128), AVG keeps its width unless the source is INT128 | `AggNodes.cpp` + the expression nodes, probed | `AggTarget::Expr`, `AggSrc::Expr`, the fallible `compute_group` |
 | a lone aggregate's output column is NAMED by its function (COUNT/MIN/MAX/SUM/AVG); a bare literal is CONSTANT, a generator read GEN_ID | probed via isql headers | `Plan::Scalar(value, name)`, `output_cols_of` |
+| GROUP BY takes expression keys, computed per row; a select-list expression must BE one of them (else the engine's -104 "not contained..."); NULL keys share a bucket; `GROUP BY <ordinal>` may name an expression item | `src/jrd/AggNodes.cpp` / DSQL grouping validation, probed | `parse_group_by` (synthetic key slots), `normalize_raw` structural matching |
+| HAVING compares numeric aggregates through exact scale alignment, text MIN/MAX through the pad-trimming compare, and takes expression aggregates as hidden folds | `AggNodes.cpp`, probed (AVG(N) > 0 works; MIN(D) has no literal to meet here) | `resolve_having` (`HKind`), `Term::NumCmp` |
 
 ## Laws probed against the live engine
 
@@ -133,6 +136,14 @@ usually a unit test too:
   argument (the engine prints `conversion error from string "pear"`;
   fire-crab's client prints a missing-argument placeholder). Carrying
   the string means a non-Copy error payload - a named later slice.
+- **A grouping key can be any typeable expression.** `GROUP BY
+  UPPER(S)` merges 'Apple' and 'apple' into one bucket; NULL keys
+  share one, exactly as with column keys. A select-list expression
+  must BE one of the group's expression keys, matched STRUCTURALLY -
+  both sides parse and the trees compare, column names
+  case-insensitively, string literals exactly - so `GROUP BY
+  upper( s )` matches `SELECT UPPER(S)` while `SELECT LOWER(S)` is
+  the engine's -104. `GROUP BY 1` may name an expression select item.
 - **Text comparisons ignore trailing blanks; LIKE does not.** A
   comparison pad-trims both sides (CHAR vs VARCHAR equality); LIKE
   matches the STORED value, padding included — `CHAR(5) 'abc'` matches
