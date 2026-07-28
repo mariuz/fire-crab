@@ -4246,12 +4246,14 @@ a negative literal elsewhere. CAST and the conditionals lex as call
 tokens in predicates now too.
 
 The previously-fenced wherefn entries flipped to differential checks
-(51). Documented differences, not silent ones: the engine surfaces
-some of these errors at EXECUTE where fire-crab surfaces them at
-first FETCH (one leading blank line in isql's output); a DML whose
-WHERE raises answers a generic SQL error (the DML error channel
-carries text, not a vector); and 22018 still lacks its
-offending-string argument.
+(51). The follow-up fidelity slice closed two of the three documented
+differences: the 22018 carries its offending string now (an
+isc_arg_string in the vector - isql prints `conversion error from
+string "pear"` identically), and DML WHERE errors travel the new
+ExecErr::Eval channel to answer the engine's own 22012. What remains,
+documented not silent: the engine surfaces some cursor errors at
+EXECUTE where fire-crab surfaces them at first FETCH (one leading
+blank line in isql's output).
 
 ## Benchmarks
 

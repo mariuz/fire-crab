@@ -116,7 +116,8 @@ sqlstate() { # <label> <sql> <state>
     esac
 }
 sqlstate "runtime divisor hits zero"   "SELECT ID FROM T WHERE MOD(A, B) = 1 ORDER BY ID" 22012
-sqlstate "bad cast raises 22018"       "SELECT ID FROM T WHERE CAST(S AS INTEGER) = 1" 22018
+# the 22018 carries its offending string now - exact differential
+same "bad cast raises 22018 with the string" "SELECT ID FROM T WHERE CAST(S AS INTEGER) = 1"
 sqlstate "error after matching rows"   "SELECT ID FROM T WHERE 100 / B > 10 ORDER BY ID" 22012
 
 # --- composition -------------------------------------------------------
@@ -130,15 +131,8 @@ same "params still bind beside exprs" "SELECT ID FROM T WHERE A = 10 AND N > -99
 # --- DML with expression WHERE -----------------------------------------
 same "UPDATE with expr WHERE"       "UPDATE T SET B = B WHERE A + 1 = 999"
 same "DELETE with expr WHERE"       "DELETE FROM T WHERE A * 2 = 999999"
-# a DML whose WHERE raises: both sides ERROR (the engine carries the
-# 22012 vector, fire-crab's DML channel answers a generic SQL error -
-# a documented difference, not a silent one)
-out=$(printf 'UPDATE T SET B = B WHERE A / 0 = 1;\n' |
-      "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
-case "$out" in
-    *"Statement failed"*) echo "OK   DML with a raising WHERE errors (channel shape documented)" ;;
-    *) echo "DIFF UPDATE with A/0 WHERE gave [$out], want an error"; fail=1 ;;
-esac
+# a DML whose WHERE raises answers the engine's own 22012 vector now
+same "DML with a raising WHERE"     "UPDATE T SET B = B WHERE A / 0 = 1"
 
 # --- refusals that REMAIN ----------------------------------------------
 for bad in "SELECT ID FROM T WHERE UPPER(S) = ?" \

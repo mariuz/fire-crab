@@ -134,16 +134,9 @@ same "HAVING expr aggregate"        "SELECT G FROM T GROUP BY G HAVING SUM(A + I
 
 # --- the eval-error conduit: SUM(A / 0) raises MID-FETCH ---------------
 same "divide by zero inside SUM"    "SELECT SUM(A / 0) FROM T"
-# the conversion error raises 22018 on both sides; the engine's message
-# carries the offending string as a vector argument fire-crab does not
-# ship yet (a named difference, see expression-surface.md) - so this
-# check asserts the matching SQLSTATE, not the argument text
-out=$(printf 'SELECT MIN(CAST(S AS INTEGER)) FROM T;\n' |
-      "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
-case "$out" in
-    *"SQLSTATE = 22018"*) echo "OK   conversion error inside MIN raises 22018" ;;
-    *) echo "DIFF MIN(CAST(S AS INTEGER)) gave [$out], want SQLSTATE 22018"; fail=1 ;;
-esac
+# the conversion error carries its offending string in the vector now
+# ("conversion error from string \"pear\"") - exact differential
+same "conversion error inside MIN"  "SELECT MIN(CAST(S AS INTEGER)) FROM T"
 
 # --- headers: lone aggregates name their FUNCTION (the fixed describe) -
 sameh "header COUNT(*)"             "SELECT COUNT(*) FROM T"

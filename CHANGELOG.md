@@ -13,6 +13,20 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — status-vector fidelity
+
+### Fixed
+- **The 22018 conversion error carries its offending string** as an
+  `isc_arg_string` in the status vector (`EvalErr::ConversionError`
+  gained a payload; the vector writer ships an XDR counted string) —
+  isql now prints `conversion error from string "pear"` identically on
+  both sides, closing the missing-argument placeholder difference.
+- **DML errors gained a vector channel**: `execute_dml` returns
+  `ExecErr { Text, Eval }`, and a per-row eval error in a DML's WHERE
+  (`UPDATE ... WHERE A / 0 = 1`) answers the engine's own 22012 vector
+  instead of a generic SQL error. The wherexpr/aggexpr gates' SQLSTATE
+  workarounds flipped back to exact differential checks.
+
 ## 2026-07-28 — fallible predicates, expressions everywhere in WHERE
 
 ### Converted

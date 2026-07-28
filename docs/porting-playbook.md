@@ -132,6 +132,12 @@ them.
     # exactly the row the engine raises on. A closure that cannot
     # propagate captures the first error and the caller re-raises it
     # after the walk.
+    # ERRORS ARE VALUES WITH PAYLOADS: the conversion error carries the
+    # offending STRING (the client's message formatter needs it as a
+    # vector argument - a code alone prints a placeholder), and every
+    # error channel between evaluator and wire must carry the VECTOR,
+    # not flatten it to text - a DML path that stringifies its errors
+    # answers a generic code where the engine ships 22012.
 
 ### Civil-date math (MJD epoch: day 0 = 1858-11-17)
 

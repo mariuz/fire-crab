@@ -7753,12 +7753,40 @@ fn collect_dml_targets(
 /// value that cannot represent its column fails the whole statement.
 /// Returns the per-verb affected counts (inserted, updated, deleted)
 /// for isc_info_sql_records.
+/// A DML execution failure: descriptive TEXT (constraint violations,
+/// unsupported shapes - answered as the generic SQL error today), or a
+/// per-row EVAL error whose engine status vector the responder ships
+/// verbatim (UPDATE ... WHERE A / 0 = 1 answers the same 22012 the
+/// engine raises).
+enum ExecErr {
+    Text(String),
+    Eval(EvalErr),
+}
+impl From<String> for ExecErr {
+    fn from(t: String) -> Self {
+        ExecErr::Text(t)
+    }
+}
+impl From<&str> for ExecErr {
+    fn from(t: &str) -> Self {
+        ExecErr::Text(t.to_string())
+    }
+}
+impl std::fmt::Display for ExecErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExecErr::Text(t) => f.write_str(t),
+            ExecErr::Eval(e) => write!(f, "evaluation error: {:?}", e),
+        }
+    }
+}
+
 fn execute_dml(
     plan: &Plan,
     database: &mut Option<Database>,
     args: &[WireParam],
     ctx: &SessionCtx,
-) -> Result<(i32, i32, i32), String> {
+) -> Result<(i32, i32, i32), ExecErr> {
     let db = database.as_mut().ok_or("no database attached")?;
     let mut work = db.bytes.clone();
     let counts = match plan {
@@ -8139,11 +8167,7 @@ fn execute_dml(
                             return Err("Operation violates CHECK constraint".into())
                         }
                         Ok(false) => {}
-                        Err(_) => {
-                            return Err(
-                                "arithmetic exception evaluating a CHECK constraint".into()
-                            )
-                        }
+                        Err(e) => return Err(ExecErr::Eval(e)),
                     }
                 }
             }
@@ -8206,8 +8230,8 @@ fn execute_dml(
             let filter = &bind_filter(filter, args)?;
             let mut targets: Vec<(u32, u16, Vec<u8>)> = Vec::new();
             let mut old_images: Vec<Vec<u8>> = Vec::new();
-            for (page, slot, fmt, image) in collect_dml_targets(db, *rel, formats, filter)
-                .map_err(|_| "arithmetic exception evaluating the WHERE clause".to_string())?
+            for (page, slot, fmt, image) in
+                collect_dml_targets(db, *rel, formats, filter).map_err(ExecErr::Eval)?
             {
                 // the SET offsets were resolved in the NEWEST format; a
                 // record still stored in an older one would patch wrong
@@ -8278,12 +8302,7 @@ fn execute_dml(
                                 return Err("Operation violates CHECK constraint".into())
                             }
                             Ok(false) => {}
-                            Err(_) => {
-                                return Err(
-                                    "arithmetic exception evaluating a CHECK constraint"
-                                        .into(),
-                                )
-                            }
+                            Err(e) => return Err(ExecErr::Eval(e)),
                         }
                     }
                 }
@@ -8330,8 +8349,8 @@ fn execute_dml(
         Plan::Delete { rel, formats, filter, fk_children } => {
             let filter = &bind_filter(filter, args)?;
             let mut targets: Vec<(u32, u16)> = Vec::new();
-            for (page, slot, fmt, image) in collect_dml_targets(db, *rel, formats, filter)
-                .map_err(|_| "arithmetic exception evaluating the WHERE clause".to_string())?
+            for (page, slot, fmt, image) in
+                collect_dml_targets(db, *rel, formats, filter).map_err(ExecErr::Eval)?
             {
                 // NO ACTION partner check, per deleted row: its key
                 // must not be referenced by any child (the row's own
@@ -11355,9 +11374,13 @@ fn eval_status_vector(w: &mut W, e: &EvalErr) {
                 .int(1) // isc_arg_gds
                 .int(GDS_INTEGER_DIVIDE);
         }
-        EvalErr::ConversionError => {
+        EvalErr::ConversionError(arg) => {
             w.int(1) // isc_arg_gds
                 .int(GDS_CONVERT_ERROR);
+            if let Some(text) = arg {
+                // isc_arg_string travels as an XDR counted string
+                w.int(2).bytes(text.as_bytes());
+            }
         }
         EvalErr::IntegerOverflow => {
             w.int(1) // isc_arg_gds
@@ -11465,15 +11488,15 @@ fn emit_rows_inner(
         // ProcInvoke is replaced at op_execute; reaching a fetch still
         // holding one means the statement was never executed
         Plan::Refused | Plan::RefusedEval(_) | Plan::ProcInvoke { .. } => {
-            return Err(EmitErr::Eval(EvalErr::ConversionError))
+            return Err(EmitErr::Eval(EvalErr::ConversionError(None)))
         }
         // ProcSelect is replaced at op_execute; reaching a fetch still
         // holding one means the statement never executed
-        Plan::ProcSelect { .. } => return Err(EmitErr::Eval(EvalErr::ConversionError)),
+        Plan::ProcSelect { .. } => return Err(EmitErr::Eval(EvalErr::ConversionError(None))),
         Plan::Modified { inner, cols, distinct, skip, take } => {
             if let Some(db) = db {
                 let mut rows = branch_rows(inner, db, args)
-                    .ok_or(EmitErr::Eval(EvalErr::ConversionError))?;
+                    .ok_or(EmitErr::Eval(EvalErr::ConversionError(None)))?;
                 // DISTINCT compares whole projected rows with NULL equal
                 // to NULL - the same set semantics UNION uses
                 if *distinct {
@@ -11503,7 +11526,7 @@ fn emit_rows_inner(
                 for b in branches {
                     match branch_rows(b, db, args) {
                         Some(mut r) => rows.append(&mut r),
-                        None => return Err(EmitErr::Eval(EvalErr::ConversionError)),
+                        None => return Err(EmitErr::Eval(EvalErr::ConversionError(None))),
                     }
                 }
                 // UNION removes duplicates; UNION ALL is the whole
@@ -11538,7 +11561,7 @@ fn emit_rows_inner(
             // computed. ProjCol.field_id is the index into `values`.
             // encode_row writes its own op_fetch_response header.
             if encode_row(w, cols, values).is_err() {
-                return Err(EmitErr::Eval(EvalErr::ConversionError));
+                return Err(EmitErr::Eval(EvalErr::ConversionError(None)));
             }
         }
         Plan::VirtualEmpty { ncols } => {
@@ -13367,15 +13390,18 @@ enum ArithOp {
 /// A per-row evaluation failure. The fetch path maps each to the engine's
 /// own status vector, so a client raises the same SQL error the real
 /// server would.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum EvalErr {
     /// integer divide by zero: `isc_arith_except` /
     /// `isc_exception_integer_divide_by_zero`
     DivideByZero,
     /// a CAST that cannot convert - a non-numeric string to an integer, or
     /// a value too long for the target text width: `isc_convert_error`
-    /// (SQLSTATE 22018)
-    ConversionError,
+    /// (SQLSTATE 22018). Carries the OFFENDING STRING when there is one:
+    /// the engine ships it as an isc_arg_string, and isql prints
+    /// `conversion error from string "pear"` - without it the client
+    /// shows a missing-argument placeholder.
+    ConversionError(Option<String>),
     /// an exact-numeric result that left its announced range - an INT64
     /// sum past `i64`, or an operation past `i128`:
     /// `isc_exception_integer_overflow` (SQLSTATE 22003)
@@ -13674,13 +13700,13 @@ fn dateadd_impl(
             d = total.div_euclid(UNITS_PER_DAY) as i64;
             u = total.rem_euclid(UNITS_PER_DAY) as i64;
         }
-        Weekday | Yearday => return Err(EvalErr::ConversionError), // parse refuses
+        Weekday | Yearday => return Err(EvalErr::ConversionError(None)), // parse refuses
     }
     // the engine's valid date range
     if !matches!(kind, TKind::Time) {
         let (y, _, _) = civil_of(d as i32);
         if !(1..=9999).contains(&y) || i32::try_from(d).is_err() {
-            return Err(EvalErr::ConversionError);
+            return Err(EvalErr::ConversionError(None));
         }
     }
     Ok(match kind {
@@ -13800,8 +13826,11 @@ fn fn_int(v: &Value) -> Result<i64, EvalErr> {
             .map_err(|_| EvalErr::IntegerOverflow);
     }
     match v {
-        Value::Text(s) => s.trim().parse::<i64>().map_err(|_| EvalErr::ConversionError),
-        _ => Err(EvalErr::ConversionError),
+        Value::Text(s) => s
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| EvalErr::ConversionError(Some(s.clone()))),
+        _ => Err(EvalErr::ConversionError(None)),
     }
 }
 
@@ -14465,7 +14494,7 @@ impl Expr {
                     CastTarget::Int { .. } => {
                         let narrow = |x: i128| match i64::try_from(x) {
                             Ok(n) => Ok(Value::Int(n)),
-                            Err(_) => Err(EvalErr::ConversionError),
+                            Err(_) => Err(EvalErr::ConversionError(None)),
                         };
                         match v {
                             Value::Int(n) => Value::Int(n),
@@ -14477,9 +14506,11 @@ impl Expr {
                             }
                             Value::Text(s) => match s.trim().parse::<i64>() {
                                 Ok(n) => Value::Int(n),
-                                Err(_) => return Err(EvalErr::ConversionError),
+                                Err(_) => {
+                                    return Err(EvalErr::ConversionError(Some(s)))
+                                }
                             },
-                            _ => return Err(EvalErr::ConversionError),
+                            _ => return Err(EvalErr::ConversionError(None)),
                         }
                     }
                     // to a text width: render the value, refuse if it does
@@ -14487,7 +14518,7 @@ impl Expr {
                     CastTarget::Text { len, pad } => {
                         let s = v.render();
                         if s.chars().count() > *len {
-                            return Err(EvalErr::ConversionError);
+                            return Err(EvalErr::ConversionError(None));
                         }
                         let out = if *pad {
                             let mut s = s;
@@ -14632,7 +14663,7 @@ impl Expr {
                     }
                     SysFn::Abs => {
                         let (raw, scale) =
-                            numeric_parts(&vs[0]).ok_or(EvalErr::ConversionError)?;
+                            numeric_parts(&vs[0]).ok_or(EvalErr::ConversionError(None))?;
                         scaled_value(
                             raw.checked_abs().ok_or(EvalErr::IntegerOverflow)?,
                             scale,
@@ -14644,7 +14675,7 @@ impl Expr {
                     SysFn::Mod => {
                         let to_int = |v: &Value| -> Result<i128, EvalErr> {
                             let (raw, scale) =
-                                numeric_parts(v).ok_or(EvalErr::ConversionError)?;
+                                numeric_parts(v).ok_or(EvalErr::ConversionError(None))?;
                             Ok(round_scaled_to_int(raw, scale))
                         };
                         let (a, b) = (to_int(&vs[0])?, to_int(&vs[1])?);
@@ -14655,7 +14686,7 @@ impl Expr {
                     }
                     SysFn::Sign => {
                         let (raw, _) =
-                            numeric_parts(&vs[0]).ok_or(EvalErr::ConversionError)?;
+                            numeric_parts(&vs[0]).ok_or(EvalErr::ConversionError(None))?;
                         Value::Int(raw.signum() as i64)
                     }
                     SysFn::Lpad | SysFn::Rpad => {
@@ -16753,7 +16784,7 @@ fn run_body_dml(
             if std::env::var("FC_SRV_TRACE").is_ok() {
                 eprintln!("[srv] psql dml failed: {}", e);
             }
-            Err(PsqlStop::Failed(e))
+            Err(PsqlStop::Failed(e.to_string()))
         }
     }
 }
@@ -16846,7 +16877,7 @@ fn insert_select(
                 vals.join(", ")
             );
             let (plan, _) = plan_insert(&sql, database).ok_or("row insert refused")?;
-            execute_dml(&plan, database, &[], ctx)?;
+            execute_dml(&plan, database, &[], ctx).map_err(|e| e.to_string())?;
             Ok(())
         })();
         if let Err(e) = step {
@@ -18224,7 +18255,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                 last_dml = counts;
                                 respond(&mut s, &mut enc, TX_HANDLE)?;
                             }
-                            Err(_) => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
+                            Err(ExecErr::Eval(ev)) => {
+                                respond_eval_error(&mut s, &mut enc, &ev)?
+                            }
+                            Err(ExecErr::Text(_)) => {
+                                respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
+                            }
                         }
                     }
                     Some(_) => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
@@ -18641,7 +18677,18 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             if std::env::var("FC_SRV_TRACE").is_ok() {
                                 eprintln!("[srv] dml failed: {}", e);
                             }
-                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                            // a per-row eval error carries the engine's
+                            // own vector (UPDATE ... WHERE A / 0 = 1
+                            // answers the same 22012); descriptive text
+                            // stays the generic SQL error
+                            match e {
+                                ExecErr::Eval(ev) => {
+                                    respond_eval_error(&mut s, &mut enc, &ev)?
+                                }
+                                ExecErr::Text(_) => {
+                                    respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
+                                }
+                            }
                         }
                     }
                     }
@@ -21699,7 +21746,7 @@ mod tests {
             let raw = parse_raw_expr("CAST(NAME AS INTEGER)").unwrap();
             assert!(matches!(
                 resolve_expr(&raw, &columns, &descs).unwrap().eval(&row),
-                Err(EvalErr::ConversionError)
+                Err(EvalErr::ConversionError(Some(ref t))) if t == "x"
             ));
         }
         // a value too long for the target text width is also the conversion error
@@ -21707,7 +21754,7 @@ mod tests {
             let raw = parse_raw_expr("CAST(A AS VARCHAR(1))").unwrap();
             assert!(matches!(
                 resolve_expr(&raw, &columns, &descs).unwrap().eval(&row),
-                Err(EvalErr::ConversionError)
+                Err(EvalErr::ConversionError(None))
             ));
         }
         // NULL casts to NULL
@@ -22728,7 +22775,8 @@ mod tests {
         ));
         assert!(matches!(
             build("SUBSTRING(NAME FROM NAME) = 'x'").unwrap().matches(&row),
-            Err(EvalErr::ConversionError) // text start cannot convert
+            // the offending string travels in the vector now
+            Err(EvalErr::ConversionError(Some(ref t))) if t == "Hello"
         ));
         // a runtime divisor WORKS when the data allows it
         assert!(build("MOD(A, ID) = 0").is_none() || true); // ID absent here

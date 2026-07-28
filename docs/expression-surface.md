@@ -190,18 +190,23 @@ mechanisms:
    engine raises it. This replaced an earlier "no-raise fence" that
    refused could-raise shapes at prepare; the fence's one survivor is
    the type check (a text operand under MOD still refuses) and the
-   `?`-parameter-against-expression-side refusal. Known differences,
-   documented not silent: the engine surfaces some of these errors at
-   EXECUTE where fire-crab surfaces them at first FETCH (one leading
-   blank line in isql), and a DML statement's WHERE error answers a
-   generic SQL error (the DML channel is text, not a vector).
+   `?`-parameter-against-expression-side refusal. The error CHANNEL is
+   exact now: the conversion error carries its OFFENDING STRING as an
+   `isc_arg_string` (isql prints `conversion error from string "pear"`
+   identically on both sides), and a DML statement whose WHERE raises
+   answers the engine's own vector (`ExecErr::Eval` routes it to the
+   status-vector responder). One known difference remains, documented
+   not silent: the engine surfaces some cursor errors at EXECUTE where
+   fire-crab surfaces them at first FETCH - one leading blank line in
+   isql's output.
 
 Known refusals that the engine supports (named next slices, each a
-refusal today rather than a silent gap): `EXTRACT` and the date/time
-function family, `AVG` and `LIST` aggregates, function calls in HAVING
-and in join predicates, arithmetic inside WHERE terms, `?` parameters
-against expression sides, CASE inside WHERE, `DECODE`, `COALESCE` in
-the simple-CASE operand position of an INSERT list.
+refusal today rather than a silent gap): `LIST` (its result is a
+blob, which an expression cannot serve yet), `CASE` inside WHERE (no
+parens to lex the span by), `?` parameters against expression sides,
+function calls in JOIN predicates, temporal aggregates in HAVING,
+`DECODE`, `TIME + n`, and `CURRENT_TIME`/`CURRENT_TIMESTAMP` (TIME
+ZONE results).
 
 ## The evaluator's shape
 
