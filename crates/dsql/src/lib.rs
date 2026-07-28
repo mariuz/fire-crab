@@ -317,6 +317,21 @@ mod blr {
     /// blr_dbkey + context byte - MERGE's matched test is
     /// missing(dbkey(target)) on the left-joined row (probed)
     pub const DBKEY: u8 = 0x16;
+    /// DECLARE ... SCROLL CURSOR: blr_scrollable before the
+    /// dcl_cursor's rse (probed)
+    pub const SCROLLABLE: u8 = 0x6D;
+    /// INSERT ... RETURNING: blr_store2 - relation, assigns begin,
+    /// returning-assigns begin (probed)
+    pub const STORE2: u8 = 0x13;
+    /// UPDATE ... RETURNING: blr_modify2 - org, new, set begin,
+    /// returning begin - under a blr_singular rse (probed)
+    pub const MODIFY2: u8 = 0xAC;
+    /// EXECUTE STATEMENT '<sql>'; - blr_exec_sql + the sql value
+    pub const EXEC_SQL: u8 = 0xB0;
+    /// [FOR] EXECUTE STATEMENT INTO: blr_exec_into, u16 out-count,
+    /// sql, flag (1 = singleton; 0 = loop + the DO statement),
+    /// then the variables (probed both flags)
+    pub const EXEC_INTO: u8 = 0xA4;
     pub const EQL: u8 = 0x2F;
     pub const NEQ: u8 = 0x30;
     pub const GTR: u8 = 0x31;
@@ -1907,6 +1922,7 @@ fn is_keyword(w: &str) -> bool {
             | "MERGE"
             | "USING"
             | "MATCHED"
+            | "RETURNING"
     )
 }
 
@@ -2580,6 +2596,23 @@ fn map_bool_to_fids(map: &[MapEntry], b: Bool, fid_ctx: u8) -> Option<Bool> {
     })
 }
 
+/// RETURNING col INTO :var - a begin of field-to-variable
+/// assignments at the given context (probed: INSERT reads its store
+/// context, UPDATE the NEW record, DELETE the erased stream).
+fn emit_returning(out: &mut Vec<u8>, ctx: u8, ret: &[(String, u16)]) {
+    out.push(blr::BEGIN);
+    for (col, vi) in ret {
+        out.push(blr::ASSIGNMENT);
+        out.push(blr::FIELD);
+        out.push(ctx);
+        out.push(col.len() as u8);
+        out.extend_from_slice(col.as_bytes());
+        out.push(blr::VARIABLE);
+        out.extend_from_slice(&vi.to_le_bytes());
+    }
+    out.push(blr::END);
+}
+
 /// blr_dcl_cursor: number, the rse (relation2 alias carrying the
 /// CURSOR NAME - the table ALIAS when one is given, else the
 /// schema-qualified table), u16 output count, then the outputs:
@@ -2591,6 +2624,9 @@ fn map_bool_to_fids(map: &[MapEntry], b: Bool, fid_ctx: u8) -> Option<Bool> {
 fn emit_cursor_decl(out: &mut Vec<u8>, d: &CursorDecl) {
     out.push(blr::DCL_CURSOR);
     out.extend_from_slice(&d.num.to_le_bytes());
+    if d.scroll {
+        out.push(blr::SCROLLABLE);
+    }
     out.push(blr::RSE);
     out.push(1);
     if let Some(agg_ctx) = d.agg {
@@ -2801,12 +2837,16 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         }
         let name = name.clone();
         p.i += 1;
-        // DECLARE <name> CURSOR FOR (SELECT ...); - shared with
-        // trigger bodies (the numbering continues past OLD/NEW there)
+        // DECLARE <name> [SCROLL] CURSOR FOR (SELECT ...); - shared
+        // with trigger bodies (numbering continues past OLD/NEW)
+        let scroll = p.kw("SCROLL");
         if p.kw("CURSOR") {
             decl_seq.push(DeclItem::Cur(p.cursor_decls.len()));
-            p.cursor_decl(name)?;
+            p.cursor_decl(name, scroll)?;
             continue;
+        }
+        if scroll {
+            return None;
         }
         let dsc = p.cast_target()?;
         p.local_vars.push(name);
@@ -2938,12 +2978,16 @@ enum TrigStmt {
     /// BEGIN ... END - compiles as a DOUBLE blr_begin (probed)
     Block(Vec<TrigStmt>),
     /// INSERT INTO rel (cols) VALUES (vals) - blr_store
-    Insert(Stream, u8, Vec<(String, Val)>),
+    /// the trailing list is RETURNING col INTO :var pairs - with
+    /// any, INSERT = blr_store2 with a second returning begin,
+    /// UPDATE = blr_modify2 under a blr_singular rse, DELETE = a
+    /// begin(returning-assigns, erase) under a singular rse (probed)
+    Insert(Stream, u8, Vec<(String, Val)>, Vec<(String, u16)>),
     /// DELETE FROM rel [WHERE ...] - for(marks(1,4), rse), erase
-    Delete(Stream, u8, Option<Bool>),
+    Delete(Stream, u8, Option<Bool>, Vec<(String, u16)>),
     /// UPDATE rel SET ... [WHERE ...] - for(marks(1,4), rse),
     /// modify(org, new, assignments)
-    Update(Stream, u8, u8, Vec<(Val, Val)>, Option<Bool>),
+    Update(Stream, u8, u8, Vec<(Val, Val)>, Option<Bool>, Vec<(String, u16)>),
     /// WHILE (cond) DO stmt - blr_label N, blr_loop, begin,
     /// blr_if(cond, body, blr_leave N), end (probed)
     While(u8, Bool, Box<TrigStmt>),
@@ -2984,6 +3028,19 @@ enum TrigStmt {
     /// FETCH c [INTO :v, ...]; - sub-verb 2 + the into-assignments
     /// (an INTO-less fetch carries an empty begin/end)
     CursorFetch(u16, Vec<(Val, u16)>),
+    /// FETCH <direction> FROM c: sub-verb 3, direction byte, the
+    /// offset value (blr_null unless ABSOLUTE/RELATIVE), assigns
+    CursorFetchDir(u16, u8, Option<i32>, Vec<(Val, u16)>),
+    /// EXECUTE STATEMENT '<sql>'; - blr_exec_sql + the sql literal
+    ExecSql(String),
+    /// [FOR] EXECUTE STATEMENT '<sql>' INTO :v, ...: blr_exec_into,
+    /// u16 out-count, the sql, then flag 1 (singleton) or flag 0 +
+    /// the labeled loop's DO statement; the variables LAST (probed)
+    ExecInto {
+        sql: String,
+        vars: Vec<u16>,
+        run: Option<(u8, Box<TrigStmt>)>,
+    },
     /// MERGE INTO tgt USING src ON <bool>, one MATCHED branch
     /// (UPDATE SET or DELETE) and/or one NOT MATCHED (INSERT): a
     /// marks(1, 6)-stamped for-loop over a JOIN of source and target
@@ -3001,6 +3058,11 @@ enum TrigStmt {
         del: bool,
         /// WHEN NOT MATCHED THEN INSERT: store ctx, columns, values
         ins: Option<(u8, Vec<String>, Vec<Val>)>,
+        /// WHEN MATCHED AND <cond>: joins the rse boolean's matched
+        /// term and wraps the action in if(cond, action, bare end)
+        mat_cond: Option<Bool>,
+        /// WHEN NOT MATCHED AND <cond>: same for the insert half
+        ins_cond: Option<Bool>,
     },
     /// DELETE ... WHERE CURRENT OF c - blr_erase at the CURSOR's
     /// context, then marks(1, 1) - MARK_POSITIONED trails the erase
@@ -3020,6 +3082,9 @@ enum TrigStmt {
 struct CursorDecl {
     name: String,
     num: u16,
+    /// DECLARE ... SCROLL CURSOR - blr_scrollable before the rse;
+    /// backward/positioned fetch directions demand it
+    scroll: bool,
     table: String,
     alias: Option<String>,
     ctx: u8,
@@ -3125,8 +3190,12 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
             out.push(blr::END);
             out.push(blr::END);
         }
-        TrigStmt::Insert(rel, ctx, sets) => {
-            out.push(blr::STORE);
+        TrigStmt::Insert(rel, ctx, sets, ret) => {
+            out.push(if ret.is_empty() {
+                blr::STORE
+            } else {
+                blr::STORE2
+            });
             emit_stream(out, rel, *ctx);
             out.push(blr::BEGIN);
             for (col, v) in sets {
@@ -3138,12 +3207,19 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 out.extend_from_slice(col.as_bytes());
             }
             out.push(blr::END);
+            if !ret.is_empty() {
+                emit_returning(out, *ctx, ret);
+            }
         }
-        TrigStmt::Delete(rel, ctx, wher) => {
+        TrigStmt::Delete(rel, ctx, wher, ret) => {
             out.push(blr::FOR);
             out.push(blr::MARKS);
             out.push(1);
             out.push(4);
+            if !ret.is_empty() {
+                // RETURNING makes the loop SINGULAR (probed)
+                out.push(blr::SINGULAR);
+            }
             out.push(blr::RSE);
             out.push(1);
             emit_stream(out, rel, *ctx);
@@ -3152,8 +3228,18 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 emit_bool(out, b);
             }
             out.push(blr::END);
-            out.push(blr::ERASE);
-            out.push(*ctx);
+            if ret.is_empty() {
+                out.push(blr::ERASE);
+                out.push(*ctx);
+            } else {
+                // DELETE's returning goes FIRST, in a begin wrapping
+                // both it and the plain erase - no erase2 (probed)
+                out.push(blr::BEGIN);
+                emit_returning(out, *ctx, ret);
+                out.push(blr::ERASE);
+                out.push(*ctx);
+                out.push(blr::END);
+            }
         }
         TrigStmt::Suspend(n) => emit_send(out, *n, 1),
         TrigStmt::ExecProc(name, ins, outs) => {
@@ -3257,6 +3343,48 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
             }
             out.push(blr::END);
         }
+        TrigStmt::CursorFetchDir(num, code, off, assigns) => {
+            out.push(blr::CURSOR_STMT);
+            out.push(3);
+            out.extend_from_slice(&num.to_le_bytes());
+            out.push(*code);
+            match off {
+                Some(n) => emit_val(out, &Val::Int(*n)),
+                None => out.push(blr::NULL),
+            }
+            out.push(blr::BEGIN);
+            for (src, vi) in assigns {
+                out.push(blr::ASSIGNMENT);
+                emit_val(out, src);
+                out.push(blr::VARIABLE);
+                out.extend_from_slice(&vi.to_le_bytes());
+            }
+            out.push(blr::END);
+        }
+        TrigStmt::ExecSql(sql) => {
+            out.push(blr::EXEC_SQL);
+            emit_val(out, &Val::Str(sql.clone()));
+        }
+        TrigStmt::ExecInto { sql, vars, run } => {
+            if let Some((label, _)) = run {
+                out.push(blr::LABEL);
+                out.push(*label);
+            }
+            out.push(blr::EXEC_INTO);
+            out.extend_from_slice(&(vars.len() as u16).to_le_bytes());
+            emit_val(out, &Val::Str(sql.clone()));
+            match run {
+                Some((_, body)) => {
+                    out.push(0);
+                    emit_trig_stmt(out, body);
+                }
+                None => out.push(1),
+            }
+            for vi in vars {
+                out.push(blr::VARIABLE);
+                out.extend_from_slice(&vi.to_le_bytes());
+            }
+        }
         TrigStmt::Merge {
             src,
             src_ctx,
@@ -3266,6 +3394,8 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
             upd,
             del,
             ins,
+            mat_cond,
+            ins_cond,
         } => {
             // one probed sentence: for(marks(1, MERGE|FOR_UPDATE),
             // rse(join2(source, target, [left], ON), [branch-union
@@ -3297,14 +3427,35 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 out.push(blr::DBKEY);
                 out.push(*tgt_ctx);
             };
+            // the rse boolean ORs the branch terms - matched first.
+            // A branch's AND joins its term: and(not(missing), cond)
+            // / and(missing, cond); a matched-ONLY merge's term is
+            // the bare cond (its INNER join already filters), or
+            // nothing at all without one (probed)
             if ins.is_some() {
                 out.push(blr::BOOLEAN);
                 if matched {
                     out.push(blr::OR);
-                    out.push(blr::NOT);
+                    if let Some(c) = mat_cond {
+                        out.push(blr::AND);
+                        out.push(blr::NOT);
+                        miss(out);
+                        emit_bool(out, c);
+                    } else {
+                        out.push(blr::NOT);
+                        miss(out);
+                    }
+                }
+                if let Some(c) = ins_cond {
+                    out.push(blr::AND);
+                    miss(out);
+                    emit_bool(out, c);
+                } else {
                     miss(out);
                 }
-                miss(out);
+            } else if let Some(c) = mat_cond {
+                out.push(blr::BOOLEAN);
+                emit_bool(out, c);
             }
             out.push(blr::END); // closes the rse
             out.push(blr::IF);
@@ -3315,6 +3466,12 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 miss(out);
             }
             let emit_matched = |out: &mut Vec<u8>| {
+                // a conditional branch nests if(cond, action, bare
+                // end) inside its slot (probed)
+                if let Some(c) = mat_cond {
+                    out.push(blr::IF);
+                    emit_bool(out, c);
+                }
                 if let Some((new_ctx, sets)) = upd {
                     out.push(blr::MODIFY);
                     out.push(*tgt_ctx);
@@ -3339,11 +3496,19 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                     out.push(1);
                     out.push(2);
                 }
+                if mat_cond.is_some() {
+                    out.push(blr::END); // the nested if's bare else
+                }
             };
             match ins {
                 Some((store_ctx, cols, vals)) => {
                     // the store re-emits the TARGET stream - alias
-                    // and all - at its own context (probed)
+                    // and all - at its own context (probed); a
+                    // conditional insert nests if(cond, store, end)
+                    if let Some(c) = ins_cond {
+                        out.push(blr::IF);
+                        emit_bool(out, c);
+                    }
                     out.push(blr::STORE);
                     emit_stream(out, tgt, *store_ctx);
                     out.push(blr::BEGIN);
@@ -3356,6 +3521,9 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                         out.extend_from_slice(c.as_bytes());
                     }
                     out.push(blr::END);
+                    if ins_cond.is_some() {
+                        out.push(blr::END); // the nested if's bare else
+                    }
                     if matched {
                         emit_matched(out);
                     } else {
@@ -3579,11 +3747,15 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
             out.push(*label);
             out.push(blr::END);
         }
-        TrigStmt::Update(rel, org, new, sets, wher) => {
+        TrigStmt::Update(rel, org, new, sets, wher, ret) => {
             out.push(blr::FOR);
             out.push(blr::MARKS);
             out.push(1);
             out.push(4);
+            if !ret.is_empty() {
+                // RETURNING makes the loop SINGULAR (probed)
+                out.push(blr::SINGULAR);
+            }
             out.push(blr::RSE);
             out.push(1);
             emit_stream(out, rel, *org);
@@ -3592,7 +3764,11 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 emit_bool(out, b);
             }
             out.push(blr::END);
-            out.push(blr::MODIFY);
+            out.push(if ret.is_empty() {
+                blr::MODIFY
+            } else {
+                blr::MODIFY2
+            });
             out.push(*org);
             out.push(*new);
             out.push(blr::BEGIN);
@@ -3602,6 +3778,10 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 emit_val(out, target);
             }
             out.push(blr::END);
+            if !ret.is_empty() {
+                // UPDATE's returning reads the NEW record (probed)
+                emit_returning(out, *new, ret);
+            }
         }
     }
 }
@@ -3943,6 +4123,51 @@ impl<'a> P<'a> {
         })))
     }
 
+    /// An optional RETURNING col [, ...] INTO :v [, ...] tail on a
+    /// DML statement - plain unqualified columns into locals; an
+    /// absent clause answers the empty list.
+    fn returning_into(&mut self) -> Option<Vec<(String, u16)>> {
+        if !self.kw("RETURNING") {
+            return Some(Vec::new());
+        }
+        let mut cols = Vec::new();
+        loop {
+            let Some(Tok::Ident(c)) = self.t.get(self.i) else {
+                return None;
+            };
+            if is_keyword(c) {
+                return None;
+            }
+            cols.push(c.clone());
+            self.i += 1;
+            if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+        if !self.kw("INTO") {
+            return None;
+        }
+        let mut out = Vec::new();
+        for c in cols {
+            if !matches!(self.t.get(self.i), Some(Tok::Colon)) {
+                return None;
+            }
+            self.i += 1;
+            let Some(Tok::Ident(v)) = self.t.get(self.i) else {
+                return None;
+            };
+            let vi = self.local_vars.iter().position(|n| n == v)? as u16;
+            self.i += 1;
+            out.push((c, vi));
+            if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                self.i += 1;
+            }
+        }
+        Some(out)
+    }
+
     /// A cursor WHERE CURRENT OF may target: a DECLAREd cursor
     /// (plain - the engine refuses positioned DML on aggregates) or
     /// an in-scope FOR SELECT ... AS CURSOR loop. Answers the
@@ -3969,7 +4194,7 @@ impl<'a> P<'a> {
     /// selects (their columns AS-aliased - the engine demands a name)
     /// nest blr_aggregate and consume a SECOND context slot (all
     /// probed). Shared by procedure and trigger declaration sections.
-    fn cursor_decl(&mut self, name: String) -> Option<()> {
+    fn cursor_decl(&mut self, name: String, scroll: bool) -> Option<()> {
         if !self.kw("FOR") || !matches!(self.t.get(self.i), Some(Tok::LParen)) {
             return None;
         }
@@ -4206,6 +4431,7 @@ impl<'a> P<'a> {
         self.cursor_decls.push(CursorDecl {
             name,
             num,
+            scroll,
             table: tbl,
             alias,
             ctx,
@@ -4406,6 +4632,51 @@ impl<'a> P<'a> {
         // (FOR) SELECT works in BOTH body kinds - a trigger's FOR
         // stream takes the next context after OLD/NEW (probed)
         if self.kw("FOR") {
+            // FOR EXECUTE STATEMENT '<sql>' INTO ... DO <stmt> - the
+            // loop form: flag 0, the DO statement, then the vars
+            if self.kw("EXECUTE") {
+                if !self.kw("STATEMENT") {
+                    return None;
+                }
+                let Some(Tok::Str(sql)) = self.t.get(self.i) else {
+                    return None;
+                };
+                let sql = sql.clone();
+                self.i += 1;
+                if !self.kw("INTO") {
+                    return None;
+                }
+                let mut vars = Vec::new();
+                loop {
+                    if !matches!(self.t.get(self.i), Some(Tok::Colon)) {
+                        return None;
+                    }
+                    self.i += 1;
+                    let Some(Tok::Ident(v)) = self.t.get(self.i) else {
+                        return None;
+                    };
+                    let vi =
+                        self.local_vars.iter().position(|n| n == v)? as u16;
+                    vars.push(vi);
+                    self.i += 1;
+                    if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                        self.i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let label = self.next_label;
+                self.next_label += 1;
+                if !self.kw("DO") {
+                    return None;
+                }
+                let body = Box::new(self.trig_stmt()?);
+                return Some(TrigStmt::ExecInto {
+                    sql,
+                    vars,
+                    run: Some((label, body)),
+                });
+            }
             if !self.kw("SELECT") {
                 return None;
             }
@@ -4416,6 +4687,50 @@ impl<'a> P<'a> {
             return self.select_stmt(false);
         }
         if self.kw("EXECUTE") {
+            // EXECUTE STATEMENT '<literal sql>' [INTO :v, ...]; -
+            // expression sql, USING, external data sources: unprobed
+            if self.kw("STATEMENT") {
+                let Some(Tok::Str(sql)) = self.t.get(self.i) else {
+                    return None;
+                };
+                let sql = sql.clone();
+                self.i += 1;
+                if matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                    self.i += 1;
+                    return Some(TrigStmt::ExecSql(sql));
+                }
+                if !self.kw("INTO") {
+                    return None;
+                }
+                let mut vars = Vec::new();
+                loop {
+                    if !matches!(self.t.get(self.i), Some(Tok::Colon)) {
+                        return None;
+                    }
+                    self.i += 1;
+                    let Some(Tok::Ident(v)) = self.t.get(self.i) else {
+                        return None;
+                    };
+                    let vi =
+                        self.local_vars.iter().position(|n| n == v)? as u16;
+                    vars.push(vi);
+                    self.i += 1;
+                    if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                        self.i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                    return None;
+                }
+                self.i += 1;
+                return Some(TrigStmt::ExecInto {
+                    sql,
+                    vars,
+                    run: None,
+                });
+            }
             if !self.kw("PROCEDURE") {
                 return None;
             }
@@ -4520,17 +4835,64 @@ impl<'a> P<'a> {
             return Some(TrigStmt::CursorOp(sub, num));
         }
         if self.kw("FETCH") {
+            // optional direction + FROM: the directed forms take the
+            // SCROLL fetch sub-verb (3) with a direction byte and an
+            // offset value - blr_null unless ABSOLUTE/RELATIVE; only
+            // NEXT is legal on an unscrolled cursor (probed)
+            let dir: Option<(u8, Option<i32>)> = if self.kw("NEXT") {
+                Some((0, None))
+            } else if self.kw("PRIOR") {
+                Some((1, None))
+            } else if self.kw("FIRST") {
+                Some((2, None))
+            } else if self.kw("LAST") {
+                Some((3, None))
+            } else if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "ABSOLUTE" || w == "RELATIVE")
+            {
+                let Some(Tok::Ident(w)) = self.t.get(self.i) else {
+                    return None;
+                };
+                let code = if w == "ABSOLUTE" { 4 } else { 5 };
+                self.i += 1;
+                let neg = matches!(self.t.get(self.i), Some(Tok::Minus));
+                if neg {
+                    self.i += 1;
+                }
+                let Some(Tok::Int(v)) = self.t.get(self.i) else {
+                    return None;
+                };
+                let v = i32::try_from(*v).ok()?;
+                self.i += 1;
+                Some((code, Some(if neg { -v } else { v })))
+            } else {
+                None
+            };
+            if dir.is_some() && !self.kw("FROM") {
+                return None;
+            }
             let Some(Tok::Ident(name)) = self.t.get(self.i) else {
                 return None;
             };
             let num = self.cursors.iter().position(|n| n == name)? as u16;
             let name = name.clone();
             self.i += 1;
+            if let Some((code, _)) = &dir {
+                let decl =
+                    self.cursor_decls.iter().find(|d| d.name == name)?;
+                if *code != 0 && !decl.scroll {
+                    return None;
+                }
+            }
             // an INTO-less FETCH (positioning a cursor for WHERE
             // CURRENT OF) carries an empty begin/end (probed)
             if matches!(self.t.get(self.i), Some(Tok::Semi)) {
                 self.i += 1;
-                return Some(TrigStmt::CursorFetch(num, Vec::new()));
+                return Some(match dir {
+                    Some((code, off)) => {
+                        TrigStmt::CursorFetchDir(num, code, off, Vec::new())
+                    }
+                    None => TrigStmt::CursorFetch(num, Vec::new()),
+                });
             }
             if !self.kw("INTO") {
                 return None;
@@ -4573,7 +4935,12 @@ impl<'a> P<'a> {
                 .zip(&vars)
                 .map(|(o, vi)| (o.clone(), *vi))
                 .collect();
-            return Some(TrigStmt::CursorFetch(num, assigns));
+            return Some(match dir {
+                Some((code, off)) => {
+                    TrigStmt::CursorFetchDir(num, code, off, assigns)
+                }
+                None => TrigStmt::CursorFetch(num, assigns),
+            });
         }
         if self.kw("POST_EVENT") {
             let v = self.val()?;
@@ -4672,6 +5039,7 @@ impl<'a> P<'a> {
             if vals.len() != cols.len() {
                 return None;
             }
+            let ret = self.returning_into()?;
             if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
                 return None;
             }
@@ -4687,6 +5055,7 @@ impl<'a> P<'a> {
                 st,
                 ctx,
                 cols.into_iter().zip(vals).collect(),
+                ret,
             ));
         }
         if self.kw("DELETE") {
@@ -4734,11 +5103,12 @@ impl<'a> P<'a> {
                 None
             };
             self.sub = saved;
+            let ret = self.returning_into()?;
             if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
                 return None;
             }
             self.i += 1;
-            return Some(TrigStmt::Delete(st, ctx, wher));
+            return Some(TrigStmt::Delete(st, ctx, wher, ret));
         }
         if self.kw("MERGE") {
             // MERGE INTO tgt [alias] USING src [alias] ON <bool>
@@ -4793,12 +5163,17 @@ impl<'a> P<'a> {
             let mut upd_sets: Option<Vec<(String, Val)>> = None;
             let mut del = false;
             let mut ins_cv: Option<(Vec<String>, Vec<Val>)> = None;
+            let mut mat_cond: Option<Bool> = None;
+            let mut ins_cond: Option<Bool> = None;
             while self.kw("WHEN") {
                 if self.kw("NOT") {
-                    if !(self.kw("MATCHED")
-                        && self.kw("THEN")
-                        && self.kw("INSERT"))
-                        || ins_cv.is_some()
+                    if !self.kw("MATCHED") || ins_cv.is_some() {
+                        return None;
+                    }
+                    if self.kw("AND") {
+                        ins_cond = Some(self.bool_or()?);
+                    }
+                    if !(self.kw("THEN") && self.kw("INSERT"))
                         || !matches!(self.t.get(self.i), Some(Tok::LParen))
                     {
                         return None;
@@ -4846,10 +5221,13 @@ impl<'a> P<'a> {
                     }
                     ins_cv = Some((cols, vals));
                 } else {
-                    if !(self.kw("MATCHED") && self.kw("THEN"))
-                        || upd_sets.is_some()
-                        || del
-                    {
+                    if !self.kw("MATCHED") || upd_sets.is_some() || del {
+                        return None;
+                    }
+                    if self.kw("AND") {
+                        mat_cond = Some(self.bool_or()?);
+                    }
+                    if !self.kw("THEN") {
                         return None;
                     }
                     if self.kw("UPDATE") {
@@ -4925,6 +5303,8 @@ impl<'a> P<'a> {
                 upd,
                 del,
                 ins,
+                mat_cond,
+                ins_cond,
             });
         }
         if self.kw("UPDATE") {
@@ -5126,11 +5506,12 @@ impl<'a> P<'a> {
                 None
             };
             self.sub = saved;
+            let ret = self.returning_into()?;
             if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
                 return None;
             }
             self.i += 1;
-            return Some(TrigStmt::Update(st, org_ctx, new_ctx, sets, wher));
+            return Some(TrigStmt::Update(st, org_ctx, new_ctx, sets, wher, ret));
         }
         // NEW.col = <value>;
         let Some(Tok::Ident(q)) = self.t.get(self.i) else {
@@ -5538,10 +5919,14 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
         }
         let name = name.clone();
         p.i += 1;
+        let scroll = p.kw("SCROLL");
         if p.kw("CURSOR") {
             decl_seq.push(TDecl::Cur(p.cursor_decls.len()));
-            p.cursor_decl(name)?;
+            p.cursor_decl(name, scroll)?;
             continue;
+        }
+        if scroll {
+            return None;
         }
         let dsc = p.cast_target()?;
         p.local_vars.push(name);
@@ -6945,16 +7330,79 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_twenty_four_shapes_byte_for_byte() {
+        // conditional MERGE branches: WHEN [NOT] MATCHED AND <cond>
+        // joins the rse boolean's branch term - and(not(missing),
+        // cond) / and(missing, cond) - and wraps the action in
+        // if(cond, action, bare end) (flip twenty)
+        pin_proc(
+            "CREATE PROCEDURE QS1 (P1 INTEGER) AS BEGIN MERGE INTO U2 USING T ON U2.UID = T.ID WHEN MATCHED AND U2.UA > :P1 THEN DELETE WHEN NOT MATCHED AND T.ID > 0 THEN INSERT (UID) VALUES (T.ID); END",
+            "050204000200080007000401010007000C00029B1100020207D90106430177024A0154004A025532015001472F1701035549441700024944FF47393A3B3D16013117010255412900000001003A3D160131170002494415080000000000FF083D160108311700024944150800000000000F4A0255320202011700024944170203554944FFFF083117010255412900000001000501D90102FFFFFFFF0E010201150700000019010000FFFF4C",
+        );
+        // SCROLL cursors: blr_scrollable before the dcl_cursor rse;
+        // FETCH <direction> FROM = cursor_stmt sub-verb 3 + direction
+        // byte (0 next / 1 prior / 2 first / 3 last / 4 absolute /
+        // 5 relative) + the offset value - blr_null unless
+        // ABSOLUTE/RELATIVE (flip twenty-one)
+        pin_proc(
+            "CREATE PROCEDURE QS2 RETURNS (R1 INTEGER) AS DECLARE CX SCROLL CURSOR FOR (SELECT UID FROM U2); BEGIN OPEN CX; FETCH LAST FROM CX INTO :R1; FETCH RELATIVE -3 FROM CX INTO :R1; FETCH NEXT FROM CX INTO :R1; CLOSE CX; SUSPEND; END",
+            "050204010300080007000700020300000800012D1A0000A600006D430192025532122243582220225055424C4943222E2255322200FF0100BF01001700035549449B11000202A7000000A7030000032D02011700035549441A0000FFA703000005150800FDFFFFFF02011700035549441A0000FFA7030000002D02011700035549441A0000FFA70100000E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // INSERT ... RETURNING INTO: blr_store2 with a second begin
+        // of field-to-variable assigns at the store's context
+        pin_proc(
+            "CREATE PROCEDURE QS3 (P1 INTEGER) RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN INSERT INTO U2 (UID, UA) VALUES (:P1, 5) RETURNING UID, UA INTO :R1, :R2; SUSPEND; END",
+            "0502040002000800070004010500080007000800070007000C00020300000800012D1A00000301000800012D1A01009B11000202134A02553200020129000000010017000355494401150800050000001700025541FF02011700035549441A00000117000255411A0100FF0E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        // UPDATE ... RETURNING INTO: blr_modify2 under a SINGULAR
+        // rse, the returning assigns reading the NEW record
+        pin_proc(
+            "CREATE PROCEDURE QS4 (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN UPDATE U2 SET UA = UA * 2 WHERE U2.UID = :P1 RETURNING UA INTO :R1; SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B1100020207D901047F43014A02553201472F170103554944290000000100FFAC01000201241701025541150800020000001700025541FF020117000255411A0000FF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // DELETE ... RETURNING INTO: NO erase2 - a begin holding the
+        // returning assigns then the PLAIN erase, under a singular
+        // rse; the values read the erased stream
+        pin_proc(
+            "CREATE PROCEDURE QS5 (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN DELETE FROM U2 WHERE U2.UID = :P1 RETURNING UA INTO :R1; SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B1100020207D901047F43014A02553200472F170003554944290000000100FF02020117000255411A0000FF0500FF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // EXECUTE STATEMENT: plain = blr_exec_sql + the literal;
+        // FOR ... INTO ... DO = a labeled blr_exec_into with flag 0,
+        // the DO statement, then the variables LAST (flip twenty-two)
+        pin_proc(
+            "CREATE PROCEDURE QS6 RETURNS (R1 INTEGER) AS BEGIN FOR EXECUTE STATEMENT 'select uid from u2' INTO :R1 DO SUSPEND; EXECUTE STATEMENT 'delete from u2'; END",
+            "050204010300080007000700020300000800012D1A00009B110002021101A40100150F0000120073656C656374207569642066726F6D207532000E0102011A000029010000010001150700010019010200FF1A0000B0150F00000E0064656C6574652066726F6D207532FFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+    }
+
+    #[test]
     fn merge_refusals() {
         for sql in [
-            // WHEN MATCHED AND <cond>: unprobed
-            "CREATE PROCEDURE X AS BEGIN MERGE INTO U2 USING T ON U2.UID = T.ID WHEN MATCHED AND U2.UA > 0 THEN DELETE; END",
-            // two MATCHED branches: unprobed
+            // two MATCHED branches (an if-else chain): unprobed
             "CREATE PROCEDURE X (P1 INTEGER) AS BEGIN MERGE INTO U2 USING T ON U2.UID = T.ID WHEN MATCHED THEN DELETE WHEN MATCHED THEN UPDATE SET UA = :P1; END",
             // bare names in the ON clause need the catalog
             "CREATE PROCEDURE X AS BEGIN MERGE INTO U2 USING T ON UID = ID WHEN MATCHED THEN DELETE; END",
             // a sub-select source: unprobed
             "CREATE PROCEDURE X AS BEGIN MERGE INTO U2 USING (SELECT ID FROM T) A ON U2.UID = A.ID WHEN MATCHED THEN DELETE; END",
+        ] {
+            assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
+        }
+    }
+
+    #[test]
+    fn slice_twenty_four_refusals() {
+        for sql in [
+            // backward fetch on an UNSCROLLED cursor is an engine error
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS DECLARE CX CURSOR FOR (SELECT UID FROM U2); BEGIN OPEN CX; FETCH PRIOR FROM CX INTO :R1; CLOSE CX; SUSPEND; END",
+            // RETURNING on positioned DML: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS DECLARE CX CURSOR FOR (SELECT UID FROM U2); BEGIN OPEN CX; FETCH CX; DELETE FROM U2 WHERE CURRENT OF CX RETURNING UID INTO :R1; CLOSE CX; SUSPEND; END",
+            // RETURNING expressions: unprobed (columns only)
+            "CREATE PROCEDURE X (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN INSERT INTO U2 (UID) VALUES (:P1) RETURNING UID * 2 INTO :R1; SUSPEND; END",
+            // EXECUTE STATEMENT with an expression sql: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS DECLARE V1 VARCHAR(50); BEGIN EXECUTE STATEMENT V1 INTO :R1; SUSPEND; END",
+            // EXECUTE STATEMENT USING: unprobed
+            "CREATE PROCEDURE X (P1 INTEGER) AS BEGIN EXECUTE STATEMENT 'delete from t where id = ?' USING :P1; END",
         ] {
             assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
         }

@@ -13,6 +13,40 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-28 — fire-crab-dsql slice 24: conditional MERGE, scroll fetch, RETURNING, EXECUTE STATEMENT
+
+### Converted
+- **WHEN [NOT] MATCHED AND <cond>**: the condition joins the rse
+  boolean's branch term — `and(not(missing), cond)` /
+  `and(missing, cond)`, bare cond for a matched-only merge — and
+  wraps the branch action in `if(cond, action, bare end)` nested in
+  its slot (flip twenty; slice 23's refusal in the gate flipped to
+  a check).
+- **SCROLL cursors + FETCH directions**: `blr_scrollable` before
+  the dcl_cursor rse; `FETCH <dir> FROM c` is cursor_stmt sub-verb
+  3 + a direction byte (0 next, 1 prior, 2 first, 3 last, 4
+  absolute, 5 relative) + an offset value — `blr_null` unless
+  ABSOLUTE/RELATIVE. NEXT works unscrolled; the rest demand SCROLL
+  (flip twenty-one).
+- **DML RETURNING ... INTO**: three different shapes for one clause
+  — INSERT = `blr_store2` with a second returning begin at the
+  store's context; UPDATE = `blr_modify2` under a SINGULAR rse,
+  returning reading the NEW record; DELETE = NO erase2 at all — a
+  begin holding the returning assigns then the PLAIN erase, under a
+  singular rse. RETURNING makes the loops singular.
+- **EXECUTE STATEMENT**: plain = `blr_exec_sql` + the sql literal;
+  `[FOR] ... INTO` = `blr_exec_into` with u16 out-count, the sql,
+  flag 1 (singleton) or flag 0 + the labeled loop's DO statement,
+  then the variables LAST (flip twenty-two).
+
+### Guarded
+- Multiple same-kind MERGE branches (if-else chains, probed but
+  unconverted), backward fetch on unscrolled cursors, RETURNING on
+  positioned DML, RETURNING expressions, EXECUTE STATEMENT with
+  expression sql / USING / external sources. Gate:
+  `qa/dsql-proc-blr.sh` grew to 123 checks (13 fresh); 271 unit
+  byte-pins.
+
 ## 2026-07-28 — fire-crab-dsql slice 23: MERGE, AS CURSOR, cursors in triggers
 
 ### Converted

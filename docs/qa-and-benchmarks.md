@@ -4666,6 +4666,35 @@ WHEN, and a BLOCK as a handler's body nests blr_block again with no
 handler section of its own - the battery runs a handler block
 containing an EXIT.
 
+Slice 24 finished what 23 started. WHEN [NOT] MATCHED AND <cond>
+flipped from slice 23's own refusal list: the condition joins the
+rse boolean's branch term - and(not(missing), cond) for matched,
+and(missing, cond) for not-matched, the BARE cond when a
+matched-only merge's inner join already filters - and the branch
+action nests in if(cond, action, bare end). The both-branch
+composition (a matched-AND delete beside a not-matched-AND insert)
+was pinned in one probe and the emitter matched it on the first
+run. SCROLL cursors came with their whole direction family:
+blr_scrollable slips in before the dcl_cursor rse, and FETCH
+<direction> FROM is cursor_stmt sub-verb THREE - not the plain
+fetch's two - with a direction byte and an offset value that is
+blr_null except for ABSOLUTE/RELATIVE. FETCH NEXT FROM takes the
+scroll form even on an unscrolled cursor; everything else demands
+SCROLL. DML RETURNING ... INTO is THREE shapes for one clause -
+the engine reuses nothing: INSERT swaps blr_store for blr_store2
+and appends a returning begin; UPDATE swaps blr_modify for
+blr_modify2 AND wraps its rse in blr_singular, the returning
+reading the NEW record; DELETE has no erase2 in this path at all -
+it wraps a begin around the returning assigns and the PLAIN erase,
+under a singular rse, values reading the doomed row. And EXECUTE
+STATEMENT joined the surface: plain is blr_exec_sql plus the sql
+literal; the INTO forms are blr_exec_into with the out-count
+first, the sql, a flag - 1 for the singleton, 0 for the FOR loop
+followed by its DO statement - and the VARIABLES LAST, after the
+body they feed. The battery drives a scroll cursor backward
+through a WHILE/ROW_COUNT loop and pairs FOR EXECUTE STATEMENT
+with an IF-guarded SUSPEND - neither probed directly.
+
 Slice 23 converted MERGE - and MERGE turned out to be one probed
 sentence, not a statement family. The engine compiles every merge
 to for(marks(1, 6) - MERGE|FOR_UPDATE - rse(join2(source at ctx 0,

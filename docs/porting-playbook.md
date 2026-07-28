@@ -307,6 +307,13 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # ONE source clause can take THREE shapes by verb (RETURNING:
+    # store2's second begin, modify2 under a singular rse, delete's
+    # begin-wrapped PLAIN erase) - and a clause can change the verb
+    # AND the rse (singular) at once; a sub-verb can outrank its
+    # sibling (directed fetch = sub-verb 3 even for NEXT); operand
+    # order can INVERT intuition (exec_into: variables AFTER the
+    # loop body they feed) - probe the whole sentence, every time
     # a composite verb (MERGE) may be ONE probed sentence: a join,
     # a dbkey-missing test, an if - with LAWS where you'd expect
     # options (join type follows the branch SET, the rse boolean is
