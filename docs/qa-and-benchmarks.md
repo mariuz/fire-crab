@@ -4003,6 +4003,17 @@ windows, and the rule now carries that provenance in its comment.
 
 ## The execution differential: running the bytes the compiler matches
 
+(Slice 16 closed the recursion loop one slice after the compiler
+opened it: blr_recurse executes as a fixpoint - the anchor seeds the
+output, each wave's rows bind at the recursion's own context and
+feed the stream-less recursive branch, breadth-first, until a wave
+yields nothing, with the engine's 1024-level cap raised as an error
+rather than a hang. Recursive procedures now serve BLR-first over
+the wire, which the source interpreter never could. The framing law
+cost one debugging round: the recursion tower is TWO rses deep and
+the inner one closes with its own end, where the union and window
+towers lean on their wrapper's.)
+
 (Slice 15 drew the persistence boundary: GEN_ID and NEXT VALUE FOR
 execute through an in-memory overlay - reads in one run see each
 other's steps, the file is never written - and the boundary is

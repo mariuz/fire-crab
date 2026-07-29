@@ -13,6 +13,30 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-exe slice 16: blr_recurse — the executor runs the recursions
+
+### Converted
+- **`blr_recurse`**, one slice after the compiler learned to emit
+  it: the context, the secondary recursive-context byte, the ANCHOR
+  branch (a real rse + map) and the STREAM-LESS recursive branch
+  whose boolean and map read the recursion's own output by fid.
+- **The fixpoint**: the anchor seeds the output, then each wave's
+  rows are bound at the recursion's own context and fed through the
+  recursive branch, breadth-first, until a wave yields nothing —
+  with the engine's depth cap (1024) as an ERROR rather than a
+  hang. Multi-column recursions work by construction (the maps are
+  positional), and the recursion tower's framing law had to be
+  learned the hard way: it is TWO rses deep and the inner one
+  DOES close with its own end, unlike the union and window towers.
+- **Over the wire**: recursive procedures now serve BLR-first —
+  `SELECT * FROM <recursive proc>` and a multi-column recursion
+  both node-verified against the engine (the source interpreter
+  never learned WITH RECURSIVE at all).
+
+### Guarded
+- Gates: `qa/exe-run-blr.sh` 111 → 115, `qa/serve-real-exeproc.sh`
+  10 → 12; psql 55, nofallback 54; 276 workspace tests.
+
 ## 2026-07-29 — fire-crab-dsql slice 47: multi-column recursive ctes
 
 ### Converted

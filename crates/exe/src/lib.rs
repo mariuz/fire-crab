@@ -112,6 +112,7 @@ mod blr {
     pub const WINDOW: u8 = 195;
     pub const PARTITION_BY: u8 = 196;
     pub const AGG_FUNCTION: u8 = 199;
+    pub const RECURSE: u8 = 185;
     pub const GEN_ID2: u8 = 210;
     pub const WINDOW_WIN: u8 = 211;
     // blr_window_win subcodes
@@ -357,6 +358,17 @@ pub enum Stream {
     /// branches concatenate in order (ALL; the distinct form rides
     /// the outer rse's blr_project over the union's fids)
     Union { context: u8, branches: Vec<(Rse, Vec<(u16, Expr)>)> },
+    /// blr_recurse: the recursion tower - its own context, a
+    /// SECONDARY recursive-context byte, an ANCHOR branch (a real
+    /// rse + map) and a STREAM-LESS recursive branch whose boolean
+    /// and map read the recursion's own output by fid
+    Recurse {
+        context: u8,
+        anchor: Box<Rse>,
+        anchor_map: Vec<(u16, Expr)>,
+        rec_boolean: Option<Bool>,
+        rec_map: Vec<(u16, Expr)>,
+    },
     /// blr_window: the inner rse and the windows over it - every
     /// source row survives (a window is an aggregate that KEEPS its
     /// rows), each window's context binding a slot-row of computed
@@ -482,6 +494,17 @@ impl<'a> P<'a> {
             }
             other => return Err(format!("message dtype {} unconverted", other)),
         })
+    }
+
+    /// A positional map: u16 count, then (u16 slot, value) pairs.
+    fn map_pairs(&mut self) -> Result<Vec<(u16, Expr)>, String> {
+        let n = self.u16()? as usize;
+        let mut map = Vec::new();
+        for _ in 0..n {
+            let slot = self.u16()?;
+            map.push((slot, self.expr()?));
+        }
+        Ok(map)
     }
 
     /// A window map: u16 count, then (u16 slot, item) - items are
@@ -920,6 +943,68 @@ impl<'a> P<'a> {
                 // window in this wrapper)
                 return Ok(Rse {
                     stream: Stream::Window { source, windows },
+                    boolean: None,
+                    sort: Vec::new(),
+                    first: None,
+                    skip: None,
+                    project: Vec::new(),
+                    plan_indices: Vec::new(),
+                    singular: false,
+                });
+            }
+            blr::RECURSE => {
+                let context = self.u8()?;
+                let _secondary = self.u8()?;
+                let branches = self.u8()?;
+                if branches != 2 {
+                    return Err("recursion with other than two branches unconverted".into());
+                }
+                if self.u8()? != blr::RSE {
+                    return Err("recursion anchor is not an rse".into());
+                }
+                let anchor = Box::new(self.rse_body()?);
+                if self.u8()? != blr::MAP {
+                    return Err("recursion anchor without a map".into());
+                }
+                let anchor_map = self.map_pairs()?;
+                if self.u8()? != blr::RSE {
+                    return Err("recursive branch is not an rse".into());
+                }
+                let streams = self.u8()?;
+                if streams != 0 {
+                    return Err("recursive branch with streams unconverted".into());
+                }
+                let mut rec_boolean = None;
+                loop {
+                    match self.u8()? {
+                        blr::BOOLEAN => rec_boolean = Some(self.boolean()?),
+                        blr::END => break,
+                        other => {
+                            return Err(format!(
+                                "recursive-branch clause {} unconverted",
+                                other
+                            ))
+                        }
+                    }
+                }
+                if self.u8()? != blr::MAP {
+                    return Err("recursive branch without a map".into());
+                }
+                let rec_map = self.map_pairs()?;
+                // the WRAPPER rse's end closes the recursion (the
+                // outer rse's own end follows, for its caller) - the
+                // recursion tower is TWO rses deep, unlike the union
+                if self.u8()? != blr::END {
+                    return Err("recursion does not close with blr_end".into());
+                }
+                return Ok(Rse {
+                    stream: Stream::Recurse {
+                        context,
+                        anchor,
+                        anchor_map,
+                        rec_boolean,
+                        rec_map,
+                    },
                     boolean: None,
                     sort: Vec::new(),
                     first: None,
@@ -1527,6 +1612,79 @@ impl<'a> Exec<'a> {
             Stream::Derived(inner) => self.open_rse(inner)?,
             Stream::Window { source, windows } => {
                 return self.open_window(source, windows);
+            }
+            Stream::Recurse {
+                context,
+                anchor,
+                anchor_map,
+                rec_boolean,
+                rec_map,
+            } => {
+                // the recursion's fixpoint: the anchor branch seeds
+                // the output, then the recursive branch runs over
+                // EACH produced row (bound at the recursion's own
+                // context - the branch has no stream of its own) and
+                // its results feed the next wave, breadth-first,
+                // until a wave yields nothing
+                let width = anchor_map
+                    .iter()
+                    .chain(rec_map.iter())
+                    .map(|(sl, _)| *sl as usize + 1)
+                    .max()
+                    .unwrap_or(0);
+                let mut out: Vec<Vec<StreamFrame>> = Vec::new();
+                let mut wave: Vec<Vec<Value>> = Vec::new();
+                for binding in self.open_rse(anchor)? {
+                    let row = self.with_binding(&binding, |ex| {
+                        let mut row = vec![Value::Null; width];
+                        for (slot, e) in anchor_map {
+                            row[*slot as usize] = ex.eval(e)?;
+                        }
+                        Ok(row)
+                    })?;
+                    wave.push(row);
+                }
+                // the engine caps recursion depth (1024 - RecursiveStream
+                // in recsrc/); a runaway is an ERROR, never a hang
+                let mut depth = 0usize;
+                while !wave.is_empty() {
+                    for row in &wave {
+                        out.push(vec![StreamFrame {
+                            context: *context,
+                            relation: None,
+                            row: row.clone(),
+                        }]);
+                    }
+                    depth += 1;
+                    if depth > 1024 {
+                        return Err("too many recursion levels".into());
+                    }
+                    let mut next = Vec::new();
+                    for row in wave {
+                        let frame = vec![StreamFrame {
+                            context: *context,
+                            relation: None,
+                            row,
+                        }];
+                        let keep = match rec_boolean {
+                            None => Some(true),
+                            Some(b) => self.with_binding(&frame, |ex| ex.bool_eval(b))?,
+                        };
+                        if keep != Some(true) {
+                            continue;
+                        }
+                        let produced = self.with_binding(&frame, |ex| {
+                            let mut r = vec![Value::Null; width];
+                            for (slot, e) in rec_map {
+                                r[*slot as usize] = ex.eval(e)?;
+                            }
+                            Ok(r)
+                        })?;
+                        next.push(produced);
+                    }
+                    wave = next;
+                }
+                out
             }
             Stream::Union { context, branches } => {
                 // branches concatenate in order; each row is the
