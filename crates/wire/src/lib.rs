@@ -16,15 +16,20 @@
 //! the C++ client, which negotiates the same version with the same
 //! server.
 //!
-//! Not yet converted (the remaining road to firebird-qa, in order):
-//! the SRP proof and `op_cont_auth`, wire encryption (ChaCha/Arc4),
-//! `op_attach`, statement allocation/prepare, `op_execute`/`op_fetch`.
-//! See `docs/subsystem-map.md`.
+//! Authentication is NOT here: it lives in `fire-crab-auth`, the same
+//! way the C++ engine keeps it in `src/auth/` and lets `src/remote/`
+//! only carry the messages. See `docs/subsystem-map.md` for what remains
+//! unconverted (ChaCha wire crypt, the services surface).
 
-pub mod crypto;
 pub mod gdscodes;
 pub mod server;
-pub mod srp;
+
+// Authentication lives in its own crate now (fire-crab-auth, the
+// conversion of src/auth/SecureRemotePassword) - the same split the C++
+// engine has, where the remote layer only CARRIES auth messages and a
+// plugin decides. Re-exported so `crate::srp` / `crate::crypto` keep
+// naming the one implementation both halves of the wire share.
+pub use fire_crab_auth::{crypto, srp};
 
 use std::io::{Read, Write};
 use std::net::TcpStream;

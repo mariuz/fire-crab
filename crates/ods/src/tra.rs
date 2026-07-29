@@ -99,6 +99,10 @@ pub fn apply_differences(diff: &[u8], newer_image: &[u8]) -> Option<Vec<u8>> {
 pub struct VisibleRow {
     pub recno: u64,
     pub values: Vec<Value>,
+    /// the record image the values were decoded from - kept so a caller
+    /// that needs BYTES (an OCTETS column, a format-level check) can go
+    /// back to the ground truth instead of a lossy string
+    pub image: Vec<u8>,
     /// how many chain steps back the visible version was found
     pub versions_walked: u32,
     /// how many of those steps reconstructed a delta (rhd_delta)
@@ -158,6 +162,7 @@ pub fn visible_rows(
                             out.push(VisibleRow {
                                 recno,
                                 values: decode_record(&img, descs),
+                                image: img,
                                 versions_walked: walked,
                                 deltas_applied: deltas,
                             });

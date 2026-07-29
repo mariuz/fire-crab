@@ -1,0 +1,18 @@
+[package]
+name = "fire-crab-auth"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Authentication: the conversion of Firebird's src/auth/SecureRemotePassword (SRP-6a, both plugin variants) with the from-scratch SHA-1/SHA-256/bignum primitives, differentially tested against the engine's own stored verifiers and a live login"
+
+[dependencies]
+fire-crab-ods = { path = "../ods" }
+
+[[bin]]
+name = "fcauth"
+path = "src/main.rs"
+
+[lib]
+name = "fire_crab_auth"
+path = "src/lib.rs"

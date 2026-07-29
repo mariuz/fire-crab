@@ -5873,6 +5873,91 @@ value, blr_gen_id2 with the name alone) - the verb chosen by the
 SYNTAX the writer used, not the semantics. POST_EVENT is blr_post
 plus the event-name value, a statement in either body kind.
 
+### Authentication: the engine's own stored verifiers (`qa/auth-srp.sh`, 13 checks)
+
+Authentication is the one subsystem where a converter can be wrong and still
+appear to work, because the two halves are usually its own. A client and a
+server that share a mistake agree perfectly. So this gate never lets fire-crab
+check its own arithmetic: every claim is settled by something the ENGINE wrote
+or said.
+
+**Oracle one: the bytes `CREATE USER` stored.** Issue `CREATE USER FCAUTH1
+PASSWORD '...'` and the engine computes v = g^x mod N and writes it beside a
+random 32-byte salt into `plg$srp.plg$srp`. fire-crab recomputes v from the same
+password and must reproduce those 128 bytes exactly; `ALTER USER` re-randomizes
+the salt, so the whole pair moves and must still be reproduced; a wrong password
+must reproduce neither the verifier nor a proof. Then the pair is checked the way
+the engine checks it — `SrpVerifier::from_stored` holds ONLY the stored bytes,
+with no password anywhere, and must accept a client that knows one.
+
+Reading that table needs no SQL and cannot use it. `databases.conf` ships the
+`security.db` alias with `RemoteAccess = false`, so no client may attach to a
+security database over TCP:
+
+```
+Statement failed, SQLSTATE = 28000
+no permission for remote access to database /opt/firebird/security6.fdb
+```
+
+and a direct local attach collides with the server that already has it open:
+
+```
+I/O error during "lock" operation for file "/opt/firebird/security6.fdb"
+-Database already opened with engine instance, incompatible with current
+```
+
+`fcauth stored` reads the file with fire-crab's own ODS decoder instead — pages,
+no attachment, no engine. `PLG$VERIFIER` and `PLG$SALT` are
+`CHARACTER SET OCTETS`, so they are read as BYTES through the new
+`fire_crab_ods::field_bytes`: decoding them as text replaces every byte above
+0x7F and the verifier stops being a number. (The security database is copied
+first and the copy re-taken until the freshly committed user appears in it — the
+server may still be holding the page.)
+
+**Oracle two: the one-in-sixteen user, hunted on purpose.** The salt is stored
+as 32 raw bytes and travels as `BigInteger::getText` (SrpServer.cpp:325) —
+uppercase hex with NO leading zero. So one user in sixteen has a 63-character
+salt, and x must be computed over exactly those characters. The gate ALTERs a
+user until the engine hands out such a salt (9–11 tries in practice, p = 1/16
+each), then asserts three things: the minimal form reproduces the stored
+verifier, the padded 64-character form and the raw 32 bytes do NOT, and a live
+login as that user still succeeds with `SALT_LEN 63` on the wire. Without the
+hunt this law is untested by construction — fifteen users in sixteen pass either
+way, and the sixteenth is the support ticket.
+
+**Oracle three: the live server's verdict.** `fcauth login` performs the real
+handshake and stops before attaching: op_connect presenting A, op_cond_accept
+carrying salt and B, op_cont_auth carrying M. An `AUTH OK` therefore means one
+thing only — the engine's own SRP plugin recomputed our proof from its stored
+verifier and agreed. The refusals are gated as carefully as the success, each
+against the engine's own status code:
+
+| attempt | engine's answer |
+|---|---|
+| correct password, `Srp256` | accepted |
+| wrong password | `isc_login` (335544472), after the proof |
+| unknown user | `isc_login` (335544472), at op_connect |
+| plugin `Srp` offered alone | `isc_login_error` (335545106), at op_connect |
+
+The last row is the honest one. A default `firebird.conf` sets
+`AuthServer = Srp256`, so the SHA-1 variant cannot be proven against this
+server; the gate records the engine's refusal code and pins that variant's
+arithmetic by loopback and by cross-implementation vectors instead. Editing the
+server's configuration until the check passes would be a gate testing itself.
+
+**Oracle four: a fourth implementation.** node-firebird's `lib/srp.js` has its
+own bignum (JS `BigInt`) and its own SHA. Given the same fixed a, b and salt, its
+A, B, K and M must equal ours digit for digit, for both plugins.
+
+That last check is what found the slice's bug. Our A was 256 hex digits where
+node — and the engine (`genClientKey`, srp.cpp:110, `getText`) — sends 255: no
+leading zero. Every value matched; only the digits differed, and only for the
+~1-in-16 numbers whose top nibble is zero. The login worked either way, because
+the far side parses a BigInteger. But "it parses" is not "it is what the engine
+sends", and the same law is what makes proof comparison a VALUE comparison on
+the server side (a padded 64-digit M against a client's 63-digit one rejects a
+valid login once every sixteen attaches). A, B and M are now all `getText`.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
@@ -6497,6 +6582,13 @@ FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
 NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     bash /path/to/fire-crab/qa/serve-real-predfull.sh 3050
+
+# SRP authentication against three oracles: the verifiers CREATE USER
+# stored (read out of the security database with fire-crab's own ODS
+# decoder), a live handshake against the running server, and
+# node-firebird's independent SRP. Creates and drops its own users.
+FCAUTH=/path/to/fire-crab/target/release/fcauth ISQL=/opt/firebird/bin/isql \
+    bash /path/to/fire-crab/qa/auth-srp.sh 127.0.0.1 3050
 
 # SQL -> BLR against the engine's own compiler: fcdsql's bytes vs the
 # RDB$VIEW_BLR the engine stores for the identical SELECT.

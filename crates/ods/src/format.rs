@@ -260,6 +260,34 @@ fn render_timestamp_tz(date: i32, utc: u32, zone: u16) -> String {
 }
 
 /// Decode one field from an unpacked record image.
+/// The RAW bytes of a character field - what `decode_field` would turn
+/// into a `Value::Text`, before any UTF-8 interpretation. Needed for
+/// `CHARACTER SET OCTETS` columns, whose bytes are not text at all: the
+/// security database's `PLG$VERIFIER` and `PLG$SALT` are binary, and
+/// reading them as a lossy string silently replaces every byte above
+/// 0x7F. Returns None for NULL, for a truncated image, or for a
+/// non-character dtype.
+pub fn field_bytes(image: &[u8], desc: &Descriptor, index: usize) -> Option<Vec<u8>> {
+    if image
+        .get(index / 8)
+        .map(|b| b & (1 << (index % 8)) != 0)
+        .unwrap_or(true)
+    {
+        return None; // NULL
+    }
+    let at = desc.offset as usize;
+    let len = desc.length as usize;
+    let f = image.get(at..at + len)?;
+    match desc.dtype {
+        dtype::TEXT => Some(f.to_vec()),
+        dtype::VARYING => {
+            let n = (u16_at(f, 0) as usize).min(len.saturating_sub(2));
+            Some(f[2..2 + n].to_vec())
+        }
+        _ => None,
+    }
+}
+
 pub fn decode_field(image: &[u8], desc: &Descriptor, index: usize) -> Value {
     // null bitmap: bit `index`, set = NULL
     if image

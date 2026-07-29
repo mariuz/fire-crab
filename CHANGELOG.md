@@ -13,6 +13,73 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-auth slice 1: the engine's own verifiers as the oracle
+
+### Converted
+- **A NEW CRATE for `src/auth/SecureRemotePassword`** — and the split is
+  the engine's own: `src/remote/` never authenticates, it CARRIES
+  opaque blobs to a named plugin (`Srp256`, `Srp`, `Legacy_Auth`) and
+  asks whether it is satisfied. So SRP and the from-scratch
+  SHA-1/SHA-256/bignum/Arc4 under it moved out of `fire-crab-wire`
+  into `fire-crab-auth`, where one implementation now serves four
+  roles: CLIENT (fire-crab logs in to the engine), SERVER (`fcwire
+  serve` accepts node-firebird, isql and the OO drivers), USER MANAGER
+  (the verifier `CREATE USER` stores — new in this slice), and ORACLE
+  (`fcauth`).
+- **Both plugin variants.** `Algo::{Srp, Srp256}` parameterizes exactly
+  what the engine parameterizes — the proof hash and nothing else
+  (`RemotePasswordImpl<SHA>::makeProof`, srp.h:134). The scramble u,
+  the user hash x and the session key K = SHA1(S) are SHA-1 in both
+  (srp.h:91), so Arc4 is keyed by 20 bytes either way.
+- **The verifier half.** `compute_verifier` is
+  `RemotePassword::computeVerifier` (srp.cpp:103) — v = g^x mod N, the
+  bytes `CREATE USER` writes into `plg$srp.plg$srp` beside a random
+  salt — and `SrpVerifier::from_stored` is the engine's server path,
+  which holds only `(salt, v)` and never a password.
+- **The differential is the ENGINE'S OWN STORED BYTES.** The engine
+  computed those verifiers; fire-crab recomputes them from the same
+  password and must reproduce them exactly, through `ALTER USER`
+  re-salting and all. Reading them needs no SQL and cannot use it:
+  `databases.conf` ships the `security.db` alias with
+  `RemoteAccess = false`, and a direct attach collides with the running
+  server — so `fcauth stored` reads the security database with
+  fire-crab's own ODS decoder, as BYTES (`OCTETS` columns, via the new
+  `fire_crab_ods::field_bytes`).
+- **The live handshake, alone.** `fcauth login` does op_connect →
+  op_cond_accept → op_cont_auth against the real server and stops
+  before attaching, so an `AUTH OK` means one thing only: the engine's
+  own plugin recomputed our proof from its stored verifier and agreed.
+
+### Fixed
+- **Every number travels as `BigInteger::getText`, not as padded hex.**
+  Our A was 256 hex digits where the engine's client (srp.cpp:110,
+  `getText`) sends 255 — no leading zero. The number was right and the
+  login worked, but the bytes were not what a real client sends. A, B
+  and M are now all `hex_text`. Caught by the cross-implementation
+  vectors: node-firebird's independent SRP agreed on the VALUE and
+  disagreed on the digits.
+
+### Guarded
+- **The one-in-sixteen salt is hunted, not hoped for.** The salt is
+  stored as 32 raw bytes and sent as `getText` (SrpServer.cpp:325), so
+  one user in sixteen has a 63-character salt. The gate ALTERs a user
+  until the engine hands out such a salt (9–11 tries in practice) and
+  then shows that only the minimal form reproduces the stored verifier
+  — the padded 64-character form and the raw bytes do not — and that a
+  live login as that user still succeeds. Without the hunt the law is
+  untested by construction.
+- **The engine's refusals are recorded, not papered over.** A default
+  `firebird.conf` serves `AuthServer = Srp256` only, so offering just
+  `Srp` cannot reach a proof: the gate asserts the engine's own
+  `isc_login_error` (335545106) at op_connect and pins the SHA-1
+  variant's arithmetic by loopback and vectors instead. Editing the
+  server's configuration to make the check pass would be a gate testing
+  itself.
+- Legacy_Auth (DES over an 8-character password), the ChaCha wire-crypt
+  plugins, cleartext `isc_dpb_password` attach and identity MAPPING stay
+  unconverted — the first would add a weak path for no differential
+  value, the rest are separate subsystems.
+
 ## 2026-07-29 — fire-crab-evt slice 1: an event is a counter
 
 ### Converted

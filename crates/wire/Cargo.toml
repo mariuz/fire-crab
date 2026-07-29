@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 fire-crab-ods = { path = "../ods" }
+fire-crab-auth = { path = "../auth" }
 fire-crab-blb = { path = "../blb" }
 fire-crab-exe = { path = "../exe" }
 

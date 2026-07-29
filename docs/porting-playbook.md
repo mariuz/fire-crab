@@ -667,6 +667,49 @@ them.
   THE ENGINE WINS — even when your gate asserted otherwise (then the
   gate is wrong; fix the gate).
 
+## Authentication has oracles nobody can argue with — use them
+
+- **The credential store is a differential.** A user manager wrote
+  verifiers into a table with a password you know. Recompute them. If
+  your bytes equal the engine's bytes for a user the ENGINE created,
+  your hash chain, your bignum, your encoding and your padding are all
+  right at once — no protocol, no server, no argument. This beat every
+  other check available for SRP, including a working login.
+- **A client and a server you both wrote will agree on your mistakes.**
+  Loopback tests prove internal consistency and nothing else. Get a
+  third implementation (here node-firebird's own SRP, with a different
+  bignum and a different SHA) to reproduce your intermediate values from
+  fixed inputs, and get the real server to accept your proof. Those two
+  disagree with you in different ways, which is the point.
+- **Hunt the one-in-N case; do not wait for it.** Firebird writes every
+  number as minimal hex (`BigInteger::getText`), so a salt with a
+  leading zero nibble is 63 characters, not 64 — one user in sixteen.
+  A gate over ordinary users passes with the padding bug in place. So
+  the gate re-rolls the credential until the engine hands out the
+  awkward case, then asserts that ONLY the correct encoding reproduces
+  what the engine stored. Same for proofs: compare by VALUE, because a
+  proof whose top nibble is zero arrives one digit short and a string
+  comparison rejects a valid login every sixteenth attach.
+- **The comment says xor; the code raises to a power.** srp.cpp's
+  `clientProof` is annotated `H(prime) ^ H(g)` and computes
+  `n1.modPow(n2, prime)`. Convert the code.
+- **Read what the hash is parameterized ON, not what the plugin is
+  called.** `Srp256` uses SHA-256 for the PROOF only; the scramble, the
+  user hash and the session key are SHA-1 in both plugins, so Arc4 is
+  keyed by 20 bytes either way. "Upgrade it all to SHA-256" is a client
+  that can never log in.
+- **When the server cannot exercise a path, say so with its own error.**
+  A default `AuthServer = Srp256` will not negotiate the SHA-1 variant.
+  Record the engine's `isc_login_error` and pin that path another way;
+  do not edit the server's configuration until the gate goes green —
+  that is a gate testing itself.
+- **Storage-layer tools reach places SQL is forbidden to reach.** The
+  security database refuses remote attach by configuration and refuses
+  a local attach while the server holds it. A page decoder needs
+  neither. If your conversion has a file reader, it can read the
+  engine's own credentials store — and OCTETS columns must be read as
+  BYTES, or every byte above 0x7F becomes U+FFFD.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with
