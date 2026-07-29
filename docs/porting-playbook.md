@@ -551,6 +551,16 @@ them.
   `0.00` differ in raw form; align raws in a wide integer before
   comparing. Text-comparing rendered forms is the tempting wrong
   answer.
+- **A compound verb is usually your own plans in a trench coat - and
+  its REFUSAL is part of the surface.** UPDATE OR INSERT desugars to
+  try-update, test row_count, store: the UPDATE and INSERT paths the
+  server already runs, with every constraint applying for free. But
+  when the table has no primary key and no MATCHING, the engine
+  refuses AT PREPARE with "Primary key required on table X" - ship
+  that specific vector, not the generic refusal. The generic error is
+  technically a refusal and practically a lie: it hides the one line
+  that tells the user what to fix, and the report that prompted this
+  feature was exactly that hidden line.
 - **Case mapping, week numbers, and NULL rules are where "obvious"
   implementations diverge.** When your answer and the engine's differ,
   THE ENGINE WINS — even when your gate asserted otherwise (then the

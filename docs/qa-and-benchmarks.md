@@ -3853,6 +3853,38 @@ full: the modifier slices the result, it does not stop the loop early.
 Refused: `FIRST ?` and `FIRST (expr)` — a limit that is a parameter or an
 expression rather than a literal.
 
+### UPDATE OR INSERT (`qa/serve-real-upsert.sh`, 17 checks)
+
+The engine's upsert is its own execution plan, and it is the plan
+fire-crab runs: try the update whose WHERE is the MATCHING columns,
+test the row count, store when nothing moved (StmtNodes.cpp
+`UpdateOrInsertNode`). The statement desugars at prepare into the
+UPDATE and INSERT plans the server already has - defaults, NOT NULL,
+CHECK, FK enforcement and index maintenance all apply because there is
+no second write path to forget them in.
+
+`MATCHING (cols)` names the key; without it the list defaults to the
+table's PRIMARY KEY columns read from the catalog, multi-column keys
+included. And a PK-less table without MATCHING is the case that
+matters most: the engine refuses it AT PREPARE with `isc_dsql_error` +
+`isc_primary_key_required` - "Primary key required on table
+"PUBLIC"."T"", SQLSTATE 22000. That specific vector is part of the
+surface. This feature came in as a user report that upserting into a
+PK-less table "should work" - it does not, on the real engine either,
+and the generic Dynamic SQL Error fire-crab used to answer hid the one
+line that says what is missing. Now the refusal names it, in the
+engine's words, and the gate asserts the refused statement wrote
+nothing.
+
+Refused: `?` parameters (the two desugared plans would double-bind one
+client message), a NULL matching value (the engine compares MATCHING
+with null-safe `blr_equiv`, where the desugared `=` would silently
+never match - refusing beats mis-matching), RETURNING, and the
+list-less form (the column set would be a catalog read this parse
+does not do). The gate runs the same script through fcwire and the
+C++ engine; the engine then opens both files and must read identical
+rows from the single-key, MATCHING and two-column-key tables alike.
+
 ### One materialising path, and the ordering bug it hid
 
 `DISTINCT`, `FIRST`/`SKIP`/`ROWS`, `UNION`, `INSERT ... SELECT` and PSQL

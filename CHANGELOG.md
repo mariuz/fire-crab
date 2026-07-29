@@ -13,6 +13,35 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-wire: UPDATE OR INSERT
+
+### Converted
+- **`UPDATE OR INSERT INTO t (cols) VALUES (...) [MATCHING (cols)]`** —
+  the engine's upsert, desugared at prepare into the UPDATE and INSERT
+  plans the server already runs: try the update whose WHERE is the
+  MATCHING columns, store when no row moved — the same execution plan
+  `UpdateOrInsertNode` compiles. The MATCHING list defaults to the
+  table's PRIMARY KEY columns, read from the catalog (multi-column
+  keys included); the statement types as an INSERT, as the engine
+  types it.
+- **The engine's specific error where the key is missing**: a PK-less
+  table without MATCHING refuses AT PREPARE with `isc_dsql_error` +
+  `isc_primary_key_required` — `Primary key required on table
+  "PUBLIC"."T"`, SQLSTATE 22000 — the one line that names what to
+  fix, where the generic Dynamic SQL Error would hide it. (This came
+  in as a user report: the upsert on a PK-less table "should work" —
+  the engine itself requires MATCHING there, and now fire-crab says
+  so in the engine's words.)
+
+### Guarded
+- `?` parameters (the two desugared plans would double-bind one
+  client message), NULL matching values (the engine compares MATCHING
+  with null-safe `blr_equiv`; a plain `=` would silently mis-match),
+  RETURNING, a missing column list. Gate: `qa/serve-real-upsert.sh`
+  (17 checks — the same script through fcwire and the C++ engine
+  leaves two files the engine reads identically; gfix + gbak
+  validate); 6 regression gates + 237 workspace tests green.
+
 ## 2026-07-29 — fire-crab-dsql slice 42: DISTINCT, PLAN INDEX, ROWS m TO n
 
 ### Converted

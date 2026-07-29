@@ -206,6 +206,10 @@ fn respond_error(s: &mut TcpStream, enc: &mut Option<Rc4>, gds: i32) -> std::io:
 /// isc_dsql_error - the generic "Dynamic SQL Error" the server answers
 /// for statements it cannot honour rather than answering them wrong.
 const GDS_DSQL_ERROR: i32 = 335544569;
+/// isc_primary_key_required - "Primary key required on table @1"
+/// (SQLSTATE 22000): UPDATE OR INSERT without MATCHING on a PK-less
+/// table, raised at prepare exactly as the engine raises it
+const GDS_PRIMARY_KEY_REQUIRED: i32 = 336003098;
 
 /// Resolve a database name the client attached to through
 /// `databases.conf`, the way the engine does: a name that matches an
@@ -1204,6 +1208,15 @@ AlterDomainRename {
         /// touches - a changed key must not leave child rows behind
         fk_children: Vec<FkPartner>,
     },
+    /// `UPDATE OR INSERT INTO <t> (cols) VALUES (...) [MATCHING
+    /// (cols)]`: the engine's own execution plan - try the update whose
+    /// WHERE is the MATCHING columns (the primary key when the clause
+    /// is absent), and store when no row moved (StmtNodes.cpp
+    /// `UpdateOrInsertNode`). Desugared at prepare into the UPDATE and
+    /// INSERT plans this server already runs; a PK-less table without
+    /// MATCHING refuses at prepare with the engine's
+    /// primary-key-required vector
+    UpdateOrInsert { update: Box<Plan>, insert: Box<Plan> },
     /// `DELETE FROM <t> [WHERE ...]`: op_execute rewrites each matching
     /// primary record as a deleted stub over its version chain
     Delete {
@@ -7523,6 +7536,176 @@ fn split_set_list(text: &str) -> Vec<String> {
 /// SQL textual order: the SET list first, then the WHERE terms. None =
 /// not a statement the server can honour (the caller answers an SQL
 /// error - never a silent no-op, never a wrong write).
+/// `UPDATE OR INSERT INTO <t> (<cols>) VALUES (<literals>) [MATCHING
+/// (<cols>)]` - the engine's upsert, desugared at prepare into the
+/// UPDATE and INSERT plans this server already runs. The MATCHING list
+/// defaults to the table's PRIMARY KEY columns; a PK-less table
+/// without MATCHING refuses AT PREPARE with the engine's
+/// primary-key-required vector (SQLSTATE 22000). Matching values must
+/// be non-NULL literals: the engine compares MATCHING with blr_equiv
+/// (null-safe equality), so a NULL matching value refuses rather than
+/// mis-match, and `?` parameters refuse - the two desugared plans
+/// would double-bind one client message.
+fn plan_upsert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "UPDATE", 0) != Some(0) {
+        return None;
+    }
+    let or_kw = find_word(&masked, "OR", "UPDATE".len())?;
+    if !masked["UPDATE".len()..or_kw].trim().is_empty() {
+        return None;
+    }
+    let ins_kw = find_word(&masked, "INSERT", or_kw + "OR".len())?;
+    if !masked[or_kw + "OR".len()..ins_kw].trim().is_empty() {
+        return None;
+    }
+    let into_kw = find_word(&masked, "INTO", ins_kw + "INSERT".len())?;
+    if !masked[ins_kw + "INSERT".len()..into_kw].trim().is_empty() {
+        return None;
+    }
+    let vals_kw = find_word(&masked, "VALUES", into_kw + "INTO".len())?;
+    // between INTO and VALUES: the table name + the (column list) -
+    // the list is REQUIRED here (without it the engine reads the
+    // column set from the catalog in field order; unconverted)
+    let head = s[into_kw + "INTO".len()..vals_kw].trim();
+    let open = head.find('(')?;
+    let table = head[..open].trim().trim_matches('"').to_ascii_uppercase();
+    if !ident_ok(&table) {
+        return None;
+    }
+    let rest = head[open..].trim();
+    if !rest.ends_with(')') {
+        return None;
+    }
+    let cols = split_ident_list(&rest[1..rest.len() - 1])?;
+    if cols.is_empty() {
+        return None;
+    }
+    // the (value list) - paren depth on the MASKED text, so parens
+    // and commas inside string literals do not count
+    let vopen = masked[vals_kw..].find('(')? + vals_kw;
+    if !masked[vals_kw + "VALUES".len()..vopen].trim().is_empty() {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut vclose = None;
+    for (i, ch) in masked[vopen..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    vclose = Some(vopen + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let vclose = vclose?;
+    // split the value list on TOP-LEVEL commas (masked indices, the
+    // ORIGINAL text's contents)
+    let mut vals: Vec<String> = Vec::new();
+    let mut depth = 0i32;
+    let mut seg = vopen + 1;
+    for (i, ch) in masked[vopen + 1..vclose].char_indices() {
+        let at = vopen + 1 + i;
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                vals.push(s[seg..at].trim().to_string());
+                seg = at + 1;
+            }
+            _ => {}
+        }
+    }
+    vals.push(s[seg..vclose].trim().to_string());
+    if vals.len() != cols.len() || vals.iter().any(|v| v.is_empty()) {
+        return None;
+    }
+    // after the value list: nothing, or MATCHING (<cols>) - RETURNING
+    // and everything else refuses
+    let tail = masked[vclose + 1..].trim();
+    let matching: Option<Vec<String>> = if tail.is_empty() {
+        None
+    } else {
+        let m_off = find_word(&masked, "MATCHING", vclose + 1)?;
+        if !masked[vclose + 1..m_off].trim().is_empty() {
+            return None;
+        }
+        let m_rest = s[m_off + "MATCHING".len()..].trim();
+        if !m_rest.starts_with('(') || !m_rest.ends_with(')') {
+            return None;
+        }
+        Some(split_ident_list(&m_rest[1..m_rest.len() - 1])?)
+    };
+    // parameters would double-bind one message across the two plans
+    if masked[vopen..vclose].contains('?') {
+        return None;
+    }
+    let dbr = db.as_ref()?;
+    let mcols = match matching {
+        Some(list) if !list.is_empty() => list,
+        Some(_) => return None,
+        None => match fire_crab_ods::ddl::primary_key_columns(
+            &dbr.bytes,
+            dbr.page_size,
+            &table,
+        ) {
+            Some(pk) => pk,
+            // the engine's error names the schema-qualified table
+            None => {
+                return Some((
+                    Plan::RefusedEval(EvalErr::PrimaryKeyRequired(format!(
+                        "\"PUBLIC\".\"{}\"",
+                        table
+                    ))),
+                    Vec::new(),
+                ))
+            }
+        },
+    };
+    // every matching column must ride the insert list (its value is
+    // the WHERE comparand), and a NULL there would need blr_equiv
+    let mut wheres: Vec<String> = Vec::new();
+    for m in &mcols {
+        let pos = cols.iter().position(|c| c.eq_ignore_ascii_case(m))?;
+        if vals[pos].trim().eq_ignore_ascii_case("NULL") {
+            return None;
+        }
+        wheres.push(format!("{} = {}", cols[pos], vals[pos]));
+    }
+    let sets: Vec<String> = cols
+        .iter()
+        .zip(vals.iter())
+        .map(|(c, v)| format!("{} = {}", c, v))
+        .collect();
+    let upd_sql = format!(
+        "UPDATE {} SET {} WHERE {}",
+        table,
+        sets.join(", "),
+        wheres.join(" AND ")
+    );
+    let ins_sql = format!(
+        "INSERT INTO {} ({}) VALUES ({})",
+        table,
+        cols.join(", "),
+        vals.join(", ")
+    );
+    let (update, ups) = plan_update(&upd_sql, db)?;
+    let (insert, ips) = plan_insert(&ins_sql, db)?;
+    if !ups.is_empty() || !ips.is_empty() {
+        return None;
+    }
+    Some((
+        Plan::UpdateOrInsert { update: Box::new(update), insert: Box::new(insert) },
+        Vec::new(),
+    ))
+}
+
 fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
@@ -7817,6 +8000,21 @@ fn execute_dml(
     args: &[WireParam],
     ctx: &SessionCtx,
 ) -> Result<(i32, i32, i32), ExecErr> {
+    // the upsert recurses BEFORE the working copy is taken: each half
+    // commits through the ordinary path, and the row count of the
+    // update half decides whether the insert half runs at all - the
+    // engine's try-update, test row_count, store plan
+    if let Plan::UpdateOrInsert { update, insert } = plan {
+        let (_, updated, _) = execute_dml(update, database, args, ctx)?;
+        if updated > 0 {
+            return Ok((0, updated, 0));
+        }
+        let (inserted, _, _) = execute_dml(insert, database, args, ctx)?;
+        return Ok((inserted, 0, 0));
+    }
+    if let Plan::RefusedEval(e) = plan {
+        return Err(ExecErr::Eval(e.clone()));
+    }
     let db = database.as_mut().ok_or("no database attached")?;
     let mut work = db.bytes.clone();
     let counts = match plan {
@@ -11073,6 +11271,9 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
             describe_dml(5, params) // isc_info_sql_stmt_ddl
         }
         Plan::Insert { .. } => describe_dml(2, params), // isc_info_sql_stmt_insert
+        // the engine types UPDATE OR INSERT as an INSERT
+        // (UpdateOrInsertNode sets TYPE_INSERT)
+        Plan::UpdateOrInsert { .. } => describe_dml(2, params),
         Plan::Update { .. } => describe_dml(3, params), // isc_info_sql_stmt_update
         Plan::Delete { .. } => describe_dml(4, params), // isc_info_sql_stmt_delete
         Plan::Project { cols, .. } => build_describe(cols, params),
@@ -11117,7 +11318,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::Refused
         | Plan::RefusedEval(_)
         | Plan::VirtualEmpty { .. } => 1,
-        Plan::Insert { .. } => 2,
+        Plan::Insert { .. } | Plan::UpdateOrInsert { .. } => 2,
         Plan::Update { .. } => 3,
         Plan::Delete { .. } => 4,
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
@@ -11461,6 +11662,14 @@ fn eval_status_vector(w: &mut W, e: &EvalErr) {
                 .int(ISC_ARG_NUMBER)
                 .int(*n as i32);
         }
+        EvalErr::PrimaryKeyRequired(table) => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds
+                .int(GDS_PRIMARY_KEY_REQUIRED)
+                .int(2) // isc_arg_string
+                .bytes(table.as_bytes());
+        }
     }
     w.int(0); // isc_arg_end
 }
@@ -11517,7 +11726,8 @@ fn emit_rows_inner(
         Plan::TxControl { .. }
         | Plan::Savepoint { .. }
         | Plan::InsertSelect { .. }
-        | Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
+        | Plan::Insert { .. } | Plan::UpdateOrInsert { .. }
+        | Plan::Update { .. } | Plan::Delete { .. }
         | Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
@@ -13482,6 +13692,11 @@ enum EvalErr {
     /// 42000 "must be zero or positive" on LPAD/RPAD/POSITION bounds -
     /// an error either way, never a wrong row
     InvalidLength(i64),
+    /// UPDATE OR INSERT without MATCHING on a table that has no
+    /// primary key: `isc_dsql_error` + `isc_primary_key_required`
+    /// (SQLSTATE 22000), the schema-qualified table name as the
+    /// message argument - the engine raises this at PREPARE
+    PrimaryKeyRequired(String),
 }
 
 /// What an expression's result is typed as - which drives its wire form
@@ -18400,6 +18615,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             .or_else(|| plan_alter_sequence(&text))
                     } else if dml_kw {
                         plan_insert(&text, &database)
+                            .or_else(|| plan_upsert(&text, &database))
                             .or_else(|| plan_update(&text, &database))
                             .or_else(|| plan_delete(&text, &database))
                     } else {
@@ -18592,10 +18808,19 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     // let a client think its write succeeded
                     let planned = match kw {
                         "INSERT" => plan_insert(&stmt_sql, &database),
-                        "UPDATE" => plan_update(&stmt_sql, &database),
+                        "UPDATE" => plan_upsert(&stmt_sql, &database)
+                            .or_else(|| plan_update(&stmt_sql, &database)),
                         _ => plan_delete(&stmt_sql, &database),
                     };
                     match planned {
+                        // UPDATE OR INSERT on a PK-less table without
+                        // MATCHING: the engine's specific vector at
+                        // prepare, not the generic Dynamic SQL Error
+                        Some((Plan::RefusedEval(e), _)) => {
+                            plan = Plan::Refused;
+                            stmt_params = Vec::new();
+                            respond_eval_error(&mut s, &mut enc, &e)?;
+                        }
                         Some((p, ps)) => {
                             let describe = answer_prepare(&prep_items, &p, &ps);
                             plan = p;
@@ -18693,6 +18918,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 } else if matches!(
                     plan,
                     Plan::Insert { .. }
+                        | Plan::UpdateOrInsert { .. }
                         | Plan::InsertSelect { .. }
                         | Plan::TxControl { .. }
                         | Plan::Savepoint { .. }

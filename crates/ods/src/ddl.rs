@@ -4912,6 +4912,21 @@ pub fn alter_table_add_foreign_key(
 /// constraint whose index carries exactly those columns in that order
 /// (probed: `REFERENCES A1 (Y)` onto a UNIQUE(Y) links the FK to the
 /// UNIQUE constraint and its index, not the table's primary key).
+/// A table's PRIMARY KEY column names in key order, from
+/// `RDB$RELATION_CONSTRAINTS` + `RDB$INDEX_SEGMENTS` - `None` when the
+/// table has no primary key. The wire server's UPDATE OR INSERT takes
+/// this as its implicit MATCHING list, exactly as the engine does
+/// (StmtNodes.cpp `UpdateOrInsertNode`).
+pub fn primary_key_columns(
+    file: &[u8],
+    page_size: usize,
+    table: &str,
+) -> Option<Vec<String>> {
+    let (_, index) = find_partner_key(file, page_size, table, &[])?;
+    let cols = index_segment_names(file, page_size, &index);
+    if cols.is_empty() { None } else { Some(cols) }
+}
+
 fn find_partner_key(
     file: &[u8],
     page_size: usize,
