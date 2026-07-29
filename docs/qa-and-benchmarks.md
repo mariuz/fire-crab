@@ -3978,6 +3978,16 @@ took the descending twin index where one existed and fell back to a
 sort where none did - an ascending index cannot serve a descending
 order.
 
+Slice 3 added the prefix rule in both its guises - a compound (X, Y)
+index serves a predicate on X but not on Y alone, and navigates an
+ORDER BY exactly when the order is a PREFIX of its segments with
+directions agreeing - plus chains of three or more streams. It also
+produced the clearest refusal in the crate: when a chain's link is
+unindexed, the engine REORDERS by deriving a new equality through an
+equivalence class (D.Z = B.UID and A.ID = B.UID give D.Z = A.ID, and
+it drives from D). fcopt refuses that shape and the gate pins the
+refusal, so the frontier is documented rather than implied.
+
 What the slice deliberately does NOT convert is as important: cost
 and selectivity arithmetic. Where the engine's choice between
 candidate indexes depends on statistics rather than structure, fcopt

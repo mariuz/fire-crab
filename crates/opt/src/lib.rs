@@ -66,8 +66,31 @@ use fire_crab_ods::{
 pub struct IndexInfo {
     pub id: i64,
     pub name: String,
-    pub column: String,
+    /// every segment, in key order - a COMPOUND index matches a
+    /// predicate only on its LEADING segment (the prefix rule,
+    /// probed: WHERE on the second segment alone plans NATURAL)
+    pub columns: Vec<String>,
     pub descending: bool,
+}
+
+impl IndexInfo {
+    /// Can this index fetch rows for a predicate on `column`?
+    pub fn matches(&self, column: &str) -> bool {
+        self.columns
+            .first()
+            .is_some_and(|c| c.eq_ignore_ascii_case(column))
+    }
+
+    /// Can this index NAVIGATE the given ORDER BY? The order columns
+    /// must be a PREFIX of the segments and every direction must
+    /// agree (probed: ORDER BY x, z on an (x, y) index sorts, and so
+    /// does a DESC order over an ascending index).
+    pub fn navigates(&self, order: &[(String, bool)]) -> bool {
+        order.len() <= self.columns.len()
+            && order.iter().enumerate().all(|(i, (c, desc))| {
+                self.columns[i].eq_ignore_ascii_case(c) && *desc == self.descending
+            })
+    }
 }
 
 /// The chosen access path for one table.
@@ -200,12 +223,11 @@ pub fn indexes_of(
                 matches!(type_f.and_then(|f| values.get(f)), Some(Value::Int(1)));
             let iname = iname.trim_end().to_string();
             let segs = index_columns(file, page_size, &iname)?;
-            // slice 1 matches SINGLE-segment indexes only
-            if segs.len() == 1 {
+            if !segs.is_empty() {
                 out.push(IndexInfo {
                     id: *id,
                     name: iname,
-                    column: segs[0].clone(),
+                    columns: segs,
                     descending,
                 });
             }
@@ -308,7 +330,7 @@ pub fn plan_query(
 
     let indexes = indexes_of(file, page_size, &table)?;
     let by_col = |c: &str| -> Vec<&IndexInfo> {
-        indexes.iter().filter(|i| i.column.eq_ignore_ascii_case(c)).collect()
+        indexes.iter().filter(|i| i.matches(c)).collect()
     };
 
     // ---- the predicates -------------------------------------------
@@ -332,20 +354,17 @@ pub fn plan_query(
     matched.sort_by_key(|i| i.id);
 
     // ---- the ORDER BY ---------------------------------------------
-    let order = match order_s {
+    let order: Option<Vec<(String, bool)>> = match order_s {
         None => None,
-        Some(o) => {
-            let (col, desc) = parse_order(o)?;
-            Some((col, desc))
-        }
+        Some(o) => Some(parse_order_list(o)?),
     };
-    if let Some((ocol, odesc)) = &order {
-        // navigation needs an index on the column whose DIRECTION
-        // MATCHES (probed: ORDER BY x DESC took the descending twin,
-        // and fell to a sort when none existed)
-        let nav = by_col(ocol)
-            .into_iter()
-            .filter(|i| i.descending == *odesc)
+    if let Some(okeys) = &order {
+        // navigation needs an index the ORDER BY is a PREFIX of,
+        // directions agreeing (probed: DESC took the descending
+        // twin, a non-prefix order sorts)
+        let nav = indexes
+            .iter()
+            .filter(|i| i.navigates(okeys))
             .min_by_key(|i| i.id);
         if let Some(n) = nav {
             let predicate_ok = matched.is_empty()
@@ -404,6 +423,13 @@ fn plan_join(
     let outer = from_s.contains(" LEFT ")
         || from_s.contains(" RIGHT ")
         || from_s.contains(" FULL ");
+    // three or more streams: the chain planner (SQL order only)
+    if from_s.matches(" JOIN ").count() > 1 {
+        if outer {
+            return Err("outer joins in a chain unconverted".into());
+        }
+        return plan_chain(file, page_size, from_s, where_s, order_s);
+    }
     // split the two sides and the ON clause
     let (lhs, rest) = if let Some(j) = from_s.find(" JOIN ") {
         (from_s[..j].trim(), from_s[j + 6..].trim())
@@ -434,7 +460,7 @@ fn plan_join(
     let ridx = indexes_of(file, page_size, &rtab)?;
     let find = |ix: &[IndexInfo], c: &str| -> Option<IndexInfo> {
         ix.iter()
-            .filter(|i| i.column.eq_ignore_ascii_case(c) && !i.descending)
+            .filter(|i| i.matches(c) && !i.descending)
             .min_by_key(|i| i.id)
             .cloned()
     };
@@ -518,7 +544,7 @@ fn plan_join(
         let ocol = ocol.split('.').next_back().unwrap_or(&ocol).to_string();
         if let Some(i) = driver_idx
             .iter()
-            .filter(|i| i.column.eq_ignore_ascii_case(&ocol) && i.descending == odesc)
+            .filter(|i| i.navigates(&[(ocol.clone(), odesc)]))
             .min_by_key(|i| i.id)
         {
             drive_access = Access::Order(i.name.clone());
@@ -537,6 +563,116 @@ fn plan_join(
         combine: Combine::Join,
         sorted,
     })
+}
+
+/// Plan a chain of three or more INNER-joined streams. The engine
+/// keeps the SQL order when every stream after the first reaches its
+/// rows through a join key's index; when it must REORDER - which it
+/// does through EQUIVALENCE CLASSES, deriving `D.Z = A.ID` from
+/// `D.Z = B.UID` and `A.ID = B.UID` (probed) - this slice refuses
+/// rather than guessing at a derivation it has not converted.
+fn plan_chain(
+    file: &[u8],
+    page_size: usize,
+    from_s: &str,
+    where_s: Option<&str>,
+    order_s: Option<&str>,
+) -> Result<Plan, String> {
+    // split `A a JOIN B b ON <k> JOIN C c ON <k>` into stream/ON pairs
+    let mut parts: Vec<&str> = Vec::new();
+    let mut rest = from_s;
+    while let Some(j) = rest.find(" JOIN ") {
+        parts.push(rest[..j].trim());
+        rest = &rest[j + 6..];
+    }
+    parts.push(rest.trim());
+    let mut streams: Vec<(String, String)> = Vec::new(); // (table, plan name)
+    let mut ons: Vec<String> = Vec::new();
+    for (i, p) in parts.iter().enumerate() {
+        let (decl, on) = match p.find(" ON ") {
+            Some(o) => (p[..o].trim(), Some(p[o + 4..].trim().to_string())),
+            None => (p.trim(), None),
+        };
+        let (tab, name) = split_alias(decl)?;
+        streams.push((tab, name));
+        match (i, on) {
+            (0, None) => {}
+            (0, Some(_)) => return Err("the first stream carries an ON".into()),
+            (_, Some(o)) => ons.push(o),
+            (_, None) => return Err("a chained JOIN without ON".into()),
+        }
+    }
+    // each stream after the first must reach its rows through an
+    // index on ITS side of its own ON clause
+    let mut out: Vec<Stream> = Vec::new();
+    for (i, (tab, name)) in streams.iter().enumerate() {
+        let idx = indexes_of(file, page_size, tab)?;
+        if i == 0 {
+            // the driver: its own WHERE filter, or a navigable
+            // ORDER BY, else NATURAL
+            let mut access = Access::Natural;
+            if let Some(w) = where_s {
+                for part in split_kw(w, "AND") {
+                    let part = part.trim();
+                    let mut halves = part.split('=');
+                    let (lq, rq) = (
+                        halves.next().unwrap_or("").trim(),
+                        halves.next().unwrap_or("").trim(),
+                    );
+                    if rq.contains('.') && !rq.contains('\'') {
+                        continue; // a join predicate, not a filter
+                    }
+                    if let Some((q, col)) = lq.split_once('.') {
+                        if q.trim().eq_ignore_ascii_case(name.trim_matches('"')) {
+                            if let Some(m) =
+                                idx.iter().filter(|x| x.matches(col.trim())).min_by_key(|x| x.id)
+                            {
+                                access = Access::Index(vec![m.name.clone()]);
+                            }
+                        }
+                    }
+                }
+            }
+            out.push(Stream { name: name.clone(), access });
+            continue;
+        }
+        // this stream's key column, from its own ON clause
+        let on = &ons[i - 1];
+        let col = own_key_column(on, name)?;
+        let m = idx
+            .iter()
+            .filter(|x| x.matches(&col) && !x.descending)
+            .min_by_key(|x| x.id)
+            .ok_or_else(|| {
+                "a chain link whose key is unindexed needs the engine's \
+                 equivalence-class reordering - unconverted"
+                    .to_string()
+            })?;
+        out.push(Stream {
+            name: name.clone(),
+            access: Access::Index(vec![m.name.clone()]),
+        });
+    }
+    Ok(Plan {
+        streams: out,
+        combine: Combine::Join,
+        sorted: order_s.is_some(),
+    })
+}
+
+/// The column THIS stream contributes to an ON clause.
+fn own_key_column(on: &str, name: &str) -> Result<String, String> {
+    let bare = name.trim_matches('"').rsplit('.').next().unwrap_or(name).to_string();
+    let clause = split_kw(on, "AND").into_iter().next().ok_or("empty ON")?;
+    let (a, b) = clause.split_once('=').ok_or("ON is not an equality")?;
+    for side in [a, b] {
+        if let Some((q, c)) = side.trim().split_once('.') {
+            if q.trim().trim_matches('"').eq_ignore_ascii_case(&bare) {
+                return Ok(c.trim().trim_matches('"').to_string());
+            }
+        }
+    }
+    Err(format!("the ON clause {:?} does not name {}", on, bare))
 }
 
 /// `TABLE [alias]` - the plan names a stream by its ALIAS when the
@@ -693,21 +829,33 @@ fn parse_one_predicate(
     Ok(Pred { column: column.clone(), matchable: matchable && indexed(&column) })
 }
 
+/// The ORDER BY keys: `[BY] col [ASC|DESC] [, ...]`, each key's
+/// column stripped of any stream qualifier.
+fn parse_order_list(o: &str) -> Result<Vec<(String, bool)>, String> {
+    let rest = o.trim().strip_prefix("BY ").unwrap_or(o.trim()).trim();
+    let mut out = Vec::new();
+    for part in rest.split(',') {
+        let part = part.trim();
+        let (col, desc) = match part.rsplit_once(' ') {
+            Some((c, d)) if d.trim() == "DESC" => (c.trim(), true),
+            Some((c, d)) if d.trim() == "ASC" => (c.trim(), false),
+            _ => (part, false),
+        };
+        if col.contains(' ') || col.is_empty() {
+            return Err("ORDER BY expression unconverted".into());
+        }
+        let col = col.rsplit('.').next().unwrap_or(col);
+        out.push((col.to_string(), desc));
+    }
+    Ok(out)
+}
+
 fn parse_order(o: &str) -> Result<(String, bool), String> {
-    let o = o.trim();
-    if o.contains(',') {
-        return Err("multi-column ORDER BY unconverted".into());
+    let list = parse_order_list(o)?;
+    if list.len() != 1 {
+        return Err("multi-column ORDER BY unconverted here".into());
     }
-    let rest = o.strip_prefix("BY ").unwrap_or(o).trim();
-    let (col, desc) = match rest.rsplit_once(' ') {
-        Some((c, d)) if d.trim() == "DESC" => (c.trim(), true),
-        Some((c, d)) if d.trim() == "ASC" => (c.trim(), false),
-        _ => (rest, false),
-    };
-    if col.contains(' ') || col.is_empty() {
-        return Err("ORDER BY expression unconverted".into());
-    }
-    Ok((col.to_string(), desc))
+    Ok(list.into_iter().next().expect("length checked"))
 }
 
 /// Find a whole-word keyword (space-delimited), ignoring quoted text.

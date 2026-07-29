@@ -34,6 +34,8 @@ CREATE INDEX IDX_T_AMT ON T (AMT);
 CREATE INDEX IDX_T_NAME ON T (NAME);
 CREATE DESCENDING INDEX IDX_T_AMT_D ON T (AMT);
 CREATE INDEX IDX_U_UID ON U (UID);
+CREATE TABLE C (X INTEGER, Y INTEGER, Z INTEGER);
+CREATE INDEX IDX_C_XY ON C (X, Y);
 COMMIT;
 EOF
 
@@ -111,10 +113,28 @@ check "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID WHERE B.UA = 7"
 check "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID ORDER BY A.ID"
 check "SELECT A.ID FROM T A, U B WHERE A.ID = B.UID"
 
+# --- compound indexes: the leading-segment (prefix) rule ---------------
+check "SELECT X FROM C WHERE X = 1"
+check "SELECT X FROM C WHERE Y = 2"
+check "SELECT X FROM C WHERE X = 1 AND Y = 2"
+check "SELECT X FROM C WHERE X = 1 AND Z = 3"
+check "SELECT X FROM C WHERE X > 1 AND Y = 2"
+check "SELECT X FROM C ORDER BY X"
+check "SELECT X FROM C ORDER BY X, Y"
+check "SELECT X FROM C ORDER BY X, Z"
+check "SELECT X FROM C ORDER BY Y"
+check "SELECT X FROM C ORDER BY X DESC"
+
+# --- chains of three streams -------------------------------------------
+check "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID JOIN C D ON D.X = B.UID"
+check "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID JOIN C D ON D.X = B.UID WHERE A.AMT = 3"
+
 # --- outside the slice -------------------------------------------------
+# the engine reorders THIS one through an equivalence class
+# (D.Z = B.UID and A.ID = B.UID give D.Z = A.ID) - unconverted
+refuse "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID JOIN C D ON D.Z = B.UID"
 refuse "SELECT ID FROM T UNION ALL SELECT UID FROM U"
 refuse "SELECT ID FROM T WHERE ID IN (SELECT UID FROM U)"
-refuse "SELECT ID FROM T ORDER BY ID, AMT"
-refuse "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID JOIN T C ON C.ID = B.UID"
+refuse "SELECT A.ID FROM T A LEFT JOIN U B ON A.ID = B.UID LEFT JOIN C D ON D.X = B.UID"
 
 exit $fail

@@ -13,6 +13,31 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-opt slice 3: compound indexes and three-stream chains
+
+### Converted
+- **Compound-index matching, by the LEADING-SEGMENT rule**: an
+  `(X, Y)` index serves a predicate on X (alone or with anything
+  else) but NOT one on Y alone — probed, and the same prefix rule
+  governs navigation: `ORDER BY X` and `ORDER BY X, Y` both ride
+  the index, while `ORDER BY X, Z` and `ORDER BY Y` sort. Multi-
+  column ORDER BY is therefore no longer refused outright — it is
+  navigable exactly when it is an index PREFIX with matching
+  directions.
+- **Chains of three or more streams**: every stream after the first
+  reaches its rows through an index on ITS side of ITS OWN ON
+  clause, the driver keeping its filter/order access.
+
+### Guarded — with the reason named
+- The engine REORDERS a chain whose link is unindexed by deriving a
+  new equality through an EQUIVALENCE CLASS (`D.Z = B.UID` and
+  `A.ID = B.UID` give `D.Z = A.ID`, and it drove from D). This
+  slice refuses that shape rather than guessing at a derivation it
+  has not converted — the gate pins the refusal beside the engine's
+  plan so the frontier is documented rather than implied. Outer
+  joins inside chains likewise. Gate: `qa/opt-plans.sh` 42 → 54
+  checks; 281 workspace tests.
+
 ## 2026-07-29 — fire-crab-opt slice 2: join plans, the swap, and the hash
 
 ### Converted
