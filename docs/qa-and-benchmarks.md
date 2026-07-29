@@ -3910,6 +3910,22 @@ differential.
 
 ## The crash matrix: careful writes judged by the engine
 
+(Slice 2 grew the matrix to three workloads. The INDEXED inserts
+maintain the B-tree per row, and the data-before-btree edge - an
+index entry names a record number - became explicit law after slice
+1's matrix had satisfied it by page-number luck alone: the flush
+walks dirty pages in ascending page order, and the btree page merely
+HAPPENED to number higher than the data pages. The DELETE workload
+shows the TIP-last law's other face: every interrupted prefix
+answers the original rows, the full sequence none, and the naive
+order makes rows vanish early - a premature commit flip. The gate
+also caught a WORKLOAD invalidity: with an index on the table, an
+insert that skips index maintenance leaves an inconsistent END
+state - gfix flagged the full prefix, and the gate now runs two
+scratch databases with the finding documented inline.)
+
+
+
 Firebird's crash safety has no log to replay - it is the ORDER of page
 writes, held by cch.cpp's precedence graph. fire-crab-cch converts the
 graph (CCH_precedence's edges, write_buffer's recursive drain,

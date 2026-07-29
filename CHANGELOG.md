@@ -13,6 +13,36 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-cch slice 2: the matrix learns indexes and deletes
+
+### Converted
+- **The indexed workload**: the crash matrix's inserts now maintain
+  T's B-tree per row (the same `btw::insert_index_entry` path the
+  wire server drives), so btree pages join the careful-write
+  ensemble. The slice-1 matrix had ordered btree-after-data by
+  PAGE-NUMBER LUCK; the edge is now law — an index entry names a
+  record NUMBER, so the data page holding the record precedes the
+  btree page holding the entry. Order: header → data → pip →
+  pointer → btree → tip, every prefix engine-valid.
+- **The delete workload**: version-chain stubs over the same pages —
+  header → data → tip, three writes, and the TIP-last law shows its
+  other face: every interrupted prefix answers the ORIGINAL rows,
+  the full sequence zero, and the naive order makes rows VANISH
+  EARLY (a premature commit flip). The file is never wrong, only
+  ever behind — in both directions.
+- **The gate caught a workload invalidity**: with an index on the
+  table, the plain (un-indexed) insert workload's own END state is
+  inconsistent — gfix flagged missing index entries at the full
+  prefix. The gate now runs two scratch databases, and the finding
+  is documented in it: an insert that skips index maintenance is
+  not a valid operation on an indexed table.
+
+### Guarded
+- Page DEALLOCATION (the pip-freed-last chain) waits for a
+  fire-crab operation that frees pages (sweep). Gate:
+  `qa/cch-crash-harness.sh` — 3 workloads × (all-prefixes-valid +
+  naive teeth); 267 workspace tests.
+
 ## 2026-07-29 — fire-crab-dsql slice 45: recursive ctes
 
 ### Converted

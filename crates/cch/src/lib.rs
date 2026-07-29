@@ -309,6 +309,15 @@ pub fn careful_plan(before: &[u8], after: &[u8], page_size: usize) -> Cache {
             cache.precedence(r, b);
         }
     }
+    // an index entry names a record NUMBER: the data page holding
+    // the record precedes the btree page holding the entry (the
+    // slice-1 matrix passed this by page-number luck; the edge makes
+    // it law)
+    for &b in &btree {
+        for &d in &data {
+            cache.precedence(b, d);
+        }
+    }
     for &d in &data {
         for &b in &blob {
             cache.precedence(d, b);

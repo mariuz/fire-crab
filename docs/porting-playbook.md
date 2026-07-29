@@ -583,6 +583,13 @@ them.
   semantics are also OBSERVABLE (table reservations expose lock
   modes through SQL), hold the same cells against the live system
   from both directions.
+- **An ordering that holds by ACCIDENT is a bug that has not
+  happened yet.** The first crash matrix satisfied data-before-btree
+  because the btree page happened to number higher and the flush
+  walks ascending; the edge became explicit only when the indexed
+  workload existed to need it. When a property matters, find the
+  code that GUARANTEES it - if only the data guarantees it, write
+  the edge.
 - **A safety property is a MATRIX, not a happy path.** Careful-write
   ordering was proved by materializing EVERY write prefix and letting
   the engine's validator judge each one - and by running the same
