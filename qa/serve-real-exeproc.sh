@@ -45,6 +45,7 @@ CREATE PROCEDURE PW4 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT ID, SU
 CREATE PROCEDURE PW5 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM U2 WHERE U2.UID = T.ID) INTO :R1 DO SUSPEND; END^
 CREATE PROCEDURE PW6 (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE AMT > :P1 ORDER BY ID INTO :R1 DO SUSPEND; END^
 CREATE PROCEDURE PW7 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT A.ID, B.UA FROM T A FULL JOIN U2 B ON A.ID = B.UID ORDER BY A.ID INTO :R1, :R2 DO SUSPEND; END^
+CREATE PROCEDURE PW8 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT AMT / (ID - 2) FROM T WHERE ID = 2 INTO :R1 DO SUSPEND; END^
 SET TERM ; ^
 COMMIT;
 EOF
@@ -67,8 +68,9 @@ node_once() {
         if(e){console.log("CONN_ERR");process.exit(1);}
         db.query(process.env.FC_Q,(e2,r)=>{
           if(e2){console.log("ERR "+(e2.message||"").split("\n")[0]);db.detach();process.exit(0);}
-          if(!r||r.length===0)console.log("<no rows>");
-          else for(const row of r)
+          const rows=Array.isArray(r)?r:(r?[r]:[]);
+          if(rows.length===0)console.log("<no rows>");
+          else for(const row of rows)
             console.log(Object.values(row).map(v=>v===null?"<null>":String(v).replace(/\s+$/,"")).join("|"));
           db.detach();process.exit(0);
         });
@@ -111,5 +113,27 @@ check "ROWS BETWEEN frame over the wire"        "SELECT * FROM PW4"
 check "correlated EXISTS over the wire"         "SELECT * FROM PW5"
 check "parameterized procedure over the wire"   "SELECT * FROM PW6(5)"
 check "FULL JOIN over the wire"                 "SELECT * FROM PW7"
+
+# EXECUTE PROCEDURE, BLR-first: a selectable body answers its FIRST
+# suspended row (the engine runs to the first SUSPEND)
+check "EXECUTE PROCEDURE first-row semantics"   "EXECUTE PROCEDURE PW1"
+check "EXECUTE PROCEDURE with a parameter"      "EXECUTE PROCEDURE PW6(5)"
+
+# a RUNTIME error in the executed body is a REAL SQL error - both
+# sides must fail, never a silent wrong answer
+got=$(node_run "SELECT * FROM PW8")
+eng=$("$ISQL" -q -b -user "$U" -pas "$P" "$DB" 2>&1 <<'SQL' | tr -s ' 
+' ' '
+SET HEADING OFF;
+SELECT * FROM PW8;
+SQL
+)
+case "$got" in
+    ERR*) case "$eng" in
+        *"zero"*|*"failed"*) echo "OK   divide-by-zero surfaces as an error on BOTH sides" ;;
+        *) echo "DIFF engine did not error on PW8: [$eng]"; fail=1 ;;
+    esac ;;
+    *) echo "DIFF fcwire answered rows for a divide-by-zero body: [$got]"; fail=1 ;;
+esac
 
 exit $fail

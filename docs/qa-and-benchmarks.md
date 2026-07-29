@@ -3981,6 +3981,16 @@ windows, and the rule now carries that provenance in its comment.
 
 ## The execution differential: running the bytes the compiler matches
 
+(Slice 14 finished the adoption: EXECUTE PROCEDURE serves BLR-first
+at BOTH wire sites - op_execute and op_execute2, the OO clients'
+path, found the honest way when the gate's node call died on it -
+with the engine's first-suspended-row semantics; and the BLR path's
+RUNTIME errors now surface as the engine's own vectors instead of
+falling back: a divide-by-zero body errors on both sides of the
+gate, because an interpreter that answered rows there would mask
+the engine's behavior. One helper lesson: node-firebird returns an
+OBJECT for EXECUTE PROCEDURE and an array for SELECT.)
+
 (Slice 13 closed the loop into PRODUCTION: the wire server now
 serves SELECT FROM <procedure> BLR-first through fire-crab-exe -
 the stored bytes the compiler matches, executed for real clients -

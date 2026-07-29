@@ -13,6 +13,32 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-exe slice 14: EXECUTE PROCEDURE adopted, runtime errors surfaced
+
+### Converted
+- **EXECUTE PROCEDURE, BLR-first** — at BOTH wire sites: the
+  OP_EXECUTE arm isql drives and the op_execute2 arm the OO clients
+  drive (the second was found the honest way: the first gate run's
+  node call died on it). Semantics are the engine's: a selectable
+  body answers its FIRST suspended row, a non-suspending one its
+  final output state — the executor runs the whole (read-only) body
+  and the wire layer picks the row, observationally identical.
+- **Runtime errors surface as SQL errors.** The BLR path now
+  distinguishes three outcomes: OUTSIDE the surface (silent
+  fallback to the interpreter, as before), ROWS, and RUNTIME error
+  — divide-by-zero and overflow ship the engine's own vectors to
+  the client instead of falling back. A body that fails must FAIL:
+  an interpreter that answered rows there would mask the engine's
+  behavior. The gate holds `SELECT * FROM PW8` (a divide-by-zero
+  body) erroring on BOTH sides.
+- Gate helper fix with a lesson attached: node-firebird returns an
+  OBJECT for EXECUTE PROCEDURE, an array for SELECT — the gate's
+  row printer assumed arrays and manufactured CONN_ERR.
+
+### Guarded
+- Gate: `qa/serve-real-exeproc.sh` 7 → 10 checks; regressions psql
+  55, modifiers 41, nofallback 54; 270 workspace tests.
+
 ## 2026-07-29 — fire-crab-exe slice 13: the wire adoption
 
 ### Converted

@@ -17506,42 +17506,88 @@ fn exec_psql_stmt(
 /// same rows where they overlap (both engine-gated), but the BLR
 /// path also serves shapes the interpreter never learned - windows,
 /// frames, quantified subqueries.
+enum BlrProcOutcome {
+    /// outside fire-crab-exe's surface: the source interpreter runs
+    Outside,
+    /// executed: the suspended rows and the FINAL send's values (the
+    /// output-parameter state at completion - what a non-suspending
+    /// EXECUTE PROCEDURE answers)
+    Rows(Vec<Vec<Value>>, Vec<Value>),
+    /// the body RAN and failed with a genuine runtime error - a real
+    /// SQL error to the client, never a silent fallback (an
+    /// interpreter that answered rows here would mask the engine's
+    /// own behavior)
+    Runtime(EvalErr),
+}
+
 fn try_procedure_blr(
     database: &Option<Database>,
     name: &str,
     args: &[Value],
-) -> Option<Vec<Vec<Value>>> {
-    let db = database.as_ref()?;
-    let blr =
-        fire_crab_exe::procedure_blr(&db.bytes, db.page_size, name).ok()?;
-    let req = fire_crab_exe::parse(&blr).ok()?;
+) -> BlrProcOutcome {
+    let Some(db) = database.as_ref() else {
+        return BlrProcOutcome::Outside;
+    };
+    let Ok(blr) = fire_crab_exe::procedure_blr(&db.bytes, db.page_size, name) else {
+        return BlrProcOutcome::Outside;
+    };
+    let Ok(req) = fire_crab_exe::parse(&blr) else {
+        return BlrProcOutcome::Outside;
+    };
     let sends =
-        fire_crab_exe::bind_and_execute(&db.bytes, db.page_size, &req, args).ok()?;
+        match fire_crab_exe::bind_and_execute(&db.bytes, db.page_size, &req, args) {
+            Ok(s) => s,
+            Err(e) => {
+                // the runtime classes surface with the engine's own
+                // vectors; anything else falls back conservatively
+                return match e.as_str() {
+                    "integer divide by zero" => {
+                        BlrProcOutcome::Runtime(EvalErr::DivideByZero)
+                    }
+                    "integer overflow" => {
+                        BlrProcOutcome::Runtime(EvalErr::IntegerOverflow)
+                    }
+                    _ => BlrProcOutcome::Outside,
+                };
+            }
+        };
     // message 1: (value, null-flag) pairs + the EOF short; a row is
-    // a send with EOF = 1
-    let out_slots = req.messages.iter().find(|(n, _)| *n == 1).map(|(_, s)| s.len())?;
+    // a send with EOF = 1, the EOF = 0 send carries the final state
+    let Some(out_slots) =
+        req.messages.iter().find(|(n, _)| *n == 1).map(|(_, s)| s.len())
+    else {
+        return BlrProcOutcome::Outside;
+    };
     if out_slots < 3 || out_slots % 2 == 0 {
-        return None;
+        return BlrProcOutcome::Outside;
     }
     let outputs = (out_slots - 1) / 2;
+    let decode = |buf: &[Value]| -> Vec<Value> {
+        (0..outputs)
+            .map(|i| {
+                let null =
+                    matches!(buf.get(2 * i + 1), Some(Value::Int(f)) if *f != 0);
+                if null {
+                    Value::Null
+                } else {
+                    buf.get(2 * i).cloned().unwrap_or(Value::Null)
+                }
+            })
+            .collect()
+    };
     let mut rows = Vec::new();
+    let mut finals = vec![Value::Null; outputs];
     for (msg, buf) in sends {
-        if msg != 1 || !matches!(buf.last(), Some(Value::Int(1))) {
+        if msg != 1 {
             continue;
         }
-        let mut row = Vec::with_capacity(outputs);
-        for i in 0..outputs {
-            let null =
-                matches!(buf.get(2 * i + 1), Some(Value::Int(f)) if *f != 0);
-            row.push(if null {
-                Value::Null
-            } else {
-                buf.get(2 * i).cloned().unwrap_or(Value::Null)
-            });
+        if matches!(buf.last(), Some(Value::Int(1))) {
+            rows.push(decode(&buf));
+        } else {
+            finals = decode(&buf);
         }
-        rows.push(row);
     }
-    Some(rows)
+    BlrProcOutcome::Rows(rows, finals)
 }
 
 fn run_procedure(
@@ -19189,22 +19235,30 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     let ctx = SessionCtx { user, attach_id };
                     // BLR-FIRST: the compiled bytes when they parse
                     // in fire-crab-exe's surface, the source
-                    // interpreter otherwise
-                    if let Some(suspended) =
-                        try_procedure_blr(&database, &pname, &pargs)
-                    {
-                        let rows: Vec<Vec<Value>> = suspended
-                            .iter()
-                            .map(|r| {
-                                picks
-                                    .iter()
-                                    .map(|p| r.get(*p).cloned().unwrap_or(Value::Null))
-                                    .collect()
-                            })
-                            .collect();
-                        plan = Plan::ProcRows { cols: pcols, rows };
-                        respond(&mut s, &mut enc, TX_HANDLE)?;
-                        continue;
+                    // interpreter otherwise - and a RUNTIME error
+                    // from the executed body is a real SQL error
+                    match try_procedure_blr(&database, &pname, &pargs) {
+                        BlrProcOutcome::Rows(suspended, _finals) => {
+                            let rows: Vec<Vec<Value>> = suspended
+                                .iter()
+                                .map(|r| {
+                                    picks
+                                        .iter()
+                                        .map(|p| {
+                                            r.get(*p).cloned().unwrap_or(Value::Null)
+                                        })
+                                        .collect()
+                                })
+                                .collect();
+                            plan = Plan::ProcRows { cols: pcols, rows };
+                            respond(&mut s, &mut enc, TX_HANDLE)?;
+                            continue;
+                        }
+                        BlrProcOutcome::Runtime(e) => {
+                            respond_eval_error(&mut s, &mut enc, &e)?;
+                            continue;
+                        }
+                        BlrProcOutcome::Outside => {}
                     }
                     match run_procedure(&mut database, &pname, &pargs, &ctx) {
                         Ok((_, suspended)) => {
@@ -19240,6 +19294,24 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         _ => unreachable!(),
                     };
                     let ctx = SessionCtx { user, attach_id };
+                    // BLR-FIRST: EXECUTE PROCEDURE answers the FIRST
+                    // suspended row of a selectable body (the engine
+                    // runs to the first SUSPEND), or the final
+                    // output state of a non-suspending one
+                    match try_procedure_blr(&database, &pname, &pargs) {
+                        BlrProcOutcome::Rows(rows, finals) => {
+                            let values =
+                                rows.into_iter().next().unwrap_or(finals);
+                            plan = Plan::ProcCall { cols: pcols, values };
+                            respond(&mut s, &mut enc, TX_HANDLE)?;
+                            continue;
+                        }
+                        BlrProcOutcome::Runtime(e) => {
+                            respond_eval_error(&mut s, &mut enc, &e)?;
+                            continue;
+                        }
+                        BlrProcOutcome::Outside => {}
+                    }
                     match run_procedure(&mut database, &pname, &pargs, &ctx) {
                         Ok((values, _rows)) => {
                             plan = Plan::ProcCall { cols: pcols, values };
@@ -19658,6 +19730,35 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         _ => unreachable!(),
                     };
                     let ctx = SessionCtx { user, attach_id };
+                    // BLR-FIRST here too - op_execute2 is the path
+                    // the OO clients drive EXECUTE PROCEDURE through
+                    match try_procedure_blr(&database, &pname, &pargs) {
+                        BlrProcOutcome::Rows(rows, finals) => {
+                            let values =
+                                rows.into_iter().next().unwrap_or(finals);
+                            let mut w = W::default();
+                            if pcols.is_empty() {
+                                w.int(OP_SQL_RESPONSE).int(0);
+                            } else {
+                                w.int(OP_SQL_RESPONSE).int(1);
+                                encode_row_body(&mut w, &pcols, &values);
+                            }
+                            w.int(OP_RESPONSE)
+                                .int(TX_HANDLE)
+                                .int(0)
+                                .int(0)
+                                .int(0)
+                                .int(0);
+                            w.send(&mut s, &mut enc)?;
+                            plan = Plan::ProcCall { cols: pcols, values };
+                            continue;
+                        }
+                        BlrProcOutcome::Runtime(e) => {
+                            respond_eval_error(&mut s, &mut enc, &e)?;
+                            continue;
+                        }
+                        BlrProcOutcome::Outside => {}
+                    }
                     match run_procedure(&mut database, &pname, &pargs, &ctx) {
                         Ok((values, _rows)) => {
                             if std::env::var("FC_SRV_TRACE").is_ok() {
