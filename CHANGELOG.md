@@ -13,6 +13,32 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-exe slice 4: outer joins, derived tables
+
+### Converted
+- **Outer joins**: `blr_join_type` (80) with operands left/right/
+  full (1/2/3, probed after a wrong first guess — the numbers live
+  in blr.h, not intuition). A preserved-side row with no ON match
+  emits once with the other side's frame an EMPTY row — and the
+  binding model makes null-padding free: a field read off an empty
+  frame answers NULL through the ordinary lookup, no special record
+  needed. The anti-join (`WHERE B.UA IS NULL` over the padded side)
+  and `COUNT(*)` over it hold against the engine.
+- **Derived tables**: a nested rse standing in the stream slot. Its
+  bindings pass straight through — the inner stream's context IS
+  what outer references name — so the feature is one parser arm and
+  ZERO executor code. Outer WHERE, ORDER BY and aggregates over
+  derived tables compose as they always did.
+
+### Guarded
+- Windows, 3+-stream join chains (nested rs_stream), outer joins
+  over more than two streams, explicit PLANs (blr_plan awaits the
+  index-retrieval slice). One check swapped when phase A refused:
+  DISTINCT-over-derived is a dsql-side guard, so its byte-pin
+  cannot hold until the dsql crate flips it — the gate's two-arrow
+  design surfaces cross-crate frontiers exactly. Gate: 41 → 49
+  checks. 261 workspace tests.
+
 ## 2026-07-29 — fire-crab-exe slice 3: expressions, joins, DISTINCT
 
 ### Converted

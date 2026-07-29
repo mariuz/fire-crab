@@ -4021,6 +4021,24 @@ are runtime errors rather than wrong numbers - and DISTINCT
 (blr_project) dedupes sort-based with NULL grouping with NULL,
 where the engine's null-first output order held unprompted.
 
+### Slice 4: null-padding for free, and a frontier the gate mapped
+
+Outer joins are where executors usually grow a special "null record".
+The binding model made that unnecessary: a preserved-side row with no
+match emits with the other side's frame simply EMPTY, and the
+ordinary field lookup answers NULL for anything read off it - the
+anti-join (WHERE padded-side IS NULL) worked the moment LEFT joins
+parsed. Derived tables were cheaper still: a nested rse in the
+stream slot whose bindings pass straight through - one parser arm,
+zero executor code, and every outer clause composes unchanged.
+
+The gate's two-arrow design also mapped a cross-crate frontier this
+slice: DISTINCT over a derived table executes fine, but fcdsql still
+GUARDS that combination, so phase A (recompile-and-diff the stored
+bytes) refuses before phase B can run. The check was swapped for a
+pinnable shape - and the frontier is now named: when the dsql crate
+flips its guard, the executor check comes back with it.
+
 ## Query surface: what the server answers, and what it refuses
 
 Everything below is verified by a differential gate under `qa/` — the

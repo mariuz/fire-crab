@@ -77,7 +77,12 @@ mod blr {
     pub const AGG_TOTAL: u8 = 86;
     pub const AGG_AVERAGE: u8 = 87;
     pub const AGG_COUNT2: u8 = 93;
+    pub const JOIN_TYPE: u8 = 80;
     pub const RS_STREAM: u8 = 119;
+    // blr_join_type operands (blr.h): inner 0, left 1, right 2, full 3
+    pub const LEFT: u8 = 1;
+    pub const RIGHT: u8 = 2;
+    pub const FULL: u8 = 3;
     pub const SINGULAR: u8 = 127;
     pub const RELATION2: u8 = 146;
     pub const SKIP: u8 = 175;
@@ -181,15 +186,27 @@ pub struct JoinStream {
     pub context: u8,
 }
 
+/// A join's kind - blr_join_type's operand; INNER when the
+/// sub-clause is absent.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum JoinKind {
+    Inner,
+    Left,
+    Right,
+    Full,
+}
+
 /// The stream slot of an rse: a plain relation scan, an aggregate
-/// over an inner rse, or an inner join (blr_rs_stream) - the
-/// NestedLoopJoin of recsrc/, streams left to right with the ON
-/// boolean over the joined frames.
+/// over an inner rse, a join (blr_rs_stream) - the NestedLoopJoin /
+/// FullOuterJoin of recsrc/ - or a DERIVED TABLE: a nested rse
+/// standing where a stream would, its bindings passing through
+/// (the inner stream's context IS what outer references name).
 #[derive(Clone, Debug)]
 pub enum Stream {
     Relation { name: String, context: u8 },
     Aggregate(Aggregate),
-    Join { streams: Vec<JoinStream>, on: Option<Bool> },
+    Join { streams: Vec<JoinStream>, kind: JoinKind, on: Option<Bool> },
+    Derived(Box<Rse>),
 }
 
 /// The record-selection expression of a blr_for: one stream, the
@@ -407,6 +424,12 @@ impl<'a> P<'a> {
                 let context = self.u8()?;
                 Stream::Relation { name, context }
             }
+            blr::RELATION2 => {
+                let name = self.counted_name()?;
+                let _alias = self.counted_name()?;
+                let context = self.u8()?;
+                Stream::Relation { name, context }
+            }
             blr::RS_STREAM => {
                 // an inner join: stream count, the streams (plain or
                 // aliased relations), an optional ON boolean, its end
@@ -431,16 +454,34 @@ impl<'a> P<'a> {
                     }
                 }
                 let mut on = None;
+                let mut kind = JoinKind::Inner;
                 loop {
                     match self.u8()? {
                         blr::BOOLEAN => on = Some(self.boolean()?),
+                        blr::JOIN_TYPE => {
+                            kind = match self.u8()? {
+                                blr::LEFT => JoinKind::Left,
+                                blr::RIGHT => JoinKind::Right,
+                                blr::FULL => JoinKind::Full,
+                                other => {
+                                    return Err(format!("join type {} unconverted", other))
+                                }
+                            };
+                        }
                         blr::END => break,
                         other => {
                             return Err(format!("join clause {} unconverted", other))
                         }
                     }
                 }
-                Stream::Join { streams, on }
+                if kind != JoinKind::Inner && streams.len() != 2 {
+                    return Err("outer join over more than two streams unconverted".into());
+                }
+                Stream::Join { streams, kind, on }
+            }
+            blr::RSE => {
+                // a derived table: an rse standing in the stream slot
+                Stream::Derived(Box::new(self.rse_body()?))
             }
             blr::AGGREGATE => {
                 let context = self.u8()?;
@@ -835,41 +876,94 @@ impl<'a> Exec<'a> {
                     vec![StreamFrame { context: agg.context, relation: None, row }]
                 })
                 .collect(),
-            Stream::Join { streams, on } => {
-                // NestedLoopJoin: the cartesian product left to
-                // right, the ON boolean keeping TRUE combinations
-                let mut acc: Vec<Vec<StreamFrame>> = vec![Vec::new()];
-                for js in streams {
-                    let rows = self.scan_relation(&js.name)?;
-                    let mut next = Vec::new();
-                    for b in &acc {
-                        for row in &rows {
-                            let mut nb = b.clone();
-                            nb.push(StreamFrame {
-                                context: js.context,
-                                relation: Some(js.name.clone()),
-                                row: row.clone(),
-                            });
-                            next.push(nb);
+            Stream::Join { streams, kind, on } => {
+                match kind {
+                    JoinKind::Inner => {
+                        // NestedLoopJoin: the cartesian product left
+                        // to right, the ON boolean keeping TRUE
+                        let mut acc: Vec<Vec<StreamFrame>> = vec![Vec::new()];
+                        for js in streams {
+                            let rows = self.scan_relation(&js.name)?;
+                            let mut next = Vec::new();
+                            for b in &acc {
+                                for row in &rows {
+                                    let mut nb = b.clone();
+                                    nb.push(StreamFrame {
+                                        context: js.context,
+                                        relation: Some(js.name.clone()),
+                                        row: row.clone(),
+                                    });
+                                    next.push(nb);
+                                }
+                            }
+                            acc = next;
                         }
-                    }
-                    acc = next;
-                }
-                match on {
-                    None => acc,
-                    Some(b) => {
-                        let mut kept = Vec::new();
-                        for binding in acc {
-                            if self.with_binding(&binding, |ex| ex.bool_eval(b))?
-                                == Some(true)
-                            {
-                                kept.push(binding);
+                        match on {
+                            None => acc,
+                            Some(b) => {
+                                let mut kept = Vec::new();
+                                for binding in acc {
+                                    if self
+                                        .with_binding(&binding, |ex| ex.bool_eval(b))?
+                                        == Some(true)
+                                    {
+                                        kept.push(binding);
+                                    }
+                                }
+                                kept
                             }
                         }
-                        kept
+                    }
+                    // outer joins: preserved-side rows with no ON
+                    // match emit once, the other side's frame an
+                    // EMPTY row - every field of it reads NULL (the
+                    // engine's null-padded record)
+                    JoinKind::Left | JoinKind::Right | JoinKind::Full => {
+                        let (a, b_) = (&streams[0], &streams[1]);
+                        let rows_a = self.scan_relation(&a.name)?;
+                        let rows_b = self.scan_relation(&b_.name)?;
+                        let frame = |js: &JoinStream, row: Vec<Value>| StreamFrame {
+                            context: js.context,
+                            relation: Some(js.name.clone()),
+                            row,
+                        };
+                        let mut out = Vec::new();
+                        let mut b_matched = vec![false; rows_b.len()];
+                        for ra in &rows_a {
+                            let mut hit = false;
+                            for (bi, rb) in rows_b.iter().enumerate() {
+                                let binding =
+                                    vec![frame(a, ra.clone()), frame(b_, rb.clone())];
+                                let keep = match on {
+                                    None => Some(true),
+                                    Some(cond) => self
+                                        .with_binding(&binding, |ex| ex.bool_eval(cond))?,
+                                };
+                                if keep == Some(true) {
+                                    hit = true;
+                                    b_matched[bi] = true;
+                                    out.push(binding);
+                                }
+                            }
+                            if !hit && matches!(kind, JoinKind::Left | JoinKind::Full) {
+                                out.push(vec![frame(a, ra.clone()), frame(b_, Vec::new())]);
+                            }
+                        }
+                        if matches!(kind, JoinKind::Right | JoinKind::Full) {
+                            for (bi, rb) in rows_b.iter().enumerate() {
+                                if !b_matched[bi] {
+                                    out.push(vec![
+                                        frame(a, Vec::new()),
+                                        frame(b_, rb.clone()),
+                                    ]);
+                                }
+                            }
+                        }
+                        out
                     }
                 }
             }
+            Stream::Derived(inner) => self.open_rse(inner)?,
         };
         // FilteredStream - over an aggregate this is HAVING
         if let Some(b) = &rse.boolean {
