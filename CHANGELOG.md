@@ -13,6 +13,67 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-pio slice 1: the floor, and the last planned row
+
+### Converted
+- **A NEW CRATE for `src/jrd/os/posix/unix.cpp`** — the `PIO_*` layer
+  every page read and write passes through. Very little code, and
+  everything above it assumes all of it:
+  - `offset = page * page_size` (`seek_file`), ABSOLUTE, with no
+    rebasing — because **Firebird 6 has no multi-file databases**.
+    `jrd_file` is one descriptor: no chain, no `fil_min_page`, no
+    `fil_max_page`, and `PageSpace` holds a single file. A converter
+    carrying an older engine's file chain would subtract a base that no
+    longer exists and place every page in the wrong spot. Converting the
+    current engine means converting its absence.
+  - `PIO_get_number_of_pages` = `file_size / page_size`, INTEGER
+    division: a trailing partial page is invisible, not rounded up and
+    not an error. Which is why a healthy database's length is a whole
+    number of pages — a check fire-crab adds, since the division alone
+    hides a truncation.
+  - `openFile`'s three flags, and the finding that **Forced Writes is an
+    OPEN MODE**: `SYNC` in the open flags, decided from
+    `hdr_force_write` (header offset 22), not an fsync after each write.
+    That is why changing it at runtime reopens the file, and why
+    `PIO_force_write` FLUSHES FIRST when switching it on — the pages
+    already in the OS cache were written under the old promise.
+  - `PIO_extend`'s fallocate arithmetic, and `PIO_init_data`'s floor: it
+    never writes below PAGE 8, which holds the header, the first PIP and
+    the first pointer page. fire-crab refuses such a request instead of
+    silently returning zero.
+- **The lock law, which explains this project's own foundations.**
+  `lockDatabaseFile` flocks the whole file — `LOCK_EX` when
+  `getServerMode() == MODE_SUPER` — and reports a busy lock as
+  `isc_already_opened`, the *"Database already opened with engine
+  instance"* error this repository has now hit twice. fire-crab's readers
+  take NO lock, which is exactly what lets every differential here read a
+  database the server holds open; the gate proves both halves at once
+  (BUSY while attached, and a successful read at the same moment).
+
+### Guarded
+- A page past the end of the file is an ERROR, never a zero-filled
+  buffer. Zeros for a page that does not exist are indistinguishable,
+  one layer up, from a page that legitimately holds zeros.
+- O_DIRECT is reported but not applied: it requires every buffer, offset
+  and length aligned to the device block size, which this reader does not
+  guarantee. Stating the law without obeying it beats pretending.
+- Shadowing, nbackup difference files, raw-device page counts (an ioctl,
+  not `stat`) and the Windows half of the layer stay unconverted.
+
+### Fixed (in the gate, before it could lie)
+- The growth phase inserted its rows with a 4000-level recursive CTE.
+  Firebird caps recursion at 1024, so the insert failed silently and the
+  gate then "verified" a page count that had not moved — three identical
+  checks wearing different labels. Now the generator cross-joins a
+  500-level recursion, and the gate ASSERTS that the file grew
+  (313 → 401 pages for 12 000 rows) before trusting the comparisons.
+
+### Milestone
+- With this row, **every subsystem in `docs/subsystem-map.md` has a
+  converted first slice with a live differential**. That is breadth, not
+  completeness: what remains is depth inside each row, and the frontier
+  paragraph on each row says what.
+
 ## 2026-07-29 — fire-crab-svc slice 1: the engine's own fbsvcmgr, on both sides
 
 ### Converted

@@ -757,6 +757,48 @@ them.
   every run. A frozen hex constant tests what the tool sent the day you
   copied it; a re-derived one tests what it sends today.
 
+## The I/O floor is small, so cover all of it — and check the checks
+
+- **Convert the ABSENCE of a feature too.** Firebird once had multi-file
+  databases with a starting page per file; Firebird 6 does not, and its
+  `seek_file` is a bare `page * page_size`. A converter working from an
+  older book (or from memory) would subtract a base that no longer
+  exists and place every page slightly wrong. Read the CURRENT struct:
+  if there is no `fil_next` and no `fil_min_page`, the law is simpler
+  than you remember.
+- **Find the counter the engine publishes about itself.** For page
+  counting it is `MON$DATABASE.MON$PAGES`; for page identity it is
+  `RDB$PAGES`, which records a type per page. An engine that publishes
+  its own accounting has handed you the differential — you do not need to
+  invent one.
+- **Every positional formula needs a shifted control.** "84 of 84 page
+  types matched" means nothing until you also show that reading one page
+  LATER matches 0 of 84. Without the control you have measured that the
+  file is self-consistent, not that your arithmetic is right.
+- **Integer division hides damage; check the remainder.** The engine
+  computes pages as `size / page_size` and never asks whether it divided
+  evenly. A healthy file always does, so testing the remainder catches a
+  truncation the engine's own arithmetic would sail past — and a gate can
+  prove that check works by truncating a copy half a page short.
+- **A flag may be an OPEN MODE, not a policy.** "Forced writes" sounds
+  like an fsync per write and is actually `O_DSYNC` at open time, decided
+  from a bit on the header page. That is why turning it on reopens the
+  file and flushes first. Follow the flag from where it is STORED to
+  where it is USED, and gate the whole chain in one check: the stored
+  bit, your derived mode, and what the vendor's tool prints.
+- **Know which lock you are not taking.** The engine flocks a database
+  file exclusively; fire-crab's readers take no lock, which is the only
+  reason they can read a live database. That is a legitimate design
+  choice, but write it down and test both halves - the lock is visible
+  (BUSY) and the read still works - because the cost is real: a lock-free
+  read can catch a page mid-write, and every gate that reads a live file
+  then needs its own freshness signal.
+- **A vacuous check is worse than a missing one.** A growth test whose
+  inserts silently failed (a recursive CTE past the engine's 1024-level
+  cap) reported three identical page counts as three passes. If a phase
+  is supposed to CHANGE something, assert that it changed before you
+  trust anything measured around it.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

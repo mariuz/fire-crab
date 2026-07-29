@@ -6020,6 +6020,75 @@ supported" against fcwire and real statistics against the real server. That chec
 exists because the previous code did the opposite — it answered `op_service_start`
 with a clean `op_response`, which to a client means the backup finished.
 
+### Platform I/O against the engine's own accounting (`qa/pio-layout.sh`, 18 checks)
+
+The `PIO_*` layer is small enough to state completely, which makes it the one
+subsystem where a gate can plausibly cover the whole surface. The oracles are
+the engine's own numbers.
+
+**The page count.** `PIO_get_number_of_pages` is `file_size / page_size` —
+integer division — and the engine publishes its own answer as
+`MON$DATABASE.MON$PAGES`. The gate compares them on a fresh scratch database,
+on the `employee` sample, and at two points during growth, and requires the
+file's length to be a whole number of pages each time.
+
+That last requirement is fire-crab's addition, not the engine's, and the gate
+proves it can fail: it truncates a copy half a page short and requires
+`WHOLE no`. Integer division alone would have reported a perfectly plausible
+page count for a damaged file.
+
+**The addressing law, against `RDB$PAGES`.** `seek_file` computes
+`offset = page * page_size`, absolute, with no rebasing — Firebird 6 has no
+multi-file databases, so there is no starting page to subtract. The engine
+records the TYPE of many pages in `RDB$PAGES`, which turns that formula into a
+checkable claim: read each of those pages at `page * page_size` and the byte
+at offset 0 must be the type the engine recorded. All 84 matched.
+
+Then the teeth, because "84 of 84 matched" is only impressive if a wrong
+formula would fail: the same comparison shifted by ONE page matched **0 of
+84**. An off-by-one offset could not survive this check, which is precisely
+what a check of an addressing formula has to guarantee.
+
+**The header bootstrap.** A 20-byte read of the file already yields the page
+size that `MON$DATABASE` reports — the entire reason `PIO_header` exists
+separately from `PIO_read` is that the page size is *inside* the first page,
+so the first read cannot know how much to read.
+
+**Forced Writes is an open mode.** `openFile` adds `SYNC` to the *open flags*
+when the header's `hdr_force_write` bit is set; it is not an fsync after each
+write. So one `gfix -w sync` has to move three things together, and the gate
+requires all three: the header bit (our decode says `force write`), the open
+mode we would use (`O_BINARY|O_RDWR|SYNC`), and what `gstat -h` prints as
+`Attributes`. `gfix -w async` clears all three. Then the behavioural half:
+with forced writes on, a copy of the file taken after `COMMIT` contains every
+row — 17 000 of them.
+
+**The lock, and why this whole repository works.** `lockDatabaseFile` flocks
+the file (`LOCK_EX` when the server mode is Super) and turns a busy lock into
+`isc_already_opened` — the *"Database already opened with engine instance,
+incompatible with current"* refusal that stopped `isql` from reading the
+security database two slices ago. fire-crab's readers take no lock at all, and
+the gate demonstrates both facts in the same second: with a live attachment
+open, `fcpio lock` reports BUSY *and* `fcpio read` returns the header page.
+
+That is the property every differential in this document rests on, and it has
+a price worth naming: a lock-free read can catch a page mid-write. Any gate
+reading a live file needs its own freshness signal — which is exactly the bug
+`qa/auth-srp.sh` had.
+
+**Refusals.** A page past the end of the file is an error, never a zero-filled
+buffer: zeros for a page that does not exist are indistinguishable, one layer
+up, from a page that legitimately holds zeros.
+
+**A gate that nearly lied.** The growth phase first inserted its rows with a
+4000-level recursive CTE. Firebird caps recursion at 1024, so the insert failed
+silently, the page count never moved, and three checks reported "313 pages =
+MON$PAGES" — all true, all the same check, and none of them about growth. The
+generator now cross-joins a 500-level recursion, and the gate asserts the file
+actually grew (313 → 401 pages for 12 000 rows) before trusting the
+comparisons around it. A vacuous check is worse than a missing one, because it
+reports success.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
@@ -6644,6 +6713,12 @@ FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
 NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     bash /path/to/fire-crab/qa/serve-real-predfull.sh 3050
+
+# Platform I/O against the engine's own accounting: MON$PAGES vs the file
+# size, RDB$PAGES types found at page*page_size (with a one-page-shift
+# control), the gfix -w sync/async open mode, and the file lock.
+FCPIO=/path/to/fire-crab/target/release/fcpio ISQL=/opt/firebird/bin/isql \
+    bash /path/to/fire-crab/qa/pio-layout.sh
 
 # The Services manager, with the engine's own fbsvcmgr on both sides:
 # our decoder against the real server, fbsvcmgr against fire-crab's
