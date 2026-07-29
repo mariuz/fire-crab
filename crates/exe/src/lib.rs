@@ -97,6 +97,9 @@ mod blr {
     pub const SINGULAR: u8 = 127;
     pub const PLAN: u8 = 139;
     pub const ANSI_ANY: u8 = 151;
+    pub const WINDOW: u8 = 195;
+    pub const PARTITION_BY: u8 = 196;
+    pub const AGG_FUNCTION: u8 = 199;
     pub const ANSI_ALL: u8 = 158;
     pub const DERIVED_EXPR: u8 = 191;
     pub const SEQUENTIAL: u8 = 142;
@@ -245,6 +248,27 @@ pub enum JoinKind {
     Full,
 }
 
+/// One item of a window's map: an aggregate verb, a named window
+/// function (ROW_NUMBER / RANK / DENSE_RANK ride blr_agg_function),
+/// or a passthrough value.
+#[derive(Clone, Debug)]
+pub enum WinItem {
+    Agg(u8, Option<Expr>),
+    Fn(String, Vec<Expr>),
+    Value(Expr),
+}
+
+/// One window of a blr_window stream: its context, partition keys,
+/// ORDER keys and map. The remap fids after the partition keys are
+/// bookkeeping (they name the keys' own map slots) and parse away.
+#[derive(Clone, Debug)]
+pub struct Win {
+    pub context: u8,
+    pub partition: Vec<Expr>,
+    pub order: Vec<SortKey>,
+    pub map: Vec<(u16, WinItem)>,
+}
+
 /// The stream slot of an rse: a plain relation scan, an aggregate
 /// over an inner rse, a join (blr_rs_stream) - the NestedLoopJoin /
 /// FullOuterJoin of recsrc/ - or a DERIVED TABLE: a nested rse
@@ -260,6 +284,11 @@ pub enum Stream {
     /// branches concatenate in order (ALL; the distinct form rides
     /// the outer rse's blr_project over the union's fids)
     Union { context: u8, branches: Vec<(Rse, Vec<(u16, Expr)>)> },
+    /// blr_window: the inner rse and the windows over it - every
+    /// source row survives (a window is an aggregate that KEEPS its
+    /// rows), each window's context binding a slot-row of computed
+    /// values the body reads by fid
+    Window { source: Box<Rse>, windows: Vec<Win> },
 }
 
 /// The record-selection expression of a blr_for: one stream, the
@@ -585,6 +614,93 @@ impl<'a> P<'a> {
             blr::RSE => {
                 // a derived table: an rse standing in the stream slot
                 Stream::Derived(Box::new(self.rse_body()?))
+            }
+            blr::WINDOW => {
+                if self.u8()? != blr::RSE {
+                    return Err("window source is not an rse".into());
+                }
+                let source = Box::new(self.rse_body()?);
+                let n = self.u8()? as usize;
+                let mut windows = Vec::new();
+                for _ in 0..n {
+                    if self.u8()? != blr::PARTITION_BY {
+                        return Err("window without blr_partition_by unconverted".into());
+                    }
+                    let context = self.u8()?;
+                    let pn = self.u8()? as usize;
+                    let mut partition = Vec::new();
+                    for _ in 0..pn {
+                        partition.push(self.expr()?);
+                    }
+                    // the remap fids: one per key, naming the key's
+                    // own slot in this window's map - bookkeeping
+                    for _ in 0..pn {
+                        let _ = self.expr()?;
+                    }
+                    if self.u8()? != blr::SORT {
+                        return Err("window without a sort clause unconverted".into());
+                    }
+                    let sn = self.u8()? as usize;
+                    let mut order = Vec::new();
+                    for _ in 0..sn {
+                        let desc = match self.u8()? {
+                            blr::ASCENDING => false,
+                            blr::DESCENDING => true,
+                            other => {
+                                return Err(format!("sort direction {} unconverted", other))
+                            }
+                        };
+                        order.push(SortKey { expr: self.expr()?, desc });
+                    }
+                    if self.u8()? != blr::MAP {
+                        return Err("window without blr_map unconverted".into());
+                    }
+                    let mn = self.u16()? as usize;
+                    let mut map = Vec::new();
+                    for _ in 0..mn {
+                        let slot = self.u16()?;
+                        let item = match self.b.get(self.i) {
+                            Some(&blr::AGG_COUNT) => {
+                                self.i += 1;
+                                WinItem::Agg(blr::AGG_COUNT, None)
+                            }
+                            Some(&v @ (blr::AGG_MAX | blr::AGG_MIN | blr::AGG_TOTAL
+                                | blr::AGG_AVERAGE | blr::AGG_COUNT2)) => {
+                                self.i += 1;
+                                WinItem::Agg(v, Some(self.expr()?))
+                            }
+                            Some(&blr::AGG_FUNCTION) => {
+                                self.i += 1;
+                                let name = self.counted_name()?;
+                                let argc = self.u8()? as usize;
+                                let mut args = Vec::new();
+                                for _ in 0..argc {
+                                    args.push(self.expr()?);
+                                }
+                                WinItem::Fn(name, args)
+                            }
+                            _ => WinItem::Value(self.expr()?),
+                        };
+                        map.push((slot, item));
+                    }
+                    windows.push(Win { context, partition, order, map });
+                }
+                if self.u8()? != blr::END {
+                    return Err("window does not close with blr_end".into());
+                }
+                // the window consumed the rse-clause END itself: the
+                // stream returns directly (no outer clauses follow a
+                // window in this wrapper)
+                return Ok(Rse {
+                    stream: Stream::Window { source, windows },
+                    boolean: None,
+                    sort: Vec::new(),
+                    first: None,
+                    skip: None,
+                    project: Vec::new(),
+                    plan_indices: Vec::new(),
+                    singular: false,
+                });
             }
             blr::UNION => {
                 let context = self.u8()?;
@@ -1137,6 +1253,9 @@ impl<'a> Exec<'a> {
                 }
             }
             Stream::Derived(inner) => self.open_rse(inner)?,
+            Stream::Window { source, windows } => {
+                return self.open_window(source, windows);
+            }
             Stream::Union { context, branches } => {
                 // branches concatenate in order; each row is the
                 // branch map's slot values on the union's context
@@ -1227,6 +1346,189 @@ impl<'a> Exec<'a> {
             bindings.truncate(n);
         }
         Ok(bindings)
+    }
+
+    /// The WindowedStream: every source row survives; each window
+    /// computes its map per row - whole-partition aggregates when the
+    /// window has no ORDER, running aggregates over the RANGE frame
+    /// (peers included - rows with equal sort keys share the value)
+    /// when it does, and ROW_NUMBER / RANK / DENSE_RANK by position.
+    /// Windows process in declaration order, each sorting the row set
+    /// by (partition, order) keys - the LAST window's order is the
+    /// order the rows emerge in, matching the engine's
+    /// sort-per-window pipeline.
+    fn open_window(
+        &mut self,
+        source: &Rse,
+        windows: &[Win],
+    ) -> Result<Vec<Vec<StreamFrame>>, String> {
+        struct WRow {
+            binding: Vec<StreamFrame>,
+            extra: Vec<StreamFrame>,
+        }
+        let mut rows: Vec<WRow> = self
+            .open_rse(source)?
+            .into_iter()
+            .map(|binding| WRow { binding, extra: Vec::new() })
+            .collect();
+        for w in windows {
+            let width = w.map.iter().map(|(sl, _)| *sl as usize + 1).max().unwrap_or(0);
+            // keys per row
+            let mut keyed: Vec<(Vec<Value>, Vec<Value>, usize)> = Vec::new();
+            for (i, r) in rows.iter().enumerate() {
+                let (pk, sk) = self.with_binding(&r.binding, |ex| {
+                    let pk = w
+                        .partition
+                        .iter()
+                        .map(|e| ex.eval(e))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let sk = w
+                        .order
+                        .iter()
+                        .map(|k| ex.eval(&k.expr))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok((pk, sk))
+                })?;
+                keyed.push((pk, sk, i));
+            }
+            let dirs: Vec<bool> = w.order.iter().map(|k| k.desc).collect();
+            keyed.sort_by(|(pa, sa, _), (pb, sb, _)| {
+                for (x, y) in pa.iter().zip(pb) {
+                    let o = null_aware_cmp(x, y, false);
+                    if o != std::cmp::Ordering::Equal {
+                        return o;
+                    }
+                }
+                for (i, desc) in dirs.iter().enumerate() {
+                    let o = null_aware_cmp(&sa[i], &sb[i], *desc);
+                    if o != std::cmp::Ordering::Equal {
+                        return o;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            // per-row slot values, indexed by ORIGINAL row position
+            let mut slot_rows: Vec<Vec<Value>> = vec![vec![Value::Null; width]; rows.len()];
+            let mut p_start = 0usize;
+            while p_start < keyed.len() {
+                let p_end = (p_start..keyed.len())
+                    .take_while(|&j| {
+                        keyed[j].0.iter().zip(&keyed[p_start].0).all(|(a, b)| group_eq(a, b))
+                    })
+                    .last()
+                    .unwrap()
+                    + 1;
+                let part = &keyed[p_start..p_end];
+                for (slot, item) in &w.map {
+                    match item {
+                        WinItem::Value(e) => {
+                            for (_, _, ri) in part {
+                                let v = self
+                                    .with_binding(&rows[*ri].binding.clone(), |ex| ex.eval(e))?;
+                                slot_rows[*ri][*slot as usize] = v;
+                            }
+                        }
+                        WinItem::Fn(name, _args) => {
+                            // peer groups by equal sort keys
+                            let mut rank = 0usize;
+                            let mut dense = 0usize;
+                            let mut j = 0usize;
+                            while j < part.len() {
+                                let peer_end = (j..part.len())
+                                    .take_while(|&k| {
+                                        part[k].1.iter().zip(&part[j].1).all(|(a, b)| group_eq(a, b))
+                                    })
+                                    .last()
+                                    .unwrap()
+                                    + 1;
+                                dense += 1;
+                                for (pos, (_, _, ri)) in
+                                    part[j..peer_end].iter().enumerate()
+                                {
+                                    let v = match name.as_str() {
+                                        "ROW_NUMBER" => (j + pos + 1) as i64,
+                                        "RANK" => (rank + 1) as i64,
+                                        "DENSE_RANK" => dense as i64,
+                                        other => {
+                                            return Err(format!(
+                                                "window function {} unconverted",
+                                                other
+                                            ))
+                                        }
+                                    };
+                                    slot_rows[*ri][*slot as usize] = Value::Int(v);
+                                }
+                                rank += peer_end - j;
+                                j = peer_end;
+                            }
+                        }
+                        WinItem::Agg(verb, operand) => {
+                            // operand values in partition order
+                            let mut ops: Vec<Option<Value>> = Vec::new();
+                            for (_, _, ri) in part {
+                                ops.push(match operand {
+                                    None => None,
+                                    Some(e) => Some(self.with_binding(
+                                        &rows[*ri].binding.clone(),
+                                        |ex| ex.eval(e),
+                                    )?),
+                                });
+                            }
+                            if w.order.is_empty() {
+                                // whole-partition value, same for all
+                                let v = window_fold(*verb, &ops)?;
+                                for (_, _, ri) in part {
+                                    slot_rows[*ri][*slot as usize] = v.clone();
+                                }
+                            } else {
+                                // the RANGE frame: unbounded preceding
+                                // through the CURRENT ROW'S PEERS
+                                let mut j = 0usize;
+                                while j < part.len() {
+                                    let peer_end = (j..part.len())
+                                        .take_while(|&k| {
+                                            part[k].1.iter().zip(&part[j].1).all(|(a, b)| group_eq(a, b))
+                                        })
+                                        .last()
+                                        .unwrap()
+                                        + 1;
+                                    let v = window_fold(*verb, &ops[..peer_end])?;
+                                    for (_, _, ri) in &part[j..peer_end] {
+                                        slot_rows[*ri][*slot as usize] = v.clone();
+                                    }
+                                    j = peer_end;
+                                }
+                            }
+                        }
+                    }
+                }
+                p_start = p_end;
+            }
+            // attach this window's frame per row, and REORDER the row
+            // set to this window's sort - the engine's pipeline order
+            let order: Vec<usize> = keyed.iter().map(|(_, _, ri)| *ri).collect();
+            for (ri, slots) in slot_rows.into_iter().enumerate() {
+                rows[ri].extra.push(StreamFrame {
+                    context: w.context,
+                    relation: None,
+                    row: slots,
+                });
+            }
+            let mut reordered = Vec::with_capacity(rows.len());
+            let mut taken: Vec<Option<WRow>> = rows.into_iter().map(Some).collect();
+            for ri in order {
+                reordered.push(taken[ri].take().expect("each row once"));
+            }
+            rows = reordered;
+        }
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let mut b = r.binding;
+                b.extend(r.extra);
+                b
+            })
+            .collect())
     }
 
     /// One join source's bindings: a relation scans, a nested join
@@ -1764,6 +2066,63 @@ impl<'a> Exec<'a> {
                 }
             }
         })
+    }
+}
+
+/// Fold a window aggregate over operand values (None = COUNT(*)'s
+/// rowcount) - the same empty-set and NULL rules the grouped
+/// aggregate uses.
+fn window_fold(verb: u8, ops: &[Option<Value>]) -> Result<Value, String> {
+    match verb {
+        blr::AGG_COUNT => Ok(Value::Int(ops.len() as i64)),
+        blr::AGG_COUNT2 => Ok(Value::Int(
+            ops.iter()
+                .filter(|o| !matches!(o, Some(Value::Null) | None))
+                .count() as i64,
+        )),
+        blr::AGG_TOTAL | blr::AGG_AVERAGE => {
+            let mut sum = 0i64;
+            let mut n = 0i64;
+            for o in ops {
+                if let Some(v) = o {
+                    if let Some(x) = int_of(v) {
+                        sum += x;
+                        n += 1;
+                    }
+                }
+            }
+            if n == 0 {
+                Ok(Value::Null)
+            } else if verb == blr::AGG_TOTAL {
+                Ok(Value::Int(sum))
+            } else {
+                Ok(Value::Int(sum / n))
+            }
+        }
+        blr::AGG_MIN | blr::AGG_MAX => {
+            let mut acc: Option<Value> = None;
+            for o in ops.iter().flatten() {
+                if matches!(o, Value::Null) {
+                    continue;
+                }
+                let take = match &acc {
+                    None => true,
+                    Some(cur) => {
+                        let want = if verb == blr::AGG_MIN {
+                            std::cmp::Ordering::Less
+                        } else {
+                            std::cmp::Ordering::Greater
+                        };
+                        value_cmp(o, cur) == Some(want)
+                    }
+                };
+                if take {
+                    acc = Some(o.clone());
+                }
+            }
+            Ok(acc.unwrap_or(Value::Null))
+        }
+        other => Err(format!("window aggregate verb {} unconverted", other)),
     }
 }
 

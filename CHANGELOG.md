@@ -13,6 +13,34 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-exe slice 8: windows — the last named refusal falls
+
+### Converted
+- **Windows** (`blr_window`): a window is an aggregate that KEEPS
+  its rows — every source row survives, each window's context
+  binding a slot-row of computed values the body reads by fid.
+  Per window (`blr_partition_by`): whole-partition aggregates when
+  the window has no ORDER; RUNNING aggregates over the default
+  RANGE frame when it does — peers included, rows with equal sort
+  keys sharing the value (the gate's running SUM walks straight
+  through a NULL, which contributes nothing, exactly as the
+  engine's does); and ROW_NUMBER / RANK / DENSE_RANK
+  (`blr_agg_function`, counted name) by peer-group position. The
+  remap fids after the partition keys are bookkeeping and parse
+  away. Windows process in declaration order, each re-sorting the
+  row set — the LAST window's order is the emission order, the
+  engine's sort-per-window pipeline, and the multi-window check
+  (a running SUM beside a partition COUNT) held.
+- Like the union, the window consumes the rse's closing end itself
+  — no clauses follow a window in this wrapper.
+
+### Guarded
+- Frame extents (`blr_window_win` — the v4 subcoded form) and
+  CAST/CASE value verbs are the new frontier, named by fresh
+  refusals. Gate: 70 → 78 checks. 261 workspace tests. With this,
+  every refusal the executor's slice 1 declared has been flipped
+  by a later slice — the roadmap ate itself in eight steps.
+
 ## 2026-07-29 — fire-crab-exe slice 7: subquery predicates, scalar subselects
 
 ### Converted

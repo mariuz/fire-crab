@@ -4088,6 +4088,24 @@ comparison poisoned to UNKNOWN - exactly as the engine does.
 Scalar subselects (blr_via over a singular rse) close the slice:
 one row binds, none yields the else-NULL, two is sing_err.
 
+### Slice 8: the last refusal falls
+
+Windows closed the circle: every refusal the executor's first slice
+declared - parameters, aggregates, joins, expressions, DISTINCT,
+unions, subqueries, windows - has now been flipped by a later slice,
+each through the same two-arrow gate that installed it. The window
+semantics worth naming: a window is an aggregate that KEEPS its rows;
+without ORDER the partition's value repeats on every member row, with
+ORDER the aggregate RUNS over the default RANGE frame where PEERS -
+rows with equal sort keys - share a value (the running SUM walks
+straight through a NULL, which contributes nothing); ROW_NUMBER,
+RANK and DENSE_RANK are peer-group arithmetic. Windows process in
+declaration order, each re-sorting the rows, and the last window's
+sort is the emission order - the engine's sort-per-window pipeline
+reproduced, held by a check running a running-SUM window beside a
+partition-COUNT window in one statement. The new frontier is named:
+frame extents (the v4 blr_window_win) and the CAST/CASE value verbs.
+
 ## Query surface: what the server answers, and what it refuses
 
 Everything below is verified by a differential gate under `qa/` — the
