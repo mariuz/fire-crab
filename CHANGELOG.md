@@ -13,6 +13,42 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-opt slice 6: the cost model, as far as the engine's own formulas take it
+
+### Converted
+- **The engine's CARDINALITY ESTIMATE** — `DPM_cardinality`
+  (dpm.epp:262), line for line: count the relation's data pages;
+  walk to the first non-secondary page holding primaries and take
+  its record count and compressed length; with exactly ONE data page
+  the count is EXACT ("too imprecise to be useful, therefore rely on
+  the record count"); otherwise
+  `dataPages * (page_size - DPG_SIZE) / recordSize`, where
+  recordSize rounds the average compressed record plus its header to
+  ODS alignment and adds the slot and SPACE_FUDGE. Never below
+  MINIMUM_CARDINALITY. It reproduces the engine's imprecision
+  faithfully — 500 rows estimate as 628, 3000 as 3770 — which is the
+  point: cost decisions are made on THESE numbers, not on true
+  counts.
+- **The join decision's cardinality BANDS**, mapped by probing a
+  6×6 grid of table sizes against the live optimizer: a TINY driver
+  (≤ 1) keeps SQL order — the engine is deliberately pessimistic
+  about a relation that "looks empty during preparation"
+  (InnerJoin.cpp:217) — a TINY inner side makes it SWAP, and once
+  BOTH sides are large the HASH wins. **And hash joins have an order
+  too**: the LARGER stream is listed first because it PROBES while
+  the smaller is hashed into the table (probed — the plan text swaps
+  with the sizes).
+- **The band in between refuses**, naming both cardinalities: that is
+  where `hashCost <= loopCost` turns on index retrieval costs from
+  `Retrieval.cpp`, which this slice does not convert.
+
+### Guarded
+- Gate phase 3 is the whole 6×6 GRID, and its assertion is the
+  property that matters for a partly-converted cost model: **29 of
+  36 cells planned exactly, 7 refused, ZERO wrong**. Exactness where
+  it knows, silence where it does not. Gate: `qa/opt-plans.sh` 66 →
+  67 checks across three databases; 281 workspace tests.
+
 ## 2026-07-29 — fire-crab-opt slice 5: the cost boundary, measured and enforced
 
 ### The finding

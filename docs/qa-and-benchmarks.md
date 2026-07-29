@@ -4002,6 +4002,26 @@ equivalence class (D.Z = B.UID and A.ID = B.UID give D.Z = A.ID, and
 it drives from D). fcopt refuses that shape and the gate pins the
 refusal, so the frontier is documented rather than implied.
 
+Slice 6 went into the cost model as far as the engine's own formulas
+allow. DPM_cardinality converted line for line - data pages, a
+first-page record sample, the exact-count rule for a single-page
+relation, and the pages-times-usable-space estimate - reproducing the
+engine's imprecision on purpose: 500 rows estimate as 628 and 3000 as
+3770, because those are the numbers the optimizer actually decides
+on. Then the join decision's BANDS, mapped by probing a 6x6 grid of
+table sizes: a tiny driver keeps SQL order (the engine is
+deliberately pessimistic about relations that look empty at prepare
+time), a tiny inner side makes it swap, and both-large hashes - with
+the larger stream listed FIRST because it probes while the smaller is
+hashed. The band in between refuses, naming both cardinalities,
+because that is where hashCost versus loopCost turns on index
+retrieval costs from Retrieval.cpp.
+
+The gate's third phase is the whole grid, and its assertion is the
+property that matters for a cost model only partly converted: 29 of
+36 cells planned EXACTLY, 7 refused, and ZERO wrong. Exactness where
+the crate knows, silence where it does not.
+
 Slice 5 found the limit of all of it - by populating a database.
 Slices 1 through 4 verified every rule against empty tables, and
 they are right there; with three thousand rows against five, the

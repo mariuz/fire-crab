@@ -568,6 +568,17 @@ them.
   the reference engine's own syntax error, another a model boundary
   (catalog-typed casts in a catalog-free compiler) - name those as
   what they are instead of forcing them.
+- **Reproduce the reference's IMPRECISION, not the truth.** Its
+  cardinality estimator samples one data page and extrapolates, so
+  500 rows come out as 628 - and every cost decision is made on THAT
+  number. Converting a "better" estimator would diverge from the
+  reference exactly where it matters. Port the formula, including
+  the parts that look wrong.
+- **For a partly-converted decision model, assert the SHAPE of the
+  result: exact where you know, refuse where you don't, never
+  wrong.** A grid of inputs with that three-way tally is a stronger
+  gate than a handful of passing cases, and it tells you precisely
+  how much of the model you have.
 - **A gate on EMPTY tables cannot see a cost model.** Four slices of
   optimizer rules verified perfectly against empty relations and
   were wrong the moment rows existed: the reference engine drives

@@ -663,7 +663,9 @@ fn plan_chain(
             (_, None) => {}
         }
     }
-    cost_free_or_refuse(file, page_size, &tables)?;
+    if tables.len() > 2 {
+        cost_free_or_refuse(file, page_size, &tables)?;
+    }
     let n = tables.len();
     let bare: Vec<String> = names
         .iter()
@@ -752,9 +754,42 @@ fn plan_chain(
         }
         None
     };
-    // ---- try each driver in SQL order, rest in SQL order ----------
+    // ---- the cardinality bands decide a TWO-stream join ----------
+    // (the structural reachability rules below still say WHETHER an
+    // arrangement is possible; the band says WHICH the engine picks)
+    let mut driver_order: Vec<usize> = (0..n).collect();
+    if n == 2 {
+        let ca = cardinality(file, page_size, &tables[0])?;
+        let cb = cardinality(file, page_size, &tables[1])?;
+        match join_band(ca, cb)? {
+            JoinShape::SqlOrder => {}
+            JoinShape::Swap => driver_order = vec![1, 0],
+            JoinShape::Hash => {
+                // the LARGER stream is listed first - it PROBES while
+                // the smaller is hashed into the table (probed: the
+                // plan text swaps with the sizes, ties keeping SQL
+                // order)
+                let mut order = vec![0usize, 1];
+                if cb > ca {
+                    order = vec![1, 0];
+                }
+                return Ok(Plan {
+                    streams: order
+                        .into_iter()
+                        .map(|i| Stream {
+                            name: names[i].clone(),
+                            access: Access::Natural,
+                        })
+                        .collect(),
+                    combine: Combine::Hash,
+                    sorted: order_s.is_some(),
+                });
+            }
+        }
+    }
+    // ---- try each driver in the chosen order ----------------------
     let mut chosen: Option<(usize, Vec<(usize, IndexInfo)>)> = None;
-    for d in 0..n {
+    for d in driver_order {
         let mut placed = vec![d];
         let mut steps: Vec<(usize, IndexInfo)> = Vec::new();
         let mut ok = true;
@@ -899,36 +934,161 @@ fn parse_join_key(
     }
 }
 
-/// How many committed rows a table holds - the cardinality the
-/// engine's cost model starts from, and the measurement that decides
-/// whether this crate may plan a join at all.
+/// How many committed rows a table holds - an exact count, useful
+/// for the gate and for reasoning; the OPTIMIZER works from the
+/// ESTIMATE below instead, because that is what the engine does.
 pub fn row_count(file: &[u8], page_size: usize, table: &str) -> Result<u64, String> {
     let rel = resolve_relation(file, page_size, table)
         .ok_or_else(|| format!("no table {}", table))?;
     Ok(fire_crab_ods::count_primary_records(file, page_size, rel))
 }
 
-/// A join may be planned STRUCTURALLY only while its streams are
-/// empty; with rows in play the engine's cardinality-driven choices
-/// (small-side driving, hash-versus-loop) take over and this crate
-/// has not converted them.
+/// The engine's own CARDINALITY ESTIMATE - `DPM_cardinality`
+/// (dpm.epp:262), converted line for line:
+///
+/// - count the relation's data pages;
+/// - walk to the FIRST non-secondary, non-empty data page and take
+///   its record count and total compressed record length;
+/// - with exactly ONE data page the count is EXACT ("the cardinality
+///   calculation is too imprecise to be useful, therefore rely on
+///   the record count from the data-page");
+/// - otherwise estimate `dataPages * (page_size - DPG_SIZE) /
+///   recordSize`, where recordSize is the average compressed record
+///   plus its header, rounded to ODS alignment, plus the slot and a
+///   SPACE_FUDGE reserve;
+/// - never below MINIMUM_CARDINALITY (1.0).
+///
+/// This is the number every cost decision starts from, so converting
+/// it is the first step of converting cost at all.
+pub fn cardinality(file: &[u8], page_size: usize, table: &str) -> Result<f64, String> {
+    const DPG_SIZE: usize = 24; // data_page less its first slot
+    const RHD_SIZE: usize = 16; // ods.h:912 - the record header
+    const RHDF_SIZE: usize = 20; // the FRAGMENT header
+    const ODS_ALIGNMENT: usize = 4;
+    const SLOT: usize = 4; // dpg_repeat: two u16
+    const MINIMUM_CARDINALITY: f64 = 1.0;
+    let roundup = |v: usize| (v + ODS_ALIGNMENT - 1) / ODS_ALIGNMENT * ODS_ALIGNMENT;
+    let space_fudge = roundup(RHDF_SIZE) + SLOT;
+
+    let rel = resolve_relation(file, page_size, table)
+        .ok_or_else(|| format!("no table {}", table))?;
+    let pages = relation_data_pages(file, page_size, rel);
+    let data_pages = pages.len();
+    if data_pages == 0 {
+        return Ok(MINIMUM_CARDINALITY);
+    }
+    // the first data page that holds primary records
+    let mut count = 0usize;
+    let mut length = 0usize;
+    for p in &pages {
+        let start = *p as usize * page_size;
+        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode)
+        else {
+            continue;
+        };
+        // dpg_secondary (0x10 in pag_flags) pages hold no primaries
+        if file[start + 1] & 0x10 != 0 {
+            continue;
+        }
+        let mut c = 0usize;
+        let mut l = 0usize;
+        for i in 0..dp.count {
+            if let Some((off, len)) = dp.slot(i) {
+                if off != 0 {
+                    c += 1;
+                    l += (len as usize).saturating_sub(RHD_SIZE);
+                }
+            }
+        }
+        if c > 0 {
+            count = c;
+            length = l;
+            break;
+        }
+    }
+    if data_pages == 1 {
+        return Ok((count as f64).max(MINIMUM_CARDINALITY));
+    }
+    let compressed = if count > 0 { length / count } else { 1 };
+    let record_size = SLOT + roundup(compressed + RHD_SIZE) + space_fudge;
+    let est = data_pages as f64 * (page_size - DPG_SIZE) as f64 / record_size as f64;
+    Ok(est.max(MINIMUM_CARDINALITY))
+}
+
+/// The cardinality BANDS the engine's join decision turns on, mapped
+/// by probing a 6x6 grid of table sizes (0, 1, 5, 50, 500, 3000
+/// rows) against the live optimizer:
+///
+/// ```text
+///   out\in     0    1    5    50   500  3000
+///   0        A->B A->B A->B A->B A->B A->B
+///   1        A->B A->B A->B A->B A->B A->B
+///   5        B->A B->A HASH A->B A->B A->B
+///   50       B->A B->A B->A HASH HASH HASH
+///   500      B->A B->A B->A HASH HASH HASH
+///   3000     B->A B->A B->A HASH HASH HASH
+/// ```
+///
+/// Three regions are unambiguous and converted: a TINY driver
+/// (cardinality <= 1) keeps SQL order, because the engine is
+/// deliberately pessimistic about a relation that "looks empty
+/// during preparation" (InnerJoin.cpp:217's avoidHashJoin) and a
+/// one-row loop is cheap anyway; a TINY inner side makes the engine
+/// SWAP so the tiny stream drives; and once BOTH sides are LARGE the
+/// hash wins outright. The band between - one side small but not
+/// tiny - is where `hashCost <= loopCost` is decided by index
+/// retrieval costs this crate has not converted, and it refuses.
+fn join_band(a: f64, b: f64) -> Result<JoinShape, String> {
+    const TINY: f64 = 1.0;
+    const LARGE: f64 = 50.0;
+    if a <= TINY {
+        return Ok(JoinShape::SqlOrder);
+    }
+    if b <= TINY {
+        return Ok(JoinShape::Swap);
+    }
+    if a >= LARGE && b >= LARGE {
+        return Ok(JoinShape::Hash);
+    }
+    Err(format!(
+        "join cardinalities ({:.0}, {:.0}) fall in the band where the \
+         engine weighs hashCost against loopCost with index retrieval \
+         costs - unconverted",
+        a, b
+    ))
+}
+
+/// What the cardinality bands say about a two-stream join.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum JoinShape {
+    SqlOrder,
+    Swap,
+    Hash,
+}
+
+/// The cost guard: a join is planned only where the cardinality
+/// bands make the engine's decision unambiguous.
 fn cost_free_or_refuse(
     file: &[u8],
     page_size: usize,
     tables: &[String],
 ) -> Result<(), String> {
-    for t in tables {
-        let n = row_count(file, page_size, t)?;
-        if n > 0 {
-            return Err(format!(
-                "join over populated {} ({} rows): the engine's choice here \
-                 is cost-based (it drives the smaller stream and hashes \
-                 above a modest size) - unconverted",
-                t, n
-            ));
+    // more than two streams: the bands were probed pairwise, so a
+    // chain is planned only while every stream looks empty
+    if tables.len() > 2 {
+        for t in tables {
+            if cardinality(file, page_size, t)? > 1.0 {
+                return Err(format!(
+                    "chain over populated {}: cost-based ordering unconverted",
+                    t
+                ));
+            }
         }
+        return Ok(());
     }
-    Ok(())
+    let a = cardinality(file, page_size, &tables[0])?;
+    let b = cardinality(file, page_size, &tables[1])?;
+    join_band(a, b).map(|_| ())
 }
 
 /// A column's TYPE FAMILY (0 numeric, 1 text, 2 other) - an index

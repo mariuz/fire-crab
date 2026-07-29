@@ -212,7 +212,61 @@ pcheck "SELECT K FROM BIG WHERE FLAT = 1 AND UNIQ = 7"
 pcheck "SELECT COUNT(*) FROM BIG"
 # the cost cases: the engine drives the SMALL side, and hashes when
 # both sides grow - fcopt refuses both rather than guess
+# the cost cases in the BAND the crate does not model
 prefuse "SELECT A.K FROM BIG A JOIN SMALL B ON A.UNIQ = B.S"
 prefuse "SELECT B.S FROM SMALL B JOIN BIG A ON A.UNIQ = B.S"
+
+# ======================================================================
+# PHASE 3: the CARDINALITY GRID - 36 cells, and never a wrong plan
+# ======================================================================
+# Six tables of 0, 1, 5, 50, 500 and 3000 rows, joined every way
+# round. For each cell fcopt must either MATCH the engine's plan or
+# REFUSE - a wrong plan anywhere fails the gate. This is the property
+# that matters for a cost model only partly converted: silence where
+# it does not know, exactness where it does.
+DBG="$D/fc-optgrid.fdb"
+rm -f "$DBG"
+{
+  echo "CREATE DATABASE '$DBG' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;"
+  for n in 0 1 5 50 500 3000; do
+      echo "CREATE TABLE G$n (V INTEGER); CREATE INDEX IDX_G$n ON G$n (V);"
+  done
+  echo "COMMIT;"
+  echo "SET TERM ^ ;"
+  for n in 1 5 50 500 3000; do
+      echo "EXECUTE BLOCK AS DECLARE I INTEGER; BEGIN I=0; WHILE (I<$n) DO BEGIN INSERT INTO G$n VALUES(:I); I=I+1; END END^"
+  done
+  echo "SET TERM ; ^"
+  echo "COMMIT;"
+} | "$ISQL" -q -b -user "$U" -pas "$P" >/dev/null 2>&1 || { echo "FAIL create grid"; exit 1; }
+
+matched=0; refused=0; wrong=0
+for o in 0 1 5 50 500 3000; do
+  for i in 0 1 5 50 500 3000; do
+    q="SELECT A.V FROM G$o A JOIN G$i B ON A.V = B.V"
+    eng=$("$ISQL" -q -user "$U" -pas "$P" "$DBG" 2>&1 <<SQL | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | head -1
+SET PLANONLY ON;
+$q;
+SQL
+)
+    got=$("$FCOPT" plan "$DBG" "$q" 2>&1)
+    if [ "$got" = "$eng" ]; then
+        matched=$((matched + 1))
+    elif [ "${got:0:7}" = "REFUSED" ]; then
+        refused=$((refused + 1))
+    else
+        echo "DIFF grid cell ($o x $i)"
+        echo "     engine: $eng"
+        echo "     fcopt:  $got"
+        wrong=$((wrong + 1))
+    fi
+  done
+done
+if [ $wrong -eq 0 ]; then
+    echo "OK   cardinality grid: $matched of 36 cells planned exactly, $refused refused, ZERO wrong"
+else
+    echo "DIFF cardinality grid: $wrong cells planned WRONGLY"
+    fail=1
+fi
 
 exit $fail
