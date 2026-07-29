@@ -144,4 +144,75 @@ refuse "SELECT ID FROM T UNION ALL SELECT UID FROM U"
 refuse "SELECT ID FROM T WHERE ID IN (SELECT UID FROM U)"
 refuse "SELECT A.ID FROM T A LEFT JOIN U B ON A.ID = B.UID LEFT JOIN C D ON D.X = B.UID"
 
+# ======================================================================
+# PHASE 2: the COST BOUNDARY, on a POPULATED database
+# ======================================================================
+# Single-table access paths are STRUCTURAL - the same plans come back
+# with three thousand rows as with none. JOIN plans are not: with data
+# the engine drives the SMALLER stream regardless of SQL order, and
+# above a modest size it HASHES even when both sides are indexed. This
+# crate measures rather than guesses: it plans single-table paths at
+# any size and REFUSES populated joins, and this phase pins both
+# halves - the plans that must still match, and the engine's own
+# answers beside the refusals.
+DBP="$D/fc-optcost.fdb"
+rm -f "$DBP"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || { echo "FAIL create populated"; exit 1; }
+CREATE DATABASE '$DBP' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE BIG (K INTEGER, FLAT INTEGER, UNIQ INTEGER);
+CREATE INDEX IDX_BIG_FLAT ON BIG (FLAT);
+CREATE INDEX IDX_BIG_UNIQ ON BIG (UNIQ);
+CREATE TABLE SMALL (S INTEGER);
+CREATE INDEX IDX_SMALL_S ON SMALL (S);
+COMMIT;
+SET TERM ^ ;
+EXECUTE BLOCK AS DECLARE I INTEGER; BEGIN I = 0; WHILE (I < 3000) DO BEGIN INSERT INTO BIG VALUES (:I, 1, :I); I = I + 1; END END^
+EXECUTE BLOCK AS DECLARE I INTEGER; BEGIN I = 0; WHILE (I < 5) DO BEGIN INSERT INTO SMALL VALUES (:I); I = I + 1; END END^
+SET TERM ; ^
+COMMIT;
+EOF
+
+pcheck() { # <sql> - single-table paths must match WITH data
+    want=$("$ISQL" -q -user "$U" -pas "$P" "$DBP" 2>&1 <<SQL | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | head -1
+SET PLANONLY ON;
+$1;
+SQL
+)
+    got=$("$FCOPT" plan "$DBP" "$1" 2>&1)
+    if [ "$got" = "$want" ]; then
+        echo "OK   (populated) $1"
+    else
+        echo "DIFF (populated) $1"
+        echo "     engine: $want"
+        echo "     fcopt:  $got"
+        fail=1
+    fi
+}
+prefuse() { # <sql> - a populated JOIN: fcopt refuses, and we RECORD
+           # the engine's own plan so the frontier is documented
+    eng=$("$ISQL" -q -user "$U" -pas "$P" "$DBP" 2>&1 <<SQL | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | head -1
+SET PLANONLY ON;
+$1;
+SQL
+)
+    got=$("$FCOPT" plan "$DBP" "$1" 2>&1)
+    case "$got" in
+        REFUSED*)
+            echo "OK   (populated) refused, engine says: $eng" ;;
+        *)
+            echo "DIFF (populated) [$1] expected REFUSED, got: $got"; fail=1 ;;
+    esac
+}
+
+pcheck "SELECT K FROM BIG WHERE FLAT = 1"
+pcheck "SELECT K FROM BIG WHERE UNIQ = 7"
+pcheck "SELECT K FROM BIG WHERE K = 1"
+pcheck "SELECT K FROM BIG ORDER BY UNIQ"
+pcheck "SELECT K FROM BIG WHERE FLAT = 1 AND UNIQ = 7"
+pcheck "SELECT COUNT(*) FROM BIG"
+# the cost cases: the engine drives the SMALL side, and hashes when
+# both sides grow - fcopt refuses both rather than guess
+prefuse "SELECT A.K FROM BIG A JOIN SMALL B ON A.UNIQ = B.S"
+prefuse "SELECT B.S FROM SMALL B JOIN BIG A ON A.UNIQ = B.S"
+
 exit $fail

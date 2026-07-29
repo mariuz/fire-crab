@@ -13,6 +13,39 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-opt slice 5: the cost boundary, measured and enforced
+
+### The finding
+- Slices 1-4 verified their rules on EMPTY tables, and the rules are
+  right there. On a POPULATED database they are not: with 3000 rows
+  against 5, the engine drives the SMALLER stream regardless of SQL
+  order; with 3000 against 50 it abandons the nested loop for a HASH
+  JOIN even though BOTH sides are indexed (3000 x 600 and 3000 x
+  2500 likewise). fcopt would have printed a confident nested-loop
+  plan where the engine hashes — a wrong answer the gate could not
+  see, because every table in it was empty.
+
+### Converted
+- **The boundary is now MEASURED, not assumed.** `row_count` reads
+  each joined stream's committed rows through
+  `ods::count_primary_records`, and a join whose streams hold ANY
+  rows is REFUSED with its cardinality in the message: the decision
+  there belongs to a cost model this crate has not converted.
+  Single-table access paths stay unconditional — verified structural
+  at three thousand rows, including a predicate on a column with one
+  distinct value still taking its index.
+- **The gate grew a second phase on a populated database**: the
+  single-table plans that must still match with data, and the
+  populated joins where fcopt refuses — each refusal RECORDING the
+  engine's own plan beside it, so the frontier is documented with
+  evidence rather than asserted.
+
+### Guarded
+- Cost/selectivity arithmetic (cardinality-driven driver choice,
+  hash-versus-loop) remains the crate's named frontier — now with
+  probe data attached. Gate: `qa/opt-plans.sh` 58 → 66 checks across
+  two databases; 281 workspace tests.
+
 ## 2026-07-29 — fire-crab-opt slice 4: equivalence classes
 
 ### Converted

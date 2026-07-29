@@ -47,12 +47,27 @@
 //!
 //! # Slice 1 boundaries
 //!
-//! Joins, unions, subqueries, procedures, views, multiple tables and
-//! compound (multi-segment) index matching REFUSE by name. Cost
-//! estimation proper - selectivity arithmetic choosing BETWEEN
-//! candidate indexes - is not converted: where the engine's choice
-//! depends on statistics rather than structure, this slice refuses
-//! rather than guesses.
+//! Unions, subqueries, procedures, views and outer joins inside
+//! chains refuse by name.
+//!
+//! # The cost boundary, ENFORCED
+//!
+//! Single-table access paths are STRUCTURAL: the same plans come
+//! back whether the table holds no rows or three thousand (verified
+//! - a predicate on a column with one distinct value still takes
+//! its index). JOIN plans are not. With real data the engine's
+//! choice turns on cardinality and statistics: it drives the SMALLER
+//! stream regardless of SQL order, and above a modest size it
+//! abandons the nested loop for a HASH JOIN even when BOTH sides are
+//! indexed (probed: 3000 x 5 rows nested-loops from the small side,
+//! 3000 x 50 hashes, 3000 x 2500 hashes).
+//!
+//! Rather than guess that arithmetic, this crate MEASURES: a join
+//! whose streams hold rows is refused, because the decision belongs
+//! to a cost model that is not converted. Empty streams keep the
+//! structural rules the gate pins. That turns a latent wrong answer
+//! into a named refusal - the crate would otherwise print a
+//! confident nested-loop plan where the engine hashes.
 
 use fire_crab_ods::{
     decode_record, relation_columns, relation_data_pages, resolve_relation,
@@ -481,6 +496,7 @@ fn plan_join(
     }
     let (ltab, lali) = split_alias(lhs)?;
     let (rtab, rali) = split_alias(rhs)?;
+    cost_free_or_refuse(file, page_size, &[ltab.clone(), rtab.clone()])?;
     // the join key: <qualifier>.<col> = <qualifier>.<col>
     let (lcol, rcol) = parse_join_key(&on_s, &lali, &rali)?;
     let lidx = indexes_of(file, page_size, &ltab)?;
@@ -647,6 +663,7 @@ fn plan_chain(
             (_, None) => {}
         }
     }
+    cost_free_or_refuse(file, page_size, &tables)?;
     let n = tables.len();
     let bare: Vec<String> = names
         .iter()
@@ -880,6 +897,38 @@ fn parse_join_key(
     } else {
         Err("the ON clause does not name both streams".into())
     }
+}
+
+/// How many committed rows a table holds - the cardinality the
+/// engine's cost model starts from, and the measurement that decides
+/// whether this crate may plan a join at all.
+pub fn row_count(file: &[u8], page_size: usize, table: &str) -> Result<u64, String> {
+    let rel = resolve_relation(file, page_size, table)
+        .ok_or_else(|| format!("no table {}", table))?;
+    Ok(fire_crab_ods::count_primary_records(file, page_size, rel))
+}
+
+/// A join may be planned STRUCTURALLY only while its streams are
+/// empty; with rows in play the engine's cardinality-driven choices
+/// (small-side driving, hash-versus-loop) take over and this crate
+/// has not converted them.
+fn cost_free_or_refuse(
+    file: &[u8],
+    page_size: usize,
+    tables: &[String],
+) -> Result<(), String> {
+    for t in tables {
+        let n = row_count(file, page_size, t)?;
+        if n > 0 {
+            return Err(format!(
+                "join over populated {} ({} rows): the engine's choice here \
+                 is cost-based (it drives the smaller stream and hashes \
+                 above a modest size) - unconverted",
+                t, n
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A column's TYPE FAMILY (0 numeric, 1 text, 2 other) - an index

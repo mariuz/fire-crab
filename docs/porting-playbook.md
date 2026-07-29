@@ -568,6 +568,14 @@ them.
   the reference engine's own syntax error, another a model boundary
   (catalog-typed casts in a catalog-free compiler) - name those as
   what they are instead of forcing them.
+- **A gate on EMPTY tables cannot see a cost model.** Four slices of
+  optimizer rules verified perfectly against empty relations and
+  were wrong the moment rows existed: the reference engine drives
+  the smaller stream and switches join methods by cardinality.
+  POPULATE a database in the gate, and where the decision turns on
+  statistics you have not converted, MEASURE the input (row counts)
+  and refuse - naming the number - instead of printing a confident
+  answer.
 - **When a special case keeps growing, look for the general rule it
   is a case OF.** A two-stream join swap, a three-stream reordering
   and an ORDER BY that navigates the wrong table's index were three

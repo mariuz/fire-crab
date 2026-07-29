@@ -4002,6 +4002,25 @@ equivalence class (D.Z = B.UID and A.ID = B.UID give D.Z = A.ID, and
 it drives from D). fcopt refuses that shape and the gate pins the
 refusal, so the frontier is documented rather than implied.
 
+Slice 5 found the limit of all of it - by populating a database.
+Slices 1 through 4 verified every rule against empty tables, and
+they are right there; with three thousand rows against five, the
+engine drives the SMALLER stream regardless of SQL order, and with
+three thousand against fifty it abandons the nested loop for a HASH
+even though both sides are indexed. fcopt would have printed a
+confident nested-loop plan where the engine hashes: a wrong answer
+the gate could not see, because every table in it was empty.
+
+The fix is the one the crate promised in slice 1, now ENFORCED
+rather than assumed: fcopt MEASURES each joined stream's row count
+and refuses any join whose streams hold rows, naming the cardinality
+in the refusal. Single-table access paths stay unconditional - they
+are genuinely structural, verified at three thousand rows, including
+a predicate on a column with a single distinct value still taking
+its index. And the gate now runs a second phase on a populated
+database where each refusal RECORDS the engine's own plan beside it,
+so the frontier is documented with evidence instead of asserted.
+
 What the slice deliberately does NOT convert is as important: cost
 and selectivity arithmetic. Where the engine's choice between
 candidate indexes depends on statistics rather than structure, fcopt
