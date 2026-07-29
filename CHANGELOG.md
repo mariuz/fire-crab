@@ -13,6 +13,32 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-dsql slice 45: recursive ctes
+
+### Converted
+- **WITH RECURSIVE** (flip sixty-eight — the transcript banked in
+  slice 42, cashed at last): `blr_recurse` carries the context, the
+  SECONDARY recursive-context byte (GEN_stuff_context emits both
+  when CTX_recursive — the secondary claims the slot BELOW the
+  recursion's), and the branch count; the ANCHOR branch is a real
+  rse + map with the cte name riding the relation2 alias exactly
+  like every inlined cte; the RECURSIVE branch is an rse with ZERO
+  streams whose boolean and map read `fid(recurse ctx, 0)`; no
+  terminator of its own — the wrapper rse's END closes it. Context
+  law: secondary, recursion, anchor claim consecutive slots.
+- **The unification law, third appearance**: a `+ 1` recursive item
+  types int64 (dialect-3 integer ADD — width-independent, so
+  CATALOG-FREE), and the anchor's bare field wraps in
+  `cast(int64)`; the no-arithmetic recursion carries no casts. Both
+  shapes pinned. Multiplication refuses — its promotion rule
+  depends on operand rank.
+
+### Guarded
+- Multi-column recursive ctes, a plain cte beside a recursive one,
+  outer WHERE over the recursion, `*` in the recursive item. Gate:
+  `qa/dsql-proc-blr.sh` 267 → 271 (the slice-42 named refusal
+  flipped); 70 dsql tests; 393 pins; 267 workspace tests.
+
 ## 2026-07-29 — fire-crab-dsql slice 44: unions as quantified subqueries
 
 ### Converted

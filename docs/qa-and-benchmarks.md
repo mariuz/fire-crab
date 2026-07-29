@@ -5071,6 +5071,21 @@ branch has ZERO streams - it reads the recursion's own output
 context by fid. That shape needs its own emission path, and the
 probe bytes are already in the refusal's comment waiting for it.
 
+Slice 45 cashed the oldest banked transcript - recursive ctes,
+named with their bytes back in slice 42. The shape rewards the wait:
+blr_recurse emits TWO context bytes (the recursion's and a SECONDARY
+one GEN_stuff_context adds under CTX_recursive, claiming the slot
+below), the anchor branch is an ordinary rse wearing the inlined-cte
+alias, and the recursive branch is an rse with ZERO streams - its
+boolean and map read fid(recurse ctx, 0), the recursion's own
+output. And the type-unification law made its third appearance, this
+time CONVERTIBLE: a + 1 recursive item types int64 because dialect-3
+integer addition is width-independent, so the anchor's bare field
+wraps in cast(int64) without any catalog knowledge - while
+multiplication, whose promotion depends on operand rank, refuses by
+name. Three laws, three costumes: CASE branches, union branches,
+recursion branches.
+
 Slice 44 cashed the banked union-in-subquery transcript - the union
 claims the subquery's reserved context slot before any branch stream
 numbers (the slice-38 reservation law wearing subquery clothing),
