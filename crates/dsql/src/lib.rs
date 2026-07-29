@@ -458,6 +458,10 @@ enum Val {
     /// EXPRESSION select item takes in a quantified subquery
     /// (probed: BF 01 <ctx> <expr>)
     DerivedWrap(u8, Box<Val>),
+    /// cast(int64, <val>) - the UNIFYING cast a plain branch takes
+    /// when a sibling's dialect-3 arithmetic types the union int64
+    /// (probed three times over: CASE, unions, recursion)
+    CastInt64(Box<Val>),
     /// a local variable declared in the body - blr_variable
     LocalVar(u16),
     /// blr_internal_info(literal 6) - the trigger-action code the
@@ -1722,6 +1726,28 @@ impl<'a> P<'a> {
             } else {
                 (None, a)
             };
+            // an optional trailing +/-/* literal: dialect-3 integer
+            // arithmetic types the item int64 and UNIFIES the union
+            // there (probed - the plain branches then wrap in
+            // cast(int64))
+            let arith = match self.t.get(self.i) {
+                Some(Tok::Plus) => Some('+'),
+                Some(Tok::Minus) => Some('-'),
+                Some(Tok::Star) => Some('*'),
+                _ => None,
+            };
+            let arith = match arith {
+                None => None,
+                Some(op) => {
+                    self.i += 1;
+                    let Some(Tok::Int(n)) = self.t.get(self.i) else {
+                        return None;
+                    };
+                    let n = i32::try_from(*n).ok()?;
+                    self.i += 1;
+                    Some((op, n))
+                }
+            };
             if !self.kw("FROM") {
                 return None;
             }
@@ -1735,7 +1761,19 @@ impl<'a> P<'a> {
             let saved = self.sub.replace(si);
             let saved_host = self.host;
             self.host = saved;
-            let item = self.field(col.0.as_deref(), &col.1)?;
+            let base_item = self.field(col.0.as_deref(), &col.1)?;
+            let item = match arith {
+                None => base_item,
+                Some(('+', n)) => {
+                    Val::Add(Box::new(base_item), Box::new(Val::Int(n)))
+                }
+                Some(('-', n)) => {
+                    Val::Sub(Box::new(base_item), Box::new(Val::Int(n)))
+                }
+                Some((_, n)) => {
+                    Val::Mul(Box::new(base_item), Box::new(Val::Int(n)))
+                }
+            };
             let wher = if self.kw("WHERE") {
                 Some(Box::new(self.bool_or()?))
             } else {
@@ -1761,6 +1799,19 @@ impl<'a> P<'a> {
         self.i += 1;
         if branches.len() < 2 {
             return None;
+        }
+        // the unification law: one arithmetic branch types the union
+        // int64, and every PLAIN branch wraps in cast(int64)
+        let unified = branches
+            .iter()
+            .any(|(.., item)| matches!(item, Val::Add(..) | Val::Sub(..) | Val::Mul(..)));
+        if unified {
+            for (.., item) in branches.iter_mut() {
+                if matches!(item, Val::Field(..)) {
+                    let taken = std::mem::replace(item, Val::Int(0));
+                    *item = Val::CastInt64(Box::new(taken));
+                }
+            }
         }
         Some(SubQ {
             stream: Stream {
@@ -2723,6 +2774,12 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
             out.push(0xBF); // blr_derived_expr
             out.push(1);
             out.push(*ctx);
+            emit_val(out, inner);
+        }
+        Val::CastInt64(inner) => {
+            out.push(0x83); // blr_cast
+            out.push(0x10); // blr_int64
+            out.push(0);
             emit_val(out, inner);
         }
         Val::InParam(i) => {
@@ -4324,6 +4381,10 @@ fn emit_map_entries(out: &mut Vec<u8>, map: &[MapEntry]) {
 enum PlanKind {
     Natural,
     Index(Vec<String>),
+    /// PLAN (tbl ORDER idx): blr_navigational + ONE counted name -
+    /// no count byte, unlike blr_indices (probed); the engine
+    /// demands a matching ORDER BY
+    Order(String),
 }
 
 /// A body FOR SELECT's UNION: the union context, ALL or distinct,
@@ -5342,6 +5403,11 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                             out.extend_from_slice(n.as_bytes());
                         }
                     }
+                    PlanKind::Order(name) => {
+                        out.push(0x8F); // blr_navigational
+                        out.push(name.len() as u8);
+                        out.extend_from_slice(name.as_bytes());
+                    }
                 }
             }
             out.push(blr::END);
@@ -5722,6 +5788,14 @@ impl<'a> P<'a> {
             self.i += 1;
             if self.kw("NATURAL") {
                 plan = Some(PlanKind::Natural);
+            } else if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "ORDER")
+            {
+                self.i += 1;
+                let Some(Tok::Ident(n)) = self.t.get(self.i) else {
+                    return None;
+                };
+                plan = Some(PlanKind::Order(n.clone()));
+                self.i += 1;
             } else if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "INDEX")
             {
                 self.i += 1;
@@ -11390,6 +11464,38 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_forty_six_shapes_byte_for_byte() {
+        // the union TYPE-UNIFICATION law, converted (flip sixty-nine):
+        // one arithmetic branch types the union int64 (dialect-3,
+        // width-independent - catalog-free) and every PLAIN branch
+        // wraps in cast(int64)
+        pin_proc(
+            "CREATE PROCEDURE RO1 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE AMT IN (SELECT UA FROM U UNION ALL SELECT UA * 2 FROM U) INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014A0154004797430143014C010243014A015502FF4D01000000831000170202554143014A015503FF4D0100000024170302554115080002000000FF472F170003414D5418010000FFFF020117000249441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // PLAN (tbl ORDER idx) - blr_navigational + ONE counted name,
+        // no count byte (flip seventy); the engine demands the
+        // matching ORDER BY
+        pin_proc(
+            "CREATE PROCEDURE RO2 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE ID > 1 PLAN (T ORDER IDX_T_ID) ORDER BY ID INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014A015400473117000249441508000100000046014817000249448B914A0154008F084944585F545F4944FF020117000249441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+    }
+
+    #[test]
+    fn slice_forty_six_refusals() {
+        for sql in [
+            // DIVISION in a union branch: the scale rules ride a
+            // different promotion - unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE AMT IN (SELECT UA FROM U UNION ALL SELECT UA / 2 FROM U) INTO :R1 DO SUSPEND; END",
+            // field-by-field arithmetic in a branch: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE AMT IN (SELECT UA FROM U UNION ALL SELECT UA + UID FROM U) INTO :R1 DO SUSPEND; END",
+        ] {
+            assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
+        }
+    }
+
+    #[test]
     fn slice_forty_five_refusals() {
         for sql in [
             // multi-column recursive ctes: unprobed
@@ -11413,11 +11519,6 @@ mod tests {
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE ID IN (SELECT UID FROM U UNION SELECT ID FROM T) INTO :R1 DO SUSPEND; END",
             // EXISTS over a union: unprobed
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE EXISTS (SELECT UID FROM U UNION ALL SELECT ID FROM T) INTO :R1 DO SUSPEND; END",
-            // EXPRESSION branch items unify the union's TYPE - the
-            // engine casts plain branches to the promoted type
-            // (probed: AMT * 2 made every branch cast(int64)) - the
-            // CASE-unification law in union clothing, unconverted
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE AMT IN (SELECT UA FROM U UNION ALL SELECT UA * 2 FROM U) INTO :R1 DO SUSPEND; END",
             // derived branches inside a union subquery: unprobed
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE ID IN (SELECT V FROM (SELECT ID AS V FROM T) A UNION ALL SELECT UID FROM U) INTO :R1 DO SUSPEND; END",
         ] {

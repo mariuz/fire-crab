@@ -5136,6 +5136,17 @@ branch has ZERO streams - it reads the recursion's own output
 context by fid. That shape needs its own emission path, and the
 probe bytes are already in the refusal's comment waiting for it.
 
+Slice 46 converted the law the gate found two slices earlier: union
+type-unification, where one arithmetic branch types the whole union
+int64 and every plain branch wraps in cast(int64) - catalog-free
+because dialect-3 integer arithmetic is width-independent, the same
+boundary the recursion slice drew. The slice-44 refusal flipped to a
+live check, completing the pattern a third time: the gate finds the
+law, names it with its transcript, and a later slice converts it.
+PLAN (tbl ORDER idx) rode along - blr_navigational with ONE counted
+name and no count byte, plus a probe-found engine rule: the plan is
+only legal beside a matching ORDER BY.
+
 Slice 45 cashed the oldest banked transcript - recursive ctes,
 named with their bytes back in slice 42. The shape rewards the wait:
 blr_recurse emits TWO context bytes (the recursion's and a SECONDARY

@@ -13,6 +13,28 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-dsql slice 46: the unification law converted, PLAN ORDER
+
+### Converted
+- **Union type-unification** (flip sixty-nine — the law the gate
+  found in slice 44, converted): one arithmetic branch (`+`/`-`/`*`
+  with an integer literal) types the union int64 — dialect-3
+  integer arithmetic is width-independent, so the typing is
+  CATALOG-FREE — and every PLAIN branch wraps in `cast(int64)`.
+  The slice-44 named refusal flipped to a live check; a three-way
+  union mixing `+ 5`, a plain column and `- 1` (with a parameter in
+  a branch WHERE) pins the general shape.
+- **PLAN (tbl ORDER idx)** (flip seventy): `blr_navigational`
+  (0x8F) + ONE counted index name — no count byte, unlike
+  blr_indices — and a probe-found engine rule: the plan is only
+  legal beside a MATCHING ORDER BY ("index cannot be used in the
+  specified plan" without it).
+
+### Guarded
+- DIVISION in union branches (scale-rule promotion), field-by-field
+  branch arithmetic. Gates: proc 271 → 274, view 128, exe 110, trig
+  48, field 39; 72 dsql tests; 395 pins; 272 workspace tests.
+
 ## 2026-07-29 — fire-crab-blb slice 3: blob GC and the blob crash workload
 
 ### Converted
