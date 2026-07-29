@@ -13,6 +13,26 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-exe slice 12: the string functions
+
+### Converted
+- **UPPER / LOWER** (`blr_upcase`/`blr_lowcase`, unary),
+  **CHAR_LENGTH / OCTET_LENGTH** (`blr_strlen` + the length-type
+  byte the dsql side probed years of slices ago, read back),
+  **SUBSTRING** (`blr_substring` — the 0-based start arriving as
+  the reference compiler's unfolded `subtract(from, 1)`, exactly
+  the tree the playbook says to match; negative start or length is
+  a runtime error, past-the-end is empty, NULL propagates through
+  all three operands) and **TRIM** (the where byte: both / leading
+  / trailing over spaces).
+
+### Guarded
+- TRIM-by-character (spec 1) refuses; GEN_ID stays named — a
+  SELECT that WRITES, against fcexe's read-only file model, is a
+  design decision rather than a parse arm. One frontier swap:
+  two-argument SUBSTRING (FROM without FOR) is a dsql-side gap.
+  Gate: 98 → 105 checks. 261 workspace tests.
+
 ## 2026-07-29 — fire-crab-exe slice 11: simple CASE, cross-family casts, RANGE value bounds
 
 ### Converted

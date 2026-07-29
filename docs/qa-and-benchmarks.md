@@ -4151,6 +4151,19 @@ operand matches nothing) rounded out the slice, keeping the standing
 posture: render or parse exactly, error on anything lossy, never
 silently.
 
+### Slice 12: the trees the compiler built, read back
+
+The string functions closed a loop the project opened thirty dsql
+slices ago: SUBSTRING's 0-based start arrives as the unfolded
+subtract(from, 1) the reference compiler emits - the tree the
+porting playbook told compiler-writers to match rather than fold -
+and the executor now evaluates that same tree against live rows.
+CHAR_LENGTH and OCTET_LENGTH share blr_strlen distinguished by the
+probed type byte; TRIM's where byte covers both/leading/trailing
+over spaces with trim-by-character refusing; and the runtime edges
+hold the standing posture - negative substring bounds error, a
+start past the end answers empty, NULL propagates.
+
 ## Query surface: what the server answers, and what it refuses
 
 Everything below is verified by a differential gate under `qa/` — the

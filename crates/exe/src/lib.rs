@@ -48,7 +48,12 @@ mod blr {
     pub const DIVIDE: u8 = 37;
     pub const NEGATE: u8 = 38;
     pub const CONCATENATE: u8 = 39;
+    pub const SUBSTRING: u8 = 40;
     pub const VIA: u8 = 43;
+    pub const UPCASE: u8 = 103;
+    pub const LOWCASE: u8 = 181;
+    pub const STRLEN: u8 = 182;
+    pub const TRIM: u8 = 183;
     pub const VALUE_IF: u8 = 105;
     pub const CAST: u8 = 131;
     pub const COALESCE: u8 = 202;
@@ -169,6 +174,18 @@ pub enum Expr {
     Arith(u8, Box<Expr>, Box<Expr>),
     /// blr_negate
     Negate(Box<Expr>),
+    /// blr_upcase / blr_lowcase - ASCII case mapping (the charset
+    /// layer waits with internationalization)
+    CaseMap(bool, Box<Expr>),
+    /// blr_strlen: the length-type byte (1 = CHAR_LENGTH, 2 =
+    /// OCTET_LENGTH) and the operand
+    StrLen(u8, Box<Expr>),
+    /// blr_substring(value, start, length) - the start is 0-BASED,
+    /// compiled as the reference compiler's unfolded subtract
+    Substr(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// blr_trim: where (0 both, 1 leading, 2 trailing), spec 0 =
+    /// spaces (spec 1, trim-by-character, is unconverted)
+    Trim(u8, Box<Expr>),
     /// blr_cast: convert to the carried descriptor's type - range
     /// checks error (never wrap), text width overflows error (never
     /// silently truncate), NULL passes through
@@ -579,6 +596,25 @@ impl<'a> P<'a> {
                     ops.push(self.expr()?);
                 }
                 Ok(Expr::Coalesce(ops))
+            }
+            blr::UPCASE => Ok(Expr::CaseMap(true, Box::new(self.expr()?))),
+            blr::LOWCASE => Ok(Expr::CaseMap(false, Box::new(self.expr()?))),
+            blr::STRLEN => {
+                let kind = self.u8()?;
+                Ok(Expr::StrLen(kind, Box::new(self.expr()?)))
+            }
+            blr::SUBSTRING => Ok(Expr::Substr(
+                Box::new(self.expr()?),
+                Box::new(self.expr()?),
+                Box::new(self.expr()?),
+            )),
+            blr::TRIM => {
+                let wher = self.u8()?;
+                let spec = self.u8()?;
+                if spec != 0 {
+                    return Err("TRIM by character unconverted".into());
+                }
+                Ok(Expr::Trim(wher, Box::new(self.expr()?)))
             }
             blr::DECODE => {
                 let operand = Box::new(self.expr()?);
@@ -2259,6 +2295,58 @@ impl<'a> Exec<'a> {
                 }
                 out
             }
+            Expr::CaseMap(up, inner) => match self.eval(inner)? {
+                Value::Null => Value::Null,
+                Value::Text(t) => Value::Text(if *up {
+                    t.to_uppercase()
+                } else {
+                    t.to_lowercase()
+                }),
+                _ => return Err("case mapping over a non-text value".into()),
+            },
+            Expr::StrLen(kind, inner) => match self.eval(inner)? {
+                Value::Null => Value::Null,
+                Value::Text(t) => Value::Int(match kind {
+                    1 => t.chars().count() as i64,
+                    2 => t.len() as i64,
+                    other => {
+                        return Err(format!("strlen type {} unconverted", other))
+                    }
+                }),
+                _ => return Err("length of a non-text value".into()),
+            },
+            Expr::Substr(v, start, len) => {
+                let (vv, sv, lv) = (self.eval(v)?, self.eval(start)?, self.eval(len)?);
+                match (vv, sv, lv) {
+                    (Value::Null, _, _) | (_, Value::Null, _) | (_, _, Value::Null) => {
+                        Value::Null
+                    }
+                    (Value::Text(t), Value::Int(st), Value::Int(ln)) => {
+                        // the engine's runtime rules: a negative
+                        // length errors, a start past the end is empty
+                        if ln < 0 {
+                            return Err("negative substring length".into());
+                        }
+                        if st < 0 {
+                            return Err("negative substring start".into());
+                        }
+                        let chars: Vec<char> = t.chars().collect();
+                        let st = (st as usize).min(chars.len());
+                        let end = (st + ln as usize).min(chars.len());
+                        Value::Text(chars[st..end].iter().collect())
+                    }
+                    _ => return Err("substring over non-text operands".into()),
+                }
+            }
+            Expr::Trim(wher, inner) => match self.eval(inner)? {
+                Value::Null => Value::Null,
+                Value::Text(t) => Value::Text(match wher {
+                    1 => t.trim_start_matches(' ').to_string(),
+                    2 => t.trim_end_matches(' ').to_string(),
+                    _ => t.trim_matches(' ').to_string(),
+                }),
+                _ => return Err("trim over a non-text value".into()),
+            },
             Expr::Decode(operand, conds, results) => {
                 let ov = self.eval(operand)?;
                 let mut hit = None;
