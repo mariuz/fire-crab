@@ -710,6 +710,53 @@ them.
   engine's own credentials store — and OCTETS columns must be read as
   BYTES, or every byte above 0x7F becomes U+FFFD.
 
+## When the engine ships a client for the thing you converted, use it
+
+- **Put the vendor's tool on BOTH sides.** The Services API has
+  `fbsvcmgr`; a wire protocol has the driver; a page format has `gstat`.
+  Point the tool at the real server and compare with your decoder
+  (proves you READ the format), then point it at your server and let it
+  print your answers (proves you WRITE it, with nothing of yours in the
+  reading path). Two directions, one tool, no self-agreement.
+- **One buffer format is often several grammars.** Firebird's clumplet
+  buffers look identical and are not: the same `[tag][len][data]` is a
+  one-byte length in an attach SPB, a two-byte length in a query's send
+  items, and no length at all in its receive items - with control tags
+  standing bare inside one of them. Find the reader's `kind` parameter
+  before you write a parser, and make the grammar an explicit argument
+  so a caller cannot pick it by accident. Then test that the same bytes
+  under a different grammar do NOT parse to the same items.
+- **When nothing in the bytes distinguishes two encodings, that
+  knowledge is code.** Service answers are length-prefixed strings or
+  bare four-byte numbers, chosen per item, and the buffer does not say
+  which; the engine knows because the writer chose a macro. Convert that
+  choice as a table (`item_is_numeric`), because a decoder that guesses
+  reads a length as data and mis-parses everything after it.
+- **Off-by-one room checks are load-bearing; measure them live.** The
+  engine's `INF_put_item` reserves `length + 4` and compares with `>=`,
+  so the client's last buffer byte is never used. A `>` fits an answer
+  the engine would have truncated. Do not read the boundary off the
+  source alone - ask the live server with n+4 and n+5 bytes of buffer
+  and let it tell you where it breaks. (And note when two paths in the
+  same file disagree by a byte: the numeric check really does use `>`.
+  Convert both as written instead of unifying them.)
+- **A clean acknowledgement is a lie about work you did not do.** The
+  service manager used to answer `op_service_start` - "back up this
+  database" - with a clean response so the client would not desync. To
+  the client that reads as "the backup finished". Refuse with the
+  engine's own code (`isc_wish_list`), and gate it against the real
+  server performing the same action, so the refusal is provably yours
+  and not the request's.
+- **How the engine says "not implemented" is itself a behaviour to
+  convert.** For an unknown info item svc.cpp RAISES rather than
+  skipping the item or writing a marker; skipping would make the client
+  read the next item's bytes as this item's answer. Check that both
+  servers refuse the same request with the same status code.
+- **Let the gate re-capture its own byte pins.** Trace the buffers the
+  vendor's tool actually sends and feed them back through your parser on
+  every run. A frozen hex constant tests what the tool sent the day you
+  copied it; a re-derived one tests what it sends today.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

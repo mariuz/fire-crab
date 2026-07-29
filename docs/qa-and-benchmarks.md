@@ -5958,6 +5958,68 @@ sends", and the same law is what makes proof comparison a VALUE comparison on
 the server side (a padded 64-digit M against a client's 63-digit one rejects a
 valid login once every sixteen attaches). A, B and M are now all `getText`.
 
+### The Services manager, with fbsvcmgr on both sides (`qa/svc-info.sh`, 19 checks)
+
+The Services API is the one subsystem where the ENGINE'S OWN CLIENT can be put on
+either side of the differential, so this gate does both.
+
+**Our decoder, the engine's server.** `fcsvc info` and `fbsvcmgr` ask the live
+service manager for the same items; every decoded value must match. That is a
+stronger statement than it looks, because the answer buffer has two shapes chosen
+per item — length-prefixed strings (`INF_put_item`) and bare four-byte numbers
+(`ADD_SPB_NUMERIC`) — with nothing in the bytes to say which. Get one item's
+shape wrong and every later item in the same request is misread, so agreement on
+a five-item request is agreement about the grammar.
+
+**The engine's client, our server.** `fbsvcmgr` — a C++ tool carrying the
+engine's own decoder — attaches to fcwire's service manager and prints its
+answers, including the `isc_info_svc_svr_db_info` cluster (bare opening tag, two
+numerics, dbnames, `isc_info_flag_end`) that the previous hand-rolled responder
+did not answer at all. Nothing of fire-crab's is in the reading path. Then our
+own client reads the same server and must agree with `fbsvcmgr` about it: two
+independent decoders over one buffer.
+
+**The truncation boundary, measured rather than assumed.** `INF_put_item` needs
+`length + 4` bytes and compares with `>=`, so an n-byte answer needs n + 5 and
+the buffer's last byte is never written. The gate reads the real server's version
+banner (35 bytes), asks again with a 39-byte buffer and requires
+`02 01` — `isc_info_truncated`, `isc_info_end` — then asks with 40 and requires
+the whole string. fire-crab's encoder must then break at the same place for its
+own 37-byte banner, both offline (`fcsvc answer`) and over the wire. This is
+where the slice's bug was: the first version used `>` and fit an answer the
+engine would have cut.
+
+**The grammars, re-captured every run.** `FC_SRV_TRACE=1` makes fcwire hex-dump
+the SPB and query buffers it receives; the gate pulls `fbsvcmgr`'s own attach SPB
+out of that trace (selected by the `fbsvcmgr` bytes in its `isc_spb_process_name`,
+so it cannot accidentally grab one of ours) and feeds it back to `fcsvc parse
+attach`. The pins are therefore derived from live bytes on every run rather than
+frozen. The teeth: the same buffer read under a different grammar must NOT yield
+the same items.
+
+Real captured bytes, for the record:
+
+```
+attach = 0202 7600 1c06"SYSDBA" 3a04 00000000 6e04 f5b90f00
+         701a"/opt/firebird/bin/fbsvcmgr" 7723"LI-T6.0.0.2076 Firebird 6.0 fd83f03"
+send   = 40 0400 01000000 01     (isc_info_svc_timeout = 1, isc_info_end)
+recv   = 37 32                   (server_version, svr_db_info - bare, unterminated)
+```
+
+Note the absent password: SRP authenticated the connection, and the SPB carries
+only the login. A service manager that demands `isc_spb_password` here refuses
+every modern client.
+
+**The refusals, both kinds.** An info item neither side implements
+(`isc_info_svc_get_license`) must draw `isc_wish_list` (335544378) from BOTH
+servers — the engine's `query2` raises on its `default:` arm rather than skipping
+the item, and skipping would make the client read the next item's bytes as this
+one's. And a service ACTION must be refused by fire-crab while the same action
+succeeds against the engine: `fbsvcmgr action_db_stats` prints "feature is not
+supported" against fcwire and real statistics against the real server. That check
+exists because the previous code did the opposite — it answered `op_service_start`
+with a clean `op_response`, which to a client means the backup finished.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
@@ -6582,6 +6644,14 @@ FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
 NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     bash /path/to/fire-crab/qa/serve-real-predfull.sh 3050
+
+# The Services manager, with the engine's own fbsvcmgr on both sides:
+# our decoder against the real server, fbsvcmgr against fire-crab's
+# service manager, the truncation boundary, and the grammar pins
+# re-captured from live bytes.
+FCSVC=/path/to/fire-crab/target/release/fcsvc \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire \
+    bash /path/to/fire-crab/qa/svc-info.sh 4183
 
 # SRP authentication against three oracles: the verifiers CREATE USER
 # stored (read out of the security database with fire-crab's own ODS

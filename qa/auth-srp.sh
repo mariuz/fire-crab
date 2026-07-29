@@ -59,19 +59,52 @@ EOF
 
 sql() { "$ISQL" -q -b -user "$U" -pas "$P" "$DB" >/dev/null 2>&1; }
 
+field() { awk -v k="$2" '$1 == k {print $2}' <<<"$1"; }
+
 # A snapshot of the security database, retried until the user we just
-# wrote is visible in it: the server may still be holding the freshly
-# committed page in its cache.
+# wrote is VISIBLE in it. Existence is only a freshness signal for a name
+# that never existed before - hence the per-run suffix on every user this
+# gate creates. (The engine writes the data page before it flips the TIP,
+# so a copy taken between the two shows the OLD record version; a reader
+# that cannot tell would compare a fresh password against a stale
+# verifier and report a conversion bug that is really a race.)
+# The wait is generous on purpose: the security database is written by an
+# attachment the engine CACHES, so how soon a committed row reaches the
+# file depends on that attachment's flushing, not on our COMMIT returning.
+# Five seconds was enough on a quiet server and not enough right after a
+# few dozen ALTER USERs.
 snap_until() { # <user>
     i=0
-    while [ $i -lt 20 ]; do
+    while [ $i -lt 60 ]; do
         cp "$SEC" "$SNAP" 2>/dev/null
         "$FCAUTH" stored "$SNAP" "$1" >/dev/null 2>&1 && return 0
-        i=$((i + 1)); sleep 0.2
+        i=$((i + 1)); sleep 0.5
     done
     return 1
 }
-field() { awk -v k="$2" '$1 == k {print $2}' <<<"$1"; }
+
+# ... and after an ALTER, retried until the SALT has changed. That is the
+# non-circular freshness test: the engine re-randomizes the salt on every
+# password change, and waiting for "the verifier matches" would be waiting
+# for the answer we are trying to check.
+snap_until_new_salt() { # <user> <old-salt>
+    i=0
+    while [ $i -lt 60 ]; do
+        cp "$SEC" "$SNAP" 2>/dev/null
+        got=$(field "$("$FCAUTH" stored "$SNAP" "$1" 2>/dev/null)" SALT)
+        if [ -n "$got" ] && [ "$got" != "$2" ]; then
+            return 0
+        fi
+        i=$((i + 1)); sleep 0.5
+    done
+    return 1
+}
+
+# every user this run creates carries the pid, so a name never collides
+# with a leftover row from an earlier run
+SFX="$$"
+U1="FCAUTH1$SFX"
+UZ="FCAUTHZ$SFX"
 
 # --------------------------------------------------- 1. stored verifier ---
 create_user() { # <user> <password>
@@ -82,15 +115,15 @@ EOF
 }
 
 PW1="fc-auth-pw-1"
-create_user FCAUTH1 "$PW1"
-if ! snap_until FCAUTH1; then
-    echo "FAIL FCAUTH1 never appeared in the security database snapshot"
+create_user "$U1" "$PW1"
+if ! snap_until "$U1"; then
+    echo "FAIL $U1 never appeared in the security database snapshot (waited 30s)"
     exit 1
 fi
-st=$("$FCAUTH" stored "$SNAP" FCAUTH1)
+st=$("$FCAUTH" stored "$SNAP" "$U1")
 salt=$(field "$st" SALT)
 stored_v=$(field "$st" VERIFIER)
-ours=$("$FCAUTH" verifier FCAUTH1 "$PW1" "$salt")
+ours=$("$FCAUTH" verifier "$U1" "$PW1" "$salt")
 our_v=$(field "$ours" V)
 if [ -n "$stored_v" ] && [ "$our_v" = "$stored_v" ]; then
     echo "OK   fire-crab reproduces the verifier CREATE USER stored (${#stored_v} hex digits)"
@@ -103,7 +136,7 @@ fi
 
 # the same pair, checked the way the engine checks it: a server half that
 # holds ONLY the stored bytes must accept a client that knows the password
-ck=$("$FCAUTH" check "$SNAP" FCAUTH1 "$PW1")
+ck=$("$FCAUTH" check "$SNAP" "$U1" "$PW1")
 case "$ck" in
     *"RECOMPUTED MATCH"*"PROOF ACCEPTED"*)
         echo "OK   the stored verifier alone (no password) accepts our proof" ;;
@@ -111,7 +144,7 @@ case "$ck" in
 esac
 
 # teeth: a WRONG password must not reproduce the stored verifier
-ck=$("$FCAUTH" check "$SNAP" FCAUTH1 "not-the-password")
+ck=$("$FCAUTH" check "$SNAP" "$U1" "not-the-password")
 case "$ck" in
     *"RECOMPUTED DIFFER"*"PROOF REJECTED"*)
         echo "OK   a wrong password reproduces neither the verifier nor a proof" ;;
@@ -120,12 +153,12 @@ esac
 
 # ALTER USER: the engine re-randomises the salt, so the whole pair moves
 PW2="fc-auth-pw-2"
-create_user FCAUTH1 "$PW2"
-snap_until FCAUTH1
-st2=$("$FCAUTH" stored "$SNAP" FCAUTH1)
+create_user "$U1" "$PW2"
+snap_until_new_salt "$U1" "$salt"
+st2=$("$FCAUTH" stored "$SNAP" "$U1")
 salt2=$(field "$st2" SALT)
 v2=$(field "$st2" VERIFIER)
-ours2=$(field "$("$FCAUTH" verifier FCAUTH1 "$PW2" "$salt2")" V)
+ours2=$(field "$("$FCAUTH" verifier "$U1" "$PW2" "$salt2")" V)
 if [ "$salt2" != "$salt" ] && [ "$ours2" = "$v2" ]; then
     echo "OK   ALTER USER re-salts and re-verifies; fire-crab follows"
 elif [ "$salt2" = "$salt" ]; then
@@ -136,12 +169,17 @@ fi
 
 # ------------------------------------------- 2. the minimal-hex salt ------
 # hunt for a salt whose leading nibble is zero (p = 1/16 per ALTER)
-zero_salt=""; tries=0
+zero_salt=""; tries=0; prev=""
 while [ $tries -lt 48 ]; do
     tries=$((tries + 1))
-    create_user FCAUTHZ "fc-auth-z-$tries"
-    snap_until FCAUTHZ || continue
-    s=$(field "$("$FCAUTH" stored "$SNAP" FCAUTHZ)" SALT)
+    create_user "$UZ" "fc-auth-z-$tries"
+    if [ -z "$prev" ]; then
+        snap_until "$UZ" || continue
+    else
+        snap_until_new_salt "$UZ" "$prev" || continue
+    fi
+    s=$(field "$("$FCAUTH" stored "$SNAP" "$UZ")" SALT)
+    prev="$s"
     case "$s" in
         0*) zero_salt="$s"; zero_pw="fc-auth-z-$tries"; break ;;
     esac
@@ -150,12 +188,12 @@ if [ -z "$zero_salt" ]; then
     echo "SKIP no leading-zero salt in $tries tries (p=1/16 each) - the"
     echo "     minimal-hex law is still pinned by unit tests"
 else
-    stz=$("$FCAUTH" stored "$SNAP" FCAUTHZ)
+    stz=$("$FCAUTH" stored "$SNAP" "$UZ")
     vz=$(field "$stz" VERIFIER)
-    minimal=$("$FCAUTH" verifier FCAUTHZ "$zero_pw" "$zero_salt")
+    minimal=$("$FCAUTH" verifier "$UZ" "$zero_pw" "$zero_salt")
     salt_text=$(field "$minimal" SALT_TEXT)
     v_min=$(field "$minimal" V)
-    padded=$("$FCAUTH" verifier-padded FCAUTHZ "$zero_pw" "$zero_salt")
+    padded=$("$FCAUTH" verifier-padded "$UZ" "$zero_pw" "$zero_salt")
     v_pad=$(field "$padded" V_PADDED)
     v_raw=$(field "$padded" V_RAW)
     if [ "$v_min" = "$vz" ]; then
@@ -170,7 +208,7 @@ else
     else
         echo "DIFF a padded or raw salt also matched - the law is untested"; fail=1
     fi
-    lg=$("$FCAUTH" login "$HOST" "$PORT" "$DB" FCAUTHZ "$zero_pw" Srp256 2>&1)
+    lg=$("$FCAUTH" login "$HOST" "$PORT" "$DB" "$UZ" "$zero_pw" Srp256 2>&1)
     slen=$(field "$lg" SALT_LEN)
     case "$lg" in
         *"AUTH OK"*)
@@ -180,7 +218,7 @@ else
 fi
 
 # ------------------------------------------------------ 3. live logins ----
-lg=$("$FCAUTH" login "$HOST" "$PORT" "$DB" FCAUTH1 "$PW2" Srp256 2>&1)
+lg=$("$FCAUTH" login "$HOST" "$PORT" "$DB" "$U1" "$PW2" Srp256 2>&1)
 case "$lg" in
     *"AUTH OK plugin=Srp256"*)
         echo "OK   Srp256 handshake accepted by the live engine ($(field "$lg" AUTH))" ;;
@@ -189,7 +227,7 @@ esac
 
 # the engine's session key is not observable, but its VERDICT is - and a
 # wrong password must reach isc_login (335544472), not an acceptance
-lg=$("$FCAUTH" login "$HOST" "$PORT" "$DB" FCAUTH1 "wrong-$PW2" Srp256 2>&1)
+lg=$("$FCAUTH" login "$HOST" "$PORT" "$DB" "$U1" "wrong-$PW2" Srp256 2>&1)
 case "$lg" in
     *"AUTH FAIL gds=335544472"*)
         echo "OK   a wrong password is refused with isc_login after the proof" ;;
@@ -207,7 +245,7 @@ esac
 # Srp256, so offering just Srp cannot reach a proof. Record the ENGINE's
 # own refusal rather than claiming the variant works - its arithmetic is
 # pinned by the loopback and vector tests instead.
-lg=$("$FCAUTH" login "$HOST" "$PORT" "$DB" FCAUTH1 "$PW2" Srp 2>&1)
+lg=$("$FCAUTH" login "$HOST" "$PORT" "$DB" "$U1" "$PW2" Srp 2>&1)
 case "$lg" in
     *"AUTH OK plugin=Srp"*)
         echo "OK   the Srp (SHA-1 proof) variant is served here and accepted" ;;
@@ -261,9 +299,9 @@ else
 fi
 
 # ----------------------------------------------------------- cleanup -----
-"$ISQL" -q -b -user "$U" -pas "$P" "$DB" >/dev/null 2>&1 <<'SQL'
-DROP USER FCAUTH1;
-DROP USER FCAUTHZ;
+"$ISQL" -q -b -user "$U" -pas "$P" "$DB" >/dev/null 2>&1 <<SQL
+DROP USER $U1;
+DROP USER $UZ;
 COMMIT;
 SQL
 rm -f "$SNAP"

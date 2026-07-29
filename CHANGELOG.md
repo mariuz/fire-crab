@@ -13,6 +13,84 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-svc slice 1: the engine's own fbsvcmgr, on both sides
+
+### Converted
+- **A NEW CRATE for `src/jrd/svc.cpp`** — the Services API, which is a
+  second protocol living inside the first: a client attaches to the name
+  `service_mgr` instead of a database, and from then on every request
+  and every answer is a byte buffer of tagged items. No statements, no
+  BLR, no rows. `gbak`, `gfix`, `gstat`, `nbackup`, `fbsvcmgr` and every
+  driver's service class are all this one interface, so converting the
+  buffers converts the tools.
+- **The four grammars the same-looking bytes follow**
+  (`ClumpletReader`'s kinds, ClumpletReader.cpp:262-310): the attach SPB
+  is TAGGED with 1-byte lengths, the query's "send" items carry 2-byte
+  lengths except the control codes which stand alone, the "receive"
+  items are bare tags with no lengths and no terminator, and a start SPB
+  is a state machine keyed by its action byte. Read a send buffer as an
+  attach buffer and a length becomes a tag.
+- **The two answer shapes, chosen per item.** Strings go through
+  `INF_put_item` (`[tag][u16 LE len][bytes]`), numerics through
+  `ADD_SPB_NUMERIC` (`[tag][4 bytes LE]`, no length at all). NOTHING in
+  the bytes says which, so `item_is_numeric` carries that knowledge,
+  read off which macro svc.cpp uses at each site.
+- **The `isc_info_svc_svr_db_info` cluster**: a BARE opening tag
+  (svc.cpp:1163 writes `*info++ = item`), then `isc_spb_num_att` and
+  `isc_spb_num_db` as numerics, then a `isc_spb_dbname` string per
+  database, closed by `isc_info_flag_end`. The old hand-rolled responder
+  did not answer this item at all; `fbsvcmgr -info_svr_db_info` now
+  works against fire-crab.
+- **fire-crab's own service client** (`fcsvc`): op_connect with SRP
+  (through `fire-crab-auth`), `op_crypt` Arc4, then op_service_attach /
+  op_service_info / op_service_detach against a live server. A client
+  that declares the wire-crypt stance ENABLED and then sends plaintext
+  is refused by the default server with `isc_miss_wirecrypt` (335545065)
+  — the declaration is a promise.
+
+### Fixed
+- **The truncation boundary was off by one, and the engine said so.**
+  `INF_put_item`'s room test is `ptr + length + 4 >= end` — a `>=`, so
+  the last byte of the client's buffer is never used and an n-byte
+  answer needs n + 5. The first implementation used `>` and fit an
+  answer the engine would have truncated. Caught by asking the LIVE
+  server for its 35-byte version banner with a 39-byte buffer (it
+  answers `isc_info_truncated`, `isc_info_end`) and a 40-byte one (it
+  answers the string). The numeric path's `ck_space_for_numeric` really
+  does use a strict `>`, one byte apart from the string path's; both are
+  converted as written rather than unified.
+
+### Guarded
+- **A service ACTION is refused, where it used to be acknowledged.**
+  `op_service_start` answered a clean `op_response` with the comment
+  "acknowledge so the client does not desync" — but a clean response to
+  a backup request means "done": the client then polls an empty output
+  stream and reports a successful backup that never happened. Now
+  `fbsvcmgr` prints *"feature is not supported"* (`isc_wish_list`) for
+  `action_db_stats` against fire-crab and the real statistics against
+  the engine, and the gate requires exactly that pair.
+- **An unimplemented info item refuses the whole query**, because that
+  is what the engine does: `query2`'s `default:` arm is
+  `status << Arg::Gds(isc_wish_list)`, not a marker and not silence.
+  Both servers refuse `isc_info_svc_get_license` with the same
+  335544378. Skipping the item would be worse than either — the client
+  would read the NEXT item's bytes as this item's answer.
+- The actions themselves (gbak/gfix/gstat behind an SPB) and the
+  `isc_info_svc_line`/`to_eof` output stream stay unconverted, as
+  constants only.
+
+### Fixed (the auth gate, from re-running it)
+- `qa/auth-srp.sh` read the security database by copying the file and
+  waiting for the user it had just written to APPEAR. Existence is not
+  freshness: on a re-run the name already existed, so the copy returned
+  the PREVIOUS run's row and the gate reported a verifier mismatch that
+  was really a race (the engine writes the data page before it flips the
+  TIP, and the security database is written by an attachment the engine
+  caches). Now every user carries the run's pid, so existence does imply
+  freshness, and after an ALTER the gate waits for the SALT to change -
+  a signal that is not the answer being checked. Waiting for "the
+  verifier matches" would have been a gate that agrees with itself.
+
 ## 2026-07-29 — fire-crab-auth slice 1: the engine's own verifiers as the oracle
 
 ### Converted

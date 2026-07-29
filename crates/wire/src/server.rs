@@ -206,6 +206,10 @@ fn respond_error(s: &mut TcpStream, enc: &mut Option<Rc4>, gds: i32) -> std::io:
 /// isc_dsql_error - the generic "Dynamic SQL Error" the server answers
 /// for statements it cannot honour rather than answering them wrong.
 const GDS_DSQL_ERROR: i32 = 335544569;
+/// `isc_wish_list` - "feature is not supported yet". The engine's own
+/// code for an operation it understands but does not perform, which is
+/// exactly what a service ACTION is to fire-crab.
+const GDS_WISH_LIST: i32 = 335544378;
 /// isc_primary_key_required - "Primary key required on table @1"
 /// (SQLSTATE 22000): UPDATE OR INSERT without MATCHING on a PK-less
 /// table, raised at prepare exactly as the engine raises it
@@ -570,8 +574,15 @@ fn serve_service(
     dec: &mut Option<Rc4>,
 ) -> std::io::Result<()> {
     read_int(s, dec)?; // database id (0)
-    read_wire_bytes(s, dec)?; // service name ("service_mgr")
-    read_wire_bytes(s, dec)?; // spb
+    let svc_name = read_wire_bytes(s, dec)?; // service name ("service_mgr")
+    let spb = read_wire_bytes(s, dec)?;
+    if std::env::var("FC_SRV_TRACE").is_ok() {
+        eprintln!(
+            "[srv] service_attach name={:?} spb={}",
+            String::from_utf8_lossy(&svc_name),
+            spb.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+        );
+    }
     respond(s, enc, 1)?; // service handle 1
     if std::env::var("FC_SRV_TRACE").is_ok() {
         eprintln!("[srv] op_service_attach ok, handle 1");
@@ -588,22 +599,51 @@ fn serve_service(
             x if x == OP_SERVICE_INFO => {
                 read_int(s, dec)?; // object (service handle)
                 read_int(s, dec)?; // incarnation
-                read_wire_bytes(s, dec)?; // send items
+                let send = read_wire_bytes(s, dec)?; // send items
                 let recv = read_wire_bytes(s, dec)?; // requested items
-                read_int(s, dec)?; // buffer length
-                let info = service_info(&recv);
-                let mut w = W::default();
-                w.int(OP_RESPONSE).int(0).int(0).int(0).bytes(&info).int(0);
-                w.send(s, enc)?;
+                let buflen = read_int(s, dec)?;
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    let hex = |b: &[u8]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
+                    eprintln!(
+                        "[srv] service_info send={} recv={} buflen={}",
+                        hex(&send), hex(&recv), buflen
+                    );
+                }
+                // an item we do not implement refuses the QUERY, the way
+                // svc.cpp's query2 does (isc_wish_list), instead of
+                // answering a buffer the client would misread
+                match service_info(&recv, buflen.max(0) as usize) {
+                    Ok(info) => {
+                        let mut w = W::default();
+                        w.int(OP_RESPONSE).int(0).int(0).int(0).bytes(&info).int(0);
+                        w.send(s, enc)?;
+                    }
+                    Err(e) => {
+                        if std::env::var("FC_SRV_TRACE").is_ok() {
+                            eprintln!("[srv] service_info REFUSED: {}", e);
+                        }
+                        respond_error(s, enc, GDS_WISH_LIST)?;
+                    }
+                }
             }
             x if x == OP_SERVICE_START => {
-                // service actions (backup, gstat, ...) are not converted;
-                // acknowledge so the client does not desync, and let its
-                // info-poll of the (empty) output stream complete
                 read_int(s, dec)?; // object
                 read_int(s, dec)?; // incarnation
-                read_wire_bytes(s, dec)?; // spb (the action)
-                respond(s, enc, 0)?;
+                let spb = read_wire_bytes(s, dec)?; // the action
+                // An action is a REQUEST TO DO SOMETHING - back up a
+                // database, sweep it, add a user. fire-crab runs none of
+                // them, and a clean op_response here says "done": the
+                // client then polls an empty output stream and reports a
+                // successful backup that never happened. So refuse, and
+                // name the action (fire-crab-svc parses the start SPB,
+                // whose first byte IS the action code).
+                let action = fire_crab_svc::parse(fire_crab_svc::Grammar::SpbStart, &spb)
+                    .ok()
+                    .and_then(|b| b.items.first().map(|c| c.tag));
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] op_service_start action={:?} REFUSED", action);
+                }
+                respond_error(s, enc, GDS_WISH_LIST)?;
             }
             x if x == OP_SERVICE_DETACH => {
                 read_int(s, dec)?; // handle
@@ -621,35 +661,34 @@ fn serve_service(
 
 /// Build the op_service_info response cluster for the requested items,
 /// mirroring the real server's bytes. Unknown items are skipped.
-fn service_info(items: &[u8]) -> Vec<u8> {
-    fn str_item(d: &mut Vec<u8>, tag: u8, val: &str) {
-        d.push(tag);
-        d.extend_from_slice(&(val.len() as u16).to_le_bytes());
-        d.extend_from_slice(val.as_bytes());
+/// What fire-crab's service manager reports about itself. The values are
+/// the ones a Firebird install on this machine would report (probe-pinned
+/// against the real server); the ENCODING comes from `fire-crab-svc`, the
+/// conversion of `Service::query2` - so the shape of every answer, the
+/// cluster framing and the truncation rule are the engine's, not this
+/// file's guesses.
+fn server_info() -> fire_crab_svc::ServerInfo {
+    fire_crab_svc::ServerInfo {
+        // the driver splits the first space-token on 'V'/'T', so this must
+        // look like a Firebird version banner
+        server_version: "LI-V6.0.0.2076 Firebird 6.0 fire-crab".to_string(),
+        implementation: "Firebird/Linux/ARM64".to_string(),
+        security_db: "/opt/firebird/security6.fdb".to_string(),
+        root: "/opt/firebird/".to_string(),
+        lock_dir: "/tmp/firebird/".to_string(),
+        msg_dir: "/opt/firebird/".to_string(),
+        service_version: 2,
+        capabilities: 0,
+        // fire-crab's service manager enumerates no attachments: it holds
+        // none. Reporting a number it cannot know would be a lie the
+        // client has no way to check.
+        attachments: 0,
+        databases: vec![],
     }
-    // RUNNING and VERSION are read by the driver as a bare 4-byte int
-    // (no 2-byte length prefix), unlike the string items - probe-pinned.
-    fn int_item(d: &mut Vec<u8>, tag: u8, val: i32) {
-        d.push(tag);
-        d.extend_from_slice(&val.to_le_bytes());
-    }
-    let mut d = Vec::new();
-    for &it in items {
-        match it {
-            // SERVER_VERSION: the driver splits the first space-token on
-            // 'V'/'T', so it must look like a Firebird version banner
-            55 => str_item(&mut d, 55, "LI-V6.0.0.2076 Firebird 6.0 fire-crab"),
-            56 => str_item(&mut d, 56, "Firebird/Linux/ARM64"), // IMPLEMENTATION
-            58 => str_item(&mut d, 58, "/opt/firebird/security6.fdb"), // USER_DBPATH
-            59 => str_item(&mut d, 59, "/opt/firebird/"), // GET_ENV (home)
-            60 => str_item(&mut d, 60, "/tmp/firebird/"), // GET_ENV_LOCK
-            54 => int_item(&mut d, 54, 2), // VERSION (service manager)
-            67 => int_item(&mut d, 67, 0), // RUNNING: no async action is running
-            _ => {}
-        }
-    }
-    d.push(1); // isc_info_end
-    d
+}
+
+fn service_info(items: &[u8], buffer_length: usize) -> Result<Vec<u8>, fire_crab_svc::QueryError> {
+    server_info().answer(items, buffer_length)
 }
 
 /// How a projected column is carried on the wire (protocol 13+ XDR).
@@ -21863,7 +21902,7 @@ mod tests {
     #[test]
     fn service_info_mirrors_real_bytes() {
         // string items carry a 2-byte length; RUNNING is a bare 4-byte int
-        let out = service_info(&[55, 67]);
+        let out = service_info(&[55, 67], 16384).expect("both items are implemented");
         assert_eq!(out[0], 55);
         let vlen = u16::from_le_bytes([out[1], out[2]]) as usize;
         let ver = &out[3..3 + vlen];
