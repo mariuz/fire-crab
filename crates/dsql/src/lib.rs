@@ -3063,6 +3063,12 @@ fn emit_cursor_decl(out: &mut Vec<u8>, d: &CursorDecl) {
         out.push(blr::RSE);
         out.push(1);
     }
+    // a JOIN chain's heads precede the cursor's own stream; the
+    // join streams carry the cursor pairing via their cur stamp
+    for _ in &d.joins {
+        out.push(blr::JOIN);
+        out.push(2);
+    }
     if d.sub {
         emit_relation3(out, &d.table);
     } else {
@@ -3077,6 +3083,16 @@ fn emit_cursor_decl(out: &mut Vec<u8>, d: &CursorDecl) {
     out.push(alias.len() as u8);
     out.extend_from_slice(alias.as_bytes());
     out.push(d.ctx);
+    for (jt, st, jctx, on) in &d.joins {
+        emit_stream(out, st, *jctx);
+        if *jt != 0 {
+            out.push(blr::JOIN_TYPE);
+            out.push(*jt);
+        }
+        out.push(blr::BOOLEAN);
+        emit_bool(out, on);
+        out.push(blr::END);
+    }
     if d.lock {
         out.push(blr::WRITELOCK);
     }
@@ -3124,7 +3140,12 @@ fn emit_cursor_decl(out: &mut Vec<u8>, d: &CursorDecl) {
         if d.agg.is_none() {
             out.push(blr::DERIVED_EXPR);
             out.push(1);
-            out.push(d.ctx);
+            // the wrap names each column's OWN stream (probed on a
+            // joined cursor: BF 01 00 then BF 01 01)
+            out.push(match o {
+                Val::Field(fctx, _) => *fctx,
+                _ => d.ctx,
+            });
         }
         emit_val(out, o);
     }
@@ -3642,6 +3663,11 @@ struct CursorDecl {
     lock: bool,
     /// declared inside a subroutine: the rse takes blr_relation3
     sub: bool,
+    /// JOIN chain inside the cursor's rse: (join_type, right stream
+    /// - pre-stamped with the cursor pairing - its ctx, the ON);
+    /// each output's derived_expr wrap carries its column's OWN
+    /// stream context (probed)
+    joins: Vec<(u8, Stream, u8, Bool)>,
     table: String,
     alias: Option<String>,
     ctx: u8,
@@ -4332,10 +4358,26 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
             out.push(1);
             if f.aggregate {
                 out.push(blr::AGGREGATE);
-                out.push(f.ctx + 1);
+                out.push(f.ctx + 1 + f.joins.len() as u8);
                 out.push(blr::RSE);
                 out.push(1);
+                // the inner rse holds the JOIN chain when one exists,
+                // its WHERE inside either way (probed)
+                for _ in &f.joins {
+                    out.push(blr::JOIN);
+                    out.push(2);
+                }
                 emit_stream(out, &f.stream, f.ctx);
+                for (jt, st, jctx, on) in &f.joins {
+                    emit_stream(out, st, *jctx);
+                    if *jt != 0 {
+                        out.push(blr::JOIN_TYPE);
+                        out.push(*jt);
+                    }
+                    out.push(blr::BOOLEAN);
+                    emit_bool(out, on);
+                    out.push(blr::END);
+                }
                 if let Some(b) = &f.boolean {
                     out.push(blr::BOOLEAN);
                     emit_bool(out, b);
@@ -4723,12 +4765,8 @@ impl<'a> P<'a> {
             }
         }
         let aggregate = has_aggs || grouped;
-        // joins beside aggregates, FIRST/SKIP or WITH LOCK: unprobed
-        if !joins.is_empty()
-            && (aggregate
-                || first.is_some()
-                || skip.is_some())
-        {
+        // joins beside FIRST/SKIP: unprobed
+        if !joins.is_empty() && (first.is_some() || skip.is_some()) {
             return None;
         }
         if aggregate {
@@ -4738,10 +4776,11 @@ impl<'a> P<'a> {
             if first.is_some() || skip.is_some() {
                 return None;
             }
-            // the aggregate node takes the NEXT context (stream + 1,
-            // probed at 1-over-0 and 3-over-2); claim its slot so
-            // later statements keep counting correctly
-            self.agg_fid_ctx = ctx + 1;
+            // the aggregate node takes the NEXT context - after the
+            // stream AND any join streams (probed: a joined COUNT
+            // put the aggregate at 2 over streams 0 and 1); claim
+            // its slot so later statements keep counting correctly
+            self.agg_fid_ctx = ctx + 1 + joins.len() as u8;
             self.streams.push(Stream {
                 name: String::new(),
                 alias: None,
@@ -4771,7 +4810,7 @@ impl<'a> P<'a> {
             self.agg_mode = true;
             let b = self.bool_or()?;
             self.agg_mode = false;
-            Some(map_bool_to_fids(&self.agg_map, b, ctx + 1)?)
+            Some(map_bool_to_fids(&self.agg_map, b, self.agg_fid_ctx)?)
         } else {
             None
         };
@@ -4803,7 +4842,7 @@ impl<'a> P<'a> {
                     _ => return None,
                 };
                 let key = if aggregate {
-                    map_val_to_fid(&self.agg_map, &key, ctx + 1)?
+                    map_val_to_fid(&self.agg_map, &key, self.agg_fid_ctx)?
                 } else {
                     key
                 };
@@ -4824,7 +4863,8 @@ impl<'a> P<'a> {
         self.sub = saved_sub;
         self.merge_scope = saved_scope;
         let col_vals: Vec<Val> = if aggregate {
-            (0..cols_n).map(|i| Val::Fid(ctx + 1, i as u16)).collect()
+            let fid_ctx = ctx + 1 + joins.len() as u8;
+            (0..cols_n).map(|i| Val::Fid(fid_ctx, i as u16)).collect()
         } else {
             items
                 .iter()
@@ -5112,7 +5152,7 @@ impl<'a> P<'a> {
     /// cursor's context and table.
     fn find_pos_cursor(&self, name: &str) -> Option<(u8, String)> {
         if let Some(d) = self.cursor_decls.iter().find(|d| d.name == name) {
-            if d.agg.is_some() {
+            if d.agg.is_some() || !d.joins.is_empty() {
                 return None;
             }
             return Some((d.ctx, d.table.clone()));
@@ -5316,9 +5356,79 @@ impl<'a> P<'a> {
         });
         let sidx = self.streams.len() - 1;
         let ctx = sidx as u8 + self.base;
+        // JOIN chain - both streams carry the cursor pairing, the
+        // ON resolving across the accumulated streams (probed)
+        let mut joins: Vec<(u8, Stream, u8, Bool)> = Vec::new();
+        loop {
+            let jt = if self.kw("INNER") {
+                if !self.kw("JOIN") {
+                    return None;
+                }
+                0u8
+            } else if self.kw("JOIN") {
+                0
+            } else if self.kw("LEFT") {
+                let _ = self.kw("OUTER");
+                if !self.kw("JOIN") {
+                    return None;
+                }
+                1
+            } else if self.kw("RIGHT") {
+                let _ = self.kw("OUTER");
+                if !self.kw("JOIN") {
+                    return None;
+                }
+                2
+            } else if self.kw("FULL") {
+                let _ = self.kw("OUTER");
+                if !self.kw("JOIN") {
+                    return None;
+                }
+                3
+            } else {
+                break;
+            };
+            let Some(Tok::Ident(jn)) = self.t.get(self.i) else {
+                return None;
+            };
+            if is_keyword(jn) {
+                return None;
+            }
+            let jn = jn.clone();
+            self.i += 1;
+            let jalias = match self.t.get(self.i) {
+                Some(Tok::Ident(a)) if !is_keyword(a) => {
+                    let a = a.clone();
+                    self.i += 1;
+                    Some(a)
+                }
+                _ => None,
+            };
+            let st2 = Stream {
+                name: jn,
+                alias: jalias,
+                derived: None,
+                sub: self.in_sub,
+                cur: Some(name.clone()),
+            };
+            self.streams.push(st2.clone());
+            let ctx2 = (self.streams.len() - 1) as u8 + self.base;
+            if !self.kw("ON") {
+                return None;
+            }
+            let saved_scope = self.merge_scope;
+            self.merge_scope = Some((sidx, self.streams.len()));
+            let on = self.bool_or()?;
+            self.merge_scope = saved_scope;
+            joins.push((jt, st2, ctx2, on));
+        }
         let aggregate = items
             .iter()
             .any(|it| matches!(it, RawItem::Agg(..)));
+        // aggregates over a joined cursor: unprobed
+        if aggregate && !joins.is_empty() {
+            return None;
+        }
         // the aggregate claims the NEXT context slot (probed:
         // a second cursor's aggregate sat at ctx 2 over its
         // stream's 1)
@@ -5335,13 +5445,29 @@ impl<'a> P<'a> {
             None
         };
         let resolve = |q: &Option<String>, n: &str| -> Option<Val> {
-            if let Some(q) = q {
-                let hit = alias.as_deref().map_or(tbl == *q, |a| a == q);
-                if !hit {
-                    return None;
+            match q {
+                Some(q) => {
+                    let hit = |st_name: &str, st_alias: &Option<String>| {
+                        st_alias.as_deref().map_or(st_name == q, |a| a == q)
+                    };
+                    if hit(&tbl, &alias) {
+                        return Some(Val::Field(ctx, n.to_string()));
+                    }
+                    for (_, st, jctx, _) in &joins {
+                        if hit(&st.name, &st.alias) {
+                            return Some(Val::Field(*jctx, n.to_string()));
+                        }
+                    }
+                    None
+                }
+                None => {
+                    // bare names need the catalog across a join
+                    if !joins.is_empty() {
+                        return None;
+                    }
+                    Some(Val::Field(ctx, n.to_string()))
                 }
             }
-            Some(Val::Field(ctx, n.to_string()))
         };
         let mut map: Vec<MapEntry> = Vec::new();
         let mut group_keys: Vec<Val> = Vec::new();
@@ -5374,11 +5500,16 @@ impl<'a> P<'a> {
             }
         }
         let saved = self.sub.replace(sidx);
+        let saved_scope = self.merge_scope;
+        if !joins.is_empty() {
+            self.merge_scope = Some((sidx, sidx + 1 + joins.len()));
+        }
         let mut boolean = if self.kw("WHERE") {
             Some(self.bool_or()?)
         } else {
             None
         };
+        self.merge_scope = saved_scope;
         // subquery streams inside a cursor's rse INHERIT the
         // cursor's concatenated alias (probed) - stamp them
         if let Some(b) = &mut boolean {
@@ -5424,7 +5555,11 @@ impl<'a> P<'a> {
         self.sub = saved;
         // WITH LOCK - refused over aggregates and sorts (unprobed)
         let lock = if self.kw("WITH") {
-            if !self.kw("LOCK") || aggregate || !sort.is_empty() {
+            if !self.kw("LOCK")
+                || aggregate
+                || !sort.is_empty()
+                || !joins.is_empty()
+            {
                 return None;
             }
             true
@@ -5447,6 +5582,7 @@ impl<'a> P<'a> {
             scroll,
             lock,
             sub: self.in_sub,
+            joins,
             table: tbl,
             alias,
             ctx,
@@ -8916,8 +9052,6 @@ mod tests {
     #[test]
     fn slice_thirty_two_refusals() {
         for sql in [
-            // aggregates over a join in a body: unprobed
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT COUNT(*) FROM T A JOIN U2 B ON A.ID = B.UID INTO :R1 DO SUSPEND; END",
             // a join under AS CURSOR: unprobed
             "CREATE PROCEDURE X AS BEGIN FOR SELECT A.ID FROM T A JOIN U2 B ON A.ID = B.UID AS CURSOR CU DO DELETE FROM T WHERE CURRENT OF CU; END",
             // bare columns across a join need the catalog
@@ -8927,6 +9061,30 @@ mod tests {
         ] {
             assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
         }
+    }
+
+    #[test]
+    fn compiles_slice_thirty_three_shapes_byte_for_byte() {
+        // AGGREGATES over joins (flip thirty-nine): the join chain
+        // sits inside the aggregate's inner rse, the aggregate
+        // claiming the slot after ALL the join streams
+        pin_proc(
+            "CREATE PROCEDURE RC1 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT COUNT(*) FROM T A JOIN U2 B ON A.ID = B.UID INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014F02430177029201540322412200920255320322422201472F1700024944170103554944FFFF4E004D0100000053FF0201180200001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... GROUP BY with a qualified key, the WHERE inside the
+        // aggregate's inner rse after the join
+        pin_proc(
+            "CREATE PROCEDURE RC2 (P1 INTEGER) RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT B.UID, SUM(A.ID) FROM T A JOIN U2 B ON A.ID = B.UID WHERE A.ID > :P1 GROUP BY B.UID INTO :R1, :R2 DO SUSPEND; END",
+            "0502040002000800070004010500080007000800070007000C00020300000800012D1A00000301000800012D1A01009B1100020211010743014F02430177029201540322412200920255320322422201472F1700024944170103554944FF47311700024944290000000100FF4E011701035549444D020000001701035549440100561700024944FF0201180200001A000001180201001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        // JOINS in cursor declarations (flip forty): BOTH streams
+        // carry the cursor pairing, and each output derived_expr
+        // wrap names its column's OWN stream
+        pin_proc(
+            "CREATE PROCEDURE RC3 RETURNS (R1 INTEGER, R2 INTEGER) AS DECLARE CX CURSOR FOR (SELECT A.ID, B.UA FROM T A JOIN U2 B ON A.ID = B.UID); BEGIN OPEN CX; FETCH CX INTO :R1, :R2; CLOSE CX; SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A0100A6000043017702920154082243582220224122009202553208224358222022422201472F1700024944170103554944FFFF0200BF01001700024944BF010117010255419B11000202A7000000A7020000020117000249441A00000117010255411A0100FFA70100000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
     }
 
     #[test]

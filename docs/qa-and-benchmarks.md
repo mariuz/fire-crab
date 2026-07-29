@@ -4666,6 +4666,24 @@ WHEN, and a BLOCK as a handler's body nests blr_block again with no
 handler section of its own - the battery runs a handler block
 containing an EXIT.
 
+Slice 33 completed the join story its predecessor opened.
+Aggregates over joins: the chain sits INSIDE the aggregate's inner
+rse with the WHERE after it, and the aggregate claims the context
+after ALL the join streams - a joined COUNT probed at 2 over
+streams 0 and 1, the slice-8 next-slot law simply counting past a
+chain. GROUP BY with qualified keys, HAVING and ORDER BY ride the
+map machinery unchanged. And cursors took joins: BOTH streams
+carry the cursor pairing - "CX" "A" beside "CX" "B" - the slice-31
+infection reaching the chain through the same cur stamp with zero
+new emission code; the law worth the probe was the OUTPUTS: each
+derived_expr wrap names its column's OWN stream (BF 01 00 then
+BF 01 01), so the wrap context now follows the field rather than
+the cursor. FETCH reads fields at per-stream contexts. Positioned
+DML on a joined cursor refuses - not updatable - as do aggregate
+joined cursors and locks over chains. The battery's closer pairs a
+LEFT OUTER joined cursor having a compound ON with a
+mixed-into-var fetch.
+
 Slice 32 brought the view compiler's joins into procedure bodies
 - and its gate caught a wrong-bytes hazard before it shipped.
 INNER/LEFT/RIGHT/FULL join chains compile in FOR SELECT and the

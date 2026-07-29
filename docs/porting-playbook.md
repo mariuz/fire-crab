@@ -307,6 +307,11 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # completions COMPOUND: a stamp built for one law (cursor alias
+    # infection) covers the next (joined cursors) with zero new
+    # emission code, and a next-slot law (aggregate ctx) generalizes
+    # by COUNTING PAST whatever sits before it - design mechanisms
+    # around the INVARIANT, not the case that revealed it
     # a FAST PATH is a resolution POLICY in disguise: the
     # single-stream bare-name shortcut silently mis-binds the moment
     # a second stream appears - audit every hardcoded ctx when a

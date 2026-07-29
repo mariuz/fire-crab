@@ -13,6 +13,31 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-dsql slice 33: aggregates over joins, joined cursors
+
+### Converted
+- **Aggregates over joins** (flip thirty-nine — slice 32's own
+  refusal): the join chain sits INSIDE the aggregate's inner rse
+  with the WHERE after it, and the aggregate claims the slot after
+  ALL the join streams (a joined COUNT put it at 2 over streams 0
+  and 1) — the slice-8 next-slot law counting past a chain. GROUP
+  BY with qualified keys, HAVING and ORDER BY ride the existing
+  map machinery.
+- **Joins in cursor declarations** (flip forty): BOTH streams carry
+  the cursor pairing — `"CX" "A"` and `"CX" "B"` — the slice-31
+  infection reaching the chain via the same cur stamp; each
+  output's derived_expr wrap names its column's OWN stream (probed:
+  `BF 01 00` then `BF 01 01`), and FETCH reads fields at per-stream
+  contexts. Positioned DML on a joined cursor refuses (not
+  updatable), as do aggregate joined cursors and WITH LOCK over
+  chains.
+
+### Guarded
+- Aggregate cursors over joins, positioned DML on joined cursors,
+  joins under AS CURSOR, subqueries in joined-cursor WHEREs (the
+  scope refuses them). Gate: `qa/dsql-proc-blr.sh` grew to 194
+  checks (6 fresh); 327 unit byte-pins.
+
 ## 2026-07-29 — fire-crab-dsql slice 32: joins in body FOR SELECTs, packaged calls
 
 ### Converted
