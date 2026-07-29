@@ -945,6 +945,11 @@ struct Stream {
 #[derive(Clone, Debug, PartialEq)]
 struct Derived {
     wher: Option<Bool>,
+    /// the derived column list as (outer name, inner name) pairs -
+    /// pass-through columns map to themselves, `col AS alias` maps
+    /// the ALIAS to the inner column; outer references translate to
+    /// the INNER name at the shared context (probed)
+    cols: Vec<(String, String)>,
 }
 
 /// One slot of an aggregate's blr_map: a group-key value or an
@@ -1119,6 +1124,14 @@ impl<'a> P<'a> {
                 }
             },
         };
+        // a DERIVED stream translates outer names to the inner
+        // column through its recorded list (probed: D.X emitted the
+        // underlying UID)
+        let idx = (ctx - self.base) as usize;
+        if let Some(d) = &self.streams[idx].derived {
+            let (_, inner) = d.cols.iter().find(|(o, _)| o == name)?;
+            return Some(Val::Field(ctx, inner.clone()));
+        }
         Some(Val::Field(ctx, name.to_string()))
     }
 
@@ -1163,18 +1176,40 @@ impl<'a> P<'a> {
         if !self.kw("SELECT") {
             return None;
         }
-        // the pass-through list: bare columns only (they leave no
-        // trace; outer references go by NAME through the shared
-        // context, which is exactly the pass-through case)
+        // the column list: bare columns (traceless pass-through) or
+        // `col AS alias` - outer references translate to the INNER
+        // name through the recorded pairs (probed)
+        let mut cols: Vec<(String, String)> = Vec::new();
         loop {
+            let Some(Tok::Ident(n)) = self.t.get(self.i) else {
+                return None; // *, expressions, quals: unprobed
+            };
+            if is_keyword(n) {
+                return None;
+            }
+            let n = n.clone();
+            self.i += 1;
+            let outer = if self.kw("AS") {
+                let Some(Tok::Ident(a)) = self.t.get(self.i) else {
+                    return None;
+                };
+                if is_keyword(a) {
+                    return None;
+                }
+                let a = a.clone();
+                self.i += 1;
+                a
+            } else {
+                n.clone()
+            };
+            cols.push((outer, n));
             match self.t.get(self.i)? {
+                Tok::Comma => self.i += 1,
                 Tok::Ident(w) if w == "FROM" => {
                     self.i += 1;
                     break;
                 }
-                Tok::Ident(w) if !is_keyword(w) => self.i += 1,
-                Tok::Comma => self.i += 1,
-                _ => return None, // *, expressions, quals: unprobed
+                _ => return None,
             }
         }
         let Some(Tok::Ident(name)) = self.t.get(self.i) else {
@@ -1216,7 +1251,7 @@ impl<'a> P<'a> {
         Some(Stream {
             name,
             alias: Some(alias),
-            derived: Some(Box::new(Derived { wher })),
+            derived: Some(Box::new(Derived { wher, cols })),
             sub: self.in_sub,
             cur: None,
         })
@@ -4923,14 +4958,10 @@ impl<'a> P<'a> {
                         self.i += 1;
                         self.field(Some(&a), &b)?
                     } else {
-                        // a select column, NOT a variable: resolve as
-                        // a field of the select's own stream - with a
-                        // JOIN the engine resolves bare names through
-                        // the catalog, so they refuse here
-                        if !joins.is_empty() {
-                            return None;
-                        }
-                        Val::Field(ctx, a)
+                        // a select column, NOT a variable - through
+                        // field() so a JOIN refuses the bare name and
+                        // a DERIVED stream translates it
+                        self.field(None, &a)?
                     };
                     items.push(Item::Col(v));
                 }
@@ -4975,10 +5006,7 @@ impl<'a> P<'a> {
                             self.i += 1;
                             self.field(Some(&a), &b)?
                         } else {
-                            if !joins.is_empty() {
-                                return None;
-                            }
-                            Val::Field(ctx, a)
+                            self.field(None, &a)?
                         }
                     }
                     _ => return None,
@@ -5086,10 +5114,7 @@ impl<'a> P<'a> {
                             self.i += 1;
                             self.field(Some(&a), &b)?
                         } else {
-                            if !joins.is_empty() {
-                                return None;
-                            }
-                            Val::Field(ctx, a)
+                            self.field(None, &a)?
                         }
                     }
                     _ => return None,
@@ -9655,6 +9680,22 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_thirty_seven_shapes_byte_for_byte() {
+        // DERIVED-COLUMN ALIASES (flip forty-six): outer references
+        // by ALIAS translate to the INNER column name at the shared
+        // context - D.X over (SELECT UID AS X ...) emits UID
+        pin_proc(
+            "CREATE PROCEDURE RG1 (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT D.X FROM (SELECT UID AS X FROM U2 WHERE UA > 0) D WHERE D.X > :P1 INTO :R1 DO SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B1100020211010743014301920255321122442220225055424C4943222E22553222004731170002554115080000000000FF4731170003554944290000000100FF02011700035549441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... the bare-name outer form translates too
+        pin_proc(
+            "CREATE PROCEDURE RF3 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT D.X FROM (SELECT UID AS X FROM U2) D INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014301920255321122442220225055424C4943222E2255322200FFFF02011700035549441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+    }
+
+    #[test]
     fn window_refusals() {
         for sql in [
             // windows beside GROUP BY/aggregates: unprobed
@@ -9669,9 +9710,9 @@ mod tests {
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT SUM(UA) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM U2 INTO :R1 DO SUSPEND; END",
             // named windows (the WINDOW clause): unprobed
             "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT UID, SUM(UA) OVER W FROM U2 WINDOW W AS (PARTITION BY UID) INTO :R1, :R2 DO SUSPEND; END",
-            // derived-column ALIASES in a derived table need the
-            // outer-name-to-inner-name mapping: unprobed
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT D.X FROM (SELECT UID AS X FROM U2) D INTO :R1 DO SUSPEND; END",
+            // UNION in a body FOR SELECT: probed (blr_union at the
+            // statement's first slot), unconverted
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T UNION ALL SELECT UID FROM U2 INTO :R1 DO SUSPEND; END",
         ] {
             assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
         }

@@ -4666,6 +4666,26 @@ WHEN, and a BLOCK as a handler's body nests blr_block again with no
 handler section of its own - the battery runs a handler block
 containing an EXIT.
 
+Slice 37 cashed the derived-alias transcript. (SELECT UID AS X
+FROM U2) D records an outer-to-inner name map at parse, and every
+outer reference to X - qualified, bare, in a WHERE, an ORDER key
+or a correlated subquery - TRANSLATES to the inner column at the
+shared context: D.X emits the underlying UID, exactly the bytes
+the engine stores. The mechanism is ONE translation point in the
+field resolver, checked after the stream resolves; the three
+hardcoded bare-name parse sites that slice 32's join hazard
+exposed now route through the resolver too - which carries their
+join refusal and gains the alias translation for free, one
+mechanism replacing three special cases. The battery drives a
+two-alias derived pair through WHERE and ORDER, a derived alias
+under IN (SELECT) in a DELETE, and one correlated through EXISTS.
+Two doors stayed shut with their shapes recorded: UNION in body
+FOR SELECTs probed cleanly - blr_union claims the statement's
+FIRST slot, branch streams follow, outputs read union fids - and
+waits as a named refusal; named windows rejected BOTH probe
+placements inside the engine's own resolver, a blocker noted as
+engine-side.
+
 Slice 36 closed two small doors and found one standing open.
 NTH_VALUE canonicalizes like its LAG/LEAD siblings - a FROM FIRST
 indicator, literal 0, appended as the third agg_function argument.

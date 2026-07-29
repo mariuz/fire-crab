@@ -307,6 +307,11 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # route special cases through the RESOLVER, not around it: the
+    # bare-name fast paths that once mis-bound over joins gained
+    # alias translation for FREE the moment they went through
+    # field() - every parse site that builds a reference by hand is
+    # a translation feature it will never receive
     # an UNPLANNED capability is an UNTESTED one: composable parsers
     # accept shapes nobody converted on purpose (derived tables in
     # subqueries rode along for nine slices) - inventory what the

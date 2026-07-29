@@ -13,6 +13,32 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-dsql slice 37: derived-column aliases
+
+### Converted
+- **Derived-column aliases** (flip forty-six — slice 36's refusal,
+  transcript in hand): `(SELECT UID AS X FROM U2) D` records an
+  outer-to-inner name map, and every outer reference to `X` —
+  qualified or bare, in select items, WHEREs, ORDER keys or
+  correlated subqueries — TRANSLATES to the inner column at the
+  shared context: `D.X` emits the underlying `UID`. One translation
+  point in the field resolver; the three hardcoded bare-name parse
+  sites now route through it (which also carries their join-refusal
+  and gains the translation for free).
+
+### Probed, unconverted
+- **UNION in body FOR SELECTs**: `blr_union` claims the statement's
+  FIRST slot with branch streams following and fid outputs — a
+  named refusal with the transcript. **Named windows** (WINDOW W
+  AS): the engine's own resolver rejected both probe placements —
+  guarded as an engine-side blocker.
+
+### Guarded
+- UNION in bodies, named windows, derived expressions/stars. Gate:
+  `qa/dsql-proc-blr.sh` grew to 220 checks (6 fresh — a two-alias
+  derived pair, one under IN (SELECT), one correlated through
+  EXISTS); 349 unit byte-pins.
+
 ## 2026-07-29 — fire-crab-dsql slice 36: NTH_VALUE, derived tables in bodies
 
 ### Converted
