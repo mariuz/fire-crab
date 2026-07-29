@@ -49,6 +49,9 @@ mod blr {
     pub const NEGATE: u8 = 38;
     pub const CONCATENATE: u8 = 39;
     pub const VIA: u8 = 43;
+    pub const VALUE_IF: u8 = 105;
+    pub const CAST: u8 = 131;
+    pub const COALESCE: u8 = 202;
     pub const FIELD: u8 = 23;
     pub const FID: u8 = 24;
     pub const PARAMETER: u8 = 25;
@@ -157,6 +160,15 @@ pub enum Expr {
     Arith(u8, Box<Expr>, Box<Expr>),
     /// blr_negate
     Negate(Box<Expr>),
+    /// blr_cast: convert to the carried descriptor's type - range
+    /// checks error (never wrap), text width overflows error (never
+    /// silently truncate), NULL passes through
+    Cast(MsgSlot, Box<Expr>),
+    /// blr_coalesce: the first non-NULL of the counted operands
+    Coalesce(Vec<Expr>),
+    /// blr_value_if(cond, then, else) - the conditional value CASE
+    /// compiles to (under a unifying cast)
+    ValueIf(Box<Bool>, Box<Expr>, Box<Expr>),
     /// blr_via(singular-rse, value, else): the scalar subselect -
     /// one row binds and the value evaluates, none and the else
     /// does, more than one is the engine's sing_err
@@ -475,6 +487,23 @@ impl<'a> P<'a> {
                 Ok(Expr::Fid(ctx, self.u16()?))
             }
             blr::NULL => Ok(Expr::Null),
+            blr::CAST => {
+                let slot = self.msg_slot()?;
+                Ok(Expr::Cast(slot, Box::new(self.expr()?)))
+            }
+            blr::COALESCE => {
+                let n = self.u8()? as usize;
+                let mut ops = Vec::new();
+                for _ in 0..n {
+                    ops.push(self.expr()?);
+                }
+                Ok(Expr::Coalesce(ops))
+            }
+            blr::VALUE_IF => Ok(Expr::ValueIf(
+                Box::new(self.boolean()?),
+                Box::new(self.expr()?),
+                Box::new(self.expr()?),
+            )),
             blr::VIA => {
                 let rse = self.rse_entry()?;
                 let value = Box::new(self.expr()?);
@@ -1428,38 +1457,127 @@ impl<'a> Exec<'a> {
                                 slot_rows[*ri][*slot as usize] = v;
                             }
                         }
-                        WinItem::Fn(name, _args) => {
-                            // peer groups by equal sort keys
-                            let mut rank = 0usize;
-                            let mut dense = 0usize;
-                            let mut j = 0usize;
-                            while j < part.len() {
-                                let peer_end = (j..part.len())
-                                    .take_while(|&k| {
-                                        part[k].1.iter().zip(&part[j].1).all(|(a, b)| group_eq(a, b))
-                                    })
-                                    .last()
-                                    .unwrap()
-                                    + 1;
-                                dense += 1;
-                                for (pos, (_, _, ri)) in
-                                    part[j..peer_end].iter().enumerate()
-                                {
-                                    let v = match name.as_str() {
-                                        "ROW_NUMBER" => (j + pos + 1) as i64,
-                                        "RANK" => (rank + 1) as i64,
-                                        "DENSE_RANK" => dense as i64,
-                                        other => {
-                                            return Err(format!(
-                                                "window function {} unconverted",
-                                                other
-                                            ))
-                                        }
-                                    };
-                                    slot_rows[*ri][*slot as usize] = Value::Int(v);
+                        WinItem::Fn(name, args) => {
+                            // arg 0 per row (the valued functions)
+                            let mut vals: Vec<Value> = Vec::new();
+                            if !args.is_empty() {
+                                for (_, _, ri) in part {
+                                    vals.push(self.with_binding(
+                                        &rows[*ri].binding.clone(),
+                                        |ex| ex.eval(&args[0]),
+                                    )?);
                                 }
-                                rank += peer_end - j;
-                                j = peer_end;
+                            }
+                            // frame end per row: the current row's
+                            // peer group's end (the default RANGE
+                            // frame); the whole partition when the
+                            // window has no ORDER
+                            let mut frame_end = vec![part.len(); part.len()];
+                            if !w.order.is_empty() {
+                                let mut j = 0usize;
+                                while j < part.len() {
+                                    let peer_end = (j..part.len())
+                                        .take_while(|&k| {
+                                            part[k].1.iter().zip(&part[j].1).all(|(a, b)| group_eq(a, b))
+                                        })
+                                        .last()
+                                        .unwrap()
+                                        + 1;
+                                    for fe in frame_end[j..peer_end].iter_mut() {
+                                        *fe = peer_end;
+                                    }
+                                    j = peer_end;
+                                }
+                            }
+                            match name.as_str() {
+                                "ROW_NUMBER" | "RANK" | "DENSE_RANK" => {
+                                    let mut rank = 0usize;
+                                    let mut dense = 0usize;
+                                    let mut j = 0usize;
+                                    while j < part.len() {
+                                        let peer_end = frame_end[j].max(j + 1);
+                                        dense += 1;
+                                        for (pos, (_, _, ri)) in
+                                            part[j..peer_end].iter().enumerate()
+                                        {
+                                            let v = match name.as_str() {
+                                                "ROW_NUMBER" => (j + pos + 1) as i64,
+                                                "RANK" => (rank + 1) as i64,
+                                                _ => dense as i64,
+                                            };
+                                            slot_rows[*ri][*slot as usize] =
+                                                Value::Int(v);
+                                        }
+                                        rank += peer_end - j;
+                                        j = peer_end;
+                                    }
+                                }
+                                // LAG/LEAD: the row offset positions
+                                // ago/ahead in partition order, the
+                                // third argument when it runs out
+                                "LAG" | "LEAD" => {
+                                    for (j, (_, _, ri)) in part.iter().enumerate() {
+                                        let off = match self.with_binding(
+                                            &rows[*ri].binding.clone(),
+                                            |ex| ex.eval(&args[1]),
+                                        )? {
+                                            Value::Int(n) if n >= 0 => n as usize,
+                                            _ => return Err("bad LAG/LEAD offset".into()),
+                                        };
+                                        let src = if name == "LAG" {
+                                            j.checked_sub(off)
+                                        } else {
+                                            let k = j + off;
+                                            (k < part.len()).then_some(k)
+                                        };
+                                        slot_rows[*ri][*slot as usize] = match src {
+                                            Some(k) => vals[k].clone(),
+                                            None => self.with_binding(
+                                                &rows[*ri].binding.clone(),
+                                                |ex| ex.eval(&args[2]),
+                                            )?,
+                                        };
+                                    }
+                                }
+                                // FIRST/LAST/NTH_VALUE read the frame:
+                                // first row, LAST OF THE CURRENT PEER
+                                // GROUP (the default frame's famous
+                                // trap), or the nth if the frame
+                                // reaches it
+                                "FIRST_VALUE" => {
+                                    for (_, _, ri) in part {
+                                        slot_rows[*ri][*slot as usize] = vals[0].clone();
+                                    }
+                                }
+                                "LAST_VALUE" => {
+                                    for (j, (_, _, ri)) in part.iter().enumerate() {
+                                        slot_rows[*ri][*slot as usize] =
+                                            vals[frame_end[j] - 1].clone();
+                                    }
+                                }
+                                "NTH_VALUE" => {
+                                    for (j, (_, _, ri)) in part.iter().enumerate() {
+                                        let n = match self.with_binding(
+                                            &rows[*ri].binding.clone(),
+                                            |ex| ex.eval(&args[1]),
+                                        )? {
+                                            Value::Int(n) if n >= 1 => n as usize,
+                                            _ => return Err("bad NTH_VALUE index".into()),
+                                        };
+                                        slot_rows[*ri][*slot as usize] =
+                                            if n <= frame_end[j] {
+                                                vals[n - 1].clone()
+                                            } else {
+                                                Value::Null
+                                            };
+                                    }
+                                }
+                                other => {
+                                    return Err(format!(
+                                        "window function {} unconverted",
+                                        other
+                                    ))
+                                }
                             }
                         }
                         WinItem::Agg(verb, operand) => {
@@ -1848,6 +1966,64 @@ impl<'a> Exec<'a> {
         Ok(match e {
             Expr::Null => Value::Null,
             Expr::Literal(v) => v.clone(),
+            Expr::Coalesce(ops) => {
+                let mut out = Value::Null;
+                for e in ops {
+                    let v = self.eval(e)?;
+                    if !matches!(v, Value::Null) {
+                        out = v;
+                        break;
+                    }
+                }
+                out
+            }
+            Expr::ValueIf(cond, then, els) => {
+                // UNKNOWN takes the else branch, like the engine
+                if self.bool_eval(cond)? == Some(true) {
+                    self.eval(then)?
+                } else {
+                    self.eval(els)?
+                }
+            }
+            Expr::Cast(slot, inner) => {
+                let v = self.eval(inner)?;
+                if matches!(v, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                match slot.dtype {
+                    blr::DT_SHORT | blr::DT_LONG | blr::DT_INT64 => {
+                        let n = int_of(&v).ok_or("cast to integer from a non-integer value unconverted")?;
+                        let fits = match slot.dtype {
+                            blr::DT_SHORT => i16::try_from(n).is_ok(),
+                            blr::DT_LONG => i32::try_from(n).is_ok(),
+                            _ => true,
+                        };
+                        if !fits {
+                            return Err("integer overflow".into());
+                        }
+                        Value::Int(n)
+                    }
+                    blr::DT_TEXT | blr::DT_TEXT2 | blr::DT_VARYING
+                    | blr::DT_VARYING2 => {
+                        let t = match v {
+                            Value::Text(t) => t,
+                            _ => {
+                                return Err(
+                                    "cast to text from a non-text value unconverted".into()
+                                )
+                            }
+                        };
+                        if t.trim_end_matches(' ').len() > slot.length as usize {
+                            // the engine's 22001, never a silent cut
+                            return Err("string right truncation".into());
+                        }
+                        Value::Text(t)
+                    }
+                    other => {
+                        return Err(format!("cast target dtype {} unconverted", other))
+                    }
+                }
+            }
             Expr::Via(rse, value, els) => {
                 let bindings = self.open_rse(rse)?;
                 match bindings.len() {

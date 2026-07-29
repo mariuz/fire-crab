@@ -13,6 +13,30 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-exe slice 9: conditionals and the valued window functions
+
+### Converted
+- **CAST** (`blr_cast` + a dsc): integer range checks ERROR rather
+  than wrap, text width overflow is the engine's string-truncation
+  error rather than a silent cut, NULL passes through; cross-family
+  conversions refuse by name. **COALESCE** takes the first
+  non-NULL. **blr_value_if** — the conditional the searched CASE
+  compiles to under its unifying cast — where UNKNOWN takes the
+  else branch.
+- **The valued window functions**: LAG/LEAD (the row an offset
+  ago/ahead in partition order, the third argument when the
+  partition runs out — the canonicalized three-argument form the
+  dsql side probed, read back), FIRST_VALUE, LAST_VALUE — the
+  default RANGE frame's famous trap, engine-verified: it answers
+  the CURRENT PEER GROUP's last value, not the partition's — and
+  NTH_VALUE (the nth only if the frame reaches it).
+
+### Guarded
+- Frame extents (blr_window_win) and cross-family casts (int↔text)
+  remain named. Two frontier swaps: NULLIF and IIF over FIELD
+  branches are dsql-side guards (the unify-typing law needs the
+  catalog). Gate: 78 → 86 checks. 261 workspace tests.
+
 ## 2026-07-29 — fire-crab-exe slice 8: windows — the last named refusal falls
 
 ### Converted

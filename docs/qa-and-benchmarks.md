@@ -4106,6 +4106,20 @@ reproduced, held by a check running a running-SUM window beside a
 partition-COUNT window in one statement. The new frontier is named:
 frame extents (the v4 blr_window_win) and the CAST/CASE value verbs.
 
+### Slice 9: errors over wrong numbers, and LAST_VALUE's trap
+
+The conditionals came with the executor's standing posture - an
+error beats a wrong answer: CAST range overflow ERRORS rather than
+wrapping, a too-long text cast is the engine's truncation error
+rather than a silent cut, and value_if sends UNKNOWN down the else
+branch. The valued window functions closed the v3 window surface,
+including the one most implementations get wrong: LAST_VALUE over
+the default RANGE frame answers the current PEER GROUP's last value
+- not the partition's - because the frame ends at the current row's
+peers. The gate holds FIRST_VALUE and LAST_VALUE side by side over
+a column with duplicate sort keys, and the engine's answers match
+row for row.
+
 ## Query surface: what the server answers, and what it refuses
 
 Everything below is verified by a differential gate under `qa/` — the
