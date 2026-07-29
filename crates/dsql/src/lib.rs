@@ -340,6 +340,22 @@ mod blr {
     /// WITH LOCK: blr_writelock, an rse sub-clause between the
     /// stream and the boolean (probed)
     pub const WRITELOCK: u8 = 0xB3;
+    /// DECLARE PROCEDURE: blr_subproc_decl - counted name, type 0
+    /// (PSQL), selectable flag, u16-counted param-name lists (each
+    /// name + default flag 0), u32 blob length, the WHOLE inner
+    /// body's BLR (probed)
+    pub const SUBPROC_DECL: u8 = 0xCD;
+    /// DECLARE FUNCTION: blr_subfunc_decl - same frame; the flag
+    /// byte carries deterministic(1)/aggregate(2) and the single
+    /// return slot is an UNNAMED output param (probed)
+    pub const SUBFUNC_DECL: u8 = 0xCF;
+    /// EXECUTE PROCEDURE on a subroutine: blr_invoke_procedure with
+    /// sub-tags - 1 (id: 4 sub, 3 counted name, end), 3 u16-counted
+    /// input values, 5 u16-counted output variables, blr_end
+    pub const INVOKE_PROCEDURE: u8 = 0xE1;
+    /// a sub-function call site - blr_invoke_function, same id
+    /// clause, 3 u16-counted argument values, blr_end (probed)
+    pub const INVOKE_FUNCTION: u8 = 0xE0;
     pub const EQL: u8 = 0x2F;
     pub const NEQ: u8 = 0x30;
     pub const GTR: u8 = 0x31;
@@ -393,6 +409,9 @@ enum Val {
     /// blr_fid - a stream's own column by number; how HAVING, ORDER
     /// BY and the DO body address an aggregate's output
     Fid(u8, u16),
+    /// a DECLAREd sub-function call: blr_invoke_function, the id
+    /// clause (sub + counted name), counted argument values (probed)
+    SubFn(String, Vec<Val>),
     /// `:name` - an INPUT parameter, referenced straight out of
     /// message 0 as blr_parameter2 (value slot 2i, null slot 2i+1);
     /// no variable is declared for inputs (probed)
@@ -875,6 +894,18 @@ struct P<'a> {
     /// stream indexes - the ONLY two streams qualified names may
     /// bind to there, and bare column names refuse
     merge_scope: Option<(usize, usize)>,
+    /// a FUNCTION body: RETURN allowed, SUSPEND refused
+    in_func: bool,
+    /// a SUBROUTINE body: nested subroutine declarations refuse
+    in_sub: bool,
+    /// a SUSPEND was parsed - the subproc_decl's selectable flag
+    saw_suspend: bool,
+    /// compiled subroutine declaration blobs, spliced in source order
+    sub_decls: Vec<Vec<u8>>,
+    /// DECLAREd sub-procedures in scope: (name, ins, outs)
+    sub_procs: Vec<(String, usize, usize)>,
+    /// DECLAREd sub-functions in scope: (name, args)
+    sub_funcs: Vec<(String, usize)>,
     /// context of stream index 0: 1 in view BLR, 0 in procedure
     /// bodies (probed - the FOR SELECT stream is context 0)
     base: u8,
@@ -890,6 +921,37 @@ struct P<'a> {
 }
 
 impl<'a> P<'a> {
+    /// a parser over `t` starting at 0 with every scope empty - the
+    /// procedure-body default (base 0, no outer streams)
+    fn fresh(t: &'a [Tok]) -> P<'a> {
+        P {
+            t,
+            i: 0,
+            streams: Vec::new(),
+            base: 0,
+            outer: None,
+            sub: None,
+            agg_map: Vec::new(),
+            agg_mode: false,
+            in_params: Vec::new(),
+            local_vars: Vec::new(),
+            next_label: 1,
+            proc: None,
+            agg_fid_ctx: 1,
+            domain_value: false,
+            cursors: Vec::new(),
+            cursor_decls: Vec::new(),
+            for_cursors: Vec::new(),
+            merge_scope: None,
+            in_func: false,
+            in_sub: false,
+            saw_suspend: false,
+            sub_decls: Vec::new(),
+            sub_procs: Vec::new(),
+            sub_funcs: Vec::new(),
+        }
+    }
+
     fn kw(&mut self, w: &str) -> bool {
         if matches!(self.t.get(self.i), Some(Tok::Ident(x)) if x == w) {
             self.i += 1;
@@ -1374,6 +1436,32 @@ impl<'a> P<'a> {
             let (verb, arg) = self.parse_agg(name)?;
             let slot = self.agg_slot(verb, arg);
             return Some(Val::Fid(self.agg_fid_ctx, slot));
+        }
+        // a DECLAREd sub-function shadows nothing the surface knows:
+        // parse its counted arguments (zero-arg calls unprobed)
+        if let Some(n_args) = self
+            .sub_funcs
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, a)| *a)
+        {
+            self.i += 1; // (
+            let mut args = Vec::new();
+            loop {
+                args.push(self.val()?);
+                match self.t.get(self.i)? {
+                    Tok::Comma => self.i += 1,
+                    Tok::RParen => {
+                        self.i += 1;
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+            if args.len() != n_args {
+                return None;
+            }
+            return Some(Val::SubFn(name.to_string(), args));
         }
         self.i += 1; // (
         let v = match name {
@@ -2121,6 +2209,21 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
             out.extend_from_slice(&(s.len() as u16).to_le_bytes());
             out.extend_from_slice(s.as_bytes());
         }
+        Val::SubFn(name, args) => {
+            out.push(blr::INVOKE_FUNCTION);
+            out.push(1); // id clause
+            out.push(4); // ... a subroutine
+            out.push(3); // ... by name
+            out.push(name.len() as u8);
+            out.extend_from_slice(name.as_bytes());
+            out.push(blr::END);
+            out.push(3); // argument values
+            out.extend_from_slice(&(args.len() as u16).to_le_bytes());
+            for a in args {
+                emit_val(out, a);
+            }
+            out.push(blr::END);
+        }
     }
 }
 
@@ -2282,6 +2385,12 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
         cursor_decls: Vec::new(),
         for_cursors: Vec::new(),
         merge_scope: None,
+        in_func: false,
+        in_sub: false,
+        saw_suspend: false,
+        sub_decls: Vec::new(),
+        sub_procs: Vec::new(),
+        sub_funcs: Vec::new(),
     };
     // a top-level UNION restructures the whole statement: the union
     // node takes context 1 BEFORE any branch stream, so it must be
@@ -2733,26 +2842,7 @@ fn emit_cursor_decl(out: &mut Vec<u8>, d: &CursorDecl) {
 /// after the loop, the same send with EOF 0. All probed.
 pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
     let toks = lex(sql.trim().trim_end_matches(';'))?;
-    let mut p = P {
-        t: &toks,
-        i: 0,
-        streams: Vec::new(),
-        base: 0,
-        outer: None,
-        sub: None,
-        agg_map: Vec::new(),
-        agg_mode: false,
-        in_params: Vec::new(),
-        local_vars: Vec::new(),
-        next_label: 1,
-        proc: None,
-        agg_fid_ctx: 1,
-        domain_value: false,
-        cursors: Vec::new(),
-        cursor_decls: Vec::new(),
-        for_cursors: Vec::new(),
-        merge_scope: None,
-    };
+    let mut p = P::fresh(&toks);
     if !(p.kw("CREATE") && p.kw("PROCEDURE")) {
         return None;
     }
@@ -2761,6 +2851,30 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         Tok::Ident(w) if !is_keyword(w) => p.i += 1,
         _ => return None,
     }
+    let bo = body_compile(&mut p, false, false)?;
+    Some(bo.blob)
+}
+
+/// A compiled procedure/function body plus what a subroutine
+/// declaration needs to describe it.
+struct BodyOut {
+    blob: Vec<u8>,
+    ins: Vec<String>,
+    outs: Vec<String>,
+    selectable: bool,
+    deterministic: bool,
+}
+
+/// Compile `[(inputs)] [RETURNS ...] AS <declares> BEGIN ... END`
+/// from the parser's position into a complete `05 .. 4C` body -
+/// top-level procedures and DECLAREd subroutines share every law.
+/// `func` bodies take `RETURNS <type> [DETERMINISTIC]`, hold ONE
+/// unnamed return variable (slot 0), refuse SUSPEND, accept RETURN,
+/// and their sends drop the EOF assignment (probed). `sub` bodies
+/// skip the end-of-input check, may end with a spare `;`, and emit
+/// blr_stall only when they HAVE outputs - a void sub-procedure
+/// goes without where a top-level one keeps it (probed).
+fn body_compile(p: &mut P, func: bool, sub: bool) -> Option<BodyOut> {
     // optional INPUT parameters: message 0, one dsc + null-flag short
     // per parameter, NO EOF slot
     let mut inputs: Vec<(String, Dsc)> = Vec::new();
@@ -2788,11 +2902,23 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         }
     }
     p.in_params = inputs.iter().map(|(n, _)| n.clone()).collect();
-    // RETURNS (name TYPE, ...) is OPTIONAL - the types reuse the
-    // probed cast-dsc encodings (identical bytes in blr_message and
-    // blr_declare)
+    // RETURNS: optional (name TYPE, ...) list for procedures - a
+    // function takes ONE bare type, its return slot UNNAMED (probed:
+    // the subfunc_decl carries an empty output name)
     let mut params: Vec<(String, Dsc)> = Vec::new();
-    if p.kw("RETURNS") {
+    let mut deterministic = false;
+    if func {
+        if !p.kw("RETURNS") {
+            return None;
+        }
+        let dsc = p.cast_target()?;
+        params.push((String::new(), dsc));
+        if matches!(p.t.get(p.i), Some(Tok::Ident(w)) if w == "DETERMINISTIC")
+        {
+            deterministic = true;
+            p.i += 1;
+        }
+    } else if p.kw("RETURNS") {
         if !matches!(p.t.get(p.i), Some(Tok::LParen)) {
             return None;
         }
@@ -2818,12 +2944,22 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
             }
         }
     }
-    // RETURNS is OPTIONAL: a procedure with no outputs carries a
-    // one-slot message 1 (just the EOF short - probed)
-    let outs_start = params.len(); // placeholder, replaced below
-    let _ = outs_start;
-    p.local_vars = params.iter().map(|(n, _)| n.clone()).collect();
-    p.proc = Some(params.len());
+    // variable numbering: outputs at 0..n, locals after - but in a
+    // SUBROUTINE body (procedure and function alike) the INPUTS
+    // reserve the slots between: no declares emitted for them, yet
+    // locals number past them. A function's slot 0 is its unnamed
+    // return. Top-level bodies do NOT reserve (all probed).
+    p.local_vars = {
+        let mut v: Vec<String> =
+            params.iter().map(|(n, _)| n.clone()).collect();
+        if sub {
+            v.extend(std::iter::repeat_n(String::new(), inputs.len()));
+        }
+        v
+    };
+    // SUSPEND refuses in a function body (proc = Some(0) closes it)
+    p.proc = Some(if func { 0 } else { params.len() });
+    p.in_func = func;
     if !p.kw("AS") {
         return None;
     }
@@ -2832,15 +2968,26 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
     // triggers group)
     let mut locals: Vec<(Dsc, Option<Val>)> = Vec::new();
     // source order of the declaration section: a variable's INIT is
-    // DEFERRED past any cursor declarations that follow it, flushing
-    // before the next variable's declare or at the section end
-    // (probed on var-then-cursor, cursor-then-var, explicit inits)
+    // DEFERRED past any cursor OR subroutine declarations that follow
+    // it, flushing before the next variable's declare or at the
+    // section end (probed on cursors and on a var-then-subproc)
     enum DeclItem {
         Var(usize),
         Cur(usize),
+        Sub(usize),
     }
     let mut decl_seq: Vec<DeclItem> = Vec::new();
     while p.kw("DECLARE") {
+        // DECLARE PROCEDURE / FUNCTION: a nested body compiled by
+        // this same machinery into a counted blob
+        if p.kw("PROCEDURE") {
+            decl_seq.push(DeclItem::Sub(p.sub_decl(false)?));
+            continue;
+        }
+        if p.kw("FUNCTION") {
+            decl_seq.push(DeclItem::Sub(p.sub_decl(true)?));
+            continue;
+        }
         let _ = p.kw("VARIABLE");
         let Some(Tok::Ident(name)) = p.t.get(p.i) else {
             return None;
@@ -2884,11 +3031,21 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
     while !p.kw("END") {
         stmts.push(p.trig_stmt()?);
     }
-    if p.i != p.t.len() || stmts.is_empty() {
+    if sub {
+        // a spare ; may follow a subroutine's END
+        if matches!(p.t.get(p.i), Some(Tok::Semi)) {
+            p.i += 1;
+        }
+    } else if p.i != p.t.len() {
+        return None;
+    }
+    if stmts.is_empty() {
         return None;
     }
 
     let n = params.len();
+    // where local declares number from (see local_vars above)
+    let var_base = n + if sub { inputs.len() } else { 0 };
     let mut out = vec![blr::VERSION5, blr::BEGIN];
     if !inputs.is_empty() {
         // message 0: the inputs - dsc + null-flag short each, no EOF
@@ -2902,6 +3059,7 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         }
     }
     // message 1: per output dsc + null-flag short, then the EOF short
+    // (a function's message keeps the EOF slot its sends never set)
     out.push(blr::MESSAGE);
     out.push(1);
     out.extend_from_slice(&((2 * n + 1) as u16).to_le_bytes());
@@ -2931,39 +3089,42 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
         out.push(blr::VARIABLE);
         out.extend_from_slice(&(vi as u16).to_le_bytes());
     }
-    // the declaration section in SOURCE order, with each variable's
-    // init deferred past following cursor declarations (probed)
-    let emit_init = |out: &mut Vec<u8>, vi: usize, init: &Option<Val>| {
-        out.push(blr::ASSIGNMENT);
-        match init {
-            Some(v) => emit_val(out, v),
-            None => out.push(blr::NULL),
-        }
-        out.push(blr::VARIABLE);
-        out.extend_from_slice(&(vi as u16).to_le_bytes());
-    };
-    let mut pending: Option<usize> = None;
+    // the declaration section: declares (variables, cursors,
+    // subroutines) in SOURCE order, then ALL the variable inits
+    // grouped after - the law slice 21 read as per-variable deferral
+    // was really this grouping; a two-local probe settled it (the
+    // outputs above DO interleave - a different rule for a
+    // different slot kind)
     for item in &decl_seq {
         match item {
             DeclItem::Var(li) => {
-                if let Some(pli) = pending.take() {
-                    emit_init(&mut out, n + pli, &locals[pli].1);
-                }
-                let vi = n + li;
+                let vi = var_base + li;
                 out.push(blr::DECLARE);
                 out.extend_from_slice(&(vi as u16).to_le_bytes());
                 emit_dsc(&mut out, locals[*li].0);
-                pending = Some(*li);
             }
             DeclItem::Cur(ci) => {
                 emit_cursor_decl(&mut out, &p.cursor_decls[*ci]);
             }
+            DeclItem::Sub(si) => {
+                out.extend_from_slice(&p.sub_decls[*si]);
+            }
         }
     }
-    if let Some(pli) = pending.take() {
-        emit_init(&mut out, n + pli, &locals[pli].1);
+    for (li, (_, init)) in locals.iter().enumerate() {
+        out.push(blr::ASSIGNMENT);
+        match init {
+            Some(v) => emit_val(&mut out, v),
+            None => out.push(blr::NULL),
+        }
+        out.push(blr::VARIABLE);
+        out.extend_from_slice(&((var_base + li) as u16).to_le_bytes());
     }
-    out.push(blr::STALL);
+    // a SUBROUTINE goes without the stall when it has no outputs;
+    // top-level bodies always carry it (probed)
+    if !sub || n > 0 {
+        out.push(blr::STALL);
+    }
     out.push(blr::LABEL);
     out.push(0);
     out.push(blr::BEGIN);
@@ -2974,10 +3135,37 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
     out.push(blr::END);
     out.push(blr::END);
     out.push(blr::END);
-    emit_send(&mut out, n, 0);
+    if func {
+        emit_send_ret(&mut out);
+    } else {
+        emit_send(&mut out, n, 0);
+    }
     out.push(blr::END);
     out.push(blr::EOC);
-    Some(out)
+    Some(BodyOut {
+        blob: out,
+        ins: inputs.into_iter().map(|(n, _)| n).collect(),
+        outs: params.into_iter().map(|(n, _)| n).collect(),
+        selectable: p.saw_suspend,
+        deterministic,
+    })
+}
+
+/// A function body's row send: message 1, the ONE unnamed return
+/// variable through blr_parameter2 - and NO EOF assignment, though
+/// the message declares the slot (probed)
+fn emit_send_ret(out: &mut Vec<u8>) {
+    out.push(blr::SEND);
+    out.push(1);
+    out.push(blr::BEGIN);
+    out.push(blr::ASSIGNMENT);
+    out.push(blr::VARIABLE);
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.push(blr::PARAMETER2);
+    out.push(1);
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.push(blr::END);
 }
 
 /// A trigger-body statement.
@@ -3046,6 +3234,13 @@ enum TrigStmt {
     CursorFetchDir(u16, u8, Option<i32>, Vec<(Val, u16)>),
     /// EXECUTE STATEMENT '<sql>'; - blr_exec_sql + the sql literal
     ExecSql(String),
+    /// RETURN <expr>; in a function body: begin(assign to the
+    /// unnamed slot 0, the no-EOF send, blr_leave 0) end (probed)
+    Return(Val),
+    /// EXECUTE PROCEDURE on a DECLAREd subroutine:
+    /// blr_invoke_procedure, id clause (sub + counted name), input
+    /// values, output variables (probed)
+    SubCall(String, Vec<Val>, Vec<u16>),
     /// [FOR] EXECUTE STATEMENT '<sql>' INTO :v, ...: blr_exec_into,
     /// u16 out-count, the sql, then flag 1 (singleton) or flag 0 +
     /// the labeled loop's DO statement; the variables LAST (probed)
@@ -3054,14 +3249,21 @@ enum TrigStmt {
         vars: Vec<u16>,
         run: Option<(u8, Box<TrigStmt>)>,
     },
-    /// the PARAMETERIZED [FOR] EXECUTE STATEMENT ('<sql>') (vals)
-    /// [INTO ...]: blr_exec_stmt with tag-prefixed clauses in fixed
-    /// order - in-count, out-count, sql, [the loop's DO statement],
-    /// input values, output variables, blr_end (probed)
+    /// the FULL [FOR] EXECUTE STATEMENT - parameters (positional or
+    /// name := value) and/or the ON EXTERNAL / AS USER / PASSWORD /
+    /// ROLE modifiers: blr_exec_stmt with tag-prefixed clauses in
+    /// fixed order - 1 in-count, 2 out-count, 3 sql, 4 the loop's
+    /// DO statement, 5 data source, 6 user, 7 password, 14 role,
+    /// 11 positional / 12 named input values, 13 output variables,
+    /// blr_end (probed; order from the engine's own genBlr)
     ExecStmtFull {
         sql: String,
-        ins: Vec<Val>,
+        ins: Vec<(Option<String>, Val)>,
         vars: Vec<u16>,
+        data_src: Option<Val>,
+        user: Option<Val>,
+        pwd: Option<Val>,
+        role: Option<Val>,
         run: Option<(u8, Box<TrigStmt>)>,
     },
     /// MERGE INTO tgt USING src ON <bool>: a marks(1, 6)-stamped
@@ -3401,6 +3603,42 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
             out.push(blr::EXEC_SQL);
             emit_val(out, &Val::Str(sql.clone()));
         }
+        TrigStmt::Return(v) => {
+            out.push(blr::BEGIN);
+            out.push(blr::ASSIGNMENT);
+            emit_val(out, v);
+            out.push(blr::VARIABLE);
+            out.extend_from_slice(&0u16.to_le_bytes());
+            emit_send_ret(out);
+            out.push(blr::LEAVE);
+            out.push(0);
+            out.push(blr::END);
+        }
+        TrigStmt::SubCall(name, ins, outs) => {
+            out.push(blr::INVOKE_PROCEDURE);
+            out.push(1); // id clause
+            out.push(4); // ... a subroutine
+            out.push(3); // ... by name
+            out.push(name.len() as u8);
+            out.extend_from_slice(name.as_bytes());
+            out.push(blr::END);
+            if !ins.is_empty() {
+                out.push(3); // input values
+                out.extend_from_slice(&(ins.len() as u16).to_le_bytes());
+                for v in ins {
+                    emit_val(out, v);
+                }
+            }
+            if !outs.is_empty() {
+                out.push(5); // output variables
+                out.extend_from_slice(&(outs.len() as u16).to_le_bytes());
+                for vi in outs {
+                    out.push(blr::VARIABLE);
+                    out.extend_from_slice(&vi.to_le_bytes());
+                }
+            }
+            out.push(blr::END);
+        }
         TrigStmt::ExecInto { sql, vars, run } => {
             if let Some((label, _)) = run {
                 out.push(blr::LABEL);
@@ -3421,7 +3659,16 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 out.extend_from_slice(&vi.to_le_bytes());
             }
         }
-        TrigStmt::ExecStmtFull { sql, ins, vars, run } => {
+        TrigStmt::ExecStmtFull {
+            sql,
+            ins,
+            vars,
+            data_src,
+            user,
+            pwd,
+            role,
+            run,
+        } => {
             if let Some((label, _)) = run {
                 out.push(blr::LABEL);
                 out.push(*label);
@@ -3441,9 +3688,22 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 out.push(4); // blr_exec_stmt_proc_block
                 emit_trig_stmt(out, body);
             }
+            for (tag, v) in
+                [(5u8, data_src), (6, user), (7, pwd), (14, role)]
+            {
+                if let Some(v) = v {
+                    out.push(tag);
+                    emit_val(out, v);
+                }
+            }
             if !ins.is_empty() {
-                out.push(11); // blr_exec_stmt_in_params
-                for v in ins {
+                let named = ins[0].0.is_some();
+                out.push(if named { 12 } else { 11 });
+                for (n, v) in ins {
+                    if let Some(n) = n {
+                        out.push(n.len() as u8);
+                        out.extend_from_slice(n.as_bytes());
+                    }
                     emit_val(out, v);
                 }
             }
@@ -4238,8 +4498,12 @@ impl<'a> P<'a> {
 
 
     /// The parameterized EXECUTE STATEMENT head: ('<literal sql>')
-    /// (val [, ...]) - self.i at the opening paren of the sql.
-    fn exec_stmt_head(&mut self) -> Option<(String, Vec<Val>)> {
+    /// (val [, ...] | name := val [, ...]) - self.i at the opening
+    /// paren of the sql. All parameters named or all unnamed (the
+    /// two live under different tags - mixing refuses).
+    fn exec_stmt_head(
+        &mut self,
+    ) -> Option<(String, Vec<(Option<String>, Val)>)> {
         self.i += 1; // (
         let Some(Tok::Str(sql)) = self.t.get(self.i) else {
             return None;
@@ -4254,9 +4518,32 @@ impl<'a> P<'a> {
             return None;
         }
         self.i += 1;
-        let mut ins = Vec::new();
+        let mut ins: Vec<(Option<String>, Val)> = Vec::new();
         loop {
-            ins.push(self.val()?);
+            // name := value (the lexer splits := into : =)
+            let named = matches!(
+                (self.t.get(self.i), self.t.get(self.i + 1), self.t.get(self.i + 2)),
+                (
+                    Some(Tok::Ident(n)),
+                    Some(Tok::Colon),
+                    Some(Tok::Cmp(CmpOp::Eql))
+                ) if !is_keyword(n)
+            );
+            let name = if named {
+                let Some(Tok::Ident(n)) = self.t.get(self.i) else {
+                    return None;
+                };
+                let n = n.clone();
+                self.i += 3;
+                Some(n)
+            } else {
+                None
+            };
+            if ins.first().is_some_and(|(f, _)| f.is_some() != name.is_some())
+            {
+                return None; // mixed named/unnamed
+            }
+            ins.push((name, self.val()?));
             match self.t.get(self.i)? {
                 Tok::Comma => self.i += 1,
                 Tok::RParen => {
@@ -4267,6 +4554,50 @@ impl<'a> P<'a> {
             }
         }
         Some((sql, ins))
+    }
+
+    /// EXECUTE STATEMENT's optional tail modifiers, any order:
+    /// ON EXTERNAL <v>, AS USER <v>, PASSWORD <v>, ROLE <v>.
+    fn exec_stmt_mods(
+        &mut self,
+    ) -> Option<(Option<Val>, Option<Val>, Option<Val>, Option<Val>)> {
+        let (mut ds, mut user, mut pwd, mut role) = (None, None, None, None);
+        loop {
+            if self.kw("ON") {
+                if !matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "EXTERNAL")
+                    || ds.is_some()
+                {
+                    return None;
+                }
+                self.i += 1;
+                ds = Some(self.val()?);
+            } else if self.kw("AS") {
+                if !matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "USER")
+                    || user.is_some()
+                {
+                    return None;
+                }
+                self.i += 1;
+                user = Some(self.val()?);
+            } else if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "PASSWORD")
+            {
+                if pwd.is_some() {
+                    return None;
+                }
+                self.i += 1;
+                pwd = Some(self.val()?);
+            } else if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "ROLE")
+            {
+                if role.is_some() {
+                    return None;
+                }
+                self.i += 1;
+                role = Some(self.val()?);
+            } else {
+                break;
+            }
+        }
+        Some((ds, user, pwd, role))
     }
 
     /// An optional RETURNING col [, ...] INTO :v [, ...] tail on a
@@ -4331,6 +4662,68 @@ impl<'a> P<'a> {
             .rev()
             .find(|(n, ..)| n == name)
             .map(|(_, ctx, tbl)| (*ctx, tbl.clone()))
+    }
+
+    /// DECLARE PROCEDURE/FUNCTION <name> ...: the nested body runs
+    /// through body_compile on a FRESH parser (own variables,
+    /// streams, labels - subroutines see nothing of the outer
+    /// scope), then wraps in blr_subproc_decl/blr_subfunc_decl with
+    /// the u32-counted blob. Streams inside subroutine bodies emit
+    /// blr_relation3 with an explicit schema (probed) - unconverted,
+    /// so stream-bearing subroutines refuse; nested subroutines
+    /// refuse too.
+    fn sub_decl(&mut self, func: bool) -> Option<usize> {
+        let Some(Tok::Ident(name)) = self.t.get(self.i) else {
+            return None;
+        };
+        if is_keyword(name) {
+            return None;
+        }
+        let name = name.clone();
+        self.i += 1;
+        if self.in_sub {
+            return None;
+        }
+        let mut inner = P::fresh(self.t);
+        inner.i = self.i;
+        inner.in_sub = true;
+        let bo = body_compile(&mut inner, func, true)?;
+        if !inner.streams.is_empty() {
+            return None;
+        }
+        self.i = inner.i;
+        let mut blob = Vec::new();
+        blob.push(if func {
+            blr::SUBFUNC_DECL
+        } else {
+            blr::SUBPROC_DECL
+        });
+        blob.push(name.len() as u8);
+        blob.extend_from_slice(name.as_bytes());
+        blob.push(0); // SUB_ROUTINE_TYPE_PSQL
+        blob.push(if func {
+            bo.deterministic as u8
+        } else {
+            bo.selectable as u8
+        });
+        for list in [&bo.ins, &bo.outs] {
+            blob.extend_from_slice(&(list.len() as u16).to_le_bytes());
+            for n in list.iter() {
+                blob.push(n.len() as u8);
+                blob.extend_from_slice(n.as_bytes());
+                blob.push(0); // no default clause
+            }
+        }
+        blob.extend_from_slice(&(bo.blob.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&bo.blob);
+        let idx = self.sub_decls.len();
+        self.sub_decls.push(blob);
+        if func {
+            self.sub_funcs.push((name, bo.ins.len()));
+        } else {
+            self.sub_procs.push((name, bo.ins.len(), bo.outs.len()));
+        }
+        Some(idx)
     }
 
     /// DECLARE <name> CURSOR FOR (SELECT cols FROM tbl [alias]
@@ -4782,7 +5175,18 @@ impl<'a> P<'a> {
                     return None; // SUSPEND without outputs: unprobed
                 }
                 self.i += 1;
+                self.saw_suspend = true;
                 return Some(TrigStmt::Suspend(n));
+            }
+            // RETURN <expr>; - function bodies only: assign the
+            // unnamed return slot, send it, leave the wrapper label
+            if self.in_func && self.kw("RETURN") {
+                let v = self.val()?;
+                if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                    return None;
+                }
+                self.i += 1;
+                return Some(TrigStmt::Return(v));
             }
         }
         // (FOR) SELECT works in BOTH body kinds - a trigger's FOR
@@ -4794,53 +5198,23 @@ impl<'a> P<'a> {
                 if !self.kw("STATEMENT") {
                     return None;
                 }
-                // parenthesized = parameterized: the full form with
-                // the DO statement under tag 4
-                if matches!(self.t.get(self.i), Some(Tok::LParen)) {
-                    let (sql, ins) = self.exec_stmt_head()?;
-                    if !self.kw("INTO") {
-                        return None;
-                    }
-                    let mut vars = Vec::new();
-                    loop {
-                        if !matches!(self.t.get(self.i), Some(Tok::Colon)) {
-                            return None;
-                        }
-                        self.i += 1;
-                        let Some(Tok::Ident(v)) = self.t.get(self.i) else {
+                let (sql, ins) =
+                    if matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                        self.exec_stmt_head()?
+                    } else {
+                        let Some(Tok::Str(sql)) = self.t.get(self.i) else {
                             return None;
                         };
-                        let vi = self
-                            .local_vars
-                            .iter()
-                            .position(|n| n == v)?
-                            as u16;
-                        vars.push(vi);
+                        let sql = sql.clone();
                         self.i += 1;
-                        if matches!(self.t.get(self.i), Some(Tok::Comma)) {
-                            self.i += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    let label = self.next_label;
-                    self.next_label += 1;
-                    if !self.kw("DO") {
-                        return None;
-                    }
-                    let body = Box::new(self.trig_stmt()?);
-                    return Some(TrigStmt::ExecStmtFull {
-                        sql,
-                        ins,
-                        vars,
-                        run: Some((label, body)),
-                    });
-                }
-                let Some(Tok::Str(sql)) = self.t.get(self.i) else {
-                    return None;
-                };
-                let sql = sql.clone();
-                self.i += 1;
+                        (sql, Vec::new())
+                    };
+                let (data_src, user, pwd, role) = self.exec_stmt_mods()?;
+                let full = !ins.is_empty()
+                    || data_src.is_some()
+                    || user.is_some()
+                    || pwd.is_some()
+                    || role.is_some();
                 if !self.kw("INTO") {
                     return None;
                 }
@@ -4869,10 +5243,23 @@ impl<'a> P<'a> {
                     return None;
                 }
                 let body = Box::new(self.trig_stmt()?);
-                return Some(TrigStmt::ExecInto {
-                    sql,
-                    vars,
-                    run: Some((label, body)),
+                return Some(if full {
+                    TrigStmt::ExecStmtFull {
+                        sql,
+                        ins,
+                        vars,
+                        data_src,
+                        user,
+                        pwd,
+                        role,
+                        run: Some((label, body)),
+                    }
+                } else {
+                    TrigStmt::ExecInto {
+                        sql,
+                        vars,
+                        run: Some((label, body)),
+                    }
                 });
             }
             if !self.kw("SELECT") {
@@ -4888,23 +5275,31 @@ impl<'a> P<'a> {
             // EXECUTE STATEMENT '<literal sql>' [INTO :v, ...]; -
             // expression sql, USING, external data sources: unprobed
             if self.kw("STATEMENT") {
-                // the parenthesized head carries INPUT parameters -
-                // the full blr_exec_stmt form
-                if matches!(self.t.get(self.i), Some(Tok::LParen)) {
-                    let (sql, ins) = self.exec_stmt_head()?;
-                    if matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                // sql: a bare literal or the parenthesized head with
+                // parameters; then the optional modifiers - either
+                // of which forces the FULL blr_exec_stmt form
+                let (sql, ins) =
+                    if matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                        self.exec_stmt_head()?
+                    } else {
+                        let Some(Tok::Str(sql)) = self.t.get(self.i) else {
+                            return None;
+                        };
+                        let sql = sql.clone();
                         self.i += 1;
-                        return Some(TrigStmt::ExecStmtFull {
-                            sql,
-                            ins,
-                            vars: Vec::new(),
-                            run: None,
-                        });
-                    }
+                        (sql, Vec::new())
+                    };
+                let (data_src, user, pwd, role) = self.exec_stmt_mods()?;
+                let full = !ins.is_empty()
+                    || data_src.is_some()
+                    || user.is_some()
+                    || pwd.is_some()
+                    || role.is_some();
+                let mut vars = Vec::new();
+                if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
                     if !self.kw("INTO") {
                         return None;
                     }
-                    let mut vars = Vec::new();
                     loop {
                         if !matches!(self.t.get(self.i), Some(Tok::Colon)) {
                             return None;
@@ -4926,56 +5321,30 @@ impl<'a> P<'a> {
                             break;
                         }
                     }
-                    if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
-                        return None;
-                    }
-                    self.i += 1;
-                    return Some(TrigStmt::ExecStmtFull {
-                        sql,
-                        ins,
-                        vars,
-                        run: None,
-                    });
-                }
-                let Some(Tok::Str(sql)) = self.t.get(self.i) else {
-                    return None;
-                };
-                let sql = sql.clone();
-                self.i += 1;
-                if matches!(self.t.get(self.i), Some(Tok::Semi)) {
-                    self.i += 1;
-                    return Some(TrigStmt::ExecSql(sql));
-                }
-                if !self.kw("INTO") {
-                    return None;
-                }
-                let mut vars = Vec::new();
-                loop {
-                    if !matches!(self.t.get(self.i), Some(Tok::Colon)) {
-                        return None;
-                    }
-                    self.i += 1;
-                    let Some(Tok::Ident(v)) = self.t.get(self.i) else {
-                        return None;
-                    };
-                    let vi =
-                        self.local_vars.iter().position(|n| n == v)? as u16;
-                    vars.push(vi);
-                    self.i += 1;
-                    if matches!(self.t.get(self.i), Some(Tok::Comma)) {
-                        self.i += 1;
-                    } else {
-                        break;
-                    }
                 }
                 if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
                     return None;
                 }
                 self.i += 1;
-                return Some(TrigStmt::ExecInto {
-                    sql,
-                    vars,
-                    run: None,
+                return Some(if full {
+                    TrigStmt::ExecStmtFull {
+                        sql,
+                        ins,
+                        vars,
+                        data_src,
+                        user,
+                        pwd,
+                        role,
+                        run: None,
+                    }
+                } else if vars.is_empty() {
+                    TrigStmt::ExecSql(sql)
+                } else {
+                    TrigStmt::ExecInto {
+                        sql,
+                        vars,
+                        run: None,
+                    }
                 });
             }
             if !self.kw("PROCEDURE") {
@@ -5030,6 +5399,19 @@ impl<'a> P<'a> {
                 return None;
             }
             self.i += 1;
+            // a DECLAREd sub-procedure takes the invoke_procedure
+            // verb, count-checked against its declaration
+            if let Some((ni, no)) = self
+                .sub_procs
+                .iter()
+                .find(|(n, ..)| n == &name)
+                .map(|(_, i, o)| (*i, *o))
+            {
+                if ins.len() != ni || outs.len() != no {
+                    return None;
+                }
+                return Some(TrigStmt::SubCall(name, ins, outs));
+            }
             return Some(TrigStmt::ExecProc(name, ins, outs));
         }
         if self.kw("EXCEPTION") {
@@ -5854,6 +6236,12 @@ pub fn compile_default(sql: &str) -> Option<Vec<u8>> {
         cursor_decls: Vec::new(),
         for_cursors: Vec::new(),
         merge_scope: None,
+        in_func: false,
+        in_sub: false,
+        saw_suspend: false,
+        sub_decls: Vec::new(),
+        sub_procs: Vec::new(),
+        sub_funcs: Vec::new(),
     };
     if !p.kw("DEFAULT") {
         return None;
@@ -5923,6 +6311,12 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
         cursor_decls: Vec::new(),
         for_cursors: Vec::new(),
         merge_scope: None,
+        in_func: false,
+        in_sub: false,
+        saw_suspend: false,
+        sub_decls: Vec::new(),
+        sub_procs: Vec::new(),
+        sub_funcs: Vec::new(),
     };
     if !(p.kw("COMPUTED") && p.kw("BY")) {
         return None;
@@ -5985,6 +6379,12 @@ pub fn compile_check(sql: &str) -> Option<Vec<u8>> {
         cursor_decls: Vec::new(),
         for_cursors: Vec::new(),
         merge_scope: None,
+        in_func: false,
+        in_sub: false,
+        saw_suspend: false,
+        sub_decls: Vec::new(),
+        sub_procs: Vec::new(),
+        sub_funcs: Vec::new(),
     };
     if !p.kw("CHECK") {
         return None;
@@ -6052,6 +6452,12 @@ pub fn compile_validation(sql: &str) -> Option<Vec<u8>> {
         cursor_decls: Vec::new(),
         for_cursors: Vec::new(),
         merge_scope: None,
+        in_func: false,
+        in_sub: false,
+        saw_suspend: false,
+        sub_decls: Vec::new(),
+        sub_procs: Vec::new(),
+        sub_funcs: Vec::new(),
     };
     if !p.kw("CHECK") {
         return None;
@@ -6139,6 +6545,12 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
         cursor_decls: Vec::new(),
         for_cursors: Vec::new(),
         merge_scope: None,
+        in_func: false,
+        in_sub: false,
+        saw_suspend: false,
+        sub_decls: Vec::new(),
+        sub_procs: Vec::new(),
+        sub_funcs: Vec::new(),
     };
     if !(p.kw("CREATE") && p.kw("TRIGGER")) {
         return None;
@@ -7707,8 +8119,78 @@ mod tests {
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT COUNT(*) FROM U2 WITH LOCK INTO :R1 DO SUSPEND; END",
             // WITH LOCK beside ORDER BY: unprobed emission order
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT UID FROM U2 ORDER BY UID WITH LOCK INTO :R1 DO SUSPEND; END",
-            // named EXECUTE STATEMENT parameters: unprobed
-            "CREATE PROCEDURE X (P1 INTEGER) AS BEGIN EXECUTE STATEMENT ('delete from u2 where uid = :a') (a := :P1); END",
+        ] {
+            assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
+        }
+    }
+
+    #[test]
+    fn compiles_slice_twenty_six_shapes_byte_for_byte() {
+        // DECLARE FUNCTION: blr_subfunc_decl - counted name, type 0,
+        // flags, u16-counted param names (the return slot UNNAMED),
+        // u32-counted inner body; the call is blr_invoke_function
+        // with the sub id clause; RETURN = begin(assign slot 0, the
+        // no-EOF send, leave 0) (flip twenty-six)
+        pin_proc(
+            "CREATE PROCEDURE QU1 RETURNS (R1 INTEGER) AS DECLARE V1 INTEGER = 3; DECLARE FUNCTION TRIPLE (I1 INTEGER) RETURNS INTEGER AS DECLARE M1 INTEGER = 3; BEGIN RETURN I1 * M1; END BEGIN R1 = TRIPLE(V1); SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00000301000800CF06545249504C450000010002493100010000006900000005020400020008000700040103000800070007000C00020300000800012D1A0000030200080001150800030000001A02009B110002020201242900000001001A02001A00000E0102011A0000290100000100FF1200FFFFFFFF0E0102011A0000290100000100FFFF4C01150800030000001A01009B1100020201E001040306545249504C45FF0301001A0100FF1A00000E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // DECLARE PROCEDURE with two outputs: blr_subproc_decl with
+        // the selectable flag, the invoke_procedure call carrying
+        // both output variables (flip twenty-seven)
+        pin_proc(
+            "CREATE PROCEDURE QU2 (P1 INTEGER) RETURNS (R1 INTEGER, R2 INTEGER) AS DECLARE PROCEDURE BOTH2 (X1 INTEGER) RETURNS (O1 INTEGER, O2 INTEGER) AS BEGIN O1 = X1 + 1; O2 = X1 - 1; SUSPEND; END BEGIN EXECUTE PROCEDURE BOTH2(:P1) RETURNING_VALUES :R1, :R2; SUSPEND; END",
+            "0502040002000800070004010500080007000800070007000C00020300000800012D1A00000301000800012D1A0100CD05424F54483200010100025831000200024F3100024F3200A10000000502040002000800070004010500080007000800070007000C00020300000800012D1A00000301000800012D1A01009B110002020122290000000100150800010000001A00000123290000000100150800010000001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C9B11000202E101040305424F544832FF0301002900000001000502001A00001A0100FF0E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        // named EXECUTE STATEMENT parameters (tag 12: counted name +
+        // value each) beside AS USER (tag 6) - flip twenty-eight
+        pin_proc(
+            "CREATE PROCEDURE QU3 (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN EXECUTE STATEMENT ('select ua from u2 where uid = :id') (id := :P1) AS USER 'SYSDBA' INTO :R1; SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B11000202BD01010002010003150F0000210073656C6563742075612066726F6D20753220776865726520756964203D203A696406150F000006005359534442410C0249442900000001000D1A0000FF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... and in the FOR loop form, the DO statement under tag 4
+        pin_proc(
+            "CREATE PROCEDURE QU4 (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR EXECUTE STATEMENT ('select uid from u2 where ua > :x') (x := :P1) INTO :R1 DO SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B110002021101BD01010002010003150F0000200073656C656374207569642066726F6D207532207768657265207561203E203A78040E0102011A000029010000010001150700010019010200FF0C01582900000001000D1A0000FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // TWO laws in one pin: a SUBROUTINE's inputs RESERVE variable
+        // slots (two inputs put the first local at 3) and local
+        // declares GROUP with their inits after
+        pin_proc(
+            "CREATE PROCEDURE QU5 RETURNS (R1 INTEGER) AS DECLARE FUNCTION FX (A1 INTEGER, A2 INTEGER) RETURNS INTEGER AS DECLARE M1 INTEGER = 1; DECLARE M2 INTEGER; BEGIN M2 = A1 + A2 + M1; RETURN M2; END BEGIN R1 = FX(1, 2); SUSPEND; END",
+            "050204010300080007000700020300000800012D1A0000CF02465800000200024131000241320001000000850000000502040004000800070008000700040103000800070007000C00020300000800012D1A00000303000800030400080001150800010000001A0300012D1A04009B110002020122222900000001002900020003001A03001A040002011A04001A00000E0102011A0000290100000100FF1200FFFFFFFF0E0102011A0000290100000100FFFF4C9B1100020201E0010403024658FF0302001508000100000015080002000000FF1A00000E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // the same two laws in a sub-PROCEDURE
+        pin_proc(
+            "CREATE PROCEDURE QU6 RETURNS (R1 INTEGER) AS DECLARE PROCEDURE SP (X1 INTEGER) RETURNS (O1 INTEGER) AS DECLARE M1 INTEGER = 1; DECLARE M2 INTEGER = 2; BEGIN O1 = X1 + M1 + M2; SUSPEND; END BEGIN EXECUTE PROCEDURE SP(4) RETURNING_VALUES :R1; SUSPEND; END",
+            "050204010300080007000700020300000800012D1A0000CD02535000010100025831000100024F31008D00000005020400020008000700040103000800070007000C00020300000800012D1A00000302000800030300080001150800010000001A020001150800020000001A03009B110002020122222900000001001A02001A03001A00000E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C9B11000202E1010403025350FF030100150800040000000501001A0000FF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // the grouping law at TOP LEVEL - the latent divergence this
+        // slice's probes exposed: two inited locals emit declare,
+        // declare, init, init - NOT interleaved pairs; the outputs
+        // above them DO interleave (a different slot kind's rule)
+        pin_proc(
+            "CREATE PROCEDURE QU7 RETURNS (R1 INTEGER, R2 INTEGER) AS DECLARE M1 INTEGER = 1; DECLARE M2 INTEGER = 2; BEGIN R1 = M1; R2 = M2; SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01000302000800030300080001150800010000001A020001150800020000001A03009B11000202011A02001A0000011A03001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+    }
+
+    #[test]
+    fn subroutine_refusals() {
+        for sql in [
+            // streams inside a subroutine emit blr_relation3 with an
+            // explicit schema - probed, unconverted
+            "CREATE PROCEDURE X (P1 INTEGER) AS DECLARE PROCEDURE LOGIT (X1 INTEGER) AS BEGIN INSERT INTO T (ID) VALUES (:X1); END BEGIN EXECUTE PROCEDURE LOGIT(:P1); END",
+            // nested subroutines: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS DECLARE PROCEDURE S1 RETURNS (O1 INTEGER) AS DECLARE PROCEDURE S2 RETURNS (O2 INTEGER) AS BEGIN O2 = 1; END BEGIN EXECUTE PROCEDURE S2 RETURNING_VALUES :O1; END BEGIN EXECUTE PROCEDURE S1 RETURNING_VALUES :R1; SUSPEND; END",
+            // RETURN belongs to function bodies only
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN RETURN 1; END",
+            // SUSPEND has no place in a function body
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS DECLARE FUNCTION F1 RETURNS INTEGER AS BEGIN SUSPEND; END BEGIN R1 = F1(); SUSPEND; END",
+            // sub-call argument counts are checked at the declaration
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS DECLARE FUNCTION DBL (I1 INTEGER) RETURNS INTEGER AS BEGIN RETURN I1 + I1; END BEGIN R1 = DBL(1, 2); SUSPEND; END",
+            // mixed named and unnamed EXECUTE STATEMENT parameters
+            "CREATE PROCEDURE X (P1 INTEGER) AS BEGIN EXECUTE STATEMENT ('delete from u2 where uid = :a and ua = ?') (a := :P1, :P1); END",
         ] {
             assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
         }

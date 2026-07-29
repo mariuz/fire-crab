@@ -13,6 +13,51 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-dsql slice 26: subroutines, named ES parameters - and a latent fix
+
+### Converted
+- **DECLARE FUNCTION** (flip twenty-six): `blr_subfunc_decl` —
+  counted name, type 0, a deterministic/aggregate flag byte,
+  u16-counted parameter-name lists (the return slot an UNNAMED
+  output), then the WHOLE inner body's BLR as a u32-counted blob —
+  compiled by the same body machinery as top-level procedures on a
+  fresh parser. RETURN <expr> = begin(assign the unnamed slot 0,
+  the no-EOF send, blr_leave 0); function sends DROP the EOF
+  assignment their message still declares. Calls are
+  `blr_invoke_function` value expressions: id clause (4 sub, 3
+  counted name), u16-counted arguments.
+- **DECLARE PROCEDURE** (flip twenty-seven): `blr_subproc_decl`,
+  same frame with a SELECTABLE flag (a SUSPEND anywhere inside);
+  calls take `blr_invoke_procedure` with input values (tag 3) and
+  output variables (tag 5). A void subroutine goes WITHOUT
+  blr_stall where a top-level body keeps it.
+- **Named EXECUTE STATEMENT parameters** (flip twenty-eight,
+  slice 25's refusal): tag 12 with a counted name before each
+  value; plus the modifiers ON EXTERNAL (5) / AS USER (6) /
+  PASSWORD (7) / ROLE (14) — clause order from the engine's own
+  genBlr; a modifier alone forces the FULL blr_exec_stmt form even
+  on a parameterless literal.
+
+### Fixed
+- **The declare-section law, re-read**: a two-local probe showed
+  procedure LOCALS group — declare, declare, init, init — NOT the
+  per-variable interleave sixteen slices had assumed (outputs DO
+  interleave; single-local bodies can't tell the difference, and no
+  battery statement had two inited locals). The slice-21 "deferral"
+  law was this grouping all along. A latent wrong-bytes path,
+  closed with pins at top level, in sub-procedures and in
+  sub-functions.
+
+### Guarded
+- Streams inside subroutine bodies (they emit blr_relation3 with an
+  explicit schema — probed, unconverted), nested subroutines,
+  zero-argument sub-function calls, RETURN outside functions,
+  SUSPEND inside them, mixed named/unnamed ES parameters. Two more
+  subroutine laws pinned on the way: a SUBROUTINE's inputs RESERVE
+  variable slots (locals number past them — top-level bodies don't)
+  — gate: `qa/dsql-proc-blr.sh` grew to 147 checks (12 fresh); 291
+  unit byte-pins.
+
 ## 2026-07-28 — fire-crab-dsql slice 25: MERGE branch chains, parameterized EXECUTE STATEMENT, WITH LOCK
 
 ### Converted

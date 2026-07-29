@@ -4666,6 +4666,39 @@ WHEN, and a BLOCK as a handler's body nests blr_block again with no
 handler section of its own - the battery runs a handler block
 containing an EXIT.
 
+Slice 26 opened the SUBROUTINE surface - and its best find was a
+FIX. DECLARE FUNCTION and DECLARE PROCEDURE compile to
+blr_subfunc_decl/blr_subproc_decl: a counted name, the PSQL type
+byte, a flag (deterministic for functions, SELECTABLE - a SUSPEND
+anywhere inside - for procedures), u16-counted parameter-name
+lists with the function's return slot an UNNAMED output, then the
+WHOLE inner body's BLR as a u32-counted blob. The inner body is
+compiled by the SAME machinery as a top-level procedure on a fresh
+parser - the refactor that made compile_procedure a two-line
+wrapper - with three subroutine-only laws the probes pinned: a
+void subroutine drops the blr_stall a top-level body keeps; a
+subroutine's INPUTS reserve variable slots (two inputs put the
+first local at 3) where top-level inputs reserve nothing; and
+RETURN <expr> is begin(assign slot 0, a send WITHOUT the EOF
+assignment its message still declares, blr_leave 0). Calls ride
+blr_invoke_function/_procedure with the sub id clause. Streams
+inside subroutines emit blr_relation3 with an explicit schema -
+probed, guarded, a named refusal with the transcript in hand. The
+FIX: a two-local probe showed procedure LOCALS group - declare,
+declare, init, init - NOT the per-variable interleave sixteen
+slices had assumed. Outputs DO interleave; a single local can't
+tell the two apart, and NO battery statement in 135 checks had two
+inited locals in a row. The slice-21 "init defers past cursor
+declarations" law was really this grouping all along - pinned now
+at top level, in sub-procedures and in sub-functions, with a
+three-local battery check. A new probe angle on an old surface is
+still a probe. Named EXECUTE STATEMENT parameters (tag 12, a
+counted UPPERCASED name before each value) flipped slice 25's last
+refusal, and the ON EXTERNAL/AS USER/PASSWORD/ROLE modifiers
+landed under tags 5/6/7/14 - clause order read from the engine's
+own genBlr, any modifier forcing the full form even on a
+parameterless literal.
+
 Slice 25 generalized MERGE to its full branch surface. Branches of
 one kind form an if-else CHAIN in SQL order - and the chain is
 written BY POSITION: each conditional branch emits if(cond, action)

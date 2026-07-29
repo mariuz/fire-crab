@@ -307,6 +307,13 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # a nested program is a BLOB: subroutines carry their whole
+    # body's BLR as a counted payload compiled by the SAME machinery
+    # on a fresh parser - refactor for reentrancy, then diff the
+    # nested wrapper against the top-level one (stall, slot
+    # reservation, send shapes all differ); and a law probed only on
+    # size-1 cases may be TWO laws (locals group, outputs interleave)
+    # - grow one probe dimension past every prior probe's size
     # branch chains nest BY POSITION: an if's else slot is simply
     # the next if, unmarked - only the innermost needs its bare end;
     # and one keyword can pick between THREE verbs by what the
