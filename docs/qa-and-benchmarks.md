@@ -4666,6 +4666,27 @@ WHEN, and a BLOCK as a handler's body nests blr_block again with no
 handler section of its own - the battery runs a handler block
 containing an EXIT.
 
+Slice 27 turned the converted surface loose inside subroutines.
+Slice 26 had probed the wall and named it: streams in subroutine
+bodies emit blr_relation3. The layout, read from the engine's own
+RelationSourceNode::genBlr, is counted schema PUBLIC, a counted
+EMPTY package - the mystery byte between schema and name - the
+object name, then the alias slot ALWAYS present: the exact alias
+string relation2 would carry (a quoted table alias, a cursor's
+name string) or a counted empty when the plain relation form
+carries none. One emission switch - a sub flag on the stream, set
+at parse time by the fresh parser every subroutine body gets -
+and the whole statement surface followed: the battery runs
+INSERT, DELETE and UPDATE loops, a singular SELECT INTO over an
+aggregate, ordered FOR SELECT, a DECLAREd cursor, an AS CURSOR
+loop driving positioned UPDATEs, UPDATE OR INSERT and a
+two-branch MERGE inside subroutine bodies - compositions the
+probes never ran; the gate proved them all on the emission
+switch alone. And the gate flipped a refusal on its own: a
+zero-argument sub-function call compiles - HEADCOUNT() emits the
+argument tag WITH COUNT 0, where invoke_procedure simply omits
+its empty tags. Two verbs, two conventions for nothing.
+
 Slice 26 opened the SUBROUTINE surface - and its best find was a
 FIX. DECLARE FUNCTION and DECLARE PROCEDURE compile to
 blr_subfunc_decl/blr_subproc_decl: a counted name, the PSQL type

@@ -13,6 +13,34 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-dsql slice 27: streams inside subroutines
+
+### Converted
+- **blr_relation3** (flip twenty-nine — slice 26's refusal, the
+  transcript already in hand): inside a SUBROUTINE body every
+  stream qualifies itself — counted schema `PUBLIC`, counted EMPTY
+  package, the name, then the alias slot relation2 would carry (the
+  quoted alias, a cursor's name string) or a counted empty when
+  relation-plain, then the context. The layout read from the
+  engine's own `RelationSourceNode::genBlr` — the mystery byte
+  between schema and name was the empty package string. ONE
+  emission switch (a `sub` flag on the stream, set at parse) turns
+  the whole converted surface loose inside subroutines: INSERT,
+  DELETE/UPDATE loops, singular SELECT INTO over aggregates,
+  FOR SELECT, DECLAREd cursors, AS CURSOR loops with positioned
+  DML, UPDATE OR INSERT and MERGE — the battery runs them all,
+  most never probed in subroutine clothing.
+- **Zero-argument sub-function calls** flipped with the gate's own
+  find: `F()` compiles — the argument tag rides along with count 0
+  where invoke_procedure omits its empty tags.
+
+### Guarded
+- Derived tables inside subroutines, nested subroutines, aliased
+  FOR streams (top level and sub alike — the relation3-with-alias
+  transcript is in hand). Gate: `qa/dsql-proc-blr.sh` grew to 155
+  checks (8 fresh + slice 26's streams refusal flipped to a check);
+  296 unit byte-pins.
+
 ## 2026-07-29 — fire-crab-dsql slice 26: subroutines, named ES parameters - and a latent fix
 
 ### Converted

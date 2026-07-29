@@ -307,6 +307,13 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # a context-dependent ENCODING may need only one switch: streams
+    # inside subroutines swap relation/relation2 for relation3, and
+    # a flag on the parsed stream let the WHOLE statement surface
+    # through unchanged - convert the encoding, then let the gate
+    # prove the compositions; and empty-operand conventions differ
+    # BY VERB (a zero-arg function call keeps its tag at count 0,
+    # a no-input procedure call drops it) - probe each verb's empties
     # a nested program is a BLOB: subroutines carry their whole
     # body's BLR as a counted payload compiled by the SAME machinery
     # on a fresh parser - refactor for reentrancy, then diff the

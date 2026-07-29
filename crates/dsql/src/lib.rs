@@ -356,6 +356,11 @@ mod blr {
     /// a sub-function call site - blr_invoke_function, same id
     /// clause, 3 u16-counted argument values, blr_end (probed)
     pub const INVOKE_FUNCTION: u8 = 0xE0;
+    /// streams inside SUBROUTINE bodies: blr_relation3 - counted
+    /// schema, counted package (empty), counted name, then the alias
+    /// string relation2 would carry OR a counted empty, ctx (probed;
+    /// layout from the engine's RelationSourceNode::genBlr)
+    pub const RELATION3: u8 = 0x94;
     pub const EQL: u8 = 0x2F;
     pub const NEQ: u8 = 0x30;
     pub const GTR: u8 = 0x31;
@@ -841,6 +846,9 @@ struct Stream {
     /// underlying table rides along (probed); the WHOLE derived table
     /// has ONE context, shared by inner and outer references
     derived: Option<Box<Derived>>,
+    /// inside a SUBROUTINE body every stream emits blr_relation3
+    /// with an explicit schema and empty package (probed)
+    sub: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1039,7 +1047,7 @@ impl<'a> P<'a> {
             }
             _ => None,
         };
-        Some(Stream { name, alias, derived: None })
+        Some(Stream { name, alias, derived: None, sub: self.in_sub })
     }
 
     /// A derived table: pass-through column list, ONE underlying
@@ -1049,6 +1057,9 @@ impl<'a> P<'a> {
     /// fields need the context id) and popped for the caller to
     /// re-push at the same index.
     fn derived_item(&mut self) -> Option<Stream> {
+        if self.in_sub {
+            return None; // derived tables in subroutines: unprobed
+        }
         self.i += 1; // (
         if !self.kw("SELECT") {
             return None;
@@ -1079,6 +1090,7 @@ impl<'a> P<'a> {
             name: name.clone(),
             alias: None,
             derived: None,
+            sub: self.in_sub,
         });
         let si = self.streams.len() - 1;
         let saved = self.sub.replace(si);
@@ -1105,6 +1117,7 @@ impl<'a> P<'a> {
             name,
             alias: Some(alias),
             derived: Some(Box::new(Derived { wher })),
+            sub: self.in_sub,
         })
     }
 
@@ -1438,7 +1451,8 @@ impl<'a> P<'a> {
             return Some(Val::Fid(self.agg_fid_ctx, slot));
         }
         // a DECLAREd sub-function shadows nothing the surface knows:
-        // parse its counted arguments (zero-arg calls unprobed)
+        // parse its counted arguments - a zero-arg call still emits
+        // the argument tag with count 0 (probed)
         if let Some(n_args) = self
             .sub_funcs
             .iter()
@@ -1447,15 +1461,19 @@ impl<'a> P<'a> {
         {
             self.i += 1; // (
             let mut args = Vec::new();
-            loop {
-                args.push(self.val()?);
-                match self.t.get(self.i)? {
-                    Tok::Comma => self.i += 1,
-                    Tok::RParen => {
-                        self.i += 1;
-                        break;
+            if matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                self.i += 1;
+            } else {
+                loop {
+                    args.push(self.val()?);
+                    match self.t.get(self.i)? {
+                        Tok::Comma => self.i += 1,
+                        Tok::RParen => {
+                            self.i += 1;
+                            break;
+                        }
+                        _ => return None,
                     }
-                    _ => return None,
                 }
             }
             if args.len() != n_args {
@@ -2343,6 +2361,22 @@ fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
         out.push(blr::END);
         return;
     }
+    if st.sub {
+        // a subroutine body qualifies every relation: blr_relation3
+        // with schema PUBLIC, an empty package, and the alias slot
+        // ALWAYS present - the quoted alias or a counted empty
+        emit_relation3(out, &st.name);
+        match &st.alias {
+            Some(a) => {
+                let quoted = format!("\"{}\"", a);
+                out.push(quoted.len() as u8);
+                out.extend_from_slice(quoted.as_bytes());
+            }
+            None => out.push(0),
+        }
+        out.push(ctx);
+        return;
+    }
     match &st.alias {
         None => {
             out.push(blr::RELATION);
@@ -2359,6 +2393,17 @@ fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
         }
     }
     out.push(ctx);
+}
+
+/// The blr_relation3 head: schema PUBLIC, empty package, the name -
+/// the caller appends the alias slot and context.
+fn emit_relation3(out: &mut Vec<u8>, name: &str) {
+    out.push(blr::RELATION3);
+    out.push(6);
+    out.extend_from_slice(b"PUBLIC");
+    out.push(0);
+    out.push(name.len() as u8);
+    out.extend_from_slice(name.as_bytes());
 }
 
 /// Compile a view-shaped SELECT to the BLR the engine's DSQL stores in
@@ -2562,6 +2607,7 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
         name: String::new(),
         alias: None,
         derived: None,
+        sub: p.in_sub,
     });
     // no outer scope: qualified names resolve only through the
     // current branch's stream, bare names bind to it
@@ -2754,9 +2800,13 @@ fn emit_cursor_decl(out: &mut Vec<u8>, d: &CursorDecl) {
         out.push(blr::RSE);
         out.push(1);
     }
-    out.push(blr::RELATION2);
-    out.push(d.table.len() as u8);
-    out.extend_from_slice(d.table.as_bytes());
+    if d.sub {
+        emit_relation3(out, &d.table);
+    } else {
+        out.push(blr::RELATION2);
+        out.push(d.table.len() as u8);
+        out.extend_from_slice(d.table.as_bytes());
+    }
     let alias = match &d.alias {
         Some(a) => format!("\"{}\" \"{}\"", d.name, a),
         None => format!("\"{}\" \"PUBLIC\".\"{}\"", d.name, d.table),
@@ -3321,6 +3371,8 @@ struct CursorDecl {
     scroll: bool,
     /// (SELECT ... WITH LOCK) - blr_writelock in the cursor's rse
     lock: bool,
+    /// declared inside a subroutine: the rse takes blr_relation3
+    sub: bool,
     table: String,
     alias: Option<String>,
     ctx: u8,
@@ -4025,10 +4077,15 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 }
             } else if let Some(cn) = &f.cursor {
                 // AS CURSOR: the name rides the relation2 alias
-                // exactly like a DECLAREd cursor's (probed)
-                out.push(blr::RELATION2);
-                out.push(f.stream.name.len() as u8);
-                out.extend_from_slice(f.stream.name.as_bytes());
+                // exactly like a DECLAREd cursor's - relation3 with
+                // the same alias string inside a subroutine (probed)
+                if f.stream.sub {
+                    emit_relation3(out, &f.stream.name);
+                } else {
+                    out.push(blr::RELATION2);
+                    out.push(f.stream.name.len() as u8);
+                    out.extend_from_slice(f.stream.name.as_bytes());
+                }
                 let alias =
                     format!("\"{}\" \"PUBLIC\".\"{}\"", cn, f.stream.name);
                 out.push(alias.len() as u8);
@@ -4302,6 +4359,7 @@ impl<'a> P<'a> {
                 name: String::new(),
                 alias: None,
                 derived: None,
+                sub: self.in_sub,
             });
             for it in &items {
                 if let Item::Col(v) = it {
@@ -4668,10 +4726,8 @@ impl<'a> P<'a> {
     /// through body_compile on a FRESH parser (own variables,
     /// streams, labels - subroutines see nothing of the outer
     /// scope), then wraps in blr_subproc_decl/blr_subfunc_decl with
-    /// the u32-counted blob. Streams inside subroutine bodies emit
-    /// blr_relation3 with an explicit schema (probed) - unconverted,
-    /// so stream-bearing subroutines refuse; nested subroutines
-    /// refuse too.
+    /// the u32-counted blob. Streams inside emit blr_relation3 (see
+    /// emit_stream); nested subroutines refuse.
     fn sub_decl(&mut self, func: bool) -> Option<usize> {
         let Some(Tok::Ident(name)) = self.t.get(self.i) else {
             return None;
@@ -4688,9 +4744,6 @@ impl<'a> P<'a> {
         inner.i = self.i;
         inner.in_sub = true;
         let bo = body_compile(&mut inner, func, true)?;
-        if !inner.streams.is_empty() {
-            return None;
-        }
         self.i = inner.i;
         let mut blob = Vec::new();
         blob.push(if func {
@@ -4855,6 +4908,7 @@ impl<'a> P<'a> {
             name: tbl.clone(),
             alias: alias.clone(),
             derived: None,
+            sub: self.in_sub,
         });
         let sidx = self.streams.len() - 1;
         let ctx = sidx as u8 + self.base;
@@ -4869,6 +4923,7 @@ impl<'a> P<'a> {
                 name: String::new(),
                 alias: None,
                 derived: None,
+                sub: self.in_sub,
             });
             Some((self.streams.len() - 1) as u8 + self.base)
         } else {
@@ -4981,6 +5036,7 @@ impl<'a> P<'a> {
             num,
             scroll,
             lock,
+            sub: self.in_sub,
             table: tbl,
             alias,
             ctx,
@@ -5030,6 +5086,7 @@ impl<'a> P<'a> {
             name: String::new(),
             alias: None,
             derived: None,
+            sub: self.in_sub,
         });
         let new_ctx = (self.streams.len() - 1) as u8 + self.base;
         if !self.kw("SET") {
@@ -5677,6 +5734,7 @@ impl<'a> P<'a> {
                 name: rel,
                 alias: None,
                 derived: None,
+                sub: self.in_sub,
             };
             self.streams.push(st.clone());
             let ctx = (self.streams.len() - 1) as u8 + self.base;
@@ -5769,6 +5827,7 @@ impl<'a> P<'a> {
                     name: n,
                     alias,
                     derived: None,
+                    sub: p.in_sub,
                 })
             };
             let tgt = named(self)?;
@@ -5934,6 +5993,7 @@ impl<'a> P<'a> {
                                     name: String::new(),
                                     alias: None,
                                     derived: None,
+                                    sub: self.in_sub,
                                 });
                                 MergeAct::Upd(
                                     (self.streams.len() - 1) as u8
@@ -5954,6 +6014,7 @@ impl<'a> P<'a> {
                             name: String::new(),
                             alias: None,
                             derived: None,
+                            sub: self.in_sub,
                         });
                         (
                             c,
@@ -6065,6 +6126,7 @@ impl<'a> P<'a> {
                     name: rel,
                     alias: None,
                     derived: None,
+                    sub: self.in_sub,
                 };
                 // contexts: store, modify-new, rse-org - in order
                 let base = self.base;
@@ -6074,12 +6136,14 @@ impl<'a> P<'a> {
                     name: String::new(),
                     alias: None,
                     derived: None,
+                    sub: self.in_sub,
                 });
                 let new_ctx = (self.streams.len() - 1) as u8 + base;
                 self.streams.push(Stream {
                     name: String::new(),
                     alias: None,
                     derived: None,
+                    sub: self.in_sub,
                 });
                 let org_ctx = (self.streams.len() - 1) as u8 + base;
                 return Some(TrigStmt::UpdateOrInsert {
@@ -6131,12 +6195,14 @@ impl<'a> P<'a> {
                 name: String::new(),
                 alias: None,
                 derived: None,
+                sub: self.in_sub,
             });
             let new_ctx = (self.streams.len() - 1) as u8 + self.base;
             let st = Stream {
                 name: rel,
                 alias: None,
                 derived: None,
+                sub: self.in_sub,
             };
             self.streams.push(st.clone());
             let org_idx = self.streams.len() - 1;
@@ -6295,6 +6361,7 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
             name: String::new(),
             alias: None,
             derived: None,
+            sub: false,
         }],
         base: 0,
         outer: Some(1),
@@ -6357,11 +6424,13 @@ pub fn compile_check(sql: &str) -> Option<Vec<u8>> {
                 name: String::new(),
                 alias: None,
                 derived: None,
+                sub: false,
             },
             Stream {
                 name: String::new(),
                 alias: None,
                 derived: None,
+                sub: false,
             },
         ],
         base: 0,
@@ -6523,11 +6592,13 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
                 name: "OLD".to_string(),
                 alias: None,
                 derived: None,
+                sub: false,
             },
             Stream {
                 name: "NEW".to_string(),
                 alias: None,
                 derived: None,
+                sub: false,
             },
         ],
         base: 0,
@@ -8176,11 +8247,43 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_twenty_seven_shapes_byte_for_byte() {
+        // streams inside SUBROUTINE bodies: blr_relation3 - counted
+        // schema PUBLIC, counted EMPTY package, the name, then the
+        // alias slot (a counted empty when relation-plain) - slice
+        // 26's refusal flipped (twenty-nine). INSERT:
+        pin_proc(
+            "CREATE PROCEDURE QV1 (P1 INTEGER) AS DECLARE PROCEDURE LOGIT (X1 INTEGER) AS BEGIN INSERT INTO T (ID) VALUES (:X1); END BEGIN EXECUTE PROCEDURE LOGIT(:P1); END",
+            "050204000200080007000401010007000C0002CD054C4F4749540000010002583100000046000000050204000200080007000401010007000C0002110002020F94065055424C4943000154000002012900000001001700024944FFFFFFFF0E010201150700000019010000FFFF4C9B11000202E1010403054C4F474954FF030100290000000100FFFFFFFF0E010201150700000019010000FFFF4C",
+        );
+        // ... a singular SELECT INTO over an aggregate
+        pin_proc(
+            "CREATE PROCEDURE QV2 RETURNS (R1 INTEGER) AS DECLARE PROCEDURE CNT RETURNS (O1 INTEGER) AS BEGIN SELECT COUNT(*) FROM U2 INTO :O1; END BEGIN EXECUTE PROCEDURE CNT RETURNING_VALUES :R1; SUSPEND; END",
+            "050204010300080007000700020300000800012D1A0000CD03434E54000000000100024F310063000000050204010300080007000700020300000800012D1A00009B11000202077F43014F01430194065055424C4943000255320000FF4E004D0100000053FF0201180100001A0000FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C9B11000202E101040303434E54FF0501001A0000FF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... DELETE and UPDATE loops - only the stream form changes
+        pin_proc(
+            "CREATE PROCEDURE QV3 RETURNS (R1 INTEGER) AS DECLARE PROCEDURE SWEEP AS BEGIN DELETE FROM U2 WHERE U2.UA < 0; UPDATE U2 SET UA = 0 WHERE U2.UID = 9; END BEGIN EXECUTE PROCEDURE SWEEP; R1 = 1; SUSPEND; END",
+            "050204010300080007000700020300000800012D1A0000CD0553574545500000000000007B0000000502040101000700021100020207D90104430194065055424C49430002553200004733170002554115080000000000FF050007D90104430194065055424C4943000255320002472F17020355494415080009000000FF0A02010201150800000000001701025541FFFFFFFF0E010201150700000019010000FFFF4C9B11000202E1010403055357454550FFFF01150800010000001A00000E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... a DECLAREd cursor: relation3 carrying the SAME
+        // cursor-name alias string relation2 would
+        pin_proc(
+            "CREATE PROCEDURE QV5 RETURNS (R1 INTEGER) AS DECLARE PROCEDURE PICK RETURNS (O1 INTEGER) AS DECLARE CX CURSOR FOR (SELECT UID FROM U2); BEGIN OPEN CX; FETCH CX INTO :O1; CLOSE CX; END BEGIN EXECUTE PROCEDURE PICK RETURNING_VALUES :R1; SUSPEND; END",
+            "050204010300080007000700020300000800012D1A0000CD045049434B000000000100024F310082000000050204010300080007000700020300000800012D1A0000A60000430194065055424C494300025532122243582220225055424C4943222E2255322200FF0100BF01001700035549449B11000202A7000000A702000002011700035549441A0000FFA7010000FFFFFF0E0102011A000029010000010001150700000019010200FFFF4C9B11000202E1010403045049434BFF0501001A0000FF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... and an AS CURSOR loop feeding positioned DML
+        pin_proc(
+            "CREATE PROCEDURE QV6 AS DECLARE PROCEDURE ZAP AS BEGIN FOR SELECT UID FROM U2 WHERE UA < 0 AS CURSOR CU DO DELETE FROM U2 WHERE CURRENT OF CU; END BEGIN EXECUTE PROCEDURE ZAP; END",
+            "050204010100070002CD035A41500000000000005B00000005020401010007000211000202110107430194065055424C494300025532122243552220225055424C4943222E22553222004733170002554115080000000000FF020500D90101FFFFFFFF0E010201150700000019010000FFFF4C9B11000202E1010403035A4150FFFFFFFFFF0E010201150700000019010000FFFF4C",
+        );
+    }
+
+    #[test]
     fn subroutine_refusals() {
         for sql in [
-            // streams inside a subroutine emit blr_relation3 with an
-            // explicit schema - probed, unconverted
-            "CREATE PROCEDURE X (P1 INTEGER) AS DECLARE PROCEDURE LOGIT (X1 INTEGER) AS BEGIN INSERT INTO T (ID) VALUES (:X1); END BEGIN EXECUTE PROCEDURE LOGIT(:P1); END",
+            // derived tables inside subroutines: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS DECLARE PROCEDURE S1 RETURNS (O1 INTEGER) AS BEGIN SELECT ID FROM (SELECT ID FROM T) A INTO :O1; END BEGIN EXECUTE PROCEDURE S1 RETURNING_VALUES :R1; SUSPEND; END",
             // nested subroutines: unprobed
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS DECLARE PROCEDURE S1 RETURNS (O1 INTEGER) AS DECLARE PROCEDURE S2 RETURNS (O2 INTEGER) AS BEGIN O2 = 1; END BEGIN EXECUTE PROCEDURE S2 RETURNING_VALUES :O1; END BEGIN EXECUTE PROCEDURE S1 RETURNING_VALUES :R1; SUSPEND; END",
             // RETURN belongs to function bodies only
