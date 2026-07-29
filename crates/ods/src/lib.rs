@@ -51,7 +51,7 @@ pub use catalog::{
     count_primary_records, list_relations, relation_columns, resolve_relation, RelationColumn,
 };
 pub use data::{DataPage, RecordHeader};
-pub use dml::{delete_records, insert_record, update_records, DmlOutcome, InsertOutcome};
+pub use dml::{allocate_page, delete_records, insert_blob_slot, insert_record, update_records, DmlOutcome, InsertOutcome};
 pub use format::{decode_record, read_blob_content, relation_formats, Descriptor, Value};
 pub use gc::{analyze as gc_analyze, version_count, GcReport};
 pub use header::HeaderPage;

@@ -231,7 +231,11 @@ fn rhd_bytes(tx: u32, b_page: u32, b_line: u16, rflags: u16, format: u8, data: &
 /// bits past EOF are how the engine extends a database. Only the first
 /// PIP (page 1) is handled; a database needing its second PIP (65312
 /// pages at 8K) fails honestly.
-pub(crate) fn allocate_page(file: &mut Vec<u8>, page_size: usize) -> Result<u32, String> {
+/// Allocate one page from the first PIP: clear its free bit, bump the
+/// used count and min-free hint, extend the file to cover it. Public
+/// for the blob crate - blob pages are plain PIP allocations that no
+/// pointer page ever names (dpm.epp allocates them the same way).
+pub fn allocate_page(file: &mut Vec<u8>, page_size: usize) -> Result<u32, String> {
     let per_pip = PipPage::pages_per_pip(page_size);
     let base = page_size; // PIP 0 is page 1
     let pip = PipPage::decode(file.get(base..base + page_size).ok_or("no PIP page")?)
@@ -458,18 +462,32 @@ pub fn insert_blob_cs(
         rec.extend_from_slice(&(seg.len() as u16).to_le_bytes());
         rec.extend_from_slice(seg);
     }
-    if rec.len() > page_size - DPG_RPT_OFFSET - 4 {
-        return Err("level-1 blob writing not supported".into());
+    insert_blob_slot(file, page_size, rel, &rec)
+}
+
+/// Write a fully built blh (header + inline payload or page vector)
+/// into a data-page slot of `rel` and return its record number - the
+/// slot-placement tail every blob level shares (dpm.epp:2491 lays the
+/// blh down in place of a record header). The caller owns the blh
+/// bytes; this owns WHERE they live.
+pub fn insert_blob_slot(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    rel: u16,
+    blh: &[u8],
+) -> Result<u64, String> {
+    if blh.len() > page_size - DPG_RPT_OFFSET - 4 {
+        return Err("blob header larger than a data-page slot".into());
     }
-    let spot = match find_space(file, page_size, rel, rec.len()) {
+    let spot = match find_space(file, page_size, rel, blh.len()) {
         Some(s) => s,
         None => {
             extend_relation(file, page_size, rel)?;
-            find_space(file, page_size, rel, rec.len())
+            find_space(file, page_size, rel, blh.len())
                 .ok_or("no room for the blob even on a fresh data page")?
         }
     };
-    write_at_spot(file, page_size, &spot, &rec);
+    write_at_spot(file, page_size, &spot, blh);
     // the blob's record number: positional, like any record's
     let seq = crate::u32_at(file, spot.page_no as usize * page_size + 16) as u64;
     Ok(seq * crate::format::max_recs_per_dp(page_size) + spot.slot as u64)

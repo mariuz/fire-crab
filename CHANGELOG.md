@@ -13,6 +13,43 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-blb slice 1: blob storage, both directions
+
+### Converted
+- **A NEW CRATE for `src/jrd/blb.cpp`'s on-disk addressing.** `blh`
+  headers and `blp` blob pages as typed codecs — every `ods.h`
+  static_assert mirrored as a unit test, so a drifted offset fails
+  before it mis-reads a byte. Reading at ALL THREE levels: 0
+  (inline), 1 (page vector), 2 (pointer pages) — the gate's 36 MB
+  engine-created blob is a genuine level 2, read byte-for-byte
+  against the engine's own OCTET_LENGTH / SUBSTRING answers.
+  Creation at levels 0 and 1 through fire-crab's own placement
+  (`ods::insert_blob_slot` + the now-public `ods::allocate_page`),
+  segment framing intact, plus the referencing record's `bid` laid
+  into the image — and the ENGINE reads every fcblb-written blob
+  back in full, `gfix -v -full -n` finds neither errors nor
+  warnings, `gbak` backs the file up.
+- **Three probe-settled laws**: `blh_max_sequence` is the LAST page
+  sequence, not the count — ods.h's "Number of data pages" comment
+  misleads, `blb.cpp:2377`'s `>` test decides, and the engine
+  reading one page past a count-valued vector (then declaring the
+  file corrupt) is how the law announced itself. `blh_length`
+  counts payload with framing excluded (OCTET_LENGTH equals it at
+  every level). And `rhd_blob`/`rhd_stream_blob` are 16/32 — a
+  first-guess 8 made every real blob "not a blob".
+- **Extensive companion documentation**:
+  [docs/blob-conversion.md](docs/blob-conversion.md) — placement,
+  the three levels, pinned layouts, framings, the probe log, the
+  two-direction oracle design, scope table and roadmap.
+
+### Guarded
+- Level-2 CREATION (refuses past the level-1 vector ceiling), blob
+  GC, blob filters, stream-blob creation, temporary blobs. 8 unit
+  tests (offset pins, round-trips, zero-length segments, stream
+  truncation, empty blobs, vector termination, ceiling math); gate
+  `qa/blb-levels.sh` (15 checks, both directions, levels asserted
+  0/0/null/0/1/2); 260 workspace tests.
+
 ## 2026-07-29 — fire-crab-lck slice 1: the lock table's policy
 
 ### Converted

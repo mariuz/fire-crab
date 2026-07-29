@@ -1,0 +1,14 @@
+[package]
+name = "fire-crab-blb"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Blob storage: the conversion of Firebird's src/jrd/blb.cpp on-disk addressing (blh, blob pages, three levels), differentially tested in both directions against the live engine"
+
+[dependencies]
+fire-crab-ods = { path = "../ods" }
+
+[[bin]]
+name = "fcblb"
+path = "src/main.rs"

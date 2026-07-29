@@ -560,6 +560,13 @@ them.
   `0.00` differ in raw form; align raws in a wide integer before
   comparing. Text-comparing rendered forms is the tempting wrong
   answer.
+- **The code is the specification; comments are testimony.** ods.h
+  calls blh_max_sequence "Number of data pages"; the reading loop's
+  `>` test makes it the LAST sequence (count minus one). Writing
+  what the comment said produced a file the reference engine called
+  corrupt. When a comment and a comparison operator disagree, the
+  operator wins - and a both-directions gate (they write/you read,
+  you write/they read) is what catches the disagreement.
 - **Pin transcriptions against the SOURCE they transcribe.** A 49-cell
   boolean matrix is a transcription slip waiting to happen - so the
   gate re-parses the table out of the reference engine's own source

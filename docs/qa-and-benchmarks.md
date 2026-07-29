@@ -3812,6 +3812,43 @@ clients, answers real typed, filtered, joined, grouped, sorted and
 aggregated queries from real pages, and accepts writes the real engine
 verifies.
 
+## The blob levels: storage read and written across the boundary
+
+fire-crab-blb converts src/jrd/blb.cpp's on-disk addressing - blob
+headers, blob pages, and the three address levels - and its gate
+crosses the engine boundary in BOTH directions, so a shared wrong
+assumption has nowhere to hide.
+
+Phase A: the engine writes, fire-crab reads. Text blobs from empty
+through 36 megabytes - a doubling EXECUTE BLOCK walks one value up
+through level 0 (inline in the slot), level 1 (a page vector) and
+level 2 (pointer pages naming data pages). For every row the gate
+compares fcblb's length and HEAD/MID/TAIL content slices against the
+engine's own OCTET_LENGTH and SUBSTRING answers, and asserts each
+blob decodes at the level its size demands.
+
+Phase B: fire-crab writes, the engine reads. fcblb creates blobs
+through fire-crab's own placement path - empty, tiny seven-byte
+segments, the level-0 ceiling, just past it, hundred-kilobyte and
+megabyte page-vector blobs, segment sizes to the u16 frame limit -
+and the records that reference them. The engine reads every byte
+back, gfix validates the file clean, gbak backs it up, and fcblb
+re-reads its own writes for self-consistency.
+
+The slice's find is a comment that lies: ods.h calls blh_max_sequence
+"Number of data pages", but the engine's reading loop stops at
+`blb_sequence > blb_max_sequence` (blb.cpp:2377) - the field is the
+LAST sequence, n minus one. The draft wrote the count; the engine
+read one page past the vector, hit a zero, and called the file
+corrupt with "page 0 is of wrong type (expected blob, found database
+header)". The code is the specification; comments are testimony. Two
+smaller laws rode the same probes: blh_length counts payload
+(framing excluded - OCTET_LENGTH equals it at every level), and the
+blob slot flags are 16/32, not the remembered 8.
+
+The deep companion documentation lives in
+[blob-conversion.md](blob-conversion.md).
+
 ## The reserving matrix: the lock table against the live engine
 
 fire-crab-lck converts the POLICY of src/lock/lock.cpp - the
