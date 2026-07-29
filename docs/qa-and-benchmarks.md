@@ -3812,6 +3812,54 @@ clients, answers real typed, filtered, joined, grouped, sorted and
 aggregated queries from real pages, and accepts writes the real engine
 verifies.
 
+## The reserving matrix: the lock table against the live engine
+
+fire-crab-lck converts the POLICY of src/lock/lock.cpp - the
+compatibility matrix, the single-aggregate grant probe, enqueue /
+convert / dequeue with FIFO regrant, and the deadlock scan - and
+holds it against two oracles at once.
+
+The first oracle is the engine's own source. The compatibility matrix
+is seven-by-seven and famously subtle (shared read IS compatible with
+protected write - the mode excludes other writers, not MVCC readers),
+and transcription is this project's recurring hazard. So the gate
+does not trust the transcription: `fclck pin-source` re-parses the
+`compatibility[LCK_max][LCK_max]` initializer out of the vendored
+lock.cpp - tokenizing true/false between the declaration and its
+closing brace - and diffs all 49 cells against the crate's constant.
+
+The second oracle is the engine running. `SET TRANSACTION RESERVING
+<table> FOR <mode>` acquires the relation lock at transaction start
+in exactly the named mode (shared read = LCK_SR, shared write =
+LCK_SW, protected read = LCK_PR, protected write = LCK_PW), which
+makes the lock table observable from SQL: the gate holds each of the
+four modes through a fifo-fed isql attachment while a second
+attachment probes all four with NO WAIT, reading the engine's verdict
+from silence versus "lock conflict on no wait transaction". Sixteen
+cells, every one compared against `fclck compat` - and the engine
+passed SR-beside-PW silently in both directions before the crate's
+table was ever written, the probe that anchored the whole slice.
+
+Phase three is the deadlock, live: two WAIT transactions cross-update
+two tables through fifo-fed attachments; the engine's scan (on its
+~10-second DeadlockTimeout cadence) denies one with SQLSTATE 40001
+"deadlock" - the same two-owner cycle the crate's wait-for DFS denies
+synchronously, pinned by its unit test.
+
+One environmental find shaped the gate: the embedded engine refuses a
+second attachment to the same file ("Database already opened with
+engine instance, incompatible"), so live contention REQUIRES the real
+server - the gate creates its scratch database through localhost so
+file ownership lands with the server's user, and every isql in it
+speaks to the running daemon.
+
+The deep companion documentation lives in
+[lock-manager-conversion.md](lock-manager-conversion.md): the
+two-layer architecture, the exact scope table, the
+aggregate-soundness argument, FIFO fairness, and the roadmap through
+lock data, ASTs, timeouts, owner teardown and the fb_lock_print
+differential.
+
 ## The crash matrix: careful writes judged by the engine
 
 Firebird's crash safety has no log to replay - it is the ORDER of page

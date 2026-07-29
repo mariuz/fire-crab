@@ -560,6 +560,14 @@ them.
   `0.00` differ in raw form; align raws in a wide integer before
   comparing. Text-comparing rendered forms is the tempting wrong
   answer.
+- **Pin transcriptions against the SOURCE they transcribe.** A 49-cell
+  boolean matrix is a transcription slip waiting to happen - so the
+  gate re-parses the table out of the reference engine's own source
+  and diffs every cell. When the artifact you copied lives in the
+  vendored tree, make the copy mechanically checkable; and when the
+  semantics are also OBSERVABLE (table reservations expose lock
+  modes through SQL), hold the same cells against the live system
+  from both directions.
 - **A safety property is a MATRIX, not a happy path.** Careful-write
   ordering was proved by materializing EVERY write prefix and letting
   the engine's validator judge each one - and by running the same

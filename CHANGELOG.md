@@ -13,6 +13,45 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-lck slice 1: the lock table's policy
+
+### Converted
+- **A NEW CRATE for `src/lock/lock.cpp`** — the lock table that
+  arbitrates every shared resource: modes (`LCK_none..LCK_EX`,
+  values identical), the compatibility matrix (transcribed from
+  `lock.cpp:150`), the `lbl_counts` + `lbl_state` single-aggregate
+  grant probe (`lock.cpp:2228` — sound because granted sets are
+  mutually compatible; the companion doc carries the argument),
+  enqueue with WAIT / NO WAIT, convert (tested against everyone
+  ELSE's aggregate, `lock.cpp:2535`), dequeue with the FIFO
+  `post_pending` regrant, queue fairness (a late compatible arrival
+  parks behind a blocked head — no starvation), and the wait-for
+  deadlock scan with the scanning request as victim.
+- **Two oracles.** The SOURCE pin: `fclck pin-source` re-parses the
+  `compatibility[LCK_max][LCK_max]` initializer out of the vendored
+  engine and diffs all 49 cells against the crate's constant — the
+  transcription itself is under differential test. And the LIVE
+  matrix: `SET TRANSACTION RESERVING` maps reservation modes onto
+  LCK_SR/SW/PR/PW, so four fifo-held modes probed by four `NO WAIT`
+  reservations give 16 engine-arbitrated cells, every one equal to
+  `fclck compat` — including the famous SR-beside-PW COMPATIBLE
+  (protected write excludes other writers, not MVCC readers). A
+  live two-attachment cross-update then draws the engine's own
+  SQLSTATE 40001 deadlock — the cycle the crate's scan denies.
+- **Extensive companion documentation**:
+  [docs/lock-manager-conversion.md](docs/lock-manager-conversion.md)
+  — the two layers, the scope table, the matrix's meaning, the
+  aggregate-soundness argument, the three verbs, FIFO fairness, the
+  deadlock scan, both oracles, the probe log and the roadmap.
+
+### Guarded
+- The arena (shared memory, hash chains), blocking-AST delivery,
+  lock data words, timeouts and series semantics ride later slices.
+  8 unit tests; gate `qa/lck-reserving-matrix.sh` (source pin + 16
+  live cells + live deadlock, all green first run — the embedded
+  engine refuses a second attachment, so the gate drives the REAL
+  server); 252 workspace tests.
+
 ## 2026-07-29 — fire-crab-cch slice 1: the careful-write precedence graph
 
 ### Converted

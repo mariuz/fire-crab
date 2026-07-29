@@ -1,0 +1,11 @@
+[package]
+name = "fire-crab-lck"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The lock manager: the conversion of Firebird's src/lock/lock.cpp lock table, differentially tested against the live engine's table reservations and pinned against the engine's own source"
+
+[[bin]]
+name = "fclck"
+path = "src/main.rs"
