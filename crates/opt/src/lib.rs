@@ -731,29 +731,62 @@ fn split_kw<'a>(s: &'a str, kw: &str) -> Vec<&'a str> {
 mod tests {
     use super::*;
 
+    fn single(access: Access, sorted: bool) -> Plan {
+        Plan {
+            streams: vec![Stream { name: qualified("T"), access }],
+            combine: Combine::Single,
+            sorted,
+        }
+    }
+
     #[test]
     fn renders_the_engines_spelling() {
-        let p = Plan {
-            table: "T".into(),
-            access: Access::Natural,
-            sorted: false,
-        };
-        assert_eq!(p.render(), "PLAN (\"PUBLIC\".\"T\" NATURAL)");
-        let p = Plan {
-            table: "T".into(),
-            access: Access::Index(vec!["IDX_A".into(), "IDX_B".into()]),
-            sorted: true,
-        };
         assert_eq!(
-            p.render(),
+            single(Access::Natural, false).render(),
+            "PLAN (\"PUBLIC\".\"T\" NATURAL)"
+        );
+        assert_eq!(
+            single(
+                Access::Index(vec!["IDX_A".into(), "IDX_B".into()]),
+                true
+            )
+            .render(),
             "PLAN SORT (\"PUBLIC\".\"T\" INDEX (\"PUBLIC\".\"IDX_A\", \"PUBLIC\".\"IDX_B\"))"
         );
-        let p = Plan {
-            table: "T".into(),
-            access: Access::Order("IDX_A".into()),
+        assert_eq!(
+            single(Access::Order("IDX_A".into()), false).render(),
+            "PLAN (\"PUBLIC\".\"T\" ORDER \"PUBLIC\".\"IDX_A\")"
+        );
+    }
+
+    /// The join spellings: aliases quoted BARE, the combiner OUTSIDE
+    /// the parentheses, and a SORT wrapping the whole join.
+    #[test]
+    fn renders_join_and_hash_spellings() {
+        let j = Plan {
+            streams: vec![
+                Stream { name: "\"A\"".into(), access: Access::Natural },
+                Stream {
+                    name: "\"B\"".into(),
+                    access: Access::Index(vec!["IDX_U_UID".into()]),
+                },
+            ],
+            combine: Combine::Join,
             sorted: false,
         };
-        assert_eq!(p.render(), "PLAN (\"PUBLIC\".\"T\" ORDER \"PUBLIC\".\"IDX_A\")");
+        assert_eq!(
+            j.render(),
+            "PLAN JOIN (\"A\" NATURAL, \"B\" INDEX (\"PUBLIC\".\"IDX_U_UID\"))"
+        );
+        let h = Plan {
+            streams: vec![
+                Stream { name: "\"A\"".into(), access: Access::Natural },
+                Stream { name: "\"B\"".into(), access: Access::Natural },
+            ],
+            combine: Combine::Hash,
+            sorted: true,
+        };
+        assert_eq!(h.render(), "PLAN SORT HASH (\"A\" NATURAL, \"B\" NATURAL)");
     }
 
     #[test]
