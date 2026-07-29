@@ -4295,14 +4295,13 @@ struct RecCte {
     anchor_alias: String,
     anchor_ctx: u8,
     anchor_wher: Option<Bool>,
-    anchor_item: Val,
-    /// the anchor item wraps in cast(int64) when the RECURSIVE item
-    /// is integer arithmetic - dialect-3 ADD/SUB types int64, so the
-    /// union unifies there (the slice-44 law, catalog-free because
-    /// the promotion does not depend on the field's width)
-    anchor_cast_int64: bool,
+    /// one entry per cte column: the anchor's item and whether it
+    /// wraps in cast(int64). The unification is PER COLUMN (probed
+    /// on a two-column recursion): only the column whose RECURSIVE
+    /// item is integer arithmetic promotes - its sibling stays bare
+    anchor_items: Vec<(Val, bool)>,
     rec_wher: Option<Bool>,
-    rec_item: Val,
+    rec_items: Vec<Val>,
 }
 
 struct ForSel {
@@ -5101,17 +5100,19 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 }
                 out.push(blr::END);
                 out.push(0x4D); // blr_map
-                out.extend_from_slice(&1u16.to_le_bytes());
-                out.extend_from_slice(&0u16.to_le_bytes());
-                if rc.anchor_cast_int64 {
-                    // the union unifies where the recursive item's
-                    // dialect-3 arithmetic types: int64 (the slice-44
-                    // law, catalog-free)
-                    out.push(0x83); // blr_cast
-                    out.push(0x10); // blr_int64
-                    out.push(0);
+                out.extend_from_slice(&(rc.anchor_items.len() as u16).to_le_bytes());
+                for (i, (item, cast)) in rc.anchor_items.iter().enumerate() {
+                    out.extend_from_slice(&(i as u16).to_le_bytes());
+                    if *cast {
+                        // this COLUMN's recursive item is integer
+                        // arithmetic: it types int64 and the anchor
+                        // field casts (per-column unification, probed)
+                        out.push(0x83); // blr_cast
+                        out.push(0x10); // blr_int64
+                        out.push(0);
+                    }
+                    emit_val(out, item);
                 }
-                emit_val(out, &rc.anchor_item);
                 // the recursive branch: ZERO streams
                 out.push(blr::RSE);
                 out.push(0);
@@ -5121,9 +5122,11 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 }
                 out.push(blr::END);
                 out.push(0x4D);
-                out.extend_from_slice(&1u16.to_le_bytes());
-                out.extend_from_slice(&0u16.to_le_bytes());
-                emit_val(out, &rc.rec_item);
+                out.extend_from_slice(&(rc.rec_items.len() as u16).to_le_bytes());
+                for (i, item) in rc.rec_items.iter().enumerate() {
+                    out.extend_from_slice(&(i as u16).to_le_bytes());
+                    emit_val(out, item);
+                }
                 out.push(blr::END); // the wrapper rse's end
             } else if f.aggregate {
                 out.push(blr::AGGREGATE);
@@ -7338,18 +7341,27 @@ impl<'a> P<'a> {
         let secondary = (self.streams.len() - 3) as u8 + self.base;
         let ctx = secondary + 1;
         let anchor_ctx = secondary + 2;
-        // ---- the anchor branch: SELECT <col> FROM <table> [WHERE]
+        // ---- the anchor branch: SELECT <col> [, ...] FROM <table>
         if !self.kw("SELECT") {
             return None;
         }
-        let Some(Tok::Ident(acol)) = self.t.get(self.i) else {
-            return None;
-        };
-        if is_keyword(acol) {
-            return None;
+        let mut acols: Vec<String> = Vec::new();
+        loop {
+            let Some(Tok::Ident(c)) = self.t.get(self.i) else {
+                return None;
+            };
+            if is_keyword(c) {
+                return None;
+            }
+            acols.push(c.clone());
+            self.i += 1;
+            if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                self.i += 1;
+            } else {
+                break;
+            }
         }
-        let acol = acol.clone();
-        self.i += 1;
+        let acol = acols[0].clone();
         if !self.kw("FROM") {
             return None;
         }
@@ -7361,21 +7373,42 @@ impl<'a> P<'a> {
         }
         let table = table.clone();
         self.i += 1;
-        let anchor_item = Val::Field(anchor_ctx, acol.clone());
         // anchor WHERE: bare names bind the anchor stream - resolve
         // by hand (plain columns and literals only, this slice)
         let anchor_wher = if self.kw("WHERE") {
-            Some(self.rec_bool(anchor_ctx, &cte, ctx, &acol, false)?)
+            Some(self.rec_bool(anchor_ctx, &cte, ctx, &acols, false)?)
         } else {
             None
         };
         if !self.kw("UNION") || !self.kw("ALL") || !self.kw("SELECT") {
             return None;
         }
-        // ---- the recursive branch: <item> FROM <name> [WHERE]
-        let rec_item = self.rec_val(&cte, ctx, &acol)?;
-        let anchor_cast_int64 =
-            matches!(rec_item, Val::Add(..) | Val::Sub(..));
+        // ---- the recursive branch: <item> [, ...] FROM <name>
+        let mut rec_items = Vec::new();
+        loop {
+            rec_items.push(self.rec_val(&cte, ctx, &acols)?);
+            if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+        if rec_items.len() != acols.len() {
+            return None;
+        }
+        // the unification is PER COLUMN: a column whose RECURSIVE
+        // item is integer arithmetic types int64 and its anchor
+        // field casts; a plain column's does not (probed)
+        let anchor_items: Vec<(Val, bool)> = acols
+            .iter()
+            .zip(&rec_items)
+            .map(|(c, r)| {
+                (
+                    Val::Field(anchor_ctx, c.clone()),
+                    matches!(r, Val::Add(..) | Val::Sub(..)),
+                )
+            })
+            .collect();
         if !self.kw("FROM") {
             return None;
         }
@@ -7384,7 +7417,7 @@ impl<'a> P<'a> {
         }
         self.i += 1;
         let rec_wher = if self.kw("WHERE") {
-            Some(self.rec_bool(0, &cte, ctx, &acol, true)?)
+            Some(self.rec_bool(0, &cte, ctx, &acols, true)?)
         } else {
             None
         };
@@ -7392,13 +7425,22 @@ impl<'a> P<'a> {
             return None;
         }
         self.i += 1;
-        // ---- the outer select: [<name>.]<col> FROM <name> INTO
+        // ---- the outer select: [<name>.]<col> [, ...] FROM <name>
         if !self.kw("SELECT") {
             return None;
         }
-        let v = self.rec_val(&cte, ctx, &acol)?;
-        if !matches!(v, Val::Fid(..)) {
-            return None; // outer expressions over the cte: unprobed
+        let mut outs = Vec::new();
+        loop {
+            let v = self.rec_val(&cte, ctx, &acols)?;
+            if !matches!(v, Val::Fid(..)) {
+                return None; // outer expressions over the cte: unprobed
+            }
+            outs.push(v);
+            if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                self.i += 1;
+            } else {
+                break;
+            }
         }
         if !self.kw("FROM") {
             return None;
@@ -7459,7 +7501,7 @@ impl<'a> P<'a> {
             sort: Vec::new(),
             first: None,
             skip: None,
-            col_vals: vec![v],
+            col_vals: outs,
             into,
             do_stmt,
             recurse: Some(RecCte {
@@ -7473,10 +7515,9 @@ impl<'a> P<'a> {
                 ),
                 anchor_ctx,
                 anchor_wher,
-                anchor_item,
-                anchor_cast_int64,
+                anchor_items,
                 rec_wher,
-                rec_item,
+                rec_items,
             }),
         })))
     }
@@ -7484,7 +7525,7 @@ impl<'a> P<'a> {
     /// A value inside the recursive cte's scope: [<cte>.]<col> reads
     /// fid(recurse ctx, 0) when the column is the cte's one column;
     /// optional +/- integer literal (dialect-3 int64 arithmetic).
-    fn rec_val(&mut self, cte: &str, ctx: u8, acol: &str) -> Option<Val> {
+    fn rec_val(&mut self, cte: &str, ctx: u8, acols: &[String]) -> Option<Val> {
         let Some(Tok::Ident(a)) = self.t.get(self.i) else {
             return None;
         };
@@ -7504,10 +7545,8 @@ impl<'a> P<'a> {
         } else {
             a
         };
-        if col != *acol {
-            return None; // the cte has ONE column
-        }
-        let base = Val::Fid(ctx, 0);
+        let slot = acols.iter().position(|c| *c == col)? as u16;
+        let base = Val::Fid(ctx, slot);
         match self.t.get(self.i) {
             Some(Tok::Plus) => {
                 self.i += 1;
@@ -7539,11 +7578,11 @@ impl<'a> P<'a> {
         field_ctx: u8,
         cte: &str,
         ctx: u8,
-        acol: &str,
+        acols: &[String],
         recursive: bool,
     ) -> Option<Bool> {
         let left = if recursive {
-            self.rec_val(cte, ctx, acol)?
+            self.rec_val(cte, ctx, acols)?
         } else {
             let Some(Tok::Ident(a)) = self.t.get(self.i) else {
                 return None;
@@ -11483,6 +11522,31 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_forty_seven_shapes_byte_for_byte() {
+        // MULTI-COLUMN recursive ctes (flip seventy-one) - and the
+        // unification law refined: it is PER COLUMN. Only the column
+        // whose RECURSIVE item is integer arithmetic promotes (its
+        // anchor field wraps in cast(int64)); the plain sibling
+        // stays bare, both in one map
+        pin_proc(
+            "CREATE PROCEDURE RQ1 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR WITH RECURSIVE N AS (SELECT ID, AMT FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1, N.AMT FROM N WHERE N.ID < 3) SELECT N.ID, N.AMT FROM N INTO :R1, :R2 DO SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B1100020211010743014301B9010002430192015410224E2220225055424C4943222E22542202472F170202494415080001000000FF4D0200000083100017020249440100170203414D54430047331801000015080003000000FF4D02000000221801000015080001000000010018010100FFFF0201180100001A000001180101001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+    }
+
+    #[test]
+    fn slice_forty_seven_refusals() {
+        for sql in [
+            // an outer column ORDER over the recursion: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR WITH RECURSIVE N AS (SELECT ID, AMT FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1, N.AMT FROM N WHERE N.ID < 3) SELECT N.ID, N.AMT FROM N ORDER BY N.ID INTO :R1, :R2 DO SUSPEND; END",
+            // a column the cte does not declare
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 3) SELECT N.AMT FROM N INTO :R1 DO SUSPEND; END",
+        ] {
+            assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
+        }
+    }
+
+    #[test]
     fn slice_forty_six_refusals() {
         for sql in [
             // DIVISION in a union branch: the scale rules ride a
@@ -11498,8 +11562,6 @@ mod tests {
     #[test]
     fn slice_forty_five_refusals() {
         for sql in [
-            // multi-column recursive ctes: unprobed
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID, AMT FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1, NUMS.AMT FROM NUMS WHERE NUMS.ID < 5) SELECT NUMS.ID, NUMS.AMT FROM NUMS INTO :R1, :R2 DO SUSPEND; END",
             // non-recursive cte BESIDE a recursive one: unprobed
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5), OTHER AS (SELECT ID FROM T) SELECT NUMS.ID FROM NUMS INTO :R1 DO SUSPEND; END",
             // an outer WHERE over the recursion: unprobed

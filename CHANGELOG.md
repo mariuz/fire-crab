@@ -13,6 +13,28 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-dsql slice 47: multi-column recursive ctes
+
+### Converted
+- **Multi-column recursive ctes** (flip seventy-one — the slice-45
+  refusal): per-column anchor and recursive item lists, the outer
+  select reading each column's fid, and column references
+  resolving to their DECLARED POSITION in the cte's list rather
+  than a fixed slot.
+- **The unification law, refined by the probe: it is PER COLUMN.**
+  A two-column recursion where one column steps (`N.ID + 1`) and
+  the other rides plain (`N.AMT`) stores `cast(int64)` on the FIRST
+  anchor item only — the sibling stays bare, both inside one map.
+  Four appearances now (CASE, unions, single-column recursion, and
+  here), each narrowing the rule: the promotion belongs to the
+  COLUMN whose own branches disagree, not to the union.
+
+### Guarded
+- Outer ORDER BY over a recursion, undeclared cte columns. Gates:
+  proc 274 → 278 (mixed stepping columns and a no-arithmetic
+  two-column recursion pinned), view 128, exe 111, trig 48, field
+  39; 74 dsql tests; 396 pins; 276 workspace tests.
+
 ## 2026-07-29 — fire-crab-blb slice 4: stream blobs, and a one-way differential
 
 ### Converted

@@ -5156,6 +5156,16 @@ branch has ZERO streams - it reads the recursion's own output
 context by fid. That shape needs its own emission path, and the
 probe bytes are already in the refusal's comment waiting for it.
 
+Slice 47 taught the unification law its final shape. Multi-column
+recursive ctes made the question concrete: when one column steps
+(N.ID + 1) and its sibling rides plain (N.AMT), does the whole union
+promote? The engine's bytes answer no - cast(int64) sits on the
+FIRST anchor item only, the sibling bare, both inside one map. The
+promotion belongs to the COLUMN whose own branches disagree, not to
+the union. That is the law's fourth appearance and its narrowest
+statement yet: CASE branches, union branches, recursion branches,
+and now recursion COLUMNS.
+
 Slice 46 converted the law the gate found two slices earlier: union
 type-unification, where one arithmetic branch types the whole union
 int64 and every plain branch wraps in cast(int64) - catalog-free
