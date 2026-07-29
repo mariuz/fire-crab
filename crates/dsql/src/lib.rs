@@ -672,6 +672,16 @@ enum Bool {
     AnsiAll(CmpOp, Val, SubQ),
 }
 
+/// A UNION ALL standing as a quantified subquery's stream: the
+/// union claims the subquery's context slot, branches take the next
+/// ones, and the comparison reads fid(union ctx, 0) (probed).
+#[derive(Clone, Debug, PartialEq)]
+struct SubUnion {
+    /// per branch: the stream, its context, its WHERE, and the
+    /// single select item
+    branches: Vec<(Stream, u8, Option<Box<Bool>>, Val)>,
+}
+
 /// A single-stream subquery: its stream (already holding a context id
 /// in the statement's numbering, which CONTINUES across subqueries -
 /// probed), its own WHERE, and for the quantified forms the selected
@@ -686,6 +696,8 @@ struct SubQ {
     /// comparand wraps in blr_derived_expr over the subquery stream
     /// (probed: IN (SELECT UA / 25 ...) stores BF 01 <ctx> divide)
     expr: Option<Val>,
+    /// a UNION ALL subquery: the stream slot holds the union
+    union_: Option<SubUnion>,
     /// an AGGREGATE scalar subselect: the verb, its argument, and
     /// the aggregate's context - the slot AFTER the stream's, which
     /// it claims like every aggregate (probed)
@@ -730,6 +742,14 @@ fn stamp_subq(sub: &mut SubQ, cn: &str) {
     sub.stream.cur = Some(cn.to_string());
     if let Some(w) = &mut sub.wher {
         stamp_bool(w, cn);
+    }
+    if let Some(u) = &mut sub.union_ {
+        for (st, _, wher, _) in &mut u.branches {
+            st.cur = Some(cn.to_string());
+            if let Some(w) = wher {
+                stamp_bool(w, cn);
+            }
+        }
     }
 }
 
@@ -1428,6 +1448,38 @@ impl<'a> P<'a> {
         if !self.kw("SELECT") {
             return None;
         }
+        // a depth-0 UNION before the closing paren makes this a
+        // UNION subquery: the union claims THIS context slot, so the
+        // lookahead must run before any branch stream numbers (the
+        // slice-38 reservation law in subquery clothing)
+        {
+            let mut depth = 0usize;
+            let mut k = self.i;
+            let mut has_union = false;
+            while let Some(t) = self.t.get(k) {
+                match t {
+                    Tok::LParen => depth += 1,
+                    Tok::RParen => {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    Tok::Ident(w) if depth == 0 && w == "UNION" => {
+                        has_union = true;
+                        break;
+                    }
+                    _ => {}
+                }
+                k += 1;
+            }
+            if has_union {
+                if !need_col {
+                    return None; // EXISTS over a union: unprobed
+                }
+                return self.subselect_union();
+            }
+        }
         // capture the select list positionally; resolve after the
         // stream exists
         let mut col: Option<(Option<String>, String)> = None;
@@ -1629,6 +1681,101 @@ impl<'a> P<'a> {
             col,
             expr,
             agg,
+            union_: None,
+        })
+    }
+
+    /// The UNION ALL subquery: `(SELECT c FROM t [WHERE ...] UNION
+    /// ALL SELECT ...)`. The union takes the reserved context slot,
+    /// each branch stream the next one; branch items are plain
+    /// columns at their own branch's scope. The distinct form is
+    /// unprobed and refuses.
+    fn subselect_union(&mut self) -> Option<SubQ> {
+        // reserve the union's slot before any branch stream numbers
+        self.streams.push(Stream {
+            name: String::new(),
+            alias: None,
+            derived: None,
+            sub: self.in_sub,
+            cur: None,
+        });
+        let ctx = (self.streams.len() - 1) as u8 + self.base;
+        let mut branches: Vec<(Stream, u8, Option<Box<Bool>>, Val)> = Vec::new();
+        loop {
+            // one branch: <col> FROM <stream> [WHERE ...]
+            let Some(Tok::Ident(a)) = self.t.get(self.i) else {
+                return None;
+            };
+            if is_keyword(a) {
+                return None;
+            }
+            let a = a.clone();
+            self.i += 1;
+            let col = if matches!(self.t.get(self.i), Some(Tok::Dot)) {
+                self.i += 1;
+                let Some(Tok::Ident(b)) = self.t.get(self.i) else {
+                    return None;
+                };
+                let b = b.clone();
+                self.i += 1;
+                (Some(a), b)
+            } else {
+                (None, a)
+            };
+            if !self.kw("FROM") {
+                return None;
+            }
+            let stream = self.stream_item()?;
+            if stream.derived.is_some() {
+                return None; // derived branches: unprobed
+            }
+            self.streams.push(stream.clone());
+            let si = self.streams.len() - 1;
+            let bctx = si as u8 + self.base;
+            let saved = self.sub.replace(si);
+            let saved_host = self.host;
+            self.host = saved;
+            let item = self.field(col.0.as_deref(), &col.1)?;
+            let wher = if self.kw("WHERE") {
+                Some(Box::new(self.bool_or()?))
+            } else {
+                None
+            };
+            self.sub = saved;
+            self.host = saved_host;
+            branches.push((stream, bctx, wher, item));
+            if self.kw("UNION") {
+                if !self.kw("ALL") {
+                    return None; // the distinct form: unprobed
+                }
+                if !self.kw("SELECT") {
+                    return None;
+                }
+                continue;
+            }
+            break;
+        }
+        if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+            return None;
+        }
+        self.i += 1;
+        if branches.len() < 2 {
+            return None;
+        }
+        Some(SubQ {
+            stream: Stream {
+                name: String::new(),
+                alias: None,
+                derived: None,
+                sub: self.in_sub,
+                cur: None,
+            },
+            ctx,
+            wher: None,
+            col: None,
+            expr: None,
+            agg: None,
+            union_: Some(SubUnion { branches }),
         })
     }
 
@@ -2786,6 +2933,36 @@ fn emit_bool(out: &mut Vec<u8>, b: &Bool) {
             out.push(1);
             out.push(blr::RSE);
             out.push(1);
+            if let Some(u) = &sub.union_ {
+                // the subquery rse's stream is a UNION: it holds the
+                // reserved context, branches carry rse + positional
+                // map, and the comparison reads fid(union ctx, 0) -
+                // no terminator of its own (probed)
+                out.push(0x4C); // blr_union
+                out.push(sub.ctx);
+                out.push(u.branches.len() as u8);
+                for (st, bctx, wher, item) in &u.branches {
+                    out.push(blr::RSE);
+                    out.push(1);
+                    emit_stream(out, st, *bctx);
+                    if let Some(w) = wher {
+                        out.push(blr::BOOLEAN);
+                        emit_bool(out, w);
+                    }
+                    out.push(blr::END);
+                    out.push(0x4D); // blr_map
+                    out.extend_from_slice(&1u16.to_le_bytes());
+                    out.extend_from_slice(&0u16.to_le_bytes());
+                    emit_val(out, item);
+                }
+                out.push(blr::END);
+                out.push(blr::BOOLEAN);
+                out.push(op.verb());
+                emit_val(out, left);
+                emit_val(out, &Val::Fid(sub.ctx, 0));
+                out.push(blr::END);
+                return;
+            }
             emit_stream(out, &sub.stream, sub.ctx);
             if let Some(w) = &sub.wher {
                 out.push(blr::BOOLEAN);
@@ -10831,12 +11008,39 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_forty_four_shapes_byte_for_byte() {
+        // UNION ALL as a quantified subquery's stream: the union
+        // claims the subquery's context slot, branches the next
+        // ones, the comparison reads fid(union ctx, 0) - and NOT IN
+        // negates to ansi_all + neq as everywhere (flip sixty-seven)
+        pin_proc(
+            "CREATE PROCEDURE RM6 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE ID NOT IN (SELECT UID FROM U UNION ALL SELECT ID FROM T) INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014A015400479E430143014C010243014A015502FF4D0100000017020355494443014A015403FF4D010000001703024944FF4730170002494418010000FFFF020117000249441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+    }
+
+    #[test]
+    fn slice_forty_four_refusals() {
+        for sql in [
+            // the DISTINCT union form in a subquery: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE ID IN (SELECT UID FROM U UNION SELECT ID FROM T) INTO :R1 DO SUSPEND; END",
+            // EXISTS over a union: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE EXISTS (SELECT UID FROM U UNION ALL SELECT ID FROM T) INTO :R1 DO SUSPEND; END",
+            // EXPRESSION branch items unify the union's TYPE - the
+            // engine casts plain branches to the promoted type
+            // (probed: AMT * 2 made every branch cast(int64)) - the
+            // CASE-unification law in union clothing, unconverted
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE AMT IN (SELECT UA FROM U UNION ALL SELECT UA * 2 FROM U) INTO :R1 DO SUSPEND; END",
+            // derived branches inside a union subquery: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE ID IN (SELECT V FROM (SELECT ID AS V FROM T) A UNION ALL SELECT UID FROM U) INTO :R1 DO SUSPEND; END",
+        ] {
+            assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
+        }
+    }
+
+    #[test]
     fn slice_forty_three_refusals() {
         for sql in [
-            // union inside a quantified subquery: probed (the
-            // wrapper's stream is a blr_union, the comparison reads
-            // fid(union ctx, 0)) - transcript held, unconverted
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE ID NOT IN (SELECT UID FROM U UNION ALL SELECT ID FROM T) INTO :R1 DO SUSPEND; END",
             // general limit expressions: unprobed (params only)
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT FIRST (1 + 1) ID FROM T INTO :R1 DO SUSPEND; END",
             // an expression item in a SCALAR subselect: unprobed

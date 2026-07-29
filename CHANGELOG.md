@@ -13,6 +13,30 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-dsql slice 44: unions as quantified subqueries
+
+### Converted
+- **UNION ALL as a quantified subquery's stream** (flip sixty-seven
+  — the banked transcript cashed): the union claims the subquery's
+  reserved context slot (the slice-38 lookahead law in subquery
+  clothing — the reservation must land before any branch stream
+  numbers), branches carry rse + positional map at the following
+  slots, and the comparison reads `fid(union ctx, 0)`. NOT IN
+  negates to ansi_all + neq as everywhere; parameters ride branch
+  WHEREs; three-branch unions hold.
+- **A law the gate's own battery found**: expression branch items
+  UNIFY the union's type — a `* 2` branch promotes to int64 and the
+  engine wraps every plain branch in `cast(int64, ...)` — the
+  CASE-unification law in union clothing. Named as a refusal with
+  the transcript in the gate comment; the same catalog-typing
+  boundary as NULLIF applies to FIELD-typed branches, so the
+  convertible slice is literal/param-typed unification.
+
+### Guarded
+- The DISTINCT union form, EXISTS over a union, derived branches,
+  expression branch items (above). Gate: `qa/dsql-proc-blr.sh`
+  262 → 267; 68 dsql tests; 391 pins; 265 workspace tests.
+
 ## 2026-07-29 — fire-crab-dsql slice 43: the executor's frontier list, cleared
 
 ### Converted

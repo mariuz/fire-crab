@@ -5071,6 +5071,19 @@ branch has ZERO streams - it reads the recursion's own output
 context by fid. That shape needs its own emission path, and the
 probe bytes are already in the refusal's comment waiting for it.
 
+Slice 44 cashed the banked union-in-subquery transcript - the union
+claims the subquery's reserved context slot before any branch stream
+numbers (the slice-38 reservation law wearing subquery clothing),
+and the quantified comparison reads fid(union ctx, 0). The gate's
+own battery then did what it has done since slice 32: found the next
+law unprompted. A three-branch check with a multiplied item diffed -
+the engine had wrapped every plain branch in cast(int64), because
+expression items UNIFY the union's type exactly as CASE branches
+unify theirs. The check was split: the same-type form pins, the
+unifying form is a named refusal carrying its transcript, and the
+convertible boundary is drawn where it was for NULLIF - literal and
+parameter types unify catalog-free, field types cannot.
+
 Slice 43 was the project's feedback loop closing over itself. Twelve
 executor slices had each swapped out gate checks the COMPILER could
 not yet pin - and named them: STARTING WITH, FIRST (:param),
