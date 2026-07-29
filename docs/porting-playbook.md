@@ -313,6 +313,15 @@ them.
     # parser (val() for sort keys) can turn an old REFUSAL into
     # wrong bytes (ORDER BY 1 = a position) - re-check refusal tests
     # after every parser widening
+    # when the compiler direction is converted, the EXECUTION
+    # direction reuses every law backwards: the interleave rule you
+    # probed to WRITE declares is the rule for READING them; write
+    # the executor against the disassembly of the reference
+    # compiler's own output, and gate BOTH arrows in one check
+    # (recompile-and-diff the bytes, execute-and-diff the rows)
+    # sort defaults are PROBED, not assumed: the reference engine
+    # collates NULL LOW (first ascending, last descending) - one
+    # ORDER BY over a nullable column settles it
     # legacy syntax may be ARITHMETIC in disguise: ROWS m TO n
     # compiles to unfolded add/subtract trees IN the first/skip
     # slots (the SUBSTRING -1 lesson at clause scale) - probe the

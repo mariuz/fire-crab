@@ -13,6 +13,36 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-exe slice 1: the BLR request executor
+
+### Converted
+- **A NEW CRATE, and the third direction of the same oracle.** The
+  dsql crate PRODUCES the engine's bytes; the ods crate READS the
+  engine's pages; `fire-crab-exe` now RUNS the bytes against the
+  pages — `src/jrd/exe.cpp`'s statement looper over the
+  `src/jrd/recsrc/` record sources. `fcexe <db> <proc>` reads
+  `RDB$PROCEDURE_BLR` (the blob fcdsql matches byte-for-byte),
+  parses the `FOR SELECT ... DO SUSPEND` wrapper — messages,
+  INTERLEAVED declares+inits (the law the dsql side probed, read
+  back), stall, labels, the for-loop, the twin sends with the EOF
+  short — and executes it: FullTableScan (`visible_rows`, the
+  VIO_get visibility rule) under FilteredStream (three-valued
+  booleans: wide-integer numeric alignment, PAD-SPACE text, Kleene
+  AND/OR) under SortedStream (blr_sort; **NULLs sort LOW — first
+  ascending, last descending — probed against the live engine, the
+  draft had it backwards**).
+- **The loop closes**: SQL → (fcdsql, byte-checked at the catalog)
+  BLR → (fcexe) rows `==` `SELECT * FROM <proc>` on the C++ engine.
+  Gate: `qa/exe-run-blr.sh` — 15 checks each asserting BOTH arrows
+  (fcdsql still matches the stored bytes, fcexe's rows match the
+  engine's), plus 5 refusals.
+
+### Guarded
+- Input parameters (blr_receive), aggregates, joins, value
+  expressions, the singular SELECT INTO shape — unknown verbs
+  refuse, never guess. 240 workspace tests; all dsql/wire gates
+  green.
+
 ## 2026-07-29 — fire-crab-wire: UPDATE OR INSERT
 
 ### Converted

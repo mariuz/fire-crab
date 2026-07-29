@@ -3812,6 +3812,42 @@ clients, answers real typed, filtered, joined, grouped, sorted and
 aggregated queries from real pages, and accepts writes the real engine
 verifies.
 
+## The execution differential: running the bytes the compiler matches
+
+`fire-crab-exe` opens the third direction on the oracle the dsql crate
+has been writing toward. The dsql crate PRODUCES the engine's compiled
+BLR byte-for-byte; ods READS the engine's pages; exe now RUNS the one
+against the other - src/jrd/exe.cpp's statement looper pulling rows
+through the src/jrd/recsrc/ record sources, the Volcano tower the
+paper's execution chapter describes.
+
+The differential is a closed loop with every arrow checked. `fcexe`
+reads a procedure's `RDB$PROCEDURE_BLR` from the catalog - the exact
+blob the dsql gates prove fcdsql can produce from the SQL text - and
+executes it against the database file: FullTableScan is the
+committed-visibility scan already converted as
+`fire_crab_ods::visible_rows` (the VIO_get rule), FilteredStream
+evaluates the rse boolean under the engine's three-valued logic
+(exact numerics align in a wide integer, text compares PAD SPACE,
+NULL beside anything is UNKNOWN, AND/OR are Kleene), and
+SortedStream orders by the blr_sort keys. The engine then answers
+`SELECT * FROM <proc>` on the same file, and the rows must be
+identical: SQL -> (fcdsql, byte-checked at the catalog) -> BLR ->
+(fcexe) -> rows == the engine's rows.
+
+The gate (`qa/exe-run-blr.sh`, 20 checks) asserts BOTH arrows per
+battery statement - phase A re-compiles the CREATE PROCEDURE with
+fcdsql and diffs it against the stored blob, phase B executes the
+stored blob and diffs the rows - so a drift in either crate fails the
+same check. The first probe correction arrived immediately: the
+engine's default NULL placement is NULLS LOW - first on an ascending
+key, last on a descending one - and the draft executor had it
+backwards until ORDER BY AMT put `3|<null>` at the TOP of the
+engine's answer. Slice 1 executes parameterless single-stream
+FOR SELECT ... DO SUSPEND bodies (filters, multi-column outputs,
+ORDER BY, VARCHAR and NULL outputs); input parameters, aggregates,
+joins and expressions refuse by name, waiting for their slices.
+
 ## Query surface: what the server answers, and what it refuses
 
 Everything below is verified by a differential gate under `qa/` — the
