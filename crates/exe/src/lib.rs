@@ -38,10 +38,12 @@ mod blr {
     pub const MESSAGE: u8 = 4;
     pub const VERSION5: u8 = 5;
     pub const FOR: u8 = 7;
+    pub const RECEIVE: u8 = 12;
     pub const SEND: u8 = 14;
     pub const LABEL: u8 = 17;
     pub const LITERAL: u8 = 21;
     pub const FIELD: u8 = 23;
+    pub const FID: u8 = 24;
     pub const PARAMETER: u8 = 25;
     pub const VARIABLE: u8 = 26;
     pub const PARAMETER2: u8 = 41;
@@ -56,8 +58,20 @@ mod blr {
     pub const NOT: u8 = 59;
     pub const MISSING: u8 = 61;
     pub const RSE: u8 = 67;
+    pub const FIRST: u8 = 68;
     pub const BOOLEAN: u8 = 71;
     pub const RELATION: u8 = 74;
+    pub const MAP: u8 = 77;
+    pub const GROUP_BY: u8 = 78;
+    pub const AGGREGATE: u8 = 79;
+    pub const AGG_COUNT: u8 = 83;
+    pub const AGG_MAX: u8 = 84;
+    pub const AGG_MIN: u8 = 85;
+    pub const AGG_TOTAL: u8 = 86;
+    pub const AGG_AVERAGE: u8 = 87;
+    pub const AGG_COUNT2: u8 = 93;
+    pub const SINGULAR: u8 = 127;
+    pub const SKIP: u8 = 175;
     pub const END: u8 = 255;
     pub const EOC: u8 = 76;
     pub const NULL: u8 = 45;
@@ -95,6 +109,11 @@ pub enum Expr {
     Field(u8, String),
     /// blr_variable
     Variable(u16),
+    /// blr_parameter2 read as a VALUE: (message, value slot) - the
+    /// null companion travels with the buffer, not the expression
+    Parameter(u8, u16),
+    /// blr_fid: an aggregate output slot (context, position)
+    Fid(u8, u16),
     /// blr_literal, already decoded to a Value
     Literal(Value),
     /// blr_null
@@ -120,16 +139,47 @@ pub struct SortKey {
     pub desc: bool,
 }
 
-/// The record-selection expression of a blr_for: slice 1 is one
-/// relation stream, an optional boolean, an optional sort - the
-/// FullTableScan under a FilteredStream under a SortedStream, the
-/// leanest Volcano tower.
+/// One aggregate-map entry: the output slot and what fills it - an
+/// aggregate verb over an optional operand, or a plain value (a
+/// group key passed through).
+#[derive(Clone, Debug)]
+pub enum MapItem {
+    Agg(u8, Option<Expr>),
+    Value(Expr),
+}
+
+/// A blr_aggregate stream: its own context over an inner rse, the
+/// group keys, and the map - the AggregatedStream of recsrc/.
+#[derive(Clone, Debug)]
+pub struct Aggregate {
+    pub context: u8,
+    pub source: Box<Rse>,
+    pub group_by: Vec<Expr>,
+    pub map: Vec<(u16, MapItem)>,
+}
+
+/// The stream slot of an rse: a plain relation scan, or an
+/// aggregate over an inner rse.
+#[derive(Clone, Debug)]
+pub enum Stream {
+    Relation { name: String, context: u8 },
+    Aggregate(Aggregate),
+}
+
+/// The record-selection expression of a blr_for: one stream, the
+/// optional clauses - FullTableScan (or AggregatedStream) under
+/// FilteredStream under SortedStream under SkipRowsStream under
+/// FirstRowsStream, the Volcano tower in the engine's own order
+/// (sort, then skip, then first).
 #[derive(Clone, Debug)]
 pub struct Rse {
-    pub relation: String,
-    pub context: u8,
+    pub stream: Stream,
     pub boolean: Option<Bool>,
     pub sort: Vec<SortKey>,
+    pub first: Option<Expr>,
+    pub skip: Option<Expr>,
+    /// blr_singular: at most one row - a second is a genuine error
+    pub singular: bool,
 }
 
 /// A statement node of the looper's subset.
@@ -226,6 +276,16 @@ impl<'a> P<'a> {
                 Ok(Expr::Field(ctx, self.counted_name()?))
             }
             blr::VARIABLE => Ok(Expr::Variable(self.u16()?)),
+            blr::PARAMETER2 => {
+                let msg = self.u8()?;
+                let val = self.u16()?;
+                let _null = self.u16()?;
+                Ok(Expr::Parameter(msg, val))
+            }
+            blr::FID => {
+                let ctx = self.u8()?;
+                Ok(Expr::Fid(ctx, self.u16()?))
+            }
             blr::NULL => Ok(Expr::Null),
             blr::LITERAL => {
                 let s = self.msg_slot()?;
@@ -283,21 +343,82 @@ impl<'a> P<'a> {
         })
     }
 
-    fn rse(&mut self) -> Result<Rse, String> {
+    /// A blr_for's source: `[blr_singular] blr_rse <body>`.
+    fn rse_entry(&mut self) -> Result<Rse, String> {
+        let singular = if self.b.get(self.i) == Some(&blr::SINGULAR) {
+            self.i += 1;
+            true
+        } else {
+            false
+        };
+        if self.u8()? != blr::RSE {
+            return Err("for source is not blr_rse - unconverted".into());
+        }
+        let mut rse = self.rse_body()?;
+        rse.singular = singular;
+        Ok(rse)
+    }
+
+    /// The rse proper: stream count onward (the tag already consumed).
+    fn rse_body(&mut self) -> Result<Rse, String> {
         let streams = self.u8()?;
         if streams != 1 {
             return Err(format!("{}-stream rse unconverted", streams));
         }
-        if self.u8()? != blr::RELATION {
-            return Err("stream is not blr_relation - unconverted".into());
-        }
-        let relation = self.counted_name()?;
-        let context = self.u8()?;
+        let stream = match self.u8()? {
+            blr::RELATION => {
+                let name = self.counted_name()?;
+                let context = self.u8()?;
+                Stream::Relation { name, context }
+            }
+            blr::AGGREGATE => {
+                let context = self.u8()?;
+                if self.u8()? != blr::RSE {
+                    return Err("aggregate source is not an rse".into());
+                }
+                let source = Box::new(self.rse_body()?);
+                if self.u8()? != blr::GROUP_BY {
+                    return Err("aggregate without blr_group_by".into());
+                }
+                let n = self.u8()? as usize;
+                let mut group_by = Vec::new();
+                for _ in 0..n {
+                    group_by.push(self.expr()?);
+                }
+                if self.u8()? != blr::MAP {
+                    return Err("aggregate without blr_map".into());
+                }
+                let n = self.u16()? as usize;
+                let mut map = Vec::new();
+                for _ in 0..n {
+                    let slot = self.u16()?;
+                    let item = match self.b.get(self.i) {
+                        Some(&blr::AGG_COUNT) => {
+                            self.i += 1;
+                            MapItem::Agg(blr::AGG_COUNT, None)
+                        }
+                        Some(&v @ (blr::AGG_MAX | blr::AGG_MIN | blr::AGG_TOTAL
+                            | blr::AGG_AVERAGE | blr::AGG_COUNT2)) => {
+                            self.i += 1;
+                            MapItem::Agg(v, Some(self.expr()?))
+                        }
+                        _ => MapItem::Value(self.expr()?),
+                    };
+                    map.push((slot, item));
+                }
+                Stream::Aggregate(Aggregate { context, source, group_by, map })
+            }
+            other => return Err(format!("stream verb {} unconverted", other)),
+        };
         let mut boolean = None;
         let mut sort = Vec::new();
+        let mut first = None;
+        let mut skip = None;
         loop {
             match self.u8()? {
                 blr::BOOLEAN => boolean = Some(self.boolean()?),
+                blr::FIRST => first = Some(self.expr()?),
+                blr::SKIP => skip = Some(self.expr()?),
                 blr::SORT => {
                     let n = self.u8()? as usize;
                     for _ in 0..n {
@@ -315,7 +436,7 @@ impl<'a> P<'a> {
                 other => return Err(format!("rse clause {} unconverted", other)),
             }
         }
-        Ok(Rse { relation, context, boolean, sort })
+        Ok(Rse { stream, boolean, sort, first, skip, singular: false })
     }
 
     fn stmt(&mut self) -> Result<Stmt, String> {
@@ -336,10 +457,7 @@ impl<'a> P<'a> {
                 Ok(Stmt::Label(n, Box::new(self.stmt()?)))
             }
             blr::FOR => {
-                if self.u8()? != blr::RSE {
-                    return Err("for source is not blr_rse - unconverted".into());
-                }
-                let rse = self.rse()?;
+                let rse = self.rse_entry()?;
                 Ok(Stmt::For(rse, Box::new(self.stmt()?)))
             }
             blr::SEND => {
@@ -401,6 +519,14 @@ pub fn parse(blr_bytes: &[u8]) -> Result<Request, String> {
         }
         messages.push((num, slots));
     }
+    // with input parameters the wrapper waits under blr_receive 0
+    // before the inner begin - the EXE_start/EXE_receive handshake;
+    // this synchronous executor binds message 0 up front, so the
+    // receive is transparent
+    if p.b.get(p.i) == Some(&blr::RECEIVE) {
+        p.i += 1;
+        let _msg = p.u8()?;
+    }
     // the inner begin: declares + their NULL-inits (procedures
     // INTERLEAVE the two - declare, init, declare, init - the law the
     // dsql crate probed), stall, the labeled body
@@ -454,9 +580,11 @@ pub fn parse(blr_bytes: &[u8]) -> Result<Request, String> {
 /// current position's decoded record, addressed by context number.
 struct StreamFrame {
     context: u8,
-    /// the bound relation's name - blr_field resolves through it
-    relation: String,
-    /// field-id -> column-values of the CURRENT row
+    /// the bound relation's name - blr_field resolves through it;
+    /// None for an aggregate frame, whose row is SLOT-indexed and
+    /// read by blr_fid
+    relation: Option<String>,
+    /// field-id (or map-slot) -> values of the CURRENT row
     row: Vec<Value>,
 }
 
@@ -481,6 +609,7 @@ pub fn execute(
     file: &[u8],
     page_size: usize,
     request: &Request,
+    args: &[String],
 ) -> Result<Vec<(u8, Vec<Value>)>, String> {
     let mut max_msg = 0u8;
     for (n, _) in &request.messages {
@@ -491,6 +620,25 @@ pub fn execute(
     for (n, slots) in &request.messages {
         msg_bufs[*n as usize] = vec![Value::Null; slots.len()];
         msg_slots[*n as usize] = slots.clone();
+    }
+    // bind message 0 - the input parameters, (value, null) pairs
+    // with no EOF slot; each CLI argument parses by its slot's dtype
+    if let Some((_, slots)) = request.messages.iter().find(|(n, _)| *n == 0) {
+        let inputs = slots.len() / 2;
+        if args.len() != inputs {
+            return Err(format!("procedure takes {} argument(s), got {}", inputs, args.len()));
+        }
+        for (i, a) in args.iter().enumerate() {
+            let slot = &slots[2 * i];
+            let v = match slot.dtype {
+                blr::DT_SHORT | blr::DT_LONG | blr::DT_INT64 => Value::Int(
+                    a.parse::<i64>().map_err(|_| format!("argument {} is not an integer", i + 1))?,
+                ),
+                _ => Value::Text(a.clone()),
+            };
+            msg_bufs[0][2 * i] = v;
+            msg_bufs[0][2 * i + 1] = Value::Int(0);
+        }
     }
     let mut ex = Exec {
         file,
@@ -564,10 +712,19 @@ impl<'a> Exec<'a> {
             }
             Stmt::For(rse, body) => {
                 let rows = self.open_rse(rse)?;
+                if rse.singular && rows.len() > 1 {
+                    // the engine's sing_err: a singleton select with
+                    // a second row is a runtime ERROR, not a truncation
+                    return Err("multiple rows in singleton select".into());
+                }
+                let (context, relation) = match &rse.stream {
+                    Stream::Relation { name, context } => (*context, Some(name.clone())),
+                    Stream::Aggregate(a) => (a.context, None),
+                };
                 for row in rows {
                     self.frames.push(StreamFrame {
-                        context: rse.context,
-                        relation: rse.relation.clone(),
+                        context,
+                        relation: relation.clone(),
                         row,
                     });
                     let r = self.stmt(body);
@@ -579,45 +736,59 @@ impl<'a> Exec<'a> {
         Ok(())
     }
 
-    /// Open the record source tower for an rse: FullTableScan (the
-    /// committed-visibility walk) under FilteredStream (the boolean,
-    /// keeping only TRUE) under SortedStream (the blr_sort keys).
+    /// Open the record source tower for an rse - the engine's own
+    /// stacking order: FullTableScan or AggregatedStream at the
+    /// bottom, FilteredStream (the boolean), SortedStream (blr_sort),
+    /// SkipRowsStream, FirstRowsStream on top.
     fn open_rse(&mut self, rse: &Rse) -> Result<Vec<Vec<Value>>, String> {
-        let rel = resolve_relation(self.file, self.page_size, &rse.relation)
-            .ok_or_else(|| format!("relation {} not found", rse.relation))?;
-        let formats =
-            fire_crab_ods::relation_formats(self.file, self.page_size, rel);
-        let (_, descs) = formats
-            .iter()
-            .max_by_key(|(n, _)| *n)
-            .ok_or("relation has no format")?;
-        let tips = TipChain::read(self.file, self.page_size)
-            .ok_or("cannot read transaction inventory")?;
-        let mut rows: Vec<Vec<Value>> = Vec::new();
-        for vr in visible_rows(self.file, self.page_size, rel, descs, &tips) {
-            self.frames.push(StreamFrame {
-                context: rse.context,
-                relation: rse.relation.clone(),
-                row: vr.values,
-            });
-            let keep = match &rse.boolean {
-                None => Some(true),
-                Some(b) => self.bool_eval(b)?,
-            };
-            let frame = self.frames.pop().expect("frame just pushed");
-            if keep == Some(true) {
-                rows.push(frame.row);
+        let (context, relation) = match &rse.stream {
+            Stream::Relation { name, context } => (*context, Some(name.clone())),
+            Stream::Aggregate(a) => (a.context, None),
+        };
+        let mut rows: Vec<Vec<Value>> = match &rse.stream {
+            Stream::Relation { name, .. } => {
+                let rel = resolve_relation(self.file, self.page_size, name)
+                    .ok_or_else(|| format!("relation {} not found", name))?;
+                let formats =
+                    fire_crab_ods::relation_formats(self.file, self.page_size, rel);
+                let (_, descs) = formats
+                    .iter()
+                    .max_by_key(|(n, _)| *n)
+                    .ok_or("relation has no format")?;
+                let tips = TipChain::read(self.file, self.page_size)
+                    .ok_or("cannot read transaction inventory")?;
+                visible_rows(self.file, self.page_size, rel, descs, &tips)
+                    .into_iter()
+                    .map(|vr| vr.values)
+                    .collect()
             }
+            Stream::Aggregate(agg) => self.open_aggregate(agg)?,
+        };
+        // FilteredStream: the boolean, three-valued, TRUE survives -
+        // over an aggregate this is HAVING, reading fids
+        if let Some(b) = &rse.boolean {
+            let mut kept = Vec::new();
+            for row in rows {
+                self.frames.push(StreamFrame {
+                    context,
+                    relation: relation.clone(),
+                    row,
+                });
+                let keep = self.bool_eval(b)?;
+                let frame = self.frames.pop().expect("frame just pushed");
+                if keep == Some(true) {
+                    kept.push(frame.row);
+                }
+            }
+            rows = kept;
         }
+        // SortedStream
         if !rse.sort.is_empty() {
-            // SortedStream: evaluate the keys per row, stable-sort.
-            // NULLs order LAST ascending, FIRST descending - the
-            // engine's default NULL placement.
             let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
             for row in rows {
                 self.frames.push(StreamFrame {
-                    context: rse.context,
-                    relation: rse.relation.clone(),
+                    context,
+                    relation: relation.clone(),
                     row,
                 });
                 let mut keys = Vec::new();
@@ -639,7 +810,189 @@ impl<'a> Exec<'a> {
             });
             rows = keyed.into_iter().map(|(_, r)| r).collect();
         }
+        // SkipRowsStream, then FirstRowsStream - blr_first/blr_skip
+        // are rse clauses, but the tower applies sort, skip, first
+        if let Some(e) = &rse.skip {
+            let n = self.eval_count(e)?;
+            rows = rows.into_iter().skip(n).collect();
+        }
+        if let Some(e) = &rse.first {
+            let n = self.eval_count(e)?;
+            rows.truncate(n);
+        }
         Ok(rows)
+    }
+
+    /// A FIRST/SKIP operand: a non-negative count.
+    fn eval_count(&mut self, e: &Expr) -> Result<usize, String> {
+        match self.eval(e)? {
+            Value::Int(n) if n >= 0 => Ok(n as usize),
+            Value::Int(_) => Err("negative row limit".into()),
+            _ => Err("row limit is not an integer".into()),
+        }
+    }
+
+    /// The AggregatedStream: fold the inner rse's rows into groups by
+    /// the group-by keys, one output row per group, slot-indexed by
+    /// the map. Aggregate semantics are the engine's: COUNT of no
+    /// rows is 0 but SUM/AVG/MIN/MAX of no rows are NULL; NULL
+    /// operands do not contribute; integer AVG truncates (sum/count
+    /// in integer division). A zero-row source with NO group keys
+    /// still yields ONE row - the aggregate of the empty set.
+    fn open_aggregate(&mut self, agg: &Aggregate) -> Result<Vec<Vec<Value>>, String> {
+        let (in_ctx, in_rel) = match &agg.source.stream {
+            Stream::Relation { name, context } => (*context, Some(name.clone())),
+            Stream::Aggregate(_) => {
+                return Err("aggregate over an aggregate unconverted".into())
+            }
+        };
+        let source_rows = self.open_rse(&agg.source)?;
+        // fold state per group, keyed by the group-by values; groups
+        // keep FIRST-ENCOUNTER order and sort by key below
+        struct Acc {
+            keys: Vec<Value>,
+            slots: Vec<(u16, Fold)>,
+        }
+        enum Fold {
+            Count(i64),
+            Sum(Option<i64>),
+            Avg(Option<(i64, i64)>),
+            Min(Option<Value>),
+            Max(Option<Value>),
+            Pass(Value),
+        }
+        let new_acc = |keys: Vec<Value>, map: &[(u16, MapItem)]| Acc {
+            keys,
+            slots: map
+                .iter()
+                .map(|(slot, item)| {
+                    let f = match item {
+                        MapItem::Agg(v, _) => match *v {
+                            blr::AGG_COUNT | blr::AGG_COUNT2 => Fold::Count(0),
+                            blr::AGG_TOTAL => Fold::Sum(None),
+                            blr::AGG_AVERAGE => Fold::Avg(None),
+                            blr::AGG_MIN => Fold::Min(None),
+                            blr::AGG_MAX => Fold::Max(None),
+                            _ => unreachable!("parse admitted the verb"),
+                        },
+                        MapItem::Value(_) => Fold::Pass(Value::Null),
+                    };
+                    (*slot, f)
+                })
+                .collect(),
+        };
+        let mut groups: Vec<Acc> = Vec::new();
+        for row in source_rows {
+            self.frames.push(StreamFrame {
+                context: in_ctx,
+                relation: in_rel.clone(),
+                row,
+            });
+            let mut keys = Vec::new();
+            for k in &agg.group_by {
+                keys.push(self.eval(k)?);
+            }
+            let gi = match groups.iter().position(|g| {
+                g.keys.len() == keys.len()
+                    && g.keys.iter().zip(&keys).all(|(a, b)| group_eq(a, b))
+            }) {
+                Some(i) => i,
+                None => {
+                    groups.push(new_acc(keys.clone(), &agg.map));
+                    groups.len() - 1
+                }
+            };
+            for (slot_i, (_, item)) in agg.map.iter().enumerate() {
+                let operand = match item {
+                    MapItem::Agg(_, Some(e)) | MapItem::Value(e) => Some(self.eval(e)?),
+                    MapItem::Agg(_, None) => None,
+                };
+                let fold = &mut groups[gi].slots[slot_i].1;
+                match (fold, item, operand) {
+                    (Fold::Count(n), MapItem::Agg(v, _), op) => {
+                        // COUNT(*) counts rows; COUNT(x) counts
+                        // non-NULL operands
+                        if *v == blr::AGG_COUNT || !matches!(op, Some(Value::Null)) {
+                            *n += 1;
+                        }
+                    }
+                    (Fold::Sum(acc), _, Some(v)) => {
+                        if let Some(n) = int_of(&v) {
+                            *acc = Some(acc.unwrap_or(0) + n);
+                        }
+                    }
+                    (Fold::Avg(acc), _, Some(v)) => {
+                        if let Some(n) = int_of(&v) {
+                            let (s, c) = acc.unwrap_or((0, 0));
+                            *acc = Some((s + n, c + 1));
+                        }
+                    }
+                    (Fold::Min(acc), _, Some(v)) => {
+                        if !matches!(v, Value::Null) {
+                            let take = match acc {
+                                None => true,
+                                Some(cur) => {
+                                    value_cmp(&v, cur) == Some(std::cmp::Ordering::Less)
+                                }
+                            };
+                            if take {
+                                *acc = Some(v);
+                            }
+                        }
+                    }
+                    (Fold::Max(acc), _, Some(v)) => {
+                        if !matches!(v, Value::Null) {
+                            let take = match acc {
+                                None => true,
+                                Some(cur) => {
+                                    value_cmp(&v, cur)
+                                        == Some(std::cmp::Ordering::Greater)
+                                }
+                            };
+                            if take {
+                                *acc = Some(v);
+                            }
+                        }
+                    }
+                    (Fold::Pass(p), _, Some(v)) => *p = v,
+                    _ => {}
+                }
+            }
+            self.frames.pop();
+        }
+        // the aggregate of the EMPTY set: no group keys -> one row
+        if groups.is_empty() && agg.group_by.is_empty() {
+            groups.push(new_acc(Vec::new(), &agg.map));
+        }
+        // groups emerge in key order (the engine aggregates over
+        // key-sorted input)
+        groups.sort_by(|a, b| {
+            for (x, y) in a.keys.iter().zip(&b.keys) {
+                let o = null_aware_cmp(x, y, false);
+                if o != std::cmp::Ordering::Equal {
+                    return o;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        let width = agg.map.iter().map(|(s, _)| *s as usize + 1).max().unwrap_or(0);
+        let mut out = Vec::with_capacity(groups.len());
+        for g in groups {
+            let mut row = vec![Value::Null; width];
+            for (slot, fold) in g.slots {
+                row[slot as usize] = match fold {
+                    Fold::Count(n) => Value::Int(n),
+                    Fold::Sum(v) => v.map(Value::Int).unwrap_or(Value::Null),
+                    // integer average truncates toward zero, like the
+                    // engine's integer division
+                    Fold::Avg(v) => v.map(|(s, c)| Value::Int(s / c)).unwrap_or(Value::Null),
+                    Fold::Min(v) | Fold::Max(v) => v.unwrap_or(Value::Null),
+                    Fold::Pass(v) => v,
+                };
+            }
+            out.push(row);
+        }
+        Ok(out)
     }
 
     fn eval(&mut self, e: &Expr) -> Result<Value, String> {
@@ -651,6 +1004,21 @@ impl<'a> Exec<'a> {
                 .get(*n as usize)
                 .ok_or("read of an undeclared variable")?
                 .clone(),
+            Expr::Parameter(msg, slot) => self
+                .msg_bufs
+                .get(*msg as usize)
+                .and_then(|b| b.get(*slot as usize))
+                .cloned()
+                .ok_or("parameter slot out of range")?,
+            Expr::Fid(ctx, slot) => {
+                let frame = self
+                    .frames
+                    .iter()
+                    .rev()
+                    .find(|f| f.context == *ctx)
+                    .ok_or_else(|| format!("context {} not bound", ctx))?;
+                frame.row.get(*slot as usize).cloned().unwrap_or(Value::Null)
+            }
             Expr::Field(ctx, name) => {
                 let frame = self
                     .frames
@@ -660,7 +1028,10 @@ impl<'a> Exec<'a> {
                     .ok_or_else(|| format!("context {} not bound", ctx))?;
                 // resolve the NAME through the catalog to the field id
                 // - decoded rows index by field id
-                let rel_name = frame.relation.clone();
+                let rel_name = frame
+                    .relation
+                    .clone()
+                    .ok_or("bare field over an aggregate frame")?;
                 let cols =
                     relation_columns(self.file, self.page_size, &rel_name);
                 let col = cols
@@ -712,6 +1083,23 @@ impl<'a> Exec<'a> {
                 Some(matches!(self.eval(e)?, Value::Null))
             }
         })
+    }
+}
+
+/// Group-key equality: NULL groups WITH NULL (set semantics, the
+/// same rule DISTINCT and UNION use - the opposite of `= NULL`).
+fn group_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, Value::Null) => true,
+        _ => value_cmp(a, b) == Some(std::cmp::Ordering::Equal),
+    }
+}
+
+/// An exact-integer view of a value for SUM/AVG folding.
+fn int_of(v: &Value) -> Option<i64> {
+    match v {
+        Value::Int(n) => Some(*n),
+        _ => None,
     }
 }
 
@@ -808,6 +1196,32 @@ mod tests {
         assert!(parse(&[4]).is_err());
         // truncated stream
         assert!(parse(&unhex(&P1[..P1.len() - 8])).is_err());
+    }
+
+    /// The aggregate wrapper - fcdsql's bytes for:
+    ///   CREATE PROCEDURE Q2 RETURNS (R1 INTEGER) AS
+    ///   BEGIN FOR SELECT COUNT(*) FROM T INTO :R1 DO SUSPEND; END
+    const Q2: &str = "050204010300080007000700020300000800012D1A00009B1100020211010743014F0143014A015400FF4E004D0100000053FF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C";
+
+    #[test]
+    fn parses_the_aggregate_stream() {
+        let req = parse(&unhex(Q2)).expect("Q2 parses");
+        fn find_agg(s: &Stmt) -> Option<&Aggregate> {
+            match s {
+                Stmt::Begin(list) => list.iter().find_map(find_agg),
+                Stmt::Label(_, i) | Stmt::Send(_, i) => find_agg(i),
+                Stmt::For(rse, body) => match &rse.stream {
+                    Stream::Aggregate(a) => Some(a),
+                    _ => find_agg(body),
+                },
+                _ => None,
+            }
+        }
+        let agg = find_agg(&req.body).expect("an aggregate stream");
+        assert_eq!(agg.context, 1);
+        assert!(agg.group_by.is_empty());
+        assert_eq!(agg.map.len(), 1);
+        assert!(matches!(agg.map[0], (0, MapItem::Agg(v, None)) if v == blr::AGG_COUNT));
     }
 
     #[test]

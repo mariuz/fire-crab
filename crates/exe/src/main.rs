@@ -1,6 +1,6 @@
 //! fcexe - execute a stored procedure's BLR against a database file.
 //!
-//!   fcexe <db.fdb> <PROCNAME>
+//!   fcexe <db.fdb> <PROCNAME> [arg ...]
 //!
 //! Reads `RDB$PROCEDURE_BLR` from the catalog (the same bytes
 //! fire-crab-dsql matches from the SQL text), runs the request through
@@ -69,8 +69,8 @@ fn procedure_blr(file: &[u8], page_size: usize, name: &str) -> Result<Vec<u8>, S
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 3 {
-        eprintln!("usage: fcexe <db.fdb> <PROCNAME>");
+    if args.len() < 3 {
+        eprintln!("usage: fcexe <db.fdb> <PROCNAME> [arg ...]");
         std::process::exit(2);
     }
     let file = match std::fs::read(&args[1]) {
@@ -97,7 +97,7 @@ fn main() {
             return Err("output message is not (value, null)* + EOF".into());
         }
         let outputs = (out_slots - 1) / 2;
-        for (msg, buf) in execute(&file, page_size, &request)? {
+        for (msg, buf) in execute(&file, page_size, &request, &args[3..])? {
             if msg != 1 {
                 continue;
             }

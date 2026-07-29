@@ -13,6 +13,36 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-exe slice 2: parameters, aggregates, singular, FIRST/SKIP
+
+### Converted
+- **Three of slice 1's own refusals flipped** by the same gate
+  machinery that installed them. INPUT PARAMETERS: message 0 binds
+  up front from fcexe's CLI arguments (typed by the message slots),
+  `blr_receive` is transparent to the synchronous looper, and
+  `blr_parameter2` joins the value expressions. AGGREGATES:
+  `blr_aggregate` as a stream with its own context — group-by keys
+  fold rows with NULL grouping WITH NULL (set semantics), the map's
+  verbs (count / count2 / total / average / min / max) carry the
+  engine's empty-set rules: COUNT of nothing is 0 but SUM/AVG/MIN/
+  MAX are NULL, a keyless aggregate of an empty set still yields ONE
+  row, integer AVG truncates; outputs read `blr_fid`, and HAVING is
+  just the outer rse's boolean evaluated over the aggregate frame.
+  SINGULAR selects: a second row is a runtime ERROR (the engine's
+  sing_err), never a truncation. FIRST/SKIP: rse clauses executed in
+  the tower's order — sort, then skip, then first.
+- The rse parser split into entry/body so `blr_singular` wraps and
+  aggregate sources nest without double-consuming tags; frames now
+  carry an optional relation (aggregate frames are slot-indexed,
+  read by fid — a bare field over one refuses).
+
+### Guarded
+- Joins, value expressions, DISTINCT (blr_project) and windows
+  remain named refusals. Gate: `qa/exe-run-blr.sh` grew 20 → 32
+  checks (13 fresh incl. three flips; text CLI arguments quote on
+  the SQL side — the engine parsed a bare `bb` as a column and
+  fcexe was right first). 5 unit tests; 262 workspace tests.
+
 ## 2026-07-29 — fire-crab-blb slice 2: level-2 creation + wire adoption
 
 ### Converted

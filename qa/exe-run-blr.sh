@@ -86,6 +86,55 @@ SQL
         fail=1
     fi
 }
+checkp() { # <args> <procedure tail> - a parameterized check: the
+           # engine answers SELECT * FROM name(<args>), fcexe takes
+           # the same values as CLI arguments; phase A still pins the
+           # stored bytes against fcdsql
+    cargs="$1"; shift
+    n=$((n + 1))
+    name="EP$n"
+    stmt="CREATE PROCEDURE $name ${1}"
+    "$ISQL" -q -b -user "$U" -pas "$P" "$DB" >/dev/null 2>&1 <<SQL
+SET TERM ^ ;
+$stmt^
+SET TERM ; ^
+COMMIT;
+SQL
+    stored=$("$ISQL" -q -b -user "$U" -pas "$P" "$DB" 2>/dev/null <<SQL | tr -d ' 
+'
+SET HEADING OFF;
+SELECT CAST(CAST(RDB\$PROCEDURE_BLR AS BLOB SUB_TYPE 0) AS VARCHAR(900) CHARACTER SET OCTETS) FROM RDB\$PROCEDURES WHERE RDB\$PROCEDURE_NAME = '$name';
+SQL
+)
+    if [ -z "$stored" ] || [ "$("$FCDSQL" "$stmt")" != "$stored" ]; then
+        echo "DIFF [$stmt] - store/byte-pin failure"; fail=1; return
+    fi
+    # SQL-side spelling: numeric args ride bare, text args quote
+    sqlargs=""
+    for a in $cargs; do
+        case "$a" in
+            ''|*[!0-9-]*) q="'$a'" ;;
+            *) q="$a" ;;
+        esac
+        sqlargs="$sqlargs${sqlargs:+,}$q"
+    done
+    want=$("$ISQL" -q -b -user "$U" -pas "$P" "$DB" 2>&1 <<SQL | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]]\{1,\}/|/g' | grep -v '^$'
+SET HEADING OFF;
+SELECT * FROM $name($sqlargs);
+SQL
+)
+    got=$("$FCEXE" "$DB" "$name" $cargs 2>&1)
+    if [ "$got" = "$want" ]; then
+        echo "OK   ($cargs) $stmt"
+    else
+        echo "DIFF ($cargs) $stmt"
+        echo "     engine: $(printf '%s' "$want" | tr '
+' ' ')"
+        echo "     fcexe:  $(printf '%s' "$got" | tr '
+' ' ')"
+        fail=1
+    fi
+}
 refuse() { # <procedure tail> - the engine runs it; fcexe must refuse
     n=$((n + 1))
     name="EP$n"
@@ -122,11 +171,27 @@ check "RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT ID, AMT FROM T ORDER
 check "RETURNS (R1 VARCHAR(10)) AS BEGIN FOR SELECT NAME FROM T ORDER BY NAME INTO :R1 DO SUSPEND; END"
 check "RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE AMT >= 8 AND (ID = 2 OR NAME = 'ee') INTO :R1 DO SUSPEND; END"
 
+# --- slice 2: parameters, aggregates, singular, FIRST/SKIP -------------
+# (input parameters, COUNT(*) and the singular SELECT INTO - all
+# slice-1 refusals - flipped)
+checkp "5" "(P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE AMT > :P1 INTO :R1 DO SUSPEND; END"
+checkp "8 3" "(P1 INTEGER, P2 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE AMT = :P1 AND ID > :P2 INTO :R1 DO SUSPEND; END"
+checkp "bb" "(P1 VARCHAR(10)) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE NAME = :P1 INTO :R1 DO SUSPEND; END"
+check "RETURNS (R1 INTEGER) AS BEGIN FOR SELECT COUNT(*) FROM T INTO :R1 DO SUSPEND; END"
+check "RETURNS (R1 INTEGER) AS BEGIN FOR SELECT COUNT(AMT) FROM T INTO :R1 DO SUSPEND; END"
+check "RETURNS (R1 INTEGER, R2 INTEGER, R3 INTEGER) AS BEGIN FOR SELECT SUM(AMT), MIN(AMT), MAX(AMT) FROM T INTO :R1, :R2, :R3 DO SUSPEND; END"
+check "RETURNS (R1 INTEGER) AS BEGIN FOR SELECT AVG(AMT) FROM T INTO :R1 DO SUSPEND; END"
+check "RETURNS (R1 INTEGER) AS BEGIN FOR SELECT COUNT(*) FROM T WHERE AMT > 100 INTO :R1 DO SUSPEND; END"
+check "RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT AMT, COUNT(*) FROM T GROUP BY AMT INTO :R1, :R2 DO SUSPEND; END"
+check "RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT AMT, SUM(ID) FROM T GROUP BY AMT HAVING COUNT(*) > 1 INTO :R1, :R2 DO SUSPEND; END"
+check "RETURNS (R1 INTEGER) AS BEGIN SELECT ID FROM T WHERE ID = 1 INTO :R1; SUSPEND; END"
+check "RETURNS (R1 INTEGER) AS BEGIN FOR SELECT FIRST 2 SKIP 1 ID FROM T ORDER BY ID DESC INTO :R1 DO SUSPEND; END"
+check "RETURNS (R1 INTEGER) AS BEGIN FOR SELECT FIRST 3 ID FROM T ORDER BY AMT INTO :R1 DO SUSPEND; END"
+
 # --- refusals: outside the slice, the answer is REFUSED ----------------
-refuse "(P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE AMT > :P1 INTO :R1 DO SUSPEND; END"
-refuse "RETURNS (R1 INTEGER) AS BEGIN FOR SELECT COUNT(*) FROM T INTO :R1 DO SUSPEND; END"
 refuse "RETURNS (R1 INTEGER) AS BEGIN FOR SELECT A.ID FROM T A JOIN T B ON A.ID = B.AMT INTO :R1 DO SUSPEND; END"
 refuse "RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID + 1 FROM T INTO :R1 DO SUSPEND; END"
-refuse "RETURNS (R1 INTEGER) AS BEGIN SELECT ID FROM T WHERE ID = 1 INTO :R1; SUSPEND; END"
+refuse "RETURNS (R1 INTEGER) AS BEGIN FOR SELECT DISTINCT AMT FROM T INTO :R1 DO SUSPEND; END"
+refuse "RETURNS (R1 INTEGER) AS BEGIN FOR SELECT COUNT(*) OVER () FROM T INTO :R1 DO SUSPEND; END"
 
 exit $fail

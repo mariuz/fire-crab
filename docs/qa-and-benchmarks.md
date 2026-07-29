@@ -3985,6 +3985,26 @@ FOR SELECT ... DO SUSPEND bodies (filters, multi-column outputs,
 ORDER BY, VARCHAR and NULL outputs); input parameters, aggregates,
 joins and expressions refuse by name, waiting for their slices.
 
+### Slice 2: the tower grows, three refusals fall
+
+Slice 2 of the executor flipped three of slice 1's own named
+refusals - input parameters, aggregates and the singular select -
+plus FIRST/SKIP, with the gate growing from twenty checks to
+thirty-two. Message 0 binds from fcexe's command line (each argument
+typed by its message slot); blr_receive - the EXE_start/EXE_receive
+staging point - is transparent to a synchronous looper that bound
+the message up front. The aggregate stream folds groups with the
+engine's exact edge semantics, all engine-verified per check: NULL
+group keys group together (set semantics, the DISTINCT/UNION rule,
+not the `= NULL` rule), COUNT of an empty set is 0 while SUM, AVG,
+MIN and MAX are NULL, a keyless aggregate over no rows still emits
+one row, and integer AVG truncates. HAVING needed no new machinery
+at all: it is the outer rse's boolean, evaluated over the aggregate
+frame's fid slots - the same FilteredStream, one frame higher. The
+singular select surfaced a semantic worth naming: a second row is a
+runtime ERROR (sing_err), not a truncation - an executor that
+silently took the first row would answer wrong queries politely.
+
 ## Query surface: what the server answers, and what it refuses
 
 Everything below is verified by a differential gate under `qa/` — the
