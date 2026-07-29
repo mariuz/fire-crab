@@ -761,7 +761,87 @@ fn plan_chain(
     if n == 2 {
         let ca = cardinality(file, page_size, &tables[0])?;
         let cb = cardinality(file, page_size, &tables[1])?;
-        match join_band(ca, cb)? {
+        // the COST MODEL decides when the statistics behind it are
+        // fresh; a zero selectivity means they were never computed
+        // for the data now present, and the crate falls back to the
+        // probed bands rather than costing with a number the engine
+        // itself distrusts
+        let key_sel = |si: usize, col: &str| -> Result<Option<f64>, String> {
+            let ix = indexes_of(file, page_size, &tables[si])?;
+            match ix
+                .iter()
+                .filter(|x| x.matches(col) && !x.descending)
+                .min_by_key(|x| x.id)
+            {
+                None => Ok(None),
+                Some(i) => Ok(Some(index_selectivity(file, page_size, &i.name)?)),
+            }
+        };
+        // the join key columns per stream, from the first class that
+        // spans both
+        let mut cols: Option<(String, String)> = None;
+        for cl in &classes {
+            let a = cl.iter().find(|(t, _)| *t == 0).map(|(_, c)| c.clone());
+            let b = cl.iter().find(|(t, _)| *t == 1).map(|(_, c)| c.clone());
+            if let (Some(a), Some(b)) = (a, b) {
+                cols = Some((a, b));
+                break;
+            }
+        }
+        let costed = match &cols {
+            None => None,
+            Some((ca_col, cb_col)) => {
+                let sa = key_sel(0, ca_col)?;
+                let sb = key_sel(1, cb_col)?;
+                match (sa, sb) {
+                    (Some(sa), Some(sb)) => {
+                        // a ZERO selectivity on a POPULATED index means
+                        // the statistics were never computed for the
+                        // data now present; the engine keeps costing
+                        // with internal state this crate has not
+                        // converted, so refuse rather than guess
+                        if (sa == 0.0 && ca > 1.0) || (sb == 0.0 && cb > 1.0) {
+                            return Err(format!(
+                                "stale index statistics (selectivity 0 on a \
+                                 populated index; cardinalities {:.0}, {:.0}) - \
+                                 the engine's costing then depends on state \
+                                 this crate has not converted; SET STATISTICS \
+                                 makes it plannable",
+                                ca, cb
+                            ));
+                        }
+                        let loop_ab = loop_cost(ca, cb, sb); // A drives, index B
+                        let loop_ba = loop_cost(cb, ca, sa); // B drives, index A
+                        // avoidHashJoin (InnerJoin.cpp:217): a stream
+                        // that looks empty or single-rowed at prepare
+                        // time is never hashed - the engine distrusts
+                        // its own cardinality there
+                        let hash = if ca.min(cb) <= 1.0 {
+                            f64::INFINITY
+                        } else {
+                            hash_cost(
+                                ca.max(cb),
+                                ca.min(cb),
+                                if ca >= cb { sb } else { sa },
+                            )
+                        };
+                        if hash < loop_ab.min(loop_ba) {
+                            Some(JoinShape::Hash)
+                        } else if loop_ba < loop_ab {
+                            Some(JoinShape::Swap)
+                        } else {
+                            Some(JoinShape::SqlOrder)
+                        }
+                    }
+                    _ => None,
+                }
+            }
+        };
+        let shape = match costed {
+            Some(sh) => sh,
+            None => join_band(ca, cb)?,
+        };
+        match shape {
             JoinShape::SqlOrder => {}
             JoinShape::Swap => driver_order = vec![1, 0],
             JoinShape::Hash => {
@@ -1013,6 +1093,87 @@ pub fn cardinality(file: &[u8], page_size: usize, table: &str) -> Result<f64, St
     let record_size = SLOT + roundup(compressed + RHD_SIZE) + space_fudge;
     let est = data_pages as f64 * (page_size - DPG_SIZE) as f64 / record_size as f64;
     Ok(est.max(MINIMUM_CARDINALITY))
+}
+
+/// An index's stored SELECTIVITY - `RDB$INDICES.RDB$STATISTICS`,
+/// the number `SET STATISTICS` refreshes (1/distinct-keys). Zero
+/// means the statistics were never computed for the data now
+/// present: the engine keeps using it, which is why a stale index
+/// makes it plan differently.
+pub fn index_selectivity(
+    file: &[u8],
+    page_size: usize,
+    index: &str,
+) -> Result<f64, String> {
+    let rel = resolve_relation(file, page_size, "RDB$INDICES")
+        .ok_or("no RDB$INDICES")?;
+    let formats = system_relation_formats(file, page_size, "RDB$INDICES")
+        .ok_or("no RDB$INDICES format")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let cols = relation_columns(file, page_size, "RDB$INDICES");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let name_f = fid("RDB$INDEX_NAME").ok_or("no name column")?;
+    let stat_f = fid("RDB$STATISTICS").ok_or("no statistics column")?;
+    for dp_no in relation_data_pages(file, page_size, rel) {
+        let start = dp_no as usize * page_size;
+        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode)
+        else {
+            continue;
+        };
+        for r in dp.records() {
+            if !r.is_primary_record() {
+                continue;
+            }
+            let Some(image) = r.image() else { continue };
+            let values = decode_record(&image, descs);
+            let Some(Value::Text(n)) = values.get(name_f) else { continue };
+            if n.trim_end() != index {
+                continue;
+            }
+            return Ok(match values.get(stat_f) {
+                Some(Value::Double(d)) => *d,
+                Some(Value::Int(n)) => *n as f64,
+                Some(Value::Scaled(raw, sc)) => {
+                    *raw as f64 * 10f64.powi(*sc as i32)
+                }
+                _ => 0.0,
+            });
+        }
+    }
+    Ok(0.0)
+}
+
+/// The engine's cost arithmetic for joining `inner` behind `outer`
+/// (InnerJoin.cpp:192-236 with Retrieval.cpp:1147 and :384):
+///
+/// - the inner's INDEXED retrieval costs `DEFAULT_INDEX_COST` (3) for
+///   the index scan plus `selectivity * cardinality` for it, plus the
+///   same again for fetching the records it names;
+/// - a nested LOOP pays that once per outer row;
+/// - a HASH pays the inner's unfiltered retrieval, the hashing of
+///   `baseSelectivity * cardinality` rows at MEMCOPY + HASHING (0.5
+///   each), and per outer row a probe plus copies of the matches.
+///
+/// The engine takes the cheapest of {loop each way, hash}, and this
+/// reproduces its whole 6x6 decision grid once statistics are fresh.
+fn loop_cost(outer_card: f64, inner_card: f64, inner_sel: f64) -> f64 {
+    const DEFAULT_INDEX_COST: f64 = 3.0;
+    let retrieval = DEFAULT_INDEX_COST + 2.0 * inner_sel * inner_card;
+    retrieval * outer_card
+}
+
+fn hash_cost(outer_card: f64, inner_card: f64, inner_sel: f64) -> f64 {
+    const MEMCOPY: f64 = 0.5;
+    const HASHING: f64 = 0.5;
+    // the inner side is retrieved UNFILTERED for hashing: a full
+    // scan, whose cost is its cardinality, and whose selectivity is
+    // 1.0 (every row hashes)
+    let base_cost = inner_card;
+    let hash_cardinality = inner_card;
+    let current_cardinality = inner_card * inner_sel;
+    base_cost
+        + hash_cardinality * (MEMCOPY + HASHING)
+        + outer_card * (HASHING + current_cardinality * MEMCOPY)
 }
 
 /// The cardinality BANDS the engine's join decision turns on, mapped

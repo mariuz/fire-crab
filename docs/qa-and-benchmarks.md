@@ -4002,6 +4002,28 @@ equivalence class (D.Z = B.UID and A.ID = B.UID give D.Z = A.ID, and
 it drives from D). fcopt refuses that shape and the gate pins the
 refusal, so the frontier is documented rather than implied.
 
+Slice 7 closed the cost model, and the decisive move was an
+experiment rather than more code: running SET STATISTICS on every
+index and re-probing the grid changed EVERY cell. Slice 6's careful
+bands had not been the law at all - they were the engine's own
+formulas behaving on STALE statistics. With the statistics fresh, the
+formulas apply directly: an indexed retrieval costs 3 plus
+selectivity times cardinality for the scan and again for the records,
+a nested loop pays that per outer row, a hash pays the inner scan
+plus hashing plus per-row probing, the engine takes the cheapest of
+{loop either way, hash}, and avoidHashJoin removes hashing whenever a
+side looks empty or single-rowed at prepare time. That model is EXACT
+on all thirty-six cells - the diagonal's hashes, both swap
+directions, and the tie-break where an empty index looks cheaper than
+a one-row one.
+
+The stale case became a refusal with a remedy attached: a zero
+selectivity on a populated index means nobody computed statistics for
+the data present, the engine keeps costing with internal state this
+crate has not converted, and fcopt says so - naming SET STATISTICS as
+the fix. Gate phase 4 runs the same grid left stale and asserts 4
+exact, 32 refused, ZERO wrong.
+
 Slice 6 went into the cost model as far as the engine's own formulas
 allow. DPM_cardinality converted line for line - data pages, a
 first-page record sample, the exact-count rule for a single-page

@@ -13,6 +13,42 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-opt slice 7: the cost model closes, on fresh statistics
+
+### The experiment that cracked it
+- Slice 6 left a refusing band and a puzzle: the 6×6 grid's shape
+  looked arbitrary. Running `SET STATISTICS` on every index and
+  re-probing changed the WHOLE grid — and the new one is exactly what
+  the engine's formulas predict. The bands were never the law; they
+  were the formulas' behaviour on STALE statistics.
+
+### Converted
+- **Index selectivity from the catalog** (`RDB$INDICES.RDB$STATISTICS`
+  — the number `SET STATISTICS` refreshes, 1/distinct-keys).
+- **The cost arithmetic itself**: an indexed retrieval costs
+  `DEFAULT_INDEX_COST` (3) plus `selectivity × cardinality` for the
+  index scan and the same again for fetching the records
+  (Retrieval.cpp:1147 and :384); a nested loop pays that per outer
+  row (InnerJoin.cpp:192); a hash pays the inner's unfiltered scan,
+  the hashing at MEMCOPY + HASHING (0.5 each), and per outer row a
+  probe plus match copies (InnerJoin.cpp:229). The engine takes the
+  cheapest of {loop either way, hash} — and `avoidHashJoin`
+  (InnerJoin.cpp:217) removes the hash entirely when a side looks
+  empty or single-rowed at prepare time, because the engine
+  distrusts its own cardinality there.
+- **With fresh statistics the model is EXACT: all 36 grid cells**,
+  including the diagonal's hashes, both swap directions, and the
+  tie-break where an EMPTY index looks cheaper than a one-row one.
+
+### Guarded
+- A ZERO selectivity on a POPULATED index means the statistics were
+  never computed for the data present; the engine keeps costing with
+  internal state this crate has not converted, so fcopt refuses and
+  says so — `SET STATISTICS makes it plannable`. Gate phase 4 is the
+  same grid left stale: 4 exact, 32 refused, ZERO wrong. Gate:
+  `qa/opt-plans.sh` 67 → 68 checks across four databases; 281
+  workspace tests.
+
 ## 2026-07-29 — fire-crab-opt slice 6: the cost model, as far as the engine's own formulas take it
 
 ### Converted

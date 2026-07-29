@@ -568,6 +568,11 @@ them.
   the reference engine's own syntax error, another a model boundary
   (catalog-typed casts in a catalog-free compiler) - name those as
   what they are instead of forcing them.
+- **When a decision surface looks arbitrary, CHANGE AN INPUT you had
+  not thought of.** An optimizer grid made no sense until statistics
+  were refreshed - and then the reference's own formulas explained
+  every cell. The shape you cannot model may be the model running on
+  an input you did not know you were feeding it.
 - **Reproduce the reference's IMPRECISION, not the truth.** Its
   cardinality estimator samples one data page and extrapolates, so
   500 rows come out as 628 - and every cost decision is made on THAT

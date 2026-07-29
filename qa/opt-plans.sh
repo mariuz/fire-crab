@@ -240,6 +240,14 @@ rm -f "$DBG"
   echo "COMMIT;"
 } | "$ISQL" -q -b -user "$U" -pas "$P" >/dev/null 2>&1 || { echo "FAIL create grid"; exit 1; }
 
+# with FRESH statistics the cost model must be EXACT everywhere;
+# without them the crate must refuse rather than guess
+for n in 0 1 5 50 500 3000; do
+    "$ISQL" -q -b -user "$U" -pas "$P" "$DBG" >/dev/null 2>&1 <<SQL
+SET STATISTICS INDEX IDX_G$n;
+COMMIT;
+SQL
+done
 matched=0; refused=0; wrong=0
 for o in 0 1 5 50 500 3000; do
   for i in 0 1 5 50 500 3000; do
@@ -262,10 +270,61 @@ SQL
     fi
   done
 done
-if [ $wrong -eq 0 ]; then
-    echo "OK   cardinality grid: $matched of 36 cells planned exactly, $refused refused, ZERO wrong"
+if [ $wrong -eq 0 ] && [ $matched -eq 36 ]; then
+    echo "OK   cost grid (FRESH statistics): all 36 cells planned EXACTLY"
+elif [ $wrong -eq 0 ]; then
+    echo "DIFF cost grid: only $matched of 36 exact ($refused refused) - the cost model regressed"
+    fail=1
 else
-    echo "DIFF cardinality grid: $wrong cells planned WRONGLY"
+    echo "DIFF cost grid: $wrong cells planned WRONGLY"
+    fail=1
+fi
+
+# ======================================================================
+# PHASE 4: the same grid with STALE statistics - refuse, never guess
+# ======================================================================
+# The engine keeps costing with a zero selectivity (it does not
+# recompute silently), and its behaviour then depends on internal state
+# this crate has not converted. Every populated cell must REFUSE.
+DBS="$D/fc-optstale.fdb"
+rm -f "$DBS"
+{
+  echo "CREATE DATABASE '$DBS' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;"
+  for n in 0 1 5 50 500 3000; do
+      echo "CREATE TABLE G$n (V INTEGER); CREATE INDEX IDX_G$n ON G$n (V);"
+  done
+  echo "COMMIT;"
+  echo "SET TERM ^ ;"
+  for n in 1 5 50 500 3000; do
+      echo "EXECUTE BLOCK AS DECLARE I INTEGER; BEGIN I=0; WHILE (I<$n) DO BEGIN INSERT INTO G$n VALUES(:I); I=I+1; END END^"
+  done
+  echo "SET TERM ; ^"
+  echo "COMMIT;"
+} | "$ISQL" -q -b -user "$U" -pas "$P" >/dev/null 2>&1 || { echo "FAIL create stale"; exit 1; }
+swrong=0; srefused=0; smatched=0
+for o in 0 1 5 50 500 3000; do
+  for i in 0 1 5 50 500 3000; do
+    q="SELECT A.V FROM G$o A JOIN G$i B ON A.V = B.V"
+    eng=$("$ISQL" -q -user "$U" -pas "$P" "$DBS" 2>&1 <<SQL | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | head -1
+SET PLANONLY ON;
+$q;
+SQL
+)
+    got=$("$FCOPT" plan "$DBS" "$q" 2>&1)
+    if [ "$got" = "$eng" ]; then smatched=$((smatched + 1))
+    elif [ "${got:0:7}" = "REFUSED" ]; then srefused=$((srefused + 1))
+    else
+        echo "DIFF stale-grid cell ($o x $i)"
+        echo "     engine: $eng"
+        echo "     fcopt:  $got"
+        swrong=$((swrong + 1))
+    fi
+  done
+done
+if [ $swrong -eq 0 ]; then
+    echo "OK   stale-statistics grid: $smatched exact, $srefused refused, ZERO wrong"
+else
+    echo "DIFF stale-statistics grid: $swrong cells planned WRONGLY"
     fail=1
 fi
 
