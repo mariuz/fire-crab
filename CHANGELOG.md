@@ -13,6 +13,27 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-exe slice 11: simple CASE, cross-family casts, RANGE value bounds
+
+### Converted
+- **RANGE value bounds**: key arithmetic over the single sort key —
+  the frame is the contiguous run of rows whose key lies within
+  cur∓v along the traversal's own axis (PRECEDING subtracts along
+  it, FOLLOWING adds, DESC flips the sign). A NULL current key
+  frames its peer group alone, and NULL keys never qualify for a
+  value edge (their comparisons are UNKNOWN). Ascending, DESC and
+  CURRENT-to-FOLLOWING forms all hold against the engine.
+- **Cross-family casts**: int→text renders plain decimal; text→int
+  parses, a bad string raising the engine's conversion error. Width
+  and range violations error as before — never silent.
+- **The simple CASE** (`blr_decode`): an operand, counted condition
+  values, counted results with the extra one as ELSE; a NULL
+  operand matches nothing and takes the else (or NULL without one).
+
+### Guarded
+- GEN_ID and the built-in string functions (UPPER et al) are the
+  new named frontier. Gate: 92 → 98 checks. 261 workspace tests.
+
 ## 2026-07-29 — fire-crab-exe slice 10: frame extents
 
 ### Converted

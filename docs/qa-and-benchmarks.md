@@ -4136,6 +4136,21 @@ tails from CURRENT to UNBOUNDED, frames a LAST_VALUE - all
 engine-equal - and names what remains: RANGE with a value bound is
 key arithmetic, not row arithmetic, and refuses until converted.
 
+### Slice 11: the axis flips with the sort
+
+RANGE value bounds finished the frame story: where ROWS frames count
+positions, RANGE frames do arithmetic on the SORT KEY - and the
+subtlety is that PRECEDING and FOLLOWING move along the traversal's
+own axis, so a DESC window subtracts where an ASC one adds. NULL
+keys sit outside the arithmetic entirely: a NULL current key frames
+its peer group alone, and NULL rows never qualify for a value edge
+because their comparisons are UNKNOWN. The engine confirmed all
+three shapes - ascending, descending, and CURRENT-to-FOLLOWING.
+Cross-family casts and blr_decode (the simple CASE, where a NULL
+operand matches nothing) rounded out the slice, keeping the standing
+posture: render or parse exactly, error on anything lossy, never
+silently.
+
 ## Query surface: what the server answers, and what it refuses
 
 Everything below is verified by a differential gate under `qa/` — the

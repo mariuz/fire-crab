@@ -52,6 +52,7 @@ mod blr {
     pub const VALUE_IF: u8 = 105;
     pub const CAST: u8 = 131;
     pub const COALESCE: u8 = 202;
+    pub const DECODE: u8 = 203;
     pub const FIELD: u8 = 23;
     pub const FID: u8 = 24;
     pub const PARAMETER: u8 = 25;
@@ -174,6 +175,10 @@ pub enum Expr {
     Cast(MsgSlot, Box<Expr>),
     /// blr_coalesce: the first non-NULL of the counted operands
     Coalesce(Vec<Expr>),
+    /// blr_decode: the simple CASE - an operand, the counted
+    /// condition values, the counted results (one extra = ELSE);
+    /// a NULL operand matches nothing and takes the else
+    Decode(Box<Expr>, Vec<Expr>, Vec<Expr>),
     /// blr_value_if(cond, then, else) - the conditional value CASE
     /// compiles to (under a unifying cast)
     ValueIf(Box<Bool>, Box<Expr>, Box<Expr>),
@@ -574,6 +579,20 @@ impl<'a> P<'a> {
                     ops.push(self.expr()?);
                 }
                 Ok(Expr::Coalesce(ops))
+            }
+            blr::DECODE => {
+                let operand = Box::new(self.expr()?);
+                let n = self.u8()? as usize;
+                let mut conds = Vec::new();
+                for _ in 0..n {
+                    conds.push(self.expr()?);
+                }
+                let m = self.u8()? as usize;
+                let mut results = Vec::new();
+                for _ in 0..m {
+                    results.push(self.expr()?);
+                }
+                Ok(Expr::Decode(operand, conds, results))
             }
             blr::VALUE_IF => Ok(Expr::ValueIf(
                 Box::new(self.boolean()?),
@@ -1564,6 +1583,13 @@ impl<'a> Exec<'a> {
                     .unwrap()
                     + 1;
                 let part = &keyed[p_start..p_end];
+                // the first sort key per row and its direction - what
+                // RANGE value bounds do arithmetic over
+                let key0: Vec<Value> = part
+                    .iter()
+                    .map(|(_, sk, _)| sk.first().cloned().unwrap_or(Value::Null))
+                    .collect();
+                let dir0_desc = w.order.first().map(|k| k.desc).unwrap_or(false);
                 // peer-group bounds per row (whole partition when the
                 // window has no ORDER)
                 let mut peer_start = vec![0usize; part.len()];
@@ -1669,6 +1695,8 @@ impl<'a> Exec<'a> {
                                             part.len(),
                                             &peer_start,
                                             &peer_end_arr,
+                                            &key0,
+                                            dir0_desc,
                                             &rows[*ri].binding.clone(),
                                         )?;
                                         let v = if fs >= fe {
@@ -1728,6 +1756,8 @@ impl<'a> Exec<'a> {
                                     part.len(),
                                     &peer_start,
                                     &peer_end_arr,
+                                    &key0,
+                                    dir0_desc,
                                     &rows[*ri].binding.clone(),
                                 )?;
                                 let v = window_fold(*verb, &ops[fs..fe])?;
@@ -1779,6 +1809,8 @@ impl<'a> Exec<'a> {
         len: usize,
         peer_start: &[usize],
         peer_end: &[usize],
+        key0: &[Value],
+        dir0_desc: bool,
         binding: &[StreamFrame],
     ) -> Result<(usize, usize), String> {
         let Some(f) = frame else {
@@ -1813,10 +1845,78 @@ impl<'a> Exec<'a> {
             };
             Ok((fs.min(fe), fe))
         } else {
-            // RANGE: only the value-less bounds (peer semantics)
-            if f.start.value.is_some() || f.end.value.is_some() {
-                return Err("RANGE frame with a value bound unconverted".into());
+            // RANGE: value bounds are KEY arithmetic over the single
+            // sort key - the frame is the contiguous run of rows
+            // whose key lies within [cur - v, cur + v] on the
+            // traversal's own axis (PRECEDING subtracts along it,
+            // FOLLOWING adds; DESC flips the sign). A NULL current
+            // key frames its peer group alone.
+            let sv = bound_value(self, &f.start)?;
+            let ev = bound_value(self, &f.end)?;
+            if sv.is_some() || ev.is_some() {
+                let cur = &key0[j];
+                if matches!(cur, Value::Null) {
+                    return Ok((peer_start[j], peer_end[j]));
+                }
+                let cur_n =
+                    int_of(cur).ok_or("RANGE value bound over a non-integer key unconverted")?;
+                let sign = if dir0_desc { -1i64 } else { 1i64 };
+                // key-space edge for a bound: how far along the axis
+                let edge = |kind: u8, v: Option<usize>| -> Result<Option<i64>, String> {
+                    Ok(match (kind, v) {
+                        (0, Some(n)) => Some(cur_n - sign * n as i64),
+                        (1, Some(n)) => Some(cur_n + sign * n as i64),
+                        (2, _) => None, // peers
+                        (0, None) => None, // unbounded start
+                        (1, None) => None, // unbounded end
+                        _ => return Err("frame bound unconverted".into()),
+                    })
+                };
+                let lo = edge(f.start.kind, sv)?;
+                let hi = edge(f.end.kind, ev)?;
+                // frame edges on the traversal axis - NULL keys
+                // never qualify (their comparisons are UNKNOWN)
+                let ok_low = |k: &Value, e: i64| match int_of(k) {
+                    None => false,
+                    Some(n) => {
+                        if dir0_desc {
+                            n <= e
+                        } else {
+                            n >= e
+                        }
+                    }
+                };
+                let ok_high = |k: &Value, e: i64| match int_of(k) {
+                    None => false,
+                    Some(n) => {
+                        if dir0_desc {
+                            n >= e
+                        } else {
+                            n <= e
+                        }
+                    }
+                };
+                let fs = match (f.start.kind, lo) {
+                    (2, _) => peer_start[j],
+                    (0, None) => 0,
+                    (_, Some(e)) => {
+                        (0..len).find(|&k| ok_low(&key0[k], e)).unwrap_or(len)
+                    }
+                    _ => return Err("frame start bound unconverted".into()),
+                };
+                let fe = match (f.end.kind, hi) {
+                    (2, _) => peer_end[j],
+                    (1, None) => len,
+                    (_, Some(e)) => (0..len)
+                        .rev()
+                        .find(|&k| ok_high(&key0[k], e))
+                        .map(|k| k + 1)
+                        .unwrap_or(0),
+                    _ => return Err("frame end bound unconverted".into()),
+                };
+                return Ok((fs.min(fe), fe));
             }
+            // value-less bounds: peer semantics
             let fs = match f.start.kind {
                 0 => 0,
                 2 => peer_start[j],
@@ -2159,6 +2259,27 @@ impl<'a> Exec<'a> {
                 }
                 out
             }
+            Expr::Decode(operand, conds, results) => {
+                let ov = self.eval(operand)?;
+                let mut hit = None;
+                if !matches!(ov, Value::Null) {
+                    for (i, c) in conds.iter().enumerate() {
+                        if value_cmp(&ov, &self.eval(c)?)
+                            == Some(std::cmp::Ordering::Equal)
+                        {
+                            hit = Some(i);
+                            break;
+                        }
+                    }
+                }
+                match hit {
+                    Some(i) => self.eval(&results[i])?,
+                    None if results.len() > conds.len() => {
+                        self.eval(&results[conds.len()])?
+                    }
+                    None => Value::Null,
+                }
+            }
             Expr::ValueIf(cond, then, els) => {
                 // UNKNOWN takes the else branch, like the engine
                 if self.bool_eval(cond)? == Some(true) {
@@ -2174,7 +2295,16 @@ impl<'a> Exec<'a> {
                 }
                 match slot.dtype {
                     blr::DT_SHORT | blr::DT_LONG | blr::DT_INT64 => {
-                        let n = int_of(&v).ok_or("cast to integer from a non-integer value unconverted")?;
+                        // text parses (the engine's string-to-number
+                        // conversion; a bad string is its 22018)
+                        let n = match &v {
+                            Value::Text(t) => t
+                                .trim()
+                                .parse::<i64>()
+                                .map_err(|_| format!("conversion error from string \"{}\"", t.trim()))?,
+                            other => int_of(other)
+                                .ok_or("cast to integer unconverted for this value")?,
+                        };
                         let fits = match slot.dtype {
                             blr::DT_SHORT => i16::try_from(n).is_ok(),
                             blr::DT_LONG => i32::try_from(n).is_ok(),
@@ -2187,11 +2317,13 @@ impl<'a> Exec<'a> {
                     }
                     blr::DT_TEXT | blr::DT_TEXT2 | blr::DT_VARYING
                     | blr::DT_VARYING2 => {
+                        // integers render in plain decimal
                         let t = match v {
                             Value::Text(t) => t,
+                            Value::Int(n) => n.to_string(),
                             _ => {
                                 return Err(
-                                    "cast to text from a non-text value unconverted".into()
+                                    "cast to text unconverted for this value".into()
                                 )
                             }
                         };
