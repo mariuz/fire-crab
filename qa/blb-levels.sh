@@ -122,6 +122,7 @@ done
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || { echo "FAIL create W"; exit 1; }
 CREATE DATABASE '$DBW' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE W (C BLOB SUB_TYPE TEXT);
+CREATE TABLE S (C BLOB SUB_TYPE TEXT);
 COMMIT;
 EOF
 
@@ -253,6 +254,43 @@ PYEOF2
 else
     echo "SKIP wire phase (node or fcwire missing)"
 fi
+
+# ---------- phase D: STREAM blobs (fcblb writes, engine reads) --------
+# A stream blob (rhd_stream_blob) carries RAW content - no [u16 len]
+# frames - and arrives from the API's BPB, never from SQL, so the
+# ENGINE cannot be made to write one through isql: the differential
+# runs one way. The engine must still read every byte back, and the
+# unframed bytes must NOT be mistaken for frames (a segmented reader
+# over stream content answers garbage).
+for spec in "w-tiny.txt" "w-over0.txt" "w-mid.txt"; do
+    out=$("$FCBLB" write "$DBW" S C "$TMP/$spec" 0) || {
+        echo "DIFF stream write $spec refused: $out"; fail=1; continue; }
+    size=$(wc -c < "$TMP/$spec")
+    srow=$(( $(grep -c . /dev/null) + 0 ))
+    elen=$("$ISQL" -q -b -user "$U" -pas "$P" "$DBW" 2>&1 <<SQL | tr -d ' \n'
+SET HEADING OFF;
+SELECT OCTET_LENGTH(C) FROM S ORDER BY OCTET_LENGTH(C) ROWS 1 TO 1;
+SQL
+)
+    # read this row back by matching its length among S's rows
+    match=$("$ISQL" -q -b -user "$U" -pas "$P" "$DBW" 2>&1 <<SQL | tr -d ' \n'
+SET HEADING OFF;
+SELECT COUNT(*) FROM S WHERE OCTET_LENGTH(C) = $size;
+SQL
+)
+    head40=$(head -c 40 "$TMP/$spec")
+    ehead=$("$ISQL" -q -b -user "$U" -pas "$P" "$DBW" 2>&1 <<SQL | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$'
+SET HEADING OFF;
+SELECT CAST(SUBSTRING(C FROM 1 FOR 40) AS VARCHAR(40)) FROM S WHERE OCTET_LENGTH(C) = $size;
+SQL
+)
+    if [ "$match" = "1" ] && [ "$ehead" = "$head40" ]; then
+        echo "OK   $out <- stream $spec ($size bytes): the engine reads the UNFRAMED content"
+    else
+        echo "DIFF stream $spec: size=$size matched=$match head=[$ehead] want=[$head40]"
+        fail=1
+    fi
+done
 
 # structural validation by the engine's own tools
 v=$("$GFIX" -v -full -n -user "$U" -pas "$P" "$DBW" 2>&1 | tr -s ' \n' ' ')

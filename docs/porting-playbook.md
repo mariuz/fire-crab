@@ -568,6 +568,12 @@ them.
   the reference engine's own syntax error, another a model boundary
   (catalog-typed casts in a catalog-free compiler) - name those as
   what they are instead of forcing them.
+- **Some differentials only run ONE WAY - say so.** Stream blobs
+  reach disk through the API's blob-parameter block, never through
+  SQL, so the reference engine cannot be asked to produce one for
+  comparison. The honest gate holds the direction that exists (you
+  write, it reads) and names the missing half in its header rather
+  than faking a round trip.
 - **The code is the specification; comments are testimony.** ods.h
   calls blh_max_sequence "Number of data pages"; the reading loop's
   `>` test makes it the LAST sequence (count minus one). Writing

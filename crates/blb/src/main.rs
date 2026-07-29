@@ -10,7 +10,9 @@
 //!   fcblb write  <db> <table> <column> <content-file> <seg-size>
 //!        create a blob from the file's bytes (segments of the given
 //!        size), insert a record referencing it, print `RECNO <n>
-//!        LEVEL <l>` - for the engine to read back
+//!        LEVEL <l>` - for the engine to read back. A segment size
+//!        of 0 writes a STREAM blob (raw, unframed - the shape the
+//!        API's BPB requests and SQL cannot produce)
 //!
 //! Row indexes are positions in the committed-visibility scan, the
 //! same order a fresh table answers `SELECT` in.
@@ -106,9 +108,6 @@ fn run() -> Result<(), String> {
             let ps = fire_crab_ods::tra::page_size_of(&file).ok_or("bad page size")?;
             let content = std::fs::read(&args[5]).map_err(|e| e.to_string())?;
             let seg: usize = args[6].parse().map_err(|_| "bad segment size")?;
-            if seg == 0 {
-                return Err("segment size must be positive".into());
-            }
             let table = args[3].to_ascii_uppercase();
             let rel = resolve_relation(&file, ps, &table)
                 .ok_or_else(|| format!("no table {}", table))?;
@@ -125,11 +124,16 @@ fn run() -> Result<(), String> {
             let d = descs
                 .get(col.field_id as usize)
                 .ok_or("no descriptor for the column")?;
-            let segments: Vec<Vec<u8>> =
-                content.chunks(seg).map(|c| c.to_vec()).collect();
-            // sub_type 1 (TEXT), charset 4 (UTF8) - what an ascii
-            // comparison workload wants
-            let recno = create_blob(&mut file, ps, rel, &segments, 1, 4)?;
+            // seg == 0 asks for a STREAM blob: raw content, no frames
+            let recno = if seg == 0 {
+                fire_crab_blb::create_stream_blob(&mut file, ps, rel, &content, 1, 4)?
+            } else {
+                let segments: Vec<Vec<u8>> =
+                    content.chunks(seg).map(|c| c.to_vec()).collect();
+                // sub_type 1 (TEXT), charset 4 (UTF8) - what an ascii
+                // comparison workload wants
+                create_blob(&mut file, ps, rel, &segments, 1, 4)?
+            };
             let level = read_blob(&file, ps, rel, recno)?.header.level;
             // the referencing record: bid = u16 relation, u8 pad,
             // u8 recno-high, u32 recno-low (RecordNumber.h:63-71)

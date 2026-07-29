@@ -198,7 +198,20 @@ the careful-write matrix — fourteen writes with nine blob pages
 riding AHEAD of the data pages whose records name them, all fifteen
 prefixes engine-valid, the naive order breaking at twelve.
 
+## Slice 4: stream blobs
+
+`create_stream_blob` writes the unframed flavour: `rhd_stream_blob`
+set, content raw, `blh_count` 1 and `blh_max_segment` the whole
+length. The differential here runs ONE WAY by nature — stream blobs
+come from the API's BPB (`isc_bpb_type_stream`), and the probe
+confirmed SQL literal blobs store SEGMENTED, so the engine cannot
+be asked to write one through isql. What the gate CAN hold is the
+direction that exists, and it does: fire-crab writes stream blobs at
+levels 0 and 1, and the engine reads every byte back through
+OCTET_LENGTH and SUBSTRING — proving in particular that the
+unframed bytes are not mistaken for frames.
+
 ## Roadmap
 
-1. **Stream-blob creation** and the `isc_bpb` parameter surface
-   (requested type/charset transliteration).
+1. The `isc_bpb` parameter surface (requested type/charset
+   transliteration) — the last named item.

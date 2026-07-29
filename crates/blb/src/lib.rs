@@ -339,23 +339,74 @@ pub fn create_blob(
     sub_type: u16,
     charset: u8,
 ) -> Result<u64, String> {
+    create_blob_kind(file, page_size, relation, segments, sub_type, charset, false)
+}
+
+/// Create a STREAM blob (`rhd_stream_blob`): the content rides RAW -
+/// no `[u16 length]` frames at all - and `blh_count` is 1 with
+/// `blh_max_segment` the whole length, the shape the engine's own
+/// stream blobs carry (a stream blob is "one segment" by
+/// bookkeeping). Stream blobs arrive from the API's BPB
+/// (`isc_bpb_type_stream`), never from SQL literals, so the engine
+/// cannot be made to WRITE one through isql - the differential runs
+/// the other way: fire-crab writes, the engine reads.
+pub fn create_stream_blob(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    relation: u16,
+    content: &[u8],
+    sub_type: u16,
+    charset: u8,
+) -> Result<u64, String> {
+    create_blob_kind(
+        file,
+        page_size,
+        relation,
+        std::slice::from_ref(&content.to_vec()),
+        sub_type,
+        charset,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_blob_kind(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    relation: u16,
+    segments: &[Vec<u8>],
+    sub_type: u16,
+    charset: u8,
+    stream: bool,
+) -> Result<u64, String> {
     let payload: usize = segments.iter().map(|s| s.len()).sum();
     let max_segment = segments.iter().map(|s| s.len()).max().unwrap_or(0);
-    if max_segment > u16::MAX as usize {
+    if !stream && max_segment > u16::MAX as usize {
         return Err("blob segment longer than a u16 frame".into());
     }
-    // the framed stream: [u16 len][payload] per segment
+    // segmented: [u16 len][payload] per segment; stream: raw bytes
     let mut raw = Vec::with_capacity(payload + segments.len() * 2);
     for seg in segments {
-        raw.extend_from_slice(&(seg.len() as u16).to_le_bytes());
+        if !stream {
+            raw.extend_from_slice(&(seg.len() as u16).to_le_bytes());
+        }
         raw.extend_from_slice(seg);
     }
     let mut header = BlobHeader {
         lead_page: 0,
         max_sequence: 0,
-        max_segment: max_segment as u16,
-        flags: flags::BLOB,
-        count: segments.len() as u32,
+        // a stream blob counts as ONE segment of the whole length
+        max_segment: if stream {
+            payload.min(u16::MAX as usize) as u16
+        } else {
+            max_segment as u16
+        },
+        flags: if stream {
+            flags::BLOB | flags::STREAM
+        } else {
+            flags::BLOB
+        },
+        count: if stream { 1 } else { segments.len() as u32 },
         length: payload as u64,
         sub_type,
         charset,

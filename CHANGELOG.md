@@ -13,6 +13,30 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-blb slice 4: stream blobs, and a one-way differential
+
+### Converted
+- **Stream-blob creation** (`create_stream_blob`, `fcblb write ...
+  0`): content rides RAW — no `[u16 length]` frames at all — with
+  `rhd_stream_blob` set, `blh_count` 1 and `blh_max_segment` the
+  whole length (a stream blob is "one segment" by bookkeeping).
+  Level selection, page chunking and the record's bid are the
+  shared path; only the framing differs.
+- **A one-way differential, named as such.** Stream blobs arrive
+  from the API's BPB (`isc_bpb_type_stream`), never from SQL — the
+  probe confirmed the engine stores an SQL literal blob SEGMENTED
+  (stream flag 0), so the engine cannot be made to WRITE one
+  through isql. The gate therefore runs the direction that exists:
+  fire-crab writes, the ENGINE reads every byte back (25 B, 8500 B
+  and 120 KB, level 0 and level 1) — and the unframed content must
+  not be mistaken for frames, which a segmented reader would turn
+  into garbage. gfix and gbak still bless the file.
+
+### Guarded
+- The BPB parameter surface (requested type/charset
+  transliteration) remains the crate's only named item. Gate:
+  `qa/blb-levels.sh` 17 → 20 checks; blb-gc 5; 274 workspace tests.
+
 ## 2026-07-29 — fire-crab-exe slice 15: GEN_ID, with the persistence boundary drawn
 
 ### Converted
