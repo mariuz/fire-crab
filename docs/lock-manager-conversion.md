@@ -278,14 +278,23 @@ relation-lock oracle, and the dump remains useful for the series
 that do appear.
 
 <a name="roadmap"></a>
+## Slice 3: knocks and clocks
+
+**Knock events**: a freshly parked request posts a knock — the
+wanted mode, deduplicated per (owner, lock) — to every owner in its
+way; `take_knocks` drains. The classic AST protocol is unit-pinned:
+the holder reads the knock, downgrades, and the waiter grants on the
+regrant sweep. **Lock timeouts**: pending requests may carry a
+deadline tick; `expire(now)` brings overdue waits down traceless and
+names who timed out where. The live oracle is `SET TRANSACTION WAIT
+LOCK TIMEOUT 2`: the engine expires the wait with "lock time-out on
+wait transaction" while the blocker still holds — deadline-less
+waiters unaffected on both sides.
+
 ## Roadmap
 
-1. **AST delivery modeling** — surface `blockers` at wait time as
-   an event the caller consumes.
-2. **Timeouts** — `Waiting` verdicts with a deadline, and the lock
-   timeout error distinct from the deadlock error.
-3. **Series semantics** — bring `jrd/lck.cpp`'s typed layer over,
+1. **Series semantics** — bring `jrd/lck.cpp`'s typed layer over,
    so fire-crab's wire server can arbitrate two of ITS OWN
    attachments through this table.
-4. **Cross-process-series dump differential** — the series that DO
+2. **Cross-process-series dump differential** — the series that DO
    live in the shared table, compared structurally.

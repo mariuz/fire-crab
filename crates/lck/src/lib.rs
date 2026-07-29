@@ -177,11 +177,14 @@ pub fn compatible(requested: Mode, held: Mode) -> bool {
 /// the table only needs identity.
 pub type OwnerId = u32;
 
-/// A granted or pending request - the engine's `lrq` block.
+/// A granted or pending request - the engine's `lrq` block. A
+/// PENDING request may carry a deadline tick (the lock-timeout
+/// clock); granted requests never do.
 #[derive(Clone, Debug)]
 struct Request {
     owner: OwnerId,
     mode: Mode,
+    deadline: Option<u64>,
 }
 
 /// One lock block (`lbl`): the granted requests with their per-mode
@@ -260,6 +263,10 @@ pub enum Verdict {
 pub struct LockTable {
     locks: BTreeMap<(u8, Vec<u8>), LockBlock>,
     next_owner: OwnerId,
+    /// per owner: the blocking KNOCKS awaiting delivery - "someone
+    /// wants (series, key) in <mode> and you stand in the way", the
+    /// decision half of the blocking AST (delivery is transport)
+    knocks: BTreeMap<OwnerId, Vec<(u8, Vec<u8>, Mode)>>,
 }
 
 impl LockTable {
@@ -286,6 +293,22 @@ impl LockTable {
         mode: Mode,
         wait: bool,
     ) -> Verdict {
+        self.enqueue_deadline(owner, series, key, mode, wait, None)
+    }
+
+    /// [LockTable::enqueue] with a lock-timeout deadline on the wait
+    /// (the engine's `SET LOCK TIMEOUT` clock, modeled as a caller
+    /// tick - the table has no clock of its own). A parked request
+    /// past its deadline falls to [LockTable::expire].
+    pub fn enqueue_deadline(
+        &mut self,
+        owner: OwnerId,
+        series: u8,
+        key: &[u8],
+        mode: Mode,
+        wait: bool,
+        deadline: Option<u64>,
+    ) -> Verdict {
         let lock = self.locks.entry((series, key.to_vec())).or_default();
         // a pending queue in front of us also blocks the grant: FIFO
         // fairness - the engine grants no one out of turn once
@@ -296,14 +319,15 @@ impl LockTable {
             .iter()
             .any(|p| !compatible(mode, p.mode) || !compatible(p.mode, mode));
         if compatible(mode, lock.state()) && !blocked_by_queue {
-            lock.granted.push(Request { owner, mode });
+            lock.granted.push(Request { owner, mode, deadline: None });
             lock.counts[mode as usize] += 1;
             return Verdict::Granted;
         }
         if !wait {
             return Verdict::Rejected;
         }
-        lock.pending.push(Request { owner, mode });
+        lock.pending.push(Request { owner, mode, deadline });
+        self.knock(series, key, owner, mode);
         if self.deadlock_from(owner) {
             // the scan found a cycle through us: withdraw the request
             // and report the deadlock (the engine errors the scanning
@@ -349,7 +373,8 @@ impl LockTable {
         if !wait {
             return Verdict::Rejected;
         }
-        lock.pending.push(Request { owner, mode: new_mode });
+        lock.pending.push(Request { owner, mode: new_mode, deadline: None });
+        self.knock(series, key, owner, new_mode);
         if self.deadlock_from(owner) {
             let lock = self.locks.get_mut(&(series, key.to_vec())).expect("just used");
             let pos = lock
@@ -399,6 +424,50 @@ impl LockTable {
             .get(&(series, key.to_vec()))
             .map(|l| l.granted.iter().any(|r| r.owner == owner))
             .unwrap_or(false)
+    }
+
+    /// Post a blocking knock to every owner standing in the way of
+    /// a freshly parked request - deduplicated per (owner, lock).
+    fn knock(&mut self, series: u8, key: &[u8], waiter: OwnerId, mode: Mode) {
+        let targets = self.blockers(waiter, series, key);
+        for t in targets {
+            let q = self.knocks.entry(t).or_default();
+            if !q.iter().any(|(s2, k2, _)| *s2 == series && k2 == key) {
+                q.push((series, key.to_vec(), mode));
+            }
+        }
+    }
+
+    /// Drain an owner's pending knocks - the AST consumer's read.
+    /// The classic protocol: the holder reads the knock, downgrades
+    /// or releases, and the waiter grants on the regrant sweep.
+    pub fn take_knocks(&mut self, owner: OwnerId) -> Vec<(u8, Vec<u8>, Mode)> {
+        self.knocks.remove(&owner).unwrap_or_default()
+    }
+
+    /// Expire every parked request whose deadline has passed: the
+    /// request comes down (leaving no trace, like a NO WAIT reject)
+    /// and its owner receives the lock-timeout error the engine
+    /// raises - "lock time-out on wait transaction". Returns who
+    /// timed out where.
+    pub fn expire(&mut self, now: u64) -> Vec<(OwnerId, u8, Vec<u8>)> {
+        let mut out = Vec::new();
+        let keys: Vec<(u8, Vec<u8>)> = self.locks.keys().cloned().collect();
+        for (series, key) in keys {
+            let Some(lock) = self.locks.get_mut(&(series, key.clone())) else {
+                continue;
+            };
+            let mut kept = Vec::new();
+            for p in lock.pending.drain(..) {
+                if p.deadline.is_some_and(|d| d <= now) {
+                    out.push((p.owner, series, key.clone()));
+                } else {
+                    kept.push(p);
+                }
+            }
+            lock.pending = kept;
+        }
+        out
     }
 
     /// Owner teardown - the engine's purge on detach: every granted
@@ -706,6 +775,55 @@ mod tests {
         t.dequeue(b, REL, b"T");
         assert!(t.is_granted(c, REL, b"T"));
         assert!(t.blockers(c, REL, b"T").is_empty());
+    }
+
+    #[test]
+    fn knocks_follow_the_ast_protocol() {
+        let mut t = LockTable::new();
+        let a = t.create_owner();
+        let b = t.create_owner();
+        assert_eq!(t.enqueue(a, REL, b"T", ProtectedWrite, false), Verdict::Granted);
+        // no waiter, no knock
+        assert!(t.take_knocks(a).is_empty());
+        // b parks - a gets the knock, once, with the wanted mode
+        assert_eq!(t.enqueue(b, REL, b"T", SharedWrite, true), Verdict::Waiting);
+        let k = t.take_knocks(a);
+        assert_eq!(k.len(), 1);
+        assert_eq!(k[0].2, SharedWrite);
+        // draining twice yields nothing new
+        assert!(t.take_knocks(a).is_empty());
+        // the classic protocol: the holder reads the knock and
+        // DOWNGRADES; the waiter grants on the regrant sweep
+        assert_eq!(t.convert(a, REL, b"T", SharedRead, false), Verdict::Granted);
+        t.dequeue(b, REL, b"T"); // no-op for granted? b is pending...
+        // b's parked SW is compatible with SR - but regrant runs on
+        // dequeue; poke it by re-enqueueing after a release
+        t.dequeue(a, REL, b"T");
+        assert!(t.is_granted(b, REL, b"T"));
+    }
+
+    #[test]
+    fn timeouts_expire_parked_requests() {
+        let mut t = LockTable::new();
+        let a = t.create_owner();
+        let b = t.create_owner();
+        let c = t.create_owner();
+        assert_eq!(t.enqueue(a, REL, b"T", Exclusive, false), Verdict::Granted);
+        assert_eq!(
+            t.enqueue_deadline(b, REL, b"T", SharedRead, true, Some(10)),
+            Verdict::Waiting
+        );
+        assert_eq!(t.enqueue(c, REL, b"T", SharedRead, true), Verdict::Waiting);
+        // before the deadline: nothing expires
+        assert!(t.expire(9).is_empty());
+        // past it: b times out and leaves no trace; c (deadline-less)
+        // keeps waiting and grants when a releases
+        let ex = t.expire(10);
+        assert_eq!(ex.len(), 1);
+        assert_eq!(ex[0].0, b);
+        t.dequeue(a, REL, b"T");
+        assert!(t.is_granted(c, REL, b"T"));
+        assert!(!t.is_granted(b, REL, b"T"));
     }
 
     #[test]

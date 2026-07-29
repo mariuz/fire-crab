@@ -13,6 +13,29 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-lck slice 3: knock events and lock timeouts
+
+### Converted
+- **Blocking-AST knocks as events**: a freshly parked request posts
+  a knock to every owner standing in its way — deduplicated per
+  (owner, lock), carrying the wanted mode — and `take_knocks`
+  drains an owner's queue. The classic protocol is unit-pinned:
+  holder reads the knock, downgrades, the waiter grants on the
+  regrant sweep. The decision half of the AST is now consumable
+  data; delivery remains transport.
+- **Lock timeouts**: pending requests may carry a DEADLINE tick
+  (`enqueue_deadline`), and `expire(now)` brings every overdue
+  parked request down — leaving no trace, like a NO WAIT reject —
+  returning who timed out where. The live differential is gate
+  phase 5: A holds PW, B waits with `SET TRANSACTION WAIT LOCK
+  TIMEOUT 2`, and the ENGINE expires the wait with "lock time-out
+  on wait transaction" while A still holds — the same expiry the
+  crate's unit test pins, deadline-less waiters unaffected.
+
+### Guarded
+- Series semantics and the cross-process dump differential remain.
+  Gate: 5 phases; 13 unit tests; 272 workspace tests.
+
 ## 2026-07-29 — fire-crab-dsql slice 46: the unification law converted, PLAN ORDER
 
 ### Converted

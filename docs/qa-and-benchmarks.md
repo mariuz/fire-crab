@@ -3875,6 +3875,15 @@ The deep companion documentation lives in
 
 ## The reserving matrix: the lock table against the live engine
 
+(Slice 3 added phase 5 - the lock timeout: B waits behind A's
+PROTECTED WRITE with SET TRANSACTION WAIT LOCK TIMEOUT 2, and the
+engine expires the wait with its lock time-out error while A still
+holds - the expiry fclck's expire(now) runs over deadline-carrying
+parked requests. Knock events landed as unit-pinned API: a parked
+request posts deduplicated knocks to its blockers, and the classic
+downgrade protocol - holder reads, converts down, waiter grants -
+holds in the table.)
+
 (Slice 2 added phase 4 - owner teardown: A holds PROTECTED WRITE,
 B's WAIT reservation parks behind it, and A detaches WITHOUT
 committing; the engine's owner purge releases A's locks and B

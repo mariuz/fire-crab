@@ -185,4 +185,33 @@ else
     fail=1
 fi
 
+# --- phase 5: the lock timeout ----------------------------------------
+# A holds PW; B waits WITH A DEADLINE (SET TRANSACTION WAIT LOCK
+# TIMEOUT 2) - the engine expires the wait with "lock time-out on
+# wait transaction" while A still holds, the same expiry
+# fclck's expire(now) runs over deadline-carrying parked requests
+# (pinned by its timeouts_expire_parked_requests unit test)
+mkfifo "$FIFO"
+"$ISQL" -q -user "$U" -pas "$P" "localhost:$DB" < "$FIFO" > "$D/lck-a.log" 2>&1 &
+apid=$!
+exec 9>"$FIFO"
+echo "SET TRANSACTION RESERVING T FOR PROTECTED WRITE;" >&9
+sleep 1
+out=$(timeout 20 "$ISQL" -q -user "$U" -pas "$P" "localhost:$DB" 2>&1 <<'SQL' | tr -s ' 
+' ' '
+SET TRANSACTION WAIT LOCK TIMEOUT 2 RESERVING T FOR PROTECTED WRITE;
+COMMIT;
+SQL
+)
+echo "COMMIT;" >&9; echo "EXIT;" >&9
+exec 9>&-
+wait $apid 2>/dev/null
+rm -f "$FIFO"
+case "$out" in
+    *"time-out"*|*"timeout"*)
+        echo "OK   the engine expires the deadlined wait: lock time-out while A holds" ;;
+    *)
+        echo "DIFF no lock timeout: [$out]"; fail=1 ;;
+esac
+
 exit $fail
