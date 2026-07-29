@@ -103,6 +103,14 @@ mod blr {
     pub const WINDOW: u8 = 195;
     pub const PARTITION_BY: u8 = 196;
     pub const AGG_FUNCTION: u8 = 199;
+    pub const WINDOW_WIN: u8 = 211;
+    // blr_window_win subcodes
+    pub const WW_PARTITION: u8 = 1;
+    pub const WW_ORDER: u8 = 2;
+    pub const WW_MAP: u8 = 3;
+    pub const WW_EXTENT_UNIT: u8 = 4;
+    pub const WW_FRAME_BOUND: u8 = 5;
+    pub const WW_FRAME_VALUE: u8 = 6;
     pub const ANSI_ALL: u8 = 158;
     pub const DERIVED_EXPR: u8 = 191;
     pub const SEQUENTIAL: u8 = 142;
@@ -270,15 +278,34 @@ pub enum WinItem {
     Value(Expr),
 }
 
+/// One frame bound: 0 = PRECEDING, 1 = FOLLOWING, 2 = CURRENT ROW;
+/// a PRECEDING/FOLLOWING bound without a value is UNBOUNDED.
+#[derive(Clone, Debug)]
+pub struct FrameBound {
+    pub kind: u8,
+    pub value: Option<Expr>,
+}
+
+/// A v4 frame extent: the unit (0 = RANGE, 1 = ROWS) and the two
+/// bounds (a missing second bound means CURRENT ROW).
+#[derive(Clone, Debug)]
+pub struct Frame {
+    pub unit: u8,
+    pub start: FrameBound,
+    pub end: FrameBound,
+}
+
 /// One window of a blr_window stream: its context, partition keys,
-/// ORDER keys and map. The remap fids after the partition keys are
-/// bookkeeping (they name the keys' own map slots) and parse away.
+/// ORDER keys, map and optional v4 frame. The remap fids after the
+/// partition keys are bookkeeping (they name the keys' own map
+/// slots) and parse away.
 #[derive(Clone, Debug)]
 pub struct Win {
     pub context: u8,
     pub partition: Vec<Expr>,
     pub order: Vec<SortKey>,
     pub map: Vec<(u16, WinItem)>,
+    pub frame: Option<Frame>,
 }
 
 /// The stream slot of an rse: a plain relation scan, an aggregate
@@ -415,6 +442,55 @@ impl<'a> P<'a> {
             }
             other => return Err(format!("message dtype {} unconverted", other)),
         })
+    }
+
+    /// A window map: u16 count, then (u16 slot, item) - items are
+    /// aggregate verbs, blr_agg_function names, or passthroughs.
+    fn win_map(&mut self) -> Result<Vec<(u16, WinItem)>, String> {
+        let mn = self.u16()? as usize;
+        let mut map = Vec::new();
+        for _ in 0..mn {
+            let slot = self.u16()?;
+            let item = match self.b.get(self.i) {
+                Some(&blr::AGG_COUNT) => {
+                    self.i += 1;
+                    WinItem::Agg(blr::AGG_COUNT, None)
+                }
+                Some(&v @ (blr::AGG_MAX | blr::AGG_MIN | blr::AGG_TOTAL
+                    | blr::AGG_AVERAGE | blr::AGG_COUNT2)) => {
+                    self.i += 1;
+                    WinItem::Agg(v, Some(self.expr()?))
+                }
+                Some(&blr::AGG_FUNCTION) => {
+                    self.i += 1;
+                    let name = self.counted_name()?;
+                    let argc = self.u8()? as usize;
+                    let mut args = Vec::new();
+                    for _ in 0..argc {
+                        args.push(self.expr()?);
+                    }
+                    WinItem::Fn(name, args)
+                }
+                _ => WinItem::Value(self.expr()?),
+            };
+            map.push((slot, item));
+        }
+        Ok(map)
+    }
+
+    /// A sort-key list: count byte + direction-tagged expressions.
+    fn sort_keys(&mut self) -> Result<Vec<SortKey>, String> {
+        let sn = self.u8()? as usize;
+        let mut order = Vec::new();
+        for _ in 0..sn {
+            let desc = match self.u8()? {
+                blr::ASCENDING => false,
+                blr::DESCENDING => true,
+                other => return Err(format!("sort direction {} unconverted", other)),
+            };
+            order.push(SortKey { expr: self.expr()?, desc });
+        }
+        Ok(order)
     }
 
     /// One blr_rs_stream node: stream count, the sources (relations
@@ -652,67 +728,107 @@ impl<'a> P<'a> {
                 let n = self.u8()? as usize;
                 let mut windows = Vec::new();
                 for _ in 0..n {
-                    if self.u8()? != blr::PARTITION_BY {
-                        return Err("window without blr_partition_by unconverted".into());
-                    }
-                    let context = self.u8()?;
-                    let pn = self.u8()? as usize;
-                    let mut partition = Vec::new();
-                    for _ in 0..pn {
-                        partition.push(self.expr()?);
-                    }
-                    // the remap fids: one per key, naming the key's
-                    // own slot in this window's map - bookkeeping
-                    for _ in 0..pn {
-                        let _ = self.expr()?;
-                    }
-                    if self.u8()? != blr::SORT {
-                        return Err("window without a sort clause unconverted".into());
-                    }
-                    let sn = self.u8()? as usize;
-                    let mut order = Vec::new();
-                    for _ in 0..sn {
-                        let desc = match self.u8()? {
-                            blr::ASCENDING => false,
-                            blr::DESCENDING => true,
-                            other => {
-                                return Err(format!("sort direction {} unconverted", other))
+                    match self.u8()? {
+                        // the v3 window: ctx, partition keys + remap
+                        // fids, sort, map - no frame
+                        blr::PARTITION_BY => {
+                            let context = self.u8()?;
+                            let pn = self.u8()? as usize;
+                            let mut partition = Vec::new();
+                            for _ in 0..pn {
+                                partition.push(self.expr()?);
                             }
-                        };
-                        order.push(SortKey { expr: self.expr()?, desc });
-                    }
-                    if self.u8()? != blr::MAP {
-                        return Err("window without blr_map unconverted".into());
-                    }
-                    let mn = self.u16()? as usize;
-                    let mut map = Vec::new();
-                    for _ in 0..mn {
-                        let slot = self.u16()?;
-                        let item = match self.b.get(self.i) {
-                            Some(&blr::AGG_COUNT) => {
-                                self.i += 1;
-                                WinItem::Agg(blr::AGG_COUNT, None)
+                            for _ in 0..pn {
+                                let _ = self.expr()?; // remap fids
                             }
-                            Some(&v @ (blr::AGG_MAX | blr::AGG_MIN | blr::AGG_TOTAL
-                                | blr::AGG_AVERAGE | blr::AGG_COUNT2)) => {
-                                self.i += 1;
-                                WinItem::Agg(v, Some(self.expr()?))
+                            if self.u8()? != blr::SORT {
+                                return Err("window without a sort clause unconverted".into());
                             }
-                            Some(&blr::AGG_FUNCTION) => {
-                                self.i += 1;
-                                let name = self.counted_name()?;
-                                let argc = self.u8()? as usize;
-                                let mut args = Vec::new();
-                                for _ in 0..argc {
-                                    args.push(self.expr()?);
+                            let order = self.sort_keys()?;
+                            if self.u8()? != blr::MAP {
+                                return Err("window without blr_map unconverted".into());
+                            }
+                            let map = self.win_map()?;
+                            windows.push(Win {
+                                context,
+                                partition,
+                                order,
+                                map,
+                                frame: None,
+                            });
+                        }
+                        // the v4 framed window: subcoded clauses with
+                        // its OWN blr_end
+                        blr::WINDOW_WIN => {
+                            let context = self.u8()?;
+                            let mut partition = Vec::new();
+                            let mut order = Vec::new();
+                            let mut map = Vec::new();
+                            let mut unit = 0u8;
+                            let mut start: Option<FrameBound> = None;
+                            let mut end: Option<FrameBound> = None;
+                            loop {
+                                match self.u8()? {
+                                    blr::WW_PARTITION => {
+                                        let pn = self.u8()? as usize;
+                                        for _ in 0..pn {
+                                            partition.push(self.expr()?);
+                                        }
+                                        for _ in 0..pn {
+                                            let _ = self.expr()?;
+                                        }
+                                    }
+                                    blr::WW_ORDER => order = self.sort_keys()?,
+                                    blr::WW_MAP => map = self.win_map()?,
+                                    blr::WW_EXTENT_UNIT => unit = self.u8()?,
+                                    blr::WW_FRAME_BOUND => {
+                                        let which = self.u8()?;
+                                        let kind = self.u8()?;
+                                        let b = FrameBound { kind, value: None };
+                                        if which == 1 {
+                                            start = Some(b);
+                                        } else {
+                                            end = Some(b);
+                                        }
+                                    }
+                                    blr::WW_FRAME_VALUE => {
+                                        let which = self.u8()?;
+                                        let v = self.expr()?;
+                                        let slot = if which == 1 { &mut start } else { &mut end };
+                                        match slot {
+                                            Some(b) => b.value = Some(v),
+                                            None => {
+                                                return Err(
+                                                    "frame value before its bound".into()
+                                                )
+                                            }
+                                        }
+                                    }
+                                    blr::END => break,
+                                    other => {
+                                        return Err(format!(
+                                            "window subcode {} unconverted",
+                                            other
+                                        ))
+                                    }
                                 }
-                                WinItem::Fn(name, args)
                             }
-                            _ => WinItem::Value(self.expr()?),
-                        };
-                        map.push((slot, item));
+                            let start = start.ok_or("framed window without a start bound")?;
+                            // a single bound implies CURRENT ROW as
+                            // the second (the dsql-probed law)
+                            let end = end.unwrap_or(FrameBound { kind: 2, value: None });
+                            windows.push(Win {
+                                context,
+                                partition,
+                                order,
+                                map,
+                                frame: Some(Frame { unit, start, end }),
+                            });
+                        }
+                        other => {
+                            return Err(format!("window verb {} unconverted", other))
+                        }
                     }
-                    windows.push(Win { context, partition, order, map });
                 }
                 if self.u8()? != blr::END {
                     return Err("window does not close with blr_end".into());
@@ -1448,6 +1564,27 @@ impl<'a> Exec<'a> {
                     .unwrap()
                     + 1;
                 let part = &keyed[p_start..p_end];
+                // peer-group bounds per row (whole partition when the
+                // window has no ORDER)
+                let mut peer_start = vec![0usize; part.len()];
+                let mut peer_end_arr = vec![part.len(); part.len()];
+                if !w.order.is_empty() {
+                    let mut j = 0usize;
+                    while j < part.len() {
+                        let pe = (j..part.len())
+                            .take_while(|&k| {
+                                part[k].1.iter().zip(&part[j].1).all(|(a, b)| group_eq(a, b))
+                            })
+                            .last()
+                            .unwrap()
+                            + 1;
+                        for k in j..pe {
+                            peer_start[k] = j;
+                            peer_end_arr[k] = pe;
+                        }
+                        j = pe;
+                    }
+                }
                 for (slot, item) in &w.map {
                     match item {
                         WinItem::Value(e) => {
@@ -1468,34 +1605,13 @@ impl<'a> Exec<'a> {
                                     )?);
                                 }
                             }
-                            // frame end per row: the current row's
-                            // peer group's end (the default RANGE
-                            // frame); the whole partition when the
-                            // window has no ORDER
-                            let mut frame_end = vec![part.len(); part.len()];
-                            if !w.order.is_empty() {
-                                let mut j = 0usize;
-                                while j < part.len() {
-                                    let peer_end = (j..part.len())
-                                        .take_while(|&k| {
-                                            part[k].1.iter().zip(&part[j].1).all(|(a, b)| group_eq(a, b))
-                                        })
-                                        .last()
-                                        .unwrap()
-                                        + 1;
-                                    for fe in frame_end[j..peer_end].iter_mut() {
-                                        *fe = peer_end;
-                                    }
-                                    j = peer_end;
-                                }
-                            }
                             match name.as_str() {
                                 "ROW_NUMBER" | "RANK" | "DENSE_RANK" => {
                                     let mut rank = 0usize;
                                     let mut dense = 0usize;
                                     let mut j = 0usize;
                                     while j < part.len() {
-                                        let peer_end = frame_end[j].max(j + 1);
+                                        let peer_end = peer_end_arr[j].max(j + 1);
                                         dense += 1;
                                         for (pos, (_, _, ri)) in
                                             part[j..peer_end].iter().enumerate()
@@ -1544,32 +1660,44 @@ impl<'a> Exec<'a> {
                                 // GROUP (the default frame's famous
                                 // trap), or the nth if the frame
                                 // reaches it
-                                "FIRST_VALUE" => {
-                                    for (_, _, ri) in part {
-                                        slot_rows[*ri][*slot as usize] = vals[0].clone();
-                                    }
-                                }
-                                "LAST_VALUE" => {
+                                "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {
                                     for (j, (_, _, ri)) in part.iter().enumerate() {
-                                        slot_rows[*ri][*slot as usize] =
-                                            vals[frame_end[j] - 1].clone();
-                                    }
-                                }
-                                "NTH_VALUE" => {
-                                    for (j, (_, _, ri)) in part.iter().enumerate() {
-                                        let n = match self.with_binding(
+                                        let (fs, fe) = self.frame_span(
+                                            &w.frame,
+                                            !w.order.is_empty(),
+                                            j,
+                                            part.len(),
+                                            &peer_start,
+                                            &peer_end_arr,
                                             &rows[*ri].binding.clone(),
-                                            |ex| ex.eval(&args[1]),
-                                        )? {
-                                            Value::Int(n) if n >= 1 => n as usize,
-                                            _ => return Err("bad NTH_VALUE index".into()),
+                                        )?;
+                                        let v = if fs >= fe {
+                                            Value::Null
+                                        } else {
+                                            match name.as_str() {
+                                                "FIRST_VALUE" => vals[fs].clone(),
+                                                "LAST_VALUE" => vals[fe - 1].clone(),
+                                                _ => {
+                                                    let n = match self.with_binding(
+                                                        &rows[*ri].binding.clone(),
+                                                        |ex| ex.eval(&args[1]),
+                                                    )? {
+                                                        Value::Int(n) if n >= 1 => n as usize,
+                                                        _ => {
+                                                            return Err(
+                                                                "bad NTH_VALUE index".into()
+                                                            )
+                                                        }
+                                                    };
+                                                    if fs + n <= fe {
+                                                        vals[fs + n - 1].clone()
+                                                    } else {
+                                                        Value::Null
+                                                    }
+                                                }
+                                            }
                                         };
-                                        slot_rows[*ri][*slot as usize] =
-                                            if n <= frame_end[j] {
-                                                vals[n - 1].clone()
-                                            } else {
-                                                Value::Null
-                                            };
+                                        slot_rows[*ri][*slot as usize] = v;
                                     }
                                 }
                                 other => {
@@ -1592,30 +1720,18 @@ impl<'a> Exec<'a> {
                                     )?),
                                 });
                             }
-                            if w.order.is_empty() {
-                                // whole-partition value, same for all
-                                let v = window_fold(*verb, &ops)?;
-                                for (_, _, ri) in part {
-                                    slot_rows[*ri][*slot as usize] = v.clone();
-                                }
-                            } else {
-                                // the RANGE frame: unbounded preceding
-                                // through the CURRENT ROW'S PEERS
-                                let mut j = 0usize;
-                                while j < part.len() {
-                                    let peer_end = (j..part.len())
-                                        .take_while(|&k| {
-                                            part[k].1.iter().zip(&part[j].1).all(|(a, b)| group_eq(a, b))
-                                        })
-                                        .last()
-                                        .unwrap()
-                                        + 1;
-                                    let v = window_fold(*verb, &ops[..peer_end])?;
-                                    for (_, _, ri) in &part[j..peer_end] {
-                                        slot_rows[*ri][*slot as usize] = v.clone();
-                                    }
-                                    j = peer_end;
-                                }
+                            for (j, (_, _, ri)) in part.iter().enumerate() {
+                                let (fs, fe) = self.frame_span(
+                                    &w.frame,
+                                    !w.order.is_empty(),
+                                    j,
+                                    part.len(),
+                                    &peer_start,
+                                    &peer_end_arr,
+                                    &rows[*ri].binding.clone(),
+                                )?;
+                                let v = window_fold(*verb, &ops[fs..fe])?;
+                                slot_rows[*ri][*slot as usize] = v;
                             }
                         }
                     }
@@ -1647,6 +1763,72 @@ impl<'a> Exec<'a> {
                 b
             })
             .collect())
+    }
+
+    /// One row's frame as a half-open span over its partition. The
+    /// default (no frame) is the whole partition without ORDER and
+    /// RANGE UNBOUNDED PRECEDING..CURRENT ROW (through the peers)
+    /// with it. ROWS frames offset by row position; RANGE bounds
+    /// with VALUES are unconverted (the key-arithmetic form).
+    #[allow(clippy::too_many_arguments)]
+    fn frame_span(
+        &mut self,
+        frame: &Option<Frame>,
+        has_order: bool,
+        j: usize,
+        len: usize,
+        peer_start: &[usize],
+        peer_end: &[usize],
+        binding: &[StreamFrame],
+    ) -> Result<(usize, usize), String> {
+        let Some(f) = frame else {
+            return Ok(if has_order { (0, peer_end[j]) } else { (0, len) });
+        };
+        let bound_value = |ex: &mut Self, b: &FrameBound| -> Result<Option<usize>, String> {
+            match &b.value {
+                None => Ok(None),
+                Some(e) => match ex.with_binding(binding, |ex| ex.eval(e))? {
+                    Value::Int(n) if n >= 0 => Ok(Some(n as usize)),
+                    _ => Err("bad frame bound value".into()),
+                },
+            }
+        };
+        if f.unit == 1 {
+            // ROWS: position arithmetic
+            let sv = bound_value(self, &f.start)?;
+            let fs = match (f.start.kind, sv) {
+                (0, Some(v)) => j.saturating_sub(v),
+                (0, None) => 0,
+                (2, _) => j,
+                (1, Some(v)) => (j + v).min(len),
+                _ => return Err("frame start bound unconverted".into()),
+            };
+            let ev = bound_value(self, &f.end)?;
+            let fe = match (f.end.kind, ev) {
+                (0, Some(v)) => (j + 1).saturating_sub(v),
+                (2, _) => j + 1,
+                (1, Some(v)) => (j + 1 + v).min(len),
+                (1, None) => len,
+                _ => return Err("frame end bound unconverted".into()),
+            };
+            Ok((fs.min(fe), fe))
+        } else {
+            // RANGE: only the value-less bounds (peer semantics)
+            if f.start.value.is_some() || f.end.value.is_some() {
+                return Err("RANGE frame with a value bound unconverted".into());
+            }
+            let fs = match f.start.kind {
+                0 => 0,
+                2 => peer_start[j],
+                _ => return Err("frame start bound unconverted".into()),
+            };
+            let fe = match f.end.kind {
+                2 => peer_end[j],
+                1 => len,
+                _ => return Err("frame end bound unconverted".into()),
+            };
+            Ok((fs.min(fe), fe))
+        }
     }
 
     /// One join source's bindings: a relation scans, a nested join

@@ -13,6 +13,32 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-exe slice 10: frame extents
+
+### Converted
+- **The v4 framed window** (`blr_window_win`): subcoded clauses —
+  partition (the v3 layout under a tag), order, map, extent unit
+  (RANGE 0 / ROWS 1), frame bounds (preceding 0 / following 1 /
+  current row 2, values optional) — closing with its OWN `blr_end`
+  where the v3 window leans on the rse's; a single bound implies
+  CURRENT ROW as the second, the dsql-probed law read back. Both
+  generations mix freely in one statement, and parse through one
+  shared map/sort-key reader.
+- **Execution**: every fold and every valued function now runs over
+  a per-row FRAME SPAN — the default reproduces slice 8's peer
+  semantics exactly (no order: the partition; order: unbounded
+  through the current peers), ROWS frames offset by row position,
+  and RANGE keeps its value-less peer forms. Sliding sums (`ROWS
+  BETWEEN 1 PRECEDING AND CURRENT ROW` walking through a NULL),
+  lookahead sums, CURRENT-to-UNBOUNDED tails, a framed LAST_VALUE
+  and an explicit RANGE UNBOUNDED..CURRENT all hold against the
+  engine row for row.
+
+### Guarded
+- RANGE frames with VALUE bounds (the key-arithmetic form) and
+  cross-family casts remain named. Gate: 86 → 92 checks. 261
+  workspace tests.
+
 ## 2026-07-29 — fire-crab-exe slice 9: conditionals and the valued window functions
 
 ### Converted

@@ -4120,6 +4120,22 @@ peers. The gate holds FIRST_VALUE and LAST_VALUE side by side over
 a column with duplicate sort keys, and the engine's answers match
 row for row.
 
+### Slice 10: one span to rule the folds
+
+Frame extents refactored the window executor around a single idea:
+every aggregate fold and every valued function reads a per-row FRAME
+SPAN - a half-open range over the sorted partition - and everything
+else is how that span is computed. The default span reproduces the
+peer semantics slice 8 hardcoded (whole partition without ORDER,
+unbounded-through-peers with it); ROWS frames are position
+arithmetic; RANGE keeps its value-less forms. The v4 blr_window_win
+parse carries the dsql-probed laws back into the reader: subcoded
+clauses, its own end, and a single bound implying CURRENT ROW. The
+gate walks a sliding sum through a NULL row, looks ahead one row,
+tails from CURRENT to UNBOUNDED, frames a LAST_VALUE - all
+engine-equal - and names what remains: RANGE with a value bound is
+key arithmetic, not row arithmetic, and refuses until converted.
+
 ## Query surface: what the server answers, and what it refuses
 
 Everything below is verified by a differential gate under `qa/` — the
