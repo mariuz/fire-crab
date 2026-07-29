@@ -3944,6 +3944,35 @@ aggregate-soundness argument, FIFO fairness, and the roadmap through
 lock data, ASTs, timeouts, owner teardown and the fb_lock_print
 differential.
 
+## Oracle number five: the engine's own PLAN
+
+The optimizer looked like the subsystem with the weakest oracle -
+until SET PLANONLY ON turned out to answer the whole question in one
+line. It makes the engine PREPARE a statement and print the plan it
+chose - which index fetches the rows, whether an ORDER BY rides an
+index's own order or needs a sort - and then execute NOTHING. That
+is a complete, textual, side-effect-free statement of a decision
+that would otherwise be visible only through timings.
+
+So fire-crab-opt prints the same line for the same statement, and
+the gate diffs them across the decision surface: no predicate,
+matchable and unmatchable comparisons, AND versus OR structure,
+indexed and unindexed columns, navigation with and without a
+direction match. Every rule in the crate was found by probe rather
+than reasoning, and two are worth naming. First, the OR law: one
+unmatchable branch spoils the WHOLE clause (the engine cannot OR a
+bitmap with a full scan), while an AND happily keeps its matchable
+half. Second, navigation is DIRECTION-SENSITIVE: ORDER BY x DESC
+took the descending twin index where one existed and fell back to a
+sort where none did - an ascending index cannot serve a descending
+order.
+
+What the slice deliberately does NOT convert is as important: cost
+and selectivity arithmetic. Where the engine's choice between
+candidate indexes depends on statistics rather than structure, fcopt
+refuses rather than guesses - a plan it cannot justify is never
+printed.
+
 ## The crash matrix: careful writes judged by the engine
 
 (Slice 2 grew the matrix to three workloads. The INDEXED inserts

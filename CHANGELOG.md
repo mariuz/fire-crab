@@ -13,6 +13,37 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-opt slice 1: the optimizer's access paths, and oracle number five
+
+### Converted
+- **A NEW CRATE for the optimizer** — and with it, ORACLE NUMBER
+  FIVE. `SET PLANONLY ON` makes the engine PREPARE a statement and
+  print the plan it chose, without executing anything: a complete,
+  textual, side-effect-free statement of the optimizer's decision.
+  `fcopt plan <db> "<sql>"` prints the same line for the same
+  statement, and the gate diffs them.
+- **The rules, every one probe-found**: NATURAL when nothing is
+  index-matchable — including the OR law (one unmatchable branch
+  spoils the whole clause, while an AND keeps its matchable half);
+  INDEX (a, b, ...) in INDEX-ID order for matchable conjuncts
+  (`=`, ranges, BETWEEN, IS NULL, STARTING WITH, prefix LIKE — but
+  not `<>`, IS NOT NULL or a leading-wildcard LIKE); ORDER \<idx\>
+  — navigation instead of a sort — only when the ORDER BY column's
+  index DIRECTION MATCHES (the engine took the descending twin for
+  DESC and fell to a sort when none existed) and any predicate
+  rides that same index; SORT (...) wrapping otherwise. The select
+  list provably does not influence the plan.
+- One parse law the gate taught immediately: **BETWEEN's `AND` is
+  not a conjunction** — the naive split cut a predicate in half.
+
+### Guarded
+- Joins, unions, subqueries, multi-table FROMs, multi-column ORDER
+  BY, compound-index matching — and COST/SELECTIVITY arithmetic
+  explicitly: where the engine's choice depends on statistics
+  rather than structure, this slice refuses rather than guesses.
+  Gate: `qa/opt-plans.sh` (31 checks); 4 unit tests; 280 workspace
+  tests.
+
 ## 2026-07-29 — fire-crab-exe slice 16: blr_recurse — the executor runs the recursions
 
 ### Converted

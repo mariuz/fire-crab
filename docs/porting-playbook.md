@@ -568,6 +568,12 @@ them.
   the reference engine's own syntax error, another a model boundary
   (catalog-typed casts in a catalog-free compiler) - name those as
   what they are instead of forcing them.
+- **Before assuming a subsystem has no oracle, look for its
+  EXPLAIN.** The optimizer seemed to need timing comparisons; the
+  reference engine prints its chosen plan as text and executes
+  nothing (SET PLANONLY ON). A decision printed as text is the
+  cheapest oracle there is - and it makes the difference between
+  converting selection rules and guessing at them.
 - **Some differentials only run ONE WAY - say so.** Stream blobs
   reach disk through the API's blob-parameter block, never through
   SQL, so the reference engine cannot be asked to produce one for
