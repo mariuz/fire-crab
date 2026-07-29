@@ -560,6 +560,14 @@ them.
   `0.00` differ in raw form; align raws in a wide integer before
   comparing. Text-comparing rendered forms is the tempting wrong
   answer.
+- **A two-arrow gate turns gaps into a work queue.** When executor
+  checks pin BOTH the compiler's bytes and the runtime's rows, a
+  missing compiler feature swaps a check out AND names it; a later
+  compiler slice clears the list and the checks re-enable
+  themselves. Triage the list before converting it: one "gap" was
+  the reference engine's own syntax error, another a model boundary
+  (catalog-typed casts in a catalog-free compiler) - name those as
+  what they are instead of forcing them.
 - **The code is the specification; comments are testimony.** ods.h
   calls blh_max_sequence "Number of data pages"; the reading loop's
   `>` test makes it the LAST sequence (count minus one). Writing

@@ -13,6 +13,40 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-dsql slice 43: the executor's frontier list, cleared
+
+### Converted
+- Five flips (sixty-two through sixty-six), every one a shape the
+  EXECUTOR's two-arrow gate had named while its compiler half was
+  missing: **STARTING [WITH]** (`blr_starting`; NOT keeps a real
+  blr_not, like LIKE), **FIRST/SKIP (:param)** (a PARENTHESIZED
+  parameter compiles to the bare parameter2 — and `FIRST :P` is a
+  syntax error in the ENGINE too: the old refusal had been correct
+  all along, only the parenthesized spelling was missing),
+  **DISTINCT over a derived table** (the project's field translates
+  through the derived list — one guard term fell), **FOR-less
+  SUBSTRING** (the engine fills the length with INT MAX — probed
+  literal 0x7FFFFFFF), and **expression select items in quantified
+  subqueries** (the comparand wraps in `blr_derived_expr` over the
+  subquery stream — the two-phase span parse, again).
+- The 2-arg SUBSTRING flip reached the VIEW surface through the
+  shared parser: the view gate's old refusal now compiles, and
+  RDB$VIEW_BLR confirmed the same INT-MAX byte live.
+- Every re-enabled EXECUTOR check went green on the first run —
+  the frontier list worked exactly as designed: gate names gap,
+  compiler slice clears it, executor check comes back by itself.
+
+### Guarded
+- Union-in-subquery stays named WITH its transcript (the wrapper's
+  stream is a blr_union; the comparison reads fid(union ctx, 0)).
+  General limit expressions, expression items in SCALAR subselects.
+  NULLIF/IIF over field branches is documented as a MODEL BOUNDARY,
+  not a gap: the unifying cast's target needs the field's catalog
+  type, and this compiler is catalog-free by design. Gates:
+  qa/dsql-proc-blr.sh 253 → 262, view 128 (one refusal flipped to
+  a live check), exe 105 → 110; 66 dsql tests; 390 unit pins; 263
+  workspace tests.
+
 ## 2026-07-29 — fire-crab-exe slice 12: the string functions
 
 ### Converted

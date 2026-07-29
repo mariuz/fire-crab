@@ -5071,6 +5071,21 @@ branch has ZERO streams - it reads the recursion's own output
 context by fid. That shape needs its own emission path, and the
 probe bytes are already in the refusal's comment waiting for it.
 
+Slice 43 was the project's feedback loop closing over itself. Twelve
+executor slices had each swapped out gate checks the COMPILER could
+not yet pin - and named them: STARTING WITH, FIRST (:param),
+DISTINCT over derived tables, two-argument SUBSTRING, expression
+items in quantified subqueries. This slice converted all five, and
+every waiting executor check came back green on its own - the gate
+names the gap, the compiler clears it, the check re-enables itself.
+Two findings sharpened the list on the way through: FIRST :P without
+parentheses is a syntax error in the ENGINE's own grammar (the old
+refusal had been right; only the parenthesized spelling was
+missing), and NULLIF/IIF over field branches is not a gap at all but
+a MODEL BOUNDARY - the unifying cast needs the field's catalog type,
+which a catalog-free compiler cannot know. The union-in-subquery
+transcript is banked for the next slice.
+
 Slice 41 opened five doors in one pass, and the gate held two of
 them open itself. Expression sort keys: the raw expression in the
 sort clause - with bare literals refusing, because ORDER BY 1 is a

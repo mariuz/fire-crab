@@ -454,6 +454,10 @@ enum Val {
     /// message 0 as blr_parameter2 (value slot 2i, null slot 2i+1);
     /// no variable is declared for inputs (probed)
     InParam(u16),
+    /// blr_derived_expr over one subquery stream: the wrapper an
+    /// EXPRESSION select item takes in a quantified subquery
+    /// (probed: BF 01 <ctx> <expr>)
+    DerivedWrap(u8, Box<Val>),
     /// a local variable declared in the body - blr_variable
     LocalVar(u16),
     /// blr_internal_info(literal 6) - the trigger-action code the
@@ -660,6 +664,9 @@ enum Bool {
     Unique(SubQ),
     /// `<left> <cmp> ANY/SOME (SELECT <col> ...)` and IN (SELECT) -
     /// blr_ansi_any; the comparison is the outer rse's boolean
+    /// STARTING [WITH]: blr_starting - NOT keeps a real blr_not,
+    /// like LIKE (probed)
+    Starting(Val, Val),
     AnsiAny(CmpOp, Val, SubQ),
     /// `<left> <cmp> ALL (SELECT ...)` and NOT IN - blr_ansi_all
     AnsiAll(CmpOp, Val, SubQ),
@@ -675,6 +682,10 @@ struct SubQ {
     ctx: u8,
     wher: Option<Box<Bool>>,
     col: Option<Val>,
+    /// an EXPRESSION select item (quantified subqueries only): the
+    /// comparand wraps in blr_derived_expr over the subquery stream
+    /// (probed: IN (SELECT UA / 25 ...) stores BF 01 <ctx> divide)
+    expr: Option<Val>,
     /// an AGGREGATE scalar subselect: the verb, its argument, and
     /// the aggregate's context - the slot AFTER the stream's, which
     /// it claims like every aggregate (probed)
@@ -691,7 +702,7 @@ fn stamp_bool(b: &mut Bool, cn: &str) {
             stamp_bool(r, cn);
         }
         Bool::Not(x) => stamp_bool(x, cn),
-        Bool::Cmp(_, a, c) | Bool::Like(a, c) => {
+        Bool::Cmp(_, a, c) | Bool::Like(a, c) | Bool::Starting(a, c) => {
             stamp_val(a, cn);
             stamp_val(c, cn);
         }
@@ -752,7 +763,8 @@ fn negate(b: Bool) -> Bool {
             Box::new(Bool::Cmp(CmpOp::Lss, v.clone(), lo)),
             Box::new(Bool::Cmp(CmpOp::Gtr, v, hi)),
         ),
-        keep @ (Bool::Missing(_) | Bool::Like(..) | Bool::InList(..)) => {
+        keep @ (Bool::Missing(_) | Bool::Like(..) | Bool::Starting(..)
+        | Bool::InList(..)) => {
             Bool::Not(Box::new(keep))
         }
         // the quantifier FLIPS and the comparison INVERTS (probed:
@@ -1371,6 +1383,31 @@ impl<'a> P<'a> {
     /// against the subquery's own stream), without it the list
     /// compiles away exactly like a view's (probed: SELECT 1 and
     /// SELECT * leave no trace).
+    /// A FIRST/SKIP operand: a bare integer literal, or a
+    /// PARENTHESIZED parameter/variable - the engine's own grammar
+    /// (`FIRST :P` is a syntax error THERE too; `FIRST (:P)` compiles
+    /// to a bare parameter2 - probed)
+    fn limit_operand(&mut self) -> Option<Val> {
+        if let Some(Tok::Int(v)) = self.t.get(self.i) {
+            let v = i32::try_from(*v).ok()?;
+            self.i += 1;
+            return Some(Val::Int(v));
+        }
+        if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
+            return None;
+        }
+        self.i += 1;
+        let v = self.val()?;
+        if !matches!(v, Val::InParam(_) | Val::LocalVar(_)) {
+            return None; // general limit expressions: unprobed
+        }
+        if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+            return None;
+        }
+        self.i += 1;
+        Some(v)
+    }
+
     fn subselect(&mut self, need_col: bool) -> Option<SubQ> {
         self.subselect_ex(need_col, false)
     }
@@ -1395,7 +1432,48 @@ impl<'a> P<'a> {
         // stream exists
         let mut col: Option<(Option<String>, String)> = None;
         let mut agg_raw: Option<(u8, Option<(Option<String>, String)>)> = None;
+        // an item that is neither a plain column nor one aggregate
+        // call is a full EXPRESSION: record its token span here and
+        // jump-parse it AFTER the stream binds (the two-phase parse)
+        let mut expr_span: Option<(usize, usize)> = None;
         if need_col {
+            let item_start = self.i;
+            // find the item's end: the depth-0 FROM
+            let mut depth = 0usize;
+            let mut fpos = None;
+            let mut k = self.i;
+            while let Some(t) = self.t.get(k) {
+                match t {
+                    Tok::LParen => depth += 1,
+                    Tok::RParen => {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    Tok::Ident(w) if depth == 0 && w == "FROM" => {
+                        fpos = Some(k);
+                        break;
+                    }
+                    _ => {}
+                }
+                k += 1;
+            }
+            let fpos = fpos?;
+            let simple = matches!(
+                &self.t[item_start..fpos],
+                [Tok::Ident(_)] | [Tok::Ident(_), Tok::Dot, Tok::Ident(_)]
+            ) || matches!(
+                (self.t.get(item_start), self.t.get(item_start + 1)),
+                (Some(Tok::Ident(a)), Some(Tok::LParen))
+                    if matches!(a.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
+            );
+            if !simple {
+                expr_span = Some((item_start, fpos));
+                self.i = fpos;
+            }
+        }
+        if need_col && expr_span.is_none() {
             let Some(Tok::Ident(a)) = self.t.get(self.i) else {
                 return None;
             };
@@ -1513,6 +1591,19 @@ impl<'a> P<'a> {
             None => None,
             Some((q, n)) => Some(self.field(q.as_deref(), &n)?),
         };
+        let expr = match expr_span {
+            None => None,
+            Some((start, end)) => {
+                let cur = self.i;
+                self.i = start;
+                let v = self.val()?;
+                if self.i != end {
+                    return None; // the item did not parse to FROM
+                }
+                self.i = cur;
+                Some(Val::DerivedWrap(ctx, Box::new(v)))
+            }
+        };
         let agg = match agg_raw {
             None => None,
             Some((verb, None)) => Some((verb, None, agg_slot)),
@@ -1536,6 +1627,7 @@ impl<'a> P<'a> {
             ctx,
             wher,
             col,
+            expr,
             agg,
         })
     }
@@ -1722,9 +1814,14 @@ impl<'a> P<'a> {
                 // a scalar subselect as a value: blr_via(singular)
                 if matches!(self.t.get(self.i + 1), Some(Tok::Ident(w)) if w == "SELECT")
                 {
-                    return Some(Val::ScalarSub(Box::new(
-                        self.subselect_ex(true, true)?,
-                    )));
+                    let sub = self.subselect_ex(true, true)?;
+                    if sub.expr.is_some() {
+                        // an expression item in a SCALAR subselect:
+                        // unprobed (the wrapper is pinned for the
+                        // quantified forms only)
+                        return None;
+                    }
+                    return Some(Val::ScalarSub(Box::new(sub)));
                 }
                 self.i += 1;
                 let inner = self.val()?;
@@ -1802,10 +1899,14 @@ impl<'a> P<'a> {
                     return None;
                 }
                 let from = self.val()?;
-                if !self.kw("FOR") {
-                    return None; // FOR-less substring: not yet probed
-                }
-                let len = self.val()?;
+                // FOR-less substring: the engine fills the length
+                // with INT MAX (probed: FROM 2 stores literal
+                // 0x7FFFFFFF)
+                let len = if self.kw("FOR") {
+                    self.val()?
+                } else {
+                    Val::Int(0x7FFF_FFFF)
+                };
                 Val::Substring(
                     Box::new(src),
                     Box::new(Val::Sub(Box::new(from), Box::new(Val::Int(1)))),
@@ -2189,6 +2290,16 @@ impl<'a> P<'a> {
                 body
             });
         }
+        if self.kw("STARTING") {
+            let _ = self.kw("WITH"); // WITH is optional sugar
+            let pat = self.val()?;
+            let body = Bool::Starting(left, pat);
+            return Some(if negated {
+                Bool::Not(Box::new(body))
+            } else {
+                body
+            });
+        }
         if self.kw("IN") {
             if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
                 return None;
@@ -2259,6 +2370,7 @@ fn is_keyword(w: &str) -> bool {
             | "NULL"
             | "BETWEEN"
             | "LIKE"
+            | "STARTING"
             | "IN"
             | "WHERE"
             | "FROM"
@@ -2460,6 +2572,12 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
             out.push(*ctx);
             out.extend_from_slice(&id.to_le_bytes());
         }
+        Val::DerivedWrap(ctx, inner) => {
+            out.push(0xBF); // blr_derived_expr
+            out.push(1);
+            out.push(*ctx);
+            emit_val(out, inner);
+        }
         Val::InParam(i) => {
             out.push(blr::PARAMETER2);
             out.push(0);
@@ -2627,6 +2745,11 @@ fn emit_bool(out: &mut Vec<u8>, b: &Bool) {
             emit_val(out, v);
             emit_val(out, p);
         }
+        Bool::Starting(v, p) => {
+            out.push(0x37); // blr_starting
+            emit_val(out, v);
+            emit_val(out, p);
+        }
         Bool::InList(v, items) => {
             out.push(blr::IN_LIST);
             emit_val(out, v);
@@ -2674,7 +2797,10 @@ fn emit_bool(out: &mut Vec<u8>, b: &Bool) {
             emit_val(out, left);
             emit_val(
                 out,
-                sub.col.as_ref().expect("quantified subquery has a column"),
+                sub.col
+                    .as_ref()
+                    .or(sub.expr.as_ref())
+                    .expect("quantified subquery has an item"),
             );
             out.push(blr::END);
         }
@@ -5038,18 +5164,10 @@ impl<'a> P<'a> {
         let mut skip: Option<Val> = None;
         // (also set by the OFFSET/FETCH spelling after the sort)
         if self.kw("FIRST") {
-            let Some(Tok::Int(v)) = self.t.get(self.i) else {
-                return None;
-            };
-            first = Some(Val::Int(i32::try_from(*v).ok()?));
-            self.i += 1;
+            first = Some(self.limit_operand()?);
         }
         if self.kw("SKIP") {
-            let Some(Tok::Int(v)) = self.t.get(self.i) else {
-                return None;
-            };
-            skip = Some(Val::Int(i32::try_from(*v).ok()?));
-            self.i += 1;
+            skip = Some(self.limit_operand()?);
         }
         if !is_for && (first.is_some() || skip.is_some()) {
             return None; // FIRST/SKIP in the singular form: unprobed
@@ -5984,12 +6102,14 @@ impl<'a> P<'a> {
             return None;
         }
         // DISTINCT beside the structured shapes: unprobed
+        // (DISTINCT over a DERIVED table: probed - the project's
+        // fields translate through the derived list like any other
+        // reference, so the guard term fell in slice 43)
         if distinct
             && (aggregate
                 || has_wins
                 || union_.is_some()
                 || !joins.is_empty()
-                || stream.derived.is_some()
                 || cursor.is_some()
                 || lock)
         {
@@ -10675,6 +10795,62 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_forty_three_shapes_byte_for_byte() {
+        // STARTING [WITH] - blr_starting; NOT keeps blr_not like
+        // LIKE (flip sixty-two)
+        pin_proc(
+            "CREATE PROCEDURE RM1 RETURNS (R1 VARCHAR(10)) AS BEGIN FOR SELECT NAME FROM T WHERE NAME STARTING WITH 'b' INTO :R1 DO SUSPEND; END",
+            "0502040103002600000A0007000700020300002600000A00012D1A00009B1100020211010743014A01540047371700044E414D45150F0000010062FF02011700044E414D451A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // FIRST (:P1) - a PARENTHESIZED parameter compiles to the
+        // bare parameter2; FIRST :P1 is a syntax error in the ENGINE
+        // too (flip sixty-three)
+        pin_proc(
+            "CREATE PROCEDURE RM2 (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT FIRST (:P1) ID FROM T ORDER BY ID INTO :R1 DO SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B1100020211010743014A015400442900000001004601481700024944FF020117000249441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // DISTINCT over a DERIVED table: the project's field
+        // translates through the derived list (flip sixty-four)
+        pin_proc(
+            "CREATE PROCEDURE RM3 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT DISTINCT X.V FROM (SELECT AMT AS V FROM T) X INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B11000202110107430143019201541022582220225055424C4943222E22542200FF4501170003414D54FF0201170003414D541A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // FOR-less SUBSTRING: the engine fills the length with INT
+        // MAX (flip sixty-five)
+        pin_proc(
+            "CREATE PROCEDURE RM4 RETURNS (R1 VARCHAR(10)) AS BEGIN FOR SELECT SUBSTRING(NAME FROM 2) FROM T INTO :R1 DO SUSPEND; END",
+            "0502040103002600000A0007000700020300002600000A00012D1A00009B1100020211010743014A015400FF0201281700044E414D45231508000200000015080001000000150800FFFFFF7F1A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // an EXPRESSION select item in a quantified subquery wraps
+        // in blr_derived_expr over the subquery stream (flip
+        // sixty-six)
+        pin_proc(
+            "CREATE PROCEDURE RM5 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE AMT IN (SELECT UA / 25 FROM U) INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014A0154004797430143014A015501FF472F170003414D54BF010125170102554115080019000000FFFF020117000249441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+    }
+
+    #[test]
+    fn slice_forty_three_refusals() {
+        for sql in [
+            // union inside a quantified subquery: probed (the
+            // wrapper's stream is a blr_union, the comparison reads
+            // fid(union ctx, 0)) - transcript held, unconverted
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE ID NOT IN (SELECT UID FROM U UNION ALL SELECT ID FROM T) INTO :R1 DO SUSPEND; END",
+            // general limit expressions: unprobed (params only)
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT FIRST (1 + 1) ID FROM T INTO :R1 DO SUSPEND; END",
+            // an expression item in a SCALAR subselect: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN R1 = (SELECT UA / 25 FROM U WHERE U.UID = 1); SUSPEND; END",
+            // NULLIF/IIF over FIELD branches: the unifying cast's
+            // target needs the field's CATALOG type - a model
+            // boundary for a catalog-free compiler, not a gap
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT NULLIF(AMT, 8) FROM T INTO :R1 DO SUSPEND; END",
+        ] {
+            assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
+        }
+    }
+
+    #[test]
     fn slice_forty_two_refusals() {
         for sql in [
             // recursive CTEs compile via blr_recurse (0xB9) - a
@@ -10966,8 +11142,6 @@ mod tests {
             // unconverted built-in - never a field
             "SELECT ID FROM T WHERE FOO(A) = 1",
             "SELECT ID FROM T WHERE DECODE(A, 1, 2) = 1",
-            // SUBSTRING without FOR: layout not yet probed
-            "SELECT ID FROM T WHERE SUBSTRING(S FROM 1) = 'a'",
             "SELECT ID FROM T CROSS JOIN U2",        // no ON clause
             // a FIELD branch in a cast-wrapped conditional: its dsc
             // lives in the catalog - never guess a descriptor
