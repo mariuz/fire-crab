@@ -4070,6 +4070,24 @@ three-valued edges - an IN with no match beside a NULL comparand
 answers UNKNOWN - and LIKE runs the porting playbook's own
 backtracking pseudocode, executable at last.
 
+### Slice 7: correlation for free, and the NOT IN trap
+
+Subquery predicates are where the binding model paid for the third
+time. EXISTS is blr_any over an rse - and correlation cost nothing,
+because the outer row's frames are already on the evaluation stack
+when the inner scan's boolean runs: U.UID = T.ID resolves through
+the ordinary frame search, no capture machinery, no environment
+threading. The quantified forms (blr_ansi_any/_all) reuse the
+derived-table arm - the wrapper rse's single stream IS the subquery
+- with the comparison as the wrapper's boolean and the three-valued
+fold on top: ANY lets true beat unknown beat false, ALL mirrors it,
+and the empty set answers false and true respectively. The gate
+pins the case most hand-rolled executors get wrong: ID NOT IN
+(SELECT AMT FROM T) where one AMT is NULL answers EMPTY - every
+comparison poisoned to UNKNOWN - exactly as the engine does.
+Scalar subselects (blr_via over a singular rse) close the slice:
+one row binds, none yields the else-NULL, two is sing_err.
+
 ## Query surface: what the server answers, and what it refuses
 
 Everything below is verified by a differential gate under `qa/` — the

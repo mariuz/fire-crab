@@ -13,6 +13,33 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-exe slice 7: subquery predicates, scalar subselects
+
+### Converted
+- **EXISTS / SINGULAR**: `blr_any` / `blr_unique` over one rse.
+  Correlation cost NOTHING: the outer row's frames are already on
+  the evaluation stack when the inner scan runs, so `U.UID = T.ID`
+  resolves through the ordinary frame search - the design dividend
+  of the binding model, third time paying.
+- **Quantified comparisons**: `blr_ansi_any` / `blr_ansi_all` over
+  a wrapper rse whose single STREAM is the subquery (the
+  derived-table arm parses it) and whose boolean is the comparison.
+  ANY: true beats unknown beats false; ALL the mirror; the empty
+  set answers false/true. NOT IN's famous trap holds: one NULL in
+  the subquery poisons every row to UNKNOWN, and the gate's
+  `ID NOT IN (SELECT AMT FROM T)` answers EMPTY exactly as the
+  engine does - the wrong-in-most-hand-rolled-executors case.
+- **Scalar subselects**: `blr_via(singular-rse, value, else)` - one
+  row binds and the value evaluates, none and the else (NULL) does,
+  a second row is sing_err. `blr_derived_expr` (191) is a
+  bookkeeping wrapper - stream ids, then the expression - parsing
+  straight through.
+
+### Guarded
+- Windows are the last named refusal. Two checks swapped at the
+  frontier (expression subquery items, union-in-subquery - both
+  dsql-side guards). Gate: 63 → 70 checks. 261 workspace tests.
+
 ## 2026-07-29 — fire-crab-exe slice 6: UNION and the remaining simple booleans
 
 ### Converted

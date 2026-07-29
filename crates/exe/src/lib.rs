@@ -48,6 +48,7 @@ mod blr {
     pub const DIVIDE: u8 = 37;
     pub const NEGATE: u8 = 38;
     pub const CONCATENATE: u8 = 39;
+    pub const VIA: u8 = 43;
     pub const FIELD: u8 = 23;
     pub const FID: u8 = 24;
     pub const PARAMETER: u8 = 25;
@@ -65,7 +66,9 @@ mod blr {
     pub const OR: u8 = 57;
     pub const AND: u8 = 58;
     pub const NOT: u8 = 59;
+    pub const ANY: u8 = 60;
     pub const MISSING: u8 = 61;
+    pub const UNIQUE: u8 = 62;
     pub const LIKE: u8 = 63;
     pub const IN_LIST: u8 = 64;
     pub const RSE: u8 = 67;
@@ -93,6 +96,9 @@ mod blr {
     pub const FULL: u8 = 3;
     pub const SINGULAR: u8 = 127;
     pub const PLAN: u8 = 139;
+    pub const ANSI_ANY: u8 = 151;
+    pub const ANSI_ALL: u8 = 158;
+    pub const DERIVED_EXPR: u8 = 191;
     pub const SEQUENTIAL: u8 = 142;
     pub const INDICES: u8 = 144;
     pub const RETRIEVE: u8 = 145;
@@ -148,6 +154,10 @@ pub enum Expr {
     Arith(u8, Box<Expr>, Box<Expr>),
     /// blr_negate
     Negate(Box<Expr>),
+    /// blr_via(singular-rse, value, else): the scalar subselect -
+    /// one row binds and the value evaluates, none and the else
+    /// does, more than one is the engine's sing_err
+    Via(Box<Rse>, Box<Expr>, Box<Expr>),
     /// blr_null
     Null,
 }
@@ -170,6 +180,15 @@ pub enum Bool {
     Like(Expr, Expr),
     /// blr_starting: STARTING WITH - a plain prefix test
     Starting(Expr, Expr),
+    /// blr_any: EXISTS - the rse yields at least one row (the
+    /// correlated outer frames stay on the stack during the scan)
+    Any(Box<Rse>),
+    /// blr_unique: SINGULAR - exactly one row
+    UniqueRse(Box<Rse>),
+    /// blr_ansi_any / blr_ansi_all: the quantified comparison - a
+    /// wrapper rse whose single stream IS the subquery and whose
+    /// boolean is the comparison; `all` flips the quantifier
+    Quantified { all: bool, rse: Box<Rse> },
 }
 
 /// One sort key of an rse's blr_sort clause: the expression and its
@@ -427,6 +446,21 @@ impl<'a> P<'a> {
                 Ok(Expr::Fid(ctx, self.u16()?))
             }
             blr::NULL => Ok(Expr::Null),
+            blr::VIA => {
+                let rse = self.rse_entry()?;
+                let value = Box::new(self.expr()?);
+                let els = Box::new(self.expr()?);
+                Ok(Expr::Via(Box::new(rse), value, els))
+            }
+            blr::DERIVED_EXPR => {
+                // bookkeeping wrapper: stream count + stream ids,
+                // then the expression itself
+                let n = self.u8()? as usize;
+                for _ in 0..n {
+                    let _stream = self.u8()?;
+                }
+                self.expr()
+            }
             v @ (blr::ADD | blr::SUBTRACT | blr::MULTIPLY | blr::DIVIDE
             | blr::CONCATENATE) => Ok(Expr::Arith(
                 v,
@@ -498,6 +532,17 @@ impl<'a> P<'a> {
             blr::BETWEEN => Bool::Between(self.expr()?, self.expr()?, self.expr()?),
             blr::LIKE => Bool::Like(self.expr()?, self.expr()?),
             blr::STARTING => Bool::Starting(self.expr()?, self.expr()?),
+            blr::ANY => Bool::Any(Box::new(self.rse_entry()?)),
+            blr::UNIQUE => Bool::UniqueRse(Box::new(self.rse_entry()?)),
+            v @ (blr::ANSI_ANY | blr::ANSI_ALL) => {
+                if self.u8()? != blr::RSE {
+                    return Err("quantified predicate without an rse".into());
+                }
+                Bool::Quantified {
+                    all: v == blr::ANSI_ALL,
+                    rse: Box::new(self.rse_body()?),
+                }
+            }
             other => return Err(format!("boolean verb {} unconverted", other)),
         })
     }
@@ -1501,6 +1546,18 @@ impl<'a> Exec<'a> {
         Ok(match e {
             Expr::Null => Value::Null,
             Expr::Literal(v) => v.clone(),
+            Expr::Via(rse, value, els) => {
+                let bindings = self.open_rse(rse)?;
+                match bindings.len() {
+                    0 => self.eval(els)?,
+                    1 => {
+                        let b = bindings.into_iter().next().expect("len checked");
+                        self.with_binding(&b, |ex| ex.eval(value))?
+                    }
+                    // the engine's sing_err, as everywhere singular
+                    _ => return Err("multiple rows in singleton select".into()),
+                }
+            }
             Expr::Negate(inner) => match self.eval(inner)? {
                 Value::Null => Value::Null,
                 Value::Int(n) => Value::Int(-n),
@@ -1666,6 +1723,44 @@ impl<'a> Exec<'a> {
                     (Value::Null, _) | (_, Value::Null) => None,
                     (Value::Text(t), Value::Text(pre)) => Some(t.starts_with(&pre)),
                     _ => return Err("STARTING over non-text values".into()),
+                }
+            }
+            Bool::Any(rse) => Some(!self.open_rse(rse)?.is_empty()),
+            Bool::UniqueRse(rse) => Some(self.open_rse(rse)?.len() == 1),
+            Bool::Quantified { all, rse } => {
+                // the wrapper's stream is the subquery; its boolean
+                // is the comparison, evaluated per subquery row -
+                // ANY: true beats unknown beats false; ALL: false
+                // beats unknown beats true; the empty set answers
+                // false for ANY and true for ALL
+                let comparison = rse.boolean.clone();
+                let inner = Rse {
+                    stream: rse.stream.clone(),
+                    boolean: None,
+                    sort: Vec::new(),
+                    first: None,
+                    skip: None,
+                    project: Vec::new(),
+                    plan_indices: Vec::new(),
+                    singular: false,
+                };
+                let mut unknown = false;
+                for binding in self.open_rse(&inner)? {
+                    let v = match &comparison {
+                        None => Some(true),
+                        Some(c) => self.with_binding(&binding, |ex| ex.bool_eval(c))?,
+                    };
+                    match (all, v) {
+                        (false, Some(true)) => return Ok(Some(true)),
+                        (true, Some(false)) => return Ok(Some(false)),
+                        (_, None) => unknown = true,
+                        _ => {}
+                    }
+                }
+                if unknown {
+                    None
+                } else {
+                    Some(*all)
                 }
             }
         })
