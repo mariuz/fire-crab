@@ -13,6 +13,31 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-dsql slice 40: item expressions, group-expr keys, multi-ctes
+
+### Converted
+- **Select-item expressions** (flip fifty-one): body FOR SELECT and
+  SELECT INTO items are FULL value expressions at the stream
+  context — parsed by the general val() (bare names resolve as
+  COLUMNS there; the stream scope is set), plain columns keeping
+  their shape for the aggregate/cursor paths.
+- **GROUP BY expressions** (flip fifty-two — slice 39's transcript
+  cashed): the group list takes the raw expression, the map carries
+  its BARE fields, and select items REBUILD over the mapped fids —
+  in SELECT-ITEM order, each item contributing its fields (deduped)
+  or its aggregate verb, the slice-8 map law generalized. ORDER BY
+  keys over aggregates rebuild the same way — the gate itself
+  caught `ORDER BY SALARY / 1000` refusing and forced the fix.
+- **Multiple ctes** (flip fifty-three): comma-separated WITH lists,
+  each expanding once at its FROM reference — one pinned expanding
+  inside a correlated subquery.
+
+### Guarded
+- Select items whose fields aren't group-key fields, non-aggregate
+  expression ORDER keys, twice-referenced/unreferenced ctes,
+  expression passthrough beside windows. Gate: `qa/dsql-proc-blr.sh`
+  grew to 236 checks (5 fresh); 363 unit byte-pins.
+
 ## 2026-07-29 — fire-crab-dsql slice 39: WITH ctes, expression INSERT..SELECT
 
 ### Converted

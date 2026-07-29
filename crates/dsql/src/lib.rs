@@ -1010,10 +1010,11 @@ struct P<'a> {
     /// inside a body-statement SUBQUERY: the enclosing statement's
     /// stream index - visible to qualified names (probed)
     host: Option<usize>,
-    /// one WITH cte: (name, body token span start, end, used) - a
-    /// FROM reference expands it as a DERIVED table with the cte
-    /// name as alias (probed: the engine inlines exactly that)
-    cte: Option<(String, usize, usize, bool)>,
+    /// WITH ctes: (name, body token span start, end, used) - a FROM
+    /// reference expands one as a DERIVED table with the cte name as
+    /// alias (probed: the engine inlines exactly that); each cte
+    /// must be referenced exactly once
+    ctes: Vec<(String, usize, usize, bool)>,
     /// compiled subroutine declaration blobs, spliced in source order
     sub_decls: Vec<Vec<u8>>,
     /// DECLAREd sub-procedures in scope: (name, ins, outs)
@@ -1061,7 +1062,7 @@ impl<'a> P<'a> {
             in_sub: false,
             saw_suspend: false,
             host: None,
-            cte: None,
+            ctes: Vec::new(),
             sub_decls: Vec::new(),
             sub_procs: Vec::new(),
             sub_funcs: Vec::new(),
@@ -1149,14 +1150,18 @@ impl<'a> P<'a> {
             return self.derived_item();
         }
         // a WITH cte referenced by name expands as a DERIVED table
-        // with the cte name as its alias (probed); one use only
-        if let Some((name, start, end, used)) = self.cte.clone() {
-            if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if *w == name)
-            {
+        // with the cte name as its alias (probed); one use each
+        if let Some(Tok::Ident(w)) = self.t.get(self.i) {
+            let hit = self
+                .ctes
+                .iter()
+                .position(|(n, ..)| n == w)
+                .map(|ci| (ci, self.ctes[ci].clone()));
+            if let Some((ci, (name, start, end, used))) = hit {
                 if used {
                     return None; // a second reference: unprobed
                 }
-                self.cte = Some((name.clone(), start, end, true));
+                self.ctes[ci].3 = true;
                 let after = self.i + 1;
                 self.i = start;
                 let st = self.derived_body(name)?;
@@ -2783,7 +2788,7 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
         in_sub: false,
         saw_suspend: false,
         host: None,
-        cte: None,
+        ctes: Vec::new(),
         sub_decls: Vec::new(),
         sub_procs: Vec::new(),
         sub_funcs: Vec::new(),
@@ -3053,6 +3058,79 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
 /// group-key column becomes blr_fid(1, its slot); fids (from
 /// aggregate calls) pass through; literals and expressions over them
 /// recurse. A column that is not a group key refuses.
+/// Collect the bare fields a value references, first-appearance
+/// order, deduped - the group keys' contribution to an aggregate map.
+fn collect_fields(v: &Val, out: &mut Vec<Val>) {
+    match v {
+        Val::Field(..) => {
+            if !out.contains(v) {
+                out.push(v.clone());
+            }
+        }
+        Val::Add(a, b)
+        | Val::Sub(a, b)
+        | Val::Mul(a, b)
+        | Val::Div(a, b)
+        | Val::Concat(a, b) => {
+            collect_fields(a, out);
+            collect_fields(b, out);
+        }
+        Val::Neg(a) => collect_fields(a, out),
+        _ => {}
+    }
+}
+
+/// Rebuild a select item over an aggregate map being built: every
+/// FIELD must appear in some group key and lands a (deduped) Key
+/// slot; the rest recurses (probed on expression group keys).
+fn rebuild_over_keys(
+    map: &mut Vec<MapEntry>,
+    v: &Val,
+    gfields: &[Val],
+    fid_ctx: u8,
+) -> Option<Val> {
+    match v {
+        Val::Field(..) => {
+            if !gfields.contains(v) {
+                return None;
+            }
+            let entry = MapEntry::Key(v.clone());
+            let slot = match map.iter().position(|e| *e == entry) {
+                Some(i) => i,
+                None => {
+                    map.push(entry);
+                    map.len() - 1
+                }
+            };
+            Some(Val::Fid(fid_ctx, slot as u16))
+        }
+        Val::Int(_) | Val::Int64(_) | Val::Dec(..) | Val::Str(_) => {
+            Some(v.clone())
+        }
+        Val::Add(a, b)
+        | Val::Sub(a, b)
+        | Val::Mul(a, b)
+        | Val::Div(a, b)
+        | Val::Concat(a, b) => {
+            let (a, b) = (
+                rebuild_over_keys(map, a, gfields, fid_ctx)?,
+                rebuild_over_keys(map, b, gfields, fid_ctx)?,
+            );
+            Some(match v {
+                Val::Add(..) => Val::Add(Box::new(a), Box::new(b)),
+                Val::Sub(..) => Val::Sub(Box::new(a), Box::new(b)),
+                Val::Mul(..) => Val::Mul(Box::new(a), Box::new(b)),
+                Val::Div(..) => Val::Div(Box::new(a), Box::new(b)),
+                _ => Val::Concat(Box::new(a), Box::new(b)),
+            })
+        }
+        Val::Neg(a) => Some(Val::Neg(Box::new(rebuild_over_keys(
+            map, a, gfields, fid_ctx,
+        )?))),
+        _ => None,
+    }
+}
+
 fn map_val_to_fid(map: &[MapEntry], v: &Val, fid_ctx: u8) -> Option<Val> {
     match v {
         Val::Field(..) => {
@@ -4998,6 +5076,8 @@ impl<'a> P<'a> {
         self.i = list_start;
         enum Item {
             Col(Val),
+            /// a full value expression at the stream context (probed)
+            Expr(Val),
             Agg(u8, Option<Val>),
             /// <fn> OVER ([PARTITION BY] [ORDER BY] [frame])
             Win(
@@ -5115,26 +5195,17 @@ impl<'a> P<'a> {
                         frame,
                     ));
                 }
-                Tok::Ident(w) if !is_keyword(w) => {
-                    let a = w.clone();
-                    self.i += 1;
-                    let v = if matches!(self.t.get(self.i), Some(Tok::Dot)) {
-                        self.i += 1;
-                        let Some(Tok::Ident(b)) = self.t.get(self.i) else {
-                            return None;
-                        };
-                        let b = b.clone();
-                        self.i += 1;
-                        self.field(Some(&a), &b)?
-                    } else {
-                        // a select column, NOT a variable - through
-                        // field() so a JOIN refuses the bare name and
-                        // a DERIVED stream translates it
-                        self.field(None, &a)?
-                    };
-                    items.push(Item::Col(v));
+                _ => {
+                    // a full value expression at the stream context
+                    // (bare names resolve as COLUMNS here - the
+                    // stream scope is set); a plain column keeps its
+                    // Col shape for the aggregate/cursor paths
+                    let v = self.val()?;
+                    items.push(match v {
+                        Val::Field(..) => Item::Col(v),
+                        other => Item::Expr(other),
+                    });
                 }
-                _ => return None,
             }
             if self.i == list_end {
                 break;
@@ -5256,26 +5327,10 @@ impl<'a> P<'a> {
             if !self.kw("BY") {
                 return None;
             }
+            // keys are full EXPRESSIONS (probed): the group list
+            // holds them raw; the map carries their BARE fields
             loop {
-                let key = match self.t.get(self.i)? {
-                    Tok::Ident(w) if !is_keyword(w) => {
-                        let a = w.clone();
-                        self.i += 1;
-                        if matches!(self.t.get(self.i), Some(Tok::Dot)) {
-                            self.i += 1;
-                            let Some(Tok::Ident(b)) = self.t.get(self.i) else {
-                                return None;
-                            };
-                            let b = b.clone();
-                            self.i += 1;
-                            self.field(Some(&a), &b)?
-                        } else {
-                            self.field(None, &a)?
-                        }
-                    }
-                    _ => return None,
-                };
-                group_keys.push(key);
+                group_keys.push(self.val()?);
                 if matches!(self.t.get(self.i), Some(Tok::Comma)) {
                     self.i += 1;
                 } else {
@@ -5284,6 +5339,7 @@ impl<'a> P<'a> {
             }
         }
         let aggregate = has_aggs || grouped;
+        let mut agg_vals: Option<Vec<Val>> = None;
         if union_.is_some()
             && (grouped || first.is_some() || skip.is_some())
         {
@@ -5338,23 +5394,45 @@ impl<'a> P<'a> {
                 sub: self.in_sub,
                 cur: None,
             });
+            // the map takes each select item's contribution in
+            // SELECT-LIST order: a column or expression contributes
+            // the BARE FIELDS it references (which must appear in
+            // some group key), deduped; an aggregate its verb; the
+            // items themselves REBUILD over the map's fids (probed
+            // on expression keys)
+            let mut gfields: Vec<Val> = Vec::new();
+            for k in &group_keys {
+                collect_fields(k, &mut gfields);
+            }
+            let fid_ctx = self.agg_fid_ctx;
+            let mut map: Vec<MapEntry> = Vec::new();
+            let mut vals: Vec<Val> = Vec::new();
             for it in &items {
-                if let Item::Col(v) = it {
-                    if !group_keys.contains(v) {
-                        return None;
+                match it {
+                    Item::Col(v) | Item::Expr(v) => {
+                        vals.push(rebuild_over_keys(
+                            &mut map, v, &gfields, fid_ctx,
+                        )?);
                     }
+                    Item::Agg(verb, arg) => {
+                        let entry = MapEntry::Agg(*verb, arg.clone());
+                        let slot = match map
+                            .iter()
+                            .position(|e| *e == entry)
+                        {
+                            Some(i) => i,
+                            None => {
+                                map.push(entry);
+                                map.len() - 1
+                            }
+                        };
+                        vals.push(Val::Fid(fid_ctx, slot as u16));
+                    }
+                    Item::Win(..) => return None, // guarded above
                 }
             }
-            self.agg_map = items
-                .iter()
-                .map(|it| match it {
-                    Item::Col(v) => Some(MapEntry::Key(v.clone())),
-                    Item::Agg(verb, arg) => {
-                        Some(MapEntry::Agg(*verb, arg.clone()))
-                    }
-                    Item::Win(..) => None, // guarded above
-                })
-                .collect::<Option<Vec<_>>>()?;
+            self.agg_map = map;
+            agg_vals = Some(vals);
         }
         let having = if self.kw("HAVING") {
             if !aggregate {
@@ -5373,27 +5451,17 @@ impl<'a> P<'a> {
                 return None;
             }
             loop {
-                let key = match self.t.get(self.i)? {
-                    Tok::Ident(w) if !is_keyword(w) => {
-                        let a = w.clone();
-                        self.i += 1;
-                        if matches!(self.t.get(self.i), Some(Tok::Dot)) {
-                            self.i += 1;
-                            let Some(Tok::Ident(b)) = self.t.get(self.i) else {
-                                return None;
-                            };
-                            let b = b.clone();
-                            self.i += 1;
-                            self.field(Some(&a), &b)?
-                        } else {
-                            self.field(None, &a)?
-                        }
-                    }
-                    _ => return None,
-                };
+                let key = self.val()?;
+                // over an aggregate the key REBUILDS against the map
+                // (probed: ORDER BY SALARY / 1000 sorts the divide
+                // over the mapped field); elsewhere expression keys
+                // are unprobed and refuse
                 let key = if aggregate {
                     map_val_to_fid(&self.agg_map, &key, self.agg_fid_ctx)?
                 } else {
+                    if !matches!(key, Val::Field(..)) {
+                        return None;
+                    }
                     key
                 };
                 let descending = if self.kw("DESC") {
@@ -5431,7 +5499,8 @@ impl<'a> P<'a> {
                     Item::Win(e, p, o, fr) => {
                         (p.clone(), o.clone(), fr.clone(), e.clone())
                     }
-                    Item::Agg(..) => return None,
+                    // expression passthrough beside windows: unprobed
+                    Item::Agg(..) | Item::Expr(..) => return None,
                 };
                 let wi = match windows.iter().position(|w| {
                     w.part == part && w.ord == ord && w.frame == frame
@@ -5484,13 +5553,12 @@ impl<'a> P<'a> {
                 .map(|(wi, slot)| Val::Fid(windows[*wi].ctx, *slot))
                 .collect()
         } else if aggregate {
-            let fid_ctx = ctx + 1 + joins.len() as u8;
-            (0..cols_n).map(|i| Val::Fid(fid_ctx, i as u16)).collect()
+            agg_vals.take()?
         } else {
             items
                 .iter()
                 .map(|it| match it {
-                    Item::Col(v) => Some(v.clone()),
+                    Item::Col(v) | Item::Expr(v) => Some(v.clone()),
                     Item::Agg(..) | Item::Win(..) => None,
                 })
                 .collect::<Option<Vec<_>>>()?
@@ -6462,37 +6530,45 @@ impl<'a> P<'a> {
     /// cte, referenced exactly once; recursion refuses because the
     /// expansion consumes the single use.
     fn parse_cte(&mut self) -> Option<()> {
-        let Some(Tok::Ident(name)) = self.t.get(self.i) else {
-            return None;
-        };
-        if is_keyword(name) {
-            return None;
-        }
-        let name = name.clone();
-        self.i += 1;
-        if !self.kw("AS") || !matches!(self.t.get(self.i), Some(Tok::LParen))
-        {
-            return None;
-        }
-        self.i += 1;
-        let start = self.i;
-        let mut depth = 0i32;
-        let mut j = self.i;
-        let end = loop {
-            match self.t.get(j)? {
-                Tok::LParen => depth += 1,
-                Tok::RParen => {
-                    if depth == 0 {
-                        break j;
-                    }
-                    depth -= 1;
-                }
-                _ => {}
+        loop {
+            let Some(Tok::Ident(name)) = self.t.get(self.i) else {
+                return None;
+            };
+            if is_keyword(name) {
+                return None;
             }
-            j += 1;
-        };
-        self.cte = Some((name, start, end, false));
-        self.i = end + 1;
+            let name = name.clone();
+            self.i += 1;
+            if !self.kw("AS")
+                || !matches!(self.t.get(self.i), Some(Tok::LParen))
+            {
+                return None;
+            }
+            self.i += 1;
+            let start = self.i;
+            let mut depth = 0i32;
+            let mut j = self.i;
+            let end = loop {
+                match self.t.get(j)? {
+                    Tok::LParen => depth += 1,
+                    Tok::RParen => {
+                        if depth == 0 {
+                            break j;
+                        }
+                        depth -= 1;
+                    }
+                    _ => {}
+                }
+                j += 1;
+            };
+            self.ctes.push((name, start, end, false));
+            self.i = end + 1;
+            if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
         Some(())
     }
 
@@ -6694,10 +6770,9 @@ impl<'a> P<'a> {
                 return None;
             }
             let r = self.select_stmt(true);
-            if let Some((.., used)) = self.cte.take() {
-                if !used {
-                    return None; // an unreferenced cte: unprobed
-                }
+            let ctes = std::mem::take(&mut self.ctes);
+            if ctes.iter().any(|(.., used)| !used) {
+                return None; // an unreferenced cte: unprobed
             }
             return r;
         }
@@ -6712,10 +6787,9 @@ impl<'a> P<'a> {
                 return None;
             }
             let r = self.select_stmt(false);
-            if let Some((.., used)) = self.cte.take() {
-                if !used {
-                    return None;
-                }
+            let ctes = std::mem::take(&mut self.ctes);
+            if ctes.iter().any(|(.., used)| !used) {
+                return None;
             }
             return r;
         }
@@ -7817,7 +7891,7 @@ pub fn compile_default(sql: &str) -> Option<Vec<u8>> {
         in_sub: false,
         saw_suspend: false,
         host: None,
-        cte: None,
+        ctes: Vec::new(),
         sub_decls: Vec::new(),
         sub_procs: Vec::new(),
         sub_funcs: Vec::new(),
@@ -7896,7 +7970,7 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
         in_sub: false,
         saw_suspend: false,
         host: None,
-        cte: None,
+        ctes: Vec::new(),
         sub_decls: Vec::new(),
         sub_procs: Vec::new(),
         sub_funcs: Vec::new(),
@@ -7970,7 +8044,7 @@ pub fn compile_check(sql: &str) -> Option<Vec<u8>> {
         in_sub: false,
         saw_suspend: false,
         host: None,
-        cte: None,
+        ctes: Vec::new(),
         sub_decls: Vec::new(),
         sub_procs: Vec::new(),
         sub_funcs: Vec::new(),
@@ -8045,7 +8119,7 @@ pub fn compile_validation(sql: &str) -> Option<Vec<u8>> {
         in_sub: false,
         saw_suspend: false,
         host: None,
-        cte: None,
+        ctes: Vec::new(),
         sub_decls: Vec::new(),
         sub_procs: Vec::new(),
         sub_funcs: Vec::new(),
@@ -8144,7 +8218,7 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
         in_sub: false,
         saw_suspend: false,
         host: None,
-        cte: None,
+        ctes: Vec::new(),
         sub_decls: Vec::new(),
         sub_procs: Vec::new(),
         sub_funcs: Vec::new(),
@@ -10178,11 +10252,8 @@ mod tests {
     #[test]
     fn slice_thirty_nine_refusals() {
         for sql in [
-            // GROUP BY expressions rebuild select items over the
-            // mapped FIELDS - probed, unconverted
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT UID + 0, COUNT(*) FROM U2 GROUP BY UID + 0 INTO :R1, :R2 DO SUSPEND; END",
-            // multiple ctes: unprobed
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN WITH A1 AS (SELECT ID FROM T), A2 AS (SELECT UID FROM U2) SELECT ID FROM A1 INTO :R1; SUSPEND; END",
+            // a select item whose field is NOT a group-key field
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT UA + 0, COUNT(*) FROM U2 GROUP BY UID + 0 INTO :R1, :R2 DO SUSPEND; END",
             // a cte referenced twice: unprobed
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN WITH A1 AS (SELECT ID FROM T) FOR SELECT ID FROM A1 UNION ALL SELECT ID FROM A1 INTO :R1 DO SUSPEND; END",
             // an unreferenced cte: unprobed
@@ -10190,6 +10261,35 @@ mod tests {
         ] {
             assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
         }
+    }
+
+    #[test]
+    fn compiles_slice_forty_shapes_byte_for_byte() {
+        // select-item EXPRESSIONS at the stream context (flip
+        // fifty-one)
+        pin_proc(
+            "CREATE PROCEDURE RJ1 (P1 INTEGER) RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT EMP_NO, SALARY * 2 + :P1 FROM EMPLOYEE WHERE DEPT_ID = 100 INTO :R1, :R2 DO SUSPEND; END",
+            "0502040002000800070004010500080007000800070007000C00020300000800012D1A00000301000800012D1A01009B1100020211010743014A08454D504C4F59454500472F170007444550545F494415080064000000FF0201170006454D505F4E4F1A000001222417000653414C415259150800020000002900000001001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        // GROUP BY EXPRESSIONS (flip fifty-two): the group list
+        // takes the raw expression, the map its BARE fields, the
+        // select item REBUILT over the fids
+        pin_proc(
+            "CREATE PROCEDURE RJ2 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT UID + UA, COUNT(*) FROM U2 GROUP BY UID + UA INTO :R1, :R2 DO SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B1100020211010743014F0143014A02553200FF4E012217000355494417000255414D0300000017000355494401001700025541020053FF02012218010000180101001A000001180102001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        // ... map slots in SELECT-ITEM order - the aggregate first
+        // when selected first (the slice-8 law generalized)
+        pin_proc(
+            "CREATE PROCEDURE RJ5 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT COUNT(*), UID + 0 FROM U2 GROUP BY UID + 0 INTO :R1, :R2 DO SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B1100020211010743014F0143014A02553200FF4E0122170003554944150800000000004D02000000530100170003554944FF0201180100001A0000012218010100150800000000001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        // MULTIPLE ctes (flip fifty-three), one in the main FROM and
+        // one expanding inside a correlated subquery
+        pin_proc(
+            "CREATE PROCEDURE RJ4 (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN WITH A1 AS (SELECT ID FROM T WHERE ID > :P1), A2 AS (SELECT UID AS V FROM U2) SELECT ID FROM A1 WHERE EXISTS (SELECT 1 FROM A2 WHERE A2.V = A1.ID) INTO :R1; SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B11000202077F43014301920154112241312220225055424C4943222E2254220047311700024944290000000100FF473C4301430192025532122241322220225055424C4943222E2255322201FF472F1701035549441700024944FFFF020117000249441A0000FF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
     }
 
     #[test]

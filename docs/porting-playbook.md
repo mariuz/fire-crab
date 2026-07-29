@@ -307,6 +307,11 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # a positional law may really be a CONTRIBUTION law: the
+    # aggregate map was never items-in-order but items-CONTRIBUTING
+    # in order (fields or verbs, deduped) - the degenerate case hid
+    # it for thirty slices; generalize the mechanism and let the old
+    # pins prove the degenerate case still holds
     # a NEW keyword may be an OLD shape's spelling: WITH ctes
     # inline as the derived tables you already emit - before
     # building machinery for a feature, probe whether the reference

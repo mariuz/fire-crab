@@ -4666,6 +4666,26 @@ WHEN, and a BLOCK as a handler's body nests blr_block again with no
 handler section of its own - the battery runs a handler block
 containing an EXIT.
 
+Slice 40 generalized the slice-8 map law and let expressions into
+three more places. Select items are FULL value expressions at the
+stream context - the general val() parses them, bare names
+resolving as columns because the stream scope is set, exactly the
+slice-14 name law. GROUP BY expressions cashed their transcript:
+the group list takes the raw expression, the map carries the BARE
+fields it references - in SELECT-ITEM order, each item
+contributing its deduped fields or its aggregate verb - and the
+select items REBUILD over the mapped fids, the rewriter the HAVING
+path has had since slice 8 doing the work unchanged. The gate
+added its own find: ORDER BY SALARY / 1000 over the aggregate
+refused - the ORDER key parse was still column-only - and the fix
+routed it through val() with the same rebuild, non-aggregate
+expression keys staying refused as unprobed. Multiple ctes rode
+along: comma-separated WITH lists, each name expanding once at its
+FROM reference, one pinned expanding inside a correlated subquery
+where its derived stream took the next context. Every prior
+aggregate pin held under the rebuild - the regression net proving
+the generalization emits every old shape identically.
+
 Slice 39 found that WITH is a spelling of something already
 converted. The engine INLINES a non-recursive cte as a DERIVED
 table: WITH W1 AS (SELECT UID AS X FROM U2 WHERE ...) SELECT X
