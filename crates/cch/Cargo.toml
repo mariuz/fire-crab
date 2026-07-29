@@ -1,0 +1,14 @@
+[package]
+name = "fire-crab-cch"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Page cache and the careful-write precedence graph: the conversion of Firebird's src/jrd/cch.cpp, crash-safety differentially tested by validating every write prefix with the engine's own tools"
+
+[dependencies]
+fire-crab-ods = { path = "../ods" }
+
+[[bin]]
+name = "fccch"
+path = "src/main.rs"

@@ -13,6 +13,42 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-cch slice 1: the careful-write precedence graph
+
+### Converted
+- **A NEW CRATE for the mechanism that replaces a write-ahead log.**
+  `fire-crab-cch` converts cch.cpp's precedence graph: `CCH_fetch` /
+  `CCH_mark`, `CCH_precedence`/`check_precedence` (the referenced
+  page reaches disk before the page that references it; an edge that
+  would close a cycle is not added — the window page is written
+  immediately instead), `write_buffer`'s recursive higher-queue
+  drain (what makes the graph load-bearing rather than advisory) and
+  `clear_precedence`.
+- **The crash-matrix differential**: `fccch crash-matrix` runs a
+  relation-growing insert batch through fire-crab's own write path
+  (header, TIP, PIP, pointer and data pages all change), flushes
+  through the graph, and materializes every crash prefix. The ENGINE
+  judges each one: `gfix -v -full -n` — no errors at any careful
+  prefix; `isql` — exactly the pre-operation committed rows on every
+  partial prefix (the TIP commit flip goes LAST, so the interrupted
+  work is simply not there), all 122 on the full one.
+- **The teeth**: the naive reverse order breaks at 5 of 8 prefixes —
+  wrong-page-type corruption, file-shorter-than-expected read
+  failures, and PHANTOM ROWS from the uncommitted insert (a
+  readable, validating-adjacent file answering rows that were never
+  committed — the class careful writes exist to prevent).
+- **A rule the gate itself probed**: the PIP bit goes out AFTER the
+  data page it allocates but BEFORE the pointer that names it. The
+  draft had PIP last; a pointer-ahead-of-PIP prefix validated with
+  page ERRORS. The right side's window shows only a benign orphan
+  WARNING — space leaked, data never harmed, the artifact a real
+  kill -9 can leave.
+
+### Guarded
+- 4 unit tests (chain drain order, cycle fallback, clean pages
+  impose no order, prefixes grow the file like a disk); 244
+  workspace tests; exe gate 20/20 intact.
+
 ## 2026-07-29 — fire-crab-exe slice 1: the BLR request executor
 
 ### Converted

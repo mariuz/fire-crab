@@ -3812,6 +3812,47 @@ clients, answers real typed, filtered, joined, grouped, sorted and
 aggregated queries from real pages, and accepts writes the real engine
 verifies.
 
+## The crash matrix: careful writes judged by the engine
+
+Firebird's crash safety has no log to replay - it is the ORDER of page
+writes, held by cch.cpp's precedence graph. fire-crab-cch converts the
+graph (CCH_precedence's edges, write_buffer's recursive drain,
+check_precedence's cycle rule: an edge that would deadlock the graph
+is not added - the window page is written immediately instead), and
+the gate makes the safety claim executable rather than rhetorical.
+
+`fccch crash-matrix` performs a real multi-page operation - a batch of
+inserts through fire-crab's own write path, sized to grow the
+relation, so the header, a TIP, a PIP, a pointer page and several data
+pages all change - flushes the changed pages through the precedence
+graph, and then materializes every crash prefix: the file exactly as
+it would exist had the process died after the k-th physical write. The
+engine judges every prefix twice over. `gfix -v -full -n` must find no
+errors in any careful prefix; `isql` must count exactly the rows that
+were committed before the operation began - the TIP commit flip is the
+LAST write, so every interrupted prefix simply answers the old rows,
+and only the complete sequence answers the new ones. The file is never
+wrong, only ever behind.
+
+The same matrix in the exact reverse order breaks at five of eight
+prefixes: wrong-page-type corruption the engine refuses to open,
+I/O errors from a file shorter than its pointers promise, and - the
+class the mechanism exists to prevent - a prefix that READS PHANTOM
+ROWS, a structurally plausible file answering uncommitted data as if
+it were real. A gate that only checked the happy path would prove
+nothing; the broken half is what shows the order is load-bearing.
+
+One ordering rule came out of the gate rather than the documentation:
+where does the PIP write go? The paper's deallocation chain (pip after
+pointer after page) inverted cleanly for content and pointers, but the
+draft put the allocation PIP last - and the pointer-ahead-of-PIP
+prefix validated with page ERRORS (a pointer naming pages the
+inventory calls free). Moved between the data pages and the pointer,
+the remaining window shows only a benign orphan WARNING: space leaked,
+repairable, no data harmed - the same artifact a real kill -9 can
+leave behind. The engine's validator drew the line between the two
+windows, and the rule now carries that provenance in its comment.
+
 ## The execution differential: running the bytes the compiler matches
 
 `fire-crab-exe` opens the third direction on the oracle the dsql crate

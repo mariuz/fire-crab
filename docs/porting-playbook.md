@@ -560,6 +560,14 @@ them.
   `0.00` differ in raw form; align raws in a wide integer before
   comparing. Text-comparing rendered forms is the tempting wrong
   answer.
+- **A safety property is a MATRIX, not a happy path.** Careful-write
+  ordering was proved by materializing EVERY write prefix and letting
+  the engine's validator judge each one - and by running the same
+  matrix in reverse to watch it break (corruption, short files,
+  phantom rows). If the careless order doesn't fail your gate, the
+  gate cannot see the property. Distinguish the reference tool's
+  ERROR classes from its WARNING classes: the benign orphan window is
+  part of the correct design, not a defect to engineer away.
 - **A compound verb is usually your own plans in a trench coat - and
   its REFUSAL is part of the surface.** UPDATE OR INSERT desugars to
   try-update, test row_count, store: the UPDATE and INSERT paths the
