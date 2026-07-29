@@ -307,6 +307,12 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # a verb family may hold TWO generations: the framed window
+    # re-encodes every v3 clause under subcodes and adds its own
+    # terminator - when a feature was bolted on, expect the OLD
+    # layout nested inside the NEW tagging; and argument fills are
+    # CANONICALIZATION (LAG(x) emits three args) - probe the short
+    # forms against the long ones to find what the compiler fills
     # a WINDOW is an aggregate that KEEPS its rows: same map/verb
     # machinery, but passthrough columns join the map and partition
     # keys appear TWICE (source form + remapped fid) - when a clause

@@ -366,6 +366,12 @@ mod blr {
     /// named window functions (ROW_NUMBER, RANK, ...):
     /// blr_agg_function - counted name + an argument-count byte
     pub const AGG_FUNCTION: u8 = 0xC7;
+    /// a FRAMED window takes the v4 verb: blr_window_win with
+    /// subcodes - 1 partition, 2 order, 3 map, 4 extent unit
+    /// (RANGE 0 / ROWS 1), 5 frame bound (frame#, bound: 0
+    /// preceding / 1 following / 2 current row), 6 frame value -
+    /// and its OWN blr_end (probed)
+    pub const WINDOW_WIN: u8 = 0xD3;
     /// packaged calls: blr_exec_proc2 - counted package, counted
     /// name, u16 in-count + values, u16 out-count + variables; and
     /// blr_function2 - package, name, a count BYTE, the arguments
@@ -948,7 +954,7 @@ struct Derived {
 enum MapEntry {
     Key(Val),
     Agg(u8, Option<Val>),
-    Fn(String),
+    Fn(String, Vec<Val>),
 }
 
 struct P<'a> {
@@ -3744,22 +3750,28 @@ fn emit_map_entries(out: &mut Vec<u8>, map: &[MapEntry]) {
                     emit_val(out, a);
                 }
             }
-            MapEntry::Fn(name) => {
+            MapEntry::Fn(name, args) => {
                 out.push(blr::AGG_FUNCTION);
                 out.push(name.len() as u8);
                 out.extend_from_slice(name.as_bytes());
-                out.push(0); // zero arguments
+                out.push(args.len() as u8);
+                for a in args {
+                    emit_val(out, a);
+                }
             }
         }
     }
 }
 
-/// One window of a windowed select: blr_partition_by's operands.
+/// One window of a windowed select: blr_partition_by's operands -
+/// or blr_window_win's when a FRAME rides along (unit, two bounds,
+/// each a code and an optional value; probed).
 struct Win {
     ctx: u8,
     part: Vec<Val>,
     ord: Vec<(bool, Val)>,
     map: Vec<MapEntry>,
+    frame: Option<(u8, (u8, Option<Val>), (u8, Option<Val>))>,
 }
 
 /// The row/EOF send of a procedure: message 1, every output variable
@@ -4448,13 +4460,66 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 out.push(blr::END);
                 out.push(f.windows.len() as u8);
                 for w in &f.windows {
+                    let key_base = w.map.len() - w.part.len();
+                    if let Some((unit, b1, b2)) = &w.frame {
+                        // the v4 verb: subcoded clauses, then the
+                        // extent, then its OWN end (probed)
+                        out.push(blr::WINDOW_WIN);
+                        out.push(w.ctx);
+                        if !w.part.is_empty() {
+                            out.push(1); // win_partition
+                            out.push(w.part.len() as u8);
+                            for k in &w.part {
+                                emit_val(out, k);
+                            }
+                            for ki in 0..w.part.len() {
+                                emit_val(
+                                    out,
+                                    &Val::Fid(
+                                        w.ctx,
+                                        (key_base + ki) as u16,
+                                    ),
+                                );
+                            }
+                        }
+                        if !w.ord.is_empty() {
+                            out.push(2); // win_order
+                            out.push(w.ord.len() as u8);
+                            for (desc, k) in &w.ord {
+                                out.push(if *desc {
+                                    blr::DESCENDING
+                                } else {
+                                    blr::ASCENDING
+                                });
+                                emit_val(out, k);
+                            }
+                        }
+                        out.push(3); // win_map
+                        out.extend_from_slice(
+                            &(w.map.len() as u16).to_le_bytes(),
+                        );
+                        emit_map_entries(out, &w.map);
+                        out.push(4); // extent unit
+                        out.push(*unit);
+                        for (j, b) in [b1, b2].into_iter().enumerate() {
+                            out.push(5); // frame bound
+                            out.push(j as u8 + 1);
+                            out.push(b.0);
+                            if let Some(v) = &b.1 {
+                                out.push(6); // frame value
+                                out.push(j as u8 + 1);
+                                emit_val(out, v);
+                            }
+                        }
+                        out.push(blr::END);
+                        continue;
+                    }
                     out.push(blr::PARTITION_BY);
                     out.push(w.ctx);
                     out.push(w.part.len() as u8);
                     for k in &w.part {
                         emit_val(out, k);
                     }
-                    let key_base = w.map.len() - w.part.len();
                     for ki in 0..w.part.len() {
                         emit_val(
                             out,
@@ -4733,8 +4798,13 @@ impl<'a> P<'a> {
         enum Item {
             Col(Val),
             Agg(u8, Option<Val>),
-            /// <fn> OVER ([PARTITION BY ...] [ORDER BY ...])
-            Win(MapEntry, Vec<Val>, Vec<(bool, Val)>),
+            /// <fn> OVER ([PARTITION BY] [ORDER BY] [frame])
+            Win(
+                MapEntry,
+                Vec<Val>,
+                Vec<(bool, Val)>,
+                Option<(u8, (u8, Option<Val>), (u8, Option<Val>))>,
+            ),
         }
         let saved_sub = self.sub.replace(sidx);
         // with a join chain, qualified-only resolution across the
@@ -4756,34 +4826,84 @@ impl<'a> P<'a> {
                     self.i += 1;
                     let (verb, arg) = self.parse_agg(&w)?;
                     if self.kw("OVER") {
-                        let (part, ord) = self.over_clause(ctx)?;
+                        let (part, ord, frame) = self.over_clause(ctx)?;
                         items.push(Item::Win(
                             MapEntry::Agg(verb, arg),
                             part,
                             ord,
+                            frame,
                         ));
                     } else {
                         items.push(Item::Agg(verb, arg));
                     }
                 }
-                // the named zero-argument window functions
+                // the named window functions: ROW_NUMBER/RANK/
+                // DENSE_RANK take no arguments; FIRST_VALUE/
+                // LAST_VALUE one; LAG/LEAD canonicalize to THREE -
+                // value, offset (default 1), default (NULL) (probed)
                 Tok::Ident(w)
                     if matches!(
                         w.as_str(),
-                        "ROW_NUMBER" | "RANK" | "DENSE_RANK"
+                        "ROW_NUMBER"
+                            | "RANK"
+                            | "DENSE_RANK"
+                            | "FIRST_VALUE"
+                            | "LAST_VALUE"
+                            | "LAG"
+                            | "LEAD"
                     ) && matches!(self.t.get(self.i + 1), Some(Tok::LParen)) =>
                 {
                     let w = w.clone();
                     self.i += 2;
+                    let mut args = Vec::new();
+                    if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                        loop {
+                            args.push(self.val()?);
+                            match self.t.get(self.i)? {
+                                Tok::Comma => self.i += 1,
+                                Tok::RParen => break,
+                                _ => return None,
+                            }
+                        }
+                    }
                     if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
                         return None;
                     }
                     self.i += 1;
+                    match w.as_str() {
+                        "ROW_NUMBER" | "RANK" | "DENSE_RANK" => {
+                            if !args.is_empty() {
+                                return None;
+                            }
+                        }
+                        "FIRST_VALUE" | "LAST_VALUE" => {
+                            if args.len() != 1 {
+                                return None;
+                            }
+                        }
+                        _ => {
+                            // LAG/LEAD fill the canonical three
+                            if args.is_empty() || args.len() > 3 {
+                                return None;
+                            }
+                            if args.len() < 2 {
+                                args.push(Val::Int(1));
+                            }
+                            if args.len() < 3 {
+                                args.push(Val::Null);
+                            }
+                        }
+                    }
                     if !self.kw("OVER") {
                         return None;
                     }
-                    let (part, ord) = self.over_clause(ctx)?;
-                    items.push(Item::Win(MapEntry::Fn(w), part, ord));
+                    let (part, ord, frame) = self.over_clause(ctx)?;
+                    items.push(Item::Win(
+                        MapEntry::Fn(w, args),
+                        part,
+                        ord,
+                        frame,
+                    ));
                 }
                 Tok::Ident(w) if !is_keyword(w) => {
                     let a = w.clone();
@@ -4987,23 +5107,28 @@ impl<'a> P<'a> {
         let win_slots: Vec<(usize, u16)> = if has_wins {
             let mut slots = Vec::new();
             for it in &items {
-                let (part, ord, entry) = match it {
-                    Item::Col(v) => {
-                        (Vec::new(), Vec::new(), MapEntry::Key(v.clone()))
+                let (part, ord, frame, entry) = match it {
+                    Item::Col(v) => (
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        MapEntry::Key(v.clone()),
+                    ),
+                    Item::Win(e, p, o, fr) => {
+                        (p.clone(), o.clone(), fr.clone(), e.clone())
                     }
-                    Item::Win(e, p, o) => (p.clone(), o.clone(), e.clone()),
                     Item::Agg(..) => return None,
                 };
-                let wi = match windows
-                    .iter()
-                    .position(|w| w.part == part && w.ord == ord)
-                {
+                let wi = match windows.iter().position(|w| {
+                    w.part == part && w.ord == ord && w.frame == frame
+                }) {
                     Some(i) => i,
                     None => {
                         windows.push(Win {
                             ctx: 0,
                             part,
                             ord,
+                            frame,
                             map: Vec::new(),
                         });
                         windows.len() - 1
@@ -5863,10 +5988,15 @@ impl<'a> P<'a> {
 
     /// OVER ( [PARTITION BY cols] [ORDER BY key [ASC|DESC], ...] ) -
     /// keys resolve at the given (single) stream context (probed)
+    #[allow(clippy::type_complexity)]
     fn over_clause(
         &mut self,
         ctx: u8,
-    ) -> Option<(Vec<Val>, Vec<(bool, Val)>)> {
+    ) -> Option<(
+        Vec<Val>,
+        Vec<(bool, Val)>,
+        Option<(u8, (u8, Option<Val>), (u8, Option<Val>))>,
+    )> {
         if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
             return None;
         }
@@ -5927,11 +6057,78 @@ impl<'a> P<'a> {
                 }
             }
         }
+        // the FRAME: ROWS(1)/RANGE(0), BETWEEN two bounds or one
+        // bound with CURRENT ROW implied as the second; a bound is
+        // UNBOUNDED PRECEDING(0)/FOLLOWING(1) - no value - CURRENT
+        // ROW(2), or <value> PRECEDING/FOLLOWING (probed; demands
+        // an ORDER BY)
+        let mut frame = None;
+        let unit = if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "ROWS")
+        {
+            Some(1u8)
+        } else if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "RANGE")
+        {
+            Some(0u8)
+        } else {
+            None
+        };
+        if let Some(unit) = unit {
+            if ord.is_empty() {
+                return None;
+            }
+            self.i += 1;
+            let mut bound = |p: &mut P| -> Option<(u8, Option<Val>)> {
+                if matches!(p.t.get(p.i), Some(Tok::Ident(w)) if w == "UNBOUNDED")
+                {
+                    p.i += 1;
+                    if p.kw("PRECEDING") {
+                        return Some((0, None));
+                    }
+                    if matches!(p.t.get(p.i), Some(Tok::Ident(w)) if w == "FOLLOWING")
+                    {
+                        p.i += 1;
+                        return Some((1, None));
+                    }
+                    return None;
+                }
+                if matches!(p.t.get(p.i), Some(Tok::Ident(w)) if w == "CURRENT")
+                {
+                    p.i += 1;
+                    if !matches!(p.t.get(p.i), Some(Tok::Ident(w)) if w == "ROW")
+                    {
+                        return None;
+                    }
+                    p.i += 1;
+                    return Some((2, None));
+                }
+                let v = p.val()?;
+                if p.kw("PRECEDING") {
+                    return Some((0, Some(v)));
+                }
+                if matches!(p.t.get(p.i), Some(Tok::Ident(w)) if w == "FOLLOWING")
+                {
+                    p.i += 1;
+                    return Some((1, Some(v)));
+                }
+                None
+            };
+            if self.kw("BETWEEN") {
+                let b1 = bound(self)?;
+                if !self.kw("AND") {
+                    return None;
+                }
+                let b2 = bound(self)?;
+                frame = Some((unit, b1, b2));
+            } else {
+                let b1 = bound(self)?;
+                frame = Some((unit, b1, (2, None)));
+            }
+        }
         if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
             return None;
         }
         self.i += 1;
-        Some((part, ord))
+        Some((part, ord, frame))
     }
 
     /// one trigger-body statement; self.i past any leading keyword
@@ -9380,6 +9577,41 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_thirty_five_shapes_byte_for_byte() {
+        // LAG canonicalizes to THREE arguments - value, offset
+        // (filled 1), default (filled NULL) - under blr_agg_function
+        // (flip forty-two)
+        pin_proc(
+            "CREATE PROCEDURE RE1 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT UID, LAG(UA, 1) OVER (ORDER BY UID) FROM U2 INTO :R1, :R2 DO SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B110002021101074301C343014A02553200FF02C4010046004D01000000170003554944C402004601481700035549444D01000000C7034C4147031700025541150800010000002DFF0201180100001A000001180200001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        // ... the fills probed against explicit arguments, two
+        // functions sharing one window
+        pin_proc(
+            "CREATE PROCEDURE RE4 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT LAG(UA) OVER (ORDER BY UID), LEAD(UA, 2, 0) OVER (ORDER BY UID) FROM U2 INTO :R1, :R2 DO SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B110002021101074301C343014A02553200FF01C401004601481700035549444D02000000C7034C4147031700025541150800010000002D0100C7044C4541440317000255411508000200000015080000000000FF0201180100001A000001180101001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        // FRAME extents take the v4 blr_window_win - subcoded
+        // order/map, extent unit ROWS(1), bounds with values, its
+        // OWN end (flip forty-three)
+        pin_proc(
+            "CREATE PROCEDURE RE3 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT SUM(UA) OVER (ORDER BY UID ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM U2 INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B110002021101074301C343014A02553200FF01D30102014817000355494403010000005617000255410401050100060115080001000000050202FFFF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... RANGE(0), UNBOUNDED = a bound sans value
+        pin_proc(
+            "CREATE PROCEDURE RE5 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT SUM(UA) OVER (ORDER BY UID RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM U2 INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B110002021101074301C343014A02553200FF01D30102014817000355494403010000005617000255410400050100050202FFFF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... a single bound implies CURRENT ROW as frame two, and
+        // the v4 partition subcode carries the v3 layout
+        pin_proc(
+            "CREATE PROCEDURE RE7 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT SUM(UA) OVER (PARTITION BY UID ORDER BY UA ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM U2 INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B110002021101074301C343014A02553200FF01D3010101170003554944180101000201481700025541030200000056170002554101001700035549440401050100050202FFFF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+    }
+
+    #[test]
     fn window_refusals() {
         for sql in [
             // windows beside GROUP BY/aggregates: unprobed
@@ -9390,9 +9622,10 @@ mod tests {
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN SELECT COUNT(*) OVER () FROM U2 INTO :R1; SUSPEND; END",
             // statement-level ORDER BY over windows: unprobed
             "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT UID, COUNT(*) OVER () FROM U2 ORDER BY UID INTO :R1, :R2 DO SUSPEND; END",
-            // frame extents (ROWS/RANGE BETWEEN) take the v4 verb:
-            // unprobed
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT SUM(UA) OVER (ORDER BY UID ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM U2 INTO :R1 DO SUSPEND; END",
+            // a frame DEMANDS an order (unprobed without one)
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT SUM(UA) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM U2 INTO :R1 DO SUSPEND; END",
+            // NTH_VALUE and the exclusion clauses: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT NTH_VALUE(UA, 2) OVER (ORDER BY UID) FROM U2 INTO :R1 DO SUSPEND; END",
         ] {
             assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
         }

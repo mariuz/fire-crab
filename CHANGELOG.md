@@ -13,6 +13,32 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-dsql slice 35: windowed argument functions, frame extents
+
+### Converted
+- **LAG / LEAD / FIRST_VALUE / LAST_VALUE** (flip forty-two):
+  argument-taking window functions under `blr_agg_function` — a
+  counted name and true argument count. LAG and LEAD canonicalize
+  to THREE arguments: the value, the offset (filled with literal 1
+  when omitted), and the default (filled with blr_null) — probed
+  against explicit-argument forms sharing one window.
+- **Frame extents** (flip forty-three — slice 34's refusal): a
+  framed window switches to the v4 `blr_window_win` verb with
+  subcoded clauses — 1 partition (the v3 layout under a tag), 2
+  order, 3 map, 4 extent unit (RANGE 0 / ROWS 1), 5 frame bound
+  (frame number + bound code: 0 preceding / 1 following / 2
+  current row), 6 frame value — and its OWN blr_end where the v3
+  form leans on the shared rse end. UNBOUNDED is a bound sans
+  value; a single-bound frame implies CURRENT ROW as frame two.
+  v3 and v4 windows mix freely in one statement.
+
+### Guarded
+- NTH_VALUE, exclusion clauses, frames without an ORDER BY, named
+  windows (the WINDOW clause). Gate: `qa/dsql-proc-blr.sh` grew to
+  208 checks (7 fresh — among them LAST_VALUE over an
+  UNBOUNDED-to-UNBOUNDED range and a mixed framed/unframed pair);
+  343 unit byte-pins.
+
 ## 2026-07-29 — fire-crab-dsql slice 34: window functions
 
 ### Converted

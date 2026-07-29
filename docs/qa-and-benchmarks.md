@@ -4666,6 +4666,26 @@ WHEN, and a BLOCK as a handler's body nests blr_block again with no
 handler section of its own - the battery runs a handler block
 containing an EXIT.
 
+Slice 35 completed the window story in two flips. The
+argument-taking functions - LAG, LEAD, FIRST_VALUE, LAST_VALUE -
+ride the same blr_agg_function verb with TRUE argument counts,
+and LAG/LEAD canonicalize to three: the value, the offset, the
+default - a one-argument LAG(X) emits (X, literal 1, blr_null),
+pinned beside an explicit LEAD(X, 2, 0) sharing the same window.
+And frames flipped slice 34's refusal on the v4 verb: a window
+with a ROWS/RANGE extent abandons blr_partition_by for
+blr_window_win, where every clause the v3 form wrote bare gets a
+SUBCODE - partition 1 (the v3 layout under a tag), order 2, map 3
+- followed by the extent: unit 4 (RANGE 0, ROWS 1), bounds 5
+(frame number then 0 preceding / 1 following / 2 current row),
+values 6. The v4 form carries its OWN blr_end where v3 leans on
+the shared rse end. UNBOUNDED is simply a bound without a value
+tag; a single-bound frame implies CURRENT ROW as its second; and
+v3 and v4 windows MIX in one statement - the battery pairs a
+framed running sum with an unframed COUNT(*) OVER (), and drives
+LAST_VALUE across an UNBOUNDED-to-UNBOUNDED range - compositions
+no probe ran.
+
 Slice 34 opened the WINDOW surface - and the engine's own genBlr
 explained the one chunk the probes couldn't. OVER ([PARTITION BY]
 [ORDER BY]) compiles to blr_window wrapping the inner rse (the
