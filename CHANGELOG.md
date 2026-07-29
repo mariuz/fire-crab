@@ -13,6 +13,35 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-evt slice 1: an event is a counter
+
+### Converted
+- **A NEW CRATE for `src/jrd/event.cpp`** — and the insight the whole
+  surface follows from: an event is not a message but a COUNTER
+  (`evnt_count`, event.h:105), while a client's interest carries the
+  count it has already seen (`rint_count`). From that alone:
+  delivery is COMMIT-TIME; ROLLBACK swallows posts because they were
+  never counted; several posts of one name COALESCE into ONE delivery
+  carrying the new counter (a client learns "it happened, and the
+  counter is now N", never "here are three messages"); a fired
+  interest comes DOWN until the client re-queues; and a fresh
+  interest below the current count fires AT ONCE, which is exactly
+  how a subscribing client learns its baseline.
+- **The differential is SEMANTIC, and it uses the paper's own
+  sample**: `samples/nodejs/events.js` prints those facts against a
+  real server over a real auxiliary connection, `fcevt replay` prints
+  them from the converted table, and the gate asserts they agree —
+  matching on the counter DELTA, the invariant that survives a
+  database's own history where absolute counters do not.
+
+### Guarded
+- The shared-memory arena (self-relative queues, process and session
+  blocks, the watcher thread) and the wire delivery path (the
+  auxiliary connection carrying op_event) are transport and stay
+  unconverted; cross-process posting and the AST callback are named
+  for later. Gate: `qa/evt-semantics.sh` (4 checks); 6 unit tests;
+  287 workspace tests.
+
 ## 2026-07-29 — fire-crab-opt slice 7: the cost model closes, on fresh statistics
 
 ### The experiment that cracked it

@@ -568,6 +568,17 @@ them.
   the reference engine's own syntax error, another a model boundary
   (catalog-typed casts in a catalog-free compiler) - name those as
   what they are instead of forcing them.
+- **Some mechanisms are a COUNTER wearing a message's clothes.**
+  Firebird's events look like a pub/sub queue and are not: the block
+  holds a count, the interest holds a threshold, and commit-time
+  delivery, rollback swallowing, coalescing and one-shot interests
+  all fall out of that. Find the state variable before modelling the
+  protocol.
+- **A differential can be SEMANTIC.** Where the transport is shared
+  memory you have not converted, drive the reference through a real
+  client, print the observable facts from both sides, and compare
+  those - matching on the INVARIANT (a delta) rather than absolutes
+  that carry history.
 - **When a decision surface looks arbitrary, CHANGE AN INPUT you had
   not thought of.** An optimizer grid made no sense until statistics
   were refreshed - and then the reference's own formulas explained

@@ -3944,6 +3944,28 @@ aggregate-soundness argument, FIFO fairness, and the roadmap through
 lock data, ASTs, timeouts, owner teardown and the fb_lock_print
 differential.
 
+## Event semantics: a counter, not a message
+
+The event manager's differential is semantic rather than byte-level,
+and it reuses something the paper already had: working event clients
+in four languages. The node one subscribes over a real auxiliary
+connection and prints exactly the laws that matter - rollback swallows
+posts, delivery is commit-time, three posts coalesce into one delivery
+- so the gate runs it against the live server and then replays the
+same scenario through the converted table, asserting both agree.
+
+The match is on the counter DELTA rather than the absolute count,
+because an event's counter carries the database's whole history: a
+scratch database that has ever posted the name starts above zero. The
+delta is the invariant, and insisting on it is what lets the gate run
+against any database rather than a pristine one.
+
+Underneath all of it is the observation that makes the surface simple:
+an event is a COUNTER and an interest is a THRESHOLD. Commit-time
+delivery, rollback swallowing, coalescing, one-shot interests and the
+immediate baseline are not five rules but one mechanism seen from five
+angles.
+
 ## Oracle number five: the engine's own PLAN
 
 The optimizer looked like the subsystem with the weakest oracle -
