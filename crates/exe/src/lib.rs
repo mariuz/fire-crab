@@ -23,7 +23,9 @@
 //! other direction.
 
 use fire_crab_ods::{
-    relation_columns, resolve_relation, visible_rows, TipChain, Value,
+    decode_record, read_blob_content, relation_columns, relation_data_pages,
+    resolve_relation, system_relation_formats, visible_rows, DataPage, TipChain,
+    Value,
 };
 
 /// The BLR verbs this executor understands - `blr.h` values. The
@@ -1217,6 +1219,42 @@ pub fn execute(
     request: &Request,
     args: &[String],
 ) -> Result<Vec<(u8, Vec<Value>)>, String> {
+    // parse each CLI argument by its message slot's dtype, then run
+    // the value-typed core (the wire server binds Values directly)
+    let mut vals = Vec::with_capacity(args.len());
+    if let Some((_, slots)) = request.messages.iter().find(|(n, _)| *n == 0) {
+        let inputs = slots.len() / 2;
+        if args.len() != inputs {
+            return Err(format!(
+                "procedure takes {} argument(s), got {}",
+                inputs,
+                args.len()
+            ));
+        }
+        for (i, a) in args.iter().enumerate() {
+            let slot = &slots[2 * i];
+            vals.push(match slot.dtype {
+                blr::DT_SHORT | blr::DT_LONG | blr::DT_INT64 => Value::Int(
+                    a.parse::<i64>()
+                        .map_err(|_| format!("argument {} is not an integer", i + 1))?,
+                ),
+                _ => Value::Text(a.clone()),
+            });
+        }
+    } else if !args.is_empty() {
+        return Err(format!("procedure takes no arguments, got {}", args.len()));
+    }
+    bind_and_execute(file, page_size, request, &vals)
+}
+
+/// [execute] with the arguments already typed - what the wire server
+/// binds (its parameters arrive as [Value]s, not text).
+pub fn bind_and_execute(
+    file: &[u8],
+    page_size: usize,
+    request: &Request,
+    args: &[Value],
+) -> Result<Vec<(u8, Vec<Value>)>, String> {
     let mut max_msg = 0u8;
     for (n, _) in &request.messages {
         max_msg = max_msg.max(*n);
@@ -1228,23 +1266,23 @@ pub fn execute(
         msg_slots[*n as usize] = slots.clone();
     }
     // bind message 0 - the input parameters, (value, null) pairs
-    // with no EOF slot; each CLI argument parses by its slot's dtype
+    // with no EOF slot
     if let Some((_, slots)) = request.messages.iter().find(|(n, _)| *n == 0) {
         let inputs = slots.len() / 2;
         if args.len() != inputs {
-            return Err(format!("procedure takes {} argument(s), got {}", inputs, args.len()));
+            return Err(format!(
+                "procedure takes {} argument(s), got {}",
+                inputs,
+                args.len()
+            ));
         }
-        for (i, a) in args.iter().enumerate() {
-            let slot = &slots[2 * i];
-            let v = match slot.dtype {
-                blr::DT_SHORT | blr::DT_LONG | blr::DT_INT64 => Value::Int(
-                    a.parse::<i64>().map_err(|_| format!("argument {} is not an integer", i + 1))?,
-                ),
-                _ => Value::Text(a.clone()),
-            };
-            msg_bufs[0][2 * i] = v;
-            msg_bufs[0][2 * i + 1] = Value::Int(0);
+        for (i, v) in args.iter().enumerate() {
+            let is_null = matches!(v, Value::Null);
+            msg_bufs[0][2 * i] = v.clone();
+            msg_bufs[0][2 * i + 1] = Value::Int(if is_null { -1 } else { 0 });
         }
+    } else if !args.is_empty() {
+        return Err(format!("procedure takes no arguments, got {}", args.len()));
     }
     let mut ex = Exec {
         file,
@@ -2820,6 +2858,56 @@ fn null_aware_cmp(a: &Value, b: &Value, desc: bool) -> std::cmp::Ordering {
         o
     }
 }
+
+/// The catalog read: RDB$PROCEDURES' committed primary row named
+/// `name`, its RDB$PROCEDURE_BLR blob.
+pub fn procedure_blr(file: &[u8], page_size: usize, name: &str) -> Result<Vec<u8>, String> {
+    let rel = resolve_relation(file, page_size, "RDB$PROCEDURES")
+        .ok_or("no RDB$PROCEDURES relation")?;
+    let formats = system_relation_formats(file, page_size, "RDB$PROCEDURES")
+        .ok_or("no RDB$PROCEDURES format")?;
+    let (_, descs) = formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .ok_or("empty format list")?;
+    let cols = relation_columns(file, page_size, "RDB$PROCEDURES");
+    let fid = |n: &str| {
+        cols.iter()
+            .find(|c| c.name == n)
+            .map(|c| c.field_id as usize)
+    };
+    let name_f = fid("RDB$PROCEDURE_NAME").ok_or("no RDB$PROCEDURE_NAME column")?;
+    let blr_f = fid("RDB$PROCEDURE_BLR").ok_or("no RDB$PROCEDURE_BLR column")?;
+    for dp_no in relation_data_pages(file, page_size, rel) {
+        let start = dp_no as usize * page_size;
+        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode)
+        else {
+            continue;
+        };
+        for r in dp.records() {
+            if !r.is_primary_record() {
+                continue;
+            }
+            let Some(image) = r.image() else { continue };
+            let values = decode_record(&image, descs);
+            let Some(Value::Text(t)) = values.get(name_f) else {
+                continue;
+            };
+            if t.trim_end() != name {
+                continue;
+            }
+            return match values.get(blr_f) {
+                Some(Value::Blob(brel, brec)) => {
+                    read_blob_content(file, page_size, *brel, *brec)
+                        .ok_or_else(|| "cannot read the BLR blob".into())
+                }
+                _ => Err(format!("procedure {} has no BLR", name)),
+            };
+        }
+    }
+    Err(format!("procedure {} not found", name))
+}
+
 
 #[cfg(test)]
 mod tests {

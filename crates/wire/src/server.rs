@@ -17497,6 +17497,53 @@ fn exec_psql_stmt(
 /// `args` are the input values already decoded (literals parsed from the
 /// statement text, or bound `?` parameters). Errors carry the SQLSTATE
 /// the caller turns into an op_response.
+/// SELECT FROM a procedure, BLR-FIRST: when the stored
+/// RDB\$PROCEDURE_BLR parses in fire-crab-exe's surface, execute the
+/// COMPILED bytes - the same bytes fcdsql matches and the engine
+/// runs - and take the suspended rows from the message-1 sends.
+/// Anything outside the surface (or any failure) returns None and
+/// the SOURCE interpreter runs as before; the two paths answer the
+/// same rows where they overlap (both engine-gated), but the BLR
+/// path also serves shapes the interpreter never learned - windows,
+/// frames, quantified subqueries.
+fn try_procedure_blr(
+    database: &Option<Database>,
+    name: &str,
+    args: &[Value],
+) -> Option<Vec<Vec<Value>>> {
+    let db = database.as_ref()?;
+    let blr =
+        fire_crab_exe::procedure_blr(&db.bytes, db.page_size, name).ok()?;
+    let req = fire_crab_exe::parse(&blr).ok()?;
+    let sends =
+        fire_crab_exe::bind_and_execute(&db.bytes, db.page_size, &req, args).ok()?;
+    // message 1: (value, null-flag) pairs + the EOF short; a row is
+    // a send with EOF = 1
+    let out_slots = req.messages.iter().find(|(n, _)| *n == 1).map(|(_, s)| s.len())?;
+    if out_slots < 3 || out_slots % 2 == 0 {
+        return None;
+    }
+    let outputs = (out_slots - 1) / 2;
+    let mut rows = Vec::new();
+    for (msg, buf) in sends {
+        if msg != 1 || !matches!(buf.last(), Some(Value::Int(1))) {
+            continue;
+        }
+        let mut row = Vec::with_capacity(outputs);
+        for i in 0..outputs {
+            let null =
+                matches!(buf.get(2 * i + 1), Some(Value::Int(f)) if *f != 0);
+            row.push(if null {
+                Value::Null
+            } else {
+                buf.get(2 * i).cloned().unwrap_or(Value::Null)
+            });
+        }
+        rows.push(row);
+    }
+    Some(rows)
+}
+
 fn run_procedure(
     database: &mut Option<Database>,
     name: &str,
@@ -19140,6 +19187,25 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         _ => unreachable!(),
                     };
                     let ctx = SessionCtx { user, attach_id };
+                    // BLR-FIRST: the compiled bytes when they parse
+                    // in fire-crab-exe's surface, the source
+                    // interpreter otherwise
+                    if let Some(suspended) =
+                        try_procedure_blr(&database, &pname, &pargs)
+                    {
+                        let rows: Vec<Vec<Value>> = suspended
+                            .iter()
+                            .map(|r| {
+                                picks
+                                    .iter()
+                                    .map(|p| r.get(*p).cloned().unwrap_or(Value::Null))
+                                    .collect()
+                            })
+                            .collect();
+                        plan = Plan::ProcRows { cols: pcols, rows };
+                        respond(&mut s, &mut enc, TX_HANDLE)?;
+                        continue;
+                    }
                     match run_procedure(&mut database, &pname, &pargs, &ctx) {
                         Ok((_, suspended)) => {
                             // project each suspended row down to the

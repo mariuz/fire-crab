@@ -3981,6 +3981,18 @@ windows, and the rule now carries that provenance in its comment.
 
 ## The execution differential: running the bytes the compiler matches
 
+(Slice 13 closed the loop into PRODUCTION: the wire server now
+serves SELECT FROM <procedure> BLR-first through fire-crab-exe -
+the stored bytes the compiler matches, executed for real clients -
+with the source interpreter as fallback outside the surface. The
+serve-real-exeproc gate holds seven procedure shapes the interpreter
+never learned - running windows, RANK, LAG, frames, correlated
+EXISTS, FULL JOIN, parameters - node-fetched from fcwire and equal
+to the engine, green on the first run. Compiler, executor and
+server now share one artifact: the engine's own BLR.)
+
+
+
 `fire-crab-exe` opens the third direction on the oracle the dsql crate
 has been writing toward. The dsql crate PRODUCES the engine's compiled
 BLR byte-for-byte; ods READS the engine's pages; exe now RUNS the one

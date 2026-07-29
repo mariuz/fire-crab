@@ -13,6 +13,32 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-exe slice 13: the wire adoption
+
+### Converted
+- **The two paths meet.** `SELECT FROM <procedure>` over the wire
+  now serves BLR-FIRST: the server reads the stored
+  RDB$PROCEDURE_BLR — the same bytes fcdsql matches byte-for-byte
+  and the engine itself executes — parses it in fire-crab-exe's
+  surface, and takes the suspended rows straight from the
+  message-1 sends. Anything outside the surface falls back to the
+  source interpreter unchanged.
+- **The payoff**: procedure bodies the interpreter NEVER learned
+  now serve over the wire — running-SUM windows, RANK/DENSE_RANK,
+  LAG, ROWS BETWEEN frames, correlated EXISTS, FULL JOINs,
+  parameterized procedures — each answer node-fetched from fcwire
+  and equal to the engine running the same procedure
+  (`qa/serve-real-exeproc.sh`, 7 checks, green first run).
+- exe's `execute` split into a value-typed core
+  (`bind_and_execute` — what the server binds) and the CLI's
+  string-parsing wrapper; `procedure_blr` moved to the library.
+
+### Guarded
+- EXECUTE PROCEDURE (ProcInvoke) stays on the interpreter — its
+  first-suspended-row semantics ride a later slice. Regressions:
+  psql 55, modifiers 41, nofallback 54, selectexpr 88, exe gate
+  110; 270 workspace tests.
+
 ## 2026-07-29 — fire-crab-lck slice 2: teardown, lock data, the blocking set
 
 ### Converted

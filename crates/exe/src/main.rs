@@ -8,63 +8,11 @@
 //! the procedure SUSPENDs - the shape `SELECT * FROM <proc>` answers
 //! on the engine, for the differential gate to compare.
 
-use fire_crab_exe::{execute, parse};
-use fire_crab_ods::{
-    decode_record, read_blob_content, relation_columns, relation_data_pages,
-    resolve_relation, system_relation_formats, DataPage, Value,
-};
+use fire_crab_exe::{execute, parse, procedure_blr};
+use fire_crab_ods::Value;
 
 fn page_size_of(file: &[u8]) -> Option<usize> {
     fire_crab_ods::tra::page_size_of(file)
-}
-
-/// The catalog read: RDB$PROCEDURES' committed primary row named
-/// `name`, its RDB$PROCEDURE_BLR blob.
-fn procedure_blr(file: &[u8], page_size: usize, name: &str) -> Result<Vec<u8>, String> {
-    let rel = resolve_relation(file, page_size, "RDB$PROCEDURES")
-        .ok_or("no RDB$PROCEDURES relation")?;
-    let formats = system_relation_formats(file, page_size, "RDB$PROCEDURES")
-        .ok_or("no RDB$PROCEDURES format")?;
-    let (_, descs) = formats
-        .iter()
-        .max_by_key(|(n, _)| *n)
-        .ok_or("empty format list")?;
-    let cols = relation_columns(file, page_size, "RDB$PROCEDURES");
-    let fid = |n: &str| {
-        cols.iter()
-            .find(|c| c.name == n)
-            .map(|c| c.field_id as usize)
-    };
-    let name_f = fid("RDB$PROCEDURE_NAME").ok_or("no RDB$PROCEDURE_NAME column")?;
-    let blr_f = fid("RDB$PROCEDURE_BLR").ok_or("no RDB$PROCEDURE_BLR column")?;
-    for dp_no in relation_data_pages(file, page_size, rel) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode)
-        else {
-            continue;
-        };
-        for r in dp.records() {
-            if !r.is_primary_record() {
-                continue;
-            }
-            let Some(image) = r.image() else { continue };
-            let values = decode_record(&image, descs);
-            let Some(Value::Text(t)) = values.get(name_f) else {
-                continue;
-            };
-            if t.trim_end() != name {
-                continue;
-            }
-            return match values.get(blr_f) {
-                Some(Value::Blob(brel, brec)) => {
-                    read_blob_content(file, page_size, *brel, *brec)
-                        .ok_or_else(|| "cannot read the BLR blob".into())
-                }
-                _ => Err(format!("procedure {} has no BLR", name)),
-            };
-        }
-    }
-    Err(format!("procedure {} not found", name))
 }
 
 fn main() {
