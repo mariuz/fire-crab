@@ -3954,6 +3954,17 @@ index's own order or needs a sort - and then execute NOTHING. That
 is a complete, textual, side-effect-free statement of a decision
 that would otherwise be visible only through timings.
 
+Slice 2 took the oracle to joins, where the optimizer's decision is
+an ORDER rather than an index: the inner stream must reach its rows
+through the join key's index, so the engine SWAPS the SQL order when
+only the first stream's key is indexed - and when neither is, it
+abandons the nested loop for a HASH, except under an outer join
+whose preserved side cannot be swapped away. Type families gate the
+whole thing: a VARCHAR = INTEGER join hashes even with an indexed
+side. That last rule caught a real bug in passing - the catalog's
+RDB$FIELD_TYPE codes and the ODS descriptor dtypes are different
+numberings, and mixing them made a VARCHAR look numeric.
+
 So fire-crab-opt prints the same line for the same statement, and
 the gate diffs them across the decision surface: no predicate,
 matchable and unmatchable comparisons, AND versus OR structure,

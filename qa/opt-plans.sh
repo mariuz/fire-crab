@@ -97,11 +97,24 @@ check "SELECT ID FROM T WHERE ID > 3 ORDER BY ID"
 check "SELECT ID FROM T WHERE AMT > 3 ORDER BY ID"
 check "SELECT ID FROM T WHERE NOTE = 'x' ORDER BY ID"
 
+# --- two-stream joins: order, swap, hash ------------------------------
+check "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID"
+check "SELECT A.UID FROM U A JOIN T B ON A.UID = B.ID"
+check "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UA"
+check "SELECT A.UA FROM U A JOIN U B ON A.UA = B.UA"
+check "SELECT A.ID FROM T A JOIN U B ON A.NAME = B.UA"
+check "SELECT A.ID FROM T A LEFT JOIN U B ON A.ID = B.UID"
+check "SELECT A.ID FROM T A LEFT JOIN U B ON A.ID = B.UA"
+check "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID WHERE A.AMT = 3"
+check "SELECT A.ID FROM T A LEFT JOIN U B ON A.ID = B.UID WHERE A.AMT = 3"
+check "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID WHERE B.UA = 7"
+check "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID ORDER BY A.ID"
+check "SELECT A.ID FROM T A, U B WHERE A.ID = B.UID"
+
 # --- outside the slice -------------------------------------------------
-refuse "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID"
 refuse "SELECT ID FROM T UNION ALL SELECT UID FROM U"
 refuse "SELECT ID FROM T WHERE ID IN (SELECT UID FROM U)"
 refuse "SELECT ID FROM T ORDER BY ID, AMT"
-refuse "SELECT ID FROM T, U"
+refuse "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID JOIN T C ON C.ID = B.UID"
 
 exit $fail

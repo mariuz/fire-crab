@@ -13,6 +13,38 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-opt slice 2: join plans, the swap, and the hash
+
+### Converted
+- **Two-stream join plans** — `PLAN JOIN (<driver>, <inner> INDEX
+  (...))`, streams named by their ALIAS when the query gives one.
+  The decision the engine makes and this slice now makes: the inner
+  stream must reach its rows through the join key's index, so the
+  optimizer **SWAPS the SQL order** when only the FIRST stream's key
+  is indexed (`T A JOIN U B ON A.ID = B.UA` plans as
+  `JOIN ("B" NATURAL, "A" INDEX (IDX_T_ID))`).
+- **The hash fallback** (FB5+): when NEITHER key is indexed the
+  engine hashes — `PLAN HASH ("A" NATURAL, "B" NATURAL)` — but an
+  OUTER join keeps its nested loop, because the preserved side must
+  drive and cannot be swapped away. Both probed, both converted.
+- **Type families gate index use**: a `VARCHAR = INTEGER` join
+  hashes even though one side is indexed. The bug this caught in
+  passing is worth the note: catalog `RDB$FIELD_TYPE` codes and ODS
+  DESCRIPTOR dtypes are DIFFERENT NUMBERINGS (37 means VARCHAR in
+  one and nothing in the other), and mixing them made a VARCHAR look
+  numeric.
+- **The driving stream keeps its own access**: a WHERE filter gives
+  it INDEX, a navigable ORDER BY gives it ORDER (and cancels the
+  SORT), else NATURAL. A conjunct with BOTH sides qualified is the
+  JOIN KEY, not a filter — the comma-join form carries its join
+  predicate in the WHERE.
+
+### Guarded
+- Three-plus-stream chains, ORDER BY on the non-driving stream
+  (which the engine answers through equivalence-class reasoning),
+  unions and subqueries. Gate: `qa/opt-plans.sh` 31 → 42 checks;
+  280 workspace tests.
+
 ## 2026-07-29 — fire-crab-opt slice 1: the optimizer's access paths, and oracle number five
 
 ### Converted
