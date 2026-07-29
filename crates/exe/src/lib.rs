@@ -52,6 +52,7 @@ mod blr {
     pub const CONCATENATE: u8 = 39;
     pub const SUBSTRING: u8 = 40;
     pub const VIA: u8 = 43;
+    pub const GEN_ID: u8 = 101;
     pub const UPCASE: u8 = 103;
     pub const LOWCASE: u8 = 181;
     pub const STRLEN: u8 = 182;
@@ -111,6 +112,7 @@ mod blr {
     pub const WINDOW: u8 = 195;
     pub const PARTITION_BY: u8 = 196;
     pub const AGG_FUNCTION: u8 = 199;
+    pub const GEN_ID2: u8 = 210;
     pub const WINDOW_WIN: u8 = 211;
     // blr_window_win subcodes
     pub const WW_PARTITION: u8 = 1;
@@ -176,6 +178,14 @@ pub enum Expr {
     Arith(u8, Box<Expr>, Box<Expr>),
     /// blr_negate
     Negate(Box<Expr>),
+    /// blr_gen_id / blr_gen_id2: read-and-advance a generator - the
+    /// step expression for GEN_ID, the sequence's own increment for
+    /// NEXT VALUE FOR. The advance lands in an IN-MEMORY overlay:
+    /// consecutive reads in one execution see it, the FILE is never
+    /// written (fcexe is a harness; the wire server excludes
+    /// generator-writing requests from the BLR path and lets its
+    /// persisting interpreter serve them)
+    GenId(String, Option<Box<Expr>>),
     /// blr_upcase / blr_lowcase - ASCII case mapping (the charset
     /// layer waits with internationalization)
     CaseMap(bool, Box<Expr>),
@@ -408,6 +418,10 @@ pub struct Request {
     pub messages: Vec<(u8, Vec<MsgSlot>)>,
     pub declares: usize,
     pub body: Stmt,
+    /// GEN_ID / NEXT VALUE FOR appears in the body: executing this
+    /// request ADVANCES generator state (in-memory here; a caller
+    /// that must persist should route around this executor)
+    pub uses_generators: bool,
 }
 
 // ---------------------------------------------------------------- parse
@@ -415,6 +429,8 @@ pub struct Request {
 struct P<'a> {
     b: &'a [u8],
     i: usize,
+    /// the request reads-and-advances a generator somewhere
+    uses_generators: bool,
 }
 
 impl<'a> P<'a> {
@@ -598,6 +614,15 @@ impl<'a> P<'a> {
                     ops.push(self.expr()?);
                 }
                 Ok(Expr::Coalesce(ops))
+            }
+            blr::GEN_ID => {
+                self.uses_generators = true;
+                let name = self.counted_name()?;
+                Ok(Expr::GenId(name, Some(Box::new(self.expr()?))))
+            }
+            blr::GEN_ID2 => {
+                self.uses_generators = true;
+                Ok(Expr::GenId(self.counted_name()?, None))
             }
             blr::UPCASE => Ok(Expr::CaseMap(true, Box::new(self.expr()?))),
             blr::LOWCASE => Ok(Expr::CaseMap(false, Box::new(self.expr()?))),
@@ -1108,7 +1133,7 @@ fn scaled(raw: i64, scale: i8) -> Value {
 /// begin, messages, an inner begin holding declares + NULL-inits +
 /// stall + the labeled body, the trailing EOF send.
 pub fn parse(blr_bytes: &[u8]) -> Result<Request, String> {
-    let mut p = P { b: blr_bytes, i: 0 };
+    let mut p = P { b: blr_bytes, i: 0, uses_generators: false };
     if p.u8()? != blr::VERSION5 {
         return Err("not blr_version5 - unconverted".into());
     }
@@ -1178,7 +1203,12 @@ pub fn parse(blr_bytes: &[u8]) -> Result<Request, String> {
     }
     let mut all = vec![Stmt::Begin(body)];
     all.extend(tail);
-    Ok(Request { messages, declares, body: Stmt::Begin(all) })
+    Ok(Request {
+        messages,
+        declares,
+        body: Stmt::Begin(all),
+        uses_generators: p.uses_generators,
+    })
 }
 
 // -------------------------------------------------------------- execute
@@ -1199,6 +1229,9 @@ struct StreamFrame {
 struct Exec<'a> {
     file: &'a [u8],
     page_size: usize,
+    /// generator advances live HERE, never in the file - reads in
+    /// one execution see each other's steps
+    gen_overlay: std::collections::BTreeMap<i64, i64>,
     variables: Vec<Value>,
     /// per message number: the slot buffer
     msg_bufs: Vec<Vec<Value>>,
@@ -1287,6 +1320,7 @@ pub fn bind_and_execute(
     let mut ex = Exec {
         file,
         page_size,
+        gen_overlay: std::collections::BTreeMap::new(),
         variables: vec![Value::Null; request.declares],
         msg_bufs,
         msg_slots,
@@ -2122,6 +2156,63 @@ impl<'a> Exec<'a> {
         Err(format!("index {} not found on {}", index, table))
     }
 
+    /// RDB$GENERATORS: the named generator's id and increment.
+    fn generator_by_name(&self, name: &str) -> Result<(i64, i64), String> {
+        let rel = resolve_relation(self.file, self.page_size, "RDB$GENERATORS")
+            .ok_or("no RDB$GENERATORS")?;
+        let formats = system_relation_formats(
+            self.file,
+            self.page_size,
+            "RDB$GENERATORS",
+        )
+        .ok_or("no RDB$GENERATORS format")?;
+        let (_, descs) = formats
+            .iter()
+            .max_by_key(|(n, _)| *n)
+            .ok_or("empty format")?;
+        let cols = relation_columns(self.file, self.page_size, "RDB$GENERATORS");
+        let fid = |n: &str| {
+            cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize)
+        };
+        let name_f = fid("RDB$GENERATOR_NAME").ok_or("no name column")?;
+        let id_f = fid("RDB$GENERATOR_ID").ok_or("no id column")?;
+        let inc_f = fid("RDB$GENERATOR_INCREMENT");
+        for dp_no in
+            fire_crab_ods::relation_data_pages(self.file, self.page_size, rel)
+        {
+            let start = dp_no as usize * self.page_size;
+            let Some(dp) = self
+                .file
+                .get(start..start + self.page_size)
+                .and_then(DataPage::decode)
+            else {
+                continue;
+            };
+            for r in dp.records() {
+                if !r.is_primary_record() {
+                    continue;
+                }
+                let Some(image) = r.image() else { continue };
+                let values = decode_record(&image, descs);
+                let Some(Value::Text(t)) = values.get(name_f) else {
+                    continue;
+                };
+                if t.trim_end() != name {
+                    continue;
+                }
+                let Some(Value::Int(id)) = values.get(id_f) else {
+                    continue;
+                };
+                let inc = match inc_f.and_then(|f| values.get(f)) {
+                    Some(Value::Int(n)) => *n,
+                    _ => 1,
+                };
+                return Ok((*id, inc));
+            }
+        }
+        Err(format!("generator {} not found", name))
+    }
+
     /// The committed-visibility scan of one relation.
     fn scan_relation(&mut self, name: &str) -> Result<Vec<Vec<Value>>, String> {
         let rel = resolve_relation(self.file, self.page_size, name)
@@ -2332,6 +2423,23 @@ impl<'a> Exec<'a> {
                     }
                 }
                 out
+            }
+            Expr::GenId(name, step) => {
+                let (id, increment) = self.generator_by_name(name)?;
+                let step = match step {
+                    Some(e) => match self.eval(e)? {
+                        Value::Int(n) => n,
+                        _ => return Err("GEN_ID step is not an integer".into()),
+                    },
+                    None => increment,
+                };
+                let cur = *self
+                    .gen_overlay
+                    .get(&id)
+                    .unwrap_or(&fire_crab_ods::gen::read(self.file, self.page_size, id));
+                let new = cur + step;
+                self.gen_overlay.insert(id, new);
+                Value::Int(new)
             }
             Expr::CaseMap(up, inner) => match self.eval(inner)? {
                 Value::Null => Value::Null,

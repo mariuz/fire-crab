@@ -4003,6 +4003,17 @@ windows, and the rule now carries that provenance in its comment.
 
 ## The execution differential: running the bytes the compiler matches
 
+(Slice 15 drew the persistence boundary: GEN_ID and NEXT VALUE FOR
+execute through an in-memory overlay - reads in one run see each
+other's steps, the file is never written - and the boundary is
+explicit at every layer: the harness documents it, the parsed
+request carries a uses_generators flag, and the wire server routes
+generator-writing bodies to its persisting interpreter instead of
+the BLR path. Correctness over adoption. The gate protocol is worth
+naming: a generator-advancing body cannot be compared by running
+both sides in sequence - each run steps the sequence - so the gate
+RESTARTS the sequence before each side and both count in lockstep.)
+
 (Slice 14 finished the adoption: EXECUTE PROCEDURE serves BLR-first
 at BOTH wire sites - op_execute and op_execute2, the OO clients'
 path, found the honest way when the gate's node call died on it -

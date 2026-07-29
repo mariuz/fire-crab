@@ -293,7 +293,53 @@ check "RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT ID, COUNT(*) OVER (O
 check "RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT ID, SUM(AMT) OVER (ORDER BY ID RANGE BETWEEN CURRENT ROW AND 2 FOLLOWING) FROM T INTO :R1, :R2 DO SUSPEND; END"
 
 # --- refusals: outside the slice, the answer is REFUSED ----------------
-refuse "RETURNS (R1 INTEGER) AS BEGIN FOR SELECT GEN_ID(EXESEQ, 1) FROM T INTO :R1 DO SUSPEND; END"
+# --- slice 15: GEN_ID / NEXT VALUE FOR (the read-and-advance verbs) ----
+# a generator-advancing body needs RESTARTS between the two sides -
+# each run steps the sequence, so the standard check would compare
+# different starting states
+genid_check() { # <label> <proc tail>
+    n=$((n + 1))
+    name="EP$n"
+    stmt="CREATE PROCEDURE $name ${1}"
+    "$ISQL" -q -b -user "$U" -pas "$P" "$DB" >/dev/null 2>&1 <<SQL
+SET TERM ^ ;
+$stmt^
+SET TERM ; ^
+COMMIT;
+SQL
+    stored=$("$ISQL" -q -b -user "$U" -pas "$P" "$DB" 2>/dev/null <<SQL | tr -d ' \n'
+SET HEADING OFF;
+SELECT CAST(CAST(RDB\$PROCEDURE_BLR AS BLOB SUB_TYPE 0) AS VARCHAR(900) CHARACTER SET OCTETS) FROM RDB\$PROCEDURES WHERE RDB\$PROCEDURE_NAME = '$name';
+SQL
+)
+    if [ -z "$stored" ] || [ "$("$FCDSQL" "$stmt")" != "$stored" ]; then
+        echo "DIFF [$stmt] - store/byte-pin failure"; fail=1; return
+    fi
+    "$ISQL" -q -b -user "$U" -pas "$P" "$DB" >/dev/null 2>&1 <<'SQL'
+ALTER SEQUENCE EXESEQ RESTART;
+COMMIT;
+SQL
+    want=$("$ISQL" -q -b -user "$U" -pas "$P" "$DB" 2>&1 <<SQL | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]]\{1,\}/|/g' | grep -v '^$'
+SET HEADING OFF;
+SELECT * FROM $name;
+SQL
+)
+    "$ISQL" -q -b -user "$U" -pas "$P" "$DB" >/dev/null 2>&1 <<'SQL'
+ALTER SEQUENCE EXESEQ RESTART;
+COMMIT;
+SQL
+    got=$("$FCEXE" "$DB" "$name" 2>&1)
+    if [ "$got" = "$want" ]; then
+        echo "OK   (restart-paired) $stmt"
+    else
+        echo "DIFF $stmt"
+        echo "     engine: $(printf '%s' "$want" | tr '\n' ' ')"
+        echo "     fcexe:  $(printf '%s' "$got" | tr '\n' ' ')"
+        fail=1
+    fi
+}
+genid_check "RETURNS (R1 BIGINT, R2 INTEGER) AS BEGIN FOR SELECT GEN_ID(EXESEQ, 2), ID FROM T INTO :R1, :R2 DO SUSPEND; END"
+genid_check "RETURNS (R1 BIGINT) AS BEGIN FOR SELECT NEXT VALUE FOR EXESEQ FROM T INTO :R1 DO SUSPEND; END"
 
 # --- slice 12: the string functions ------------------------------------
 # (UPPER - a slice-11 refusal - flipped)

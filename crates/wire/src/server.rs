@@ -17534,6 +17534,12 @@ fn try_procedure_blr(
     let Ok(req) = fire_crab_exe::parse(&blr) else {
         return BlrProcOutcome::Outside;
     };
+    if req.uses_generators {
+        // GEN_ID advances must PERSIST; this executor's overlay does
+        // not - the interpreter (whose GenIdIncrement path writes the
+        // generator page back) serves these
+        return BlrProcOutcome::Outside;
+    }
     let sends =
         match fire_crab_exe::bind_and_execute(&db.bytes, db.page_size, &req, args) {
             Ok(s) => s,

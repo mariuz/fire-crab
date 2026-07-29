@@ -13,6 +13,31 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-exe slice 15: GEN_ID, with the persistence boundary drawn
+
+### Converted
+- **GEN_ID / NEXT VALUE FOR** (`blr_gen_id` 101 with a step
+  expression, `blr_gen_id2` 210 with the sequence's own increment
+  from RDB$GENERATORS): read-and-advance through an IN-MEMORY
+  overlay — consecutive reads in one execution see each other's
+  steps, the file is never written. The persistence boundary is
+  drawn explicitly, in three places: fcexe documents itself as a
+  non-persisting harness; the parsed Request carries a
+  `uses_generators` flag; and the WIRE server excludes
+  generator-writing requests from the BLR path, letting its
+  persisting interpreter (the GenIdIncrement machinery) serve them
+  — correctness over adoption.
+- **The restart-paired gate protocol**: a generator-advancing body
+  cannot use the standard check (each side's run steps the
+  sequence), so the gate RESTARTS the sequence before each side —
+  engine rows, restart, fcexe rows — and both count 2, 4, 6, 8, 10
+  in lockstep.
+
+### Guarded
+- Gate: `qa/exe-run-blr.sh` → 111 checks (the GEN_ID refusal
+  flipped to two restart-paired checks); serve-real exeproc 10,
+  psql 55, genstep 11 intact; 274 workspace tests.
+
 ## 2026-07-29 — fire-crab-lck slice 3: knock events and lock timeouts
 
 ### Converted
