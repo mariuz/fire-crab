@@ -3846,6 +3846,17 @@ smaller laws rode the same probes: blh_length counts payload
 (framing excluded - OCTET_LENGTH equals it at every level), and the
 blob slot flags are 16/32, not the remembered 8.
 
+Slice 2 closed the loop from the other side: level-2 CREATION, with
+the pointer-page layout probed off the engine's own level-2 blob
+(blob-wide lead on every page, sequence 0 on pointer pages,
+blp_length counting entry bytes), pushes an 18 MB fcblb-written blob
+through fire-crab's own path and the engine reads every byte back.
+And the wire server now serves blobs THROUGH fire-crab-blb - seven
+call sites swapped - so a node-firebird client assembles the 18 MB
+level-2 blob over op_open_blob/op_get_segment, byte-equal to the
+source file; the pre-existing serve-real-blob differential stays
+green on the swapped reader.
+
 The deep companion documentation lives in
 [blob-conversion.md](blob-conversion.md).
 

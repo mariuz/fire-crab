@@ -13,6 +13,32 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-blb slice 2: level-2 creation + wire adoption
+
+### Converted
+- **Level-2 blob creation.** The pointer-page layout was probed off
+  the engine's own 36 MB level-2 blob before a byte was written:
+  data pages keep the blob-wide lead page and their GLOBAL sequence;
+  pointer pages are type 8 with `blp_pointers`, carry the blob-wide
+  lead, SEQUENCE 0 (the engine writes 0 on every pointer page), and
+  a `blp_length` counting the entry BYTES of their u32 data-page
+  vectors; `blh_max_sequence` still counts data pages (last
+  sequence). The gate writes an 18 MB blob through this path and
+  the engine reads all eighteen million bytes back - gfix silent,
+  gbak happy. "Level-3 does not exist" is now an explicit refusal.
+- **Wire adoption.** The server's SEVEN blob call sites now read
+  through `fire_crab_blb::read_blob_content` - op_open_blob /
+  op_get_segment serve level-2 blobs no earlier reader could. Gate
+  phase C: node-firebird fetches every fcblb-written blob over the
+  wire (the 18 MB level 2 included) and the assembled content
+  equals the source files. The pre-existing `qa/serve-real-blob.sh`
+  differential stays green on the swapped reader.
+
+### Guarded
+- Blob GC, filters, stream creation, temporary blobs (unchanged
+  refusals). Gate `qa/blb-levels.sh` grew to 17 checks; serve-real
+  blob/show/nofallback regressions green; 260 workspace tests.
+
 ## 2026-07-29 — fire-crab-blb slice 1: blob storage, both directions
 
 ### Converted

@@ -141,13 +141,14 @@ gen(f"{d}/w-edge0.txt", 8000)     # near the level-0 ceiling
 gen(f"{d}/w-over0.txt", 8500)     # just past it - one blob page
 gen(f"{d}/w-mid.txt", 120000)     # a fifteen-page vector
 gen(f"{d}/w-big.txt", 1000000)    # a hundred-plus-page vector
+gen(f"{d}/w-l2.txt", 18000000)    # past the level-1 vector ceiling
 PYEOF
 
 # (file, segment size) pairs - segment framing crosses page borders
 i=0
 for spec in "w-empty.txt 100" "w-tiny.txt 7" "w-edge0.txt 8000" \
             "w-over0.txt 512" "w-mid.txt 4000" "w-mid.txt 65535" \
-            "w-big.txt 30000"; do
+            "w-big.txt 30000" "w-l2.txt 60000"; do
     f=${spec% *}; seg=${spec#* }
     out=$("$FCBLB" write "$DBW" W C "$TMP/$f" "$seg") || {
         echo "DIFF write $f seg=$seg refused: $out"; fail=1; i=$((i+1)); continue; }
@@ -189,6 +190,69 @@ SQL
     fi
     i=$((i + 1))
 done
+
+# ---------- phase C: the fcblb-written blobs served over the wire ----
+# the wire server now reads blobs through fire-crab-blb (op_open_blob /
+# op_get_segment assemble content from the pages) - including the
+# level-2 blob no earlier reader could serve
+FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
+if command -v node >/dev/null 2>&1 && [ -x "$FCWIRE" ]; then
+    PORT=4095
+    "$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >/dev/null 2>&1 &
+    srv=$!
+    i=0; while [ $i -lt 20 ]; do
+        command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$PORT" 2>/dev/null && break
+        i=$((i + 1)); sleep 0.1
+    done
+    got=$(FC_DB="$DBW" FC_PORT="$PORT" FC_U="$U" FC_P="$P" timeout 120 node -e '
+      process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(1); });
+      const F=require("node-firebird");
+      const readBlob=(fn)=>new Promise((res,rej)=>{
+        fn((err,name,e)=>{
+          if(err){rej(err);return;}
+          const chunks=[];
+          e.on("data",(c)=>chunks.push(Buffer.isBuffer(c)?c:Buffer.from(c)));
+          e.on("end",()=>res(Buffer.concat(chunks).toString("utf8")));
+          e.on("error",rej);
+        });
+      });
+      F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
+                user:process.env.FC_U,password:process.env.FC_P},(e,db)=>{
+        if(e){console.log("CONN_ERR");process.exit(1);}
+        db.query("SELECT C FROM W",async (e2,r)=>{
+          if(e2){console.log("ERR "+(e2.message||"").split("\n")[0]);db.detach();process.exit(0);}
+          for(const row of r){
+            const v=Object.values(row)[0];
+            if(v===null){console.log("<null>");continue;}
+            const s=typeof v==="function"?await readBlob(v):String(v);
+            console.log(s.length+"|"+s.slice(0,40)+"|"+s.slice(-40));
+          }
+          db.detach();process.exit(0);
+        });
+      });' 2>/dev/null)
+    kill $srv 2>/dev/null; wait $srv 2>/dev/null
+    want=$(python3 - "$TMP" <<'PYEOF2'
+import sys
+d = sys.argv[1]
+for f in ["w-empty.txt", "w-tiny.txt", "w-edge0.txt", "w-over0.txt",
+          "w-mid.txt", "w-mid.txt", "w-big.txt", "w-l2.txt"]:
+    b = open(f"{d}/{f}").read()
+    print(f"{len(b)}|{b[:40]}|{b[-40:]}")
+PYEOF2
+)
+    if [ "$got" = "$want" ]; then
+        echo "OK   the wire server serves every fcblb-written blob through fire-crab-blb (level 2 included)"
+    else
+        echo "DIFF wire-served blobs"
+        echo "--- want"; printf '%s
+' "$want"
+        echo "--- got"; printf '%s
+' "$got"
+        fail=1
+    fi
+else
+    echo "SKIP wire phase (node or fcwire missing)"
+fi
 
 # structural validation by the engine's own tools
 v=$("$GFIX" -v -full -n -user "$U" -pas "$P" "$DBW" 2>&1 | tr -s ' \n' ' ')

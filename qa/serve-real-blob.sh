@@ -3,7 +3,7 @@
 # described SQL_BLOB, rows carry the 8-byte on-disk blob id, and the
 # client fetches the content through the blob ops - op_open_blob(2) /
 # op_get_segment / op_close_blob - which fire-crab answers by assembling
-# the blob from the pages (level 0 inline and level 1 page-vector,
+# the blob from the pages through fire-crab-blb (levels 0, 1 AND 2,
 # segment framing stripped for segmented blobs, raw for stream blobs).
 # This is the first differential on blob CONTENT (diff-rows compared
 # only blob presence): node-firebird's assembled text must equal what

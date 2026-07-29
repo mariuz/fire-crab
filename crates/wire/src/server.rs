@@ -1866,7 +1866,7 @@ fn computed_sources(db: &Database, table: &str) -> std::collections::HashMap<usi
         }
     });
     for (id, r, n) in blobs {
-        if let Some(bytes) = fire_crab_ods::read_blob_content(&db.bytes, db.page_size, r, n) {
+        if let Some(bytes) = fire_crab_blb::read_blob_content(&db.bytes, db.page_size, r, n) {
             if let Ok(text) = String::from_utf8(bytes) {
                 out.insert(id, text);
             }
@@ -2102,7 +2102,7 @@ fn insert_defaults(
     for (fid, blob, src) in omitted {
         match blob {
             Some((r, n)) => {
-                let bytes = fire_crab_ods::read_blob_content(&db.bytes, db.page_size, r, n)?;
+                let bytes = fire_crab_blb::read_blob_content(&db.bytes, db.page_size, r, n)?;
                 match decode_default_blr(&bytes)? {
                     DefaultVal::Null => {} // same as no default
                     dv => out.push((fid, dv)),
@@ -2135,7 +2135,7 @@ fn insert_defaults(
             }
         });
         for (fid, r, n) in blobs {
-            let bytes = fire_crab_ods::read_blob_content(&db.bytes, db.page_size, r, n)?;
+            let bytes = fire_crab_blb::read_blob_content(&db.bytes, db.page_size, r, n)?;
             match decode_default_blr(&bytes)? {
                 DefaultVal::Null => {}
                 dv => out.push((fid, dv)),
@@ -2482,7 +2482,7 @@ fn check_predicates(
     // the two triggers of a pair carry the SAME source - dedup by text
     let mut sources: Vec<String> = Vec::new();
     for (r, n) in blobs {
-        let bytes = fire_crab_ods::read_blob_content(&db.bytes, db.page_size, r, n)?;
+        let bytes = fire_crab_blb::read_blob_content(&db.bytes, db.page_size, r, n)?;
         let text = String::from_utf8(bytes).ok()?;
         if !sources.contains(&text) {
             sources.push(text);
@@ -9259,7 +9259,7 @@ fn view_of(db: &Database, name: &str) -> Option<ViewDef> {
             return;
         }
         if let Some(Value::Blob(r, n)) = v.get(src_f) {
-            if let Some(b) = fire_crab_ods::read_blob_content(&db.bytes, db.page_size, *r, *n) {
+            if let Some(b) = fire_crab_blb::read_blob_content(&db.bytes, db.page_size, *r, *n) {
                 source = Some(String::from_utf8_lossy(&b).into_owned());
             }
         }
@@ -16929,7 +16929,7 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
             return;
         }
         if let Some(Value::Blob(r, n)) = v.get(src_f) {
-            if let Some(bytes) = fire_crab_ods::read_blob_content(&db.bytes, db.page_size, *r, *n) {
+            if let Some(bytes) = fire_crab_blb::read_blob_content(&db.bytes, db.page_size, *r, *n) {
                 source = Some(String::from_utf8_lossy(&bytes).into_owned());
             }
         }
@@ -19323,7 +19323,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 let id = read_n(&mut s, &mut dec, 8)?;
                 let (rel, num) = decode_blob_id(&id);
                 let content = database.as_ref().and_then(|db| {
-                    fire_crab_ods::read_blob_content(&db.bytes, db.page_size, rel, num)
+                    fire_crab_blb::read_blob_content(&db.bytes, db.page_size, rel, num)
                 });
                 match content {
                     Some(data) => {

@@ -368,37 +368,92 @@ pub fn create_blob(
         blh.extend_from_slice(&raw);
         return insert_blob_slot(file, page_size, relation, &blh);
     }
-    // level 1: chunk the framed stream over blob pages
+    // levels 1 and 2: chunk the framed stream over blob DATA pages
+    // (blob-wide lead, global sequence - probed on the engine's own
+    // level-2 blob: every data page carries the blob's first data
+    // page as blp_lead_page and its global index as blp_sequence)
     let per_page = page_size - BLP_DATA_OFFSET;
     let n_pages = raw.len().div_ceil(per_page);
-    if BLH_DATA_OFFSET + n_pages * 4 > slot_cap {
-        return Err("level-2 blob creation unconverted".into());
-    }
     let mut pages = Vec::with_capacity(n_pages);
     for _ in 0..n_pages {
         pages.push(allocate_page(file, page_size)?);
     }
     let lead = pages[0];
     for (seq, (page, chunk)) in pages.iter().zip(raw.chunks(per_page)).enumerate() {
-        let base = *page as usize * page_size;
-        file[base..base + page_size].fill(0);
-        file[base] = 8; // pag_type blob
-        file[base + 12..base + 16].copy_from_slice(&page.to_le_bytes()); // pag_pageno
-        file[base + 16..base + 20].copy_from_slice(&lead.to_le_bytes()); // blp_lead_page
-        file[base + 20..base + 24].copy_from_slice(&(seq as u32).to_le_bytes()); // blp_sequence
-        file[base + 24..base + 26].copy_from_slice(&(chunk.len() as u16).to_le_bytes());
-        file[base + BLP_DATA_OFFSET..base + BLP_DATA_OFFSET + chunk.len()]
-            .copy_from_slice(chunk);
+        write_blob_page(file, page_size, *page, lead, seq as u32, 0, chunk);
     }
     header.lead_page = lead;
-    // the last sequence, not the count (blb.cpp:2377)
+    // the last DATA sequence, not the count (blb.cpp:2377)
     header.max_sequence = (n_pages - 1) as u32;
-    header.level = 1;
+    if BLH_DATA_OFFSET + n_pages * 4 <= slot_cap {
+        // level 1: the data-page vector rides the slot
+        header.level = 1;
+        let mut blh = header.encode();
+        for p in &pages {
+            blh.extend_from_slice(&p.to_le_bytes());
+        }
+        return insert_blob_slot(file, page_size, relation, &blh);
+    }
+    // level 2: the vector itself overflows the slot - chunk it over
+    // POINTER pages (pag_flags |= blp_pointers), whose data areas
+    // are u32 data-page vectors; the slot holds the pointer-page
+    // vector. Probed on the engine's level-2 blob: pointer pages
+    // carry the blob-wide lead and sequence 0, and blp_length is the
+    // BYTE length of the entries.
+    let per_ptr = per_page / 4;
+    let mut ptr_pages = Vec::new();
+    for chunk in pages.chunks(per_ptr) {
+        let pp = allocate_page(file, page_size)?;
+        let mut entries = Vec::with_capacity(chunk.len() * 4);
+        for p in chunk {
+            entries.extend_from_slice(&p.to_le_bytes());
+        }
+        write_blob_page(file, page_size, pp, lead, 0, BLP_POINTERS, &entries);
+        ptr_pages.push(pp);
+    }
+    if BLH_DATA_OFFSET + ptr_pages.len() * 4 > slot_cap {
+        return Err("level-3 blobs do not exist - the pointer vector cannot overflow".into());
+    }
+    header.level = 2;
     let mut blh = header.encode();
-    for p in &pages {
+    for p in &ptr_pages {
         blh.extend_from_slice(&p.to_le_bytes());
     }
     insert_blob_slot(file, page_size, relation, &blh)
+}
+
+/// Lay one blob page down: type 8, the given flags, the blob-wide
+/// lead page, the sequence, and the data area with its blp_length.
+fn write_blob_page(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    page: u32,
+    lead: u32,
+    sequence: u32,
+    pflags: u8,
+    data: &[u8],
+) {
+    let base = page as usize * page_size;
+    file[base..base + page_size].fill(0);
+    file[base] = 8; // pag_type blob
+    file[base + 1] = pflags;
+    file[base + 12..base + 16].copy_from_slice(&page.to_le_bytes()); // pag_pageno
+    file[base + 16..base + 20].copy_from_slice(&lead.to_le_bytes()); // blp_lead_page
+    file[base + 20..base + 24].copy_from_slice(&sequence.to_le_bytes()); // blp_sequence
+    file[base + 24..base + 26].copy_from_slice(&(data.len() as u16).to_le_bytes());
+    file[base + BLP_DATA_OFFSET..base + BLP_DATA_OFFSET + data.len()].copy_from_slice(data);
+}
+
+/// The whole content by blob id, framing decided by the blob itself -
+/// the adapter the wire server serves through (op_open_blob /
+/// op_get_segment hand out CONTENT; the framing is storage detail).
+pub fn read_blob_content(
+    file: &[u8],
+    page_size: usize,
+    relation: u16,
+    recno: u64,
+) -> Option<Vec<u8>> {
+    read_blob(file, page_size, relation, recno).ok().map(|b| b.content())
 }
 
 fn u16le(b: &[u8], at: usize) -> u16 {

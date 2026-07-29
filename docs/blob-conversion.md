@@ -154,28 +154,43 @@ to hide.
 | Level 0/1/2 reading | `read_blob` |
 | Segment framing, both directions | `SegmentIter` / `create_blob` |
 | Stream-blob content | `Blob::content` |
-| Level 0/1 creation + page allocation | `create_blob` (+ `ods::allocate_page`, `ods::insert_blob_slot`) |
+| Level 0/1/2 creation + page allocation | `create_blob` (+ `ods::allocate_page`, `ods::insert_blob_slot`) |
+| Wire serving through this crate | `read_blob_content` (op_open_blob / op_get_segment content source) |
 | The referencing record's `bid` | `fcblb write` |
 
-Not yet, by name: **level-2 creation** (refuses past the level-1
-vector ceiling), **blob garbage collection** (a deleted record's
-blobs), **blob filters**, the **per-transaction temporary blob**
-namespace, and unification with the wire server's existing read path
-(`ods::format::read_blob` stays serving until this crate absorbs it).
+Not yet, by name: **blob garbage collection** (a deleted record's
+blobs), **blob filters**, **stream-blob creation**, and the
+**per-transaction temporary blob** namespace.
 
 <a name="roadmap"></a>
+## Slice 2: level-2 creation and the wire adoption
+
+Both leading roadmap items landed in slice 2. **Level-2 creation**
+mirrors the layout probed off the engine's own 36 MB blob: data pages
+keep the blob-wide lead and their global sequence; pointer pages are
+type 8 with `blp_pointers` set, carry the blob-wide lead, sequence 0
+(the engine writes 0 on every pointer page - probed, mirrored), and a
+`blp_length` counting the ENTRY BYTES of their u32 data-page vectors;
+the slot's `blh_page[]` holds the pointer pages and `blh_max_sequence`
+still counts data pages (last sequence). The gate writes an 18 MB
+blob through this path - `RECNO n LEVEL 2` - and the engine reads all
+eighteen million bytes back, gfix silent, gbak happy.
+
+**Wire adoption**: the server's seven blob call sites now read through
+`fire_crab_blb::read_blob_content` instead of the ods reader - so
+op_open_blob / op_get_segment serve level-2 blobs no earlier reader
+could, proven by the gate's phase C: node-firebird fetches every
+fcblb-written blob (the 18 MB level 2 included) over the wire and the
+assembled content equals the source files, byte counts and both ends.
+The pre-existing `qa/serve-real-blob.sh` differential stays green on
+the swapped reader.
+
 ## Roadmap
 
-1. **Level-2 creation** — allocate pointer pages, mirror the read
-   shape; the gate already holds a 36 MB level-2 read to diff
-   against.
-2. **Wire-server adoption** — swap `ods::format::read_blob` for this
-   crate's reader (one call site), then serve `fcblb`-written blobs
-   over the wire.
-3. **Blob GC** — when a record version dies, its blob dies with it;
+1. **Blob GC** — when a record version dies, its blob dies with it;
    `gfix -sweep` as the oracle, as with record chains.
-4. **Careful-write edges** — blob pages before the blh that names
+2. **Careful-write edges** — blob pages before the blh that names
    them, the `fire-crab-cch` graph's blob rule exercised by a real
    blob workload in the crash matrix.
-5. **Stream-blob creation** and the `isc_bpb` parameter surface
+3. **Stream-blob creation** and the `isc_bpb` parameter surface
    (requested type/charset transliteration).

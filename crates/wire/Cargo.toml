@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 fire-crab-ods = { path = "../ods" }
+fire-crab-blb = { path = "../blb" }
 
 [[bin]]
 name = "fcwire"
