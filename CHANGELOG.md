@@ -13,6 +13,31 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-exe slice 3: expressions, joins, DISTINCT
+
+### Converted
+- **Value expressions**: blr_add / subtract / multiply / divide /
+  negate / concatenate — NULL propagates through every verb, integer
+  division truncates toward zero, and divide-by-zero and overflow
+  are runtime ERRORS, not wrong numbers.
+- **Inner joins**: `blr_rs_stream` — the NestedLoopJoin — with
+  aliased `blr_relation2` streams and the ON boolean evaluated over
+  the joined frames. The executor's core generalized from
+  single-frame rows to BINDINGS (one frame per joined stream), so
+  the whole tower — filters, DISTINCT, sorts, aggregates, FIRST/
+  SKIP — composes over joins with no per-feature work: COUNT(*)
+  over a join ran the moment joins parsed.
+- **DISTINCT**: `blr_project` as the rse clause it is — sort-based
+  unique over the projected values, NULL grouping WITH NULL; the
+  engine's null-first output order held unprompted (the nulls-low
+  law reaching the project sort).
+
+### Guarded
+- LEFT/outer joins (blr_join_type refuses in the join clause loop),
+  derived tables, windows. Gate: `qa/exe-run-blr.sh` 32 → 41
+  checks (three refusals flipped; join+WHERE, aggregate-over-join,
+  DISTINCT+ORDER, expression params). 262 workspace tests.
+
 ## 2026-07-29 — fire-crab-exe slice 2: parameters, aggregates, singular, FIRST/SKIP
 
 ### Converted

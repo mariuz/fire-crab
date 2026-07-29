@@ -42,6 +42,12 @@ mod blr {
     pub const SEND: u8 = 14;
     pub const LABEL: u8 = 17;
     pub const LITERAL: u8 = 21;
+    pub const ADD: u8 = 34;
+    pub const SUBTRACT: u8 = 35;
+    pub const MULTIPLY: u8 = 36;
+    pub const DIVIDE: u8 = 37;
+    pub const NEGATE: u8 = 38;
+    pub const CONCATENATE: u8 = 39;
     pub const FIELD: u8 = 23;
     pub const FID: u8 = 24;
     pub const PARAMETER: u8 = 25;
@@ -59,6 +65,7 @@ mod blr {
     pub const MISSING: u8 = 61;
     pub const RSE: u8 = 67;
     pub const FIRST: u8 = 68;
+    pub const PROJECT: u8 = 69;
     pub const BOOLEAN: u8 = 71;
     pub const RELATION: u8 = 74;
     pub const MAP: u8 = 77;
@@ -70,7 +77,9 @@ mod blr {
     pub const AGG_TOTAL: u8 = 86;
     pub const AGG_AVERAGE: u8 = 87;
     pub const AGG_COUNT2: u8 = 93;
+    pub const RS_STREAM: u8 = 119;
     pub const SINGULAR: u8 = 127;
+    pub const RELATION2: u8 = 146;
     pub const SKIP: u8 = 175;
     pub const END: u8 = 255;
     pub const EOC: u8 = 76;
@@ -116,6 +125,12 @@ pub enum Expr {
     Fid(u8, u16),
     /// blr_literal, already decoded to a Value
     Literal(Value),
+    /// blr_add/subtract/multiply/divide/concatenate - the arithmetic
+    /// verb and both operands; NULL propagates, integer division
+    /// truncates toward zero, divide-by-zero is a runtime ERROR
+    Arith(u8, Box<Expr>, Box<Expr>),
+    /// blr_negate
+    Negate(Box<Expr>),
     /// blr_null
     Null,
 }
@@ -158,12 +173,23 @@ pub struct Aggregate {
     pub map: Vec<(u16, MapItem)>,
 }
 
-/// The stream slot of an rse: a plain relation scan, or an
-/// aggregate over an inner rse.
+/// One relation stream of a join: catalog name and context (the
+/// alias is display-only - context is the binding).
+#[derive(Clone, Debug)]
+pub struct JoinStream {
+    pub name: String,
+    pub context: u8,
+}
+
+/// The stream slot of an rse: a plain relation scan, an aggregate
+/// over an inner rse, or an inner join (blr_rs_stream) - the
+/// NestedLoopJoin of recsrc/, streams left to right with the ON
+/// boolean over the joined frames.
 #[derive(Clone, Debug)]
 pub enum Stream {
     Relation { name: String, context: u8 },
     Aggregate(Aggregate),
+    Join { streams: Vec<JoinStream>, on: Option<Bool> },
 }
 
 /// The record-selection expression of a blr_for: one stream, the
@@ -178,6 +204,9 @@ pub struct Rse {
     pub sort: Vec<SortKey>,
     pub first: Option<Expr>,
     pub skip: Option<Expr>,
+    /// blr_project: DISTINCT - the projected expressions; rows
+    /// dedupe on them with NULL equal to NULL (set semantics)
+    pub project: Vec<Expr>,
     /// blr_singular: at most one row - a second is a genuine error
     pub singular: bool,
 }
@@ -287,6 +316,13 @@ impl<'a> P<'a> {
                 Ok(Expr::Fid(ctx, self.u16()?))
             }
             blr::NULL => Ok(Expr::Null),
+            v @ (blr::ADD | blr::SUBTRACT | blr::MULTIPLY | blr::DIVIDE
+            | blr::CONCATENATE) => Ok(Expr::Arith(
+                v,
+                Box::new(self.expr()?),
+                Box::new(self.expr()?),
+            )),
+            blr::NEGATE => Ok(Expr::Negate(Box::new(self.expr()?))),
             blr::LITERAL => {
                 let s = self.msg_slot()?;
                 Ok(Expr::Literal(match s.dtype {
@@ -371,6 +407,41 @@ impl<'a> P<'a> {
                 let context = self.u8()?;
                 Stream::Relation { name, context }
             }
+            blr::RS_STREAM => {
+                // an inner join: stream count, the streams (plain or
+                // aliased relations), an optional ON boolean, its end
+                let n = self.u8()? as usize;
+                let mut streams = Vec::new();
+                for _ in 0..n {
+                    match self.u8()? {
+                        blr::RELATION => {
+                            let name = self.counted_name()?;
+                            let context = self.u8()?;
+                            streams.push(JoinStream { name, context });
+                        }
+                        blr::RELATION2 => {
+                            let name = self.counted_name()?;
+                            let _alias = self.counted_name()?;
+                            let context = self.u8()?;
+                            streams.push(JoinStream { name, context });
+                        }
+                        other => {
+                            return Err(format!("join stream verb {} unconverted", other))
+                        }
+                    }
+                }
+                let mut on = None;
+                loop {
+                    match self.u8()? {
+                        blr::BOOLEAN => on = Some(self.boolean()?),
+                        blr::END => break,
+                        other => {
+                            return Err(format!("join clause {} unconverted", other))
+                        }
+                    }
+                }
+                Stream::Join { streams, on }
+            }
             blr::AGGREGATE => {
                 let context = self.u8()?;
                 if self.u8()? != blr::RSE {
@@ -414,11 +485,18 @@ impl<'a> P<'a> {
         let mut sort = Vec::new();
         let mut first = None;
         let mut skip = None;
+        let mut project = Vec::new();
         loop {
             match self.u8()? {
                 blr::BOOLEAN => boolean = Some(self.boolean()?),
                 blr::FIRST => first = Some(self.expr()?),
                 blr::SKIP => skip = Some(self.expr()?),
+                blr::PROJECT => {
+                    let n = self.u8()? as usize;
+                    for _ in 0..n {
+                        project.push(self.expr()?);
+                    }
+                }
                 blr::SORT => {
                     let n = self.u8()? as usize;
                     for _ in 0..n {
@@ -436,7 +514,7 @@ impl<'a> P<'a> {
                 other => return Err(format!("rse clause {} unconverted", other)),
             }
         }
-        Ok(Rse { stream, boolean, sort, first, skip, singular: false })
+        Ok(Rse { stream, boolean, sort, first, skip, project, singular: false })
     }
 
     fn stmt(&mut self) -> Result<Stmt, String> {
@@ -578,6 +656,7 @@ pub fn parse(blr_bytes: &[u8]) -> Result<Request, String> {
 
 /// A stream binding: the rows of the opened record source and the
 /// current position's decoded record, addressed by context number.
+#[derive(Clone)]
 struct StreamFrame {
     context: u8,
     /// the bound relation's name - blr_field resolves through it;
@@ -711,24 +790,17 @@ impl<'a> Exec<'a> {
                 }
             }
             Stmt::For(rse, body) => {
-                let rows = self.open_rse(rse)?;
-                if rse.singular && rows.len() > 1 {
+                let bindings = self.open_rse(rse)?;
+                if rse.singular && bindings.len() > 1 {
                     // the engine's sing_err: a singleton select with
                     // a second row is a runtime ERROR, not a truncation
                     return Err("multiple rows in singleton select".into());
                 }
-                let (context, relation) = match &rse.stream {
-                    Stream::Relation { name, context } => (*context, Some(name.clone())),
-                    Stream::Aggregate(a) => (a.context, None),
-                };
-                for row in rows {
-                    self.frames.push(StreamFrame {
-                        context,
-                        relation: relation.clone(),
-                        row,
-                    });
+                for binding in bindings {
+                    let depth = self.frames.len();
+                    self.frames.extend(binding);
                     let r = self.stmt(body);
-                    self.frames.pop();
+                    self.frames.truncate(depth);
                     r?;
                 }
             }
@@ -737,66 +809,110 @@ impl<'a> Exec<'a> {
     }
 
     /// Open the record source tower for an rse - the engine's own
-    /// stacking order: FullTableScan or AggregatedStream at the
-    /// bottom, FilteredStream (the boolean), SortedStream (blr_sort),
-    /// SkipRowsStream, FirstRowsStream on top.
-    fn open_rse(&mut self, rse: &Rse) -> Result<Vec<Vec<Value>>, String> {
-        let (context, relation) = match &rse.stream {
-            Stream::Relation { name, context } => (*context, Some(name.clone())),
-            Stream::Aggregate(a) => (a.context, None),
-        };
-        let mut rows: Vec<Vec<Value>> = match &rse.stream {
-            Stream::Relation { name, .. } => {
-                let rel = resolve_relation(self.file, self.page_size, name)
-                    .ok_or_else(|| format!("relation {} not found", name))?;
-                let formats =
-                    fire_crab_ods::relation_formats(self.file, self.page_size, rel);
-                let (_, descs) = formats
-                    .iter()
-                    .max_by_key(|(n, _)| *n)
-                    .ok_or("relation has no format")?;
-                let tips = TipChain::read(self.file, self.page_size)
-                    .ok_or("cannot read transaction inventory")?;
-                visible_rows(self.file, self.page_size, rel, descs, &tips)
-                    .into_iter()
-                    .map(|vr| vr.values)
-                    .collect()
-            }
-            Stream::Aggregate(agg) => self.open_aggregate(agg)?,
-        };
-        // FilteredStream: the boolean, three-valued, TRUE survives -
-        // over an aggregate this is HAVING, reading fids
-        if let Some(b) = &rse.boolean {
-            let mut kept = Vec::new();
-            for row in rows {
-                self.frames.push(StreamFrame {
-                    context,
-                    relation: relation.clone(),
-                    row,
-                });
-                let keep = self.bool_eval(b)?;
-                let frame = self.frames.pop().expect("frame just pushed");
-                if keep == Some(true) {
-                    kept.push(frame.row);
+    /// stacking: FullTableScan / NestedLoopJoin / AggregatedStream at
+    /// the bottom, FilteredStream (the boolean), the DISTINCT project
+    /// (sort-based unique, NULL equal to NULL), SortedStream,
+    /// SkipRowsStream, FirstRowsStream. A BINDING is the set of
+    /// stream frames one "row" of the source stands for - one frame
+    /// for a scan, one per joined stream for a join.
+    fn open_rse(&mut self, rse: &Rse) -> Result<Vec<Vec<StreamFrame>>, String> {
+        let mut bindings: Vec<Vec<StreamFrame>> = match &rse.stream {
+            Stream::Relation { name, context } => self
+                .scan_relation(name)?
+                .into_iter()
+                .map(|row| {
+                    vec![StreamFrame {
+                        context: *context,
+                        relation: Some(name.clone()),
+                        row,
+                    }]
+                })
+                .collect(),
+            Stream::Aggregate(agg) => self
+                .open_aggregate(agg)?
+                .into_iter()
+                .map(|row| {
+                    vec![StreamFrame { context: agg.context, relation: None, row }]
+                })
+                .collect(),
+            Stream::Join { streams, on } => {
+                // NestedLoopJoin: the cartesian product left to
+                // right, the ON boolean keeping TRUE combinations
+                let mut acc: Vec<Vec<StreamFrame>> = vec![Vec::new()];
+                for js in streams {
+                    let rows = self.scan_relation(&js.name)?;
+                    let mut next = Vec::new();
+                    for b in &acc {
+                        for row in &rows {
+                            let mut nb = b.clone();
+                            nb.push(StreamFrame {
+                                context: js.context,
+                                relation: Some(js.name.clone()),
+                                row: row.clone(),
+                            });
+                            next.push(nb);
+                        }
+                    }
+                    acc = next;
+                }
+                match on {
+                    None => acc,
+                    Some(b) => {
+                        let mut kept = Vec::new();
+                        for binding in acc {
+                            if self.with_binding(&binding, |ex| ex.bool_eval(b))?
+                                == Some(true)
+                            {
+                                kept.push(binding);
+                            }
+                        }
+                        kept
+                    }
                 }
             }
-            rows = kept;
+        };
+        // FilteredStream - over an aggregate this is HAVING
+        if let Some(b) = &rse.boolean {
+            let mut kept = Vec::new();
+            for binding in bindings {
+                if self.with_binding(&binding, |ex| ex.bool_eval(b))? == Some(true) {
+                    kept.push(binding);
+                }
+            }
+            bindings = kept;
+        }
+        // the DISTINCT project: sort-based unique on the projected
+        // values, NULL grouping with NULL (set semantics)
+        if !rse.project.is_empty() {
+            let mut keyed: Vec<(Vec<Value>, Vec<StreamFrame>)> = Vec::new();
+            for binding in bindings {
+                let keys = self.with_binding(&binding, |ex| {
+                    rse.project.iter().map(|e| ex.eval(e)).collect::<Result<Vec<_>, _>>()
+                })?;
+                keyed.push((keys, binding));
+            }
+            keyed.sort_by(|(a, _), (b, _)| {
+                for (x, y) in a.iter().zip(b) {
+                    let o = null_aware_cmp(x, y, false);
+                    if o != std::cmp::Ordering::Equal {
+                        return o;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            keyed.dedup_by(|(a, _), (b, _)| {
+                a.iter().zip(b.iter()).all(|(x, y)| group_eq(x, y))
+            });
+            bindings = keyed.into_iter().map(|(_, b)| b).collect();
         }
         // SortedStream
         if !rse.sort.is_empty() {
-            let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
-            for row in rows {
-                self.frames.push(StreamFrame {
-                    context,
-                    relation: relation.clone(),
-                    row,
-                });
-                let mut keys = Vec::new();
-                for k in &rse.sort {
-                    keys.push(self.eval(&k.expr)?);
-                }
-                let frame = self.frames.pop().expect("frame just pushed");
-                keyed.push((keys, frame.row));
+            let mut keyed: Vec<(Vec<Value>, Vec<StreamFrame>)> = Vec::new();
+            for binding in bindings {
+                let keys = self.with_binding(&binding, |ex| {
+                    rse.sort.iter().map(|k| ex.eval(&k.expr)).collect::<Result<Vec<_>, _>>()
+                })?;
+                keyed.push((keys, binding));
             }
             let dirs: Vec<bool> = rse.sort.iter().map(|k| k.desc).collect();
             keyed.sort_by(|(a, _), (b, _)| {
@@ -808,19 +924,48 @@ impl<'a> Exec<'a> {
                 }
                 std::cmp::Ordering::Equal
             });
-            rows = keyed.into_iter().map(|(_, r)| r).collect();
+            bindings = keyed.into_iter().map(|(_, b)| b).collect();
         }
-        // SkipRowsStream, then FirstRowsStream - blr_first/blr_skip
-        // are rse clauses, but the tower applies sort, skip, first
+        // SkipRowsStream, then FirstRowsStream
         if let Some(e) = &rse.skip {
             let n = self.eval_count(e)?;
-            rows = rows.into_iter().skip(n).collect();
+            bindings = bindings.into_iter().skip(n).collect();
         }
         if let Some(e) = &rse.first {
             let n = self.eval_count(e)?;
-            rows.truncate(n);
+            bindings.truncate(n);
         }
-        Ok(rows)
+        Ok(bindings)
+    }
+
+    /// The committed-visibility scan of one relation.
+    fn scan_relation(&mut self, name: &str) -> Result<Vec<Vec<Value>>, String> {
+        let rel = resolve_relation(self.file, self.page_size, name)
+            .ok_or_else(|| format!("relation {} not found", name))?;
+        let formats = fire_crab_ods::relation_formats(self.file, self.page_size, rel);
+        let (_, descs) = formats
+            .iter()
+            .max_by_key(|(n, _)| *n)
+            .ok_or("relation has no format")?;
+        let tips = TipChain::read(self.file, self.page_size)
+            .ok_or("cannot read transaction inventory")?;
+        Ok(visible_rows(self.file, self.page_size, rel, descs, &tips)
+            .into_iter()
+            .map(|vr| vr.values)
+            .collect())
+    }
+
+    /// Run an evaluation with a binding's frames pushed.
+    fn with_binding<T>(
+        &mut self,
+        binding: &[StreamFrame],
+        f: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let depth = self.frames.len();
+        self.frames.extend(binding.iter().cloned());
+        let r = f(self);
+        self.frames.truncate(depth);
+        r
     }
 
     /// A FIRST/SKIP operand: a non-negative count.
@@ -840,13 +985,10 @@ impl<'a> Exec<'a> {
     /// in integer division). A zero-row source with NO group keys
     /// still yields ONE row - the aggregate of the empty set.
     fn open_aggregate(&mut self, agg: &Aggregate) -> Result<Vec<Vec<Value>>, String> {
-        let (in_ctx, in_rel) = match &agg.source.stream {
-            Stream::Relation { name, context } => (*context, Some(name.clone())),
-            Stream::Aggregate(_) => {
-                return Err("aggregate over an aggregate unconverted".into())
-            }
-        };
-        let source_rows = self.open_rse(&agg.source)?;
+        if matches!(agg.source.stream, Stream::Aggregate(_)) {
+            return Err("aggregate over an aggregate unconverted".into());
+        }
+        let source_bindings = self.open_rse(&agg.source)?;
         // fold state per group, keyed by the group-by values; groups
         // keep FIRST-ENCOUNTER order and sort by key below
         struct Acc {
@@ -882,12 +1024,9 @@ impl<'a> Exec<'a> {
                 .collect(),
         };
         let mut groups: Vec<Acc> = Vec::new();
-        for row in source_rows {
-            self.frames.push(StreamFrame {
-                context: in_ctx,
-                relation: in_rel.clone(),
-                row,
-            });
+        for binding in source_bindings {
+            let depth = self.frames.len();
+            self.frames.extend(binding);
             let mut keys = Vec::new();
             for k in &agg.group_by {
                 keys.push(self.eval(k)?);
@@ -958,7 +1097,7 @@ impl<'a> Exec<'a> {
                     _ => {}
                 }
             }
-            self.frames.pop();
+            self.frames.truncate(depth);
         }
         // the aggregate of the EMPTY set: no group keys -> one row
         if groups.is_empty() && agg.group_by.is_empty() {
@@ -999,6 +1138,44 @@ impl<'a> Exec<'a> {
         Ok(match e {
             Expr::Null => Value::Null,
             Expr::Literal(v) => v.clone(),
+            Expr::Negate(inner) => match self.eval(inner)? {
+                Value::Null => Value::Null,
+                Value::Int(n) => Value::Int(-n),
+                Value::Scaled(raw, sc) => Value::Scaled(-raw, sc),
+                _ => return Err("negate over a non-numeric value".into()),
+            },
+            Expr::Arith(verb, l, r) => {
+                let lv = self.eval(l)?;
+                let rv = self.eval(r)?;
+                if matches!(lv, Value::Null) || matches!(rv, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                if *verb == blr::CONCATENATE {
+                    let text = |v: &Value| match v {
+                        Value::Text(t) => Ok(t.clone()),
+                        _ => Err("concatenation over a non-text value".to_string()),
+                    };
+                    return Ok(Value::Text(format!("{}{}", text(&lv)?, text(&rv)?)));
+                }
+                let (a, b) = match (int_of(&lv), int_of(&rv)) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => return Err("arithmetic over a non-integer value".into()),
+                };
+                Value::Int(match *verb {
+                    blr::ADD => a.checked_add(b).ok_or("integer overflow")?,
+                    blr::SUBTRACT => a.checked_sub(b).ok_or("integer overflow")?,
+                    blr::MULTIPLY => a.checked_mul(b).ok_or("integer overflow")?,
+                    // integer division truncates toward zero; zero
+                    // divisor is the engine's runtime error
+                    blr::DIVIDE => {
+                        if b == 0 {
+                            return Err("integer divide by zero".into());
+                        }
+                        a / b
+                    }
+                    _ => unreachable!("parse admitted the verb"),
+                })
+            }
             Expr::Variable(n) => self
                 .variables
                 .get(*n as usize)

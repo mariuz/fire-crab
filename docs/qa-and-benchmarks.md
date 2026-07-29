@@ -4005,6 +4005,22 @@ singular select surfaced a semantic worth naming: a second row is a
 runtime ERROR (sing_err), not a truncation - an executor that
 silently took the first row would answer wrong queries politely.
 
+### Slice 3: bindings, and composition for free
+
+Slice 3's real work was one generalization: the executor's "row"
+became a BINDING - the set of stream frames a source row stands for,
+one frame for a scan, one per joined stream for a join. Everything
+above the source (the filter, the DISTINCT project, the sort, the
+limits, the aggregate fold) evaluates with the binding's frames
+pushed, so when blr_rs_stream (the NestedLoopJoin) arrived, the
+whole tower composed over joins with no per-feature code: COUNT(*)
+over a join worked the moment joins parsed, and the gate holds it.
+Value expressions came with the engine's edge semantics - NULL
+propagates, integer division truncates, divide-by-zero and overflow
+are runtime errors rather than wrong numbers - and DISTINCT
+(blr_project) dedupes sort-based with NULL grouping with NULL,
+where the engine's null-first output order held unprompted.
+
 ## Query surface: what the server answers, and what it refuses
 
 Everything below is verified by a differential gate under `qa/` — the
