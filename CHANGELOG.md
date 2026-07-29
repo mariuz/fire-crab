@@ -13,6 +13,32 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-dsql slice 38: body unions, INSERT..SELECT
+
+### Converted
+- **UNION in body FOR SELECTs** (flip forty-seven — slice 37's
+  transcript cashed): `blr_union` claims the statement's FIRST
+  slot — a lookahead reserves it before the branch streams number —
+  with per-branch rses (each WHERE inside) and maps; a DISTINCT
+  union appends `blr_project` over the union fids; duplicate select
+  columns keep separate slots; INTO reads union fids. UNION ALL
+  chains of any length; mixed ALL/distinct refuses.
+- **INSERT ... SELECT** (flip forty-eight — a refusal named in
+  slice 12, twenty-six slices ago): a marks(1, 4)-stamped FOR loop
+  over the source rse storing one row per source row — the SOURCE
+  stream numbers FIRST, the target claims the next slot. Plain and
+  qualified source columns, a source WHERE, working in procedures,
+  subroutines and triggers.
+
+### Guarded
+- Mixed ALL/distinct unions, unions beside every other structure
+  (sorts, cursors, locks, aggregates, windows, joins, derived),
+  INSERT..SELECT with expressions or aggregates. Gate:
+  `qa/dsql-proc-blr.sh` grew to 226 checks (6 fresh — a
+  three-branch union with aliases, INSERT..SELECT inside a
+  subroutine), `qa/dsql-trig-blr.sh` holds 48 with the trigger
+  INSERT..SELECT flipped; 353 unit byte-pins.
+
 ## 2026-07-29 — fire-crab-dsql slice 37: derived-column aliases
 
 ### Converted

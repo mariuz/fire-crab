@@ -307,6 +307,11 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # when a wrapper claims the FIRST slot (union before its
+    # branches), a LOOKAHEAD reservation beats re-parsing: scan for
+    # the keyword at depth 0, reserve, then parse normally; and an
+    # old refusal may be a KNOWN shape in new clothes - INSERT..
+    # SELECT is the slice-12 DML loop around a store
     # route special cases through the RESOLVER, not around it: the
     # bare-name fast paths that once mis-bound over joins gained
     # alias translation for FREE the moment they went through

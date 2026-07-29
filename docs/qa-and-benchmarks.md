@@ -4666,6 +4666,24 @@ WHEN, and a BLOCK as a handler's body nests blr_block again with no
 handler section of its own - the battery runs a handler block
 containing an EXIT.
 
+Slice 38 cashed one transcript and flipped one of the oldest
+refusals left. UNION in body FOR SELECTs: blr_union claims the
+statement's FIRST slot - which forces a parser trick, since branch
+one's stream would otherwise take it: a token LOOKAHEAD spots the
+depth-0 UNION before INTO/DO and reserves the slot before any
+stream numbers. Per branch, an rse with its own WHERE inside and a
+positional map; a DISTINCT union appends blr_project over the
+union fids; duplicate select columns keep separate slots; INTO
+reads the fids. And INSERT ... SELECT - named unprobed back in
+slice 12, twenty-six slices ago - is a marks(1, 4)-stamped FOR
+loop over the source rse with one store per row, the SOURCE stream
+numbering FIRST and the target claiming the next slot: the DML
+loop shape the DELETE and UPDATE verbs have worn since that same
+slice, wrapped around a store instead. The battery runs a
+three-branch aliased union, an INSERT..SELECT inside a subroutine
+(relation3 on both streams by composition), and a trigger
+INSERT..SELECT where the slice-12 refusal used to stand.
+
 Slice 37 cashed the derived-alias transcript. (SELECT UID AS X
 FROM U2) D records an outer-to-inner name map at parse, and every
 outer reference to X - qualified, bare, in a WHERE, an ORDER key

@@ -3648,6 +3648,18 @@ enum TrigStmt {
         role: Option<Val>,
         run: Option<(u8, Box<TrigStmt>)>,
     },
+    /// INSERT INTO tgt (cols) SELECT ... - a marks(1, 4)-stamped
+    /// FOR loop over the source rse storing one row per source row;
+    /// the SOURCE stream numbers first, the target after (probed)
+    InsertSel {
+        src: Stream,
+        src_ctx: u8,
+        tgt: Stream,
+        tgt_ctx: u8,
+        cols: Vec<String>,
+        vals: Vec<Val>,
+        wher: Option<Bool>,
+    },
     /// MERGE INTO tgt USING src ON <bool>: a marks(1, 6)-stamped
     /// for-loop over a JOIN of source and target - LEFT when a NOT
     /// MATCHED branch needs unmatched rows, INNER otherwise -
@@ -3759,6 +3771,11 @@ struct ForSel {
     /// specs) its context, partition keys, order keys and map -
     /// passthrough columns live in the DEFAULT window (probed)
     windows: Vec<Win>,
+    /// UNION [ALL]: the union claims the statement's FIRST slot,
+    /// branch streams follow; per branch its rse (WHERE inside) and
+    /// map; a DISTINCT union appends blr_project over the fids
+    /// (probed at body numbering)
+    union_: Option<BodyUnion>,
     aggregate: bool,
     map: Vec<MapEntry>,
     group_keys: Vec<Val>,
@@ -3796,6 +3813,14 @@ fn emit_map_entries(out: &mut Vec<u8>, map: &[MapEntry]) {
             }
         }
     }
+}
+
+/// A body FOR SELECT's UNION: the union context, ALL or distinct,
+/// and per branch its stream, context, WHERE and select columns.
+struct BodyUnion {
+    ctx: u8,
+    all: bool,
+    branches: Vec<(Stream, u8, Option<Bool>, Vec<Val>)>,
 }
 
 /// One window of a windowed select: blr_partition_by's operands -
@@ -4166,6 +4191,40 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
             }
             out.push(blr::END);
         }
+        TrigStmt::InsertSel {
+            src,
+            src_ctx,
+            tgt,
+            tgt_ctx,
+            cols,
+            vals,
+            wher,
+        } => {
+            out.push(blr::FOR);
+            out.push(blr::MARKS);
+            out.push(1);
+            out.push(4);
+            out.push(blr::RSE);
+            out.push(1);
+            emit_stream(out, src, *src_ctx);
+            if let Some(b) = wher {
+                out.push(blr::BOOLEAN);
+                emit_bool(out, b);
+            }
+            out.push(blr::END);
+            out.push(blr::STORE);
+            emit_stream(out, tgt, *tgt_ctx);
+            out.push(blr::BEGIN);
+            for (c, v) in cols.iter().zip(vals) {
+                out.push(blr::ASSIGNMENT);
+                emit_val(out, v);
+                out.push(blr::FIELD);
+                out.push(*tgt_ctx);
+                out.push(c.len() as u8);
+                out.extend_from_slice(c.as_bytes());
+            }
+            out.push(blr::END);
+        }
         TrigStmt::Merge {
             src,
             src_ctx,
@@ -4478,6 +4537,41 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                     out.push(blr::BOOLEAN);
                     emit_bool(out, h);
                 }
+            } else if let Some(u) = &f.union_ {
+                // blr_union at the FIRST slot: count, per branch its
+                // rse (WHERE inside) and map; a DISTINCT union
+                // appends blr_project over the fids; the shared rse
+                // END below closes it (probed)
+                out.push(blr::UNION);
+                out.push(u.ctx);
+                out.push(u.branches.len() as u8);
+                for (st, bctx, bwher, cols) in &u.branches {
+                    out.push(blr::RSE);
+                    out.push(1);
+                    emit_stream(out, st, *bctx);
+                    if let Some(b) = bwher {
+                        out.push(blr::BOOLEAN);
+                        emit_bool(out, b);
+                    }
+                    out.push(blr::END);
+                    out.push(blr::MAP);
+                    out.extend_from_slice(
+                        &(cols.len() as u16).to_le_bytes(),
+                    );
+                    for (fi, c) in cols.iter().enumerate() {
+                        out.extend_from_slice(
+                            &(fi as u16).to_le_bytes(),
+                        );
+                        emit_val(out, c);
+                    }
+                }
+                if !u.all {
+                    out.push(blr::PROJECT);
+                    out.push(u.branches[0].3.len() as u8);
+                    for i in 0..u.branches[0].3.len() {
+                        emit_val(out, &Val::Fid(u.ctx, i as u16));
+                    }
+                }
             } else if !f.windows.is_empty() {
                 // blr_window wraps the inner rse (its WHERE inside);
                 // then the count and each window: blr_partition_by,
@@ -4774,6 +4868,45 @@ impl<'a> P<'a> {
             }
         };
         self.i = list_end + 1;
+        // a UNION ahead (depth-0, before INTO/DO) claims the
+        // statement's FIRST slot - look ahead and reserve it so the
+        // branch streams number after it (probed)
+        let mut has_union = false;
+        {
+            let mut j = self.i;
+            let mut depth = 0i32;
+            while let Some(t) = self.t.get(j) {
+                match t {
+                    Tok::LParen => depth += 1,
+                    Tok::RParen => depth -= 1,
+                    Tok::Ident(w)
+                        if depth == 0
+                            && (w == "INTO" || w == "DO" || w == "AS") =>
+                    {
+                        break
+                    }
+                    Tok::Ident(w) if depth == 0 && w == "UNION" => {
+                        has_union = true;
+                        break;
+                    }
+                    Tok::Semi => break,
+                    _ => {}
+                }
+                j += 1;
+            }
+        }
+        let union_ctx = if has_union {
+            self.streams.push(Stream {
+                name: String::new(),
+                alias: None,
+                derived: None,
+                sub: self.in_sub,
+                cur: None,
+            });
+            Some((self.streams.len() - 1) as u8 + self.base)
+        } else {
+            None
+        };
         let stream = self.stream_item()?;
         self.streams.push(stream.clone());
         let sidx = self.streams.len() - 1;
@@ -4986,6 +5119,101 @@ impl<'a> P<'a> {
         } else {
             None
         };
+        // UNION [ALL] branches: each a plain single-stream select -
+        // items resolved at ITS stream, WHERE inside its rse; the
+        // whole union refuses beside every other structure
+        let mut union_ = None;
+        if let Some(uctx) = union_ctx {
+            if !self.kw("UNION") {
+                return None; // the lookahead promised one
+            }
+            let all = self.kw("ALL");
+            let first_cols: Vec<Val> = items
+                .iter()
+                .map(|it| match it {
+                    Item::Col(v) => Some(v.clone()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if has_aggs || !joins.is_empty() || stream.derived.is_some() {
+                return None;
+            }
+            let mut branches = vec![(
+                stream.clone(),
+                ctx,
+                boolean.take(),
+                first_cols.clone(),
+            )];
+            loop {
+                if !self.kw("SELECT") {
+                    return None;
+                }
+                // the branch select list, positionally
+                let mut raw: Vec<(Option<String>, String)> = Vec::new();
+                loop {
+                    let Some(Tok::Ident(a)) = self.t.get(self.i) else {
+                        return None;
+                    };
+                    if is_keyword(a) {
+                        return None;
+                    }
+                    let a = a.clone();
+                    self.i += 1;
+                    if matches!(self.t.get(self.i), Some(Tok::Dot)) {
+                        self.i += 1;
+                        let Some(Tok::Ident(b)) = self.t.get(self.i)
+                        else {
+                            return None;
+                        };
+                        raw.push((Some(a), b.clone()));
+                        self.i += 1;
+                    } else {
+                        raw.push((None, a));
+                    }
+                    match self.t.get(self.i)? {
+                        Tok::Comma => self.i += 1,
+                        Tok::Ident(w) if w == "FROM" => {
+                            self.i += 1;
+                            break;
+                        }
+                        _ => return None,
+                    }
+                }
+                if raw.len() != first_cols.len() {
+                    return None;
+                }
+                let bst = self.stream_item()?;
+                if bst.derived.is_some() {
+                    return None;
+                }
+                self.streams.push(bst.clone());
+                let bidx = self.streams.len() - 1;
+                let bctx = bidx as u8 + self.base;
+                let saved_b = self.sub.replace(bidx);
+                let mut cols = Vec::with_capacity(raw.len());
+                for (q, n) in &raw {
+                    cols.push(self.field(q.as_deref(), n)?);
+                }
+                let bwher = if self.kw("WHERE") {
+                    Some(self.bool_or()?)
+                } else {
+                    None
+                };
+                self.sub = saved_b;
+                branches.push((bst, bctx, bwher, cols));
+                if !self.kw("UNION") {
+                    break;
+                }
+                if all != self.kw("ALL") {
+                    return None; // mixed ALL/distinct: unprobed
+                }
+            }
+            union_ = Some(BodyUnion {
+                ctx: uctx,
+                all,
+                branches,
+            });
+        }
         let mut group_keys: Vec<Val> = Vec::new();
         let grouped = self.kw("GROUP");
         if grouped {
@@ -5020,7 +5248,15 @@ impl<'a> P<'a> {
             }
         }
         let aggregate = has_aggs || grouped;
+        if union_.is_some()
+            && (grouped || first.is_some() || skip.is_some())
+        {
+            return None;
+        }
         let has_wins = items.iter().any(|it| matches!(it, Item::Win(..)));
+        if union_.is_some() && has_wins {
+            return None;
+        }
         // a DERIVED stream (probed pass-through at body numbering)
         // beside aggregates, windows, joins, FIRST/SKIP: unprobed
         if stream.derived.is_some()
@@ -5202,7 +5438,11 @@ impl<'a> P<'a> {
         } else {
             Vec::new()
         };
-        let col_vals: Vec<Val> = if has_wins {
+        let col_vals: Vec<Val> = if let Some(u) = &union_ {
+            (0..cols_n)
+                .map(|i| Val::Fid(u.ctx, i as u16))
+                .collect()
+        } else if has_wins {
             win_slots
                 .iter()
                 .map(|(wi, slot)| Val::Fid(windows[*wi].ctx, *slot))
@@ -5328,6 +5568,11 @@ impl<'a> P<'a> {
         if has_wins && !sort.is_empty() {
             return None; // statement ORDER BY over windows: unprobed
         }
+        if union_.is_some()
+            && (!sort.is_empty() || lock || cursor.is_some())
+        {
+            return None;
+        }
         Some(TrigStmt::ForSel(Box::new(ForSel {
             label,
             stream,
@@ -5336,6 +5581,7 @@ impl<'a> P<'a> {
             lock,
             joins,
             windows,
+            union_,
             aggregate,
             map,
             group_keys,
@@ -6767,6 +7013,83 @@ impl<'a> P<'a> {
                     }
                     _ => return None,
                 }
+            }
+            // INSERT ... SELECT: a marks-stamped FOR loop over the
+            // source rse - the source stream numbers FIRST (probed)
+            if self.kw("SELECT") {
+                let mut raw: Vec<(Option<String>, String)> = Vec::new();
+                loop {
+                    let Some(Tok::Ident(a)) = self.t.get(self.i) else {
+                        return None;
+                    };
+                    if is_keyword(a) {
+                        return None;
+                    }
+                    let a = a.clone();
+                    self.i += 1;
+                    if matches!(self.t.get(self.i), Some(Tok::Dot)) {
+                        self.i += 1;
+                        let Some(Tok::Ident(b)) = self.t.get(self.i)
+                        else {
+                            return None;
+                        };
+                        raw.push((Some(a), b.clone()));
+                        self.i += 1;
+                    } else {
+                        raw.push((None, a));
+                    }
+                    match self.t.get(self.i)? {
+                        Tok::Comma => self.i += 1,
+                        Tok::Ident(w) if w == "FROM" => {
+                            self.i += 1;
+                            break;
+                        }
+                        _ => return None,
+                    }
+                }
+                if raw.len() != cols.len() {
+                    return None;
+                }
+                let src = self.stream_item()?;
+                if src.derived.is_some() {
+                    return None;
+                }
+                self.streams.push(src.clone());
+                let src_idx = self.streams.len() - 1;
+                let src_ctx = src_idx as u8 + self.base;
+                let saved = self.sub.replace(src_idx);
+                let mut vals = Vec::with_capacity(raw.len());
+                for (q, n) in &raw {
+                    vals.push(self.field(q.as_deref(), n)?);
+                }
+                let wher = if self.kw("WHERE") {
+                    Some(self.bool_or()?)
+                } else {
+                    None
+                };
+                self.sub = saved;
+                if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                    return None;
+                }
+                self.i += 1;
+                let tgt = Stream {
+                    name: rel,
+                    alias: None,
+                    derived: None,
+                    sub: self.in_sub,
+                    cur: None,
+                };
+                self.streams.push(tgt.clone());
+                let tgt_ctx = (self.streams.len() - 1) as u8 + self.base;
+                return Some(TrigStmt::InsertSel {
+                    src,
+                    src_ctx,
+                    tgt,
+                    tgt_ctx,
+                    cols,
+                    vals,
+                    wher,
+                });
             }
             if !self.kw("VALUES") || !matches!(self.t.get(self.i), Some(Tok::LParen)) {
                 return None;
@@ -9696,6 +10019,34 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_thirty_eight_shapes_byte_for_byte() {
+        // UNION in body FOR SELECTs (flip forty-seven): blr_union at
+        // the statement's FIRST slot, branch streams following
+        pin_proc(
+            "CREATE PROCEDURE RG3 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T UNION ALL SELECT UID FROM U2 INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014C000243014A015401FF4D01000000170102494443014A02553202FF4D01000000170203554944FF0201180000001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... a DISTINCT union appends blr_project over the fids
+        pin_proc(
+            "CREATE PROCEDURE RH1 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T UNION SELECT UID FROM U2 INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014C000243014A015401FF4D01000000170102494443014A02553202FF4D01000000170203554944450118000000FF0201180000001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... per-branch WHEREs inside their rses, duplicate columns
+        // keeping separate slots
+        pin_proc(
+            "CREATE PROCEDURE RH2 (P1 INTEGER) RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT ID, ID FROM T WHERE ID > :P1 UNION ALL SELECT UID, UA FROM U2 WHERE UA < :P1 INTO :R1, :R2 DO SUSPEND; END",
+            "0502040002000800070004010500080007000800070007000C00020300000800012D1A00000301000800012D1A01009B1100020211010743014C000243014A01540147311701024944290000000100FF4D0200000017010249440100170102494443014A0255320247331702025541290000000100FF4D0200000017020355494401001702025541FF0201180000001A000001180001001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        // INSERT ... SELECT (flip forty-eight - a slice-12 refusal):
+        // a marks(1, 4) FOR loop over the source rse, one store per
+        // row, the SOURCE stream numbering first
+        pin_proc(
+            "CREATE PROCEDURE RH4 (P1 INTEGER) AS BEGIN INSERT INTO T (ID) SELECT UID FROM U2 WHERE UA > :P1; END",
+            "050204000200080007000401010007000C00029B1100020207D9010443014A0255320047311700025541290000000100FF0F4A01540102011700035549441701024944FFFFFFFF0E010201150700000019010000FFFF4C",
+        );
+    }
+
+    #[test]
     fn window_refusals() {
         for sql in [
             // windows beside GROUP BY/aggregates: unprobed
@@ -9710,9 +10061,8 @@ mod tests {
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT SUM(UA) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM U2 INTO :R1 DO SUSPEND; END",
             // named windows (the WINDOW clause): unprobed
             "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT UID, SUM(UA) OVER W FROM U2 WINDOW W AS (PARTITION BY UID) INTO :R1, :R2 DO SUSPEND; END",
-            // UNION in a body FOR SELECT: probed (blr_union at the
-            // statement's first slot), unconverted
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T UNION ALL SELECT UID FROM U2 INTO :R1 DO SUSPEND; END",
+            // mixed ALL/distinct across union branches: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T UNION ALL SELECT UID FROM U2 UNION SELECT UID FROM U2 INTO :R1 DO SUSPEND; END",
         ] {
             assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
         }
@@ -9857,8 +10207,8 @@ mod tests {
             "CREATE TRIGGER X FOR T BEFORE INSERT AS BEGIN INSERT INTO U2 VALUES (1); END",
             // column/value count mismatch is an engine error
             "CREATE TRIGGER X FOR T BEFORE INSERT AS BEGIN INSERT INTO U2 (UID) VALUES (1, 2); END",
-            // INSERT ... SELECT: unprobed
-            "CREATE TRIGGER X FOR T BEFORE INSERT AS BEGIN INSERT INTO U2 (UID) SELECT ID FROM T; END",
+            // INSERT ... SELECT with expressions: unprobed
+            "CREATE TRIGGER X FOR T BEFORE INSERT AS BEGIN INSERT INTO U2 (UID) SELECT ID * 2 FROM T; END",
         ] {
             assert!(compile_trigger(sql).is_none(), "{sql} was compiled");
         }
