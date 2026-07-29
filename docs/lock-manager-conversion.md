@@ -242,26 +242,50 @@ same shape.
   `DeadlockTimeout` cadence: the cross-update denial arrived ~10s
   after the cycle closed, inside the gate's 25s window.
 
+<a name="slice2"></a>
+## Slice 2: teardown, lock data, the blocking set
+
+Three of the roadmap's six items landed, and one was re-scoped by a
+live finding.
+
+**Owner teardown** (`purge_owner`): every granted and pending
+request the owner holds comes down, each affected lock regranting
+its queue FIFO — the engine's purge on detach. The live
+differential is phase 4 of the gate: A holds PROTECTED WRITE, B's
+WAIT reservation parks behind it, A *detaches without committing* —
+and B proceeds the moment the engine's purge releases A's locks,
+exactly the release-all-and-regrant the crate's unit test pins.
+
+**Lock data words** (`write_data`/`read_data`): the `lbl_data` side
+channel — writing requires HOLDING the lock, anyone reads, an
+absent lock reads zero. The probe found one live: a transaction
+lock (series 4, `LCK_tra`) carrying `Data: 134` in this box's
+`fb_lock_print` output — the mechanism in the wild, not just in the
+nbackup case study.
+
+**The blocking set** (`blockers`): the owners whose granted,
+incompatible requests stand between a parked request and its grant —
+exactly who would receive the blocking AST when delivery exists.
+The decision layer is now data; the transport stays out.
+
+**The re-scope**: fb_lock_print on this SuperServer shows NO
+series-2 relation locks — relation arbitration lives in-process,
+and the shared table carries only the cross-process series
+(idx_rescan, dsql_cache, tra, attachment, monitor...). A structural
+diff of relation locks against the dump is therefore not observable
+here; the RESERVATION behavior (phases 2–4) remains the
+relation-lock oracle, and the dump remains useful for the series
+that do appear.
+
 <a name="roadmap"></a>
 ## Roadmap
 
-Next slices, in likely order:
-
-1. **Lock data words** (`lbl_data`, `LCK_write_data`) — the nbackup
-   state lock's side channel; unit-pinnable, and observable through
-   `nbackup` states.
-2. **Blocking notifications** — model the AST decision ("who gets
-   knocked when this request parks") as data the caller can read;
-   the delivery transport stays out.
-3. **Timeouts** — `Waiting` verdicts with a deadline, and the lock
+1. **AST delivery modeling** — surface `blockers` at wait time as
+   an event the caller consumes.
+2. **Timeouts** — `Waiting` verdicts with a deadline, and the lock
    timeout error distinct from the deadlock error.
-4. **Owner teardown** — release-all on detach (the engine's purge on
-   owner death), regranting across everything the owner held.
-5. **Series semantics** — bring `jrd/lck.cpp`'s typed layer over:
-   database, attachment, relation locks with their real keys, so
-   fire-crab's wire server can eventually arbitrate two of ITS OWN
-   attachments through this table (today it is single-attachment).
-6. **fb_lock_print differential** — dump the real server's lock
-   table under a scripted scenario and compare the granted/waiting
-   sets structurally against the crate's table after the same
-   sequence.
+3. **Series semantics** — bring `jrd/lck.cpp`'s typed layer over,
+   so fire-crab's wire server can arbitrate two of ITS OWN
+   attachments through this table.
+4. **Cross-process-series dump differential** — the series that DO
+   live in the shared table, compared structurally.

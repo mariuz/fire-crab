@@ -13,6 +13,33 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-lck slice 2: teardown, lock data, the blocking set
+
+### Converted
+- **Owner teardown** (`purge_owner`): the engine's purge on detach —
+  every granted and pending request comes down, each affected lock
+  regranting FIFO. Live-verified (gate phase 4): A holds PW, B's
+  WAIT reservation parks, A DETACHES WITHOUT COMMITTING — and B
+  proceeds the moment the engine's purge fires, the same
+  release-all-and-regrant the crate's unit test pins.
+- **Lock data words** (`write_data`/`read_data`): `lbl_data` — the
+  writer must HOLD the lock, anyone reads, an absent lock reads
+  zero. The probe caught the mechanism live: a transaction lock
+  carrying `Data: 134` in fb_lock_print on this very box.
+- **The blocking set** (`blockers`): the owners whose granted,
+  incompatible requests park a waiter — exactly who would receive
+  the blocking AST; the decision is now data, the delivery stays
+  transport.
+- **A SuperServer finding re-scoped the roadmap**: fb_lock_print
+  shows NO relation locks — relation arbitration is in-process, the
+  shared table carries only cross-process series. The structural
+  dump differential is bounded accordingly; reservations remain the
+  relation-lock oracle.
+
+### Guarded
+- AST delivery, timeouts, series semantics. Gate grew phase 4
+  (teardown-unblock); 11 unit tests; 267 workspace tests.
+
 ## 2026-07-29 — fire-crab-cch slice 2: the matrix learns indexes and deletes
 
 ### Converted

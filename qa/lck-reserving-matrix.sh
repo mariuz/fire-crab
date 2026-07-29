@@ -138,4 +138,51 @@ else
     fail=1
 fi
 
+# --- phase 4: owner teardown unblocks the queue ------------------------
+# A holds PW; B's WAIT reservation parks behind it; A DETACHES (the
+# fifo closes) and the engine's owner purge regrants B - the same
+# release-all-and-regrant fclck's purge_owner runs (pinned by its
+# purge_regrants_the_queue unit test)
+mkfifo "$FIFO"; FIFO2="$D/lck-fifo2"; rm -f "$FIFO2"; mkfifo "$FIFO2"
+"$ISQL" -q -user "$U" -pas "$P" "localhost:$DB" < "$FIFO" > "$D/lck-a.log" 2>&1 &
+apid=$!
+"$ISQL" -q -user "$U" -pas "$P" "localhost:$DB" < "$FIFO2" > "$D/lck-b.log" 2>&1 &
+bpid=$!
+exec 9>"$FIFO"; exec 8>"$FIFO2"
+echo "SET TRANSACTION RESERVING T FOR PROTECTED WRITE;" >&9
+sleep 1
+# B parks: a WAIT reservation conflicting with A's PW
+echo "SET TRANSACTION WAIT RESERVING T FOR PROTECTED WRITE;" >&8
+echo "SELECT 'B-PROCEEDED' FROM RDB\$DATABASE;" >&8
+echo "COMMIT;" >&8
+echo "EXIT;" >&8
+sleep 2
+if grep -q "B-PROCEEDED" "$D/lck-b.log" 2>/dev/null; then
+    echo "DIFF teardown: B proceeded while A still held PW"
+    fail=1
+fi
+# A detaches WITHOUT committing - the owner purge must release its
+# locks and regrant B
+echo "EXIT;" >&9
+exec 9>&-
+deadline=$((SECONDS + 15))
+ok=0
+while [ $SECONDS -lt $deadline ]; do
+    if grep -q "B-PROCEEDED" "$D/lck-b.log" 2>/dev/null; then
+        ok=1
+        break
+    fi
+    sleep 1
+done
+exec 8>&-
+wait $apid 2>/dev/null; wait $bpid 2>/dev/null
+rm -f "$FIFO" "$FIFO2"
+if [ $ok -eq 1 ]; then
+    echo "OK   A's detach releases its locks and B's parked reservation proceeds (owner purge + regrant)"
+else
+    echo "DIFF B never proceeded after A detached"
+    tail -3 "$D/lck-b.log"
+    fail=1
+fi
+
 exit $fail

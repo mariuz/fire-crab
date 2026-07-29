@@ -81,10 +81,18 @@
 //!
 //! In-process table only (the arena is transport); owners, enqueue
 //! with WAIT/NO WAIT, convert, dequeue, FIFO regrant of the pending
-//! queue, and the deadlock scan. Blocking ASTs, lock data words
-//! (`lbl_data`/LCK_write_data), timeouts, and the 36 lock series'
-//! semantics ride later slices - series and key are opaque bytes
-//! here, exactly as they are to the table itself.
+//! queue, and the deadlock scan. Slice 2 added OWNER TEARDOWN
+//! ([LockTable::purge_owner] - the detach purge, live-verified: a
+//! parked reservation proceeds the moment its blocker's attachment
+//! dies), LOCK DATA WORDS ([LockTable::write_data]/read_data -
+//! holding required to write, anyone reads, absent reads zero; a
+//! live transaction lock on this box carries Data: 134 in
+//! fb_lock_print) and the BLOCKING SET ([LockTable::blockers] - who
+//! would receive the AST). AST delivery, timeouts and the series'
+//! semantics ride later slices. A SuperServer finding bounds the
+//! structural differential: RELATION locks do not appear in the
+//! shared lock table (fb_lock_print shows the cross-process series
+//! only), so reservation behavior stays the relation-lock oracle.
 
 use std::collections::BTreeMap;
 
@@ -182,6 +190,11 @@ struct Request {
 /// does not interpret either.
 #[derive(Default)]
 struct LockBlock {
+    /// `lbl_data`: the lock's data word - a value an owner HOLDING
+    /// the lock may stamp (LCK_write_data) and any owner may read;
+    /// the nbackup state lock's side channel, and live on this box:
+    /// a transaction lock carrying Data: 134 in fb_lock_print
+    data: u64,
     granted: Vec<Request>,
     /// `lbl_counts`: how many granted requests hold each mode
     counts: [u32; 7],
@@ -388,6 +401,85 @@ impl LockTable {
             .unwrap_or(false)
     }
 
+    /// Owner teardown - the engine's purge on detach: every granted
+    /// and pending request the owner holds comes down, and every
+    /// affected lock regrants its queue FIFO (the release path run
+    /// once per lock). Returns how many grants were released.
+    pub fn purge_owner(&mut self, owner: OwnerId) -> usize {
+        let keys: Vec<(u8, Vec<u8>)> = self.locks.keys().cloned().collect();
+        let mut released = 0;
+        for (series, key) in keys {
+            let Some(lock) = self.locks.get_mut(&(series, key.clone())) else {
+                continue;
+            };
+            lock.pending.retain(|p| p.owner != owner);
+            let before = lock.granted.len();
+            // dequeue re-runs the FIFO regrant per removal; an owner
+            // may hold at most one grant per lock in this table
+            if lock.granted.iter().any(|r| r.owner == owner) {
+                self.dequeue(owner, series, &key);
+                released += 1;
+            } else {
+                let _ = before;
+                if lock.granted.is_empty() && lock.pending.is_empty() {
+                    self.locks.remove(&(series, key));
+                }
+            }
+        }
+        released
+    }
+
+    /// LCK_write_data: stamp the lock's data word. The engine
+    /// requires the writer to HOLD the lock - so does this.
+    pub fn write_data(
+        &mut self,
+        owner: OwnerId,
+        series: u8,
+        key: &[u8],
+        data: u64,
+    ) -> Result<(), String> {
+        let lock = self
+            .locks
+            .get_mut(&(series, key.to_vec()))
+            .ok_or("no such lock")?;
+        if !lock.granted.iter().any(|r| r.owner == owner) {
+            return Err("data writes require holding the lock".into());
+        }
+        lock.data = data;
+        Ok(())
+    }
+
+    /// LCK_read_data: any owner may read the word; an absent lock
+    /// reads zero (the engine's convention - data outlives no lock).
+    pub fn read_data(&self, series: u8, key: &[u8]) -> u64 {
+        self.locks
+            .get(&(series, key.to_vec()))
+            .map(|l| l.data)
+            .unwrap_or(0)
+    }
+
+    /// The blocking set: the owners whose GRANTED requests are
+    /// incompatible with this owner's PENDING request on the lock -
+    /// exactly who would receive the blocking AST when delivery
+    /// exists. Empty when the owner is not waiting there.
+    pub fn blockers(&self, owner: OwnerId, series: u8, key: &[u8]) -> Vec<OwnerId> {
+        let Some(lock) = self.locks.get(&(series, key.to_vec())) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for p in lock.pending.iter().filter(|p| p.owner == owner) {
+            for g in &lock.granted {
+                if g.owner != owner
+                    && !compatible(p.mode, g.mode)
+                    && !out.contains(&g.owner)
+                {
+                    out.push(g.owner);
+                }
+            }
+        }
+        out
+    }
+
     /// The deadlock scan: does a wait-for cycle pass through `start`?
     /// An owner with a PENDING request waits for every owner whose
     /// GRANTED request on the same lock is incompatible with it - the
@@ -561,6 +653,59 @@ mod tests {
         // releasing T2 regrants it
         t.dequeue(b, REL, b"T2");
         assert!(t.is_granted(a, REL, b"T2"));
+    }
+
+    #[test]
+    fn purge_regrants_the_queue() {
+        let mut t = LockTable::new();
+        let a = t.create_owner();
+        let b = t.create_owner();
+        let c = t.create_owner();
+        assert_eq!(t.enqueue(a, REL, b"T", Exclusive, false), Verdict::Granted);
+        assert_eq!(t.enqueue(b, REL, b"T", SharedWrite, true), Verdict::Waiting);
+        assert_eq!(t.enqueue(a, REL, b"U", SharedRead, false), Verdict::Granted);
+        // a detaches: everything it held comes down, b's wait grants
+        assert_eq!(t.purge_owner(a), 2);
+        assert!(t.is_granted(b, REL, b"T"));
+        assert!(!t.is_granted(a, REL, b"U"));
+        // c never waits on anything a held
+        assert_eq!(t.enqueue(c, REL, b"U", Exclusive, false), Verdict::Granted);
+    }
+
+    #[test]
+    fn lock_data_requires_holding() {
+        let mut t = LockTable::new();
+        let a = t.create_owner();
+        let b = t.create_owner();
+        assert_eq!(t.enqueue(a, REL, b"T", SharedRead, false), Verdict::Granted);
+        // a holds - the stamp lands; b does not - refused
+        assert!(t.write_data(a, REL, b"T", 134).is_ok());
+        assert!(t.write_data(b, REL, b"T", 7).is_err());
+        // anyone reads; an absent lock reads zero
+        assert_eq!(t.read_data(REL, b"T"), 134);
+        assert_eq!(t.read_data(REL, b"NONE"), 0);
+    }
+
+    #[test]
+    fn blockers_name_the_ast_targets() {
+        let mut t = LockTable::new();
+        let a = t.create_owner();
+        let b = t.create_owner();
+        let c = t.create_owner();
+        assert_eq!(t.enqueue(a, REL, b"T", SharedWrite, false), Verdict::Granted);
+        assert_eq!(t.enqueue(b, REL, b"T", SharedWrite, false), Verdict::Granted);
+        assert_eq!(t.enqueue(c, REL, b"T", ProtectedRead, true), Verdict::Waiting);
+        // both shared writers would get the knock; nobody blocks a
+        // non-waiter
+        assert_eq!(t.blockers(c, REL, b"T"), vec![a, b]);
+        assert!(t.blockers(a, REL, b"T").is_empty());
+        // one releases: still blocked by the other alone
+        t.dequeue(a, REL, b"T");
+        assert_eq!(t.blockers(c, REL, b"T"), vec![b]);
+        // the last releases: c grants, no blockers remain
+        t.dequeue(b, REL, b"T");
+        assert!(t.is_granted(c, REL, b"T"));
+        assert!(t.blockers(c, REL, b"T").is_empty());
     }
 
     #[test]

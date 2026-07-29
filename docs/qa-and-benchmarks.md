@@ -3862,6 +3862,20 @@ The deep companion documentation lives in
 
 ## The reserving matrix: the lock table against the live engine
 
+(Slice 2 added phase 4 - owner teardown: A holds PROTECTED WRITE,
+B's WAIT reservation parks behind it, and A detaches WITHOUT
+committing; the engine's owner purge releases A's locks and B
+proceeds, the same release-all-and-regrant fclck's purge_owner runs.
+Lock data words and the blocking set landed as unit-pinned API - and
+the probe caught lbl_data live, a transaction lock carrying Data:
+134 in fb_lock_print. One finding re-scoped the roadmap: this
+SuperServer keeps RELATION locks out of the shared lock table
+entirely, so the structural dump differential is bounded to the
+cross-process series and reservation behavior remains the
+relation-lock oracle.)
+
+
+
 fire-crab-lck converts the POLICY of src/lock/lock.cpp - the
 compatibility matrix, the single-aggregate grant probe, enqueue /
 convert / dequeue with FIFO regrant, and the deadlock scan - and
