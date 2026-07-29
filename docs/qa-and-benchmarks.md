@@ -4666,6 +4666,27 @@ WHEN, and a BLOCK as a handler's body nests blr_block again with no
 handler section of its own - the battery runs a handler block
 containing an EXIT.
 
+Slice 42 converted three probes that all landed in one pass, and
+the gate then held the variations open by itself. DISTINCT in body
+FOR SELECTs is blr_project over the select columns after the
+boolean - the slice-6 view law arriving at body numbering without a
+byte of difference; the multi-column and ORDER BY variants went
+straight into the battery and verified live, never separately
+probed. PLAN (tbl INDEX (names)) keeps slice 41's plan head and
+stands blr_indices - a count, then counted index names - where
+blr_sequential stood; a two-index plan verified the count byte.
+And ROWS m TO n, the legacy row-limit spelling, turns out to be
+ARITHMETIC in disguise: the engine desugars it to unfolded
+expression trees - first = add(subtract(n, m), 1), skip =
+subtract(m, 1) - in the same rse slots OFFSET/FETCH fills, the
+SUBSTRING subtract(from,1) lesson at clause scale. Recursive CTEs
+were probed and left as a named refusal with the transcript in
+hand: WITH RECURSIVE compiles to blr_recurse, a union-like whose
+anchor branch is an ordinary rse and map but whose RECURSIVE
+branch has ZERO streams - it reads the recursion's own output
+context by fid. That shape needs its own emission path, and the
+probe bytes are already in the refusal's comment waiting for it.
+
 Slice 41 opened five doors in one pass, and the gate held two of
 them open itself. Expression sort keys: the raw expression in the
 sort clause - with bare literals refusing, because ORDER BY 1 is a

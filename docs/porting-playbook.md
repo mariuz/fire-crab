@@ -313,6 +313,17 @@ them.
     # parser (val() for sort keys) can turn an old REFUSAL into
     # wrong bytes (ORDER BY 1 = a position) - re-check refusal tests
     # after every parser widening
+    # legacy syntax may be ARITHMETIC in disguise: ROWS m TO n
+    # compiles to unfolded add/subtract trees IN the first/skip
+    # slots (the SUBSTRING -1 lesson at clause scale) - probe the
+    # TREES the reference compiler builds, not the values they mean
+    # a law probed at one oracle CARRIES: view DISTINCT (project
+    # after the boolean) lands at body numbering unchanged, and the
+    # INDEX plan form just swaps the sequential marker for a
+    # counted-name verb - probe the carry once, let the gate hold
+    # the variations; recursion is a union with a STREAM-LESS
+    # branch reading its own output context by fid - hold the
+    # transcript until the emission path exists
     # a positional law may really be a CONTRIBUTION law: the
     # aggregate map was never items-in-order but items-CONTRIBUTING
     # in order (fields or verbs, deduped) - the degenerate case hid

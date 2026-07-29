@@ -13,6 +13,31 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-dsql slice 42: DISTINCT, PLAN INDEX, ROWS m TO n
+
+### Converted
+- **DISTINCT in body FOR SELECTs** (flip fifty-nine): `blr_project`
+  over the select columns AFTER the boolean — the slice-6 view law
+  landing at body numbering unchanged; multi-column and ORDER BY
+  variants live-verified by the gate, never separately probed.
+- **PLAN (tbl INDEX (names))** (flip sixty — a slice-41 refusal):
+  `blr_indices` + a count + counted index names standing where
+  `blr_sequential` stood; two-index plans battery-verified.
+- **ROWS m TO n** (flip sixty-one): the legacy row limits desugar
+  to UNFOLDED arithmetic — first = add(subtract(n, m), 1), skip =
+  subtract(m, 1) — literal expression trees in the same rse slots
+  OFFSET/FETCH fills.
+
+### Guarded
+- Recursive CTEs probed and named: WITH RECURSIVE = `blr_recurse`,
+  a union-like whose anchor branch is an ordinary rse + map but
+  whose RECURSIVE branch has ZERO streams — it reads the
+  recursion's own context by fid. Transcript held. Also: ROWS n
+  alone, ROWS with parameter bounds, DISTINCT in the singular
+  form / over aggregates / over joins, empty index lists, PLAN
+  JOIN. Gate: `qa/dsql-proc-blr.sh` grew to 253 checks (11
+  fresh); 381 unit byte-pins.
+
 ## 2026-07-29 — fire-crab-dsql slice 41: five doors - sort exprs, window exprs, OFFSET/FETCH, PLAN, params in HAVING
 
 ### Converted

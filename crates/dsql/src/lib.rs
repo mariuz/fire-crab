@@ -383,6 +383,9 @@ mod blr {
     pub const PLAN: u8 = 0x8B;
     pub const RETRIEVE: u8 = 0x91;
     pub const SEQUENTIAL: u8 = 0x8E;
+    /// PLAN (tbl INDEX (names)): blr_indices + a count byte + the
+    /// counted index names (probed)
+    pub const INDICES: u8 = 0x90;
     /// streams inside SUBROUTINE bodies: blr_relation3 - counted
     /// schema, counted package (empty), counted name, then the alias
     /// string relation2 would carry OR a counted empty, ctx (probed;
@@ -3933,9 +3936,13 @@ struct ForSel {
     /// specs) its context, partition keys, order keys and map -
     /// passthrough columns live in the DEFAULT window (probed)
     windows: Vec<Win>,
-    /// PLAN (tbl NATURAL): blr_plan + blr_retrieve + the stream
-    /// re-emitted + blr_sequential, last in the rse (probed)
-    plan: bool,
+    /// SELECT DISTINCT: blr_project over the select columns, after
+    /// the boolean (probed at body numbering)
+    distinct: bool,
+    /// PLAN (tbl NATURAL | tbl INDEX (names)): blr_plan +
+    /// blr_retrieve + the stream re-emitted + blr_sequential or
+    /// blr_indices with counted names, last in the rse (probed)
+    plan: Option<PlanKind>,
     /// UNION [ALL]: the union claims the statement's FIRST slot,
     /// branch streams follow; per branch its rse (WHERE inside) and
     /// map; a DISTINCT union appends blr_project over the fids
@@ -3978,6 +3985,12 @@ fn emit_map_entries(out: &mut Vec<u8>, map: &[MapEntry]) {
             }
         }
     }
+}
+
+/// The probed PLAN shapes.
+enum PlanKind {
+    Natural,
+    Index(Vec<String>),
 }
 
 /// A body FOR SELECT's UNION: the union context, ALL or distinct,
@@ -4918,11 +4931,30 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                     emit_val(out, key);
                 }
             }
-            if f.plan {
+            if f.distinct {
+                // blr_project over the select columns, after the
+                // boolean (probed at body numbering)
+                out.push(blr::PROJECT);
+                out.push(f.col_vals.len() as u8);
+                for v in &f.col_vals {
+                    emit_val(out, v);
+                }
+            }
+            if let Some(pk) = &f.plan {
                 out.push(blr::PLAN);
                 out.push(blr::RETRIEVE);
                 emit_stream(out, &f.stream, f.ctx);
-                out.push(blr::SEQUENTIAL);
+                match pk {
+                    PlanKind::Natural => out.push(blr::SEQUENTIAL),
+                    PlanKind::Index(names) => {
+                        out.push(blr::INDICES);
+                        out.push(names.len() as u8);
+                        for n in names {
+                            out.push(n.len() as u8);
+                            out.extend_from_slice(n.as_bytes());
+                        }
+                    }
+                }
             }
             out.push(blr::END);
             out.push(blr::BEGIN);
@@ -5022,6 +5054,10 @@ impl<'a> P<'a> {
         if !is_for && (first.is_some() || skip.is_some()) {
             return None; // FIRST/SKIP in the singular form: unprobed
         }
+        // SELECT DISTINCT - blr_project over the select columns
+        // after the boolean (probed); beside everything structured
+        // it refuses below
+        let distinct = self.kw("DISTINCT");
         // two-phase select list: fields need the stream's context
         let list_start = self.i;
         let mut depth = 0i32;
@@ -5288,7 +5324,7 @@ impl<'a> P<'a> {
         // blr_plan/blr_retrieve/the stream again/blr_sequential,
         // LAST in the rse after the sort (probed); other plan forms
         // refuse
-        let mut plan = false;
+        let mut plan: Option<PlanKind> = None;
         if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "PLAN") {
             self.i += 1;
             if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
@@ -5304,11 +5340,35 @@ impl<'a> P<'a> {
                 return None;
             }
             self.i += 1;
-            if !matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "NATURAL")
+            if self.kw("NATURAL") {
+                plan = Some(PlanKind::Natural);
+            } else if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "INDEX")
             {
+                self.i += 1;
+                if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                    return None;
+                }
+                self.i += 1;
+                let mut names = Vec::new();
+                loop {
+                    let Some(Tok::Ident(n)) = self.t.get(self.i) else {
+                        return None;
+                    };
+                    names.push(n.clone());
+                    self.i += 1;
+                    match self.t.get(self.i)? {
+                        Tok::Comma => self.i += 1,
+                        Tok::RParen => {
+                            self.i += 1;
+                            break;
+                        }
+                        _ => return None,
+                    }
+                }
+                plan = Some(PlanKind::Index(names));
+            } else {
                 return None;
             }
-            self.i += 1;
             if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
                 return None;
             }
@@ -5316,7 +5376,6 @@ impl<'a> P<'a> {
             if !joins.is_empty() || stream.derived.is_some() {
                 return None;
             }
-            plan = true;
         }
         // UNION [ALL] branches: each a plain single-stream select -
         // items resolved at ITS stream, WHERE inside its rse; the
@@ -5756,6 +5815,47 @@ impl<'a> P<'a> {
                 return None;
             }
         }
+        // ROWS m TO n - the legacy row limits: first = (n - m) + 1
+        // and skip = m - 1, both UNFOLDED arithmetic (probed)
+        if self.kw("ROWS") {
+            if first.is_some() || skip.is_some() {
+                return None;
+            }
+            let Some(Tok::Int(m)) = self.t.get(self.i) else {
+                return None;
+            };
+            let m = i32::try_from(*m).ok()?;
+            self.i += 1;
+            if !matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "TO")
+            {
+                return None;
+            }
+            self.i += 1;
+            let Some(Tok::Int(n)) = self.t.get(self.i) else {
+                return None;
+            };
+            let n = i32::try_from(*n).ok()?;
+            self.i += 1;
+            first = Some(Val::Add(
+                Box::new(Val::Sub(
+                    Box::new(Val::Int(n)),
+                    Box::new(Val::Int(m)),
+                )),
+                Box::new(Val::Int(1)),
+            ));
+            skip = Some(Val::Sub(
+                Box::new(Val::Int(m)),
+                Box::new(Val::Int(1)),
+            ));
+            if aggregate
+                || has_wins
+                || union_.is_some()
+                || !joins.is_empty()
+                || stream.derived.is_some()
+            {
+                return None;
+            }
+        }
         // WITH LOCK - probed beside a WHERE and alone; the shapes
         // beyond the probes (aggregates, FIRST/SKIP, ORDER BY) refuse
         let lock = if self.kw("WITH") {
@@ -5870,7 +5970,28 @@ impl<'a> P<'a> {
         {
             return None;
         }
-        if plan && (aggregate || has_wins || union_.is_some() || lock || cursor.is_some())
+        if plan.is_some()
+            && (aggregate
+                || has_wins
+                || union_.is_some()
+                || lock
+                || cursor.is_some())
+        {
+            return None;
+        }
+        // DISTINCT in the singular form: unprobed
+        if distinct && !is_for {
+            return None;
+        }
+        // DISTINCT beside the structured shapes: unprobed
+        if distinct
+            && (aggregate
+                || has_wins
+                || union_.is_some()
+                || !joins.is_empty()
+                || stream.derived.is_some()
+                || cursor.is_some()
+                || lock)
         {
             return None;
         }
@@ -5882,6 +6003,7 @@ impl<'a> P<'a> {
             lock,
             joins,
             windows,
+            distinct,
             plan,
             union_,
             aggregate,
@@ -10524,6 +10646,61 @@ mod tests {
             "CREATE PROCEDURE RK6 (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE ID > :P1 PLAN (T NATURAL) ORDER BY ID INTO :R1 DO SUSPEND; END",
             "05020400020008000700040103000800070007000C00020300000800012D1A00009B1100020211010743014A0154004731170002494429000000010046014817000249448B914A0154008EFF020117000249441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
         );
+    }
+
+    #[test]
+    fn compiles_slice_forty_two_shapes_byte_for_byte() {
+        // SELECT DISTINCT in a body FOR SELECT: blr_project over the
+        // select columns, AFTER the boolean - the view law lands at
+        // body numbering (flip fifty-nine)
+        pin_proc(
+            "CREATE PROCEDURE RL1 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT DISTINCT DEPT_ID FROM EMPLOYEE WHERE SALARY > 0 INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014A08454D504C4F59454500473117000653414C415259150800000000004501170007444550545F4944FF0201170007444550545F49441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // PLAN (tbl INDEX (name)): the plan head as NATURAL, then
+        // blr_indices + a count + counted index names in place of
+        // blr_sequential (flip sixty)
+        pin_proc(
+            "CREATE PROCEDURE RL2 (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE ID = :P1 PLAN (T INDEX (IDX_T_ID)) INTO :R1 DO SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B1100020211010743014A015400472F17000249442900000001008B914A0154009001084944585F545F4944FF020117000249441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ROWS m TO n: the legacy limits desugar to UNFOLDED
+        // arithmetic - first = add(subtract(n, m), 1) and skip =
+        // subtract(m, 1), literal expression trees in the rse
+        // (flip sixty-one)
+        pin_proc(
+            "CREATE PROCEDURE RL3 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT EMP_NO FROM EMPLOYEE ORDER BY EMP_NO ROWS 2 TO 4 INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014A08454D504C4F59454500442223150800040000001508000200000015080001000000AF231508000200000015080001000000460148170006454D505F4E4FFF0201170006454D505F4E4F1A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+    }
+
+    #[test]
+    fn slice_forty_two_refusals() {
+        for sql in [
+            // recursive CTEs compile via blr_recurse (0xB9) - a
+            // union-like with an anchor branch and a STREAM-LESS
+            // recursive branch referencing the recursion context by
+            // fid; transcript held, unconverted
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 10) SELECT ID FROM NUMS INTO :R1 DO SUSPEND; END",
+            // ROWS n alone (no TO): unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT EMP_NO FROM EMPLOYEE ORDER BY EMP_NO ROWS 3 INTO :R1 DO SUSPEND; END",
+            // ROWS with parameter bounds: unprobed
+            "CREATE PROCEDURE X (P1 INTEGER, P2 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT EMP_NO FROM EMPLOYEE ORDER BY EMP_NO ROWS :P1 TO :P2 INTO :R1 DO SUSPEND; END",
+            // ROWS after OFFSET/FETCH: contradictory limits
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT EMP_NO FROM EMPLOYEE ORDER BY EMP_NO OFFSET 1 ROW FETCH FIRST 2 ROWS ONLY ROWS 2 TO 4 INTO :R1 DO SUSPEND; END",
+            // DISTINCT in the singular form: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN SELECT DISTINCT DEPT_ID FROM EMPLOYEE INTO :R1; SUSPEND; END",
+            // DISTINCT over aggregates: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT DISTINCT COUNT(*) FROM EMPLOYEE INTO :R1 DO SUSPEND; END",
+            // DISTINCT over a join: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT DISTINCT A.ID FROM T A JOIN U2 B ON A.ID = B.UID INTO :R1 DO SUSPEND; END",
+            // PLAN INDEX with an empty index list: malformed
+            "CREATE PROCEDURE X (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE ID = :P1 PLAN (T INDEX ()) INTO :R1 DO SUSPEND; END",
+            // PLAN over a join: unprobed
+            "CREATE PROCEDURE X (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT A.ID FROM T A JOIN U2 B ON A.ID = B.UID WHERE A.ID = :P1 PLAN JOIN (A INDEX (IDX_T_ID), B NATURAL) INTO :R1 DO SUSPEND; END",
+        ] {
+            assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
+        }
     }
 
     #[test]
