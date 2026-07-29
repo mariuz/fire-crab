@@ -356,6 +356,16 @@ mod blr {
     /// a sub-function call site - blr_invoke_function, same id
     /// clause, 3 u16-counted argument values, blr_end (probed)
     pub const INVOKE_FUNCTION: u8 = 0xE0;
+    /// window functions: blr_window wraps the inner rse (its WHERE
+    /// inside), then a count of windows, each blr_partition_by -
+    /// context, partition keys (source fields then REMAPPED fids
+    /// into the window's own map), a sort clause, the map - and ONE
+    /// trailing end (all probed)
+    pub const WINDOW: u8 = 0xC3;
+    pub const PARTITION_BY: u8 = 0xC4;
+    /// named window functions (ROW_NUMBER, RANK, ...):
+    /// blr_agg_function - counted name + an argument-count byte
+    pub const AGG_FUNCTION: u8 = 0xC7;
     /// packaged calls: blr_exec_proc2 - counted package, counted
     /// name, u16 in-count + values, u16 out-count + variables; and
     /// blr_function2 - package, name, a count BYTE, the arguments
@@ -932,11 +942,13 @@ struct Derived {
 }
 
 /// One slot of an aggregate's blr_map: a group-key value or an
-/// aggregate function (verb + optional operand).
+/// aggregate function (verb + optional operand) - or, in a WINDOW's
+/// map, a named function (blr_agg_function, zero arguments).
 #[derive(Clone, Debug, PartialEq)]
 enum MapEntry {
     Key(Val),
     Agg(u8, Option<Val>),
+    Fn(String),
 }
 
 struct P<'a> {
@@ -3109,18 +3121,7 @@ fn emit_cursor_decl(out: &mut Vec<u8>, d: &CursorDecl) {
         }
         out.push(blr::MAP);
         out.extend_from_slice(&(d.map.len() as u16).to_le_bytes());
-        for (fi, e) in d.map.iter().enumerate() {
-            out.extend_from_slice(&(fi as u16).to_le_bytes());
-            match e {
-                MapEntry::Key(v) => emit_val(out, v),
-                MapEntry::Agg(verb, arg) => {
-                    out.push(*verb);
-                    if let Some(a) = arg {
-                        emit_val(out, a);
-                    }
-                }
-            }
-        }
+        emit_map_entries(out, &d.map);
     }
     if !d.sort.is_empty() {
         out.push(blr::SORT);
@@ -3713,6 +3714,10 @@ struct ForSel {
     /// join, left-nested exactly like a view's (probed at body
     /// numbering); qualified-only resolution across the chain
     joins: Vec<(u8, Stream, u8, Bool)>,
+    /// WINDOW clause: per window (encounter order of distinct
+    /// specs) its context, partition keys, order keys and map -
+    /// passthrough columns live in the DEFAULT window (probed)
+    windows: Vec<Win>,
     aggregate: bool,
     map: Vec<MapEntry>,
     group_keys: Vec<Val>,
@@ -3724,6 +3729,37 @@ struct ForSel {
     col_vals: Vec<Val>,
     into: Vec<u16>,
     do_stmt: Option<Box<TrigStmt>>,
+}
+
+/// The body of a blr_map: slot indexes then entries - group keys,
+/// aggregate verbs, or named window functions.
+fn emit_map_entries(out: &mut Vec<u8>, map: &[MapEntry]) {
+    for (fi, e) in map.iter().enumerate() {
+        out.extend_from_slice(&(fi as u16).to_le_bytes());
+        match e {
+            MapEntry::Key(v) => emit_val(out, v),
+            MapEntry::Agg(verb, arg) => {
+                out.push(*verb);
+                if let Some(a) = arg {
+                    emit_val(out, a);
+                }
+            }
+            MapEntry::Fn(name) => {
+                out.push(blr::AGG_FUNCTION);
+                out.push(name.len() as u8);
+                out.extend_from_slice(name.as_bytes());
+                out.push(0); // zero arguments
+            }
+        }
+    }
+}
+
+/// One window of a windowed select: blr_partition_by's operands.
+struct Win {
+    ctx: u8,
+    part: Vec<Val>,
+    ord: Vec<(bool, Val)>,
+    map: Vec<MapEntry>,
 }
 
 /// The row/EOF send of a procedure: message 1, every output variable
@@ -4390,21 +4426,56 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 }
                 out.push(blr::MAP);
                 out.extend_from_slice(&(f.map.len() as u16).to_le_bytes());
-                for (fi, e) in f.map.iter().enumerate() {
-                    out.extend_from_slice(&(fi as u16).to_le_bytes());
-                    match e {
-                        MapEntry::Key(v) => emit_val(out, v),
-                        MapEntry::Agg(verb, arg) => {
-                            out.push(*verb);
-                            if let Some(a) = arg {
-                                emit_val(out, a);
-                            }
-                        }
-                    }
-                }
+                emit_map_entries(out, &f.map);
                 if let Some(h) = &f.having {
                     out.push(blr::BOOLEAN);
                     emit_bool(out, h);
+                }
+            } else if !f.windows.is_empty() {
+                // blr_window wraps the inner rse (its WHERE inside);
+                // then the count and each window: blr_partition_by,
+                // context, partition keys as source fields then
+                // REMAPPED to the window's own map slots, the sort,
+                // the map; the shared rse END below closes it all
+                out.push(blr::WINDOW);
+                out.push(blr::RSE);
+                out.push(1);
+                emit_stream(out, &f.stream, f.ctx);
+                if let Some(b) = &f.boolean {
+                    out.push(blr::BOOLEAN);
+                    emit_bool(out, b);
+                }
+                out.push(blr::END);
+                out.push(f.windows.len() as u8);
+                for w in &f.windows {
+                    out.push(blr::PARTITION_BY);
+                    out.push(w.ctx);
+                    out.push(w.part.len() as u8);
+                    for k in &w.part {
+                        emit_val(out, k);
+                    }
+                    let key_base = w.map.len() - w.part.len();
+                    for ki in 0..w.part.len() {
+                        emit_val(
+                            out,
+                            &Val::Fid(w.ctx, (key_base + ki) as u16),
+                        );
+                    }
+                    out.push(blr::SORT);
+                    out.push(w.ord.len() as u8);
+                    for (desc, k) in &w.ord {
+                        out.push(if *desc {
+                            blr::DESCENDING
+                        } else {
+                            blr::ASCENDING
+                        });
+                        emit_val(out, k);
+                    }
+                    out.push(blr::MAP);
+                    out.extend_from_slice(
+                        &(w.map.len() as u16).to_le_bytes(),
+                    );
+                    emit_map_entries(out, &w.map);
                 }
             } else if let Some(cn) = &f.cursor {
                 // AS CURSOR: the name rides the relation2 alias
@@ -4662,6 +4733,8 @@ impl<'a> P<'a> {
         enum Item {
             Col(Val),
             Agg(u8, Option<Val>),
+            /// <fn> OVER ([PARTITION BY ...] [ORDER BY ...])
+            Win(MapEntry, Vec<Val>, Vec<(bool, Val)>),
         }
         let saved_sub = self.sub.replace(sidx);
         // with a join chain, qualified-only resolution across the
@@ -4682,7 +4755,35 @@ impl<'a> P<'a> {
                     let w = w.clone();
                     self.i += 1;
                     let (verb, arg) = self.parse_agg(&w)?;
-                    items.push(Item::Agg(verb, arg));
+                    if self.kw("OVER") {
+                        let (part, ord) = self.over_clause(ctx)?;
+                        items.push(Item::Win(
+                            MapEntry::Agg(verb, arg),
+                            part,
+                            ord,
+                        ));
+                    } else {
+                        items.push(Item::Agg(verb, arg));
+                    }
+                }
+                // the named zero-argument window functions
+                Tok::Ident(w)
+                    if matches!(
+                        w.as_str(),
+                        "ROW_NUMBER" | "RANK" | "DENSE_RANK"
+                    ) && matches!(self.t.get(self.i + 1), Some(Tok::LParen)) =>
+                {
+                    let w = w.clone();
+                    self.i += 2;
+                    if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                        return None;
+                    }
+                    self.i += 1;
+                    if !self.kw("OVER") {
+                        return None;
+                    }
+                    let (part, ord) = self.over_clause(ctx)?;
+                    items.push(Item::Win(MapEntry::Fn(w), part, ord));
                 }
                 Tok::Ident(w) if !is_keyword(w) => {
                     let a = w.clone();
@@ -4765,6 +4866,18 @@ impl<'a> P<'a> {
             }
         }
         let aggregate = has_aggs || grouped;
+        let has_wins = items.iter().any(|it| matches!(it, Item::Win(..)));
+        // windows beside aggregates, joins, FIRST/SKIP or in the
+        // singular form: unprobed
+        if has_wins
+            && (aggregate
+                || !joins.is_empty()
+                || first.is_some()
+                || skip.is_some()
+                || !is_for)
+        {
+            return None;
+        }
         // joins beside FIRST/SKIP: unprobed
         if !joins.is_empty() && (first.is_some() || skip.is_some()) {
             return None;
@@ -4798,10 +4911,13 @@ impl<'a> P<'a> {
             self.agg_map = items
                 .iter()
                 .map(|it| match it {
-                    Item::Col(v) => MapEntry::Key(v.clone()),
-                    Item::Agg(verb, arg) => MapEntry::Agg(*verb, arg.clone()),
+                    Item::Col(v) => Some(MapEntry::Key(v.clone())),
+                    Item::Agg(verb, arg) => {
+                        Some(MapEntry::Agg(*verb, arg.clone()))
+                    }
+                    Item::Win(..) => None, // guarded above
                 })
-                .collect();
+                .collect::<Option<Vec<_>>>()?;
         }
         let having = if self.kw("HAVING") {
             if !aggregate {
@@ -4862,7 +4978,69 @@ impl<'a> P<'a> {
         }
         self.sub = saved_sub;
         self.merge_scope = saved_scope;
-        let col_vals: Vec<Val> = if aggregate {
+        // build the WINDOWS: one per distinct (partition, order)
+        // spec in ENCOUNTER order, passthrough columns in the
+        // DEFAULT (empty-spec) window; each window's map holds its
+        // items in select order with the partition keys appended;
+        // contexts claim the slots after the stream (all probed)
+        let mut windows: Vec<Win> = Vec::new();
+        let win_slots: Vec<(usize, u16)> = if has_wins {
+            let mut slots = Vec::new();
+            for it in &items {
+                let (part, ord, entry) = match it {
+                    Item::Col(v) => {
+                        (Vec::new(), Vec::new(), MapEntry::Key(v.clone()))
+                    }
+                    Item::Win(e, p, o) => (p.clone(), o.clone(), e.clone()),
+                    Item::Agg(..) => return None,
+                };
+                let wi = match windows
+                    .iter()
+                    .position(|w| w.part == part && w.ord == ord)
+                {
+                    Some(i) => i,
+                    None => {
+                        windows.push(Win {
+                            ctx: 0,
+                            part,
+                            ord,
+                            map: Vec::new(),
+                        });
+                        windows.len() - 1
+                    }
+                };
+                let slot = windows[wi].map.len() as u16;
+                windows[wi].map.push(entry);
+                slots.push((wi, slot));
+            }
+            for (i, w) in windows.iter_mut().enumerate() {
+                w.ctx = ctx + 1 + i as u8;
+            }
+            for _ in &windows {
+                self.streams.push(Stream {
+                    name: String::new(),
+                    alias: None,
+                    derived: None,
+                    sub: self.in_sub,
+                    cur: None,
+                });
+            }
+            for w in &mut windows {
+                let keys = w.part.clone();
+                for k in keys {
+                    w.map.push(MapEntry::Key(k));
+                }
+            }
+            slots
+        } else {
+            Vec::new()
+        };
+        let col_vals: Vec<Val> = if has_wins {
+            win_slots
+                .iter()
+                .map(|(wi, slot)| Val::Fid(windows[*wi].ctx, *slot))
+                .collect()
+        } else if aggregate {
             let fid_ctx = ctx + 1 + joins.len() as u8;
             (0..cols_n).map(|i| Val::Fid(fid_ctx, i as u16)).collect()
         } else {
@@ -4870,7 +5048,7 @@ impl<'a> P<'a> {
                 .iter()
                 .map(|it| match it {
                     Item::Col(v) => Some(v.clone()),
-                    Item::Agg(..) => None,
+                    Item::Agg(..) | Item::Win(..) => None,
                 })
                 .collect::<Option<Vec<_>>>()?
         };
@@ -4883,6 +5061,7 @@ impl<'a> P<'a> {
                 || skip.is_some()
                 || !sort.is_empty()
                 || !joins.is_empty()
+                || has_wins
             {
                 return None;
             }
@@ -4927,6 +5106,7 @@ impl<'a> P<'a> {
                 || skip.is_some()
                 || !sort.is_empty()
                 || !joins.is_empty()
+                || has_wins
             {
                 return None;
             }
@@ -4976,6 +5156,9 @@ impl<'a> P<'a> {
             (None, None)
         };
         let map = std::mem::take(&mut self.agg_map);
+        if has_wins && !sort.is_empty() {
+            return None; // statement ORDER BY over windows: unprobed
+        }
         Some(TrigStmt::ForSel(Box::new(ForSel {
             label,
             stream,
@@ -4983,6 +5166,7 @@ impl<'a> P<'a> {
             cursor,
             lock,
             joins,
+            windows,
             aggregate,
             map,
             group_keys,
@@ -5675,6 +5859,79 @@ impl<'a> P<'a> {
         }
         self.i += 1;
         Some(TrigStmt::PosUpdate(org_ctx, new_ctx, sets))
+    }
+
+    /// OVER ( [PARTITION BY cols] [ORDER BY key [ASC|DESC], ...] ) -
+    /// keys resolve at the given (single) stream context (probed)
+    fn over_clause(
+        &mut self,
+        ctx: u8,
+    ) -> Option<(Vec<Val>, Vec<(bool, Val)>)> {
+        if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
+            return None;
+        }
+        self.i += 1;
+        let mut key = |p: &mut P| -> Option<Val> {
+            let Some(Tok::Ident(a)) = p.t.get(p.i) else {
+                return None;
+            };
+            if is_keyword(a) {
+                return None;
+            }
+            let a = a.clone();
+            p.i += 1;
+            if matches!(p.t.get(p.i), Some(Tok::Dot)) {
+                p.i += 1;
+                let Some(Tok::Ident(b)) = p.t.get(p.i) else {
+                    return None;
+                };
+                let b = b.clone();
+                p.i += 1;
+                p.field(Some(&a), &b)
+            } else {
+                Some(Val::Field(ctx, a))
+            }
+        };
+        let mut part = Vec::new();
+        if self.kw("PARTITION") {
+            if !self.kw("BY") {
+                return None;
+            }
+            loop {
+                part.push(key(self)?);
+                if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                    self.i += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        let mut ord = Vec::new();
+        if self.kw("ORDER") {
+            if !self.kw("BY") {
+                return None;
+            }
+            loop {
+                let k = key(self)?;
+                let descending = if self.kw("DESC") {
+                    true
+                } else {
+                    let _ = self.kw("ASC");
+                    false
+                };
+                ord.push((descending, k));
+                if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                    self.i += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+            return None;
+        }
+        self.i += 1;
+        Some((part, ord))
     }
 
     /// one trigger-body statement; self.i past any leading keyword
@@ -9085,6 +9342,60 @@ mod tests {
             "CREATE PROCEDURE RC3 RETURNS (R1 INTEGER, R2 INTEGER) AS DECLARE CX CURSOR FOR (SELECT A.ID, B.UA FROM T A JOIN U2 B ON A.ID = B.UID); BEGIN OPEN CX; FETCH CX INTO :R1, :R2; CLOSE CX; SUSPEND; END",
             "05020401050008000700080007000700020300000800012D1A00000301000800012D1A0100A6000043017702920154082243582220224122009202553208224358222022422201472F1700024944170103554944FFFF0200BF01001700024944BF010117010255419B11000202A7000000A7020000020117000249441A00000117010255411A0100FFA70100000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
         );
+    }
+
+    #[test]
+    fn compiles_slice_thirty_four_shapes_byte_for_byte() {
+        // WINDOW functions (flip forty-one): blr_window wraps the
+        // inner rse; ONE window holds passthrough columns AND an
+        // empty-spec OVER () side by side
+        pin_proc(
+            "CREATE PROCEDURE RD1 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT UID, COUNT(*) OVER () FROM U2 INTO :R1, :R2 DO SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B110002021101074301C343014A02553200FF01C4010046004D02000000170003554944010053FF0201180100001A000001180101001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        // ... PARTITION BY: keys as source fields then REMAPPED to
+        // the window's own map slots; the partitioned function gets
+        // its OWN window beside the passthrough default
+        pin_proc(
+            "CREATE PROCEDURE RD2 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT UID, SUM(UA) OVER (PARTITION BY UID) FROM U2 INTO :R1, :R2 DO SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B110002021101074301C343014A02553200FF02C4010046004D01000000170003554944C402011700035549441802010046004D020000005617000255410100170003554944FF0201180100001A000001180200001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        // ... ROW_NUMBER() OVER (ORDER BY): blr_agg_function with a
+        // counted name and zero arguments, the order under the
+        // window's sort clause
+        pin_proc(
+            "CREATE PROCEDURE RD4 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT UID, ROW_NUMBER() OVER (ORDER BY UA DESC) FROM U2 INTO :R1, :R2 DO SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B110002021101074301C343014A02553200FF02C4010046004D01000000170003554944C4020046014917000255414D01000000C70A524F575F4E554D42455200FF0201180100001A000001180200001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        // ... the WHERE lives inside the window's inner rse
+        pin_proc(
+            "CREATE PROCEDURE RD5 (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT SUM(UA) OVER () FROM U2 WHERE UID > :P1 INTO :R1 DO SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B110002021101074301C343014A025532004731170003554944290000000100FF01C4010046004D01000000561700025541FF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... windows number in ENCOUNTER order of their specs
+        pin_proc(
+            "CREATE PROCEDURE RD6 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT MAX(UA) OVER (PARTITION BY UID), UID FROM U2 INTO :R1, :R2 DO SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B110002021101074301C343014A02553200FF02C401011700035549441801010046004D020000005417000255410100170003554944C4020046004D01000000170003554944FF0201180100001A000001180200001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+    }
+
+    #[test]
+    fn window_refusals() {
+        for sql in [
+            // windows beside GROUP BY/aggregates: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT COUNT(*), SUM(UA) OVER () FROM U2 INTO :R1, :R2 DO SUSPEND; END",
+            // windows over a JOIN: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT COUNT(*) OVER () FROM T A JOIN U2 B ON A.ID = B.UID INTO :R1 DO SUSPEND; END",
+            // the singular form with a window: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN SELECT COUNT(*) OVER () FROM U2 INTO :R1; SUSPEND; END",
+            // statement-level ORDER BY over windows: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT UID, COUNT(*) OVER () FROM U2 ORDER BY UID INTO :R1, :R2 DO SUSPEND; END",
+            // frame extents (ROWS/RANGE BETWEEN) take the v4 verb:
+            // unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT SUM(UA) OVER (ORDER BY UID ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM U2 INTO :R1 DO SUSPEND; END",
+        ] {
+            assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
+        }
     }
 
     #[test]

@@ -13,6 +13,33 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-dsql slice 34: window functions
+
+### Converted
+- **Window functions** (flip forty-one): `<fn> OVER ([PARTITION BY
+  ...] [ORDER BY ...])` in FOR SELECT bodies — `blr_window` wraps
+  the inner rse (its WHERE inside), then a window count and per
+  window `blr_partition_by`: context, partition keys as source
+  fields then REMAPPED as fids into the window's own map, a sort
+  clause, the map. The laws: passthrough columns live in the
+  DEFAULT (empty-spec) window beside empty-spec OVER () functions;
+  each distinct (partition, order) spec gets its own window, in
+  ENCOUNTER order, claiming the contexts after the stream; a
+  window's map holds its items in select order with the partition
+  keys appended; outputs read fids at per-window contexts. The
+  aggregate verbs work windowed, and the named zero-argument
+  functions (ROW_NUMBER, RANK, DENSE_RANK) ride
+  `blr_agg_function` — a counted name and an argument count. The
+  battery's RANK / DENSE_RANK / three-item multi-window /
+  two-key-partition checks were never probed — green on the
+  convention alone.
+
+### Guarded
+- Frame extents (ROWS/RANGE BETWEEN — the v4 `blr_window_win`
+  verb), windows beside aggregates/GROUP BY/joins/statement ORDER
+  BY, the singular form, named windows. Gate: `qa/dsql-proc-blr.sh`
+  grew to 201 checks (7 fresh); 337 unit byte-pins.
+
 ## 2026-07-29 — fire-crab-dsql slice 33: aggregates over joins, joined cursors
 
 ### Converted

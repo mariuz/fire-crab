@@ -4666,6 +4666,29 @@ WHEN, and a BLOCK as a handler's body nests blr_block again with no
 handler section of its own - the battery runs a handler block
 containing an EXIT.
 
+Slice 34 opened the WINDOW surface - and the engine's own genBlr
+explained the one chunk the probes couldn't. OVER ([PARTITION BY]
+[ORDER BY]) compiles to blr_window wrapping the inner rse (the
+WHERE inside, like every wrapped stream since slice 8), then a
+window count and per window blr_partition_by: context, the
+partition keys TWICE - once as source fields, once REMAPPED as
+fids into the window's own map (the mystery bytes, read from
+RecordSourceNodes.cpp: partitionRemapped) - a sort clause, the
+map. The shape laws: passthrough columns live in the DEFAULT
+empty-spec window BESIDE empty-spec OVER () functions - one probe
+showed UID and COUNT(*) OVER () sharing a single window's map;
+each distinct (partition, order) spec gets its OWN window, in
+ENCOUNTER order of the select list, claiming the contexts after
+the stream; a window's map holds its items in select order with
+the partition keys appended (the remap targets); outputs read
+fids at per-window contexts. ROW_NUMBER probed as
+blr_agg_function - a counted NAME and an argument count, the
+generic named-function verb - and the battery bet the same
+convention on RANK and DENSE_RANK, a three-item two-window
+statement and a two-key partition: all green on composition, none
+ever probed. Frame extents take the v4 blr_window_win verb with
+its own subcode family - guarded whole, transcript path known.
+
 Slice 33 completed the join story its predecessor opened.
 Aggregates over joins: the chain sits INSIDE the aggregate's inner
 rse with the WHERE after it, and the aggregate claims the context

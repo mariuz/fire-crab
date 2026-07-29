@@ -307,6 +307,11 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # a WINDOW is an aggregate that KEEPS its rows: same map/verb
+    # machinery, but passthrough columns join the map and partition
+    # keys appear TWICE (source form + remapped fid) - when a clause
+    # emits the same operand in two encodings, the second is usually
+    # a reference INTO the first's structure; find the indirection
     # completions COMPOUND: a stamp built for one law (cursor alias
     # infection) covers the next (joined cursors) with zero new
     # emission code, and a next-slot law (aggregate ctx) generalizes
