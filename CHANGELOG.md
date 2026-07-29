@@ -13,6 +13,31 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-dsql slice 32: joins in body FOR SELECTs, packaged calls
+
+### Converted
+- **Joins in body FOR SELECTs** (flip thirty-seven): INNER/LEFT/
+  RIGHT/FULL join chains compile in FOR SELECT and the singular
+  SELECT INTO — the view's left-nested chain at body numbering, ON
+  at the join level, WHERE at the rse level, join_type absent for
+  INNER. The MERGE scope generalized to a RANGE of stream indexes:
+  qualified names resolve across the chain, and BARE names refuse —
+  the gate itself caught a bare column binding to the FIRST stream
+  where the engine resolves through the catalog (a wrong-bytes
+  hazard closed before it shipped). A three-stream chain and a FULL
+  OUTER under the singular form pinned.
+- **Packaged routine calls** (flip thirty-eight):
+  `EXECUTE PROCEDURE PKG.P` = `blr_exec_proc2` (counted package +
+  name, exec_proc-style u16 counts); `PKG.F(x)` in expressions =
+  `blr_function2` (package, name, a count BYTE, the arguments) —
+  compact verbs, not the invoke forms subroutines take.
+
+### Guarded
+- Aggregates over joins, joins under AS CURSOR, bare columns
+  across a join, subqueries inside ON clauses, derived streams in
+  chains. Gate: `qa/dsql-proc-blr.sh` grew to 188 checks (6
+  fresh); 323 unit byte-pins.
+
 ## 2026-07-29 — fire-crab-dsql slice 31: the cursor-alias infection, DISTINCT scalars
 
 ### Converted

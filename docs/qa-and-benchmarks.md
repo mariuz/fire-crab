@@ -4666,6 +4666,29 @@ WHEN, and a BLOCK as a handler's body nests blr_block again with no
 handler section of its own - the battery runs a handler block
 containing an EXIT.
 
+Slice 32 brought the view compiler's joins into procedure bodies
+- and its gate caught a wrong-bytes hazard before it shipped.
+INNER/LEFT/RIGHT/FULL join chains compile in FOR SELECT and the
+singular SELECT INTO exactly as views emit them, at body
+numbering: n join heads, the first stream, then per join its
+stream, the type byte (absent for INNER), the ON boolean; WHERE
+stays at the rse level. Resolution generalized the MERGE scope
+into a RANGE of stream indexes - qualified names scan the chain,
+bare names refuse. The refusal is the story: the first gate run
+showed a bare column in a joined select COMPILING - bound to the
+FIRST stream by the single-stream fast path, where the engine
+resolves bare names through the catalog and could pick the SECOND.
+SELECT SALARY FROM SRC JOIN EMPLOYEE would have emitted the wrong
+context byte. Three parse sites hardcoded Field(ctx, name); all
+three now refuse bare names when a chain is present. A
+three-stream chain and a FULL OUTER under the singular form pinned
+the nesting. Packaged calls rode along on two verbs: EXECUTE
+PROCEDURE PKG.P is blr_exec_proc2 - counted package and name with
+exec_proc's u16 count layout - and PKG.F(x) in an expression is
+blr_function2 with a count BYTE where the procedure form counts in
+u16s: compact verbs predating the invoke family subroutines use,
+two count conventions in one verb pair.
+
 Slice 31 converted the infection it had guarded the day before.
 Every stream under a cursor's rse - subquery streams included -
 carries the cursor's concatenated alias: the cursor name paired

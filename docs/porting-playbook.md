@@ -307,6 +307,12 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # a FAST PATH is a resolution POLICY in disguise: the
+    # single-stream bare-name shortcut silently mis-binds the moment
+    # a second stream appears - audit every hardcoded ctx when a
+    # scope grows; and sibling verbs may count DIFFERENTLY
+    # (function2 counts in a byte, exec_proc2 in u16s) - never
+    # assume a family shares conventions
     # when a name isn't known until AFTER its clause parses (AS
     # CURSOR), stamp POST-PARSE: walk the finished tree and set a
     # slot - cheaper than threading context through every parser;

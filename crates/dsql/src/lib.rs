@@ -356,6 +356,12 @@ mod blr {
     /// a sub-function call site - blr_invoke_function, same id
     /// clause, 3 u16-counted argument values, blr_end (probed)
     pub const INVOKE_FUNCTION: u8 = 0xE0;
+    /// packaged calls: blr_exec_proc2 - counted package, counted
+    /// name, u16 in-count + values, u16 out-count + variables; and
+    /// blr_function2 - package, name, a count BYTE, the arguments
+    /// (both probed)
+    pub const EXEC_PROC2: u8 = 0xC1;
+    pub const FUNCTION2: u8 = 0xC2;
     /// streams inside SUBROUTINE bodies: blr_relation3 - counted
     /// schema, counted package (empty), counted name, then the alias
     /// string relation2 would carry OR a counted empty, ctx (probed;
@@ -417,6 +423,9 @@ enum Val {
     /// a DECLAREd sub-function call: blr_invoke_function, the id
     /// clause (sub + counted name), counted argument values (probed)
     SubFn(String, Vec<Val>),
+    /// a PACKAGED function call: blr_function2, counted package +
+    /// name, a count BYTE, the arguments (probed)
+    PkgFn(String, String, Vec<Val>),
     /// `:name` - an INPUT parameter, referenced straight out of
     /// message 0 as blr_parameter2 (value slot 2i, null slot 2i+1);
     /// no variable is declared for inputs (probed)
@@ -964,9 +973,10 @@ struct P<'a> {
     /// FOR SELECT ... AS CURSOR names in scope: (name, ctx, table) -
     /// pushed around the DO body, targets for WHERE CURRENT OF
     for_cursors: Vec<(String, u8, String)>,
-    /// while parsing a MERGE's ON/SET/VALUES: the (source, target)
-    /// stream indexes - the ONLY two streams qualified names may
-    /// bind to there, and bare column names refuse
+    /// while parsing a MERGE's ON/SET/VALUES or a JOINed FOR
+    /// SELECT's clauses: the half-open RANGE of stream indexes
+    /// qualified names may bind to - and bare column names refuse
+    /// (catalog-free)
     merge_scope: Option<(usize, usize)>,
     /// a FUNCTION body: RETURN allowed, SUSPEND refused
     in_func: bool,
@@ -1053,14 +1063,12 @@ impl<'a> P<'a> {
         // inside a MERGE's ON/SET/VALUES only the source and target
         // streams are visible, and bare names refuse (catalog-free -
         // the engine resolves them through column lists)
-        if let Some((si, ti)) = self.merge_scope {
+        if let Some((start, end)) = self.merge_scope {
             let q = qualifier?;
             let hit = |st: &Stream| {
                 st.alias.as_deref().map_or(st.name == q, |a| a == q)
             };
-            let idx = [si, ti]
-                .into_iter()
-                .find(|&i| hit(&self.streams[i]))?;
+            let idx = (start..end).find(|&i| hit(&self.streams[i]))?;
             return Some(Val::Field(idx as u8 + self.base, name.to_string()));
         }
         let n_outer = self.outer.unwrap_or(self.streams.len());
@@ -1270,9 +1278,9 @@ impl<'a> P<'a> {
     /// - the SCALAR caller only; quantified/IN comparisons over
     /// aggregate output are unprobed and refuse
     fn subselect_ex(&mut self, need_col: bool, allow_agg: bool) -> Option<SubQ> {
-        if self.outer.is_none() {
-            // a subquery inside an ON clause would interleave the
-            // join chain's stream numbering: unprobed, refuse
+        if self.outer.is_none() || self.merge_scope.is_some() {
+            // a subquery inside an ON clause (or any multi-stream
+            // scope) would interleave the stream numbering: unprobed
             return None;
         }
         if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
@@ -1570,7 +1578,8 @@ impl<'a> P<'a> {
                         return Some(Val::InParam(pi as u16));
                     }
                 }
-                // a qualified field: IDENT . IDENT
+                // a qualified field: IDENT . IDENT - or a PACKAGED
+                // function call when a paren follows
                 if matches!(self.t.get(self.i), Some(Tok::Dot)) {
                     self.i += 1;
                     let Some(Tok::Ident(f)) = self.t.get(self.i) else {
@@ -1578,6 +1587,26 @@ impl<'a> P<'a> {
                     };
                     let f = f.clone();
                     self.i += 1;
+                    if matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                        self.i += 1;
+                        let mut args = Vec::new();
+                        if matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                            self.i += 1;
+                        } else {
+                            loop {
+                                args.push(self.val()?);
+                                match self.t.get(self.i)? {
+                                    Tok::Comma => self.i += 1,
+                                    Tok::RParen => {
+                                        self.i += 1;
+                                        break;
+                                    }
+                                    _ => return None,
+                                }
+                            }
+                        }
+                        return Some(Val::PkgFn(first, f, args));
+                    }
                     return self.field(Some(&first), &f);
                 }
                 return self.field(None, &first);
@@ -2426,6 +2455,17 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
             out.extend_from_slice(&0u16.to_le_bytes()); // charset (NONE)
             out.extend_from_slice(&(s.len() as u16).to_le_bytes());
             out.extend_from_slice(s.as_bytes());
+        }
+        Val::PkgFn(pkg, name, args) => {
+            out.push(blr::FUNCTION2);
+            out.push(pkg.len() as u8);
+            out.extend_from_slice(pkg.as_bytes());
+            out.push(name.len() as u8);
+            out.extend_from_slice(name.as_bytes());
+            out.push(args.len() as u8);
+            for a in args {
+                emit_val(out, a);
+            }
         }
         Val::SubFn(name, args) => {
             out.push(blr::INVOKE_FUNCTION);
@@ -3517,6 +3557,9 @@ enum TrigStmt {
     /// blr_invoke_procedure, id clause (sub + counted name), input
     /// values, output variables (probed)
     SubCall(String, Vec<Val>, Vec<u16>),
+    /// EXECUTE PROCEDURE PKG.P: blr_exec_proc2 - counted package +
+    /// name, u16-counted values and variables (probed)
+    PkgCall(String, String, Vec<Val>, Vec<u16>),
     /// [FOR] EXECUTE STATEMENT '<sql>' INTO :v, ...: blr_exec_into,
     /// u16 out-count, the sql, then flag 1 (singleton) or flag 0 +
     /// the labeled loop's DO statement; the variables LAST (probed)
@@ -3640,6 +3683,10 @@ struct ForSel {
     cursor: Option<String>,
     /// WITH LOCK: blr_writelock between the stream and the boolean
     lock: bool,
+    /// JOIN chain: (join_type, right stream, its ctx, the ON) per
+    /// join, left-nested exactly like a view's (probed at body
+    /// numbering); qualified-only resolution across the chain
+    joins: Vec<(u8, Stream, u8, Bool)>,
     aggregate: bool,
     map: Vec<MapEntry>,
     group_keys: Vec<Val>,
@@ -3891,6 +3938,22 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
             out.push(blr::LEAVE);
             out.push(0);
             out.push(blr::END);
+        }
+        TrigStmt::PkgCall(pkg, name, ins, outs) => {
+            out.push(blr::EXEC_PROC2);
+            out.push(pkg.len() as u8);
+            out.extend_from_slice(pkg.as_bytes());
+            out.push(name.len() as u8);
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&(ins.len() as u16).to_le_bytes());
+            for v in ins {
+                emit_val(out, v);
+            }
+            out.extend_from_slice(&(outs.len() as u16).to_le_bytes());
+            for vi in outs {
+                out.push(blr::VARIABLE);
+                out.extend_from_slice(&vi.to_le_bytes());
+            }
         }
         TrigStmt::SubCall(name, ins, outs) => {
             out.push(blr::INVOKE_PROCEDURE);
@@ -4330,6 +4393,29 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                     out.push(blr::BOOLEAN);
                     emit_bool(out, b);
                 }
+            } else if !f.joins.is_empty() {
+                // the view's left-nested chain at body numbering:
+                // n join heads, the first stream, then per join its
+                // stream, the type (absent for INNER), the ON
+                for _ in &f.joins {
+                    out.push(blr::JOIN);
+                    out.push(2);
+                }
+                emit_stream(out, &f.stream, f.ctx);
+                for (jt, st, jctx, on) in &f.joins {
+                    emit_stream(out, st, *jctx);
+                    if *jt != 0 {
+                        out.push(blr::JOIN_TYPE);
+                        out.push(*jt);
+                    }
+                    out.push(blr::BOOLEAN);
+                    emit_bool(out, on);
+                    out.push(blr::END);
+                }
+                if let Some(b) = &f.boolean {
+                    out.push(blr::BOOLEAN);
+                    emit_bool(out, b);
+                }
             } else {
                 emit_stream(out, &f.stream, f.ctx);
                 if f.lock {
@@ -4482,6 +4568,53 @@ impl<'a> P<'a> {
         self.streams.push(stream.clone());
         let sidx = self.streams.len() - 1;
         let ctx = sidx as u8 + self.base;
+        // JOIN chain - the view laws at body numbering (probed):
+        // each ON resolves across the accumulated statement streams
+        let mut joins: Vec<(u8, Stream, u8, Bool)> = Vec::new();
+        loop {
+            let jt = if self.kw("INNER") {
+                if !self.kw("JOIN") {
+                    return None;
+                }
+                0u8
+            } else if self.kw("JOIN") {
+                0
+            } else if self.kw("LEFT") {
+                let _ = self.kw("OUTER");
+                if !self.kw("JOIN") {
+                    return None;
+                }
+                1
+            } else if self.kw("RIGHT") {
+                let _ = self.kw("OUTER");
+                if !self.kw("JOIN") {
+                    return None;
+                }
+                2
+            } else if self.kw("FULL") {
+                let _ = self.kw("OUTER");
+                if !self.kw("JOIN") {
+                    return None;
+                }
+                3
+            } else {
+                break;
+            };
+            let st2 = self.stream_item()?;
+            if st2.derived.is_some() {
+                return None;
+            }
+            self.streams.push(st2.clone());
+            let ctx2 = (self.streams.len() - 1) as u8 + self.base;
+            if !self.kw("ON") {
+                return None;
+            }
+            let saved_scope = self.merge_scope;
+            self.merge_scope = Some((sidx, self.streams.len()));
+            let on = self.bool_or()?;
+            self.merge_scope = saved_scope;
+            joins.push((jt, st2, ctx2, on));
+        }
         let after_from = self.i;
         self.i = list_start;
         enum Item {
@@ -4489,6 +4622,12 @@ impl<'a> P<'a> {
             Agg(u8, Option<Val>),
         }
         let saved_sub = self.sub.replace(sidx);
+        // with a join chain, qualified-only resolution across the
+        // statement's streams replaces the single-stream scope
+        let saved_scope = self.merge_scope;
+        if !joins.is_empty() {
+            self.merge_scope = Some((sidx, sidx + 1 + joins.len()));
+        }
         let mut items: Vec<Item> = Vec::new();
         loop {
             match self.t.get(self.i)? {
@@ -4516,7 +4655,12 @@ impl<'a> P<'a> {
                         self.field(Some(&a), &b)?
                     } else {
                         // a select column, NOT a variable: resolve as
-                        // a field of the select's own stream
+                        // a field of the select's own stream - with a
+                        // JOIN the engine resolves bare names through
+                        // the catalog, so they refuse here
+                        if !joins.is_empty() {
+                            return None;
+                        }
                         Val::Field(ctx, a)
                     };
                     items.push(Item::Col(v));
@@ -4562,6 +4706,9 @@ impl<'a> P<'a> {
                             self.i += 1;
                             self.field(Some(&a), &b)?
                         } else {
+                            if !joins.is_empty() {
+                                return None;
+                            }
                             Val::Field(ctx, a)
                         }
                     }
@@ -4576,6 +4723,14 @@ impl<'a> P<'a> {
             }
         }
         let aggregate = has_aggs || grouped;
+        // joins beside aggregates, FIRST/SKIP or WITH LOCK: unprobed
+        if !joins.is_empty()
+            && (aggregate
+                || first.is_some()
+                || skip.is_some())
+        {
+            return None;
+        }
         if aggregate {
             if !has_aggs {
                 return None; // grouped-without-aggs: unprobed
@@ -4639,6 +4794,9 @@ impl<'a> P<'a> {
                             self.i += 1;
                             self.field(Some(&a), &b)?
                         } else {
+                            if !joins.is_empty() {
+                                return None;
+                            }
                             Val::Field(ctx, a)
                         }
                     }
@@ -4664,6 +4822,7 @@ impl<'a> P<'a> {
             }
         }
         self.sub = saved_sub;
+        self.merge_scope = saved_scope;
         let col_vals: Vec<Val> = if aggregate {
             (0..cols_n).map(|i| Val::Fid(ctx + 1, i as u16)).collect()
         } else {
@@ -4683,6 +4842,7 @@ impl<'a> P<'a> {
                 || first.is_some()
                 || skip.is_some()
                 || !sort.is_empty()
+                || !joins.is_empty()
             {
                 return None;
             }
@@ -4722,7 +4882,11 @@ impl<'a> P<'a> {
             if !self.kw("CURSOR") || !is_for {
                 return None;
             }
-            if aggregate || first.is_some() || skip.is_some() || !sort.is_empty()
+            if aggregate
+                || first.is_some()
+                || skip.is_some()
+                || !sort.is_empty()
+                || !joins.is_empty()
             {
                 return None;
             }
@@ -4778,6 +4942,7 @@ impl<'a> P<'a> {
             ctx,
             cursor,
             lock,
+            joins,
             aggregate,
             map,
             group_keys,
@@ -5659,8 +5824,22 @@ impl<'a> P<'a> {
             if is_keyword(name) {
                 return None;
             }
-            let name = name.clone();
+            let mut name = name.clone();
             self.i += 1;
+            // EXECUTE PROCEDURE PKG.NAME - the packaged form
+            let mut pkg: Option<String> = None;
+            if matches!(self.t.get(self.i), Some(Tok::Dot)) {
+                self.i += 1;
+                let Some(Tok::Ident(pn)) = self.t.get(self.i) else {
+                    return None;
+                };
+                if is_keyword(pn) {
+                    return None;
+                }
+                pkg = Some(name);
+                name = pn.clone();
+                self.i += 1;
+            }
             let mut ins = Vec::new();
             if matches!(self.t.get(self.i), Some(Tok::LParen)) {
                 self.i += 1;
@@ -5702,6 +5881,9 @@ impl<'a> P<'a> {
                 return None;
             }
             self.i += 1;
+            if let Some(pkg) = pkg {
+                return Some(TrigStmt::PkgCall(pkg, name, ins, outs));
+            }
             // a DECLAREd sub-procedure takes the invoke_procedure
             // verb, count-checked against its declaration
             if let Some((ni, no)) = self
@@ -6095,7 +6277,7 @@ impl<'a> P<'a> {
             if !self.kw("ON") {
                 return None;
             }
-            self.merge_scope = Some((src_idx, tgt_idx));
+            self.merge_scope = Some((src_idx, tgt_idx + 1));
             let on = self.bool_or()?;
             // branches in SQL order; an UNCONDITIONAL branch must be
             // its kind's LAST (later ones would be unreachable - and
@@ -8696,6 +8878,55 @@ mod tests {
             "CREATE PROCEDURE RA5 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN R1 = (SELECT COUNT(DISTINCT UA) FROM U2); R2 = (SELECT SUM(DISTINCT ID) FROM T); SUSPEND; END",
             "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B11000202012B7F43014F0143014A02553200FF4E004D010000005E1700025541FF180100002D1A0000012B7F43014F0343014A015402FF4E004D010000005F1702024944FF180300002D1A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
         );
+    }
+
+    #[test]
+    fn compiles_slice_thirty_two_shapes_byte_for_byte() {
+        // JOINS in body FOR SELECTs (flip thirty-seven): the view's
+        // left-nested chain at body numbering, ON at the join level
+        pin_proc(
+            "CREATE PROCEDURE RB1 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT E.EMP_NO, X.ID FROM EMPLOYEE E JOIN T X ON E.EMP_NO = X.ID INTO :R1, :R2 DO SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B11000202110107430177029208454D504C4F59454503224522009201540322582201472F170006454D505F4E4F1701024944FFFF0201170006454D505F4E4F1A00000117010249441A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        // ... LEFT with the WHERE at the RSE level
+        pin_proc(
+            "CREATE PROCEDURE RB2 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT E.EMP_NO, X.ID FROM EMPLOYEE E LEFT JOIN T X ON E.EMP_NO = X.ID WHERE E.SALARY > 0 INTO :R1, :R2 DO SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B11000202110107430177029208454D504C4F594545032245220092015403225822015001472F170006454D505F4E4F1701024944FF473117000653414C41525915080000000000FF0201170006454D505F4E4F1A00000117010249441A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        // ... a three-stream chain: the second join holds the first
+        // as its left slot, RIGHT = type 2
+        pin_proc(
+            "CREATE PROCEDURE RB4 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT A.EMP_NO FROM EMPLOYEE A JOIN T B ON A.EMP_NO = B.ID RIGHT JOIN U2 C ON B.ID = C.UID INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B110002021101074301770277029208454D504C4F59454503224122009201540322422201472F170006454D505F4E4F1701024944FF9202553203224322025002472F1701024944170203554944FFFF0201170006454D505F4E4F1A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... and the SINGULAR select-into over a FULL OUTER join
+        pin_proc(
+            "CREATE PROCEDURE RB5 (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN SELECT X.ID FROM T X FULL OUTER JOIN U2 Y ON X.ID = Y.UID WHERE Y.UA > :P1 INTO :R1; SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B11000202077F4301770292015403225822009202553203225922015003472F1700024944170103554944FF47311701025541290000000100FF020117000249441A0000FF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // PACKAGED calls (flip thirty-eight): blr_exec_proc2 and
+        // blr_function2 - counted package + name, exec_proc-style
+        // u16 counts for the procedure, a count BYTE for the function
+        pin_proc(
+            "CREATE PROCEDURE RB3 (P1 INTEGER) RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN EXECUTE PROCEDURE PKG1.PADD(:P1) RETURNING_VALUES :R1; R2 = PKG1.FDBL(:P1); SUSPEND; END",
+            "0502040002000800070004010500080007000800070007000C00020300000800012D1A00000301000800012D1A01009B11000202C104504B47310450414444010029000000010001001A000001C204504B4731044644424C012900000001001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+    }
+
+    #[test]
+    fn slice_thirty_two_refusals() {
+        for sql in [
+            // aggregates over a join in a body: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT COUNT(*) FROM T A JOIN U2 B ON A.ID = B.UID INTO :R1 DO SUSPEND; END",
+            // a join under AS CURSOR: unprobed
+            "CREATE PROCEDURE X AS BEGIN FOR SELECT A.ID FROM T A JOIN U2 B ON A.ID = B.UID AS CURSOR CU DO DELETE FROM T WHERE CURRENT OF CU; END",
+            // bare columns across a join need the catalog
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T A JOIN U2 B ON A.ID = B.UID INTO :R1 DO SUSPEND; END",
+            // subqueries inside an ON clause: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT A.ID FROM T A JOIN U2 B ON EXISTS (SELECT 1 FROM T) INTO :R1 DO SUSPEND; END",
+        ] {
+            assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
+        }
     }
 
     #[test]
