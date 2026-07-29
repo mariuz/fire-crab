@@ -568,6 +568,13 @@ them.
   the reference engine's own syntax error, another a model boundary
   (catalog-typed casts in a catalog-free compiler) - name those as
   what they are instead of forcing them.
+- **When a special case keeps growing, look for the general rule it
+  is a case OF.** A two-stream join swap, a three-stream reordering
+  and an ORDER BY that navigates the wrong table's index were three
+  separate mysteries until equivalence classes explained all three -
+  and the special-case code then DELETED itself (the swap is the
+  general rule at n = 2). Convert the general rule and let the
+  earlier cases fall out.
 - **Before assuming a subsystem has no oracle, look for its
   EXPLAIN.** The optimizer seemed to need timing comparisons; the
   reference engine prints its chosen plan as text and executes

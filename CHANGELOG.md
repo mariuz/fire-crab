@@ -13,6 +13,33 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-opt slice 4: equivalence classes
+
+### Converted
+- **The reordering slice 3 refused.** Every equi-join predicate
+  feeds an EQUIVALENCE CLASS — `D.Z = B.UID` and `A.ID = B.UID` put
+  A.ID, B.UID and D.Z in one class — and a stream is reachable when
+  it has an index on a column of a class it SHARES WITH AN
+  ALREADY-PLACED stream. The engine tries drivers in SQL order and
+  keeps the rest in SQL order, which is exactly why an unindexable
+  link ends up DRIVING: no arrangement starting anywhere else
+  completes. Four probed shapes, all four now planned identically.
+- **The order transfers through the class too**: `ORDER BY B.UID`
+  navigates A's index on A.ID, because the class proves them equal.
+- **One planner for all inner joins.** The two-stream swap turned
+  out to be the same rule with n = 2, so plan_join now delegates to
+  the general planner and keeps only what is genuinely its own: the
+  HASH fallback (the general planner's "no arrangement" answer) and
+  the OUTER-join case, whose preserved side cannot be reordered.
+- Type families gate CLASS MEMBERSHIP now, not just the two-stream
+  key: an equality across families proves nothing an index can use,
+  so the VARCHAR = INTEGER join still hashes.
+
+### Guarded
+- Outer joins in chains, unions, subqueries, cost/selectivity.
+  Gate: `qa/opt-plans.sh` 54 → 58 checks (the slice-3 refusal became
+  five checks); 281 workspace tests.
+
 ## 2026-07-29 — fire-crab-opt slice 3: compound indexes and three-stream chains
 
 ### Converted

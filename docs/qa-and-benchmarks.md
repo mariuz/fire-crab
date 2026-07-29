@@ -3978,6 +3978,20 @@ took the descending twin index where one existed and fell back to a
 sort where none did - an ascending index cannot serve a descending
 order.
 
+Slice 4 converted what slice 3 had refused, and the shape of the
+rule is the reward: every equi-join predicate feeds an EQUIVALENCE
+CLASS, a stream is reachable when it holds an index on a column of a
+class it shares with an already-placed stream, and the engine tries
+drivers in SQL order while keeping the rest in SQL order. That single
+sentence explains all four probed reorderings - including why an
+unindexable link ends up driving (no arrangement starting anywhere
+else completes) - and it explains the two-stream swap too, which
+turned out to be the same rule at n = 2. The planner collapsed
+accordingly: one routine for every inner join, with the hash
+fallback and the un-reorderable outer join as its only special
+cases. The order transfers through a class as well: ORDER BY B.UID
+navigates A's index on A.ID because the class proves them equal.
+
 Slice 3 added the prefix rule in both its guises - a compound (X, Y)
 index serves a predicate on X but not on Y alone, and navigates an
 ORDER BY exactly when the order is a PREFIX of its segments with

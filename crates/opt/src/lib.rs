@@ -423,7 +423,8 @@ fn plan_join(
     let outer = from_s.contains(" LEFT ")
         || from_s.contains(" RIGHT ")
         || from_s.contains(" FULL ");
-    // three or more streams: the chain planner (SQL order only)
+    // three or more streams: the general planner (equivalence
+    // classes decide both the driver and the order)
     if from_s.matches(" JOIN ").count() > 1 {
         if outer {
             return Err("outer joins in a chain unconverted".into());
@@ -437,7 +438,8 @@ fn plan_join(
         let c = from_s.find(',').ok_or("cannot split the FROM")?;
         (from_s[..c].trim(), from_s[c + 1..].trim())
     };
-    let lhs = lhs
+    let lhs_raw = lhs;
+    let lhs = lhs_raw
         .trim_end_matches(" LEFT")
         .trim_end_matches(" RIGHT")
         .trim_end_matches(" FULL")
@@ -452,6 +454,31 @@ fn plan_join(
             (rest, w.to_string())
         }
     };
+    // INNER joins go through the general equivalence-class planner
+    // (it subsumes the two-stream swap); its no-arrangement error is
+    // where the HASH join lives
+    if !outer {
+        match plan_chain(file, page_size, from_s, where_s, order_s) {
+            Ok(p) => return Ok(p),
+            Err(e) if e.starts_with("no arrangement") => {
+                let (_, lali) = split_alias(lhs)?;
+                let rhs_decl = match rest.find(" ON ") {
+                    Some(o) => rest[..o].trim(),
+                    None => rest,
+                };
+                let (_, rali) = split_alias(rhs_decl)?;
+                return Ok(Plan {
+                    streams: vec![
+                        Stream { name: lali, access: Access::Natural },
+                        Stream { name: rali, access: Access::Natural },
+                    ],
+                    combine: Combine::Hash,
+                    sorted: order_s.is_some(),
+                });
+            }
+            Err(e) => return Err(e),
+        }
+    }
     let (ltab, lali) = split_alias(lhs)?;
     let (rtab, rali) = split_alias(rhs)?;
     // the join key: <qualifier>.<col> = <qualifier>.<col>
@@ -565,12 +592,15 @@ fn plan_join(
     })
 }
 
-/// Plan a chain of three or more INNER-joined streams. The engine
-/// keeps the SQL order when every stream after the first reaches its
-/// rows through a join key's index; when it must REORDER - which it
-/// does through EQUIVALENCE CLASSES, deriving `D.Z = A.ID` from
-/// `D.Z = B.UID` and `A.ID = B.UID` (probed) - this slice refuses
-/// rather than guessing at a derivation it has not converted.
+/// Plan an INNER join of THREE OR MORE streams by the rule the
+/// probes settled: build EQUIVALENCE CLASSES from every equi-join
+/// predicate (so `D.Z = B.UID` and `A.ID = B.UID` put A.ID, B.UID
+/// and D.Z in one class), then find an arrangement in which every
+/// stream after the first reaches its rows through an index on a
+/// column of a class it SHARES WITH AN ALREADY-PLACED STREAM. The
+/// engine tries drivers in SQL order and keeps the remaining streams
+/// in SQL order too - which is why an unindexable link ends up
+/// driving: no arrangement starting anywhere else completes.
 fn plan_chain(
     file: &[u8],
     page_size: usize,
@@ -578,15 +608,28 @@ fn plan_chain(
     where_s: Option<&str>,
     order_s: Option<&str>,
 ) -> Result<Plan, String> {
-    // split `A a JOIN B b ON <k> JOIN C c ON <k>` into stream/ON pairs
+    // split `A a JOIN B b ON <k> JOIN C c ON <k>` into declarations
+    // and ON clauses
     let mut parts: Vec<&str> = Vec::new();
     let mut rest = from_s;
-    while let Some(j) = rest.find(" JOIN ") {
-        parts.push(rest[..j].trim());
-        rest = &rest[j + 6..];
+    loop {
+        let j = rest.find(" JOIN ").map(|j| (j, 6));
+        let c = rest.find(',').map(|c| (c, 1));
+        match match (j, c) {
+            (Some(a), Some(b)) if a.0 < b.0 => Some(a),
+            (Some(_), Some(b)) => Some(b),
+            (a, b) => a.or(b),
+        } {
+            Some((at, skip)) => {
+                parts.push(rest[..at].trim());
+                rest = &rest[at + skip..];
+            }
+            None => break,
+        }
     }
     parts.push(rest.trim());
-    let mut streams: Vec<(String, String)> = Vec::new(); // (table, plan name)
+    let mut tables: Vec<String> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
     let mut ons: Vec<String> = Vec::new();
     for (i, p) in parts.iter().enumerate() {
         let (decl, on) = match p.find(" ON ") {
@@ -594,70 +637,196 @@ fn plan_chain(
             None => (p.trim(), None),
         };
         let (tab, name) = split_alias(decl)?;
-        streams.push((tab, name));
+        tables.push(tab);
+        names.push(name);
         match (i, on) {
             (0, None) => {}
             (0, Some(_)) => return Err("the first stream carries an ON".into()),
             (_, Some(o)) => ons.push(o),
-            (_, None) => return Err("a chained JOIN without ON".into()),
+            // the comma form carries its equalities in the WHERE
+            (_, None) => {}
         }
     }
-    // each stream after the first must reach its rows through an
-    // index on ITS side of its own ON clause
-    let mut out: Vec<Stream> = Vec::new();
-    for (i, (tab, name)) in streams.iter().enumerate() {
-        let idx = indexes_of(file, page_size, tab)?;
-        if i == 0 {
-            // the driver: its own WHERE filter, or a navigable
-            // ORDER BY, else NATURAL
-            let mut access = Access::Natural;
-            if let Some(w) = where_s {
-                for part in split_kw(w, "AND") {
-                    let part = part.trim();
-                    let mut halves = part.split('=');
-                    let (lq, rq) = (
-                        halves.next().unwrap_or("").trim(),
-                        halves.next().unwrap_or("").trim(),
-                    );
-                    if rq.contains('.') && !rq.contains('\'') {
-                        continue; // a join predicate, not a filter
+    let n = tables.len();
+    let bare: Vec<String> = names
+        .iter()
+        .map(|x| x.trim_matches('"').rsplit('.').next().unwrap_or(x).trim_matches('"').to_string())
+        .collect();
+    let indexes: Vec<Vec<IndexInfo>> = tables
+        .iter()
+        .map(|t| indexes_of(file, page_size, t))
+        .collect::<Result<_, _>>()?;
+
+    // ---- the equivalence classes -----------------------------------
+    // each class is a set of (stream, column) pairs the join
+    // predicates prove equal
+    let mut classes: Vec<Vec<(usize, String)>> = Vec::new();
+    let mut add_pair = |a: (usize, String), b: (usize, String), classes: &mut Vec<Vec<(usize, String)>>| {
+        let find = |c: &(usize, String), classes: &Vec<Vec<(usize, String)>>| {
+            classes.iter().position(|cl| {
+                cl.iter().any(|(s, col)| *s == c.0 && col.eq_ignore_ascii_case(&c.1))
+            })
+        };
+        match (find(&a, classes), find(&b, classes)) {
+            (None, None) => classes.push(vec![a, b]),
+            (Some(i), None) => classes[i].push(b),
+            (None, Some(j)) => classes[j].push(a),
+            (Some(i), Some(j)) if i != j => {
+                let merged = classes[j].clone();
+                classes[i].extend(merged);
+                classes.remove(j);
+            }
+            _ => {}
+        }
+    };
+    let qual_of = |q: &str| -> Option<usize> {
+        bare.iter().position(|b| b.eq_ignore_ascii_case(q.trim().trim_matches('"')))
+    };
+    let mut collect_equi = |text: &str, classes: &mut Vec<Vec<(usize, String)>>| {
+        for clause in split_kw(text, "AND") {
+            let Some((a, b)) = clause.split_once('=') else { continue };
+            let (Some((aq, ac)), Some((bq, bc))) =
+                (a.trim().split_once('.'), b.trim().split_once('.'))
+            else {
+                continue;
+            };
+            if let (Some(ai), Some(bi)) = (qual_of(aq), qual_of(bq)) {
+                let (acol, bcol) = (
+                    ac.trim().trim_matches('"').to_string(),
+                    bc.trim().trim_matches('"').to_string(),
+                );
+                // an equality across TYPE FAMILIES proves nothing an
+                // index can use (probed: a VARCHAR = INTEGER join
+                // hashes even with an indexed side)
+                let fam_a = column_family(file, page_size, &tables[ai], &acol);
+                let fam_b = column_family(file, page_size, &tables[bi], &bcol);
+                if !matches!((fam_a, fam_b), (Ok(x), Ok(y)) if x == y) {
+                    continue;
+                }
+                add_pair((ai, acol), (bi, bcol), classes);
+            }
+        }
+    };
+    for on in &ons {
+        collect_equi(on, &mut classes);
+    }
+    if let Some(w) = where_s {
+        collect_equi(w, &mut classes);
+    }
+
+    // ---- can stream `s` be reached by index from `placed`? ---------
+    let reach = |s: usize, placed: &[usize]| -> Option<IndexInfo> {
+        for cl in &classes {
+            // a column of s in this class, and a column of some
+            // already-placed stream in the SAME class
+            let joined = cl.iter().any(|(t, _)| placed.contains(t));
+            if !joined {
+                continue;
+            }
+            for (t, col) in cl.iter().filter(|(t, _)| *t == s) {
+                if let Some(i) = indexes[*t]
+                    .iter()
+                    .filter(|x| x.matches(col) && !x.descending)
+                    .min_by_key(|x| x.id)
+                {
+                    return Some(i.clone());
+                }
+            }
+        }
+        None
+    };
+    // ---- try each driver in SQL order, rest in SQL order ----------
+    let mut chosen: Option<(usize, Vec<(usize, IndexInfo)>)> = None;
+    for d in 0..n {
+        let mut placed = vec![d];
+        let mut steps: Vec<(usize, IndexInfo)> = Vec::new();
+        let mut ok = true;
+        for s in (0..n).filter(|s| *s != d) {
+            match reach(s, &placed) {
+                Some(i) => {
+                    steps.push((s, i));
+                    placed.push(s);
+                }
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            chosen = Some((d, steps));
+            break;
+        }
+    }
+    let Some((driver, steps)) = chosen else {
+        return Err("no arrangement indexes every stream after the first".into());
+    };
+
+    // ---- the driver's own access -----------------------------------
+    let mut access = Access::Natural;
+    let mut sorted = order_s.is_some();
+    if let Some(w) = where_s {
+        for part in split_kw(w, "AND") {
+            let part = part.trim();
+            let mut halves = part.split('=');
+            let (lq, rq) = (
+                halves.next().unwrap_or("").trim(),
+                halves.next().unwrap_or("").trim(),
+            );
+            if rq.contains('.') && !rq.contains('\'') {
+                continue; // a join predicate, not a filter
+            }
+            if let Some((q, col)) = lq.split_once('.') {
+                if qual_of(q) == Some(driver) {
+                    if let Some(m) = indexes[driver]
+                        .iter()
+                        .filter(|x| x.matches(col.trim()))
+                        .min_by_key(|x| x.id)
+                    {
+                        access = Access::Index(vec![m.name.clone()]);
                     }
-                    if let Some((q, col)) = lq.split_once('.') {
-                        if q.trim().eq_ignore_ascii_case(name.trim_matches('"')) {
-                            if let Some(m) =
-                                idx.iter().filter(|x| x.matches(col.trim())).min_by_key(|x| x.id)
-                            {
-                                access = Access::Index(vec![m.name.clone()]);
-                            }
+                }
+            }
+        }
+    }
+    if let Some(o) = order_s {
+        // the ORDER BY may name ANOTHER stream's column: its
+        // equivalence class carries the order to the driver (probed -
+        // ORDER BY B.UID navigated A's index on A.ID)
+        let keys = parse_order_list(o)?;
+        if keys.len() == 1 {
+            let (ocol, odesc) = &keys[0];
+            let mut cands: Vec<String> = vec![ocol.clone()];
+            for cl in &classes {
+                if cl.iter().any(|(_, c)| c.eq_ignore_ascii_case(ocol)) {
+                    for (t, c) in cl {
+                        if *t == driver {
+                            cands.push(c.clone());
                         }
                     }
                 }
             }
-            out.push(Stream { name: name.clone(), access });
-            continue;
+            for c in cands {
+                if let Some(i) = indexes[driver]
+                    .iter()
+                    .filter(|x| x.navigates(&[(c.clone(), *odesc)]))
+                    .min_by_key(|x| x.id)
+                {
+                    access = Access::Order(i.name.clone());
+                    sorted = false;
+                    break;
+                }
+            }
         }
-        // this stream's key column, from its own ON clause
-        let on = &ons[i - 1];
-        let col = own_key_column(on, name)?;
-        let m = idx
-            .iter()
-            .filter(|x| x.matches(&col) && !x.descending)
-            .min_by_key(|x| x.id)
-            .ok_or_else(|| {
-                "a chain link whose key is unindexed needs the engine's \
-                 equivalence-class reordering - unconverted"
-                    .to_string()
-            })?;
+    }
+    let mut out = vec![Stream { name: names[driver].clone(), access }];
+    for (s, i) in steps {
         out.push(Stream {
-            name: name.clone(),
-            access: Access::Index(vec![m.name.clone()]),
+            name: names[s].clone(),
+            access: Access::Index(vec![i.name]),
         });
     }
-    Ok(Plan {
-        streams: out,
-        combine: Combine::Join,
-        sorted: order_s.is_some(),
-    })
+    Ok(Plan { streams: out, combine: Combine::Join, sorted })
 }
 
 /// The column THIS stream contributes to an ON clause.

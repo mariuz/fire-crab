@@ -129,10 +129,17 @@ check "SELECT X FROM C ORDER BY X DESC"
 check "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID JOIN C D ON D.X = B.UID"
 check "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID JOIN C D ON D.X = B.UID WHERE A.AMT = 3"
 
+# --- equivalence classes: the reordering, converted -------------------
+# `D.Z = B.UID` and `A.ID = B.UID` put A.ID, B.UID and D.Z in ONE
+# class, so the unindexable link DRIVES and the rest follow SQL order
+check "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID JOIN C D ON D.Z = B.UID"
+check "SELECT A.ID FROM C D JOIN U B ON D.Z = B.UID JOIN T A ON A.ID = B.UID"
+check "SELECT A.ID FROM T A JOIN C D ON A.ID = D.Z JOIN U B ON B.UID = D.Z"
+check "SELECT A.ID FROM T A JOIN U B ON A.AMT = B.UA JOIN C D ON D.X = B.UA"
+# ...and the order transfers through the class too
+check "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID ORDER BY B.UID"
+
 # --- outside the slice -------------------------------------------------
-# the engine reorders THIS one through an equivalence class
-# (D.Z = B.UID and A.ID = B.UID give D.Z = A.ID) - unconverted
-refuse "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID JOIN C D ON D.Z = B.UID"
 refuse "SELECT ID FROM T UNION ALL SELECT UID FROM U"
 refuse "SELECT ID FROM T WHERE ID IN (SELECT UID FROM U)"
 refuse "SELECT A.ID FROM T A LEFT JOIN U B ON A.ID = B.UID LEFT JOIN C D ON D.X = B.UID"
