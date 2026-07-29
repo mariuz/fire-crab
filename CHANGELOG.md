@@ -13,6 +13,30 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-dsql slice 28: aliased streams, subroutines in triggers
+
+### Converted
+- **Aliased streams in body statements** (flip thirty — one of the
+  OLDEST refusals, named in slice 7): `FOR SELECT ... FROM T E`,
+  `DELETE FROM T E`, `UPDATE T E SET ...` all compile — relation2
+  with the quoted alias at top level, relation3 with the alias in
+  its always-present slot inside subroutines (the QV4 transcript),
+  qualified references resolving through the one stream with the
+  field machinery unchanged. Aliased aggregate sources with
+  qualified group keys ride along.
+- **Subroutines in trigger bodies** (flip thirty-one): DECLARE
+  PROCEDURE/FUNCTION takes the same grouped-declare slot cursors do
+  — the sub_decl machinery shared verbatim, sub calls working from
+  trigger statements (a probe passed NEW.ID as a sub-function
+  argument, resolved in the OUTER trigger scope).
+
+### Guarded
+- Aliased streams under AS CURSOR (the alias string's shape
+  unprobed), aliased positioned DML, derived FOR streams. Gate:
+  `qa/dsql-proc-blr.sh` grew to 161 checks (7 fresh + the slice-7
+  alias refusal flipped to a check), `qa/dsql-trig-blr.sh` to 48;
+  302 unit byte-pins.
+
 ## 2026-07-29 — fire-crab-dsql slice 27: streams inside subroutines
 
 ### Converted

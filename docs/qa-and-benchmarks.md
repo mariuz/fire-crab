@@ -4666,6 +4666,27 @@ WHEN, and a BLOCK as a handler's body nests blr_block again with no
 handler section of its own - the battery runs a handler block
 containing an EXIT.
 
+Slice 28 flipped one of the oldest refusals on the books. Aliased
+FOR streams were named unprobed back in slice 7 - twenty-one
+slices ago - and the flip cost three probes and two deleted
+guards: FOR SELECT ... FROM EMPLOYEE E, DELETE FROM EMPLOYEE E and
+UPDATE EMPLOYEE E SET all compile to the relation2-plus-quoted-
+alias shape the view compiler has emitted since slice 2, with
+qualified references resolving through the one visible stream by
+machinery that never changed. Inside subroutines the same
+statements take relation3's always-present alias slot - the QV4
+transcript slice 27 left on the table, cashed by composition. An
+aliased aggregate source with a qualified group key rode along on
+the existing map machinery. And subroutines reached TRIGGER
+bodies: DECLARE PROCEDURE/FUNCTION takes the same grouped-declare
+slot cursors do - the declaration machinery shared verbatim - with
+a probe passing NEW.ID as a sub-function argument, resolved in the
+outer trigger scope where the subroutine itself sees nothing of
+OLD or NEW. The battery drives an aliased-DML sub-procedure and a
+trigger sub-procedure that INSERTs - stream-bearing subroutines in
+trigger clothing, a composition of three slices' laws no probe
+ever ran.
+
 Slice 27 turned the converted surface loose inside subroutines.
 Slice 26 had probed the wall and named it: streams in subroutine
 bodies emit blr_relation3. The layout, read from the engine's own

@@ -307,6 +307,11 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # the OLDEST refusals get cheap: an alias guard written in
+    # slice 7 fell to three probes in slice 28 because every law it
+    # feared (quoted-alias emission, qualified resolution, the
+    # relation3 slot) had been converted for OTHER reasons since -
+    # re-audit early refusals after the surface around them fills in
     # a context-dependent ENCODING may need only one switch: streams
     # inside subroutines swap relation/relation2 for relation3, and
     # a flag on the parsed stream let the WHOLE statement surface

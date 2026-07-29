@@ -4244,8 +4244,8 @@ impl<'a> P<'a> {
         };
         self.i = list_end + 1;
         let stream = self.stream_item()?;
-        if stream.alias.is_some() || stream.derived.is_some() {
-            return None; // aliased / derived FOR streams: unprobed
+        if stream.derived.is_some() {
+            return None; // derived FOR streams: unprobed
         }
         self.streams.push(stream.clone());
         let sidx = self.streams.len() - 1;
@@ -4489,7 +4489,13 @@ impl<'a> P<'a> {
             if !self.kw("CURSOR") || !is_for {
                 return None;
             }
-            if aggregate || first.is_some() || skip.is_some() || !sort.is_empty()
+            // an ALIASED stream under AS CURSOR: the alias string's
+            // shape is unprobed - refuse
+            if aggregate
+                || first.is_some()
+                || skip.is_some()
+                || !sort.is_empty()
+                || stream.alias.is_some()
             {
                 return None;
             }
@@ -5752,11 +5758,12 @@ impl<'a> P<'a> {
                 return None;
             }
             let st = self.stream_item()?;
-            if st.alias.is_some() || st.derived.is_some() {
+            if st.derived.is_some() {
                 return None;
             }
             // WHERE CURRENT OF <cursor>: blr_erase at the cursor's
-            // OWN context - no fresh stream slot (probed)
+            // OWN context - no fresh stream slot (probed; an aliased
+            // positioned delete is unprobed and refuses below)
             if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "WHERE")
                 && matches!(self.t.get(self.i + 1), Some(Tok::Ident(w)) if w == "CURRENT")
             {
@@ -5770,7 +5777,7 @@ impl<'a> P<'a> {
                 // the erased table must be the cursor's (and a plain,
                 // non-aggregate cursor - the engine refuses the rest)
                 let (ctx, ctbl) = self.find_pos_cursor(cur)?;
-                if ctbl != st.name {
+                if ctbl != st.name || st.alias.is_some() {
                     return None;
                 }
                 self.i += 1;
@@ -6168,6 +6175,16 @@ impl<'a> P<'a> {
             }
             let rel = rel.clone();
             self.i += 1;
+            // an optional stream alias (SET is a keyword, so a bare
+            // following ident is the alias)
+            let rel_alias = match self.t.get(self.i) {
+                Some(Tok::Ident(a)) if !is_keyword(a) => {
+                    let a = a.clone();
+                    self.i += 1;
+                    Some(a)
+                }
+                _ => None,
+            };
             // UPDATE ... WHERE CURRENT OF: the modify goes from the
             // cursor's context to ONE fresh slot (the new record) -
             // scan ahead for the positioned tail before allocating
@@ -6187,6 +6204,10 @@ impl<'a> P<'a> {
                 j += 1;
             }
             if positioned {
+                // an aliased positioned update: unprobed
+                if rel_alias.is_some() {
+                    return None;
+                }
                 return self.positioned_update(rel);
             }
             // the new-record placeholder is unnameable: SET targets
@@ -6200,7 +6221,7 @@ impl<'a> P<'a> {
             let new_ctx = (self.streams.len() - 1) as u8 + self.base;
             let st = Stream {
                 name: rel,
-                alias: None,
+                alias: rel_alias,
                 derived: None,
                 sub: self.in_sub,
             };
@@ -6674,9 +6695,20 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
     enum TDecl {
         Var(usize),
         Cur(usize),
+        Sub(usize),
     }
     let mut decl_seq: Vec<TDecl> = Vec::new();
     while p.kw("DECLARE") {
+        // subroutines declare in trigger bodies too - the same
+        // grouped-declare slots cursors take (probed)
+        if p.kw("PROCEDURE") {
+            decl_seq.push(TDecl::Sub(p.sub_decl(false)?));
+            continue;
+        }
+        if p.kw("FUNCTION") {
+            decl_seq.push(TDecl::Sub(p.sub_decl(true)?));
+            continue;
+        }
         let _ = p.kw("VARIABLE");
         let Some(Tok::Ident(name)) = p.t.get(p.i) else {
             return None;
@@ -6733,6 +6765,7 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
                 emit_dsc(&mut out, declares[*vi].0);
             }
             TDecl::Cur(ci) => emit_cursor_decl(&mut out, &p.cursor_decls[*ci]),
+            TDecl::Sub(si) => out.extend_from_slice(&p.sub_decls[*si]),
         }
     }
     for (vi, (_, init)) in declares.iter().enumerate() {
@@ -8280,6 +8313,39 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_twenty_eight_shapes_byte_for_byte() {
+        // ALIASED streams in body statements (flip thirty): FOR
+        // SELECT emits relation2 with the quoted alias, qualified
+        // refs resolving through the one stream
+        pin_proc(
+            "CREATE PROCEDURE QX1 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT B.UID FROM U2 B WHERE B.UA > 0 ORDER BY B.UID DESC INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743019202553203224222004731170002554115080000000000460149170003554944FF02011700035549441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... aliased UPDATE (the alias on the ORG stream) and DELETE
+        pin_proc(
+            "CREATE PROCEDURE QX2 (P1 INTEGER, P2 INTEGER) AS BEGIN UPDATE U2 X SET UA = :P2 WHERE X.UID = :P1; DELETE FROM U2 Y WHERE Y.UA < 0; END",
+            "05020400040008000700080007000401010007000C00029B1100020207D901044301920255320322582201472F170103554944290000000100FF0A010002012900020003001700025541FF07D9010443019202553203225922024733170202554115080000000000FF0502FFFFFF0E010201150700000019010000FFFF4C",
+        );
+        // ... and inside a SUBROUTINE: relation3 with the quoted
+        // alias in the always-present alias slot (the QV4 law)
+        pin_proc(
+            "CREATE PROCEDURE QX3 RETURNS (R1 INTEGER) AS DECLARE PROCEDURE PICK RETURNS (O1 INTEGER) AS BEGIN FOR SELECT B.UID FROM U2 B WHERE B.UA > 0 INTO :O1 DO SUSPEND; END BEGIN EXECUTE PROCEDURE PICK RETURNING_VALUES :R1; SUSPEND; END",
+            "050204010300080007000700020300000800012D1A0000CD045049434B000100000100024F310082000000050204010300080007000700020300000800012D1A00009B11000202110107430194065055424C49430002553203224222004731170002554115080000000000FF02011700035549441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C9B11000202E1010403045049434BFF0501001A0000FF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... an aliased AGGREGATE source with a qualified group key
+        pin_proc(
+            "CREATE PROCEDURE QX4 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT COUNT(*) FROM U2 Z GROUP BY Z.UA INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014F0143019202553203225A2200FF4E0117000255414D0100000053FF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // SUBROUTINES IN TRIGGER BODIES (flip thirty-one): the
+        // declaration takes the same grouped-declare slot cursors do
+        pin_trig(
+            "CREATE TRIGGER TRS1 FOR T BEFORE INSERT AS DECLARE V1 INTEGER; DECLARE FUNCTION CAP (X1 INTEGER) RETURNS INTEGER AS BEGIN IF (X1 > 100) THEN RETURN 100; RETURN X1; END BEGIN V1 = CAP(NEW.ID); NEW.ID = V1; END",
+            "05020300000800CF034341500000010002583100010000008200000005020400020008000700040103000800070007000C00020300000800012D1A00009B110002020831290000000100150800640000000201150800640000001A00000E0102011A0000290100000100FF1200FFFF02012900000001001A00000E0102011A0000290100000100FF1200FFFFFFFF0E0102011A0000290100000100FFFF4C012D1A00001100020201E001040303434150FF0301001701024944FF1A0000011A00001701024944FFFFFF4C",
+        );
+    }
+
+    #[test]
     fn subroutine_refusals() {
         for sql in [
             // derived tables inside subroutines: unprobed
@@ -8500,8 +8566,10 @@ mod tests {
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID, A FROM T INTO :R1 DO SUSPEND; END",
             // subqueries inside procedure bodies: contexts unprobed
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM U2 WHERE U2.UID = T.ID) INTO :R1 DO SUSPEND; END",
-            // aliased FOR streams: unprobed
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T E INTO :R1 DO SUSPEND; END",
+            // an ALIASED stream under AS CURSOR: unprobed alias string
+            "CREATE PROCEDURE X AS BEGIN FOR SELECT ID FROM T E AS CURSOR CU DO DELETE FROM T WHERE CURRENT OF CU; END",
+            // aliased positioned DML: unprobed
+            "CREATE PROCEDURE X (P1 INTEGER) AS DECLARE CX CURSOR FOR (SELECT ID FROM T); BEGIN OPEN CX; FETCH CX; UPDATE T A SET ID = :P1 WHERE CURRENT OF CX; CLOSE CX; END",
         ] {
             assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
         }
