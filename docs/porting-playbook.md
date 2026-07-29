@@ -307,6 +307,12 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # every NEW clause keyword is an alias-slurp bug until proven
+    # otherwise (FROM T PLAN parsed PLAN as the alias) - grep the
+    # stream parser's alias arm when adding grammar; and widening a
+    # parser (val() for sort keys) can turn an old REFUSAL into
+    # wrong bytes (ORDER BY 1 = a position) - re-check refusal tests
+    # after every parser widening
     # a positional law may really be a CONTRIBUTION law: the
     # aggregate map was never items-in-order but items-CONTRIBUTING
     # in order (fields or verbs, deduped) - the degenerate case hid

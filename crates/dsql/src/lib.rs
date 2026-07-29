@@ -378,6 +378,11 @@ mod blr {
     /// (both probed)
     pub const EXEC_PROC2: u8 = 0xC1;
     pub const FUNCTION2: u8 = 0xC2;
+    /// PLAN (tbl NATURAL): blr_plan, blr_retrieve, the stream
+    /// re-emitted, blr_sequential - last in the rse (probed)
+    pub const PLAN: u8 = 0x8B;
+    pub const RETRIEVE: u8 = 0x91;
+    pub const SEQUENTIAL: u8 = 0x8E;
     /// streams inside SUBROUTINE bodies: blr_relation3 - counted
     /// schema, counted package (empty), counted name, then the alias
     /// string relation2 would carry OR a counted empty, ctx (probed;
@@ -2332,6 +2337,11 @@ fn is_keyword(w: &str) -> bool {
             | "RETURNING"
             | "WITH"
             | "LOCK"
+            | "PLAN"
+            | "NATURAL"
+            | "OFFSET"
+            | "ROWS"
+            | "ONLY"
     )
 }
 
@@ -3131,6 +3141,36 @@ fn rebuild_over_keys(
     }
 }
 
+/// Stamp a context into every Fid of a rebuilt expression - the
+/// window contexts are assigned after the maps are built.
+fn patch_fid_ctx(v: &Val, ctx: u8) -> Val {
+    match v {
+        Val::Fid(_, slot) => Val::Fid(ctx, *slot),
+        Val::Add(a, b) => Val::Add(
+            Box::new(patch_fid_ctx(a, ctx)),
+            Box::new(patch_fid_ctx(b, ctx)),
+        ),
+        Val::Sub(a, b) => Val::Sub(
+            Box::new(patch_fid_ctx(a, ctx)),
+            Box::new(patch_fid_ctx(b, ctx)),
+        ),
+        Val::Mul(a, b) => Val::Mul(
+            Box::new(patch_fid_ctx(a, ctx)),
+            Box::new(patch_fid_ctx(b, ctx)),
+        ),
+        Val::Div(a, b) => Val::Div(
+            Box::new(patch_fid_ctx(a, ctx)),
+            Box::new(patch_fid_ctx(b, ctx)),
+        ),
+        Val::Concat(a, b) => Val::Concat(
+            Box::new(patch_fid_ctx(a, ctx)),
+            Box::new(patch_fid_ctx(b, ctx)),
+        ),
+        Val::Neg(a) => Val::Neg(Box::new(patch_fid_ctx(a, ctx))),
+        other => other.clone(),
+    }
+}
+
 fn map_val_to_fid(map: &[MapEntry], v: &Val, fid_ctx: u8) -> Option<Val> {
     match v {
         Val::Field(..) => {
@@ -3139,9 +3179,17 @@ fn map_val_to_fid(map: &[MapEntry], v: &Val, fid_ctx: u8) -> Option<Val> {
                 .position(|e| matches!(e, MapEntry::Key(k) if k == v))?;
             Some(Val::Fid(fid_ctx, idx as u16))
         }
-        Val::Fid(..) | Val::Int(_) | Val::Int64(_) | Val::Dec(..) | Val::Str(_) | Val::Null => {
-            Some(v.clone())
-        }
+        // parameters and variables pass through an aggregate's
+        // boundary plainly (probed: HAVING SUM(AMT) > :P1 - the
+        // slice-9 refusal fell to the gate's own battery statement)
+        Val::Fid(..)
+        | Val::Int(_)
+        | Val::Int64(_)
+        | Val::Dec(..)
+        | Val::Str(_)
+        | Val::Null
+        | Val::InParam(_)
+        | Val::LocalVar(_) => Some(v.clone()),
         Val::Add(a, b) | Val::Sub(a, b) | Val::Mul(a, b) | Val::Div(a, b)
         | Val::Concat(a, b) => {
             let (a, b) = (
@@ -3885,6 +3933,9 @@ struct ForSel {
     /// specs) its context, partition keys, order keys and map -
     /// passthrough columns live in the DEFAULT window (probed)
     windows: Vec<Win>,
+    /// PLAN (tbl NATURAL): blr_plan + blr_retrieve + the stream
+    /// re-emitted + blr_sequential, last in the rse (probed)
+    plan: bool,
     /// UNION [ALL]: the union claims the statement's FIRST slot,
     /// branch streams follow; per branch its rse (WHERE inside) and
     /// map; a DISTINCT union appends blr_project over the fids
@@ -4867,6 +4918,12 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                     emit_val(out, key);
                 }
             }
+            if f.plan {
+                out.push(blr::PLAN);
+                out.push(blr::RETRIEVE);
+                emit_stream(out, &f.stream, f.ctx);
+                out.push(blr::SEQUENTIAL);
+            }
             out.push(blr::END);
             out.push(blr::BEGIN);
             // an INTO-less AS CURSOR loop has no assignments at all
@@ -4947,6 +5004,7 @@ impl<'a> P<'a> {
     fn select_stmt(&mut self, is_for: bool) -> Option<TrigStmt> {
         let mut first: Option<Val> = None;
         let mut skip: Option<Val> = None;
+        // (also set by the OFFSET/FETCH spelling after the sort)
         if self.kw("FIRST") {
             let Some(Tok::Int(v)) = self.t.get(self.i) else {
                 return None;
@@ -5226,6 +5284,40 @@ impl<'a> P<'a> {
         } else {
             None
         };
+        // PLAN (tbl NATURAL) - the single-table sequential plan:
+        // blr_plan/blr_retrieve/the stream again/blr_sequential,
+        // LAST in the rse after the sort (probed); other plan forms
+        // refuse
+        let mut plan = false;
+        if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "PLAN") {
+            self.i += 1;
+            if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                return None;
+            }
+            self.i += 1;
+            let named_ok = matches!(
+                self.t.get(self.i),
+                Some(Tok::Ident(w)) if *w == stream.name
+                    || stream.alias.as_deref() == Some(w)
+            );
+            if !named_ok {
+                return None;
+            }
+            self.i += 1;
+            if !matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "NATURAL")
+            {
+                return None;
+            }
+            self.i += 1;
+            if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                return None;
+            }
+            self.i += 1;
+            if !joins.is_empty() || stream.derived.is_some() {
+                return None;
+            }
+            plan = true;
+        }
         // UNION [ALL] branches: each a plain single-stream select -
         // items resolved at ITS stream, WHERE inside its rse; the
         // whole union refuses beside every other structure
@@ -5452,16 +5544,19 @@ impl<'a> P<'a> {
             }
             loop {
                 let key = self.val()?;
-                // over an aggregate the key REBUILDS against the map
-                // (probed: ORDER BY SALARY / 1000 sorts the divide
-                // over the mapped field); elsewhere expression keys
-                // are unprobed and refuse
+                // over an aggregate the key REBUILDS against the
+                // map; elsewhere the raw expression IS the sort key
+                // (both probed) - but a bare literal is a POSITION
+                // to the engine, not a value: refuse
+                if matches!(
+                    key,
+                    Val::Int(..) | Val::Int64(..) | Val::Dec(..)
+                ) {
+                    return None;
+                }
                 let key = if aggregate {
                     map_val_to_fid(&self.agg_map, &key, self.agg_fid_ctx)?
                 } else {
-                    if !matches!(key, Val::Field(..)) {
-                        return None;
-                    }
                     key
                 };
                 let descending = if self.kw("DESC") {
@@ -5486,21 +5581,38 @@ impl<'a> P<'a> {
         // items in select order with the partition keys appended;
         // contexts claim the slots after the stream (all probed)
         let mut windows: Vec<Win> = Vec::new();
+        let mut rebuilt_exprs: Vec<(usize, usize, Val)> = Vec::new();
         let win_slots: Vec<(usize, u16)> = if has_wins {
             let mut slots = Vec::new();
             for it in &items {
+                // a passthrough EXPRESSION contributes its bare
+                // fields to the default window's map and rebuilds
+                // over the fids - the group-expression law in window
+                // clothing (probed: UID + 1 beside COUNT(*) OVER ())
+                enum WSlot {
+                    Direct(MapEntry),
+                    Rebuild(Val),
+                }
                 let (part, ord, frame, entry) = match it {
                     Item::Col(v) => (
                         Vec::new(),
                         Vec::new(),
                         None,
-                        MapEntry::Key(v.clone()),
+                        WSlot::Direct(MapEntry::Key(v.clone())),
                     ),
-                    Item::Win(e, p, o, fr) => {
-                        (p.clone(), o.clone(), fr.clone(), e.clone())
-                    }
-                    // expression passthrough beside windows: unprobed
-                    Item::Agg(..) | Item::Expr(..) => return None,
+                    Item::Expr(v) => (
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        WSlot::Rebuild(v.clone()),
+                    ),
+                    Item::Win(e, p, o, fr) => (
+                        p.clone(),
+                        o.clone(),
+                        fr.clone(),
+                        WSlot::Direct(e.clone()),
+                    ),
+                    Item::Agg(..) => return None,
                 };
                 let wi = match windows.iter().position(|w| {
                     w.part == part && w.ord == ord && w.frame == frame
@@ -5517,9 +5629,29 @@ impl<'a> P<'a> {
                         windows.len() - 1
                     }
                 };
-                let slot = windows[wi].map.len() as u16;
-                windows[wi].map.push(entry);
-                slots.push((wi, slot));
+                match entry {
+                    WSlot::Direct(e) => {
+                        let slot = windows[wi].map.len() as u16;
+                        windows[wi].map.push(e);
+                        slots.push((wi, slot));
+                    }
+                    WSlot::Rebuild(v) => {
+                        // no key constraint: passthrough fields all
+                        // land in the window's map
+                        let mut gf = Vec::new();
+                        collect_fields(&v, &mut gf);
+                        // ctx filled below; rebuild against slot ids
+                        // with a placeholder ctx, fixed after
+                        let rebuilt = rebuild_over_keys(
+                            &mut windows[wi].map,
+                            &v,
+                            &gf,
+                            0,
+                        )?;
+                        slots.push((wi, u16::MAX));
+                        rebuilt_exprs.push((slots.len() - 1, wi, rebuilt));
+                    }
+                }
             }
             for (i, w) in windows.iter_mut().enumerate() {
                 w.ctx = ctx + 1 + i as u8;
@@ -5548,10 +5680,16 @@ impl<'a> P<'a> {
                 .map(|i| Val::Fid(u.ctx, i as u16))
                 .collect()
         } else if has_wins {
-            win_slots
+            let mut vals: Vec<Val> = win_slots
                 .iter()
                 .map(|(wi, slot)| Val::Fid(windows[*wi].ctx, *slot))
-                .collect()
+                .collect();
+            // rebuilt passthrough expressions: patch the window ctx
+            // into their fids now that contexts are assigned
+            for (vi, wi, rebuilt) in &rebuilt_exprs {
+                vals[*vi] = patch_fid_ctx(rebuilt, windows[*wi].ctx);
+            }
+            vals
         } else if aggregate {
             agg_vals.take()?
         } else {
@@ -5563,6 +5701,61 @@ impl<'a> P<'a> {
                 })
                 .collect::<Option<Vec<_>>>()?
         };
+        // OFFSET n ROW[S] / FETCH FIRST|NEXT n ROW[S] ONLY - the
+        // standard spelling of SKIP and FIRST, same rse clauses in
+        // the same probed order (probed)
+        if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "OFFSET")
+        {
+            if skip.is_some() {
+                return None;
+            }
+            self.i += 1;
+            let Some(Tok::Int(n)) = self.t.get(self.i) else {
+                return None;
+            };
+            skip = Some(Val::Int(i32::try_from(*n).ok()?));
+            self.i += 1;
+            if !(matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "ROW" || w == "ROWS"))
+            {
+                return None;
+            }
+            self.i += 1;
+        }
+        if self.kw("FETCH") {
+            if first.is_some() {
+                return None;
+            }
+            if !(matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "FIRST" || w == "NEXT"))
+            {
+                return None;
+            }
+            self.i += 1;
+            let Some(Tok::Int(n)) = self.t.get(self.i) else {
+                return None;
+            };
+            first = Some(Val::Int(i32::try_from(*n).ok()?));
+            self.i += 1;
+            if !(matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "ROW" || w == "ROWS"))
+            {
+                return None;
+            }
+            self.i += 1;
+            if !matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "ONLY")
+            {
+                return None;
+            }
+            self.i += 1;
+            // FIRST/SKIP refuse beside the structures they always
+            // have - re-check now that they may have just appeared
+            if aggregate
+                || has_wins
+                || union_.is_some()
+                || !joins.is_empty()
+                || stream.derived.is_some()
+            {
+                return None;
+            }
+        }
         // WITH LOCK - probed beside a WHERE and alone; the shapes
         // beyond the probes (aggregates, FIRST/SKIP, ORDER BY) refuse
         let lock = if self.kw("WITH") {
@@ -5677,6 +5870,10 @@ impl<'a> P<'a> {
         {
             return None;
         }
+        if plan && (aggregate || has_wins || union_.is_some() || lock || cursor.is_some())
+        {
+            return None;
+        }
         Some(TrigStmt::ForSel(Box::new(ForSel {
             label,
             stream,
@@ -5685,6 +5882,7 @@ impl<'a> P<'a> {
             lock,
             joins,
             windows,
+            plan,
             union_,
             aggregate,
             map,
@@ -10293,6 +10491,42 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_forty_one_shapes_byte_for_byte() {
+        // non-aggregate EXPRESSION sort keys - the raw expression in
+        // the sort clause (flip fifty-four)
+        pin_proc(
+            "CREATE PROCEDURE RK1 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT EMP_NO FROM EMPLOYEE ORDER BY SALARY * 2 DESC INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014A08454D504C4F594545004601492417000653414C41525915080002000000FF0201170006454D505F4E4F1A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // window PASSTHROUGH expressions: fields into the default
+        // window's map, the item rebuilt over the fids - the
+        // group-expression law in window clothing (flip fifty-five)
+        pin_proc(
+            "CREATE PROCEDURE RK2 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT UID + 1, COUNT(*) OVER () FROM U2 INTO :R1, :R2 DO SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B110002021101074301C343014A02553200FF01C4010046004D02000000170003554944010053FF02012218010000150800010000001A000001180101001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        // HAVING without GROUP BY: an aggregate with zero group keys
+        // - LIVE through composition, pinned now
+        pin_proc(
+            "CREATE PROCEDURE RK3 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT COUNT(*) FROM U2 HAVING COUNT(*) > 5 INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014F0143014A02553200FF4E004D010000005347311801000015080005000000FF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // OFFSET/FETCH - the standard spelling of SKIP and FIRST,
+        // the same rse clauses in the same order (flip fifty-six)
+        pin_proc(
+            "CREATE PROCEDURE RK4 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT EMP_NO FROM EMPLOYEE ORDER BY EMP_NO OFFSET 1 ROW FETCH FIRST 2 ROWS ONLY INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014A08454D504C4F594545004415080002000000AF15080001000000460148170006454D505F4E4FFF0201170006454D505F4E4F1A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // PLAN (tbl NATURAL): blr_plan/blr_retrieve/the stream
+        // again/blr_sequential, LAST in the rse after the sort
+        // (flip fifty-seven)
+        pin_proc(
+            "CREATE PROCEDURE RK6 (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE ID > :P1 PLAN (T NATURAL) ORDER BY ID INTO :R1 DO SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B1100020211010743014A0154004731170002494429000000010046014817000249448B914A0154008EFF020117000249441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+    }
+
+    #[test]
     fn window_refusals() {
         for sql in [
             // windows beside GROUP BY/aggregates: unprobed
@@ -10495,9 +10729,6 @@ mod tests {
         for sql in [
             // `:name` must name an input parameter
             "CREATE PROCEDURE X (I1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE A > :MISSING INTO :R1 DO SUSPEND; END",
-            // an input inside HAVING crosses the aggregate boundary:
-            // unprobed
-            "CREATE PROCEDURE X (I1 INTEGER) RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT A, COUNT(*) FROM T GROUP BY A HAVING COUNT(*) > :I1 INTO :R1, :R2 DO SUSPEND; END",
             // `:name` outside a procedure body means nothing
             "SELECT ID FROM T WHERE A > :I1",
         ] {

@@ -13,6 +13,34 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-dsql slice 41: five doors - sort exprs, window exprs, OFFSET/FETCH, PLAN, params in HAVING
+
+### Converted
+- **Expression sort keys** (flip fifty-four): the raw expression in
+  the sort clause — bare literals refuse (the engine reads them as
+  POSITIONS, a wrong-bytes hazard closed at the same stroke).
+- **Window passthrough expressions** (flip fifty-five): fields into
+  the default window's map, the item rebuilt over the fids — the
+  group-expression law in window clothing.
+- **OFFSET/FETCH** (flip fifty-six): the standard spelling of SKIP
+  and FIRST — the same rse clauses in the same probed order. PLAN,
+  NATURAL, OFFSET, ROWS and ONLY joined the keyword list (PLAN was
+  being slurped as a table ALIAS — the alias trap again).
+- **PLAN (tbl NATURAL)** (flip fifty-seven): `blr_plan` +
+  `blr_retrieve` + the stream re-emitted + `blr_sequential`, LAST
+  in the rse after the sort. Other plan forms refuse.
+- **Parameters in HAVING** (flip fifty-eight — a slice-9 refusal,
+  thirty-two slices old, felled by the gate's own battery
+  statement): parameters and variables pass through the aggregate
+  boundary plainly.
+- **HAVING without GROUP BY** — pinned: an aggregate with zero
+  group keys, live through composition all along.
+
+### Guarded
+- ORDER BY positions, PLAN INDEX/ORDER/JOIN forms, OFFSET/FETCH
+  with parameters. Gate: `qa/dsql-proc-blr.sh` grew to 243 checks
+  (7 fresh); 369 unit byte-pins.
+
 ## 2026-07-29 — fire-crab-dsql slice 40: item expressions, group-expr keys, multi-ctes
 
 ### Converted

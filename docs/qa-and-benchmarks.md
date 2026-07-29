@@ -4666,6 +4666,28 @@ WHEN, and a BLOCK as a handler's body nests blr_block again with no
 handler section of its own - the battery runs a handler block
 containing an EXIT.
 
+Slice 41 opened five doors in one pass, and the gate held two of
+them open itself. Expression sort keys: the raw expression in the
+sort clause - with bare literals refusing, because ORDER BY 1 is a
+POSITION to the engine, not a value: the same statement that was a
+refusal since slice 7 would have become wrong bytes the moment
+val() started parsing sort keys, and the guard closed the hazard
+at the same stroke. Window passthrough expressions reused the
+group-expression rebuild verbatim - fields into the default
+window's map, items rebuilt over fids. OFFSET/FETCH turned out to
+be the standard SPELLING of SKIP and FIRST - the same rse clauses
+in the same probed order - and cost five new keywords, PLAN among
+them, after the probe showed FROM T PLAN slurping PLAN as a table
+ALIAS: the alias trap that has bitten every clause keyword since
+WITH. PLAN (tbl NATURAL) is blr_plan, blr_retrieve, the stream
+re-emitted, blr_sequential - LAST in the rse after the sort. And
+the gate's own battery felled a THIRTY-TWO-slice-old refusal:
+HAVING SUM(AMT) > :P1 diffed as REFUSED against clean engine bytes
+- parameters pass through the aggregate boundary plainly, one
+passthrough arm in the rewriter. HAVING without GROUP BY was
+pinned as another open door - an aggregate with zero group keys,
+live through composition all along.
+
 Slice 40 generalized the slice-8 map law and let expressions into
 three more places. Select items are FULL value expressions at the
 stream context - the general val() parses them, bare names
