@@ -4053,6 +4053,23 @@ might be, never what a transaction may see. The engine answers the
 same rows either way, which is precisely the point: the plan changes
 the path, not the answer, and the gate holds fcexe to both.
 
+### Slice 6: a byte that means two things, and a clause with no end
+
+UNION's two lessons were both about framing rather than semantics.
+The opcode is 76 - the same byte as blr_eoc - and only POSITION
+tells them apart: a union stands where a stream would, an eoc where
+a statement would. And a union has no terminator of its own: the
+branch count bounds it, and the blr_end that follows the last
+branch's map belongs to the OUTER rse - the first parse consumed it
+as the union's close and promptly refused its own probe. Semantics
+came free: branches concatenate onto slot-indexed frames, and the
+DISTINCT form is just the outer rse's project over the union's
+fids - machinery slice 3 already built. The remaining simple
+booleans (IN-list, BETWEEN, LIKE, STARTING) carry their
+three-valued edges - an IN with no match beside a NULL comparand
+answers UNKNOWN - and LIKE runs the porting playbook's own
+backtracking pseudocode, executable at last.
+
 ## Query surface: what the server answers, and what it refuses
 
 Everything below is verified by a differential gate under `qa/` — the

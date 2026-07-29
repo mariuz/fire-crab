@@ -59,11 +59,19 @@ mod blr {
     pub const GEQ: u8 = 50;
     pub const LSS: u8 = 51;
     pub const LEQ: u8 = 52;
+    pub const MATCHING: u8 = 54;
+    pub const STARTING: u8 = 55;
+    pub const BETWEEN: u8 = 56;
     pub const OR: u8 = 57;
     pub const AND: u8 = 58;
     pub const NOT: u8 = 59;
     pub const MISSING: u8 = 61;
+    pub const LIKE: u8 = 63;
+    pub const IN_LIST: u8 = 64;
     pub const RSE: u8 = 67;
+    /// 76 doubles as blr_eoc - position disambiguates: union stands
+    /// in a stream slot, eoc at the top level
+    pub const UNION: u8 = 76;
     pub const FIRST: u8 = 68;
     pub const PROJECT: u8 = 69;
     pub const BOOLEAN: u8 = 71;
@@ -153,6 +161,15 @@ pub enum Bool {
     Or(Box<Bool>, Box<Bool>),
     Not(Box<Bool>),
     Missing(Expr),
+    /// blr_in_list: operand = any of the u16-counted values (3VL:
+    /// no match beside a NULL comparand is UNKNOWN, not false)
+    InList(Expr, Vec<Expr>),
+    /// blr_between: lo <= v AND v <= hi, three-valued
+    Between(Expr, Expr, Expr),
+    /// blr_like: SQL LIKE - % any run, _ one character
+    Like(Expr, Expr),
+    /// blr_starting: STARTING WITH - a plain prefix test
+    Starting(Expr, Expr),
 }
 
 /// One sort key of an rse's blr_sort clause: the expression and its
@@ -220,6 +237,10 @@ pub enum Stream {
     Aggregate(Aggregate),
     Join { streams: Vec<JoinSource>, kind: JoinKind, on: Option<Bool> },
     Derived(Box<Rse>),
+    /// blr_union: its own context, per-branch (rse, positional map) -
+    /// branches concatenate in order (ALL; the distinct form rides
+    /// the outer rse's blr_project over the union's fids)
+    Union { context: u8, branches: Vec<(Rse, Vec<(u16, Expr)>)> },
 }
 
 /// The record-selection expression of a blr_for: one stream, the
@@ -322,6 +343,11 @@ impl<'a> P<'a> {
                 length: self.u16()?,
                 scale: 0,
             },
+            // the charset-carrying twins: u16 charset, then length
+            blr::DT_TEXT2 | blr::DT_VARYING2 => {
+                let _charset = self.u16()?;
+                MsgSlot { dtype, length: self.u16()?, scale: 0 }
+            }
             // the charset-carrying twins: u16 charset, then the length
             blr::DT_TEXT2 | blr::DT_VARYING2 => {
                 let _charset = self.u16()?;
@@ -460,6 +486,18 @@ impl<'a> P<'a> {
             blr::OR => Bool::Or(Box::new(self.boolean()?), Box::new(self.boolean()?)),
             blr::NOT => Bool::Not(Box::new(self.boolean()?)),
             blr::MISSING => Bool::Missing(self.expr()?),
+            blr::IN_LIST => {
+                let v = self.expr()?;
+                let n = self.u16()? as usize;
+                let mut list = Vec::new();
+                for _ in 0..n {
+                    list.push(self.expr()?);
+                }
+                Bool::InList(v, list)
+            }
+            blr::BETWEEN => Bool::Between(self.expr()?, self.expr()?, self.expr()?),
+            blr::LIKE => Bool::Like(self.expr()?, self.expr()?),
+            blr::STARTING => Bool::Starting(self.expr()?, self.expr()?),
             other => return Err(format!("boolean verb {} unconverted", other)),
         })
     }
@@ -502,6 +540,30 @@ impl<'a> P<'a> {
             blr::RSE => {
                 // a derived table: an rse standing in the stream slot
                 Stream::Derived(Box::new(self.rse_body()?))
+            }
+            blr::UNION => {
+                let context = self.u8()?;
+                let n = self.u8()? as usize;
+                let mut branches = Vec::new();
+                for _ in 0..n {
+                    if self.u8()? != blr::RSE {
+                        return Err("union branch is not an rse".into());
+                    }
+                    let rse = self.rse_body()?;
+                    if self.u8()? != blr::MAP {
+                        return Err("union branch without blr_map".into());
+                    }
+                    let cnt = self.u16()? as usize;
+                    let mut map = Vec::new();
+                    for _ in 0..cnt {
+                        let slot = self.u16()?;
+                        map.push((slot, self.expr()?));
+                    }
+                    branches.push((rse, map));
+                }
+                // no terminator of its own - the branch count bounds
+                // the union; the next end belongs to the OUTER rse
+                Stream::Union { context, branches }
             }
             blr::AGGREGATE => {
                 let context = self.u8()?;
@@ -1030,6 +1092,30 @@ impl<'a> Exec<'a> {
                 }
             }
             Stream::Derived(inner) => self.open_rse(inner)?,
+            Stream::Union { context, branches } => {
+                // branches concatenate in order; each row is the
+                // branch map's slot values on the union's context
+                let mut out = Vec::new();
+                for (rse, map) in branches {
+                    let width =
+                        map.iter().map(|(sl, _)| *sl as usize + 1).max().unwrap_or(0);
+                    for binding in self.open_rse(rse)? {
+                        let row = self.with_binding(&binding, |ex| {
+                            let mut row = vec![Value::Null; width];
+                            for (slot, e) in map {
+                                row[*slot as usize] = ex.eval(e)?;
+                            }
+                            Ok(row)
+                        })?;
+                        out.push(vec![StreamFrame {
+                            context: *context,
+                            relation: None,
+                            row,
+                        }]);
+                    }
+                }
+                out
+            }
         };
         // FilteredStream - over an aggregate this is HAVING
         if let Some(b) = &rse.boolean {
@@ -1536,7 +1622,73 @@ impl<'a> Exec<'a> {
             Bool::Missing(e) => {
                 Some(matches!(self.eval(e)?, Value::Null))
             }
+            Bool::InList(v, list) => {
+                let lv = self.eval(v)?;
+                if matches!(lv, Value::Null) {
+                    return Ok(None);
+                }
+                let mut unknown = false;
+                for item in list {
+                    match value_cmp(&lv, &self.eval(item)?) {
+                        Some(std::cmp::Ordering::Equal) => return Ok(Some(true)),
+                        None => unknown = true,
+                        _ => {}
+                    }
+                }
+                if unknown { None } else { Some(false) }
+            }
+            Bool::Between(v, lo, hi) => {
+                let vv = self.eval(v)?;
+                let lov = self.eval(lo)?;
+                let hiv = self.eval(hi)?;
+                let ge = value_cmp(&vv, &lov).map(|o| o != std::cmp::Ordering::Less);
+                let le = value_cmp(&vv, &hiv).map(|o| o != std::cmp::Ordering::Greater);
+                match (ge, le) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                }
+            }
+            Bool::Like(v, p) => {
+                let (vv, pv) = (self.eval(v)?, self.eval(p)?);
+                match (vv, pv) {
+                    (Value::Null, _) | (_, Value::Null) => None,
+                    (Value::Text(t), Value::Text(pat)) => {
+                        Some(like_match(&t.chars().collect::<Vec<_>>(),
+                                        &pat.chars().collect::<Vec<_>>()))
+                    }
+                    _ => return Err("LIKE over non-text values".into()),
+                }
+            }
+            Bool::Starting(v, p) => {
+                let (vv, pv) = (self.eval(v)?, self.eval(p)?);
+                match (vv, pv) {
+                    (Value::Null, _) | (_, Value::Null) => None,
+                    (Value::Text(t), Value::Text(pre)) => Some(t.starts_with(&pre)),
+                    _ => return Err("STARTING over non-text values".into()),
+                }
+            }
         })
+    }
+}
+
+/// SQL LIKE, character-based with backtracking (the porting
+/// playbook's own pseudocode): `%` matches any run including empty -
+/// try every split point - and `_` exactly one character.
+fn like_match(v: &[char], p: &[char]) -> bool {
+    match p.split_first() {
+        None => v.is_empty(),
+        Some(('%', rest)) => {
+            (0..=v.len()).any(|i| like_match(&v[i..], rest))
+        }
+        Some(('_', rest)) => match v.split_first() {
+            Some((_, vr)) => like_match(vr, rest),
+            None => false,
+        },
+        Some((c, rest)) => match v.split_first() {
+            Some((vc, vr)) => vc == c && like_match(vr, rest),
+            None => false,
+        },
     }
 }
 

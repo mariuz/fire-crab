@@ -13,6 +13,32 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-exe slice 6: UNION and the remaining simple booleans
+
+### Converted
+- **UNION**: `blr_union` standing in the stream slot — its own
+  context, per-branch rse + positional map, branches concatenating
+  in order onto slot-indexed union frames. Two byte-level laws:
+  the opcode is 76 — `blr_eoc`'s — disambiguated purely by
+  POSITION; and a union has NO terminator of its own — the branch
+  count bounds it, and the next `blr_end` belongs to the OUTER rse
+  (the first parse consumed one end too many and refused its own
+  probe to learn this). The DISTINCT form needed nothing: it is
+  the outer rse's `blr_project` over the union's fids, and the
+  existing project machinery dedupes union frames unchanged.
+- **The remaining simple booleans**: IN-list (`blr_in_list`,
+  u16-counted, three-valued — no match beside a NULL comparand is
+  UNKNOWN, not false), BETWEEN (3VL on both bounds), LIKE
+  (character-based backtracking — the porting playbook's own
+  pseudocode, executable at last) and STARTING WITH. `blr_text2`
+  literals (charset-carrying) decode alongside.
+
+### Guarded
+- Windows and subquery predicates (EXISTS et al) remain named. One
+  check swapped: STARTING WITH executes but fcdsql does not compile
+  it yet — another cross-crate frontier the two-arrow gate named.
+  Gate: 54 → 63 checks. 261 workspace tests.
+
 ## 2026-07-29 — fire-crab-exe slice 5: join chains, index retrievals
 
 ### Converted
