@@ -4039,6 +4039,20 @@ bytes) refuses before phase B can run. The check was swapped for a
 pinnable shape - and the frontier is now named: when the dsql crate
 flips its guard, the executor check comes back with it.
 
+### Slice 5: chains splice, and the index says "might"
+
+Join chains needed exactly one structural change: a join SOURCE can
+be a nested join, whose bindings splice whole into the outer
+product - the left-nested shape the compiler emits executes by the
+same recursion that parses it, and outer joins over chains pad every
+context the nested side binds. Index retrievals made the paper's
+law executable: PLAN (T INDEX (...)) walks the B-tree for record
+NUMBERS (ods::walk_index_leaves), fetches records by number, and
+decides visibility ON THE RECORD - index pages say where records
+might be, never what a transaction may see. The engine answers the
+same rows either way, which is precisely the point: the plan changes
+the path, not the answer, and the gate holds fcexe to both.
+
 ## Query surface: what the server answers, and what it refuses
 
 Everything below is verified by a differential gate under `qa/` — the

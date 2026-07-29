@@ -13,6 +13,30 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-exe slice 5: join chains, index retrievals
+
+### Converted
+- **Join chains**: `blr_rs_stream` nests as a SOURCE of the outer
+  rs_stream — the left-nested shape the dsql crate emits. Join
+  sources went recursive (`JoinSource::Rel | Nested`), a nested
+  join's bindings splice whole into the outer product, and an outer
+  join over a chain pads EVERY context the nested side binds. A
+  mixed chain — `T JOIN T LEFT JOIN U` — holds against the engine.
+- **Index retrievals**: `PLAN (T INDEX (names))` executes as the
+  real BitmapTableScan. The B-tree walk (`ods::walk_index_leaves`)
+  yields record numbers; records fetch by number; and VISIBILITY IS
+  DECIDED ON THE RECORD ITSELF — the index only says where records
+  might be, the paper's own law about Firebird's index
+  architecture, now executable. The index name resolves through
+  RDB$INDICES to its 0-based index-root slot (the catalog's
+  RDB$INDEX_ID is 1-based). `PLAN (T NATURAL)` runs the plain scan.
+
+### Guarded
+- Windows and UNION remain named refusals. Gate: 49 → 54 checks
+  (three-stream chains, chain + WHERE, mixed LEFT chain, PLAN
+  INDEX with a parameter, PLAN INDEX + ORDER, PLAN NATURAL). 261
+  workspace tests.
+
 ## 2026-07-29 — fire-crab-exe slice 4: outer joins, derived tables
 
 ### Converted

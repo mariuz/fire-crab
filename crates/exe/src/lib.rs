@@ -84,6 +84,10 @@ mod blr {
     pub const RIGHT: u8 = 2;
     pub const FULL: u8 = 3;
     pub const SINGULAR: u8 = 127;
+    pub const PLAN: u8 = 139;
+    pub const SEQUENTIAL: u8 = 142;
+    pub const INDICES: u8 = 144;
+    pub const RETRIEVE: u8 = 145;
     pub const RELATION2: u8 = 146;
     pub const SKIP: u8 = 175;
     pub const END: u8 = 255;
@@ -186,6 +190,15 @@ pub struct JoinStream {
     pub context: u8,
 }
 
+/// One side of a join: a relation, or a NESTED join - chains
+/// left-nest (the inner rs_stream stands as the outer's first
+/// stream, exactly the shape the dsql crate emits).
+#[derive(Clone, Debug)]
+pub enum JoinSource {
+    Rel(JoinStream),
+    Nested(Box<Stream>),
+}
+
 /// A join's kind - blr_join_type's operand; INNER when the
 /// sub-clause is absent.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -205,7 +218,7 @@ pub enum JoinKind {
 pub enum Stream {
     Relation { name: String, context: u8 },
     Aggregate(Aggregate),
-    Join { streams: Vec<JoinStream>, kind: JoinKind, on: Option<Bool> },
+    Join { streams: Vec<JoinSource>, kind: JoinKind, on: Option<Bool> },
     Derived(Box<Rse>),
 }
 
@@ -224,6 +237,9 @@ pub struct Rse {
     /// blr_project: DISTINCT - the projected expressions; rows
     /// dedupe on them with NULL equal to NULL (set semantics)
     pub project: Vec<Expr>,
+    /// blr_plan (T INDEX (names)): retrieve through the named
+    /// indexes - the BitmapTableScan; empty = none/NATURAL
+    pub plan_indices: Vec<String>,
     /// blr_singular: at most one row - a second is a genuine error
     pub singular: bool,
 }
@@ -313,6 +329,58 @@ impl<'a> P<'a> {
             }
             other => return Err(format!("message dtype {} unconverted", other)),
         })
+    }
+
+    /// One blr_rs_stream node: stream count, the sources (relations
+    /// or NESTED rs_streams - chains left-nest), the optional
+    /// join_type and ON boolean, its end.
+    fn rs_stream(&mut self) -> Result<Stream, String> {
+        let n = self.u8()? as usize;
+        let mut streams = Vec::new();
+        for _ in 0..n {
+            match self.u8()? {
+                blr::RELATION => {
+                    let name = self.counted_name()?;
+                    let context = self.u8()?;
+                    streams.push(JoinSource::Rel(JoinStream { name, context }));
+                }
+                blr::RELATION2 => {
+                    let name = self.counted_name()?;
+                    let _alias = self.counted_name()?;
+                    let context = self.u8()?;
+                    streams.push(JoinSource::Rel(JoinStream { name, context }));
+                }
+                blr::RS_STREAM => {
+                    streams.push(JoinSource::Nested(Box::new(self.rs_stream()?)));
+                }
+                other => {
+                    return Err(format!("join stream verb {} unconverted", other))
+                }
+            }
+        }
+        let mut on = None;
+        let mut kind = JoinKind::Inner;
+        loop {
+            match self.u8()? {
+                blr::BOOLEAN => on = Some(self.boolean()?),
+                blr::JOIN_TYPE => {
+                    kind = match self.u8()? {
+                        blr::LEFT => JoinKind::Left,
+                        blr::RIGHT => JoinKind::Right,
+                        blr::FULL => JoinKind::Full,
+                        other => {
+                            return Err(format!("join type {} unconverted", other))
+                        }
+                    };
+                }
+                blr::END => break,
+                other => return Err(format!("join clause {} unconverted", other)),
+            }
+        }
+        if kind != JoinKind::Inner && streams.len() != 2 {
+            return Err("outer join over more than two streams unconverted".into());
+        }
+        Ok(Stream::Join { streams, kind, on })
     }
 
     fn expr(&mut self) -> Result<Expr, String> {
@@ -430,55 +498,7 @@ impl<'a> P<'a> {
                 let context = self.u8()?;
                 Stream::Relation { name, context }
             }
-            blr::RS_STREAM => {
-                // an inner join: stream count, the streams (plain or
-                // aliased relations), an optional ON boolean, its end
-                let n = self.u8()? as usize;
-                let mut streams = Vec::new();
-                for _ in 0..n {
-                    match self.u8()? {
-                        blr::RELATION => {
-                            let name = self.counted_name()?;
-                            let context = self.u8()?;
-                            streams.push(JoinStream { name, context });
-                        }
-                        blr::RELATION2 => {
-                            let name = self.counted_name()?;
-                            let _alias = self.counted_name()?;
-                            let context = self.u8()?;
-                            streams.push(JoinStream { name, context });
-                        }
-                        other => {
-                            return Err(format!("join stream verb {} unconverted", other))
-                        }
-                    }
-                }
-                let mut on = None;
-                let mut kind = JoinKind::Inner;
-                loop {
-                    match self.u8()? {
-                        blr::BOOLEAN => on = Some(self.boolean()?),
-                        blr::JOIN_TYPE => {
-                            kind = match self.u8()? {
-                                blr::LEFT => JoinKind::Left,
-                                blr::RIGHT => JoinKind::Right,
-                                blr::FULL => JoinKind::Full,
-                                other => {
-                                    return Err(format!("join type {} unconverted", other))
-                                }
-                            };
-                        }
-                        blr::END => break,
-                        other => {
-                            return Err(format!("join clause {} unconverted", other))
-                        }
-                    }
-                }
-                if kind != JoinKind::Inner && streams.len() != 2 {
-                    return Err("outer join over more than two streams unconverted".into());
-                }
-                Stream::Join { streams, kind, on }
-            }
+            blr::RS_STREAM => self.rs_stream()?,
             blr::RSE => {
                 // a derived table: an rse standing in the stream slot
                 Stream::Derived(Box::new(self.rse_body()?))
@@ -527,6 +547,7 @@ impl<'a> P<'a> {
         let mut first = None;
         let mut skip = None;
         let mut project = Vec::new();
+        let mut plan_indices = Vec::new();
         loop {
             match self.u8()? {
                 blr::BOOLEAN => boolean = Some(self.boolean()?),
@@ -536,6 +557,39 @@ impl<'a> P<'a> {
                     let n = self.u8()? as usize;
                     for _ in 0..n {
                         project.push(self.expr()?);
+                    }
+                }
+                blr::PLAN => {
+                    // blr_retrieve { the stream re-emitted, then
+                    // blr_sequential or blr_indices + counted names }
+                    if self.u8()? != blr::RETRIEVE {
+                        return Err("plan clause without blr_retrieve unconverted".into());
+                    }
+                    match self.u8()? {
+                        blr::RELATION => {
+                            let _name = self.counted_name()?;
+                            let _ctx = self.u8()?;
+                        }
+                        blr::RELATION2 => {
+                            let _name = self.counted_name()?;
+                            let _alias = self.counted_name()?;
+                            let _ctx = self.u8()?;
+                        }
+                        other => {
+                            return Err(format!("plan stream verb {} unconverted", other))
+                        }
+                    }
+                    match self.u8()? {
+                        blr::SEQUENTIAL => {}
+                        blr::INDICES => {
+                            let n = self.u8()? as usize;
+                            for _ in 0..n {
+                                plan_indices.push(self.counted_name()?);
+                            }
+                        }
+                        other => {
+                            return Err(format!("plan access {} unconverted", other))
+                        }
                     }
                 }
                 blr::SORT => {
@@ -555,7 +609,16 @@ impl<'a> P<'a> {
                 other => return Err(format!("rse clause {} unconverted", other)),
             }
         }
-        Ok(Rse { stream, boolean, sort, first, skip, project, singular: false })
+        Ok(Rse {
+            stream,
+            boolean,
+            sort,
+            first,
+            skip,
+            project,
+            plan_indices,
+            singular: false,
+        })
     }
 
     fn stmt(&mut self) -> Result<Stmt, String> {
@@ -858,17 +921,27 @@ impl<'a> Exec<'a> {
     /// for a scan, one per joined stream for a join.
     fn open_rse(&mut self, rse: &Rse) -> Result<Vec<Vec<StreamFrame>>, String> {
         let mut bindings: Vec<Vec<StreamFrame>> = match &rse.stream {
-            Stream::Relation { name, context } => self
-                .scan_relation(name)?
-                .into_iter()
-                .map(|row| {
-                    vec![StreamFrame {
-                        context: *context,
-                        relation: Some(name.clone()),
-                        row,
-                    }]
-                })
-                .collect(),
+            Stream::Relation { name, context } => {
+                let rows = if rse.plan_indices.is_empty() {
+                    self.scan_relation(name)?
+                } else {
+                    // PLAN (T INDEX (...)): the BitmapTableScan -
+                    // the B-tree walk yields record numbers, the
+                    // records fetch by number, visibility decided on
+                    // the record itself (the index only says where
+                    // records MIGHT be)
+                    self.scan_relation_bitmap(name, &rse.plan_indices)?
+                };
+                rows.into_iter()
+                    .map(|row| {
+                        vec![StreamFrame {
+                            context: *context,
+                            relation: Some(name.clone()),
+                            row,
+                        }]
+                    })
+                    .collect()
+            }
             Stream::Aggregate(agg) => self
                 .open_aggregate(agg)?
                 .into_iter()
@@ -879,20 +952,17 @@ impl<'a> Exec<'a> {
             Stream::Join { streams, kind, on } => {
                 match kind {
                     JoinKind::Inner => {
-                        // NestedLoopJoin: the cartesian product left
-                        // to right, the ON boolean keeping TRUE
+                        // NestedLoopJoin over SOURCES - each a
+                        // relation or a nested join whose bindings
+                        // splice in whole (chains left-nest)
                         let mut acc: Vec<Vec<StreamFrame>> = vec![Vec::new()];
-                        for js in streams {
-                            let rows = self.scan_relation(&js.name)?;
+                        for src in streams {
+                            let side = self.open_source(src)?;
                             let mut next = Vec::new();
                             for b in &acc {
-                                for row in &rows {
+                                for sb in &side {
                                     let mut nb = b.clone();
-                                    nb.push(StreamFrame {
-                                        context: js.context,
-                                        relation: Some(js.name.clone()),
-                                        row: row.clone(),
-                                    });
+                                    nb.extend(sb.iter().cloned());
                                     next.push(nb);
                                 }
                             }
@@ -914,26 +984,21 @@ impl<'a> Exec<'a> {
                             }
                         }
                     }
-                    // outer joins: preserved-side rows with no ON
-                    // match emit once, the other side's frame an
-                    // EMPTY row - every field of it reads NULL (the
-                    // engine's null-padded record)
+                    // outer joins: preserved-side bindings with no ON
+                    // match emit once, the other side's frames EMPTY
+                    // rows - every field of them reads NULL
                     JoinKind::Left | JoinKind::Right | JoinKind::Full => {
-                        let (a, b_) = (&streams[0], &streams[1]);
-                        let rows_a = self.scan_relation(&a.name)?;
-                        let rows_b = self.scan_relation(&b_.name)?;
-                        let frame = |js: &JoinStream, row: Vec<Value>| StreamFrame {
-                            context: js.context,
-                            relation: Some(js.name.clone()),
-                            row,
-                        };
+                        let side_a = self.open_source(&streams[0])?;
+                        let side_b = self.open_source(&streams[1])?;
+                        let pad_a = padding_frames(&streams[0]);
+                        let pad_b = padding_frames(&streams[1]);
                         let mut out = Vec::new();
-                        let mut b_matched = vec![false; rows_b.len()];
-                        for ra in &rows_a {
+                        let mut b_matched = vec![false; side_b.len()];
+                        for ba in &side_a {
                             let mut hit = false;
-                            for (bi, rb) in rows_b.iter().enumerate() {
-                                let binding =
-                                    vec![frame(a, ra.clone()), frame(b_, rb.clone())];
+                            for (bi, bb) in side_b.iter().enumerate() {
+                                let mut binding = ba.clone();
+                                binding.extend(bb.iter().cloned());
                                 let keep = match on {
                                     None => Some(true),
                                     Some(cond) => self
@@ -946,16 +1011,17 @@ impl<'a> Exec<'a> {
                                 }
                             }
                             if !hit && matches!(kind, JoinKind::Left | JoinKind::Full) {
-                                out.push(vec![frame(a, ra.clone()), frame(b_, Vec::new())]);
+                                let mut binding = ba.clone();
+                                binding.extend(pad_b.iter().cloned());
+                                out.push(binding);
                             }
                         }
                         if matches!(kind, JoinKind::Right | JoinKind::Full) {
-                            for (bi, rb) in rows_b.iter().enumerate() {
+                            for (bi, bb) in side_b.iter().enumerate() {
                                 if !b_matched[bi] {
-                                    out.push(vec![
-                                        frame(a, Vec::new()),
-                                        frame(b_, rb.clone()),
-                                    ]);
+                                    let mut binding = pad_a.clone();
+                                    binding.extend(bb.iter().cloned());
+                                    out.push(binding);
                                 }
                             }
                         }
@@ -1030,6 +1096,123 @@ impl<'a> Exec<'a> {
             bindings.truncate(n);
         }
         Ok(bindings)
+    }
+
+    /// One join source's bindings: a relation scans, a nested join
+    /// recurses (the chain's left-nested inner node).
+    fn open_source(&mut self, src: &JoinSource) -> Result<Vec<Vec<StreamFrame>>, String> {
+        match src {
+            JoinSource::Rel(js) => Ok(self
+                .scan_relation(&js.name)?
+                .into_iter()
+                .map(|row| {
+                    vec![StreamFrame {
+                        context: js.context,
+                        relation: Some(js.name.clone()),
+                        row,
+                    }]
+                })
+                .collect()),
+            JoinSource::Nested(inner) => {
+                let rse = Rse {
+                    stream: (**inner).clone(),
+                    boolean: None,
+                    sort: Vec::new(),
+                    first: None,
+                    skip: None,
+                    project: Vec::new(),
+                    plan_indices: Vec::new(),
+                    singular: false,
+                };
+                self.open_rse(&rse)
+            }
+        }
+    }
+
+    /// The BitmapTableScan: walk the named indexes' leaves for record
+    /// numbers, then fetch the visible rows those numbers name -
+    /// index pages say where records MIGHT be; visibility is decided
+    /// on the record itself (VIO_get through visible_rows).
+    fn scan_relation_bitmap(
+        &mut self,
+        name: &str,
+        indices: &[String],
+    ) -> Result<Vec<Vec<Value>>, String> {
+        let rel = resolve_relation(self.file, self.page_size, name)
+            .ok_or_else(|| format!("relation {} not found", name))?;
+        let mut bitmap = std::collections::BTreeSet::new();
+        for iname in indices {
+            let id = self.index_id_by_name(name, iname)?;
+            let leaves =
+                fire_crab_ods::walk_index_leaves(self.file, self.page_size, rel, id)
+                    .ok_or_else(|| format!("index {} has no tree", iname))?;
+            for (_, recno) in leaves {
+                bitmap.insert(recno);
+            }
+        }
+        let formats = fire_crab_ods::relation_formats(self.file, self.page_size, rel);
+        let (_, descs) = formats
+            .iter()
+            .max_by_key(|(n, _)| *n)
+            .ok_or("relation has no format")?;
+        let tips = TipChain::read(self.file, self.page_size)
+            .ok_or("cannot read transaction inventory")?;
+        Ok(visible_rows(self.file, self.page_size, rel, descs, &tips)
+            .into_iter()
+            .filter(|vr| bitmap.contains(&vr.recno))
+            .map(|vr| vr.values)
+            .collect())
+    }
+
+    /// RDB$INDICES: the named index's 0-based slot in the relation's
+    /// index root (RDB$INDEX_ID is 1-based in the catalog).
+    fn index_id_by_name(&self, table: &str, index: &str) -> Result<u8, String> {
+        let rel = resolve_relation(self.file, self.page_size, "RDB$INDICES")
+            .ok_or("no RDB$INDICES")?;
+        let formats =
+            fire_crab_ods::system_relation_formats(self.file, self.page_size, "RDB$INDICES")
+                .ok_or("no RDB$INDICES format")?;
+        let (_, descs) = formats
+            .iter()
+            .max_by_key(|(n, _)| *n)
+            .ok_or("empty format")?;
+        let cols = relation_columns(self.file, self.page_size, "RDB$INDICES");
+        let fid = |n: &str| {
+            cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize)
+        };
+        let name_f = fid("RDB$INDEX_NAME").ok_or("no RDB$INDEX_NAME")?;
+        let relname_f = fid("RDB$RELATION_NAME").ok_or("no RDB$RELATION_NAME")?;
+        let id_f = fid("RDB$INDEX_ID").ok_or("no RDB$INDEX_ID")?;
+        for dp_no in
+            fire_crab_ods::relation_data_pages(self.file, self.page_size, rel)
+        {
+            let start = dp_no as usize * self.page_size;
+            let Some(dp) = self
+                .file
+                .get(start..start + self.page_size)
+                .and_then(fire_crab_ods::DataPage::decode)
+            else {
+                continue;
+            };
+            for r in dp.records() {
+                if !r.is_primary_record() {
+                    continue;
+                }
+                let Some(image) = r.image() else { continue };
+                let values = fire_crab_ods::decode_record(&image, descs);
+                let (Some(Value::Text(iname)), Some(Value::Text(rname))) =
+                    (values.get(name_f), values.get(relname_f))
+                else {
+                    continue;
+                };
+                if iname.trim_end() == index && rname.trim_end() == table {
+                    if let Some(Value::Int(id)) = values.get(id_f) {
+                        return Ok((*id - 1) as u8);
+                    }
+                }
+            }
+        }
+        Err(format!("index {} not found on {}", index, table))
     }
 
     /// The committed-visibility scan of one relation.
@@ -1354,6 +1537,29 @@ impl<'a> Exec<'a> {
                 Some(matches!(self.eval(e)?, Value::Null))
             }
         })
+    }
+}
+
+/// The empty frames an outer join's unmatched side stands on - one
+/// per context the side binds; every field read off them is NULL.
+fn padding_frames(src: &JoinSource) -> Vec<StreamFrame> {
+    match src {
+        JoinSource::Rel(js) => vec![StreamFrame {
+            context: js.context,
+            relation: Some(js.name.clone()),
+            row: Vec::new(),
+        }],
+        JoinSource::Nested(inner) => match &**inner {
+            Stream::Join { streams, .. } => {
+                streams.iter().flat_map(padding_frames).collect()
+            }
+            Stream::Relation { name, context } => vec![StreamFrame {
+                context: *context,
+                relation: Some(name.clone()),
+                row: Vec::new(),
+            }],
+            _ => Vec::new(),
+        },
     }
 }
 
