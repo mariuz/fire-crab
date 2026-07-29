@@ -8,6 +8,7 @@ description = "Page cache and the careful-write precedence graph: the conversion
 
 [dependencies]
 fire-crab-ods = { path = "../ods" }
+fire-crab-blb = { path = "../blb" }
 
 [[bin]]
 name = "fccch"

@@ -3814,6 +3814,19 @@ verifies.
 
 ## The blob levels: storage read and written across the boundary
 
+(Slice 3 added the GC differential and the crash workload. The
+engine's own sweep - gfix -sweep, the collector that already blesses
+fire-crab's record chains - now collects fcblb-written BLOBS when
+their rows die: validation silent, survivors intact through both
+readers, and the teeth count PIP free BITS, which rose by exactly
+the dead blobs' fifty pages. The counter at pip+24 proved unreliable
+for this; the bitmap is the allocation truth. And the careful-write
+crash matrix gained a blob workload: nine blob pages riding AHEAD of
+the data pages whose records name them - the blob-before-data edge
+under real weight at last - all fifteen prefixes engine-valid.)
+
+
+
 fire-crab-blb converts src/jrd/blb.cpp's on-disk addressing - blob
 headers, blob pages, and the three address levels - and its gate
 crosses the engine boundary in BOTH directions, so a shared wrong

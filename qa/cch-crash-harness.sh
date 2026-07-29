@@ -53,6 +53,7 @@ EOF
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || { echo "FAIL create idx"; exit 1; }
 CREATE DATABASE '$DBI' USER '$U' PASSWORD '$P' PAGE_SIZE 4096;
 CREATE TABLE T (NAME CHAR(120));
+CREATE TABLE TB (C BLOB SUB_TYPE TEXT);
 CREATE INDEX IDX_T_NAME ON T (NAME);
 COMMIT;
 INSERT INTO T VALUES ('committed-1');
@@ -122,5 +123,15 @@ run_workload() { # <db> <workload> <n> <rows-after-full>
 run_workload "$DB" insert 120 122
 run_workload "$DBI" indexed 120 122
 run_workload "$DBI" delete 2 0
+# the blob workload counts TB's rows, not T's
+rows_of() {
+    "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 <<'SQL' | tr -s ' 
+	' ' ' | sed 's/^ *//; s/ *$//'
+SET HEADING OFF;
+SELECT COUNT(*) FROM TB;
+SQL
+}
+ROWS_BEFORE=0
+run_workload "$DBI" blob 3 3
 
 exit $fail

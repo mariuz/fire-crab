@@ -185,12 +185,20 @@ assembled content equals the source files, byte counts and both ends.
 The pre-existing `qa/serve-real-blob.sh` differential stays green on
 the swapped reader.
 
+## Slice 3: the sweep and the crash matrix
+
+Both leading roadmap items landed. **Blob GC** (`qa/blb-gc.sh`): the
+ENGINE's own sweep over a fire-crab-written file — two deleted rows'
+level-1 blobs collected, validation silent, survivors intact through
+both readers, and the PIP free-bit count rising by exactly the dead
+blobs' pages (the bitmap, not the unreliable pip_used counter, is
+the allocation truth). **The crash workload** (`fccch crash-matrix
+... blob`): level-1 blobs through this crate's own creation path in
+the careful-write matrix — fourteen writes with nine blob pages
+riding AHEAD of the data pages whose records name them, all fifteen
+prefixes engine-valid, the naive order breaking at twelve.
+
 ## Roadmap
 
-1. **Blob GC** — when a record version dies, its blob dies with it;
-   `gfix -sweep` as the oracle, as with record chains.
-2. **Careful-write edges** — blob pages before the blh that names
-   them, the `fire-crab-cch` graph's blob rule exercised by a real
-   blob workload in the crash matrix.
-3. **Stream-blob creation** and the `isc_bpb` parameter surface
+1. **Stream-blob creation** and the `isc_bpb` parameter surface
    (requested type/charset transliteration).

@@ -7,7 +7,11 @@
 //! B-tree maintenance on T's index - btree pages join the ensemble),
 //! `delete` (delete n committed rows - version-chain stubs, TIP and
 //! header; the commit flip still goes LAST, so every interrupted
-//! prefix answers the ORIGINAL rows).
+//! prefix answers the ORIGINAL rows), `blob` (n rows into TB, each
+//! referencing a fresh LEVEL-1 blob written through fire-crab-blb -
+//! blob pages join the ensemble, and the blob-before-data edge
+//! carries the weight: a record's bid must never name a blob whose
+//! pages are not on disk).
 //!
 //! Performs a real multi-page operation on a copy of the database -
 //! `nrows` inserts through `fire_crab_ods::dml`, sized to grow the
@@ -139,6 +143,51 @@ fn main() {
                             &mut after, page_size, rel, *id, &key, recno, false,
                         )?;
                     }
+                }
+            }
+            "blob" => {
+                // n rows into TB (one BLOB column), each referencing
+                // a fresh level-1 blob - fire-crab-blb's own path
+                let brel = resolve_relation(&before, page_size, "TB")
+                    .ok_or("blob workload needs table TB")?;
+                let bformats = relation_formats(&before, page_size, brel);
+                let (bfmt, bdescs) = bformats
+                    .iter()
+                    .max_by_key(|(no, _)| *no)
+                    .ok_or("TB has no format")?;
+                let bcols = relation_columns(&before, page_size, "TB");
+                let bcol = bcols.first().ok_or("TB has no columns")?;
+                let bd = bdescs
+                    .get(bcol.field_id as usize)
+                    .ok_or("no descriptor for the blob column")?;
+                let bfmt_length = bdescs
+                    .iter()
+                    .map(|d| d.offset as usize + d.length as usize)
+                    .max()
+                    .unwrap_or(0);
+                for i in 0..n {
+                    // ~20 KB per blob: comfortably level 1
+                    let text: Vec<u8> = format!("blob-{:04}-", i)
+                        .into_bytes()
+                        .into_iter()
+                        .cycle()
+                        .take(20000)
+                        .collect();
+                    let segments: Vec<Vec<u8>> =
+                        text.chunks(4000).map(|c| c.to_vec()).collect();
+                    let recno = fire_crab_blb::create_blob(
+                        &mut after, page_size, brel, &segments, 1, 4,
+                    )?;
+                    let mut image = vec![0u8; bfmt_length];
+                    let at = bd.offset as usize;
+                    image[at..at + 2].copy_from_slice(&brel.to_le_bytes());
+                    image[at + 2] = 0;
+                    image[at + 3] = (recno >> 32) as u8;
+                    image[at + 4..at + 8]
+                        .copy_from_slice(&(recno as u32).to_le_bytes());
+                    fire_crab_ods::insert_record(
+                        &mut after, page_size, brel, *bfmt, &image,
+                    )?;
                 }
             }
             "delete" => {

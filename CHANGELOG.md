@@ -13,6 +13,31 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-blb slice 3: blob GC and the blob crash workload
+
+### Converted
+- **The blob GC differential** (`qa/blb-gc.sh`): fcblb writes a
+  level-0 and three level-1 blobs with their records; the ENGINE
+  deletes two rows, commits, and runs its own garbage collector
+  (`gfix -sweep`) over the fire-crab-written file. The dead rows'
+  blobs die with them: validation silent, the survivors read in
+  full through BOTH readers — and the TEETH count PIP free BITS,
+  which rose by exactly the dead blobs' fifty pages. (A sweep that
+  "worked" but freed nothing would pass a validity-only check; and
+  the pip_used counter proved unreliable for this — the BITMAP is
+  the allocation truth.)
+- **The blob crash workload** (`fccch crash-matrix ... blob`): rows
+  referencing fresh level-1 blobs written through fire-crab-blb's
+  own path. Fourteen writes — header, NINE blob pages, data, pip,
+  pointer, tip — with the blob-before-data edge finally carrying
+  real weight: a record's bid never names a blob whose pages are
+  not on disk. All fifteen careful prefixes engine-valid; the
+  naive order breaks at twelve.
+
+### Guarded
+- Stream-blob creation and the bpb surface remain named. Crash
+  harness now FOUR workloads; 270 workspace tests.
+
 ## 2026-07-29 — fire-crab-exe slice 14: EXECUTE PROCEDURE adopted, runtime errors surfaced
 
 ### Converted
