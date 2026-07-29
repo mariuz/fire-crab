@@ -13,6 +13,31 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-dsql slice 29: subqueries in bodies, aliased AS CURSOR
+
+### Converted
+- **Subqueries in body statements** (flip thirty-two — the second
+  slice-7 refusal to fall in two slices): EXISTS/SINGULAR,
+  IN (SELECT)/ANY/ALL and scalar subselects work in body WHEREs and
+  assignments. The whole view-compiler subquery machinery carried
+  over on TWO changes: the subquery stream takes the NEXT context
+  id in the statement's numbering (`si + base` — the view formula
+  was this law at base 1 all along), and the enclosing statement's
+  stream stays visible to QUALIFIED names (a `host` slot in the
+  field resolver — probed: an EXISTS correlated on the FOR's table
+  by name). A scalar subselect in an assignment claims ctx 0.
+- **Aliased AS CURSOR** (flip thirty-three): the cursor name pairs
+  with the table ALIAS — `"CU" "E"` — the DECLARE CURSOR law; in a
+  subroutine the same string rides relation3's alias slot (battery,
+  by composition).
+
+### Guarded
+- Aggregate scalar subselects (`(SELECT MAX(..) ...)` — transcript
+  in hand), joins/comma-FROM inside subqueries, subqueries in ON
+  clauses. Gate: `qa/dsql-proc-blr.sh` grew to 170 checks (9
+  fresh — among them NOT EXISTS, > ALL, IF (EXISTS ...) and
+  back-to-back scalar subselects); 305 unit byte-pins.
+
 ## 2026-07-29 — fire-crab-dsql slice 28: aliased streams, subroutines in triggers
 
 ### Converted

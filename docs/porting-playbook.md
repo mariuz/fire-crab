@@ -307,6 +307,11 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # a formula probed in ONE regime may BE the general law: the
+    # view subquery ctx (si + 1) was next-id-at-base all along -
+    # write formulas in terms of the parser's base/offsets, and a
+    # scope hole (outer refs from subqueries) may need one SLOT, not
+    # a scope system: host = the enclosing statement's stream
     # the OLDEST refusals get cheap: an alias guard written in
     # slice 7 fell to three probes in slice 28 because every law it
     # feared (quoted-alias emission, qualified resolution, the

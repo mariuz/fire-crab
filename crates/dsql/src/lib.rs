@@ -908,6 +908,9 @@ struct P<'a> {
     in_sub: bool,
     /// a SUSPEND was parsed - the subproc_decl's selectable flag
     saw_suspend: bool,
+    /// inside a body-statement SUBQUERY: the enclosing statement's
+    /// stream index - visible to qualified names (probed)
+    host: Option<usize>,
     /// compiled subroutine declaration blobs, spliced in source order
     sub_decls: Vec<Vec<u8>>,
     /// DECLAREd sub-procedures in scope: (name, ins, outs)
@@ -954,6 +957,7 @@ impl<'a> P<'a> {
             in_func: false,
             in_sub: false,
             saw_suspend: false,
+            host: None,
             sub_decls: Vec::new(),
             sub_procs: Vec::new(),
             sub_funcs: Vec::new(),
@@ -1004,6 +1008,9 @@ impl<'a> P<'a> {
                     .iter()
                     .take(n_outer)
                     .position(hit)
+                    .or_else(|| {
+                        self.host.filter(|&hi| hit(&self.streams[hi]))
+                    })
                     .or_else(|| {
                         self.sub
                             .filter(|&si| hit(&self.streams[si]))
@@ -1236,15 +1243,20 @@ impl<'a> P<'a> {
         if !self.kw("FROM") {
             return None;
         }
-        if self.base != 1 {
-            return None; // subqueries in procedure bodies: unprobed
-        }
         let stream = self.stream_item()?;
         self.streams.push(stream.clone());
         let si = self.streams.len() - 1;
-        let ctx = (si + 1) as u8;
-        // the subquery scope: bare names bind to ITS stream
+        // the subquery stream takes the NEXT context id in the
+        // statement's numbering - view and body alike (probed: a
+        // body FOR's EXISTS put its stream at ctx 1 over the FOR's 0)
+        let ctx = si as u8 + self.base;
+        // the subquery scope: bare names bind to ITS stream; the
+        // ENCLOSING statement's stream stays visible to QUALIFIED
+        // names (probed: the subquery WHERE correlated on the FOR's
+        // table by name)
         let saved = self.sub.replace(si);
+        let saved_host = self.host;
+        self.host = saved;
         let col = match col {
             None => None,
             Some((q, n)) => Some(self.field(q.as_deref(), &n)?),
@@ -1255,6 +1267,7 @@ impl<'a> P<'a> {
             None
         };
         self.sub = saved;
+        self.host = saved_host;
         if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
             return None; // joins, comma-FROM etc. in a subquery: unconverted
         }
@@ -2433,6 +2446,7 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
         in_func: false,
         in_sub: false,
         saw_suspend: false,
+        host: None,
         sub_decls: Vec::new(),
         sub_procs: Vec::new(),
         sub_funcs: Vec::new(),
@@ -4086,8 +4100,14 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                     out.push(f.stream.name.len() as u8);
                     out.extend_from_slice(f.stream.name.as_bytes());
                 }
-                let alias =
-                    format!("\"{}\" \"PUBLIC\".\"{}\"", cn, f.stream.name);
+                // with a table alias the cursor name pairs with IT -
+                // the DECLARE CURSOR law (probed)
+                let alias = match &f.stream.alias {
+                    Some(a) => format!("\"{}\" \"{}\"", cn, a),
+                    None => {
+                        format!("\"{}\" \"PUBLIC\".\"{}\"", cn, f.stream.name)
+                    }
+                };
                 out.push(alias.len() as u8);
                 out.extend_from_slice(alias.as_bytes());
                 out.push(f.ctx);
@@ -4489,13 +4509,7 @@ impl<'a> P<'a> {
             if !self.kw("CURSOR") || !is_for {
                 return None;
             }
-            // an ALIASED stream under AS CURSOR: the alias string's
-            // shape is unprobed - refuse
-            if aggregate
-                || first.is_some()
-                || skip.is_some()
-                || !sort.is_empty()
-                || stream.alias.is_some()
+            if aggregate || first.is_some() || skip.is_some() || !sort.is_empty()
             {
                 return None;
             }
@@ -6326,6 +6340,7 @@ pub fn compile_default(sql: &str) -> Option<Vec<u8>> {
         in_func: false,
         in_sub: false,
         saw_suspend: false,
+        host: None,
         sub_decls: Vec::new(),
         sub_procs: Vec::new(),
         sub_funcs: Vec::new(),
@@ -6402,6 +6417,7 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
         in_func: false,
         in_sub: false,
         saw_suspend: false,
+        host: None,
         sub_decls: Vec::new(),
         sub_procs: Vec::new(),
         sub_funcs: Vec::new(),
@@ -6472,6 +6488,7 @@ pub fn compile_check(sql: &str) -> Option<Vec<u8>> {
         in_func: false,
         in_sub: false,
         saw_suspend: false,
+        host: None,
         sub_decls: Vec::new(),
         sub_procs: Vec::new(),
         sub_funcs: Vec::new(),
@@ -6545,6 +6562,7 @@ pub fn compile_validation(sql: &str) -> Option<Vec<u8>> {
         in_func: false,
         in_sub: false,
         saw_suspend: false,
+        host: None,
         sub_decls: Vec::new(),
         sub_procs: Vec::new(),
         sub_funcs: Vec::new(),
@@ -6640,6 +6658,7 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
         in_func: false,
         in_sub: false,
         saw_suspend: false,
+        host: None,
         sub_decls: Vec::new(),
         sub_procs: Vec::new(),
         sub_funcs: Vec::new(),
@@ -8346,6 +8365,37 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_twenty_nine_shapes_byte_for_byte() {
+        // SUBQUERIES in body statements (flip thirty-two - named
+        // unprobed in slice 7): the subquery stream takes the NEXT
+        // context id in the statement's numbering, and the enclosing
+        // statement's stream stays visible to QUALIFIED names -
+        // EXISTS correlated on the FOR's table:
+        pin_proc(
+            "CREATE PROCEDURE QY1 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT EMP_NO FROM EMPLOYEE WHERE EXISTS (SELECT 1 FROM T WHERE T.ID = EMPLOYEE.EMP_NO) INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014A08454D504C4F59454500473C43014A015401472F1701024944170006454D505F4E4FFFFF0201170006454D505F4E4F1A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... IN (SELECT): the ansi_any double-rse at body numbering
+        pin_proc(
+            "CREATE PROCEDURE QY2 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT EMP_NO FROM EMPLOYEE WHERE DEPT_ID IN (SELECT ID FROM T) INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014A08454D504C4F594545004797430143014A015401FF472F170007444550545F49441701024944FFFF0201170006454D505F4E4F1A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... a scalar subselect in an ASSIGNMENT: the subquery
+        // claims ctx 0 (no other streams in the statement)
+        pin_proc(
+            "CREATE PROCEDURE QY5 (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN R1 = (SELECT UA FROM U2 WHERE U2.UID = :P1); SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B11000202012B7F43014A02553200472F170003554944290000000100FF17000255412D1A00000E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // an ALIASED stream under AS CURSOR: the cursor name pairs
+        // with the ALIAS - "CU" "E" - the DECLARE CURSOR law (flip
+        // thirty-three)
+        pin_proc(
+            "CREATE PROCEDURE QY4 AS BEGIN FOR SELECT EMP_NO FROM EMPLOYEE E AS CURSOR CU DO UPDATE EMPLOYEE SET SALARY = 0 WHERE CURRENT OF CU; END",
+            "0502040101000700029B1100020211010743019208454D504C4F59454508224355222022452200FF020A0001D9010102011508000000000017010653414C415259FFFFFFFFFF0E010201150700000019010000FFFF4C",
+        );
+    }
+
+    #[test]
     fn subroutine_refusals() {
         for sql in [
             // derived tables inside subroutines: unprobed
@@ -8564,10 +8614,8 @@ mod tests {
             // INTO must name RETURNS parameters, one per column
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T INTO :NOPE DO SUSPEND; END",
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID, A FROM T INTO :R1 DO SUSPEND; END",
-            // subqueries inside procedure bodies: contexts unprobed
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM U2 WHERE U2.UID = T.ID) INTO :R1 DO SUSPEND; END",
-            // an ALIASED stream under AS CURSOR: unprobed alias string
-            "CREATE PROCEDURE X AS BEGIN FOR SELECT ID FROM T E AS CURSOR CU DO DELETE FROM T WHERE CURRENT OF CU; END",
+            // AGGREGATE scalar subselects: unprobed shape
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN R1 = (SELECT MAX(ID) FROM T); SUSPEND; END",
             // aliased positioned DML: unprobed
             "CREATE PROCEDURE X (P1 INTEGER) AS DECLARE CX CURSOR FOR (SELECT ID FROM T); BEGIN OPEN CX; FETCH CX; UPDATE T A SET ID = :P1 WHERE CURRENT OF CX; CLOSE CX; END",
         ] {

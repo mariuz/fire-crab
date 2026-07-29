@@ -4666,6 +4666,28 @@ WHEN, and a BLOCK as a handler's body nests blr_block again with no
 handler section of its own - the battery runs a handler block
 containing an EXIT.
 
+Slice 29 dropped the SECOND slice-7 refusal in two slices.
+Subqueries in body statements - EXISTS, SINGULAR, IN (SELECT),
+ANY/ALL, scalar subselects - were named unprobed when the
+procedure oracle opened, and the whole view-compiler machinery
+carried over on exactly TWO changes. One: the subquery stream
+takes the NEXT context id in the statement's numbering - the view
+formula (si + 1) was this law at base 1 all along, and one probe
+showed a body FOR's EXISTS putting its stream at ctx 1 over the
+FOR's 0. Two: the enclosing statement's stream stays visible to
+QUALIFIED names inside the subquery - a host slot in the field
+resolver, saved and restored around the subquery parse, probed on
+an EXISTS correlated on the FOR's table by name. A scalar
+subselect in an assignment claims ctx 0 - no other streams in the
+statement. The battery runs NOT EXISTS, > ALL under an UPDATE,
+IF (EXISTS ...) guarding a DELETE, and two scalar subselects
+back-to-back in one body. Aliased AS CURSOR closed the alias
+story: the cursor name pairs with the table ALIAS - "CU" "E", the
+DECLARE CURSOR law - and inside a subroutine the same string rides
+relation3's alias slot, proven by composition in the battery.
+Aggregate scalar subselects stay guarded with their transcript in
+hand.
+
 Slice 28 flipped one of the oldest refusals on the books. Aliased
 FOR streams were named unprobed back in slice 7 - twenty-one
 slices ago - and the flip cost three probes and two deleted
