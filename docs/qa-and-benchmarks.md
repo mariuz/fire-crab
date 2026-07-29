@@ -4666,6 +4666,24 @@ WHEN, and a BLOCK as a handler's body nests blr_block again with no
 handler section of its own - the battery runs a handler block
 containing an EXIT.
 
+Slice 36 closed two small doors and found one standing open.
+NTH_VALUE canonicalizes like its LAG/LEAD siblings - a FROM FIRST
+indicator, literal 0, appended as the third agg_function argument.
+Derived tables reached body FOR SELECTs on the view convention at
+body numbering: the inner rse sits in the stream slot with the
+"D" "PUBLIC"."U2" alias text, the inner WHERE inside it, the
+outer WHERE at the rse level, one shared context - pass-through
+column lists only, since a derived-column alias (SELECT UID AS X)
+needs an outer-to-inner name mapping the engine resolves through
+the derived list; guarded with its transcript. The open door:
+derived tables in SUBQUERIES had been compiling byte-identical
+since the subquery slice - stream_item could always return a
+derived stream, and nothing in the subquery path refused it - LIVE
+through composition with not a single covering test. A probe
+confirmed the bytes; a pin and a battery check now hold the door.
+An unplanned capability is still an untested one - inventory what
+your parsers ACCEPT, not just what you converted.
+
 Slice 35 completed the window story in two flips. The
 argument-taking functions - LAG, LEAD, FIRST_VALUE, LAST_VALUE -
 ride the same blr_agg_function verb with TRUE argument counts,

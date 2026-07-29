@@ -13,6 +13,30 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-dsql slice 36: NTH_VALUE, derived tables in bodies
+
+### Converted
+- **NTH_VALUE** (flip forty-four): canonicalizes like its LAG/LEAD
+  siblings — a FROM FIRST indicator (literal 0) appended as the
+  third `blr_agg_function` argument.
+- **Derived tables in body FOR SELECTs** (flip forty-five): the
+  view convention at body numbering — the inner rse in the stream
+  slot with alias text `"D" "PUBLIC"."U2"`, the inner WHERE inside
+  it, the outer WHERE at the rse level, ONE shared context.
+  Pass-through column lists only (a derived-column alias needs
+  outer-to-inner name mapping — guarded with the transcript).
+- **Derived tables in subqueries** — pinned: the shape was LIVE
+  through composition since the subquery slice (stream_item always
+  could return a derived stream), compiling byte-identical without
+  a single covering test until now.
+
+### Guarded
+- Derived-column aliases, derived streams beside aggregates/
+  windows/joins/cursors/locks, named windows (the WINDOW clause —
+  the engine's own placement rules resisted the probe). Gate:
+  `qa/dsql-proc-blr.sh` grew to 214 checks (6 fresh); 347 unit
+  byte-pins.
+
 ## 2026-07-29 — fire-crab-dsql slice 35: windowed argument functions, frame extents
 
 ### Converted

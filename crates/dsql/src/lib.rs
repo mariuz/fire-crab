@@ -4740,9 +4740,6 @@ impl<'a> P<'a> {
         };
         self.i = list_end + 1;
         let stream = self.stream_item()?;
-        if stream.derived.is_some() {
-            return None; // derived FOR streams: unprobed
-        }
         self.streams.push(stream.clone());
         let sidx = self.streams.len() - 1;
         let ctx = sidx as u8 + self.base;
@@ -4849,6 +4846,7 @@ impl<'a> P<'a> {
                             | "DENSE_RANK"
                             | "FIRST_VALUE"
                             | "LAST_VALUE"
+                            | "NTH_VALUE"
                             | "LAG"
                             | "LEAD"
                     ) && matches!(self.t.get(self.i + 1), Some(Tok::LParen)) =>
@@ -4880,6 +4878,14 @@ impl<'a> P<'a> {
                             if args.len() != 1 {
                                 return None;
                             }
+                        }
+                        "NTH_VALUE" => {
+                            // canonicalizes with a FROM FIRST
+                            // indicator - literal 0 (probed)
+                            if args.len() != 2 {
+                                return None;
+                            }
+                            args.push(Val::Int(0));
                         }
                         _ => {
                             // LAG/LEAD fill the canonical three
@@ -4987,6 +4993,17 @@ impl<'a> P<'a> {
         }
         let aggregate = has_aggs || grouped;
         let has_wins = items.iter().any(|it| matches!(it, Item::Win(..)));
+        // a DERIVED stream (probed pass-through at body numbering)
+        // beside aggregates, windows, joins, FIRST/SKIP: unprobed
+        if stream.derived.is_some()
+            && (aggregate
+                || has_wins
+                || !joins.is_empty()
+                || first.is_some()
+                || skip.is_some())
+        {
+            return None;
+        }
         // windows beside aggregates, joins, FIRST/SKIP or in the
         // singular form: unprobed
         if has_wins
@@ -5187,6 +5204,7 @@ impl<'a> P<'a> {
                 || !sort.is_empty()
                 || !joins.is_empty()
                 || has_wins
+                || stream.derived.is_some()
             {
                 return None;
             }
@@ -5232,6 +5250,7 @@ impl<'a> P<'a> {
                 || !sort.is_empty()
                 || !joins.is_empty()
                 || has_wins
+                || stream.derived.is_some()
             {
                 return None;
             }
@@ -9612,6 +9631,30 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_thirty_six_shapes_byte_for_byte() {
+        // NTH_VALUE canonicalizes with a FROM FIRST indicator -
+        // literal 0 as a third argument (flip forty-four)
+        pin_proc(
+            "CREATE PROCEDURE RF1 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT NTH_VALUE(UA, 2) OVER (ORDER BY UID) FROM U2 INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B110002021101074301C343014A02553200FF01C401004601481700035549444D01000000C7094E54485F56414C55450317000255411508000200000015080000000000FF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // DERIVED tables in body FOR SELECTs (flip forty-five): the
+        // view convention at body numbering - the inner rse in the
+        // stream slot, inner WHERE inside, outer WHERE at rse level,
+        // one shared context
+        pin_proc(
+            "CREATE PROCEDURE RF4 (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT UID FROM (SELECT UID FROM U2 WHERE UA > 0) D WHERE UID > :P1 INTO :R1 DO SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B1100020211010743014301920255321122442220225055424C4943222E22553222004731170002554115080000000000FF4731170003554944290000000100FF02011700035549441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... and a derived table in a SUBQUERY - live through
+        // composition since the subquery slice, pinned NOW
+        pin_proc(
+            "CREATE PROCEDURE RF5 RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM (SELECT UID FROM U2) D WHERE D.UID = T.ID) INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014A015400473C43014301920255321122442220225055424C4943222E2255322201FF472F1701035549441700024944FFFF020117000249441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+    }
+
+    #[test]
     fn window_refusals() {
         for sql in [
             // windows beside GROUP BY/aggregates: unprobed
@@ -9624,8 +9667,11 @@ mod tests {
             "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT UID, COUNT(*) OVER () FROM U2 ORDER BY UID INTO :R1, :R2 DO SUSPEND; END",
             // a frame DEMANDS an order (unprobed without one)
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT SUM(UA) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM U2 INTO :R1 DO SUSPEND; END",
-            // NTH_VALUE and the exclusion clauses: unprobed
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT NTH_VALUE(UA, 2) OVER (ORDER BY UID) FROM U2 INTO :R1 DO SUSPEND; END",
+            // named windows (the WINDOW clause): unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT UID, SUM(UA) OVER W FROM U2 WINDOW W AS (PARTITION BY UID) INTO :R1, :R2 DO SUSPEND; END",
+            // derived-column ALIASES in a derived table need the
+            // outer-name-to-inner-name mapping: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT D.X FROM (SELECT UID AS X FROM U2) D INTO :R1 DO SUSPEND; END",
         ] {
             assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
         }

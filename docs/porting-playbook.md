@@ -307,6 +307,10 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # an UNPLANNED capability is an UNTESTED one: composable parsers
+    # accept shapes nobody converted on purpose (derived tables in
+    # subqueries rode along for nine slices) - inventory what the
+    # grammar ACCEPTS and pin or refuse it, don't discover it later
     # a verb family may hold TWO generations: the framed window
     # re-encodes every v3 clause under subcodes and adds its own
     # terminator - when a feature was bolted on, expect the OLD
