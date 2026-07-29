@@ -4666,6 +4666,25 @@ WHEN, and a BLOCK as a handler's body nests blr_block again with no
 handler section of its own - the battery runs a handler block
 containing an EXIT.
 
+Slice 39 found that WITH is a spelling of something already
+converted. The engine INLINES a non-recursive cte as a DERIVED
+table: WITH W1 AS (SELECT UID AS X FROM U2 WHERE ...) SELECT X
+FROM W1 stores byte-for-byte the derived shape - the cte name in
+the relation2 alias slot, the column aliases translating through
+the recorded pairs, the inner WHERE inside the nested rse. The
+parser records the body's TOKEN SPAN at the WITH and expands it
+when the FROM reference names the cte - a jump-parse into the
+span, one cte referenced exactly once, recursion refusing because
+the expansion consumes the single use. Expression INSERT..SELECT
+made the FIFTIETH refusal to fall: source items are full value
+expressions at the source stream, through the same two-phase
+list-scan-then-rewind parse every select in the codebase uses.
+And GROUP BY expressions were probed and deliberately left: the
+expression rides the GROUP list, the map carries the BARE fields
+it uses, and the select items are REBUILT over the mapped fids -
+machinery the HAVING rewriter almost has, named with its
+transcript for a future slice.
+
 Slice 38 cashed one transcript and flipped one of the oldest
 refusals left. UNION in body FOR SELECTs: blr_union claims the
 statement's FIRST slot - which forces a parser trick, since branch

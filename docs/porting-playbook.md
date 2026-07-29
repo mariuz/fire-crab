@@ -307,6 +307,11 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # a NEW keyword may be an OLD shape's spelling: WITH ctes
+    # inline as the derived tables you already emit - before
+    # building machinery for a feature, probe whether the reference
+    # compiler REDUCES it to one you have; a token-span jump-parse
+    # expands a definition at its use site without re-architecting
     # when a wrapper claims the FIRST slot (union before its
     # branches), a LOOKAHEAD reservation beats re-parsing: scan for
     # the keyword at depth 0, reserve, then parse normally; and an

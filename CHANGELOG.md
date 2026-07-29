@@ -13,6 +13,33 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-dsql slice 39: WITH ctes, expression INSERT..SELECT
+
+### Converted
+- **WITH ctes** (flip forty-nine): the engine INLINES a
+  non-recursive cte as a DERIVED table — the cte name becomes the
+  relation2 alias (`"W1" "PUBLIC"."U2"`), column aliases translate,
+  inner WHERE inside, exactly the derived machinery by another
+  syntax. The parser records the body's token SPAN at WITH and
+  expands it at the FROM reference — one cte, referenced exactly
+  once (recursion refuses because the expansion consumes the single
+  use). Works in the singular SELECT INTO and FOR loops.
+- **Expression INSERT..SELECT** (flip fifty — the FIFTIETH refusal
+  to fall): source items are FULL value expressions at the source
+  stream, via the same two-phase list parse every select uses.
+
+### Probed, unconverted
+- **GROUP BY expressions**: the expression rides the group list but
+  the map carries the BARE fields, and select items are REBUILT
+  over the mapped fids — a named refusal with its transcript.
+
+### Guarded
+- GROUP BY expressions, multiple ctes, twice-referenced ctes,
+  unreferenced ctes, INSERT..SELECT over aggregates. Gate:
+  `qa/dsql-proc-blr.sh` grew to 232 checks (6 fresh — a
+  two-column cte, one correlated through EXISTS from the cte's
+  derived stream); 360 unit byte-pins.
+
 ## 2026-07-29 — fire-crab-dsql slice 38: body unions, INSERT..SELECT
 
 ### Converted

@@ -1010,6 +1010,10 @@ struct P<'a> {
     /// inside a body-statement SUBQUERY: the enclosing statement's
     /// stream index - visible to qualified names (probed)
     host: Option<usize>,
+    /// one WITH cte: (name, body token span start, end, used) - a
+    /// FROM reference expands it as a DERIVED table with the cte
+    /// name as alias (probed: the engine inlines exactly that)
+    cte: Option<(String, usize, usize, bool)>,
     /// compiled subroutine declaration blobs, spliced in source order
     sub_decls: Vec<Vec<u8>>,
     /// DECLAREd sub-procedures in scope: (name, ins, outs)
@@ -1057,6 +1061,7 @@ impl<'a> P<'a> {
             in_sub: false,
             saw_suspend: false,
             host: None,
+            cte: None,
             sub_decls: Vec::new(),
             sub_procs: Vec::new(),
             sub_funcs: Vec::new(),
@@ -1143,6 +1148,25 @@ impl<'a> P<'a> {
         {
             return self.derived_item();
         }
+        // a WITH cte referenced by name expands as a DERIVED table
+        // with the cte name as its alias (probed); one use only
+        if let Some((name, start, end, used)) = self.cte.clone() {
+            if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if *w == name)
+            {
+                if used {
+                    return None; // a second reference: unprobed
+                }
+                self.cte = Some((name.clone(), start, end, true));
+                let after = self.i + 1;
+                self.i = start;
+                let st = self.derived_body(name)?;
+                if self.i != end {
+                    return None;
+                }
+                self.i = after;
+                return Some(st);
+            }
+        }
         let Some(Tok::Ident(name)) = self.t.get(self.i) else {
             return None;
         };
@@ -1169,10 +1193,33 @@ impl<'a> P<'a> {
     /// fields need the context id) and popped for the caller to
     /// re-push at the same index.
     fn derived_item(&mut self) -> Option<Stream> {
+        self.i += 1; // (
+        let st = self.derived_body(String::new())?;
+        if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+            return None;
+        }
+        self.i += 1;
+        let Some(Tok::Ident(alias)) = self.t.get(self.i) else {
+            return None; // an alias-less derived table: unprobed
+        };
+        if is_keyword(alias) {
+            return None;
+        }
+        let alias = alias.clone();
+        self.i += 1;
+        Some(Stream {
+            alias: Some(alias),
+            ..st
+        })
+    }
+
+    /// The body of a derived table or a WITH cte: `SELECT cols FROM
+    /// tbl [WHERE ...]` - the resulting stream carries the given
+    /// alias and the recorded column pairs.
+    fn derived_body(&mut self, alias: String) -> Option<Stream> {
         if self.in_sub {
             return None; // derived tables in subroutines: unprobed
         }
-        self.i += 1; // (
         if !self.kw("SELECT") {
             return None;
         }
@@ -1236,21 +1283,9 @@ impl<'a> P<'a> {
         };
         self.sub = saved;
         self.streams.pop();
-        if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
-            return None;
-        }
-        self.i += 1;
-        let Some(Tok::Ident(alias)) = self.t.get(self.i) else {
-            return None; // an alias-less derived table: unprobed
-        };
-        if is_keyword(alias) {
-            return None;
-        }
-        let alias = alias.clone();
-        self.i += 1;
         Some(Stream {
             name,
-            alias: Some(alias),
+            alias: if alias.is_empty() { None } else { Some(alias) },
             derived: Some(Box::new(Derived { wher, cols })),
             sub: self.in_sub,
             cur: None,
@@ -2748,6 +2783,7 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
         in_sub: false,
         saw_suspend: false,
         host: None,
+        cte: None,
         sub_decls: Vec::new(),
         sub_procs: Vec::new(),
         sub_funcs: Vec::new(),
@@ -6421,6 +6457,45 @@ impl<'a> P<'a> {
         Some((part, ord, frame))
     }
 
+    /// WITH <name> AS ( ... ) - records the body's token span; the
+    /// FROM reference expands it as a derived table (probed). One
+    /// cte, referenced exactly once; recursion refuses because the
+    /// expansion consumes the single use.
+    fn parse_cte(&mut self) -> Option<()> {
+        let Some(Tok::Ident(name)) = self.t.get(self.i) else {
+            return None;
+        };
+        if is_keyword(name) {
+            return None;
+        }
+        let name = name.clone();
+        self.i += 1;
+        if !self.kw("AS") || !matches!(self.t.get(self.i), Some(Tok::LParen))
+        {
+            return None;
+        }
+        self.i += 1;
+        let start = self.i;
+        let mut depth = 0i32;
+        let mut j = self.i;
+        let end = loop {
+            match self.t.get(j)? {
+                Tok::LParen => depth += 1,
+                Tok::RParen => {
+                    if depth == 0 {
+                        break j;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+            j += 1;
+        };
+        self.cte = Some((name, start, end, false));
+        self.i = end + 1;
+        Some(())
+    }
+
     /// one trigger-body statement; self.i past any leading keyword
     fn trig_stmt(&mut self) -> Option<TrigStmt> {
         if self.kw("BEGIN") {
@@ -6610,14 +6685,39 @@ impl<'a> P<'a> {
                     }
                 });
             }
+            // FOR WITH cte AS (...) SELECT ... - the cte expands as
+            // a derived table at its FROM reference (probed)
+            if self.kw("WITH") {
+                self.parse_cte()?;
+            }
             if !self.kw("SELECT") {
                 return None;
             }
-            return self.select_stmt(true);
+            let r = self.select_stmt(true);
+            if let Some((.., used)) = self.cte.take() {
+                if !used {
+                    return None; // an unreferenced cte: unprobed
+                }
+            }
+            return r;
         }
         if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "SELECT") {
             self.i += 1;
             return self.select_stmt(false);
+        }
+        if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "WITH") {
+            self.i += 1;
+            self.parse_cte()?;
+            if !self.kw("SELECT") {
+                return None;
+            }
+            let r = self.select_stmt(false);
+            if let Some((.., used)) = self.cte.take() {
+                if !used {
+                    return None;
+                }
+            }
+            return r;
         }
         if self.kw("EXECUTE") {
             // EXECUTE STATEMENT '<literal sql>' [INTO :v, ...]; -
@@ -7017,39 +7117,28 @@ impl<'a> P<'a> {
             // INSERT ... SELECT: a marks-stamped FOR loop over the
             // source rse - the source stream numbers FIRST (probed)
             if self.kw("SELECT") {
-                let mut raw: Vec<(Option<String>, String)> = Vec::new();
-                loop {
-                    let Some(Tok::Ident(a)) = self.t.get(self.i) else {
-                        return None;
-                    };
-                    if is_keyword(a) {
-                        return None;
-                    }
-                    let a = a.clone();
-                    self.i += 1;
-                    if matches!(self.t.get(self.i), Some(Tok::Dot)) {
-                        self.i += 1;
-                        let Some(Tok::Ident(b)) = self.t.get(self.i)
-                        else {
-                            return None;
-                        };
-                        raw.push((Some(a), b.clone()));
-                        self.i += 1;
-                    } else {
-                        raw.push((None, a));
-                    }
+                // two-phase: the source items are FULL value
+                // expressions at the source stream (probed) - scan
+                // to FROM, parse the stream, rewind for the items
+                let list_start = self.i;
+                let mut depth = 0i32;
+                let list_end = loop {
                     match self.t.get(self.i)? {
-                        Tok::Comma => self.i += 1,
-                        Tok::Ident(w) if w == "FROM" => {
+                        Tok::LParen => {
+                            depth += 1;
                             self.i += 1;
-                            break;
                         }
-                        _ => return None,
+                        Tok::RParen => {
+                            depth -= 1;
+                            self.i += 1;
+                        }
+                        Tok::Ident(w) if w == "FROM" && depth == 0 => {
+                            break self.i
+                        }
+                        _ => self.i += 1,
                     }
-                }
-                if raw.len() != cols.len() {
-                    return None;
-                }
+                };
+                self.i = list_end + 1;
                 let src = self.stream_item()?;
                 if src.derived.is_some() {
                     return None;
@@ -7057,11 +7146,24 @@ impl<'a> P<'a> {
                 self.streams.push(src.clone());
                 let src_idx = self.streams.len() - 1;
                 let src_ctx = src_idx as u8 + self.base;
+                let after_from = self.i;
+                self.i = list_start;
                 let saved = self.sub.replace(src_idx);
-                let mut vals = Vec::with_capacity(raw.len());
-                for (q, n) in &raw {
-                    vals.push(self.field(q.as_deref(), n)?);
+                let mut vals = Vec::new();
+                loop {
+                    vals.push(self.val()?);
+                    if self.i == list_end {
+                        break;
+                    }
+                    if !matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                        return None;
+                    }
+                    self.i += 1;
                 }
+                if vals.len() != cols.len() {
+                    return None;
+                }
+                self.i = after_from;
                 let wher = if self.kw("WHERE") {
                     Some(self.bool_or()?)
                 } else {
@@ -7715,6 +7817,7 @@ pub fn compile_default(sql: &str) -> Option<Vec<u8>> {
         in_sub: false,
         saw_suspend: false,
         host: None,
+        cte: None,
         sub_decls: Vec::new(),
         sub_procs: Vec::new(),
         sub_funcs: Vec::new(),
@@ -7793,6 +7896,7 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
         in_sub: false,
         saw_suspend: false,
         host: None,
+        cte: None,
         sub_decls: Vec::new(),
         sub_procs: Vec::new(),
         sub_funcs: Vec::new(),
@@ -7866,6 +7970,7 @@ pub fn compile_check(sql: &str) -> Option<Vec<u8>> {
         in_sub: false,
         saw_suspend: false,
         host: None,
+        cte: None,
         sub_decls: Vec::new(),
         sub_procs: Vec::new(),
         sub_funcs: Vec::new(),
@@ -7940,6 +8045,7 @@ pub fn compile_validation(sql: &str) -> Option<Vec<u8>> {
         in_sub: false,
         saw_suspend: false,
         host: None,
+        cte: None,
         sub_decls: Vec::new(),
         sub_procs: Vec::new(),
         sub_funcs: Vec::new(),
@@ -8038,6 +8144,7 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
         in_sub: false,
         saw_suspend: false,
         host: None,
+        cte: None,
         sub_decls: Vec::new(),
         sub_procs: Vec::new(),
         sub_funcs: Vec::new(),
@@ -10047,6 +10154,45 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_thirty_nine_shapes_byte_for_byte() {
+        // WITH ctes inline as DERIVED tables - the cte name becomes
+        // the alias, column aliases translate (flip forty-nine)
+        pin_proc(
+            "CREATE PROCEDURE RI4 (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN WITH W1 AS (SELECT UID AS X FROM U2 WHERE UA > 0) SELECT X FROM W1 WHERE X > :P1 INTO :R1; SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B11000202077F4301430192025532122257312220225055424C4943222E22553222004731170002554115080000000000FF4731170003554944290000000100FF02011700035549441A0000FF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... and in the FOR loop form with an ORDER BY at the
+        // shared context
+        pin_proc(
+            "CREATE PROCEDURE RI5 (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR WITH CW AS (SELECT ID FROM T WHERE ID > :P1) SELECT ID FROM CW ORDER BY ID INTO :R1 DO SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B1100020211010743014301920154112243572220225055424C4943222E2254220047311700024944290000000100FF4601481700024944FF020117000249441A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // INSERT..SELECT items are FULL expressions at the source
+        // stream (flip fifty)
+        pin_proc(
+            "CREATE PROCEDURE RI1 (P1 INTEGER) AS BEGIN INSERT INTO T (ID) SELECT UID * 2 + :P1 FROM U2; END",
+            "050204000200080007000401010007000C00029B1100020207D9010443014A02553200FF0F4A01540102012224170003554944150800020000002900000001001701024944FFFFFFFF0E010201150700000019010000FFFF4C",
+        );
+    }
+
+    #[test]
+    fn slice_thirty_nine_refusals() {
+        for sql in [
+            // GROUP BY expressions rebuild select items over the
+            // mapped FIELDS - probed, unconverted
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT UID + 0, COUNT(*) FROM U2 GROUP BY UID + 0 INTO :R1, :R2 DO SUSPEND; END",
+            // multiple ctes: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN WITH A1 AS (SELECT ID FROM T), A2 AS (SELECT UID FROM U2) SELECT ID FROM A1 INTO :R1; SUSPEND; END",
+            // a cte referenced twice: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN WITH A1 AS (SELECT ID FROM T) FOR SELECT ID FROM A1 UNION ALL SELECT ID FROM A1 INTO :R1 DO SUSPEND; END",
+            // an unreferenced cte: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN WITH A1 AS (SELECT ID FROM T) SELECT UID FROM U2 INTO :R1; SUSPEND; END",
+        ] {
+            assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
+        }
+    }
+
+    #[test]
     fn window_refusals() {
         for sql in [
             // windows beside GROUP BY/aggregates: unprobed
@@ -10207,8 +10353,8 @@ mod tests {
             "CREATE TRIGGER X FOR T BEFORE INSERT AS BEGIN INSERT INTO U2 VALUES (1); END",
             // column/value count mismatch is an engine error
             "CREATE TRIGGER X FOR T BEFORE INSERT AS BEGIN INSERT INTO U2 (UID) VALUES (1, 2); END",
-            // INSERT ... SELECT with expressions: unprobed
-            "CREATE TRIGGER X FOR T BEFORE INSERT AS BEGIN INSERT INTO U2 (UID) SELECT ID * 2 FROM T; END",
+            // INSERT ... SELECT over aggregates: unprobed
+            "CREATE TRIGGER X FOR T BEFORE INSERT AS BEGIN INSERT INTO U2 (UID) SELECT COUNT(*) FROM T; END",
         ] {
             assert!(compile_trigger(sql).is_none(), "{sql} was compiled");
         }
