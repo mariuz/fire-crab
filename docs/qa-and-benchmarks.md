@@ -4666,6 +4666,26 @@ WHEN, and a BLOCK as a handler's body nests blr_block again with no
 handler section of its own - the battery runs a handler block
 containing an EXIT.
 
+Slice 31 converted the infection it had guarded the day before.
+Every stream under a cursor's rse - subquery streams included -
+carries the cursor's concatenated alias: the cursor name paired
+with the stream's own alias ("CX" "X") or its schema-qualified
+name ("CX" "PUBLIC"."T"). The mechanism is a post-parse STAMP: a
+walk over the parsed boolean tree setting a cur slot on every
+subquery stream - necessary because an AS CURSOR name isn't known
+until AFTER its WHERE has parsed - and one emission branch reading
+it; inside subroutines relation3 takes the same string in its
+always-present alias slot, and all three cursor forms pinned
+byte-identical. The flip surfaced a companion bug: subselect's
+ON-clause guard (refuse when outer is unset) also fired during
+DECLARE sections, because body_compile set outer only before the
+statements - cursor declarations could never hold a subquery at
+all. outer now sets before the declares. DISTINCT aggregate
+scalars rode along: the dedicated COUNT/SUM/AVG verbs with MIN/MAX
+folding DISTINCT away - the slice-10 law reaching the
+scalar-subselect surface, contexts continuing across back-to-back
+scalars in one body.
+
 Slice 30 cashed the transcript slice 29 left on the table.
 Aggregate scalar subselects - (SELECT MAX(ID) FROM T) as a value -
 compile to via(singular, rse1(<aggregate>), fid(agg, 0), null)

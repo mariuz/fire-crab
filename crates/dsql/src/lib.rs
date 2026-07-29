@@ -648,6 +648,63 @@ struct SubQ {
     agg: Option<(u8, Option<Val>, u8)>,
 }
 
+/// Stamp every subquery stream under a cursor's rse with the cursor
+/// name - the concatenated-alias infection (probed). Recurses into
+/// the subqueries' own WHEREs.
+fn stamp_bool(b: &mut Bool, cn: &str) {
+    match b {
+        Bool::And(l, r) | Bool::Or(l, r) => {
+            stamp_bool(l, cn);
+            stamp_bool(r, cn);
+        }
+        Bool::Not(x) => stamp_bool(x, cn),
+        Bool::Cmp(_, a, c) | Bool::Like(a, c) => {
+            stamp_val(a, cn);
+            stamp_val(c, cn);
+        }
+        Bool::Missing(v) => stamp_val(v, cn),
+        Bool::Between(v, lo, hi) => {
+            stamp_val(v, cn);
+            stamp_val(lo, cn);
+            stamp_val(hi, cn);
+        }
+        Bool::InList(v, items) => {
+            stamp_val(v, cn);
+            for it in items {
+                stamp_val(it, cn);
+            }
+        }
+        Bool::Any(sub) | Bool::Unique(sub) => stamp_subq(sub, cn),
+        Bool::AnsiAny(_, left, sub) | Bool::AnsiAll(_, left, sub) => {
+            stamp_val(left, cn);
+            stamp_subq(sub, cn);
+        }
+    }
+}
+
+fn stamp_subq(sub: &mut SubQ, cn: &str) {
+    sub.stream.cur = Some(cn.to_string());
+    if let Some(w) = &mut sub.wher {
+        stamp_bool(w, cn);
+    }
+}
+
+fn stamp_val(v: &mut Val, cn: &str) {
+    match v {
+        Val::ScalarSub(sub) => stamp_subq(sub, cn),
+        Val::Add(a, b)
+        | Val::Sub(a, b)
+        | Val::Mul(a, b)
+        | Val::Div(a, b)
+        | Val::Concat(a, b) => {
+            stamp_val(a, cn);
+            stamp_val(b, cn);
+        }
+        Val::Neg(a) | Val::Upper(a) | Val::Lower(a) => stamp_val(a, cn),
+        _ => {}
+    }
+}
+
 /// Push a negation down the tree the way the engine's DSQL does
 /// (probed): De Morgan through AND/OR, inverse verbs for comparisons,
 /// `NOT BETWEEN` expanded to `< lo OR > hi`, blr_not kept only over
@@ -853,6 +910,11 @@ struct Stream {
     /// inside a SUBROUTINE body every stream emits blr_relation3
     /// with an explicit schema and empty package (probed)
     sub: bool,
+    /// inside a CURSOR's rse every stream - subquery streams
+    /// included - carries the cursor's concatenated alias: the
+    /// cursor name paired with the stream's alias or its
+    /// schema-qualified name (probed); stamped post-parse
+    cur: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1058,7 +1120,7 @@ impl<'a> P<'a> {
             }
             _ => None,
         };
-        Some(Stream { name, alias, derived: None, sub: self.in_sub })
+        Some(Stream { name, alias, derived: None, sub: self.in_sub, cur: None })
     }
 
     /// A derived table: pass-through column list, ONE underlying
@@ -1102,6 +1164,7 @@ impl<'a> P<'a> {
             alias: None,
             derived: None,
             sub: self.in_sub,
+            cur: None,
         });
         let si = self.streams.len() - 1;
         let saved = self.sub.replace(si);
@@ -1129,6 +1192,7 @@ impl<'a> P<'a> {
             alias: Some(alias),
             derived: Some(Box::new(Derived { wher })),
             sub: self.in_sub,
+            cur: None,
         })
     }
 
@@ -1239,7 +1303,11 @@ impl<'a> P<'a> {
                 && matches!(self.t.get(self.i), Some(Tok::LParen))
             {
                 self.i += 1;
+                // DISTINCT gets the dedicated verbs for COUNT/SUM/
+                // AVG; MIN/MAX fold it away (the slice-10 law)
+                let distinct = self.kw("DISTINCT");
                 let arg = if a == "COUNT"
+                    && !distinct
                     && matches!(self.t.get(self.i), Some(Tok::Star))
                 {
                     self.i += 1;
@@ -1269,13 +1337,16 @@ impl<'a> P<'a> {
                     return None;
                 }
                 self.i += 1;
-                let verb = match a.as_str() {
-                    "COUNT" if arg.is_none() => blr::AGG_COUNT,
-                    "COUNT" => blr::AGG_COUNT2,
-                    "SUM" => blr::AGG_TOTAL,
-                    "AVG" => blr::AGG_AVERAGE,
-                    "MIN" => blr::AGG_MIN,
-                    _ => blr::AGG_MAX,
+                let verb = match (a.as_str(), distinct) {
+                    ("COUNT", false) if arg.is_none() => blr::AGG_COUNT,
+                    ("COUNT", false) => blr::AGG_COUNT2,
+                    ("COUNT", true) => blr::AGG_COUNT_DISTINCT,
+                    ("SUM", false) => blr::AGG_TOTAL,
+                    ("SUM", true) => blr::AGG_TOTAL_DISTINCT,
+                    ("AVG", false) => blr::AGG_AVERAGE,
+                    ("AVG", true) => blr::AGG_AVERAGE_DISTINCT,
+                    ("MIN", _) => blr::AGG_MIN,
+                    (_, _) => blr::AGG_MAX,
                 };
                 agg_raw = Some((verb, arg));
             } else if matches!(self.t.get(self.i), Some(Tok::Dot)) {
@@ -1316,6 +1387,7 @@ impl<'a> P<'a> {
                 alias: None,
                 derived: None,
                 sub: self.in_sub,
+                cur: None,
             });
             (self.streams.len() - 1) as u8 + self.base
         } else {
@@ -2489,6 +2561,27 @@ fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
         out.push(blr::END);
         return;
     }
+    if let Some(cn) = &st.cur {
+        // inside a CURSOR's rse every stream carries the cursor's
+        // concatenated alias - the cursor name paired with the
+        // stream's own alias, or with its schema-qualified name
+        // (probed; relation3's slot takes the same string in subs)
+        let alias = match &st.alias {
+            Some(a) => format!("\"{}\" \"{}\"", cn, a),
+            None => format!("\"{}\" \"PUBLIC\".\"{}\"", cn, st.name),
+        };
+        if st.sub {
+            emit_relation3(out, &st.name);
+        } else {
+            out.push(blr::RELATION2);
+            out.push(st.name.len() as u8);
+            out.extend_from_slice(st.name.as_bytes());
+        }
+        out.push(alias.len() as u8);
+        out.extend_from_slice(alias.as_bytes());
+        out.push(ctx);
+        return;
+    }
     if st.sub {
         // a subroutine body qualifies every relation: blr_relation3
         // with schema PUBLIC, an empty package, and the alias slot
@@ -2737,6 +2830,7 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
         alias: None,
         derived: None,
         sub: p.in_sub,
+        cur: None,
     });
     // no outer scope: qualified names resolve only through the
     // current branch's stream, bare names bind to it
@@ -3142,6 +3236,10 @@ fn body_compile(p: &mut P, func: bool, sub: bool) -> Option<BodyOut> {
     if !p.kw("AS") {
         return None;
     }
+    // zero outer FROM streams from here on - set BEFORE the declare
+    // section so cursor declarations may hold subqueries (subselect
+    // refuses under a None outer, the ON-clause guard)
+    p.outer = Some(0);
     // local DECLAREs: variable numbering CONTINUES after the outputs;
     // procedures INTERLEAVE declare/init per variable (probed - where
     // triggers group)
@@ -3205,7 +3303,6 @@ fn body_compile(p: &mut P, func: bool, sub: bool) -> Option<BodyOut> {
     if !p.kw("BEGIN") {
         return None;
     }
-    p.outer = Some(0);
     let mut stmts: Vec<TrigStmt> = Vec::new();
     while !p.kw("END") {
         stmts.push(p.trig_stmt()?);
@@ -4440,7 +4537,7 @@ impl<'a> P<'a> {
             return None;
         }
         let has_aggs = items.iter().any(|it| matches!(it, Item::Agg(..)));
-        let boolean = if self.kw("WHERE") {
+        let mut boolean = if self.kw("WHERE") {
             Some(self.bool_or()?)
         } else {
             None
@@ -4495,6 +4592,7 @@ impl<'a> P<'a> {
                 alias: None,
                 derived: None,
                 sub: self.in_sub,
+                cur: None,
             });
             for it in &items {
                 if let Item::Col(v) = it {
@@ -4624,13 +4722,7 @@ impl<'a> P<'a> {
             if !self.kw("CURSOR") || !is_for {
                 return None;
             }
-            // subquery streams under a cursor's rse inherit the
-            // cursor alias (probed on DECLARE) - refuse them here too
-            if aggregate
-                || first.is_some()
-                || skip.is_some()
-                || !sort.is_empty()
-                || self.streams.len() != sidx + 1
+            if aggregate || first.is_some() || skip.is_some() || !sort.is_empty()
             {
                 return None;
             }
@@ -4648,6 +4740,11 @@ impl<'a> P<'a> {
         };
         if cursor.is_none() && into.is_empty() {
             return None;
+        }
+        // AS CURSOR: subquery streams in the WHERE inherit the
+        // cursor's alias, stamped now that the name is known
+        if let (Some(cn), Some(b)) = (&cursor, &mut boolean) {
+            stamp_bool(b, cn);
         }
         let (label, do_stmt) = if is_for {
             let label = self.next_label;
@@ -5050,6 +5147,7 @@ impl<'a> P<'a> {
             alias: alias.clone(),
             derived: None,
             sub: self.in_sub,
+            cur: None,
         });
         let sidx = self.streams.len() - 1;
         let ctx = sidx as u8 + self.base;
@@ -5065,6 +5163,7 @@ impl<'a> P<'a> {
                 alias: None,
                 derived: None,
                 sub: self.in_sub,
+                cur: None,
             });
             Some((self.streams.len() - 1) as u8 + self.base)
         } else {
@@ -5110,17 +5209,15 @@ impl<'a> P<'a> {
             }
         }
         let saved = self.sub.replace(sidx);
-        // subquery streams inside a cursor's rse INHERIT the cursor
-        // alias string (probed) - unconverted, so a WHERE that grows
-        // the stream list refuses
-        let pre_subq = self.streams.len();
-        let boolean = if self.kw("WHERE") {
+        let mut boolean = if self.kw("WHERE") {
             Some(self.bool_or()?)
         } else {
             None
         };
-        if self.streams.len() != pre_subq {
-            return None;
+        // subquery streams inside a cursor's rse INHERIT the
+        // cursor's concatenated alias (probed) - stamp them
+        if let Some(b) = &mut boolean {
+            stamp_bool(b, &name);
         }
         if self.kw("GROUP") {
             if !aggregate || !self.kw("BY") {
@@ -5235,6 +5332,7 @@ impl<'a> P<'a> {
             alias: None,
             derived: None,
             sub: self.in_sub,
+            cur: None,
         });
         let new_ctx = (self.streams.len() - 1) as u8 + self.base;
         if !self.kw("SET") {
@@ -5883,6 +5981,7 @@ impl<'a> P<'a> {
                 alias: None,
                 derived: None,
                 sub: self.in_sub,
+                cur: None,
             };
             self.streams.push(st.clone());
             let ctx = (self.streams.len() - 1) as u8 + self.base;
@@ -5977,6 +6076,7 @@ impl<'a> P<'a> {
                     alias,
                     derived: None,
                     sub: p.in_sub,
+                    cur: None,
                 })
             };
             let tgt = named(self)?;
@@ -6143,6 +6243,7 @@ impl<'a> P<'a> {
                                     alias: None,
                                     derived: None,
                                     sub: self.in_sub,
+                                    cur: None,
                                 });
                                 MergeAct::Upd(
                                     (self.streams.len() - 1) as u8
@@ -6164,6 +6265,7 @@ impl<'a> P<'a> {
                             alias: None,
                             derived: None,
                             sub: self.in_sub,
+                            cur: None,
                         });
                         (
                             c,
@@ -6276,6 +6378,7 @@ impl<'a> P<'a> {
                     alias: None,
                     derived: None,
                     sub: self.in_sub,
+                    cur: None,
                 };
                 // contexts: store, modify-new, rse-org - in order
                 let base = self.base;
@@ -6286,6 +6389,7 @@ impl<'a> P<'a> {
                     alias: None,
                     derived: None,
                     sub: self.in_sub,
+                    cur: None,
                 });
                 let new_ctx = (self.streams.len() - 1) as u8 + base;
                 self.streams.push(Stream {
@@ -6293,6 +6397,7 @@ impl<'a> P<'a> {
                     alias: None,
                     derived: None,
                     sub: self.in_sub,
+                    cur: None,
                 });
                 let org_ctx = (self.streams.len() - 1) as u8 + base;
                 return Some(TrigStmt::UpdateOrInsert {
@@ -6359,6 +6464,7 @@ impl<'a> P<'a> {
                 alias: None,
                 derived: None,
                 sub: self.in_sub,
+                cur: None,
             });
             let new_ctx = (self.streams.len() - 1) as u8 + self.base;
             let st = Stream {
@@ -6366,6 +6472,7 @@ impl<'a> P<'a> {
                 alias: rel_alias,
                 derived: None,
                 sub: self.in_sub,
+                cur: None,
             };
             self.streams.push(st.clone());
             let org_idx = self.streams.len() - 1;
@@ -6526,6 +6633,7 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
             alias: None,
             derived: None,
             sub: false,
+            cur: None,
         }],
         base: 0,
         outer: Some(1),
@@ -6590,12 +6698,14 @@ pub fn compile_check(sql: &str) -> Option<Vec<u8>> {
                 alias: None,
                 derived: None,
                 sub: false,
+                cur: None,
             },
             Stream {
                 name: String::new(),
                 alias: None,
                 derived: None,
                 sub: false,
+                cur: None,
             },
         ],
         base: 0,
@@ -6760,12 +6870,14 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
                 alias: None,
                 derived: None,
                 sub: false,
+                cur: None,
             },
             Stream {
                 name: "NEW".to_string(),
                 alias: None,
                 derived: None,
                 sub: false,
+                cur: None,
             },
         ],
         base: 0,
@@ -8553,6 +8665,40 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_thirty_one_shapes_byte_for_byte() {
+        // the cursor-alias INFECTION (flip thirty-five - slice 30's
+        // guarded law): a subquery stream inside a cursor's rse
+        // carries the cursor's concatenated alias
+        pin_proc(
+            "CREATE PROCEDURE QZ4 RETURNS (R1 INTEGER) AS DECLARE CX CURSOR FOR (SELECT UID FROM U2 WHERE EXISTS (SELECT 1 FROM T WHERE T.ID = U2.UID)); BEGIN OPEN CX; FETCH CX INTO :R1; CLOSE CX; SUSPEND; END",
+            "050204010300080007000700020300000800012D1A0000A60000430192025532122243582220225055424C4943222E2255322200473C4301920154112243582220225055424C4943222E22542201472F1701024944170003554944FFFF0100BF01001700035549449B11000202A7000000A702000002011700035549441A0000FFA70100000E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... an ALIASED subquery stream pairs the cursor name with
+        // the inner alias - "CX" "X"
+        pin_proc(
+            "CREATE PROCEDURE RA2 RETURNS (R1 INTEGER) AS DECLARE CX CURSOR FOR (SELECT UID FROM U2 WHERE EXISTS (SELECT 1 FROM T X WHERE X.ID = U2.UID)); BEGIN OPEN CX; FETCH CX INTO :R1; CLOSE CX; SUSPEND; END",
+            "050204010300080007000700020300000800012D1A0000A60000430192025532122243582220225055424C4943222E2255322200473C430192015408224358222022582201472F1701024944170003554944FFFF0100BF01001700035549449B11000202A7000000A702000002011700035549441A0000FFA70100000E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... AS CURSOR infects alike
+        pin_proc(
+            "CREATE PROCEDURE RA3 AS BEGIN FOR SELECT UID FROM U2 WHERE EXISTS (SELECT 1 FROM T WHERE T.ID = U2.UID) AS CURSOR CU DO DELETE FROM U2 WHERE CURRENT OF CU; END",
+            "0502040101000700029B11000202110107430192025532122243552220225055424C4943222E2255322200473C4301920154112243552220225055424C4943222E22542201472F1701024944170003554944FFFF020500D90101FFFFFFFF0E010201150700000019010000FFFF4C",
+        );
+        // ... and in a SUBROUTINE the infected stream is relation3
+        // with the cursor string in its alias slot (composition)
+        pin_proc(
+            "CREATE PROCEDURE RA4 RETURNS (R1 INTEGER) AS DECLARE PROCEDURE PICK RETURNS (O1 INTEGER) AS DECLARE CX CURSOR FOR (SELECT UID FROM U2 WHERE EXISTS (SELECT 1 FROM T WHERE T.ID = U2.UID)); BEGIN OPEN CX; FETCH CX INTO :O1; CLOSE CX; END BEGIN EXECUTE PROCEDURE PICK RETURNING_VALUES :R1; SUSPEND; END",
+            "050204010300080007000700020300000800012D1A0000CD045049434B000000000100024F3100B2000000050204010300080007000700020300000800012D1A0000A60000430194065055424C494300025532122243582220225055424C4943222E2255322200473C430194065055424C4943000154112243582220225055424C4943222E22542201472F1701024944170003554944FFFF0100BF01001700035549449B11000202A7000000A702000002011700035549441A0000FFA7010000FFFFFF0E0102011A000029010000010001150700000019010200FFFF4C9B11000202E1010403045049434BFF0501001A0000FF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // DISTINCT aggregate scalars: the dedicated verbs, contexts
+        // continuing across back-to-back statements (flip thirty-six)
+        pin_proc(
+            "CREATE PROCEDURE RA5 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN R1 = (SELECT COUNT(DISTINCT UA) FROM U2); R2 = (SELECT SUM(DISTINCT ID) FROM T); SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B11000202012B7F43014F0143014A02553200FF4E004D010000005E1700025541FF180100002D1A0000012B7F43014F0343014A015402FF4E004D010000005F1702024944FF180300002D1A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+    }
+
+    #[test]
     fn subroutine_refusals() {
         for sql in [
             // derived tables inside subroutines: unprobed
@@ -8771,11 +8917,6 @@ mod tests {
             // INTO must name RETURNS parameters, one per column
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T INTO :NOPE DO SUSPEND; END",
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID, A FROM T INTO :R1 DO SUSPEND; END",
-            // a subquery inside a CURSOR's rse: its stream inherits
-            // the cursor alias string (probed) - unconverted
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS DECLARE CX CURSOR FOR (SELECT UID FROM U2 WHERE EXISTS (SELECT 1 FROM T WHERE T.ID = U2.UID)); BEGIN OPEN CX; FETCH CX INTO :R1; CLOSE CX; SUSPEND; END",
-            // ... and under AS CURSOR alike
-            "CREATE PROCEDURE X AS BEGIN FOR SELECT UID FROM U2 WHERE EXISTS (SELECT 1 FROM T WHERE T.ID = U2.UID) AS CURSOR CU DO DELETE FROM U2 WHERE CURRENT OF CU; END",
             // quantified comparisons over AGGREGATE output: unprobed
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE ID > ALL (SELECT MAX(UA) FROM U2) INTO :R1 DO SUSPEND; END",
             // aliased positioned DML: unprobed

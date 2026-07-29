@@ -307,6 +307,12 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # when a name isn't known until AFTER its clause parses (AS
+    # CURSOR), stamp POST-PARSE: walk the finished tree and set a
+    # slot - cheaper than threading context through every parser;
+    # and a guard added for one reason (subqueries in ON clauses)
+    # can silently fire in another regime (declare sections) - when
+    # a flip refuses unexpectedly, find WHICH guard, not just where
     # an ALIAS CONVENTION can infect a whole rse: every stream under
     # a cursor's rse - subquery streams included - carries the
     # cursor's alias string; when a wrapper stamps its children,

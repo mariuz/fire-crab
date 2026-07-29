@@ -13,6 +13,32 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-dsql slice 31: the cursor-alias infection, DISTINCT scalars
+
+### Converted
+- **Subqueries inside cursor rses** (flip thirty-five — slice 30's
+  guarded law, converted with its transcript): every stream under a
+  cursor's rse — subquery streams included — carries the cursor's
+  concatenated alias: the cursor name paired with the stream's own
+  alias (`"CX" "X"`) or its schema-qualified name
+  (`"CX" "PUBLIC"."T"`). Implemented as a post-parse STAMP walking
+  the boolean tree (the AS CURSOR name isn't known until after its
+  WHERE parses), a `cur` slot on the stream, and one emission
+  branch; relation3 takes the same string in its alias slot inside
+  subroutines — DECLARE CURSOR, AS CURSOR, and cursor-in-subroutine
+  all pinned. Found on the way: subselect's ON-clause guard
+  (`outer` = None) also fired during declare sections — `outer`
+  now sets before the declares.
+- **DISTINCT aggregate scalars** (flip thirty-six): the dedicated
+  verbs for COUNT/SUM/AVG, MIN/MAX folding DISTINCT away — the
+  slice-10 law reaching the scalar-subselect surface.
+
+### Guarded
+- Quantified comparisons over aggregate output, derived tables in
+  subqueries, subqueries in MERGE ON clauses. Gate:
+  `qa/dsql-proc-blr.sh` grew to 182 checks (4 fresh + slice 30's
+  refusal flipped); 314 unit byte-pins.
+
 ## 2026-07-29 — fire-crab-dsql slice 30: aggregate scalar subselects
 
 ### Converted
