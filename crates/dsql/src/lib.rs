@@ -642,6 +642,10 @@ struct SubQ {
     ctx: u8,
     wher: Option<Box<Bool>>,
     col: Option<Val>,
+    /// an AGGREGATE scalar subselect: the verb, its argument, and
+    /// the aggregate's context - the slot AFTER the stream's, which
+    /// it claims like every aggregate (probed)
+    agg: Option<(u8, Option<Val>, u8)>,
 }
 
 /// Push a negation down the tree the way the engine's DSQL does
@@ -1195,6 +1199,13 @@ impl<'a> P<'a> {
     /// compiles away exactly like a view's (probed: SELECT 1 and
     /// SELECT * leave no trace).
     fn subselect(&mut self, need_col: bool) -> Option<SubQ> {
+        self.subselect_ex(need_col, false)
+    }
+
+    /// `allow_agg` admits a single aggregate call as the select item
+    /// - the SCALAR caller only; quantified/IN comparisons over
+    /// aggregate output are unprobed and refuse
+    fn subselect_ex(&mut self, need_col: bool, allow_agg: bool) -> Option<SubQ> {
         if self.outer.is_none() {
             // a subquery inside an ON clause would interleave the
             // join chain's stream numbering: unprobed, refuse
@@ -1210,6 +1221,7 @@ impl<'a> P<'a> {
         // capture the select list positionally; resolve after the
         // stream exists
         let mut col: Option<(Option<String>, String)> = None;
+        let mut agg_raw: Option<(u8, Option<(Option<String>, String)>)> = None;
         if need_col {
             let Some(Tok::Ident(a)) = self.t.get(self.i) else {
                 return None;
@@ -1219,7 +1231,54 @@ impl<'a> P<'a> {
             }
             let a = a.clone();
             self.i += 1;
-            if matches!(self.t.get(self.i), Some(Tok::Dot)) {
+            if allow_agg
+                && matches!(
+                    a.as_str(),
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+                )
+                && matches!(self.t.get(self.i), Some(Tok::LParen))
+            {
+                self.i += 1;
+                let arg = if a == "COUNT"
+                    && matches!(self.t.get(self.i), Some(Tok::Star))
+                {
+                    self.i += 1;
+                    None
+                } else {
+                    let Some(Tok::Ident(c)) = self.t.get(self.i) else {
+                        return None;
+                    };
+                    if is_keyword(c) {
+                        return None;
+                    }
+                    let c = c.clone();
+                    self.i += 1;
+                    if matches!(self.t.get(self.i), Some(Tok::Dot)) {
+                        self.i += 1;
+                        let Some(Tok::Ident(d)) = self.t.get(self.i) else {
+                            return None;
+                        };
+                        let d = d.clone();
+                        self.i += 1;
+                        Some((Some(c), d))
+                    } else {
+                        Some((None, c))
+                    }
+                };
+                if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                    return None;
+                }
+                self.i += 1;
+                let verb = match a.as_str() {
+                    "COUNT" if arg.is_none() => blr::AGG_COUNT,
+                    "COUNT" => blr::AGG_COUNT2,
+                    "SUM" => blr::AGG_TOTAL,
+                    "AVG" => blr::AGG_AVERAGE,
+                    "MIN" => blr::AGG_MIN,
+                    _ => blr::AGG_MAX,
+                };
+                agg_raw = Some((verb, arg));
+            } else if matches!(self.t.get(self.i), Some(Tok::Dot)) {
                 self.i += 1;
                 let Some(Tok::Ident(b)) = self.t.get(self.i) else {
                     return None;
@@ -1250,6 +1309,18 @@ impl<'a> P<'a> {
         // statement's numbering - view and body alike (probed: a
         // body FOR's EXISTS put its stream at ctx 1 over the FOR's 0)
         let ctx = si as u8 + self.base;
+        // an aggregate claims the slot after its stream, as always
+        let agg_slot = if agg_raw.is_some() {
+            self.streams.push(Stream {
+                name: String::new(),
+                alias: None,
+                derived: None,
+                sub: self.in_sub,
+            });
+            (self.streams.len() - 1) as u8 + self.base
+        } else {
+            0
+        };
         // the subquery scope: bare names bind to ITS stream; the
         // ENCLOSING statement's stream stays visible to QUALIFIED
         // names (probed: the subquery WHERE correlated on the FOR's
@@ -1260,6 +1331,13 @@ impl<'a> P<'a> {
         let col = match col {
             None => None,
             Some((q, n)) => Some(self.field(q.as_deref(), &n)?),
+        };
+        let agg = match agg_raw {
+            None => None,
+            Some((verb, None)) => Some((verb, None, agg_slot)),
+            Some((verb, Some((q, n)))) => {
+                Some((verb, Some(self.field(q.as_deref(), &n)?), agg_slot))
+            }
         };
         let wher = if self.kw("WHERE") {
             Some(Box::new(self.bool_or()?))
@@ -1272,7 +1350,13 @@ impl<'a> P<'a> {
             return None; // joins, comma-FROM etc. in a subquery: unconverted
         }
         self.i += 1;
-        Some(SubQ { stream, ctx, wher, col })
+        Some(SubQ {
+            stream,
+            ctx,
+            wher,
+            col,
+            agg,
+        })
     }
 
     /// expression grammar mirroring the engine's precedence:
@@ -1436,7 +1520,9 @@ impl<'a> P<'a> {
                 // a scalar subselect as a value: blr_via(singular)
                 if matches!(self.t.get(self.i + 1), Some(Tok::Ident(w)) if w == "SELECT")
                 {
-                    return Some(Val::ScalarSub(Box::new(self.subselect(true)?)));
+                    return Some(Val::ScalarSub(Box::new(
+                        self.subselect_ex(true, true)?,
+                    )));
                 }
                 self.i += 1;
                 let inner = self.val()?;
@@ -2212,13 +2298,42 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
             out.push(blr::SINGULAR);
             out.push(blr::RSE);
             out.push(1);
-            emit_stream(out, &sub.stream, sub.ctx);
-            if let Some(w) = &sub.wher {
-                out.push(blr::BOOLEAN);
-                emit_bool(out, w);
+            if let Some((verb, arg, agg_ctx)) = &sub.agg {
+                // the aggregate wrap: inner rse (its WHERE inside),
+                // zero group keys, a one-slot map, the fid result
+                out.push(blr::AGGREGATE);
+                out.push(*agg_ctx);
+                out.push(blr::RSE);
+                out.push(1);
+                emit_stream(out, &sub.stream, sub.ctx);
+                if let Some(w) = &sub.wher {
+                    out.push(blr::BOOLEAN);
+                    emit_bool(out, w);
+                }
+                out.push(blr::END);
+                out.push(blr::GROUP_BY);
+                out.push(0);
+                out.push(blr::MAP);
+                out.extend_from_slice(&1u16.to_le_bytes());
+                out.extend_from_slice(&0u16.to_le_bytes());
+                out.push(*verb);
+                if let Some(a) = arg {
+                    emit_val(out, a);
+                }
+                out.push(blr::END);
+                emit_val(out, &Val::Fid(*agg_ctx, 0));
+            } else {
+                emit_stream(out, &sub.stream, sub.ctx);
+                if let Some(w) = &sub.wher {
+                    out.push(blr::BOOLEAN);
+                    emit_bool(out, w);
+                }
+                out.push(blr::END);
+                emit_val(
+                    out,
+                    sub.col.as_ref().expect("scalar subselect has a column"),
+                );
             }
-            out.push(blr::END);
-            emit_val(out, sub.col.as_ref().expect("scalar subselect has a column"));
             out.push(blr::NULL);
         }
         Val::Int(n) => {
@@ -4509,7 +4624,13 @@ impl<'a> P<'a> {
             if !self.kw("CURSOR") || !is_for {
                 return None;
             }
-            if aggregate || first.is_some() || skip.is_some() || !sort.is_empty()
+            // subquery streams under a cursor's rse inherit the
+            // cursor alias (probed on DECLARE) - refuse them here too
+            if aggregate
+                || first.is_some()
+                || skip.is_some()
+                || !sort.is_empty()
+                || self.streams.len() != sidx + 1
             {
                 return None;
             }
@@ -4989,11 +5110,18 @@ impl<'a> P<'a> {
             }
         }
         let saved = self.sub.replace(sidx);
+        // subquery streams inside a cursor's rse INHERIT the cursor
+        // alias string (probed) - unconverted, so a WHERE that grows
+        // the stream list refuses
+        let pre_subq = self.streams.len();
         let boolean = if self.kw("WHERE") {
             Some(self.bool_or()?)
         } else {
             None
         };
+        if self.streams.len() != pre_subq {
+            return None;
+        }
         if self.kw("GROUP") {
             if !aggregate || !self.kw("BY") {
                 return None;
@@ -8396,6 +8524,35 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_thirty_shapes_byte_for_byte() {
+        // AGGREGATE scalar subselects (flip thirty-four): via(
+        // singular, rse1(aggregate at the NEXT slot over the inner
+        // rse - its WHERE inside - zero group keys, a one-slot map),
+        // fid(agg, 0), null)
+        pin_proc(
+            "CREATE PROCEDURE QY3 (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN R1 = (SELECT MAX(ID) FROM T); SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B11000202012B7F43014F0143014A015400FF4E004D01000000541700024944FF180100002D1A00000E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... in a FOR's WHERE comparison: subquery stream at 1 over
+        // the FOR's 0, the aggregate claiming 2
+        pin_proc(
+            "CREATE PROCEDURE QZ2 (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT EMP_NO FROM EMPLOYEE WHERE SALARY > (SELECT AVG(UA) FROM U2 WHERE U2.UID > :P1) INTO :R1 DO SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B1100020211010743014A08454D504C4F59454500473117000653414C4152592B7F43014F0243014A025532014731170103554944290000000100FF4E004D01000000571701025541FF180200002DFF0201170006454D505F4E4F1A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // ... COUNT(*) with its WHERE inside the aggregate's rse
+        pin_proc(
+            "CREATE PROCEDURE QZ3 (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN R1 = (SELECT COUNT(*) FROM T WHERE T.ID > :P1); SUSPEND; END",
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B11000202012B7F43014F0143014A01540047311700024944290000000100FF4E004D0100000053FF180100002D1A00000E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // EXISTS inside a SUBROUTINE body: relation3 with the empty
+        // alias slot on the subquery stream (composition)
+        pin_proc(
+            "CREATE PROCEDURE QZ5 RETURNS (R1 INTEGER) AS DECLARE PROCEDURE ANYROW RETURNS (O1 INTEGER) AS BEGIN O1 = 0; IF (EXISTS (SELECT 1 FROM T)) THEN O1 = 1; END BEGIN EXECUTE PROCEDURE ANYROW RETURNING_VALUES :R1; SUSPEND; END",
+            "050204010300080007000700020300000800012D1A0000CD06414E59524F57000000000100024F310062000000050204010300080007000700020300000800012D1A00009B1100020201150800000000001A0000083C430194065055424C49430001540000FF01150800010000001A0000FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C9B11000202E101040306414E59524F57FF0501001A0000FF0E0102011A000029010000010001150700010019010200FFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+    }
+
+    #[test]
     fn subroutine_refusals() {
         for sql in [
             // derived tables inside subroutines: unprobed
@@ -8614,8 +8771,13 @@ mod tests {
             // INTO must name RETURNS parameters, one per column
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T INTO :NOPE DO SUSPEND; END",
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID, A FROM T INTO :R1 DO SUSPEND; END",
-            // AGGREGATE scalar subselects: unprobed shape
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN R1 = (SELECT MAX(ID) FROM T); SUSPEND; END",
+            // a subquery inside a CURSOR's rse: its stream inherits
+            // the cursor alias string (probed) - unconverted
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS DECLARE CX CURSOR FOR (SELECT UID FROM U2 WHERE EXISTS (SELECT 1 FROM T WHERE T.ID = U2.UID)); BEGIN OPEN CX; FETCH CX INTO :R1; CLOSE CX; SUSPEND; END",
+            // ... and under AS CURSOR alike
+            "CREATE PROCEDURE X AS BEGIN FOR SELECT UID FROM U2 WHERE EXISTS (SELECT 1 FROM T WHERE T.ID = U2.UID) AS CURSOR CU DO DELETE FROM U2 WHERE CURRENT OF CU; END",
+            // quantified comparisons over AGGREGATE output: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T WHERE ID > ALL (SELECT MAX(UA) FROM U2) INTO :R1 DO SUSPEND; END",
             // aliased positioned DML: unprobed
             "CREATE PROCEDURE X (P1 INTEGER) AS DECLARE CX CURSOR FOR (SELECT ID FROM T); BEGIN OPEN CX; FETCH CX; UPDATE T A SET ID = :P1 WHERE CURRENT OF CX; CLOSE CX; END",
         ] {

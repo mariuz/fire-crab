@@ -13,6 +13,29 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-29 — fire-crab-dsql slice 30: aggregate scalar subselects
+
+### Converted
+- **Aggregate scalar subselects** (flip thirty-four — slice 29's
+  refusal, transcript in hand): `(SELECT MAX(ID) FROM T [WHERE])`
+  as a value compiles to `via(singular, rse1(aggregate at the NEXT
+  slot over the inner rse — its WHERE INSIDE — zero group keys, a
+  one-slot map), fid(agg, 0), null)`. The aggregate claims the slot
+  after its stream, as everywhere; in a FOR's WHERE the subquery
+  stream lands at 1 over the FOR's 0 with the aggregate at 2. All
+  five verbs plus COUNT(*)/COUNT(col); works in assignments, WHERE
+  comparisons, SET values, and inside subroutine bodies (battery).
+- EXISTS inside subroutine bodies pinned by composition —
+  relation3's empty alias slot on the subquery stream.
+
+### Guarded
+- Subqueries inside a CURSOR's rse — their streams INHERIT the
+  cursor alias string (probed: the EXISTS stream carried
+  `"CX" "PUBLIC"."T"`), a peculiar law left with its transcript;
+  quantified comparisons over aggregate output; DISTINCT aggregate
+  scalars. Gate: `qa/dsql-proc-blr.sh` grew to 178 checks (8
+  fresh); 311 unit byte-pins.
+
 ## 2026-07-29 — fire-crab-dsql slice 29: subqueries in bodies, aliased AS CURSOR
 
 ### Converted

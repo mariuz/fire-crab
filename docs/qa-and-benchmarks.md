@@ -4666,6 +4666,26 @@ WHEN, and a BLOCK as a handler's body nests blr_block again with no
 handler section of its own - the battery runs a handler block
 containing an EXIT.
 
+Slice 30 cashed the transcript slice 29 left on the table.
+Aggregate scalar subselects - (SELECT MAX(ID) FROM T) as a value -
+compile to via(singular, rse1(<aggregate>), fid(agg, 0), null)
+where the aggregate wrap is the FOR-SELECT layout in miniature: the
+inner rse carries the subquery's WHERE, the group list is empty,
+the map holds one slot, and the aggregate claims the context AFTER
+its stream - the law that has held at every aggregate since slice
+8. In a FOR's WHERE the subquery stream lands at 1 over the FOR's
+0 with the aggregate at 2; in a bare assignment they take 0 and 1.
+The battery runs all five verbs, COUNT(*) beside COUNT(col),
+back-to-back scalars, an aggregate scalar as an UPDATE's SET
+value, and one inside a subroutine body. The slice's probe find
+was a PECULIAR law it chose to guard rather than convert: a
+subquery inside a CURSOR's rse - DECLARE CX CURSOR FOR (SELECT ...
+WHERE EXISTS (...)) - gives its subquery stream the CURSOR'S alias
+string: the EXISTS stream probed as relation2 "T" carrying
+"CX" "PUBLIC"."T". The cursor's concatenated-alias convention
+infects every stream in its rse. Left named, transcript in hand,
+with a stream-growth check refusing it in both cursor forms.
+
 Slice 29 dropped the SECOND slice-7 refusal in two slices.
 Subqueries in body statements - EXISTS, SINGULAR, IN (SELECT),
 ANY/ALL, scalar subselects - were named unprobed when the

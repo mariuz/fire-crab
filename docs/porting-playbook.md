@@ -307,6 +307,11 @@ them.
     # + null-flag short + one trailing EOF short; ORDER BY = a sort
     # clause after the boolean with a direction marker per key; the
     # INTO names choose the VARIABLE per column - order matters
+    # an ALIAS CONVENTION can infect a whole rse: every stream under
+    # a cursor's rse - subquery streams included - carries the
+    # cursor's alias string; when a wrapper stamps its children,
+    # probe the CHILDREN, and guard by STRUCTURE (stream-count
+    # growth) when a law is known but not yet worth its plumbing
     # a formula probed in ONE regime may BE the general law: the
     # view subquery ctx (si + 1) was next-id-at-base all along -
     # write formulas in terms of the parser's base/offsets, and a
