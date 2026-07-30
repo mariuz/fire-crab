@@ -6747,6 +6747,35 @@ fallback has been the thing quietly answering; it is worth stating plainly that
 a total comparison function is a liability wherever a type system is still
 being filled in.
 
+### Column aliases in the select list (`qa/serve-real-colalias.sh`, 30 checks)
+
+An alias is the only part of a result a client is guaranteed to key on, and it
+had been dropped for the item type where it is most often written. `SELECT NAME
+AS X` described the column as NAME — the parser said so in a comment, "the alias
+only changes display, which build_projcols does not currently apply" — `SELECT
+NAME X` refused outright, and `SELECT COUNT(*) AS N` refused because the alias
+was split off AFTER the aggregate parser had already been handed the whole text
+and failed on it. EXPRESSIONS honoured their aliases perfectly.
+
+That last fact is why this survived so long. The shape anyone reaches for first
+when testing aliases is `SELECT A + B AS TOTAL`, and it worked. The gap was
+found while reading a diff in an unrelated slice's probe output, where a
+throwaway `AS X` came back as the column's own name.
+
+**The gate compares no values at all.** Every check compares the KEYS of the
+returned objects, because that is what the driver builds from the describe —
+and a wrong alias is not a wrong value, it is a result the client cannot find.
+
+**Two traps, both caught by existing gates rather than the new one.** A bare
+trailing alias is a whitespace split, and `NOT B` splits into `NOT` and `B`,
+`B AND C` into `B AND` and `C` — one item each, whose last token only looks
+like a name. The rule now refuses to split when the head ends in an operator
+keyword. And `TRUE`/`FALSE`/`UNKNOWN`/`NULL` pass `ident_ok` while being
+LITERALS, so removing the old `alias.is_none()` guard sent `SELECT TRUE AS X`
+down the column path looking for a column named TRUE. Both were red gates
+within a minute of the change, which is the argument for running the whole
+suite after touching a parser rather than the gate you are writing.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

@@ -13,6 +13,39 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — column aliases in the select list
+
+### Converted
+- **`SELECT NAME AS X`** and the bare form **`SELECT NAME X`**, on a
+  plain column, an expression, an aggregate and a grouped column. A
+  quoted alias keeps its case; an unquoted one folds up, the way every
+  unquoted identifier does.
+- **`ORDER BY <alias>`** and **`GROUP BY <alias>`** — the engine
+  resolves an alias in both, and a real column of that name wins over
+  one, which is what makes a shadowing alias harmless.
+- Two items over the SAME column with different aliases are TWO output
+  columns.
+
+### Fixed
+- **The alias was dropped for the item type where it is most often
+  written.** A plain column described as its own name — the parser even
+  said so in a comment — `SELECT NAME X` refused outright, and
+  `SELECT COUNT(*) AS N` refused because the alias was split off AFTER
+  the aggregate parser had already failed on the whole text. Expressions
+  honoured their aliases, which is what made the gap easy to miss: the
+  shape people reach for first was the shape that worked.
+
+`qa/serve-real-colalias.sh` (30 checks, twin servers). Nothing in it
+compares values — every check compares the KEYS of the returned objects,
+which is what a driver builds from the describe.
+
+Two traps, both caught by existing gates rather than the new one. A bare
+trailing alias must not swallow an OPERAND: `NOT B` is one item whose
+last token only looks like a name, and so is `B AND C`; the rule now
+refuses to split when the head ends in an operator keyword. And
+`TRUE`/`FALSE`/`UNKNOWN`/`NULL` look like identifiers but are LITERALS,
+so they must not take the column path — aliased or not.
+
 ## 2026-07-30 — a CONDITION used as a VALUE
 
 ### Converted

@@ -1188,6 +1188,21 @@ them.
   boolean. A function that can compare anything will compare the pairs
   you have not thought about, and it will not tell you.
 
+- **The shape you test first is the shape that works.** Aliases were
+  honoured on expressions and dropped on plain columns for dozens of
+  increments, because `SELECT A + B AS TOTAL` is what anyone writes when
+  checking aliases. Enumerate the ITEM TYPES a clause accepts and check
+  the feature against each, not against the one that comes to mind.
+- **A name is not a value, and a gate that compares values will not see
+  it.** A wrong alias produces correct rows under a key the client
+  cannot find. Compare the describe - the keys, the types - separately
+  from the data.
+- **A whitespace split is a parser, and it will meet operators.** The
+  bare trailing alias (`NAME X`) is a split on the last space, which
+  happily turns `NOT B` into `NOT` aliased as `B`. Guard it on what the
+  head ENDS with, and remember the literals that pass an
+  identifier test: TRUE, FALSE, UNKNOWN, NULL.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with
