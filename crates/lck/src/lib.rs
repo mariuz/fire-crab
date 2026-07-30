@@ -94,6 +94,8 @@
 //! shared lock table (fb_lock_print shows the cross-process series
 //! only), so reservation behavior stays the relation-lock oracle.
 
+pub mod shm;
+
 use std::collections::BTreeMap;
 
 /// A lock mode - `lock_proto.h:69-76`, values identical. The names

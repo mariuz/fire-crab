@@ -291,10 +291,82 @@ LOCK TIMEOUT 2`: the engine expires the wait with "lock time-out on
 wait transaction" while the blocker still holds — deadline-less
 waiters unaffected on both sides.
 
+## Slice 4: the shared table itself, in fb_lock_print's own words
+
+The three slices above convert the lock manager's POLICY as an in-process
+model — matrix, queues, verdicts — and check it against the engine's source
+and the live server's behaviour. This slice converts the other half: the
+BYTES several processes share.
+
+The table is a file the server maps (`/tmp/firebird/fb_lock_<id>` on Linux),
+and it has a companion nobody should waste: `fb_lock_print` dumps it as text.
+So `fclck dump` decodes the same file and must print the same thing —
+`LOCK_HEADER BLOCK` with its counters, the hash-length distribution, the four
+free/active queues, and an `OWNER BLOCK` section per owner. It does, exactly,
+tabs and column widths included.
+
+**Every pointer is an offset, and the printed offset is not the stored one.**
+`SRQ_PTR` is a byte offset from the start of the table (`src/jrd/que.h:108`),
+never an address — it has to be, since each process maps the region
+somewhere else. A queue node sits INSIDE the block it links, so `prt_que`
+prints `que->srq_forward - offsetof(own, own_lhb_owners)`: the BLOCK, not the
+node. On a live table the owners queue held 78408 and the tool printed 78392.
+Sixteen bytes is the entire difference, and a converter that misses it prints
+a table that looks right and refers to nothing.
+
+**The comparison had to be made on a snapshot.** Reading the live file twice
+gives two different tables — `Enqs` and `Acquires` move between the readings.
+`cp` the file first and point `fb_lock_print -f` at the copy, and the
+comparison becomes exact. That is worth remembering generally: when the
+subject is live shared memory, snapshot it and give the same bytes to both
+readers.
+
+**What actually caught the bugs.** Two, and both are instructive:
+
+* The `lhb` counter run is eleven `FB_UINT64`s, then
+  `lhb_operations[LCK_MAX_SERIES]`, then seven more. Miscounting inside it is
+  INVISIBLE for any field that happens to be zero — which, on a quiet
+  server, is most of them. `Enqs` and `Converts` were right at my first
+  guess; `Rejects`, `Blocks`, `Deadlock scans` and `Deadlocks` were all
+  four wrong and three of them still printed a plausible `0`. Only
+  `Deadlock scans`, whose wrong offset read into the hash table, printed
+  garbage and gave the game away.
+* `lhb_hash` sits after `srq lhb_data[LCK_MAX_SERIES]`, and getting its
+  offset wrong walked the wrong slots — producing a distribution that was
+  *nearly* the engine's (53 chains of length 1 instead of 52) and a maximum
+  chain length of 131072, which is not a plausible number for a hash bucket.
+  A near-miss in a statistic is a real failure mode: this one shifted one
+  chain and no human reading the dump would have noticed.
+
+**One number here belongs to libc, not to Firebird.** `own` embeds an
+`event_t`, which embeds a `pthread_mutex_t` and a `pthread_cond_t`, so
+`own_flags`'s offset depends on the C library's sizes (48 + 48 on
+Linux/aarch64 and Linux/x86-64 alike). A lock table is therefore not portable
+across builds — the engine never needs it to be, and a converter should know
+that rather than discover it. `shm::EVENT_T_SIZE` is where the assumption
+lives, alone and labelled.
+
+**Alive or dead.** The dump says whether each owner's process still exists.
+The engine asks `kill(pid, 0)`; fire-crab reads `/proc/<pid>`, which answers
+the same question for the only processes that can appear in this table.
+
+The gate (`qa/lck-table-dump.sh`, 8 checks) compares both dumps on a quiet
+table and on a busier one — three attachments with a `PROTECTED WRITE`
+reservation, so there are more owners and a different distribution, because a
+dump that matches in one state may have matched a coincidence. It also
+requires the dump to have content (owner blocks, a nonzero `Enqs`) and the
+distribution to account for every one of the 8191 hash slots: a chain walk
+that stopped early would still print a table that reads fine.
+
 ## Roadmap
 
 1. **Series semantics** — bring `jrd/lck.cpp`'s typed layer over,
    so fire-crab's wire server can arbitrate two of ITS OWN
    attachments through this table.
-2. **Cross-process-series dump differential** — the series that DO
-   live in the shared table, compared structurally.
+2. **The rest of the dump**: `-l` (lock blocks, with their series and keys),
+   `-r` (the requests inside each owner), `-h` (the history ring) and `-w`
+   (the "waiting for" cycles). The blocks are decoded far enough to count
+   and link; their own fields are not.
+3. **Writing** to the table rather than reading it, which is where the
+   mutex in the memory header stops being decoration.
+

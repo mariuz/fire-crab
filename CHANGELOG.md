@@ -13,6 +13,61 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — fire-crab-lck slice 4: the shared lock table, in fb_lock_print's words
+
+### Converted
+- **The lock manager's other half.** Slices 1-3 converted the POLICY (the
+  compatibility matrix, the queues, the verdicts) as an in-process model.
+  This one converts the BYTES several processes share: the file the
+  server maps as its lock table (`/tmp/firebird/fb_lock_<id>`), decoded
+  from `src/lock/lock_proto.h` and printed in `fb_lock_print`'s own text
+  (`src/lock/print.cpp`). `fclck dump <file> [-o]` produces the
+  `LOCK_HEADER BLOCK` with its counters, the hash-length distribution,
+  the four queues and an `OWNER BLOCK` per owner - **byte-identical to
+  the engine's tool on the same snapshot**, tabs and column widths
+  included.
+- **Self-relative queues, and the offset the tool does not print.**
+  Every pointer is a byte offset from the start of the table (`SRQ_PTR`,
+  que.h:108) because each process maps the region elsewhere. A queue
+  node sits INSIDE its block, so `prt_que` prints
+  `srq_forward - offsetof(own, own_lhb_owners)` - the BLOCK. On a live
+  table the queue held 78408 and the tool printed 78392: sixteen bytes,
+  and without them a dump refers to nothing.
+- Owner blocks with their three queues (granted, blocking, pending), the
+  process block behind each owner, and the `Alive`/`Dead` check - the
+  engine's `kill(pid, 0)` becomes a `/proc/<pid>` lookup, which answers
+  the same question for the only processes this table can hold.
+
+### Fixed
+- **The counter run hid three wrong offsets behind zeros.** `lhb` has
+  eleven `FB_UINT64` counters, then `lhb_operations[LCK_MAX_SERIES]`,
+  then seven more. My first guesses for `Rejects`, `Blocks`,
+  `Deadlock scans` and `Deadlocks` were all four wrong, and three still
+  printed a plausible `0` on a quiet server. Only `Deadlock scans` -
+  whose wrong offset read into the hash table - printed garbage and gave
+  it away. A field that is usually zero is a field whose offset is
+  usually untested.
+- **A near-miss in a statistic is a real failure.** `lhb_hash` sits after
+  `srq lhb_data[LCK_MAX_SERIES]`; with its offset wrong the distribution
+  came out *nearly* right - 53 chains of length one where the engine
+  counted 52 - with a maximum chain length of 131072, which is not a
+  plausible bucket. Nobody reading the dump would have noticed the 53.
+
+### Guarded
+- The comparison is made on a SNAPSHOT (`cp` the file, then
+  `fb_lock_print -f`), because reading live shared memory twice gives two
+  different tables - `Enqs` and `Acquires` move between the readings.
+- Queue walks are bounded by the table's own size and stop on a
+  self-pointing node: a snapshot of live memory can catch a queue
+  mid-update, and a dump must still terminate.
+- `own_flags`'s offset depends on libc (`event_t` embeds a
+  `pthread_mutex_t` and a `pthread_cond_t`), so a lock table is not
+  portable across builds. `shm::EVENT_T_SIZE` is that assumption, alone
+  and labelled.
+- Lock blocks, request details, the history ring and the wait-for cycles
+  (`-l`, `-r`, `-h`, `-w`) stay unconverted; writing to the table stays
+  out entirely.
+
 ## 2026-07-30 — fire-crab-svc slice 2: gstat asks fire-crab for statistics
 
 ### Converted

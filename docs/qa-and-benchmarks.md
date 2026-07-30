@@ -6151,6 +6151,52 @@ produces that refusal. The first version of this gate read the refusal as
 "the engine cannot do it either" and would have quietly weakened its own claim;
 asking for `data` ALONE is what proves the engine performs it.
 
+### The shared lock table, against fb_lock_print (`qa/lck-table-dump.sh`, 8 checks)
+
+The lock table is not a file format anybody documents — it is live shared
+memory, mapped by every process that touches the database, with a
+`pthread_mutex_t` sitting in its header. It also has a dumper: `fb_lock_print`.
+That combination makes it checkable in the strongest way available, and this
+gate does the obvious thing with it: decode the same bytes and require the same
+text.
+
+**Snapshot first.** Reading the live file twice gives two different tables —
+`Enqs` and `Acquires` move between the readings — so the gate `cp`s the file and
+runs `fb_lock_print -f` on the copy. Same bytes, both readers, exact diff.
+
+**Both states.** A quiet table (one attachment) and a busier one (three
+attachments, one holding `SET TRANSACTION RESERVING ... FOR PROTECTED WRITE`),
+because a dump that matches in a single state may have matched a coincidence.
+The busier snapshot has six owner blocks and 137 enqueues, and both dumps agree
+line for line, including the hash-length distribution over 8191 slots.
+
+**Teeth.** Two checks exist purely to stop the comparison from being vacuous:
+the dump must contain owner blocks and a nonzero `Enqs`, and the distribution
+must account for every hash slot — a chain walk that stopped early would still
+print a table that reads perfectly well.
+
+**What the differential caught.** This is the clearest case yet of why exact
+text matters:
+
+* The `lhb` counter run is eleven `FB_UINT64`s, then
+  `lhb_operations[LCK_MAX_SERIES]`, then seven more. Four of my derived
+  offsets were wrong, and **three of them printed a plausible `0`** because
+  those counters are zero on a quiet server. Only `Deadlock scans`, whose wrong
+  offset landed in the hash table, printed garbage. A field that is usually
+  zero is a field whose offset is usually untested — and a gate comparing
+  *values* rather than *text* would have passed all four.
+* `lhb_hash` sits after `srq lhb_data[LCK_MAX_SERIES]`, and with its offset
+  wrong the distribution came out **nearly** right: 53 chains of length one
+  where the engine counted 52, with a maximum chain length of 131072. The 53
+  is the dangerous part; nobody reading a dump notices one chain.
+
+**The law worth carrying away.** Every pointer in this memory is a byte offset
+from the start of the table (`SRQ_PTR`), because each process maps the region at
+a different address — and a queue node lives INSIDE the block it links, so the
+tool prints `srq_forward - offsetof(own, own_lhb_owners)`. On the live table the
+queue held 78408 and `fb_lock_print` printed 78392. Sixteen bytes, and without
+them every offset in the dump refers to nothing.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
@@ -6775,6 +6821,12 @@ FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
 NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     bash /path/to/fire-crab/qa/serve-real-predfull.sh 3050
+
+# The engine's shared LOCK TABLE, decoded by fire-crab and diffed against
+# fb_lock_print on the same snapshot (header, hash distribution, queues,
+# owner blocks). Needs a live attachment; the gate makes its own.
+FCLCK=/path/to/fire-crab/target/release/fclck ISQL=/opt/firebird/bin/isql \
+    bash /path/to/fire-crab/qa/lck-table-dump.sh
 
 # A service ACTION: the engine's own gstat asks fire-crab for a database's
 # header statistics and prints them; the text must equal what the same

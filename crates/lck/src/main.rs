@@ -19,7 +19,9 @@ use fire_crab_lck::{compatible, parse_engine_matrix, Mode, COMPATIBILITY};
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let usage = || {
-        eprintln!("usage: fclck compat <A> <B> | matrix | pin-source <lock.cpp>");
+        eprintln!(
+            "usage: fclck compat <A> <B> | matrix | pin-source <lock.cpp> | dump <lock-file> [-o]"
+        );
         std::process::exit(2);
     };
     match args.get(1).map(|s| s.as_str()) {
@@ -33,6 +35,25 @@ fn main() {
                 std::process::exit(2);
             });
             println!("{}", if compatible(a, b) { "COMPATIBLE" } else { "CONFLICT" });
+        }
+        // the engine's own shared lock table, decoded from the file it
+        // maps - the same bytes fb_lock_print reads
+        Some("dump") if args.len() >= 3 => {
+            let owners = args.iter().any(|a| a == "-o");
+            let data = match std::fs::read(&args[2]) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("REFUSED: {}: {}", args[2], e);
+                    std::process::exit(1);
+                }
+            };
+            match fire_crab_lck::shm::dump(&data, owners) {
+                Ok(t) => print!("{}", t),
+                Err(e) => {
+                    eprintln!("REFUSED: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
         Some("matrix") if args.len() == 2 => {
             print!("      ");

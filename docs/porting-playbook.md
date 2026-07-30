@@ -838,6 +838,42 @@ them.
   the engine refuses data-page statistics too, and a gate built on that
   combination would prove nothing.
 
+## Shared memory is a format too — and its dumper is your oracle
+
+- **If the vendor ships a dumper, the shared memory is checkable.** A lock
+  table, a monitoring arena, an event table: none of them are documented
+  formats, but a tool that prints one turns it into an exact-text
+  differential. Decode the same bytes, print the same words.
+- **Snapshot before comparing anything live.** Two reads of live shared
+  memory are two different objects - counters move between them. Copy the
+  file (or the region), then point BOTH readers at the copy. Without this
+  the diff is noise and you will start "fixing" fields that were right.
+- **Self-relative offsets, and the offset the dumper subtracts.** Shared
+  structures cannot hold addresses, so every pointer is an offset from the
+  region's base. When a queue node sits inside the block it links, the
+  dumper prints the BLOCK - i.e. the stored offset MINUS the field's
+  offset within the struct. Miss that and every number in your dump is
+  consistently, invisibly wrong by a constant.
+- **A field that is usually zero is a field whose offset is untested.**
+  Half of a counter block reads 0 on a quiet system, so wrong offsets in
+  it produce plausible dumps. Deliberately create activity (open
+  attachments, take a reservation) before trusting an offset, and prefer
+  comparing the dumper's whole TEXT over comparing the fields you thought
+  to check.
+- **Watch for statistics that are NEARLY right.** A hash distribution off
+  by one chain, a maximum bucket length of 131072: those are the failures
+  that survive review, because nothing looks broken. If a derived
+  statistic is even slightly off, treat it as a wrong offset rather than
+  rounding.
+- **Bound every walk by the region's size, and stop on a self-loop.** A
+  snapshot can catch a queue mid-update. A dumper that hangs on a torn
+  structure is worse than one that prints a short queue.
+- **Know which numbers belong to libc.** If a shared struct embeds a
+  mutex or a condition variable, its later field offsets depend on the C
+  library, and the region is not portable across builds. Isolate that
+  assumption in one named constant instead of spreading it through
+  offsets.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with
