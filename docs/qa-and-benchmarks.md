@@ -6398,6 +6398,56 @@ looks identical either way — the contents are the only witness. So after every
 statement both servers' tables are compared, including the subquery's own table,
 to show it was only read.
 
+### An aggregate inside a scalar subquery (`qa/serve-real-subqagg.sh`, 30 checks)
+
+`WHERE AMT > (SELECT AVG(AMT) FROM T)` was refused while
+`WHERE AMT > (SELECT MAX(AMT) FROM T)` answered, and the asymmetry pointed at
+the path rather than the function: a subquery aggregate folded through a
+prepare-time helper typed `Option<Option<i64>>`. That helper refuses AVG on
+purpose (an i64 fold cannot divide at the source's scale) and would have
+flattened `AVG(NUM)` from 11.30 to 11 if it had tried.
+
+The fix was to stop having a second implementation. A scalar aggregate is one
+group of one item, so the subquery now builds exactly that — a `GItem::Agg`
+with no keys — and calls the group machinery `SELECT AVG(NUM) FROM T` already
+used. The argument forms came with it rather than one per slice: MIN/MAX over
+TEXT, `COUNT(DISTINCT col)`, `AVG(AMT + 1)`, `MIN(UPPER(NAME))`.
+
+**What the gate is built around.** A subquery's value is a number nobody ever
+sees. A wrong average is not an error and not a wrong column — it is a
+different SET OF ROWS, and the reply looks perfectly reasonable either way. So
+every fixture row is placed to separate the engine's answer from a plausible
+wrong one:
+
+| the law | the engine's value | a plausible wrong one | the row between them |
+|---|---|---|---|
+| a NULL is ignored by the DIVISOR too | 32/4 = 8 | 32/5 = 6 | `AMT = 7` |
+| AVG over INTEGER truncates | (10+11)/2 = 10 | rounded 11 | `AMT = 11` |
+| AVG over NUMERIC keeps the scale | 7.27 | flattened 7 | a NUM near 7.27 |
+
+The empty subquery is in the gate twice on purpose, because the two answers are
+different: `AVG`/`MIN`/`MAX`/`SUM` over nothing is NULL — the comparison is
+UNKNOWN and NO row is selected — while `COUNT` over nothing is 0, and `> 0`
+selects nearly all of them. A converter that returns "no value" for both gets
+one of the two backwards with no error anywhere.
+
+**What it caught.** Routing subqueries through the group fold made a standing
+bug reachable and therefore visible: SUM and AVG asked `numeric_parts` for an
+exact `(raw, scale)` and `continue`d on None — so a DOUBLE value was SKIPPED,
+not refused, and `AVG(D)` over a column full of numbers folded to NULL. The
+fold now promotes to f64 as soon as one approximate value arrives, carrying the
+exact rows that came before it, which is what the engine's descriptor
+arithmetic does. A DOUBLE *source* is still refused in a subquery — not because
+the fold cannot do it, but because the top-level planner refuses
+`SELECT AVG(D) FROM T`, and one expression must not be legal in one position
+and illegal in another. The gate asserts both refusals in a single check so
+they cannot drift apart.
+
+`COUNT(*)` over a system relation is in the gate as well. Those relations have
+no `RDB$FORMATS` entry, so their rows cannot be decoded and the count comes
+from the record headers; moving subqueries onto the group machinery had to
+leave that path intact.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

@@ -11262,13 +11262,11 @@ fn aggregate(
         // falls through to it)
         return None;
     }
-    // AVG always takes the GROUP path (decline here): the scalar
-    // plan's describe headers the column CONSTANT, and the engine says
-    // AVG - the group machinery describes aggregates by function name.
-    // (The lone COUNT/MIN/MAX/SUM header keeps the scalar path's
-    // CONSTANT for now - a standing difference this slice made visible;
-    // flipping those means touching the COUNT(*) fast path that system
-    // relations depend on, a later slice.)
+    // AVG always takes the GROUP path (decline here). This helper folds
+    // i64 and would answer SUM's total where AVG wants a division at the
+    // source's scale; the group machinery already does that. Aggregate
+    // SUBQUERIES no longer come through here at all - they build a
+    // one-item, no-key group, which is what a scalar aggregate is.
     if matches!(func, AggFn::Avg) {
         return None;
     }
@@ -11746,19 +11744,45 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                 }
                 // SUM and AVG fold exact numerics wide at the source's
                 // scale; AVG divides by the non-NULL count truncating
-                // toward zero (probed) - NULL over an empty input
+                // toward zero (probed) - NULL over an empty input.
+                //
+                // An APPROXIMATE input (FLOAT/DOUBLE) makes the whole fold
+                // approximate, the way the engine's descriptor arithmetic
+                // promotes: `AVG(DOUBLE)` is 2.6666666666666665, not the
+                // truncated 2. Both accumulators run so a double arriving
+                // after some exact rows still carries them - and so that an
+                // approximate value can never be SILENTLY DROPPED, which is
+                // what `numeric_parts` returning None used to do: AVG over a
+                // DOUBLE column folded nothing and answered NULL.
                 GItem::Agg(func @ (AggFn::Sum | AggFn::Avg), src, _) => {
                     let (mut sum, mut scale, mut n) = (0i128, None::<i8>, 0i64);
+                    let (mut fsum, mut approx) = (0f64, false);
                     for r in rows {
                         let v = src_value(src, r)?;
-                        let Some((raw, sc)) = numeric_parts(&v) else { continue };
-                        // one source, one scale - the first value pins it
-                        scale.get_or_insert(sc);
-                        sum = sum.saturating_add(raw);
-                        n += 1;
+                        match (&v, numeric_parts(&v)) {
+                            (_, Some((raw, sc))) => {
+                                // one source, one scale - the first pins it
+                                scale.get_or_insert(sc);
+                                sum = sum.saturating_add(raw);
+                                fsum += raw as f64 * 10f64.powi(sc as i32);
+                                n += 1;
+                            }
+                            (Value::Double(d), None) => {
+                                approx = true;
+                                fsum += d;
+                                n += 1;
+                            }
+                            _ => continue,
+                        }
                     }
                     if n == 0 {
                         Value::Null
+                    } else if approx {
+                        Value::Double(if matches!(func, AggFn::Sum) {
+                            fsum
+                        } else {
+                            fsum / n as f64
+                        })
                     } else if matches!(func, AggFn::Sum) {
                         scaled_value(sum, scale.unwrap_or(0))
                     } else {
@@ -15942,12 +15966,59 @@ fn eval_subquery(
         }
     };
 
-    // an aggregate subquery answers one value through the same path a
-    // top-level aggregate takes
+    // An aggregate subquery answers one value. It goes through the GROUP
+    // machinery with no keys - the whole table as one group - rather than
+    // the scalar integer helper, because that helper folds i64 only: it
+    // refuses AVG outright and would flatten a NUMERIC's scale
+    // (`AVG(NUM)` is 11.30, not 11). One group of one item is exactly what
+    // a scalar aggregate is, so this is the same code the top-level
+    // `SELECT AVG(NUM) FROM T` already runs.
     if let Some((func, target)) = agg {
-        let got = aggregate(db, rel, &formats, &columns, &descs, func, &target, &filter)?;
+        // the source is built exactly as the top-level group planner
+        // builds it, so a subquery accepts the same arguments a SELECT
+        // list does - a column, `COUNT(DISTINCT col)`, or an expression
+        let (src, distinct) = match &target {
+            AggTarget::Star => (AggSrc::Star, false),
+            AggTarget::Col(name) | AggTarget::Distinct(name) => {
+                let c = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+                let fid = c.field_id as usize;
+                if is_computed_fid(&descs, fid) {
+                    return None;
+                }
+                let d = descs.get(fid)?;
+                // the same source typing the planner applies: SUM/AVG
+                // fold EXACT numerics only. A DOUBLE column is refused
+                // here rather than folded, because the planner refuses
+                // `SELECT AVG(D) FROM T` too - answering it in a
+                // subquery would make one expression legal in one
+                // position and illegal in the other
+                if matches!(func, AggFn::Sum | AggFn::Avg)
+                    && !(matches!(col_kind(d), Some(ColKind::Int)) || is_numeric_col(d))
+                {
+                    return None;
+                }
+                (AggSrc::Field(fid), matches!(target, AggTarget::Distinct(_)))
+            }
+            AggTarget::Expr(raw) => {
+                let e = resolve_expr(raw, &columns, &descs)?;
+                if matches!(func, AggFn::Sum | AggFn::Avg)
+                    && !matches!(e.type_of(&descs)?, ExprType::Int | ExprType::Numeric)
+                {
+                    return None;
+                }
+                (AggSrc::Expr(e), false)
+            }
+        };
+        if distinct && !matches!(func, AggFn::Count) {
+            return None; // only COUNT(DISTINCT) is answered
+        }
+        let gitems = vec![GItem::Agg(func, src, distinct)];
+        let rows = group_output(db, rel, &formats, &gitems, &[], &[], 1, &filter, &None).ok()?;
+        // no rows at all still yields ONE row (the global aggregate's
+        // shape: COUNT 0, everything else NULL)
+        let v = rows.first().and_then(|r| r.first()).cloned().unwrap_or(Value::Null);
         return Some(SubqRows {
-            values: vec![got.map_or(Value::Null, Value::Int)],
+            values: vec![v],
             any: true,
         });
     }
@@ -22246,6 +22317,50 @@ mod tests {
             compute_group(&[], &gitems[1..]).unwrap(),
             vec![Value::Int(0), Value::Int(0), Value::Null, Value::Null, Value::Null]
         );
+    }
+
+    #[test]
+    fn avg_truncates_keeps_scale_and_promotes_doubles() {
+        let avg = |rows: &[Vec<Value>]| {
+            compute_group(rows, &[GItem::Agg(AggFn::Avg, AggSrc::Field(0), false)])
+                .unwrap()
+                .remove(0)
+        };
+        let r = |v: Value| vec![v];
+        // AVG over INTEGER TRUNCATES toward zero - it does not round.
+        // 25/3 is 8 (probed), and a pair of 10 and 11 averages 10, not
+        // the 11 a rounding fold would answer
+        assert_eq!(avg(&[r(Value::Int(10)), r(Value::Int(11)), r(Value::Int(4))]), Value::Int(8));
+        assert_eq!(avg(&[r(Value::Int(10)), r(Value::Int(11))]), Value::Int(10));
+        assert_eq!(avg(&[r(Value::Int(-7)), r(Value::Int(-2))]), Value::Int(-4)); // toward zero
+        // a NULL is ignored by BOTH the sum and the DIVISOR: with the
+        // NULL counted, 25 over 4 rows would be 6
+        assert_eq!(
+            avg(&[r(Value::Int(10)), r(Value::Null), r(Value::Int(11)), r(Value::Int(4))]),
+            Value::Int(8)
+        );
+        assert_eq!(avg(&[r(Value::Null)]), Value::Null); // all-NULL is empty
+        assert_eq!(avg(&[]), Value::Null);
+        // a NUMERIC keeps its SCALE through the division: AVG of 11.25,
+        // 11.35 and 1.00 is 7.86 at scale -2, not the integer 7
+        let n = |raw| r(Value::Scaled(raw, -2));
+        assert_eq!(avg(&[n(1125), n(1135), n(100)]), Value::Scaled(786, -2));
+        assert_eq!(
+            compute_group(&[n(1125), n(1135), n(100)],
+                          &[GItem::Agg(AggFn::Sum, AggSrc::Field(0), false)]).unwrap(),
+            vec![Value::Scaled(2360, -2)]
+        );
+        // an APPROXIMATE input makes the whole fold approximate - the
+        // f64 average, not a truncated integer. Before this, a DOUBLE
+        // was silently DROPPED by the exact fold and AVG answered NULL.
+        let d = |v: f64| r(Value::Double(v));
+        assert_eq!(
+            avg(&[d(1.5), d(2.5), d(4.0)]),
+            Value::Double(2.6666666666666665)
+        );
+        // ... and it carries the exact rows that arrived before it
+        assert_eq!(avg(&[r(Value::Int(1)), d(2.0)]), Value::Double(1.5));
+        assert_eq!(avg(&[n(150), d(2.5)]), Value::Double(2.0));
     }
 
     #[test]

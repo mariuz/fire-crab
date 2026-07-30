@@ -47,6 +47,8 @@ same database file.
 | temporal literals `DATE '...'` / `TIME '...'` / `TIMESTAMP '...'`; the clock keywords fixed per statement | `parse.y`, `src/jrd/CurrentDateNode` et al. | `RawExpr::{DateLit, TimeLit, TsLit, CurrentDate, LocalTime, LocalTimestamp}` |
 | aggregate result types: AVG/SUM widen to NUMERIC(18,s) (BIGINT width at the operand scale), MIN/MAX keep the column's type, COUNT is BIGINT | `src/jrd/AggNodes.cpp` (`makeDesc`), probed | the `SelItem::Agg` arm of `plan_group` |
 | AVG = SUM/COUNT with TRUNCATING division toward zero; folds skip NULLs; empty/all-NULL input is NULL; COUNT(DISTINCT) counts distinct non-NULLs | `src/jrd/AggNodes.cpp` (`AvgAggNode::execute` et al.), probed | `compute_group`, `aggregate` |
+| an APPROXIMATE input makes SUM/AVG approximate (the exact fold no longer SKIPS a DOUBLE and answers NULL); AVG over NUMERIC divides at the source's scale | `dsc.cpp` descriptor promotion, probed (`AVG(D)` = 2.6666666666666665, `AVG(NUM)` = 7.27) | the two accumulators in `compute_group`'s SUM/AVG arm |
+| an aggregate SUBQUERY takes every argument a select-list aggregate takes - a column, `COUNT(DISTINCT col)`, an expression - and its empty answer is NULL for MIN/MAX/SUM/AVG but 0 for COUNT | the engine has one aggregate implementation, not one per position | `eval_subquery`'s aggregate branch: a one-item, no-key `group_output` |
 | aggregates take EXPRESSION arguments, evaluated per row before the fold; an eval error in the argument raises mid-fetch; SUM widens ONE step (LONG source → BIGINT, INT64-ranked → INT128), AVG keeps its width unless the source is INT128 | `AggNodes.cpp` + the expression nodes, probed | `AggTarget::Expr`, `AggSrc::Expr`, the fallible `compute_group` |
 | a lone aggregate's output column is NAMED by its function (COUNT/MIN/MAX/SUM/AVG); a bare literal is CONSTANT, a generator read GEN_ID | probed via isql headers | `Plan::Scalar(value, name)`, `output_cols_of` |
 | DATEADD/DATEDIFF (both syntaxes each); month-end clamping; TIME wraps midnight; DATEDIFF components vs boundary crossings; MILLISECOND at NUMERIC(18,1) | `src/jrd/SysFunction.cpp` (`makeDateAdd`/`makeDateDiff`), probed | `SysFn::DateAdd`/`DateDiff`, `dateadd_impl`, `datediff_impl` |
@@ -210,7 +212,13 @@ blob, which an expression cannot serve yet), `?` parameters INSIDE an
 expression (only a bare `?` on a comparison side binds), QUALIFIED
 names in join-predicate expressions, temporal aggregates in HAVING,
 temporal parameters against expression sides, `DECODE`, `TIME + n`,
-and `CURRENT_TIME`/`CURRENT_TIMESTAMP` (TIME ZONE results).
+and `CURRENT_TIME`/`CURRENT_TIMESTAMP` (TIME ZONE results). An
+aggregate over an APPROXIMATE column (`AVG(D)` where D is DOUBLE) is
+refused in every position - the planner has no approximate result type
+yet, and refusing it in the subquery too keeps one expression from being
+legal in one place and illegal in another. A DATE column in a WHERE
+comparison is refused as well, which is why `WHERE DT = (SELECT MAX(DT)
+FROM T)` refuses: the gap is the predicate's typing, not the subquery.
 
 ## The evaluator's shape
 

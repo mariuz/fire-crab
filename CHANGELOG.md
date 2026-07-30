@@ -13,6 +13,48 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — the wire server: an aggregate inside a scalar subquery
+
+### Converted
+- **`WHERE AMT > (SELECT AVG(AMT) FROM T)`** — an aggregate as the value
+  of a scalar subquery, in a SELECT and in a DML alike. AVG, and with it
+  MIN/MAX over TEXT, `COUNT(DISTINCT col)`, `AVG(<expression>)` and any
+  NUMERIC source's SCALE.
+- The subquery no longer folds through the prepare-time integer helper
+  (`Option<Option<i64>>`, which refused AVG outright and would have
+  flattened `AVG(NUM)` from 11.30 to 11). It builds a **one-item,
+  no-key GROUP** and runs the group machinery — because a scalar
+  aggregate *is* one group of one item, this is the same code
+  `SELECT AVG(NUM) FROM T` already ran, and the argument forms arrived
+  with it rather than one at a time.
+
+### Fixed
+- **SUM/AVG silently DROPPED approximate values.** The exact fold asked
+  `numeric_parts` for `(raw, scale)` and skipped anything that answered
+  None — so a DOUBLE column contributed nothing and `AVG(D)` folded to
+  NULL over a table full of numbers. The fold now promotes: one
+  approximate input makes the whole fold approximate (carrying the exact
+  rows that arrived before it), the way the engine's descriptor
+  arithmetic does.
+
+### Guarded
+- An approximate source is refused in the SUBQUERY as well, because the
+  top-level `SELECT AVG(D) FROM T` is refused: one expression cannot be
+  legal in one position and illegal in the other. The gate checks both
+  positions in a single case.
+- `AVG(DISTINCT ...)` and `SUM(<text>)` refuse rather than fold.
+
+The gate (`qa/serve-real-subqagg.sh`, 30 checks) is built around one
+property: a subquery's value is a number nobody ever sees, so a wrong
+average is not an error — it is a different SET OF ROWS. Each fixture
+row is placed so the engine's answer and a plausible wrong one select
+different rows: `AVG(AMT)` is 32/4 = 8 with the NULL row ignored and
+32/5 = 6 with it counted, and a row sits between them; the average of 10
+and 11 is 10 truncated and 11 rounded, and a row sits between those too.
+`COUNT(*)` over a system relation is in the gate as well, since routing
+subqueries through the group machinery must not lose the record-header
+count those relations depend on.
+
 ## 2026-07-30 — the wire server: subqueries in a DML WHERE
 
 ### Converted

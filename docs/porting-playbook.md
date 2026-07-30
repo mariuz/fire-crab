@@ -1009,6 +1009,37 @@ them.
   the wrong ones. Compare the tables after every statement - and compare
   the OTHER table too, to show it was only read.
 
+- **Two implementations of one thing will differ; delete one.** A scalar
+  aggregate had a prepare-time i64 fold of its own beside the group
+  machinery's. The narrow one refused AVG and could not have carried a
+  NUMERIC's scale - so the same expression answered in a SELECT list and
+  refused in a subquery. A scalar aggregate IS one group of one item;
+  building that and calling the existing code brought AVG, text MIN/MAX,
+  COUNT(DISTINCT) and expression arguments in together.
+- **Refuse in every position or answer in every position.** If the
+  planner refuses `SELECT AVG(D) FROM T`, a subquery must refuse
+  `(SELECT AVG(D) FROM T)` too. Legal in one place and illegal in
+  another is a bug report waiting to be filed, and the cheapest guard is
+  a single gate check that asserts BOTH refusals at once, so they cannot
+  drift.
+- **`continue` on an unrecognized value is a silent wrong answer.** The
+  exact fold skipped anything that was not an integer or a scaled
+  numeric - which meant a DOUBLE column contributed NOTHING and AVG
+  answered NULL over a table full of numbers. Skipping is only safe for
+  values you have decided to skip (NULL); everything else must widen the
+  fold or refuse the statement.
+- **A value nobody sees still decides the answer.** A subquery's
+  aggregate never appears in a row - a wrong one just returns a
+  different SET of rows, with no error and a perfectly plausible reply.
+  Build the fixture so the right value and the likely wrong one pick
+  different rows (put a row BETWEEN the truncated and the rounded
+  average, and between the NULL-ignored and NULL-counted one), or the
+  gate proves only that the query ran.
+- **NULL and 0 are different empty answers.** Over no rows, MIN/MAX/SUM/
+  AVG are NULL (so a comparison is UNKNOWN and selects nothing) while
+  COUNT is 0 (so `> 0` selects nearly everything). One "the aggregate
+  found nothing" branch gets one of the two backwards.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with
