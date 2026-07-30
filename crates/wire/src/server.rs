@@ -10999,7 +10999,9 @@ fn plan_query_inner(
             let mut out = Vec::new();
             for it in &items {
                 match it {
-                    SelItem::Col(name, alias) => {
+                    // the alias is applied positionally below, where
+                    // both branches of this `if` meet
+                    SelItem::Col(name, _) => {
                         let one = build_projcols(&[name.clone()], &columns, &descs, &computed)?;
                         out.push(one.into_iter().next()?);
                     }
