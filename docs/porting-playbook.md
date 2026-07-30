@@ -854,12 +854,24 @@ them.
   dumper prints the BLOCK - i.e. the stored offset MINUS the field's
   offset within the struct. Miss that and every number in your dump is
   consistently, invisibly wrong by a constant.
-- **A field that is usually zero is a field whose offset is untested.**
-  Half of a counter block reads 0 on a quiet system, so wrong offsets in
-  it produce plausible dumps. Deliberately create activity (open
-  attachments, take a reservation) before trusting an offset, and prefer
-  comparing the dumper's whole TEXT over comparing the fields you thought
-  to check.
+- **A field that is usually zero — or a queue that is usually EMPTY — is a
+  field whose offset is untested.** Half a counter block reads 0 on a quiet
+  system, and an empty queue prints "*empty*" with no offset in it to be
+  wrong about, so bad offsets produce perfect dumps. This bit twice in two
+  slices: three queue-field offsets were each shifted by one field and
+  nothing noticed until a second transaction was made to BLOCK on the
+  first, filling the pending queue. Deliberately create the state you are
+  trying to observe — contention, activity, a full buffer — before
+  trusting an offset, and prefer comparing the dumper's whole TEXT over
+  the fields you thought to check.
+- **A value transcribed from a numbered listing is an off-by-one waiting
+  to happen.** An enum that starts at 1 makes each constant's value its
+  POSITION, and copying from a listing whose line numbers start at the
+  file's first line shifts everything. Mine shifted every lock series past
+  the fifth, and it surfaced on exactly one line in 636 output lines —
+  the one series whose key is printed in a split format. Convert enums by
+  counting the enum, not the listing, and pick a check that exercises the
+  branch each value selects.
 - **Watch for statistics that are NEARLY right.** A hash distribution off
   by one chain, a maximum bucket length of 131072: those are the failures
   that survive review, because nothing looks broken. If a derived

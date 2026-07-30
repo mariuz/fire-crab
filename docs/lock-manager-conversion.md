@@ -358,15 +358,89 @@ requires the dump to have content (owner blocks, a nonzero `Enqs`) and the
 distribution to account for every one of the 8191 hash slots: a chain walk
 that stopped early would still print a table that reads fine.
 
+## Slice 5: the whole dump — locks, requests, history — and three offsets that were wrong
+
+Slice 4 matched `fb_lock_print`'s header and owner sections. This one finishes
+the dump: `-l` (lock blocks with their keys), `-r` (the request blocks inside
+each owner), `-h` (the two history rings) and therefore `-a`. Every switch is
+now byte-identical to the engine's tool on the same snapshot — 1990 lines for
+`-a` on a contended table.
+
+**The keys are where the bytes become meaning.** A lock's key is a byte string
+whose interpretation depends on its SERIES, and `prt_lock` has a branch per
+shape:
+
+| series | length | printed as | meaning |
+|---|---|---|---|
+| `LCK_bdb`, `LCK_btr_dont_gc` | 8 | `0000:000231` | page space : page number |
+| `LCK_relation`, `LCK_rel_gc` | 12 | `0128:000000007` | relation id : instance id |
+| `LCK_tra`, `LCK_attachment`, `LCK_monitor`, `LCK_cancel` | 8 | `000001362` | the transaction / attachment number |
+| `LCK_record_gc` | 8 | `000231:0004` | page : line, packed in one 64-bit key |
+| `LCK_idx_rescan` | 4 | `0004:0000` | relation id : index id |
+| anything else | 4 | `262144` | the number itself |
+| anything else | 0 | `<none>` | |
+| anything else | n | `ab<1>c/` | printable bytes, the rest escaped |
+
+Note the page key: the stored order is (page number, page space) and the dump
+prints them the other way round.
+
+**Three of slice 4's queue-field offsets were wrong, and every check passed.**
+`offsetof(lrq, lrq_lbl_requests)`, `lrq_own_blocks` and `lrq_own_pending` were
+each shifted by one field. Nothing caught it, because those three queues —
+`Free requests`, `Blocks`, `Pending` — are EMPTY on a server with no
+contention, and an empty queue prints `*empty*`, which has no offset in it to
+be wrong about.
+
+What caught it was making the server contend: a second transaction taking
+`SET TRANSACTION WAIT RESERVING EMPLOYEE FOR PROTECTED WRITE` while the first
+still holds it. The waiter blocks, its owner's pending queue fills, and the
+dump immediately disagreed with the tool by exactly eight bytes:
+
+```
+< 	Pending (1):	forward:  91216, backward:  91216      (fb_lock_print)
+> 	Pending (1):	forward:  91224, backward:  91224      (fire-crab, wrong)
+```
+
+The gate now creates that contention before comparing, so those three offsets
+are held by something. This is the second time in two slices that a field
+which is *usually zero or empty* turned out to be a field whose offset was
+*never tested* — it is the characteristic failure mode of converting a shared
+structure, and the remedy is always the same: make the structure non-trivial
+before you compare.
+
+**A series enum counted off a listing is an off-by-one waiting to happen.**
+`lck_t` starts at `LCK_database = 1`, so a series' value is its position in the
+enum. I transcribed the later ones from a numbered listing and shifted every
+value past `LCK_attachment` by one — which was invisible for all the
+single-number keys and visible for exactly one line: series 22's four-byte key,
+which the engine prints split as `0004:0000` and fire-crab printed as `262144`.
+One line in 636.
+
+**A quirk faithfully reproduced.** `prt_request` writes `"AST: 0x%p"`, and
+glibc's `%p` already emits `0x`, so the engine's real output is
+`AST: 0x0xeb781933e044`. fire-crab prints the double prefix too. The
+differential is the tool's text, not the text the tool meant to write —
+"fixing" it here would make the dump wrong.
+
+**Two history rings, not one.** `-h` prints `lhb_history` under the title
+`History` and then `shb_history` under `Event log` (print.cpp:885-886). Missing
+the second cost one line plus its entries, and the diff found it. The rings are
+circular and pre-allocated: an entry whose operation is 0 is an unused slot,
+skipped but still advancing the walk, and the walk ends when a next pointer
+comes back to the head — not at a null.
+
 ## Roadmap
 
 1. **Series semantics** — bring `jrd/lck.cpp`'s typed layer over,
    so fire-crab's wire server can arbitrate two of ITS OWN
    attachments through this table.
-2. **The rest of the dump**: `-l` (lock blocks, with their series and keys),
-   `-r` (the requests inside each owner), `-h` (the history ring) and `-w`
-   (the "waiting for" cycles). The blocks are decoded far enough to count
-   and link; their own fields are not.
-3. **Writing** to the table rather than reading it, which is where the
+2. **`-w`, the "waiting for" cycles** — `prt_owner_wait_cycle` walks from a
+   blocked owner to whoever holds what it wants, recursively, and prints the
+   chain that a deadlock scan would follow. The data is all decoded now; the
+   traversal is not.
+3. **`lbl_counts[LCK_max]`** — the per-mode granted counts inside each lock
+   block, which the dump does not print but the granted-state aggregate is
+   computed from. Comparing them needs a different oracle than text.
+4. **Writing** to the table rather than reading it, which is where the
    mutex in the memory header stops being decoration.
 

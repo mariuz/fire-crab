@@ -20,7 +20,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let usage = || {
         eprintln!(
-            "usage: fclck compat <A> <B> | matrix | pin-source <lock.cpp> | dump <lock-file> [-o]"
+            "usage: fclck compat <A> <B> | matrix | pin-source <lock.cpp>\n\
+             \x20      | dump <lock-file> [-o] [-l] [-r] [-a]"
         );
         std::process::exit(2);
     };
@@ -39,7 +40,10 @@ fn main() {
         // the engine's own shared lock table, decoded from the file it
         // maps - the same bytes fb_lock_print reads
         Some("dump") if args.len() >= 3 => {
-            let owners = args.iter().any(|a| a == "-o");
+            let owners = args.iter().any(|a| a == "-o" || a == "-a");
+            let locks = args.iter().any(|a| a == "-l" || a == "-a");
+            let requests = args.iter().any(|a| a == "-r" || a == "-a");
+            let history = args.iter().any(|a| a == "-h" || a == "-a");
             let data = match std::fs::read(&args[2]) {
                 Ok(d) => d,
                 Err(e) => {
@@ -47,7 +51,7 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            match fire_crab_lck::shm::dump(&data, owners) {
+            match fire_crab_lck::shm::dump_all(&data, owners, locks, requests, history) {
                 Ok(t) => print!("{}", t),
                 Err(e) => {
                     eprintln!("REFUSED: {}", e);

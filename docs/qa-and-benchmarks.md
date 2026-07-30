@@ -6151,7 +6151,7 @@ produces that refusal. The first version of this gate read the refusal as
 "the engine cannot do it either" and would have quietly weakened its own claim;
 asking for `data` ALONE is what proves the engine performs it.
 
-### The shared lock table, against fb_lock_print (`qa/lck-table-dump.sh`, 8 checks)
+### The shared lock table, against fb_lock_print (`qa/lck-table-dump.sh`, 16 checks)
 
 The lock table is not a file format anybody documents — it is live shared
 memory, mapped by every process that touches the database, with a
@@ -6196,6 +6196,31 @@ a different address — and a queue node lives INSIDE the block it links, so the
 tool prints `srq_forward - offsetof(own, own_lhb_owners)`. On the live table the
 queue held 78408 and `fb_lock_print` printed 78392. Sixteen bytes, and without
 them every offset in the dump refers to nothing.
+
+**Then the gate grew, and the same lesson arrived twice more.** Covering `-l`,
+`-r`, `-h` and `-a` (1990 lines of `-a` on a contended table) required three
+things the first version had left untested:
+
+* **Contention.** Three queue-field offsets — `lrq_lbl_requests`,
+  `lrq_own_blocks`, `lrq_own_pending` — were each shifted by one field, and
+  every check passed, because `Free requests`, `Blocks` and `Pending` are EMPTY
+  on a quiet server and an empty queue prints `*empty*` with no offset in it to
+  be wrong about. The gate now runs a second transaction into
+  `SET TRANSACTION WAIT RESERVING ... FOR PROTECTED WRITE` while the first holds
+  the table, so a real waiter sits in the pending queue. With the wrong offsets
+  the dump differs by exactly eight bytes; with the right ones it is identical.
+* **Key shapes.** A lock's key means something different per series, and the
+  split-key branches (`space:page`, `relation:instance`, `page:line`,
+  `relation:index`) are where a wrong SERIES NUMBER hides. Mine were off by one
+  past `LCK_attachment` — transcribed from a numbered listing, where the value
+  is the position — and the error surfaced on exactly ONE line in 636: series
+  22's four-byte key, printed `0004:0000` by the engine and `262144` by
+  fire-crab. The gate now requires both shapes to appear in the dump it
+  compares.
+* **A quirk kept.** `prt_request` writes `"AST: 0x%p"`, glibc's `%p` already
+  emits `0x`, and the engine's output therefore reads
+  `AST: 0x0xeb781933e044`. fire-crab prints the double prefix, because the
+  differential is the tool's text and not the text the tool meant to write.
 
 ## Benchmarks
 

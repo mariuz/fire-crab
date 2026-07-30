@@ -13,6 +13,58 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — fire-crab-lck slice 5: the whole dump, and three offsets that hid in empty queues
+
+### Converted
+- **The rest of `fb_lock_print`.** Slice 4 matched the header and owner
+  sections; this one adds `-l` (lock blocks with their keys), `-r` (the
+  request blocks inside each owner) and `-h` (the history rings), so
+  every switch - and `-a`, 1990 lines on a contended table - is
+  byte-identical to the engine's tool on the same snapshot.
+- **A lock's KEY is where its bytes become meaning**, and its shape
+  depends on the SERIES: a page lock prints `space:page` (with the stored
+  order reversed - the key holds the page number first), a relation lock
+  `relation:instance`, a transaction or attachment lock one 64-bit
+  number, a record-GC lock `page:line` packed in one key, an index-rescan
+  lock `relation:index` packed in four bytes, and anything else either a
+  plain number, `<none>`, or printable bytes with `<NNN>` escapes.
+- **Two history rings, not one**: `lhb_history` under the title `History`
+  and `shb_history` under `Event log` (print.cpp:885-886). The rings are
+  circular and pre-allocated - operation 0 is an unused slot, skipped but
+  still advancing the walk, and the walk ends when a next pointer returns
+  to the head rather than at a null.
+
+### Fixed
+- **Three queue-field offsets from slice 4 were wrong, and every check
+  passed anyway.** `offsetof(lrq, lrq_lbl_requests)`, `lrq_own_blocks`
+  and `lrq_own_pending` were each shifted by one field - invisible
+  because those queues (`Free requests`, `Blocks`, `Pending`) are EMPTY
+  on a server with no contention, and an empty queue prints `*empty*`,
+  which has no offset in it to be wrong about. Making the server contend
+  - a second transaction taking `WAIT RESERVING ... FOR PROTECTED WRITE`
+  while the first holds it - filled the pending queue and the dump
+  disagreed by exactly eight bytes (91216 against 91224). The gate now
+  creates that contention before comparing, so the offsets are held by
+  something. Second slice in a row where a field that is usually empty
+  turned out to be a field whose offset was never tested.
+- **A series enum transcribed from a numbered listing was off by one**
+  past `LCK_attachment`. `lck_t` starts at `LCK_database = 1`, so a
+  series' value is its position - and every single-number key printed
+  correctly regardless, so the error showed up on exactly ONE line in
+  636: series 22's four-byte key, which the engine splits as `0004:0000`
+  and fire-crab printed as `262144`.
+- **A quirk reproduced rather than corrected**: `prt_request` writes
+  `"AST: 0x%p"` and glibc's `%p` already emits `0x`, so the engine's real
+  output is `AST: 0x0xeb781933e044`. fire-crab prints the double prefix
+  too - the differential is the tool's text, not the text it meant.
+
+### Guarded
+- The AST line prints pointers into the server's address space. They are
+  meaningless outside that process and match only because both readers
+  read the same snapshot; the docs say so rather than implying otherwise.
+- `-w` (the wait-for cycles) and `lbl_counts[LCK_max]` stay unconverted,
+  and so does writing to the table.
+
 ## 2026-07-30 — fire-crab-lck slice 4: the shared lock table, in fb_lock_print's words
 
 ### Converted

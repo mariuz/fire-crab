@@ -17,11 +17,18 @@
 #      reservation, so there are more owners, more requests and a different
 #      hash distribution. A dump that matches in only one state has matched
 #      a coincidence.
-#   3. Teeth: the dump must contain what it claims to (owner blocks, a
-#      nonzero Enqs), and the distribution must account for every hash
-#      slot - a walk that silently stops early would still print a plausible
-#      table.
-#   4. Refusals: a database file is not a lock table; a truncated table is
+#   3. EVERY switch on a CONTENDED table - -o, -l, -r, -h and -a - with a
+#      second transaction actually BLOCKED on the first one's PROTECTED
+#      WRITE reservation. That last part is not decoration: three of this
+#      module's queue-field offsets were wrong and every check passed
+#      anyway, because `Blocks`, `Pending` and `Free requests` are EMPTY on
+#      an uncontended server and an empty queue prints `*empty*` with no
+#      offset to be wrong about. A blocked waiter populates them.
+#   4. Teeth: the dump must contain what it claims to (owner blocks, a
+#      nonzero Enqs, lock blocks with keys, a pending queue), and the
+#      distribution must account for every hash slot - a walk that silently
+#      stops early would still print a plausible table.
+#   5. Refusals: a database file is not a lock table; a truncated table is
 #      refused rather than decoded into nonsense.
 #
 #   qa/lck-table-dump.sh
@@ -116,6 +123,46 @@ if snapshot; then
 else
     echo "DIFF could not snapshot the busier table"; fail=1
 fi
+# ------------------------------- 3. a CONTENDED table, every switch ------
+# a second PROTECTED WRITE reservation on the same table, in WAIT mode: it
+# blocks, which is the only way the owner's pending queue is non-empty
+printf 'SET TRANSACTION WAIT RESERVING EMPLOYEE FOR PROTECTED WRITE;\nSELECT COUNT(*) FROM EMPLOYEE;\n' >&6
+sleep 2
+if snapshot; then
+    for sw in "-o" "-l" "-o -r" "-h" "-a"; do
+        compare "contended table, $sw" "$sw"
+    done
+    # the queues that only a blocked waiter populates
+    pend=$("$FCLCK" dump "$SNAP" -o | grep -c '^	Pending ([0-9]')
+    if [ "$pend" -ge 1 ]; then
+        echo "OK   a real waiter is in the dump: $pend non-empty Pending queue(s)"
+    else
+        echo "DIFF no pending queue in the dump - the contention phase proved nothing"
+        fail=1
+    fi
+    # lock blocks with decoded keys. Which SERIES show up depends on what
+    # the server is doing, so the check is about the two SHAPES that must
+    # both appear - a split key (series:sub-id, e.g. an index-rescan lock)
+    # and a plain 64-bit one (a transaction or attachment lock) - since the
+    # split branches are exactly where a wrong series number hides.
+    keys=$("$FCLCK" dump "$SNAP" -l | grep -c '^	Key: ')
+    split=$("$FCLCK" dump "$SNAP" -l | grep -cE '^	Key: [0-9]+:[0-9]+,')
+    single=$("$FCLCK" dump "$SNAP" -l | grep -cE '^	Key: [0-9]+,')
+    if [ "$keys" -gt 20 ] && [ "$split" -gt 0 ] && [ "$single" -gt 0 ]; then
+        echo "OK   $keys lock keys decoded: $split split (series:sub-id), $single single"
+    else
+        echo "DIFF thin key coverage: $keys keys, $split split, $single single"; fail=1
+    fi
+    hist=$("$FCLCK" dump "$SNAP" -h | grep -cE '^    (ENQ|GRANT|CONVERT|WAIT|DEQ|POST|DEL_)')
+    if [ "$hist" -gt 5 ]; then
+        echo "OK   the history rings decode: $hist events (ENQ/GRANT/... in order)"
+    else
+        echo "DIFF history events: $hist"; fail=1
+    fi
+else
+    echo "DIFF could not snapshot the contended table"; fail=1
+fi
+
 close_isql 6 /tmp/fc-lk-fifo-3
 close_isql 7 /tmp/fc-lk-fifo-2
 close_isql 8 /tmp/fc-lk-fifo-1

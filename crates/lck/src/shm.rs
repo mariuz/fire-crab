@@ -187,22 +187,92 @@ mod own_off {
     pub const FLAGS: usize = WAKEUP + super::EVENT_T_SIZE;
 }
 
+/// Field offsets inside an `lbl` (lock) block (lock_proto.h:164-178).
+mod lbl_off {
+    pub const TYPE: usize = 0;
+    pub const STATE: usize = 1;
+    pub const SIZE: usize = 2;
+    pub const LENGTH: usize = 3;
+    pub const REQUESTS: usize = 4;
+    pub const LHB_HASH: usize = 12;
+    pub const LHB_DATA: usize = 20;
+    /// `LOCK_DATA_T` is SINT64, so it aligns to 8 - leaving a pad after
+    /// the third queue
+    pub const DATA: usize = 32;
+    pub const SERIES: usize = 40;
+    pub const FLAGS: usize = 41;
+    pub const PENDING_LRQ_COUNT: usize = 42;
+    /// `lbl_counts[LCK_max]` - seven USHORTs
+    pub const COUNTS: usize = 44;
+    pub const KEY: usize = 58;
+}
+
+/// Field offsets inside an `lrq` (request) block (lock_proto.h:182-197).
+mod lrq_off {
+    pub const TYPE: usize = 0;
+    pub const REQUESTED: usize = 1;
+    pub const STATE: usize = 2;
+    /// USHORT after three bytes: aligned to 4
+    pub const FLAGS: usize = 4;
+    pub const OWNER: usize = 8;
+    pub const LOCK: usize = 12;
+    /// SINT64, 8-byte aligned
+    pub const DATA: usize = 16;
+    pub const OWN_REQUESTS: usize = 24;
+    pub const LBL_REQUESTS: usize = 32;
+    pub const OWN_BLOCKS: usize = 40;
+    pub const OWN_PENDING: usize = 48;
+}
+
+/// `LCK_max` (lock_proto.h:76) - the width of `lbl_counts`, not the number
+/// of lock SERIES (which runs past thirty).
+pub const LCK_MAX: usize = 7;
+
 /// The queue-field offsets `prt_que` subtracts to print a BLOCK's offset
 /// rather than the queue node's (print.cpp).
+///
+/// Three of these were WRONG in the first version of this module, shifted
+/// by one field, and every gate passed anyway - because the queues they
+/// belong to (`Blocks`, `Pending`, `Free requests`) are EMPTY on a server
+/// with no contention, and an empty queue prints `*empty*` with no offset
+/// to be wrong about. They are right now, and `qa/lck-table-dump.sh` makes
+/// a real waiter block on a `PROTECTED WRITE` reservation so the pending
+/// queue is populated when the dumps are compared.
 pub mod que_field {
     /// `offsetof(own, own_lhb_owners)`
-    pub const OWN_LHB_OWNERS: i32 = 16;
-    /// `offsetof(lrq, lrq_own_requests)` - verified against the tool's
-    /// printed queue heads
-    pub const LRQ_OWN_REQUESTS: i32 = 24;
+    pub const OWN_LHB_OWNERS: i32 = super::own_off::LHB_OWNERS as i32;
+    /// `offsetof(lrq, lrq_own_requests)`
+    pub const LRQ_OWN_REQUESTS: i32 = super::lrq_off::OWN_REQUESTS as i32;
     /// `offsetof(lrq, lrq_own_blocks)`
-    pub const LRQ_OWN_BLOCKS: i32 = 32;
+    pub const LRQ_OWN_BLOCKS: i32 = super::lrq_off::OWN_BLOCKS as i32;
     /// `offsetof(lrq, lrq_own_pending)`
-    pub const LRQ_OWN_PENDING: i32 = 40;
+    pub const LRQ_OWN_PENDING: i32 = super::lrq_off::OWN_PENDING as i32;
     /// `offsetof(lbl, lbl_lhb_hash)`
-    pub const LBL_LHB_HASH: i32 = 12;
+    pub const LBL_LHB_HASH: i32 = super::lbl_off::LHB_HASH as i32;
     /// `offsetof(lrq, lrq_lbl_requests)`
-    pub const LRQ_LBL_REQUESTS: i32 = 16;
+    pub const LRQ_LBL_REQUESTS: i32 = super::lrq_off::LBL_REQUESTS as i32;
+}
+
+/// Lock series (`lck_t`, jrd/lck.h:45+, starting at 1). Only the ones whose
+/// KEY the dump formats specially are named; the rest are printed by
+/// number, exactly as the engine does.
+pub mod series {
+    // `enum lck_t : UCHAR { LCK_database = 1, ... }` - the values are
+    // positions in that enum, so counting them off a listing is exactly
+    // where an off-by-one comes from. These were checked against a live
+    // dump: series 22 is the one whose 4-byte key prints split as
+    // `0004:0000`, which is LCK_idx_rescan.
+    pub const DATABASE: u8 = 1;
+    pub const RELATION: u8 = 2;
+    pub const BDB: u8 = 3;
+    pub const TRA: u8 = 4;
+    pub const ATTACHMENT: u8 = 5;
+    pub const MONITOR: u8 = 14;
+    pub const CANCEL: u8 = 15;
+    pub const BTR_DONT_GC: u8 = 16;
+    pub const REL_GC: u8 = 17;
+    pub const IDX_RESCAN: u8 = 22;
+    pub const RECORD_GC: u8 = 29;
 }
 
 /// The lock header block.
@@ -440,6 +510,301 @@ fn que_line(b: &[u8], label: &str, head: usize, field: i32) -> String {
     )
 }
 
+/// `prt_lock`'s key formatting (print.cpp:...): the key's MEANING depends
+/// on the series, and each shape has its own field widths.
+///
+/// This is the most informative part of the dump - it is where a row of
+/// bytes becomes "page 231 of page space 0" or "transaction 1362" - and it
+/// is also where a converter can be wrong in a way that still prints
+/// something plausible, so every branch below cites the series and length
+/// that select it.
+pub fn format_key(series: u8, length: u8, key: &[u8], data: i64) -> String {
+    let u32_le = |o: usize| -> u32 {
+        if o + 4 <= key.len() {
+            u32::from_le_bytes([key[o], key[o + 1], key[o + 2], key[o + 3]])
+        } else {
+            0
+        }
+    };
+    let i64_le = |o: usize| -> i64 {
+        if o + 8 <= key.len() {
+            let mut v = [0u8; 8];
+            v.copy_from_slice(&key[o..o + 8]);
+            i64::from_le_bytes(v)
+        } else {
+            0
+        }
+    };
+    let _ = data;
+    match (series, length) {
+        // a page lock: since 2.1 the key is (page number, page SPACE), and
+        // the dump prints them the other way round - space first
+        (series::BDB | series::BTR_DONT_GC, 8) => {
+            format!("\tKey: {:04}:{:06},", u32_le(4), u32_le(0))
+        }
+        // a relation lock: relation id + instance id
+        (series::RELATION | series::REL_GC, 12) => {
+            format!("\tKey: {:04}:{:09},", u32_le(0), i64_le(4))
+        }
+        (series::TRA | series::ATTACHMENT | series::MONITOR | series::CANCEL, 8) => {
+            format!("\tKey: {:09},", i64_le(0))
+        }
+        // a record-level GC lock packs the page number and the line number
+        // into one 64-bit key
+        (series::RECORD_GC, 8) => {
+            let k = i64_le(0);
+            format!("\tKey: {:06}:{:04},", (k >> 16) as u32, (k & 0xffff) as u32)
+        }
+        (series::IDX_RESCAN, 4) => {
+            let k = u32_le(0) as i32;
+            format!("\tKey: {:04}:{:04},", (k >> 16) as u32, (k & 0xffff) as u32)
+        }
+        (_, 4) => format!("\tKey: {:06},", u32_le(0) as i32),
+        (_, 0) => "\tKey: <none>".to_string(),
+        // anything else: printable characters as themselves, everything
+        // else as <NNN> - the engine's own escape
+        _ => {
+            let mut t = String::new();
+            for &c in key.iter().take(length as usize) {
+                if c.is_ascii_alphanumeric() || c == b'/' {
+                    t.push(c as char);
+                } else {
+                    t.push_str(&format!("<{}>", c));
+                }
+            }
+            format!("\tKey: {},", t)
+        }
+    }
+}
+
+/// One lock block.
+#[derive(Clone, Debug)]
+pub struct Lbl {
+    pub offset: i32,
+    pub series: u8,
+    pub state: u8,
+    pub size: u8,
+    pub length: u8,
+    pub data: i64,
+    pub flags: u8,
+    pub pending_lrq_count: u16,
+    pub key: Vec<u8>,
+}
+
+impl Lbl {
+    pub fn decode(b: &[u8], at: i32) -> Result<Lbl, String> {
+        let o = at as usize;
+        if o + lbl_off::KEY > b.len() {
+            return Err(format!("lock block at {} runs past the table", at));
+        }
+        let length = u8_at(b, o + lbl_off::LENGTH);
+        let key_end = (o + lbl_off::KEY + length as usize).min(b.len());
+        Ok(Lbl {
+            offset: at,
+            series: u8_at(b, o + lbl_off::SERIES),
+            state: u8_at(b, o + lbl_off::STATE),
+            size: u8_at(b, o + lbl_off::SIZE),
+            length,
+            data: u64_at(b, o + lbl_off::DATA) as i64,
+            flags: u8_at(b, o + lbl_off::FLAGS),
+            pending_lrq_count: u16_at(b, o + lbl_off::PENDING_LRQ_COUNT),
+            key: b[(o + lbl_off::KEY).min(b.len())..key_end].to_vec(),
+        })
+    }
+}
+
+/// One request block.
+#[derive(Clone, Debug)]
+pub struct Lrq {
+    pub offset: i32,
+    pub owner: i32,
+    pub lock: i32,
+    pub state: u8,
+    pub requested: u8,
+    pub flags: u16,
+}
+
+impl Lrq {
+    pub fn decode(b: &[u8], at: i32) -> Lrq {
+        let o = at as usize;
+        Lrq {
+            offset: at,
+            owner: i32_at(b, o + lrq_off::OWNER),
+            lock: i32_at(b, o + lrq_off::LOCK),
+            state: u8_at(b, o + lrq_off::STATE),
+            requested: u8_at(b, o + lrq_off::REQUESTED),
+            flags: u16_at(b, o + lrq_off::FLAGS),
+        }
+    }
+}
+
+/// `prt_que2`: the same as [`que_line`] but WITHOUT counting the entries -
+/// "as they might be invalid" (print.cpp). A request's own queues are
+/// printed this way, so a torn snapshot cannot make the dump hang.
+fn que_line_uncounted(b: &[u8], label: &str, head: usize, field: i32) -> String {
+    let q = Srq::at(b, head);
+    if q.is_empty(head as i32) {
+        return format!("{}: *empty*\n", label);
+    }
+    format!(
+        "{}:\tforward: {:6}, backward: {:6}\n",
+        label,
+        q.forward - field,
+        q.backward - field
+    )
+}
+
+/// Every lock block in the table, in hash-slot order - the order
+/// `fb_lock_print -l` walks them (print.cpp: over the hash slots, then
+/// along each collision chain).
+pub fn locks(b: &[u8], h: &Lhb) -> Vec<i32> {
+    let mut out = Vec::new();
+    for i in 0..h.hash_slots as usize {
+        let slot = lhb_off::HASH + i * 8;
+        for at in walk_queue(b, slot, que_field::LBL_LHB_HASH) {
+            out.push(at);
+        }
+    }
+    out
+}
+
+/// `prt_lock` (print.cpp): one LOCK BLOCK section.
+pub fn lock_section(b: &[u8], at: i32) -> Result<String, String> {
+    let l = Lbl::decode(b, at)?;
+    let mut s = format!("LOCK BLOCK {:6}\n", l.offset);
+    s.push_str(&format!(
+        "\tSeries: {}, State: {}, Size: {}, Length: {}, Data: {}\n",
+        l.series, l.state, l.size, l.length, l.data
+    ));
+    // the key line has NO newline of its own: the flags continue it
+    s.push_str(&format_key(l.series, l.length, &l.key, l.data));
+    s.push_str(&format!(
+        " Flags: 0x{:02X}, Pending request count: {:6}\n",
+        l.flags, l.pending_lrq_count
+    ));
+    s.push_str(&que_line(
+        b,
+        "\tHash que",
+        at as usize + lbl_off::LHB_HASH,
+        que_field::LBL_LHB_HASH,
+    ));
+    s.push_str(&que_line(
+        b,
+        "\tRequests",
+        at as usize + lbl_off::REQUESTS,
+        que_field::LRQ_LBL_REQUESTS,
+    ));
+    for r in walk_queue(
+        b,
+        at as usize + lbl_off::REQUESTS,
+        que_field::LRQ_LBL_REQUESTS,
+    ) {
+        let q = Lrq::decode(b, r);
+        s.push_str(&format!(
+            "\t\tRequest {:6}, Owner: {:6}, State: {} ({}), Flags: 0x{:02X}\n",
+            q.offset, q.owner, q.state, q.requested, q.flags
+        ));
+    }
+    s.push('\n');
+    Ok(s)
+}
+
+/// `prt_request` (print.cpp): one REQUEST BLOCK section.
+///
+/// The AST line prints two POINTERS - addresses in the server's address
+/// space, which are meaningless in a snapshot and differ between the tool's
+/// process and ours. fire-crab prints the stored values as the engine
+/// formats them (`0x%p`), which for a granted request with no blocking AST
+/// is `0x(nil)`; a request that HAS an AST cannot be compared across
+/// processes at all, and the gate says so rather than pretending.
+pub fn request_section(b: &[u8], at: i32) -> String {
+    let r = Lrq::decode(b, at);
+    let o = at as usize;
+    let mut s = format!("REQUEST BLOCK {:6}\n", at);
+    s.push_str(&format!(
+        "\tOwner: {:6}, Lock: {:6}, State: {}, Mode: {}, Flags: 0x{:02X}\n",
+        r.owner, r.lock, r.state, r.requested, r.flags
+    ));
+    let ast = u64_at(b, o + 56);
+    let arg = u64_at(b, o + 64);
+    // The engine's format string is "AST: 0x%p" and glibc's %p ALREADY
+    // prints a 0x prefix, so the real output carries a DOUBLE one:
+    // `AST: 0x0xeb781933e044`. Converted as it prints, not as it reads -
+    // the differential is the tool's text, quirks included.
+    let ptr = |v: u64| {
+        if v == 0 {
+            "0x(nil)".to_string()
+        } else {
+            format!("0x0x{:x}", v)
+        }
+    };
+    s.push_str(&format!("\tAST: {}, argument: {}\n", ptr(ast), ptr(arg)));
+    for (label, off, field) in [
+        ("\tlrq_own_requests", lrq_off::OWN_REQUESTS, que_field::LRQ_OWN_REQUESTS),
+        ("\tlrq_lbl_requests", lrq_off::LBL_REQUESTS, que_field::LRQ_LBL_REQUESTS),
+        ("\tlrq_own_blocks  ", lrq_off::OWN_BLOCKS, que_field::LRQ_OWN_BLOCKS),
+        ("\tlrq_own_pending ", lrq_off::OWN_PENDING, que_field::LRQ_OWN_PENDING),
+    ] {
+        s.push_str(&que_line_uncounted(b, label, o + off, field));
+    }
+    s.push('\n');
+    s
+}
+
+/// `history_names` (print.cpp): the operation each history entry records.
+/// Index 0 is `n/a` and entries with operation 0 are SKIPPED - the ring is
+/// pre-allocated, so an unused slot is a zero.
+pub const HISTORY_NAMES: &[&str] = &[
+    "n/a", "ENQ", "DEQ", "CONVERT", "SIGNAL", "POST", "WAIT", "DEL_PROC", "DEL_LOCK", "DEL_REQ",
+    "DENY", "GRANT", "LEAVE", "SCAN", "DEAD", "ENTER", "BUG", "ACTIVE", "CLEANUP", "DEL_OWNER",
+];
+
+/// Field offsets inside a `his` block (lock_proto.h:218-226).
+mod his_off {
+    pub const OPERATION: usize = 1;
+    pub const NEXT: usize = 4;
+    pub const PROCESS: usize = 8;
+    pub const LOCK: usize = 12;
+    pub const REQUEST: usize = 16;
+}
+
+/// `prt_history`: the ring of recent lock-manager events, walked from
+/// `lhb_history` all the way round to itself.
+///
+/// The ring is CIRCULAR and pre-allocated, so the walk is "print, then stop
+/// when the next pointer is the head again" - not "stop at a null". An
+/// entry whose operation is 0 is an unused slot and is skipped, but it
+/// still advances the walk.
+pub fn history_section(b: &[u8], head: i32, title: &str) -> String {
+    let mut s = format!("{}:\n", title);
+    let mut at = head;
+    let limit = b.len() / 8;
+    let mut steps = 0;
+    loop {
+        let o = at as usize;
+        if at < 0 || o + 20 > b.len() || steps > limit {
+            break;
+        }
+        let op = u8_at(b, o + his_off::OPERATION) as usize;
+        if op != 0 {
+            s.push_str(&format!(
+                "    {}:\towner = {:6}, lock = {:6}, request = {:6}\n",
+                HISTORY_NAMES.get(op).copied().unwrap_or("n/a"),
+                i32_at(b, o + his_off::PROCESS),
+                i32_at(b, o + his_off::LOCK),
+                i32_at(b, o + his_off::REQUEST)
+            ));
+        }
+        let next = i32_at(b, o + his_off::NEXT);
+        if next == head {
+            break;
+        }
+        at = next;
+        steps += 1;
+    }
+    s
+}
+
 /// Dump the lock table the way `fb_lock_print` does, for the header block
 /// and (with `owners`) the owner blocks - the `-o` switch's output.
 ///
@@ -447,7 +812,31 @@ fn que_line(b: &[u8], label: &str, head: usize, field: i32) -> String {
 /// and all, because the differential is a text comparison against the
 /// tool's own output on the same snapshot.
 pub fn dump(b: &[u8], owners: bool) -> Result<String, String> {
+    dump_with(b, owners, false, false)
+}
+
+/// The same, with `fb_lock_print`'s other two switches: `-l` (lock blocks)
+/// and `-r` (the requests inside each owner, which the engine only prints
+/// when `-o` is also given).
+pub fn dump_with(
+    b: &[u8],
+    owners: bool,
+    locks_too: bool,
+    requests: bool,
+) -> Result<String, String> {
+    dump_all(b, owners, locks_too, requests, false)
+}
+
+/// The full `-a`: owners, locks, requests and the history ring.
+pub fn dump_all(
+    b: &[u8],
+    owners: bool,
+    locks_too: bool,
+    requests: bool,
+    history: bool,
+) -> Result<String, String> {
     let h = Lhb::decode(b)?;
+    let h_secondary = h.secondary;
     let mut s = String::new();
     s.push_str("LOCK_HEADER BLOCK\n");
     s.push_str(&format!(
@@ -605,7 +994,34 @@ pub fn dump(b: &[u8], owners: bool) -> Result<String, String> {
                 que_field::LRQ_OWN_PENDING,
             ));
             s.push('\n');
+            // -r prints every request this owner holds, in the owner's own
+            // request queue order
+            if requests {
+                for r in walk_queue(
+                    b,
+                    o.offset as usize + own_off::REQUESTS,
+                    que_field::LRQ_OWN_REQUESTS,
+                ) {
+                    s.push_str(&request_section(b, r));
+                }
+            }
         }
+    }
+    if locks_too {
+        let h = Lhb::decode(b)?;
+        for at in locks(b, &h) {
+            s.push_str(&lock_section(b, at)?);
+        }
+    }
+    if history {
+        // TWO rings, printed one after the other: the lock table's own
+        // (`lhb_history`) and the secondary header's (`shb_history`,
+        // print.cpp:885-886) - titled "History" and "Event log". Missing
+        // the second one costs exactly one line of output plus its entries,
+        // which is how this was caught.
+        s.push_str(&history_section(b, i32_at(b, lhb_off::HISTORY), "History"));
+        let shb = h_secondary as usize;
+        s.push_str(&history_section(b, i32_at(b, shb + 4), "Event log"));
     }
     Ok(s)
 }
@@ -717,6 +1133,117 @@ mod tests {
         let mut b2 = vec![0u8; 64];
         b2[head..head + 4].copy_from_slice(&999_999i32.to_le_bytes());
         assert!(walk_queue(&b2, head, 0).is_empty());
+    }
+
+    #[test]
+    fn a_key_means_what_its_series_says() {
+        // The most informative line in the dump, and the one with the most
+        // branches. Series and LENGTH together select the shape; the widths
+        // are the engine's.
+        // a page lock: the key is (page number, page SPACE) and the dump
+        // prints them the other way round
+        let mut k = Vec::new();
+        k.extend_from_slice(&231u32.to_le_bytes());
+        k.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(format_key(series::BDB, 8, &k, 0), "\tKey: 0000:000231,");
+        assert_eq!(
+            format_key(series::BTR_DONT_GC, 8, &k, 0),
+            "\tKey: 0000:000231,"
+        );
+        // a relation lock: relation id + instance id
+        let mut k = Vec::new();
+        k.extend_from_slice(&128u32.to_le_bytes());
+        k.extend_from_slice(&7i64.to_le_bytes());
+        assert_eq!(
+            format_key(series::RELATION, 12, &k, 0),
+            "\tKey: 0128:000000007,"
+        );
+        // transaction / attachment / monitor / cancel: one 64-bit number
+        let k = 1362i64.to_le_bytes().to_vec();
+        assert_eq!(format_key(series::TRA, 8, &k, 0), "\tKey: 000001362,");
+        assert_eq!(
+            format_key(series::ATTACHMENT, 8, &k, 0),
+            "\tKey: 000001362,"
+        );
+        // a record-level GC lock packs page and line into one key
+        let k = ((231i64 << 16) | 4).to_le_bytes().to_vec();
+        assert_eq!(
+            format_key(series::RECORD_GC, 8, &k, 0),
+            "\tKey: 000231:0004,"
+        );
+        // an index rescan lock packs relation and index id into four bytes
+        let k = ((4u32 << 16) | 0).to_le_bytes().to_vec();
+        assert_eq!(
+            format_key(series::IDX_RESCAN, 4, &k, 0),
+            "\tKey: 0004:0000,"
+        );
+        // ... and the SAME four bytes under any other series print as one
+        // number. Series 22 was verified against a live dump for exactly
+        // this reason: an off-by-one in the series enum shows up here and
+        // nowhere else.
+        assert_eq!(format_key(99, 4, &k, 0), "\tKey: 262144,");
+        // no key at all, and a text key with the engine's escape
+        assert_eq!(format_key(series::DATABASE, 0, &[], 0), "\tKey: <none>");
+        assert_eq!(
+            format_key(99, 5, b"ab\x01c/", 0),
+            "\tKey: ab<1>c/,"
+        );
+    }
+
+    #[test]
+    fn the_ast_line_keeps_the_engine_s_double_prefix() {
+        // print.cpp writes "AST: 0x%p", and glibc's %p already prints 0x,
+        // so the real output is `AST: 0x0xeb781933e044`. The differential is
+        // the tool's TEXT, quirks included - "fixing" this makes the dump
+        // wrong.
+        let mut b = vec![0u8; 128];
+        b[56..64].copy_from_slice(&0xeb781933e044u64.to_le_bytes());
+        b[64..72].copy_from_slice(&0u64.to_le_bytes());
+        let s = request_section(&b, 0);
+        assert!(s.contains("\tAST: 0x0xeb781933e044, argument: 0x(nil)\n"), "{}", s);
+    }
+
+    #[test]
+    fn the_history_ring_skips_unused_slots_and_stops_at_the_head() {
+        // the ring is pre-allocated and circular: operation 0 is an unused
+        // slot (skipped, but it still advances the walk), and the walk ends
+        // when a next pointer points back at the head - not at a null
+        let mut b = vec![0u8; 256];
+        let mk = |b: &mut Vec<u8>, at: usize, op: u8, next: i32, owner: i32| {
+            b[at + 1] = op;
+            b[at + 4..at + 8].copy_from_slice(&next.to_le_bytes());
+            b[at + 8..at + 12].copy_from_slice(&owner.to_le_bytes());
+        };
+        mk(&mut b, 32, 1, 64, 111); // ENQ
+        mk(&mut b, 64, 0, 96, 222); // unused slot: skipped
+        mk(&mut b, 96, 11, 32, 333); // GRANT, then back to the head
+        let s = history_section(&b, 32, "History");
+        assert_eq!(
+            s,
+            "History:\n    ENQ:\towner =    111, lock =      0, request =      0\n    GRANT:\towner =    333, lock =      0, request =      0\n"
+        );
+    }
+
+    #[test]
+    fn the_lock_and_request_layouts_are_pinned() {
+        // lbl_lhb_hash at 12 was verified in slice 4 through the free-locks
+        // queue; the rest follow the struct, with LOCK_DATA_T forcing an
+        // 8-byte alignment pad after the third queue
+        assert_eq!(lbl_off::REQUESTS, 4);
+        assert_eq!(lbl_off::LHB_HASH, 12);
+        assert_eq!(lbl_off::DATA, 32);
+        assert_eq!(lbl_off::SERIES, 40);
+        assert_eq!(lbl_off::COUNTS, 44);
+        assert_eq!(lbl_off::KEY, 44 + 2 * LCK_MAX);
+        // The request queues: own_requests at 24 was verified against a
+        // printed queue head in slice 4, and the other three were WRONG
+        // there - shifted by one field - because they are empty on a server
+        // with no contention. A blocked waiter populates own_pending, and
+        // then 48 is the only value that prints what the tool prints.
+        assert_eq!(lrq_off::OWN_REQUESTS, 24);
+        assert_eq!(lrq_off::LBL_REQUESTS, 32);
+        assert_eq!(lrq_off::OWN_BLOCKS, 40);
+        assert_eq!(lrq_off::OWN_PENDING, 48);
     }
 
     #[test]
