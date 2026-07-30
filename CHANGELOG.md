@@ -13,6 +13,37 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — the other half of the condition/value duality
+
+### Converted
+- **`LIKE` as a VALUE** — `SELECT NAME LIKE 'a%'`, `NOT LIKE`, with
+  `ESCAPE`, inside a `CASE` condition and under `AND`/`NOT`. It was the
+  one predicate form the condition-as-a-value slice left out, because
+  `RawCond`/`Cond2` had no LIKE leaf to put it in.
+- **A CONDITION as a comparison SIDE** — `WHERE (ID > 2) = TRUE`,
+  `(B = TRUE) = TRUE`, `(NAME LIKE 'a%') = TRUE`. If a predicate is a
+  value, a comparison between two of them is just a comparison. The
+  predicate tokenizer now looks past a parenthesised group: followed by
+  a comparison operator it is an OPERAND and lexes as one expression;
+  followed by anything else it stays the sub-predicate it always was.
+
+### Fixed
+- **`SELECT CASE ... ELSE LOWER(S) END` refused.** The bare trailing
+  alias added two increments ago split it at the last space and read
+  `END` as the alias, leaving a CASE with no END. The rule guarded
+  keywords at the end of the HEAD (`NOT B`, `B AND C`) but not the TAIL,
+  which is where this one is. Caught by an existing gate.
+
+### Guarded
+- `qa/serve-real-boolvalue.sh` now COUNTS the checks it ran and fails if
+  fewer than expected. Adding this slice's checks with a mistyped helper
+  name made eight of them vanish — a shell "command not found" does not
+  touch the failure flag, so the gate reported success while doing less
+  work than it claimed. A gate that can silently skip is a gate that can
+  silently pass.
+
+`qa/serve-real-boolvalue.sh` grew from 33 checks to 51.
+
 ## 2026-07-30 — aggregates and GROUP BY over a JOIN
 
 ### Converted

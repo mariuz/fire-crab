@@ -6872,6 +6872,39 @@ single-column reference, one by the rendered text of a COALESCE, where
 looked exactly like a server bug until read closely, which is the argument for
 writing the reference query as the same question rather than a convenient one.
 
+### The other half of the condition/value duality
+
+Two shapes were left over when conditions became values. `SELECT NAME LIKE
+'a%'` had nowhere to go, because `RawCond` and `Cond2` carried comparisons and
+NULL tests and no LIKE leaf - the predicate grammar keeps its own, on a
+different type. And `WHERE (ID > 2) = TRUE` is the same duality read the other
+way: if a predicate is a value, a comparison between two of them is just a
+comparison.
+
+The second needed one lookahead in the tokenizer. A parenthesised group had
+always been a sub-predicate; now, when a comparison operator follows the
+closing paren, the group is an OPERAND and lexes as a single expression token.
+Everything else about parentheses is unchanged, which the gate checks in the
+same breath - `(ID > 1) AND (ID < 4)` is still a group, and `(ID + 1) > 2` is
+still arithmetic.
+
+**A bug from two increments ago, caught by an old gate.** `SELECT CASE WHEN
+CHAR_LENGTH(S) > 3 THEN UPPER(S) ELSE LOWER(S) END` refused. The bare trailing
+alias - `SELECT NAME X` - is a split on the last space, and it read `END` as
+the alias, leaving a CASE with no END. The rule already guarded keywords at the
+end of the HEAD (so `NOT B` and `B AND C` stay whole); it did not guard the
+TAIL, which is where this one lives. `CASE ... END` had integer branches in my
+own probes, and those happen to survive: the head `CASE WHEN ... ELSE 0` does
+not parse as an expression, so no split happened. The text branches made the
+head end in `)`, which does.
+
+**And a near-miss in the gate itself.** The new checks used a `where` helper
+this gate did not have. A shell "command not found" does not touch the failure
+flag, so eight checks vanished and the gate still reported success - 43 OK
+instead of 51, which nobody would notice. It now COUNTS what it ran and fails
+if the count is short. Worth doing everywhere a gate is edited often: a gate
+that can silently skip is a gate that can silently pass.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

@@ -1238,6 +1238,17 @@ them.
   Every one looked like a server bug. If the reference has to be written
   differently, make the DIFFERENCE the thing you reason about.
 
+- **Count what your gate actually ran.** A mistyped helper name is a
+  shell "command not found" that leaves the failure flag alone, so the
+  gate reports success having done less work than it claims. Eight
+  checks disappeared from one gate that way and the run still passed.
+  Track a counter and assert a floor.
+- **A grammar rule that splits on whitespace must guard BOTH sides.**
+  The bare trailing alias guarded keywords at the end of the head, so
+  `NOT B` stayed whole - and read `END` as an alias in `CASE ... END`,
+  because nothing checked the TAIL. Both ends of a split are the same
+  question.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

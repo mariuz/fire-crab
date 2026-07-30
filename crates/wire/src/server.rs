@@ -11427,6 +11427,7 @@ fn normalize_cond(c: &RawCond) -> RawCond {
         RawCond::Cmp(a, op, b) => RawCond::Cmp(nb(a), *op, nb(b)),
         RawCond::IsNull(a) => RawCond::IsNull(nb(a)),
         RawCond::IsNotNull(a) => RawCond::IsNotNull(nb(a)),
+        RawCond::Like(a, p, e, n) => RawCond::Like(nb(a), p.clone(), *e, *n),
         RawCond::Not(inner) => RawCond::Not(Box::new(normalize_cond(inner))),
         RawCond::And(v) => RawCond::And(v.iter().map(normalize_cond).collect()),
         RawCond::Or(v) => RawCond::Or(v.iter().map(normalize_cond).collect()),
@@ -13625,6 +13626,9 @@ enum RawCond {
     Cmp(Box<RawExpr>, Cmp, Box<RawExpr>),
     IsNull(Box<RawExpr>),
     IsNotNull(Box<RawExpr>),
+    /// `<expr> [NOT] LIKE '<pattern>' [ESCAPE '<c>']` - a condition like
+    /// any other, and so a VALUE like any other
+    Like(Box<RawExpr>, String, Option<char>, bool),
     Not(Box<RawCond>),
     And(Vec<RawCond>),
     Or(Vec<RawCond>),
@@ -13744,6 +13748,54 @@ fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
         } else {
             RawCond::IsNull(Box::new(left))
         });
+    }
+    // LIKE is its own leaf (the pattern is a literal, so there is
+    // nothing to desugar into) - `SELECT NAME LIKE 'a%'` is a value like
+    // any other condition
+    {
+        let mut p2 = *pos;
+        skip_ws(b, &mut p2);
+        let mut probe = p2;
+        let negated = take_keyword(b, &mut probe, "NOT");
+        if negated {
+            p2 = probe;
+        }
+        let mut after = p2;
+        if take_keyword(b, &mut after, "LIKE") {
+            skip_ws(b, &mut after);
+            if b.get(after) != Some(&'\'') {
+                return None; // only a literal pattern
+            }
+            after += 1;
+            let start = after;
+            while after < b.len() && b[after] != '\'' {
+                after += 1;
+            }
+            if after >= b.len() {
+                return None;
+            }
+            let pattern: String = b[start..after].iter().collect();
+            after += 1;
+            let mut esc = None;
+            let mut probe = after;
+            if take_keyword(b, &mut probe, "ESCAPE") {
+                skip_ws(b, &mut probe);
+                if b.get(probe) != Some(&'\'') {
+                    return None;
+                }
+                probe += 1;
+                let c = *b.get(probe)?;
+                probe += 1;
+                if b.get(probe) != Some(&'\'') {
+                    return None; // ESCAPE takes a single character
+                }
+                probe += 1;
+                esc = Some(c);
+                after = probe;
+            }
+            *pos = after;
+            return Some(RawCond::Like(Box::new(left), pattern, esc, negated));
+        }
     }
     // BETWEEN and IN desugar here exactly as they do in the predicate
     // grammar - into comparisons the rest of the pipeline already knows -
@@ -14250,7 +14302,9 @@ fn raw_cond_bad_substring_len(c: &RawCond) -> Option<i64> {
         RawCond::Cmp(x, _, y) => {
             raw_bad_substring_len(x).or_else(|| raw_bad_substring_len(y))
         }
-        RawCond::IsNull(x) | RawCond::IsNotNull(x) => raw_bad_substring_len(x),
+        RawCond::IsNull(x) | RawCond::IsNotNull(x) | RawCond::Like(x, ..) => {
+            raw_bad_substring_len(x)
+        }
         RawCond::Not(inner) => raw_cond_bad_substring_len(inner),
         RawCond::And(parts) | RawCond::Or(parts) => {
             parts.iter().find_map(raw_cond_bad_substring_len)
@@ -14712,6 +14766,12 @@ fn resolve_raw_cond(
             )?;
             Cond2::Cmp(Box::new(l), *op, Box::new(r))
         }
+        RawCond::Like(a, pat, esc, negated) => Cond2::Like(
+            Box::new(resolve_expr(a, columns, descs)?),
+            pat.clone(),
+            *esc,
+            *negated,
+        ),
         RawCond::IsNull(a) => Cond2::IsNull(Box::new(resolve_expr(a, columns, descs)?)),
         RawCond::IsNotNull(a) => Cond2::IsNotNull(Box::new(resolve_expr(a, columns, descs)?)),
         RawCond::Not(inner) => Cond2::Not(Box::new(resolve_raw_cond(inner, columns, descs)?)),
@@ -14879,6 +14939,10 @@ enum Cond2 {
     Cmp(Box<Expr>, Cmp, Box<Expr>),
     IsNull(Box<Expr>),
     IsNotNull(Box<Expr>),
+    /// `<expr> [NOT] LIKE <pattern> [ESCAPE <c>]`: the operand is
+    /// rendered to text (as the engine coerces) and matched per
+    /// CHARACTER. A NULL operand is UNKNOWN, like every comparison.
+    Like(Box<Expr>, String, Option<char>, bool),
     Not(Box<Cond2>),
     And(Vec<Cond2>),
     Or(Vec<Cond2>),
@@ -14893,6 +14957,13 @@ impl Cond2 {
         Ok(match self {
             Cond2::IsNull(a) => Some(matches!(a.eval(values)?, Value::Null)),
             Cond2::IsNotNull(a) => Some(!matches!(a.eval(values)?, Value::Null)),
+            // the operand renders to text, as the engine coerces it; a
+            // NULL is UNKNOWN, and NOT LIKE is the negation of the match
+            // rather than of the three-valued result
+            Cond2::Like(a, pat, esc, negated) => match a.eval(values)? {
+                Value::Null => None,
+                v => Some(like_match(&v.render(), pat, *esc) != *negated),
+            },
             Cond2::Not(c) => c.eval(values)?.map(|b| !b),
             Cond2::And(parts) => {
                 let mut unknown = false;
@@ -17551,16 +17622,22 @@ fn split_alias(item: &str) -> (&str, Option<&str>) {
     if head.is_empty() || tail.is_empty() {
         return (item, None);
     }
-    // An OPERATOR KEYWORD at the end of the head means the tail is its
-    // OPERAND, not an alias: `NOT B` splits into `NOT` and `B`, and
-    // `B AND C` into `B AND` and `C`. Both are complete items whose last
-    // token only looks like a name.
+    // A KEYWORD on either side of the split means this is not an alias.
+    // At the END OF THE HEAD it is an operator whose operand follows -
+    // `NOT B` splits into `NOT` and `B`, `B AND C` into `B AND` and `C`.
+    // As the TAIL it is the item's own last token: `CASE ... ELSE
+    // LOWER(S) END` ends in END, which is not a name however much it
+    // looks like one, and splitting there leaves a CASE with no END.
+    let keyword = |w: &str| {
+        matches!(
+            w.to_ascii_uppercase().as_str(),
+            "NOT" | "AND" | "OR" | "IS" | "LIKE" | "BETWEEN" | "IN" | "DISTINCT" | "FROM"
+                | "ESCAPE" | "THEN" | "ELSE" | "WHEN" | "CASE" | "END" | "ALL" | "ANY"
+                | "SOME" | "NULL" | "UNKNOWN"
+        )
+    };
     let last_word = head.rsplit(|c: char| c.is_whitespace()).next().unwrap_or("");
-    if matches!(
-        last_word.to_ascii_uppercase().as_str(),
-        "NOT" | "AND" | "OR" | "IS" | "LIKE" | "BETWEEN" | "IN" | "DISTINCT" | "FROM"
-            | "ESCAPE" | "THEN" | "ELSE" | "WHEN" | "CASE" | "END" | "ALL" | "ANY" | "SOME"
-    ) {
+    if keyword(last_word) || (!quoted && keyword(tail)) {
         return (item, None);
     }
     // an alias cannot be a keyword that continues the statement, and the
@@ -17913,6 +17990,26 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                 i += 1;
             }
             b'(' => {
+                // A parenthesised group followed by a COMPARISON is not
+                // a sub-predicate but an OPERAND - `WHERE (ID > 2) =
+                // TRUE`. Firebird makes every predicate a value, so the
+                // group is lexed whole and parsed as an expression (the
+                // expression parser falls back to the condition
+                // grammar); a group followed by anything else stays the
+                // sub-predicate it has always been.
+                if let Some(close) = matching_paren(b, i) {
+                    let mut j = close + 1;
+                    while j < b.len() && b[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if matches!(b.get(j), Some(b'=' | b'<' | b'>' | b'!')) {
+                        if let Some(raw) = parse_raw_expr_any(&s[i..=close]) {
+                            out.push(Tok::FnExpr(raw));
+                            i = close + 1;
+                            continue;
+                        }
+                    }
+                }
                 out.push(Tok::LParen);
                 i += 1;
             }
@@ -19915,7 +20012,7 @@ fn resolve_expr_term(
                 a.type_of(descs)?;
                 b.type_of(descs)?;
             }
-            Cond2::IsNull(a) | Cond2::IsNotNull(a) => {
+            Cond2::IsNull(a) | Cond2::IsNotNull(a) | Cond2::Like(a, ..) => {
                 a.type_of(descs)?;
             }
             Cond2::Not(inner) => cond_types(inner, descs)?,
@@ -20154,7 +20251,9 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
 fn cond_no_raise(c: &Cond2, descs: &[Descriptor]) -> bool {
     match c {
         Cond2::Cmp(a, _, b) => expr_no_raise(a, descs) && expr_no_raise(b, descs),
-        Cond2::IsNull(a) | Cond2::IsNotNull(a) => expr_no_raise(a, descs),
+        Cond2::IsNull(a) | Cond2::IsNotNull(a) | Cond2::Like(a, ..) => {
+            expr_no_raise(a, descs)
+        }
         Cond2::Not(inner) => cond_no_raise(inner, descs),
         Cond2::And(parts) | Cond2::Or(parts) => {
             parts.iter().all(|p| cond_no_raise(p, descs))
@@ -25643,6 +25742,14 @@ mod tests {
         assert_eq!(split_alias("ID NAME AMT"), ("ID NAME AMT", None));
         assert_eq!(split_alias("ID NAME"), ("ID", Some("NAME")));
 
+        // a KEYWORD is never an alias, on either side of the split:
+        // `CASE ... ELSE LOWER(S) END` ends in END, and splitting there
+        // leaves a CASE with no END (an existing gate caught it)
+        assert_eq!(
+            split_alias("CASE WHEN A > 1 THEN UPPER(S) ELSE LOWER(S) END"),
+            ("CASE WHEN A > 1 THEN UPPER(S) ELSE LOWER(S) END", None)
+        );
+        assert_eq!(split_alias("A IS NULL"), ("A IS NULL", None));
         // TRUE/FALSE/UNKNOWN/NULL look like identifiers and are
         // LITERALS - they must not take the column path, with or
         // without an alias

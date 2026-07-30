@@ -44,6 +44,7 @@ B="$D/fc-bv-engine.fdb"
 command -v node >/dev/null 2>&1 || { echo "SKIP node not found"; exit 0; }
 mkdir -p "$D"
 fail=0
+ran=0
 
 # row 3 is (NULL, FALSE) and row 4 is (TRUE, NULL): one for each half of
 # the Kleene rule, so an implementation that answered NULL whenever an
@@ -95,6 +96,7 @@ query() { # <sql> <port> <db>
 }
 
 both() { # <label> <sql>
+    ran=$((ran + 1))
     a=$(query "$2" "$PORT" "$A")
     b=$(query "$2" "$REAL" "$B")
     if [ "$a" = "$b" ]; then
@@ -110,6 +112,9 @@ both() { # <label> <sql>
 # how the BOOL naming law is checked without a separate probe
 val() { # <expression>
     both "$1" "SELECT ID, $1 FROM T ORDER BY ID"
+}
+where() { # <label> <predicate>
+    both "$1" "SELECT ID FROM T WHERE $2 ORDER BY ID"
 }
 
 # --- 1. the Kleene fold, which only a VALUE can show -------------------
@@ -158,7 +163,35 @@ both "GROUP BY a condition" \
 both "a bare column keeps its OWN name" "SELECT B FROM T WHERE ID = 1"
 both "and an aliased one takes the alias" "SELECT B AND C AS X FROM T WHERE ID = 1"
 
-# --- 6. the ordinary expressions are untouched -------------------------
+# --- 6. LIKE is a condition, so LIKE is a VALUE ------------------------
+val "NAME LIKE 'a%'"
+val "NAME NOT LIKE 'a%'"
+val "NAME LIKE '_a'"
+val "NAME LIKE 'A%'"
+both "LIKE with an ESCAPE as a value" \
+     "SELECT ID, NAME LIKE 'a#%' ESCAPE '#' FROM T ORDER BY ID"
+val "B AND (NAME LIKE 'a%')"
+val "NOT (NAME LIKE 'a%')"
+both "LIKE inside a CASE condition" \
+     "SELECT ID, CASE WHEN NAME LIKE 'a%' THEN 1 ELSE 0 END FROM T ORDER BY ID"
+# ... and the WHERE clause's own LIKE is unchanged
+both "LIKE still filters" "SELECT ID FROM T WHERE NAME LIKE 'a%' ORDER BY ID"
+both "NOT LIKE still filters" "SELECT ID FROM T WHERE NAME NOT LIKE 'a%' ORDER BY ID"
+
+# --- 7. a CONDITION as a comparison SIDE -------------------------------
+# the other direction of the same duality: if a predicate is a value,
+# then `(ID > 2) = TRUE` is a comparison between two booleans
+where "a parenthesised condition against TRUE" "(ID > 2) = TRUE"
+where "against FALSE" "(ID > 2) = FALSE"
+where "a boolean comparison as a side" "(B = TRUE) = TRUE"
+where "a LIKE as a side" "(NAME LIKE 'a%') = TRUE"
+where "negated with <>" "(ID > 2) <> TRUE"
+# a parenthesised group NOT followed by a comparison is still a group
+where "an ordinary parenthesised group" "(ID > 1) AND (ID < 4)"
+where "a group of boolean columns" "(B OR C) AND ID > 1"
+where "and parenthesised ARITHMETIC is an operand" "(ID + 1) > 2"
+
+# --- 8. the ordinary expressions are untouched -------------------------
 both "arithmetic still parses as arithmetic" \
      "SELECT ID, ID + 1, ID - 1, ID * 2 FROM T ORDER BY ID"
 both "and the WHERE grammar is unchanged" \
@@ -166,6 +199,7 @@ both "and the WHERE grammar is unchanged" \
 
 # --- refusals ----------------------------------------------------------
 # a non-boolean column is not a condition, in either grammar
+ran=$((ran + 1))
 r=$(query "SELECT CASE WHEN NAME THEN 1 ELSE 0 END FROM T" "$PORT" "$A")
 case "$r" in
     ERR*) echo "OK   a text column is not a CASE condition" ;;
@@ -173,4 +207,12 @@ case "$r" in
 esac
 
 rm -f "$A" "$B"
+# A COUNT of what actually ran. A mistyped helper name is a shell
+# "command not found" that does not touch `fail`, so eight checks once
+# vanished from this gate while it still reported success. Counting them
+# turns a silent skip into a visible failure.
+if [ "$ran" -lt 51 ]; then
+    echo "DIFF only $ran checks ran (expected at least 51) - did one silently skip?"
+    fail=1
+fi
 exit $fail
