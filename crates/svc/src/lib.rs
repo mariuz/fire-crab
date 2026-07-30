@@ -155,6 +155,124 @@ pub mod action {
     pub const LAST: u8 = 32;
 }
 
+/// `isc_spb_sts_*` (consts_pub.h:619-630): what a `db_stats` action is
+/// asked to report. The low bits are an OPTIONS bitmask; `sts_table` and
+/// `sts_schema` are string clumplets, not bits.
+pub mod sts {
+    pub const DATA_PAGES: u32 = 0x01;
+    pub const DB_LOG: u32 = 0x02;
+    pub const HDR_PAGES: u32 = 0x04;
+    pub const IDX_PAGES: u32 = 0x08;
+    pub const SYS_RELATIONS: u32 = 0x10;
+    pub const RECORD_VERSIONS: u32 = 0x20;
+    pub const NOCREATION: u32 = 0x80;
+    pub const ENCRYPTION: u32 = 0x100;
+    /// string clumplets, not bits
+    pub const TABLE: u8 = 64;
+    pub const SCHEMA: u8 = 65;
+}
+
+/// Statistics-option validation, enforced by the SERVICE and not by the
+/// client: `isc_spb_sts_hdr_pages` may not be combined with any other
+/// analysis. The engine answers the combination with gstat message 38 -
+/// *"option -h is incompatible with options -a, -d, -i, -r, -schema, -s
+/// and -t"* - as gds 336920614, which is a facility-coded message, not one
+/// of the isc_* codes.
+///
+/// Probed both ways against the live server: `data` alone runs, `hdr data`
+/// and `hdr versions` are refused with that exact code.
+pub const GSTAT_HDR_INCOMPATIBLE: i32 = 336920614;
+
+/// Whether an options bitmask breaks the rule above.
+pub fn stats_options_conflict(options: u32) -> bool {
+    let others = sts::DATA_PAGES
+        | sts::DB_LOG
+        | sts::IDX_PAGES
+        | sts::SYS_RELATIONS
+        | sts::RECORD_VERSIONS
+        | sts::ENCRYPTION;
+    options & sts::HDR_PAGES != 0 && options & others != 0
+}
+
+/// How one clumplet is framed (`ClumpletReader::ClumpletType`, with the
+/// sizes from `getClumpletSize`). A start SPB mixes all of these in one
+/// buffer, keyed by (action, tag) - there is no self-describing length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClumpletType {
+    /// 1-byte length (the attach SPB's form)
+    Traditional,
+    /// 2-byte LE length - "used in SPB for long strings"
+    StringSpb,
+    /// no length, 4 bytes of data
+    IntSpb,
+    /// no length, 8 bytes
+    BigIntSpb,
+    /// no length, 1 byte
+    ByteSpb,
+    /// tag only
+    Single,
+}
+
+impl ClumpletType {
+    fn length_bytes(self) -> usize {
+        match self {
+            ClumpletType::Traditional => 1,
+            ClumpletType::StringSpb => 2,
+            _ => 0,
+        }
+    }
+    fn fixed_data(self) -> usize {
+        match self {
+            ClumpletType::IntSpb => 4,
+            ClumpletType::BigIntSpb => 8,
+            ClumpletType::ByteSpb => 1,
+            _ => 0,
+        }
+    }
+}
+
+/// The (action, tag) -> framing table for a start SPB
+/// (`ClumpletReader::getClumpletType`, the `SpbStart` arm).
+///
+/// Only the actions fire-crab parses are described. An unknown pair is
+/// refused rather than guessed: guessing a length turns the next tag into
+/// data and the rest of the buffer into nonsense.
+pub fn start_clumplet_type(action: u8, tag: u8) -> Option<ClumpletType> {
+    use ClumpletType::*;
+    match action {
+        action::DB_STATS => match tag {
+            spb::DBNAME | spb::COMMAND_LINE | sts::TABLE | sts::SCHEMA => Some(StringSpb),
+            spb::OPTIONS => Some(IntSpb),
+            _ => None,
+        },
+        action::BACKUP | action::RESTORE => match tag {
+            spb::DBNAME => Some(StringSpb),
+            spb::OPTIONS | spb::VERBINT => Some(IntSpb),
+            spb::VERBOSE => Some(Single),
+            _ => None,
+        },
+        action::REPAIR | action::VALIDATE => match tag {
+            spb::DBNAME => Some(StringSpb),
+            spb::OPTIONS => Some(IntSpb),
+            _ => None,
+        },
+        action::GET_FB_LOG => None,
+        _ => None,
+    }
+}
+
+/// Build the start SPB for `db_stats` on one database - what `gstat`
+/// through a service manager sends.
+pub fn build_start_db_stats(db: &str, options: u32) -> Vec<u8> {
+    let mut v = vec![action::DB_STATS];
+    v.push(spb::DBNAME);
+    v.extend_from_slice(&(db.len() as u16).to_le_bytes());
+    v.extend_from_slice(db.as_bytes());
+    v.push(spb::OPTIONS);
+    v.extend_from_slice(&options.to_le_bytes());
+    v
+}
+
 /// Which grammar a buffer follows (`ClumpletReader::Kind`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Grammar {
@@ -272,13 +390,48 @@ pub fn parse(grammar: Grammar, buf: &[u8]) -> Result<Buffer, String> {
                 items.push(Clumplet { tag, data: vec![] });
             }
             Grammar::SpbStart => {
-                // the action byte, then a per-action grammar this slice
-                // does not claim to know
+                // the FIRST byte is the action, and it decides how every
+                // later tag in this buffer is framed
+                if items.is_empty() {
+                    items.push(Clumplet { tag, data: vec![] });
+                    continue;
+                }
+                let action = items[0].tag;
+                let kind = start_clumplet_type(action, tag).ok_or_else(|| {
+                    format!("action {} has no framing for tag {}", action, tag)
+                })?;
+                let mut len = kind.fixed_data();
+                match kind.length_bytes() {
+                    1 => {
+                        len = *buf
+                            .get(at)
+                            .ok_or_else(|| format!("clumplet {} has no length byte", tag))?
+                            as usize;
+                        at += 1;
+                    }
+                    2 => {
+                        if at + 2 > buf.len() {
+                            return Err(format!("clumplet {} has no length word", tag));
+                        }
+                        len = u16::from_le_bytes([buf[at], buf[at + 1]]) as usize;
+                        at += 2;
+                    }
+                    _ => {}
+                }
+                let end = at + len;
+                if end > buf.len() {
+                    return Err(format!(
+                        "clumplet {} claims {} bytes, {} remain",
+                        tag,
+                        len,
+                        buf.len() - at
+                    ));
+                }
                 items.push(Clumplet {
                     tag,
-                    data: buf[at..].to_vec(),
+                    data: buf[at..end].to_vec(),
                 });
-                at = buf.len();
+                at = end;
             }
             Grammar::SpbAttach => {
                 let len = *buf
@@ -439,6 +592,98 @@ impl InfoResponse {
         }
         self.buf
     }
+}
+
+/// The output stream of a running action - what `isc_info_svc_line` and
+/// `isc_info_svc_to_eof` read from (`Service::get`, svc.cpp:2360-2430).
+///
+/// The two items differ in ONE documented way, and it is a strange one:
+///
+/// > If returning a line of information, replace all new line characters
+/// > with a space. This will ensure that the output is consistent when
+/// > returning a line or to eof. — svc.cpp:2404
+///
+/// So `isc_info_svc_line` returns the bytes up to and including the
+/// newline, with the newline itself REPLACED BY A SPACE, and stops there.
+/// An empty line therefore comes back as a single space, not as nothing -
+/// and "nothing" is reserved: a ZERO-length item is how the stream says it
+/// is finished. Both were read off the wire from the live engine
+/// (`fcsvc stats --raw`), which is the only way to be sure of a convention
+/// like this.
+pub struct Output {
+    text: Vec<u8>,
+    at: usize,
+}
+
+impl Output {
+    pub fn new(text: impl Into<Vec<u8>>) -> Output {
+        Output {
+            text: text.into(),
+            at: 0,
+        }
+    }
+
+    /// `isc_info_svc_line`: one line, its newline turned into a space.
+    /// Empty when the stream is exhausted.
+    pub fn next_line(&mut self) -> Vec<u8> {
+        if self.at >= self.text.len() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        while self.at < self.text.len() {
+            let ch = self.text[self.at];
+            self.at += 1;
+            if ch == b'\n' {
+                out.push(b' ');
+                break;
+            }
+            out.push(ch);
+        }
+        out
+    }
+
+    /// `isc_info_svc_to_eof`: as much as fits, raw - newlines survive.
+    pub fn to_eof(&mut self, limit: usize) -> Vec<u8> {
+        let end = (self.at + limit).min(self.text.len());
+        let out = self.text[self.at..end].to_vec();
+        self.at = end;
+        out
+    }
+
+    pub fn finished(&self) -> bool {
+        self.at >= self.text.len()
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.text.len().saturating_sub(self.at)
+    }
+}
+
+/// Answer a poll of a running action's output. `item` is
+/// `isc_info_svc_line` or `isc_info_svc_to_eof`; anything else is not this
+/// function's business.
+///
+/// The buffer length bounds the answer the same way every other info item
+/// is bounded, so a `to_eof` of a long report comes back in several polls.
+pub fn answer_output(item: u8, out: &mut Output, buffer_length: usize) -> Vec<u8> {
+    let mut r = InfoResponse::new(buffer_length);
+    // room for the tag, the length word and isc_info_end
+    let room = buffer_length.saturating_sub(5);
+    let chunk = match item {
+        info::TO_EOF => out.to_eof(room),
+        _ => {
+            let line = out.next_line();
+            if line.len() > room {
+                // a line longer than the buffer: the engine's own answer
+                // is a truncated item, which InfoResponse produces
+                line
+            } else {
+                line
+            }
+        }
+    };
+    r.string(item, &chunk);
+    r.finish()
 }
 
 /// What a service manager knows about itself - the values svc.cpp reads
@@ -763,10 +1008,35 @@ mod tests {
     }
 
     #[test]
-    fn start_spb_keeps_the_action_first() {
-        let b = parse(Grammar::SpbStart, &[action::BACKUP, spb::DBNAME, 3, b'x', b'y', b'z'])
-            .unwrap();
-        assert_eq!(b.items[0].tag, action::BACKUP);
+    fn a_start_spb_is_framed_by_its_action() {
+        // the action byte decides how every later tag is framed - a start
+        // SPB mixes 2-byte-length strings with bare 4-byte integers, and
+        // nothing in the bytes says which is which
+        let spb = build_start_db_stats("/tmp/x.fdb", sts::HDR_PAGES);
+        let b = parse(Grammar::SpbStart, &spb).expect("our own start SPB");
+        assert_eq!(b.items[0].tag, action::DB_STATS);
+        assert_eq!(b.text(spb::DBNAME).as_deref(), Some("/tmp/x.fdb"));
+        assert_eq!(b.number(spb::OPTIONS), Some(sts::HDR_PAGES as u64));
+        // isc_spb_dbname is a StringSpb (2-byte length), isc_spb_options an
+        // IntSpb (no length at all)
+        assert_eq!(
+            start_clumplet_type(action::DB_STATS, spb::DBNAME),
+            Some(ClumpletType::StringSpb)
+        );
+        assert_eq!(
+            start_clumplet_type(action::DB_STATS, spb::OPTIONS),
+            Some(ClumpletType::IntSpb)
+        );
+        // a tag this action has no framing for is REFUSED, not guessed:
+        // guessing a length turns the next tag into data
+        assert_eq!(start_clumplet_type(action::DB_STATS, spb::PASSWORD), None);
+        assert!(parse(
+            Grammar::SpbStart,
+            &[action::DB_STATS, spb::PASSWORD, 3, b'a', b'b', b'c']
+        )
+        .is_err());
+        // and an action we do not parse at all
+        assert!(parse(Grammar::SpbStart, &[action::ADD_USER, spb::USER_NAME, 1, b'x']).is_err());
     }
 
     fn server() -> ServerInfo {
@@ -818,6 +1088,60 @@ mod tests {
                 Answer::Marker(info::FLAG_END),
             ]
         );
+    }
+
+    #[test]
+    fn hdr_statistics_may_not_be_combined_with_another_analysis() {
+        // the engine enforces this in the SERVICE, with gstat message 38
+        // (gds 336920614) - probed live: `data` alone runs, `hdr data` and
+        // `hdr versions` are refused
+        assert!(stats_options_conflict(sts::HDR_PAGES | sts::DATA_PAGES));
+        assert!(stats_options_conflict(sts::HDR_PAGES | sts::RECORD_VERSIONS));
+        assert!(stats_options_conflict(sts::HDR_PAGES | sts::IDX_PAGES));
+        // each alone is fine
+        assert!(!stats_options_conflict(sts::HDR_PAGES));
+        assert!(!stats_options_conflict(sts::DATA_PAGES | sts::IDX_PAGES));
+        // nocreation is a MODIFIER of the header report, not an analysis
+        assert!(!stats_options_conflict(sts::HDR_PAGES | sts::NOCREATION));
+    }
+
+    #[test]
+    fn a_line_ends_with_a_space_where_its_newline_was() {
+        // svc.cpp:2404 - "replace all new line characters with a space" -
+        // so an EMPTY line is a single space, and a zero-length item is
+        // reserved for end-of-stream. Both pinned off the live engine's
+        // wire bytes (3e 0100 20 01 for a blank line, 3e 0000 01 at EOF).
+        let mut o = Output::new("a\n\nbc\n");
+        assert_eq!(o.next_line(), b"a ");
+        assert_eq!(o.next_line(), b" ");
+        assert_eq!(o.next_line(), b"bc ");
+        assert!(o.finished());
+        assert_eq!(o.next_line(), b"");
+        // the framing the engine sends: [tag][u16 len][text][isc_info_end]
+        let mut o = Output::new("x\n");
+        let buf = answer_output(info::LINE, &mut o, 8192);
+        assert_eq!(buf, vec![info::LINE, 2, 0, b'x', b' ', info::END]);
+        let end = answer_output(info::LINE, &mut o, 8192);
+        assert_eq!(end, vec![info::LINE, 0, 0, info::END]);
+    }
+
+    #[test]
+    fn to_eof_keeps_the_newlines_and_chunks_by_buffer() {
+        // the same stream read the other way: raw bytes, newlines intact -
+        // which is why the LINE path has to substitute a space, or the two
+        // readings would disagree about the text
+        let mut o = Output::new("one\ntwo\n");
+        let all = o.to_eof(8192);
+        assert_eq!(all, b"one\ntwo\n");
+        assert!(o.finished());
+        // a small buffer splits the stream across polls
+        let mut o = Output::new("abcdefghij");
+        let a = answer_output(info::TO_EOF, &mut o, 10); // 10 - 5 = 5 bytes
+        assert_eq!(a, vec![info::TO_EOF, 5, 0, b'a', b'b', b'c', b'd', b'e', info::END]);
+        assert_eq!(o.remaining(), 5);
+        let b = answer_output(info::TO_EOF, &mut o, 10);
+        assert_eq!(&b[3..8], b"fghij");
+        assert!(o.finished());
     }
 
     #[test]

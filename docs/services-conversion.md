@@ -126,13 +126,13 @@ the status vector. Not a marker in the buffer, and *not* silence. So:
 * an info item fire-crab does not serve refuses the whole query with
   `isc_wish_list` (335544378), and the gate checks that the REAL server refuses
   the same item with the same code;
-* a service **action** — backup, restore, sweep, stats, add-user — is refused
-  outright. This slice changed that from an acknowledgement: the old server
-  answered `op_service_start` with a clean `op_response`, and a clean response
-  to a backup request means "done". The client then polled an empty output
-  stream and reported a successful backup that never happened. `fbsvcmgr` now
-  prints *"feature is not supported"* for `action_db_stats` against fire-crab
-  and the real statistics against the engine, which is the honest pair.
+* a service **action** fire-crab cannot perform — backup, restore, sweep,
+  add-user — is refused outright. That replaced an acknowledgement: the server
+  once answered `op_service_start` with a clean `op_response`, and a clean
+  response to a backup request means "done", so the client polled an empty
+  output stream and reported a backup that never happened. `fbsvcmgr` now
+  prints *"feature is not supported"* for those, and the actions fire-crab DOES
+  perform (`db_stats` for the header report, below) stream real output.
 
 Skipping an unknown item would be worse than either error: the client would
 read the *next* item's bytes as this item's answer.
@@ -155,15 +155,96 @@ read the *next* item's bytes as this item's answer.
 5. **The refusals**: `isc_wish_list` from both servers for an unimplemented
    item; an action refused by fire-crab and performed by the engine.
 
+## Actions: `db_stats`, and what an action's answer really is
+
+An action is not a query. `op_service_start` hands the manager an SPB naming
+what to do; the answer is a TEXT STREAM the client then polls with
+`isc_info_svc_line` or `isc_info_svc_to_eof`. So a service session is
+stateful — start, then poll until the stream ends — and a converted service
+manager has to hold that state per connection.
+
+`isc_action_svc_db_stats` with `isc_spb_sts_hdr_pages` is converted, which
+means `gstat` — the engine's own C++ tool — can ask fire-crab for a database's
+header statistics and print them:
+
+```
+$ gstat -user SYSDBA -password masterkey localhost/4231:/tmp/x.fdb -h
+```
+
+The report itself is `fire_crab_ods::header_report`, the conversion of
+`PPG_print_header` (`src/utilities/gstat/ppg.cpp:56-287`), and the gate
+requires the text to be **identical** to what the same `gstat` prints when it
+reads the file itself. Three details in that text are easy to get wrong:
+
+* **`Flags` is the PAGE's flags, not the header's.** `ppg.cpp:58` prints
+  `header->hdr_header.pag_flags` — a `pag` field, usually 0 — while the
+  interesting bits (`hdr_force_write` and friends) come out further down as
+  `Attributes`. A converter that prints `hdr_flags` on the `Flags` line gets
+  18 where gstat gets 0.
+* **The `Attributes` label is printed unconditionally; its value is not.**
+  The label goes out with no newline, and only if some attribute exists does
+  the text and the line break follow (`ppg.cpp:102-217`). A database with no
+  attributes therefore ends that line dangling, and the next thing in the
+  stream is the blank line before `Variable header data`. The gate keeps a
+  `gfix -w async` database around purely to cover that case.
+* **`Database dialect 1` means "no dialect information".** A dialect-1
+  database has no dialect bit in its header, so the absence is the answer
+  (`ppg.cpp:81-87`) — it is not unknown.
+
+The report also needs fields fire-crab had not decoded before: the
+implementation triple (`hdr_db_impl`, printed through
+`DbImplementation`'s hardware/OS/compiler NAME TABLES — index-into-a-list, so
+the tables are part of the format), the creation date, the shadow count, and
+the **variable header clumplets** after the fixed part (`hdr_data` at offset
+148: `<type><length><data>` until `HDR_end`), which is where the sweep
+interval, the backup difference file and the replication sequence live.
+
+## The output stream, and the strangest law in this subsystem
+
+`isc_info_svc_line` and `isc_info_svc_to_eof` read the same bytes and disagree
+about newlines, on purpose (`svc.cpp:2404`):
+
+> If returning a line of information, replace all new line characters with a
+> space. This will ensure that the output is consistent when returning a line
+> or to eof.
+
+So a LINE is the bytes up to and including its newline, with **the newline
+turned into a space** — which makes a blank line arrive as a single space,
+`3e 01 00 20 01` on the wire. And "nothing" is reserved: a **zero-length**
+item, `3e 00 00 01`, is how the stream says it is finished. `to_eof` returns
+the raw bytes, newlines intact, chunked by the client's buffer length.
+
+Both conventions were read off the live engine's wire with
+`fcsvc stats --raw` before being implemented, and the gate compares the real
+server's bytes with fire-crab's for the same poll. Guessing here is
+unnecessary and would have been wrong: "a blank line is an empty item" is the
+natural guess, and it collides with end-of-stream.
+
+## Validation belongs to the service, not the client
+
+`gstat -h` combined with `-d` is refused — *"option -h is incompatible with
+options -a, -d, -i, -r, -schema, -s and -t"* — and the refusal comes from the
+SERVER: gstat message 38, arriving as gds **336920614**, a facility-coded
+number rather than one of the `isc_*` codes. fire-crab converts the rule
+(`stats_options_conflict`) and answers the same combination with the same
+code, which the gate checks in both directions for three combinations.
+
+The ordering matters and is deliberate: the conflict check runs BEFORE
+fire-crab's own capability check, so a malformed request gets the engine's
+answer rather than "fire-crab cannot do that".
+
 ## Frontier
 
-* **Actions**, which is where the rest of this subsystem lives: `gbak`'s backup
-  and restore, `gfix`'s repair, `gstat`'s statistics, user management. Each is a
-  whole utility behind an SPB; `fcstat` already answers gstat's questions
-  offline, so `isc_action_svc_db_stats` is the natural first one.
-* **The output stream** (`isc_info_svc_line` / `isc_info_svc_to_eof` with
-  `isc_info_data_not_ready` and the `isc_info_length` prefix) — the framing an
-  action's progress text arrives in. Converted only as constants so far.
+* **The remaining actions**: `gbak`'s backup and restore, `gfix`'s repair and
+  sweep, user management. Each is a whole utility behind an SPB. `db_stats` is
+  done for the header report (below); its data-page, index and record-version
+  analyses need the page walks `fcstat census` already does offline.
+* **`isc_info_svc_data_not_ready`** — the marker for "the action is still
+  running, ask again". fire-crab computes its whole answer inside
+  `op_service_start`, so its stream is complete before the first poll and the
+  marker never arises; a long-running action would need it.
+* **The `isc_info_length` prefix** on a query whose first item is
+  `isc_info_length`, and `isc_info_svc_timeout` as a *response* item.
 * `isc_info_svc_limbo_trans` (the real server answers it as an empty string
   item), `isc_info_svc_get_users`, `isc_info_svc_get_config`.
 * The `SpbStart` per-action grammar: the state machine in

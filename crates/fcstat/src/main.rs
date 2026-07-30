@@ -29,7 +29,7 @@ use std::time::Instant;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "usage: fcstat header|census|tip <db.fdb> | fcstat bench-census <db.fdb> <iters>";
+    let usage = "usage: fcstat header|header-report|census|tip <db.fdb> | fcstat bench-census <db.fdb> <iters>";
     if args.len() < 3 {
         eprintln!("{}", usage);
         std::process::exit(2);
@@ -67,6 +67,15 @@ fn main() {
 
     match args[1].as_str() {
         "header" => header(&data),
+        // gstat -h's own report text, byte for byte (the conversion of
+        // PPG_print_header): what a Services db_stats action streams
+        "header-report" => match fire_crab_ods::header_report(&data, false) {
+            Some(t) => print!("{}", t),
+            None => {
+                eprintln!("fcstat: page 0 is not a header page");
+                std::process::exit(1);
+            }
+        },
         "census" => census_cmd(&data),
         "tip" => tip(&data),
         "gc" => {

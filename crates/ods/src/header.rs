@@ -31,8 +31,84 @@ pub struct HeaderPage {
     pub oldest_active: u64,
     pub oldest_snapshot: u64,
     pub next_attachment_id: u64,
+    /// `hdr_db_impl` (offset 80): the cpu, os, compiler and compatibility
+    /// bytes of the machine the database was CREATED on
+    pub db_impl: [u8; 4],
     pub guid: [u8; 16],
+    /// `hdr_creation_date` (offset 100): an ISC timestamp - MJD days and
+    /// 1/10000-second units
+    pub creation_date: (i32, u32),
+    /// `hdr_shadow_count` (offset 108)
+    pub shadow_count: i32,
+    /// `hdr_crypt_plugin` (offset 116, 32 bytes)
+    pub crypt_plugin: String,
 }
+
+/// One variable-header clumplet: `<type><length><data>` in `hdr_data`
+/// (ods.h:703-719).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeaderClumplet {
+    pub tag: u8,
+    pub data: Vec<u8>,
+}
+
+/// `HDR_*` clumplet codes (ods.h:707-719). The commented-out ones -
+/// `HDR_file` (2) and `HDR_last_page` (3) - are the multi-file database's
+/// remains: Firebird 6 no longer writes them.
+pub mod hdr_clump {
+    pub const END: u8 = 0;
+    pub const ROOT_FILE_NAME: u8 = 1;
+    pub const SWEEP_INTERVAL: u8 = 4;
+    pub const CRYPT_CHECKSUM: u8 = 5;
+    pub const DIFFERENCE_FILE: u8 = 6;
+    pub const BACKUP_GUID: u8 = 7;
+    pub const CRYPT_KEY: u8 = 8;
+    pub const CRYPT_HASH: u8 = 9;
+    pub const REPL_SEQ: u8 = 11;
+    pub const MAX: u8 = 11;
+}
+
+/// `hdr_data` starts at offset 148 (ods.h:672 static_assert).
+pub const HDR_DATA_OFFSET: usize = 148;
+
+/// The machine-description tables `DbImplementation` prints from
+/// (common/classes/DbImplementation.cpp:77-120). The INDEX is what the
+/// header stores, so these lists are a byte-for-byte part of the format:
+/// dropping an entry renames every later platform.
+const HARDWARE: &[&str] = &[
+    "Intel/i386",
+    "AMD/Intel/x64",
+    "UltraSparc",
+    "PowerPC",
+    "PowerPC64",
+    "MIPSEL",
+    "MIPS",
+    "ARM",
+    "IA64",
+    "s390",
+    "s390x",
+    "SH",
+    "SHEB",
+    "HPPA",
+    "Alpha",
+    "ARM64",
+    "PowerPC64el",
+    "M68k",
+    "RiscV64",
+    "MIPS64EL",
+    "LOONGARCH",
+];
+
+const OPERATING_SYSTEM: &[&str] = &[
+    "Windows", "Linux", "Darwin", "Solaris", "HPUX", "AIX", "MVS", "FreeBSD", "NetBSD",
+];
+
+const COMPILER: &[&str] = &["MSVC", "gcc", "xlC", "aCC", "SunStudio", "icc"];
+
+/// The three short month names `gstat` prints (`FB_SHORT_MONTHS`).
+const SHORT_MONTHS: &[&str] = &[
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 
 impl HeaderPage {
     /// ODS major version with the Firebird flag stripped (14 for
@@ -55,8 +131,18 @@ impl HeaderPage {
         if pag.page_type != PageType::Header as u8 {
             return None;
         }
+        if page.len() < 148 {
+            return None;
+        }
         let mut guid = [0u8; 16];
         guid.copy_from_slice(&page[84..100]); // hdr_guid, offset 84
+        let mut db_impl = [0u8; 4];
+        db_impl.copy_from_slice(&page[80..84]); // hdr_db_impl, offset 80
+        let plugin_bytes = &page[116..148]; // hdr_crypt_plugin, offset 116
+        let plugin_end = plugin_bytes
+            .iter()
+            .position(|b| *b == 0)
+            .unwrap_or(plugin_bytes.len());
 
         Some(HeaderPage {
             pag,
@@ -74,8 +160,124 @@ impl HeaderPage {
             oldest_active: u64_at(page, 56),      // hdr_oldest_active
             oldest_snapshot: u64_at(page, 64),    // hdr_oldest_snapshot
             next_attachment_id: u64_at(page, 72), // hdr_attachment_id
+            db_impl,
             guid,
+            creation_date: (
+                u32_at(page, 100) as i32, // hdr_creation_date[0], MJD days
+                u32_at(page, 104),        // hdr_creation_date[1], 1/10000 s
+            ),
+            shadow_count: u32_at(page, 108) as i32, // hdr_shadow_count
+            crypt_plugin: String::from_utf8_lossy(&plugin_bytes[..plugin_end]).into_owned(),
         })
+    }
+
+
+    /// `DbImplementation::cpu/endianess/os/cc` as one line, the way
+    /// `gstat -h` prints it: `HW=ARM64 little-endian OS=Linux CC=gcc`.
+    /// An index the tables do not cover prints as `unknown`, which is what
+    /// `GET_ARRAY_ELEMENT` does for an out-of-range value.
+    pub fn implementation_string(&self) -> String {
+        let name = |t: &[&str], i: u8| -> String {
+            t.get(i as usize).map(|s| s.to_string()).unwrap_or_else(|| "unknown".to_string())
+        };
+        // EndianMask = 1, EndianBig = 1 (DbImplementation.cpp:75)
+        let endian = if self.db_impl[3] & 1 != 0 { "big" } else { "little" };
+        format!(
+            "HW={} {}-endian OS={} CC={}",
+            name(HARDWARE, self.db_impl[0]),
+            endian,
+            name(OPERATING_SYSTEM, self.db_impl[1]),
+            name(COMPILER, self.db_impl[2])
+        )
+    }
+
+    /// The SQL dialect line's value. A dialect-1 database has NO dialect
+    /// information in its header (ppg.cpp:81-87), so the absence of the
+    /// bit means 1 - it does not mean "unknown".
+    pub fn dialect(&self) -> u8 {
+        if self.flags & hdr_flags::SQL_DIALECT_3 != 0 {
+            3
+        } else {
+            1
+        }
+    }
+
+    /// `Creation date` as `gstat` prints it: `Jul 28, 2026 14:42:59`.
+    pub fn creation_date_string(&self) -> String {
+        let (days, frac) = self.creation_date;
+        // civil-from-days, Firebird epoch (day 0 = 1858-11-17)
+        let z = days as i64 - 40587 + 719468;
+        let era = z.div_euclid(146097);
+        let doe = z.rem_euclid(146097);
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        let secs = frac / 10_000;
+        format!(
+            "{} {}, {} {}:{:02}:{:02}",
+            SHORT_MONTHS
+                .get((m - 1) as usize)
+                .copied()
+                .unwrap_or("???"),
+            d,
+            y,
+            secs / 3600,
+            (secs / 60) % 60,
+            secs % 60
+        )
+    }
+
+    /// The `Attributes` line's value - `ppg.cpp:102-217`, in the engine's
+    /// exact order, comma-separated. Empty when the database has none, in
+    /// which case gstat prints the label with nothing after it.
+    pub fn attributes_string(&self) -> String {
+        let f = self.flags;
+        let mut v: Vec<String> = Vec::new();
+        if f & hdr_flags::FORCE_WRITE != 0 {
+            v.push("force write".into());
+        }
+        if f & hdr_flags::NO_RESERVE != 0 {
+            v.push("no reserve".into());
+        }
+        if f & hdr_flags::ACTIVE_SHADOW != 0 {
+            v.push("active shadow".into());
+        }
+        if f & hdr_flags::ENCRYPTED != 0 {
+            v.push("encrypted".into());
+        }
+        if f & hdr_flags::CRYPT_PROCESS != 0 {
+            v.push("crypt process".into());
+        }
+        if f & (hdr_flags::ENCRYPTED | hdr_flags::CRYPT_PROCESS) != 0 {
+            v.push(format!("plugin {}", self.crypt_plugin));
+        }
+        if f & hdr_flags::READ_ONLY != 0 {
+            v.push("read only".into());
+        }
+        match self.shutdown_mode {
+            0 => {}
+            1 => v.push("multi-user maintenance".into()),
+            2 => v.push("single-user maintenance".into()),
+            3 => v.push("full shutdown".into()),
+            m => v.push(format!("wrong shutdown state {}", m)),
+        }
+        match self.backup_mode {
+            0 => {}
+            1 => v.push("backup lock".into()),
+            2 => v.push("backup merge".into()),
+            m => v.push(format!("wrong backup state {}", m)),
+        }
+        match self.replica_mode {
+            0 => {}
+            1 => v.push("read-only replica".into()),
+            2 => v.push("read-write replica".into()),
+            m => v.push(format!("wrong replica state {}", m)),
+        }
+        v.join(", ")
     }
 
     /// Render the GUID the way the engine prints it:
@@ -101,9 +303,219 @@ impl HeaderPage {
     }
 }
 
+
+/// Header-page flag bits (ods.h:722-728).
+pub mod hdr_flags {
+    pub const ACTIVE_SHADOW: u16 = 0x1;
+    pub const FORCE_WRITE: u16 = 0x2;
+    pub const CRYPT_PROCESS: u16 = 0x4;
+    pub const NO_RESERVE: u16 = 0x8;
+    pub const SQL_DIALECT_3: u16 = 0x10;
+    pub const READ_ONLY: u16 = 0x20;
+    pub const ENCRYPTED: u16 = 0x40;
+}
+
+/// Walk the variable header data - the clumplets after the fixed part
+/// (`hdr_data`, offset 148), each `<type><length><data>`, terminated by
+/// `HDR_end` (0) or by the end of the page (ppg.cpp:222-226).
+pub fn variable_header(page: &[u8]) -> Vec<HeaderClumplet> {
+    let mut out = Vec::new();
+    let mut at = HDR_DATA_OFFSET;
+    while at + 1 < page.len() {
+        let tag = page[at];
+        if tag == hdr_clump::END {
+            break;
+        }
+        let len = page[at + 1] as usize;
+        let end = at + 2 + len;
+        if end > page.len() {
+            break; // a length past the page: stop rather than invent data
+        }
+        out.push(HeaderClumplet {
+            tag,
+            data: page[at + 2..end].to_vec(),
+        });
+        at = end;
+    }
+    out
+}
+
+/// `gstat -h`'s report for a header page, byte for byte - the conversion
+/// of `PPG_print_header` (`src/utilities/gstat/ppg.cpp:56-287`).
+///
+/// This is the text a Services `db_stats` action streams back, which makes
+/// it checkable in the strongest possible way: run the engine's own
+/// `gstat -h` against a file and this function against the same file, and
+/// the two must be identical.
+///
+/// `nocreation` suppresses the GUID and creation-date lines, exactly as
+/// `isc_spb_sts_nocreation` does.
+pub fn header_report(page: &[u8], nocreation: bool) -> Option<String> {
+    let h = HeaderPage::decode(page)?;
+    let mut s = String::new();
+    s.push_str("Database header page information:\n");
+    s.push_str(&format!("\tFlags\t\t\t{}\n", h.pag.flags));
+    s.push_str(&format!("\tGeneration\t\t{}\n", h.pag.generation));
+    s.push_str(&format!("\tSystem Change Number\t{}\n", h.pag.scn));
+    s.push_str(&format!("\tPage size\t\t{}\n", h.page_size));
+    s.push_str(&format!(
+        "\tODS version\t\t{}.{}\n",
+        h.ods_major(),
+        h.ods_minor
+    ));
+    s.push_str(&format!(
+        "\tOldest transaction\t{}\n",
+        h.oldest_transaction
+    ));
+    s.push_str(&format!("\tOldest active\t\t{}\n", h.oldest_active));
+    s.push_str(&format!("\tOldest snapshot\t\t{}\n", h.oldest_snapshot));
+    s.push_str(&format!("\tNext transaction\t{}\n", h.next_transaction));
+    s.push_str(&format!(
+        "\tNext attachment ID\t{}\n",
+        h.next_attachment_id
+    ));
+    s.push_str(&format!(
+        "\tImplementation\t\t{}\n",
+        h.implementation_string()
+    ));
+    s.push_str(&format!("\tShadow count\t\t{}\n", h.shadow_count));
+    s.push_str(&format!("\tPage buffers\t\t{}\n", h.page_buffers));
+    s.push_str(&format!("\tDatabase dialect\t{}\n", h.dialect()));
+    if !nocreation {
+        s.push_str(&format!("\tDatabase GUID:\t{}\n", h.guid_string()));
+        s.push_str(&format!(
+            "\tCreation date\t\t{}\n",
+            h.creation_date_string()
+        ));
+    }
+    // The label is printed unconditionally; the VALUE and its newline only
+    // when there is something to say (ppg.cpp:102-217) - so a database with
+    // no attributes leaves a dangling label with no line break, and the
+    // next line is the blank one before "Variable header data".
+    s.push_str("\tAttributes\t\t");
+    let attrs = h.attributes_string();
+    if !attrs.is_empty() {
+        s.push_str(&attrs);
+        s.push('\n');
+    }
+    s.push_str("\n    Variable header data:\n");
+    for c in variable_header(page) {
+        let text = || String::from_utf8_lossy(&c.data).into_owned();
+        match c.tag {
+            hdr_clump::ROOT_FILE_NAME => {
+                s.push_str(&format!("\tRoot file name:\t\t{}\n", text()))
+            }
+            hdr_clump::SWEEP_INTERVAL => {
+                let n = if c.data.len() >= 4 {
+                    i32::from_le_bytes([c.data[0], c.data[1], c.data[2], c.data[3]])
+                } else {
+                    0
+                };
+                s.push_str(&format!("\tSweep interval:\t\t{}\n", n));
+            }
+            hdr_clump::DIFFERENCE_FILE => {
+                s.push_str(&format!("\tBackup difference file:\t{}\n", text()))
+            }
+            hdr_clump::BACKUP_GUID => {
+                let mut g = [0u8; 16];
+                if c.data.len() >= 16 {
+                    g.copy_from_slice(&c.data[..16]);
+                }
+                let fake = HeaderPage {
+                    guid: g,
+                    ..h.clone()
+                };
+                s.push_str(&format!(
+                    "\tDatabase backup GUID:\t{}\n",
+                    fake.guid_string()
+                ));
+            }
+            hdr_clump::CRYPT_KEY => {
+                s.push_str(&format!("\tEncryption key name:\t{}\n", text()))
+            }
+            hdr_clump::CRYPT_HASH => s.push_str(&format!("\tKey hash:\t{}\n", text())),
+            hdr_clump::CRYPT_CHECKSUM => {
+                s.push_str(&format!("\tCrypt checksum:\t{}\n", text()))
+            }
+            hdr_clump::REPL_SEQ => {
+                let mut n = 0u64;
+                for (i, b) in c.data.iter().take(8).enumerate() {
+                    n |= (*b as u64) << (8 * i);
+                }
+                s.push_str(&format!("\tReplication sequence:\t{}\n", n));
+            }
+            t if t > hdr_clump::MAX => s.push_str(&format!(
+                "\tUnrecognized option {}, length {}\n",
+                t,
+                c.data.len()
+            )),
+            t => s.push_str(&format!(
+                "\tEncoded option {}, length {}\n",
+                t,
+                c.data.len()
+            )),
+        }
+    }
+    s.push_str("\t*END*\n");
+    Some(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_report_is_gstat_s_text() {
+        // A synthetic header with the fields gstat prints. The live
+        // differential (qa/svc-stats.sh) compares this generator's output
+        // with the engine's own gstat on real databases; this pins the
+        // SHAPE offline, including the two branches that are easy to get
+        // backwards.
+        let mut page = vec![0u8; 8192];
+        page[0] = 1; // pag_type = header
+        page[1] = 0; // pag_flags - what the "Flags" LINE prints
+        page[4..8].copy_from_slice(&30u32.to_le_bytes()); // pag_generation
+        page[8..12].copy_from_slice(&0u32.to_le_bytes()); // pag_scn
+        page[16..18].copy_from_slice(&8192u16.to_le_bytes());
+        page[18..20].copy_from_slice(&0x800eu16.to_le_bytes()); // ODS 14
+        page[22..24].copy_from_slice(&0x12u16.to_le_bytes()); // force write + dialect 3
+        page[80] = 15; // ARM64
+        page[81] = 1; // Linux
+        page[82] = 1; // gcc
+        page[83] = 0; // little-endian
+        // one variable-header clumplet: a sweep interval
+        page[148] = hdr_clump::SWEEP_INTERVAL;
+        page[149] = 4;
+        page[150..154].copy_from_slice(&20000i32.to_le_bytes());
+
+        let t = header_report(&page, false).expect("a header page");
+        assert!(t.starts_with("Database header page information:\n"));
+        // the Flags LINE is the PAGE's flags (0), while hdr_flags (0x12)
+        // shows up as Attributes - a converter that prints hdr_flags here
+        // reports 18 where gstat reports 0
+        assert!(t.contains("\tFlags\t\t\t0\n"), "{}", t);
+        assert!(t.contains("\tAttributes\t\tforce write\n"), "{}", t);
+        assert!(t.contains("\tGeneration\t\t30\n"));
+        assert!(t.contains("\tODS version\t\t14.0\n"));
+        assert!(t.contains("\tImplementation\t\tHW=ARM64 little-endian OS=Linux CC=gcc\n"));
+        assert!(t.contains("\tDatabase dialect\t3\n"));
+        assert!(t.contains("\tSweep interval:\t\t20000\n"));
+        assert!(t.ends_with("\t*END*\n"));
+
+        // no attributes: the LABEL is still printed, with NO newline after
+        // it, so the blank line before "Variable header data" follows
+        // immediately (ppg.cpp:102-217)
+        page[22..24].copy_from_slice(&0u16.to_le_bytes());
+        let t = header_report(&page, false).unwrap();
+        assert!(t.contains("\tAttributes\t\t\n    Variable header data:\n"), "{}", t);
+        // dialect 1 is the ABSENCE of the dialect bit, not an unknown
+        assert!(t.contains("\tDatabase dialect\t1\n"));
+
+        // nocreation drops the GUID and creation-date lines
+        let t = header_report(&page, true).unwrap();
+        assert!(!t.contains("Database GUID"));
+        assert!(!t.contains("Creation date"));
+    }
 
     /// Build a synthetic header page with a distinct value at every
     /// field offset pinned by ods.h:661-685, and check each lands in

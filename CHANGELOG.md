@@ -13,6 +13,72 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — fire-crab-svc slice 2: gstat asks fire-crab for statistics
+
+### Converted
+- **A service ACTION, end to end.** `isc_action_svc_db_stats` with
+  `isc_spb_sts_hdr_pages`: the engine's own `gstat`, pointed at
+  fire-crab's service manager, now prints a database's header
+  statistics that fire-crab computed from the file and streamed back —
+  and the gate requires that text to be IDENTICAL to what the same
+  `gstat` prints when it reads the file itself.
+- **`gstat -h`'s report text** (`fire_crab_ods::header_report`, the
+  conversion of `PPG_print_header`, ppg.cpp:56-287), which needed three
+  details a converter can easily get backwards:
+  - **`Flags` is the PAGE's flags** (`hdr_header.pag_flags`, usually 0),
+    not `hdr_flags`. The interesting bits come out below as
+    `Attributes`. Printing `hdr_flags` there gives 18 where gstat gives 0.
+  - **The `Attributes` label is unconditional, its value is not**: the
+    label goes out with no newline and only an existing attribute adds
+    text and the line break, so a database with none leaves the line
+    dangling. The gate keeps a `gfix -w async` database to cover exactly
+    that.
+  - **`Database dialect 1` means "no dialect information in the
+    header"** — the absence IS the answer (ppg.cpp:81-87).
+- **The header fields that report needs**, new in the ODS decoder: the
+  implementation triple (`hdr_db_impl` through `DbImplementation`'s
+  hardware/OS/compiler NAME TABLES — an index into a list, so the tables
+  are part of the format), the creation date, the shadow count, the
+  crypt plugin name, and the **variable header clumplets** after the
+  fixed part (`hdr_data` at offset 148, `<type><length><data>` until
+  `HDR_end`) where the sweep interval, the backup difference file and
+  the replication sequence live.
+- **The output stream, and the strangest law in this subsystem.**
+  `isc_info_svc_line` returns the bytes up to and including the newline
+  with **the newline replaced by a space** (svc.cpp:2404, comment and
+  all), so a blank line arrives as a single space — `3e 01 00 20 01` —
+  and "nothing" is reserved: a ZERO-length item is end-of-stream.
+  `isc_info_svc_to_eof` returns the raw bytes, newlines intact. Both
+  conventions were read off the live engine's wire with
+  `fcsvc stats --raw` BEFORE being implemented, and the gate compares
+  the engine's bytes with fire-crab's for the same poll.
+- **The real `SpbStart` grammar**: a per-(action, tag) framing table
+  (`ClumpletReader::getClumpletType`), because a start SPB mixes
+  2-byte-length strings with bare 4-byte integers and nothing in the
+  bytes says which is which. An unknown pair is refused rather than
+  guessed — guessing a length turns the next tag into data.
+- A service session is **stateful**: start, then poll until the stream
+  ends. The server now holds that output per connection.
+
+### Guarded
+- **The engine's own validation, with the engine's own code.** `-h`
+  combined with any other analysis is refused — *"option -h is
+  incompatible with options -a, -d, -i, -r, -schema, -s and -t"*, gstat
+  message 38, arriving as gds **336920614** (facility-coded, not an
+  `isc_*` number). fire-crab converts the rule and refuses the same
+  combinations with the same code; the check runs BEFORE fire-crab's own
+  capability check, so a malformed request gets the engine's answer
+  rather than "fire-crab cannot do that".
+- Statistics fire-crab cannot compute (data pages, index pages, record
+  versions, encryption, the log) are refused with `isc_wish_list`, and
+  the gate requires the REAL server to PERFORM the same request — so the
+  refusal is provably ours and not the request's. An empty section would
+  have read as "this database has no data pages".
+- The service timestamps fire-crab prints are UTC where the engine
+  prints the server's local time. Stated in the code and in the docs
+  rather than faked; the gate compares the report, not gstat's own
+  timestamp lines.
+
 ## 2026-07-29 — fire-crab-pio slice 1: the floor, and the last planned row
 
 ### Converted

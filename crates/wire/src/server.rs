@@ -210,6 +210,10 @@ const GDS_DSQL_ERROR: i32 = 335544569;
 /// code for an operation it understands but does not perform, which is
 /// exactly what a service ACTION is to fire-crab.
 const GDS_WISH_LIST: i32 = 335544378;
+/// `isc_io_error` - the engine's answer when a service action cannot open
+/// the database it was given (the real server answers exactly this for a
+/// file its own user cannot read).
+const GDS_IO_ERROR: i32 = 335544344;
 /// isc_primary_key_required - "Primary key required on table @1"
 /// (SQLSTATE 22000): UPDATE OR INSERT without MATCHING on a PK-less
 /// table, raised at prepare exactly as the engine raises it
@@ -587,6 +591,9 @@ fn serve_service(
     if std::env::var("FC_SRV_TRACE").is_ok() {
         eprintln!("[srv] op_service_attach ok, handle 1");
     }
+    // the output of the action this session started, if any: a service
+    // session is stateful, and `isc_info_svc_line` reads from exactly this
+    let mut output: Option<fire_crab_svc::Output> = None;
     loop {
         let op = match read_int(s, dec) {
             Ok(o) => o,
@@ -609,6 +616,31 @@ fn serve_service(
                         hex(&send), hex(&recv), buflen
                     );
                 }
+                // a poll of a running action's output stream is answered
+                // from the session's output, not from the server-info table
+                if recv.len() == 1
+                    && (recv[0] == fire_crab_svc::info::LINE
+                        || recv[0] == fire_crab_svc::info::TO_EOF)
+                {
+                    let info = match output.as_mut() {
+                        Some(o) => fire_crab_svc::answer_output(
+                            recv[0],
+                            o,
+                            buflen.max(0) as usize,
+                        ),
+                        // no action has been started: the stream is empty,
+                        // which is end-of-output, not an error
+                        None => fire_crab_svc::answer_output(
+                            recv[0],
+                            &mut fire_crab_svc::Output::new(""),
+                            buflen.max(0) as usize,
+                        ),
+                    };
+                    let mut w = W::default();
+                    w.int(OP_RESPONSE).int(0).int(0).int(0).bytes(&info).int(0);
+                    w.send(s, enc)?;
+                    continue;
+                }
                 // an item we do not implement refuses the QUERY, the way
                 // svc.cpp's query2 does (isc_wish_list), instead of
                 // answering a buffer the client would misread
@@ -630,20 +662,26 @@ fn serve_service(
                 read_int(s, dec)?; // object
                 read_int(s, dec)?; // incarnation
                 let spb = read_wire_bytes(s, dec)?; // the action
-                // An action is a REQUEST TO DO SOMETHING - back up a
-                // database, sweep it, add a user. fire-crab runs none of
-                // them, and a clean op_response here says "done": the
-                // client then polls an empty output stream and reports a
-                // successful backup that never happened. So refuse, and
-                // name the action (fire-crab-svc parses the start SPB,
-                // whose first byte IS the action code).
-                let action = fire_crab_svc::parse(fire_crab_svc::Grammar::SpbStart, &spb)
-                    .ok()
-                    .and_then(|b| b.items.first().map(|c| c.tag));
-                if std::env::var("FC_SRV_TRACE").is_ok() {
-                    eprintln!("[srv] op_service_start action={:?} REFUSED", action);
+                // An action is a REQUEST TO DO SOMETHING. A clean
+                // op_response here says "done", so an action fire-crab
+                // cannot perform must be REFUSED - otherwise the client
+                // polls an empty output stream and reports a successful
+                // backup that never happened.
+                match run_service_action(&spb) {
+                    Ok(text) => {
+                        if std::env::var("FC_SRV_TRACE").is_ok() {
+                            eprintln!("[srv] op_service_start ok, {} bytes of output", text.len());
+                        }
+                        output = Some(fire_crab_svc::Output::new(text));
+                        respond(s, enc, 0)?;
+                    }
+                    Err(gds) => {
+                        if std::env::var("FC_SRV_TRACE").is_ok() {
+                            eprintln!("[srv] op_service_start REFUSED gds {}", gds);
+                        }
+                        respond_error(s, enc, gds)?;
+                    }
                 }
-                respond_error(s, enc, GDS_WISH_LIST)?;
             }
             x if x == OP_SERVICE_DETACH => {
                 read_int(s, dec)?; // handle
@@ -685,6 +723,115 @@ fn server_info() -> fire_crab_svc::ServerInfo {
         attachments: 0,
         databases: vec![],
     }
+}
+
+/// Run a service ACTION and return the text it streams back, or the gds
+/// code to refuse it with.
+///
+/// Only `isc_action_svc_db_stats` with `isc_spb_sts_hdr_pages` is served,
+/// and it is served the honest way: by reading the named file and printing
+/// the header report `fire_crab_ods::header_report` produces - the
+/// conversion of gstat's own `PPG_print_header`. Every other statistics
+/// option (data pages, indexes, record versions, encryption) is REFUSED,
+/// because an empty section reads as "this database has no data pages".
+fn run_service_action(spb: &[u8]) -> Result<String, i32> {
+    let b = fire_crab_svc::parse(fire_crab_svc::Grammar::SpbStart, spb).map_err(|e| {
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] start SPB refused: {}", e);
+        }
+        GDS_WISH_LIST
+    })?;
+    let action = b.items.first().map(|c| c.tag).unwrap_or(0);
+    if action != fire_crab_svc::action::DB_STATS {
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] action {} not converted", action);
+        }
+        return Err(GDS_WISH_LIST);
+    }
+    let db = b
+        .text(fire_crab_svc::spb::DBNAME)
+        .ok_or(GDS_WISH_LIST)?;
+    let options = b.number(fire_crab_svc::spb::OPTIONS).unwrap_or(0) as u32;
+    use fire_crab_svc::sts;
+    // The engine's own validation first, with the engine's own code: a
+    // header report may not be combined with another analysis (gstat
+    // message 38). Checking this BEFORE our own capability check matters -
+    // an invalid request should get the same answer from both servers, not
+    // "fire-crab cannot do that" for a request the engine calls malformed.
+    if fire_crab_svc::stats_options_conflict(options) {
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] db_stats options {:#x} conflict (hdr + another analysis)", options);
+        }
+        return Err(fire_crab_svc::GSTAT_HDR_INCOMPATIBLE);
+    }
+    // the options we cannot answer - refuse rather than print nothing
+    let unsupported = sts::DATA_PAGES
+        | sts::IDX_PAGES
+        | sts::DB_LOG
+        | sts::RECORD_VERSIONS
+        | sts::ENCRYPTION;
+    if options & unsupported != 0 {
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] db_stats options {:#x} include unconverted analyses", options);
+        }
+        return Err(GDS_WISH_LIST);
+    }
+    if options & sts::HDR_PAGES == 0 {
+        return Err(GDS_WISH_LIST);
+    }
+    let data = std::fs::read(&db).map_err(|e| {
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] db_stats cannot read {}: {}", db, e);
+        }
+        GDS_IO_ERROR
+    })?;
+    let report = fire_crab_ods::header_report(&data, options & sts::NOCREATION != 0)
+        .ok_or(GDS_IO_ERROR)?;
+    // gstat's own framing around the report: the engine's service prints
+    // these lines too (read off the wire with `fcsvc stats --raw`).
+    // DEVIATION, stated rather than hidden: the timestamps are UTC, where
+    // the engine prints the server's local time - fire-crab has no timezone
+    // database and will not guess one.
+    let stamp = service_timestamp();
+    Ok(format!(
+        "\nDatabase \"{}\"\nGstat execution time {}\n\n{}Gstat completion time {}\n",
+        db, stamp, report, stamp
+    ))
+}
+
+/// A `ctime`-shaped stamp - "Thu Jul 30 05:15:05 2026" - in UTC.
+fn service_timestamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86400);
+    let tod = secs.rem_euclid(86400);
+    // civil-from-days from the Unix epoch
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    const WD: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MO: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    format!(
+        "{} {} {:2} {:02}:{:02}:{:02} {}",
+        WD[days.rem_euclid(7) as usize],
+        MO[(m - 1) as usize],
+        d,
+        tod / 3600,
+        (tod / 60) % 60,
+        tod % 60,
+        y
+    )
 }
 
 fn service_info(items: &[u8], buffer_length: usize) -> Result<Vec<u8>, fire_crab_svc::QueryError> {

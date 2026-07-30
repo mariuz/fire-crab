@@ -28,6 +28,7 @@ const OP_CONT_AUTH: i32 = 92;
 const OP_SERVICE_ATTACH: i32 = 82;
 const OP_SERVICE_DETACH: i32 = 83;
 const OP_SERVICE_INFO: i32 = 84;
+const OP_SERVICE_START: i32 = 85;
 const OP_CRYPT: i32 = 96;
 
 const CNCT_USER: u8 = 1;
@@ -291,6 +292,27 @@ impl Service {
             return Err(format!("service info failed, gds {}", gds));
         }
         Ok(data)
+    }
+
+    /// `op_service_start`: hand the service manager an action SPB. The
+    /// action then runs on the SERVER and its text comes back through
+    /// `isc_info_svc_line` / `isc_info_svc_to_eof` - so a client's job is
+    /// two operations, start and poll, not one.
+    pub fn start(&mut self, spb: &[u8]) -> Result<(), String> {
+        let mut w = Xdr::default();
+        w.int(OP_SERVICE_START)
+            .int(self.handle)
+            .int(0) // incarnation
+            .bytes(spb);
+        write_all(&mut self.stream, &mut self.enc, &w.0)?;
+        if read_int(&mut self.stream, &mut self.dec)? != OP_RESPONSE {
+            return Err("expected op_response to op_service_start".into());
+        }
+        let (_, _, gds) = read_response(&mut self.stream, &mut self.dec)?;
+        if gds != 0 {
+            return Err(format!("service start failed, gds {}", gds));
+        }
+        Ok(())
     }
 
     pub fn detach(&mut self) -> Result<(), String> {

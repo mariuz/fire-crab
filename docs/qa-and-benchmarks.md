@@ -6089,6 +6089,68 @@ actually grew (313 → 401 pages for 12 000 rows) before trusting the
 comparisons around it. A vacuous check is worse than a missing one, because it
 reports success.
 
+### A service action: gstat asks fire-crab for statistics (`qa/svc-stats.sh`, 16 checks)
+
+The strongest form a differential can take is the vendor's own tool printing
+YOUR answer and nobody being able to tell. That is what this gate arranges.
+
+**The text.** `gstat -h <db>` reads the file itself, in C++, and prints a
+report. `gstat localhost/<port>:<db> -h` asks a service manager for the same
+thing — and when that manager is fcwire, the report is computed by
+`fire_crab_ods::header_report` and streamed back through the converted output
+stream. The two outputs are compared line for line (gstat's own two timestamp
+lines excluded, since they are its framing and not the report), on three
+databases whose header ATTRIBUTES differ.
+
+The third database exists for one line of the format. `ppg.cpp` prints the
+`Attributes` label unconditionally and its value only if there is one, so a
+database with no attributes leaves that line dangling and the next thing in the
+stream is the blank line before `Variable header data`. A `gfix -w async`
+database is kept in the gate purely to cover that shape.
+
+Two other details of the same report are easy to get backwards, and both would
+have produced plausible-looking output:
+
+* `Flags` prints `hdr_header.pag_flags` — the PAGE's flags, usually 0 — not
+  `hdr_flags`. The force-write bit and its friends come out further down as
+  `Attributes`. Printing `hdr_flags` there yields 18 where gstat yields 0.
+* `Database dialect 1` means the header carries NO dialect information; the
+  absence is the answer, not an unknown.
+
+**The stream framing, from the engine's own bytes.** `isc_info_svc_line` and
+`isc_info_svc_to_eof` read the same output and disagree about newlines on
+purpose (svc.cpp:2404): a LINE comes back with its newline REPLACED BY A SPACE,
+so a blank line is a single space — `3e 01 00 20 01` — and a ZERO-length item,
+`3e 00 00 01`, is how the stream says it is finished. `to_eof` returns the raw
+bytes with newlines intact.
+
+Both conventions were read off the live engine with `fcsvc stats --raw` before
+being implemented, and the gate compares the real server's wire bytes with
+fire-crab's for the same poll. This is a place where guessing would have been
+wrong in the natural direction: "a blank line is an empty item" is the obvious
+guess, and it collides with end-of-stream.
+
+**The refusals, and whose they are.** Statistics fire-crab cannot compute — data
+pages, index pages, record versions — are refused with `isc_wish_list`, and the
+gate requires the REAL server to PERFORM the same request, so the refusal is
+provably fire-crab's and not the request's. An empty section would have read as
+"this database has no data pages".
+
+Then the engine's OWN validation, converted with its own number: `-h` combined
+with any other analysis is refused — *"option -h is incompatible with options
+-a, -d, -i, -r, -schema, -s and -t"* — as gstat message 38, which arrives as
+gds **336920614**, a facility-coded value rather than one of the `isc_*` codes.
+Both servers refuse all three tested combinations with that exact code. The
+conflict check deliberately runs BEFORE fire-crab's capability check: a
+malformed request should get the engine's answer, not "fire-crab cannot do
+that".
+
+One more probe worth recording, because it changed the gate: asking the real
+server for `hdr` and `data` together does not produce data-page statistics — it
+produces that refusal. The first version of this gate read the refusal as
+"the engine cannot do it either" and would have quietly weakened its own claim;
+asking for `data` ALONE is what proves the engine performs it.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
@@ -6713,6 +6775,14 @@ FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
 NODE_PATH="$PWD/node_modules" \
     FCWIRE=/path/to/fire-crab/target/release/fcwire ISQL=/opt/firebird/bin/isql \
     bash /path/to/fire-crab/qa/serve-real-predfull.sh 3050
+
+# A service ACTION: the engine's own gstat asks fire-crab for a database's
+# header statistics and prints them; the text must equal what the same
+# gstat prints reading the file itself.
+FCSVC=/path/to/fire-crab/target/release/fcsvc \
+    FCWIRE=/path/to/fire-crab/target/release/fcwire \
+    FCSTAT=/path/to/fire-crab/target/release/fcstat \
+    bash /path/to/fire-crab/qa/svc-stats.sh 4235
 
 # Platform I/O against the engine's own accounting: MON$PAGES vs the file
 # size, RDB$PAGES types found at page*page_size (with a one-page-shift

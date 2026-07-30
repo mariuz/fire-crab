@@ -30,7 +30,8 @@
 //! SYSDBA/masterkey), like the other fire-crab oracles.
 
 use fire_crab_svc::{
-    action, decode, info, parse, spb, Answer, Grammar, ServerInfo, SRP_A,
+    action, build_start_db_stats, decode, info, parse, spb, sts, Answer, Grammar, ServerInfo,
+    SRP_A,
 };
 
 fn item_code(name: &str) -> Option<u8> {
@@ -173,10 +174,90 @@ fn query(args: &[String], with_buffer: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Drive a real service ACTION and poll its output stream. This is the
+/// probe that pins the framing: `--raw` prints the response bytes of every
+/// poll, so the engine's own line/EOF convention can be read off the wire
+/// rather than guessed.
+fn stats(args: &[String]) -> Result<(), String> {
+    let host = &args[2];
+    let port: u16 = args[3].parse().map_err(|_| "bad port")?;
+    let db = &args[4];
+    let raw = args.iter().any(|a| a == "--raw");
+    let eof = args.iter().any(|a| a == "--eof");
+    // The analyses are named explicitly. `hdr_pages` is the default only
+    // when no other analysis is asked for, because the engine REFUSES the
+    // combination: "option -h is incompatible with options -a, -d, -i, -r,
+    // -schema, -s and -t" (gstat message 38 = gds 336920614), which the
+    // service enforces server-side.
+    let mut opts = 0u32;
+    for (name, bit) in [
+        ("hdr", sts::HDR_PAGES),
+        ("data", sts::DATA_PAGES),
+        ("idx", sts::IDX_PAGES),
+        ("sys", sts::SYS_RELATIONS),
+        ("versions", sts::RECORD_VERSIONS),
+        ("encryption", sts::ENCRYPTION),
+    ] {
+        if args.iter().any(|a| a == name) {
+            opts |= bit;
+        }
+    }
+    if opts == 0 {
+        opts = sts::HDR_PAGES;
+    }
+    let user = std::env::var("ISC_USER").unwrap_or_else(|_| "SYSDBA".into());
+    let password = std::env::var("ISC_PASSWORD").unwrap_or_else(|_| "masterkey".into());
+    let mut svc = fire_crab_svc::client::Service::attach(host, port, &user, &password, SRP_A)?;
+    svc.start(&build_start_db_stats(db, opts))?;
+
+    let item = if eof { info::TO_EOF } else { info::LINE };
+    // poll until the stream says it is finished: an empty text item, the
+    // engine's end-of-output convention
+    for _ in 0..2000 {
+        let answer = svc.info(&[item], 8192)?;
+        if raw {
+            println!("RAW {}", hex(&answer));
+        }
+        let decoded = decode(&answer)?;
+        let mut done = false;
+        // in --raw mode print ONLY the wire bytes: interleaving the decoded
+        // text would put it on the same line and hide the framing a gate is
+        // trying to compare
+        for a in &decoded {
+            match a {
+                Answer::Text(_, t) if t.is_empty() => done = true,
+                Answer::Text(_, t) => {
+                    if !raw {
+                        print!("{}", t);
+                    }
+                }
+                Answer::Number(t, v) => {
+                    if !raw {
+                        println!("[{} {}]", item_name(*t), v)
+                    }
+                }
+                Answer::Marker(m) => {
+                    if *m == info::DATA_NOT_READY {
+                        // the action is still running: keep polling
+                    } else if !raw {
+                        println!("[{}]", item_name(*m));
+                    }
+                }
+            }
+        }
+        if done {
+            break;
+        }
+    }
+    let _ = svc.detach();
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()).unwrap_or("") {
         "info" if args.len() >= 5 => query(&args, false)?,
+        "stats" if args.len() >= 5 => stats(&args)?,
         "info-buffer" if args.len() >= 6 => query(&args, true)?,
         "parse" if args.len() == 4 => {
             let grammar = match args[2].as_str() {
@@ -215,7 +296,8 @@ fn run() -> Result<(), String> {
                 "usage: fcsvc info <host> <port> <item>... [--raw]\n\
                  \x20      | info-buffer <host> <port> <bytes> <item>...\n\
                  \x20      | parse <attach|send|receive|start> <hex>\n\
-                 \x20      | answer <items-hex> <buffer-length>"
+                 \x20      | answer <items-hex> <buffer-length>\n\
+                 \x20      | stats <host> <port> <db> [data idx sys versions] [--eof] [--raw]"
             );
             std::process::exit(2);
         }

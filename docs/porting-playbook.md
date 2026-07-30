@@ -799,6 +799,45 @@ them.
   is supposed to CHANGE something, assert that it changed before you
   trust anything measured around it.
 
+## Make the vendor's tool print your answer
+
+- **The strongest differential is indistinguishability.** Not "my output
+  looks right" but "the vendor's own tool, run two ways, prints the same
+  bytes". If the tool can be pointed at a server (`gstat host/port:db`),
+  implement the server side of what it asks for and diff its output
+  against the local run. Nothing of yours is in the printing path, and
+  the comparison is exact text.
+- **Read stream conventions off the wire before writing them.** An output
+  stream that returns "one line per call" sounds obvious and is not: this
+  engine replaces the line's NEWLINE WITH A SPACE (so a blank line is a
+  single space) and reserves the zero-length answer for end-of-stream.
+  The natural guess — blank line = empty answer — collides with EOF and
+  would hang a client. One `--raw` probe against the real server settles
+  it; the source comment then confirms it.
+- **A report's text has laws too.** `Flags` printing a different field
+  than the one with that name (`pag_flags`, not `hdr_flags`), a LABEL
+  printed unconditionally while its value is conditional (so the line
+  dangles when empty), "dialect 1" meaning "no dialect information
+  recorded" — none of these are visible from field names. Convert the
+  printer, not your idea of the report, and keep a fixture for each
+  awkward branch (a database with no attributes, in this case).
+- **Name tables are part of the format.** The implementation triple in
+  Firebird's header is three indexes into hardware/OS/compiler NAME
+  LISTS. Dropping or reordering an entry renames every later platform, so
+  the lists get converted verbatim, in order, with the source cited.
+- **Convert the vendor's validation, with the vendor's error number.**
+  "-h is incompatible with -d" is enforced by the SERVICE, and it arrives
+  as a facility-coded number (gstat message 38 = 336920614), not an
+  `isc_*` code. Refuse the same combinations with the same number, and
+  run that check BEFORE your own capability check - a malformed request
+  should get the engine's answer, not "not implemented".
+- **When a refusal is the point, prove whose refusal it is.** "We refuse
+  data-page statistics" is only meaningful beside "the engine performs
+  them". Ask the real server for the SAME thing in the same gate - and
+  make sure you are asking for what you think: asked together with `-h`,
+  the engine refuses data-page statistics too, and a gate built on that
+  combination would prove nothing.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with
