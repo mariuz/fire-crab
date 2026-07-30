@@ -13,6 +13,50 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — the wire server: a DATE/TIME/TIMESTAMP column in a WHERE
+
+### Converted
+- **Temporal columns in a predicate.** Every operator against a typed
+  literal (`WHERE D > DATE'2021-01-01'`), `IS [NOT] NULL`, `BETWEEN`,
+  `IN`, `LIKE`, in a SELECT and in a DML alike. Until now a temporal
+  column refused the whole statement — `WHERE D IS NULL` included.
+- The comparison RULES were already one layer down: the expression path
+  compares `Value`s and `value_cmp` reads a DATE as MIDNIGHT against a
+  TIMESTAMP, the engine's own conversion. What was missing was the ROUTE
+  to them (the predicate resolver classified columns through `col_kind`,
+  which answers Int or Text and nothing else) and the lexer's temporal
+  literal: `DATE'...'` was two tokens, so the keyword became a column
+  name and the WHERE refused. Both are now one token — as are the clock
+  keywords `CURRENT_DATE`, `LOCALTIME`, `LOCALTIMESTAMP`.
+- **A temporal answer from a subquery** — `WHERE D = (SELECT MAX(D) FROM
+  T)`. A lifted subquery folds its value back into the token stream, and
+  a DATE now folds back as a temporal LITERAL rather than not at all.
+
+### Fixed
+- **A string literal against a temporal column is CONVERTED, not
+  text-compared.** `value_cmp`'s last resort compares two values by
+  rendered text, and ISO date text happens to order like dates — so
+  `D > '2021-01-01'` was right by accident while `D = '2021-6-15'` (which
+  the engine accepts as the same date) compared unequal. The literal is
+  now parsed at prepare, per the column's kind.
+
+### Guarded
+- `D > 'garbage'` and `D > 20200101` refuse at prepare where the engine
+  raises SQLSTATE 22018 at run time. Both are an error to the client;
+  what neither may do — and what the text fallback DID — is return a row
+  set.
+- **TIME against DATE or TIMESTAMP is refused.** The engine promotes a
+  TIME to a TIMESTAMP using the CURRENT DATE; this server does not do
+  that yet, and a render-compare of the two would have answered every
+  row confidently and wrongly.
+
+`qa/serve-real-temporalwhere.sh` (47 checks, twin servers on identical
+databases). The fixture's row 1 carries a TIMESTAMP of 08:30 on its own
+DATE, so `TS > D` returns it and `D = TS` does not — the case that
+separates a real conversion from a text compare. `qa/serve-real-datemath.sh`
+lost a refusal and gained two comparisons: `WHERE DATEADD(1 DAY TO D) >
+DATE '2024-01-01'` was on its refusal list and is a comparison now.
+
 ## 2026-07-30 — the wire server: an aggregate inside a scalar subquery
 
 ### Converted

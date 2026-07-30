@@ -6448,6 +6448,58 @@ no `RDB$FORMATS` entry, so their rows cannot be decoded and the count comes
 from the record headers; moving subqueries onto the group machinery had to
 leave that path intact.
 
+### A temporal column in a WHERE (`qa/serve-real-temporalwhere.sh`, 47 checks)
+
+`WHERE D IS NULL` refused. Not the comparison — the NULL TEST, on a DATE
+column, in a server that had been answering `ORDER BY D` and
+`EXTRACT(YEAR FROM D) = 2021` for slices. That is the shape of a routing gap
+rather than a missing feature, and it was two of them:
+
+- the predicate resolver classified a column through `col_kind`, which
+  answers `Int` or `Text` and nothing else, so every temporal column fell
+  through to `return None`;
+- the tokenizer had no temporal literal, so `DATE'2021-01-01'` lexed as the
+  identifier `DATE` followed by a string, the identifier resolved to no
+  column, and the WHERE refused before typing anything.
+
+The comparison rules themselves were already correct one layer down. The
+expression path compares `Value`s through `value_cmp`, which reads a DATE as
+MIDNIGHT against a TIMESTAMP — the engine's own conversion, written when the
+select list needed it. Routing temporal columns to that path brought
+`IS [NOT] NULL`, `BETWEEN`, `IN` and `LIKE` along at once, because those
+desugar into ordinary comparisons at parse time.
+
+**What the gate is built around.** The fixture's row 1 has a TIMESTAMP of
+08:30 on its own DATE, so a timestamp is strictly LATER than its date:
+`TS > D` returns row 1 and `D = TS` does not. Rendered as text those two
+values differ at the length, so a text compare gets the equality wrong and
+the ordering right — which is exactly the trap the next law walks into.
+
+**The text-compare trap.** `value_cmp`'s last resort compares two values by
+their RENDERED TEXT, and ISO date text happens to order like dates. So
+`D > '2021-01-01'` answered correctly for the wrong reason, `D = '2021-6-15'`
+— the same date, a different string, and legal SQL to the engine — answered
+false, and `D > 'garbage'`, where the engine raises SQLSTATE 22018, returned
+a perfectly plausible row set. A string literal against a temporal side is
+now parsed at PREPARE into the matching literal, and one that does not parse
+refuses the statement. The engine raises at run time and this server refuses
+at prepare; both are an error to the client, and the gate's assertion is that
+neither returns rows.
+
+**One refusal on purpose.** `TM > TS` — a TIME against a TIMESTAMP — is
+refused. The engine promotes the TIME to a TIMESTAMP using the CURRENT DATE
+(probed: with today far past the stored dates, every non-null row comes back,
+and a row dated 2030 does not). This server does not do that promotion, and
+the render-compare that would otherwise have happened answers confidently and
+wrongly. Refusing is the honest half-implementation; the gate pins it so it
+stays a refusal rather than drifting into an answer.
+
+Two knock-on results. A temporal answer from a lifted SUBQUERY
+(`WHERE D = (SELECT MAX(D) FROM T)`) folds back into the token stream as a
+temporal LITERAL — as text it would take the text path again. And
+`qa/serve-real-datemath.sh` lost a refusal: `WHERE DATEADD(1 DAY TO D) >
+DATE '2024-01-01'` was on its refusal list and is now checked as a comparison.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

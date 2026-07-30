@@ -1040,6 +1040,32 @@ them.
   COUNT is 0 (so `> 0` selects nearly everything). One "the aggregate
   found nothing" branch gets one of the two backwards.
 
+- **A refusal on the SIMPLEST shape means the route is missing, not the
+  rule.** `WHERE D IS NULL` refused on a server that already sorted by
+  D and extracted its year. Nothing about NULL tests was unimplemented -
+  the predicate resolver classified columns through a function that
+  answers Int or Text and nothing else, so every temporal column fell
+  out. When a trivial case fails and hard ones pass, look for the
+  classifier, not the logic.
+- **A LAST-RESORT comparison is where wrong answers hide.** Comparing
+  two values by their RENDERED TEXT is a reasonable fallback and a trap:
+  ISO date text orders like dates, so the comparisons LOOKED right while
+  `D = '2021-6-15'` (the same date, a different string) answered false
+  and `D > 'garbage'` returned rows where the engine raises. Convert at
+  PREPARE and refuse what will not convert; a fallback that can answer
+  anything will answer everything.
+- **Half an implementation must refuse, not approximate.** The engine
+  promotes a TIME to a TIMESTAMP using the CURRENT DATE. Not doing that
+  is fine; text-comparing the two instead is not, because it answers
+  every row with no error. Refuse the shape and PIN THE REFUSAL in the
+  gate, so it stays a refusal instead of drifting into a wrong answer.
+- **A gate's refusal list is a claim with a shelf life.** One entry in
+  the date-math gate asserted that a temporal comparison RAISED. It was
+  true when written and became a false claim the moment this slice
+  landed - and it failed loudly, which is the good outcome. Write
+  refusals as `both servers error` rather than `we error` where you
+  can, and expect to promote them to comparisons later.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

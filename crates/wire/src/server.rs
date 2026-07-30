@@ -15783,6 +15783,12 @@ fn value_to_tok(v: &Value) -> Option<Tok> {
         Value::Scaled(raw, scale) => Tok::Dec(*raw, *scale),
         Value::Text(s) => Tok::Str(s.clone()),
         Value::Bool(b) => Tok::Int(if *b { 1 } else { 0 }),
+        // a TEMPORAL answer folds back as the literal it is, not as its
+        // rendered text: `WHERE D = (SELECT MAX(D) FROM T)` must compare
+        // as a DATE, and a Tok::Str would have taken the text path
+        Value::Date(d) => Tok::FnExpr(RawExpr::DateLit(*d)),
+        Value::Time(t) => Tok::FnExpr(RawExpr::TimeLit(*t)),
+        Value::Timestamp(d, t) => Tok::FnExpr(RawExpr::TsLit(*d, *t)),
         _ => return None,
     })
 }
@@ -16898,6 +16904,36 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                     let raw = parse_raw_expr_any(&s[start..close])?;
                     out.push(Tok::FnExpr(raw));
                     i = close;
+                    continue;
+                }
+                // a TEMPORAL LITERAL - `DATE'2021-01-01'`, `TIME'09:00'`,
+                // `TIMESTAMP'2021-01-01 09:00'` - is a keyword followed by
+                // a quoted string, so the two lex as ONE expression token
+                // the way a call does. Without this the keyword became a
+                // column name and the whole WHERE refused.
+                if matches!(upper.as_str(), "DATE" | "TIME" | "TIMESTAMP") {
+                    let mut j = i;
+                    while j < b.len() && b[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if j < b.len() && b[j] == b'\'' {
+                        let mut k = j + 1;
+                        while k < b.len() && b[k] != b'\'' {
+                            k += 1;
+                        }
+                        if k >= b.len() {
+                            return None; // unterminated literal
+                        }
+                        let raw = parse_raw_expr_any(&s[start..=k])?;
+                        out.push(Tok::FnExpr(raw));
+                        i = k + 1;
+                        continue;
+                    }
+                }
+                // the CLOCK keywords take no parentheses, so they need
+                // their own arm or they lex as column names
+                if matches!(upper.as_str(), "CURRENT_DATE" | "LOCALTIME" | "LOCALTIMESTAMP") {
+                    out.push(Tok::FnExpr(parse_raw_expr_any(word)?));
                     continue;
                 }
                 if sysfn_named(&upper).is_some()
@@ -18592,6 +18628,15 @@ fn resolve_predicate(
                 // scaled NUMERIC/DECIMAL and INT128 columns: the exact
                 // numeric comparison surface
                 None if is_numeric_col(d) => numeric_term(fid, rt.kind, d, params)?,
+                // a DATE/TIME/TIMESTAMP column takes the EXPRESSION
+                // path. Its comparison rules already live there -
+                // `value_cmp` converts a DATE to midnight against a
+                // TIMESTAMP, the way the engine does - and going
+                // through it means IS NULL, LIKE, BETWEEN and IN come
+                // along without a temporal case each
+                None if temporal_kind(d).is_some() => {
+                    resolve_expr_term(&rt, columns, descs, params)?
+                }
                 None => return None,
             };
             terms.push(term);
@@ -18657,16 +18702,14 @@ fn resolve_expr_term(
             params[*slot] = Some(desc);
             return Some(Term::ExprParam(Box::new(lhs), *op, *slot, kind));
         }
-        RawKind::Cmp(op, rhs) => Term::ExprCond(Box::new(Cond2::Cmp(
-            Box::new(lhs),
-            *op,
-            Box::new(rhs_expr(rhs)?),
-        ))),
-        RawKind::CmpExpr(op, e) => Term::ExprCond(Box::new(Cond2::Cmp(
-            Box::new(lhs),
-            *op,
-            Box::new(resolve_expr(e, columns, descs)?),
-        ))),
+        RawKind::Cmp(op, rhs) => {
+            let (l, r) = temporal_sides(lhs, rhs_expr(rhs)?, descs)?;
+            Term::ExprCond(Box::new(Cond2::Cmp(Box::new(l), *op, Box::new(r))))
+        }
+        RawKind::CmpExpr(op, e) => {
+            let (l, r) = temporal_sides(lhs, resolve_expr(e, columns, descs)?, descs)?;
+            Term::ExprCond(Box::new(Cond2::Cmp(Box::new(l), *op, Box::new(r))))
+        }
         RawKind::IsNull => Term::ExprCond(Box::new(Cond2::IsNull(Box::new(lhs)))),
         RawKind::IsNotNull => Term::ExprCond(Box::new(Cond2::IsNotNull(Box::new(lhs)))),
         RawKind::Like(Rhs::Str(p), escape, negated) => {
@@ -18703,6 +18746,69 @@ fn resolve_expr_term(
         _ => {}
     }
     Some(term)
+}
+
+/// Type-check (and where the engine converts, CONVERT) the two sides of
+/// a comparison when either is TEMPORAL.
+///
+/// `value_cmp`'s last resort compares two values by their RENDERED TEXT,
+/// which is a trap here: ISO date text happens to order like dates, so
+/// `D > '2021-01-01'` answered correctly by accident while
+/// `D = '2021-6-15'` (which the engine accepts) compared unequal, and
+/// `D > 'garbage'` - where the engine raises a conversion error -
+/// silently returned rows. So a string LITERAL against a temporal side
+/// is parsed into the matching literal here, at prepare, and anything
+/// that does not parse refuses the statement instead of reaching the
+/// text fallback.
+///
+/// The kinds that may meet are the ones the engine converts between:
+/// DATE and TIMESTAMP (the DATE reads as midnight - already `value_cmp`'s
+/// rule). TIME against DATE or TIMESTAMP is REFUSED: the engine promotes
+/// a TIME using the CURRENT DATE, which this server does not do, and a
+/// render-compare of the two would answer confidently and wrongly.
+fn temporal_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)> {
+    // a NULL literal has no type to check against - the comparison is
+    // UNKNOWN whatever the other side is. (It types as Int, so without
+    // this it would look like the number-against-a-date refusal; that
+    // cost a `NOT IN (SELECT ...)` whose inner set held a NULL.)
+    if matches!(lhs, Expr::Null) || matches!(rhs, Expr::Null) {
+        return Some((lhs, rhs));
+    }
+    let (lt, rt) = (lhs.type_of(descs)?, rhs.type_of(descs)?);
+    let coerce = |k: TKind, e: &Expr| -> Option<Expr> {
+        match e {
+            Expr::Str(s) => Some(match k {
+                TKind::Date => Expr::DateLit(parse_date_lit(s)?),
+                TKind::Time => Expr::TimeLit(parse_time_lit(s)?),
+                TKind::Timestamp => {
+                    let (d, t) = s.trim().split_once(' ')?;
+                    Expr::TsLit(parse_date_lit(d)?, parse_time_lit(t.trim())?)
+                }
+            }),
+            _ => None,
+        }
+    };
+    // a pair of temporal kinds: only the DATE/TIMESTAMP conversions
+    let compatible = |a: TKind, b: TKind| {
+        a == b || matches!((a, b), (TKind::Date, TKind::Timestamp) | (TKind::Timestamp, TKind::Date))
+    };
+    match (lt, rt) {
+        (ExprType::Temporal(a), ExprType::Temporal(b)) if compatible(a, b) => Some((lhs, rhs)),
+        (ExprType::Temporal(_), ExprType::Temporal(_)) => None,
+        (ExprType::Temporal(k), ExprType::Text) => {
+            let r = coerce(k, &rhs)?;
+            Some((lhs, r))
+        }
+        (ExprType::Text, ExprType::Temporal(k)) => {
+            let l = coerce(k, &lhs)?;
+            Some((l, rhs))
+        }
+        // a temporal side against a NUMBER: the engine renders the
+        // temporal and fails the conversion (SQLSTATE 22018), so there
+        // is no answer to give - refuse rather than text-compare
+        (ExprType::Temporal(_), _) | (_, ExprType::Temporal(_)) => None,
+        _ => Some((lhs, rhs)),
+    }
 }
 
 /// TRUE when evaluating this expression can NEVER raise, whatever the
@@ -24176,6 +24282,93 @@ mod tests {
         ] {
             assert!(parse_raw_expr(bad).is_none(), "{bad} parsed");
         }
+    }
+
+    #[test]
+    fn resolves_and_evaluates_temporal_predicates() {
+        // D DATE, TM TIME, TS TIMESTAMP, NAME VARCHAR(10)
+        let columns = vec![
+            RelationColumn { name: "D".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "TM".into(), field_id: 1, position: 1 },
+            RelationColumn { name: "TS".into(), field_id: 2, position: 2 },
+            RelationColumn { name: "NAME".into(), field_id: 3, position: 3 },
+        ];
+        let d = |dt, len| Descriptor {
+            dtype: dt, scale: 0, length: len, sub_type: 0, flags: 0, offset: 4,
+        };
+        let descs = vec![
+            d(dtype::SQL_DATE, 4),
+            d(dtype::SQL_TIME, 4),
+            d(dtype::TIMESTAMP, 8),
+            d(dtype::VARYING, 10),
+        ];
+        // 2020-01-01 is MJD 58849; 08:30 is 306_000_000 units of 1/10000 s
+        let day = parse_date_lit("2020-01-01").unwrap();
+        let t830 = parse_time_lit("08:30:00").unwrap();
+        let row = vec![
+            Value::Date(day),
+            Value::Time(t830),
+            Value::Timestamp(day, t830),
+            Value::Text("aa".into()),
+        ];
+        let null_row = vec![Value::Null; 4];
+        let build = |s: &str| -> Option<Predicate> {
+            let toks = tokenize(s)?;
+            let mut np = 0usize;
+            let raw = parse_predicate(&toks, &mut np)?;
+            let mut params: Vec<Option<Descriptor>> = Vec::new();
+            resolve_predicate(raw, &columns, &descs, &mut params)
+        };
+        let hit = |s: &str| build(s).unwrap_or_else(|| panic!("{s} refused")).matches(&row).unwrap();
+
+        // the literal and the keyword lex as ONE token, so the column
+        // comparison resolves at all
+        assert!(matches!(tokenize("D > DATE'2020-01-01'").unwrap()[2], Tok::FnExpr(_)));
+        assert!(hit("D = DATE'2020-01-01'"));
+        assert!(!hit("D > DATE'2020-01-01'"));
+        assert!(hit("TM = TIME'08:30:00'"));
+        assert!(hit("TS = TIMESTAMP'2020-01-01 08:30:00'"));
+        // IS [NOT] NULL over a temporal column - refused outright before,
+        // because `col_kind` has no temporal answer
+        assert!(hit("D IS NOT NULL"));
+        assert!(!hit("D IS NULL"));
+        assert!(build("D IS NULL").unwrap().matches(&null_row).unwrap());
+        // desugared shapes come along with the expression path
+        assert!(hit("D BETWEEN DATE'2019-01-01' AND DATE'2021-01-01'"));
+        assert!(hit("D IN (DATE'2020-01-01', DATE'2022-12-31')"));
+        assert!(!hit("D NOT IN (DATE'2020-01-01')"));
+        assert!(hit("D LIKE '2020%'"));
+
+        // a DATE against a TIMESTAMP reads as MIDNIGHT (the engine's
+        // conversion): the row's 08:30 timestamp is LATER than its date
+        assert!(hit("TS > D"));
+        assert!(!hit("D = TS"));
+        assert!(hit("D < TIMESTAMP'2020-01-01 08:30:00'"));
+
+        // a STRING literal is converted at PREPARE, not compared as
+        // text: '2020-1-1' is the same date though it is not the same
+        // string, which the render-compare fallback got wrong
+        assert!(hit("D = '2020-01-01'"));
+        assert!(hit("D = '2020-1-1'"));
+        assert!(hit("TM = '08:30'"));
+        assert!(hit("TS = '2020-01-01 08:30:00'"));
+        // ... and a string that is not a date REFUSES the statement
+        // rather than text-comparing (the engine raises 22018 - either
+        // way the client gets an error, never a silent row set)
+        assert!(build("D > 'garbage'").is_none());
+        // ... but a NULL literal always passes: the comparison is
+        // UNKNOWN whatever the other side is, and a NULL types as Int -
+        // so without an early pass it looked like the number refusal
+        // (which cost a `NOT IN (SELECT ...)` holding a NULL)
+        assert!(!hit("D = NULL"));
+        assert!(hit("D IN (DATE'2020-01-01', NULL)"));
+        assert!(!hit("D NOT IN (DATE'2019-01-01', NULL)"));
+        assert!(build("D > 20200101").is_none());
+        // TIME against DATE/TIMESTAMP: the engine promotes the TIME with
+        // the CURRENT DATE, which this server does not do - refuse
+        // rather than answer confidently from rendered text
+        assert!(build("TM > TS").is_none());
+        assert!(build("D > TIME'09:00:00'").is_none());
     }
 
     #[test]

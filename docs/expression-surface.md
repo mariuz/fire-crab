@@ -53,6 +53,7 @@ same database file.
 | a lone aggregate's output column is NAMED by its function (COUNT/MIN/MAX/SUM/AVG); a bare literal is CONSTANT, a generator read GEN_ID | probed via isql headers | `Plan::Scalar(value, name)`, `output_cols_of` |
 | DATEADD/DATEDIFF (both syntaxes each); month-end clamping; TIME wraps midnight; DATEDIFF components vs boundary crossings; MILLISECOND at NUMERIC(18,1) | `src/jrd/SysFunction.cpp` (`makeDateAdd`/`makeDateDiff`), probed | `SysFn::DateAdd`/`DateDiff`, `dateadd_impl`, `datediff_impl` |
 | native temporal operators: DATE ± n (numeric addend CVT-rounds), DATE−DATE = days, TIME−TIME = seconds @ −4, TIMESTAMP diff = days @ −9 truncating | `ExprNodes.cpp` arithmetic over temporal descs, probed | the temporal arms of `Expr::Bin` typing/scale/eval |
+| a TEMPORAL COLUMN in a predicate: every operator against a typed literal, IS [NOT] NULL, BETWEEN, IN, LIKE; a DATE against a TIMESTAMP reads as MIDNIGHT; a STRING literal is CONVERTED at prepare (so `D = '2021-6-15'` is the same date, not a different string) and one that will not convert refuses where the engine raises 22018 | `src/jrd/evl.cpp` comparison over temporal descs, probed | `temporal_kind` routing in `resolve_predicate`, `temporal_sides`, the `DATE'...'` arm of `tokenize` |
 | WHERE comparison sides are full expressions (arithmetic, functions, CAST, conditionals, column vs column); per-row eval errors raise mid-statement with the engine's vector | `src/jrd/evl.cpp` boolean evaluation over expression nodes, probed | `texpr` (token-level sides), the fallible `Predicate::matches` |
 | CASE inside WHERE - the span lexes to its balancing END, keyword-matched (nested CASEs nest, literals skipped) | `parse.y` (CASE is an expression production; the predicate grammar just holds it) | `matching_case_end`, the CASE arm of `tokenize` |
 | `?` against an expression side - the bind target descriptor synthesizes from the expression's TYPE (text → VARCHAR, int → BIGINT, numeric → BIGINT at the scale); the arrived value substitutes as a literal | the engine describes parameters from the comparison's other side | `Term::ExprParam`, the param arm of `resolve_expr_term`, `Predicate::bind` |
@@ -216,9 +217,10 @@ and `CURRENT_TIME`/`CURRENT_TIMESTAMP` (TIME ZONE results). An
 aggregate over an APPROXIMATE column (`AVG(D)` where D is DOUBLE) is
 refused in every position - the planner has no approximate result type
 yet, and refusing it in the subquery too keeps one expression from being
-legal in one place and illegal in another. A DATE column in a WHERE
-comparison is refused as well, which is why `WHERE DT = (SELECT MAX(DT)
-FROM T)` refuses: the gap is the predicate's typing, not the subquery.
+legal in one place and illegal in another. TIME against DATE or TIMESTAMP is
+refused too: the engine promotes a TIME to a TIMESTAMP using the CURRENT
+DATE (probed), and comparing the two by rendered text would answer every
+row confidently and wrongly.
 
 ## The evaluator's shape
 

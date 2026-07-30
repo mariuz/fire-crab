@@ -130,6 +130,11 @@ same "DATEDIFF under CASE"          "SELECT CASE WHEN DATEDIFF(DAY, D, CURRENT_D
 same "aggregates over the results"  "SELECT MIN(D + 30), MAX(DATEDIFF(DAY, D, DATE '2024-06-01')) FROM T"
 same "EXTRACT of a DATEADD"         "SELECT EXTRACT(MONTH FROM DATEADD(1 MONTH TO D)) FROM T ORDER BY ID"
 same "GROUP BY a DATEDIFF"          "SELECT DATEDIFF(YEAR, D, DATE '2024-06-01'), COUNT(*) FROM T GROUP BY DATEDIFF(YEAR, D, DATE '2024-06-01') ORDER BY 1"
+# a temporal-valued CALL on the left of a comparison against a temporal
+# literal: this was a REFUSAL here until the predicate resolver learned
+# temporal columns, and it is a comparison now - so it is checked as one
+same "a DATEADD compared to a DATE literal" "SELECT ID FROM T WHERE DATEADD(1 DAY TO D) > DATE '2024-01-01' ORDER BY ID"
+same "a DATEADD compared to a DATE column"  "SELECT ID FROM T WHERE DATEADD(1 DAY TO D) > D ORDER BY ID"
 
 # --- headers -----------------------------------------------------------
 sameh "header DATEADD"              "SELECT DATEADD(1 DAY TO D) FROM T WHERE ID = 1"
@@ -140,7 +145,6 @@ sameh "headers ADD/SUBTRACT"        "SELECT D + 1, D - DATE '1999-01-01' FROM T 
 for bad in "SELECT DATEADD(1 MONTH TO TM) FROM T" \
            "SELECT DATEDIFF(DAY, TM, D) FROM T" \
            "SELECT DATEADD(1 WEEKDAY TO D) FROM T" \
-           "SELECT ID FROM T WHERE DATEADD(1 DAY TO D) > DATE '2024-01-01'" \
            "SELECT TM + 1 FROM T"; do
     out=$(printf '%s;\n' "$bad" |
           "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
