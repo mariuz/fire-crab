@@ -13086,6 +13086,10 @@ enum RawExpr {
     /// means (probed: `B IS UNKNOWN` and `B IS NULL` select the same
     /// rows)
     Bool(bool),
+    /// a CONDITION used as a VALUE - `SELECT B AND C`, `SELECT ID > 2`.
+    /// Firebird makes every predicate an expression of type BOOLEAN, so
+    /// the two grammars meet here
+    Cond(Box<RawCond>),
     Str(String),
     Null,
     Neg(Box<RawExpr>),
@@ -13359,8 +13363,16 @@ fn parse_cond_unary(b: &[char], pos: &mut usize) -> Option<RawCond> {
         if let Some(c) = parse_cond_or(b, &mut p2) {
             skip_ws(b, &mut p2);
             if b.get(p2) == Some(&')') {
-                *pos = p2 + 1;
-                return Some(c);
+                // ... but a COMPARISON after the close paren means the
+                // group was an operand, not a condition: `(A) > 2` and
+                // `(A + 1) > 2` both reach here now that a bare column
+                // parses as a boolean condition on its own
+                let mut p3 = p2 + 1;
+                skip_ws(b, &mut p3);
+                if !matches!(b.get(p3), Some('=' | '<' | '>' | '!')) {
+                    *pos = p2 + 1;
+                    return Some(c);
+                }
             }
         }
     }
@@ -13387,6 +13399,79 @@ fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
         } else {
             RawCond::IsNull(Box::new(left))
         });
+    }
+    // BETWEEN and IN desugar here exactly as they do in the predicate
+    // grammar - into comparisons the rest of the pipeline already knows -
+    // so a condition used as a VALUE gets them for free
+    {
+        let mut p2 = *pos;
+        skip_ws(b, &mut p2);
+        let mut probe = p2;
+        let negated = take_keyword(b, &mut probe, "NOT");
+        if negated {
+            p2 = probe;
+        }
+        let mut after = p2;
+        if take_keyword(b, &mut after, "BETWEEN") {
+            let lo = expr_add(b, &mut after)?;
+            if !take_keyword(b, &mut after, "AND") {
+                return None;
+            }
+            let hi = expr_add(b, &mut after)?;
+            *pos = after;
+            let body = RawCond::And(vec![
+                RawCond::Cmp(Box::new(left.clone()), Cmp::Ge, Box::new(lo)),
+                RawCond::Cmp(Box::new(left), Cmp::Le, Box::new(hi)),
+            ]);
+            return Some(if negated { RawCond::Not(Box::new(body)) } else { body });
+        }
+        let mut after = p2;
+        if take_keyword(b, &mut after, "IN") {
+            skip_ws(b, &mut after);
+            if b.get(after) != Some(&'(') {
+                return None;
+            }
+            after += 1;
+            let mut items = Vec::new();
+            loop {
+                let v = expr_add(b, &mut after)?;
+                items.push(RawCond::Cmp(
+                    Box::new(left.clone()),
+                    Cmp::Eq,
+                    Box::new(v),
+                ));
+                skip_ws(b, &mut after);
+                match b.get(after) {
+                    Some(',') => after += 1,
+                    Some(')') => {
+                        after += 1;
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+            *pos = after;
+            let body = if items.len() == 1 {
+                items.pop()?
+            } else {
+                RawCond::Or(items)
+            };
+            return Some(if negated { RawCond::Not(Box::new(body)) } else { body });
+        }
+    }
+    // A bare COLUMN is a condition on its own - `CASE WHEN B THEN ...`,
+    // `SELECT B AND C`. It means `B = TRUE`; resolution refuses a
+    // non-boolean column, so `CASE WHEN NAME` still fails. Restricted to
+    // a column for the same reason the predicate grammar restricts it:
+    // an expression here would swallow the left side of a comparison.
+    if matches!(left, RawExpr::Col(_))
+        && !matches!(b.get(*pos), Some('=' | '<' | '>' | '!'))
+    {
+        return Some(RawCond::Cmp(
+            Box::new(left),
+            Cmp::Eq,
+            Box::new(RawExpr::Bool(true)),
+        ));
     }
     // a comparison operator, longest match first
     let two: String = b.get(*pos..*pos + 2).map(|c| c.iter().collect()).unwrap_or_default();
@@ -13420,12 +13505,24 @@ fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
 fn parse_raw_expr_any(s: &str) -> Option<RawExpr> {
     let b: Vec<char> = s.chars().collect();
     let mut pos = 0usize;
-    let e = expr_add(&b, &mut pos)?;
+    if let Some(e) = expr_add(&b, &mut pos) {
+        skip_ws(&b, &mut pos);
+        if pos == b.len() {
+            return Some(e);
+        }
+    }
+    // Not an arithmetic expression to its end - try a CONDITION. In
+    // Firebird every predicate is also a VALUE of type BOOLEAN, so
+    // `SELECT B AND C` and `SELECT ID > 2` are select-list items; the
+    // two grammars meet here, with the arithmetic one tried first
+    // because `A - 1` must not lex as a comparison.
+    let mut pos = 0usize;
+    let c = parse_cond_or(&b, &mut pos)?;
     skip_ws(&b, &mut pos);
     if pos != b.len() {
-        return None; // trailing tokens
+        return None;
     }
-    Some(e)
+    Some(RawExpr::Cond(Box::new(c)))
 }
 
 fn skip_ws(b: &[char], pos: &mut usize) {
@@ -13774,6 +13871,7 @@ fn raw_bad_substring_len(e: &RawExpr) -> Option<i64> {
             .or_else(|| walk_all(args)),
         RawExpr::Func(_, args) | RawExpr::Coalesce(args) => walk_all(args),
         RawExpr::Double(_) | RawExpr::Bool(_) => None,
+        RawExpr::Cond(c) => raw_cond_bad_substring_len(c),
         RawExpr::Neg(a) | RawExpr::Cast(a, _) => raw_bad_substring_len(a),
         RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => {
             raw_bad_substring_len(a).or_else(|| raw_bad_substring_len(b))
@@ -14254,11 +14352,21 @@ fn resolve_raw_cond(
     descs: &[Descriptor],
 ) -> Option<Cond2> {
     Some(match c {
-        RawCond::Cmp(a, op, b) => Cond2::Cmp(
-            Box::new(resolve_expr(a, columns, descs)?),
-            *op,
-            Box::new(resolve_expr(b, columns, descs)?),
-        ),
+        // the SAME side typing the predicate resolver applies - a
+        // temporal or approximate or boolean side against something it
+        // cannot meet REFUSES here too. Without it a `CASE WHEN NAME`
+        // built a Text-against-Bool comparison that fell to
+        // `value_cmp`'s rendered-text last resort and answered 0 for
+        // every row, where the engine raises "Invalid usage of boolean
+        // expression".
+        RawCond::Cmp(a, op, b) => {
+            let (l, r) = cmp_sides(
+                resolve_expr(a, columns, descs)?,
+                resolve_expr(b, columns, descs)?,
+                descs,
+            )?;
+            Cond2::Cmp(Box::new(l), *op, Box::new(r))
+        }
         RawCond::IsNull(a) => Cond2::IsNull(Box::new(resolve_expr(a, columns, descs)?)),
         RawCond::IsNotNull(a) => Cond2::IsNotNull(Box::new(resolve_expr(a, columns, descs)?)),
         RawCond::Not(inner) => Cond2::Not(Box::new(resolve_raw_cond(inner, columns, descs)?)),
@@ -14307,6 +14415,7 @@ fn resolve_expr(
         RawExpr::Dec(raw, scale) => Expr::Dec(*raw, *scale),
         RawExpr::Double(d) => Expr::Double(*d),
         RawExpr::Bool(b) => Expr::Bool(*b),
+        RawExpr::Cond(c) => Expr::Cond(Box::new(resolve_raw_cond(c, columns, descs)?)),
         RawExpr::Str(s) => Expr::Str(s.clone()),
         RawExpr::Null => Expr::Null,
         RawExpr::Neg(e) => Expr::Neg(Box::new(resolve_expr(e, columns, descs)?)),
@@ -14389,6 +14498,10 @@ enum Expr {
     Double(f64),
     /// `TRUE` / `FALSE` (`UNKNOWN` is `Null`)
     Bool(bool),
+    /// a CONDITION as a VALUE - three-valued, so its result is
+    /// TRUE/FALSE/NULL and the fold is Kleene's (probed: `FALSE AND
+    /// UNKNOWN` is FALSE, `TRUE OR UNKNOWN` is TRUE)
+    Cond(Box<Cond2>),
     Str(String),
     Null,
     Neg(Box<Expr>),
@@ -15184,7 +15297,7 @@ impl Expr {
             Expr::Int(_) => Some(ExprType::Int),
             Expr::Dec(..) => Some(ExprType::Numeric),
             Expr::Double(_) => Some(ExprType::Approx),
-            Expr::Bool(_) => Some(ExprType::Bool),
+            Expr::Bool(_) | Expr::Cond(_) => Some(ExprType::Bool),
             Expr::Str(_) => Some(ExprType::Text),
             Expr::Null => Some(ExprType::Int),
             Expr::DateLit(_) => Some(ExprType::Temporal(TKind::Date)),
@@ -15465,7 +15578,7 @@ impl Expr {
             // branch fits the announced column
             // an APPROXIMATE or BOOLEAN value has no exact rank - width
             // is not what decides its wire form
-            Expr::Double(_) | Expr::Bool(_) => None,
+            Expr::Double(_) | Expr::Bool(_) | Expr::Cond(_) => None,
             Expr::Coalesce(args) => args.iter().filter_map(|a| a.rank_of(descs)).max(),
             Expr::Case(branches, else_) => branches
                 .iter()
@@ -15572,6 +15685,11 @@ impl Expr {
         Ok(match self {
             Expr::Double(d) => Value::Double(*d),
             Expr::Bool(b) => Value::Bool(*b),
+            // three-valued: UNKNOWN is the SQL NULL of the boolean type
+            Expr::Cond(c) => match c.eval(values)? {
+                Some(b) => Value::Bool(b),
+                None => Value::Null,
+            },
             // the first operand that is not NULL; NULL when all are
             Expr::Coalesce(args) => {
                 let mut out = Value::Null;
@@ -17097,6 +17215,12 @@ fn default_expr_name(raw: &RawExpr) -> String {
         RawExpr::Neg(_) => "",
         RawExpr::Int(_) | RawExpr::Dec(..) | RawExpr::Double(_) | RawExpr::Str(_)
         | RawExpr::Bool(_) | RawExpr::Null => "CONSTANT",
+        // every boolean-valued expression is named BOOL, whatever
+        // produced it - `B AND C`, `ID > 2`, `NOT B`, `B IS NULL`,
+        // `ID BETWEEN 1 AND 2`, `ID IN (1, 2)` all describe as BOOL
+        // (probed). A bare column keeps its own name, which it does by
+        // never becoming a Cond in the select list.
+        RawExpr::Cond(_) => "BOOL",
         RawExpr::Col(_) => "EXPR",
     }
     .to_string()
@@ -19546,6 +19670,8 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
         | Expr::DateLit(_)
         | Expr::TimeLit(_)
         | Expr::TsLit(..) => true,
+        // a condition as a value raises only where its own operands do
+        Expr::Cond(c) => cond_no_raise(c, descs),
         Expr::Neg(x) => expr_no_raise(x, descs),
         // arithmetic can overflow / divide by zero; CAST can fail
         Expr::Bin(..) | Expr::Cast(..) => false,
@@ -24993,6 +25119,92 @@ mod tests {
         ] {
             assert!(parse_raw_expr(bad).is_none(), "{bad} parsed");
         }
+    }
+
+    #[test]
+    fn a_condition_is_a_value() {
+        // B BOOLEAN, C BOOLEAN, ID INTEGER, NAME VARCHAR(10)
+        let columns = vec![
+            RelationColumn { name: "B".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "C".into(), field_id: 1, position: 1 },
+            RelationColumn { name: "ID".into(), field_id: 2, position: 2 },
+            RelationColumn { name: "NAME".into(), field_id: 3, position: 3 },
+        ];
+        let d = |dt, len| Descriptor {
+            dtype: dt, scale: 0, length: len, sub_type: 0, flags: 0, offset: 4,
+        };
+        let descs = vec![
+            d(dtype::BOOLEAN, 1),
+            d(dtype::BOOLEAN, 1),
+            d(dtype::LONG, 4),
+            d(dtype::VARYING, 10),
+        ];
+        let val = |src: &str, row: &[Value]| -> Option<Value> {
+            let raw = parse_raw_expr_any(src)?;
+            let e = resolve_expr(&raw, &columns, &descs)?;
+            assert_eq!(e.type_of(&descs), Some(ExprType::Bool), "{src} is not boolean");
+            e.eval(row).ok()
+        };
+        let row = |b: Value, c: Value, id: i64| vec![b, c, Value::Int(id), Value::Text("aa".into())];
+        let tt = row(Value::Bool(true), Value::Bool(true), 1);
+        let nf = row(Value::Null, Value::Bool(false), 3); // NULL and FALSE
+        let tn = row(Value::Bool(true), Value::Null, 4); // TRUE and NULL
+
+        // the KLEENE fold, which a WHERE clause cannot show because it
+        // collapses false and unknown into "row excluded"
+        assert_eq!(val("B AND C", &tt), Some(Value::Bool(true)));
+        assert_eq!(val("B AND C", &nf), Some(Value::Bool(false))); // FALSE dominates
+        assert_eq!(val("B AND C", &tn), Some(Value::Null)); // TRUE does not
+        assert_eq!(val("B OR C", &nf), Some(Value::Null));
+        assert_eq!(val("B OR C", &tn), Some(Value::Bool(true))); // TRUE dominates
+        assert_eq!(val("NOT B", &nf), Some(Value::Null)); // NOT UNKNOWN
+
+        // any predicate shape is a value, including the ones that
+        // desugar (BETWEEN, IN) and the two-valued NULL tests
+        assert_eq!(val("ID > 2", &tt), Some(Value::Bool(false)));
+        assert_eq!(val("ID > 2", &nf), Some(Value::Bool(true)));
+        assert_eq!(val("B IS NULL", &nf), Some(Value::Bool(true)));
+        assert_eq!(val("ID BETWEEN 2 AND 3", &nf), Some(Value::Bool(true)));
+        assert_eq!(val("ID IN (1, 2)", &tt), Some(Value::Bool(true)));
+        assert_eq!(val("ID NOT IN (1, 2)", &nf), Some(Value::Bool(true)));
+        assert_eq!(val("(ID > 2) AND B", &tn), Some(Value::Bool(true)));
+
+        // ARITHMETIC still parses as arithmetic - the condition parser
+        // is only tried when the expression one does not reach the end,
+        // and a parenthesised operand is not a boolean group
+        let num = |src: &str| {
+            let raw = parse_raw_expr_any(src).unwrap();
+            resolve_expr(&raw, &columns, &descs).unwrap().eval(&tt).unwrap()
+        };
+        assert_eq!(num("ID + 1"), Value::Int(2));
+        assert_eq!(num("(ID + 1) * 2"), Value::Int(4));
+        assert!(matches!(
+            parse_raw_expr_any("(ID + 1) > 2"),
+            Some(RawExpr::Cond(_))
+        ));
+        assert!(matches!(parse_raw_expr_any("(ID + 1) * 2"), Some(RawExpr::Bin(..))));
+
+        // a boolean-valued expression is named BOOL whatever produced
+        // it; a bare column keeps its own name by never becoming one
+        for src in ["B AND C", "ID > 2", "NOT B", "B IS NULL", "ID BETWEEN 1 AND 2"] {
+            assert_eq!(default_expr_name(&parse_raw_expr_any(src).unwrap()), "BOOL", "{src}");
+        }
+
+        // a non-boolean column is not a condition: the side typing
+        // refuses it rather than comparing rendered text (which
+        // answered FALSE for every row)
+        let raw = parse_raw_expr_any("NAME").unwrap();
+        assert!(matches!(raw, RawExpr::Col(_))); // an expression, not a condition
+        assert!(resolve_raw_cond(
+            &RawCond::Cmp(
+                Box::new(RawExpr::Col("NAME".into())),
+                Cmp::Eq,
+                Box::new(RawExpr::Bool(true)),
+            ),
+            &columns,
+            &descs
+        )
+        .is_none());
     }
 
     #[test]

@@ -1168,6 +1168,26 @@ them.
   of work and turns "did I break this?" into a fact. Both of these
   turned out to predate the slice being checked.
 
+- **Two grammars for one language will disagree.** A predicate parser
+  and an expression parser that both exist will eventually be asked the
+  same question - `B AND C` in a select list, `CASE WHEN B` in an
+  expression - and each will answer for the shapes it knows. Give them
+  ONE typing check (here `cmp_sides`) even while their parsers stay
+  separate, or one of them will quietly answer what the other refuses.
+- **Three-valued logic hides inside a WHERE clause.** False and unknown
+  both mean "row excluded", so a predicate engine can be wrong about
+  which one it computed for years. The moment a condition becomes a
+  VALUE the difference is visible - and the Kleene rules (`FALSE AND
+  UNKNOWN` is FALSE, `TRUE OR UNKNOWN` is TRUE) are exactly where a
+  naive "any NULL operand makes NULL" implementation breaks. Build the
+  fixture with one row for each half.
+- **A total comparison function is a liability.** Three separate slices
+  in this run found `value_cmp`'s rendered-text fallback quietly
+  answering a comparison the type system had not yet learned to refuse -
+  approximate against exact, temporal against text, text against
+  boolean. A function that can compare anything will compare the pairs
+  you have not thought about, and it will not tell you.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

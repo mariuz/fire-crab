@@ -6707,6 +6707,46 @@ where the value is needed and assert the parameter's refusal on BOTH servers,
 which is what that fact is. A fixed-expectation gate can encode an assumption
 the oracle never held; a twin comparison cannot.
 
+### A condition used as a value (`qa/serve-real-boolvalue.sh`, 33 checks)
+
+This server has two grammars — the WHERE parser and the select-list
+expression parser — and Firebird has one. Every predicate there is also an
+expression of type BOOLEAN, so `SELECT B AND C` and `SELECT ID > 2` are
+select-list items, `ORDER BY` keys and `GROUP BY` keys. Joining the two is
+mostly plumbing: an `Expr::Cond` wrapping the condition tree, and an
+expression parser that tries arithmetic first and falls back to the condition
+grammar when the arithmetic one does not reach the end of the text.
+
+**What is not plumbing is the fold.** A condition as a value has THREE
+results, and the rule is Kleene's: `FALSE AND UNKNOWN` is FALSE, `TRUE OR
+UNKNOWN` is TRUE — a decided dominant value wins over the unknown one. A WHERE
+clause cannot show any of this, because it collapses false and unknown into the
+same "row excluded". So the fixture carries one `(NULL, FALSE)` row and one
+`(TRUE, NULL)` row, one for each half of the rule: an implementation that
+answered NULL whenever an operand was NULL fails the first, and one that
+answered FALSE fails the second. Every check reads the VALUE.
+
+**Two parser traps, both about parentheses.** The condition grammar already had
+a paren-group rule, and making a bare column a condition turned `(A) > 2` and
+`(A + 1) > 2` into "a group, then junk" — the group closes, and the comparison
+that follows is orphaned. The fix is a lookahead: a comparison operator after
+the closing paren means the parens were an OPERAND. And `parse_raw_expr_any`
+tries arithmetic FIRST, because `A - 1` must not be read as the start of a
+comparison.
+
+**The silent wrong answer it uncovered.** `CASE WHEN NAME THEN 1 ELSE 0 END`
+returned 0 for every row. The condition resolver built its comparison with
+plain `resolve_expr` on both sides and no side typing, so a Text-against-Bool
+comparison fell through to `value_cmp`'s rendered-text last resort and compared
+`"aa"` with `"true"` — false, every time, with no error. The engine raises
+`Invalid usage of boolean expression`. Both resolvers now run the same
+`cmp_sides` check, which as a side effect gives `CASE`/`IIF` conditions the
+temporal and approximate typing rules the WHERE clause has had for several
+increments. That is the third time in this run of slices that the rendered-text
+fallback has been the thing quietly answering; it is worth stating plainly that
+a total comparison function is a liability wherever a type system is still
+being filled in.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

@@ -13,6 +13,46 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — a CONDITION used as a VALUE
+
+### Converted
+- **`SELECT B AND C`, `SELECT ID > 2`** — in Firebird every predicate is
+  also an expression of type BOOLEAN, so the two grammars this server
+  keeps apart (the WHERE parser and the select-list expression parser)
+  meet in the select list. Comparisons, `AND`/`OR`/`NOT`, `IS [NOT]
+  NULL`, `BETWEEN`, `IN`, parenthesised and nested — as select-list
+  items, as `ORDER BY` and `GROUP BY` keys, and anywhere else an
+  expression goes.
+- **The fold is Kleene's, and only a VALUE can show it.** `FALSE AND
+  UNKNOWN` is FALSE and `TRUE OR UNKNOWN` is TRUE — a decided dominant
+  value wins over the unknown one. A WHERE clause collapses false and
+  unknown into "row excluded", so none of that is visible until the
+  condition is a value; every check in the new gate reads the value.
+- **`BETWEEN` and `IN` in the condition grammar**, desugared into
+  comparisons the way the predicate grammar already does — so `CASE WHEN
+  ID BETWEEN 2 AND 3` and `IIF(ID IN (1, 4), ...)` work now too.
+- **A bare boolean column is a condition** there as well: `CASE WHEN B
+  THEN ...`, `IIF(B, ...)`.
+- Every boolean-valued expression describes as **BOOL** — `B AND C`,
+  `ID > 2`, `NOT B`, `B IS NULL`, `ID BETWEEN 1 AND 2`, `ID IN (1, 2)`
+  (probed). A bare column keeps its own name, which it does by never
+  becoming a condition in the select list.
+
+### Fixed
+- **`CASE WHEN NAME THEN ...` answered 0 for every row.** The condition
+  resolver built the comparison without the side typing the predicate
+  resolver applies, so a Text-against-Bool comparison fell to
+  `value_cmp`'s rendered-text last resort and quietly compared `"aa"`
+  with `"true"`. The engine raises `Invalid usage of boolean
+  expression`; both resolvers now run the same `cmp_sides` check, which
+  also gives `CASE`/`IIF` conditions the temporal and approximate typing
+  rules the WHERE clause already had.
+
+`qa/serve-real-boolvalue.sh` (33 checks, twin servers). Its fixture has
+one `(NULL, FALSE)` row and one `(TRUE, NULL)` row, one for each half of
+the Kleene rule: an implementation that answered NULL whenever an operand
+was NULL fails the first, and one that answered FALSE fails the second.
+
 ## 2026-07-30 — BOOLEAN, the type that is also a predicate
 
 ### Converted
