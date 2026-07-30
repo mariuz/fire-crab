@@ -7006,6 +7006,40 @@ refusal (when unplannable queries began to raise), and now a comparison (now
 that CROSS JOIN works). The property it defends — never wrong rows — has not
 moved once. That is what a well-written gate check looks like over time.
 
+### NATURAL JOIN: a condition made of names (`qa/serve-real-joinchain.sh`, 33 checks)
+
+Every other join says what to compare. NATURAL says WHICH NAMES, and the
+condition follows: one equality per column name the two sides share. Sharing
+nothing makes it a cross join, which is the same answer the empty AND gives.
+That much is a dozen lines once the ON is a predicate.
+
+**The rest is about identity, not matching.** The shared columns become ONE
+column, so a bare `K` after a natural join is not ambiguous — it means the
+merged column — while `NR.K` still reaches the other side's copy, which the
+engine allows. `SELECT *` emits the pair once. Modelling that as "remove the
+right's copy" was wrong twice over: it broke the qualified name, and it broke
+the WHERE, because the combined view is built before the removal happened.
+What works is a flag — `merged_away` on the side that was joined in — read by
+three places that each ask a different question: bare resolution skips it,
+`SELECT *` skips it, and the combined view does not count it as a second
+column of that name. The qualified path ignores the flag entirely.
+
+**And the merged column has two sources.** In `NATURAL RIGHT JOIN` the
+preserved side is the right one, so a padded left row has NULL where the right
+has a value — and the engine shows the value. The star projection therefore
+builds each merged column as `COALESCE(left, right)` rather than reading the
+left's slot. An inner join hides this completely, since the two are equal by
+construction; only an outer one asks the question.
+
+The NULL rule needed no code at all. A row whose shared columns are NULL on
+both sides does not join, because the derived condition is an equality and
+`NULL = NULL` is UNKNOWN. The fixture has exactly that row, and the LEFT
+variant shows it padded.
+
+With this the FROM clause answers every join shape the engine has except a
+join over a VIEW: inner and the three outer kinds, chains of any length,
+CROSS, comma lists, and NATURAL.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

@@ -23,6 +23,10 @@
 #                                 for most rows and disagrees for a few,
 #                                 so a two-column ON is not the same
 #                                 join as a one-column ON.
+#   NL / NR(K, G, ...)          - two tables sharing K and G by NAME, for
+#                                 NATURAL JOIN: only one pair agrees on
+#                                 both, and a row where both shared
+#                                 columns are NULL never joins.
 #   REGION(ID, NAME)            - 5 rows, one of which (50) no department
 #                                 references, so a three-table chain has
 #                                 something to drop at its second step.
@@ -72,6 +76,12 @@ CREATE TABLE REGION (
   ID INTEGER NOT NULL PRIMARY KEY,
   NAME VARCHAR(20)
 );
+-- two tables built for NATURAL JOIN: they share K and G by name (so the
+-- derived condition has two terms), each has a column of its own, and a
+-- row where both shared columns are NULL - which never joins, because
+-- NULL = NULL is UNKNOWN
+CREATE TABLE NL (K INTEGER, G INTEGER, LONLY VARCHAR(6));
+CREATE TABLE NR (K INTEGER, G INTEGER, RONLY VARCHAR(6));
 CREATE TABLE J1 (K CHAR(10), V INTEGER);
 CREATE TABLE J2 (K2 VARCHAR(10), W INTEGER);
 COMMIT;
@@ -98,6 +108,14 @@ COMMIT;
 
 -- text join keys: duplicates on both sides, a NULL each, and the
 -- CHAR/VARCHAR padding difference
+INSERT INTO NL VALUES (1, 10, 'l1');
+INSERT INTO NL VALUES (2, 20, 'l2');
+INSERT INTO NL VALUES (3, 30, 'l3');
+INSERT INTO NL VALUES (4, NULL, 'l4');
+INSERT INTO NR VALUES (1, 10, 'r1');
+INSERT INTO NR VALUES (2, 99, 'r2');
+INSERT INTO NR VALUES (5, 50, 'r5');
+INSERT INTO NR VALUES (4, NULL, 'r4');
 INSERT INTO J1 VALUES ('alpha', 1);
 INSERT INTO J1 VALUES ('alpha', 2);
 INSERT INTO J1 VALUES ('beta', 3);

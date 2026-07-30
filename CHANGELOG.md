@@ -13,6 +13,34 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — NATURAL JOIN: a condition made of names
+
+### Converted
+- **`NATURAL [LEFT|RIGHT|FULL [OUTER]] JOIN`** — the last shape the FROM
+  clause refused. It has no ON: the condition is DERIVED from the column
+  names the two sides share, one equality per shared name. Sharing
+  nothing makes it a cross join (probed).
+- **The shared columns become ONE column.** A bare `K` after a natural
+  join is not ambiguous — it means the merged column — while `NR.K`
+  still reaches the other side's copy, which is what the engine allows.
+  `SELECT *` emits the pair once.
+- **In an OUTER natural join the merged column shows whichever side has
+  a value.** `NATURAL RIGHT JOIN` preserves the right, so a padded left
+  would show NULL for a column the right has a value for; the engine
+  shows the value, so the star projection builds those columns as a
+  COALESCE of the two sources.
+
+The FROM clause now answers every join shape the engine has except a
+join over a VIEW: inner and the three outer kinds, chains of any length,
+CROSS, comma lists, and NATURAL — with the ON generalised to a predicate
+two increments ago.
+
+`qa/serve-real-joinchain.sh` grew from 24 checks to 33, and
+`qa/mkjoindb.sh` gained two tables built for this: they share K and G by
+name, only one pair agrees on both, and a row whose shared columns are
+NULL never joins — because NULL = NULL is UNKNOWN, which is the rule a
+derived condition inherits rather than restates.
+
 ## 2026-07-30 — CROSS JOIN, comma lists, and where an item's ON can look
 
 ### Converted

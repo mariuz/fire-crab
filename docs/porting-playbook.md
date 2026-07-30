@@ -1284,6 +1284,17 @@ them.
   plan shape for comma lists. Rules about VISIBILITY usually want a
   range, not a special case.
 
+- **"Hidden" is a flag, not a deletion.** A NATURAL join merges two
+  columns into one, and removing the second from its side's column list
+  looks right until a QUALIFIED name needs it back - and until something
+  built its own view of the columns before the removal. A flag, read by
+  each consumer that asks a different question, survives both.
+- **A derived condition inherits the semantics of the operator it is
+  built from.** The NULL rule for NATURAL JOIN needed no code: the
+  condition is an equality, and `NULL = NULL` is UNKNOWN. When you find
+  yourself writing a special case for NULLs in a derived predicate, check
+  whether the operator already says it.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

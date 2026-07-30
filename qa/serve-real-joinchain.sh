@@ -156,6 +156,41 @@ compare "a comma item that is itself a join" \
     "SELECT COUNT(*) FROM DEPT D, REGION R JOIN EMP E ON E.REGION_ID = R.ID" \
     "SELECT COUNT(*) FROM DEPT D, REGION R JOIN EMP E ON E.REGION_ID = R.ID;"
 
+# --- NATURAL JOIN: the condition comes from the NAMES ------------------
+# NL and NR share K and G, so the derived condition has two terms; only
+# one pair agrees on both, and the row whose shared columns are NULL
+# never joins, because NULL = NULL is UNKNOWN.
+compare "NATURAL JOIN derives its condition" \
+    "SELECT COUNT(*) FROM NL NATURAL JOIN NR" \
+    "SELECT COUNT(*) FROM NL NATURAL JOIN NR;"
+compare "the shared columns appear ONCE in *" \
+    "SELECT * FROM NL NATURAL JOIN NR" \
+    "SELECT NL.K || '|' || NL.G || '|' || NL.LONLY || '|' || NR.RONLY FROM NL NATURAL JOIN NR;"
+compare "a bare shared name is not ambiguous" \
+    "SELECT K FROM NL NATURAL JOIN NR" \
+    "SELECT K FROM NL NATURAL JOIN NR;"
+compare "and the qualified one still reaches the other side" \
+    "SELECT NR.K FROM NL NATURAL JOIN NR" \
+    "SELECT NR.K FROM NL NATURAL JOIN NR;"
+compare "a bare shared name in the WHERE" \
+    "SELECT COUNT(*) FROM NL NATURAL JOIN NR WHERE K = 1" \
+    "SELECT COUNT(*) FROM NL NATURAL JOIN NR WHERE K = 1;"
+compare "NATURAL LEFT keeps the unmatched left rows" \
+    "SELECT COUNT(*) FROM NL NATURAL LEFT JOIN NR" \
+    "SELECT COUNT(*) FROM NL NATURAL LEFT JOIN NR;"
+compare "NATURAL FULL keeps both sides" \
+    "SELECT COUNT(*) FROM NL NATURAL FULL JOIN NR" \
+    "SELECT COUNT(*) FROM NL NATURAL FULL JOIN NR;"
+# in an OUTER natural join the merged column shows whichever side has a
+# value - the preserved side may be the PADDED one
+compare "the merged column in a NATURAL RIGHT join" \
+    "SELECT * FROM NL NATURAL RIGHT JOIN NR" \
+    "SELECT COALESCE(CAST(NL.K AS VARCHAR(12)),CAST(NR.K AS VARCHAR(12))) || '|' || COALESCE(CAST(NL.G AS VARCHAR(12)),CAST(NR.G AS VARCHAR(12)),'<null>') || '|' || COALESCE(NL.LONLY,'<null>') || '|' || NR.RONLY FROM NL NATURAL RIGHT JOIN NR;"
+# sharing NO column name makes it a cross join (probed)
+compare "NATURAL with nothing in common is a cross join" \
+    "SELECT COUNT(*) FROM NL NATURAL JOIN REGION" \
+    "SELECT COUNT(*) FROM NL NATURAL JOIN REGION;"
+
 # --- refusals ----------------------------------------------------------
 # ... and naming a table from ANOTHER item in that ON is an error on
 # both: the join binds tighter than the comma, so D is not in scope
@@ -169,12 +204,12 @@ case "$a" in
           esac ;;
     *) echo "DIFF fire-crab answered a cross-item ON: [$a]"; fail=1 ;;
 esac
-# NATURAL JOIN joins on every shared NAME - a different rule, refused
-r=$(node_q "SELECT COUNT(*) FROM DEPT NATURAL JOIN REGION")
+# a NATURAL kind keyword that is not one
+r=$(node_q "SELECT COUNT(*) FROM NL NATURAL BOGUS JOIN NR")
 ran=$((ran + 1))
 case "$r" in
-    ERR*) echo "OK   NATURAL JOIN is refused (it joins on shared NAMES)" ;;
-    *) echo "DIFF NATURAL JOIN answered: [$r]"; fail=1 ;;
+    ERR*) echo "OK   an unknown NATURAL join kind is refused" ;;
+    *) echo "DIFF NATURAL BOGUS answered: [$r]"; fail=1 ;;
 esac
 # two sides sharing a qualifier cannot be told apart
 r=$(node_q "SELECT COUNT(*) FROM EMP E JOIN DEPT D ON E.DEPT_ID = D.ID JOIN REGION D ON D.REGION_ID = D.ID")
@@ -191,8 +226,8 @@ case "$r" in
     *) echo "DIFF ambiguous bare name answered: [$r]"; fail=1 ;;
 esac
 
-if [ "$ran" -lt 24 ]; then
-    echo "DIFF only $ran checks ran (expected at least 24) - did one silently skip?"
+if [ "$ran" -lt 33 ]; then
+    echo "DIFF only $ran checks ran (expected at least 33) - did one silently skip?"
     fail=1
 fi
 exit $fail

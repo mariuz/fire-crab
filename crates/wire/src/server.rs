@@ -9378,11 +9378,21 @@ fn parse_from(
         }
     }
     let up = from_s.to_ascii_uppercase();
-    // NATURAL JOIN joins on every SHARED COLUMN NAME and then collapses
-    // those columns into one - a rule about names rather than a
-    // condition, and not one this server answers yet
-    if find_word(&up, "NATURAL", 0).is_some() {
-        return None;
+    // `NATURAL [LEFT|RIGHT|FULL [OUTER]] JOIN t` - no ON clause; the
+    // condition comes from the shared column NAMES, and the planner
+    // derives it once it knows both sides
+    if let Some(np) = find_word(&up, "NATURAL", 0) {
+        let jp = find_word(&up, "JOIN", np)?;
+        let kind = match up[np + "NATURAL".len()..jp].trim() {
+            "" | "INNER" => JoinKind::Inner,
+            "LEFT" | "LEFT OUTER" => JoinKind::Left,
+            "RIGHT" | "RIGHT OUTER" => JoinKind::Right,
+            "FULL" | "FULL OUTER" => JoinKind::Full,
+            _ => return None,
+        };
+        let left = parse_table_ref(from_s[..np].trim())?;
+        let right = parse_table_ref(from_s[jp + "JOIN".len()..].trim())?;
+        return Some((left, vec![(kind, right, NATURAL_ON, 0)]));
     }
     if let Some(cp) = find_word(&up, "CROSS", 0) {
         // `A CROSS JOIN B` - no ON, every pair kept
@@ -9489,6 +9499,11 @@ struct JoinSide {
     columns: Vec<RelationColumn>,
     descs: Vec<Descriptor>,
     offset: usize,
+    /// columns a NATURAL join MERGED into the side before this one: they
+    /// are still reachable QUALIFIED (`R.K`, which the engine allows)
+    /// but a bare name means the other side's, and `*` emits the pair
+    /// once
+    merged_away: Vec<u16>,
 }
 
 /// Resolve a (possibly qualified) column name against the two join sides
@@ -9500,7 +9515,11 @@ fn resolve_join_col<'a>(
 ) -> Option<(usize, &'a Descriptor, &'a str)> {
     let (qual, col) = split_qual(name);
     let hit = |side: &'a JoinSide| -> Option<(usize, &'a Descriptor, &'a str)> {
-        let rc = side.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col))?;
+        let rc = side.columns.iter().find(|c| {
+            c.name.eq_ignore_ascii_case(col)
+                // a merged-away column answers only to its qualifier
+                && (qual.is_some() || !side.merged_away.contains(&c.field_id))
+        })?;
         // a computed column has no record bytes in the joined row
         if is_computed_fid(&side.descs, rc.field_id as usize) {
             return None;
@@ -9534,6 +9553,10 @@ fn resolve_join_col<'a>(
 /// item of a comma list. Distinct from an empty string so a genuinely
 /// empty ON stays the parse error it is.
 const CROSS_ON: &str = "\u{0}cross";
+
+/// The ON text of a NATURAL step: the condition is not written, it is
+/// DERIVED from the two sides' shared column names.
+const NATURAL_ON: &str = "\u{0}natural";
 
 fn parse_on(on_s: &str, sides: &[JoinSide]) -> Option<Predicate> {
     // a step with no condition keeps every pair: the fold's `matches`
@@ -9616,6 +9639,12 @@ fn combined_view(sides: &[JoinSide]) -> (Vec<RelationColumn>, Vec<Descriptor>) {
                 field_id: idx as u16,
                 position: idx as u16,
             });
+            // a merged-away column is not a second column of that name -
+            // a NATURAL join made the pair ONE - so it does not make the
+            // bare name ambiguous
+            if side.merged_away.contains(&rc.field_id) {
+                continue;
+            }
             if let Some(prev) = comb_cols
                 .iter()
                 .position(|c| c.name.eq_ignore_ascii_case(&rc.name))
@@ -9763,6 +9792,7 @@ fn plan_join(
             columns,
             descs,
             offset,
+            merged_away: Vec::new(),
         });
     }
     // every side must be distinguishable by qualifier
@@ -9778,12 +9808,45 @@ fn plan_join(
     // the one it adds - `A JOIN B ON ... JOIN C ON B.Y = C.Y` lets the
     // second condition name B, which is what makes the chain a fold.
     let mut parts: Vec<JoinPart> = Vec::new();
+    // per step, the column names a NATURAL join merged - hidden on the
+    // new side so `*` emits them once and a bare name is not ambiguous
+    let mut natural_shared: Vec<Vec<String>> = Vec::new();
     for (k, (kind, _, on_s, vis)) in joins.iter().enumerate() {
         // a step sees the sides from `vis` up to the one it adds - the
         // whole chain for a plain FROM, and only its own comma item for
         // a list, which is what the engine scopes an item's ON to
         let visible = &sides[*vis..=k + 1];
-        let on = parse_on(on_s, visible)?;
+        // A NATURAL step's condition is DERIVED: every column name the
+        // new side shares with the ones before it, compared for
+        // equality. Sharing nothing makes it a cross join (probed), and
+        // those shared columns are then HIDDEN on the new side - one
+        // column, not two, which is why a bare `K` resolves after a
+        // natural join where it would be ambiguous after an ON one.
+        let on = if *on_s == NATURAL_ON {
+            let mut terms: Vec<Term> = Vec::new();
+            let mut shared: Vec<String> = Vec::new();
+            for rc in &sides[k + 1].columns {
+                let Some((li, _, _)) = resolve_join_col(&sides[*vis..=k], &rc.name) else {
+                    continue;
+                };
+                let ri = sides[k + 1].offset + rc.field_id as usize;
+                terms.push(Term::ExprCond(Box::new(Cond2::Cmp(
+                    Box::new(Expr::Col(li)),
+                    Cmp::Eq,
+                    Box::new(Expr::Col(ri)),
+                ))));
+                shared.push(rc.name.clone());
+            }
+            natural_shared.push(shared);
+            if terms.is_empty() {
+                Predicate(vec![vec![Term::Const(true)]])
+            } else {
+                Predicate(vec![terms])
+            }
+        } else {
+            natural_shared.push(Vec::new());
+            parse_on(on_s, visible)?
+        };
         parts.push(JoinPart {
             kind: *kind,
             rel: sides[k + 1].rel,
@@ -9792,6 +9855,28 @@ fn plan_join(
             on,
         });
     }
+    // The merged names are hidden on the side that was joined IN: they
+    // stay in the row (and stay reachable as `R.K`, which the engine
+    // allows) but a bare name now means the left one, and `*` emits the
+    // pair once.
+    let mut merged: Vec<(usize, usize)> = Vec::new(); // (left index, right index)
+    for (k, names) in natural_shared.iter().enumerate() {
+        for n in names {
+            if let Some((li, _, _)) = resolve_join_col(&sides[..=k], n) {
+                if let Some(rc) = sides[k + 1]
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(n))
+                {
+                    let fid = rc.field_id;
+                    let idx = sides[k + 1].offset + fid as usize;
+                    sides[k + 1].merged_away.push(fid);
+                    merged.push((li, idx));
+                }
+            }
+        }
+    }
+
     let mut next_param = params.len();
     let filter = match where_s {
         None => None,
@@ -9881,6 +9966,11 @@ fn plan_join(
             // all left columns then all right, each in declared order
             for side in &sides {
                 for rc in &side.columns {
+                    // a merged-away column is the SAME column as one
+                    // already emitted - `*` shows it once
+                    if side.merged_away.contains(&rc.field_id) {
+                        continue;
+                    }
                     // a computed column would need per-side expression
                     // evaluation the join path does not do - refuse
                     if is_computed_fid(&side.descs, rc.field_id as usize) {
@@ -9888,15 +9978,26 @@ fn plan_join(
                     }
                     let d = side.descs.get(rc.field_id as usize)?;
                     let (wire, sql_type, length, scale, sub_type) = wire_for(d);
+                    let idx = side.offset + rc.field_id as usize;
+                    // A NATURAL join's merged column is ONE column with
+                    // TWO sources: in an outer one the preserved side
+                    // may be the padded one, and the engine shows the
+                    // other's value (probed on `NATURAL RIGHT JOIN`).
+                    let expr = merged
+                        .iter()
+                        .find(|(l, _)| *l == idx)
+                        .map(|(l, r)| {
+                            Expr::Coalesce(vec![Expr::Col(*l), Expr::Col(*r)])
+                        });
                     cols.push(ProjCol {
                         name: rc.name.clone(),
-                        field_id: side.offset + rc.field_id as usize,
+                        field_id: idx,
                         wire,
                         sql_type: nullable(sql_type),
                         length,
                         scale,
                         sub_type,
-                        expr: None,
+                        expr,
                     });
                 }
             }
@@ -24133,8 +24234,16 @@ mod tests {
         assert_eq!(j.len(), 2);
         assert_eq!(j[1].2, CROSS_ON);
         assert!(parse_from("EMP JOIN DEPT").is_none()); // no ON
-        // NATURAL joins on every shared NAME - a different rule, refused
-        assert!(parse_from("EMP NATURAL JOIN DEPT").is_none());
+        // NATURAL has no ON: its condition is derived from the shared
+        // names, and the marker says so
+        let (b, j) = parse_from("EMP NATURAL JOIN DEPT").unwrap();
+        assert_eq!(b.table, "EMP");
+        assert_eq!((j.len(), j[0].1.table, j[0].2), (1, "DEPT", NATURAL_ON));
+        let (_, j) = parse_from("EMP NATURAL LEFT JOIN DEPT").unwrap();
+        assert!(matches!(j.as_slice(), [(JoinKind::Left, _, NATURAL_ON, _)]));
+        let (_, j) = parse_from("EMP NATURAL full outer join DEPT").unwrap();
+        assert!(matches!(j.as_slice(), [(JoinKind::Full, _, NATURAL_ON, _)]));
+        assert!(parse_from("EMP NATURAL BOGUS JOIN DEPT").is_none());
         assert!(parse_from("EMP OUTER JOIN DEPT ON 1 = 1").is_none());
         assert!(parse_from("LEFT EMP JOIN DEPT ON 1 = 1").is_none());
         assert!(parse_from("EMP LEFT DEPT").is_none()); // stray keyword, no JOIN
@@ -24154,6 +24263,7 @@ mod tests {
                 ],
                 descs: vec![d(dtype::LONG), d(dtype::LONG), d(dtype::VARYING)],
                 offset: 0,
+                merged_away: Vec::new(),
             },
             JoinSide {
                 key: "D".into(),
@@ -24165,6 +24275,7 @@ mod tests {
                 ],
                 descs: vec![d(dtype::LONG), d(dtype::VARYING)],
                 offset: 3,
+                merged_away: Vec::new(),
             },
         ]
     }
