@@ -6336,7 +6336,7 @@ PREPARE, so the write does not happen at all. The alternative — running the DM
 and handing back an empty cursor — is the worst outcome this clause can
 produce, and the gate checks the table to prove it does not.
 
-### Where NULL sits (`qa/serve-real-nulls.sh`, 19 checks)
+### Where NULL sits, and ORDER BY expressions (`qa/serve-real-nulls.sh`, 25 checks)
 
 Two small surfaces that are the same question - what does the engine think a
 NULL is - checked against the live engine as a twin.
@@ -6363,6 +6363,25 @@ A makes the comparison UNKNOWN, `NOT UNKNOWN` is UNKNOWN, and the row is
 dropped - while the engine returns it. The gate keeps `<>` and `NOT (=)` as
 checks of their own, so all three predicates are pinned side by side and the
 difference between them is visible in the output rather than argued about.
+
+**And the ordering key stopped having to be a column.** `ORDER BY AMT + 1`,
+`ORDER BY CASE WHEN AMT IS NULL THEN 1 ELSE 0 END`,
+`ORDER BY UPPER(NAME) NULLS LAST` — the key is computed per row by the same
+parser and resolver the select list uses, so anything that can be projected can
+be sorted by, with the same direction and NULLS clauses.
+
+Two details worth keeping:
+
+* **The value is computed once per row, before the sort.** An expression that
+  raises mid-sort has to fail the fetch the way it would fail a projection, and
+  a comparator has nowhere to report that — so the sort decorates first.
+* **Matching on token counts stopped working the moment items could be
+  expressions.** `AMT + 1` is three tokens and looks exactly like
+  `ID NULLS LAST` to a shape match. The parser now strips the trailing
+  `[ASC|DESC]` and `[NULLS FIRST|LAST]` clauses first and only then asks what
+  the head is — a bare identifier, an ordinal, or an expression. One it cannot
+  resolve refuses the statement rather than sorting by something else, which
+  the gate checks with `ORDER BY NOSUCH(AMT)`.
 
 ## Benchmarks
 

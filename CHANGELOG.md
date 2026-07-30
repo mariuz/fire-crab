@@ -13,7 +13,7 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
-## 2026-07-30 — the wire server: where NULL sits
+## 2026-07-30 — the wire server: where NULL sits, and ORDER BY expressions
 
 ### Converted
 - **`ORDER BY ... NULLS FIRST | LAST`.** The DEFAULT placement was
@@ -41,7 +41,28 @@ was caught), **Guarded** (a wrong-answer path closed by refusal).
   row - while the engine returns it. The gate keeps `<>` and `NOT (=)`
   beside the new operator to show the three apart.
 
-The gate (`qa/serve-real-nulls.sh`, 19 checks) runs every statement
+### Converted (same slice, second half)
+- **`ORDER BY <expression>`**: `ORDER BY AMT + 1`,
+  `ORDER BY CASE WHEN AMT IS NULL THEN 1 ELSE 0 END`,
+  `ORDER BY UPPER(NAME) NULLS LAST` - the key is computed per row, by the
+  same parser and resolver the select list uses, so an expression that
+  can be projected can also be sorted by. It carries the same direction
+  and NULLS clauses a column key does.
+- Every key's value is computed ONCE per row (a decorate-sort pass), not
+  inside the comparator: an expression that raises mid-sort must fail the
+  fetch the way it would fail a projection, and a comparator has nowhere
+  to report that.
+
+### Fixed
+- The ORDER BY item parser matched on TOKEN COUNTS, which cannot work
+  once items may be expressions: `AMT + 1` is three tokens and looks
+  exactly like `ID NULLS LAST` to a shape match. It now strips the
+  trailing `[ASC|DESC]` and `[NULLS FIRST|LAST]` clauses first and then
+  decides what the head is - a bare identifier, an ordinal, or an
+  expression. An expression it cannot resolve refuses the statement
+  rather than sorting by something else.
+
+The gate (`qa/serve-real-nulls.sh`, 25 checks) runs every statement
 through the SAME driver against TWO servers - fire-crab and the live
 engine - on identical databases: the two default orders, all four
 explicit combinations, a second key with its own placement, a text

@@ -110,6 +110,19 @@ both "the placement applies to a text column too" \
      "SELECT ID FROM T ORDER BY NAME NULLS LAST, ID"
 both "ORDER BY an ordinal with NULLS LAST" "SELECT AMT, ID FROM T ORDER BY 1 NULLS LAST, 2"
 
+# --- ORDER BY <expression> ---------------------------------------------
+# the key is computed per row, so it can be arithmetic, a call or a CASE -
+# and it carries the same direction and NULLS clauses a column key does
+both "ORDER BY arithmetic" "SELECT ID FROM T ORDER BY AMT + 1, ID"
+both "ORDER BY a CASE (the null-first idiom)" \
+     "SELECT ID FROM T ORDER BY CASE WHEN AMT IS NULL THEN 1 ELSE 0 END, ID"
+both "ORDER BY a function call with a NULLS clause" \
+     "SELECT ID FROM T ORDER BY UPPER(NAME) NULLS LAST, ID"
+both "ORDER BY an expression, DESC and NULLS LAST" \
+     "SELECT ID FROM T ORDER BY AMT * 2 DESC NULLS LAST, ID"
+both "an expression key beside a column key" \
+     "SELECT ID FROM T ORDER BY OTHER DESC, AMT + OTHER NULLS FIRST, ID"
+
 # --- 3. IS [NOT] DISTINCT FROM -----------------------------------------
 both "IS DISTINCT FROM a value keeps the NULL rows" \
      "SELECT ID FROM T WHERE AMT IS DISTINCT FROM 5 ORDER BY ID"
@@ -137,6 +150,13 @@ r=$(query "SELECT ID FROM T ORDER BY AMT NULLS SIDEWAYS" "$PORT" "$A")
 case "$r" in
     ERR*) echo "OK   a bad NULLS position is refused, not guessed" ;;
     *) echo "DIFF NULLS SIDEWAYS answered: [$r]"; fail=1 ;;
+esac
+# an ORDER BY expression this server cannot resolve refuses the statement
+# rather than sorting by something else
+r=$(query "SELECT ID FROM T ORDER BY NOSUCH(AMT)" "$PORT" "$A")
+case "$r" in
+    ERR*) echo "OK   an unresolvable ORDER BY expression is refused" ;;
+    *) echo "DIFF unknown ORDER BY function answered: [$r]"; fail=1 ;;
 esac
 
 rm -f "$A" "$B"

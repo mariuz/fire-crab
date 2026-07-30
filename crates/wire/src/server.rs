@@ -1083,7 +1083,7 @@ enum Plan {
         cols: Vec<ProjCol>,
         branches: Vec<Plan>,
         distinct: bool,
-        order_by: Option<(usize, bool, NullsAt)>,
+        order_by: Option<OrderKey>,
     },
     /// A statement this server will not answer, kept as a plan so it
     /// raises a SQL ERROR. Falling back to the fixed-answer plan would
@@ -1440,7 +1440,7 @@ AlterDomainRename {
         formats: Vec<(u8, Vec<Descriptor>)>,
         cols: Vec<ProjCol>,
         filter: Option<Predicate>,
-        order_by: Vec<(usize, bool, NullsAt)>,
+        order_by: Vec<OrderKey>,
         /// generator-advancing output columns (usually empty); each is
         /// evaluated per emitted row in output order and persisted when
         /// the fetch completes
@@ -1457,7 +1457,7 @@ AlterDomainRename {
         on: Vec<(usize, usize)>,
         cols: Vec<ProjCol>,
         filter: Option<Predicate>,
-        order_by: Vec<(usize, bool, NullsAt)>,
+        order_by: Vec<OrderKey>,
     },
     Group {
         rel: u16,
@@ -1472,7 +1472,7 @@ AlterDomainRename {
         synth_base: usize,
         filter: Option<Predicate>,
         having: Option<Predicate>,
-        order_by: Vec<(usize, bool, NullsAt)>,
+        order_by: Vec<OrderKey>,
     },
     /// `SET GENERATOR <name> TO <n>` or `ALTER SEQUENCE|GENERATOR <name>
     /// RESTART WITH <n>`: write a new value into the generator page at
@@ -9988,11 +9988,10 @@ fn branch_rows(
                 }
             });
         }
-        if let Some((idx, desc, nulls)) = order_by {
-            let keys = [(*idx, *desc, *nulls)];
+        if let Some(key) = order_by {
+            let keys = [key.clone()];
             rows.sort_by(|a, b| {
                 let o = order_cmp(a, b, &keys);
-                let _ = (idx, desc);
                 o
             });
         }
@@ -10091,7 +10090,7 @@ fn plan_union(
     // a trailing ORDER BY belongs to the WHOLE union, not the last branch
     let last = parts.pop()?;
     let up = mask_literals(&last.to_ascii_uppercase());
-    let mut order_ordinal: Option<(usize, bool, NullsAt)> = None;
+    let mut order_ordinal: Option<OrderKey> = None;
     let last_body = match find_kw_by(&up, "ORDER") {
         Some((kw, cols_at)) => {
             let spec = last[cols_at..].trim();
@@ -10127,7 +10126,7 @@ fn plan_union(
             if it.next().is_some() || n == 0 {
                 return None;
             }
-            order_ordinal = Some((n - 1, desc, nulls));
+            order_ordinal = Some(OrderKey::field(n - 1, desc, nulls));
             last[..kw].trim().to_string()
         }
         None => last.clone(),
@@ -10164,7 +10163,7 @@ fn plan_union(
         .enumerate()
         .map(|(i, c)| ProjCol { field_id: i, expr: None, ..c.clone() })
         .collect();
-    if let Some((idx, _, _)) = order_ordinal {
+    if let Some(OrderKey { field: idx, .. }) = order_ordinal {
         if idx >= cols.len() {
             return None;
         }
@@ -10621,13 +10620,21 @@ fn plan_query_inner(
             let cols = build_projcols(&["*".to_string()], &columns, &descs, &computed)?;
             let order_by = match order_s {
                 None => Vec::new(),
-                Some(os) => parse_order_by(os, &cols, |n| {
-                    columns
-                        .iter()
-                        .find(|c| c.name.eq_ignore_ascii_case(n))
-                        .map(|c| c.field_id as usize)
-                        .filter(|fid| !is_computed_fid(&descs, *fid))
-                })?,
+                Some(os) => parse_order_by_expr(
+                    os,
+                    &cols,
+                    |n| {
+                        columns
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(n))
+                            .map(|c| c.field_id as usize)
+                            .filter(|fid| !is_computed_fid(&descs, *fid))
+                    },
+                    // ORDER BY <expression>: the same parser and resolver
+                    // the select list uses, so an expression that can be
+                    // projected can also be sorted by
+                    |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
+                )?,
             };
             return Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols: Vec::new() });
         }
@@ -10739,13 +10746,18 @@ fn plan_query_inner(
         let order_by = match order_s {
             None => Vec::new(),
             Some(os) => {
-                match parse_order_by(os, &cols, |n| {
-                    columns
-                        .iter()
-                        .find(|c| c.name.eq_ignore_ascii_case(n))
-                        .map(|c| c.field_id as usize)
-                        .filter(|fid| !is_computed_fid(&descs, *fid))
-                }) {
+                match parse_order_by_expr(
+                    os,
+                    &cols,
+                    |n| {
+                        columns
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(n))
+                            .map(|c| c.field_id as usize)
+                            .filter(|fid| !is_computed_fid(&descs, *fid))
+                    },
+                    |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
+                ) {
                     Some(keys) => keys,
                     None => {
                         if trace { eprintln!("[srv] plan: ORDER BY parse failed for {:?}", os); }
@@ -11440,10 +11452,74 @@ enum NullsAt {
     Last,
 }
 
-fn order_cmp(a: &[Value], b: &[Value], keys: &[(usize, bool, NullsAt)]) -> std::cmp::Ordering {
+/// One ORDER BY key: a record FIELD or an EXPRESSION over the row, its
+/// direction, and where its NULLs go.
+///
+/// `ORDER BY <expression>` sorts by something no column holds -
+/// `ORDER BY CASE WHEN AMT IS NULL THEN 1 ELSE 0 END`, `ORDER BY AMT + 1`
+/// - so the key is computed per row before the comparison. Its value is
+/// computed ONCE per row (a decorate-sort pass), not inside the
+/// comparator: an expression that raises mid-sort must fail the fetch the
+/// way it would fail a projection, and a comparator cannot report that.
+#[derive(Clone)]
+struct OrderKey {
+    field: usize,
+    expr: Option<Expr>,
+    desc: bool,
+    nulls: NullsAt,
+}
+
+impl OrderKey {
+    fn field(field: usize, desc: bool, nulls: NullsAt) -> OrderKey {
+        OrderKey { field, expr: None, desc, nulls }
+    }
+    /// This key's value for a decoded row.
+    fn value_of(&self, values: &[Value]) -> Result<Value, EvalErr> {
+        match &self.expr {
+            None => Ok(values.get(self.field).cloned().unwrap_or(Value::Null)),
+            Some(e) => e.eval(values),
+        }
+    }
+    fn has_expr(&self) -> bool {
+        self.expr.is_some()
+    }
+}
+
+/// Sort rows by keys that may be EXPRESSIONS: every key is evaluated for
+/// every row first, so an arithmetic exception surfaces as the fetch's
+/// error instead of a wrong order.
+fn sort_rows(rows: &mut [Vec<Value>], keys: &[OrderKey]) -> Result<(), EvalErr> {
+    if keys.iter().all(|k| !k.has_expr()) {
+        rows.sort_by(|a, b| order_cmp(a, b, keys));
+        return Ok(());
+    }
+    let mut decorated: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(rows.len());
+    for r in rows.iter() {
+        let mut k = Vec::with_capacity(keys.len());
+        for key in keys {
+            k.push(key.value_of(r)?);
+        }
+        decorated.push((k, r.clone()));
+    }
+    // the decorated keys sit at positions 0..n, so the comparison uses
+    // field keys over THEM
+    let flat: Vec<OrderKey> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| OrderKey::field(i, k.desc, k.nulls))
+        .collect();
+    decorated.sort_by(|a, b| order_cmp(&a.0, &b.0, &flat));
+    for (dst, (_, row)) in rows.iter_mut().zip(decorated.into_iter()) {
+        *dst = row;
+    }
+    Ok(())
+}
+
+fn order_cmp(a: &[Value], b: &[Value], keys: &[OrderKey]) -> std::cmp::Ordering {
     use std::cmp::Ordering::{Equal, Greater, Less};
     let nullv = Value::Null;
-    for &(fid, desc, nulls) in keys {
+    for key in keys {
+        let (fid, desc, nulls) = (key.field, key.desc, key.nulls);
         let va = a.get(fid).unwrap_or(&nullv);
         let vb = b.get(fid).unwrap_or(&nullv);
         let na = matches!(va, Value::Null);
@@ -11529,8 +11605,10 @@ fn group_output(
     if key_fids.is_empty() {
         out.push(compute_group(&input, gitems)?);
     } else {
-        let keys: Vec<(usize, bool, NullsAt)> =
-            key_fids.iter().map(|&f| (f, false, NullsAt::Default)).collect();
+        let keys: Vec<OrderKey> = key_fids
+            .iter()
+            .map(|&f| OrderKey::field(f, false, NullsAt::Default))
+            .collect();
         input.sort_by(|a, b| order_cmp(a, b, &keys));
         let mut i = 0;
         while i < input.len() {
@@ -12264,11 +12342,10 @@ fn emit_rows_inner(
                         }
                     });
                 }
-                if let Some((idx, desc, nulls)) = order_by {
-                    let keys = [(*idx, *desc, *nulls)];
+                if let Some(key) = order_by {
+                    let keys = [key.clone()];
                     rows.sort_by(|a, b| {
                         let o = order_cmp(a, b, &keys);
-                        let _ = (idx, desc);
                         o
                     });
                 }
@@ -12349,7 +12426,7 @@ fn emit_rows_inner(
                         return Err(EmitErr::Eval(e));
                     }
                     if !order_by.is_empty() {
-                        rows.sort_by(|a, b| order_cmp(a, b, order_by));
+                        sort_rows(&mut rows, order_by).map_err(EmitErr::Eval)?;
                     }
                     // running value per distinct generator, from its stored
                     // base; the increment resolves a NEXT VALUE FOR's step
@@ -12422,7 +12499,7 @@ fn emit_rows_inner(
                     if let Some(e) = ferr {
                         return Err(EmitErr::Eval(e));
                     }
-                    rows.sort_by(|a, b| order_cmp(a, b, order_by));
+                    sort_rows(&mut rows, order_by).map_err(EmitErr::Eval)?;
                     for values in &rows {
                         encode_row(w, cols, values)?;
                     }
@@ -16387,43 +16464,70 @@ fn parse_order_by(
     order: &str,
     cols: &[ProjCol],
     resolve_name: impl Fn(&str) -> Option<usize>,
-) -> Option<Vec<(usize, bool, NullsAt)>> {
+) -> Option<Vec<OrderKey>> {
+    parse_order_by_expr(order, cols, resolve_name, |_| None)
+}
+
+/// The same, with a resolver for ORDER BY items that are EXPRESSIONS
+/// rather than names or ordinals - `ORDER BY AMT + 1`,
+/// `ORDER BY CASE WHEN AMT IS NULL THEN 1 ELSE 0 END`. Only the callers
+/// that have the table's columns and descriptors to hand pass one; the
+/// others keep refusing, which is what they did before.
+fn parse_order_by_expr(
+    order: &str,
+    cols: &[ProjCol],
+    resolve_name: impl Fn(&str) -> Option<usize>,
+    resolve_expression: impl Fn(&str) -> Option<Expr>,
+) -> Option<Vec<OrderKey>> {
     let mut keys = Vec::new();
-    for part in order.split(',') {
-        let toks: Vec<&str> = part.split_whitespace().collect();
-        // <name> [ASC|DESC] [NULLS FIRST|LAST] - the two clauses are
-        // independent, and the NULLS one does not flip with the direction
-        let (name, desc, nulls) = match toks.as_slice() {
-            [n] => (*n, false, NullsAt::Default),
-            [n, dir] => match dir.to_ascii_uppercase().as_str() {
-                "ASC" => (*n, false, NullsAt::Default),
-                "DESC" => (*n, true, NullsAt::Default),
-                _ => return None,
-            },
-            [n, kw, pos] if kw.eq_ignore_ascii_case("NULLS") => {
-                let at = match pos.to_ascii_uppercase().as_str() {
-                    "FIRST" => NullsAt::First,
-                    "LAST" => NullsAt::Last,
-                    _ => return None,
-                };
-                (*n, false, at)
-            }
-            [n, dir, kw, pos] if kw.eq_ignore_ascii_case("NULLS") => {
-                let d = match dir.to_ascii_uppercase().as_str() {
-                    "ASC" => false,
-                    "DESC" => true,
-                    _ => return None,
-                };
-                let at = match pos.to_ascii_uppercase().as_str() {
-                    "FIRST" => NullsAt::First,
-                    "LAST" => NullsAt::Last,
-                    _ => return None,
-                };
-                (*n, d, at)
-            }
-            _ => return None,
+    // an ORDER BY list is split on commas - but an expression may CONTAIN
+    // one (`SUBSTRING(x FROM 1 FOR 2)`), so the split is depth-aware
+    for part in split_top_level_commas(order) {
+        // Strip the trailing clauses FIRST, then decide what the head is.
+        // Matching on token counts instead cannot work: `AMT + 1` is three
+        // tokens and looks exactly like `ID NULLS LAST` to a shape match.
+        let mut head = part.trim();
+        let mut nulls = NullsAt::Default;
+        let up = head.to_ascii_uppercase();
+        if up.ends_with(" NULLS FIRST") {
+            nulls = NullsAt::First;
+            head = head[..head.len() - " NULLS FIRST".len()].trim_end();
+        } else if up.ends_with(" NULLS LAST") {
+            nulls = NullsAt::Last;
+            head = head[..head.len() - " NULLS LAST".len()].trim_end();
+        } else if up.ends_with(" NULLS") || up == "NULLS" {
+            return None; // a NULLS with no position
+        }
+        let up = head.to_ascii_uppercase();
+        let desc = if up.ends_with(" DESC") {
+            head = head[..head.len() - " DESC".len()].trim_end();
+            true
+        } else if up.ends_with(" ASC") {
+            head = head[..head.len() - " ASC".len()].trim_end();
+            false
+        } else {
+            false
         };
-        let name = name.trim_matches('"');
+        if head.is_empty() {
+            return None;
+        }
+        let name = head.trim_matches('"');
+        // a bare identifier or an ordinal is a FIELD key
+        let plain_ident = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+        if !plain_ident {
+            // anything else - an operator, a call, a CASE - is an
+            // EXPRESSION key, computed per row
+            match resolve_expression(head) {
+                Some(e) => {
+                    keys.push(OrderKey { field: 0, expr: Some(e), desc, nulls });
+                    continue;
+                }
+                None => return None,
+            }
+        }
         let fid = if let Ok(ord) = name.parse::<usize>() {
             // 1-based ordinal into the projection
             if ord == 0 || ord > cols.len() {
@@ -16440,7 +16544,7 @@ fn parse_order_by(
         } else {
             resolve_name(name)?
         };
-        keys.push((fid, desc, nulls));
+        keys.push(OrderKey::field(fid, desc, nulls));
     }
     if keys.is_empty() {
         None
@@ -22020,22 +22124,28 @@ mod tests {
                 .find(|c| c.name.eq_ignore_ascii_case(n))
                 .map(|c| c.field_id as usize)
         };
+        // the keys are compared by their (field, desc, nulls) shape -
+        // an expression key has no field to compare and is exercised by
+        // the live gate instead
+        let shape = |k: Option<Vec<OrderKey>>| -> Option<Vec<(usize, bool, NullsAt)>> {
+            k.map(|v| v.iter().map(|k| (k.field, k.desc, k.nulls)).collect())
+        };
         assert_eq!(
-            parse_order_by("2 DESC, ID", &cols, by_col),
+            shape(parse_order_by("2 DESC, ID", &cols, by_col)),
             Some(vec![(1, true, NullsAt::Default), (3, false, NullsAt::Default)])
         );
         // the NULLS clause is independent of the direction, and either
         // may appear alone
         assert_eq!(
-            parse_order_by("ID NULLS LAST", &cols, by_col),
+            shape(parse_order_by("ID NULLS LAST", &cols, by_col)),
             Some(vec![(3, false, NullsAt::Last)])
         );
         assert_eq!(
-            parse_order_by("ID DESC NULLS FIRST", &cols, by_col),
+            shape(parse_order_by("ID DESC NULLS FIRST", &cols, by_col)),
             Some(vec![(3, true, NullsAt::First)])
         );
         assert_eq!(
-            parse_order_by("2 DESC NULLS LAST, ID NULLS FIRST", &cols, by_col),
+            shape(parse_order_by("2 DESC NULLS LAST, ID NULLS FIRST", &cols, by_col)),
             Some(vec![(1, true, NullsAt::Last), (3, false, NullsAt::First)])
         );
         // a position that is not FIRST or LAST is refused, not guessed
@@ -22112,7 +22222,7 @@ mod tests {
 
     #[test]
     fn order_cmp_sorts_with_nulls_low() {
-        let keys = vec![(0usize, false, NullsAt::Default)];
+        let keys = vec![OrderKey::field(0, false, NullsAt::Default)];
         let mut rows = vec![
             vec![Value::Int(3)],
             vec![Value::Null],
@@ -22121,21 +22231,24 @@ mod tests {
         rows.sort_by(|a, b| order_cmp(a, b, &keys));
         assert_eq!(rows, vec![vec![Value::Null], vec![Value::Int(1)], vec![Value::Int(3)]]);
         // descending reverses (NULLs last)
-        let keys = vec![(0usize, true, NullsAt::Default)];
+        let keys = vec![OrderKey::field(0, true, NullsAt::Default)];
         rows.sort_by(|a, b| order_cmp(a, b, &keys));
         assert_eq!(rows, vec![vec![Value::Int(3)], vec![Value::Int(1)], vec![Value::Null]]);
 
         // ... and an EXPLICIT placement does not flip with the direction:
         // the four combinations are four different orders, which is why
         // `NULLS FIRST` is not a no-op on an ascending key's default
-        let asc_last = vec![(0usize, false, NullsAt::Last)];
+        let asc_last = vec![OrderKey::field(0, false, NullsAt::Last)];
         rows.sort_by(|a, b| order_cmp(a, b, &asc_last));
         assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(3)], vec![Value::Null]]);
-        let desc_first = vec![(0usize, true, NullsAt::First)];
+        let desc_first = vec![OrderKey::field(0, true, NullsAt::First)];
         rows.sort_by(|a, b| order_cmp(a, b, &desc_first));
         assert_eq!(rows, vec![vec![Value::Null], vec![Value::Int(3)], vec![Value::Int(1)]]);
         // two NULLs tie, so a later key decides
-        let two = vec![(0usize, false, NullsAt::Last), (1usize, false, NullsAt::Default)];
+        let two = vec![
+            OrderKey::field(0, false, NullsAt::Last),
+            OrderKey::field(1, false, NullsAt::Default),
+        ];
         let mut rows2 = vec![
             vec![Value::Null, Value::Int(2)],
             vec![Value::Null, Value::Int(1)],

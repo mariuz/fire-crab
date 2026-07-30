@@ -979,6 +979,16 @@ them.
   knows.** `IS NOT DISTINCT FROM` becomes an OR of comparisons and NULL
   tests at PARSE time, exactly as BETWEEN and IN do - so index matching,
   evaluation and refusal all keep working without a new case each.
+- **A grammar that matched on token COUNTS stops working when items grow.**
+  An ORDER BY item was `[name]`, `[name, dir]`, `[name, NULLS, pos]` - a
+  tidy shape match until keys could be expressions, and `AMT + 1` is
+  three tokens that look exactly like `ID NULLS LAST`. Strip the trailing
+  CLAUSES first, then ask what the head is. Shape matches on token counts
+  are a bet that the grammar will not grow.
+- **Compute a sort key before sorting, not inside the comparator.** If
+  the key can raise (an expression, a conversion), a comparator has
+  nowhere to report it - and swallowing the error silently reorders the
+  result. Decorate, then sort.
 - **Write the three-valued rule out before coding it.** `A IS DISTINCT
   FROM v` is `A IS NULL OR A <> v`, NOT `NOT (A = v)`: under three-valued
   logic the negation of UNKNOWN is UNKNOWN and the row vanishes. Put the
