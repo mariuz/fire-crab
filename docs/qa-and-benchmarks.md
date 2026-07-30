@@ -7040,6 +7040,29 @@ With this the FROM clause answers every join shape the engine has except a
 join over a VIEW: inner and the three outer kinds, chains of any length,
 CROSS, comma lists, and NATURAL.
 
+### The values an UPDATE could compute but not store (`qa/serve-real-setexpr.sh`, 35 checks)
+
+`UPDATE T SET FLAG = (A > 5)` answered "expression type cannot be stored". The
+condition evaluated correctly — the select list had been answering the same
+expression for two increments — and then met a match statement that turns a
+`Value` into a wire value before it is encoded into the record. That match was
+written when the expression surface produced integers, scaled numerics, text
+and NULL. Booleans, the temporal types and INT128 arrived later, each with its
+own increment and its own gate, and none of them touched this list.
+
+The shape is worth naming because it does not fail to compile and it does not
+fail loudly: a `_ =>` arm returning an error is a perfectly reasonable thing to
+write, and it silently accumulates every family added after it. Any place that
+maps your value type to a wire or storage form is such a list — the parameter
+encoder, the row encoder, the token folder, this one. When a new family lands,
+they are what to grep for.
+
+The gate's fixture gained a BOOLEAN and a DATE column, which it had no way to
+exercise before. What makes it a real check is that it compares the TABLE after
+every statement, read back by the ENGINE from the file fire-crab wrote — a
+wrongly encoded boolean is not a wrong answer to a query, it is a wrong byte in
+a record, and only reading it back with the other implementation shows it.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

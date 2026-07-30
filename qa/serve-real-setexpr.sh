@@ -46,14 +46,18 @@ CREATE TABLE T (
   A INTEGER,
   B INTEGER,
   N NUMERIC(9,2),
-  K BIGINT
+  K BIGINT,
+  -- a BOOLEAN and a DATE: the families the SET path could not STORE,
+  -- however well it computed them
+  FLAG BOOLEAN,
+  D DATE
 );
 CREATE INDEX T_A ON T (A);
 COMMIT;
-INSERT INTO T VALUES (1, 10, 3, 12.50, 4000000000);
-INSERT INTO T VALUES (2, 20, 4, 1.25, 5);
-INSERT INTO T VALUES (3, NULL, 5, NULL, NULL);
-INSERT INTO T VALUES (4, -8, 2, 13.50, 7);
+INSERT INTO T VALUES (1, 10, 3, 12.50, 4000000000, TRUE, '2020-01-01');
+INSERT INTO T VALUES (2, 20, 4, 1.25, 5, FALSE, '2021-06-15');
+INSERT INTO T VALUES (3, NULL, 5, NULL, NULL, NULL, NULL);
+INSERT INTO T VALUES (4, -8, 2, 13.50, 7, TRUE, '2022-12-31');
 COMMIT;
 EOF
 
@@ -84,6 +88,22 @@ same() { # <label> <sql>
         echo "DIFF $1"; echo "     engine: [$theirs]"; echo "     fc:     [$ours]"; fail=1
     fi
 }
+
+# --- values the SET path could COMPUTE but not STORE --------------------
+# The expression machinery had learned booleans and the temporal types;
+# the code that writes the result back had a list of value shapes that
+# predated them, and answered "expression type cannot be stored". A
+# condition IS a value in Firebird, so this is the ordinary way to fill
+# a boolean column from one.
+same "SET boolean = a condition"      "UPDATE T SET FLAG = (A > 5)"
+same "SET boolean = NOT itself"       "UPDATE T SET FLAG = NOT FLAG"
+same "SET boolean = another boolean"  "UPDATE T SET FLAG = (B > 3)"
+same "SET boolean = a LIKE"           "UPDATE T SET FLAG = (CAST(A AS VARCHAR(8)) LIKE '1%')"
+same "SET boolean = an IS NULL test"  "UPDATE T SET FLAG = (A IS NULL)"
+same "SET boolean = a literal"        "UPDATE T SET FLAG = TRUE"
+same "SET date = date arithmetic"     "UPDATE T SET D = D + 1"
+same "SET date = a CAST"              "UPDATE T SET D = CAST('2024-02-29' AS DATE)"
+same "a NULL operand still propagates" "UPDATE T SET FLAG = (A > 5), D = D + A"
 
 # --- the basic shapes --------------------------------------------------
 same "SET col = col + literal"        "UPDATE T SET A = A + 5"

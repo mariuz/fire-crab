@@ -1295,6 +1295,14 @@ them.
   yourself writing a special case for NULLs in a derived predicate, check
   whether the operator already says it.
 
+- **A conversion table is a list of what you knew when you wrote it.**
+  The UPDATE SET path computed booleans and dates perfectly and then hit
+  a match on value shapes that predated both, answering "expression type
+  cannot be stored". Every place that maps YOUR value type to a wire or
+  storage form is such a list - when a new family lands, grep for the
+  ones that will silently refuse it, because they will not fail to
+  compile.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

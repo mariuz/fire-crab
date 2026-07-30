@@ -8988,6 +8988,20 @@ fn execute_dml_collecting(
                             Value::Double(_) | Value::Float(_) => {
                                 WireParam::Double(approx_of(&v).unwrap_or(0.0))
                             }
+                            // the families the expression surface has
+                            // learned since this list was written: a
+                            // boolean (so `SET B = (ID > 2)` stores what
+                            // the condition answered) and the temporals
+                            Value::Bool(b) => WireParam::Bool(*b),
+                            Value::Date(d) => WireParam::Date(*d),
+                            Value::Time(t) => WireParam::Time(*t),
+                            Value::Timestamp(d, t) => WireParam::Timestamp(*d, *t),
+                            Value::Int128(r, sc) => match i64::try_from(*r) {
+                                Ok(n) => WireParam::Int(n, *sc),
+                                Err(_) => {
+                                    return Err("expression result does not fit the column".into())
+                                }
+                            },
                             _ => return Err("expression type cannot be stored".into()),
                         };
                         match encode_wire_value(d, &wp)

@@ -13,6 +13,27 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — the values an UPDATE could compute but not store
+
+### Fixed
+- **`UPDATE T SET FLAG = (A > 5)` answered "expression type cannot be
+  stored".** The SET path evaluates its expression per row and then maps
+  the result to a wire value — and that mapping was a list of value
+  shapes written before the expression surface learned booleans, the
+  temporal types and INT128. Everything computed correctly and then had
+  nowhere to go.
+- A condition IS a value in Firebird, so filling a boolean column from
+  one is the ordinary way to write it: `SET FLAG = (A > 5)`,
+  `SET FLAG = NOT FLAG`, `SET FLAG = (A IS NULL)`, `SET FLAG = (S LIKE
+  'a%')`. Dates and timestamps store from arithmetic and from a CAST the
+  same way.
+
+`qa/serve-real-setexpr.sh` grew from 26 checks to 35, and its fixture
+gained a BOOLEAN and a DATE column — the two families it could not
+exercise before. It compares the TABLE after every statement, read back
+by the engine, which is what makes a wrongly encoded value visible at
+all.
+
 ## 2026-07-30 — NATURAL JOIN: a condition made of names
 
 ### Converted
