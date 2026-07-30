@@ -1203,6 +1203,24 @@ them.
   head ENDS with, and remember the literals that pass an
   identifier test: TRUE, FALSE, UNKNOWN, NULL.
 
+- **A gate that cannot run is worse than no gate.** Five of these
+  depended on a scratch database that existed in one workspace, so they
+  failed identically forever and everyone learned to look past them.
+  Build fixtures with a SCRIPT, committed beside the gate, and have the
+  script ASSERT the properties the checks depend on - a fixture that
+  quietly loses its dangling foreign key makes every anti-join check
+  vacuous.
+- **A fixture detail can impersonate a bug.** A NUMERIC column where the
+  gate expected an INTEGER produced eleven diffs that all looked like
+  join failures. It was masking a real routing gap - and only the
+  differential could tell the two apart, because both sides of a
+  self-comparison would have agreed.
+- **Check a feature at every ENTRY POINT, not just the main one.** The
+  predicate resolver learned NUMERIC, temporal, approximate and boolean
+  columns over four increments. The JOIN resolver - a second, older copy
+  of the same classification - learned none of them, and nothing noticed
+  because its gate could not run.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

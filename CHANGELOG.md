@@ -13,6 +13,53 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — the join gates, restored and what they found
+
+### Fixed
+- **Five gates had no database to run against.** `qa/serve-real-{join,
+  outerjoin,project,insert,syscat}.sh` were written against a "join
+  scratch db" that existed in one workspace and nowhere else, so they had
+  been failing for want of it. `qa/mkjoindb.sh` builds it from a script -
+  DEPT with a department no employee references, EMP with NULL and
+  DANGLING department keys, and CHAR/VARCHAR key tables with duplicates
+  and NULLs - and gbak-restores the clean copy the gates want. A gate
+  nobody can run is a gate that stops telling the truth.
+
+### Converted
+Everything below was found by those gates within minutes of their
+running again.
+
+- **`FROM EMP AS E`** — the keyword form of a table alias, which the FROM
+  parser accepted only as `FROM EMP E`.
+- **`ORDER BY E.ID`** — a QUALIFIED name as a sort key. The parser
+  classified anything containing a dot as an expression, and a join's
+  expression resolver is `|_| None`, so every aliased join with an
+  ordered result refused.
+- **A join whose WHERE names a NUMERIC, DATE, DOUBLE or BOOLEAN column.**
+  The single-table resolver learned those families over several
+  increments; the join resolver still classified its columns through
+  `col_kind`, which answers Int or Text and nothing else. So a join was
+  not "broken for NUMERIC columns" but broken for any QUERY whose WHERE
+  mentioned one — and a NUMERIC salary in the new fixture hid a
+  perfectly working join until the column was made an INTEGER to match
+  what the gates expected.
+- The same for a QUALIFIED such column (`WHERE A.D > DATE'2020-01-01'`),
+  whose literal makes the term an expression comparison and so takes a
+  different branch — one that resolves against a combined view holding
+  only BARE names.
+
+### Guarded
+- `qa/serve-real-outerjoin.sh` asserted that a CROSS JOIN answers the
+  fixed scalar 4242. A later increment made unplannable queries RAISE
+  instead, on the grounds that a made-up row is worse than an error, so
+  the check now asserts the refusal. Same property, different expression.
+
+`qa/serve-real-jointypes.sh` (20 checks, twin servers) covers the typed
+columns directly, deliberately dully: each check is a join that works
+with a WHERE naming one column of one family, bare and qualified, so
+what it measures is the ROUTING and not the comparison rules, which have
+their own gates.
+
 ## 2026-07-30 — column aliases in the select list
 
 ### Converted

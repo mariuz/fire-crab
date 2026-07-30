@@ -6776,6 +6776,61 @@ down the column path looking for a column named TRUE. Both were red gates
 within a minute of the change, which is the argument for running the whole
 suite after touching a parser rather than the gate you are writing.
 
+### The join gates, restored — and what they found (`qa/mkjoindb.sh`, `qa/serve-real-jointypes.sh`)
+
+Five gates — `serve-real-{join,outerjoin,project,insert,syscat}.sh` — were
+written against a "join scratch db" that existed in one workspace and nowhere
+else. Without it they failed on every run, and a gate that always fails is
+indistinguishable from a gate nobody reads. `qa/mkjoindb.sh` builds it from a
+script and gbak-restores the clean copy they want.
+
+The fixture's shape is chosen by what the joins must PROVE, not by realism:
+a department no employee references (so a LEFT join from DEPT is padded there
+and an INNER join drops it), NULL and DANGLING department keys in EMP (a NULL
+key never joins, and a dangling one must be dropped by INNER and kept padded by
+LEFT), REGION_IDs that agree with the department's for most rows and disagree
+for a few (so a two-column ON is not the same join as a one-column one), and
+CHAR/VARCHAR text keys with duplicates on both sides (so a match is a small
+cross product, and a join emitting one row per left row would look right until
+counted). The script asserts each of those properties before printing the path
+— a fixture that quietly lost its dangling key would make every anti-join check
+vacuous.
+
+**What ran when they ran.** Three real gaps, inside minutes:
+
+- `FROM EMP AS E` — the keyword form of a table alias. The FROM parser took
+  `EMP E` and nothing else.
+- `ORDER BY E.ID` — a qualified sort key. The parser classified anything with a
+  dot as an EXPRESSION, and a join's expression resolver is `|_| None`, so
+  every aliased join with an ordered result refused. That one query shape is
+  most of what the join gate does.
+- A join whose WHERE names a NUMERIC, DATE, DOUBLE or BOOLEAN column. The
+  single-table resolver learned each of those families over several increments;
+  the join resolver still classified through `col_kind`, which answers Int or
+  Text. So the join was not "broken for NUMERIC columns" — it was broken for
+  any QUERY whose WHERE mentioned one.
+
+That last one has a lesson in how it surfaced. The fixture's SALARY was written
+as `NUMERIC(9,2)`, and the gate diffs blamed the join. Making it an INTEGER —
+because the gates' expected text said so — turned eleven diffs into two, and
+the remaining two were the alias gaps. A fixture detail was masking a real
+routing gap, and the only reason it came out was that the gate compared against
+the engine rather than against itself.
+
+**One expectation was stale rather than wrong.** `serve-real-outerjoin.sh`
+asserted a CROSS JOIN answers the fixed scalar 4242 — what an unplannable query
+returned when the gate was written. A later increment made those RAISE, on the
+grounds that a made-up row is worse than an error. The check now asserts the
+refusal: the property (never wrong rows) is unchanged, only its expression.
+
+**One thing the twin cannot check.** node-firebird mis-decodes the ENGINE's own
+answer when a join projects a text column of the joined table — `string right
+truncation, expected length 7, actual 10` for a VARCHAR(10). The driver is
+third-party code and this is its bug, not the engine's (isql answers the query
+fine), so `serve-real-jointypes.sh` avoids that shape and says why; the older
+join gate compares projections against isql's text instead, which is why it is
+built the way it is.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

@@ -9231,6 +9231,10 @@ fn parse_table_ref(s: &str) -> Option<TableRef<'_>> {
     let (table, alias) = match toks.as_slice() {
         [t] => (t.trim_matches('"'), None),
         [t, a] => (t.trim_matches('"'), Some(a.trim_matches('"'))),
+        // `FROM EMP AS E` - the keyword form of the same alias
+        [t, kw, a] if kw.eq_ignore_ascii_case("AS") => {
+            (t.trim_matches('"'), Some(a.trim_matches('"')))
+        }
         _ => return None,
     };
     if !ident_ok(table) || alias.is_some_and(|a| !ident_ok(a)) {
@@ -9464,8 +9468,23 @@ fn resolve_join_predicate(
                 terms.push(Term::Const(b));
                 continue;
             }
-            // an expression side resolves against the combined view
+            // An expression side resolves against the combined view,
+            // whose names are BARE - so a qualified left column has its
+            // qualifier stripped first. Without that, `WHERE A.D >
+            // DATE'2020-01-01'` refused while the unqualified `D > ...`
+            // answered: the literal makes it a CmpExpr, which is caught
+            // here rather than by the column path below.
             if matches!(rt.lhs, RawLhs::Expr(_)) || matches!(rt.kind, RawKind::CmpExpr(..)) {
+                let rt = match &rt.lhs {
+                    RawLhs::Col(c) if c.contains('.') => {
+                        let bare = c.rsplit('.').next().unwrap_or(c);
+                        if !comb_cols.iter().any(|k| k.name.eq_ignore_ascii_case(bare)) {
+                            return None; // ambiguous, or not in the view
+                        }
+                        RawTerm { lhs: RawLhs::Col(bare.to_string()), kind: rt.kind }
+                    }
+                    _ => rt,
+                };
                 terms.push(resolve_expr_term(&rt, &comb_cols, &comb_descs, params)?);
                 continue;
             }
@@ -9473,7 +9492,29 @@ fn resolve_join_predicate(
                 return None;
             };
             let (idx, d, _) = resolve_join_col(sides, col)?;
-            terms.push(param_or_typed_term(idx, col_kind(d)?, rt.kind, d, params)?);
+            match col_kind(d) {
+                Some(kind) => {
+                    terms.push(param_or_typed_term(idx, kind, rt.kind, d, params)?)
+                }
+                // A scaled NUMERIC, temporal, approximate or boolean
+                // column takes the EXPRESSION path here for the same
+                // reason it does over a single table - `col_kind`
+                // answers Int or Text and nothing else. Without this a
+                // join whose WHERE named a NUMERIC column refused the
+                // whole query, which is how a NUMERIC salary in the
+                // scratch fixture hid a working join.
+                None => {
+                    let bare = col.rsplit('.').next().unwrap_or(col);
+                    if !comb_cols.iter().any(|c| c.name.eq_ignore_ascii_case(bare)) {
+                        return None; // ambiguous, or not in the view
+                    }
+                    let rt2 = RawTerm {
+                        lhs: RawLhs::Col(bare.to_string()),
+                        kind: rt.kind,
+                    };
+                    terms.push(resolve_expr_term(&rt2, &comb_cols, &comb_descs, params)?);
+                }
+            }
         }
         groups.push(terms);
     }
@@ -17389,11 +17430,23 @@ fn parse_order_by_expr(
             return None;
         }
         let name = head.trim_matches('"');
-        // a bare identifier or an ordinal is a FIELD key
-        let plain_ident = !name.is_empty()
-            && name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+        // a bare identifier or an ordinal is a FIELD key - and so is a
+        // QUALIFIED one, `ORDER BY E.ID`, which a join's resolver reads
+        // whole and a single table's reads after the dot
+        let ident_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
+        let plain_ident = !name.is_empty() && name.chars().all(ident_char);
+        let qualified = !plain_ident
+            && name.matches('.').count() == 1
+            && name.split('.').all(|p| {
+                let p = p.trim_matches('"');
+                !p.is_empty() && p.chars().all(ident_char)
+            });
+        if qualified {
+            let fid = resolve_name(name)
+                .or_else(|| resolve_name(name.split('.').nth(1)?.trim_matches('"')))?;
+            keys.push(OrderKey::field(fid, desc, nulls));
+            continue;
+        }
         if !plain_ident {
             // anything else - an operator, a call, a CASE - is an
             // EXPRESSION key, computed per row
@@ -25235,6 +25288,55 @@ mod tests {
         ] {
             assert!(parse_raw_expr(bad).is_none(), "{bad} parsed");
         }
+    }
+
+    #[test]
+    fn table_aliases_and_qualified_order_keys() {
+        // `FROM EMP E` and `FROM EMP AS E` are the same alias
+        fn tr(s: &str) -> Option<(String, Option<String>)> {
+            parse_table_ref(s).map(|t| (t.table.to_string(), t.alias.map(|a| a.to_string())))
+        }
+        assert_eq!(tr("EMP"), Some(("EMP".to_string(), None)));
+        assert_eq!(tr("EMP E"), Some(("EMP".to_string(), Some("E".to_string()))));
+        assert_eq!(tr("EMP AS E"), Some(("EMP".to_string(), Some("E".to_string()))));
+        assert_eq!(tr("\"Emp\" AS \"E\""), Some(("Emp".to_string(), Some("E".to_string()))));
+        // three words that are not `t AS a` is not a table reference
+        assert_eq!(tr("EMP X E"), None);
+
+        // ORDER BY takes a QUALIFIED key. The resolver is the caller's:
+        // a join's reads the whole name, a single table's knows only
+        // bare ones, so the parser tries the whole name and then the
+        // part after the dot.
+        let col = |name: &str, fid: usize| ProjCol {
+            name: name.into(),
+            field_id: fid,
+            wire: Wire::Int64,
+            sql_type: 580,
+            length: 8,
+            scale: 0,
+            sub_type: 0,
+            expr: None,
+        };
+        let cols = vec![col("ID", 0), col("NAME", 1)];
+        // a resolver that only knows bare names - the single-table case
+        let bare_only = |n: &str| match n {
+            "ID" => Some(0usize),
+            "NAME" => Some(1usize),
+            _ => None,
+        };
+        let keys = |o: &str| parse_order_by(o, &cols, bare_only);
+        assert_eq!(keys("ID").map(|k| k[0].field), Some(0));
+        assert_eq!(keys("E.ID").map(|k| k[0].field), Some(0));
+        assert_eq!(keys("E.NAME").map(|k| k[0].field), Some(1));
+        assert_eq!(keys("\"E\".\"ID\"").map(|k| k[0].field), Some(0));
+        // descending and NULLS still parse around the qualifier
+        let k = keys("E.ID DESC").unwrap();
+        assert!(k[0].desc);
+        let k = keys("E.ID NULLS LAST").unwrap();
+        assert_eq!(k[0].nulls, NullsAt::Last);
+        // an unknown column refuses, qualified or not
+        assert!(keys("E.NOSUCH").is_none());
+        assert!(keys("A.B.C").is_none()); // two dots is not a column
     }
 
     #[test]
