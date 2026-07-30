@@ -915,6 +915,27 @@ them.
   shape none of the gate's four databases had. When you build a scratch
   database for an unrelated experiment, run the existing checks against
   it; that is nearly free and it is where the surprises live.
+- **Symmetric fixtures hide asymmetric laws.** Those four databases all
+  paired like with like - both sides of every join indexed the same way -
+  so no check could ever ask which KIND of index the engine prefers to
+  look through. One fixture with a primary key on one side and a plain
+  index on the other exposed two wrong answers and an entire cost rule.
+  When a decision has a "which of these two" shape, build a fixture where
+  the two are DIFFERENT.
+- **A cost model can be counter-intuitive on purpose - read the
+  comment.** Firebird prices a UNIQUE lookup at a fixed 4 and a
+  non-unique one at 3 + rows-it-names, "independent from a possibly
+  outdated statistics". On an unanalysed database that makes the unique
+  index the DEARER one, and the engine drives the stream you expected to
+  be the inner. Converting the formula reproduced it; guessing the intent
+  never would have.
+- **A greedy search can quietly exclude the right answer.** The
+  arrangement search placed remaining streams in index order, so a chain
+  driven from its far end - which reaches its neighbours in the opposite
+  direction - was discarded before it could be costed. If your search
+  rejects candidates, log or test what it rejected: an arrangement never
+  costed cannot lose on cost, and its absence looks exactly like a
+  cost-model disagreement.
 
 ## Suggested porting order
 

@@ -50,6 +50,29 @@
 //! Unions, subqueries, procedures, views and outer joins inside
 //! chains refuse by name.
 //!
+//! # A unique lookup costs a FIXED four, and that decides join orders
+//!
+//! `Retrieval::getInversion` prices an indexed retrieval two ways
+//! (Retrieval.cpp:371-384):
+//!
+//! ```text
+//! if (unique)  cost = DEFAULT_INDEX_COST * indexes + 1;      // a fixed 4
+//! else         cost = index scan + cardinality * selectivity;
+//! ```
+//!
+//! The comment on the unique branch explains itself - "independent from a
+//! possibly outdated statistics" - and the consequence is the most
+//! counter-intuitive thing in this crate: on a database whose statistics
+//! are zero, a UNIQUE lookup (4) costs MORE than a non-unique one (3), so
+//! the engine drives the stream whose inner lookup is non-unique. Probed:
+//! with `A.BX` indexed and `B.ID` a primary key the engine plans
+//! `JOIN (B NATURAL, A INDEX (A_BX))` in BOTH SQL orders, while two
+//! symmetric indexes keep the SQL order - because `findJoinOrder` replaces
+//! its best arrangement only on a STRICTLY smaller cost.
+//!
+//! That is also why a chain of such links drives from its FAR end: two
+//! non-unique lookups (3 + 3) beat two unique ones (4 + 4).
+//!
 //! # Outer joins: the kind decides who drives, and the plan NESTS
 //!
 //! An inner join may be reordered freely, so a chain of them flattens
@@ -109,6 +132,15 @@ pub struct IndexInfo {
     /// probed: WHERE on the second segment alone plans NATURAL)
     pub columns: Vec<String>,
     pub descending: bool,
+    /// `RDB$UNIQUE_FLAG` - and it changes the COST, not just the
+    /// semantics: a unique equality retrieval is priced at a FIXED
+    /// `DEFAULT_INDEX_COST * indexes + 1`, deliberately independent of
+    /// statistics (Retrieval.cpp:371-376), while a non-unique one pays
+    /// `index cost + cardinality * selectivity`. On a table whose
+    /// statistics are zero that makes the NON-unique index look cheaper,
+    /// which is why the engine drives the stream a reader expects to be
+    /// the inner one.
+    pub unique: bool,
 }
 
 impl IndexInfo {
@@ -280,6 +312,7 @@ pub fn indexes_of(
     let id_f = fid("RDB$INDEX_ID").ok_or("no RDB$INDEX_ID")?;
     let type_f = fid("RDB$INDEX_TYPE");
     let inactive_f = fid("RDB$INDEX_INACTIVE");
+    let unique_f = fid("RDB$UNIQUE_FLAG");
     let mut out = Vec::new();
     for dp_no in relation_data_pages(file, page_size, rel) {
         let start = dp_no as usize * page_size;
@@ -313,11 +346,14 @@ pub fn indexes_of(
             let iname = iname.trim_end().to_string();
             let segs = index_columns(file, page_size, &iname)?;
             if !segs.is_empty() {
+                let unique =
+                    matches!(unique_f.and_then(|f| values.get(f)), Some(Value::Int(1)));
                 out.push(IndexInfo {
                     id: *id,
                     name: iname,
                     columns: segs,
                     descending,
+                    unique,
                 });
             }
         }
@@ -815,25 +851,55 @@ fn plan_join(
                     node: None,
                 });
             }
-            (Some(ri), Some(_), false, true) => {
+            (Some(ri), Some(li), false, true) => {
                 // BOTH keys are indexed, so both arrangements are legal and
-                // the engine picks by COST - and on equal costs by the
-                // stream ordering in `StreamInfo::cheaperThan`
-                // (independence, then previousExpectedStreams, then
-                // baseCost; Optimizer.h:895). Probed: with A.BX indexed and
-                // B.ID a primary key the engine drives B in BOTH SQL orders,
-                // i.e. the choice is a property of the streams and not of
-                // the text. That ordering is not converted, so this case is
-                // REFUSED rather than answered - it used to be answered by
-                // keeping the SQL order, which is right only by accident.
-                let _ = ri;
-                return Err(format!(
-                    "both join keys are indexed ({} on {}, {} on {}) - the \
-                     engine then chooses by baseCost and stream ordering \
-                     (InnerJoin::calculateStreamInfo), which this crate has \
-                     not converted",
-                    lcol, ltab, rcol, rtab
-                ));
+                // the engine picks the cheaper - where "cheaper" is decided
+                // by `retrieval_cost`, whose unique branch is a FIXED 4.
+                // On a database whose statistics are zero that makes the
+                // non-unique side cheaper, and the engine drives the stream
+                // whose inner lookup is non-unique (probed in both SQL
+                // orders). Equal costs keep the SQL order, which is the
+                // engine's own tie-break: `findJoinOrder` replaces the best
+                // arrangement only on a STRICTLY smaller cost
+                // (InnerJoin.cpp:366).
+                let sel_r = index_selectivity(file, page_size, &ri.name)?;
+                let sel_l = index_selectivity(file, page_size, &li.name)?;
+                let card_l = cardinality(file, page_size, &ltab)?;
+                let card_r = cardinality(file, page_size, &rtab)?;
+                let drive_l = retrieval_cost(ri.unique, sel_r, card_r);
+                let drive_r = retrieval_cost(li.unique, sel_l, card_l);
+                if drive_r < drive_l {
+                    // the RIGHT stream drives, the left rides its index
+                    (
+                        rtab.clone(),
+                        ltab.clone(),
+                        ridx.clone(),
+                        li.clone(),
+                        rali.clone(),
+                        lali.clone(),
+                    )
+                } else {
+                    (
+                        ltab.clone(),
+                        rtab.clone(),
+                        lidx.clone(),
+                        ri.clone(),
+                        lali.clone(),
+                        rali.clone(),
+                    )
+                }
+            }
+            (Some(ri), Some(_), true, true) => {
+                // an OUTER join has no choice: the preserved side drives,
+                // whatever the costs say
+                (
+                    ltab.clone(),
+                    rtab.clone(),
+                    lidx.clone(),
+                    ri.clone(),
+                    lali.clone(),
+                    rali.clone(),
+                )
             }
             (Some(ri), _, _, _) => {
                 (ltab.clone(), rtab.clone(), lidx.clone(), ri.clone(), lali.clone(), rali.clone())
@@ -1066,6 +1132,12 @@ fn plan_chain(
     // (the structural reachability rules below still say WHETHER an
     // arrangement is possible; the band says WHICH the engine picks)
     let mut driver_order: Vec<usize> = (0..n).collect();
+    // Whether the two-stream COST model above has already decided the
+    // order. When it has, the arrangement search must not second-guess it
+    // - the band/cost decision is the converted engine model for
+    // populated tables, while the per-arrangement costing below is what
+    // decides when statistics are absent.
+    let mut order_decided = false;
     if n == 2 {
         let ca = cardinality(file, page_size, &tables[0])?;
         let cb = cardinality(file, page_size, &tables[1])?;
@@ -1074,7 +1146,9 @@ fn plan_chain(
         // for the data now present, and the crate falls back to the
         // probed bands rather than costing with a number the engine
         // itself distrusts
-        let key_sel = |si: usize, col: &str| -> Result<Option<f64>, String> {
+        // the key's index: its SELECTIVITY and whether it is UNIQUE, which
+        // price the inner retrieval differently (Retrieval.cpp:371)
+        let key_sel = |si: usize, col: &str| -> Result<Option<(f64, bool)>, String> {
             let ix = indexes_of(file, page_size, &tables[si])?;
             match ix
                 .iter()
@@ -1082,7 +1156,10 @@ fn plan_chain(
                 .min_by_key(|x| x.id)
             {
                 None => Ok(None),
-                Some(i) => Ok(Some(index_selectivity(file, page_size, &i.name)?)),
+                Some(i) => Ok(Some((
+                    index_selectivity(file, page_size, &i.name)?,
+                    i.unique,
+                ))),
             }
         };
         // the join key columns per stream, from the first class that
@@ -1102,7 +1179,7 @@ fn plan_chain(
                 let sa = key_sel(0, ca_col)?;
                 let sb = key_sel(1, cb_col)?;
                 match (sa, sb) {
-                    (Some(sa), Some(sb)) => {
+                    (Some((sa, ua)), Some((sb, ub))) => {
                         // a ZERO selectivity on a POPULATED index means
                         // the statistics were never computed for the
                         // data now present; the engine keeps costing
@@ -1118,8 +1195,8 @@ fn plan_chain(
                                 ca, cb
                             ));
                         }
-                        let loop_ab = loop_cost(ca, cb, sb); // A drives, index B
-                        let loop_ba = loop_cost(cb, ca, sa); // B drives, index A
+                        let loop_ab = loop_cost(ca, cb, sb, ub); // A drives, index B
+                        let loop_ba = loop_cost(cb, ca, sa, ua); // B drives, index A
                         // avoidHashJoin (InnerJoin.cpp:217): a stream
                         // that looks empty or single-rowed at prepare
                         // time is never hashed - the engine distrusts
@@ -1145,13 +1222,22 @@ fn plan_chain(
                 }
             }
         };
-        let shape = match costed {
-            Some(sh) => sh,
-            None => join_band(ca, cb)?,
+        // A shape from the COST model is final; one from the probed
+        // cardinality BANDS is not, when it merely says "keep the SQL
+        // order" - that was the right answer on every database the bands
+        // were probed against, and those all had symmetric indexes. The
+        // per-arrangement costing below is what distinguishes a unique
+        // inner lookup from a non-unique one.
+        let (shape, from_cost) = match costed {
+            Some(sh) => (sh, true),
+            None => (join_band(ca, cb)?, false),
         };
         match shape {
-            JoinShape::SqlOrder => {}
-            JoinShape::Swap => driver_order = vec![1, 0],
+            JoinShape::SqlOrder => order_decided = from_cost,
+            JoinShape::Swap => {
+                driver_order = vec![1, 0];
+                order_decided = true;
+            }
             JoinShape::Hash => {
                 // the LARGER stream is listed first - it PROBES while
                 // the smaller is hashed into the table (probed: the
@@ -1176,15 +1262,33 @@ fn plan_chain(
             }
         }
     }
-    // ---- try each driver in the chosen order ----------------------
+    // ---- try each driver, and COST the arrangements ----------------
+    //
+    // Every driver that can reach the rest by index gives a legal
+    // arrangement; the engine takes the CHEAPEST, replacing its best only
+    // on a strictly smaller cost (`findJoinOrder`, InnerJoin.cpp:366), so
+    // ties keep the enumeration order. The cost of an arrangement is the
+    // sum of its inner retrievals, and the surprise lives in
+    // `retrieval_cost`: a UNIQUE lookup is a fixed 4 while a non-unique
+    // one is 3 + cardinality * selectivity, so on a database whose
+    // statistics are zero the NON-unique index is cheaper and the engine
+    // drives the stream a reader would have made the inner one.
     let mut chosen: Option<(usize, Vec<(usize, IndexInfo)>)> = None;
+    let mut chosen_cost = f64::INFINITY;
     for d in driver_order {
         let mut placed = vec![d];
         let mut steps: Vec<(usize, IndexInfo)> = Vec::new();
         let mut ok = true;
-        for s in (0..n).filter(|s| *s != d) {
-            match reach(s, &placed) {
-                Some(i) => {
+        // place whichever remaining stream is reachable NOW, not the
+        // lowest-numbered one: a chain driven from its far end reaches
+        // its neighbours in the opposite order, and demanding index
+        // order threw that arrangement away before it could be costed
+        while placed.len() < n {
+            let next = (0..n)
+                .filter(|s| !placed.contains(s))
+                .find_map(|s| reach(s, &placed).map(|i| (s, i)));
+            match next {
+                Some((s, i)) => {
                     steps.push((s, i));
                     placed.push(s);
                 }
@@ -1194,9 +1298,24 @@ fn plan_chain(
                 }
             }
         }
-        if ok {
+        if !ok {
+            continue;
+        }
+        let mut cost = 0.0;
+        for (s, idx) in &steps {
+            let sel = index_selectivity(file, page_size, &idx.name)?;
+            let card = cardinality(file, page_size, &tables[*s])?;
+            cost += retrieval_cost(idx.unique, sel, card);
+        }
+        if order_decided {
+            // the cost model above already chose; take the first
+            // arrangement that works in its order
             chosen = Some((d, steps));
             break;
+        }
+        if cost < chosen_cost {
+            chosen_cost = cost;
+            chosen = Some((d, steps));
         }
     }
     let Some((driver, steps)) = chosen else {
@@ -1454,6 +1573,33 @@ pub fn index_selectivity(
     Ok(0.0)
 }
 
+/// `DEFAULT_INDEX_COST` (Optimizer.h) - the price of one index scan.
+pub const DEFAULT_INDEX_COST: f64 = 3.0;
+
+/// What ONE indexed retrieval of the inner stream costs, converted from
+/// `Retrieval::getInversion` (Retrieval.cpp:371-384):
+///
+/// ```text
+/// if (unique)  cost = DEFAULT_INDEX_COST * indexes + 1;   // fixed: 4
+/// else         cost = index scan cost + cardinality * selectivity;
+/// ```
+///
+/// The comment on the unique branch says why it is fixed - "independent
+/// from a possibly outdated statistics" - and that single decision is
+/// what makes the engine's join order surprising on a database whose
+/// statistics are zero: a unique lookup costs 4 while a non-unique one
+/// costs 3 + 0, so the arrangement that uses the NON-unique index wins.
+/// Probed and confirmed: with `A.BX` indexed (non-unique) and `B.ID` a
+/// primary key, the engine drives B in BOTH SQL orders, while two
+/// symmetric indexes keep the SQL order.
+pub fn retrieval_cost(unique: bool, selectivity: f64, cardinality: f64) -> f64 {
+    if unique {
+        DEFAULT_INDEX_COST + 1.0
+    } else {
+        DEFAULT_INDEX_COST + cardinality * selectivity
+    }
+}
+
 /// The engine's cost arithmetic for joining `inner` behind `outer`
 /// (InnerJoin.cpp:192-236 with Retrieval.cpp:1147 and :384):
 ///
@@ -1467,9 +1613,16 @@ pub fn index_selectivity(
 ///
 /// The engine takes the cheapest of {loop each way, hash}, and this
 /// reproduces its whole 6x6 decision grid once statistics are fresh.
-fn loop_cost(outer_card: f64, inner_card: f64, inner_sel: f64) -> f64 {
-    const DEFAULT_INDEX_COST: f64 = 3.0;
-    let retrieval = DEFAULT_INDEX_COST + 2.0 * inner_sel * inner_card;
+fn loop_cost(outer_card: f64, inner_card: f64, inner_sel: f64, inner_unique: bool) -> f64 {
+    // A UNIQUE inner lookup is priced at a FIXED DEFAULT_INDEX_COST + 1
+    // (Retrieval.cpp:371-376, "independent from a possibly outdated
+    // statistics"); a non-unique one pays the index scan plus the rows it
+    // names, twice - once to scan, once to fetch.
+    let retrieval = if inner_unique {
+        DEFAULT_INDEX_COST + 1.0
+    } else {
+        DEFAULT_INDEX_COST + 2.0 * inner_sel * inner_card
+    };
     retrieval * outer_card
 }
 
@@ -1728,6 +1881,25 @@ fn split_kw<'a>(s: &'a str, kw: &str) -> Vec<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_unique_lookup_costs_a_fixed_four() {
+        // Retrieval.cpp:371-376 - "For unique retrievals, set up a fixed
+        // cost (independent from a possibly outdated statistics)". That
+        // one decision is why the engine's join order looks backwards on
+        // a database whose statistics are zero: the unique lookup costs
+        // 4 while the non-unique one costs 3, so the NON-unique index
+        // wins and the stream a reader expects to be the inner one drives.
+        assert_eq!(retrieval_cost(true, 0.0, 1.0), 4.0);
+        assert_eq!(retrieval_cost(true, 0.5, 1000.0), 4.0, "statistics ignored");
+        assert_eq!(retrieval_cost(false, 0.0, 1.0), 3.0);
+        assert_eq!(retrieval_cost(false, 0.5, 100.0), 53.0);
+        // and the ordering that follows on an unanalysed database
+        assert!(retrieval_cost(false, 0.0, 1.0) < retrieval_cost(true, 0.0, 1.0));
+        // ... which reverses once the statistics are real and the
+        // non-unique index turns out to name many rows
+        assert!(retrieval_cost(false, 0.5, 100.0) > retrieval_cost(true, 0.5, 100.0));
+    }
 
     #[test]
     fn an_outer_join_nests_where_an_inner_chain_flattens() {

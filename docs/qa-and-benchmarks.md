@@ -6222,7 +6222,7 @@ things the first version had left untested:
   `AST: 0x0xeb781933e044`. fire-crab prints the double prefix, because the
   differential is the tool's text and not the text the tool meant to write.
 
-### Outer joins, and the two wrong answers they exposed (`qa/opt-plans.sh`, now 78 checks)
+### Outer joins, the cost of a unique lookup, and what symmetry hid (`qa/opt-plans.sh`, now 87 checks)
 
 The optimizer gate compares fire-crab's plan line with the engine's own
 `SET PLANONLY ON` output, which makes it unusually sharp: the engine prints its
@@ -6267,6 +6267,40 @@ checks, and the one that moved was a REFUSAL that has become a converted case �
 the outer chain the engine plans as
 `JOIN (JOIN ("A" NATURAL, "B" INDEX (IDX_U_UID)), "D" INDEX (IDX_C_XY))`, which
 fire-crab now prints exactly.
+
+**And then the refusal was lifted, one slice later, by reading the cost model.**
+`Retrieval::getInversion` prices an indexed retrieval two ways
+(Retrieval.cpp:371-384):
+
+```c
+if (unique)  cost = DEFAULT_INDEX_COST * indexes + 1;      // a fixed 4
+else         cost = index scan + cardinality * selectivity;
+```
+
+The comment on the unique branch says why: *"independent from a possibly
+outdated statistics"*. The consequence is the least intuitive thing in this
+crate, and it is the engine's: on a database whose statistics are zero, a
+UNIQUE lookup costs 4 while a non-unique one costs 3, so the engine drives the
+stream whose inner lookup is NON-unique. It plans
+`JOIN (B NATURAL, A INDEX (A_BX))` in both SQL orders when `A.BX` carries a
+plain index and `B.ID` a primary key — and keeps the SQL order when the two
+sides are indexed alike, because `findJoinOrder` replaces its best arrangement
+only on a strictly smaller cost. A chain of such links drives from its FAR end,
+since two non-unique lookups (3 + 3) beat two unique ones (4 + 4).
+
+Reaching that arrangement also required fixing the placement search, which had
+demanded the remaining streams in index order and so discarded every
+arrangement that reaches its neighbours in the opposite direction — an
+invisible restriction, because the arrangements it threw away were the ones
+nobody had costed.
+
+**The gate gained a fifth database, and that is the real lesson.** Its four
+existing databases all paired like with like: both sides of a join indexed the
+same way. So they never asked which of a unique and a non-unique inner lookup
+the engine prefers — and two wrong answers (RIGHT and FULL joins) plus this
+whole cost law sat undetected behind that symmetry for six slices. The new
+database indexes one side with a primary key and the other with a plain index,
+and it is now the first place these checks run.
 
 ## Benchmarks
 

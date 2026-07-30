@@ -139,6 +139,18 @@ check "SELECT A.ID FROM T A JOIN U B ON A.AMT = B.UA JOIN C D ON D.X = B.UA"
 # ...and the order transfers through the class too
 check "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID ORDER BY B.UID"
 
+# --- the retrieval cost: a UNIQUE lookup is a fixed 4 -----------------
+# With BOTH join keys indexed, both arrangements are legal and the engine
+# takes the cheaper. Retrieval.cpp prices a unique equality lookup at a
+# FIXED DEFAULT_INDEX_COST + 1 = 4 ("independent from a possibly outdated
+# statistics") while a non-unique one costs 3 + cardinality * selectivity
+# - so on a database whose statistics are zero the NON-unique index is
+# cheaper, and the engine drives the stream a reader would have made the
+# inner one. Symmetric pairs keep the SQL order, because the engine
+# replaces its best arrangement only on a STRICTLY smaller cost.
+check "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID"
+check "SELECT A.UID FROM U A JOIN T B ON A.UID = B.ID"
+
 # --- outer joins: the KIND decides who drives -------------------------
 # An outer join makes a plan NODE, so a chain NESTS where an inner chain
 # of the same streams would have flattened into one JOIN list - the
@@ -349,5 +361,58 @@ else
     echo "DIFF stale-statistics grid: $swrong cells planned WRONGLY"
     fail=1
 fi
+
+# ==== a FIFTH database: ASYMMETRIC index kinds =========================
+# The four databases above all pair like with like - both sides of a join
+# indexed the same way - so they never asked which of a UNIQUE and a
+# NON-UNIQUE inner lookup the engine prefers. Retrieval.cpp prices the
+# unique one at a FIXED 4 ("independent from a possibly outdated
+# statistics") and the other at 3 + cardinality * selectivity, so on a
+# database whose statistics are zero the NON-unique index is cheaper and
+# the engine drives the stream a reader would have made the inner one.
+# Both wrong answers this database found had been passing for six slices.
+DBA="$D/fc-optuniq.fdb"
+rm -f "$DBA"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || { echo "FAIL asymmetric db"; exit 1; }
+CREATE DATABASE '$DBA' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE A (ID INTEGER PRIMARY KEY, BX INTEGER, N INTEGER);
+CREATE TABLE B (ID INTEGER PRIMARY KEY, CX INTEGER, N INTEGER);
+CREATE TABLE C (ID INTEGER PRIMARY KEY, N INTEGER);
+CREATE INDEX A_BX ON A (BX);
+CREATE INDEX B_CX ON B (CX);
+COMMIT;
+EOF
+
+acheck() { # <sql> - against the asymmetric database
+    q="$1"
+    eng=$("$ISQL" -q -user "$U" -pas "$P" "$DBA" 2>&1 <<SQL | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | head -1
+SET PLANONLY ON;
+$q;
+SQL
+)
+    got=$("$FCOPT" plan "$DBA" "$q" 2>&1)
+    if [ "$got" = "$eng" ]; then
+        echo "OK   [$q] $got"
+    else
+        echo "DIFF [$q]"
+        echo "     engine: $eng"
+        echo "     fcopt:  $got"
+        fail=1
+    fi
+}
+
+# a NON-unique index on one side, a primary key on the other: the engine
+# drives the same stream in BOTH SQL orders, because the cost - not the
+# text - decides
+acheck "SELECT A.ID FROM A JOIN B ON A.BX = B.ID"
+acheck "SELECT A.ID FROM B JOIN A ON A.BX = B.ID"
+# a chain of two such links: the far end drives, because two non-unique
+# lookups (3 + 3) beat two unique ones (4 + 4)
+acheck "SELECT A.ID FROM A JOIN B ON A.BX = B.ID JOIN C ON B.CX = C.ID"
+# the outer-join laws hold on this database too
+acheck "SELECT A.ID FROM A LEFT JOIN B ON A.BX = B.ID"
+acheck "SELECT A.ID FROM A RIGHT JOIN B ON A.BX = B.ID"
+acheck "SELECT A.ID FROM A FULL JOIN B ON A.BX = B.ID"
+acheck "SELECT A.ID FROM A LEFT JOIN B ON A.BX = B.ID LEFT JOIN C ON B.CX = C.ID"
 
 exit $fail

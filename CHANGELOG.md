@@ -13,6 +13,51 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — fire-crab-opt slice 9: a unique lookup costs a fixed four
+
+### Converted
+- **The retrieval-cost law that decides join orders.**
+  `Retrieval::getInversion` (Retrieval.cpp:371-384) prices a UNIQUE
+  equality retrieval at a FIXED `DEFAULT_INDEX_COST * indexes + 1` = 4,
+  with the comment "independent from a possibly outdated statistics",
+  and a non-unique one at `index scan + cardinality * selectivity`.
+  `IndexInfo` therefore grew a `unique` flag (`RDB$UNIQUE_FLAG`), and
+  both the two-stream cost model and the chain's arrangement search now
+  use it.
+- **The consequence is counter-intuitive and it is the engine's**: on a
+  database whose statistics are zero a unique lookup (4) costs MORE than
+  a non-unique one (3), so the engine drives the stream whose inner
+  lookup is NON-unique. Probed: with `A.BX` indexed and `B.ID` a primary
+  key it plans `JOIN (B NATURAL, A INDEX (A_BX))` in BOTH SQL orders,
+  while two symmetric indexes keep the SQL order - because
+  `findJoinOrder` replaces its best arrangement only on a STRICTLY
+  smaller cost (InnerJoin.cpp:366).
+- **A chain drives from its FAR end** for the same reason: two
+  non-unique lookups (3 + 3) beat two unique ones (4 + 4). Reaching that
+  arrangement also needed the placement search fixed - it demanded the
+  remaining streams in index order, which threw away every arrangement
+  that reaches its neighbours in the opposite direction.
+
+### Fixed
+- **The refusal added in slice 8 is lifted**: a two-stream join with both
+  keys indexed is planned again, now by cost rather than by keeping the
+  SQL order. The refusal was the honest placeholder for exactly one
+  slice.
+- A shape from the probed cardinality BANDS no longer overrides the
+  per-arrangement costing when it merely says "keep the SQL order". The
+  bands were probed on databases with symmetric indexes, where that was
+  always right; a real cost decision still wins, as it should.
+
+### Guarded
+- The stale-statistics refusal is untouched: a zero selectivity on a
+  POPULATED index still refuses, because there the engine keeps costing
+  with state this crate has not converted.
+
+The gate grew a FIFTH database whose join sides are indexed
+ASYMMETRICALLY - a primary key against a plain index - which is the shape
+none of the other four had, and the one that exposed both of slice 8's
+wrong answers and this slice's law. 87 checks.
+
 ## 2026-07-30 — fire-crab-opt slice 8: outer joins, and two wrong answers they exposed
 
 ### Converted
