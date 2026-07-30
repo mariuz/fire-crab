@@ -126,11 +126,24 @@ check() { # <label> <got> <want>
 
 # --- phase 1: parameterised DML through fire-crab ----------------------
 # every column type bound in one statement: int, text, double->NUMERIC,
-# Date->TIMESTAMP, string->DATE, Date->TIME (time half), bool->BOOLEAN
-check "insert all-param row" \
-    "$(node_run "INSERT INTO PT VALUES (?, ?, ?, ?, ?, ?, ?)" \
-        '[1,"alpha",100.25,new Date(2024,0,15,10,30,0),"2024-02-20",new Date(1970,0,1,11,22,33),true]')" \
+# Date->TIMESTAMP, string->DATE, Date->TIME (time half). The BOOLEAN is a
+# LITERAL, not a parameter: node-firebird cannot encode a JS boolean into
+# a BOOLEAN slot at all - the REAL ENGINE answers `Conversion error from
+# string "1"` for the parameterised form, so asking fire-crab to accept
+# it would be asking it to out-do the engine. The refusal is asserted
+# below instead.
+check "insert all-param row (boolean as a literal)" \
+    "$(node_run "INSERT INTO PT VALUES (?, ?, ?, ?, ?, ?, TRUE)" \
+        '[1,"alpha",100.25,new Date(2024,0,15,10,30,0),"2024-02-20",new Date(1970,0,1,11,22,33)]')" \
     "<no rows>"
+# ... and the boolean PARAMETER, which this driver cannot send. Both
+# servers raise; the check is that fire-crab does not quietly accept
+# what the engine rejects.
+b=$(node_run "INSERT INTO PT (ID, ACTIVE) VALUES (99, ?)" '[true]')
+case "$b" in
+    ERR*) echo "OK   a boolean PARAMETER is refused, as the engine refuses this driver's encoding" ;;
+    *) echo "DIFF boolean parameter answered: [$b]"; fail=1 ;;
+esac
 # mixed literals and params, column list; JS integral 50 arrives as
 # blr_long and must rescale into NUMERIC(9,2) as 5000
 check "insert mixed literal/param" \

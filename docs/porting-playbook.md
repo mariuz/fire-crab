@@ -1146,6 +1146,28 @@ them.
   implemented, refuse. Converting it to the obvious thing answers a
   different set of rows with no error anywhere.
 
+- **A type that is also a predicate needs both grammars.** BOOLEAN is
+  the only one, and `WHERE B` is a complete clause meaning `B = TRUE`.
+  Getting the desugaring right is what decides where the NULL rows go -
+  in the bare form, under NOT, and in `IS NOT TRUE`, which is NOT the
+  negation of `IS TRUE`.
+- **A one-line grammar rule can un-parse everything else.** Making a
+  bare column a leaf hit two traps in one commit: the existing
+  end-of-SIDE test counts an operator as a boundary (so every `ID > 2`
+  became `ID = TRUE`), and letting an EXPRESSION side qualify broke
+  parenthesised arithmetic, whose inner group ends at `)`. Run the full
+  unit suite after touching a parser, not just the new cases.
+- **A fixed-expectation gate can assert what the ORACLE cannot do.** Two
+  gates sent a boolean parameter their driver cannot encode and the
+  engine itself rejects, and stayed red for dozens of increments while
+  looking like our bug. A twin comparison would have shown both sides
+  failing on day one. Where a gate must state an expectation, state what
+  the ENGINE answers - and check it.
+- **When a gate goes red, date it.** Rebuilding the tree at older
+  commits (a throwaway `git worktree` and one `cargo build`) is minutes
+  of work and turns "did I break this?" into a fact. Both of these
+  turned out to predate the slice being checked.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

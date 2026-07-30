@@ -106,9 +106,13 @@ check() { # <label> <got> <want>
 check "create table" \
     "$(node_run "CREATE TABLE TDDL (ID INTEGER, NAME VARCHAR(20), SAL BIGINT, F SMALLINT, D DATE, B BOOLEAN, N NUMERIC(9,2))")" \
     "<no rows>"
+# the BOOLEAN is a literal, not a parameter: node-firebird cannot encode
+# a JS boolean into a BOOLEAN slot, and the REAL ENGINE rejects that
+# encoding too (`Conversion error from string "1"`) - so a parameter here
+# would be asking fire-crab to out-do the engine
 check "insert into created table" \
-    "$(node_run "INSERT INTO TDDL VALUES (1, 'alpha', 1000, 7, ?, ?, ?)" \
-        '["2024-03-05",true,12.5]')" "<no rows>"
+    "$(node_run "INSERT INTO TDDL VALUES (1, 'alpha', 1000, 7, ?, TRUE, ?)" \
+        '["2024-03-05",12.5]')" "<no rows>"
 check "insert second row" \
     "$(node_run "INSERT INTO TDDL (ID, NAME) VALUES (2, 'beta')")" "<no rows>"
 check "fire-crab reads its own table" \

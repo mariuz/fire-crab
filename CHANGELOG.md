@@ -13,6 +13,49 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — BOOLEAN, the type that is also a predicate
+
+### Converted
+- **Boolean literals as VALUES**: `INSERT ... VALUES (TRUE)`, `UPDATE
+  SET B = FALSE`, `SELECT TRUE`. This was the gap keeping
+  `qa/serve-real-params.sh` red for dozens of increments — the LITERAL,
+  not the parameter.
+- **Boolean columns as PREDICATES.** `WHERE B` is a complete WHERE
+  clause; so are `WHERE B AND C`, `WHERE NOT B` and `WHERE (B OR C) AND
+  ID > 1`. A bare column means `B = TRUE`, which is why the NULL rows
+  drop — and drop under `NOT` as well.
+- **`IS [NOT] TRUE|FALSE|UNKNOWN`.** `IS TRUE` and `IS FALSE` are
+  TWO-valued (a NULL is simply not true), so they desugar to `=`. Their
+  negations are NOT the negated comparison: `B IS NOT TRUE` RETURNS the
+  NULL rows where `B <> TRUE` and `NOT (B = TRUE)` both drop them, so it
+  desugars to the explicit `IS NULL OR <>`, exactly as `IS DISTINCT
+  FROM` does. `IS UNKNOWN` is `IS NULL` by another name.
+- Comparison against another boolean column, `IN`, a boolean answer from
+  a subquery, `ORDER BY`, `GROUP BY`, and `MIN`/`MAX`/`COUNT` over one.
+
+### Guarded
+- **A number is not a boolean.** `B = 1` raises a conversion error on
+  the engine, so it refuses here rather than answering. A string DOES
+  convert (`B = 'TRUE'`, case-insensitively).
+- A bare non-boolean column is not a predicate: `WHERE NAME` refuses on
+  both servers.
+
+### Fixed
+- **Two gates that had been red for dozens of increments**, both for the
+  same reason and neither of them fire-crab's fault beyond the missing
+  literal. `qa/serve-real-params.sh` and `qa/serve-real-ddl.sh` each sent
+  a JS `true` as a BOOLEAN parameter — an encoding node-firebird cannot
+  produce, and one the REAL ENGINE rejects with `Conversion error from
+  string "1"`. Their expectations asked fire-crab to out-do the engine.
+  Both now pass a boolean LITERAL where the value is needed and assert
+  the parameter's refusal on BOTH servers, which is what that fact
+  actually is.
+
+`qa/serve-real-boolean.sh` (46 checks, twin servers). Its centre is the
+run of predicates that differ only on the NULL row — `IS TRUE`, `IS NOT
+TRUE`, `<> TRUE`, `NOT (= TRUE)` — kept side by side so the difference
+shows as a row count rather than an error.
+
 ## 2026-07-30 — `?` parameters over the temporal and approximate families
 
 ### Converted

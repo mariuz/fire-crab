@@ -6659,24 +6659,53 @@ driver that honours the announced descriptor and sends a real TIME binds
 normally, which is the check that keeps the refusal about the wire shape and
 not about TIME columns.
 
-### A standing red gate: BOOLEAN as a written value
+### BOOLEAN, the type that is also a predicate (`qa/serve-real-boolean.sh`, 46 checks)
 
-`qa/serve-real-params.sh` reports six DIFFs, and has for at least 25
-increments — this was found while checking the parameter slice above for
-regressions, by rebuilding the tree at older commits and re-running it.
+Boolean columns had been readable for a long time and nothing else. `INSERT
+INTO T VALUES (1, TRUE)` was refused — the LITERAL, not the parameter — so a
+row with a boolean never landed, and every predicate over one refused too.
+That single gap is what had been keeping `qa/serve-real-params.sh` red for
+dozens of increments; it was found by rebuilding the tree at older commits
+while checking an unrelated slice for regressions.
 
-The cause is one statement, not six: `INSERT INTO PT (ID, ACTIVE) VALUES (20,
-TRUE)` is REFUSED. Not the parameter — the LITERAL. `TRUE` and `FALSE` are not
-values this server's INSERT/UPDATE value list knows, so the row never lands,
-and the five later checks that read it back or compare the mirror table fail
-because row 1 is missing. A BOOLEAN column READS correctly (the type gate
-compares them), and a boolean parameter fails for the same reason its literal
-does.
+BOOLEAN is the only type that is both a VALUE and a PREDICATE, and the rules
+live in that overlap.
 
-It is recorded here rather than quietly left because a red gate that nobody
-names becomes a gate nobody reads. The fix is its own increment: BOOLEAN as a
-value — literals and parameters in a VALUES list and a SET, and `WHERE ACTIVE =
-TRUE` / `IS TRUE` in a predicate.
+**A bare column is a complete WHERE clause**, and it means `= TRUE`. So
+`WHERE B` drops the NULL rows, and `WHERE NOT B` — which becomes `B <> TRUE` —
+drops them as well. A converter that read a bare column as "not null" or as
+"not false" would return the NULL row in one of those two and look right in
+the other.
+
+**`IS TRUE` and `IS FALSE` are two-valued; their negations are not.** A NULL
+is simply not true, so `IS TRUE` desugars to `=`. But `B IS NOT TRUE` RETURNS
+the NULL rows, where `B <> TRUE` and `NOT (B = TRUE)` both drop them — the same
+shape as `IS DISTINCT FROM`, and desugared the same way, into an explicit
+`IS NULL OR <>`. The gate keeps all four side by side, because what separates
+them is a row count and not an error. `IS UNKNOWN` is `IS NULL` under another
+spelling.
+
+**What a boolean may meet.** Another boolean, or a string the engine converts
+(`B = 'TRUE'`, case-insensitively). Not a number: `B = 1` is a conversion error
+on the engine, so answering it would be worse than refusing.
+
+**The parser trap.** Making a bare column a leaf is a one-line rule and it
+broke two things at once. The obvious end-of-leaf test, `side_boundary`, counts
+an OPERATOR as the end of a SIDE — so `ID > 2` became `ID = TRUE` and every
+comparison in the server refused. And allowing an EXPRESSION side to qualify
+broke `(A + 8) * 2 = 2`, whose first parenthesised group parses as a
+sub-predicate where `A + 8` is followed by `)`. The rule that works is narrow:
+a bare COLUMN, and only where the leaf itself ends.
+
+**Two long-red gates, and what they were really saying.** `serve-real-params.sh`
+and `serve-real-ddl.sh` each sent a JS `true` as a BOOLEAN parameter and
+expected it to land. node-firebird cannot produce that encoding — and the REAL
+ENGINE rejects it too, with `Conversion error from string "1"`. So both gates
+were asking fire-crab to out-do the engine, and would have stayed red however
+much of the boolean surface was converted. They now pass a boolean LITERAL
+where the value is needed and assert the parameter's refusal on BOTH servers,
+which is what that fact is. A fixed-expectation gate can encode an assumption
+the oracle never held; a twin comparison cannot.
 
 ## Benchmarks
 

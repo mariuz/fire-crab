@@ -1733,6 +1733,7 @@ impl Predicate {
                 }
                 (ColKind::Temporal(_), WireParam::Date(d)) => Some(Expr::DateLit(*d)),
                 (ColKind::Approx, WireParam::Double(x)) => Some(Expr::Double(*x)),
+                (ColKind::Bool, WireParam::Bool(b)) => Some(Expr::Bool(*b)),
                 // an exact value for an approximate slot converts, the
                 // way an exact literal in the SQL text would
                 (ColKind::Approx, WireParam::Int(v, sc)) => {
@@ -2821,6 +2822,7 @@ fn build_expr_col(
         // an approximate result is a DOUBLE on the wire whatever its
         // source width - the engine widens FLOAT the same way
         ExprType::Approx => (Wire::Double, nullable(480), 8, 0),
+        ExprType::Bool => (Wire::Bool, nullable(32764), 1, 0),
         // a temporal result travels exactly like a stored temporal
         // column (the same wire forms wire_for announces)
         ExprType::Temporal(TKind::Date) => (Wire::Date, nullable(570), 4, 0),
@@ -2893,6 +2895,9 @@ enum InsVal {
     /// does not fit an INTEGER)
     Dec(i64, i8),
     Str(String),
+    /// `TRUE` / `FALSE` - `UNKNOWN` tokenizes to NULL, which is what it
+    /// means
+    Bool(bool),
     Null,
     Param(usize),
     /// `GenId(name, step)`: `None` step = `NEXT VALUE FOR` (use the
@@ -7332,6 +7337,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
             [Tok::Int(n)] => InsVal::Int(*n),
             [Tok::Dec(r, s)] => InsVal::Dec(*r, *s),
             [Tok::Str(v)] => InsVal::Str(v.clone()),
+            [Tok::FnExpr(RawExpr::Bool(b))] => InsVal::Bool(*b),
             [Tok::Null] => InsVal::Null,
             [Tok::Param] => {
                 nparams += 1;
@@ -7531,6 +7537,7 @@ fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
         InsVal::Int(n) => WireParam::Int(*n, 0),
         InsVal::Dec(r, s) => WireParam::Int(*r, *s),
         InsVal::Str(text) => WireParam::Text(text.clone()),
+        InsVal::Bool(b) => WireParam::Bool(*b),
         // parameters bind, generators advance, at execute - not here
         InsVal::Param(_) | InsVal::GenId(..) => return None,
     };
@@ -8138,6 +8145,9 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
             }
             Some([Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Str(t)]) => {
                 Some((c.clone(), InsVal::Str(t.clone())))
+            }
+            Some([Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::FnExpr(RawExpr::Bool(b))]) => {
+                Some((c.clone(), InsVal::Bool(*b)))
             }
             Some([Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Null]) => {
                 Some((c.clone(), InsVal::Null))
@@ -11010,6 +11020,8 @@ fn plan_group(
                             ExprType::Numeric
                         } else if is_approx_col(d) {
                             ExprType::Approx
+                        } else if d.dtype == dtype::BOOLEAN {
+                            ExprType::Bool
                         } else if let Some(k) = temporal_kind(d) {
                             ExprType::Temporal(k)
                         } else {
@@ -11051,6 +11063,7 @@ fn plan_group(
                                 None => (Wire::Varying, 448, 32765, 0, 0),
                             },
                             ExprType::Approx => (Wire::Double, 480, 8, 0, 0),
+                            ExprType::Bool => (Wire::Bool, 32764, 1, 0, 0),
                             ExprType::Temporal(TKind::Date) => (Wire::Date, 570, 4, 0, 0),
                             ExprType::Temporal(TKind::Time) => (Wire::Time, 560, 4, 0, 0),
                             ExprType::Temporal(TKind::Timestamp) => {
@@ -13069,6 +13082,10 @@ enum RawExpr {
     /// FLOAT/DOUBLE answer back into the token stream (there is no
     /// approximate literal in the SQL text; `1.5` is EXACT)
     Double(f64),
+    /// `TRUE` / `FALSE` - `UNKNOWN` parses to `Null`, which is what it
+    /// means (probed: `B IS UNKNOWN` and `B IS NULL` select the same
+    /// rows)
+    Bool(bool),
     Str(String),
     Null,
     Neg(Box<RawExpr>),
@@ -13628,6 +13645,12 @@ fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                     let (ds, ts) = text.trim().split_once(' ')?;
                     Some(RawExpr::TsLit(parse_date_lit(ds)?, parse_time_lit(ts.trim())?))
                 }
+            } else if !quoted && word.eq_ignore_ascii_case("TRUE") {
+                Some(RawExpr::Bool(true))
+            } else if !quoted && word.eq_ignore_ascii_case("FALSE") {
+                Some(RawExpr::Bool(false))
+            } else if !quoted && word.eq_ignore_ascii_case("UNKNOWN") {
+                Some(RawExpr::Null)
             } else if !quoted && word.eq_ignore_ascii_case("CAST") && {
                 skip_ws(b, pos);
                 b.get(*pos) == Some(&'(')
@@ -13750,7 +13773,7 @@ fn raw_bad_substring_len(e: &RawExpr) -> Option<i64> {
             .filter(|n| *n < 0)
             .or_else(|| walk_all(args)),
         RawExpr::Func(_, args) | RawExpr::Coalesce(args) => walk_all(args),
-        RawExpr::Double(_) => None,
+        RawExpr::Double(_) | RawExpr::Bool(_) => None,
         RawExpr::Neg(a) | RawExpr::Cast(a, _) => raw_bad_substring_len(a),
         RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => {
             raw_bad_substring_len(a).or_else(|| raw_bad_substring_len(b))
@@ -14274,6 +14297,7 @@ fn resolve_expr(
                 && !is_numeric_col(d)
                 && temporal_kind(d).is_none()
                 && !is_approx_col(d)
+                && d.dtype != dtype::BOOLEAN
             {
                 return None;
             }
@@ -14282,6 +14306,7 @@ fn resolve_expr(
         RawExpr::Int(n) => Expr::Int(*n),
         RawExpr::Dec(raw, scale) => Expr::Dec(*raw, *scale),
         RawExpr::Double(d) => Expr::Double(*d),
+        RawExpr::Bool(b) => Expr::Bool(*b),
         RawExpr::Str(s) => Expr::Str(s.clone()),
         RawExpr::Null => Expr::Null,
         RawExpr::Neg(e) => Expr::Neg(Box::new(resolve_expr(e, columns, descs)?)),
@@ -14362,6 +14387,8 @@ enum Expr {
     /// an APPROXIMATE literal - what a string literal becomes when the
     /// other side of a comparison is a FLOAT/DOUBLE column
     Double(f64),
+    /// `TRUE` / `FALSE` (`UNKNOWN` is `Null`)
+    Bool(bool),
     Str(String),
     Null,
     Neg(Box<Expr>),
@@ -14521,6 +14548,9 @@ enum ExprType {
     /// because the two answer differently: an exact AVG truncates at
     /// the source's scale, an approximate one divides in f64
     Approx,
+    /// a BOOLEAN - the only type that is both a VALUE and a PREDICATE,
+    /// which is why `WHERE B` is a complete WHERE clause
+    Bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -14554,9 +14584,10 @@ fn conditional_type<'a>(
             ExprType::Numeric => any_numeric = true,
             ExprType::Text => any_text = true,
             ExprType::Int => any_other = true,
-            // an approximate branch does not share a describe with any
-            // other family (nor promote them yet) - refuse the mix
+            // an approximate or boolean branch does not share a describe
+            // with any other family - refuse the mix
             ExprType::Approx => any_approx = true,
+            ExprType::Bool => any_approx = true,
             ExprType::Temporal(k) => match temporal {
                 None => temporal = Some(k),
                 // two different temporal kinds cannot share a describe
@@ -15138,15 +15169,22 @@ impl Expr {
                     // col_kind never returns these (they are
                     // parameter-binding markers); such columns classify
                     // from the descriptor below
-                    Some(ColKind::Numeric | ColKind::Temporal(_) | ColKind::Approx) => None,
+                        Some(
+                        ColKind::Numeric
+                        | ColKind::Temporal(_)
+                        | ColKind::Approx
+                        | ColKind::Bool,
+                    ) => None,
                     None if is_numeric_col(d) => Some(ExprType::Numeric),
                     None if is_approx_col(d) => Some(ExprType::Approx),
+                    None if d.dtype == dtype::BOOLEAN => Some(ExprType::Bool),
                     None => temporal_kind(d).map(ExprType::Temporal),
                 }
             }
             Expr::Int(_) => Some(ExprType::Int),
             Expr::Dec(..) => Some(ExprType::Numeric),
             Expr::Double(_) => Some(ExprType::Approx),
+            Expr::Bool(_) => Some(ExprType::Bool),
             Expr::Str(_) => Some(ExprType::Text),
             Expr::Null => Some(ExprType::Int),
             Expr::DateLit(_) => Some(ExprType::Temporal(TKind::Date)),
@@ -15156,7 +15194,7 @@ impl Expr {
                 ExprType::Int => Some(ExprType::Int),
                 ExprType::Numeric => Some(ExprType::Numeric),
                 ExprType::Approx => Some(ExprType::Approx),
-                ExprType::Text | ExprType::Temporal(_) => None,
+                ExprType::Text | ExprType::Temporal(_) | ExprType::Bool => None,
             },
             Expr::Bin(a, op, b) => match (a.type_of(descs)?, b.type_of(descs)?) {
                 // pure integer arithmetic stays integer
@@ -15320,7 +15358,7 @@ impl Expr {
                         ExprType::Int => Some(ExprType::Int),
                         ExprType::Numeric => Some(ExprType::Numeric),
                         ExprType::Approx => Some(ExprType::Approx),
-                        ExprType::Text | ExprType::Temporal(_) => None,
+                        ExprType::Text | ExprType::Temporal(_) | ExprType::Bool => None,
                     },
                 }
             }
@@ -15425,9 +15463,9 @@ impl Expr {
         match self {
             // the widest branch decides the width, so a value from any
             // branch fits the announced column
-            // an APPROXIMATE value has no exact rank - width is not what
-            // decides its wire form
-            Expr::Double(_) => None,
+            // an APPROXIMATE or BOOLEAN value has no exact rank - width
+            // is not what decides its wire form
+            Expr::Double(_) | Expr::Bool(_) => None,
             Expr::Coalesce(args) => args.iter().filter_map(|a| a.rank_of(descs)).max(),
             Expr::Case(branches, else_) => branches
                 .iter()
@@ -15533,6 +15571,7 @@ impl Expr {
     fn eval(&self, values: &[Value]) -> Result<Value, EvalErr> {
         Ok(match self {
             Expr::Double(d) => Value::Double(*d),
+            Expr::Bool(b) => Value::Bool(*b),
             // the first operand that is not NULL; NULL when all are
             Expr::Coalesce(args) => {
                 let mut out = Value::Null;
@@ -16276,7 +16315,10 @@ fn value_to_tok(v: &Value) -> Option<Tok> {
         Value::Int(n) => Tok::Int(*n),
         Value::Scaled(raw, scale) => Tok::Dec(*raw, *scale),
         Value::Text(s) => Tok::Str(s.clone()),
-        Value::Bool(b) => Tok::Int(if *b { 1 } else { 0 }),
+        // a BOOLEAN answer folds back as the literal it is: as an
+        // integer it would meet the engine's own refusal (`B = 1` is a
+        // conversion error) on the way back in
+        Value::Bool(b) => Tok::FnExpr(RawExpr::Bool(*b)),
         // a TEMPORAL answer folds back as the literal it is, not as its
         // rendered text: `WHERE D = (SELECT MAX(D) FROM T)` must compare
         // as a DATE, and a Tok::Str would have taken the text path
@@ -17054,7 +17096,7 @@ fn default_expr_name(raw: &RawExpr) -> String {
         // the engine leaves a unary-minus column unnamed (blank header)
         RawExpr::Neg(_) => "",
         RawExpr::Int(_) | RawExpr::Dec(..) | RawExpr::Double(_) | RawExpr::Str(_)
-        | RawExpr::Null => "CONSTANT",
+        | RawExpr::Bool(_) | RawExpr::Null => "CONSTANT",
         RawExpr::Col(_) => "EXPR",
     }
     .to_string()
@@ -17478,6 +17520,18 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                         continue;
                     }
                 }
+                // TRUE/FALSE are VALUES, and UNKNOWN is NULL by another
+                // name (probed: `B IS UNKNOWN` and `B IS NULL` select
+                // the same rows). Lexed as expression tokens, they reach
+                // the same comparison path every other literal takes.
+                if matches!(upper.as_str(), "TRUE" | "FALSE") {
+                    out.push(Tok::FnExpr(RawExpr::Bool(upper == "TRUE")));
+                    continue;
+                }
+                if upper == "UNKNOWN" {
+                    out.push(Tok::Null);
+                    continue;
+                }
                 match upper.as_str() {
                     "AND" => out.push(Tok::And),
                     "OR" => out.push(Tok::Or),
@@ -17892,6 +17946,27 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
     } else {
         false
     };
+    // A BOOLEAN side is a complete predicate on its own: `WHERE B`,
+    // `WHERE B AND C`, `WHERE NOT B`. It means `B = TRUE` - including
+    // under NOT, where it becomes `B <> TRUE` and drops the NULL rows,
+    // which is what the engine returns (probed). Checked BEFORE the
+    // operator match because the side may END the clause, and the
+    // resolver refuses a non-boolean one, so `WHERE NAME` still fails
+    // rather than testing emptiness.
+    // Only a bare COLUMN, and only where the leaf ENDS. Two traps:
+    // `side_boundary` is the wrong test (it counts an OPERATOR as the end
+    // of a SIDE, so `ID > 2` would become `ID = TRUE`), and an
+    // EXPRESSION side must not qualify - `(A + 8) * 2 = 2` parses its
+    // first parenthesised group as a sub-predicate, where `A + 8` is
+    // followed by `)` and would otherwise become `A + 8 = TRUE`.
+    // Resolution refuses a non-boolean column, so `WHERE NAME` still
+    // fails rather than testing emptiness.
+    if !negated
+        && matches!(lhs, RawLhs::Col(_))
+        && matches!(t.get(*pos), None | Some(Tok::And | Tok::Or | Tok::RParen))
+    {
+        return Some(leaf(RawKind::CmpExpr(Cmp::Eq, RawExpr::Bool(true))));
+    }
     match t.get(*pos)? {
         Tok::Cmp(op) if !negated => {
             let op = *op;
@@ -17981,6 +18056,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                 });
             }
             match (t.get(*pos), t.get(*pos + 1)) {
+                // IS UNKNOWN lexes as IS NULL - the same predicate
                 (Some(Tok::Null), _) => {
                     *pos += 1;
                     Some(leaf(RawKind::IsNull))
@@ -17988,6 +18064,25 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                 (Some(Tok::Not), Some(Tok::Null)) => {
                     *pos += 2;
                     Some(leaf(RawKind::IsNotNull))
+                }
+                // `IS TRUE` / `IS FALSE` are TWO-valued: a NULL is
+                // simply not true, so they desugar to `=`. Their
+                // negations are NOT the negated comparison - `B IS NOT
+                // TRUE` RETURNS the NULL rows (probed) where `NOT (B =
+                // TRUE)` drops them, so it desugars to the explicit OR,
+                // exactly as IS DISTINCT FROM does.
+                (Some(Tok::FnExpr(RawExpr::Bool(b))), _) => {
+                    let b = *b;
+                    *pos += 1;
+                    Some(leaf(RawKind::CmpExpr(Cmp::Eq, RawExpr::Bool(b))))
+                }
+                (Some(Tok::Not), Some(Tok::FnExpr(RawExpr::Bool(b)))) => {
+                    let b = *b;
+                    *pos += 2;
+                    Some(Ast::Or(vec![
+                        leaf(RawKind::IsNull),
+                        leaf(RawKind::CmpExpr(Cmp::Ne, RawExpr::Bool(b))),
+                    ]))
                 }
                 _ => None,
             }
@@ -18183,6 +18278,8 @@ enum ColKind {
     Temporal(TKind),
     /// a FLOAT/DOUBLE PRECISION parameter target - a binding marker only
     Approx,
+    /// a BOOLEAN parameter target - a binding marker only
+    Bool,
 }
 // ===================================================================
 // PSQL EXECUTION
@@ -19166,7 +19263,10 @@ fn resolve_predicate(
                 // TIMESTAMP, the way the engine does - and going
                 // through it means IS NULL, LIKE, BETWEEN and IN come
                 // along without a temporal case each
-                None if temporal_kind(d).is_some() || is_approx_col(d) => {
+                None if temporal_kind(d).is_some()
+                    || is_approx_col(d)
+                    || d.dtype == dtype::BOOLEAN =>
+                {
                     resolve_expr_term(&rt, columns, descs, params)?
                 }
                 None => return None,
@@ -19240,6 +19340,7 @@ fn resolve_expr_term(
                     ColKind::Temporal(TKind::Timestamp),
                 ),
                 ExprType::Approx => (d(dtype::DOUBLE, 8, 0), ColKind::Approx),
+                ExprType::Bool => (d(dtype::BOOLEAN, 1, 0), ColKind::Bool),
             };
             if params.len() <= *slot {
                 params.resize(*slot + 1, None);
@@ -19372,7 +19473,36 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
             Some((l, rhs))
         }
         (ExprType::Approx, _) | (_, ExprType::Approx) => None,
+        // BOOLEAN meets BOOLEAN, or a string the engine converts
+        // (probed: `B = 'TRUE'` selects the true rows). A NUMBER does
+        // not: the engine renders the boolean and fails the conversion
+        // (`B = 1` is SQLSTATE 22018), so there is no answer to give.
+        (ExprType::Bool, ExprType::Bool) => Some((lhs, rhs)),
+        (ExprType::Bool, ExprType::Text) => {
+            let r = bool_literal(&rhs)?;
+            Some((lhs, r))
+        }
+        (ExprType::Text, ExprType::Bool) => {
+            let l = bool_literal(&lhs)?;
+            Some((l, rhs))
+        }
+        (ExprType::Bool, _) | (_, ExprType::Bool) => None,
         _ => Some((lhs, rhs)),
+    }
+}
+
+/// A string literal read as a BOOLEAN, for the side of a comparison
+/// whose other side is one - the engine converts `'TRUE'` and `'FALSE'`
+/// (case-insensitively, probed). Anything else refuses, where the engine
+/// raises its conversion error.
+fn bool_literal(e: &Expr) -> Option<Expr> {
+    match e {
+        Expr::Str(s) => match s.trim().to_ascii_uppercase().as_str() {
+            "TRUE" => Some(Expr::Bool(true)),
+            "FALSE" => Some(Expr::Bool(false)),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -19410,6 +19540,7 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
         | Expr::Int(_)
         | Expr::Dec(..)
         | Expr::Double(_)
+        | Expr::Bool(_)
         | Expr::Str(_)
         | Expr::Null
         | Expr::DateLit(_)
@@ -24862,6 +24993,73 @@ mod tests {
         ] {
             assert!(parse_raw_expr(bad).is_none(), "{bad} parsed");
         }
+    }
+
+    #[test]
+    fn boolean_is_a_value_and_a_predicate() {
+        // B BOOLEAN, C BOOLEAN, NAME VARCHAR(10)
+        let columns = vec![
+            RelationColumn { name: "B".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "C".into(), field_id: 1, position: 1 },
+            RelationColumn { name: "NAME".into(), field_id: 2, position: 2 },
+        ];
+        let d = |dt, len| Descriptor {
+            dtype: dt, scale: 0, length: len, sub_type: 0, flags: 0, offset: 4,
+        };
+        let descs = vec![d(dtype::BOOLEAN, 1), d(dtype::BOOLEAN, 1), d(dtype::VARYING, 10)];
+        let build = |s: &str| -> Option<Predicate> {
+            let toks = tokenize(s)?;
+            let mut np = 0usize;
+            let raw = parse_predicate(&toks, &mut np)?;
+            let mut params: Vec<Option<Descriptor>> = Vec::new();
+            resolve_predicate(raw, &columns, &descs, &mut params)
+        };
+        let on = |s: &str, row: &[Value]| {
+            build(s).unwrap_or_else(|| panic!("{s} refused")).matches(row).unwrap()
+        };
+        let t_row = vec![Value::Bool(true), Value::Bool(true), Value::Text("aa".into())];
+        let f_row = vec![Value::Bool(false), Value::Bool(true), Value::Text("bb".into())];
+        let n_row = vec![Value::Null, Value::Bool(false), Value::Text("cc".into())];
+
+        // a bare boolean column is a COMPLETE predicate, and it means
+        // `= TRUE` - so the NULL row drops, and drops under NOT as well
+        assert!(on("B", &t_row));
+        assert!(!on("B", &f_row));
+        assert!(!on("B", &n_row));
+        assert!(!on("NOT B", &t_row));
+        assert!(on("NOT B", &f_row));
+        assert!(!on("NOT B", &n_row)); // NOT UNKNOWN is UNKNOWN
+        assert!(on("B AND C", &t_row));
+        assert!(on("B OR C", &f_row));
+
+        // IS TRUE / IS FALSE are TWO-valued; their negations are NOT the
+        // negated comparison. These three differ ONLY on the NULL row,
+        // which is exactly why they are all here.
+        assert!(!on("B IS TRUE", &n_row));
+        assert!(on("B IS NOT TRUE", &n_row)); // keeps it
+        assert!(!on("B <> TRUE", &n_row)); // drops it
+        assert!(!on("NOT (B = TRUE)", &n_row)); // drops it too
+        assert!(on("B IS NOT TRUE", &f_row));
+        assert!(on("B IS FALSE", &f_row));
+        assert!(on("B IS NOT FALSE", &n_row));
+
+        // UNKNOWN is NULL by another name
+        assert!(on("B IS UNKNOWN", &n_row));
+        assert!(!on("B IS UNKNOWN", &t_row));
+        assert!(on("B IS NOT UNKNOWN", &t_row));
+        assert!(!on("B = NULL", &t_row)); // a comparison, so UNKNOWN
+
+        // what a boolean may meet: another boolean, or a string the
+        // engine converts - but NOT a number, where the engine raises
+        assert!(on("B = C", &t_row));
+        assert!(on("B <> C", &f_row));
+        assert!(on("B = 'TRUE'", &t_row));
+        assert!(on("B = 'false'", &f_row));
+        assert!(build("B = 1").is_none());
+        assert!(build("B = 'yes'").is_none());
+        // ... and a non-boolean column is not a predicate on its own
+        assert!(build("NAME").is_none());
+        assert!(build("NAME AND B").is_none());
     }
 
     #[test]
