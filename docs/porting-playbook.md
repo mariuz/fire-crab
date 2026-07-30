@@ -1108,6 +1108,26 @@ them.
   from the file against isql's text. The second found the bug, because
   nothing in between could absorb it.
 
+- **When the TYPE is what changed, compare the TEXT.** Promoting an
+  exact operand to approximate leaves the value alone - 11.75 either way
+  - and a driver decodes both into the same number. The rendering is
+  where the difference lives, so route the check through the engine's
+  own printing rather than the driver's decode.
+- **IEEE returns where the engine raises.** Floating-point division by
+  zero and overflow produce infinities and NaNs in every language you
+  will write this in, and an arithmetic exception in the engine. Letting
+  the language decide gives you a plausible number in a result set the
+  engine never returns - no exception, no diff in a value-only gate.
+- **Two errors that share a SQLSTATE are still two errors.** The integer
+  and floating divide-by-zero both report 22012 with different gds codes
+  and different text. A gate that asks "did it fail?" passes with either
+  one; ask which one.
+- **A second lexer is a second grammar.** This server lexes numbers in
+  two places - the expression parser and the predicate tokenizer. Teach
+  only one about exponents and `1e3` becomes a DOUBLE in the select list
+  and an integer in the WHERE, in the same statement. Any literal rule
+  has to land in every lexer that can see it.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

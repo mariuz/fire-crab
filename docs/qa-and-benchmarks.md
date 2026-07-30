@@ -6590,6 +6590,40 @@ gate is, because no protocol sits between the two texts.
 gained two comparisons. That is the third refusal-list entry promoted this way
 in four slices; each one failed loudly the moment the capability landed.
 
+### Approximate arithmetic (`qa/serve-real-approxmath.sh`, 39 checks)
+
+The comparison and the fold arrived two slices ago; `DP * 2` still refused,
+because `Expr::Bin` had arms for integers, for exact numerics and for the
+temporal types, and nothing for this family. Filling it in is small. What the
+gate is really defending are three rules that only arithmetic can show.
+
+**The promotion is invisible in a value.** One approximate operand makes the
+whole result approximate — `DP + N` is a DOUBLE, not a NUMERIC(9,2) — and both
+answers are 11.75. A driver decodes each into the same JS number, so a gate
+comparing values passes whichever type the server picked. What differs is the
+RENDERING: the exact result prints `11.75`, the approximate one
+`11.75000000000000`. So every arithmetic check in this gate concatenates its
+result into text, and the comparison is against the engine's own printing.
+That is only possible because the previous slice made the printing right; the
+two slices check each other.
+
+**The engine raises where IEEE returns a value.** `DP / 0` is
+`isc_exception_float_divide_by_zero`, and a product past the range is
+`isc_exception_float_overflow` — not an infinity, not a NaN. An implementation
+that let IEEE decide would answer a row where the engine answers an error,
+which is the worst shape of divergence: no exception anywhere and a plausible
+number in the result set. The two divide-by-zero errors are also different gds
+codes with different message text (the integer one shares SQLSTATE 22012 and
+says "Integer divide by zero"), so the gate asserts they do not collapse into
+one — a check that merely asked "did it fail?" would pass with a single code.
+
+**A literal's TYPE is decided by a character.** `1e3` is a DOUBLE 1000, not the
+integer 1000, and `1.5e0` is a DOUBLE where a bare `1.5` is an exact NUMERIC.
+There are two lexers in this server — the select list's character parser and
+the predicate tokenizer — and either one alone knowing about exponents would
+make the same literal mean different things on the two sides of a statement.
+Both learned it, and the gate exercises both positions.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

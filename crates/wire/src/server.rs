@@ -12212,6 +12212,10 @@ impl From<EvalErr> for EmitErr {
 /// by zero".
 const GDS_ARITH_EXCEPT: i32 = 335544321;
 const GDS_INTEGER_DIVIDE: i32 = 335544778;
+/// `isc_exception_float_divide_by_zero` - SQLSTATE 22012
+const GDS_FLOAT_DIVIDE: i32 = 335544772;
+/// `isc_exception_float_overflow` - SQLSTATE 22003
+const GDS_FLOAT_OVERFLOW: i32 = 335544775;
 /// isc_convert_error - the engine's "conversion error from string" for a
 /// CAST that cannot convert (SQLSTATE 22018).
 const GDS_CONVERT_ERROR: i32 = 335544334;
@@ -12252,6 +12256,18 @@ fn eval_status_vector(w: &mut W, e: &EvalErr) {
                 .int(GDS_ARITH_EXCEPT)
                 .int(1) // isc_arg_gds
                 .int(GDS_INTEGER_DIVIDE);
+        }
+        EvalErr::FloatDivideByZero => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_ARITH_EXCEPT)
+                .int(1) // isc_arg_gds
+                .int(GDS_FLOAT_DIVIDE);
+        }
+        EvalErr::FloatOverflow => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_ARITH_EXCEPT)
+                .int(1) // isc_arg_gds
+                .int(GDS_FLOAT_OVERFLOW);
         }
         EvalErr::ConversionError(arg) => {
             w.int(1) // isc_arg_gds
@@ -13457,18 +13473,44 @@ fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
             // digit; the raw is the digits with the point removed, the
             // scale the negative of the fractional-digit count (trailing
             // zeros included, matching the engine)
+            let mut scale = 0i8;
+            let mut frac_start = *pos;
             if b.get(*pos) == Some(&'.') && b.get(*pos + 1).is_some_and(|c| c.is_ascii_digit()) {
                 *pos += 1; // '.'
-                let frac_start = *pos;
+                frac_start = *pos;
                 while *pos < b.len() && b[*pos].is_ascii_digit() {
                     *pos += 1;
                 }
+                scale = -((*pos - frac_start) as i8);
+            }
+            // an EXPONENT makes the literal APPROXIMATE, whatever it
+            // looks like otherwise: `1e3` is a DOUBLE 1000, not the
+            // integer (the engine types it that way, probed - its
+            // describe is a DOUBLE and it prints at 16 digits)
+            if b.get(*pos).is_some_and(|c| *c == 'e' || *c == 'E') {
+                let after = *pos + 1;
+                let digits_at = if b.get(after).is_some_and(|c| *c == '+' || *c == '-') {
+                    after + 1
+                } else {
+                    after
+                };
+                // an `e` with no digits after it is not an exponent -
+                // it starts the next token, and `pos` stays where it was
+                if b.get(digits_at).is_some_and(|c| c.is_ascii_digit()) {
+                    *pos = digits_at;
+                    while *pos < b.len() && b[*pos].is_ascii_digit() {
+                        *pos += 1;
+                    }
+                    let text: String = b[start..*pos].iter().collect();
+                    return text.parse::<f64>().ok().map(RawExpr::Double);
+                }
+            }
+            if scale != 0 {
                 let digits: String = b[start..frac_start - 1]
                     .iter()
                     .chain(&b[frac_start..*pos])
                     .collect();
                 let raw: i64 = digits.parse().ok()?;
-                let scale = -((*pos - frac_start) as i8);
                 return Some(RawExpr::Dec(raw, scale));
             }
             let n: i64 = b[start..*pos].iter().collect::<String>().parse().ok()?;
@@ -14392,6 +14434,14 @@ enum EvalErr {
     /// 42000 "must be zero or positive" on LPAD/RPAD/POSITION bounds -
     /// an error either way, never a wrong row
     InvalidLength(i64),
+    /// a floating-point division by zero: `isc_arith_except` +
+    /// `isc_exception_float_divide_by_zero` (SQLSTATE 22012). The engine
+    /// RAISES here - it does not answer an infinity - so this is one of
+    /// the places where returning a value would be the wrong answer
+    FloatDivideByZero,
+    /// a floating-point result past the double's range:
+    /// `isc_exception_float_overflow` (SQLSTATE 22003)
+    FloatOverflow,
     /// UPDATE OR INSERT without MATCHING on a table that has no
     /// primary key: `isc_dsql_error` + `isc_primary_key_required`
     /// (SQLSTATE 22000), the schema-qualified table name as the
@@ -15061,6 +15111,17 @@ impl Expr {
                 (ExprType::Int | ExprType::Numeric, ExprType::Int | ExprType::Numeric) => {
                     Some(ExprType::Numeric)
                 }
+                // ONE approximate operand makes the whole result
+                // approximate - the engine's descriptor promotion. There
+                // is no scale to carry: the result is a DOUBLE whichever
+                // width and scale came in
+                (
+                    ExprType::Approx,
+                    ExprType::Int | ExprType::Numeric | ExprType::Approx,
+                )
+                | (ExprType::Int | ExprType::Numeric, ExprType::Approx) => {
+                    Some(ExprType::Approx)
+                }
                 // DATE/TIMESTAMP plus-or-minus a number of days (the
                 // amount rounds half away, probed: D + 0.5 moves a
                 // day); a number + temporal commutes for Add
@@ -15516,6 +15577,37 @@ impl Expr {
                             scaled_value((*x as i128) / (*y as i128), 0)
                         }
                     }
+                } else if approx_of(&va).is_some() || approx_of(&vb).is_some() {
+                    // one approximate operand makes the arithmetic
+                    // approximate; the exact side converts to f64 first
+                    let f = |v: &Value| {
+                        approx_of(v).or_else(|| {
+                            numeric_parts(v)
+                                .map(|(raw, sc)| raw as f64 * 10f64.powi(sc as i32))
+                        })
+                    };
+                    let (x, y) = match (f(&va), f(&vb)) {
+                        (Some(x), Some(y)) => (x, y),
+                        _ => return Err(EvalErr::ConversionError(None)),
+                    };
+                    // the engine RAISES on both of these rather than
+                    // answering an IEEE infinity (probed: `DP / 0` is
+                    // SQLSTATE 22012, and a product past the range is
+                    // 22003) - so a value here would be a wrong answer,
+                    // not a lenient one
+                    if matches!(op, ArithOp::Div) && y == 0.0 {
+                        return Err(EvalErr::FloatDivideByZero);
+                    }
+                    let out = match op {
+                        ArithOp::Add => x + y,
+                        ArithOp::Sub => x - y,
+                        ArithOp::Mul => x * y,
+                        ArithOp::Div => x / y,
+                    };
+                    if !out.is_finite() {
+                        return Err(EvalErr::FloatOverflow);
+                    }
+                    Value::Double(out)
                 } else if let (Some((r1, s1)), Some((r2, s2))) =
                     (numeric_parts(&va), numeric_parts(&vb))
                 {
@@ -17066,17 +17158,42 @@ enum Tok {
 /// written fraction length as its (negative) scale, trailing zeros
 /// counting; otherwise it is a plain [Tok::Int].
 fn numeric_tok(s: &str, b: &[u8], start: usize, i: &mut usize) -> Option<Tok> {
+    let mut scale = 0i8;
     if b.get(*i) == Some(&b'.') && b.get(*i + 1).is_some_and(|c| c.is_ascii_digit()) {
         *i += 1;
         let fs = *i;
         while *i < b.len() && b[*i].is_ascii_digit() {
             *i += 1;
         }
-        let digits: String = s[start..*i].chars().filter(|c| *c != '.').collect();
-        Some(Tok::Dec(digits.parse().ok()?, -((*i - fs) as i8)))
-    } else {
-        Some(Tok::Int(s[start..*i].parse().ok()?))
+        scale = -((*i - fs) as i8);
     }
+    // an EXPONENT makes the literal APPROXIMATE, exactly as it does in
+    // the select list's parser: `1e3` is a DOUBLE 1000, not an integer.
+    // An `e` with no digits after it is not an exponent - it begins the
+    // next token, so `i` stays put.
+    if b.get(*i).is_some_and(|c| *c == b'e' || *c == b'E') {
+        let after = *i + 1;
+        let digits_at = if b.get(after).is_some_and(|c| *c == b'+' || *c == b'-') {
+            after + 1
+        } else {
+            after
+        };
+        if b.get(digits_at).is_some_and(|c| c.is_ascii_digit()) {
+            *i = digits_at;
+            while *i < b.len() && b[*i].is_ascii_digit() {
+                *i += 1;
+            }
+            return s[start..*i]
+                .parse::<f64>()
+                .ok()
+                .map(|d| Tok::FnExpr(RawExpr::Double(d)));
+        }
+    }
+    if scale != 0 {
+        let digits: String = s[start..*i].chars().filter(|c| *c != '.').collect();
+        return Some(Tok::Dec(digits.parse().ok()?, scale));
+    }
+    Some(Tok::Int(s[start..*i].parse().ok()?))
 }
 
 /// Tokenise a WHERE/HAVING clause. Single-quoted strings ('' escapes a
@@ -24672,6 +24789,81 @@ mod tests {
         ] {
             assert!(parse_raw_expr(bad).is_none(), "{bad} parsed");
         }
+    }
+
+    #[test]
+    fn approximate_arithmetic_promotes_and_raises() {
+        let descs = vec![Descriptor {
+            dtype: dtype::DOUBLE, scale: 0, length: 8, sub_type: 0, flags: 0, offset: 4,
+        }];
+        let row = vec![Value::Double(1.5)];
+        let bin = |a: Expr, op: ArithOp, b: Expr| Expr::Bin(Box::new(a), op, Box::new(b));
+
+        // ONE approximate operand types the whole result approximate -
+        // no scale to carry, whatever the other side was
+        let mixed = bin(Expr::Col(0), ArithOp::Add, Expr::Dec(1025, -2));
+        assert_eq!(mixed.type_of(&descs), Some(ExprType::Approx));
+        assert_eq!(mixed.eval(&row).unwrap(), Value::Double(11.75));
+        let exact = bin(Expr::Int(1), ArithOp::Add, Expr::Dec(1025, -2));
+        assert_eq!(exact.type_of(&descs), Some(ExprType::Numeric));
+
+        assert_eq!(
+            bin(Expr::Col(0), ArithOp::Mul, Expr::Int(2)).eval(&row).unwrap(),
+            Value::Double(3.0)
+        );
+        assert_eq!(
+            bin(Expr::Int(3), ArithOp::Div, Expr::Col(0)).eval(&row).unwrap(),
+            Value::Double(2.0)
+        );
+
+        // the engine RAISES here rather than answering an IEEE infinity
+        // or a NaN, and the two divide-by-zero errors are DIFFERENT gds
+        // codes carrying different message text
+        // (isc_exception_float_divide_by_zero vs the integer one) though
+        // they share SQLSTATE 22012
+        assert!(matches!(
+            bin(Expr::Col(0), ArithOp::Div, Expr::Int(0)).eval(&row),
+            Err(EvalErr::FloatDivideByZero)
+        ));
+        assert!(matches!(
+            bin(Expr::Int(1), ArithOp::Div, Expr::Int(0)).eval(&row),
+            Err(EvalErr::DivideByZero)
+        ));
+        assert!(matches!(
+            bin(Expr::Double(1e200), ArithOp::Mul, Expr::Double(1e200)).eval(&row),
+            Err(EvalErr::FloatOverflow)
+        ));
+        // a NULL operand is NULL, not an error - the NULL check runs
+        // BEFORE the zero divisor is looked at
+        assert_eq!(
+            bin(Expr::Null, ArithOp::Div, Expr::Int(0)).eval(&row).unwrap(),
+            Value::Null
+        );
+
+        // an EXPONENT makes a literal approximate; without one the same
+        // digits are an EXACT numeric, which is a different type and a
+        // different rendering
+        let lit = |s: &str| {
+            let b: Vec<char> = s.chars().collect();
+            let mut p = 0usize;
+            expr_atom(&b, &mut p)
+        };
+        assert!(matches!(lit("1e3"), Some(RawExpr::Double(d)) if d == 1000.0));
+        assert!(matches!(lit("1.5e-3"), Some(RawExpr::Double(d)) if d == 0.0015));
+        assert!(matches!(lit("1.5"), Some(RawExpr::Dec(15, -1))));
+        assert!(matches!(lit("3"), Some(RawExpr::Int(3))));
+        // an `e` with no digits after it is not an exponent - it begins
+        // the next token, and the number ends where it did
+        assert!(matches!(lit("1e"), Some(RawExpr::Int(1))));
+        assert!(matches!(lit("1.5e"), Some(RawExpr::Dec(15, -1))));
+
+        // the predicate tokenizer is a SECOND lexer and must agree
+        assert!(matches!(
+            tokenize("A > 1e3").unwrap()[2],
+            Tok::FnExpr(RawExpr::Double(_))
+        ));
+        assert!(matches!(tokenize("A > 1.5").unwrap()[2], Tok::Dec(15, -1)));
+        assert!(matches!(tokenize("A > 3").unwrap()[2], Tok::Int(3)));
     }
 
     #[test]

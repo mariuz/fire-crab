@@ -13,6 +13,41 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — approximate ARITHMETIC, and the literal that makes one
+
+### Converted
+- **Arithmetic over FLOAT and DOUBLE**: `DP * 2`, `DP / 3`, `DP + N`,
+  `I / DP`, nested and parenthesised, in a WHERE, under an aggregate, as
+  a GROUP BY key, in ORDER BY, in a subquery's value and on the right of
+  a SET. `Expr::Bin` had arms for integers, exact numerics and the
+  temporal types and nothing for this family.
+- **ONE approximate operand makes the whole result approximate** — the
+  engine's descriptor promotion. `DP + N` is a DOUBLE, not a
+  NUMERIC(9,2), and there is no scale to carry.
+- **An EXPONENT makes a literal approximate**, whatever the digits look
+  like: `1e3` is a DOUBLE 1000, not the integer, and `1.5e0` is a DOUBLE
+  where a bare `1.5` is an exact NUMERIC. Both lexers learned it — the
+  select list's character parser and the predicate tokenizer — because
+  either one alone would make the same literal mean two things.
+
+### Guarded
+- **The engine RAISES on float division by zero and on overflow.** It
+  does not answer an IEEE infinity or a NaN, so a value there would be a
+  wrong answer rather than a lenient one: new `EvalErr::FloatDivideByZero`
+  (`isc_exception_float_divide_by_zero`) and `EvalErr::FloatOverflow`
+  (`isc_exception_float_overflow`), each with its own gds code. The
+  integer divide-by-zero shares SQLSTATE 22012 but is a different code
+  with different text, and the gate checks the two do not collapse into
+  one.
+- A NULL operand is still NULL, never a division error — the NULL check
+  runs before the divisor is looked at.
+
+`qa/serve-real-approxmath.sh` (39 checks, twin servers). Every arithmetic
+result is concatenated into TEXT before comparing, so the check sees the
+engine's own rendering: an exact 11.75 and an approximate
+11.75000000000000 are the same number to a driver that decodes both into
+a JS number, and the promotion is only visible in the digits.
+
 ## 2026-07-30 — CAST's target list, and how an approximate number PRINTS
 
 ### Converted
