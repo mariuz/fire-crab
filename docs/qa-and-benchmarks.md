@@ -6831,6 +6831,47 @@ fine), so `serve-real-jointypes.sh` avoids that shape and says why; the older
 join gate compares projections against isql's text instead, which is why it is
 built the way it is.
 
+### Aggregates and GROUP BY over a join (`qa/serve-real-joingroup.sh`, 18 checks)
+
+A join answered projections, WHERE and ORDER BY, and exactly one aggregate
+shape: a lone `COUNT(*)`, counted at prepare. Everything else refused. The
+fold it needed already existed for a single relation, so most of this slice is
+a SPLIT rather than new logic: `group_output` became a scan plus a `group_rows`
+fold, and the select-list item rules became `build_group_items`. Only the input
+differs — `join_rows` produces what the scan produced there.
+
+**Where the joined case is genuinely different is the NAMES.** A single
+relation's grouping resolves items against its own columns. A join's combined
+view drops ambiguous names on purpose, so a bare `ID` means nothing when both
+sides have one — and `GROUP BY D.ID` is the natural way to write it. The view
+now carries the QUALIFIED spelling of every column alongside the bare one; the
+qualified form is never ambiguous, because the two side keys differ. A key
+describes by its column name with the qualifier dropped, which is what the
+engine answers.
+
+Two smaller gaps fell out of the same place: `GROUP BY D.ID` was read as an
+EXPRESSION key (a dotted name is not an identifier), and so was `SUM(E.SALARY)`
+— the item parser made it an expression ARGUMENT for the same reason.
+
+**What the fixture is for.** Every aggregate here is over the join, so the
+three employees with no department and the department with no employees are
+what separate an inner fold from an outer one. `GROUP BY D.ID` over a LEFT join
+has a NULL group of exactly those three; `COUNT(D.ID)` over it counts 97 where
+`COUNT(*)` counts 100. A join that leaked an unmatched row would still produce
+plausible-looking groups — only the totals say otherwise.
+
+**Five of this gate's own first-draft checks were wrong, not the server.** Two
+selected two columns both titled COUNT, and this driver keys a row by column
+name, so one clobbered the other and the comparison saw one value where the
+reference had two. One grouped by a name that is a column of BOTH tables, where
+the engine correctly raises "Ambiguous field name" (that became a refusal check
+instead). And two ordered the REFERENCE query by something other than the key
+the data was grouped on — one by an ordinal that did not exist in a
+single-column reference, one by the rendered text of a COALESCE, where
+`'<null>'` sorts after the digits while a NULL key sorts before them. Each
+looked exactly like a server bug until read closely, which is the argument for
+writing the reference query as the same question rather than a convenient one.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

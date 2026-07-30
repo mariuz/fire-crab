@@ -13,6 +13,43 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — aggregates and GROUP BY over a JOIN
+
+### Converted
+- **`SELECT SUM(E.SALARY) FROM EMP E JOIN DEPT D ON ...`** and the
+  grouped form — `GROUP BY`, `HAVING`, `ORDER BY` over the groups, on an
+  INNER or an OUTER join. Only a lone `COUNT(*)` worked before; every
+  other aggregate shape refused.
+- The fold is the SAME machinery a single relation's grouping uses.
+  `group_output` split into a scan and a `group_rows` fold, and the
+  select-list item rules (a bare column must be a group key, an
+  expression item must BE one of the expression keys, an aggregate's
+  output type follows its function and source) came out as
+  `build_group_items`. Only the INPUT differs: `join_rows` produces what
+  the scan produced there.
+- **The combined view now carries QUALIFIED names too.** That is what
+  lets a grouped join name `D.ID` when BOTH sides have an ID — the bare
+  name is ambiguous and dropped, so only the qualified spelling can mean
+  one of them. A qualified key describes by its column name with the
+  qualifier dropped, as the engine does.
+- Along the way: `GROUP BY D.ID` (a qualified key, which the group
+  parser read as an expression), and `SUM(E.SALARY)` (a qualified
+  aggregate argument, which the item parser read as an expression
+  argument because a dotted name is not an identifier).
+
+`qa/serve-real-joingroup.sh` (18 checks) runs against the same scratch
+database, where the three employees with no department and the
+department with no employees are what tell an inner fold from an outer
+one: `GROUP BY D.ID` over a LEFT join has a NULL group of exactly those
+three, and `COUNT(D.ID)` over it counts 97 where `COUNT(*)` counts 100.
+
+Five of the gate's own first-draft checks were wrong rather than the
+server: two selected two columns both titled COUNT (this driver keys a
+row by name, so one clobbered the other), one grouped by a name that is
+a column of BOTH tables, and two ordered the reference query by
+something other than the key the data was grouped on. Worth recording
+because each looked exactly like a server bug until read closely.
+
 ## 2026-07-30 — the join gates, restored and what they found
 
 ### Fixed

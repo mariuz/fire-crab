@@ -1459,6 +1459,29 @@ AlterDomainRename {
         filter: Option<Predicate>,
         order_by: Vec<OrderKey>,
     },
+    /// A grouped or aggregated JOIN: the combined rows a `Join` produces,
+    /// folded by the same machinery `Group` uses. Kept as its own variant
+    /// rather than an option on `Join` because the two emit different
+    /// SHAPES - a join emits its combined rows, this emits one row per
+    /// group.
+    JoinGroup {
+        kind: JoinKind,
+        left_rel: u16,
+        left_formats: Vec<(u8, Vec<Descriptor>)>,
+        left_width: usize,
+        right_rel: u16,
+        right_formats: Vec<(u8, Vec<Descriptor>)>,
+        right_width: usize,
+        on: Vec<(usize, usize)>,
+        cols: Vec<ProjCol>,
+        gitems: Vec<GItem>,
+        key_fids: Vec<usize>,
+        key_exprs: Vec<Expr>,
+        synth_base: usize,
+        filter: Option<Predicate>,
+        having: Option<Predicate>,
+        order_by: Vec<OrderKey>,
+    },
     Group {
         rel: u16,
         formats: Vec<(u8, Vec<Descriptor>)>,
@@ -9186,7 +9209,10 @@ fn resolve_index_ops(db: &Database, rel: u16, descs: &[Descriptor]) -> Option<Ve
 /// row set at fetch. Plans without parameters validate trivially.
 fn validate_select_bind(plan: &Plan, args: &[WireParam]) -> Result<(), String> {
     match plan {
-        Plan::Project { filter, .. } | Plan::Group { filter, .. } | Plan::Join { filter, .. } => {
+        Plan::Project { filter, .. }
+        | Plan::Group { filter, .. }
+        | Plan::JoinGroup { filter, .. }
+        | Plan::Join { filter, .. } => {
             bind_filter(filter, args).map(|_| ())
         }
         _ => Ok(()),
@@ -9420,18 +9446,31 @@ fn parse_on(on_s: &str, sides: &[JoinSide; 2]) -> Option<Vec<(usize, usize)>> {
 
 /// Resolve a WHERE predicate against the two join sides (combined row
 /// indexes). Aggregates are invalid here, exactly as in the single-table
-/// resolver; `?` terms register parameter slots the same way.
-fn resolve_join_predicate(
-    raw: Vec<Vec<RawTerm>>,
-    sides: &[JoinSide; 2],
-    params: &mut Vec<Option<Descriptor>>,
-) -> Option<Predicate> {
-    // a SYNTHETIC single-relation view of the combined row, for the
-    // expression-term resolver: each side's columns at their combined
-    // indexes (bare names only - an AMBIGUOUS name is dropped from the
-    // view, so an expression naming it refuses rather than guessing a
-    // side; qualified names in join expressions are a later slice),
-    // and the descriptors laid out by combined index
+/// A joined row as if it were ONE relation's: each side's columns at
+/// their combined indexes, and the descriptors laid out by that index.
+/// Bare names only - an AMBIGUOUS one is dropped from the view, so
+/// Strip the table qualifier off every column name in a raw expression -
+/// what a JOIN's grouping needs, because its combined view holds bare
+/// names (an AMBIGUOUS one is not in the view at all, so it refuses).
+fn unqualify_raw(e: &RawExpr) -> RawExpr {
+    let nb = |b: &RawExpr| Box::new(unqualify_raw(b));
+    let nv = |v: &[RawExpr]| v.iter().map(unqualify_raw).collect();
+    match e {
+        RawExpr::Col(n) if n.contains('.') => {
+            RawExpr::Col(n.rsplit('.').next().unwrap_or(n).to_string())
+        }
+        RawExpr::Neg(a) => RawExpr::Neg(nb(a)),
+        RawExpr::Bin(a, op, b) => RawExpr::Bin(nb(a), *op, nb(b)),
+        RawExpr::Concat(a, b) => RawExpr::Concat(nb(a), nb(b)),
+        RawExpr::Cast(a, t) => RawExpr::Cast(nb(a), *t),
+        RawExpr::Coalesce(v) => RawExpr::Coalesce(nv(v)),
+        RawExpr::Func(f, v) => RawExpr::Func(f.clone(), nv(v)),
+        other => other.clone(),
+    }
+}
+
+/// anything naming it refuses rather than guessing a side.
+fn combined_view(sides: &[JoinSide; 2]) -> (Vec<RelationColumn>, Vec<Descriptor>) {
     let mut comb_cols: Vec<RelationColumn> = Vec::new();
     let mut comb_descs: Vec<Descriptor> = Vec::new();
     for side in sides.iter() {
@@ -9446,6 +9485,14 @@ fn resolve_join_predicate(
             if let Some(d) = side.descs.get(rc.field_id as usize) {
                 comb_descs[idx] = d.clone();
             }
+            // the QUALIFIED name is never ambiguous - the two side keys
+            // differ - so it is always in the view. That is what lets a
+            // grouped join name `D.ID` when both sides have an ID.
+            comb_cols.push(RelationColumn {
+                name: format!("{}.{}", side.key, rc.name),
+                field_id: idx as u16,
+                position: idx as u16,
+            });
             if let Some(prev) = comb_cols
                 .iter()
                 .position(|c| c.name.eq_ignore_ascii_case(&rc.name))
@@ -9460,6 +9507,22 @@ fn resolve_join_predicate(
             }
         }
     }
+    (comb_cols, comb_descs)
+}
+
+/// resolver; `?` terms register parameter slots the same way.
+fn resolve_join_predicate(
+    raw: Vec<Vec<RawTerm>>,
+    sides: &[JoinSide; 2],
+    params: &mut Vec<Option<Descriptor>>,
+) -> Option<Predicate> {
+    // a SYNTHETIC single-relation view of the combined row, for the
+    // expression-term resolver: each side's columns at their combined
+    // indexes (bare names only - an AMBIGUOUS name is dropped from the
+    // view, so an expression naming it refuses rather than guessing a
+    // side; qualified names in join expressions are a later slice),
+    // and the descriptors laid out by combined index
+    let (comb_cols, comb_descs) = combined_view(sides);
     let mut groups = Vec::new();
     for g in raw {
         let mut terms = Vec::new();
@@ -9535,6 +9598,8 @@ fn plan_join(
     right: &TableRef<'_>,
     on_s: &str,
     where_s: Option<&str>,
+    group_s: Option<&str>,
+    having_s: Option<&str>,
     order_s: Option<&str>,
     db: &Database,
     params: &mut Vec<Option<Descriptor>>,
@@ -9582,6 +9647,84 @@ fn plan_join(
                 .and_then(|raw| resolve_join_predicate(raw, &sides, params))?,
         ),
     };
+
+    // An AGGREGATE in the projection (or any GROUP BY) folds the joined
+    // rows instead of emitting them. The fold is the same machinery a
+    // single relation's grouping uses; only the INPUT differs, so the
+    // items resolve against the joined row seen as one relation.
+    let items: Option<&[SelItem]> = match proj {
+        Proj::Items(v) => Some(v.as_slice()),
+        Proj::Star => None,
+    };
+    let grouped = group_s.is_some()
+        || items.is_some_and(|v| v.iter().any(|i| matches!(i, SelItem::Agg(..))));
+    if grouped {
+        let items = items?;
+        let (comb_cols, comb_descs) = combined_view(&sides);
+        // The view carries BOTH spellings of every column - bare (unless
+        // ambiguous) and qualified - so items keep the names they were
+        // written with. The one rewrite still needed is for an
+        // aggregate whose argument is a qualified column: a qualified
+        // name is not `ident_ok`, so the item parser read `SUM(E.SALARY)`
+        // as an EXPRESSION argument rather than a column.
+        let items: Vec<SelItem> = items
+            .iter()
+            .map(|it| match it {
+                SelItem::Agg(f, AggTarget::Expr(RawExpr::Col(n)), a) if n.contains('.') => {
+                    SelItem::Agg(*f, AggTarget::Col(n.clone()), a.clone())
+                }
+                other => other.clone(),
+            })
+            .collect();
+        let synth_base = comb_descs.len();
+        let (key_fids, key_exprs) = match group_s {
+            None => (Vec::new(), Vec::new()),
+            Some(g) => parse_group_by(g, &items, &comb_cols, &comb_descs, synth_base)?,
+        };
+        let (cols, mut gitems) =
+            build_group_items(&items, &comb_cols, &comb_descs, &key_fids, &key_exprs, synth_base)?;
+        let mut having_np = 0usize;
+        let having = match having_s {
+            None => None,
+            Some(hs) => Some(
+                tokenize(hs)
+                    .and_then(|t| parse_predicate(&t, &mut having_np))
+                    .and_then(|raw| {
+                        resolve_having(raw, &mut gitems, &key_fids, &comb_cols, &comb_descs)
+                    })?,
+            ),
+        };
+        // ORDER BY sorts the OUTPUT rows, so its names are the output
+        // columns' - the same rule the single-relation grouping follows
+        let order_by = match order_s {
+            None => Vec::new(),
+            Some(os) => parse_order_by(os, &cols, |n| {
+                let bare = n.rsplit('.').next().unwrap_or(n);
+                cols.iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(bare))
+                    .filter(|&p| matches!(gitems.get(p), Some(GItem::Key(_))))
+            })?,
+        };
+        let [l, r] = sides;
+        return Some(Plan::JoinGroup {
+            kind,
+            left_rel: l.rel,
+            left_formats: l.formats,
+            left_width: l.descs.len(),
+            right_rel: r.rel,
+            right_formats: r.formats,
+            right_width: r.descs.len(),
+            on,
+            cols,
+            gitems,
+            key_fids,
+            key_exprs: key_exprs.into_iter().map(|(_, e)| e).collect(),
+            synth_base,
+            filter,
+            having,
+            order_by,
+        });
+    }
 
     let mut cols = Vec::new();
     match proj {
@@ -10659,14 +10802,18 @@ fn plan_query_inner(
         return None;
     };
     if let Some((kind, right, on_s)) = join {
-        // a join supports projections, WHERE and ORDER BY; the one
-        // aggregate shape is a lone COUNT(*), counted at prepare.
-        // GROUP BY/HAVING over a join fall back.
-        if group_s.is_some() || having_s.is_some() {
-            return None;
-        }
+        // A join supports projections, WHERE, GROUP BY/HAVING and ORDER
+        // BY. A lone unaliased COUNT(*) keeps its prepare-time fast path
+        // (it answers a scalar, which is what the engine describes);
+        // every other aggregate shape folds the joined rows at fetch.
         if let Proj::Items(items) = &proj {
             if let [SelItem::Agg(AggFn::Count, AggTarget::Star, None)] = items.as_slice() {
+                if group_s.is_some() || having_s.is_some() {
+                    return plan_join(
+                        &proj, kind, &left, &right, on_s, where_s, group_s, having_s,
+                        order_s, db, params,
+                    );
+                }
                 if order_s.is_some() {
                     return None;
                 }
@@ -10681,7 +10828,7 @@ fn plan_query_inner(
                     on,
                     filter,
                     ..
-                }) = plan_join(&Proj::Star, kind, &left, &right, on_s, where_s, None, db, params)
+                }) = plan_join(&Proj::Star, kind, &left, &right, on_s, where_s, None, None, None, db, params)
                 {
                     // counted at prepare, so a parameterised WHERE (whose
                     // values only arrive at execute) cannot be honoured
@@ -10698,7 +10845,7 @@ fn plan_query_inner(
                 return None;
             }
         }
-        return match plan_join(&proj, kind, &left, &right, on_s, where_s, order_s, db, params) {
+        return match plan_join(&proj, kind, &left, &right, on_s, where_s, group_s, having_s, order_s, db, params) {
             Some(p) => Some(p),
             None => {
                 if trace { eprintln!("[srv] plan: JOIN plan failed"); }
@@ -10943,45 +11090,22 @@ fn plan_query_inner(
     }
 }
 
-/// Build a `Plan::Group`. With a GROUP BY every bare select-list column
-/// must be one of the group keys (anything else is invalid SQL); with no
-/// GROUP BY (a multi-aggregate projection, or a lone aggregate with a
-/// HAVING) there are no keys, the whole table is one group, and a bare
-/// column is invalid. MIN/MAX/SUM need an integer column; COUNT takes any
-/// column or `*`. HAVING resolves against the output items, appending
-/// hidden ones for aggregates/keys it names that the select list does
-/// not. Returns None on any unresolvable or invalid piece - the caller
-/// falls back.
+/// Build a grouped projection's OUTPUT COLUMNS and fold items from the
+/// select list. Shared by the single-relation planner and the JOIN one:
+/// the only thing that differs between them is which `columns`/`descs`
+/// the names resolve against - a relation's, or the combined view of a
+/// joined row - so the item rules (a bare column must be a group key, an
+/// expression item must BE one of the expression keys, an aggregate's
+/// output type follows its function and source) live here once.
 #[allow(clippy::too_many_arguments)]
-fn plan_group(
+fn build_group_items(
     items: &[SelItem],
-    group_s: Option<&str>,
-    having_s: Option<&str>,
-    order_s: Option<&str>,
-    rel: u16,
-    formats: Vec<(u8, Vec<Descriptor>)>,
     columns: &[RelationColumn],
     descs: &[Descriptor],
-    filter: Option<Predicate>,
-) -> Option<Plan> {
-    // grouping decodes records, which needs the relation's formats: a
-    // relation without any (a system relation) cannot be answered here -
-    // falling back beats emitting empty or miscounted groups
-    if formats.is_empty() {
-        return None;
-    }
-    // synthetic value slots for expression keys start past every
-    // format's real fields (the gen_base convention)
-    let synth_base = formats
-        .iter()
-        .map(|(_, d)| d.len())
-        .max()
-        .unwrap_or(0)
-        .max(descs.len());
-    let (key_fids, key_exprs) = match group_s {
-        None => (Vec::new(), Vec::new()),
-        Some(g) => parse_group_by(g, items, columns, descs, synth_base)?,
-    };
+    key_fids: &[usize],
+    key_exprs: &[(RawExpr, Expr)],
+    synth_base: usize,
+) -> Option<(Vec<ProjCol>, Vec<GItem>)> {
     let mut gitems = Vec::new();
     let mut cols = Vec::new();
     for (out_idx, item) in items.iter().enumerate() {
@@ -11024,7 +11148,12 @@ fn plan_group(
                 }
                 let (wire, sql_type, length, scale, sub_type) = wire_for(descs.get(fid)?);
                 cols.push(ProjCol {
-                    name: alias.clone().unwrap_or_else(|| rc.name.clone()),
+                    // the engine describes a grouped key by its COLUMN
+                    // name, qualifier dropped (probed: `GROUP BY D.ID`
+                    // answers a column titled ID)
+                    name: alias.clone().unwrap_or_else(|| {
+                        rc.name.rsplit('.').next().unwrap_or(&rc.name).to_string()
+                    }),
                     field_id: out_idx,
                     wire,
                     sql_type: nullable(sql_type),
@@ -11179,6 +11308,51 @@ fn plan_group(
             }
         }
     }
+    Some((cols, gitems))
+}
+
+
+/// Build a `Plan::Group`. With a GROUP BY every bare select-list column
+/// must be one of the group keys (anything else is invalid SQL); with no
+/// GROUP BY (a multi-aggregate projection, or a lone aggregate with a
+/// HAVING) there are no keys, the whole table is one group, and a bare
+/// column is invalid. MIN/MAX/SUM need an integer column; COUNT takes any
+/// column or `*`. HAVING resolves against the output items, appending
+/// hidden ones for aggregates/keys it names that the select list does
+/// not. Returns None on any unresolvable or invalid piece - the caller
+/// falls back.
+#[allow(clippy::too_many_arguments)]
+fn plan_group(
+    items: &[SelItem],
+    group_s: Option<&str>,
+    having_s: Option<&str>,
+    order_s: Option<&str>,
+    rel: u16,
+    formats: Vec<(u8, Vec<Descriptor>)>,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    filter: Option<Predicate>,
+) -> Option<Plan> {
+    // grouping decodes records, which needs the relation's formats: a
+    // relation without any (a system relation) cannot be answered here -
+    // falling back beats emitting empty or miscounted groups
+    if formats.is_empty() {
+        return None;
+    }
+    // synthetic value slots for expression keys start past every
+    // format's real fields (the gen_base convention)
+    let synth_base = formats
+        .iter()
+        .map(|(_, d)| d.len())
+        .max()
+        .unwrap_or(0)
+        .max(descs.len());
+    let (key_fids, key_exprs) = match group_s {
+        None => (Vec::new(), Vec::new()),
+        Some(g) => parse_group_by(g, items, columns, descs, synth_base)?,
+    };
+    let (cols, mut gitems) =
+        build_group_items(items, columns, descs, &key_fids, &key_exprs, synth_base)?;
     // HAVING filters the computed output rows (may append hidden gitems);
     // `?` in HAVING is not supported - the resolver refuses the slots
     // (the throwaway counter just satisfies the parser)
@@ -11305,6 +11479,18 @@ fn parse_group_by(
                     continue;
                 }
                 _ => return None,
+            }
+        } else if name.matches('.').count() == 1
+            && name.split('.').all(|p| ident_ok(p.trim_matches('"')))
+        {
+            // A QUALIFIED key - `GROUP BY D.ID`. A join's combined view
+            // carries the qualified spelling, so it is tried first; a
+            // single relation has no qualifiers, so the part after the
+            // dot is what names its column.
+            if columns.iter().any(|c| c.name.eq_ignore_ascii_case(name)) {
+                name
+            } else {
+                name.split('.').nth(1)?.trim_matches('"')
             }
         } else if ident_ok(name) {
             // a bare name is a COLUMN, or one of the select list's
@@ -11811,6 +11997,23 @@ fn group_output(
     if let Some(e) = ferr {
         return Err(e);
     }
+    group_rows(input, gitems, key_fids, key_exprs, synth_base, having)
+}
+
+/// Fold already-collected rows into grouped output. Split out of
+/// [group_output] so the JOIN planner can group the COMBINED rows a join
+/// produces: everything after the scan - the expression keys, the
+/// bucketing sort, the per-group fold and HAVING - is the same work
+/// whether the rows came from one relation's pages or from two joined
+/// ones.
+fn group_rows(
+    mut input: Vec<Vec<Value>>,
+    gitems: &[GItem],
+    key_fids: &[usize],
+    key_exprs: &[Expr],
+    synth_base: usize,
+    having: &Option<Predicate>,
+) -> Result<Vec<Vec<Value>>, EvalErr> {
     // expression keys: evaluate each into its synthetic slot, so the
     // bucketing sort and the Key output items read it like a field.
     // The filter above ran on the ORIGINAL row; an eval error here
@@ -12034,7 +12237,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         Plan::Update { .. } => describe_dml(3, params), // isc_info_sql_stmt_update
         Plan::Delete { .. } => describe_dml(4, params), // isc_info_sql_stmt_delete
         Plan::Project { cols, .. } => build_describe(cols, params),
-        Plan::Join { cols, .. } => build_describe(cols, params),
+        Plan::Join { cols, .. } | Plan::JoinGroup { cols, .. } => build_describe(cols, params),
         Plan::Group { cols, .. } => build_describe(cols, params),
         Plan::VirtualEmpty { .. } => build_describe(&output_cols_of(plan), params),
         Plan::Rows { cols, .. } => build_describe(cols, params),
@@ -12073,6 +12276,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::GenIdIncrement { .. }
         | Plan::Project { .. }
         | Plan::Join { .. }
+        | Plan::JoinGroup { .. }
         | Plan::Group { .. }
         | Plan::Refused
         | Plan::RefusedEval(_)
@@ -12129,7 +12333,10 @@ fn bigint_col(n: usize) -> ProjCol {
 /// as one BIGINT column.
 fn output_cols_of(plan: &Plan) -> Vec<ProjCol> {
     match plan {
-        Plan::Project { cols, .. } | Plan::Join { cols, .. } | Plan::Group { cols, .. } => {
+        Plan::Project { cols, .. }
+        | Plan::Join { cols, .. }
+        | Plan::JoinGroup { cols, .. }
+        | Plan::Group { cols, .. } => {
             cols.clone()
         }
         Plan::Scalar(_, name) => vec![ProjCol {
@@ -12235,6 +12442,7 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
             | Plan::GenIdIncrement { .. }
             | Plan::Project { .. }
             | Plan::Join { .. }
+            | Plan::JoinGroup { .. }
             | Plan::Group { .. }
             | Plan::VirtualEmpty { .. }
     );
@@ -12303,6 +12511,7 @@ fn answer_info_sql(items: &[u8], plan: &Plan, last_dml: (i32, i32, i32)) -> Vec<
             | Plan::GenIdIncrement { .. }
             | Plan::Project { .. }
             | Plan::Join { .. }
+            | Plan::JoinGroup { .. }
             | Plan::Group { .. }
             | Plan::VirtualEmpty { .. }
     );
@@ -12798,6 +13007,44 @@ fn emit_rows_inner(
                 }
             }
         }
+        // the joined rows, folded by the same machinery a single
+        // relation's grouping uses - `join_rows` produces the input that
+        // `group_output`'s scan produces there
+        Plan::JoinGroup {
+            kind,
+            left_rel,
+            left_formats,
+            left_width,
+            right_rel,
+            right_formats,
+            right_width,
+            on,
+            cols,
+            gitems,
+            key_fids,
+            key_exprs,
+            synth_base,
+            filter,
+            having,
+            order_by,
+        } => {
+            if let Some(db) = db {
+                let filter = bind_filter(filter, args)?;
+                let input = join_rows(
+                    db, *kind, *left_rel, left_formats, *left_width, *right_rel,
+                    right_formats, *right_width, on, &filter,
+                );
+                let mut rows =
+                    group_rows(input, gitems, key_fids, key_exprs, *synth_base, having)
+                        .map_err(EmitErr::Eval)?;
+                if !order_by.is_empty() {
+                    rows.sort_by(|a, b| order_cmp(a, b, order_by));
+                }
+                for values in &rows {
+                    encode_row(w, cols, values)?;
+                }
+            }
+        }
         Plan::Group {
             rel,
             formats,
@@ -13132,6 +13379,7 @@ fn strip_gen_name(arg: &str) -> String {
     }
 }
 
+#[derive(Clone)]
 enum SelItem {
     /// a column, and the ALIAS it is described by when it has one -
     /// `NAME AS X` and `NAME X` both name the output column X, and two

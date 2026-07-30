@@ -1221,6 +1221,23 @@ them.
   of the same classification - learned none of them, and nothing noticed
   because its gate could not run.
 
+- **When a second input needs the same fold, split the function, do not
+  copy it.** Grouping over a join is grouping - the only difference is
+  where the rows come from. Splitting the scan from the fold (and the
+  item rules from both) meant the joined case inherited every rule the
+  single-relation one had learned over a dozen increments, including the
+  ones nobody remembers writing.
+- **Ambiguity is the joined case's real difference.** Names, not
+  semantics: a bare column that means one thing over one table means
+  nothing over two. Carry BOTH spellings - bare where unambiguous,
+  qualified always - and let the resolver refuse what it cannot place.
+- **Write the reference query as the same QUESTION, not a convenient
+  one.** Five checks in one gate failed because the reference ordered by
+  a rendered COALESCE, or by an ordinal a single-column reference did
+  not have, or selected two columns the driver keys by the same name.
+  Every one looked like a server bug. If the reference has to be written
+  differently, make the DIFFERENCE the thing you reason about.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with
