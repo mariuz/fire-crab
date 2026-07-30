@@ -1249,6 +1249,17 @@ them.
   because nothing checked the TAIL. Both ends of a split are the same
   question.
 
+- **A special-cased sub-language will fall behind the general one.**
+  The ON clause was a list of equality pairs over Int-or-Text columns
+  while the WHERE clause learned four numeric families, three temporal
+  ones and booleans. Resolving the ON with the WHERE's own code did not
+  just add operators - it inherited every rule the other had learned,
+  and deleted the NULL handling that had to be written twice.
+- **A gate that fails EVERYWHERE at once is usually not a regression.**
+  Both times it happened here the binary was stale: `cargo test` leaves
+  `target/release/` untouched when the test file does not compile, so
+  the gates exercised the previous build. Rebuild before you debug.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

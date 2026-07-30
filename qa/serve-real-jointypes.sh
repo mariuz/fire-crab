@@ -128,6 +128,27 @@ where "a bare BOOLEAN column" "B"
 where "IS TRUE over one" "B IS TRUE"
 where "IS NOT TRUE keeps its NULL row" "B IS NOT TRUE"
 
+# --- the ON condition beyond equality ----------------------------------
+# The ON is a PREDICATE over the joined row, not a list of equality
+# pairs, so a theta join and a disjunctive one are the same shape as the
+# equi-join everyone writes. Each of these was refused before.
+on_cmp() { # <label> <on condition>
+    both "$1" "SELECT A.ID FROM A JOIN C ON $2 ORDER BY A.ID"
+}
+on_cmp "the equi-join, as the control" "A.K = C.K"
+on_cmp "a theta join with >" "A.K > C.K"
+on_cmp "with >=" "A.K >= C.K"
+on_cmp "with <>" "A.K <> C.K"
+on_cmp "an AND of two different operators" "A.K = C.K AND A.ID > C.K"
+on_cmp "an OR in the ON" "A.K = C.K OR A.ID = 1"
+# a NULL key never joins, whatever the operator - the comparison is
+# UNKNOWN, so the row is padded by an outer join and dropped by an
+# inner. Row 4's AMT is NULL, so it is the padded one.
+both "a NULL key never joins (inner drops it)" \
+     "SELECT A.ID FROM A JOIN C ON A.AMT = C.AMT2 ORDER BY A.ID"
+both "... and the outer join pads it" \
+     "SELECT A.ID, C.K FROM A LEFT JOIN C ON A.AMT = C.AMT2 ORDER BY A.ID"
+
 # --- combinations, and the other side ----------------------------------
 where "two families in one predicate" "AMT > 10 AND D > DATE'2019-01-01'"
 where "a NUMERIC on the RIGHT-hand table" "AMT2 > 50"

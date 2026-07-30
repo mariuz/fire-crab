@@ -13,6 +13,34 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — the ON clause is a predicate, not a list of pairs
+
+### Converted
+- **`ON` beyond equality**: `ON A.K > C.K` (a theta join), `<>`, `>=`,
+  an `AND` mixing operators, and an `OR` in the ON. All refused before.
+- **`ON` over any column family** — NUMERIC, DATE, DOUBLE, BOOLEAN —
+  where it accepted only INTEGER and TEXT keys.
+- The ON is now resolved by the SAME code the WHERE clause uses and
+  evaluated over the concatenated row, instead of being a list of
+  `(left index, right index)` equality pairs. NULL semantics come out
+  unchanged for free: a comparison with NULL is UNKNOWN, `matches`
+  answers false, and an unmatched row is padded by an outer join exactly
+  as before.
+
+### Fixed
+- **A join's evaluation errors were collected and dropped.** `join_rows`
+  accumulated an error from the WHERE into a local and returned the rows
+  it had computed anyway — a wrong answer with no error attached. It
+  returns a `Result` now, and the ON's errors travel the same way.
+
+### Guarded
+- A `?` in an ON refuses: the parameter would have to bind before the
+  join runs, and this server has no path for that.
+
+`qa/serve-real-jointypes.sh` grew from 20 checks to 28, with the new
+operators alongside the equi-join they generalise, and both halves of
+the NULL-key rule — an inner join drops the row, an outer join pads it.
+
 ## 2026-07-30 — the other half of the condition/value duality
 
 ### Converted

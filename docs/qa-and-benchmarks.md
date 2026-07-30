@@ -6905,6 +6905,39 @@ instead of 51, which nobody would notice. It now COUNTS what it ran and fails
 if the count is short. Worth doing everywhere a gate is edited often: a gate
 that can silently skip is a gate that can silently pass.
 
+### The ON clause is a predicate (`qa/serve-real-jointypes.sh`, 28 checks)
+
+`parse_on` built a list of `(left index, right index)` equality pairs, and
+`join_rows` compared those indexes directly. That is the join everyone writes
+and not the join the engine answers: `ON A.K > C.K` is a theta join, an `OR` in
+an ON is a disjunctive one, and a NUMERIC or DATE or BOOLEAN key is just a key
+— all of them refused.
+
+The ON is now resolved by the same code the WHERE clause uses and evaluated
+over the concatenated row. The pair list is gone, and with it the special
+casing: every column family the predicate resolver has learned since works in
+an ON for free, and so does every operator.
+
+**The NULL rule survives without being written down twice.** The old code
+excluded NULLs explicitly (`!matches!(a, Value::Null) && ...`). The new one does
+not have to: a comparison with NULL is UNKNOWN, `Predicate::matches` answers
+false to UNKNOWN, and an unmatched left row is padded by an outer join exactly
+as before. The gate checks both halves — an inner join drops the NULL-keyed
+row, an outer join pads it.
+
+**And a silent swallow, fixed on the way past.** `join_rows` accumulated an
+evaluation error from the WHERE into a local variable and then returned the
+rows it had computed anyway. A divide-by-zero in a join's filter produced a
+short result set and no error. It returns a `Result` now, and the ON's errors
+travel the same channel.
+
+**Two hours lost to a stale binary, twice.** `cargo test` builds the test
+binaries; when the test file does not compile it leaves `target/release/fcwire`
+untouched, so a gate run afterwards exercises the PREVIOUS build. Both times
+the symptom was a gate failing everywhere at once — which reads exactly like a
+catastrophic regression and is worth recognising on sight. `cargo build
+--release` before running gates, always.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

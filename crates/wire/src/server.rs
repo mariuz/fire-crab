@@ -1454,7 +1454,10 @@ AlterDomainRename {
         right_rel: u16,
         right_formats: Vec<(u8, Vec<Descriptor>)>,
         right_width: usize,
-        on: Vec<(usize, usize)>,
+        /// the ON condition, evaluated over the CONCATENATED row - not a
+        /// list of equality pairs, so `ON A.K > C.K` and a NUMERIC or
+        /// DATE key are the same shape as `ON A.K = C.K`
+        on: Predicate,
         cols: Vec<ProjCol>,
         filter: Option<Predicate>,
         order_by: Vec<OrderKey>,
@@ -1472,7 +1475,10 @@ AlterDomainRename {
         right_rel: u16,
         right_formats: Vec<(u8, Vec<Descriptor>)>,
         right_width: usize,
-        on: Vec<(usize, usize)>,
+        /// the ON condition, evaluated over the CONCATENATED row - not a
+        /// list of equality pairs, so `ON A.K > C.K` and a NUMERIC or
+        /// DATE key are the same shape as `ON A.K = C.K`
+        on: Predicate,
         cols: Vec<ProjCol>,
         gitems: Vec<GItem>,
         key_fids: Vec<usize>,
@@ -9411,37 +9417,31 @@ fn resolve_join_col<'a>(
 /// Parse an ON condition into (left, right) combined-index equality
 /// pairs: one or more `<col> = <col>` terms joined by AND, each term
 /// naming one column from each side, both of the same comparable kind.
-fn parse_on(on_s: &str, sides: &[JoinSide; 2]) -> Option<Vec<(usize, usize)>> {
+fn parse_on(on_s: &str, sides: &[JoinSide; 2]) -> Option<Predicate> {
+    // The ON condition is a PREDICATE over the joined row, resolved by
+    // the same code the WHERE clause uses. It used to be a list of
+    // equality pairs of Int-or-Text columns, which is the join everyone
+    // writes and not the join the engine answers: `ON A.K > C.K` is a
+    // theta join, and a NUMERIC or DATE or BOOLEAN key is just a key.
+    //
+    // NULL semantics come out right for free: a comparison with NULL is
+    // UNKNOWN, `Predicate::matches` answers false, and an unmatched
+    // left row is padded exactly as it was.
     let toks = tokenize(on_s)?;
-    if toks.iter().any(|t| matches!(t, Tok::Or)) {
+    let mut np = 0usize;
+    let raw = parse_predicate(&toks, &mut np)?;
+    if np != 0 {
+        return None; // a `?` in an ON is not a shape this server binds
+    }
+    let mut params: Vec<Option<Descriptor>> = Vec::new();
+    let on = resolve_join_predicate(raw, sides, &mut params)?;
+    // the ON must actually reference BOTH sides - a condition over one
+    // of them is a filter wearing a join's clothes, and answering it
+    // would turn a missing predicate into a silent cross product
+    if !params.is_empty() {
         return None;
     }
-    let mut on = Vec::new();
-    for part in split_on(&toks, |t| matches!(t, Tok::And)) {
-        let [Tok::Ident(a), Tok::Cmp(Cmp::Eq), Tok::Ident(b)] = part else {
-            return None;
-        };
-        let (ia, da, _) = resolve_join_col(sides, a)?;
-        let (ib, db, _) = resolve_join_col(sides, b)?;
-        // the two columns must come from opposite sides and compare as
-        // the same kind
-        let width = sides[1].offset;
-        let (l, r, dl, dr) = match (ia < width, ib < width) {
-            (true, false) => (ia, ib, da, db),
-            (false, true) => (ib, ia, db, da),
-            _ => return None,
-        };
-        match (col_kind(dl)?, col_kind(dr)?) {
-            (ColKind::Int, ColKind::Int) | (ColKind::Text, ColKind::Text) => {}
-            _ => return None,
-        }
-        on.push((l, r));
-    }
-    if on.is_empty() {
-        None
-    } else {
-        Some(on)
-    }
+    Some(on)
 }
 
 /// Resolve a WHERE predicate against the two join sides (combined row
@@ -9539,7 +9539,14 @@ fn resolve_join_predicate(
             // here rather than by the column path below.
             if matches!(rt.lhs, RawLhs::Expr(_)) || matches!(rt.kind, RawKind::CmpExpr(..)) {
                 let rt = match &rt.lhs {
-                    RawLhs::Col(c) if c.contains('.') => {
+                    // the view carries the QUALIFIED spelling too, and it
+                    // is the one that resolves when both sides have a
+                    // column of that name (`ON A.K = C.K`); the bare form
+                    // is the fallback for a view built without it
+                    RawLhs::Col(c)
+                        if c.contains('.')
+                            && !comb_cols.iter().any(|k| k.name.eq_ignore_ascii_case(c)) =>
+                    {
                         let bare = c.rsplit('.').next().unwrap_or(c);
                         if !comb_cols.iter().any(|k| k.name.eq_ignore_ascii_case(bare)) {
                             return None; // ambiguous, or not in the view
@@ -10839,6 +10846,7 @@ fn plan_query_inner(
                         db, kind, left_rel, &left_formats, left_width, right_rel,
                         &right_formats, right_width, &on, &filter,
                     )
+                    .ok()?
                     .len();
                     return Some(Plan::Scalar(Some(n as i64), "COUNT".to_string()));
                 }
@@ -11714,9 +11722,9 @@ fn join_rows(
     right_rel: u16,
     right_formats: &[(u8, Vec<Descriptor>)],
     right_width: usize,
-    on: &[(usize, usize)],
+    on: &Predicate,
     filter: &Option<Predicate>,
-) -> Vec<Vec<Value>> {
+) -> Result<Vec<Vec<Value>>, EvalErr> {
     let collect = |rel: u16, formats: &[(u8, Vec<Descriptor>)], width: usize| {
         let mut rows: Vec<Vec<Value>> = Vec::new();
         for_each_record(db, rel, formats, |v| {
@@ -11740,23 +11748,28 @@ fn join_rows(
             Err(e) => ferr = Some(e),
         }
     };
+    let mut on_err: Option<EvalErr> = None;
     let mut right_matched = vec![false; rrows.len()];
     for l in &lrows {
         let mut matched = false;
         for (ri, r) in rrows.iter().enumerate() {
-            let joined = on.iter().all(|&(li, rj)| {
-                let (a, b) = (&l[li], &r[rj - left_width]);
-                !matches!(a, Value::Null)
-                    && !matches!(b, Value::Null)
-                    && value_cmp(a, b) == std::cmp::Ordering::Equal
-            });
+            let mut row = l.clone();
+            row.extend(r.iter().cloned());
+            // an eval error in the ON aborts the join the way one in the
+            // WHERE aborts the scan; `matches` answers false for UNKNOWN,
+            // which is what makes a NULL key never join
+            let joined = match on.matches(&row) {
+                Ok(b) => b,
+                Err(e) => {
+                    on_err = Some(e);
+                    break;
+                }
+            };
             if !joined {
                 continue;
             }
             matched = true;
             right_matched[ri] = true;
-            let mut row = l.clone();
-            row.extend(r.iter().cloned());
             keep(row);
         }
         if !matched && matches!(kind, JoinKind::Left | JoinKind::Full) {
@@ -11775,7 +11788,14 @@ fn join_rows(
             keep(row);
         }
     }
-    out
+    // an evaluation error in the ON or the WHERE ends the join with the
+    // engine's own status vector. It used to be COLLECTED AND DROPPED -
+    // the rows computed before it were returned as if nothing had
+    // happened, which is a wrong answer with no error attached.
+    if let Some(e) = on_err.or(ferr) {
+        return Err(e);
+    }
+    Ok(out)
 }
 
 /// Order two values for ORDER BY. NULL sorts as the lowest value (so
@@ -13001,7 +13021,8 @@ fn emit_rows_inner(
                 let mut rows = join_rows(
                     db, *kind, *left_rel, left_formats, *left_width, *right_rel,
                     right_formats, *right_width, on, &filter,
-                );
+                )
+                .map_err(EmitErr::Eval)?;
                 if !order_by.is_empty() {
                     rows.sort_by(|a, b| order_cmp(a, b, order_by));
                 }
@@ -13036,7 +13057,8 @@ fn emit_rows_inner(
                 let input = join_rows(
                     db, *kind, *left_rel, left_formats, *left_width, *right_rel,
                     right_formats, *right_width, on, &filter,
-                );
+                )
+                .map_err(EmitErr::Eval)?;
                 let mut rows =
                     group_rows(input, gitems, key_fids, key_exprs, *synth_base, having)
                         .map_err(EmitErr::Eval)?;
@@ -23998,21 +24020,45 @@ mod tests {
     #[test]
     fn parses_on_conditions() {
         let sides = join_sides();
-        // single equality, either operand order normalises to (left, right)
-        assert_eq!(parse_on("E.DEPT_ID = D.ID", &sides), Some(vec![(1, 3)]));
-        assert_eq!(parse_on("D.ID = E.DEPT_ID", &sides), Some(vec![(1, 3)]));
-        // AND-ed equalities; a text pair joins text columns
-        assert_eq!(
-            parse_on("E.DEPT_ID = D.ID AND E.NAME = D.NAME", &sides),
-            Some(vec![(1, 3), (2, 4)])
-        );
-        // both columns from one side, non-equality, OR, literals: all fall back
-        assert!(parse_on("E.ID = E.DEPT_ID", &sides).is_none());
-        assert!(parse_on("E.DEPT_ID > D.ID", &sides).is_none());
-        assert!(parse_on("E.DEPT_ID = D.ID OR E.NAME = D.NAME", &sides).is_none());
-        assert!(parse_on("E.DEPT_ID = 3", &sides).is_none());
-        // int/text mismatch
-        assert!(parse_on("E.DEPT_ID = D.NAME", &sides).is_none());
+        // The ON is a PREDICATE over the joined row now, not a list of
+        // equality pairs - so what is asserted is which rows it keeps.
+        // Row layout: E(ID, DEPT_ID, NAME) then D(ID, NAME).
+        let row = |eid: i64, dept: i64, ename: &str, did: i64, dname: &str| {
+            vec![
+                Value::Int(eid),
+                Value::Int(dept),
+                Value::Text(ename.into()),
+                Value::Int(did),
+                Value::Text(dname.into()),
+            ]
+        };
+        let on = |s: &str| parse_on(s, &sides);
+        let keeps = |s: &str, r: &[Value]| on(s).unwrap().matches(r).unwrap();
+        let matched = row(1, 3, "a", 3, "a");
+        let other = row(1, 3, "a", 4, "b");
+
+        assert!(keeps("E.DEPT_ID = D.ID", &matched));
+        assert!(!keeps("E.DEPT_ID = D.ID", &other));
+        // either operand order is the same predicate
+        assert!(keeps("D.ID = E.DEPT_ID", &matched));
+        assert!(keeps("E.DEPT_ID = D.ID AND E.NAME = D.NAME", &matched));
+        assert!(!keeps("E.DEPT_ID = D.ID AND E.NAME = D.NAME", &other));
+        // beyond equality: a theta join, and an OR - both refused before
+        assert!(keeps("E.DEPT_ID < D.ID", &other));
+        assert!(!keeps("E.DEPT_ID < D.ID", &matched));
+        assert!(keeps("E.DEPT_ID = D.ID OR E.NAME = D.NAME", &matched));
+        // a NULL key never joins: the comparison is UNKNOWN, which
+        // `matches` answers false to, and the row is padded instead
+        let null_key = vec![
+            Value::Int(1),
+            Value::Null,
+            Value::Text("a".into()),
+            Value::Int(3),
+            Value::Text("a".into()),
+        ];
+        assert!(!keeps("E.DEPT_ID = D.ID", &null_key));
+        // a `?` in an ON is not a shape this server binds
+        assert!(on("E.DEPT_ID = ?").is_none());
     }
 
     #[test]
