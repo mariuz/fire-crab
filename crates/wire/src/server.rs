@@ -9282,9 +9282,33 @@ fn parse_table_ref(s: &str) -> Option<TableRef<'_>> {
 /// join is supported: `t1 [a1] [INNER|LEFT|RIGHT|FULL [OUTER]] JOIN
 /// t2 [a2] ON <cond>`. Cross/natural joins, comma lists and chained
 /// joins return None (fall back).
-fn parse_from(from_s: &str) -> Option<(TableRef<'_>, Vec<(JoinKind, TableRef<'_>, &str)>)> {
+fn parse_from(
+    from_s: &str,
+) -> Option<(TableRef<'_>, Vec<(JoinKind, TableRef<'_>, &str, usize)>)> {
+    // A COMMA LIST is the older spelling of a cross join, and each item
+    // may itself be a join chain: `FROM A, B JOIN C ON ...`. Every item
+    // after the first becomes a step with no condition, exactly as
+    // `CROSS JOIN` does - which is what makes `FROM A, B WHERE A.K =
+    // B.K` the same query as the ON form.
     if from_s.contains(',') {
-        return None;
+        let parts: Vec<&str> = split_top_level_commas(from_s);
+        if parts.len() < 2 {
+            return None;
+        }
+        let (base, mut steps) = parse_from(parts[0].trim())?;
+        for item in &parts[1..] {
+            let (t, more) = parse_from(item.trim())?;
+            // this item's own base is side `here`; its internal joins may
+            // name only the tables of THIS item, which is the engine's
+            // scoping rule (`FROM A, B JOIN C ON C.x = A.x` is an error
+            // there - A is in a different item)
+            let here = 1 + steps.len();
+            steps.push((JoinKind::Inner, t, CROSS_ON, 0));
+            for (k, r, on, _) in more {
+                steps.push((k, r, on, here));
+            }
+        }
+        return Some((base, steps));
     }
     // A CHAIN - `A JOIN B ON ... JOIN C ON ...` - peels one join off the
     // RIGHT: everything left of the last join keyword is itself a FROM
@@ -9310,7 +9334,7 @@ fn parse_from(from_s: &str) -> Option<(TableRef<'_>, Vec<(JoinKind, TableRef<'_>
                 (start, &t[start..])
             };
             let (ws, w) = word_before(last);
-            if matches!(w, "INNER" | "LEFT" | "RIGHT" | "FULL") {
+            if matches!(w, "INNER" | "LEFT" | "RIGHT" | "FULL" | "CROSS") {
                 cut = ws;
             } else if w == "OUTER" {
                 let (ws2, w2) = word_before(ws);
@@ -9320,6 +9344,21 @@ fn parse_from(from_s: &str) -> Option<(TableRef<'_>, Vec<(JoinKind, TableRef<'_>
                 cut = ws2;
             }
             let (head, tail) = (&from_s[..cut], &from_s[cut..]);
+            let up_t = tail.to_ascii_uppercase();
+            if up_t.trim_start().starts_with("CROSS") {
+                let (base, mut steps) = parse_from(head)?;
+                let jp = find_word(&up_t, "JOIN", 0)?;
+                if up_t[..jp].trim() != "CROSS" {
+                    return None;
+                }
+                steps.push((
+                    JoinKind::Inner,
+                    parse_table_ref(tail[jp + "JOIN".len()..].trim())?,
+                    CROSS_ON,
+                    0,
+                ));
+                return Some((base, steps));
+            }
             let (base, mut steps) = parse_from(head)?;
             // the tail is a single `[<kind>] JOIN <table> ON <cond>`
             let up_tail = tail.to_ascii_uppercase();
@@ -9334,15 +9373,26 @@ fn parse_from(from_s: &str) -> Option<(TableRef<'_>, Vec<(JoinKind, TableRef<'_>
             let after = jp + "JOIN".len();
             let on = find_word(&up_tail, "ON", after)?;
             let right = parse_table_ref(&tail[after..on])?;
-            steps.push((kind, right, tail[on + "ON".len()..].trim()));
+            steps.push((kind, right, tail[on + "ON".len()..].trim(), 0));
             return Some((base, steps));
         }
     }
     let up = from_s.to_ascii_uppercase();
-    for kw in ["CROSS", "NATURAL"] {
-        if find_word(&up, kw, 0).is_some() {
+    // NATURAL JOIN joins on every SHARED COLUMN NAME and then collapses
+    // those columns into one - a rule about names rather than a
+    // condition, and not one this server answers yet
+    if find_word(&up, "NATURAL", 0).is_some() {
+        return None;
+    }
+    if let Some(cp) = find_word(&up, "CROSS", 0) {
+        // `A CROSS JOIN B` - no ON, every pair kept
+        let jp = find_word(&up, "JOIN", cp)?;
+        if up[cp + "CROSS".len()..jp].trim() != "" {
             return None;
         }
+        let left = parse_table_ref(from_s[..cp].trim())?;
+        let right = parse_table_ref(from_s[jp + "JOIN".len()..].trim())?;
+        return Some((left, vec![(JoinKind::Inner, right, CROSS_ON, 0)]));
     }
     let Some(jp) = find_word(&up, "JOIN", 0) else {
         // no JOIN: none of the join keywords may appear either
@@ -9397,7 +9447,7 @@ fn parse_from(from_s: &str) -> Option<(TableRef<'_>, Vec<(JoinKind, TableRef<'_>
     let on = find_word(&up, "ON", after)?;
     let right = parse_table_ref(&from_s[after..on])?;
     let on_s = from_s[on + "ON".len()..].trim();
-    Some((left, vec![(kind, right, on_s)]))
+    Some((left, vec![(kind, right, on_s, 0)]))
 }
 
 /// Split a possibly-qualified column name into (qualifier, column), each
@@ -9480,7 +9530,17 @@ fn resolve_join_col<'a>(
 /// Parse an ON condition into (left, right) combined-index equality
 /// pairs: one or more `<col> = <col>` terms joined by AND, each term
 /// naming one column from each side, both of the same comparable kind.
+/// The ON text of a step that HAS no condition - a CROSS JOIN, or an
+/// item of a comma list. Distinct from an empty string so a genuinely
+/// empty ON stays the parse error it is.
+const CROSS_ON: &str = "\u{0}cross";
+
 fn parse_on(on_s: &str, sides: &[JoinSide]) -> Option<Predicate> {
+    // a step with no condition keeps every pair: the fold's `matches`
+    // answers true for every combined row
+    if on_s == CROSS_ON {
+        return Some(Predicate(vec![vec![Term::Const(true)]]));
+    }
     // The ON condition is a PREDICATE over the joined row, resolved by
     // the same code the WHERE clause uses. It used to be a list of
     // equality pairs of Int-or-Text columns, which is the join everyone
@@ -9664,7 +9724,7 @@ fn resolve_join_predicate(
 fn plan_join(
     proj: &Proj,
     left: &TableRef<'_>,
-    joins: &[(JoinKind, TableRef<'_>, &str)],
+    joins: &[(JoinKind, TableRef<'_>, &str, usize)],
     where_s: Option<&str>,
     group_s: Option<&str>,
     having_s: Option<&str>,
@@ -9677,7 +9737,7 @@ fn plan_join(
     }
     let mut sides: Vec<JoinSide> = Vec::new();
     let mut refs: Vec<&TableRef<'_>> = vec![left];
-    refs.extend(joins.iter().map(|(_, r, _)| r));
+    refs.extend(joins.iter().map(|(_, r, _, _)| r));
     for tr in refs {
         let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, tr.table)?;
         let columns = relation_columns(&db.bytes, db.page_size, tr.table);
@@ -9718,9 +9778,12 @@ fn plan_join(
     // the one it adds - `A JOIN B ON ... JOIN C ON B.Y = C.Y` lets the
     // second condition name B, which is what makes the chain a fold.
     let mut parts: Vec<JoinPart> = Vec::new();
-    for (k, (kind, _, on_s)) in joins.iter().enumerate() {
-        let upto = &sides[..=k + 1];
-        let on = parse_on(on_s, upto)?;
+    for (k, (kind, _, on_s, vis)) in joins.iter().enumerate() {
+        // a step sees the sides from `vis` up to the one it adds - the
+        // whole chain for a plain FROM, and only its own comma item for
+        // a list, which is what the engine scopes an item's ON to
+        let visible = &sides[*vis..=k + 1];
+        let on = parse_on(on_s, visible)?;
         parts.push(JoinPart {
             kind: *kind,
             rel: sides[k + 1].rel,
@@ -24012,7 +24075,7 @@ mod tests {
         assert_eq!((l.table, l.alias), ("EMP", Some("E")));
         // JOIN with aliases and the optional INNER keyword
         let (l, j) = parse_from("EMP E JOIN DEPT D ON E.DEPT_ID = D.ID").unwrap();
-        let [(k, r, on)] = j.as_slice() else { panic!("one join") };
+        let [(k, r, on, _)] = j.as_slice() else { panic!("one join") };
         let (k, r, on) = (*k, r, *on);
         assert!(k == JoinKind::Inner);
         assert_eq!((l.table, l.alias), ("EMP", Some("E")));
@@ -24046,9 +24109,32 @@ mod tests {
         assert!(matches!(j[2].0, JoinKind::Inner));
         // unsupported shapes fall back: comma lists, cross, OUTER
         // without a direction, join keywords out of place
-        assert!(parse_from("EMP, DEPT").is_none());
+        // a COMMA LIST and a CROSS JOIN are steps with no condition
+        let (b, j) = parse_from("EMP, DEPT").unwrap();
+        assert_eq!(b.table, "EMP");
+        assert_eq!((j.len(), j[0].1.table, j[0].2), (1, "DEPT", CROSS_ON));
+        let (b, j) = parse_from("EMP E CROSS JOIN DEPT D").unwrap();
+        assert_eq!((b.table, b.alias), ("EMP", Some("E")));
+        assert_eq!((j.len(), j[0].1.table, j[0].2), (1, "DEPT", CROSS_ON));
+        // a three-item list, and a list whose item is itself a chain
+        let (_, j) = parse_from("A, B, C").unwrap();
+        assert_eq!(j.len(), 2);
+        let (_, j) = parse_from("A, B JOIN C ON B.X = C.X").unwrap();
+        assert_eq!(j.len(), 2);
+        assert_eq!(j[0].2, CROSS_ON);
+        assert_eq!(j[1].2, "B.X = C.X");
+        // that inner join sees ONLY its own comma item - side 1 (B)
+        // onward - which is how the engine scopes it: naming A there is
+        // an error, not a wider join
+        assert_eq!(j[1].3, 1);
+        assert_eq!(j[0].3, 0);
+        // a CROSS after an ON-join, and before one
+        let (_, j) = parse_from("A JOIN B ON A.X = B.X CROSS JOIN C").unwrap();
+        assert_eq!(j.len(), 2);
+        assert_eq!(j[1].2, CROSS_ON);
         assert!(parse_from("EMP JOIN DEPT").is_none()); // no ON
-        assert!(parse_from("EMP CROSS JOIN DEPT").is_none());
+        // NATURAL joins on every shared NAME - a different rule, refused
+        assert!(parse_from("EMP NATURAL JOIN DEPT").is_none());
         assert!(parse_from("EMP OUTER JOIN DEPT ON 1 = 1").is_none());
         assert!(parse_from("LEFT EMP JOIN DEPT ON 1 = 1").is_none());
         assert!(parse_from("EMP LEFT DEPT").is_none()); // stray keyword, no JOIN

@@ -13,6 +13,32 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — CROSS JOIN, comma lists, and where an item's ON can look
+
+### Converted
+- **`CROSS JOIN`** and **`FROM a, b, c`** — the two spellings of the same
+  thing, and with the chain in place both are just a step whose ON keeps
+  every pair. `FROM a, b WHERE a.k = b.k` is then the old-style join it
+  has always been, computed the same way as the ON form.
+- Either spelling composes with the rest of a chain: a CROSS before an
+  ON-join, after one, and a comma item that is itself a join.
+
+### Guarded
+- **An item's ON may only name tables within that item.** `FROM A, B
+  JOIN C ON C.x = A.x` is an error on the engine — the join binds
+  tighter than the comma, so A is not in scope — and fire-crab answered
+  it, having flattened the list into one chain where every later ON saw
+  everything. Each step now carries the index of the first side visible
+  to it, and a comma item's steps start at that item's own base.
+- **`NATURAL JOIN` refuses.** It joins on every SHARED COLUMN NAME and
+  then collapses those columns into one — a rule about names rather than
+  a condition, and not one this server answers.
+
+`qa/serve-real-joinchain.sh` grew from 15 checks to 24. One more of
+`qa/serve-real-outerjoin.sh`'s checks changed verdict: its CROSS JOIN
+case has now been a fixed scalar, then a refusal, and now a comparison —
+the property it defends (never wrong rows) has not moved once.
+
 ## 2026-07-30 — a CHAIN of joins: three tables and more
 
 ### Converted

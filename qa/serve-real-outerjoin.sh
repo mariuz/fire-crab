@@ -141,14 +141,13 @@ check "text-key LEFT JOIN (CHAR = VARCHAR, NULL keys pad)" \
     "$(node_run "SELECT J1.K, J1.V, J2.W FROM J1 LEFT JOIN J2 ON J1.K = J2.K2" | sort)" \
     "$(isql_q "SELECT COALESCE(TRIM(J1.K),'<null>') || '|' || J1.V || '|' || COALESCE(CAST(J2.W AS VARCHAR(12)),'<null>') FROM J1 LEFT JOIN J2 ON J1.K = J2.K2;" | sort)"
 
-# An unsupported shape REFUSES. This check used to assert the fixed
-# scalar 4242, which is what an unplannable query answered when the gate
-# was written; a later increment made those RAISE instead, on the
-# grounds that a made-up row is worse than an error. The property is the
-# same one - never wrong rows - and only the way it is expressed moved.
-r=$(node_run "SELECT COUNT(*) FROM EMP E CROSS JOIN DEPT D")
-case "$r" in
-    ERR*|CONN_ERR*) echo "OK   CROSS JOIN is refused, not answered" ;;
-    *) echo "DIFF CROSS JOIN answered: [$r]"; fail=1 ;;
-esac
+# This check has been three things. It first asserted the fixed scalar
+# 4242, which an unplannable query answered when the gate was written; a
+# later increment made those RAISE, so it asserted the refusal; and the
+# join-chain increment implemented CROSS JOIN, so it is a comparison now.
+# The property never moved - never wrong rows - only what the server can
+# say about this one.
+check "CROSS JOIN is a cartesian product" \
+    "$(node_run "SELECT COUNT(*) FROM EMP E CROSS JOIN DEPT D")" \
+    "$(isql_q "SELECT COUNT(*) FROM EMP E CROSS JOIN DEPT D;")"
 exit $fail

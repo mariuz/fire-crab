@@ -132,7 +132,50 @@ compare "four tables in one chain" \
     "SELECT COUNT(*) FROM $E JOIN REGION R ON D.REGION_ID = R.ID JOIN REGION R2 ON R.ID = R2.ID" \
     "SELECT COUNT(*) FROM $E JOIN REGION R ON D.REGION_ID = R.ID JOIN REGION R2 ON R.ID = R2.ID;"
 
+# --- CROSS JOIN and the comma list, which are the same step -----------
+compare "CROSS JOIN is a cartesian product" \
+    "SELECT COUNT(*) FROM DEPT D CROSS JOIN REGION R" \
+    "SELECT COUNT(*) FROM DEPT D CROSS JOIN REGION R;"
+compare "a comma list says the same thing" \
+    "SELECT COUNT(*) FROM DEPT D, REGION R" \
+    "SELECT COUNT(*) FROM DEPT D, REGION R;"
+compare "a comma list with a WHERE is the old-style join" \
+    "SELECT COUNT(*) FROM DEPT D, REGION R WHERE D.REGION_ID = R.ID" \
+    "SELECT COUNT(*) FROM DEPT D, REGION R WHERE D.REGION_ID = R.ID;"
+compare "three items in a comma list" \
+    "SELECT COUNT(*) FROM DEPT D, REGION R, J1" \
+    "SELECT COUNT(*) FROM DEPT D, REGION R, J1;"
+compare "a CROSS after an ON-join" \
+    "SELECT COUNT(*) FROM $E CROSS JOIN REGION R" \
+    "SELECT COUNT(*) FROM $E CROSS JOIN REGION R;"
+compare "a CROSS before one" \
+    "SELECT COUNT(*) FROM DEPT D CROSS JOIN REGION R JOIN EMP E ON E.DEPT_ID = D.ID" \
+    "SELECT COUNT(*) FROM DEPT D CROSS JOIN REGION R JOIN EMP E ON E.DEPT_ID = D.ID;"
+# a comma ITEM may be a join, and its ON sees only that item's tables
+compare "a comma item that is itself a join" \
+    "SELECT COUNT(*) FROM DEPT D, REGION R JOIN EMP E ON E.REGION_ID = R.ID" \
+    "SELECT COUNT(*) FROM DEPT D, REGION R JOIN EMP E ON E.REGION_ID = R.ID;"
+
 # --- refusals ----------------------------------------------------------
+# ... and naming a table from ANOTHER item in that ON is an error on
+# both: the join binds tighter than the comma, so D is not in scope
+a=$(node_q "SELECT COUNT(*) FROM DEPT D, REGION R JOIN EMP E ON E.DEPT_ID = D.ID")
+b=$(isql_q "SELECT COUNT(*) FROM DEPT D, REGION R JOIN EMP E ON E.DEPT_ID = D.ID;")
+ran=$((ran + 1))
+case "$a" in
+    ERR*) case "$b" in
+              *rror*|*SQLSTATE*) echo "OK   an item's ON cannot name another item's table, on either" ;;
+              *) echo "DIFF the engine answered the cross-item ON: [$b]"; fail=1 ;;
+          esac ;;
+    *) echo "DIFF fire-crab answered a cross-item ON: [$a]"; fail=1 ;;
+esac
+# NATURAL JOIN joins on every shared NAME - a different rule, refused
+r=$(node_q "SELECT COUNT(*) FROM DEPT NATURAL JOIN REGION")
+ran=$((ran + 1))
+case "$r" in
+    ERR*) echo "OK   NATURAL JOIN is refused (it joins on shared NAMES)" ;;
+    *) echo "DIFF NATURAL JOIN answered: [$r]"; fail=1 ;;
+esac
 # two sides sharing a qualifier cannot be told apart
 r=$(node_q "SELECT COUNT(*) FROM EMP E JOIN DEPT D ON E.DEPT_ID = D.ID JOIN REGION D ON D.REGION_ID = D.ID")
 ran=$((ran + 1))
@@ -148,8 +191,8 @@ case "$r" in
     *) echo "DIFF ambiguous bare name answered: [$r]"; fail=1 ;;
 esac
 
-if [ "$ran" -lt 15 ]; then
-    echo "DIFF only $ran checks ran (expected at least 15) - did one silently skip?"
+if [ "$ran" -lt 24 ]; then
+    echo "DIFF only $ran checks ran (expected at least 24) - did one silently skip?"
     fail=1
 fi
 exit $fail

@@ -1273,6 +1273,17 @@ them.
   name any earlier table; a kind applies to the accumulation) expressible
   at all.
 
+- **Being MORE permissive is also a divergence.** Flattening a comma
+  list let a later ON name a table from an earlier item, which the
+  engine rejects outright. Accepting what the engine refuses means every
+  answer to those queries is invented - and no gate that only compares
+  ANSWERS will catch it, because there is nothing to compare against.
+  Check the refusals too.
+- **Scope is data, not structure.** The fix was one number per join step
+  - the first side its condition may look at - rather than a different
+  plan shape for comma lists. Rules about VISIBILITY usually want a
+  range, not a special case.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

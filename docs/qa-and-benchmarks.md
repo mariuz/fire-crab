@@ -6972,6 +6972,40 @@ BY/HAVING, ORDER BY, the aggregates — because each was already written against
 the combined row rather than against two named sides. The gate checks a
 four-table chain too, to show the fold is not special-cased at three.
 
+### CROSS JOIN, comma lists, and where an item's ON can look
+
+Once a chain is a fold, `CROSS JOIN` is a step whose condition keeps every
+pair, and `FROM a, b, c` is the same step written the older way. Both were
+explicit refusals in `parse_from`; both are now a few lines, and
+`FROM a, b WHERE a.k = b.k` computes exactly like the ON form because it IS
+the ON form with the condition moved.
+
+**What took the thought was scope.** Flattening a comma list into one chain
+makes every later ON able to see every earlier table — and the engine does not
+allow that. `FROM A, B JOIN C ON C.x = A.x` is an error there: the join binds
+tighter than the comma, so A is in a different item and not in scope. fire-crab
+answered it. That is the wrong direction for a converter to diverge in — being
+MORE permissive means accepting queries the engine rejects, and any answer to
+them is invented.
+
+The fix is one number per step: the index of the first side visible to its ON.
+A plain chain's steps all see from zero; a comma item's steps see from that
+item's own base. The predicate's column indexes are unaffected, because a
+side's offset in the combined row is absolute — the visibility slice only
+decides which NAMES resolve, which is exactly the rule being modelled.
+
+`NATURAL JOIN` stays refused, and for a reason worth writing down: it joins on
+every SHARED COLUMN NAME and then collapses those columns into one. That is a
+rule about names, not a condition, so it does not fit the step shape at all —
+it would have to build the ON from the two sides' column lists and then change
+the projection.
+
+One check in `qa/serve-real-outerjoin.sh` has now been three things: a fixed
+scalar 4242 (what an unplannable query answered when the gate was written), a
+refusal (when unplannable queries began to raise), and now a comparison (now
+that CROSS JOIN works). The property it defends — never wrong rows — has not
+moved once. That is what a well-written gate check looks like over time.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
