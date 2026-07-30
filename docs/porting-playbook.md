@@ -1082,6 +1082,32 @@ them.
   with only the first case passes with the wrong implementation. Look
   for the input that splits the readings, and put it in.
 
+- **A conversion is a rounding rule, and rounding rules differ on
+  exactly one input.** Truncation, half-up and half-even all agree on
+  12.54; they separate on 12.55 and on -12.55. Pick the value where they
+  disagree, and put its NEGATIVE in too - half-away-from-zero and
+  half-up are the same rule until the sign changes.
+- **Printing a number is a law, not a detail.** The engine renders a
+  DOUBLE at 16 significant digits with trailing zeros kept; Rust's
+  default prints the shortest round-tripping form. Same value, different
+  STRING - and the string is what a CAST to text and a concatenation
+  both hand the client. Any type whose text form the language decides
+  for you deserves a probed rule of its own.
+- **If two widths PRINT differently, they are two types.** A FLOAT
+  renders at 8 significant digits and a DOUBLE at 16, and 1.5 is
+  exactly representable in both - so no examination of the VALUE can
+  recover which one stored it. The decoder has to keep them apart even
+  though every arithmetic path treats them identically.
+- **When a gate says "skipping", that is a TODO with a date on it.** The
+  row differential had been visibly skipping float columns for many
+  increments because the Rust side could not render them. Un-skipping
+  them is what found the FLOAT/DOUBLE digit difference. Read your own
+  gates' skip lists when you touch the area they mention.
+- **Prefer the oracle with the fewest layers.** The same rendering law
+  was checkable through the wire (driver, describe, decode) or straight
+  from the file against isql's text. The second found the bug, because
+  nothing in between could absorb it.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

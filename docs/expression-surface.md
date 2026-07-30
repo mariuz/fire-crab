@@ -53,6 +53,8 @@ same database file.
 | a lone aggregate's output column is NAMED by its function (COUNT/MIN/MAX/SUM/AVG); a bare literal is CONSTANT, a generator read GEN_ID | probed via isql headers | `Plan::Scalar(value, name)`, `output_cols_of` |
 | DATEADD/DATEDIFF (both syntaxes each); month-end clamping; TIME wraps midnight; DATEDIFF components vs boundary crossings; MILLISECOND at NUMERIC(18,1) | `src/jrd/SysFunction.cpp` (`makeDateAdd`/`makeDateDiff`), probed | `SysFn::DateAdd`/`DateDiff`, `dateadd_impl`, `datediff_impl` |
 | native temporal operators: DATE ± n (numeric addend CVT-rounds), DATE−DATE = days, TIME−TIME = seconds @ −4, TIMESTAMP diff = days @ −9 truncating | `ExprNodes.cpp` arithmetic over temporal descs, probed | the temporal arms of `Expr::Bin` typing/scale/eval |
+| `CAST(<expr> AS <type>)` over the whole target list - integer family, CHAR/VARCHAR, NUMERIC/DECIMAL(p,s) (precision > 18 stores and announces INT128), FLOAT/DOUBLE PRECISION, DATE/TIME/TIMESTAMP - rounding HALF AWAY FROM ZERO at the declared scale, with the engine's conversion errors (22018) and truncation error (22001) | `src/common/cvt.cpp`, probed (12.55 to scale 1 is 12.6; -12.55 is -12.6; 2.5 to INTEGER is 3) | `CastTarget`, `parse_cast_target`, `rescale`, `decimal_parts`, the CAST arm of `Expr::eval` |
+| an approximate value's TEXT: a DOUBLE at 16 significant digits, a FLOAT at 8, trailing zeros kept, scientific outside the fixed range (C's `%#.16g`/`%#.8g`) - what CAST AS VARCHAR and `\|\|` produce | `dsc.cpp` double conversion, probed against isql | `fire-crab-ods::format::{render_double, render_float}`, `Value::Float` |
 | an APPROXIMATE column (FLOAT/DOUBLE PRECISION) as an operand: every comparison operator, IS [NOT] NULL, BETWEEN, IN, unary minus, ABS, and SUM/AVG/MIN/MAX (all describing as DOUBLE, FLOAT sources included); an exact side converts to f64, a string literal converts at prepare | `dsc.cpp` promotion + `AggNodes.cpp`, probed (`AVG(DP)` = 1.875, `SUM(F)` reads as a DOUBLE) | `ExprType::Approx`, `is_approx_col`, `cmp_sides`, the approximate arms of `value_cmp` and `compute_group` |
 | a TEMPORAL COLUMN in a predicate: every operator against a typed literal, IS [NOT] NULL, BETWEEN, IN, LIKE; a DATE against a TIMESTAMP reads as MIDNIGHT; a STRING literal is CONVERTED at prepare (so `D = '2021-6-15'` is the same date, not a different string) and one that will not convert refuses where the engine raises 22018 | `src/jrd/evl.cpp` comparison over temporal descs, probed | `temporal_kind` routing in `resolve_predicate`, `temporal_sides`, the `DATE'...'` arm of `tokenize` |
 | WHERE comparison sides are full expressions (arithmetic, functions, CAST, conditionals, column vs column); per-row eval errors raise mid-statement with the engine's vector | `src/jrd/evl.cpp` boolean evaluation over expression nodes, probed | `texpr` (token-level sides), the fallible `Predicate::matches` |
@@ -218,9 +220,10 @@ and `CURRENT_TIME`/`CURRENT_TIMESTAMP` (TIME ZONE results). An
 aggregate over an APPROXIMATE column (`AVG(D)` where D is DOUBLE) is
 refused in every position - the planner has no approximate result type
 yet, and refusing it in the subquery too keeps one expression from being
-legal in one place and illegal in another. `CAST(... AS DOUBLE PRECISION)` refuses because the CAST
-target list holds integer and text types only (NUMERIC and the temporal
-targets are missing from it too), an approximate branch may not share a
+legal in one place and illegal in another. A TIME does not CAST to a DATE or a TIMESTAMP (the
+engine fills the date from the CURRENT DATE), an unknown CAST target
+refuses rather than falling back to another conversion, an approximate
+branch may not share a
 CASE/COALESCE describe with another family, and there is no approximate
 `?` parameter path. TIME against DATE or TIMESTAMP is refused too: the engine promotes a TIME to a TIMESTAMP using the CURRENT
 DATE (probed), and comparing the two by rendered text would answer every

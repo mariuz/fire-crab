@@ -11,8 +11,11 @@
 # TRIM(CAST(.. AS VARCHAR)) with booleans lowercased and NULLs as
 # <null>; fcstat values via per-field trim, with blob ids collapsed to
 # <blob> on both sides. Columns whose types the Rust decoder does not
-# yet render (double/float, DECFLOAT, INT128, TZ types) are excluded
-# per-table and reported, not silently dropped.
+# yet render (DECFLOAT, INT128, TZ types) are excluded per-table and
+# reported, not silently dropped. FLOAT and DOUBLE are IN now: the Rust
+# renderer prints them as the engine does (C's %#.16g), and comparing
+# them here is a second oracle for that rendering - the raw file against
+# isql's own text, with no wire protocol in between.
 
 set -u
 ISQL="${ISQL:-isql}"
@@ -73,8 +76,16 @@ EOF
                      esac ;;
             12|13|35) expr="TRIM(CAST(\"$fname\" AS VARCHAR(64)))" ;;  # date/time/timestamp
             23)      expr="LOWER(TRIM(CAST(\"$fname\" AS VARCHAR(8))))" ;; # boolean
+            10|27)   # FLOAT/DOUBLE: the Rust side prints these the way
+                     # the engine does now (16 significant digits,
+                     # trailing zeros kept, scientific outside the fixed
+                     # range - C's %#.16g), so they are compared rather
+                     # than skipped. A SECOND oracle for that rendering:
+                     # the raw file against isql's own text, with no wire
+                     # protocol in between.
+                     expr="TRIM(CAST(\"$fname\" AS VARCHAR(40)))" ;;
             261)     expr="IIF(\"$fname\" IS NULL, CAST(NULL AS VARCHAR(8)), '<blob>')" ;; # blob presence
-            *)       skipped="$skipped $fname($ftype)"; continue ;;     # double/float/dec/int128/tz
+            *)       skipped="$skipped $fname($ftype)"; continue ;;     # dec/int128/tz
         esac
         select_list="$select_list${select_list:+ || '|' || }COALESCE($expr, '<null>')"
         awk_cols="$awk_cols${awk_cols:+,}$((fid + 1))"

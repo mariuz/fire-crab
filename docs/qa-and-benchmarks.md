@@ -6546,6 +6546,50 @@ in three slices to be promoted this way, and both failed loudly rather than
 rotting silently, which is the argument for writing refusals as gate checks
 in the first place.
 
+### CAST's target list, and how an approximate number prints (`qa/serve-real-cast.sh`, 53 checks)
+
+`CastTarget` held two shapes — an integer family and a text width — so
+`CAST(N AS NUMERIC(9,1))`, `CAST(S AS DATE)` and `CAST(I AS DOUBLE PRECISION)`
+all refused. Adding the rest is mostly mechanical; what makes CAST worth its
+own gate is that nearly every conversion carries a ROUNDING or a FORMAT rule,
+and each of those is a silent wrong answer when it is one digit off.
+
+**The rounding is half away from zero.** Truncation, round-half-up and
+round-half-even all agree with the engine on 12.54. They part company on 12.55
+(12.6 / 12.6 / 12.6 but 12.5 for truncation) and on **-12.55**, where
+half-away gives -12.6 and half-up gives -12.5. So the fixture's second row is
+the negative of its first, and every check runs over all three rows: a rule
+that is right for the positive and wrong for the negative cannot hide behind a
+one-row test.
+
+**The rendering bug this uncovered.** `CAST(DP AS VARCHAR(30))` is not a
+conversion so much as a FORMAT, and the format is the engine's own: 16
+significant digits for a DOUBLE, trailing zeros kept, scientific outside the
+fixed range — C's `%#.16g`. Rust's `{}` prints the shortest round-tripping
+form, `1.5` where the engine writes `1.500000000000000`. Same number, different
+string, and that string is what a CAST to VARCHAR and a `||` concatenation
+both produce.
+
+**And the variant it forced.** A FLOAT prints at EIGHT significant digits, not
+sixteen — `1.5000000`. Nothing about the *number* says which width stored it,
+because 1.5 is exactly representable either way; only the column does. So the
+decoder now produces `Value::Float(f32)` for a REAL, kept apart from `Double`
+for exactly one reason: how it prints. Every arithmetic path asks `approx_of`
+for the f64 behind either, which is also the guard against the failure mode
+the previous slice had — a new numeric variant silently falling into a catch-all
+arm and being skipped.
+
+**The second oracle.** `qa/diff-rows.sh` decodes every row of every table from
+the RAW FILE and compares against `SELECT` through the engine. It had been
+SKIPPING float and double columns, visibly, since the Rust side could not
+render them the same way. Un-skipping them is what caught the FLOAT/DOUBLE
+digit difference — and it is a better test of a rendering law than the wire
+gate is, because no protocol sits between the two texts.
+
+`qa/serve-real-approx.sh` lost its `CAST AS DOUBLE PRECISION` refusal and
+gained two comparisons. That is the third refusal-list entry promoted this way
+in four slices; each one failed loudly the moment the capability landed.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

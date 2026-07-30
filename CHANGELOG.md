@@ -13,6 +13,57 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — CAST's target list, and how an approximate number PRINTS
+
+### Converted
+- **`CAST(<expr> AS <type>)` across the whole target list**: `NUMERIC(p,
+  s)` / `DECIMAL(p, s)` (including a precision past 18, which stores and
+  announces as INT128), `FLOAT` / `DOUBLE PRECISION`, `DATE`, `TIME` and
+  `TIMESTAMP` — alongside the integer and CHAR/VARCHAR targets that were
+  already there. Conversions in every direction the engine allows,
+  nested, in a WHERE, and inside an aggregate.
+- The rounding is the engine's: **HALF AWAY FROM ZERO**, at the declared
+  scale. `CAST(12.55 AS NUMERIC(9,1))` is 12.6 and `-12.55` is `-12.6`;
+  `CAST(2.5 AS INTEGER)` is 3 and `CAST(-2.5 AS INTEGER)` is -3.
+  Truncation and banker's rounding each answer one of those differently
+  and neither raises.
+
+### Fixed
+- **An approximate value printed as the wrong STRING.** The engine
+  renders a DOUBLE at 16 significant digits and a FLOAT at 8, trailing
+  zeros kept, scientific outside the fixed range — C's `%#.16g` /
+  `%#.8g`. Rust's default float formatting prints the shortest
+  round-tripping form, `1.5` where the engine writes
+  `1.500000000000000`: the same number, a different string, and this
+  text is what `CAST ... AS VARCHAR` and `||` both produce.
+- **FLOAT needed its own `Value` variant to say so.** 1.5 is exactly
+  representable at either width, so nothing about the NUMBER says which
+  one stored it — only the column does. `Value::Float(f32)` now decodes
+  from REAL; every arithmetic path asks `approx_of` for the f64 behind
+  it, and only `render` cares which it was.
+
+### Guarded
+- A TIME does not CAST to a DATE or a TIMESTAMP: the engine fills the
+  date from the CURRENT DATE, which this server does not do — the same
+  reason the two do not compare.
+- An unknown target (`CAST(I AS BLOB)`) refuses rather than falling back
+  to another conversion.
+
+`qa/serve-real-cast.sh` (53 checks, twin servers). Every check runs over
+all three rows, one of which is the negative of another, because a
+rounding rule that is right for the positive and wrong for the negative
+is exactly what half-away-from-zero distinguishes.
+
+`qa/diff-rows.sh` stopped SKIPPING float and double columns. It compares
+the raw file's decoded text against isql's own — no wire protocol in
+between — which makes it a second, independent oracle for the rendering
+above, and it was the run that caught the FLOAT/DOUBLE digit difference
+in the first place.
+
+`qa/serve-real-approx.sh` lost its `CAST AS DOUBLE PRECISION` refusal
+and gained two comparisons — the third refusal-list entry promoted this
+way in four slices.
+
 ## 2026-07-30 — the wire server: FLOAT and DOUBLE PRECISION as operands
 
 ### Converted

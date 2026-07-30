@@ -1816,7 +1816,7 @@ impl Term {
                     // literal to f64, which is the engine's conversion.
                     // (This is the HAVING side of an approximate
                     // aggregate: `HAVING AVG(DP) > 1.8`.)
-                    Some(v @ Value::Double(_)) => ord_ok(value_cmp(v, &rhs), *op),
+                    Some(v) if approx_of(v).is_some() => ord_ok(value_cmp(v, &rhs), *op),
                     Some(v) => match num_cmp(v, &rhs) {
                         Some(o) => ord_ok(o, *op),
                         None => false,
@@ -8890,7 +8890,9 @@ fn execute_dml_collecting(
                             Value::Int(n) => WireParam::Int(*n, 0),
                             Value::Scaled(r, sc) => WireParam::Int(*r, *sc),
                             Value::Text(t) => WireParam::Text(t.clone()),
-                            Value::Double(f) => WireParam::Double(*f),
+                            Value::Double(_) | Value::Float(_) => {
+                                WireParam::Double(approx_of(&v).unwrap_or(0.0))
+                            }
                             _ => return Err("expression type cannot be stored".into()),
                         };
                         match encode_wire_value(d, &wp)
@@ -11469,23 +11471,22 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
             &fire_crab_ods::decfloat::decode_dec128(*x),
             &fire_crab_ods::decfloat::decode_dec128(*y),
         ),
-        (Value::Double(x), Value::Double(y)) => x.partial_cmp(y).unwrap_or(Equal),
-        // an APPROXIMATE value against an exact one: the exact side
-        // converts to f64, which is the engine's promotion. Without
-        // these two arms the pair fell to the rendered-text fallback
-        // below and `DP > 1` compared "1.5" against "1" as strings.
-        (Value::Double(x), other) => match numeric_parts(other) {
-            Some((raw, sc)) => x
-                .partial_cmp(&(raw as f64 * 10f64.powi(sc as i32)))
-                .unwrap_or(Equal),
-            None => a.render().cmp(&b.render()),
-        },
-        (other, Value::Double(y)) => match numeric_parts(other) {
-            Some((raw, sc)) => (raw as f64 * 10f64.powi(sc as i32))
-                .partial_cmp(y)
-                .unwrap_or(Equal),
-            None => a.render().cmp(&b.render()),
-        },
+        // APPROXIMATE values compare as f64 whatever their widths, and
+        // against an exact value the exact side converts - the engine's
+        // promotion. Without these arms the pair fell to the
+        // rendered-text fallback below and `DP > 1` compared "1.5"
+        // against "1" as strings.
+        _ if approx_of(a).is_some() || approx_of(b).is_some() => {
+            let f = |v: &Value| {
+                approx_of(v).or_else(|| {
+                    numeric_parts(v).map(|(raw, sc)| raw as f64 * 10f64.powi(sc as i32))
+                })
+            };
+            match (f(a), f(b)) {
+                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Equal),
+                _ => a.render().cmp(&b.render()),
+            }
+        }
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::Time(x), Value::Time(y)) => x.cmp(y),
@@ -11805,9 +11806,9 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                                 fsum += raw as f64 * 10f64.powi(sc as i32);
                                 n += 1;
                             }
-                            (Value::Double(d), None) => {
+                            (v, None) if approx_of(v).is_some() => {
                                 approx = true;
-                                fsum += d;
+                                fsum += approx_of(v).unwrap_or(0.0);
                                 n += 1;
                             }
                             _ => continue,
@@ -12715,12 +12716,10 @@ fn encode_row_body(w: &mut W, cols: &[ProjCol], vals: &[Value]) {
                 w.raw(&(raw_int(v) as i32).to_be_bytes());
             }
             Wire::Double => {
-                let d = if let Value::Double(d) = v { *d } else { 0.0 };
-                w.raw(&d.to_be_bytes());
+                w.raw(&approx_of(v).unwrap_or(0.0).to_be_bytes());
             }
             Wire::Float => {
-                let d = if let Value::Double(d) = v { *d } else { 0.0 };
-                w.raw(&(d as f32).to_be_bytes());
+                w.raw(&(approx_of(v).unwrap_or(0.0) as f32).to_be_bytes());
             }
             Wire::Date => {
                 let d = if let Value::Date(d) = v { *d } else { 0 };
@@ -13207,6 +13206,15 @@ enum CastTarget {
     /// engine's DSC_multiply_result), while SMALLINT/INTEGER stay long
     Int { wide: bool },
     Text { len: usize, pad: bool },
+    /// `NUMERIC(p, s)` / `DECIMAL(p, s)` - the declared SCALE is what the
+    /// value is rounded to (half away from zero, probed: 12.55 to scale
+    /// -1 is 12.6 and -12.55 is -12.6); `wide` marks a precision past 18,
+    /// which stores as INT128
+    Numeric { scale: i8, wide: bool },
+    /// `FLOAT` / `DOUBLE PRECISION` - both announce DOUBLE
+    Approx,
+    /// `DATE` / `TIME` / `TIMESTAMP`
+    Temporal(TKind),
 }
 
 /// Parse an arithmetic expression: `+`/`-` (lowest precedence) over
@@ -14023,6 +14031,15 @@ fn take_keyword(b: &[char], pos: &mut usize, kw: &str) -> bool {
 /// Parse a CAST target type: SMALLINT/INTEGER/INT/BIGINT (the integer
 /// family) or VARCHAR(n)/CHAR(n)/CHARACTER(n) (a text width). None for
 /// any other type - the CAST then falls back rather than convert wrong.
+fn parse_uint(b: &[char], pos: &mut usize) -> Option<i64> {
+    skip_ws(b, pos);
+    let start = *pos;
+    while *pos < b.len() && b[*pos].is_ascii_digit() {
+        *pos += 1;
+    }
+    b[start..*pos].iter().collect::<String>().parse().ok()
+}
+
 fn parse_cast_target(b: &[char], pos: &mut usize) -> Option<CastTarget> {
     skip_ws(b, pos);
     let start = *pos;
@@ -14033,6 +14050,56 @@ fn parse_cast_target(b: &[char], pos: &mut usize) -> Option<CastTarget> {
     let ku = kw.to_ascii_uppercase();
     if matches!(ku.as_str(), "SMALLINT" | "INTEGER" | "INT" | "BIGINT") {
         return Some(CastTarget::Int { wide: ku == "BIGINT" });
+    }
+    if matches!(ku.as_str(), "DATE" | "TIME" | "TIMESTAMP") {
+        return Some(CastTarget::Temporal(match ku.as_str() {
+            "DATE" => TKind::Date,
+            "TIME" => TKind::Time,
+            _ => TKind::Timestamp,
+        }));
+    }
+    if ku == "FLOAT" {
+        return Some(CastTarget::Approx);
+    }
+    // `DOUBLE PRECISION` - two words, the second optional in no dialect
+    // but skipped tolerantly here the way the engine's parser reads it
+    if ku == "DOUBLE" {
+        skip_ws(b, pos);
+        let ws = *pos;
+        while *pos < b.len() && b[*pos].is_alphabetic() {
+            *pos += 1;
+        }
+        let w: String = b[ws..*pos].iter().collect();
+        if !w.eq_ignore_ascii_case("PRECISION") {
+            return None;
+        }
+        return Some(CastTarget::Approx);
+    }
+    if matches!(ku.as_str(), "NUMERIC" | "DECIMAL" | "DEC") {
+        // `NUMERIC` alone is (9, 0); `(p)` is scale 0; `(p, s)` both
+        let (mut prec, mut scale) = (9i64, 0i64);
+        skip_ws(b, pos);
+        if b.get(*pos) == Some(&'(') {
+            *pos += 1;
+            prec = parse_uint(b, pos)?;
+            skip_ws(b, pos);
+            if b.get(*pos) == Some(&',') {
+                *pos += 1;
+                scale = parse_uint(b, pos)?;
+            }
+            skip_ws(b, pos);
+            if b.get(*pos) != Some(&')') {
+                return None;
+            }
+            *pos += 1;
+        }
+        if !(1..=38).contains(&prec) || scale > prec {
+            return None;
+        }
+        return Some(CastTarget::Numeric {
+            scale: -(scale as i8),
+            wide: prec > 18,
+        });
     }
     let pad = match ku.as_str() {
         "VARCHAR" => false,
@@ -14417,8 +14484,21 @@ fn conditional_type<'a>(
 }
 
 /// A FLOAT / DOUBLE PRECISION column - the APPROXIMATE numerics, which
-/// decode to `Value::Double` and compare as f64 rather than through the
-/// exact i128 alignment.
+/// The f64 behind an approximate value, whichever width stored it. A
+/// FLOAT and a DOUBLE differ in how they PRINT, never in how they
+/// compare or fold - so every arithmetic path asks this, and only
+/// `render` cares which it was.
+fn approx_of(v: &Value) -> Option<f64> {
+    match v {
+        Value::Double(d) => Some(*d),
+        Value::Float(f) => Some(*f as f64),
+        _ => None,
+    }
+}
+
+/// A FLOAT / DOUBLE PRECISION column - the APPROXIMATE numerics, which
+/// decode to `Value::Float`/`Value::Double` and compare as f64 rather
+/// than through the exact i128 alignment.
 fn is_approx_col(d: &Descriptor) -> bool {
     matches!(d.dtype, dtype::REAL | dtype::DOUBLE)
 }
@@ -14524,6 +14604,65 @@ fn numeric_bin(r1: i128, s1: i8, op: ArithOp, r2: i128, s2: i8) -> Result<(i128,
 /// Round a scaled exact numeric (`raw` at `scale`) to an integer, half
 /// away from zero - the engine's rule for CAST to an integer type
 /// (`12.50` -> `13`, `13.50` -> `14`, `-12.50` -> `-13`). Works in `i128`
+/// Move an exact `(raw, scale)` value to a different scale, rounding HALF
+/// AWAY FROM ZERO where digits are lost - the engine's rule (probed:
+/// `CAST(12.55 AS NUMERIC(9,1))` is 12.6 and `-12.55` is `-12.6`; a
+/// truncating conversion would answer 12.5).
+fn rescale(raw: i128, from: i8, to: i8) -> Result<i128, EvalErr> {
+    if from == to {
+        return Ok(raw);
+    }
+    let shift = (from - to) as i32; // scales are NEGATIVE for decimals
+    if shift > 0 {
+        // gaining digits: exact
+        let pow = 10i128
+            .checked_pow(shift as u32)
+            .ok_or(EvalErr::ConversionError(None))?;
+        raw.checked_mul(pow).ok_or(EvalErr::ConversionError(None))
+    } else {
+        let pow = 10i128
+            .checked_pow((-shift) as u32)
+            .ok_or(EvalErr::ConversionError(None))?;
+        let q = raw / pow;
+        let r = raw % pow;
+        Ok(if 2 * r.unsigned_abs() >= pow as u128 {
+            q + raw.signum()
+        } else {
+            q
+        })
+    }
+}
+
+/// A decimal string as an exact `(raw, scale)` pair - what a CAST from
+/// text to a numeric type starts from. Rejects anything that is not
+/// `[+-]?digits[.digits]?` so the caller can raise the engine's 22018
+/// rather than silently reading a prefix.
+fn decimal_parts(s: &str) -> Option<(i128, i8)> {
+    let t = s.trim();
+    let (neg, body) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let (int_part, frac) = match body.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (body, ""),
+    };
+    if int_part.is_empty() && frac.is_empty() {
+        return None;
+    }
+    if !int_part.chars().all(|c| c.is_ascii_digit())
+        || !frac.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    if frac.len() > 38 {
+        return None;
+    }
+    let digits: String = format!("{}{}", int_part, frac);
+    let raw: i128 = digits.parse().ok()?;
+    Some((if neg { -raw } else { raw }, -(frac.len() as i8)))
+}
+
 /// so it covers `INT128`-backed numerics; the caller narrows to `i64`.
 fn round_scaled_to_int(raw: i128, scale: i8) -> i128 {
     if scale >= 0 {
@@ -14965,6 +15104,9 @@ impl Expr {
                 Some(match t {
                     CastTarget::Int { .. } => ExprType::Int,
                     CastTarget::Text { .. } => ExprType::Text,
+                    CastTarget::Numeric { .. } => ExprType::Numeric,
+                    CastTarget::Approx => ExprType::Approx,
+                    CastTarget::Temporal(k) => ExprType::Temporal(*k),
                 })
             }
             Expr::Func(f, args) => {
@@ -15088,6 +15230,9 @@ impl Expr {
             }
             Expr::Int(_) => Some(0),
             Expr::Dec(_, scale) => Some(*scale),
+            // a CAST states its own scale - that is what the target IS
+            Expr::Cast(_, CastTarget::Numeric { scale, .. }) => Some(*scale),
+            Expr::Cast(_, CastTarget::Int { .. }) => Some(0),
             // A CONDITIONAL'S SCALE IS ITS WIDEST BRANCH'S. Scales are
             // negative (12.50 is scale -2), so "widest" is the MINIMUM -
             // taking anything narrower would truncate a branch's value
@@ -15225,8 +15370,16 @@ impl Expr {
                 })
             }
             Expr::Cast(_, t) => match t {
-                CastTarget::Int { wide } => Some(if *wide { NumRank::I64 } else { NumRank::Long }),
-                CastTarget::Text { .. } => None,
+                // BIGINT ranks I64; a NUMERIC past precision 18 is stored
+                // as INT128 and must announce that width, or the value
+                // travels in a slot too narrow to hold it
+                CastTarget::Int { wide } => {
+                    Some(if *wide { NumRank::I64 } else { NumRank::Long })
+                }
+                CastTarget::Numeric { wide, .. } => {
+                    Some(if *wide { NumRank::I128 } else { NumRank::Long })
+                }
+                CastTarget::Text { .. } | CastTarget::Approx | CastTarget::Temporal(_) => None,
             },
             Expr::Func(f, args) => match f {
                 // ABS ranks (and so widens) as its operand does - ABS
@@ -15330,6 +15483,7 @@ impl Expr {
                 Value::Scaled(r, s) => Value::Scaled(r.wrapping_neg(), s),
                 Value::Int128(r, s) => Value::Int128(-r, s),
                 Value::Double(d) => Value::Double(-d),
+                Value::Float(f) => Value::Float(-f),
                 _ => Value::Null,
             },
             Expr::Bin(a, op, b) => {
@@ -15459,6 +15613,18 @@ impl Expr {
                                     return Err(EvalErr::ConversionError(Some(s)))
                                 }
                             },
+                            // an approximate source rounds the same way -
+                            // Rust's `round` is half away from zero, which
+                            // is the engine's rule (probed: 1.5 is 2, 2.5
+                            // is 3, -0.5 is -1 - NOT banker's rounding,
+                            // which would answer 2 for 2.5)
+                            v if approx_of(&v).is_some() => {
+                                let r = approx_of(&v).unwrap_or(0.0).round();
+                                if !r.is_finite() || r.abs() >= 9.223_372_036_854_776e18 {
+                                    return Err(EvalErr::ConversionError(None));
+                                }
+                                Value::Int(r as i64)
+                            }
                             _ => return Err(EvalErr::ConversionError(None)),
                         }
                     }
@@ -15479,6 +15645,94 @@ impl Expr {
                             s
                         };
                         Value::Text(out)
+                    }
+                    // to an EXACT numeric at a declared scale: every
+                    // source is decomposed to (raw, scale) and rescaled
+                    // with the engine's rounding - HALF AWAY FROM ZERO
+                    // (probed: 12.55 to scale 1 is 12.6, -12.55 is -12.6)
+                    CastTarget::Numeric { scale, wide } => {
+                        let (raw, from) = match &v {
+                            Value::Text(t) => decimal_parts(t)
+                                .ok_or_else(|| EvalErr::ConversionError(Some(t.clone())))?,
+                            // an approximate source rounds at the target
+                            // scale directly - it has no exact form to
+                            // rescale from
+                            v if approx_of(v).is_some() => {
+                                let d = approx_of(v).unwrap_or(0.0);
+                                let scaled = d * 10f64.powi(-(*scale) as i32);
+                                if !scaled.is_finite() {
+                                    return Err(EvalErr::ConversionError(None));
+                                }
+                                (scaled.round() as i128, *scale)
+                            }
+                            other => numeric_parts(other)
+                                .ok_or(EvalErr::ConversionError(None))?,
+                        };
+                        let out = rescale(raw, from, *scale)?;
+                        if *wide {
+                            Value::Int128(out, *scale)
+                        } else {
+                            match i64::try_from(out) {
+                                Ok(n) => Value::Scaled(n, *scale),
+                                Err(_) => return Err(EvalErr::ConversionError(None)),
+                            }
+                        }
+                    }
+                    // to the APPROXIMATE family: every exact shape
+                    // converts, a string parses (a non-numeric one is
+                    // the engine's 22018)
+                    CastTarget::Approx => match &v {
+                        v if approx_of(v).is_some() => {
+                            Value::Double(approx_of(v).unwrap_or(0.0))
+                        }
+                        Value::Text(t) => match t.trim().parse::<f64>() {
+                            Ok(d) => Value::Double(d),
+                            Err(_) => return Err(EvalErr::ConversionError(Some(t.clone()))),
+                        },
+                        other => match numeric_parts(other) {
+                            Some((raw, sc)) => {
+                                Value::Double(raw as f64 * 10f64.powi(sc as i32))
+                            }
+                            None => return Err(EvalErr::ConversionError(None)),
+                        },
+                    },
+                    // to a temporal type. A DATE reads as MIDNIGHT
+                    // against a TIMESTAMP and a TIMESTAMP splits into
+                    // either half (probed); a TIME does NOT become a
+                    // DATE or a TIMESTAMP here, for the same reason it
+                    // does not compare with one - the engine would use
+                    // the CURRENT DATE, which this server does not do.
+                    CastTarget::Temporal(k) => {
+                        let bad = |v: &Value| EvalErr::ConversionError(Some(v.render()));
+                        match (k, &v) {
+                            (TKind::Date, Value::Date(d)) => Value::Date(*d),
+                            (TKind::Date, Value::Timestamp(d, _)) => Value::Date(*d),
+                            (TKind::Time, Value::Time(t)) => Value::Time(*t),
+                            (TKind::Time, Value::Timestamp(_, t)) => Value::Time(*t),
+                            (TKind::Timestamp, Value::Timestamp(d, t)) => {
+                                Value::Timestamp(*d, *t)
+                            }
+                            (TKind::Timestamp, Value::Date(d)) => Value::Timestamp(*d, 0),
+                            (_, Value::Text(t)) => {
+                                let parse = || -> Option<Value> {
+                                    Some(match k {
+                                        TKind::Date => Value::Date(parse_date_lit(t)?),
+                                        TKind::Time => Value::Time(parse_time_lit(t)?),
+                                        TKind::Timestamp => {
+                                            let (ds, ts) = t.trim().split_once(' ')?;
+                                            Value::Timestamp(
+                                                parse_date_lit(ds)?,
+                                                parse_time_lit(ts.trim())?,
+                                            )
+                                        }
+                                    })
+                                };
+                                parse().ok_or_else(|| {
+                                    EvalErr::ConversionError(Some(t.clone()))
+                                })?
+                            }
+                            _ => return Err(bad(&v)),
+                        }
                     }
                 }
             }
@@ -15612,6 +15866,10 @@ impl Expr {
                     }
                     // an approximate operand keeps its family (there is
                     // no scale to keep)
+                    SysFn::Abs if matches!(vs[0], Value::Float(_)) => {
+                        let Value::Float(f) = vs[0] else { unreachable!() };
+                        Value::Float(f.abs())
+                    }
                     SysFn::Abs if matches!(vs[0], Value::Double(_)) => {
                         let Value::Double(d) = vs[0] else { unreachable!() };
                         Value::Double(d.abs())
@@ -15876,6 +16134,7 @@ fn value_to_tok(v: &Value) -> Option<Tok> {
         // rendered text: `WHERE D = (SELECT MAX(D) FROM T)` must compare
         // as a DATE, and a Tok::Str would have taken the text path
         Value::Double(d) => Tok::FnExpr(RawExpr::Double(*d)),
+        Value::Float(f) => Tok::FnExpr(RawExpr::Double(*f as f64)),
         Value::Date(d) => Tok::FnExpr(RawExpr::DateLit(*d)),
         Value::Time(t) => Tok::FnExpr(RawExpr::TimeLit(*t)),
         Value::Timestamp(d, t) => Tok::FnExpr(RawExpr::TsLit(*d, *t)),
@@ -24413,6 +24672,78 @@ mod tests {
         ] {
             assert!(parse_raw_expr(bad).is_none(), "{bad} parsed");
         }
+    }
+
+    #[test]
+    fn cast_targets_parse_and_round_like_the_engine() {
+        // the target grammar
+        let target = |s: &str| {
+            let b: Vec<char> = s.chars().collect();
+            let mut p = 0usize;
+            parse_cast_target(&b, &mut p)
+        };
+        assert!(matches!(target("INTEGER"), Some(CastTarget::Int { wide: false })));
+        assert!(matches!(target("BIGINT"), Some(CastTarget::Int { wide: true })));
+        assert!(matches!(target("VARCHAR(10)"), Some(CastTarget::Text { len: 10, pad: false })));
+        assert!(matches!(target("CHAR(5)"), Some(CastTarget::Text { len: 5, pad: true })));
+        assert!(matches!(target("DOUBLE PRECISION"), Some(CastTarget::Approx)));
+        assert!(matches!(target("FLOAT"), Some(CastTarget::Approx)));
+        assert!(matches!(target("DATE"), Some(CastTarget::Temporal(TKind::Date))));
+        assert!(matches!(target("TIMESTAMP"), Some(CastTarget::Temporal(TKind::Timestamp))));
+        // NUMERIC's scale is what the value is rounded TO; a precision
+        // past 18 stores as INT128 and has to announce that width
+        assert!(matches!(
+            target("NUMERIC(9,2)"),
+            Some(CastTarget::Numeric { scale: -2, wide: false })
+        ));
+        assert!(matches!(
+            target("DECIMAL(20,3)"),
+            Some(CastTarget::Numeric { scale: -3, wide: true })
+        ));
+        // bare NUMERIC is (9, 0), and `(p)` alone is scale 0
+        assert!(matches!(
+            target("NUMERIC"),
+            Some(CastTarget::Numeric { scale: 0, wide: false })
+        ));
+        assert!(matches!(
+            target("NUMERIC(5)"),
+            Some(CastTarget::Numeric { scale: 0, wide: false })
+        ));
+        // `DOUBLE` without PRECISION is not a type, and a scale past the
+        // precision is not one either - refuse rather than guess
+        assert!(target("DOUBLE").is_none());
+        assert!(target("NUMERIC(2,5)").is_none());
+        assert!(target("BLOB").is_none());
+
+        // the rounding: HALF AWAY FROM ZERO, at the target scale.
+        // Truncation and banker's rounding agree with it on 12.54 and
+        // part company on 12.55 / -12.55, which is why those are here.
+        let r = |raw, from, to| rescale(raw, from, to).unwrap();
+        assert_eq!(r(1255, -2, -1), 126); // 12.55 -> 12.6, not 12.5
+        assert_eq!(r(-1255, -2, -1), -126); // and the negative goes AWAY from zero
+        assert_eq!(r(1254, -2, -1), 125);
+        assert_eq!(r(1250, -2, -1), 125); // 12.50 -> 12.5 exactly
+        assert_eq!(r(1255, -2, 0), 13);
+        assert_eq!(r(-1255, -2, 0), -13);
+        assert_eq!(r(7, 0, -2), 700); // gaining digits is exact
+        assert_eq!(r(5, 0, 0), 5);
+
+        // a decimal STRING decomposes exactly - no f64 in the path, so a
+        // value too wide for a double still converts digit for digit
+        assert_eq!(decimal_parts("12.55"), Some((1255, -2)));
+        assert_eq!(decimal_parts(" -0.500 "), Some((-500, -3)));
+        assert_eq!(decimal_parts("42"), Some((42, 0)));
+        assert_eq!(decimal_parts("+7"), Some((7, 0)));
+        assert_eq!(decimal_parts("123456789012345678901234567890"),
+                   Some((123456789012345678901234567890i128, 0)));
+        // anything that is not a plain decimal REFUSES, so the caller
+        // raises the engine's conversion error instead of reading a
+        // prefix and answering a number
+        assert_eq!(decimal_parts("abc"), None);
+        assert_eq!(decimal_parts("12abc"), None);
+        assert_eq!(decimal_parts("1.5e3"), None);
+        assert_eq!(decimal_parts(""), None);
+        assert_eq!(decimal_parts("."), None);
     }
 
     #[test]

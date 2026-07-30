@@ -121,6 +121,11 @@ pub enum Value {
     /// scaled exact numeric rendered with its decimals (raw, scale)
     Scaled(i64, i8),
     Double(f64),
+    /// FLOAT (4-byte REAL). Kept apart from `Double` because the two
+    /// PRINT differently - the engine renders a single at 8 significant
+    /// digits and a double at 16 - and the stored width is the only
+    /// thing that says which (1.5 is exactly representable either way)
+    Float(f32),
     Bool(bool),
     /// SQL_DATE: days since the Modified Julian Day epoch (1858-11-17)
     Date(i32),
@@ -151,7 +156,8 @@ impl Value {
             Value::Text(s) => s.clone(),
             Value::Int(i) => i.to_string(),
             Value::Scaled(raw, scale) => render_scaled(*raw, *scale),
-            Value::Double(d) => format!("{}", d),
+            Value::Double(d) => render_double(*d),
+            Value::Float(f) => render_float(*f),
             Value::Bool(b) => if *b { "true" } else { "false" }.into(),
             Value::Date(d) => render_date(*d),
             Value::Time(t) => render_time(*t),
@@ -165,6 +171,57 @@ impl Value {
             Value::Unsupported(t) => format!("<{}>", t),
         }
     }
+}
+
+/// An approximate value as the engine prints it: 8 SIGNIFICANT digits for
+/// a FLOAT and 16 for a DOUBLE (`render_double`),
+/// trailing zeros kept, scientific outside the range where a fixed form
+/// stays that precise - C's `%#.16g` (`dsc.cpp`'s double conversion),
+/// probed against isql:
+///
+/// | value | text |
+/// |---|---|
+/// | 1.5 | `1.500000000000000` |
+/// | 0 | `0.000000000000000` |
+/// | 123456789.25 | `123456789.2500000` |
+/// | 1e20 | `1.000000000000000e+20` |
+/// | 1e-7 | `1.000000000000000e-07` |
+///
+/// Rust's `{}` prints the shortest round-tripping form (`1.5`), which is
+/// a different string for the same number - and this text is what a CAST
+/// to VARCHAR and a `||` concatenation both produce.
+pub fn render_float(f: f32) -> String {
+    render_approx(f as f64, 8)
+}
+
+/// See [render_float] - a DOUBLE carries 16.
+pub fn render_double(d: f64) -> String {
+    render_approx(d, 16)
+}
+
+fn render_approx(d: f64, p: i32) -> String {
+    let P = p; // significant digits
+    if d.is_nan() {
+        return "NaN".into();
+    }
+    if d.is_infinite() {
+        return if d < 0.0 { "-Infinity".into() } else { "Infinity".into() };
+    }
+    if d == 0.0 {
+        return format!("{:.*}", (P - 1) as usize, 0.0);
+    }
+    // the decimal exponent %g decides the form with - taken from the
+    // ROUNDED value, so 9.9999...e-5 does not straddle the boundary
+    let sci = format!("{:.*e}", (P - 1) as usize, d);
+    let exp: i32 = sci.rsplit('e').next().and_then(|e| e.parse().ok()).unwrap_or(0);
+    if exp < -4 || exp >= P {
+        // Rust writes `1.5e20`; C writes `1.5e+20` with at least two
+        // exponent digits
+        let (mantissa, _) = sci.split_once('e').unwrap_or((sci.as_str(), "0"));
+        let sign = if exp < 0 { '-' } else { '+' };
+        return format!("{}e{}{:02}", mantissa, sign, exp.abs());
+    }
+    format!("{:.*}", (P - 1 - exp).max(0) as usize, d)
 }
 
 fn render_scaled(raw: i64, scale: i8) -> String {
@@ -311,7 +368,7 @@ pub fn decode_field(image: &[u8], desc: &Descriptor, index: usize) -> Value {
         dtype::SHORT => scaled_or_int(u16_at(f, 0) as i16 as i64, desc.scale),
         dtype::LONG => scaled_or_int(u32_at(f, 0) as i32 as i64, desc.scale),
         dtype::INT64 => scaled_or_int(u64_at(f, 0) as i64, desc.scale),
-        dtype::REAL => Value::Double(f32::from_le_bytes([f[0], f[1], f[2], f[3]]) as f64),
+        dtype::REAL => Value::Float(f32::from_le_bytes([f[0], f[1], f[2], f[3]])),
         dtype::DOUBLE => Value::Double(f64::from_le_bytes(f[0..8].try_into().unwrap())),
         dtype::BOOLEAN => Value::Bool(f[0] != 0),
         dtype::SQL_DATE => Value::Date(u32_at(f, 0) as i32),
@@ -523,6 +580,34 @@ pub fn relation_formats(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn renders_doubles_the_way_the_engine_prints_them() {
+        // 16 SIGNIFICANT digits, trailing zeros kept, scientific outside
+        // the fixed range - C's `%#.16g`. Every line probed against isql.
+        let r = super::render_double;
+        assert_eq!(r(1.5), "1.500000000000000");
+        assert_eq!(r(0.1), "0.1000000000000000");
+        assert_eq!(r(-0.5), "-0.5000000000000000");
+        assert_eq!(r(0.0), "0.000000000000000");
+        assert_eq!(r(123456789.25), "123456789.2500000");
+        assert_eq!(r(1e20), "1.000000000000000e+20");
+        assert_eq!(r(1e-7), "1.000000000000000e-07");
+        // Rust's own `{}` would print "1.5" and "0" here - the shortest
+        // round-tripping form, which is a DIFFERENT STRING for the same
+        // number, and this text is what CAST AS VARCHAR and `||` produce
+        assert_ne!(r(1.5), format!("{}", 1.5));
+        // a FLOAT is the same rule at 8 significant digits, and that
+        // difference is the only reason the two Value variants exist -
+        // 1.5 is exactly representable either way, so nothing about the
+        // NUMBER says which width stored it
+        let f = super::render_float;
+        assert_eq!(f(1.5), "1.5000000");
+        assert_eq!(f(-1.5), "-1.5000000");
+        assert_eq!(f(4.0), "4.0000000");
+        assert_eq!(f(0.0), "0.0000000");
+        assert_ne!(f(1.5), r(1.5));
+    }
     use super::*;
 
     #[test]

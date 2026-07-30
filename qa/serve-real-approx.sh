@@ -33,6 +33,9 @@
 #   5. An approximate answer from a lifted SUBQUERY.
 #   6. A string literal converts (`DP > '1.25'`); one that does not parse
 #      is an error on both sides, never a row set.
+#   7. A CAST to and from an approximate type - including the TEXT one,
+#      where the engine prints 16 significant digits for a DOUBLE and 8
+#      for a FLOAT.
 #
 #   qa/serve-real-approx.sh [port]
 #
@@ -190,15 +193,12 @@ case "$a:$b" in
     *) echo "DIFF DP > 'x': fcwire [$a] engine [$b]"; fail=1 ;;
 esac
 
-# --- a documented refusal ----------------------------------------------
-# CAST's target list has no approximate type yet (nor NUMERIC, nor the
-# temporal ones) - a separate surface. It must REFUSE, not cast to
-# something else.
-r=$(query "SELECT ID FROM T WHERE DP > CAST('1.5' AS DOUBLE PRECISION)" "$PORT" "$A")
-case "$r" in
-    ERR*) echo "OK   CAST to an approximate type is refused (the CAST target list is its own surface)" ;;
-    *) echo "DIFF CAST AS DOUBLE PRECISION answered: [$r]"; fail=1 ;;
-esac
+# --- CAST to an approximate type ---------------------------------------
+# A REFUSAL check when this gate was written - CAST's target list held
+# integer and text types only - and a comparison since the CAST-target
+# slice. The expression is the same; only the verdict moved.
+where "against a CAST to DOUBLE PRECISION" "DP > CAST('1.5' AS DOUBLE PRECISION)"
+both "the CAST itself" "SELECT CAST(DP AS VARCHAR(30)) FROM T ORDER BY ID"
 
 rm -f "$A" "$B"
 exit $fail
