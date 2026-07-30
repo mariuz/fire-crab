@@ -1111,6 +1111,27 @@ enum Plan {
     /// empty: one row of `ncols` NULL columns (an aggregate over no
     /// rows). Used for the firebird-qa bootstrap's architecture probe.
     VirtualEmpty { ncols: usize },
+    /// Rows already computed - what a `RETURNING` clause leaves behind
+    /// after its DML has run. The statement executes at op_execute (like
+    /// every other DML), keeps the rows it touched, and the fetch that
+    /// follows serves them from here.
+    Rows { cols: Vec<ProjCol>, rows: Vec<Vec<Value>> },
+    /// `<dml> RETURNING <columns>`: the DML to run and the columns to
+    /// give back from the rows it touched - the NEW image for INSERT and
+    /// UPDATE, the OLD one for DELETE (probed: an UPDATE returns the
+    /// values AFTER the update, a DELETE the row as it was).
+    ///
+    /// Firebird 5 makes this a CURSOR, not a singleton: an UPDATE that
+    /// touches three rows returns three (probed against the live engine
+    /// and against node-firebird, which dispatches on the statement type
+    /// and fetches all of them - so the type reported here is
+    /// isc_info_sql_stmt_select).
+    Returning {
+        inner: Box<Plan>,
+        cols: Vec<ProjCol>,
+        /// field ids into the table's newest format, one per column
+        fields: Vec<usize>,
+    },
     /// `CREATE TABLE <name> (<col defs>)`: catalog rows, format and
     /// runtime blobs, pointer/root pages, NOT NULL/PRIMARY KEY
     /// constraint rows - all written at op_execute through
@@ -7050,6 +7071,123 @@ fn plan_alter_sequence(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
 /// None = the statement is not one the server can honour (the caller
 /// answers an SQL error, never a silent wrong write). The second
 /// element of the pair is the parameter target list, in VALUES order.
+/// Split a trailing `RETURNING <list>` off a DML statement.
+///
+/// The search runs over the MASKED uppercase text, so a literal that
+/// happens to contain the word (`INSERT INTO T VALUES ('returning')`) does
+/// not split the statement - the same masking every other clause finder in
+/// this file uses.
+fn split_returning(sql: &str) -> (String, Option<String>) {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    match find_word(&masked, "RETURNING", 0) {
+        Some(at) => (
+            s[..at].trim().to_string(),
+            Some(s[at + "RETURNING".len()..].trim().to_string()),
+        ),
+        None => (s.to_string(), None),
+    }
+}
+
+/// Wrap a planned DML in its `RETURNING` clause.
+///
+/// Only plain column references are converted - `RETURNING ID, AMT`, with
+/// an optional `NEW.`/`OLD.` qualifier, which is how the engine's own
+/// contexts are named. An expression there (`RETURNING AMT * 2`) is
+/// refused rather than guessed: the value would look right and the type
+/// in the describe would not.
+fn wrap_returning(
+    plan: Plan,
+    params: Vec<Descriptor>,
+    list: &str,
+    table: &str,
+    db: &Option<Database>,
+) -> Option<(Plan, Vec<Descriptor>)> {
+    let dbr = db.as_ref()?;
+    let rel = fire_crab_ods::resolve_relation(&dbr.bytes, dbr.page_size, table)?;
+    let formats = fire_crab_ods::relation_formats(&dbr.bytes, dbr.page_size, rel);
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let columns = fire_crab_ods::relation_columns(&dbr.bytes, dbr.page_size, table);
+    let mut cols = Vec::new();
+    let mut fields = Vec::new();
+    for item in list.split(',') {
+        let item = item.trim();
+        // A qualifier is allowed only when it names the TARGET TABLE
+        // (`RETURNING T.ID` works); `NEW.`/`OLD.` do NOT exist in DSQL -
+        // they are the PSQL trigger contexts, and the engine answers
+        // `Column unknown, "NEW"."ID"`. Accepting them would return rows
+        // for a statement the engine refuses, and write a row it never
+        // wrote (probed, and caught by the gate's twin-database check).
+        if let Some((qual, _)) = item.rsplit_once('.') {
+            let q = qual.trim().trim_matches('"');
+            if !q.eq_ignore_ascii_case(table) {
+                return None;
+            }
+        }
+        let bare = item.rsplit('.').next()?.trim().trim_matches('"');
+        if bare.is_empty() || !ident_ok(bare) {
+            return None;
+        }
+        let c = columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(bare))?;
+        let fid = c.field_id as usize;
+        let d = descs.get(fid)?;
+        let (wire, sql_type, length, scale, sub_type) = wire_for(d);
+        cols.push(ProjCol {
+            name: c.name.clone(),
+            field_id: fid,
+            wire,
+            sql_type,
+            length,
+            scale,
+            sub_type,
+            expr: None,
+        });
+        fields.push(fid);
+    }
+    if cols.is_empty() {
+        return None;
+    }
+    Some((
+        Plan::Returning {
+            inner: Box::new(plan),
+            cols,
+            fields,
+        },
+        params,
+    ))
+}
+
+/// The table a DML plan writes to, for resolving a RETURNING list.
+fn dml_table_name(sql: &str) -> Option<String> {
+    let s = sql.trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    let (kw, after) = if find_word(&masked, "INSERT", 0) == Some(0) {
+        ("INTO", find_word(&masked, "INTO", 0)?)
+    } else if find_word(&masked, "UPDATE", 0) == Some(0) {
+        ("UPDATE", 0)
+    } else if find_word(&masked, "DELETE", 0) == Some(0) {
+        ("FROM", find_word(&masked, "FROM", 0)?)
+    } else {
+        return None;
+    };
+    let start = after + kw.len();
+    let rest = s[start..].trim_start();
+    let end = rest
+        .char_indices()
+        .find(|(_, c)| c.is_whitespace() || *c == '(')
+        .map(|(i, _)| i)
+        .unwrap_or(rest.len());
+    let name = rest[..end].trim().trim_matches('"');
+    if name.is_empty() || !ident_ok(name) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
@@ -8180,12 +8318,37 @@ impl std::fmt::Display for ExecErr {
     }
 }
 
+/// The rows a DML statement touched, kept for a `RETURNING` clause: the
+/// images as they stand AFTER the statement (an INSERT's stored row, an
+/// UPDATE's patched row) or as they stood before it (a DELETE's), with the
+/// format that decodes them.
+#[derive(Default)]
+struct Affected {
+    descs: Vec<Descriptor>,
+    images: Vec<Vec<u8>>,
+}
+
 fn execute_dml(
     plan: &Plan,
     database: &mut Option<Database>,
     args: &[WireParam],
     ctx: &SessionCtx,
 ) -> Result<(i32, i32, i32), ExecErr> {
+    execute_dml_collecting(plan, database, args, ctx, None)
+}
+
+fn execute_dml_collecting(
+    plan: &Plan,
+    database: &mut Option<Database>,
+    args: &[WireParam],
+    ctx: &SessionCtx,
+    mut affected: Option<&mut Affected>,
+) -> Result<(i32, i32, i32), ExecErr> {
+    // RETURNING wraps a DML: run the inner statement, keeping the rows it
+    // touched
+    if let Plan::Returning { inner, .. } = plan {
+        return execute_dml_collecting(inner, database, args, ctx, affected);
+    }
     // the upsert recurses BEFORE the working copy is taken: each half
     // commits through the ordinary path, and the row count of the
     // update half decides whether the insert half runs at all - the
@@ -8593,6 +8756,10 @@ fn execute_dml(
                 fk_check_child_row(db, fk_refs, &values)?;
             }
             let image = &image;
+            if let Some(a) = affected.as_deref_mut() {
+                a.descs = descs.clone();
+                a.images.push(image.clone());
+            }
             let out =
                 fire_crab_ods::insert_record(&mut work, db.page_size, *rel, *format_no, image)?;
             if !index_ops.is_empty() {
@@ -8731,6 +8898,12 @@ fn execute_dml(
                     fk_check_parent_row(db, fk_children, &old_values, Some(&new_values))?;
                 }
                 old_images.push(image);
+                // the PATCHED row is what RETURNING gives back for an
+                // UPDATE (probed: the values AFTER the update)
+                if let Some(a) = affected.as_deref_mut() {
+                    a.descs = descs.clone();
+                    a.images.push(img.clone());
+                }
                 targets.push((page, slot, img));
             }
             let out =
@@ -8778,6 +8951,17 @@ fn execute_dml(
                         .ok_or("no format for a matching record")?;
                     let values = decode_record(&image, descs);
                     fk_check_parent_row(db, fk_children, &values, None)?;
+                }
+                // a DELETE returns the row AS IT WAS
+                if let Some(a) = affected.as_deref_mut() {
+                    let d = formats
+                        .iter()
+                        .find(|(n, _)| *n == fmt)
+                        .or_else(|| formats.iter().max_by_key(|(n, _)| *n))
+                        .map(|(_, d)| d)
+                        .ok_or("no format for a matching record")?;
+                    a.descs = d.clone();
+                    a.images.push(image.clone());
                 }
                 targets.push((page, slot));
             }
@@ -11466,6 +11650,8 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         Plan::Join { cols, .. } => build_describe(cols, params),
         Plan::Group { cols, .. } => build_describe(cols, params),
         Plan::VirtualEmpty { .. } => build_describe(&output_cols_of(plan), params),
+        Plan::Rows { cols, .. } => build_describe(cols, params),
+        Plan::Returning { cols, .. } => build_describe(cols, params),
         Plan::SetGenerator { stmt_type, .. } => describe_dml(*stmt_type, params),
         Plan::InsertSelect { .. } => describe_dml(2, params), // isc_info_sql_stmt_insert
         // isc_info_sql_stmt_commit (?) - no columns either way
@@ -11503,7 +11689,12 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::Group { .. }
         | Plan::Refused
         | Plan::RefusedEval(_)
-        | Plan::VirtualEmpty { .. } => 1,
+        | Plan::VirtualEmpty { .. }
+        // a DML with RETURNING is a CURSOR in Firebird 5, so it is typed
+        // as a SELECT - a client dispatches on this, and announcing the
+        // DML type instead makes it fetch nothing
+        | Plan::Rows { .. }
+        | Plan::Returning { .. } => 1,
         Plan::Insert { .. } | Plan::UpdateOrInsert { .. } => 2,
         Plan::Update { .. } => 3,
         Plan::Delete { .. } => 4,
@@ -11575,6 +11766,9 @@ fn output_cols_of(plan: &Plan) -> Vec<ProjCol> {
             expr: None,
         }],
         Plan::VirtualEmpty { ncols } => (0..*ncols).map(bigint_col).collect(),
+        // the RETURNING columns, both before the DML runs and after it
+        // has been replaced by its materialised rows
+        Plan::Returning { cols, .. } | Plan::Rows { cols, .. } => cols.clone(),
         Plan::ProcCall { cols, .. } | Plan::ProcInvoke { cols, .. } => cols.clone(),
         Plan::Union { cols, .. }
         | Plan::ProcSelect { cols, .. }
@@ -12029,6 +12223,17 @@ fn emit_rows_inner(
                 return Err(EmitErr::Eval(EvalErr::ConversionError(None)));
             }
         }
+        Plan::Rows { cols, rows } => {
+            for r in rows {
+                encode_row(w, cols, r)?;
+            }
+        }
+        // the DML has NOT run yet if a fetch arrives here: op_execute
+        // replaces the plan with its Rows once it has. Reaching this arm
+        // means a client fetched without executing, and the honest answer
+        // is an empty cursor rather than running the statement at fetch
+        // time - which would make a re-fetch update the table twice.
+        Plan::Returning { .. } => {}
         Plan::VirtualEmpty { ncols } => {
             // one row, every column NULL - an aggregate over the empty
             // MON$ relation. The null bitmap is all-ones (padded to 4B).
@@ -19091,11 +19296,29 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     // DML prepares to a real plan or to an SQL error -
                     // never to the fixed-answer fallback, which would
                     // let a client think its write succeeded
+                    // `<dml> RETURNING <cols>` plans the DML from the text
+                    // WITHOUT the clause, then wraps it - so every
+                    // constraint, index and trigger path stays exactly the
+                    // one an unadorned statement takes
+                    let (dml_sql, returning) = split_returning(&stmt_sql);
                     let planned = match kw {
-                        "INSERT" => plan_insert(&stmt_sql, &database),
-                        "UPDATE" => plan_upsert(&stmt_sql, &database)
-                            .or_else(|| plan_update(&stmt_sql, &database)),
-                        _ => plan_delete(&stmt_sql, &database),
+                        "INSERT" => plan_insert(&dml_sql, &database),
+                        "UPDATE" => plan_upsert(&dml_sql, &database)
+                            .or_else(|| plan_update(&dml_sql, &database)),
+                        _ => plan_delete(&dml_sql, &database),
+                    };
+                    let planned = match (planned, &returning) {
+                        (Some((p, ps)), Some(list)) => match dml_table_name(&dml_sql)
+                            .and_then(|t| wrap_returning(p, ps, list, &t, &database))
+                        {
+                            Some(w) => Some(w),
+                            // a RETURNING list this slice does not convert
+                            // refuses the STATEMENT: answering the DML
+                            // without its rows would run the write and
+                            // then hand the client an empty cursor
+                            None => None,
+                        },
+                        (planned, _) => planned,
                     };
                     match planned {
                         // UPDATE OR INSERT on a PK-less table without
@@ -19204,6 +19427,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     plan,
                     Plan::Insert { .. }
                         | Plan::UpdateOrInsert { .. }
+                        // a RETURNING statement is a DML that also has a
+                        // cursor: it must EXECUTE here like every other
+                        // write, or the write never happens and the client
+                        // fetches an empty result from a table it thinks
+                        // it changed
+                        | Plan::Returning { .. }
                         | Plan::InsertSelect { .. }
                         | Plan::TxControl { .. }
                         | Plan::Savepoint { .. }
@@ -19329,6 +19558,60 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                     eprintln!("[srv] insert-select failed: {}", e);
                                 }
                                 respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                            }
+                        }
+                    } else if let Plan::Returning { inner, cols, fields } = &plan {
+                        // the DML runs HERE, like every other write, and
+                        // the rows it touched become the cursor the client
+                        // fetches next
+                        let ctx = SessionCtx { user, attach_id };
+                        let mut affected = Affected::default();
+                        let inner = inner.clone();
+                        let cols = cols.clone();
+                        let fields = fields.clone();
+                        match execute_dml_collecting(
+                            &inner,
+                            &mut database,
+                            &bound_args,
+                            &ctx,
+                            Some(&mut affected),
+                        ) {
+                            Ok(counts) => {
+                                last_dml = counts;
+                                // the FULL decoded record per row: a ProjCol
+                                // projects by its own field_id, so
+                                // pre-projecting here would shift every
+                                // column past the first
+                                let _ = &fields;
+                                let rows: Vec<Vec<Value>> = affected
+                                    .images
+                                    .iter()
+                                    .map(|img| decode_record(img, &affected.descs))
+                                    .collect();
+                                if std::env::var("FC_SRV_TRACE").is_ok() {
+                                    eprintln!(
+                                        "[srv] returning: {} row(s) from {:?}",
+                                        rows.len(),
+                                        counts
+                                    );
+                                }
+                                // the projected rows ARE the statement now:
+                                // a fetch serves them, and a second fetch
+                                // finds the cursor empty rather than
+                                // running the write again
+                                plan = Plan::Rows { cols, rows };
+                                respond(&mut s, &mut enc, TX_HANDLE)?;
+                            }
+                            Err(e) => {
+                                last_dml = (0, 0, 0);
+                                match e {
+                                    ExecErr::Eval(ev) => {
+                                        respond_eval_error(&mut s, &mut enc, &ev)?
+                                    }
+                                    ExecErr::Text(_) => {
+                                        respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
+                                    }
+                                }
                             }
                         }
                     } else {
@@ -19576,6 +19859,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 let mut w = W::default();
                 let mut gen_writes: Vec<(String, i64)> = Vec::new();
                 emit_rows(&mut w, &plan, &database, &bound_args, &mut gen_writes);
+                // a materialised cursor is CONSUMED by its fetch: the rows
+                // exist once. Re-emitting them on the next fetch is what a
+                // driver's fetch-until-empty loop turns into duplicates.
+                if let Plan::Rows { cols, .. } = &plan {
+                    plan = Plan::Rows { cols: cols.clone(), rows: Vec::new() };
+                }
                 // a generator-advancing SELECT (NEXT VALUE FOR / GEN_ID in
                 // the select list) writes its generators' final values as
                 // the fetch completes - the engine advances them mid-fetch

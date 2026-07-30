@@ -13,6 +13,45 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — the wire server: DML with RETURNING
+
+### Converted
+- **`INSERT` / `UPDATE` / `DELETE ... RETURNING <columns>` over the
+  wire.** The statement plans WITHOUT its clause - so every default,
+  NOT NULL, CHECK, FK and index path stays exactly the one an unadorned
+  write takes - and the clause wraps the result.
+- **It is a CURSOR, not a singleton.** In Firebird 5 an UPDATE that
+  touches three rows returns three; the statement is therefore typed
+  `isc_info_sql_stmt_select` and its rows are fetched. That type is not
+  cosmetic: node-firebird dispatches on it, fetching all rows for a
+  select and exactly one for an exec_procedure, so announcing the DML
+  type instead makes a client fetch nothing.
+- **Which row each statement gives back** (probed): an INSERT returns
+  the row as stored (defaults filled in), an UPDATE the row as it
+  stands AFTER the update, a DELETE the row as it WAS.
+- The DML runs at op_execute like every other write, and the rows it
+  touched become the cursor the next fetch drains - once. A
+  materialised cursor that re-emits its rows turns a driver's
+  fetch-until-empty loop into duplicates.
+
+### Guarded
+- **`NEW.`/`OLD.` qualifiers are refused, because the engine refuses
+  them.** They are the PSQL trigger contexts and do not exist in DSQL:
+  `RETURNING NEW.ID` answers `Column unknown, "NEW"."ID"`. fire-crab
+  accepted them at first - and so returned rows for a statement the
+  engine rejects AND wrote a row the engine never wrote. The gate
+  caught it because it compares the TABLE afterwards, not just the
+  rows. A qualifier naming the target table (`RETURNING T.ID`) is fine
+  and works on both.
+- An expression in the list (`RETURNING AMT * 2`) is refused at PREPARE,
+  so the write does not happen: running the DML and handing back an
+  empty cursor is the worst possible outcome for this clause.
+
+The gate (`qa/serve-real-returning.sh`, 14 checks) runs every statement
+through the SAME driver against TWO servers - fire-crab and the live
+engine - on two identical databases, and compares both the rows and the
+resulting table.
+
 ## 2026-07-30 — fire-crab-opt slice 9: a unique lookup costs a fixed four
 
 ### Converted

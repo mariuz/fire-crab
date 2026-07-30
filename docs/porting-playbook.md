@@ -937,6 +937,34 @@ them.
   costed cannot lose on cost, and its absence looks exactly like a
   cost-model disagreement.
 
+## When a statement both writes and returns, compare the table too
+
+- **Run the same statement against both servers, then look at what
+  CHANGED.** A DML with a RETURNING clause can hand back perfectly
+  plausible rows while writing something the vendor's engine would not
+  have written - or writing at all where the engine refuses. Comparing
+  rows alone passes; comparing the TABLE afterwards is what fails. Build
+  twin databases and diff both.
+- **A vendor's grammar is narrower than its concepts.** `NEW.`/`OLD.`
+  exist in Firebird's PSQL and NOT in its DSQL RETURNING clause, though
+  every instinct says they should. Accepting a superset means accepting
+  statements the engine rejects - and then performing their side effects.
+  When in doubt, ask the engine: one probe settles it.
+- **A statement type is a DISPATCH, not a label.** The client decides
+  whether to fetch rows, fetch one row, or fetch nothing from the type
+  the prepare announced. A DML-with-RETURNING is a cursor in Firebird 5
+  and must be typed as a SELECT; type it as an UPDATE and a correct
+  implementation returns nothing.
+- **A materialised cursor must be CONSUMED.** Rows computed at execute
+  and re-emitted on every fetch turn a driver's fetch-until-empty loop
+  into duplicates - which looks like an off-by-one in the row count and
+  is really a missing state transition.
+- **Plan the statement WITHOUT its clause.** Stripping `RETURNING` and
+  planning the plain DML keeps every default, constraint, index and
+  trigger path identical to the unadorned statement's; the clause then
+  only decides what to hand back. Anything else duplicates the write
+  path and drifts from it.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

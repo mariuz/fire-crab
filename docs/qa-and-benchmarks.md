@@ -6302,6 +6302,40 @@ whole cost law sat undetected behind that symmetry for six slices. The new
 database indexes one side with a primary key and the other with a plain index,
 and it is now the first place these checks run.
 
+### DML with RETURNING, against the engine as a twin (`qa/serve-real-returning.sh`, 14 checks)
+
+`INSERT`/`UPDATE`/`DELETE ... RETURNING` is the first statement surface where
+a wrong answer can be invisible in the rows and visible only in the table — so
+this gate runs every statement through the SAME driver (node-firebird) against
+TWO servers, fire-crab and the live engine, each with its own copy of an
+identical database, and compares the rows AND the table afterwards.
+
+Making that possible took one small discovery: a scratch database in
+`/tmp/fbhandson` becomes readable by the real server with a `chmod 666`. Until
+now the twin-server comparison had been limited to the `employee` sample,
+because the server's own user could not open a developer-owned file.
+
+**What the clause is.** In Firebird 5 it is a CURSOR, not a singleton: an
+UPDATE that touches three rows returns three. The statement is therefore typed
+`isc_info_sql_stmt_select`, and that type is load-bearing — node-firebird
+dispatches on it, fetching all rows for a select and exactly one for an
+exec_procedure, so announcing the DML's own type makes a client fetch nothing.
+An INSERT returns the row as stored (defaults filled in), an UPDATE the row
+AFTER the update, a DELETE the row as it was.
+
+**What the twin caught.** fire-crab accepted `RETURNING NEW.ID`. The engine
+does not — `NEW.`/`OLD.` are the PSQL trigger contexts and do not exist in
+DSQL, so it answers `Column unknown, "NEW"."ID"`. fire-crab therefore returned
+rows for a statement the engine rejects *and wrote a row the engine never
+wrote*. The rows alone would not have shown it: the check that failed was the
+one comparing the two tables. A qualifier naming the target table
+(`RETURNING T.ID`) is valid on both, and now works here too.
+
+**What is refused.** An expression in the list (`RETURNING AMT * 2`) refuses at
+PREPARE, so the write does not happen at all. The alternative — running the DML
+and handing back an empty cursor — is the worst outcome this clause can
+produce, and the gate checks the table to prove it does not.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
