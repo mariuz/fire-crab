@@ -1083,7 +1083,7 @@ enum Plan {
         cols: Vec<ProjCol>,
         branches: Vec<Plan>,
         distinct: bool,
-        order_by: Option<(usize, bool)>,
+        order_by: Option<(usize, bool, NullsAt)>,
     },
     /// A statement this server will not answer, kept as a plan so it
     /// raises a SQL ERROR. Falling back to the fixed-answer plan would
@@ -1440,7 +1440,7 @@ AlterDomainRename {
         formats: Vec<(u8, Vec<Descriptor>)>,
         cols: Vec<ProjCol>,
         filter: Option<Predicate>,
-        order_by: Vec<(usize, bool)>,
+        order_by: Vec<(usize, bool, NullsAt)>,
         /// generator-advancing output columns (usually empty); each is
         /// evaluated per emitted row in output order and persisted when
         /// the fetch completes
@@ -1457,7 +1457,7 @@ AlterDomainRename {
         on: Vec<(usize, usize)>,
         cols: Vec<ProjCol>,
         filter: Option<Predicate>,
-        order_by: Vec<(usize, bool)>,
+        order_by: Vec<(usize, bool, NullsAt)>,
     },
     Group {
         rel: u16,
@@ -1472,7 +1472,7 @@ AlterDomainRename {
         synth_base: usize,
         filter: Option<Predicate>,
         having: Option<Predicate>,
-        order_by: Vec<(usize, bool)>,
+        order_by: Vec<(usize, bool, NullsAt)>,
     },
     /// `SET GENERATOR <name> TO <n>` or `ALTER SEQUENCE|GENERATOR <name>
     /// RESTART WITH <n>`: write a new value into the generator page at
@@ -9988,10 +9988,12 @@ fn branch_rows(
                 }
             });
         }
-        if let Some((idx, desc)) = order_by {
+        if let Some((idx, desc, nulls)) = order_by {
+            let keys = [(*idx, *desc, *nulls)];
             rows.sort_by(|a, b| {
-                let o = value_cmp(&a[*idx], &b[*idx]);
-                if *desc { o.reverse() } else { o }
+                let o = order_cmp(a, b, &keys);
+                let _ = (idx, desc);
+                o
             });
         }
         return Some(rows);
@@ -10089,22 +10091,43 @@ fn plan_union(
     // a trailing ORDER BY belongs to the WHOLE union, not the last branch
     let last = parts.pop()?;
     let up = mask_literals(&last.to_ascii_uppercase());
-    let mut order_ordinal: Option<(usize, bool)> = None;
+    let mut order_ordinal: Option<(usize, bool, NullsAt)> = None;
     let last_body = match find_kw_by(&up, "ORDER") {
         Some((kw, cols_at)) => {
             let spec = last[cols_at..].trim();
             let mut it = spec.split_whitespace();
             let n: usize = it.next()?.parse().ok()?;
-            let desc = match it.next() {
+            let mut next = it.next();
+            let desc = match next {
                 None => false,
-                Some(w) if w.eq_ignore_ascii_case("DESC") => true,
-                Some(w) if w.eq_ignore_ascii_case("ASC") => false,
+                Some(w) if w.eq_ignore_ascii_case("DESC") => {
+                    next = it.next();
+                    true
+                }
+                Some(w) if w.eq_ignore_ascii_case("ASC") => {
+                    next = it.next();
+                    false
+                }
+                Some(w) if w.eq_ignore_ascii_case("NULLS") => false,
+                _ => return None,
+            };
+            // ... [ASC|DESC] [NULLS FIRST|LAST], the same two independent
+            // clauses a plain SELECT's ORDER BY takes
+            let nulls = match next {
+                None => NullsAt::Default,
+                Some(w) if w.eq_ignore_ascii_case("NULLS") => {
+                    match it.next().map(|p| p.to_ascii_uppercase()) {
+                        Some(p) if p == "FIRST" => NullsAt::First,
+                        Some(p) if p == "LAST" => NullsAt::Last,
+                        _ => return None,
+                    }
+                }
                 _ => return None,
             };
             if it.next().is_some() || n == 0 {
                 return None;
             }
-            order_ordinal = Some((n - 1, desc));
+            order_ordinal = Some((n - 1, desc, nulls));
             last[..kw].trim().to_string()
         }
         None => last.clone(),
@@ -10141,7 +10164,7 @@ fn plan_union(
         .enumerate()
         .map(|(i, c)| ProjCol { field_id: i, expr: None, ..c.clone() })
         .collect();
-    if let Some((idx, _)) = order_ordinal {
+    if let Some((idx, _, _)) = order_ordinal {
         if idx >= cols.len() {
             return None;
         }
@@ -11404,14 +11427,50 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
 }
 
 /// Compare two rows by a list of (field id, descending) ORDER BY keys.
-fn order_cmp(a: &[Value], b: &[Value], keys: &[(usize, bool)]) -> std::cmp::Ordering {
-    use std::cmp::Ordering::Equal;
+/// Where an ORDER BY key puts its NULLs.
+///
+/// The DEFAULT is not "first" or "last" - it is LOW: NULLs sort below
+/// every value, so they come FIRST ascending and LAST descending (probed
+/// against the engine). `NULLS FIRST` / `NULLS LAST` state a position
+/// instead, and that position does NOT flip with the direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NullsAt {
+    Default,
+    First,
+    Last,
+}
+
+fn order_cmp(a: &[Value], b: &[Value], keys: &[(usize, bool, NullsAt)]) -> std::cmp::Ordering {
+    use std::cmp::Ordering::{Equal, Greater, Less};
     let nullv = Value::Null;
-    for &(fid, desc) in keys {
+    for &(fid, desc, nulls) in keys {
         let va = a.get(fid).unwrap_or(&nullv);
         let vb = b.get(fid).unwrap_or(&nullv);
-        let o = value_cmp(va, vb);
-        let o = if desc { o.reverse() } else { o };
+        let na = matches!(va, Value::Null);
+        let nb = matches!(vb, Value::Null);
+        let o = if na || nb {
+            if na && nb {
+                Equal
+            } else {
+                let first = match nulls {
+                    NullsAt::First => true,
+                    NullsAt::Last => false,
+                    // NULLs are LOW, so the direction decides
+                    NullsAt::Default => !desc,
+                };
+                match (na, first) {
+                    (true, true) | (false, false) => Less,
+                    _ => Greater,
+                }
+            }
+        } else {
+            let o = value_cmp(va, vb);
+            if desc {
+                o.reverse()
+            } else {
+                o
+            }
+        };
         if o != Equal {
             return o;
         }
@@ -11470,7 +11529,8 @@ fn group_output(
     if key_fids.is_empty() {
         out.push(compute_group(&input, gitems)?);
     } else {
-        let keys: Vec<(usize, bool)> = key_fids.iter().map(|&f| (f, false)).collect();
+        let keys: Vec<(usize, bool, NullsAt)> =
+            key_fids.iter().map(|&f| (f, false, NullsAt::Default)).collect();
         input.sort_by(|a, b| order_cmp(a, b, &keys));
         let mut i = 0;
         while i < input.len() {
@@ -12204,10 +12264,12 @@ fn emit_rows_inner(
                         }
                     });
                 }
-                if let Some((idx, desc)) = order_by {
+                if let Some((idx, desc, nulls)) = order_by {
+                    let keys = [(*idx, *desc, *nulls)];
                     rows.sort_by(|a, b| {
-                        let o = value_cmp(&a[*idx], &b[*idx]);
-                        if *desc { o.reverse() } else { o }
+                        let o = order_cmp(a, b, &keys);
+                        let _ = (idx, desc);
+                        o
                     });
                 }
                 for r in &rows {
@@ -16325,17 +16387,40 @@ fn parse_order_by(
     order: &str,
     cols: &[ProjCol],
     resolve_name: impl Fn(&str) -> Option<usize>,
-) -> Option<Vec<(usize, bool)>> {
+) -> Option<Vec<(usize, bool, NullsAt)>> {
     let mut keys = Vec::new();
     for part in order.split(',') {
         let toks: Vec<&str> = part.split_whitespace().collect();
-        let (name, desc) = match toks.as_slice() {
-            [n] => (*n, false),
+        // <name> [ASC|DESC] [NULLS FIRST|LAST] - the two clauses are
+        // independent, and the NULLS one does not flip with the direction
+        let (name, desc, nulls) = match toks.as_slice() {
+            [n] => (*n, false, NullsAt::Default),
             [n, dir] => match dir.to_ascii_uppercase().as_str() {
-                "ASC" => (*n, false),
-                "DESC" => (*n, true),
+                "ASC" => (*n, false, NullsAt::Default),
+                "DESC" => (*n, true, NullsAt::Default),
                 _ => return None,
             },
+            [n, kw, pos] if kw.eq_ignore_ascii_case("NULLS") => {
+                let at = match pos.to_ascii_uppercase().as_str() {
+                    "FIRST" => NullsAt::First,
+                    "LAST" => NullsAt::Last,
+                    _ => return None,
+                };
+                (*n, false, at)
+            }
+            [n, dir, kw, pos] if kw.eq_ignore_ascii_case("NULLS") => {
+                let d = match dir.to_ascii_uppercase().as_str() {
+                    "ASC" => false,
+                    "DESC" => true,
+                    _ => return None,
+                };
+                let at = match pos.to_ascii_uppercase().as_str() {
+                    "FIRST" => NullsAt::First,
+                    "LAST" => NullsAt::Last,
+                    _ => return None,
+                };
+                (*n, d, at)
+            }
             _ => return None,
         };
         let name = name.trim_matches('"');
@@ -16355,7 +16440,7 @@ fn parse_order_by(
         } else {
             resolve_name(name)?
         };
-        keys.push((fid, desc));
+        keys.push((fid, desc, nulls));
     }
     if keys.is_empty() {
         None
@@ -17052,6 +17137,83 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
         }
         Tok::Is if !negated => {
             *pos += 1;
+            // IS [NOT] NULL, or IS [NOT] DISTINCT FROM <side>
+            let not = matches!(t.get(*pos), Some(Tok::Not));
+            let after_not = if not { *pos + 1 } else { *pos };
+            let distinct = matches!(t.get(after_not), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("DISTINCT"));
+            if distinct {
+                // <lhs> IS [NOT] DISTINCT FROM <rhs>
+                *pos = after_not + 1;
+                if !matches!(t.get(*pos), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("FROM")) {
+                    return None;
+                }
+                *pos += 1;
+                // A NULL-SAFE comparison, desugared here the way BETWEEN
+                // and IN are - so every later stage (index matching,
+                // evaluation, refusal) sees shapes it already knows.
+                //
+                //   A IS NOT DISTINCT FROM NULL  ==  A IS NULL
+                //   A IS NOT DISTINCT FROM v     ==  A = v          (v not null)
+                //   A IS DISTINCT FROM v         ==  A IS NULL OR A <> v
+                //   A IS NOT DISTINCT FROM B     ==  A = B OR (A IS NULL AND B IS NULL)
+                //
+                // The third line is the one worth stating: `NOT (A = v)`
+                // is NOT the same predicate, because a NULL A makes the
+                // comparison UNKNOWN and drops the row - while the engine
+                // returns it (probed: `AMT IS DISTINCT FROM 5` gives back
+                // every NULL row).
+                if matches!(t.get(*pos), Some(Tok::Null)) {
+                    *pos += 1;
+                    return Some(if not {
+                        leaf(RawKind::IsNull)
+                    } else {
+                        leaf(RawKind::IsNotNull)
+                    });
+                }
+                let rhs_lhs: Option<RawLhs> = match t.get(*pos) {
+                    Some(Tok::Ident(name)) => Some(RawLhs::Col(name.clone())),
+                    _ => None,
+                };
+                let side = parse_side(t, pos, np)?;
+                let cmp_leaf = |op: Cmp| -> Ast {
+                    match &side {
+                        Side::Val(v) => Ast::Leaf(RawTerm {
+                            lhs: lhs.clone(),
+                            kind: RawKind::Cmp(op, v.clone()),
+                        }),
+                        Side::Expr(e) => Ast::Leaf(RawTerm {
+                            lhs: lhs.clone(),
+                            kind: RawKind::CmpExpr(op, e.clone()),
+                        }),
+                    }
+                };
+                return Some(match (not, rhs_lhs) {
+                    // both sides are columns: the NULL-NULL case is real
+                    (true, Some(rl)) => Ast::Or(vec![
+                        cmp_leaf(Cmp::Eq),
+                        Ast::And(vec![
+                            leaf(RawKind::IsNull),
+                            Ast::Leaf(RawTerm { lhs: rl, kind: RawKind::IsNull }),
+                        ]),
+                    ]),
+                    (false, Some(rl)) => Ast::Or(vec![
+                        cmp_leaf(Cmp::Ne),
+                        Ast::And(vec![
+                            leaf(RawKind::IsNull),
+                            Ast::Leaf(RawTerm { lhs: rl.clone(), kind: RawKind::IsNotNull }),
+                        ]),
+                        Ast::And(vec![
+                            leaf(RawKind::IsNotNull),
+                            Ast::Leaf(RawTerm { lhs: rl, kind: RawKind::IsNull }),
+                        ]),
+                    ]),
+                    // the right side is a value that is not NULL
+                    (true, None) => cmp_leaf(Cmp::Eq),
+                    (false, None) => {
+                        Ast::Or(vec![leaf(RawKind::IsNull), cmp_leaf(Cmp::Ne)])
+                    }
+                });
+            }
             match (t.get(*pos), t.get(*pos + 1)) {
                 (Some(Tok::Null), _) => {
                     *pos += 1;
@@ -21858,7 +22020,27 @@ mod tests {
                 .find(|c| c.name.eq_ignore_ascii_case(n))
                 .map(|c| c.field_id as usize)
         };
-        assert_eq!(parse_order_by("2 DESC, ID", &cols, by_col), Some(vec![(1, true), (3, false)]));
+        assert_eq!(
+            parse_order_by("2 DESC, ID", &cols, by_col),
+            Some(vec![(1, true, NullsAt::Default), (3, false, NullsAt::Default)])
+        );
+        // the NULLS clause is independent of the direction, and either
+        // may appear alone
+        assert_eq!(
+            parse_order_by("ID NULLS LAST", &cols, by_col),
+            Some(vec![(3, false, NullsAt::Last)])
+        );
+        assert_eq!(
+            parse_order_by("ID DESC NULLS FIRST", &cols, by_col),
+            Some(vec![(3, true, NullsAt::First)])
+        );
+        assert_eq!(
+            parse_order_by("2 DESC NULLS LAST, ID NULLS FIRST", &cols, by_col),
+            Some(vec![(1, true, NullsAt::Last), (3, false, NullsAt::First)])
+        );
+        // a position that is not FIRST or LAST is refused, not guessed
+        assert!(parse_order_by("ID NULLS SIDEWAYS", &cols, by_col).is_none());
+        assert!(parse_order_by("ID NULLS", &cols, by_col).is_none());
         assert!(parse_order_by("3", &cols, by_col).is_none()); // ordinal out of range
         assert!(parse_order_by("BOGUS", &cols, by_col).is_none()); // unknown column
     }
@@ -21930,7 +22112,7 @@ mod tests {
 
     #[test]
     fn order_cmp_sorts_with_nulls_low() {
-        let keys = vec![(0usize, false)];
+        let keys = vec![(0usize, false, NullsAt::Default)];
         let mut rows = vec![
             vec![Value::Int(3)],
             vec![Value::Null],
@@ -21939,9 +22121,27 @@ mod tests {
         rows.sort_by(|a, b| order_cmp(a, b, &keys));
         assert_eq!(rows, vec![vec![Value::Null], vec![Value::Int(1)], vec![Value::Int(3)]]);
         // descending reverses (NULLs last)
-        let keys = vec![(0usize, true)];
+        let keys = vec![(0usize, true, NullsAt::Default)];
         rows.sort_by(|a, b| order_cmp(a, b, &keys));
         assert_eq!(rows, vec![vec![Value::Int(3)], vec![Value::Int(1)], vec![Value::Null]]);
+
+        // ... and an EXPLICIT placement does not flip with the direction:
+        // the four combinations are four different orders, which is why
+        // `NULLS FIRST` is not a no-op on an ascending key's default
+        let asc_last = vec![(0usize, false, NullsAt::Last)];
+        rows.sort_by(|a, b| order_cmp(a, b, &asc_last));
+        assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(3)], vec![Value::Null]]);
+        let desc_first = vec![(0usize, true, NullsAt::First)];
+        rows.sort_by(|a, b| order_cmp(a, b, &desc_first));
+        assert_eq!(rows, vec![vec![Value::Null], vec![Value::Int(3)], vec![Value::Int(1)]]);
+        // two NULLs tie, so a later key decides
+        let two = vec![(0usize, false, NullsAt::Last), (1usize, false, NullsAt::Default)];
+        let mut rows2 = vec![
+            vec![Value::Null, Value::Int(2)],
+            vec![Value::Null, Value::Int(1)],
+        ];
+        rows2.sort_by(|a, b| order_cmp(a, b, &two));
+        assert_eq!(rows2[0][1], Value::Int(1));
     }
 
     #[test]

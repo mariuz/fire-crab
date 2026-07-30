@@ -965,6 +965,26 @@ them.
   only decides what to hand back. Anything else duplicates the write
   path and drifts from it.
 
+## NULL is not a value and not an absence - it is a THIRD answer
+
+- **A default is a LAW, not an accident.** "ORDER BY puts NULLs first"
+  is wrong; "NULLs are LOW" is right, and it predicts that a descending
+  key puts them last. State the rule that generates the behaviour, or
+  the first descending query will disagree with you.
+- **An explicit clause may not be the default's mirror.** `NULLS FIRST`
+  states a position that does not flip with ASC/DESC, so the four
+  combinations are four orders. Testing two of them proves nothing about
+  the other two.
+- **Desugar new predicates into shapes the rest of the pipeline already
+  knows.** `IS NOT DISTINCT FROM` becomes an OR of comparisons and NULL
+  tests at PARSE time, exactly as BETWEEN and IN do - so index matching,
+  evaluation and refusal all keep working without a new case each.
+- **Write the three-valued rule out before coding it.** `A IS DISTINCT
+  FROM v` is `A IS NULL OR A <> v`, NOT `NOT (A = v)`: under three-valued
+  logic the negation of UNKNOWN is UNKNOWN and the row vanishes. Put the
+  near-miss predicate in the gate NEXT to the real one, so the
+  difference is a visible row count instead of a claim.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

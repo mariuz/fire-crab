@@ -6336,6 +6336,34 @@ PREPARE, so the write does not happen at all. The alternative — running the DM
 and handing back an empty cursor — is the worst outcome this clause can
 produce, and the gate checks the table to prove it does not.
 
+### Where NULL sits (`qa/serve-real-nulls.sh`, 19 checks)
+
+Two small surfaces that are the same question - what does the engine think a
+NULL is - checked against the live engine as a twin.
+
+**Ordering.** The default placement is not "first" or "last": NULLs are LOW, so
+they come first ascending and last descending. `NULLS FIRST`/`NULLS LAST` state
+a position that does NOT flip with the direction, so the four combinations are
+four distinct orders and the gate checks all four. It also checks a second key
+carrying its own placement, a text column, and the ordinal form - because each
+of those is a separate code path that could have kept the old two-part key.
+
+**Comparison.** `IS [NOT] DISTINCT FROM` treats NULL as a value, and it
+desugars at parse time the way `BETWEEN` and `IN` already do:
+
+```text
+A IS NOT DISTINCT FROM NULL  ==  A IS NULL
+A IS NOT DISTINCT FROM v     ==  A = v                    (v not null)
+A IS DISTINCT FROM v         ==  A IS NULL OR A <> v
+A IS NOT DISTINCT FROM B     ==  A = B OR (A IS NULL AND B IS NULL)
+```
+
+The third rule is the trap. `A IS DISTINCT FROM 5` is NOT `NOT (A = 5)`: a NULL
+A makes the comparison UNKNOWN, `NOT UNKNOWN` is UNKNOWN, and the row is
+dropped - while the engine returns it. The gate keeps `<>` and `NOT (=)` as
+checks of their own, so all three predicates are pinned side by side and the
+difference between them is visible in the output rather than argued about.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

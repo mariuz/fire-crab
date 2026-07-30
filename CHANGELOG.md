@@ -13,6 +13,42 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — the wire server: where NULL sits
+
+### Converted
+- **`ORDER BY ... NULLS FIRST | LAST`.** The DEFAULT placement was
+  already right and is worth naming: it is not "first" or "last" but
+  LOW - NULLs sort below every value, so they come FIRST ascending and
+  LAST descending. An explicit `NULLS FIRST`/`NULLS LAST` states a
+  POSITION instead, and that position does NOT flip with the direction,
+  so the four combinations are four different orders. A converter that
+  reads the clause as "reverse the default" gets two of them wrong.
+  Every ORDER BY key carries its own placement, including a UNION's
+  ordinal form.
+- **`IS [NOT] DISTINCT FROM`**, the null-safe comparison, desugared at
+  parse time the way `BETWEEN` and `IN` already are, so every later
+  stage sees shapes it knows:
+
+  ```text
+  A IS NOT DISTINCT FROM NULL  ==  A IS NULL
+  A IS NOT DISTINCT FROM v     ==  A = v                    (v not null)
+  A IS DISTINCT FROM v         ==  A IS NULL OR A <> v
+  A IS NOT DISTINCT FROM B     ==  A = B OR (A IS NULL AND B IS NULL)
+  ```
+
+  The third line is the one worth stating: `NOT (A = v)` is a DIFFERENT
+  predicate, because a NULL A makes the comparison UNKNOWN and drops the
+  row - while the engine returns it. The gate keeps `<>` and `NOT (=)`
+  beside the new operator to show the three apart.
+
+The gate (`qa/serve-real-nulls.sh`, 19 checks) runs every statement
+through the SAME driver against TWO servers - fire-crab and the live
+engine - on identical databases: the two default orders, all four
+explicit combinations, a second key with its own placement, a text
+column, the ordinal form, both directions of the comparison against
+values, NULLs and other columns, and a refusal for a NULLS position that
+is neither FIRST nor LAST.
+
 ## 2026-07-30 — the wire server: DML with RETURNING
 
 ### Converted
