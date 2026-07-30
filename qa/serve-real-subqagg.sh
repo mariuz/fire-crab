@@ -25,10 +25,12 @@
 #      `> 0` selects nearly all of them). These two are the discriminator
 #      between "the aggregate found nothing" and "the aggregate is zero".
 #   7. The same values through DML, where the check is the TABLE.
-#   8. A refusal: an aggregate over an approximate column is refused
-#      rather than folded, because the top-level `SELECT AVG(D) FROM T`
-#      is refused too - one expression cannot be legal in one position
-#      and illegal in the other.
+#   8. An aggregate over an APPROXIMATE column, in the select list and as
+#      a subquery value. This was a pair of REFUSAL checks when the gate
+#      was written - neither position answered, and what mattered was
+#      that they AGREED. Both answer now, so both are compared; the
+#      property defended is the same one, that one expression may not be
+#      legal in one position and illegal in the other.
 #
 #   qa/serve-real-subqagg.sh [port]
 #
@@ -185,18 +187,15 @@ both "DELETE ... WHERE AMT < (SELECT AVG(AMT))" \
      "DELETE FROM T WHERE AMT < (SELECT AVG(AMT) FROM T)"
 both "the table after the average delete" "SELECT ID, AMT, G FROM T ORDER BY ID"
 
-# --- 8. refusals --------------------------------------------------------
-# an APPROXIMATE source: the engine answers it, this server does not - and
-# what matters is that it refuses in BOTH positions. A subquery that folded
-# a DOUBLE while `SELECT AVG(D) FROM T` was refused would make the same
-# expression legal in one place and illegal in another; worse, the fold
-# used to DROP the double values silently and answer NULL.
-top=$(query "SELECT AVG(D) FROM T" "$PORT" "$A")
-sub=$(query "SELECT ID FROM T WHERE AMT > (SELECT AVG(D) FROM T)" "$PORT" "$A")
-case "$top:$sub" in
-    ERR*:ERR*) echo "OK   an approximate source is refused in BOTH positions" ;;
-    *) echo "DIFF approximate source: top [$top] subquery [$sub]"; fail=1 ;;
-esac
+# --- 8. an APPROXIMATE source, in both positions -----------------------
+# This pair was a REFUSAL check when the slice landed: neither position
+# answered, and what mattered was that they agreed. They both answer now
+# (the approximate-numerics slice), so they are compared instead - and the
+# property being defended is the same one, that a subquery and a select
+# list treat the same expression the same way.
+both "an approximate aggregate in the select list" "SELECT AVG(D) FROM T"
+both "the same aggregate as a subquery value" \
+     "SELECT ID FROM T WHERE AMT > (SELECT AVG(D) FROM T) ORDER BY ID"
 # SUM(text) is not an aggregate the engine allows either
 r=$(query "SELECT ID FROM T WHERE AMT > (SELECT SUM(NAME) FROM T)" "$PORT" "$A")
 case "$r" in

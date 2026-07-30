@@ -1066,6 +1066,22 @@ them.
   refusals as `both servers error` rather than `we error` where you
   can, and expect to promote them to comparisons later.
 
+- **Keep EXACT and APPROXIMATE numerics in different types.** They are
+  both "numbers" and they answer differently: an exact AVG truncates at
+  the source's scale, an approximate one divides in f64. One shared type
+  makes one of the two wrong in every fold, and the wrongness is
+  plausible - a value, not an error.
+- **Types with no decomposition find your fallback.** The exact
+  comparison asks a value for `(raw, scale)`; an f64 has none, so every
+  mixed pair fell past it into a rendered-text compare. Ask what happens
+  to a value your fast path DECLINES, because that is where the last
+  resort lives - and a last resort that can compare anything will
+  compare everything, including the pairs it gets wrong.
+- **Pick fixture values where two plausible rules DISAGREE.** Under text
+  ordering `"1.5" > "1"` is right and `"1.5" < "10"` is wrong. A gate
+  with only the first case passes with the wrong implementation. Look
+  for the input that splits the readings, and put it in.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

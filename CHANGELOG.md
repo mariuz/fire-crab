@@ -13,6 +13,47 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — the wire server: FLOAT and DOUBLE PRECISION as operands
+
+### Converted
+- **Approximate numerics in a predicate**: every operator against an
+  exact literal, against another column (exact or approximate),
+  `IS [NOT] NULL`, `BETWEEN`, `IN`, unary minus and `ABS` — in a SELECT
+  and in a DML.
+- **Aggregates over them**: `SUM`/`AVG`/`MIN`/`MAX` over `DOUBLE
+  PRECISION` and over `FLOAT`, global and grouped, in `HAVING`, and as a
+  subquery's value. All describe as DOUBLE, which is what the engine
+  announces for a FLOAT source too (probed).
+- A new `ExprType::Approx` keeps the family apart from `Numeric`, which
+  is EXACT and folds in i128. The two answer differently and must:
+  `AVG(N)` truncates at the source's scale, `AVG(DP)` is 1.875.
+
+### Fixed
+- **Mixed comparisons fell to the RENDERED-TEXT last resort.** An
+  approximate value has no exact `(raw, scale)` decomposition, so
+  `num_cmp` declined every mixed pair and `value_cmp` compared the two
+  by their printed form. Text ordering is not numeric ordering — `"1.5"`
+  sorts after `"10"` — so the comparisons that looked right were right
+  by luck. `value_cmp` now promotes the exact side to f64, the engine's
+  own conversion.
+
+### Guarded
+- A string literal against an approximate side is CONVERTED at prepare
+  (`DP > '1.25'`), and one that does not parse refuses — where the
+  engine raises SQLSTATE 22018. Neither returns rows.
+- `CAST(... AS DOUBLE PRECISION)` still refuses: the CAST target list
+  holds only integer and text types, a separate surface.
+- An approximate branch may not share a `CASE`/`COALESCE` describe with
+  another family yet, and there is no approximate `?` parameter path.
+
+`qa/serve-real-approx.sh` (46 checks, twin servers on identical
+databases). Its values are chosen so text ordering and numeric ordering
+DISAGREE — `DP < 10` with a 1.5 row in the table is the check that a
+text compare cannot pass. `qa/serve-real-subqagg.sh` lost its
+approximate-source REFUSAL pair and gained two comparisons instead: both
+positions answer now, and the property being defended (a subquery and a
+select list treat one expression the same way) is unchanged.
+
 ## 2026-07-30 — the wire server: a DATE/TIME/TIMESTAMP column in a WHERE
 
 ### Converted

@@ -1810,8 +1810,17 @@ impl Term {
             // NULL or a non-numeric value is UNKNOWN
             Term::NumCmp(fid, op, Rhs::Num(r, s)) => {
                 let rhs = if *s == 0 { Value::Int(*r) } else { Value::Scaled(*r, *s) };
-                match values.get(*fid).and_then(|v| num_cmp(v, &rhs)) {
-                    Some(o) => ord_ok(o, *op),
+                match values.get(*fid) {
+                    // an APPROXIMATE value has no exact decomposition, so
+                    // `num_cmp` declines it; `value_cmp` promotes the
+                    // literal to f64, which is the engine's conversion.
+                    // (This is the HAVING side of an approximate
+                    // aggregate: `HAVING AVG(DP) > 1.8`.)
+                    Some(v @ Value::Double(_)) => ord_ok(value_cmp(v, &rhs), *op),
+                    Some(v) => match num_cmp(v, &rhs) {
+                        Some(o) => ord_ok(o, *op),
+                        None => false,
+                    },
                     None => false,
                 }
             }
@@ -2755,6 +2764,9 @@ fn build_expr_col(
         ExprType::Int => num_form(0),
         ExprType::Text => (Wire::Varying, nullable(448), 32765, 0),
         ExprType::Numeric => num_form(e.result_scale(descs)? as i32),
+        // an approximate result is a DOUBLE on the wire whatever its
+        // source width - the engine widens FLOAT the same way
+        ExprType::Approx => (Wire::Double, nullable(480), 8, 0),
         // a temporal result travels exactly like a stored temporal
         // column (the same wire forms wire_for announces)
         ExprType::Temporal(TKind::Date) => (Wire::Date, nullable(570), 4, 0),
@@ -10940,6 +10952,8 @@ fn plan_group(
                             ExprType::Text
                         } else if is_numeric_col(d) {
                             ExprType::Numeric
+                        } else if is_approx_col(d) {
+                            ExprType::Approx
                         } else if let Some(k) = temporal_kind(d) {
                             ExprType::Temporal(k)
                         } else {
@@ -10980,6 +10994,7 @@ fn plan_group(
                                 Some(d) => wire_for(d),
                                 None => (Wire::Varying, 448, 32765, 0, 0),
                             },
+                            ExprType::Approx => (Wire::Double, 480, 8, 0, 0),
                             ExprType::Temporal(TKind::Date) => (Wire::Date, 570, 4, 0, 0),
                             ExprType::Temporal(TKind::Time) => (Wire::Time, 560, 4, 0, 0),
                             ExprType::Temporal(TKind::Timestamp) => {
@@ -10989,6 +11004,12 @@ fn plan_group(
                     }
                     AggFn::Sum | AggFn::Avg => {
                         let (t, sc, rank) = src_shape?;
+                        // an approximate source folds in f64 and answers
+                        // a DOUBLE - no widening, no scale (probed:
+                        // SUM over a FLOAT column reads as a DOUBLE too)
+                        if matches!(t, ExprType::Approx) {
+                            (Wire::Double, 480, 8, 0, 0)
+                        } else {
                         if !matches!(t, ExprType::Int | ExprType::Numeric) {
                             return None;
                         }
@@ -11002,6 +11023,7 @@ fn plan_group(
                             (Wire::Int128, 32752, 16, sc as i32, 0)
                         } else {
                             (Wire::Int64, 580, 8, sc as i32, 0)
+                        }
                         }
                     }
                 };
@@ -11448,6 +11470,22 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
             &fire_crab_ods::decfloat::decode_dec128(*y),
         ),
         (Value::Double(x), Value::Double(y)) => x.partial_cmp(y).unwrap_or(Equal),
+        // an APPROXIMATE value against an exact one: the exact side
+        // converts to f64, which is the engine's promotion. Without
+        // these two arms the pair fell to the rendered-text fallback
+        // below and `DP > 1` compared "1.5" against "1" as strings.
+        (Value::Double(x), other) => match numeric_parts(other) {
+            Some((raw, sc)) => x
+                .partial_cmp(&(raw as f64 * 10f64.powi(sc as i32)))
+                .unwrap_or(Equal),
+            None => a.render().cmp(&b.render()),
+        },
+        (other, Value::Double(y)) => match numeric_parts(other) {
+            Some((raw, sc)) => (raw as f64 * 10f64.powi(sc as i32))
+                .partial_cmp(y)
+                .unwrap_or(Equal),
+            None => a.render().cmp(&b.render()),
+        },
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::Time(x), Value::Time(y)) => x.cmp(y),
@@ -12958,6 +12996,10 @@ enum RawExpr {
     /// `(15, -1)`, `1.50` is `(150, -2)` (trailing zeros count, as the
     /// engine's scale does)
     Dec(i64, i8),
+    /// an APPROXIMATE literal - only ever built by folding a subquery's
+    /// FLOAT/DOUBLE answer back into the token stream (there is no
+    /// approximate literal in the SQL text; `1.5` is EXACT)
+    Double(f64),
     Str(String),
     Null,
     Neg(Box<RawExpr>),
@@ -13604,6 +13646,7 @@ fn raw_bad_substring_len(e: &RawExpr) -> Option<i64> {
             .filter(|n| *n < 0)
             .or_else(|| walk_all(args)),
         RawExpr::Func(_, args) | RawExpr::Coalesce(args) => walk_all(args),
+        RawExpr::Double(_) => None,
         RawExpr::Neg(a) | RawExpr::Cast(a, _) => raw_bad_substring_len(a),
         RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => {
             raw_bad_substring_len(a).or_else(|| raw_bad_substring_len(b))
@@ -14062,15 +14105,20 @@ fn resolve_expr(
                 return None;
             }
             let d = descs.get(fid)?;
-            // an int, text, scaled-numeric or temporal column
-            // (type_of/eval decide what each may do)
-            if col_kind(d).is_none() && !is_numeric_col(d) && temporal_kind(d).is_none() {
+            // an int, text, scaled-numeric, temporal or approximate
+            // column (type_of/eval decide what each may do)
+            if col_kind(d).is_none()
+                && !is_numeric_col(d)
+                && temporal_kind(d).is_none()
+                && !is_approx_col(d)
+            {
                 return None;
             }
             Expr::Col(fid)
         }
         RawExpr::Int(n) => Expr::Int(*n),
         RawExpr::Dec(raw, scale) => Expr::Dec(*raw, *scale),
+        RawExpr::Double(d) => Expr::Double(*d),
         RawExpr::Str(s) => Expr::Str(s.clone()),
         RawExpr::Null => Expr::Null,
         RawExpr::Neg(e) => Expr::Neg(Box::new(resolve_expr(e, columns, descs)?)),
@@ -14148,6 +14196,9 @@ enum Expr {
     Int(i64),
     /// a decimal literal: (raw integer, scale)
     Dec(i64, i8),
+    /// an APPROXIMATE literal - what a string literal becomes when the
+    /// other side of a comparison is a FLOAT/DOUBLE column
+    Double(f64),
     Str(String),
     Null,
     Neg(Box<Expr>),
@@ -14294,6 +14345,11 @@ enum ExprType {
     /// a DATE/TIME/TIMESTAMP result - travels in its own wire form
     /// exactly like a stored temporal column
     Temporal(TKind),
+    /// an APPROXIMATE numeric - FLOAT or DOUBLE PRECISION. Kept apart
+    /// from `Numeric` (which is EXACT, scaled, and folds in i128)
+    /// because the two answer differently: an exact AVG truncates at
+    /// the source's scale, an approximate one divides in f64
+    Approx,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -14318,6 +14374,7 @@ fn conditional_type<'a>(
     let mut any_text = false;
     let mut temporal: Option<TKind> = None;
     let mut any_other = false;
+    let mut any_approx = false;
     for t in branches.filter_map(|e| e.type_of(descs)) {
         if first.is_none() {
             first = Some(t);
@@ -14326,6 +14383,9 @@ fn conditional_type<'a>(
             ExprType::Numeric => any_numeric = true,
             ExprType::Text => any_text = true,
             ExprType::Int => any_other = true,
+            // an approximate branch does not share a describe with any
+            // other family (nor promote them yet) - refuse the mix
+            ExprType::Approx => any_approx = true,
             ExprType::Temporal(k) => match temporal {
                 None => temporal = Some(k),
                 // two different temporal kinds cannot share a describe
@@ -14343,10 +14403,24 @@ fn conditional_type<'a>(
             first
         };
     }
+    if any_approx {
+        return if any_numeric || any_text || any_other {
+            None
+        } else {
+            first
+        };
+    }
     if any_numeric && !any_text {
         return Some(ExprType::Numeric);
     }
     first
+}
+
+/// A FLOAT / DOUBLE PRECISION column - the APPROXIMATE numerics, which
+/// decode to `Value::Double` and compare as f64 rather than through the
+/// exact i128 alignment.
+fn is_approx_col(d: &Descriptor) -> bool {
+    matches!(d.dtype, dtype::REAL | dtype::DOUBLE)
 }
 
 /// A plain temporal column - DATE/TIME/TIMESTAMP (the TIME ZONE types
@@ -14822,11 +14896,13 @@ impl Expr {
                     // marker); numeric columns classify from the desc
                     Some(ColKind::Numeric) => None,
                     None if is_numeric_col(d) => Some(ExprType::Numeric),
+                    None if is_approx_col(d) => Some(ExprType::Approx),
                     None => temporal_kind(d).map(ExprType::Temporal),
                 }
             }
             Expr::Int(_) => Some(ExprType::Int),
             Expr::Dec(..) => Some(ExprType::Numeric),
+            Expr::Double(_) => Some(ExprType::Approx),
             Expr::Str(_) => Some(ExprType::Text),
             Expr::Null => Some(ExprType::Int),
             Expr::DateLit(_) => Some(ExprType::Temporal(TKind::Date)),
@@ -14835,6 +14911,7 @@ impl Expr {
             Expr::Neg(e) => match e.type_of(descs)? {
                 ExprType::Int => Some(ExprType::Int),
                 ExprType::Numeric => Some(ExprType::Numeric),
+                ExprType::Approx => Some(ExprType::Approx),
                 ExprType::Text | ExprType::Temporal(_) => None,
             },
             Expr::Bin(a, op, b) => match (a.type_of(descs)?, b.type_of(descs)?) {
@@ -14984,6 +15061,7 @@ impl Expr {
                     SysFn::Abs => match ts[0] {
                         ExprType::Int => Some(ExprType::Int),
                         ExprType::Numeric => Some(ExprType::Numeric),
+                        ExprType::Approx => Some(ExprType::Approx),
                         ExprType::Text | ExprType::Temporal(_) => None,
                     },
                 }
@@ -15086,6 +15164,9 @@ impl Expr {
         match self {
             // the widest branch decides the width, so a value from any
             // branch fits the announced column
+            // an APPROXIMATE value has no exact rank - width is not what
+            // decides its wire form
+            Expr::Double(_) => None,
             Expr::Coalesce(args) => args.iter().filter_map(|a| a.rank_of(descs)).max(),
             Expr::Case(branches, else_) => branches
                 .iter()
@@ -15182,6 +15263,7 @@ impl Expr {
     /// `Err(EvalErr)` is a per-row arithmetic exception (divide by zero).
     fn eval(&self, values: &[Value]) -> Result<Value, EvalErr> {
         Ok(match self {
+            Expr::Double(d) => Value::Double(*d),
             // the first operand that is not NULL; NULL when all are
             Expr::Coalesce(args) => {
                 let mut out = Value::Null;
@@ -15247,6 +15329,7 @@ impl Expr {
                 Value::Int(n) => Value::Int(n.wrapping_neg()),
                 Value::Scaled(r, s) => Value::Scaled(r.wrapping_neg(), s),
                 Value::Int128(r, s) => Value::Int128(-r, s),
+                Value::Double(d) => Value::Double(-d),
                 _ => Value::Null,
             },
             Expr::Bin(a, op, b) => {
@@ -15527,6 +15610,12 @@ impl Expr {
                     SysFn::Reverse => {
                         Value::Text(fn_text(&vs[0]).chars().rev().collect())
                     }
+                    // an approximate operand keeps its family (there is
+                    // no scale to keep)
+                    SysFn::Abs if matches!(vs[0], Value::Double(_)) => {
+                        let Value::Double(d) = vs[0] else { unreachable!() };
+                        Value::Double(d.abs())
+                    }
                     SysFn::Abs => {
                         let (raw, scale) =
                             numeric_parts(&vs[0]).ok_or(EvalErr::ConversionError(None))?;
@@ -15786,6 +15875,7 @@ fn value_to_tok(v: &Value) -> Option<Tok> {
         // a TEMPORAL answer folds back as the literal it is, not as its
         // rendered text: `WHERE D = (SELECT MAX(D) FROM T)` must compare
         // as a DATE, and a Tok::Str would have taken the text path
+        Value::Double(d) => Tok::FnExpr(RawExpr::Double(*d)),
         Value::Date(d) => Tok::FnExpr(RawExpr::DateLit(*d)),
         Value::Time(t) => Tok::FnExpr(RawExpr::TimeLit(*t)),
         Value::Timestamp(d, t) => Tok::FnExpr(RawExpr::TsLit(*d, *t)),
@@ -15999,7 +16089,9 @@ fn eval_subquery(
                 // subquery would make one expression legal in one
                 // position and illegal in the other
                 if matches!(func, AggFn::Sum | AggFn::Avg)
-                    && !(matches!(col_kind(d), Some(ColKind::Int)) || is_numeric_col(d))
+                    && !(matches!(col_kind(d), Some(ColKind::Int))
+                        || is_numeric_col(d)
+                        || is_approx_col(d))
                 {
                     return None;
                 }
@@ -16008,7 +16100,10 @@ fn eval_subquery(
             AggTarget::Expr(raw) => {
                 let e = resolve_expr(raw, &columns, &descs)?;
                 if matches!(func, AggFn::Sum | AggFn::Avg)
-                    && !matches!(e.type_of(&descs)?, ExprType::Int | ExprType::Numeric)
+                    && !matches!(
+                        e.type_of(&descs)?,
+                        ExprType::Int | ExprType::Numeric | ExprType::Approx
+                    )
                 {
                     return None;
                 }
@@ -16552,7 +16647,8 @@ fn default_expr_name(raw: &RawExpr) -> String {
         RawExpr::DateLit(_) | RawExpr::TimeLit(_) | RawExpr::TsLit(..) => "CONSTANT",
         // the engine leaves a unary-minus column unnamed (blank header)
         RawExpr::Neg(_) => "",
-        RawExpr::Int(_) | RawExpr::Dec(..) | RawExpr::Str(_) | RawExpr::Null => "CONSTANT",
+        RawExpr::Int(_) | RawExpr::Dec(..) | RawExpr::Double(_) | RawExpr::Str(_)
+        | RawExpr::Null => "CONSTANT",
         RawExpr::Col(_) => "EXPR",
     }
     .to_string()
@@ -18634,7 +18730,7 @@ fn resolve_predicate(
                 // TIMESTAMP, the way the engine does - and going
                 // through it means IS NULL, LIKE, BETWEEN and IN come
                 // along without a temporal case each
-                None if temporal_kind(d).is_some() => {
+                None if temporal_kind(d).is_some() || is_approx_col(d) => {
                     resolve_expr_term(&rt, columns, descs, params)?
                 }
                 None => return None,
@@ -18693,8 +18789,8 @@ fn resolve_expr_term(
                     (d(dtype::INT64, 8, lhs.result_scale(descs)?), ColKind::Numeric)
                 }
                 ExprType::Text => (d(dtype::VARYING, 32765, 0), ColKind::Text),
-                // no temporal parameter path yet - refuse
-                ExprType::Temporal(_) => return None,
+                // no temporal or approximate parameter path yet - refuse
+                ExprType::Temporal(_) | ExprType::Approx => return None,
             };
             if params.len() <= *slot {
                 params.resize(*slot + 1, None);
@@ -18703,11 +18799,11 @@ fn resolve_expr_term(
             return Some(Term::ExprParam(Box::new(lhs), *op, *slot, kind));
         }
         RawKind::Cmp(op, rhs) => {
-            let (l, r) = temporal_sides(lhs, rhs_expr(rhs)?, descs)?;
+            let (l, r) = cmp_sides(lhs, rhs_expr(rhs)?, descs)?;
             Term::ExprCond(Box::new(Cond2::Cmp(Box::new(l), *op, Box::new(r))))
         }
         RawKind::CmpExpr(op, e) => {
-            let (l, r) = temporal_sides(lhs, resolve_expr(e, columns, descs)?, descs)?;
+            let (l, r) = cmp_sides(lhs, resolve_expr(e, columns, descs)?, descs)?;
             Term::ExprCond(Box::new(Cond2::Cmp(Box::new(l), *op, Box::new(r))))
         }
         RawKind::IsNull => Term::ExprCond(Box::new(Cond2::IsNull(Box::new(lhs)))),
@@ -18749,7 +18845,9 @@ fn resolve_expr_term(
 }
 
 /// Type-check (and where the engine converts, CONVERT) the two sides of
-/// a comparison when either is TEMPORAL.
+/// a comparison when either is TEMPORAL or APPROXIMATE - the two
+/// families `value_cmp` would otherwise hand to its rendered-text last
+/// resort.
 ///
 /// `value_cmp`'s last resort compares two values by their RENDERED TEXT,
 /// which is a trap here: ISO date text happens to order like dates, so
@@ -18766,7 +18864,7 @@ fn resolve_expr_term(
 /// rule). TIME against DATE or TIMESTAMP is REFUSED: the engine promotes
 /// a TIME using the CURRENT DATE, which this server does not do, and a
 /// render-compare of the two would answer confidently and wrongly.
-fn temporal_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)> {
+fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)> {
     // a NULL literal has no type to check against - the comparison is
     // UNKNOWN whatever the other side is. (It types as Int, so without
     // this it would look like the number-against-a-date refusal; that
@@ -18807,7 +18905,37 @@ fn temporal_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, E
         // temporal and fails the conversion (SQLSTATE 22018), so there
         // is no answer to give - refuse rather than text-compare
         (ExprType::Temporal(_), _) | (_, ExprType::Temporal(_)) => None,
+        // an APPROXIMATE side meets any exact number: the exact one
+        // converts to f64 (probed - `DP > 1` takes the 1.5 row, which a
+        // truncating conversion the other way would have dropped)
+        (ExprType::Approx, ExprType::Int | ExprType::Numeric | ExprType::Approx)
+        | (ExprType::Int | ExprType::Numeric, ExprType::Approx) => Some((lhs, rhs)),
+        // ... and against a STRING LITERAL the engine converts the
+        // string (probed: `DP > '1.5'` is the same as `DP > 1.5`, and
+        // `DP > 'x'` raises 22018). Parse it here, at prepare; one that
+        // will not parse refuses instead of reaching the text compare.
+        (ExprType::Approx, ExprType::Text) => {
+            let r = approx_literal(&rhs)?;
+            Some((lhs, r))
+        }
+        (ExprType::Text, ExprType::Approx) => {
+            let l = approx_literal(&lhs)?;
+            Some((l, rhs))
+        }
+        (ExprType::Approx, _) | (_, ExprType::Approx) => None,
         _ => Some((lhs, rhs)),
+    }
+}
+
+/// A string literal read as an APPROXIMATE number, for the side of a
+/// comparison whose other side is one. Anything that is not a literal,
+/// or does not parse, answers None and refuses the statement - the
+/// engine raises SQLSTATE 22018 there, and the one thing neither may do
+/// is compare the two as text.
+fn approx_literal(e: &Expr) -> Option<Expr> {
+    match e {
+        Expr::Str(s) => s.trim().parse::<f64>().ok().map(Expr::Double),
+        _ => None,
     }
 }
 
@@ -18832,6 +18960,7 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
         Expr::Col(_)
         | Expr::Int(_)
         | Expr::Dec(..)
+        | Expr::Double(_)
         | Expr::Str(_)
         | Expr::Null
         | Expr::DateLit(_)
@@ -19048,7 +19177,9 @@ fn resolve_having(
                                 HKind::Int
                             } else if matches!(col_kind(d), Some(ColKind::Int)) {
                                 HKind::Int
-                            } else if is_numeric_col(d) {
+                            } else if is_numeric_col(d) || is_approx_col(d) {
+                                // approximate folds land here too - the
+                                // comparison promotes the literal
                                 HKind::Numeric
                             } else if matches!(col_kind(d), Some(ColKind::Text))
                                 && matches!(func, AggFn::Min | AggFn::Max)
@@ -19068,7 +19199,7 @@ fn resolve_having(
                             } else {
                                 match e.type_of(descs)? {
                                     ExprType::Int => HKind::Int,
-                                    ExprType::Numeric => HKind::Numeric,
+                                    ExprType::Numeric | ExprType::Approx => HKind::Numeric,
                                     ExprType::Text
                                         if matches!(func, AggFn::Min | AggFn::Max) =>
                                     {
@@ -24282,6 +24413,77 @@ mod tests {
         ] {
             assert!(parse_raw_expr(bad).is_none(), "{bad} parsed");
         }
+    }
+
+    #[test]
+    fn resolves_and_evaluates_approximate_predicates() {
+        // DP DOUBLE PRECISION, F FLOAT, N NUMERIC(9,2), I INTEGER
+        let columns = vec![
+            RelationColumn { name: "DP".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "F".into(), field_id: 1, position: 1 },
+            RelationColumn { name: "N".into(), field_id: 2, position: 2 },
+            RelationColumn { name: "I".into(), field_id: 3, position: 3 },
+        ];
+        let d = |dt, len, sc| Descriptor {
+            dtype: dt, scale: sc, length: len, sub_type: 0, flags: 0, offset: 4,
+        };
+        let descs = vec![
+            d(dtype::DOUBLE, 8, 0),
+            d(dtype::REAL, 4, 0),
+            d(dtype::LONG, 4, -2),
+            d(dtype::LONG, 4, 0),
+        ];
+        let row = vec![
+            Value::Double(1.5),
+            Value::Double(1.5),
+            Value::Scaled(125, -2), // 1.25
+            Value::Int(1),
+        ];
+        let null_row = vec![Value::Null; 4];
+        let build = |s: &str| -> Option<Predicate> {
+            let toks = tokenize(s)?;
+            let mut np = 0usize;
+            let raw = parse_predicate(&toks, &mut np)?;
+            let mut params: Vec<Option<Descriptor>> = Vec::new();
+            resolve_predicate(raw, &columns, &descs, &mut params)
+        };
+        let hit = |s: &str| build(s).unwrap_or_else(|| panic!("{s} refused")).matches(&row).unwrap();
+
+        // an approximate column against an EXACT literal: the literal
+        // converts to f64. `DP > 1` must take the 1.5 row - a compare
+        // that truncated the other way would drop it, and the RENDERED
+        // TEXT fallback compared "1.5" against "1" as strings
+        assert!(hit("DP > 1"));
+        assert!(!hit("DP > 1.5"));
+        assert!(hit("DP >= 1.5"));
+        assert!(hit("DP = 1.5"));
+        assert!(hit("F = 1.5")); // FLOAT decodes to the same family
+        assert!(hit("DP BETWEEN 1 AND 2"));
+        assert!(hit("DP IN (1.5, 4)"));
+        assert!(!hit("DP IS NULL"));
+        assert!(build("DP IS NULL").unwrap().matches(&null_row).unwrap());
+        // against another column, exact or approximate
+        assert!(hit("DP > N"));   // 1.5 > 1.25
+        assert!(hit("DP > I"));   // 1.5 > 1
+        assert!(hit("DP = F"));
+        // a STRING literal converts (the engine does too); one that does
+        // not parse refuses rather than reaching the text compare
+        assert!(hit("DP > '1.25'"));
+        assert!(build("DP > 'x'").is_none());
+        // unary and ABS keep the family
+        assert!(hit("-DP < 0"));
+        assert!(hit("ABS(DP) = 1.5"));
+
+        // and the comparison rule itself, which is where a wrong answer
+        // would hide: an f64 against every exact shape
+        use std::cmp::Ordering::*;
+        assert_eq!(value_cmp(&Value::Double(1.5), &Value::Int(1)), Greater);
+        assert_eq!(value_cmp(&Value::Int(2), &Value::Double(1.5)), Greater);
+        assert_eq!(value_cmp(&Value::Double(1.5), &Value::Scaled(150, -2)), Equal);
+        assert_eq!(value_cmp(&Value::Double(1.5), &Value::Scaled(1500, -3)), Equal);
+        assert_eq!(value_cmp(&Value::Double(-0.5), &Value::Int(0)), Less);
+        // text ordering would have said "1.5" > "10" - the numbers do not
+        assert_eq!(value_cmp(&Value::Double(1.5), &Value::Int(10)), Less);
     }
 
     #[test]

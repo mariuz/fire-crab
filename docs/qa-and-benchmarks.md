@@ -6500,6 +6500,52 @@ temporal LITERAL — as text it would take the text path again. And
 `qa/serve-real-datemath.sh` lost a refusal: `WHERE DATEADD(1 DAY TO D) >
 DATE '2024-01-01'` was on its refusal list and is now checked as a comparison.
 
+### FLOAT and DOUBLE PRECISION as operands (`qa/serve-real-approx.sh`, 46 checks)
+
+The approximate numerics had been readable and sortable for many slices and
+nothing else: a FLOAT or DOUBLE column in any predicate refused the statement,
+and `SUM(DP)` refused too. Structurally this is the temporal gap again — the
+resolver classified columns through `col_kind`, which answers `Int` or `Text`
+— so the fix has the same shape: a new `ExprType::Approx`, a classifier
+beside `is_numeric_col`, and the column routed to the expression path.
+
+The family has to stay APART from `Numeric`, which is exact and folds in
+i128, because the two answer differently. `AVG(N)` over a NUMERIC truncates at
+the source's scale; `AVG(DP)` is 1.875 and has no scale at all. Collapsing
+them would have made one of the two wrong in every aggregate.
+
+**The trap underneath.** `value_cmp` ends in a last resort that compares two
+values by their RENDERED TEXT. An approximate value has no exact
+`(raw, scale)` decomposition, so `num_cmp` declined every mixed pair and each
+one fell through to that fallback. Text ordering is not numeric ordering:
+`"1.5"` sorts after `"10"`. Every comparison that appeared to work was working
+by luck of the decimal digits, and `DP < 10` — with a 1.5 row in the table —
+is the case that separates the two. It is in the gate for exactly that reason,
+next to `DP > 1`, which agrees under both readings.
+
+The fold had the same hole one layer up, closed in the previous slice: SUM and
+AVG asked for an exact decomposition and `continue`d on None, so a DOUBLE
+contributed nothing and `AVG(DP)` folded to NULL over a column full of
+numbers. With the planner now typing approximate sources, that promotion
+finally has a caller.
+
+**What is deliberately still refused**, and pinned:
+
+- `CAST(... AS DOUBLE PRECISION)` — the CAST target list holds integer and
+  text types only, a separate surface (NUMERIC and the temporal targets are
+  missing from it too).
+- an approximate branch mixed with another family in one `CASE`/`COALESCE`
+  describe, and `?` parameters against an approximate side.
+
+One neighbouring gate changed shape. `qa/serve-real-subqagg.sh` had a pair of
+REFUSAL checks asserting that an approximate aggregate was refused in BOTH
+positions — the select list and a subquery value — the point being that they
+AGREED. Both answer now, so both are compared; the property defended is
+identical, and only the verdict moved. That is the second refusal-list entry
+in three slices to be promoted this way, and both failed loudly rather than
+rotting silently, which is the argument for writing refusals as gate checks
+in the first place.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
