@@ -10237,6 +10237,253 @@ fn replace_idents(text: &str, map: &[(String, String)]) -> String {
     out
 }
 
+/// Replace an identifier only where it stands as a TABLE REFERENCE - not
+/// as a qualifier (`V.C`), not as a column, and not inside a string.
+/// What separates the two is a dot on either side.
+fn replace_table_ref(text: &str, from: &str, to: &str) -> String {
+    let b: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == '\'' {
+            out.push(b[i]);
+            i += 1;
+            while i < b.len() {
+                out.push(b[i]);
+                if b[i] == '\'' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b[i].is_alphabetic() || b[i] == '_' {
+            let start = i;
+            while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$') {
+                i += 1;
+            }
+            let word: String = b[start..i].iter().collect();
+            let after_dot = start > 0 && b[start - 1] == '.';
+            let before_dot = i < b.len() && b[i] == '.';
+            if word.eq_ignore_ascii_case(from) && !after_dot && !before_dot {
+                out.push_str(to);
+            } else {
+                out.push_str(&word);
+            }
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+/// A view used as a SIDE of a join. The single-table path rewrites the
+/// whole query - projection, WHERE, GROUP BY - because it can rename the
+/// view's columns to the base's freely. In a join it CANNOT: a bare name
+/// belongs to whichever side owns it, and renaming it blindly would also
+/// rename a same-named column of the other table.
+///
+/// So this handles the case that needs NO renaming - a view whose columns
+/// carry the base's own names, which is what `CREATE VIEW V AS SELECT A,
+/// B FROM T` makes - and rewrites only two things: the FROM (the view's
+/// name becomes the base table's, keeping the alias, so every qualified
+/// reference still resolves) and the WHERE (the view's own condition,
+/// QUALIFIED by that alias, ANDed with the outer one).
+///
+/// A view with renamed columns refuses. That wants an alias-aware rewrite
+/// of every reference in the statement, which is a different piece of
+/// work from this one.
+fn expand_view_join(
+    sql: &str,
+    db: &Database,
+    table_s: &str,
+    where_s: Option<&str>,
+    from: &TableRef<'_>,
+    join: &[(JoinKind, TableRef<'_>, &str, usize)],
+) -> Option<String> {
+    // A RIGHT or FULL join makes an EARLIER side nullable, and which side
+    // a view's own WHERE belongs to then stops being a local question.
+    // Refuse rather than guess.
+    if join
+        .iter()
+        .any(|(k, _, _, _)| matches!(k, JoinKind::Right | JoinKind::Full))
+        && std::iter::once(from)
+            .chain(join.iter().map(|(_, r, _, _)| r))
+            .any(|tr| view_of(db, tr.table).is_some())
+    {
+        return None;
+    }
+    // (alias, view name, base table, the view's own WHERE, step index -
+    // None for the base table)
+    let mut expansions: Vec<(String, String, String, Option<String>, Option<usize>)> = Vec::new();
+    let mut any = false;
+    for (step, tr) in std::iter::once((None, from))
+        .chain(join.iter().enumerate().map(|(i, (_, r, _, _))| (Some(i), r)))
+    {
+        let Some(vd) = view_of(db, tr.table) else { continue };
+        any = true;
+        let (vproj, vtable, vwhere, vgroup, vhaving, vorder) = split_query(&vd.source)?;
+        if vgroup.is_some() || vhaving.is_some() || vorder.is_some() {
+            return None;
+        }
+        let (vfrom, vjoin) = parse_from(vtable)?;
+        if !vjoin.is_empty() || view_of(db, vfrom.table).is_some() {
+            return None; // a view over a join, or over another view
+        }
+        let base_cols: Vec<String> = match parse_projection(vproj)? {
+            Proj::Items(items) => items
+                .iter()
+                .map(|it| match it {
+                    SelItem::Col(c, _) => Some(c.clone()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?,
+            Proj::Star => return None,
+        };
+        if base_cols.len() != vd.cols.len() {
+            return None;
+        }
+        // the no-renaming case only: every view column carries the base
+        // column's own name
+        if vd
+            .cols
+            .iter()
+            .zip(base_cols.iter())
+            .any(|(v, b)| !v.eq_ignore_ascii_case(b))
+        {
+            return None;
+        }
+        expansions.push((
+            tr.alias.unwrap_or(tr.table).to_string(),
+            tr.table.to_string(),
+            vfrom.table.to_string(),
+            vwhere.map(|w| w.to_string()),
+            step,
+        ));
+    }
+    if !any {
+        return None;
+    }
+    // Where a view's own WHERE goes is decided by whether that side can
+    // be NULL-PADDED. A padded row's columns are all NULL, so a predicate
+    // in the outer WHERE would throw the padded row away - the view's
+    // rows must be filtered BEFORE the padding, which is what putting the
+    // predicate in that step's ON means. The base table is never padded
+    // here (the RIGHT/FULL case was refused above), so its own WHERE goes
+    // to the outer WHERE, where it belongs.
+    let mut new_from = table_s.to_string();
+    let mut conds: Vec<String> = Vec::new();
+    let mut splices: Vec<(usize, usize, String)> = Vec::new();
+    for (alias, _, _, vwhere, step) in &expansions {
+        let Some(w) = vwhere else { continue };
+        let q = qualify_idents(w, alias);
+        match step {
+            None => conds.push(format!("({})", q)),
+            Some(i) => {
+                let (kind, _, on, _) = &join[*i];
+                if *on == CROSS_ON || *on == NATURAL_ON {
+                    // no ON text to attach to: only sound where the side
+                    // cannot be padded
+                    if !matches!(kind, JoinKind::Inner) {
+                        return None;
+                    }
+                    conds.push(format!("({})", q));
+                } else {
+                    let off = on.as_ptr() as usize - table_s.as_ptr() as usize;
+                    if off + on.len() > table_s.len() {
+                        return None;
+                    }
+                    splices.push((off, on.len(), format!("({}) AND ({})", on, q)));
+                }
+            }
+        }
+    }
+    splices.sort_by(|a, b| b.0.cmp(&a.0));
+    for (off, len, text) in splices {
+        new_from.replace_range(off..off + len, &text);
+    }
+    for (alias, view, base, _, _) in &expansions {
+        // Only in TABLE position: the FROM text contains the ON
+        // conditions too, and `VEMP.DEPT_ID` there must keep its
+        // qualifier - an unaliased view lends its NAME to the base table
+        // as an alias, which is what makes that reference still resolve.
+        let to = if alias.eq_ignore_ascii_case(view) {
+            format!("{} {}", base, alias)
+        } else {
+            base.clone()
+        };
+        new_from = replace_table_ref(&new_from, view, &to);
+    }
+    if let Some(w) = where_s {
+        conds.push(format!("({})", w));
+    }
+    let (proj_s, _, _, group_s, having_s, order_s) = split_query(sql)?;
+    let mut out = format!("SELECT {} FROM {}", proj_s, new_from);
+    if !conds.is_empty() {
+        out.push_str(&format!(" WHERE {}", conds.join(" AND ")));
+    }
+    if let Some(g) = group_s {
+        out.push_str(&format!(" GROUP BY {}", g));
+    }
+    if let Some(h) = having_s {
+        out.push_str(&format!(" HAVING {}", h));
+    }
+    if let Some(o) = order_s {
+        out.push_str(&format!(" ORDER BY {}", o));
+    }
+    Some(out)
+}
+
+/// Prefix every bare column name in a view's own WHERE with the alias the
+/// view has in the outer query. Safe because that text can only name the
+/// view's base table's columns - there is no other side in scope there.
+fn qualify_idents(text: &str, alias: &str) -> String {
+    let b: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == '\'' {
+            out.push(b[i]);
+            i += 1;
+            while i < b.len() {
+                out.push(b[i]);
+                if b[i] == '\'' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b[i].is_alphabetic() || b[i] == '_' {
+            let start = i;
+            while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$') {
+                i += 1;
+            }
+            let word: String = b[start..i].iter().collect();
+            let kw = matches!(
+                word.to_ascii_uppercase().as_str(),
+                "AND" | "OR" | "NOT" | "IS" | "NULL" | "LIKE" | "BETWEEN" | "IN"
+                    | "TRUE" | "FALSE" | "UNKNOWN" | "ESCAPE"
+            );
+            // already qualified, or a keyword: leave it alone
+            let qualified = start > 0 && b[start - 1] == '.';
+            let has_qual = i < b.len() && b[i] == '.';
+            if kw || qualified || has_qual {
+                out.push_str(&word);
+            } else {
+                out.push_str(&format!("{}.{}", alias, word));
+            }
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
 /// If `sql`'s FROM names a VIEW, rewrite the query against the view's
 /// base table and return it for the planner to re-plan. None when the
 /// FROM is an ordinary table or the view is outside the supported shape.
@@ -10244,7 +10491,7 @@ fn expand_view(sql: &str, db: &Database) -> Option<String> {
     let (proj_s, table_s, where_s, group_s, having_s, order_s) = split_query(sql)?;
     let (from, join) = parse_from(table_s)?;
     if !join.is_empty() {
-        return None; // a join over a view: not this slice
+        return expand_view_join(sql, db, table_s, where_s, &from, &join);
     }
     let vd = view_of(db, from.table)?;
     // the view's own source must be a single-table projection of bare
@@ -11004,13 +11251,19 @@ fn plan_query_inner(
         // falling through would scan its empty storage and answer ZERO
         // ROWS - a wrong answer that looks like a legitimately empty
         // result.
+        // Every SIDE, not just the first: a view that is the second table
+        // of a join is the same empty scan, and it reads as a plausible
+        // count rather than as an error - `DEPT RIGHT JOIN VEMP` answered
+        // 0 while the engine answered 3.
         if let Some((_, table_s, _, _, _, _)) = split_query(sql) {
-            if let Some((from, _)) = parse_from(table_s) {
-                if view_of(dbr, from.table).is_some() {
-                    if trace {
-                        eprintln!("[srv] plan: view {} is not expandable", from.table);
+            if let Some((from, join)) = parse_from(table_s) {
+                for tr in std::iter::once(&from).chain(join.iter().map(|(_, r, _, _)| r)) {
+                    if view_of(dbr, tr.table).is_some() {
+                        if trace {
+                            eprintln!("[srv] plan: view {} is not expandable", tr.table);
+                        }
+                        return Some(Plan::Refused);
                     }
-                    return Some(Plan::Refused);
                 }
             }
         }
@@ -23483,6 +23736,39 @@ pub fn serve(addr: &str, user: &str, password: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_position_is_not_qualifier_position() {
+        // An unaliased view lends its NAME to its base table, so the ON's
+        // `VEMP.DEPT_ID` must survive untouched. Replacing the word
+        // everywhere produced `EMP VEMP.DEPT_ID`, which parses as
+        // nothing at all.
+        let f = "VEMP JOIN DEPT ON VEMP.DEPT_ID = DEPT.ID";
+        assert_eq!(
+            replace_table_ref(f, "VEMP", "EMP VEMP"),
+            "EMP VEMP JOIN DEPT ON VEMP.DEPT_ID = DEPT.ID"
+        );
+        // an ALIASED view: the qualifier is the alias, so the view's own
+        // name appears only in table position
+        assert_eq!(
+            replace_table_ref("VEMP V JOIN DEPT D ON V.K = D.K", "VEMP", "EMP"),
+            "EMP V JOIN DEPT D ON V.K = D.K"
+        );
+        // a column of the same name is not a table
+        assert_eq!(
+            replace_table_ref("T JOIN U ON T.VEMP = U.VEMP", "VEMP", "EMP"),
+            "T JOIN U ON T.VEMP = U.VEMP"
+        );
+        // case-insensitive, and only WHOLE identifiers
+        assert_eq!(replace_table_ref("vemp v", "VEMP", "EMP"), "EMP v");
+        assert_eq!(replace_table_ref("VEMPX v", "VEMP", "EMP"), "VEMPX v");
+        assert_eq!(replace_table_ref("X_VEMP v", "VEMP", "EMP"), "X_VEMP v");
+        // and a string literal is not identifier text
+        assert_eq!(
+            replace_table_ref("T ON T.N = 'VEMP'", "VEMP", "EMP"),
+            "T ON T.N = 'VEMP'"
+        );
+    }
 
     #[test]
     fn describe_buffer_is_parseable() {

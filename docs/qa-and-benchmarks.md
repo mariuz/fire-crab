@@ -7063,6 +7063,54 @@ every statement, read back by the ENGINE from the file fire-crab wrote — a
 wrongly encoded boolean is not a wrong answer to a query, it is a wrong byte in
 a record, and only reading it back with the other implementation shows it.
 
+### A view as a side of a join (`qa/serve-real-viewjoin.sh`, 32 checks)
+
+A view in the FROM had been handled by a rewrite: swap its name for its base
+table, AND its own WHERE into the outer one, re-plan the text. For one table
+that is exactly right. With a second table present it is wrong in two ways, and
+neither announces itself.
+
+**The predicate's placement is a question about PADDING.** `DEPT D LEFT JOIN
+VEMP V ON V.DEPT_ID = D.ID` keeps every department, padding the ones with no
+qualifying employee. A padded row's columns are all NULL, so the view's own
+`SALARY > 150` in the OUTER where throws that row away — and the LEFT join has
+silently become an inner one. The view's rows must be filtered BEFORE the
+padding, which is what putting the predicate in that step's ON means. The rule
+that falls out is not "views in joins use the ON": it is that a predicate
+belongs to the ON when its side can be padded and to the WHERE when it cannot,
+which is the same distinction the engine draws when it merges the view's RSE.
+
+That distinction is only VISIBLE with the right fixture. The gate's department
+3 has exactly one employee and that employee is below the view's threshold, so
+it is padded through the view and present through the base table. A fixture
+where every department either qualifies or is empty passes with the predicate
+in either place — the first fixture written for this slice was that fixture,
+and it agreed with the engine on all sixteen probes while the code was wrong.
+
+**An unaliased view still owns its name.** In `FROM VEMP JOIN DEPT ON
+VEMP.DEPT_ID = DEPT.ID` the ON says VEMP, so the base table takes the VIEW's
+name as its alias — and that means the substitution must happen in TABLE
+POSITION ONLY. The first attempt replaced the identifier everywhere and then
+patched the result with a second pass, which produced `EMP VEMP.DEPT_ID`.
+`replace_table_ref` is the whole fix: an identifier with a dot on either side
+is a qualifier or a column, never a table.
+
+**And the refusal that was answering.** A view is a relation — it has a
+relation id and a format, and NO records of its own. So a view the planner
+cannot expand does not fail to resolve; it scans its empty storage and answers
+zero rows. The guard for that existed and checked the FIRST table of the FROM,
+which is where a view used to be able to appear. `DEPT D RIGHT JOIN VEMP V`
+answered `COUNT = 0` against the engine's 3, and the FULL join answered 4 — two
+plausible numbers, from a check the gate had written down as a refusal. The
+guard now walks every side.
+
+Three shapes refuse, each because its rewrite is a different one rather than a
+harder one: a view with RENAMED columns (every reference would need rewriting,
+not the table's name), a view over a JOIN (no single base table for its name to
+become), and a RIGHT or FULL join with any view in it (those make an EARLIER
+side nullable, so where a predicate belongs stops being a local question about
+its own side).
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

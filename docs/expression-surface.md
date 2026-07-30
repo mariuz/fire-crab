@@ -65,6 +65,7 @@ same database file.
 | WHERE comparison sides are full expressions (arithmetic, functions, CAST, conditionals, column vs column); per-row eval errors raise mid-statement with the engine's vector | `src/jrd/evl.cpp` boolean evaluation over expression nodes, probed | `texpr` (token-level sides), the fallible `Predicate::matches` |
 | CASE inside WHERE - the span lexes to its balancing END, keyword-matched (nested CASEs nest, literals skipped) | `parse.y` (CASE is an expression production; the predicate grammar just holds it) | `matching_case_end`, the CASE arm of `tokenize` |
 | `?` against an expression side - the bind target descriptor synthesizes from the expression's TYPE (text → VARCHAR, int → BIGINT, numeric → BIGINT at the scale); the arrived value substitutes as a literal | the engine describes parameters from the comparison's other side | `Term::ExprParam`, the param arm of `resolve_expr_term`, `Predicate::bind` |
+| a VIEW as a SIDE of a JOIN: the view's name is replaced by its base table in TABLE POSITION ONLY (an unaliased view lends its NAME to the base as an alias, so `VEMP.C` still resolves), and the view's own WHERE goes into that STEP'S ON when the side can be NULL-padded and into the outer WHERE when it cannot | the engine merges the view's RSE into the outer one; probed against the live server | `expand_view_join`, `replace_table_ref`, `qualify_idents` |
 | expressions in JOIN predicates evaluate against the combined row through a synthetic single-relation view (bare unambiguous names; ambiguous names refuse) | the engine's joined-stream contexts | `resolve_join_predicate`'s combined view |
 | GROUP BY takes expression keys, computed per row; a select-list expression must BE one of them (else the engine's -104 "not contained..."); NULL keys share a bucket; `GROUP BY <ordinal>` may name an expression item | `src/jrd/AggNodes.cpp` / DSQL grouping validation, probed | `parse_group_by` (synthetic key slots), `normalize_raw` structural matching |
 | HAVING compares numeric aggregates through exact scale alignment, text MIN/MAX through the pad-trimming compare, and takes expression aggregates as hidden folds | `AggNodes.cpp`, probed (AVG(N) > 0 works; MIN(D) has no literal to meet here) | `resolve_having` (`HKind`), `Term::NumCmp` |
@@ -222,6 +223,21 @@ expression (only a bare `?` on a comparison side binds), QUALIFIED
 names in join-predicate expressions, temporal aggregates in HAVING,
 temporal parameters against expression sides, `DECODE`, `TIME + n`,
 and `CURRENT_TIME`/`CURRENT_TIMESTAMP` (TIME ZONE results).
+
+Refusals around VIEWS in a join, each because the rewrite is a
+different one rather than a harder one:
+
+- **A view with RENAMED columns** — every reference in the outer query
+  would have to be rewritten, not the table's name.
+- **A view over a JOIN**, or over another view — there is no single base
+  table for its name to become.
+- **A RIGHT or FULL join with any view in it** — those make an EARLIER
+  side nullable, so where the view's own predicate belongs stops being a
+  local question about that side.
+
+Each of these REFUSES rather than falling through, because a view is a
+relation with a relation id and no records: an unexpanded one scans its
+empty storage and answers zero rows, which reads as a legitimate result.
 
 Refusals in the approximate and temporal families, each for a stated
 reason rather than an omission:

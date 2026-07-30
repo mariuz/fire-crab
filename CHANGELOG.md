@@ -13,6 +13,50 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — a view as a side of a join
+
+### Converted
+- **A VIEW may now stand on either side of a JOIN** — the last gap in
+  the FROM clause. A view standing alone was already expanded (its name
+  swapped for its base table, its own WHERE ANDed into the outer one);
+  with a second table present that rewrite is wrong twice over, and both
+  corrections are the increment:
+  - **Where the view's predicate goes depends on whether that side can be
+    NULL-PADDED.** `DEPT D LEFT JOIN VEMP V ON V.DEPT_ID = D.ID` must keep
+    every department. Push the view's `SALARY > 150` into the outer WHERE
+    and the padded row — whose SALARY is NULL — is thrown away, and the
+    LEFT join has quietly become an inner one. The predicate belongs in
+    that step's ON, which filters the view's rows BEFORE the padding.
+  - **An unaliased view still owns its name as a qualifier**: in
+    `FROM VEMP JOIN DEPT ON VEMP.DEPT_ID = DEPT.ID` the ON says VEMP, so
+    the base table takes the VIEW's name as its alias and the
+    substitution happens in TABLE POSITION ONLY (`replace_table_ref`). A
+    rewrite that also renamed the qualifier produced `EMP VEMP.DEPT_ID`.
+- Both sides may be views, a view may appear in a three-table chain, in
+  a CROSS join and in a comma list, and the rewritten query flows on into
+  WHERE, GROUP BY, HAVING, ORDER BY and the aggregates unchanged.
+
+### Guarded
+- **A view the server cannot expand answered ZERO ROWS instead of
+  refusing** whenever it was not the FIRST table of the FROM. A view is a
+  relation with a relation id and no records of its own, so an
+  unexpanded one scans its empty storage: `DEPT D RIGHT JOIN VEMP V`
+  answered `COUNT = 0` where the engine answers 3, and a FULL join
+  answered 4. The refusal guard checked only the base table; it now
+  checks every side. This is the failure shape the project keeps
+  meeting — the wrong answer that looks like a legitimate empty result.
+- Three shapes refuse for stated reasons rather than by omission: a view
+  with RENAMED columns (every reference would need rewriting, not the
+  table name), a view over a JOIN (no single base table to become), and
+  a RIGHT or FULL join with any view (it makes an EARLIER side nullable,
+  so which side a predicate belongs to stops being a local question).
+
+`qa/serve-real-viewjoin.sh` is new, 32 checks. Its fixture is built so
+that department 3's only employee is BELOW the view's threshold — that
+row is what tells the two predicate placements apart, and a fixture
+where every department either qualifies or is empty would have passed
+either way.
+
 ## 2026-07-30 — the values an UPDATE could compute but not store
 
 ### Fixed

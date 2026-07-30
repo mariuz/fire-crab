@@ -1303,6 +1303,42 @@ them.
   ones that will silently refuse it, because they will not fail to
   compile.
 
+- **A rewrite that is right for one table can be wrong for two, and the
+  difference is usually about NULL PADDING.** Expanding a view is a
+  textual rewrite: swap the name, AND the view's own WHERE into the outer
+  one. Add a join and that second half is wrong whenever the view's side
+  can be padded - a padded row is all NULLs, so the view's predicate in
+  the outer WHERE deletes it and the outer join has quietly become an
+  inner one. The predicate belongs to the ON when its side can be padded
+  and to the WHERE when it cannot. Any rewrite that MOVES a predicate
+  outward across a join has this bug available to it.
+
+- **A fixture where the right and the wrong answer agree is not a
+  fixture.** The above was invisible against a fixture whose every group
+  either qualified or was empty: sixteen probes agreed with the engine
+  while the placement was wrong. What made it visible was one row - a
+  department whose ONLY member falls below the view's threshold, so it is
+  padded through the view and present through the base table. Build the
+  row that separates the two implementations before you trust the ones
+  that pass.
+
+- **An identifier's POSITION is part of its meaning.** Replacing a view's
+  name with its base table's is a table-position substitution only: an
+  unaliased view lends its name to the base table as an ALIAS, so
+  `VEMP.DEPT_ID` in the ON must survive untouched. A blind
+  search-and-replace produced `EMP VEMP.DEPT_ID`. A dot on either side of
+  a word says it is a qualifier or a column, never a table - that one
+  test is the whole difference between a rewrite and a corruption.
+
+- **A refusal you cannot reach is a wrong answer.** A view is a relation
+  with a relation id, a format, and no records - so an unexpanded view
+  does not fail to resolve, it scans its empty storage and answers ZERO
+  ROWS. The guard existed and checked the first table of the FROM,
+  because that is where a view could appear when it was written; a view
+  as the second side of a join walked straight past it and answered
+  plausible numbers. When you extend WHERE a construct may appear, the
+  guards that mention it are part of the construct.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with
