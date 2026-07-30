@@ -6938,6 +6938,40 @@ the symptom was a gate failing everywhere at once — which reads exactly like a
 catastrophic regression and is worth recognising on sight. `cargo build
 --release` before running gates, always.
 
+### A chain of joins (`qa/serve-real-joinchain.sh`, 15 checks)
+
+`parse_from` had an explicit refusal — "a second JOIN (chained) is not
+supported" — and the plan carried a left side and a right side by name. Three
+tables is not three of anything: it is a FOLD, where each step joins everything
+accumulated so far with the next table, and the shape of the plan has to say
+so. `Plan::Join` now carries a base and a `Vec<JoinPart>`, and `join_rows`
+folds them.
+
+**Two rules make a chain more than a pair of joins.** A step's ON may name any
+EARLIER table, not just the one before it — so the second condition is resolved
+against every side up to and including the one it adds. And a step's KIND
+applies to the ACCUMULATION: `LEFT JOIN` in the middle pads everything to its
+left, and because those padded rows' columns are NULL, an INNER step after a
+LEFT one drops them again. That last interaction is where the row counts
+separate, so the gate's centre is a table of them: INNER/INNER, INNER/LEFT,
+LEFT/INNER, LEFT/LEFT and a RIGHT second step all differ, and a mis-folded
+chain lands on the wrong one.
+
+**The bug the third table found.** Each side's offset in the combined row was
+computed as `sides.first().map_or(0, |s| s.descs.len())` — the FIRST side's
+width. For two tables that is the right answer by coincidence; for three, the
+third table's columns landed on top of the second's. The symptom was precise
+and misleading: every three-table INNER join returned zero rows while the LEFT
+variants returned the correct counts, because the second ON never matched and
+padding hid it. An arithmetic mistake that only a third element can expose is
+worth remembering as a shape — anything written as "the previous one" rather
+than "the sum so far" has it.
+
+Everything around the join came along for free — projections, WHERE, GROUP
+BY/HAVING, ORDER BY, the aggregates — because each was already written against
+the combined row rather than against two named sides. The gate checks a
+four-table chain too, to show the fold is not special-cased at three.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

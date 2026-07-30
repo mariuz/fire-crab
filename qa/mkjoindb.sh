@@ -23,6 +23,9 @@
 #                                 for most rows and disagrees for a few,
 #                                 so a two-column ON is not the same
 #                                 join as a one-column ON.
+#   REGION(ID, NAME)            - 5 rows, one of which (50) no department
+#                                 references, so a three-table chain has
+#                                 something to drop at its second step.
 #   J1(K CHAR(10), V) / J2(K2 VARCHAR(10), W)
 #                               - text keys: duplicates on both sides (so
 #                                 a match is a small cross product, and
@@ -65,6 +68,10 @@ CREATE TABLE EMP (
   SALARY INTEGER,
   NAME VARCHAR(30)
 );
+CREATE TABLE REGION (
+  ID INTEGER NOT NULL PRIMARY KEY,
+  NAME VARCHAR(20)
+);
 CREATE TABLE J1 (K CHAR(10), V INTEGER);
 CREATE TABLE J2 (K2 VARCHAR(10), W INTEGER);
 COMMIT;
@@ -77,6 +84,16 @@ INSERT INTO DEPT VALUES (5, 30, 'Legal');
 INSERT INTO DEPT VALUES (6, 30, 'Facilities');
 INSERT INTO DEPT VALUES (7, 40, 'Research');
 INSERT INTO DEPT VALUES (8, 40, 'Archive');
+COMMIT;
+
+-- the THIRD table of a chain: every department's region exists, and
+-- region 50 belongs to none, so a three-table inner join drops it and
+-- an outer one keeps it
+INSERT INTO REGION VALUES (10, 'North');
+INSERT INTO REGION VALUES (20, 'South');
+INSERT INTO REGION VALUES (30, 'East');
+INSERT INTO REGION VALUES (40, 'West');
+INSERT INTO REGION VALUES (50, 'Nowhere');
 COMMIT;
 
 -- text join keys: duplicates on both sides, a NULL each, and the
@@ -134,12 +151,14 @@ SELECT COUNT(*) FROM EMP WHERE DEPT_ID IS NULL;
 SELECT COUNT(*) FROM EMP E WHERE E.DEPT_ID IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM DEPT D WHERE D.ID = E.DEPT_ID);
 SELECT COUNT(*) FROM DEPT D WHERE NOT EXISTS (SELECT 1 FROM EMP E WHERE E.DEPT_ID = D.ID);
+SELECT COUNT(*) FROM REGION R WHERE NOT EXISTS (SELECT 1 FROM DEPT D WHERE D.REGION_ID = R.ID);
 EOF
 )
 set -- $check
-if [ "$1" = "100" ] && [ "$2" = "8" ] && [ "$3" = "2" ] && [ "$4" = "1" ] && [ "$5" = "1" ]; then
+if [ "$1" = "100" ] && [ "$2" = "8" ] && [ "$3" = "2" ] && [ "$4" = "1" ] && [ "$5" = "1" ] \
+   && [ "$6" = "1" ]; then
     echo "$CLEAN"
 else
-    echo "FAIL fixture properties: emp=$1 dept=$2 null_keys=$3 dangling=$4 empty_dept=$5" >&2
+    echo "FAIL fixture properties: emp=$1 dept=$2 null_keys=$3 dangling=$4 empty_dept=$5 empty_region=$6" >&2
     exit 1
 fi

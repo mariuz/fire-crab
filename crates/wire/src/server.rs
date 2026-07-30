@@ -1447,17 +1447,11 @@ AlterDomainRename {
         gen_cols: Vec<GenCol>,
     },
     Join {
-        kind: JoinKind,
-        left_rel: u16,
-        left_formats: Vec<(u8, Vec<Descriptor>)>,
-        left_width: usize,
-        right_rel: u16,
-        right_formats: Vec<(u8, Vec<Descriptor>)>,
-        right_width: usize,
-        /// the ON condition, evaluated over the CONCATENATED row - not a
-        /// list of equality pairs, so `ON A.K > C.K` and a NUMERIC or
-        /// DATE key are the same shape as `ON A.K = C.K`
-        on: Predicate,
+        base_rel: u16,
+        base_formats: Vec<(u8, Vec<Descriptor>)>,
+        base_width: usize,
+        /// one per JOIN in the FROM chain, in fold order
+        parts: Vec<JoinPart>,
         cols: Vec<ProjCol>,
         filter: Option<Predicate>,
         order_by: Vec<OrderKey>,
@@ -1468,17 +1462,11 @@ AlterDomainRename {
     /// SHAPES - a join emits its combined rows, this emits one row per
     /// group.
     JoinGroup {
-        kind: JoinKind,
-        left_rel: u16,
-        left_formats: Vec<(u8, Vec<Descriptor>)>,
-        left_width: usize,
-        right_rel: u16,
-        right_formats: Vec<(u8, Vec<Descriptor>)>,
-        right_width: usize,
-        /// the ON condition, evaluated over the CONCATENATED row - not a
-        /// list of equality pairs, so `ON A.K > C.K` and a NUMERIC or
-        /// DATE key are the same shape as `ON A.K = C.K`
-        on: Predicate,
+        base_rel: u16,
+        base_formats: Vec<(u8, Vec<Descriptor>)>,
+        base_width: usize,
+        /// one per JOIN in the FROM chain, in fold order
+        parts: Vec<JoinPart>,
         cols: Vec<ProjCol>,
         gitems: Vec<GItem>,
         key_fids: Vec<usize>,
@@ -1513,6 +1501,20 @@ AlterDomainRename {
         mode: GenWrite,
         stmt_type: i32,
     },
+}
+
+/// One JOIN in a FROM chain: the side being added, and the ON condition
+/// that admits a combined row. `on` is evaluated over EVERYTHING to the
+/// left concatenated with this side, so a three-table join's second ON
+/// may name any of the tables before it - which is what makes the chain
+/// a fold rather than a pair of independent joins.
+#[derive(Clone)]
+struct JoinPart {
+    kind: JoinKind,
+    rel: u16,
+    formats: Vec<(u8, Vec<Descriptor>)>,
+    width: usize,
+    on: Predicate,
 }
 
 /// How a generator write sets its value: `Absolute(n)` stores `n` (`SET
@@ -9280,9 +9282,61 @@ fn parse_table_ref(s: &str) -> Option<TableRef<'_>> {
 /// join is supported: `t1 [a1] [INNER|LEFT|RIGHT|FULL [OUTER]] JOIN
 /// t2 [a2] ON <cond>`. Cross/natural joins, comma lists and chained
 /// joins return None (fall back).
-fn parse_from(from_s: &str) -> Option<(TableRef<'_>, Option<(JoinKind, TableRef<'_>, &str)>)> {
+fn parse_from(from_s: &str) -> Option<(TableRef<'_>, Vec<(JoinKind, TableRef<'_>, &str)>)> {
     if from_s.contains(',') {
         return None;
+    }
+    // A CHAIN - `A JOIN B ON ... JOIN C ON ...` - peels one join off the
+    // RIGHT: everything left of the last join keyword is itself a FROM
+    // clause, and the tail is the side being added. Recursing that way
+    // means the steps come out in the order the rows are folded.
+    let up_all = from_s.to_ascii_uppercase();
+    if let Some(first) = find_word(&up_all, "JOIN", 0) {
+        // the LAST join, not merely a second one - the chain peels from
+        // the right, and splitting at the second of three would leave a
+        // whole join inside the tail
+        let mut last_join = None;
+        let mut at = first + "JOIN".len();
+        while let Some(p) = find_word(&up_all, "JOIN", at) {
+            last_join = Some(p);
+            at = p + "JOIN".len();
+        }
+        if let Some(last) = last_join {
+            // the last join's kind keywords sit just before it
+            let mut cut = last;
+            let word_before = |end: usize| -> (usize, &str) {
+                let t = up_all[..end].trim_end();
+                let start = t.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+                (start, &t[start..])
+            };
+            let (ws, w) = word_before(last);
+            if matches!(w, "INNER" | "LEFT" | "RIGHT" | "FULL") {
+                cut = ws;
+            } else if w == "OUTER" {
+                let (ws2, w2) = word_before(ws);
+                if !matches!(w2, "LEFT" | "RIGHT" | "FULL") {
+                    return None;
+                }
+                cut = ws2;
+            }
+            let (head, tail) = (&from_s[..cut], &from_s[cut..]);
+            let (base, mut steps) = parse_from(head)?;
+            // the tail is a single `[<kind>] JOIN <table> ON <cond>`
+            let up_tail = tail.to_ascii_uppercase();
+            let jp = find_word(&up_tail, "JOIN", 0)?;
+            let kind = match up_tail[..jp].trim() {
+                "" | "INNER" => JoinKind::Inner,
+                "LEFT" | "LEFT OUTER" => JoinKind::Left,
+                "RIGHT" | "RIGHT OUTER" => JoinKind::Right,
+                "FULL" | "FULL OUTER" => JoinKind::Full,
+                _ => return None,
+            };
+            let after = jp + "JOIN".len();
+            let on = find_word(&up_tail, "ON", after)?;
+            let right = parse_table_ref(&tail[after..on])?;
+            steps.push((kind, right, tail[on + "ON".len()..].trim()));
+            return Some((base, steps));
+        }
     }
     let up = from_s.to_ascii_uppercase();
     for kw in ["CROSS", "NATURAL"] {
@@ -9297,7 +9351,7 @@ fn parse_from(from_s: &str) -> Option<(TableRef<'_>, Option<(JoinKind, TableRef<
                 return None;
             }
         }
-        return Some((parse_table_ref(from_s)?, None));
+        return Some((parse_table_ref(from_s)?, Vec::new()));
     };
     // a second JOIN (chained) is not supported
     if find_word(&up, "JOIN", jp + "JOIN".len()).is_some() {
@@ -9343,7 +9397,7 @@ fn parse_from(from_s: &str) -> Option<(TableRef<'_>, Option<(JoinKind, TableRef<
     let on = find_word(&up, "ON", after)?;
     let right = parse_table_ref(&from_s[after..on])?;
     let on_s = from_s[on + "ON".len()..].trim();
-    Some((left, Some((kind, right, on_s))))
+    Some((left, vec![(kind, right, on_s)]))
 }
 
 /// Split a possibly-qualified column name into (qualifier, column), each
@@ -9391,7 +9445,7 @@ struct JoinSide {
 /// to (combined row index, descriptor, canonical column name). A bare
 /// name must be unambiguous - present on exactly one side.
 fn resolve_join_col<'a>(
-    sides: &'a [JoinSide; 2],
+    sides: &'a [JoinSide],
     name: &str,
 ) -> Option<(usize, &'a Descriptor, &'a str)> {
     let (qual, col) = split_qual(name);
@@ -9406,18 +9460,27 @@ fn resolve_join_col<'a>(
     };
     match qual {
         Some(q) => hit(sides.iter().find(|s| s.key.eq_ignore_ascii_case(q))?),
-        None => match (hit(&sides[0]), hit(&sides[1])) {
-            (Some(h), None) => Some(h),
-            (None, Some(h)) => Some(h),
-            _ => None, // ambiguous or unknown
-        },
+        // a bare name must hit EXACTLY ONE side - with three tables in
+        // the FROM there are three chances to be ambiguous, not one
+        None => {
+            let mut found = None;
+            for side in sides {
+                if let Some(h) = hit(side) {
+                    if found.is_some() {
+                        return None; // ambiguous
+                    }
+                    found = Some(h);
+                }
+            }
+            found
+        }
     }
 }
 
 /// Parse an ON condition into (left, right) combined-index equality
 /// pairs: one or more `<col> = <col>` terms joined by AND, each term
 /// naming one column from each side, both of the same comparable kind.
-fn parse_on(on_s: &str, sides: &[JoinSide; 2]) -> Option<Predicate> {
+fn parse_on(on_s: &str, sides: &[JoinSide]) -> Option<Predicate> {
     // The ON condition is a PREDICATE over the joined row, resolved by
     // the same code the WHERE clause uses. It used to be a list of
     // equality pairs of Int-or-Text columns, which is the join everyone
@@ -9470,7 +9533,7 @@ fn unqualify_raw(e: &RawExpr) -> RawExpr {
 }
 
 /// anything naming it refuses rather than guessing a side.
-fn combined_view(sides: &[JoinSide; 2]) -> (Vec<RelationColumn>, Vec<Descriptor>) {
+fn combined_view(sides: &[JoinSide]) -> (Vec<RelationColumn>, Vec<Descriptor>) {
     let mut comb_cols: Vec<RelationColumn> = Vec::new();
     let mut comb_descs: Vec<Descriptor> = Vec::new();
     for side in sides.iter() {
@@ -9513,7 +9576,7 @@ fn combined_view(sides: &[JoinSide; 2]) -> (Vec<RelationColumn>, Vec<Descriptor>
 /// resolver; `?` terms register parameter slots the same way.
 fn resolve_join_predicate(
     raw: Vec<Vec<RawTerm>>,
-    sides: &[JoinSide; 2],
+    sides: &[JoinSide],
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Predicate> {
     // a SYNTHETIC single-relation view of the combined row, for the
@@ -9600,10 +9663,8 @@ fn resolve_join_predicate(
 #[allow(clippy::too_many_arguments)]
 fn plan_join(
     proj: &Proj,
-    kind: JoinKind,
     left: &TableRef<'_>,
-    right: &TableRef<'_>,
-    on_s: &str,
+    joins: &[(JoinKind, TableRef<'_>, &str)],
     where_s: Option<&str>,
     group_s: Option<&str>,
     having_s: Option<&str>,
@@ -9611,8 +9672,13 @@ fn plan_join(
     db: &Database,
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Plan> {
+    if joins.is_empty() {
+        return None;
+    }
     let mut sides: Vec<JoinSide> = Vec::new();
-    for tr in [left, right] {
+    let mut refs: Vec<&TableRef<'_>> = vec![left];
+    refs.extend(joins.iter().map(|(_, r, _)| r));
+    for tr in refs {
         let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, tr.table)?;
         let columns = relation_columns(&db.bytes, db.page_size, tr.table);
         let formats = select_formats(db, tr.table, rel);
@@ -9625,7 +9691,11 @@ fn plan_join(
             .max_by_key(|(n, _)| *n)
             .map(|(_, d)| d.clone())
             .unwrap_or_default();
-        let offset = sides.first().map_or(0, |s: &JoinSide| s.descs.len());
+        // where this side's columns begin in the combined row: the SUM of
+        // every previous side's width. Taking the FIRST side's width was
+        // right for two tables and silently wrong for three - the third
+        // side's columns landed on top of the second's.
+        let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
         sides.push(JoinSide {
             key: tr.alias.unwrap_or(tr.table).to_string(),
             rel,
@@ -9635,16 +9705,30 @@ fn plan_join(
             offset,
         });
     }
-    // the two sides must be distinguishable by qualifier
-    if sides[0].key.eq_ignore_ascii_case(&sides[1].key) {
-        return None;
+    // every side must be distinguishable by qualifier
+    for i in 0..sides.len() {
+        for j in i + 1..sides.len() {
+            if sides[i].key.eq_ignore_ascii_case(&sides[j].key) {
+                return None;
+            }
+        }
     }
-    let sides: [JoinSide; 2] = match <[JoinSide; 2]>::try_from(sides) {
-        Ok(s) => s,
-        Err(_) => return None,
-    };
 
-    let on = parse_on(on_s, &sides)?;
+    // Each step's ON is resolved against every side up to and including
+    // the one it adds - `A JOIN B ON ... JOIN C ON B.Y = C.Y` lets the
+    // second condition name B, which is what makes the chain a fold.
+    let mut parts: Vec<JoinPart> = Vec::new();
+    for (k, (kind, _, on_s)) in joins.iter().enumerate() {
+        let upto = &sides[..=k + 1];
+        let on = parse_on(on_s, upto)?;
+        parts.push(JoinPart {
+            kind: *kind,
+            rel: sides[k + 1].rel,
+            formats: sides[k + 1].formats.clone(),
+            width: sides[k + 1].descs.len(),
+            on,
+        });
+    }
     let mut next_param = params.len();
     let filter = match where_s {
         None => None,
@@ -9712,16 +9796,11 @@ fn plan_join(
                     .filter(|&p| matches!(gitems.get(p), Some(GItem::Key(_))))
             })?,
         };
-        let [l, r] = sides;
         return Some(Plan::JoinGroup {
-            kind,
-            left_rel: l.rel,
-            left_formats: l.formats,
-            left_width: l.descs.len(),
-            right_rel: r.rel,
-            right_formats: r.formats,
-            right_width: r.descs.len(),
-            on,
+            base_rel: sides[0].rel,
+            base_formats: sides[0].formats.clone(),
+            base_width: sides[0].descs.len(),
+            parts,
             cols,
             gitems,
             key_fids,
@@ -9790,16 +9869,11 @@ fn plan_join(
         })?,
     };
 
-    let [l, r] = sides;
     Some(Plan::Join {
-        kind,
-        left_rel: l.rel,
-        left_formats: l.formats,
-        left_width: l.descs.len(),
-        right_rel: r.rel,
-        right_formats: r.formats,
-        right_width: r.descs.len(),
-        on,
+        base_rel: sides[0].rel,
+        base_formats: sides[0].formats.clone(),
+        base_width: sides[0].descs.len(),
+        parts,
         cols,
         filter,
         order_by,
@@ -9991,7 +10065,7 @@ fn replace_idents(text: &str, map: &[(String, String)]) -> String {
 fn expand_view(sql: &str, db: &Database) -> Option<String> {
     let (proj_s, table_s, where_s, group_s, having_s, order_s) = split_query(sql)?;
     let (from, join) = parse_from(table_s)?;
-    if join.is_some() {
+    if !join.is_empty() {
         return None; // a join over a view: not this slice
     }
     let vd = view_of(db, from.table)?;
@@ -10002,7 +10076,7 @@ fn expand_view(sql: &str, db: &Database) -> Option<String> {
         return None;
     }
     let (vfrom, vjoin) = parse_from(vtable)?;
-    if vjoin.is_some() {
+    if !vjoin.is_empty() {
         return None;
     }
     // the base must be a TABLE, not another view
@@ -10808,43 +10882,40 @@ fn plan_query_inner(
         if trace { eprintln!("[srv] plan: FROM parse failed for {:?}", table_s); }
         return None;
     };
-    if let Some((kind, right, on_s)) = join {
+    if !join.is_empty() {
         // A join supports projections, WHERE, GROUP BY/HAVING and ORDER
-        // BY. A lone unaliased COUNT(*) keeps its prepare-time fast path
-        // (it answers a scalar, which is what the engine describes);
-        // every other aggregate shape folds the joined rows at fetch.
+        // BY, over any number of tables in the chain. A lone unaliased
+        // COUNT(*) keeps its prepare-time fast path (it answers a
+        // scalar, which is what the engine describes); every other
+        // aggregate shape folds the joined rows at fetch.
         if let Proj::Items(items) = &proj {
             if let [SelItem::Agg(AggFn::Count, AggTarget::Star, None)] = items.as_slice() {
                 if group_s.is_some() || having_s.is_some() {
                     return plan_join(
-                        &proj, kind, &left, &right, on_s, where_s, group_s, having_s,
-                        order_s, db, params,
+                        &proj, &left, &join, where_s, group_s, having_s, order_s, db,
+                        params,
                     );
                 }
                 if order_s.is_some() {
                     return None;
                 }
                 if let Some(Plan::Join {
-                    kind,
-                    left_rel,
-                    left_formats,
-                    left_width,
-                    right_rel,
-                    right_formats,
-                    right_width,
-                    on,
+                    base_rel,
+                    base_formats,
+                    base_width,
+                    parts,
                     filter,
                     ..
-                }) = plan_join(&Proj::Star, kind, &left, &right, on_s, where_s, None, None, None, db, params)
-                {
+                }) = plan_join(
+                    &Proj::Star, &left, &join, where_s, None, None, None, db, params,
+                ) {
                     // counted at prepare, so a parameterised WHERE (whose
                     // values only arrive at execute) cannot be honoured
                     if !params.is_empty() {
                         return None;
                     }
                     let n = join_rows(
-                        db, kind, left_rel, &left_formats, left_width, right_rel,
-                        &right_formats, right_width, &on, &filter,
+                        db, base_rel, &base_formats, base_width, &parts, &filter,
                     )
                     .ok()?
                     .len();
@@ -10853,7 +10924,7 @@ fn plan_query_inner(
                 return None;
             }
         }
-        return match plan_join(&proj, kind, &left, &right, on_s, where_s, group_s, having_s, order_s, db, params) {
+        return match plan_join(&proj, &left, &join, where_s, group_s, having_s, order_s, db, params) {
             Some(p) => Some(p),
             None => {
                 if trace { eprintln!("[srv] plan: JOIN plan failed"); }
@@ -11715,14 +11786,10 @@ fn for_each_record<F: FnMut(&[Value])>(
 #[allow(clippy::too_many_arguments)]
 fn join_rows(
     db: &Database,
-    kind: JoinKind,
-    left_rel: u16,
-    left_formats: &[(u8, Vec<Descriptor>)],
-    left_width: usize,
-    right_rel: u16,
-    right_formats: &[(u8, Vec<Descriptor>)],
-    right_width: usize,
-    on: &Predicate,
+    base_rel: u16,
+    base_formats: &[(u8, Vec<Descriptor>)],
+    base_width: usize,
+    parts: &[JoinPart],
     filter: &Option<Predicate>,
 ) -> Result<Vec<Vec<Value>>, EvalErr> {
     let collect = |rel: u16, formats: &[(u8, Vec<Descriptor>)], width: usize| {
@@ -11734,66 +11801,80 @@ fn join_rows(
         });
         rows
     };
-    let lrows = collect(left_rel, left_formats, left_width);
-    let rrows = collect(right_rel, right_formats, right_width);
-    let mut out = Vec::new();
+    // The chain is a FOLD: the accumulated rows are the left side of the
+    // next join, so `A JOIN B ... JOIN C ...` joins (A×B) with C and the
+    // second ON may name A or B. Every step's kind applies to what is
+    // accumulated so far, which is what LEFT JOIN means in a chain.
+    let mut acc = collect(base_rel, base_formats, base_width);
+    let mut acc_width = base_width;
+    for part in parts {
+        let rrows = collect(part.rel, &part.formats, part.width);
+        acc = join_step(acc, acc_width, &rrows, part)?;
+        acc_width += part.width;
+    }
+    let mut out: Vec<Vec<Value>> = Vec::new();
     let mut ferr: Option<EvalErr> = None;
-    let mut keep = |row: Vec<Value>| {
-        if ferr.is_some() {
-            return;
-        }
+    for row in acc {
         match filter.as_ref().map_or(Ok(true), |p| p.matches(&row)) {
             Ok(true) => out.push(row),
             Ok(false) => {}
-            Err(e) => ferr = Some(e),
+            Err(e) => {
+                ferr = Some(e);
+                break;
+            }
         }
-    };
-    let mut on_err: Option<EvalErr> = None;
+    }
+    // an evaluation error in the WHERE ends the join with the engine's
+    // own status vector. It used to be COLLECTED AND DROPPED - the rows
+    // computed before it were returned as if nothing had happened,
+    // which is a wrong answer with no error attached.
+    if let Some(e) = ferr {
+        return Err(e);
+    }
+    Ok(out)
+}
+
+/// One step of the fold: join the rows accumulated so far with the next
+/// side's, on that step's condition. The step's KIND applies to the
+/// accumulated side as a whole - `A JOIN B ON ... LEFT JOIN C ON ...`
+/// keeps every (A, B) pair and pads C, which is what the chain means.
+fn join_step(
+    acc: Vec<Vec<Value>>,
+    acc_width: usize,
+    rrows: &[Vec<Value>],
+    part: &JoinPart,
+) -> Result<Vec<Vec<Value>>, EvalErr> {
+    let mut out = Vec::new();
     let mut right_matched = vec![false; rrows.len()];
-    for l in &lrows {
+    for l in &acc {
         let mut matched = false;
         for (ri, r) in rrows.iter().enumerate() {
             let mut row = l.clone();
             row.extend(r.iter().cloned());
-            // an eval error in the ON aborts the join the way one in the
-            // WHERE aborts the scan; `matches` answers false for UNKNOWN,
-            // which is what makes a NULL key never join
-            let joined = match on.matches(&row) {
-                Ok(b) => b,
-                Err(e) => {
-                    on_err = Some(e);
-                    break;
-                }
-            };
-            if !joined {
+            // `matches` answers false for UNKNOWN, which is what makes a
+            // NULL key never join; an eval error ends the whole join
+            if !part.on.matches(&row)? {
                 continue;
             }
             matched = true;
             right_matched[ri] = true;
-            keep(row);
+            out.push(row);
         }
-        if !matched && matches!(kind, JoinKind::Left | JoinKind::Full) {
+        if !matched && matches!(part.kind, JoinKind::Left | JoinKind::Full) {
             let mut row = l.clone();
-            row.resize(left_width + right_width, Value::Null);
-            keep(row);
+            row.resize(acc_width + part.width, Value::Null);
+            out.push(row);
         }
     }
-    if matches!(kind, JoinKind::Right | JoinKind::Full) {
+    if matches!(part.kind, JoinKind::Right | JoinKind::Full) {
         for (ri, r) in rrows.iter().enumerate() {
             if right_matched[ri] {
                 continue;
             }
-            let mut row = vec![Value::Null; left_width];
+            let mut row = vec![Value::Null; acc_width];
             row.extend(r.iter().cloned());
-            keep(row);
+            out.push(row);
         }
-    }
-    // an evaluation error in the ON or the WHERE ends the join with the
-    // engine's own status vector. It used to be COLLECTED AND DROPPED -
-    // the rows computed before it were returned as if nothing had
-    // happened, which is a wrong answer with no error attached.
-    if let Some(e) = on_err.or(ferr) {
-        return Err(e);
     }
     Ok(out)
 }
@@ -13004,25 +13085,19 @@ fn emit_rows_inner(
             }
         }
         Plan::Join {
-            kind,
-            left_rel,
-            left_formats,
-            left_width,
-            right_rel,
-            right_formats,
-            right_width,
-            on,
+            base_rel,
+            base_formats,
+            base_width,
+            parts,
             cols,
             filter,
             order_by,
         } => {
             if let Some(db) = db {
                 let filter = bind_filter(filter, args)?;
-                let mut rows = join_rows(
-                    db, *kind, *left_rel, left_formats, *left_width, *right_rel,
-                    right_formats, *right_width, on, &filter,
-                )
-                .map_err(EmitErr::Eval)?;
+                let mut rows =
+                    join_rows(db, *base_rel, base_formats, *base_width, parts, &filter)
+                        .map_err(EmitErr::Eval)?;
                 if !order_by.is_empty() {
                     rows.sort_by(|a, b| order_cmp(a, b, order_by));
                 }
@@ -13035,14 +13110,10 @@ fn emit_rows_inner(
         // relation's grouping uses - `join_rows` produces the input that
         // `group_output`'s scan produces there
         Plan::JoinGroup {
-            kind,
-            left_rel,
-            left_formats,
-            left_width,
-            right_rel,
-            right_formats,
-            right_width,
-            on,
+            base_rel,
+            base_formats,
+            base_width,
+            parts,
             cols,
             gitems,
             key_fids,
@@ -13054,11 +13125,9 @@ fn emit_rows_inner(
         } => {
             if let Some(db) = db {
                 let filter = bind_filter(filter, args)?;
-                let input = join_rows(
-                    db, *kind, *left_rel, left_formats, *left_width, *right_rel,
-                    right_formats, *right_width, on, &filter,
-                )
-                .map_err(EmitErr::Eval)?;
+                let input =
+                    join_rows(db, *base_rel, base_formats, *base_width, parts, &filter)
+                        .map_err(EmitErr::Eval)?;
                 let mut rows =
                     group_rows(input, gitems, key_fids, key_exprs, *synth_base, having)
                         .map_err(EmitErr::Eval)?;
@@ -16919,7 +16988,7 @@ fn eval_subquery(
         return None;
     }
     let (from, join) = parse_from(table_s)?;
-    if join.is_some() {
+    if !join.is_empty() {
         return None; // a subquery over a join
     }
     let table = from.table;
@@ -23938,33 +24007,46 @@ mod tests {
         // plain table, with and without alias
         let (l, j) = parse_from("EMP").unwrap();
         assert_eq!(l.table, "EMP");
-        assert!(l.alias.is_none() && j.is_none());
+        assert!(l.alias.is_none() && j.is_empty());
         let (l, _) = parse_from("EMP E").unwrap();
         assert_eq!((l.table, l.alias), ("EMP", Some("E")));
         // JOIN with aliases and the optional INNER keyword
         let (l, j) = parse_from("EMP E JOIN DEPT D ON E.DEPT_ID = D.ID").unwrap();
-        let (k, r, on) = j.unwrap();
+        let [(k, r, on)] = j.as_slice() else { panic!("one join") };
+        let (k, r, on) = (*k, r, *on);
         assert!(k == JoinKind::Inner);
         assert_eq!((l.table, l.alias), ("EMP", Some("E")));
         assert_eq!((r.table, r.alias), ("DEPT", Some("D")));
         assert_eq!(on, "E.DEPT_ID = D.ID");
         let (_, j) = parse_from("EMP inner join DEPT on EMP.DEPT_ID = DEPT.ID").unwrap();
-        assert!(matches!(j, Some((JoinKind::Inner, ..))));
+        assert!(matches!(j.as_slice(), [(JoinKind::Inner, ..)]));
         // the outer kinds, with and without the OUTER keyword, any case
         let (l, j) = parse_from("EMP E LEFT JOIN DEPT D ON E.DEPT_ID = D.ID").unwrap();
         assert_eq!((l.table, l.alias), ("EMP", Some("E")));
-        assert!(matches!(j, Some((JoinKind::Left, ..))));
+        assert!(matches!(j.as_slice(), [(JoinKind::Left, ..)]));
         let (l, j) = parse_from("EMP left outer join DEPT on EMP.DEPT_ID = DEPT.ID").unwrap();
         assert_eq!((l.table, l.alias), ("EMP", None));
-        assert!(matches!(j, Some((JoinKind::Left, ..))));
+        assert!(matches!(j.as_slice(), [(JoinKind::Left, ..)]));
         let (_, j) = parse_from("EMP RIGHT JOIN DEPT ON EMP.DEPT_ID = DEPT.ID").unwrap();
-        assert!(matches!(j, Some((JoinKind::Right, ..))));
+        assert!(matches!(j.as_slice(), [(JoinKind::Right, ..)]));
         let (_, j) = parse_from("EMP FULL OUTER JOIN DEPT ON EMP.DEPT_ID = DEPT.ID").unwrap();
-        assert!(matches!(j, Some((JoinKind::Full, ..))));
-        // unsupported shapes fall back: comma lists, chains, cross,
-        // OUTER without a direction, join keywords out of place
+        assert!(matches!(j.as_slice(), [(JoinKind::Full, ..)]));
+        // A CHAIN parses into one step per join, in fold order
+        let (l, j) = parse_from("A JOIN B ON A.X = B.X JOIN C ON B.Y = C.Y").unwrap();
+        assert_eq!(l.table, "A");
+        assert_eq!(j.len(), 2);
+        assert_eq!((j[0].1.table, j[0].2), ("B", "A.X = B.X"));
+        assert_eq!((j[1].1.table, j[1].2), ("C", "B.Y = C.Y"));
+        let (_, j) = parse_from(
+            "A JOIN B ON A.X = B.X LEFT JOIN C ON B.Y = C.Y JOIN D ON C.Z = D.Z",
+        )
+        .unwrap();
+        assert_eq!(j.len(), 3);
+        assert!(matches!(j[1].0, JoinKind::Left));
+        assert!(matches!(j[2].0, JoinKind::Inner));
+        // unsupported shapes fall back: comma lists, cross, OUTER
+        // without a direction, join keywords out of place
         assert!(parse_from("EMP, DEPT").is_none());
-        assert!(parse_from("A JOIN B ON A.X = B.X JOIN C ON B.Y = C.Y").is_none());
         assert!(parse_from("EMP JOIN DEPT").is_none()); // no ON
         assert!(parse_from("EMP CROSS JOIN DEPT").is_none());
         assert!(parse_from("EMP OUTER JOIN DEPT ON 1 = 1").is_none());
@@ -24015,6 +24097,62 @@ mod tests {
         // unknown qualifier or column
         assert!(resolve_join_col(&sides, "X.ID").is_none());
         assert!(resolve_join_col(&sides, "E.BOGUS").is_none());
+    }
+
+    #[test]
+    fn a_chain_folds_left_to_right() {
+        // the FROM parses into one step per join, in fold order, and the
+        // kind keywords belong to the join that FOLLOWS them
+        let (base, steps) = parse_from(
+            "A JOIN B ON A.X = B.X LEFT JOIN C ON B.Y = C.Y RIGHT JOIN D ON C.Z = D.Z",
+        )
+        .unwrap();
+        assert_eq!(base.table, "A");
+        assert_eq!(steps.len(), 3);
+        assert!(matches!(steps[0].0, JoinKind::Inner));
+        assert!(matches!(steps[1].0, JoinKind::Left));
+        assert!(matches!(steps[2].0, JoinKind::Right));
+        assert_eq!(steps[2].2, "C.Z = D.Z");
+        // aliases survive the split, and so does the base's
+        let (base, steps) = parse_from("EMP E JOIN DEPT D ON E.DEPT_ID = D.ID JOIN REGION R ON D.REGION_ID = R.ID").unwrap();
+        assert_eq!((base.table, base.alias), ("EMP", Some("E")));
+        assert_eq!((steps[1].1.table, steps[1].1.alias), ("REGION", Some("R")));
+
+        // the FOLD itself: one step of it, with the padding rule. The
+        // accumulated side is two columns wide, the new side one.
+        let part = |kind| JoinPart {
+            kind,
+            rel: 0,
+            formats: Vec::new(),
+            width: 1,
+            // ON acc[1] = new[0] - index 2 is the new side's only column
+            on: Predicate(vec![vec![Term::ExprCond(Box::new(Cond2::Cmp(
+                Box::new(Expr::Col(1)),
+                Cmp::Eq,
+                Box::new(Expr::Col(2)),
+            )))]]),
+        };
+        let acc = vec![
+            vec![Value::Int(1), Value::Int(10)],
+            vec![Value::Int(2), Value::Int(99)], // matches nothing
+        ];
+        let rrows = vec![vec![Value::Int(10)]];
+        // INNER drops the unmatched accumulated row
+        let out = join_step(acc.clone(), 2, &rrows, &part(JoinKind::Inner)).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], vec![Value::Int(1), Value::Int(10), Value::Int(10)]);
+        // LEFT keeps it, padded to the FULL accumulated width plus the
+        // new side's - the padding is what a chain gets wrong when it
+        // remembers only the previous step's width
+        let out = join_step(acc.clone(), 2, &rrows, &part(JoinKind::Left)).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1], vec![Value::Int(2), Value::Int(99), Value::Null]);
+        // RIGHT emits the unmatched NEW row with the accumulated side
+        // NULLed, again at the full width
+        let rrows2 = vec![vec![Value::Int(10)], vec![Value::Int(77)]];
+        let out = join_step(acc, 2, &rrows2, &part(JoinKind::Right)).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1], vec![Value::Null, Value::Null, Value::Int(77)]);
     }
 
     #[test]

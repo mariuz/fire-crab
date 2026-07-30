@@ -13,6 +13,39 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — a CHAIN of joins: three tables and more
+
+### Converted
+- **`FROM a JOIN b ON ... JOIN c ON ...`** — the FROM clause refused a
+  second JOIN outright. It parses into one step per join now, and the
+  rows are FOLDED: each step joins everything accumulated so far with
+  the next table.
+- **A step's ON may name any earlier table.** `A JOIN B ON ... JOIN C ON
+  B.Y = C.Y` resolves the second condition against A, B and C together,
+  which is what makes a chain different from two independent joins.
+- **Each step's KIND applies to the accumulation**, so `LEFT JOIN` in
+  the middle of a chain pads what came before it — and the padded rows'
+  columns are NULL, so an INNER step after a LEFT one drops them again.
+  Every kind combination has a different row count and the gate compares
+  all of them.
+- Projections, WHERE, GROUP BY/HAVING, ORDER BY and the aggregates all
+  work over a chain, because they were already written against the
+  combined row.
+
+### Fixed
+- **A side's offset in the combined row was the FIRST side's width**,
+  not the sum of every previous one. Right for two tables and silently
+  wrong for three: the third table's columns landed on top of the
+  second's, so every three-table inner join returned no rows while the
+  outer variants quietly padded.
+
+`qa/serve-real-joinchain.sh` (15 checks) and `qa/mkjoindb.sh` gained a
+REGION table whose row 50 no department references, so the chain's
+second step has something of its own to drop. The gate's centre is a
+table of row COUNTS: INNER/INNER, INNER/LEFT, LEFT/INNER, LEFT/LEFT and
+a RIGHT second step all differ, and a mis-folded chain lands on the
+wrong one.
+
 ## 2026-07-30 — the ON clause is a predicate, not a list of pairs
 
 ### Converted

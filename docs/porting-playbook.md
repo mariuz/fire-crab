@@ -1260,6 +1260,19 @@ them.
   `target/release/` untouched when the test file does not compile, so
   the gates exercised the previous build. Rebuild before you debug.
 
+- **"The previous one" and "the sum so far" are the same number until
+  there are three.** A join side's offset in the combined row was the
+  FIRST side's width - correct for two tables, and for three it put the
+  third table's columns on top of the second's. The symptom was that
+  inner joins returned nothing while outer ones looked right, because
+  padding hid the mismatch. Any accumulator written against the previous
+  element has this bug waiting.
+- **A list of two is not a list.** `left`/`right` fields, `[T; 2]`,
+  `(a, b)` - each one is a decision that there will never be a third.
+  Turning them into a fold made the chain's other rules (a later ON may
+  name any earlier table; a kind applies to the accumulation) expressible
+  at all.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with
