@@ -6222,6 +6222,52 @@ things the first version had left untested:
   `AST: 0x0xeb781933e044`. fire-crab prints the double prefix, because the
   differential is the tool's text and not the text the tool meant to write.
 
+### Outer joins, and the two wrong answers they exposed (`qa/opt-plans.sh`, now 78 checks)
+
+The optimizer gate compares fire-crab's plan line with the engine's own
+`SET PLANONLY ON` output, which makes it unusually sharp: the engine prints its
+decision in full, so any disagreement is visible in one line of text.
+
+Extending it to OUTER joins turned up two answers that had been silently wrong
+since the join slices, and one that had been right by accident.
+
+**An outer join makes a plan NODE.** Inner joins can be reordered, so a chain of
+them flattens into a single `JOIN (a, b, c)` list. An outer join cannot — the
+preserved side and its optional side are one result that later joins see as a
+unit — so the plan nests:
+
+```
+A JOIN B ON A.BX=B.ID JOIN C ON B.CX=C.ID
+   -> PLAN JOIN (C NATURAL, B INDEX (B_CX), A INDEX (A_BX))          -- flat
+A LEFT JOIN B ON A.BX=B.ID LEFT JOIN C ON B.CX=C.ID
+   -> PLAN JOIN (JOIN (A NATURAL, B INDEX (PK_B)), C INDEX (PK_C))   -- nested
+```
+
+**RIGHT JOIN was answered as if it were LEFT.** It is LEFT with the sides
+exchanged: the preserved side drives. `A RIGHT JOIN B ON A.BX = B.ID` plans
+`JOIN (B NATURAL, A INDEX (A_BX))`, and fire-crab printed the left-driving plan.
+The ON clause needs no rewriting — `A.BX = B.ID` means the same either way round
+— which is exactly what makes the engine's own parser-level rewrite sound.
+
+**FULL JOIN was answered as one nested loop.** It is both directions, and the
+engine prints both:
+`JOIN (JOIN (A NATURAL, B INDEX ...), JOIN (B NATURAL, A INDEX ...))`.
+
+**And one case is now refused instead of guessed.** With BOTH join keys indexed,
+both arrangements are legal. Probing showed the engine drives the same stream in
+BOTH SQL orders — so the choice is a property of the streams, not of the text:
+`StreamInfo::cheaperThan` orders them by independence, then
+`previousExpectedStreams`, then base cost (Optimizer.h:895), and `findJoinOrder`
+keeps the first strictly-cheapest arrangement. None of that is converted, so
+fire-crab's old answer (keep the SQL order) was right only when it happened to
+agree. It now refuses and names both indexes.
+
+That refusal cost nothing: the gate stayed green at 67 of its 68 existing
+checks, and the one that moved was a REFUSAL that has become a converted case —
+the outer chain the engine plans as
+`JOIN (JOIN ("A" NATURAL, "B" INDEX (IDX_U_UID)), "D" INDEX (IDX_C_XY))`, which
+fire-crab now prints exactly.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

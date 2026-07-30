@@ -139,10 +139,32 @@ check "SELECT A.ID FROM T A JOIN U B ON A.AMT = B.UA JOIN C D ON D.X = B.UA"
 # ...and the order transfers through the class too
 check "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID ORDER BY B.UID"
 
+# --- outer joins: the KIND decides who drives -------------------------
+# An outer join makes a plan NODE, so a chain NESTS where an inner chain
+# of the same streams would have flattened into one JOIN list - the
+# preserved side and its optional side are one result the next join sees
+# as a unit.
+check "SELECT A.ID FROM T A LEFT JOIN U B ON A.ID = B.UID LEFT JOIN C D ON D.X = B.UID"
+check "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID LEFT JOIN C D ON D.X = B.UID"
+check "SELECT A.ID FROM T A LEFT JOIN U B ON A.ID = B.UID JOIN C D ON D.X = B.UID"
+check "SELECT A.ID FROM T A LEFT JOIN U B ON A.ID = B.UA LEFT JOIN C D ON D.X = B.UA"
+# RIGHT is LEFT with the sides exchanged: the PRESERVED side drives, so
+# the plan is the swapped one - not the left-driving one
+check "SELECT A.ID FROM T A RIGHT JOIN U B ON A.ID = B.UID"
+check "SELECT A.ID FROM U B RIGHT JOIN T A ON A.ID = B.UID"
+# FULL is BOTH directions, and the engine says so: JOIN (JOIN(...), JOIN(...))
+check "SELECT A.ID FROM T A FULL JOIN U B ON A.ID = B.UID"
+check "SELECT A.ID FROM T A FULL JOIN U B ON A.ID = B.UA"
+# an outer join with a driving filter still filters the DRIVER
+check "SELECT A.ID FROM T A LEFT JOIN U B ON A.ID = B.UID LEFT JOIN C D ON D.X = B.UID WHERE A.AMT = 3"
+
 # --- outside the slice -------------------------------------------------
 refuse "SELECT ID FROM T UNION ALL SELECT UID FROM U"
 refuse "SELECT ID FROM T WHERE ID IN (SELECT UID FROM U)"
-refuse "SELECT A.ID FROM T A LEFT JOIN U B ON A.ID = B.UID LEFT JOIN C D ON D.X = B.UID"
+# a FULL or RIGHT join INSIDE a chain: the nesting is converted, the
+# direction-swap inside a chain is not
+refuse "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID FULL JOIN C D ON D.X = B.UID"
+refuse "SELECT A.ID FROM T A JOIN U B ON A.ID = B.UID RIGHT JOIN C D ON D.X = B.UID"
 
 # ======================================================================
 # PHASE 2: the COST BOUNDARY, on a POPULATED database

@@ -13,6 +13,48 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — fire-crab-opt slice 8: outer joins, and two wrong answers they exposed
+
+### Converted
+- **Outer joins in chains**, the frontier item this row named. An inner
+  join can be reordered, so a chain of them FLATTENS into one
+  `JOIN (a, b, c)` list; an outer join cannot, so it makes a plan NODE
+  and the chain NESTS:
+  `JOIN (JOIN (A NATURAL, B INDEX ...), C INDEX ...)`. The plan model
+  grew a `PlanNode` for exactly that shape.
+- Inside such a chain the INNER join at the head is still free to swap
+  before the outer join wraps it - probed:
+  `A JOIN B ON A.BX=B.ID LEFT JOIN C ON B.CX=C.ID` plans
+  `JOIN (JOIN (B NATURAL, A INDEX (A_BX)), C INDEX (PK_C))`.
+
+### Fixed
+- **RIGHT JOIN was answered as if it were LEFT.** It is LEFT with the
+  sides exchanged: the PRESERVED side drives, so `A RIGHT JOIN B ON
+  A.BX = B.ID` plans `JOIN (B NATURAL, A INDEX (A_BX))` and fire-crab
+  printed `JOIN (A NATURAL, B INDEX (PK_B))`. The ON clause needs no
+  rewriting - `A.BX = B.ID` means the same either way round - which is
+  what makes the engine's own parser-level rewrite sound.
+- **FULL JOIN was answered as a single nested loop.** It is BOTH
+  directions, and the engine prints both:
+  `JOIN (JOIN (A NATURAL, B INDEX ...), JOIN (B NATURAL, A INDEX ...))`.
+  A plan showing one half answers a different question.
+
+### Guarded
+- **A two-stream join whose BOTH keys are indexed is now REFUSED**
+  instead of answered by keeping the SQL order. Probed: with `A.BX`
+  indexed and `B.ID` a primary key the engine drives B in BOTH SQL
+  orders - the choice is a property of the streams, decided by
+  `StreamInfo::cheaperThan` (independence, then previousExpectedStreams,
+  then baseCost; Optimizer.h:895) and by which arrangement costs less.
+  That ordering is not converted, so the old answer was right only by
+  accident. The refusal names the two indexes and the reason.
+- RIGHT and FULL joins INSIDE a chain refuse: the nesting is converted,
+  the direction-swap within a chain is not.
+
+The gate grew from 68 to 78 checks: LEFT chains in three shapes,
+inner-then-outer and outer-then-inner, RIGHT in both SQL orders, FULL in
+two, an outer chain with a driving filter, and the two new refusals.
+
 ## 2026-07-30 — fire-crab-lck slice 5: the whole dump, and three offsets that hid in empty queues
 
 ### Converted

@@ -50,6 +50,29 @@
 //! Unions, subqueries, procedures, views and outer joins inside
 //! chains refuse by name.
 //!
+//! # Outer joins: the kind decides who drives, and the plan NESTS
+//!
+//! An inner join may be reordered freely, so a chain of them flattens
+//! into one `JOIN (a, b, c)` list. An outer join may not: the preserved
+//! side and its optional side are ONE result that later joins see as a
+//! unit, and the engine prints that structure -
+//! `JOIN (JOIN (A NATURAL, B INDEX ...), C INDEX ...)`.
+//!
+//! Three laws, all probed against `SET PLANONLY ON`:
+//!
+//! * **LEFT**: the preserved (left) side drives, the optional side rides
+//!   its key index if it has one.
+//! * **RIGHT** is LEFT with the sides exchanged - the engine rewrites it
+//!   and prints the swapped plan, so `A RIGHT JOIN B` drives B. The ON
+//!   clause needs no rewriting, which is what makes the rewrite sound.
+//! * **FULL** is BOTH directions at once, and says so:
+//!   `JOIN (JOIN (A NATURAL, B INDEX ...), JOIN (B NATURAL, A INDEX ...))`.
+//!   A plan that prints only one half is answering a different question.
+//!
+//! Inside a chain, an INNER join at the head is still free to swap before
+//! the outer join wraps it (probed: `A JOIN B ... LEFT JOIN C ...` plans
+//! `JOIN (JOIN (B NATURAL, A INDEX (A_BX)), C INDEX (PK_C))`).
+//!
 //! # The cost boundary, ENFORCED
 //!
 //! Single-table access paths are STRUCTURAL: the same plans come
@@ -135,13 +158,35 @@ pub struct Stream {
     pub access: Access,
 }
 
+/// A plan's shape when it NESTS. Most plans are flat - one JOIN or HASH
+/// over a list of streams - but an OUTER join makes a plan NODE: the
+/// engine prints `JOIN (JOIN (A NATURAL, B INDEX ...), C INDEX ...)`,
+/// where an inner-join chain of the same three streams would have printed
+/// one flat `JOIN (C NATURAL, B INDEX ..., A INDEX ...)`.
+///
+/// That difference is the outer join's semantics showing through: the
+/// preserved side and its optional side form ONE result that later joins
+/// see as a unit, so they cannot be reordered into the same list.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PlanNode {
+    Stream(Stream),
+    Join(Vec<PlanNode>),
+    Hash(Vec<PlanNode>),
+}
+
 /// A plan: the streams, how they combine, and whether a SORT wraps
 /// the whole thing.
+///
+/// `node` carries the nested shape when there is one; when it is `None`
+/// the plan is the flat `streams`/`combine` pair. Keeping both is
+/// deliberate - every flat plan in this crate (and its tests) predates
+/// nesting, and a flat plan is what most queries produce.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Plan {
     pub streams: Vec<Stream>,
     pub combine: Combine,
     pub sorted: bool,
+    pub node: Option<PlanNode>,
 }
 
 impl Plan {
@@ -165,6 +210,35 @@ impl Plan {
                 }
             }
         };
+        if let Some(node) = &self.node {
+            fn render_node(n: &PlanNode, one: &dyn Fn(&Stream) -> String) -> String {
+                match n {
+                    PlanNode::Stream(st) => one(st),
+                    PlanNode::Join(parts) => format!(
+                        "JOIN ({})",
+                        parts
+                            .iter()
+                            .map(|p| render_node(p, one))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    PlanNode::Hash(parts) => format!(
+                        "HASH ({})",
+                        parts
+                            .iter()
+                            .map(|p| render_node(p, one))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                }
+            }
+            let inner = render_node(node, &one);
+            return if self.sorted {
+                format!("PLAN SORT {}", inner)
+            } else {
+                format!("PLAN {}", inner)
+            };
+        }
         let body: Vec<String> = self.streams.iter().map(one).collect();
         let inner = match self.combine {
             Combine::Single => body.join(", "),
@@ -392,6 +466,7 @@ pub fn plan_query(
                     }],
                     combine: Combine::Single,
                     sorted: false,
+                    node: None,
                 });
             }
         }
@@ -405,6 +480,7 @@ pub fn plan_query(
         streams: vec![Stream { name: qualified(&table), access }],
         combine: Combine::Single,
         sorted: order.is_some(),
+        node: None,
     })
 }
 
@@ -428,6 +504,187 @@ fn where_s_of<'a>(
 /// indexed. When NEITHER key is indexed the engine hashes (FB5+),
 /// except under an OUTER join, whose preserved side must drive and
 /// which therefore keeps its nested loop with both streams NATURAL.
+/// Exchange the two sides of a two-stream join, keeping the ON clause:
+/// `A LEFT JOIN B ON ...` becomes `B LEFT JOIN A ON ...`.
+///
+/// The ON predicate needs no rewriting - `A.BX = B.ID` means the same
+/// either way round - which is exactly why the engine can treat RIGHT as
+/// LEFT-reversed.
+fn swap_join_sides(from_s: &str) -> Result<String, String> {
+    let up = from_s.to_uppercase();
+    let jpos = up.find(" JOIN ").ok_or("cannot split the join")?;
+    let head = from_s[..jpos].trim();
+    let rest = from_s[jpos + 6..].trim();
+    // the join word(s) between the two sides
+    let lhs = head
+        .trim_end_matches(|_| false)
+        .to_string();
+    let (lhs, keyword) = {
+        let u = lhs.to_uppercase();
+        let mut cut = lhs.len();
+        for kw in [" LEFT OUTER", " RIGHT OUTER", " FULL OUTER", " LEFT", " RIGHT", " FULL", " INNER"] {
+            if let Some(p) = u.rfind(kw) {
+                if p + kw.len() == lhs.len() {
+                    cut = p;
+                    break;
+                }
+            }
+        }
+        (lhs[..cut].trim().to_string(), lhs[cut..].trim().to_string())
+    };
+    let (rhs, on) = match rest.to_uppercase().find(" ON ") {
+        Some(o) => (rest[..o].trim().to_string(), rest[o..].to_string()),
+        None => (rest.to_string(), String::new()),
+    };
+    // RIGHT becomes LEFT once the sides move
+    let kw = match keyword.to_uppercase().as_str() {
+        k if k.starts_with("RIGHT") => "LEFT".to_string(),
+        k if k.starts_with("LEFT") => "LEFT".to_string(),
+        k if k.is_empty() => String::new(),
+        k => k.to_string(),
+    };
+    Ok(if kw.is_empty() {
+        format!("{} JOIN {}{}", rhs, lhs, on)
+    } else {
+        format!("{} {} JOIN {}{}", rhs, kw, lhs, on)
+    })
+}
+
+/// A chain with an outer join in it. The engine builds a plan NODE per
+/// outer join and nests them LEFT-DEEP, in the SQL's own order - the
+/// optional side of a LEFT join cannot be reordered ahead of the side it
+/// preserves, so unlike an inner chain there is nothing to arrange.
+///
+/// Probed on the engine:
+/// ```text
+/// A LEFT JOIN B ON A.BX=B.ID LEFT JOIN C ON B.CX=C.ID
+///   -> JOIN (JOIN (A NATURAL, B INDEX (PK_B)), C INDEX (PK_C))
+/// A JOIN B ON A.BX=B.ID LEFT JOIN C ON B.CX=C.ID
+///   -> JOIN (JOIN (B NATURAL, A INDEX (A_BX)), C INDEX (PK_C))
+/// ```
+/// The second is the interesting one: the INNER join at the head is still
+/// free to swap (B drives A through A_BX), and only then does the outer
+/// join wrap it.
+fn plan_outer_chain(
+    file: &[u8],
+    page_size: usize,
+    from_s: &str,
+    where_s: Option<&str>,
+    order_s: Option<&str>,
+) -> Result<Plan, String> {
+    // split into the head (everything before the LAST join) and the tail
+    // stream that join attaches
+    let up = from_s.to_uppercase();
+    let last = up.rfind(" JOIN ").ok_or("cannot split the chain")?;
+    let head_end = ["  LEFT", " LEFT", " RIGHT", " FULL", " INNER", " OUTER"]
+        .iter()
+        .filter_map(|kw| {
+            let p = up[..last].rfind(kw)?;
+            if p + kw.len() == last {
+                Some(p)
+            } else {
+                None
+            }
+        })
+        .min()
+        .unwrap_or(last);
+    let head = from_s[..head_end].trim();
+    let tail_kind = outer_kind(&from_s[head_end..last + 6]);
+    let rest = from_s[last + 6..].trim();
+    let (tail, on_s) = match rest.to_uppercase().find(" ON ") {
+        Some(o) => (rest[..o].trim(), rest[o + 4..].trim().to_string()),
+        None => return Err("outer join in a chain without an ON clause".into()),
+    };
+    if tail_kind == OuterKind::Full {
+        return Err("FULL join inside a chain unconverted".into());
+    }
+    if tail_kind == OuterKind::Right {
+        return Err("RIGHT join inside a chain unconverted".into());
+    }
+    // the head is a plan in its own right - recursively, so a three-way
+    // chain nests twice
+    let head_plan = plan_join(file, page_size, head, where_s, None)?;
+    // the tail stream rides the ON key's index if it has one
+    let (ttab, tali) = split_alias(tail)?;
+    let tidx = indexes_of(file, page_size, &ttab)?;
+    let tcol = on_column_for(&on_s, &tali)?;
+    let access = match tidx
+        .iter()
+        .filter(|i| i.matches(&tcol) && !i.descending)
+        .min_by_key(|i| i.id)
+    {
+        Some(i) => Access::Index(vec![i.name.clone()]),
+        None => Access::Natural,
+    };
+    let head_node = match head_plan.node.clone() {
+        Some(n) => n,
+        None => match head_plan.combine {
+            Combine::Single => PlanNode::Stream(head_plan.streams[0].clone()),
+            Combine::Hash => PlanNode::Hash(
+                head_plan.streams.iter().cloned().map(PlanNode::Stream).collect(),
+            ),
+            Combine::Join => PlanNode::Join(
+                head_plan.streams.iter().cloned().map(PlanNode::Stream).collect(),
+            ),
+        },
+    };
+    let tail_stream = Stream { name: tali, access };
+    let mut streams = head_plan.streams.clone();
+    streams.push(tail_stream.clone());
+    Ok(Plan {
+        streams,
+        combine: Combine::Join,
+        sorted: order_s.is_some(),
+        node: Some(PlanNode::Join(vec![head_node, PlanNode::Stream(tail_stream)])),
+    })
+}
+
+/// The column of `alias` mentioned in an ON clause `x.a = y.b`.
+fn on_column_for(on_s: &str, alias: &str) -> Result<String, String> {
+    // the stream name may arrive schema-qualified (`"PUBLIC"."C"`), while
+    // the ON clause names it bare (`C.ID`)
+    let bare = alias
+        .rsplit('.')
+        .next()
+        .unwrap_or(alias)
+        .trim_matches('"');
+    for side in on_s.split('=') {
+        let side = side.trim();
+        if let Some((q, c)) = side.split_once('.') {
+            if q.trim().trim_matches('"').eq_ignore_ascii_case(bare) {
+                return Ok(c.trim().trim_matches('"').to_string());
+            }
+        }
+    }
+    Err(format!("no ON column for {}", alias))
+}
+
+/// Which outer join, if any - the KIND matters, not just the fact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OuterKind {
+    Inner,
+    Left,
+    Right,
+    Full,
+}
+
+/// The kind of the FIRST join in a FROM clause.
+fn outer_kind(from_s: &str) -> OuterKind {
+    let up = from_s.to_uppercase();
+    let at = |k: &str| up.find(k).unwrap_or(usize::MAX);
+    let (l, r, f) = (at(" LEFT "), at(" RIGHT "), at(" FULL "));
+    let first = l.min(r).min(f);
+    if first == usize::MAX {
+        OuterKind::Inner
+    } else if first == l {
+        OuterKind::Left
+    } else if first == r {
+        OuterKind::Right
+    } else {
+        OuterKind::Full
+    }
+}
+
 fn plan_join(
     file: &[u8],
     page_size: usize,
@@ -435,16 +692,43 @@ fn plan_join(
     where_s: Option<&str>,
     order_s: Option<&str>,
 ) -> Result<Plan, String> {
-    let outer = from_s.contains(" LEFT ")
-        || from_s.contains(" RIGHT ")
-        || from_s.contains(" FULL ");
-    // three or more streams: the general planner (equivalence
-    // classes decide both the driver and the order)
+    let kind = outer_kind(from_s);
+    let outer = kind != OuterKind::Inner;
+    // three or more streams with an outer join anywhere: an outer join
+    // makes a plan NODE, so the chain nests instead of flattening
     if from_s.matches(" JOIN ").count() > 1 {
         if outer {
-            return Err("outer joins in a chain unconverted".into());
+            return plan_outer_chain(file, page_size, from_s, where_s, order_s);
         }
         return plan_chain(file, page_size, from_s, where_s, order_s);
+    }
+    // A RIGHT join is a LEFT join with the sides exchanged: the
+    // PRESERVED side is the right one, so it drives. The engine does
+    // this rewrite in the parser, and the plan it prints is the
+    // swapped-left plan - not the left-driving one, which is what
+    // fire-crab printed before this slice.
+    if kind == OuterKind::Right {
+        let swapped = swap_join_sides(from_s)?;
+        return plan_join(file, page_size, &swapped, where_s, order_s);
+    }
+    // A FULL join is BOTH directions, and the engine says so: it plans
+    // `JOIN (JOIN (A ..., B ...), JOIN (B ..., A ...))` - the union of
+    // the left-driving and right-driving nested loops. Anything that
+    // prints one of the two halves is answering a different question.
+    if kind == OuterKind::Full {
+        let left_first = from_s.replacen(" FULL ", " LEFT ", 1);
+        let a = plan_join(file, page_size, &left_first, where_s, order_s)?;
+        let swapped = swap_join_sides(&left_first)?;
+        let b = plan_join(file, page_size, &swapped, where_s, order_s)?;
+        let as_node = |p: &Plan| -> PlanNode {
+            PlanNode::Join(p.streams.iter().cloned().map(PlanNode::Stream).collect())
+        };
+        return Ok(Plan {
+            streams: a.streams.iter().chain(b.streams.iter()).cloned().collect(),
+            combine: Combine::Join,
+            sorted: order_s.is_some(),
+            node: Some(PlanNode::Join(vec![as_node(&a), as_node(&b)])),
+        });
     }
     // split the two sides and the ON clause
     let (lhs, rest) = if let Some(j) = from_s.find(" JOIN ") {
@@ -489,6 +773,7 @@ fn plan_join(
                     ],
                     combine: Combine::Hash,
                     sorted: order_s.is_some(),
+                    node: None,
                 });
             }
             Err(e) => return Err(e),
@@ -527,7 +812,28 @@ fn plan_join(
                     ],
                     combine: if outer { Combine::Join } else { Combine::Hash },
                     sorted: order_s.is_some(),
+                    node: None,
                 });
+            }
+            (Some(ri), Some(_), false, true) => {
+                // BOTH keys are indexed, so both arrangements are legal and
+                // the engine picks by COST - and on equal costs by the
+                // stream ordering in `StreamInfo::cheaperThan`
+                // (independence, then previousExpectedStreams, then
+                // baseCost; Optimizer.h:895). Probed: with A.BX indexed and
+                // B.ID a primary key the engine drives B in BOTH SQL orders,
+                // i.e. the choice is a property of the streams and not of
+                // the text. That ordering is not converted, so this case is
+                // REFUSED rather than answered - it used to be answered by
+                // keeping the SQL order, which is right only by accident.
+                let _ = ri;
+                return Err(format!(
+                    "both join keys are indexed ({} on {}, {} on {}) - the \
+                     engine then chooses by baseCost and stream ordering \
+                     (InnerJoin::calculateStreamInfo), which this crate has \
+                     not converted",
+                    lcol, ltab, rcol, rtab
+                ));
             }
             (Some(ri), _, _, _) => {
                 (ltab.clone(), rtab.clone(), lidx.clone(), ri.clone(), lali.clone(), rali.clone())
@@ -544,6 +850,7 @@ fn plan_join(
                     ],
                     combine: Combine::Join,
                     sorted: order_s.is_some(),
+                    node: None,
                 })
             }
         };
@@ -605,6 +912,7 @@ fn plan_join(
         ],
         combine: Combine::Join,
         sorted,
+        node: None,
     })
 }
 
@@ -863,6 +1171,7 @@ fn plan_chain(
                         .collect(),
                     combine: Combine::Hash,
                     sorted: order_s.is_some(),
+                    node: None,
                 });
             }
         }
@@ -958,7 +1267,9 @@ fn plan_chain(
             access: Access::Index(vec![i.name]),
         });
     }
-    Ok(Plan { streams: out, combine: Combine::Join, sorted })
+    Ok(Plan { streams: out, combine: Combine::Join, sorted,
+            node: None,
+        })
 }
 
 /// The column THIS stream contributes to an ON clause.
@@ -1418,11 +1729,99 @@ fn split_kw<'a>(s: &'a str, kw: &str) -> Vec<&'a str> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_outer_join_nests_where_an_inner_chain_flattens() {
+        // three streams, inner: ONE flat JOIN list
+        let flat = Plan {
+            streams: vec![
+                Stream { name: qualified("A"), access: Access::Natural },
+                Stream { name: qualified("B"), access: Access::Index(vec!["IB".into()]) },
+                Stream { name: qualified("C"), access: Access::Index(vec!["IC".into()]) },
+            ],
+            combine: Combine::Join,
+            sorted: false,
+            node: None,
+        };
+        assert_eq!(
+            flat.render(),
+            "PLAN JOIN (\"PUBLIC\".\"A\" NATURAL, \"PUBLIC\".\"B\" INDEX (\"PUBLIC\".\"IB\"), \"PUBLIC\".\"C\" INDEX (\"PUBLIC\".\"IC\"))"
+        );
+        // the same three streams with an outer join: a NODE, so it nests
+        let a = Stream { name: qualified("A"), access: Access::Natural };
+        let b = Stream { name: qualified("B"), access: Access::Index(vec!["IB".into()]) };
+        let c = Stream { name: qualified("C"), access: Access::Index(vec!["IC".into()]) };
+        let nested = Plan {
+            streams: vec![a.clone(), b.clone(), c.clone()],
+            combine: Combine::Join,
+            sorted: false,
+            node: Some(PlanNode::Join(vec![
+                PlanNode::Join(vec![PlanNode::Stream(a), PlanNode::Stream(b)]),
+                PlanNode::Stream(c),
+            ])),
+        };
+        assert_eq!(
+            nested.render(),
+            "PLAN JOIN (JOIN (\"PUBLIC\".\"A\" NATURAL, \"PUBLIC\".\"B\" INDEX (\"PUBLIC\".\"IB\")), \"PUBLIC\".\"C\" INDEX (\"PUBLIC\".\"IC\"))"
+        );
+        // and a SORT wraps the nested shape the same way
+        let mut sorted = nested.clone();
+        sorted.sorted = true;
+        assert!(sorted.render().starts_with("PLAN SORT JOIN (JOIN ("));
+    }
+
+    #[test]
+    fn right_is_left_with_the_sides_exchanged() {
+        // the ON clause needs no rewriting - `A.BX = B.ID` means the same
+        // either way round - which is why the engine can treat RIGHT as
+        // LEFT-reversed, and why its plan drives the RIGHT side
+        assert_eq!(
+            swap_join_sides("A RIGHT JOIN B ON A.BX = B.ID").unwrap(),
+            "B LEFT JOIN A ON A.BX = B.ID"
+        );
+        assert_eq!(
+            swap_join_sides("T A LEFT JOIN U B ON A.ID = B.UID").unwrap(),
+            "U B LEFT JOIN T A ON A.ID = B.UID"
+        );
+        // a plain inner join swaps without a keyword
+        assert_eq!(
+            swap_join_sides("A JOIN B ON A.BX = B.ID").unwrap(),
+            "B JOIN A ON A.BX = B.ID"
+        );
+    }
+
+    #[test]
+    fn the_first_join_keyword_decides_the_kind() {
+        assert_eq!(outer_kind("A JOIN B ON A.X = B.Y"), OuterKind::Inner);
+        assert_eq!(outer_kind("A LEFT JOIN B ON A.X = B.Y"), OuterKind::Left);
+        assert_eq!(outer_kind("A RIGHT JOIN B ON A.X = B.Y"), OuterKind::Right);
+        assert_eq!(outer_kind("A FULL JOIN B ON A.X = B.Y"), OuterKind::Full);
+        // a chain takes its kind from the FIRST join, and the tail's kind
+        // is read separately when the chain is split
+        assert_eq!(
+            outer_kind("A JOIN B ON A.X = B.Y LEFT JOIN C ON B.Z = C.Z"),
+            OuterKind::Left
+        );
+    }
+
+    #[test]
+    fn the_on_column_survives_a_qualified_stream_name() {
+        // the stream name arrives schema-qualified while the ON clause
+        // names it bare - the mismatch that made every outer chain refuse
+        // with "no ON column" the first time round
+        assert_eq!(
+            on_column_for("B.CX = C.ID", "\"PUBLIC\".\"C\"").unwrap(),
+            "ID"
+        );
+        assert_eq!(on_column_for("B.CX = C.ID", "B").unwrap(), "CX");
+        assert!(on_column_for("B.CX = C.ID", "D").is_err());
+    }
+
     fn single(access: Access, sorted: bool) -> Plan {
         Plan {
             streams: vec![Stream { name: qualified("T"), access }],
             combine: Combine::Single,
             sorted,
+            node: None,
         }
     }
 
@@ -1460,6 +1859,7 @@ mod tests {
             ],
             combine: Combine::Join,
             sorted: false,
+            node: None,
         };
         assert_eq!(
             j.render(),
@@ -1472,6 +1872,7 @@ mod tests {
             ],
             combine: Combine::Hash,
             sorted: true,
+            node: None,
         };
         assert_eq!(h.render(), "PLAN SORT HASH (\"A\" NATURAL, \"B\" NATURAL)");
     }

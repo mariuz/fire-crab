@@ -886,6 +886,36 @@ them.
   assumption in one named constant instead of spreading it through
   offsets.
 
+## A converted decision has a SHAPE, not just a choice
+
+- **Watch for structure in the vendor's own output.** Firebird prints an
+  inner-join chain flat (`JOIN (a, b, c)`) and an outer-join chain nested
+  (`JOIN (JOIN (a, b), c)`). That is not formatting - it is the semantics
+  showing through, because an outer join's two sides are one result that
+  later joins cannot reorder into. If your model can only express the
+  flat shape, you will produce plausible output for a query whose meaning
+  you have not represented.
+- **A dialect's syntactic sugar is usually a REWRITE - find it.** RIGHT
+  JOIN is LEFT JOIN with the sides exchanged, and the engine performs
+  that swap before planning, so the plan it prints drives the OTHER
+  stream. The predicate needs no rewriting, which is what makes the swap
+  sound. Convert the rewrite, not the surface.
+- **When a construct means "both directions", say both.** A FULL join
+  plans as the union of the two nested loops and the engine prints both
+  halves. Printing one is a different answer that looks like a rounding
+  difference.
+- **"Right by accident" is a bug waiting for a new database.** Keeping
+  the SQL order when both join keys are indexed matched the engine on
+  every database the gate had - and disagreed on the first one built for
+  a different purpose. When two arrangements are legal and the vendor
+  decides by machinery you have not converted, refuse and name it;
+  a refusal that is later lifted costs a slice, a wrong plan costs trust.
+- **New fixtures are new coverage.** Both wrong answers here surfaced
+  because a probe database happened to index both sides of a join - a
+  shape none of the gate's four databases had. When you build a scratch
+  database for an unrelated experiment, run the existing checks against
+  it; that is nearly free and it is where the surprises live.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with
