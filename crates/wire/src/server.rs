@@ -1689,6 +1689,66 @@ impl Predicate {
                 _ => return Err("parameter type does not match its column".into()),
             })
         };
+        // An expression side binds to a literal EXPRESSION rather than an
+        // `Rhs`: `Rhs` carries the exact and text shapes the classic
+        // column terms compare against, and a DATE or a DOUBLE is
+        // neither. Going straight to `Expr` also keeps the comparison
+        // rules in one place - the bound term is an ordinary `Cond2`.
+        let bind_literal = |idx: &usize, kind: &ColKind| -> Result<Option<Expr>, String> {
+            let arg = args.get(*idx).ok_or("missing parameter value")?;
+            Ok(match (kind, arg) {
+                (_, WireParam::Null) => None,
+                (ColKind::Temporal(TKind::Date), WireParam::Date(d)) => {
+                    Some(Expr::DateLit(*d))
+                }
+                (ColKind::Temporal(TKind::Time), WireParam::Time(t)) => {
+                    Some(Expr::TimeLit(*t))
+                }
+                (ColKind::Temporal(TKind::Timestamp), WireParam::Timestamp(d, t)) => {
+                    Some(Expr::TsLit(*d, *t))
+                }
+                // The input BLR is VALUE-derived, not
+                // descriptor-derived: a driver may send a JS Date as
+                // blr_timestamp whatever type the describe announced.
+                // For a DATE slot that is harmless - `value_cmp` reads a
+                // DATE as midnight against a TIMESTAMP, which is the
+                // engine's own rule. For a TIME slot it is NOT: the
+                // engine compares TIME against TIMESTAMP by promoting
+                // the TIME with the CURRENT DATE (probed - every stored
+                // row then sorts above a 1970 timestamp), which this
+                // server does not do. Reading the timestamp's time half
+                // instead would answer a DIFFERENT SET OF ROWS with no
+                // error, so the statement refuses. A driver that honours
+                // the announced descriptor and sends a real TIME binds
+                // through the arm above.
+                (ColKind::Temporal(TKind::Time), WireParam::Timestamp(..)) => {
+                    return Err("a TIMESTAMP value for a TIME parameter needs the \
+                                engine's current-date promotion".into())
+                }
+                (ColKind::Temporal(_), WireParam::Timestamp(d, t)) => {
+                    Some(Expr::TsLit(*d, *t))
+                }
+                (ColKind::Temporal(TKind::Timestamp), WireParam::Date(d)) => {
+                    Some(Expr::TsLit(*d, 0))
+                }
+                (ColKind::Temporal(_), WireParam::Date(d)) => Some(Expr::DateLit(*d)),
+                (ColKind::Approx, WireParam::Double(x)) => Some(Expr::Double(*x)),
+                // an exact value for an approximate slot converts, the
+                // way an exact literal in the SQL text would
+                (ColKind::Approx, WireParam::Int(v, sc)) => {
+                    Some(Expr::Double(*v as f64 * 10f64.powi(*sc as i32)))
+                }
+                // everything else keeps the classic Rhs typing, then
+                // becomes the matching literal
+                _ => match bind_rhs(idx, kind)? {
+                    None => None,
+                    Some(Rhs::Int(n)) => Some(Expr::Int(n)),
+                    Some(Rhs::Num(r, sc)) => Some(Expr::Dec(r, sc)),
+                    Some(Rhs::Str(t)) => Some(Expr::Str(t)),
+                    Some(Rhs::Null | Rhs::Param(..)) => Some(Expr::Null),
+                },
+            })
+        };
         let mut groups = Vec::new();
         for g in &self.0 {
             let mut terms = Vec::new();
@@ -1712,15 +1772,9 @@ impl Predicate {
                     // becomes a literal expression and the term an
                     // ordinary three-valued comparison
                     Term::ExprParam(lhs, op, idx, kind) => {
-                        match bind_rhs(idx, kind)? {
+                        match bind_literal(idx, kind)? {
                             None => Term::Never, // compared with NULL: UNKNOWN
-                            Some(rhs) => {
-                                let lit = match rhs {
-                                    Rhs::Int(n) => Expr::Int(n),
-                                    Rhs::Num(r, sc) => Expr::Dec(r, sc),
-                                    Rhs::Str(t) => Expr::Str(t),
-                                    Rhs::Null | Rhs::Param(..) => Expr::Null,
-                                };
+                            Some(lit) => {
                                 Term::ExprCond(Box::new(Cond2::Cmp(
                                     lhs.clone(),
                                     *op,
@@ -15081,9 +15135,10 @@ impl Expr {
                 match col_kind(d) {
                     Some(ColKind::Int) => Some(ExprType::Int),
                     Some(ColKind::Text) => Some(ExprType::Text),
-                    // col_kind never returns Numeric (predicate-only
-                    // marker); numeric columns classify from the desc
-                    Some(ColKind::Numeric) => None,
+                    // col_kind never returns these (they are
+                    // parameter-binding markers); such columns classify
+                    // from the descriptor below
+                    Some(ColKind::Numeric | ColKind::Temporal(_) | ColKind::Approx) => None,
                     None if is_numeric_col(d) => Some(ExprType::Numeric),
                     None if is_approx_col(d) => Some(ExprType::Approx),
                     None => temporal_kind(d).map(ExprType::Temporal),
@@ -18123,6 +18178,11 @@ enum ColKind {
     /// [col_kind] itself never returns it (the shared bind/expr paths
     /// keep their narrower classification)
     Numeric,
+    /// a DATE/TIME/TIMESTAMP parameter target - like `Numeric`, a
+    /// binding marker only
+    Temporal(TKind),
+    /// a FLOAT/DOUBLE PRECISION parameter target - a binding marker only
+    Approx,
 }
 // ===================================================================
 // PSQL EXECUTION
@@ -19165,8 +19225,21 @@ fn resolve_expr_term(
                     (d(dtype::INT64, 8, lhs.result_scale(descs)?), ColKind::Numeric)
                 }
                 ExprType::Text => (d(dtype::VARYING, 32765, 0), ColKind::Text),
-                // no temporal or approximate parameter path yet - refuse
-                ExprType::Temporal(_) | ExprType::Approx => return None,
+                // a temporal or approximate side asks the client for
+                // that type: the descriptor IS the contract, so the
+                // driver encodes a DATE where a DATE is announced and
+                // the value arrives already decoded
+                ExprType::Temporal(TKind::Date) => {
+                    (d(dtype::SQL_DATE, 4, 0), ColKind::Temporal(TKind::Date))
+                }
+                ExprType::Temporal(TKind::Time) => {
+                    (d(dtype::SQL_TIME, 4, 0), ColKind::Temporal(TKind::Time))
+                }
+                ExprType::Temporal(TKind::Timestamp) => (
+                    d(dtype::TIMESTAMP, 8, 0),
+                    ColKind::Temporal(TKind::Timestamp),
+                ),
+                ExprType::Approx => (d(dtype::DOUBLE, 8, 0), ColKind::Approx),
             };
             if params.len() <= *slot {
                 params.resize(*slot + 1, None);
@@ -24789,6 +24862,85 @@ mod tests {
         ] {
             assert!(parse_raw_expr(bad).is_none(), "{bad} parsed");
         }
+    }
+
+    #[test]
+    fn typed_parameters_describe_and_bind() {
+        // D DATE, TM TIME, TS TIMESTAMP, DP DOUBLE PRECISION
+        let columns = vec![
+            RelationColumn { name: "D".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "TM".into(), field_id: 1, position: 1 },
+            RelationColumn { name: "TS".into(), field_id: 2, position: 2 },
+            RelationColumn { name: "DP".into(), field_id: 3, position: 3 },
+        ];
+        let d = |dt, len| Descriptor {
+            dtype: dt, scale: 0, length: len, sub_type: 0, flags: 0, offset: 4,
+        };
+        let descs = vec![
+            d(dtype::SQL_DATE, 4),
+            d(dtype::SQL_TIME, 4),
+            d(dtype::TIMESTAMP, 8),
+            d(dtype::DOUBLE, 8),
+        ];
+        let day = parse_date_lit("2020-01-01").unwrap();
+        let t830 = parse_time_lit("08:30:00").unwrap();
+        let row = vec![
+            Value::Date(day),
+            Value::Time(t830),
+            Value::Timestamp(day, t830),
+            Value::Double(1.5),
+        ];
+        let build = |s: &str| -> (Predicate, Vec<Option<Descriptor>>) {
+            let toks = tokenize(s).unwrap();
+            let mut np = 0usize;
+            let raw = parse_predicate(&toks, &mut np).unwrap();
+            let mut params: Vec<Option<Descriptor>> = Vec::new();
+            let p = resolve_predicate(raw, &columns, &descs, &mut params)
+                .unwrap_or_else(|| panic!("{s} refused"));
+            (p, params)
+        };
+
+        // the DESCRIBE is the contract: the client encodes from it, so a
+        // temporal side has to announce its own type rather than the
+        // BIGINT an integer parameter gets
+        let (p, params) = build("D > ?");
+        assert_eq!(params[0].map(|d| d.dtype), Some(dtype::SQL_DATE));
+        let (_, params) = build("TM > ?");
+        assert_eq!(params[0].map(|d| d.dtype), Some(dtype::SQL_TIME));
+        let (_, params) = build("TS > ?");
+        assert_eq!(params[0].map(|d| d.dtype), Some(dtype::TIMESTAMP));
+        let (_, params) = build("DP > ?");
+        assert_eq!(params[0].map(|d| d.dtype), Some(dtype::DOUBLE));
+
+        // ... and the BIND puts the arrived value where a written-out
+        // literal would have been: the bound term is the same
+        // three-valued comparison either way
+        let earlier = parse_date_lit("2019-01-01").unwrap();
+        assert!(p.bind(&[WireParam::Date(earlier)]).unwrap().matches(&row).unwrap());
+        let later = parse_date_lit("2021-01-01").unwrap();
+        assert!(!p.bind(&[WireParam::Date(later)]).unwrap().matches(&row).unwrap());
+        // a NULL parameter is UNKNOWN, never an error
+        assert!(!p.bind(&[WireParam::Null]).unwrap().matches(&row).unwrap());
+        // a driver that sends a TIMESTAMP for a DATE slot is asking for
+        // the engine's midnight conversion, which value_cmp performs
+        assert!(p.bind(&[WireParam::Timestamp(earlier, 0)]).unwrap().matches(&row).unwrap());
+
+        let (p, _) = build("DP > ?");
+        assert!(p.bind(&[WireParam::Double(1.0)]).unwrap().matches(&row).unwrap());
+        assert!(!p.bind(&[WireParam::Double(2.0)]).unwrap().matches(&row).unwrap());
+        // an exact value for an approximate slot converts - 1.5 > 1 is
+        // true, which a truncating conversion the other way would miss
+        assert!(p.bind(&[WireParam::Int(1, 0)]).unwrap().matches(&row).unwrap());
+        assert!(p.bind(&[WireParam::Int(125, -2)]).unwrap().matches(&row).unwrap());
+
+        // a TIMESTAMP value for a TIME slot REFUSES: the engine compares
+        // those by promoting the TIME with the CURRENT DATE, and reading
+        // the timestamp's time half instead would answer a different set
+        // of rows with no error anywhere
+        let (p, _) = build("TM > ?");
+        assert!(p.bind(&[WireParam::Timestamp(day, 0)]).is_err());
+        // a driver that honours the announced descriptor still works
+        assert!(p.bind(&[WireParam::Time(0)]).unwrap().matches(&row).unwrap());
     }
 
     #[test]

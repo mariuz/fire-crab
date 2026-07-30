@@ -13,6 +13,41 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — `?` parameters over the temporal and approximate families
+
+### Converted
+- **A `?` against a DATE, TIME, TIMESTAMP, FLOAT or DOUBLE side.**
+  `WHERE D = ?`, `WHERE DP > ?`, `BETWEEN ? AND ?`, a parameter against
+  approximate arithmetic (`WHERE DP * 2 > ?`) and against an expression
+  (`WHERE D + 1 > ?`), in a SELECT and in a DML.
+- Two halves had to agree. The **describe** now announces the slot's own
+  type — SQL_DATE, SQL_TIME, TIMESTAMP, DOUBLE — because the client
+  builds its encoder from it, so a wrong announcement does not produce a
+  wrong answer but a wrongly ENCODED message. The **bind** turns the
+  arrived value into a literal EXPRESSION rather than one of the exact
+  `Rhs` shapes, which a DATE or a DOUBLE is not; the bound term is then
+  the same three-valued comparison a written-out literal produces, and
+  the gate checks the two select the same rows.
+- An exact value arriving for an approximate slot converts (a driver may
+  send `1` where a DOUBLE was announced), and a NULL parameter is
+  UNKNOWN rather than an error, as before.
+
+### Guarded
+- **A TIMESTAMP value for a TIME slot refuses.** The input BLR is
+  VALUE-derived, not descriptor-derived: node-firebird sends any JS Date
+  as `blr_timestamp` whatever the describe said. Against a DATE column
+  that is harmless — a DATE reads as midnight against a TIMESTAMP — but
+  against a TIME column the engine promotes the TIME with the CURRENT
+  DATE (probed: every stored row then sorts above a 1970 timestamp), and
+  reading the timestamp's time half instead would answer a different set
+  of rows with no error anywhere. A driver that honours the announced
+  descriptor and sends a real TIME binds normally.
+
+`qa/serve-real-typedparams.sh` (26 checks, twin servers on identical
+databases), which also runs each parameter form beside its written-out
+literal on the same server: a bind that lands the value in the wrong
+shape shows up there even when both servers agree with each other.
+
 ## 2026-07-30 — approximate ARITHMETIC, and the literal that makes one
 
 ### Converted

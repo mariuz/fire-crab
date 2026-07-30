@@ -6624,6 +6624,60 @@ the predicate tokenizer — and either one alone knowing about exponents would
 make the same literal mean different things on the two sides of a statement.
 Both learned it, and the gate exercises both positions.
 
+### `?` parameters over the temporal and approximate families (`qa/serve-real-typedparams.sh`, 26 checks)
+
+A parameter is a contract with two sides, and both of them can be wrong
+independently.
+
+**The describe is the encoder's specification.** The client builds its message
+from the type the server announces for the slot, so announcing BIGINT where a
+DATE belongs does not produce a wrong ANSWER — it produces a wrongly ENCODED
+message, and what survives is whichever values the two encodings happen to
+agree on. That is why every check here sends a real value and compares the
+rows, rather than inspecting the describe alone.
+
+**The bind is where the value re-enters the comparison.** The classic column
+terms compare against an `Rhs`, which carries the exact and text shapes; a DATE
+and a DOUBLE are neither. So these bind straight to a literal EXPRESSION and
+the term becomes an ordinary three-valued `Cond2` — the same one a written-out
+literal produces. The gate runs each parameter form beside its literal
+equivalent ON THE SAME SERVER for exactly that reason: a bind that lands the
+value in the wrong shape shows up there even when both servers happen to agree
+with each other.
+
+**The refusal, and why it is not a shortcut.** The input BLR is VALUE-derived,
+not descriptor-derived: node-firebird sends any JS Date as `blr_timestamp`
+whatever the describe announced. Against a DATE column that is harmless,
+because `value_cmp` reads a DATE as midnight against a TIMESTAMP — the engine's
+own rule. Against a TIME column it is not. The engine compares TIME against
+TIMESTAMP by promoting the TIME with the CURRENT DATE, so `TM > <a 1970
+timestamp>` returns EVERY non-null row; reading the timestamp's time half
+instead — the obvious implementation — answers a completely different set with
+no error anywhere. The gate pins both halves: it asserts the engine's answer IS
+the every-row promotion, and that fire-crab refuses rather than guessing. A
+driver that honours the announced descriptor and sends a real TIME binds
+normally, which is the check that keeps the refusal about the wire shape and
+not about TIME columns.
+
+### A standing red gate: BOOLEAN as a written value
+
+`qa/serve-real-params.sh` reports six DIFFs, and has for at least 25
+increments — this was found while checking the parameter slice above for
+regressions, by rebuilding the tree at older commits and re-running it.
+
+The cause is one statement, not six: `INSERT INTO PT (ID, ACTIVE) VALUES (20,
+TRUE)` is REFUSED. Not the parameter — the LITERAL. `TRUE` and `FALSE` are not
+values this server's INSERT/UPDATE value list knows, so the row never lands,
+and the five later checks that read it back or compare the mirror table fail
+because row 1 is missing. A BOOLEAN column READS correctly (the type gate
+compares them), and a boolean parameter fails for the same reason its literal
+does.
+
+It is recorded here rather than quietly left because a red gate that nobody
+names becomes a gate nobody reads. The fix is its own increment: BOOLEAN as a
+value — literals and parameters in a VALUES list and a SET, and `WHERE ACTIVE =
+TRUE` / `IS TRUE` in a predicate.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

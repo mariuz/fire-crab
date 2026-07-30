@@ -57,6 +57,7 @@ same database file.
 | an approximate value's TEXT: a DOUBLE at 16 significant digits, a FLOAT at 8, trailing zeros kept, scientific outside the fixed range (C's `%#.16g`/`%#.8g`) - what CAST AS VARCHAR and `\|\|` produce | `dsc.cpp` double conversion, probed against isql | `fire-crab-ods::format::{render_double, render_float}`, `Value::Float` |
 | approximate ARITHMETIC: one approximate operand makes the result approximate (no scale carried); float division by zero raises `isc_exception_float_divide_by_zero` and a result past the range `isc_exception_float_overflow` - the engine does NOT answer an IEEE infinity | `dsc.cpp` promotion + `ExprNodes.cpp` arithmetic, probed (`DP / 0` is SQLSTATE 22012, `1e200 * 1e200` is 22003) | the approximate arm of `Expr::Bin`'s typing and eval, `EvalErr::{FloatDivideByZero, FloatOverflow}` |
 | an EXPONENT makes a literal APPROXIMATE - `1e3` is a DOUBLE 1000, `1.5e0` a DOUBLE where a bare `1.5` is an exact NUMERIC | `parse.y` numeric literals, probed via the describe and the rendering | the exponent scan in `expr_atom` AND in `numeric_tok` - two lexers, one rule |
+| a `?` parameter against a TEMPORAL or APPROXIMATE side: the describe announces the slot's own type (SQL_DATE/SQL_TIME/TIMESTAMP/DOUBLE) and the arrived value binds to a literal EXPRESSION, so the bound term is the comparison a written-out literal makes | the engine describes a parameter from the other side of the comparison | the temporal/approximate arms of `resolve_expr_term`'s param path and of `Predicate::bind`'s `bind_literal`, `ColKind::{Temporal, Approx}` |
 | an APPROXIMATE column (FLOAT/DOUBLE PRECISION) as an operand: every comparison operator, IS [NOT] NULL, BETWEEN, IN, unary minus, ABS, and SUM/AVG/MIN/MAX (all describing as DOUBLE, FLOAT sources included); an exact side converts to f64, a string literal converts at prepare | `dsc.cpp` promotion + `AggNodes.cpp`, probed (`AVG(DP)` = 1.875, `SUM(F)` reads as a DOUBLE) | `ExprType::Approx`, `is_approx_col`, `cmp_sides`, the approximate arms of `value_cmp` and `compute_group` |
 | a TEMPORAL COLUMN in a predicate: every operator against a typed literal, IS [NOT] NULL, BETWEEN, IN, LIKE; a DATE against a TIMESTAMP reads as MIDNIGHT; a STRING literal is CONVERTED at prepare (so `D = '2021-6-15'` is the same date, not a different string) and one that will not convert refuses where the engine raises 22018 | `src/jrd/evl.cpp` comparison over temporal descs, probed | `temporal_kind` routing in `resolve_predicate`, `temporal_sides`, the `DATE'...'` arm of `tokenize` |
 | WHERE comparison sides are full expressions (arithmetic, functions, CAST, conditionals, column vs column); per-row eval errors raise mid-statement with the engine's vector | `src/jrd/evl.cpp` boolean evaluation over expression nodes, probed | `texpr` (token-level sides), the fallible `Predicate::matches` |
@@ -231,8 +232,12 @@ reason rather than an omission:
   conversion.
 - **An approximate branch mixed with another family** in one
   `CASE`/`COALESCE` describe - the wire form could not carry both.
-- **`?` parameters against a temporal or approximate side** - the bind
-  descriptor has no synthesis path for either yet.
+- **A TIMESTAMP-shaped `?` value for a TIME slot.** Drivers encode from
+  the value's language type, not the published descriptor, so a JS Date
+  arrives as `blr_timestamp` for every temporal slot. For a DATE that is
+  the engine's own midnight conversion; for a TIME it is the
+  current-date promotion above, so the bind refuses. A real TIME value
+  binds normally.
 
 ## The evaluator's shape
 

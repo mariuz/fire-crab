@@ -1128,6 +1128,24 @@ them.
   and an integer in the WHERE, in the same statement. Any literal rule
   has to land in every lexer that can see it.
 
+- **A parameter's DESCRIBE is a specification, not a label.** The
+  client encodes from it. Announce the wrong type and you do not get a
+  wrong answer - you get a wrongly encoded message, and the values that
+  survive are the ones whose two encodings coincide. Test parameters by
+  sending real values and comparing rows, never by reading the describe
+  back.
+- **Check a bound parameter against the same statement written out.**
+  Both servers can agree with each other while the value lands in the
+  wrong internal shape; the parameter form and the literal form running
+  on YOUR server must select the same rows.
+- **The input BLR is value-derived.** Drivers encode from the VALUE's
+  language type, not from the descriptor you published - a JS Date
+  arrives as a timestamp whether you asked for a DATE, a TIME or a
+  TIMESTAMP. So the bind has to decide what a mismatched shape MEANS,
+  and where the engine's rule for that pair is one you have not
+  implemented, refuse. Converting it to the obvious thing answers a
+  different set of rows with no error anywhere.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with
