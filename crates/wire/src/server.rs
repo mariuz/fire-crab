@@ -8146,11 +8146,27 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     let mut next_param = params.len();
     let filter = match where_kw {
         None => None,
-        Some(w) => Some(
-            tokenize(&s[w + "WHERE".len()..])
-                .and_then(|t| parse_predicate(&t, &mut next_param))
-                .and_then(|raw| resolve_predicate(raw, &columns, descs, &mut params))?,
-        ),
+        // A DML WHERE may carry SUBQUERIES, exactly as a SELECT's does -
+        // `UPDATE T SET ... WHERE ID IN (SELECT UID FROM U)` is the same
+        // predicate the SELECT path already answers, and it is lifted the
+        // same way: each subquery is evaluated once and folded back in as
+        // ordinary tokens BEFORE the predicate parser sees them.
+        Some(w) => {
+            let ws = &s[w + "WHERE".len()..];
+            Some(
+                extract_subqueries(ws)
+                    .and_then(|(rewritten, subs)| {
+                        let toks = tokenize(&rewritten)?;
+                        if subs.is_empty() {
+                            Some(toks)
+                        } else {
+                            resolve_subqueries(&toks, &subs, db, &columns)
+                        }
+                    })
+                    .and_then(|t| parse_predicate(&t, &mut next_param))
+                    .and_then(|raw| resolve_predicate(raw, &columns, descs, &mut params))?,
+            )
+        }
     };
     let params: Vec<Descriptor> = params.into_iter().collect::<Option<_>>()?;
     // the table's CHECK constraints (an unevaluatable one refuses) and
@@ -8224,11 +8240,23 @@ fn plan_delete(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     let mut next_param = 0usize;
     let filter = match where_kw {
         None => None,
-        Some(w) => Some(
-            tokenize(&s[w + "WHERE".len()..])
-                .and_then(|t| parse_predicate(&t, &mut next_param))
-                .and_then(|raw| resolve_predicate(raw, &columns, descs, &mut params))?,
-        ),
+        // the same subquery lifting the SELECT and UPDATE paths use
+        Some(w) => {
+            let ws = &s[w + "WHERE".len()..];
+            Some(
+                extract_subqueries(ws)
+                    .and_then(|(rewritten, subs)| {
+                        let toks = tokenize(&rewritten)?;
+                        if subs.is_empty() {
+                            Some(toks)
+                        } else {
+                            resolve_subqueries(&toks, &subs, db, &columns)
+                        }
+                    })
+                    .and_then(|t| parse_predicate(&t, &mut next_param))
+                    .and_then(|raw| resolve_predicate(raw, &columns, descs, &mut params))?,
+            )
+        }
     };
     let params: Vec<Descriptor> = params.into_iter().collect::<Option<_>>()?;
     // the trigger guard: an FK AFTER DELETE action trigger (the engine

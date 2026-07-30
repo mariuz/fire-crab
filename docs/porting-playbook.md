@@ -995,6 +995,20 @@ them.
   near-miss predicate in the gate NEXT to the real one, so the
   difference is a visible row count instead of a claim.
 
+## The missing piece is often a PASS, not a feature
+
+- **When one path answers a shape and another refuses it, compare the
+  PIPELINES before writing any logic.** `WHERE ID IN (SELECT ...)` worked
+  in SELECT and failed in UPDATE - not because the predicate was
+  unimplemented, but because the DML planner tokenized the WHERE directly
+  while the SELECT planner ran a subquery-lifting pass first. Moving the
+  pass, not the logic, brought IN, NOT IN and the scalar forms in at
+  once.
+- **A statement that returns nothing needs the STATE as its assertion.**
+  A DML's reply is identical whether its filter chose the right rows or
+  the wrong ones. Compare the tables after every statement - and compare
+  the OTHER table too, to show it was only read.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

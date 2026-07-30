@@ -13,6 +13,28 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-30 — the wire server: subqueries in a DML WHERE
+
+### Converted
+- **`UPDATE`/`DELETE ... WHERE <col> IN (SELECT ...)`**, `NOT IN`, and a
+  scalar subquery on the right of a comparison
+  (`WHERE ID = (SELECT MIN(UID) FROM U)`,
+  `WHERE AMT < (SELECT MAX(N) FROM U)`).
+- The predicate was never the missing piece - the SELECT path has
+  answered these shapes for slices. What the DML planners lacked was the
+  LIFTING pass in front of the parser: each subquery is evaluated once
+  and folded back into the token stream as ordinary values before the
+  predicate parser ever sees it. Both DML planners now run the same pass
+  the SELECT path runs, which is why `IN`, `NOT IN` and the scalar forms
+  all arrived together.
+
+The gate (`qa/serve-real-dmlsubq.sh`, 17 checks) is mostly TABLE
+comparisons on purpose: a DML returns no rows, so a subquery filter that
+selects the wrong rows deletes the wrong rows and nothing in the reply
+shows it. Every statement runs against both servers on identical
+databases, and after each one both tables are compared - including the
+subquery's own table, to prove it was only read.
+
 ## 2026-07-30 — the wire server: where NULL sits, and ORDER BY expressions
 
 ### Converted

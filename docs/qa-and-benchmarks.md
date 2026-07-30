@@ -6383,6 +6383,21 @@ Two details worth keeping:
   resolve refuses the statement rather than sorting by something else, which
   the gate checks with `ORDER BY NOSUCH(AMT)`.
 
+### Subqueries in a DML WHERE (`qa/serve-real-dmlsubq.sh`, 17 checks)
+
+`UPDATE T SET AMT = 0 WHERE ID IN (SELECT UID FROM U)` is the same predicate
+the SELECT path had answered for slices; what the DML planners lacked was the
+lifting pass in front of the parser, which evaluates each subquery once and
+folds its answer back into the token stream as ordinary values. Adding that one
+pass to both planners brought `IN`, `NOT IN` and the scalar-comparison forms in
+together.
+
+The gate is deliberately mostly TABLE comparisons. A DML returns no rows, so a
+subquery filter that selects the wrong rows deletes the wrong rows and the reply
+looks identical either way — the contents are the only witness. So after every
+statement both servers' tables are compared, including the subquery's own table,
+to show it was only read.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
