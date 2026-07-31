@@ -13,6 +13,39 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — one statement of "which side is which"
+
+### Converted
+- **A correlated `EXISTS` whose INNER table is aliased** — the refusal
+  the previous increment named. `SELECT COUNT(*) FROM EMP E WHERE EXISTS
+  (SELECT 1 FROM DEPT D WHERE D.ID = E.DEPT_ID)` is how the shape is
+  normally written, and it refused while the SAME correlation worked
+  through `IN`, through a scalar comparison and in the select list.
+
+**The cause is worth more than the fix.** The EXISTS arm recovers the
+outer column with a helper that carried its **own copy** of the
+"which side of this equality is the inner one" rule — and that copy
+compared a qualifier against the inner table's NAME only, never its
+alias. The rule had been written three times: once in `eval_subquery`,
+once in that helper, and once (extracted two increments ago) in
+`split_correlation`. Two of the three learned about aliases; the third
+did not, and it was the one that failed last.
+
+The helper is now four lines that call `split_correlation`. A rule
+stated twice is a rule that drifts; a rule stated three times drifts
+twice, and the copies fail at different times, which is what makes the
+symptom look like a different bug each time.
+
+### Fixed
+- `qa/gate-selfcheck.sh`'s squatter check conflated "the gate failed for
+  the RIGHT reason" with "the gate failed" — a transient scratch-database
+  failure inside the squatted gate read as the guard not firing. It now
+  retries the setup once and reports the two cases differently.
+
+`qa/serve-real-subqalias.sh` grows from 29 checks to 32; its two
+refusals become comparisons, including the negated form and the shape
+with an inner residual beside the correlation.
+
 ## 2026-07-31 — subqueries whose tables carry aliases
 
 ### Fixed

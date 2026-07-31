@@ -1580,6 +1580,21 @@ them.
   left the second. When you find yourself writing "the classic X/Y
   divergence" in a comment, enumerate BOTH directions before moving on.
 
+- **A rule stated three times drifts twice.** "Which side of this
+  equality belongs to the inner table" lived in three places here. Two
+  learned that a table answers to its ALIAS as well as its name; the
+  third did not, and it was the one that failed last - so the symptom
+  arrived an increment after the cause looked fixed, in a different
+  shape. When you extract a rule into a helper, grep for the OTHER copies
+  in the same breath: the extraction is only half the fix.
+
+- **When a capability works on three paths and fails on a fourth, look
+  for a duplicated rule rather than a missing feature.** The correlation
+  worked through IN, through a scalar comparison and in the select list,
+  and failed through EXISTS. That pattern - most paths fine, one path
+  not - almost never means the feature is missing; it means one caller
+  has its own copy of something.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

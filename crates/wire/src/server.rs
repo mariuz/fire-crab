@@ -19873,37 +19873,20 @@ fn correlated_outer_col(
     db: &Database,
     outer_cols: &[RelationColumn],
 ) -> Option<String> {
+    // ONE implementation of "which side is which". This used to carry
+    // its own copy of the rule and compared a qualifier against the
+    // inner table's NAME only - so `FROM DEPT D ... WHERE D.ID =
+    // EMP.DEPT_ID` found no correlation here even though the split in
+    // `eval_subquery` had already found one, and the whole WHERE
+    // refused. A rule stated twice is a rule that drifts; a rule stated
+    // three times drifts twice.
     let (_, table_s, where_s, _, _, _) = split_query(sql)?;
     let (from, _) = parse_from(table_s)?;
     let columns = relation_columns(&db.bytes, db.page_size, from.table);
-    for p in split_top_and(&tokenize(where_s?)?) {
-        if let [Tok::Ident(a), Tok::Cmp(Cmp::Eq), Tok::Ident(b)] = p.as_slice() {
-            let name_of = |q: &str| q.rsplit('.').next().unwrap_or(q).to_string();
-            let qual_of = |q: &str| -> Option<String> {
-                let mut it = q.rsplitn(2, '.');
-                it.next();
-                it.next().map(|s| s.to_string())
-            };
-            let (an, bn) = (name_of(a), name_of(b));
-            // a qualifier naming the INNER table settles which side is
-            // which - see eval_subquery
-            let is_inner = |q: &str, n: &str| match qual_of(q) {
-                Some(t) => t.eq_ignore_ascii_case(from.table),
-                None => columns.iter().any(|c| c.name.eq_ignore_ascii_case(n)),
-            };
-            let is_outer = |q: &str, n: &str| {
-                qual_of(q).is_none_or(|t| !t.eq_ignore_ascii_case(from.table))
-                    && outer_cols.iter().any(|c| c.name.eq_ignore_ascii_case(n))
-            };
-            if is_inner(a, &an) && is_outer(b, &bn) {
-                return Some(bn);
-            }
-            if is_inner(b, &bn) && is_outer(a, &an) {
-                return Some(an);
-            }
-        }
-    }
-    None
+    let toks = tokenize(where_s?)?;
+    let (_, outer, _) =
+        split_correlation(&toks, from.table, from.alias, &columns, outer_cols)?;
+    Some(outer)
 }
 
 /// Token equality, enough to de-duplicate an IN list.

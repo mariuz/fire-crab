@@ -211,22 +211,30 @@ both "a plain qualified WHERE" "SELECT COUNT(*) FROM EMP E WHERE E.SALARY > 150"
 both "a qualified projection beside one" \
      "SELECT E.ID, E.NAME FROM EMP E WHERE E.DEPT_ID IN (SELECT D.ID FROM DEPT D) ORDER BY E.ID"
 
-# --- 6. what still refuses, and why -----------------------------------
-# A correlated EXISTS whose INNER table is aliased is not answered yet:
-# the correlation split reads the alias, but something later in the
-# EXISTS path still resolves against the inner table's own name. It
-# REFUSES rather than answering, and the shapes above show the same
-# correlation working through IN, through a scalar comparison and in the
-# select list - so this is a gap in one path, named here as the next
-# slice rather than left to be discovered.
-refuses "a correlated EXISTS whose INNER table is aliased" \
-        "SELECT COUNT(*) FROM EMP WHERE EXISTS (SELECT 1 FROM DEPT D WHERE D.ID = EMP.DEPT_ID)"
-refuses "... with both aliased" \
-        "SELECT COUNT(*) FROM EMP E WHERE EXISTS (SELECT 1 FROM DEPT D WHERE D.ID = E.DEPT_ID)"
+# --- 6. a correlated EXISTS whose INNER table is aliased --------------
+# This refused for one increment while the SAME correlation worked
+# through IN, through a scalar comparison and in the select list - a gap
+# in ONE path, because the EXISTS arm recovered the outer column with its
+# OWN copy of the "which side is which" rule, and that copy compared a
+# qualifier against the inner table's NAME only. The rule is now stated
+# ONCE (`split_correlation`) and the copy is gone: a rule stated twice is
+# a rule that drifts, and this one had been stated three times.
+both "a correlated EXISTS whose INNER table is aliased" \
+     "SELECT COUNT(*) FROM EMP WHERE EXISTS (SELECT 1 FROM DEPT D WHERE D.ID = EMP.DEPT_ID)"
+both "... with BOTH aliased" \
+     "SELECT COUNT(*) FROM EMP E WHERE EXISTS (SELECT 1 FROM DEPT D WHERE D.ID = E.DEPT_ID)"
+both "... negated, with both aliased" \
+     "SELECT COUNT(*) FROM EMP E WHERE NOT EXISTS (SELECT 1 FROM DEPT D WHERE D.ID = E.DEPT_ID)"
+both "... and WHICH rows, negated" \
+     "SELECT E.ID FROM EMP E WHERE NOT EXISTS (SELECT 1 FROM DEPT D WHERE D.ID = E.DEPT_ID)
+      ORDER BY E.ID"
+both "... with an inner residual beside the correlation" \
+     "SELECT COUNT(*) FROM EMP E
+      WHERE EXISTS (SELECT 1 FROM DEPT D WHERE D.ID = E.DEPT_ID AND D.ID > 1)"
 
 rm -f "$A" "$B"
-if [ "$ran" -lt 28 ]; then
-    echo "DIFF only $ran checks ran (expected at least 28) - did one silently skip?"
+if [ "$ran" -lt 31 ]; then
+    echo "DIFF only $ran checks ran (expected at least 31) - did one silently skip?"
     fail=1
 fi
 exit $fail

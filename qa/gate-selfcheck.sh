@@ -122,12 +122,20 @@ else
     if ! kill -0 $squat 2>/dev/null; then
         echo "SKIP could not hold port $SQUAT to test with"
     else
+        # The squatted gate builds its own scratch databases first, and
+        # that can fail transiently - which looked exactly like the guard
+        # not firing. Distinguish "failed for the RIGHT reason" from
+        # "failed at all", and retry the setup once before believing it.
         out=$(timeout 300 qa/serve-real-viewjoin.sh "$SQUAT" 2>&1)
         rc=$?
+        if printf '%s' "$out" | grep -q "^FAIL scratch"; then
+            out=$(timeout 300 qa/serve-real-viewjoin.sh "$SQUAT" 2>&1)
+            rc=$?
+        fi
         if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "already in use"; then
             echo "OK   a gate whose port is occupied FAILS and says why (rc=$rc)"
         else
-            echo "DIFF a gate ran to completion with another server on its port (rc=$rc)"
+            echo "DIFF the squatted gate did not fail on the port (rc=$rc)"
             printf '%s\n' "$out" | head -4 | sed 's/^/     /'
             fail=1
         fi
