@@ -883,6 +883,114 @@ enum Wire {
     TimestampTz,
 }
 
+// ===================================================================
+// ROW SOURCES - the engine's execution shape
+//
+// The engine answers a query by building a TREE OF RECORD SOURCES
+// (`RecordSource` / rsb in src/jrd/) and pulling rows through it: a scan
+// at the leaf, a filter above it, a sort above that. This server grew
+// the other way round - each plan kind carried its own scan-filter-sort
+// loop, and the shapes the tree makes easy (a derived table, a
+// materialised CTE, a recursive one) were reached by rewriting SQL TEXT
+// instead.
+//
+// `RowSource` is that tree. It is introduced here holding the three
+// nodes every plan already implements by hand, and the plans move onto
+// it one at a time - each move a slice whose statement is "the answers
+// do not change", with the gates as the proof. See docs/roadmap.md.
+//
+// The node set is deliberately the engine's, not a convenient one:
+//
+//   TableScan   FullTableScan  - every record of a relation, in storage
+//                                order, which is what `for_each_record`
+//                                has always done
+//   Filter      the boolean-filtered stream; a per-row evaluation error
+//                                propagates rather than dropping the row
+//   Sort        materialises and orders, evaluating EXPRESSION keys
+//
+// What is NOT here yet, and is named so the shape is not mistaken for
+// finished: Aggregate, NestedLoopJoin, Union, and an IndexScan leaf -
+// the last being the one that makes `fire-crab-opt`'s access-path
+// choices executable rather than advisory.
+#[derive(Clone)]
+enum RowSource {
+    /// every record of a relation, in storage order
+    TableScan {
+        rel: u16,
+        formats: Vec<(u8, Vec<Descriptor>)>,
+    },
+    /// the rows of `input` that satisfy `pred` (None keeps every row)
+    Filter {
+        input: Box<RowSource>,
+        pred: Option<Predicate>,
+    },
+    /// `input`, ordered - materialising, since a sort must see them all
+    Sort {
+        input: Box<RowSource>,
+        keys: Vec<OrderKey>,
+    },
+    /// rows already in hand - the engine's materialised buffer. It is
+    /// what a derived table, a materialised CTE and a recursive one all
+    /// stand on, and it is what makes the tree testable without a
+    /// database behind it.
+    Rows(Vec<Vec<Value>>),
+}
+
+impl RowSource {
+    /// Pull every row. Materialising for now: the engine streams, and
+    /// the fetch path here already collects before encoding, so the
+    /// difference is not observable yet. It becomes observable when a
+    /// FIRST/ROWS wrapper can stop a scan early - which is a later
+    /// slice, and is why this returns a Vec rather than an iterator
+    /// today rather than pretending otherwise.
+    fn rows(&self, db: &Database) -> Result<Vec<Vec<Value>>, EvalErr> {
+        match self {
+            RowSource::TableScan { rel, formats } => {
+                let mut out = Vec::new();
+                for_each_record(db, *rel, formats, |values| out.push(values.to_vec()));
+                Ok(out)
+            }
+            RowSource::Filter { input, pred } => {
+                let rows = input.rows(db)?;
+                let Some(p) = pred else { return Ok(rows) };
+                let mut out = Vec::with_capacity(rows.len());
+                for r in rows {
+                    // a per-row evaluation error is the engine's, raised
+                    // where the engine raises it - never a dropped row
+                    if p.matches(&r)? {
+                        out.push(r);
+                    }
+                }
+                Ok(out)
+            }
+            RowSource::Rows(rows) => Ok(rows.clone()),
+            RowSource::Sort { input, keys } => {
+                let mut rows = input.rows(db)?;
+                if !keys.is_empty() {
+                    sort_rows(&mut rows, keys)?;
+                }
+                Ok(rows)
+            }
+        }
+    }
+
+    /// The scan-filter-sort tree every single-relation plan builds.
+    fn scan_filter_sort(
+        rel: u16,
+        formats: Vec<(u8, Vec<Descriptor>)>,
+        pred: Option<Predicate>,
+        keys: Vec<OrderKey>,
+    ) -> RowSource {
+        RowSource::Sort {
+            input: Box::new(RowSource::Filter {
+                input: Box::new(RowSource::TableScan { rel, formats }),
+                pred,
+            }),
+            keys,
+        }
+    }
+}
+
 /// One column of a projection: its name, the field id that indexes the
 /// decoded record, and how it is described/encoded on the wire. `scale`
 /// is announced in the describe; the raw scaled integer travels on the
@@ -11513,51 +11621,29 @@ fn branch_rows(
         return None;
     };
     let filter = bind_filter(filter, args).ok()?;
-    // the RECORD is kept beside the projected row: ORDER BY indexes the
-    // record's fields, not the projection, so the sort has to happen on
-    // the record and carry the projected row with it
-    let mut out: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
-    let mut bad = false;
-    for_each_record(db, *rel, formats, |values| {
-        if bad {
-            return;
-        }
-        // an eval error in the filter refuses the materialising path
-        // (the engine raises; the refusal is an error too, not a row)
-        match filter.as_ref().map_or(Ok(true), |p| p.matches(values)) {
-            Ok(true) => {}
-            Ok(false) => return,
-            Err(_) => {
-                bad = true;
-                return;
-            }
-        }
+    // The ROW SOURCE TREE does the scan, the filter and the sort - the
+    // three nodes this function used to spell out by hand. THE SORT
+    // BELONGS INSIDE IT because ORDER BY indexes the RECORD's fields and
+    // not the projection, so the ordering has to happen before the rows
+    // are projected down. (Losing it is invisible for an INSERT ...
+    // SELECT, where order rarely matters, and wrong the moment a
+    // modifier slices: `FIRST 2 ... ORDER BY x` would take two ARBITRARY
+    // rows.)
+    let order_by = match plan {
+        Plan::Project { order_by, .. } => order_by.clone(),
+        _ => Vec::new(),
+    };
+    let src = RowSource::scan_filter_sort(*rel, formats.clone(), filter, order_by);
+    let records = src.rows(db).ok()?;
+    let mut out = Vec::with_capacity(records.len());
+    for values in &records {
         let mut row = Vec::with_capacity(cols.len());
         for c in cols {
-            match c.value_of(values) {
-                Ok(v) => row.push(v),
-                Err(_) => {
-                    bad = true;
-                    return;
-                }
-            }
+            row.push(c.value_of(values).ok()?);
         }
-        out.push((values.to_vec(), row));
-    });
-    if bad {
-        return None;
+        out.push(row);
     }
-    // THE INNER PLAN'S ORDER BY MUST BE APPLIED HERE. Without it a
-    // materialising caller loses the ordering the query asked for -
-    // invisible for INSERT ... SELECT, where order rarely matters, but
-    // wrong the moment a modifier slices: `FIRST 2 ... ORDER BY x` would
-    // otherwise take two ARBITRARY rows.
-    if let Plan::Project { order_by, .. } = plan {
-        if !order_by.is_empty() {
-            out.sort_by(|a, b| order_cmp(&a.0, &b.0, order_by));
-        }
-    }
-    Some(out.into_iter().map(|(_, row)| row).collect())
+    Some(out)
 }
 
 /// Two projected rows are the same row for UNION's set semantics -
@@ -14829,23 +14915,17 @@ fn emit_rows_inner(
                         return Err(EmitErr::Eval(e));
                     }
                 } else {
-                    // collect matching rows, then sort by the ORDER BY keys
-                    let mut rows: Vec<Vec<Value>> = Vec::new();
-                    let mut ferr: Option<EvalErr> = None;
-                    for_each_record(db, *rel, formats, |values| {
-                        if ferr.is_some() {
-                            return;
-                        }
-                        match accepts(values) {
-                            Ok(true) => rows.push(values.to_vec()),
-                            Ok(false) => {}
-                            Err(e) => ferr = Some(e),
-                        }
-                    });
-                    if let Some(e) = ferr {
-                        return Err(EmitErr::Eval(e));
-                    }
-                    sort_rows(&mut rows, order_by).map_err(EmitErr::Eval)?;
+                    // the ordinary fetch: scan, filter, sort - the three
+                    // nodes of the ROW SOURCE TREE, which is where they
+                    // live now rather than being spelled out per plan
+                    let rows = RowSource::scan_filter_sort(
+                        *rel,
+                        formats.clone(),
+                        filter.clone(),
+                        order_by.clone(),
+                    )
+                    .rows(db)
+                    .map_err(EmitErr::Eval)?;
                     for values in &rows {
                         encode_row(w, cols, values)?;
                     }
@@ -25884,6 +25964,55 @@ pub fn serve(addr: &str, user: &str, password: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_row_source_tree_scans_filters_and_sorts() {
+        // The tree is exercised without a database behind it, which is
+        // what the materialised leaf is for. `db` is never touched on
+        // these paths, so a null pointer would do - but Database has no
+        // cheap constructor here, and the Rows leaf answers before the
+        // recursion ever reaches one, so the argument is unused.
+        let db = Database {
+            bytes: Vec::new(),
+            page_size: 8192,
+            path: String::new(),
+            ods_major: 0,
+            ods_minor: 0,
+        };
+        let row = |a: i64, b: i64| vec![Value::Int(a), Value::Int(b)];
+        let base = RowSource::Rows(vec![row(1, 30), row(2, 10), row(3, 20)]);
+
+        // no predicate keeps every row, in storage order
+        let src = RowSource::Filter { input: Box::new(base.clone()), pred: None };
+        assert_eq!(src.rows(&db).unwrap().len(), 3);
+
+        // a SORT orders by the key's own value, not by the row order -
+        // field 1 disagrees with field 0 on every pair here, which is
+        // what makes the check mean anything
+        let sorted = RowSource::Sort {
+            input: Box::new(base.clone()),
+            keys: vec![OrderKey::field(1, false, NullsAt::Default)],
+        }
+        .rows(&db)
+        .unwrap();
+        let ids: Vec<i64> = sorted
+            .iter()
+            .map(|r| match r[0] {
+                Value::Int(i) => i,
+                _ => -1,
+            })
+            .collect();
+        assert_eq!(ids, vec![2, 3, 1]);
+
+        // and DESCENDING is the same keys read the other way
+        let desc = RowSource::Sort {
+            input: Box::new(base),
+            keys: vec![OrderKey::field(1, true, NullsAt::Default)],
+        }
+        .rows(&db)
+        .unwrap();
+        assert!(matches!(desc[0][0], Value::Int(1)));
+    }
 
     #[test]
     fn a_numeric_function_declares_its_own_width() {

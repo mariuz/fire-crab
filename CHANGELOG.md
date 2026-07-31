@@ -13,6 +13,43 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — R1: the row-source tree exists
+
+The first increment of a PROGRAMME rather than a feature — see the new
+[docs/roadmap.md](docs/roadmap.md), which says plainly where the project
+stands: nine subsystems are converted, and **five of them
+(`opt`, `cch`, `lck`, `evt`, `pio`) are not linked by the server at
+all**. The optimizer picks access paths nothing executes; the lock
+manager decodes a table it never enqueues into; every query is answered
+by a full scan. Alongside that, the SQL layer answers views, CTEs and
+constant subqueries by **rewriting SQL text**, where the engine builds a
+tree of record sources.
+
+### Converted
+- **`RowSource`** — the engine's execution shape (`RecordSource`/rsb in
+  `src/jrd/`) as a real tree: `TableScan`, `Filter`, `Sort`, and a
+  materialised `Rows` leaf. The node set is deliberately the engine's,
+  not a convenient one.
+- The two places that hand-rolled scan-filter-sort — the ordinary fetch
+  and `branch_rows` — now build a tree and pull it. **No behaviour
+  change: that is the whole claim**, and 38 gates plus 363 unit tests are
+  the proof.
+- The sort stays INSIDE the tree, below the projection, because ORDER BY
+  indexes the record's fields rather than the projection's. Both call
+  sites had that right and each said so in its own words; now the tree
+  says it once.
+
+What is deliberately NOT here, named so the shape is not mistaken for
+finished: `Aggregate`, `NestedLoopJoin`, `Union`, and an `IndexScan`
+leaf — the last being what makes `fire-crab-opt`'s choices executable
+instead of advisory.
+
+The `Rows` leaf is not decoration: a derived table, a materialised CTE
+and a recursive one all stand on it, and it is what lets the tree be
+unit-tested without a database behind it — which is how the sort's
+"orders by the key, not by the row order" check is written over a
+fixture whose two fields disagree on every pair.
+
 ## 2026-07-31 — a `?` on the left of a comparison
 
 ### Converted
