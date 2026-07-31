@@ -1601,6 +1601,36 @@ them.
   is right; a fixture where the comparison happens to select the same
   rows either way cannot tell you which you wrote.
 
+- **A construct that cannot be REWRITTEN is telling you the structure is
+  missing, not the feature.** Views, CTEs and constant subqueries can all
+  be answered by splicing text and re-planning, and that carried this
+  server a very long way. `WITH RECURSIVE` cannot be, for a reason no
+  amount of parser work fixes: the name it must resolve is ITS OWN, and
+  there is no text to substitute for rows that exist only while the query
+  runs. Once the planner built a TREE of row sources, the fixpoint was a
+  dozen lines — and the hierarchy walk needed nothing at all, because a
+  level's rows were already a legal side of an ordinary join. The lesson
+  is the ordering: the shapes that refuse under rewriting are a map of
+  which structure you have not built yet.
+
+- **Ask what the engine REJECTS, not only what it answers.** A twin gate
+  compares two answers, so it is blind by construction to a statement the
+  engine refuses and you accept — the wrong-answer direction. Two of
+  those turned up in one slice: a recursive branch naming the CTE twice
+  (a fixpoint over a product, which bound both sides to the same rows and
+  produced something entirely plausible), and `ORDER BY` inside a union
+  branch. Neither was reasoned out; both were found by sending them.
+  Assert the refusal AND assert that the engine rejects the same
+  statement, or the gate will one day enforce a refusal the engine does
+  not share.
+
+- **A keyword is a declaration, not a fact.** `WITH RECURSIVE` on a body
+  that never names itself is an ordinary CTE and must answer like one.
+  Branching on the word rather than on the property refused a statement
+  the engine answers — and the check that fixes it (count the references
+  to the CTE in its recursive branch) is the same one the engine's own
+  rule needs, since exactly one is legal.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

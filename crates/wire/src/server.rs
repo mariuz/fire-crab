@@ -10204,6 +10204,12 @@ fn resolve_join_predicate(
 /// `SELECT COUNT(*)`. GROUP BY/HAVING or other aggregates over a join
 /// fall back.
 #[allow(clippy::too_many_arguments)]
+/// One name BOUND to rows already in hand, for a side of a join: the
+/// CTE of a recursive query, whose rows exist but whose name resolves to
+/// no relation. R5a made a side a ROW SOURCE, which is what makes this
+/// possible at all - a materialised buffer is as good a side as a scan.
+type BoundRows<'a> = (&'a str, &'a [ProjCol], &'a [Vec<Value>]);
+
 fn plan_join(
     proj: &Proj,
     left: &TableRef<'_>,
@@ -10217,6 +10223,22 @@ fn plan_join(
     // takes - a DERIVED SIDE plans its own inner query through it
     db_opt: &Option<Database>,
     params: &mut Vec<Option<Descriptor>>,
+) -> Option<Plan> {
+    plan_join_bound(proj, left, joins, where_s, group_s, having_s, order_s, db, db_opt, params, None)
+}
+
+fn plan_join_bound(
+    proj: &Proj,
+    left: &TableRef<'_>,
+    joins: &[(JoinKind, TableRef<'_>, &str, usize)],
+    where_s: Option<&str>,
+    group_s: Option<&str>,
+    having_s: Option<&str>,
+    order_s: Option<&str>,
+    db: &Database,
+    db_opt: &Option<Database>,
+    params: &mut Vec<Option<Descriptor>>,
+    bound: Option<BoundRows<'_>>,
 ) -> Option<Plan> {
     if joins.is_empty() {
         return None;
@@ -10262,6 +10284,22 @@ fn plan_join(
                 merged_away: Vec::new(),
             });
             continue;
+        }
+        // the BOUND name is a side whose rows are already here
+        if let Some((bname, bcols, brows)) = bound {
+            if tr.table.eq_ignore_ascii_case(bname) {
+                let (columns, descs) = derived_view(bcols);
+                let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
+                sides.push(JoinSide {
+                    key: tr.alias.unwrap_or(tr.table).to_string(),
+                    src: RowSource::Rows(brows.to_vec()),
+                    columns,
+                    descs,
+                    offset,
+                    merged_away: Vec::new(),
+                });
+                continue;
+            }
         }
         let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, tr.table)?;
         let columns = relation_columns(&db.bytes, db.page_size, tr.table);
@@ -10684,6 +10722,213 @@ fn lookup_view(db: &Database, ctes: &[(String, ViewDef)], name: &str) -> Option<
     view_of(db, name)
 }
 
+/// Plan `sql` with one name BOUND to rows already in hand.
+///
+/// This is the derived-table planner with the inner query replaced by a
+/// materialised buffer: `FROM C` resolves to `cols`/`rows` instead of to
+/// a relation. It is what a RECURSIVE CTE needs at every step - the
+/// recursive branch reads the rows accumulated so far, and the final
+/// query reads them all.
+fn plan_over_rows(
+    sql: &str,
+    name: &str,
+    cols: &[ProjCol],
+    rows: Vec<Vec<Value>>,
+    db: &Option<Database>,
+) -> Option<Plan> {
+    let (proj_s, table_s, where_s, group_s, having_s, order_s) = split_query(sql)?;
+    let (from, join) = parse_from(table_s)?;
+    // A JOIN against the bound name is the hierarchy walk - the thing a
+    // recursive CTE is usually FOR. It goes to the ordinary join
+    // planner, with the name bound to the rows as a side; nothing else
+    // about the join changes.
+    if !join.is_empty() {
+        let dbr = db.as_ref()?;
+        let mut params: Vec<Option<Descriptor>> = Vec::new();
+        let plan = plan_join_bound(
+            &parse_projection(proj_s)?,
+            &from,
+            &join,
+            where_s,
+            group_s,
+            having_s,
+            order_s,
+            dbr,
+            db,
+            &mut params,
+            Some((name, cols, &rows)),
+        )?;
+        return params.is_empty().then_some(plan);
+    }
+    if !from.table.eq_ignore_ascii_case(name) {
+        return None; // the bound name must BE the FROM
+    }
+    let alias = from.alias.unwrap_or(from.table);
+    let (columns, descs) = derived_view(cols);
+    // AGGREGATING the bound rows - `SELECT COUNT(*) FROM C`. A grouped
+    // JOIN is already "fold this row source", so the same node serves
+    // here with NO parts: the bound rows are the base and the fold sits
+    // straight on top of them.
+    let items_for_group = match parse_projection(&unqualify_single(proj_s, &[alias, name])
+        .unwrap_or_else(|| proj_s.to_string()))?
+    {
+        Proj::Items(v) => Some(v),
+        Proj::Star => None,
+    };
+    let grouped = group_s.is_some()
+        || items_for_group
+            .as_ref()
+            .is_some_and(|v| v.iter().any(|i| matches!(i, SelItem::Agg(..))));
+    if grouped {
+        let items = items_for_group?;
+        let synth_base = descs.len();
+        let (key_fids, key_exprs) = match group_s {
+            None => (Vec::new(), Vec::new()),
+            Some(g) => parse_group_by(g, &items, &columns, &descs, synth_base)?,
+        };
+        let (gcols, mut gitems) =
+            build_group_items(&items, &columns, &descs, &key_fids, &key_exprs, synth_base)?;
+        let mut np = 0usize;
+        let filter = match where_s {
+            None => None,
+            Some(ws) => Some(resolve_predicate(
+                tokenize(&unqualify_single(ws, &[alias, name]).unwrap_or_else(|| ws.to_string()))
+                    .and_then(|t| parse_predicate(&t, &mut np))?,
+                &columns,
+                &descs,
+                &mut Vec::new(),
+            )?),
+        };
+        let having = match having_s {
+            None => None,
+            Some(hs) => Some(
+                tokenize(hs)
+                    .and_then(|t| parse_predicate(&t, &mut np))
+                    .and_then(|raw| resolve_having(raw, &mut gitems, &key_fids, &columns, &descs))?,
+            ),
+        };
+        if np != 0 {
+            return None;
+        }
+        let order_by = match order_s {
+            None => Vec::new(),
+            Some(os) => parse_order_by(os, &gcols, |n| {
+                let bare = n.rsplit('.').next().unwrap_or(n);
+                gcols
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(bare))
+                    .filter(|&p| matches!(gitems.get(p), Some(GItem::Key(_))))
+            })?,
+        };
+        return Some(Plan::JoinGroup {
+            base: RowSource::Rows(rows),
+            base_width: descs.len(),
+            parts: Vec::new(),
+            cols: gcols,
+            gitems,
+            key_fids,
+            key_exprs: key_exprs.into_iter().map(|(_, e)| e).collect(),
+            synth_base,
+            filter,
+            having,
+            order_by,
+        });
+    }
+    let unq = |t: &str| unqualify_single(t, &[alias, name]).unwrap_or_else(|| t.to_string());
+    let computed = Default::default();
+    let mut out_cols: Vec<ProjCol> = Vec::new();
+    match parse_projection(&unq(proj_s))? {
+        Proj::Star => {
+            for (i, c) in cols.iter().enumerate() {
+                out_cols.push(ProjCol { field_id: i, expr: None, ..c.clone() });
+            }
+        }
+        Proj::Items(items) => {
+            for it in items {
+                match it {
+                    SelItem::Col(n, a) => {
+                        let mut pc = build_projcols(&[n], &columns, &descs, &computed)?
+                            .into_iter()
+                            .next()?;
+                        if let Some(a) = a {
+                            pc.name = a;
+                        }
+                        out_cols.push(pc);
+                    }
+                    SelItem::Expr(raw, n) => {
+                        out_cols.push(build_expr_col(&raw, &n, &columns, &descs)?)
+                    }
+                    _ => return None,
+                }
+            }
+        }
+    }
+    let mut np = 0usize;
+    let filter = match where_s {
+        None => None,
+        Some(ws) => Some(resolve_predicate(
+            tokenize(&unq(ws)).and_then(|t| parse_predicate(&t, &mut np))?,
+            &columns,
+            &descs,
+            &mut Vec::new(),
+        )?),
+    };
+    if np != 0 {
+        return None;
+    }
+    let order_by = match order_s {
+        None => Vec::new(),
+        Some(os) => parse_order_by_expr(
+            &unq(os),
+            &out_cols,
+            |n| {
+                columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(n))
+                    .map(|c| c.field_id as usize)
+            },
+            |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
+        )?,
+    };
+    Some(Plan::Derived {
+        inner: Box::new(Plan::ProcRows { cols: cols.to_vec(), rows }),
+        cols: out_cols,
+        filter,
+        order_by,
+    })
+}
+
+/// How many times a query's FROM names `name` - the count that decides
+/// whether a recursive branch is legal (exactly one) and whether a
+/// `WITH RECURSIVE` body is recursive at all (more than zero).
+fn bound_refs(sql: &str, name: &str) -> usize {
+    let Some((_, table_s, ..)) = split_query(sql) else {
+        return 0;
+    };
+    let Some((from, joins)) = parse_from(table_s) else {
+        return 0;
+    };
+    std::iter::once(from.table)
+        .chain(joins.iter().map(|(_, r, _, _)| r.table))
+        .filter(|t| t.eq_ignore_ascii_case(name))
+        .count()
+}
+
+/// Split a recursive CTE's body into its SEED and RECURSIVE branches.
+/// The seed is everything before the first top-level `UNION ALL`.
+fn split_recursive_body(source: &str) -> Option<(String, String)> {
+    let up = mask_literals(&source.to_ascii_uppercase());
+    let at = find_word_depth0(&up, "UNION", 0)?;
+    let after = up[at + "UNION".len()..].trim_start();
+    if !after.starts_with("ALL") {
+        return None; // a recursive CTE unions ALL: duplicates are the point
+    }
+    let all_at = at + "UNION".len() + (up[at + "UNION".len()..].len() - after.len());
+    let seed = source[..at].trim().to_string();
+    let rec = source[all_at + "ALL".len()..].trim().to_string();
+    (!seed.is_empty() && !rec.is_empty()).then_some((seed, rec))
+}
+
 /// Split `WITH <name> [(cols)] AS (<query>) [, ...] <main select>` into
 /// the named queries and the statement that uses them.
 ///
@@ -10693,7 +10938,7 @@ fn lookup_view(db: &Database, ctes: &[(String, ViewDef)], name: &str) -> Option<
 ///
 /// `WITH RECURSIVE` is not this: it is a fixpoint rather than a
 /// substitution, and it refuses.
-fn parse_with(sql: &str) -> Option<(Vec<(String, ViewDef)>, String)> {
+fn parse_with(sql: &str) -> Option<(Vec<(String, ViewDef)>, String, bool)> {
     let t = sql.trim().trim_end_matches(';').trim();
     let up = mask_literals(&t.to_ascii_uppercase());
     if find_word(&up, "WITH", 0) != Some(0) {
@@ -10707,6 +10952,7 @@ fn parse_with(sql: &str) -> Option<(Vec<(String, ViewDef)>, String)> {
         }
     };
     let mut ctes: Vec<(String, ViewDef)> = Vec::new();
+    let mut recursive = false;
     loop {
         skip_ws(&b, &mut i);
         // the name
@@ -10717,9 +10963,20 @@ fn parse_with(sql: &str) -> Option<(Vec<(String, ViewDef)>, String)> {
         if i == start {
             return None;
         }
-        let name: String = b[start..i].iter().collect();
+        let mut name: String = b[start..i].iter().collect();
+        // `WITH RECURSIVE` marks the whole list; the name follows it
         if name.eq_ignore_ascii_case("RECURSIVE") {
-            return None; // a fixpoint, not a substitution
+            recursive = true;
+            skip_ws(&b, &mut i);
+            let start = i;
+            while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$') {
+                i += 1;
+            }
+            if i == start {
+                return None;
+            }
+            name = b[start..i].iter().collect();
+            skip_ws(&b, &mut i);
         }
         skip_ws(&b, &mut i);
         // an optional column list, which RENAMES the query's columns
@@ -10799,7 +11056,7 @@ fn parse_with(sql: &str) -> Option<(Vec<(String, ViewDef)>, String)> {
     if main.is_empty() || ctes.is_empty() {
         return None;
     }
-    Some((ctes, main))
+    Some((ctes, main, recursive))
 }
 
 /// Read `<name>` as a view. None when it is an ordinary table (no
@@ -11743,6 +12000,16 @@ fn branch_rows(
     if let Plan::ProcRows { rows, .. } = plan {
         return Some(rows.clone());
     }
+    // A SCALAR is a row source too - one row of one column. It is what a
+    // lone aggregate plans to (`SELECT MIN(ID) FROM T`), so without this
+    // an aggregate could not seed a recursive CTE or feed an
+    // INSERT ... SELECT, even though it answers perfectly on its own.
+    if let Plan::Scalar(v, _) = plan {
+        return Some(vec![vec![match v {
+            Some(n) => Value::Int(*n),
+            None => Value::Null,
+        }]]);
+    }
     // a modified plan is a row source too, so DISTINCT/FIRST can feed a
     // FOR SELECT loop or an INSERT ... SELECT
     if let Plan::Modified { inner, distinct, skip, take, .. } = plan {
@@ -12066,11 +12333,118 @@ fn plan_query_inner(
     // before anything else looks at the text, since every later stage
     // expects a FROM naming things that exist.
     if let Some(dbr) = db.as_ref() {
-        if let Some((ctes, main)) = parse_with(sql) {
-            // FIRST/SKIP/DISTINCT sit BETWEEN `SELECT` and the select
-            // list, so the expansion cannot read the projection past
-            // them. They come off here and go back on afterwards, in the
-            // engine's own order (FIRST, then SKIP, then DISTINCT).
+        if let Some((ctes, main, recursive)) = parse_with(sql) {
+            // A RECURSIVE CTE is a FIXPOINT, not a substitution: the seed
+            // produces the first rows, then the recursive branch is
+            // evaluated AGAINST WHAT HAS ACCUMULATED, over and over,
+            // until it produces nothing new. `RowSource`'s materialised
+            // leaf is the accumulator; `plan_over_rows` is what lets the
+            // branch read it.
+            // `WITH RECURSIVE` is a DECLARATION, not a fact: a body that
+            // never names itself is an ordinary CTE and takes the
+            // ordinary path, exactly as the engine treats it.
+            let self_referencing = ctes.len() == 1
+                && split_recursive_body(&ctes[0].1.source)
+                    .is_some_and(|(_, rec)| bound_refs(&rec, &ctes[0].0) > 0);
+            if recursive && self_referencing {
+                if ctes.len() != 1 {
+                    return Some({ if trace { eprintln!("[srv] recursive CTE refused: a recursive WITH may declare one CTE here"); } Plan::Refused }); // one recursive CTE at a time
+                }
+                let (name, def) = &ctes[0];
+                let Some((seed_sql, rec_sql)) = split_recursive_body(&def.source) else {
+                    return Some({ if trace { eprintln!("[srv] recursive CTE refused: a recursive body must be <seed> UNION ALL <step>"); } Plan::Refused });
+                };
+                let mut seed_params: Vec<Option<Descriptor>> = Vec::new();
+                let Some(seed_plan) = plan_query_inner(&seed_sql, db, &mut seed_params) else {
+                    return Some({ if trace { eprintln!("[srv] recursive CTE refused: the seed does not plan"); } Plan::Refused });
+                };
+                if !seed_params.is_empty() {
+                    return Some({ if trace { eprintln!("[srv] recursive CTE refused: a parameter in the seed"); } Plan::Refused });
+                }
+                // A branch of a union does not carry its own ORDER BY -
+                // the engine rejects it, and evaluating it anyway would
+                // have answered where the engine raises.
+                if split_query(&seed_sql).is_some_and(|q| q.5.is_some())
+                    || split_query(&rec_sql).is_some_and(|q| q.5.is_some())
+                {
+                    return Some({ if trace { eprintln!("[srv] recursive CTE refused: ORDER BY inside a branch"); } Plan::Refused });
+                }
+                // EXACTLY ONE self-reference in the recursive branch. Two
+                // is a fixpoint over a product, which the engine rejects
+                // outright - and which binding both sides to the same
+                // rows would otherwise have ANSWERED.
+                if bound_refs(&rec_sql, name) != 1 {
+                    return Some({ if trace { eprintln!("[srv] recursive CTE refused: not exactly one self-reference"); } Plan::Refused });
+                }
+                let mut cols = output_cols_of(&seed_plan);
+                // `WITH RECURSIVE C(X, Y) AS ...` names the CTE's columns
+                // itself; the seed only supplies their VALUES.
+                if !def.cols.is_empty() {
+                    if def.cols.len() != cols.len() {
+                        return Some({ if trace { eprintln!("[srv] recursive CTE refused: declared column count"); } Plan::Refused });
+                    }
+                    for (c, n) in cols.iter_mut().zip(def.cols.iter()) {
+                        c.name = n.clone();
+                    }
+                }
+                let Some(mut acc) = branch_rows(&seed_plan, dbr, &[]) else {
+                    return Some({ if trace { eprintln!("[srv] recursive CTE refused: the seed does not materialise"); } Plan::Refused });
+                };
+                // the engine bounds recursion at 1024 levels; the same
+                // bound here turns a non-terminating fixpoint into an
+                // error rather than a hang
+                let mut frontier = acc.clone();
+                for _ in 0..1024 {
+                    if frontier.is_empty() {
+                        break;
+                    }
+                    let Some(step) = plan_over_rows(&rec_sql, name, &cols, frontier, db) else {
+                        return Some({ if trace { eprintln!("[srv] recursive CTE refused: the recursive branch does not plan over the accumulated rows"); } Plan::Refused });
+                    };
+                    let Some(next) = branch_rows(&step, dbr, &[]) else {
+                        return Some({ if trace { eprintln!("[srv] recursive CTE refused: the recursive branch does not materialise"); } Plan::Refused });
+                    };
+                    frontier = next.clone();
+                    acc.extend(next);
+                }
+                if !frontier.is_empty() {
+                    return Some({ if trace { eprintln!("[srv] recursive CTE refused: did not converge in 1024 levels"); } Plan::Refused }); // did not converge
+                }
+                if trace {
+                    eprintln!("[srv] plan: recursive CTE {} produced {} rows", name, acc.len());
+                }
+                // FIRST/SKIP/DISTINCT on the final query are peeled off,
+                // the query planned over the accumulated rows, and the
+                // modifiers put BACK as the wrapper they always are -
+                // dropping them here would have answered every row.
+                let (final_sql, distinct, skip, take) = match strip_modifiers(&main) {
+                    Some((inner, distinct, skip, take, bad)) => {
+                        if bad {
+                            return Some({ if trace { eprintln!("[srv] recursive CTE refused: modifiers out of order on the final query"); } Plan::Refused });
+                        }
+                        (inner, distinct, skip, take)
+                    }
+                    None => (main.clone(), false, 0, None),
+                };
+                let Some(plan) = plan_over_rows(&final_sql, name, &cols, acc, db) else {
+                    return Some({ if trace { eprintln!("[srv] recursive CTE refused: the final query does not plan over the accumulated rows"); } Plan::Refused });
+                };
+                if !distinct && skip == 0 && take.is_none() {
+                    return Some(plan);
+                }
+                let mcols: Vec<ProjCol> = output_cols_of(&plan)
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| ProjCol { field_id: i, expr: None, ..c.clone() })
+                    .collect();
+                return Some(Plan::Modified {
+                    inner: Box::new(plan),
+                    cols: mcols,
+                    distinct,
+                    skip,
+                    take,
+                });
+            }
             let (mut cur, modifiers) = match strip_modifiers(&main) {
                 Some((inner, distinct, skip, take, bad)) if !bad => {
                     (inner, Some((distinct, skip, take)))
@@ -26829,7 +27203,7 @@ mod tests {
 
     #[test]
     fn a_cte_parses_as_a_view_definition() {
-        let (ctes, main) =
+        let (ctes, main, _) =
             parse_with("WITH C AS (SELECT ID, SALARY FROM EMP) SELECT ID FROM C").unwrap();
         assert_eq!(ctes.len(), 1);
         assert_eq!(ctes[0].0, "C");
@@ -26839,12 +27213,12 @@ mod tests {
         assert_eq!(main, "SELECT ID FROM C");
 
         // an explicit column list RENAMES, positionally
-        let (ctes, _) =
+        let (ctes, _, _) =
             parse_with("WITH C (A, B) AS (SELECT ID, SALARY FROM EMP) SELECT A FROM C").unwrap();
         assert_eq!(ctes[0].1.cols, vec!["A", "B"]);
 
         // several, comma-separated
-        let (ctes, main) = parse_with(
+        let (ctes, main, _) = parse_with(
             "WITH C AS (SELECT ID FROM EMP), D AS (SELECT ID FROM DEPT) SELECT * FROM D",
         )
         .unwrap();
@@ -26853,14 +27227,27 @@ mod tests {
         assert_eq!(main, "SELECT * FROM D");
 
         // a nested paren inside the body does not end it early
-        let (ctes, _) = parse_with(
+        let (ctes, _, _) = parse_with(
             "WITH C AS (SELECT ID FROM EMP WHERE ID IN (1, 2)) SELECT ID FROM C",
         )
         .unwrap();
         assert_eq!(ctes[0].1.source, "SELECT ID FROM EMP WHERE ID IN (1, 2)");
 
-        // RECURSIVE is a FIXPOINT, not a substitution
-        assert!(parse_with("WITH RECURSIVE C AS (SELECT 1 FROM T) SELECT * FROM C").is_none());
+        // RECURSIVE is REPORTED, and the name it precedes is still the
+        // CTE's - reading RECURSIVE itself as the name is the shape of
+        // bug that makes a recursive query answer under a wrong name
+        let (ctes, main, rec) =
+            parse_with("WITH RECURSIVE C AS (SELECT 1 FROM T) SELECT * FROM C").unwrap();
+        assert!(rec);
+        assert_eq!(ctes[0].0, "C");
+        assert_eq!(main, "SELECT * FROM C");
+        let (_, _, rec) = parse_with("WITH C AS (SELECT 1 FROM T) SELECT * FROM C").unwrap();
+        assert!(!rec);
+        // the declared column list survives the RECURSIVE keyword
+        let (ctes, _, rec) =
+            parse_with("WITH RECURSIVE C (X, Y) AS (SELECT 1, 2 FROM T) SELECT X FROM C").unwrap();
+        assert!(rec);
+        assert_eq!(ctes[0].1.cols, vec!["X", "Y"]);
         // and an ordinary statement is not a WITH
         assert!(parse_with("SELECT ID FROM EMP").is_none());
     }
@@ -31984,6 +32371,49 @@ mod tests {
         // other ALTER forms are not generator restarts
         assert!(plan_alter_sequence("ALTER TABLE T ADD C INT").is_none());
         assert!(plan_alter_sequence("ALTER SEQUENCE SEQ_A RESTART").is_none());
+    }
+
+    #[test]
+    fn split_recursive_body_finds_the_seed_and_the_step() {
+        let (seed, rec) = split_recursive_body(
+            "SELECT 1 AS N FROM RDB$DATABASE UNION ALL SELECT N+1 FROM C WHERE N < 5",
+        )
+        .unwrap();
+        assert_eq!(seed, "SELECT 1 AS N FROM RDB$DATABASE");
+        assert_eq!(rec, "SELECT N+1 FROM C WHERE N < 5");
+
+        // a UNION nested inside the seed belongs to the SEED - splitting
+        // on the first `UNION` anywhere would cut the body at a keyword
+        // that is not the body's own
+        let (seed, rec) = split_recursive_body(
+            "SELECT N FROM (SELECT 1 AS N FROM T UNION ALL SELECT 2 FROM T) X \
+             UNION ALL SELECT N+1 FROM C",
+        )
+        .unwrap();
+        assert!(seed.starts_with("SELECT N FROM (SELECT 1"));
+        assert_eq!(rec, "SELECT N+1 FROM C");
+
+        // a recursive body unions ALL: duplicates are the point
+        assert!(split_recursive_body("SELECT 1 FROM T UNION SELECT 2 FROM T").is_none());
+        // the word inside a literal is not the keyword
+        assert!(split_recursive_body("SELECT 'UNION ALL' FROM T").is_none());
+        // both halves must exist
+        assert!(split_recursive_body("SELECT 1 FROM T UNION ALL").is_none());
+    }
+
+    #[test]
+    fn bound_refs_counts_only_the_from() {
+        assert_eq!(bound_refs("SELECT N+1 FROM C WHERE N < 5", "C"), 1);
+        assert_eq!(bound_refs("SELECT N+1 FROM c WHERE N < 5", "C"), 1);
+        // a self-join is TWO - the engine allows one, and a fixpoint over
+        // a product would be ANSWERED rather than refused without this
+        assert_eq!(bound_refs("SELECT C1.N FROM C C1 JOIN C C2 ON C1.N = C2.N", "C"), 2);
+        // the ordinary hierarchy walk names it once, on the right
+        assert_eq!(bound_refs("SELECT O.ID FROM ORG O JOIN C ON O.PARENT = C.ID", "C"), 1);
+        // a body that never names itself is not recursive at all
+        assert_eq!(bound_refs("SELECT ID FROM T WHERE ID < 3", "C"), 0);
+        // and a COLUMN called C is not a reference to the CTE
+        assert_eq!(bound_refs("SELECT C FROM T WHERE C < 3", "C"), 0);
     }
 
     #[test]

@@ -13,6 +13,54 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — R6: WITH RECURSIVE, a fixpoint over the tree
+
+The capability the whole row-source programme was built toward: the one
+CTE shape that **cannot** be answered by rewriting text, because the name
+it must resolve is its own.
+
+### Converted
+- **`WITH RECURSIVE` evaluates as a FIXPOINT.** The seed runs once; the
+  recursive branch is then evaluated against the last level's rows until
+  a round produces nothing; the accumulated rows are the CTE. The loop is
+  a dozen lines — R5a is what made it expressible.
+- **The hierarchy walk goes to the ORDINARY join planner.** `FROM ORG O
+  JOIN C ON O.PARENT = C.ID` binds `C` to the rows in hand as a join
+  side (`RowSource::Rows`), and nothing else about the join changes: not
+  the ON, not the outer padding, not the qualifiers, not a grouping above
+  it. The same binding serves the final query, so the CTE joined to a
+  real table — and to *itself* — needed nothing of their own.
+- **Aggregating the accumulated rows reuses the grouped join.**
+  `SELECT COUNT(*) FROM C` is a fold over a materialised base, which is a
+  `Plan::JoinGroup` with no parts; GROUP BY, HAVING and every aggregate
+  arrived together.
+- **A CTE may name its own columns** — `WITH RECURSIVE C(X, Y) AS ...` —
+  where the seed supplies only the values.
+- **`Plan::Scalar` is a row source** in `branch_rows`: a lone aggregate
+  plans to a scalar, and `SELECT MIN(ID) FROM T` is an ordinary seed.
+- `WITH RECURSIVE` on a body that never names itself is an **ordinary
+  CTE** and takes the ordinary path — the keyword is a declaration, not a
+  fact.
+
+### Guarded
+- **Two self-references answered.** `FROM C C1 JOIN C C2` is a fixpoint
+  over a product; the engine rejects it, and binding both sides to the
+  same rows produced a plausible answer instead. Now counted: exactly one
+  reference in the recursive branch, which is the engine's rule.
+- **`ORDER BY` inside a branch answered.** A union branch carries no sort
+  of its own; the engine rejects it and this sorted the branch.
+- Non-termination is bounded at **1024 levels**, the engine's own limit,
+  so a runaway fixpoint raises rather than hangs.
+
+Both wrong answers were found by PROBING, not by reasoning — each looked
+entirely reasonable. The new gate therefore asserts the refusal *and*
+asserts that the engine rejects the same statement, so it cannot drift
+into enforcing a refusal the engine does not share.
+
+New `qa/serve-real-recursive.sh` (43 checks). `qa/serve-real-cte.sh`
+grows to 35 with its `WITH RECURSIVE` refusal promoted to a comparison.
+23 planner gates and 365 unit tests confirm nothing moved.
+
 ## 2026-07-31 — R5a: a derived table as a side of a join
 
 The prerequisite R6 turned out to need, and the refusal both R4 and R5

@@ -208,9 +208,12 @@ both "a CTE that shadows a real table" \
      "WITH DEPT AS (SELECT ID FROM EMP WHERE SALARY > 150) SELECT COUNT(*) FROM DEPT"
 
 # --- 6. the refusals --------------------------------------------------
-# WITH RECURSIVE is a FIXPOINT, not a substitution
-refuses "WITH RECURSIVE" \
-        "WITH RECURSIVE C AS (SELECT ID FROM EMP) SELECT COUNT(*) FROM C"
+# `WITH RECURSIVE` is a FIXPOINT rather than a substitution - and this
+# body never names itself, so it is an ORDINARY CTE that happens to
+# carry the keyword, and must answer like one. The fixpoint itself has
+# its own gate (qa/serve-real-recursive.sh).
+both "WITH RECURSIVE on a body that never names itself" \
+     "WITH RECURSIVE C AS (SELECT ID FROM EMP) SELECT COUNT(*) FROM C"
 # A CTE body the INLINING cannot rewrite - one that GROUPS, stars or
 # JOINS - is MATERIALISED instead: it is a derived table by another name,
 # so `FROM C` becomes `FROM (<body>) C`. These three refused until the

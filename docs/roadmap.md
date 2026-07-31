@@ -28,9 +28,10 @@ And inside the SQL layer there is a second structural gap: the server
 answers views, CTEs and constant subqueries by **rewriting SQL text and
 re-planning it**, where the engine builds a tree of record sources. That
 approach has worked far better than it has any right to — but it is why
-a CTE body that GROUPs refuses, why `FROM (SELECT ...)` does not exist,
-why `WITH RECURSIVE` cannot work, and why a qualifier-stripping pass had
-to be taught not to reach inside a subquery.
+a CTE body that GROUPs refused, why `FROM (SELECT ...)` did not exist,
+why `WITH RECURSIVE` could not work, and why a qualifier-stripping pass
+had to be taught not to reach inside a subquery. R1–R6 have closed all
+four; R7 is the removal of what they replaced.
 
 ## The two programmes
 
@@ -58,15 +59,16 @@ pulled by the fetch.
   rewrite is a DERIVED TABLE by another name: `FROM C` becomes
   `FROM (<body>) C`. Grouped, starred and joined bodies all answer now,
   and a grouped PLAN became a row source in the process.
-- **R6 — `WITH RECURSIVE`**, a fixpoint over the tree. R5a unblocked it;
-  the sizing is still worth recording: the fixpoint itself is small
-  (evaluate the seed, then re-evaluate the recursive branch against the
-  accumulated rows until it yields nothing new - `RowSource::Rows` is
-  already the accumulator). What blocks it is that a recursive branch is
-  almost always `FROM C JOIN T ON ...`, and **a join side here can only
-  be a RELATION**: `JoinSide` carries `rel` + `formats` and is built from
-  `resolve_relation`/`select_formats`, and `Plan::Join` carries
-  `base_rel`/`base_formats`. Materialised rows cannot be a side.
+- **R6 — `WITH RECURSIVE`**, a fixpoint over the tree. *(done)* The one
+  CTE shape rewriting cannot reach, because the name it resolves is its
+  own. Seed once, then evaluate the recursive branch against the last
+  level's rows until a round yields nothing. The hierarchy walk — the
+  thing recursive CTEs are usually *for* — goes to the ORDINARY join
+  planner with the CTE bound as a side, which is R5a paying for itself;
+  aggregating the result reuses the grouped join with no parts. Two
+  shapes the engine REJECTS were found ANSWERING (two self-references,
+  and `ORDER BY` inside a branch), which is the failure direction a
+  behaviour gate does not look in unless it is told to.
 - **R5a — a derived table as a SIDE of a join.** *(done)* `JoinSide`,
   `JoinPart` and `Plan::Join` now carry a ROW SOURCE instead of a
   relation id, so a side can be a scan or an inner plan. A materialised

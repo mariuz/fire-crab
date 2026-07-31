@@ -7528,9 +7528,9 @@ rewrite — a GROUP BY inside, a `SELECT *`, a join — leaves its name in the F
 That name refers to no relation at all, so falling through would reach the
 fixed-answer fallback and answer `4242` to a query over real tables. The
 planner therefore checks, after expanding, whether any CTE name still appears
-in the FROM and refuses if one does. `WITH RECURSIVE` refuses for a different
-reason: it is a fixpoint rather than a substitution, and pretending otherwise
-would answer the first iteration and call it the result.
+in the FROM and refuses if one does. `WITH RECURSIVE` took a different path
+entirely — it is a fixpoint rather than a substitution, and it has its own gate
+below.
 
 ### The width and form of a text result (`qa/serve-real-textwidth2.sh`, 30 checks)
 
@@ -7597,6 +7597,76 @@ answer differs in the string itself. The shapes this driver cannot decode from
 the engine — a CHAR column, or several text columns in one row — are compared
 against isql instead, with a `'#'` marker concatenated so the trailing spaces
 have a right-hand boundary in the output.
+
+### WITH RECURSIVE: a fixpoint over the row-source tree (`qa/serve-real-recursive.sh`, 43 checks)
+
+Every other CTE in this server is answered by **rewriting**: the body is
+spliced in where the name stood, and the statement is re-planned. A recursive
+CTE cannot be, and the reason is not a missing feature — it is that *the name it
+must resolve is its own*. There is no text to substitute. `C` refers to the rows
+`C` has produced so far, which exist only while the query runs.
+
+So it is evaluated the way the engine evaluates it:
+
+- the **seed** runs once, and its rows are the first level;
+- the **recursive branch** is then evaluated against the *last level's* rows,
+  over and over;
+- when a round produces nothing, the accumulated rows are the CTE.
+
+The loop itself is a dozen lines. What made it expressible at all is the
+row-source tree: a level's rows are a materialised leaf, and since R5a a leaf
+can be a **side of a join**. That single fact is the entire hierarchy walk —
+
+```sql
+WITH RECURSIVE C AS (
+  SELECT ID, PARENT, NAME, 0 AS LVL FROM ORG WHERE PARENT IS NULL
+  UNION ALL
+  SELECT O.ID, O.PARENT, O.NAME, C.LVL+1 FROM ORG O JOIN C ON O.PARENT = C.ID)
+SELECT LVL, COUNT(*) FROM C GROUP BY LVL
+```
+
+— goes to the **ordinary join planner**, with `C` bound to the rows in hand as
+one side. Nothing about the join changes: not the ON, not the outer padding, not
+the qualifier resolution, not the grouping above it. The same is true of the
+final query, which is why `C` joined to a real table, and `C` joined to *itself*,
+both worked the moment the binding existed rather than needing anything of their
+own.
+
+The other reuse is the fold. `SELECT COUNT(*) FROM C` is a grouped plan over a
+materialised base — which is exactly what a grouped JOIN already is, with no
+parts. So `Plan::JoinGroup` serves it unchanged, and GROUP BY, HAVING and every
+aggregate arrived together.
+
+**Four shapes the engine REJECTS, which is where the risk was.** A gate that
+only checks what both sides answer would have passed while this server answered
+statements the engine refuses — the wrong-answer direction, not the refusal one:
+
+| shape | why the engine rejects it | what this would have done |
+|---|---|---|
+| two self-references (`FROM C C1 JOIN C C2`) | a fixpoint over a product | bound BOTH sides to the same rows and answered |
+| `ORDER BY` inside a branch | a union branch carries no sort of its own | sorted the branch and answered |
+| `UNION` rather than `UNION ALL` | duplicates are the point of the recursion | — (refused already) |
+| a recursion that never ends | bounded recursion | run forever |
+
+The first two were found by probing, not by reasoning: both *answered*, and the
+answers looked entirely reasonable. The gate now asserts the refusal **and**
+asserts that the engine rejects the same statement, so it cannot drift into
+enforcing a refusal the engine does not share.
+
+Non-termination is bounded at **1024 levels**, which is the engine's own limit,
+so a runaway fixpoint raises rather than hangs. The gate exercises it twice: an
+unbounded counter, and a row that is its own parent.
+
+**And `WITH RECURSIVE` is a declaration, not a fact.** A body carrying the
+keyword that never names itself is an ordinary CTE, and must still answer as
+one — so the recursive path engages only when the recursive branch actually
+references the CTE, and otherwise steps aside for the ordinary rewrite. The same
+check counts the references, because *exactly one* is the engine's rule.
+
+Two smaller things fell out of it. A CTE may **name its own columns** —
+`WITH RECURSIVE C(X, Y) AS ...` — where the seed supplies only the values; and
+`Plan::Scalar` became a row source in `branch_rows`, because a lone aggregate
+plans to a scalar and `SELECT MIN(ID) FROM T` is a perfectly ordinary seed.
 
 ## Benchmarks
 
