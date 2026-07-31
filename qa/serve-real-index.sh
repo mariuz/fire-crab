@@ -77,6 +77,8 @@ CREATE INDEX CP3 ON CP (A, B, C);
 CREATE DESCENDING INDEX CPD ON CP (A, B);
 CREATE INDEX CP_S ON CP (S);
 CREATE INDEX CP_K ON CP (KC);
+CREATE TABLE TX (S VARCHAR(8) NOT NULL, N INTEGER);
+CREATE UNIQUE INDEX TX_S ON TX (S);
 COMMIT;
 INSERT INTO EMP VALUES (1, 1, 100, 'a');
 INSERT INTO EMP VALUES (2, 1, 200, 'b');
@@ -101,6 +103,12 @@ INSERT INTO CP VALUES (2, 10, 400, 'cc', 'cc');
 INSERT INTO CP VALUES (-1, 5, 500, 'dd  ', 'dd');
 INSERT INTO CP VALUES (0, 0, 600, '', '');
 INSERT INTO CP VALUES (-2, NULL, 700, 'ee', 'ee');
+INSERT INTO TX VALUES ('b', 1);
+INSERT INTO TX VALUES ('A', 2);
+INSERT INTO TX VALUES ('a', 3);
+INSERT INTO TX VALUES ('', 4);
+INSERT INTO TX VALUES ('ab', 5);
+INSERT INTO TX VALUES ('B', 6);
 INSERT INTO PARENT VALUES (1, 'p1');
 INSERT INTO PARENT VALUES (2, 'p2');
 INSERT INTO TPARENT VALUES ('a');
@@ -391,6 +399,18 @@ sorted_anyway "a UNIQUE index on a NULLABLE column" \
 # to save a sort, which is opt's rule too
 sorted_anyway "the predicate's index is not the order's" \
               "SELECT ID FROM EMP WHERE DEPT_ID = 1 ORDER BY ID"
+# TEXT navigation. The index key is the stripped bytes, so the walk is
+# in BYTE order - and for the DEFAULT collation that is the order the
+# engine sorts by, case included ('' < 'A' < 'B' < 'a' < 'ab' < 'b').
+# A column with a NON-default collation cannot reach here at all: its
+# index carries an itype outside the accepted list, so no pick is built
+# for the relation. The sequences below are the assertion.
+navigated "ORDER BY a UNIQUE NOT NULL text column" \
+          "SELECT N FROM TX ORDER BY S"
+navigated "... under FIRST, where the order decides which rows" \
+          "SELECT FIRST 3 N FROM TX ORDER BY S"
+navigated "... and bounded by a text range" \
+          "SELECT N FROM TX WHERE S >= '' ORDER BY S"
 
 
 # --- 3d. COMPOUND INDEXES: an equality is a BAND, not a point ---------
@@ -647,6 +667,7 @@ same_both_ways "an empty range" "SELECT ID FROM EMP WHERE ID > 9 AND ID < 2"
 same_both_ways "a compound prefix band" "SELECT C FROM CP WHERE A = 1 ORDER BY C"
 same_both_ways "a text equality" "SELECT C FROM CP WHERE S = 'aa'"
 same_both_ways "an empty-string key" "SELECT C FROM CP WHERE S = ''"
+same_both_ways "a navigated TEXT order, case included" "SELECT N FROM TX ORDER BY S"
 same_both_ways "an aggregate" "SELECT COUNT(*) AS K FROM EMP WHERE DEPT_ID = 9"
 # ORDER is part of the answer, so the navigating server and the sorting
 # one must produce the same SEQUENCE, not just the same set
@@ -668,8 +689,8 @@ else
 fi
 
 rm -f "$A" "$B"
-if [ "$ran" -lt 190 ]; then
-    echo "DIFF only $ran checks ran (expected at least 190) - did one silently skip?"
+if [ "$ran" -lt 196 ]; then
+    echo "DIFF only $ran checks ran (expected at least 196) - did one silently skip?"
     fail=1
 fi
 exit $fail
