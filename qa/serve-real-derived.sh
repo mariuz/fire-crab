@@ -197,6 +197,39 @@ both "... with a filter at each level" \
      "SELECT Y.ID FROM (SELECT X.ID, X.SALARY FROM (SELECT ID, SALARY FROM EMP
       WHERE SALARY > 60) X WHERE X.SALARY < 350) Y ORDER BY Y.ID"
 
+# --- 5a. a derived table as a SIDE OF A JOIN --------------------------
+# The EXECUTION half needed nothing: `NestedLoopJoin` takes a row source
+# per side and does not care where the rows come from. The PLANNING half
+# is the work - a side's columns and descriptors come from the inner
+# plan's describe when it is derived, rather than from a relation.
+both "a derived table on the LEFT of a join" \
+     "SELECT COUNT(*) FROM (SELECT ID, DEPT_ID FROM EMP) X JOIN DEPT D ON X.DEPT_ID = D.ID"
+both "on the RIGHT" \
+     "SELECT COUNT(*) FROM DEPT D JOIN (SELECT ID, DEPT_ID FROM EMP) X ON X.DEPT_ID = D.ID"
+both "BOTH sides derived" \
+     "SELECT COUNT(*) FROM (SELECT ID, DEPT_ID FROM EMP) X
+      JOIN (SELECT ID FROM DEPT) Y ON X.DEPT_ID = Y.ID"
+both "projecting through a derived side" \
+     "SELECT X.ID FROM (SELECT ID, DEPT_ID FROM EMP) X JOIN DEPT D ON X.DEPT_ID = D.ID
+      ORDER BY X.ID"
+both "a derived side with its own WHERE" \
+     "SELECT COUNT(*) FROM (SELECT ID, DEPT_ID FROM EMP WHERE SALARY > 150) X
+      JOIN DEPT D ON X.DEPT_ID = D.ID"
+both "a GROUPED derived side" \
+     "SELECT COUNT(*) FROM (SELECT DEPT_ID, COUNT(*) AS N FROM EMP GROUP BY DEPT_ID) X
+      JOIN DEPT D ON X.DEPT_ID = D.ID"
+both "a derived side on the padded side of a LEFT join" \
+     "SELECT COUNT(*) FROM DEPT D LEFT JOIN (SELECT DEPT_ID FROM EMP WHERE SALARY > 150) X
+      ON X.DEPT_ID = D.ID"
+both "GROUP BY over a join with a derived side" \
+     "SELECT D.ID, COUNT(*) FROM (SELECT DEPT_ID FROM EMP) X JOIN DEPT D ON X.DEPT_ID = D.ID
+      GROUP BY D.ID ORDER BY D.ID"
+# the comma inside a derived table's OWN select list is that query's, not
+# this FROM's - reading it as a comma-join list broke every derived side
+# whose body selected more than one column
+both "a comma join beside a derived table" \
+     "SELECT COUNT(*) FROM EMP E, DEPT D WHERE E.DEPT_ID = D.ID"
+
 # --- 6. the refusals, each for a stated reason ------------------------
 # a column the INNER query did not project is not there to name
 refuses "a column the inner query did not select" \
@@ -222,8 +255,8 @@ both "SUBSTRING's own FROM keyword still splits" \
      "SELECT COUNT(*) FROM EMP WHERE SUBSTRING(NAME FROM 1 FOR 1) = 'a'"
 
 rm -f "$A" "$B"
-if [ "$ran" -lt 31 ]; then
-    echo "DIFF only $ran checks ran (expected at least 31) - did one silently skip?"
+if [ "$ran" -lt 40 ]; then
+    echo "DIFF only $ran checks ran (expected at least 40) - did one silently skip?"
     fail=1
 fi
 exit $fail

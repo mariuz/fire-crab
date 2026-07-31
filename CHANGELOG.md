@@ -13,6 +13,45 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — R5a: a derived table as a side of a join
+
+The prerequisite R6 turned out to need, and the refusal both R4 and R5
+had recorded.
+
+### Converted
+- **A join side may now be a DERIVED TABLE.** `JoinSide`, `JoinPart` and
+  `Plan::Join` carried a relation id and its formats; they carry a **row
+  source** now, so a side is either a scan or an inner plan. On the left,
+  on the right, on both, under an outer join, with the join grouped above
+  it.
+- **The execution half needed nothing.** `RowSource::NestedLoopJoin`
+  already took a `RowSource` per side and never cared where the rows came
+  from — that was R3's shape paying for itself. The work was all in
+  planning: a derived side's columns and descriptors come from the inner
+  plan's DESCRIBE rather than from a relation.
+- **A materialised CTE can be a join side**, which was R5's stated
+  refusal: the CTE's name is spliced in that position like any other,
+  with the splices applied in descending offset order so an earlier one
+  cannot move a later one.
+- New `RowSource::PlanRows` — an inner plan as a leaf, evaluated when the
+  tree is pulled rather than when it is built, so a plan is still a plan
+  at prepare time.
+
+### Fixed
+- **`FROM (SELECT A, B FROM T) X JOIN ...` was read as a COMMA JOIN
+  LIST.** `parse_from` tested `from_s.contains(',')` — and a derived
+  table's own select list has commas in it. The depth-aware split was
+  already there and already used two lines later; only the TEST was
+  naive. It is the third clause-splitting bug this programme has found in
+  the same shape: a keyword or separator inside a nested query is not
+  this query's.
+- `parse_table_ref` and the JOIN scan are paren-aware for the same
+  reason.
+
+`qa/serve-real-derived.sh` grows to 41 checks and `qa/serve-real-cte.sh`
+to 35, with the CTE refusal promoted to three comparisons. 13 join and
+subquery gates plus 363 unit tests confirm nothing moved.
+
 ## 2026-07-31 — R5: the materialised CTE
 
 ### Converted

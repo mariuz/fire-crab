@@ -58,8 +58,8 @@ pulled by the fetch.
   rewrite is a DERIVED TABLE by another name: `FROM C` becomes
   `FROM (<body>) C`. Grouped, starred and joined bodies all answer now,
   and a grouped PLAN became a row source in the process.
-- **R6 — `WITH RECURSIVE`**, a fixpoint over the tree. **Blocked on
-  R5a**, and the sizing is worth recording: the fixpoint itself is small
+- **R6 — `WITH RECURSIVE`**, a fixpoint over the tree. R5a unblocked it;
+  the sizing is still worth recording: the fixpoint itself is small
   (evaluate the seed, then re-evaluate the recursive branch against the
   accumulated rows until it yields nothing new - `RowSource::Rows` is
   already the accumulator). What blocks it is that a recursive branch is
@@ -67,13 +67,10 @@ pulled by the fetch.
   be a RELATION**: `JoinSide` carries `rel` + `formats` and is built from
   `resolve_relation`/`select_formats`, and `Plan::Join` carries
   `base_rel`/`base_formats`. Materialised rows cannot be a side.
-- **R5a — a derived table as a SIDE of a join.** The prerequisite, and
-  the refusal both R4 and R5 recorded. The EXECUTION half is already
-  done: `RowSource::NestedLoopJoin` takes a `RowSource` per side, so it
-  does not care where its rows come from. The PLANNING half is the work -
-  `JoinSide`, `JoinPart` and `Plan::Join` would each carry a row source
-  instead of a relation id, with columns and descriptors coming from the
-  inner plan's describe (`derived_view`) when a side is derived.
+- **R5a — a derived table as a SIDE of a join.** *(done)* `JoinSide`,
+  `JoinPart` and `Plan::Join` now carry a ROW SOURCE instead of a
+  relation id, so a side can be a scan or an inner plan. A materialised
+  CTE can be a join side too, which was R5's stated refusal.
 - **R7 — retire the textual view/CTE rewriting** and the qualifier
   passes that exist only to serve it.
 

@@ -233,16 +233,22 @@ both "a CTE whose body is a JOIN" \
 both "FIRST over a materialised CTE" \
      "WITH C AS (SELECT DEPT_ID, COUNT(*) AS N FROM EMP GROUP BY DEPT_ID)
       SELECT FIRST 2 C.DEPT_ID FROM C ORDER BY C.DEPT_ID"
-# still refused: a materialised CTE as one SIDE of a join needs derived
-# tables in joins, which is a later slice - it must keep refusing rather
-# than half-work
-refuses "a materialised CTE in a JOIN" \
-        "WITH C AS (SELECT DEPT_ID, COUNT(*) AS N FROM EMP GROUP BY DEPT_ID)
-         SELECT COUNT(*) FROM C JOIN DEPT D ON C.DEPT_ID = D.ID"
+# a materialised CTE as one SIDE of a join refused until a derived table
+# could BE a side; now it can, so the CTE is spliced into that position
+# like any other
+both "a materialised CTE in a JOIN" \
+     "WITH C AS (SELECT DEPT_ID, COUNT(*) AS N FROM EMP GROUP BY DEPT_ID)
+      SELECT COUNT(*) FROM C JOIN DEPT D ON C.DEPT_ID = D.ID"
+both "... projecting the CTE's folded column" \
+     "WITH C AS (SELECT DEPT_ID, COUNT(*) AS N FROM EMP GROUP BY DEPT_ID)
+      SELECT C.N FROM C JOIN DEPT D ON C.DEPT_ID = D.ID ORDER BY C.N"
+both "TWO CTEs joined to each other" \
+     "WITH C AS (SELECT DEPT_ID FROM EMP), E AS (SELECT ID FROM DEPT)
+      SELECT COUNT(*) FROM C JOIN E ON C.DEPT_ID = E.ID"
 
 rm -f "$A" "$B"
-if [ "$ran" -lt 33 ]; then
-    echo "DIFF only $ran checks ran (expected at least 33) - did one silently skip?"
+if [ "$ran" -lt 35 ]; then
+    echo "DIFF only $ran checks ran (expected at least 35) - did one silently skip?"
     fail=1
 fi
 exit $fail

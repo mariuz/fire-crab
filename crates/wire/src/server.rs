@@ -933,6 +933,11 @@ enum RowSource {
         input: Box<RowSource>,
         keys: Vec<OrderKey>,
     },
+    /// an inner PLAN's rows. A derived table's side of a join has no
+    /// relation id to scan - it has a query - and this is what lets a
+    /// join side be one. Evaluated when the tree is pulled, not when it
+    /// is built, so the plan is still a plan at prepare time.
+    PlanRows(std::rc::Rc<Plan>),
     /// rows already in hand - the engine's materialised buffer. It is
     /// what a derived table, a materialised CTE and a recursive one all
     /// stand on, and it is what makes the tree testable without a
@@ -1004,6 +1009,11 @@ impl RowSource {
                     }
                 }
                 Ok(out)
+            }
+            RowSource::PlanRows(plan) => {
+                // a derived side refuses `?` at plan time, so there are
+                // no bound arguments to thread through here
+                branch_rows(plan, db, &[]).ok_or(EvalErr::ConversionError(None))
             }
             RowSource::Rows(rows) => Ok(rows.clone()),
             RowSource::NestedLoopJoin { left, left_width, right, part } => {
@@ -1659,8 +1669,9 @@ AlterDomainRename {
         order_by: Vec<OrderKey>,
     },
     Join {
-        base_rel: u16,
-        base_formats: Vec<(u8, Vec<Descriptor>)>,
+        /// where the base (left-most) side's rows come from - a relation
+        /// to scan, or an inner plan when that side is a DERIVED TABLE
+        base: RowSource,
         base_width: usize,
         /// one per JOIN in the FROM chain, in fold order
         parts: Vec<JoinPart>,
@@ -1674,8 +1685,7 @@ AlterDomainRename {
     /// SHAPES - a join emits its combined rows, this emits one row per
     /// group.
     JoinGroup {
-        base_rel: u16,
-        base_formats: Vec<(u8, Vec<Descriptor>)>,
+        base: RowSource,
         base_width: usize,
         /// one per JOIN in the FROM chain, in fold order
         parts: Vec<JoinPart>,
@@ -1723,8 +1733,9 @@ AlterDomainRename {
 #[derive(Clone)]
 struct JoinPart {
     kind: JoinKind,
-    rel: u16,
-    formats: Vec<(u8, Vec<Descriptor>)>,
+    /// where this side's rows come from - a relation to scan, or an
+    /// inner plan when the side is a DERIVED TABLE
+    src: RowSource,
     width: usize,
     on: Predicate,
 }
@@ -9686,6 +9697,22 @@ struct TableRef<'a> {
 
 /// Parse a table reference: `NAME` or `NAME ALIAS`.
 fn parse_table_ref(s: &str) -> Option<TableRef<'_>> {
+    // A DERIVED TABLE is a table reference whose "name" is a whole
+    // query. Splitting on whitespace would tear it apart, so the paren
+    // span is taken first and what follows is the alias SQL requires.
+    let t = s.trim();
+    if t.starts_with('(') {
+        let close = matching_paren(t.as_bytes(), 0)?;
+        let mut rest = t[close + 1..].trim();
+        if let Some(r) = rest.strip_prefix("AS ").or_else(|| rest.strip_prefix("as ")) {
+            rest = r.trim();
+        }
+        let alias = rest.trim_matches('"');
+        if !ident_ok(alias) {
+            return None;
+        }
+        return Some(TableRef { table: &t[..close + 1], alias: Some(alias) });
+    }
     let toks: Vec<&str> = s.split_whitespace().collect();
     let (table, alias) = match toks.as_slice() {
         [t] => (t.trim_matches('"'), None),
@@ -9715,11 +9742,12 @@ fn parse_from(
     // after the first becomes a step with no condition, exactly as
     // `CROSS JOIN` does - which is what makes `FROM A, B WHERE A.K =
     // B.K` the same query as the ON form.
-    if from_s.contains(',') {
-        let parts: Vec<&str> = split_top_level_commas(from_s);
-        if parts.len() < 2 {
-            return None;
-        }
+    // a comma at DEPTH 0 makes a comma list; one inside a derived
+    // table's own select list is that query's, not this FROM's - which
+    // is why the test is the depth-aware split rather than `contains`
+    let comma_parts: Vec<&str> = split_top_level_commas(from_s);
+    if comma_parts.len() > 1 {
+        let parts = comma_parts;
         let (base, mut steps) = parse_from(parts[0].trim())?;
         for item in &parts[1..] {
             let (t, more) = parse_from(item.trim())?;
@@ -9740,13 +9768,13 @@ fn parse_from(
     // clause, and the tail is the side being added. Recursing that way
     // means the steps come out in the order the rows are folded.
     let up_all = from_s.to_ascii_uppercase();
-    if let Some(first) = find_word(&up_all, "JOIN", 0) {
+    if let Some(first) = find_word_depth0(&up_all, "JOIN", 0) {
         // the LAST join, not merely a second one - the chain peels from
         // the right, and splitting at the second of three would leave a
         // whole join inside the tail
         let mut last_join = None;
         let mut at = first + "JOIN".len();
-        while let Some(p) = find_word(&up_all, "JOIN", at) {
+        while let Some(p) = find_word_depth0(&up_all, "JOIN", at) {
             last_join = Some(p);
             at = p + "JOIN".len();
         }
@@ -9919,8 +9947,9 @@ fn is_qualified_col(body: &str) -> bool {
 /// descriptors, and this side's offset into the combined row.
 struct JoinSide {
     key: String,
-    rel: u16,
-    formats: Vec<(u8, Vec<Descriptor>)>,
+    /// where this side's rows come from - a relation to scan, or an
+    /// inner plan when the side is a DERIVED TABLE
+    src: RowSource,
     columns: Vec<RelationColumn>,
     descs: Vec<Descriptor>,
     offset: usize,
@@ -10184,6 +10213,9 @@ fn plan_join(
     having_s: Option<&str>,
     order_s: Option<&str>,
     db: &Database,
+    // the same database as an Option, which is what plan_query_inner
+    // takes - a DERIVED SIDE plans its own inner query through it
+    db_opt: &Option<Database>,
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Plan> {
     if joins.is_empty() {
@@ -10193,6 +10225,44 @@ fn plan_join(
     let mut refs: Vec<&TableRef<'_>> = vec![left];
     refs.extend(joins.iter().map(|(_, r, _, _)| r));
     for tr in refs {
+        // A DERIVED SIDE has no relation to resolve: its rows come from
+        // an inner PLAN and its columns from that plan's DESCRIBE. The
+        // execution half needed nothing - `NestedLoopJoin` takes a row
+        // source per side and does not care where the rows come from -
+        // so this is the whole of it.
+        // `parse_table_ref` has already split the alias off, so what is
+        // left is the paren span alone - reading it back with
+        // `parse_derived_table` would look for an alias that is no
+        // longer there.
+        let derived_inner = tr.table.trim().strip_prefix('(').and_then(|_| {
+            let t = tr.table.trim();
+            let close = matching_paren(t.as_bytes(), 0)?;
+            let inner = t[1..close].trim();
+            let up = mask_literals(&inner.to_ascii_uppercase());
+            (find_word(&up, "SELECT", 0) == Some(0)).then(|| inner.to_string())
+        });
+        if let Some(inner_sql) = derived_inner {
+            let mut inner_params: Vec<Option<Descriptor>> = Vec::new();
+            let inner = plan_query_inner(&inner_sql, db_opt, &mut inner_params)?;
+            if !inner_params.is_empty() {
+                return None; // a `?` inside a derived side
+            }
+            let inner_cols = output_cols_of(&inner);
+            if inner_cols.is_empty() {
+                return None;
+            }
+            let (columns, descs) = derived_view(&inner_cols);
+            let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
+            sides.push(JoinSide {
+                key: tr.alias?.to_string(),
+                src: RowSource::PlanRows(std::rc::Rc::new(inner)),
+                columns,
+                descs,
+                offset,
+                merged_away: Vec::new(),
+            });
+            continue;
+        }
         let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, tr.table)?;
         let columns = relation_columns(&db.bytes, db.page_size, tr.table);
         let formats = select_formats(db, tr.table, rel);
@@ -10212,8 +10282,11 @@ fn plan_join(
         let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
         sides.push(JoinSide {
             key: tr.alias.unwrap_or(tr.table).to_string(),
-            rel,
-            formats,
+            src: RowSource::TableScan {
+                rel,
+                formats,
+                width: Some(descs.len()),
+            },
             columns,
             descs,
             offset,
@@ -10274,8 +10347,7 @@ fn plan_join(
         };
         parts.push(JoinPart {
             kind: *kind,
-            rel: sides[k + 1].rel,
-            formats: sides[k + 1].formats.clone(),
+            src: sides[k + 1].src.clone(),
             width: sides[k + 1].descs.len(),
             on,
         });
@@ -10370,8 +10442,7 @@ fn plan_join(
             })?,
         };
         return Some(Plan::JoinGroup {
-            base_rel: sides[0].rel,
-            base_formats: sides[0].formats.clone(),
+            base: sides[0].src.clone(),
             base_width: sides[0].descs.len(),
             parts,
             cols,
@@ -10487,8 +10558,7 @@ fn plan_join(
     };
 
     Some(Plan::Join {
-        base_rel: sides[0].rel,
-        base_formats: sides[0].formats.clone(),
+        base: sides[0].src.clone(),
         base_width: sides[0].descs.len(),
         parts,
         cols,
@@ -11751,11 +11821,10 @@ fn branch_rows(
     // all arrive here. The rows are sorted on the COMBINED row (the
     // ORDER BY indexes it, not the projection) and then projected, the
     // same two steps `Plan::Project` takes below.
-    if let Plan::Join { base_rel, base_formats, base_width, parts, cols, filter, order_by } = plan
-    {
+    if let Plan::Join { base, base_width, parts, cols, filter, order_by } = plan {
         let filter = bind_filter(filter, args).ok()?;
         let mut rows =
-            join_rows(db, *base_rel, base_formats, *base_width, parts, &filter).ok()?;
+            join_rows(db, base, *base_width, parts, &filter).ok()?;
         if !order_by.is_empty() {
             sort_rows(&mut rows, order_by).ok()?;
         }
@@ -11765,8 +11834,7 @@ fn branch_rows(
             .collect();
     }
     if let Plan::JoinGroup {
-        base_rel,
-        base_formats,
+        base,
         base_width,
         parts,
         cols,
@@ -11780,7 +11848,7 @@ fn branch_rows(
     } = plan
     {
         let filter = bind_filter(filter, args).ok()?;
-        let input = join_rows(db, *base_rel, base_formats, *base_width, parts, &filter).ok()?;
+        let input = join_rows(db, base, *base_width, parts, &filter).ok()?;
         // the joined rows are a materialised leaf; the fold and the sort
         // above them are tree nodes (a NestedLoopJoin leaf is R3)
         let rows = RowSource::aggregate_sorted(
@@ -12031,11 +12099,16 @@ fn plan_query_inner(
             // one SIDE of a join needs derived tables in joins, which is
             // a later slice, and it must keep refusing rather than
             // half-work.
+            // Every SIDE, not only a lone FROM: a materialised CTE may
+            // be one side of a join now that a derived table can be.
+            // The splices are applied in DESCENDING offset order so an
+            // earlier one does not move a later one's position.
+            let mut splices: Vec<(usize, usize, String)> = Vec::new();
             if let Some((from, join)) = split_query(&cur).and_then(|(_, t, _, _, _, _)| parse_from(t))
             {
-                if join.is_empty() {
+                for tr in std::iter::once(&from).chain(join.iter().map(|(_, r, _, _)| r)) {
                     if let Some((_, def)) =
-                        ctes.iter().find(|(n, _)| n.eq_ignore_ascii_case(from.table))
+                        ctes.iter().find(|(n, _)| n.eq_ignore_ascii_case(tr.table))
                     {
                         // An EXPLICIT column list RENAMES the body's
                         // columns, and a derived table carries the
@@ -12075,26 +12148,36 @@ fn plan_query_inner(
                         if !def.cols.is_empty() && def.cols != body_cols {
                             return Some(Plan::Refused);
                         }
-                        let alias = from.alias.unwrap_or(from.table).to_string();
-                        let table_s = split_query(&cur)?.1;
-                        let derived = format!("({}) {}", def.source, alias);
+                        let alias = tr.alias.unwrap_or(tr.table).to_string();
                         // THE OFFSET COMES FROM THE SLICE, NOT FROM A
-                        // TEXT SEARCH. `cur.find(table_s)` looks for the
+                        // TEXT SEARCH. `cur.find(name)` looks for the
                         // CTE's name and finds the `C` inside `SELECT`,
                         // splicing the body into the middle of the
-                        // keyword. `table_s` is a subslice of `cur`, so
+                        // keyword. `tr.table` is a subslice of `cur`, so
                         // its position is arithmetic rather than a guess.
-                        let head = table_s.as_ptr() as usize - cur.as_ptr() as usize;
-                        cur = format!(
-                            "{}{}{}",
-                            &cur[..head],
-                            derived,
-                            &cur[head + table_s.len()..]
-                        );
-                        if trace {
-                            eprintln!("[srv] plan: CTE materialised as {:?}", cur);
-                        }
+                        let head = tr.table.as_ptr() as usize - cur.as_ptr() as usize;
+                        // the name, plus any alias that followed it
+                        let end = match tr.alias {
+                            Some(a) => {
+                                a.as_ptr() as usize - cur.as_ptr() as usize + a.len()
+                            }
+                            None => head + tr.table.len(),
+                        };
+                        splices.push((
+                            head,
+                            end - head,
+                            format!("({}) {}", def.source, alias),
+                        ));
                     }
+                }
+            }
+            if !splices.is_empty() {
+                splices.sort_by(|a, b| b.0.cmp(&a.0));
+                for (at, len, text) in splices {
+                    cur = format!("{}{}{}", &cur[..at], text, &cur[at + len..]);
+                }
+                if trace {
+                    eprintln!("[srv] plan: CTE materialised as {:?}", cur);
                 }
             }
             // Anything still naming a CTE names NO RELATION - falling
@@ -12722,6 +12805,9 @@ fn plan_query_inner(
             }
         }
     }
+    // the Option is kept alongside the narrowed reference: a DERIVED
+    // side plans its own inner query, and that planner takes the Option
+    let db_all = db;
     let db = db.as_ref()?;
     let Some((left, join)) = parse_from(table_s) else {
         if trace { eprintln!("[srv] plan: FROM parse failed for {:?}", table_s); }
@@ -12738,30 +12824,28 @@ fn plan_query_inner(
                 if group_s.is_some() || having_s.is_some() {
                     return plan_join(
                         &proj, &left, &join, where_s, group_s, having_s, order_s, db,
-                        params,
+                        &db_all, params,
                     );
                 }
                 if order_s.is_some() {
                     return None;
                 }
                 if let Some(Plan::Join {
-                    base_rel,
-                    base_formats,
+                    base,
                     base_width,
                     parts,
                     filter,
                     ..
                 }) = plan_join(
-                    &Proj::Star, &left, &join, where_s, None, None, None, db, params,
+                    &Proj::Star, &left, &join, where_s, None, None, None, db, &db_all,
+                    params,
                 ) {
                     // counted at prepare, so a parameterised WHERE (whose
                     // values only arrive at execute) cannot be honoured
                     if !params.is_empty() {
                         return None;
                     }
-                    let n = join_rows(
-                        db, base_rel, &base_formats, base_width, &parts, &filter,
-                    )
+                    let n = join_rows(db, &base, base_width, &parts, &filter)
                     .ok()?
                     .len();
                     return Some(Plan::Scalar(Some(n as i64), "COUNT".to_string()));
@@ -12769,7 +12853,9 @@ fn plan_query_inner(
                 return None;
             }
         }
-        return match plan_join(&proj, &left, &join, where_s, group_s, having_s, order_s, db, params) {
+        return match plan_join(
+            &proj, &left, &join, where_s, group_s, having_s, order_s, db, &db_all, params,
+        ) {
             Some(p) => Some(p),
             None => {
                 if trace { eprintln!("[srv] plan: JOIN plan failed"); }
@@ -14085,8 +14171,7 @@ fn for_each_record<F: FnMut(&[Value])>(
 #[allow(clippy::too_many_arguments)]
 fn join_rows(
     db: &Database,
-    base_rel: u16,
-    base_formats: &[(u8, Vec<Descriptor>)],
+    base: &RowSource,
     base_width: usize,
     parts: &[JoinPart],
     filter: &Option<Predicate>,
@@ -14103,21 +14188,13 @@ fn join_rows(
     // the engine's own status vector - it used to be collected and
     // DROPPED, returning the rows computed before it as if nothing had
     // happened, which is a wrong answer with no error attached.)
-    let mut src = RowSource::TableScan {
-        rel: base_rel,
-        formats: base_formats.to_vec(),
-        width: Some(base_width),
-    };
+    let mut src = base.clone();
     let mut left_width = base_width;
     for part in parts {
         src = RowSource::NestedLoopJoin {
             left: Box::new(src),
             left_width,
-            right: Box::new(RowSource::TableScan {
-                rel: part.rel,
-                formats: part.formats.clone(),
-                width: Some(part.width),
-            }),
+            right: Box::new(part.src.clone()),
             part: Box::new(part.clone()),
         };
         left_width += part.width;
@@ -15406,8 +15483,7 @@ fn emit_rows_inner(
             }
         }
         Plan::Join {
-            base_rel,
-            base_formats,
+            base,
             base_width,
             parts,
             cols,
@@ -15417,7 +15493,7 @@ fn emit_rows_inner(
             if let Some(db) = db {
                 let filter = bind_filter(filter, args)?;
                 let mut rows =
-                    join_rows(db, *base_rel, base_formats, *base_width, parts, &filter)
+                    join_rows(db, base, *base_width, parts, &filter)
                         .map_err(EmitErr::Eval)?;
                 if !order_by.is_empty() {
                     sort_rows(&mut rows, order_by).map_err(EmitErr::Eval)?;
@@ -15431,8 +15507,7 @@ fn emit_rows_inner(
         // relation's grouping uses - `join_rows` produces the input that
         // `group_output`'s scan produces there
         Plan::JoinGroup {
-            base_rel,
-            base_formats,
+            base,
             base_width,
             parts,
             cols,
@@ -15447,7 +15522,7 @@ fn emit_rows_inner(
             if let Some(db) = db {
                 let filter = bind_filter(filter, args)?;
                 let input =
-                    join_rows(db, *base_rel, base_formats, *base_width, parts, &filter)
+                    join_rows(db, base, *base_width, parts, &filter)
                         .map_err(EmitErr::Eval)?;
                 let rows = RowSource::aggregate_sorted(
                     RowSource::Rows(input),
@@ -26552,8 +26627,7 @@ mod tests {
         let part = |kind: JoinKind, on: bool| {
             Box::new(JoinPart {
                 kind,
-                rel: 0,
-                formats: Vec::new(),
+                src: RowSource::Rows(Vec::new()),
                 width: 2,
                 on: Predicate(vec![vec![Term::Const(on)]]),
             })
@@ -27816,8 +27890,7 @@ mod tests {
         [
             JoinSide {
                 key: "E".into(),
-                rel: 10,
-                formats: vec![(1, vec![d(dtype::LONG), d(dtype::LONG), d(dtype::VARYING)])],
+                src: RowSource::TableScan { rel: 10, formats: vec![(1, vec![d(dtype::LONG), d(dtype::LONG), d(dtype::VARYING)])], width: None },
                 columns: vec![
                     RelationColumn { name: "ID".into(), field_id: 0, position: 0 },
                     RelationColumn { name: "DEPT_ID".into(), field_id: 1, position: 1 },
@@ -27829,8 +27902,7 @@ mod tests {
             },
             JoinSide {
                 key: "D".into(),
-                rel: 11,
-                formats: vec![(1, vec![d(dtype::LONG), d(dtype::VARYING)])],
+                src: RowSource::TableScan { rel: 11, formats: vec![(1, vec![d(dtype::LONG), d(dtype::VARYING)])], width: None },
                 columns: vec![
                     RelationColumn { name: "ID".into(), field_id: 0, position: 0 },
                     RelationColumn { name: "NAME".into(), field_id: 1, position: 1 },
@@ -27881,8 +27953,7 @@ mod tests {
         // accumulated side is two columns wide, the new side one.
         let part = |kind| JoinPart {
             kind,
-            rel: 0,
-            formats: Vec::new(),
+            src: RowSource::Rows(Vec::new()),
             width: 1,
             // ON acc[1] = new[0] - index 2 is the new side's only column
             on: Predicate(vec![vec![Term::ExprCond(Box::new(Cond2::Cmp(
