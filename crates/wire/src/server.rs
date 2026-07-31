@@ -10191,6 +10191,124 @@ struct ViewDef {
     cols: Vec<String>,
 }
 
+/// A view definition by name, checking the statement's own CTEs first.
+///
+/// A CTE SHADOWS a catalog view or table of the same name for the
+/// statement it is written in, which is what makes `WITH EMP AS (...)`
+/// legal SQL rather than a redefinition.
+fn lookup_view(db: &Database, ctes: &[(String, ViewDef)], name: &str) -> Option<ViewDef> {
+    if let Some((_, d)) = ctes.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
+        return Some(ViewDef { source: d.source.clone(), cols: d.cols.clone() });
+    }
+    view_of(db, name)
+}
+
+/// Split `WITH <name> [(cols)] AS (<query>) [, ...] <main select>` into
+/// the named queries and the statement that uses them.
+///
+/// A CTE is a VIEW that lives in the statement instead of the catalog -
+/// same source text, same column names - so it expands through exactly
+/// the same rewrite, renamed columns and all.
+///
+/// `WITH RECURSIVE` is not this: it is a fixpoint rather than a
+/// substitution, and it refuses.
+fn parse_with(sql: &str) -> Option<(Vec<(String, ViewDef)>, String)> {
+    let t = sql.trim().trim_end_matches(';').trim();
+    let up = mask_literals(&t.to_ascii_uppercase());
+    if find_word(&up, "WITH", 0) != Some(0) {
+        return None;
+    }
+    let b: Vec<char> = t.chars().collect();
+    let mut i = "WITH".len();
+    let skip_ws = |b: &[char], i: &mut usize| {
+        while *i < b.len() && b[*i].is_whitespace() {
+            *i += 1;
+        }
+    };
+    let mut ctes: Vec<(String, ViewDef)> = Vec::new();
+    loop {
+        skip_ws(&b, &mut i);
+        // the name
+        let start = i;
+        while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$') {
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+        let name: String = b[start..i].iter().collect();
+        if name.eq_ignore_ascii_case("RECURSIVE") {
+            return None; // a fixpoint, not a substitution
+        }
+        skip_ws(&b, &mut i);
+        // an optional column list, which RENAMES the query's columns
+        let mut cols: Vec<String> = Vec::new();
+        if b.get(i) == Some(&'(') {
+            let close = matching_paren(t.as_bytes(), i)?;
+            let inner: String = b[i + 1..close].iter().collect();
+            for c in inner.split(',') {
+                let c = c.trim().trim_matches('"');
+                if !ident_ok(c) {
+                    return None;
+                }
+                cols.push(c.to_ascii_uppercase());
+            }
+            i = close + 1;
+            skip_ws(&b, &mut i);
+        }
+        // AS ( ... )
+        let kw: String = b[i..(i + 2).min(b.len())].iter().collect();
+        if !kw.eq_ignore_ascii_case("AS") {
+            return None;
+        }
+        i += 2;
+        skip_ws(&b, &mut i);
+        if b.get(i) != Some(&'(') {
+            return None;
+        }
+        let close = matching_paren(t.as_bytes(), i)?;
+        let source: String = b[i + 1..close].iter().collect();
+        i = close + 1;
+        // the column names: the explicit list, else the query's own
+        let cols = if cols.is_empty() {
+            let (p, _, _, _, _, _) = split_query(source.trim())?;
+            match parse_projection(p)? {
+                Proj::Items(items) => items
+                    .iter()
+                    .map(|it| match it {
+                        SelItem::Col(c, alias) => Some(
+                            alias
+                                .clone()
+                                .unwrap_or_else(|| c.rsplit('.').next().unwrap_or(c).to_string())
+                                .to_ascii_uppercase(),
+                        ),
+                        SelItem::Expr(_, n) | SelItem::Gen(_, _, n) => {
+                            Some(n.to_ascii_uppercase())
+                        }
+                        SelItem::Agg(_, _, alias) => alias.clone().map(|a| a.to_ascii_uppercase()),
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+                Proj::Star => return None, // the positional mapping is unknown
+            }
+        } else {
+            cols
+        };
+        ctes.push((name.to_ascii_uppercase(), ViewDef { source: source.trim().to_string(), cols }));
+        skip_ws(&b, &mut i);
+        if b.get(i) == Some(&',') {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    let main: String = b[i..].iter().collect();
+    let main = main.trim().to_string();
+    if main.is_empty() || ctes.is_empty() {
+        return None;
+    }
+    Some((ctes, main))
+}
+
 /// Read `<name>` as a view. None when it is an ordinary table (no
 /// RDB$VIEW_SOURCE) or the blob cannot be read.
 fn view_of(db: &Database, name: &str) -> Option<ViewDef> {
@@ -10492,6 +10610,7 @@ fn replace_table_ref(text: &str, from: &str, to: &str) -> String {
 fn expand_view_join(
     sql: &str,
     db: &Database,
+    ctes: &[(String, ViewDef)],
     table_s: &str,
     where_s: Option<&str>,
     from: &TableRef<'_>,
@@ -10505,7 +10624,7 @@ fn expand_view_join(
         .any(|(k, _, _, _)| matches!(k, JoinKind::Right | JoinKind::Full))
         && std::iter::once(from)
             .chain(join.iter().map(|(_, r, _, _)| r))
-            .any(|tr| view_of(db, tr.table).is_some())
+            .any(|tr| lookup_view(db, ctes, tr.table).is_some())
     {
         return None;
     }
@@ -10517,14 +10636,14 @@ fn expand_view_join(
     for (step, tr) in std::iter::once((None, from))
         .chain(join.iter().enumerate().map(|(i, (_, r, _, _))| (Some(i), r)))
     {
-        let Some(vd) = view_of(db, tr.table) else { continue };
+        let Some(vd) = lookup_view(db, ctes, tr.table) else { continue };
         any = true;
         let (vproj, vtable, vwhere, vgroup, vhaving, vorder) = split_query(&vd.source)?;
         if vgroup.is_some() || vhaving.is_some() || vorder.is_some() {
             return None;
         }
         let (vfrom, vjoin) = parse_from(vtable)?;
-        if !vjoin.is_empty() || view_of(db, vfrom.table).is_some() {
+        if !vjoin.is_empty() || lookup_view(db, ctes, vfrom.table).is_some() {
             return None; // a view over a join, or over another view
         }
         let base_cols: Vec<String> = match parse_projection(vproj)? {
@@ -10735,13 +10854,13 @@ fn qualify_idents(text: &str, alias: &str) -> String {
 /// If `sql`'s FROM names a VIEW, rewrite the query against the view's
 /// base table and return it for the planner to re-plan. None when the
 /// FROM is an ordinary table or the view is outside the supported shape.
-fn expand_view(sql: &str, db: &Database) -> Option<String> {
+fn expand_view(sql: &str, db: &Database, ctes: &[(String, ViewDef)]) -> Option<String> {
     let (proj_s, table_s, where_s, group_s, having_s, order_s) = split_query(sql)?;
     let (from, join) = parse_from(table_s)?;
     if !join.is_empty() {
-        return expand_view_join(sql, db, table_s, where_s, &from, &join);
+        return expand_view_join(sql, db, ctes, table_s, where_s, &from, &join);
     }
-    let vd = view_of(db, from.table)?;
+    let vd = lookup_view(db, ctes, from.table)?;
     // the view's own source must be a single-table projection of bare
     // columns; anything else would need real RSE merging
     let (vproj, vtable, vwhere, vgroup, vhaving, vorder) = split_query(&vd.source)?;
@@ -10753,7 +10872,7 @@ fn expand_view(sql: &str, db: &Database) -> Option<String> {
         return None;
     }
     // the base must be a TABLE, not another view
-    if view_of(db, vfrom.table).is_some() {
+    if lookup_view(db, ctes, vfrom.table).is_some() {
         return None;
     }
     let base_cols: Vec<String> = match parse_projection(vproj)? {
@@ -11371,6 +11490,76 @@ fn plan_query_inner(
         }
     }
     // RESULT MODIFIERS - see strip_modifiers for the grammar order
+    // A COMMON TABLE EXPRESSION is a VIEW that lives in the statement
+    // rather than the catalog: same source text, same column names. So
+    // it expands through exactly the same rewrite - renamed columns,
+    // joins and all - and the expanded statement is re-planned. Done
+    // before anything else looks at the text, since every later stage
+    // expects a FROM naming things that exist.
+    if let Some(dbr) = db.as_ref() {
+        if let Some((ctes, main)) = parse_with(sql) {
+            // FIRST/SKIP/DISTINCT sit BETWEEN `SELECT` and the select
+            // list, so the expansion cannot read the projection past
+            // them. They come off here and go back on afterwards, in the
+            // engine's own order (FIRST, then SKIP, then DISTINCT).
+            let (mut cur, modifiers) = match strip_modifiers(&main) {
+                Some((inner, distinct, skip, take, bad)) if !bad => {
+                    (inner, Some((distinct, skip, take)))
+                }
+                Some(_) => return Some(Plan::Refused), // modifiers out of order
+                None => (main, None),
+            };
+            // each pass expands one FROM; a chain of CTEs referring to
+            // earlier ones needs one pass each, and the bound stops a
+            // self-referencing name from looping
+            for _ in 0..8 {
+                match expand_view(&cur, dbr, &ctes) {
+                    Some(next) => cur = next,
+                    None => break,
+                }
+            }
+            // A CTE NAME STILL IN THE FROM WAS NOT EXPANDED, and it names
+            // no relation - falling through would reach the fixed-answer
+            // fallback and reply 4242 to a query over a real table.
+            let names_cte = split_query(&cur)
+                .and_then(|(_, t, _, _, _, _)| parse_from(t))
+                .map(|(from, join)| {
+                    std::iter::once(from.table)
+                        .chain(join.iter().map(|(_, r, _, _)| r.table))
+                        .any(|t| ctes.iter().any(|(n, _)| n.eq_ignore_ascii_case(t)))
+                })
+                .unwrap_or(true);
+            if names_cte {
+                if trace {
+                    eprintln!("[srv] plan: a CTE could not be expanded in {:?}", cur);
+                }
+                return Some(Plan::Refused);
+            }
+            if let Some((distinct, skip, take)) = modifiers {
+                let rest = cur.trim().strip_prefix("SELECT").or_else(|| {
+                    cur.trim().get(..6).filter(|h| h.eq_ignore_ascii_case("SELECT"))?;
+                    Some(&cur.trim()[6..])
+                })?;
+                let mut head = String::from("SELECT");
+                if let Some(n) = take {
+                    head.push_str(&format!(" FIRST {}", n));
+                }
+                if skip > 0 {
+                    head.push_str(&format!(" SKIP {}", skip));
+                }
+                if distinct {
+                    head.push_str(" DISTINCT");
+                }
+                cur = format!("{}{}", head, rest);
+            }
+            if trace {
+                eprintln!("[srv] plan: WITH expanded to {:?}", cur);
+            }
+            params.clear();
+            return plan_query_inner(&cur, db, params);
+        }
+    }
+
     if let Some((inner_sql, distinct, skip, take, bad_order)) = strip_modifiers(sql) {
         if bad_order {
             if trace {
@@ -11734,7 +11923,7 @@ fn plan_query_inner(
     // table and re-plan it (see VIEWS). Done before anything else is
     // resolved, so the rewritten text goes through the whole planner.
     if let Some(dbr) = db.as_ref() {
-        if let Some(rewritten) = expand_view(sql, dbr) {
+        if let Some(rewritten) = expand_view(sql, dbr, &[]) {
             if trace {
                 eprintln!("[srv] plan: view expanded to {:?}", rewritten);
             }
@@ -25233,6 +25422,44 @@ pub fn serve(addr: &str, user: &str, password: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cte_parses_as_a_view_definition() {
+        let (ctes, main) =
+            parse_with("WITH C AS (SELECT ID, SALARY FROM EMP) SELECT ID FROM C").unwrap();
+        assert_eq!(ctes.len(), 1);
+        assert_eq!(ctes[0].0, "C");
+        assert_eq!(ctes[0].1.source, "SELECT ID, SALARY FROM EMP");
+        // with no column list the CTE's columns are its query's own
+        assert_eq!(ctes[0].1.cols, vec!["ID", "SALARY"]);
+        assert_eq!(main, "SELECT ID FROM C");
+
+        // an explicit column list RENAMES, positionally
+        let (ctes, _) =
+            parse_with("WITH C (A, B) AS (SELECT ID, SALARY FROM EMP) SELECT A FROM C").unwrap();
+        assert_eq!(ctes[0].1.cols, vec!["A", "B"]);
+
+        // several, comma-separated
+        let (ctes, main) = parse_with(
+            "WITH C AS (SELECT ID FROM EMP), D AS (SELECT ID FROM DEPT) SELECT * FROM D",
+        )
+        .unwrap();
+        assert_eq!(ctes.len(), 2);
+        assert_eq!(ctes[1].0, "D");
+        assert_eq!(main, "SELECT * FROM D");
+
+        // a nested paren inside the body does not end it early
+        let (ctes, _) = parse_with(
+            "WITH C AS (SELECT ID FROM EMP WHERE ID IN (1, 2)) SELECT ID FROM C",
+        )
+        .unwrap();
+        assert_eq!(ctes[0].1.source, "SELECT ID FROM EMP WHERE ID IN (1, 2)");
+
+        // RECURSIVE is a FIXPOINT, not a substitution
+        assert!(parse_with("WITH RECURSIVE C AS (SELECT 1 FROM T) SELECT * FROM C").is_none());
+        // and an ordinary statement is not a WITH
+        assert!(parse_with("SELECT ID FROM EMP").is_none());
+    }
 
     #[test]
     fn a_lookup_answers_absent_keys_by_function() {

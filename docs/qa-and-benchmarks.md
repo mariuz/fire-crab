@@ -7491,6 +7491,47 @@ D.BUDGET`), which a keyed table cannot express and the engine answers by
 re-running the subquery per row; and a GROUP BY inside the subquery, which
 would need a second level of folding.
 
+### WITH: a view that lives in the statement (`qa/serve-real-cte.sh`, 29 checks)
+
+A common table expression looks like a new feature and is not one. `WITH C AS
+(SELECT ...) SELECT ... FROM C` is a **view that lives in the statement rather
+than the catalog** — the same source text, the same column names, the same
+substitution into the FROM. Once framed that way the conversion is a lookup
+change: where the expander asked the catalog for a view definition, it now asks
+the statement's own CTEs first and the catalog second.
+
+That is the whole slice, and the payoff is that everything the view expansion
+learned over several increments arrives at once, unwritten: an alias on the
+FROM item, RENAMED columns, the CTE's own WHERE ANDed into the outer one, a CTE
+as either side of a JOIN, a CTE on the padded side of an outer join. Every
+check in this gate has a view-shaped twin that already passed — which is why
+the gate is organised to mirror them.
+
+Two things genuinely are CTE-specific:
+
+- The **column list** renames: `WITH C (A, B) AS (SELECT ID, SALARY ...)` makes
+  the columns A and B, positionally. A view does the same through
+  `RDB$RELATION_FIELDS`, but it is written completely differently, so it is
+  parsed separately and checked separately.
+- A CTE **shadows** a table of the same name for its statement, which is what
+  makes `WITH DEPT AS (...)` legal rather than a redefinition.
+
+**One shape needed care.** `FIRST`, `SKIP` and `DISTINCT` sit *between* `SELECT`
+and the select list, so an expander that splits a query into clauses cannot
+read the projection past them — `SELECT DISTINCT DEPT_ID FROM C` looked like a
+projection of `DISTINCT DEPT_ID`. They are stripped before the rewrite and
+re-attached after, in the engine's own order (FIRST, then SKIP, then DISTINCT),
+which is a rule an earlier increment had already had to probe.
+
+**The refusal that matters.** A CTE whose body the view expansion cannot
+rewrite — a GROUP BY inside, a `SELECT *`, a join — leaves its name in the FROM.
+That name refers to no relation at all, so falling through would reach the
+fixed-answer fallback and answer `4242` to a query over real tables. The
+planner therefore checks, after expanding, whether any CTE name still appears
+in the FROM and refuses if one does. `WITH RECURSIVE` refuses for a different
+reason: it is a fixpoint rather than a substitution, and pretending otherwise
+would answer the first iteration and call it the result.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

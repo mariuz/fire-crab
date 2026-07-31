@@ -13,6 +13,37 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — WITH: a view that lives in the statement
+
+### Converted
+- **Common table expressions** — `WITH C AS (SELECT ...) SELECT ... FROM
+  C`. A CTE is a VIEW that lives in the STATEMENT rather than the
+  catalog: the same source text, the same column names, the same
+  substitution into the FROM. So it is not a new mechanism — it is the
+  view expansion with a different place to look the name up, and
+  everything that expansion learned over several increments arrives with
+  it at once: an alias on the FROM item, RENAMED columns, the CTE's own
+  WHERE ANDed into the outer one, and a CTE as a side of a JOIN.
+- Two things are specific to CTEs and are parsed here: the **column
+  list** (`WITH C (A, B) AS ...`) renames positionally, which is what a
+  view does through `RDB$RELATION_FIELDS` but written very differently;
+  and a CTE **shadows** a table of the same name for its statement.
+- `FIRST`, `SKIP` and `DISTINCT` sit BETWEEN `SELECT` and the select
+  list, so the expansion cannot read the projection past them. They come
+  off before the rewrite and go back on after, in the engine's own order.
+
+### Guarded
+- **A CTE name left in the FROM refuses.** If a CTE's body is one the
+  view expansion cannot rewrite (a GROUP BY inside, a `SELECT *`, a join),
+  its name stays in the FROM — where it names no relation at all, so
+  falling through would reach the fixed-answer fallback and reply 4242 to
+  a query over real tables. `WITH RECURSIVE` refuses too: it is a
+  fixpoint, not a substitution.
+
+`qa/serve-real-cte.sh` is new, 29 checks. Each has a view-shaped twin
+that already passed — which is the point of the framing, and the reason
+this cost one function rather than a subsystem.
+
 ## 2026-07-31 — a correlated subquery in the select list
 
 ### Converted

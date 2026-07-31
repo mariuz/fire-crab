@@ -1482,6 +1482,22 @@ them.
   against a DIFFERENT table. Any textual rewrite needs to know where its
   scope ends, and a nested query is where it ends.
 
+- **Ask what the new construct IS before asking how to build it.** A CTE
+  is a view that lives in the statement instead of the catalog; framed
+  that way it cost one lookup function, and every capability the view
+  expansion had already accumulated - aliases, renamed columns, joins,
+  outer padding - arrived with it unwritten. The same feature framed as
+  "a new kind of derived table" would have been a subsystem. When a
+  construct feels large, look for the one you already have that it is a
+  respelling of.
+
+- **When a rewrite consumes a query, it must consume the WHOLE grammar of
+  one.** `FIRST`, `SKIP` and `DISTINCT` sit between SELECT and the select
+  list, so a clause splitter reading the projection sees them as part of
+  it. Anything that takes a query apart and puts it back together has to
+  know every position a keyword can occupy, not just the clauses it cares
+  about.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with
