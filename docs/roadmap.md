@@ -46,7 +46,10 @@ pulled by the fetch.
 - **R2 — Aggregate** is a node. *(done)* `group_output` and both grouped
   paths build `TableScan → Filter → Aggregate → Sort`; the fold itself
   (`group_rows`) now has exactly ONE caller, the node.
-- **R3 — NestedLoopJoin**, inner and outer, replacing `join_rows`.
+- **R3 — NestedLoopJoin**, inner and outer. *(done)* `join_rows` builds
+  a LEFT-DEEP tree instead of folding, so "each step's kind applies to
+  everything accumulated so far" is true by construction; the WHERE is a
+  `Filter` above the whole join.
 - **R4 — derived tables**: `FROM (SELECT ...)`, the first capability the
   tree unlocks that the rewriting could not reach.
 - **R5 — a materialised CTE**, which retires the "CTE body must be a

@@ -13,6 +13,33 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — R3: NestedLoopJoin is a node
+
+### Converted
+- **`RowSource::NestedLoopJoin`** — every left row against every right
+  row, kept when the ON answers TRUE, with the KIND deciding what
+  happens to a row that finds no partner. `join_rows` no longer folds:
+  it **builds a left-deep tree** and pulls it.
+- **Left-deep is the point.** `A JOIN B ... JOIN C ...` is `(A ⋈ B) ⋈ C`,
+  so the second ON may name A or B and each step's kind applies to
+  everything accumulated so far. The fold expressed that by carrying an
+  accumulated width; the tree makes it **true by construction**, and the
+  width is just where the right side's fields begin.
+- **The WHERE is a `Filter` above the whole join, not inside a step** —
+  a predicate pushed into a step would see a row before its outer
+  padding existed. That was already true and is now structural.
+- `TableScan` gained the stream's record **width**: a join side's rows
+  are padded so the combined row's field offsets are the same for every
+  row, matched or padded. The single-relation scans pass `None`.
+
+The node's unit test decides the ON with a constant rather than
+resolving one, because what has no analogue elsewhere is the KIND: with
+a false ON an INNER join drops the row and a LEFT keeps it **padded to
+the combined width** — which is the check that gives the width field a
+reason to exist.
+
+11 join gates green, 363 unit tests, no behaviour change.
+
 ## 2026-07-31 — R2: Aggregate is a node
 
 ### Converted

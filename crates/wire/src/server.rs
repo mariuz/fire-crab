@@ -914,10 +914,14 @@ enum Wire {
 // choices executable rather than advisory.
 #[derive(Clone)]
 enum RowSource {
-    /// every record of a relation, in storage order
+    /// every record of a relation, in storage order. `width` is the
+    /// stream's record width when it must be padded to one - a join
+    /// side's rows are padded so the COMBINED row's field offsets are
+    /// the same for every row, matched or padded.
     TableScan {
         rel: u16,
         formats: Vec<(u8, Vec<Descriptor>)>,
+        width: Option<usize>,
     },
     /// the rows of `input` that satisfy `pred` (None keeps every row)
     Filter {
@@ -934,6 +938,26 @@ enum RowSource {
     /// stand on, and it is what makes the tree testable without a
     /// database behind it.
     Rows(Vec<Vec<Value>>),
+    /// the engine's NestedLoop: every left row against every right row,
+    /// kept when the ON predicate answers TRUE. The KIND decides what
+    /// happens to a row with no partner - an inner join drops it, a
+    /// LEFT keeps the left one padded, a RIGHT keeps the right, a FULL
+    /// keeps both.
+    ///
+    /// A chain is LEFT-DEEP: `A JOIN B ... JOIN C ...` is
+    /// `(A ⋈ B) ⋈ C`, so the second ON may name A or B and each step's
+    /// kind applies to everything accumulated so far. That is what
+    /// `LEFT JOIN` means in the middle of a chain, and building the tree
+    /// left-deep is what makes it true by construction rather than by a
+    /// fold that remembers.
+    NestedLoopJoin {
+        left: Box<RowSource>,
+        /// the combined width of everything on the left, which is where
+        /// the right side's fields begin
+        left_width: usize,
+        right: Box<RowSource>,
+        part: Box<JoinPart>,
+    },
     /// the engine's AggregatedStream: `input` folded into one row per
     /// distinct key, with HAVING filtering the FOLDED rows rather than
     /// the input ones. A query with no GROUP BY is the single global
@@ -957,9 +981,15 @@ impl RowSource {
     /// today rather than pretending otherwise.
     fn rows(&self, db: &Database) -> Result<Vec<Vec<Value>>, EvalErr> {
         match self {
-            RowSource::TableScan { rel, formats } => {
+            RowSource::TableScan { rel, formats, width } => {
                 let mut out = Vec::new();
-                for_each_record(db, *rel, formats, |values| out.push(values.to_vec()));
+                for_each_record(db, *rel, formats, |values| {
+                    let mut row = values.to_vec();
+                    if let Some(w) = width {
+                        row.resize(*w, Value::Null);
+                    }
+                    out.push(row);
+                });
                 Ok(out)
             }
             RowSource::Filter { input, pred } => {
@@ -976,6 +1006,11 @@ impl RowSource {
                 Ok(out)
             }
             RowSource::Rows(rows) => Ok(rows.clone()),
+            RowSource::NestedLoopJoin { left, left_width, right, part } => {
+                let l = left.rows(db)?;
+                let r = right.rows(db)?;
+                join_step(l, *left_width, &r, part)
+            }
             RowSource::Aggregate {
                 input,
                 gitems,
@@ -1038,7 +1073,7 @@ impl RowSource {
     ) -> RowSource {
         RowSource::Sort {
             input: Box::new(RowSource::Filter {
-                input: Box::new(RowSource::TableScan { rel, formats }),
+                input: Box::new(RowSource::TableScan { rel, formats, width: None }),
                 pred,
             }),
             keys,
@@ -13702,46 +13737,38 @@ fn join_rows(
     parts: &[JoinPart],
     filter: &Option<Predicate>,
 ) -> Result<Vec<Vec<Value>>, EvalErr> {
-    let collect = |rel: u16, formats: &[(u8, Vec<Descriptor>)], width: usize| {
-        let mut rows: Vec<Vec<Value>> = Vec::new();
-        for_each_record(db, rel, formats, |v| {
-            let mut row = v.to_vec();
-            row.resize(width, Value::Null);
-            rows.push(row);
-        });
-        rows
+    // The chain is a LEFT-DEEP TREE: `A JOIN B ... JOIN C ...` is
+    // `(A ⋈ B) ⋈ C`, so the second ON may name A or B and each step's
+    // kind applies to everything accumulated so far. Building the tree
+    // left-deep makes that TRUE BY CONSTRUCTION rather than by a fold
+    // that has to remember an accumulated width.
+    //
+    // The WHERE is a Filter ABOVE the whole join, not inside a step: a
+    // predicate pushed into a step would see a row before its outer
+    // padding existed. (An evaluation error there ends the join with
+    // the engine's own status vector - it used to be collected and
+    // DROPPED, returning the rows computed before it as if nothing had
+    // happened, which is a wrong answer with no error attached.)
+    let mut src = RowSource::TableScan {
+        rel: base_rel,
+        formats: base_formats.to_vec(),
+        width: Some(base_width),
     };
-    // The chain is a FOLD: the accumulated rows are the left side of the
-    // next join, so `A JOIN B ... JOIN C ...` joins (A×B) with C and the
-    // second ON may name A or B. Every step's kind applies to what is
-    // accumulated so far, which is what LEFT JOIN means in a chain.
-    let mut acc = collect(base_rel, base_formats, base_width);
-    let mut acc_width = base_width;
+    let mut left_width = base_width;
     for part in parts {
-        let rrows = collect(part.rel, &part.formats, part.width);
-        acc = join_step(acc, acc_width, &rrows, part)?;
-        acc_width += part.width;
+        src = RowSource::NestedLoopJoin {
+            left: Box::new(src),
+            left_width,
+            right: Box::new(RowSource::TableScan {
+                rel: part.rel,
+                formats: part.formats.clone(),
+                width: Some(part.width),
+            }),
+            part: Box::new(part.clone()),
+        };
+        left_width += part.width;
     }
-    let mut out: Vec<Vec<Value>> = Vec::new();
-    let mut ferr: Option<EvalErr> = None;
-    for row in acc {
-        match filter.as_ref().map_or(Ok(true), |p| p.matches(&row)) {
-            Ok(true) => out.push(row),
-            Ok(false) => {}
-            Err(e) => {
-                ferr = Some(e);
-                break;
-            }
-        }
-    }
-    // an evaluation error in the WHERE ends the join with the engine's
-    // own status vector. It used to be COLLECTED AND DROPPED - the rows
-    // computed before it were returned as if nothing had happened,
-    // which is a wrong answer with no error attached.
-    if let Some(e) = ferr {
-        return Err(e);
-    }
-    Ok(out)
+    RowSource::Filter { input: Box::new(src), pred: filter.clone() }.rows(db)
 }
 
 /// One step of the fold: join the rows accumulated so far with the next
@@ -14003,6 +14030,7 @@ fn group_output(
             input: Box::new(RowSource::TableScan {
                 rel,
                 formats: formats.to_vec(),
+                width: None,
             }),
             pred: filter.clone(),
         }),
@@ -15081,6 +15109,7 @@ fn emit_rows_inner(
                         input: Box::new(RowSource::TableScan {
                             rel: *rel,
                             formats: formats.to_vec(),
+                            width: None,
                         }),
                         pred: filter,
                     },
@@ -26048,7 +26077,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_row_source_tree_scans_filters_sorts_and_aggregates() {
+    fn a_row_source_tree_scans_filters_sorts_aggregates_and_joins() {
         // The tree is exercised without a database behind it, which is
         // what the materialised leaf is for. `db` is never touched on
         // these paths, so a null pointer would do - but Database has no
@@ -26106,6 +26135,41 @@ mod tests {
         assert!(matches!(counted[0][0], Value::Int(10)));
         assert!(matches!(counted[0][1], Value::Int(2)));
         assert!(matches!(counted[1][1], Value::Int(1)));
+
+        // a NESTED LOOP JOIN, with the ON decided rather than resolved:
+        // a `Const` predicate is the cleanest way to test what the KIND
+        // does, which is the part that has no analogue anywhere else.
+        let part = |kind: JoinKind, on: bool| {
+            Box::new(JoinPart {
+                kind,
+                rel: 0,
+                formats: Vec::new(),
+                width: 2,
+                on: Predicate(vec![vec![Term::Const(on)]]),
+            })
+        };
+        let l = RowSource::Rows(vec![row(1, 10), row(2, 20)]);
+        let r = RowSource::Rows(vec![row(7, 70)]);
+        let join = |kind: JoinKind, on: bool| RowSource::NestedLoopJoin {
+            left: Box::new(l.clone()),
+            left_width: 2,
+            right: Box::new(r.clone()),
+            part: part(kind, on),
+        }
+        .rows(&db)
+        .unwrap();
+
+        // a matching ON pairs every left row with every right one
+        assert_eq!(join(JoinKind::Inner, true).len(), 2);
+        // and an INNER join DROPS a left row with no partner...
+        assert!(join(JoinKind::Inner, false).is_empty());
+        // ... while a LEFT join keeps it, PADDED to the combined width,
+        // which is why the scan carries a width at all
+        let padded = join(JoinKind::Left, false);
+        assert_eq!(padded.len(), 2);
+        assert_eq!(padded[0].len(), 4);
+        assert!(matches!(padded[0][0], Value::Int(1)));
+        assert!(matches!(padded[0][2], Value::Null));
 
         // and DESCENDING is the same keys read the other way
         let desc = RowSource::Sort {
