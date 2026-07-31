@@ -1717,6 +1717,22 @@ them.
   refusal and gate it, so the coverage check becomes the thing that
   notices when the component learns more.
 
+- **Some optimisations cannot lose data — they can only lie about
+  order.** Skipping a sort because a walk is already sorted returns the
+  right rows in the wrong sequence, which no row-set comparison catches
+  and no "did we lose anything" check notices. Before allowing one, write
+  down what makes the cheap order TOTAL and identical to the requested
+  one, then gate every way two rows can tie: a duplicate key, a NULL key,
+  a second sort column, an explicit NULLS clause, the opposite direction.
+  The list of exclusions is the deliverable as much as the optimisation.
+
+- **A faster path that reads less beats one that merely saves work.**
+  When the predicate's index and the ORDER BY's index differ, bounding
+  the retrieval wins and the sort stays: reading a handful of records
+  beats walking the whole relation to avoid sorting a handful. Both are
+  "use the index", and choosing the wrong one is a pessimisation that
+  every correctness gate passes.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

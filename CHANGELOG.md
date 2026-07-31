@@ -13,6 +13,48 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — W1d: the sort an index makes unnecessary
+
+`Access::Order` — the engine's navigation. An index walk already
+delivers its rows in key order, so the sort above it re-establishes an
+order that is already there.
+
+### Converted
+- **A navigating retrieval drops the `Sort`.** `ORDER BY <primary key>`
+  walks the index and streams; `WHERE ID > 2 ORDER BY ID` bounds the
+  same walk; `FIRST 3 ... ORDER BY ID` reads three rows' worth of the
+  tree instead of sorting the relation.
+- **An ORDER BY alone is now reason enough to use an index** — until
+  now a predicate was required, so the commonest ordered query in the
+  language could not reach one.
+- **BOUNDS BEAT NAVIGATION.** When the predicate's index and the order's
+  index differ, the bounded retrieval wins and the sort runs: reading a
+  few records beats walking the whole relation to save a sort. When they
+  are the *same* index you get both. That is opt's rule too.
+
+### Guarded
+Row order is part of the answer, and a sort dropped wrongly does not
+lose rows — it returns the right rows in an order the engine did not
+choose. So navigation is taken only where the index's order is **total
+and identical** to the clause: one ascending key, no explicit NULLS
+placement, a plain field, an ascending single-segment index that is
+**unique**, and a **NOT NULL** column. Each exclusion is gated:
+
+- a DESCENDING order (the walk goes the other way);
+- a NON-UNIQUE index — duplicates come back in record-number order, which
+  the engine has never promised;
+- a **unique index on a NULLABLE column**, because an all-NULL key is
+  exempt from uniqueness, so two rows can share the empty key and tie;
+- two keys where the index has one; an explicit `NULLS LAST`; a column
+  with no index.
+
+The index-vs-scan-vs-engine equivalence checks now compare *sequences*
+over navigated orders, which is what makes those exclusions checkable
+rather than argued.
+
+`qa/serve-real-index.sh` grows to 171 checks. 33 gates and 369 unit
+tests confirm nothing moved.
+
 ## 2026-07-31 — W1c: the fold reads through a retrieval too
 
 ### Converted

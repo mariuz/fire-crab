@@ -57,6 +57,7 @@ CREATE TABLE EMP (ID INTEGER NOT NULL PRIMARY KEY, DEPT_ID INTEGER,
                   SALARY INTEGER, NAME VARCHAR(6));
 CREATE TABLE PLAIN (ID INTEGER, V INTEGER);
 CREATE TABLE WIDE (K BIGINT, S SMALLINT, N NUMERIC(9,2), T VARCHAR(6));
+CREATE TABLE NU (K INTEGER, V VARCHAR(4));
 COMMIT;
 CREATE INDEX EMP_DEPT ON EMP (DEPT_ID);
 CREATE INDEX WIDE_K ON WIDE (K);
@@ -65,6 +66,7 @@ CREATE INDEX WIDE_N ON WIDE (N);
 CREATE INDEX WIDE_T ON WIDE (T);
 CREATE INDEX EMP_PAIR ON EMP (DEPT_ID, SALARY);
 CREATE DESCENDING INDEX WIDE_SD ON WIDE (S);
+CREATE UNIQUE INDEX NU_K ON NU (K);
 COMMIT;
 INSERT INTO EMP VALUES (1, 1, 100, 'a');
 INSERT INTO EMP VALUES (2, 1, 200, 'b');
@@ -78,6 +80,10 @@ INSERT INTO WIDE VALUES (9000000000, 7, 12.50, 'aa');
 INSERT INTO WIDE VALUES (-9000000000, -7, -3.25, 'bb');
 INSERT INTO WIDE VALUES (0, 0, 0.00, NULL);
 INSERT INTO WIDE VALUES (9000000000, 7, 12.50, 'cc');
+INSERT INTO NU VALUES (2, 'two');
+INSERT INTO NU VALUES (1, 'one');
+INSERT INTO NU VALUES (NULL, 'nil');
+INSERT INTO NU VALUES (NULL, 'nil2');
 COMMIT;
 EOF
     chmod 666 "$1"
@@ -240,12 +246,14 @@ natural "a column with no index" "SELECT ID FROM EMP WHERE SALARY = 300"
 natural "a table with no index at all" "SELECT ID FROM PLAIN WHERE ID = 1"
 natural "IS NULL, which is not an equality" \
         "SELECT ID FROM EMP WHERE DEPT_ID IS NULL"
-natural "no predicate at all" "SELECT ID FROM EMP ORDER BY ID"
+# these order by a column with NO index, so nothing but the PREDICATE
+# could drive a retrieval - which is what each one is asking about
+natural "no predicate at all" "SELECT ID FROM EMP ORDER BY NAME"
 natural "an OR of two equalities" \
         "SELECT ID FROM EMP WHERE ID = 1 OR ID = 2 ORDER BY ID"
-natural "a NOT EQUAL" "SELECT ID FROM EMP WHERE ID <> 3 ORDER BY ID"
+natural "a NOT EQUAL" "SELECT ID FROM EMP WHERE ID <> 3 ORDER BY NAME"
 natural "an equality on the SECOND segment of a compound index" \
-        "SELECT ID FROM EMP WHERE SALARY = 200 ORDER BY ID"
+        "SELECT ID FROM EMP WHERE SALARY = 200 ORDER BY NAME"
 # the types whose key encoding this slice does not build
 # BIGINT and SMALLINT are keyed too - the encoding is the WRITE path's
 # own (int64 key for one, the double-form numeric key for the other),
@@ -295,6 +303,72 @@ indexed "a range through a DESCENDING index" \
         "SELECT T FROM WIDE WHERE S > -7 ORDER BY T"
 indexed "... and the other way" "SELECT T FROM WIDE WHERE S < 7 ORDER BY T"
 indexed "... and between" "SELECT T FROM WIDE WHERE S BETWEEN -7 AND 7 ORDER BY T"
+
+
+# --- 3c. NAVIGATION: the sort an index makes unnecessary ---------------
+# An index walk delivers its rows in KEY order, so a sort above it would
+# re-establish an order that is already there. Dropping it is the
+# engine's `Access::Order` - and it is the one place in this whole slice
+# where getting it wrong does not lose a row but hands back the RIGHT
+# rows in the WRONG ORDER, which a differential does catch, but only
+# because row order is compared.
+#
+# The conditions are the ones that make the index's order TOTAL and
+# equal to the clause: one ascending key, no explicit NULLS placement, a
+# plain field, an ascending single-segment index that is UNIQUE, and a
+# NOT NULL column (a unique index still admits several all-NULL keys,
+# and duplicates come back in record-number order, which the engine has
+# never promised).
+navigated() { # <label> <sql> - answers like the engine AND skips the sort
+    before=$(scans_since "navigate=true")
+    both "$1" "$2"
+    after=$(scans_since "navigate=true")
+    ran=$((ran + 1))
+    if [ "$after" -gt "$before" ]; then
+        echo "OK   ... and it NAVIGATED (no sort)"
+    else
+        echo "DIFF $1 did not navigate"
+        fail=1
+    fi
+}
+sorted_anyway() { # <label> <sql> - answers like the engine and SORTS
+    before=$(scans_since "navigate=true")
+    both "$1" "$2"
+    after=$(scans_since "navigate=true")
+    ran=$((ran + 1))
+    if [ "$after" -eq "$before" ]; then
+        echo "OK   ... and it sorted, as it must"
+    else
+        echo "DIFF $1 navigated an order the index does not deliver"
+        fail=1
+    fi
+}
+navigated "ORDER BY the primary key, with no predicate at all" \
+          "SELECT ID, NAME FROM EMP ORDER BY ID"
+navigated "... and with a range, which bounds the same walk" \
+          "SELECT ID FROM EMP WHERE ID > 2 ORDER BY ID"
+navigated "... under FIRST, where the order decides WHICH rows" \
+          "SELECT FIRST 3 ID FROM EMP ORDER BY ID"
+navigated "... and SKIP" "SELECT SKIP 2 ID FROM EMP ORDER BY ID"
+# every one of these has an order the index does NOT deliver
+sorted_anyway "DESCENDING - the walk goes the other way" \
+              "SELECT ID FROM EMP ORDER BY ID DESC"
+sorted_anyway "a NON-UNIQUE index - duplicates tie, and ties have no promised order" \
+              "SELECT ID FROM EMP ORDER BY DEPT_ID, ID"
+sorted_anyway "a column with no index" "SELECT ID FROM EMP ORDER BY NAME"
+sorted_anyway "two keys, where the index has one" \
+              "SELECT ID FROM EMP ORDER BY ID, NAME"
+sorted_anyway "an explicit NULLS placement" \
+              "SELECT ID FROM EMP ORDER BY ID NULLS LAST"
+# a UNIQUE index on a NULLABLE column: all-NULL keys are exempt from
+# uniqueness, so two rows can share the empty key and tie
+sorted_anyway "a UNIQUE index on a NULLABLE column" \
+              "SELECT V FROM NU ORDER BY K"
+# and when the predicate's index is NOT the order's, the bounds win and
+# the sort runs - reading a few records beats walking the whole relation
+# to save a sort, which is opt's rule too
+sorted_anyway "the predicate's index is not the order's" \
+              "SELECT ID FROM EMP WHERE DEPT_ID = 1 ORDER BY ID"
 
 # --- 4. the answers themselves, index and scan side by side ------------
 # the same question asked two ways: if the index path lost a row, these
@@ -387,6 +461,13 @@ same_both_ways "a range with NULLs below it" \
                "SELECT ID FROM EMP WHERE DEPT_ID < 3 ORDER BY ID"
 same_both_ways "an empty range" "SELECT ID FROM EMP WHERE ID > 9 AND ID < 2"
 same_both_ways "an aggregate" "SELECT COUNT(*) AS K FROM EMP WHERE DEPT_ID = 9"
+# ORDER is part of the answer, so the navigating server and the sorting
+# one must produce the same SEQUENCE, not just the same set
+same_both_ways "a navigated order" "SELECT ID, NAME FROM EMP ORDER BY ID"
+same_both_ways "a navigated order under a range" \
+               "SELECT ID FROM EMP WHERE ID >= 2 ORDER BY ID"
+same_both_ways "a navigated order under FIRST" \
+               "SELECT FIRST 2 ID FROM EMP ORDER BY ID"
 same_both_ways "a grouped query" \
                "SELECT DEPT_ID, COUNT(*) AS K FROM EMP WHERE ID > 1
                 GROUP BY DEPT_ID ORDER BY DEPT_ID"
@@ -400,8 +481,8 @@ else
 fi
 
 rm -f "$A" "$B"
-if [ "$ran" -lt 105 ]; then
-    echo "DIFF only $ran checks ran (expected at least 105) - did one silently skip?"
+if [ "$ran" -lt 125 ]; then
+    echo "DIFF only $ran checks ran (expected at least 125) - did one silently skip?"
     fail=1
 fi
 exit $fail

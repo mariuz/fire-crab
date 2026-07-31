@@ -1112,14 +1112,20 @@ impl RowSource {
         keys: Vec<OrderKey>,
         index: Option<IndexPick>,
     ) -> RowSource {
+        let navigate = index.as_ref().is_some_and(|p| p.navigate);
         // the LEAF is the optimizer's choice; everything above it is
         // the same tree either way, which is what makes "the answers do
         // not move" a property of the shape rather than a hope
         let leaf = leaf_source(rel, formats, &index);
-        RowSource::Sort {
-            input: Box::new(RowSource::Filter { input: Box::new(leaf), pred }),
-            keys,
+        let filtered = RowSource::Filter { input: Box::new(leaf), pred };
+        // NAVIGATION: the index walked the rows in key order, so the
+        // sort above it would re-establish an order that is already
+        // there. Dropping it is only safe when that order is TOTAL and
+        // matches the clause - see `navigates`.
+        if navigate {
+            return filtered;
         }
+        RowSource::Sort { input: Box::new(filtered), keys }
     }
 }
 
@@ -9650,6 +9656,47 @@ struct IndexPick {
     lo: Option<(Vec<u8>, bool)>,
     /// upper bound; None is unbounded above
     hi: Option<(Vec<u8>, bool)>,
+    /// the walk already delivers the ORDER BY, so the sort above it is
+    /// unnecessary - the engine's `Access::Order`. See `navigates`.
+    navigate: bool,
+}
+
+/// Does the chosen index already deliver `order_by`, so the sort above
+/// it is unnecessary?
+///
+/// This is the engine's `Access::Order` - navigation - and the reason it
+/// is worth being careful about is that ROW ORDER IS PART OF THE ANSWER.
+/// A sort that is skipped wrongly does not lose rows; it hands back the
+/// right rows in an order the engine did not choose, and a twin gate
+/// compares sequences.
+///
+/// So the conditions are the ones under which the index's order is a
+/// TOTAL order matching the clause exactly:
+///
+///   - ONE key, ASCENDING, with no explicit NULLS placement (the
+///     default puts NULLs first ascending, which is where a zero-length
+///     key already sits);
+///   - a plain FIELD, not an expression;
+///   - the index is ASCENDING (a descending one complements its keys,
+///     so it walks values downward with NULLs at the wrong end) and
+///     SINGLE-SEGMENT on that field;
+///   - the index is UNIQUE and the column is NOT NULL, so there are no
+///     TIES. Duplicates come back in record-number order, which is an
+///     order the engine has not promised - and an all-NULL key is
+///     exempt from uniqueness, so a nullable unique column can tie too.
+fn navigates(db: &Database, table: &str, op: &IndexOp, order_by: &[OrderKey]) -> bool {
+    let [key] = order_by else { return false };
+    if key.desc || key.expr.is_some() || !matches!(key.nulls, NullsAt::Default) {
+        return false;
+    }
+    if op.descending || !op.unique {
+        return false;
+    }
+    let [(seg_fid, _, _)] = op.segs.as_slice() else { return false };
+    if *seg_fid != key.field {
+        return false;
+    }
+    not_null_fids(db, table).contains(&key.field)
 }
 
 /// The retrieval leaf for a relation: the optimizer's index, or a scan.
@@ -9706,12 +9753,15 @@ impl IndexPick {
 ///     excluded because a collation makes the key a collation key;
 ///   - no parameters: their values arrive at execute, and this runs at
 ///     prepare.
+#[allow(clippy::too_many_arguments)]
 fn choose_index(
     db: &Database,
     rel: u16,
+    table: &str,
     descs: &[Descriptor],
     filter: &Option<Predicate>,
     sql: &str,
+    order_by: &[OrderKey],
 ) -> Option<IndexPick> {
     use fire_crab_ods::btw;
     // FC_NO_INDEX forces the scan. It exists for the GATE: a coverage
@@ -9722,10 +9772,16 @@ fn choose_index(
     if std::env::var("FC_NO_INDEX").is_ok() {
         return None;
     }
-    let pred = filter.as_ref()?;
-    // one conjunctive term list: an OR of alternatives would need one
-    // retrieval per branch and a merge, which is a later slice
-    let [terms] = pred.0.as_slice() else { return None };
+    // One conjunctive term list: an OR of alternatives would need one
+    // retrieval per branch and a merge, which is a later slice. NO
+    // predicate at all is fine - an ORDER BY that the index already
+    // delivers is reason enough to walk it (the engine's Access::Order).
+    let empty: Vec<Term> = Vec::new();
+    let terms = match filter.as_ref().map(|p| p.0.as_slice()) {
+        None => &empty,
+        Some([t]) => t,
+        Some(_) => return None,
+    };
 
     // What would the engine do here? opt answers from the same catalog
     // and the same rules its PLAN gate holds against the live server.
@@ -9749,6 +9805,7 @@ fn choose_index(
     }
 
     let ops = resolve_index_ops(db, rel, descs)?;
+    let (mut best_bounded, mut best_nav): (Option<IndexPick>, Option<IndexPick>) = (None, None);
     // Collect every comparison in the conjunction that could bound an
     // indexed column, then keep the FIRST column an index can serve.
     // A conjunction narrows, so several bounds on one column combine:
@@ -9816,8 +9873,9 @@ fn choose_index(
             }
             bounded = true;
         }
-        if !bounded {
-            continue;
+        let nav = navigates(db, table, op, order_by);
+        if !bounded && !nav {
+            continue; // nothing to bound the walk and nothing to gain
         }
         // A DESCENDING index complements its keys, so the tree's byte
         // order is the REVERSE of the value order: the value-low bound
@@ -9826,7 +9884,22 @@ fn choose_index(
         if op.descending {
             std::mem::swap(&mut lo, &mut hi);
         }
-        return Some(IndexPick { id: op.id, lo, hi });
+        let pick = IndexPick { id: op.id, lo, hi, navigate: nav };
+        // BOUNDS BEAT NAVIGATION. An index that bounds the retrieval
+        // reads a few records; one that merely delivers the order walks
+        // the whole relation to save a sort. When they are the same
+        // index you get both, which is the case worth having - and it
+        // is opt's rule too (it navigates only when the ORDER BY's
+        // index IS the predicate's).
+        match (bounded, nav) {
+            (true, true) => return Some(pick),
+            (true, false) => best_bounded.get_or_insert(pick),
+            // (false, false) was skipped above
+            _ => best_nav.get_or_insert(pick),
+        };
+    }
+    if let Some(p) = best_bounded.or(best_nav) {
+        return Some(p);
     }
     None
 }
@@ -13178,10 +13251,13 @@ fn plan_query_inner(
                     |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
                 )?,
             };
-            let index = choose_index(db, rel, &descs, &filter, sql);
+            let index = choose_index(db, rel, table, &descs, &filter, sql, &order_by);
             if trace {
                 match &index {
-                    Some(p) => eprintln!("[srv] index scan: rel={} index={} lo={:?} hi={:?}", rel, p.id, p.lo, p.hi),
+                    Some(p) => eprintln!(
+                    "[srv] index scan: rel={} index={} lo={:?} hi={:?} navigate={}",
+                    rel, p.id, p.lo, p.hi, p.navigate
+                ),
                     None => eprintln!("[srv] natural scan: rel={}", rel),
                 }
             }
@@ -13223,12 +13299,12 @@ fn plan_query_inner(
             // declines (MIN/MAX over text or temporal, SUM/AVG over
             // scaled numerics, COUNT(DISTINCT)) fall THROUGH to the
             // group machinery, which types and computes them at fetch
-            let agg_index = choose_index(db, rel, &descs, &filter, sql);
+            let agg_index = choose_index(db, rel, table, &descs, &filter, sql, &[]);
             if trace {
                 match &agg_index {
                     Some(p) => eprintln!(
-                        "[srv] index scan: rel={} index={} lo={:?} hi={:?}",
-                        rel, p.id, p.lo, p.hi
+                        "[srv] index scan: rel={} index={} lo={:?} hi={:?} navigate={}",
+                        rel, p.id, p.lo, p.hi, p.navigate
                     ),
                     None => eprintln!("[srv] natural scan: rel={}", rel),
                 }
@@ -13352,10 +13428,13 @@ fn plan_query_inner(
                 }
             }
         };
-        let index = choose_index(db, rel, &descs, &filter, sql);
+        let index = choose_index(db, rel, table, &descs, &filter, sql, &order_by);
         if trace {
             match &index {
-                Some(p) => eprintln!("[srv] index scan: rel={} index={} lo={:?} hi={:?}", rel, p.id, p.lo, p.hi),
+                Some(p) => eprintln!(
+                    "[srv] index scan: rel={} index={} lo={:?} hi={:?} navigate={}",
+                    rel, p.id, p.lo, p.hi, p.navigate
+                ),
                 None => eprintln!("[srv] natural scan: rel={}", rel),
             }
         }
@@ -13380,12 +13459,12 @@ fn plan_query_inner(
         }) => {
             // the same choice the projection makes, at the same moment:
             // a fold reads its input through a retrieval like any other
-            let index = choose_index(db, rel, &descs, &filter, sql);
+            let index = choose_index(db, rel, table, &descs, &filter, sql, &[]);
             if trace {
                 match &index {
                     Some(p) => eprintln!(
-                        "[srv] index scan: rel={} index={} lo={:?} hi={:?}",
-                        rel, p.id, p.lo, p.hi
+                        "[srv] index scan: rel={} index={} lo={:?} hi={:?} navigate={}",
+                        rel, p.id, p.lo, p.hi, p.navigate
                     ),
                     None => eprintln!("[srv] natural scan: rel={}", rel),
                 }
@@ -32385,6 +32464,7 @@ mod tests {
             id: 2,
             lo: Some((vec![0xC0, 8], true)),
             hi: Some((vec![0xC0, 8], true)),
+            navigate: false,
         };
         let scan = RowSource::scan_filter_sort(128, Vec::new(), None, Vec::new(), None);
         let idx = RowSource::scan_filter_sort(128, Vec::new(), None, Vec::new(), Some(pick.clone()));
@@ -32405,6 +32485,27 @@ mod tests {
         };
         assert_eq!(leaf_of(&scan), "scan");
         assert_eq!(leaf_of(&idx), "index 2 Some(([192, 8], true))");
+
+        // NAVIGATION removes the Sort - and only navigation does. A
+        // sort dropped wrongly does not lose rows; it hands back the
+        // right rows in an order the engine did not choose.
+        let keys = vec![OrderKey { field: 0, expr: None, desc: false, nulls: NullsAt::Default }];
+        let sorted = RowSource::scan_filter_sort(
+            128,
+            Vec::new(),
+            None,
+            keys.clone(),
+            Some(pick.clone()),
+        );
+        assert!(matches!(sorted, RowSource::Sort { .. }));
+        let navigated = RowSource::scan_filter_sort(
+            128,
+            Vec::new(),
+            None,
+            keys,
+            Some(IndexPick { navigate: true, ..pick }),
+        );
+        assert!(matches!(navigated, RowSource::Filter { .. }));
     }
 
     #[test]

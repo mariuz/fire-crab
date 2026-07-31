@@ -7721,7 +7721,7 @@ fixed for the unquoted case only (`bare_ident_ok`), because `"3"` is a
 perfectly legal delimited identifier and the callers strip the quotes before
 asking.
 
-### The first index-driven retrieval (`qa/serve-real-index.sh`, 146 checks)
+### The first index-driven retrieval (`qa/serve-real-index.sh`, 171 checks)
 
 Two subsystems had been finished and left disconnected. `ods::btr` decoded
 index pages and walked leaf levels; `fire-crab-opt` reproduced the engine's
@@ -7822,12 +7822,41 @@ component that cannot read the statement must not be asked to bless it. The
 gate asserts the scan, so the day `opt` learns HAVING, that check is what
 notices.
 
-**What is not wired yet, named so it is not assumed.** `ORDER BY` via
-navigation (the sort still runs above an index-driven range), index-driven
-joins, text and scaled keys, compound prefixes, `OR` (which needs a retrieval
-per branch and a merge), `<>`, and parameters — whose values arrive after the
-plan is built. The roadmap counts thirty retrieval sites; this wires the
-projection's and the fold's.
+**Then navigation — the sort an index makes unnecessary.** An index walk
+already delivers its rows in key order, so the `Sort` above it re-establishes
+an order that is already there. Dropping it is the engine's `Access::Order`,
+and it is the one place in this whole slice where being wrong does not lose a
+row: it returns the *right* rows in an order the engine did not choose. A
+differential catches that only because row order is compared — which it is, and
+which is why the equivalence checks compare sequences from the navigating server
+and the sorting one.
+
+So navigation is taken only where the index's order is **total and identical**
+to the clause: one ascending key, no explicit NULLS placement, a plain field, an
+ascending single-segment index that is unique, and a NOT NULL column. The
+exclusions are each a way for two rows to tie, and each is gated:
+
+| excluded | why |
+|---|---|
+| `ORDER BY x DESC` | the walk goes the other way |
+| a non-unique index | duplicates come back in record-number order, which the engine never promised |
+| a unique index on a **nullable** column | an all-NULL key is exempt from uniqueness, so two rows share the empty key |
+| two keys, one segment | the index orders by the first only |
+| an explicit `NULLS LAST` | a zero-length key already sits first |
+
+Two decisions fell out of building it. An `ORDER BY` alone is now reason enough
+to use an index — until then a predicate was required, so the commonest ordered
+query in the language could not reach one. And **bounds beat navigation**: when
+the predicate's index and the order's index differ, the bounded retrieval wins
+and the sort runs, because reading a few records beats walking the whole
+relation to save a sort. When they are the same index you get both, which is the
+case worth having — and it is `opt`'s rule too.
+
+**What is not wired yet, named so it is not assumed.** Index-driven joins, text
+and scaled keys, compound prefixes, `OR` (which needs a retrieval per branch and
+a merge), `<>`, and parameters — whose values arrive after the plan is built.
+The roadmap counts thirty retrieval sites; this wires the projection's and the
+fold's.
 
 ## Benchmarks
 

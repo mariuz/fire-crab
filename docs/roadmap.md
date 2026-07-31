@@ -99,7 +99,7 @@ it", which is a different risk profile from converting something new:
 the oracle already exists, so the gate is *behaviour must not change*
 plus *the subsystem is now on the path*.
 
-- **W1 — index-driven retrieval.** *(equality, ranges and the fold's input done)* The first
+- **W1 — index-driven retrieval.** *(equality, ranges, the fold's input and ORDER BY navigation done)* The first
   slice that put a converted subsystem on the running server's path.
   `crates/wire/Cargo.toml` now depends on `fire-crab-opt`, and **opt
   makes the choice**: `plan_query` is asked about the statement, and only
@@ -116,8 +116,7 @@ plus *the subsystem is now on the path*.
     read their candidates through the same leaf. A key this cannot
     build byte-exactly would be a MISSED ROW rather than a refusal,
     which is why the mechanics are narrow and everything else scans.
-  - Still to do: `ORDER BY` via navigation (the index is used for the
-    range but the sort still runs), index-driven joins,
+  - Still to do: index-driven joins,
     text keys (a collation makes the key a collation key), compound
     prefixes, and parameters (their values arrive after the plan is
     built). Also: a statement `opt` cannot parse - a `HAVING`, for one -
