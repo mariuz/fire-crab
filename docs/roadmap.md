@@ -40,9 +40,9 @@ Replace textual rewriting with the engine's own structure: a tree of row
 sources (`RecordSource`/rsb in `src/jrd/`), built by the planner and
 pulled by the fetch.
 
-- **R1 — the tree exists.** A `RowSource` with `TableScan`, `Filter` and
+- **R1 — the tree exists.** *(done)* A `RowSource` with `TableScan`, `Filter` and
   `Sort`, and the simplest plan executing through it. No behaviour
-  change; the gates are the proof. *(this increment)*
+  change; the gates are the proof.
 - **R2 — Aggregate** is a node. *(done)* `group_output` and both grouped
   paths build `TableScan → Filter → Aggregate → Sort`; the fold itself
   (`group_rows`) now has exactly ONE caller, the node.
