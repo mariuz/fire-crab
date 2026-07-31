@@ -1534,6 +1534,22 @@ them.
   only because the gate was written to ask "and what does this value do
   next?" rather than to stop at the select list.
 
+- **Some differences are invisible to your oracle - pick a different
+  one.** A declared WIDTH is not a value, so a driver twin that returns
+  strings cannot see it; fire-crab announced 32765 for every text
+  function result and every value-comparing gate passed. The engine's own
+  command-line tool lays its columns out from the describe, so it renders
+  the difference as plain text: a 32765-wide column beside a 6-wide one.
+  When a property does not reach your comparison, find the consumer that
+  does surface it and compare THAT.
+
+- **Do not turn one probe into a law.** REPLACE's result width is some
+  function of the search and replacement lengths; one measurement fits
+  many formulas, so it keeps the catch-all declaration and the gate says
+  why. A rule you cannot state is a rule you should not encode - the
+  refusal to guess is itself worth writing down, or the next person
+  assumes it was checked.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

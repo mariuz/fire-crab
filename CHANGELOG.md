@@ -13,6 +13,40 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — the width of a text FUNCTION's result
+
+### Fixed
+- **A text function's result has a derived width, and fire-crab declared
+  the catch-all 32765 for all of them.** The values agreed, so no driver
+  twin could see it — but isql lays its columns out FROM THE DESCRIBE, so
+  `SELECT UPPER(V) FROM T` printed a **32765-wide column** where the
+  engine prints a 6-wide one, in the engine's own client.
+- The rules, each probed with `SET SQLDA_DISPLAY ON`:
+  - `UPPER`/`LOWER` keep the argument's FORM and width — so
+    `UPPER(<CHAR(6)>)` is CHAR(6) and pads.
+  - `TRIM` is VARYING at the argument's width.
+  - `LEFT`/`RIGHT`/`REVERSE` take the **source's** width, not the count:
+    `LEFT(V, 3)` over a VARCHAR(6) is VARYING(6).
+  - `SUBSTRING` takes its literal FOR length, or the source's width when
+    there is no FOR.
+  - `LPAD`/`RPAD` take their pad length.
+  - `a || b` is VARYING at the **sum** of the two widths.
+- `REPLACE` is deliberately left unsized: its bound is some function of
+  the search and replacement lengths, and one probe is not a law. It
+  keeps the catch-all declaration and the gate says so.
+
+`qa/serve-real-funcwidth.sh` is new, 32 checks, and it is the first gate
+here to compare **isql's rendered output verbatim** — header and
+separator included, because those lines ARE the width. A declared width
+is not a value, so the usual driver twin cannot see it; the engine's own
+tool can.
+
+It also names a standing deviation rather than hiding it: fire-crab
+computes integer arithmetic at full i64 and announces BIGINT where the
+engine announces INTEGER, so an arithmetic column's isql layout differs
+even though every value matches. That predates this increment, and the
+gate's numeric check is a plain column with a comment explaining why.
+
 ## 2026-07-31 — the width and form of a text result
 
 ### Fixed

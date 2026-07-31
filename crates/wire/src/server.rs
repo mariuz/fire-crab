@@ -2890,6 +2890,47 @@ fn text_form(e: &Expr, descs: &[Descriptor]) -> Option<(bool, i32)> {
             .reduce(widen)
             .flatten(),
         Expr::NullIf(a, _) => text_form(a, descs),
+        // CONCATENATION is always VARYING and as wide as the SUM of its
+        // operands (probed: CHAR(6) || VARCHAR(6) is VARYING(12))
+        Expr::Concat(a, b) => {
+            let (_, wa) = text_form(a, descs)?;
+            let (_, wb) = text_form(b, descs)?;
+            Some((true, wa + wb))
+        }
+        // Text-returning FUNCTIONS, each rule probed with SQLDA_DISPLAY:
+        //
+        //   UPPER/LOWER   keep the argument's FORM and width, so
+        //                 UPPER(<CHAR(6)>) is CHAR(6) and PADS
+        //   TRIM          always VARYING, the argument's width
+        //   LEFT/RIGHT/REVERSE  always VARYING, the SOURCE's width -
+        //                 not the count, which surprised: LEFT(V, 3)
+        //                 over a VARCHAR(6) is VARYING(6)
+        //   SUBSTRING     VARYING; the literal FOR length when there is
+        //                 one, else the source's width
+        //   LPAD/RPAD     VARYING at the literal pad length
+        //
+        // Anything else keeps None, which is the catch-all declaration.
+        Expr::Func(f, args) => {
+            let arg = |i: usize| args.get(i).and_then(|a| text_form(a, descs));
+            let lit = |i: usize| match args.get(i) {
+                Some(Expr::Int(n)) if *n >= 0 => Some(*n as i32),
+                _ => None,
+            };
+            match f {
+                SysFn::Upper | SysFn::Lower => arg(0),
+                SysFn::Trim(_) => arg(1).map(|(_, w)| (true, w)),
+                SysFn::Left | SysFn::Right | SysFn::Reverse => {
+                    arg(0).map(|(_, w)| (true, w))
+                }
+                SysFn::Substring => match (arg(0), lit(2)) {
+                    (Some((_, w)), None) if args.len() == 2 => Some((true, w)),
+                    (Some(_), Some(n)) => Some((true, n)),
+                    _ => None,
+                },
+                SysFn::Lpad | SysFn::Rpad => lit(1).map(|n| (true, n)),
+                _ => None,
+            }
+        }
         Expr::Iif(_, a, b) => widen(text_form(a, descs), text_form(b, descs)),
         Expr::Case(branches, else_) => {
             let mut acc: Option<(bool, i32)> = None;
@@ -25676,11 +25717,43 @@ mod tests {
         assert_eq!(padded.eval(&[]).unwrap(), Value::Text("ab    ".into()));
         assert!(!matches!(pad_conditional(mixed, &descs), Expr::Cast(..)));
 
-        // a function's width is not derived, which keeps the old
-        // catch-all declaration rather than a guessed one
+        // a text FUNCTION's width follows its own probed rule
+        let f = |sf: SysFn, a: Vec<Expr>| text_form(&Expr::Func(sf, a), &descs);
+        // UPPER keeps the argument's FORM: over a CHAR column it is CHAR
+        // and therefore pads; over a VARCHAR it does not
+        assert_eq!(f(SysFn::Upper, vec![Expr::Col(0)]), Some((false, 6)));
+        assert_eq!(f(SysFn::Upper, vec![Expr::Col(1)]), Some((true, 6)));
+        // TRIM is always VARYING, at the argument's width
         assert_eq!(
-            text_form(&Expr::Func(SysFn::Upper, vec![Expr::Col(1)]), &descs),
+            f(SysFn::Trim(TrimSide::Both), vec![lit(" "), Expr::Col(0)]),
+            Some((true, 6))
+        );
+        // LEFT takes the SOURCE's width, NOT the count - the surprise
+        assert_eq!(f(SysFn::Left, vec![Expr::Col(1), Expr::Int(3)]), Some((true, 6)));
+        assert_eq!(f(SysFn::Reverse, vec![Expr::Col(0)]), Some((true, 6)));
+        // SUBSTRING takes its literal FOR length, or the source's width
+        assert_eq!(
+            f(SysFn::Substring, vec![Expr::Col(0), Expr::Int(1), Expr::Int(3)]),
+            Some((true, 3))
+        );
+        assert_eq!(
+            f(SysFn::Substring, vec![Expr::Col(0), Expr::Int(2)]),
+            Some((true, 6))
+        );
+        // LPAD takes its pad length
+        assert_eq!(f(SysFn::Lpad, vec![Expr::Col(1), Expr::Int(9)]), Some((true, 9)));
+        // and REPLACE is deliberately unsized: one probe is not a law
+        assert_eq!(
+            f(SysFn::Replace, vec![Expr::Col(1), lit("a"), lit("bb")]),
             None
+        );
+        // CONCATENATION is VARYING at the SUM of its operands
+        assert_eq!(
+            text_form(
+                &Expr::Concat(Box::new(Expr::Col(0)), Box::new(Expr::Col(1))),
+                &descs
+            ),
+            Some((true, 12))
         );
     }
 
