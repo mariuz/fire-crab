@@ -13,6 +13,58 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — R7: the textual rewriting is gone
+
+The end of Programme R. A view was answered by **rewriting the query
+against its base table**; it is a **row source** now, like everything
+else the tree reaches.
+
+### Converted
+- **A VIEW is planned, not expanded.** Its stored SELECT is planned on
+  its own; the outer query resolves against that plan's DESCRIBE; its
+  declared column names are laid over the body's, positionally. In a
+  join it is a SIDE, which is R5a serving a second caller.
+- **~870 lines deleted**: `expand_view`, `expand_view_join`,
+  `qualify_idents`, `replace_qualified_col`, `mentions_bare`,
+  `replace_table_ref`, `replace_idents` — and with them the laws they
+  implemented by hand. The view's own WHERE going into a join step's ON
+  when the side can be NULL-padded, and into the outer WHERE when it
+  cannot, was an emulation of *the filter sits inside the inner plan,
+  below the padding*. The tree gets that by construction.
+- **The derived-table planner and the CTE planner became ONE
+  function** (`plan_over_source`): a query over a bound name, whose
+  source is either materialised rows or an inner plan. R6's recursive
+  CTE, R4's derived table and R7's view all enter through it.
+- **Three shapes the rewriting could not express now answer**: a view
+  whose own body JOINs (there was no single table to rewrite to), a view
+  under a RIGHT or FULL join, and a bare renamed column in a join.
+- **GROUP BY over a derived table** — a refusal R4 recorded — answers:
+  the fold above a materialised base is what a grouped join with no
+  parts already is.
+- **A derived table may name its own columns**: `(SELECT ...) X (A, B)`,
+  probed against the engine. That is also how a renaming CTE keeps its
+  names now, instead of the rewriting refusing it.
+- Every CTE is materialised as a derived table; the INLINING pass is
+  gone. A chain of CTEs is spliced into the next body in declaration
+  order, so each inner query names only real relations.
+
+### Fixed
+- **`qa/serve-real-alias.sh` could not pass.** Its second-phase liveness
+  check tested `$srv` — the first server's pid, cleared two lines
+  earlier — so the gate exited 1 before phase 2 ever ran. Twelve checks
+  had never executed. The mirror of a gate that cannot fail is a gate
+  that cannot pass, and both report something untrue.
+- **`ident_ok` accepts `3`**, so a derived table's column list would have
+  taken a numeric literal as a column name. An unquoted identifier starts
+  with a LETTER; a delimited one may be anything, and the callers that
+  have already stripped the quotes cannot tell the two apart. New
+  `bare_ident_ok` for the unquoted case. (The central fix breaks `"3"`,
+  which the engine accepts — the trap is worth stating rather than
+  papering over.)
+
+44 gates and 366 unit tests are the safety net; four gates promoted
+refusals to comparisons.
+
 ## 2026-07-31 — R6: WITH RECURSIVE, a fixpoint over the tree
 
 The capability the whole row-source programme was built toward: the one

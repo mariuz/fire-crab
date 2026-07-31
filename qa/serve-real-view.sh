@@ -138,22 +138,33 @@ case "$out$eng" in
     *) echo "DIFF a base column name resolved through the rename: fc=[$out] engine=[$eng]"; fail=1 ;;
 esac
 
-# 3. a view over a JOIN is outside this slice - it must FAIL, not answer
-#    a wrong row set
+# 3. a view over a JOIN - answered now that a view is a ROW SOURCE
+#    rather than a rewrite against base tables, so the view's own join
+#    is simply an inner plan. Compared through the ENGINE'S OWN isql,
+#    verbatim, because the rendered widths are part of the answer.
 "$ISQL" -q -b -user "$U" -pas "$P" "$DB" >/dev/null 2>&1 <<'SQL'
 CREATE TABLE U2 (ID INTEGER NOT NULL PRIMARY KEY, W INTEGER);
 COMMIT;
 INSERT INTO U2 VALUES (1, 100);
+INSERT INTO U2 VALUES (2, 200);
 COMMIT;
 CREATE VIEW VJ AS SELECT T.ID, U2.W FROM T JOIN U2 ON U2.ID = T.ID;
 COMMIT;
 SQL
-out=$(printf 'SELECT ID, W FROM VJ;\n' |
-      "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
-case "$out" in
-    *"Statement failed"*|*error*|*ERROR*)
-        echo "OK   teeth: a view over a JOIN is refused, not guessed at" ;;
-    *) echo "DIFF a view over a join answered [$out]"; fail=1 ;;
-esac
+for q in 'SELECT ID, W FROM VJ ORDER BY ID' 'SELECT COUNT(*) FROM VJ' \
+         'SELECT W FROM VJ WHERE ID = 1'; do
+    out=$(printf '%s;\n' "$q" |
+          "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
+    eng=$(printf '%s;\n' "$q" |
+          "$ISQL" -q -b -user "$U" -pas "$P" "$DB" 2>&1 | tr -s ' \n' ' ')
+    if [ "$out" = "$eng" ] && [ -n "$eng" ]; then
+        echo "OK   a view over a JOIN: $q"
+    else
+        echo "DIFF a view over a JOIN: $q"
+        echo "     fcwire: [$out]"
+        echo "     engine: [$eng]"
+        fail=1
+    fi
+done
 
 exit $fail

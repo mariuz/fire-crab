@@ -73,8 +73,21 @@ pulled by the fetch.
   `JoinPart` and `Plan::Join` now carry a ROW SOURCE instead of a
   relation id, so a side can be a scan or an inner plan. A materialised
   CTE can be a join side too, which was R5's stated refusal.
-- **R7 — retire the textual view/CTE rewriting** and the qualifier
-  passes that exist only to serve it.
+- **R7 — retire the textual view/CTE rewriting.** *(done)* A VIEW is a
+  ROW SOURCE: its stored SELECT is planned on its own and the outer
+  query resolves against that plan's DESCRIBE, exactly as over a derived
+  table; in a join it is a side, which is R5a again. `expand_view`,
+  `expand_view_join`, `qualify_idents`, `replace_qualified_col`,
+  `mentions_bare`, `replace_table_ref` and `replace_idents` are **gone** -
+  ~870 lines - and with them the WHERE-moving, the name-lending and the
+  renaming-through-text they implemented. Three shapes that refused
+  because the rewriting could not express them (a view over a JOIN, a
+  view under a RIGHT/FULL join, a bare renamed column in a join) now
+  answer, and the derived-table and CTE planners became ONE function.
+  What is left of the rewriting is a single FROM-ITEM replacement
+  (`FROM C` → `FROM (<body>) C`) into that planner. Removing even that
+  needs the planner to bind N names at once rather than one; the
+  refusals it still carries are listed with it.
 
 ### Programme W — wire the converted subsystems in
 

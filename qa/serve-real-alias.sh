@@ -113,8 +113,12 @@ done
 # server is listening". If the port was already taken, fcwire exited at
 # bind and every check below runs against the OTHER server - a gate that
 # reports success while measuring nothing. Fatal, not a warning.
-kill -0 $srv 2>/dev/null || {
-    echo "FAIL fcwire is not running - port $PORT already in use? (see the server log)"
+# $srv2, NOT $srv: the first server was killed and its variable cleared
+# two lines up, so checking it here tested the empty string and this gate
+# exited 1 before phase 2 ever ran - the mirror of a gate that cannot
+# fail is a gate that cannot pass, and both report something untrue.
+kill -0 $srv2 2>/dev/null || {
+    echo "FAIL fcwire is not running - port $((PORT + 1)) already in use? (see the server log)"
     exit 1
 }
 P2=$((PORT + 1))

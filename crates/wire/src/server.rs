@@ -9707,11 +9707,27 @@ fn parse_table_ref(s: &str) -> Option<TableRef<'_>> {
         if let Some(r) = rest.strip_prefix("AS ").or_else(|| rest.strip_prefix("as ")) {
             rest = r.trim();
         }
+        // `(SELECT ...) X (A, B)` names the derived table's columns; the
+        // list belongs to the REFERENCE, so it is kept with the paren
+        // span for `parse_derived_table` to read back
+        let span_end = match rest.find('(') {
+            Some(open) => {
+                let cl = matching_paren(rest.as_bytes(), open)?;
+                if !rest[cl + 1..].trim().is_empty() {
+                    return None;
+                }
+                rest = rest[..open].trim();
+                let base = rest.as_ptr() as usize;
+                let _ = base;
+                t.len()
+            }
+            None => close + 1,
+        };
         let alias = rest.trim_matches('"');
         if !ident_ok(alias) {
             return None;
         }
-        return Some(TableRef { table: &t[..close + 1], alias: Some(alias) });
+        return Some(TableRef { table: &t[..span_end], alias: Some(alias) });
     }
     let toks: Vec<&str> = s.split_whitespace().collect();
     let (table, alias) = match toks.as_slice() {
@@ -10208,7 +10224,7 @@ fn resolve_join_predicate(
 /// CTE of a recursive query, whose rows exist but whose name resolves to
 /// no relation. R5a made a side a ROW SOURCE, which is what makes this
 /// possible at all - a materialised buffer is as good a side as a scan.
-type BoundRows<'a> = (&'a str, &'a [ProjCol], &'a [Vec<Value>]);
+type BoundRows<'a> = (&'a str, &'a [ProjCol], &'a RowSource);
 
 fn plan_join(
     proj: &Proj,
@@ -10256,6 +10272,10 @@ fn plan_join_bound(
         // left is the paren span alone - reading it back with
         // `parse_derived_table` would look for an alias that is no
         // longer there.
+        // `parse_table_ref` has already split the alias off, so what is
+        // left is usually the paren span alone - EXCEPT when the
+        // reference carries a column list (`(SELECT ...) X (A, B)`),
+        // which stays with the span because it names the side's columns.
         let derived_inner = tr.table.trim().strip_prefix('(').and_then(|_| {
             let t = tr.table.trim();
             let close = matching_paren(t.as_bytes(), 0)?;
@@ -10263,15 +10283,26 @@ fn plan_join_bound(
             let up = mask_literals(&inner.to_ascii_uppercase());
             (find_word(&up, "SELECT", 0) == Some(0)).then(|| inner.to_string())
         });
+        let declared: Vec<String> = parse_derived_table(tr.table)
+            .map(|(_, _, c)| c)
+            .unwrap_or_default();
         if let Some(inner_sql) = derived_inner {
             let mut inner_params: Vec<Option<Descriptor>> = Vec::new();
             let inner = plan_query_inner(&inner_sql, db_opt, &mut inner_params)?;
             if !inner_params.is_empty() {
                 return None; // a `?` inside a derived side
             }
-            let inner_cols = output_cols_of(&inner);
+            let mut inner_cols = output_cols_of(&inner);
             if inner_cols.is_empty() {
                 return None;
+            }
+            if !declared.is_empty() {
+                if declared.len() != inner_cols.len() {
+                    return None;
+                }
+                for (c, n) in inner_cols.iter_mut().zip(declared.iter()) {
+                    c.name = n.clone();
+                }
             }
             let (columns, descs) = derived_view(&inner_cols);
             let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
@@ -10285,14 +10316,31 @@ fn plan_join_bound(
             });
             continue;
         }
+        // A VIEW is a side whose rows come from a PLAN. It has to be
+        // tried BEFORE `resolve_relation`, because a view IS a relation
+        // with an id - and one with no records of its own, so scanning
+        // it answers zero rows rather than failing.
+        if let Some((inner, view_cols)) = plan_view(db_opt, db, tr.table) {
+            let (columns, descs) = derived_view(&view_cols);
+            let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
+            sides.push(JoinSide {
+                key: tr.alias.unwrap_or(tr.table).to_string(),
+                src: RowSource::PlanRows(std::rc::Rc::new(inner)),
+                columns,
+                descs,
+                offset,
+                merged_away: Vec::new(),
+            });
+            continue;
+        }
         // the BOUND name is a side whose rows are already here
-        if let Some((bname, bcols, brows)) = bound {
+        if let Some((bname, bcols, bsrc)) = bound {
             if tr.table.eq_ignore_ascii_case(bname) {
                 let (columns, descs) = derived_view(bcols);
                 let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
                 sides.push(JoinSide {
                     key: tr.alias.unwrap_or(tr.table).to_string(),
-                    src: RowSource::Rows(brows.to_vec()),
+                    src: bsrc.clone(),
                     columns,
                     descs,
                     offset,
@@ -10729,12 +10777,165 @@ fn lookup_view(db: &Database, ctes: &[(String, ViewDef)], name: &str) -> Option<
 /// a relation. It is what a RECURSIVE CTE needs at every step - the
 /// recursive branch reads the rows accumulated so far, and the final
 /// query reads them all.
-fn plan_over_rows(
+/// Replace every FROM item naming one of `ctes` with a DERIVED TABLE
+/// over that CTE's body: `FROM C` becomes `FROM (<body>) C`.
+///
+/// This is what is left of the CTE rewriting, and the difference from
+/// what it replaced is the whole of R7. The old path EXPANDED a
+/// definition - it rewrote the outer query against base tables, moved
+/// the body's WHERE into the outer one, renamed columns through the text
+/// and lent names to tables so qualifiers still resolved. This moves ONE
+/// FROM ITEM and hands the body to the planner as a query of its own.
+///
+/// Returns None when a CTE cannot be materialised - the caller must
+/// REFUSE, since a CTE name left in the FROM refers to no relation and
+/// would reach the fixed-answer fallback.
+fn splice_ctes(sql: &str, ctes: &[(String, ViewDef)]) -> Option<String> {
+    let Some((from, join)) = split_query(sql).and_then(|(_, t, ..)| parse_from(t)) else {
+        return Some(sql.to_string());
+    };
+    // applied in DESCENDING offset order so an earlier splice does not
+    // move a later one's position
+    let mut splices: Vec<(usize, usize, String)> = Vec::new();
+    for tr in std::iter::once(&from).chain(join.iter().map(|(_, r, _, _)| r)) {
+        let Some((_, def)) = ctes.iter().find(|(n, _)| n.eq_ignore_ascii_case(tr.table)) else {
+            continue;
+        };
+        // An EXPLICIT column list RENAMES the body's columns, and a
+        // derived table carries the BODY's own names - so that
+        // combination would answer under the wrong ones and refuses
+        // instead. The list is explicit exactly when it DIFFERS from
+        // what the body itself names, which is the only signal here.
+        let body_cols: Vec<String> = split_query(def.source.trim())
+            .and_then(|(p, ..)| parse_projection(p))
+            .and_then(|proj| match proj {
+                Proj::Items(items) => items
+                    .iter()
+                    .map(|it| match it {
+                        SelItem::Col(c, alias) => Some(
+                            alias
+                                .clone()
+                                .unwrap_or_else(|| c.rsplit('.').next().unwrap_or(c).to_string())
+                                .to_ascii_uppercase(),
+                        ),
+                        SelItem::Expr(_, n) | SelItem::Gen(_, _, n) => {
+                            Some(n.to_ascii_uppercase())
+                        }
+                        SelItem::Agg(_, _, alias) => alias.clone().map(|a| a.to_ascii_uppercase()),
+                    })
+                    .collect::<Option<Vec<_>>>(),
+                Proj::Star => None,
+            })
+            .unwrap_or_default();
+        // A RENAMING column list is carried by the derived table's own
+        // column list - `WITH C (A, B) AS (<body>)` becomes
+        // `(<body>) C (A, B)`, which is what the engine writes too. The
+        // list is explicit exactly when it DIFFERS from what the body
+        // itself names, which is the only signal available here.
+        let rename = if !def.cols.is_empty() && def.cols != body_cols {
+            format!(" ({})", def.cols.join(", "))
+        } else {
+            String::new()
+        };
+        let alias = tr.alias.unwrap_or(tr.table).to_string();
+        // THE OFFSET COMES FROM THE SLICE, NOT FROM A TEXT SEARCH.
+        // `sql.find(name)` looks for the CTE's name and finds the `C`
+        // inside `SELECT`, splicing the body into the middle of the
+        // keyword. `tr.table` is a subslice of `sql`, so its position is
+        // arithmetic rather than a guess.
+        let head = tr.table.as_ptr() as usize - sql.as_ptr() as usize;
+        let end = match tr.alias {
+            Some(a) => a.as_ptr() as usize - sql.as_ptr() as usize + a.len(),
+            None => head + tr.table.len(),
+        };
+        splices.push((head, end - head, format!("({}) {}{}", def.source, alias, rename)));
+    }
+    let mut out = sql.to_string();
+    splices.sort_by(|a, b| b.0.cmp(&a.0));
+    for (at, len, text) in splices {
+        out = format!("{}{}{}", &out[..at], text, &out[at + len..]);
+    }
+    Some(out)
+}
+
+/// A VIEW as a ROW SOURCE: its stored SELECT is planned on its own, and
+/// its DECLARED column names are laid over the body's, positionally.
+///
+/// This is what replaced the textual expansion. The old path rewrote the
+/// outer query against the view's BASE TABLE - moving the view's WHERE
+/// into the outer one (or into a join step's ON, when the side could be
+/// NULL-padded), renaming columns through the text, and lending the
+/// view's name to the base as an alias so qualifiers still resolved.
+/// Every one of those was an emulation of what a nested row source does
+/// by construction.
+fn plan_view(db: &Option<Database>, dbr: &Database, name: &str) -> Option<(Plan, Vec<ProjCol>)> {
+    let vd = view_of(dbr, name)?;
+    let mut vparams: Vec<Option<Descriptor>> = Vec::new();
+    let inner = plan_query_inner(&vd.source, db, &mut vparams)?;
+    if !vparams.is_empty() || matches!(inner, Plan::Refused) {
+        return None;
+    }
+    let mut cols = output_cols_of(&inner);
+    if cols.is_empty() {
+        return None;
+    }
+    // A view NAMES its own columns - `CREATE VIEW V (A, B) AS SELECT
+    // ID, SALARY ...` - and the catalog holds those names whether they
+    // were written or inherited. The body supplies only the values.
+    if !vd.cols.is_empty() {
+        if vd.cols.len() != cols.len() {
+            return None;
+        }
+        for (c, n) in cols.iter_mut().zip(vd.cols.iter()) {
+            c.name = n.clone();
+        }
+    }
+    Some((inner, cols))
+}
+
+/// The statement with its FROM item replaced by a bare `<name>` - the
+/// one rewrite the tree still needs, and a much smaller one than
+/// expanding a definition: nothing but the FROM item moves, and what
+/// takes its place is a name the planner has already BOUND to a row
+/// source.
+fn sql_over_from(sql: &str, name: &str) -> String {
+    let Some((_, table_s, ..)) = split_query(sql) else {
+        return sql.to_string();
+    };
+    let at = table_s.as_ptr() as usize - sql.as_ptr() as usize;
+    format!("{}{}{}", &sql[..at], name, &sql[at + table_s.len()..])
+}
+
+/// What a bound name resolves to: rows already computed, or an inner
+/// plan to be pulled when the tree is. A recursive CTE binds the first;
+/// a derived table, a materialised CTE and a VIEW bind the second.
+enum BoundSrc {
+    Rows(Vec<Vec<Value>>),
+    Inner(Plan),
+}
+
+impl BoundSrc {
+    fn into_row_source(self) -> RowSource {
+        match self {
+            BoundSrc::Rows(rows) => RowSource::Rows(rows),
+            BoundSrc::Inner(plan) => RowSource::PlanRows(std::rc::Rc::new(plan)),
+        }
+    }
+    fn into_plan(self, cols: &[ProjCol]) -> Plan {
+        match self {
+            BoundSrc::Rows(rows) => Plan::ProcRows { cols: cols.to_vec(), rows },
+            BoundSrc::Inner(plan) => plan,
+        }
+    }
+}
+
+fn plan_over_source(
     sql: &str,
     name: &str,
     cols: &[ProjCol],
-    rows: Vec<Vec<Value>>,
+    src: BoundSrc,
     db: &Option<Database>,
+    params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Plan> {
     let (proj_s, table_s, where_s, group_s, having_s, order_s) = split_query(sql)?;
     let (from, join) = parse_from(table_s)?;
@@ -10744,8 +10945,7 @@ fn plan_over_rows(
     // about the join changes.
     if !join.is_empty() {
         let dbr = db.as_ref()?;
-        let mut params: Vec<Option<Descriptor>> = Vec::new();
-        let plan = plan_join_bound(
+        return plan_join_bound(
             &parse_projection(proj_s)?,
             &from,
             &join,
@@ -10755,10 +10955,9 @@ fn plan_over_rows(
             order_s,
             dbr,
             db,
-            &mut params,
-            Some((name, cols, &rows)),
-        )?;
-        return params.is_empty().then_some(plan);
+            params,
+            Some((name, cols, &src.into_row_source())),
+        );
     }
     if !from.table.eq_ignore_ascii_case(name) {
         return None; // the bound name must BE the FROM
@@ -10769,8 +10968,10 @@ fn plan_over_rows(
     // JOIN is already "fold this row source", so the same node serves
     // here with NO parts: the bound rows are the base and the fold sits
     // straight on top of them.
-    let items_for_group = match parse_projection(&unqualify_single(proj_s, &[alias, name])
-        .unwrap_or_else(|| proj_s.to_string()))?
+    // the alias qualifies these columns - or the name, when the FROM
+    // item carries no alias of its own
+    let unq = |t: &str| unqualify_single(t, &[alias]).unwrap_or_else(|| t.to_string());
+    let items_for_group = match parse_projection(&unq(proj_s))?
     {
         Proj::Items(v) => Some(v),
         Proj::Star => None,
@@ -10792,11 +10993,10 @@ fn plan_over_rows(
         let filter = match where_s {
             None => None,
             Some(ws) => Some(resolve_predicate(
-                tokenize(&unqualify_single(ws, &[alias, name]).unwrap_or_else(|| ws.to_string()))
-                    .and_then(|t| parse_predicate(&t, &mut np))?,
+                tokenize(&unq(ws)).and_then(|t| parse_predicate(&t, &mut np))?,
                 &columns,
                 &descs,
-                &mut Vec::new(),
+                params,
             )?),
         };
         let having = match having_s {
@@ -10821,7 +11021,7 @@ fn plan_over_rows(
             })?,
         };
         return Some(Plan::JoinGroup {
-            base: RowSource::Rows(rows),
+            base: src.into_row_source(),
             base_width: descs.len(),
             parts: Vec::new(),
             cols: gcols,
@@ -10834,7 +11034,6 @@ fn plan_over_rows(
             order_by,
         });
     }
-    let unq = |t: &str| unqualify_single(t, &[alias, name]).unwrap_or_else(|| t.to_string());
     let computed = Default::default();
     let mut out_cols: Vec<ProjCol> = Vec::new();
     match parse_projection(&unq(proj_s))? {
@@ -10870,12 +11069,9 @@ fn plan_over_rows(
             tokenize(&unq(ws)).and_then(|t| parse_predicate(&t, &mut np))?,
             &columns,
             &descs,
-            &mut Vec::new(),
+            params,
         )?),
     };
-    if np != 0 {
-        return None;
-    }
     let order_by = match order_s {
         None => Vec::new(),
         Some(os) => parse_order_by_expr(
@@ -10891,7 +11087,7 @@ fn plan_over_rows(
         )?,
     };
     Some(Plan::Derived {
-        inner: Box::new(Plan::ProcRows { cols: cols.to_vec(), rows }),
+        inner: Box::new(src.into_plan(cols)),
         cols: out_cols,
         filter,
         order_by,
@@ -11089,140 +11285,6 @@ fn view_of(db: &Database, name: &str) -> Option<ViewDef> {
     Some(ViewDef { source, cols: cols.into_iter().map(|(_, n)| n).collect() })
 }
 
-/// Replace whole-word identifiers using `map` (case-insensitive), leaving
-/// string literals alone. Used to turn a view's column names into the
-/// base table's inside the outer query's clauses.
-fn replace_idents(text: &str, map: &[(String, String)]) -> String {
-    let b: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0usize;
-    while i < b.len() {
-        if b[i] == '\'' {
-            out.push(b[i]);
-            i += 1;
-            while i < b.len() {
-                out.push(b[i]);
-                if b[i] == '\'' {
-                    i += 1;
-                    if i < b.len() && b[i] == '\'' {
-                        out.push(b[i]);
-                        i += 1;
-                        continue;
-                    }
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$' {
-            let start = i;
-            while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$') {
-                i += 1;
-            }
-            let word: String = b[start..i].iter().collect();
-            match map.iter().find(|(from, _)| from.eq_ignore_ascii_case(&word)) {
-                Some((_, to)) => out.push_str(to),
-                None => out.push_str(&word),
-            }
-            continue;
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    out
-}
-
-/// Rewrite `alias.col` where `col` is a RENAMED view column, leaving the
-/// qualifier in place: `V.DID` becomes `V.DEPT_ID`.
-///
-/// Global substitution is wrong here - a join has more than one side, and
-/// the same word can be one side's view column and another side's real
-/// one. The qualifier is what says which, so only qualified references
-/// are rewritten; a BARE reference to a renamed column is caught by the
-/// caller and refused rather than guessed at.
-fn replace_qualified_col(text: &str, alias: &str, map: &[(String, String)]) -> String {
-    let b: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0usize;
-    while i < b.len() {
-        if b[i] == '\'' {
-            out.push(b[i]);
-            i += 1;
-            while i < b.len() {
-                out.push(b[i]);
-                if b[i] == '\'' {
-                    i += 1;
-                    if i < b.len() && b[i] == '\'' {
-                        out.push(b[i]);
-                        i += 1;
-                        continue;
-                    }
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if b[i].is_alphabetic() || b[i] == '_' {
-            let start = i;
-            while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$') {
-                i += 1;
-            }
-            let word: String = b[start..i].iter().collect();
-            // `<alias> . <col>` - the dot binds tightly, no spaces
-            if word.eq_ignore_ascii_case(alias) && i < b.len() && b[i] == '.' {
-                let ts = i + 1;
-                let mut te = ts;
-                while te < b.len() && (b[te].is_alphanumeric() || b[te] == '_' || b[te] == '$') {
-                    te += 1;
-                }
-                let tail: String = b[ts..te].iter().collect();
-                if let Some((_, to)) = map.iter().find(|(f, _)| f.eq_ignore_ascii_case(&tail)) {
-                    out.push_str(&word);
-                    out.push('.');
-                    out.push_str(to);
-                    i = te;
-                    continue;
-                }
-            }
-            out.push_str(&word);
-            continue;
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    out
-}
-
-/// Does `text` mention any of these names WITHOUT a qualifier?
-fn mentions_bare(text: &str, names: &[String]) -> bool {
-    let b: Vec<char> = text.chars().collect();
-    let mut i = 0usize;
-    let mut in_str = false;
-    while i < b.len() {
-        if b[i] == '\'' {
-            in_str = !in_str;
-            i += 1;
-            continue;
-        }
-        if !in_str && (b[i].is_alphabetic() || b[i] == '_') {
-            let start = i;
-            while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$') {
-                i += 1;
-            }
-            let qualified = start > 0 && b[start - 1] == '.';
-            let word: String = b[start..i].iter().collect();
-            if !qualified && names.iter().any(|n| n.eq_ignore_ascii_case(&word)) {
-                return true;
-            }
-            continue;
-        }
-        i += 1;
-    }
-    false
-}
-
 /// Drop a qualifier that names the query's ONE relation: `E.ID` and
 /// `EMP.ID` both mean `ID` when the FROM is `EMP E`.
 ///
@@ -11333,437 +11395,6 @@ fn unqualify_single(text: &str, allowed: &[&str]) -> Option<String> {
         i += 1;
     }
     hit.then_some(out)
-}
-
-/// Replace an identifier only where it stands as a TABLE REFERENCE - not
-/// as a qualifier (`V.C`), not as a column, and not inside a string.
-/// What separates the two is a dot on either side.
-fn replace_table_ref(text: &str, from: &str, to: &str) -> String {
-    let b: Vec<char> = text.chars().collect();
-    let mut out = String::new();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == '\'' {
-            out.push(b[i]);
-            i += 1;
-            while i < b.len() {
-                out.push(b[i]);
-                if b[i] == '\'' {
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if b[i].is_alphabetic() || b[i] == '_' {
-            let start = i;
-            while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$') {
-                i += 1;
-            }
-            let word: String = b[start..i].iter().collect();
-            let after_dot = start > 0 && b[start - 1] == '.';
-            let before_dot = i < b.len() && b[i] == '.';
-            if word.eq_ignore_ascii_case(from) && !after_dot && !before_dot {
-                out.push_str(to);
-            } else {
-                out.push_str(&word);
-            }
-            continue;
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    out
-}
-
-/// A view used as a SIDE of a join. The single-table path rewrites the
-/// whole query - projection, WHERE, GROUP BY - because it can rename the
-/// view's columns to the base's freely. In a join it CANNOT: a bare name
-/// belongs to whichever side owns it, and renaming it blindly would also
-/// rename a same-named column of the other table.
-///
-/// So this handles the case that needs NO renaming - a view whose columns
-/// carry the base's own names, which is what `CREATE VIEW V AS SELECT A,
-/// B FROM T` makes - and rewrites only two things: the FROM (the view's
-/// name becomes the base table's, keeping the alias, so every qualified
-/// reference still resolves) and the WHERE (the view's own condition,
-/// QUALIFIED by that alias, ANDed with the outer one).
-///
-/// A view with renamed columns refuses. That wants an alias-aware rewrite
-/// of every reference in the statement, which is a different piece of
-/// work from this one.
-fn expand_view_join(
-    sql: &str,
-    db: &Database,
-    ctes: &[(String, ViewDef)],
-    table_s: &str,
-    where_s: Option<&str>,
-    from: &TableRef<'_>,
-    join: &[(JoinKind, TableRef<'_>, &str, usize)],
-) -> Option<String> {
-    // A RIGHT or FULL join makes an EARLIER side nullable, and which side
-    // a view's own WHERE belongs to then stops being a local question.
-    // Refuse rather than guess.
-    if join
-        .iter()
-        .any(|(k, _, _, _)| matches!(k, JoinKind::Right | JoinKind::Full))
-        && std::iter::once(from)
-            .chain(join.iter().map(|(_, r, _, _)| r))
-            .any(|tr| lookup_view(db, ctes, tr.table).is_some())
-    {
-        return None;
-    }
-    // (alias, view name, base table, the view's own WHERE, step index -
-    // None for the base table)
-    let mut expansions: Vec<(String, String, String, Option<String>, Option<usize>, Vec<(String, String)>)> =
-        Vec::new();
-    let mut any = false;
-    for (step, tr) in std::iter::once((None, from))
-        .chain(join.iter().enumerate().map(|(i, (_, r, _, _))| (Some(i), r)))
-    {
-        let Some(vd) = lookup_view(db, ctes, tr.table) else { continue };
-        any = true;
-        let (vproj, vtable, vwhere, vgroup, vhaving, vorder) = split_query(&vd.source)?;
-        if vgroup.is_some() || vhaving.is_some() || vorder.is_some() {
-            return None;
-        }
-        let (vfrom, vjoin) = parse_from(vtable)?;
-        if !vjoin.is_empty() || lookup_view(db, ctes, vfrom.table).is_some() {
-            return None; // a view over a join, or over another view
-        }
-        let base_cols: Vec<String> = match parse_projection(vproj)? {
-            Proj::Items(items) => items
-                .iter()
-                .map(|it| match it {
-                    SelItem::Col(c, _) => Some(c.clone()),
-                    _ => None,
-                })
-                .collect::<Option<Vec<_>>>()?,
-            Proj::Star => return None,
-        };
-        if base_cols.len() != vd.cols.len() {
-            return None;
-        }
-        // RENAMED columns are carried as a map rather than refused: the
-        // reference is rewritten under its qualifier (`V.DID` ->
-        // `V.DEPT_ID`) and the select list aliases the view's name back
-        // on, since that is what the describe must say
-        let renames: Vec<(String, String)> = vd
-            .cols
-            .iter()
-            .zip(base_cols.iter())
-            .filter(|(v, b)| !v.eq_ignore_ascii_case(b))
-            .map(|(v, b)| (v.clone(), b.clone()))
-            .collect();
-        expansions.push((
-            tr.alias.unwrap_or(tr.table).to_string(),
-            tr.table.to_string(),
-            vfrom.table.to_string(),
-            vwhere.map(|w| w.to_string()),
-            step,
-            renames,
-        ));
-    }
-    if !any {
-        return None;
-    }
-    // Where a view's own WHERE goes is decided by whether that side can
-    // be NULL-PADDED. A padded row's columns are all NULL, so a predicate
-    // in the outer WHERE would throw the padded row away - the view's
-    // rows must be filtered BEFORE the padding, which is what putting the
-    // predicate in that step's ON means. The base table is never padded
-    // here (the RIGHT/FULL case was refused above), so its own WHERE goes
-    // to the outer WHERE, where it belongs.
-    let mut new_from = table_s.to_string();
-    let mut conds: Vec<String> = Vec::new();
-    let mut splices: Vec<(usize, usize, String)> = Vec::new();
-    for (alias, _, _, vwhere, step, _) in &expansions {
-        let Some(w) = vwhere else { continue };
-        let q = qualify_idents(w, alias);
-        match step {
-            None => conds.push(format!("({})", q)),
-            Some(i) => {
-                let (kind, _, on, _) = &join[*i];
-                if *on == CROSS_ON || *on == NATURAL_ON {
-                    // no ON text to attach to: only sound where the side
-                    // cannot be padded
-                    if !matches!(kind, JoinKind::Inner) {
-                        return None;
-                    }
-                    conds.push(format!("({})", q));
-                } else {
-                    let off = on.as_ptr() as usize - table_s.as_ptr() as usize;
-                    if off + on.len() > table_s.len() {
-                        return None;
-                    }
-                    splices.push((off, on.len(), format!("({}) AND ({})", on, q)));
-                }
-            }
-        }
-    }
-    splices.sort_by(|a, b| b.0.cmp(&a.0));
-    for (off, len, text) in splices {
-        new_from.replace_range(off..off + len, &text);
-    }
-    for (alias, view, base, _, _, _) in &expansions {
-        // Only in TABLE position: the FROM text contains the ON
-        // conditions too, and `VEMP.DEPT_ID` there must keep its
-        // qualifier - an unaliased view lends its NAME to the base table
-        // as an alias, which is what makes that reference still resolve.
-        let to = if alias.eq_ignore_ascii_case(view) {
-            format!("{} {}", base, alias)
-        } else {
-            base.clone()
-        };
-        new_from = replace_table_ref(&new_from, view, &to);
-    }
-    if let Some(w) = where_s {
-        conds.push(format!("({})", w));
-    }
-    let (proj_s, _, _, group_s, having_s, order_s) = split_query(sql)?;
-
-    // Every RENAMED view column, rewritten under its own qualifier. A
-    // BARE reference to one is refused instead: with more than one side
-    // in scope, the same word can be this view's renamed column and
-    // another table's real one, and only the qualifier says which.
-    let renamed_names: Vec<String> = expansions
-        .iter()
-        .flat_map(|(_, _, _, _, _, r)| r.iter().map(|(v, _)| v.clone()))
-        .collect();
-    let sub_q = |t: &str| -> String {
-        let mut acc = t.to_string();
-        for (alias, _, _, _, _, renames) in &expansions {
-            if !renames.is_empty() {
-                acc = replace_qualified_col(&acc, alias, renames);
-            }
-        }
-        acc
-    };
-    if !renamed_names.is_empty() {
-        let mut all = format!("{} {}", proj_s, new_from);
-        for extra in [where_s, group_s, having_s, order_s].into_iter().flatten() {
-            all.push(' ');
-            all.push_str(extra);
-        }
-        // the view's OWN where is written in the BASE table's names, so
-        // it is not part of this test
-        if mentions_bare(&sub_q(&all), &renamed_names) {
-            return None;
-        }
-    }
-    new_from = sub_q(&new_from);
-    let conds: Vec<String> = conds.iter().map(|c| sub_q(c)).collect();
-
-    // a projected view column keeps the VIEW's name in the describe, so
-    // a rewritten bare item is aliased back to what the client asked for
-    let proj_out = split_top_level_commas(proj_s)
-        .iter()
-        .map(|item| {
-            let (expr, alias) = split_alias(item);
-            let bare = expr.trim().rsplit('.').next().unwrap_or("").trim();
-            let renamed = alias.is_none()
-                && renamed_names.iter().any(|n| n.eq_ignore_ascii_case(bare));
-            if renamed {
-                format!("{} AS {}", sub_q(item).trim(), bare)
-            } else {
-                sub_q(item).trim().to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let mut out = format!("SELECT {} FROM {}", proj_out, new_from);
-    if !conds.is_empty() {
-        out.push_str(&format!(" WHERE {}", conds.join(" AND ")));
-    }
-    if let Some(g) = group_s {
-        out.push_str(&format!(" GROUP BY {}", sub_q(g)));
-    }
-    if let Some(h) = having_s {
-        out.push_str(&format!(" HAVING {}", sub_q(h)));
-    }
-    if let Some(o) = order_s {
-        out.push_str(&format!(" ORDER BY {}", sub_q(o)));
-    }
-    Some(out)
-}
-
-/// Prefix every bare column name in a view's own WHERE with the alias the
-/// view has in the outer query. Safe because that text can only name the
-/// view's base table's columns - there is no other side in scope there.
-fn qualify_idents(text: &str, alias: &str) -> String {
-    let b: Vec<char> = text.chars().collect();
-    let mut out = String::new();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == '\'' {
-            out.push(b[i]);
-            i += 1;
-            while i < b.len() {
-                out.push(b[i]);
-                if b[i] == '\'' {
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if b[i].is_alphabetic() || b[i] == '_' {
-            let start = i;
-            while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$') {
-                i += 1;
-            }
-            let word: String = b[start..i].iter().collect();
-            let kw = matches!(
-                word.to_ascii_uppercase().as_str(),
-                "AND" | "OR" | "NOT" | "IS" | "NULL" | "LIKE" | "BETWEEN" | "IN"
-                    | "TRUE" | "FALSE" | "UNKNOWN" | "ESCAPE"
-            );
-            // already qualified, or a keyword: leave it alone
-            let qualified = start > 0 && b[start - 1] == '.';
-            let has_qual = i < b.len() && b[i] == '.';
-            if kw || qualified || has_qual {
-                out.push_str(&word);
-            } else {
-                out.push_str(&format!("{}.{}", alias, word));
-            }
-            continue;
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    out
-}
-
-/// If `sql`'s FROM names a VIEW, rewrite the query against the view's
-/// base table and return it for the planner to re-plan. None when the
-/// FROM is an ordinary table or the view is outside the supported shape.
-fn expand_view(sql: &str, db: &Database, ctes: &[(String, ViewDef)]) -> Option<String> {
-    let (proj_s, table_s, where_s, group_s, having_s, order_s) = split_query(sql)?;
-    let (from, join) = parse_from(table_s)?;
-    if !join.is_empty() {
-        return expand_view_join(sql, db, ctes, table_s, where_s, &from, &join);
-    }
-    let vd = lookup_view(db, ctes, from.table)?;
-    // the view's own source must be a single-table projection of bare
-    // columns; anything else would need real RSE merging
-    let (vproj, vtable, vwhere, vgroup, vhaving, vorder) = split_query(&vd.source)?;
-    if vgroup.is_some() || vhaving.is_some() || vorder.is_some() {
-        return None;
-    }
-    let (vfrom, vjoin) = parse_from(vtable)?;
-    if !vjoin.is_empty() {
-        return None;
-    }
-    // the base must be a TABLE, not another view
-    if lookup_view(db, ctes, vfrom.table).is_some() {
-        return None;
-    }
-    let base_cols: Vec<String> = match parse_projection(vproj)? {
-        Proj::Items(items) => items
-            .iter()
-            .map(|it| match it {
-                SelItem::Col(c, _) => Some(c.clone()),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()?,
-        Proj::Star => return None, // `SELECT *` in a view: the positional
-                                   // mapping would have to be inferred
-    };
-    if base_cols.len() != vd.cols.len() {
-        return None;
-    }
-    // view column name -> base column name, skipping the identity pairs
-    let map: Vec<(String, String)> = vd
-        .cols
-        .iter()
-        .zip(base_cols.iter())
-        .filter(|(v, b)| !v.eq_ignore_ascii_case(b))
-        .map(|(v, b)| (v.clone(), b.clone()))
-        .collect();
-    let sub = |t: &str| -> String {
-        if map.is_empty() { t.to_string() } else { replace_idents(t, &map) }
-    };
-
-    // A RENAMED column keeps the VIEW's name in the describe. Rewriting
-    // `EID` to the base's `ID` answers the right VALUE under the wrong
-    // NAME, which a driver builds its row objects from - and when a view
-    // SWAPS two names (`SELECT NAME AS ID, ID AS NAME`) the values end up
-    // attached to each other's names, so `row.ID` differs between the two
-    // servers. Every rewritten reference in the SELECT LIST is therefore
-    // aliased back to the name the client asked for.
-    let view_name_of = |item: &str| -> Option<String> {
-        let (expr, alias) = split_alias(item);
-        if alias.is_some() {
-            return None; // the client named it; that name wins
-        }
-        // a bare column, with or without a qualifier
-        let bare = expr.trim().rsplit('.').next()?.trim();
-        if !ident_ok(bare) {
-            return None;
-        }
-        vd.cols
-            .iter()
-            .find(|c| c.eq_ignore_ascii_case(bare))
-            .map(|c| c.clone())
-    };
-
-    // `SELECT *` over the view lists the view's columns explicitly, so
-    // the outer projection keeps naming what the client asked for
-    let proj_out = match parse_projection(proj_s)? {
-        Proj::Star => vd
-            .cols
-            .iter()
-            .zip(base_cols.iter())
-            .map(|(v, b)| {
-                if v.eq_ignore_ascii_case(b) {
-                    b.clone()
-                } else {
-                    format!("{} AS {}", b, v)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", "),
-        _ => split_top_level_commas(proj_s)
-            .iter()
-            .map(|item| match view_name_of(item) {
-                Some(name) => format!("{} AS {}", sub(item).trim(), name),
-                None => sub(item).trim().to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(", "),
-    };
-    // The view's own name (or the alias the query gave it) stays in
-    // scope: `SELECT V.EID FROM VREN V` and `SELECT VREN.EID FROM VREN`
-    // both qualify by something that is about to stop existing, so the
-    // base table inherits it as an alias.
-    let mut out = format!(
-        "SELECT {} FROM {} {}",
-        proj_out,
-        vfrom.table,
-        from.alias.unwrap_or(from.table)
-    );
-    // the view's WHERE and the outer one both apply
-    match (vwhere, where_s) {
-        (Some(a), Some(b)) => {
-            out.push_str(&format!(" WHERE ({}) AND ({})", a, sub(b)));
-        }
-        (Some(a), None) => out.push_str(&format!(" WHERE {}", a)),
-        (None, Some(b)) => out.push_str(&format!(" WHERE {}", sub(b))),
-        (None, None) => {}
-    }
-    if let Some(g) = group_s {
-        out.push_str(&format!(" GROUP BY {}", sub(g)));
-    }
-    if let Some(h) = having_s {
-        out.push_str(&format!(" HAVING {}", sub(h)));
-    }
-    if let Some(o) = order_s {
-        out.push_str(&format!(" ORDER BY {}", sub(o)));
-    }
-    Some(out)
 }
 
 // ===================================================================
@@ -12338,7 +11969,7 @@ fn plan_query_inner(
             // produces the first rows, then the recursive branch is
             // evaluated AGAINST WHAT HAS ACCUMULATED, over and over,
             // until it produces nothing new. `RowSource`'s materialised
-            // leaf is the accumulator; `plan_over_rows` is what lets the
+            // leaf is the accumulator; `plan_over_source` is what lets the
             // branch read it.
             // `WITH RECURSIVE` is a DECLARATION, not a fact: a body that
             // never names itself is an ordinary CTE and takes the
@@ -12398,7 +12029,16 @@ fn plan_query_inner(
                     if frontier.is_empty() {
                         break;
                     }
-                    let Some(step) = plan_over_rows(&rec_sql, name, &cols, frontier, db) else {
+                    let mut rec_params: Vec<Option<Descriptor>> = Vec::new();
+                    let step = plan_over_source(
+                        &rec_sql,
+                        name,
+                        &cols,
+                        BoundSrc::Rows(frontier),
+                        db,
+                        &mut rec_params,
+                    );
+                    let Some(step) = step.filter(|_| rec_params.is_empty()) else {
                         return Some({ if trace { eprintln!("[srv] recursive CTE refused: the recursive branch does not plan over the accumulated rows"); } Plan::Refused });
                     };
                     let Some(next) = branch_rows(&step, dbr, &[]) else {
@@ -12426,7 +12066,15 @@ fn plan_query_inner(
                     }
                     None => (main.clone(), false, 0, None),
                 };
-                let Some(plan) = plan_over_rows(&final_sql, name, &cols, acc, db) else {
+                let plan = plan_over_source(
+                    &final_sql,
+                    name,
+                    &cols,
+                    BoundSrc::Rows(acc),
+                    db,
+                    params,
+                );
+                let Some(plan) = plan else {
                     return Some({ if trace { eprintln!("[srv] recursive CTE refused: the final query does not plan over the accumulated rows"); } Plan::Refused });
                 };
                 if !distinct && skip == 0 && take.is_none() {
@@ -12452,15 +12100,16 @@ fn plan_query_inner(
                 Some(_) => return Some(Plan::Refused), // modifiers out of order
                 None => (main, None),
             };
-            // each pass expands one FROM; a chain of CTEs referring to
-            // earlier ones needs one pass each, and the bound stops a
-            // self-referencing name from looping
-            for _ in 0..8 {
-                match expand_view(&cur, dbr, &ctes) {
-                    Some(next) => cur = next,
-                    None => break,
-                }
+            // A chain of CTEs refers to EARLIER ones, so each body is
+            // materialised into the next before the main query is: after
+            // this, every CTE name that appears anywhere stands for a
+            // derived table whose inner query names only real relations.
+            let mut ctes = ctes;
+            for i in 1..ctes.len() {
+                let (earlier, rest) = ctes.split_at_mut(i);
+                rest[0].1.source = splice_ctes(&rest[0].1.source, earlier)?;
             }
+            let ctes = ctes;
             // A CTE NAME STILL IN THE FROM was not expanded - its body
             // is something the view expansion cannot substitute (it
             // GROUPS, it JOINS, it stars). MATERIALISE IT INSTEAD: a CTE
@@ -12477,82 +12126,9 @@ fn plan_query_inner(
             // be one side of a join now that a derived table can be.
             // The splices are applied in DESCENDING offset order so an
             // earlier one does not move a later one's position.
-            let mut splices: Vec<(usize, usize, String)> = Vec::new();
-            if let Some((from, join)) = split_query(&cur).and_then(|(_, t, _, _, _, _)| parse_from(t))
-            {
-                for tr in std::iter::once(&from).chain(join.iter().map(|(_, r, _, _)| r)) {
-                    if let Some((_, def)) =
-                        ctes.iter().find(|(n, _)| n.eq_ignore_ascii_case(tr.table))
-                    {
-                        // An EXPLICIT column list RENAMES the body's
-                        // columns, and a derived table carries the
-                        // BODY's own names - so that combination would
-                        // answer under the wrong ones and refuses
-                        // instead. The list is explicit exactly when it
-                        // DIFFERS from what the body itself names, which
-                        // is the only signal available here: `WITH C (A,
-                        // B) AS (SELECT ID, SALARY ...)` and `WITH C AS
-                        // (SELECT ID, SALARY ...)` reach this point
-                        // holding cols the same way.
-                        let body_cols: Vec<String> = split_query(def.source.trim())
-                            .and_then(|(p, _, _, _, _, _)| parse_projection(p))
-                            .and_then(|proj| match proj {
-                                Proj::Items(items) => items
-                                    .iter()
-                                    .map(|it| match it {
-                                        SelItem::Col(c, alias) => Some(
-                                            alias
-                                                .clone()
-                                                .unwrap_or_else(|| {
-                                                    c.rsplit('.').next().unwrap_or(c).to_string()
-                                                })
-                                                .to_ascii_uppercase(),
-                                        ),
-                                        SelItem::Expr(_, n) | SelItem::Gen(_, _, n) => {
-                                            Some(n.to_ascii_uppercase())
-                                        }
-                                        SelItem::Agg(_, _, alias) => {
-                                            alias.clone().map(|a| a.to_ascii_uppercase())
-                                        }
-                                    })
-                                    .collect::<Option<Vec<_>>>(),
-                                Proj::Star => None,
-                            })
-                            .unwrap_or_default();
-                        if !def.cols.is_empty() && def.cols != body_cols {
-                            return Some(Plan::Refused);
-                        }
-                        let alias = tr.alias.unwrap_or(tr.table).to_string();
-                        // THE OFFSET COMES FROM THE SLICE, NOT FROM A
-                        // TEXT SEARCH. `cur.find(name)` looks for the
-                        // CTE's name and finds the `C` inside `SELECT`,
-                        // splicing the body into the middle of the
-                        // keyword. `tr.table` is a subslice of `cur`, so
-                        // its position is arithmetic rather than a guess.
-                        let head = tr.table.as_ptr() as usize - cur.as_ptr() as usize;
-                        // the name, plus any alias that followed it
-                        let end = match tr.alias {
-                            Some(a) => {
-                                a.as_ptr() as usize - cur.as_ptr() as usize + a.len()
-                            }
-                            None => head + tr.table.len(),
-                        };
-                        splices.push((
-                            head,
-                            end - head,
-                            format!("({}) {}", def.source, alias),
-                        ));
-                    }
-                }
-            }
-            if !splices.is_empty() {
-                splices.sort_by(|a, b| b.0.cmp(&a.0));
-                for (at, len, text) in splices {
-                    cur = format!("{}{}{}", &cur[..at], text, &cur[at + len..]);
-                }
-                if trace {
-                    eprintln!("[srv] plan: CTE materialised as {:?}", cur);
-                }
+            cur = splice_ctes(&cur, &ctes)?;
+            if trace {
+                eprintln!("[srv] plan: CTEs materialised as {:?}", cur);
             }
             // Anything still naming a CTE names NO RELATION - falling
             // through would reach the fixed-answer fallback and reply
@@ -12703,8 +12279,8 @@ fn plan_query_inner(
     // catalog entry to read a format from. Everything above it - the
     // projection, the WHERE, the ORDER BY - is resolved exactly as it
     // would be over a real relation, against that synthetic view.
-    if let Some(dbr) = db.as_ref() {
-        if let Some((inner_sql, alias)) = parse_derived_table(table_s) {
+    if let Some(_dbr) = db.as_ref() {
+        if let Some((inner_sql, alias, declared)) = parse_derived_table(table_s) {
             let mut inner_params: Vec<Option<Descriptor>> = Vec::new();
             let Some(inner) = plan_query_inner(&inner_sql, db, &mut inner_params) else {
                 if trace {
@@ -12715,88 +12291,40 @@ fn plan_query_inner(
             if !inner_params.is_empty() {
                 return Some(Plan::Refused); // a `?` inside a derived table
             }
-            let inner_cols = output_cols_of(&inner);
+            let mut inner_cols = output_cols_of(&inner);
             if inner_cols.is_empty() {
                 return Some(Plan::Refused);
             }
-            let (columns, descs) = derived_view(&inner_cols);
-            // the alias qualifies its columns, exactly as a table's name
-            // or alias does - and is stripped the same way
-            let unq = |t: &str| {
-                unqualify_single(t, &[alias.as_str()]).unwrap_or_else(|| t.to_string())
-            };
-            let computed = Default::default();
-            let mut cols: Vec<ProjCol> = Vec::new();
-            match parse_projection(&unq(proj_s))? {
-                Proj::Star => {
-                    for (i, c) in inner_cols.iter().enumerate() {
-                        cols.push(ProjCol { field_id: i, expr: None, ..c.clone() });
+            if !declared.is_empty() {
+                if declared.len() != inner_cols.len() {
+                    return Some(Plan::Refused); // the engine counts them
+                }
+                for (c, n) in inner_cols.iter_mut().zip(declared.iter()) {
+                    c.name = n.clone();
+                }
+            }
+            // Everything above the leaf - the projection, the WHERE, the
+            // GROUP BY, the ORDER BY - is resolved by the SAME planner a
+            // bound CTE uses, against a synthetic view built from the
+            // inner plan's DESCRIBE. A derived table has no catalog entry
+            // to read a format from, and neither has a CTE's rows.
+            let bound = sql_over_from(sql, &alias);
+            return match plan_over_source(
+                &bound,
+                &alias,
+                &inner_cols,
+                BoundSrc::Inner(inner),
+                db,
+                params,
+            ) {
+                Some(p) => Some(p),
+                None => {
+                    if trace {
+                        eprintln!("[srv] plan: derived table {:?} not resolved", inner_sql);
                     }
-                }
-                Proj::Items(items) => {
-                    for it in items {
-                        match it {
-                            SelItem::Col(name, alias_of) => {
-                                let mut pc =
-                                    build_projcols(&[name], &columns, &descs, &computed)?
-                                        .into_iter()
-                                        .next()?;
-                                if let Some(a) = alias_of {
-                                    pc.name = a;
-                                }
-                                cols.push(pc);
-                            }
-                            SelItem::Expr(raw, name) => {
-                                cols.push(build_expr_col(&raw, &name, &columns, &descs)?)
-                            }
-                            _ => return Some(Plan::Refused),
-                        }
-                    }
-                }
-            }
-            let mut np = 0usize;
-            let filter = match where_s {
-                None => None,
-                Some(ws) => {
-                    let ws = unq(ws);
-                    Some(resolve_predicate(
-                        tokenize(&ws).and_then(|t| parse_predicate(&t, &mut np))?,
-                        &columns,
-                        &descs,
-                        params,
-                    )?)
+                    Some(Plan::Refused)
                 }
             };
-            let order_by = match order_s {
-                None => Vec::new(),
-                Some(os) => parse_order_by_expr(
-                    &unq(os),
-                    &cols,
-                    |n| {
-                        columns
-                            .iter()
-                            .find(|c| c.name.eq_ignore_ascii_case(n))
-                            .map(|c| c.field_id as usize)
-                    },
-                    |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
-                )?,
-            };
-            // GROUP BY over a derived table needs the fold to run above
-            // the leaf, which is a later slice - refused rather than
-            // silently ignored
-            if group_s.is_some() || having_s.is_some() {
-                return Some(Plan::Refused);
-            }
-            let _ = dbr;
-            if trace {
-                eprintln!("[srv] plan: derived table {:?} as {}", inner_sql, alias);
-            }
-            return Some(Plan::Derived {
-                inner: Box::new(inner),
-                cols,
-                filter,
-                order_by,
-            });
         }
     }
 
@@ -13105,37 +12633,55 @@ fn plan_query_inner(
             }
         }
     }
-    // a VIEW in the FROM: rewrite the query against the view's base
-    // table and re-plan it (see VIEWS). Done before anything else is
-    // resolved, so the rewritten text goes through the whole planner.
+    // Whether any FROM item of a JOIN names a view - see the refusal
+    // below, which the join planner's return has to honour too
+    let mut from_names_view = false;
+    // A VIEW in the FROM is a ROW SOURCE, not a rewrite: its stored
+    // SELECT is planned on its own and the outer query resolves against
+    // that plan's DESCRIBE, exactly as it does over a derived table. A
+    // view in a JOIN is handled by the join planner's side builder, for
+    // the same reason and with the same code.
     if let Some(dbr) = db.as_ref() {
-        if let Some(rewritten) = expand_view(sql, dbr, &[]) {
-            if trace {
-                eprintln!("[srv] plan: view expanded to {:?}", rewritten);
-            }
-            // parameter slots number in the REWRITTEN text's order
-            params.clear();
-            return plan_query_inner(&rewritten, db, params);
-        }
-        // A view this server cannot expand must REFUSE here. A view is a
-        // relation with a relation id but NO records of its own, so
-        // falling through would scan its empty storage and answer ZERO
-        // ROWS - a wrong answer that looks like a legitimately empty
-        // result.
-        // Every SIDE, not just the first: a view that is the second table
-        // of a join is the same empty scan, and it reads as a plausible
-        // count rather than as an error - `DEPT RIGHT JOIN VEMP` answered
-        // 0 while the engine answered 3.
-        if let Some((_, table_s, _, _, _, _)) = split_query(sql) {
-            if let Some((from, join)) = parse_from(table_s) {
-                for tr in std::iter::once(&from).chain(join.iter().map(|(_, r, _, _)| r)) {
-                    if view_of(dbr, tr.table).is_some() {
-                        if trace {
-                            eprintln!("[srv] plan: view {} is not expandable", tr.table);
-                        }
-                        return Some(Plan::Refused);
+        if let Some((from, join)) = parse_from(table_s) {
+            if join.is_empty() {
+                if let Some((inner, view_cols)) = plan_view(db, dbr, from.table) {
+                    let alias = from.alias.unwrap_or(from.table);
+                    if trace {
+                        eprintln!("[srv] plan: view {} as a row source", from.table);
                     }
+                    let bound = sql_over_from(sql, alias);
+                    return match plan_over_source(
+                        &bound,
+                        alias,
+                        &view_cols,
+                        BoundSrc::Inner(inner),
+                        db,
+                        params,
+                    ) {
+                        Some(p) => Some(p),
+                        None => Some(Plan::Refused),
+                    };
                 }
+            }
+            // A view this server cannot plan must REFUSE rather than
+            // fall through. A view is a relation with a relation id but
+            // NO records of its own, so a fall-through scans its empty
+            // storage and answers ZERO ROWS - a wrong answer that looks
+            // like a legitimately empty result. For a LONE view that is
+            // decided here; for a view in a JOIN the side builder gets
+            // its turn first, and `from_names_view` carries the same
+            // guarantee down to the join planner's return.
+            if join.is_empty() {
+                if view_of(dbr, from.table).is_some() {
+                    if trace {
+                        eprintln!("[srv] plan: view {} is not planned", from.table);
+                    }
+                    return Some(Plan::Refused);
+                }
+            } else {
+                from_names_view = std::iter::once(&from)
+                    .chain(join.iter().map(|(_, r, _, _)| r))
+                    .any(|tr| view_of(dbr, tr.table).is_some());
             }
         }
     }
@@ -13199,10 +12745,11 @@ fn plan_query_inner(
                     return plan_join(
                         &proj, &left, &join, where_s, group_s, having_s, order_s, db,
                         &db_all, params,
-                    );
+                    )
+                    .or_else(|| from_names_view.then_some(Plan::Refused));
                 }
                 if order_s.is_some() {
-                    return None;
+                    return from_names_view.then_some(Plan::Refused);
                 }
                 if let Some(Plan::Join {
                     base,
@@ -13224,7 +12771,7 @@ fn plan_query_inner(
                     .len();
                     return Some(Plan::Scalar(Some(n as i64), "COUNT".to_string()));
                 }
-                return None;
+                return from_names_view.then_some(Plan::Refused);
             }
         }
         return match plan_join(
@@ -13233,7 +12780,9 @@ fn plan_query_inner(
             Some(p) => Some(p),
             None => {
                 if trace { eprintln!("[srv] plan: JOIN plan failed"); }
-                None
+                // a view among the sides has no records of its own, so
+                // falling through would scan empty storage
+                from_names_view.then_some(Plan::Refused)
             }
         };
     }
@@ -13551,7 +13100,7 @@ fn derived_view(inner_cols: &[ProjCol]) -> (Vec<RelationColumn>, Vec<Descriptor>
 
 /// Split `( <select> ) [AS] <alias>` - a DERIVED TABLE in the FROM.
 /// Returns the inner query text and the alias, which SQL requires.
-fn parse_derived_table(from_s: &str) -> Option<(String, String)> {
+fn parse_derived_table(from_s: &str) -> Option<(String, String, Vec<String>)> {
     let t = from_s.trim();
     if !t.starts_with('(') {
         return None;
@@ -13566,13 +13115,36 @@ fn parse_derived_table(from_s: &str) -> Option<(String, String)> {
     if let Some(r) = rest.strip_prefix("AS ").or_else(|| rest.strip_prefix("as ")) {
         rest = r.trim();
     }
+    // `(SELECT ...) X (A, B)` NAMES the derived table's columns, the way
+    // a view's or a CTE's column list does - the inner query supplies
+    // only the values. Probed: the engine takes it.
+    let mut cols: Vec<String> = Vec::new();
+    if let Some(open) = rest.find('(') {
+        let cl = matching_paren(rest.as_bytes(), open)?;
+        if !rest[cl + 1..].trim().is_empty() {
+            return None;
+        }
+        for c in split_top_level_commas(&rest[open + 1..cl]) {
+            let c = c.trim();
+            let quoted = c.starts_with('"') && c.ends_with('"') && c.len() > 1;
+            let c = c.trim_matches('"');
+            if !(if quoted { ident_ok(c) } else { bare_ident_ok(c) }) {
+                return None;
+            }
+            cols.push(if quoted { c.to_string() } else { c.to_ascii_uppercase() });
+        }
+        if cols.is_empty() {
+            return None;
+        }
+        rest = rest[..open].trim();
+    }
     let alias = rest.trim_matches('"');
     // the engine REQUIRES a name for a derived table; without one there
     // is nothing to qualify its columns with
     if !ident_ok(alias) {
         return None;
     }
-    Some((inner, alias.to_ascii_uppercase()))
+    Some((inner, alias.to_ascii_uppercase(), cols))
 }
 
 /// The DESCRIPTOR of an aggregate's result - what the group row holds in
@@ -16118,6 +15690,16 @@ fn decode_blob_id(b: &[u8]) -> (u16, u64) {
 /// A bare SQL identifier: letters, digits, `_`, `$`, non-empty.
 fn ident_ok(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+/// `ident_ok` for text that was NOT quoted: an unquoted identifier
+/// starts with a LETTER. `ident_ok` alone accepts "3", which is why a
+/// numeric literal once read as a column named 3 - and why the callers
+/// that have already stripped the quotes cannot use it to tell a name
+/// from a number. A DELIMITED identifier may be anything, so this is
+/// only for the unquoted case.
+fn bare_ident_ok(s: &str) -> bool {
+    ident_ok(s) && s.starts_with(|c: char| c.is_ascii_alphabetic())
 }
 
 fn is_ident_byte(c: u8) -> bool {
@@ -27437,61 +27019,14 @@ mod tests {
         assert!(unqualify_single("SELECT ID FROM EMP WHERE N = 'E.ID'", &a).is_none());
     }
 
-    #[test]
-    fn renamed_view_columns_rewrite_under_their_qualifier() {
-        let map = vec![
-            ("DID".to_string(), "DEPT_ID".to_string()),
-            ("EID".to_string(), "ID".to_string()),
-        ];
-        assert_eq!(
-            replace_qualified_col("V.DID = D.ID AND V.EID > 0", "V", &map),
-            "V.DEPT_ID = D.ID AND V.ID > 0"
-        );
-        // another side's identically-named column is NOT this view's
-        assert_eq!(
-            replace_qualified_col("W.DID = 1", "V", &map),
-            "W.DID = 1"
-        );
-        // a bare name is left for the caller to refuse - only the
-        // qualifier says which side owns the word
-        assert_eq!(replace_qualified_col("DID = 1", "V", &map), "DID = 1");
-        assert!(mentions_bare("DID = 1", &["DID".to_string()]));
-        assert!(!mentions_bare("V.DID = 1", &["DID".to_string()]));
-        assert!(!mentions_bare("N = 'DID'", &["DID".to_string()]));
-    }
-
-    #[test]
-    fn table_position_is_not_qualifier_position() {
-        // An unaliased view lends its NAME to its base table, so the ON's
-        // `VEMP.DEPT_ID` must survive untouched. Replacing the word
-        // everywhere produced `EMP VEMP.DEPT_ID`, which parses as
-        // nothing at all.
-        let f = "VEMP JOIN DEPT ON VEMP.DEPT_ID = DEPT.ID";
-        assert_eq!(
-            replace_table_ref(f, "VEMP", "EMP VEMP"),
-            "EMP VEMP JOIN DEPT ON VEMP.DEPT_ID = DEPT.ID"
-        );
-        // an ALIASED view: the qualifier is the alias, so the view's own
-        // name appears only in table position
-        assert_eq!(
-            replace_table_ref("VEMP V JOIN DEPT D ON V.K = D.K", "VEMP", "EMP"),
-            "EMP V JOIN DEPT D ON V.K = D.K"
-        );
-        // a column of the same name is not a table
-        assert_eq!(
-            replace_table_ref("T JOIN U ON T.VEMP = U.VEMP", "VEMP", "EMP"),
-            "T JOIN U ON T.VEMP = U.VEMP"
-        );
-        // case-insensitive, and only WHOLE identifiers
-        assert_eq!(replace_table_ref("vemp v", "VEMP", "EMP"), "EMP v");
-        assert_eq!(replace_table_ref("VEMPX v", "VEMP", "EMP"), "VEMPX v");
-        assert_eq!(replace_table_ref("X_VEMP v", "VEMP", "EMP"), "X_VEMP v");
-        // and a string literal is not identifier text
-        assert_eq!(
-            replace_table_ref("T ON T.N = 'VEMP'", "VEMP", "EMP"),
-            "T ON T.N = 'VEMP'"
-        );
-    }
+    // The tests that stood here exercised the TEXTUAL VIEW REWRITING -
+    // `replace_qualified_col`, `mentions_bare` and `replace_table_ref`,
+    // which turned a view's column names into its base table's inside
+    // the outer query and replaced the view's name in TABLE POSITION
+    // ONLY. R7 deleted all three: a view is a ROW SOURCE now, so its
+    // columns are announced by its own plan and there is no text to
+    // rewrite. What they protected is protected instead by
+    // qa/serve-real-viewrename.sh, which asks the engine.
 
     #[test]
     fn describe_buffer_is_parseable() {
@@ -32371,6 +31906,89 @@ mod tests {
         // other ALTER forms are not generator restarts
         assert!(plan_alter_sequence("ALTER TABLE T ADD C INT").is_none());
         assert!(plan_alter_sequence("ALTER SEQUENCE SEQ_A RESTART").is_none());
+    }
+
+    #[test]
+    fn a_derived_table_may_name_its_own_columns() {
+        let (inner, alias, cols) = parse_derived_table("(SELECT ID, S FROM T) X").unwrap();
+        assert_eq!(inner, "SELECT ID, S FROM T");
+        assert_eq!(alias, "X");
+        assert!(cols.is_empty());
+
+        // `(SELECT ...) X (A, B)` - the inner query supplies the values,
+        // the list supplies the names (probed: the engine takes it)
+        let (_, alias, cols) = parse_derived_table("(SELECT ID, S FROM T) X (A, B)").unwrap();
+        assert_eq!(alias, "X");
+        assert_eq!(cols, vec!["A", "B"]);
+        let (_, _, cols) = parse_derived_table("(SELECT ID FROM T) AS X (K)").unwrap();
+        assert_eq!(cols, vec!["K"]);
+
+        // a name is still required, and the list must hold names
+        assert!(parse_derived_table("(SELECT ID FROM T)").is_none());
+        assert!(parse_derived_table("(SELECT ID FROM T) X ()").is_none());
+        assert!(parse_derived_table("(SELECT ID FROM T) X (1)").is_none());
+    }
+
+    #[test]
+    fn splice_ctes_replaces_the_from_item_only() {
+        let ctes = vec![(
+            "C".to_string(),
+            ViewDef { source: "SELECT ID FROM EMP".to_string(), cols: vec![] },
+        )];
+        assert_eq!(
+            splice_ctes("SELECT COUNT(*) FROM C", &ctes).unwrap(),
+            "SELECT COUNT(*) FROM (SELECT ID FROM EMP) C"
+        );
+        // the alias survives, and NOTHING else moves - in particular the
+        // `C` inside SELECT is not a FROM item (a text search for a
+        // one-letter CTE name spliced into the middle of the keyword)
+        assert_eq!(
+            splice_ctes("SELECT X.ID FROM C X WHERE X.ID > 1", &ctes).unwrap(),
+            "SELECT X.ID FROM (SELECT ID FROM EMP) X WHERE X.ID > 1"
+        );
+        // a name that is not a CTE is left alone
+        assert_eq!(splice_ctes("SELECT ID FROM EMP", &ctes).unwrap(), "SELECT ID FROM EMP");
+
+        // a RENAMING list rides along as the derived table's own list,
+        // which is how the rename survives without rewriting the body
+        let ren = vec![(
+            "C".to_string(),
+            ViewDef {
+                source: "SELECT ID, SALARY FROM EMP".to_string(),
+                cols: vec!["A".to_string(), "B".to_string()],
+            },
+        )];
+        assert_eq!(
+            splice_ctes("SELECT A FROM C", &ren).unwrap(),
+            "SELECT A FROM (SELECT ID, SALARY FROM EMP) C (A, B)"
+        );
+        // and a list that merely REPEATS what the body names is not a
+        // rename, so it adds nothing
+        let same = vec![(
+            "C".to_string(),
+            ViewDef {
+                source: "SELECT ID, SALARY FROM EMP".to_string(),
+                cols: vec!["ID".to_string(), "SALARY".to_string()],
+            },
+        )];
+        assert_eq!(
+            splice_ctes("SELECT ID FROM C", &same).unwrap(),
+            "SELECT ID FROM (SELECT ID, SALARY FROM EMP) C"
+        );
+    }
+
+    #[test]
+    fn sql_over_from_replaces_the_from_item() {
+        assert_eq!(
+            sql_over_from("SELECT ID FROM (SELECT ID FROM EMP) X WHERE ID > 1", "X"),
+            "SELECT ID FROM X WHERE ID > 1"
+        );
+        // the clauses around it are untouched, including one that
+        // contains the name as ordinary text
+        assert_eq!(
+            sql_over_from("SELECT ID FROM VEMP V ORDER BY ID", "V"),
+            "SELECT ID FROM V ORDER BY ID"
+        );
     }
 
     #[test]

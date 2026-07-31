@@ -230,13 +230,27 @@ both "ORDER BY a view column" \
 # reason.)
 both "a view with RENAMED columns in a join" \
      "SELECT COUNT(*) FROM VREN V JOIN DEPT D ON V.DID = D.ID"
-refuses "a view over a JOIN" "SELECT COUNT(*) FROM VJOIN"
-refuses "a view over a join, in a join" \
-        "SELECT COUNT(*) FROM VJOIN V JOIN DEPT D ON V.ID = D.ID"
-refuses "a RIGHT join with a view" \
-        "SELECT COUNT(*) FROM DEPT D RIGHT JOIN VEMP V ON V.DEPT_ID = D.ID"
-refuses "a FULL join with a view" \
-        "SELECT COUNT(*) FROM DEPT D FULL JOIN VEMP V ON V.DEPT_ID = D.ID"
+# These four REFUSED while a view was a rewrite against its base table:
+# a view whose own body joins had no single table to be rewritten to, and
+# an outer join could not put the view's WHERE anywhere that was right
+# for both the matched and the padded rows. A view is a ROW SOURCE now -
+# an inner plan, with its own WHERE inside it, below the padding - so all
+# four are ordinary joins over one more node.
+both "a view over a JOIN" "SELECT COUNT(*) FROM VJOIN"
+both "a view over a join, projected" "SELECT ID, DNAME FROM VJOIN ORDER BY ID"
+both "a view over a join, in a join" \
+     "SELECT COUNT(*) FROM VJOIN V JOIN DEPT D ON V.ID = D.ID"
+both "a view over a join, qualified by its alias" \
+     "SELECT V.ID, V.DNAME FROM VJOIN V ORDER BY V.ID"
+both "a RIGHT join with a view" \
+     "SELECT COUNT(*) FROM DEPT D RIGHT JOIN VEMP V ON V.DEPT_ID = D.ID"
+both "a FULL join with a view" \
+     "SELECT COUNT(*) FROM DEPT D FULL JOIN VEMP V ON V.DEPT_ID = D.ID"
+both "a view joined to ANOTHER VIEW" \
+     "SELECT COUNT(*) FROM VEMP V JOIN VDEPT D ON V.DEPT_ID = D.ID"
+both "an OUTER join with a view, grouped above it" \
+     "SELECT D.DNAME, COUNT(*) AS K FROM DEPT D LEFT JOIN VEMP V ON V.DEPT_ID = D.ID
+      GROUP BY D.DNAME ORDER BY D.DNAME"
 
 rm -f "$A" "$B"
 # A COUNT of what actually ran: a mistyped helper name is a shell

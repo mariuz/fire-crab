@@ -1631,6 +1631,33 @@ them.
   to the CTE in its recursive branch) is the same one the engine's own
   rule needs, since exactly one is legal.
 
+- **When the emulation works, the structure is still missing — and the
+  bill arrives as a list of refusals.** A view answered by rewriting the
+  query against its base table passed hundreds of checks. What it could
+  not do was not a list of missing features: a view whose body JOINed had
+  no single table to rewrite to, a view under an outer join had nowhere
+  to put its own WHERE that was right for both the matched and the padded
+  rows, and a bare renamed column had no qualifier to say which side it
+  came from. Those are all one thing said three ways. Replacing the
+  rewriting with a nested row source deleted ~870 lines and answered all
+  three, because *the filter is inside the inner plan, below the padding*
+  is something a tree has by construction and text has to emulate.
+
+- **Three planners doing the same thing is a design, not a duplication —
+  until you write the third.** A derived table, a bound CTE and a view
+  are the same question: plan a query whose FROM is a name standing for
+  a row source. Merging them was not tidying; it moved capabilities
+  between them for free, because each had learned something the others
+  had not.
+
+- **The mirror of a gate that cannot fail is a gate that cannot pass.**
+  One gate here checked the wrong process id for liveness and exited
+  before its second phase ran; twelve checks had never executed. Both
+  failure modes report something untrue, and this one is easier to leave
+  in place, because a red gate looks like outstanding work rather than a
+  broken instrument. When a gate fails, find out WHICH check failed
+  before you find out why.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

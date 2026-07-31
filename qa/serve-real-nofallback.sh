@@ -150,10 +150,15 @@ answers "SELECT AVG(A) FROM T"
 answers "SELECT COUNT(DISTINCT A) FROM T"
 answers "SELECT MIN(S) FROM T"
 
+# a view over a join - ANSWERED since R7 made a view a row source rather
+# than a rewrite against base tables. It stays here rather than moving to
+# its own gate because the point is unchanged: a view has a relation id
+# and NO records, so the one thing this must never do is fall through to
+# a scan of its empty storage and call the result an answer.
+answers "SELECT ID, W FROM VJ"
+answers "SELECT COUNT(*) FROM VJ"
+
 # --- NOT supported: each must raise ------------------------------------
-# a view over a join (the view has a relation id but no records, so a
-# fall-through would scan its empty storage and answer ZERO ROWS)
-refuses "SELECT ID, W FROM VJ"
 # a PSQL body outside the interpreted surface
 refuses "EXECUTE PROCEDURE UNSUP"
 # a procedure that does not exist

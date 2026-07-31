@@ -234,10 +234,20 @@ both "a comma join beside a derived table" \
 # a column the INNER query did not project is not there to name
 refuses "a column the inner query did not select" \
         "SELECT X.SALARY FROM (SELECT ID FROM EMP) X"
-# an aggregate over a derived table needs the fold ABOVE the leaf, which
-# is a later slice - refused rather than silently ungrouped
-refuses "GROUP BY over a derived table" \
-        "SELECT X.DEPT_ID, COUNT(*) FROM (SELECT DEPT_ID FROM EMP) X GROUP BY X.DEPT_ID"
+# The fold has to run ABOVE the leaf, which is what a grouped JOIN with
+# no parts already is - so the same node serves a derived table, and
+# these four refused until the two planners became one.
+both "GROUP BY over a derived table" \
+     "SELECT X.DEPT_ID, COUNT(*) AS K FROM (SELECT DEPT_ID FROM EMP) X
+      GROUP BY X.DEPT_ID ORDER BY X.DEPT_ID"
+both "a bare GROUP BY key over a derived table" \
+     "SELECT DEPT_ID, COUNT(*) AS K FROM (SELECT DEPT_ID FROM EMP) X
+      GROUP BY DEPT_ID ORDER BY DEPT_ID"
+both "an ungrouped aggregate over a derived table" \
+     "SELECT SUM(X.SALARY) AS S FROM (SELECT SALARY FROM EMP) X"
+both "GROUP BY with a HAVING over a derived table" \
+     "SELECT X.DEPT_ID, MAX(X.SALARY) AS M FROM (SELECT DEPT_ID, SALARY FROM EMP) X
+      GROUP BY X.DEPT_ID HAVING COUNT(*) > 1 ORDER BY X.DEPT_ID"
 # SQL requires a derived table to be named; without one there is nothing
 # to qualify its columns with
 refuses "a derived table with NO alias" "SELECT ID FROM (SELECT ID FROM EMP)"

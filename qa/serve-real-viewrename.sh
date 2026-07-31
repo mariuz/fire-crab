@@ -244,10 +244,15 @@ both "an unrenamed view is unaffected" \
 # one side in scope, the same word can be this view's renamed column and
 # another table's real one, and only the qualifier says which. The engine
 # resolves it; this server refuses rather than guessing a side.
-refuses "a BARE renamed column in a join" \
-        "SELECT EID FROM VREN V JOIN DEPT D ON V.DID = D.ID"
-refuses "... and in the ON" \
-        "SELECT COUNT(*) FROM VREN V JOIN DEPT D ON EID > 0"
+# Both refused while the rename was carried through TEXT: a bare
+# renamed column had no qualifier to say which side it came from, so the
+# rewrite could not place it. The view's columns are announced by its
+# plan now, and the combined view resolves a bare name the same way it
+# does for any table.
+both "a BARE renamed column in a join" \
+     "SELECT EID FROM VREN V JOIN DEPT D ON V.DID = D.ID ORDER BY EID"
+both "... and in the ON" \
+     "SELECT COUNT(*) FROM VREN V JOIN DEPT D ON EID > 0"
 
 rm -f "$A" "$B"
 if [ "$ran" -lt 41 ]; then

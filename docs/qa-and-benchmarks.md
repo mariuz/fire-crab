@@ -7668,6 +7668,59 @@ Two smaller things fell out of it. A CTE may **name its own columns** —
 `Plan::Scalar` became a row source in `branch_rows`, because a lone aggregate
 plans to a scalar and `SELECT MIN(ID) FROM T` is a perfectly ordinary seed.
 
+### Retiring the rewriting: a view is a row source (R7)
+
+For most of this project a view was answered by **rewriting the query
+against its base table**. `SELECT ID FROM VEMP WHERE SALARY > 100` became a
+query over `EMP` with the view's own WHERE ANDed in, the view's name lent to
+the base table as an alias so `VEMP.ID` still resolved, and the view's column
+names replaced by the base's throughout the text. It worked, and it worked for
+a long time — 46 checks of renamed columns alone.
+
+What it could not do is the interesting part, because the list is not a list of
+missing features. It is a list of things the *shape* could not say:
+
+| shape | why the rewriting could not | why the tree can |
+|---|---|---|
+| a view whose body JOINs | no single table to rewrite the outer query to | the body is a plan; a plan is a leaf |
+| a view under a RIGHT/FULL join | the view's WHERE belongs *inside* the padded side, and text has no inside | the filter sits in the inner plan, below the padding |
+| a bare renamed column in a join | no qualifier to say which side the name came from | the combined view resolves it like any table's |
+
+All three answer now, and the code that implemented them by hand is gone:
+`expand_view`, `expand_view_join`, `qualify_idents`, `replace_qualified_col`,
+`mentions_bare`, `replace_table_ref`, `replace_idents` — about 870 lines. The
+law they encoded most carefully — *the view's own WHERE goes into that step's
+ON when the side can be NULL-padded, and into the outer WHERE when it cannot* —
+was an emulation of something a nested row source does by construction.
+
+**The three planners became one.** A derived table, a bound CTE and a view are
+the same question: plan a query whose FROM is a name standing for a row source,
+where the source is either materialised rows or an inner plan. That is
+`plan_over_source`, and R4's derived table, R6's recursive CTE and R7's view all
+enter through it. Two capabilities arrived just from the merge — GROUP BY over a
+derived table (a refusal R4 recorded, since the fold has to run *above* the
+leaf, which is what a grouped join with no parts already is) and the whole of
+the aggregate surface over a CTE.
+
+**What is left, stated plainly.** A CTE is still spliced textually — `FROM C`
+becomes `FROM (<body>) C` — but that is a FROM-ITEM replacement into the derived
+planner, not an expansion of a definition. Removing even that needs the planner
+to bind N names at once instead of one, which is the next slice's price rather
+than this one's.
+
+**Two gate bugs surfaced, in opposite directions.** `qa/serve-real-alias.sh`
+checked `$srv` for liveness in its second phase — the *first* server's pid,
+cleared two lines earlier — so it exited 1 before phase 2 ever ran, and twelve
+checks had never executed. A gate that cannot fail reports a passing system that
+was never measured; a gate that cannot pass reports a broken one that works.
+Both report something untrue, and the second is the easier to leave in place,
+because a red gate looks like work rather than a bug. And `ident_ok` accepts
+`3`, so a derived table's column list would have read a numeric literal as a
+column name — the same trap that once made `SELECT 3 FROM T` refuse. It is
+fixed for the unquoted case only (`bare_ident_ok`), because `"3"` is a
+perfectly legal delimited identifier and the callers strip the quotes before
+asking.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
