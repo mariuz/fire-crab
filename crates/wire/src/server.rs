@@ -21186,7 +21186,50 @@ fn side_kind(op: Cmp, side: Side) -> RawKind {
     }
 }
 
+/// The comparison read from the other side: `? < S` is `S > ?`.
+///
+/// The operator is MIRRORED, not moved. Writing `S < ?` there would
+/// answer a different set of rows, and would do it quietly.
+fn mirror_cmp(op: Cmp) -> Cmp {
+    match op {
+        Cmp::Lt => Cmp::Gt,
+        Cmp::Gt => Cmp::Lt,
+        Cmp::Le => Cmp::Ge,
+        Cmp::Ge => Cmp::Le,
+        Cmp::Eq => Cmp::Eq,
+        Cmp::Ne => Cmp::Ne,
+    }
+}
+
 fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
+    // A `?` ON THE LEFT - `WHERE ? < SALARY`. The engine describes the
+    // parameter from the OTHER side whichever way round it is written,
+    // so the leaf is read from that side too: the sides swap and the
+    // operator MIRRORS. The slot is registered BEFORE the right side is
+    // parsed, because `?` is POSITIONAL and its number is its place in
+    // the text, not its place in the rewritten leaf.
+    if matches!(t.get(*pos), Some(Tok::Param)) {
+        let mut p2 = *pos;
+        let mut np2 = *np;
+        if let Some(param) = parse_value(t, &mut p2, &mut np2) {
+            if let Some(Tok::Cmp(op)) = t.get(p2) {
+                let op = *op;
+                let mut p3 = p2 + 1;
+                if let Some(rhs_expr) = texpr(t, &mut p3) {
+                    let lhs = match rhs_expr {
+                        RawExpr::Col(c) => RawLhs::Col(c),
+                        e => RawLhs::Expr(e),
+                    };
+                    *pos = p3;
+                    *np = np2;
+                    return Some(Ast::Leaf(RawTerm {
+                        lhs,
+                        kind: RawKind::Cmp(mirror_cmp(op), param),
+                    }));
+                }
+            }
+        }
+    }
     let lhs = match t.get(*pos)? {
         Tok::Agg(f, target) => {
             let l = RawLhs::Agg(*f, target.clone());

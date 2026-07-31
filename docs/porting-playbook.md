@@ -1595,6 +1595,12 @@ them.
   not - almost never means the feature is missing; it means one caller
   has its own copy of something.
 
+- **When you read a construct "from the other side", MIRROR the
+  operator - and prove it with a fixture where the two answers differ.**
+  `? < S` is `S > ?`, not `S < ?`. Both compile, both run, and only one
+  is right; a fixture where the comparison happens to select the same
+  rows either way cannot tell you which you wrote.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

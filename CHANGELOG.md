@@ -13,6 +13,34 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — a `?` on the left of a comparison
+
+### Converted
+- **`WHERE ? < SALARY`.** A parameter bound on the LEFT of a comparison
+  refused; only `SALARY > ?` worked. The engine describes the parameter
+  from the OTHER side whichever way round it is written, so the leaf is
+  now read from that side too: the sides SWAP and **the operator
+  MIRRORS**.
+- The mirroring is the whole point. Moving the operator instead of
+  mirroring it — reading `? < S` as `S < ?` — answers a different set of
+  rows and does it quietly, so the gate checks every ordering operator in
+  both spellings, over a fixture where the two answers DIFFER.
+- **A `?` is POSITIONAL**: its number is its place in the TEXT, not its
+  place in the rewritten leaf. The slot is registered before the right
+  side is parsed, so `WHERE ? < DP AND DP < ?` binds the client's two
+  values in the order they were written.
+
+`qa/serve-real-typedparams.sh` grows from 26 checks to 39, including a
+left-side parameter beside a right-side one, two left-side ones, a text
+column, and one in a DML WHERE with the table compared afterwards.
+
+Probed and NOT converted, so it is not mistaken for covered: a `?` inside
+an arithmetic operand (`WHERE SALARY > ? + 100`) and inside a CASE
+condition still refuse — the expression parser has no parameter counter
+to register a slot with, which is a different change from this one. A
+lone `?` in a select list errors on BOTH servers, so that is agreement
+rather than a gap.
+
 ## 2026-07-31 — one statement of "which side is which"
 
 ### Converted

@@ -213,5 +213,32 @@ esac
 both "a TIME column against a written TIME literal" \
      "SELECT ID FROM T WHERE TM > TIME'09:00:00' ORDER BY ID" '[]'
 
+# --- a `?` ON THE LEFT of the comparison -----------------------------
+# The engine describes the parameter from the OTHER side whichever way
+# round it is written, so `? < DP` is read from that side too: the sides
+# SWAP and the operator MIRRORS. Writing `DP < ?` there instead would
+# answer a different set of rows and would do it quietly, so every
+# ordering operator is checked in both spellings and the two must give
+# DIFFERENT answers for the check to mean anything.
+both "a parameter on the LEFT with <" "SELECT ID FROM T WHERE ? < DP ORDER BY ID" '[1]'
+both "... and its mirror on the right" "SELECT ID FROM T WHERE DP > ? ORDER BY ID" '[1]'
+both "a parameter on the LEFT with >" "SELECT ID FROM T WHERE ? > DP ORDER BY ID" '[1]'
+both "... and its mirror" "SELECT ID FROM T WHERE DP < ? ORDER BY ID" '[1]'
+both "on the LEFT with <=" "SELECT ID FROM T WHERE ? <= DP ORDER BY ID" '[1.5]'
+both "on the LEFT with >=" "SELECT ID FROM T WHERE ? >= DP ORDER BY ID" '[1.5]'
+both "on the LEFT with =" "SELECT ID FROM T WHERE ? = DP ORDER BY ID" '[1.5]'
+both "on the LEFT with <>" "SELECT ID FROM T WHERE ? <> DP ORDER BY ID" '[1.5]'
+# a `?` is POSITIONAL: its number is its place in the TEXT, not its place
+# in the rewritten leaf, so a left-side one beside a right-side one must
+# keep the order the client bound them in
+both "a LEFT parameter beside a RIGHT one" \
+     "SELECT ID FROM T WHERE ? < DP AND DP < ? ORDER BY ID" '[0, 3]'
+both "two LEFT parameters" \
+     "SELECT ID FROM T WHERE ? < DP AND ? < ID ORDER BY ID" '[0, 1]'
+both "a LEFT parameter against a TEXT column" \
+     "SELECT ID FROM T WHERE ? = NAME ORDER BY ID" '["py"]'
+both "a LEFT parameter in a DML WHERE" "UPDATE T SET NAME = 'lp' WHERE ? > DP" '[3]'
+both "the table after it" "SELECT ID, NAME FROM T ORDER BY ID" '[]'
+
 rm -f "$A" "$B"
 exit $fail
