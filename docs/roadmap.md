@@ -54,8 +54,10 @@ pulled by the fetch.
   capability the tree unlocks that the rewriting could not reach: a
   derived table has no name to substitute, so the outer query resolves
   against a synthetic view built from the inner plan's DESCRIBE.
-- **R5 — a materialised CTE**, which retires the "CTE body must be a
-  single-table projection" refusal.
+- **R5 — a materialised CTE**. *(done)* A CTE body the inlining cannot
+  rewrite is a DERIVED TABLE by another name: `FROM C` becomes
+  `FROM (<body>) C`. Grouped, starred and joined bodies all answer now,
+  and a grouped PLAN became a row source in the process.
 - **R6 — `WITH RECURSIVE`**, a fixpoint over the tree.
 - **R7 — retire the textual view/CTE rewriting** and the qualifier
   passes that exist only to serve it.

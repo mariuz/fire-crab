@@ -13,6 +13,44 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — R5: the materialised CTE
+
+### Converted
+- **A CTE body the inlining cannot rewrite is MATERIALISED** — because a
+  CTE whose body cannot be inlined **is a derived table by another
+  name**. `FROM C` becomes `FROM (<body>) C`, and R4's machinery plans it
+  properly: inner query planned on its own, columns from its describe,
+  rows as a leaf.
+- So a CTE body that **GROUPS**, **stars**, or **JOINS** now answers.
+  Those three were refusals one increment ago, and the fix is a rewrite
+  of one FROM item — because the hard part was already built.
+- **A grouped PLAN became a row source.** It could not be one before the
+  fold was a node: materialising a grouped query meant repeating
+  scan-filter-aggregate-sort by hand, so nothing did, and a grouped CTE
+  or derived table had nowhere to get its rows. `branch_rows` now builds
+  the same `TableScan → Filter → Aggregate → Sort` the emit path does.
+
+### Guarded
+- A CTE with an explicit **renaming** column list AND an unexpandable
+  body refuses: a derived table carries the body's own names, so
+  answering under the renamed ones would be wrong. The list is detected
+  as explicit by DIFFERING from what the body itself names, which is the
+  only signal available at that point.
+- A materialised CTE as one **side of a join** still refuses — that needs
+  derived tables in joins, a later slice, and it must keep refusing
+  rather than half-work.
+
+**The bug worth recording**: the rewrite spliced the body in by searching
+for the CTE's name with `cur.find(table_s)` — and for a CTE named `C`
+that found the **C inside `SELECT`**, producing `SELE(SELECT ...) CT
+COUNT(*)`. The position has to come from the slice itself
+(`table_s.as_ptr() - cur.as_ptr()`), since `split_query` returns
+subslices of the text. A one-letter identifier is not an unusual name for
+a CTE, and a text search for one is never safe.
+
+`qa/serve-real-cte.sh` grows from 29 checks to 33; three of its refusals
+become comparisons. 17 gates and 363 unit tests confirm nothing moved.
+
 ## 2026-07-31 — R4: derived tables
 
 **The first capability the row-source tree unlocks**, and the reason it

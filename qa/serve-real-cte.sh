@@ -211,21 +211,38 @@ both "a CTE that shadows a real table" \
 # WITH RECURSIVE is a FIXPOINT, not a substitution
 refuses "WITH RECURSIVE" \
         "WITH RECURSIVE C AS (SELECT ID FROM EMP) SELECT COUNT(*) FROM C"
-# a CTE body the view expansion cannot rewrite leaves its name in the
-# FROM - where it names no relation, so it must REFUSE rather than reach
-# the fixed-answer fallback
-refuses "a CTE whose body GROUPS" \
+# A CTE body the INLINING cannot rewrite - one that GROUPS, stars or
+# JOINS - is MATERIALISED instead: it is a derived table by another name,
+# so `FROM C` becomes `FROM (<body>) C`. These three refused until the
+# increment that made a grouped plan a row source.
+both "a CTE whose body GROUPS" \
+     "WITH C AS (SELECT DEPT_ID, COUNT(*) AS N FROM EMP GROUP BY DEPT_ID)
+      SELECT C.DEPT_ID, C.N FROM C ORDER BY C.DEPT_ID"
+both "... filtered by the OUTER query on a folded column" \
+     "WITH C AS (SELECT DEPT_ID, COUNT(*) AS N FROM EMP GROUP BY DEPT_ID)
+      SELECT C.DEPT_ID FROM C WHERE C.N > 1 ORDER BY C.DEPT_ID"
+both "... with a HAVING inside" \
+     "WITH C AS (SELECT DEPT_ID, COUNT(*) AS N FROM EMP GROUP BY DEPT_ID
+                 HAVING COUNT(*) > 1)
+      SELECT C.DEPT_ID FROM C ORDER BY C.DEPT_ID"
+both "a CTE whose body is a star" \
+     "WITH C AS (SELECT * FROM EMP) SELECT C.ID FROM C ORDER BY C.ID"
+both "a CTE whose body is a JOIN" \
+     "WITH C AS (SELECT E.ID FROM EMP E JOIN DEPT D ON E.DEPT_ID = D.ID)
+      SELECT C.ID FROM C ORDER BY C.ID"
+both "FIRST over a materialised CTE" \
+     "WITH C AS (SELECT DEPT_ID, COUNT(*) AS N FROM EMP GROUP BY DEPT_ID)
+      SELECT FIRST 2 C.DEPT_ID FROM C ORDER BY C.DEPT_ID"
+# still refused: a materialised CTE as one SIDE of a join needs derived
+# tables in joins, which is a later slice - it must keep refusing rather
+# than half-work
+refuses "a materialised CTE in a JOIN" \
         "WITH C AS (SELECT DEPT_ID, COUNT(*) AS N FROM EMP GROUP BY DEPT_ID)
-         SELECT COUNT(*) FROM C"
-refuses "a CTE whose body is a star" \
-        "WITH C AS (SELECT * FROM EMP) SELECT COUNT(*) FROM C"
-refuses "a CTE whose body is a JOIN" \
-        "WITH C AS (SELECT E.ID FROM EMP E JOIN DEPT D ON E.DEPT_ID = D.ID)
-         SELECT COUNT(*) FROM C"
+         SELECT COUNT(*) FROM C JOIN DEPT D ON C.DEPT_ID = D.ID"
 
 rm -f "$A" "$B"
-if [ "$ran" -lt 28 ]; then
-    echo "DIFF only $ran checks ran (expected at least 28) - did one silently skip?"
+if [ "$ran" -lt 33 ]; then
+    echo "DIFF only $ran checks ran (expected at least 33) - did one silently skip?"
     fail=1
 fi
 exit $fail

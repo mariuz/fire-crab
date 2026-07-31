@@ -10681,26 +10681,38 @@ fn parse_with(sql: &str) -> Option<(Vec<(String, ViewDef)>, String)> {
         let source: String = b[i + 1..close].iter().collect();
         i = close + 1;
         // the column names: the explicit list, else the query's own
+        // The CTE's column names, when they can be read off its body -
+        // that is what the INLINING path needs. An EMPTY list is not a
+        // failure: it means "this body names its own columns", and such
+        // a CTE is MATERIALISED as a derived table instead, where the
+        // inner plan's describe answers the question. A `SELECT *` body,
+        // a GROUP BY, a join and an unaliased aggregate all land here.
         let cols = if cols.is_empty() {
-            let (p, _, _, _, _, _) = split_query(source.trim())?;
-            match parse_projection(p)? {
-                Proj::Items(items) => items
-                    .iter()
-                    .map(|it| match it {
-                        SelItem::Col(c, alias) => Some(
-                            alias
-                                .clone()
-                                .unwrap_or_else(|| c.rsplit('.').next().unwrap_or(c).to_string())
-                                .to_ascii_uppercase(),
-                        ),
-                        SelItem::Expr(_, n) | SelItem::Gen(_, _, n) => {
-                            Some(n.to_ascii_uppercase())
-                        }
-                        SelItem::Agg(_, _, alias) => alias.clone().map(|a| a.to_ascii_uppercase()),
-                    })
-                    .collect::<Option<Vec<_>>>()?,
-                Proj::Star => return None, // the positional mapping is unknown
-            }
+            split_query(source.trim())
+                .and_then(|(p, _, _, _, _, _)| parse_projection(p))
+                .and_then(|proj| match proj {
+                    Proj::Items(items) => items
+                        .iter()
+                        .map(|it| match it {
+                            SelItem::Col(c, alias) => Some(
+                                alias
+                                    .clone()
+                                    .unwrap_or_else(|| {
+                                        c.rsplit('.').next().unwrap_or(c).to_string()
+                                    })
+                                    .to_ascii_uppercase(),
+                            ),
+                            SelItem::Expr(_, n) | SelItem::Gen(_, _, n) => {
+                                Some(n.to_ascii_uppercase())
+                            }
+                            SelItem::Agg(_, _, alias) => {
+                                alias.clone().map(|a| a.to_ascii_uppercase())
+                            }
+                        })
+                        .collect::<Option<Vec<_>>>(),
+                    Proj::Star => None,
+                })
+                .unwrap_or_default()
         } else {
             cols
         };
@@ -11678,6 +11690,46 @@ fn branch_rows(
         }
         return Some(rows.into_iter().skip(*skip).take(take.unwrap_or(usize::MAX)).collect());
     }
+    // A GROUPED plan is a row source too. It could not be one before the
+    // fold became a node: materialising a grouped query meant repeating
+    // the scan-filter-aggregate-sort by hand, so nothing did, and a
+    // grouped CTE or derived table had nowhere to get its rows.
+    if let Plan::Group {
+        rel,
+        formats,
+        cols,
+        gitems,
+        key_fids,
+        key_exprs,
+        synth_base,
+        filter,
+        having,
+        order_by,
+    } = plan
+    {
+        let rows = RowSource::aggregate_sorted(
+            RowSource::Filter {
+                input: Box::new(RowSource::TableScan {
+                    rel: *rel,
+                    formats: formats.to_vec(),
+                    width: None,
+                }),
+                pred: bind_filter(filter, args).ok()?,
+            },
+            gitems,
+            key_fids,
+            key_exprs,
+            *synth_base,
+            having,
+            order_by,
+        )
+        .rows(db)
+        .ok()?;
+        return rows
+            .iter()
+            .map(|values| cols.iter().map(|c| c.value_of(values).ok()).collect())
+            .collect();
+    }
     if let Plan::Derived { inner, cols, filter, order_by } = plan {
         let rows = branch_rows(inner, db, args)?;
         let out = RowSource::Sort {
@@ -11967,9 +12019,87 @@ fn plan_query_inner(
                     None => break,
                 }
             }
-            // A CTE NAME STILL IN THE FROM WAS NOT EXPANDED, and it names
-            // no relation - falling through would reach the fixed-answer
-            // fallback and reply 4242 to a query over a real table.
+            // A CTE NAME STILL IN THE FROM was not expanded - its body
+            // is something the view expansion cannot substitute (it
+            // GROUPS, it JOINS, it stars). MATERIALISE IT INSTEAD: a CTE
+            // whose body cannot be inlined IS A DERIVED TABLE by another
+            // name, so `FROM C` becomes `FROM (<body>) C` and the derived
+            // table machinery plans it properly - inner query planned on
+            // its own, columns from its DESCRIBE, rows as a leaf.
+            //
+            // Only when the CTE is the WHOLE from: a materialised CTE as
+            // one SIDE of a join needs derived tables in joins, which is
+            // a later slice, and it must keep refusing rather than
+            // half-work.
+            if let Some((from, join)) = split_query(&cur).and_then(|(_, t, _, _, _, _)| parse_from(t))
+            {
+                if join.is_empty() {
+                    if let Some((_, def)) =
+                        ctes.iter().find(|(n, _)| n.eq_ignore_ascii_case(from.table))
+                    {
+                        // An EXPLICIT column list RENAMES the body's
+                        // columns, and a derived table carries the
+                        // BODY's own names - so that combination would
+                        // answer under the wrong ones and refuses
+                        // instead. The list is explicit exactly when it
+                        // DIFFERS from what the body itself names, which
+                        // is the only signal available here: `WITH C (A,
+                        // B) AS (SELECT ID, SALARY ...)` and `WITH C AS
+                        // (SELECT ID, SALARY ...)` reach this point
+                        // holding cols the same way.
+                        let body_cols: Vec<String> = split_query(def.source.trim())
+                            .and_then(|(p, _, _, _, _, _)| parse_projection(p))
+                            .and_then(|proj| match proj {
+                                Proj::Items(items) => items
+                                    .iter()
+                                    .map(|it| match it {
+                                        SelItem::Col(c, alias) => Some(
+                                            alias
+                                                .clone()
+                                                .unwrap_or_else(|| {
+                                                    c.rsplit('.').next().unwrap_or(c).to_string()
+                                                })
+                                                .to_ascii_uppercase(),
+                                        ),
+                                        SelItem::Expr(_, n) | SelItem::Gen(_, _, n) => {
+                                            Some(n.to_ascii_uppercase())
+                                        }
+                                        SelItem::Agg(_, _, alias) => {
+                                            alias.clone().map(|a| a.to_ascii_uppercase())
+                                        }
+                                    })
+                                    .collect::<Option<Vec<_>>>(),
+                                Proj::Star => None,
+                            })
+                            .unwrap_or_default();
+                        if !def.cols.is_empty() && def.cols != body_cols {
+                            return Some(Plan::Refused);
+                        }
+                        let alias = from.alias.unwrap_or(from.table).to_string();
+                        let table_s = split_query(&cur)?.1;
+                        let derived = format!("({}) {}", def.source, alias);
+                        // THE OFFSET COMES FROM THE SLICE, NOT FROM A
+                        // TEXT SEARCH. `cur.find(table_s)` looks for the
+                        // CTE's name and finds the `C` inside `SELECT`,
+                        // splicing the body into the middle of the
+                        // keyword. `table_s` is a subslice of `cur`, so
+                        // its position is arithmetic rather than a guess.
+                        let head = table_s.as_ptr() as usize - cur.as_ptr() as usize;
+                        cur = format!(
+                            "{}{}{}",
+                            &cur[..head],
+                            derived,
+                            &cur[head + table_s.len()..]
+                        );
+                        if trace {
+                            eprintln!("[srv] plan: CTE materialised as {:?}", cur);
+                        }
+                    }
+                }
+            }
+            // Anything still naming a CTE names NO RELATION - falling
+            // through would reach the fixed-answer fallback and reply
+            // 4242 to a query over real tables.
             let names_cte = split_query(&cur)
                 .and_then(|(_, t, _, _, _, _)| parse_from(t))
                 .map(|(from, join)| {
@@ -11977,7 +12107,14 @@ fn plan_query_inner(
                         .chain(join.iter().map(|(_, r, _, _)| r.table))
                         .any(|t| ctes.iter().any(|(n, _)| n.eq_ignore_ascii_case(t)))
                 })
-                .unwrap_or(true);
+                .unwrap_or(false)
+                || parse_derived_table(
+                    split_query(&cur).map(|(_, t, _, _, _, _)| t).unwrap_or(""),
+                )
+                .is_none()
+                    && split_query(&cur)
+                        .and_then(|(_, t, _, _, _, _)| parse_from(t))
+                        .is_none();
             if names_cte {
                 if trace {
                     eprintln!("[srv] plan: a CTE could not be expanded in {:?}", cur);
@@ -14630,7 +14767,8 @@ fn output_cols_of(plan: &Plan) -> Vec<ProjCol> {
         | Plan::ProcSelect { cols, .. }
         | Plan::ProcRows { cols, .. }
         | Plan::Modified { cols, .. }
-        | Plan::Derived { cols, .. } => cols.clone(),
+        | Plan::Derived { cols, .. }
+        | Plan::Group { cols, .. } => cols.clone(),
         _ => Vec::new(),
     }
 }
