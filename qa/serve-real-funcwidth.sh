@@ -55,11 +55,12 @@ ran=0
 rm -f "$DB"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || { echo "FAIL scratch"; exit 1; }
 CREATE DATABASE '$DB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
-CREATE TABLE T (ID INTEGER, V VARCHAR(6), C CHAR(6), W VARCHAR(10));
+CREATE TABLE T (ID INTEGER, V VARCHAR(6), C CHAR(6), W VARCHAR(10),
+                SM SMALLINT, BG BIGINT);
 COMMIT;
-INSERT INTO T VALUES (1, 'ab', 'ab', 'abc');
-INSERT INTO T VALUES (2, 'abcdef', 'abcdef', 'abcdefghij');
-INSERT INTO T VALUES (3, NULL, NULL, NULL);
+INSERT INTO T VALUES (1, 'ab', 'ab', 'abc', 7, 9000000000);
+INSERT INTO T VALUES (2, 'abcdef', 'abcdef', 'abcdefghij', -7, -9000000000);
+INSERT INTO T VALUES (3, NULL, NULL, NULL, NULL, NULL);
 COMMIT;
 EOF
 chmod 666 "$DB"
@@ -147,18 +148,47 @@ both "SELECT COALESCE(V, 'zzzzzzzzzz') FROM T ORDER BY ID"
 both "SELECT CAST(V AS CHAR(9)) FROM T ORDER BY ID"
 both "SELECT 'abc' FROM T ORDER BY ID"
 
-# --- 8. a mixture, and the numeric neighbours that must not move ------
+# --- 8. a NUMERIC function's declared width ---------------------------
+# The engine does NOT announce every integer result as BIGINT. It has a
+# width per function, and the earlier version of this gate had to soften
+# a check because of it - that check is restored at the bottom.
+#
+#   SIGN                       SHORT, whatever its argument
+#   CHAR_LENGTH / OCTET_LENGTH
+#   / POSITION                 LONG, always
+#   MOD                        the FIRST operand's own width
+#   ABS                        ONE STEP WIDER than its source
+#
+# Ordinary ARITHMETIC is INT64 on both sides (probed: ID + 1, S + S and
+# ID * 2 all announce INT64), so the widening fire-crab does there is
+# what the engine does too - the deviation was only ever in the
+# functions.
+both "SELECT SIGN(ID) FROM T ORDER BY ID"
+both "SELECT SIGN(SM) FROM T ORDER BY ID"
+both "SELECT SIGN(BG) FROM T ORDER BY ID"
+both "SELECT MOD(ID, 3) FROM T ORDER BY ID"
+both "SELECT MOD(SM, 3) FROM T ORDER BY ID"
+both "SELECT MOD(BG, 3) FROM T ORDER BY ID"
+both "SELECT ABS(ID) FROM T ORDER BY ID"
+both "SELECT ABS(SM) FROM T ORDER BY ID"
+both "SELECT CHAR_LENGTH(V) FROM T ORDER BY ID"
+both "SELECT OCTET_LENGTH(C) FROM T ORDER BY ID"
+both "SELECT POSITION('a' IN V) FROM T ORDER BY ID"
+# ordinary arithmetic, which must NOT narrow
+both "SELECT ID + 1 FROM T ORDER BY ID"
+both "SELECT SM + SM FROM T ORDER BY ID"
+both "SELECT ID * 2 FROM T ORDER BY ID"
+both "SELECT ID + BG FROM T ORDER BY ID"
+
+# --- 9. a mixture, text and numeric together --------------------------
 both "SELECT ID, V, UPPER(C), LEFT(W, 4) FROM T ORDER BY ID"
-# (a NUMERIC neighbour is checked as a plain column only. fire-crab
-# computes integer arithmetic at full i64 and announces BIGINT where the
-# engine announces INTEGER - a standing, documented deviation whose
-# VALUES are identical and whose isql column WIDTHS are not. It predates
-# this increment and is not smuggled into it.)
-both "SELECT ID, V FROM T ORDER BY ID"
+# the check the previous increment had to soften, restored in full
+both "SELECT ID, ID + 1, CHAR_LENGTH(V) FROM T ORDER BY ID"
+both "SELECT SIGN(ID), UPPER(V), MOD(ID, 3), TRIM(C) FROM T ORDER BY ID"
 
 rm -f "$DB"
-if [ "$ran" -lt 31 ]; then
-    echo "DIFF only $ran checks ran (expected at least 31) - did one silently skip?"
+if [ "$ran" -lt 48 ]; then
+    echo "DIFF only $ran checks ran (expected at least 48) - did one silently skip?"
     fail=1
 fi
 exit $fail

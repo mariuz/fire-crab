@@ -1550,6 +1550,21 @@ them.
   refusal to guess is itself worth writing down, or the next person
   assumes it was checked.
 
+- **A "known deviation" is a claim, and claims expire.** This codebase
+  carried "fire-crab announces BIGINT for integer arithmetic where the
+  engine announces INTEGER" as a documented difference, and a gate was
+  softened around it. One probe showed the engine announces INT64 for
+  arithmetic too - the deviation was in a handful of FUNCTIONS, not in
+  arithmetic at all. Re-probe a recorded deviation before you design
+  around it; the note may be older than the evidence.
+
+- **A summary that can be EMPTY as well as ZERO hides failure.** A unit
+  test here failed to compile, the release build succeeded anyway
+  (`cfg(test)`), and the grep that counts "N passed" matched nothing and
+  printed a blank - which reads like success. Any check that reports by
+  counting must distinguish "counted zero" from "counted nothing", or it
+  reports loudest when it is working least.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

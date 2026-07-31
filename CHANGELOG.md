@@ -13,6 +13,42 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — the declared width of a numeric function
+
+### Fixed
+- **The engine announces a width PER FUNCTION, not BIGINT for every
+  integer result.** fire-crab announced BIGINT throughout, so isql laid
+  out a 20-wide column where the engine lays out 6. Probed with
+  `SET SQLDA_DISPLAY ON`:
+  - `SIGN` is **SHORT**, whatever its argument.
+  - `CHAR_LENGTH`, `OCTET_LENGTH`, `POSITION` are **LONG**, always.
+  - `MOD` keeps the **first operand's** own width.
+  - `ABS` is **one step wider** than its source (SMALLINT→INTEGER,
+    INTEGER→BIGINT).
+
+### Corrected
+- **The "standing deviation" the previous increment recorded was not
+  one.** That gate softened a numeric check and blamed fire-crab's
+  integer arithmetic for announcing BIGINT where the engine announces
+  INTEGER. Probing it directly says otherwise: `ID + 1`, `S + S`,
+  `ID * 2` and `ID + BG` all announce **INT64** on the engine too. The
+  widening fire-crab does for arithmetic is exactly the engine's; the
+  divergence was only ever in the FUNCTIONS. The softened check is
+  restored in full.
+
+`qa/serve-real-funcwidth.sh` grows from 32 checks to 48 and its fixture
+gains SMALLINT and BIGINT columns, so a function's declared width can be
+varied by its source.
+
+**A note on how nearly this shipped unverified.** The new unit test did
+not compile — `Wire` derived neither `Debug` nor `PartialEq`, which
+`assert_eq!` needs — and `cargo build --release` still succeeded, because
+the test module is `cfg(test)`. The greps that summarise "N tests passed"
+matched nothing and printed an empty count, which reads like a pass at a
+glance. This is the same silent-skip shape the playbook already records
+for gates, in the unit-test path: a summary that can be EMPTY as well as
+ZERO needs to distinguish the two.
+
 ## 2026-07-31 — the width of a text FUNCTION's result
 
 ### Fixed

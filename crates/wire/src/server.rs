@@ -844,7 +844,7 @@ fn service_info(items: &[u8], buffer_length: usize) -> Result<Vec<u8>, fire_crab
 /// e.g. blobs) is rendered and sent as SQL_VARYING. The client is
 /// expected to fetch with the message format the describe announced -
 /// which is what real clients build their output BLR from.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Wire {
     /// 8-byte big-endian integer (BIGINT, and INT64-backed numerics)
     Int64,
@@ -2821,6 +2821,56 @@ fn check_predicates(
 /// column names to field ids, type it (integer arithmetic -> BIGINT,
 /// string literal -> VARCHAR), and carry the expression evaluated per
 /// row. None if the expression cannot be resolved or typed.
+/// The declared INTEGER width of a numeric function's result.
+///
+/// The engine does NOT announce every integer result as BIGINT - it
+/// announces a width per function, and isql lays its columns out from
+/// that, so a BIGINT-for-everything declaration prints a 20-wide column
+/// where the engine prints 6. Probed with `SET SQLDA_DISPLAY ON`:
+///
+///   SIGN(anything)                     SHORT  (500), len 2
+///   CHAR_LENGTH / OCTET_LENGTH /
+///   POSITION                           LONG   (496), len 4
+///   MOD(a, b)                          the FIRST operand's own width
+///                                      (SMALLINT -> SHORT, INTEGER ->
+///                                      LONG, BIGINT -> INT64)
+///   ABS(a)                             ONE STEP WIDER than the source
+///                                      (SHORT -> LONG, LONG -> INT64)
+///
+/// Returns (wire, sql_type, length) or None to keep the caller's default
+/// (the INT64/INT128 form every other integer expression takes - which
+/// is also what the engine announces for ordinary arithmetic, probed:
+/// `ID + 1`, `S + S` and `ID * 2` are all INT64).
+fn int_func_form(e: &Expr, descs: &[Descriptor]) -> Option<(Wire, i32, i32)> {
+    // an XDR SHORT travels in a 32-bit slot, as `Wire::Int32` already
+    // carries for SMALLINT columns
+    let short = (Wire::Int32, 500, 2);
+    let long = (Wire::Int32, 496, 4);
+    let int64 = (Wire::Int64, 580, 8);
+    let Expr::Func(f, args) = e else { return None };
+    // the operand's own stored width, when it has one
+    let src_dtype = |i: usize| match args.get(i) {
+        Some(Expr::Col(fid)) => descs.get(*fid).map(|d| d.dtype),
+        _ => None,
+    };
+    match f {
+        SysFn::Sign => Some(short),
+        SysFn::CharLength | SysFn::OctetLength | SysFn::Position => Some(long),
+        SysFn::Mod => match src_dtype(0)? {
+            dtype::SHORT => Some(short),
+            dtype::LONG => Some(long),
+            dtype::INT64 => Some(int64),
+            _ => None,
+        },
+        SysFn::Abs => match src_dtype(0)? {
+            dtype::SHORT => Some(long),
+            dtype::LONG => Some(int64),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Pad a CHAR-formed conditional to its declared width.
 ///
 /// A conditional's type is CHAR(n) when every branch is, and the engine
@@ -2981,7 +3031,13 @@ fn build_expr_col(
     // describe. The padding is applied by wrapping the expression in the
     // CAST that already implements it rather than by a second code path.
     let (wire, sql_type, length, scale) = match e.type_of(descs)? {
-        ExprType::Int => num_form(0),
+        // a FUNCTION's integer result has its own declared width; every
+        // other integer expression takes the INT64/INT128 form, which is
+        // what the engine announces for arithmetic too (probed)
+        ExprType::Int => match int_func_form(&e, descs) {
+            Some((w, t, l)) => (w, nullable(t), l, 0),
+            None => num_form(0),
+        },
         ExprType::Text => match text_form(&e, descs) {
             // the VALUE is padded where the conditional is resolved (see
             // `pad_conditional`); here only the WIDTH is announced
@@ -25678,6 +25734,54 @@ pub fn serve(addr: &str, user: &str, password: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_numeric_function_declares_its_own_width() {
+        let d = |dt: u8, len: u16| Descriptor {
+            dtype: dt,
+            scale: 0,
+            length: len,
+            sub_type: 0,
+            flags: 0,
+            offset: 8,
+        };
+        // 0: SMALLINT, 1: INTEGER, 2: BIGINT
+        let descs = vec![d(dtype::SHORT, 2), d(dtype::LONG, 4), d(dtype::INT64, 8)];
+        let f = |sf: SysFn, a: Vec<Expr>| int_func_form(&Expr::Func(sf, a), &descs);
+        // SIGN is SHORT whatever its argument
+        assert_eq!(f(SysFn::Sign, vec![Expr::Col(1)]), Some((Wire::Int32, 500, 2)));
+        assert_eq!(f(SysFn::Sign, vec![Expr::Col(2)]), Some((Wire::Int32, 500, 2)));
+        // the length/position family is LONG, always
+        assert_eq!(
+            f(SysFn::CharLength, vec![Expr::Col(1)]),
+            Some((Wire::Int32, 496, 4))
+        );
+        // MOD keeps the FIRST operand's width
+        assert_eq!(
+            f(SysFn::Mod, vec![Expr::Col(0), Expr::Int(3)]),
+            Some((Wire::Int32, 500, 2))
+        );
+        assert_eq!(
+            f(SysFn::Mod, vec![Expr::Col(1), Expr::Int(3)]),
+            Some((Wire::Int32, 496, 4))
+        );
+        assert_eq!(
+            f(SysFn::Mod, vec![Expr::Col(2), Expr::Int(3)]),
+            Some((Wire::Int64, 580, 8))
+        );
+        // ABS widens ONE STEP
+        assert_eq!(f(SysFn::Abs, vec![Expr::Col(0)]), Some((Wire::Int32, 496, 4)));
+        assert_eq!(f(SysFn::Abs, vec![Expr::Col(1)]), Some((Wire::Int64, 580, 8)));
+        // and ARITHMETIC keeps the caller's INT64 form - the engine
+        // announces INT64 for `ID + 1` too, so there is nothing to narrow
+        assert_eq!(
+            int_func_form(
+                &Expr::Bin(Box::new(Expr::Col(1)), ArithOp::Add, Box::new(Expr::Int(1))),
+                &descs
+            ),
+            None
+        );
+    }
 
     #[test]
     fn a_text_result_takes_its_widest_branch() {
