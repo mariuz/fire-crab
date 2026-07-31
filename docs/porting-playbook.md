@@ -1498,6 +1498,23 @@ them.
   know every position a keyword can occupy, not just the clauses it cares
   about.
 
+- **A construct borrowed from another dialect may not have borrowed its
+  SEMANTICS.** Firebird's DECODE looks like Oracle's and differs where it
+  matters: Oracle's matches a NULL subject to a NULL search value, and
+  Firebird's does not, because it compiles to a simple CASE whose
+  comparison is `=`. Writing the desugar from the other dialect's
+  documentation would have produced a wrong answer on exactly the rows
+  people use DECODE for. Probe the construct in the system you are
+  converting, not in the system it came from.
+
+- **When you find a divergence your slice did not cause, say so in the
+  gate rather than encoding around it silently.** A conditional's text
+  result is CHAR of the widest branch and pads; this increment's gate
+  uses equal-width branches and a header comment naming the law and the
+  evidence. Choosing inputs that dodge a known bug is fine; choosing them
+  without recording why turns the gate into a claim that the bug does not
+  exist.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

@@ -11714,6 +11714,45 @@ fn plan_query_inner(
                 // projection builder, which turns it into a lookup.
                 let mut correlated: Vec<(usize, String)> = Vec::new();
                 for (i, sub) in subs.iter().enumerate() {
+                    // `EXISTS (SELECT ...)` lifts as a subquery too - the
+                    // paren belongs to EXISTS, not to a scalar - so the
+                    // marker is preceded by the keyword. It asks only
+                    // whether a row survives, and folds to TRUE or FALSE.
+                    let mark = format!("{}{}", SUBQ_MARK, i);
+                    let exists_at = proj_out.find(&mark).and_then(|at| {
+                        let head = proj_out[..at].trim_end();
+                        let up = head.to_ascii_uppercase();
+                        up.ends_with("EXISTS").then(|| head.len() - "EXISTS".len())
+                    });
+                    if let Some(cut) = exists_at {
+                        let Some(rows) = eval_subquery(sub, dbr, None, true) else {
+                            if trace {
+                                eprintln!("[srv] plan: EXISTS subquery {:?} not answerable", sub);
+                            }
+                            return Some(Plan::Refused);
+                        };
+                        let lit = if rows.any { "TRUE" } else { "FALSE" };
+                        // the whole `EXISTS <marker>` span becomes the
+                        // literal, and the engine names such a column
+                        // BOOL like every other boolean-valued expression
+                        let span = &proj_out[cut..];
+                        let end = span.find(&mark)? + mark.len();
+                        // `split_alias` would read the MARKER as a
+                        // trailing bare alias of the word EXISTS, so the
+                        // item is matched on its own text with the
+                        // whitespace normalised instead
+                        let alone = split_top_level_commas(&proj_out).iter().any(|item| {
+                            let squashed: String = item.split_whitespace().collect::<Vec<_>>().join(" ");
+                            squashed.eq_ignore_ascii_case(&format!("EXISTS {}", mark))
+                        });
+                        let repl = if alone {
+                            format!("{} AS BOOL", lit)
+                        } else {
+                            lit.to_string()
+                        };
+                        proj_out = format!("{}{}{}", &proj_out[..cut], repl, &span[end..]);
+                        continue;
+                    }
                     // `corr: None` - a CORRELATED subquery cannot resolve
                     // its outer column here and refuses, since its value
                     // differs per row and this fold is once per statement
@@ -15820,6 +15859,51 @@ fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                 Some(node)
             } else if !quoted && word.eq_ignore_ascii_case("CASE") {
                 parse_case_tail(b, pos)
+            } else if !quoted && word.eq_ignore_ascii_case("DECODE") && {
+                skip_ws(b, pos);
+                b.get(*pos) == Some(&'(')
+            } {
+                // DECODE(<subject>, <search>, <result>, ..., [<default>])
+                // IS a simple CASE: the engine compiles it to the same
+                // blr_decode node, and the comparison is `=`, so a NULL
+                // subject matches NOTHING - not even a NULL search value
+                // (probed; Oracle's DECODE differs here, which is
+                // exactly the sort of law a converter inherits wrongly).
+                *pos += 1; // '('
+                let mut args: Vec<RawExpr> = Vec::new();
+                loop {
+                    args.push(expr_add(b, pos)?);
+                    skip_ws(b, pos);
+                    match b.get(*pos) {
+                        Some(',') => {
+                            *pos += 1;
+                        }
+                        Some(')') => {
+                            *pos += 1;
+                            break;
+                        }
+                        _ => return None,
+                    }
+                }
+                if args.len() < 3 {
+                    return None; // a subject and at least one pair
+                }
+                let subject = args.remove(0);
+                // an ODD number of remaining arguments ends with a
+                // DEFAULT; an even number has none, and no match is NULL
+                let default = if args.len() % 2 == 1 { Some(args.pop()?) } else { None };
+                let mut branches = Vec::new();
+                for pair in args.chunks(2) {
+                    branches.push((
+                        RawCond::Cmp(
+                            Box::new(subject.clone()),
+                            Cmp::Eq,
+                            Box::new(pair[0].clone()),
+                        ),
+                        pair[1].clone(),
+                    ));
+                }
+                Some(RawExpr::Case(branches, default.map(Box::new)))
             } else if !quoted && agg_named(&word) && {
                 skip_ws(b, pos);
                 b.get(*pos) == Some(&'(')
@@ -19717,9 +19801,29 @@ fn parse_projection(proj: &str) -> Option<Proj> {
         } else if let Some(raw) = parse_raw_expr(body).or_else(|| {
             literal_kw.then(|| parse_raw_expr_any(body)).flatten()
         }) {
-            let name = alias_owned
-                .clone()
-                .unwrap_or_else(|| default_expr_name(&raw));
+            // DECODE compiles to a simple CASE and is named DECODE all
+            // the same (probed: the two sit side by side in one select
+            // list with different headers). The desugar preserves every
+            // VALUE and would have changed the CONTRACT.
+            let decodes = {
+                let t = body.trim();
+                // ... and ONLY when the whole item IS the call:
+                // `DECODE(...) + 1` is an ADD, which the engine names
+                // after its top operator like any other expression
+                t.len() > 6 && t[..6].eq_ignore_ascii_case("DECODE") && {
+                    let rest = t[6..].trim_start();
+                    let at = t.len() - rest.len();
+                    rest.starts_with('(')
+                        && matching_paren(t.as_bytes(), at) == Some(t.len() - 1)
+                }
+            };
+            let name = alias_owned.clone().unwrap_or_else(|| {
+                if decodes {
+                    "DECODE".to_string()
+                } else {
+                    default_expr_name(&raw)
+                }
+            });
             items.push(SelItem::Expr(raw, name));
         } else {
             return None;
@@ -25422,6 +25526,42 @@ pub fn serve(addr: &str, user: &str, password: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_is_a_simple_case_that_keeps_its_name() {
+        let items = match parse_projection("DECODE(D, 1, 'a', 2, 'b', 'z')").unwrap() {
+            Proj::Items(v) => v,
+            Proj::Star => panic!("not a star"),
+        };
+        // it compiles to a CASE - two branches and a default...
+        match &items[0] {
+            SelItem::Expr(RawExpr::Case(branches, else_), name) => {
+                assert_eq!(branches.len(), 2);
+                assert!(else_.is_some());
+                // ... and each branch is an `=` comparison, which is why
+                // a NULL subject matches NOTHING (Oracle's DECODE
+                // differs, and this desugar is what gets it right)
+                assert!(matches!(branches[0].0, RawCond::Cmp(_, Cmp::Eq, _)));
+                // ... and is still described as DECODE, not CASE
+                assert_eq!(name, "DECODE");
+            }
+            _ => panic!("DECODE did not compile to a CASE"),
+        }
+        // an EVEN number of arguments after the subject has no default
+        let items = match parse_projection("DECODE(D, 1, 'a')").unwrap() {
+            Proj::Items(v) => v,
+            Proj::Star => panic!("not a star"),
+        };
+        assert!(matches!(&items[0], SelItem::Expr(RawExpr::Case(b, None), _) if b.len() == 1));
+        // the name is DECODE only when the WHOLE item is the call
+        let items = match parse_projection("DECODE(D, 1, 10, 20) + 1").unwrap() {
+            Proj::Items(v) => v,
+            Proj::Star => panic!("not a star"),
+        };
+        assert!(matches!(&items[0], SelItem::Expr(_, n) if n == "ADD"));
+        // and a subject with no pair at all is not a DECODE
+        assert!(parse_projection("DECODE(D, 1)").is_none());
+    }
 
     #[test]
     fn a_cte_parses_as_a_view_definition() {

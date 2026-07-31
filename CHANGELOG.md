@@ -13,6 +13,48 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — DECODE, and EXISTS as a value
+
+### Converted
+- **`DECODE(<subject>, <search>, <result>, ..., [<default>])`** — it IS a
+  simple CASE (the engine compiles it to the same node), so it desugars
+  to the searched form the parser already builds, one `=` comparison per
+  pair. An ODD number of arguments after the subject ends with a
+  DEFAULT; an even number has none, and no match answers NULL.
+- **`EXISTS(SELECT ...)` as a select-list value**, folded to TRUE or
+  FALSE at prepare through the same subquery lifting the select list
+  already uses — it asks only whether a row survives.
+
+**The law worth probing**, because it is the one a converter inherits
+wrongly: **Firebird's DECODE does not match a NULL subject to a NULL
+search value.** Oracle's does. Here the comparison is `=` and `NULL =
+NULL` is UNKNOWN, so a NULL subject matches nothing and takes the
+default — which the simple-CASE desugar gives for free, and which a
+desugar written to Oracle's semantics would have got wrong.
+
+**The other law is about names, not values**: DECODE compiles to a CASE
+and is still described as **DECODE**, while a simple CASE is described as
+CASE. The gate puts both in one select list, which is the only place the
+difference shows — and the naming applies only when the whole item is the
+call, since `DECODE(...) + 1` is an ADD like any other expression.
+
+### Found, not fixed
+- **A conditional's TEXT result takes the width of its WIDEST branch and
+  is padded to it.** `CASE WHEN ... THEN 'other' ELSE 'isnull' END`
+  describes as `CHAR(6)` (sqltype 452, len 6 — confirmed with
+  `SET SQLDA_DISPLAY`) and answers `'other '`; fire-crab announces a
+  VARCHAR and does not pad. This is **pre-existing** and belongs to plain
+  CASE as much as to DECODE — both differ identically — so the new gate
+  uses branches of EQUAL width and says why, rather than quietly encoding
+  a known-wrong expectation. It is the next slice.
+
+### Guarded
+- DECODE inside a WHERE refuses: the predicate tokenizer spans a CASE by
+  its balancing END and has no rule for a DECODE call, so the desugar the
+  select list gets never reaches it. Named rather than left unexplained.
+
+`qa/serve-real-decode.sh` is new, 29 checks.
+
 ## 2026-07-31 — WITH: a view that lives in the statement
 
 ### Converted
