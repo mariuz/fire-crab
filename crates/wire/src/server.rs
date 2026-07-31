@@ -1644,6 +1644,20 @@ AlterDomainRename {
         /// the fetch completes
         gen_cols: Vec<GenCol>,
     },
+    /// a DERIVED TABLE - `SELECT ... FROM (SELECT ...) X`. The inner
+    /// plan produces the rows; the outer projection, WHERE and ORDER BY
+    /// run over them as a materialised leaf of the row-source tree.
+    ///
+    /// This is the first shape the tree answers that the textual
+    /// rewriting could not: a derived table has no name in the catalog
+    /// to substitute, and its columns exist only because the inner query
+    /// ANNOUNCES them.
+    Derived {
+        inner: Box<Plan>,
+        cols: Vec<ProjCol>,
+        filter: Option<Predicate>,
+        order_by: Vec<OrderKey>,
+    },
     Join {
         base_rel: u16,
         base_formats: Vec<(u8, Vec<Descriptor>)>,
@@ -11664,6 +11678,22 @@ fn branch_rows(
         }
         return Some(rows.into_iter().skip(*skip).take(take.unwrap_or(usize::MAX)).collect());
     }
+    if let Plan::Derived { inner, cols, filter, order_by } = plan {
+        let rows = branch_rows(inner, db, args)?;
+        let out = RowSource::Sort {
+            input: Box::new(RowSource::Filter {
+                input: Box::new(RowSource::Rows(rows)),
+                pred: bind_filter(filter, args).ok()?,
+            }),
+            keys: order_by.clone(),
+        }
+        .rows(db)
+        .ok()?;
+        return out
+            .iter()
+            .map(|values| cols.iter().map(|c| c.value_of(values).ok()).collect())
+            .collect();
+    }
     // A JOIN is a row source too, so DISTINCT/FIRST/SKIP/ROWS may wrap
     // one - and so may an INSERT ... SELECT or a FOR SELECT loop, which
     // all arrive here. The rows are sorted on the COMBINED row (the
@@ -12002,6 +12032,7 @@ fn plan_query_inner(
                 | Plan::ProcSelect { .. }
                 | Plan::Join { .. }
                 | Plan::JoinGroup { .. }
+                | Plan::Derived { .. }
         ) {
             return Some(Plan::Refused);
         }
@@ -12072,6 +12103,109 @@ fn plan_query_inner(
             proj_s, table_s, where_s, group_s, having_s, order_s
         );
     }
+    // A DERIVED TABLE - `SELECT ... FROM (SELECT ...) X`. The inner
+    // query is planned on its own; its ANNOUNCED output columns are what
+    // the outer query resolves against, because a derived table has no
+    // catalog entry to read a format from. Everything above it - the
+    // projection, the WHERE, the ORDER BY - is resolved exactly as it
+    // would be over a real relation, against that synthetic view.
+    if let Some(dbr) = db.as_ref() {
+        if let Some((inner_sql, alias)) = parse_derived_table(table_s) {
+            let mut inner_params: Vec<Option<Descriptor>> = Vec::new();
+            let Some(inner) = plan_query_inner(&inner_sql, db, &mut inner_params) else {
+                if trace {
+                    eprintln!("[srv] plan: derived table {:?} not planned", inner_sql);
+                }
+                return Some(Plan::Refused);
+            };
+            if !inner_params.is_empty() {
+                return Some(Plan::Refused); // a `?` inside a derived table
+            }
+            let inner_cols = output_cols_of(&inner);
+            if inner_cols.is_empty() {
+                return Some(Plan::Refused);
+            }
+            let (columns, descs) = derived_view(&inner_cols);
+            // the alias qualifies its columns, exactly as a table's name
+            // or alias does - and is stripped the same way
+            let unq = |t: &str| {
+                unqualify_single(t, &[alias.as_str()]).unwrap_or_else(|| t.to_string())
+            };
+            let computed = Default::default();
+            let mut cols: Vec<ProjCol> = Vec::new();
+            match parse_projection(&unq(proj_s))? {
+                Proj::Star => {
+                    for (i, c) in inner_cols.iter().enumerate() {
+                        cols.push(ProjCol { field_id: i, expr: None, ..c.clone() });
+                    }
+                }
+                Proj::Items(items) => {
+                    for it in items {
+                        match it {
+                            SelItem::Col(name, alias_of) => {
+                                let mut pc =
+                                    build_projcols(&[name], &columns, &descs, &computed)?
+                                        .into_iter()
+                                        .next()?;
+                                if let Some(a) = alias_of {
+                                    pc.name = a;
+                                }
+                                cols.push(pc);
+                            }
+                            SelItem::Expr(raw, name) => {
+                                cols.push(build_expr_col(&raw, &name, &columns, &descs)?)
+                            }
+                            _ => return Some(Plan::Refused),
+                        }
+                    }
+                }
+            }
+            let mut np = 0usize;
+            let filter = match where_s {
+                None => None,
+                Some(ws) => {
+                    let ws = unq(ws);
+                    Some(resolve_predicate(
+                        tokenize(&ws).and_then(|t| parse_predicate(&t, &mut np))?,
+                        &columns,
+                        &descs,
+                        params,
+                    )?)
+                }
+            };
+            let order_by = match order_s {
+                None => Vec::new(),
+                Some(os) => parse_order_by_expr(
+                    &unq(os),
+                    &cols,
+                    |n| {
+                        columns
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(n))
+                            .map(|c| c.field_id as usize)
+                    },
+                    |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
+                )?,
+            };
+            // GROUP BY over a derived table needs the fold to run above
+            // the leaf, which is a later slice - refused rather than
+            // silently ignored
+            if group_s.is_some() || having_s.is_some() {
+                return Some(Plan::Refused);
+            }
+            let _ = dbr;
+            if trace {
+                eprintln!("[srv] plan: derived table {:?} as {}", inner_sql, alias);
+            }
+            return Some(Plan::Derived {
+                inner: Box::new(inner),
+                cols,
+                filter,
+                order_by,
+            });
+        }
+    }
+
     // A SUBQUERY IN THE SELECT LIST - `SELECT ID, (SELECT COUNT(*) FROM
     // D) FROM T`. A subquery that names no outer column is a CONSTANT for
     // the whole statement, so it is evaluated once here and FOLDED BACK
@@ -12761,6 +12895,89 @@ fn plan_query_inner(
 /// expression item must BE one of the expression keys, an aggregate's
 /// output type follows its function and source) live here once.
 #[allow(clippy::too_many_arguments)]
+/// The DESCRIPTOR an output column carries, so a query ABOVE it can type
+/// and resolve against its rows.
+///
+/// A derived table's rows come from a plan, not from a relation, so
+/// there is no stored format to read - the shape has to be recovered
+/// from what the inner query ANNOUNCES. The announcement is exactly the
+/// describe the client would receive, which is the right source: if the
+/// outer query and the client disagree about a column's type, one of
+/// them is wrong.
+///
+/// The OFFSET is deliberately non-zero. `is_computed_fid` reads
+/// `offset == 0 && length != 0` as "this is a computed column", so a
+/// freshly built descriptor claims to be one and every expression over
+/// it refuses - a trap this codebase has already paid for once.
+fn desc_of_projcol(c: &ProjCol) -> Descriptor {
+    // the describe adds 1 for NULLABLE; the type is the even value
+    let t = c.sql_type & !1;
+    let (dtype, length) = match t {
+        448 => (dtype::VARYING, (c.length + 2) as u16),
+        452 => (dtype::TEXT, c.length as u16),
+        500 => (dtype::SHORT, 2),
+        496 => (dtype::LONG, 4),
+        580 => (dtype::INT64, 8),
+        32752 => (dtype::INT128, 16),
+        480 => (dtype::DOUBLE, 8),
+        482 => (dtype::REAL, 4),
+        570 => (dtype::SQL_DATE, 4),
+        560 => (dtype::SQL_TIME, 4),
+        510 => (dtype::TIMESTAMP, 8),
+        32764 => (dtype::BOOLEAN, 1),
+        _ => (dtype::INT64, 8),
+    };
+    Descriptor {
+        dtype,
+        scale: c.scale as i8,
+        length,
+        sub_type: c.sub_type as i16,
+        flags: 0,
+        offset: 1,
+    }
+}
+
+/// A derived table's columns and descriptors, as the outer query sees
+/// them: one per output column of the inner plan, in order.
+fn derived_view(inner_cols: &[ProjCol]) -> (Vec<RelationColumn>, Vec<Descriptor>) {
+    let columns = inner_cols
+        .iter()
+        .enumerate()
+        .map(|(i, c)| RelationColumn {
+            name: c.name.clone(),
+            field_id: i as u16,
+            position: i as u16,
+        })
+        .collect();
+    (columns, inner_cols.iter().map(desc_of_projcol).collect())
+}
+
+/// Split `( <select> ) [AS] <alias>` - a DERIVED TABLE in the FROM.
+/// Returns the inner query text and the alias, which SQL requires.
+fn parse_derived_table(from_s: &str) -> Option<(String, String)> {
+    let t = from_s.trim();
+    if !t.starts_with('(') {
+        return None;
+    }
+    let close = matching_paren(t.as_bytes(), 0)?;
+    let inner = t[1..close].trim().to_string();
+    let up = mask_literals(&inner.to_ascii_uppercase());
+    if find_word(&up, "SELECT", 0) != Some(0) {
+        return None;
+    }
+    let mut rest = t[close + 1..].trim();
+    if let Some(r) = rest.strip_prefix("AS ").or_else(|| rest.strip_prefix("as ")) {
+        rest = r.trim();
+    }
+    let alias = rest.trim_matches('"');
+    // the engine REQUIRES a name for a derived table; without one there
+    // is nothing to qualify its columns with
+    if !ident_ok(alias) {
+        return None;
+    }
+    Some((inner, alias.to_ascii_uppercase()))
+}
+
 /// The DESCRIPTOR of an aggregate's result - what the group row holds in
 /// that slot, so an expression built over it types like any column.
 ///
@@ -14248,7 +14465,8 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         Plan::Union { cols, .. }
         | Plan::ProcSelect { cols, .. }
         | Plan::ProcRows { cols, .. }
-        | Plan::Modified { cols, .. } => build_describe(cols, params),
+        | Plan::Modified { cols, .. }
+        | Plan::Derived { cols, .. } => build_describe(cols, params),
         Plan::Refused | Plan::RefusedEval(_) => build_describe(&[], params),
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
@@ -14314,7 +14532,8 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         Plan::Union { .. }
         | Plan::ProcSelect { .. }
         | Plan::ProcRows { .. }
-        | Plan::Modified { .. } => 1,
+        | Plan::Modified { .. }
+        | Plan::Derived { .. } => 1,
         Plan::Scalar(..)
         | Plan::GenIdIncrement { .. }
         | Plan::Project { .. }
@@ -14410,7 +14629,8 @@ fn output_cols_of(plan: &Plan) -> Vec<ProjCol> {
         Plan::Union { cols, .. }
         | Plan::ProcSelect { cols, .. }
         | Plan::ProcRows { cols, .. }
-        | Plan::Modified { cols, .. } => cols.clone(),
+        | Plan::Modified { cols, .. }
+        | Plan::Derived { cols, .. } => cols.clone(),
         _ => Vec::new(),
     }
 }
@@ -15023,6 +15243,27 @@ fn emit_rows_inner(
                     for values in &rows {
                         encode_row(w, cols, values)?;
                     }
+                }
+            }
+        }
+        Plan::Derived { inner, cols, filter, order_by } => {
+            if let Some(db) = db {
+                // the inner plan's rows are a MATERIALISED LEAF; the
+                // outer WHERE and ORDER BY are nodes above it - the same
+                // Rows -> Filter -> Sort the grouped join builds
+                let rows = branch_rows(inner, db, args)
+                    .ok_or(EmitErr::Eval(EvalErr::ConversionError(None)))?;
+                let out = RowSource::Sort {
+                    input: Box::new(RowSource::Filter {
+                        input: Box::new(RowSource::Rows(rows)),
+                        pred: bind_filter(filter, args)?,
+                    }),
+                    keys: order_by.clone(),
+                }
+                .rows(db)
+                .map_err(EmitErr::Eval)?;
+                for values in &out {
+                    encode_row(w, cols, values)?;
                 }
             }
         }
@@ -18868,6 +19109,34 @@ fn mask_literals(up: &str) -> String {
 /// begins). The last occurrence is taken so a string literal containing
 /// the phrase earlier in a WHERE clause does not shadow the real clause
 /// (the caller additionally masks literals out).
+/// The paren DEPTH at a byte position of masked, uppercased SQL.
+fn paren_depth_at(masked_up: &str, at: usize) -> i32 {
+    masked_up[..at].bytes().fold(0i32, |d, c| match c {
+        b'(' => d + 1,
+        b')' => d - 1,
+        _ => d,
+    })
+}
+
+/// The first occurrence of `word` at paren depth 0.
+///
+/// A clause keyword INSIDE parentheses belongs to something else - a
+/// derived table's own WHERE, a subquery's ORDER BY - and splitting the
+/// outer statement there tears it in half. `FROM` has been found this
+/// way since function arguments carry their own FROM (`SUBSTRING(S FROM
+/// 2)`); every other clause keyword needed it the moment a derived table
+/// could appear in the FROM.
+fn find_word_depth0(masked_up: &str, word: &str, from: usize) -> Option<usize> {
+    let mut cand = find_word(masked_up, word, from);
+    loop {
+        let p = cand?;
+        if paren_depth_at(masked_up, p) == 0 {
+            return Some(p);
+        }
+        cand = find_word(masked_up, word, p + word.len());
+    }
+}
+
 fn find_kw_by(up: &str, kw: &str) -> Option<(usize, usize)> {
     let mut result = None;
     let mut from = 0;
@@ -18881,6 +19150,9 @@ fn find_kw_by(up: &str, kw: &str) -> Option<(usize, usize)> {
             && t[ws] == b'B'
             && t[ws + 1] == b'Y'
             && (t.len() == ws + 2 || !is_ident_byte(t[ws + 2]))
+            // ... and at paren depth 0: a GROUP BY or ORDER BY inside a
+            // derived table or a subquery is that query's, not this one's
+            && paren_depth_at(up, p) == 0
         {
             result = Some((p, p + kw.len() + ws + 2));
         }
@@ -20126,9 +20398,9 @@ fn split_query(
     // original.
     let masked = mask_literals(&up[after..]);
 
-    let where_pos = find_word(&masked, "WHERE", 0);
+    let where_pos = find_word_depth0(&masked, "WHERE", 0);
     let group = find_kw_by(&masked, "GROUP");
-    let having_pos = find_word(&masked, "HAVING", 0);
+    let having_pos = find_word_depth0(&masked, "HAVING", 0);
     let order = find_kw_by(&masked, "ORDER");
     let group_kw = group.map(|(k, _)| k);
     let order_kw = order.map(|(k, _)| k);

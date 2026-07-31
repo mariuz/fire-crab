@@ -50,8 +50,10 @@ pulled by the fetch.
   a LEFT-DEEP tree instead of folding, so "each step's kind applies to
   everything accumulated so far" is true by construction; the WHERE is a
   `Filter` above the whole join.
-- **R4 — derived tables**: `FROM (SELECT ...)`, the first capability the
-  tree unlocks that the rewriting could not reach.
+- **R4 — derived tables**: `FROM (SELECT ...)`. *(done)* The first
+  capability the tree unlocks that the rewriting could not reach: a
+  derived table has no name to substitute, so the outer query resolves
+  against a synthetic view built from the inner plan's DESCRIBE.
 - **R5 — a materialised CTE**, which retires the "CTE body must be a
   single-table projection" refusal.
 - **R6 — `WITH RECURSIVE`**, a fixpoint over the tree.

@@ -13,6 +13,49 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — R4: derived tables
+
+**The first capability the row-source tree unlocks**, and the reason it
+could not be reached before is worth stating: every earlier "query over a
+query" here worked by SUBSTITUTING A NAME. A view has a catalog entry; a
+CTE has one written in the statement. Both could be expanded into the
+FROM and re-planned. **A derived table has neither** — its columns exist
+only because the inner query ANNOUNCES them, and its rows exist only
+because something RAN it.
+
+### Converted
+- **`SELECT ... FROM (SELECT ...) X`**, with the outer projection, WHERE
+  and ORDER BY resolved against a synthetic view built from the inner
+  plan's **describe** — the same move the join makes with its combined
+  row and the group makes with its folded one. The describe is the right
+  source: if the outer query and the CLIENT disagree about a column's
+  type, one of them is wrong.
+- The inner plan's rows become a materialised leaf, with the outer WHERE
+  and ORDER BY as nodes above it: `Rows → Filter → Sort`.
+- Renamed and computed inner columns work, because they are exactly what
+  an announcement is for; so do nested derived tables, FIRST/SKIP/
+  DISTINCT above one, and a derived table as a row source for
+  `INSERT ... SELECT`.
+
+### Fixed
+- **The clause splitter was not paren-aware.** It found the first
+  `WHERE`/`GROUP BY`/`HAVING`/`ORDER BY` keyword ANYWHERE in the text, and
+  a derived table puts one inside parentheses — so the outer statement
+  was torn in half at the inner query's WHERE. `FROM` had been found at
+  paren depth 0 since `SUBSTRING(S FROM 2)` needed it; now every clause
+  keyword is. That change touches EVERY statement, which is why the new
+  gate ends with subquery, grouped and `SUBSTRING` checks that have
+  nothing to do with derived tables.
+
+### Guarded
+- A column the inner query did not project refuses rather than answering
+  NULL; `GROUP BY` over a derived table refuses (the fold has to run
+  above the leaf — a later slice); and a derived table with no alias
+  refuses, because SQL requires the name.
+
+`qa/serve-real-derived.sh` is new, 32 checks. 38 behaviour gates and 363
+unit tests confirm nothing else moved.
+
 ## 2026-07-31 — R3: NestedLoopJoin is a node
 
 ### Converted
