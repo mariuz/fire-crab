@@ -177,6 +177,14 @@ engine_finds "the blank-stripped key" "SELECT ID FROM T WHERE NAME = 'delta'"
 engine_finds "every key, in index order" \
              "SELECT ID FROM T WHERE NAME >= 'a' ORDER BY NAME"
 engine_finds "the integer index beside it" "SELECT ID FROM T WHERE N >= 50 ORDER BY N"
+# THE EMPTY STRING IS THE ONE BYTE WHERE THE TWO TEXT ITYPES DIFFER:
+# idx_string pads an empty value to a BLANK (0x20), idx_metadata to 0x00
+# (btr.cpp:3593). So this check is what proves the write path took the
+# itype from the INDEX ROOT - what the engine stamped - rather than
+# guessing one from the column's dtype, which would key every UTF8
+# column as idx_string and put this row at the wrong place in the tree.
+engine_finds "an EMPTY text key, where idx_string and idx_metadata disagree" \
+             "SELECT ID FROM T WHERE NAME = ''"
 
 # --- 3. and the pages are sound ---------------------------------------
 ran=$((ran + 1))
@@ -189,8 +197,8 @@ else
 fi
 
 rm -f "$A" "$B"
-if [ "$ran" -lt 20 ]; then
-    echo "DIFF only $ran checks ran (expected at least 20) - did one silently skip?"
+if [ "$ran" -lt 21 ]; then
+    echo "DIFF only $ran checks ran (expected at least 21) - did one silently skip?"
     fail=1
 fi
 exit $fail

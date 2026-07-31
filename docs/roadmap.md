@@ -133,6 +133,19 @@ plus *the subsystem is now on the path*.
     - `eval_subquery` / `build_correlated_lookup` — a subquery's own
       retrieval.
     - the JOIN's inner side.
+  - **A predicted bug that measurement did not confirm, recorded as
+    such.** `ods::ddl::index_itype` maps every TEXT/VARYING column to
+    `idx_string`, ignoring the charset, so a `CREATE INDEX` issued to
+    fire-crab on a UTF8 column stamps itype 1 where the engine stamps 4.
+    It was expected to produce an index the engine misreads. It does
+    not: the engine builds its lookup keys from the itype IN THE INDEX
+    ROOT, so the index is self-consistent either way, a gbak round trip
+    normalises it, and the two encodings differ only for the EMPTY
+    string. The WRITE path was never at risk because
+    `resolve_index_ops` reads the itype from the root too — which the
+    gate now pins with an empty-string lookup, the one byte where
+    `idx_string` (0x20) and `idx_metadata` (0x00) disagree. It remains a
+    metadata divergence worth closing, not a wrong answer.
   - Still to do: index-driven joins,
     text keys (a collation makes the key a collation key), compound
     prefixes, and parameters (their values arrive after the plan is
