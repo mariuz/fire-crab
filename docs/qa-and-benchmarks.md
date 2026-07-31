@@ -7852,6 +7852,41 @@ and the sort runs, because reading a few records beats walking the whole
 relation to save a sort. When they are the same index you get both, which is the
 case worth having — and it is `opt`'s rule too.
 
+**Then a row that moved was returned twice, and the rule had to be stated more
+carefully.** "An index names candidates and the predicate decides" is not
+enough. An entry outlives the version that wrote it — an UPDATE adds the new key
+and leaves the old — so a record whose key *changed* is named by **both**
+entries. A range covering both fetched it twice, and the predicate could not
+catch it, because the row genuinely matches:
+
+```
+UPDATE T SET ID = 20 WHERE ID = 1;
+SELECT ID FROM T ORDER BY ID;   -- [20, 2, 20]      the engine: [2, 20]
+```
+
+In a navigating retrieval it was worse: the row also appeared at the *old* key's
+position, so the order was wrong as well. This was live for two increments and
+no gate caught it — none of them changed a key column and then asked a question
+whose range spanned both places. The fix is the engine's own arrangement: the
+key travels back with the record number, and a candidate survives only if the
+fetched record still carries that key. The gate now moves a key to the far end of
+the tree and asks every question that spans both.
+
+**And a whole class of database could not be written to at all.** A text index on
+a UTF8 column is stamped `idx_metadata`, not `idx_string`, and the accept-list in
+`resolve_index_ops` was one name short. That function returns None for the *whole
+relation* when any index carries an itype the write path cannot key, and the
+INSERT planner takes it with `?` — so on a UTF8 database, which is the default in
+this project's own hands-on samples, a table with a text index accepted no INSERT
+and no UPDATE. Reads worked, which is exactly why nobody noticed: every gate here
+builds its scratch database in the default NONE charset, so the entire test
+estate shared one blind spot. The encoder had been right all along.
+
+Its gate's decisive check is not that fire-crab accepts the write. The server is
+stopped and **the engine reads the file back through its own index**, with `SET
+PLAN ON` so the PLAN line proves an index was used rather than a scan; a key
+written differently from the engine's would find nothing there.
+
 **What is not wired yet, named so it is not assumed.** Index-driven joins, text
 and scaled keys, compound prefixes, `OR` (which needs a retrieval per branch and
 a merge), `<>`, and parameters — whose values arrive after the plan is built.

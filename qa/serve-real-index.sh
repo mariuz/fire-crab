@@ -424,6 +424,39 @@ esac
 both "the whole table, after all of it" "SELECT ID, SALARY FROM EMP ORDER BY ID"
 
 
+
+# --- 5c. A ROW THAT MOVED - the failure this section exists for --------
+# An index entry OUTLIVES the version that wrote it: an UPDATE adds the
+# new key and leaves the old one for garbage collection. So a record
+# whose key changed is named by BOTH entries, and a RANGE that covers
+# both fetches it TWICE - the predicate cannot catch that, because the
+# row genuinely matches. In a NAVIGATING retrieval it is worse: the row
+# also appears at the OLD key's position, so the order is wrong too.
+#
+# This was live for two increments (ranges, then navigation) and no gate
+# caught it, because none of them changed a key column and then asked a
+# question whose range spanned both keys. Every check below does.
+both "move a row's key to the far end" "UPDATE EMP SET ID = 40 WHERE ID = 2"
+both "... a full walk returns it ONCE, in its new place" \
+     "SELECT ID FROM EMP ORDER BY ID"
+both "... and so does a range covering both keys" \
+     "SELECT ID FROM EMP WHERE ID > 0 ORDER BY ID"
+both "... counted" "SELECT COUNT(*) AS K FROM EMP WHERE ID > 0"
+both "... the OLD key finds nothing" "SELECT ID FROM EMP WHERE ID = 2"
+both "... the NEW key finds one row" "SELECT ID FROM EMP WHERE ID = 40"
+both "move it back" "UPDATE EMP SET ID = 2 WHERE ID = 40"
+both "... and the walk is stable again" "SELECT ID FROM EMP ORDER BY ID"
+# the same for a non-unique index, where the row moves between groups
+both "move a row between groups" "UPDATE EMP SET DEPT_ID = 7 WHERE ID = 3"
+both "... the old group no longer holds it" \
+     "SELECT ID FROM EMP WHERE DEPT_ID = 2 ORDER BY ID"
+both "... the new one does, once" "SELECT ID FROM EMP WHERE DEPT_ID = 7"
+both "... and a range over the whole column is unchanged in size" \
+     "SELECT COUNT(*) AS K FROM EMP WHERE DEPT_ID > -100"
+# and a DELETE whose target was found through an index
+both "delete through an index, then walk" "DELETE FROM EMP WHERE ID = 6"
+both "... the walk agrees" "SELECT ID FROM EMP ORDER BY ID"
+
 # --- 5b. THE FOREIGN KEY CHECK, which scanned once per written row -----
 # `does a parent row with this key exist` is an EXISTENCE test, and the
 # referenced side always carries a UNIQUE index because SQL requires one.
@@ -565,8 +598,8 @@ else
 fi
 
 rm -f "$A" "$B"
-if [ "$ran" -lt 135 ]; then
-    echo "DIFF only $ran checks ran (expected at least 135) - did one silently skip?"
+if [ "$ran" -lt 148 ]; then
+    echo "DIFF only $ran checks ran (expected at least 148) - did one silently skip?"
     fail=1
 fi
 exit $fail

@@ -13,6 +13,66 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — W1f: a row that moved was returned twice
+
+### Fixed
+- **An index entry outlives the version that wrote it, and that is not
+  merely a wasted fetch.** An UPDATE adds the new key and leaves the old
+  one for garbage collection, so a record whose key changed is named by
+  **both** entries. A range covering both fetched it twice — and the
+  predicate cannot catch that, because the row genuinely matches. In a
+  navigating retrieval it was worse: the row also appeared at the OLD
+  key's position, so the order was wrong too.
+
+  ```
+  UPDATE T SET ID = 20 WHERE ID = 1;
+  SELECT ID FROM T ORDER BY ID;   -- [20, 2, 20]   engine: [2, 20]
+  ```
+
+  This was live for two increments — ranges, then navigation — and no
+  gate caught it, because none of them changed a key column and then
+  asked a question whose range spanned both keys.
+- **The fix is the engine's own rule**: `btr::lookup_range` returns
+  `(key, record number)` pairs now, and a candidate is kept only when the
+  fetched record STILL CARRIES that key (`IndexPick::entry_is_current`,
+  which rebuilds the key from the record with the same encoder). That
+  makes the earlier claim true rather than approximately true.
+
+### Converted
+- **`UPDATE`/`DELETE ... WHERE` retrieve through the index.** A write
+  reads before it writes, and `collect_dml_targets` had been walking
+  every page — it never appeared in any count of retrieval sites because
+  it has its own scan rather than calling `for_each_record`.
+
+`qa/serve-real-index.sh` grows to 200 checks, with a section that moves a
+key to the far end of the tree and asks every question whose range spans
+both places. 28 gates and 370 unit tests confirm nothing else moved.
+
+## 2026-07-31 — A UTF8 database could not be written to at all
+
+### Fixed
+- **A text index on a UTF8 column is stamped `idx_metadata` (itype 4),
+  not `idx_string`**, and `resolve_index_ops` did not list itype 4. It
+  returns None for the WHOLE RELATION when any index carries an itype the
+  write path cannot key, and the INSERT planner takes that with `?` — so
+  on a UTF8 database, **the default character set in this project's own
+  hands-on samples**, a table with a text index accepted no INSERT and no
+  UPDATE whatsoever. The engine took both. Reads worked, which is exactly
+  why it went unnoticed: every gate here builds its scratch database in
+  the default NONE charset.
+- `btw::index_key` had encoded itype 4 correctly all along
+  (`INTL_string_to_key` for `ttype_metadata`: plain bytes, trailing
+  spaces stripped, an empty value padding to `0x00` rather than the blank
+  `idx_string` uses). The conversion was right; the accept-list was one
+  name short.
+
+New `qa/serve-real-utf8index.sh` (20 checks). Its decisive check is not
+that fire-crab accepts the write: the server is stopped and **the engine
+reads the file back through its own index**, with `SET PLAN ON` so the
+PLAN line proves an index was used rather than a scan — a key written
+differently from the engine's would find nothing there — and `gfix -v
+-full` then validates the pages.
+
 ## 2026-07-31 — W1e: the foreign-key check stops scanning
 
 ### Converted

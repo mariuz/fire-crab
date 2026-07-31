@@ -126,9 +126,10 @@ plus *the subsystem is now on the path*.
       relation **per written row**. It drives the parent's unique index
       now; the whole key is known, so a compound index is a point lookup
       rather than a prefix range. A text key still scans.
-    - **`collect_dml_targets`** — `UPDATE`/`DELETE ... WHERE <indexed> =
-      k` walks every page. It has its own scan rather than going through
-      `for_each_record`, which is why it never appeared in the count.
+    - **`collect_dml_targets`** — *(done)* `UPDATE`/`DELETE ... WHERE`
+      retrieves through the index now. It had its own scan rather than
+      going through `for_each_record`, which is why it never appeared in
+      the count.
     - `eval_subquery` / `build_correlated_lookup` — a subquery's own
       retrieval.
     - the JOIN's inner side.
@@ -137,6 +138,13 @@ plus *the subsystem is now on the path*.
     prefixes, and parameters (their values arrive after the plan is
     built). Also: a statement `opt` cannot parse - a `HAVING`, for one -
     scans, because the retrieval inherits the optimizer's own limits.
+  - **The rule that took two increments to state correctly.** "An index
+    names candidates, the predicate decides" is not enough: an entry
+    outlives the version that wrote it, so a record whose key CHANGED is
+    named by both its old and its new entry, and a range covering both
+    returns it TWICE — which no predicate can catch, because the row
+    genuinely matches. A candidate is kept only if the fetched record
+    still carries the entry's key.
   - It also fixed a pre-existing wrong answer it was in a position to
     see: uniqueness was read from the index ENTRIES, which outlive their
     records, so re-inserting a deleted key was refused against an engine

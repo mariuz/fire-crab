@@ -345,7 +345,7 @@ pub fn lookup_key(
     relation: u16,
     index_id: u8,
     key: &[u8],
-) -> Option<Vec<u64>> {
+) -> Option<Vec<(Vec<u8>, u64)>> {
     lookup_range(
         file,
         page_size,
@@ -368,12 +368,22 @@ pub fn lookup_key(
 ///
 /// This is what makes a retrieval INDEX-DRIVEN rather than a scan: the
 /// tree is descended once per level, and only the leaf pages inside the
-/// range are read. What it returns is a set of CANDIDATES, never an
-/// answer: index entries survive the rows they describe (an UPDATE adds
-/// the new key and leaves the old one for garbage collection, a DELETE
-/// removes nothing), so the caller must fetch each record and apply the
-/// predicate. That is the engine's own arrangement, and it is why a
-/// stale entry costs a wasted fetch rather than a wrong row.
+/// range are read.
+///
+/// What it returns is a set of CANDIDATES, never an answer - each as
+/// `(key, record number)`. Index entries survive the rows they describe:
+/// an UPDATE adds the new key and LEAVES THE OLD ONE for garbage
+/// collection, and a DELETE removes nothing. So the caller must fetch
+/// each record and check TWO things, not one:
+///
+///   - the predicate, as it would over a full scan; and
+///   - that the record STILL CARRIES THIS KEY.
+///
+/// The second is not optional. A record whose key changed is named by
+/// BOTH entries, and if a range covers both it is fetched twice and, in
+/// a navigating retrieval, appears at the OLD key's position. The
+/// predicate cannot catch either - the row genuinely matches. That is
+/// why the key travels back with the record number.
 ///
 /// The key encoding is ORDER-PRESERVING (that is what `compress` is
 /// for), so a byte range IS a value range - for an ASCENDING index. A
@@ -386,7 +396,7 @@ pub fn lookup_range(
     index_id: u8,
     lo: Option<(&[u8], bool)>,
     hi: Option<(&[u8], bool)>,
-) -> Option<Vec<u64>> {
+) -> Option<Vec<(Vec<u8>, u64)>> {
     let root_no = find_index_root(file, page_size, relation)?
         .entry(index_id)?
         .root_page;
@@ -472,7 +482,11 @@ pub fn lookup_range(
                 },
             };
             if admitted {
-                out.push(node.record_number);
+                // the KEY travels with the record number: an entry
+                // outlives the version that put it there, so the caller
+                // has to be able to ask whether the record it names
+                // still carries this key
+                out.push((leaf_key.clone(), node.record_number));
             }
             at = node.next_at;
         }
@@ -486,6 +500,10 @@ pub fn lookup_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recnos_of(r: Option<Vec<(Vec<u8>, u64)>>) -> Vec<u64> {
+        r.unwrap().into_iter().map(|(_, n)| n).collect()
+    }
 
     /// The retrieval half against the WRITE half: build a real index
     /// with `btw::insert_index_entry`, then ask `lookup_key` for keys
@@ -517,17 +535,17 @@ mod tests {
         }
 
         // a key with one entry
-        assert_eq!(lookup_key(&file, page_size, rel, 0, &key(5)), Some(vec![50]));
+        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(5))), vec![50]);
         // the first and the last, which are where a descent goes wrong
-        assert_eq!(lookup_key(&file, page_size, rel, 0, &key(1)), Some(vec![10]));
-        assert_eq!(lookup_key(&file, page_size, rel, 0, &key(7)), Some(vec![70]));
+        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(1))), vec![10]);
+        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(7))), vec![70]);
         // DUPLICATES come back together, in record-number order
-        assert_eq!(lookup_key(&file, page_size, rel, 0, &key(3)), Some(vec![30, 31]));
+        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(3))), vec![30, 31]);
         // a key that is not there is an EMPTY answer, not a nearby one -
         // returning the neighbour is how an index lookup invents rows
-        assert_eq!(lookup_key(&file, page_size, rel, 0, &key(4)), Some(vec![]));
-        assert_eq!(lookup_key(&file, page_size, rel, 0, &key(0)), Some(vec![]));
-        assert_eq!(lookup_key(&file, page_size, rel, 0, &key(9)), Some(vec![]));
+        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(4))), Vec::<u64>::new());
+        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(0))), Vec::<u64>::new());
+        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(9))), Vec::<u64>::new());
         // and the whole level still walks, so the two agree
         let all = walk_index_leaves(&file, page_size, rel, 0).unwrap();
         assert_eq!(all.len(), 5);
@@ -569,6 +587,9 @@ mod tests {
                 hk.as_ref().map(|(k, i)| (k.as_slice(), *i)),
             )
             .unwrap()
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect::<Vec<u64>>()
         };
 
         // inclusivity, one bound at a time
@@ -589,7 +610,7 @@ mod tests {
         // and an equality is the degenerate range, which is what
         // `lookup_key` asks for
         assert_eq!(range(Some((5, true)), Some((5, true))), vec![50]);
-        assert_eq!(lookup_key(&file, page_size, rel, 0, &key(5)), Some(vec![50]));
+        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(5))), vec![50]);
     }
 
     /// Every slot with a root page carries entries, whatever its state

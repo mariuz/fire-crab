@@ -1733,6 +1733,29 @@ them.
   "use the index", and choosing the wrong one is a pessimisation that
   every correctness gate passes.
 
+- **"The slow path still decides" protects against wrong rows, not
+  against wrong MULTIPLICITY.** An index entry here outlives the record
+  version that wrote it, so a row whose key changed is named twice, and
+  re-applying the predicate cannot help: the row matches both times. Any
+  accelerator that maps one logical row to several physical entries owes
+  you a second check — that the entry still describes the record it
+  names — and it is separate from the filter, not a special case of it.
+
+- **When every fixture shares a setting, that setting is untested.**
+  Every scratch database in this project is created in the default
+  character set, so a text index on a UTF8 column — the character set the
+  project's own samples use — was never once exercised. The failure was
+  not subtle when finally provoked: no INSERT and no UPDATE succeeded on
+  such a table at all. Ask what your fixtures have in common, and build
+  one that does not.
+
+- **A refusal can be an outage.** The accept-list that skipped the UTF8
+  index type did not narrow an optimisation; it made a resolver return
+  None, and its caller turned that into "refuse the statement". A
+  conservative default is only conservative where its caller treats it as
+  one — trace what happens to your "I cannot do this safely" value before
+  trusting it to be safe.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

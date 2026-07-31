@@ -1016,9 +1016,8 @@ impl RowSource {
                 Ok(out)
             }
             RowSource::IndexScan { rel, formats, pick, width } => {
-                let recnos = pick.recnos(&db.bytes, db.page_size, *rel);
                 let mut out = Vec::new();
-                for values in records_at(db, *rel, formats, &recnos) {
+                for values in records_for(db, *rel, formats, pick) {
                     let mut row = values;
                     if let Some(w) = width {
                         row.resize(*w, Value::Null);
@@ -1660,6 +1659,8 @@ AlterDomainRename {
         /// FKs REFERENCING this table whose key columns the SET list
         /// touches - a changed key must not leave child rows behind
         fk_children: Vec<FkPartner>,
+        /// the access path for finding the rows to update
+        index: Option<IndexPick>,
     },
     /// `UPDATE OR INSERT INTO <t> (cols) VALUES (...) [MATCHING
     /// (cols)]`: the engine's own execution plan - try the update whose
@@ -1680,6 +1681,10 @@ AlterDomainRename {
         /// referenced by any child row (NO ACTION - the action rules
         /// are refused at plan time by the flag-4 trigger guard)
         fk_children: Vec<FkPartner>,
+        /// the access path for finding the rows to delete - a WRITE
+        /// reads before it writes, and that read is a retrieval like
+        /// any other
+        index: Option<IndexPick>,
     },
     Project {
         rel: u16,
@@ -2889,7 +2894,8 @@ fn fk_partner_has(db: &Database, fk: &FkPartner, key: &[&Value]) -> bool {
                 recnos.len()
             );
         }
-        return records_at(db, fk.other_rel, &fk.other_formats, &recnos)
+        let nums: Vec<u64> = recnos.iter().map(|(_, n)| *n).collect();
+        return records_at(db, fk.other_rel, &fk.other_formats, &nums)
             .iter()
             .any(|v| matches_key(v));
     }
@@ -2910,7 +2916,7 @@ fn fk_partner_has(db: &Database, fk: &FkPartner, key: &[&Value]) -> bool {
 /// missed parent row turns a legal INSERT into a foreign-key violation.
 /// So the index's segments must be exactly the partnership's columns, in
 /// order, and every one an integer at scale 0.
-fn fk_partner_lookup(db: &Database, fk: &FkPartner, key: &[&Value]) -> Option<Vec<u64>> {
+fn fk_partner_lookup(db: &Database, fk: &FkPartner, key: &[&Value]) -> Option<Vec<(Vec<u8>, u64)>> {
     use fire_crab_ods::btw;
     let (_, descs) = fk.other_formats.iter().max_by_key(|(n, _)| *n)?;
     let ops = resolve_index_ops(db, fk.other_rel, descs)?;
@@ -8832,6 +8838,7 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     let touched = |fk: &FkPartner| fk.my_fids.iter().any(|f| set_fids.contains(f));
     let fk_refs: Vec<FkPartner> = fk_refs.into_iter().filter(|fk| touched(fk)).collect();
     let fk_children: Vec<FkPartner> = fk_children.into_iter().filter(|fk| touched(fk)).collect();
+    let index = choose_index(db, rel, table, descs, &filter, sql, &[]);
     Some((
         Plan::Update {
             rel,
@@ -8844,6 +8851,7 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
             checks,
             fk_refs,
             fk_children,
+            index,
         },
         params,
     ))
@@ -8906,19 +8914,86 @@ fn plan_delete(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     // NO ACTION FKs referencing this table: each deleted row's key must
     // be checked for child references at execute
     let (_, fk_children) = fk_partners(db, table, &columns)?;
-    Some((Plan::Delete { rel, formats, filter, fk_children }, params))
+    let index = choose_index(db, rel, table, descs, &filter, sql, &[]);
+    Some((Plan::Delete { rel, formats, filter, fk_children, index }, params))
 }
 
 /// The DML target walk: every committed primary record of `rel` the
 /// filter accepts, with the page/slot address the version-chain writer
 /// needs, the record's stored format, and its unpacked image (what an
 /// UPDATE patch starts from).
+/// The DML target walk, driven by an index: the same result as the page
+/// scan, over the candidates the index names.
+///
+/// The tuple is (page number, slot, format, image) - the physical
+/// identity the write path needs - so a record number has to be turned
+/// back into a page and a slot, which is `recno_of` read backwards.
+fn dml_targets_at(
+    db: &Database,
+    rel: u16,
+    formats: &[(u8, Vec<Descriptor>)],
+    filter: &Option<Predicate>,
+    pick: &IndexPick,
+) -> Result<Vec<(u32, u16, u8, Vec<u8>)>, EvalErr> {
+    let per_page = fire_crab_ods::format::max_recs_per_dp(db.page_size);
+    if per_page == 0 {
+        return Ok(Vec::new());
+    }
+    let pages = relation_data_pages(&db.bytes, db.page_size, rel);
+    let mut out = Vec::new();
+    for (entry_key, recno) in pick.candidates(&db.bytes, db.page_size, rel) {
+        let seq = (recno / per_page) as usize;
+        let slot = (recno % per_page) as u16;
+        let Some(&dp_no) = pages.get(seq) else { continue };
+        let start = dp_no as usize * db.page_size;
+        let Some(dp) = db
+            .bytes
+            .get(start..start + db.page_size)
+            .and_then(DataPage::decode)
+        else {
+            continue;
+        };
+        if dp.sequence as u64 != recno / per_page {
+            continue;
+        }
+        let Some(r) = dp.records().nth(slot as usize) else { continue };
+        if !r.is_primary_record() {
+            continue;
+        }
+        let Some(image) = r.image() else { continue };
+        let descs = formats
+            .iter()
+            .find(|(n, _)| *n == r.format)
+            .or_else(|| formats.iter().max_by_key(|(n, _)| *n));
+        let Some((_, descs)) = descs else { continue };
+        let values = decode_record(&image, descs);
+        // an entry the record no longer answers to would write the same
+        // row twice (an UPDATE leaves the old entry behind)
+        if !pick.entry_is_current(&entry_key, &values) {
+            continue;
+        }
+        if filter.as_ref().map_or(Ok(true), |p| p.matches(&values))? {
+            out.push((dp_no, r.slot, r.format, image));
+        }
+    }
+    Ok(out)
+}
+
 fn collect_dml_targets(
     db: &Database,
     rel: u16,
     formats: &[(u8, Vec<Descriptor>)],
     filter: &Option<Predicate>,
+    index: &Option<IndexPick>,
 ) -> Result<Vec<(u32, u16, u8, Vec<u8>)>, EvalErr> {
+    // A WRITE READS FIRST, and that read is a retrieval like any other:
+    // `DELETE FROM T WHERE ID = 5` had been walking every page of T. The
+    // index names candidates and the same filter still decides which of
+    // them are written, so this narrows the walk and cannot change which
+    // rows the statement touches.
+    if let Some(pick) = index {
+        return dml_targets_at(db, rel, formats, filter, pick);
+    }
     let mut out = Vec::new();
     for dp_no in relation_data_pages(&db.bytes, db.page_size, rel) {
         let start = dp_no as usize * db.page_size;
@@ -9447,7 +9522,7 @@ fn execute_dml_collecting(
             }
             (1, 0, 0)
         }
-        Plan::Update { rel, format_no, formats, sets, filter, index_ops, not_null, checks, fk_refs, fk_children } => {
+        Plan::Update { rel, format_no, formats, sets, filter, index_ops, not_null, checks, fk_refs, fk_children, index } => {
             let descs = formats
                 .iter()
                 .find(|(n, _)| n == format_no)
@@ -9480,7 +9555,7 @@ fn execute_dml_collecting(
             let mut targets: Vec<(u32, u16, Vec<u8>)> = Vec::new();
             let mut old_images: Vec<Vec<u8>> = Vec::new();
             for (page, slot, fmt, image) in
-                collect_dml_targets(db, *rel, formats, filter).map_err(ExecErr::Eval)?
+                collect_dml_targets(db, *rel, formats, filter, index).map_err(ExecErr::Eval)?
             {
                 // the SET offsets were resolved in the NEWEST format; a
                 // record still stored in an older one would patch wrong
@@ -9616,11 +9691,11 @@ fn execute_dml_collecting(
             }
             (0, out.affected as i32, 0)
         }
-        Plan::Delete { rel, formats, filter, fk_children } => {
+        Plan::Delete { rel, formats, filter, fk_children, index } => {
             let filter = &bind_filter(filter, args)?;
             let mut targets: Vec<(u32, u16)> = Vec::new();
             for (page, slot, fmt, image) in
-                collect_dml_targets(db, *rel, formats, filter).map_err(ExecErr::Eval)?
+                collect_dml_targets(db, *rel, formats, filter, index).map_err(ExecErr::Eval)?
             {
                 // NO ACTION partner check, per deleted row: its key
                 // must not be referenced by any child (the row's own
@@ -9674,6 +9749,7 @@ fn execute_dml_collecting(
 /// itype, scale each), key direction, and whether duplicates are
 /// refused. Resolved at plan time from the index root page
 /// (irt_repeat + the irtd array).
+#[derive(Clone, Debug, PartialEq)]
 struct IndexOp {
     id: u8,
     segs: Vec<(usize, u16, i8)>,
@@ -9715,7 +9791,9 @@ impl IndexOp {
 /// identity `btr` navigates by; `key` is the encoded search key.
 #[derive(Clone, Debug, PartialEq)]
 struct IndexPick {
-    id: u8,
+    /// the index itself, kept whole because verifying a candidate means
+    /// REBUILDING ITS KEY from the fetched record
+    op: IndexOp,
     /// lower bound as (key, inclusive); None is unbounded below
     lo: Option<(Vec<u8>, bool)>,
     /// upper bound; None is unbounded above
@@ -9782,16 +9860,31 @@ fn leaf_source(
 }
 
 impl IndexPick {
-    fn recnos(&self, bytes: &[u8], page_size: usize, rel: u16) -> Vec<u64> {
+    /// The candidates this pick offers: `(entry key, record number)`.
+    fn candidates(&self, bytes: &[u8], page_size: usize, rel: u16) -> Vec<(Vec<u8>, u64)> {
         fire_crab_ods::btr::lookup_range(
             bytes,
             page_size,
             rel,
-            self.id,
+            self.op.id,
             self.lo.as_ref().map(|(k, i)| (k.as_slice(), *i)),
             self.hi.as_ref().map(|(k, i)| (k.as_slice(), *i)),
         )
         .unwrap_or_default()
+    }
+
+    /// Does `values` - a record the index named - STILL CARRY the key
+    /// the entry was found under?
+    ///
+    /// An entry outlives the version that wrote it, so a record whose
+    /// key changed is named by BOTH its old and its new entry. If a
+    /// range covers both, the row is fetched twice and, in a navigating
+    /// retrieval, appears at the OLD key's position. The predicate above
+    /// cannot catch either, because the row genuinely matches. This is
+    /// the check that makes a stale entry cost a wasted fetch instead of
+    /// a duplicated row.
+    fn entry_is_current(&self, entry_key: &[u8], values: &[Value]) -> bool {
+        self.op.key_for(values).is_some_and(|(k, _)| k == entry_key)
     }
 }
 
@@ -9948,7 +10041,7 @@ fn choose_index(
         if op.descending {
             std::mem::swap(&mut lo, &mut hi);
         }
-        let pick = IndexPick { id: op.id, lo, hi, navigate: nav };
+        let pick = IndexPick { op: op.clone(), lo, hi, navigate: nav };
         // BOUNDS BEAT NAVIGATION. An index that bounds the retrieval
         // reads a few records; one that merely delivers the order walks
         // the whole relation to save a sort. When they are the same
@@ -9993,6 +10086,18 @@ fn resolve_index_ops(db: &Database, rel: u16, descs: &[Descriptor]) -> Option<Ve
             if !matches!(
                 itype,
                 btw::IDX_STRING
+                    // A UTF8 text index is stamped IDX_METADATA, not
+                    // IDX_STRING - and leaving it out of this list did
+                    // not narrow a retrieval, it REFUSED EVERY WRITE to
+                    // the relation: `resolve_index_ops(..)?` returns
+                    // None for the whole table when any index carries an
+                    // itype the write path cannot key, and INSERT takes
+                    // it with `?`. On a UTF8 database - the default in
+                    // this project's own samples - a table with a text
+                    // index accepted no INSERT and no UPDATE at all,
+                    // while the engine took both. `btw::index_key` has
+                    // encoded itype 4 all along.
+                    | btw::IDX_METADATA
                     | btw::IDX_NUMERIC
                     | btw::IDX_NUMERIC2
                     | btw::IDX_SQL_DATE
@@ -10107,7 +10212,11 @@ fn unique_conflict(
         // inside `insert_index_entry` rather than allowing a duplicate
         return true;
     };
-    let others: Vec<u64> = candidates.into_iter().filter(|r| *r != recno).collect();
+    let others: Vec<u64> = candidates
+        .into_iter()
+        .map(|(_, r)| r)
+        .filter(|r| *r != recno)
+        .collect();
     if others.is_empty() {
         return false;
     }
@@ -13320,7 +13429,7 @@ fn plan_query_inner(
                 match &index {
                     Some(p) => eprintln!(
                     "[srv] index scan: rel={} index={} lo={:?} hi={:?} navigate={}",
-                    rel, p.id, p.lo, p.hi, p.navigate
+                    rel, p.op.id, p.lo, p.hi, p.navigate
                 ),
                     None => eprintln!("[srv] natural scan: rel={}", rel),
                 }
@@ -13368,7 +13477,7 @@ fn plan_query_inner(
                 match &agg_index {
                     Some(p) => eprintln!(
                         "[srv] index scan: rel={} index={} lo={:?} hi={:?} navigate={}",
-                        rel, p.id, p.lo, p.hi, p.navigate
+                        rel, p.op.id, p.lo, p.hi, p.navigate
                     ),
                     None => eprintln!("[srv] natural scan: rel={}", rel),
                 }
@@ -13497,7 +13606,7 @@ fn plan_query_inner(
             match &index {
                 Some(p) => eprintln!(
                     "[srv] index scan: rel={} index={} lo={:?} hi={:?} navigate={}",
-                    rel, p.id, p.lo, p.hi, p.navigate
+                    rel, p.op.id, p.lo, p.hi, p.navigate
                 ),
                 None => eprintln!("[srv] natural scan: rel={}", rel),
             }
@@ -13528,7 +13637,7 @@ fn plan_query_inner(
                 match &index {
                     Some(p) => eprintln!(
                         "[srv] index scan: rel={} index={} lo={:?} hi={:?} navigate={}",
-                        rel, p.id, p.lo, p.hi, p.navigate
+                        rel, p.op.id, p.lo, p.hi, p.navigate
                     ),
                     None => eprintln!("[srv] natural scan: rel={}", rel),
                 }
@@ -14619,6 +14728,27 @@ fn records_at(
     records_at_in(&db.bytes, db.page_size, rel, formats, recnos)
 }
 
+/// The records a PICK's candidates name, with every candidate whose
+/// record no longer carries its key dropped - see
+/// [IndexPick::entry_is_current], which is what keeps a row that moved
+/// from being returned twice.
+fn records_for(
+    db: &Database,
+    rel: u16,
+    formats: &[(u8, Vec<Descriptor>)],
+    pick: &IndexPick,
+) -> Vec<Vec<Value>> {
+    let mut out = Vec::new();
+    for (entry_key, recno) in pick.candidates(&db.bytes, db.page_size, rel) {
+        for values in records_at_in(&db.bytes, db.page_size, rel, formats, &[recno]) {
+            if pick.entry_is_current(&entry_key, &values) {
+                out.push(values);
+            }
+        }
+    }
+    out
+}
+
 fn records_at_in(
     bytes: &[u8],
     page_size: usize,
@@ -14681,8 +14811,7 @@ fn for_each_candidate<F: FnMut(&[Value])>(
         for_each_record(db, rel, formats, f);
         return;
     };
-    let recnos = pick.recnos(&db.bytes, db.page_size, rel);
-    for values in records_at(db, rel, formats, &recnos) {
+    for values in records_for(db, rel, formats, pick) {
         f(&values);
     }
 }
@@ -32525,7 +32654,7 @@ mod tests {
         // scan and an index retrieval differ in what they READ, and the
         // Filter/Sort above them is identical either way
         let pick = IndexPick {
-            id: 2,
+            op: IndexOp { id: 2, segs: vec![(0, 8, 0)], descending: false, unique: true },
             lo: Some((vec![0xC0, 8], true)),
             hi: Some((vec![0xC0, 8], true)),
             navigate: false,
@@ -32538,7 +32667,7 @@ mod tests {
                     RowSource::Filter { input, .. } => match input.as_ref() {
                         RowSource::TableScan { .. } => "scan".to_string(),
                         RowSource::IndexScan { pick, .. } => {
-                            format!("index {} {:?}", pick.id, pick.lo)
+                            format!("index {} {:?}", pick.op.id, pick.lo)
                         }
                         _ => "other".to_string(),
                     },
@@ -32570,6 +32699,31 @@ mod tests {
             Some(IndexPick { navigate: true, ..pick }),
         );
         assert!(matches!(navigated, RowSource::Filter { .. }));
+    }
+
+    #[test]
+    fn an_entry_is_only_valid_while_the_record_still_carries_its_key() {
+        // An index entry outlives the version that wrote it: an UPDATE
+        // adds the new key and LEAVES THE OLD ONE. A record whose key
+        // changed is therefore named by both entries, and a range
+        // covering both would return the row TWICE - which the
+        // predicate cannot catch, because the row genuinely matches.
+        let op = IndexOp {
+            id: 0,
+            segs: vec![(0, fire_crab_ods::btw::IDX_NUMERIC, 0)],
+            descending: false,
+            unique: true,
+        };
+        let pick = IndexPick { op: op.clone(), lo: None, hi: None, navigate: false };
+        let row_now = vec![Value::Int(20)];
+        let key_now = op.key_for(&row_now).unwrap().0;
+        let key_then = op.key_for(&[Value::Int(1)]).unwrap().0;
+        assert_ne!(key_now, key_then);
+
+        // the entry the record still answers to is kept ...
+        assert!(pick.entry_is_current(&key_now, &row_now));
+        // ... and the one it has moved away from is dropped
+        assert!(!pick.entry_is_current(&key_then, &row_now));
     }
 
     #[test]
