@@ -7262,6 +7262,61 @@ which. The engine resolves it from the full scope; this server would have to
 guess a side, and guessing produces a wrong answer rather than an error. The
 qualified spelling is converted, and the refusal is checked.
 
+### The rest of the SELECT, over a join (`qa/serve-real-joinexpr.sh`, 46 checks)
+
+The join had been converted in pieces over many increments: projections, a
+WHERE, the ON as a full predicate, chains of any length, CROSS and NATURAL,
+GROUP BY, HAVING, aggregates, outer padding. What it never had was the rest of
+an ordinary SELECT. Its select list took **bare columns and nothing else**, so
+
+```sql
+SELECT E.SALARY + 1 FROM EMP E JOIN DEPT D ON E.DEPT_ID = D.ID
+```
+
+refused — as did every CASE, CAST, function, COALESCE, IIF and
+condition-as-value. `DISTINCT`, `FIRST`, `SKIP` and `ROWS` refused over a join,
+and so did `ORDER BY <expression>`.
+
+**None of these is a join feature.** Each is a capability the single-relation
+path has had for increments. That is why this gate is organised by CAPABILITY
+rather than by join shape, and why it re-runs the single-table twin of every
+group in the same file: the bug class here is not "joins are missing X", it is
+"X was taught to one path", and the only defence is to check both.
+
+The three pieces that made it work were all already present:
+
+- The **combined view** — a join's rows seen as one synthetic relation — was
+  built for the ON resolver. Handing it to `build_expr_col` lets the ordinary
+  select-list expression builder run over a join with no changes.
+- **`branch_rows`** is what materialises rows for a `DISTINCT`/`FIRST` wrapper.
+  It knew `Project`, `Union` and `ProcRows`, so teaching it `Join` and
+  `JoinGroup` gave `INSERT ... SELECT` and `FOR SELECT` loops the same row
+  sources at the same time.
+- **`sort_rows`** — the sort that *evaluates* expression keys — existed in this
+  file **with no callers at all**.
+
+That last one is the dangerous half of the increment. `Plan::Join`,
+`Plan::JoinGroup` and `Plan::Group` each sorted with `order_cmp`, which reads a
+key's `field` and ignores its `expr`. So the moment the ORDER BY parser was
+given an expression resolver, the join **accepted** `ORDER BY E.SALARY + 0` and
+sorted by field 0 — the natural row order, confidently, with no error. The
+first probe after wiring the parser showed exactly that: four rows in id order
+where the engine returned them salary-first. A refusal had become a wrong
+answer, which is the one direction a conversion must never move in.
+
+It was visible only because the fixture makes the two orders disagree: the
+lowest salary belongs to the **highest** id, so any sort that quietly used the
+row order answers `1,2,3,4` where the engine answers `4,1,2,3`. A fixture whose
+sort keys happened to agree with its ids would have passed the wrong
+implementation.
+
+The one shape this gate compares against **isql** rather than the twin is
+concatenation. `SELECT E.NAME || D.DNAME` over a join returns
+`string right truncation` from *the engine* through this driver — a
+node-firebird limit already documented here for joined text columns — so the
+twin has no oracle and isql is the reference instead. fire-crab's answer
+matches isql exactly.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

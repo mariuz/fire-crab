@@ -13,6 +13,47 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — the rest of the SELECT, over a join
+
+### Converted
+- **EXPRESSIONS in a join's select list.** The join had projections, a
+  WHERE, ON predicates, chains, GROUP BY and aggregates — and a select
+  list that took BARE COLUMNS AND NOTHING ELSE. `SELECT E.SALARY + 1
+  FROM ... JOIN ...` refused, and so did every CASE, CAST, function,
+  COALESCE, IIF and condition-as-value. The combined view (a join's rows
+  seen as one synthetic relation) already existed for the ON resolver, so
+  the ordinary `build_expr_col` runs over it unchanged.
+- **`DISTINCT`, `FIRST`, `SKIP` and `ROWS` over a join**, including over
+  a grouped join and a join through a view. `branch_rows` is what
+  materialises rows for those wrappers and it knew Project, Union and
+  ProcRows; teaching it Join and JoinGroup gave `INSERT ... SELECT` and
+  `FOR SELECT` the same sources at the same time.
+- **`ORDER BY <expression>` over a join** — arithmetic, a CASE, a
+  function, an expression spanning both sides, alone or beside a column
+  key, and composing with FIRST and DISTINCT.
+
+### Fixed
+- **An expression sort key was accepted and then IGNORED.** `sort_rows`
+  — the sort that EVALUATES a key's expression — existed in this file
+  with NO CALLERS. `Plan::Join`, `Plan::JoinGroup` and `Plan::Group` all
+  sorted with `order_cmp`, which reads a key's FIELD and ignores its
+  expression, so the moment the join accepted `ORDER BY E.SALARY + 0` it
+  sorted by field 0 instead. Wiring the ORDER BY parser up without this
+  would have turned a refusal into a wrong answer, which is the worse of
+  the two.
+
+None of these are join FEATURES: each is a capability the single-relation
+path has had for increments and the join path never learned. That is the
+failure shape this project keeps meeting, and it is why
+`qa/serve-real-joinexpr.sh` (new, 46 checks) is organised by CAPABILITY
+rather than by join shape — every check has a single-table twin, and
+those twins are re-run in the same file so a fix on one path cannot
+quietly break the other.
+
+The fixture's lowest salary belongs to its highest id, so every
+expression sort puts that row where the natural row order never would —
+a sort that ignored the expression answers the id order, visibly.
+
 ## 2026-07-31 — a view's columns keep the view's names
 
 ### Fixed

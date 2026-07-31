@@ -10017,9 +10017,23 @@ fn plan_join(
             }
         }
         Proj::Items(items) => {
+            // The combined row is a synthetic single relation, which is
+            // what lets the ORDINARY expression resolver run over a join:
+            // an item like `E.SALARY + 1` or `UPPER(E.NAME)` is built by
+            // the same `build_expr_col` a one-table projection uses, with
+            // the combined view standing in for the table's columns.
+            // Without this the join's select list took bare columns and
+            // NOTHING else - every arithmetic, CASE, CAST, function and
+            // COALESCE item refused.
+            let (comb_cols, comb_descs) = combined_view(&sides);
             for item in items {
-                let SelItem::Col(name, alias) = item else {
-                    return None; // aggregates over a join: fall back
+                let (name, alias) = match item {
+                    SelItem::Col(name, alias) => (name, alias),
+                    SelItem::Expr(e, out_name) => {
+                        cols.push(build_expr_col(e, out_name, &comb_cols, &comb_descs)?);
+                        continue;
+                    }
+                    _ => return None, // aggregates over a join: fall back
                 };
                 let (idx, d, colname) = resolve_join_col(&sides, name)?;
                 let (wire, sql_type, length, scale, sub_type) = wire_for(d);
@@ -10046,11 +10060,19 @@ fn plan_join(
         return None;
     }
 
+    // `ORDER BY <expression>` over a join, resolved against the same
+    // combined view the select list uses - the single-relation path has
+    // taken expression sort keys for several increments and this one
+    // took names and ordinals only.
+    let (ord_cols, ord_descs) = combined_view(&sides);
     let order_by = match order_s {
         None => Vec::new(),
-        Some(os) => parse_order_by(os, &cols, |n| {
-            resolve_join_col(&sides, n).map(|(idx, _, _)| idx)
-        })?,
+        Some(os) => parse_order_by_expr(
+            os,
+            &cols,
+            |n| resolve_join_col(&sides, n).map(|(idx, _, _)| idx),
+            |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &ord_cols, &ord_descs)),
+        )?,
     };
 
     Some(Plan::Join {
@@ -11090,6 +11112,51 @@ fn branch_rows(
         }
         return Some(rows.into_iter().skip(*skip).take(take.unwrap_or(usize::MAX)).collect());
     }
+    // A JOIN is a row source too, so DISTINCT/FIRST/SKIP/ROWS may wrap
+    // one - and so may an INSERT ... SELECT or a FOR SELECT loop, which
+    // all arrive here. The rows are sorted on the COMBINED row (the
+    // ORDER BY indexes it, not the projection) and then projected, the
+    // same two steps `Plan::Project` takes below.
+    if let Plan::Join { base_rel, base_formats, base_width, parts, cols, filter, order_by } = plan
+    {
+        let filter = bind_filter(filter, args).ok()?;
+        let mut rows =
+            join_rows(db, *base_rel, base_formats, *base_width, parts, &filter).ok()?;
+        if !order_by.is_empty() {
+            sort_rows(&mut rows, order_by).ok()?;
+        }
+        return rows
+            .iter()
+            .map(|values| cols.iter().map(|c| c.value_of(values).ok()).collect())
+            .collect();
+    }
+    if let Plan::JoinGroup {
+        base_rel,
+        base_formats,
+        base_width,
+        parts,
+        cols,
+        gitems,
+        key_fids,
+        key_exprs,
+        synth_base,
+        filter,
+        having,
+        order_by,
+    } = plan
+    {
+        let filter = bind_filter(filter, args).ok()?;
+        let input = join_rows(db, *base_rel, base_formats, *base_width, parts, &filter).ok()?;
+        let mut rows =
+            group_rows(input, gitems, key_fids, key_exprs, *synth_base, having).ok()?;
+        if !order_by.is_empty() {
+            sort_rows(&mut rows, order_by).ok()?;
+        }
+        return rows
+            .iter()
+            .map(|values| cols.iter().map(|c| c.value_of(values).ok()).collect())
+            .collect();
+    }
     let Plan::Project { rel, formats, cols, filter, .. } = plan else {
         return None;
     };
@@ -11325,6 +11392,8 @@ fn plan_query_inner(
                 | Plan::Union { .. }
                 | Plan::ProcRows { .. }
                 | Plan::ProcSelect { .. }
+                | Plan::Join { .. }
+                | Plan::JoinGroup { .. }
         ) {
             return Some(Plan::Refused);
         }
@@ -13843,7 +13912,7 @@ fn emit_rows_inner(
                     join_rows(db, *base_rel, base_formats, *base_width, parts, &filter)
                         .map_err(EmitErr::Eval)?;
                 if !order_by.is_empty() {
-                    rows.sort_by(|a, b| order_cmp(a, b, order_by));
+                    sort_rows(&mut rows, order_by).map_err(EmitErr::Eval)?;
                 }
                 for values in &rows {
                     encode_row(w, cols, values)?;
@@ -13876,7 +13945,7 @@ fn emit_rows_inner(
                     group_rows(input, gitems, key_fids, key_exprs, *synth_base, having)
                         .map_err(EmitErr::Eval)?;
                 if !order_by.is_empty() {
-                    rows.sort_by(|a, b| order_cmp(a, b, order_by));
+                    sort_rows(&mut rows, order_by).map_err(EmitErr::Eval)?;
                 }
                 for values in &rows {
                     encode_row(w, cols, values)?;
@@ -13905,7 +13974,7 @@ fn emit_rows_inner(
                 if !order_by.is_empty() {
                     // order_by keys are output indexes; output rows are
                     // aligned with gitems/cols, so order_cmp applies as-is
-                    rows.sort_by(|a, b| order_cmp(a, b, order_by));
+                    sort_rows(&mut rows, order_by).map_err(EmitErr::Eval)?;
                 }
                 for values in &rows {
                     encode_row(w, cols, values)?;
@@ -24049,6 +24118,37 @@ pub fn serve(addr: &str, user: &str, password: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_expression_sort_key_is_evaluated() {
+        // `sort_rows` existed with NO CALLERS while Join, JoinGroup and
+        // Group sorted with `order_cmp`, which reads a key's FIELD and
+        // ignores its expression - so an expression key silently sorted
+        // by field 0. Here field 0 and the expression disagree on every
+        // pair, which is what a fixture for this has to do.
+        let mut rows = vec![
+            vec![Value::Int(1), Value::Int(100)],
+            vec![Value::Int(2), Value::Int(200)],
+            vec![Value::Int(3), Value::Int(50)],
+        ];
+        let key = OrderKey {
+            field: 0,
+            expr: Some(Expr::Col(1)),
+            desc: false,
+            nulls: NullsAt::Default,
+        };
+        sort_rows(&mut rows, &[key]).unwrap();
+        let ids: Vec<i64> = rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Int(i) => i,
+                _ => -1,
+            })
+            .collect();
+        // by the EXPRESSION (column 1): 50, 100, 200 -> ids 3, 1, 2.
+        // Sorting by the key's FIELD would have answered 1, 2, 3.
+        assert_eq!(ids, vec![3, 1, 2]);
+    }
 
     #[test]
     fn one_relation_qualifiers_are_stripped() {

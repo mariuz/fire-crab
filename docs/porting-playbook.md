@@ -1402,6 +1402,23 @@ them.
   for the ones that assert it: a refusal test that keeps passing after
   the refusal is gone is worse than a deleted one.
 
+- **Dead code that SHOULD be live is a bug waiting for its caller.** The
+  expression-aware sort here existed, was correct, was unit-testable, and
+  had NO CALLERS - three plans sorted with the field-only comparator
+  instead. Nothing failed, because nothing yet produced an expression
+  sort key. The day one did, the feature "worked" and sorted by the wrong
+  column. When you add a capability, grep for the helper that already
+  implements it before writing the wiring, and grep for the helper's
+  CALLERS before trusting that it runs.
+
+- **Turning a refusal into a wrong answer is the one direction you must
+  never move.** Wiring an ORDER BY parser to accept expressions took ten
+  minutes; without the sort fix it would have shipped a query that
+  answers confidently in the wrong order. When you lift a refusal, the
+  first probe should be one whose CORRECT answer differs from the answer
+  the old code path would produce - if you cannot construct that probe,
+  you cannot tell the two apart.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with
