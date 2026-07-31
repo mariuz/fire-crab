@@ -9909,13 +9909,37 @@ fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
 ///     TIES. Duplicates come back in record-number order, which is an
 ///     order the engine has not promised - and an all-NULL key is
 ///     exempt from uniqueness, so a nullable unique column can tie too.
-fn navigates(db: &Database, table: &str, op: &IndexOp, order_by: &[OrderKey]) -> bool {
+fn navigates(
+    db: &Database,
+    table: &str,
+    descs: &[Descriptor],
+    op: &IndexOp,
+    order_by: &[OrderKey],
+) -> bool {
     let [key] = order_by else { return false };
     if key.desc || key.expr.is_some() || !matches!(key.nulls, NullsAt::Default) {
         return false;
     }
     if op.descending || !op.unique {
         return false;
+    }
+    // Navigation trusts the WALK's order, so it must only be taken over
+    // a key this server can rebuild exactly - the same families the
+    // search key is built from. A FLOAT or scaled segment cannot be
+    // re-keyed, so its entries cannot be judged, and an unjudgeable
+    // entry may be stale and sit at the wrong place in the walk.
+    let [(seg, itype, _)] = op.segs.as_slice() else { return false };
+    let text = matches!(*itype, fire_crab_ods::btw::IDX_STRING | fire_crab_ods::btw::IDX_METADATA);
+    if !text {
+        if !matches!(
+            *itype,
+            fire_crab_ods::btw::IDX_NUMERIC | fire_crab_ods::btw::IDX_NUMERIC2
+        ) {
+            return false;
+        }
+        if descs.get(*seg).is_none_or(|d| d.scale != 0) {
+            return false;
+        }
     }
     let [(seg_fid, _, _)] = op.segs.as_slice() else { return false };
     if *seg_fid != key.field {
@@ -9967,7 +9991,20 @@ impl IndexPick {
     /// the check that makes a stale entry cost a wasted fetch instead of
     /// a duplicated row.
     fn entry_is_current(&self, entry_key: &[u8], values: &[Value]) -> bool {
-        self.op.key_for(values).is_some_and(|(k, _)| k == entry_key)
+        match self.op.key_for(values) {
+            Some((k, _)) => k == entry_key,
+            // THE KEY COULD NOT BE REBUILT, so this check has NOTHING TO
+            // SAY - and it must therefore say nothing. Answering "stale"
+            // here DROPS the row, which is how a FLOAT column emptied
+            // every retrieval over its index, how a scaled NUMERIC lost
+            // most of its values, and how i64::MIN came back through a
+            // door the search-key guard had already closed. The
+            // predicate above still decides, and the record-number
+            // dedup still collapses duplicates, so keeping an
+            // unjudgeable candidate costs a wasted comparison. Dropping
+            // one costs a row.
+            None => true,
+        }
     }
 }
 
@@ -10203,7 +10240,7 @@ fn pick_for_terms(
             }
             bounded = true;
         }
-        let nav = navigates(db, table, op, order_by);
+        let nav = navigates(db, table, descs, op, order_by);
         if !bounded && !nav {
             continue; // nothing to bound the walk and nothing to gain
         }
@@ -14901,17 +14938,36 @@ fn records_for(
     // same key on the same record, and the row came back TWICE.
     // ACROSS BANDS TOO: a row can satisfy two branches of an OR, and
     // `A = 1 OR B = 2` would then return it twice.
-    let mut seen: Vec<u64> = Vec::new();
+    // COLLECT EVERY CANDIDATE FIRST - do NOT dedup here. A record can be
+    // named by a STALE entry and by its current one, and the stale one
+    // may come first; dropping the later duplicate would then leave only
+    // the entry that fails verification, and the row would vanish. The
+    // dedup belongs on ACCEPTANCE, below.
+    let mut cands: Vec<(&IndexPick, Vec<u8>, u64)> = Vec::new();
     for pick in &access.picks {
         for (entry_key, recno) in pick.candidates(&db.bytes, db.page_size, rel) {
-            if seen.contains(&recno) {
-                continue;
-            }
-            for values in records_at_in(&db.bytes, db.page_size, rel, formats, &[recno]) {
-                if pick.entry_is_current(&entry_key, &values) {
-                    seen.push(recno);
-                    out.push(values);
-                }
+            cands.push((pick, entry_key, recno));
+        }
+    }
+    // IN RECORD ORDER, unless the walk IS the order. The engine's
+    // non-navigational retrieval ORs its branches into a record-number
+    // bitmap and hands rows back in RECORD order; ours came back in band
+    // order, then key order within a band. With no ORDER BY that is an
+    // unordered result either way - until `FIRST 2` makes it a
+    // different SET OF ROWS, which is what this cost. Navigation is the
+    // exception: there the key order is the answer.
+    if !access.navigate() {
+        cands.sort_by_key(|(_, _, recno)| *recno);
+    }
+    let mut seen: Vec<u64> = Vec::new();
+    for (pick, entry_key, recno) in cands {
+        if seen.contains(&recno) {
+            continue;
+        }
+        for values in records_at_in(&db.bytes, db.page_size, rel, formats, &[recno]) {
+            if pick.entry_is_current(&entry_key, &values) {
+                seen.push(recno);
+                out.push(values);
             }
         }
     }

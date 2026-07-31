@@ -13,6 +13,46 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — W1l: an entry the server cannot judge is not a stale one
+
+The fleet's first hunter came back with four failures against the new
+union-of-bands surface. Three of them were one mistake.
+
+### Fixed
+- **A key that cannot be rebuilt was read as "the entry is stale", which
+  DROPS the row.** A candidate survives only if the fetched record still
+  carries the entry's key — and that means rebuilding the key from the
+  record. When the rebuild fails, the check has nothing to say, and it
+  must therefore say nothing.
+
+  It said plenty. A **FLOAT** column anywhere in an index made every
+  retrieval over that index return the **empty set**. A scaled
+  **DECIMAL** lost most of its values. And **`i64::MIN` came back**
+  through this door after the search-key guard had closed the other one.
+  The predicate above still decides and the record-number dedup still
+  collapses duplicates, so keeping an unjudgeable candidate costs a
+  comparison; dropping one costs a row.
+- **Row order without an `ORDER BY` is not arbitrary — it is the
+  engine's.** Its non-navigational retrieval ORs the branches into a
+  record-number bitmap and returns rows in RECORD order; ours came back
+  in band order, then key order within a band. With no `ORDER BY` that is
+  an unordered result either way, until `FIRST 2` makes it a different
+  **set of rows**. Candidates are sorted by record number now unless the
+  walk *is* the order.
+- **Navigation is restricted to key families the server can rebuild
+  exactly.** Trusting a walk's order means trusting that its entries can
+  be judged.
+
+### And a regression I introduced fixing them
+Deduplicating candidates when they are COLLECTED rather than when they
+are ACCEPTED let a stale entry shadow the valid one: a record named first
+by its stale entry was skipped as a duplicate when its current entry
+arrived, and the row vanished. The moved-key checks caught it
+immediately, which is what they are for.
+
+`qa/serve-real-index.sh` grows to 322 checks. 371 unit tests and 7 gates
+confirm nothing moved.
+
 ## 2026-07-31 — W1k: OR is a union of bands, and so is IN
 
 ### Converted

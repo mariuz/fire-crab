@@ -1796,6 +1796,22 @@ them.
   arrived. A reproducer passing after a change is evidence about the
   reproducer, not about the diagnosis.
 
+- **"I cannot tell" is not "no".** A validity check that rebuilds a key
+  to compare it will sometimes fail to rebuild it — an unsupported type,
+  an edge value — and the tempting default is to treat that as failing
+  the check. Here it deleted rows: a FLOAT column emptied every retrieval
+  over its index. When a check cannot evaluate its own question, it must
+  abstain and let whatever decides correctness downstream decide. Make
+  the abstain case explicit in the signature or in the comment, because
+  `is_some_and` reads as caution and behaves as deletion.
+
+- **An unordered result is only unordered until something slices it.**
+  Two systems can disagree about the order of a query with no ORDER BY
+  and both be right — until `FIRST n` turns that order into a *set*.
+  If you reorder anything, find out what the reference implementation's
+  order actually is (here: record order, because it unions through a
+  record-number bitmap) rather than assuming nobody can tell.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

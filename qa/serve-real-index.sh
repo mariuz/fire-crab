@@ -91,6 +91,11 @@ CREATE TABLE GC (ID INTEGER NOT NULL PRIMARY KEY, K INTEGER);
 CREATE INDEX GC_K ON GC (K);
 CREATE TABLE RT (ID INTEGER NOT NULL PRIMARY KEY, K INTEGER);
 CREATE INDEX RT_K ON RT (K);
+CREATE TABLE UNJ (ID INTEGER, A INTEGER, D DECIMAL(4,1), F FLOAT, B BIGINT);
+CREATE INDEX UNJ_A ON UNJ (A);
+CREATE INDEX UNJ_D ON UNJ (D);
+CREATE INDEX UNJ_AF ON UNJ (A, F);
+CREATE INDEX UNJ_B ON UNJ (B);
 COMMIT;
 INSERT INTO EMP VALUES (1, 1, 100, 'a');
 INSERT INTO EMP VALUES (2, 1, 200, 'b');
@@ -153,6 +158,10 @@ COMMIT;
 INSERT INTO RT VALUES (1, 10);
 INSERT INTO RT VALUES (2, 11);
 INSERT INTO RT VALUES (3, 12);
+INSERT INTO UNJ VALUES (1, 1, 0.1, 0, -9223372036854775808);
+INSERT INTO UNJ VALUES (2, 2, 0.2, 1, 5);
+INSERT INTO UNJ VALUES (3, 3, 0.3, -2.5, 7);
+INSERT INTO UNJ VALUES (4, 1, 9.9, 3.5, 9);
 COMMIT;
 UPDATE RT SET K = 25 WHERE ID = 1;
 UPDATE RT SET K = 10 WHERE ID = 1;
@@ -795,6 +804,57 @@ indexed "... counted once" "SELECT COUNT(*) AS C FROM RT WHERE K = 10"
 indexed "... summed once" "SELECT SUM(K) AS S FROM RT WHERE K >= 0"
 navigated "... and a navigated order is not shifted by it" \
           "SELECT FIRST 2 ID FROM RT ORDER BY ID"
+
+
+# --- 5e. AN ENTRY THE SERVER CANNOT JUDGE ------------------------------
+# A candidate is kept only if the fetched record STILL CARRIES the
+# entry's key - which means REBUILDING the key from the record. When
+# that rebuild FAILS, the check has nothing to say, and it must
+# therefore say nothing: answering "stale" DROPS the row.
+#
+# It dropped a lot. A FLOAT column anywhere in an index made every
+# retrieval over that index return the EMPTY SET (a FLOAT decodes to a
+# value the key encoder does not take). A scaled DECIMAL lost most of
+# its values. And i64::MIN came back through this door after the
+# search-key guard had already closed the other one.
+#
+# The predicate above still decides and the record-number dedup still
+# collapses duplicates, so an unjudgeable candidate costs a comparison.
+# Dropping one costs a row.
+indexed "a row beside a scaled DECIMAL column" "SELECT ID FROM UNJ WHERE A = 3"
+indexed "... and all of them" "SELECT COUNT(*) AS K FROM UNJ WHERE A >= 1"
+# an index ON a scaled column cannot be keyed at all (the stored value
+# is Scaled(raw, scale) and a literal would build a different key), so
+# it scans - and must still be RIGHT
+natural "an index ON the scaled column" "SELECT ID FROM UNJ WHERE D = 0.2"
+indexed "a compound index holding a FLOAT segment" \
+        "SELECT ID FROM UNJ WHERE A = 1 ORDER BY ID"
+# a row holding i64::MIN in a column the retrieval does NOT key on: its
+# entry in the OTHER index cannot be rebuilt, and dropping it for that
+# reason is what the fail-open rule prevents. (The predicate compares
+# against a value that is not i64::MIN - the engine's own comparison
+# against i64::MIN differs from fire-crab's, which is a separate,
+# pre-existing question and not this one.)
+indexed "a row whose OTHER column holds i64::MIN" \
+        "SELECT ID FROM UNJ WHERE A = 1 AND B > -5"
+both "the whole table, whatever it is keyed by" "SELECT ID, A FROM UNJ ORDER BY ID"
+
+# --- 5f. ROW ORDER WITHOUT AN ORDER BY --------------------------------
+# The engine's non-navigational retrieval ORs its branches into a
+# RECORD-NUMBER BITMAP and hands rows back in RECORD order. Ours came
+# back in band order, then key order within a band. With no ORDER BY
+# that is an unordered result either way - until FIRST makes it a
+# different SET OF ROWS.
+both "FIRST over an OR, with no ORDER BY" \
+     "SELECT FIRST 2 ID FROM EMP WHERE DEPT_ID = 2 OR DEPT_ID = 1"
+both "... the branches the other way round" \
+     "SELECT FIRST 2 ID FROM EMP WHERE DEPT_ID = 1 OR DEPT_ID = 2"
+both "... and more of them" \
+     "SELECT FIRST 3 ID FROM EMP WHERE DEPT_ID = 1 OR DEPT_ID = 2"
+both "FIRST over a single band, with no ORDER BY" \
+     "SELECT FIRST 2 ID FROM EMP WHERE DEPT_ID = 1"
+both "SKIP over an OR" \
+     "SELECT SKIP 1 ID FROM EMP WHERE DEPT_ID = 1 OR DEPT_ID = 2"
 
 # --- 6. THE COVERAGE CHECK'S OWN TEETH ---------------------------------
 # Everything above asserts "an index was used". That claim is only worth
