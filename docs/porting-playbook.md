@@ -1658,6 +1658,39 @@ them.
   broken instrument. When a gate fails, find out WHICH check failed
   before you find out why.
 
+- **An accelerator must name CANDIDATES, not answers.** An index in
+  Firebird outlives the rows it describes: an UPDATE adds the new key
+  and leaves the old, a DELETE removes nothing. So the retrieval fetches
+  the records and re-applies the predicate that would have run over a
+  full scan. Keep that shape and a stale entry costs a wasted fetch; drop
+  it and the same entry is a wrong row. The rule generalises past
+  indexes: whenever a faster path narrows a set, decide whether it is
+  allowed to be *approximate in one direction only*, and build so the
+  slow path still has the last word.
+
+- **Then notice that the same rule applies to the WRITER.** Uniqueness
+  here was decided from the index entries, which are exactly the thing
+  that outlives its record — so deleting a row and re-inserting its key
+  was refused against an engine that accepts it. One sentence, two
+  places, and the second was found only because the first was being
+  written down.
+
+- **A wiring slice needs a gate a behaviour gate cannot be.** "The
+  answers do not move" is necessary and says nothing about whether the
+  new subsystem was called at all — *wired in but never used* passes
+  every differential. Assert the path itself, in both directions (it
+  must be taken where it should be and NOT taken where it should not),
+  and then prove the assertion can fail: run a second server with the
+  new path disabled and check that it reports nothing. A coverage check
+  you have never seen fail is a coverage check you have not written.
+
+- **When a faster path can only be wrong by MISSING something, scope it
+  by what you can build exactly.** A refusal is visible; a missing row
+  is not. So the first index slice keys only the types whose encoding
+  was already gated byte-exact, and everything else scans — with the
+  gate asserting the scan, so the boundary is a checked claim rather
+  than a comment.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

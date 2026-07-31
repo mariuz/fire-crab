@@ -13,6 +13,56 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — W1: the first index-driven retrieval
+
+Programme W begins. Every query here was a full scan; a converted
+optimizer chose access paths that nothing executed. Both of those are
+now less true.
+
+### Converted
+- **`btr::lookup_key`** — the retrieval half of `BTR_lookup`: descend to
+  a key, collect the record numbers of the entries that equal it,
+  following the sibling chain while duplicates continue. `ods` could
+  walk a whole leaf level before this; it can now find a key.
+- **The server asks `fire-crab-opt` for the access path.**
+  `crates/wire/Cargo.toml` depends on it for the first time, and
+  `plan_query` — the same converted cost model whose PLAN output is
+  gated against the live engine — decides. When it answers NATURAL, this
+  scans, whatever the predicate looks like.
+- **`RowSource::IndexScan`**, a leaf beside `TableScan`. The tree above
+  it is identical either way: the same `Filter`, the same `Sort`. An
+  index narrows what is READ and never what is ANSWERED, which is what
+  makes "the answers do not move" a property of the shape.
+- The choice is made at PREPARE and carried on `Plan::Project`, which is
+  where the engine makes it too.
+
+### Fixed
+- **Re-inserting a deleted key was refused**, against an engine that
+  accepts it. Uniqueness was read from the index ENTRIES, and entries
+  outlive their records — an UPDATE adds the new key and leaves the old,
+  a DELETE removes nothing. The conflicting records are fetched and
+  their keys recomputed now; only a live record that still carries the
+  key is a duplicate. The cheap entry-level check still runs first and
+  only its REJECTION is re-examined, so a duplicate this cannot disprove
+  is still a duplicate.
+
+### Guarded
+- The mechanics are deliberately narrow — single-segment integer indexes
+  at scale 0, against an integer literal — because a key this cannot
+  build byte-exactly is not a refusal but a **missed row**, the one
+  failure the predicate above cannot catch. Scaled numerics, text (a
+  collation makes the key a collation key), compound prefixes, ranges,
+  `IS NULL`, `OR` and parameters all scan.
+
+New `qa/serve-real-index.sh` (90 checks) is gated twice: the answers
+against the engine, and **the access path itself**, read from the
+server's own log — because "wired in but never used" passes every
+behaviour gate. It asserts an index for the shapes that have one and a
+scan for the shapes that do not, runs a second server with the index
+path switched off (`FC_NO_INDEX`) to prove the coverage checks can fail,
+and interleaves DML so a stale entry has to be survived rather than
+assumed away. 45 gates and 368 unit tests confirm nothing moved.
+
 ## 2026-07-31 — R7: the textual rewriting is gone
 
 The end of Programme R. A view was answered by **rewriting the query

@@ -16,11 +16,14 @@ matters more than the row count:
 |---|---|---|
 | **done** | on-disk structures, record decode + RLE, PIP, pointer/data pages, B-tree decode, TIP/MVCC, GC/sweep, BLR decode | converted and held against an oracle; the server depends on them |
 | **converted, wired** | `ods`, `blb`, `auth`, `svc`, `exe`, `dsql` | the running server links and uses them |
-| **converted, NOT wired** | `opt`, `cch`, `lck`, `evt`, `pio` | a real conversion of a real law, with a gate — that the server never calls |
+| **converted, NOT wired** | `cch`, `lck`, `evt`, `pio` | a real conversion of a real law, with a gate — that the server never calls |
+| **being wired** | `opt` | the server asks it for the access path, and takes an index when it says so (W1) |
 
-That last row is the honest headline. `crates/wire/Cargo.toml` does not
-depend on `fire-crab-opt`, `-cch`, `-lck`, `-evt` or `-pio`. The
-optimizer chooses access paths that nothing executes. The lock manager
+That third row was the honest headline, and W1 has begun on it.
+`crates/wire/Cargo.toml` still does not depend on `-cch`, `-lck`, `-evt`
+or `-pio`. It DOES depend on `fire-crab-opt` now, and the optimizer's
+choice is executed rather than merely printed — for the one shape W1
+covers so far. The lock manager
 decodes a lock table it never enqueues into. The page cache models a
 careful-write graph the read path does not go through.
 
@@ -96,12 +99,27 @@ it", which is a different risk profile from converting something new:
 the oracle already exists, so the gate is *behaviour must not change*
 plus *the subsystem is now on the path*.
 
-- **W1 — index-driven retrieval.** The largest by impact: today every
-  query is a full scan (30 `for_each_record` sites, zero B-tree
-  navigation). `ods::btr` already decodes index pages and `opt` already
-  picks the access path the engine picks. Wire them: equality lookup
-  first, then ranges, then ORDER BY via navigation, then index-driven
-  joins.
+- **W1 — index-driven retrieval.** *(equality lookup done)* The first
+  slice that put a converted subsystem on the running server's path.
+  `crates/wire/Cargo.toml` now depends on `fire-crab-opt`, and **opt
+  makes the choice**: `plan_query` is asked about the statement, and only
+  when it answers `Access::Index` does the retrieval descend a tree
+  (`btr::lookup_key`, new) instead of scanning. The predicate above the
+  leaf is unchanged, so an index narrows what is READ and never what is
+  ANSWERED.
+  - Scope so far: a single-segment integer index at scale 0 against an
+    integer literal, on the projection's retrieval. A key this cannot
+    build byte-exactly would be a MISSED ROW rather than a refusal,
+    which is why the mechanics are narrow and everything else scans.
+  - Still to do: ranges, `ORDER BY` via navigation, index-driven joins,
+    the aggregate's own walk (it has a separate retrieval), text keys
+    (a collation makes the key a collation key), compound prefixes, and
+    parameters (their values arrive after the plan is built).
+  - It also fixed a pre-existing wrong answer it was in a position to
+    see: uniqueness was read from the index ENTRIES, which outlive their
+    records, so re-inserting a deleted key was refused against an engine
+    that accepts it. The conflicting records are fetched and checked now
+    — the same "candidates, not answers" rule.
 - **W2 — the page cache in the read path** (`cch`), then the write path
   with its careful-write precedence.
 - **W3 — platform I/O** (`pio`) under the cache, instead of the server

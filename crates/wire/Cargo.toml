@@ -12,6 +12,7 @@ fire-crab-auth = { path = "../auth" }
 fire-crab-svc = { path = "../svc" }
 fire-crab-blb = { path = "../blb" }
 fire-crab-exe = { path = "../exe" }
+fire-crab-opt = { path = "../opt" }
 
 [[bin]]
 name = "fcwire"

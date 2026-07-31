@@ -7721,6 +7721,64 @@ fixed for the unquoted case only (`bare_ident_ok`), because `"3"` is a
 perfectly legal delimited identifier and the callers strip the quotes before
 asking.
 
+### The first index-driven retrieval (`qa/serve-real-index.sh`, 90 checks)
+
+Two subsystems had been finished and left disconnected. `ods::btr` decoded
+index pages and walked leaf levels; `fire-crab-opt` reproduced the engine's
+access-path choice closely enough to print the same `PLAN` line. Neither was
+ever called by the running server, which answered every query by scanning every
+record.
+
+This slice connects them, and the interesting part is what makes it safe.
+
+**An index names candidates, never answers.** Index entries outlive the rows
+they describe — an UPDATE adds the new key and leaves the old one for garbage
+collection, a DELETE removes nothing at all. So a retrieval that trusted the
+index would return deleted rows. The arrangement instead is the engine's own:
+the index produces record numbers, the records are fetched, and *the same
+predicate that would have run over a full scan still decides every row*. The
+`Filter` above the leaf is untouched; only the leaf changes. That turns "the
+answers do not move" from a hope into a property of the shape — a stale entry
+costs a wasted fetch, and the only way to be wrong is a **missed** entry.
+
+Which is why the mechanics are narrow. A key this server cannot build
+byte-exactly is not a refusal — refusals are visible — it is a missing row.
+So the first slice keys only single-segment integer indexes at scale 0 against
+an integer literal, using the *write path's own* key encoder, which has been
+gated byte-exact against `compress` since long before this. A scaled column
+stores `Scaled(550, -2)` where a literal `5.5` would build a different key
+entirely; text keys are collation keys; a compound index matches on its leading
+segment, but equality on a prefix is a range. All of those scan, and the gate
+asserts that they scan.
+
+**The gate is two gates.** The first is the usual differential: every statement
+against both servers, rows compared. The second is a **coverage** check, and it
+is the one a behaviour gate cannot make — *wired in but never used* passes all
+of them. The server logs the access path it chose and the gate asserts the
+choice, in both directions: an index for the shapes that have one, a natural
+scan for the shapes that do not. A server that always answers "index" is as
+wrong as one that never does.
+
+And because a coverage check that cannot fail is worth nothing, the gate runs a
+**second server with the index path switched off** (`FC_NO_INDEX=1`) and asks
+the same questions again. The rows must be identical — index and scan and
+engine, three ways — and that server must report no index scans at all. That
+last assertion is what gives the other twenty-odd teeth.
+
+**It found a pre-existing wrong answer, in the write path.** Deleting a row and
+re-inserting its key was refused, because uniqueness was read from the index
+entries alone — and the deleted row's entry was still there. The engine accepts
+it. The fix is the same sentence as the retrieval's: the entries name
+candidates, and the records decide. The cheap entry-level check still runs
+first, and only its *rejection* is re-examined, so a duplicate the record check
+cannot disprove is still a duplicate.
+
+**What is not wired yet, named so it is not assumed.** Ranges, `ORDER BY` via
+navigation, index-driven joins, the aggregate's own retrieval walk (it is a
+separate loop), text and scaled keys, compound prefixes, and parameters — whose
+values arrive after the plan is built. The roadmap counts thirty retrieval
+sites; this slice wires the projection's.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

@@ -923,6 +923,25 @@ enum RowSource {
         formats: Vec<(u8, Vec<Descriptor>)>,
         width: Option<usize>,
     },
+    /// the records an INDEX says may match: the tree is descended once
+    /// per level and only the leaf pages holding the key are read, then
+    /// each record number is fetched from its data page.
+    ///
+    /// What the index yields is a set of CANDIDATES, never an answer.
+    /// Index entries survive the rows they describe - an UPDATE adds the
+    /// new key and leaves the old one for garbage collection, a DELETE
+    /// removes nothing - so this node is only ever built UNDER the
+    /// `Filter` that would have run over a full scan, and the predicate
+    /// still decides every row. That is the engine's own arrangement,
+    /// and it is what makes "the answers do not move" true by
+    /// construction rather than by hope.
+    IndexScan {
+        rel: u16,
+        formats: Vec<(u8, Vec<Descriptor>)>,
+        index_id: u8,
+        key: Vec<u8>,
+        width: Option<usize>,
+    },
     /// the rows of `input` that satisfy `pred` (None keeps every row)
     Filter {
         input: Box<RowSource>,
@@ -995,6 +1014,25 @@ impl RowSource {
                     }
                     out.push(row);
                 });
+                Ok(out)
+            }
+            RowSource::IndexScan { rel, formats, index_id, key, width } => {
+                let recnos = fire_crab_ods::btr::lookup_key(
+                    &db.bytes,
+                    db.page_size,
+                    *rel,
+                    *index_id,
+                    key,
+                )
+                .unwrap_or_default();
+                let mut out = Vec::new();
+                for values in records_at(db, *rel, formats, &recnos) {
+                    let mut row = values;
+                    if let Some(w) = width {
+                        row.resize(*w, Value::Null);
+                    }
+                    out.push(row);
+                }
                 Ok(out)
             }
             RowSource::Filter { input, pred } => {
@@ -1080,12 +1118,23 @@ impl RowSource {
         formats: Vec<(u8, Vec<Descriptor>)>,
         pred: Option<Predicate>,
         keys: Vec<OrderKey>,
+        index: Option<IndexPick>,
     ) -> RowSource {
+        // the LEAF is the optimizer's choice; everything above it is
+        // the same tree either way, which is what makes "the answers do
+        // not move" a property of the shape rather than a hope
+        let leaf = match index {
+            Some(p) => RowSource::IndexScan {
+                rel,
+                formats,
+                index_id: p.id,
+                key: p.key,
+                width: None,
+            },
+            None => RowSource::TableScan { rel, formats, width: None },
+        };
         RowSource::Sort {
-            input: Box::new(RowSource::Filter {
-                input: Box::new(RowSource::TableScan { rel, formats, width: None }),
-                pred,
-            }),
+            input: Box::new(RowSource::Filter { input: Box::new(leaf), pred }),
             keys,
         }
     }
@@ -1653,6 +1702,11 @@ AlterDomainRename {
         /// evaluated per emitted row in output order and persisted when
         /// the fetch completes
         gen_cols: Vec<GenCol>,
+        /// the ACCESS PATH, chosen at prepare by `fire-crab-opt`: an
+        /// index-driven retrieval, or None for a full scan. The filter
+        /// above it is the same either way, so this narrows what is
+        /// READ and never what is ANSWERED.
+        index: Option<IndexPick>,
     },
     /// a DERIVED TABLE - `SELECT ... FROM (SELECT ...) X`. The inner
     /// plan produces the rows; the outer projection, WHERE and ORDER BY
@@ -9327,10 +9381,10 @@ fn execute_dml_collecting(
                         .key_for(&values)
                         .ok_or("unsupported value for an index key")?;
                     // only an ALL-NULL key is exempt from uniqueness
-                    // (btr.cpp:5629 key_all_nulls)
-                    fire_crab_ods::btw::insert_index_entry(
-                        &mut work, db.page_size, *rel, op.id, &key, recno,
-                        op.unique && !all_null,
+                    // (btr.cpp:5629 key_all_nulls) - and a key held only
+                    // by entries whose records are GONE is not taken
+                    insert_entry_verified(
+                        &mut work, db.page_size, *rel, op, &key, recno, all_null,
                     )?;
                 }
             }
@@ -9496,9 +9550,8 @@ fn execute_dml_collecting(
                             .key_for(&new_values)
                             .ok_or("unsupported value for an index key")?;
                         if new_key != old_key {
-                            fire_crab_ods::btw::insert_index_entry(
-                                &mut work, db.page_size, *rel, op.id, &new_key, recno,
-                                op.unique && !all_null,
+                            insert_entry_verified(
+                                &mut work, db.page_size, *rel, op, &new_key, recno, all_null,
                             )?;
                         }
                     }
@@ -9600,6 +9653,103 @@ impl IndexOp {
 /// statement is then refused rather than writing records the engine's
 /// index scans would miss. Multi-segment and descending indexes are
 /// maintained.
+/// The index a retrieval will drive, decided at PREPARE - which is
+/// where the engine decides it too. `id` is the index root's slot, the
+/// identity `btr` navigates by; `key` is the encoded search key.
+#[derive(Clone, Debug, PartialEq)]
+struct IndexPick {
+    id: u8,
+    key: Vec<u8>,
+}
+
+/// Choose an index-driven retrieval for a single-relation SELECT, or
+/// None to scan.
+///
+/// The CHOICE is `fire-crab-opt`'s - the same converted cost model that
+/// produces the engine's own PLAN output, asked about this very
+/// statement. Until now nothing called it: the optimizer picked access
+/// paths that nothing executed, and this is the wire that closes that
+/// loop. When opt says NATURAL, this scans, whatever the predicate
+/// looks like.
+///
+/// The MECHANICS are deliberately narrow for a first slice, because a
+/// key this cannot build is not a refusal - it is a MISSED ROW, the one
+/// failure a filter above cannot catch:
+///
+///   - a single-segment index only (a compound index matches on its
+///     leading segment, but then the key is a PREFIX and equality on it
+///     is a range);
+///   - an INTEGER-family segment at scale 0 against an integer literal,
+///     so the key encoding cannot disagree with the stored one. Text is
+///     excluded because a collation makes the key a collation key;
+///   - no parameters: their values arrive at execute, and this runs at
+///     prepare.
+fn choose_index(
+    db: &Database,
+    rel: u16,
+    descs: &[Descriptor],
+    filter: &Option<Predicate>,
+    sql: &str,
+) -> Option<IndexPick> {
+    use fire_crab_ods::btw;
+    // FC_NO_INDEX forces the scan. It exists for the GATE: a coverage
+    // check that cannot fail is worth nothing, and the only way to show
+    // this one can is to take the index away and watch it. It doubles
+    // as the equivalence check - the same statements down both paths
+    // must give the same rows.
+    if std::env::var("FC_NO_INDEX").is_ok() {
+        return None;
+    }
+    let pred = filter.as_ref()?;
+    // one conjunctive term list: an OR of alternatives would need one
+    // retrieval per branch and a merge, which is a later slice
+    let [terms] = pred.0.as_slice() else { return None };
+
+    // What would the engine do here? opt answers from the same catalog
+    // and the same rules its PLAN gate holds against the live server.
+    let plan = fire_crab_opt::plan_query(&db.bytes, db.page_size, sql).ok()?;
+    if !matches!(
+        plan.streams.as_slice(),
+        [fire_crab_opt::Stream { access: fire_crab_opt::Access::Index(_), .. }]
+    ) {
+        return None;
+    }
+
+    let ops = resolve_index_ops(db, rel, descs)?;
+    for term in terms {
+        let (fid, value) = match term {
+            Term::Cmp(fid, Cmp::Eq, Rhs::Int(v)) | Term::NumCmp(fid, Cmp::Eq, Rhs::Int(v)) => {
+                (*fid, Value::Int(*v))
+            }
+            _ => continue,
+        };
+        // the column must BE an integer at scale 0 - a scaled column
+        // stores Value::Scaled, and a key built from Value::Int would
+        // land somewhere else in the tree and find nothing
+        let d = descs.get(fid)?;
+        if d.scale != 0 {
+            continue;
+        }
+        for op in &ops {
+            let [(seg_fid, itype, _)] = op.segs.as_slice() else { continue };
+            if *seg_fid != fid {
+                continue;
+            }
+            if !matches!(*itype, btw::IDX_NUMERIC | btw::IDX_NUMERIC2) {
+                continue;
+            }
+            let mut values = vec![Value::Null; descs.len()];
+            values[fid] = value.clone();
+            let (key, all_null) = op.key_for(&values)?;
+            if all_null {
+                continue;
+            }
+            return Some(IndexPick { id: op.id, key });
+        }
+    }
+    None
+}
+
 fn resolve_index_ops(db: &Database, rel: u16, descs: &[Descriptor]) -> Option<Vec<IndexOp>> {
     use fire_crab_ods::btw;
     let Some(irt) = fire_crab_ods::btr::find_index_root(&db.bytes, db.page_size, rel) else {
@@ -9665,6 +9815,89 @@ fn validate_select_bind(plan: &Plan, args: &[WireParam]) -> Result<(), String> {
 
 /// The record number of the record at (page, slot) - the positional
 /// identity index entries carry.
+/// Insert an index entry, letting the ENTRY-level uniqueness check
+/// stand unless the records prove it wrong.
+///
+/// `insert_index_entry` rejects a duplicate key held by another record
+/// number, which is right until the other record is GONE - and entries
+/// outlive records here (an UPDATE leaves the old key behind, a DELETE
+/// removes nothing). Deleting a row and re-inserting its key was
+/// refused for exactly that reason, against an engine that accepts it.
+///
+/// The order matters: the cheap check runs FIRST and only its rejection
+/// is re-examined, so a duplicate this cannot disprove is still a
+/// duplicate.
+#[allow(clippy::too_many_arguments)]
+fn insert_entry_verified(
+    work: &mut Vec<u8>,
+    page_size: usize,
+    rel: u16,
+    op: &IndexOp,
+    key: &[u8],
+    recno: u64,
+    all_null: bool,
+) -> Result<(), String> {
+    let enforce = op.unique && !all_null;
+    match fire_crab_ods::btw::insert_index_entry(
+        work, page_size, rel, op.id, key, recno, enforce,
+    ) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // the formats are read only on a REJECTION, and from the
+            // work copy: a conflicting record may carry any stored
+            // format, and decoding it with the newest one is how a
+            // verification becomes a second bug
+            let formats = fire_crab_ods::relation_formats(work, page_size, rel);
+            if enforce && !unique_conflict(work, page_size, rel, op, &formats, key, recno) {
+                // every entry holding this key names a record that is
+                // gone, or no longer carries it
+                fire_crab_ods::btw::insert_index_entry(
+                    work, page_size, rel, op.id, key, recno, false,
+                )
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Is `key` already held by a LIVE record other than `recno`?
+///
+/// An index entry outlives the record version it describes: an UPDATE
+/// adds the new key and leaves the old one for garbage collection, and
+/// a DELETE removes nothing at all. So the entries alone cannot answer
+/// "is this key taken" - and answering from them alone REFUSED an
+/// INSERT the engine accepts, the moment a deleted row's key came back.
+///
+/// The rule is the one index-driven retrieval already follows: the
+/// index names CANDIDATES, and the records decide. Each conflicting
+/// entry is fetched and its key recomputed; only a live record that
+/// still carries the key is a duplicate.
+fn unique_conflict(
+    work: &[u8],
+    page_size: usize,
+    rel: u16,
+    op: &IndexOp,
+    formats: &[(u8, Vec<Descriptor>)],
+    key: &[u8],
+    recno: u64,
+) -> bool {
+    let Some(candidates) =
+        fire_crab_ods::btr::lookup_key(work, page_size, rel, op.id, key)
+    else {
+        // the index cannot be read: fall back to the entry-level check
+        // inside `insert_index_entry` rather than allowing a duplicate
+        return true;
+    };
+    let others: Vec<u64> = candidates.into_iter().filter(|r| *r != recno).collect();
+    if others.is_empty() {
+        return false;
+    }
+    records_at_in(work, page_size, rel, formats, &others)
+        .iter()
+        .any(|values| op.key_for(values).is_some_and(|(k, _)| k == key))
+}
+
 fn recno_of(work: &[u8], page_size: usize, page_no: u32, slot: u16) -> Result<u64, String> {
     let start = page_no as usize * page_size;
     let dp = work
@@ -11781,7 +12014,11 @@ fn branch_rows(
         Plan::Project { order_by, .. } => order_by.clone(),
         _ => Vec::new(),
     };
-    let src = RowSource::scan_filter_sort(*rel, formats.clone(), filter, order_by);
+    let index = match plan {
+        Plan::Project { index, .. } => index.clone(),
+        _ => None,
+    };
+    let src = RowSource::scan_filter_sort(*rel, formats.clone(), filter, order_by, index);
     let records = src.rows(db).ok()?;
     let mut out = Vec::with_capacity(records.len());
     for values in &records {
@@ -12863,7 +13100,14 @@ fn plan_query_inner(
                     |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
                 )?,
             };
-            return Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols: Vec::new() });
+            let index = choose_index(db, rel, &descs, &filter, sql);
+            if trace {
+                match &index {
+                    Some(p) => eprintln!("[srv] index scan: rel={} index={} key={:?}", rel, p.id, p.key),
+                    None => eprintln!("[srv] natural scan: rel={}", rel),
+                }
+            }
+            return Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols: Vec::new(), index });
         }
         Proj::Items(items) => items,
     };
@@ -13019,7 +13263,14 @@ fn plan_query_inner(
                 }
             }
         };
-        return Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols });
+        let index = choose_index(db, rel, &descs, &filter, sql);
+        if trace {
+            match &index {
+                Some(p) => eprintln!("[srv] index scan: rel={} index={} key={:?}", rel, p.id, p.key),
+                None => eprintln!("[srv] natural scan: rel={}", rel),
+            }
+        }
+        return Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols, index });
     }
 
     // grouped query: GROUP BY, or a multi-aggregate global projection
@@ -14075,6 +14326,93 @@ fn aggregate(
 
 /// Walk a relation's committed primary records, decoding each with the
 /// format it names, and hand the decoded values to `f`.
+/// Fetch the records at `recnos` - the positional identity index
+/// entries carry - decoding each with its own stored format.
+///
+/// The record number is `page sequence * records-per-page + slot`, so
+/// the pages needed are known before any is read: the recnos are
+/// grouped by sequence and only those data pages are decoded. A number
+/// pointing at a slot that holds no primary record is SKIPPED, which is
+/// what a stale index entry looks like from here.
+fn records_at(
+    db: &Database,
+    rel: u16,
+    formats: &[(u8, Vec<Descriptor>)],
+    recnos: &[u64],
+) -> Vec<Vec<Value>> {
+    records_at_in(&db.bytes, db.page_size, rel, formats, recnos)
+}
+
+fn records_at_in(
+    bytes: &[u8],
+    page_size: usize,
+    rel: u16,
+    formats: &[(u8, Vec<Descriptor>)],
+    recnos: &[u64],
+) -> Vec<Vec<Value>> {
+    let per_page = fire_crab_ods::format::max_recs_per_dp(page_size);
+    if per_page == 0 {
+        return Vec::new();
+    }
+    let pages = relation_data_pages(bytes, page_size, rel);
+    let mut out = Vec::with_capacity(recnos.len());
+    for &recno in recnos {
+        let seq = (recno / per_page) as usize;
+        let slot = (recno % per_page) as usize;
+        let Some(&dp_no) = pages.get(seq) else { continue };
+        let start = dp_no as usize * page_size;
+        let Some(dp) = bytes.get(start..start + page_size).and_then(DataPage::decode) else {
+            continue;
+        };
+        // the page must BE the one this sequence names - a relation's
+        // data pages are listed in sequence order, but a gap would make
+        // the position a lie
+        if dp.sequence as u64 != recno / per_page {
+            continue;
+        }
+        let Some(r) = dp.records().nth(slot) else { continue };
+        if !r.is_primary_record() {
+            continue;
+        }
+        let Some(image) = r.image() else { continue };
+        let descs = formats
+            .iter()
+            .find(|(n, _)| *n == r.format)
+            .or_else(|| formats.iter().max_by_key(|(n, _)| *n));
+        let Some((_, descs)) = descs else { continue };
+        out.push(decode_record(&image, descs));
+    }
+    out
+}
+
+/// Walk the records a retrieval must consider: every record of the
+/// relation, or - when the optimizer chose an index - only those the
+/// index names.
+///
+/// The caller's predicate runs over whatever this yields, unchanged.
+/// That is the whole safety argument for W1: an index narrows what is
+/// READ, never what is ANSWERED, so a stale entry costs a wasted fetch
+/// and a missed entry is the only way to be wrong - which is why
+/// `choose_index` is narrow about the keys it will build.
+fn for_each_candidate<F: FnMut(&[Value])>(
+    db: &Database,
+    rel: u16,
+    formats: &[(u8, Vec<Descriptor>)],
+    index: &Option<IndexPick>,
+    mut f: F,
+) {
+    let Some(pick) = index else {
+        for_each_record(db, rel, formats, f);
+        return;
+    };
+    let recnos =
+        fire_crab_ods::btr::lookup_key(&db.bytes, db.page_size, rel, pick.id, &pick.key)
+            .unwrap_or_default();
+    for values in records_at(db, rel, formats, &recnos) {
+        f(&values);
+    }
+}
+
 fn for_each_record<F: FnMut(&[Value])>(
     db: &Database,
     rel: u16,
@@ -15302,6 +15640,7 @@ fn emit_rows_inner(
             filter,
             order_by,
             gen_cols,
+            index,
         } => {
             if let Some(db) = db {
                 let filter = bind_filter(filter, args)?;
@@ -15319,7 +15658,7 @@ fn emit_rows_inner(
                     // handed back for the caller to persist.
                     let mut rows: Vec<Vec<Value>> = Vec::new();
                     let mut ferr: Option<EvalErr> = None;
-                    for_each_record(db, *rel, formats, |values| {
+                    for_each_candidate(db, *rel, formats, index, |values| {
                         if ferr.is_some() {
                             return;
                         }
@@ -15372,7 +15711,7 @@ fn emit_rows_inner(
                     // (divide by zero, a failed cast) stops the walk and is
                     // reported after it
                     let mut eval_err: Option<EvalErr> = None;
-                    for_each_record(db, *rel, formats, |values| {
+                    for_each_candidate(db, *rel, formats, index, |values| {
                         if eval_err.is_some() {
                             return;
                         }
@@ -15398,6 +15737,7 @@ fn emit_rows_inner(
                         formats.clone(),
                         filter.clone(),
                         order_by.clone(),
+                        index.clone(),
                     )
                     .rows(db)
                     .map_err(EmitErr::Eval)?;
@@ -19691,7 +20031,7 @@ fn plan_correlated_select(
             |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
         )?,
     };
-    Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols: Vec::new() })
+    Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols: Vec::new(), index: None })
 }
 
 /// The name a subquery's own select item gives its output column.
@@ -31906,6 +32246,33 @@ mod tests {
         // other ALTER forms are not generator restarts
         assert!(plan_alter_sequence("ALTER TABLE T ADD C INT").is_none());
         assert!(plan_alter_sequence("ALTER SEQUENCE SEQ_A RESTART").is_none());
+    }
+
+    #[test]
+    fn an_index_scan_is_a_leaf_like_any_other() {
+        // the tree above the leaf must not know which one it got: a
+        // scan and an index retrieval differ in what they READ, and the
+        // Filter/Sort above them is identical either way
+        let pick = IndexPick { id: 2, key: vec![0xC0, 8] };
+        let scan = RowSource::scan_filter_sort(128, Vec::new(), None, Vec::new(), None);
+        let idx = RowSource::scan_filter_sort(128, Vec::new(), None, Vec::new(), Some(pick.clone()));
+        let leaf_of = |s: &RowSource| -> String {
+            match s {
+                RowSource::Sort { input, .. } => match input.as_ref() {
+                    RowSource::Filter { input, .. } => match input.as_ref() {
+                        RowSource::TableScan { .. } => "scan".to_string(),
+                        RowSource::IndexScan { index_id, key, .. } => {
+                            format!("index {} {:?}", index_id, key)
+                        }
+                        _ => "other".to_string(),
+                    },
+                    _ => "not a filter".to_string(),
+                },
+                _ => "not a sort".to_string(),
+            }
+        };
+        assert_eq!(leaf_of(&scan), "scan");
+        assert_eq!(leaf_of(&idx), "index 2 [192, 8]");
     }
 
     #[test]

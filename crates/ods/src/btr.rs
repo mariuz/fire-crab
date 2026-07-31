@@ -323,9 +323,159 @@ pub fn walk_index_leaves(
     }
 }
 
+/// Descend the tree to `key` and collect the record numbers of every
+/// leaf entry whose key EQUALS it - a port of the retrieval half of
+/// `BTR_lookup`/`BTR_find_page` (btr.cpp), where `walk_index_leaves`
+/// is the whole-level walk.
+///
+/// This is what makes a retrieval INDEX-DRIVEN rather than a scan: the
+/// tree is descended once per level, and only the leaf pages holding
+/// the key are read. What it returns is a set of CANDIDATES, never an
+/// answer: index entries survive the rows they describe (an UPDATE adds
+/// the new key and leaves the old one for garbage collection, a DELETE
+/// removes nothing), so the caller must fetch each record and apply the
+/// predicate. That is the engine's own arrangement, and it is why a
+/// stale entry costs a wasted fetch rather than a wrong row.
+///
+/// Duplicates may span pages, so the sibling chain is followed while
+/// the key still matches.
+pub fn lookup_key(
+    file: &[u8],
+    page_size: usize,
+    relation: u16,
+    index_id: u8,
+    key: &[u8],
+) -> Option<Vec<u64>> {
+    let root_no = find_index_root(file, page_size, relation)?
+        .entry(index_id)?
+        .root_page;
+    if root_no == 0 {
+        return None;
+    }
+    let get = |no: u32| {
+        let start = no as usize * page_size;
+        file.get(start..start + page_size).and_then(BtreePage::decode)
+    };
+
+    // Descend: on each non-leaf page take the LAST node whose key is
+    // <= the target (the leftmost node otherwise), which is the child
+    // whose range can hold it.
+    let mut page = get(root_no)?;
+    while page.level > 0 {
+        let bytes = page.bytes();
+        let mut at = page.first_node();
+        let mut node_key: Vec<u8> = Vec::new();
+        let mut chosen: Option<u32> = None;
+        loop {
+            let node = read_node(bytes, at, false)?;
+            if node.is_end_level {
+                break;
+            }
+            if node.is_end_bucket {
+                // the level continues on the sibling; if nothing on
+                // this page was <= the key, the sibling's first node
+                // is where the search goes on
+                break;
+            }
+            node_key.truncate(node.prefix as usize);
+            node_key.extend_from_slice(&bytes[node.data_at..node.data_at + node.length as usize]);
+            if chosen.is_some() && node_key.as_slice() > key {
+                break;
+            }
+            chosen = Some(node.page_number);
+            at = node.next_at;
+        }
+        match chosen {
+            Some(next) => page = get(next)?,
+            None if page.sibling != 0 => {
+                page = get(page.sibling)?;
+                continue;
+            }
+            None => return Some(Vec::new()),
+        }
+    }
+
+    // Scan the leaf level from here, collecting equal keys and stopping
+    // at the first key greater than the target.
+    let mut out = Vec::new();
+    let mut leaf_key: Vec<u8> = Vec::new();
+    loop {
+        let bytes = page.bytes();
+        let mut at = page.first_node();
+        loop {
+            let node = read_node(bytes, at, true)?;
+            if node.is_end_level {
+                return Some(out);
+            }
+            if node.is_end_bucket {
+                break;
+            }
+            leaf_key.truncate(node.prefix as usize);
+            leaf_key.extend_from_slice(&bytes[node.data_at..node.data_at + node.length as usize]);
+            match leaf_key.as_slice().cmp(key) {
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Equal => out.push(node.record_number),
+                std::cmp::Ordering::Greater => return Some(out),
+            }
+            at = node.next_at;
+        }
+        if page.sibling == 0 {
+            return Some(out);
+        }
+        page = get(page.sibling)?;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The retrieval half against the WRITE half: build a real index
+    /// with `btw::insert_index_entry`, then ask `lookup_key` for keys
+    /// that are there, keys that are not, and a key with duplicates.
+    ///
+    /// A round trip is the right shape here because the two halves are
+    /// the two directions of one format: a descent that agreed with a
+    /// hand-built page but not with the writer would be a test of the
+    /// test.
+    #[test]
+    fn lookup_key_finds_what_the_writer_put_there() {
+        let page_size = 1024usize;
+        let rel = 128u16;
+        // page 0 unused, page 1 the index root, page 2 the tree root
+        let mut file = vec![0u8; page_size * 8];
+        file[page_size] = PageType::IndexRoot as u8;
+        file[page_size + 16..page_size + 18].copy_from_slice(&rel.to_le_bytes());
+        file[page_size + 18..page_size + 20].copy_from_slice(&1u16.to_le_bytes()); // irt_count
+        // one index entry: id 0, root page 2 (irt_page_num @8 of the slot)
+        let entry_at = page_size + 24;
+        file[entry_at + 8..entry_at + 12].copy_from_slice(&2u32.to_le_bytes());
+        file[entry_at + 20] = IRT_NORMAL;
+        crate::btw::write_empty_root(&mut file, page_size, 2, rel, 0).unwrap();
+
+        let key = |n: u8| vec![0xC0, n];
+        for (n, recno) in [(1u8, 10u64), (3, 30), (5, 50), (3, 31), (7, 70)] {
+            crate::btw::insert_index_entry(&mut file, page_size, rel, 0, &key(n), recno, false)
+                .unwrap();
+        }
+
+        // a key with one entry
+        assert_eq!(lookup_key(&file, page_size, rel, 0, &key(5)), Some(vec![50]));
+        // the first and the last, which are where a descent goes wrong
+        assert_eq!(lookup_key(&file, page_size, rel, 0, &key(1)), Some(vec![10]));
+        assert_eq!(lookup_key(&file, page_size, rel, 0, &key(7)), Some(vec![70]));
+        // DUPLICATES come back together, in record-number order
+        assert_eq!(lookup_key(&file, page_size, rel, 0, &key(3)), Some(vec![30, 31]));
+        // a key that is not there is an EMPTY answer, not a nearby one -
+        // returning the neighbour is how an index lookup invents rows
+        assert_eq!(lookup_key(&file, page_size, rel, 0, &key(4)), Some(vec![]));
+        assert_eq!(lookup_key(&file, page_size, rel, 0, &key(0)), Some(vec![]));
+        assert_eq!(lookup_key(&file, page_size, rel, 0, &key(9)), Some(vec![]));
+        // and the whole level still walks, so the two agree
+        let all = walk_index_leaves(&file, page_size, rel, 0).unwrap();
+        assert_eq!(all.len(), 5);
+        assert_eq!(all.first().map(|(_, r)| *r), Some(10));
+    }
 
     /// Every slot with a root page carries entries, whatever its state
     /// - a freshly engine-created index idles in irt_rollback (2) and a
