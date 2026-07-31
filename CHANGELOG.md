@@ -13,6 +13,40 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — the width and form of a text result
+
+### Fixed
+- **A conditional's text result is CHAR of its WIDEST branch, and is
+  PADDED to it.** `CASE WHEN ... THEN 'other' ELSE 'isnull' END` answers
+  `'other '`; fire-crab announced VARCHAR(32765) for every text
+  expression and padded nothing, so it answered `'other'`. A wrong VALUE,
+  not just a wrong describe. The previous increment found this and said
+  so rather than encoding around it; this is the fix.
+- The rules, probed with `SET SQLDA_DISPLAY ON`: a LITERAL is `CHAR(n)`;
+  a conditional's WIDTH is the maximum over its branches; its FORM is
+  VARYING if ANY branch is varying, else CHAR — and only a CHAR result
+  pads. `COALESCE(NAME, 'zzzzzzzzzz')` is VARYING(10);
+  `COALESCE('ab', 'cdef')` is CHAR(4).
+- **The padding applies wherever the value is used, not only in a select
+  list**: `CASE WHEN 1=1 THEN 'ab' ELSE 'abcdef' END || 'X'` answers
+  `'ab    X'`. So it is applied where the node is RESOLVED, and the
+  padded value then flows into concatenations, comparisons and sort keys
+  by itself. The gate found that — the first attempt padded only the
+  top-level projection.
+- It is applied by wrapping in the CAST that already implements padding
+  (`CAST(x AS CHAR(n))`), rather than by a second implementation of the
+  same law.
+
+**Three unit tests had encoded the old, unpadded values** —
+`CASE ... 'pos'/'neg'/'zero'` asserting `"neg"`, `IIF(..., 'long',
+'short')` asserting `"long"`. They were the bug, written down and
+protected. Each is now the engine's own answer, with a note saying why.
+
+`qa/serve-real-textwidth2.sh` is new, 30 checks, every one over branches
+of DIFFERENT widths so the padding is visible in the string itself. The
+shapes this driver cannot decode from the engine (a CHAR column, several
+text columns in one row) are compared against isql instead.
+
 ## 2026-07-31 — DECODE, and EXISTS as a value
 
 ### Converted

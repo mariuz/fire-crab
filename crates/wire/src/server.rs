@@ -2821,6 +2821,95 @@ fn check_predicates(
 /// column names to field ids, type it (integer arithmetic -> BIGINT,
 /// string literal -> VARCHAR), and carry the expression evaluated per
 /// row. None if the expression cannot be resolved or typed.
+/// Pad a CHAR-formed conditional to its declared width.
+///
+/// A conditional's type is CHAR(n) when every branch is, and the engine
+/// pads its value to n WHEREVER IT IS USED - not only in a select list:
+/// `CASE WHEN 1=1 THEN 'ab' ELSE 'abcdef' END || 'X'` answers
+/// `'ab    X'`. So the padding belongs where the node is BUILT, and the
+/// padded value then flows into concatenations, comparisons and sort
+/// keys by itself.
+///
+/// It is applied by wrapping in the CAST that already implements
+/// padding, rather than by a second implementation of the same law.
+fn pad_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
+    if !matches!(
+        e,
+        Expr::Case(..) | Expr::Coalesce(_) | Expr::Iif(..) | Expr::NullIf(..)
+    ) {
+        return e;
+    }
+    if !matches!(e.type_of(descs), Some(ExprType::Text)) {
+        return e;
+    }
+    match text_form(&e, descs) {
+        Some((false, w)) if w > 0 => {
+            Expr::Cast(Box::new(e), CastTarget::Text { len: w as usize, pad: true })
+        }
+        _ => e,
+    }
+}
+
+/// The WIDTH and FORM of a text-valued expression: `(varying, width)`.
+///
+/// The engine gives a text result a real declared width, and whether it
+/// is CHAR or VARCHAR decides whether shorter values are PADDED - which
+/// is a difference in the VALUE, not only in the describe. Probed with
+/// `SET SQLDA_DISPLAY`:
+///
+///   `'abc'`                          -> TEXT(3)      (a literal is CHAR)
+///   `CASE .. 'other' .. 'isnull' ..` -> TEXT(6)      (the WIDEST branch)
+///   `COALESCE('ab', 'cdef')`         -> TEXT(4)
+///   `CASE .. NAME .. 'isnull' ..`    -> VARYING(6)   (one VARYING branch
+///   `COALESCE(NAME, 'zzzzzzzzzz')`   -> VARYING(10)   makes it VARYING)
+///
+/// So the width is the MAXIMUM over the branches and the form is VARYING
+/// if ANY branch is varying. None means "no statically known width",
+/// which keeps the old catch-all declaration.
+fn text_form(e: &Expr, descs: &[Descriptor]) -> Option<(bool, i32)> {
+    let widen = |a: Option<(bool, i32)>, b: Option<(bool, i32)>| match (a, b) {
+        (Some((va, wa)), Some((vb, wb))) => Some((va || vb, wa.max(wb))),
+        _ => None,
+    };
+    match e {
+        Expr::Str(s) => Some((false, s.chars().count() as i32)),
+        Expr::Col(fid) => {
+            let d = descs.get(*fid)?;
+            match d.dtype {
+                dtype::TEXT => Some((false, d.length as i32)),
+                // a VARYING descriptor's length carries its 2-byte count
+                dtype::VARYING => Some((true, (d.length as i32 - 2).max(0))),
+                _ => None,
+            }
+        }
+        Expr::Cast(_, CastTarget::Text { len, pad }) => Some((!*pad, *len as i32)),
+        // a conditional is as wide as its widest branch
+        Expr::Coalesce(v) => v
+            .iter()
+            .map(|x| text_form(x, descs))
+            .reduce(widen)
+            .flatten(),
+        Expr::NullIf(a, _) => text_form(a, descs),
+        Expr::Iif(_, a, b) => widen(text_form(a, descs), text_form(b, descs)),
+        Expr::Case(branches, else_) => {
+            let mut acc: Option<(bool, i32)> = None;
+            for (_, t) in branches {
+                acc = match acc {
+                    None => text_form(t, descs),
+                    some => widen(some, text_form(t, descs)),
+                };
+            }
+            match else_ {
+                // no ELSE means a NULL branch, which is untyped and does
+                // not widen
+                None => acc,
+                Some(x) => widen(acc, text_form(x, descs)),
+            }
+        }
+        _ => None,
+    }
+}
+
 fn build_expr_col(
     raw: &RawExpr,
     name: &str,
@@ -2846,9 +2935,20 @@ fn build_expr_col(
             (Wire::Int64, nullable(580), 8, scale)
         }
     };
+    // A text result carries a real WIDTH, and a CHAR-formed one PADS
+    // shorter values to it - so this decides a VALUE, not just a
+    // describe. The padding is applied by wrapping the expression in the
+    // CAST that already implements it rather than by a second code path.
     let (wire, sql_type, length, scale) = match e.type_of(descs)? {
         ExprType::Int => num_form(0),
-        ExprType::Text => (Wire::Varying, nullable(448), 32765, 0),
+        ExprType::Text => match text_form(&e, descs) {
+            // the VALUE is padded where the conditional is resolved (see
+            // `pad_conditional`); here only the WIDTH is announced
+            Some((_, w)) => (Wire::Varying, nullable(448), w, 0),
+            // no statically known width: the maximum is the only safe
+            // declaration, which is what every text expression got before
+            None => (Wire::Varying, nullable(448), 32765, 0),
+        },
         ExprType::Numeric => num_form(e.result_scale(descs)? as i32),
         // an approximate result is a DOUBLE on the wire whatever its
         // source width - the engine widens FLOAT the same way
@@ -16508,6 +16608,17 @@ fn resolve_expr(
     columns: &[RelationColumn],
     descs: &[Descriptor],
 ) -> Option<Expr> {
+    // every level of resolution goes through here, so a CHAR-formed
+    // conditional is padded wherever it appears - inside a concatenation
+    // or a comparison as much as in the select list
+    Some(pad_conditional(resolve_expr_inner(raw, columns, descs)?, descs))
+}
+
+fn resolve_expr_inner(
+    raw: &RawExpr,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+) -> Option<Expr> {
     Some(match raw {
         // An AGGREGATE is not resolvable per row - it has a value for a
         // GROUP, not for a record. The group planner rewrites each one
@@ -25528,6 +25639,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_text_result_takes_its_widest_branch() {
+        let d = |dt: u8, len: u16| Descriptor {
+            dtype: dt,
+            scale: 0,
+            length: len,
+            sub_type: 0,
+            flags: 0,
+            offset: 8,
+        };
+        // field 0 is CHAR(6), field 1 is VARCHAR(6) (its descriptor
+        // length carries the 2-byte count)
+        let descs = vec![d(dtype::TEXT, 6), d(dtype::VARYING, 8)];
+        let lit = |t: &str| Expr::Str(t.to_string());
+
+        // a LITERAL is a CHAR of its own width
+        assert_eq!(text_form(&lit("abc"), &descs), Some((false, 3)));
+        // a CHAR column is CHAR; a VARCHAR column is VARYING, and its
+        // width excludes the count bytes
+        assert_eq!(text_form(&Expr::Col(0), &descs), Some((false, 6)));
+        assert_eq!(text_form(&Expr::Col(1), &descs), Some((true, 6)));
+
+        // a conditional is as wide as its WIDEST branch...
+        let all_char = Expr::Coalesce(vec![lit("ab"), lit("abcdef")]);
+        assert_eq!(text_form(&all_char, &descs), Some((false, 6)));
+        // ... and ONE varying branch makes the whole thing varying
+        let mixed = Expr::Coalesce(vec![Expr::Col(1), lit("zzzzzzzzzz")]);
+        assert_eq!(text_form(&mixed, &descs), Some((true, 10)));
+
+        // a CHAR-formed conditional is PADDED, a varying one is not
+        let padded = pad_conditional(all_char, &descs);
+        assert!(matches!(
+            padded,
+            Expr::Cast(_, CastTarget::Text { len: 6, pad: true })
+        ));
+        assert_eq!(padded.eval(&[]).unwrap(), Value::Text("ab    ".into()));
+        assert!(!matches!(pad_conditional(mixed, &descs), Expr::Cast(..)));
+
+        // a function's width is not derived, which keeps the old
+        // catch-all declaration rather than a guessed one
+        assert_eq!(
+            text_form(&Expr::Func(SysFn::Upper, vec![Expr::Col(1)]), &descs),
+            None
+        );
+    }
+
+    #[test]
     fn decode_is_a_simple_case_that_keeps_its_name() {
         let items = match parse_projection("DECODE(D, 1, 'a', 2, 'b', 'z')").unwrap() {
             Proj::Items(v) => v,
@@ -27767,7 +27924,8 @@ mod tests {
         txt("UPPER(LEFT(NAME, 3)) || '-' || LOWER(RIGHT(NAME, 2))", "HEL-lo");
         assert!(matches!(ev("CHAR_LENGTH(NAME) + 10"), Value::Int(15)));
         assert!(matches!(ev("ABS(A) * 2"), Value::Int(14)));
-        txt("IIF(CHAR_LENGTH(NAME) > 3, 'long', 'short')", "long");
+        // padded to the width of 'short' (see the CASE note elsewhere)
+        txt("IIF(CHAR_LENGTH(NAME) > 3, 'long', 'short')", "long ");
         txt("COALESCE(SUBSTRING(NAME FROM 99), 'gone')", "");
     }
 
@@ -28179,7 +28337,10 @@ mod tests {
         ));
         assert!(matches!(
             ev("IIF(TS > TIMESTAMP '2001-01-01 00:00:00', 'after', 'before')"),
-            Value::Text(ref t) if t == "after"
+            // PADDED to the widest branch: a conditional's text result
+            // is CHAR of its widest branch, so 'after' comes back at
+            // the width of 'before' (probed)
+            Value::Text(ref t) if t == "after "
         ));
         assert!(matches!(
             ev("COALESCE(D, DATE '2000-01-01')"),
@@ -28278,8 +28439,13 @@ mod tests {
         };
 
         // searched CASE: first TRUE branch answers, in order
-        txt("CASE WHEN A > 0 THEN 'pos' WHEN A < 0 THEN 'neg' ELSE 'zero' END", "neg");
-        txt("CASE WHEN A < 0 THEN 'first' WHEN A = -7 THEN 'second' END", "first");
+        // PADDED to the widest branch: a conditional's text result is
+        // CHAR of its widest branch, so 'neg' comes back at the width of
+        // 'zero' and 'first' at the width of 'second' (probed against
+        // the engine; these expectations encoded the unpadded values
+        // until the increment that found the law)
+        txt("CASE WHEN A > 0 THEN 'pos' WHEN A < 0 THEN 'neg' ELSE 'zero' END", "neg ");
+        txt("CASE WHEN A < 0 THEN 'first' WHEN A = -7 THEN 'second' END", "first ");
         // missing ELSE is NULL; an UNTAKEN branch list falls through
         assert!(matches!(ev("CASE WHEN A > 0 THEN 'pos' END"), Value::Null));
         // UNKNOWN conditions move on (NULL row: every cond UNKNOWN -> ELSE)

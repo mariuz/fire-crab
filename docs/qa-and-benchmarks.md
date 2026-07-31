@@ -7532,6 +7532,72 @@ in the FROM and refuses if one does. `WITH RECURSIVE` refuses for a different
 reason: it is a fixpoint rather than a substitution, and pretending otherwise
 would answer the first iteration and call it the result.
 
+### The width and form of a text result (`qa/serve-real-textwidth2.sh`, 30 checks)
+
+A text result is not just "some text". It has a declared WIDTH, and a
+CHAR-formed one PADS shorter values to it — so this decides a VALUE, not only a
+describe. fire-crab announced `VARCHAR(32765)` for every text expression and
+padded nothing, so
+
+```sql
+SELECT CASE WHEN 1=1 THEN 'other' ELSE 'isnull' END FROM T
+```
+
+answered `'other'` where the engine answers `'other '`. The previous increment
+found this while converting DECODE, could not fix it there, and said so in that
+gate's header instead of choosing inputs that hid it. This is the fix.
+
+**The rules**, probed with `SET SQLDA_DISPLAY ON` before any code:
+
+| expression | engine describes |
+|---|---|
+| `'abc'` | `TEXT(3)` — a literal is CHAR |
+| `CASE .. 'other' .. 'isnull' ..` | `TEXT(6)` — the widest branch |
+| `COALESCE('ab', 'cdef')` | `TEXT(4)` |
+| `CASE .. NAME .. 'isnull' ..` | `VARYING(6)` — one varying branch |
+| `COALESCE(NAME, 'zzzzzzzzzz')` | `VARYING(10)` |
+
+So the width is the maximum over the branches and the form is VARYING if any
+branch is varying, else CHAR.
+
+**The gate corrected the first implementation.** Padding the top-level
+projection made every select-list check pass — and
+
+```sql
+SELECT CASE WHEN 1=1 THEN 'ab' ELSE 'abcdef' END || 'X'
+```
+
+still answered `'abX'` where the engine answers `'ab    X'`. The conditional's
+TYPE is CHAR(6), so its value is padded *wherever it is used*, not where it
+happens to be projected. The padding therefore belongs where the node is
+resolved; the padded value then reaches concatenations, comparisons and sort
+keys without any of them knowing about it. That check existed only because the
+gate was written to follow the value into other constructs rather than to stop
+at the select list.
+
+It is applied by wrapping in `CAST(x AS CHAR(n))` — the conversion that has
+padded correctly since the CAST increment — rather than by a second
+implementation of the same law.
+
+**Three unit tests had to change, and that is the interesting part.**
+
+```rust
+txt("CASE WHEN A > 0 THEN 'pos' WHEN A < 0 THEN 'neg' ELSE 'zero' END", "neg");
+txt("IIF(CHAR_LENGTH(NAME) > 3, 'long', 'short')", "long");
+```
+
+Both assert the unpadded answer. They are not tests that broke; they are the
+bug, written down and protected by a passing suite. A unit test states what the
+author believed the engine does, and a differential gate states what it does —
+which is why the two disagree exactly where a law was never probed. Every one
+of them now carries the engine's own value and a note pointing at the law.
+
+Every check in the new gate uses branches of DIFFERENT widths, so an unpadded
+answer differs in the string itself. The shapes this driver cannot decode from
+the engine — a CHAR column, or several text columns in one row — are compared
+against isql instead, with a `'#'` marker concatenated so the trailing spaces
+have a right-hand boundary in the output.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

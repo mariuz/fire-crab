@@ -1515,6 +1515,25 @@ them.
   without recording why turns the gate into a claim that the bug does not
   exist.
 
+- **A unit test states what you BELIEVED; a differential states what the
+  system DOES.** Three unit tests here asserted the unpadded result of a
+  CASE and passed for many increments - they were the bug, written down
+  and protected. When a differential and a unit test disagree, the unit
+  test is the suspect, and the disagreement marks exactly where a law was
+  never probed.
+
+- **A type is a property of the VALUE, not of the place it is used.**
+  Padding the select list made every projection check pass while
+  `CASE ... END || 'X'` was still wrong: the conditional's type is
+  CHAR(n) wherever it appears, so the padding belongs where the node is
+  BUILT. Whenever a rule is applied at the point of USE, ask what happens
+  when the value is used somewhere you did not enumerate.
+
+- **Follow the value into other constructs when writing the gate.** The
+  concatenation check is the one that caught the above, and it existed
+  only because the gate was written to ask "and what does this value do
+  next?" rather than to stop at the select list.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with
