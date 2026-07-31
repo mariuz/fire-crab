@@ -43,7 +43,9 @@ pulled by the fetch.
 - **R1 — the tree exists.** A `RowSource` with `TableScan`, `Filter` and
   `Sort`, and the simplest plan executing through it. No behaviour
   change; the gates are the proof. *(this increment)*
-- **R2 — Aggregate and Group** become nodes rather than a separate plan.
+- **R2 — Aggregate** is a node. *(done)* `group_output` and both grouped
+  paths build `TableScan → Filter → Aggregate → Sort`; the fold itself
+  (`group_rows`) now has exactly ONE caller, the node.
 - **R3 — NestedLoopJoin**, inner and outer, replacing `join_rows`.
 - **R4 — derived tables**: `FROM (SELECT ...)`, the first capability the
   tree unlocks that the rewriting could not reach.

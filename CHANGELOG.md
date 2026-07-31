@@ -13,6 +13,35 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — R2: Aggregate is a node
+
+### Converted
+- **`RowSource::Aggregate`** — the engine's aggregated stream as a tree
+  node: `input` folded into one row per distinct key, with HAVING
+  filtering the FOLDED rows rather than the input ones. A query with no
+  GROUP BY is the single global group, which is the same node with no
+  keys.
+- `group_output` now *builds* `TableScan → Filter → Aggregate` rather
+  than spelling those three out, and both grouped emit paths build the
+  full `… → Sort` above it. **The fold itself (`group_rows`) has exactly
+  one caller now — the node.** Before this it had three.
+- The grouped JOIN path composes the same nodes over a materialised
+  leaf: `Rows(joined) → Aggregate → Sort`. That is the first place the
+  tree is seen STACKING rather than replacing a single loop, and it is
+  why the `Rows` leaf earned its place in R1.
+
+**Where Sort sits is a claim, not a detail.** It goes ABOVE the
+Aggregate, because a grouped query's ORDER BY keys are OUTPUT indexes
+and the folded rows are aligned with `gitems`/`cols` — while a plain
+projection's ORDER BY indexes the RECORD's fields, so there the Sort
+goes BELOW the projection. Both facts were already true and each was
+explained where it happened; the tree makes them structural.
+
+No behaviour change, again the whole claim: 20 grouping-and-aggregate
+gates and 363 unit tests, with the node's own unit test now folding
+`Rows → Aggregate → Sort` over a fixture whose two keys have different
+row counts.
+
 ## 2026-07-31 — R1: the row-source tree exists
 
 The first increment of a PROGRAMME rather than a feature — see the new

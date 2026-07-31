@@ -934,6 +934,18 @@ enum RowSource {
     /// stand on, and it is what makes the tree testable without a
     /// database behind it.
     Rows(Vec<Vec<Value>>),
+    /// the engine's AggregatedStream: `input` folded into one row per
+    /// distinct key, with HAVING filtering the FOLDED rows rather than
+    /// the input ones. A query with no GROUP BY is the single global
+    /// group, which is the same node with no keys.
+    Aggregate {
+        input: Box<RowSource>,
+        gitems: Vec<GItem>,
+        key_fids: Vec<usize>,
+        key_exprs: Vec<Expr>,
+        synth_base: usize,
+        having: Option<Predicate>,
+    },
 }
 
 impl RowSource {
@@ -964,6 +976,21 @@ impl RowSource {
                 Ok(out)
             }
             RowSource::Rows(rows) => Ok(rows.clone()),
+            RowSource::Aggregate {
+                input,
+                gitems,
+                key_fids,
+                key_exprs,
+                synth_base,
+                having,
+            } => group_rows(
+                input.rows(db)?,
+                gitems,
+                key_fids,
+                key_exprs,
+                *synth_base,
+                having,
+            ),
             RowSource::Sort { input, keys } => {
                 let mut rows = input.rows(db)?;
                 if !keys.is_empty() {
@@ -971,6 +998,34 @@ impl RowSource {
                 }
                 Ok(rows)
             }
+        }
+    }
+
+    /// The engine stacks `Sort` above `Aggregate` above the input, and
+    /// so does this: HAVING filters the FOLDED rows, and ORDER BY sorts
+    /// what HAVING left. Used wherever a grouped result is produced from
+    /// rows already in hand - a join's combined rows today, a derived
+    /// table's tomorrow.
+    #[allow(clippy::too_many_arguments)]
+    fn aggregate_sorted(
+        input: RowSource,
+        gitems: &[GItem],
+        key_fids: &[usize],
+        key_exprs: &[Expr],
+        synth_base: usize,
+        having: &Option<Predicate>,
+        keys: &[OrderKey],
+    ) -> RowSource {
+        RowSource::Sort {
+            input: Box::new(RowSource::Aggregate {
+                input: Box::new(input),
+                gitems: gitems.to_vec(),
+                key_fids: key_fids.to_vec(),
+                key_exprs: key_exprs.to_vec(),
+                synth_base,
+                having: having.clone(),
+            }),
+            keys: keys.to_vec(),
         }
     }
 
@@ -1660,6 +1715,7 @@ enum JoinKind {
 /// One output column of a grouped query: a grouping key (carried by its
 /// record field id) or an aggregate over the group's rows (`None` fid =
 /// `COUNT(*)`).
+#[derive(Clone)]
 enum GItem {
     Key(usize),
     /// (function, source, distinct) - distinct only with COUNT
@@ -1667,6 +1723,7 @@ enum GItem {
 }
 
 /// Where an aggregate's per-row input value comes from.
+#[derive(Clone)]
 enum AggSrc {
     /// COUNT(*) - no value, every row counts
     Star,
@@ -11607,11 +11664,19 @@ fn branch_rows(
     {
         let filter = bind_filter(filter, args).ok()?;
         let input = join_rows(db, *base_rel, base_formats, *base_width, parts, &filter).ok()?;
-        let mut rows =
-            group_rows(input, gitems, key_fids, key_exprs, *synth_base, having).ok()?;
-        if !order_by.is_empty() {
-            sort_rows(&mut rows, order_by).ok()?;
-        }
+        // the joined rows are a materialised leaf; the fold and the sort
+        // above them are tree nodes (a NestedLoopJoin leaf is R3)
+        let rows = RowSource::aggregate_sorted(
+            RowSource::Rows(input),
+            gitems,
+            key_fids,
+            key_exprs,
+            *synth_base,
+            having,
+            order_by,
+        )
+        .rows(db)
+        .ok()?;
         return rows
             .iter()
             .map(|values| cols.iter().map(|c| c.value_of(values).ok()).collect())
@@ -13931,22 +13996,23 @@ fn group_output(
     filter: &Option<Predicate>,
     having: &Option<Predicate>,
 ) -> Result<Vec<Vec<Value>>, EvalErr> {
-    let mut input: Vec<Vec<Value>> = Vec::new();
-    let mut ferr: Option<EvalErr> = None;
-    for_each_record(db, rel, formats, |v| {
-        if ferr.is_some() {
-            return;
-        }
-        match filter.as_ref().map_or(Ok(true), |p| p.matches(v)) {
-            Ok(true) => input.push(v.to_vec()),
-            Ok(false) => {}
-            Err(e) => ferr = Some(e),
-        }
-    });
-    if let Some(e) = ferr {
-        return Err(e);
+    // scan -> filter -> aggregate, as a ROW SOURCE TREE. This function
+    // used to spell those three out; it now names them.
+    RowSource::Aggregate {
+        input: Box::new(RowSource::Filter {
+            input: Box::new(RowSource::TableScan {
+                rel,
+                formats: formats.to_vec(),
+            }),
+            pred: filter.clone(),
+        }),
+        gitems: gitems.to_vec(),
+        key_fids: key_fids.to_vec(),
+        key_exprs: key_exprs.to_vec(),
+        synth_base,
+        having: having.clone(),
     }
-    group_rows(input, gitems, key_fids, key_exprs, synth_base, having)
+    .rows(db)
 }
 
 /// Fold already-collected rows into grouped output. Split out of
@@ -14976,12 +15042,17 @@ fn emit_rows_inner(
                 let input =
                     join_rows(db, *base_rel, base_formats, *base_width, parts, &filter)
                         .map_err(EmitErr::Eval)?;
-                let mut rows =
-                    group_rows(input, gitems, key_fids, key_exprs, *synth_base, having)
-                        .map_err(EmitErr::Eval)?;
-                if !order_by.is_empty() {
-                    sort_rows(&mut rows, order_by).map_err(EmitErr::Eval)?;
-                }
+                let rows = RowSource::aggregate_sorted(
+                    RowSource::Rows(input),
+                    gitems,
+                    key_fids,
+                    key_exprs,
+                    *synth_base,
+                    having,
+                    order_by,
+                )
+                .rows(db)
+                .map_err(EmitErr::Eval)?;
                 for values in &rows {
                     encode_row(w, cols, values)?;
                 }
@@ -15001,16 +15072,27 @@ fn emit_rows_inner(
         } => {
             if let Some(db) = db {
                 let filter = bind_filter(filter, args)?;
-                let mut rows = group_output(
-                    db, *rel, formats, gitems, key_fids, key_exprs, *synth_base,
-                    &filter, having,
+                // scan -> filter -> aggregate -> sort, as one tree. The
+                // ORDER BY keys are OUTPUT indexes and the folded rows
+                // are aligned with gitems/cols, which is exactly why the
+                // Sort sits ABOVE the Aggregate rather than below it.
+                let rows = RowSource::aggregate_sorted(
+                    RowSource::Filter {
+                        input: Box::new(RowSource::TableScan {
+                            rel: *rel,
+                            formats: formats.to_vec(),
+                        }),
+                        pred: filter,
+                    },
+                    gitems,
+                    key_fids,
+                    key_exprs,
+                    *synth_base,
+                    having,
+                    order_by,
                 )
+                .rows(db)
                 .map_err(EmitErr::Eval)?;
-                if !order_by.is_empty() {
-                    // order_by keys are output indexes; output rows are
-                    // aligned with gitems/cols, so order_cmp applies as-is
-                    sort_rows(&mut rows, order_by).map_err(EmitErr::Eval)?;
-                }
                 for values in &rows {
                     encode_row(w, cols, values)?;
                 }
@@ -25966,7 +26048,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_row_source_tree_scans_filters_and_sorts() {
+    fn a_row_source_tree_scans_filters_sorts_and_aggregates() {
         // The tree is exercised without a database behind it, which is
         // what the materialised leaf is for. `db` is never touched on
         // these paths, so a null pointer would do - but Database has no
@@ -26003,6 +26085,27 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, vec![2, 3, 1]);
+
+        // an AGGREGATE folds its input into one row per key, and the
+        // node composes above the others: Rows -> Aggregate -> Sort is
+        // what a grouped join builds today and what a grouped derived
+        // table will build tomorrow
+        let counted = RowSource::aggregate_sorted(
+            RowSource::Rows(vec![row(1, 10), row(2, 10), row(3, 20)]),
+            &[GItem::Key(1), GItem::Agg(AggFn::Count, AggSrc::Star, false)],
+            &[1],
+            &[],
+            8,
+            &None,
+            &[OrderKey::field(0, false, NullsAt::Default)],
+        )
+        .rows(&db)
+        .unwrap();
+        // two keys: 10 with two rows, 20 with one
+        assert_eq!(counted.len(), 2);
+        assert!(matches!(counted[0][0], Value::Int(10)));
+        assert!(matches!(counted[0][1], Value::Int(2)));
+        assert!(matches!(counted[1][1], Value::Int(1)));
 
         // and DESCENDING is the same keys read the other way
         let desc = RowSource::Sort {
