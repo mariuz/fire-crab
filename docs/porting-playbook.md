@@ -1373,6 +1373,35 @@ them.
   that builds it and asserts its own properties — otherwise the check
   degrades into a check of whether someone still has the file.
 
+- **A rewrite that preserves VALUES can still change ANSWERS.** Expanding
+  a view by substituting its columns for the base table's is correct in
+  every row and wrong in every NAME, and the name is what a client keys
+  its rows by. When you rewrite one query into another, the output
+  CONTRACT - names, order, types, arity - is part of what has to survive,
+  not just the data. Compare the metadata, not only the values: this
+  increment's gate compares whole JSON objects for exactly that reason.
+
+- **Build the input where the two failure modes disagree.** A view that
+  SWAPS two column names separates "corrupted by a two-pass rewrite" from
+  "correct values under the wrong names" - the first scrambles the data,
+  the second leaves every value right and every label wrong. One fixture
+  row distinguished two bugs that a hundred ordinary rows could not.
+
+- **A capability learned on one path is not learned.** Qualified column
+  names worked in joins for many increments while `SELECT E.ID FROM EMP E`
+  refused, and a column ALIAS worked on a single relation while the join
+  projection silently discarded it - after a dedicated alias increment,
+  because that increment's gate used one table. When you add a feature,
+  enumerate the PATHS that should have it, not the cases you happened to
+  test.
+
+- **A refusal has a shelf life, and so does the check that pins it.**
+  Converting the renamed-view-in-a-join case turned a passing refusal
+  check into a passing check of the wrong thing - it now had to be
+  promoted to a comparison. Whenever you lift a refusal, grep the gates
+  for the ones that assert it: a refusal test that keeps passing after
+  the refusal is gone is worse than a deleted one.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

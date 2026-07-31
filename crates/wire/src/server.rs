@@ -10018,13 +10018,19 @@ fn plan_join(
         }
         Proj::Items(items) => {
             for item in items {
-                let SelItem::Col(name, _) = item else {
+                let SelItem::Col(name, alias) = item else {
                     return None; // aggregates over a join: fall back
                 };
                 let (idx, d, colname) = resolve_join_col(&sides, name)?;
                 let (wire, sql_type, length, scale, sub_type) = wire_for(d);
                 cols.push(ProjCol {
-                    name: colname.to_string(),
+                    // An ALIAS names the output column here as it does
+                    // everywhere else. Dropping it was not only a wrong
+                    // NAME: `SELECT E.ID AS EMPID, D.ID AS DEPTID` gave
+                    // two columns both called ID, and a driver keying its
+                    // row objects by name kept ONE of them - two columns
+                    // asked for, one column delivered.
+                    name: alias.clone().unwrap_or_else(|| colname.to_string()),
                     field_id: idx,
                     wire,
                     sql_type: nullable(sql_type),
@@ -10237,6 +10243,172 @@ fn replace_idents(text: &str, map: &[(String, String)]) -> String {
     out
 }
 
+/// Rewrite `alias.col` where `col` is a RENAMED view column, leaving the
+/// qualifier in place: `V.DID` becomes `V.DEPT_ID`.
+///
+/// Global substitution is wrong here - a join has more than one side, and
+/// the same word can be one side's view column and another side's real
+/// one. The qualifier is what says which, so only qualified references
+/// are rewritten; a BARE reference to a renamed column is caught by the
+/// caller and refused rather than guessed at.
+fn replace_qualified_col(text: &str, alias: &str, map: &[(String, String)]) -> String {
+    let b: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == '\'' {
+            out.push(b[i]);
+            i += 1;
+            while i < b.len() {
+                out.push(b[i]);
+                if b[i] == '\'' {
+                    i += 1;
+                    if i < b.len() && b[i] == '\'' {
+                        out.push(b[i]);
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b[i].is_alphabetic() || b[i] == '_' {
+            let start = i;
+            while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$') {
+                i += 1;
+            }
+            let word: String = b[start..i].iter().collect();
+            // `<alias> . <col>` - the dot binds tightly, no spaces
+            if word.eq_ignore_ascii_case(alias) && i < b.len() && b[i] == '.' {
+                let ts = i + 1;
+                let mut te = ts;
+                while te < b.len() && (b[te].is_alphanumeric() || b[te] == '_' || b[te] == '$') {
+                    te += 1;
+                }
+                let tail: String = b[ts..te].iter().collect();
+                if let Some((_, to)) = map.iter().find(|(f, _)| f.eq_ignore_ascii_case(&tail)) {
+                    out.push_str(&word);
+                    out.push('.');
+                    out.push_str(to);
+                    i = te;
+                    continue;
+                }
+            }
+            out.push_str(&word);
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Does `text` mention any of these names WITHOUT a qualifier?
+fn mentions_bare(text: &str, names: &[String]) -> bool {
+    let b: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    let mut in_str = false;
+    while i < b.len() {
+        if b[i] == '\'' {
+            in_str = !in_str;
+            i += 1;
+            continue;
+        }
+        if !in_str && (b[i].is_alphabetic() || b[i] == '_') {
+            let start = i;
+            while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$') {
+                i += 1;
+            }
+            let qualified = start > 0 && b[start - 1] == '.';
+            let word: String = b[start..i].iter().collect();
+            if !qualified && names.iter().any(|n| n.eq_ignore_ascii_case(&word)) {
+                return true;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Drop a qualifier that names the query's ONE relation: `E.ID` and
+/// `EMP.ID` both mean `ID` when the FROM is `EMP E`.
+///
+/// The join resolver has always understood qualified names - it must,
+/// since that is the only way to say which side you mean - but the
+/// single-relation path never did, so `SELECT E.ID FROM EMP E` refused
+/// while `SELECT ID FROM EMP E` answered. Qualifying a column in a
+/// one-table query is ordinary SQL and the engine allows it everywhere:
+/// select list, WHERE, GROUP BY, HAVING, ORDER BY.
+///
+/// A qualifier that names something ELSE is LEFT ALONE rather than
+/// refused - a correlated subquery names its outer table that way, and
+/// this pass runs before anything knows what is in scope there.
+///
+/// Returns None when there was nothing to strip.
+fn unqualify_single(text: &str, allowed: &[&str]) -> Option<String> {
+    let b: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    let mut hit = false;
+    while i < b.len() {
+        if b[i] == '\'' {
+            out.push(b[i]);
+            i += 1;
+            while i < b.len() {
+                out.push(b[i]);
+                if b[i] == '\'' {
+                    i += 1;
+                    if i < b.len() && b[i] == '\'' {
+                        out.push(b[i]);
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // an identifier START is never a digit, so `1.5` is not a
+        // qualified name
+        if b[i].is_alphabetic() || b[i] == '_' || b[i] == '"' {
+            let start = i;
+            if b[i] == '"' {
+                i += 1;
+                while i < b.len() && b[i] != '"' {
+                    i += 1;
+                }
+                i = (i + 1).min(b.len());
+            } else {
+                while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$') {
+                    i += 1;
+                }
+            }
+            let word: String = b[start..i].iter().collect();
+            let bare = word.trim_matches('"');
+            // a qualifier is an identifier immediately followed by a dot
+            // and another identifier (or a star)
+            let qualifies = i < b.len()
+                && b[i] == '.'
+                && i + 1 < b.len()
+                && (b[i + 1].is_alphabetic() || b[i + 1] == '_' || b[i + 1] == '"' || b[i + 1] == '*');
+            if qualifies && allowed.iter().any(|a| a.eq_ignore_ascii_case(bare)) {
+                i += 1; // the dot goes with the qualifier
+                hit = true;
+                continue;
+            }
+            out.push_str(&word);
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    hit.then_some(out)
+}
+
 /// Replace an identifier only where it stands as a TABLE REFERENCE - not
 /// as a qualifier (`V.C`), not as a column, and not inside a string.
 /// What separates the two is a dot on either side.
@@ -10317,7 +10489,8 @@ fn expand_view_join(
     }
     // (alias, view name, base table, the view's own WHERE, step index -
     // None for the base table)
-    let mut expansions: Vec<(String, String, String, Option<String>, Option<usize>)> = Vec::new();
+    let mut expansions: Vec<(String, String, String, Option<String>, Option<usize>, Vec<(String, String)>)> =
+        Vec::new();
     let mut any = false;
     for (step, tr) in std::iter::once((None, from))
         .chain(join.iter().enumerate().map(|(i, (_, r, _, _))| (Some(i), r)))
@@ -10345,22 +10518,24 @@ fn expand_view_join(
         if base_cols.len() != vd.cols.len() {
             return None;
         }
-        // the no-renaming case only: every view column carries the base
-        // column's own name
-        if vd
+        // RENAMED columns are carried as a map rather than refused: the
+        // reference is rewritten under its qualifier (`V.DID` ->
+        // `V.DEPT_ID`) and the select list aliases the view's name back
+        // on, since that is what the describe must say
+        let renames: Vec<(String, String)> = vd
             .cols
             .iter()
             .zip(base_cols.iter())
-            .any(|(v, b)| !v.eq_ignore_ascii_case(b))
-        {
-            return None;
-        }
+            .filter(|(v, b)| !v.eq_ignore_ascii_case(b))
+            .map(|(v, b)| (v.clone(), b.clone()))
+            .collect();
         expansions.push((
             tr.alias.unwrap_or(tr.table).to_string(),
             tr.table.to_string(),
             vfrom.table.to_string(),
             vwhere.map(|w| w.to_string()),
             step,
+            renames,
         ));
     }
     if !any {
@@ -10376,7 +10551,7 @@ fn expand_view_join(
     let mut new_from = table_s.to_string();
     let mut conds: Vec<String> = Vec::new();
     let mut splices: Vec<(usize, usize, String)> = Vec::new();
-    for (alias, _, _, vwhere, step) in &expansions {
+    for (alias, _, _, vwhere, step, _) in &expansions {
         let Some(w) = vwhere else { continue };
         let q = qualify_idents(w, alias);
         match step {
@@ -10404,7 +10579,7 @@ fn expand_view_join(
     for (off, len, text) in splices {
         new_from.replace_range(off..off + len, &text);
     }
-    for (alias, view, base, _, _) in &expansions {
+    for (alias, view, base, _, _, _) in &expansions {
         // Only in TABLE position: the FROM text contains the ON
         // conditions too, and `VEMP.DEPT_ID` there must keep its
         // qualifier - an unaliased view lends its NAME to the base table
@@ -10420,18 +10595,69 @@ fn expand_view_join(
         conds.push(format!("({})", w));
     }
     let (proj_s, _, _, group_s, having_s, order_s) = split_query(sql)?;
-    let mut out = format!("SELECT {} FROM {}", proj_s, new_from);
+
+    // Every RENAMED view column, rewritten under its own qualifier. A
+    // BARE reference to one is refused instead: with more than one side
+    // in scope, the same word can be this view's renamed column and
+    // another table's real one, and only the qualifier says which.
+    let renamed_names: Vec<String> = expansions
+        .iter()
+        .flat_map(|(_, _, _, _, _, r)| r.iter().map(|(v, _)| v.clone()))
+        .collect();
+    let sub_q = |t: &str| -> String {
+        let mut acc = t.to_string();
+        for (alias, _, _, _, _, renames) in &expansions {
+            if !renames.is_empty() {
+                acc = replace_qualified_col(&acc, alias, renames);
+            }
+        }
+        acc
+    };
+    if !renamed_names.is_empty() {
+        let mut all = format!("{} {}", proj_s, new_from);
+        for extra in [where_s, group_s, having_s, order_s].into_iter().flatten() {
+            all.push(' ');
+            all.push_str(extra);
+        }
+        // the view's OWN where is written in the BASE table's names, so
+        // it is not part of this test
+        if mentions_bare(&sub_q(&all), &renamed_names) {
+            return None;
+        }
+    }
+    new_from = sub_q(&new_from);
+    let conds: Vec<String> = conds.iter().map(|c| sub_q(c)).collect();
+
+    // a projected view column keeps the VIEW's name in the describe, so
+    // a rewritten bare item is aliased back to what the client asked for
+    let proj_out = split_top_level_commas(proj_s)
+        .iter()
+        .map(|item| {
+            let (expr, alias) = split_alias(item);
+            let bare = expr.trim().rsplit('.').next().unwrap_or("").trim();
+            let renamed = alias.is_none()
+                && renamed_names.iter().any(|n| n.eq_ignore_ascii_case(bare));
+            if renamed {
+                format!("{} AS {}", sub_q(item).trim(), bare)
+            } else {
+                sub_q(item).trim().to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut out = format!("SELECT {} FROM {}", proj_out, new_from);
     if !conds.is_empty() {
         out.push_str(&format!(" WHERE {}", conds.join(" AND ")));
     }
     if let Some(g) = group_s {
-        out.push_str(&format!(" GROUP BY {}", g));
+        out.push_str(&format!(" GROUP BY {}", sub_q(g)));
     }
     if let Some(h) = having_s {
-        out.push_str(&format!(" HAVING {}", h));
+        out.push_str(&format!(" HAVING {}", sub_q(h)));
     }
     if let Some(o) = order_s {
-        out.push_str(&format!(" ORDER BY {}", o));
+        out.push_str(&format!(" ORDER BY {}", sub_q(o)));
     }
     Some(out)
 }
@@ -10534,13 +10760,64 @@ fn expand_view(sql: &str, db: &Database) -> Option<String> {
         if map.is_empty() { t.to_string() } else { replace_idents(t, &map) }
     };
 
+    // A RENAMED column keeps the VIEW's name in the describe. Rewriting
+    // `EID` to the base's `ID` answers the right VALUE under the wrong
+    // NAME, which a driver builds its row objects from - and when a view
+    // SWAPS two names (`SELECT NAME AS ID, ID AS NAME`) the values end up
+    // attached to each other's names, so `row.ID` differs between the two
+    // servers. Every rewritten reference in the SELECT LIST is therefore
+    // aliased back to the name the client asked for.
+    let view_name_of = |item: &str| -> Option<String> {
+        let (expr, alias) = split_alias(item);
+        if alias.is_some() {
+            return None; // the client named it; that name wins
+        }
+        // a bare column, with or without a qualifier
+        let bare = expr.trim().rsplit('.').next()?.trim();
+        if !ident_ok(bare) {
+            return None;
+        }
+        vd.cols
+            .iter()
+            .find(|c| c.eq_ignore_ascii_case(bare))
+            .map(|c| c.clone())
+    };
+
     // `SELECT *` over the view lists the view's columns explicitly, so
     // the outer projection keeps naming what the client asked for
     let proj_out = match parse_projection(proj_s)? {
-        Proj::Star => base_cols.join(", "),
-        _ => sub(proj_s),
+        Proj::Star => vd
+            .cols
+            .iter()
+            .zip(base_cols.iter())
+            .map(|(v, b)| {
+                if v.eq_ignore_ascii_case(b) {
+                    b.clone()
+                } else {
+                    format!("{} AS {}", b, v)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => split_top_level_commas(proj_s)
+            .iter()
+            .map(|item| match view_name_of(item) {
+                Some(name) => format!("{} AS {}", sub(item).trim(), name),
+                None => sub(item).trim().to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
     };
-    let mut out = format!("SELECT {} FROM {}", proj_out, vfrom.table);
+    // The view's own name (or the alias the query gave it) stays in
+    // scope: `SELECT V.EID FROM VREN V` and `SELECT VREN.EID FROM VREN`
+    // both qualify by something that is about to stop existing, so the
+    // base table inherits it as an alias.
+    let mut out = format!(
+        "SELECT {} FROM {} {}",
+        proj_out,
+        vfrom.table,
+        from.alias.unwrap_or(from.table)
+    );
     // the view's WHERE and the outer one both apply
     match (vwhere, where_s) {
         (Some(a), Some(b)) => {
@@ -11118,6 +11395,27 @@ fn plan_query_inner(
             proj_s, table_s, where_s, group_s, having_s, order_s
         );
     }
+    // A QUALIFIED column in a ONE-TABLE query - `SELECT E.ID FROM EMP E`
+    // - is stripped to its bare name and the whole statement re-planned,
+    // so every clause gets it at once rather than each resolver learning
+    // qualifiers separately. Only a qualifier naming THIS relation goes;
+    // anything else is left for whoever owns it.
+    if let Some((from1, join1)) = parse_from(table_s) {
+        if join1.is_empty() {
+            let mut allowed: Vec<&str> = vec![from1.table];
+            if let Some(a) = from1.alias {
+                allowed.push(a);
+            }
+            if let Some(rewritten) = unqualify_single(sql, &allowed) {
+                if trace {
+                    eprintln!("[srv] plan: unqualified to {:?}", rewritten);
+                }
+                params.clear();
+                return plan_query_inner(&rewritten, db, params);
+            }
+        }
+    }
+
     // MON$ virtual tables: fire-crab keeps no live monitoring state, so
     // it reports them as EMPTY. The firebird-qa bootstrap runs one
     // aggregate query over MON$ATTACHMENTS to detect the server
@@ -11878,13 +12176,28 @@ fn plan_group(
         ),
     };
     // ORDER BY sorts the OUTPUT rows: names resolve to output columns
-    // (group keys by column name), ordinals to select-list positions
+    // (group keys by column name), ordinals to select-list positions.
+    //
+    // A grouped key answers to BOTH names when the select list renamed
+    // it: `SELECT DEPT_ID AS D2 ... GROUP BY DEPT_ID ORDER BY DEPT_ID`
+    // sorts by the key, which the engine allows and which only looks
+    // exotic until a VIEW does the renaming - `ORDER BY DID` over a view
+    // whose DID is the base table's DEPT_ID becomes exactly this.
     let order_by = match order_s {
         None => Vec::new(),
         Some(os) => parse_order_by(os, &cols, |n| {
-            cols.iter()
-                .find(|c| c.name.eq_ignore_ascii_case(n))
-                .map(|c| c.field_id)
+            if let Some(c) = cols.iter().find(|c| c.name.eq_ignore_ascii_case(n)) {
+                return Some(c.field_id);
+            }
+            // the key's own column name, for an output column that was
+            // renamed by an alias
+            cols.iter().zip(gitems.iter()).find_map(|(c, g)| match g {
+                GItem::Key(fid) => columns
+                    .iter()
+                    .find(|rc| rc.field_id as usize == *fid && rc.name.eq_ignore_ascii_case(n))
+                    .map(|_| c.field_id),
+                _ => None,
+            })
         })?,
     };
     Some(Plan::Group {
@@ -23736,6 +24049,61 @@ pub fn serve(addr: &str, user: &str, password: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_relation_qualifiers_are_stripped() {
+        let a = ["EMP", "E"];
+        assert_eq!(
+            unqualify_single("SELECT E.ID FROM EMP E ORDER BY E.ID", &a).unwrap(),
+            "SELECT ID FROM EMP E ORDER BY ID"
+        );
+        // the table's own name qualifies too
+        assert_eq!(
+            unqualify_single("SELECT EMP.ID FROM EMP", &a).unwrap(),
+            "SELECT ID FROM EMP"
+        );
+        assert_eq!(
+            unqualify_single("SELECT E.* FROM EMP E", &a).unwrap(),
+            "SELECT * FROM EMP E"
+        );
+        // a qualifier naming something ELSE is LEFT ALONE - a correlated
+        // subquery names its outer table that way, and this pass runs
+        // before anything knows what is in scope there
+        assert_eq!(
+            unqualify_single("SELECT E.ID FROM EMP E WHERE D.X = 1", &a).unwrap(),
+            "SELECT ID FROM EMP E WHERE D.X = 1"
+        );
+        // nothing to strip
+        assert!(unqualify_single("SELECT ID FROM EMP", &a).is_none());
+        // a DECIMAL is not a qualified name: an identifier never starts
+        // with a digit
+        assert!(unqualify_single("SELECT 1.5 FROM EMP", &a).is_none());
+        // and a string literal is not identifier text
+        assert!(unqualify_single("SELECT ID FROM EMP WHERE N = 'E.ID'", &a).is_none());
+    }
+
+    #[test]
+    fn renamed_view_columns_rewrite_under_their_qualifier() {
+        let map = vec![
+            ("DID".to_string(), "DEPT_ID".to_string()),
+            ("EID".to_string(), "ID".to_string()),
+        ];
+        assert_eq!(
+            replace_qualified_col("V.DID = D.ID AND V.EID > 0", "V", &map),
+            "V.DEPT_ID = D.ID AND V.ID > 0"
+        );
+        // another side's identically-named column is NOT this view's
+        assert_eq!(
+            replace_qualified_col("W.DID = 1", "V", &map),
+            "W.DID = 1"
+        );
+        // a bare name is left for the caller to refuse - only the
+        // qualifier says which side owns the word
+        assert_eq!(replace_qualified_col("DID = 1", "V", &map), "DID = 1");
+        assert!(mentions_bare("DID = 1", &["DID".to_string()]));
+        assert!(!mentions_bare("V.DID = 1", &["DID".to_string()]));
+        assert!(!mentions_bare("N = 'DID'", &["DID".to_string()]));
+    }
 
     #[test]
     fn table_position_is_not_qualifier_position() {

@@ -7195,6 +7195,73 @@ because the two sides speak different languages — JS values against isql text:
 
 Ten checks, green on the first run.
 
+### A view's columns keep the view's names (`qa/serve-real-viewrename.sh`, 46 checks)
+
+A view is expanded by a rewrite: its name becomes the base table's, its column
+names become the base's, its WHERE is ANDed in. Three of those four are right.
+The column names are not — because a renamed view column is not a spelling of
+the base column, it is the **name the client asked for**, and the describe is
+what a driver builds its row objects from. `SELECT EID FROM VREN` returned the
+right number in a column called `ID`, so `row.EID` was `undefined`.
+
+The check that shows it is not a value comparison, and this gate therefore
+compares the whole JSON — keys included. Every bug in this increment had
+correct values.
+
+**The fixture's sharpest row is a view that SWAPS two names:**
+
+```sql
+CREATE VIEW VSWAP AS SELECT NAME AS ID, ID AS NAME FROM EMP;
+```
+
+Here the two failure modes separate. A two-pass substitution corrupts the text
+(rewrite `ID`→`NAME`, then `NAME`→`ID`, and both columns end up the same); a
+single-pass one gets the values right and then, reporting the base's names,
+puts them on *each other's* names. `row.ID` is then a string on one server and
+a number on the other — same query, same row order, opposite types. A gate
+comparing values alone passes.
+
+**Fixing it needed two things that turned out to be missing on their own.**
+
+The rewrite produces `SELECT V.ID AS EID FROM EMP V`, and that refused, because
+`SELECT E.ID FROM EMP E` refused. The join resolver has always understood
+qualified names — it has to, since that is the only way to say which side you
+mean — but the single-relation path never did, in any clause. Qualifying a
+column in a one-table query is ordinary SQL that people write by hand every
+day. It is now stripped in one place, before anything else resolves: a
+qualifier naming THIS relation goes, and the statement is re-planned so every
+clause gets it at once. A qualifier naming anything *else* is deliberately left
+alone — a correlated subquery names its outer table that way, and this pass
+runs before anything knows what is in scope there. Being permissive here cannot
+regress anything; refusing would have.
+
+The second was the alias on a joined column, which was **dropped**:
+
+```
+SELECT E.ID AS EMPID, D.ID AS DEPTID FROM EMP E JOIN DEPT D ON E.DEPT_ID = D.ID
+```
+
+fire-crab answered `[{"ID":1}, ...]` — one column. Both output columns were
+named `ID`, and a driver keying its row objects by name keeps the last one. Two
+columns asked for, one column delivered, no error anywhere. The fix is one
+field (`SelItem::Col`'s alias, which the join projection discarded), and the
+reason it survived a dedicated column-alias increment is that the alias gate
+tested a single relation.
+
+**And one law about grouping.** A grouped key answers to BOTH names when the
+select list renamed it: `SELECT DEPT_ID AS D2 ... GROUP BY DEPT_ID ORDER BY
+DEPT_ID` sorts by the key. Written by hand that is unusual enough to overlook;
+it is what a renamed view produces on every grouped query, which is how it was
+found.
+
+**The refusal that remains, with its reason.** A BARE reference to a renamed
+view column inside a join — `SELECT EID FROM VREN V JOIN DEPT D ON ...` — is
+refused. With more than one side in scope, the same word can be this view's
+renamed column and another table's real column, and only the qualifier says
+which. The engine resolves it from the full scope; this server would have to
+guess a side, and guessing produces a wrong answer rather than an error. The
+qualified spelling is converted, and the refusal is checked.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

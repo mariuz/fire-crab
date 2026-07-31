@@ -13,6 +13,54 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — a view's columns keep the view's names
+
+### Fixed
+- **A view with RENAMED columns answered under the BASE table's names.**
+  `SELECT EID FROM VREN` returned the right value in a column called ID.
+  Every value was right and every NAME was wrong — and a driver builds
+  its row objects from those names, so `row.EID` was undefined. The
+  sharpest case is a view that SWAPS two names (`SELECT NAME AS ID, ID AS
+  NAME`): the values then land on each other's names, so `row.ID` is a
+  number on one server and a string on the other. Rewriting a view's
+  column to its base's is only half the job; the select list has to alias
+  the view's name back on, because that name is the whole contract.
+- **`SELECT E.ID FROM EMP E` refused.** The join resolver has always
+  understood qualified names — it must, since that is the only way to say
+  which side you mean — but the single-relation path never did. So
+  qualifying a column in a one-table query, which is ordinary SQL and
+  also what the view rewrite produces, was an error: in the select list,
+  the WHERE, GROUP BY, HAVING and ORDER BY alike. A qualifier naming
+  THIS relation is now stripped and the statement re-planned; one naming
+  anything else is left alone, since a correlated subquery names its
+  outer table that way.
+- **An ALIAS on a joined column was dropped**, and that was not only a
+  wrong name: `SELECT E.ID AS EMPID, D.ID AS DEPTID` produced two output
+  columns both called ID, and a driver keying its rows by name kept one
+  of them. Two columns asked for, one column delivered.
+- **A grouped key now answers to BOTH names.** `SELECT DEPT_ID AS D2 ...
+  GROUP BY DEPT_ID ORDER BY DEPT_ID` sorts by the key, which the engine
+  allows. It looks exotic written by hand and is exactly what a renamed
+  view produces once expanded.
+
+### Converted
+- **A view with renamed columns may now be a SIDE OF A JOIN** — the
+  refusal `qa/serve-real-viewjoin.sh` recorded one increment ago. The
+  reference is rewritten under its QUALIFIER (`V.DID` → `V.DEPT_ID`),
+  which is what keeps two sides apart, and the select list aliases the
+  view's name back on.
+
+### Guarded
+- **A BARE reference to a renamed view column inside a join refuses.**
+  With more than one side in scope the same word can be this view's
+  renamed column and another table's real one, and only the qualifier
+  says which. The engine resolves it; guessing a side would be a wrong
+  answer, so this is a refusal with a reason rather than a gap.
+
+`qa/serve-real-viewrename.sh` is new, 46 checks. It compares the whole
+JSON — KEYS included — because every bug in this increment was visible
+only in the keys: the values were right throughout.
+
 ## 2026-07-31 — the gates that measured nothing
 
 ### Fixed

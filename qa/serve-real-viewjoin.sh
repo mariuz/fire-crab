@@ -28,11 +28,11 @@
 #      that also renamed the qualifier produced `EMP VEMP.DEPT_ID`.
 #
 # The refusals are checked too, because each is a shape whose rewrite is
-# not merely harder but different in kind: a view with RENAMED columns
-# needs every reference rewritten rather than the table name; a view over
-# a JOIN has no single base table to become; and a RIGHT or FULL join
-# makes an EARLIER side nullable, so which side a predicate belongs to
-# stops being a local question.
+# not merely harder but different in kind: a view over a JOIN has no
+# single base table to become, and a RIGHT or FULL join makes an EARLIER
+# side nullable, so which side a predicate belongs to stops being a local
+# question. (A view with RENAMED columns was a third; it was converted an
+# increment later and is compared here now.)
 #
 #   qa/serve-real-viewjoin.sh [port]
 #
@@ -222,8 +222,14 @@ both "ORDER BY a view column" \
 
 # --- 6. the refusals ---------------------------------------------------
 # each of these is a rewrite of a different kind, not a harder one
-refuses "a view with RENAMED columns in a join" \
-        "SELECT COUNT(*) FROM VREN V JOIN DEPT D ON V.DID = D.ID"
+# (a view with RENAMED columns was refused here until the increment that
+# converted it - the reference is now rewritten under its qualifier and
+# the select list aliases the view's name back on. It is COMPARED now,
+# and qa/serve-real-viewrename.sh owns the shape; a refusal left in place
+# after the refusal is lifted is a check that passes for the wrong
+# reason.)
+both "a view with RENAMED columns in a join" \
+     "SELECT COUNT(*) FROM VREN V JOIN DEPT D ON V.DID = D.ID"
 refuses "a view over a JOIN" "SELECT COUNT(*) FROM VJOIN"
 refuses "a view over a join, in a join" \
         "SELECT COUNT(*) FROM VJOIN V JOIN DEPT D ON V.ID = D.ID"
