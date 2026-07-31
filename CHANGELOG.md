@@ -13,6 +13,42 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — W1e: the foreign-key check stops scanning
+
+### Converted
+- **`fk_partner_has` drives the parent's own index.** "Does a parent row
+  with this key exist" is an EXISTENCE test, and the referenced side
+  always carries a unique index because SQL requires one. It had been
+  answered by scanning the whole referenced relation **once per written
+  row** — its own comment already said *the engine compares partner
+  index keys*.
+- **The whole key is known here, so a COMPOUND index is a point lookup**
+  rather than a prefix range. This is the one place where a
+  multi-segment key is the easy case, and the write path's encoder
+  already stuffs compound keys byte-exactly.
+- Same safety rule as every other retrieval: the index names candidates
+  and the same pad-insensitive comparison still decides. A text key
+  cannot be built byte-exactly yet, so it **scans** — and the gate
+  asserts that it scans.
+
+### Fixed
+- **The roadmap's "30 `for_each_record` sites" was a remembered number,
+  not a measurement.** There are 21, and most are catalog walks that are
+  not query retrieval at all. The sites that matter are four, and two
+  had never been named: this one, and `collect_dml_targets` — which
+  walks every page for `UPDATE`/`DELETE ... WHERE` and never appeared in
+  the count because it has its own scan rather than calling
+  `for_each_record`.
+
+`qa/serve-real-index.sh` grows to 186 checks, with an `fk lookup:` trace
+line and assertions in both directions. A `both_refuse` helper joins it:
+fire-crab has no constraint-violation TEXT of its own (a generic error
+where the engine names the constraint and the offending key), which is a
+pre-existing gap, so those checks assert that both sides refuse rather
+than pretending the wording matches.
+
+21 gates and 369 unit tests confirm nothing moved.
+
 ## 2026-07-31 — W1d: the sort an index makes unnecessary
 
 `Access::Order` — the engine's navigation. An index walk already

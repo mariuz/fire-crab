@@ -58,6 +58,10 @@ CREATE TABLE EMP (ID INTEGER NOT NULL PRIMARY KEY, DEPT_ID INTEGER,
 CREATE TABLE PLAIN (ID INTEGER, V INTEGER);
 CREATE TABLE WIDE (K BIGINT, S SMALLINT, N NUMERIC(9,2), T VARCHAR(6));
 CREATE TABLE NU (K INTEGER, V VARCHAR(4));
+CREATE TABLE PARENT (K INTEGER NOT NULL PRIMARY KEY, V VARCHAR(4));
+CREATE TABLE CHILD (ID INTEGER, PK INTEGER REFERENCES PARENT (K));
+CREATE TABLE TPARENT (K VARCHAR(4) NOT NULL PRIMARY KEY);
+CREATE TABLE TCHILD (ID INTEGER, PK VARCHAR(4) REFERENCES TPARENT (K));
 COMMIT;
 CREATE INDEX EMP_DEPT ON EMP (DEPT_ID);
 CREATE INDEX WIDE_K ON WIDE (K);
@@ -84,6 +88,9 @@ INSERT INTO NU VALUES (2, 'two');
 INSERT INTO NU VALUES (1, 'one');
 INSERT INTO NU VALUES (NULL, 'nil');
 INSERT INTO NU VALUES (NULL, 'nil2');
+INSERT INTO PARENT VALUES (1, 'p1');
+INSERT INTO PARENT VALUES (2, 'p2');
+INSERT INTO TPARENT VALUES ('a');
 COMMIT;
 EOF
     chmod 666 "$1"
@@ -416,6 +423,83 @@ case "$a$b" in
 esac
 both "the whole table, after all of it" "SELECT ID, SALARY FROM EMP ORDER BY ID"
 
+
+# --- 5b. THE FOREIGN KEY CHECK, which scanned once per written row -----
+# `does a parent row with this key exist` is an EXISTENCE test, and the
+# referenced side always carries a UNIQUE index because SQL requires one.
+# It had been answered by scanning the whole referenced relation for
+# EVERY row written. The whole key is known here, so a compound key is a
+# point lookup rather than a prefix range - the one place a
+# multi-segment index is the easy case.
+# Both servers must REFUSE, but their messages differ: fire-crab has no
+# constraint-violation text of its own yet (it raises a generic Dynamic
+# SQL Error where the engine names the constraint and the offending
+# key). That is a pre-existing gap, unchanged by this slice, so these
+# assert the refusal on both sides rather than pretending the wording
+# matches.
+both_refuse() { # <label> <sql>
+    ran=$((ran + 1))
+    a=$(query "$2" "$PORT" "$A")
+    b=$(query "$2" "$REAL" "$B")
+    case "$a" in
+        ERR*) ;;
+        *) echo "DIFF $1: fire-crab ANSWERED [$a] where the engine raises"; fail=1; return ;;
+    esac
+    case "$b" in
+        ERR*) echo "OK   refused by both: $1" ;;
+        *) echo "DIFF $1: the ENGINE answered [$b] - this must not be refused"; fail=1 ;;
+    esac
+}
+fk_lookups() { grep -c "fk lookup:" "$LOG" 2>/dev/null || true; }
+fk_indexed() { # <label> <sql>
+    before=$(fk_lookups)
+    both "$1" "$2"
+    after=$(fk_lookups)
+    ran=$((ran + 1))
+    if [ "$after" -gt "$before" ]; then
+        echo "OK   ... and the FK check used the parent's INDEX"
+    else
+        echo "DIFF $1 scanned the parent relation"
+        fail=1
+    fi
+}
+fk_scans() { # <label> <sql>
+    before=$(fk_lookups)
+    both "$1" "$2"
+    after=$(fk_lookups)
+    ran=$((ran + 1))
+    if [ "$after" -eq "$before" ]; then
+        echo "OK   ... and the FK check scanned, as it must"
+    else
+        echo "DIFF $1 keyed a lookup it cannot build exactly"
+        fail=1
+    fi
+}
+fk_indexed "a child row whose parent EXISTS" "INSERT INTO CHILD VALUES (1, 1)"
+fk_indexed "another one, same parent" "INSERT INTO CHILD VALUES (2, 1)"
+before=$(fk_lookups)
+both_refuse "a child row whose parent does NOT exist" \
+            "INSERT INTO CHILD VALUES (3, 99)"
+ran=$((ran + 1))
+if [ "$(fk_lookups)" -gt "$before" ]; then
+    echo "OK   ... and the refusal came from an INDEX lookup, not a scan"
+else
+    echo "DIFF the failing FK check scanned the parent relation"; fail=1
+fi
+both "... and the refusal left no row behind" \
+     "SELECT COUNT(*) AS K FROM CHILD"
+# a NULL FK column passes without any check at all (MATCH SIMPLE)
+both "a NULL foreign key needs no parent" "INSERT INTO CHILD VALUES (4, NULL)"
+both "the child table, after all of it" "SELECT ID, PK FROM CHILD ORDER BY ID"
+# the parent side: a key still referenced may not be deleted
+both_refuse "deleting a referenced parent" "DELETE FROM PARENT WHERE K = 1"
+both "deleting an UNreferenced parent is allowed" "DELETE FROM PARENT WHERE K = 2"
+# a TEXT key cannot be built byte-exactly here, so it must still scan -
+# and it must still be RIGHT
+fk_scans "a TEXT foreign key, which scans" "INSERT INTO TCHILD VALUES (1, 'a')"
+both_refuse "a TEXT key with no parent" "INSERT INTO TCHILD VALUES (2, 'zz')"
+both "the text child table" "SELECT ID, PK FROM TCHILD ORDER BY ID"
+
 # --- 6. THE COVERAGE CHECK'S OWN TEETH ---------------------------------
 # Everything above asserts "an index was used". That claim is only worth
 # something if the assertion can FAIL - so a second server runs with the
@@ -481,8 +565,8 @@ else
 fi
 
 rm -f "$A" "$B"
-if [ "$ran" -lt 125 ]; then
-    echo "DIFF only $ran checks ran (expected at least 125) - did one silently skip?"
+if [ "$ran" -lt 135 ]; then
+    echo "DIFF only $ran checks ran (expected at least 135) - did one silently skip?"
     fail=1
 fi
 exit $fail

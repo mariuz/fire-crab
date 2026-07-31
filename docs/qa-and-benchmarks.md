@@ -7855,8 +7855,14 @@ case worth having — and it is `opt`'s rule too.
 **What is not wired yet, named so it is not assumed.** Index-driven joins, text
 and scaled keys, compound prefixes, `OR` (which needs a retrieval per branch and
 a merge), `<>`, and parameters — whose values arrive after the plan is built.
-The roadmap counts thirty retrieval sites; this wires the projection's and the
-fold's.
+The roadmap said thirty retrieval sites; counting them says **21**, and most are
+catalog walks rather than query retrieval. The ones that matter are four, and
+two had never been named: `fk_partner_has`, which scans the referenced relation
+**once per written row** to ask whether a parent key exists (its own comment
+already says the engine compares partner *index* keys), and
+`collect_dml_targets`, which walks every page for `UPDATE`/`DELETE ... WHERE`
+and never appeared in the count because it has its own scan rather than calling
+`for_each_record`. A remembered number is not a measurement.
 
 ## Benchmarks
 

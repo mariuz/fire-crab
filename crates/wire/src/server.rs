@@ -2866,18 +2866,82 @@ fn fk_partners(
 /// [value_cmp], the pad-insensitive equality the join machinery uses
 /// (the engine compares partner INDEX keys, equally pad-insensitive).
 fn fk_partner_has(db: &Database, fk: &FkPartner, key: &[&Value]) -> bool {
+    let matches_key = |v: &[Value]| {
+        fk.other_fids.iter().zip(key).all(|(of, k)| {
+            let o = v.get(*of).unwrap_or(&Value::Null);
+            !matches!(o, Value::Null) && value_cmp(o, k) == std::cmp::Ordering::Equal
+        })
+    };
+    // THE PARTNER'S OWN INDEX ANSWERS THIS. A referenced key always
+    // carries a UNIQUE index - SQL requires one - and the question here
+    // is an EXISTENCE test, so the index names the candidates and the
+    // comparison above still decides. Without it this scanned the whole
+    // referenced relation ONCE PER WRITTEN ROW.
+    //
+    // The whole key is known, so a COMPOUND index is a point lookup
+    // rather than a prefix range: this is the one place where a
+    // multi-segment key is the easy case.
+    if let Some(recnos) = fk_partner_lookup(db, fk, key) {
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!(
+                "[srv] fk lookup: rel={} candidates={}",
+                fk.other_rel,
+                recnos.len()
+            );
+        }
+        return records_at(db, fk.other_rel, &fk.other_formats, &recnos)
+            .iter()
+            .any(|v| matches_key(v));
+    }
     let mut found = false;
     for_each_record(db, fk.other_rel, &fk.other_formats, |v| {
-        if !found
-            && fk.other_fids.iter().zip(key).all(|(of, k)| {
-                let o = v.get(*of).unwrap_or(&Value::Null);
-                !matches!(o, Value::Null) && value_cmp(o, k) == std::cmp::Ordering::Equal
-            })
-        {
+        if !found && matches_key(v) {
             found = true;
         }
     });
     found
+}
+
+/// The record numbers the partner's index offers for `key`, or None when
+/// no index can answer it and the caller must scan.
+///
+/// Narrow for the same reason every other key-building site is: a key
+/// this cannot build byte-exactly does not refuse, it MISSES - and a
+/// missed parent row turns a legal INSERT into a foreign-key violation.
+/// So the index's segments must be exactly the partnership's columns, in
+/// order, and every one an integer at scale 0.
+fn fk_partner_lookup(db: &Database, fk: &FkPartner, key: &[&Value]) -> Option<Vec<u64>> {
+    use fire_crab_ods::btw;
+    let (_, descs) = fk.other_formats.iter().max_by_key(|(n, _)| *n)?;
+    let ops = resolve_index_ops(db, fk.other_rel, descs)?;
+    let op = ops.iter().find(|o| {
+        o.segs.len() == fk.other_fids.len()
+            && o.segs
+                .iter()
+                .zip(&fk.other_fids)
+                .all(|((sf, itype, _), of)| {
+                    sf == of && matches!(*itype, btw::IDX_NUMERIC | btw::IDX_NUMERIC2)
+                })
+    })?;
+    if fk
+        .other_fids
+        .iter()
+        .any(|of| descs.get(*of).is_none_or(|d| d.scale != 0))
+    {
+        return None;
+    }
+    let mut values = vec![Value::Null; descs.len()];
+    for (of, k) in fk.other_fids.iter().zip(key) {
+        match k {
+            Value::Int(n) => values[*of] = Value::Int(*n),
+            _ => return None, // any other form may key differently
+        }
+    }
+    let (ikey, all_null) = op.key_for(&values)?;
+    if all_null {
+        return None;
+    }
+    fire_crab_ods::btr::lookup_key(&db.bytes, db.page_size, fk.other_rel, op.id, &ikey)
 }
 
 /// Child-side partner check at store time: every FK on the row's table

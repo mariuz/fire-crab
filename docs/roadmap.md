@@ -99,7 +99,7 @@ it", which is a different risk profile from converting something new:
 the oracle already exists, so the gate is *behaviour must not change*
 plus *the subsystem is now on the path*.
 
-- **W1 — index-driven retrieval.** *(equality, ranges, the fold's input and ORDER BY navigation done)* The first
+- **W1 — index-driven retrieval.** *(equality, ranges, the fold's input, ORDER BY navigation and the FK check done)* The first
   slice that put a converted subsystem on the running server's path.
   `crates/wire/Cargo.toml` now depends on `fire-crab-opt`, and **opt
   makes the choice**: `plan_query` is asked about the statement, and only
@@ -116,6 +116,22 @@ plus *the subsystem is now on the path*.
     read their candidates through the same leaf. A key this cannot
     build byte-exactly would be a MISSED ROW rather than a refusal,
     which is why the mechanics are narrow and everything else scans.
+  - **The map of what is left, measured rather than remembered.** The
+    original entry said "30 `for_each_record` sites"; there are **21**,
+    and most are CATALOG walks (`RDB$RELATIONS`, `RDB$FIELDS`,
+    `RDB$RELATION_FIELDS`, the FK catalog) which are not query retrieval
+    at all. The retrieval sites that matter are four, and two of them
+    the roadmap had never named:
+    - **`fk_partner_has`** — *(done)* was a FULL SCAN of the referenced
+      relation **per written row**. It drives the parent's unique index
+      now; the whole key is known, so a compound index is a point lookup
+      rather than a prefix range. A text key still scans.
+    - **`collect_dml_targets`** — `UPDATE`/`DELETE ... WHERE <indexed> =
+      k` walks every page. It has its own scan rather than going through
+      `for_each_record`, which is why it never appeared in the count.
+    - `eval_subquery` / `build_correlated_lookup` — a subquery's own
+      retrieval.
+    - the JOIN's inner side.
   - Still to do: index-driven joins,
     text keys (a collation makes the key a collation key), compound
     prefixes, and parameters (their values arrive after the plan is
