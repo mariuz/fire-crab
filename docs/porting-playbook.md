@@ -1701,6 +1701,22 @@ them.
   caller has to account for every variant, not the one the first test
   happened to produce.
 
+- **A coverage check reads what the code SAYS, so silence looks like
+  absence.** One retrieval path here chose an index correctly and never
+  logged the choice; the gate duly reported a scan. Nothing was broken
+  except the instrument, which is the failure that wastes the most time,
+  because it points at the code that works. When you assert on a
+  component's own reporting, make emitting the report part of the change
+  that makes the decision.
+
+- **Let the wiring inherit the converted component's limits rather than
+  routing around them.** The optimizer here cannot parse a HAVING, so a
+  statement with one scans — even though its WHERE is the same
+  indexable predicate that drives an index without it. The tempting fix
+  is to strip the clause before asking; the honest one is to accept the
+  refusal and gate it, so the coverage check becomes the thing that
+  notices when the component learns more.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

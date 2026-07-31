@@ -13,6 +13,39 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — W1c: the fold reads through a retrieval too
+
+### Converted
+- **A grouped query's leaf is chosen the same way** as a projection's.
+  `Plan::Group` carries the access path, and both trees that build a
+  fold (`branch_rows` and the emit) take it — so `GROUP BY` over an
+  indexed `WHERE` looks up instead of scanning.
+- **The prepare-time aggregate walk** — the fast path a lone `COUNT`,
+  `SUM`, `MIN` or `MAX` takes — reads its candidates through the same
+  leaf. It was the one retrieval site the previous slice named and left
+  scanning, with the gate saying so.
+- One function, `leaf_source`, now states "index or scan" for every site
+  that builds a tree.
+
+### Fixed
+- **The aggregate's choice was made and never logged**, so the coverage
+  check could not see it: the gate reported a scan for a statement that
+  was using an index. A coverage assertion is only as good as what it
+  can read, and an unlogged decision is invisible to it in exactly the
+  same way as a decision never made.
+
+### Guarded
+- **A `HAVING` clause makes the whole statement scan**, because `opt`
+  does not parse one and declines it — even though the `WHERE` beside it
+  is the same indexable predicate that drives an index without the
+  HAVING. That is the right way round: a component that cannot read the
+  statement must not be asked to bless it. The retrieval inherits the
+  optimizer's limits, and the gate asserts the scan so the day opt
+  learns HAVING, the check notices.
+
+`qa/serve-real-index.sh` grows to 146 checks. 29 gates and 369 unit
+tests confirm nothing moved.
+
 ## 2026-07-31 — W1b: ranges, and the bound that was never asked for
 
 ### Converted

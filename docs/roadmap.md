@@ -99,7 +99,7 @@ it", which is a different risk profile from converting something new:
 the oracle already exists, so the gate is *behaviour must not change*
 plus *the subsystem is now on the path*.
 
-- **W1 — index-driven retrieval.** *(equality and ranges done)* The first
+- **W1 — index-driven retrieval.** *(equality, ranges and the fold's input done)* The first
   slice that put a converted subsystem on the running server's path.
   `crates/wire/Cargo.toml` now depends on `fire-crab-opt`, and **opt
   makes the choice**: `plan_query` is asked about the statement, and only
@@ -111,14 +111,17 @@ plus *the subsystem is now on the path*.
     projection's retrieval — equality and RANGES (`>`, `>=`, `<`, `<=`,
     `BETWEEN`), including descending indexes (their keys are
     complemented, so the bounds swap) and multiple bounds on one column
-    (a conjunction narrows). A key this cannot
+    (a conjunction narrows). Both the PROJECTION's retrieval and the
+    FOLD's - a grouped query and the prepare-time aggregate fast path
+    read their candidates through the same leaf. A key this cannot
     build byte-exactly would be a MISSED ROW rather than a refusal,
     which is why the mechanics are narrow and everything else scans.
   - Still to do: `ORDER BY` via navigation (the index is used for the
     range but the sort still runs), index-driven joins,
-    the aggregate's own walk (it has a separate retrieval), text keys
-    (a collation makes the key a collation key), compound prefixes, and
-    parameters (their values arrive after the plan is built).
+    text keys (a collation makes the key a collation key), compound
+    prefixes, and parameters (their values arrive after the plan is
+    built). Also: a statement `opt` cannot parse - a `HAVING`, for one -
+    scans, because the retrieval inherits the optimizer's own limits.
   - It also fixed a pre-existing wrong answer it was in a position to
     see: uniqueness was read from the index ENTRIES, which outlive their
     records, so re-inserting a deleted key was refused against an engine

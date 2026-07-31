@@ -202,12 +202,32 @@ indexed "a lookup with an ORDER BY above it" \
 # --- 2. a NON-unique index: duplicates, and the empty case -------------
 indexed "a non-unique index with several matches" \
         "SELECT ID FROM EMP WHERE DEPT_ID = 1 ORDER BY ID"
-# An AGGREGATE has its own walk over the records, which this slice does
-# not route through the chosen leaf - so the answer is checked and the
-# access path is not claimed. Naming it here is the point: the roadmap
-# counts 30 retrieval sites and this slice wires the projection's.
-both "... counted (the aggregate walk is not index-driven yet)" \
-     "SELECT COUNT(*) AS K FROM EMP WHERE DEPT_ID = 1"
+# An AGGREGATE reads its input through a retrieval like anything else -
+# the fold sits ABOVE the leaf, so the leaf is chosen the same way. Both
+# the prepare-time scalar path and the grouped one go through it.
+indexed "... counted" "SELECT COUNT(*) AS K FROM EMP WHERE DEPT_ID = 1"
+indexed "... summed" "SELECT SUM(SALARY) AS S FROM EMP WHERE DEPT_ID = 1"
+indexed "... the largest of them" "SELECT MAX(SALARY) AS M FROM EMP WHERE DEPT_ID = 1"
+indexed "... a counted COLUMN, which skips NULLs" \
+        "SELECT COUNT(SALARY) AS K FROM EMP WHERE DEPT_ID = 1"
+indexed "an aggregate over a RANGE" "SELECT COUNT(*) AS K FROM EMP WHERE ID > 2"
+indexed "a GROUPED query with an indexed WHERE" \
+        "SELECT DEPT_ID, COUNT(*) AS K FROM EMP WHERE DEPT_ID = 1 GROUP BY DEPT_ID"
+indexed "a GROUPED query over a range" \
+        "SELECT DEPT_ID, COUNT(*) AS K FROM EMP WHERE ID > 1
+         GROUP BY DEPT_ID ORDER BY DEPT_ID"
+# The retrieval inherits the OPTIMIZER'S OWN LIMITS: opt does not parse
+# a HAVING clause, so it declines the whole statement and this scans -
+# even though the WHERE is the same indexable predicate as the check
+# above. That is the right way round (a component that cannot read the
+# statement must not be asked to bless it), and it is checked rather
+# than assumed, so the day opt learns HAVING this check is what notices.
+natural "... with a HAVING above it, which opt does not parse" \
+        "SELECT DEPT_ID, COUNT(*) AS K FROM EMP WHERE ID > 1
+         GROUP BY DEPT_ID HAVING COUNT(*) > 1 ORDER BY DEPT_ID"
+natural "an aggregate with NO predicate" "SELECT COUNT(*) AS K FROM EMP"
+natural "a GROUPED query with no predicate" \
+        "SELECT DEPT_ID, COUNT(*) AS K FROM EMP GROUP BY DEPT_ID ORDER BY DEPT_ID"
 indexed "a single match" "SELECT ID FROM EMP WHERE DEPT_ID = 3"
 indexed "no match" "SELECT ID FROM EMP WHERE DEPT_ID = 77"
 indexed "a negative key" "SELECT ID FROM EMP WHERE DEPT_ID = -1"
@@ -366,6 +386,10 @@ same_both_ways "a range" "SELECT ID FROM EMP WHERE ID > 2 AND ID <= 5 ORDER BY I
 same_both_ways "a range with NULLs below it" \
                "SELECT ID FROM EMP WHERE DEPT_ID < 3 ORDER BY ID"
 same_both_ways "an empty range" "SELECT ID FROM EMP WHERE ID > 9 AND ID < 2"
+same_both_ways "an aggregate" "SELECT COUNT(*) AS K FROM EMP WHERE DEPT_ID = 9"
+same_both_ways "a grouped query" \
+               "SELECT DEPT_ID, COUNT(*) AS K FROM EMP WHERE ID > 1
+                GROUP BY DEPT_ID ORDER BY DEPT_ID"
 # and the switch really did switch it off
 ran=$((ran + 1))
 if [ "$(grep -c 'index scan:' "$LOG2" 2>/dev/null || true)" -eq 0 ]; then
@@ -376,8 +400,8 @@ else
 fi
 
 rm -f "$A" "$B"
-if [ "$ran" -lt 90 ]; then
-    echo "DIFF only $ran checks ran (expected at least 90) - did one silently skip?"
+if [ "$ran" -lt 105 ]; then
+    echo "DIFF only $ran checks ran (expected at least 105) - did one silently skip?"
     fail=1
 fi
 exit $fail

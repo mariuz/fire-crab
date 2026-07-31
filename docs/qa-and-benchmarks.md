@@ -7721,7 +7721,7 @@ fixed for the unquoted case only (`bare_ident_ok`), because `"3"` is a
 perfectly legal delimited identifier and the callers strip the quotes before
 asking.
 
-### The first index-driven retrieval (`qa/serve-real-index.sh`, 125 checks)
+### The first index-driven retrieval (`qa/serve-real-index.sh`, 146 checks)
 
 Two subsystems had been finished and left disconnected. `ods::btr` decoded
 index pages and walked leaf levels; `fire-crab-opt` reproduced the engine's
@@ -7799,12 +7799,35 @@ NULLs are stored as a **zero-length key**, which sorts before every value, so
 throws them all out. A wasted fetch, never a wrong row. It is the property the
 whole slice rests on, and it is gated rather than argued.
 
+**Then the fold.** An aggregate reads its input through a retrieval like
+anything else — the fold sits *above* the leaf — so a grouped query and the
+prepare-time `COUNT`/`SUM`/`MIN`/`MAX` fast path now choose the same way the
+projection does. That closed the one site the previous slice had named and left
+scanning; `leaf_source` is now the single place that says "index or scan".
+
+Two things came out of doing it that are worth more than the wiring.
+
+**An unlogged decision is invisible in exactly the way an absent one is.** The
+aggregate path chose an index correctly and never said so, and the coverage
+check — which reads the server's log — reported a scan. The answers were right,
+the wiring was right, and the gate was wrong in the direction that matters
+least and confuses most. A coverage assertion is only as good as what it can
+read.
+
+**And the retrieval inherits the optimizer's limits, which is the right way
+round.** A `HAVING` clause makes the whole statement scan, because `opt` does
+not parse one and declines — even though the `WHERE` beside it is the same
+indexable predicate that drives an index when the HAVING is removed. A
+component that cannot read the statement must not be asked to bless it. The
+gate asserts the scan, so the day `opt` learns HAVING, that check is what
+notices.
+
 **What is not wired yet, named so it is not assumed.** `ORDER BY` via
 navigation (the sort still runs above an index-driven range), index-driven
-joins, the aggregate's own retrieval walk (it is a separate loop), text and
-scaled keys, compound prefixes, `OR` (which needs a retrieval per branch and a
-merge), `<>`, and parameters — whose values arrive after the plan is built. The
-roadmap counts thirty retrieval sites; this slice wires the projection's.
+joins, text and scaled keys, compound prefixes, `OR` (which needs a retrieval
+per branch and a merge), `<>`, and parameters — whose values arrive after the
+plan is built. The roadmap counts thirty retrieval sites; this wires the
+projection's and the fold's.
 
 ## Benchmarks
 

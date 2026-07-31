@@ -1115,10 +1115,7 @@ impl RowSource {
         // the LEAF is the optimizer's choice; everything above it is
         // the same tree either way, which is what makes "the answers do
         // not move" a property of the shape rather than a hope
-        let leaf = match index {
-            Some(pick) => RowSource::IndexScan { rel, formats, pick, width: None },
-            None => RowSource::TableScan { rel, formats, width: None },
-        };
+        let leaf = leaf_source(rel, formats, &index);
         RowSource::Sort {
             input: Box::new(RowSource::Filter { input: Box::new(leaf), pred }),
             keys,
@@ -1752,6 +1749,10 @@ AlterDomainRename {
         filter: Option<Predicate>,
         having: Option<Predicate>,
         order_by: Vec<OrderKey>,
+        /// the ACCESS PATH, chosen at prepare by `fire-crab-opt` - the
+        /// fold's input is a retrieval leaf like any other, so a
+        /// grouped query looks up rather than scanning too
+        index: Option<IndexPick>,
     },
     /// `SET GENERATOR <name> TO <n>` or `ALTER SEQUENCE|GENERATOR <name>
     /// RESTART WITH <n>`: write a new value into the generator page at
@@ -9651,6 +9652,24 @@ struct IndexPick {
     hi: Option<(Vec<u8>, bool)>,
 }
 
+/// The retrieval leaf for a relation: the optimizer's index, or a scan.
+/// One statement of the rule, for every site that builds a tree.
+fn leaf_source(
+    rel: u16,
+    formats: Vec<(u8, Vec<Descriptor>)>,
+    index: &Option<IndexPick>,
+) -> RowSource {
+    match index {
+        Some(pick) => RowSource::IndexScan {
+            rel,
+            formats,
+            pick: pick.clone(),
+            width: None,
+        },
+        None => RowSource::TableScan { rel, formats, width: None },
+    }
+}
+
 impl IndexPick {
     fn recnos(&self, bytes: &[u8], page_size: usize, rel: u16) -> Vec<u64> {
         fire_crab_ods::btr::lookup_range(
@@ -11968,15 +11987,12 @@ fn branch_rows(
         filter,
         having,
         order_by,
+        index,
     } = plan
     {
         let rows = RowSource::aggregate_sorted(
             RowSource::Filter {
-                input: Box::new(RowSource::TableScan {
-                    rel: *rel,
-                    formats: formats.to_vec(),
-                    width: None,
-                }),
+                input: Box::new(leaf_source(*rel, formats.to_vec(), index)),
                 pred: bind_filter(filter, args).ok()?,
             },
             gitems,
@@ -13207,7 +13223,18 @@ fn plan_query_inner(
             // declines (MIN/MAX over text or temporal, SUM/AVG over
             // scaled numerics, COUNT(DISTINCT)) fall THROUGH to the
             // group machinery, which types and computes them at fetch
-            if let Some(v) = aggregate(db, rel, &formats, &columns, &descs, *func, target, &filter)
+            let agg_index = choose_index(db, rel, &descs, &filter, sql);
+            if trace {
+                match &agg_index {
+                    Some(p) => eprintln!(
+                        "[srv] index scan: rel={} index={} lo={:?} hi={:?}",
+                        rel, p.id, p.lo, p.hi
+                    ),
+                    None => eprintln!("[srv] natural scan: rel={}", rel),
+                }
+            }
+            if let Some(v) =
+                aggregate(db, rel, &formats, &columns, &descs, *func, target, &filter, &agg_index)
             {
                 // the engine names a lone aggregate's column by its
                 // function (probed) - CONSTANT here was a standing
@@ -13338,6 +13365,45 @@ fn plan_query_inner(
     // grouped query: GROUP BY, or a multi-aggregate global projection
     // (including a lone parameterised aggregate, deferred to fetch)
     match plan_group(&items, group_s, having_s, order_s, rel, formats, &columns, &descs, filter) {
+        Some(Plan::Group {
+            rel,
+            formats,
+            cols,
+            gitems,
+            key_fids,
+            key_exprs,
+            synth_base,
+            filter,
+            having,
+            order_by,
+            ..
+        }) => {
+            // the same choice the projection makes, at the same moment:
+            // a fold reads its input through a retrieval like any other
+            let index = choose_index(db, rel, &descs, &filter, sql);
+            if trace {
+                match &index {
+                    Some(p) => eprintln!(
+                        "[srv] index scan: rel={} index={} lo={:?} hi={:?}",
+                        rel, p.id, p.lo, p.hi
+                    ),
+                    None => eprintln!("[srv] natural scan: rel={}", rel),
+                }
+            }
+            Some(Plan::Group {
+                rel,
+                formats,
+                cols,
+                gitems,
+                key_fids,
+                key_exprs,
+                synth_base,
+                filter,
+                having,
+                order_by,
+                index,
+            })
+        }
         Some(p) => Some(p),
         None => {
             if trace { eprintln!("[srv] plan: GROUP BY plan failed"); }
@@ -14111,6 +14177,9 @@ fn plan_group(
         filter,
         having,
         order_by,
+        // filled in by the caller, which has the statement text
+        // `fire-crab-opt` needs to choose the access path
+        index: None,
     })
 }
 
@@ -14280,6 +14349,7 @@ fn parse_group_by(
 /// Some(None) for a NULL result (MIN/MAX/SUM over no rows), or None if the
 /// aggregate is unsupported (so the caller falls back).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn aggregate(
     db: &Database,
     rel: u16,
@@ -14289,6 +14359,7 @@ fn aggregate(
     func: AggFn,
     target: &AggTarget,
     filter: &Option<Predicate>,
+    index: &Option<IndexPick>,
 ) -> Option<Option<i64>> {
     // an eval error in the filter DECLINES the prepare-time fast path
     // (poisons the flag); the caller then routes through the group
@@ -14312,7 +14383,7 @@ fn aggregate(
             None => fire_crab_ods::count_primary_records(&db.bytes, db.page_size, rel) as i64,
             Some(_) => {
                 let mut n = 0i64;
-                for_each_record(db, rel, formats, |v| {
+                for_each_candidate(db, rel, formats, index, |v| {
                     if matches(v) {
                         n += 1;
                     }
@@ -14340,7 +14411,7 @@ fn aggregate(
     // COUNT(col) counts non-null values; MIN/MAX/SUM need an integer column
     if matches!(func, AggFn::Count) {
         let mut n = 0i64;
-        for_each_record(db, rel, formats, |v| {
+        for_each_candidate(db, rel, formats, index, |v| {
             if matches(v) && matches!(v.get(fid), Some(x) if !matches!(x, Value::Null)) {
                 n += 1;
             }
@@ -14365,7 +14436,7 @@ fn aggregate(
         return None;
     }
     let mut acc: Option<i64> = None;
-    for_each_record(db, rel, formats, |v| {
+    for_each_candidate(db, rel, formats, index, |v| {
         if !matches(v) {
             return;
         }
@@ -15897,6 +15968,7 @@ fn emit_rows_inner(
             filter,
             having,
             order_by,
+            index,
         } => {
             if let Some(db) = db {
                 let filter = bind_filter(filter, args)?;
@@ -15906,11 +15978,7 @@ fn emit_rows_inner(
                 // Sort sits ABOVE the Aggregate rather than below it.
                 let rows = RowSource::aggregate_sorted(
                     RowSource::Filter {
-                        input: Box::new(RowSource::TableScan {
-                            rel: *rel,
-                            formats: formats.to_vec(),
-                            width: None,
-                        }),
+                        input: Box::new(leaf_source(*rel, formats.to_vec(), index)),
                         pred: filter,
                     },
                     gitems,
