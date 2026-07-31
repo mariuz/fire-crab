@@ -219,10 +219,12 @@ mechanisms:
 Known refusals that the engine supports (named next slices, each a
 refusal today rather than a silent gap): `LIST` (its result is a
 blob, which an expression cannot serve yet), `?` parameters INSIDE an
-expression (only a bare `?` on a comparison side binds), QUALIFIED
-names in join-predicate expressions, temporal aggregates in HAVING,
-temporal parameters against expression sides, `DECODE`, `TIME + n`,
-and `CURRENT_TIME`/`CURRENT_TIMESTAMP` (TIME ZONE results).
+expression (a bare `?` binds on EITHER side of a comparison, but not
+inside an operand), QUALIFIED names in join-predicate expressions,
+temporal aggregates in HAVING, temporal parameters against expression
+sides, `TIME + n`, and `CURRENT_TIME`/`CURRENT_TIMESTAMP` (TIME ZONE
+results). (`DECODE` was on this list until the increment that converted
+it - a refusal list is only true on the day it is written.)
 
 Refusals around VIEWS in a join, each because the rewrite is a
 different one rather than a harder one:
