@@ -7387,6 +7387,55 @@ expression, on the single-relation, grouped and join paths alike. The refusal
 and the fix are the same fact seen from either side of one increment, which is
 why a refusal is worth re-reading whenever the thing it was protecting changes.
 
+### A subquery in the select list (`qa/serve-real-selectsubq.sh`, 34 checks)
+
+The WHERE clause has taken subqueries for many increments: they are lifted out
+of the text, evaluated, and folded back in as ordinary tokens before the
+predicate parser sees them. The select list could not hold one at all.
+
+The conversion reuses that lifting rather than adding a second mechanism. A
+subquery that names no outer column is a **constant for the whole statement**,
+so it is evaluated once, folded back into the query TEXT as the literal it
+computed, and the statement re-planned — the same "rewrite and re-plan" the
+view expansion uses. Everything the select list can already do then applies to
+it for free: an alias, arithmetic around it, a CASE, a CAST, COALESCE, a
+grouped query, ORDER BY over the folded column, FIRST.
+
+**Three laws, probed before any code.** No rows answers NULL — not an empty
+result and not an error. More than one row **raises**: `multiple rows in
+singleton select`, SQLSTATE 21000, which fire-crab now answers with the
+engine's own message. And the output column is named by the SUBQUERY's own
+select item — `(SELECT COUNT(*) ...)` describes as `COUNT`, `(SELECT ID ...)`
+as `ID` — and *not* by the literal it folded to. That last one is invisible in
+the values and visible in every driver's row objects, so this gate compares
+whole JSON, keys included.
+
+**The fold could not work until an older bug did.** Folding `(SELECT COUNT(*)
+FROM DEPT)` produces `SELECT ID, 3 FROM EMP` — and *that* refused:
+
+```rust
+fn ident_ok(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+```
+
+`ident_ok("3")` is true, so a numeric literal in the select list was read as a
+**column named 3**, looked up, and not found. An unquoted SQL identifier cannot
+begin with a digit; a quoted `"3"` can, and still resolves as a column. What
+kept this hidden is that the two neighbouring literals worked: `SELECT NULL`
+and `SELECT 'x'` take other branches entirely. A gap that only shows for *one*
+of three sibling forms is one nobody writes a test for.
+
+The same probe turned up a naming law worth recording: the engine describes
+`-3` as `CONSTANT` but `-SALARY` as blank. A negated literal is still a
+constant; negating anything else is not.
+
+**The refusal.** A CORRELATED subquery is refused rather than folded. Its value
+differs per outer row, and this fold happens once per statement — folding it
+would put one row's answer into every row, which is a wrong answer rather than
+a slow one. The engine answers those; fire-crab says so plainly and the gate
+pins it.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

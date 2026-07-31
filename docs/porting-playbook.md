@@ -1443,6 +1443,26 @@ them.
   make a capability real, grep for the refusals that existed BECAUSE it
   was not.
 
+- **A new feature often lands on an old bug.** Folding a constant
+  subquery into the query text produces `SELECT ID, 3 FROM T` - and that
+  refused, because `ident_ok` accepted "3" and a numeric literal was read
+  as a column NAMED 3. The feature could not work until a years-old
+  parsing gap did. When a rewrite emits text, the emitted text is a new
+  INPUT to your parser: try it by hand before assuming the rewrite is the
+  hard part.
+
+- **A gap that shows for ONE of three sibling forms is the one nobody
+  tests.** `SELECT NULL` and `SELECT 'x'` worked while `SELECT 3`
+  refused, because each takes a different branch. When you find a
+  refusal, enumerate its siblings and check them all - the working ones
+  are what kept it invisible.
+
+- **When you fold a value back into TEXT, the literal must round-trip.**
+  A scaled numeric written without its decimal point multiplies the
+  answer by a power of ten; a text value containing a quote ends the
+  literal early. Rendering a value as source is a conversion like any
+  other and deserves its own unit test, not a `to_string`.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

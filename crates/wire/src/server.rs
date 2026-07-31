@@ -11464,6 +11464,107 @@ fn plan_query_inner(
             proj_s, table_s, where_s, group_s, having_s, order_s
         );
     }
+    // A SUBQUERY IN THE SELECT LIST - `SELECT ID, (SELECT COUNT(*) FROM
+    // D) FROM T`. A subquery that names no outer column is a CONSTANT for
+    // the whole statement, so it is evaluated once here and FOLDED BACK
+    // INTO THE TEXT as the literal it computed - the same "rewrite and
+    // re-plan" the view expansion uses, and the same lifting the WHERE
+    // clause has done for several increments. Every select-list shape
+    // then works over it for free: an alias, an expression around it, a
+    // CASE, an ORDER BY.
+    //
+    // The subquery's own LAWS, probed: no rows answers NULL (not an
+    // empty result), and MORE THAN ONE ROW is the engine's
+    // "multiple rows in singleton select" - taking the first would be a
+    // wrong answer where the engine raises.
+    if let Some(dbr) = db.as_ref() {
+        if let Some((folded, subs)) = extract_subqueries(proj_s) {
+            if !subs.is_empty() {
+                // The output column is named by the SUBQUERY's own select
+                // item, not by the literal it folded to: the engine
+                // describes `(SELECT COUNT(*) FROM D)` as COUNT and
+                // `(SELECT ID FROM D ...)` as ID. Only when the subquery
+                // IS the whole item - inside an expression the
+                // expression's own name applies.
+                let subq_name = |sub: &str| -> Option<String> {
+                    let (p, _, _, _, _, _) = split_query(sub)?;
+                    match parse_projection(p)? {
+                        Proj::Items(items) => match items.first()? {
+                            SelItem::Col(c, alias) => Some(alias.clone().unwrap_or_else(|| {
+                                c.rsplit('.').next().unwrap_or(c).to_string()
+                            })),
+                            SelItem::Agg(f, _, alias) => Some(alias.clone().unwrap_or_else(|| {
+                                match f {
+                                    AggFn::Count => "COUNT",
+                                    AggFn::Min => "MIN",
+                                    AggFn::Max => "MAX",
+                                    AggFn::Sum => "SUM",
+                                    AggFn::Avg => "AVG",
+                                }
+                                .to_string()
+                            })),
+                            SelItem::Expr(_, n) => Some(n.clone()),
+                            SelItem::Gen(_, _, n) => Some(n.clone()),
+                        },
+                        Proj::Star => None,
+                    }
+                };
+                // which markers stand ALONE as a select item
+                let alone: Vec<bool> = (0..subs.len())
+                    .map(|i| {
+                        split_top_level_commas(&folded).iter().any(|item| {
+                            let (body, alias) = split_alias(item);
+                            alias.is_none()
+                                && body.trim() == format!("{}{}", SUBQ_MARK, i)
+                        })
+                    })
+                    .collect();
+                let mut proj_out = folded.clone();
+                for (i, sub) in subs.iter().enumerate() {
+                    // `corr: None` - a CORRELATED subquery cannot resolve
+                    // its outer column here and refuses, since its value
+                    // differs per row and this fold is once per statement
+                    let Some(rows) = eval_subquery(sub, dbr, None, false) else {
+                        if trace {
+                            eprintln!("[srv] plan: select-list subquery {:?} not answerable", sub);
+                        }
+                        return Some(Plan::Refused);
+                    };
+                    if rows.values.len() > 1 {
+                        return Some(Plan::RefusedEval(EvalErr::SingletonSelect));
+                    }
+                    let v = rows.values.first().cloned().unwrap_or(Value::Null);
+                    let Some(lit) = value_literal(&v) else {
+                        return Some(Plan::Refused);
+                    };
+                    let repl = match (alone.get(i), subq_name(sub)) {
+                        (Some(true), Some(n)) => format!("{} AS {}", lit, n),
+                        _ => lit,
+                    };
+                    proj_out = proj_out.replace(&format!("{}{}", SUBQ_MARK, i), &repl);
+                }
+                let mut out = format!("SELECT {} FROM {}", proj_out, table_s);
+                if let Some(w) = where_s {
+                    out.push_str(&format!(" WHERE {}", w));
+                }
+                if let Some(g) = group_s {
+                    out.push_str(&format!(" GROUP BY {}", g));
+                }
+                if let Some(h) = having_s {
+                    out.push_str(&format!(" HAVING {}", h));
+                }
+                if let Some(o) = order_s {
+                    out.push_str(&format!(" ORDER BY {}", o));
+                }
+                if trace {
+                    eprintln!("[srv] plan: select-list subqueries folded to {:?}", out);
+                }
+                params.clear();
+                return plan_query_inner(&out, db, params);
+            }
+        }
+    }
+
     // A QUALIFIED column in a ONE-TABLE query - `SELECT E.ID FROM EMP E`
     // - is stripped to its bare name and the whole statement re-planned,
     // so every clause gets it at once rather than each resolver learning
@@ -13860,6 +13961,11 @@ const GDS_FLOAT_OVERFLOW: i32 = 335544775;
 /// CAST that cannot convert (SQLSTATE 22018).
 const GDS_CONVERT_ERROR: i32 = 335544334;
 
+/// isc_sing_select_err - "multiple rows in singleton select" (SQLSTATE
+/// 21000): a scalar subquery that answers more than one row is an ERROR,
+/// not a first-row-wins.
+const GDS_SING_SELECT: i32 = 335544652;
+
 /// isc_exception_integer_overflow - "Integer overflow. The result of an
 /// integer operation caused the most significant bit of the result to
 /// carry" (SQLSTATE 22003).
@@ -13908,6 +14014,10 @@ fn eval_status_vector(w: &mut W, e: &EvalErr) {
                 .int(GDS_ARITH_EXCEPT)
                 .int(1) // isc_arg_gds
                 .int(GDS_FLOAT_OVERFLOW);
+        }
+        EvalErr::SingletonSelect => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_SING_SELECT);
         }
         EvalErr::ConversionError(arg) => {
             w.int(1) // isc_arg_gds
@@ -16351,6 +16461,11 @@ enum EvalErr {
     /// 42000 "must be zero or positive" on LPAD/RPAD/POSITION bounds -
     /// an error either way, never a wrong row
     InvalidLength(i64),
+    /// a scalar subquery answered MORE THAN ONE ROW - the engine's
+    /// `isc_sing_select_err`, "multiple rows in singleton select"
+    /// (SQLSTATE 21000). Taking the first row would be a wrong answer
+    /// where the engine raises.
+    SingletonSelect,
     /// a floating-point division by zero: `isc_arith_except` +
     /// `isc_exception_float_divide_by_zero` (SQLSTATE 22012). The engine
     /// RAISES here - it does not answer an infinity - so this is one of
@@ -18182,6 +18297,42 @@ struct SubqRows {
     any: bool,
 }
 
+/// Render a value as the SQL LITERAL that means it, for folding a
+/// constant subquery's answer back into the query text.
+///
+/// Only the shapes whose literal spelling round-trips exactly: an
+/// integer, a scaled numeric (written with its decimal point, so the
+/// parser reads back the same scale), text (quotes doubled) and NULL.
+/// Anything else refuses rather than risk a literal that means a
+/// slightly different value than the one computed.
+fn value_literal(v: &Value) -> Option<String> {
+    Some(match v {
+        Value::Null => "NULL".to_string(),
+        Value::Int(i) => i.to_string(),
+        // an INT128 carries its own scale, so it renders like a scaled
+        // numeric rather than a plain integer
+        Value::Int128(i, 0) => i.to_string(),
+        Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+        Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
+        Value::Scaled(raw, scale) => {
+            if *scale >= 0 {
+                return None; // a positive scale has no literal spelling
+            }
+            let places = (-*scale) as usize;
+            let neg = *raw < 0;
+            let digits = raw.unsigned_abs().to_string();
+            let digits = if digits.len() <= places {
+                format!("{}{}", "0".repeat(places - digits.len() + 1), digits)
+            } else {
+                digits
+            };
+            let (int_part, frac) = digits.split_at(digits.len() - places);
+            format!("{}{}.{}", if neg { "-" } else { "" }, int_part, frac)
+        }
+        _ => return None,
+    })
+}
+
 /// Evaluate an inner `SELECT <one item> FROM <one table> [WHERE ...]`.
 ///
 /// `corr` optionally names an OUTER column: when set, the inner WHERE is
@@ -18850,9 +19001,17 @@ fn parse_projection(proj: &str) -> Option<Proj> {
             body.trim_matches('"').to_ascii_uppercase().as_str(),
             "TRUE" | "FALSE" | "UNKNOWN" | "NULL"
         );
+        // An UNQUOTED identifier cannot start with a digit, so `3` is a
+        // LITERAL and not a column named "3" - which is how it was read,
+        // making `SELECT 3 FROM T` refuse while `SELECT NULL` and
+        // `SELECT 'x'` worked. A QUOTED "3" is still a column name.
+        let quoted_ident = body.starts_with('"') && body.ends_with('"') && body.len() >= 2;
+        let bare_ident = body.trim_matches('"');
+        let ident_like = ident_ok(bare_ident)
+            && (quoted_ident || !bare_ident.starts_with(|c: char| c.is_ascii_digit()));
         if !literal_kw && is_qualified_col(body) {
             items.push(SelItem::Col(body.to_string(), alias_owned));
-        } else if !literal_kw && ident_ok(body.trim_matches('"')) {
+        } else if !literal_kw && ident_like {
             items.push(SelItem::Col(
                 body.trim_matches('"').to_string(),
                 alias_owned,
@@ -19008,6 +19167,21 @@ fn default_expr_name(raw: &RawExpr) -> String {
         RawExpr::LocalTimestamp => "LOCALTIMESTAMP",
         RawExpr::DateLit(_) | RawExpr::TimeLit(_) | RawExpr::TsLit(..) => "CONSTANT",
         // the engine leaves a unary-minus column unnamed (blank header)
+        // a NEGATED LITERAL is still a constant (probed: `-3` describes
+        // as CONSTANT), while negating anything else describes BLANK
+        RawExpr::Neg(a)
+            if matches!(
+                **a,
+                RawExpr::Int(_)
+                    | RawExpr::Dec(..)
+                    | RawExpr::Double(_)
+                    | RawExpr::Str(_)
+                    | RawExpr::Bool(_)
+                    | RawExpr::Null
+            ) =>
+        {
+            "CONSTANT"
+        }
         RawExpr::Neg(_) => "",
         RawExpr::Int(_) | RawExpr::Dec(..) | RawExpr::Double(_) | RawExpr::Str(_)
         | RawExpr::Bool(_) | RawExpr::Null => "CONSTANT",
@@ -24548,6 +24722,44 @@ pub fn serve(addr: &str, user: &str, password: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_folded_value_round_trips_as_a_literal() {
+        // the fold writes the subquery's answer back into the query TEXT,
+        // so the literal must parse back to the SAME value - scale
+        // included, which is where a naive `to_string` loses
+        assert_eq!(value_literal(&Value::Int(3)).unwrap(), "3");
+        assert_eq!(value_literal(&Value::Int(-3)).unwrap(), "-3");
+        assert_eq!(value_literal(&Value::Null).unwrap(), "NULL");
+        assert_eq!(value_literal(&Value::Text("x".into())).unwrap(), "'x'");
+        // a quote inside text is DOUBLED, or the literal ends early
+        assert_eq!(value_literal(&Value::Text("O'x".into())).unwrap(), "'O''x'");
+        // a scaled numeric keeps its decimal places: 1050 at scale -2 is
+        // 10.50, and writing "1050" would multiply the answer by 100
+        assert_eq!(value_literal(&Value::Scaled(1050, -2)).unwrap(), "10.50");
+        assert_eq!(value_literal(&Value::Scaled(-1050, -2)).unwrap(), "-10.50");
+        // and a value smaller than its scale keeps the leading zero
+        assert_eq!(value_literal(&Value::Scaled(5, -2)).unwrap(), "0.05");
+    }
+
+    #[test]
+    fn a_number_in_the_select_list_is_not_a_column() {
+        // `ident_ok` accepts "3", so a numeric literal was read as a
+        // COLUMN NAMED 3 and `SELECT 3 FROM T` refused - while NULL and
+        // 'x' worked, which is what hid it
+        let items = match parse_projection("ID, 3").unwrap() {
+            Proj::Items(v) => v,
+            Proj::Star => panic!("not a star"),
+        };
+        assert!(matches!(items[0], SelItem::Col(ref c, None) if c == "ID"));
+        assert!(matches!(items[1], SelItem::Expr(RawExpr::Int(3), _)));
+        // a QUOTED digit is still an identifier
+        let q = match parse_projection("\"3\"").unwrap() {
+            Proj::Items(v) => v,
+            Proj::Star => panic!("not a star"),
+        };
+        assert!(matches!(q[0], SelItem::Col(ref c, None) if c == "3"));
+    }
 
     #[test]
     fn a_synthetic_descriptor_must_not_look_computed() {

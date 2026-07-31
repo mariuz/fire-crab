@@ -13,6 +13,44 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — a subquery in the select list
+
+### Converted
+- **`SELECT ID, (SELECT COUNT(*) FROM D) FROM T`.** The WHERE clause has
+  taken subqueries for many increments — lifted out of the text,
+  evaluated, folded back in as ordinary tokens. The select list could not
+  hold one at all. The conversion reuses that lifting: a subquery naming
+  no outer column is a CONSTANT for the whole statement, so it is
+  evaluated once and folded back into the query TEXT as the literal it
+  computed, and the statement re-planned. Every select-list shape then
+  works over it for free — an alias, arithmetic around it, a CASE, a
+  CAST, COALESCE, a grouped query, ORDER BY, FIRST.
+- Three laws, probed first: **no rows answers NULL**; **more than one row
+  raises** "multiple rows in singleton select" (SQLSTATE 21000, the
+  engine's own message, byte for byte); and the output column is named by
+  the **subquery's own select item** — `(SELECT COUNT(*) ...)` describes
+  as COUNT, `(SELECT ID ...)` as ID — not by the literal it folded to.
+
+### Fixed
+- **`SELECT 3 FROM T` refused.** An unquoted SQL identifier cannot start
+  with a digit, but `ident_ok` accepted `"3"`, so a numeric literal in
+  the select list was read as a COLUMN NAMED 3 and never found. `SELECT
+  NULL` and `SELECT 'x'` worked, which is exactly what kept it hidden for
+  so long — and a folded subquery lands precisely there, so the fold
+  could not work until this did.
+- **`SELECT -3` described as blank**; the engine names a negated LITERAL
+  `CONSTANT` and only a negated column blank (probed). 
+
+### Guarded
+- A **correlated** subquery in the select list refuses. Its value differs
+  per outer row, so folding it once for the statement would put one row's
+  answer in every row — a wrong answer where a refusal is honest.
+
+`qa/serve-real-selectsubq.sh` is new, 34 checks, comparing whole JSON
+objects because half this increment is a naming law. The text-column case
+is compared against isql rather than the twin: node-firebird cannot
+decode the ENGINE's own answer for it.
+
 ## 2026-07-31 — an aggregate inside an expression
 
 ### Converted
