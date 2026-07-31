@@ -13,6 +13,59 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — the gates that measured nothing
+
+### Fixed
+- **Eleven gates defaulted to port 3050 — the real engine's own.** Every
+  differential here starts `fcwire` on a port, waits for the port to
+  answer with `nc -z`, then runs its checks. But `nc` answers "SOMETHING
+  is listening", which is not the question: when the port was already
+  taken, fcwire exited at bind with `Address already in use` and `nc`
+  succeeded anyway — against the OTHER server. Since the other server on
+  a machine running these gates is the engine, a twin gate then compared
+  **the engine with itself** and passed. Perfectly, every time.
+- That is the worst failure a differential has — not a wrong answer but a
+  green run that measured nothing — and it had already produced a wrong
+  conclusion: yesterday's slice reported a "pre-existing VARCHAR
+  length-metadata bug" in `qa/serve-real-{project,join}.sh`. There is no
+  such bug. Both gates were talking to the engine, and the truncation was
+  node-firebird mis-decoding the ENGINE's own answer, a limit this
+  project had already documented. Run on their own ports, both are green.
+- Each of the eleven now has its own default port, and **every one of the
+  149 gates that starts a server now asserts the server is running**
+  (`kill -0 $srv`) after the readiness probe, so a failed bind is fatal
+  instead of invisible.
+- **Five gates carried a `#!/bin/sh` shebang while using bash-only
+  syntax**, so running them the way their own headers say failed at
+  parse. Same lost coverage by another route.
+
+### Converted
+- **`qa/mktypesdb.sh`** builds the wiretypes scratch database, and
+  `qa/serve-real-types.sh` runs for the first time — 10 checks green. It
+  is the gate for the one thing only a typed client can see: that
+  fire-crab describes and encodes each type in the engine's own wire form
+  (SMALLINT natively rather than widened, scaled numerics as raw integers
+  with the scale in the DESCRIBE, IEEE floats, raw temporal units,
+  BOOLEAN as an XDR int slot). Like the join gates before `qa/mkjoindb.sh`,
+  it had been unrunnable for want of a database that lived nowhere. Its
+  values are picked against the canonicalisation rules the two sides
+  force: SMALLINT at both extremes (a widened type still round-trips, so
+  only the extremes prove the describe), BIGINT inside 2^53 (or the gate
+  measures the driver), no scaled value ending in a zero decimal digit,
+  floats exactly representable in binary, DATE including **1858-11-17**
+  (the MJD epoch — the value an off-by-one in the day conversion cannot
+  hide in), and no midnight time or 1970-01-01 timestamp, both of which
+  the gate's formatter reads as type sentinels.
+
+### Guarded
+- **`qa/gate-selfcheck.sh`** is new: the gate that checks the gates. Five
+  properties — no gate's own server defaults to the engine's port, every
+  server start is guarded, default ports are distinct, every gate parses
+  under its own shebang, and the one with teeth: it starts a squatter on
+  a gate's port, runs that gate for real, and requires a non-zero exit
+  with a spoken reason. A guard that is present and does not work looks
+  exactly like a guard that works, until the day it matters.
+
 ## 2026-07-30 — a view as a side of a join
 
 ### Converted

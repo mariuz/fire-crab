@@ -7111,6 +7111,90 @@ become), and a RIGHT or FULL join with any view in it (those make an EARLIER
 side nullable, so where a predicate belongs stops being a local question about
 its own side).
 
+### The gates that measured nothing (`qa/gate-selfcheck.sh`, 5 checks)
+
+Every differential here has the same skeleton: start `fcwire` on a port, wait
+for the port to answer, run the checks. The waiting is one line —
+
+```sh
+command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$PORT" 2>/dev/null && break
+```
+
+— and it answers a question nobody asked. `nc -z` reports that *something* is
+listening. If the port was already in use, `fcwire` printed `Address already in
+use` and exited, `nc` succeeded against the incumbent, and every check below
+ran against **that** server. Eleven gates defaulted to port **3050**. On any
+machine where these gates are useful, 3050 is the real Firebird engine. So
+those eleven, run without an explicit port, started a server that died,
+connected to the engine, and compared the engine with itself.
+
+They passed. All of them, every time, for as long as they have existed.
+
+This is worth stating plainly because the project's whole method rests on the
+differential being a differential. A wrong answer is a finding. A gate that
+cannot fail is not a weaker check — it is a **source of false findings**, and
+it had already produced one: the previous increment reported a "pre-existing
+VARCHAR length-metadata bug" in `serve-real-project.sh` and `serve-real-join.sh`
+and wrote it down as a frontier for a future slice. There is no such bug. Both
+gates were querying the engine, and the `string right truncation, expected
+length 2, actual 10` was node-firebird mis-decoding the ENGINE's own answer —
+a driver limit this very document already records for a different gate. Given
+their own ports, both are green.
+
+**The fix is two lines and one of them is the interesting one.** Each of the
+eleven got its own default port; and all 149 gates that start a server now
+follow the readiness probe with
+
+```sh
+kill -0 $srv 2>/dev/null || { echo "FAIL fcwire is not running - port $PORT already in use?"; exit 1; }
+```
+
+The probe asks whether the port answers. The assertion asks whether *our
+server* is the one answering. Those are different questions, and only the
+second one is the gate's.
+
+**Why this needs a gate of its own.** A guard that is present and does not work
+looks exactly like a guard that works. So `qa/gate-selfcheck.sh` checks four
+properties statically — no gate's own server defaults to the engine's port,
+every server start is followed by an assertion, default ports are distinct, and
+every gate parses under the interpreter its own shebang names (five carried
+`#!/bin/sh` while using bash syntax, so running them as written failed at
+parse) — and then does the thing a static scan cannot: it starts a squatter on
+a real gate's port, runs that gate, and requires a non-zero exit **and** a
+spoken reason.
+
+### The wiretypes fixture, and a gate that had never run (`qa/mktypesdb.sh`)
+
+Fixing the ports made `qa/serve-real-types.sh` visible, and it turned out to be
+in the state the join gates were in before `qa/mkjoindb.sh`: written against a
+scratch database that lived in one workspace and nowhere else. It checks the
+one thing only a typed client can see — that fire-crab describes and encodes
+each column in the engine's own wire form rather than in a convenient one:
+SMALLINT and INTEGER natively instead of widened to BIGINT, scaled numerics as
+raw integers with the scale in the DESCRIBE (the client divides; that is the
+contract, and getting it wrong moves a decimal point rather than raising),
+IEEE bytes for floats, raw day and 1/10000-second units for temporals, BOOLEAN
+as an XDR int slot.
+
+Every value in the fixture is chosen against a rule the comparison forces,
+because the two sides speak different languages — JS values against isql text:
+
+- **SMALLINT at both extremes** (−32768, 32767). A type widened to BIGINT still
+  round-trips every ordinary value, so only the extremes of the narrow type
+  prove what the describe announced.
+- **BIGINT inside 2^53**, because node decodes it to a JS number. Past that the
+  gate measures the driver's precision, not fire-crab's encoding.
+- **No scaled value ending in a zero decimal digit** — a JS number drops it, so
+  `12.30` would print as `12.3` on one side only.
+- **Floats exactly representable in binary** (halves and quarters), so neither
+  renderer rounds.
+- **DATE 1858-11-17** — the MJD epoch, day 0. An off-by-one in the day
+  conversion has nowhere to hide there.
+- **No midnight TIME and no 1970-01-01 TIMESTAMP**: the gate's formatter picks
+  a shape by sentinel, and those two values are the sentinels.
+
+Ten checks, green on the first run.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the

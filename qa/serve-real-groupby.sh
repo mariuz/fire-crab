@@ -22,7 +22,7 @@ set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
 ISQL="${ISQL:-isql}"
 DB="${1:?usage: serve-real-groupby.sh <clean-db-path> [port]}"
-PORT="${2:-3050}"
+PORT="${2:-4526}"
 U="${ISC_USER:-SYSDBA}"; P="${ISC_PASSWORD:-masterkey}"
 
 command -v node >/dev/null 2>&1 || { echo "SKIP node not found"; exit 0; }
@@ -40,6 +40,14 @@ i=0; while [ $i -lt 20 ]; do
     command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$PORT" 2>/dev/null && break
     i=$((i + 1)); sleep 0.1
 done
+# The readiness probe above answers "SOMETHING is listening", not "OUR
+# server is listening". If the port was already taken, fcwire exited at
+# bind and every check below runs against the OTHER server - a gate that
+# reports success while measuring nothing. Fatal, not a warning.
+kill -0 $srv 2>/dev/null || {
+    echo "FAIL fcwire is not running - port $PORT already in use? (see the server log)"
+    exit 1
+}
 
 strip() { sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
 

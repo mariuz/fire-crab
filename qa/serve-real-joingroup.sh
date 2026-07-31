@@ -37,6 +37,14 @@ while [ $i -lt 20 ]; do
     command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$PORT" 2>/dev/null && break
     i=$((i + 1)); sleep 0.1
 done
+# The readiness probe above answers "SOMETHING is listening", not "OUR
+# server is listening". If the port was already taken, fcwire exited at
+# bind and every check below runs against the OTHER server - a gate that
+# reports success while measuring nothing. Fatal, not a warning.
+kill -0 $srv 2>/dev/null || {
+    echo "FAIL fcwire is not running - port $PORT already in use? (see the server log)"
+    exit 1
+}
 
 node_q() { # <sql> - values joined by |, one row per line
     FC_DB="$DB" FC_PORT="$PORT" FC_Q="$1" timeout 25 node -e '

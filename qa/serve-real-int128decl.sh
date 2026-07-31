@@ -61,6 +61,14 @@ i=0; while [ $i -lt 20 ]; do
     command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$PORT" 2>/dev/null && break
     i=$((i + 1)); sleep 0.1
 done
+# The readiness probe above answers "SOMETHING is listening", not "OUR
+# server is listening". If the port was already taken, fcwire exited at
+# bind and every check below runs against the OTHER server - a gate that
+# reports success while measuring nothing. Fatal, not a warning.
+kill -0 $srv 2>/dev/null || {
+    echo "FAIL fcwire is not running - port $PORT already in use? (see the server log)"
+    exit 1
+}
 
 strip() { sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
 node_q() { # <query> [json params]
@@ -210,6 +218,14 @@ i=0; while [ $i -lt 20 ]; do
     command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$PORT" 2>/dev/null && break
     i=$((i + 1)); sleep 0.1
 done
+# The readiness probe above answers "SOMETHING is listening", not "OUR
+# server is listening". If the port was already taken, fcwire exited at
+# bind and every check below runs against the OTHER server - a gate that
+# reports success while measuring nothing. Fatal, not a warning.
+kill -0 $srv 2>/dev/null || {
+    echo "FAIL fcwire is not running - port $PORT already in use? (see the server log)"
+    exit 1
+}
 check "fc serves the engine-written INT128 maximum via CAST text" \
       "$(node_run 'SELECT CAST(I AS VARCHAR(45)) FROM H WHERE ID = 3')" \
       "170141183460469231731687303715884105727"

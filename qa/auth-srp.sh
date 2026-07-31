@@ -40,7 +40,7 @@ set -u
 FCAUTH="${FCAUTH:-$(dirname "$0")/../target/release/fcauth}"
 ISQL="${ISQL:-isql}"
 HOST="${1:-127.0.0.1}"
-PORT="${2:-3050}"
+PORT="${2:-4533}"
 U="${ISC_USER:-SYSDBA}"; P="${ISC_PASSWORD:-masterkey}"
 SEC="${FC_SECURITY_DB:-/opt/firebird/security6.fdb}"
 D=/tmp/fbhandson

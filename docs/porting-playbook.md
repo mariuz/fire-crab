@@ -1339,6 +1339,40 @@ them.
   plausible numbers. When you extend WHERE a construct may appear, the
   guards that mention it are part of the construct.
 
+- **A readiness probe is not an identity check.** Every differential here
+  waited for its server with `nc -z <port>`, which answers "something is
+  listening" — and when the port was already taken, the something was the
+  REFERENCE implementation. Eleven gates defaulted to the reference
+  server's own port, so they started a server that died at bind and then
+  compared the reference with itself. They passed, always. Whenever you
+  wait for a service you just started, assert that the process you
+  started is the one that answered (`kill -0 $pid`), because "the port
+  responds" and "my server responds" differ exactly when it matters.
+
+- **A gate that cannot fail is worse than a missing gate.** A missing one
+  is a known hole. One that cannot fail is a SOURCE OF FALSE FINDINGS:
+  these produced a written-down "pre-existing bug in the isql describe"
+  that did not exist, complete with a stash-to-HEAD "confirmation" —
+  which confirmed nothing, because the same wrong invocation was used
+  both times. A reproduction is not a diagnosis. Before recording any
+  divergence as a frontier, check that the gate that found it was
+  measuring what its name says.
+
+- **Check the checkers, and give that check teeth.** A guard that is
+  present and does not work is indistinguishable from one that works. So
+  the meta-gate here does not only scan for the guard's text: it starts a
+  squatter on a real gate's port, runs that gate, and requires a non-zero
+  exit and a spoken reason. Any invariant you enforce by convention
+  across many files needs one executable check that the convention
+  actually bites.
+
+- **Fixtures rot in the same way binaries do.** Two gates in this
+  codebase were written against scratch databases that lived in one
+  workspace and nowhere else, and both were discovered by accident, years
+  of increments apart. If a check needs data, the data needs a SCRIPT
+  that builds it and asserts its own properties — otherwise the check
+  degrades into a check of whether someone still has the file.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

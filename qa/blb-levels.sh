@@ -205,6 +205,13 @@ if command -v node >/dev/null 2>&1 && [ -x "$FCWIRE" ]; then
         command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$PORT" 2>/dev/null && break
         i=$((i + 1)); sleep 0.1
     done
+    # "something is listening" is not "OUR server is listening": if the
+    # port was taken, fcwire exited at bind and this would measure the
+    # other server (see the header of qa/gate-selfcheck.sh)
+    kill -0 $srv 2>/dev/null || {
+        echo "FAIL fcwire is not running - port $PORT already in use?"
+        exit 1
+    }
     got=$(FC_DB="$DBW" FC_PORT="$PORT" FC_U="$U" FC_P="$P" timeout 120 node -e '
       process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(1); });
       const F=require("node-firebird");

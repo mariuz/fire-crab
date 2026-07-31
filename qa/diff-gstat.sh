@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # Differential QA: compare fcstat's header decode against the C++
 # engine's gstat, field for field, on one or more database files.
 #

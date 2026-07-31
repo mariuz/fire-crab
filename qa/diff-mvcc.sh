@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # MVCC differential QA: freeze a database file WHILE a transaction
 # holds uncommitted inserts, updates and deletes, then check that
 # fire-crab's TIP-driven visibility walk (fcstat visible) reproduces

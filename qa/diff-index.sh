@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # Index differential QA: walk each single-segment PRIMARY KEY index at
 # leaf level from the RAW FILE (fcstat index-walk: root descent, leaf
 # chain, prefix decompression) and compare the resulting ROW ORDER

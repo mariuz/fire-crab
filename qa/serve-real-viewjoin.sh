@@ -42,7 +42,7 @@
 set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
 ISQL="${ISQL:-isql}"
-PORT="${1:-4515}"
+PORT="${1:-4541}"
 REAL="${FC_REAL_PORT:-3050}"
 U="${ISC_USER:-SYSDBA}"; P="${ISC_PASSWORD:-masterkey}"
 D=/tmp/fbhandson
@@ -95,6 +95,14 @@ i=0; while [ $i -lt 20 ]; do
     command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$PORT" 2>/dev/null && break
     i=$((i + 1)); sleep 0.1
 done
+# The readiness probe above answers "SOMETHING is listening", not "OUR
+# server is listening". If the port was already taken, fcwire exited at
+# bind and every check below runs against the OTHER server - a gate that
+# reports success while measuring nothing. Fatal, not a warning.
+kill -0 $srv 2>/dev/null || {
+    echo "FAIL fcwire is not running - port $PORT already in use? (see the server log)"
+    exit 1
+}
 
 query() { # <sql> <port> <db>
     n=0

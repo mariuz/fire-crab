@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # General SELECT differential: fire-crab runs multi-column, multi-row
 # SELECTs over the encrypted wire (prepare -> describe -> execute ->
 # batched fetch, decoding INT64 and VARYING - the two coerced wire

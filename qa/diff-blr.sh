@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # BLR differential QA: for every BLR blob in a database (computed
 # fields, view/trigger/procedure bodies, check constraints, defaults),
 # compare fire-crab's structural decode against the engine's OWN BLR
