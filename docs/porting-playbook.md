@@ -1565,6 +1565,21 @@ them.
   counting must distinguish "counted zero" from "counted nothing", or it
   reports loudest when it is working least.
 
+- **A textual rewrite must know where its SCOPE ends.** Stripping a
+  table's qualifiers across a whole statement reached inside a subquery,
+  where the outer table's name appears ON PURPOSE - and the stripped name
+  either vanished or, worse, matched a different table's column. Every
+  pass that rewrites SQL text needs an answer to "what happens when this
+  text contains another query", and "nothing, it is copied" is a fine
+  answer as long as it is written down.
+
+- **Half a NULL law is not a NULL law.** The NOT IN / NOT EXISTS
+  divergence has two halves - inner NULLs poisoning the list, and an
+  OUTER NULL key that matches nothing and therefore satisfies NOT EXISTS.
+  This codebase had closed the first, with a comment explaining it, and
+  left the second. When you find yourself writing "the classic X/Y
+  divergence" in a comment, enumerate BOTH directions before moving on.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

@@ -13,6 +13,52 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — subqueries whose tables carry aliases
+
+### Fixed
+- **A rewrite reached into a nested query's SCOPE.** The pass that
+  strips a table's qualifiers rewrote the WHOLE statement, including the
+  text inside a subquery — and `(SELECT 1 FROM DEPT D WHERE D.ID =
+  EMP.DEPT_ID)` names the OUTER table there on purpose. Stripping that
+  qualifier left a bare `DEPT_ID`, which the inner table does not have
+  (and in other shapes DOES have, meaning something else). A nested query
+  is a different scope; the rewrite now copies such a span verbatim.
+- **A subquery's own clauses may qualify by the INNER table's name or
+  alias** (`SELECT D.ID FROM DEPT D WHERE D.ID > 1`) and its resolver
+  looked those up unqualified. They come off AFTER the correlation split,
+  which needs them to tell the two sides apart — an ordering the code now
+  states, because reversing it silently changes which column the
+  correlation names.
+- Together these fix `IN`, `NOT IN`, a scalar subquery on the right of a
+  comparison, and a subquery in the select list, in every combination of
+  aliased and unaliased tables. That is how most people write them.
+
+- **`NOT EXISTS` dropped the row whose key is NULL.** This one is a wrong
+  answer, found by the new gate and PRE-EXISTING — unrelated to aliases,
+  which is why both spellings failed. `NOT EXISTS` is a **two-valued**
+  test on rows ("no inner row matches"), while the `NOT IN` it rewrites
+  to is three-valued and answers UNKNOWN for a NULL left side. An outer
+  key that is NULL matches nothing and therefore SATISFIES `NOT EXISTS`;
+  fire-crab answered 0 where the engine answers 1. The rewrite now emits
+  `(<key> IS NULL OR <key> NOT IN (...))`.
+  - The code already handled the mirror case — inner NULLs are filtered
+    out of the list — so half of the classic NOT IN / NOT EXISTS
+    divergence was closed and the other half was not. A literal
+    `NOT IN (SELECT ...)` still poisons on NULL, correctly, and the gate
+    checks that too.
+
+### Guarded
+- A correlated `EXISTS` whose INNER table is aliased still refuses: the
+  correlation split reads the alias, but something later in that one path
+  resolves against the inner table's own name. It refuses rather than
+  answering, the same correlation works through `IN`, through a scalar
+  comparison and in the select list, and the gate names it as the next
+  slice rather than leaving it to be rediscovered.
+
+`qa/serve-real-subqalias.sh` is new, 29 checks, each shape run in its
+unaliased spelling too — the aliases are the variable under test, so
+everything else has to be identical.
+
 ## 2026-07-31 — the declared width of a numeric function
 
 ### Fixed

@@ -10691,6 +10691,42 @@ fn unqualify_single(text: &str, allowed: &[&str]) -> Option<String> {
     let mut i = 0usize;
     let mut hit = false;
     while i < b.len() {
+        // A NESTED QUERY IS A DIFFERENT SCOPE. `(SELECT ... WHERE D.ID =
+        // EMP.DEPT_ID)` names the OUTER table on purpose, and stripping
+        // that qualifier leaves a bare `DEPT_ID` which the inner table
+        // may not have - or, worse, may have and mean something else.
+        // The span is copied verbatim.
+        if b[i] == '(' {
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_whitespace() {
+                j += 1;
+            }
+            let word: String = b[j..(j + 6).min(b.len())].iter().collect();
+            if word.eq_ignore_ascii_case("SELECT") {
+                let mut depth = 0i32;
+                let mut k = i;
+                while k < b.len() {
+                    match b[k] {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    out.push(b[k]);
+                    k += 1;
+                }
+                if k < b.len() {
+                    out.push(b[k]); // the closing paren
+                    k += 1;
+                }
+                i = k;
+                continue;
+            }
+        }
         if b[i] == '\'' {
             out.push(b[i]);
             i += 1;
@@ -19294,6 +19330,47 @@ fn expr_type_of_desc(d: &Descriptor) -> Option<(ExprType, i8)> {
     }
 }
 
+/// Strip a qualifier naming the INNER table (by name or alias) from every
+/// identifier in a clause's text - the projection's counterpart to the
+/// token-level strip the WHERE gets.
+fn strip_inner_all(text: &str, names: &[&str]) -> String {
+    let b: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == '\'' {
+            out.push(b[i]);
+            i += 1;
+            while i < b.len() {
+                out.push(b[i]);
+                if b[i] == '\'' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b[i].is_alphabetic() || b[i] == '_' {
+            let start = i;
+            while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$') {
+                i += 1;
+            }
+            let word: String = b[start..i].iter().collect();
+            if i < b.len() && b[i] == '.' && names.iter().any(|n| n.eq_ignore_ascii_case(&word))
+            {
+                i += 1; // the qualifier and its dot go
+                continue;
+            }
+            out.push_str(&word);
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
 /// Split a correlated subquery's WHERE into its CORRELATION LEAF and the
 /// rest.
 ///
@@ -19441,6 +19518,35 @@ fn eval_subquery(
         corr_inner_fid = Some(fid);
         where_toks = residual;
     }
+
+    // The inner clauses may qualify by the inner table's NAME or its
+    // ALIAS - `SELECT D.ID FROM DEPT D WHERE D.ID > 1`. The correlation
+    // split above NEEDED those qualifiers to tell the two sides apart;
+    // now that it is done they only get in the resolver's way, so they
+    // come off. (An inner alias made every such subquery refuse, which
+    // is how most people write one.)
+    let inner_names: Vec<&str> = match from.alias {
+        Some(a) => vec![table, a],
+        None => vec![table],
+    };
+    let strip_inner = |t: &str| -> String {
+        let bare = t.rsplit('.').next().unwrap_or(t);
+        match t.rsplitn(2, '.').nth(1) {
+            Some(q) if inner_names.iter().any(|n| n.eq_ignore_ascii_case(q)) => {
+                bare.to_string()
+            }
+            _ => t.to_string(),
+        }
+    };
+    let where_toks = where_toks.map(|toks| {
+        toks.into_iter()
+            .map(|t| match t {
+                Tok::Ident(n) => Tok::Ident(strip_inner(&n)),
+                other => other,
+            })
+            .collect::<Vec<Tok>>()
+    });
+    let proj_s = &strip_inner_all(proj_s, &inner_names);
 
     // which column the rows are collected from: the correlation column
     // for a semi-join, otherwise the projection's single item
@@ -19669,11 +19775,29 @@ fn resolve_subqueries(
                         if vals.is_empty() {
                             // no partner for any row
                             out.push(Tok::Const(negated));
+                        } else if negated {
+                            // NOT EXISTS is a TWO-VALUED test on rows -
+                            // "no inner row matches" - while `NOT IN` is
+                            // three-valued and answers UNKNOWN for a NULL
+                            // left side, dropping that row. An outer key
+                            // that is NULL matches NOTHING, so it
+                            // SATISFIES `NOT EXISTS`; rewriting to
+                            // `NOT IN` alone lost exactly those rows
+                            // (probed: an employee with a NULL department
+                            // is one of them, and fire-crab answered 0
+                            // where the engine answers 1).
+                            out.push(Tok::LParen);
+                            out.push(Tok::Ident(outer.clone()));
+                            out.push(Tok::Is);
+                            out.push(Tok::Null);
+                            out.push(Tok::Or);
+                            out.push(Tok::Ident(outer));
+                            out.push(Tok::Not);
+                            out.push(Tok::In);
+                            out.extend(list_tokens(&vals)?);
+                            out.push(Tok::RParen);
                         } else {
                             out.push(Tok::Ident(outer));
-                            if negated {
-                                out.push(Tok::Not);
-                            }
                             out.push(Tok::In);
                             out.extend(list_tokens(&vals)?);
                         }
