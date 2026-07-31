@@ -427,7 +427,18 @@ pub fn lookup_range(
             node_key.truncate(node.prefix as usize);
             node_key.extend_from_slice(&bytes[node.data_at..node.data_at + node.length as usize]);
             if let Some((lo_key, _)) = lo {
-                if chosen.is_some() && node_key.as_slice() > lo_key {
+                // STRICTLY LESS, and that word is the whole of it. A
+                // non-leaf node's key is the LOWEST key of its child
+                // page, so when one value's duplicates span several leaf
+                // pages, SEVERAL non-leaf nodes carry that same key.
+                // Advancing while `key <= target` lands on the LAST of
+                // them and skips every earlier page that also holds it -
+                // which loses rows silently, because they never become
+                // candidates for the predicate to judge. The child that
+                // can contain the FIRST occurrence is the last one whose
+                // key is strictly less than the target (or the leftmost,
+                // when even that is not less).
+                if chosen.is_some() && node_key.as_slice() >= lo_key {
                     break;
                 }
             } else if chosen.is_some() {
@@ -612,6 +623,16 @@ mod tests {
         assert_eq!(range(Some((5, true)), Some((5, true))), vec![50]);
         assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(5))), vec![50]);
     }
+
+    // A DUPLICATE RUN THAT SPANS LEAF PAGES - the descent's page
+    // boundary - is NOT tested here, and the reason is worth recording.
+    // Building such a tree in memory means letting the writer SPLIT,
+    // which needs a page-inventory page to allocate from; a hand-built
+    // PIP produced a tree the writer then walked forever. The real
+    // thing is covered end-to-end instead, by
+    // qa/serve-real-index.sh's 6000-identical-key fixture against the
+    // live engine - which is where the bug was found in the first
+    // place, and where a single-page tree could never have found it.
 
     /// Every slot with a root page carries entries, whatever its state
     /// - a freshly engine-created index idles in irt_rollback (2) and a

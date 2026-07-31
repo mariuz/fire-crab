@@ -13,6 +13,43 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — W1h: a duplicate run that spans leaf pages lost 2306 of 2310 rows
+
+Found by an adversarial fleet, not by a gate — and no gate here could
+have found it.
+
+### Fixed
+- **The B-tree descent landed on the LAST interior node with the target
+  key, not the first.** A non-leaf node's key is the LOWEST key of its
+  child page, so when one value's duplicates span several leaf pages,
+  *several* non-leaf nodes carry that same key. Advancing while
+  `key <= target` walks past every earlier page that also holds it. The
+  child that can contain the first occurrence is the last one whose key
+  is **strictly less** than the target.
+
+  ```
+  2310 rows, all A = 1, PAGE_SIZE 4096:
+  SELECT COUNT(*), MIN(ID) FROM H2310 WHERE A = 1
+      -->  4 | 2307        the engine:  2310 | 1
+  ```
+
+  The rows were not filtered out — they never became candidates, so the
+  predicate above never saw them. Aggregates, `FIRST`, `GROUP BY` and
+  the DML target walk all inherited it.
+
+### Why no gate caught it
+Every fixture in `qa/serve-real-index.sh` was a handful of rows, and a
+handful of rows is **one leaf page** — the page-boundary behaviour was
+untestable by construction. The gate now carries a 6000-identical-key
+run and asks eight questions across it. The same reasoning killed a
+planned unit test: building such a tree in memory means letting the
+writer split, which needs a page-inventory page, and a hand-built one
+produced a tree the writer walked forever. The comment in `btr.rs` says
+so, so the next person does not re-attempt it blindly.
+
+`qa/serve-real-index.sh` grows to 271 checks. 9 gates and 371 unit tests
+confirm nothing moved.
+
 ## 2026-07-31 — W1g: a compound index's leading segment, and text keys
 
 ### Converted

@@ -79,6 +79,9 @@ CREATE INDEX CP_S ON CP (S);
 CREATE INDEX CP_K ON CP (KC);
 CREATE TABLE TX (S VARCHAR(8) NOT NULL, N INTEGER);
 CREATE UNIQUE INDEX TX_S ON TX (S);
+CREATE TABLE BIG (ID INTEGER, A INTEGER, B INTEGER);
+CREATE INDEX BIG_AB ON BIG (A, B);
+CREATE INDEX BIG_A ON BIG (A);
 COMMIT;
 INSERT INTO EMP VALUES (1, 1, 100, 'a');
 INSERT INTO EMP VALUES (2, 1, 200, 'b');
@@ -109,6 +112,18 @@ INSERT INTO TX VALUES ('a', 3);
 INSERT INTO TX VALUES ('', 4);
 INSERT INTO TX VALUES ('ab', 5);
 INSERT INTO TX VALUES ('B', 6);
+COMMIT;
+-- A DUPLICATE RUN LONG ENOUGH TO SPAN LEAF PAGES. Every fixture in this
+-- gate is otherwise a handful of rows, and a handful of rows is ONE leaf
+-- page - so the descent's page-boundary behaviour was untestable here by
+-- construction. It took 6000 identical keys to reach it.
+SET TERM ^ ;
+EXECUTE BLOCK AS DECLARE I INTEGER = 0; BEGIN
+  WHILE (I < 6000) DO BEGIN I = I + 1; INSERT INTO BIG VALUES (:I, 1, NULL); END
+  I = 0;
+  WHILE (I < 40) DO BEGIN I = I + 1; INSERT INTO BIG VALUES (10000 + :I, 2, :I); END
+END^
+SET TERM ; ^
 INSERT INTO PARENT VALUES (1, 'p1');
 INSERT INTO PARENT VALUES (2, 'p2');
 INSERT INTO TPARENT VALUES ('a');
@@ -464,6 +479,34 @@ natural "a NON-ASCII literal, which must not be keyed" \
 natural "IS NULL on a text column" "SELECT C FROM CP WHERE S IS NULL ORDER BY C"
 natural "a text RANGE" "SELECT C FROM CP WHERE S > 'a' ORDER BY C"
 
+
+# --- 3f. A DUPLICATE RUN THAT SPANS LEAF PAGES ------------------------
+# A non-leaf node's key is the LOWEST key of its child page, so when one
+# value's duplicates span several leaf pages, SEVERAL non-leaf nodes
+# carry that same key. A descent that advances while `key <= target`
+# lands on the LAST of them and skips every earlier page that also holds
+# it - 2306 of 2310 rows lost, and lost SILENTLY, because those rows
+# never become candidates for the predicate to judge.
+#
+# Nothing in this gate could reach that: every other fixture here is a
+# handful of rows, which is one leaf page. That is why these checks
+# exist, and why they use 6000 identical keys.
+indexed "a duplicate run spanning pages, through a compound band" \
+        "SELECT COUNT(*) AS K, MIN(ID) AS LO, MAX(ID) AS HI FROM BIG WHERE A = 1"
+indexed "... and through the single-segment index on the same column" \
+        "SELECT COUNT(*) AS K FROM BIG WHERE A = 1 AND B IS NULL"
+indexed "the short run beside it" \
+        "SELECT COUNT(*) AS K, MIN(ID) AS LO FROM BIG WHERE A = 2"
+indexed "a range that starts inside the long run" \
+        "SELECT COUNT(*) AS K FROM BIG WHERE A >= 1"
+indexed "a range that ends inside it" "SELECT COUNT(*) AS K FROM BIG WHERE A <= 1"
+indexed "the FIRST rows of the run, in order" \
+        "SELECT FIRST 3 ID FROM BIG WHERE A = 1 ORDER BY ID"
+indexed "an aggregate over the whole run" \
+        "SELECT SUM(ID) AS S FROM BIG WHERE A = 1"
+indexed "grouped over it" \
+        "SELECT A, COUNT(*) AS K FROM BIG WHERE A >= 1 GROUP BY A ORDER BY A"
+
 # --- 4. the answers themselves, index and scan side by side ------------
 # the same question asked two ways: if the index path lost a row, these
 # disagree with each other as well as with the engine
@@ -668,6 +711,8 @@ same_both_ways "a compound prefix band" "SELECT C FROM CP WHERE A = 1 ORDER BY C
 same_both_ways "a text equality" "SELECT C FROM CP WHERE S = 'aa'"
 same_both_ways "an empty-string key" "SELECT C FROM CP WHERE S = ''"
 same_both_ways "a navigated TEXT order, case included" "SELECT N FROM TX ORDER BY S"
+same_both_ways "a duplicate run spanning leaf pages" \
+               "SELECT COUNT(*) AS K, MIN(ID) AS LO FROM BIG WHERE A = 1"
 same_both_ways "an aggregate" "SELECT COUNT(*) AS K FROM EMP WHERE DEPT_ID = 9"
 # ORDER is part of the answer, so the navigating server and the sorting
 # one must produce the same SEQUENCE, not just the same set
@@ -689,8 +734,8 @@ else
 fi
 
 rm -f "$A" "$B"
-if [ "$ran" -lt 196 ]; then
-    echo "DIFF only $ran checks ran (expected at least 196) - did one silently skip?"
+if [ "$ran" -lt 210 ]; then
+    echo "DIFF only $ran checks ran (expected at least 210) - did one silently skip?"
     fail=1
 fi
 exit $fail
