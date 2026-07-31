@@ -8970,7 +8970,13 @@ fn dml_targets_at(
         else {
             continue;
         };
-        let Some(r) = dp.records().nth(slot as usize) else { continue };
+        // `record(slot)`, NOT `records().nth(slot)`: `records()` FILTERS
+        // OUT released slots, so the nth survivor is not the record at
+        // slot n. After a deleted row's version is garbage-collected the
+        // iterator shifts, and an entry then fetches SOMEONE ELSE'S
+        // record - which is worse than missing one, because the wrong
+        // row can satisfy the predicate and be written or returned.
+        let Some(r) = dp.record(slot) else { continue };
         if !r.is_primary_record() {
             continue;
         }
@@ -14891,7 +14897,10 @@ fn records_at_in(
         let Some(dp) = bytes.get(start..start + page_size).and_then(DataPage::decode) else {
             continue;
         };
-        let Some(r) = dp.records().nth(slot) else { continue };
+        // `record(slot)`, NOT `records().nth(slot)` - see the DML walk:
+        // `records()` skips released slots, so nth() shifts after a
+        // garbage collection and fetches the wrong record entirely.
+        let Some(r) = dp.record(slot as u16) else { continue };
         if !r.is_primary_record() {
             continue;
         }

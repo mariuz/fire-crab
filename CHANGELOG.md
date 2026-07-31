@@ -13,6 +13,41 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — W1j: the wrong record, not the missing one
+
+The adversarial fleet's full report arrived after the previous fix, and
+corrected it. The deleted-row failure was real but the cause was not the
+one I fixed.
+
+### Fixed
+- **`records().nth(slot)` is not the record at slot `n`.**
+  `DataPage::records()` filters out RELEASED slots, so once a deleted
+  row's version is garbage-collected — which any ordinary read does —
+  the iterator shifts and every entry after the hole fetches **someone
+  else's record**. That is worse than a missed row: a wrong record can
+  satisfy the predicate and be returned, or written. `record(slot)`
+  indexes the slot directly.
+- The sequence→page mapping fixed in the previous increment was also
+  wrong, and both were needed; only this one produced wrong ROWS.
+
+### Gated where it could not be gated before
+Both remaining reproducers need **the engine** to do the writing —
+fire-crab performing the same statements does not produce either. So the
+fixture now mutates through `isql` before any server starts: a delete
+followed by a read that collects the dead version and releases its slot,
+and a key that leaves and returns inside one engine transaction (which
+leaves two live entries with the same key and record — what a stored
+procedure touching a column twice produces).
+
+`qa/serve-real-index.sh` grows to 306 checks. 371 unit tests and the
+write-path gates confirm nothing moved.
+
+### On the fleet
+Six agents, ~17,000 statements, one report that named a root cause I had
+guessed wrong. The three-way oracle is what did it: the second server is
+the same binary with `FC_NO_INDEX=1`, so "index bug or SQL-surface
+difference" was never a question anyone had to argue about.
+
 ## 2026-07-31 — W1i: four more the fleet found, and one capability withdrawn
 
 ### Fixed

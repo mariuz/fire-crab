@@ -1772,6 +1772,30 @@ them.
   whose rule you have measured, gate the others as scanning, and let the
   gate be what tells you when that changes.
 
+- **The sharpest differential is your own binary with the feature
+  switched off.** A flag that disables the new path costs a line, and it
+  turns every "is this a bug in the new thing or a pre-existing
+  difference?" argument into a two-line experiment. It was added here
+  only to prove a coverage check could fail; it then localised four
+  separate defects in minutes, because a disagreement between the
+  feature-on and feature-off builds of the SAME binary is the feature's
+  fault by construction.
+
+- **A convenience iterator that skips holes is not an index.** Fetching
+  "the nth item" from an iterator that filters out released slots
+  silently returns a DIFFERENT item once a hole appears — not an error,
+  not an absence, someone else's data. When a positional API and a
+  filtered view live side by side, the position must come from the API
+  that keeps the holes.
+
+- **Fix the failure you reproduced, not the cause you guessed.** A
+  delete-then-lookup failure had two plausible causes here, one page-
+  level and one slot-level. I fixed the page-level one, the reproducer
+  passed, and the slot-level one — the more serious, because it returned
+  the WRONG row rather than none — survived until the full report
+  arrived. A reproducer passing after a change is evidence about the
+  reproducer, not about the diagnosis.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

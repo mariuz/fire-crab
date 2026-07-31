@@ -87,6 +87,10 @@ CREATE TABLE DEL (ID INTEGER, K INTEGER);
 CREATE INDEX DEL_K ON DEL (K);
 CREATE TABLE TD (ID INTEGER, C VARCHAR(8));
 CREATE DESCENDING INDEX TD_CD ON TD (C);
+CREATE TABLE GC (ID INTEGER NOT NULL PRIMARY KEY, K INTEGER);
+CREATE INDEX GC_K ON GC (K);
+CREATE TABLE RT (ID INTEGER NOT NULL PRIMARY KEY, K INTEGER);
+CREATE INDEX RT_K ON RT (K);
 COMMIT;
 INSERT INTO EMP VALUES (1, 1, 100, 'a');
 INSERT INTO EMP VALUES (2, 1, 200, 'b');
@@ -125,6 +129,33 @@ INSERT INTO DEL VALUES (3, 20);
 INSERT INTO DEL VALUES (4, 20);
 INSERT INTO TD VALUES (1, 'ab');
 INSERT INTO TD VALUES (2, 'abc');
+COMMIT;
+-- ENGINE-SIDE mutations, done by isql while neither server is running.
+-- Both shapes below need the ENGINE's own index maintenance and its
+-- garbage collector; fire-crab performing the same writes does not
+-- produce them, so no check that goes through the wire can reach these.
+--
+-- (a) a deleted row whose version is then GARBAGE COLLECTED, which
+--     RELEASES its slot. `DataPage::records()` skips released slots, so
+--     indexing the nth SURVIVOR is not the record at slot n - after the
+--     collection every later entry fetched SOMEONE ELSE'S record.
+INSERT INTO GC VALUES (1, 5);
+INSERT INTO GC VALUES (2, 20);
+INSERT INTO GC VALUES (3, 20);
+INSERT INTO GC VALUES (4, 20);
+COMMIT;
+DELETE FROM GC WHERE ID = 1;
+COMMIT;
+SELECT COUNT(*) FROM GC;
+COMMIT;
+-- (b) a key that LEAVES and COMES BACK inside ONE transaction, so the
+--     index holds two live entries with the same (key, record) pair.
+INSERT INTO RT VALUES (1, 10);
+INSERT INTO RT VALUES (2, 11);
+INSERT INTO RT VALUES (3, 12);
+COMMIT;
+UPDATE RT SET K = 25 WHERE ID = 1;
+UPDATE RT SET K = 10 WHERE ID = 1;
 COMMIT;
 -- A DUPLICATE RUN LONG ENOUGH TO SPAN LEAF PAGES. Every fixture in this
 -- gate is otherwise a handful of rows, and a handful of rows is ONE leaf
@@ -736,6 +767,35 @@ both "... the row comes back ONCE" "SELECT ID, K FROM DEL WHERE K = 20 ORDER BY 
 both "... counted once" "SELECT COUNT(*) AS C FROM DEL WHERE K = 20"
 both "... and summed once" "SELECT SUM(K) AS S FROM DEL WHERE K >= 0"
 
+
+# (iii) A GARBAGE-COLLECTED SLOT SHIFTED EVERY LATER RECORD. The fixture
+# deleted one row through the ENGINE and then read the table, which
+# collects the dead version and RELEASES its slot. `DataPage::records()`
+# filters released slots out, so taking the nth survivor is not the
+# record at slot n: every entry after the hole fetched someone else's
+# record - a WRONG row, not a missing one, and a wrong row can satisfy
+# the predicate and be returned or written.
+indexed "after an engine-side delete and collection, the count is right" \
+        "SELECT COUNT(*) AS C FROM GC WHERE K = 20"
+indexed "... and the rows are the right ones" \
+        "SELECT ID, K FROM GC WHERE K = 20 ORDER BY ID"
+indexed "... including the one whose slot moved" "SELECT ID FROM GC WHERE ID = 3"
+both "... and the whole table agrees" "SELECT ID, K FROM GC ORDER BY ID"
+#
+# (iv) A KEY THAT LEFT AND CAME BACK INSIDE ONE ENGINE TRANSACTION
+# leaves TWO live entries with the same (key, record) pair - the one the
+# INSERT wrote and the one the second UPDATE wrote. Both are current, so
+# verifying the key cannot separate them; only one row per record can.
+# fire-crab doing the same writes does NOT produce this - it needs the
+# engine's own same-transaction index maintenance, which is what a
+# stored procedure touching a column twice will produce.
+indexed "a key that left and came back answers ONCE" \
+        "SELECT ID, K FROM RT WHERE K = 10"
+indexed "... counted once" "SELECT COUNT(*) AS C FROM RT WHERE K = 10"
+indexed "... summed once" "SELECT SUM(K) AS S FROM RT WHERE K >= 0"
+navigated "... and a navigated order is not shifted by it" \
+          "SELECT FIRST 2 ID FROM RT ORDER BY ID"
+
 # --- 6. THE COVERAGE CHECK'S OWN TEETH ---------------------------------
 # Everything above asserts "an index was used". That claim is only worth
 # something if the assertion can FAIL - so a second server runs with the
@@ -807,8 +867,8 @@ else
 fi
 
 rm -f "$A" "$B"
-if [ "$ran" -lt 224 ]; then
-    echo "DIFF only $ran checks ran (expected at least 224) - did one silently skip?"
+if [ "$ran" -lt 236 ]; then
+    echo "DIFF only $ran checks ran (expected at least 236) - did one silently skip?"
     fail=1
 fi
 exit $fail
