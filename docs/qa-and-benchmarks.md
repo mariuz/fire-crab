@@ -7914,6 +7914,19 @@ literal. The encoder strips trailing blanks on both sides, which is the same
 pad-insensitivity the comparison has, so a CHAR value and a VARCHAR literal meet
 at the same key and neither can be missed.
 
+**`OR` — and therefore `IN` — is a union of bands.** A disjunction retrieves
+through one band per branch of the predicate's DNF, and `IN (...)` desugars to
+exactly that at parse time. Two rules decide correctness rather than speed, and
+both are asked for directly in the gate:
+
+- **Every branch must be servable, or the whole statement scans.** A partial
+  union is a *missing set of rows*, not a slower answer. One branch on an
+  unindexed column and the retrieval declines entirely.
+- **Candidates are deduplicated across bands.** A row can satisfy two branches —
+  most obviously when the branches use different indexes — and would otherwise
+  come back twice. `ID = 1 OR DEPT_ID = 1`, where one row answers both, is the
+  check that says so.
+
 **What is not wired yet, named so it is not assumed.** Index-driven joins, text
 and scaled keys, compound prefixes, `OR` (which needs a retrieval per branch and
 a merge), `<>`, and parameters — whose values arrive after the plan is built.
