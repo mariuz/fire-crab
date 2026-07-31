@@ -95,6 +95,8 @@ INSERT INTO WIDE VALUES (9000000000, 7, 12.50, 'aa');
 INSERT INTO WIDE VALUES (-9000000000, -7, -3.25, 'bb');
 INSERT INTO WIDE VALUES (0, 0, 0.00, NULL);
 INSERT INTO WIDE VALUES (9000000000, 7, 12.50, 'cc');
+INSERT INTO WIDE VALUES (-9223372036854775808, -1, -1.00, 'mn');
+INSERT INTO WIDE VALUES (9223372036854775807, 1, 1.00, 'mx');
 INSERT INTO NU VALUES (2, 'two');
 INSERT INTO NU VALUES (1, 'one');
 INSERT INTO NU VALUES (NULL, 'nil');
@@ -303,6 +305,16 @@ natural "an equality on the SECOND segment of a compound index" \
 # gated byte-exact against `compress` long before this slice
 indexed "a BIGINT key" "SELECT T FROM WIDE WHERE K = 9000000000 ORDER BY T"
 indexed "a NEGATIVE BIGINT key" "SELECT T FROM WIDE WHERE K = -9000000000"
+indexed "the LARGEST BIGINT key" "SELECT T FROM WIDE WHERE K = 9223372036854775807"
+# i64::MIN is the ONE value whose key cannot be built the way the engine
+# built it: the engine's make_int64_key NEGATES the value before scaling
+# it, and negating i64::MIN overflows, so its scale-control choice
+# differs from the arithmetically correct one and our key lands
+# elsewhere in the tree. Measured: this returned NOTHING where the
+# engine returns its rows. A key that cannot be built exactly must SCAN,
+# because the failure mode is a missed row rather than a refusal.
+natural "i64::MIN, whose key the engine builds through an overflow" \
+        "SELECT T FROM WIDE WHERE K = -9223372036854775808"
 indexed "a SMALLINT key" "SELECT T FROM WIDE WHERE S = 7 ORDER BY T"
 indexed "a NEGATIVE SMALLINT key" "SELECT T FROM WIDE WHERE S = -7"
 natural "a SCALED numeric key" "SELECT T FROM WIDE WHERE N = 12.50 ORDER BY T"
@@ -734,8 +746,8 @@ else
 fi
 
 rm -f "$A" "$B"
-if [ "$ran" -lt 210 ]; then
-    echo "DIFF only $ran checks ran (expected at least 210) - did one silently skip?"
+if [ "$ran" -lt 212 ]; then
+    echo "DIFF only $ran checks ran (expected at least 212) - did one silently skip?"
     fail=1
 fi
 exit $fail

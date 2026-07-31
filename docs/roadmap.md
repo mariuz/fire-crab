@@ -151,6 +151,16 @@ plus *the subsystem is now on the path*.
     bound is the prefix's EXCLUSIVE SUCCESSOR (an inclusive one drops
     every row with a non-NULL trailing segment), and text equality is
     keyed for ASCII literals on `idx_string` and `idx_metadata`.
+  - **A named, measured write-path divergence at `i64::MIN`.**
+    `btw::int64_key` builds a key for `-9223372036854775808` that is not
+    the one the engine wrote: the engine's `make_int64_key` NEGATES the
+    value before choosing a scale, and negating `i64::MIN` overflows, so
+    its choice differs from the arithmetically correct one. Retrieval
+    now SCANS for that value, which restores the right answers; the
+    WRITE path still stores our key, so a row fire-crab inserts with a
+    BIGINT of exactly `i64::MIN` carries an index entry the engine's own
+    lookups may not find. Closing it means reading the engine's actual
+    key bytes for that value, which is a probe of its own.
   - Still to do: index-driven joins,
     text keys (a collation makes the key a collation key), compound
     prefixes, and parameters (their values arrive after the plan is

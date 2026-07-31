@@ -13,6 +13,29 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — i64::MIN: a key the engine builds through an overflow
+
+### Fixed
+- **`WHERE A = -9223372036854775808` returned nothing** where the engine
+  returns its rows. With the index path switched off the same server
+  answered correctly, which localised it immediately: the key, not the
+  comparison. The engine's `make_int64_key` negates the value before
+  choosing a scale factor, and negating `i64::MIN` overflows — so its
+  scale-control choice differs from the arithmetically correct one and
+  our key lands elsewhere in the tree.
+- Retrieval refuses to key that one value and scans instead, which is the
+  standing rule: a key that cannot be built exactly must not be used,
+  because the failure is a missed row rather than a refusal.
+
+### Named, not fixed
+The WRITE path still stores our key for `i64::MIN`, so a row fire-crab
+inserts with exactly that value carries an index entry the engine's own
+lookups may not find. Closing it means reading the engine's actual key
+bytes for that value. It is in the roadmap with the reproducer.
+
+`qa/serve-real-index.sh` grows to 275 checks, with both BIGINT extremes
+in the fixture — the largest keyed, the smallest asserted to scan.
+
 ## 2026-07-31 — W1h: a duplicate run that spans leaf pages lost 2306 of 2310 rows
 
 Found by an adversarial fleet, not by a gate — and no gate here could

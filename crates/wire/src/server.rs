@@ -10017,6 +10017,18 @@ fn choose_index(
             continue;
         }
         let key_of = |v: &Value| -> Option<Vec<u8>> {
+            // i64::MIN is the one value whose key this cannot build the
+            // way the engine did. The engine's make_int64_key negates
+            // the value before scaling it, and negating i64::MIN
+            // overflows - so its scale-control choice differs from the
+            // arithmetically correct one, and our key lands elsewhere in
+            // the tree. Measured: `WHERE A = -9223372036854775808`
+            // returned nothing where the engine returns its rows. A key
+            // that cannot be built exactly must SCAN, because the
+            // failure is a missed row rather than a refusal.
+            if matches!(v, Value::Int(i64::MIN)) {
+                return None;
+            }
             let mut values = vec![Value::Null; descs.len()];
             values[*seg_fid] = v.clone();
             // On a COMPOUND index this is the key of `(v, NULL, ...)`,
