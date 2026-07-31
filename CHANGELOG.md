@@ -13,6 +13,45 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — W1i: four more the fleet found, and one capability withdrawn
+
+### Fixed
+- **A deleted row moved every later row out of reach.** A record number
+  names its page by SEQUENCE, and the sequence is not the page's
+  POSITION in the relation's page list — a freed page leaves a gap. The
+  lookup read the wrong page, failed its own sanity check, and dropped
+  the row: **one deleted row hid every key stored after it**. The mapping
+  is a lookup now, not an index.
+- **A key that leaves and comes back was returned twice.** The writer
+  skips an entry it already holds, but only within the leaf page it
+  descended to — so `K 20 → 25 → 20` can leave two identical entries in
+  different pages, **both of them current**. Verification cannot separate
+  those: same key, same record. One row per record, however many entries
+  name it.
+
+### Withdrawn
+- **A DESCENDING index is no longer keyed at all**, and that is measured
+  rather than cautious. Complementing the key reverses byte order, which
+  the bounds could swap for — but it also destroys the PREFIX
+  relationship variable-length keys rely on: with `'ab'` and `'abc'` in
+  one descending text index, equality on `'ab'` found **nothing**, and
+  equality on a descending integer index missed rows too. Two measured
+  misses in one piece of arithmetic is enough. It scans until the layout
+  has been read back off the engine's own index.
+
+### How they were found
+An adversarial fleet of six agents, each with its own strategy, ran
+~17,000 statements through a three-way oracle: fire-crab with index
+retrieval, **the same binary with `FC_NO_INDEX=1`**, and the real engine.
+That middle server is what makes the method sharp — a difference between
+it and the first is an index bug by construction, with no argument about
+whether the SQL surface agrees with Firebird. Every failure above needed
+a shape no fixture in this gate had: a page boundary, a freed page, a key
+that returns, a value that extends another.
+
+`qa/serve-real-index.sh` grows to 291 checks. 12 gates and 371 unit tests
+confirm nothing moved.
+
 ## 2026-07-31 — i64::MIN: a key the engine builds through an overflow
 
 ### Fixed

@@ -8939,12 +8939,29 @@ fn dml_targets_at(
     if per_page == 0 {
         return Ok(Vec::new());
     }
-    let pages = relation_data_pages(&db.bytes, db.page_size, rel);
+    // sequence -> page number, by LOOKUP: see `records_at_in`
+    let pages: std::collections::HashMap<u32, u32> =
+        relation_data_pages(&db.bytes, db.page_size, rel)
+            .into_iter()
+            .filter_map(|no| {
+                let start = no as usize * db.page_size;
+                let dp = db
+                    .bytes
+                    .get(start..start + db.page_size)
+                    .and_then(DataPage::decode)?;
+                Some((dp.sequence, no))
+            })
+            .collect();
     let mut out = Vec::new();
+    let mut seen: Vec<u64> = Vec::new();
     for (entry_key, recno) in pick.candidates(&db.bytes, db.page_size, rel) {
-        let seq = (recno / per_page) as usize;
+        if seen.contains(&recno) {
+            continue;
+        }
+        seen.push(recno);
+        let seq = (recno / per_page) as u32;
         let slot = (recno % per_page) as u16;
-        let Some(&dp_no) = pages.get(seq) else { continue };
+        let Some(&dp_no) = pages.get(&seq) else { continue };
         let start = dp_no as usize * db.page_size;
         let Some(dp) = db
             .bytes
@@ -8953,9 +8970,6 @@ fn dml_targets_at(
         else {
             continue;
         };
-        if dp.sequence as u64 != recno / per_page {
-            continue;
-        }
         let Some(r) = dp.records().nth(slot as usize) else { continue };
         if !r.is_primary_record() {
             continue;
@@ -9998,12 +10012,16 @@ fn choose_index(
         // second, so an equality on the first names a CONTIGUOUS BAND.
         let Some((seg_fid, itype, _)) = op.segs.first() else { continue };
         let compound = op.segs.len() > 1;
-        // A DESCENDING compound index complements the WHOLE assembled
-        // key - markers and padding included - so the successor would
-        // have to be computed before the complement, with the bounds
-        // swapped. That is a second piece of arithmetic and a second
-        // chance to lose a row, so it scans.
-        if compound && op.descending {
+        // A DESCENDING index is not keyed AT ALL, and this is measured
+        // rather than cautious. Its keys are complemented, which
+        // reverses byte order - so bounds must swap - but the
+        // complement also destroys the PREFIX relationship that
+        // variable-length keys rely on: with 'ab' and 'abc' in the same
+        // descending text index, an equality on 'ab' found NOTHING.
+        // Equality on a descending INTEGER index missed rows too. Two
+        // measured misses in one arithmetic is enough: it scans until
+        // the key layout has been read back off the engine's own index.
+        if op.descending {
             continue;
         }
         let text = matches!(*itype, btw::IDX_STRING | btw::IDX_METADATA);
@@ -10118,13 +10136,6 @@ fn choose_index(
         let nav = navigates(db, table, op, order_by);
         if !bounded && !nav {
             continue; // nothing to bound the walk and nothing to gain
-        }
-        // A DESCENDING index complements its keys, so the tree's byte
-        // order is the REVERSE of the value order: the value-low bound
-        // is the byte-high one. Swapping is the whole adjustment -
-        // `key_for` has already complemented the bytes themselves.
-        if op.descending {
-            std::mem::swap(&mut lo, &mut hi);
         }
         let pick = IndexPick { op: op.clone(), lo, hi, navigate: nav };
         // BOUNDS BEAT NAVIGATION. An index that bounds the retrieval
@@ -14824,9 +14835,20 @@ fn records_for(
     pick: &IndexPick,
 ) -> Vec<Vec<Value>> {
     let mut out = Vec::new();
+    // ONE ROW PER RECORD, however many entries name it. `insert_index_entry`
+    // skips an entry it already holds, but only within the leaf page it
+    // descended to - so a key that LEAVES a row and comes back can end
+    // up with two identical entries in different pages, both of them
+    // current. Verification cannot separate those two: they are the
+    // same key on the same record, and the row came back TWICE.
+    let mut seen: Vec<u64> = Vec::new();
     for (entry_key, recno) in pick.candidates(&db.bytes, db.page_size, rel) {
+        if seen.contains(&recno) {
+            continue;
+        }
         for values in records_at_in(&db.bytes, db.page_size, rel, formats, &[recno]) {
             if pick.entry_is_current(&entry_key, &values) {
+                seen.push(recno);
                 out.push(values);
             }
         }
@@ -14845,22 +14867,30 @@ fn records_at_in(
     if per_page == 0 {
         return Vec::new();
     }
-    let pages = relation_data_pages(bytes, page_size, rel);
+    // A record number names a page by its SEQUENCE, and the sequence is
+    // not the page's POSITION in this list: a relation's data pages are
+    // listed in pointer-page order, and a freed page leaves a gap, so
+    // indexing positionally reads the wrong page - or, with the
+    // sequence check below, reads nothing and silently DROPS the row.
+    // One deleted row was enough to hide every later key.
+    let pages: std::collections::HashMap<u32, u32> =
+        relation_data_pages(bytes, page_size, rel)
+            .into_iter()
+            .filter_map(|no| {
+                let start = no as usize * page_size;
+                let dp = bytes.get(start..start + page_size).and_then(DataPage::decode)?;
+                Some((dp.sequence, no))
+            })
+            .collect();
     let mut out = Vec::with_capacity(recnos.len());
     for &recno in recnos {
-        let seq = (recno / per_page) as usize;
+        let seq = (recno / per_page) as u32;
         let slot = (recno % per_page) as usize;
-        let Some(&dp_no) = pages.get(seq) else { continue };
+        let Some(&dp_no) = pages.get(&seq) else { continue };
         let start = dp_no as usize * page_size;
         let Some(dp) = bytes.get(start..start + page_size).and_then(DataPage::decode) else {
             continue;
         };
-        // the page must BE the one this sequence names - a relation's
-        // data pages are listed in sequence order, but a gap would make
-        // the position a lie
-        if dp.sequence as u64 != recno / per_page {
-            continue;
-        }
         let Some(r) = dp.records().nth(slot) else { continue };
         if !r.is_primary_record() {
             continue;

@@ -56,7 +56,7 @@ CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE EMP (ID INTEGER NOT NULL PRIMARY KEY, DEPT_ID INTEGER,
                   SALARY INTEGER, NAME VARCHAR(6));
 CREATE TABLE PLAIN (ID INTEGER, V INTEGER);
-CREATE TABLE WIDE (K BIGINT, S SMALLINT, N NUMERIC(9,2), T VARCHAR(6));
+CREATE TABLE WIDE (K BIGINT, S SMALLINT, N NUMERIC(9,2), T VARCHAR(6), DS INTEGER);
 CREATE TABLE NU (K INTEGER, V VARCHAR(4));
 CREATE TABLE CP (A INTEGER, B INTEGER, C INTEGER, S VARCHAR(8), KC CHAR(6));
 CREATE TABLE PARENT (K INTEGER NOT NULL PRIMARY KEY, V VARCHAR(4));
@@ -71,6 +71,7 @@ CREATE INDEX WIDE_N ON WIDE (N);
 CREATE INDEX WIDE_T ON WIDE (T);
 CREATE INDEX EMP_PAIR ON EMP (DEPT_ID, SALARY);
 CREATE DESCENDING INDEX WIDE_SD ON WIDE (S);
+CREATE DESCENDING INDEX WIDE_DS ON WIDE (DS);
 CREATE UNIQUE INDEX NU_K ON NU (K);
 CREATE INDEX CP2 ON CP (A, B);
 CREATE INDEX CP3 ON CP (A, B, C);
@@ -82,6 +83,10 @@ CREATE UNIQUE INDEX TX_S ON TX (S);
 CREATE TABLE BIG (ID INTEGER, A INTEGER, B INTEGER);
 CREATE INDEX BIG_AB ON BIG (A, B);
 CREATE INDEX BIG_A ON BIG (A);
+CREATE TABLE DEL (ID INTEGER, K INTEGER);
+CREATE INDEX DEL_K ON DEL (K);
+CREATE TABLE TD (ID INTEGER, C VARCHAR(8));
+CREATE DESCENDING INDEX TD_CD ON TD (C);
 COMMIT;
 INSERT INTO EMP VALUES (1, 1, 100, 'a');
 INSERT INTO EMP VALUES (2, 1, 200, 'b');
@@ -91,12 +96,12 @@ INSERT INTO EMP VALUES (5, NULL, 400, 'e');
 INSERT INTO EMP VALUES (6, 1, 200, 'f');
 INSERT INTO PLAIN VALUES (1, 10);
 INSERT INTO PLAIN VALUES (2, 20);
-INSERT INTO WIDE VALUES (9000000000, 7, 12.50, 'aa');
-INSERT INTO WIDE VALUES (-9000000000, -7, -3.25, 'bb');
-INSERT INTO WIDE VALUES (0, 0, 0.00, NULL);
-INSERT INTO WIDE VALUES (9000000000, 7, 12.50, 'cc');
-INSERT INTO WIDE VALUES (-9223372036854775808, -1, -1.00, 'mn');
-INSERT INTO WIDE VALUES (9223372036854775807, 1, 1.00, 'mx');
+INSERT INTO WIDE VALUES (9000000000, 7, 12.50, 'aa', 1);
+INSERT INTO WIDE VALUES (-9000000000, -7, -3.25, 'bb', 2);
+INSERT INTO WIDE VALUES (0, 0, 0.00, NULL, 3);
+INSERT INTO WIDE VALUES (9000000000, 7, 12.50, 'cc', 4);
+INSERT INTO WIDE VALUES (-9223372036854775808, -1, -1.00, 'mn', 5);
+INSERT INTO WIDE VALUES (9223372036854775807, 1, 1.00, 'mx', 6);
 INSERT INTO NU VALUES (2, 'two');
 INSERT INTO NU VALUES (1, 'one');
 INSERT INTO NU VALUES (NULL, 'nil');
@@ -114,6 +119,12 @@ INSERT INTO TX VALUES ('a', 3);
 INSERT INTO TX VALUES ('', 4);
 INSERT INTO TX VALUES ('ab', 5);
 INSERT INTO TX VALUES ('B', 6);
+INSERT INTO DEL VALUES (1, 10);
+INSERT INTO DEL VALUES (2, 20);
+INSERT INTO DEL VALUES (3, 20);
+INSERT INTO DEL VALUES (4, 20);
+INSERT INTO TD VALUES (1, 'ab');
+INSERT INTO TD VALUES (2, 'abc');
 COMMIT;
 -- A DUPLICATE RUN LONG ENOUGH TO SPAN LEAF PAGES. Every fixture in this
 -- gate is otherwise a handful of rows, and a handful of rows is ONE leaf
@@ -356,10 +367,25 @@ indexed "an upper-bounded range over a column that has NULLs" \
         "SELECT ID FROM EMP WHERE DEPT_ID < 3 ORDER BY ID"
 # a DESCENDING index complements its keys, so the tree's byte order is
 # the reverse of the value order and the bounds swap
-indexed "a range through a DESCENDING index" \
-        "SELECT T FROM WIDE WHERE S > -7 ORDER BY T"
-indexed "... and the other way" "SELECT T FROM WIDE WHERE S < 7 ORDER BY T"
-indexed "... and between" "SELECT T FROM WIDE WHERE S BETWEEN -7 AND 7 ORDER BY T"
+# A DESCENDING index is not keyed at all, and that is MEASURED rather
+# than cautious. Its keys are complemented, which reverses byte order -
+# so bounds must swap - but the complement also destroys the PREFIX
+# relationship variable-length keys rely on: with 'ab' and 'abc' in one
+# descending text index, an equality on 'ab' found NOTHING, and equality
+# on a descending INTEGER index missed rows too. Two measured misses in
+# one piece of arithmetic is enough.
+# DS carries ONLY a descending index, so nothing else can serve these -
+# on S, which has an ascending twin, the ascending one is used and the
+# assertion would be about the wrong index.
+natural "a range where only a DESCENDING index exists" \
+        "SELECT T FROM WIDE WHERE DS > 2 ORDER BY T"
+natural "... and the other way" "SELECT T FROM WIDE WHERE DS < 5 ORDER BY T"
+natural "... and between" "SELECT T FROM WIDE WHERE DS BETWEEN 2 AND 5 ORDER BY T"
+natural "EQUALITY on a descending integer index, which missed rows" \
+        "SELECT T FROM WIDE WHERE DS = 4"
+# on a column that ALSO has an ascending index, the ascending one serves
+both "the ascending twin of a descending index still answers" \
+     "SELECT T FROM WIDE WHERE S = 7 ORDER BY T"
 
 
 # --- 3c. NAVIGATION: the sort an index makes unnecessary ---------------
@@ -490,6 +516,12 @@ natural "a NON-ASCII literal, which must not be keyed" \
         "SELECT C FROM CP WHERE S = 'ää'"
 natural "IS NULL on a text column" "SELECT C FROM CP WHERE S IS NULL ORDER BY C"
 natural "a text RANGE" "SELECT C FROM CP WHERE S > 'a' ORDER BY C"
+# (iii) a DESCENDING text index holding a value that EXTENDS another:
+# complementing the bytes destroys the prefix relationship, and the
+# equality found nothing
+natural "equality on a descending TEXT index, where one value extends another" \
+        "SELECT ID FROM TD WHERE C = 'ab'"
+natural "... and the longer one" "SELECT ID FROM TD WHERE C = 'abc'"
 
 
 # --- 3f. A DUPLICATE RUN THAT SPANS LEAF PAGES ------------------------
@@ -675,6 +707,35 @@ fk_scans "a TEXT foreign key, which scans" "INSERT INTO TCHILD VALUES (1, 'a')"
 both_refuse "a TEXT key with no parent" "INSERT INTO TCHILD VALUES (2, 'zz')"
 both "the text child table" "SELECT ID, PK FROM TCHILD ORDER BY ID"
 
+
+# --- 5d. WHAT AN ADVERSARIAL FLEET FOUND ------------------------------
+# Four failures that no fixture here could produce, each reduced to the
+# smallest table that shows it. They are grouped because they share a
+# cause: a record number is not a position, and an index entry is not a
+# row.
+#
+# (i) A DELETED ROW MOVED EVERY LATER ROW OUT OF REACH. A record number
+# names its page by SEQUENCE, and the sequence is not the page's
+# POSITION in the relation's page list - a freed page leaves a gap. The
+# lookup read the wrong page, failed its own sanity check, and dropped
+# the row: one deleted row hid every key stored after it.
+both "delete one row" "DELETE FROM DEL WHERE ID = 1"
+both "... every later key is still reachable" \
+     "SELECT COUNT(*) AS C FROM DEL WHERE K = 20"
+both "... and by their own values" "SELECT ID, K FROM DEL WHERE K = 20 ORDER BY ID"
+both "... and the whole table agrees" "SELECT ID, K FROM DEL ORDER BY ID"
+#
+# (ii) A KEY THAT LEAVES AND COMES BACK was returned TWICE. The writer
+# skips an entry it already holds, but only within the leaf page it
+# descended to - so a key can end up with two identical entries in
+# different pages, both of them CURRENT. Verification cannot separate
+# them; only one row per record can.
+both "move a key away" "UPDATE DEL SET K = 25 WHERE ID = 2"
+both "... and bring it back" "UPDATE DEL SET K = 20 WHERE ID = 2"
+both "... the row comes back ONCE" "SELECT ID, K FROM DEL WHERE K = 20 ORDER BY ID"
+both "... counted once" "SELECT COUNT(*) AS C FROM DEL WHERE K = 20"
+both "... and summed once" "SELECT SUM(K) AS S FROM DEL WHERE K >= 0"
+
 # --- 6. THE COVERAGE CHECK'S OWN TEETH ---------------------------------
 # Everything above asserts "an index was used". That claim is only worth
 # something if the assertion can FAIL - so a second server runs with the
@@ -746,8 +807,8 @@ else
 fi
 
 rm -f "$A" "$B"
-if [ "$ran" -lt 212 ]; then
-    echo "DIFF only $ran checks ran (expected at least 212) - did one silently skip?"
+if [ "$ran" -lt 224 ]; then
+    echo "DIFF only $ran checks ran (expected at least 224) - did one silently skip?"
     fail=1
 fi
 exit $fail

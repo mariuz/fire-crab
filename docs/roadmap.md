@@ -111,7 +111,11 @@ plus *the subsystem is now on the path*.
     projection's retrieval — equality and RANGES (`>`, `>=`, `<`, `<=`,
     `BETWEEN`), including descending indexes (their keys are
     complemented, so the bounds swap) and multiple bounds on one column
-    (a conjunction narrows). Both the PROJECTION's retrieval and the
+    (a conjunction narrows), and DESCENDING indexes are NOT keyed - two
+    measured misses (equality on a descending integer index, and
+    equality on a descending text index holding a value that extends
+    the searched one) say the complement's arithmetic has not been
+    established. Both the PROJECTION's retrieval and the
     FOLD's - a grouped query and the prepare-time aggregate fast path
     read their candidates through the same leaf. A key this cannot
     build byte-exactly would be a MISSED ROW rather than a refusal,
