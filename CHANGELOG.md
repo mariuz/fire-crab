@@ -13,6 +13,51 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — a correlated subquery in the select list
+
+### Converted
+- **`SELECT D.ID, (SELECT COUNT(*) FROM EMP E WHERE E.DEPT_ID = D.ID)
+  FROM DEPT D`** — the refusal the previous increment recorded. A
+  correlated subquery has no single value to fold into the text: it has
+  one per outer row. So it is not folded, it is **precomputed as a
+  LOOKUP TABLE** — the inner table is scanned once at prepare, its rows
+  bucketed by the correlation column, each bucket folded into the one
+  value that key answers, and each outer row then looks its own key up.
+  A correlated aggregate IS a group keyed by the correlation column, so
+  the fold is the same `compute_group` a GROUP BY runs.
+- Covered: COUNT/MIN/MAX/SUM/AVG and a bare column; the inner table by
+  name or alias; the equality either way round; a residual inner filter
+  beside the correlation; several correlated items in one select list;
+  an outer WHERE, an alias, and ORDER BY over the looked-up column.
+
+**The law this turns on**: a key with NO matching inner rows is **not
+always NULL**. `COUNT` answers 0 there and every other function answers
+NULL — and both appear in the SAME ROW of one query, which is how the
+fixture pins it: department 9 has no employees and answers `0` and
+`<null>` side by side. A lookup defaulting to NULL is right for three of
+the four functions and wrong for the one people use most.
+
+### Fixed
+- **The inner table's ALIAS is its qualifier.** `FROM EMP E ... WHERE
+  E.DEPT_ID = D.ID` correlates through `E`, and the correlation split
+  compared only the table NAME — so it found no correlation at all and
+  every aliased correlated subquery refused, which is nearly all of them
+  as people write them. This also widens the correlated EXISTS/IN path,
+  which shares the split.
+- **`SUM(E.SALARY)` parses as an EXPRESSION target**, not a column one —
+  the dot stops it looking like an identifier — so the qualified
+  spelling took a different path from `SUM(SALARY)` and refused while the
+  bare one worked.
+
+### Guarded
+- A **non-equality** correlation (`WHERE E.SALARY > D.BUDGET`) refuses: a
+  keyed table cannot express it, and the engine answers it by re-running
+  the subquery per row. So does a GROUP BY inside the subquery.
+
+`qa/serve-real-corrsubq.sh` is new, 27 checks. The two correlated
+refusals `qa/serve-real-selectsubq.sh` recorded one increment ago are
+promoted there from refusals to comparisons.
+
 ## 2026-07-31 — a subquery in the select list
 
 ### Converted

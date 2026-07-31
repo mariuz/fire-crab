@@ -11520,11 +11520,25 @@ fn plan_query_inner(
                     })
                     .collect();
                 let mut proj_out = folded.clone();
+                // a CORRELATED subquery cannot be folded into the text:
+                // its value differs per outer row. It is left for the
+                // projection builder, which turns it into a lookup.
+                let mut correlated: Vec<(usize, String)> = Vec::new();
                 for (i, sub) in subs.iter().enumerate() {
                     // `corr: None` - a CORRELATED subquery cannot resolve
                     // its outer column here and refuses, since its value
                     // differs per row and this fold is once per statement
                     let Some(rows) = eval_subquery(sub, dbr, None, false) else {
+                        // not a constant - it may be CORRELATED, which
+                        // is answered per row from a lookup table rather
+                        // than folded into the text
+                        if split_top_level_commas(&folded).iter().any(|item| {
+                            let (body, _) = split_alias(item);
+                            body.trim() == format!("{}{}", SUBQ_MARK, i)
+                        }) {
+                            correlated.push((i, sub.clone()));
+                            continue;
+                        }
                         if trace {
                             eprintln!("[srv] plan: select-list subquery {:?} not answerable", sub);
                         }
@@ -11555,6 +11569,20 @@ fn plan_query_inner(
                 }
                 if let Some(o) = order_s {
                     out.push_str(&format!(" ORDER BY {}", o));
+                }
+                if !correlated.is_empty() {
+                    // the markers stay in the text; the projection
+                    // builder below resolves each against the OUTER
+                    // table's columns
+                    if trace {
+                        eprintln!(
+                            "[srv] plan: {} correlated select-list subquery(s)",
+                            correlated.len()
+                        );
+                    }
+                    return plan_correlated_select(
+                        &proj_out, &correlated, table_s, where_s, order_s, dbr, params, trace,
+                    );
                 }
                 if trace {
                     eprintln!("[srv] plan: select-list subqueries folded to {:?}", out);
@@ -16340,6 +16368,26 @@ enum Expr {
     Iif(Box<Cond2>, Box<Expr>, Box<Expr>),
     /// a built-in scalar function over resolved arguments
     Func(SysFn, Vec<Expr>),
+    /// A CORRELATED scalar subquery, precomputed as a LOOKUP TABLE.
+    ///
+    /// `(SELECT COUNT(*) FROM EMP E WHERE E.DEPT_ID = D.ID)` has one
+    /// answer per value of the outer key, so the inner table is scanned
+    /// ONCE at prepare and folded per key; each outer row then looks its
+    /// key up. A key with NO matching inner rows takes `absent`, which is
+    /// NOT always NULL: COUNT answers 0 there and every other function
+    /// answers NULL (probed - a department with no employees counts 0 and
+    /// maxes NULL in the same row).
+    Lookup {
+        key: Box<Expr>,
+        /// (outer key value, the subquery's answer for it)
+        pairs: Vec<(Value, Value)>,
+        absent: Value,
+        /// the result's announced type and scale, decided at prepare
+        /// from the inner item (the pairs alone cannot say, since an
+        /// empty table has no value to read a type from)
+        ty: ExprType,
+        scale: i8,
+    },
     /// `CASE`: the first branch whose condition is TRUE answers; false
     /// and UNKNOWN move on; no branch -> ELSE, no ELSE -> NULL
     Case(Vec<(Cond2, Expr)>, Option<Box<Expr>>),
@@ -17094,6 +17142,10 @@ impl Expr {
     /// then falls back rather than answering wrong).
     fn type_of(&self, descs: &[Descriptor]) -> Option<ExprType> {
         match self {
+            // decided at prepare from the INNER item: the pairs alone
+            // cannot say, since an empty inner table has no value to
+            // read a type from
+            Expr::Lookup { ty, .. } => Some(*ty),
             // a conditional's type comes from its branches TOGETHER: a
             // NULL branch is untyped and defers to its siblings, and ANY
             // exact-numeric branch beside integer ones makes the whole
@@ -17323,6 +17375,7 @@ impl Expr {
     /// called for an expression already typed `ExprType::Numeric`.
     fn result_scale(&self, descs: &[Descriptor]) -> Option<i8> {
         match self {
+            Expr::Lookup { scale, .. } => Some(*scale),
             Expr::Col(fid) => {
                 let d = descs.get(*fid)?;
                 if matches!(col_kind(d), Some(ColKind::Int)) {
@@ -17412,6 +17465,9 @@ impl Expr {
     /// engine's getDesc copies the non-null side. None = not numeric.
     fn rank_of(&self, descs: &[Descriptor]) -> Option<NumRank> {
         match self {
+            // a folded lookup answers within i64: its values came from
+            // the inner table's own columns and folds
+            Expr::Lookup { .. } => Some(NumRank::I64),
             // the widest branch decides the width, so a value from any
             // branch fits the announced column
             // an APPROXIMATE or BOOLEAN value has no exact rank - width
@@ -17521,6 +17577,20 @@ impl Expr {
     /// `Err(EvalErr)` is a per-row arithmetic exception (divide by zero).
     fn eval(&self, values: &[Value]) -> Result<Value, EvalErr> {
         Ok(match self {
+            Expr::Lookup { key, pairs, absent, .. } => {
+                let k = key.eval(values)?;
+                // a NULL key matches nothing - `NULL = NULL` is UNKNOWN,
+                // so the row has no partner and takes the absent answer
+                if matches!(k, Value::Null) {
+                    absent.clone()
+                } else {
+                    pairs
+                        .iter()
+                        .find(|(pk, _)| *pk == k)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_else(|| absent.clone())
+                }
+            }
             Expr::Double(d) => Value::Double(*d),
             Expr::Bool(b) => Value::Bool(*b),
             // three-valued: UNKNOWN is the SQL NULL of the boolean type
@@ -18333,6 +18403,506 @@ fn value_literal(v: &Value) -> Option<String> {
     })
 }
 
+/// Plan a SELECT whose select list holds ONE CORRELATED subquery.
+///
+/// The outer query is planned as an ordinary projection; the correlated
+/// item becomes a [Expr::Lookup] column, whose table was folded once at
+/// prepare. Everything else - the outer WHERE, the other select items,
+/// ORDER BY - is the ordinary path.
+#[allow(clippy::too_many_arguments)]
+fn plan_correlated_select(
+    proj_marked: &str,
+    correlated: &[(usize, String)],
+    table_s: &str,
+    where_s: Option<&str>,
+    order_s: Option<&str>,
+    db: &Database,
+    params: &mut Vec<Option<Descriptor>>,
+    trace: bool,
+) -> Option<Plan> {
+    let (from, join) = parse_from(table_s)?;
+    if !join.is_empty() {
+        return Some(Plan::Refused); // a correlated subquery over a join
+    }
+    let table = from.table;
+    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
+    let columns = relation_columns(&db.bytes, db.page_size, table);
+    let formats = select_formats(db, table, rel);
+    let descs = formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, d)| d.clone())
+        .unwrap_or_default();
+    if descs.is_empty() {
+        return Some(Plan::Refused);
+    }
+    // one lookup table per correlated item, each scanned once here
+    let mut lookups: Vec<(usize, Expr, Descriptor, String)> = Vec::new();
+    for (marker, sub) in correlated {
+        let Some((lookup, result_desc)) = build_correlated_lookup(sub, db, &columns, &descs)
+        else {
+            if trace {
+                eprintln!("[srv] plan: correlated subquery {:?} not answerable", sub);
+            }
+            return Some(Plan::Refused);
+        };
+        lookups.push((
+            *marker,
+            lookup,
+            result_desc,
+            subquery_item_name(sub).unwrap_or_else(|| "CONSTANT".to_string()),
+        ));
+    }
+
+    // The OUTER table's own qualifiers are stripped HERE rather than by
+    // the general pass, which runs later and would also strip them
+    // INSIDE the subquery - where `D.ID` becoming a bare `ID` would
+    // resolve against the INNER table instead, silently changing which
+    // column the correlation names.
+    let mut allowed: Vec<&str> = vec![table];
+    if let Some(a) = from.alias {
+        allowed.push(a);
+    }
+    let unq = |t: &str| unqualify_single(t, &allowed).unwrap_or_else(|| t.to_string());
+
+    // the outer WHERE, resolved the ordinary way
+    let mut np = 0usize;
+    let filter = match where_s {
+        None => None,
+        Some(ws) => {
+            let ws = unq(ws);
+            Some(resolve_predicate(
+                tokenize(&ws).and_then(|t| parse_predicate(&t, &mut np))?,
+                &columns,
+                &descs,
+                params,
+            )?)
+        }
+    };
+
+    // build the output columns: the marker becomes the lookup, every
+    // other item is an ordinary select item
+    let mut cols: Vec<ProjCol> = Vec::new();
+    for item in split_top_level_commas(proj_marked) {
+        let (body, alias) = split_alias(item);
+        if let Some((_, lookup, result_desc, iname)) = lookups
+            .iter()
+            .find(|(m, _, _, _)| body.trim() == format!("{}{}", SUBQ_MARK, m))
+        {
+            let (wire, sql_type, length, scale, sub_type) = wire_for(result_desc);
+            cols.push(ProjCol {
+                // the subquery's own item names the column, as it does
+                // for a folded constant one
+                name: alias
+                    .map(|a| a.trim_matches('"').to_ascii_uppercase())
+                    .unwrap_or_else(|| iname.clone()),
+                field_id: 0,
+                wire,
+                sql_type: nullable(sql_type),
+                length,
+                scale,
+                sub_type,
+                expr: Some(lookup.clone()),
+            });
+            continue;
+        }
+        match parse_projection(&unq(item))? {
+            Proj::Items(items) if items.len() == 1 => match items.into_iter().next()? {
+                SelItem::Col(name, alias) => {
+                    let mut pc = build_projcols(&[name], &columns, &descs, &Default::default())?
+                        .into_iter()
+                        .next()?;
+                    if let Some(a) = alias {
+                        pc.name = a;
+                    }
+                    cols.push(pc);
+                }
+                SelItem::Expr(raw, name) => {
+                    cols.push(build_expr_col(&raw, &name, &columns, &descs)?)
+                }
+                _ => return Some(Plan::Refused),
+            },
+            _ => return Some(Plan::Refused),
+        }
+    }
+    if cols.is_empty() {
+        return Some(Plan::Refused);
+    }
+    let order_by = match order_s {
+        None => Vec::new(),
+        Some(os) => parse_order_by_expr(
+            &unq(os),
+            &cols,
+            |n| {
+                columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(n))
+                    .map(|c| c.field_id as usize)
+            },
+            |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
+        )?,
+    };
+    Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols: Vec::new() })
+}
+
+/// The name a subquery's own select item gives its output column.
+fn subquery_item_name(sub: &str) -> Option<String> {
+    let (p, _, _, _, _, _) = split_query(sub)?;
+    match parse_projection(p)? {
+        Proj::Items(items) => match items.first()? {
+            SelItem::Col(c, alias) => Some(
+                alias
+                    .clone()
+                    .unwrap_or_else(|| c.rsplit('.').next().unwrap_or(c).to_string()),
+            ),
+            SelItem::Agg(f, _, alias) => Some(alias.clone().unwrap_or_else(|| {
+                match f {
+                    AggFn::Count => "COUNT",
+                    AggFn::Min => "MIN",
+                    AggFn::Max => "MAX",
+                    AggFn::Sum => "SUM",
+                    AggFn::Avg => "AVG",
+                }
+                .to_string()
+            })),
+            SelItem::Expr(_, n) => Some(n.clone()),
+            SelItem::Gen(_, _, n) => Some(n.clone()),
+        },
+        Proj::Star => None,
+    }
+}
+
+/// Build a CORRELATED scalar subquery's answer as a LOOKUP TABLE.
+///
+/// `(SELECT COUNT(*) FROM EMP E WHERE E.DEPT_ID = D.ID)` has one answer
+/// per value of the outer key, so the inner table is scanned ONCE here
+/// and folded per key; each outer row then looks its own key up
+/// ([Expr::Lookup]). That is a different mechanism from the constant
+/// fold - a correlated subquery has no single value to fold - and it is
+/// the reason this is a plan-time table rather than a rewritten literal.
+///
+/// Covered: one inner table, one correlation equality, and an inner item
+/// that is either an AGGREGATE or a bare COLUMN. Refused: a non-equality
+/// correlation (`WHERE E.SALARY > D.BUDGET` - the engine answers it, and
+/// a keyed table cannot), more than one correlation, a GROUP BY/HAVING
+/// inside, and an inner item this server would not fold on its own.
+///
+/// Returns the lookup expression and the descriptor its result
+/// announces.
+fn build_correlated_lookup(
+    sub: &str,
+    db: &Database,
+    outer_cols: &[RelationColumn],
+    outer_descs: &[Descriptor],
+) -> Option<(Expr, Descriptor)> {
+    let (proj_s, table_s, where_s, group_s, having_s, order_s) = split_query(sub)?;
+    if group_s.is_some() || having_s.is_some() || order_s.is_some() {
+        return None;
+    }
+    let (from, join) = parse_from(table_s)?;
+    if !join.is_empty() {
+        return None;
+    }
+    let table = from.table;
+    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
+    let columns = relation_columns(&db.bytes, db.page_size, table);
+    let formats = select_formats(db, table, rel);
+    let descs = formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, d)| d.clone())
+        .unwrap_or_default();
+    if descs.is_empty() {
+        return None;
+    }
+    let ws = where_s?; // no WHERE means no correlation
+    if !extract_subqueries(ws)?.1.is_empty() {
+        return None; // a subquery inside the subquery
+    }
+    let toks = tokenize(ws)?;
+    let (corr_fid, outer_name, residual) =
+        split_correlation(&toks, table, from.alias, &columns, outer_cols)?;
+
+    // The residual WHERE names the INNER table, often by its alias
+    // (`AND E.SALARY > 150`). The correlation split needed those
+    // qualifiers to tell the two sides apart; now that it is done they
+    // only get in the resolver's way, so they come off.
+    let inner_names: Vec<&str> = match from.alias {
+        Some(a) => vec![table, a],
+        None => vec![table],
+    };
+    let strip_inner = |t: &str| -> String {
+        t.rsplit('.')
+            .next()
+            .filter(|_| {
+                t.rsplitn(2, '.')
+                    .nth(1)
+                    .map_or(true, |q| inner_names.iter().any(|n| n.eq_ignore_ascii_case(q)))
+            })
+            .unwrap_or(t)
+            .to_string()
+    };
+    let residual = residual.map(|toks| {
+        toks.into_iter()
+            .map(|t| match t {
+                Tok::Ident(n) => Tok::Ident(strip_inner(&n)),
+                other => other,
+            })
+            .collect::<Vec<Tok>>()
+    });
+
+    // the residual WHERE filters the inner table on its own
+    let mut np = 0usize;
+    let filter = match residual {
+        None => None,
+        Some(t) => Some(resolve_predicate(parse_predicate(&t, &mut np)?, &columns, &descs, &mut Vec::new())?),
+    };
+    if np != 0 {
+        return None; // a `?` inside a correlated subquery
+    }
+
+    // what the inner query projects: an aggregate, or one bare column
+    let item = match parse_projection(proj_s)? {
+        Proj::Items(items) if items.len() == 1 => items.into_iter().next()?,
+        _ => return None,
+    };
+
+    // gather the inner rows per correlation key
+    let mut buckets: Vec<(Value, Vec<Vec<Value>>)> = Vec::new();
+    let mut bad = false;
+    for_each_record(db, rel, &formats, |vals| {
+        if bad {
+            return;
+        }
+        match filter.as_ref().map_or(Ok(true), |p| p.matches(vals)) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(_) => {
+                bad = true;
+                return;
+            }
+        }
+        let k = vals.get(corr_fid).cloned().unwrap_or(Value::Null);
+        // a NULL key never joins, so it can never be looked up
+        if matches!(k, Value::Null) {
+            return;
+        }
+        match buckets.iter_mut().find(|(bk, _)| *bk == k) {
+            Some((_, rows)) => rows.push(vals.to_vec()),
+            None => buckets.push((k, vec![vals.to_vec()])),
+        }
+    });
+    if bad {
+        return None;
+    }
+
+    // fold each bucket into the one value the subquery answers for it
+    let (pairs, absent, result_desc): (Vec<(Value, Value)>, Value, Descriptor) = match &item {
+        SelItem::Agg(func, target, _) => {
+            // `SUM(E.SALARY)` names the inner column through the
+            // alias; the fold wants the bare name
+            // `SUM(E.SALARY)` is parsed as an EXPRESSION target (the
+            // dot stops it looking like an identifier), so a qualified
+            // inner column arrives here as Expr(Col("E.SALARY")) rather
+            // than Col - which is why the unqualified spelling worked
+            // and the qualified one refused
+            let target = match target {
+                AggTarget::Col(n) => AggTarget::Col(strip_inner(n)),
+                AggTarget::Expr(RawExpr::Col(n)) => AggTarget::Col(strip_inner(n)),
+                other => other.clone(),
+            };
+            let d = agg_result_desc(*func, &target, &columns, &descs)?;
+            let src = match &target {
+                AggTarget::Star => AggSrc::Star,
+                AggTarget::Col(n) => AggSrc::Field(
+                    columns
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(n))?
+                        .field_id as usize,
+                ),
+                _ => return None,
+            };
+            // the SAME fold a grouped query runs, over one bucket at a
+            // time - a correlated aggregate IS a group, keyed by the
+            // correlation column
+            let gitems = vec![GItem::Agg(*func, src, false)];
+            let mut out = Vec::with_capacity(buckets.len());
+            for (k, rows) in &buckets {
+                let folded = compute_group(rows, &gitems).ok()?;
+                out.push((k.clone(), folded.into_iter().next()?));
+            }
+            // A KEY WITH NO ROWS IS NOT ALWAYS NULL: COUNT answers 0
+            // there and every other function answers NULL (probed - a
+            // department with no employees counts 0 and maxes NULL in
+            // the same row).
+            let absent = match func {
+                AggFn::Count => Value::Int(0),
+                _ => Value::Null,
+            };
+            (out, absent, d)
+        }
+        SelItem::Col(name, _) => {
+            let name = strip_inner(name);
+            let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(&name))?;
+            let fid = rc.field_id as usize;
+            if is_computed_fid(&descs, fid) {
+                return None;
+            }
+            let d = descs.get(fid)?.clone();
+            let mut out = Vec::with_capacity(buckets.len());
+            for (k, rows) in &buckets {
+                // more than one row for a key is the engine's
+                // "multiple rows in singleton select" - but only when
+                // that key is actually reached, which this cannot know;
+                // refusing the whole statement is the safe reading and
+                // matches the engine for every fixture where the key
+                // exists
+                if rows.len() > 1 {
+                    return None;
+                }
+                out.push((k.clone(), rows[0].get(fid).cloned().unwrap_or(Value::Null)));
+            }
+            (out, Value::Null, d)
+        }
+        _ => return None,
+    };
+
+    // the outer key: the column named on the other side of the equality
+    let key_rc = outer_cols
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(&outer_name))?;
+    let key_fid = key_rc.field_id as usize;
+    if is_computed_fid(outer_descs, key_fid) {
+        return None;
+    }
+    let kd = outer_descs.get(key_fid)?;
+    let ty = if matches!(col_kind(kd), Some(ColKind::Text)) {
+        ExprType::Text
+    } else {
+        ExprType::Int
+    };
+    let _ = ty;
+    let (rty, rscale) = expr_type_of_desc(&result_desc)?;
+    Some((
+        Expr::Lookup {
+            key: Box::new(Expr::Col(key_fid)),
+            pairs,
+            absent,
+            ty: rty,
+            scale: rscale,
+        },
+        result_desc,
+    ))
+}
+
+/// The (type, scale) an announced descriptor carries, for typing a
+/// precomputed value that has no descriptor slot of its own.
+fn expr_type_of_desc(d: &Descriptor) -> Option<(ExprType, i8)> {
+    if matches!(col_kind(d), Some(ColKind::Int)) {
+        Some((ExprType::Int, 0))
+    } else if matches!(col_kind(d), Some(ColKind::Text)) {
+        Some((ExprType::Text, 0))
+    } else if is_numeric_col(d) {
+        Some((ExprType::Numeric, d.scale))
+    } else if is_approx_col(d) {
+        Some((ExprType::Approx, 0))
+    } else if d.dtype == dtype::BOOLEAN {
+        Some((ExprType::Bool, 0))
+    } else {
+        temporal_kind(d).map(|k| (ExprType::Temporal(k), 0))
+    }
+}
+
+/// Split a correlated subquery's WHERE into its CORRELATION LEAF and the
+/// rest.
+///
+/// The leaf is exactly `<inner col> = <outer col>`; it is removed, and
+/// what remains filters the inner table on its own. Returns
+/// (inner field id, the outer column's bare name, the residual WHERE).
+///
+/// A QUALIFIER SETTLES WHICH SIDE IS WHICH. `U2.ID = T.ID` names the
+/// same column in two tables, so stripping the qualifier and asking
+/// which table has "ID" finds BOTH and calls it ambiguous - which is how
+/// a correlated EXISTS over tables sharing a column name came to refuse.
+/// An UNQUALIFIED name present in both tables stays ambiguous, and more
+/// than one correlation pair refuses rather than picking one.
+fn split_correlation(
+    toks: &[Tok],
+    table: &str,
+    alias: Option<&str>,
+    columns: &[RelationColumn],
+    outer_cols: &[RelationColumn],
+) -> Option<(usize, String, Option<Vec<Tok>>)> {
+    let parts = split_top_and(toks);
+    let mut kept: Vec<Vec<Tok>> = Vec::new();
+    let mut found: Option<(usize, String)> = None;
+    for p in parts {
+        if let [Tok::Ident(a), Tok::Cmp(Cmp::Eq), Tok::Ident(b)] = p.as_slice() {
+            let name_of = |q: &str| q.rsplit('.').next().unwrap_or(q).to_string();
+            let qual_of = |q: &str| -> Option<String> {
+                let mut it = q.rsplitn(2, '.');
+                it.next();
+                it.next().map(|s| s.to_string())
+            };
+            let (an, bn) = (name_of(a), name_of(b));
+            // the inner table answers to its NAME and to its ALIAS:
+            // `FROM EMP E ... WHERE E.DEPT_ID = D.ID` qualifies by E,
+            // and reading only the table name found no correlation at
+            // all - which made every aliased correlated subquery refuse
+            let in_tbl = |q: &str| -> bool {
+                match qual_of(q) {
+                    Some(t) => {
+                        t.eq_ignore_ascii_case(table)
+                            || alias.map_or(false, |a| t.eq_ignore_ascii_case(a))
+                    }
+                    None => false,
+                }
+            };
+            let a_in = in_tbl(a)
+                || (qual_of(a).is_none()
+                    && columns.iter().any(|c| c.name.eq_ignore_ascii_case(&an)));
+            let b_in = in_tbl(b)
+                || (qual_of(b).is_none()
+                    && columns.iter().any(|c| c.name.eq_ignore_ascii_case(&bn)));
+            let a_out =
+                !in_tbl(a) && outer_cols.iter().any(|c| c.name.eq_ignore_ascii_case(&an));
+            let b_out =
+                !in_tbl(b) && outer_cols.iter().any(|c| c.name.eq_ignore_ascii_case(&bn));
+            // exactly the original rule: one side resolves in the INNER
+            // table and not the outer, and the other side is then the
+            // outer reference
+            let pair = match (a_in && !a_out, b_in && !b_out) {
+                (true, false) => Some((an.clone(), bn.clone())),
+                (false, true) => Some((bn.clone(), an.clone())),
+                _ => None,
+            };
+            if let Some((inner, outer)) = pair {
+                if found.is_some() {
+                    return None; // more than one correlation pair
+                }
+                found = Some((
+                    columns
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(&inner))?
+                        .field_id as usize,
+                    outer,
+                ));
+                continue; // drop this leaf
+            }
+        }
+        kept.push(p);
+    }
+    let (fid, outer) = found?; // no correlation leaf - not correlated
+    let mut rejoined: Vec<Tok> = Vec::new();
+    for (i, p) in kept.into_iter().enumerate() {
+        if i > 0 {
+            rejoined.push(Tok::And);
+        }
+        rejoined.extend(p);
+    }
+    Some((fid, outer, if rejoined.is_empty() { None } else { Some(rejoined) }))
+}
+
 /// Evaluate an inner `SELECT <one item> FROM <one table> [WHERE ...]`.
 ///
 /// `corr` optionally names an OUTER column: when set, the inner WHERE is
@@ -18385,71 +18955,10 @@ fn eval_subquery(
     };
     if let Some(outer_cols) = corr {
         let toks = where_toks.take()?; // correlated EXISTS needs a WHERE
-        let parts = split_top_and(&toks);
-        let mut kept: Vec<Vec<Tok>> = Vec::new();
-        for p in parts {
-            // exactly `<ident> = <ident>`, one side inner, one side outer
-            if let [Tok::Ident(a), Tok::Cmp(Cmp::Eq), Tok::Ident(b)] = p.as_slice() {
-                let name_of = |q: &str| q.rsplit('.').next().unwrap_or(q).to_string();
-                let qual_of = |q: &str| -> Option<String> {
-                    let mut it = q.rsplitn(2, '.');
-                    it.next();
-                    it.next().map(|s| s.to_string())
-                };
-                let (an, bn) = (name_of(a), name_of(b));
-                let in_tbl = |q: &str| -> bool {
-                    // A QUALIFIER SETTLES IT. `U2.ID = T.ID` names the
-                    // same column in two tables, so stripping the
-                    // qualifier and asking which table has "ID" finds
-                    // BOTH and calls it ambiguous - which is how a
-                    // correlated EXISTS over tables sharing a column name
-                    // came to refuse.
-                    match qual_of(q) {
-                        Some(t) => t.eq_ignore_ascii_case(table),
-                        None => false,
-                    }
-                };
-                let a_in = in_tbl(a)
-                    || (qual_of(a).is_none()
-                        && columns.iter().any(|c| c.name.eq_ignore_ascii_case(&an)));
-                let b_in = in_tbl(b)
-                    || (qual_of(b).is_none()
-                        && columns.iter().any(|c| c.name.eq_ignore_ascii_case(&bn)));
-                let a_out = !in_tbl(a)
-                    && outer_cols.iter().any(|c| c.name.eq_ignore_ascii_case(&an));
-                let b_out = !in_tbl(b)
-                    && outer_cols.iter().any(|c| c.name.eq_ignore_ascii_case(&bn));
-                // an UNQUALIFIED name present in both tables is still
-                // ambiguous - refuse rather than pick a side
-                let inner_name = match (a_in && !a_out, b_in && !b_out) {
-                    (true, false) => Some(an.clone()),
-                    (false, true) => Some(bn.clone()),
-                    _ => None,
-                };
-                if let Some(inner) = inner_name {
-                    if corr_inner_fid.is_some() {
-                        return None; // more than one correlation pair
-                    }
-                    corr_inner_fid = Some(
-                        columns
-                            .iter()
-                            .find(|c| c.name.eq_ignore_ascii_case(&inner))?
-                            .field_id as usize,
-                    );
-                    continue; // drop this leaf
-                }
-            }
-            kept.push(p);
-        }
-        corr_inner_fid?; // no correlation leaf found - not a semi-join
-        let mut rejoined: Vec<Tok> = Vec::new();
-        for (i, p) in kept.into_iter().enumerate() {
-            if i > 0 {
-                rejoined.push(Tok::And);
-            }
-            rejoined.extend(p);
-        }
-        where_toks = if rejoined.is_empty() { None } else { Some(rejoined) };
+        let (fid, _outer_name, residual) =
+            split_correlation(&toks, table, from.alias, &columns, outer_cols)?;
+        corr_inner_fid = Some(fid);
+        where_toks = residual;
     }
 
     // which column the rows are collected from: the correlation column
@@ -21684,6 +22193,8 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
             && a.rank_of(descs) != Some(NumRank::I128)
     };
     match e {
+        // the fold already happened at prepare; a lookup only compares
+        Expr::Lookup { key, .. } => expr_no_raise(key, descs),
         Expr::Col(_)
         | Expr::Int(_)
         | Expr::Dec(..)
@@ -24722,6 +25233,36 @@ pub fn serve(addr: &str, user: &str, password: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lookup_answers_absent_keys_by_function() {
+        // The law the whole design turns on: a key with NO rows is not
+        // always NULL. COUNT answers 0 there; every other function
+        // answers NULL - and both appear in the SAME row of a query.
+        let count = Expr::Lookup {
+            key: Box::new(Expr::Col(0)),
+            pairs: vec![(Value::Int(1), Value::Int(2))],
+            absent: Value::Int(0),
+            ty: ExprType::Int,
+            scale: 0,
+        };
+        let max = Expr::Lookup {
+            key: Box::new(Expr::Col(0)),
+            pairs: vec![(Value::Int(1), Value::Int(200))],
+            absent: Value::Null,
+            ty: ExprType::Int,
+            scale: 0,
+        };
+        assert_eq!(count.eval(&[Value::Int(1)]).unwrap(), Value::Int(2));
+        assert_eq!(max.eval(&[Value::Int(1)]).unwrap(), Value::Int(200));
+        // department 9 has no employees
+        assert_eq!(count.eval(&[Value::Int(9)]).unwrap(), Value::Int(0));
+        assert_eq!(max.eval(&[Value::Int(9)]).unwrap(), Value::Null);
+        // a NULL key matches nothing - `NULL = NULL` is UNKNOWN - so it
+        // takes the absent answer rather than any bucket
+        assert_eq!(count.eval(&[Value::Null]).unwrap(), Value::Int(0));
+        assert_eq!(max.eval(&[Value::Null]).unwrap(), Value::Null);
+    }
 
     #[test]
     fn a_folded_value_round_trips_as_a_literal() {

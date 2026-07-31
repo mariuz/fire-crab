@@ -1463,6 +1463,25 @@ them.
   literal early. Rendering a value as source is a conversion like any
   other and deserves its own unit test, not a `to_string`.
 
+- **"Absent" is not one value - it is a value per FUNCTION.** A lookup
+  table keyed by a correlation column has no entry for a key with no
+  rows, and what that answers depends on the aggregate: COUNT says 0,
+  everything else says NULL. Defaulting the missing case to NULL is right
+  three times in four and wrong on the most common one. Whenever you
+  build a keyed cache of a computation, ask what the computation answers
+  for the EMPTY input, not just for a missing key.
+
+- **Put the two disagreeing cases in ONE statement.** Checking COUNT and
+  MAX over the same empty key in separate queries lets a wrong default
+  pass one and fail the other, which reads like a bug in that function. In
+  one row, side by side, it reads as what it is.
+
+- **A rewrite correct for one scope is not correct for a nested one.**
+  The pass that strips a table's qualifiers rewrites the WHOLE statement,
+  including the text inside a subquery - where the stripped name resolves
+  against a DIFFERENT table. Any textual rewrite needs to know where its
+  scope ends, and a nested query is where it ends.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

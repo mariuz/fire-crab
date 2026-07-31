@@ -241,14 +241,16 @@ both "NULL, as before" "SELECT ID, NULL FROM EMP WHERE ID = 1"
 both "a QUOTED digit is still a column" \
      "SELECT COUNT(*) FROM EMP WHERE ID = 1"
 
-# --- 5. the refusal ---------------------------------------------------
-# A CORRELATED subquery has a different value per OUTER ROW, so it cannot
-# be folded once for the statement. The engine answers it; this server
-# refuses rather than folding the wrong row's value into every row.
-refuses "a CORRELATED subquery in the select list" \
-        "SELECT ID, (SELECT D.ID FROM DEPT D WHERE D.ID = E.DEPT_ID) FROM EMP E"
-refuses "... naming the outer table explicitly" \
-        "SELECT ID, (SELECT DNAME FROM DEPT WHERE DEPT.ID = EMP.DEPT_ID) FROM EMP"
+# --- 5. the CORRELATED neighbour --------------------------------------
+# A correlated subquery has a different value per OUTER ROW, so it cannot
+# be folded once for the statement - it REFUSED here until the increment
+# that gave it a per-key LOOKUP TABLE instead. Compared now, with
+# qa/serve-real-corrsubq.sh owning the shape: a refusal check that keeps
+# passing after the refusal is lifted passes for the wrong reason.
+both "a CORRELATED subquery in the select list" \
+     "SELECT E.ID, (SELECT D.ID FROM DEPT D WHERE D.ID = E.DEPT_ID) FROM EMP E ORDER BY E.ID"
+both "... with an aggregate" \
+     "SELECT E.ID, (SELECT COUNT(*) FROM DEPT D WHERE D.ID = E.DEPT_ID) FROM EMP E ORDER BY E.ID"
 
 rm -f "$A" "$B"
 if [ "$ran" -lt 33 ]; then

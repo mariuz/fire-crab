@@ -7436,6 +7436,61 @@ would put one row's answer into every row, which is a wrong answer rather than
 a slow one. The engine answers those; fire-crab says so plainly and the gate
 pins it.
 
+### A correlated subquery in the select list (`qa/serve-real-corrsubq.sh`, 27 checks)
+
+The previous increment folded a **constant** subquery into the query text as the
+literal it computed, and refused a correlated one — rightly, since a correlated
+subquery has no single value to fold. It has one per outer row.
+
+So this one is not folded. It is precomputed as a **lookup table**: the inner
+table is scanned once at prepare, its rows bucketed by the correlation column,
+each bucket folded into the one value the subquery answers for that key. Each
+outer row then looks its own key up. The nice part is that a correlated
+aggregate *is* a group — keyed by the correlation column — so the fold is the
+same `compute_group` a GROUP BY runs, over one bucket at a time.
+
+**The law the design turns on.** A key with no matching inner rows is not
+always NULL:
+
+```sql
+SELECT D.ID,
+       (SELECT COUNT(*)      FROM EMP E WHERE E.DEPT_ID = D.ID),
+       (SELECT MAX(E.SALARY) FROM EMP E WHERE E.DEPT_ID = D.ID)
+  FROM DEPT D
+```
+
+Department 9 has no employees and answers **0** and **`<null>`** in the same
+row. `COUNT` is the exception and it is the function people use most, so a
+lookup table that defaulted to NULL would be right three times out of four and
+wrong on the common case. The fixture has that department for exactly this
+check, and the gate runs both functions side by side rather than in separate
+statements — separate statements would let a NULL default pass the MAX check
+and fail only the COUNT one, which reads like a COUNT bug rather than a
+defaulting bug.
+
+**Two things refused for the same underlying reason.** The correlation split
+compared a qualifier against the inner table's NAME, so `FROM EMP E ... WHERE
+E.DEPT_ID = D.ID` — correlating through the *alias* — found no correlation at
+all. Nearly every correlated subquery is written that way. And `SUM(E.SALARY)`
+parses as an *expression* target rather than a column one, because the dot
+stops it looking like an identifier, so the qualified spelling took a different
+path from `SUM(SALARY)` and refused while the bare one worked. Both are the
+same shape of bug: a name that carries a qualifier is not the name the resolver
+was looking for.
+
+**One ordering subtlety worth recording.** The outer table's qualifiers are
+stripped *inside* this planner rather than by the general single-relation pass,
+which runs later. That pass rewrites the whole statement — including the text
+inside the subquery — so `D.ID` in the correlation would become a bare `ID`,
+and `ID` resolves against the INNER table too. The correlation would then
+silently name a different column. A rewrite that is correct for one scope is
+not automatically correct for a nested one.
+
+**Refused, with reasons**: a non-equality correlation (`WHERE E.SALARY >
+D.BUDGET`), which a keyed table cannot express and the engine answers by
+re-running the subquery per row; and a GROUP BY inside the subquery, which
+would need a second level of folding.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
