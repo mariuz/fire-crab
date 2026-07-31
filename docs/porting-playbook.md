@@ -1756,6 +1756,22 @@ them.
   one — trace what happens to your "I cannot do this safely" value before
   trusting it to be safe.
 
+- **When a lookup becomes a RANGE, the bound that ends it is the whole
+  job.** An equality on a compound index's leading segment is not a point
+  — it is every key beginning with that prefix — and closing that band
+  with an inclusive bound at the prefix returns only the rows whose
+  remaining segments are all NULL. The rows are not refused, they are
+  absent. Whenever a change turns "find this" into "find this range",
+  write the boundary case into the fixture first: a row exactly at the
+  bound, and a row just past it.
+
+- **Adjacent operators can need different arithmetic, and that is a
+  reason to ship one of them.** `<= v` over a prefix band ends at the
+  successor of v's band; `< v` ends at that band's start. Implementing
+  both together invites using one rule for two cases. Ship the operator
+  whose rule you have measured, gate the others as scanning, and let the
+  gate be what tells you when that changes.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

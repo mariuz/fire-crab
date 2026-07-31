@@ -7887,6 +7887,33 @@ stopped and **the engine reads the file back through its own index**, with `SET
 PLAN ON` so the PLAN line proves an index was used rather than a scan; a key
 written differently from the engine's would find nothing there.
 
+**A compound index's leading segment, where the arithmetic decides whether rows
+survive.** A compound key stuffs its segments together, so `A = 1` on an `(A, B)`
+index is not a point but a **band**: every key beginning with that prefix. The
+lower bound is the key of `(1, NULL, ...)` — which is exactly the bytes the engine
+writes for that row, so the NULL-tailed rows cannot be missed — and the upper
+bound is the prefix's **exclusive successor**, computed by incrementing the last
+byte, dropping trailing `0xFF`s and carrying left.
+
+That upper bound is the entire slice. An *inclusive* bound at the prefix itself
+admits only the all-NULL-tail key and silently drops every row that has a value
+in its trailing segments. It is the same failure mode as everything else here —
+a missed row, which no filter above can catch — so every compound check in the
+gate has rows on both sides of the line, including negative leading values whose
+encoded key ends in `0xFF` and therefore exercises the carry.
+
+Three things still scan, each for a stated reason rather than an omission: a
+**range** on a compound leading segment (`<= v` ends at the successor of v's band
+while `< v` ends at the band's *start* — two rules for two adjacent operators is
+how a missed row ships); a **descending** compound index (the complement covers
+the markers and the padding, so the successor would have to be computed before
+it, with the bounds swapped); and a **non-ASCII** text literal.
+
+**Text keys** came with it: equality on `VARCHAR` and `CHAR` with an ASCII
+literal. The encoder strips trailing blanks on both sides, which is the same
+pad-insensitivity the comparison has, so a CHAR value and a VARCHAR literal meet
+at the same key and neither can be missed.
+
 **What is not wired yet, named so it is not assumed.** Index-driven joins, text
 and scaled keys, compound prefixes, `OR` (which needs a retrieval per branch and
 a merge), `<>`, and parameters — whose values arrive after the plan is built.
