@@ -7721,7 +7721,7 @@ fixed for the unquoted case only (`bare_ident_ok`), because `"3"` is a
 perfectly legal delimited identifier and the callers strip the quotes before
 asking.
 
-### The first index-driven retrieval (`qa/serve-real-index.sh`, 90 checks)
+### The first index-driven retrieval (`qa/serve-real-index.sh`, 125 checks)
 
 Two subsystems had been finished and left disconnected. `ods::btr` decoded
 index pages and walked leaf levels; `fire-crab-opt` reproduced the engine's
@@ -7773,11 +7773,38 @@ candidates, and the records decide. The cheap entry-level check still runs
 first, and only its *rejection* is re-examined, so a duplicate the record check
 cannot disprove is still a duplicate.
 
-**What is not wired yet, named so it is not assumed.** Ranges, `ORDER BY` via
-navigation, index-driven joins, the aggregate's own retrieval walk (it is a
-separate loop), text and scaled keys, compound prefixes, and parameters — whose
-values arrive after the plan is built. The roadmap counts thirty retrieval
-sites; this slice wires the projection's.
+**Ranges came next, and one descent serves them all.** The key encoding is
+order-preserving — that is what `compress` is for — so a byte range *is* a value
+range: descend to the lower bound, walk forward, stop past the upper one. Each
+bound is optional and carries its own inclusivity, which makes `>`, `>=`, `<`,
+`<=` and `BETWEEN` a single code path, and makes equality the degenerate case
+where both bounds are the same key. A conjunction can only narrow, so several
+comparisons on one column combine into one range. A **descending** index is
+served by swapping the bounds: its keys are complemented, so the tree's byte
+order is the reverse of the value order, and the encoder has already done the
+complementing.
+
+**And the range work found that the most obvious shape was the one being
+missed.** `SELECT ... WHERE ID > 3 ORDER BY ID` scanned, while
+`WHERE DEPT_ID > 3 ORDER BY ID` used an index. The difference had nothing to do
+with the range: `opt` answers `Access::Order` rather than `Access::Index` when
+an index *navigates* the ORDER BY, and in the first query the predicate's index
+and the sort's index are the same one. Both answers mean "an index serves this".
+The retrieval half is taken now and the sort still runs above it — work the
+engine avoids and we do not, which costs time and cannot change an answer.
+
+Worth stating on its own: a column with NULLs under an upper-bounded range.
+NULLs are stored as a **zero-length key**, which sorts before every value, so
+`WHERE DEPT_ID < 3` sweeps every NULL row up as a candidate — and the predicate
+throws them all out. A wasted fetch, never a wrong row. It is the property the
+whole slice rests on, and it is gated rather than argued.
+
+**What is not wired yet, named so it is not assumed.** `ORDER BY` via
+navigation (the sort still runs above an index-driven range), index-driven
+joins, the aggregate's own retrieval walk (it is a separate loop), text and
+scaled keys, compound prefixes, `OR` (which needs a retrieval per branch and a
+merge), `<>`, and parameters — whose values arrive after the plan is built. The
+roadmap counts thirty retrieval sites; this slice wires the projection's.
 
 ## Benchmarks
 

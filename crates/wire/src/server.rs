@@ -938,8 +938,7 @@ enum RowSource {
     IndexScan {
         rel: u16,
         formats: Vec<(u8, Vec<Descriptor>)>,
-        index_id: u8,
-        key: Vec<u8>,
+        pick: IndexPick,
         width: Option<usize>,
     },
     /// the rows of `input` that satisfy `pred` (None keeps every row)
@@ -1016,15 +1015,8 @@ impl RowSource {
                 });
                 Ok(out)
             }
-            RowSource::IndexScan { rel, formats, index_id, key, width } => {
-                let recnos = fire_crab_ods::btr::lookup_key(
-                    &db.bytes,
-                    db.page_size,
-                    *rel,
-                    *index_id,
-                    key,
-                )
-                .unwrap_or_default();
+            RowSource::IndexScan { rel, formats, pick, width } => {
+                let recnos = pick.recnos(&db.bytes, db.page_size, *rel);
                 let mut out = Vec::new();
                 for values in records_at(db, *rel, formats, &recnos) {
                     let mut row = values;
@@ -1124,13 +1116,7 @@ impl RowSource {
         // the same tree either way, which is what makes "the answers do
         // not move" a property of the shape rather than a hope
         let leaf = match index {
-            Some(p) => RowSource::IndexScan {
-                rel,
-                formats,
-                index_id: p.id,
-                key: p.key,
-                width: None,
-            },
+            Some(pick) => RowSource::IndexScan { rel, formats, pick, width: None },
             None => RowSource::TableScan { rel, formats, width: None },
         };
         RowSource::Sort {
@@ -9659,7 +9645,24 @@ impl IndexOp {
 #[derive(Clone, Debug, PartialEq)]
 struct IndexPick {
     id: u8,
-    key: Vec<u8>,
+    /// lower bound as (key, inclusive); None is unbounded below
+    lo: Option<(Vec<u8>, bool)>,
+    /// upper bound; None is unbounded above
+    hi: Option<(Vec<u8>, bool)>,
+}
+
+impl IndexPick {
+    fn recnos(&self, bytes: &[u8], page_size: usize, rel: u16) -> Vec<u64> {
+        fire_crab_ods::btr::lookup_range(
+            bytes,
+            page_size,
+            rel,
+            self.id,
+            self.lo.as_ref().map(|(k, i)| (k.as_slice(), *i)),
+            self.hi.as_ref().map(|(k, i)| (k.as_slice(), *i)),
+        )
+        .unwrap_or_default()
+    }
 }
 
 /// Choose an index-driven retrieval for a single-relation SELECT, or
@@ -9708,44 +9711,103 @@ fn choose_index(
     // What would the engine do here? opt answers from the same catalog
     // and the same rules its PLAN gate holds against the live server.
     let plan = fire_crab_opt::plan_query(&db.bytes, db.page_size, sql).ok()?;
+    // `Access::Index` is a retrieval; `Access::Order` is the engine
+    // NAVIGATING an index for the ORDER BY, which it does with the same
+    // predicate as bounds - so both mean "an index serves this". Only
+    // the retrieval half is taken here; the sort still runs above,
+    // which costs work and cannot change an answer. Without this,
+    // `WHERE ID > 3 ORDER BY ID` scanned while `WHERE DEPT_ID > 3
+    // ORDER BY ID` did not, purely because the second one's ORDER BY
+    // names a different index.
     if !matches!(
         plan.streams.as_slice(),
-        [fire_crab_opt::Stream { access: fire_crab_opt::Access::Index(_), .. }]
+        [fire_crab_opt::Stream {
+            access: fire_crab_opt::Access::Index(_) | fire_crab_opt::Access::Order(_),
+            ..
+        }]
     ) {
         return None;
     }
 
     let ops = resolve_index_ops(db, rel, descs)?;
-    for term in terms {
-        let (fid, value) = match term {
-            Term::Cmp(fid, Cmp::Eq, Rhs::Int(v)) | Term::NumCmp(fid, Cmp::Eq, Rhs::Int(v)) => {
-                (*fid, Value::Int(*v))
-            }
-            _ => continue,
-        };
-        // the column must BE an integer at scale 0 - a scaled column
-        // stores Value::Scaled, and a key built from Value::Int would
-        // land somewhere else in the tree and find nothing
-        let d = descs.get(fid)?;
+    // Collect every comparison in the conjunction that could bound an
+    // indexed column, then keep the FIRST column an index can serve.
+    // A conjunction narrows, so several bounds on one column combine:
+    // `ID > 3 AND ID < 7` is one range, and BETWEEN has already been
+    // desugared into exactly that pair.
+    for op in &ops {
+        let [(seg_fid, itype, _)] = op.segs.as_slice() else { continue };
+        if !matches!(*itype, btw::IDX_NUMERIC | btw::IDX_NUMERIC2) {
+            continue;
+        }
+        // a scaled column stores Value::Scaled, and a key built from
+        // Value::Int would land elsewhere in the tree and find nothing
+        let Some(d) = descs.get(*seg_fid) else { continue };
         if d.scale != 0 {
             continue;
         }
-        for op in &ops {
-            let [(seg_fid, itype, _)] = op.segs.as_slice() else { continue };
-            if *seg_fid != fid {
-                continue;
-            }
-            if !matches!(*itype, btw::IDX_NUMERIC | btw::IDX_NUMERIC2) {
-                continue;
-            }
+        let key_of = |v: i64| -> Option<Vec<u8>> {
             let mut values = vec![Value::Null; descs.len()];
-            values[fid] = value.clone();
-            let (key, all_null) = op.key_for(&values)?;
-            if all_null {
+            values[*seg_fid] = Value::Int(v);
+            op.key_for(&values).filter(|(_, all_null)| !all_null).map(|(k, _)| k)
+        };
+        // (key, inclusive) bounds in VALUE order, tightened as terms are
+        // read; the descending swap happens once, at the end
+        let mut lo: Option<(Vec<u8>, bool)> = None;
+        let mut hi: Option<(Vec<u8>, bool)> = None;
+        let mut bounded = false;
+        for term in terms {
+            let (fid, cmp, v) = match term {
+                Term::Cmp(fid, cmp, Rhs::Int(v)) | Term::NumCmp(fid, cmp, Rhs::Int(v)) => {
+                    (*fid, *cmp, *v)
+                }
+                _ => continue,
+            };
+            if fid != *seg_fid {
                 continue;
             }
-            return Some(IndexPick { id: op.id, key });
+            let Some(key) = key_of(v) else { continue };
+            // tighter wins: a conjunction can only narrow
+            let tighten = |slot: &mut Option<(Vec<u8>, bool)>,
+                           k: Vec<u8>,
+                           incl: bool,
+                           upper: bool| {
+                let better = match slot.as_ref() {
+                    None => true,
+                    Some((cur, cur_incl)) => match k.cmp(cur) {
+                        std::cmp::Ordering::Equal => *cur_incl && !incl,
+                        std::cmp::Ordering::Less => upper,
+                        std::cmp::Ordering::Greater => !upper,
+                    },
+                };
+                if better {
+                    *slot = Some((k, incl));
+                }
+            };
+            match cmp {
+                Cmp::Eq => {
+                    tighten(&mut lo, key.clone(), true, false);
+                    tighten(&mut hi, key, true, true);
+                }
+                Cmp::Gt => tighten(&mut lo, key, false, false),
+                Cmp::Ge => tighten(&mut lo, key, true, false),
+                Cmp::Lt => tighten(&mut hi, key, false, true),
+                Cmp::Le => tighten(&mut hi, key, true, true),
+                Cmp::Ne => continue, // two ranges, not one
+            }
+            bounded = true;
         }
+        if !bounded {
+            continue;
+        }
+        // A DESCENDING index complements its keys, so the tree's byte
+        // order is the REVERSE of the value order: the value-low bound
+        // is the byte-high one. Swapping is the whole adjustment -
+        // `key_for` has already complemented the bytes themselves.
+        if op.descending {
+            std::mem::swap(&mut lo, &mut hi);
+        }
+        return Some(IndexPick { id: op.id, lo, hi });
     }
     None
 }
@@ -13103,7 +13165,7 @@ fn plan_query_inner(
             let index = choose_index(db, rel, &descs, &filter, sql);
             if trace {
                 match &index {
-                    Some(p) => eprintln!("[srv] index scan: rel={} index={} key={:?}", rel, p.id, p.key),
+                    Some(p) => eprintln!("[srv] index scan: rel={} index={} lo={:?} hi={:?}", rel, p.id, p.lo, p.hi),
                     None => eprintln!("[srv] natural scan: rel={}", rel),
                 }
             }
@@ -13266,7 +13328,7 @@ fn plan_query_inner(
         let index = choose_index(db, rel, &descs, &filter, sql);
         if trace {
             match &index {
-                Some(p) => eprintln!("[srv] index scan: rel={} index={} key={:?}", rel, p.id, p.key),
+                Some(p) => eprintln!("[srv] index scan: rel={} index={} lo={:?} hi={:?}", rel, p.id, p.lo, p.hi),
                 None => eprintln!("[srv] natural scan: rel={}", rel),
             }
         }
@@ -14405,9 +14467,7 @@ fn for_each_candidate<F: FnMut(&[Value])>(
         for_each_record(db, rel, formats, f);
         return;
     };
-    let recnos =
-        fire_crab_ods::btr::lookup_key(&db.bytes, db.page_size, rel, pick.id, &pick.key)
-            .unwrap_or_default();
+    let recnos = pick.recnos(&db.bytes, db.page_size, rel);
     for values in records_at(db, rel, formats, &recnos) {
         f(&values);
     }
@@ -32253,7 +32313,11 @@ mod tests {
         // the tree above the leaf must not know which one it got: a
         // scan and an index retrieval differ in what they READ, and the
         // Filter/Sort above them is identical either way
-        let pick = IndexPick { id: 2, key: vec![0xC0, 8] };
+        let pick = IndexPick {
+            id: 2,
+            lo: Some((vec![0xC0, 8], true)),
+            hi: Some((vec![0xC0, 8], true)),
+        };
         let scan = RowSource::scan_filter_sort(128, Vec::new(), None, Vec::new(), None);
         let idx = RowSource::scan_filter_sort(128, Vec::new(), None, Vec::new(), Some(pick.clone()));
         let leaf_of = |s: &RowSource| -> String {
@@ -32261,8 +32325,8 @@ mod tests {
                 RowSource::Sort { input, .. } => match input.as_ref() {
                     RowSource::Filter { input, .. } => match input.as_ref() {
                         RowSource::TableScan { .. } => "scan".to_string(),
-                        RowSource::IndexScan { index_id, key, .. } => {
-                            format!("index {} {:?}", index_id, key)
+                        RowSource::IndexScan { pick, .. } => {
+                            format!("index {} {:?}", pick.id, pick.lo)
                         }
                         _ => "other".to_string(),
                     },
@@ -32272,7 +32336,7 @@ mod tests {
             }
         };
         assert_eq!(leaf_of(&scan), "scan");
-        assert_eq!(leaf_of(&idx), "index 2 [192, 8]");
+        assert_eq!(leaf_of(&idx), "index 2 Some(([192, 8], true))");
     }
 
     #[test]

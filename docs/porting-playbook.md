@@ -1691,6 +1691,16 @@ them.
   gate asserting the scan, so the boundary is a checked claim rather
   than a comment.
 
+- **Ask the converted component ALL the ways it can say yes.** The
+  optimizer here has three access verdicts, and the wiring accepted one
+  of them. The result was that the most obvious shape in the language —
+  a range over a primary key with an ORDER BY on it — was the single
+  shape that would not use an index, while the same range on another
+  column did. It looked like a bug in the range code; it was a missing
+  arm in the caller's `match`. When a converted decision is an enum, the
+  caller has to account for every variant, not the one the first test
+  happened to produce.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

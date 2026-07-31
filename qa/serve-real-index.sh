@@ -64,6 +64,7 @@ CREATE INDEX WIDE_S ON WIDE (S);
 CREATE INDEX WIDE_N ON WIDE (N);
 CREATE INDEX WIDE_T ON WIDE (T);
 CREATE INDEX EMP_PAIR ON EMP (DEPT_ID, SALARY);
+CREATE DESCENDING INDEX WIDE_SD ON WIDE (S);
 COMMIT;
 INSERT INTO EMP VALUES (1, 1, 100, 'a');
 INSERT INTO EMP VALUES (2, 1, 200, 'b');
@@ -217,7 +218,6 @@ indexed "zero as a key" "SELECT ID FROM EMP WHERE DEPT_ID = 0"
 # them would be a MISSED ROW rather than a refusal if it guessed
 natural "a column with no index" "SELECT ID FROM EMP WHERE SALARY = 300"
 natural "a table with no index at all" "SELECT ID FROM PLAIN WHERE ID = 1"
-natural "a RANGE, not an equality" "SELECT ID FROM EMP WHERE ID > 3 ORDER BY ID"
 natural "IS NULL, which is not an equality" \
         "SELECT ID FROM EMP WHERE DEPT_ID IS NULL"
 natural "no predicate at all" "SELECT ID FROM EMP ORDER BY ID"
@@ -236,6 +236,45 @@ indexed "a SMALLINT key" "SELECT T FROM WIDE WHERE S = 7 ORDER BY T"
 indexed "a NEGATIVE SMALLINT key" "SELECT T FROM WIDE WHERE S = -7"
 natural "a SCALED numeric key" "SELECT T FROM WIDE WHERE N = 12.50 ORDER BY T"
 natural "a TEXT key" "SELECT K FROM WIDE WHERE T = 'aa'"
+
+
+# --- 3b. RANGES ---------------------------------------------------------
+# The key encoding is ORDER-PRESERVING - that is what `compress` is for -
+# so a byte range IS a value range, and one descent plus a forward walk
+# serves `>`, `>=`, `<`, `<=` and BETWEEN. Both bounds are optional and
+# each carries its own inclusivity, which is the part that is easy to get
+# off by one row.
+indexed "a strict lower bound" "SELECT ID FROM EMP WHERE ID > 3 ORDER BY ID"
+indexed "an inclusive lower bound" "SELECT ID FROM EMP WHERE ID >= 3 ORDER BY ID"
+indexed "a strict upper bound" "SELECT ID FROM EMP WHERE ID < 3 ORDER BY ID"
+indexed "an inclusive upper bound" "SELECT ID FROM EMP WHERE ID <= 3 ORDER BY ID"
+indexed "both bounds" "SELECT ID FROM EMP WHERE ID > 2 AND ID < 5 ORDER BY ID"
+indexed "BETWEEN, which is the inclusive pair" \
+        "SELECT ID FROM EMP WHERE ID BETWEEN 2 AND 5 ORDER BY ID"
+indexed "a range past every key" "SELECT ID FROM EMP WHERE ID > 100 ORDER BY ID"
+indexed "a range before every key" "SELECT ID FROM EMP WHERE ID < -100 ORDER BY ID"
+indexed "an EMPTY range - the bounds cross" \
+        "SELECT ID FROM EMP WHERE ID > 3 AND ID < 3 ORDER BY ID"
+indexed "the whole table, through the index" \
+        "SELECT ID FROM EMP WHERE ID > 0 ORDER BY ID"
+# a conjunction can only NARROW, so several bounds on one column combine
+indexed "two lower bounds - the tighter wins" \
+        "SELECT ID FROM EMP WHERE ID >= 2 AND ID >= 4 ORDER BY ID"
+indexed "an equality and a range together" \
+        "SELECT ID FROM EMP WHERE ID = 4 AND ID > 1 ORDER BY ID"
+indexed "a range on a NON-UNIQUE index, with duplicates inside it" \
+        "SELECT ID FROM EMP WHERE DEPT_ID >= 1 AND DEPT_ID <= 2 ORDER BY ID"
+# NULLs are stored as a zero-length key, which sorts BEFORE every value:
+# an upper-bounded range therefore sweeps them up as candidates, and the
+# predicate above throws them out - a wasted fetch, never a wrong row
+indexed "an upper-bounded range over a column that has NULLs" \
+        "SELECT ID FROM EMP WHERE DEPT_ID < 3 ORDER BY ID"
+# a DESCENDING index complements its keys, so the tree's byte order is
+# the reverse of the value order and the bounds swap
+indexed "a range through a DESCENDING index" \
+        "SELECT T FROM WIDE WHERE S > -7 ORDER BY T"
+indexed "... and the other way" "SELECT T FROM WIDE WHERE S < 7 ORDER BY T"
+indexed "... and between" "SELECT T FROM WIDE WHERE S BETWEEN -7 AND 7 ORDER BY T"
 
 # --- 4. the answers themselves, index and scan side by side ------------
 # the same question asked two ways: if the index path lost a row, these
@@ -323,6 +362,10 @@ same_both_ways "a key with no row" "SELECT ID FROM EMP WHERE ID = 4242"
 same_both_ways "a lookup a second predicate narrows" \
                "SELECT ID FROM EMP WHERE ID = 6 AND SALARY = 200"
 same_both_ways "the whole table" "SELECT ID, SALARY FROM EMP ORDER BY ID"
+same_both_ways "a range" "SELECT ID FROM EMP WHERE ID > 2 AND ID <= 5 ORDER BY ID"
+same_both_ways "a range with NULLs below it" \
+               "SELECT ID FROM EMP WHERE DEPT_ID < 3 ORDER BY ID"
+same_both_ways "an empty range" "SELECT ID FROM EMP WHERE ID > 9 AND ID < 2"
 # and the switch really did switch it off
 ran=$((ran + 1))
 if [ "$(grep -c 'index scan:' "$LOG2" 2>/dev/null || true)" -eq 0 ]; then
@@ -333,8 +376,8 @@ else
 fi
 
 rm -f "$A" "$B"
-if [ "$ran" -lt 60 ]; then
-    echo "DIFF only $ran checks ran (expected at least 60) - did one silently skip?"
+if [ "$ran" -lt 90 ]; then
+    echo "DIFF only $ran checks ran (expected at least 90) - did one silently skip?"
     fail=1
 fi
 exit $fail

@@ -99,7 +99,7 @@ it", which is a different risk profile from converting something new:
 the oracle already exists, so the gate is *behaviour must not change*
 plus *the subsystem is now on the path*.
 
-- **W1 — index-driven retrieval.** *(equality lookup done)* The first
+- **W1 — index-driven retrieval.** *(equality and ranges done)* The first
   slice that put a converted subsystem on the running server's path.
   `crates/wire/Cargo.toml` now depends on `fire-crab-opt`, and **opt
   makes the choice**: `plan_query` is asked about the statement, and only
@@ -107,11 +107,15 @@ plus *the subsystem is now on the path*.
   (`btr::lookup_key`, new) instead of scanning. The predicate above the
   leaf is unchanged, so an index narrows what is READ and never what is
   ANSWERED.
-  - Scope so far: a single-segment integer index at scale 0 against an
-    integer literal, on the projection's retrieval. A key this cannot
+  - Scope so far: a single-segment integer index at scale 0, on the
+    projection's retrieval — equality and RANGES (`>`, `>=`, `<`, `<=`,
+    `BETWEEN`), including descending indexes (their keys are
+    complemented, so the bounds swap) and multiple bounds on one column
+    (a conjunction narrows). A key this cannot
     build byte-exactly would be a MISSED ROW rather than a refusal,
     which is why the mechanics are narrow and everything else scans.
-  - Still to do: ranges, `ORDER BY` via navigation, index-driven joins,
+  - Still to do: `ORDER BY` via navigation (the index is used for the
+    range but the sort still runs), index-driven joins,
     the aggregate's own walk (it has a separate retrieval), text keys
     (a collation makes the key a collation key), compound prefixes, and
     parameters (their values arrive after the plan is built).

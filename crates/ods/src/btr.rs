@@ -346,6 +346,47 @@ pub fn lookup_key(
     index_id: u8,
     key: &[u8],
 ) -> Option<Vec<u64>> {
+    lookup_range(
+        file,
+        page_size,
+        relation,
+        index_id,
+        Some((key, true)),
+        Some((key, true)),
+    )
+}
+
+/// Descend to `lo` and walk the leaf level to `hi`, collecting record
+/// numbers - the retrieval half of `BTR_lookup`/`BTR_find_page`
+/// (btr.cpp), where `walk_index_leaves` is the whole-level walk.
+///
+/// Each bound is `(key, inclusive)`; `None` means unbounded on that
+/// side. An EQUALITY is the degenerate case where both bounds are the
+/// same key, inclusive, which is why there is one function here rather
+/// than two - the descent and the stop condition are the part that is
+/// easy to get subtly wrong.
+///
+/// This is what makes a retrieval INDEX-DRIVEN rather than a scan: the
+/// tree is descended once per level, and only the leaf pages inside the
+/// range are read. What it returns is a set of CANDIDATES, never an
+/// answer: index entries survive the rows they describe (an UPDATE adds
+/// the new key and leaves the old one for garbage collection, a DELETE
+/// removes nothing), so the caller must fetch each record and apply the
+/// predicate. That is the engine's own arrangement, and it is why a
+/// stale entry costs a wasted fetch rather than a wrong row.
+///
+/// The key encoding is ORDER-PRESERVING (that is what `compress` is
+/// for), so a byte range IS a value range - for an ASCENDING index. A
+/// descending one complements its keys, so its caller must hand the
+/// bounds over already swapped.
+pub fn lookup_range(
+    file: &[u8],
+    page_size: usize,
+    relation: u16,
+    index_id: u8,
+    lo: Option<(&[u8], bool)>,
+    hi: Option<(&[u8], bool)>,
+) -> Option<Vec<u64>> {
     let root_no = find_index_root(file, page_size, relation)?
         .entry(index_id)?
         .root_page;
@@ -358,8 +399,10 @@ pub fn lookup_key(
     };
 
     // Descend: on each non-leaf page take the LAST node whose key is
-    // <= the target (the leftmost node otherwise), which is the child
-    // whose range can hold it.
+    // <= the lower bound (the leftmost node otherwise), which is the
+    // child whose range can hold it. With no lower bound the descent is
+    // down the leftmost spine, which is where `walk_index_leaves`
+    // starts too.
     let mut page = get(root_no)?;
     while page.level > 0 {
         let bytes = page.bytes();
@@ -368,19 +411,17 @@ pub fn lookup_key(
         let mut chosen: Option<u32> = None;
         loop {
             let node = read_node(bytes, at, false)?;
-            if node.is_end_level {
-                break;
-            }
-            if node.is_end_bucket {
-                // the level continues on the sibling; if nothing on
-                // this page was <= the key, the sibling's first node
-                // is where the search goes on
+            if node.is_end_level || node.is_end_bucket {
                 break;
             }
             node_key.truncate(node.prefix as usize);
             node_key.extend_from_slice(&bytes[node.data_at..node.data_at + node.length as usize]);
-            if chosen.is_some() && node_key.as_slice() > key {
-                break;
+            if let Some((lo_key, _)) = lo {
+                if chosen.is_some() && node_key.as_slice() > lo_key {
+                    break;
+                }
+            } else if chosen.is_some() {
+                break; // unbounded below: the leftmost child
             }
             chosen = Some(node.page_number);
             at = node.next_at;
@@ -395,8 +436,8 @@ pub fn lookup_key(
         }
     }
 
-    // Scan the leaf level from here, collecting equal keys and stopping
-    // at the first key greater than the target.
+    // Walk the leaf level, keeping what the bounds admit and stopping
+    // at the first key past the upper one.
     let mut out = Vec::new();
     let mut leaf_key: Vec<u8> = Vec::new();
     loop {
@@ -412,10 +453,26 @@ pub fn lookup_key(
             }
             leaf_key.truncate(node.prefix as usize);
             leaf_key.extend_from_slice(&bytes[node.data_at..node.data_at + node.length as usize]);
-            match leaf_key.as_slice().cmp(key) {
-                std::cmp::Ordering::Less => {}
-                std::cmp::Ordering::Equal => out.push(node.record_number),
-                std::cmp::Ordering::Greater => return Some(out),
+            if let Some((hi_key, incl)) = hi {
+                let past = match leaf_key.as_slice().cmp(hi_key) {
+                    std::cmp::Ordering::Greater => true,
+                    std::cmp::Ordering::Equal => !incl,
+                    std::cmp::Ordering::Less => false,
+                };
+                if past {
+                    return Some(out);
+                }
+            }
+            let admitted = match lo {
+                None => true,
+                Some((lo_key, incl)) => match leaf_key.as_slice().cmp(lo_key) {
+                    std::cmp::Ordering::Less => false,
+                    std::cmp::Ordering::Equal => incl,
+                    std::cmp::Ordering::Greater => true,
+                },
+            };
+            if admitted {
+                out.push(node.record_number);
             }
             at = node.next_at;
         }
@@ -475,6 +532,64 @@ mod tests {
         let all = walk_index_leaves(&file, page_size, rel, 0).unwrap();
         assert_eq!(all.len(), 5);
         assert_eq!(all.first().map(|(_, r)| *r), Some(10));
+    }
+
+    /// The RANGE half, on the same writer-built tree: each bound is
+    /// optional and each carries its own inclusivity, which is exactly
+    /// where an off-by-one row lives.
+    #[test]
+    fn lookup_range_respects_both_bounds() {
+        let page_size = 1024usize;
+        let rel = 128u16;
+        let mut file = vec![0u8; page_size * 8];
+        file[page_size] = PageType::IndexRoot as u8;
+        file[page_size + 16..page_size + 18].copy_from_slice(&rel.to_le_bytes());
+        file[page_size + 18..page_size + 20].copy_from_slice(&1u16.to_le_bytes());
+        let entry_at = page_size + 24;
+        file[entry_at + 8..entry_at + 12].copy_from_slice(&2u32.to_le_bytes());
+        file[entry_at + 20] = IRT_NORMAL;
+        crate::btw::write_empty_root(&mut file, page_size, 2, rel, 0).unwrap();
+
+        let key = |n: u8| vec![0xC0, n];
+        for n in [1u8, 3, 5, 7, 9] {
+            crate::btw::insert_index_entry(
+                &mut file, page_size, rel, 0, &key(n), n as u64 * 10, false,
+            )
+            .unwrap();
+        }
+        let range = |lo: Option<(u8, bool)>, hi: Option<(u8, bool)>| {
+            let lk = lo.map(|(n, i)| (key(n), i));
+            let hk = hi.map(|(n, i)| (key(n), i));
+            lookup_range(
+                &file,
+                page_size,
+                rel,
+                0,
+                lk.as_ref().map(|(k, i)| (k.as_slice(), *i)),
+                hk.as_ref().map(|(k, i)| (k.as_slice(), *i)),
+            )
+            .unwrap()
+        };
+
+        // inclusivity, one bound at a time
+        assert_eq!(range(Some((5, true)), None), vec![50, 70, 90]);
+        assert_eq!(range(Some((5, false)), None), vec![70, 90]);
+        assert_eq!(range(None, Some((5, true))), vec![10, 30, 50]);
+        assert_eq!(range(None, Some((5, false))), vec![10, 30]);
+        // both bounds, and a bound that falls BETWEEN two keys
+        assert_eq!(range(Some((3, true)), Some((7, true))), vec![30, 50, 70]);
+        assert_eq!(range(Some((4, true)), Some((6, true))), vec![50]);
+        // unbounded both ways is the whole level
+        assert_eq!(range(None, None), vec![10, 30, 50, 70, 90]);
+        // past the ends, and CROSSED bounds - an empty answer, not a
+        // wrapped one
+        assert_eq!(range(Some((9, false)), None), Vec::<u64>::new());
+        assert_eq!(range(None, Some((1, false))), Vec::<u64>::new());
+        assert_eq!(range(Some((7, true)), Some((3, true))), Vec::<u64>::new());
+        // and an equality is the degenerate range, which is what
+        // `lookup_key` asks for
+        assert_eq!(range(Some((5, true)), Some((5, true))), vec![50]);
+        assert_eq!(lookup_key(&file, page_size, rel, 0, &key(5)), Some(vec![50]));
     }
 
     /// Every slot with a root page carries entries, whatever its state

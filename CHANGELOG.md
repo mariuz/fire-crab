@@ -13,6 +13,45 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — W1b: ranges, and the bound that was never asked for
+
+### Converted
+- **`btr::lookup_range`** — one descent, then a forward walk to the
+  upper bound. Each bound is optional and carries its own inclusivity,
+  so `>`, `>=`, `<`, `<=` and `BETWEEN` are one code path. `lookup_key`
+  is now the degenerate case where both bounds are the same key,
+  inclusive: the descent and the stop condition are the part that is
+  easy to get subtly wrong, and there is one of each.
+- **A conjunction NARROWS**, so several comparisons on one column
+  combine into a single range: `ID >= 2 AND ID >= 4` starts at 4, and an
+  equality beside a range collapses to a point.
+- **A DESCENDING index is served by swapping the bounds.** Its keys are
+  complemented, so the tree's byte order is the reverse of the value
+  order — and `key_for` has already complemented the bytes, which makes
+  the swap the whole adjustment.
+
+### Fixed
+- **Every range on a primary key was still scanning.** `opt` answers
+  `Access::Order` — not `Access::Index` — when an index NAVIGATES the
+  `ORDER BY`, and `SELECT ... WHERE ID > 3 ORDER BY ID` is exactly that.
+  So the shape that most obviously wants an index was the one shape
+  refusing it, while `WHERE DEPT_ID > 3 ORDER BY ID` used one, purely
+  because its ORDER BY named a different index. Both answers mean "an
+  index serves this"; the retrieval half is taken and the sort still
+  runs above it.
+
+### Guarded
+- A column with NULLs under an upper-bounded range: NULLs are stored as
+  a **zero-length key**, which sorts before every value, so the range
+  sweeps them up as candidates and the predicate throws them out. A
+  wasted fetch, never a wrong row — the same property the whole slice
+  rests on, gated explicitly.
+
+`qa/serve-real-index.sh` grows to 125 checks (17 of them ranges, plus
+the index-vs-scan-vs-engine equivalence over a range, a range with NULLs
+below it, and an empty one). 48 gates and 369 unit tests confirm nothing
+moved.
+
 ## 2026-07-31 — W1: the first index-driven retrieval
 
 Programme W begins. Every query here was a full scan; a converted
