@@ -1585,7 +1585,7 @@ enum AggFn {
 }
 
 /// What an aggregate is computed over.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 enum AggTarget {
     Star,
     Col(String),
@@ -11812,7 +11812,15 @@ fn plan_query_inner(
         Proj::Items(items) => items,
     };
 
-    let has_agg = items.iter().any(|i| matches!(i, SelItem::Agg(..)));
+    // An aggregate inside an EXPRESSION (`SUM(A) + 1`) makes the query a
+    // grouped one exactly as a bare aggregate item does - with no GROUP
+    // BY it is the single global group, which is what the engine
+    // computes for `SELECT SUM(A) + 1 FROM T`.
+    let has_agg = items.iter().any(|i| match i {
+        SelItem::Agg(..) => true,
+        SelItem::Expr(raw, _) => raw_has_agg(raw),
+        _ => false,
+    });
     let has_gen = items.iter().any(|i| matches!(i, SelItem::Gen(..)));
     // a generator advance in the select list needs the row-by-row Project
     // path; a grouped/aggregated query with one is not a shape we answer
@@ -11977,6 +11985,217 @@ fn plan_query_inner(
 /// expression item must BE one of the expression keys, an aggregate's
 /// output type follows its function and source) live here once.
 #[allow(clippy::too_many_arguments)]
+/// The DESCRIPTOR of an aggregate's result - what the group row holds in
+/// that slot, so an expression built over it types like any column.
+///
+/// The rules are the probed ones the select-list aggregate items already
+/// follow: COUNT is BIGINT; MIN/MAX keep the source's own type; SUM
+/// widens ONE STEP (a LONG source folds to BIGINT, an INT64-ranked one
+/// to INT128) and AVG stays at BIGINT width unless the source is already
+/// INT128 - both keeping the source's SCALE.
+fn agg_result_desc(
+    func: AggFn,
+    target: &AggTarget,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+) -> Option<Descriptor> {
+    // A SYNTHETIC descriptor may not carry offset 0: `is_computed_fid`
+    // reads `offset == 0 && length != 0` as "this is a COMPUTED column",
+    // so a freshly built descriptor is indistinguishable from one - and
+    // every expression naming that slot then refuses. The offset is
+    // never used here (a group-row slot is read by INDEX, not decoded
+    // from record bytes), so any non-zero value says "a real field".
+    let int64 = |scale: i8| Descriptor {
+        dtype: dtype::INT64,
+        scale,
+        length: 8,
+        sub_type: 0,
+        flags: 0,
+        offset: 1,
+    };
+    if matches!(func, AggFn::Count) {
+        return Some(int64(0));
+    }
+    // only a plain column source is folded inside an expression; a
+    // DISTINCT or an expression argument there is a later slice, and a
+    // refusal beats a guess at its type
+    let name = match target {
+        AggTarget::Col(n) => n,
+        _ => return None,
+    };
+    let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+    let d = descs.get(rc.field_id as usize)?;
+    if is_computed_fid(descs, rc.field_id as usize) {
+        return None;
+    }
+    Some(match func {
+        AggFn::Count => int64(0),
+        AggFn::Min | AggFn::Max => d.clone(),
+        AggFn::Sum => match d.dtype {
+            dtype::SHORT | dtype::LONG => int64(d.scale),
+            dtype::INT64 | dtype::INT128 => Descriptor {
+                dtype: dtype::INT128,
+                scale: d.scale,
+                length: 16,
+                sub_type: 0,
+                flags: 0,
+                offset: 1,
+            },
+            _ => return None, // approximate and temporal folds: not here
+        },
+        AggFn::Avg => match d.dtype {
+            dtype::SHORT | dtype::LONG | dtype::INT64 => int64(d.scale),
+            dtype::INT128 => Descriptor {
+                dtype: dtype::INT128,
+                scale: d.scale,
+                length: 16,
+                sub_type: 0,
+                flags: 0,
+                offset: 1,
+            },
+            _ => return None,
+        },
+    })
+}
+
+/// The name an aggregate's group-row slot answers to while an expression
+/// over it is resolved. `\0` cannot start a real identifier, so these
+/// never collide with a column.
+fn agg_slot_name(slot: usize) -> String {
+    format!("\u{0}agg{}", slot)
+}
+
+/// Does this expression contain an AGGREGATE anywhere?
+fn raw_has_agg(e: &RawExpr) -> bool {
+    !collect_aggs(e).is_empty()
+}
+
+/// Every AGGREGATE in an expression, in left-to-right order, with
+/// duplicates kept (`SUM(A) + SUM(A)` folds once but reads twice - the
+/// caller dedupes).
+fn collect_aggs(e: &RawExpr) -> Vec<(AggFn, AggTarget)> {
+    let mut out = Vec::new();
+    walk_aggs(e, &mut out);
+    out
+}
+
+fn walk_aggs(e: &RawExpr, out: &mut Vec<(AggFn, AggTarget)>) {
+    match e {
+        RawExpr::Agg(f, t) => out.push((*f, (**t).clone())),
+        RawExpr::Neg(a) => walk_aggs(a, out),
+        RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => {
+            walk_aggs(a, out);
+            walk_aggs(b, out);
+        }
+        RawExpr::Cast(a, _) => walk_aggs(a, out),
+        RawExpr::Coalesce(v) | RawExpr::Func(_, v) => {
+            for a in v {
+                walk_aggs(a, out);
+            }
+        }
+        RawExpr::Iif(c, a, b) => {
+            walk_cond_aggs(c, out);
+            walk_aggs(a, out);
+            walk_aggs(b, out);
+        }
+        RawExpr::Case(branches, else_) => {
+            for (c, t) in branches {
+                walk_cond_aggs(c, out);
+                walk_aggs(t, out);
+            }
+            if let Some(e) = else_ {
+                walk_aggs(e, out);
+            }
+        }
+        RawExpr::Cond(c) => walk_cond_aggs(c, out),
+        _ => {}
+    }
+}
+
+/// The same walk through a CONDITION - `CASE WHEN COUNT(*) > 2 THEN ...`
+/// puts an aggregate inside the condition rather than the branches.
+fn walk_cond_aggs(c: &RawCond, out: &mut Vec<(AggFn, AggTarget)>) {
+    match c {
+        RawCond::Cmp(a, _, b) => {
+            walk_aggs(a, out);
+            walk_aggs(b, out);
+        }
+        RawCond::IsNull(a) | RawCond::IsNotNull(a) | RawCond::Like(a, _, _, _) => {
+            walk_aggs(a, out)
+        }
+        RawCond::Not(a) => walk_cond_aggs(a, out),
+        RawCond::And(v) | RawCond::Or(v) => {
+            for x in v {
+                walk_cond_aggs(x, out);
+            }
+        }
+    }
+}
+
+/// Replace every AGGREGATE leaf with a column reference, taking the name
+/// for each from `slot_of` - which is what turns an expression over a
+/// GROUP into an ordinary expression over the group's computed row.
+fn substitute_aggs(e: &RawExpr, slot_of: &dyn Fn(&AggFn, &AggTarget) -> Option<String>) -> Option<RawExpr> {
+    let sub = |x: &RawExpr| substitute_aggs(x, slot_of);
+    let subb = |x: &RawExpr| sub(x).map(Box::new);
+    Some(match e {
+        RawExpr::Agg(f, t) => RawExpr::Col(slot_of(f, t)?),
+        RawExpr::Neg(a) => RawExpr::Neg(subb(a)?),
+        RawExpr::Bin(a, op, b) => RawExpr::Bin(subb(a)?, *op, subb(b)?),
+        RawExpr::Concat(a, b) => RawExpr::Concat(subb(a)?, subb(b)?),
+        RawExpr::NullIf(a, b) => RawExpr::NullIf(subb(a)?, subb(b)?),
+        RawExpr::Cast(a, t) => RawExpr::Cast(subb(a)?, *t),
+        RawExpr::Coalesce(v) => {
+            RawExpr::Coalesce(v.iter().map(sub).collect::<Option<Vec<_>>>()?)
+        }
+        RawExpr::Func(f, v) => {
+            RawExpr::Func(*f, v.iter().map(sub).collect::<Option<Vec<_>>>()?)
+        }
+        RawExpr::Iif(c, a, b) => RawExpr::Iif(
+            Box::new(substitute_cond_aggs(c, slot_of)?),
+            subb(a)?,
+            subb(b)?,
+        ),
+        RawExpr::Case(branches, else_) => RawExpr::Case(
+            branches
+                .iter()
+                .map(|(c, t)| Some((substitute_cond_aggs(c, slot_of)?, sub(t)?)))
+                .collect::<Option<Vec<_>>>()?,
+            match else_ {
+                None => None,
+                Some(x) => Some(subb(x)?),
+            },
+        ),
+        RawExpr::Cond(c) => RawExpr::Cond(Box::new(substitute_cond_aggs(c, slot_of)?)),
+        other => other.clone(),
+    })
+}
+
+fn substitute_cond_aggs(
+    c: &RawCond,
+    slot_of: &dyn Fn(&AggFn, &AggTarget) -> Option<String>,
+) -> Option<RawCond> {
+    let sub = |x: &RawExpr| substitute_aggs(x, slot_of);
+    let subb = |x: &RawExpr| sub(x).map(Box::new);
+    Some(match c {
+        RawCond::Cmp(a, op, b) => RawCond::Cmp(subb(a)?, *op, subb(b)?),
+        RawCond::IsNull(a) => RawCond::IsNull(subb(a)?),
+        RawCond::IsNotNull(a) => RawCond::IsNotNull(subb(a)?),
+        RawCond::Like(a, p, e, n) => RawCond::Like(subb(a)?, p.clone(), *e, *n),
+        RawCond::Not(a) => RawCond::Not(Box::new(substitute_cond_aggs(a, slot_of)?)),
+        RawCond::And(v) => RawCond::And(
+            v.iter()
+                .map(|x| substitute_cond_aggs(x, slot_of))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        RawCond::Or(v) => RawCond::Or(
+            v.iter()
+                .map(|x| substitute_cond_aggs(x, slot_of))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+    })
+}
+
 fn build_group_items(
     items: &[SelItem],
     columns: &[RelationColumn],
@@ -11987,12 +12206,50 @@ fn build_group_items(
 ) -> Option<(Vec<ProjCol>, Vec<GItem>)> {
     let mut gitems = Vec::new();
     let mut cols = Vec::new();
+    // the descriptor each group-row slot holds, so a second pass can
+    // type an expression built over those slots
+    let mut slot_descs: Vec<Option<Descriptor>> = Vec::new();
+    let mut deferred: Vec<(usize, RawExpr, String)> = Vec::new();
     for (out_idx, item) in items.iter().enumerate() {
         match item {
             // an expression select item must BE one of the group's
             // expression keys (matched structurally); anything else is
             // the engine's "not contained in an aggregate or the GROUP
             // BY clause" - refuse
+            // an expression CONTAINING an aggregate is neither a group
+            // key nor a bare aggregate: its aggregates each become a
+            // slot of the group row, and the expression is then an
+            // ordinary expression OVER that row. Deferred to a second
+            // pass, because the row's shape is not known until every
+            // item has claimed its slot.
+            SelItem::Expr(raw, name) if raw_has_agg(raw) => {
+                let aggs = collect_aggs(raw);
+                let (f, t) = aggs.first()?.clone();
+                let d = agg_result_desc(f, &t, columns, descs)?;
+                let src = match &t {
+                    AggTarget::Star => AggSrc::Star,
+                    AggTarget::Col(n) => {
+                        let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(n))?;
+                        AggSrc::Field(rc.field_id as usize)
+                    }
+                    _ => return None,
+                };
+                // the item's OWN slot holds its first aggregate; any
+                // further ones are appended after the loop
+                gitems.push(GItem::Agg(f, src, false));
+                slot_descs.push(Some(d));
+                deferred.push((out_idx, raw.clone(), name.clone()));
+                cols.push(ProjCol {
+                    name: name.clone(),
+                    field_id: out_idx,
+                    wire: Wire::Int64,
+                    sql_type: 581,
+                    length: 8,
+                    scale: 0,
+                    sub_type: 0,
+                    expr: None,
+                });
+            }
             SelItem::Expr(raw, name) => {
                 let pos = {
                     let n = normalize_raw(raw);
@@ -12013,6 +12270,7 @@ fn build_group_items(
                     expr: None,
                 });
                 gitems.push(GItem::Key(synth_base + pos));
+                slot_descs.push(None); // an expression key: not addressable by name
             }
             SelItem::Gen(..) => return None,  // generator advances need the Project path
             SelItem::Col(name, alias) => {
@@ -12042,6 +12300,7 @@ fn build_group_items(
                     expr: None,
                 });
                 gitems.push(GItem::Key(fid));
+                slot_descs.push(descs.get(fid).cloned());
             }
             SelItem::Agg(func, target, agg_alias) => {
                 let (src, distinct) = match target {
@@ -12187,6 +12446,98 @@ fn build_group_items(
             }
         }
     }
+    // ---- second pass: the expressions that fold aggregates ----------
+    if !deferred.is_empty() {
+        // every GROUPED COLUMN gets a slot, so an expression may name it
+        // (`SELECT DEPT_ID + SUM(SALARY) ... GROUP BY DEPT_ID` selects no
+        // bare DEPT_ID, so nothing has claimed one yet)
+        for fid in key_fids {
+            if !gitems
+                .iter()
+                .any(|g| matches!(g, GItem::Key(f) if f == fid))
+            {
+                gitems.push(GItem::Key(*fid));
+                slot_descs.push(descs.get(*fid).cloned());
+            }
+        }
+        for (out_idx, raw, name) in &deferred {
+            let aggs = collect_aggs(raw);
+            // the first aggregate lives in the item's own slot; the rest
+            // are appended as hidden folds
+            let mut names: Vec<(AggFn, AggTarget, String)> = Vec::new();
+            for (i, (f, t)) in aggs.iter().enumerate() {
+                let slot = if i == 0 {
+                    *out_idx
+                } else {
+                    let d = agg_result_desc(*f, t, columns, descs)?;
+                    let src = match t {
+                        AggTarget::Star => AggSrc::Star,
+                        AggTarget::Col(n) => {
+                            let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(n))?;
+                            AggSrc::Field(rc.field_id as usize)
+                        }
+                        _ => return None,
+                    };
+                    gitems.push(GItem::Agg(*f, src, false));
+                    slot_descs.push(Some(d));
+                    gitems.len() - 1
+                };
+                names.push((*f, t.clone(), agg_slot_name(slot)));
+            }
+            // a SYNTHETIC single-relation view of the GROUP ROW: each
+            // slot is a column, aggregates under generated names and
+            // grouped keys under their own. It is the same trick the
+            // join uses to run the ordinary expression resolver over a
+            // combined row.
+            let mut synth_cols: Vec<RelationColumn> = Vec::new();
+            let mut synth_descs: Vec<Descriptor> = Vec::new();
+            for (slot, gi) in gitems.iter().enumerate() {
+                let d = slot_descs.get(slot).cloned().flatten().unwrap_or(Descriptor {
+                    dtype: 0,
+                    scale: 0,
+                    length: 0,
+                    sub_type: 0,
+                    flags: 0,
+                    offset: 0,
+                });
+                if synth_descs.len() <= slot {
+                    synth_descs.resize(slot + 1, d.clone());
+                }
+                synth_descs[slot] = d;
+                let nm = match gi {
+                    GItem::Key(f) if *f < synth_base => columns
+                        .iter()
+                        .find(|c| c.field_id as usize == *f)
+                        .map(|c| c.name.clone()),
+                    GItem::Agg(..) => Some(agg_slot_name(slot)),
+                    _ => None,
+                };
+                if let Some(nm) = nm {
+                    synth_cols.push(RelationColumn {
+                        name: nm,
+                        field_id: slot as u16,
+                        position: slot as u16,
+                    });
+                }
+            }
+            let subbed = substitute_aggs(raw, &|f: &AggFn, t: &AggTarget| {
+                names
+                    .iter()
+                    .find(|(nf, nt, _)| nf == f && nt == t)
+                    .map(|(_, _, n)| n.clone())
+            })?;
+            let pc = build_expr_col(&subbed, name, &synth_cols, &synth_descs)?;
+            let col = cols.get_mut(*out_idx)?;
+            col.name = pc.name;
+            col.wire = pc.wire;
+            col.sql_type = pc.sql_type;
+            col.length = pc.length;
+            col.scale = pc.scale;
+            col.sub_type = pc.sub_type;
+            // the VALUE is computed from the group row by this expression
+            col.expr = Some(resolve_expr(&subbed, &synth_cols, &synth_descs)?);
+        }
+    }
     Some((cols, gitems))
 }
 
@@ -12258,13 +12609,18 @@ fn plan_group(
             if let Some(c) = cols.iter().find(|c| c.name.eq_ignore_ascii_case(n)) {
                 return Some(c.field_id);
             }
-            // the key's own column name, for an output column that was
-            // renamed by an alias
-            cols.iter().zip(gitems.iter()).find_map(|(c, g)| match g {
+            // The key's own column name - for an output column the select
+            // list renamed, and for a key that has a group-row SLOT but
+            // no output column at all (an expression item over an
+            // aggregate makes such hidden slots). An order key indexes
+            // the GROUP ROW, so the answer is the slot's own index; the
+            // earlier form paired `cols` with `gitems`, which cannot
+            // reach a slot past the last output column.
+            gitems.iter().enumerate().find_map(|(slot, g)| match g {
                 GItem::Key(fid) => columns
                     .iter()
                     .find(|rc| rc.field_id as usize == *fid && rc.name.eq_ignore_ascii_case(n))
-                    .map(|_| c.field_id),
+                    .map(|_| slot),
                 _ => None,
             })
         })?,
@@ -14352,6 +14708,14 @@ enum RawExpr {
     /// `COALESCE(a, b, ...)` - the first operand that is not NULL, or
     /// NULL when they all are. Two or more operands.
     Coalesce(Vec<RawExpr>),
+    /// An AGGREGATE inside an expression - `SUM(A) + 1`,
+    /// `MAX(A) - MIN(A)`, `CAST(SUM(A) AS VARCHAR(10))`. It is a LEAF of
+    /// the expression grammar and NOT resolvable on its own: an
+    /// aggregate has no value for a row, only for a GROUP. The group
+    /// planner replaces each one with a reference to the group row's
+    /// slot that holds its fold, and only then is the surrounding
+    /// expression an ordinary expression.
+    Agg(AggFn, Box<AggTarget>),
     /// `NULLIF(a, b)` - NULL when the two are equal, otherwise `a`.
     NullIf(Box<RawExpr>, Box<RawExpr>),
     /// `IIF(<cond>, a, b)` - `a` when the condition is TRUE, `b` when it
@@ -15129,6 +15493,34 @@ fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                 Some(node)
             } else if !quoted && word.eq_ignore_ascii_case("CASE") {
                 parse_case_tail(b, pos)
+            } else if !quoted && agg_named(&word) && {
+                skip_ws(b, pos);
+                b.get(*pos) == Some(&'(')
+            } {
+                // an AGGREGATE as an expression leaf: hand the whole
+                // `SUM(...)` span to the aggregate parser, which already
+                // knows DISTINCT, `*` and expression arguments
+                let open = *pos;
+                let mut depth = 0i32;
+                let mut end = None;
+                for (i, c) in b.iter().enumerate().skip(open) {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(i);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let end = end?;
+                let text: String = b[open..=end].iter().collect();
+                let (func, target) = parse_agg_item(&format!("{}{}", word, text))?;
+                *pos = end + 1;
+                Some(RawExpr::Agg(func, Box::new(target)))
             } else if !quoted && sysfn_named(&word).is_some() && {
                 skip_ws(b, pos);
                 b.get(*pos) == Some(&'(')
@@ -15165,6 +15557,12 @@ fn raw_bad_substring_len(e: &RawExpr) -> Option<i64> {
     };
     let walk_all = |args: &[RawExpr]| args.iter().find_map(raw_bad_substring_len);
     match e {
+        // an aggregate's ARGUMENT is an expression too, so a bad literal
+        // length inside `SUM(SUBSTRING(...))` fails the prepare as well
+        RawExpr::Agg(_, t) => match &**t {
+            AggTarget::Expr(inner) => raw_bad_substring_len(inner),
+            _ => None,
+        },
         RawExpr::Func(SysFn::Substring, args) => args
             .get(2)
             .and_then(neg_literal)
@@ -15700,6 +16098,11 @@ fn resolve_expr(
     descs: &[Descriptor],
 ) -> Option<Expr> {
     Some(match raw {
+        // An AGGREGATE is not resolvable per row - it has a value for a
+        // GROUP, not for a record. The group planner rewrites each one
+        // into a reference to the group row's slot BEFORE this runs, so
+        // arriving here means there is no grouping to take it from.
+        RawExpr::Agg(..) => return None,
         RawExpr::Col(name) => {
             let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
             let fid = rc.field_id as usize;
@@ -18329,6 +18732,16 @@ fn split_query(
 /// Parse one select-list item as an aggregate: `COUNT(*)`, `COUNT(col)`,
 /// `MIN|MAX|SUM(col)` (spacing-tolerant). None if it is not an aggregate
 /// or is malformed (`MIN(*)`).
+/// Is this word one of the aggregate functions? (The expression parser
+/// asks before treating a `name(` as a call, since an aggregate is a
+/// LEAF there rather than a scalar function.)
+fn agg_named(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "COUNT" | "MIN" | "MAX" | "SUM" | "AVG"
+    )
+}
+
 fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
     let t = item.trim();
     let open = t.find('(')?;
@@ -18570,6 +18983,13 @@ fn split_alias(item: &str) -> (&str, Option<&str>) {
 /// value alias it).
 fn default_expr_name(raw: &RawExpr) -> String {
     match raw {
+        // a lone aggregate is described by its FUNCTION name - the same
+        // law the select list's own aggregate items follow
+        RawExpr::Agg(AggFn::Count, _) => "COUNT",
+        RawExpr::Agg(AggFn::Min, _) => "MIN",
+        RawExpr::Agg(AggFn::Max, _) => "MAX",
+        RawExpr::Agg(AggFn::Sum, _) => "SUM",
+        RawExpr::Agg(AggFn::Avg, _) => "AVG",
         RawExpr::Bin(_, ArithOp::Add, _) => "ADD",
         RawExpr::Bin(_, ArithOp::Sub, _) => "SUBTRACT",
         RawExpr::Bin(_, ArithOp::Mul, _) => "MULTIPLY",
@@ -18698,8 +19118,14 @@ fn parse_order_by_expr(
             // has no field to sort on, so ORDER BY that ordinal is not
             // something this server answers (fall back rather than sort
             // by the dummy field id)
-            if cols[ord - 1].expr.is_some() {
-                return None;
+            // A COMPUTED output column has no field of its own to sort
+            // by - its `field_id` is a placeholder - so the key becomes
+            // that column's OWN EXPRESSION, evaluated per row by
+            // `sort_rows`. This used to refuse, which was right only
+            // while nothing evaluated expression keys.
+            if let Some(e) = &cols[ord - 1].expr {
+                keys.push(OrderKey { field: 0, expr: Some(e.clone()), desc, nulls });
+                continue;
             }
             cols[ord - 1].field_id
         } else {
@@ -18710,9 +19136,13 @@ fn parse_order_by_expr(
             match resolve_name(name) {
                 Some(fid) => fid,
                 None => {
-                    let c = cols
-                        .iter()
-                        .find(|c| c.name.eq_ignore_ascii_case(name) && c.expr.is_none())?;
+                    let c = cols.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+                    // the same rule as the ordinal above: an aliased
+                    // EXPRESSION sorts by the expression it names
+                    if let Some(e) = &c.expr {
+                        keys.push(OrderKey { field: 0, expr: Some(e.clone()), desc, nulls });
+                        continue;
+                    }
                     c.field_id
                 }
             }
@@ -24118,6 +24548,60 @@ pub fn serve(addr: &str, user: &str, password: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_synthetic_descriptor_must_not_look_computed() {
+        // `is_computed_fid` reads `offset == 0 && length != 0` as "this
+        // is a COMPUTED column". A freshly built descriptor defaults its
+        // offset to 0, so every aggregate slot typed that way was read
+        // as computed and every expression naming it refused - visible
+        // only for SUM/COUNT/AVG, because MIN and MAX clone the SOURCE
+        // column's descriptor and inherit its real offset.
+        let cols = vec![RelationColumn {
+            name: "SALARY".into(),
+            field_id: 0,
+            position: 0,
+        }];
+        let descs = vec![Descriptor {
+            dtype: dtype::LONG,
+            scale: 0,
+            length: 4,
+            sub_type: 0,
+            flags: 0,
+            offset: 8,
+        }];
+        for f in [AggFn::Sum, AggFn::Avg, AggFn::Min, AggFn::Max] {
+            let d = agg_result_desc(f, &AggTarget::Col("SALARY".into()), &cols, &descs)
+                .expect("a plain column source folds");
+            assert!(d.offset != 0 || d.length == 0, "slot descriptor reads as COMPUTED");
+        }
+        let c = agg_result_desc(AggFn::Count, &AggTarget::Star, &cols, &descs).unwrap();
+        assert!(c.offset != 0);
+    }
+
+    #[test]
+    fn aggregates_are_found_anywhere_in_an_expression() {
+        let one = |t: &str| {
+            let b: Vec<char> = t.chars().collect();
+            let mut p = 0usize;
+            expr_add(&b, &mut p).unwrap()
+        };
+        // a bare aggregate, and one under each construct that can hold it
+        assert_eq!(collect_aggs(&one("SUM(A)")).len(), 1);
+        assert_eq!(collect_aggs(&one("SUM(A) + 1")).len(), 1);
+        assert_eq!(collect_aggs(&one("MAX(A) - MIN(A)")).len(), 2);
+        assert_eq!(collect_aggs(&one("CAST(SUM(A) AS BIGINT)")).len(), 1);
+        assert_eq!(collect_aggs(&one("COALESCE(MAX(A), 0)")).len(), 1);
+        // inside a CASE's CONDITION, not only its branches
+        assert_eq!(
+            collect_aggs(&one("CASE WHEN COUNT(*) > 2 THEN 1 ELSE 0 END")).len(),
+            1
+        );
+        // and an expression with none stays none
+        assert!(collect_aggs(&one("A + 1")).is_empty());
+        assert!(!raw_has_agg(&one("A + 1")));
+        assert!(raw_has_agg(&one("A + SUM(B)")));
+    }
 
     #[test]
     fn an_expression_sort_key_is_evaluated() {

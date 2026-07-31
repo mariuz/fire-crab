@@ -13,6 +13,57 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — an aggregate inside an expression
+
+### Converted
+- **`SUM(A) + 1`, `MAX(A) - MIN(A)`, `COUNT(*) * 2`, `CAST(SUM(A) AS
+  VARCHAR(10))`, `CASE WHEN COUNT(*) > 2 THEN ...`.** The select list
+  could hold an aggregate or an expression but never one INSIDE the
+  other: an aggregate was a select-list ITEM while an expression is a
+  TREE, and the tree had no leaf for a fold. Every such shape refused.
+- The conversion is one idea: **an aggregate is a leaf with no value for
+  a ROW, only for a GROUP.** Each one becomes a SLOT of the group row,
+  and the surrounding expression is then an ordinary expression over that
+  row — the same trick the join uses to run the ordinary expression
+  resolver over a combined row. With no GROUP BY the query is the single
+  global group, which is what makes `SELECT SUM(A) + 1 FROM T` one row.
+- Two aggregates in one expression need two slots, and the second is a
+  HIDDEN one appended past the output columns, so the group row is wider
+  than the select list. A grouped KEY inside the expression
+  (`DEPT_ID + SUM(SALARY)`) gets a slot too, though no output column
+  selects it.
+
+### Fixed
+- **`ORDER BY` a COMPUTED output column** — by alias or by ordinal — used
+  to refuse. A computed column has no field of its own to sort by, so its
+  `field_id` is a placeholder and sorting by it would be wrong; the
+  refusal was right *while nothing evaluated expression sort keys*, and
+  wrong the moment the previous increment made `sort_rows` live. The key
+  is now the column's OWN expression, on all three paths.
+- A grouped `ORDER BY` reached its keys by pairing output columns with
+  group-row slots, which cannot see a slot past the last output column —
+  exactly the hidden slots this increment introduces. It indexes the
+  group row directly now.
+
+### Guarded
+- `COUNT(DISTINCT c)` and an EXPRESSION argument (`SUM(A + 1)`) inside a
+  folded aggregate refuse: their result type is not derived here, and a
+  guessed type decodes as the wrong number rather than failing.
+
+`qa/serve-real-aggexpr2.sh` is new, 45 checks. Its department 2 has one
+employee, so `MAX - MIN` over it is 0 — the value a fold reading the
+wrong slot is least likely to produce by accident — and its salaries do
+not divide evenly by the row count, so `SUM/COUNT` shows the dialect-3
+truncation (650/4 is 162, not 163).
+
+**The bug worth naming**: a synthetic descriptor built for an aggregate's
+slot defaulted its `offset` to 0, and `is_computed_fid` reads
+`offset == 0 && length != 0` as "this is a COMPUTED column" — so every
+expression naming that slot refused. It was invisible for MIN and MAX,
+which clone the SOURCE column's descriptor and inherit its real offset,
+and failed for SUM, AVG and COUNT, which build a fresh one. A field whose
+zero value means something else is a field you cannot default.
+
 ## 2026-07-31 — the rest of the SELECT, over a join
 
 ### Converted

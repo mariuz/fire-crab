@@ -1419,6 +1419,30 @@ them.
   the old code path would produce - if you cannot construct that probe,
   you cannot tell the two apart.
 
+- **A field whose ZERO value means something else is a field you cannot
+  default.** Here `offset == 0 && length != 0` was the encoding for "this
+  is a computed column", so every freshly built descriptor - the natural
+  way to describe a synthetic slot - claimed to be one, and every
+  expression over it refused. Half the cases worked, because MIN and MAX
+  describe their result by CLONING the source column's descriptor and
+  inherit a real offset while SUM, AVG and COUNT build a fresh one. When
+  a struct doubles as a tagged union through a sentinel value, building
+  one from scratch is a decision, not a default.
+
+- **When half the cases work, the difference between the halves IS the
+  bug.** `MAX(A) - MIN(A)` answering while `SUM(A) + 1` refused looked
+  like a parser problem and was a descriptor problem. Before theorising,
+  enumerate what the working and failing sets have in common - the
+  partition is usually a single line of code, and it is rarely the line
+  you were editing.
+
+- **A refusal encodes an assumption about the rest of the system.** "Do
+  not sort by a computed column's placeholder field id" was correct while
+  nothing evaluated expression sort keys; one increment later that was no
+  longer true, and the refusal had become a missing feature. When you
+  make a capability real, grep for the refusals that existed BECAUSE it
+  was not.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

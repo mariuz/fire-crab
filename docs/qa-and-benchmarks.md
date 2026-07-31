@@ -7317,6 +7317,76 @@ node-firebird limit already documented here for joined text columns — so the
 twin has no oracle and isql is the reference instead. fire-crab's answer
 matches isql exactly.
 
+### An aggregate inside an expression (`qa/serve-real-aggexpr2.sh`, 45 checks)
+
+The select list could hold an aggregate (`SELECT SUM(A)`) or an expression
+(`SELECT A + 1`) but never one inside the other. The reason is structural
+rather than incidental: an aggregate was a select-list **item**, while an
+expression is a **tree**, and the tree had no leaf for a fold. So
+`SELECT COUNT(*) * 2 FROM T` — about as ordinary as SQL gets — refused.
+
+**The conversion is one idea.** An aggregate is a leaf that has no value for a
+ROW, only for a GROUP. So each one becomes a **slot of the group row**, and the
+expression around it is then an ordinary expression over that row — the same
+move the join makes when it runs the ordinary expression resolver over a
+combined row. A query with no GROUP BY is the single global group, which is
+what makes `SELECT SUM(A) + 1 FROM T` one row rather than none.
+
+Three consequences shape the code:
+
+- **Two aggregates need two slots.** `MAX(A) - MIN(A)` puts its first fold in
+  the item's own slot and appends the second as a HIDDEN slot past the output
+  columns, so the group row is wider than the select list.
+- **A grouped KEY inside the expression needs a slot too.**
+  `SELECT DEPT_ID + SUM(SALARY) ... GROUP BY DEPT_ID` selects no bare
+  `DEPT_ID`, so nothing has claimed one; the planner adds it.
+- **ORDER BY has to reach those hidden slots**, which is a different lookup
+  from "find the output column with that name". The grouped sort resolver
+  paired output columns with slots — a pairing that stops at the last output
+  column, precisely where the hidden ones begin. It indexes the group row
+  directly now.
+
+**The bug worth the retelling.** Once the machinery was in, `MAX(A) - MIN(A)`
+worked and `SUM(A) + 1` refused. Same code path, same shape, one works. The
+difference is that MIN and MAX describe their result by *cloning the source
+column's descriptor*, while SUM, AVG and COUNT *build a fresh one* — and a
+freshly built `Descriptor` defaults `offset` to 0. Meanwhile:
+
+```rust
+fn is_computed_fid(descs: &[Descriptor], fid: usize) -> bool {
+    matches!(descs.get(fid), Some(d) if d.offset == 0 && d.length != 0)
+}
+```
+
+An offset of zero is how this codebase says *computed column*. So every
+synthetic slot typed by SUM, AVG or COUNT read as a computed column, and the
+expression resolver — correctly, by its own rules — refused to evaluate it. The
+fix is one line (a non-zero offset, never used, since a group-row slot is read
+by index rather than decoded from record bytes) and the lesson is not: **a
+field whose zero value means something else is a field you cannot default.**
+MIN and MAX hid it by inheriting a real offset, which is why half the shapes
+worked and half did not.
+
+The fixture is built so wrong answers are visible rather than plausible:
+department 2 has exactly one employee, so its `MAX - MIN` is **0** — the value
+a fold that read the wrong slot is least likely to produce by accident — and
+the salaries do not divide evenly by the row count, so `SUM(SALARY)/COUNT(*)`
+shows dialect-3 integer truncation (650/4 is 162, not 163).
+
+**And the companion fix.** `ORDER BY` a computed output column, by alias or by
+ordinal, used to refuse:
+
+```rust
+// (before) fall back rather than sort by the dummy field id
+if cols[ord - 1].expr.is_some() { return None; }
+```
+
+That was right *while nothing evaluated expression sort keys* — and the
+previous increment made `sort_rows` live. The key is now the column's own
+expression, on the single-relation, grouped and join paths alike. The refusal
+and the fix are the same fact seen from either side of one increment, which is
+why a refusal is worth re-reading whenever the thing it was protecting changes.
+
 ## Benchmarks
 
 `bench/compare.sh <db.fdb>` runs both measurements below. Numbers from the
