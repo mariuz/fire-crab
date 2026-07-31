@@ -938,7 +938,7 @@ enum RowSource {
     IndexScan {
         rel: u16,
         formats: Vec<(u8, Vec<Descriptor>)>,
-        pick: IndexPick,
+        access: IndexAccess,
         width: Option<usize>,
     },
     /// the rows of `input` that satisfy `pred` (None keeps every row)
@@ -1015,9 +1015,9 @@ impl RowSource {
                 });
                 Ok(out)
             }
-            RowSource::IndexScan { rel, formats, pick, width } => {
+            RowSource::IndexScan { rel, formats, access, width } => {
                 let mut out = Vec::new();
-                for values in records_for(db, *rel, formats, pick) {
+                for values in records_for(db, *rel, formats, access) {
                     let mut row = values;
                     if let Some(w) = width {
                         row.resize(*w, Value::Null);
@@ -1109,9 +1109,9 @@ impl RowSource {
         formats: Vec<(u8, Vec<Descriptor>)>,
         pred: Option<Predicate>,
         keys: Vec<OrderKey>,
-        index: Option<IndexPick>,
+        index: Option<IndexAccess>,
     ) -> RowSource {
-        let navigate = index.as_ref().is_some_and(|p| p.navigate);
+        let navigate = index.as_ref().is_some_and(|a| a.navigate());
         // the LEAF is the optimizer's choice; everything above it is
         // the same tree either way, which is what makes "the answers do
         // not move" a property of the shape rather than a hope
@@ -1660,7 +1660,7 @@ AlterDomainRename {
         /// touches - a changed key must not leave child rows behind
         fk_children: Vec<FkPartner>,
         /// the access path for finding the rows to update
-        index: Option<IndexPick>,
+        index: Option<IndexAccess>,
     },
     /// `UPDATE OR INSERT INTO <t> (cols) VALUES (...) [MATCHING
     /// (cols)]`: the engine's own execution plan - try the update whose
@@ -1684,7 +1684,7 @@ AlterDomainRename {
         /// the access path for finding the rows to delete - a WRITE
         /// reads before it writes, and that read is a retrieval like
         /// any other
-        index: Option<IndexPick>,
+        index: Option<IndexAccess>,
     },
     Project {
         rel: u16,
@@ -1700,7 +1700,7 @@ AlterDomainRename {
         /// index-driven retrieval, or None for a full scan. The filter
         /// above it is the same either way, so this narrows what is
         /// READ and never what is ANSWERED.
-        index: Option<IndexPick>,
+        index: Option<IndexAccess>,
     },
     /// a DERIVED TABLE - `SELECT ... FROM (SELECT ...) X`. The inner
     /// plan produces the rows; the outer projection, WHERE and ORDER BY
@@ -1763,7 +1763,7 @@ AlterDomainRename {
         /// the ACCESS PATH, chosen at prepare by `fire-crab-opt` - the
         /// fold's input is a retrieval leaf like any other, so a
         /// grouped query looks up rather than scanning too
-        index: Option<IndexPick>,
+        index: Option<IndexAccess>,
     },
     /// `SET GENERATOR <name> TO <n>` or `ALTER SEQUENCE|GENERATOR <name>
     /// RESTART WITH <n>`: write a new value into the generator page at
@@ -8933,7 +8933,7 @@ fn dml_targets_at(
     rel: u16,
     formats: &[(u8, Vec<Descriptor>)],
     filter: &Option<Predicate>,
-    pick: &IndexPick,
+    access: &IndexAccess,
 ) -> Result<Vec<(u32, u16, u8, Vec<u8>)>, EvalErr> {
     let per_page = fire_crab_ods::format::max_recs_per_dp(db.page_size);
     if per_page == 0 {
@@ -8954,7 +8954,16 @@ fn dml_targets_at(
             .collect();
     let mut out = Vec::new();
     let mut seen: Vec<u64> = Vec::new();
-    for (entry_key, recno) in pick.candidates(&db.bytes, db.page_size, rel) {
+    let candidates: Vec<(&IndexPick, Vec<u8>, u64)> = access
+        .picks
+        .iter()
+        .flat_map(|p| {
+            p.candidates(&db.bytes, db.page_size, rel)
+                .into_iter()
+                .map(move |(k, r)| (p, k, r))
+        })
+        .collect();
+    for (pick, entry_key, recno) in candidates {
         if seen.contains(&recno) {
             continue;
         }
@@ -9004,15 +9013,15 @@ fn collect_dml_targets(
     rel: u16,
     formats: &[(u8, Vec<Descriptor>)],
     filter: &Option<Predicate>,
-    index: &Option<IndexPick>,
+    index: &Option<IndexAccess>,
 ) -> Result<Vec<(u32, u16, u8, Vec<u8>)>, EvalErr> {
     // A WRITE READS FIRST, and that read is a retrieval like any other:
     // `DELETE FROM T WHERE ID = 5` had been walking every page of T. The
     // index names candidates and the same filter still decides which of
     // them are written, so this narrows the walk and cannot change which
     // rows the statement touches.
-    if let Some(pick) = index {
-        return dml_targets_at(db, rel, formats, filter, pick);
+    if let Some(access) = index {
+        return dml_targets_at(db, rel, formats, filter, access);
     }
     let mut out = Vec::new();
     for dp_no in relation_data_pages(&db.bytes, db.page_size, rel) {
@@ -9806,6 +9815,36 @@ impl IndexOp {
 /// statement is then refused rather than writing records the engine's
 /// index scans would miss. Multi-segment and descending indexes are
 /// maintained.
+/// The access path for one retrieval: one band per branch of the
+/// predicate's disjunction.
+///
+/// `WHERE A = 1 OR A = 2` is two bands of one index; `WHERE A = 1 OR
+/// B = 2` is one band of each of two. Every branch must be servable -
+/// if any is not, the whole statement scans, because a partial union of
+/// bands is a MISSING SET OF ROWS rather than a slower answer.
+#[derive(Clone, Debug, PartialEq)]
+struct IndexAccess {
+    picks: Vec<IndexPick>,
+}
+
+impl IndexAccess {
+    fn one(pick: IndexPick) -> IndexAccess {
+        IndexAccess { picks: vec![pick] }
+    }
+    /// A union of bands has no single order to inherit, so navigation
+    /// belongs to the single-band case only.
+    fn navigate(&self) -> bool {
+        matches!(self.picks.as_slice(), [p] if p.navigate)
+    }
+    fn describe(&self) -> String {
+        self.picks
+            .iter()
+            .map(|p| format!("index={} lo={:?} hi={:?} navigate={}", p.op.id, p.lo, p.hi, p.navigate))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+}
+
 /// The index a retrieval will drive, decided at PREPARE - which is
 /// where the engine decides it too. `id` is the index root's slot, the
 /// identity `btr` navigates by; `key` is the encoded search key.
@@ -9890,13 +9929,13 @@ fn navigates(db: &Database, table: &str, op: &IndexOp, order_by: &[OrderKey]) ->
 fn leaf_source(
     rel: u16,
     formats: Vec<(u8, Vec<Descriptor>)>,
-    index: &Option<IndexPick>,
+    index: &Option<IndexAccess>,
 ) -> RowSource {
     match index {
-        Some(pick) => RowSource::IndexScan {
+        Some(access) => RowSource::IndexScan {
             rel,
             formats,
-            pick: pick.clone(),
+            access: access.clone(),
             width: None,
         },
         None => RowSource::TableScan { rel, formats, width: None },
@@ -9963,7 +10002,7 @@ fn choose_index(
     filter: &Option<Predicate>,
     sql: &str,
     order_by: &[OrderKey],
-) -> Option<IndexPick> {
+) -> Option<IndexAccess> {
     use fire_crab_ods::btw;
     // FC_NO_INDEX forces the scan. It exists for the GATE: a coverage
     // check that cannot fail is worth nothing, and the only way to show
@@ -9977,13 +10016,12 @@ fn choose_index(
     // retrieval per branch and a merge, which is a later slice. NO
     // predicate at all is fine - an ORDER BY that the index already
     // delivers is reason enough to walk it (the engine's Access::Order).
-    let empty: Vec<Term> = Vec::new();
-    let terms = match filter.as_ref().map(|p| p.0.as_slice()) {
-        None => &empty,
-        Some([t]) => t,
-        Some(_) => return None,
-    };
-
+    // ONE BAND PER BRANCH of the disjunction. `A = 1 OR A = 2` is two
+    // bands of one index and `A = 1 OR B = 2` one band of each of two -
+    // and EVERY branch must be servable, because a partial union is a
+    // MISSING SET OF ROWS rather than a slower answer. A conjunction is
+    // the one-branch case, and no predicate at all is still fine: an
+    // ORDER BY the index already delivers is reason enough to walk it.
     // What would the engine do here? opt answers from the same catalog
     // and the same rules its PLAN gate holds against the live server.
     let plan = fire_crab_opt::plan_query(&db.bytes, db.page_size, sql).ok()?;
@@ -10005,6 +10043,32 @@ fn choose_index(
         return None;
     }
 
+    let empty: Vec<Vec<Term>> = vec![Vec::new()];
+    let branches: &[Vec<Term>] = match filter.as_ref() {
+        None => &empty,
+        Some(p) => p.0.as_slice(),
+    };
+    // navigation belongs to the single-band case: a union of bands has
+    // no single order to inherit
+    let nav_order: &[OrderKey] = if branches.len() == 1 { order_by } else { &[] };
+    let mut picks = Vec::with_capacity(branches.len());
+    for terms in branches {
+        picks.push(pick_for_terms(db, rel, table, descs, terms, nav_order)?);
+    }
+    Some(IndexAccess { picks })
+}
+
+/// The band one conjunctive branch names, or None when no index serves
+/// it - which makes the whole statement scan.
+fn pick_for_terms(
+    db: &Database,
+    rel: u16,
+    table: &str,
+    descs: &[Descriptor],
+    terms: &[Term],
+    order_by: &[OrderKey],
+) -> Option<IndexPick> {
+    use fire_crab_ods::btw;
     let ops = resolve_index_ops(db, rel, descs)?;
     let (mut best_bounded, mut best_nav): (Option<IndexPick>, Option<IndexPick>) = (None, None);
     // Collect every comparison in the conjunction that could bound an
@@ -13529,10 +13593,7 @@ fn plan_query_inner(
             let index = choose_index(db, rel, table, &descs, &filter, sql, &order_by);
             if trace {
                 match &index {
-                    Some(p) => eprintln!(
-                    "[srv] index scan: rel={} index={} lo={:?} hi={:?} navigate={}",
-                    rel, p.op.id, p.lo, p.hi, p.navigate
-                ),
+                    Some(p) => eprintln!("[srv] index scan: rel={} {}", rel, p.describe()),
                     None => eprintln!("[srv] natural scan: rel={}", rel),
                 }
             }
@@ -13577,10 +13638,7 @@ fn plan_query_inner(
             let agg_index = choose_index(db, rel, table, &descs, &filter, sql, &[]);
             if trace {
                 match &agg_index {
-                    Some(p) => eprintln!(
-                        "[srv] index scan: rel={} index={} lo={:?} hi={:?} navigate={}",
-                        rel, p.op.id, p.lo, p.hi, p.navigate
-                    ),
+                    Some(p) => eprintln!("[srv] index scan: rel={} {}", rel, p.describe()),
                     None => eprintln!("[srv] natural scan: rel={}", rel),
                 }
             }
@@ -13706,10 +13764,7 @@ fn plan_query_inner(
         let index = choose_index(db, rel, table, &descs, &filter, sql, &order_by);
         if trace {
             match &index {
-                Some(p) => eprintln!(
-                    "[srv] index scan: rel={} index={} lo={:?} hi={:?} navigate={}",
-                    rel, p.op.id, p.lo, p.hi, p.navigate
-                ),
+                Some(p) => eprintln!("[srv] index scan: rel={} {}", rel, p.describe()),
                 None => eprintln!("[srv] natural scan: rel={}", rel),
             }
         }
@@ -13737,10 +13792,7 @@ fn plan_query_inner(
             let index = choose_index(db, rel, table, &descs, &filter, sql, &[]);
             if trace {
                 match &index {
-                    Some(p) => eprintln!(
-                        "[srv] index scan: rel={} index={} lo={:?} hi={:?} navigate={}",
-                        rel, p.op.id, p.lo, p.hi, p.navigate
-                    ),
+                    Some(p) => eprintln!("[srv] index scan: rel={} {}", rel, p.describe()),
                     None => eprintln!("[srv] natural scan: rel={}", rel),
                 }
             }
@@ -14713,7 +14765,7 @@ fn aggregate(
     func: AggFn,
     target: &AggTarget,
     filter: &Option<Predicate>,
-    index: &Option<IndexPick>,
+    index: &Option<IndexAccess>,
 ) -> Option<Option<i64>> {
     // an eval error in the filter DECLINES the prepare-time fast path
     // (poisons the flag); the caller then routes through the group
@@ -14838,7 +14890,7 @@ fn records_for(
     db: &Database,
     rel: u16,
     formats: &[(u8, Vec<Descriptor>)],
-    pick: &IndexPick,
+    access: &IndexAccess,
 ) -> Vec<Vec<Value>> {
     let mut out = Vec::new();
     // ONE ROW PER RECORD, however many entries name it. `insert_index_entry`
@@ -14847,15 +14899,19 @@ fn records_for(
     // up with two identical entries in different pages, both of them
     // current. Verification cannot separate those two: they are the
     // same key on the same record, and the row came back TWICE.
+    // ACROSS BANDS TOO: a row can satisfy two branches of an OR, and
+    // `A = 1 OR B = 2` would then return it twice.
     let mut seen: Vec<u64> = Vec::new();
-    for (entry_key, recno) in pick.candidates(&db.bytes, db.page_size, rel) {
-        if seen.contains(&recno) {
-            continue;
-        }
-        for values in records_at_in(&db.bytes, db.page_size, rel, formats, &[recno]) {
-            if pick.entry_is_current(&entry_key, &values) {
-                seen.push(recno);
-                out.push(values);
+    for pick in &access.picks {
+        for (entry_key, recno) in pick.candidates(&db.bytes, db.page_size, rel) {
+            if seen.contains(&recno) {
+                continue;
+            }
+            for values in records_at_in(&db.bytes, db.page_size, rel, formats, &[recno]) {
+                if pick.entry_is_current(&entry_key, &values) {
+                    seen.push(recno);
+                    out.push(values);
+                }
             }
         }
     }
@@ -14928,14 +14984,14 @@ fn for_each_candidate<F: FnMut(&[Value])>(
     db: &Database,
     rel: u16,
     formats: &[(u8, Vec<Descriptor>)],
-    index: &Option<IndexPick>,
+    index: &Option<IndexAccess>,
     mut f: F,
 ) {
-    let Some(pick) = index else {
+    let Some(access) = index else {
         for_each_record(db, rel, formats, f);
         return;
     };
-    for values in records_for(db, rel, formats, pick) {
+    for values in records_for(db, rel, formats, access) {
         f(&values);
     }
 }
@@ -32784,14 +32840,21 @@ mod tests {
             navigate: false,
         };
         let scan = RowSource::scan_filter_sort(128, Vec::new(), None, Vec::new(), None);
-        let idx = RowSource::scan_filter_sort(128, Vec::new(), None, Vec::new(), Some(pick.clone()));
+        let idx = RowSource::scan_filter_sort(
+            128,
+            Vec::new(),
+            None,
+            Vec::new(),
+            Some(IndexAccess::one(pick.clone())),
+        );
         let leaf_of = |s: &RowSource| -> String {
             match s {
                 RowSource::Sort { input, .. } => match input.as_ref() {
                     RowSource::Filter { input, .. } => match input.as_ref() {
                         RowSource::TableScan { .. } => "scan".to_string(),
-                        RowSource::IndexScan { pick, .. } => {
-                            format!("index {} {:?}", pick.op.id, pick.lo)
+                        RowSource::IndexScan { access, .. } => {
+                            let p = &access.picks[0];
+                            format!("index {} {:?}", p.op.id, p.lo)
                         }
                         _ => "other".to_string(),
                     },
@@ -32812,7 +32875,7 @@ mod tests {
             Vec::new(),
             None,
             keys.clone(),
-            Some(pick.clone()),
+            Some(IndexAccess::one(pick.clone())),
         );
         assert!(matches!(sorted, RowSource::Sort { .. }));
         let navigated = RowSource::scan_filter_sort(
@@ -32820,7 +32883,7 @@ mod tests {
             Vec::new(),
             None,
             keys,
-            Some(IndexPick { navigate: true, ..pick }),
+            Some(IndexAccess::one(IndexPick { navigate: true, ..pick })),
         );
         assert!(matches!(navigated, RowSource::Filter { .. }));
     }

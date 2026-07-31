@@ -165,6 +165,10 @@ plus *the subsystem is now on the path*.
     BIGINT of exactly `i64::MIN` carries an index entry the engine's own
     lookups may not find. Closing it means reading the engine's actual
     key bytes for that value, which is a probe of its own.
+  - **`OR` and `IN`** *(done)*: a disjunction is a UNION OF BANDS, one
+    per DNF branch, with every branch required to be servable (a partial
+    union is a missing set of rows) and candidates deduplicated ACROSS
+    bands (one row can satisfy two branches).
   - Still to do: index-driven joins,
     text keys (a collation makes the key a collation key), compound
     prefixes, and parameters (their values arrive after the plan is

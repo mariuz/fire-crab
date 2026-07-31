@@ -13,6 +13,34 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — W1k: OR is a union of bands, and so is IN
+
+### Converted
+- **A disjunction retrieves through one band per branch.**
+  `A = 1 OR A = 2` is two bands of one index; `A = 1 OR B = 2` is one
+  band of each of two. `IN (...)` desugars to exactly that at parse
+  time, which is where most of the value is.
+- New `IndexAccess` — the access path for a retrieval is a *set* of
+  bands, and the plan carries it. `choose_index` splits into a
+  per-branch `pick_for_terms`.
+
+### Guarded
+Two rules, both of which decide correctness rather than speed:
+- **Every branch must be servable, or the whole statement scans.** A
+  partial union is a *missing set of rows*, not a slower answer. One
+  branch on an unindexed column, or one shape no band can express, and
+  the retrieval declines entirely.
+- **Candidates are deduplicated ACROSS bands.** A row can satisfy two
+  branches — most obviously when the branches use different indexes —
+  and would otherwise be returned twice. The gate asks for it directly:
+  the same branch twice, and `ID = 1 OR DEPT_ID = 1` where one row
+  answers both.
+- Navigation belongs to the single-band case only: a union of bands has
+  no single order to inherit.
+
+`qa/serve-real-index.sh` grows to 306 checks. 371 unit tests and the
+write-path gates confirm nothing moved.
+
 ## 2026-07-31 — W1j: the wrong record, not the missing one
 
 The adversarial fleet's full report arrived after the previous fix, and

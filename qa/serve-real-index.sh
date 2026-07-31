@@ -336,7 +336,7 @@ natural "IS NULL, which is not an equality" \
 # these order by a column with NO index, so nothing but the PREDICATE
 # could drive a retrieval - which is what each one is asking about
 natural "no predicate at all" "SELECT ID FROM EMP ORDER BY NAME"
-natural "an OR of two equalities" \
+indexed "an OR of two equalities on the primary key" \
         "SELECT ID FROM EMP WHERE ID = 1 OR ID = 2 ORDER BY ID"
 natural "a NOT EQUAL" "SELECT ID FROM EMP WHERE ID <> 3 ORDER BY NAME"
 natural "an equality on the SECOND segment of a compound index" \
