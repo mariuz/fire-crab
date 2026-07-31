@@ -9803,6 +9803,30 @@ struct IndexPick {
     navigate: bool,
 }
 
+/// The smallest key that is GREATER than every key beginning with
+/// `prefix` - the exclusive upper bound of a prefix band.
+///
+/// Increment the last byte; a trailing 0xFF cannot be incremented, so it
+/// is dropped and the carry moves left. An all-0xFF prefix has no
+/// successor, which means "unbounded above".
+///
+/// This is the whole of the compound-index arithmetic, and getting it
+/// wrong LOSES ROWS rather than refusing: an INCLUSIVE bound at the
+/// prefix itself admits only the key whose trailing segments are all
+/// NULL, and drops every row that has a value in them.
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut out = prefix.to_vec();
+    while let Some(&last) = out.last() {
+        if last == 0xFF {
+            out.pop();
+            continue;
+        }
+        *out.last_mut()? = last + 1;
+        return Some(out);
+    }
+    None
+}
+
 /// Does the chosen index already deliver `order_by`, so the sort above
 /// it is unnecessary?
 ///
@@ -9969,19 +9993,36 @@ fn choose_index(
     // `ID > 3 AND ID < 7` is one range, and BETWEEN has already been
     // desugared into exactly that pair.
     for op in &ops {
-        let [(seg_fid, itype, _)] = op.segs.as_slice() else { continue };
-        if !matches!(*itype, btw::IDX_NUMERIC | btw::IDX_NUMERIC2) {
+        // The LEADING segment is what a predicate can match - a compound
+        // index orders by its first column, then within that by the
+        // second, so an equality on the first names a CONTIGUOUS BAND.
+        let Some((seg_fid, itype, _)) = op.segs.first() else { continue };
+        let compound = op.segs.len() > 1;
+        // A DESCENDING compound index complements the WHOLE assembled
+        // key - markers and padding included - so the successor would
+        // have to be computed before the complement, with the bounds
+        // swapped. That is a second piece of arithmetic and a second
+        // chance to lose a row, so it scans.
+        if compound && op.descending {
+            continue;
+        }
+        let text = matches!(*itype, btw::IDX_STRING | btw::IDX_METADATA);
+        if !text && !matches!(*itype, btw::IDX_NUMERIC | btw::IDX_NUMERIC2) {
             continue;
         }
         // a scaled column stores Value::Scaled, and a key built from
         // Value::Int would land elsewhere in the tree and find nothing
         let Some(d) = descs.get(*seg_fid) else { continue };
-        if d.scale != 0 {
+        if !text && d.scale != 0 {
             continue;
         }
-        let key_of = |v: i64| -> Option<Vec<u8>> {
+        let key_of = |v: &Value| -> Option<Vec<u8>> {
             let mut values = vec![Value::Null; descs.len()];
-            values[*seg_fid] = Value::Int(v);
+            values[*seg_fid] = v.clone();
+            // On a COMPOUND index this is the key of `(v, NULL, ...)`,
+            // which is exactly the LOWEST key in the band - the engine
+            // writes the same bytes for that row - so it cannot miss the
+            // rows whose trailing segments are NULL.
             op.key_for(&values).filter(|(_, all_null)| !all_null).map(|(k, _)| k)
         };
         // (key, inclusive) bounds in VALUE order, tightened as terms are
@@ -9991,15 +10032,34 @@ fn choose_index(
         let mut bounded = false;
         for term in terms {
             let (fid, cmp, v) = match term {
-                Term::Cmp(fid, cmp, Rhs::Int(v)) | Term::NumCmp(fid, cmp, Rhs::Int(v)) => {
-                    (*fid, *cmp, *v)
+                Term::Cmp(fid, cmp, Rhs::Int(v)) | Term::NumCmp(fid, cmp, Rhs::Int(v))
+                    if !text =>
+                {
+                    (*fid, *cmp, Value::Int(*v))
+                }
+                // TEXT keys, equality only. The literal must be ASCII:
+                // above 0x7F a charset or a collation decides the bytes,
+                // and a key that differs from the stored one does not
+                // refuse, it MISSES. Trailing blanks are stripped by the
+                // encoder on both sides, which is the same
+                // pad-insensitivity the comparison has.
+                Term::Cmp(fid, Cmp::Eq, Rhs::Str(t)) if text && t.is_ascii() => {
+                    (*fid, Cmp::Eq, Value::Text(t.clone()))
                 }
                 _ => continue,
             };
             if fid != *seg_fid {
                 continue;
             }
-            let Some(key) = key_of(v) else { continue };
+            // On a compound index only EQUALITY is served: a range over
+            // a prefix band needs its own arithmetic per operator
+            // (`<= v` ends at the SUCCESSOR of v's band, `< v` at the
+            // band's start), and two rules for two adjacent operators is
+            // how a missed row ships.
+            if compound && !matches!(cmp, Cmp::Eq) {
+                continue;
+            }
+            let Some(key) = key_of(&v) else { continue };
             // tighter wins: a conjunction can only narrow
             let tighten = |slot: &mut Option<(Vec<u8>, bool)>,
                            k: Vec<u8>,
@@ -10018,6 +10078,19 @@ fn choose_index(
                 }
             };
             match cmp {
+                // On a COMPOUND index an equality is a BAND, not a
+                // point: every key that begins with this prefix. An
+                // inclusive upper bound at the prefix itself would admit
+                // only the all-NULL-tail key and drop every other row.
+                Cmp::Eq if compound => {
+                    let Some(succ) = prefix_successor(&key) else {
+                        tighten(&mut lo, key, true, false);
+                        bounded = true;
+                        continue;
+                    };
+                    tighten(&mut lo, key, true, false);
+                    tighten(&mut hi, succ, false, true);
+                }
                 Cmp::Eq => {
                     tighten(&mut lo, key.clone(), true, false);
                     tighten(&mut hi, key, true, true);
@@ -32699,6 +32772,34 @@ mod tests {
             Some(IndexPick { navigate: true, ..pick }),
         );
         assert!(matches!(navigated, RowSource::Filter { .. }));
+    }
+
+    #[test]
+    fn a_prefix_band_ends_at_its_successor() {
+        // an equality on a compound index's leading segment is a BAND,
+        // and its upper bound is the prefix's successor - EXCLUSIVE. A
+        // bound at the prefix itself admits only the all-NULL-tail key.
+        assert_eq!(prefix_successor(&[2, 0xBF, 0xF0, 0, 0]), Some(vec![2, 0xBF, 0xF0, 0, 1]));
+        // a trailing 0xFF cannot be incremented: it is dropped and the
+        // carry moves left
+        assert_eq!(
+            prefix_successor(&[2, 0x40, 0x0F, 0xFF, 0xFF, 2, 0xFF, 0xFF, 0xFF, 0xFF]),
+            Some(vec![2, 0x40, 0x0F, 0xFF, 0xFF, 3])
+        );
+        assert_eq!(prefix_successor(&[1, 0xFF]), Some(vec![2]));
+        // an all-0xFF prefix has no successor - the band runs to the end
+        // of the index, which is what None means to `lookup_range`
+        assert_eq!(prefix_successor(&[0xFF, 0xFF]), None);
+        assert_eq!(prefix_successor(&[]), None);
+        // and the successor is strictly greater than the prefix AND
+        // than anything that begins with it, which is the property the
+        // band relies on
+        let p = vec![2, 0xBF, 0xF0, 0, 0];
+        let succ = prefix_successor(&p).unwrap();
+        assert!(succ > p);
+        let mut inside = p.clone();
+        inside.extend_from_slice(&[1, 0xFF, 0xFF]);
+        assert!(inside < succ);
     }
 
     #[test]

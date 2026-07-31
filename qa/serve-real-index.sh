@@ -58,6 +58,7 @@ CREATE TABLE EMP (ID INTEGER NOT NULL PRIMARY KEY, DEPT_ID INTEGER,
 CREATE TABLE PLAIN (ID INTEGER, V INTEGER);
 CREATE TABLE WIDE (K BIGINT, S SMALLINT, N NUMERIC(9,2), T VARCHAR(6));
 CREATE TABLE NU (K INTEGER, V VARCHAR(4));
+CREATE TABLE CP (A INTEGER, B INTEGER, C INTEGER, S VARCHAR(8), KC CHAR(6));
 CREATE TABLE PARENT (K INTEGER NOT NULL PRIMARY KEY, V VARCHAR(4));
 CREATE TABLE CHILD (ID INTEGER, PK INTEGER REFERENCES PARENT (K));
 CREATE TABLE TPARENT (K VARCHAR(4) NOT NULL PRIMARY KEY);
@@ -71,6 +72,11 @@ CREATE INDEX WIDE_T ON WIDE (T);
 CREATE INDEX EMP_PAIR ON EMP (DEPT_ID, SALARY);
 CREATE DESCENDING INDEX WIDE_SD ON WIDE (S);
 CREATE UNIQUE INDEX NU_K ON NU (K);
+CREATE INDEX CP2 ON CP (A, B);
+CREATE INDEX CP3 ON CP (A, B, C);
+CREATE DESCENDING INDEX CPD ON CP (A, B);
+CREATE INDEX CP_S ON CP (S);
+CREATE INDEX CP_K ON CP (KC);
 COMMIT;
 INSERT INTO EMP VALUES (1, 1, 100, 'a');
 INSERT INTO EMP VALUES (2, 1, 200, 'b');
@@ -88,6 +94,13 @@ INSERT INTO NU VALUES (2, 'two');
 INSERT INTO NU VALUES (1, 'one');
 INSERT INTO NU VALUES (NULL, 'nil');
 INSERT INTO NU VALUES (NULL, 'nil2');
+INSERT INTO CP VALUES (1, 10, 100, 'aa', 'aa');
+INSERT INTO CP VALUES (1, 20, 200, 'bb', 'bb');
+INSERT INTO CP VALUES (1, NULL, 300, NULL, NULL);
+INSERT INTO CP VALUES (2, 10, 400, 'cc', 'cc');
+INSERT INTO CP VALUES (-1, 5, 500, 'dd  ', 'dd');
+INSERT INTO CP VALUES (0, 0, 600, '', '');
+INSERT INTO CP VALUES (-2, NULL, 700, 'ee', 'ee');
 INSERT INTO PARENT VALUES (1, 'p1');
 INSERT INTO PARENT VALUES (2, 'p2');
 INSERT INTO TPARENT VALUES ('a');
@@ -270,7 +283,9 @@ indexed "a NEGATIVE BIGINT key" "SELECT T FROM WIDE WHERE K = -9000000000"
 indexed "a SMALLINT key" "SELECT T FROM WIDE WHERE S = 7 ORDER BY T"
 indexed "a NEGATIVE SMALLINT key" "SELECT T FROM WIDE WHERE S = -7"
 natural "a SCALED numeric key" "SELECT T FROM WIDE WHERE N = 12.50 ORDER BY T"
-natural "a TEXT key" "SELECT K FROM WIDE WHERE T = 'aa'"
+# text WAS excluded here; it is keyed now (see the text section below),
+# so this asserts the capability rather than its absence
+indexed "a TEXT key" "SELECT K FROM WIDE WHERE T = 'aa'"
 
 
 # --- 3b. RANGES ---------------------------------------------------------
@@ -376,6 +391,58 @@ sorted_anyway "a UNIQUE index on a NULLABLE column" \
 # to save a sort, which is opt's rule too
 sorted_anyway "the predicate's index is not the order's" \
               "SELECT ID FROM EMP WHERE DEPT_ID = 1 ORDER BY ID"
+
+
+# --- 3d. COMPOUND INDEXES: an equality is a BAND, not a point ---------
+# A compound key stuffs its segments together, so an equality on the
+# LEADING segment names every key that begins with that prefix. The
+# lower bound is the key of `(v, NULL, ...)` - which is exactly what the
+# engine writes for that row, so it cannot miss the NULL-tailed ones -
+# and the upper bound is that prefix's EXCLUSIVE SUCCESSOR.
+#
+# The successor is the whole slice. An INCLUSIVE bound at the prefix
+# itself admits ONLY the all-NULL-tail key and silently drops every row
+# that has a value in its trailing segments - a missed row, which no
+# filter above can catch. Every check here has rows on both sides of
+# that line.
+indexed "an equality on the LEADING segment of a 2-segment index" \
+        "SELECT C FROM CP WHERE A = 1 ORDER BY C"
+indexed "... its NULL-tailed row is in the band" \
+        "SELECT C FROM CP WHERE A = 1 AND B IS NULL"
+indexed "... and so are the rows that have a trailing value" \
+        "SELECT C FROM CP WHERE A = 1 AND B = 20"
+indexed "a leading value with ONE row" "SELECT C FROM CP WHERE A = 2"
+indexed "a NEGATIVE leading value, whose key carries 0xFF bytes" \
+        "SELECT C FROM CP WHERE A = -1"
+indexed "... and another" "SELECT C FROM CP WHERE A = -2"
+indexed "ZERO as a leading value" "SELECT C FROM CP WHERE A = 0"
+indexed "a leading value with no rows at all" "SELECT C FROM CP WHERE A = 42"
+indexed "counted through the band" "SELECT COUNT(*) AS K FROM CP WHERE A = 1"
+# what a compound index must NOT serve yet
+natural "a RANGE on the leading segment - its own arithmetic per operator" \
+        "SELECT C FROM CP WHERE A > 0 ORDER BY C"
+natural "... and the inclusive one" "SELECT C FROM CP WHERE A <= 1 ORDER BY C"
+natural "a predicate on a NON-leading segment" \
+        "SELECT C FROM CP WHERE B = 10 ORDER BY C"
+
+# --- 3e. TEXT KEYS -----------------------------------------------------
+# The key strips trailing blanks on BOTH sides, which is the same
+# pad-insensitivity the comparison has - so a CHAR value and a VARCHAR
+# literal meet at the same key. A non-ASCII literal must SCAN: above
+# 0x7F a charset or collation decides the bytes, and a key that differs
+# from the stored one does not refuse, it misses.
+indexed "text equality on a VARCHAR" "SELECT C FROM CP WHERE S = 'aa'"
+indexed "... a value stored WITH trailing blanks" "SELECT C FROM CP WHERE S = 'dd'"
+indexed "... and the literal carrying them instead" "SELECT C FROM CP WHERE S = 'dd  '"
+indexed "the EMPTY string, whose key is a pad byte" "SELECT C FROM CP WHERE S = ''"
+indexed "a text value that is not there" "SELECT C FROM CP WHERE S = 'zz'"
+indexed "text equality on a CHAR, which pads" "SELECT C FROM CP WHERE KC = 'aa'"
+indexed "... matched by a literal padded to the column's width" \
+        "SELECT C FROM CP WHERE KC = 'aa    '"
+natural "a NON-ASCII literal, which must not be keyed" \
+        "SELECT C FROM CP WHERE S = 'ää'"
+natural "IS NULL on a text column" "SELECT C FROM CP WHERE S IS NULL ORDER BY C"
+natural "a text RANGE" "SELECT C FROM CP WHERE S > 'a' ORDER BY C"
 
 # --- 4. the answers themselves, index and scan side by side ------------
 # the same question asked two ways: if the index path lost a row, these
@@ -577,6 +644,9 @@ same_both_ways "a range" "SELECT ID FROM EMP WHERE ID > 2 AND ID <= 5 ORDER BY I
 same_both_ways "a range with NULLs below it" \
                "SELECT ID FROM EMP WHERE DEPT_ID < 3 ORDER BY ID"
 same_both_ways "an empty range" "SELECT ID FROM EMP WHERE ID > 9 AND ID < 2"
+same_both_ways "a compound prefix band" "SELECT C FROM CP WHERE A = 1 ORDER BY C"
+same_both_ways "a text equality" "SELECT C FROM CP WHERE S = 'aa'"
+same_both_ways "an empty-string key" "SELECT C FROM CP WHERE S = ''"
 same_both_ways "an aggregate" "SELECT COUNT(*) AS K FROM EMP WHERE DEPT_ID = 9"
 # ORDER is part of the answer, so the navigating server and the sorting
 # one must produce the same SEQUENCE, not just the same set
@@ -598,8 +668,8 @@ else
 fi
 
 rm -f "$A" "$B"
-if [ "$ran" -lt 148 ]; then
-    echo "DIFF only $ran checks ran (expected at least 148) - did one silently skip?"
+if [ "$ran" -lt 190 ]; then
+    echo "DIFF only $ran checks ran (expected at least 190) - did one silently skip?"
     fail=1
 fi
 exit $fail

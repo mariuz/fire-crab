@@ -99,7 +99,7 @@ it", which is a different risk profile from converting something new:
 the oracle already exists, so the gate is *behaviour must not change*
 plus *the subsystem is now on the path*.
 
-- **W1 — index-driven retrieval.** *(equality, ranges, the fold's input, ORDER BY navigation and the FK check done)* The first
+- **W1 — index-driven retrieval.** *(equality, ranges, compound prefixes, text keys, the fold's input, ORDER BY navigation, the FK check and DML targets done)* The first
   slice that put a converted subsystem on the running server's path.
   `crates/wire/Cargo.toml` now depends on `fire-crab-opt`, and **opt
   makes the choice**: `plan_query` is asked about the statement, and only
@@ -146,6 +146,11 @@ plus *the subsystem is now on the path*.
     gate now pins with an empty-string lookup, the one byte where
     `idx_string` (0x20) and `idx_metadata` (0x00) disagree. It remains a
     metadata divergence worth closing, not a wrong answer.
+  - **Compound prefixes and text keys** *(done)*: an equality on an
+    ascending compound index's LEADING segment is a band whose upper
+    bound is the prefix's EXCLUSIVE SUCCESSOR (an inclusive one drops
+    every row with a non-NULL trailing segment), and text equality is
+    keyed for ASCII literals on `idx_string` and `idx_metadata`.
   - Still to do: index-driven joins,
     text keys (a collation makes the key a collation key), compound
     prefixes, and parameters (their values arrive after the plan is

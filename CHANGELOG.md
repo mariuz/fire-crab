@@ -13,6 +13,39 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-07-31 — W1g: a compound index's leading segment, and text keys
+
+### Converted
+- **An equality on the LEADING SEGMENT of an ascending compound index.**
+  A compound key stuffs its segments together, so `A = 1` on an `(A, B)`
+  index names a contiguous BAND: the lower bound is the key of
+  `(1, NULL, ...)` — which is exactly what the engine writes for that row,
+  so it cannot miss the NULL-tailed ones — and the upper bound is that
+  prefix's **exclusive successor** (`prefix_successor`: increment the
+  last byte, dropping trailing `0xFF`s and carrying left).
+- **Text equality**, on `VARCHAR` and `CHAR`, with an ASCII literal. The
+  encoder strips trailing blanks on both sides, which is the same
+  pad-insensitivity the comparison has, so a CHAR value and a VARCHAR
+  literal meet at the same key.
+
+### Guarded
+- **The upper bound is the whole slice.** An INCLUSIVE bound at the
+  prefix itself admits only the all-NULL-tail key and silently drops
+  every row with a value in its trailing segments. Every compound check
+  in the gate has rows on both sides of that line.
+- A **range** on a compound leading segment still scans: `<= v` ends at
+  the successor of v's band while `< v` ends at the band's start, and two
+  rules for two adjacent operators is how a missed row ships.
+- A **descending** compound index still scans: the complement covers the
+  markers and the padding, so the successor would have to be computed
+  before it, with the bounds swapped.
+- A **non-ASCII** literal still scans: above `0x7F` a charset or
+  collation decides the bytes, and a key that differs from the stored one
+  does not refuse — it misses.
+
+`qa/serve-real-index.sh` grows to 247 checks. 27 gates and 371 unit tests
+confirm nothing moved.
+
 ## 2026-07-31 — W1f: a row that moved was returned twice
 
 ### Fixed
