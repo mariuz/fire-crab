@@ -2030,6 +2030,28 @@ them.
   against a binary that was rebuilt underneath it, and this. Parallelism
   is worth it for BUILDING things and dangerous for MEASURING them.
 
+- **A flag you do not handle must be a flag you EXCLUDE.** The record
+  header has a bit meaning "this record continues elsewhere". The write
+  path checked it and refused; the read path did not, and quietly handed
+  back a truncated image whose later fields decoded as short or missing.
+  Both halves were written by someone who knew fragments existed. **When
+  you skip implementing a case, grep for every place that case can
+  arrive**, not just the one in front of you.
+
+- **A defect that depends on LAYOUT hides from every fixture you own.**
+  Nothing fragments until a row exceeds a page, and every fixture in this
+  project is small. The bug surfaced only on a 99-relation database a
+  fleet built for an unrelated purpose, and it moves when the file is
+  backed up and restored. If a code path branches on physical layout,
+  a fixture that is merely *correct* will never reach it — you have to
+  build one that is *big or awkward* on purpose.
+
+- **RLE will defeat your attempt to build a large row.** Two tries at a
+  fragmenting fixture failed because `LPAD('', 4000, 'x')` compresses to
+  almost nothing and the row fits after all. To make a record physically
+  large you need incompressible content — concatenated `GEN_UUID()`s, or
+  data from outside the database.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

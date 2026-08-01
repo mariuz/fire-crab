@@ -59,6 +59,42 @@ four; R7 is the removal of what they replaced.
   nothing and the cost barely scales with database size (2.3 MB → 8.9 s,
   25 MB → 11.1 s). Unfound, and named so it is not mistaken for finished.
 
+- **FRAGMENTED RECORDS ARE NOT ASSEMBLED, and the read path does not
+  notice.** A record too large for one page is stored as a head with
+  `rhd_incomplete` (flag 8) plus `rhdf` continuation fragments on other
+  pages. `RecordHeader::is_primary_record` (`crates/ods/src/data.rs:65`)
+  excludes CHAIN, FRAGMENT, BLOB and DELETED — **but not INCOMPLETE** —
+  and `image()` unpacks only that record's own bytes. So a fragmented row
+  decodes to a TRUNCATED image, and every field past the cut reads short
+  or missing.
+
+  **Measured, on a database with 99 relations and 69 indexes:
+  `RDB$INDEX_SEGMENTS` holds 15 INCOMPLETE records, and 17 of the 69
+  indexes are invisible to `fcopt` — `WHERE K = 5` plans NATURAL where
+  the engine plans INDEX.** The mechanism is exact: `index_columns` skips
+  the truncated segment rows, `indexes_of` then drops any index whose
+  segments come back empty, and the optimizer never learns the index
+  exists. It degrades to a scan **silently**, which is worse than
+  refusing.
+
+  It is layout-dependent, so it comes and goes: the missing set changes
+  after a `gbak` backup/restore of the same database. That is also why no
+  gate has ever caught it — every fixture here is small enough that
+  nothing fragments.
+
+  Note the asymmetry that shows someone already knew: `crates/ods/src/dml.rs:518`
+  DOES exclude INCOMPLETE, refusing to update a fragmented record ("target
+  is not a live primary record version"). The write path was guarded and
+  the read path was not.
+
+  The fix is fragment assembly in `ods` — follow the chain from the head
+  and concatenate before unpacking — and it needs its own gate with a
+  fixture built to fragment on purpose (incompressible content, since RLE
+  makes repeated bytes collapse and the row then fits after all; two
+  attempts at a fragmenting fixture failed for exactly that reason).
+  Until then, **any differential over a many-relation database is
+  confounded** and must not be used to judge the optimizer.
+
 - **Statistics that are non-zero but WRONG are not refused at all.**
   fcopt's stale guard tests `sa == 0.0`, so an index whose statistics
   were computed and then went stale as the table grew takes the ordinary
