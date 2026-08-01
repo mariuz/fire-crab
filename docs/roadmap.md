@@ -52,6 +52,29 @@ four; R7 is the removal of what they replaced.
   filter side turned out to have different rules, and the filter
   comparison is exact rather than through a double.
 
+- **A second per-statement stall, ~44 ms, that is not the socket.** With
+  `TCP_NODELAY` set, 200 sequential `SELECT 1 FROM RDB$DATABASE` still
+  take 8,689 ms against the engine's 293. About 3.8 s of that is server
+  CPU and the rest is waiting; the client socket's own `noDelay` changes
+  nothing and the cost barely scales with database size (2.3 MB → 8.9 s,
+  25 MB → 11.1 s). Unfound, and named so it is not mistaken for finished.
+
+- **The `opt` cost model is plan-text fidelity only, today.** A fleet
+  established the mechanism: `server.rs` discards any plan that is not a
+  one-element `Access::Index | Access::Order` stream, `plan_join_bound`
+  pushes a `TableScan` for every base side without ever calling
+  `choose_index`, and there is no hash-join row source. So the four
+  coupled cost-model edits (the doubled selectivity in `loop_cost`,
+  charging position 0, pricing both hash arrangements, and the
+  `MINIMUM_CARDINALITY` cap on a unique hashed side), the
+  `DEFAULT_SELECTIVITY = 0.1` substitution, the one-sided-index arm, and
+  the removal of the stale-statistics guard are all worth doing — the
+  crate's stated purpose is agreeing with `SET PLANONLY ON`, and a
+  correct model is a hard prerequisite for the keyed join — but none of
+  them changes an executed plan until that join exists. They must ship as
+  ONE increment for the first four, because each alone regresses a
+  measured fixture.
+
 - **`name` and `alias` are two describe fields, and fire-crab sets both
   to the alias.** For `SELECT X + 1 AS Y` the engine answers `name: ADD
   alias: Y`; for `UPPER('a') AS U`, `name: UPPER alias: U`; for a plain

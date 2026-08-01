@@ -4415,6 +4415,50 @@ same `isql` runs the same statement against the real engine and against
 only when refusing is deliberate and a gate asserts the failure; a
 refusal is always a SQL error, never a wrong answer dressed as a result.
 
+### The cost of a plan (`qa/serve-real-idxcost.sh`, 5 checks)
+
+Every other gate here asks whether the answer is right. This one asks
+whether the plan was worth executing — because for a long while it was
+not, and nothing could see it.
+
+fire-crab and the engine agreed on the plan: an index retrieval. fire-crab
+then executed it **7.4× slower than ignoring the index**. `records_at_in`
+built the relation's whole `sequence -> page` map, a walk of the file and
+a decode of every data page, and `records_for` called it with a
+**one-element slice per accepted record**.
+
+| rows returned | index | scan (`FC_NO_INDEX=1`) |
+|---|---|---|
+| 99 | 100 ms | 157 ms |
+| 499 | 184 ms | 185 ms |
+| 999 | 283 ms | 149 ms |
+| 4999 | **1132 ms** | 152 ms |
+
+Every correctness gate stayed green throughout, because the rows were
+right. **A differential on answers cannot see a differential on cost.**
+
+Three things make this gate honest rather than decorative:
+
+- **Its own 200,000-row fixture.** Every other gate runs on ~2.5 MB with
+  a few hundred rows, where the map rebuild is invisible. Sizing a
+  fixture to the semantics is not sizing it to the pathology.
+- **The same three-way oracle as the rest of the index work** — the
+  binary with the feature on, **the same binary** with `FC_NO_INDEX=1`,
+  and the real engine. `FC_NO_INDEX` was built so coverage assertions
+  could be seen to fail; it turns out to be the only honest baseline for
+  a timing assertion too, because it moves with the machine in a way a
+  stopwatch budget does not. Rows are compared as digests across all
+  three, so a cost fix that changed an answer would be caught here first.
+- **A ratio, not a budget.** The bound is 1.5×; the defect was 7.4×. An
+  absolute millisecond assertion is a gate that fails when the machine is
+  busy, which is a gate people learn to ignore.
+
+The fixture is reused between runs — building it takes longer than the
+rest of the gate — but the reuse test is the **row count**, not the
+file's existence. An interrupted earlier run leaves a database with the
+table and no rows, and trusting existence turned that into a gate failing
+for its own reasons. It did, once, before the check was tightened.
+
 ### Generators per row (`qa/serve-real-genrow.sh`, 14 checks)
 
 The gate that caught a regression nothing else could see, and then grew

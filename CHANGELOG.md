@@ -13,6 +13,79 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — Two ways of being slow, both measured
+
+A fleet sent to settle three recorded gaps in `opt`'s cost model came
+back having reordered its own list. Its relevance lens — an agent whose
+only job was to ask "grant this finding is true; does it change any plan
+fire-crab would execute differently?" — answered *no* for all three, and
+then found something none of the four investigations had been looking
+for. Both items below are live and user-visible; the cost-model work is
+plan-text fidelity only, and is now scheduled behind them.
+
+### Fixed
+- **Taking the index cost more than ignoring it.** `records_at_in` built
+  the relation's whole `sequence -> page` map — a walk of the file and a
+  decode of every data page — and `records_for` called it with a
+  **one-element slice per accepted record**. O(rows × pages), paid inside
+  the loop. Measured on a 200,000-row / 26 MB database, the same
+  statement with the index path against `FC_NO_INDEX=1`:
+
+  | rows returned | index | scan |
+  |---|---|---|
+  | 99 | 100 ms | 157 ms |
+  | 499 | 184 ms | 185 ms |
+  | 999 | 283 ms | 149 ms |
+  | 4999 | **1132 ms** | 152 ms |
+
+  fire-crab was executing the retrieval it and the engine both chose and
+  paying **7.4× the cost of ignoring it**. After hoisting the map to once
+  per retrieval — the shape `dml_targets_at` already used — and replacing
+  `records_for`'s linearly-scanned `Vec` dedup with a `HashSet`: 4999
+  rows in **111 ms against 166 ms**, the index now faster at every size.
+  A slower plan, never a wrong answer, and all three index gates stay at
+  zero DIFFs.
+
+- **Nagle was never turned off.** `grep set_nodelay crates/` returned
+  nothing. The wire protocol is strictly request/response and a response
+  is written in several pieces, so the kernel held each response tail
+  waiting to coalesce while the client — with nothing to send until it
+  had the whole answer — held its ACK under delayed-ACK. Neither side
+  blocked on anything either could see; both waited on a timer. Measured:
+  **200 sequential `SELECT 1 FROM RDB$DATABASE` took 17,092 ms through
+  fire-crab against 293 ms through the real engine.** The engine sets
+  `TCP_NODELAY` (`remote/inet.cpp:1039`); so does this now.
+
+### Corrected
+- **An earlier conclusion of this project's was right for the wrong
+  reason.** "600 inserts in 38.4s with Forced Writes on vs 38.3s off —
+  the sync was never the cost" still holds, but both numbers were
+  dominated by ~85 ms per statement of delayed-ACK, not by the work
+  either measurement was about. Every end-to-end timing this project has
+  ever taken had that floor under it.
+
+### Measured, not fixed
+- **A second per-statement stall remains, and it is not the socket.**
+  After `TCP_NODELAY` the same 200 statements take 8,689 ms — still 37×
+  the engine. About 3.8 s of that is server CPU and the rest is waiting;
+  forcing the *client* socket to `noDelay` changes nothing, and the cost
+  barely scales with database size (2.3 MB → 8.9 s, 25 MB → 11.1 s), so
+  it is a fixed ~44 ms per statement of something else. Named here rather
+  than left as a good number.
+
+New `qa/serve-real-idxcost.sh` (5 checks). It builds its own 200,000-row
+database, because every existing gate runs on ~2.5 MB fixtures where this
+pathology is invisible — they would have stayed green through all of it.
+It asserts a **ratio** rather than a millisecond budget, so a loaded
+machine cannot make it flaky; the defect it exists to catch was 7.4× and
+the bound is 1.5×. And it uses the same three-way oracle as the rest of
+the index work: the binary with the feature on, **the same binary** with
+`FC_NO_INDEX=1`, and the real engine — so a row-set difference is the
+index path's fault by construction, and here the comparison is a time as
+well as a row set.
+
+381 unit tests, 91 plan checks.
+
 ## 2026-08-01 — The batching swallowed the generators
 
 A full sweep of all 191 gates — run to check the character-set work —

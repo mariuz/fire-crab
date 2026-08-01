@@ -1951,6 +1951,38 @@ them.
   wrong nullability the whole time. Values and metadata are two
   differentials; running one is not running the other.
 
+- **Choosing the right plan and executing it well are two different
+  achievements, and only one of them has a gate.** fire-crab and the
+  engine agreed on the plan — an index retrieval — and fire-crab then
+  executed it *seven times slower than ignoring the index*. Every
+  correctness gate stayed green, because the rows were right. **A
+  differential on answers cannot see a differential on cost.** If you
+  have a feature that is supposed to make something faster, one gate must
+  assert that it did.
+
+- **Give the cost gate the same off-switch the correctness gate has.**
+  `FC_NO_INDEX=1` was built so coverage assertions could be *seen* to
+  fail; it turns out to be the only honest baseline for a timing
+  assertion too. The same binary with the feature off is a far better
+  comparison than a stopwatch budget, because it moves with the machine.
+  Assert a RATIO, not milliseconds.
+
+- **Size the fixture to the pathology, not to the semantics.** Every
+  gate here runs on a few hundred rows, which is right for pinning what a
+  statement MEANS and useless for pinning what it COSTS: the map rebuild
+  is invisible under a thousand rows and 7.4× at five thousand. This is
+  the third time the project has been bitten by fixtures too small — a
+  socket buffer at ~2300 rows, a leaf-page boundary, and now this.
+
+- **`grep` for the thing you never wrote.** `set_nodelay` appeared
+  nowhere in the codebase, and the cost was ~85 ms on *every statement
+  the server had ever answered* — including every benchmark used to draw
+  conclusions about something else. An absent line makes no diff, shows
+  in no review, and cannot be found by reading what the code does. Keep a
+  list of the socket and file options the reference implementation sets
+  and check them off; the engine's `setNoNagleOption` is right there in
+  `remote/inet.cpp`.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

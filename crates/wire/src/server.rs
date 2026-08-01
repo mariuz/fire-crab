@@ -9059,7 +9059,9 @@ fn dml_targets_at(
             })
             .collect();
     let mut out = Vec::new();
-    let mut seen: Vec<u64> = Vec::new();
+    // a SET, for the same reason as `records_for`'s: consulted once per
+    // candidate, so a linear scan makes this quadratic
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let candidates: Vec<(&IndexPick, Vec<u8>, u64)> = access
         .picks
         .iter()
@@ -9070,10 +9072,9 @@ fn dml_targets_at(
         })
         .collect();
     for (pick, entry_key, recno) in candidates {
-        if seen.contains(&recno) {
+        if !seen.insert(recno) {
             continue;
         }
-        seen.push(recno);
         let seq = (recno / per_page) as u32;
         let slot = (recno % per_page) as u16;
         let Some(&dp_no) = pages.get(&seq) else { continue };
@@ -15270,19 +15271,80 @@ fn records_for(
     // ordinary predicate decides - which is the same contract the index
     // has everywhere else.
     let verify = access.navigate();
-    let mut seen: Vec<u64> = Vec::new();
+    // ONCE, not once per row. The map costs a walk of the whole file and
+    // a decode of every data page of the relation; the loop below asks
+    // for ONE record at a time, so building it inside the fetch made an
+    // index retrieval cost O(rows x pages) and, past a few hundred rows,
+    // several times more than ignoring the index altogether. See
+    // [page_sequence_map] for the measurements.
+    let per_page = fire_crab_ods::format::max_recs_per_dp(db.page_size);
+    if per_page == 0 {
+        return out;
+    }
+    let pages = page_sequence_map(&db.bytes, db.page_size, rel);
+    // a SET, not a Vec scanned linearly: the dedup is consulted once per
+    // candidate, so `contains` on a Vec makes the acceptance loop
+    // quadratic in the candidate count
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for (pick, entry_key, recno) in cands {
         if seen.contains(&recno) {
             continue;
         }
-        for values in records_at_in(&db.bytes, db.page_size, rel, formats, &[recno]) {
+        for values in
+            records_at_in_with(&db.bytes, db.page_size, formats, &pages, per_page, &[recno])
+        {
             if !verify || pick.entry_is_current(&entry_key, &values) {
-                seen.push(recno);
+                seen.insert(recno);
                 out.push(values);
             }
         }
     }
     out
+}
+
+/// The relation's `sequence -> page number` map.
+///
+/// A record number names a page by its SEQUENCE, and the sequence is not
+/// the page's POSITION in the list: a relation's data pages are listed in
+/// pointer-page order, and a freed page leaves a gap, so indexing
+/// positionally reads the wrong page - or, with the sequence check at the
+/// use site, reads nothing and silently DROPS the row. One deleted row
+/// was enough to hide every later key.
+///
+/// Building it walks the whole file (`relation_data_pages`) and decodes
+/// every data page of the relation, so it is built ONCE PER RETRIEVAL and
+/// handed to the per-record fetch. It used to be built inside that fetch,
+/// which `records_for` calls with a ONE-ELEMENT slice per accepted
+/// record: the prologue ran once per row.
+///
+/// MEASURED on a 200,000-row / 26 MB database, the same statement with
+/// the index path against `FC_NO_INDEX=1`:
+///
+///   rows returned |  index  |  scan
+///   ------------- | ------- | ------
+///            99   |  100 ms | 157 ms
+///           499   |  184 ms | 185 ms   <- parity
+///           999   |  283 ms | 149 ms
+///          4999   | 1132 ms | 152 ms   <- 7.4x SLOWER than ignoring it
+///
+/// The engine and `fcopt` both plan every one of those as an index
+/// retrieval, so fire-crab was executing the plan the two agree on and
+/// paying seven times the cost of ignoring it. A slower plan, not a wrong
+/// answer - and the only defect of its kind on the live single-relation
+/// path.
+fn page_sequence_map(
+    bytes: &[u8],
+    page_size: usize,
+    rel: u16,
+) -> std::collections::HashMap<u32, u32> {
+    relation_data_pages(bytes, page_size, rel)
+        .into_iter()
+        .filter_map(|no| {
+            let start = no as usize * page_size;
+            let dp = bytes.get(start..start + page_size).and_then(DataPage::decode)?;
+            Some((dp.sequence, no))
+        })
+        .collect()
 }
 
 fn records_at_in(
@@ -15296,21 +15358,21 @@ fn records_at_in(
     if per_page == 0 {
         return Vec::new();
     }
-    // A record number names a page by its SEQUENCE, and the sequence is
-    // not the page's POSITION in this list: a relation's data pages are
-    // listed in pointer-page order, and a freed page leaves a gap, so
-    // indexing positionally reads the wrong page - or, with the
-    // sequence check below, reads nothing and silently DROPS the row.
-    // One deleted row was enough to hide every later key.
-    let pages: std::collections::HashMap<u32, u32> =
-        relation_data_pages(bytes, page_size, rel)
-            .into_iter()
-            .filter_map(|no| {
-                let start = no as usize * page_size;
-                let dp = bytes.get(start..start + page_size).and_then(DataPage::decode)?;
-                Some((dp.sequence, no))
-            })
-            .collect();
+    let pages = page_sequence_map(bytes, page_size, rel);
+    records_at_in_with(bytes, page_size, formats, &pages, per_page, recnos)
+}
+
+/// [records_at_in] with the page map already built - the form a
+/// retrieval loop wants, so the walk above happens once and not once per
+/// row.
+fn records_at_in_with(
+    bytes: &[u8],
+    page_size: usize,
+    formats: &[(u8, Vec<Descriptor>)],
+    pages: &std::collections::HashMap<u32, u32>,
+    per_page: u64,
+    recnos: &[u64],
+) -> Vec<Vec<Value>> {
     let mut out = Vec::with_capacity(recnos.len());
     for &recno in recnos {
         let seq = (recno / per_page) as u32;
@@ -28216,6 +28278,28 @@ pub fn serve(addr: &str, user: &str, password: &str) -> std::io::Result<()> {
     for conn in listener.incoming() {
         match conn {
             Ok(s) => {
+                // NAGLE OFF, and this is not a micro-optimisation.
+                //
+                // The wire protocol is strictly request/response and a
+                // response is written in several small pieces. With
+                // Nagle's algorithm on, the kernel holds the tail of a
+                // response waiting for more data to coalesce, while the
+                // client - having nothing further to send until it has
+                // the whole answer - holds its ACK under delayed-ACK.
+                // Neither side is blocked on the other in any way either
+                // can see; they are both waiting on a timer.
+                //
+                // MEASURED, 200 sequential `SELECT 1 FROM RDB$DATABASE`
+                // on one attachment: 17,092 ms through fire-crab against
+                // 293 ms through the real engine on 3050. About 85 ms of
+                // dead time per statement, and it had been in every
+                // benchmark this project ever ran - including the "600
+                // inserts in 38.4s with Forced Writes on vs 38.3s off"
+                // that concluded the fsync was never the cost. That
+                // conclusion was right for the wrong reason.
+                //
+                // The engine sets it too (`setNoNagle`, remote/inet.cpp).
+                let _ = s.set_nodelay(true);
                 // one thread per connection so clients that reconnect in
                 // quick succession are not serialized behind each other
                 let (u, p) = (user.to_string(), password.to_string());
