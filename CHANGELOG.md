@@ -13,6 +13,37 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — The same disease at the next call site
+
+`catalog::relation_columns` is now memoised for system relations, the way
+`system_relation_formats` was. After the format cache landed, a fleet's
+profile put this function at **60.9% of the server's remaining CPU** —
+an uncached full walk of `RDB$RELATION_FIELDS`, with 120 call sites and
+`sqz::unpack` and `catalog::cstr` beneath it.
+
+**The safety argument is the same one, and it was checked rather than
+assumed to transfer.** Only system relations are cached. Every cached
+call site asks for `RDB$RELATION_FIELDS`, `RDB$FIELDS`, `RDB$INDICES`,
+`RDB$INDEX_SEGMENTS` or `RDB$DEPENDENCIES`, and what is cached is those
+tables' OWN column definitions — rows written at database creation that
+no DDL rewrites. A user relation's columns change under `ALTER TABLE`, so
+the DDL call site that passes a user name (`ddl.rs:354`) bypasses the
+cache entirely. The key carries the ODS major and the page size so two
+attachments to different databases cannot share an entry.
+
+**No speedup is quoted here.** This box has one core and a fleet was
+running two investigations on it; a stopwatch reading under that load is
+the error this project spent a day correcting, and the last figure taken
+that way turned out to be half a stray process. What is verified is
+correctness: 388 unit tests, and `serve-real-restored.sh`,
+`serve-real-syscat.sh` and `serve-real-alter.sh` all at zero DIFFs — the
+three gates that read catalogues and then write to them.
+
+For the record, the measurement that motivated it was taken properly, by
+the fleet, on a verified-quiet machine: 2.92 ms per statement at HEAD
+against the engine's 0.95 ms, down from 19.6 ms before the format cache,
+with server CPU at 730 ms per 200 statements against 3,810 ms.
+
 ## 2026-08-01 — The guard was standing on a false premise, and it was mine
 
 Three edits to `opt`, and a cache. The stale-statistics grid goes from

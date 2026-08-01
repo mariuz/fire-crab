@@ -137,6 +137,58 @@ fn cstr(image: &[u8], off: usize) -> Option<String> {
 /// matched by name because `RDB$RELATION_FIELDS` is keyed by name, which
 /// is what a query gives us.
 pub fn relation_columns(file: &[u8], page_size: usize, relation_name: &str) -> Vec<RelationColumn> {
+    // A SYSTEM relation's columns are memoised, for the same reason and
+    // with the same safety argument as [crate::sysfmt::system_relation_formats]:
+    // this walks every data page of RDB$RELATION_FIELDS on every call and
+    // has 120 call sites, and after the format cache landed it was 60.9%
+    // of what the server still burned per statement (with `sqz::unpack`
+    // and `cstr` beneath it).
+    //
+    // ONLY system relations. A user relation's column set changes under
+    // ALTER TABLE - that is most of what DDL does - and serving a stale
+    // one would resolve names against columns the table no longer has.
+    // A system relation's columns are fixed by the ODS for the life of
+    // the database. The key carries the ODS major and the page size so
+    // two attachments to different databases cannot share an entry.
+    if let Some(hit) = cached_system_columns(file, page_size, relation_name) {
+        return hit;
+    }
+    relation_columns_uncached(file, page_size, relation_name)
+}
+
+fn cached_system_columns(
+    file: &[u8],
+    page_size: usize,
+    relation_name: &str,
+) -> Option<Vec<RelationColumn>> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    let name = relation_name.trim();
+    if !(name.starts_with("RDB$") || name.starts_with("MON$") || name.starts_with("SEC$")) {
+        return None;
+    }
+    let ods = crate::header::HeaderPage::decode(file)?.ods_major();
+    static CACHE: OnceLock<Mutex<HashMap<(u16, usize, String), Vec<RelationColumn>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (ods, page_size, name.to_string());
+    if let Ok(g) = cache.lock() {
+        if let Some(hit) = g.get(&key) {
+            return Some(hit.clone());
+        }
+    }
+    let computed = relation_columns_uncached(file, page_size, relation_name);
+    if let Ok(mut g) = cache.lock() {
+        g.insert(key, computed.clone());
+    }
+    Some(computed)
+}
+
+fn relation_columns_uncached(
+    file: &[u8],
+    page_size: usize,
+    relation_name: &str,
+) -> Vec<RelationColumn> {
     let want = relation_name.trim();
     let mut out = Vec::new();
     for dp_no in relation_data_pages(file, page_size, REL_RELATION_FIELDS) {
