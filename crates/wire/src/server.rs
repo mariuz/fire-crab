@@ -1978,6 +1978,23 @@ enum Term {
     /// from); at execute, [Predicate::bind] substitutes the arrived
     /// value as a literal and the term becomes an ordinary [ExprCond].
     ExprParam(Box<Expr>, Cmp, usize, ColKind),
+    /// `? IS [NOT] NULL` - ROW-INDEPENDENT, decided at bind, and
+    /// TYPE-BLIND there (probed: a text value in the slot answers 0
+    /// rows, no error). The slot describes as SQL_NULL (32766/len 0),
+    /// the engine's own makeNullString describe.
+    ParamIsNull(usize, bool),
+    /// `? [NOT] LIKE <pattern> [ESCAPE c]` - the bound value against a
+    /// literal or second-parameter pattern; becomes Const at bind.
+    /// NULL on either side is UNKNOWN under both polarities (probed).
+    ParamLike(usize, Rhs, Option<char>, bool),
+    /// `? [NOT] STARTING [WITH] <prefix>` - per-byte, no trimming
+    /// (probed: a bound ' 1' prefixes nothing that '1' does).
+    ParamStarting(usize, Rhs, bool),
+    /// `<integer column> [NOT] STARTING WITH ?` - the column rendered
+    /// to its decimal text against the BOUND prefix (probed: '1'
+    /// matches N=1 and N=10, '' matches every non-NULL N, a blr_long 1
+    /// binds as '1'); becomes [Term::ExprStarting] at bind.
+    ExprStartingParam(Box<Expr>, usize, bool),
 }
 
 /// A resolved WHERE predicate in disjunctive normal form (OR of ANDs),
@@ -2173,6 +2190,92 @@ impl Predicate {
                             Some(rhs) => Term::Starting(*fid, rhs, *negated),
                         }
                     }
+                    // `? IS [NOT] NULL` - decided HERE, row-independently,
+                    // and TYPE-BLIND (probed: any typed bind answers as
+                    // "not null", no error)
+                    Term::ParamIsNull(slot, negated) => Term::Const(
+                        matches!(
+                            args.get(*slot).ok_or("missing parameter value")?,
+                            WireParam::Null
+                        ) != *negated,
+                    ),
+                    Term::ParamLike(slot, pattern, escape, negated) => {
+                        // the tested value: text as-is, an integer
+                        // rendered to its decimal text (the engine
+                        // renders; probed: a blr_long bind answers, no
+                        // error), NULL is UNKNOWN both ways
+                        let fetch = |s: usize| -> Result<Option<String>, String> {
+                            match args.get(s).ok_or("missing parameter value")? {
+                                WireParam::Null => Ok(None),
+                                WireParam::Text(t) => Ok(Some(t.clone())),
+                                WireParam::Int(v, 0) => Ok(Some(v.to_string())),
+                                _ => Err("parameter type does not match its column"
+                                    .to_string()),
+                            }
+                        };
+                        let Some(val) = fetch(*slot)? else {
+                            terms.push(Term::Never);
+                            continue;
+                        };
+                        let pat = match pattern {
+                            Rhs::Str(p) => Some(p.clone()),
+                            Rhs::Param(pslot, _) => fetch(*pslot)?,
+                            _ => None,
+                        };
+                        match pat {
+                            Some(p) => Term::Const(
+                                like_match(&val, &p, *escape) != *negated,
+                            ),
+                            None => Term::Never,
+                        }
+                    }
+                    Term::ParamStarting(slot, prefix, negated) => {
+                        let fetch = |s: usize| -> Result<Option<String>, String> {
+                            match args.get(s).ok_or("missing parameter value")? {
+                                WireParam::Null => Ok(None),
+                                WireParam::Text(t) => Ok(Some(t.clone())),
+                                WireParam::Int(v, 0) => Ok(Some(v.to_string())),
+                                _ => Err("parameter type does not match its column"
+                                    .to_string()),
+                            }
+                        };
+                        let Some(val) = fetch(*slot)? else {
+                            terms.push(Term::Never);
+                            continue;
+                        };
+                        let pre = match prefix {
+                            Rhs::Str(p) => Some(p.clone()),
+                            Rhs::Param(pslot, _) => fetch(*pslot)?,
+                            _ => None,
+                        };
+                        match pre {
+                            // per-byte, no trimming - the literal rule
+                            Some(p) => Term::Const(
+                                val.starts_with(p.as_str()) != *negated,
+                            ),
+                            None => Term::Never,
+                        }
+                    }
+                    // `<int col> STARTING WITH ?`: the bound prefix
+                    // becomes the literal and the term the ordinary
+                    // per-row column-to-text render
+                    Term::ExprStartingParam(e, slot, negated) => {
+                        match args.get(*slot).ok_or("missing parameter value")? {
+                            WireParam::Null => Term::Never,
+                            WireParam::Text(t) => {
+                                Term::ExprStarting(e.clone(), t.clone(), *negated)
+                            }
+                            // probed: a blr_long 1 binds as '1'
+                            WireParam::Int(v, 0) => {
+                                Term::ExprStarting(e.clone(), v.to_string(), *negated)
+                            }
+                            _ => {
+                                return Err(
+                                    "parameter type does not match its column".into()
+                                )
+                            }
+                        }
+                    }
                     // an expression side against a parameter: the value
                     // becomes a literal expression and the term an
                     // ordinary three-valued comparison
@@ -2319,6 +2422,10 @@ impl Term {
             // an unbound parameter never matches (the execute path
             // binds before evaluating; this is the defensive answer)
             Term::ExprParam(..) => false,
+            Term::ParamIsNull(..)
+            | Term::ParamLike(..)
+            | Term::ParamStarting(..)
+            | Term::ExprStartingParam(..) => false,
         })
     }
 }
@@ -2397,6 +2504,10 @@ fn nullable(sql_type: i32) -> i32 {
 fn wire_for(d: &Descriptor) -> (Wire, i32, i32, i32, i32) {
     let scale = d.scale as i32;
     match d.dtype {
+        // the SQL_NULL bind slot a `? IS NULL` predicate describes -
+        // the engine's own makeNullString describe (32766, length 0,
+        // probed); the bind is type-blind, so the wire form is inert
+        dtype::UNKNOWN => (Wire::Varying, 32766, 0, 0, 0), // SQL_NULL
         dtype::SHORT => (Wire::Int32, 500, 2, scale, 0), // SQL_SHORT
         dtype::LONG => (Wire::Int32, 496, 4, scale, 0),  // SQL_LONG
         dtype::INT64 => (Wire::Int64, 580, 8, scale, 0), // SQL_INT64
@@ -10266,6 +10377,10 @@ fn filter_has_params(filter: &Option<Predicate>) -> bool {
                     | Term::Like(_, Rhs::Param(..), _, _)
                     | Term::Starting(_, Rhs::Param(..), _)
                     | Term::ExprParam(..)
+                    | Term::ParamIsNull(..)
+                    | Term::ParamLike(..)
+                    | Term::ParamStarting(..)
+                    | Term::ExprStartingParam(..)
             )
         })
     })
@@ -23729,6 +23844,13 @@ enum RawLhs {
     /// a built-in function call ([Tok::FnExpr]) as the tested side:
     /// `WHERE UPPER(S) = 'X'`, `WHERE CHAR_LENGTH(S) > 3`
     Expr(RawExpr),
+    /// a `?` as the TESTED side of a non-comparison predicate -
+    /// `? IS NULL`, `? LIKE 'o%'`, `? STARTING WITH 'a'`. (A `?`
+    /// beside a COMPARISON mirrors into the other side instead, and
+    /// `? BETWEEN`/`? IN` desugar into those mirrored leaves.) Only
+    /// [resolve_predicate] resolves this; every other resolver
+    /// refuses it.
+    Param(usize),
 }
 #[derive(Clone)]
 enum RawKind {
@@ -24030,6 +24152,185 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                     }));
                 }
             }
+            // The slot number, for the shapes below that keep the `?`
+            // as the TESTED side
+            let slot = match &param {
+                Rhs::Param(s, _) => *s,
+                _ => return None, // parse_value on Tok::Param yields Param
+            };
+            // `? IS [NOT] NULL` / `? IS UNKNOWN` (UNKNOWN lexes as
+            // Tok::Null, and the engine's truth table is identical,
+            // probed) - a ROW-INDEPENDENT predicate decided at bind,
+            // and TYPE-BLIND there (probed: a text value in the slot
+            // answers 0 rows, no error). The slot describes as
+            // SQL_NULL (32766, length 0) - the engine's own
+            // makeNullString describe, probed.
+            if matches!(t.get(p2), Some(Tok::Is)) {
+                let mut p3 = p2 + 1;
+                let not = matches!(t.get(p3), Some(Tok::Not));
+                if not {
+                    p3 += 1;
+                }
+                if matches!(t.get(p3), Some(Tok::Null)) {
+                    *pos = p3 + 1;
+                    *np = np2;
+                    return Some(Ast::Leaf(RawTerm {
+                        lhs: RawLhs::Param(slot),
+                        kind: if not { RawKind::IsNotNull } else { RawKind::IsNull },
+                    }));
+                }
+                // `? IS TRUE/FALSE/DISTINCT FROM` with a param left
+                // side: unprobed - refuse
+                return None;
+            }
+            // an optional NOT before LIKE/BETWEEN/IN/STARTING, the
+            // same lookahead the column path uses below
+            let mut p3 = p2;
+            let negated = if matches!(t.get(p3), Some(Tok::Not))
+                && (matches!(t.get(p3 + 1), Some(Tok::Like | Tok::Between | Tok::In))
+                    || matches!(t.get(p3 + 1), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("STARTING")))
+            {
+                p3 += 1;
+                true
+            } else {
+                false
+            };
+            // a bound literal as a RawExpr, for the BETWEEN/IN
+            // desugars whose leaves mirror `<literal> <op> ?`
+            let raw_of = |r: &Rhs| -> Option<RawExpr> {
+                Some(match r {
+                    Rhs::Int(n) => RawExpr::Int(*n),
+                    Rhs::Num(v, s) => RawExpr::Dec(*v, *s),
+                    Rhs::Str(s) => RawExpr::Str(s.clone()),
+                    Rhs::Null => RawExpr::Null,
+                    Rhs::Param(..) => return None,
+                })
+            };
+            match t.get(p3) {
+                // `? [NOT] LIKE <pattern> [ESCAPE 'c']` - pattern is a
+                // string literal, a second parameter (the engine
+                // answers `? LIKE ?`, probed), or NULL (permanently
+                // UNKNOWN); a numeric pattern refuses, as LIKE does
+                Some(Tok::Like) => {
+                    let mut p4 = p3 + 1;
+                    let pattern = parse_value(t, &mut p4, &mut np2)?;
+                    if matches!(pattern, Rhs::Int(_) | Rhs::Num(..)) {
+                        return None;
+                    }
+                    let escape = if matches!(t.get(p4), Some(Tok::Escape)) {
+                        p4 += 1;
+                        let Some(Tok::Str(e)) = t.get(p4) else { return None };
+                        let mut chars = e.chars();
+                        let c = chars.next()?;
+                        if chars.next().is_some() {
+                            return None;
+                        }
+                        p4 += 1;
+                        Some(c)
+                    } else {
+                        None
+                    };
+                    *pos = p4;
+                    *np = np2;
+                    return Some(Ast::Leaf(RawTerm {
+                        lhs: RawLhs::Param(slot),
+                        kind: RawKind::Like(pattern, escape, negated),
+                    }));
+                }
+                // `? [NOT] STARTING [WITH] <prefix>` - same shape,
+                // no ESCAPE (the engine answers `? STARTING WITH ?`)
+                Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("STARTING") => {
+                    let mut p4 = p3 + 1;
+                    if matches!(t.get(p4), Some(Tok::Ident(w2)) if w2.eq_ignore_ascii_case("WITH"))
+                    {
+                        p4 += 1;
+                    }
+                    let prefix = parse_value(t, &mut p4, &mut np2)?;
+                    if matches!(prefix, Rhs::Int(_) | Rhs::Num(..)) {
+                        return None;
+                    }
+                    *pos = p4;
+                    *np = np2;
+                    return Some(Ast::Leaf(RawTerm {
+                        lhs: RawLhs::Param(slot),
+                        kind: RawKind::Starting(prefix, negated),
+                    }));
+                }
+                // `? [NOT] BETWEEN <lo> AND <hi>` desugars into the
+                // MIRRORED comparison leaves this parser already
+                // answers - `lo <= ?` AND `hi >= ?` - both referencing
+                // the ONE slot (claimed above, before the bounds).
+                // Param bounds refuse (the engine refuses them too,
+                // -804 "Data type unknown", even with one typed
+                // bound); a Str bound mixed with a numeric one refuses
+                // (the engine defers a conversion error to execute -
+                // refusing at prepare is the deliberate boundary).
+                Some(Tok::Between) => {
+                    let mut p4 = p3 + 1;
+                    let lo = parse_value(t, &mut p4, &mut np2)?;
+                    if !matches!(t.get(p4), Some(Tok::And)) {
+                        return None;
+                    }
+                    p4 += 1;
+                    let hi = parse_value(t, &mut p4, &mut np2)?;
+                    let is_str = |r: &Rhs| matches!(r, Rhs::Str(_));
+                    let is_num = |r: &Rhs| matches!(r, Rhs::Int(_) | Rhs::Num(..));
+                    if (is_str(&lo) && is_num(&hi)) || (is_num(&lo) && is_str(&hi)) {
+                        return None;
+                    }
+                    let leaf = |bound: &Rhs, op: Cmp| -> Option<Ast> {
+                        Some(Ast::Leaf(RawTerm {
+                            lhs: RawLhs::Expr(raw_of(bound)?),
+                            kind: RawKind::Cmp(op, param.clone()),
+                        }))
+                    };
+                    let body =
+                        Ast::And(vec![leaf(&lo, Cmp::Le)?, leaf(&hi, Cmp::Ge)?]);
+                    *pos = p4;
+                    *np = np2;
+                    return Some(if negated { Ast::Not(Box::new(body)) } else { body });
+                }
+                // `? [NOT] IN (v, ...)` - an OR of mirrored
+                // equalities over the one slot. A parameter ITEM
+                // refuses (the engine answers `? IN (?, 2)` by typing
+                // the inner ? from the list - a recorded boundary),
+                // and Str mixed with numeric refuses (the engine's
+                // semantics there raise per-bind conversion errors).
+                Some(Tok::In) => {
+                    let mut p4 = p3 + 1;
+                    if !matches!(t.get(p4), Some(Tok::LParen)) {
+                        return None;
+                    }
+                    p4 += 1;
+                    let mut items = vec![parse_value(t, &mut p4, &mut np2)?];
+                    while matches!(t.get(p4), Some(Tok::Comma)) {
+                        p4 += 1;
+                        items.push(parse_value(t, &mut p4, &mut np2)?);
+                    }
+                    if !matches!(t.get(p4), Some(Tok::RParen)) {
+                        return None;
+                    }
+                    p4 += 1;
+                    let any_str = items.iter().any(|r| matches!(r, Rhs::Str(_)));
+                    let any_num =
+                        items.iter().any(|r| matches!(r, Rhs::Int(_) | Rhs::Num(..)));
+                    if any_str && any_num {
+                        return None;
+                    }
+                    let mut ors = Vec::new();
+                    for item in &items {
+                        ors.push(Ast::Leaf(RawTerm {
+                            lhs: RawLhs::Expr(raw_of(item)?),
+                            kind: RawKind::Cmp(Cmp::Eq, param.clone()),
+                        }));
+                    }
+                    let body = Ast::Or(ors);
+                    *pos = p4;
+                    *np = np2;
+                    return Some(if negated { Ast::Not(Box::new(body)) } else { body });
+                }
+                _ => {}
+            }
             // A `?` that IS the whole predicate - `WHERE ?`, `WHERE ?
             // AND ID > 1`. The engine describes it as SQL_BOOLEAN
             // (probed: dtype 32764, length 1) and answers it as
@@ -24040,14 +24341,12 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
             // already probed against the engine. Nothing downstream
             // needs to learn anything.
             //
-            // The boundary set is the narrow one, and for the same two
-            // reasons as the bare BOOLEAN COLUMN rule below: side_boundary
-            // is the wrong test (it counts an operator as the end of a
-            // side), and `WHERE ? IS NULL`, `WHERE ? LIKE 'o%'`,
-            // `WHERE ? BETWEEN 1 AND 3` and `WHERE ? IN (1,2)` are
-            // DIFFERENT shapes - the engine answers all four and this
-            // parser covers none of them, so they must keep refusing
-            // rather than be mis-read as `TRUE = ?` with tokens left over.
+            // The boundary set is the narrow one, for the same two
+            // reasons as the bare BOOLEAN COLUMN rule below:
+            // side_boundary is the wrong test (it counts an operator
+            // as the end of a side), and an unrecognized shape after
+            // the `?` must keep refusing rather than be mis-read as
+            // `TRUE = ?` with tokens left over.
             if matches!(t.get(p2), None | Some(Tok::And | Tok::Or | Tok::RParen)) {
                 *pos = p2;
                 *np = np2;
@@ -25422,6 +25721,12 @@ fn resolve_predicate(
                 terms.push(Term::Const(b));
                 continue;
             }
+            // a `?` as the TESTED side - `? IS NULL`, `? LIKE ...`,
+            // `? STARTING WITH ...` - resolves without any column
+            if let RawLhs::Param(slot) = &rt.lhs {
+                terms.push(resolve_param_lhs(*slot, &rt.kind, params)?);
+                continue;
+            }
             // an EXPRESSION on either side takes the expression-predicate
             // path (Cond2 evaluation per row)
             if matches!(rt.lhs, RawLhs::Expr(_)) || matches!(rt.kind, RawKind::CmpExpr(..)) {
@@ -25464,6 +25769,86 @@ fn resolve_predicate(
     Some(Predicate(groups))
 }
 
+/// Resolve a `?`-as-tested-side term ([RawLhs::Param]): claim the slot
+/// with the shape's own bind descriptor and emit the bind-time Term.
+/// Every shape here was probed against the engine (see the ParamIsNull
+/// / ParamLike / ParamStarting docs for the semantics each carries).
+fn resolve_param_lhs(
+    slot: usize,
+    kind: &RawKind,
+    params: &mut Vec<Option<Descriptor>>,
+) -> Option<Term> {
+    let mut claim = |slot: usize, d: Descriptor| {
+        if params.len() <= slot {
+            params.resize(slot + 1, None);
+        }
+        params[slot] = Some(d);
+    };
+    // the synthesized wide-text bind target, the 25500s convention
+    let text_desc = || Descriptor {
+        dtype: dtype::VARYING,
+        scale: 0,
+        length: 32765,
+        sub_type: 0,
+        flags: 0,
+        offset: 4,
+    };
+    // the SQL_NULL slot (32766/len 0) - what the engine describes for
+    // `? IS NULL`, and honest: the bind is type-blind
+    let null_desc = || Descriptor {
+        dtype: dtype::UNKNOWN,
+        scale: 0,
+        length: 0,
+        sub_type: 0,
+        flags: 0,
+        offset: 0,
+    };
+    Some(match kind {
+        RawKind::IsNull => {
+            claim(slot, null_desc());
+            Term::ParamIsNull(slot, false)
+        }
+        RawKind::IsNotNull => {
+            claim(slot, null_desc());
+            Term::ParamIsNull(slot, true)
+        }
+        RawKind::Like(pattern, escape, negated) => {
+            claim(slot, text_desc());
+            match pattern {
+                Rhs::Str(_) => {
+                    Term::ParamLike(slot, pattern.clone(), *escape, *negated)
+                }
+                Rhs::Param(pslot, _) => {
+                    claim(*pslot, text_desc());
+                    Term::ParamLike(
+                        slot,
+                        Rhs::Param(*pslot, ColKind::Text),
+                        *escape,
+                        *negated,
+                    )
+                }
+                // `? LIKE NULL` is UNKNOWN for every bind (probed) -
+                // but the slot still describes, so prepare succeeds
+                Rhs::Null => Term::Never,
+                _ => return None,
+            }
+        }
+        RawKind::Starting(prefix, negated) => {
+            claim(slot, text_desc());
+            match prefix {
+                Rhs::Str(_) => Term::ParamStarting(slot, prefix.clone(), *negated),
+                Rhs::Param(pslot, _) => {
+                    claim(*pslot, text_desc());
+                    Term::ParamStarting(slot, Rhs::Param(*pslot, ColKind::Text), *negated)
+                }
+                Rhs::Null => Term::Never,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    })
+}
+
 /// Resolve a term with an EXPRESSION on either side into a
 /// [Term::ExprCond] / [Term::ExprLike] / [Term::ExprParam]. The
 /// comparison itself is [Cond2]'s: three-valued, exact numeric
@@ -25482,6 +25867,8 @@ fn resolve_expr_term(
         RawLhs::Expr(e) => resolve_expr(e, columns, descs)?,
         RawLhs::Col(name) => resolve_expr(&RawExpr::Col(name.clone()), columns, descs)?,
         RawLhs::Agg(..) => return None,
+        // resolve_predicate routes a param lhs before this runs
+        RawLhs::Param(_) => return None,
     };
     // a literal right side becomes the matching literal expression
     let rhs_expr = |rhs: &Rhs| -> Option<Expr> {
@@ -25889,13 +26276,35 @@ fn param_or_typed_term(
             claim(slot)?;
             Some(Term::Like(idx, Rhs::Param(slot, ColKind::Text), escape, negated))
         }
-        RawKind::Starting(Rhs::Param(slot, _), negated) => {
-            if kind != ColKind::Text {
-                return None;
+        RawKind::Starting(Rhs::Param(slot, _), negated) => match kind {
+            ColKind::Text => {
+                claim(slot)?;
+                Some(Term::Starting(idx, Rhs::Param(slot, ColKind::Text), negated))
             }
-            claim(slot)?;
-            Some(Term::Starting(idx, Rhs::Param(slot, ColKind::Text), negated))
-        }
+            // an INTEGER column: the engine renders the column to its
+            // decimal text and describes the SLOT as TEXT (probed:
+            // 448/120 for N INTEGER; '1' matches N=1 AND N=10, ''
+            // matches every non-NULL N, ' 1' matches none, a blr_long
+            // 1 binds as '1'). Mirrors the literal-prefix arm in
+            // typed_term. The slot claims the SYNTHESIZED text
+            // descriptor, not the column's - param_target_ok vets
+            // column targets and does not apply here.
+            ColKind::Int => {
+                if params.len() <= slot {
+                    params.resize(slot + 1, None);
+                }
+                params[slot] = Some(Descriptor {
+                    dtype: dtype::VARYING,
+                    scale: 0,
+                    length: 32765,
+                    sub_type: 0,
+                    flags: 0,
+                    offset: 4,
+                });
+                Some(Term::ExprStartingParam(Box::new(Expr::Col(idx)), slot, negated))
+            }
+            _ => None,
+        },
         other => typed_term(idx, kind, other),
     }
 }
@@ -25926,6 +26335,8 @@ fn resolve_having(
             let (idx, kind) = match &rt.lhs {
                 // a function call in HAVING is a later slice - refuse
                 RawLhs::Expr(_) => return None,
+                // a `?` as the tested side of a HAVING: unprobed - refuse
+                RawLhs::Param(_) => return None,
                 RawLhs::Col(col) => {
                     let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(col))?;
                     let fid = rc.field_id as usize;
@@ -29907,6 +30318,70 @@ mod tests {
         // multi-byte: `_` is one CHARACTER
         assert!(like_match("héllo", "h_llo", None));
         assert!(like_match("héllo", "h%o", None));
+    }
+
+    #[test]
+    fn param_as_tested_side_parses_and_binds() {
+        let dnf = |s: &str| {
+            let mut np = 0;
+            let d = parse_predicate(&tokenize(s).unwrap(), &mut np).unwrap();
+            (d, np)
+        };
+        // ? IS [NOT] NULL is one leaf on the param itself
+        let (d, np) = dnf("? IS NULL");
+        assert_eq!(np, 1);
+        assert!(matches!(&d[0][0],
+            RawTerm { lhs: RawLhs::Param(0), kind: RawKind::IsNull }));
+        let (d, _) = dnf("? IS NOT NULL");
+        assert!(matches!(&d[0][0].kind, RawKind::IsNotNull));
+        // ? BETWEEN desugars into the mirrored comparisons, BOTH
+        // referencing the ONE slot (lo <= ?, hi >= ?)
+        let (d, np) = dnf("? BETWEEN 1 AND 3");
+        assert_eq!((np, d.len(), d[0].len()), (1, 1, 2));
+        assert!(matches!(&d[0][0].kind, RawKind::Cmp(Cmp::Le, Rhs::Param(0, _))));
+        assert!(matches!(&d[0][1].kind, RawKind::Cmp(Cmp::Ge, Rhs::Param(0, _))));
+        assert!(matches!(&d[0][0].lhs, RawLhs::Expr(RawExpr::Int(1))));
+        // ? IN is an OR of mirrored equalities over the one slot
+        let (d, np) = dnf("? IN (1, 2)");
+        assert_eq!((np, d.len()), (1, 2));
+        assert!(matches!(&d[0][0].kind, RawKind::Cmp(Cmp::Eq, Rhs::Param(0, _))));
+        assert!(matches!(&d[1][0].kind, RawKind::Cmp(Cmp::Eq, Rhs::Param(0, _))));
+        // NOT IN pushes De Morgan through: AND of Ne
+        let (d, _) = dnf("? NOT IN (1, 2)");
+        assert_eq!((d.len(), d[0].len()), (1, 2));
+        assert!(matches!(&d[0][0].kind, RawKind::Cmp(Cmp::Ne, Rhs::Param(0, _))));
+        // a param BOUND refuses (the engine refuses too, -804)
+        assert!(parse_predicate(&tokenize("? BETWEEN ? AND 3").unwrap(), &mut 0).is_none());
+        // mixed text/numeric bounds refuse at prepare
+        assert!(parse_predicate(&tokenize("? BETWEEN 1 AND 'x'").unwrap(), &mut 0).is_none());
+        assert!(parse_predicate(&tokenize("? IN (1, 'a')").unwrap(), &mut 0).is_none());
+        // ? LIKE ? claims two slots in textual order
+        let (d, np) = dnf("? LIKE ?");
+        assert_eq!(np, 2);
+        assert!(matches!(&d[0][0],
+            RawTerm { lhs: RawLhs::Param(0), kind: RawKind::Like(Rhs::Param(1, _), None, false) }));
+
+        // the bind: ? IS NULL is type-blind and row-independent
+        let mut params = Vec::new();
+        let (d, _) = dnf("? IS NULL");
+        let p = resolve_predicate(d, &[], &[], &mut params).unwrap();
+        // the slot describes as SQL_NULL (32766/len 0)
+        assert_eq!(params[0].as_ref().unwrap().dtype, dtype::UNKNOWN);
+        let b = p.bind(&[WireParam::Null]).unwrap();
+        assert!(b.matches(&[]).unwrap());
+        let b = p.bind(&[WireParam::Text("x".into())]).unwrap();
+        assert!(!b.matches(&[]).unwrap());
+        // ? LIKE: NULL pattern or value is UNKNOWN both ways
+        let (d, _) = dnf("? NOT LIKE 'o%'");
+        let p = resolve_predicate(d, &[], &[], &mut Vec::new()).unwrap();
+        assert!(!p.bind(&[WireParam::Null]).unwrap().matches(&[]).unwrap());
+        assert!(p.bind(&[WireParam::Text("x".into())]).unwrap().matches(&[]).unwrap());
+        assert!(!p.bind(&[WireParam::Text("ok".into())]).unwrap().matches(&[]).unwrap());
+        // an integer bind renders to decimal text (probed engine rule)
+        let (d, _) = dnf("? STARTING WITH '1'");
+        let p = resolve_predicate(d, &[], &[], &mut Vec::new()).unwrap();
+        assert!(p.bind(&[WireParam::Int(10, 0)]).unwrap().matches(&[]).unwrap());
+        assert!(!p.bind(&[WireParam::Int(25, 0)]).unwrap().matches(&[]).unwrap());
     }
 
     #[test]

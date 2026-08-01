@@ -19,6 +19,9 @@ use crate::{u16_at, u32_at, u64_at, DataPage};
 
 /// dtype constants, dsc_pub.h:45-67.
 pub mod dtype {
+    /// dtype_unknown - never a stored column's dtype; used for the
+    /// SQL_NULL bind slot a `? IS NULL` predicate describes
+    pub const UNKNOWN: u8 = 0;
     pub const TEXT: u8 = 1;
     pub const VARYING: u8 = 3;
     pub const SHORT: u8 = 8;

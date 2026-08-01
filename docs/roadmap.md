@@ -40,11 +40,25 @@ four; R7 is the removal of what they replaced.
 - ~~A bare boolean parameter as a whole predicate~~ — *fixed*. `WHERE ?`
   is `TRUE = ?` with the `TRUE =` elided: the engine describes the slot
   as `SQL_BOOLEAN` and answers ordinary three-valued logic, and that leaf
-  was one the parser already built. One `else` branch, nothing downstream
-  changed. `WHERE ? IS NULL`, `WHERE ? LIKE 'o%'`, `WHERE ? BETWEEN 1 AND 3`
-  and `WHERE ? IN (1,2)` are *different shapes* the engine also answers
-  and this parser covers none of — still refused, deliberately, rather
-  than mis-read as `TRUE = ?` with tokens left over.
+  was one the parser already built.
+
+- ~~`WHERE ? IS NULL`, `? LIKE 'o%'`, `? BETWEEN 1 AND 3`, `? IN (1,2)`~~
+  — *fixed*, plus `? STARTING WITH`, `? LIKE ?`, `? STARTING WITH ?`,
+  and the refuter's `N STARTING WITH ?` (integer column, text slot).
+  The load-bearing probe discovery: the mirrored comparisons already
+  answered, so BETWEEN/IN are a parse-time desugar into `lo <= ? AND
+  hi >= ?` / an OR of equalities, all referencing the ONE slot — only
+  IS NULL/LIKE/STARTING needed new bind-time terms. Engine laws pinned:
+  `? IS NULL` describes as SQL_NULL (32766/len 0) and the bind is
+  TYPE-BLIND; NULL binds are UNKNOWN under both polarities everywhere;
+  `? BETWEEN 1 AND 3` takes `'2.5'` and raises a conversion error on
+  `'x'` at EXECUTE on both sides; `? NOT IN (1, NULL)` is never true.
+  `qa/serve-real-paramshapes.sh`, 83 checks. Refused deliberately, with
+  the engine's answers recorded in the gate: `? IN (?, 2)` (the engine
+  types the inner `?` from the list), `? IN (1, 'a')` (per-bind
+  conversion semantics), `? BETWEEN 1 AND 'x'` (conversion deferred to
+  execute), `? IS DISTINCT FROM 5`, `N LIKE ?` (same treatment as
+  STARTING would fix it — the probes are already captured).
 
 - ~~A text parameter into a numeric column or filter~~ — *fixed*. It was
   the largest single hole in the parameter surface (82 of 119 measured

@@ -13,6 +13,45 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — The parameter takes the stand
+
+`WHERE ? IS NULL`, `? LIKE 'o%'`, `? BETWEEN 1 AND 3`, `? IN (1,2)` —
+the four shapes the roadmap carried as "the engine answers all of them
+and this parser covers none" — answer now, plus `? STARTING WITH`,
+`? LIKE ?`, `? STARTING WITH ?`, and the refuter's `N STARTING WITH ?`.
+
+### Converted
+- The load-bearing probe discovery: fire-crab already answered every
+  MIRRORED comparison (`? = 1`, `? >= 1.5`) with engine-identical rows,
+  so BETWEEN and IN are a parse-time DESUGAR into those leaves —
+  `lo <= ? AND hi >= ?`, an OR of equalities — all referencing the ONE
+  slot (claimed before the bounds, so `? LIKE ?` numbers its two slots
+  in textual order). Only IS NULL / LIKE / STARTING needed new terms,
+  each ROW-INDEPENDENT and decided at bind.
+- Engine laws probed and pinned: `? IS NULL` describes as SQL_NULL
+  (32766, length 0 — the engine's makeNullString describe, now a real
+  dtype::UNKNOWN arm in wire_for) and the bind is TYPE-BLIND (a text
+  value answers "not null", no error); `? IS UNKNOWN` is the same
+  predicate; NULL binds are UNKNOWN under both polarities everywhere;
+  `? BETWEEN 1 AND 3` takes '2.5' with the fraction kept; text items
+  are pad-insensitive in the mirrored compare; `? NOT IN (1, NULL)` is
+  never true.
+- `N STARTING WITH ?` (INTEGER column): the engine describes the SLOT
+  as text and renders the COLUMN per row — '1' matches N=1 and N=10,
+  '' matches every non-NULL N, ' 1' matches none, and a blr_long 1
+  binds as '1'. param_or_typed_term routes the Int-column case into a
+  bind-time ExprStarting.
+- New `qa/serve-real-paramshapes.sh`, 83 checks, including error
+  parity ('x' into an int-anchored BETWEEN raises at EXECUTE on both
+  sides) and the refusal pins.
+
+### Guarded
+- Refused deliberately, engine answers recorded: `? IN (?, 2)` (the
+  engine types the inner ? from the list — asymmetric with BETWEEN,
+  which refuses -804 even with one typed bound), `? IN (1, 'a')`
+  (per-bind conversion semantics), `? BETWEEN 1 AND 'x'`,
+  `? IS DISTINCT FROM 5`, `N LIKE ?`.
+
 ## 2026-08-01 — Sixteen DIFFs, one stale path
 
 The "environment drift" recorded yesterday — serve-real-index 346/13,
