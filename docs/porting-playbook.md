@@ -1834,6 +1834,22 @@ them.
   rows the first guard was protecting. Push the refusal down into the
   function that knows it cannot answer, so every caller inherits it.
 
+- **A consistency check that cannot distinguish its two hypotheses will
+  blame the wrong one.** "Does this index entry still describe its
+  record?" was answered by rebuilding the key and comparing bytes — so
+  every disagreement between our encoder and the reference's read as *the
+  entry is stale*, and the row was dropped. Four separate encoder bugs
+  arrived as four sets of missing rows. Before trusting a check like
+  that, ask what ELSE could make it fail, and then ask what it costs to
+  be wrong in each direction. Here, keeping a doubtful candidate costs a
+  fetch; dropping one costs a row.
+
+- **Then narrow the check to where it is load-bearing.** This one had two
+  jobs and only one of them was still its own: duplicates were already
+  handled downstream. Running it only on the path that genuinely needs it
+  turned an entire class of future encoder bugs from data loss into
+  wasted work.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

@@ -13,6 +13,36 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — W1o: the check that could not tell the difference
+
+### Fixed
+- **An INT128 key could be one byte too long.** The BCD compressor
+  pushes the 4th byte of each cycle unconditionally; when the last
+  3-digit group lands there and is a multiple of 256, that byte is a
+  trailing `0x00` the engine's `makeBcdKey` does not write. About 2 in
+  3000 random `NUMERIC(38,6)` values — which is why it took random
+  full-range data to find, and why repeating digit patterns never did.
+
+### Contained — the more important half
+`entry_is_current` **cannot tell "this entry is stale" from "my encoder
+disagrees with the engine"**, and it treated both as staleness. Every
+encoder difference it met therefore became a MISSED ROW rather than a
+wasted fetch: a scaled `DECIMAL`, a `FLOAT` segment, `i64::MIN`, and now
+an INT128 one byte too long — four separate bugs, one failure mode.
+
+The check has exactly two jobs: stop a moved row coming back twice, and
+stop it appearing at its old key's position in a navigated walk. **The
+first is already done by the record-number dedup.** So the check now runs
+only when the walk IS the order. Outside navigation a differing key costs
+a fetch and the ordinary predicate decides — the same contract the index
+has everywhere else.
+
+That does not excuse the encoder bugs, and all four are fixed. It means
+the next one is a performance bug instead of a data-loss bug.
+
+`qa/serve-real-index.sh` is 338 checks. 372 unit tests and 8 gates
+confirm nothing moved.
+
 ## 2026-08-01 — W1n: three keys the engine never wrote
 
 The fleet's full report named root causes my previous fix had only

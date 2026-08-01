@@ -14959,13 +14959,28 @@ fn records_for(
     if !access.navigate() {
         cands.sort_by_key(|(_, _, recno)| *recno);
     }
+    // THE VERIFICATION IS ONLY APPLIED WHERE IT IS NEEDED, and that is
+    // navigation. Its purpose is twofold: to stop a moved row coming
+    // back twice, and to stop it appearing at its OLD key's position in
+    // a navigated walk. The first is already handled by the
+    // record-number dedup below. The second needs the check - but only
+    // when the walk IS the order.
+    //
+    // That matters because the check CANNOT TELL "this entry is stale"
+    // from "my encoder disagrees with the engine". Every encoder
+    // difference it met became a MISSED ROW: a scaled DECIMAL, a FLOAT
+    // segment, i64::MIN, an INT128 whose key was one byte too long. So
+    // outside navigation a differing key costs a wasted fetch, and the
+    // ordinary predicate decides - which is the same contract the index
+    // has everywhere else.
+    let verify = access.navigate();
     let mut seen: Vec<u64> = Vec::new();
     for (pick, entry_key, recno) in cands {
         if seen.contains(&recno) {
             continue;
         }
         for values in records_at_in(&db.bytes, db.page_size, rel, formats, &[recno]) {
-            if pick.entry_is_current(&entry_key, &values) {
+            if !verify || pick.entry_is_current(&entry_key, &values) {
                 seen.push(recno);
                 out.push(values);
             }

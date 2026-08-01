@@ -335,7 +335,16 @@ pub fn int128_bcd_key(v: i128, mut exp: i32) -> Vec<u8> {
         out.push(cur);
         cur = ((val as u32) << table[t].1) as u8;
         if table[t].1 == 0 {
-            out.push(cur);
+            // The 4th group of the cycle completes a byte. Push it only
+            // when it CARRIES something or when more digits follow: a
+            // trailing zero byte here is one the engine's makeBcdKey
+            // does not write, and a key one byte longer than the engine's
+            // is a key that matches nothing. It needed a value whose last
+            // 3-digit group lands at t == 3 AND is a multiple of 256 -
+            // about 2 in 3000 random NUMERIC(38,6) values.
+            if cur != 0 || p + 3 < dig {
+                out.push(cur);
+            }
             cur = 0;
             t = 0;
         } else {

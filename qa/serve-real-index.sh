@@ -98,7 +98,11 @@ CREATE INDEX UNJ_AF ON UNJ (A, F);
 CREATE INDEX UNJ_B ON UNJ (B);
 CREATE INDEX UNJ_AD ON UNJ (A, D);
 CREATE TABLE SN (ID INTEGER, BG BIGINT);
+CREATE TABLE Z128 (ID INTEGER, K INTEGER, N NUMERIC(38,6));
+CREATE TABLE CTB (ID INTEGER, K INTEGER, N BIGINT);
 CREATE INDEX SN_B ON SN (BG);
+CREATE INDEX Z128_I ON Z128 (K, N);
+CREATE INDEX CTB_I ON CTB (K, N);
 COMMIT;
 INSERT INTO EMP VALUES (1, 1, 100, 'a');
 INSERT INTO EMP VALUES (2, 1, 200, 'b');
@@ -171,6 +175,13 @@ INSERT INTO UNJ VALUES (7, 7, 1.7, 1.7, 13);
 INSERT INTO SN VALUES (1, -9223372036854775808);
 INSERT INTO SN VALUES (2, -9223372036854775807);
 INSERT INTO SN VALUES (3, 0);
+INSERT INTO Z128 VALUES (1, 1, 592189395975403986605735411451.897512);
+INSERT INTO Z128 VALUES (2, 1, 1.000000);
+INSERT INTO Z128 VALUES (3, 1, 613081327444869060060576626715.019256);
+INSERT INTO Z128 VALUES (4, 1, 0.250000);
+INSERT INTO CTB VALUES (1, 1, -9223372036854775808);
+INSERT INTO CTB VALUES (4, 1, 1);
+INSERT INTO CTB VALUES (7, 1, -2147483648);
 COMMIT;
 UPDATE RT SET K = 25 WHERE ID = 1;
 UPDATE RT SET K = 10 WHERE ID = 1;
@@ -867,6 +878,17 @@ indexed "... all of them at once" \
 both "a range over a column holding i64::MIN" \
      "SELECT ID FROM SN WHERE BG <= 0 ORDER BY ID"
 both "... and the whole column" "SELECT ID FROM SN ORDER BY ID"
+# An INT128 key whose LAST 3-digit group is a multiple of 256 grew a
+# trailing 0x00 byte the engine does not write - about 2 in 3000 random
+# NUMERIC(38,6) values, which is why it took random full-range data to
+# find. This value is one of them.
+indexed "a compound band over NUMERIC(38,6), one value keyed a byte too long" \
+        "SELECT ID FROM Z128 WHERE K = 1 ORDER BY ID"
+indexed "... counted" "SELECT COUNT(*) AS C FROM Z128 WHERE K = 1"
+# a compound band whose TRAILING segment holds i64::MIN, with no
+# predicate on that column at all
+indexed "a compound band whose trailing segment holds i64::MIN" \
+        "SELECT ID FROM CTB WHERE K = 1 ORDER BY ID"
 
 # --- 5f. ROW ORDER WITHOUT AN ORDER BY --------------------------------
 # The engine's non-navigational retrieval ORs its branches into a
