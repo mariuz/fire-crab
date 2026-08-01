@@ -121,6 +121,11 @@ refuses() { # <label> <sql>
 
 
 
+# `set -u` and a trap that names a variable it may reach before the
+# variable exists is a gate that fails for its own reasons - these are
+# declared up front so every trap below is safe whichever path runs.
+srv2=""
+srv3=""
 LOG=/tmp/fc-serve-carefulflush.log
 flushes() { grep -c "careful flush:" "$LOG" 2>/dev/null || true; }
 

@@ -113,6 +113,19 @@ it", which is a different risk profile from converting something new:
 the oracle already exists, so the gate is *behaviour must not change*
 plus *the subsystem is now on the path*.
 
+- **The optimizer's cost model has three further known gaps**, measured
+  by a fleet against the engine's own source and confirmed by sweeping
+  the crossover: `loop_cost` charges the index SCAN term against the
+  table's cardinality where the engine uses the index's PAGE count
+  (Retrieval.cpp:186-194), so a keyed loop looks roughly twice its true
+  cost; the driver's own natural scan is not charged at position 0
+  (InnerJoin.cpp:323); and only one hash arrangement is costed where the
+  engine takes the minimum over all of them. Between them the engine
+  crosses from HASH to a keyed loop at ~115 distinct inner values and
+  fcopt at ~441. None of these is a wrong ANSWER - they choose a slower
+  plan, not a different result - which is why they are recorded here
+  rather than fixed in a hurry.
+
 - **W1 — index-driven retrieval.** *(equality, ranges, compound prefixes, text keys, the fold's input, ORDER BY navigation, the FK check and DML targets done)* The first
   slice that put a converted subsystem on the running server's path.
   `crates/wire/Cargo.toml` now depends on `fire-crab-opt`, and **opt

@@ -1535,6 +1535,88 @@ pub fn index_selectivity(
     page_size: usize,
     index: &str,
 ) -> Result<f64, String> {
+    // THE MATCHED SEGMENT'S SELECTIVITY, NOT THE WHOLE INDEX'S.
+    //
+    // `RDB$INDICES.RDB$STATISTICS` is the figure for the WHOLE key - the
+    // last segment's, in effect. The engine costs a retrieval with
+    // `idx_rpt[j].idx_selectivity`, the figure for the segments the
+    // predicate actually MATCHED (Retrieval.cpp:1019), which for a
+    // compound index is a different number entirely: on `INDEX (K, B)`
+    // over 5000 rows with 10 distinct K, the whole-index figure is
+    // 0.0002 and segment 0's is 0.1 - five hundred times apart.
+    //
+    // Reading the wrong one made a keyed loop look 500x cheaper than it
+    // is, and produced a plan the engine does not choose:
+    //
+    //   engine:  PLAN HASH ("I" NATURAL, "O" NATURAL)
+    //   fcopt:   PLAN JOIN ("O" NATURAL, "I" INDEX (INNR_KB))
+    //
+    // A predicate is only ever matched against an index's LEADING
+    // segment here (`IndexInfo::matches`), so segment 0 is the figure
+    // this needs. `RDB$INDEX_SEGMENTS` holds it per position; the
+    // whole-index column remains the fallback for an index whose
+    // segments carry nothing.
+    if let Some(sel) = segment_selectivity(file, page_size, index, 0) {
+        return Ok(sel);
+    }
+    whole_index_selectivity(file, page_size, index)
+}
+
+/// `RDB$INDEX_SEGMENTS.RDB$STATISTICS` at `position`, when it holds one.
+fn segment_selectivity(
+    file: &[u8],
+    page_size: usize,
+    index: &str,
+    position: i64,
+) -> Option<f64> {
+    let rel = resolve_relation(file, page_size, "RDB$INDEX_SEGMENTS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$INDEX_SEGMENTS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$INDEX_SEGMENTS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let name_f = fid("RDB$INDEX_NAME")?;
+    let pos_f = fid("RDB$FIELD_POSITION")?;
+    let stat_f = fid("RDB$STATISTICS")?;
+    for dp_no in relation_data_pages(file, page_size, rel) {
+        let start = dp_no as usize * page_size;
+        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+            continue;
+        };
+        for r in dp.records() {
+            if !r.is_primary_record() {
+                continue;
+            }
+            let Some(image) = r.image() else { continue };
+            let values = decode_record(&image, descs);
+            let Some(Value::Text(n)) = values.get(name_f) else { continue };
+            if n.trim_end() != index {
+                continue;
+            }
+            let at = match values.get(pos_f) {
+                Some(Value::Int(p)) => *p,
+                _ => continue,
+            };
+            if at != position {
+                continue;
+            }
+            return match values.get(stat_f) {
+                Some(Value::Double(d)) => Some(*d),
+                Some(Value::Int(n)) => Some(*n as f64),
+                Some(Value::Scaled(raw, sc)) => Some(*raw as f64 * 10f64.powi(*sc as i32)),
+                // a NULL segment statistic is "never computed", which is
+                // not the same as zero - fall back rather than claim it
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+fn whole_index_selectivity(
+    file: &[u8],
+    page_size: usize,
+    index: &str,
+) -> Result<f64, String> {
     let rel = resolve_relation(file, page_size, "RDB$INDICES")
         .ok_or("no RDB$INDICES")?;
     let formats = system_relation_formats(file, page_size, "RDB$INDICES")

@@ -13,6 +13,50 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — The optimizer was reading the wrong selectivity
+
+A fleet sent to teach `opt` to key an indexed inner join reported, first,
+that it **already does** once statistics are fresh — correcting a premise
+an earlier fleet had left me with and I had repeated. Then it found what
+is actually wrong.
+
+### Fixed
+- **`index_selectivity` returned the WHOLE-INDEX figure where the engine
+  uses the MATCHED SEGMENT's.** `RDB$INDICES.RDB$STATISTICS` is the
+  statistic for the whole key; the engine costs a retrieval with
+  `idx_rpt[j].idx_selectivity`, the figure for the segments the predicate
+  actually matched. On `INDEX (K, B)` over 5000 rows with 10 distinct K
+  those are **0.0002 and 0.1 — five hundred times apart**.
+
+  It produced a plan the engine does not choose, today, with no
+  contrivance:
+
+  ```
+  SELECT O.ID, I.ID FROM OUTR O JOIN INNR I ON I.K = O.K
+  engine:  PLAN HASH ("I" NATURAL, "O" NATURAL)
+  fcopt:   PLAN JOIN ("O" NATURAL, "I" INDEX (INNR_KB))
+  ```
+
+  A predicate is only ever matched against an index's leading segment
+  here, so segment 0's figure is the one to read;
+  `RDB$INDEX_SEGMENTS.RDB$STATISTICS` holds it per position, and the
+  whole-index column stays as the fallback for an index whose segments
+  carry nothing.
+
+`qa/opt-plans.sh` grows to 91 checks with a fixture nothing else in it
+had: 5000 rows and a **skewed** leading column, which is the only shape
+that can tell the two readings apart. Four of them are the join plans
+either side of the crossover.
+
+### Also fixed: my own gate
+`serve-real-carefulflush.sh` named `$srv2` in a trap it could reach
+before the variable existed — under `set -u` that is a gate failing for
+its own reasons. And a stray server from an interrupted run held the
+port the async check needed, which the liveness assertion correctly
+refused to measure around.
+
+372 unit tests, 91 plan checks, 8 behaviour gates.
+
 ## 2026-08-01 — One cap was doing two jobs
 
 `SELECT ... WHERE ID IN (SELECT ...)` refused as soon as the subquery

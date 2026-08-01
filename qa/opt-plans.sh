@@ -36,6 +36,24 @@ CREATE DESCENDING INDEX IDX_T_AMT_D ON T (AMT);
 CREATE INDEX IDX_U_UID ON U (UID);
 CREATE TABLE C (X INTEGER, Y INTEGER, Z INTEGER);
 CREATE INDEX IDX_C_XY ON C (X, Y);
+-- a SKEWED compound index with real rows: 5000 rows, 10 distinct X, so
+-- the whole-index statistic (0.0002) and segment 0's (0.1) are 500x
+-- apart. Nothing else in this fixture can tell the two readings apart.
+CREATE TABLE CS (X INTEGER, Y INTEGER);
+CREATE TABLE SMALLT (X INTEGER);
+CREATE INDEX IDX_CS_XY ON CS (X, Y);
+CREATE INDEX IDX_SMALLT_X ON SMALLT (X);
+COMMIT;
+SET TERM ^ ;
+EXECUTE BLOCK AS DECLARE I INTEGER = 0; BEGIN
+  WHILE (I < 5000) DO BEGIN I = I + 1; INSERT INTO CS VALUES (MOD(:I,10), :I); END
+  I = 0;
+  WHILE (I < 200) DO BEGIN I = I + 1; INSERT INTO SMALLT VALUES (MOD(:I,200)); END
+END^
+SET TERM ; ^
+COMMIT;
+SET STATISTICS INDEX IDX_CS_XY;
+SET STATISTICS INDEX IDX_SMALLT_X;
 COMMIT;
 EOF
 
@@ -121,6 +139,18 @@ check "SELECT X FROM C WHERE X = 1 AND Z = 3"
 check "SELECT X FROM C WHERE X > 1 AND Y = 2"
 check "SELECT X FROM C ORDER BY X"
 check "SELECT X FROM C ORDER BY X, Y"
+# THE MATCHED SEGMENT'S SELECTIVITY, NOT THE WHOLE INDEX'S.
+# `RDB$INDICES.RDB$STATISTICS` is the figure for the whole key; the
+# engine costs a retrieval with the figure for the segments the
+# predicate actually MATCHED. On a compound index over a skewed leading
+# column they differ by orders of magnitude - reading the whole-index
+# one made a keyed loop look far cheaper than it is and produced a plan
+# the engine does not choose. These need REAL ROWS and fresh statistics,
+# which the fixture below provides.
+check "SELECT X FROM CS WHERE X = 1"
+check "SELECT X FROM CS WHERE X = 1 AND Y = 2"
+check "SELECT S.X FROM SMALLT S JOIN CS ON CS.X = S.X"
+check "SELECT S.X FROM SMALLT S LEFT JOIN CS ON CS.X = S.X"
 check "SELECT X FROM C ORDER BY X, Z"
 check "SELECT X FROM C ORDER BY Y"
 check "SELECT X FROM C ORDER BY X DESC"
