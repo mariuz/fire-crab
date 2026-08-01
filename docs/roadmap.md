@@ -16,12 +16,11 @@ matters more than the row count:
 |---|---|---|
 | **done** | on-disk structures, record decode + RLE, PIP, pointer/data pages, B-tree decode, TIP/MVCC, GC/sweep, BLR decode | converted and held against an oracle; the server depends on them |
 | **converted, wired** | `ods`, `blb`, `auth`, `svc`, `exe`, `dsql` | the running server links and uses them |
-| **converted, NOT wired** | `lck`, `evt`, `pio` | a real conversion of a real law, with a gate — that the server never calls |
-| **being wired** | `opt`, `cch` | the server asks `opt` for the access path and takes an index when it says so (W1); it flushes through `cch`'s careful write order (W2) |
+| **converted, NOT wired** | `lck`, `evt` | a real conversion of a real law, with a gate — that the server never calls |
+| **being wired** | `opt`, `cch`, `pio` | the server asks `opt` for the access path and takes an index when it says so (W1); it flushes through `cch`'s careful write order (W2), and writes those pages with `pio`, in the open mode the header's Forced Writes flag calls for (W3) |
 
 That third row was the honest headline, and W1 has begun on it.
-`crates/wire/Cargo.toml` still does not depend on `-lck`, `-evt` or
-`-pio`. It DOES depend on `fire-crab-opt` now, and the optimizer's
+`crates/wire/Cargo.toml` still does not depend on `-lck` or `-evt`. It DOES depend on `fire-crab-opt` now, and the optimizer's
 choice is executed rather than merely printed — for the one shape W1
 covers so far. The lock manager
 decodes a lock table it never enqueues into. The page cache models a
@@ -229,8 +228,15 @@ plus *the subsystem is now on the path*.
   file that GROWS is written whole (extending is its own careful-write
   question), and the READ path still slices the image directly rather
   than fetching through buffers.
-- **W3 — platform I/O** (`pio`) under the cache, instead of the server
-  mapping bytes itself.
+- **W3 — platform I/O.** *(the write path done)* The careful flush
+  writes its pages through `fire-crab-pio`, opened with
+  `plan_for_header(<the header's flags>)`. That fixed a rule the flush
+  had got wrong on its own: **Forced Writes is an OPEN MODE, not an
+  fsync per write** — the engine adds SYNC to the open mode when the
+  header says so and does nothing per write when it does not, while the
+  flush had been syncing every page unconditionally. Measured: 38.4s
+  with it on against 38.3s off, so the sync was never the cost. Still to
+  do: the READ path (the server still slices the image directly).
 - **W4 — the lock manager participating** (`lck`): enqueue, dequeue,
   AST callbacks. This is what makes concurrent attachments correct
   rather than accidentally correct.

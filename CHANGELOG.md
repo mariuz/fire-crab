@@ -13,6 +13,36 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — W3: platform I/O, and a rule my flush had got wrong
+
+### Converted
+- **The careful flush writes through `fire-crab-pio`.**
+  `crates/wire` depends on it now, leaving `-lck` and `-evt` as the only
+  subsystems the server never calls.
+
+### Fixed by wiring it
+- **Forced Writes is an OPEN MODE, not an fsync per write.** My flush
+  synced every page unconditionally, which is *stricter* than the engine:
+  `PIO_open` adds SYNC to the open mode when the header's Forced Writes
+  flag is set, and does nothing per write when it is not. `pio` has held
+  that rule — with the offset arithmetic and the retry count — since it
+  was converted, with nothing calling it. The flush now opens with
+  `plan_for_header(<the header's flags>)` and flushes at the end only
+  when Forced Writes is off, which is what the engine leaves to the
+  operating system.
+
+### Measured
+600 inserts in 38.4s with Forced Writes on and 38.3s with it off — the
+sync was never the cost. The whole-file copy each statement makes is,
+and that is a different slice. Recording it because the obvious
+expectation (a per-page fsync is expensive) turned out not to be where
+the time goes.
+
+`qa/serve-real-carefulflush.sh` grows to 21 checks: the trace names which
+open mode each flush ran in, a copy of the database has Forced Writes
+turned off with `gfix -write async` and is written again, and `gfix`
+validates both files. 372 unit tests and 11 gates.
+
 ## 2026-08-01 — Four conversions the engine makes and fire-crab refused
 
 A fleet probing around the boolean parameter found four statements the

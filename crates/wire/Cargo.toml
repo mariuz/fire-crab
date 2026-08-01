@@ -14,6 +14,7 @@ fire-crab-blb = { path = "../blb" }
 fire-crab-exe = { path = "../exe" }
 fire-crab-opt = { path = "../opt" }
 fire-crab-cch = { path = "../cch" }
+fire-crab-pio = { path = "../pio" }
 
 [[bin]]
 name = "fcwire"

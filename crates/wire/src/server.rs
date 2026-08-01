@@ -9821,7 +9821,6 @@ fn execute_dml_collecting(
 /// does not cover, and answering it by guessing would be worse than not
 /// answering it.
 fn flush_careful(path: &str, before: &[u8], after: &[u8], page_size: usize) -> Result<(), String> {
-    use std::io::{Seek, SeekFrom, Write};
     // FC_NO_CAREFUL restores the whole-file write. It exists for the
     // GATE, for the same reason FC_NO_INDEX does: an assertion that the
     // ordering happened is worth nothing unless it can be seen not to.
@@ -9837,25 +9836,41 @@ fn flush_careful(path: &str, before: &[u8], after: &[u8], page_size: usize) -> R
     if order.is_empty() {
         return Ok(()); // nothing changed
     }
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .map_err(|e| e.to_string())?;
+    // FORCED WRITES IS AN OPEN MODE, NOT AN FSYNC PER WRITE. The first
+    // version of this flush synced every page unconditionally, which is
+    // STRICTER than the engine: `PIO_open` adds SYNC to the open mode
+    // when the header's Forced Writes flag is set, and does nothing per
+    // write when it is not. `fire-crab-pio` has held that rule - and the
+    // offset arithmetic, and the retry count - since it was converted,
+    // with nothing calling it.
+    let flags = fire_crab_ods::header::HeaderPage::decode(&after[..page_size.min(after.len())])
+        .map(|h| h.flags)
+        .unwrap_or(0);
+    let plan = fire_crab_pio::plan_for_header(flags, false);
+    let forced = plan.force_write;
+    let pio = fire_crab_pio::Pio::open(path, page_size as u32, plan)?;
     for page in &order {
         let start = *page as usize * page_size;
         let end = (start + page_size).min(after.len());
         if start >= after.len() {
             continue;
         }
-        f.seek(SeekFrom::Start(start as u64)).map_err(|e| e.to_string())?;
-        f.write_all(&after[start..end]).map_err(|e| e.to_string())?;
-        // each page must REACH the disk before the one that references
-        // it is written - an ordering that only exists in memory is not
-        // an ordering
-        f.sync_data().map_err(|e| e.to_string())?;
+        let mut buf = after[start..end].to_vec();
+        buf.resize(page_size, 0);
+        pio.write_page(*page, &buf)?;
+    }
+    // With Forced Writes the open mode has already put each page on the
+    // disk in turn; without it the engine leaves the ordering to the
+    // operating system and flushes at the end, and so does this.
+    if !forced {
+        pio.flush()?;
     }
     if std::env::var("FC_SRV_TRACE").is_ok() {
-        eprintln!("[srv] careful flush: {} pages in precedence order", order.len());
+        eprintln!(
+            "[srv] careful flush: {} pages in precedence order (forced writes {})",
+            order.len(),
+            if forced { "on" } else { "off" }
+        );
     }
     Ok(())
 }
