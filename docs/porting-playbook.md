@@ -2119,6 +2119,15 @@ them.
   the engine performs on an ordinary restored database. A boundary you
   have priced is a decision; one you have not is a guess.
 
+- **A read defect and a write defect can wear the same error message.**
+  Two DDL statements refused on fragmented catalogue rows, and the read
+  they perform was the obvious culprit. It was not: the WRITE path
+  rejects the same records a few frames later, on a flag set that differs
+  from the read path's by exactly one bit. Converting the read would have
+  changed the message and fixed nothing — a whole increment spent moving
+  an error. **When a statement fails, find every gate it must pass, not
+  the first one that rejects it.**
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

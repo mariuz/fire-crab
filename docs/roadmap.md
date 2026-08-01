@@ -52,6 +52,23 @@ four; R7 is the removal of what they replaced.
   filter side turned out to have different rules, and the filter
   comparison is exact rather than through a double.
 
+- **The per-statement cost at HEAD is 2.92 ms against the engine's
+  0.95 ms**, measured on a verified-quiet box (nproc 1, load 0.04, 97%
+  idle, serialised). The metadata cache took it from 19.6 ms and server
+  CPU from 3,810 to 730 ms per 200 statements. The residual is CPU-bound,
+  not waiting, and the cause is the same disease at the next call site:
+  `catalog::relation_columns` (`catalog.rs:139`) is an uncached full walk
+  of `RDB$RELATION_FIELDS` with 121 call sites — 60.9% of what is left,
+  with `sqz::unpack` and `catalog::cstr` beneath it. `intl::fit_char` is
+  secondary.
+
+- **169/169 does NOT mean the cost model is right everywhere the guard
+  used to refuse.** On a stale UNIQUE/PK index there is a structural miss
+  at (1200, 700) — engine `PLAN HASH`, fcopt `JOIN_SWAP`, loop 4375.7
+  against hash 6417.7, a 47% margin — and it is **pre-existing**: it
+  reproduces on the same database with FRESH statistics, where the guard
+  never fired. Removing the guard unmasked it; it did not create it.
+
 - ~~A second per-statement stall, ~44 ms~~ — *explained, and half of it
   was self-inflicted*. A `cargo test` binary left spinning on this
   ONE-CORE box since Jul 31 (14h41m of CPU) halved every measurement;
@@ -85,6 +102,22 @@ four; R7 is the removal of what they replaced.
   across pages, which fire-crab cannot do, and refusing is the correct
   boundary. `fcstat`, `exe` and `sysfmt` still use the old path and are
   incremental work.
+
+- **Fixing those two DDL reads will NOT fix them, and that is the trap.**
+  Both `patch_sys_row` and `deferred_drop_index` write back through
+  `dml::update_records`, and `dml::push_back_version`
+  (`crates/ods/src/dml.rs:502`) rejects the record at :517-521 whenever
+  its flags carry `CHAIN|BLOB|FRAGMENT|INCOMPLETE|DELETED`. Note the gap:
+  `is_primary_record` (`data.rs:74`) excludes only
+  `CHAIN|FRAGMENT|BLOB|DELETED`, so the **one flag in the difference is
+  INCOMPLETE** — exactly the fragmented rows. Converting the reads to
+  `assembled_image` would change the error message and nothing else. The
+  WRITE path has to learn fragments first, or neither statement moves.
+
+  This also explains the residual `DROP INDEX` failures on rows that are
+  NOT fragmented: it also deletes the index's `RDB$INDEX_SEGMENTS` rows
+  through the same `push_back_version`, and that relation carries 26
+  fragmented rows on a restored file. Same cause, different relation.
 
 - **Two DDL statements refuse on a fragmented catalogue row, and the cost
   is now measured.** Both are in-place patch sites that cannot rewrite a
