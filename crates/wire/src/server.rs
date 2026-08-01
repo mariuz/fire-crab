@@ -23295,7 +23295,18 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
 
 /// The size cap on the normalized predicate - a cross-product past
 /// this is refused (fallback), never silently truncated.
+/// The MULTIPLICATIVE bound: `cross_dnf` turns `(a OR b) AND (c OR d)`
+/// into a product of groups, and a chain of ORed clauses squares and
+/// cubes. 64 is where that stops.
 const DNF_MAX_GROUPS: usize = 64;
+
+/// The ADDITIVE bound, which is a different quantity and had been
+/// sharing the multiplicative one. `x IN (v1, ..., vn)` is n ORed
+/// equalities - it GROWS BY ONE per value, and 64 values is an ordinary
+/// list rather than an explosion. Sharing the cap meant
+/// `WHERE ID IN (SELECT ...)` refused as soon as the subquery returned
+/// 65 distinct values, on a statement the engine answers.
+const DNF_MAX_OR_GROUPS: usize = 4096;
 
 /// Normalize the tree to OR-of-ANDs, pushing `neg` down by De Morgan.
 fn to_dnf(ast: &Ast, neg: bool) -> Option<Vec<Vec<RawTerm>>> {
@@ -23318,7 +23329,7 @@ fn concat_dnf(parts: &[Ast], neg: bool) -> Option<Vec<Vec<RawTerm>>> {
     let mut out = Vec::new();
     for p in parts {
         out.extend(to_dnf(p, neg)?);
-        if out.len() > DNF_MAX_GROUPS {
+        if out.len() > DNF_MAX_OR_GROUPS {
             return None;
         }
     }
@@ -23329,6 +23340,11 @@ fn cross_dnf(parts: &[Ast], neg: bool) -> Option<Vec<Vec<RawTerm>>> {
     let mut acc: Vec<Vec<RawTerm>> = vec![Vec::new()];
     for p in parts {
         let d = to_dnf(p, neg)?;
+        // CHECK THE PRODUCT BEFORE BUILDING IT. With a larger additive
+        // cap, `d` can now be thousands of groups wide, and multiplying
+        // first and refusing afterwards would allocate the explosion it
+        // exists to prevent.
+        acc.len().checked_mul(d.len()).filter(|n| *n <= DNF_MAX_GROUPS)?;
         let mut next = Vec::with_capacity(acc.len() * d.len());
         for a in &acc {
             for g in &d {

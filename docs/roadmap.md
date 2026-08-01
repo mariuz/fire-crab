@@ -44,12 +44,11 @@ four; R7 is the removal of what they replaced.
   against the value the engine actually stores. This one is the predicate
   parser rather than a conversion.
 
-- **An IN-SUBQUERY refuses past ~10-100 inner rows.**
-  `SELECT COUNT(*) FROM B WHERE ID IN (SELECT ID FROM B WHERE ID > 5990)`
-  answers (10 inner rows); the same statement with `> 5900` (100 rows)
-  is REFUSED, and the engine answers both. An IN-subquery is desugared
-  into a literal list, and something downstream of that does not scale.
-  Found while gating the fetch batch; it has nothing to do with fetching.
+- ~~An IN-SUBQUERY refuses past ~10-100 inner rows~~ — *fixed*. It was
+  exactly 64/65 DISTINCT values, and the cause was one constant doing
+  two jobs: the DNF cap bounds the AND cross-product (multiplicative,
+  must stay small) and was also bounding OR growth (additive, one group
+  per value). Separate bounds now.
 
 ## The two programmes
 

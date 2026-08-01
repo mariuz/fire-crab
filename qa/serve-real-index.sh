@@ -411,6 +411,20 @@ natural "IS NULL, which is not an equality" \
 natural "no predicate at all" "SELECT ID FROM EMP ORDER BY NAME"
 indexed "an OR of two equalities on the primary key" \
         "SELECT ID FROM EMP WHERE ID = 1 OR ID = 2 ORDER BY ID"
+# A LONG list. `x IN (v1, ..., vn)` is n ORed equalities, and the DNF cap
+# that bounds the AND CROSS-PRODUCT had been bounding this ADDITIVE
+# growth too - so a list of 65 values was refused on a statement the
+# engine answers. The multiplicative bound is still 64; the additive one
+# is its own, and much larger.
+# It ANSWERS; whether it drives an index is opt's call, and opt does not
+# plan a long IN list - the retrieval inherits its limits, as everywhere
+# else. The assertion is the answer.
+both "an IN list of 70 values, past the old cap" \
+        "SELECT COUNT(*) AS K FROM EMP WHERE ID IN (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70)"
+both "... the same length over a column with no index" \
+     "SELECT COUNT(*) AS K FROM EMP WHERE SALARY IN (100,200,300,400,50,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66)"
+both "a cross-product of ORs stays bounded" \
+     "SELECT COUNT(*) AS K FROM EMP WHERE (ID = 1 OR ID = 2) AND (DEPT_ID = 1 OR DEPT_ID = 2)"
 natural "a NOT EQUAL" "SELECT ID FROM EMP WHERE ID <> 3 ORDER BY NAME"
 natural "an equality on the SECOND segment of a compound index" \
         "SELECT ID FROM EMP WHERE SALARY = 200 ORDER BY NAME"

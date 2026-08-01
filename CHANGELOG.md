@@ -13,6 +13,32 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — One cap was doing two jobs
+
+`SELECT ... WHERE ID IN (SELECT ...)` refused as soon as the subquery
+returned **65 distinct values**, on a statement the engine answers. A
+fleet bisected it to exactly 64/65 and named the cause: not the
+subquery, and not its desugaring into a literal list — the DNF group cap.
+
+### Fixed
+- **`DNF_MAX_GROUPS = 64` was bounding two different quantities.**
+  `cross_dnf` is MULTIPLICATIVE — `(a OR b) AND (c OR d)` is a product,
+  and a chain of them squares and cubes, so 64 is where that must stop.
+  `concat_dnf` is ADDITIVE: `x IN (v1..vn)` grows by ONE per value, and
+  65 values is an ordinary list rather than an explosion. They have
+  separate bounds now, 64 and 4096.
+- **The product is checked BEFORE it is built.** With a larger additive
+  cap a branch can be thousands of groups wide, and multiplying first to
+  refuse afterwards would allocate exactly the explosion the cap exists
+  to prevent.
+
+A 4000-value `IN` subquery answers in 0.15s — the union-of-bands
+retrieval takes it in its stride. Whether it drives an index is `opt`'s
+call, and `opt` refuses parenthesised predicates, so a literal `IN` list
+scans; the gate asserts the answer rather than the path.
+
+`qa/serve-real-index.sh` is 359 checks. 372 unit tests and 10 gates.
+
 ## 2026-08-01 — W3: platform I/O, and a rule my flush had got wrong
 
 ### Converted
