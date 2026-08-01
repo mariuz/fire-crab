@@ -86,6 +86,39 @@ four; R7 is the removal of what they replaced.
   boundary. `fcstat`, `exe` and `sysfmt` still use the old path and are
   incremental work.
 
+- **Two DDL statements refuse on a fragmented catalogue row, and the cost
+  is now measured.** Both are in-place patch sites that cannot rewrite a
+  record spanning pages, so they fail closed - `gfix -v -full` is clean
+  afterwards and the engine still reads the file. This is NOT the
+  durable-wrong-state class that `backfill_index` was. But the refusals
+  are common on a restored database:
+
+  * `COMMENT ON TABLE` (`ddl.rs:5716`, `patch_sys_row`) - engine 220/220,
+    fire-crab 132 OK / **88 refused**, and the 88 are EXACTLY the tables
+    whose `RDB$RELATIONS` row is fragmented (the two sorted name sets
+    diff empty). Control: against the same schema before `gbak`, where no
+    row is fragmented, fire-crab is 220/220.
+  * `DROP INDEX` (`ddl.rs:4472`, `deferred_drop_index`) - on the 60
+    indexes whose catalogue row is whole, fire-crab matches the engine
+    **statement by statement**, including the 24 constraint indexes both
+    correctly refuse. On the 178 fragmented ones the engine does 92 and
+    fire-crab does 0. **92 statements the engine performs and fire-crab
+    will not.**
+
+  Fixing these needs a record REWRITE that can re-fragment across pages -
+  a real slice in `ods`, not a patch.
+
+- **Restored databases fragment their catalogues heavily, and not where
+  the source did.** Measured on a 220-table schema: 292 fragmented rows
+  after `gbak -b`/`gbak -c`, concentrated in `RDB$INDICES` (27.4% of
+  rows) and `RDB$RELATIONS` (28.4%); the un-backed-up source had 45, in
+  different relations. **Restore does not preserve fragmentation, it
+  relocates it.** And it is not the >8151-byte case: `dpm.epp:2650-2656`
+  fragments whenever an UPDATE's new version exceeds the space left on
+  the page the record already occupies, so ordinary small catalogue rows
+  fragment as restore replays DDL onto crowded pages. An EMPTY database
+  gains 26 fragmented rows from a backup/restore round trip alone.
+
 - **fire-crab refuses to WRITE a row that would fragment.** A cross-page
   store it does not implement. `qa/serve-real-fragment.sh` asserts the
   refusal so it cannot quietly become a half-written row.

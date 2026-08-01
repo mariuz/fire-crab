@@ -2102,6 +2102,23 @@ them.
   about the other system, and claims get tested** — this one blocked 165
   of 169 cells for several increments.
 
+- **Never hand-roll a parse of the format you are testing, inside the
+  gate that tests it.** A gate here counts fragmented records with its
+  own page walk. An auditor's hand-rolled walk of the same file reported
+  ZERO where the real count was 88 - and if such a parser OVER-reports
+  instead, the fixture self-check passes on a fixture that exhibits
+  nothing and every later assertion is vacuously green. Prove the fixture
+  with ARITHMETIC the format cannot fake (a row wider than the page bound
+  cannot fit a page) or with the system under test's own differentially
+  tested decoder, and say which.
+
+- **When a refusal is deliberate, MEASURE what it costs.** Two DDL
+  statements here fail closed on a fragmented catalogue row, which is the
+  right boundary - but "right boundary" was an argument, not a number.
+  The number is 92 `DROP INDEX` and 88 `COMMENT ON TABLE` statements that
+  the engine performs on an ordinary restored database. A boundary you
+  have priced is a decision; one you have not is a guess.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

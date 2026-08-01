@@ -117,6 +117,32 @@ for off in range(0, len(f) - ps + 1, ps):
 print(inc)
 PY
 )
+# AND A SECOND, PARSER-FREE PROOF. The count above comes from a
+# hand-rolled page walk, and that is a hazard: an agent auditing this work
+# had its own hand-rolled parser report ZERO fragmented rows on a file
+# where fire-crab's own decoder found 88. A parser that UNDER-reports
+# fails this gate loudly, which is safe - but one that OVER-reports would
+# let the self-check pass on a fixture that does not fragment, and every
+# assertion after it would then be vacuously green.
+#
+# So the fixture is also proved by ARITHMETIC, which cannot be
+# mis-parsed: a record whose stored bytes exceed the engine's own
+# single-page bound (dpm.epp:2383-2392, page_size - 28 - 13 = 8151 at
+# 8192) CANNOT live on one page, whatever any parser says. The engine is
+# asked for the length, so this does not trust fire-crab either.
+ran=$((ran + 1))
+big=$("$ISQL" -q -b -user "$U" -pas "$P" "$RE" <<'SQL' 2>&1 | grep -oE '[0-9]+' | head -1
+SET HEADING OFF;
+SELECT MAX(OCTET_LENGTH(A) + OCTET_LENGTH(B) + OCTET_LENGTH(C)) FROM HUGE;
+SQL
+)
+if [ "${big:-0}" -gt 8151 ]; then
+    echo "OK   a row of ${big} bytes cannot fit an 8192-byte page (bound 8151)"
+else
+    echo "FAIL the widest row is only ${big:-0} bytes - it fits one page, so nothing fragments"
+    exit 1
+fi
+
 if [ "${frags:-0}" -ge 10 ]; then
     echo "OK   the fixture fragments: $frags records carry rhd_incomplete"
 else
@@ -244,8 +270,8 @@ fi
 
 kill $srv 2>/dev/null; srv=""
 rm -f "$RE" "$FC" "$D/fc-frag.js"
-if [ "$ran" -lt 12 ]; then
-    echo "DIFF only $ran checks ran (expected at least 12) - did one silently skip?"
+if [ "$ran" -lt 13 ]; then
+    echo "DIFF only $ran checks ran (expected at least 13) - did one silently skip?"
     fail=1
 fi
 exit $fail
