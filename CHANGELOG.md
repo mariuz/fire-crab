@@ -13,6 +13,65 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — The row that was nine bytes to the left
+
+Fragment assembly. A record too large for one page is stored as a head
+carrying `rhd_incomplete` plus continuation fragments, and fire-crab
+could read none of them — which cost **seventeen of sixty-nine indexes**
+on a 99-relation database, silently.
+
+### Fixed
+- **A fragmented record's payload was read from the wrong offset.**
+  `rhdf` (ods.h:940-964) is nine bytes longer than `rhd`: it carries
+  `rhdf_tra_high` @14 and a forward pointer, `rhdf_f_page` @16 and
+  `rhdf_f_line` @20, so its data starts at **22**. fire-crab chose 13 or
+  16 on `LONG_TRANUM` alone and never considered the third layout, so
+  every fragment's payload began *on the pointer itself*. Measured on the
+  live file: what fire-crab called payload started `81 81 81 | 27 10 00
+  00 | 06 00` — padding, then page 4135, then line 6.
+
+  It did not corrupt data, and the earlier record of this said otherwise:
+  the RLE decoder *rejects* those bytes, so the row was dropped rather
+  than mis-valued. Missing rows, not wrong ones.
+
+- **`assembled_image` follows the chain.** Head and fragments are each
+  RLE-compressed and their compressed forms **concatenate** — measured, a
+  head unpacking to 828 bytes and its fragment to 754 give exactly 1582
+  when joined and unpacked once, because the codec is a byte stream with
+  no header of its own. So assembly joins first and unpacks last: one
+  pass, and no chance of mis-splitting a run.
+
+  The proof it recovers the right bytes: the first row it assembled
+  decoded to `PK_BS2P_500` on table `BS2P_500` — the first entry on the
+  list of seventeen missing indexes. After wiring it into `opt`'s four
+  catalogue readers and the server's four record readers, all **69 of 69
+  indexes are visible, 0 disagreements** with the engine.
+
+- **A fabricated transaction id, caught by the fleet in code twenty
+  minutes old.** My first version read `rhdf_tra_high` unconditionally
+  for fragmented records. `Ods::getTraNum` (ods.cpp:157-169) reads it
+  ONLY inside `if (rhd_flags & rhd_long_tranum)`, and picks the rhdf or
+  rhde field by `rhd_incomplete` *inside* that test. On this fixture the
+  bytes at 14 are `0x8181`, so every fragmented row would have claimed a
+  transaction id 2^32 times too large — and MVCC visibility is decided on
+  that number. A unit test now pins both halves of the rule.
+
+### The design choice
+`image()` now returns `None` for a fragmented record **deliberately**.
+There are 41 callers; converting them all at once would be a flag day,
+and handing back the head's piece would give every unconverted one a
+short image whose later fields decode as missing or wrong — silently.
+`None` preserves exactly what those callers did before (the mis-offset
+payload happened to fail to unpack), so conversion is incremental and the
+unconverted path is the safe one. Eight call sites are converted; the
+rest keep skipping.
+
+Six unit tests pin the layout, including that a chain pointing at
+something without `rhd_fragment` is **refused** rather than splicing
+another row's bytes onto this one.
+
+386 unit tests.
+
 ## 2026-08-01 — A gate that read another run's log
 
 `serve-real-index.sh` reported 33 DIFFs immediately after an optimizer

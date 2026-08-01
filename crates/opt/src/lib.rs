@@ -115,6 +115,7 @@
 //! into a named refusal - the crate would otherwise print a
 //! confident nested-loop plan where the engine hashes.
 
+use fire_crab_ods::data::assembled_image;
 use fire_crab_ods::{
     decode_record, relation_columns, relation_data_pages, resolve_relation,
     system_relation_formats, DataPage, Value,
@@ -324,7 +325,7 @@ pub fn indexes_of(
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = r.image() else { continue };
+            let Some(image) = assembled_image(file, page_size, &r) else { continue };
             let values = decode_record(&image, descs);
             let (Some(Value::Text(iname)), Some(Value::Text(rname))) =
                 (values.get(name_f), values.get(rel_f))
@@ -389,7 +390,7 @@ fn index_columns(
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = r.image() else { continue };
+            let Some(image) = assembled_image(file, page_size, &r) else { continue };
             let values = decode_record(&image, descs);
             let (Some(Value::Text(iname)), Some(Value::Text(fname))) =
                 (values.get(name_f), values.get(field_f))
@@ -1625,7 +1626,7 @@ fn segment_selectivity(
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = r.image() else { continue };
+            let Some(image) = assembled_image(file, page_size, &r) else { continue };
             let values = decode_record(&image, descs);
             let Some(Value::Text(n)) = values.get(name_f) else { continue };
             if n.trim_end() != index {
@@ -1675,7 +1676,7 @@ fn whole_index_selectivity(
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = r.image() else { continue };
+            let Some(image) = assembled_image(file, page_size, &r) else { continue };
             let values = decode_record(&image, descs);
             let Some(Value::Text(n)) = values.get(name_f) else { continue };
             if n.trim_end() != index {

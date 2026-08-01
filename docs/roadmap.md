@@ -59,8 +59,16 @@ four; R7 is the removal of what they replaced.
   nothing and the cost barely scales with database size (2.3 MB → 8.9 s,
   25 MB → 11.1 s). Unfound, and named so it is not mistaken for finished.
 
-- **FRAGMENTED RECORDS ARE NOT ASSEMBLED, and the read path does not
-  notice.** A record too large for one page is stored as a head with
+- ~~FRAGMENTED RECORDS ARE NOT ASSEMBLED~~ — *fixed*. `rhdf` data starts
+  at 22, not 13/16; `assembled_image` follows `rhdf_f_page`/`rhdf_f_line`
+  and joins the compressed pieces before unpacking once. All 69 indexes
+  on the 99-relation fixture are visible again (was 52). `image()`
+  returns `None` for a fragmented record on purpose, so the 33 callers
+  not yet converted keep skipping rather than silently gaining truncated
+  rows — converting the rest is incremental work, and `fcstat`, `exe`,
+  `ddl` and `catalog` are still on the old path.
+
+- **(superseded, kept for the mechanism)** A record too large for one page is stored as a head with
   `rhd_incomplete` (flag 8) plus `rhdf` continuation fragments on other
   pages. `RecordHeader::is_primary_record` (`crates/ods/src/data.rs:65`)
   excludes CHAIN, FRAGMENT, BLOB and DELETED — **but not INCOMPLETE** —

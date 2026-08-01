@@ -29,6 +29,13 @@ pub mod flags {
 pub const DPG_RPT_OFFSET: usize = 24;
 pub const RHD_DATA_OFFSET: usize = 13; // RHD_SIZE, ods.h:912
 pub const RHDE_DATA_OFFSET: usize = 16; // rhde_data, ods.h:934
+/// `rhdf_data`, ods.h:961 - a FRAGMENTED record's header is nine bytes
+/// longer than `rhd`'s, because it carries a forward pointer to the next
+/// fragment (`rhdf_f_page` @16, `rhdf_f_line` @20).
+pub const RHDF_DATA_OFFSET: usize = 22;
+/// `rhdf_f_page` / `rhdf_f_line` (ods.h:947-948).
+pub const RHDF_F_PAGE_OFFSET: usize = 16;
+pub const RHDF_F_LINE_OFFSET: usize = 20;
 
 pub struct DataPage<'a> {
     pub pag: PageHeader,
@@ -55,6 +62,9 @@ pub struct RecordHeader<'a> {
     pub format: u8,
     /// The still-RLE-compressed record payload (feed to `sqz::unpack`)
     pub packed_data: &'a [u8],
+    /// `(rhdf_f_page, rhdf_f_line)` when this record continues in a
+    /// fragment elsewhere (ods.h:947-948); `None` otherwise.
+    pub frag_ptr: Option<(u32, u16)>,
 }
 
 impl RecordHeader<'_> {
@@ -65,10 +75,29 @@ impl RecordHeader<'_> {
         self.flags & (flags::CHAIN | flags::FRAGMENT | flags::BLOB | flags::DELETED) == 0
     }
 
+    /// Where this record continues, when it does: `(rhdf_f_page,
+    /// rhdf_f_line)` (ods.h:947-948). `None` for an ordinary record.
+    pub fn next_fragment(&self) -> Option<(u32, u16)> {
+        self.frag_ptr
+    }
+
     /// The unpacked record image: `NOT_PACKED` records (ods.h:1018,
     /// stored "as is") pass through, everything else goes through the
     /// sqz codec.
+    ///
+    /// **A FRAGMENTED RECORD ANSWERS `None` HERE, DELIBERATELY.** Its
+    /// payload is only the first piece of the row; the rest lives on
+    /// other pages and this type cannot reach them. Returning the piece
+    /// would hand every caller a short image whose later fields decode
+    /// as missing or wrong - silently. Callers that can reach the file
+    /// use [assembled_image], which follows the chain; the rest keep
+    /// skipping the record, which is what they did before this was
+    /// understood (the mis-offset payload happened to fail to unpack)
+    /// and is the safe half of the two behaviours.
     pub fn image(&self) -> Option<Vec<u8>> {
+        if self.flags & flags::INCOMPLETE != 0 {
+            return None;
+        }
         if self.flags & flags::NOT_PACKED != 0 {
             Some(self.packed_data.to_vec())
         } else {
@@ -139,9 +168,38 @@ impl<'a> DataPage<'a> {
                 flags,
                 format: 0,
                 packed_data: &[],
+                frag_ptr: None,
             });
         }
-        let (transaction, data_at) = if flags & flags::LONG_TRANUM != 0 {
+        // WHICH HEADER IS THIS? Three layouts, and the choice used to be
+        // made on LONG_TRANUM alone - which silently mis-read every
+        // FRAGMENTED record, because `rhdf` is longer than both.
+        //
+        // A record that continues elsewhere carries `rhd_incomplete` and
+        // is stored as `rhdf`: nine bytes longer than `rhd`, the extra
+        // being `rhdf_tra_high` plus the forward pointer. Reading its
+        // payload from offset 13 therefore starts NINE BYTES EARLY, on
+        // the pointer itself - measured on a live database, the bytes
+        // fire-crab called payload began `81 81 81 | 27 10 00 00 | 06 00`,
+        // which is padding, then f_page = 4135, then f_line = 6.
+        let (transaction, data_at) = if flags & flags::INCOMPLETE != 0 {
+            // rhdf's payload starts at 22 whatever the transaction width.
+            // But the HIGH WORD is only present when LONG_TRANUM says so
+            // - `Ods::getTraNum` (ods.cpp:157-169) reads it ONLY inside
+            // `if (rhd_flags & rhd_long_tranum)`, and picks the rhdf or
+            // rhde field by rhd_incomplete INSIDE that test. Reading it
+            // unconditionally invents a transaction: on the fixture here
+            // the bytes at 14 are 0x8181, which would have made every
+            // fragmented row claim transaction 0x8181_00000000 + its
+            // real id, and MVCC visibility is decided on that number.
+            let low = u32_at(r, 0) as u64;
+            let high = if flags & flags::LONG_TRANUM != 0 {
+                u16_at(r, 14) as u64
+            } else {
+                0
+            };
+            (high << 32 | low, RHDF_DATA_OFFSET)
+        } else if flags & flags::LONG_TRANUM != 0 {
             // rhde: 64-bit id split low/high (ods.h:918/923)
             let low = u32_at(r, 0) as u64;
             let high = u16_at(r, 14) as u64;
@@ -161,6 +219,9 @@ impl<'a> DataPage<'a> {
             flags,
             format: r[12], // rhd_format @12
             packed_data: &r[data_at..],
+            frag_ptr: (flags & flags::INCOMPLETE != 0).then(|| {
+                (u32_at(r, RHDF_F_PAGE_OFFSET), u16_at(r, RHDF_F_LINE_OFFSET))
+            }),
         })
     }
 
@@ -250,5 +311,219 @@ mod tests {
 
         let dp = DataPage::decode(&page).unwrap();
         assert_eq!(dp.records().count(), 1);
+    }
+}
+
+/// The WHOLE record image, following the fragment chain when there is
+/// one. `None` for the same reasons [RecordHeader::image] answers `None`,
+/// plus a broken or looping chain.
+///
+/// A record too large for one page is stored as a head carrying
+/// `rhd_incomplete` and a forward pointer, plus continuation fragments
+/// carrying `rhd_fragment`, each pointing at the next. Every piece is
+/// RLE-compressed, and the pieces CONCATENATE: measured on a live
+/// database, a head unpacking to 828 bytes and its fragment unpacking to
+/// 754 give 1582 when their compressed forms are joined and unpacked
+/// once - the same total, because the codec is a byte stream with no
+/// header of its own. So this joins first and unpacks last: one pass
+/// instead of two, and no chance of mis-splitting a run.
+///
+/// What it recovers is not academic. On a 99-relation database
+/// `RDB$INDEX_SEGMENTS` held fifteen fragmented rows, and because they
+/// were unreadable SEVENTEEN of sixty-nine indexes did not exist as far
+/// as the optimizer was concerned - `WHERE K = 5` planned NATURAL where
+/// the engine planned INDEX. The first row this function assembled
+/// decoded to `PK_BS2P_500` on table `BS2P_500`, the first index on that
+/// missing list.
+pub fn assembled_image(
+    file: &[u8],
+    page_size: usize,
+    head: &RecordHeader<'_>,
+) -> Option<Vec<u8>> {
+    if head.flags & flags::INCOMPLETE == 0 {
+        return head.image();
+    }
+    // NOT_PACKED is decided per piece, so a mixed chain could not simply
+    // be concatenated. It does not arise for fragments in practice, and
+    // declining beats guessing.
+    if head.flags & flags::NOT_PACKED != 0 {
+        return None;
+    }
+    let mut packed: Vec<u8> = head.packed_data.to_vec();
+    let mut next = head.next_fragment();
+    // A chain longer than the file has pages is a corrupt file, not a
+    // long record; bound it rather than loop forever.
+    let max_hops = (file.len() / page_size.max(1)).max(1);
+    let mut hops = 0usize;
+    while let Some((pno, line)) = next {
+        hops += 1;
+        if pno == 0 || hops > max_hops {
+            return None;
+        }
+        let start = (pno as usize).checked_mul(page_size)?;
+        let end = start.checked_add(page_size)?;
+        let dp = file.get(start..end).and_then(DataPage::decode)?;
+        let frag = dp.record(line)?;
+        if frag.flags & flags::FRAGMENT == 0 {
+            return None; // the chain points at something that is not one
+        }
+        if frag.flags & flags::NOT_PACKED != 0 {
+            return None;
+        }
+        packed.extend_from_slice(frag.packed_data);
+        next = frag.next_fragment();
+    }
+    crate::sqz::unpack(&packed)
+}
+
+#[cfg(test)]
+mod frag_tests {
+    use super::*;
+
+    /// Build a two-page file: page 1 holds a fragmented HEAD pointing at
+    /// page 2 slot 0, which holds the continuation.
+    fn two_page_chain(head_payload: &[u8], frag_payload: &[u8], frag_flags: u16) -> Vec<u8> {
+        let ps = 4096usize;
+        let mut file = vec![0u8; ps * 3];
+        // --- page 1: the head, rhdf layout, INCOMPLETE ---
+        let p = ps; // page index 1
+        file[p] = 5; // pag_data
+        file[p + 16..p + 20].copy_from_slice(&0u32.to_le_bytes());
+        file[p + 20..p + 22].copy_from_slice(&128u16.to_le_bytes());
+        file[p + 22..p + 24].copy_from_slice(&1u16.to_le_bytes());
+        let len = RHDF_DATA_OFFSET + head_payload.len();
+        let r = ps - len; // offset within the page
+        let a = p + r;
+        file[a + 10..a + 12].copy_from_slice(&flags::INCOMPLETE.to_le_bytes());
+        file[a + 12] = 1;
+        file[a + RHDF_F_PAGE_OFFSET..a + RHDF_F_PAGE_OFFSET + 4]
+            .copy_from_slice(&2u32.to_le_bytes()); // next page = 2
+        file[a + RHDF_F_LINE_OFFSET..a + RHDF_F_LINE_OFFSET + 2]
+            .copy_from_slice(&0u16.to_le_bytes()); // next line = 0
+        file[a + RHDF_DATA_OFFSET..a + RHDF_DATA_OFFSET + head_payload.len()]
+            .copy_from_slice(head_payload);
+        file[p + DPG_RPT_OFFSET..p + DPG_RPT_OFFSET + 2]
+            .copy_from_slice(&(r as u16).to_le_bytes());
+        file[p + DPG_RPT_OFFSET + 2..p + DPG_RPT_OFFSET + 4]
+            .copy_from_slice(&(len as u16).to_le_bytes());
+        // --- page 2: the terminal fragment, plain rhd layout ---
+        let q = ps * 2;
+        file[q] = 5;
+        file[q + 16..q + 20].copy_from_slice(&1u32.to_le_bytes());
+        file[q + 20..q + 22].copy_from_slice(&128u16.to_le_bytes());
+        file[q + 22..q + 24].copy_from_slice(&1u16.to_le_bytes());
+        let flen = RHD_DATA_OFFSET + frag_payload.len();
+        let fr = ps - flen;
+        let b = q + fr;
+        file[b + 10..b + 12].copy_from_slice(&frag_flags.to_le_bytes());
+        file[b + 12] = 1;
+        file[b + RHD_DATA_OFFSET..b + RHD_DATA_OFFSET + frag_payload.len()]
+            .copy_from_slice(frag_payload);
+        file[q + DPG_RPT_OFFSET..q + DPG_RPT_OFFSET + 2]
+            .copy_from_slice(&(fr as u16).to_le_bytes());
+        file[q + DPG_RPT_OFFSET + 2..q + DPG_RPT_OFFSET + 4]
+            .copy_from_slice(&(flen as u16).to_le_bytes());
+        file
+    }
+
+    // one RLE literal run of n bytes: control byte n (positive = literal)
+    fn lit(bytes: &[u8]) -> Vec<u8> {
+        let mut v = vec![bytes.len() as u8];
+        v.extend_from_slice(bytes);
+        v
+    }
+
+    #[test]
+    fn a_fragmented_head_reads_its_payload_from_offset_22() {
+        // THE BUG THIS PINS: the data offset used to be chosen on
+        // LONG_TRANUM alone, so a fragmented record's payload was read
+        // from 13 - nine bytes early, starting on rhdf_f_page itself.
+        let file = two_page_chain(&lit(b"HEAD"), &lit(b"TAIL"), flags::FRAGMENT);
+        let dp = DataPage::decode(&file[4096..8192]).unwrap();
+        let head = dp.record(0).unwrap();
+        assert_eq!(head.flags & flags::INCOMPLETE, flags::INCOMPLETE);
+        // the payload begins at the literal run, not at the pointer
+        assert_eq!(head.packed_data, lit(b"HEAD").as_slice());
+        // and the forward pointer is decoded, not swallowed as data
+        assert_eq!(head.next_fragment(), Some((2, 0)));
+    }
+
+    #[test]
+    fn image_declines_a_fragment_rather_than_returning_half_a_row() {
+        // Every caller that cannot reach the file keeps SKIPPING the
+        // record. Handing back the head's piece would be a short image
+        // whose later fields decode as missing or wrong, silently.
+        let file = two_page_chain(&lit(b"HEAD"), &lit(b"TAIL"), flags::FRAGMENT);
+        let dp = DataPage::decode(&file[4096..8192]).unwrap();
+        assert!(dp.record(0).unwrap().image().is_none());
+    }
+
+    #[test]
+    fn assembled_image_follows_the_chain() {
+        let file = two_page_chain(&lit(b"HEAD"), &lit(b"TAIL"), flags::FRAGMENT);
+        let dp = DataPage::decode(&file[4096..8192]).unwrap();
+        let head = dp.record(0).unwrap();
+        assert_eq!(
+            assembled_image(&file, 4096, &head),
+            Some(b"HEADTAIL".to_vec())
+        );
+    }
+
+    #[test]
+    fn an_unfragmented_record_is_unaffected() {
+        let file = two_page_chain(&lit(b"HEAD"), &lit(b"TAIL"), flags::FRAGMENT);
+        let dp = DataPage::decode(&file[8192..12288]).unwrap();
+        let frag = dp.record(0).unwrap();
+        // the terminal piece on its own is an ordinary rhd record
+        assert_eq!(frag.next_fragment(), None);
+        assert_eq!(assembled_image(&file, 4096, &frag), Some(b"TAIL".to_vec()));
+    }
+
+    #[test]
+    fn a_chain_pointing_at_a_non_fragment_is_refused() {
+        // corruption, or a pointer into a live row - either way, do not
+        // splice someone else's bytes onto this record
+        let file = two_page_chain(&lit(b"HEAD"), &lit(b"TAIL"), 0);
+        let dp = DataPage::decode(&file[4096..8192]).unwrap();
+        let head = dp.record(0).unwrap();
+        assert_eq!(assembled_image(&file, 4096, &head), None);
+    }
+}
+
+#[cfg(test)]
+mod frag_tranum_tests {
+    use super::*;
+
+    /// A fragmented record without LONG_TRANUM must NOT read a high
+    /// word. `Ods::getTraNum` (ods.cpp:157-169) reads `rhdf_tra_high`
+    /// only inside `if (rhd_flags & rhd_long_tranum)`, and MVCC
+    /// visibility is decided on the number this produces - inventing a
+    /// high word would make a fragmented row claim a transaction 2^32
+    /// times too large.
+    #[test]
+    fn a_fragment_without_long_tranum_has_no_high_word() {
+        let ps = 4096usize;
+        let mut page = vec![0u8; ps];
+        page[0] = 5;
+        page[20..22].copy_from_slice(&128u16.to_le_bytes());
+        page[22..24].copy_from_slice(&1u16.to_le_bytes());
+        let len = RHDF_DATA_OFFSET + 2;
+        let r = ps - len;
+        page[r..r + 4].copy_from_slice(&99u32.to_le_bytes()); // low id = 99
+        // bytes 14-15 are NOT a transaction high word here; set them to
+        // the same 0x8181 the live fixture happened to carry
+        page[r + 14..r + 16].copy_from_slice(&0x8181u16.to_le_bytes());
+        page[r + 10..r + 12].copy_from_slice(&flags::INCOMPLETE.to_le_bytes());
+        page[r + DPG_RPT_OFFSET - DPG_RPT_OFFSET] = page[r]; // no-op, keep layout explicit
+        page[DPG_RPT_OFFSET..DPG_RPT_OFFSET + 2].copy_from_slice(&(r as u16).to_le_bytes());
+        page[DPG_RPT_OFFSET + 2..DPG_RPT_OFFSET + 4].copy_from_slice(&(len as u16).to_le_bytes());
+        let dp = DataPage::decode(&page).unwrap();
+        assert_eq!(dp.record(0).unwrap().transaction, 99);
+
+        // ... and WITH the flag, it does read one
+        page[r + 10..r + 12]
+            .copy_from_slice(&(flags::INCOMPLETE | flags::LONG_TRANUM).to_le_bytes());
+        let dp = DataPage::decode(&page).unwrap();
+        assert_eq!(dp.record(0).unwrap().transaction, 0x8181u64 << 32 | 99);
     }
 }

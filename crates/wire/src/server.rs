@@ -9096,7 +9096,7 @@ fn dml_targets_at(
         if !r.is_primary_record() {
             continue;
         }
-        let Some(image) = r.image() else { continue };
+        let Some(image) = fire_crab_ods::data::assembled_image(&db.bytes, db.page_size, &r) else { continue };
         let descs = formats
             .iter()
             .find(|(n, _)| *n == r.format)
@@ -9144,7 +9144,7 @@ fn collect_dml_targets(
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = r.image() else { continue };
+            let Some(image) = fire_crab_ods::data::assembled_image(&db.bytes, db.page_size, &r) else { continue };
             let descs = formats
                 .iter()
                 .find(|(n, _)| *n == r.format)
@@ -15389,7 +15389,7 @@ fn records_at_in_with(
         if !r.is_primary_record() {
             continue;
         }
-        let Some(image) = r.image() else { continue };
+        let Some(image) = fire_crab_ods::data::assembled_image(bytes, page_size, &r) else { continue };
         let descs = formats
             .iter()
             .find(|(n, _)| *n == r.format)
@@ -15444,7 +15444,10 @@ fn for_each_record<F: FnMut(&[Value])>(
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = r.image() else { continue };
+            let Some(image) = fire_crab_ods::data::assembled_image(&db.bytes, db.page_size, &r)
+            else {
+                continue;
+            };
             let descs = formats
                 .iter()
                 .find(|(n, _)| *n == r.format)
