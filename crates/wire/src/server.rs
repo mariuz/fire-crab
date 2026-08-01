@@ -1701,6 +1701,9 @@ AlterDomainRename {
         /// above it is the same either way, so this narrows what is
         /// READ and never what is ANSWERED.
         index: Option<IndexAccess>,
+        /// set when the predicate holds a `?`, whose value only arrives
+        /// at execute - the bands are built then, from the bound filter
+        defer: Option<DeferredAccess>,
     },
     /// a DERIVED TABLE - `SELECT ... FROM (SELECT ...) X`. The inner
     /// plan produces the rows; the outer projection, WHERE and ORDER BY
@@ -9815,6 +9818,21 @@ impl IndexOp {
 /// statement is then refused rather than writing records the engine's
 /// index scans would miss. Multi-segment and descending indexes are
 /// maintained.
+/// What a retrieval needs to choose its access path AT EXECUTE.
+///
+/// A parameter's value arrives after the plan is built, so a predicate
+/// holding one cannot be turned into a band at prepare - and
+/// `WHERE ID = ?` is how a prepared-statement client asks almost
+/// everything. The plan therefore carries the two things `choose_index`
+/// cannot recover from a bound filter (the table's name, and the
+/// statement text `opt` reads), and the retrieval builds its bands from
+/// the BOUND predicate, where the `?` has become a literal.
+#[derive(Clone, Debug, PartialEq)]
+struct DeferredAccess {
+    table: String,
+    sql: String,
+}
+
 /// The access path for one retrieval: one band per branch of the
 /// predicate's disjunction.
 ///
@@ -9946,6 +9964,47 @@ fn navigates(
         return false;
     }
     not_null_fids(db, table).contains(&key.field)
+}
+
+/// The access path for a retrieval whose predicate may have held a `?`.
+///
+/// With no parameters this is just the plan's own choice. With them, the
+/// bands are built now, from the BOUND filter - the same `choose_index`,
+/// the same rules, one moment later.
+/// Does the predicate still hold a `?` - i.e. can its bands only be
+/// built once the values arrive?
+fn filter_has_params(filter: &Option<Predicate>) -> bool {
+    filter.as_ref().is_some_and(|p| {
+        p.0.iter().flatten().any(|t| {
+            matches!(
+                t,
+                Term::Cmp(_, _, Rhs::Param(..))
+                    | Term::NumCmp(_, _, Rhs::Param(..))
+                    | Term::Like(_, Rhs::Param(..), _, _)
+                    | Term::ExprParam(..)
+            )
+        })
+    })
+}
+
+fn trace_on() -> bool {
+    std::env::var("FC_SRV_TRACE").is_ok()
+}
+
+fn resolve_access(
+    index: &Option<IndexAccess>,
+    defer: &Option<DeferredAccess>,
+    db: &Database,
+    rel: u16,
+    descs: &[Descriptor],
+    filter: &Option<Predicate>,
+    order_by: &[OrderKey],
+) -> Option<IndexAccess> {
+    if index.is_some() {
+        return index.clone();
+    }
+    let d = defer.as_ref()?;
+    choose_index(db, rel, &d.table, descs, filter, &d.sql, order_by)
 }
 
 /// The retrieval leaf for a relation: the optimizer's index, or a scan.
@@ -13634,7 +13693,11 @@ fn plan_query_inner(
                     None => eprintln!("[srv] natural scan: rel={}", rel),
                 }
             }
-            return Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols: Vec::new(), index });
+            let defer = (index.is_none() && filter_has_params(&filter)).then(|| DeferredAccess {
+                table: table.to_string(),
+                sql: sql.to_string(),
+            });
+            return Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols: Vec::new(), index, defer });
         }
         Proj::Items(items) => items,
     };
@@ -13805,7 +13868,11 @@ fn plan_query_inner(
                 None => eprintln!("[srv] natural scan: rel={}", rel),
             }
         }
-        return Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols, index });
+        let defer = (index.is_none() && filter_has_params(&filter)).then(|| DeferredAccess {
+            table: table.to_string(),
+            sql: sql.to_string(),
+        });
+        return Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols, index, defer });
     }
 
     // grouped query: GROUP BY, or a multi-aggregate global projection
@@ -16295,9 +16362,24 @@ fn emit_rows_inner(
             order_by,
             gen_cols,
             index,
+            defer,
         } => {
             if let Some(db) = db {
                 let filter = bind_filter(filter, args)?;
+                // the bands, now that any `?` has a value
+                let descs_now: Vec<Descriptor> = formats
+                    .iter()
+                    .max_by_key(|(n, _)| *n)
+                    .map(|(_, d)| d.clone())
+                    .unwrap_or_default();
+                let index = &resolve_access(
+                    index, defer, db, *rel, &descs_now, &filter, order_by,
+                );
+                if trace_on() {
+                    if let (Some(a), true) = (index.as_ref(), defer.is_some()) {
+                        eprintln!("[srv] index scan: rel={} {} (deferred)", rel, a.describe());
+                    }
+                }
                 let accepts = |v: &[Value]| -> Result<bool, EvalErr> {
                     match &filter {
                         None => Ok(true),
@@ -20682,7 +20764,7 @@ fn plan_correlated_select(
             |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
         )?,
     };
-    Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols: Vec::new(), index: None })
+    Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols: Vec::new(), index: None, defer: None })
 }
 
 /// The name a subquery's own select item gives its output column.

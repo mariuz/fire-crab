@@ -244,6 +244,50 @@ query() { # <sql> <port> <db>
     printf 'CONN_ERR'
 }
 
+pquery() { # <sql> <port> <db> <json-args>
+    n=0
+    while [ $n -lt 6 ]; do
+        r=$(timeout 25 env FC_Q="$1" FC_PORT="$2" FC_DB="$3" FC_ARGS="$4" node -e '
+          process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(0); });
+          const F=require("node-firebird");
+          F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
+                    user:"SYSDBA",password:"masterkey"},(e,db)=>{
+            if(e){console.log("CONN_ERR");process.exit(0);}
+            db.query(process.env.FC_Q,JSON.parse(process.env.FC_ARGS),(e2,r)=>{
+              if(e2){console.log("ERR "+(e2.message||"").split("\n")[0].slice(0,50));db.detach();process.exit(0);}
+              console.log(JSON.stringify(Array.isArray(r)?r:(r?[r]:[])));
+              db.detach();process.exit(0);});});' 2>/dev/null)
+        case "$r" in
+            CONN_ERR|"") n=$((n + 1)); sleep 0.3 ;;
+            *) printf '%s' "$r"; return ;;
+        esac
+    done
+    printf 'CONN_ERR'
+}
+# a PARAMETERISED statement, answered alike and driving a band built at
+# EXECUTE - the trace says "(deferred)" for those
+pboth() { # <label> <sql> <json-args> <want-deferred: yes|no>
+    ran=$((ran + 1))
+    before=$(grep -c "(deferred)" "$LOG" 2>/dev/null || true)
+    a=$(pquery "$2" "$PORT" "$A" "$3")
+    b=$(pquery "$2" "$REAL" "$B" "$3")
+    if [ "$a" = "$b" ]; then
+        echo "OK   $1: $a"
+    else
+        echo "DIFF $1"; echo "     fcwire: $a"; echo "     engine: $b"; fail=1
+    fi
+    after=$(grep -c "(deferred)" "$LOG" 2>/dev/null || true)
+    ran=$((ran + 1))
+    if [ "$4" = yes ] && [ "$after" -gt "$before" ]; then
+        echo "OK   ... and its band was built at EXECUTE"
+    elif [ "$4" = no ] && [ "$after" -eq "$before" ]; then
+        echo "OK   ... and it scanned, as it must"
+    else
+        echo "DIFF $1: deferred=$4 but the log says otherwise"
+        fail=1
+    fi
+}
+
 both() { # <label> <sql>
     ran=$((ran + 1))
     a=$(query "$2" "$PORT" "$A")
@@ -610,6 +654,32 @@ indexed "an aggregate over the whole run" \
         "SELECT SUM(ID) AS S FROM BIG WHERE A = 1"
 indexed "grouped over it" \
         "SELECT A, COUNT(*) AS K FROM BIG WHERE A >= 1 GROUP BY A ORDER BY A"
+
+
+# --- 3h. A PARAMETER'S VALUE ARRIVES AFTER THE PLAN -------------------
+# `WHERE ID = ?` is how a prepared-statement client asks almost
+# everything, and it could not reach an index at all: the band needs a
+# value and the plan is built before there is one. The plan carries what
+# `choose_index` cannot recover from a bound predicate - the table's
+# name and the statement text opt reads - and the bands are built at
+# EXECUTE, from the filter in which the `?` has become a literal.
+pboth "an equality on a parameter" \
+      "SELECT ID, NAME FROM EMP WHERE ID = ?" "[3]" yes
+pboth "... one that matches nothing" \
+      "SELECT ID FROM EMP WHERE ID = ?" "[99]" yes
+pboth "a non-unique equality" \
+      "SELECT ID FROM EMP WHERE DEPT_ID = ?" "[1]" yes
+pboth "a range" "SELECT ID FROM EMP WHERE ID > ?" "[3]" yes
+pboth "two bounds, two parameters" \
+      "SELECT ID FROM EMP WHERE ID >= ? AND ID <= ?" "[2,4]" yes
+pboth "an OR of two parameters" \
+      "SELECT ID FROM EMP WHERE DEPT_ID = ? OR DEPT_ID = ?" "[1,2]" yes
+pboth "a parameter on a column with no index" \
+      "SELECT ID FROM EMP WHERE SALARY = ?" "[300]" no
+pboth "a parameter beside a literal" \
+      "SELECT ID FROM EMP WHERE DEPT_ID = ? AND SALARY > 100" "[1]" yes
+pboth "a NULL parameter, which matches nothing" \
+      "SELECT ID FROM EMP WHERE DEPT_ID = ?" "[null]" no
 
 # --- 4. the answers themselves, index and scan side by side ------------
 # the same question asked two ways: if the index path lost a row, these

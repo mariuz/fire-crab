@@ -13,6 +13,33 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — W1p: a parameter's value arrives after the plan
+
+### Converted
+- **`WHERE ID = ?` reaches an index.** It could not before: a band needs
+  a value, and the plan is built while the value is still a `?`. The plan
+  now carries the two things `choose_index` cannot recover from a bound
+  predicate — the table's name and the statement text `opt` reads — and
+  the bands are built at EXECUTE, from the filter in which binding has
+  already turned each `?` into a literal. Same function, same rules, one
+  moment later.
+- It matters because that is how a prepared-statement client asks almost
+  everything. Equalities, ranges, two bounds from two parameters, and an
+  `OR` of parameters all retrieve now; a parameter on an unindexed
+  column still scans, and so does a NULL one.
+
+### Found while widening the sweep, and NOT caused by this work
+`qa/serve-real-params.sh` fails, and has been failing since before the
+index programme began — bisected to R7 and earlier. fire-crab **accepts a
+boolean parameter INSERT that the engine rejects**, so its table gains a
+row the engine's has not, and the two counts diverge. It is in the
+roadmap with the reproducer. The gate was never in any sweep here: I had
+been running `serve-real-typedparams.sh` and assumed it covered the same
+ground.
+
+`qa/serve-real-index.sh` is 356 checks. 372 unit tests and 7 gates
+confirm nothing moved.
+
 ## 2026-08-01 — W1o: the check that could not tell the difference
 
 ### Fixed
