@@ -13,6 +13,43 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — W2: the careful write order, called at last
+
+`fire-crab-cch` has modelled the engine's precedence graph — content
+before the reference to it — since it was converted, and
+`qa/cch-crash-harness.sh` has gated it that whole time. **Nothing called
+it.** The server flushed a modified database with one `fs::write` of the
+whole file, which is correct when it completes and arbitrary when it does
+not: a crash part-way through leaves whatever the operating system
+happened to flush, in whatever order it chose.
+
+### Converted
+- **The DML flush writes PAGES, in precedence order.** `careful_plan`
+  builds the graph from the before/after images, `flush` drains it, and
+  each page is written at its offset and `sync_data`'d before the page
+  that references it — an ordering that exists only in memory is not an
+  ordering.
+- `crates/wire` depends on `fire-crab-cch` for the first time. That
+  leaves `-lck`, `-evt` and `-pio` as the subsystems the server still
+  never calls.
+- A file that GREW is still written whole: extending a file is its own
+  careful-write question, and answering it by guessing would be worse
+  than not answering it.
+
+### Measured, not assumed
+Five pages per statement instead of the whole file, and 1200 inserts in
+74.1s against 79.1s before — so the per-page `sync_data` very nearly
+cancels the smaller writes. **This slice does not buy speed.** It buys
+the property the harness has been checking all along: every prefix of the
+write sequence is a database the engine can open.
+
+New `qa/serve-real-carefulflush.sh` (17 checks): the flush is ordered,
+it touches only the pages that changed, the engine opens the result,
+`gfix` validates it — and `FC_NO_CAREFUL` turns the ordering off so the
+assertions can be seen to fail, the same trick `FC_NO_INDEX` earns its
+keep with. 372 unit tests and 11 gates, including the ones that run
+`gfix` and `gbak` over the written file.
+
 ## 2026-08-01 — W1p: a parameter's value arrives after the plan
 
 ### Converted

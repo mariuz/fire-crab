@@ -16,12 +16,12 @@ matters more than the row count:
 |---|---|---|
 | **done** | on-disk structures, record decode + RLE, PIP, pointer/data pages, B-tree decode, TIP/MVCC, GC/sweep, BLR decode | converted and held against an oracle; the server depends on them |
 | **converted, wired** | `ods`, `blb`, `auth`, `svc`, `exe`, `dsql` | the running server links and uses them |
-| **converted, NOT wired** | `cch`, `lck`, `evt`, `pio` | a real conversion of a real law, with a gate — that the server never calls |
-| **being wired** | `opt` | the server asks it for the access path, and takes an index when it says so (W1) |
+| **converted, NOT wired** | `lck`, `evt`, `pio` | a real conversion of a real law, with a gate — that the server never calls |
+| **being wired** | `opt`, `cch` | the server asks `opt` for the access path and takes an index when it says so (W1); it flushes through `cch`'s careful write order (W2) |
 
 That third row was the honest headline, and W1 has begun on it.
-`crates/wire/Cargo.toml` still does not depend on `-cch`, `-lck`, `-evt`
-or `-pio`. It DOES depend on `fire-crab-opt` now, and the optimizer's
+`crates/wire/Cargo.toml` still does not depend on `-lck`, `-evt` or
+`-pio`. It DOES depend on `fire-crab-opt` now, and the optimizer's
 choice is executed rather than merely printed — for the one shape W1
 covers so far. The lock manager
 decodes a lock table it never enqueues into. The page cache models a
@@ -198,8 +198,18 @@ plus *the subsystem is now on the path*.
     records, so re-inserting a deleted key was refused against an engine
     that accepts it. The conflicting records are fetched and checked now
     — the same "candidates, not answers" rule.
-- **W2 — the page cache in the read path** (`cch`), then the write path
-  with its careful-write precedence.
+- **W2 — the page cache.** *(the write order done)* The server's DML
+  flush writes PAGES in `cch`'s precedence order and syncs each before
+  the page that references it, instead of dumping the whole file — so
+  every prefix of the write sequence is a database the engine can open,
+  which is exactly what `qa/cch-crash-harness.sh` had been checking
+  about a model nothing called. `crates/wire` depends on
+  `fire-crab-cch` now. Measured: five pages per statement instead of the
+  whole file, and no speed change (the per-page sync cancels the smaller
+  write) — this buys crash behaviour, not throughput. Still to do: a
+  file that GROWS is written whole (extending is its own careful-write
+  question), and the READ path still slices the image directly rather
+  than fetching through buffers.
 - **W3 — platform I/O** (`pio`) under the cache, instead of the server
   mapping bytes itself.
 - **W4 — the lock manager participating** (`lck`): enqueue, dequeue,

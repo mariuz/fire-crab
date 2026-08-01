@@ -9772,9 +9772,70 @@ fn execute_dml_collecting(
         }
         _ => return Err("not a DML plan".into()),
     };
+    flush_careful(&db.path, &db.bytes, &work, db.page_size)?;
     db.bytes = work;
-    std::fs::write(&db.path, &db.bytes).map_err(|e| e.to_string())?;
     Ok(counts)
+}
+
+/// Flush a modified database image to disk THE WAY THE ENGINE DOES: one
+/// page at a time, in an order where every page a reader might follow is
+/// already there.
+///
+/// The server had been writing the whole file with one `fs::write`. That
+/// is correct when it completes and arbitrary when it does not: a crash
+/// part-way through leaves whatever the operating system happened to
+/// flush, in whatever order. The engine instead orders its page writes
+/// by a PRECEDENCE GRAPH - content before the reference to it, so a
+/// pointer page never names a data page that is not on disk yet - and
+/// `fire-crab-cch` has modelled that graph, and been gated on it by
+/// `qa/cch-crash-harness.sh`, since long before anything called it.
+///
+/// This is what calls it. Every prefix of the resulting write sequence
+/// is a database the engine can open, which is the property the harness
+/// checks and the reason the order exists.
+///
+/// A file that GREW (new pages allocated past the old end) is written
+/// whole: extending a file is itself a careful-write question the model
+/// does not cover, and answering it by guessing would be worse than not
+/// answering it.
+fn flush_careful(path: &str, before: &[u8], after: &[u8], page_size: usize) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom, Write};
+    // FC_NO_CAREFUL restores the whole-file write. It exists for the
+    // GATE, for the same reason FC_NO_INDEX does: an assertion that the
+    // ordering happened is worth nothing unless it can be seen not to.
+    if std::env::var("FC_NO_CAREFUL").is_ok() {
+        return std::fs::write(path, after).map_err(|e| e.to_string());
+    }
+    if before.len() != after.len() || before.is_empty() || page_size == 0 {
+        return std::fs::write(path, after).map_err(|e| e.to_string());
+    }
+    let mut cache = fire_crab_cch::careful_plan(before, after, page_size);
+    cache.flush();
+    let order: Vec<u32> = cache.write_order().to_vec();
+    if order.is_empty() {
+        return Ok(()); // nothing changed
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    for page in &order {
+        let start = *page as usize * page_size;
+        let end = (start + page_size).min(after.len());
+        if start >= after.len() {
+            continue;
+        }
+        f.seek(SeekFrom::Start(start as u64)).map_err(|e| e.to_string())?;
+        f.write_all(&after[start..end]).map_err(|e| e.to_string())?;
+        // each page must REACH the disk before the one that references
+        // it is written - an ordering that only exists in memory is not
+        // an ordering
+        f.sync_data().map_err(|e| e.to_string())?;
+    }
+    if std::env::var("FC_SRV_TRACE").is_ok() {
+        eprintln!("[srv] careful flush: {} pages in precedence order", order.len());
+    }
+    Ok(())
 }
 
 /// One index a DML statement must maintain: its key segments (field,
