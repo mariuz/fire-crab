@@ -38,15 +38,12 @@ four; R7 is the removal of what they replaced.
 
 ## Measured gaps that are nobody's slice yet
 
-- **fire-crab is STRICTER than the engine in four places**, measured by
-  a fleet probing around the boolean parameter. Each is a statement the
-  engine accepts and fire-crab refuses, which is the outage direction:
-  a string `'true'` into a BOOLEAN column (the engine stores TRUE); a
-  boolean parameter into a VARCHAR column (the engine stores `'1'`); a
-  bare boolean parameter as a whole predicate, `WHERE ?`; and an integer
-  parameter into a text column. The missing arms are named:
-  `WireParam::Text` has no `dtype::BOOLEAN` case in `encode_wire_value`,
-  and `WireParam::Int` has no `TEXT`/`VARYING` case.
+- **A bare boolean parameter as a whole predicate** — `SELECT ... WHERE ?`
+  — is refused; the engine answers it. The other three strictness
+  divergences found with it (a string into a BOOLEAN column, a boolean
+  into a text column, an integer into a text column) are fixed, each
+  against the value the engine actually stores. This one is the predicate
+  parser rather than a conversion.
 
 - **An IN-SUBQUERY refuses past ~10-100 inner rows.**
   `SELECT COUNT(*) FROM B WHERE ID IN (SELECT ID FROM B WHERE ID > 5990)`

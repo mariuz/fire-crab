@@ -198,13 +198,42 @@ for bad in "NAME" "ID"; do
         *) echo "DIFF bare $bad: fcwire [$a] engine [$b]"; fail=1 ;;
     esac
 done
-# and the driver's own limit, asserted as the shared refusal it is
+# A boolean PARAMETER. This asserted a shared REFUSAL, because the driver
+# could not encode one - node-firebird 2.14.1 made the encoding
+# metadata-directed, so a BOOLEAN target now receives a real blr_bool and
+# both servers take it. The premise expired; the assertion is now that
+# they AGREE, which is what it was always for.
 a=$(query "INSERT INTO T (ID, B) VALUES (9, ?)" "[true]" "$PORT" "$A")
 b=$(query "INSERT INTO T (ID, B) VALUES (9, ?)" "[true]" "$REAL" "$B")
-case "$a:$b" in
-    ERR*:ERR*) echo "OK   a boolean PARAMETER is refused by both - this driver cannot encode one" ;;
-    *) echo "DIFF boolean parameter: fcwire [$a] engine [$b]"; fail=1 ;;
-esac
+if [ "$a" = "$b" ]; then
+    echo "OK   a boolean PARAMETER is taken by both, alike"
+else
+    echo "DIFF boolean parameter: fcwire [$a] engine [$b]"; fail=1
+fi
+# and it stored the same thing on both sides
+a=$(query "SELECT ID, B FROM T WHERE ID = 9" "[]" "$PORT" "$A")
+b=$(query "SELECT ID, B FROM T WHERE ID = 9" "[]" "$REAL" "$B")
+if [ "$a" = "$b" ]; then
+    echo "OK   ... and stored the same value: $a"
+else
+    echo "DIFF the stored boolean differs: fcwire [$a] engine [$b]"; fail=1
+fi
+# the conversions AROUND it, each probed against the engine rather than
+# assumed: a string names the value ('true'/'false', case-insensitively,
+# blanks ignored) and nothing else does; a boolean into a text column
+# stores '1'/'0'; an integer into a text column stores its digits.
+for pair in "'true' 10 B ['true']" "'FALSE' 11 B ['FALSE']" "' True ' 12 B [' True ']" \
+            "'t' 13 B ['t']" "'yes' 14 B ['yes']" "bool 15 NAME [true]" "int 16 NAME [42]"; do
+    set -- $pair
+    lbl=$1; id=$2; col=$3; shift 3; args="$*"
+    a=$(query "INSERT INTO T (ID, $col) VALUES ($id, ?)" "$args" "$PORT" "$A")
+    b=$(query "INSERT INTO T (ID, $col) VALUES ($id, ?)" "$args" "$REAL" "$B")
+    if [ "$a" = "$b" ]; then
+        echo "OK   $lbl into $col: both agree ($a)"
+    else
+        echo "DIFF $lbl into $col: fcwire [$a] engine [$b]"; fail=1
+    fi
+done
 
 rm -f "$A" "$B"
 exit $fail

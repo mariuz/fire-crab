@@ -8359,6 +8359,12 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
             }
             dtype::DOUBLE if *ws == 0 => (*v as f64).to_le_bytes().to_vec(),
             dtype::REAL if *ws == 0 => (*v as f32).to_le_bytes().to_vec(),
+            // an INTEGER parameter into a TEXT column: the engine
+            // stores its decimal rendering ("42", "-7"), and REFUSES
+            // rather than truncate when it does not fit
+            dtype::TEXT | dtype::VARYING if *ws == 0 => {
+                text_bytes_for(&v.to_string(), d, flen)?
+            }
             _ => return None,
         }),
         WireParam::Text(text) => {
@@ -8380,6 +8386,17 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
                     out.resize(flen, b' '); // CHAR blank padding
                     Some(out)
                 }
+                // a TEXT parameter into a BOOLEAN column. The engine
+                // takes exactly two words, case-insensitively and with
+                // surrounding blanks ignored: probed, `'true'`, `'TRUE'`,
+                // `'True'` and `' true '` all store TRUE, while `'t'`,
+                // `'1'`, `'yes'` and `''` are all refused. So this is a
+                // NAME match, not a truthiness test.
+                dtype::BOOLEAN => match text.trim() {
+                    t if t.eq_ignore_ascii_case("true") => Some(vec![1u8]),
+                    t if t.eq_ignore_ascii_case("false") => Some(vec![0u8]),
+                    _ => return None,
+                },
                 _ => return None,
             }
         }
@@ -8423,6 +8440,11 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
         }),
         WireParam::Bool(v) => Some(match d.dtype {
             dtype::BOOLEAN => vec![*v as u8],
+            // a BOOLEAN parameter into a TEXT column: the engine stores
+            // "1" or "0" - probed, not the word
+            dtype::TEXT | dtype::VARYING => {
+                text_bytes_for(if *v { "1" } else { "0" }, d, flen)?
+            }
             _ => return None,
         }),
     })
@@ -9836,6 +9858,31 @@ fn flush_careful(path: &str, before: &[u8], after: &[u8], page_size: usize) -> R
         eprintln!("[srv] careful flush: {} pages in precedence order", order.len());
     }
     Ok(())
+}
+
+/// Store `text` in a TEXT/VARYING column, or None when it does not fit -
+/// the engine refuses an overflowing parameter rather than truncating.
+fn text_bytes_for(text: &str, d: &Descriptor, flen: usize) -> Option<Vec<u8>> {
+    let b = text.as_bytes();
+    match d.dtype {
+        dtype::VARYING => {
+            if b.len() + 2 > flen {
+                return None;
+            }
+            let mut out = (b.len() as u16).to_le_bytes().to_vec();
+            out.extend_from_slice(b);
+            Some(out)
+        }
+        dtype::TEXT => {
+            if b.len() > flen {
+                return None;
+            }
+            let mut out = b.to_vec();
+            out.resize(flen, b' '); // CHAR blank padding
+            Some(out)
+        }
+        _ => None,
+    }
 }
 
 /// One index a DML statement must maintain: its key segments (field,
@@ -20095,7 +20142,19 @@ impl Expr {
                     // to a text width: render the value, refuse if it does
                     // not fit (the engine's convert error), pad for CHAR
                     CastTarget::Text { len, pad } => {
-                        let s = v.render();
+                        // A BOOLEAN casts to the WORD IN CAPITALS -
+                        // `CAST(B AS VARCHAR(6))` is 'TRUE', while isql
+                        // DISPLAYS the same column as `<true>`. Two
+                        // renderings of one value, and only the cast's
+                        // is a value the SQL surface can be asked about,
+                        // so `Value::render` (which the dumpers and the
+                        // display path share) keeps the lower-case form.
+                        let s = match v {
+                            Value::Bool(b) => {
+                                if b { "TRUE".to_string() } else { "FALSE".to_string() }
+                            }
+                            _ => v.render(),
+                        };
                         if s.chars().count() > *len {
                             return Err(EvalErr::ConversionError(None));
                         }

@@ -13,6 +13,40 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — Four conversions the engine makes and fire-crab refused
+
+A fleet probing around the boolean parameter found four statements the
+engine accepts and fire-crab rejected. Refusing what the engine takes is
+the outage direction, so each was probed against the engine for the value
+it STORES, not just for acceptance.
+
+### Fixed
+| parameter | column | the engine stores |
+|---|---|---|
+| `'true'` / `'FALSE'` / `' True '` | BOOLEAN | TRUE / FALSE — a NAME match, case-insensitive, blanks ignored |
+| `'t'`, `'1'`, `'yes'`, `''` | BOOLEAN | **refused** — it is not a truthiness test |
+| a boolean | VARCHAR / CHAR | `'1'` or `'0'`, not the word |
+| an integer | VARCHAR / CHAR | its decimal digits, and **refused** rather than truncated when too long |
+
+- `CAST(<boolean> AS VARCHAR)` renders **`TRUE`**, in capitals, while
+  isql DISPLAYS the same column as `<true>`. Two renderings of one value,
+  and only the cast's is a value the SQL surface can be asked about — so
+  `Value::render`, which the dumpers share, keeps the lower-case form and
+  the cast overrides it.
+
+### Still refused, and now recorded rather than assumed
+A bare boolean parameter as a whole predicate — `SELECT ... WHERE ?` —
+which the engine answers. That is the predicate parser rather than a
+conversion, and it is in the roadmap.
+
+### A second gate with the same expired premise
+`qa/serve-real-boolean.sh` also asserted "a boolean PARAMETER is refused
+by both — this driver cannot encode one". Same driver update, same
+expiry. It now asserts that the two servers AGREE, which is what it was
+always for, and carries the seven conversions above.
+
+372 unit tests and 11 gates.
+
 ## 2026-08-01 — A SELECT returning 2400 rows hung forever
 
 Not a roadmap item. A fleet sent to design the index-driven join
