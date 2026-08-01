@@ -13,6 +13,72 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — Sixty-three tables that did not exist
+
+The fleet sent to plan fragment assembly refuted the assembly I had just
+committed, and the correction found something far worse than the
+optimizer symptom that started it.
+
+### Fixed
+- **Each piece is decoded with its OWN flags.** My first version joined
+  the compressed bytes and unpacked once. `vio.cpp:1849` unpacks the
+  head, then `:1861-1865` loops `while (rpb_incomplete) {
+  DPM_fetch_fragment(); unpack(rpb, ...) }`, and `unpack`
+  (vio.cpp:575-602) tests `rpb_not_packed` **on every call**. So
+  NOT_PACKED is a property of the PIECE, not the record, and a chain can
+  mix a raw head with a compressed tail. Joining first gives the same
+  answer whenever every piece happens to be packed — which is what the
+  one fixture I had contained — and on a mixed chain it refused the
+  record and lost the row.
+
+- **63 of 220 tables were unqueryable after an ordinary `gbak` backup and
+  restore.** `catalog.rs` is where names are resolved, so a fragmented
+  `RDB$RELATIONS` row means the table **does not exist** as far as
+  fire-crab is concerned: `SELECT ... FROM <table>` answered *Dynamic SQL
+  Error* on a database the engine reads perfectly. Measured before: 220
+  tables, 157 queryable, 63 failed. After: **220 queryable, 0 failed.**
+
+  The trap, and it is a good one: `SELECT COUNT(*) FROM RDB$RELATIONS`
+  answered **220 correctly** the whole time. A gate that only diffs
+  catalogue queries passes while a quarter of the schema is unreachable.
+  The gate has to name a table in a `FROM` clause.
+
+- **`CREATE INDEX` silently omitted fragmented rows** (`backfill_index`),
+  writing an index the **real engine** then reads and finds nothing in —
+  durable wrong state, not a bad plan. Also converted: `column_has_nulls`
+  (so `SET NOT NULL` cannot succeed over a NULL hiding in a fragmented
+  row) and `index_selectivity`.
+
+- **A fragmented BACK version dropped the row entirely.** `tra.rs`'s MVCC
+  walk did `let Some(back_data) = back.image() else { break }`, so a
+  fragmented prior version broke the loop even when the primary was
+  perfectly readable — and the delta path would then have applied against
+  an image never fetched.
+
+### The gate
+New `qa/serve-real-fragment.sh` (12 checks). Making a record fragment on
+purpose is most of the work, and two earlier attempts failed:
+
+  1. **`LPAD('', 4000, 'x')` compresses away.** The record RLE collapses a
+     run of equal bytes and the row fits after all. The payload is now
+     `RPAD('', n, 'ab')` — "abab…" — which the codec cannot touch.
+  2. **`PAGE_SIZE 4096` is not 4096.** Firebird 6 clamps silently to
+     MIN_PAGE_SIZE (ods.h:228 = 8192), so an "8 KB row in a 4 KB page"
+     experiment produces no fragments whatsoever. That one cost an hour
+     of believing rows simply would not fragment.
+
+The threshold is `page_size - 28 - 13` (dpm.epp:2383-2392), and the gate
+asserts its own fixture fragments — 16 records — before it measures
+anything, because a fragment gate whose fixture does not fragment is a
+green run that proves nothing.
+
+One boundary is asserted rather than fixed: fire-crab **refuses** to
+write a row that would fragment, instead of half-writing one. That is a
+cross-page store it does not do, and the gate pins the refusal so it
+cannot quietly become a bad write.
+
+388 unit tests.
+
 ## 2026-08-01 — The row that was nine bytes to the left
 
 Fragment assembly. A record too large for one page is stored as a head

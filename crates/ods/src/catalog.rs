@@ -85,7 +85,7 @@ pub fn list_relations(file: &[u8], page_size: usize) -> Vec<(u16, String)> {
             if !r.is_primary_record() {
                 continue;
             }
-            if let Some(image) = r.image() {
+            if let Some(image) = crate::data::assembled_image(file, page_size, &r) {
                 if let Some(row) = relation_row(&image) {
                     out.push(row);
                 }
@@ -148,7 +148,7 @@ pub fn relation_columns(file: &[u8], page_size: usize, relation_name: &str) -> V
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = r.image() else { continue };
+            let Some(image) = crate::data::assembled_image(file, page_size, &r) else { continue };
             let Some(rname) = cstr(&image, RF_RELATION_NAME_OFFSET) else {
                 continue;
             };

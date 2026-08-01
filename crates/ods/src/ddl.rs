@@ -270,7 +270,7 @@ fn walk_rows(
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = r.image() else { continue };
+            let Some(image) = crate::data::assembled_image(file, page_size, &r) else { continue };
             cb(&decode_record(&image, descs));
         }
     }
@@ -622,7 +622,7 @@ fn find_sys_row_slot(
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = r.image() else { continue };
+            let Some(image) = crate::data::assembled_image(file, page_size, &r) else { continue };
             if pred(&decode_record(&image, descs)) {
                 return Some((dp_no, r.slot));
             }
@@ -654,7 +654,7 @@ fn find_relations_row(
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = r.image() else { continue };
+            let Some(image) = crate::data::assembled_image(file, page_size, &r) else { continue };
             let vals = decode_record(&image, descs);
             if let Some(Value::Text(t)) = vals.get(name_fid) {
                 if t.trim_end().eq_ignore_ascii_case(table) {
@@ -1126,7 +1126,7 @@ pub fn rename_domain(
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = r.image() else { continue };
+            let Some(image) = crate::data::assembled_image(file, page_size, &r) else { continue };
             let vals = decode_record(&image, &f_descs);
             if text_eq(vals.get(name_fid), &old) {
                 hit = Some((dp_no, r.slot, image, r.format));
@@ -1175,7 +1175,7 @@ pub fn rename_domain(
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = r.image() else { continue };
+            let Some(image) = crate::data::assembled_image(file, page_size, &r) else { continue };
             let vals = decode_record(&image, &rf_descs);
             if !text_eq(vals.get(src_fid), &old) {
                 continue;
@@ -2668,7 +2668,7 @@ fn column_has_nulls(file: &[u8], page_size: usize, rel: u16, fid: usize) -> bool
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = r.image() else { continue };
+            let Some(image) = crate::data::assembled_image(file, page_size, &r) else { continue };
             let descs = formats
                 .iter()
                 .find(|(n, _)| *n == r.format)
@@ -5344,7 +5344,14 @@ fn backfill_index(
         let rows: Vec<(u16, Vec<Value>)> = dp
             .records()
             .filter(|r| r.is_primary_record())
-            .filter_map(|r| r.image().map(|img| (r.slot, decode_record(&img, descs))))
+            .filter_map(|r| {
+                // ASSEMBLED, not `image()`. A fragmented row skipped here is
+                // a row MISSING FROM THE INDEX THIS WRITES - and that index is
+                // then read by the REAL engine, which returns nothing for a key
+                // whose row plainly exists. Durable wrong state, not a bad plan.
+                crate::data::assembled_image(file, page_size, &r)
+                    .map(|img| (r.slot, decode_record(&img, descs)))
+            })
             .collect();
         for (line, values) in rows {
             let recno = seq * recs + line as u64;
@@ -5392,7 +5399,7 @@ fn walk_rows_at(
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = r.image() else { continue };
+            let Some(image) = crate::data::assembled_image(file, page_size, &r) else { continue };
             cb(dp_no, r.slot, &decode_record(&image, descs));
         }
     }
@@ -5758,7 +5765,7 @@ fn index_selectivity(
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = r.image() else { continue };
+            let Some(image) = crate::data::assembled_image(file, page_size, &r) else { continue };
             let values = decode_record(&image, descs);
             rows += 1;
             let null = Value::Null;

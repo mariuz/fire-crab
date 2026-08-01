@@ -319,22 +319,32 @@ mod tests {
 /// plus a broken or looping chain.
 ///
 /// A record too large for one page is stored as a head carrying
-/// `rhd_incomplete` and a forward pointer, plus continuation fragments
-/// carrying `rhd_fragment`, each pointing at the next. Every piece is
-/// RLE-compressed, and the pieces CONCATENATE: measured on a live
-/// database, a head unpacking to 828 bytes and its fragment unpacking to
-/// 754 give 1582 when their compressed forms are joined and unpacked
-/// once - the same total, because the codec is a byte stream with no
-/// header of its own. So this joins first and unpacks last: one pass
-/// instead of two, and no chance of mis-splitting a run.
+/// `rhd_incomplete` and a forward pointer (`rhdf_f_page` @16,
+/// `rhdf_f_line` @20, data at 22), plus continuation fragments carrying
+/// `rhd_fragment`, each pointing at the next.
 ///
-/// What it recovers is not academic. On a 99-relation database
+/// **EACH PIECE IS DECODED WITH ITS OWN FLAGS, and that is not a detail.**
+/// `vio.cpp:1849` unpacks the head, then `:1861-1865` loops
+/// `while (rpb_flags & rpb_incomplete) { DPM_fetch_fragment(); unpack(rpb, ...) }`
+/// - and `unpack` (vio.cpp:575-602) tests `rpb_not_packed` on every call.
+/// So `NOT_PACKED` is a property of the PIECE, not of the record, and a
+/// chain can mix a raw head with a compressed tail.
+///
+/// The first version of this function joined the compressed bytes and
+/// unpacked once. That gives the same answer whenever every piece is
+/// packed - measured, a head unpacking to 828 bytes and its fragment to
+/// 754 give exactly 1582 either way, because the codec is a byte stream
+/// with no header of its own - and it is simply WRONG on a mixed chain,
+/// where it either splices raw bytes into a compressed stream or (as it
+/// did) refuses the record and loses the row. The all-packed case is not
+/// the general case; it is what one fixture happened to contain.
+///
+/// What this recovers is not academic. On a 99-relation database
 /// `RDB$INDEX_SEGMENTS` held fifteen fragmented rows, and because they
 /// were unreadable SEVENTEEN of sixty-nine indexes did not exist as far
 /// as the optimizer was concerned - `WHERE K = 5` planned NATURAL where
-/// the engine planned INDEX. The first row this function assembled
-/// decoded to `PK_BS2P_500` on table `BS2P_500`, the first index on that
-/// missing list.
+/// the engine planned INDEX. The first row this assembled decoded to
+/// `PK_BS2P_500` on table `BS2P_500`, the first index on that list.
 pub fn assembled_image(
     file: &[u8],
     page_size: usize,
@@ -343,13 +353,15 @@ pub fn assembled_image(
     if head.flags & flags::INCOMPLETE == 0 {
         return head.image();
     }
-    // NOT_PACKED is decided per piece, so a mixed chain could not simply
-    // be concatenated. It does not arise for fragments in practice, and
-    // declining beats guessing.
-    if head.flags & flags::NOT_PACKED != 0 {
-        return None;
-    }
-    let mut packed: Vec<u8> = head.packed_data.to_vec();
+    // one piece, by ITS OWN flags (vio.cpp:575-602)
+    let piece = |flags: u16, bytes: &[u8]| -> Option<Vec<u8>> {
+        if flags & flags::NOT_PACKED != 0 {
+            Some(bytes.to_vec())
+        } else {
+            crate::sqz::unpack(bytes)
+        }
+    };
+    let mut out = piece(head.flags, head.packed_data)?;
     let mut next = head.next_fragment();
     // A chain longer than the file has pages is a corrupt file, not a
     // long record; bound it rather than loop forever.
@@ -367,13 +379,10 @@ pub fn assembled_image(
         if frag.flags & flags::FRAGMENT == 0 {
             return None; // the chain points at something that is not one
         }
-        if frag.flags & flags::NOT_PACKED != 0 {
-            return None;
-        }
-        packed.extend_from_slice(frag.packed_data);
+        out.extend_from_slice(&piece(frag.flags, frag.packed_data)?);
         next = frag.next_fragment();
     }
-    crate::sqz::unpack(&packed)
+    Some(out)
 }
 
 #[cfg(test)]
@@ -477,6 +486,30 @@ mod frag_tests {
         // the terminal piece on its own is an ordinary rhd record
         assert_eq!(frag.next_fragment(), None);
         assert_eq!(assembled_image(&file, 4096, &frag), Some(b"TAIL".to_vec()));
+    }
+
+    /// A MIXED chain: a raw head and a compressed tail. The engine
+    /// decodes each piece by its own `rpb_not_packed` (vio.cpp:575-602,
+    /// called per fragment at :1849 and :1864), so this must assemble -
+    /// the first version of `assembled_image` REFUSED it, and the row
+    /// was lost.
+    #[test]
+    fn a_chain_may_mix_packed_and_raw_pieces() {
+        // head stored raw, fragment compressed
+        let file = two_page_chain(b"HEAD", &lit(b"TAIL"), flags::FRAGMENT);
+        // mark the head NOT_PACKED
+        let mut file = file;
+        let ps = 4096usize;
+        let len = RHDF_DATA_OFFSET + 4;
+        let a = ps + (ps - len);
+        file[a + 10..a + 12]
+            .copy_from_slice(&(flags::INCOMPLETE | flags::NOT_PACKED).to_le_bytes());
+        let dp = DataPage::decode(&file[4096..8192]).unwrap();
+        let head = dp.record(0).unwrap();
+        assert_eq!(
+            assembled_image(&file, 4096, &head),
+            Some(b"HEADTAIL".to_vec())
+        );
     }
 
     #[test]

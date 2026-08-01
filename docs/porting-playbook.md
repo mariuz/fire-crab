@@ -2052,6 +2052,35 @@ them.
   large you need incompressible content — concatenated `GEN_UUID()`s, or
   data from outside the database.
 
+- **The reference implementation's PER-PIECE decision is per-piece for a
+  reason.** Fragment assembly looked like "concatenate and decode once",
+  and that is right whenever every piece is compressed — which is what
+  the first fixture contained. The engine decodes each fragment with its
+  OWN `not_packed` flag, so a mixed chain either splices raw bytes into a
+  compressed stream or gets refused. **When the reference tests a flag
+  inside a loop, the flag varies inside the loop.** Do not hoist it.
+
+- **A fixture that cannot exhibit the defect is worse than no fixture,
+  because it produces a green run.** Two attempts to build a fragmenting
+  database silently produced zero fragments: one because
+  `LPAD('', n, 'x')` compresses to nothing under the record RLE, the
+  other because **Firebird clamps PAGE_SIZE up to 8192 without saying
+  so**, making an "8 KB row in a 4 KB page" experiment meaningless. The
+  gate now asserts its own fixture fragments before it measures anything.
+
+- **Ask what a broken lookup TABLE breaks, not just what it returns.**
+  The symptom was seventeen invisible indexes — a plan-quality problem.
+  The same defect in the same code made 63 of 220 TABLES unqueryable
+  after a backup and restore, because the catalogue read that failed is
+  the one that resolves NAMES. Trace a broken reader up to what depends
+  on it; the worst consequence is rarely the one you noticed first.
+
+- **`SELECT COUNT(*) FROM <catalogue>` is not a test of the catalogue.**
+  It answered 220 correctly while a quarter of those tables could not be
+  named in a FROM clause. Counting rows in a system table exercises a
+  different path from resolving one. If you are testing metadata, make a
+  statement DEPEND on it.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

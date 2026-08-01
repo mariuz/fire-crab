@@ -139,7 +139,10 @@ pub fn visible_rows(
         };
         for r in dp.records() {
             // only chain heads: back versions and blobs are reached
-            // through their primaries; fragments not yet handled
+            // through their primaries. A FRAGMENT is skipped here for the
+            // same reason - it is reached through its head, which carries
+            // rhd_incomplete and is NOT filtered out - and the head's
+            // image is assembled below.
             if r.flags & (flags::CHAIN | flags::BLOB | flags::FRAGMENT) != 0 {
                 continue;
             }
@@ -149,7 +152,7 @@ pub fn visible_rows(
             let mut image: Option<Vec<u8>> = if current.flags & flags::DELETED != 0 {
                 None // deleted stubs carry no data
             } else {
-                current.image()
+                crate::data::assembled_image(file, page_size, &current)
             };
             let mut walked = 0u32;
             let mut deltas = 0u32;
@@ -180,7 +183,15 @@ pub fn visible_rows(
                 let Some(back) = bdp.record(current.back_line) else {
                     break;
                 };
-                let Some(back_data) = back.image() else { break };
+                // ASSEMBLED. A fragmented BACK version used to `break`
+                // here, dropping the row even when the primary was
+                // perfectly readable - and the delta path below would
+                // then have applied against an image that was never
+                // fetched.
+                let Some(back_data) = crate::data::assembled_image(file, page_size, &back)
+                else {
+                    break;
+                };
 
                 image = if current.flags & flags::DELTA != 0 {
                     // prior version stored as differences against the

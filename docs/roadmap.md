@@ -68,6 +68,25 @@ four; R7 is the removal of what they replaced.
   rows — converting the rest is incremental work, and `fcstat`, `exe`,
   `ddl` and `catalog` are still on the old path.
 
+- **Fragment assembly is wired into the READ paths; the PATCH paths still
+  refuse.** `catalog.rs` (name resolution), nine read loops in `ddl.rs`
+  including `backfill_index`, both MVCC sites in `tra.rs`, `opt`'s four
+  catalogue readers and the server's four record readers all assemble
+  now. The in-place rewriters — `alter_domain_type`,
+  `alter_table_alter_column_type` and the other `dp.record(slot)` patch
+  sites — deliberately do NOT: patching a fragmented record means writing
+  across pages, which fire-crab cannot do, and refusing is the correct
+  boundary. `fcstat`, `exe` and `sysfmt` still use the old path and are
+  incremental work.
+
+- **fire-crab refuses to WRITE a row that would fragment.** A cross-page
+  store it does not implement. `qa/serve-real-fragment.sh` asserts the
+  refusal so it cannot quietly become a half-written row.
+
+- **`STARTING WITH` is not in the predicate parser.** Noticed while
+  building the fragment gate; the engine answers it. Unrelated to
+  fragments, small, and unclaimed.
+
 - **(superseded, kept for the mechanism)** A record too large for one page is stored as a head with
   `rhd_incomplete` (flag 8) plus `rhdf` continuation fragments on other
   pages. `RecordHeader::is_primary_record` (`crates/ods/src/data.rs:65`)
