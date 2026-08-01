@@ -96,6 +96,9 @@ CREATE INDEX UNJ_A ON UNJ (A);
 CREATE INDEX UNJ_D ON UNJ (D);
 CREATE INDEX UNJ_AF ON UNJ (A, F);
 CREATE INDEX UNJ_B ON UNJ (B);
+CREATE INDEX UNJ_AD ON UNJ (A, D);
+CREATE TABLE SN (ID INTEGER, BG BIGINT);
+CREATE INDEX SN_B ON SN (BG);
 COMMIT;
 INSERT INTO EMP VALUES (1, 1, 100, 'a');
 INSERT INTO EMP VALUES (2, 1, 200, 'b');
@@ -162,6 +165,12 @@ INSERT INTO UNJ VALUES (1, 1, 0.1, 0, -9223372036854775808);
 INSERT INTO UNJ VALUES (2, 2, 0.2, 1, 5);
 INSERT INTO UNJ VALUES (3, 3, 0.3, -2.5, 7);
 INSERT INTO UNJ VALUES (4, 1, 9.9, 3.5, 9);
+INSERT INTO UNJ VALUES (5, 5, 0.3, 0.5, 11);
+INSERT INTO UNJ VALUES (6, 6, 0.6, 0.6, 12);
+INSERT INTO UNJ VALUES (7, 7, 1.7, 1.7, 13);
+INSERT INTO SN VALUES (1, -9223372036854775808);
+INSERT INTO SN VALUES (2, -9223372036854775807);
+INSERT INTO SN VALUES (3, 0);
 COMMIT;
 UPDATE RT SET K = 25 WHERE ID = 1;
 UPDATE RT SET K = 10 WHERE ID = 1;
@@ -838,6 +847,26 @@ indexed "a compound index holding a FLOAT segment" \
 indexed "a row whose OTHER column holds i64::MIN" \
         "SELECT ID FROM UNJ WHERE A = 1 AND B > -5"
 both "the whole table, whatever it is keyed by" "SELECT ID, A FROM UNJ ORDER BY ID"
+# A SCALED value's key goes through MOV_get_double, which DIVIDES by the
+# power of ten. Multiplying by 10^-n is a different double in the last
+# ulp for about a third of the raws - 0.3, 0.6, 0.7, 1.2, 1.4, 1.7 among
+# them - so the key was one the engine never wrote, and every row
+# carrying such a value dropped out of the index that held it. These
+# values are in the fixture on purpose.
+indexed "a compound index whose second segment is a scaled DECIMAL" \
+        "SELECT ID FROM UNJ WHERE A = 5"
+indexed "... one of the other raws where multiply and divide disagree" \
+        "SELECT ID FROM UNJ WHERE A = 6"
+indexed "... and another" "SELECT ID FROM UNJ WHERE A = 7"
+indexed "... all of them at once" \
+        "SELECT COUNT(*) AS K FROM UNJ WHERE A = 5 OR A = 6 OR A = 7"
+# a row holding i64::MIN in the very column the retrieval keys on: the
+# key cannot be built faithfully, so the retrieval must ABSTAIN - both
+# for the search key and for the candidate's verification - and the row
+# must still come back
+both "a range over a column holding i64::MIN" \
+     "SELECT ID FROM SN WHERE BG <= 0 ORDER BY ID"
+both "... and the whole column" "SELECT ID FROM SN ORDER BY ID"
 
 # --- 5f. ROW ORDER WITHOUT AN ORDER BY --------------------------------
 # The engine's non-navigational retrieval ORs its branches into a

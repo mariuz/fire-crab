@@ -1820,6 +1820,20 @@ them.
   convert a WRITER, the oracle cannot be your own reader; it has to be
   the other implementation, and ideally its consistency checker too.
 
+- **`a * 10^-n` is not `a / 10^n`.** They differ in the last ulp for a
+  large fraction of inputs, and when the result is hashed, keyed or
+  compared byte-for-byte, "differs in the last ulp" means "does not
+  match at all". About a third of the values in a `DECIMAL(9,1)` column
+  vanished from their own index this way. If the reference
+  implementation divides, divide.
+
+- **Abstain at the SOURCE, not at each call site.** The value this
+  server cannot key faithfully was guarded where the search key is built
+  — and then the same arithmetic ran again, unguarded, where a
+  candidate's key is rebuilt for verification, and dropped exactly the
+  rows the first guard was protecting. Push the refusal down into the
+  function that knows it cannot answer, so every caller inherits it.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

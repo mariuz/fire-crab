@@ -13,6 +13,42 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — W1n: three keys the engine never wrote
+
+The fleet's full report named root causes my previous fix had only
+softened. Two of these were corrupting the WRITE path as well.
+
+### Fixed
+- **A scaled value's key MULTIPLIED where the engine DIVIDES.**
+  `MOV_get_double` divides by the power of ten; `raw * 10^-n` is a
+  different double in the last ulp for about a third of the raws — 0.3,
+  0.6, 0.7, 1.2, 1.4, 1.7 among them. So a `DECIMAL`/`NUMERIC` column
+  produced keys the engine never wrote, and every row carrying such a
+  value fell out of the index that held it — **in both directions**: our
+  retrieval could not find them, and the engine could not find what
+  fire-crab wrote.
+- **A `FLOAT` column's value form was not accepted at all**, so
+  `key_for` returned None for every candidate from an index holding one
+  and the index answered the **empty set**. (`Value::Float` is kept
+  apart from `Double` for printing; the key encoder only knew `Double`.)
+  A single-segment FLOAT index scans, so this needed a compound index to
+  surface.
+- **`i64::MIN` now ABSTAINS at the source.** `int64_key` returns None for
+  it, which makes the search key unbuildable (so the retrieval scans) and
+  the candidate unjudgeable (so it is kept). The previous guard covered
+  only the search key, so a row that merely *contained* `i64::MIN` in an
+  indexed segment was still rejected by verification.
+
+### Gated
+The index gate carries the raws where multiply and divide disagree, a
+compound index with a FLOAT segment, and a column holding `i64::MIN`.
+The write gate — the one that asks the ENGINE — now writes scaled
+DECIMAL keys through fire-crab and has the engine find them through its
+own index, with `gfix` after.
+
+`qa/serve-real-index.sh` is 332 checks, `qa/serve-real-descwrite.sh` 36.
+372 unit tests and 7 gates confirm nothing moved.
+
 ## 2026-08-01 — W1m: fire-crab was corrupting descending indexes
 
 The worst defect the fleets have found, and it has nothing to do with

@@ -45,10 +45,12 @@ make_db() {
     "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
 CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE T (ID INTEGER, D INTEGER, S VARCHAR(8));
+CREATE TABLE DC (ID INTEGER, V DECIMAL(9,1));
 COMMIT;
 CREATE DESCENDING INDEX T_D ON T (D);
 CREATE DESCENDING INDEX T_S ON T (S);
 CREATE ASCENDING INDEX T_DA ON T (D);
+CREATE INDEX DC_V ON DC (V);
 COMMIT;
 INSERT INTO T VALUES (0, 100, 'zz');
 COMMIT;
@@ -133,6 +135,17 @@ both "... and the one it prefixes" \
 both "an UPDATE that moves a descending key" "UPDATE T SET D = 999 WHERE ID = 1"
 both "a DELETE from a descending index" "DELETE FROM T WHERE ID = 2"
 
+# A SCALED DECIMAL key travels the same road: its bytes come from
+# MOV_get_double, which DIVIDES by the power of ten. Multiplying by
+# 10^-n instead is a different double in the last ulp for about a third
+# of the raws, so fire-crab wrote keys the engine could not match - the
+# same shape of silent corruption as the descending order, found by the
+# same fleet. These raws are the ones where the two disagree.
+both "write a scaled DECIMAL key" "INSERT INTO DC VALUES (1, 0.3)"
+both "... another" "INSERT INTO DC VALUES (2, 0.6)"
+both "... and another" "INSERT INTO DC VALUES (3, 1.7)"
+both "... one where they agree" "INSERT INTO DC VALUES (4, 5.0)"
+
 # --- 2. THE ENGINE reads what fire-crab wrote ------------------------
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; srv=""
 plan_and_rows() {
@@ -168,6 +181,9 @@ engine_finds "the text index, prefix pair included" \
              "SELECT S FROM T WHERE S >= 'a' ORDER BY S DESC"
 engine_finds "the ASCENDING twin on the same column is unharmed" \
              "SELECT D FROM T WHERE D > 0 ORDER BY D"
+engine_finds "a scaled DECIMAL key fire-crab wrote" "SELECT COUNT(*) FROM DC WHERE V = 0.3"
+engine_finds "... and another" "SELECT COUNT(*) FROM DC WHERE V = 1.7"
+engine_finds "... every one of them, in order" "SELECT V FROM DC WHERE V > 0 ORDER BY V"
 
 # --- 3. and gfix, which is what named the corruption -----------------
 ran=$((ran + 1))
@@ -180,8 +196,8 @@ else
 fi
 
 rm -f "$A" "$B"
-if [ "$ran" -lt 29 ]; then
-    echo "DIFF only $ran checks ran (expected at least 29) - did one silently skip?"
+if [ "$ran" -lt 36 ]; then
+    echo "DIFF only $ran checks ran (expected at least 36) - did one silently skip?"
     fail=1
 fi
 exit $fail

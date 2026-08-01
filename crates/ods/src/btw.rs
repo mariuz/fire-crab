@@ -137,7 +137,18 @@ fn flipped_int_key(be: &[u8]) -> Vec<u8> {
 
 /// `make_int64_key` (btr.cpp:7056) + the int64 emission and munging in
 /// `compress`.
-fn int64_key(raw: i64, scale: i16) -> Vec<u8> {
+fn int64_key(raw: i64, scale: i16) -> Option<Vec<u8>> {
+    // i64::MIN has no faithful key here: the engine's make_int64_key
+    // NEGATES the value before choosing a scale factor, and negating
+    // i64::MIN overflows, so its choice is not the arithmetically
+    // correct one. Returning None makes every caller ABSTAIN - the
+    // search key is not built (so the retrieval scans) and a candidate
+    // holding this value is not judged (so it is kept, and the
+    // predicate decides). Answering with our own bytes instead dropped
+    // any row that merely CONTAINED i64::MIN in an indexed segment.
+    if raw == i64::MIN {
+        return None;
+    }
     let mut n = 0;
     let uq = raw.unsigned_abs();
     while uq < INT64_SCALE_CONTROL[n].0 {
@@ -162,7 +173,7 @@ fn int64_key(raw: i64, scale: i16) -> Vec<u8> {
     while k.len() > 1 && *k.last().unwrap() == 0 {
         k.pop();
     }
-    k
+    Some(k)
 }
 
 /// Encode one column value as an index key for `itype` (ascending,
@@ -188,11 +199,27 @@ pub fn index_key(itype: u16, value: &Value, scale: i8) -> Option<Vec<u8>> {
             Some(if trimmed.is_empty() { vec![0] } else { trimmed.to_vec() })
         }
         IDX_NUMERIC => {
-            // MOV_get_double of a scaled exact numeric
+            // MOV_get_double of a scaled exact numeric. It DIVIDES by
+            // the power of ten; multiplying by 10^-n is a DIFFERENT
+            // DOUBLE in the last ulp for most raws, and a key that
+            // differs in one bit is a key the engine never wrote. At
+            // scale 1 the raws that disagreed were 3, 6, 7, 12, 14, 17,
+            // ... - so a DECIMAL(9,1) column lost about a third of its
+            // values from every index that held it, in both directions:
+            // retrieval could not find them and the ENGINE could not
+            // find what fire-crab wrote.
             let d = match value {
                 Value::Int(v) => *v as f64,
+                Value::Scaled(raw, s) if *s < 0 => {
+                    *raw as f64 / 10f64.powi(-(*s as i32))
+                }
                 Value::Scaled(raw, s) => *raw as f64 * 10f64.powi(*s as i32),
                 Value::Double(d) => *d,
+                // a FLOAT column decodes to its own value form (kept
+                // apart from Double for printing), and rejecting it here
+                // meant every candidate from an index holding one failed
+                // verification - the index returned the EMPTY SET
+                Value::Float(f) => *f as f64,
                 _ => return None,
             };
             Some(double_key(d))
@@ -203,7 +230,7 @@ pub fn index_key(itype: u16, value: &Value, scale: i8) -> Option<Vec<u8>> {
                 Value::Scaled(raw, s) => (*raw, *s as i16),
                 _ => return None,
             };
-            Some(int64_key(raw, s))
+            int64_key(raw, s)
         }
         IDX_SQL_DATE => {
             let Value::Date(d) = value else { return None };
