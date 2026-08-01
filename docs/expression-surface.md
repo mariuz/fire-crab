@@ -184,6 +184,48 @@ usually a unit test too:
   matches the STORED value, padding included — `CHAR(5) 'abc'` matches
   `'abc  '` and `'abc%'` but not `'abc'`.
 
+- **A declared text width is in CHARACTERS; the descriptor's is in
+  bytes.** `CHAR(5)` and `VARCHAR(10)` occupy twenty and forty bytes in
+  a UTF8 database, and the two numbers govern different things: the
+  declared width bounds what may be stored (an eleven-character value
+  into `VARCHAR(10)` is *string right truncation*, whatever it weighs),
+  and the byte length is the field's capacity. A `CHAR` is stored
+  blank-padded to the BYTE length and read back cut to the CHARACTER
+  count — `'abc'` in a UTF8 `CHAR(5)` is `"abc  "`, five characters, and
+  `OCTET_LENGTH` answers 5, not 20. The character set lives in the
+  descriptor's `sub_type`, which is the ttype: set in the low byte,
+  collation in the high one (`CHAR(5) UTF8 COLLATE UNICODE_CI` reads
+  `772 = 0x0304`).
+
+- **A number written as text converts, by a grammar narrower than any
+  general-purpose parser's.** `'1'`, `'+5'`, `'  42  '`, `'.5'`, `'5.'`,
+  `'1e3'`, `'1e-3'`, `'1.5e2'` and hex literals `'0x10'` are all
+  accepted; `''`, `'abc'`, `'1 2'`, `'1,5'`, `'1.5.5'`, `'inf'`, `'NaN'`,
+  `'.'`, `'1e'`, `'e1'`, `'\t5'` and `'5\n'` are all conversion errors.
+  The blanks it ignores are SPACES only — a tab is not one, so
+  `str::trim` is the wrong tool. Rounding is **half away from zero at the
+  target's scale** (`'2.5'` → 3, `'-2.5'` → −3), and the *mantissa* is
+  range-checked against the target's integer width BEFORE the rescale,
+  which is why `'1.999999'` is 2 in an `INTEGER` and a conversion error
+  in a `SMALLINT`. A hex literal is sized by its DIGIT COUNT, not its
+  value, and read as a signed integer at the target's width: `'0xFFFF'`
+  is −1 in a SMALLINT and 65535 in an INTEGER, and
+  `'0x0000000000000001'` — sixteen digits — is refused by an INTEGER
+  though it equals one. Hex never reaches a `FLOAT`/`DOUBLE`.
+
+- **The same text converts differently in a filter.** `WHERE N_SM = ?`
+  with `'1.999999'` returns NO ROWS where the column store refuses it —
+  a filter asks a question and "none" is an answer — and hex, which the
+  store side takes, is a conversion error on the filter side. The
+  comparison is exact rather than through a double: the two BIGINTs
+  `9223372036854775806` and `…807` are one `f64`, and the engine picks a
+  different row for each string.
+
+- **Text against BOOLEAN is a NAME match, not a truthiness test**, on
+  both the store and the filter side: `'true'`, `'TRUE'`, `'True'` and
+  `' true '` are TRUE, while `'t'`, `'1'`, `'yes'` and `''` are all
+  conversion errors.
+
 ## The refusal policy
 
 The surface is bounded, and the boundary is enforced by REFUSAL — a

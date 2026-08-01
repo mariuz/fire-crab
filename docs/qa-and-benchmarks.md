@@ -4415,6 +4415,103 @@ same `isql` runs the same statement against the real engine and against
 only when refusing is deliberate and a gate asserts the failure; a
 refusal is always a SQL error, never a wrong answer dressed as a result.
 
+### Character sets (`qa/serve-real-charset.sh`, 18 checks)
+
+The gate exists because of a row the real engine could not read.
+
+A text descriptor carries its length in **bytes** and its character set
+in `sub_type`, and fire-crab read only the first of those. In a database
+created `DEFAULT CHARACTER SET UTF8` a `CHAR(5)` is twenty bytes, and
+that cost two defects pointing in opposite directions:
+
+- **reading** — `SELECT C5` handed back *twenty* characters where the
+  engine hands back five, on rows the **engine** had written.
+  `OCTET_LENGTH` and `CHAR_LENGTH` answered `20`/`20` against the
+  engine's `5`/`5`.
+- **writing** — an eleven-character parameter into `VARCHAR(10)` was
+  *accepted*, because eleven bytes fit in forty. The engine refuses it,
+  and the row fire-crab then wrote could not be read back: `SELECT`
+  through isql failed with *string right truncation, expected length 10,
+  actual 19*.
+
+The second is why the gate's last two checks stop the server, open
+fire-crab's own database file with the engine's isql, and then run
+`gfix -v -full` on it. A row the reference implementation cannot read is
+worth more than any feature, so it is checked with the reference
+implementation's own tools, not with a client both sides share.
+
+Four character sets, chosen for their widths — UTF8 (4 bytes/char),
+UNICODE_FSS (3), WIN1252 and NONE (1). A gate with only UTF8 columns
+would pass on code that divided everything by four.
+
+The **first** check is not a behaviour at all: it re-reads
+`RDB$CHARACTER_SETS.RDB$BYTES_PER_CHARACTER` from the live database and
+compares all 52 rows against the table hardcoded in
+`crates/ods/src/intl.rs`. A copied constant is a claim about the engine
+and gets tested like one.
+
+One divergence is **asserted rather than removed**: the engine accepts a
+text value of exactly four times the declared character length and
+*silently truncates* it — `CHAR(5)` ← 20 characters stores `"abcde"`,
+reproducible at every width and independent of content. It is an engine
+buffer-sizing bug. Copying it would mean quietly storing a value nobody
+asked for, so fire-crab refuses, and the gate fails if it ever stops
+refusing.
+
+Not covered, and named in the module rather than left to be discovered:
+**transliteration**. The engine converts a WIN1252 column's bytes into
+the connection's character set on the way out; fire-crab passes the
+stored bytes through. Identical for ASCII content — which is what every
+fixture uses — and not for a high byte.
+
+### A number written as text (`qa/serve-real-textnum.sh`, 6 checks over ~650 cases)
+
+The largest single hole in the parameter surface: 82 of 119 measured
+disagreements were one shape, *a text parameter into a numeric column*,
+which the engine converts and fire-crab refused outright.
+
+The grammar was settled by 495 probes — 54 spellings × 9 numeric column
+types, each an `INSERT` followed by a read-back of the **stored value**,
+so the gate checks the conversion and not merely the absence of an
+error. Three of its rules are not what a hand-written parser produces:
+
+- **`'1.999999'` goes into an `INTEGER` as 2 and is refused by a
+  `SMALLINT`.** The rounded result fits both. The *mantissa* — 1999999 —
+  is range-checked against the target's integer width **before** the
+  rescale, and only the SMALLINT is too narrow for it. One string, one
+  rounded result, a different answer per column.
+- **A hex string is sized by its digit count, not its value.**
+  `'0x0000000000000001'` is one, and an `INTEGER` refuses it, because
+  sixteen digits is a BIGINT-shaped literal. The digits are then read as
+  a **signed** integer at the *target's* width, so `'0xFFFF'` is −1 in a
+  SMALLINT and 65535 in an INTEGER.
+- **The store side and the filter side disagree with each other.**
+  `'1.999999'` into a SMALLINT column is a conversion error, but
+  `WHERE N_SM = ?` with the same string returns *no rows* — a filter asks
+  a question, and "none" is an answer. And hex, which the store side
+  takes, is a conversion error on the filter side.
+
+The filter comparison is **exact, not through a double**, and the gate
+proves it the only way that can be proved: the two BIGINTs
+`9223372036854775806` and `…807` are one single `f64`, and the engine
+picks a *different row* for each of those strings.
+
+The engine's own string→double is **not correctly rounded** — it answers
+`100000000000000020` for `'99999999999999999'` where the nearest double
+is `100000000000000000`. fire-crab is correctly rounded and therefore
+more accurate. Rather than copy a one-ulp error or quietly drop the
+cases, the gate splits: twin comparison up to sixteen significant digits
+(the measured boundary — seventeen digits of `'12345678901234567'` agree,
+seventeen *nines* do not), and beyond that fire-crab is checked against
+the true nearest double computed independently by the client.
+
+Still refused, and asserted so: **a non-text parameter against a TEXT
+column**. The engine does not render the value as text — it coerces the
+**column** to a number, per row, so `WHERE S_VC = 5` matches `'5'`,
+`' 5'`, `'5.0'` and `'05'` alike, and *raises mid-scan* if any row holds
+a non-numeric string (adding one `'TRUE'` row makes the whole statement
+fail). That is a comparison rule rather than a conversion.
+
 ### Result modifiers (`qa/serve-real-modifiers.sh`, 36 checks)
 
 The grammar order is the engine's, and it is not negotiable:

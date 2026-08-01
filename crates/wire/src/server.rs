@@ -1997,6 +1997,42 @@ impl Predicate {
                 // a numeric column's parameter keeps its wire scale -
                 // num_cmp aligns it against the stored value exactly
                 (ColKind::Numeric, WireParam::Int(v, ws)) => Some(Rhs::Num(*v, *ws)),
+                // A TEXT parameter against a NUMERIC column. The engine
+                // converts it here too - `WHERE N_INT = ?` with `'5'`
+                // answers rows - but by DIFFERENT rules from the store
+                // path, and both differences were probed rather than
+                // assumed:
+                //
+                //   * no range check. `'1.999999'` into a SMALLINT
+                //     COLUMN is a conversion error, but `WHERE N_SM = ?`
+                //     with the same string returns NO ROWS - a filter
+                //     asks a question, and the answer is simply "none".
+                //     `'99999'` likewise.
+                //   * hex is REFUSED, though the store path takes it:
+                //     `WHERE N_SM = ?` with `'0x5'` is *Conversion error
+                //     from string "0x5"* on the live engine.
+                //
+                // And the comparison is EXACT, not through a double: the
+                // two BIGINTs 9223372036854775806 and ...807 are one
+                // single f64, and the engine picks a DIFFERENT ROW for
+                // each of those strings. So the value keeps its own
+                // scale and `num_cmp` aligns it in i128.
+                (ColKind::Int | ColKind::Numeric, WireParam::Text(s)) => {
+                    match text_number(s) {
+                        Some(TextNum::Dec { mantissa, exp }) => {
+                            let raw = i64::try_from(mantissa)
+                                .map_err(|_| "numeric value is out of range".to_string())?;
+                            let sc = i8::try_from(exp)
+                                .map_err(|_| "numeric value is out of range".to_string())?;
+                            Some(if sc == 0 && matches!(kind, ColKind::Int) {
+                                Rhs::Int(raw)
+                            } else {
+                                Rhs::Num(raw, sc)
+                            })
+                        }
+                        _ => return Err(format!("conversion error from string \"{}\"", s)),
+                    }
+                }
                 _ => return Err("parameter type does not match its column".into()),
             })
         };
@@ -2050,6 +2086,22 @@ impl Predicate {
                 (ColKind::Approx, WireParam::Int(v, sc)) => {
                     Some(Expr::Double(*v as f64 * 10f64.powi(*sc as i32)))
                 }
+                // the same two text conversions the store path learned,
+                // reaching the filter side: a text value into an
+                // approximate column, and the engine's NAME match for a
+                // text value against a BOOLEAN one (probed on this side
+                // too: `'true'`, `'FALSE'` and `' True '` all answer
+                // rows, `'t'` is a conversion error)
+                (ColKind::Approx, WireParam::Text(s)) => Some(Expr::Double(
+                    text_number(s)
+                        .and_then(|n| text_to_approx(n, s))
+                        .ok_or_else(|| format!("conversion error from string \"{}\"", s))?,
+                )),
+                (ColKind::Bool, WireParam::Text(s)) => Some(Expr::Bool(match s.trim() {
+                    t if t.eq_ignore_ascii_case("true") => true,
+                    t if t.eq_ignore_ascii_case("false") => false,
+                    _ => return Err(format!("conversion error from string \"{}\"", s)),
+                })),
                 // everything else keeps the classic Rhs typing, then
                 // becomes the matching literal
                 _ => match bind_rhs(idx, kind)? {
@@ -2068,6 +2120,13 @@ impl Predicate {
                 terms.push(match t {
                     Term::Cmp(fid, op, Rhs::Param(idx, kind)) => match bind_rhs(idx, kind)? {
                         None => Term::Never,
+                        // A text parameter can bind a FRACTION into an
+                        // integer column's term - `WHERE N_INT > ?` with
+                        // `'1.5'`. Rounding it to fit `Rhs::Int` would
+                        // move the boundary, so the term switches to the
+                        // exact path instead, which [Term::NumCmp]
+                        // documents as covering plain integer columns.
+                        Some(rhs @ Rhs::Num(..)) => Term::NumCmp(*fid, *op, rhs),
                         Some(rhs) => Term::Cmp(*fid, *op, rhs),
                     },
                     Term::NumCmp(fid, op, Rhs::Param(idx, kind)) => match bind_rhs(idx, kind)? {
@@ -2313,9 +2372,24 @@ fn wire_for(d: &Descriptor) -> (Wire, i32, i32, i32, i32) {
         // hundreds of megabytes, which is what made firebird-qa's isql
         // init scripts look like hangs. A VARYING descriptor's length
         // carries the 2-byte count word; a TEXT (CHAR) one does not.
-        // (Byte length == character length here: charset NONE.)
-        dtype::TEXT => (Wire::Varying, 448, d.length as i32, 0, 0),
-        dtype::VARYING => (Wire::Varying, 448, (d.length as i32 - 2).max(0), 0, 0),
+        //
+        // The sub_type is the ttype - the column's CHARACTER SET in the
+        // low byte, its collation in the high one - and announcing zero
+        // for it, as this did, told every client the column was
+        // CHARACTER SET NONE. node-firebird then widened the declared
+        // length four-fold (its own compensation for an untransliterated
+        // column) and a UTF8 CHAR(5) arrived as twenty characters. The
+        // engine announces the real ttype; so does this now, which also
+        // hands `CHARACTER SET OCTETS` back as the binary buffer it is
+        // rather than as lossy text.
+        dtype::TEXT => (Wire::Varying, 448, d.length as i32, 0, d.sub_type as i32),
+        dtype::VARYING => (
+            Wire::Varying,
+            448,
+            (d.length as i32 - 2).max(0),
+            0,
+            d.sub_type as i32,
+        ),
         // anything with no native mapping is RENDERED to text, and the
         // rendered width is not known from the descriptor - the maximum
         // is the only safe declaration there
@@ -8368,24 +8442,15 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
             _ => return None,
         }),
         WireParam::Text(text) => {
-            let b = text.as_bytes();
             match d.dtype {
-                dtype::VARYING => {
-                    if b.len() + 2 > flen {
-                        return None;
-                    }
-                    let mut out = (b.len() as u16).to_le_bytes().to_vec();
-                    out.extend_from_slice(b);
-                    Some(out)
-                }
-                dtype::TEXT => {
-                    if b.len() > flen {
-                        return None;
-                    }
-                    let mut out = b.to_vec();
-                    out.resize(flen, b' '); // CHAR blank padding
-                    Some(out)
-                }
+                // one function, not a second copy of it: these two arms
+                // used to duplicate `text_bytes_for`, and when the
+                // length check there learned to count CHARACTERS the
+                // copy here would have gone on counting bytes.
+                // the `?` matters: `text_bytes_for`'s None means "does
+                // not fit", which is a REFUSAL - returned as-is here it
+                // would read as SQL NULL and store one.
+                dtype::VARYING | dtype::TEXT => Some(text_bytes_for(text, d, flen)?),
                 // a TEXT parameter into a BOOLEAN column. The engine
                 // takes exactly two words, case-insensitively and with
                 // surrounding blanks ignored: probed, `'true'`, `'TRUE'`,
@@ -8397,6 +8462,22 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
                     t if t.eq_ignore_ascii_case("false") => Some(vec![0u8]),
                     _ => return None,
                 },
+                // a TEXT parameter into a NUMERIC column. The engine
+                // converts it - this was the single largest hole in the
+                // parameter surface, 82 of 119 measured disagreements -
+                // by a grammar narrow enough to be worth its own
+                // function; see [text_number].
+                dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128 => {
+                    Some(int_bytes(text_to_exact(text_number(text)?, d.dtype, d.scale)?)?)
+                }
+                dtype::DOUBLE => Some(
+                    text_to_approx(text_number(text)?, text)?.to_le_bytes().to_vec(),
+                ),
+                dtype::REAL => Some(
+                    (text_to_approx(text_number(text)?, text)? as f32)
+                        .to_le_bytes()
+                        .to_vec(),
+                ),
                 _ => return None,
             }
         }
@@ -9877,8 +9958,25 @@ fn flush_careful(path: &str, before: &[u8], after: &[u8], page_size: usize) -> R
 
 /// Store `text` in a TEXT/VARYING column, or None when it does not fit -
 /// the engine refuses an overflowing parameter rather than truncating.
+///
+/// "Fit" is TWO bounds, and this used to check only the second of them.
+/// `VARCHAR(10)` is ten CHARACTERS; in a UTF8 database it occupies forty
+/// bytes, so an eleven-character parameter passed the byte test and was
+/// stored. The engine refuses it - *string right truncation, expected
+/// length 10, actual 11* - and, worse, could not afterwards READ the row
+/// fire-crab had written: the same truncation error came back out of
+/// `SELECT` through isql. A row the reference implementation cannot read
+/// is the one outcome worth more than any feature, so the declared
+/// CHARACTER width is checked first.
+///
+/// The byte bound stays. It is the field's actual capacity, it is what
+/// stops a wide value overrunning the record image, and in every
+/// single-byte character set the two bounds are the same number.
 fn text_bytes_for(text: &str, d: &Descriptor, flen: usize) -> Option<Vec<u8>> {
     let b = text.as_bytes();
+    if text.chars().count() > fire_crab_ods::intl::char_length(d.dtype, flen as u16, d.sub_type) {
+        return None;
+    }
     match d.dtype {
         dtype::VARYING => {
             if b.len() + 2 > flen {
@@ -19081,6 +19179,174 @@ fn rescale(raw: i128, from: i8, to: i8) -> Result<i128, EvalErr> {
     }
 }
 
+/// A number written as text, decomposed the way the engine's `cvt`
+/// decomposes one: either a decimal `mantissa x 10^exp`, or a hex
+/// literal remembered WITH ITS DIGIT COUNT - because the count, not the
+/// value, is what decides which columns will take it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TextNum {
+    Dec { mantissa: i128, exp: i32 },
+    Hex { value: u64, digits: u32 },
+}
+
+/// Read the engine's string-to-number grammar. `None` is its
+/// *conversion error from string* - a refusal, not a zero.
+///
+/// Probed exhaustively against Firebird 6 (54 spellings x 9 numeric
+/// column types, `INSERT ... RETURNING`), and the grammar is narrower
+/// than a permissive parser would be:
+///
+///   accepted   `1` `0` `-7` `+5` `  42  ` `00000000000000000012`
+///              `.5` `5.` `-0` `1e3` `1E3` `1e-3` `1.5e2` `+.5`
+///   refused    `` ` ` `abc` `1 2` `1,5` `--5` `1.5.5` `inf` `NaN`
+///              `1d3` `.` `-` `1e` `e1` `0x` `0x 10` `0x1g`
+///
+/// Two details a hand-written parser gets wrong. The surrounding blanks
+/// the engine ignores are SPACES only - `'\t5'` and `'5\n'` are
+/// conversion errors, so this cannot use `str::trim`, which takes all
+/// Unicode whitespace. And there must be at least one digit somewhere:
+/// `'.'`, `'-'` and `'e1'` are all refused, but `'5.'` and `'.5'` are
+/// both fine.
+fn text_number(s: &str) -> Option<TextNum> {
+    let t = s.trim_matches(' ');
+    if t.is_empty() {
+        return None;
+    }
+    // A hex literal: `0x` or `0X` and then hex digits, nothing else and
+    // no sign. Sixteen digits is the whole of a u64 and the engine
+    // refuses a seventeenth (probed: `0x10000000000000000`).
+    if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        if h.is_empty() || h.len() > 16 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        return Some(TextNum::Hex {
+            value: u64::from_str_radix(h, 16).ok()?,
+            digits: h.len() as u32,
+        });
+    }
+    let (neg, body) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    // split off the exponent before the decimal point, so `1e-3` does
+    // not look like a body of `1e-3` with a stray sign in it
+    let (mant, exp10) = match body.find(['e', 'E']) {
+        Some(i) => {
+            let e = &body[i + 1..];
+            let (eneg, ed) = match e.strip_prefix('-') {
+                Some(r) => (true, r),
+                None => (false, e.strip_prefix('+').unwrap_or(e)),
+            };
+            if ed.is_empty() || !ed.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            // an absurd exponent cannot be represented and is a refusal
+            // either way, so clamping it here (rather than overflowing)
+            // keeps the arithmetic below in range
+            let v: i32 = ed.parse().unwrap_or(i32::MAX / 2).min(i32::MAX / 2);
+            (&body[..i], if eneg { -v } else { v })
+        }
+        None => (body, 0),
+    };
+    let (int_part, frac) = match mant.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (mant, ""),
+    };
+    if int_part.is_empty() && frac.is_empty() {
+        return None;
+    }
+    if !int_part.chars().all(|c| c.is_ascii_digit())
+        || !frac.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let digits: String = format!("{}{}", int_part, frac);
+    let raw: i128 = digits.parse().ok()?;
+    Some(TextNum::Dec {
+        mantissa: if neg { -raw } else { raw },
+        exp: exp10 - frac.len() as i32,
+    })
+}
+
+/// A text parameter into an EXACT numeric column: the stored value, or
+/// `None` for the engine's refusal.
+///
+/// Three checks in the engine's own order, and the ORDER is visible from
+/// outside. `'1.999999'` goes into an INTEGER as 2 but is REFUSED by a
+/// SMALLINT - even though 2 fits comfortably in a SMALLINT - because the
+/// MANTISSA (1999999) is range-checked against the target's integer
+/// width BEFORE it is rescaled. Same string, same rounded result,
+/// different answer per column: that is not a bound anyone would guess,
+/// and it is checked here first for exactly that reason.
+///
+/// Then the rescale to the column's own scale, rounding HALF AWAY FROM
+/// ZERO (`'2.5'` -> 3, `'-2.5'` -> -3), and finally the range check on
+/// the stored value - which is what refuses `'9223372036854775807'` into
+/// `NUMERIC(18,4)`, where the mantissa fits an i64 but the x10^4 does
+/// not.
+fn text_to_exact(n: TextNum, dtype: u8, scale: i8) -> Option<i128> {
+    let (lo, hi, bytes) = match dtype {
+        dtype::SHORT => (i16::MIN as i128, i16::MAX as i128, 2u32),
+        dtype::LONG => (i32::MIN as i128, i32::MAX as i128, 4),
+        dtype::INT64 => (i64::MIN as i128, i64::MAX as i128, 8),
+        dtype::INT128 => (i128::MIN, i128::MAX, 16),
+        _ => return None,
+    };
+    let (mantissa, exp) = match n {
+        TextNum::Dec { mantissa, exp } => (mantissa, exp),
+        // A hex literal is sized by ITS DIGIT COUNT, not its value:
+        // `0x0000000000000001` is sixteen digits, so the engine will put
+        // it in a BIGINT and REFUSES it to an INTEGER, though the value
+        // is 1. The pattern is then read as a SIGNED integer of the
+        // TARGET's width, which is why `0xFFFF` is -1 in a SMALLINT and
+        // 65535 in an INTEGER - one string, two values, both probed.
+        TextNum::Hex { value, digits } => {
+            if digits > bytes * 2 {
+                return None;
+            }
+            let signed = match bytes {
+                2 => value as u16 as i16 as i128,
+                4 => value as u32 as i32 as i128,
+                8 => value as i64 as i128,
+                _ => value as i128,
+            };
+            (signed, 0)
+        }
+    };
+    if mantissa < lo || mantissa > hi {
+        return None;
+    }
+    let k = exp - scale as i32;
+    let stored = if k >= 0 {
+        mantissa.checked_mul(pow10_i128(u32::try_from(k).ok()?)?)?
+    } else if k < -39 {
+        // An i128 mantissa is under 1.71e38, so dividing it by 10^40 or
+        // more cannot round to anything but zero - and zero is what the
+        // engine answers (probed: `CAST('1e-200' AS INTEGER)` is 0, as
+        // is `'1e-40'`). Taken before the i8 narrowing below, which
+        // would otherwise turn a representable answer into a refusal.
+        0
+    } else {
+        round_scaled_to_int(mantissa, k as i8)
+    };
+    (stored >= lo && stored <= hi).then_some(stored)
+}
+
+/// A text parameter into an APPROXIMATE column. The engine has no
+/// mantissa bound here - `'99999999999999999999'` is 1e20 in a DOUBLE
+/// and out of range in a BIGINT - but it does refuse a hex literal
+/// outright (probed: `'0x10'` into DOUBLE is *Conversion error from
+/// string "0x10"*), and it refuses anything that overflows to infinity.
+fn text_to_approx(n: TextNum, s: &str) -> Option<f64> {
+    match n {
+        TextNum::Hex { .. } => None,
+        TextNum::Dec { .. } => {
+            let d: f64 = s.trim_matches(' ').parse().ok()?;
+            d.is_finite().then_some(d)
+        }
+    }
+}
+
 /// A decimal string as an exact `(raw, scale)` pair - what a CAST from
 /// text to a numeric type starts from. Rejects anything that is not
 /// `[+-]?digits[.digits]?` so the caller can raise the engine's 22018
@@ -23067,6 +23333,32 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                         kind: RawKind::Cmp(mirror_cmp(op), param),
                     }));
                 }
+            }
+            // A `?` that IS the whole predicate - `WHERE ?`, `WHERE ?
+            // AND ID > 1`. The engine describes it as SQL_BOOLEAN
+            // (probed: dtype 32764, length 1) and answers it as
+            // ordinary three-valued logic, so it is exactly `TRUE = ?`
+            // with the `TRUE =` elided - and that leaf is one this
+            // parser already builds, for `WHERE TRUE = ?`, with its
+            // describe, its bind and its NULL-is-UNKNOWN behaviour
+            // already probed against the engine. Nothing downstream
+            // needs to learn anything.
+            //
+            // The boundary set is the narrow one, and for the same two
+            // reasons as the bare BOOLEAN COLUMN rule below: side_boundary
+            // is the wrong test (it counts an operator as the end of a
+            // side), and `WHERE ? IS NULL`, `WHERE ? LIKE 'o%'`,
+            // `WHERE ? BETWEEN 1 AND 3` and `WHERE ? IN (1,2)` are
+            // DIFFERENT shapes - the engine answers all four and this
+            // parser covers none of them, so they must keep refusing
+            // rather than be mis-read as `TRUE = ?` with tokens left over.
+            if matches!(t.get(p2), None | Some(Tok::And | Tok::Or | Tok::RParen)) {
+                *pos = p2;
+                *np = np2;
+                return Some(Ast::Leaf(RawTerm {
+                    lhs: RawLhs::Expr(RawExpr::Bool(true)),
+                    kind: RawKind::Cmp(Cmp::Eq, param),
+                }));
             }
         }
     }
@@ -28407,6 +28699,189 @@ mod tests {
         Descriptor { dtype: dt, scale, length: len, sub_type: 0, flags: 0, offset: 4 }
     }
 
+    // Every expectation below is a measured engine answer, not a
+    // guess: 495 INSERT ... RETURNING probes (54 spellings x 9 numeric
+    // column types) against Firebird 6, plus a focused hex sweep.
+    #[test]
+    fn text_number_reads_the_engine_s_grammar() {
+        let dec = |s: &str| match text_number(s) {
+            Some(TextNum::Dec { mantissa, exp }) => Some((mantissa, exp)),
+            _ => None,
+        };
+        assert_eq!(dec("1"), Some((1, 0)));
+        assert_eq!(dec("-7"), Some((-7, 0)));
+        assert_eq!(dec("+5"), Some((5, 0)));
+        assert_eq!(dec("  42  "), Some((42, 0)));
+        assert_eq!(dec("00000000000000000012"), Some((12, 0)));
+        assert_eq!(dec(".5"), Some((5, -1)));
+        assert_eq!(dec("5."), Some((5, 0)));
+        assert_eq!(dec("+.5"), Some((5, -1)));
+        assert_eq!(dec("1e3"), Some((1, 3)));
+        assert_eq!(dec("1E3"), Some((1, 3)));
+        assert_eq!(dec("1e-3"), Some((1, -3)));
+        assert_eq!(dec("1.5e2"), Some((15, 1)));
+        assert_eq!(dec("-1e-3"), Some((-1, -3)));
+        // and the refusals - each one a *conversion error from string*
+        // on the live engine, so each one must be None rather than a
+        // best-effort prefix
+        for bad in [
+            "", " ", "abc", "1 2", "1,5", "--5", "1.5.5", "inf", "NaN", "1d3", ".", "-",
+            "1e", "e1", "0x", "0x 10", "0x1g", "\t5", "5\n",
+        ] {
+            assert!(text_number(bad).is_none(), "{:?} should not convert", bad);
+        }
+        // the blanks the engine ignores are SPACES; a tab is not one,
+        // which is why `str::trim` is the wrong tool here
+        assert!(text_number(" 5 ").is_some());
+        assert!(text_number("\t5").is_none());
+        assert!(text_number("5\n").is_none());
+        // a hex literal keeps its DIGIT COUNT, which is what sizes it
+        assert_eq!(
+            text_number("0xFFFF"),
+            Some(TextNum::Hex { value: 0xFFFF, digits: 4 })
+        );
+        assert_eq!(
+            text_number("0x0000000000000001"),
+            Some(TextNum::Hex { value: 1, digits: 16 })
+        );
+        assert!(text_number("0x10000000000000000").is_none()); // 17 digits
+    }
+
+    #[test]
+    fn text_to_exact_checks_the_mantissa_before_it_rescales() {
+        let ex = |s: &str, dt: u8, sc: i8| text_to_exact(text_number(s).unwrap(), dt, sc);
+        // THE surprise, and the reason the order is written down:
+        // '1.999999' rounds to 2, which fits a SMALLINT comfortably -
+        // but the engine range-checks the MANTISSA (1999999) first, so
+        // the SMALLINT refuses and every wider column accepts.
+        assert_eq!(ex("1.999999", dtype::SHORT, 0), None);
+        assert_eq!(ex("1.999999", dtype::LONG, 0), Some(2));
+        assert_eq!(ex("1.999999", dtype::INT64, 0), Some(2));
+        assert_eq!(ex("1.999999", dtype::LONG, -2), Some(200)); // NUMERIC(9,2)
+        // rounding is HALF AWAY FROM ZERO at the target's scale
+        assert_eq!(ex("3.75", dtype::SHORT, 0), Some(4));
+        assert_eq!(ex("2.5", dtype::SHORT, 0), Some(3));
+        assert_eq!(ex("3.5", dtype::SHORT, 0), Some(4));
+        assert_eq!(ex("-2.5", dtype::SHORT, 0), Some(-3));
+        assert_eq!(ex("0.5", dtype::SHORT, 0), Some(1));
+        assert_eq!(ex("-0.5", dtype::SHORT, 0), Some(-1));
+        assert_eq!(ex(".5", dtype::LONG, -2), Some(50)); // 0.50, not 1
+        assert_eq!(ex("3.75", dtype::LONG, -2), Some(375)); // 3.75 kept
+        // exponents
+        assert_eq!(ex("1e3", dtype::SHORT, 0), Some(1000));
+        assert_eq!(ex("1e-3", dtype::SHORT, 0), Some(0));
+        assert_eq!(ex("1e-3", dtype::INT64, -4), Some(10)); // 0.0010
+        assert_eq!(ex("1.5e2", dtype::SHORT, 0), Some(150));
+        assert_eq!(ex("1e400", dtype::INT64, 0), None);
+        // a tiny exponent is ZERO, not a refusal (probed:
+        // CAST('1e-200' AS INTEGER) and CAST('1e-40' AS INTEGER) are
+        // both 0) - the scale is far past what an i8 can name, and
+        // narrowing to one first would have turned this into an error
+        assert_eq!(ex("1e-200", dtype::LONG, 0), Some(0));
+        assert_eq!(ex("1e-40", dtype::LONG, 0), Some(0));
+        assert_eq!(ex("1e-40", dtype::INT64, -4), Some(0));
+        assert_eq!(
+            ex("0.00000000000000000000000000000000000000001", dtype::LONG, 0),
+            Some(0)
+        );
+        // width bounds, per column
+        assert_eq!(ex("32767", dtype::SHORT, 0), Some(32767));
+        assert_eq!(ex("32768", dtype::SHORT, 0), None);
+        assert_eq!(ex("32768", dtype::LONG, 0), Some(32768));
+        assert_eq!(ex("-32769", dtype::SHORT, 0), None);
+        assert_eq!(ex("2147483648", dtype::LONG, 0), None);
+        assert_eq!(ex("2147483648", dtype::INT64, 0), Some(2147483648));
+        assert_eq!(ex("9223372036854775807", dtype::INT64, 0), Some(9223372036854775807));
+        assert_eq!(ex("9223372036854775808", dtype::INT64, 0), None);
+        // the mantissa fits an i64 but x10^4 does not - the check on
+        // the STORED value, after the rescale
+        assert_eq!(ex("9223372036854775807", dtype::INT64, -4), None);
+    }
+
+    #[test]
+    fn hex_is_sized_by_its_digit_count_and_read_at_the_target_s_width() {
+        let ex = |s: &str, dt: u8, sc: i8| text_to_exact(text_number(s).unwrap(), dt, sc);
+        // one string, two values: four digits fill a SMALLINT exactly
+        // and are read as signed there, while an INTEGER has room to
+        // zero-extend them
+        assert_eq!(ex("0xFFFF", dtype::SHORT, 0), Some(-1));
+        assert_eq!(ex("0xFFFF", dtype::LONG, 0), Some(65535));
+        assert_eq!(ex("0x8000", dtype::SHORT, 0), Some(-32768));
+        assert_eq!(ex("0x8000", dtype::LONG, 0), Some(32768));
+        assert_eq!(ex("0xFFFFFFFF", dtype::LONG, 0), Some(-1));
+        assert_eq!(ex("0xFFFFFFFF", dtype::INT64, 0), Some(4294967295));
+        assert_eq!(ex("0x7F", dtype::SHORT, 0), Some(127));
+        assert_eq!(ex("0x10", dtype::LONG, -2), Some(1600)); // scaled like any value
+        // the DIGIT COUNT is the bound, not the value: this is 1, and
+        // an INTEGER still refuses it because it is sixteen digits wide
+        assert_eq!(ex("0x0000000000000001", dtype::INT64, 0), Some(1));
+        assert_eq!(ex("0x0000000000000001", dtype::LONG, 0), None);
+        assert_eq!(ex("0x0000000000000001", dtype::SHORT, 0), None);
+        assert_eq!(ex("0x10000", dtype::SHORT, 0), None); // five digits
+        assert_eq!(ex("0xabcdef", dtype::SHORT, 0), None); // six
+        // and hex never reaches an approximate column
+        assert_eq!(text_to_approx(text_number("0x10").unwrap(), "0x10"), None);
+        assert_eq!(text_to_approx(text_number("1e3").unwrap(), "1e3"), Some(1000.0));
+    }
+
+    #[test]
+    fn text_parameters_reach_numeric_columns() {
+        let bytes = |s: &str, dt: u8, len: u16, sc: i8| {
+            encode_wire_value(&desc(dt, len, sc), &WireParam::Text(s.into()))
+        };
+        assert_eq!(
+            bytes("42", dtype::LONG, 4, 0),
+            Some(Some(42i32.to_le_bytes().to_vec()))
+        );
+        assert_eq!(
+            bytes("3.75", dtype::SHORT, 2, 0),
+            Some(Some(4i16.to_le_bytes().to_vec()))
+        );
+        assert_eq!(
+            bytes("5.25", dtype::LONG, 4, -2),
+            Some(Some(525i32.to_le_bytes().to_vec()))
+        );
+        assert_eq!(
+            bytes("2.5", dtype::DOUBLE, 8, 0),
+            Some(Some(2.5f64.to_le_bytes().to_vec()))
+        );
+        // the refusals travel too
+        assert!(bytes("abc", dtype::LONG, 4, 0).is_none());
+        assert!(bytes("1.999999", dtype::SHORT, 2, 0).is_none());
+        assert!(bytes("0x10", dtype::DOUBLE, 8, 0).is_none());
+    }
+
+    #[test]
+    fn a_text_parameter_is_measured_in_characters() {
+        // VARCHAR(10) in a UTF8 database: forty bytes on disk, ten
+        // CHARACTERS declared. Before the character bound, the eleven
+        // below was stored - and the ENGINE could then not read the row.
+        let v10 = Descriptor {
+            dtype: dtype::VARYING,
+            scale: 0,
+            length: 42,
+            sub_type: 4, // UTF8
+            flags: 0,
+            offset: 4,
+        };
+        assert!(text_bytes_for("1234567890", &v10, 42).is_some());
+        assert!(text_bytes_for("12345678901", &v10, 42).is_none());
+        assert!(text_bytes_for("ääääääääää", &v10, 42).is_some()); // 10 chars, 20 bytes
+        assert!(text_bytes_for("äääääääääää", &v10, 42).is_none()); // 11
+        // CHAR(5) UTF8: twenty bytes, five characters, and stored
+        // blank-padded to the full BYTE length
+        let c5 = Descriptor { sub_type: 4, dtype: dtype::TEXT, length: 20, scale: 0, flags: 0, offset: 4 };
+        assert_eq!(text_bytes_for("abc", &c5, 20).map(|b| b.len()), Some(20));
+        assert!(text_bytes_for("123456", &c5, 20).is_none());
+        assert!(text_bytes_for("äbcde", &c5, 20).is_some()); // 5 chars, 6 bytes
+        assert!(text_bytes_for("ääääää", &c5, 20).is_none()); // 6 chars, 12 bytes
+        // ... and in a single-byte set the two bounds coincide, which is
+        // what every earlier gate was measuring
+        let n5 = Descriptor { sub_type: 0, dtype: dtype::TEXT, length: 5, scale: 0, flags: 0, offset: 4 };
+        assert!(text_bytes_for("12345", &n5, 5).is_some());
+        assert!(text_bytes_for("123456", &n5, 5).is_none());
+    }
+
     #[test]
     fn parses_node_style_param_blr() {
         // what node-firebird's CalcBlr emits for (int, 'abcde', bigint):
@@ -28493,9 +28968,17 @@ mod tests {
             Some(Some(vec![1]))
         );
         assert!(encode_wire_value(&desc(dtype::LONG, 4, 0), &WireParam::Bool(true)).is_none());
-        // text into an int column is a mismatch, never a conversion
+        // Text into an int column CONVERTS - this assertion used to
+        // say "a mismatch, never a conversion", which was fire-crab's
+        // behaviour and not the engine's: probed, the engine stores 9.
+        // A non-numeric string is still the refusal.
+        assert_eq!(
+            encode_wire_value(&desc(dtype::LONG, 4, 0), &WireParam::Text("9".into())),
+            Some(Some(9i32.to_le_bytes().to_vec()))
+        );
         assert!(
-            encode_wire_value(&desc(dtype::LONG, 4, 0), &WireParam::Text("9".into())).is_none()
+            encode_wire_value(&desc(dtype::LONG, 4, 0), &WireParam::Text("nine".into()))
+                .is_none()
         );
     }
 
@@ -28529,9 +29012,14 @@ mod tests {
             Value::Null,
             Value::Text("x".into()),
         ]).unwrap());
-        // a wire type that does not match the column kind is an error
+        // A TEXT value against an INTEGER column now converts, the way
+        // the engine does (`WHERE N_INT = ?` with '5' answers rows); the
+        // mismatch that stays an error is a string that is not a number.
         assert!(p
             .bind(&[WireParam::Text("42".into()), WireParam::Text("x".into())])
+            .is_ok());
+        assert!(p
+            .bind(&[WireParam::Text("forty-two".into()), WireParam::Text("x".into())])
             .is_err());
         // scaled wire integers do not bind into scale-0 comparisons
         assert!(p

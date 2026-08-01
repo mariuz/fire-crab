@@ -360,7 +360,17 @@ pub fn decode_field(image: &[u8], desc: &Descriptor, index: usize) -> Value {
         return Value::Unsupported("truncated");
     };
     match desc.dtype {
-        dtype::TEXT => Value::Text(String::from_utf8_lossy(f).into_owned()),
+        // A CHAR is stored blank-padded to its full BYTE length, and its
+        // DECLARED width is in characters - twenty bytes for a UTF8
+        // CHAR(5). Handing back all twenty is what made every CHAR value
+        // in a UTF8 database wrong on the wire, on rows the ENGINE had
+        // written; [crate::intl::fit_char] cuts it to the five the
+        // engine returns. In a single-byte set the two are the same
+        // number and this is the identity it always was.
+        dtype::TEXT => Value::Text(crate::intl::fit_char(
+            &String::from_utf8_lossy(f),
+            crate::intl::char_length(desc.dtype, desc.length, desc.sub_type),
+        )),
         dtype::VARYING => {
             let n = (u16_at(f, 0) as usize).min(len.saturating_sub(2));
             Value::Text(String::from_utf8_lossy(&f[2..2 + n]).into_owned())

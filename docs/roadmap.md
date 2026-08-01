@@ -37,12 +37,52 @@ four; R7 is the removal of what they replaced.
 
 ## Measured gaps that are nobody's slice yet
 
-- **A bare boolean parameter as a whole predicate** — `SELECT ... WHERE ?`
-  — is refused; the engine answers it. The other three strictness
-  divergences found with it (a string into a BOOLEAN column, a boolean
-  into a text column, an integer into a text column) are fixed, each
-  against the value the engine actually stores. This one is the predicate
-  parser rather than a conversion.
+- ~~A bare boolean parameter as a whole predicate~~ — *fixed*. `WHERE ?`
+  is `TRUE = ?` with the `TRUE =` elided: the engine describes the slot
+  as `SQL_BOOLEAN` and answers ordinary three-valued logic, and that leaf
+  was one the parser already built. One `else` branch, nothing downstream
+  changed. `WHERE ? IS NULL`, `WHERE ? LIKE 'o%'`, `WHERE ? BETWEEN 1 AND 3`
+  and `WHERE ? IN (1,2)` are *different shapes* the engine also answers
+  and this parser covers none of — still refused, deliberately, rather
+  than mis-read as `TRUE = ?` with tokens left over.
+
+- ~~A text parameter into a numeric column or filter~~ — *fixed*. It was
+  the largest single hole in the parameter surface (82 of 119 measured
+  disagreements). See `qa/serve-real-textnum.sh`; the store side and the
+  filter side turned out to have different rules, and the filter
+  comparison is exact rather than through a double.
+
+- **A NON-TEXT parameter against a TEXT column** — `WHERE S_VC = 5`,
+  `WHERE S_VC = ?` with a boolean — is refused; the engine answers it.
+  And it is not "render the value as text": the engine coerces the
+  **column** to a number, per row, so that predicate matches `'5'`,
+  `' 5'`, `'5.0'` and `'05'` alike — and *raises mid-scan* if any row
+  holds a non-numeric string. That is a comparison rule rather than a
+  conversion, it needs a per-row coercion this server has nowhere to put
+  yet, and `qa/serve-real-textnum.sh` asserts the refusal so it cannot
+  quietly become a wrong answer.
+
+- **Transliteration between character sets.** `crates/ods/src/intl.rs`
+  gives every text descriptor its character set and so its declared
+  CHARACTER width, which is what the reads and writes needed. It does not
+  convert bytes: the engine hands a WIN1252 column back in the
+  connection's character set, and fire-crab passes the stored bytes
+  through. Identical for ASCII content, which is what every fixture uses;
+  not identical for a high byte. A codepage-table job, and named as one.
+
+- **The engine's string→double is not correctly rounded**, and fire-crab
+  is. `'99999999999999999'` becomes `100000000000000020` on the engine
+  where the nearest double is `100000000000000000`. Not a gap to close —
+  copying a one-ulp error would make fire-crab less accurate — but a
+  divergence that exists, so `qa/serve-real-textnum.sh` compares twins
+  only up to sixteen significant digits and checks correctness directly
+  beyond that.
+
+- **`RETURNING` comes back in a different shape.** Through node-firebird
+  the engine answers an `INSERT ... RETURNING` as a single object and
+  fire-crab as an array of one. The values agree; the statement's
+  announced *type* apparently does not. Noticed while diffing 495
+  conversions and set aside, not chased.
 
 - ~~An IN-SUBQUERY refuses past ~10-100 inner rows~~ — *fixed*. It was
   exactly 64/65 DISTINCT values, and the cause was one constant doing

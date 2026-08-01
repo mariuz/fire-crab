@@ -1879,6 +1879,56 @@ them.
   boundary, or a page-allocation edge. Every one of those has now hidden
   a serious defect.
 
+- **A comment that states an assumption is a defect waiting for its
+  database.** The one that cost most here read, in full: *"(Byte length
+  == character length here: charset NONE.)"* It was accurate about every
+  fixture the project had ever built and false about every database
+  anyone would create, because `DEFAULT CHARACTER SET UTF8` makes a
+  `CHAR(5)` twenty bytes. The comment was not wrong to exist — it was the
+  only reason the bug took ten minutes to find rather than a day. But an
+  assumption written down and never gated is a countdown. **Grep your own
+  comments for the word "here".**
+
+- **A width in a type declaration is in the unit the USER wrote, not the
+  unit you store.** `VARCHAR(10)` is ten characters; the descriptor
+  carries forty bytes; checking the parameter against forty accepted
+  eleven characters and wrote a row **the reference implementation could
+  not read back**. That is the worst outcome available — worse than
+  refusing a feature, worse than a wrong answer, because it is a wrong
+  answer written to disk that only surfaces later, somewhere else. Keep
+  the byte bound (it is the buffer's) and put the declared bound in front
+  of it.
+
+- **When you hardcode a table out of the reference implementation, gate
+  the table.** `bytes_per_char` is 52 rows copied from
+  `RDB$CHARACTER_SETS`. Copied constants rot silently and are trusted
+  absolutely — exactly the wrong combination. The first check of the gate
+  now re-reads that catalogue and compares row by row, so the table is
+  a *claim* with a test rather than a fact by assertion.
+
+- **The same conversion can have different rules on the way in and the
+  way through.** `'1.999999'` into a `SMALLINT` column is a conversion
+  error; `WHERE N_SM = ?` with the same string returns no rows. Hex is
+  accepted by the store side and refused by the filter side. Both were
+  found only because the probe ran the same value list through both
+  paths — a converter tested on one side and *reused* on the other would
+  have been wrong twice, confidently.
+
+- **Check the order of the checks, not just the checks.** `'1.999999'`
+  rounds to 2, which fits a SMALLINT comfortably, and the engine refuses
+  it anyway — because the *mantissa* is range-checked before the rescale.
+  One string, one rounded result, a different answer per column width.
+  No amount of reasoning about "does the value fit" finds that; only
+  running it against the reference does.
+
+- **Being MORE correct than the reference is still a divergence, and
+  belongs in the gate.** The engine's string→double is off by one ulp
+  past sixteen significant digits. Matching it would mean writing a bug
+  on purpose; hiding it would mean a gate that quietly excludes cases.
+  The third option is the right one: compare against the engine over the
+  range where the engine is right, and against the *arithmetic* beyond
+  it. Say which is which in the gate's own output.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

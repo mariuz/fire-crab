@@ -36,6 +36,7 @@ pub mod format;
 pub mod gc;
 pub mod gen;
 pub mod header;
+pub mod intl;
 pub mod pages;
 pub mod pip;
 pub mod pointer;
