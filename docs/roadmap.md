@@ -36,6 +36,15 @@ why `WITH RECURSIVE` could not work, and why a qualifier-stripping pass
 had to be taught not to reach inside a subquery. R1–R6 have closed all
 four; R7 is the removal of what they replaced.
 
+## Measured gaps that are nobody's slice yet
+
+- **An IN-SUBQUERY refuses past ~10-100 inner rows.**
+  `SELECT COUNT(*) FROM B WHERE ID IN (SELECT ID FROM B WHERE ID > 5990)`
+  answers (10 inner rows); the same statement with `> 5900` (100 rows)
+  is REFUSED, and the engine answers both. An IN-subquery is desugared
+  into a literal list, and something downstream of that does not scale.
+  Found while gating the fetch batch; it has nothing to do with fetching.
+
 ## The two programmes
 
 ### Programme R — the engine's execution shape

@@ -13,6 +13,50 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — A SELECT returning 2400 rows hung forever
+
+Not a roadmap item. A fleet sent to design the index-driven join
+measured the current one first, and reported that it could not: the
+server stopped answering above about 2300 rows.
+
+### Fixed
+- **The fetch ignored the client's row count and answered every
+  `op_fetch` with the WHOLE result.** Below ~2300 rows that is invisible —
+  it all fits in the socket. Above it the server's write BLOCKS; the
+  client, having read the batch it asked for, stops reading to send its
+  next `op_fetch`; and neither side ever moves again.
+- **A batch also has to be TERMINATED**, which is why bounding it alone
+  was not enough — the first fix made *every* size hang. The client's
+  decode loop runs while `count && status != 100`, so it needs one of the
+  two to stop reading:
+
+  | | |
+  |---|---|
+  | end of BATCH, rows still to come | `count = 0`, ordinary status |
+  | end of CURSOR | `status = 100` |
+
+- The cursor is materialised once and drained in batches. `Plan::Rows`
+  was already "a materialised cursor, consumed by its fetch"; that is the
+  general rule now rather than a special case.
+
+### Two mistakes made fixing it, both caught by gates
+- Materialised rows come back ALREADY PROJECTED, so their columns must
+  be re-indexed positionally. Keeping the original field ids made every
+  column read a record it no longer had, and **every value came back
+  NULL** — eight gates said so at once.
+- Materialising ran the retrieval *before* a parameterised statement's
+  bands were built, so `WHERE ID = ?` quietly went back to scanning. The
+  answers stayed right and only the coverage assertion noticed, which is
+  exactly what it is for.
+
+New `qa/serve-real-fetchbatch.sh` (17 checks) over a 6000-row fixture:
+every shape that materialises differently, the rows either side of the
+old cliff, and exact multiples of the batch size. It compares **digests**
+— the first version pasted 6000 rows into a shell variable and reported
+DIFFs that were its own truncation.
+
+372 unit tests and 20 gates confirm nothing moved.
+
 ## 2026-08-01 — A gate's premise expired, and I reported it as a defect
 
 `qa/serve-real-params.sh` asserted that a boolean PARAMETER is refused,

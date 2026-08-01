@@ -1859,6 +1859,26 @@ them.
   re-ask the reference implementation the question the gate is
   remembering the answer to, BEFORE reading your own diff.
 
+- **A protocol's flow control is not decoration.** The count in a fetch
+  request looks like a hint and is a contract: answer more than it asks
+  for and the two sides deadlock, one blocked writing and the other
+  waiting to ask. It stayed invisible for the whole project because
+  every test result fitted in one socket buffer — the failure needs
+  about 2300 rows, and nothing here had ever returned that many.
+
+- **Bounding a batch is half the protocol; ending it is the other
+  half.** Sending fewer rows than asked for, with no marker, hung
+  *every* query rather than just the large ones. A reader that loops
+  "while there is more" needs to be told when there is not, and the two
+  ways of saying it — this batch is over, this cursor is over — are
+  different messages.
+
+- **Ask the reference implementation how big your test data should be.**
+  Fixtures here are a handful of rows because that is enough to pin
+  semantics. It is not enough to reach a socket buffer, a leaf page
+  boundary, or a page-allocation edge. Every one of those has now hidden
+  a serious defect.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

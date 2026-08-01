@@ -26113,13 +26113,115 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 use_stmt!(h);
                 read_wire_bytes(&mut s, &mut dec)?; // blr
                 read_int(&mut s, &mut dec)?; // msg number
-                read_int(&mut s, &mut dec)?; // count
+                let want = read_int(&mut s, &mut dec)?; // count
                 if std::env::var("FC_SRV_TRACE").is_ok() {
-                    eprintln!("[srv] fetch: {:?}", stmt_sql.trim());
+                    eprintln!("[srv] fetch: {:?} (want {})", stmt_sql.trim(), want);
                 }
-                // stream the plan's rows + end-of-cursor terminator
+                // THE COUNT IS THE CLIENT'S BATCH SIZE, and ignoring it
+                // DEADLOCKS the pair. The server used to answer every
+                // fetch with the WHOLE result: the client reads the batch
+                // it asked for, stops reading to send the next op_fetch,
+                // and the server - still writing - blocks on a socket
+                // nobody is draining. Neither side ever moves again. It
+                // took about 2300 rows to fill the buffer, so every
+                // result smaller than that worked perfectly.
+                //
+                // So the cursor is MATERIALISED once and drained in
+                // batches. `Plan::Rows` is what a materialised cursor
+                // already is here, and its "consumed by its fetch"
+                // behaviour becomes the general rule rather than a
+                // special case.
+                // A DEFERRED access must be resolved BEFORE the cursor is
+                // materialised: materialising runs the retrieval, and a
+                // retrieval that has not been given its bands scans.
+                if let (
+                    Plan::Project { rel, formats, filter, order_by, index, defer, .. },
+                    Some(db),
+                ) = (&mut plan, database.as_ref())
+                {
+                    if index.is_none() && defer.is_some() {
+                        if let Ok(bound) = bind_filter(filter, &bound_args) {
+                            let descs: Vec<Descriptor> = formats
+                                .iter()
+                                .max_by_key(|(n, _)| *n)
+                                .map(|(_, d)| d.clone())
+                                .unwrap_or_default();
+                            let a = resolve_access(
+                                &None, defer, db, *rel, &descs, &bound, order_by,
+                            );
+                            if let Some(a) = a {
+                                if std::env::var("FC_SRV_TRACE").is_ok() {
+                                    eprintln!(
+                                        "[srv] index scan: rel={} {} (deferred)",
+                                        rel,
+                                        a.describe()
+                                    );
+                                }
+                                *index = Some(a);
+                            }
+                        }
+                    }
+                }
+                if want > 0 && !matches!(plan, Plan::Rows { .. }) {
+                    if let Some(db) = database.as_ref() {
+                        if let Some(rows) = branch_rows(&plan, db, &bound_args) {
+                            // `branch_rows` hands back rows that are
+                            // ALREADY PROJECTED - one value per output
+                            // column, in output order - so the columns
+                            // must be re-indexed POSITIONALLY. Keeping
+                            // their original field ids makes each one
+                            // read the record it no longer has, and
+                            // every value comes back NULL.
+                            let cols: Vec<ProjCol> = output_cols_of(&plan)
+                                .iter()
+                                .enumerate()
+                                .map(|(i, c)| ProjCol { field_id: i, expr: None, ..c.clone() })
+                                .collect();
+                            if !cols.is_empty() {
+                                plan = Plan::Rows { cols, rows };
+                            }
+                        }
+                    }
+                }
                 let mut w = W::default();
                 let mut gen_writes: Vec<(String, i64)> = Vec::new();
+                if let (Plan::Rows { cols, rows }, true) = (&mut plan, want > 0) {
+                    // one batch, and the terminator ONLY when the cursor
+                    // is empty - a terminator with rows still to come is
+                    // a truncated answer
+                    let n = (want as usize).min(rows.len());
+                    let batch: Vec<Vec<Value>> = rows.drain(..n).collect();
+                    let mut err = None;
+                    for r in &batch {
+                        if let Err(e) = encode_row(&mut w, cols, r) {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                    match err {
+                        // an evaluation error mid-cursor is the engine's
+                        // own: an error response in place of the
+                        // terminator, exactly as `emit_rows` does
+                        Some(e) => write_eval_error(&mut w, &e),
+                        None => {
+                            if rows.is_empty() {
+                                // end of CURSOR: status 100
+                                w.int(OP_FETCH_RESPONSE).int(100).int(0);
+                            } else {
+                                // end of BATCH, rows still to come: a
+                                // count of 0 with an ordinary status.
+                                // The client's decode loop runs while
+                                // `count && status != 100`, so it needs
+                                // one of the two to stop reading and
+                                // send the next op_fetch - without it
+                                // both sides wait for the other.
+                                w.int(OP_FETCH_RESPONSE).int(0).int(0);
+                            }
+                        }
+                    }
+                    w.send(&mut s, &mut enc)?;
+                    continue;
+                }
                 emit_rows(&mut w, &plan, &database, &bound_args, &mut gen_writes);
                 // a materialised cursor is CONSUMED by its fetch: the rows
                 // exist once. Re-emitting them on the next fetch is what a
