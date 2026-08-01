@@ -13,6 +13,50 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — STARTING [WITH] joins the predicate parser
+
+The roadmap had carried "STARTING WITH is not in the predicate parser"
+since the fragment gate was built. It is one leaf beside LIKE now — and
+because STARTING is **not a reserved word** (probed: `CREATE TABLE T2
+(STARTING INT)` succeeds), it is recognized by identifier text, the
+`IS [NOT] DISTINCT FROM` precedent, so a column named STARTING still
+parses everywhere else.
+
+### Converted
+- `<col> [NOT] STARTING [WITH] <prefix>` in WHERE, HAVING, join
+  filters, `UPDATE`/`DELETE ... WHERE`, and with a `?` prefix bound at
+  execute. Semantics probed row by row against the engine: a per-BYTE
+  prefix on the STORED value with **no trimming on either side**
+  (CHAR(5) `'ab'` stores `'ab   '` and matches prefix `'ab '`; VARCHAR
+  `'ab'` does NOT), the empty prefix takes every non-NULL row, a NULL
+  prefix or value is UNKNOWN under both polarities, and an INTEGER
+  column coerces to its decimal text per row (1 and 10 both match
+  `'1'`). New `qa/serve-real-starting.sh`, 36 checks, every row set
+  diffed against the engine and against an `FC_NO_INDEX` twin — the
+  optimizer answers INDEX for a prefix test but no band-builder exists,
+  so the statement SCANS, never a partial answer.
+
+### Guarded
+- Refusals kept, each with the engine's answer recorded for its future
+  slice: a column prefix (`V STARTING WITH C` — the CHAR pad makes the
+  prefix `'ab   '`), an expression prefix (`'a'||'b'`), a numeric
+  prefix literal.
+
+### Found, not fixed (recorded in the roadmap)
+- The BLR path's `BBool::Starting` (isql SHOW plumbing) trims trailing
+  blanks on BOTH sides; the engine does not. Wrong in general, right
+  for the padded metadata columns SHOW reads — not copied into the new
+  term.
+- The engine converts a NONE column into the ATTACHMENT charset on the
+  way out and that conversion drops a VARCHAR's trailing blank on a
+  UTF8 attachment; fire-crab passes stored bytes through. Measured on
+  plain ASCII — the transliteration gap bites before any high byte.
+- `qa/serve-real-index.sh` is 346/13 at HEAD on this box and the 13 are
+  environment drift (the ENGINE side now errors with numeric overflow
+  on the BIGINT-family key checks) — identical at clean HEAD, so the
+  floor still attests this slice; the gate's premises need re-probing
+  against the current driver.
+
 ## 2026-08-01 — Patch the head, leave the tail alone
 
 `dml::patch_head_in_place`. A record too large for a page is stored as a

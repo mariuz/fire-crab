@@ -103,27 +103,31 @@ four; R7 is the removal of what they replaced.
   boundary. `fcstat`, `exe` and `sysfmt` still use the old path and are
   incremental work.
 
-- **The head-in-place rewrite: sound, and worth 179 of 184.** Poke a
-  fragmented record's HEAD in place and refuse when the field lives in
-  the tail. Validated against the live engine by an adversarial pass -
-  head is a byte-prefix of the assembled image 266/266, every poke
-  head-resident, 155 index rows fit their slot with none relocated, full
-  column differential byte-identical including tail fields, `gfix` clean,
-  and `COMMENT ON` text readable through the engine after 88 pokes.
-  Needs a `patch_head_in_place` helper in `dml.rs` guarded on "every
-  poked range ends within the head's unpacked length", the five `ddl.rs`
-  sites routed through it when `INCOMPLETE` is set, and
-  `deferred_drop_index`'s `maintain_indexes` call kept.
+- ~~The head-in-place rewrite~~ — *done*, worth 179 of 184.
+  `dml::patch_head_in_place` pokes a fragmented record's HEAD in place
+  and refuses when the field lives in the tail; the guard is "every
+  poked range ends within the head's unpacked length". Validated against
+  the live engine by an adversarial pass - head is a byte-prefix of the
+  assembled image 266/266, every poke head-resident, full column
+  differential byte-identical including tail fields, `gfix` clean, and
+  `COMMENT ON` text readable through the engine after 88 pokes. The
+  `ddl.rs` patch sites route through it when `INCOMPLETE` is set, and
+  `serve-real-restored.sh` reads the patched values back THROUGH THE
+  ENGINE rather than trusting survival.
 
-  It does NOT need the four missing machinery items (rhdf writer, packed
-  stream truncate, tail teardown, page compaction) and should not acquire
-  them: each is a new way to write into a user's database, and nothing in
-  the 184 statements needs one.
+  It did NOT acquire the four missing machinery items (rhdf writer,
+  packed stream truncate, tail teardown, page compaction) and should not:
+  each is a new way to write into a user's database, and nothing in the
+  184 statements needs one.
 
   **The remaining 5** are indexes owning a fragmented
-  `RDB$INDEX_SEGMENTS` row, deleted via the same guard.
+  `RDB$INDEX_SEGMENTS` row, deleted via the same guard. Still refused,
+  deliberately.
 
-- **Fixing those two DDL reads will NOT fix them, and that is the trap.**
+- **(historical, kept for the mechanism)** Fixing those two DDL reads
+  would NOT have fixed them, and that was the trap — the head-in-place
+  rewrite sidesteps `push_back_version` entirely (a byte edit inside one
+  record's payload, no back version pushed).
   Both `patch_sys_row` and `deferred_drop_index` write back through
   `dml::update_records`, and `dml::push_back_version`
   (`crates/ods/src/dml.rs:502`) rejects the record at :517-521 whenever
@@ -139,12 +143,12 @@ four; R7 is the removal of what they replaced.
   through the same `push_back_version`, and that relation carries 26
   fragmented rows on a restored file. Same cause, different relation.
 
-- **Two DDL statements refuse on a fragmented catalogue row, and the cost
-  is now measured.** Both are in-place patch sites that cannot rewrite a
-  record spanning pages, so they fail closed - `gfix -v -full` is clean
-  afterwards and the engine still reads the file. This is NOT the
-  durable-wrong-state class that `backfill_index` was. But the refusals
-  are common on a restored database:
+- **(superseded by the head-in-place rewrite, kept for the numbers)**
+  Two DDL statements refused on a fragmented catalogue row, and the cost
+  was measured. Both were in-place patch sites that could not rewrite a
+  record spanning pages, so they failed closed - `gfix -v -full` clean,
+  the engine still read the file. NOT the durable-wrong-state class that
+  `backfill_index` was. The refusals were common on a restored database:
 
   * `COMMENT ON TABLE` (`ddl.rs:5716`, `patch_sys_row`) - engine 220/220,
     fire-crab 132 OK / **88 refused**, and the 88 are EXACTLY the tables
@@ -176,9 +180,37 @@ four; R7 is the removal of what they replaced.
   store it does not implement. `qa/serve-real-fragment.sh` asserts the
   refusal so it cannot quietly become a half-written row.
 
-- **`STARTING WITH` is not in the predicate parser.** Noticed while
-  building the fragment gate; the engine answers it. Unrelated to
-  fragments, small, and unclaimed.
+- ~~`STARTING WITH` is not in the predicate parser~~ — *fixed*. One
+  leaf beside LIKE, recognized by Ident text because STARTING is NOT a
+  reserved word (probed: a column may be named by it). Per-byte prefix
+  on the stored value with no trimming on either side — which exposed
+  that the BLR path's `BBool::Starting` DOES trim both sides (right for
+  the padded metadata columns isql's SHOW reads, wrong in general — a
+  recorded divergence, not copied). An INTEGER column coerces to its
+  decimal text per row. WHERE, HAVING, join filters, UPDATE/DELETE and
+  parameters all funnel through the same term; the index path scans
+  (fcopt answers INDEX for a prefix but no band-builder exists — the
+  deliberate prefix band via `prefix_successor` is its own measured
+  increment). Refusals kept: a column prefix, an expression prefix, a
+  numeric prefix literal — the engine's answers for each are in
+  `qa/serve-real-starting.sh` for the slice that converts them.
+
+- **The engine converts a NONE column into the ATTACHMENT charset on
+  the way out, and fire-crab does not.** Measured with plain ASCII: a
+  stored `'ab '` (OCTET_LENGTH 3) answers `'ab'` through a UTF8
+  attachment and `'ab '` through a NONE one; fire-crab passes the
+  stored bytes through on every attachment. Same family as the
+  transliteration entry below, but it bites on a BLANK, not a high
+  byte — any gate comparing VARCHAR VALUES with trailing blanks must
+  compare a server-side length instead (see serve-real-starting.sh).
+
+- **`qa/serve-real-index.sh` is 346/13 at HEAD on this box, and the 13
+  are environment drift, not code.** The engine side ERRORS (numeric
+  overflow) on the BIGINT/SMALLINT/SCALED key checks and the
+  descending-index family where fcwire answers rows — the same class as
+  the boolean-parameter premise that expired when node-firebird went
+  metadata-directed. Pre-existing (identical at clean HEAD), unclaimed;
+  the gate's premises need re-probing against the current driver.
 
 - **(superseded, kept for the mechanism)** A record too large for one page is stored as a head with
   `rhd_incomplete` (flag 8) plus `rhdf` continuation fragments on other

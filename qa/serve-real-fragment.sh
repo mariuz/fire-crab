@@ -204,11 +204,14 @@ both "a multi-fragment row (three long columns)" \
 both "the unfragmented control is unaffected"  "SELECT ID, OCTET_LENGTH(V) L FROM SMALL ORDER BY ID"
 both "COUNT over a fragmented table"           "SELECT COUNT(*) C FROM BIG"
 # reads the fragmented column to DECIDE the row, not merely to return it.
-# (STARTING WITH would be the natural test and is not in this predicate
-# parser - an unrelated gap, recorded in the roadmap rather than papered
-# over by picking a shape that happens to work.)
+# STARTING WITH is the natural test - it reads the value's BYTES, and a
+# truncated assembly changes the answer where IS NOT NULL might not.
+# (It was a recorded roadmap gap when this gate was written; it is in
+# the predicate parser now, so the gate finally asks what it meant to.)
 both "a predicate that READS the fragmented column" \
      "SELECT ID FROM BIG WHERE V IS NOT NULL ORDER BY ID"
+both "a predicate that READS the fragmented BYTES" \
+     "SELECT ID FROM BIG WHERE V STARTING WITH 'ab' ORDER BY ID"
 # the row that was UPDATEd - its back version fragments too, and a
 # fragmented back version used to break the MVCC walk and drop the row
 both "the updated row (a fragmented BACK version)" \

@@ -1928,6 +1928,13 @@ enum Term {
     /// counts, exactly as the engine matches (CHAR(5) 'abc' matches
     /// 'abc  ' and 'abc%' but NOT 'abc')
     Like(usize, Rhs, Option<char>, bool),
+    /// `<col> [NOT] STARTING [WITH] <prefix>`: per-BYTE prefix on the
+    /// STORED value - CHAR padding counts on BOTH sides, no trimming
+    /// (probed: CHAR(5) 'ab' matches prefixes 'ab ' and 'ab   ' but not
+    /// 'ab    '; VARCHAR 'ab' does NOT match prefix 'ab '). The engine
+    /// routes blr_starting to a direct per-byte starts() with no pad
+    /// handling (BoolNodes.cpp stringBoolean).
+    Starting(usize, Rhs, bool),
     /// A row-independent decision - an evaluated subquery's verdict.
     /// See [RawKind::Const].
     Const(bool),
@@ -1946,6 +1953,11 @@ enum Term {
     /// result (rendered to text, as the engine coerces) against the
     /// pattern. A NULL result is UNKNOWN.
     ExprLike(Box<Expr>, String, Option<char>, bool),
+    /// `<expression> [NOT] STARTING [WITH] <literal prefix>` - the
+    /// evaluated result rendered to text (the engine coerces an INTEGER
+    /// to its decimal text: N=1,10 both match prefix '1', probed)
+    /// against the prefix, per byte. A NULL result is UNKNOWN.
+    ExprStarting(Box<Expr>, String, bool),
     /// an expression side compared against a `?` parameter -
     /// `WHERE UPPER(S) = ?`. The bind target descriptor is SYNTHESIZED
     /// from the expression's type (what the client builds its encoder
@@ -2139,6 +2151,14 @@ impl Predicate {
                             Some(rhs) => Term::Like(*fid, rhs, *escape, *negated),
                         }
                     }
+                    Term::Starting(fid, Rhs::Param(idx, _), negated) => {
+                        match bind_rhs(idx, &ColKind::Text)? {
+                            // STARTING WITH NULL is UNKNOWN under both
+                            // polarities (probed: zero rows either way)
+                            None => Term::Never,
+                            Some(rhs) => Term::Starting(*fid, rhs, *negated),
+                        }
+                    }
                     // an expression side against a parameter: the value
                     // becomes a literal expression and the term an
                     // ordinary three-valued comparison
@@ -2257,6 +2277,14 @@ impl Term {
                 // NULL value or NULL/unbound pattern: UNKNOWN
                 _ => false,
             },
+            Term::Starting(fid, prefix, negated) => match (values.get(*fid), prefix) {
+                // per-byte prefix on the STORED value, padding included
+                // on both sides - the engine's starts() does no trimming
+                // (probed: VARCHAR 'ab' does not start with 'ab ')
+                (Some(Value::Text(s)), Rhs::Str(p)) => s.starts_with(p.as_str()) != *negated,
+                // NULL value or NULL/unbound prefix: UNKNOWN
+                _ => false,
+            },
             Term::Const(b) => *b,
             Term::Never => false,
             // TRUE keeps the row; false and UNKNOWN exclude it; an eval
@@ -2266,6 +2294,13 @@ impl Term {
             Term::ExprLike(e, pattern, escape, negated) => match e.eval(values)? {
                 Value::Null => false,
                 v => like_match(&v.render(), pattern, *escape) != *negated,
+            },
+            Term::ExprStarting(e, prefix, negated) => match e.eval(values)? {
+                Value::Null => false,
+                // rendered to text as the engine coerces (an INTEGER
+                // becomes its decimal text: 1 -> '1', 10 -> '10'), then
+                // a per-byte prefix test
+                v => v.render().starts_with(prefix.as_str()) != *negated,
             },
             // an unbound parameter never matches (the execute path
             // binds before evaluating; this is the defensive answer)
@@ -10203,6 +10238,7 @@ fn filter_has_params(filter: &Option<Predicate>) -> bool {
                 Term::Cmp(_, _, Rhs::Param(..))
                     | Term::NumCmp(_, _, Rhs::Param(..))
                     | Term::Like(_, Rhs::Param(..), _, _)
+                    | Term::Starting(_, Rhs::Param(..), _)
                     | Term::ExprParam(..)
             )
         })
@@ -23196,6 +23232,9 @@ enum RawKind {
     IsNull,
     IsNotNull,
     Like(Rhs, Option<char>, bool),
+    /// `[NOT] STARTING [WITH] <prefix>` - a per-byte text prefix test
+    /// (blr_starting); no ESCAPE clause exists for it
+    Starting(Rhs, bool),
     /// A leaf whose truth is already decided and does not depend on the
     /// row: what a subquery collapses to once it has been evaluated
     /// (`EXISTS` over an uncorrelated inner query, or an `IN` whose
@@ -23527,9 +23566,13 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
         },
     };
     let leaf = |kind: RawKind| Ast::Leaf(RawTerm { lhs: lhs.clone(), kind });
-    // an optional NOT immediately before LIKE/BETWEEN/IN
+    // an optional NOT immediately before LIKE/BETWEEN/IN/STARTING
+    // (STARTING lexes as an Ident - it is a usable column name, probed:
+    // CREATE TABLE T2 (STARTING INT) succeeds - so it is recognized by
+    // text here, the IS [NOT] DISTINCT FROM precedent)
     let negated = if matches!(t.get(*pos), Some(Tok::Not))
-        && matches!(t.get(*pos + 1), Some(Tok::Like | Tok::Between | Tok::In))
+        && (matches!(t.get(*pos + 1), Some(Tok::Like | Tok::Between | Tok::In))
+            || matches!(t.get(*pos + 1), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("STARTING")))
     {
         *pos += 1;
         true
@@ -23731,6 +23774,22 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
             let body = Ast::Or(items);
             Some(if negated { Ast::Not(Box::new(body)) } else { body })
         }
+        // STARTING [WITH] - by Ident text, so a column NAMED "STARTING"
+        // still parses everywhere else exactly as before
+        Tok::Ident(w) if w.eq_ignore_ascii_case("STARTING") => {
+            *pos += 1;
+            if matches!(t.get(*pos), Some(Tok::Ident(w2)) if w2.eq_ignore_ascii_case("WITH")) {
+                *pos += 1; // WITH is optional sugar (the PSQL parser agrees)
+            }
+            let prefix = parse_value(t, pos, np)?;
+            if matches!(prefix, Rhs::Int(_) | Rhs::Num(..)) {
+                // a numeric prefix literal is legal (the engine renders
+                // it to text) but unprobed through every scale shape -
+                // refuse, as LIKE does
+                return None;
+            }
+            Some(leaf(RawKind::Starting(prefix, negated)))
+        }
         _ => None,
     }
 }
@@ -23826,6 +23885,9 @@ fn negate_term(t: &RawTerm) -> Option<RawTerm> {
         RawKind::IsNull => RawKind::IsNotNull,
         RawKind::IsNotNull => RawKind::IsNull,
         RawKind::Like(p, e, negated) => RawKind::Like(p.clone(), *e, !negated),
+        // flipped like LIKE - sound in 3VL (probed: NULL operand rows
+        // drop under both polarities)
+        RawKind::Starting(p, negated) => RawKind::Starting(p.clone(), !negated),
         // a decided leaf negates to the opposite decision - no
         // three-valued subtlety, it is TRUE or FALSE, never UNKNOWN
         RawKind::Const(b) => RawKind::Const(!b),
@@ -24817,6 +24879,17 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
             (ColKind::Text, Rhs::Null) => Term::Never,
             _ => return None,
         },
+        RawKind::Starting(prefix, negated) => match (kind, prefix) {
+            (ColKind::Text, Rhs::Str(p)) => Term::Starting(idx, Rhs::Str(p), negated),
+            // an INTEGER column coerces to its decimal text per row
+            // (probed: N=1,10 both match prefix '1')
+            (ColKind::Int, Rhs::Str(p)) => {
+                Term::ExprStarting(Box::new(Expr::Col(idx)), p, negated)
+            }
+            // <col> STARTING WITH NULL is UNKNOWN for every row
+            (_, Rhs::Null) => Term::Never,
+            _ => return None,
+        },
     })
 }
 
@@ -24968,6 +25041,16 @@ fn resolve_expr_term(
             Term::ExprLike(Box::new(lhs), p.clone(), *escape, *negated)
         }
         RawKind::Like(..) => return None, // non-literal pattern
+        RawKind::Starting(Rhs::Str(p), negated) => {
+            // temporal/approx/bool/numeric rendering under a prefix test
+            // is unprobed - refuse those, answer text and integer sides
+            if !matches!(lhs.type_of(descs)?, ExprType::Text | ExprType::Int) {
+                return None;
+            }
+            Term::ExprStarting(Box::new(lhs), p.clone(), *negated)
+        }
+        RawKind::Starting(Rhs::Null, _) => Term::Never,
+        RawKind::Starting(..) => return None, // non-literal prefix
         RawKind::Const(_) => return None, // handled before resolution
     };
     // both sides must TYPE - an untypeable operand never reaches
@@ -24992,7 +25075,7 @@ fn resolve_expr_term(
     }
     match &term {
         Term::ExprCond(c) => cond_types(c, descs)?,
-        Term::ExprLike(e, ..) => {
+        Term::ExprLike(e, ..) | Term::ExprStarting(e, ..) => {
             e.type_of(descs)?;
         }
         _ => {}
@@ -25260,6 +25343,9 @@ fn numeric_term(
         RawKind::IsNull => Term::IsNull(idx),
         RawKind::IsNotNull => Term::IsNotNull(idx),
         RawKind::Like(..) => return None,
+        // a scaled NUMERIC's rendered text under a prefix test is
+        // unprobed - refuse
+        RawKind::Starting(..) => return None,
     })
 }
 
@@ -25294,6 +25380,13 @@ fn param_or_typed_term(
             }
             claim(slot)?;
             Some(Term::Like(idx, Rhs::Param(slot, ColKind::Text), escape, negated))
+        }
+        RawKind::Starting(Rhs::Param(slot, _), negated) => {
+            if kind != ColKind::Text {
+                return None;
+            }
+            claim(slot)?;
+            Some(Term::Starting(idx, Rhs::Param(slot, ColKind::Text), negated))
         }
         other => typed_term(idx, kind, other),
     }
@@ -29259,6 +29352,63 @@ mod tests {
         // multi-byte: `_` is one CHARACTER
         assert!(like_match("héllo", "h_llo", None));
         assert!(like_match("héllo", "h%o", None));
+    }
+
+    #[test]
+    fn starting_with_parses_and_matches_per_byte() {
+        let dnf = |s: &str| parse_predicate(&tokenize(s).unwrap(), &mut 0).unwrap();
+        // STARTING [WITH] is one leaf; WITH is optional sugar
+        let d = dnf("V STARTING WITH 'ab'");
+        assert!(matches!(&d[0][0].kind, RawKind::Starting(Rhs::Str(p), false) if p == "ab"));
+        let d = dnf("V STARTING 'ab'");
+        assert!(matches!(&d[0][0].kind, RawKind::Starting(Rhs::Str(_), false)));
+        // both spellings of NOT land in the negated flag
+        let d = dnf("V NOT STARTING WITH 'ab'");
+        assert!(matches!(&d[0][0].kind, RawKind::Starting(Rhs::Str(_), true)));
+        let d = dnf("NOT V STARTING WITH 'ab'");
+        assert!(matches!(&d[0][0].kind, RawKind::Starting(Rhs::Str(_), true)));
+        // a numeric prefix literal refuses (unprobed through scales)
+        assert!(parse_predicate(&tokenize("V STARTING WITH 1").unwrap(), &mut 0).is_none());
+        // STARTING is NOT a reserved word: a column of that name still
+        // compares (probed: CREATE TABLE T2 (STARTING INT) succeeds)
+        let d = dnf("STARTING = 7");
+        assert!(matches!(&d[0][0].kind, RawKind::Cmp(Cmp::Eq, Rhs::Int(7))));
+
+        // per-BYTE prefix on the STORED value: no pad trim on either
+        // side (probed: VARCHAR 'ab' does not start with 'ab ';
+        // CHAR(5) stores 'ab   ' and matches 'ab ' and 'ab   ')
+        let t = Term::Starting(0, Rhs::Str("ab ".into()), false);
+        assert!(!t.matches(&[Value::Text("ab".into())]).unwrap());
+        assert!(t.matches(&[Value::Text("ab   ".into())]).unwrap());
+        let t = Term::Starting(0, Rhs::Str("ab    ".into()), false);
+        assert!(!t.matches(&[Value::Text("ab   ".into())]).unwrap());
+        // the empty prefix matches every non-NULL value; NULL is UNKNOWN
+        // under both polarities
+        let t = Term::Starting(0, Rhs::Str(String::new()), false);
+        assert!(t.matches(&[Value::Text(String::new())]).unwrap());
+        assert!(!t.matches(&[Value::Null]).unwrap());
+        let t = Term::Starting(0, Rhs::Str("ab".into()), true);
+        assert!(!t.matches(&[Value::Null]).unwrap());
+        assert!(t.matches(&[Value::Text("xy".into())]).unwrap());
+        // an INTEGER side renders to decimal text (probed: 1 and 10
+        // both match prefix '1', 25 does not)
+        let t = Term::ExprStarting(Box::new(Expr::Col(0)), "1".into(), false);
+        assert!(t.matches(&[Value::Int(1)]).unwrap());
+        assert!(t.matches(&[Value::Int(10)]).unwrap());
+        assert!(!t.matches(&[Value::Int(25)]).unwrap());
+        // a bound NULL prefix is Never (UNKNOWN both ways)
+        let toks = tokenize("V STARTING WITH ?").unwrap();
+        let mut np = 0;
+        let raw = parse_predicate(&toks, &mut np).unwrap();
+        assert_eq!(np, 1);
+        let columns = vec![RelationColumn { name: "V".into(), field_id: 0, position: 0 }];
+        let descs = vec![desc(dtype::VARYING, 12, 0)];
+        let mut params = Vec::new();
+        let p = resolve_predicate(raw, &columns, &descs, &mut params).unwrap();
+        let b = p.bind(&[WireParam::Null]).unwrap();
+        assert!(!b.matches(&[Value::Text("ab".into())]).unwrap());
+        let b = p.bind(&[WireParam::Text("ab".into())]).unwrap();
+        assert!(b.matches(&[Value::Text("abc".into())]).unwrap());
     }
 
     #[test]
