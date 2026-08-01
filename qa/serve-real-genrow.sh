@@ -37,6 +37,17 @@ CREATE TABLE SRC (X INTEGER);
 CREATE SEQUENCE SEQ;
 CREATE SEQUENCE SEQ5 START WITH 100 INCREMENT BY 5;
 CREATE GENERATOR G;
+CREATE SEQUENCE SEQBIG;
+-- BIG exists for ONE check, and it is the check the whole batching
+-- interaction hangs on: 2500 rows is past the ~2300 where a fetch has
+-- to be split into batches, which is what made the cursor MATERIALISE
+-- and is exactly how the generator advance came to be dropped.
+CREATE TABLE BIG (X INTEGER);
+COMMIT;
+-- a cross join, not a recursive CTE: the CTE form hits Firebird's
+-- 1024-deep recursion limit ("too many concurrent executions of the
+-- same request") long before 2500 rows.
+INSERT INTO BIG SELECT ROW_NUMBER() OVER () FROM RDB\$TYPES A, RDB\$TYPES B ROWS 2500;
 COMMIT;
 INSERT INTO SRC VALUES (30);
 INSERT INTO SRC VALUES (10);
@@ -131,12 +142,63 @@ Q4="SELECT GEN_ID(G, 1), X FROM SRC WHERE X > 15 ORDER BY X"
 check "GEN_ID(G,1) with WHERE (only matching rows advance)" \
     "$(fc_rows "$Q4")" "$(en_rows "SELECT GEN_ID(G, 1) || '|' || X FROM SRC WHERE X > 15 ORDER BY X")"
 
+# A GENERATOR ACROSS FETCH BATCHES. The three-row checks above all fit in
+# one batch; this one does not, and the two halves of the interaction it
+# pins are the two that were broken:
+#
+#   * the cursor is MATERIALISED before it is batched, and the advance has
+#     to happen at materialisation - `branch_rows` computes the rows and
+#     knows nothing of gen_cols, so every value came back NULL;
+#   * the advance must happen ONCE, not once per batch, and its final
+#     value must be persisted by a fetch that returns without reaching the
+#     old single persistence site.
+#
+# Compared as DIGESTS: 2500 rows pasted into a shell variable is a gate
+# that reports its own truncation as a difference.
+QB="SELECT NEXT VALUE FOR SEQBIG, X FROM BIG ORDER BY X"
+a=$(fc_rows "$QB" | md5sum | cut -d' ' -f1)
+b=$(en_rows "SELECT (NEXT VALUE FOR SEQBIG) || '|' || X FROM BIG ORDER BY X" | md5sum | cut -d' ' -f1)
+check "NEXT VALUE FOR over 2500 rows (spans fetch batches)" "$a" "$b"
+
+# THE DECLARED COLUMN, which the value comparisons above cannot see -
+# they compare values positionally and a wrong NAME is invisible to them.
+# Probed with SET SQLDA_DISPLAY ON: the two spellings get DIFFERENT
+# names and DIFFERENT nullability. `NEXT VALUE FOR S` is NEXT_VALUE and
+# sqltype 580; `GEN_ID(S, 1)` is GEN_ID and 581, the nullable form.
+# fire-crab announced GEN_ID/581 for both.
+sqlda() { # <conn> <statement>
+    "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 <<SQL | grep -E 'sqltype:|name:' | tr -s ' '
+SET SQLDA_DISPLAY ON;
+SET PLANONLY ON;
+$2;
+SQL
+}
+for st in "SELECT NEXT VALUE FOR SEQ FROM SRC" "SELECT GEN_ID(SEQ, 1) FROM SRC"; do
+    check "declared column for: $st" \
+        "$(sqlda "127.0.0.1/$PORT:$WORK" "$st")" "$(sqlda "$REF" "$st")"
+done
+
+# A GENERATOR INSIDE AN EXPRESSION is still refused, and that is stated
+# here rather than left to be discovered. The engine answers
+# `SELECT (NEXT VALUE FOR S) || '|' || X` and `(NEXT VALUE FOR S) + 100`;
+# fire-crab's select-list parser only recognises the generator as a WHOLE
+# item, so both refuse. An outage, not a wrong answer - and asserted so
+# it cannot quietly become one.
+for st in "SELECT (NEXT VALUE FOR SEQ) + 100 FROM SRC" \
+          "SELECT (NEXT VALUE FOR SEQ) || 'x' FROM SRC"; do
+    r=$(fc_rows "$st")
+    case "$r" in
+        *ERR*) echo "OK   still refused (generator inside an expression): $st" ;;
+        *) echo "DIFF fire-crab answered a shape it does not implement: $st -> $r"; fail=1 ;;
+    esac
+done
+
 # stored generator values must match the engine's. WORK advanced once per
 # fc query above; REF advanced once per en_rows query in the SAME order
 # (same generators, same steps, same row counts) - so they are in lockstep
 # and no replay is needed (replaying would double-advance REF).
 kill $srv 2>/dev/null; wait $srv 2>/dev/null
-for g in SEQ SEQ5 G; do
+for g in SEQ SEQ5 G SEQBIG; do
     check "stored $g matches engine" "$(gen_of "$WORK" "$g")" "$(gen_of "$REF" "$g")"
 done
 

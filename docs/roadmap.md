@@ -52,6 +52,20 @@ four; R7 is the removal of what they replaced.
   filter side turned out to have different rules, and the filter
   comparison is exact rather than through a double.
 
+- **`name` and `alias` are two describe fields, and fire-crab sets both
+  to the alias.** For `SELECT X + 1 AS Y` the engine answers `name: ADD
+  alias: Y`; for `UPPER('a') AS U`, `name: UPPER alias: U`; for a plain
+  `X AS Z`, `name: X alias: Z`. fire-crab answers the alias in both, for
+  every aliased column. Invisible to a client that reads `alias` (which
+  node-firebird does) and visible in isql. Projection-wide, so it needs
+  `ProjCol` to carry both names and the describe writer to emit them
+  separately — its own slice, not a patch.
+
+- **A generator inside an EXPRESSION.** `SELECT (NEXT VALUE FOR S) + 100`
+  and `(NEXT VALUE FOR S) || 'x'` are answered by the engine and refused
+  by fire-crab, whose select-list parser recognises a generator only as a
+  WHOLE item. `qa/serve-real-genrow.sh` asserts the refusal.
+
 - **A NON-TEXT parameter against a TEXT column** — `WHERE S_VC = 5`,
   `WHERE S_VC = ?` with a boolean — is refused; the engine answers it.
   And it is not "render the value as text": the engine coerces the

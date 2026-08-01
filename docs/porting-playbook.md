@@ -1929,6 +1929,28 @@ them.
   range where the engine is right, and against the *arithmetic* beyond
   it. Say which is which in the gate's own output.
 
+- **A performance fix is a behaviour change until you prove otherwise.**
+  Bounding a fetch into batches meant materialising the cursor, and
+  materialising went through a function that destructured the plan with
+  `..`. One field it silently dropped was the generator list, so
+  `NEXT VALUE FOR` in a select list quietly returned NULL and stopped
+  advancing. Nothing about "make the batch smaller" suggests "and lose a
+  column's value". **When you reroute a path, diff what the OLD path
+  read out of the plan against what the NEW one does** — a `..` in a
+  destructuring is a list of fields nobody is thinking about.
+
+- **The surviving special case is what hides the general break.**
+  `SELECT NEXT VALUE FOR <seq> FROM RDB$DATABASE` has its own code path
+  and kept working perfectly while the general form was dead. Every
+  casual check anyone would run used the special case. If a feature has
+  a fast path, test the SLOW one.
+
+- **A gate that compares values positionally is blind to names.** The
+  generator gate compared row values and had done so correctly for
+  months, while the column was announced under the wrong name AND the
+  wrong nullability the whole time. Values and metadata are two
+  differentials; running one is not running the other.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

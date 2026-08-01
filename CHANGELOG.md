@@ -13,6 +13,74 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — The batching swallowed the generators
+
+A full sweep of all 191 gates — run to check the character-set work —
+turned up one failure that predated it. `qa/serve-real-genrow.sh` had
+been failing on seven of its eight checks, and a worktree build of HEAD
+confirmed it: not a regression from that day's work, a regression from
+the fetch-batching increment before it.
+
+### Fixed
+- **`NEXT VALUE FOR` in a select list answered NULL and advanced
+  nothing.** When `op_fetch` began materialising every cursor through
+  `branch_rows` — to bound the batch, which a 2300-row deadlock required
+  — `branch_rows`'s `Plan::Project` arm destructured with `..` and
+  dropped `gen_cols` on the floor. The streaming path that did the
+  advance was simply never reached again.
+
+  What made it hide: the special case for `SELECT NEXT VALUE FOR <seq>
+  FROM RDB$DATABASE` has its own code path and went on working
+  perfectly, so the feature looked alive from the outside.
+
+  The advance now lives in one function, `advance_generators`, called
+  from both paths. It previously existed as one copy and one omission,
+  which is exactly the shape that broke. The two callers write into
+  different coordinate systems — the streaming path into a decoded
+  record at the synthetic `value_index`, the materialising path into an
+  already-projected row at the column's output position — so the slot is
+  a parameter, and that is the whole reason the function takes one.
+
+- **The advance was persisted by a code path the fetch no longer
+  reaches.** The batch path returns to the client before the single
+  persistence site at the bottom of the handler, so even a correct
+  advance would not have survived. `persist_generators` is now called
+  from both, and writes the whole set atomically — a statement that
+  advanced two sequences never persists one of them.
+
+- **Both generator spellings were announced wrongly.** Probed with `SET
+  SQLDA_DISPLAY ON`: `NEXT VALUE FOR S` describes as **NEXT_VALUE**,
+  sqltype 580; `GEN_ID(S, 1)` describes as **GEN_ID**, sqltype 581 — the
+  nullable form. fire-crab said GEN_ID/581 for both. A generator can
+  never yield NULL either way; the engine simply announces the two
+  differently, and the announcement is what a client builds its message
+  from.
+
+`qa/serve-real-genrow.sh` grows 8 → 14 checks. The new ones are the two
+halves the old fixture could not reach: a **2500-row** generator SELECT,
+past the ~2300 where a fetch must be split, which pins that the advance
+happens at materialisation and happens ONCE rather than once per batch;
+and a direct comparison of the **declared column**, which every existing
+check was blind to because they compare values positionally and a wrong
+name is invisible to them.
+
+### Stated rather than hidden
+- **A generator inside an EXPRESSION is still refused.** The engine
+  answers `SELECT (NEXT VALUE FOR S) + 100` and `(NEXT VALUE FOR S) ||
+  'x'`; fire-crab's select-list parser recognises the generator only as a
+  whole item. An outage, not a wrong answer, and the gate asserts the
+  refusal so it cannot quietly become one.
+
+- **`name` and `alias` are two fields and fire-crab sets both to the
+  alias.** Found while probing the above, and it is not
+  generator-specific: for `SELECT X + 1 AS Y` the engine answers `name:
+  ADD alias: Y`, for `UPPER('a') AS U` it answers `name: UPPER alias: U`,
+  and for a plain `X AS Z` it answers `name: X alias: Z`. fire-crab
+  answers the alias in both fields, for every aliased column. That is a
+  projection-wide slice of its own; it is in the roadmap.
+
+381 unit tests, 91 plan checks, 14 generator checks.
+
 ## 2026-08-01 — A CHAR(5) was twenty characters wide
 
 A database created `DEFAULT CHARACTER SET UTF8` — the ordinary case —

@@ -4415,6 +4415,43 @@ same `isql` runs the same statement against the real engine and against
 only when refusing is deliberate and a gate asserts the failure; a
 refusal is always a SQL error, never a wrong answer dressed as a result.
 
+### Generators per row (`qa/serve-real-genrow.sh`, 14 checks)
+
+The gate that caught a regression nothing else could see, and then grew
+the two checks that would have caught it sooner.
+
+`NEXT VALUE FOR` in a select list answered NULL for every row and
+advanced nothing. The cause was not in the generator code: when
+`op_fetch` began materialising every cursor through `branch_rows` — to
+bound the batch, which a 2300-row deadlock required — that function's
+`Plan::Project` arm destructured with `..` and dropped `gen_cols`. The
+streaming path that did the advance was never reached again. The
+persistence had the same shape of failure: the batch path returns to the
+client before the single site at the bottom of the fetch handler, so
+even a correct advance would not have survived.
+
+What hid it: `SELECT NEXT VALUE FOR <seq> FROM RDB$DATABASE` has its own
+code path and kept working perfectly, so every casual check passed.
+
+The two new checks are the two the old fixture could not reach:
+
+- **2500 rows**, past the ~2300 where a fetch must be split. It pins that
+  the advance happens at materialisation and happens *once* rather than
+  once per batch, and it is compared as an **md5 digest** — 2500 rows
+  pasted into a shell variable is a gate that reports its own truncation
+  as a difference.
+- **the declared column**, compared through `SET SQLDA_DISPLAY ON`. Every
+  existing check compared values positionally, so a wrong name was
+  invisible to all of them — and both spellings had been announced
+  wrongly the whole time. Probed: `NEXT VALUE FOR S` is **NEXT_VALUE**,
+  sqltype 580; `GEN_ID(S, 1)` is **GEN_ID**, sqltype 581, the nullable
+  form. fire-crab said GEN_ID/581 for both.
+
+One refusal is asserted rather than left implicit: a generator inside an
+**expression** — `(NEXT VALUE FOR S) + 100`, `(NEXT VALUE FOR S) || 'x'`
+— which the engine answers and this select-list parser does not, because
+it recognises a generator only as a whole item.
+
 ### Character sets (`qa/serve-real-charset.sh`, 18 checks)
 
 The gate exists because of a row the real engine could not read.

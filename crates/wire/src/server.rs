@@ -14022,7 +14022,15 @@ fn plan_query_inner(
                             name: alias.clone(),
                             field_id: value_index,
                             wire: Wire::Int64,
-                            sql_type: 581, // SQL_INT64 (BIGINT)
+                            // and different NULLABILITY, from the same
+                            // probe: NEXT VALUE FOR describes as 580, a
+                            // plain SQL_INT64, while GEN_ID describes as
+                            // 581 - the nullable form. A generator can
+                            // never yield NULL either way; the engine
+                            // simply announces the two differently, and
+                            // the announcement is what a client builds
+                            // its message from.
+                            sql_type: if step.is_none() { 580 } else { 581 },
                             length: 8,
                             scale: 0,
                             sub_type: 0,
@@ -16393,6 +16401,99 @@ fn respond_eval_error(s: &mut TcpStream, enc: &mut Option<Rc4>, e: &EvalErr) -> 
     w.send(s, enc)
 }
 
+/// Write the final value of each advanced generator back to the
+/// database, atomically over the whole set: the page image is edited in
+/// a copy and installed only if EVERY write lands, so a statement that
+/// advanced two sequences never persists one of them.
+///
+/// Called from both fetch paths. The materialising one returns to the
+/// client without ever reaching `emit_rows`, so a single call site at
+/// the bottom of the handler silently stopped persisting anything the
+/// moment cursors began to be materialised.
+fn persist_generators(db: Option<&mut Database>, writes: &[(String, i64)]) {
+    if writes.is_empty() {
+        return;
+    }
+    let Some(db) = db else { return };
+    let mut work = db.bytes.clone();
+    let mut ok = true;
+    for (name, val) in writes {
+        match generator_id(db, name) {
+            Some(id) => {
+                if write_generator_value(&mut work, db.page_size, id, *val).is_err() {
+                    ok = false;
+                }
+            }
+            None => ok = false,
+        }
+    }
+    if ok {
+        db.bytes = work;
+        let _ = std::fs::write(&db.path, &db.bytes);
+    }
+}
+
+/// Advance each generator once per row, in the order the rows are about
+/// to be handed back, writing each new value into that row. Returns the
+/// final value per generator, for the caller to persist.
+///
+/// `slots` is `(index in the row, generator name, explicit step)`. The
+/// index differs between callers and that is the whole reason this takes
+/// one: the streaming path writes into a DECODED RECORD, where the slot
+/// is the synthetic `value_index` past every real field, while the
+/// materialising fetch path writes into an ALREADY PROJECTED row, where
+/// it is the column's position in the select list. Same advance, two
+/// coordinate systems.
+///
+/// This exists as one function because it previously existed as one COPY
+/// and one OMISSION. When `op_fetch` began materialising every cursor
+/// through `branch_rows` - to bound the batch, which a 2300-row deadlock
+/// required - `branch_rows`'s `Plan::Project` arm destructured with `..`
+/// and dropped `gen_cols` on the floor. `SELECT NEXT VALUE FOR SEQ FROM T`
+/// then answered NULL for every row and advanced nothing, silently, and
+/// the special case for `FROM RDB$DATABASE` went on working, which is
+/// what made it look fine.
+///
+/// The engine evaluates NEXT VALUE FOR / GEN_ID mid-fetch, AFTER the
+/// sort, so the caller must sort before calling this: the first row of
+/// the output gets the first value, whatever record it came from.
+fn advance_generators(
+    db: &Database,
+    slots: &[(usize, String, Option<i64>)],
+    rows: &mut [Vec<Value>],
+) -> Vec<(String, i64)> {
+    use std::collections::HashMap;
+    // running value per DISTINCT generator, from its stored base; the
+    // increment resolves a NEXT VALUE FOR's step (two columns naming one
+    // sequence advance it twice per row, which is why this is keyed by
+    // name and not by slot)
+    let mut running: HashMap<String, i64> = HashMap::new();
+    let mut incr: HashMap<String, i64> = HashMap::new();
+    for (_, name, _) in slots {
+        let key = name.to_ascii_uppercase();
+        if !running.contains_key(&key) {
+            let base = read_generator_value(db, name).unwrap_or(0);
+            let gi = generator_info(db, name).map(|(_, i)| i).unwrap_or(1);
+            running.insert(key.clone(), base);
+            incr.insert(key, gi);
+        }
+    }
+    let max_idx = slots.iter().map(|(i, _, _)| *i).max().unwrap_or(0);
+    for values in rows.iter_mut() {
+        if values.len() <= max_idx {
+            values.resize(max_idx + 1, Value::Null);
+        }
+        for (idx, name, step) in slots {
+            let key = name.to_ascii_uppercase();
+            let step = step.unwrap_or_else(|| *incr.get(&key).unwrap_or(&1));
+            let v = running.get_mut(&key).unwrap();
+            *v = v.wrapping_add(step);
+            values[*idx] = Value::Int(*v);
+        }
+    }
+    running.into_iter().collect()
+}
+
 /// Emit a cursor's rows. `gen_writes` collects the (generator name, final
 /// value) each generator column reached - the caller persists them after
 /// the fetch, mirroring the engine's mid-fetch generator advance.
@@ -16631,37 +16732,17 @@ fn emit_rows_inner(
                     if !order_by.is_empty() {
                         sort_rows(&mut rows, order_by).map_err(EmitErr::Eval)?;
                     }
-                    // running value per distinct generator, from its stored
-                    // base; the increment resolves a NEXT VALUE FOR's step
-                    let mut running: std::collections::HashMap<String, i64> =
-                        std::collections::HashMap::new();
-                    let mut incr: std::collections::HashMap<String, i64> =
-                        std::collections::HashMap::new();
-                    for gc in gen_cols {
-                        let key = gc.name.to_ascii_uppercase();
-                        if !running.contains_key(&key) {
-                            let base = read_generator_value(db, &gc.name).unwrap_or(0);
-                            let gi = generator_info(db, &gc.name).map(|(_, i)| i).unwrap_or(1);
-                            running.insert(key.clone(), base);
-                            incr.insert(key, gi);
-                        }
+                    // the advance itself lives in one function, shared with
+                    // the materialising fetch path - see [advance_generators]
+                    let slots: Vec<(usize, String, Option<i64>)> = gen_cols
+                        .iter()
+                        .map(|g| (g.value_index, g.name.clone(), g.step))
+                        .collect();
+                    for (k, v) in advance_generators(db, &slots, &mut rows) {
+                        gen_writes.push((k, v));
                     }
-                    let max_idx = gen_cols.iter().map(|g| g.value_index).max().unwrap_or(0);
-                    for mut values in rows {
-                        if values.len() <= max_idx {
-                            values.resize(max_idx + 1, Value::Null);
-                        }
-                        for gc in gen_cols {
-                            let key = gc.name.to_ascii_uppercase();
-                            let step = gc.step.unwrap_or_else(|| *incr.get(&key).unwrap_or(&1));
-                            let v = running.get_mut(&key).unwrap();
-                            *v = v.wrapping_add(step);
-                            values[gc.value_index] = Value::Int(*v);
-                        }
+                    for values in rows {
                         encode_row(w, cols, &values)?;
-                    }
-                    for (key, val) in &running {
-                        gen_writes.push((key.clone(), *val));
                     }
                 } else if order_by.is_empty() {
                     // stream matching rows; an evaluation error on any row
@@ -22178,9 +22259,13 @@ fn parse_projection(proj: &str) -> Option<Proj> {
         }
         // a generator advance (NEXT VALUE FOR / GEN_ID) in the select list
         if let Some((gen, step)) = parse_gen_sel_item(body) {
-            let name = alias_owned
-                .clone()
-                .unwrap_or_else(|| "GEN_ID".into());
+            // The two spellings get DIFFERENT default names, probed with
+            // SET SQLDA_DISPLAY ON: `NEXT VALUE FOR S` is NEXT_VALUE and
+            // `GEN_ID(S, 1)` is GEN_ID. `step` is None for exactly the
+            // first form, so it is also the discriminator.
+            let name = alias_owned.clone().unwrap_or_else(|| {
+                if step.is_none() { "NEXT_VALUE".into() } else { "GEN_ID".into() }
+            });
             items.push(SelItem::Gen(gen, step, name));
             continue;
         }
@@ -26544,6 +26629,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         }
                     }
                 }
+                // Declared BEFORE the materialisation below, because the
+                // materialisation is where a generator now advances - and
+                // the batch path returns without ever reaching `emit_rows`.
+                let mut gen_writes: Vec<(String, i64)> = Vec::new();
                 if want > 0 && !matches!(plan, Plan::Rows { .. }) {
                     if let Some(db) = database.as_ref() {
                         if let Some(rows) = branch_rows(&plan, db, &bound_args) {
@@ -26554,6 +26643,34 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             // their original field ids makes each one
                             // read the record it no longer has, and
                             // every value comes back NULL.
+                            let mut rows = rows;
+                            // A GENERATOR ADVANCE SURVIVES MATERIALISATION.
+                            // `branch_rows` computes the rows but knows
+                            // nothing of `gen_cols` - it destructures
+                            // `Plan::Project` with `..` - so without this
+                            // every `NEXT VALUE FOR` in a select list came
+                            // back NULL and the sequence never moved.
+                            //
+                            // The slot is the column's POSITION in the
+                            // output here, not its synthetic `value_index`:
+                            // these rows are already projected. The
+                            // position is found by matching that index
+                            // against the plan's own ProjCols, which still
+                            // carry it as their field_id.
+                            if let Plan::Project { gen_cols, cols: pcols, .. } = &plan {
+                                if !gen_cols.is_empty() {
+                                    let slots: Vec<(usize, String, Option<i64>)> = gen_cols
+                                        .iter()
+                                        .filter_map(|g| {
+                                            pcols
+                                                .iter()
+                                                .position(|c| c.field_id == g.value_index)
+                                                .map(|at| (at, g.name.clone(), g.step))
+                                        })
+                                        .collect();
+                                    gen_writes = advance_generators(db, &slots, &mut rows);
+                                }
+                            }
                             let cols: Vec<ProjCol> = output_cols_of(&plan)
                                 .iter()
                                 .enumerate()
@@ -26566,7 +26683,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     }
                 }
                 let mut w = W::default();
-                let mut gen_writes: Vec<(String, i64)> = Vec::new();
+                persist_generators(database.as_mut(), &gen_writes);
                 if let (Plan::Rows { cols, rows }, true) = (&mut plan, want > 0) {
                     // one batch, and the terminator ONLY when the cursor
                     // is empty - a terminator with rows still to come is
@@ -26614,26 +26731,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 // a generator-advancing SELECT (NEXT VALUE FOR / GEN_ID in
                 // the select list) writes its generators' final values as
                 // the fetch completes - the engine advances them mid-fetch
-                if !gen_writes.is_empty() {
-                    if let Some(db) = database.as_mut() {
-                        let mut work = db.bytes.clone();
-                        let mut ok = true;
-                        for (name, val) in &gen_writes {
-                            match generator_id(db, name) {
-                                Some(id) => {
-                                    if write_generator_value(&mut work, db.page_size, id, *val).is_err() {
-                                        ok = false;
-                                    }
-                                }
-                                None => ok = false,
-                            }
-                        }
-                        if ok {
-                            db.bytes = work;
-                            let _ = std::fs::write(&db.path, &db.bytes);
-                        }
-                    }
-                }
+                persist_generators(database.as_mut(), &gen_writes);
                 w.send(&mut s, &mut enc)?;
             }
             x if x == OP_FREE_STATEMENT => {
