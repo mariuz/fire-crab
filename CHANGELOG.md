@@ -13,6 +13,54 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — A generator is an expression leaf
+
+`(NEXT VALUE FOR S) + 100` and its kin, refused since the select-list
+parser was built, are answered now — with the engine's evaluation-order
+law, which took a probe to find.
+
+### Converted
+- `RawExpr::Gen`, on the `RawExpr::Agg` pattern: a leaf not resolvable
+  on its own; the planner assigns it a synthetic slot that the per-row
+  advance fills, and the expression evaluates against the filled row.
+  Arithmetic, concat, CAST, function arguments and COALESCE heads all
+  take one; `GEN_ID(S, n)` with a literal step likewise.
+- **The order law**: select-list ITEMS evaluate RIGHT-TO-LEFT (probed:
+  two bare `NEXT VALUE` items on a fresh sequence answer A=2, B=1 — the
+  LEFT item gets the HIGHER value), leaves within one item evaluate
+  left-to-right (probed: `(NEXT VALUE FOR S)*1000 + (NEXT VALUE FOR S)`
+  at 61 answers 62063). The `gen_cols` vector's ORDER now carries that
+  law — which also fixed a pre-existing wrong VALUE: two bare items had
+  been numbered ascending left-to-right.
+- `qa/serve-real-genrow.sh` grew from 14 to 25 checks: the expression
+  forms agree value-for-value including a 2500-row digest that spans
+  fetch batches, the two-item twins are compared as TWO ITEMS (a concat
+  twin would evaluate left-to-right and mis-pin the law), and all four
+  generators' stored values stay in engine lockstep.
+
+### Fixed
+- **`SELECT FIRST 2 NEXT VALUE FOR SEQ` had been ANSWERING — every
+  value NULL, and the sequence never moved.** `branch_rows`
+  destructures `Plan::Project` with `..` and knows nothing of
+  `gen_cols`; `Plan::Modified` materialised through it. It now refuses
+  a gen-bearing Project outright (prepare-time refusal at the Modified
+  constructor, plus the `branch_rows` backstop for every other caller:
+  union branches, FOR SELECT, INSERT ... SELECT, recursive CTE levels).
+- The batch fetch materialises a gen-bearing Project in RECORD
+  coordinates — slots filled by the advance, ORIGINAL columns kept, so
+  a gen-bearing expression evaluates against the filled slot at encode
+  time. The old positional patch (which could only fix WHOLE-item
+  columns, after projection) is gone.
+
+### Guarded
+- The LAZY positions refuse rather than over-bump: the engine does not
+  advance in an untaken CASE branch (probed), bumps per matching row in
+  WHERE, per compared row in ORDER BY, only for emitted rows under
+  FIRST, and 19-times-for-5-rows under GROUP BY (measured). CASE, IIF,
+  NULLIF, COALESCE tails, conditions, WHERE, ORDER BY clauses, GROUP
+  BY/HAVING and FIRST/SKIP/DISTINCT all refuse, each pinned in the
+  gate.
+
 ## 2026-08-01 — The describe's two names
 
 The engine's describe carries a FIELD name (item 16, the symbolic or

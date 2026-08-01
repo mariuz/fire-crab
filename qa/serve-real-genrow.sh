@@ -7,6 +7,13 @@
 # order (after any ORDER BY), so with `ORDER BY X` the value follows the
 # sorted output, not the scan order.
 #
+# Generators inside EXPRESSIONS - `(NEXT VALUE FOR S) + 100`, a CAST, a
+# concat - are answered too, with the engine's evaluation-order law:
+# select-list ITEMS evaluate RIGHT-TO-LEFT (probed: two bare items give
+# the LEFT one the HIGHER value), leaves within one item LEFT-TO-RIGHT,
+# and the LAZY positions (CASE branches, COALESCE tails, WHERE, ORDER
+# BY, FIRST, GROUP BY) refuse rather than over-bump.
+#
 # THE differential is the engine. The SAME query runs through BOTH
 # fire-crab (node -> fcwire, WORK) and the C++ engine (isql, REF); the
 # per-row values must match value-for-value AND the stored generator value
@@ -142,6 +149,33 @@ Q4="SELECT GEN_ID(G, 1), X FROM SRC WHERE X > 15 ORDER BY X"
 check "GEN_ID(G,1) with WHERE (only matching rows advance)" \
     "$(fc_rows "$Q4")" "$(en_rows "SELECT GEN_ID(G, 1) || '|' || X FROM SRC WHERE X > 15 ORDER BY X")"
 
+# A GENERATOR INSIDE AN EXPRESSION - the shapes this gate used to assert
+# as refusals. The law that took a probe to find: the engine evaluates
+# select-list ITEMS RIGHT-TO-LEFT (two bare NEXT VALUE items give the
+# LEFT one the HIGHER value) and leaves WITHIN one item left-to-right.
+# The engine twins for the two-item checks are therefore TWO ITEMS
+# joined by sed, never a single concat expression - a concat evaluates
+# its leaves left-to-right and answers DIFFERENT per-column values.
+en_cols() { en_rows "$1" | sed 's/[[:space:]]\{1,\}/|/g'; }
+Q5="SELECT (NEXT VALUE FOR SEQ) + 100, X FROM SRC ORDER BY X"
+check "an advance inside arithmetic, per row" \
+    "$(fc_rows "$Q5")" "$(en_rows "SELECT ((NEXT VALUE FOR SEQ) + 100) || '|' || X FROM SRC ORDER BY X")"
+Q6="SELECT (NEXT VALUE FOR SEQ) || 'x' FROM SRC"
+check "an advance inside a concat" \
+    "$(fc_rows "$Q6")" "$(en_rows "SELECT (NEXT VALUE FOR SEQ) || 'x' FROM SRC")"
+Q7="SELECT CAST(NEXT VALUE FOR SEQ AS VARCHAR(10)) FROM SRC"
+check "an advance inside a CAST" \
+    "$(fc_rows "$Q7")" "$(en_rows "SELECT CAST(NEXT VALUE FOR SEQ AS VARCHAR(10)) FROM SRC")"
+Q8="SELECT NEXT VALUE FOR SEQ AS A, NEXT VALUE FOR SEQ AS B, X FROM SRC ORDER BY X"
+check "two bare items evaluate RIGHT-TO-LEFT (A > B)" \
+    "$(fc_rows "$Q8")" "$(en_cols "SELECT NEXT VALUE FOR SEQ, NEXT VALUE FOR SEQ, X FROM SRC ORDER BY X")"
+Q9="SELECT NEXT VALUE FOR SEQ AS A, (NEXT VALUE FOR SEQ) + 1000 AS B, X FROM SRC ORDER BY X"
+check "a bare item beside an expression item" \
+    "$(fc_rows "$Q9")" "$(en_cols "SELECT NEXT VALUE FOR SEQ, (NEXT VALUE FOR SEQ) + 1000, X FROM SRC ORDER BY X")"
+Q10="SELECT GEN_ID(SEQ5, 5) + 1, X FROM SRC ORDER BY X DESC"
+check "GEN_ID with a step inside arithmetic" \
+    "$(fc_rows "$Q10")" "$(en_rows "SELECT (GEN_ID(SEQ5, 5) + 1) || '|' || X FROM SRC ORDER BY X DESC")"
+
 # A GENERATOR ACROSS FETCH BATCHES. The three-row checks above all fit in
 # one batch; this one does not, and the two halves of the interaction it
 # pins are the two that were broken:
@@ -159,6 +193,14 @@ QB="SELECT NEXT VALUE FOR SEQBIG, X FROM BIG ORDER BY X"
 a=$(fc_rows "$QB" | md5sum | cut -d' ' -f1)
 b=$(en_rows "SELECT (NEXT VALUE FOR SEQBIG) || '|' || X FROM BIG ORDER BY X" | md5sum | cut -d' ' -f1)
 check "NEXT VALUE FOR over 2500 rows (spans fetch batches)" "$a" "$b"
+# ... and the EXPRESSION form over the same 2500 rows - this is the one
+# that exercises the gen-aware materialisation in the batch fetch (an
+# expression column evaluates against the filled slot at encode time,
+# which the projected-rows path could never do)
+QB2="SELECT (NEXT VALUE FOR SEQBIG) + 0, X FROM BIG ORDER BY X"
+a=$(fc_rows "$QB2" | md5sum | cut -d' ' -f1)
+b=$(en_rows "SELECT ((NEXT VALUE FOR SEQBIG) + 0) || '|' || X FROM BIG ORDER BY X" | md5sum | cut -d' ' -f1)
+check "the expression form over 2500 rows" "$a" "$b"
 
 # THE DECLARED COLUMN, which the value comparisons above cannot see -
 # they compare values positionally and a wrong NAME is invisible to them.
@@ -178,18 +220,25 @@ for st in "SELECT NEXT VALUE FOR SEQ FROM SRC" "SELECT GEN_ID(SEQ, 1) FROM SRC";
         "$(sqlda "127.0.0.1/$PORT:$WORK" "$st")" "$(sqlda "$REF" "$st")"
 done
 
-# A GENERATOR INSIDE AN EXPRESSION is still refused, and that is stated
-# here rather than left to be discovered. The engine answers
-# `SELECT (NEXT VALUE FOR S) || '|' || X` and `(NEXT VALUE FOR S) + 100`;
-# fire-crab's select-list parser only recognises the generator as a WHOLE
-# item, so both refuse. An outage, not a wrong answer - and asserted so
-# it cannot quietly become one.
-for st in "SELECT (NEXT VALUE FOR SEQ) + 100 FROM SRC" \
-          "SELECT (NEXT VALUE FOR SEQ) || 'x' FROM SRC"; do
+# THE SHAPES THAT MUST STILL REFUSE, each one an engine-answered shape
+# whose eager slot-filling would give WRONG VALUES rather than an
+# outage: the engine bumps lazily in a CASE (an untaken branch does not
+# advance), per matching row in a WHERE, per compared row in an ORDER
+# BY, only for EMITTED rows under FIRST, and 19-bumps-for-5-rows
+# messily under GROUP BY. `FIRST 2 NEXT VALUE FOR SEQ` used to ANSWER
+# here - every value NULL and the sequence never moved - so its line is
+# the regression pin for that bug. These run against fire-crab only (a
+# refusal advances nothing, so the twins stay in lockstep).
+for st in "SELECT X FROM SRC WHERE NEXT VALUE FOR SEQ > 0" \
+          "SELECT X FROM SRC ORDER BY NEXT VALUE FOR SEQ" \
+          "SELECT CASE WHEN X > 15 THEN NEXT VALUE FOR SEQ ELSE -1 END FROM SRC" \
+          "SELECT FIRST 2 NEXT VALUE FOR SEQ FROM SRC" \
+          "SELECT COUNT(*), NEXT VALUE FOR SEQ FROM SRC" \
+          "SELECT COALESCE(X, NEXT VALUE FOR SEQ) FROM SRC"; do
     r=$(fc_rows "$st")
     case "$r" in
-        *ERR*) echo "OK   still refused (generator inside an expression): $st" ;;
-        *) echo "DIFF fire-crab answered a shape it does not implement: $st -> $r"; fail=1 ;;
+        *ERR*) echo "OK   refused (the engine's evaluation there is lazy/partial): $st" ;;
+        *) echo "DIFF fire-crab answered a shape it must refuse: $st -> $r"; fail=1 ;;
     esac
 done
 

@@ -336,10 +336,24 @@ four; R7 is the removal of what they replaced.
   concern); and items 17/18 (relation/owner) still answer `""` where
   the engine names the table/view/procedure — its own slice.
 
-- **A generator inside an EXPRESSION.** `SELECT (NEXT VALUE FOR S) + 100`
-  and `(NEXT VALUE FOR S) || 'x'` are answered by the engine and refused
-  by fire-crab, whose select-list parser recognises a generator only as a
-  WHOLE item. `qa/serve-real-genrow.sh` asserts the refusal.
+- ~~A generator inside an EXPRESSION~~ — *fixed*. `RawExpr::Gen` is a
+  leaf on the `RawExpr::Agg` pattern: not resolvable on its own, the
+  planner assigns it a synthetic slot the per-row advance fills. The
+  law that took a probe to find: the engine evaluates select-list
+  ITEMS RIGHT-TO-LEFT (two bare `NEXT VALUE` items give the LEFT one
+  the HIGHER value — fire-crab had been answering ascending
+  left-to-right, a pre-existing wrong VALUE) and leaves within one
+  item left-to-right; `gen_cols` order now carries that law. LAZY
+  positions refuse: an untaken CASE branch does not bump on the
+  engine, so eager slot-filling would over-bump — CASE/IIF/NULLIF/
+  COALESCE-tails, WHERE, ORDER BY clauses, GROUP BY (measured: 19
+  bumps for 5 rows) and FIRST/SKIP/DISTINCT all refuse rather than
+  mis-answer. Two bugs died on the way: `FIRST 2 NEXT VALUE FOR SEQ`
+  had ANSWERED — every value NULL and the sequence never moved
+  (`branch_rows` knows nothing of gen_cols; it now refuses gen-bearing
+  Projects outright, and the batch fetch materialises them in RECORD
+  coordinates so expressions evaluate against filled slots); and the
+  batch path's positional patch is gone with it.
 
 - **A NON-TEXT parameter against a TEXT column** — `WHERE S_VC = 5`,
   `WHERE S_VC = ?` with a boolean — is refused; the engine answers it.

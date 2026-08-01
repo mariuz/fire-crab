@@ -12741,6 +12741,16 @@ fn branch_rows(
     db: &Database,
     args: &[WireParam],
 ) -> Option<Vec<Vec<Value>>> {
+    // A GENERATOR-ADVANCING PROJECT IS NOT A ROW SOURCE HERE. This
+    // function destructures Project with `..` and knows nothing of
+    // gen_cols, so a generator column would come back NULL and the
+    // sequence would never move - silently. The batch fetch has its own
+    // gen-aware materialisation; every OTHER caller (a union branch, a
+    // FOR SELECT, INSERT ... SELECT, a recursive CTE level) refuses
+    // until someone converts it deliberately.
+    if matches!(plan, Plan::Project { gen_cols, .. } if !gen_cols.is_empty()) {
+        return None;
+    }
     // a UNION is a row source too - and so is a nested one, since this
     // recurses. Everything that materialises rows (INSERT ... SELECT, a
     // FOR SELECT loop, a union branch) goes through here, so they all
@@ -13354,6 +13364,15 @@ fn plan_query_inner(
                 | Plan::JoinGroup { .. }
                 | Plan::Derived { .. }
         ) {
+            return Some(Plan::Refused);
+        }
+        // a generator advance under FIRST/SKIP/DISTINCT must refuse:
+        // materialising through branch_rows knows nothing of gen_cols,
+        // so this ANSWERED - every generator column NULL and the
+        // sequence never moved, which is worse than the refusal. The
+        // engine bumps only for the emitted rows; matching that is a
+        // real slice, not a patch.
+        if matches!(&plan, Plan::Project { gen_cols, .. } if !gen_cols.is_empty()) {
             return Some(Plan::Refused);
         }
         let cols: Vec<ProjCol> = output_cols_of(&plan)
@@ -14084,9 +14103,16 @@ fn plan_query_inner(
         SelItem::Expr(raw, ..) => raw_has_agg(raw),
         _ => false,
     });
-    let has_gen = items.iter().any(|i| matches!(i, SelItem::Gen(..)));
+    let has_gen = items.iter().any(|i| match i {
+        SelItem::Gen(..) => true,
+        // a generator INSIDE an expression takes the same path
+        SelItem::Expr(raw, ..) => raw_contains_gen(raw),
+        _ => false,
+    });
     // a generator advance in the select list needs the row-by-row Project
     // path; a grouped/aggregated query with one is not a shape we answer
+    // (the engine's grouped-bump behavior is measured and MESSY - 19
+    // bumps for 5 rows - so the refusal is deliberate)
     if has_gen && (has_agg || group_s.is_some() || having_s.is_some()) {
         return None;
     }
@@ -14150,9 +14176,43 @@ fn plan_query_inner(
         // format's real fields, so a decoded row never collides with them
         let gen_base = formats.iter().map(|(_, d)| d.len()).max().unwrap_or(0).max(descs.len());
         let mut gen_cols: Vec<GenCol> = Vec::new();
+        // Slots are assigned in the ENGINE'S EVALUATION ORDER: items
+        // RIGHT-TO-LEFT (probed: `SELECT NEXT VALUE FOR S AS A, NEXT
+        // VALUE FOR S AS B` on a fresh sequence answers A=2, B=1 - the
+        // LEFT item gets the HIGHER value), leaves within one item
+        // left-to-right. advance_generators fills slots in gen_cols
+        // ORDER, so that vector's order is what carries the law; the
+        // slot numbers only need to be distinct. This pass is also
+        // what fixed the two-bare-items divergence: they had been
+        // numbered left-to-right.
+        let mut items = items;
+        let mut gen_slots: Vec<Option<usize>> = vec![None; items.len()];
+        if has_gen {
+            for idx in (0..items.len()).rev() {
+                match &mut items[idx] {
+                    SelItem::Gen(gen, step, _) => {
+                        // the generator must exist at prepare (else
+                        // refuse rather than fail mid-fetch)
+                        generator_info(db, gen)?;
+                        let value_index = gen_base + gen_cols.len();
+                        gen_cols.push(GenCol {
+                            name: gen.clone(),
+                            step: *step,
+                            value_index,
+                        });
+                        gen_slots[idx] = Some(value_index);
+                    }
+                    SelItem::Expr(raw, ..) if raw_contains_gen(raw) => {
+                        assign_gen_slots(raw, db, gen_base, &mut gen_cols)?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let items = items;
         let cols = if has_expr || has_gen {
             let mut out = Vec::new();
-            for it in &items {
+            for (item_idx, it) in items.iter().enumerate() {
                 match it {
                     // the alias is applied positionally below, where
                     // both branches of this `if` meet
@@ -14165,12 +14225,10 @@ fn plan_query_inner(
                         pc.fname = Some(fname.clone());
                         out.push(pc);
                     }
-                    SelItem::Gen(gen, step, alias) => {
-                        // the generator must exist at prepare (else refuse
-                        // rather than fail mid-fetch)
-                        generator_info(db, gen)?;
-                        let value_index = gen_base + gen_cols.len();
-                        gen_cols.push(GenCol { name: gen.clone(), step: *step, value_index });
+                    SelItem::Gen(_, step, alias) => {
+                        // the slot was assigned by the evaluation-order
+                        // pass above
+                        let value_index = gen_slots[item_idx]?;
                         out.push(ProjCol {
                             name: alias.clone(),
                             // the spelling is the field name, alias or
@@ -17443,6 +17501,115 @@ fn parse_gen_sel_item(part: &str) -> Option<(String, Option<i64>)> {
     if name.is_empty() { None } else { Some((name, Some(step))) }
 }
 
+/// Does this expression contain a generator advance anywhere - eager,
+/// lazy, or nested? Used to route a select list to the Project path
+/// and to refuse the lazy positions [assign_gen_slots] cannot fill.
+fn raw_contains_gen(e: &RawExpr) -> bool {
+    match e {
+        RawExpr::Gen { .. } => true,
+        RawExpr::Neg(a) | RawExpr::Cast(a, _) => raw_contains_gen(a),
+        RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => {
+            raw_contains_gen(a) || raw_contains_gen(b)
+        }
+        RawExpr::Func(_, args) | RawExpr::Coalesce(args) => {
+            args.iter().any(raw_contains_gen)
+        }
+        RawExpr::Iif(_, a, b) => raw_contains_gen(a) || raw_contains_gen(b),
+        RawExpr::Case(branches, else_) => {
+            branches.iter().any(|(_, t)| raw_contains_gen(t))
+                || else_.as_deref().is_some_and(raw_contains_gen)
+        }
+        RawExpr::Agg(_, t) => match &**t {
+            AggTarget::Expr(inner) => raw_contains_gen(inner),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Assign synthetic value slots to the generator advances of ONE select
+/// item's expression, in the engine's WITHIN-ITEM order: leaves
+/// LEFT-TO-RIGHT through the positions it evaluates EAGERLY (probed:
+/// `(NEXT VALUE FOR S)*1000 + (NEXT VALUE FOR S)` at S=61 answers
+/// 62063 - left leaf first). A generator under a LAZY position - a
+/// CASE/IIF branch, NULLIF, a COALESCE tail, any condition - REFUSES:
+/// the engine bumps only when the branch is actually taken (probed:
+/// the untaken CASE branch does not bump), and filling the slot
+/// eagerly would over-bump the sequence.
+fn assign_gen_slots(
+    e: &mut RawExpr,
+    db: &Database,
+    gen_base: usize,
+    gen_cols: &mut Vec<GenCol>,
+) -> Option<()> {
+    match e {
+        RawExpr::Gen { name, step, slot } => {
+            // the generator must exist at prepare (else refuse rather
+            // than fail mid-fetch)
+            generator_info(db, name)?;
+            let value_index = gen_base + gen_cols.len();
+            gen_cols.push(GenCol { name: name.clone(), step: *step, value_index });
+            *slot = Some(value_index);
+        }
+        RawExpr::Neg(a) | RawExpr::Cast(a, _) => {
+            assign_gen_slots(a, db, gen_base, gen_cols)?;
+        }
+        RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) => {
+            assign_gen_slots(a, db, gen_base, gen_cols)?;
+            assign_gen_slots(b, db, gen_base, gen_cols)?;
+        }
+        RawExpr::Func(_, args) => {
+            for a in args {
+                assign_gen_slots(a, db, gen_base, gen_cols)?;
+            }
+        }
+        RawExpr::Coalesce(args) => {
+            // the FIRST operand is evaluated unconditionally; the tail
+            // only when everything before it was NULL - lazy, refuse
+            if args[1..].iter().any(raw_contains_gen) {
+                return None;
+            }
+            assign_gen_slots(&mut args[0], db, gen_base, gen_cols)?;
+        }
+        RawExpr::NullIf(..) | RawExpr::Iif(..) | RawExpr::Case(..) | RawExpr::Cond(_)
+        | RawExpr::Agg(..) => {
+            if raw_contains_gen(e) {
+                return None;
+            }
+        }
+        _ => {}
+    }
+    Some(())
+}
+
+/// Read a generator reference from the char-level expression parser -
+/// an identifier, possibly quoted and possibly qualified - and reduce
+/// it through [strip_gen_name] to the bare catalog name.
+fn parse_gen_ref(b: &[char], pos: &mut usize) -> Option<String> {
+    skip_ws(b, pos);
+    let start = *pos;
+    if b.get(*pos) == Some(&'"') {
+        *pos += 1;
+        while *pos < b.len() && b[*pos] != '"' {
+            *pos += 1;
+        }
+        if b.get(*pos) != Some(&'"') {
+            return None;
+        }
+        *pos += 1;
+    } else {
+        while *pos < b.len()
+            && (b[*pos].is_alphanumeric() || b[*pos] == '_' || b[*pos] == '$' || b[*pos] == '.'
+                || b[*pos] == '"')
+        {
+            *pos += 1;
+        }
+    }
+    let text: String = b[start..*pos].iter().collect();
+    let name = strip_gen_name(&text);
+    if name.is_empty() { None } else { Some(name) }
+}
+
 /// Reduce a possibly schema/package-qualified, possibly quoted generator
 /// reference (`PUBLIC.MYGEN`, `PUBLIC."MyGen"`, `MYGEN`, `"MyGen"`) to the
 /// bare object name the catalog stores.
@@ -17540,6 +17707,16 @@ enum RawExpr {
     /// slot that holds its fold, and only then is the surrounding
     /// expression an ordinary expression.
     Agg(AggFn, Box<AggTarget>),
+    /// A GENERATOR ADVANCE inside an expression - `(NEXT VALUE FOR S) +
+    /// 100`, `GEN_ID(S, 5) || 'x'`. The [RawExpr::Agg] pattern again: a
+    /// leaf NOT resolvable on its own, because a row has no value for
+    /// it until the planner assigns a synthetic SLOT that the per-row
+    /// advance fills ([GenCol]). The parser always emits `slot: None`;
+    /// [assign_gen_slots] fills it on the Project path, and anywhere it
+    /// stays None (WHERE, ORDER BY, group keys, computed columns)
+    /// resolution refuses - the engine answers some of those shapes,
+    /// but eager slot-filling would over- or under-bump them.
+    Gen { name: String, step: Option<i64>, slot: Option<usize> },
     /// `NULLIF(a, b)` - NULL when the two are equal, otherwise `a`.
     NullIf(Box<RawExpr>, Box<RawExpr>),
     /// `IIF(<cond>, a, b)` - `a` when the condition is TRUE, `b` when it
@@ -18315,6 +18492,53 @@ fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                 }
                 *pos += 1; // ')'
                 Some(node)
+            } else if !quoted && word.eq_ignore_ascii_case("NEXT") && {
+                // NEXT VALUE FOR <seq> - only when both keywords follow,
+                // so a column named NEXT still parses as itself
+                let save = *pos;
+                let ok = take_keyword(b, pos, "VALUE") && take_keyword(b, pos, "FOR");
+                if !ok {
+                    *pos = save;
+                }
+                ok
+            } {
+                let name = parse_gen_ref(b, pos)?;
+                Some(RawExpr::Gen { name, step: None, slot: None })
+            } else if !quoted && word.eq_ignore_ascii_case("GEN_ID") && {
+                skip_ws(b, pos);
+                b.get(*pos) == Some(&'(')
+            } {
+                // GEN_ID(<name>, <signed integer literal>) - a literal
+                // step only, mirroring the whole-item parser
+                *pos += 1; // '('
+                let name = parse_gen_ref(b, pos)?;
+                skip_ws(b, pos);
+                if b.get(*pos) != Some(&',') {
+                    return None;
+                }
+                *pos += 1;
+                skip_ws(b, pos);
+                let neg = b.get(*pos) == Some(&'-');
+                if neg {
+                    *pos += 1;
+                }
+                let dstart = *pos;
+                while *pos < b.len() && b[*pos].is_ascii_digit() {
+                    *pos += 1;
+                }
+                if *pos == dstart {
+                    return None;
+                }
+                let mut step: i64 = b[dstart..*pos].iter().collect::<String>().parse().ok()?;
+                if neg {
+                    step = -step;
+                }
+                skip_ws(b, pos);
+                if b.get(*pos) != Some(&')') {
+                    return None;
+                }
+                *pos += 1;
+                Some(RawExpr::Gen { name, step: Some(step), slot: None })
             } else if !quoted && word.eq_ignore_ascii_case("CASE") {
                 parse_case_tail(b, pos)
             } else if !quoted && word.eq_ignore_ascii_case("DECODE") && {
@@ -18426,6 +18650,8 @@ fn raw_bad_substring_len(e: &RawExpr) -> Option<i64> {
     };
     let walk_all = |args: &[RawExpr]| args.iter().find_map(raw_bad_substring_len);
     match e {
+        // a generator's step is an integer literal; nothing to check
+        RawExpr::Gen { .. } => None,
         // an aggregate's ARGUMENT is an expression too, so a bad literal
         // length inside `SUM(SUBSTRING(...))` fails the prepare as well
         RawExpr::Agg(_, t) => match &**t {
@@ -18983,6 +19209,11 @@ fn resolve_expr_inner(
         // into a reference to the group row's slot BEFORE this runs, so
         // arriving here means there is no grouping to take it from.
         RawExpr::Agg(..) => return None,
+        // a generator leaf reads the synthetic slot the per-row advance
+        // fills; one that never got a slot ([assign_gen_slots] runs
+        // only on the Project select list) refuses the statement
+        RawExpr::Gen { slot: Some(i), .. } => Expr::GenVal(*i),
+        RawExpr::Gen { slot: None, .. } => return None,
         RawExpr::Col(name) => {
             let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
             let fid = rc.field_id as usize;
@@ -19082,6 +19313,12 @@ fn resolve_expr_inner(
 enum Expr {
     /// a scale-0 integer column, by field id
     Col(usize),
+    /// the SYNTHETIC SLOT a per-row generator advance fills ([GenCol]):
+    /// reads exactly like [Expr::Col] - the advance happened before
+    /// eval, so the value is already in the row - but types as a plain
+    /// INT64 always (the engine declares every NEXT VALUE/GEN_ID
+    /// expression INT64, probed)
+    GenVal(usize),
     Int(i64),
     /// a decimal literal: (raw integer, scale)
     Dec(i64, i8),
@@ -20056,6 +20293,8 @@ impl Expr {
             // cannot say, since an empty inner table has no value to
             // read a type from
             Expr::Lookup { ty, .. } => Some(*ty),
+            // a generator's value is a plain INT64, whatever wraps it
+            Expr::GenVal(_) => Some(ExprType::Int),
             // a conditional's type comes from its branches TOGETHER: a
             // NULL branch is untyped and defers to its siblings, and ANY
             // exact-numeric branch beside integer ones makes the whole
@@ -20286,6 +20525,7 @@ impl Expr {
     fn result_scale(&self, descs: &[Descriptor]) -> Option<i8> {
         match self {
             Expr::Lookup { scale, .. } => Some(*scale),
+            Expr::GenVal(_) => Some(0),
             Expr::Col(fid) => {
                 let d = descs.get(*fid)?;
                 if matches!(col_kind(d), Some(ColKind::Int)) {
@@ -20378,6 +20618,7 @@ impl Expr {
             // a folded lookup answers within i64: its values came from
             // the inner table's own columns and folds
             Expr::Lookup { .. } => Some(NumRank::I64),
+            Expr::GenVal(_) => Some(NumRank::I64),
             // the widest branch decides the width, so a value from any
             // branch fits the announced column
             // an APPROXIMATE or BOOLEAN value has no exact rank - width
@@ -20562,6 +20803,7 @@ impl Expr {
                 }
             }
             Expr::Col(fid) => values.get(*fid).cloned().unwrap_or(Value::Null),
+            Expr::GenVal(i) => values.get(*i).cloned().unwrap_or(Value::Null),
             Expr::Int(n) => Value::Int(*n),
             Expr::Dec(raw, scale) => Value::Scaled(*raw, *scale),
             Expr::Str(s) => Value::Text(s.clone()),
@@ -22717,6 +22959,9 @@ fn default_expr_name(raw: &RawExpr) -> String {
         RawExpr::Agg(AggFn::Max, _) => "MAX",
         RawExpr::Agg(AggFn::Sum, _) => "SUM",
         RawExpr::Agg(AggFn::Avg, _) => "AVG",
+        // the spelling names the column, parenthesised or not
+        RawExpr::Gen { step: None, .. } => "NEXT_VALUE",
+        RawExpr::Gen { step: Some(_), .. } => "GEN_ID",
         RawExpr::Bin(_, ArithOp::Add, _) => "ADD",
         RawExpr::Bin(_, ArithOp::Sub, _) => "SUBTRACT",
         RawExpr::Bin(_, ArithOp::Mul, _) => "MULTIPLY",
@@ -25390,6 +25635,7 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
         // the fold already happened at prepare; a lookup only compares
         Expr::Lookup { key, .. } => expr_no_raise(key, descs),
         Expr::Col(_)
+        | Expr::GenVal(_)
         | Expr::Int(_)
         | Expr::Dec(..)
         | Expr::Double(_)
@@ -26954,6 +27200,80 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 // materialisation is where a generator now advances - and
                 // the batch path returns without ever reaching `emit_rows`.
                 let mut gen_writes: Vec<(String, i64)> = Vec::new();
+                // A GENERATOR-ADVANCING PROJECT MATERIALISES IN RECORD
+                // COORDINATES. `branch_rows` hands back PROJECTED rows,
+                // which is exactly too late for a generator: a whole-item
+                // column reads its unfilled slot as NULL, and a
+                // gen-bearing EXPRESSION has already evaluated against
+                // it. So the record rows are materialised first, the
+                // advance fills the synthetic slots (in gen_cols order,
+                // which the planner arranged into the engine's
+                // evaluation order), and the ORIGINAL cols are kept -
+                // encode_row then evaluates each output column against
+                // the filled row, exactly as the streaming path does.
+                if want > 0 {
+                    let gen_batch = match (&plan, database.as_ref()) {
+                        (
+                            Plan::Project {
+                                rel, formats, cols, filter, order_by, gen_cols, index, ..
+                            },
+                            Some(db),
+                        ) if !gen_cols.is_empty() => {
+                            match bind_filter(filter, &bound_args) {
+                                // a bind failure falls through to
+                                // emit_rows, which reports it the same
+                                // way the streaming path always has
+                                Err(_) => None,
+                                Ok(bound) => {
+                                    let mut rows: Vec<Vec<Value>> = Vec::new();
+                                    let mut ferr: Option<EvalErr> = None;
+                                    for_each_candidate(db, *rel, formats, index, |values| {
+                                        if ferr.is_some() {
+                                            return;
+                                        }
+                                        let keep = match &bound {
+                                            None => Ok(true),
+                                            Some(p) => p.matches(values),
+                                        };
+                                        match keep {
+                                            Ok(true) => rows.push(values.to_vec()),
+                                            Ok(false) => {}
+                                            Err(e) => ferr = Some(e),
+                                        }
+                                    });
+                                    if ferr.is_none() && !order_by.is_empty() {
+                                        if let Err(e) = sort_rows(&mut rows, order_by) {
+                                            ferr = Some(e);
+                                        }
+                                    }
+                                    match ferr {
+                                        // a per-row error falls through to
+                                        // emit_rows, which raises it
+                                        // mid-cursor like the engine
+                                        Some(_) => None,
+                                        None => {
+                                            let slots: Vec<(usize, String, Option<i64>)> =
+                                                gen_cols
+                                                    .iter()
+                                                    .map(|g| {
+                                                        (g.value_index, g.name.clone(), g.step)
+                                                    })
+                                                    .collect();
+                                            let writes =
+                                                advance_generators(db, &slots, &mut rows);
+                                            Some((cols.clone(), rows, writes))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some((cols, rows, writes)) = gen_batch {
+                        gen_writes = writes;
+                        plan = Plan::Rows { cols, rows };
+                    }
+                }
                 if want > 0 && !matches!(plan, Plan::Rows { .. }) {
                     if let Some(db) = database.as_ref() {
                         if let Some(rows) = branch_rows(&plan, db, &bound_args) {
@@ -26964,34 +27284,6 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             // their original field ids makes each one
                             // read the record it no longer has, and
                             // every value comes back NULL.
-                            let mut rows = rows;
-                            // A GENERATOR ADVANCE SURVIVES MATERIALISATION.
-                            // `branch_rows` computes the rows but knows
-                            // nothing of `gen_cols` - it destructures
-                            // `Plan::Project` with `..` - so without this
-                            // every `NEXT VALUE FOR` in a select list came
-                            // back NULL and the sequence never moved.
-                            //
-                            // The slot is the column's POSITION in the
-                            // output here, not its synthetic `value_index`:
-                            // these rows are already projected. The
-                            // position is found by matching that index
-                            // against the plan's own ProjCols, which still
-                            // carry it as their field_id.
-                            if let Plan::Project { gen_cols, cols: pcols, .. } = &plan {
-                                if !gen_cols.is_empty() {
-                                    let slots: Vec<(usize, String, Option<i64>)> = gen_cols
-                                        .iter()
-                                        .filter_map(|g| {
-                                            pcols
-                                                .iter()
-                                                .position(|c| c.field_id == g.value_index)
-                                                .map(|at| (at, g.name.clone(), g.step))
-                                        })
-                                        .collect();
-                                    gen_writes = advance_generators(db, &slots, &mut rows);
-                                }
-                            }
                             let cols: Vec<ProjCol> = output_cols_of(&plan)
                                 .iter()
                                 .enumerate()
@@ -29515,6 +29807,38 @@ mod tests {
         // multi-byte: `_` is one CHARACTER
         assert!(like_match("héllo", "h_llo", None));
         assert!(like_match("héllo", "h%o", None));
+    }
+
+    #[test]
+    fn generators_parse_inside_expressions() {
+        // the two spellings are expression LEAVES now, slot unassigned
+        // at parse (the planner fills it in evaluation order)
+        let e = parse_raw_expr("(NEXT VALUE FOR S) + 100").unwrap();
+        assert!(matches!(&e, RawExpr::Bin(a, ArithOp::Add, _)
+            if matches!(&**a, RawExpr::Gen { name, step: None, slot: None } if name == "S")));
+        let e = parse_raw_expr("GEN_ID(S, -5) + 1").unwrap();
+        assert!(matches!(&e, RawExpr::Bin(a, ArithOp::Add, _)
+            if matches!(&**a, RawExpr::Gen { step: Some(-5), .. })));
+        let e = parse_raw_expr("(NEXT VALUE FOR S) || 'x'").unwrap();
+        assert!(matches!(&e, RawExpr::Concat(a, _)
+            if matches!(&**a, RawExpr::Gen { step: None, .. })));
+        let e = parse_raw_expr("CAST(NEXT VALUE FOR S AS BIGINT)").unwrap();
+        assert!(matches!(&e, RawExpr::Cast(a, _)
+            if matches!(&**a, RawExpr::Gen { .. })));
+        // NEXT is not reserved: a column of that name still parses
+        let e = parse_raw_expr("NEXT + 1").unwrap();
+        assert!(matches!(&e, RawExpr::Bin(a, ArithOp::Add, _)
+            if matches!(&**a, RawExpr::Col(c) if c == "NEXT")));
+        // containment sees through eager wrappers and into lazy ones
+        assert!(raw_contains_gen(&parse_raw_expr("(NEXT VALUE FOR S) * 2").unwrap()));
+        assert!(raw_contains_gen(
+            &parse_raw_expr("CASE WHEN 1 = 1 THEN NEXT VALUE FOR S ELSE 0 END").unwrap()
+        ));
+        assert!(!raw_contains_gen(&parse_raw_expr("A + 1").unwrap()));
+        // a qualified/quoted reference reduces to the catalog name
+        let e = parse_raw_expr("(NEXT VALUE FOR PUBLIC.\"MyGen\") + 0").unwrap();
+        assert!(matches!(&e, RawExpr::Bin(a, _, _)
+            if matches!(&**a, RawExpr::Gen { name, .. } if name == "MyGen")));
     }
 
     #[test]
