@@ -13,6 +13,43 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-02 — The describe names its sources
+
+Items 17 (relation), 18 (owner), 25 (relation_alias) and 33 (schema)
+join the describe — and the plan's own item numbers were wrong: the
+relation alias is 25, not 34. fire-crab's 34 arm was dead code no
+client ever requests, and the engine answers item 25 for every query
+(empty payload when no alias) while fire-crab omitted it entirely —
+invisible to a field+alias comparison.
+
+### Fixed
+- `ProjCol` carries `relation`/`rel_alias` (None = "", the fname
+  precedent); ~14 producer categories stamp the probed engine answers:
+  the single-table path, RETURNING, all four JoinSide constructors
+  (per-column relations mapped back through the combined offsets),
+  views (stamped on EVERY column — an expression view column still
+  carries the view), derived tables and CTEs (base relation shines
+  through under the OUTERMOST binding alias; a CTE's name IS an alias
+  where a view's name is NOT), unions (first branch's relation+alias
+  under the existing all-plain predicate), procedures, group keys
+  (plain keys only), the subquery fold (an inner FROM alias ESCAPES),
+  and correlated lookups.
+- Owner derives at emission: SYSDBA exactly when a relation is
+  answered, RDB$ tables included (a non-SYSDBA-owned relation is a
+  recorded boundary).
+- Item 33 was wrong in BOTH directions — SYSTEM tables answered
+  PUBLIC, expressions answered PUBLIC instead of "" — and now follows
+  the same relation knowledge.
+- A law the probe table itself got wrong, refuted live during
+  implementation: a BINDING ALIAS does not require a relation —
+  `(SELECT X+1 AS C FROM T) V` answers relation "", relationAlias V.
+
+### Converted
+- `qa/serve-real-describe.sh` grew to 107 checks comparing all SIX
+  describe strings (field, alias, relation, relationAlias, owner —
+  spliced into node-firebird's request, its parser already handles
+  it — and relationSchema).
+
 ## 2026-08-01 — The parameter takes the stand
 
 `WHERE ? IS NULL`, `? LIKE 'o%'`, `? BETWEEN 1 AND 3`, `? IN (1,2)` —

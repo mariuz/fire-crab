@@ -1,30 +1,36 @@
 #!/bin/bash
-# The DESCRIBE's two names, against the REAL engine as a twin: item 16
-# (isc_info_sql_field, the engine's symbolic/source name) and item 19
-# (isc_info_sql_alias, the client's column key), compared for every
-# expression class this server can project.
+# The DESCRIBE's names, against the REAL engine as a twin: item 16
+# (isc_info_sql_field), item 19 (isc_info_sql_alias), item 17
+# (isc_info_sql_relation), item 25 (isc_info_sql_relation_alias), item
+# 18 (isc_info_sql_owner, spliced into node-firebird's request - its
+# parser already handles it) and item 33 (isc_info_sql_relation_schema),
+# compared for every projection class this server can answer.
 #
-# fire-crab had answered the ALIAS in both fields for every aliased
-# column since the describe writer was built - invisible to a client
-# that reads only `alias` (node-firebird keys rows by it), visible in
-# isql headers and to anything reading `field`. The engine's rule
-# (DsqlAliasNode::setParameterName): every expression node sets BOTH
-# names to its symbolic name; the user's AS overwrites ONLY the alias.
+# fire-crab had answered the ALIAS in both name fields for every
+# aliased column since the describe writer was built - invisible to a
+# client that reads only `alias` (node-firebird keys rows by it),
+# visible in isql headers and to anything reading `field`. The engine's
+# rule (DsqlAliasNode::setParameterName): every expression node sets
+# BOTH names to its symbolic name; the user's AS overwrites ONLY the
+# alias.
 #
 # The engine answers probed and pinned here include the surprises:
 #   * unary minus has an EMPTY field name (and empty alias, unaliased);
 #   * NULLIF describes as CASE - it compiles into one;
 #   * a scalar subquery delegates naming to its INNER item, whose alias
-#     becomes the outer alias;
+#     becomes the outer alias - and its FROM alias ESCAPES with it;
 #   * UNION columns have an EMPTY field name but keep the first
-#     branch's name as the alias;
+#     branch's name as the alias - and the first branch's RELATION and
+#     binding alias, under the same all-plain-columns predicate;
 #   * a derived table lets the BASE name shine through (V.C over
-#     `X AS C` is field X) while a VIEW hides it (VC/VC);
+#     `X AS C` is field X, relation T with the derived alias binding
+#     it, the OUTERMOST alias winning) while a VIEW hides it (VC/VC,
+#     and the view itself is the relation);
+#   * a view's own name is NOT a relation alias, a CTE's name IS one;
+#   * an expression VIEW column still carries the view as relation;
+#   * owner is SYSDBA exactly when a relation is answered - RDB$ tables
+#     included - and schema is SYSTEM/PUBLIC/"" along the same split;
 #   * NEXT VALUE FOR ... FROM RDB$DATABASE is NEXT_VALUE, not GEN_ID.
-#
-# NOT compared here: item 17 (relation) and 18 (owner) - fire-crab
-# sends "" where the engine sends the table/view/procedure name; that
-# is its own slice, noted in the roadmap.
 #
 #   qa/serve-real-describe.sh [port]
 set -u
@@ -46,6 +52,7 @@ make_db() {
     "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
 CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE T (X INTEGER, S VARCHAR(10), D DOUBLE PRECISION);
+CREATE TABLE U (Y INTEGER, S2 VARCHAR(10));
 CREATE GENERATOR G1;
 COMMIT;
 CREATE VIEW V1 (VC) AS SELECT X FROM T;
@@ -57,6 +64,7 @@ SET TERM ; ^
 COMMIT;
 INSERT INTO T (X, S, D) VALUES (1, 'a', 1.5);
 INSERT INTO T (X, S, D) VALUES (2, 'b', 2.5);
+INSERT INTO U (Y, S2) VALUES (1, 'u');
 COMMIT;
 EOF
     chmod 666 "$1"
@@ -83,13 +91,21 @@ describe() { # <sql> <port> <db>
     while [ $n -lt 6 ]; do
         r=$(timeout 25 env FC_Q="$1" FC_PORT="$2" FC_DB="$3" node -e '
           process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(0); });
+          // splice OWNER (18) into the describe request - the parser
+          // handles it already, the request just never asked
+          const M=require("node-firebird/lib/wire/const");
+          const C=M.default||M;
+          for (const a of [C.DESCRIBE, C.DESCRIBE_WITH_SCHEMA]) {
+            const i=a.indexOf(C.isc_info_sql_alias);
+            if(i>=0&&!a.includes(C.isc_info_sql_owner)) a.splice(i,0,C.isc_info_sql_owner); }
           const F=require("node-firebird");
           F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
                     user:"SYSDBA",password:"masterkey"},(e,db)=>{
             if(e){console.log("CONN_ERR");process.exit(0);}
             db.newStatement(process.env.FC_Q,(e2,st)=>{
               if(e2){console.log("ERR "+(e2.message||"").split("\n")[0].slice(0,60));db.detach();process.exit(0);}
-              console.log(JSON.stringify((st.output||[]).map(v=>[v.field??"",v.alias??""])));
+              console.log(JSON.stringify((st.output||[]).map(v=>
+                [v.field??"",v.alias??"",v.relation??"",v.relationAlias??"",v.owner??"",v.relationSchema??""])));
               db.detach();process.exit(0);});});' 2>/dev/null)
         case "$r" in
             CONN_ERR|"") n=$((n + 1)); sleep 0.3 ;;
@@ -203,6 +219,85 @@ both "... and the expression may sit in the FIRST branch" "SELECT X + 1 FROM T U
 
 # --- 10b. folded EXISTS -------------------------------------------------
 both "a whole-item EXISTS describes as BOOL" "SELECT EXISTS(SELECT 1 FROM T) FROM RDB\$DATABASE"
+
+# --- 12. relation, relation_alias, owner, schema ------------------------
+# Every tuple above now carries [field, alias, relation, relationAlias,
+# owner, relationSchema]; the checks below pin the classes with a
+# DISTINCT relation rule. No expected values are written here - the
+# engine's answer IS the expectation, verbatim.
+
+# a table's own name is never the binding alias; a user alias is
+both "a table alias binds the relation" "SELECT X FROM T QA"
+both "a quoted table alias keeps its case" "SELECT X FROM T \"qa\""
+both "a star carries the relation per column" "SELECT * FROM T"
+both "a starred alias rides along" "SELECT * FROM T QA"
+both "a parameterised, ordered read keeps its relation" "SELECT X FROM T WHERE X > ? ORDER BY X"
+
+# system tables: schema SYSTEM, owner still SYSDBA
+both "RDB\$DATABASE is schema SYSTEM" "SELECT RDB\$RELATION_ID FROM RDB\$DATABASE"
+both "RDB\$RELATIONS is schema SYSTEM" "SELECT RDB\$RELATION_NAME FROM RDB\$RELATIONS"
+
+# joins: each column answers ITS side's relation and alias
+both "a join answers per-column relations" "SELECT T.X, U.Y FROM T JOIN U ON T.X = U.Y"
+both "join side aliases ride per column" "SELECT A.X, B.Y FROM T A JOIN U B ON A.X = B.Y"
+both "a self join distinguishes its two bindings" "SELECT A1.X, A2.S FROM T A1 JOIN T A2 ON A1.X = A2.X"
+
+# views: the view IS the relation; its NAME is not an alias
+both "a bare view has no relation alias" "SELECT VC FROM V1"
+both "a view alias binds the view" "SELECT VC FROM V1 VA"
+both "an expression view column still carries the view" "SELECT E FROM V2"
+both "a bare view in a join" "SELECT V1.VC, U.Y FROM V1 JOIN U ON V1.VC = U.Y"
+both "an aliased view in a join" "SELECT VA.VC, U.Y FROM V1 VA JOIN U ON VA.VC = U.Y"
+
+# derived tables: the base relation shines through, the alias binds it
+both "a derived table's base shines through" "SELECT C FROM (SELECT X AS C FROM T) DT"
+both "an inner alias is replaced by the derived one" "SELECT X FROM (SELECT X FROM T QI) DT"
+both "nested derived tables: the outermost alias wins" "SELECT X FROM (SELECT X FROM (SELECT X FROM T) D1) D2"
+
+# CTEs: the CTE's NAME is a binding alias - unlike a view's
+both "a bare CTE binds under its own name" "WITH W AS (SELECT X FROM T) SELECT X FROM W"
+both "a use-site alias beats the CTE name" "WITH W AS (SELECT X FROM T) SELECT X FROM W WW"
+both "a CTE over a view keeps the view as relation" "WITH W AS (SELECT VC FROM V1) SELECT VC FROM W"
+both "a CTE in a join" "WITH W AS (SELECT X FROM T) SELECT W.X, U.Y FROM W JOIN U ON W.X = U.Y"
+both "a recursive CTE binds under its name" "WITH RECURSIVE R AS (SELECT X FROM T UNION ALL SELECT X + 1 FROM R WHERE X < 3) SELECT X FROM R"
+
+# procedures: the procedure is the relation, no alias
+both "a selectable procedure is the relation" "SELECT R FROM PR"
+both "EXECUTE PROCEDURE carries the procedure" "EXECUTE PROCEDURE PR"
+
+# unions: the FIRST branch's relation AND alias, under the same
+# all-plain predicate the field name follows
+both "a mixed-relation union keeps the first branch's" "SELECT X FROM T UNION ALL SELECT Y FROM U"
+both "a union keeps the first branch's table alias" "SELECT X FROM T QA UNION ALL SELECT X FROM T"
+
+# FIRST/SKIP/DISTINCT pass the relation through
+both "FIRST passes the relation and alias through" "SELECT FIRST 1 X FROM T QA"
+both "DISTINCT passes the relation through" "SELECT DISTINCT X FROM T"
+
+# grouping: a plain key keeps its relation, an expression key none
+both "an aliased source reaches the group key" "SELECT X, COUNT(*) FROM T QA GROUP BY X"
+both "an expression group key has no relation" "SELECT X + 1 FROM T GROUP BY X + 1"
+both "a qualified join group key" "SELECT T.X, COUNT(*) FROM T JOIN U ON T.X = U.Y GROUP BY T.X"
+both "an aliased join group key" "SELECT A.X, COUNT(*) FROM T A JOIN U B ON A.X = B.Y GROUP BY A.X"
+
+# scalar subqueries: a plain inner column delegates its relation out,
+# and the sub's own FROM alias ESCAPES with it; an aggregate blanks all
+both "a scalar subquery delegates its relation" "SELECT (SELECT X FROM T WHERE X = 1) FROM RDB\$DATABASE"
+both "the inner FROM alias escapes the subquery" "SELECT (SELECT X FROM T QA WHERE X = 1) FROM RDB\$DATABASE"
+both "a correlated subquery carries the inner table" "SELECT X, (SELECT Y FROM U WHERE U.Y = T.X) FROM T"
+
+# RETURNING: the target table, never a binding alias
+both "INSERT RETURNING carries the table" "INSERT INTO T (X) VALUES (1) RETURNING X"
+both "a qualified RETURNING item stays unaliased" "INSERT INTO T (X) VALUES (1) RETURNING T.X"
+both "UPDATE RETURNING carries the table" "UPDATE T SET X = 1 WHERE X = 0 RETURNING X, S"
+both "DELETE RETURNING carries the table" "DELETE FROM T WHERE X = 0 RETURNING X"
+
+# NOT gated - fire-crab REFUSES these statements (probed "Dynamic SQL
+# Error" on its side, answered by the engine): a procedure alias
+# (SELECT PA.R FROM PR PA), an expression in RETURNING (RETURNING
+# X + 1), SELECT CURRENT_TIMESTAMP FROM RDB\$DATABASE, a star over a
+# join (SELECT * FROM T JOIN U - T's computed column refuses), and a
+# view in a union branch.
 
 # --- 11. shared refusals ------------------------------------------------
 a=$(describe "SELECT ? FROM T" "$PORT" "$A")

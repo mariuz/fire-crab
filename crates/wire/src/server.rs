@@ -1146,6 +1146,19 @@ struct ProjCol {
     /// `None` here means "same as `name`" - the pre-slice behavior, so
     /// an unconverted construction site stays byte-identical.
     fname: Option<String>,
+    /// describe item 17, the source RELATION - the named table, view or
+    /// procedure the column is read from (probed: a computed column and
+    /// an expression VIEW column both still carry theirs; any
+    /// select-list expression carries none). Item 18 (owner) and item
+    /// 33 (schema) are DERIVED from it at emission. `None` = "" - no
+    /// source relation.
+    relation: Option<String>,
+    /// describe item 25, the BINDING ALIAS - the innermost-query-level
+    /// alias binding the relation into the FROM: a user alias, a
+    /// derived table's alias (the OUTERMOST wins), or a CTE's name -
+    /// but never a view's or table's own name (probed: bare V1 answers
+    /// "", bare CTE W answers W). `None` = "".
+    rel_alias: Option<String>,
     field_id: usize,
     wire: Wire,
     sql_type: i32,
@@ -3642,6 +3655,10 @@ fn build_expr_col(
         // symbolic name, before DECODE desugared to CASE) - it assigns
         // fname after this returns
         fname: None,
+        // an expression reads from no ONE relation (probed: even
+        // `A + 0` answers empty relation/owner/schema)
+        relation: None,
+        rel_alias: None,
         field_id: 0,
         wire,
         sql_type,
@@ -3690,6 +3707,11 @@ fn build_projcols(
             // the catalog name; an alias applied later overwrites only
             // `name` (probed: X AS Z is field X, alias Z)
             fname: Some(rc.name.clone()),
+            // the CALLER knows which relation these columns are read
+            // from and stamps it; a synthetic view (derived table,
+            // bound CTE) passes its inner columns' own through instead
+            relation: None,
+            rel_alias: None,
             field_id: rc.field_id as usize,
             wire,
             sql_type: nullable(sql_type),
@@ -8027,6 +8049,11 @@ fn wrap_returning(
         cols.push(ProjCol {
             name: c.name.clone(),
             fname: None,
+            // probed: INSERT/UPDATE/DELETE RETURNING all answer the
+            // target table as the relation, and NO binding alias -
+            // even for a qualified `RETURNING T.A`
+            relation: Some(table.to_string()),
+            rel_alias: None,
             field_id: fid,
             wire,
             sql_type,
@@ -11190,6 +11217,14 @@ struct JoinSide {
     columns: Vec<RelationColumn>,
     descs: Vec<Descriptor>,
     offset: usize,
+    /// the source relation of each column, indexed by field id like
+    /// `descs`: one name for a whole table or view side, per-column for
+    /// a derived or bound side (whose inner query names its own)
+    rels: Vec<Option<String>>,
+    /// the alias binding this side into the FROM - the user's alias, a
+    /// derived table's, or a CTE's name; a table's or view's OWN name
+    /// is not one (probed: bare V1 in a join answers "")
+    rel_alias: Option<String>,
     /// columns a NATURAL join MERGED into the side before this one: they
     /// are still reachable QUALIFIED (`R.K`, which the engine allows)
     /// but a bare name means the other side's, and `*` emits the pair
@@ -11533,6 +11568,10 @@ fn plan_join_bound(
                 columns,
                 descs,
                 offset,
+                // the inner columns' own relations shine through; the
+                // derived table's alias (mandatory here) binds them
+                rels: inner_cols.iter().map(|c| c.relation.clone()).collect(),
+                rel_alias: tr.alias.map(str::to_string),
                 merged_away: Vec::new(),
             });
             continue;
@@ -11550,6 +11589,10 @@ fn plan_join_bound(
                 columns,
                 descs,
                 offset,
+                // plan_view stamped the view's name on every column;
+                // its OWN name never doubles as the binding alias
+                rels: view_cols.iter().map(|c| c.relation.clone()).collect(),
+                rel_alias: tr.alias.map(str::to_string),
                 merged_away: Vec::new(),
             });
             continue;
@@ -11565,6 +11608,10 @@ fn plan_join_bound(
                     columns,
                     descs,
                     offset,
+                    // a CTE's name IS a binding alias, unlike a view's
+                    // (probed: a bare recursive CTE R answers R)
+                    rels: bcols.iter().map(|c| c.relation.clone()).collect(),
+                    rel_alias: Some(tr.alias.unwrap_or(tr.table).to_string()),
                     merged_away: Vec::new(),
                 });
                 continue;
@@ -11587,6 +11634,7 @@ fn plan_join_bound(
         // right for two tables and silently wrong for three - the third
         // side's columns landed on top of the second's.
         let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
+        let rels = vec![Some(tr.table.to_string()); descs.len()];
         sides.push(JoinSide {
             key: tr.alias.unwrap_or(tr.table).to_string(),
             src: RowSource::TableScan {
@@ -11597,6 +11645,8 @@ fn plan_join_bound(
             columns,
             descs,
             offset,
+            rels,
+            rel_alias: tr.alias.map(str::to_string),
             merged_away: Vec::new(),
         });
     }
@@ -11724,8 +11774,26 @@ fn plan_join_bound(
             None => (Vec::new(), Vec::new()),
             Some(g) => parse_group_by(g, &items, &comb_cols, &comb_descs, synth_base)?,
         };
-        let (cols, mut gitems) =
+        let (mut cols, mut gitems) =
             build_group_items(&items, &comb_cols, &comb_descs, &key_fids, &key_exprs, synth_base)?;
+        // a PLAIN group key reads from the side it came from (probed:
+        // `GROUP BY T.B` keys answer relation T, and the side's alias);
+        // an expression key (a synthetic slot) reads from none
+        for (i, gi) in gitems.iter().enumerate() {
+            if let GItem::Key(fid) = gi {
+                if *fid < synth_base {
+                    if let (Some(side), Some(c)) = (
+                        sides
+                            .iter()
+                            .find(|s| *fid >= s.offset && *fid < s.offset + s.descs.len()),
+                        cols.get_mut(i),
+                    ) {
+                        c.relation = side.rels.get(fid - side.offset).cloned().flatten();
+                        c.rel_alias = side.rel_alias.clone();
+                    }
+                }
+            }
+        }
         let mut having_np = 0usize;
         let having = match having_s {
             None => None,
@@ -11795,6 +11863,11 @@ fn plan_join_bound(
                     cols.push(ProjCol {
                         name: rc.name.clone(),
                         fname: None,
+                        // each starred column reads from ITS side's
+                        // relation (probed: `T JOIN U` answers T,T,U,U
+                        // per column, side aliases riding along)
+                        relation: side.rels.get(rc.field_id as usize).cloned().flatten(),
+                        rel_alias: side.rel_alias.clone(),
                         field_id: idx,
                         wire,
                         sql_type: nullable(sql_type),
@@ -11829,6 +11902,12 @@ fn plan_join_bound(
                 };
                 let (idx, d, colname) = resolve_join_col(&sides, name)?;
                 let (wire, sql_type, length, scale, sub_type) = wire_for(d);
+                // the combined index maps back to the side it landed
+                // in, which knows the column's relation and its own
+                // binding alias
+                let side = sides
+                    .iter()
+                    .find(|s| idx >= s.offset && idx < s.offset + s.descs.len())?;
                 cols.push(ProjCol {
                     // An ALIAS names the output column here as it does
                     // everywhere else. Dropping it was not only a wrong
@@ -11842,6 +11921,8 @@ fn plan_join_bound(
                     // AX; a VIEW side is right by construction because
                     // plan_view renames both)
                     fname: Some(colname.to_string()),
+                    relation: side.rels.get(idx - side.offset).cloned().flatten(),
+                    rel_alias: side.rel_alias.clone(),
                     field_id: idx,
                     wire,
                     sql_type: nullable(sql_type),
@@ -12108,6 +12189,15 @@ fn plan_view(db: &Option<Database>, dbr: &Database, name: &str) -> Option<(Plan,
     if cols.is_empty() {
         return None;
     }
+    // The view IS the relation of every column it serves - including
+    // one whose body item is an EXPRESSION (probed: V2 over `X + 1`
+    // still answers relation V2), so the stamp is unconditional. Its
+    // own name is NOT a binding alias (probed: bare V1 answers "") and
+    // the body's inner aliases do not escape it.
+    for c in cols.iter_mut() {
+        c.relation = Some(name.to_string());
+        c.rel_alias = None;
+    }
     // A view NAMES its own columns - `CREATE VIEW V (A, B) AS SELECT
     // ID, SALARY ...` - and the catalog holds those names whether they
     // were written or inherited. The body supplies only the values.
@@ -12169,6 +12259,7 @@ fn plan_over_source(
     src: BoundSrc,
     db: &Option<Database>,
     params: &mut Vec<Option<Descriptor>>,
+    rel_alias: Option<&str>,
 ) -> Option<Plan> {
     let (proj_s, table_s, where_s, group_s, having_s, order_s) = split_query(sql)?;
     let (from, join) = parse_from(table_s)?;
@@ -12196,6 +12287,13 @@ fn plan_over_source(
         return None; // the bound name must BE the FROM
     }
     let alias = from.alias.unwrap_or(from.table);
+    // the OUTERMOST binding wins (probed: `((...) D1) D2` answers D2,
+    // and a use-site alias over a recursive CTE beats the CTE's name):
+    // a FROM-item alias here, else what the caller binds this source
+    // under - a derived table's alias, a CTE's name, or nothing for a
+    // bare view
+    let bind_alias: Option<String> =
+        from.alias.or(rel_alias).map(str::to_string);
     let (columns, descs) = derived_view(cols);
     // AGGREGATING the bound rows - `SELECT COUNT(*) FROM C`. A grouped
     // JOIN is already "fold this row source", so the same node serves
@@ -12230,6 +12328,12 @@ fn plan_over_source(
                 if let (Some(gc), Some(ic)) = (gcols.get_mut(i), cols.get(*fid)) {
                     gc.fname =
                         Some(ic.fname.clone().unwrap_or_else(|| ic.name.clone()));
+                    // the key's relation shines through from the inner
+                    // column, under this source's own binding alias -
+                    // which binds EVEN a relation-less column (probed:
+                    // `V.C` over `X + 1 AS C` answers "", alias V)
+                    gc.relation = ic.relation.clone();
+                    gc.rel_alias = bind_alias.clone();
                 }
             }
         }
@@ -12283,7 +12387,17 @@ fn plan_over_source(
     match parse_projection(&unq(proj_s))? {
         Proj::Star => {
             for (i, c) in cols.iter().enumerate() {
-                out_cols.push(ProjCol { field_id: i, expr: None, ..c.clone() });
+                // the inner relation shines through; the binding alias
+                // is OVERWRITTEN - outermost wins (probed: an inner
+                // `T QI` is replaced by the derived table's DT), and it
+                // binds even a relation-less column (probed: `V.C` over
+                // `X + 1 AS C` answers relation "", alias V)
+                out_cols.push(ProjCol {
+                    field_id: i,
+                    expr: None,
+                    rel_alias: bind_alias.clone(),
+                    ..c.clone()
+                });
             }
         }
         Proj::Items(items) => {
@@ -12307,6 +12421,12 @@ fn plan_over_source(
                                 .clone()
                                 .unwrap_or_else(|| cols[pc.field_id].name.clone()),
                         );
+                        // the relation too - and the binding alias is
+                        // this source's own, outermost wins, binding
+                        // even a relation-less column (probed: `V.C`
+                        // over `X + 1 AS C` answers "", alias V)
+                        pc.relation = cols[pc.field_id].relation.clone();
+                        pc.rel_alias = bind_alias.clone();
                         out_cols.push(pc);
                     }
                     SelItem::Expr(raw, n, fname) => {
@@ -13189,6 +13309,12 @@ fn plan_union(
                 } else {
                     Some(String::new())
                 },
+                // the SAME predicate carries the relation and its
+                // binding alias (probed: an all-plain union answers the
+                // FIRST branch's table AND its alias; any expression
+                // branch blanks all four relation-derived items)
+                relation: if all_plain[i] { c.relation.clone() } else { None },
+                rel_alias: if all_plain[i] { c.rel_alias.clone() } else { None },
                 ..c.clone()
             }
         })
@@ -13341,6 +13467,7 @@ fn plan_query_inner(
                         BoundSrc::Rows(frontier),
                         db,
                         &mut rec_params,
+                        Some(name),
                     );
                     let Some(step) = step.filter(|_| rec_params.is_empty()) else {
                         return Some({ if trace { eprintln!("[srv] recursive CTE refused: the recursive branch does not plan over the accumulated rows"); } Plan::Refused });
@@ -13370,6 +13497,8 @@ fn plan_query_inner(
                     }
                     None => (main.clone(), false, 0, None),
                 };
+                // the CTE's name IS the binding alias (probed: a bare
+                // recursive CTE R answers relation_alias R)
                 let plan = plan_over_source(
                     &final_sql,
                     name,
@@ -13377,6 +13506,7 @@ fn plan_query_inner(
                     BoundSrc::Rows(acc),
                     db,
                     params,
+                    Some(name),
                 );
                 let Some(plan) = plan else {
                     return Some({ if trace { eprintln!("[srv] recursive CTE refused: the final query does not plan over the accumulated rows"); } Plan::Refused });
@@ -13565,6 +13695,10 @@ fn plan_query_inner(
             .map(|(i, p)| ProjCol {
                 name: p.name.clone(),
                 fname: None,
+                // probed: EXECUTE PROCEDURE P answers the procedure as
+                // the relation of each output parameter, no alias
+                relation: Some(pname.clone()),
+                rel_alias: None,
                 field_id: i,
                 wire: Wire::Int64,
                 sql_type: 581, // nullable - see wire_for
@@ -13630,6 +13764,7 @@ fn plan_query_inner(
                 BoundSrc::Inner(inner),
                 db,
                 params,
+                Some(&alias),
             ) {
                 Some(p) => Some(p),
                 None => {
@@ -13703,7 +13838,7 @@ fn plan_query_inner(
                 // aliased or not). The text cannot carry that, so each
                 // whole-item subquery remembers its select-list position
                 // and the planned column is patched after the re-plan.
-                let fname_patches: Vec<(usize, String)> = subs
+                let fname_patches: Vec<(usize, String, Option<String>, Option<String>)> = subs
                     .iter()
                     .enumerate()
                     .filter_map(|(i, sub)| {
@@ -13720,13 +13855,14 @@ fn plan_query_inner(
                                 item.split_whitespace().collect::<Vec<_>>().join(" ");
                             squashed.eq_ignore_ascii_case(&exists_item)
                         }) {
-                            return Some((idx, "BOOL".to_string()));
+                            return Some((idx, "BOOL".to_string(), None, None));
                         }
                         let idx = items.iter().position(|item| {
                             let (body, _) = split_alias(item);
                             body.trim() == mark
                         })?;
-                        Some((idx, subquery_item_name(sub)?.0))
+                        let (rel, ralias) = subquery_source(sub);
+                        Some((idx, subquery_item_name(sub)?.0, rel, ralias))
                     })
                     .collect();
                 let mut proj_out = folded.clone();
@@ -13838,7 +13974,7 @@ fn plan_query_inner(
                 }
                 params.clear();
                 let mut plan = plan_query_inner(&out, db, params)?;
-                for (idx, fname) in &fname_patches {
+                for (idx, fname, rel, ralias) in &fname_patches {
                     match &mut plan {
                         Plan::Project { cols, .. }
                         | Plan::Join { cols, .. }
@@ -13849,8 +13985,15 @@ fn plan_query_inner(
                         | Plan::Rows { cols, .. } => {
                             if let Some(c) = cols.get_mut(*idx) {
                                 c.fname = Some(fname.clone());
+                                c.relation = rel.clone();
+                                c.rel_alias = ralias.clone();
                             }
                         }
+                        // a plain-column sub folds to a literal
+                        // PROJECTION over the outer FROM, never to a
+                        // Scalar - only aggregate/expression subs (all
+                        // relation-empty, like Scalar's own column)
+                        // reach this arm, so fname is the whole patch
                         Plan::Scalar(_, _, f) if *idx == 0 => {
                             *f = Some(fname.clone());
                         }
@@ -13991,6 +14134,10 @@ fn plan_query_inner(
                             // the declared output parameter is the field
                             // name (probed: R AS RR is field R, alias RR)
                             fname: Some(out_names[*p].clone()),
+                            // probed: `FROM P(1)` answers the PROCEDURE
+                            // as the relation, and no binding alias
+                            relation: Some(pname.clone()),
+                            rel_alias: None,
                             field_id: i,
                             wire: Wire::Int64,
                             sql_type: 581,
@@ -14031,6 +14178,9 @@ fn plan_query_inner(
                         BoundSrc::Inner(inner),
                         db,
                         params,
+                        // the USER's alias only - a bare view's own
+                        // name is not a binding (probed: bare V1 -> "")
+                        from.alias,
                     ) {
                         Some(p) => Some(p),
                         None => Some(Plan::Refused),
@@ -14218,7 +14368,15 @@ fn plan_query_inner(
             if group_s.is_some() || having_s.is_some() {
                 return None;
             }
-            let cols = build_projcols(&["*".to_string()], &columns, &descs, &computed)?;
+            let mut cols = build_projcols(&["*".to_string()], &columns, &descs, &computed)?;
+            // every starred column - computed ones included - reads
+            // from THIS relation (probed: `SELECT C FROM T` over a
+            // COMPUTED BY column still answers relation T)
+            for c in cols.iter_mut() {
+                c.relation = Some(table.to_string());
+                c.rel_alias = left.alias.map(str::to_string);
+            }
+            let cols = cols;
             let order_by = match order_s {
                 None => Vec::new(),
                 Some(os) => parse_order_by_expr(
@@ -14376,8 +14534,15 @@ fn plan_query_inner(
                     // the alias is applied positionally below, where
                     // both branches of this `if` meet
                     SelItem::Col(name, _) => {
-                        let one = build_projcols(&[name.clone()], &columns, &descs, &computed)?;
-                        out.push(one.into_iter().next()?);
+                        let mut one =
+                            build_projcols(&[name.clone()], &columns, &descs, &computed)?
+                                .into_iter()
+                                .next()?;
+                        // a bare column reads from this relation; the
+                        // expression and generator items around it do not
+                        one.relation = Some(table.to_string());
+                        one.rel_alias = left.alias.map(str::to_string);
+                        out.push(one);
                     }
                     SelItem::Expr(e, alias, fname) => {
                         let mut pc = build_expr_col(e, alias, &columns, &descs)?;
@@ -14396,6 +14561,9 @@ fn plan_query_inner(
                             fname: Some(
                                 if step.is_none() { "NEXT_VALUE" } else { "GEN_ID" }.into(),
                             ),
+                            // a generator advance reads no relation
+                            relation: None,
+                            rel_alias: None,
                             field_id: value_index,
                             wire: Wire::Int64,
                             // and different NULLABILITY, from the same
@@ -14425,7 +14593,12 @@ fn plan_query_inner(
                     _ => unreachable!(),
                 })
                 .collect();
-            build_projcols(&collist, &columns, &descs, &computed)?
+            let mut cols = build_projcols(&collist, &columns, &descs, &computed)?;
+            for c in cols.iter_mut() {
+                c.relation = Some(table.to_string());
+                c.rel_alias = left.alias.map(str::to_string);
+            }
+            cols
         };
         // An ALIAS renames the output column - `NAME AS X` describes X.
         // Applied here rather than in each branch above, and positionally
@@ -14501,7 +14674,10 @@ fn plan_query_inner(
 
     // grouped query: GROUP BY, or a multi-aggregate global projection
     // (including a lone parameterised aggregate, deferred to fetch)
-    match plan_group(&items, group_s, having_s, order_s, rel, formats, &columns, &descs, filter) {
+    match plan_group(
+        &items, group_s, having_s, order_s, rel, formats, &columns, &descs, filter, table,
+        left.alias,
+    ) {
         Some(Plan::Group {
             rel,
             formats,
@@ -14917,6 +15093,8 @@ fn build_group_items(
                 cols.push(ProjCol {
                     name: name.clone(),
                     fname: Some(fname.clone()),
+                    relation: None,
+                    rel_alias: None,
                     field_id: out_idx,
                     wire: Wire::Int64,
                     sql_type: 581,
@@ -14938,6 +15116,8 @@ fn build_group_items(
                 cols.push(ProjCol {
                     name: pc.name,
                     fname: Some(fname.clone()),
+                    relation: None,
+                    rel_alias: None,
                     field_id: out_idx,
                     wire: pc.wire,
                     sql_type: pc.sql_type,
@@ -14968,6 +15148,11 @@ fn build_group_items(
                     // answers a column titled ID)
                     name: alias.clone().unwrap_or_else(|| bare.clone()),
                     fname: Some(bare),
+                    // the CALLER stamps a key's relation - it knows
+                    // whether the key is a table's, a side's, or a
+                    // derived source's column
+                    relation: None,
+                    rel_alias: None,
                     field_id: out_idx,
                     wire,
                     sql_type: nullable(sql_type),
@@ -15113,6 +15298,10 @@ fn build_group_items(
                 cols.push(ProjCol {
                     name,
                     fname: Some(fname),
+                    // probed: an aggregate answers no relation even
+                    // when its argument is a plain column
+                    relation: None,
+                    rel_alias: None,
                     field_id: out_idx,
                     wire,
                     sql_type: nullable(sql_type),
@@ -15241,6 +15430,8 @@ fn plan_group(
     columns: &[RelationColumn],
     descs: &[Descriptor],
     filter: Option<Predicate>,
+    rel_name: &str,
+    rel_alias: Option<&str>,
 ) -> Option<Plan> {
     // grouping decodes records, which needs the relation's formats: a
     // relation without any (a system relation) cannot be answered here -
@@ -15260,8 +15451,23 @@ fn plan_group(
         None => (Vec::new(), Vec::new()),
         Some(g) => parse_group_by(g, items, columns, descs, synth_base)?,
     };
-    let (cols, mut gitems) =
+    let (mut cols, mut gitems) =
         build_group_items(items, columns, descs, &key_fids, &key_exprs, synth_base)?;
+    // a PLAIN group key reads from the grouped relation (probed:
+    // `SELECT B, COUNT(*) ... GROUP BY B` answers relation T on the
+    // key, "" on the fold); an expression key - a synthetic slot at or
+    // past synth_base - reads from none
+    for (i, gi) in gitems.iter().enumerate() {
+        if let GItem::Key(fid) = gi {
+            if *fid < synth_base {
+                if let Some(c) = cols.get_mut(i) {
+                    c.relation = Some(rel_name.to_string());
+                    c.rel_alias = rel_alias.map(str::to_string);
+                }
+            }
+        }
+    }
+    let cols = cols;
     // HAVING filters the computed output rows (may append hidden gitems);
     // `?` in HAVING is not supported - the resolver refuses the slots
     // (the throwaway counter just satisfies the parser)
@@ -16493,6 +16699,8 @@ fn bigint_col(n: usize) -> ProjCol {
     ProjCol {
         name: format!("C{}", n),
         fname: None,
+        relation: None,
+        rel_alias: None,
         field_id: n,
         wire: Wire::Int64,
         sql_type: 581, // nullable - see wire_for
@@ -16516,6 +16724,8 @@ fn output_cols_of(plan: &Plan) -> Vec<ProjCol> {
         Plan::Scalar(_, name, fname) => vec![ProjCol {
             name: name.clone(),
             fname: fname.clone(),
+            relation: None,
+            rel_alias: None,
             field_id: 0,
             wire: Wire::Int64,
             sql_type: 581,
@@ -16530,6 +16740,8 @@ fn output_cols_of(plan: &Plan) -> Vec<ProjCol> {
             // is GEN_ID/GEN_ID - this path answered GEN_ID for both)
             name: if step.is_none() { "NEXT_VALUE" } else { "GEN_ID" }.into(),
             fname: None,
+            relation: None,
+            rel_alias: None,
             field_id: 0,
             wire: Wire::Int64,
             sql_type: 581,
@@ -16603,6 +16815,10 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         length: i32,
         fname: String,
         name: String,
+        /// item 17; items 18 (owner) and 33 (schema) derive from it
+        relation: String,
+        /// item 25
+        rel_alias: String,
     }
     let out_vars: Vec<Var> = output_cols_of(plan)
         .into_iter()
@@ -16613,6 +16829,8 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
             length: c.length,
             fname: c.fname.clone().unwrap_or_else(|| c.name.clone()),
             name: c.name,
+            relation: c.relation.unwrap_or_default(),
+            rel_alias: c.rel_alias.unwrap_or_default(),
         })
         .collect();
     let bind_vars: Vec<Var> = params
@@ -16626,6 +16844,8 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
                 length,
                 fname: String::new(),
                 name: String::new(),
+                relation: String::new(),
+                rel_alias: String::new(),
             }
         })
         .collect();
@@ -16674,11 +16894,38 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
                             14 => int_item(&mut d, 14, v.length),
                             15 => int_item(&mut d, 15, 0), // null_ind
                             16 => str_item(&mut d, 16, &v.fname), // field
-                            17 => str_item(&mut d, 17, ""),      // relation
-                            18 => str_item(&mut d, 18, ""),      // owner
+                            17 => str_item(&mut d, 17, &v.relation),
+                            // probed: owner is SYSDBA exactly when a
+                            // relation is answered - uniformly, RDB$
+                            // tables included (a non-SYSDBA-owned
+                            // relation is a recorded boundary: every
+                            // gate database is created as SYSDBA and
+                            // fc's own DDL writes the attaching owner)
+                            18 => str_item(
+                                &mut d,
+                                18,
+                                if v.relation.is_empty() { "" } else { "SYSDBA" },
+                            ),
                             19 => str_item(&mut d, 19, &v.name), // alias
-                            33 => str_item(&mut d, 33, "PUBLIC"), // schema (FB6)
-                            34 => str_item(&mut d, 34, ""), // relation_alias
+                            // relation_alias is 25 (inf_pub.h); the
+                            // engine ANSWERS it for every variable,
+                            // empty payload when there is no alias
+                            25 => str_item(&mut d, 25, &v.rel_alias),
+                            // schema (FB6): SYSTEM for system tables,
+                            // PUBLIC for user relations, "" when the
+                            // variable reads from no relation (probed
+                            // in all three directions)
+                            33 => str_item(
+                                &mut d,
+                                33,
+                                if v.relation.is_empty() {
+                                    ""
+                                } else if v.relation.starts_with("RDB$") {
+                                    "SYSTEM"
+                                } else {
+                                    "PUBLIC"
+                                },
+                            ),
                             _ => {}
                         }
                     }
@@ -21847,7 +22094,14 @@ fn plan_correlated_select(
         return Some(Plan::Refused);
     }
     // one lookup table per correlated item, each scanned once here
-    let mut lookups: Vec<(usize, Expr, Descriptor, (String, String))> = Vec::new();
+    #[allow(clippy::type_complexity)]
+    let mut lookups: Vec<(
+        usize,
+        Expr,
+        Descriptor,
+        (String, String),
+        (Option<String>, Option<String>),
+    )> = Vec::new();
     for (marker, sub) in correlated {
         let Some((lookup, result_desc)) = build_correlated_lookup(sub, db, &columns, &descs)
         else {
@@ -21862,6 +22116,9 @@ fn plan_correlated_select(
             result_desc,
             subquery_item_name(sub)
                 .unwrap_or_else(|| ("CONSTANT".to_string(), "CONSTANT".to_string())),
+            // probed: a correlated sub delegates its relation exactly
+            // as the constant fold does (inner D from U answers U)
+            subquery_source(sub),
         ));
     }
 
@@ -21896,9 +22153,9 @@ fn plan_correlated_select(
     let mut cols: Vec<ProjCol> = Vec::new();
     for item in split_top_level_commas(proj_marked) {
         let (body, alias) = split_alias(item);
-        if let Some((_, lookup, result_desc, (ifname, iname))) = lookups
+        if let Some((_, lookup, result_desc, (ifname, iname), (irel, iralias))) = lookups
             .iter()
-            .find(|(m, _, _, _)| body.trim() == format!("{}{}", SUBQ_MARK, m))
+            .find(|(m, _, _, _, _)| body.trim() == format!("{}{}", SUBQ_MARK, m))
         {
             let (wire, sql_type, length, scale, sub_type) = wire_for(result_desc);
             cols.push(ProjCol {
@@ -21911,6 +22168,8 @@ fn plan_correlated_select(
                     .map(|a| a.trim_matches('"').to_ascii_uppercase())
                     .unwrap_or_else(|| iname.clone()),
                 fname: Some(ifname.clone()),
+                relation: irel.clone(),
+                rel_alias: iralias.clone(),
                 field_id: 0,
                 wire,
                 sql_type: nullable(sql_type),
@@ -21930,6 +22189,9 @@ fn plan_correlated_select(
                     if let Some(a) = alias {
                         pc.name = a;
                     }
+                    // an outer plain column reads from the outer table
+                    pc.relation = Some(table.to_string());
+                    pc.rel_alias = from.alias.map(str::to_string);
                     cols.push(pc);
                 }
                 SelItem::Expr(raw, name, fname) => {
@@ -21993,6 +22255,35 @@ fn subquery_item_name(sub: &str) -> Option<(String, String)> {
         },
         Proj::Star => None,
     }
+}
+
+/// The (relation, binding alias) a whole-item scalar subquery hands its
+/// output column - probed: the sub DELEGATES these like it does the two
+/// names. A plain inner column carries the sub's FROM relation (a view
+/// name stays the view name) and the sub's own FROM alias ESCAPES with
+/// it (`(SELECT A FROM T QA)` answers relation T, relation_alias QA);
+/// an aggregate or expression item answers neither.
+fn subquery_source(sub: &str) -> (Option<String>, Option<String>) {
+    let item_is_col = split_query(sub)
+        .and_then(|(p, ..)| parse_projection(p))
+        .is_some_and(|proj| {
+            matches!(proj, Proj::Items(v) if matches!(v.first(), Some(SelItem::Col(..))))
+        });
+    if !item_is_col {
+        return (None, None);
+    }
+    let Some((from, joins)) = split_query(sub).and_then(|(_, t, ..)| parse_from(t)) else {
+        return (None, None);
+    };
+    // a joined or derived FROM inside the sub is not a shape whose
+    // relation this fold can name - "" is the honest answer
+    if !joins.is_empty() || from.table.starts_with('(') {
+        return (None, None);
+    }
+    (
+        Some(from.table.to_string()),
+        from.alias.map(str::to_string),
+    )
 }
 
 /// Build a CORRELATED scalar subquery's answer as a LOOKUP TABLE.
@@ -30452,6 +30743,8 @@ mod tests {
         let pc = ProjCol {
             name: "Y".into(),
             fname: Some("ADD".into()),
+            relation: None,
+            rel_alias: None,
             field_id: 0,
             wire: Wire::Int64,
             sql_type: 580,
@@ -30474,6 +30767,81 @@ mod tests {
         };
         assert_eq!(find(16), "ADD");
         assert_eq!(find(19), "Y");
+    }
+
+    #[test]
+    fn describe_answers_relation_owner_alias_and_schema() {
+        // three variables: a user-table column bound under an alias, a
+        // system-table one, and an expression. Probed: item 18 (owner)
+        // is SYSDBA exactly when item 17 (relation) is non-empty, item
+        // 33 (schema) is SYSTEM for RDB$* / PUBLIC for user relations /
+        // "" alongside an empty 17, and the binding alias is item 25 -
+        // the engine answers it for EVERY variable (empty payload when
+        // there is no alias); item 34 does not exist in inf_pub.h.
+        let pc = |relation: Option<&str>, rel_alias: Option<&str>| ProjCol {
+            name: "X".into(),
+            fname: None,
+            relation: relation.map(str::to_string),
+            rel_alias: rel_alias.map(str::to_string),
+            field_id: 0,
+            wire: Wire::Int64,
+            sql_type: 580,
+            length: 8,
+            scale: 0,
+            sub_type: 0,
+            expr: None,
+        };
+        let plan = Plan::Rows {
+            cols: vec![
+                pc(Some("T"), Some("QA")),
+                pc(Some("RDB$DATABASE"), None),
+                pc(None, None),
+            ],
+            rows: Vec::new(),
+        };
+        let d = answer_prepare(&[4, 9, 17, 18, 25, 33, 8], &plan, &[]);
+        // every answered item is code + u16 length + payload; the
+        // section tag (4), each var's describe_end (8) and the final
+        // isc_info_end (1) travel bare
+        assert_eq!(d[0], 4);
+        let mut vars: Vec<Vec<(u8, String)>> = vec![Vec::new()];
+        let mut i = 1;
+        while i < d.len() && d[i] != 1 {
+            if d[i] == 8 {
+                vars.push(Vec::new());
+                i += 1;
+                continue;
+            }
+            let code = d[i];
+            let len = u16::from_le_bytes([d[i + 1], d[i + 2]]) as usize;
+            if matches!(code, 17 | 18 | 25 | 33) {
+                let s = String::from_utf8_lossy(&d[i + 3..i + 3 + len]).into_owned();
+                vars.last_mut().unwrap().push((code, s));
+            }
+            i += 3 + len;
+        }
+        let var = |n: usize, code: u8| -> String {
+            vars[n]
+                .iter()
+                .find(|(c, _)| *c == code)
+                .map(|(_, s)| s.clone())
+                .unwrap_or_else(|| panic!("var {} item {} not answered", n, code))
+        };
+        assert_eq!(var(0, 17), "T");
+        assert_eq!(var(0, 18), "SYSDBA");
+        assert_eq!(var(0, 25), "QA");
+        assert_eq!(var(0, 33), "PUBLIC");
+        assert_eq!(var(1, 17), "RDB$DATABASE");
+        assert_eq!(var(1, 18), "SYSDBA"); // uniform, RDB$ included
+        assert_eq!(var(1, 25), "");
+        assert_eq!(var(1, 33), "SYSTEM");
+        assert_eq!(var(2, 17), "");
+        assert_eq!(var(2, 18), ""); // no relation, no owner
+        assert_eq!(var(2, 25), "");
+        assert_eq!(var(2, 33), ""); // no relation, no schema
+        // 34 names no item: the writer omits it rather than answering
+        let d = answer_prepare(&[4, 34, 8], &plan, &[]);
+        assert_eq!(d, vec![4, 8, 8, 8, 1]);
     }
 
     #[test]
@@ -30755,8 +31123,8 @@ mod tests {
         );
         // ORDER BY resolution: ordinal into the projection, and by name
         let cols = vec![
-            ProjCol { name: "ID".into(), fname: None, field_id: 3, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0, sub_type: 0, expr: None },
-            ProjCol { name: "NAME".into(), fname: None, field_id: 1, wire: Wire::Varying, sql_type: 448, length: 32765, scale: 0, sub_type: 0, expr: None },
+            ProjCol { name: "ID".into(), fname: None, relation: None, rel_alias: None, field_id: 3, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0, sub_type: 0, expr: None },
+            ProjCol { name: "NAME".into(), fname: None, relation: None, rel_alias: None, field_id: 1, wire: Wire::Varying, sql_type: 448, length: 32765, scale: 0, sub_type: 0, expr: None },
         ];
         let columns = vec![
             RelationColumn { name: "ID".into(), field_id: 3, position: 0 },
@@ -31091,6 +31459,8 @@ mod tests {
                 ],
                 descs: vec![d(dtype::LONG), d(dtype::LONG), d(dtype::VARYING)],
                 offset: 0,
+                rels: vec![Some("EMP".into()); 3],
+                rel_alias: Some("E".into()),
                 merged_away: Vec::new(),
             },
             JoinSide {
@@ -31102,6 +31472,8 @@ mod tests {
                 ],
                 descs: vec![d(dtype::LONG), d(dtype::VARYING)],
                 offset: 3,
+                rels: vec![Some("DEPT".into()); 2],
+                rel_alias: Some("D".into()),
                 merged_away: Vec::new(),
             },
         ]
@@ -31341,6 +31713,8 @@ mod tests {
     fn encodes_native_wire_values() {
         let pc = |wire, sql_type, length, scale| ProjCol {
             fname: None,
+            relation: None,
+            rel_alias: None,
             name: "C".into(), field_id: 0, wire, sql_type, length, scale, sub_type: 0, expr: None,
         };
         let enc = |col: ProjCol, v: Value| {
@@ -31383,8 +31757,8 @@ mod tests {
     fn encodes_row_bitmap_and_values() {
         // two INT64 cols, second null: 4-byte bitmap (bit 1 set) + one 8-byte value
         let cols = vec![
-            ProjCol { name: "A".into(), fname: None, field_id: 0, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0, sub_type: 0, expr: None },
-            ProjCol { name: "B".into(), fname: None, field_id: 1, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0, sub_type: 0, expr: None },
+            ProjCol { name: "A".into(), fname: None, relation: None, rel_alias: None, field_id: 0, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0, sub_type: 0, expr: None },
+            ProjCol { name: "B".into(), fname: None, relation: None, rel_alias: None, field_id: 1, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0, sub_type: 0, expr: None },
         ];
         let values = vec![Value::Int(7), Value::Null];
         let mut w = W::default();
@@ -32875,6 +33249,8 @@ mod tests {
         // part after the dot.
         let col = |name: &str, fid: usize| ProjCol {
             fname: None,
+            relation: None,
+            rel_alias: None,
             name: name.into(),
             field_id: fid,
             wire: Wire::Int64,

@@ -364,8 +364,29 @@ four; R7 is the removal of what they replaced.
   Residual, flagged not gated: a derived table as a JOIN side loses
   base-name propagation (`resolve_join_col` works over synthetic
   `RelationColumn`s, an ods catalog type that should not grow a wire
-  concern); and items 17/18 (relation/owner) still answer `""` where
-  the engine names the table/view/procedure — its own slice.
+  concern).
+
+- ~~Describe items 17 (relation), 18 (owner) answer `""`~~ — *fixed*,
+  and the item numbers in the plan were themselves wrong: the
+  relation ALIAS is item 25, not 34 — fire-crab's 34 arm was DEAD CODE
+  no client ever requests, and the engine answers 25 (empty payload)
+  for every query while fire-crab OMITTED it, invisible to a
+  field+alias comparison. `ProjCol` carries `relation`/`rel_alias`
+  (None = `""`); owner derives at emission (SYSDBA iff a relation is
+  answered — uniform, RDB$ tables included; a non-SYSDBA owner is a
+  recorded boundary); item 33 (schema) was wrong in BOTH directions
+  (SYSTEM tables got PUBLIC, expressions got PUBLIC instead of `""`)
+  and now follows the same relation knowledge. The probed laws: a
+  view's own name is NOT a binding alias but a CTE's name IS; an
+  expression view column still carries the view as relation; a
+  derived table lets the base relation shine through under the
+  OUTERMOST alias; an inner subquery FROM alias escapes the fold; a
+  union carries the first branch's relation and alias under the same
+  all-plain predicate as the field name; and a BINDING ALIAS does NOT
+  need a relation (`(SELECT X+1 AS C FROM T) V` answers relation `""`,
+  alias `V` — refuting the first draft of the rule).
+  `qa/serve-real-describe.sh` is 107 checks comparing all six describe
+  strings.
 
 - ~~A generator inside an EXPRESSION~~ — *fixed*. `RawExpr::Gen` is a
   leaf on the `RawExpr::Agg` pattern: not resolvable on its own, the
