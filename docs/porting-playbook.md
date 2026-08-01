@@ -2128,6 +2128,13 @@ them.
   an error. **When a statement fails, find every gate it must pass, not
   the first one that rejects it.**
 
+- **A gate that cannot be EXECUTED fails in the safe-looking direction,
+  twice.** One gate here sat at mode 644 for a day. A runner that counts
+  DIFF lines sees a clean result, because "Permission denied" contains
+  none; a runner that checks exit codes sees rc=126 and no explanation.
+  Neither reading says "this measured nothing". It is the same class as a
+  squatted port or an empty fixture, and the self-check now covers it.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

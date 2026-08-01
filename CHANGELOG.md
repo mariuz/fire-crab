@@ -13,6 +13,61 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — A write that relabelled the row it wrote
+
+A fleet asked to design fragmented-record rewriting found, on the way, a
+corruption reachable **today, on ordinary unfragmented rows**.
+
+### Fixed
+- **`patch_sys_row` poked at the wrong format's offsets and then
+  relabelled the record.** It took `formats.iter().max_by_key(…)` — the
+  relation's NEWEST format — and used that format's field offsets to poke
+  an image it had decoded at *the record's own* format, then stamped the
+  record with the newest format number.
+
+  On a row written under an older format that lands the write on the
+  wrong bytes AND relabels the row, so every later read decodes the whole
+  thing at offsets it was never written with. **`gfix -v -full` calls the
+  result clean** — the page structure is intact and only the values are
+  wrong, which is the worst kind of damage this project can do.
+
+  It needs a system relation carrying more than one format to fire, so it
+  has been latent rather than absent. It has nothing to do with
+  fragmentation; that is simply what the fleet was looking at when it
+  saw it.
+
+- **One gate could not be run at all.** `serve-real-comment.sh` sat at
+  mode 644. Nothing failed: a runner counting DIFF lines sees a clean
+  result, because "Permission denied" contains none, and a runner
+  checking exit codes sees rc=126 with no explanation. Both readings are
+  wrong in the safe-looking direction, which is the same class as a
+  squatted port or an empty fixture. `qa/gate-selfcheck.sh` grows a
+  seventh check for it; the gate itself passes 20/20 now that it can run.
+
+### Recorded: the head-in-place rewrite is sound, and the count was not
+The fleet's proposal — poke a fragmented record's HEAD in place, refuse
+when the field lives in the tail — **survived its refutation on the
+mechanism and failed on the arithmetic**, which is the useful outcome.
+
+Verified independently by the refuter: the head is a byte-prefix of the
+assembled image in 266/266 cases, every poke is head-resident (88/88 and
+178/178), 155 index rows fit their existing slot with none needing
+relocation, and a full column-by-column differential of all 650
+`RDB$INDICES` rows against an untouched baseline is byte-identical
+including tail-resident `RDB$SCHEMA_NAME`, with `gfix` clean. It also
+completed the `COMMENT ON` half the original never validated end to end:
+88 rows poked, comment text readable **through the engine**.
+
+But "fixes all 180" is wrong twice over. The real total is **184**
+fragmentation-caused refusals — 88 `COMMENT ON`, 92 `DROP INDEX`, and 4
+more the original's model could not see — and the slice fixes **179**.
+Five indexes each own a fragmented `RDB$INDEX_SEGMENTS` row, deleted
+through the same rejecting path. That is the next increment, and it now
+has an honest number attached.
+
+388 unit tests; alter, comment, comment2, restored, syscat gates clean;
+gate-selfcheck 7/7.
+
 ## 2026-08-01 — The same disease at the next call site
 
 `catalog::relation_columns` is now memoised for system relations, the way

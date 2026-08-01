@@ -5703,18 +5703,35 @@ fn patch_sys_row(
 ) -> Result<(), String> {
     let formats =
         system_relation_formats(file, page_size, rel_name).ok_or("no computed system format")?;
-    let (format_no, descs) = {
-        let (n, d) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
-        (*n, d.clone())
-    };
     let (page, slot) = find_sys_row_slot(file, page_size, rel_name, rel, pred)
         .ok_or_else(|| format!("no matching {} row", rel_name))?;
-    let mut image = {
+    // THE ROW'S OWN FORMAT, NOT THE NEWEST ONE.
+    //
+    // This used to take `formats.iter().max_by_key(...)` - the relation's
+    // LATEST format - and then poke the image at that format's field
+    // OFFSETS and re-stamp the record with that format NUMBER. The image
+    // itself was decoded at the record's own format, so on a row written
+    // under an older format the poke landed on the wrong bytes AND the
+    // row was relabelled as the newer shape, which makes every later read
+    // decode the WHOLE row at offsets it was never written with.
+    //
+    // It leaves a file `gfix -v -full` calls clean, which is the worst
+    // kind: the page structure is intact and only the values are wrong.
+    // It needs a system relation carrying more than one format to fire,
+    // so it has been latent rather than absent - and it is reachable on
+    // ORDINARY rows, nothing to do with fragmentation.
+    let (mut image, format_no) = {
         let start = page as usize * page_size;
         let dp = DataPage::decode(file.get(start..start + page_size).ok_or("bad page")?)
             .ok_or("bad data page")?;
-        dp.record(slot).and_then(|r| r.image()).ok_or("no row image")?
+        let r = dp.record(slot).ok_or("no row image")?;
+        (r.image().ok_or("no row image")?, r.format)
     };
+    let descs = formats
+        .iter()
+        .find(|(n, _)| *n == format_no)
+        .map(|(_, d)| d.clone())
+        .ok_or("the row's format is not among the relation's computed formats")?;
     let columns = relation_columns(file, page_size, rel_name);
     for (name, v) in values {
         let fid = columns

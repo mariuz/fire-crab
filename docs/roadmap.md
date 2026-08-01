@@ -103,6 +103,26 @@ four; R7 is the removal of what they replaced.
   boundary. `fcstat`, `exe` and `sysfmt` still use the old path and are
   incremental work.
 
+- **The head-in-place rewrite: sound, and worth 179 of 184.** Poke a
+  fragmented record's HEAD in place and refuse when the field lives in
+  the tail. Validated against the live engine by an adversarial pass -
+  head is a byte-prefix of the assembled image 266/266, every poke
+  head-resident, 155 index rows fit their slot with none relocated, full
+  column differential byte-identical including tail fields, `gfix` clean,
+  and `COMMENT ON` text readable through the engine after 88 pokes.
+  Needs a `patch_head_in_place` helper in `dml.rs` guarded on "every
+  poked range ends within the head's unpacked length", the five `ddl.rs`
+  sites routed through it when `INCOMPLETE` is set, and
+  `deferred_drop_index`'s `maintain_indexes` call kept.
+
+  It does NOT need the four missing machinery items (rhdf writer, packed
+  stream truncate, tail teardown, page compaction) and should not acquire
+  them: each is a new way to write into a user's database, and nothing in
+  the 184 statements needs one.
+
+  **The remaining 5** are indexes owning a fragmented
+  `RDB$INDEX_SEGMENTS` row, deleted via the same guard.
+
 - **Fixing those two DDL reads will NOT fix them, and that is the trap.**
   Both `patch_sys_row` and `deferred_drop_index` write back through
   `dml::update_records`, and `dml::push_back_version`

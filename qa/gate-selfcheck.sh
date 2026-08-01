@@ -180,8 +180,29 @@ else
     fail=1
 fi
 
-if [ "$ran" -lt 6 ]; then
-    echo "DIFF only $ran checks ran (expected 6)"
+# --- 6. every gate must be EXECUTABLE ---------------------------------
+# `serve-real-comment.sh` sat at mode 644 for a day. Nothing failed:
+# a sweep that runs `qa/x.sh` gets "Permission denied" and rc=126, which
+# has NO DIFF lines in it, so a runner counting DIFFs sees a clean gate
+# and a runner counting exit codes sees a failure it cannot explain. Both
+# readings are wrong in the safe-looking direction.
+#
+# This is the same failure as a gate whose port is taken or whose fixture
+# is empty: it did not measure anything, and it did not say so.
+ran=$((ran + 1))
+noexec=""
+for g in qa/*.sh; do
+    [ -x "$g" ] || noexec="$noexec $(basename "$g")"
+done
+if [ -z "$noexec" ]; then
+    echo "OK   every gate is executable ($(ls qa/*.sh | wc -l) files)"
+else
+    echo "DIFF gates that cannot be run at all (mode is not +x):$noexec"
+    fail=1
+fi
+
+if [ "$ran" -lt 7 ]; then
+    echo "DIFF only $ran checks ran (expected 7)"
     fail=1
 fi
 exit $fail
