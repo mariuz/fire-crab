@@ -393,8 +393,18 @@ SQL
     fi
   done
 done
-if [ $swrong -eq 0 ]; then
-    echo "OK   stale-statistics grid: $smatched exact, $srefused refused, ZERO wrong"
+# THE LENIENCY IS GONE. This phase used to pass on "zero wrong" however
+# many cells were REFUSED - the right rule while the crate declined to
+# cost a zero statistic, and the wrong one now that it substitutes
+# DEFAULT_SELECTIVITY like the engine (Retrieval.cpp:1019-1026). A model
+# that refuses everything must not score a clean sheet, so the stale grid
+# is now held to the same standard as the fresh one: every cell exact,
+# nothing refused.
+if [ $swrong -eq 0 ] && [ $srefused -eq 0 ] && [ $smatched -eq 169 ]; then
+    echo "OK   stale-statistics grid: all 169 cells planned EXACTLY, zero refused"
+elif [ $swrong -eq 0 ]; then
+    echo "DIFF stale-statistics grid: $smatched exact but $srefused REFUSED - the engine answers every one"
+    fail=1
 else
     echo "DIFF stale-statistics grid: $swrong cells planned WRONGLY"
     fail=1

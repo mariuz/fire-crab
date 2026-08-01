@@ -422,7 +422,7 @@ fn rows_inner(data: &[u8], relation: u16, with_recno: bool) {
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = r.image() else {
+            let Some(image) = fire_crab_ods::data::assembled_image(data, page_size, &r) else {
                 eprintln!("fcstat: sqz error at page {} slot {}", dp_no, r.slot);
                 continue;
             };

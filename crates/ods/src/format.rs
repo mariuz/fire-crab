@@ -566,7 +566,7 @@ pub fn relation_formats(
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = r.image() else {
+            let Some(image) = crate::data::assembled_image(file, page_size, &r) else {
                 continue;
             };
             let row = decode_record(&image, &sys);

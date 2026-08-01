@@ -52,7 +52,14 @@ four; R7 is the removal of what they replaced.
   filter side turned out to have different rules, and the filter
   comparison is exact rather than through a double.
 
-- **A second per-statement stall, ~44 ms, that is not the socket.** With
+- ~~A second per-statement stall, ~44 ms~~ — *explained, and half of it
+  was self-inflicted*. A `cargo test` binary left spinning on this
+  ONE-CORE box since Jul 31 (14h41m of CPU) halved every measurement;
+  the rest was `system_relation_formats` being uncached and called five
+  times per statement. Both fixed. **Any timing measurement on this box
+  must check `nproc` and the load first** — see the playbook.
+
+- **(superseded)** With
   `TCP_NODELAY` set, 200 sequential `SELECT 1 FROM RDB$DATABASE` still
   take 8,689 ms against the engine's 293. About 3.8 s of that is server
   CPU and the rest is waiting; the client socket's own `noDelay` changes
@@ -146,8 +153,13 @@ four; R7 is the removal of what they replaced.
   cardinalities are within factor F" model is refuted by measurement, and
   one fitted on a single decade will mis-predict another.
 
-- **The `DEFAULT_SELECTIVITY = 0.1` substitution, and the removal of the
-  stale-statistics guard — one increment, in that order.** The engine
+- ~~The `DEFAULT_SELECTIVITY = 0.1` substitution and the stale-statistics
+  guard~~ — *done*. Both grids now score 169/169 with zero refusals. The
+  guard's premise was false: the "internal state this crate has not
+  converted" was one constant, and for the leading segment the engine's
+  `MAX` is dead code. Superseded text below.
+
+- **(superseded)** The engine
   does not refuse a zero selectivity, it substitutes
   (`Retrieval.cpp:1019-1026`, a **value** test `selectivity <= 0`, per
   matched segment; for the leading segment `minSelectivity` is provably

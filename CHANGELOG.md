@@ -13,6 +13,99 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — The guard was standing on a false premise, and it was mine
+
+Three edits to `opt`, and a cache. The stale-statistics grid goes from
+**4 exact / 165 refused to 169/169 with zero refusals**; the fresh grid
+stays 169/169.
+
+### Fixed
+- **A zero index statistic is the engine's SUBSTITUTION case, not a
+  refusal.** fcopt returned *"stale index statistics … the engine's
+  costing then depends on state this crate has not converted"*. That
+  premise was false, and it was mine. The state is one constant:
+  `Retrieval.cpp:1019-1026` substitutes
+  `MAX(scratch.selectivity * DEFAULT_SELECTIVITY, minSelectivity)` with
+  `DEFAULT_SELECTIVITY = 0.1`.
+
+  It is per matched segment and geometric — `scratch.selectivity` is the
+  running compound figure, so two matched segments give 0.1 then 0.01,
+  not 0.1 twice. And for the LEADING segment the `MAX` is **dead code**:
+  `scratch.selectivity` is still 1.0 there, so the expression is
+  `MAX(0.1, MIN(1/cardinality, 0.1))` whose right operand cannot exceed
+  0.1 by construction. The substituted leading figure is exactly 0.1 at
+  every cardinality, and since this crate only ever matches segment 0,
+  that is the entire conversion — one line.
+
+- **The index-page term is restored, reversing a decision recorded two
+  increments ago.** I had written it off as "under 0.1%, and it needs
+  `irtd_itype` plumbing `ods` does not have". Both halves were wrong in
+  the way that matters:
+
+  * 0.13% is exactly what decides the cell at **(28, 500)**. A term being
+    *small* is not a term being *inert*.
+  * the `MAX(…, MINIMUM_CARDINALITY)` **floors it at 1.0** on every table
+    measured, so the key length never reaches the answer — identical
+    scores at key lengths 4, 8 and 12. The plumbing was never a
+    prerequisite.
+
+  Worth 9 of the 11 cells that otherwise missed.
+
+- **The tie-break direction.** `InnerJoin.cpp:236` is
+  `if (hashCost <= loopCost && …)`; fcopt had `<`. Ties are not rare —
+  (5,8), (10,20), (15,40), (9,18), (12,28) are all exact — so the
+  direction decides real cells. Worth the last 2.
+
+### Fixed: 105,412 field decodes to answer `SELECT 1`
+`system_relation_formats` is called **five times per statement** and was
+uncached, each call scanning *two entire catalogues* and decoding every
+field of every row.
+
+The numbers here are a **fleet's measurement, not mine**, and are quoted
+as such: a uprobe counted 105,412 field decodes for one `SELECT 1 FROM
+RDB$DATABASE`, perf attributed 77% of server CPU to the function, a
+micro-benchmark linking the crate put it at 2.9 ms per call, and an
+A/B/A on a quieted machine took 200 statements from 3,926 ms to 569 ms
+with server CPU down 81%. Four instruments, and they agree. I have NOT
+re-measured independently: this box has one core and was running a fleet
+throughout, and taking a timing figure under that load is the exact
+mistake corrected below. The correctness of the cache does not depend on
+the figure — that is 388 unit tests and 169/169 on both plan grids — but
+the speedup is on their authority until I re-run it quiet.
+
+**Only system relations are cached, and that is the whole safety
+argument.** A user relation's format changes under `ALTER TABLE`, and two
+call sites do pass a user name — caching those would serve a stale layout
+and decode every later row at the wrong offsets. A system relation's
+layout is fixed by the ODS for the life of the database, so a cached
+answer cannot go stale. The key carries the ODS major and the page size
+so two attachments to different databases cannot share an entry.
+
+### Corrected: every timing number this session was taken on a stolen core
+The box has **one core**, and a `cargo test` binary left running on
+Jul 31 had been spinning at 100% for **14 hours 41 minutes**. It halved
+every measurement taken since. It was mine; it is killed.
+
+That retracts a claim made earlier today — "a second ~44 ms
+per-statement stall remains, and it is not the socket". The waiting half
+was **runqueue wait caused by that process**, not anything in fire-crab.
+The real engine barely noticed the contention (337 ms against 161 ms)
+because it needs 0.8 ms of CPU per statement, which is exactly why the
+starvation looked fire-crab-specific. Syscalls, disk and the wire were
+ruled out by measurement: 1,045 syscalls totalling 1.85 ms of 391 ms
+wall, and two `openat` for the entire run.
+
+### The gate lost a leniency
+`qa/opt-plans.sh`'s stale phase passed on "zero wrong" however many cells
+were REFUSED. That was the right rule while the crate declined to cost a
+zero statistic and the wrong one now. The stale grid is held to the same
+standard as the fresh one: every cell exact, nothing refused.
+
+One property to keep in any future test matrix: the substitution's effect
+is **not monotone in staleness**. Ten cells are HASH with one side stale
+but a keyed loop with both stale, because the hashed side's selectivity
+also prices the probe. One-sided staleness has to be in the matrix.
+
 ## 2026-08-01 — Sixty-three tables that did not exist
 
 The fleet sent to plan fragment assembly refuted the assembly I had just

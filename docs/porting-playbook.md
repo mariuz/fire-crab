@@ -2081,6 +2081,27 @@ them.
   different path from resolving one. If you are testing metadata, make a
   statement DEPEND on it.
 
+- **Check the machine before you believe a number.** Every timing figure
+  in this project for a full day was taken on a box with ONE core while a
+  leftover `cargo test` binary spun at 100% — 14 hours of stolen CPU. It
+  halved every measurement and made a plain CPU shortage look like a
+  network stall, because the reference implementation needed so little
+  CPU that contention barely touched it. **`nproc`, `/proc/loadavg`, and
+  `ps` for your own strays, before the stopwatch.**
+
+- **"It is only 0.1%" is not a reason to drop a term.** An index-page
+  term worth 0.13% was dropped as negligible; it was exactly what decided
+  a cell, and restoring it fixed 9 of 11 mismatches. In a model whose
+  output is a DISCRETE choice, a tiny term near a boundary is not a tiny
+  effect. Drop terms because they are WRONG, not because they are small.
+
+- **A refusal needs the same evidence as an answer.** fcopt refused to
+  cost a zero statistic on the grounds that "the engine's costing depends
+  on state this crate has not converted". Nobody had checked. The state
+  was one constant on one line of the reference. **A guard is a claim
+  about the other system, and claims get tested** — this one blocked 165
+  of 169 cells for several increments.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

@@ -2295,6 +2295,14 @@ pub fn alter_table_alter_column_type(
         let start = fpage as usize * page_size;
         let dp = DataPage::decode(file.get(start..start + page_size).ok_or("bad page")?)
             .ok_or("bad data page")?;
+        // `image()`, NOT `assembled_image` - ON PURPOSE. This reads a
+        // record it is about to REWRITE IN PLACE, and a fragmented one
+        // cannot be rewritten in place: its bytes live on several pages
+        // and the pieces would have to be re-split. `image()` answers
+        // None for a fragmented record, so this errors out instead of
+        // patching the head and leaving the tail describing the old
+        // shape. Refusing is the boundary; the other patch sites in this
+        // file are the same, and the roadmap names them.
         dp.record(fslot).and_then(|r| r.image()).ok_or("no field image")?
     };
     let patch_field = |image: &mut [u8], name: &str, v: SysVal<'_>| -> Result<(), String> {

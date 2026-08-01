@@ -2297,7 +2297,7 @@ impl<'a> Exec<'a> {
                 if !r.is_primary_record() {
                     continue;
                 }
-                let Some(image) = r.image() else { continue };
+                let Some(image) = fire_crab_ods::data::assembled_image(self.file, self.page_size, &r) else { continue };
                 let values = fire_crab_ods::decode_record(&image, descs);
                 let (Some(Value::Text(iname)), Some(Value::Text(rname))) =
                     (values.get(name_f), values.get(relname_f))
@@ -2350,7 +2350,7 @@ impl<'a> Exec<'a> {
                 if !r.is_primary_record() {
                     continue;
                 }
-                let Some(image) = r.image() else { continue };
+                let Some(image) = fire_crab_ods::data::assembled_image(self.file, self.page_size, &r) else { continue };
                 let values = decode_record(&image, descs);
                 let Some(Value::Text(t)) = values.get(name_f) else {
                     continue;
@@ -3154,7 +3154,7 @@ pub fn procedure_blr(file: &[u8], page_size: usize, name: &str) -> Result<Vec<u8
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = r.image() else { continue };
+            let Some(image) = fire_crab_ods::data::assembled_image(file, page_size, &r) else { continue };
             let values = decode_record(&image, descs);
             let Some(Value::Text(t)) = values.get(name_f) else {
                 continue;

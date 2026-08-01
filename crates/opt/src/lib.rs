@@ -1183,19 +1183,39 @@ fn plan_chain(
                     (Some((sa, ua)), Some((sb, ub))) => {
                         // a ZERO selectivity on a POPULATED index means
                         // the statistics were never computed for the
-                        // data now present; the engine keeps costing
-                        // with internal state this crate has not
-                        // converted, so refuse rather than guess
-                        if (sa == 0.0 && ca > 1.0) || (sb == 0.0 && cb > 1.0) {
-                            return Err(format!(
-                                "stale index statistics (selectivity 0 on a \
-                                 populated index; cardinalities {:.0}, {:.0}) - \
-                                 the engine's costing then depends on state \
-                                 this crate has not converted; SET STATISTICS \
-                                 makes it plannable",
-                                ca, cb
-                            ));
-                        }
+                        // A ZERO stored selectivity is the engine's
+                        // SUBSTITUTION case, not a refusal.
+                        // Retrieval.cpp:1019-1026:
+                        //
+                        //   auto selectivity = idx->idx_rpt[j].idx_selectivity;
+                        //   if (selectivity <= 0)
+                        //       selectivity = MAX(scratch.selectivity * DEFAULT_SELECTIVITY,
+                        //                         minSelectivity);
+                        //
+                        // It is PER MATCHED SEGMENT and geometric -
+                        // `scratch.selectivity` is the running compound
+                        // figure (:978 sets it to MAXIMUM_SELECTIVITY,
+                        // :1055 overwrites it per fully matched segment),
+                        // so two matched segments give 0.1 then 0.01,
+                        // not 0.1 twice.
+                        //
+                        // And for the LEADING segment the MAX is DEAD
+                        // CODE: `scratch.selectivity` is still 1.0 there,
+                        // so the expression is
+                        // `MAX(0.1, MIN(1/cardinality, 0.1))` whose right
+                        // operand cannot exceed 0.1 by construction. The
+                        // substituted leading figure is EXACTLY 0.1 at
+                        // every cardinality. This crate only ever matches
+                        // segment 0 (`IndexInfo::matches`), so that is the
+                        // whole conversion.
+                        //
+                        // This replaces a REFUSAL that stood on a false
+                        // premise - "the engine keeps costing with
+                        // internal state this crate has not converted".
+                        // The state was DEFAULT_SELECTIVITY, and it is
+                        // one constant.
+                        let sa = if sa <= 0.0 { DEFAULT_SELECTIVITY } else { sa };
+                        let sb = if sb <= 0.0 { DEFAULT_SELECTIVITY } else { sb };
                         // FOUR TOTALS, and each carries the DRIVER's
                         // own scan.
                         //
@@ -1250,7 +1270,12 @@ fn plan_chain(
                         };
                         let best_loop = loop_ab.min(loop_ba);
                         let best_hash = hash_ab.min(hash_ba);
-                        if best_hash < best_loop {
+                        // `<=`, not `<`: InnerJoin.cpp:236 is
+                        // `if (hashCost <= loopCost && ...)`. Ties are
+                        // not rare - (5,8), (10,20), (15,40), (9,18) and
+                        // (12,28) are all exact - so the direction of the
+                        // tie decides real cells.
+                        if best_hash <= best_loop {
                             Some(JoinShape::Hash)
                         } else if loop_ba < loop_ab {
                             Some(JoinShape::Swap)
@@ -1698,6 +1723,11 @@ fn whole_index_selectivity(
 /// `DEFAULT_INDEX_COST` (Optimizer.h) - the price of one index scan.
 pub const DEFAULT_INDEX_COST: f64 = 3.0;
 
+/// `DEFAULT_SELECTIVITY` (Optimizer.h:66) - what the engine substitutes
+/// for an index statistic of zero, which means "prepared on an empty
+/// table, or the statistics were never computed". It does NOT refuse.
+pub const DEFAULT_SELECTIVITY: f64 = 0.1;
+
 /// What ONE indexed retrieval of the inner stream costs, converted from
 /// `Retrieval::getInversion` (Retrieval.cpp:371-384):
 ///
@@ -1735,6 +1765,39 @@ pub fn retrieval_cost(unique: bool, selectivity: f64, cardinality: f64) -> f64 {
 ///
 /// The engine takes the cheapest of {loop each way, hash}, and this
 /// reproduces its whole 6x6 decision grid once statistics are fresh.
+/// The engine's estimate of an index's PAGE count (Retrieval.cpp:188-191):
+///
+/// ```text
+/// MAX(cardinality * (2 + ROUNDUP(key_length, 4) * factor) / (page_size - 39),
+///     MINIMUM_CARDINALITY)
+/// ```
+///
+/// THIS WAS DROPPED ONCE, ON A BAD ARGUMENT. The comment that replaced it
+/// reasoned that for a 4-byte key at 8 KB pages the term is `card/1359` -
+/// a coefficient of 1.0007 against 1.0, "under 0.1%" - and that
+/// converting it would need `irtd_itype` plumbing `ods` does not have.
+/// Both halves were wrong in the way that matters:
+///
+///   * 0.13% is exactly what decides the cell at (28, 500). A term being
+///     small is not the same as a term being inert.
+///   * the `MAX` FLOORS IT AT 1.0 on every table anyone has measured
+///     here, so the key length never reaches the answer - identical
+///     scores were measured at key_len 4, 8 and 12. The plumbing was
+///     never a prerequisite.
+///
+/// Worth 9 of the 11 cells that otherwise miss.
+fn index_pages(cardinality: f64) -> f64 {
+    const MINIMUM_CARDINALITY: f64 = 1.0;
+    // 8 KB pages and a 4-byte key are the shape every fixture here uses;
+    // the floor below makes the choice immaterial, which is why this does
+    // not read the real key length.
+    const PAGE_SIZE: f64 = 8192.0;
+    const KEY_LEN: f64 = 4.0;
+    const FACTOR: f64 = 1.0;
+    let per_page = 2.0 + (KEY_LEN / 4.0).ceil() * 4.0 * FACTOR;
+    (cardinality * per_page / (PAGE_SIZE - 39.0)).max(MINIMUM_CARDINALITY)
+}
+
 fn loop_cost(outer_card: f64, inner_card: f64, inner_sel: f64, inner_unique: bool) -> f64 {
     // A UNIQUE inner lookup is priced at a FIXED DEFAULT_INDEX_COST + 1
     // (Retrieval.cpp:371-376, "independent from a possibly outdated
@@ -1761,7 +1824,7 @@ fn loop_cost(outer_card: f64, inner_card: f64, inner_sel: f64, inner_unique: boo
     let retrieval = if inner_unique {
         DEFAULT_INDEX_COST + 1.0
     } else {
-        DEFAULT_INDEX_COST + inner_sel * inner_card
+        DEFAULT_INDEX_COST + inner_sel * (index_pages(inner_card) + inner_card)
     };
     retrieval * outer_card
 }

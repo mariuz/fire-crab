@@ -8545,7 +8545,7 @@ fn sample_image_len(db: &Database, rel: u16, format_no: u8) -> Option<usize> {
         };
         for r in dp.records() {
             if r.is_primary_record() && r.format == format_no {
-                if let Some(img) = r.image() {
+                if let Some(img) = fire_crab_ods::data::assembled_image(&db.bytes, db.page_size, &r) {
                     return Some(img.len());
                 }
             }
