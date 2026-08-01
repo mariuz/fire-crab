@@ -13,6 +13,24 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — A gate's premise expired, and I reported it as a defect
+
+`qa/serve-real-params.sh` asserted that a boolean PARAMETER is refused,
+"as the engine refuses this driver's encoding". I found it failing, saw
+fire-crab accepting where the gate expected a refusal, and recorded a
+defect: *fire-crab accepts what the engine rejects*.
+
+**That was inferred from the gate, not from the engine.** Asked directly,
+the engine accepts it too, and the two databases come out byte-identical
+— node-firebird 2.14.1 made boolean encoding metadata-directed, so a
+BOOLEAN target now receives a real `blr_bool`. The premise was true when
+it was written and had expired since.
+
+Four failures, every one of them pointing at fire-crab, and none of them
+fire-crab's. The gate now asks the engine rather than remembering what it
+once answered, and its literal mirror script carries the row the
+parameterised statement writes.
+
 ## 2026-08-01 — W2: the careful write order, called at last
 
 `fire-crab-cch` has modelled the engine's precedence graph — content

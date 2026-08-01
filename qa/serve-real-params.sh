@@ -144,13 +144,22 @@ check "insert all-param row (boolean as a literal)" \
     "$(node_run "INSERT INTO PT VALUES (?, ?, ?, ?, ?, ?, TRUE)" \
         '[1,"alpha",100.25,new Date(2024,0,15,10,30,0),"2024-02-20",new Date(1970,0,1,11,22,33)]')" \
     "<no rows>"
-# ... and the boolean PARAMETER, which this driver cannot send. Both
-# servers raise; the check is that fire-crab does not quietly accept
-# what the engine rejects.
+# ... and the boolean PARAMETER. This check used to assert a REFUSAL,
+# because the driver could not encode a JS boolean for a BOOLEAN column
+# and the engine rejected what it sent. node-firebird 2.14.1 made that
+# encoding metadata-directed (a BOOLEAN target now gets a real
+# blr_bool), so the ENGINE ACCEPTS IT - and so does fire-crab, which is
+# the only thing that was ever being asserted. The premise expired, not
+# the behaviour.
+#
+# It is checked against the engine directly rather than against a
+# remembered verdict, which is what a stale premise costs: the four
+# failures this produced all pointed at fire-crab, and none of them was
+# fire-crab's.
 b=$(node_run "INSERT INTO PT (ID, ACTIVE) VALUES (99, ?)" '[true]')
 case "$b" in
-    ERR*) echo "OK   a boolean PARAMETER is refused, as the engine refuses this driver's encoding" ;;
-    *) echo "DIFF boolean parameter answered: [$b]"; fail=1 ;;
+    ERR*) echo "DIFF fire-crab refused a boolean parameter the engine accepts: [$b]"; fail=1 ;;
+    *) echo "OK   a boolean PARAMETER is accepted, as the engine accepts this driver's encoding" ;;
 esac
 # mixed literals and params, column list; JS integral 50 arrives as
 # blr_long and must rescale into NUMERIC(9,2) as 5000
@@ -176,10 +185,11 @@ check "select WHERE text param" \
     "$(node_run "SELECT ID, SAL FROM PT WHERE NAME = ?" '["gamma"]')" "2|50"
 # a lone aggregate over a parameterised WHERE cannot be computed at
 # prepare - it must route through the group machinery and still agree
+# 3, not 2: row 99 exists now (see the boolean parameter above)
 check "count WHERE param" \
-    "$(node_run "SELECT COUNT(*) FROM PT WHERE ID > ?" '[0]')" "2"
+    "$(node_run "SELECT COUNT(*) FROM PT WHERE ID > ?" '[0]')" "3"
 check "sum WHERE param" \
-    "$(node_run "SELECT SUM(ID) FROM PT WHERE ID >= ?" '[1]')" "3"
+    "$(node_run "SELECT SUM(ID) FROM PT WHERE ID >= ?" '[1]')" "102"
 # comparison with a NULL parameter is UNKNOWN - no rows, never "= NULL"
 check "NULL param comparison is UNKNOWN" \
     "$(node_run "SELECT ID FROM PT WHERE ID = ?" '[null]')" "<no rows>"
@@ -196,6 +206,9 @@ kill $srv 2>/dev/null; wait $srv 2>/dev/null
 INSERT INTO PT VALUES (1, 'alpha', 100.25, TIMESTAMP '2024-01-15 10:30:00', DATE '2024-02-20', TIME '11:22:33', TRUE);
 INSERT INTO PT (ID, NAME, SAL) VALUES (2, 'beta', 50);
 INSERT INTO PT VALUES (3, NULL, NULL, NULL, NULL, NULL, NULL);
+-- the literal twin of the boolean PARAMETER above, which the driver can
+-- now encode and both servers now accept
+INSERT INTO PT (ID, ACTIVE) VALUES (99, TRUE);
 UPDATE PT SET SAL = 77.5 WHERE ID = 1;
 UPDATE PT SET NAME = 'gamma' WHERE NAME = 'beta';
 DELETE FROM PT WHERE ID = 3;

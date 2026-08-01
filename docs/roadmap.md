@@ -173,14 +173,17 @@ plus *the subsystem is now on the path*.
     bound predicate, since a `?` has no value at prepare. Only the
     projection's retrieval defers so far - a parameterised GROUP BY or
     DML WHERE still scans.
-  - **A pre-existing divergence found by widening the sweep, not caused
-    by any of this**: `qa/serve-real-params.sh` fails, and bisecting says
-    it has failed since before W1 began. fire-crab ACCEPTS a boolean
-    parameter INSERT that the engine REJECTS
-    (`INSERT INTO PT (ID, ACTIVE) VALUES (99, ?)` with this driver's
-    encoding of `true`), so its table gains a row the engine's has not.
-    Accepting what the engine refuses is the wrong direction, and it is
-    its own slice.
+  - **A failure that was the GATE's, and a claim of mine that was
+    wrong.** `qa/serve-real-params.sh` had been failing since before W1,
+    and I reported it as "fire-crab accepts a boolean parameter INSERT
+    the engine rejects" — inferred from the gate's expectation rather
+    than from the engine. Asked directly, **the engine accepts it too**,
+    and the two files come out byte-identical: node-firebird 2.14.1 made
+    boolean encoding metadata-directed, so a BOOLEAN target now gets a
+    real `blr_bool`. The gate's premise was written when the driver could
+    not do that. Four failures, every one pointing at fire-crab, and
+    none of them fire-crab's. The gate now asks the engine instead of
+    remembering.
   - Still to do: index-driven joins,
     text keys (a collation makes the key a collation key), compound
     prefixes, and parameters (their values arrive after the plan is

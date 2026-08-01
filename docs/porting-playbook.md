@@ -1850,6 +1850,15 @@ them.
   turned an entire class of future encoder bugs from data loss into
   wasted work.
 
+- **A gate encodes a claim about the OTHER system, and those expire
+  too.** One here asserted that a driver could not encode a boolean
+  parameter and that the engine therefore refused it. Both were true when
+  written. The driver was updated, the engine accepted, and the gate
+  reported four failures that all pointed at our code — where I duly
+  looked, and wrote up a defect that did not exist. When a gate fails,
+  re-ask the reference implementation the question the gate is
+  remembering the answer to, BEFORE reading your own diff.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with
