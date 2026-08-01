@@ -541,7 +541,7 @@ mod tests {
 
         let key = |n: u8| vec![0xC0, n];
         for (n, recno) in [(1u8, 10u64), (3, 30), (5, 50), (3, 31), (7, 70)] {
-            crate::btw::insert_index_entry(&mut file, page_size, rel, 0, &key(n), recno, false)
+            crate::btw::insert_index_entry(&mut file, page_size, rel, 0, &key(n), recno, false, false)
                 .unwrap();
         }
 
@@ -582,7 +582,7 @@ mod tests {
         let key = |n: u8| vec![0xC0, n];
         for n in [1u8, 3, 5, 7, 9] {
             crate::btw::insert_index_entry(
-                &mut file, page_size, rel, 0, &key(n), n as u64 * 10, false,
+                &mut file, page_size, rel, 0, &key(n), n as u64 * 10, false, false,
             )
             .unwrap();
         }

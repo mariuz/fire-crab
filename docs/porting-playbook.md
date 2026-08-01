@@ -1812,6 +1812,14 @@ them.
   order actually is (here: record order, because it unions through a
   record-number bitmap) rather than assuming nobody can tell.
 
+- **A writer that can read its own mistakes back is not validated.**
+  fire-crab wrote descending index entries in the wrong order for as
+  long as it has written them, and every gate passed, because fire-crab
+  read them back with the same wrong comparison. Only the ENGINE could
+  see it — and `gfix`, which called it index page errors. When you
+  convert a WRITER, the oracle cannot be your own reader; it has to be
+  the other implementation, and ideally its consistency checker too.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

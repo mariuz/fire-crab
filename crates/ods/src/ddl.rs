@@ -435,6 +435,7 @@ fn maintain_indexes(
             &key,
             recno,
             iflags & btw::IRT_UNIQUE != 0 && !all_null,
+            iflags & btw::IRT_DESCENDING != 0,
         )?;
     }
     Ok(())
@@ -5366,6 +5367,7 @@ fn backfill_index(
                 &key,
                 recno,
                 (unique && !all_null) || primary,
+                descending,
             )?;
         }
     }

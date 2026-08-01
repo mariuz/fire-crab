@@ -611,11 +611,37 @@ fn node_cmp(key: &[u8], recno: u64, n: &BtNode) -> std::cmp::Ordering {
     key.cmp(&n.key).then(recno.cmp(&n.recno))
 }
 
+/// Node order in a DESCENDING index.
+///
+/// A descending key is stored COMPLEMENTED, so plain byte order almost
+/// works - except where one key is a byte PREFIX of another. Ordinary
+/// lexicographic comparison pads the shorter key with 0x00, which puts
+/// it FIRST; the engine pads it with 0xFF, which puts it LAST. Writing
+/// entries in the wrong order produced an index the engine's own
+/// retrieval could not read (`WHERE D = 3` found nothing on a table
+/// that held it, `ORDER BY D DESC` came back out of order) and that
+/// `gfix -v -full` reported as index page errors.
+fn node_cmp_desc(key: &[u8], recno: u64, n: &BtNode) -> std::cmp::Ordering {
+    let a = key;
+    let b = &n.key;
+    let len = a.len().max(b.len());
+    for i in 0..len {
+        // the missing bytes of the shorter key are 0xFF here, not 0x00
+        let x = a.get(i).copied().unwrap_or(0xFF);
+        let y = b.get(i).copied().unwrap_or(0xFF);
+        if x != y {
+            return x.cmp(&y);
+        }
+    }
+    recno.cmp(&n.recno)
+}
+
 /// Insert one (key, recno) into index `index_id` of `rel` -
 /// `BTR_insert`: descend to the leaf, insert in order, split full
 /// pages upward, grow a new root when the root itself splits (the
 /// index root page repointed). `unique` refuses an existing equal
 /// non-NULL key (isc_no_dup semantics).
+#[allow(clippy::too_many_arguments)]
 pub fn insert_index_entry(
     file: &mut Vec<u8>,
     page_size: usize,
@@ -624,7 +650,17 @@ pub fn insert_index_entry(
     key: &[u8],
     recno: u64,
     unique: bool,
+    descending: bool,
 ) -> Result<(), String> {
+    // a DESCENDING index orders its (complemented) keys by a different
+    // rule where one is a prefix of another - see `node_cmp_desc`
+    let cmp = |k: &[u8], r: u64, n: &BtNode| {
+        if descending {
+            node_cmp_desc(k, r, n)
+        } else {
+            node_cmp(k, r, n)
+        }
+    };
     // the index root page's location (to repoint irt_root on a root split)
     let irt_page_off = file
         .chunks_exact(page_size)
@@ -650,7 +686,7 @@ pub fn insert_index_entry(
         let c = decode_content(&bp).ok_or("undecodable btree page")?;
         // an equal-or-greater END_BUCKET key continues on the sibling
         if let Terminator::Bucket(t) = &c.term {
-            if node_cmp(key, recno, t) != std::cmp::Ordering::Less {
+            if cmp(key, recno, t) != std::cmp::Ordering::Less {
                 cur = c.sibling;
                 continue;
             }
@@ -662,7 +698,7 @@ pub fn insert_index_entry(
         // first node (degenerate) when everything is greater
         let mut child = c.nodes.first().ok_or("empty interior page")?.page;
         for n in &c.nodes {
-            if node_cmp(key, recno, n) == std::cmp::Ordering::Less {
+            if cmp(key, recno, n) == std::cmp::Ordering::Less {
                 break;
             }
             child = n.page;
@@ -689,7 +725,7 @@ pub fn insert_index_entry(
     let pos = content
         .nodes
         .iter()
-        .position(|n| node_cmp(key, recno, n) == std::cmp::Ordering::Less)
+        .position(|n| cmp(key, recno, n) == std::cmp::Ordering::Less)
         .unwrap_or(content.nodes.len());
     content.nodes.insert(pos, BtNode { key: key.to_vec(), recno, page: 0 });
 
@@ -738,7 +774,7 @@ pub fn insert_index_entry(
                     .nodes
                     .iter()
                     .position(|n| {
-                        node_cmp(&parent_node.key, parent_node.recno, n)
+                        cmp(&parent_node.key, parent_node.recno, n)
                             == std::cmp::Ordering::Less
                     })
                     .unwrap_or(pc.nodes.len());
@@ -851,6 +887,33 @@ pub fn index_segments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The DESCENDING order rule, which decides where an entry is
+    /// WRITTEN. A descending key is stored complemented, so plain byte
+    /// order almost works - and fails on exactly one shape: where one
+    /// key is a byte PREFIX of another. Ordinary comparison pads the
+    /// shorter with 0x00 and puts it FIRST; the engine pads it with
+    /// 0xFF and puts it LAST. Getting it wrong wrote entries into the
+    /// wrong place, which fire-crab could still read back (it reads
+    /// what it wrote) and the ENGINE could not - gfix called it index
+    /// page errors.
+    #[test]
+    fn a_descending_prefix_sorts_after_the_key_it_prefixes() {
+        let node = |k: &[u8]| BtNode { key: k.to_vec(), recno: 0, page: 0 };
+        use std::cmp::Ordering;
+        // the prefix is GREATER under the descending rule ...
+        assert_eq!(node_cmp_desc(&[0xC0], 0, &node(&[0xC0, 0x10])), Ordering::Greater);
+        // ... and LESS under the ordinary one, which is the whole bug
+        assert_eq!(node_cmp(&[0xC0], 0, &node(&[0xC0, 0x10])), Ordering::Less);
+        // where neither is a prefix the two agree
+        assert_eq!(node_cmp_desc(&[0xC0, 0x10], 0, &node(&[0xC0, 0x20])), Ordering::Less);
+        assert_eq!(node_cmp(&[0xC0, 0x10], 0, &node(&[0xC0, 0x20])), Ordering::Less);
+        // equal keys fall through to the record number, both ways
+        assert_eq!(node_cmp_desc(&[0xC0], 5, &node(&[0xC0])), Ordering::Greater);
+        assert_eq!(node_cmp_desc(&[0xC0], 0, &node(&[0xC0])), Ordering::Equal);
+        // an empty key (a NULL) is the extreme case of a prefix
+        assert_eq!(node_cmp_desc(&[], 0, &node(&[0xC0])), Ordering::Greater);
+    }
 
     #[test]
     fn compound_keys_stuff_like_btr_key() {

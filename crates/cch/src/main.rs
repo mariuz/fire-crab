@@ -140,7 +140,7 @@ fn main() {
                             fire_crab_ods::btw::build_index_key(&ksegs, false)
                                 .ok_or("cannot build the index key")?;
                         fire_crab_ods::btw::insert_index_entry(
-                            &mut after, page_size, rel, *id, &key, recno, false,
+                            &mut after, page_size, rel, *id, &key, recno, false, false,
                         )?;
                     }
                 }

@@ -10365,7 +10365,7 @@ fn insert_entry_verified(
 ) -> Result<(), String> {
     let enforce = op.unique && !all_null;
     match fire_crab_ods::btw::insert_index_entry(
-        work, page_size, rel, op.id, key, recno, enforce,
+        work, page_size, rel, op.id, key, recno, enforce, op.descending,
     ) {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -10378,7 +10378,7 @@ fn insert_entry_verified(
                 // every entry holding this key names a record that is
                 // gone, or no longer carries it
                 fire_crab_ods::btw::insert_index_entry(
-                    work, page_size, rel, op.id, key, recno, false,
+                    work, page_size, rel, op.id, key, recno, false, op.descending,
                 )
             } else {
                 Err(e)

@@ -13,6 +13,40 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — W1m: fire-crab was corrupting descending indexes
+
+The worst defect the fleets have found, and it has nothing to do with
+retrieval — it is the WRITE path, and it predates every index slice.
+
+### Fixed
+- **A descending key is stored COMPLEMENTED, so plain byte order almost
+  works.** It fails on exactly one shape: where one key is a byte PREFIX
+  of another. Ordinary lexicographic comparison pads the shorter key
+  with `0x00` and puts it FIRST; the engine pads it with `0xFF` and puts
+  it LAST. `insert_index_entry` used the ordinary one, so every entry
+  whose key prefixed or was prefixed by another went into the wrong
+  place in the tree.
+
+  fire-crab could not see the damage — it reads back what it wrote. The
+  engine could:
+
+  ```
+  SELECT COUNT(*) FROM T WHERE D = 3    -> 0, on a table that holds it
+  SELECT D FROM T ORDER BY D DESC       -> 2, 256, 257, 17, 16, 5, ...
+  gfix -v -full                         -> Number of index page errors: 2
+  ```
+
+- `insert_index_entry` takes the index's direction now, and
+  `node_cmp_desc` implements the engine's rule.
+
+New `qa/serve-real-descwrite.sh` (29 checks). It asks fire-crab nothing:
+fire-crab does the WRITING — over the value pairs where one encoded key
+prefixes another, 16/256 and 17/257 — then the server stops and **the
+engine** reads, with `SET PLAN ON` so the PLAN line proves an index was
+used, and `gfix` finishes, since gfix is what named the corruption.
+
+372 unit tests and 6 gates confirm nothing moved.
+
 ## 2026-07-31 — W1l: an entry the server cannot judge is not a stale one
 
 The fleet's first hunter came back with four failures against the new
