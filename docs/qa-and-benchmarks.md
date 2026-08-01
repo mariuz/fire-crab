@@ -4415,6 +4415,33 @@ same `isql` runs the same statement against the real engine and against
 only when refusing is deliberate and a gate asserts the failure; a
 refusal is always a SQL error, never a wrong answer dressed as a result.
 
+### The optimizer grid, and the hole that was in it (`qa/opt-plans.sh`)
+
+The cost grid joins every table size against every other and requires
+fcopt to either match the engine's plan exactly or refuse — a wrong plan
+anywhere fails. That property is right. The **sample points** were not.
+
+The set was `{0, 1, 5, 50, 500, 3000}`: 36 cells, and a jump from 5 to 50
+that steps straight over the engine's HASH/loop crossover. A model can
+therefore score 36/36 while being wrong at every cardinality in between,
+and one did. Widened to thirteen sizes — `{0, 1, 2, 5, 8, 20, 30, 50,
+120, 500, 900, 3000, 5000}`, 169 cells — the same model scores
+**153/169, with all sixteen errors in the 2-120 band the narrow set
+skipped**.
+
+This matters beyond one grid. Two separate claims about this cost model
+had been asserted twice and refuted twice, both times on the strength of
+a full score. Nobody was careless: the grid could not disagree. **A full
+score on a narrow test is the most persuasive kind of wrong evidence.**
+
+The gate now runs the widened set in both phases. With fresh statistics
+the model must be exact everywhere — it is, 169/169. Without them fcopt
+refuses rather than guesses, and the stale phase counts a refusal as a
+pass, which is a leniency that goes when the `DEFAULT_SELECTIVITY`
+substitution lands: on those same 169 stale cells the engine answers
+every one while fcopt answers 4 and refuses 165. Zero wrong, either way —
+which is the property the gate is really defending.
+
 ### The cost of a plan (`qa/serve-real-idxcost.sh`, 5 checks)
 
 Every other gate here asks whether the answer is right. This one asks

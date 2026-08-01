@@ -1983,6 +1983,29 @@ them.
   and check them off; the engine's `setNoNagleOption` is right there in
   `remote/inet.cpp`.
 
+- **A test grid's RESOLUTION is part of the test.** The optimizer grid
+  sampled table sizes at `{0, 1, 5, 50, 500, 3000}` and scored 36/36 —
+  while the model was wrong at every cardinality between 8 and 30,
+  because the jump from 5 to 50 steps straight over the crossover the
+  grid exists to find. Widened to thirteen sizes, the same model scores
+  153/169 and every error is in the skipped band. **Put your sample
+  points where the behaviour CHANGES, not at round numbers**; if you know
+  there is a threshold, bracket it on both sides.
+
+- **A full score on a narrow test is the most persuasive kind of wrong
+  evidence.** Two separate claims about this cost model were asserted
+  twice and refuted twice, both times on the strength of 36/36. Nobody
+  was careless; the grid simply could not disagree. When a change scores
+  perfectly, ask what the test CANNOT distinguish before you ask what it
+  proves.
+
+- **Ship coupled edits together, and say why.** Four corrections to this
+  cost model each regress a measured fixture when applied alone — the
+  arithmetic only lands on the engine's answer when all four are present.
+  That is not a reason to skip verification; it is a reason to verify the
+  SET, and to resist the reviewer's instinct to split it into four
+  reviewable commits that would each be individually wrong.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

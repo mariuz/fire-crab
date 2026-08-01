@@ -283,16 +283,24 @@ prefuse "SELECT B.S FROM SMALL B JOIN BIG A ON A.UNIQ = B.S"
 # ======================================================================
 # PHASE 3: the CARDINALITY GRID - 36 cells, and never a wrong plan
 # ======================================================================
-# Six tables of 0, 1, 5, 50, 500 and 3000 rows, joined every way
-# round. For each cell fcopt must either MATCH the engine's plan or
-# REFUSE - a wrong plan anywhere fails the gate. This is the property
-# that matters for a cost model only partly converted: silence where
-# it does not know, exactness where it does.
+# THIRTEEN tables - 0, 1, 2, 5, 8, 20, 30, 50, 120, 500, 900, 3000 and
+# 5000 rows - joined every way round: 169 cells. For each, fcopt must
+# either MATCH the engine's plan or REFUSE. A wrong plan anywhere fails
+# the gate. That is the property that matters for a cost model only
+# partly converted: silence where it does not know, exactness where it
+# does.
+#
+# THE SIZE SET IS THE GATE. It used to be {0, 1, 5, 50, 500, 3000}, and
+# that set has a HOLE FROM 5 TO 50 that straddles the engine's HASH/loop
+# crossover - so a model could score 36/36 on it while being wrong at
+# every cardinality between. It was: against this widened set the old
+# model scores 153/169, and all sixteen of its errors are in the 2-120
+# band the narrow set skipped. A grid that cannot fail is not a grid.
 DBG="$D/fc-optgrid.fdb"
 rm -f "$DBG"
 {
   echo "CREATE DATABASE '$DBG' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;"
-  for n in 0 1 5 50 500 3000; do
+  for n in 0 1 2 5 8 20 30 50 120 500 900 3000 5000; do
       echo "CREATE TABLE G$n (V INTEGER); CREATE INDEX IDX_G$n ON G$n (V);"
   done
   echo "COMMIT;"
@@ -306,15 +314,15 @@ rm -f "$DBG"
 
 # with FRESH statistics the cost model must be EXACT everywhere;
 # without them the crate must refuse rather than guess
-for n in 0 1 5 50 500 3000; do
+for n in 0 1 2 5 8 20 30 50 120 500 900 3000 5000; do
     "$ISQL" -q -b -user "$U" -pas "$P" "$DBG" >/dev/null 2>&1 <<SQL
 SET STATISTICS INDEX IDX_G$n;
 COMMIT;
 SQL
 done
 matched=0; refused=0; wrong=0
-for o in 0 1 5 50 500 3000; do
-  for i in 0 1 5 50 500 3000; do
+for o in 0 1 2 5 8 20 30 50 120 500 900 3000 5000; do
+  for i in 0 1 2 5 8 20 30 50 120 500 900 3000 5000; do
     q="SELECT A.V FROM G$o A JOIN G$i B ON A.V = B.V"
     eng=$("$ISQL" -q -user "$U" -pas "$P" "$DBG" 2>&1 <<SQL | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | head -1
 SET PLANONLY ON;
@@ -334,10 +342,10 @@ SQL
     fi
   done
 done
-if [ $wrong -eq 0 ] && [ $matched -eq 36 ]; then
-    echo "OK   cost grid (FRESH statistics): all 36 cells planned EXACTLY"
+if [ $wrong -eq 0 ] && [ $matched -eq 169 ]; then
+    echo "OK   cost grid (FRESH statistics): all 169 cells planned EXACTLY"
 elif [ $wrong -eq 0 ]; then
-    echo "DIFF cost grid: only $matched of 36 exact ($refused refused) - the cost model regressed"
+    echo "DIFF cost grid: only $matched of 169 exact ($refused refused) - the cost model regressed"
     fail=1
 else
     echo "DIFF cost grid: $wrong cells planned WRONGLY"
@@ -354,7 +362,7 @@ DBS="$D/fc-optstale.fdb"
 rm -f "$DBS"
 {
   echo "CREATE DATABASE '$DBS' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;"
-  for n in 0 1 5 50 500 3000; do
+  for n in 0 1 2 5 8 20 30 50 120 500 900 3000 5000; do
       echo "CREATE TABLE G$n (V INTEGER); CREATE INDEX IDX_G$n ON G$n (V);"
   done
   echo "COMMIT;"
@@ -366,8 +374,8 @@ rm -f "$DBS"
   echo "COMMIT;"
 } | "$ISQL" -q -b -user "$U" -pas "$P" >/dev/null 2>&1 || { echo "FAIL create stale"; exit 1; }
 swrong=0; srefused=0; smatched=0
-for o in 0 1 5 50 500 3000; do
-  for i in 0 1 5 50 500 3000; do
+for o in 0 1 2 5 8 20 30 50 120 500 900 3000 5000; do
+  for i in 0 1 2 5 8 20 30 50 120 500 900 3000 5000; do
     q="SELECT A.V FROM G$o A JOIN G$i B ON A.V = B.V"
     eng=$("$ISQL" -q -user "$U" -pas "$P" "$DBS" 2>&1 <<SQL | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | head -1
 SET PLANONLY ON;

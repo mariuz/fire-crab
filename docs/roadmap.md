@@ -59,6 +59,45 @@ four; R7 is the removal of what they replaced.
   nothing and the cost barely scales with database size (2.3 MB → 8.9 s,
   25 MB → 11.1 s). Unfound, and named so it is not mistaken for finished.
 
+- **Statistics that are non-zero but WRONG are not refused at all.**
+  fcopt's stale guard tests `sa == 0.0`, so an index whose statistics
+  were computed and then went stale as the table grew takes the ordinary
+  costing path with a figure that no longer describes the data. The
+  engine takes its `useDefaultSelectivity == false` branch there. That
+  third region is **entirely unmeasured** — neither the fresh grid nor
+  the stale one reaches it — so nothing currently says whether fcopt is
+  right in it. Measured and named by the grid fleet; it needs its own
+  fixture family (load, `SET STATISTICS`, then grow the table).
+
+- **The stale grid's only threshold is the 20→30 step**, which the
+  widened size set barely straddles and the old `{0,1,5,50,500,3000}` set
+  jumped clean over. Any stale-region model tuned on the old grid had
+  zero cells near the one boundary that decides it. When the
+  `DEFAULT_SELECTIVITY` increment comes, the size set needs points
+  *inside* 20-30, not merely either side.
+
+- **The HASH band edge is not a scale-invariant ratio and does not move
+  monotonically with size.** Measured brackets: at base 20 the edge is in
+  (1.50, 1.55]; at base 100 in (1.30, 1.40]; at base 1000 in (1.55,
+  1.70]. So the band is *narrowest in the middle*. Any "HASH iff the
+  cardinalities are within factor F" model is refuted by measurement, and
+  one fitted on a single decade will mis-predict another.
+
+- **The `DEFAULT_SELECTIVITY = 0.1` substitution, and the removal of the
+  stale-statistics guard — one increment, in that order.** The engine
+  does not refuse a zero selectivity, it substitutes
+  (`Retrieval.cpp:1019-1026`, a **value** test `selectivity <= 0`, per
+  matched segment; for the leading segment `minSelectivity` is provably
+  inert so the answer is exactly 0.1). fcopt refuses instead. The two are
+  coupled: putting the substitution in `index_selectivity` makes the
+  guard unreachable as a *side effect*, and "the guard can now go" is the
+  claim that was asserted twice and refuted twice. Ground truth now
+  exists to judge it — the widened 169-cell **stale** grid, where the
+  engine answers every cell and fcopt today answers 4 and refuses 165
+  with zero wrong. Note the stale region's shape distribution is quite
+  different from the fresh one (59 HASH against 13), so it is a real
+  test and not a formality.
+
 - **The `opt` cost model is plan-text fidelity only, today.** A fleet
   established the mechanism: `server.rs` discards any plan that is not a
   one-element `Access::Index | Access::Order` stream, `plan_join_bound`

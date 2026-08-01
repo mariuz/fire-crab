@@ -1195,22 +1195,61 @@ fn plan_chain(
                                 ca, cb
                             ));
                         }
-                        let loop_ab = loop_cost(ca, cb, sb, ub); // A drives, index B
-                        let loop_ba = loop_cost(cb, ca, sa, ua); // B drives, index A
+                        // FOUR TOTALS, and each carries the DRIVER's
+                        // own scan.
+                        //
+                        // The driver is not free. InnerJoin.cpp:323
+                        // seeds `findBestOrder(0, innerStream, ..., 0.0,
+                        // 1.0)`, which looks like a zero - but :377
+                        // calls `estimateCost(position = 0, ...)` under
+                        // no guard, and :192 charges `loopCost =
+                        // candidate->cost * cardinality` with
+                        // cardinality == 1.0. A bare natural scan's
+                        // candidate cost is the stream's own row count
+                        // (Retrieval.cpp:308-316 builds a dummy
+                        // candidate with selectivity 1.0 and cost 0,
+                        // then :1145 adds `cardinality * 1.0`). So
+                        // position 0 costs the driver's cardinality.
+                        //
+                        // Comparing inner-side costs only - which is
+                        // what leaving it out did - cancels the driver's
+                        // price. That is harmless when the two sides are
+                        // similar and wrong when they differ
+                        // hundredfold, which is exactly the shape a
+                        // keyed join is for.
+                        //
+                        // And BOTH hash orientations are priced. The
+                        // engine reaches them through its two starting
+                        // streams (InnerJoin.cpp:318-323) and prices the
+                        // stream at `position` as the hashed one against
+                        // the priors probing (:229-234, where
+                        // `hashCardinality`/`currentCardinality` come
+                        // from the NEW stream and `cardinality` from the
+                        // priors). `formRiver`'s swap (:575-581) is
+                        // POST-decision - it sits behind
+                        // `equiMatches.hasData()`, which :269-270 fills
+                        // only after `hashCost <= loopCost` has already
+                        // passed - so it renormalises the printed sides
+                        // rather than restricting what gets costed.
+                        let loop_ab = ca + loop_cost(ca, cb, sb, ub); // A drives, B indexed
+                        let loop_ba = cb + loop_cost(cb, ca, sa, ua); // B drives, A indexed
                         // avoidHashJoin (InnerJoin.cpp:217): a stream
                         // that looks empty or single-rowed at prepare
                         // time is never hashed - the engine distrusts
                         // its own cardinality there
-                        let hash = if ca.min(cb) <= 1.0 {
+                        let hash_ab = if cb <= 1.0 {
                             f64::INFINITY
                         } else {
-                            hash_cost(
-                                ca.max(cb),
-                                ca.min(cb),
-                                if ca >= cb { sb } else { sa },
-                            )
+                            ca + hash_cost(ca, cb, sb, ub) // A probes, B hashed
                         };
-                        if hash < loop_ab.min(loop_ba) {
+                        let hash_ba = if ca <= 1.0 {
+                            f64::INFINITY
+                        } else {
+                            cb + hash_cost(cb, ca, sa, ua) // B probes, A hashed
+                        };
+                        let best_loop = loop_ab.min(loop_ba);
+                        let best_hash = hash_ab.min(hash_ba);
+                        if best_hash < best_loop {
                             Some(JoinShape::Hash)
                         } else if loop_ba < loop_ab {
                             Some(JoinShape::Swap)
@@ -1698,25 +1737,62 @@ pub fn retrieval_cost(unique: bool, selectivity: f64, cardinality: f64) -> f64 {
 fn loop_cost(outer_card: f64, inner_card: f64, inner_sel: f64, inner_unique: bool) -> f64 {
     // A UNIQUE inner lookup is priced at a FIXED DEFAULT_INDEX_COST + 1
     // (Retrieval.cpp:371-376, "independent from a possibly outdated
-    // statistics"); a non-unique one pays the index scan plus the rows it
-    // names, twice - once to scan, once to fetch.
+    // statistics").
+    //
+    // A NON-UNIQUE one pays the row term ONCE, not twice. The engine
+    // charges two terms and they are not the same quantity:
+    //
+    //   Retrieval.cpp:385   cost  = DEFAULT_INDEX_COST + selectivity * scratch.cardinality
+    //   Retrieval.cpp:1145  cost += cardinality * selectivity
+    //
+    // The first is the INDEX SCAN and its cardinality is an index PAGE
+    // count; the second is the RECORD retrieval against the TABLE's
+    // cardinality. Reading both as the table's - which `2.0 *` did -
+    // doubles a keyed loop's price and pushes the HASH/loop crossover
+    // out by a factor of two.
+    //
+    // The page term is dropped rather than converted. It is
+    // `csb_cardinality * idx_fraction * (2 + ROUNDUP(BTR_key_length,4)
+    // * factor) / (page_size - 39)`, which for a 4-byte INTEGER key at
+    // 8 KB pages is card/1359 - a coefficient of 1.0007 against the 1.0
+    // below, under 0.1%. Converting it would need `irtd_itype` plumbing
+    // that `ods` does not have, for that. Recorded in the roadmap.
     let retrieval = if inner_unique {
         DEFAULT_INDEX_COST + 1.0
     } else {
-        DEFAULT_INDEX_COST + 2.0 * inner_sel * inner_card
+        DEFAULT_INDEX_COST + inner_sel * inner_card
     };
     retrieval * outer_card
 }
 
-fn hash_cost(outer_card: f64, inner_card: f64, inner_sel: f64) -> f64 {
+/// The engine's hash arithmetic (InnerJoin.cpp:228-234), including the
+/// cap the previous version left out.
+///
+/// `inner_unique` is not decoration: InnerJoin.cpp:210-211 reads
+///
+/// ```text
+/// if ((candidate->unique || firstRows) && currentCardinality > MINIMUM_CARDINALITY)
+///     currentCardinality = MINIMUM_CARDINALITY;
+/// ```
+///
+/// so a UNIQUE hashed side contributes ONE row per probe to the copying
+/// term however large the table is. Without it, hashing a unique side
+/// was priced as though every probe copied `inner_card * inner_sel`
+/// rows, which for a large unique inner is an enormous over-charge and
+/// made fcopt prefer a loop where the engine hashes.
+fn hash_cost(outer_card: f64, inner_card: f64, inner_sel: f64, inner_unique: bool) -> f64 {
     const MEMCOPY: f64 = 0.5;
     const HASHING: f64 = 0.5;
+    const MINIMUM_CARDINALITY: f64 = 1.0;
     // the inner side is retrieved UNFILTERED for hashing: a full
     // scan, whose cost is its cardinality, and whose selectivity is
     // 1.0 (every row hashes)
     let base_cost = inner_card;
     let hash_cardinality = inner_card;
-    let current_cardinality = inner_card * inner_sel;
+    let mut current_cardinality = inner_card * inner_sel;
+    if inner_unique && current_cardinality > MINIMUM_CARDINALITY {
+        current_cardinality = MINIMUM_CARDINALITY;
+    }
     base_cost
         + hash_cardinality * (MEMCOPY + HASHING)
         + outer_card * (HASHING + current_cardinality * MEMCOPY)

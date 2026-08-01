@@ -13,6 +13,89 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — The grid had a hole in it
+
+Four edits to `opt`'s join cost model, shipped as one increment because
+each of them alone regresses a measured fixture — which is exactly why
+four independent investigations of this had contradicted each other, each
+having isolated one term and validated it on its own row counts.
+
+### Fixed
+- **`loop_cost` charged the row term twice.** The engine charges two
+  terms and they are *not the same quantity*: `Retrieval.cpp:385` is
+  `DEFAULT_INDEX_COST + selectivity * scratch.cardinality`, an index
+  **page** count, and `Retrieval.cpp:1145` adds `cardinality *
+  selectivity` against the **table's**. Reading both as the table's
+  doubled a keyed loop's price and pushed the HASH/loop crossover out by
+  a factor of two. The page term is dropped rather than converted — for a
+  4-byte key at 8 KB pages it is `card/1359`, a coefficient of 1.0007
+  against 1.0, and converting it needs `irtd_itype` plumbing `ods` does
+  not have. That is in the roadmap, with the arithmetic.
+
+- **The driver was free.** `InnerJoin.cpp:323` seeds `findBestOrder(0,
+  ..., 0.0, 1.0)`, which *looks* like a zero — but `:377` calls
+  `estimateCost(position = 0, ...)` under no guard and `:192` charges
+  `loopCost = candidate->cost * cardinality` with `cardinality == 1.0`,
+  and a bare natural scan's candidate cost is the stream's own row count.
+  Comparing inner-side costs only cancels the driver's price: harmless
+  when the sides are similar, wrong when they differ hundredfold — which
+  is the shape a keyed join exists for.
+
+- **Only one hash arrangement was priced.** fcopt costed "larger drives,
+  smaller hashed" and nothing else. The engine reaches both through its
+  two starting streams (`InnerJoin.cpp:318-323`), pricing the stream at
+  `position` as the hashed one against the priors probing. `formRiver`'s
+  swap (`:575-581`) is **post-decision** — it sits behind
+  `equiMatches.hasData()`, which `:269-270` fills only after `hashCost <=
+  loopCost` has already passed — so it renormalises the printed sides
+  rather than restricting what gets costed.
+
+- **A unique hashed side was over-charged.** `InnerJoin.cpp:210-211`
+  caps `currentCardinality` at `MINIMUM_CARDINALITY` when the candidate
+  is unique, so a unique hashed side contributes one row per probe
+  however large the table is. Without it, hashing a large unique inner
+  looked enormously expensive and fcopt preferred a loop where the engine
+  hashes.
+
+### The gate is the finding
+`qa/opt-plans.sh`'s cost grid ran over table sizes `{0, 1, 5, 50, 500,
+3000}` — and **that set has a hole from 5 to 50 that straddles the
+engine's crossover**. A model can score 36/36 on it while being wrong at
+every cardinality in between, and one did: against a widened set of
+thirteen sizes `{0, 1, 2, 5, 8, 20, 30, 50, 120, 500, 900, 3000, 5000}`,
+169 cells, the model this increment replaces scores **153/169 — and all
+sixteen of its errors are in the 2-120 band the narrow set skipped**.
+
+After the four edits: **169/169, zero refusals.** The grid in the gate is
+now the widened one, in both its fresh and stale phases.
+
+A grid that cannot fail is not a grid. Two claims about this cost model
+were previously asserted twice and refuted twice, both times because the
+evidence was a full score on a set too narrow to disagree.
+
+### Not done, deliberately
+- **The `DEFAULT_SELECTIVITY = 0.1` substitution is NOT in this
+  increment**, though it is read, understood and quoted
+  (`Retrieval.cpp:1019-1026`: a **value** test `selectivity <= 0`, per
+  matched segment, and for the leading segment the `minSelectivity` floor
+  is provably inert so the answer is exactly 0.1). Adding it to
+  `index_selectivity` would make the stale-statistics guard *unreachable*
+  as a side effect — which is the very step that was asserted twice and
+  refuted twice. It goes in with the guard's removal, judged against the
+  widened stale grid, as its own increment.
+
+  That grid now exists as ground truth: on the 169 stale cells the engine
+  answers every one, and fcopt today answers 4 and **refuses 165, with
+  zero wrong**. The guard is load-bearing and measurably so.
+
+- **None of this changes an executed plan.** A fleet established the
+  mechanism by reading the code: `server.rs` discards any plan that is
+  not a one-element `Access::Index | Access::Order` stream,
+  `plan_join_bound` pushes a `TableScan` for every base side without
+  calling `choose_index`, and there is no hash-join row source. This is
+  plan-text fidelity — the crate's stated purpose, and a prerequisite for
+  the keyed join — and the commit says so rather than implying otherwise.
+
 ## 2026-08-01 — Two ways of being slow, both measured
 
 A fleet sent to settle three recorded gaps in `opt`'s cost model came
