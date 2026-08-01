@@ -430,8 +430,8 @@ fn respond_prepare(s: &mut TcpStream, enc: &mut Option<Rc4>, describe: &[u8]) ->
 
 /// The describe buffer for N projected columns - the reciprocal of a
 /// client's describe parser. Each column carries its SQL type, length,
-/// and its name as both the field name (16) and the alias (19); clients
-/// key result columns by the alias, so multi-column results need it.
+/// its symbolic field name (16) and its alias (19); clients key result
+/// columns by the alias, so multi-column results need it.
 fn build_describe(cols: &[ProjCol], params: &[Descriptor]) -> Vec<u8> {
     let mut d = Vec::new();
     fn int_item(d: &mut Vec<u8>, code: u8, val: i32) {
@@ -454,7 +454,7 @@ fn build_describe(cols: &[ProjCol], params: &[Descriptor]) -> Vec<u8> {
         int_item(&mut d, 12, c.sub_type); // sub_type (blob text/binary)
         int_item(&mut d, 13, c.scale); // scale (client divides scaled ints)
         int_item(&mut d, 14, c.length); // length
-        str_item(&mut d, 16, &c.name); // field name
+        str_item(&mut d, 16, c.fname.as_deref().unwrap_or(&c.name)); // field name
         str_item(&mut d, 19, &c.name); // alias (the client's column key)
         d.push(8); // describe_end (column)
     }
@@ -1134,7 +1134,18 @@ impl RowSource {
 /// wire and the client divides (that is the engine's contract too).
 #[derive(Clone)]
 struct ProjCol {
+    /// describe item 19, the ALIAS - the client's column key
+    /// (node-firebird keys result rows by it), and what ORDER BY/HAVING
+    /// resolution reads. The user's `AS` overwrites only this.
     name: String,
+    /// describe item 16, the engine's symbolic/source name: the base
+    /// column for a plain read, `ADD`/`UPPER`/`CONSTANT`/... for an
+    /// expression, `""` for unary minus and union columns. The engine
+    /// sets BOTH fields from the expression and lets the alias
+    /// overwrite only par_alias (DsqlAliasNode::setParameterName);
+    /// `None` here means "same as `name`" - the pre-slice behavior, so
+    /// an unconverted construction site stays byte-identical.
+    fname: Option<String>,
     field_id: usize,
     wire: Wire,
     sql_type: i32,
@@ -1241,7 +1252,10 @@ enum Plan {
     /// (value, output-column name): the engine names a lone aggregate's
     /// column by its FUNCTION (COUNT/MIN/MAX/SUM), a bare literal
     /// CONSTANT, a generator read GEN_ID - probed; clients display it
-    Scalar(Option<i64>, String),
+    /// third field: describe item 16, the SYMBOLIC field name, when
+    /// it differs from the output name (an aliased aggregate fast
+    /// path: COUNT(*) AS N is field COUNT, alias N). None = same.
+    Scalar(Option<i64>, String, Option<String>),
     /// `EXECUTE PROCEDURE <name> [(args)]` - the procedure's OUTPUT
     /// parameters as one row. isql prepares this like any other
     /// statement and then FETCHES it (probed: op_prepare, op_execute,
@@ -3513,6 +3527,10 @@ fn build_expr_col(
     };
     Some(ProjCol {
         name: name.to_string(),
+        // the caller knows what the expression WAS (the parse-time
+        // symbolic name, before DECODE desugared to CASE) - it assigns
+        // fname after this returns
+        fname: None,
         field_id: 0,
         wire,
         sql_type,
@@ -3545,7 +3563,11 @@ fn build_projcols(
         // named after itself; one whose expression is not in the map
         // (unparsable source) refuses rather than reading garbage
         if let Some(raw) = computed.get(&(rc.field_id as usize)) {
-            out.push(build_expr_col(raw, &rc.name, columns, descs)?);
+            let mut pc = build_expr_col(raw, &rc.name, columns, descs)?;
+            // a computed column describes as its OWN name, not the
+            // expression's (probed: CC COMPUTED BY (X+1) is CC/CC)
+            pc.fname = Some(rc.name.clone());
+            out.push(pc);
             continue;
         }
         if is_computed_fid(descs, rc.field_id as usize) {
@@ -3554,6 +3576,9 @@ fn build_projcols(
         let (wire, sql_type, length, scale, sub_type) = wire_for(d);
         out.push(ProjCol {
             name: rc.name.clone(),
+            // the catalog name; an alias applied later overwrites only
+            // `name` (probed: X AS Z is field X, alias Z)
+            fname: Some(rc.name.clone()),
             field_id: rc.field_id as usize,
             wire,
             sql_type: nullable(sql_type),
@@ -7890,6 +7915,7 @@ fn wrap_returning(
         let (wire, sql_type, length, scale, sub_type) = wire_for(d);
         cols.push(ProjCol {
             name: c.name.clone(),
+            fname: None,
             field_id: fid,
             wire,
             sql_type,
@@ -11653,6 +11679,7 @@ fn plan_join_bound(
                         });
                     cols.push(ProjCol {
                         name: rc.name.clone(),
+                        fname: None,
                         field_id: idx,
                         wire,
                         sql_type: nullable(sql_type),
@@ -11677,8 +11704,10 @@ fn plan_join_bound(
             for item in items {
                 let (name, alias) = match item {
                     SelItem::Col(name, alias) => (name, alias),
-                    SelItem::Expr(e, out_name) => {
-                        cols.push(build_expr_col(e, out_name, &comb_cols, &comb_descs)?);
+                    SelItem::Expr(e, out_name, fname) => {
+                        let mut pc = build_expr_col(e, out_name, &comb_cols, &comb_descs)?;
+                        pc.fname = Some(fname.clone());
+                        cols.push(pc);
                         continue;
                     }
                     _ => return None, // aggregates over a join: fall back
@@ -11693,6 +11722,11 @@ fn plan_join_bound(
                     // row objects by name kept ONE of them - two columns
                     // asked for, one column delivered.
                     name: alias.clone().unwrap_or_else(|| colname.to_string()),
+                    // the resolved base column shines through as the
+                    // field name (probed: A.X AS AX is field X, alias
+                    // AX; a VIEW side is right by construction because
+                    // plan_view renames both)
+                    fname: Some(colname.to_string()),
                     field_id: idx,
                     wire,
                     sql_type: nullable(sql_type),
@@ -11763,7 +11797,7 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
         // it: a connection with no database behind it, where the wire
         // pipeline must still round-trip.
         _ if db.is_some() => (Plan::Refused, Vec::new()),
-        _ => (Plan::Scalar(Some(FIXED_ANSWER), "CONSTANT".into()), Vec::new()),
+        _ => (Plan::Scalar(Some(FIXED_ANSWER), "CONSTANT".into(), None), Vec::new()),
     }
 }
 
@@ -11898,7 +11932,7 @@ fn splice_ctes(sql: &str, ctes: &[(String, ViewDef)]) -> Option<String> {
                                 .unwrap_or_else(|| c.rsplit('.').next().unwrap_or(c).to_string())
                                 .to_ascii_uppercase(),
                         ),
-                        SelItem::Expr(_, n) | SelItem::Gen(_, _, n) => {
+                        SelItem::Expr(_, n, _) | SelItem::Gen(_, _, n) => {
                             Some(n.to_ascii_uppercase())
                         }
                         SelItem::Agg(_, _, alias) => alias.clone().map(|a| a.to_ascii_uppercase()),
@@ -11968,6 +12002,10 @@ fn plan_view(db: &Option<Database>, dbr: &Database, name: &str) -> Option<(Plan,
         }
         for (c, n) in cols.iter_mut().zip(vd.cols.iter()) {
             c.name = n.clone();
+            // the view column STOPS base-name propagation - unlike a
+            // derived table, whose base name shines through (probed:
+            // V1(VC) over X is VC/VC, never X)
+            c.fname = Some(n.clone());
         }
     }
     Some((inner, cols))
@@ -12067,8 +12105,19 @@ fn plan_over_source(
             None => (Vec::new(), Vec::new()),
             Some(g) => parse_group_by(g, &items, &columns, &descs, synth_base)?,
         };
-        let (gcols, mut gitems) =
+        let (mut gcols, mut gitems) =
             build_group_items(&items, &columns, &descs, &key_fids, &key_exprs, synth_base)?;
+        // a grouped KEY over the derived rows keeps the INNER column's
+        // field name, exactly as the ungrouped read does (probed:
+        // GROUP BY C over `X AS C` is field X, alias C)
+        for (i, gi) in gitems.iter().enumerate() {
+            if let GItem::Key(fid) = gi {
+                if let (Some(gc), Some(ic)) = (gcols.get_mut(i), cols.get(*fid)) {
+                    gc.fname =
+                        Some(ic.fname.clone().unwrap_or_else(|| ic.name.clone()));
+                }
+            }
+        }
         let mut np = 0usize;
         let filter = match where_s {
             None => None,
@@ -12132,10 +12181,23 @@ fn plan_over_source(
                         if let Some(a) = a {
                             pc.name = a;
                         }
+                        // a derived table's BASE name shines through
+                        // (probed: V.C over `X AS C` is field X, over
+                        // `X + 1 AS C` is ADD - unlike a view, which
+                        // renames): pass the inner column's own field
+                        // name up, not the synthetic view's
+                        pc.fname = Some(
+                            cols[pc.field_id]
+                                .fname
+                                .clone()
+                                .unwrap_or_else(|| cols[pc.field_id].name.clone()),
+                        );
                         out_cols.push(pc);
                     }
-                    SelItem::Expr(raw, n) => {
-                        out_cols.push(build_expr_col(&raw, &n, &columns, &descs)?)
+                    SelItem::Expr(raw, n, fname) => {
+                        let mut pc = build_expr_col(&raw, &n, &columns, &descs)?;
+                        pc.fname = Some(fname.clone());
+                        out_cols.push(pc)
                     }
                     _ => return None,
                 }
@@ -12305,7 +12367,7 @@ fn parse_with(sql: &str) -> Option<(Vec<(String, ViewDef)>, String, bool)> {
                                     })
                                     .to_ascii_uppercase(),
                             ),
-                            SelItem::Expr(_, n) | SelItem::Gen(_, _, n) => {
+                            SelItem::Expr(_, n, _) | SelItem::Gen(_, _, n) => {
                                 Some(n.to_ascii_uppercase())
                             }
                             SelItem::Agg(_, _, alias) => {
@@ -12715,7 +12777,7 @@ fn branch_rows(
     // lone aggregate plans to (`SELECT MIN(ID) FROM T`), so without this
     // an aggregate could not seed a recursive CTE or feed an
     // INSERT ... SELECT, even though it answers perfectly on its own.
-    if let Plan::Scalar(v, _) = plan {
+    if let Plan::Scalar(v, ..) = plan {
         return Some(vec![vec![match v {
             Some(n) => Value::Int(*n),
             None => Value::Null,
@@ -12964,11 +13026,18 @@ fn plan_union(
             return None;
         }
     }
-    // the output columns read the already-projected row positionally
+    // the output columns read the already-projected row positionally.
+    // A union column has an EMPTY field name while the alias keeps the
+    // first branch's name (probed: X UNION X+1 is field "", alias X)
     let cols: Vec<ProjCol> = first_cols
         .iter()
         .enumerate()
-        .map(|(i, c)| ProjCol { field_id: i, expr: None, ..c.clone() })
+        .map(|(i, c)| ProjCol {
+            field_id: i,
+            expr: None,
+            fname: Some(String::new()),
+            ..c.clone()
+        })
         .collect();
     if let Some(OrderKey { field: idx, .. }) = order_ordinal {
         if idx >= cols.len() {
@@ -13332,6 +13401,7 @@ fn plan_query_inner(
             .enumerate()
             .map(|(i, p)| ProjCol {
                 name: p.name.clone(),
+                fname: None,
                 field_id: i,
                 wire: Wire::Int64,
                 sql_type: 581, // nullable - see wire_for
@@ -13448,7 +13518,7 @@ fn plan_query_inner(
                                 }
                                 .to_string()
                             })),
-                            SelItem::Expr(_, n) => Some(n.clone()),
+                            SelItem::Expr(_, n, _) => Some(n.clone()),
                             SelItem::Gen(_, _, n) => Some(n.clone()),
                         },
                         Proj::Star => None,
@@ -13462,6 +13532,23 @@ fn plan_query_inner(
                             alias.is_none()
                                 && body.trim() == format!("{}{}", SUBQ_MARK, i)
                         })
+                    })
+                    .collect();
+                // The literal the fold splices in describes as CONSTANT,
+                // but the engine keeps the INNER item's symbolic name as
+                // the FIELD (probed: `(SELECT MAX(X) FROM T)` is MAX,
+                // aliased or not). The text cannot carry that, so each
+                // whole-item subquery remembers its select-list position
+                // and the planned column is patched after the re-plan.
+                let fname_patches: Vec<(usize, String)> = subs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, sub)| {
+                        let idx = split_top_level_commas(&folded).iter().position(|item| {
+                            let (body, _) = split_alias(item);
+                            body.trim() == format!("{}{}", SUBQ_MARK, i)
+                        })?;
+                        Some((idx, subquery_item_name(sub)?.0))
                     })
                     .collect();
                 let mut proj_out = folded.clone();
@@ -13572,7 +13659,27 @@ fn plan_query_inner(
                     eprintln!("[srv] plan: select-list subqueries folded to {:?}", out);
                 }
                 params.clear();
-                return plan_query_inner(&out, db, params);
+                let mut plan = plan_query_inner(&out, db, params)?;
+                for (idx, fname) in &fname_patches {
+                    match &mut plan {
+                        Plan::Project { cols, .. }
+                        | Plan::Join { cols, .. }
+                        | Plan::JoinGroup { cols, .. }
+                        | Plan::Group { cols, .. }
+                        | Plan::Union { cols, .. }
+                        | Plan::Derived { cols, .. }
+                        | Plan::Rows { cols, .. } => {
+                            if let Some(c) = cols.get_mut(*idx) {
+                                c.fname = Some(fname.clone());
+                            }
+                        }
+                        Plan::Scalar(_, _, f) if *idx == 0 => {
+                            *f = Some(fname.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                return Some(plan);
             }
         }
     }
@@ -13635,7 +13742,7 @@ fn plan_query_inner(
                     // NULL answer here read as a legitimate value
                     // (caught by the aggexpr slice's header probes)
                     return match read_generator_value(db.as_ref()?, &gen_name) {
-                        Some(v) => Some(Plan::Scalar(Some(v), "GEN_ID".into())),
+                        Some(v) => Some(Plan::Scalar(Some(v), "GEN_ID".into(), None)),
                         None => Some(Plan::Refused),
                     };
                 }
@@ -13675,30 +13782,37 @@ fn plan_query_inner(
                     // the projection picks output parameters by name
                     let out_names: Vec<String> =
                         meta.outs.iter().map(|p| p.name.clone()).collect();
-                    let picks: Vec<usize> = match parse_projection(split_query(sql)?.0)? {
-                        Proj::Star => (0..out_names.len()).collect(),
-                        Proj::Items(items) => {
-                            let mut v = Vec::new();
-                            for it in &items {
-                                match it {
-                                    SelItem::Col(c, _) => match out_names
-                                        .iter()
-                                        .position(|n| n.eq_ignore_ascii_case(c))
-                                    {
-                                        Some(i) => v.push(i),
-                                        None => return Some(Plan::Refused),
-                                    },
-                                    _ => return Some(Plan::Refused),
+                    // each pick keeps its ALIAS: dropping it answered
+                    // `R AS RR` under the name R - invisible to isql,
+                    // wrong for every client keying rows by alias
+                    let picked: Vec<(usize, Option<String>)> =
+                        match parse_projection(split_query(sql)?.0)? {
+                            Proj::Star => (0..out_names.len()).map(|i| (i, None)).collect(),
+                            Proj::Items(items) => {
+                                let mut v = Vec::new();
+                                for it in &items {
+                                    match it {
+                                        SelItem::Col(c, alias) => match out_names
+                                            .iter()
+                                            .position(|n| n.eq_ignore_ascii_case(c))
+                                        {
+                                            Some(i) => v.push((i, alias.clone())),
+                                            None => return Some(Plan::Refused),
+                                        },
+                                        _ => return Some(Plan::Refused),
+                                    }
                                 }
+                                v
                             }
-                            v
-                        }
-                    };
-                    let cols: Vec<ProjCol> = picks
+                        };
+                    let cols: Vec<ProjCol> = picked
                         .iter()
                         .enumerate()
-                        .map(|(i, p)| ProjCol {
-                            name: out_names[*p].clone(),
+                        .map(|(i, (p, alias))| ProjCol {
+                            name: alias.clone().unwrap_or_else(|| out_names[*p].clone()),
+                            // the declared output parameter is the field
+                            // name (probed: R AS RR is field R, alias RR)
+                            fname: Some(out_names[*p].clone()),
                             field_id: i,
                             wire: Wire::Int64,
                             sql_type: 581,
@@ -13708,6 +13822,7 @@ fn plan_query_inner(
                             expr: None,
                         })
                         .collect();
+                    let picks: Vec<usize> = picked.iter().map(|(p, _)| *p).collect();
                     params.clear();
                     return Some(Plan::ProcSelect { name: pname, args, cols, picks });
                 }
@@ -13799,7 +13914,7 @@ fn plan_query_inner(
     // it must fail this prepare too - with the engine's own status vector
     if let Proj::Items(items) = &proj {
         for it in items {
-            if let SelItem::Expr(raw, _) = it {
+            if let SelItem::Expr(raw, ..) = it {
                 if let Some(n) = raw_bad_substring_len(raw) {
                     return Some(Plan::RefusedEval(EvalErr::InvalidLength(n)));
                 }
@@ -13850,7 +13965,7 @@ fn plan_query_inner(
                     let n = join_rows(db, &base, base_width, &parts, &filter)
                     .ok()?
                     .len();
-                    return Some(Plan::Scalar(Some(n as i64), "COUNT".to_string()));
+                    return Some(Plan::Scalar(Some(n as i64), "COUNT".to_string(), None));
                 }
                 return from_names_view.then_some(Plan::Refused);
             }
@@ -13966,7 +14081,7 @@ fn plan_query_inner(
     // computes for `SELECT SUM(A) + 1 FROM T`.
     let has_agg = items.iter().any(|i| match i {
         SelItem::Agg(..) => true,
-        SelItem::Expr(raw, _) => raw_has_agg(raw),
+        SelItem::Expr(raw, ..) => raw_has_agg(raw),
         _ => false,
     });
     let has_gen = items.iter().any(|i| matches!(i, SelItem::Gen(..)));
@@ -14006,17 +14121,16 @@ fn plan_query_inner(
                 // the engine names a lone aggregate's column by its
                 // function (probed) - CONSTANT here was a standing
                 // difference the aggfn gate's header checks surfaced
-                let name = alias.clone().unwrap_or_else(|| {
-                    match func {
-                        AggFn::Count => "COUNT",
-                        AggFn::Min => "MIN",
-                        AggFn::Max => "MAX",
-                        AggFn::Sum => "SUM",
-                        AggFn::Avg => "AVG",
-                    }
-                    .to_string()
-                });
-                return Some(Plan::Scalar(v, name));
+                let fname = match func {
+                    AggFn::Count => "COUNT",
+                    AggFn::Min => "MIN",
+                    AggFn::Max => "MAX",
+                    AggFn::Sum => "SUM",
+                    AggFn::Avg => "AVG",
+                }
+                .to_string();
+                let name = alias.clone().unwrap_or_else(|| fname.clone());
+                return Some(Plan::Scalar(v, name, Some(fname)));
             }
         }
     }
@@ -14046,8 +14160,10 @@ fn plan_query_inner(
                         let one = build_projcols(&[name.clone()], &columns, &descs, &computed)?;
                         out.push(one.into_iter().next()?);
                     }
-                    SelItem::Expr(e, alias) => {
-                        out.push(build_expr_col(e, alias, &columns, &descs)?);
+                    SelItem::Expr(e, alias, fname) => {
+                        let mut pc = build_expr_col(e, alias, &columns, &descs)?;
+                        pc.fname = Some(fname.clone());
+                        out.push(pc);
                     }
                     SelItem::Gen(gen, step, alias) => {
                         // the generator must exist at prepare (else refuse
@@ -14057,6 +14173,12 @@ fn plan_query_inner(
                         gen_cols.push(GenCol { name: gen.clone(), step: *step, value_index });
                         out.push(ProjCol {
                             name: alias.clone(),
+                            // the spelling is the field name, alias or
+                            // not (probed: NEXT VALUE FOR G1 AS NV is
+                            // field NEXT_VALUE, alias NV)
+                            fname: Some(
+                                if step.is_none() { "NEXT_VALUE" } else { "GEN_ID" }.into(),
+                            ),
                             field_id: value_index,
                             wire: Wire::Int64,
                             // and different NULLABILITY, from the same
@@ -14539,7 +14661,7 @@ fn build_group_items(
             // ordinary expression OVER that row. Deferred to a second
             // pass, because the row's shape is not known until every
             // item has claimed its slot.
-            SelItem::Expr(raw, name) if raw_has_agg(raw) => {
+            SelItem::Expr(raw, name, fname) if raw_has_agg(raw) => {
                 let aggs = collect_aggs(raw);
                 let (f, t) = aggs.first()?.clone();
                 let d = agg_result_desc(f, &t, columns, descs)?;
@@ -14558,6 +14680,7 @@ fn build_group_items(
                 deferred.push((out_idx, raw.clone(), name.clone()));
                 cols.push(ProjCol {
                     name: name.clone(),
+                    fname: Some(fname.clone()),
                     field_id: out_idx,
                     wire: Wire::Int64,
                     sql_type: 581,
@@ -14567,7 +14690,7 @@ fn build_group_items(
                     expr: None,
                 });
             }
-            SelItem::Expr(raw, name) => {
+            SelItem::Expr(raw, name, fname) => {
                 let pos = {
                     let n = normalize_raw(raw);
                     key_exprs.iter().position(|(r, _)| *r == n)?
@@ -14578,6 +14701,7 @@ fn build_group_items(
                 let pc = build_expr_col(raw, name, columns, descs)?;
                 cols.push(ProjCol {
                     name: pc.name,
+                    fname: Some(fname.clone()),
                     field_id: out_idx,
                     wire: pc.wire,
                     sql_type: pc.sql_type,
@@ -14601,13 +14725,13 @@ fn build_group_items(
                     return None; // a selected column that is not grouped
                 }
                 let (wire, sql_type, length, scale, sub_type) = wire_for(descs.get(fid)?);
+                let bare = rc.name.rsplit('.').next().unwrap_or(&rc.name).to_string();
                 cols.push(ProjCol {
                     // the engine describes a grouped key by its COLUMN
                     // name, qualifier dropped (probed: `GROUP BY D.ID`
                     // answers a column titled ID)
-                    name: alias.clone().unwrap_or_else(|| {
-                        rc.name.rsplit('.').next().unwrap_or(&rc.name).to_string()
-                    }),
+                    name: alias.clone().unwrap_or_else(|| bare.clone()),
+                    fname: Some(bare),
                     field_id: out_idx,
                     wire,
                     sql_type: nullable(sql_type),
@@ -14738,19 +14862,21 @@ fn build_group_items(
                     }
                 };
                 // the engine titles aggregate output columns by function
-                // unless the item carries an alias
-                let name = agg_alias.clone().unwrap_or_else(|| {
-                    match func {
-                        AggFn::Count => "COUNT",
-                        AggFn::Min => "MIN",
-                        AggFn::Max => "MAX",
-                        AggFn::Sum => "SUM",
-                        AggFn::Avg => "AVG",
-                    }
-                    .to_string()
-                });
+                // unless the item carries an alias - and the FUNCTION
+                // stays the field name either way (probed: COUNT(*) AS
+                // N is field COUNT, alias N)
+                let fname = match func {
+                    AggFn::Count => "COUNT",
+                    AggFn::Min => "MIN",
+                    AggFn::Max => "MAX",
+                    AggFn::Sum => "SUM",
+                    AggFn::Avg => "AVG",
+                }
+                .to_string();
+                let name = agg_alias.clone().unwrap_or_else(|| fname.clone());
                 cols.push(ProjCol {
                     name,
+                    fname: Some(fname),
                     field_id: out_idx,
                     wire,
                     sql_type: nullable(sql_type),
@@ -15045,7 +15171,7 @@ fn parse_group_by(
                 SelItem::Col(c, _) => c.as_str(),
                 // GROUP BY <ordinal> may name an EXPRESSION select item
                 // (probed: GROUP BY 1 over SELECT UPPER(S), COUNT(*))
-                SelItem::Expr(raw, _) => {
+                SelItem::Expr(raw, ..) => {
                     push_expr(raw.clone(), &mut key_exprs, &mut fids)?;
                     continue;
                 }
@@ -15084,7 +15210,7 @@ fn parse_group_by(
                             // an alias over an EXPRESSION item groups by
                             // that expression
                             let raw = items.iter().find_map(|it| match it {
-                                SelItem::Expr(raw, n) if n.eq_ignore_ascii_case(name) => {
+                                SelItem::Expr(raw, n, _) if n.eq_ignore_ascii_case(name) => {
                                     Some(raw.clone())
                                 }
                                 _ => None,
@@ -16130,6 +16256,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
 fn bigint_col(n: usize) -> ProjCol {
     ProjCol {
         name: format!("C{}", n),
+        fname: None,
         field_id: n,
         wire: Wire::Int64,
         sql_type: 581, // nullable - see wire_for
@@ -16150,8 +16277,9 @@ fn output_cols_of(plan: &Plan) -> Vec<ProjCol> {
         | Plan::Group { cols, .. } => {
             cols.clone()
         }
-        Plan::Scalar(_, name) => vec![ProjCol {
+        Plan::Scalar(_, name, fname) => vec![ProjCol {
             name: name.clone(),
+            fname: fname.clone(),
             field_id: 0,
             wire: Wire::Int64,
             sql_type: 581,
@@ -16160,8 +16288,12 @@ fn output_cols_of(plan: &Plan) -> Vec<ProjCol> {
             sub_type: 0,
             expr: None,
         }],
-        Plan::GenIdIncrement { .. } => vec![ProjCol {
-            name: "GEN_ID".into(),
+        Plan::GenIdIncrement { step, .. } => vec![ProjCol {
+            // the spelling names the column (probed: NEXT VALUE FOR G1
+            // FROM RDB$DATABASE is NEXT_VALUE/NEXT_VALUE, GEN_ID(G1, 1)
+            // is GEN_ID/GEN_ID - this path answered GEN_ID for both)
+            name: if step.is_none() { "NEXT_VALUE" } else { "GEN_ID" }.into(),
+            fname: None,
             field_id: 0,
             wire: Wire::Int64,
             sql_type: 581,
@@ -16224,12 +16356,16 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         d.extend_from_slice(&(s.len() as u16).to_le_bytes());
         d.extend_from_slice(s.as_bytes());
     }
-    // one described variable: (type, sub_type, scale, length, name)
+    // one described variable: (type, sub_type, scale, length, names).
+    // `fname` is item 16 (the engine's symbolic/source name), `name` is
+    // item 19 (the alias, the client's column key) - the engine sets
+    // both from the expression and lets AS overwrite only the alias.
     struct Var {
         sql_type: i32,
         sub_type: i32,
         scale: i32,
         length: i32,
+        fname: String,
         name: String,
     }
     let out_vars: Vec<Var> = output_cols_of(plan)
@@ -16239,6 +16375,7 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
             sub_type: c.sub_type,
             scale: c.scale,
             length: c.length,
+            fname: c.fname.clone().unwrap_or_else(|| c.name.clone()),
             name: c.name,
         })
         .collect();
@@ -16246,7 +16383,14 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         .iter()
         .map(|pd| {
             let (_, sql_type, length, scale, sub_type) = wire_for(pd);
-            Var { sql_type, sub_type, scale, length, name: String::new() }
+            Var {
+                sql_type,
+                sub_type,
+                scale,
+                length,
+                fname: String::new(),
+                name: String::new(),
+            }
         })
         .collect();
     let has_cursor = matches!(
@@ -16293,7 +16437,7 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
                             13 => int_item(&mut d, 13, v.scale),
                             14 => int_item(&mut d, 14, v.length),
                             15 => int_item(&mut d, 15, 0), // null_ind
-                            16 => str_item(&mut d, 16, &v.name), // field
+                            16 => str_item(&mut d, 16, &v.fname), // field
                             17 => str_item(&mut d, 17, ""),      // relation
                             18 => str_item(&mut d, 18, ""),      // owner
                             19 => str_item(&mut d, 19, &v.name), // alias
@@ -16657,7 +16801,7 @@ fn emit_rows_inner(
         | Plan::AlterTableDrop { .. }
         | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. } | Plan::AlterColumnDropIdentity { .. } | Plan::AlterColumnPosition { .. }
         | Plan::GenIdIncrement { .. } | Plan::SetGenerator { .. } => {}
-        Plan::Scalar(v, _) => {
+        Plan::Scalar(v, ..) => {
             w.int(OP_FETCH_RESPONSE).int(0).int(1);
             match v {
                 Some(n) => {
@@ -17327,8 +17471,12 @@ enum SelItem {
     Col(String, Option<String>),
     Agg(AggFn, AggTarget, Option<String>),
     /// a scalar expression (parsed with column NAMES, resolved to field
-    /// ids at plan time) and the output column name it is described by
-    Expr(RawExpr, String),
+    /// ids at plan time), the output column name it is described by
+    /// (the alias when there is one), and the SYMBOLIC field name the
+    /// engine describes it under (ADD, UPPER, DECODE, ...) - carried
+    /// from parse because DECODE desugars to CASE and the symbol cannot
+    /// be recomputed later
+    Expr(RawExpr, String, String),
     /// a generator advance in the select list - `NEXT VALUE FOR <seq>`
     /// (step None) or `GEN_ID(<name>, <n>)` (step Some(n)) - evaluated
     /// once per emitted row (see [GenCol]), with its output column name
@@ -21242,7 +21390,7 @@ fn plan_correlated_select(
         return Some(Plan::Refused);
     }
     // one lookup table per correlated item, each scanned once here
-    let mut lookups: Vec<(usize, Expr, Descriptor, String)> = Vec::new();
+    let mut lookups: Vec<(usize, Expr, Descriptor, (String, String))> = Vec::new();
     for (marker, sub) in correlated {
         let Some((lookup, result_desc)) = build_correlated_lookup(sub, db, &columns, &descs)
         else {
@@ -21255,7 +21403,8 @@ fn plan_correlated_select(
             *marker,
             lookup,
             result_desc,
-            subquery_item_name(sub).unwrap_or_else(|| "CONSTANT".to_string()),
+            subquery_item_name(sub)
+                .unwrap_or_else(|| ("CONSTANT".to_string(), "CONSTANT".to_string())),
         ));
     }
 
@@ -21290,17 +21439,21 @@ fn plan_correlated_select(
     let mut cols: Vec<ProjCol> = Vec::new();
     for item in split_top_level_commas(proj_marked) {
         let (body, alias) = split_alias(item);
-        if let Some((_, lookup, result_desc, iname)) = lookups
+        if let Some((_, lookup, result_desc, (ifname, iname))) = lookups
             .iter()
             .find(|(m, _, _, _)| body.trim() == format!("{}{}", SUBQ_MARK, m))
         {
             let (wire, sql_type, length, scale, sub_type) = wire_for(result_desc);
             cols.push(ProjCol {
-                // the subquery's own item names the column, as it does
-                // for a folded constant one
+                // the subquery DELEGATES naming to its inner item: the
+                // inner ALIAS becomes the outer alias unless an outer
+                // one overrides it, and the inner FIELD name passes
+                // through untouched (probed: (SELECT MAX(X) AS M ...)
+                // is field MAX, alias M; ... AS SUB is MAX/SUB)
                 name: alias
                     .map(|a| a.trim_matches('"').to_ascii_uppercase())
                     .unwrap_or_else(|| iname.clone()),
+                fname: Some(ifname.clone()),
                 field_id: 0,
                 wire,
                 sql_type: nullable(sql_type),
@@ -21322,8 +21475,10 @@ fn plan_correlated_select(
                     }
                     cols.push(pc);
                 }
-                SelItem::Expr(raw, name) => {
-                    cols.push(build_expr_col(&raw, &name, &columns, &descs)?)
+                SelItem::Expr(raw, name, fname) => {
+                    let mut pc = build_expr_col(&raw, &name, &columns, &descs)?;
+                    pc.fname = Some(fname.clone());
+                    cols.push(pc)
                 }
                 _ => return Some(Plan::Refused),
             },
@@ -21350,28 +21505,34 @@ fn plan_correlated_select(
     Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols: Vec::new(), index: None, defer: None })
 }
 
-/// The name a subquery's own select item gives its output column.
-fn subquery_item_name(sub: &str) -> Option<String> {
+/// The (field name, alias) a subquery's own select item gives its
+/// output column - the inner item's symbolic name and its alias-or-name
+/// (probed: `(SELECT MAX(X) AS M FROM T)` describes as field MAX,
+/// alias M; a bare-column subquery passes the column through as both).
+fn subquery_item_name(sub: &str) -> Option<(String, String)> {
     let (p, _, _, _, _, _) = split_query(sub)?;
     match parse_projection(p)? {
         Proj::Items(items) => match items.first()? {
-            SelItem::Col(c, alias) => Some(
-                alias
-                    .clone()
-                    .unwrap_or_else(|| c.rsplit('.').next().unwrap_or(c).to_string()),
-            ),
-            SelItem::Agg(f, _, alias) => Some(alias.clone().unwrap_or_else(|| {
-                match f {
+            SelItem::Col(c, alias) => {
+                let bare = c.rsplit('.').next().unwrap_or(c).to_string();
+                Some((bare.clone(), alias.clone().unwrap_or(bare)))
+            }
+            SelItem::Agg(f, _, alias) => {
+                let fname = match f {
                     AggFn::Count => "COUNT",
                     AggFn::Min => "MIN",
                     AggFn::Max => "MAX",
                     AggFn::Sum => "SUM",
                     AggFn::Avg => "AVG",
                 }
-                .to_string()
-            })),
-            SelItem::Expr(_, n) => Some(n.clone()),
-            SelItem::Gen(_, _, n) => Some(n.clone()),
+                .to_string();
+                Some((fname.clone(), alias.clone().unwrap_or(fname)))
+            }
+            SelItem::Expr(_, n, f) => Some((f.clone(), n.clone())),
+            SelItem::Gen(_, step, n) => Some((
+                if step.is_none() { "NEXT_VALUE" } else { "GEN_ID" }.to_string(),
+                n.clone(),
+            )),
         },
         Proj::Star => None,
     }
@@ -22378,10 +22539,9 @@ fn parse_projection(proj: &str) -> Option<Proj> {
             .any(|k| body.trim().eq_ignore_ascii_case(k));
         if clock_kw {
             let raw = parse_raw_expr_any(body.trim())?;
-            let name = alias_owned
-                .clone()
-                .unwrap_or_else(|| default_expr_name(&raw));
-            items.push(SelItem::Expr(raw, name));
+            let fname = default_expr_name(&raw);
+            let name = alias_owned.clone().unwrap_or_else(|| fname.clone());
+            items.push(SelItem::Expr(raw, name, fname));
             continue;
         }
         // TRUE/FALSE/UNKNOWN/NULL LOOK like identifiers and are
@@ -22424,14 +22584,13 @@ fn parse_projection(proj: &str) -> Option<Proj> {
                         && matching_paren(t.as_bytes(), at) == Some(t.len() - 1)
                 }
             };
-            let name = alias_owned.clone().unwrap_or_else(|| {
-                if decodes {
-                    "DECODE".to_string()
-                } else {
-                    default_expr_name(&raw)
-                }
-            });
-            items.push(SelItem::Expr(raw, name));
+            let fname = if decodes {
+                "DECODE".to_string()
+            } else {
+                default_expr_name(&raw)
+            };
+            let name = alias_owned.clone().unwrap_or_else(|| fname.clone());
+            items.push(SelItem::Expr(raw, name, fname));
         } else {
             return None;
         }
@@ -22565,7 +22724,10 @@ fn default_expr_name(raw: &RawExpr) -> String {
         RawExpr::Concat(_, _) => "CONCATENATION",
         RawExpr::Cast(_, _) => "CAST",
         RawExpr::Coalesce(_) => "COALESCE",
-        RawExpr::NullIf(_, _) => "NULLIF",
+        // the engine compiles NULLIF into a CASE and the header says so
+        // (probed: an un-aliased NULLIF(X, 0) columns as CASE - this
+        // answered NULLIF for a long time, a live describe DIFF)
+        RawExpr::NullIf(_, _) => "CASE",
         // the engine parses IIF into a searched CASE, and the header
         // says so (probed: an un-aliased IIF columns as CASE)
         RawExpr::Iif(_, _, _) => "CASE",
@@ -25608,7 +25770,7 @@ fn switch_stmt(
         *cur,
         StmtSlot {
             sql: std::mem::take(sql),
-            plan: std::mem::replace(plan, Plan::Scalar(Some(FIXED_ANSWER), "CONSTANT".to_string())),
+            plan: std::mem::replace(plan, Plan::Scalar(Some(FIXED_ANSWER), "CONSTANT".to_string(), None)),
             params: std::mem::take(params),
             bound: std::mem::take(bound),
             last_dml: *last_dml,
@@ -25625,7 +25787,7 @@ fn switch_stmt(
         // a handle the client allocated but never prepared
         None => {
             sql.clear();
-            *plan = Plan::Scalar(Some(FIXED_ANSWER), "CONSTANT".to_string());
+            *plan = Plan::Scalar(Some(FIXED_ANSWER), "CONSTANT".to_string(), None);
             params.clear();
             bound.clear();
             *last_dml = (0, 0, 0);
@@ -25829,7 +25991,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // the last op_execute carried for them, and the last DML's per-verb
     // affected counts (what isc_info_sql_records reports).
     let mut stmt_sql = String::new();
-    let mut plan = Plan::Scalar(Some(FIXED_ANSWER), "CONSTANT".to_string());
+    let mut plan = Plan::Scalar(Some(FIXED_ANSWER), "CONSTANT".to_string(), None);
     let mut stmt_params: Vec<Descriptor> = Vec::new();
     let mut bound_args: Vec<WireParam> = Vec::new();
     let mut last_dml = (0i32, 0i32, 0i32); // (inserted, updated, deleted)
@@ -26068,7 +26230,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 // no message.
                 let mut w = W::default();
                 match &p {
-                    Plan::Scalar(v, _) => {
+                    Plan::Scalar(v, ..) => {
                         w.int(OP_SQL_RESPONSE).int(1);
                         match v {
                             Some(n) => {
@@ -26174,7 +26336,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             respond_prepare(&mut s, &mut enc, &describe)?;
                         }
                         None => {
-                            plan = Plan::Scalar(Some(FIXED_ANSWER), "CONSTANT".to_string());
+                            plan = Plan::Scalar(Some(FIXED_ANSWER), "CONSTANT".to_string(), None);
                             stmt_params = Vec::new();
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
@@ -26223,7 +26385,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             respond_prepare(&mut s, &mut enc, &describe)?;
                         }
                         None => {
-                            plan = Plan::Scalar(Some(FIXED_ANSWER), "CONSTANT".to_string());
+                            plan = Plan::Scalar(Some(FIXED_ANSWER), "CONSTANT".to_string(), None);
                             stmt_params = Vec::new();
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
@@ -26695,7 +26857,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     };
                     match gen_id_increment(&mut database, &name, step) {
                         Ok(new_val) => {
-                            plan = Plan::Scalar(Some(new_val), "GEN_ID".to_string());
+                            let n = if step.is_none() { "NEXT_VALUE" } else { "GEN_ID" };
+                            plan = Plan::Scalar(Some(new_val), n.to_string(), None);
                             respond(&mut s, &mut enc, TX_HANDLE)?;
                         }
                         Err(e) => {
@@ -26902,7 +27065,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     stmts.remove(&h);
                     if h == cur_stmt {
                         stmt_sql.clear();
-                        plan = Plan::Scalar(Some(FIXED_ANSWER), "CONSTANT".to_string());
+                        plan = Plan::Scalar(Some(FIXED_ANSWER), "CONSTANT".to_string(), None);
                         stmt_params.clear();
                         bound_args.clear();
                         last_dml = (0, 0, 0);
@@ -28651,7 +28814,7 @@ mod tests {
         };
         // it compiles to a CASE - two branches and a default...
         match &items[0] {
-            SelItem::Expr(RawExpr::Case(branches, else_), name) => {
+            SelItem::Expr(RawExpr::Case(branches, else_), name, _) => {
                 assert_eq!(branches.len(), 2);
                 assert!(else_.is_some());
                 // ... and each branch is an `=` comparison, which is why
@@ -28668,13 +28831,13 @@ mod tests {
             Proj::Items(v) => v,
             Proj::Star => panic!("not a star"),
         };
-        assert!(matches!(&items[0], SelItem::Expr(RawExpr::Case(b, None), _) if b.len() == 1));
+        assert!(matches!(&items[0], SelItem::Expr(RawExpr::Case(b, None), ..) if b.len() == 1));
         // the name is DECODE only when the WHOLE item is the call
         let items = match parse_projection("DECODE(D, 1, 10, 20) + 1").unwrap() {
             Proj::Items(v) => v,
             Proj::Star => panic!("not a star"),
         };
-        assert!(matches!(&items[0], SelItem::Expr(_, n) if n == "ADD"));
+        assert!(matches!(&items[0], SelItem::Expr(_, n, _) if n == "ADD"));
         // and a subject with no pair at all is not a DECODE
         assert!(parse_projection("DECODE(D, 1)").is_none());
     }
@@ -28789,7 +28952,7 @@ mod tests {
             Proj::Star => panic!("not a star"),
         };
         assert!(matches!(items[0], SelItem::Col(ref c, None) if c == "ID"));
-        assert!(matches!(items[1], SelItem::Expr(RawExpr::Int(3), _)));
+        assert!(matches!(items[1], SelItem::Expr(RawExpr::Int(3), ..)));
         // a QUOTED digit is still an identifier
         let q = match parse_projection("\"3\"").unwrap() {
             Proj::Items(v) => v,
@@ -29355,6 +29518,66 @@ mod tests {
     }
 
     #[test]
+    fn describe_carries_field_name_and_alias_separately() {
+        // the engine sets BOTH describe names from the expression and
+        // lets AS overwrite only the alias (DsqlAliasNode); every
+        // expectation here is a probed engine answer
+        let items = |sql: &str| match parse_projection(sql).unwrap() {
+            Proj::Items(v) => v,
+            Proj::Star => panic!("star"),
+        };
+        // an aliased expression keeps its symbolic name in the third
+        // field, so the describe can answer ADD/Y instead of Y/Y
+        let it = items("X + 1 AS Y");
+        assert!(matches!(&it[0], SelItem::Expr(_, n, f) if n == "Y" && f == "ADD"));
+        // NULLIF compiles to a CASE and the header says so (probed;
+        // this answered NULLIF for a long time)
+        let it = items("NULLIF(X, 0)");
+        assert!(matches!(&it[0], SelItem::Expr(_, n, f) if n == "CASE" && f == "CASE"));
+        // DECODE keeps its own name even though it desugars to CASE -
+        // which is WHY the symbol travels from parse time
+        let it = items("DECODE(X, 1, 'a', 'b') AS D");
+        assert!(matches!(&it[0], SelItem::Expr(_, n, f) if n == "D" && f == "DECODE"));
+        // a subquery delegates naming to its inner item: field = the
+        // symbol, alias = the inner alias
+        assert_eq!(
+            subquery_item_name("SELECT MAX(X) AS M FROM T"),
+            Some(("MAX".to_string(), "M".to_string()))
+        );
+        assert_eq!(
+            subquery_item_name("SELECT X FROM T"),
+            Some(("X".to_string(), "X".to_string()))
+        );
+        // the describe writer: item 16 takes fname, 19 takes name, and
+        // an unconverted col (fname None) answers name for both
+        let pc = ProjCol {
+            name: "Y".into(),
+            fname: Some("ADD".into()),
+            field_id: 0,
+            wire: Wire::Int64,
+            sql_type: 580,
+            length: 8,
+            scale: 0,
+            sub_type: 0,
+            expr: None,
+        };
+        let d = build_describe(&[pc], &[]);
+        let find = |code: u8| -> String {
+            let mut i = 0;
+            while i < d.len() {
+                if d[i] == code && i + 3 <= d.len() {
+                    let len = u16::from_le_bytes([d[i + 1], d[i + 2]]) as usize;
+                    return String::from_utf8_lossy(&d[i + 3..i + 3 + len]).into();
+                }
+                i += 1;
+            }
+            panic!("item {} not found", code)
+        };
+        assert_eq!(find(16), "ADD");
+        assert_eq!(find(19), "Y");
+    }
+
+    #[test]
     fn starting_with_parses_and_matches_per_byte() {
         let dnf = |s: &str| parse_predicate(&tokenize(s).unwrap(), &mut 0).unwrap();
         // STARTING [WITH] is one leaf; WITH is optional sugar
@@ -29517,7 +29740,7 @@ mod tests {
                 .map(|i| match i {
                     SelItem::Col(c, _) => c.clone(),
                     SelItem::Agg(..) => "<agg>".into(),
-                    SelItem::Expr(_, name) => format!("<expr:{}>", name),
+                    SelItem::Expr(_, name, _) => format!("<expr:{}>", name),
                     SelItem::Gen(n, s, _) => format!("<gen:{}:{:?}>", n, s),
                 })
                 .collect(),
@@ -29633,8 +29856,8 @@ mod tests {
         );
         // ORDER BY resolution: ordinal into the projection, and by name
         let cols = vec![
-            ProjCol { name: "ID".into(), field_id: 3, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0, sub_type: 0, expr: None },
-            ProjCol { name: "NAME".into(), field_id: 1, wire: Wire::Varying, sql_type: 448, length: 32765, scale: 0, sub_type: 0, expr: None },
+            ProjCol { name: "ID".into(), fname: None, field_id: 3, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0, sub_type: 0, expr: None },
+            ProjCol { name: "NAME".into(), fname: None, field_id: 1, wire: Wire::Varying, sql_type: 448, length: 32765, scale: 0, sub_type: 0, expr: None },
         ];
         let columns = vec![
             RelationColumn { name: "ID".into(), field_id: 3, position: 0 },
@@ -29826,9 +30049,9 @@ mod tests {
     #[test]
     fn plan_falls_back_to_scalar_without_database() {
         // with no database loaded, everything plans to the fixed scalar
-        assert!(matches!(plan_query("SELECT COUNT(*) FROM DEPT", &None).0, Plan::Scalar(Some(FIXED_ANSWER), _)));
-        assert!(matches!(plan_query("SELECT ID, NAME FROM EMP WHERE ID > 5", &None).0, Plan::Scalar(Some(FIXED_ANSWER), _)));
-        assert!(matches!(plan_query("SELECT CAST(1 AS BIGINT) FROM RDB$DATABASE", &None).0, Plan::Scalar(Some(FIXED_ANSWER), _)));
+        assert!(matches!(plan_query("SELECT COUNT(*) FROM DEPT", &None).0, Plan::Scalar(Some(FIXED_ANSWER), ..)));
+        assert!(matches!(plan_query("SELECT ID, NAME FROM EMP WHERE ID > 5", &None).0, Plan::Scalar(Some(FIXED_ANSWER), ..)));
+        assert!(matches!(plan_query("SELECT CAST(1 AS BIGINT) FROM RDB$DATABASE", &None).0, Plan::Scalar(Some(FIXED_ANSWER), ..)));
     }
 
     #[test]
@@ -30218,6 +30441,7 @@ mod tests {
     #[test]
     fn encodes_native_wire_values() {
         let pc = |wire, sql_type, length, scale| ProjCol {
+            fname: None,
             name: "C".into(), field_id: 0, wire, sql_type, length, scale, sub_type: 0, expr: None,
         };
         let enc = |col: ProjCol, v: Value| {
@@ -30260,8 +30484,8 @@ mod tests {
     fn encodes_row_bitmap_and_values() {
         // two INT64 cols, second null: 4-byte bitmap (bit 1 set) + one 8-byte value
         let cols = vec![
-            ProjCol { name: "A".into(), field_id: 0, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0, sub_type: 0, expr: None },
-            ProjCol { name: "B".into(), field_id: 1, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0, sub_type: 0, expr: None },
+            ProjCol { name: "A".into(), fname: None, field_id: 0, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0, sub_type: 0, expr: None },
+            ProjCol { name: "B".into(), fname: None, field_id: 1, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0, sub_type: 0, expr: None },
         ];
         let values = vec![Value::Int(7), Value::Null];
         let mut w = W::default();
@@ -31751,6 +31975,7 @@ mod tests {
         // bare ones, so the parser tries the whole name and then the
         // part after the dot.
         let col = |name: &str, fid: usize| ProjCol {
+            fname: None,
             name: name.into(),
             field_id: fid,
             wire: Wire::Int64,
@@ -31800,7 +32025,7 @@ mod tests {
                     SelItem::Agg(_, _, a) => {
                         format!("agg:{}", a.clone().unwrap_or_else(|| "-".into()))
                     }
-                    SelItem::Expr(_, n) => format!("expr:{n}"),
+                    SelItem::Expr(_, n, _) => format!("expr:{n}"),
                     SelItem::Gen(_, _, n) => format!("gen:{n}"),
                 })
                 .collect()
@@ -32593,7 +32818,7 @@ mod tests {
                 .iter()
                 .map(|i| match i {
                     SelItem::Col(c, _) => format!("col:{}", c),
-                    SelItem::Expr(_, n) => format!("expr:{}", n),
+                    SelItem::Expr(_, n, _) => format!("expr:{}", n),
                     SelItem::Agg(..) => "agg".into(),
                     SelItem::Gen(n, s, _) => format!("gen:{}:{:?}", n, s),
                 })

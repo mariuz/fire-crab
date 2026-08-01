@@ -211,6 +211,11 @@ four; R7 is the removal of what they replaced.
   the boolean-parameter premise that expired when node-firebird went
   metadata-directed. Pre-existing (identical at clean HEAD), unclaimed;
   the gate's premises need re-probing against the current driver.
+  `serve-real-viewjoin.sh` carries 3 of the same class (engine-side
+  "string truncation" errors on view-over-join reads the drivers used
+  to make) — the engine's answer there cannot depend on fire-crab's
+  code, so the DIFF is the environment's, but it should be re-probed
+  and re-premised in the same sweep.
 
 - **(superseded, kept for the mechanism)** A record too large for one page is stored as a head with
   `rhd_incomplete` (flag 8) plus `rhdf` continuation fragments on other
@@ -307,14 +312,29 @@ four; R7 is the removal of what they replaced.
   ONE increment for the first four, because each alone regresses a
   measured fixture.
 
-- **`name` and `alias` are two describe fields, and fire-crab sets both
-  to the alias.** For `SELECT X + 1 AS Y` the engine answers `name: ADD
-  alias: Y`; for `UPPER('a') AS U`, `name: UPPER alias: U`; for a plain
-  `X AS Z`, `name: X alias: Z`. fire-crab answers the alias in both, for
-  every aliased column. Invisible to a client that reads `alias` (which
-  node-firebird does) and visible in isql. Projection-wide, so it needs
-  `ProjCol` to carry both names and the describe writer to emit them
-  separately — its own slice, not a patch.
+- ~~`name` and `alias` are two describe fields, and fire-crab sets both
+  to the alias~~ — *fixed*. `ProjCol` carries `fname` (item 16, the
+  engine's symbolic name — `ADD`, `UPPER`, the base column) beside
+  `name` (item 19, the alias, still the client's row key), `None`
+  meaning "same as name" so unconverted sites stay byte-identical. The
+  engine's rule is `DsqlAliasNode::setParameterName`: the expression
+  sets BOTH, `AS` overwrites only the alias. Probed surprises now
+  pinned by `qa/serve-real-describe.sh` (63 checks): unary minus is
+  EMPTY, `NULLIF` describes as `CASE` (fire-crab answered `NULLIF` —
+  a live DIFF even unaliased), UNION columns have an empty field name,
+  a derived table lets the BASE name shine through where a VIEW hides
+  it, a scalar subquery delegates naming to its inner item, and
+  `NEXT VALUE FOR ... FROM RDB$DATABASE` is `NEXT_VALUE` (the
+  GenIdIncrement path said `GEN_ID`). Two alias-visible bugs fixed on
+  the way: a selectable procedure's `R AS RR` dropped the alias, and
+  the folded-subquery path lost the inner symbol (patched onto the
+  re-planned columns, since SQL text cannot carry it).
+
+  Residual, flagged not gated: a derived table as a JOIN side loses
+  base-name propagation (`resolve_join_col` works over synthetic
+  `RelationColumn`s, an ods catalog type that should not grow a wire
+  concern); and items 17/18 (relation/owner) still answer `""` where
+  the engine names the table/view/procedure — its own slice.
 
 - **A generator inside an EXPRESSION.** `SELECT (NEXT VALUE FOR S) + 100`
   and `(NEXT VALUE FOR S) || 'x'` are answered by the engine and refused

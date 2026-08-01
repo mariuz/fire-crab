@@ -13,6 +13,52 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — The describe's two names
+
+The engine's describe carries a FIELD name (item 16, the symbolic or
+source name) and an ALIAS (item 19, the client's column key), and its
+rule is one line of `DsqlAliasNode::setParameterName`: every expression
+sets BOTH names to its symbol; the user's `AS` overwrites only the
+alias. fire-crab had answered the alias in both fields for every
+aliased column since the describe writer was built.
+
+### Fixed
+- `ProjCol` carries `fname` beside `name`; `None` means "same as name",
+  so an unconverted construction site stays byte-identical. The live
+  describe writer (`answer_prepare`) emits them separately; ~20
+  producer sites set the symbol the engine was probed to answer:
+  `X AS Z` is `X`/`Z`, `X + 1 AS Y` is `ADD`/`Y`, `COUNT(*) AS N` is
+  `COUNT`/`N`, a computed column is its own name, a view column hides
+  the base where a derived table lets it shine through, a UNION column
+  is EMPTY, a grouped key keeps its bare column name under an alias.
+- `NULLIF` describes as `CASE` — it compiles into one; fire-crab
+  answered `NULLIF`, a DIFF visible without any alias.
+- `NEXT VALUE FOR G1 FROM RDB$DATABASE` describes as `NEXT_VALUE`; the
+  GenIdIncrement path had said `GEN_ID` for both spellings.
+- A selectable procedure's `SELECT R AS RR FROM P` DROPPED the alias
+  entirely — wrong for every client keying rows by it.
+- A folded scalar subquery lost its inner symbol (`(SELECT MAX(X) ...)`
+  described as `CONSTANT`): the fold rewrites SQL text, which cannot
+  carry the name, so the fold now remembers each whole-item subquery's
+  position and patches the re-planned column.
+
+### Converted
+- New `qa/serve-real-describe.sh`, 63 checks, comparing BOTH fields via
+  `newStatement` (prepare only, so generator probes advance nothing) —
+  including the engine's surprises: unary minus is EMPTY/EMPTY, a
+  scalar subquery delegates naming to its inner item, `DECODE` keeps
+  its own name although it desugars to CASE (which is why the symbol
+  travels from parse time in `SelItem::Expr`).
+
+### Found, not fixed (recorded in the roadmap)
+- Items 17/18 (relation/owner) still answer `""` where the engine names
+  the table/view/procedure — a separate slice.
+- A derived table as a JOIN side loses base-name propagation — the
+  synthetic `RelationColumn` is an ods catalog type and should not grow
+  a wire concern.
+- `serve-real-viewjoin.sh` carries 3 engine-side errors of the same
+  environment-drift class the index gate showed.
+
 ## 2026-08-01 — STARTING [WITH] joins the predicate parser
 
 The roadmap had carried "STARTING WITH is not in the predicate parser"
