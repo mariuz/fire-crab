@@ -13037,16 +13037,45 @@ fn plan_union(
         }
     }
     // the output columns read the already-projected row positionally.
-    // A union column has an EMPTY field name while the alias keeps the
-    // first branch's name (probed: X UNION X+1 is field "", alias X)
+    // The union FIELD name is EMPTY only when some branch's item is an
+    // EXPRESSION; when every branch reads a plain column, the FIRST
+    // branch's column name stays (probed: X UNION ALL X+1 is field "",
+    // X UNION ALL Y is field X, X+1 UNION ALL X is "" - an adversarial
+    // pass refuted the first version of this rule, which blanked every
+    // union column from the one shape the gate had probed). A plain
+    // column's ProjCol carries expr: None; anything computed does not.
+    let all_plain: Vec<bool> = (0..first_cols.len())
+        .map(|i| {
+            branches.iter().all(|b| {
+                output_cols_of(b).get(i).is_some_and(|c| c.expr.is_none())
+            })
+        })
+        .collect();
     let cols: Vec<ProjCol> = first_cols
         .iter()
         .enumerate()
-        .map(|(i, c)| ProjCol {
-            field_id: i,
-            expr: None,
-            fname: Some(String::new()),
-            ..c.clone()
+        .map(|(i, c)| {
+            // ... and the ALIAS goes the same way when the FIRST
+            // branch's item is an UNALIASED expression (probed:
+            // `X+1 UNION ALL X` describes ""/"" where `X UNION ALL
+            // X+1` keeps alias X and `X+1 AS U1 ...` keeps U1).
+            // "Unaliased" is approximated as name == symbolic name -
+            // an explicit `AS ADD` on an ADD would blank wrongly, a
+            // corner the engine distinguishes by par_alias presence
+            // that the branch plan no longer carries.
+            let unaliased_expr =
+                c.expr.is_some() && c.fname.as_deref() == Some(c.name.as_str());
+            ProjCol {
+                field_id: i,
+                expr: None,
+                name: if unaliased_expr { String::new() } else { c.name.clone() },
+                fname: if all_plain[i] {
+                    Some(c.fname.clone().unwrap_or_else(|| c.name.clone()))
+                } else {
+                    Some(String::new())
+                },
+                ..c.clone()
+            }
         })
         .collect();
     if let Some(OrderKey { field: idx, .. }) = order_ordinal {
@@ -13563,9 +13592,24 @@ fn plan_query_inner(
                     .iter()
                     .enumerate()
                     .filter_map(|(i, sub)| {
-                        let idx = split_top_level_commas(&folded).iter().position(|item| {
+                        let mark = format!("{}{}", SUBQ_MARK, i);
+                        let exists_item = format!("EXISTS {}", mark);
+                        let items = split_top_level_commas(&folded);
+                        // a whole-item `EXISTS <marker>` folds to `TRUE
+                        // AS BOOL`, and the engine names such a column
+                        // BOOL - the literal would say CONSTANT
+                        // (matched on squashed text: split_alias reads
+                        // the marker as EXISTS's trailing alias)
+                        if let Some(idx) = items.iter().position(|item| {
+                            let squashed: String =
+                                item.split_whitespace().collect::<Vec<_>>().join(" ");
+                            squashed.eq_ignore_ascii_case(&exists_item)
+                        }) {
+                            return Some((idx, "BOOL".to_string()));
+                        }
+                        let idx = items.iter().position(|item| {
                             let (body, _) = split_alias(item);
-                            body.trim() == format!("{}{}", SUBQ_MARK, i)
+                            body.trim() == mark
                         })?;
                         Some((idx, subquery_item_name(sub)?.0))
                     })
@@ -14307,6 +14351,25 @@ fn plan_query_inner(
                 }
             }
         };
+        // ORDER BY aimed at a GENERATOR column must refuse, however it
+        // is spelled. The spelled form (`ORDER BY NEXT VALUE FOR S`)
+        // refuses at resolution, but an ORDINAL or ALIAS reference
+        // reaches the key through the ProjCol - a synthetic field_id
+        // for a whole-item generator, an Expr::GenVal inside a cloned
+        // expression - and the sort would then compare UNFILLED slots:
+        // every key NULL, scan order kept, values numbered after the
+        // sort. The engine bumps per COMPARED row there (probed:
+        // `ORDER BY 1 DESC` over a fresh sequence answers 4,5,6 with
+        // the sequence at 6), so answering means wrong rows AND a
+        // diverged stored value. Found by an adversarial pass.
+        if !gen_cols.is_empty()
+            && order_by.iter().any(|k| {
+                k.field >= gen_base
+                    || k.expr.as_ref().is_some_and(expr_contains_genval)
+            })
+        {
+            return None;
+        }
         let index = choose_index(db, rel, table, &descs, &filter, sql, &order_by);
         if trace {
             match &index {
@@ -17499,6 +17562,43 @@ fn parse_gen_sel_item(part: &str) -> Option<(String, Option<i64>)> {
     let step: i64 = args[comma + 1..].trim().parse().ok()?;
     let name = strip_gen_name(args[..comma].trim());
     if name.is_empty() { None } else { Some((name, Some(step))) }
+}
+
+/// Does this RESOLVED expression read a generator slot anywhere? Used
+/// to refuse an ORDER BY key that reaches a generator through an
+/// ordinal or alias - the sort would compare slots the advance has not
+/// filled yet.
+fn expr_contains_genval(e: &Expr) -> bool {
+    fn cond(c: &Cond2) -> bool {
+        match c {
+            Cond2::Cmp(a, _, b) => expr_contains_genval(a) || expr_contains_genval(b),
+            Cond2::IsNull(a) | Cond2::IsNotNull(a) | Cond2::Like(a, ..) => {
+                expr_contains_genval(a)
+            }
+            Cond2::Not(inner) => cond(inner),
+            Cond2::And(parts) | Cond2::Or(parts) => parts.iter().any(cond),
+        }
+    }
+    match e {
+        Expr::GenVal(_) => true,
+        Expr::Neg(a) | Expr::Cast(a, _) => expr_contains_genval(a),
+        Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
+            expr_contains_genval(a) || expr_contains_genval(b)
+        }
+        Expr::Coalesce(args) | Expr::Func(_, args) => args.iter().any(expr_contains_genval),
+        Expr::Cond(c) => cond(c),
+        Expr::Iif(c, a, b) => {
+            cond(c) || expr_contains_genval(a) || expr_contains_genval(b)
+        }
+        Expr::Case(branches, else_) => {
+            branches
+                .iter()
+                .any(|(c, t)| cond(c) || expr_contains_genval(t))
+                || else_.as_deref().is_some_and(expr_contains_genval)
+        }
+        Expr::Lookup { key, .. } => expr_contains_genval(key),
+        _ => false,
+    }
 }
 
 /// Does this expression contain a generator advance anywhere - eager,

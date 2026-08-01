@@ -191,8 +191,18 @@ both "a selectable procedure's output" "SELECT R FROM PR"
 both "... aliased (the alias was dropped once)" "SELECT R AS RR FROM PR"
 
 # --- 10. unions ---------------------------------------------------------
-both "a union column's field is EMPTY" "SELECT X FROM T UNION ALL SELECT X + 1 FROM T"
+# the field name is EMPTY only when some branch's item is an
+# EXPRESSION; an all-plain-column union keeps the FIRST branch's column
+# name (an adversarial pass refuted the blanket-empty rule this gate's
+# first two shapes had suggested)
+both "a union column's field is EMPTY over an expression branch" "SELECT X FROM T UNION ALL SELECT X + 1 FROM T"
 both "... and an aliased first branch names the alias" "SELECT X AS U1 FROM T UNION ALL SELECT X + 1 AS U2 FROM T"
+both "an all-plain-column union keeps the first branch's field" "SELECT X FROM T UNION ALL SELECT X FROM T"
+both "... under an alias too" "SELECT X AS U1 FROM T UNION ALL SELECT X FROM T"
+both "... and the expression may sit in the FIRST branch" "SELECT X + 1 FROM T UNION ALL SELECT X FROM T"
+
+# --- 10b. folded EXISTS -------------------------------------------------
+both "a whole-item EXISTS describes as BOOL" "SELECT EXISTS(SELECT 1 FROM T) FROM RDB\$DATABASE"
 
 # --- 11. shared refusals ------------------------------------------------
 a=$(describe "SELECT ? FROM T" "$PORT" "$A")

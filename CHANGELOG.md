@@ -13,6 +13,50 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — What the refuters found
+
+An adversarial pass over the day's three increments: one confirmed
+clean (STARTING WITH — ~60 probes including a column named STARTING
+used as a table alias, quote/wildcard prefixes, high bytes, and
+Halloween-style updates), two refuted. All three findings fixed and
+pinned.
+
+### Fixed
+- **ORDER BY reaching a generator through an ORDINAL or ALIAS answered
+  wrong rows and diverged the stored sequence.** The spelled form
+  (`ORDER BY NEXT VALUE FOR S`) refused at resolution, but `ORDER BY
+  1` / `ORDER BY A` reach the key through the ProjCol — a synthetic
+  field_id, or an `Expr::GenVal` inside a cloned expression — and the
+  sort ran over slots the advance had not filled: every key NULL, scan
+  order kept, values numbered afterwards, stored value 3 where the
+  engine's was 6. Refused now (`expr_contains_genval` + the synthetic
+  field check), pinned in the genrow gate.
+- **The union FIELD name is empty only when some branch's item is an
+  EXPRESSION** — an all-plain-column union keeps the FIRST branch's
+  column name (probed: `X UNION ALL Y` is field X; `X+1 UNION ALL X`
+  is ""). The increment had blanked every union column from the one
+  shape the gate probed — a regression against pre-increment behavior,
+  which had been right for plain columns by accident.
+- **The union ALIAS blanks too when the first branch's item is an
+  unaliased expression** (probed: `X+1 UNION ALL X` describes ""/"");
+  a pre-existing divergence the new union checks exposed. "Unaliased"
+  is approximated as name == symbolic name.
+- **A folded whole-item EXISTS described as CONSTANT** — the fold
+  rewrites to `TRUE AS BOOL` and the literal named itself; the
+  position-patch now recognizes the `EXISTS <marker>` item and stamps
+  BOOL.
+
+### Recorded (refuter observations, deliberate boundaries)
+- `N STARTING WITH ?` (a parameter prefix against an INTEGER column)
+  refuses where the literal form answers — param_or_typed_term
+  requires a text column; a future slice.
+- A gen-bearing union branch refuses with a conversion-error message
+  rather than a clean unsupported error — cosmetic.
+- `raw_contains_gen` ignores generator advances inside CONDITIONS
+  (IIF/CASE tests); resolution still refuses them, so no wrong answer
+  — but the routing is by luck, worth tightening when conditions learn
+  generators.
+
 ## 2026-08-01 — A generator is an expression leaf
 
 `(NEXT VALUE FOR S) + 100` and its kin, refused since the select-list

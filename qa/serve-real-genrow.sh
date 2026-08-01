@@ -229,8 +229,16 @@ done
 # here - every value NULL and the sequence never moved - so its line is
 # the regression pin for that bug. These run against fire-crab only (a
 # refusal advances nothing, so the twins stay in lockstep).
+# ... including ORDER BY reaching the generator through an ORDINAL or
+# an ALIAS - the spelled form refuses at resolution, but these two
+# reach the key through the ProjCol and ANSWERED with wrong rows and a
+# diverged stored value before an adversarial pass caught them (the
+# sort ran over slots the advance had not filled).
 for st in "SELECT X FROM SRC WHERE NEXT VALUE FOR SEQ > 0" \
           "SELECT X FROM SRC ORDER BY NEXT VALUE FOR SEQ" \
+          "SELECT NEXT VALUE FOR SEQ, X FROM SRC ORDER BY 1 DESC" \
+          "SELECT NEXT VALUE FOR SEQ AS A, X FROM SRC ORDER BY A DESC" \
+          "SELECT (NEXT VALUE FOR SEQ) + 0 AS A, X FROM SRC ORDER BY 1" \
           "SELECT CASE WHEN X > 15 THEN NEXT VALUE FOR SEQ ELSE -1 END FROM SRC" \
           "SELECT FIRST 2 NEXT VALUE FOR SEQ FROM SRC" \
           "SELECT COUNT(*), NEXT VALUE FOR SEQ FROM SRC" \
