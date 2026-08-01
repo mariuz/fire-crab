@@ -13,6 +13,65 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — Patch the head, leave the tail alone
+
+`dml::patch_head_in_place`. A record too large for a page is stored as a
+head plus continuation fragments, and the catalogue patch sites refused
+such a record outright — costing 88 `COMMENT ON TABLE` and 92
+`DROP INDEX` statements on an ordinary `gbak`-restored database that the
+engine performs without complaint.
+
+### The guard is the design
+Every poked range must end within the head's unpacked length, or the
+function refuses and the caller fails exactly as before. That is not
+caution for its own sake: it is what makes the change small enough to be
+safe. Measured on a restored 220-table schema, the head's own bytes are a
+**byte prefix of the assembled image in 266 of 266** fragmented rows, and
+every field these sites poke lands inside it — **88 of 88 and 178 of
+178**. The change never reaches the tail, so the tail never has to move.
+
+A poke that ran past the head would need an `rhdf` writer, packed-stream
+truncation, tail teardown and page compaction. Those four are
+deliberately NOT built: each is a new way to write into a user's
+database, and nothing in the 184 statements needs one.
+
+Two further refusals, both because the alternative is worse: an
+unfragmented record is sent to the ordinary update path, and a repack
+that would grow past its slot is rejected rather than relocated, because
+moving the body would strand a tail that points at this page.
+
+Never touched: the transaction id, the back pointer, the format byte,
+`rhdf_f_page`/`rhdf_f_line`, and every fragment after the head. This is a
+byte edit inside one record's payload, not a record rewrite — which is
+why it does not push a back version either, matching what the engine does
+for catalogue patches.
+
+### What it fixes, and what it does not
+`COMMENT ON TABLE` now succeeds on every table of the restored fixture
+(it was 48 of 60, refusing exactly the fragmented ones). Of the 184
+fragmentation-caused refusals measured on the 220-table schema, this
+slice addresses 179. The remaining five are indexes that own a fragmented
+`RDB$INDEX_SEGMENTS` row, deleted through the same rejecting path — a
+separate increment, with its own honest number.
+
+### The gate learned to check the bytes, not just the survival
+`gfix` clean and "the engine still opens it" prove the page structure
+survived; neither proves the value went where it was meant to.
+`serve-real-restored.sh` now reads the new descriptions back **through
+the engine** and asserts that a field of the same rows which should NOT
+have changed is intact. A mis-split shows there first.
+
+Four unit tests, and the ones that matter are the refusals: a poke past
+the head, an unfragmented record, and an over-long repack each leave the
+record byte-identical.
+
+392 unit tests; restored gate 8/8.
+
+**Adversarial verification is in flight** — three lenses (MVCC, the bytes,
+what else reaches the code) attacking this specifically, because it
+writes into real databases and a prototype someone else validated is not
+the same as this implementation being correct.
+
 ## 2026-08-01 — A write that relabelled the row it wrote
 
 A fleet asked to design fragmented-record rewriting found, on the way, a

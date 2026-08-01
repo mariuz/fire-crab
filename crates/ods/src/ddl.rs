@@ -5720,12 +5720,19 @@ fn patch_sys_row(
     // It needs a system relation carrying more than one format to fire,
     // so it has been latent rather than absent - and it is reachable on
     // ORDINARY rows, nothing to do with fragmentation.
-    let (mut image, format_no) = {
+    let (mut image, format_no, fragmented) = {
         let start = page as usize * page_size;
         let dp = DataPage::decode(file.get(start..start + page_size).ok_or("bad page")?)
             .ok_or("bad data page")?;
         let r = dp.record(slot).ok_or("no row image")?;
-        (r.image().ok_or("no row image")?, r.format)
+        let frag = r.flags & crate::data::flags::INCOMPLETE != 0;
+        // A FRAGMENTED ROW IS READ WHOLE and patched in its head. Reading
+        // with `image()` answered None here, which is what refused 88
+        // COMMENT ON and 92 DROP INDEX statements on an ordinary restored
+        // database - see [dml::patch_head_in_place] for why the head is
+        // enough and what happens when it is not.
+        let img = crate::data::assembled_image(file, page_size, &r).ok_or("no row image")?;
+        (img, r.format, frag)
     };
     let descs = formats
         .iter()
@@ -5733,6 +5740,9 @@ fn patch_sys_row(
         .map(|(_, d)| d.clone())
         .ok_or("the row's format is not among the relation's computed formats")?;
     let columns = relation_columns(file, page_size, rel_name);
+    // which byte ranges the loop below actually changes, so a fragmented
+    // row can be patched by range instead of rewritten whole
+    let mut touched: Vec<(usize, usize)> = Vec::new();
     for (name, v) in values {
         let fid = columns
             .iter()
@@ -5750,9 +5760,26 @@ fn patch_sys_row(
             .get_mut(at..at + bytes.len())
             .ok_or("image shorter than its format")?
             .copy_from_slice(&bytes);
+        touched.push((at, bytes.len()));
         image[fid / 8] &= !(1 << (fid % 8)); // not NULL
     }
-    dml::update_records(file, page_size, rel, &[(page, slot, image)], format_no)?;
+    if fragmented {
+        // Only the bytes that actually changed, as offsets into the
+        // assembled image - which for a fragmented record begins with the
+        // head's own bytes, so an offset inside the head is the same
+        // offset either way. `patch_head_in_place` re-checks that every
+        // range lands in the head and refuses otherwise.
+        let mut pokes: Vec<(usize, Vec<u8>)> = Vec::new();
+        for (at, len) in touched {
+            pokes.push((at, image[at..at + len].to_vec()));
+        }
+        // the null-flag bytes are at the very front, so they are always
+        // in the head
+        pokes.push((0, image[..crate::format::flag_bytes(descs.len())].to_vec()));
+        dml::patch_head_in_place(file, page_size, page, slot, &pokes)?;
+    } else {
+        dml::update_records(file, page_size, rel, &[(page, slot, image)], format_no)?;
+    }
     Ok(())
 }
 

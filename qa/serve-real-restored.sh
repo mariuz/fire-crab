@@ -230,6 +230,36 @@ case "$r" in
     *) echo "DIFF unexpected DDL outcome: $r"; fail=1 ;;
 esac
 
+# --- 4b. THE POKE MUST HAVE LANDED ON THE RIGHT BYTES ------------------
+# `gfix` clean and "the engine still opens it" prove the page structure
+# survived; neither proves the VALUE went where it was meant to. A
+# head-in-place patch writes into a record whose tail lives on another
+# page, so the two things worth checking are that the new value reads
+# back THROUGH THE ENGINE, and that a TAIL-RESIDENT field of the same row
+# is untouched - a mis-split shows there first.
+ran=$((ran + 1))
+back=$("$ISQL" -q -b -user "$U" -pas "$P" "$FC" <<'SQL' 2>&1
+SET HEADING OFF;
+SELECT COUNT(*) FROM RDB$RELATIONS
+ WHERE RDB$SYSTEM_FLAG = 0 AND RDB$DESCRIPTION IS NOT NULL;
+SQL
+)
+nback=$(printf '%s' "$back" | grep -oE '[0-9]+' | head -1)
+tail_ok=$("$ISQL" -q -b -user "$U" -pas "$P" "$FC" <<'SQL' 2>&1
+SET HEADING OFF;
+SELECT COUNT(*) FROM RDB$RELATIONS
+ WHERE RDB$SYSTEM_FLAG = 0 AND TRIM(RDB$OWNER_NAME) = 'SYSDBA';
+SQL
+)
+ntail=$(printf '%s' "$tail_ok" | grep -oE '[0-9]+' | head -1)
+if [ "${nback:-0}" -ge "$cat_n" ] && [ "${ntail:-0}" = "$cat_n" ]; then
+    echo "OK   the engine reads back all $nback descriptions, and every owner name survived"
+else
+    echo "DIFF the engine sees $nback descriptions and $ntail intact owner names, expected $cat_n of each"
+    echo "     (a patch that landed on the wrong bytes shows up exactly here)"
+    fail=1
+fi
+
 # --- 5. whatever the DDL did, the file must still be sound -------------
 ran=$((ran + 1))
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$FC" 2>&1)
@@ -257,8 +287,8 @@ else
 fi
 
 rm -f "$SRC" "$FBK" "$RE" "$FC" "$D"/fc-rst*.js
-if [ "$ran" -lt 7 ]; then
-    echo "DIFF only $ran checks ran (expected at least 7) - did one silently skip?"
+if [ "$ran" -lt 8 ]; then
+    echo "DIFF only $ran checks ran (expected at least 8) - did one silently skip?"
     fail=1
 fi
 exit $fail

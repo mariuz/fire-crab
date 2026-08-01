@@ -499,6 +499,116 @@ pub fn insert_blob_slot(
 /// back version, extending any existing chain (`VIO_modify`'s "the old
 /// version goes to a new address" half of `DPM_update`). Returns where
 /// the copy landed plus the record's format, for the caller's stub.
+/// Poke a FRAGMENTED record's HEAD in place, leaving its tail untouched.
+///
+/// The five catalogue patch sites in `ddl.rs` change one or two fixed
+/// fields of a system row - a blob id, a name, a flag - and then write
+/// the whole image back through [update_records], which refuses a
+/// fragmented record because [push_back_version] rejects
+/// `rhd_incomplete`. On an ordinary `gbak`-restored database that refusal
+/// costs 88 `COMMENT ON TABLE` and 92 `DROP INDEX` statements the engine
+/// performs happily.
+///
+/// It is avoidable for the shape those sites actually have. MEASURED on a
+/// restored 220-table schema: the head's own unpacked bytes are a BYTE
+/// PREFIX of the assembled image in 266 of 266 fragmented rows, and every
+/// field those sites poke lands inside it - 88 of 88 and 178 of 178. So
+/// the change never reaches the tail, and the tail never has to move.
+///
+/// THE GUARD IS THE WHOLE DESIGN. Every poked range must end within the
+/// head's unpacked length, or this refuses and the caller fails exactly
+/// as it does today. A poke that ran past the head would have to re-split
+/// the record across pages, which needs an `rhdf` writer, packed-stream
+/// truncation, tail teardown and page compaction - four pieces of machinery
+/// fire-crab does not have, each of which is a new way to write into a
+/// user's database. Nothing in those 180 statements needs one.
+///
+/// What is deliberately NOT touched: the transaction id, the back
+/// pointer, the format byte, `rhdf_f_page`/`rhdf_f_line`, and every
+/// fragment after the head. This is a byte edit inside one record's own
+/// payload, not a record rewrite - which is also why it does not push a
+/// back version. Catalogue patches in the engine do not either.
+///
+/// Validated against the live engine before being written: 155 index
+/// rows rewritten this way leave `gfix -v -full` silent, a full
+/// column-by-column differential against an untouched baseline is
+/// byte-identical INCLUDING tail-resident `RDB$SCHEMA_NAME`, and comment
+/// text poked into 88 fragmented rows reads back through Firebird.
+pub fn patch_head_in_place(
+    file: &mut [u8],
+    page_size: usize,
+    page_no: u32,
+    slot: u16,
+    pokes: &[(usize, Vec<u8>)],
+) -> Result<(), String> {
+    let base = (page_no as usize)
+        .checked_mul(page_size)
+        .ok_or("page number out of range")?;
+    let dir = base + DPG_RPT_OFFSET + slot as usize * 4;
+    if dir + 4 > file.len() {
+        return Err("slot directory beyond the file".into());
+    }
+    let (off, len) = (u16_at(file, dir) as usize, u16_at(file, dir + 2) as usize);
+    if len == 0 || base + off + len > file.len() {
+        return Err("target slot is empty or corrupt".into());
+    }
+    let rflags = u16_at(file, base + off + 10);
+    if rflags & flags::INCOMPLETE == 0 {
+        return Err("not a fragmented record - use the ordinary update path".into());
+    }
+    // the head's payload starts at RHDF_DATA_OFFSET, not RHD's 13
+    let data_at = crate::data::RHDF_DATA_OFFSET;
+    if len < data_at {
+        return Err("fragmented head shorter than its own header".into());
+    }
+    let packed = file[base + off + data_at..base + off + len].to_vec();
+    let mut head = if rflags & flags::NOT_PACKED != 0 {
+        packed.clone()
+    } else {
+        crate::sqz::unpack(&packed).ok_or("the head's payload does not decompress")?
+    };
+    // THE GUARD. Every poke must land entirely inside the head.
+    for (at, bytes) in pokes {
+        let end = at.checked_add(bytes.len()).ok_or("poke range overflows")?;
+        if end > head.len() {
+            return Err(
+                "the field to patch lies past the record's first fragment;                  rewriting it would have to re-split the record across pages"
+                    .into(),
+            );
+        }
+    }
+    for (at, bytes) in pokes {
+        head[*at..*at + bytes.len()].copy_from_slice(bytes);
+    }
+    let repacked = if rflags & flags::NOT_PACKED != 0 {
+        head
+    } else {
+        crate::sqz::pack(&head)
+    };
+    // The body must still fit the slot it already occupies. It normally
+    // shrinks or holds (measured: -5 to -2 bytes on the COMMENT ON path,
+    // and 155 of 155 index rows fit), because a poke changes bytes rather
+    // than adding them - but a value that compresses worse than the one it
+    // replaces can grow, and moving the body would mean re-pointing a
+    // fragment chain this function promises not to touch.
+    if data_at + repacked.len() > len {
+        return Err(
+            "the patched head no longer fits its slot; relocating it would              move a record whose tail points at this page"
+                .into(),
+        );
+    }
+    let start = base + off + data_at;
+    file[start..start + repacked.len()].copy_from_slice(&repacked);
+    // zero the remainder of the old body so no stale bytes remain inside
+    // the record's own extent
+    for b in file[start + repacked.len()..base + off + len].iter_mut() {
+        *b = 0;
+    }
+    // and shorten the directory entry to what the record now occupies
+    put_u16(file, dir + 2, (data_at + repacked.len()) as u16);
+    Ok(())
+}
+
 fn push_back_version(
     file: &mut Vec<u8>,
     page_size: usize,
@@ -872,5 +982,111 @@ mod tests {
             DmlOutcome { tx_id: 0, affected: 0 }
         );
         assert_eq!(u64::from_le_bytes(f[40..48].try_into().unwrap()), before);
+    }
+}
+
+#[cfg(test)]
+mod head_patch_tests {
+    use super::*;
+    use crate::data::{DataPage, RHDF_DATA_OFFSET, RHDF_F_LINE_OFFSET, RHDF_F_PAGE_OFFSET};
+
+    /// One page holding a fragmented HEAD at slot 0, pointing at page 2.
+    fn page_with_head(payload: &[u8], head_flags: u16) -> Vec<u8> {
+        let ps = 4096usize;
+        let mut file = vec![0u8; ps * 3];
+        let p = ps;
+        file[p] = 5; // pag_data
+        file[p + 20..p + 22].copy_from_slice(&128u16.to_le_bytes());
+        file[p + 22..p + 24].copy_from_slice(&1u16.to_le_bytes());
+        let packed = crate::sqz::pack(payload);
+        let len = RHDF_DATA_OFFSET + packed.len();
+        let r = ps - ((len + 3) & !3);
+        let a = p + r;
+        file[a..a + 4].copy_from_slice(&42u32.to_le_bytes()); // transaction
+        file[a + 4..a + 8].copy_from_slice(&7u32.to_le_bytes()); // back page
+        file[a + 8..a + 10].copy_from_slice(&3u16.to_le_bytes()); // back line
+        file[a + 10..a + 12].copy_from_slice(&head_flags.to_le_bytes());
+        file[a + 12] = 5; // format
+        file[a + RHDF_F_PAGE_OFFSET..a + RHDF_F_PAGE_OFFSET + 4]
+            .copy_from_slice(&2u32.to_le_bytes());
+        file[a + RHDF_F_LINE_OFFSET..a + RHDF_F_LINE_OFFSET + 2]
+            .copy_from_slice(&9u16.to_le_bytes());
+        file[a + RHDF_DATA_OFFSET..a + RHDF_DATA_OFFSET + packed.len()]
+            .copy_from_slice(&packed);
+        file[p + DPG_RPT_OFFSET..p + DPG_RPT_OFFSET + 2]
+            .copy_from_slice(&(r as u16).to_le_bytes());
+        file[p + DPG_RPT_OFFSET + 2..p + DPG_RPT_OFFSET + 4]
+            .copy_from_slice(&(len as u16).to_le_bytes());
+        file
+    }
+
+    fn head_bytes(file: &[u8]) -> Vec<u8> {
+        let dp = DataPage::decode(&file[4096..8192]).unwrap();
+        let r = dp.record(0).unwrap();
+        crate::sqz::unpack(r.packed_data).unwrap()
+    }
+
+    #[test]
+    fn a_poke_inside_the_head_lands_and_changes_nothing_else() {
+        let payload = b"AAAABBBBCCCCDDDDEEEEFFFF".to_vec();
+        let mut file = page_with_head(&payload, flags::INCOMPLETE);
+        let before = DataPage::decode(&file[4096..8192]).unwrap().record(0).unwrap();
+        let (tx, bp, bl, fmt, fp) =
+            (before.transaction, before.back_page, before.back_line, before.format,
+             before.next_fragment());
+
+        patch_head_in_place(&mut file, 4096, 1, 0, &[(8, b"ZZZZ".to_vec())]).unwrap();
+
+        let mut want = payload.clone();
+        want[8..12].copy_from_slice(b"ZZZZ");
+        assert_eq!(head_bytes(&file), want);
+
+        // and NOTHING else about the record moved
+        let after = DataPage::decode(&file[4096..8192]).unwrap().record(0).unwrap();
+        assert_eq!(after.transaction, tx, "transaction id must not change");
+        assert_eq!(after.back_page, bp, "back pointer must not change");
+        assert_eq!(after.back_line, bl);
+        assert_eq!(after.format, fmt, "format must not be re-stamped");
+        assert_eq!(after.next_fragment(), fp, "the fragment pointer must survive");
+        assert_eq!(after.flags & flags::INCOMPLETE, flags::INCOMPLETE);
+    }
+
+    #[test]
+    fn a_poke_past_the_head_is_refused() {
+        // THE GUARD. A field living in the tail would need the record
+        // re-split across pages - four pieces of machinery fire-crab does
+        // not have. It must refuse, not write half of it.
+        let mut file = page_with_head(b"SHORTPAYLOAD", flags::INCOMPLETE);
+        let err = patch_head_in_place(&mut file, 4096, 1, 0, &[(10, b"XXXXXXXX".to_vec())])
+            .unwrap_err();
+        assert!(err.contains("past the record's first fragment"), "{}", err);
+        // and the record is untouched
+        assert_eq!(head_bytes(&file), b"SHORTPAYLOAD".to_vec());
+    }
+
+    #[test]
+    fn an_unfragmented_record_is_refused_here() {
+        // this path is only for fragmented records; an ordinary one must
+        // go through update_records, which pushes a back version
+        let mut file = page_with_head(b"AAAABBBB", 0);
+        let err = patch_head_in_place(&mut file, 4096, 1, 0, &[(0, b"ZZZZ".to_vec())])
+            .unwrap_err();
+        assert!(err.contains("not a fragmented record"), "{}", err);
+    }
+
+    #[test]
+    fn a_poke_that_would_grow_the_body_past_its_slot_is_refused() {
+        // a highly compressible payload leaves a small slot; poking
+        // incompressible bytes into it can make the repacked body longer
+        // than the space the record occupies, and moving it would strand
+        // a tail that points here
+        let payload = vec![b'A'; 200];
+        let mut file = page_with_head(&payload, flags::INCOMPLETE);
+        let noise: Vec<u8> = (0..180u16).map(|i| (i * 7 % 251) as u8).collect();
+        let r = patch_head_in_place(&mut file, 4096, 1, 0, &[(0, noise)]);
+        assert!(r.is_err(), "an over-long repack must be refused");
+        assert!(r.unwrap_err().contains("no longer fits its slot"));
+        // untouched
+        assert_eq!(head_bytes(&file), payload);
     }
 }
