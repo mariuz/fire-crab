@@ -13,6 +13,33 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — Sixteen DIFFs, one stale path
+
+The "environment drift" recorded yesterday — serve-real-index 346/13,
+viewjoin 33/3, engine-side errors labelled "numeric overflow on the
+BIGINT-family keys" — is diagnosed, and the label was a red herring.
+
+### Fixed
+- All 16 DIFFs were ONE defect, selected by what each check PROJECTS
+  (a ≥2-character NONE VARCHAR), not what it filters on. A stock
+  node-firebird 2.11.0 declares its output slot at the column's BYTE
+  length; `blr_varying` carries no charset; the engine resolves the
+  slot to the ATTACHMENT charset (UTF8, 4 bytes/char) and its capacity
+  check raises "string right truncation" per row. The green baselines
+  ran on the patched 2.14.1 checkout with the node-firebird#422 fix;
+  a NODE_PATH note went stale and selected the published 2.11.0. The
+  engine build never changed (LI-T6.0.0.2076, verified). Both gates
+  now pin `encoding:"NONE"` — driver-proof — and answer 359/0 and
+  36/0 under either driver.
+
+### Found, not fixed (recorded in the roadmap)
+- fire-crab IGNORES the client's declared output message BLR (op_fetch
+  reads and discards it), so for a stock 2.11.0 client the ENGINE
+  refuses — correctly, per the client's own declaration — what
+  fire-crab answers. Honoring the declared format (charset-aware
+  per-row truncation with the engine's status vector) is its own
+  slice.
+
 ## 2026-08-01 — What the refuters found
 
 An adversarial pass over the day's three increments: one confirmed

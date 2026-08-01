@@ -204,18 +204,35 @@ four; R7 is the removal of what they replaced.
   byte — any gate comparing VARCHAR VALUES with trailing blanks must
   compare a server-side length instead (see serve-real-starting.sh).
 
-- **`qa/serve-real-index.sh` is 346/13 at HEAD on this box, and the 13
-  are environment drift, not code.** The engine side ERRORS (numeric
-  overflow) on the BIGINT/SMALLINT/SCALED key checks and the
-  descending-index family where fcwire answers rows — the same class as
-  the boolean-parameter premise that expired when node-firebird went
-  metadata-directed. Pre-existing (identical at clean HEAD), unclaimed;
-  the gate's premises need re-probing against the current driver.
-  `serve-real-viewjoin.sh` carries 3 of the same class (engine-side
-  "string truncation" errors on view-over-join reads the drivers used
-  to make) — the engine's answer there cannot depend on fire-crab's
-  code, so the DIFF is the environment's, but it should be re-probed
-  and re-premised in the same sweep.
+- ~~`qa/serve-real-index.sh` 346/13 and `viewjoin` 33/3 environment
+  drift~~ — *diagnosed and fixed*, and the label "numeric overflow on
+  the BIGINT-family keys" was a red herring. All 16 DIFFs were ONE
+  defect selected by what the check PROJECTS, not what it filters on:
+  a ≥2-character NONE `VARCHAR` through the driver's default UTF8
+  attachment. A stock node-firebird (2.11.0) declares its output slot
+  at the column's byte length; `blr_varying` carries no charset, the
+  engine resolves the slot to the ATTACHMENT charset (4 bytes/char),
+  and the capacity check raises "string right truncation" per row —
+  the ENGINE erroring, correctly, on the client's own declaration. The
+  green baselines ran on the patched 2.14.1 checkout
+  (`/home/ubuntu/work`, has the node-firebird#422 fix); the drift was
+  a NODE_PATH note gone stale. Both gates are pinned to
+  `encoding:"NONE"` now (driver-proof) and answer 359/0 and 36/0
+  under either driver.
+
+- **fire-crab IGNORES the client's declared output message format.**
+  Found by the drift diagnosis: op_fetch discards the client's BLR
+  (`server.rs` "read_wire_bytes // blr"), as do op_exec_immediate2 and
+  op_execute2's out_blr — rows encode from fire-crab's own formats. So
+  for a stock 2.11.0 client, THE ENGINE REFUSES (per-row truncation on
+  a too-narrow declared slot) WHAT FIRE-CRAB ANSWERS. Being a faithful
+  twin means: record `isc_dpb_lc_ctype` at attach, parse the out-BLR
+  text slots (`parse_param_blr` already decodes these shapes for
+  input), and raise `isc_arith_except << isc_string_truncation <<
+  isc_trunc_limits << Num(cap) << Num(actual)` in place of the row
+  when a non-NULL text value exceeds `declared_len /
+  max_bytes_per_char(attachment charset)`. Zero-row and NULL results
+  succeed (probed). Its own slice, unclaimed.
 
 - **(superseded, kept for the mechanism)** A record too large for one page is stored as a head with
   `rhd_incomplete` (flag 8) plus `rhdf` continuation fragments on other

@@ -104,6 +104,13 @@ kill -0 $srv 2>/dev/null || {
     exit 1
 }
 
+# The attachment charset is pinned to NONE: this fixture's text values
+# are NONE columns, and a UTF8 attachment makes a stock node-firebird
+# (2.11.0, without the #422 fix) declare output slots too narrow - the
+# ENGINE then raises "string right truncation" per row and 16 checks
+# spuriously DIFF while fire-crab, which ignores the client's declared
+# output format, answers. Diagnosed 2026-08-01: the green baselines ran
+# on the patched 2.14.1 checkout; the premise is now driver-proof.
 query() { # <sql> <port> <db>
     n=0
     while [ $n -lt 6 ]; do
@@ -111,7 +118,7 @@ query() { # <sql> <port> <db>
           process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(0); });
           const F=require("node-firebird");
           F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
-                    user:"SYSDBA",password:"masterkey"},(e,db)=>{
+                    user:"SYSDBA",password:"masterkey",encoding:"NONE"},(e,db)=>{
             if(e){console.log("CONN_ERR");process.exit(0);}
             db.query(process.env.FC_Q,(e2,r)=>{
               if(e2){console.log("ERR "+(e2.message||"").split("\n")[0].slice(0,50));db.detach();process.exit(0);}
