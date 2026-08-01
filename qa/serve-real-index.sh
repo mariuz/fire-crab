@@ -40,6 +40,15 @@ ISQL="${ISQL:-isql}"
 PORT="${1:-4554}"
 REAL="${FC_REAL_PORT:-3050}"
 U="${ISC_USER:-SYSDBA}"; P="${ISC_PASSWORD:-masterkey}"
+# PER-PORT, and that is not tidiness. This gate asserts on the SERVER'S
+# OWN LOG - `natural()` counts "index scan:" lines before and after a
+# statement and fails if the count moved. With a fixed path, two runs of
+# this gate write into the SAME FILE, and each one then reads the other's
+# index scans as its own: every negative assertion fires at once,
+# including "a table with no index at all drove an index", which is not a
+# thing that can happen. Measured: 44 DIFFs, none of them real. The port
+# already distinguishes concurrent runs, so the log follows it.
+LOG="/tmp/fc-serve-index-$PORT.log"
 D=/tmp/fbhandson
 A="$D/fc-idx-crab.fdb"
 B="$D/fc-idx-engine.fdb"
@@ -207,7 +216,7 @@ EOF
 make_db "$A" || { echo "FAIL scratch A"; exit 1; }
 make_db "$B" || { echo "FAIL scratch B"; exit 1; }
 
-FC_SRV_TRACE=1 "$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >/tmp/fc-serve-index.log 2>&1 &
+FC_SRV_TRACE=1 "$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >"$LOG" 2>&1 &
 srv=$!
 trap 'kill $srv 2>/dev/null' EXIT
 i=0; while [ $i -lt 20 ]; do
@@ -314,7 +323,6 @@ refuses() { # <label> <sql>
 # --- the coverage helpers ---------------------------------------------
 # The access path is read from the server's own log, which is what makes
 # "the subsystem is on the path" an assertion rather than a hope.
-LOG=/tmp/fc-serve-index.log
 scans_since() { grep -c "$1" "$LOG" 2>/dev/null || true; }
 
 indexed() { # <label> <sql> - answers like the engine AND drives an index
@@ -998,7 +1006,7 @@ both "SKIP over an OR" \
 # must answer identically (an index narrows what is read, not what is
 # answered) and they must NOT report an index scan.
 P2=$((PORT + 1))
-LOG2=/tmp/fc-serve-index-noidx.log
+LOG2="/tmp/fc-serve-index-noidx-$PORT.log"
 FC_NO_INDEX=1 FC_SRV_TRACE=1 "$FCWIRE" serve "127.0.0.1:$P2" "$U" "$P" >"$LOG2" 2>&1 &
 srv2=$!
 trap 'kill $srv $srv2 2>/dev/null' EXIT

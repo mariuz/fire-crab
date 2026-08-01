@@ -143,8 +143,45 @@ else
     kill $squat 2>/dev/null
 fi
 
-if [ "$ran" -lt 5 ]; then
-    echo "DIFF only $ran checks ran (expected 5)"
+# --- 5. a gate that ASSERTS ON ITS OWN LOG must isolate that log -------
+# Most gates only redirect their server's output somewhere and never read
+# it back. A few make ASSERTIONS from it - counting "index scan:" lines
+# to prove a statement did or did not drive an index, or looking for a
+# trace line to prove a write order. Those gates have a hidden shared
+# resource: a FIXED log path is written by every concurrent run of the
+# same gate, and each one then reads the others' lines as its own.
+#
+# It is not hypothetical. Two overlapping runs of serve-real-index.sh
+# produced 44 DIFFs, every one of them a negative assertion firing on
+# another run's index scans - including "a table with no index at all
+# drove an index", which cannot happen. Hours went into deciding whether
+# a just-committed optimizer change had caused it. It had not.
+#
+# The port already distinguishes concurrent runs. So must the log.
+ran=$((ran + 1))
+shared=""
+for g in qa/*.sh; do
+    # does this gate READ a /tmp log for an assertion?
+    grep -qE 'grep [^|]*("\$LOG[0-9]*"|/tmp/fc-serve)' "$g" || continue
+    # then every log path it assigns must vary with the port
+    while read -r line; do
+        case "$line" in
+            *'$PORT'*|*'$P2'*|*'$PORT2'*) ;;
+            *) shared="$shared $(basename "$g"):${line%%=*}" ;;
+        esac
+    done <<EOF
+$(grep -oE '^[A-Z_]*LOG[0-9]*=[^ ]*' "$g")
+EOF
+done
+if [ -z "$shared" ]; then
+    echo "OK   every gate that asserts on its own log keeps that log per-port"
+else
+    echo "DIFF gates asserting on a SHARED log path (concurrent runs contaminate):$shared"
+    fail=1
+fi
+
+if [ "$ran" -lt 6 ]; then
+    echo "DIFF only $ran checks ran (expected 6)"
     fail=1
 fi
 exit $fail

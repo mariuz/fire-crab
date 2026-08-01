@@ -149,7 +149,7 @@ else
     fi
 fi
 
-c_sql=0; c_ot=0; c_it=0; c_or=0; c_ir=0; c_eng=0; n=0
+c_sql=0; c_ot=0; c_it=0; c_or=0; c_ir=0; c_eng=0; c_tag=0; n=0
 while IFS= read -r name; do
     n=$((n + 1))
     case "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | tr -d ' ')" in
@@ -159,6 +159,7 @@ while IFS= read -r name; do
         outer_rows|orows|outer_n)                 c_or=$n ;;
         inner_rows|irows|inner_n)                 c_ir=$n ;;
         engine_plan|raw_plan|plan|engine|eng)     c_eng=$n ;;
+        cell|label|case|name)                     c_tag=$n ;;
     esac
 done <<EOF
 $(printf '%s' "$hdr" | tr '\t' '\n')
@@ -227,7 +228,8 @@ while IFS= read -r line || [ -n "$line" ]; do
             exit 1 ;;
     esac
     tag="$(get "$c_or")x$(get "$c_ir")"
-    [ "$tag" = "x" ] && tag="row$((rows + 1))"
+    [ "$tag" = "x" ] && tag="$(get "$c_tag")"
+    [ -z "$tag" ] && tag="row$((rows + 1))"
     [ "$mode" = tables ] && tag="$tag ${ot}/${it}"
     Q_ARR[$rows]="$q"; ENG_ARR[$rows]="$eng"; TAG_ARR[$rows]="$tag"
     rows=$((rows + 1))

@@ -4415,6 +4415,37 @@ same `isql` runs the same statement against the real engine and against
 only when refusing is deliberate and a gate asserts the failure; a
 refusal is always a SQL error, never a wrong answer dressed as a result.
 
+### The gate that read another run's log (`qa/gate-selfcheck.sh`, 6 checks)
+
+The self-check exists because a differential's worst failure is not a
+wrong answer but a green run that measured nothing. Its newest check
+covers the mirror image: a RED run that measured something else.
+
+Two gates of 197 make assertions from the server's own trace rather than
+merely redirecting it — `serve-real-index.sh` counts `"index scan:"`
+lines to prove a statement did or did not use an index, and
+`serve-real-carefulflush.sh` looks for the line naming the open mode.
+Both wrote to a fixed path. Two concurrent runs of the same gate
+therefore shared one file, and each read the other's lines as its own:
+**44 DIFFs, every one a negative assertion firing on another run's index
+scans.**
+
+The tell was in the output from the first run:
+
+```
+DIFF a table with no index at all drove an index it has no business driving
+```
+
+No change to an optimizer can make that true. An impossible failure is
+evidence about the instrument, not the subject — and reading it that way
+immediately would have saved two binary rebuilds and a controlled A/B.
+
+Both gates now key their logs to the port, which already distinguishes
+concurrent runs, and the self-check enforces it for any gate that greps
+a `/tmp` log for an assertion. Teeth proven by reverting one gate: it
+prints `DIFF … serve-real-index.sh:LOG`, naming the file and the
+variable.
+
 ### The optimizer grid, and the hole that was in it (`qa/opt-plans.sh`)
 
 The cost grid joins every table size against every other and requires

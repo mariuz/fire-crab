@@ -59,7 +59,7 @@ EOF
 make_db "$A" || { echo "FAIL scratch A"; exit 1; }
 make_db "$B" || { echo "FAIL scratch B"; exit 1; }
 
-FC_SRV_TRACE=1 "$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >/tmp/fc-serve-carefulflush.log 2>&1 &
+FC_SRV_TRACE=1 "$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >/tmp/fc-serve-carefulflush-$PORT.log 2>&1 &
 srv=$!
 trap 'kill $srv 2>/dev/null' EXIT
 i=0; while [ $i -lt 20 ]; do
@@ -126,7 +126,7 @@ refuses() { # <label> <sql>
 # declared up front so every trap below is safe whichever path runs.
 srv2=""
 srv3=""
-LOG=/tmp/fc-serve-carefulflush.log
+LOG="/tmp/fc-serve-carefulflush-$PORT.log"
 flushes() { grep -c "careful flush:" "$LOG" 2>/dev/null || true; }
 
 # --- 1. every write is flushed in precedence order --------------------
@@ -200,7 +200,7 @@ fi
 cp "$A" "$A.async" 2>/dev/null
 "${GFIX:-gfix}" -write async -user "$U" -pas "$P" "$A.async" >/dev/null 2>&1
 P3=$((PORT + 2))
-LOG3=/tmp/fc-serve-carefulflush-async.log
+LOG3="/tmp/fc-serve-carefulflush-async-$PORT.log"
 FC_SRV_TRACE=1 "$FCWIRE" serve "127.0.0.1:$P3" "$U" "$P" >"$LOG3" 2>&1 &
 srv3=$!
 trap 'kill $srv $srv2 $srv3 2>/dev/null' EXIT
@@ -234,7 +234,7 @@ rm -f "$A.async"
 # with the ordering off the trace must say nothing, and the answers must
 # be identical - the order changes WHEN bytes land, never WHICH.
 P2=$((PORT + 1))
-LOG2=/tmp/fc-serve-carefulflush-off.log
+LOG2="/tmp/fc-serve-carefulflush-off-$PORT.log"
 FC_NO_CAREFUL=1 FC_SRV_TRACE=1 "$FCWIRE" serve "127.0.0.1:$P2" "$U" "$P" >"$LOG2" 2>&1 &
 srv2=$!
 trap 'kill $srv $srv2 2>/dev/null' EXIT

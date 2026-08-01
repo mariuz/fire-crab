@@ -2006,6 +2006,30 @@ them.
   SET, and to resist the reviewer's instinct to split it into four
   reviewable commits that would each be individually wrong.
 
+- **A gate that asserts on a log has a hidden shared resource.** Two
+  gates here prove things by counting lines in the server's trace — that
+  a statement drove an index, that pages were written in a given order.
+  Both wrote to a FIXED path, so two concurrent runs of the same gate
+  read each other's lines. It produced 44 DIFFs, none real, and cost
+  hours of deciding whether a just-committed change had caused them. If a
+  gate reads a file it also writes, that file belongs to the RUN, not to
+  the gate: key it to the port, which already distinguishes runs.
+
+- **An IMPOSSIBLE failure is evidence about the instrument, not the
+  subject.** The DIFF list contained "a table with no index at all drove
+  an index it has no business driving". No change to an optimizer can
+  make that true. That line was in the output from the first run and
+  should have redirected the whole investigation immediately — instead it
+  scrolled past while two binaries were rebuilt to compare. **Read the
+  failures before you reproduce them**, and treat any that cannot happen
+  as a defect in the measurement.
+
+- **Serialise your measurements, or state that you did not.** Three
+  separate times in one session a contaminated run was read as a signal:
+  two overlapping gate sweeps on identical port ranges, a gate run
+  against a binary that was rebuilt underneath it, and this. Parallelism
+  is worth it for BUILDING things and dangerous for MEASURING them.
+
 ## Suggested porting order
 
 The order that worked here, each stage differentially testable with

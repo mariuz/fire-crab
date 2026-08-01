@@ -13,6 +13,55 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-01 — A gate that read another run's log
+
+`serve-real-index.sh` reported 33 DIFFs immediately after an optimizer
+commit, where the same gate had reported 0 an hour earlier. Deciding
+whether that was the commit took longer than the commit did.
+
+It was not. The gate proves a statement did or did not use an index by
+counting `"index scan:"` lines in the server's trace — at a **fixed
+path**, `/tmp/fc-serve-index.log`. Two concurrent runs of the gate write
+to the same file, and each then reads the other's index scans as its own,
+so every negative assertion fires at once. The tell was in the output all
+along:
+
+```
+DIFF a table with no index at all drove an index it has no business driving
+```
+
+which is not a thing that can happen.
+
+The cause was mine — the gate was running concurrently with itself, and
+earlier alongside a 338-statement optimizer gate and a fleet of twenty
+agents. Cleanly, alone: **0 DIFFs, 359 OKs.**
+
+### Fixed
+- **`serve-real-index.sh` and `serve-real-carefulflush.sh` key their logs
+  to the port.** Of 197 gates these are the only two that make assertions
+  from a server log rather than merely redirecting it somewhere. The port
+  already distinguishes concurrent runs; now the log follows it.
+
+- **`qa/gate-selfcheck.sh` gained a sixth check** for the whole class: any
+  gate that greps a `/tmp` log for an assertion must have every log path
+  it assigns vary with the port. Teeth proven — reverting one gate makes
+  it print `DIFF … serve-real-index.sh:LOG`, naming the file and the
+  variable rather than just failing.
+
+### What exonerated the commit
+Three independent things, none of which needed a quiet machine:
+- single-relation plans are **byte-identical** across the change (10
+  statements, compared against a `HEAD~1` build of the optimizer);
+- `loop_cost` and `hash_cost` have exactly two call sites, both inside
+  the two-stream join block, and `choose_index` discards any plan that is
+  not a one-element stream;
+- the failing assertions were all *negative* ones, and one of them was
+  impossible rather than merely wrong.
+
+The third is the one worth keeping. **An impossible failure is evidence
+about the instrument, not the subject** — and it was visible before any
+of the rebuilding.
+
 ## 2026-08-01 — The grid had a hole in it
 
 Four edits to `opt`'s join cost model, shipped as one increment because
