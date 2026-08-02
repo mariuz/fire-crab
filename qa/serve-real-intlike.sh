@@ -44,15 +44,15 @@ make_db() {
     rm -f "$1"
     "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
 CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
-CREATE TABLE T (ID INTEGER, N INTEGER, N92 NUMERIC(9,2), N382 NUMERIC(38,2));
+CREATE TABLE T (ID INTEGER, N INTEGER, N92 NUMERIC(9,2), N382 NUMERIC(38,2), NAME VARCHAR(10));
 COMMIT;
-INSERT INTO T VALUES (1, 1,    0,       0);
-INSERT INTO T VALUES (2, 2,    0.5,     0.5);
-INSERT INTO T VALUES (3, 3,    -1.5,    -1.5);
-INSERT INTO T VALUES (4, 10,   10,      10);
-INSERT INTO T VALUES (5, NULL, NULL,    NULL);
-INSERT INTO T VALUES (6, 100,  1234.56, 1234.56);
-INSERT INTO T VALUES (7, -5,   1.5,     1.5);
+INSERT INTO T VALUES (1, 1,    0,       0,       'alpha');
+INSERT INTO T VALUES (2, 2,    0.5,     0.5,     'beta');
+INSERT INTO T VALUES (3, 3,    -1.5,    -1.5,    'a%b');
+INSERT INTO T VALUES (4, 10,   10,      10,      'gamma');
+INSERT INTO T VALUES (5, NULL, NULL,    NULL,    NULL);
+INSERT INTO T VALUES (6, 100,  1234.56, 1234.56, 'delta');
+INSERT INTO T VALUES (7, -5,   1.5,     1.5,     'eps');
 COMMIT;
 EOF
     chmod 666 "$1"
@@ -156,6 +156,35 @@ case "$a:$b" in
     *) echo "DIFF bad escape: fcwire [$a] engine [$b]"; fail=1 ;;
 esac
 where "... and the FALSE invariant kills it" "N LIKE '1!2' ESCAPE '!' AND 1 = 0"
+
+# --- 7. a LITERAL bad escape on a TEXT side gates on the LENIENT PREFIX -
+# probed: the engine's DSQL rewrite of a LITERAL pattern prepends a
+# lenient prefix pre-filter (the bad escape processed as if it escaped
+# the next character), so the 22025 raise happens only for rows whose
+# value STARTS WITH that prefix - `NAME LIKE 'a!bc' ESCAPE '!'` answers
+# [] when no row starts with 'abc' and raises when one does; a pattern
+# with no literal prefix (leading % or _) reaches every non-NULL row;
+# NOT LIKE and a non-text side ('N LIKE' above) raise ungated.
+raises() { # <label> <predicate>
+    a=$(query "SELECT ID FROM T WHERE $2 ORDER BY ID" "[]" "$PORT" "$A")
+    b=$(query "SELECT ID FROM T WHERE $2 ORDER BY ID" "[]" "$REAL" "$B")
+    case "$a:$b" in
+        ERR*:ERR*) echo "OK   $1 raises on BOTH" ;;
+        *) echo "DIFF $1: fcwire [$a] engine [$b]"; fail=1 ;;
+    esac
+}
+where  "no row starts 'abc': answers, no raise" "NAME LIKE 'a!bc' ESCAPE '!'"
+where  "... nor with a trailing wildcard" "NAME LIKE 'a!bc%' ESCAPE '!'"
+where  "a trailing escape: prefix 'ab', no hit" "NAME LIKE 'ab!' ESCAPE '!'"
+where  "prefix 'zza', no hit" "NAME LIKE 'zz!a' ESCAPE '!'"
+raises "prefix 'alpha' hits its row" "NAME LIKE 'alph!a' ESCAPE '!'"
+raises "prefix 'beta' hits its row" "NAME LIKE 'bet!a' ESCAPE '!'"
+raises "prefix 'eps' hits under a wildcard tail" "NAME LIKE 'ep!s%' ESCAPE '!'"
+raises "no literal prefix: every non-NULL row reached" "NAME LIKE '%a!bc' ESCAPE '!'"
+raises "NOT LIKE stays ungated" "NAME NOT LIKE 'zz!a' ESCAPE '!'"
+where  "an expression side gates the same" "UPPER(NAME) LIKE 'zz!a' ESCAPE '!'"
+both   "HAVING gates the same" "SELECT NAME FROM T GROUP BY NAME HAVING NAME LIKE 'a!b' ESCAPE '!'"
+both   "a 0-row DELETE succeeds, no raise" "DELETE FROM T WHERE NAME LIKE 'zz!a' ESCAPE '!'"
 
 rm -f "$A" "$B"
 exit $fail

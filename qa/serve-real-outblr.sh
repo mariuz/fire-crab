@@ -199,6 +199,27 @@ chk "a user CAST is attachment-charset too" \
 chk "a non-text slot has no capacity rule" \
     "SELECT I FROM T WHERE ID = 1"
 
+# --- expression widths over a MULTIBYTE source column ----------------
+# probed with SQLDA_DISPLAY: the engine's expression widths are
+# CHARACTER counts scaled by the RESULT charset's bytes-per-character -
+# SUBSTRING(U6 FROM 1 FOR 3) describes 12 bytes UTF8 (not 3), LPAD/RPAD
+# to 8 describe 32, U6 || 'x' describes 28 (7 chars x 4, not 100), and
+# a FOR count past the source caps at the source's width (FOR 100 over
+# VARCHAR(6) describes 24). fire-crab used to announce the raw
+# character count as bytes and spuriously raised through 2.11.0.
+chk "SUBSTRING FOR n over UTF8 is n chars x 4: delivers" \
+    "SELECT SUBSTRING(U6 FROM 1 FOR 3) A FROM T WHERE ID = 1"
+chk "LPAD over UTF8 describes 8 chars x 4: delivers" \
+    "SELECT LPAD(U6, 8, 'x') A FROM T WHERE ID = 1"
+chk "RPAD over UTF8 describes 8 chars x 4: delivers" \
+    "SELECT RPAD(U6, 8, 'x') A FROM T WHERE ID = 1"
+chk "U6 || 'x' is 7 chars x 4 = 28 bytes, not 100" \
+    "SELECT U6 || 'x' A FROM T WHERE ID = 1"
+chk "a FOR count past the source caps at its width" \
+    "SELECT SUBSTRING(U6 FROM 1 FOR 100) A FROM T WHERE ID = 1"
+chk "a NONE source stays NONE: SUBSTRING raises (0, 3)" \
+    "SELECT SUBSTRING(V6 FROM 1 FOR 3) A FROM T WHERE ID = 3"
+
 # --- 2.11.0 under a NONE attachment: single-byte dest, no checks ------
 ran=$((ran + 1))
 a=$(NODE_PATH="$N211" timeout 60 node "$D/fc-ob-rows.js" "$PORT" "$FC" "SELECT V6, C5 FROM T WHERE ID IN (1, 2, 7) ORDER BY ID" NONE 2>&1)
@@ -253,8 +274,8 @@ fi
 
 kill $srv 2>/dev/null; srv=""
 rm -f "$RE" "$FC" "$D"/fc-ob-*.js
-if [ "$ran" -lt 26 ]; then
-    echo "DIFF only $ran checks ran (expected 26) - did one silently skip?"
+if [ "$ran" -lt 32 ]; then
+    echo "DIFF only $ran checks ran (expected 32) - did one silently skip?"
     fail=1
 fi
 exit $fail

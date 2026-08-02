@@ -449,13 +449,10 @@ fn build_describe(cols: &[ProjCol], params: &[Descriptor], att: AttCs) -> Vec<u8
     d.push(4); // isc_info_sql_select
     int_item(&mut d, 7, cols.len() as i32); // describe_vars: N columns
     for (i, c) in cols.iter().enumerate() {
-        // an attachment-charset text column resolves to the dpb's
-        // charset, width in its bytes - same law as [answer_prepare]
-        let (sub_type, length) = if c.sub_type == ATT_SUBTYPE {
-            (att.id as i32, c.length * att.bpc as i32)
-        } else {
-            (c.sub_type, c.length)
-        };
+        // an attachment-charset or real-charset-expression text column
+        // resolves to its announced charset, width in its bytes - same
+        // law as [answer_prepare] (see [resolve_text_cs])
+        let (sub_type, length) = resolve_text_cs(c.sub_type, c.length, &att);
         int_item(&mut d, 9, (i + 1) as i32); // sqlda_seq
         int_item(&mut d, 11, c.sql_type); // type
         int_item(&mut d, 12, sub_type); // sub_type (blob text/binary, text ttype)
@@ -1143,6 +1140,37 @@ impl RowSource {
 /// describe emission and in the output capacity check; a real column's
 /// ttype is never negative.
 const ATT_SUBTYPE: i32 = -1;
+
+/// A REAL-charset text EXPRESSION column's sub_type sentinel: the
+/// charset id `cs` (>= 2) encoded as `-2 - cs`, with [ProjCol::length]
+/// holding a CHARACTER count. Probed with SQLDA_DISPLAY across UTF8,
+/// WIN1252 and NONE attachments: the engine announces a real-charset
+/// expression in the ATTACHMENT charset whenever the attachment names a
+/// real one (its width scaled by the attachment's bytes-per-character),
+/// and in the operand's own charset under a NONE attachment - so the
+/// resolution has to wait for the emission, exactly like [ATT_SUBTYPE].
+/// Plain stored columns keep their positive ttype and byte width.
+fn enc_real_cs(cs: u8) -> i32 {
+    -2 - cs as i32
+}
+
+/// Resolve a text column's `(sub_type, length)` for the describe: the
+/// two negative sentinels scale their character count into the bytes of
+/// the charset they resolve to; a plain ttype passes through.
+fn resolve_text_cs(sub: i32, len: i32, att: &AttCs) -> (i32, i32) {
+    if sub == ATT_SUBTYPE {
+        (att.id as i32, len * att.bpc as i32)
+    } else if sub <= -2 {
+        let cs = (-2 - sub) as u8;
+        if att.id != 0 {
+            (att.id as i32, len * att.bpc as i32)
+        } else {
+            (cs as i32, len * fire_crab_ods::intl::bytes_per_char(cs) as i32)
+        }
+    } else {
+        (sub, len)
+    }
+}
 
 /// One column of a projection: its name, the field id that indexes the
 /// decoded record, and how it is described/encoded on the wire. `scale`
@@ -1976,6 +2004,27 @@ enum Term {
     /// counts, exactly as the engine matches (CHAR(5) 'abc' matches
     /// 'abc  ' and 'abc%' but NOT 'abc')
     Like(usize, Rhs, Option<char>, bool),
+    /// `<text col> LIKE <literal pattern with an INVALID escape>` in a
+    /// WHERE/HAVING: the engine's DSQL-time rewrite of a LITERAL
+    /// pattern prepends a LENIENT prefix pre-filter (the bad escape
+    /// processed as if it escaped the next character,
+    /// [lenient_like_prefix]), so the 22025 raise is row-gated: a NULL
+    /// value is UNKNOWN, a value that does not start with the prefix
+    /// is plain FALSE with no raise, one that does raises. Probed:
+    /// `NAME LIKE 'a!bc' ESCAPE '!'` answers [] over rows none of
+    /// which start with 'abc' and raises over a row 'abcd'; NOT LIKE
+    /// and a BOUND pattern (`NAME LIKE ?`) raise ungated against any
+    /// non-NULL value, so only the literal non-negated form lands
+    /// here. Applies to `?`/expression tested sides too
+    /// ([Term::BadExprLike]) but only TEXT-typed ones - `N LIKE
+    /// '1!2' ESCAPE '!'` (integer N) raises ungated.
+    BadLike(usize, String),
+    /// The expression-side twin of [Term::BadLike]: `UPPER(NAME) LIKE
+    /// 'zz!a' ESCAPE '!'` answers [] where no row's value starts with
+    /// 'zza' (probed), and `? LIKE 'a!bc' ESCAPE '!'` bound 'zz'
+    /// answers [] where 'abc' raises - the latter is row-independent,
+    /// so the invariant pass raises it even over an empty table.
+    BadExprLike(Box<Expr>, String),
     /// `<col> [NOT] STARTING [WITH] <prefix>`: per-BYTE prefix on the
     /// STORED value - CHAR padding counts on BOTH sides, no trimming
     /// (probed: CHAR(5) 'ab' matches prefixes 'ab ' and 'ab   ' but not
@@ -2047,41 +2096,121 @@ enum Term {
 }
 
 /// A resolved WHERE predicate in disjunctive normal form (OR of ANDs),
-/// which is what AND-binds-tighter-than-OR gives with no parentheses. A
-/// row matches if every term of any one group matches.
+/// which is what AND-binds-tighter-than-OR gives with no parentheses,
+/// PLUS the provenance the normalization erases: which TOP-LEVEL
+/// conjunct of the source tree each term came from (`tags`, same shape
+/// as `groups`). The provenance matters because the engine evaluates
+/// conjunct by conjunct - `(1=1 OR 1/0=1) AND ID>3` short-circuits the
+/// invariant OR at TRUE and never touches the division, while its
+/// distributed DNF `1=1 AND ID>3 OR 1/0=1 AND ID>3` raises on the
+/// first row that fails `ID>3` (both probed) - so [Predicate::matches]
+/// and the bind-time invariant pass walk the conjuncts, not the raw
+/// groups.
 #[derive(Clone)]
-struct Predicate(Vec<Vec<Term>>);
+struct Predicate {
+    groups: Vec<Vec<Term>>,
+    tags: Vec<Vec<u32>>,
+}
 
 impl Predicate {
+    /// A DNF whose provenance is derivable: ONE group is a plain
+    /// conjunction (each term its own top-level conjunct), several
+    /// groups are a plain top-level OR (one conjunct in total). Only
+    /// the parser's paren distribution produces anything else, and it
+    /// carries its own tags ([parse_predicate]).
+    fn dnf(groups: Vec<Vec<Term>>) -> Predicate {
+        let tags = if groups.len() == 1 {
+            vec![(0..groups[0].len() as u32).collect()]
+        } else {
+            groups.iter().map(|g| vec![0; g.len()]).collect()
+        };
+        Predicate { groups, tags }
+    }
+
+    fn tagged(groups: Vec<Vec<Term>>, tags: Vec<Vec<u32>>) -> Predicate {
+        debug_assert_eq!(
+            groups.iter().map(Vec::len).collect::<Vec<_>>(),
+            tags.iter().map(Vec::len).collect::<Vec<_>>(),
+        );
+        Predicate { groups, tags }
+    }
+
+    /// `WHERE 1=0`: no group to satisfy, matches nothing.
+    fn empty() -> Predicate {
+        Predicate { groups: vec![], tags: vec![] }
+    }
+
+    /// One conjunct's verdict: OR over the groups (in written order) of
+    /// AND over that group's terms carrying the conjunct's tag (in
+    /// written order). The short-circuit laws are the engine's, all
+    /// probed: OR stops at the first TRUE alternative (`1=1 OR 1/0=1`
+    /// answers), FALSE stops an alternative's AND (`1=0 AND 1/0=1`
+    /// answers no rows), UNKNOWN stops neither (`1=NULL AND 1/0=1`
+    /// raises), and an error raises where the walk reaches it.
+    fn conjunct(&self, tag: u32, values: &[Value]) -> Result<Option<bool>, EvalErr> {
+        let mut unknown = false;
+        for (g, gt) in self.groups.iter().zip(&self.tags) {
+            let mut all = true;
+            let mut dead = false;
+            for (t, tt) in g.iter().zip(gt) {
+                if *tt != tag {
+                    continue;
+                }
+                match t.matches(values)? {
+                    Some(true) => {}
+                    Some(false) => {
+                        all = false;
+                        break;
+                    }
+                    None => {
+                        all = false;
+                        dead = true;
+                    }
+                }
+            }
+            if all {
+                return Ok(Some(true));
+            }
+            if dead {
+                unknown = true;
+            }
+        }
+        Ok(if unknown { None } else { Some(false) })
+    }
+
+    /// The distinct conjunct tags, ascending = written order (the
+    /// parser numbers top-level conjuncts left to right and the DNF
+    /// cross-product keeps each group's terms in that order).
+    fn conjunct_tags(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.tags.iter().flatten().copied().collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
     /// TRUE keeps the row. `Err` is a per-row evaluation error inside an
     /// expression term (WHERE A / 0 = 1) - the engine raises it
     /// mid-statement, so every caller must propagate, never swallow: a
     /// swallowed error would silently exclude exactly the row the
     /// engine raises on.
+    ///
+    /// Conjunct by conjunct, in written order (probed): a FALSE
+    /// conjunct stops the row's walk (`ID = 99 AND <bad LIKE ?>`
+    /// answers no rows), an UNKNOWN one fails the row but the walk
+    /// continues (`ID = NULL AND <bad LIKE ?>` raises).
     fn matches(&self, values: &[Value]) -> Result<bool, EvalErr> {
-        for group in &self.0 {
-            let mut all = true;
-            for t in group {
-                match t.matches(values)? {
-                    Some(true) => {}
-                    // probed: the engine's AND short-circuits on FALSE
-                    // only - `ID = 99 AND <bad LIKE>` answers no rows
-                    // while `<bad LIKE> AND ID = 99` raises
-                    Some(false) => {
-                        all = false;
-                        break;
-                    }
-                    // ... and NOT on UNKNOWN: `ID = NULL AND <bad
-                    // LIKE>` raises, so the remaining terms still
-                    // evaluate even though the group cannot succeed
-                    None => all = false,
-                }
-            }
-            if all {
-                return Ok(true);
+        if self.groups.is_empty() {
+            return Ok(false);
+        }
+        let mut ok = true;
+        for tag in self.conjunct_tags() {
+            match self.conjunct(tag, values)? {
+                Some(true) => {}
+                Some(false) => return Ok(false),
+                None => ok = false,
             }
         }
-        Ok(false)
+        Ok(ok)
     }
 
     /// Substitute every parameter slot with the value that arrived at
@@ -2089,12 +2218,20 @@ impl Predicate {
     /// `Term::Unknown` (per-row UNKNOWN), one on a `?`-tested side to
     /// `Term::Never` (invariant); a value whose wire type does not
     /// match the column kind is an error - never a silent wrong
-    /// filter. After each group's terms are bound, the INVARIANT PASS
-    /// runs (probed): the engine evaluates row-independent conjuncts
-    /// BEFORE the scan, left to right, and the first FALSE kills the
-    /// group with no raise, an error raises, and UNKNOWN deadens the
-    /// group while the walk continues - `1=0 AND 1/0=1` answers no
-    /// rows where `1=NULL AND 1/0=1` raises.
+    /// filter. After the terms are bound, the INVARIANT PASS runs
+    /// (probed): the engine evaluates every fully row-independent
+    /// TOP-LEVEL CONJUNCT once, BEFORE the scan - even over an empty
+    /// table (`SELECT .. FROM EMPTYT WHERE 1/0=1` raises with zero
+    /// rows, and so does `? LIKE ?` with a bad escape) - left to
+    /// right, wherever it is written among the row-dependent conjuncts
+    /// (`ID/0=1 AND 1=0` answers no rows: the FALSE invariant kills
+    /// the scan the division never reaches). The first FALSE conjunct
+    /// stops the pass with no raise, an error raises, and UNKNOWN
+    /// dooms the predicate while the walk continues - `1=0 AND 1/0=1`
+    /// answers no rows where `1=NULL AND 1/0=1` raises. A conjunct
+    /// with ANY row-dependent term is left to the per-row walk whole:
+    /// `ID>0 OR 1/0=1` answers every ID>0 row and raises only when a
+    /// row fails into the division (probed both ways).
     fn bind(&self, args: &[WireParam]) -> Result<Predicate, ExecErr> {
         let bind_rhs = |idx: &usize, kind: &ColKind| -> Result<Option<Rhs>, String> {
             let arg = args.get(*idx).ok_or("missing parameter value")?;
@@ -2222,13 +2359,7 @@ impl Predicate {
             })
         };
         let mut groups = Vec::new();
-        // an all-invariant TRUE group already seen: the predicate is
-        // decided, and the engine's OR short-circuits at it for every
-        // row - invariants in groups written after it never evaluate
-        // and never raise (probed: `1=1 OR <bad LIKE>` answers every
-        // row, no raise; `<bad LIKE> OR 1=1` raises)
-        let mut decided = false;
-        for g in &self.0 {
+        for g in &self.groups {
             let mut terms = Vec::new();
             for t in g {
                 terms.push(match t {
@@ -2291,10 +2422,10 @@ impl Predicate {
                             terms.push(Term::Never);
                             continue;
                         };
-                        let pat = match pattern {
-                            Rhs::Str(p) => Some(p.clone()),
-                            Rhs::Param(pslot, _) => fetch(*pslot)?,
-                            _ => None,
+                        let (pat, literal_pat) = match pattern {
+                            Rhs::Str(p) => (Some(p.clone()), true),
+                            Rhs::Param(pslot, _) => (fetch(*pslot)?, false),
+                            _ => (None, false),
                         };
                         match pat {
                             // probed: an invalid ESCAPE in a
@@ -2303,16 +2434,31 @@ impl Predicate {
                             // - a FALSE written before it suppresses
                             // the raise (`? IS NULL [5] AND ? LIKE
                             // ?bad` answers no rows, the reverse order
-                            // raises) - so the bad shape stays a term:
-                            // a no-column ExprLike the invariant pass
-                            // below evaluates in its place, raising
-                            // 22025 value-gated
-                            Some(p) if invalid_escape(&p, *escape) => Term::ExprLike(
-                                Box::new(Expr::Str(val)),
-                                p,
-                                *escape,
-                                *negated,
-                            ),
+                            // raises) - so the bad shape stays a term
+                            // the invariant pass evaluates in its
+                            // place, raising even over an empty table
+                            // (probed: `? LIKE ?`(x, bad) over a
+                            // zero-row table raises on execute). A
+                            // LITERAL pattern takes the lenient-prefix
+                            // gate first, exactly like a column tested
+                            // side (probed: `? LIKE 'a!bc' ESCAPE '!'`
+                            // bound 'zz' answers [], bound 'abc'
+                            // raises); a BOUND pattern raises ungated.
+                            Some(p) if invalid_escape(&p, *escape) => {
+                                if literal_pat && !*negated {
+                                    Term::BadExprLike(
+                                        Box::new(Expr::Str(val)),
+                                        lenient_like_prefix(&p, *escape),
+                                    )
+                                } else {
+                                    Term::ExprLike(
+                                        Box::new(Expr::Str(val)),
+                                        p,
+                                        *escape,
+                                        *negated,
+                                    )
+                                }
+                            }
                             Some(p) => {
                                 Term::Const(like_match(&val, &p, *escape) != *negated)
                             }
@@ -2406,41 +2552,66 @@ impl Predicate {
                     other => other.clone(),
                 });
             }
-            if decided {
-                groups.push(terms);
+            groups.push(terms);
+        }
+        let bound = Predicate::tagged(groups, self.tags.clone());
+        // the invariant pass, conjunct by conjunct in written order.
+        // A conjunct is INVARIANT when every term it contributed to
+        // the DNF is row-independent; its verdict is the same
+        // OR-of-AND walk the row pass would do, over no row at all.
+        let invariant = |p: &Predicate, tag: u32| {
+            p.groups
+                .iter()
+                .zip(&p.tags)
+                .flat_map(|(g, gt)| g.iter().zip(gt))
+                .filter(|(_, tt)| **tt == tag)
+                .all(|(t, _)| term_row_independent(t))
+        };
+        // TRUE conjuncts are STRIPPED from the row pass: once the
+        // open-time OR decided them, the engine never revisits their
+        // alternatives per row - `(1=1 OR 1/0=1) AND ID>3` answers the
+        // ID>3 rows and never raises, even for rows failing ID>3
+        // (probed with an ID=0 row present)
+        let mut strip: Vec<u32> = Vec::new();
+        // an UNKNOWN invariant conjunct dooms the predicate to zero
+        // rows, but the walk continues: a LATER invariant error still
+        // raises (`1=NULL AND 1/0=1` raises, empty table included)
+        let mut doomed = false;
+        for tag in bound.conjunct_tags() {
+            if !invariant(&bound, tag) {
                 continue;
             }
-            // the invariant pass, in term order (probed): the first
-            // FALSE drops the group with no raise - even ahead of a
-            // constant that would raise; an error raises; UNKNOWN
-            // deadens the group for rows but the walk continues, so a
-            // later invariant error still raises in written order
-            // (`1=0 AND 1/0=1` answers no rows, `1=NULL AND 1/0=1`
-            // raises). Row-dependent terms are stepped over - a FALSE
-            // invariant written after one still kills the group.
-            let mut keep = true;
-            let mut dead = false;
-            for t in &terms {
-                if !term_row_independent(t) {
-                    continue;
-                }
-                match t.matches(&[]).map_err(ExecErr::Eval)? {
-                    Some(false) => {
-                        keep = false;
-                        break;
-                    }
-                    None => dead = true,
-                    Some(true) => {}
-                }
+            match bound.conjunct(tag, &[]).map_err(ExecErr::Eval)? {
+                // the first FALSE stops the pass: nothing written
+                // after it evaluates (`1=0 AND 1/0=1` answers no rows)
+                Some(false) => return Ok(Predicate::empty()),
+                None => doomed = true,
+                Some(true) => strip.push(tag),
             }
-            if keep && !dead {
-                decided = terms.iter().all(term_row_independent);
-                groups.push(terms);
-            }
-            // a dropped group leaves nothing behind: Predicate(vec![])
-            // answers false everywhere, which is `WHERE 1=0`
         }
-        Ok(Predicate(groups))
+        if doomed {
+            return Ok(Predicate::empty());
+        }
+        if strip.is_empty() {
+            return Ok(bound);
+        }
+        let mut groups = Vec::new();
+        let mut tags = Vec::new();
+        for (g, gt) in bound.groups.into_iter().zip(bound.tags) {
+            let (g, gt): (Vec<Term>, Vec<u32>) = g
+                .into_iter()
+                .zip(gt)
+                .filter(|(_, tt)| !strip.contains(tt))
+                .unzip();
+            // a group emptied by the strip was ALL invariant-TRUE: the
+            // predicate holds for every row
+            if g.is_empty() {
+                return Ok(Predicate::dnf(vec![vec![Term::Const(true)]]));
+            }
+            groups.push(g);
+            tags.push(gt);
+        }
+        Ok(Predicate::tagged(groups, tags))
     }
 }
 
@@ -2464,7 +2635,9 @@ fn term_row_independent(t: &Term) -> bool {
     match t {
         Term::Const(_) | Term::Never => true,
         Term::ExprCond(c) => !cond_has_col(c),
-        Term::ExprLike(e, ..) | Term::ExprStarting(e, ..) => !expr_has_col(e),
+        Term::ExprLike(e, ..) | Term::ExprStarting(e, ..) | Term::BadExprLike(e, ..) => {
+            !expr_has_col(e)
+        }
         _ => false,
     }
 }
@@ -2600,6 +2773,27 @@ impl Term {
                 // NULL value or NULL/unbound pattern: UNKNOWN
                 _ => None,
             },
+            // the lenient-prefix gate on a LITERAL bad-escape pattern
+            // (see the variant): NULL is UNKNOWN, a prefix miss is
+            // FALSE, a hit raises 22025
+            Term::BadLike(fid, prefix) => match values.get(*fid) {
+                Some(Value::Text(s)) => {
+                    if s.starts_with(prefix.as_str()) {
+                        return Err(EvalErr::InvalidEscape);
+                    }
+                    Some(false)
+                }
+                _ => None,
+            },
+            Term::BadExprLike(e, prefix) => match e.eval(values)? {
+                Value::Null => None,
+                v => {
+                    if v.render().starts_with(prefix.as_str()) {
+                        return Err(EvalErr::InvalidEscape);
+                    }
+                    Some(false)
+                }
+            },
             Term::Starting(fid, prefix, negated) => match (values.get(*fid), prefix) {
                 // per-byte prefix on the STORED value, padding included
                 // on both sides - the engine's starts() does no trimming
@@ -2649,6 +2843,34 @@ impl Term {
 /// the check lives in the bind, not the parse. Found by an adversarial
 /// pass: `like_match` accepts any escaped character, so an invalid
 /// pattern silently matched as literals where the engine raises.
+/// The engine's LENIENT literal prefix of a LIKE pattern: characters up
+/// to the first unescaped wildcard, the escape processed as if it
+/// escaped the next character EVEN WHEN THE ESCAPE IS INVALID, and a
+/// trailing escape contributing nothing. Probed against the live
+/// engine (each via raise-vs-answer over a chosen row): `'a!bc'` ->
+/// `abc` (raises over 'abcd', answers over 'abX' - a PREFIX test, not
+/// an equality), `'ab!'` -> `ab`, `'a!!b!c'` -> `a!bc`, `'a!%b!c'` ->
+/// `a%bc`, `'ab%!c'` -> `ab`, `'_b!c'` and `'%a!b'` -> `` (every
+/// non-NULL row reached). The comparison is the same per-byte,
+/// case-sensitive, pad-including starts_with the STARTING term uses.
+fn lenient_like_prefix(pattern: &str, escape: Option<char>) -> String {
+    let mut out = String::new();
+    let mut it = pattern.chars();
+    while let Some(c) = it.next() {
+        if Some(c) == escape {
+            match it.next() {
+                Some(next) => out.push(next),
+                None => break,
+            }
+        } else if c == '%' || c == '_' {
+            break;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn invalid_escape(pattern: &str, escape: Option<char>) -> bool {
     let Some(esc) = escape else { return false };
     let p: Vec<char> = pattern.chars().collect();
@@ -3734,9 +3956,16 @@ enum TfCs {
     Att,
 }
 
-/// Join two operands' charsets the way the engine types a combination:
+/// Join two operands' charsets the way the engine types a combination
+/// (probed under UTF8, WIN1252 and NONE attachments, SQLDA_DISPLAY):
 /// same charset keeps it, CHARACTER SET NONE yields to the other side,
-/// and two different real charsets take the attachment's.
+/// the attachment-charset sentinel yields to a REAL column charset
+/// (`U6 || 'x'` under a NONE attachment stays UTF8), and of two
+/// DIFFERENT real charsets the FIRST operand's wins (`W6 || U6` under a
+/// NONE attachment is WIN1252, `U6 || W6` is UTF8). Note that under a
+/// REAL attachment charset the emission maps every real-charset
+/// expression to the ATTACHMENT charset anyway ([enc_real_cs]), so the
+/// join order is only observable under a NONE attachment.
 fn cs_join(a: TfCs, b: TfCs) -> TfCs {
     let id = |c: TfCs| match c {
         TfCs::Att => -1,
@@ -3746,11 +3975,21 @@ fn cs_join(a: TfCs, b: TfCs) -> TfCs {
         (x, y) if x == y => a,
         (0, _) => b,
         (_, 0) => a,
-        _ => TfCs::Att,
+        (-1, _) => b,
+        (_, -1) => a,
+        _ => a,
     }
 }
 
 /// The WIDTH and FORM of a text-valued expression: `(varying, width)`.
+///
+/// The width is a CHARACTER count for every charset - a column
+/// descriptor's byte length divides by its bytes-per-character on the
+/// way in, and [build_expr_col] scales back to bytes for the announced
+/// charset on the way out. (Probed: `SUBSTRING(U6 FROM 1 FOR 3)` over
+/// a VARCHAR(6) UTF8 column describes 12 bytes = 3 chars x 4, and
+/// `U6 || 'x'` describes 28 = 7 chars x 4 - the char algebra is
+/// charset-independent, only the final scaling is not.)
 ///
 /// The engine gives a text result a real declared width, and whether it
 /// is CHAR or VARCHAR decides whether shorter values are PADDED - which
@@ -3775,16 +4014,22 @@ fn text_form(e: &Expr, descs: &[Descriptor]) -> Option<(bool, i32, TfCs)> {
     };
     match e {
         Expr::Str(s) => Some((false, s.chars().count() as i32, TfCs::Att)),
+        // a column's descriptor length is BYTES; the width here is
+        // CHARACTERS, so a multibyte charset divides by its
+        // bytes-per-character (CHAR(6) UTF8 stores 24 bytes, is 6 wide)
         Expr::Col(fid) => {
             let d = descs.get(*fid)?;
+            let bpc = fire_crab_ods::intl::bytes_per_char(
+                fire_crab_ods::intl::charset_id(d.sub_type),
+            ) as i32;
             match d.dtype {
                 dtype::TEXT => {
-                    Some((false, d.length as i32, TfCs::Ttype(d.sub_type as i32)))
+                    Some((false, d.length as i32 / bpc, TfCs::Ttype(d.sub_type as i32)))
                 }
                 // a VARYING descriptor's length carries its 2-byte count
                 dtype::VARYING => Some((
                     true,
-                    (d.length as i32 - 2).max(0),
+                    (d.length as i32 - 2).max(0) / bpc,
                     TfCs::Ttype(d.sub_type as i32),
                 )),
                 _ => None,
@@ -3842,7 +4087,11 @@ fn text_form(e: &Expr, descs: &[Descriptor]) -> Option<(bool, i32, TfCs)> {
                 }
                 SysFn::Substring => match (arg(0), lit(2)) {
                     (Some((_, w, c)), None) if args.len() == 2 => Some((true, w, c)),
-                    (Some((_, _, c)), Some(n)) => Some((true, n, c)),
+                    // the literal FOR count, CAPPED at the source's own
+                    // width (probed: SUBSTRING(U6 FROM 1 FOR 100) over a
+                    // VARCHAR(6) describes 6 characters, not 100 - and
+                    // the FROM offset does not shrink it)
+                    (Some((_, w, c)), Some(n)) => Some((true, n.min(w), c)),
                     _ => None,
                 },
                 SysFn::Lpad | SysFn::Rpad => lit(1).map(|n| {
@@ -3930,14 +4179,22 @@ fn build_expr_col(
         ExprType::Temporal(TKind::Timestamp) => (Wire::Timestamp, nullable(510), 8, 0),
     };
     // a text result carries its CHARSET too (probed with SQLDA_DISPLAY):
-    // the described ttype when the operands pin one, or the attachment
-    // sentinel - resolved to the dpb's charset at describe emission.
-    // For a text_form the width above is in the ttype's own bytes; the
-    // attachment-charset widths are characters, scaled by the
-    // attachment's bytes-per-character where the sentinel resolves.
+    // NONE and OCTETS operands keep their charset with the width in
+    // bytes (= characters); a REAL charset or the attachment sentinel
+    // stays a CHARACTER width behind a negative sub_type, resolved to
+    // an id and a byte width at describe emission ([resolve_text_cs]) -
+    // because the engine announces every real-charset EXPRESSION in the
+    // ATTACHMENT charset when the attachment names a real one
+    // (UPPER(W6) under UTF8 is 24 UTF8, SUBSTRING(U6 FOR 3) under
+    // WIN1252 is 3 WIN1252), and only a NONE attachment lets the
+    // operand charset through (UPPER(U6) under NONE is 24 UTF8).
     let sub_type = if matches!(e.type_of(descs), Some(ExprType::Text)) {
         match text_form(&e, descs) {
-            Some((_, _, TfCs::Ttype(t))) => t,
+            Some((_, _, TfCs::Ttype(t))) => {
+                let cs = fire_crab_ods::intl::charset_id(t as i16);
+                // NONE/OCTETS: announced as-is, one byte per character
+                if cs <= 1 { t } else { enc_real_cs(cs) }
+            }
             Some((_, _, TfCs::Att)) => ATT_SUBTYPE,
             // the 32765 catch-all stays NONE: its cap never fires
             None => 0,
@@ -10899,7 +11156,7 @@ fn navigates(
 /// built once the values arrive?
 fn filter_has_params(filter: &Option<Predicate>) -> bool {
     filter.as_ref().is_some_and(|p| {
-        p.0.iter().flatten().any(|t| {
+        p.groups.iter().flatten().any(|t| {
             matches!(
                 t,
                 Term::Cmp(_, _, Rhs::Param(..))
@@ -11072,7 +11329,7 @@ fn choose_index(
     let empty: Vec<Vec<Term>> = vec![Vec::new()];
     let branches: &[Vec<Term>] = match filter.as_ref() {
         None => &empty,
-        Some(p) => p.0.as_slice(),
+        Some(p) => p.groups.as_slice(),
     };
     // navigation belongs to the single-band case: a union of bands has
     // no single order to inherit
@@ -11798,7 +12055,7 @@ fn parse_on(on_s: &str, sides: &[JoinSide]) -> Option<Predicate> {
     // a step with no condition keeps every pair: the fold's `matches`
     // answers true for every combined row
     if on_s == CROSS_ON {
-        return Some(Predicate(vec![vec![Term::Const(true)]]));
+        return Some(Predicate::dnf(vec![vec![Term::Const(true)]]));
     }
     // The ON condition is a PREDICATE over the joined row, resolved by
     // the same code the WHERE clause uses. It used to be a list of
@@ -11900,10 +12157,11 @@ fn combined_view(sides: &[JoinSide]) -> (Vec<RelationColumn>, Vec<Descriptor>) {
 
 /// resolver; `?` terms register parameter slots the same way.
 fn resolve_join_predicate(
-    raw: Vec<Vec<RawTerm>>,
+    raw: (Vec<Vec<RawTerm>>, Vec<Vec<u32>>),
     sides: &[JoinSide],
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Predicate> {
+    let (raw, tags) = raw;
     // a SYNTHETIC single-relation view of the combined row, for the
     // expression-term resolver: each side's columns at their combined
     // indexes (bare names only - an AMBIGUOUS name is dropped from the
@@ -11976,7 +12234,7 @@ fn resolve_join_predicate(
         }
         groups.push(terms);
     }
-    Some(Predicate(groups))
+    Some(Predicate::tagged(groups, tags))
 }
 
 /// Plan an equi-join (INNER or LEFT/RIGHT/FULL OUTER). Supported around
@@ -12218,9 +12476,9 @@ fn plan_join_bound(
             }
             natural_shared.push(shared);
             if terms.is_empty() {
-                Predicate(vec![vec![Term::Const(true)]])
+                Predicate::dnf(vec![vec![Term::Const(true)]])
             } else {
-                Predicate(vec![terms])
+                Predicate::dnf(vec![terms])
             }
         } else {
             natural_shared.push(Vec::new());
@@ -15285,9 +15543,18 @@ fn plan_query_inner(
 fn desc_of_projcol(c: &ProjCol) -> Descriptor {
     // the describe adds 1 for NULLABLE; the type is the even value
     let t = c.sql_type & !1;
+    // a real-charset EXPRESSION column ([enc_real_cs]) becomes an
+    // ordinary column of that charset for the query above: sub_type
+    // the ttype, length back in BYTES (the sentinel held characters)
+    let (c_sub, c_len) = if c.sub_type <= -2 {
+        let cs = (-2 - c.sub_type) as u8;
+        (cs as i32, c.length * fire_crab_ods::intl::bytes_per_char(cs) as i32)
+    } else {
+        (c.sub_type, c.length)
+    };
     let (dtype, length) = match t {
-        448 => (dtype::VARYING, (c.length + 2) as u16),
-        452 => (dtype::TEXT, c.length as u16),
+        448 => (dtype::VARYING, (c_len + 2) as u16),
+        452 => (dtype::TEXT, c_len as u16),
         500 => (dtype::SHORT, 2),
         496 => (dtype::LONG, 4),
         580 => (dtype::INT64, 8),
@@ -15304,7 +15571,7 @@ fn desc_of_projcol(c: &ProjCol) -> Descriptor {
         dtype,
         scale: c.scale as i8,
         length,
-        sub_type: c.sub_type as i16,
+        sub_type: c_sub as i16,
         flags: 0,
         offset: 1,
     }
@@ -17364,12 +17631,9 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor], att: AttCs) 
             // an attachment-charset text variable announces the dpb's
             // charset and its width in that charset's BYTES - probed:
             // 'ab' under a UTF8 attachment is length 8 CHARSET UTF8,
-            // under NONE it is length 2 CHARSET NONE
-            let (sub_type, length) = if c.sub_type == ATT_SUBTYPE {
-                (att.id as i32, c.length * att.bpc as i32)
-            } else {
-                (c.sub_type, c.length)
-            };
+            // under NONE it is length 2 CHARSET NONE; a real-charset
+            // EXPRESSION resolves the same way (see [resolve_text_cs])
+            let (sub_type, length) = resolve_text_cs(c.sub_type, c.length, &att);
             Var {
                 sql_type: c.sql_type,
                 sub_type,
@@ -18281,10 +18545,15 @@ fn enforce_out_capacity(
             Some(t) => AttCs::by_id((t & 0xFF) as u8),
             None => out.att,
         };
-        // the described source charset; ATT_SUBTYPE marks a column the
-        // describe already resolved to the attachment charset
+        // the described source charset; the negative sentinels resolve
+        // exactly as the describe resolved them ([resolve_text_cs]):
+        // the attachment charset, except a real-charset expression
+        // under a NONE attachment, which keeps its own
         let src_id = if c.sub_type == ATT_SUBTYPE {
             out.att.id
+        } else if c.sub_type <= -2 {
+            let cs = (-2 - c.sub_type) as u8;
+            if out.att.id != 0 { out.att.id } else { cs }
         } else {
             fire_crab_ods::intl::charset_id(c.sub_type as i16)
         };
@@ -25014,17 +25283,66 @@ enum Ast {
 /// still references its one slot. None = a shape this parser does not
 /// cover, or a DNF blow-up past the size cap (the caller falls back
 /// rather than answering wrong).
-fn parse_predicate(toks: &[Tok], next_param: &mut usize) -> Option<Vec<Vec<RawTerm>>> {
+/// Alongside the DNF, every term carries the index of the TOP-LEVEL
+/// conjunct (of the NNF source tree) it came from - the provenance
+/// [Predicate] evaluates by, since the engine walks conjunct by
+/// conjunct and the cross-product duplicates terms across groups.
+fn parse_predicate(
+    toks: &[Tok],
+    next_param: &mut usize,
+) -> Option<(Vec<Vec<RawTerm>>, Vec<Vec<u32>>)> {
     let mut pos = 0usize;
     let ast = parse_or(toks, &mut pos, next_param)?;
     if pos != toks.len() {
         return None; // trailing tokens
     }
-    let dnf = to_dnf(&ast, false)?;
-    if dnf.is_empty() || dnf.iter().any(|g| g.is_empty()) {
+    // the top-level conjunction of the NNF: AND parts (or NOT-OR parts)
+    // flattened recursively; anything else is a single conjunct
+    fn flatten<'a>(ast: &'a Ast, neg: bool, out: &mut Vec<(&'a Ast, bool)>) {
+        match ast {
+            Ast::Not(inner) => flatten(inner, !neg, out),
+            Ast::And(parts) if !neg => parts.iter().for_each(|p| flatten(p, neg, out)),
+            Ast::Or(parts) if neg => parts.iter().for_each(|p| flatten(p, neg, out)),
+            _ => out.push((ast, neg)),
+        }
+    }
+    let mut conjuncts = Vec::new();
+    flatten(&ast, false, &mut conjuncts);
+    // the same cross-product [cross_dnf] runs, conjunct by conjunct so
+    // each term can carry its conjunct's index; same size caps - the
+    // MULTIPLICATIVE cap only when there is something to multiply,
+    // since a lone OR conjunct (an IN-list desugar) is bounded by the
+    // ADDITIVE cap inside [concat_dnf], exactly as before
+    let single = conjuncts.len() == 1;
+    let mut groups: Vec<Vec<RawTerm>> = vec![Vec::new()];
+    let mut tags: Vec<Vec<u32>> = vec![Vec::new()];
+    for (i, (part, neg)) in conjuncts.iter().enumerate() {
+        let d = to_dnf(part, *neg)?;
+        if d.is_empty() || d.iter().any(|g| g.is_empty()) {
+            return None;
+        }
+        if !single {
+            groups.len().checked_mul(d.len()).filter(|n| *n <= DNF_MAX_GROUPS)?;
+        }
+        let mut next_g = Vec::with_capacity(groups.len() * d.len());
+        let mut next_t = Vec::with_capacity(groups.len() * d.len());
+        for (a, at) in groups.iter().zip(&tags) {
+            for g in &d {
+                let mut mg = a.clone();
+                let mut mt = at.clone();
+                mg.extend(g.iter().cloned());
+                mt.extend(std::iter::repeat(i as u32).take(g.len()));
+                next_g.push(mg);
+                next_t.push(mt);
+            }
+        }
+        groups = next_g;
+        tags = next_t;
+    }
+    if groups.is_empty() || groups.iter().any(|g| g.is_empty()) {
         return None;
     }
-    Some(dnf)
+    Some((groups, tags))
 }
 
 fn parse_or(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
@@ -26802,6 +27120,12 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
         RawKind::IsNull => Term::IsNull(idx),
         RawKind::IsNotNull => Term::IsNotNull(idx),
         RawKind::Like(pattern, escape, negated) => match (kind, pattern) {
+            // a LITERAL pattern whose escape is invalid takes the
+            // engine's lenient-prefix rewrite ([Term::BadLike]) - the
+            // non-negated TEXT form only; NOT LIKE raises ungated
+            (ColKind::Text, Rhs::Str(p)) if !negated && invalid_escape(&p, escape) => {
+                Term::BadLike(idx, lenient_like_prefix(&p, escape))
+            }
             (ColKind::Text, Rhs::Str(p)) => Term::Like(idx, Rhs::Str(p), escape, negated),
             // an INTEGER column coerces to its decimal text per row
             // (probed: '1%' takes N=1,10,100; '-%' takes -5; '_' the
@@ -26835,11 +27159,12 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
 /// with the column's descriptor (a leaf the DNF cross-product
 /// duplicated fills its one slot twice with the same descriptor).
 fn resolve_predicate(
-    raw: Vec<Vec<RawTerm>>,
+    raw: (Vec<Vec<RawTerm>>, Vec<Vec<u32>>),
     columns: &[RelationColumn],
     descs: &[Descriptor],
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Predicate> {
+    let (raw, tags) = raw;
     let mut groups = Vec::new();
     for g in raw {
         let mut terms = Vec::new();
@@ -26894,7 +27219,7 @@ fn resolve_predicate(
         }
         groups.push(terms);
     }
-    Some(Predicate(groups))
+    Some(Predicate::tagged(groups, tags))
 }
 
 /// Resolve a `?`-as-tested-side term ([RawLhs::Param]): claim the slot
@@ -27060,7 +27385,19 @@ fn resolve_expr_term(
         RawKind::IsNull => Term::ExprCond(Box::new(Cond2::IsNull(Box::new(lhs)))),
         RawKind::IsNotNull => Term::ExprCond(Box::new(Cond2::IsNotNull(Box::new(lhs)))),
         RawKind::Like(Rhs::Str(p), escape, negated) => {
-            Term::ExprLike(Box::new(lhs), p.clone(), *escape, *negated)
+            // a TEXT-typed side with a literal bad-escape pattern takes
+            // the lenient-prefix gate exactly like a text column
+            // (probed: `UPPER(NAME) LIKE 'zz!a' ESCAPE '!'` answers []
+            // where no value starts with 'zza'); a non-text side raises
+            // ungated (`N LIKE '1!2' ESCAPE '!'` raises on both)
+            if !negated
+                && invalid_escape(p, *escape)
+                && matches!(lhs.type_of(descs), Some(ExprType::Text))
+            {
+                Term::BadExprLike(Box::new(lhs), lenient_like_prefix(p, *escape))
+            } else {
+                Term::ExprLike(Box::new(lhs), p.clone(), *escape, *negated)
+            }
         }
         // `<expression> LIKE ?` - the evaluated side rendered against
         // the BOUND pattern (probed: `UPPER(NAME) LIKE ?` with 'A%'
@@ -27529,12 +27866,13 @@ fn param_or_typed_term(
 /// select list does not carry it. Aggregate values are integers, so their
 /// literals must be too. Returns None on any unresolvable piece.
 fn resolve_having(
-    raw: Vec<Vec<RawTerm>>,
+    raw: (Vec<Vec<RawTerm>>, Vec<Vec<u32>>),
     gitems: &mut Vec<GItem>,
     key_fids: &[usize],
     columns: &[RelationColumn],
     descs: &[Descriptor],
 ) -> Option<Predicate> {
+    let (raw, tags) = raw;
     let mut groups = Vec::new();
     for g in raw {
         let mut terms = Vec::new();
@@ -27689,7 +28027,7 @@ fn resolve_having(
         }
         groups.push(terms);
     }
-    Some(Predicate(groups))
+    Some(Predicate::tagged(groups, tags))
 }
 
 /// Serve one connection to completion.
@@ -30700,7 +31038,7 @@ mod tests {
                 kind,
                 src: RowSource::Rows(Vec::new()),
                 width: 2,
-                on: Predicate(vec![vec![Term::Const(on)]]),
+                on: Predicate::dnf(vec![vec![Term::Const(on)]]),
             })
         };
         let l = RowSource::Rows(vec![row(1, 10), row(2, 20)]);
@@ -30861,6 +31199,175 @@ mod tests {
             ),
             Some((true, 12, TfCs::Ttype(0)))
         );
+    }
+
+    #[test]
+    fn multibyte_expression_widths_are_characters_scaled_at_emission() {
+        // probed (SQLDA_DISPLAY, UTF8/WIN1252/NONE attachments): the
+        // width algebra runs in CHARACTERS - `SUBSTRING(U6 FROM 1 FOR
+        // 3)` over VARCHAR(6) UTF8 describes 12 bytes, `U6 || 'x'` 28,
+        // `LPAD(U6, 8, 'x')` 32 - and the byte scaling happens at
+        // emission against the charset the expression resolves to
+        let d = |dt: u8, len: u16, st: i16| Descriptor {
+            dtype: dt, scale: 0, length: len, sub_type: st, flags: 0, offset: 8,
+        };
+        // 0: U6 VARCHAR(6) UTF8 (24 payload bytes + 2 count)
+        // 1: CU6 CHAR(6) UTF8, 2: V6 VARCHAR(6) NONE, 3: W6 VARCHAR(6) WIN1252
+        let descs = vec![
+            d(dtype::VARYING, 26, 4),
+            d(dtype::TEXT, 24, 4),
+            d(dtype::VARYING, 8, 0),
+            d(dtype::VARYING, 8, 53),
+        ];
+        let u6 = || Expr::Col(0);
+        let lit = |t: &str| Expr::Str(t.to_string());
+        // a multibyte column's width is its CHARACTER count
+        assert_eq!(text_form(&u6(), &descs), Some((true, 6, TfCs::Ttype(4))));
+        assert_eq!(text_form(&Expr::Col(1), &descs), Some((false, 6, TfCs::Ttype(4))));
+        let f = |sf: SysFn, a: Vec<Expr>| text_form(&Expr::Func(sf, a), &descs);
+        // SUBSTRING: the literal FOR count in characters, CAPPED at the
+        // source's width (probed: FOR 100 over VARCHAR(6) describes 6)
+        assert_eq!(
+            f(SysFn::Substring, vec![u6(), Expr::Int(1), Expr::Int(3)]),
+            Some((true, 3, TfCs::Ttype(4)))
+        );
+        assert_eq!(
+            f(SysFn::Substring, vec![u6(), Expr::Int(1), Expr::Int(100)]),
+            Some((true, 6, TfCs::Ttype(4)))
+        );
+        assert_eq!(f(SysFn::Lpad, vec![u6(), Expr::Int(8)]), Some((true, 8, TfCs::Ttype(4))));
+        // `U6 || 'x'` is 7 characters; the attachment literal YIELDS
+        // to the real charset (probed: 28 UTF8 under a NONE attachment)
+        assert_eq!(
+            text_form(&Expr::Concat(Box::new(u6()), Box::new(lit("x"))), &descs),
+            Some((true, 7, TfCs::Ttype(4)))
+        );
+        // NONE yields to real; two REAL charsets take the FIRST's
+        assert_eq!(cs_join(TfCs::Ttype(0), TfCs::Ttype(4)), TfCs::Ttype(4));
+        assert_eq!(cs_join(TfCs::Ttype(4), TfCs::Ttype(53)), TfCs::Ttype(4));
+        assert_eq!(cs_join(TfCs::Ttype(53), TfCs::Ttype(4)), TfCs::Ttype(53));
+        assert_eq!(cs_join(TfCs::Att, TfCs::Ttype(4)), TfCs::Ttype(4));
+        assert_eq!(cs_join(TfCs::Ttype(0), TfCs::Att), TfCs::Att);
+        // the emission law (probed): a real-charset expression resolves
+        // to the ATTACHMENT charset when the attachment names a real
+        // one, and keeps its own under a NONE attachment
+        let utf8 = AttCs { id: 4, bpc: 4, multibyte: true };
+        let w1252 = AttCs { id: 53, bpc: 1, multibyte: false };
+        let none = AttCs::NONE;
+        let real_utf8 = enc_real_cs(4);
+        assert_eq!(resolve_text_cs(real_utf8, 3, &utf8), (4, 12));
+        assert_eq!(resolve_text_cs(real_utf8, 3, &w1252), (53, 3));
+        assert_eq!(resolve_text_cs(real_utf8, 3, &none), (4, 12));
+        assert_eq!(resolve_text_cs(ATT_SUBTYPE, 3, &utf8), (4, 12));
+        assert_eq!(resolve_text_cs(ATT_SUBTYPE, 3, &none), (0, 3));
+        // a plain NONE expression and a stored column pass through
+        assert_eq!(resolve_text_cs(0, 6, &utf8), (0, 6));
+        assert_eq!(resolve_text_cs(4, 24, &utf8), (4, 24));
+    }
+
+    #[test]
+    fn conjunct_provenance_survives_the_dnf() {
+        // probed: `(1=1 OR 1/0=1) AND ID>3` answers the ID>3 rows and
+        // never raises - the invariant OR short-circuits ONCE at open -
+        // while its distributed twin `1=1 AND ID>3 OR 1/0=1 AND ID>3`
+        // raises on the first row failing ID>3; and `ID>0 OR 1/0=1`
+        // reaches the division only for rows failing ID>0
+        let columns = vec![RelationColumn { name: "ID".into(), field_id: 0, position: 0 }];
+        let descs = vec![Descriptor {
+            dtype: dtype::LONG, scale: 0, length: 4, sub_type: 0, flags: 0, offset: 4,
+        }];
+        let resolve = |s: &str| -> Option<Predicate> {
+            let toks = tokenize(s)?;
+            let mut np = 0usize;
+            let raw = parse_predicate(&toks, &mut np)?;
+            resolve_predicate(raw, &columns, &descs, &mut Vec::new())
+        };
+        // the parenthesised invariant OR is ONE conjunct: TRUE at bind,
+        // stripped from the row pass - a row failing ID>3 answers
+        // FALSE with no raise
+        let b = resolve("(1 = 1 OR 1 / 0 = 1) AND ID > 3").unwrap().bind(&[]).unwrap();
+        assert!(b.matches(&[Value::Int(4)]).unwrap());
+        assert!(!b.matches(&[Value::Int(1)]).unwrap());
+        // the distributed spelling is a single top-level OR: per row,
+        // the first group failing into the second REACHES the division
+        let b = resolve("1 = 1 AND ID > 3 OR 1 / 0 = 1 AND ID > 3").unwrap().bind(&[]).unwrap();
+        assert!(matches!(b.matches(&[Value::Int(1)]), Err(EvalErr::DivideByZero)));
+        // a mixed OR conjunct short-circuits per row at ID>0 ...
+        let b = resolve("ID > 0 OR 1 / 0 = 1").unwrap().bind(&[]).unwrap();
+        assert!(b.matches(&[Value::Int(1)]).unwrap());
+        // ... and reaches the division only when the row fails into it
+        assert!(matches!(b.matches(&[Value::Int(0)]), Err(EvalErr::DivideByZero)));
+        // an invariant FALSE conjunct kills the scan wherever it is
+        // written, even behind a row-dependent raising term (probed:
+        // `ID/0=1 AND 1=0` answers no rows)
+        let b = resolve("ID / 0 = 1 AND 1 = 0").unwrap().bind(&[]).unwrap();
+        assert!(!b.matches(&[Value::Int(1)]).unwrap());
+        // the mixed-OR-under-AND composition: `(ID>0 OR 1/0=1) AND
+        // ID>3` answers a row with ID=1 FALSE with no raise (probed)
+        let b = resolve("(ID > 0 OR 1 / 0 = 1) AND ID > 3").unwrap().bind(&[]).unwrap();
+        assert!(!b.matches(&[Value::Int(1)]).unwrap());
+        assert!(b.matches(&[Value::Int(4)]).unwrap());
+    }
+
+    #[test]
+    fn literal_bad_escape_gates_on_the_lenient_prefix() {
+        // probed rules of the prefix itself
+        let p = |s: &str| lenient_like_prefix(s, Some('!'));
+        assert_eq!(p("a!bc"), "abc");
+        assert_eq!(p("ab!"), "ab");
+        assert_eq!(p("a!!b!c"), "a!bc");
+        assert_eq!(p("a!%b!c"), "a%bc");
+        assert_eq!(p("ab%!c"), "ab");
+        assert_eq!(p("_b!c"), "");
+        assert_eq!(p("%a!b"), "");
+        assert_eq!(p("!ab"), "ab");
+        // the gated term: NULL is UNKNOWN, a prefix miss is FALSE with
+        // no raise, a hit raises 22025 (probed: 'a!bc' answers [] over
+        // 'abX' and raises over 'abcd' - a PREFIX test, case-sensitive)
+        let t = Term::BadLike(0, "abc".into());
+        assert_eq!(t.matches(&[Value::Null]).unwrap(), None);
+        assert_eq!(t.matches(&[Value::Text("abX".into())]).unwrap(), Some(false));
+        assert_eq!(t.matches(&[Value::Text("Abcd".into())]).unwrap(), Some(false));
+        assert!(matches!(
+            t.matches(&[Value::Text("abcd".into())]),
+            Err(EvalErr::InvalidEscape)
+        ));
+        // resolution routes the literal non-negated TEXT form here ...
+        let columns = vec![RelationColumn { name: "NAME".into(), field_id: 0, position: 0 }];
+        let descs = vec![Descriptor {
+            dtype: dtype::VARYING, scale: 0, length: 12, sub_type: 0, flags: 0, offset: 4,
+        }];
+        let resolve = |s: &str| -> Option<Predicate> {
+            let toks = tokenize(s)?;
+            let mut np = 0usize;
+            let raw = parse_predicate(&toks, &mut np)?;
+            resolve_predicate(raw, &columns, &descs, &mut Vec::new())
+        };
+        let b = resolve("NAME LIKE 'zz!a' ESCAPE '!'").unwrap().bind(&[]).unwrap();
+        assert!(!b.matches(&[Value::Text("alpha".into())]).unwrap());
+        assert!(matches!(
+            b.matches(&[Value::Text("zzab".into())]),
+            Err(EvalErr::InvalidEscape)
+        ));
+        // ... while NOT LIKE stays ungated (probed: raises over a
+        // prefix-missing row too)
+        let b = resolve("NAME NOT LIKE 'zz!a' ESCAPE '!'").unwrap().bind(&[]).unwrap();
+        assert!(matches!(
+            b.matches(&[Value::Text("alpha".into())]),
+            Err(EvalErr::InvalidEscape)
+        ));
+        // `? LIKE '<literal bad>'` gates at bind: a prefix-missing bind
+        // answers no rows, a hitting one raises - over ZERO rows too,
+        // since the conjunct is row-independent (probed on EMPTYT)
+        let toks = tokenize("? LIKE 'a!bc' ESCAPE '!'").unwrap();
+        let mut np = 0usize;
+        let raw = parse_predicate(&toks, &mut np).unwrap();
+        let p = resolve_predicate(raw, &columns, &descs, &mut Vec::new()).unwrap();
+        assert!(!p.bind(&[WireParam::Text("zz".into())]).unwrap().matches(&[]).unwrap());
+        assert!(matches!(
+            p.bind(&[WireParam::Text("abc".into())]),
+            Err(ExecErr::Eval(EvalErr::InvalidEscape))
+        ));
     }
 
     #[test]
@@ -31482,7 +31989,7 @@ mod tests {
 
     #[test]
     fn predicate_binds_params_at_execute() {
-        let p = Predicate(vec![vec![
+        let p = Predicate::dnf(vec![vec![
             Term::Cmp(3, Cmp::Eq, Rhs::Param(0, ColKind::Int)),
             Term::Cmp(5, Cmp::Eq, Rhs::Param(1, ColKind::Text)),
         ]]);
@@ -31584,26 +32091,26 @@ mod tests {
         // ? IS [NOT] NULL is one leaf on the param itself
         let (d, np) = dnf("? IS NULL");
         assert_eq!(np, 1);
-        assert!(matches!(&d[0][0],
+        assert!(matches!(&d.0[0][0],
             RawTerm { lhs: RawLhs::Param(0), kind: RawKind::IsNull }));
         let (d, _) = dnf("? IS NOT NULL");
-        assert!(matches!(&d[0][0].kind, RawKind::IsNotNull));
+        assert!(matches!(&d.0[0][0].kind, RawKind::IsNotNull));
         // ? BETWEEN desugars into the mirrored comparisons, BOTH
         // referencing the ONE slot (lo <= ?, hi >= ?)
         let (d, np) = dnf("? BETWEEN 1 AND 3");
-        assert_eq!((np, d.len(), d[0].len()), (1, 1, 2));
-        assert!(matches!(&d[0][0].kind, RawKind::Cmp(Cmp::Le, Rhs::Param(0, _))));
-        assert!(matches!(&d[0][1].kind, RawKind::Cmp(Cmp::Ge, Rhs::Param(0, _))));
-        assert!(matches!(&d[0][0].lhs, RawLhs::Expr(RawExpr::Int(1))));
+        assert_eq!((np, d.0.len(), d.0[0].len()), (1, 1, 2));
+        assert!(matches!(&d.0[0][0].kind, RawKind::Cmp(Cmp::Le, Rhs::Param(0, _))));
+        assert!(matches!(&d.0[0][1].kind, RawKind::Cmp(Cmp::Ge, Rhs::Param(0, _))));
+        assert!(matches!(&d.0[0][0].lhs, RawLhs::Expr(RawExpr::Int(1))));
         // ? IN is an OR of mirrored equalities over the one slot
         let (d, np) = dnf("? IN (1, 2)");
-        assert_eq!((np, d.len()), (1, 2));
-        assert!(matches!(&d[0][0].kind, RawKind::Cmp(Cmp::Eq, Rhs::Param(0, _))));
-        assert!(matches!(&d[1][0].kind, RawKind::Cmp(Cmp::Eq, Rhs::Param(0, _))));
+        assert_eq!((np, d.0.len()), (1, 2));
+        assert!(matches!(&d.0[0][0].kind, RawKind::Cmp(Cmp::Eq, Rhs::Param(0, _))));
+        assert!(matches!(&d.0[1][0].kind, RawKind::Cmp(Cmp::Eq, Rhs::Param(0, _))));
         // NOT IN pushes De Morgan through: AND of Ne
         let (d, _) = dnf("? NOT IN (1, 2)");
-        assert_eq!((d.len(), d[0].len()), (1, 2));
-        assert!(matches!(&d[0][0].kind, RawKind::Cmp(Cmp::Ne, Rhs::Param(0, _))));
+        assert_eq!((d.0.len(), d.0[0].len()), (1, 2));
+        assert!(matches!(&d.0[0][0].kind, RawKind::Cmp(Cmp::Ne, Rhs::Param(0, _))));
         // a param BOUND refuses (the engine refuses too, -804)
         assert!(parse_predicate(&tokenize("? BETWEEN ? AND 3").unwrap(), &mut 0).is_none());
         // mixed text/numeric bounds refuse at prepare
@@ -31612,7 +32119,7 @@ mod tests {
         // ? LIKE ? claims two slots in textual order
         let (d, np) = dnf("? LIKE ?");
         assert_eq!(np, 2);
-        assert!(matches!(&d[0][0],
+        assert!(matches!(&d.0[0][0],
             RawTerm { lhs: RawLhs::Param(0), kind: RawKind::Like(Rhs::Param(1, _), None, false) }));
 
         // the bind: ? IS NULL is type-blind and row-independent
@@ -31812,20 +32319,20 @@ mod tests {
         let dnf = |s: &str| parse_predicate(&tokenize(s).unwrap(), &mut 0).unwrap();
         // STARTING [WITH] is one leaf; WITH is optional sugar
         let d = dnf("V STARTING WITH 'ab'");
-        assert!(matches!(&d[0][0].kind, RawKind::Starting(Rhs::Str(p), false) if p == "ab"));
+        assert!(matches!(&d.0[0][0].kind, RawKind::Starting(Rhs::Str(p), false) if p == "ab"));
         let d = dnf("V STARTING 'ab'");
-        assert!(matches!(&d[0][0].kind, RawKind::Starting(Rhs::Str(_), false)));
+        assert!(matches!(&d.0[0][0].kind, RawKind::Starting(Rhs::Str(_), false)));
         // both spellings of NOT land in the negated flag
         let d = dnf("V NOT STARTING WITH 'ab'");
-        assert!(matches!(&d[0][0].kind, RawKind::Starting(Rhs::Str(_), true)));
+        assert!(matches!(&d.0[0][0].kind, RawKind::Starting(Rhs::Str(_), true)));
         let d = dnf("NOT V STARTING WITH 'ab'");
-        assert!(matches!(&d[0][0].kind, RawKind::Starting(Rhs::Str(_), true)));
+        assert!(matches!(&d.0[0][0].kind, RawKind::Starting(Rhs::Str(_), true)));
         // a numeric prefix literal refuses (unprobed through scales)
         assert!(parse_predicate(&tokenize("V STARTING WITH 1").unwrap(), &mut 0).is_none());
         // STARTING is NOT a reserved word: a column of that name still
         // compares (probed: CREATE TABLE T2 (STARTING INT) succeeds)
         let d = dnf("STARTING = 7");
-        assert!(matches!(&d[0][0].kind, RawKind::Cmp(Cmp::Eq, Rhs::Int(7))));
+        assert!(matches!(&d.0[0][0].kind, RawKind::Cmp(Cmp::Eq, Rhs::Int(7))));
 
         // per-BYTE prefix on the STORED value: no pad trim on either
         // side (probed: VARCHAR 'ab' does not start with 'ab ';
@@ -31869,38 +32376,38 @@ mod tests {
         let dnf = |s: &str| parse_predicate(&tokenize(s).unwrap(), &mut 0).unwrap();
         // BETWEEN = >= AND <=
         let d = dnf("A BETWEEN 2 AND 5");
-        assert_eq!((d.len(), d[0].len()), (1, 2));
-        assert!(matches!(&d[0][0].kind, RawKind::Cmp(Cmp::Ge, Rhs::Int(2))));
-        assert!(matches!(&d[0][1].kind, RawKind::Cmp(Cmp::Le, Rhs::Int(5))));
+        assert_eq!((d.0.len(), d.0[0].len()), (1, 2));
+        assert!(matches!(&d.0[0][0].kind, RawKind::Cmp(Cmp::Ge, Rhs::Int(2))));
+        assert!(matches!(&d.0[0][1].kind, RawKind::Cmp(Cmp::Le, Rhs::Int(5))));
         // NOT BETWEEN pushes through De Morgan: < 2 OR > 5
         let d = dnf("A NOT BETWEEN 2 AND 5");
-        assert_eq!(d.len(), 2);
-        assert!(matches!(&d[0][0].kind, RawKind::Cmp(Cmp::Lt, Rhs::Int(2))));
-        assert!(matches!(&d[1][0].kind, RawKind::Cmp(Cmp::Gt, Rhs::Int(5))));
+        assert_eq!(d.0.len(), 2);
+        assert!(matches!(&d.0[0][0].kind, RawKind::Cmp(Cmp::Lt, Rhs::Int(2))));
+        assert!(matches!(&d.0[1][0].kind, RawKind::Cmp(Cmp::Gt, Rhs::Int(5))));
         // IN = OR of equalities; NOT IN = AND of inequalities
         let d = dnf("A IN (1, 2, 3)");
-        assert_eq!(d.len(), 3);
+        assert_eq!(d.0.len(), 3);
         let d = dnf("A NOT IN (1, 2)");
-        assert_eq!((d.len(), d[0].len()), (1, 2));
-        assert!(matches!(&d[0][0].kind, RawKind::Cmp(Cmp::Ne, Rhs::Int(1))));
+        assert_eq!((d.0.len(), d.0[0].len()), (1, 2));
+        assert!(matches!(&d.0[0][0].kind, RawKind::Cmp(Cmp::Ne, Rhs::Int(1))));
         // a NULL in a NOT IN list survives as <> NULL (resolves to
         // Never - the whole conjunct can never pass: engine 3VL)
         let d = dnf("A NOT IN (1, NULL)");
-        assert!(matches!(&d[0][1].kind, RawKind::Cmp(Cmp::Ne, Rhs::Null)));
+        assert!(matches!(&d.0[0][1].kind, RawKind::Cmp(Cmp::Ne, Rhs::Null)));
         // NOT over a parenthesized OR: De Morgan to one AND group
         let d = dnf("NOT (A = 1 OR B = 2)");
-        assert_eq!((d.len(), d[0].len()), (1, 2));
-        assert!(matches!(&d[0][0].kind, RawKind::Cmp(Cmp::Ne, Rhs::Int(1))));
+        assert_eq!((d.0.len(), d.0[0].len()), (1, 2));
+        assert!(matches!(&d.0[0][0].kind, RawKind::Cmp(Cmp::Ne, Rhs::Int(1))));
         // parens override precedence: (A=1 OR B=2) AND C=3 cross-multiplies
         let d = dnf("(A = 1 OR B = 2) AND C = 3");
-        assert_eq!(d.len(), 2);
-        assert_eq!(d[0].len(), 2);
+        assert_eq!(d.0.len(), 2);
+        assert_eq!(d.0[0].len(), 2);
         // NOT LIKE flips the leaf flag; ESCAPE parses
         let d = dnf("A NOT LIKE 'x%' ESCAPE '!'");
-        assert!(matches!(&d[0][0].kind, RawKind::Like(Rhs::Str(_), Some('!'), true)));
+        assert!(matches!(&d.0[0][0].kind, RawKind::Like(Rhs::Str(_), Some('!'), true)));
         // double NOT cancels
         let d = dnf("NOT NOT A = 1");
-        assert!(matches!(&d[0][0].kind, RawKind::Cmp(Cmp::Eq, Rhs::Int(1))));
+        assert!(matches!(&d.0[0][0].kind, RawKind::Cmp(Cmp::Eq, Rhs::Int(1))));
         // unsupported shapes refuse: dangling paren, bare NOT, agg call
         let pp = |s: &str| parse_predicate(&tokenize(s).unwrap(), &mut 0);
         assert!(pp("(A = 1").is_none());
@@ -31918,7 +32425,7 @@ mod tests {
         let raw =
             parse_predicate(&tokenize("(A = ? OR B = ?) AND A = ?").unwrap(), &mut np).unwrap();
         assert_eq!(np, 3);
-        assert_eq!(raw.len(), 2); // two OR groups after distribution
+        assert_eq!(raw.0.len(), 2); // two OR groups after distribution
         let columns = vec![
             RelationColumn { name: "A".into(), field_id: 0, position: 0 },
             RelationColumn { name: "B".into(), field_id: 1, position: 1 },
@@ -32288,17 +32795,17 @@ mod tests {
     fn tokenizes_and_parses_predicate() {
         let toks = tokenize("ID >= 5 AND NAME = 'a b' OR SALARY IS NULL").unwrap();
         let dnf = parse_predicate(&toks, &mut 0).unwrap();
-        assert_eq!(dnf.len(), 2); // two OR groups
-        assert_eq!(dnf[0].len(), 2); // ID>=5 AND NAME='a b'
-        assert_eq!(dnf[1].len(), 1); // SALARY IS NULL
+        assert_eq!(dnf.0.len(), 2); // two OR groups
+        assert_eq!(dnf.0[0].len(), 2); // ID>=5 AND NAME='a b'
+        assert_eq!(dnf.0[1].len(), 1); // SALARY IS NULL
         // string literal keeps embedded spaces and case
-        assert!(matches!(&dnf[0][1].kind, RawKind::Cmp(_, Rhs::Str(s)) if s == "a b"));
+        assert!(matches!(&dnf.0[0][1].kind, RawKind::Cmp(_, Rhs::Str(s)) if s == "a b"));
         // <> and != both parse; negative ints; IS NOT NULL
         assert!(parse_predicate(&tokenize("A <> -3").unwrap(), &mut 0).is_some());
         assert!(parse_predicate(&tokenize("A != 1 AND B IS NOT NULL").unwrap(), &mut 0).is_some());
         // parentheses group (increment 32): (A = 1) is one plain leaf
         let dnf = parse_predicate(&tokenize("(A = 1)").unwrap(), &mut 0).unwrap();
-        assert_eq!((dnf.len(), dnf[0].len()), (1, 1));
+        assert_eq!((dnf.0.len(), dnf.0[0].len()), (1, 1));
     }
 
     #[test]
@@ -32306,24 +32813,24 @@ mod tests {
         // an aggregate call is ONE token, spacing-tolerant
         let toks = tokenize("count( * ) > 3 AND MIN(SALARY) >= 100").unwrap();
         let dnf = parse_predicate(&toks, &mut 0).unwrap();
-        assert_eq!(dnf.len(), 1);
-        assert_eq!(dnf[0].len(), 2);
-        assert!(matches!(&dnf[0][0].lhs, RawLhs::Agg(AggFn::Count, AggTarget::Star)));
+        assert_eq!(dnf.0.len(), 1);
+        assert_eq!(dnf.0[0].len(), 2);
+        assert!(matches!(&dnf.0[0][0].lhs, RawLhs::Agg(AggFn::Count, AggTarget::Star)));
         assert!(
-            matches!(&dnf[0][1].lhs, RawLhs::Agg(AggFn::Min, AggTarget::Col(c)) if c == "SALARY")
+            matches!(&dnf.0[0][1].lhs, RawLhs::Agg(AggFn::Min, AggTarget::Col(c)) if c == "SALARY")
         );
         // IS [NOT] NULL applies to aggregates too
         let toks = tokenize("SUM(B) IS NOT NULL").unwrap();
-        assert!(matches!(&parse_predicate(&toks, &mut 0).unwrap()[0][0].kind, RawKind::IsNotNull));
+        assert!(matches!(&parse_predicate(&toks, &mut 0).unwrap().0[0][0].kind, RawKind::IsNotNull));
         // a built-in function call is a leaf of its own now: one
         // FnExpr token, an expression left side
         let dnf = parse_predicate(&tokenize("UPPER(NAME) = 'X'").unwrap(), &mut 0).unwrap();
-        assert!(matches!(&dnf[0][0].lhs, RawLhs::Expr(RawExpr::Func(SysFn::Upper, _))));
+        assert!(matches!(&dnf.0[0][0].lhs, RawLhs::Expr(RawExpr::Func(SysFn::Upper, _))));
         // ...as does a malformed aggregate
         assert!(tokenize("MIN(*) > 1").is_none());
         // an aggregate name NOT followed by parens is a plain identifier
         let toks = tokenize("COUNT = 1").unwrap();
-        assert!(matches!(&parse_predicate(&toks, &mut 0).unwrap()[0][0].lhs, RawLhs::Col(c) if c == "COUNT"));
+        assert!(matches!(&parse_predicate(&toks, &mut 0).unwrap().0[0][0].lhs, RawLhs::Col(c) if c == "COUNT"));
     }
 
     #[test]
@@ -32538,7 +33045,7 @@ mod tests {
             src: RowSource::Rows(Vec::new()),
             width: 1,
             // ON acc[1] = new[0] - index 2 is the new side's only column
-            on: Predicate(vec![vec![Term::ExprCond(Box::new(Cond2::Cmp(
+            on: Predicate::dnf(vec![vec![Term::ExprCond(Box::new(Cond2::Cmp(
                 Box::new(Expr::Col(1)),
                 Cmp::Eq,
                 Box::new(Expr::Col(2)),
@@ -32680,7 +33187,7 @@ mod tests {
     #[test]
     fn predicate_matches_rows() {
         // col 0 int, col 1 text
-        let p = Predicate(vec![vec![
+        let p = Predicate::dnf(vec![vec![
             Term::Cmp(0, Cmp::Ge, Rhs::Int(5)),
             Term::Cmp(1, Cmp::Eq, Rhs::Str("x".into())),
         ]]);
@@ -32776,7 +33283,7 @@ mod tests {
         // `? LIKE ?` with a bad bound pattern raises as an IN-ORDER
         // invariant: alone it raises typed ...
         let like = Term::ParamLike(0, Rhs::Param(1, ColKind::Text), Some('!'), false);
-        let p = Predicate(vec![vec![like.clone()]]);
+        let p = Predicate::dnf(vec![vec![like.clone()]]);
         let bad = [WireParam::Text("x".into()), WireParam::Text("a!bc".into())];
         assert!(matches!(p.bind(&bad), Err(ExecErr::Eval(EvalErr::InvalidEscape))));
         // ... a NULL tested value gates it off entirely ...
@@ -32784,9 +33291,9 @@ mod tests {
         assert!(!p.bind(&nul).unwrap().matches(&[]).unwrap());
         // ... a FALSE written before it suppresses the raise, one
         // written after does not
-        let p = Predicate(vec![vec![Term::Const(false), like.clone()]]);
+        let p = Predicate::dnf(vec![vec![Term::Const(false), like.clone()]]);
         assert!(!p.bind(&bad).unwrap().matches(&[]).unwrap());
-        let p = Predicate(vec![vec![like, Term::Const(false)]]);
+        let p = Predicate::dnf(vec![vec![like, Term::Const(false)]]);
         assert!(matches!(p.bind(&bad), Err(ExecErr::Eval(EvalErr::InvalidEscape))));
     }
 

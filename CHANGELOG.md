@@ -13,6 +13,78 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-02 — Three refutations, three laws re-probed
+
+Three adversarially-confirmed divergences, each re-probed against the
+live engine before the fix: expression describe widths over multibyte
+charsets, the bind-time invariant pass raising into OR-groups the
+engine never reaches, and the literal bad-escape LIKE raising where the
+engine's lenient-prefix pre-filter answers.
+
+### Fixed
+- **Text expression widths are CHARACTER counts, scaled at emission**
+  (out-blr refutation): `SUBSTRING(U6 FROM 1 FOR 3)` over a VARCHAR(6)
+  UTF8 column described 3 bytes where the engine describes 12, so both
+  node-firebird generations got a spurious per-row truncation raise;
+  `U6 || 'x'` described 100 vs the engine's 28. Probed the full
+  {SUBSTRING FOR/LPAD/RPAD/LEFT/UPPER/TRIM/`||`/COALESCE} x {NONE col,
+  UTF8 col, WIN1252 col, literal} matrix under UTF8, WIN1252 AND NONE
+  attachments (SQLDA_DISPLAY): the algebra is charset-independent in
+  characters; the announced charset is the ATTACHMENT's whenever it
+  names a real one, the operand's own under a NONE attachment (NONE
+  and OCTETS operands keep theirs); of two different real charsets the
+  FIRST operand's wins; a FOR count past the source caps at the
+  source's width. text_form now runs in characters, real-charset
+  expressions ride a second negative sub_type sentinel (enc_real_cs)
+  resolved beside ATT_SUBTYPE at describe emission, and cs_join
+  carries the probed join. Six new outblr pins (32 checks).
+- **The invariant pass walks CONJUNCTS, not DNF groups** (tri-state
+  refutation, a regression): `(1=1 OR 1/0=1) AND ID>0` and
+  `ID>0 OR 1/0=1` raised at bind where the engine answers every row.
+  Probed model: every fully row-independent TOP-LEVEL conjunct
+  evaluates ONCE at open - even over an EMPTY table (`WHERE 1/0=1`
+  and `? LIKE ?bad` both raise with zero rows; `1=0 AND 1/0=1` does
+  not; `ID/0=1 AND 1=0` answers no rows - the FALSE invariant kills
+  the scan the row-dependent division never reaches) - while a
+  conjunct with any row-dependent part evaluates whole, per row, in
+  written order under the engine's short-circuit (OR stops at TRUE,
+  AND at FALSE, UNKNOWN at neither). The DNF now carries per-term
+  conjunct provenance (parse_predicate tags, kept 1:1 through
+  resolution and bind), Predicate::matches evaluates conjunct by
+  conjunct, and the bind pass raises/drops/strips by conjunct. The
+  distributed spelling `1=1 AND ID>3 OR 1/0=1 AND ID>3` still raises
+  per row exactly as the engine does - same DNF, different provenance,
+  different answer, both probed.
+- **Literal bad-escape LIKE gates on the LENIENT PREFIX** (tri-state
+  refutation): `NAME LIKE 'a!bc' ESCAPE '!'` answers [] when no row
+  starts with 'abc' (the bad escape processed as if it escaped the
+  next character; prefix stops at an unescaped wildcard or trailing
+  escape; per-byte case-sensitive starts_with - probed 'abcd' raises,
+  'abX' answers), raises 22025 on the first reached prefix-hit row.
+  The gate is the engine's DSQL-time rewrite of a LITERAL pattern
+  only: a BOUND pattern (`NAME LIKE ?`), NOT LIKE, and a non-text
+  side (`N LIKE '1!2'`) all raise ungated, and a `?`/expression text
+  side gates the same (`? LIKE 'a!bc'` bound 'zz' answers [], bound
+  'abc' raises even over zero rows - the conjunct is invariant).
+  Term::BadLike / Term::BadExprLike carry the prefix; the select-list
+  value path (IIF) keeps its ungated value-gated raise. Twelve new
+  intlike pins (40 checks), five new paramshapes pins (114).
+
+### Recorded
+- DNF flattening tags only TOP-LEVEL conjuncts, so a parenthesized
+  invariant OR nested BELOW another OR still shows DNF raise-order:
+  `((1=1 OR 1/0=1) AND ID>3) OR ID=1` raises on the first row failing
+  ID>3 where the engine short-circuits the inner OR once and answers
+  (probed both ways). Exact fidelity needs tree-shaped evaluation,
+  its own slice.
+- `LPAD(U6, ?, 'x')`-style NON-literal counts still describe the
+  32765 NONE catch-all where the engine announces 32764 in the
+  attachment charset - describe-only, no raise flip observed.
+- The engine's OCTETS-expression law is pinned only where probed
+  (UPPER/`||` over OCTETS keep OCTETS under a UTF8 attachment);
+  OCTETS joined with a real charset is unprobed and keeps cs_join's
+  first-real answer.
+
 ## 2026-08-02 — W1 reaches the subquery
 
 The subquery surface never consulted the optimizer: all three inner

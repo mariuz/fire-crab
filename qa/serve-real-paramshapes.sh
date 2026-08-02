@@ -65,6 +65,7 @@ make_db() {
     "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
 CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE T (ID INTEGER, N INTEGER, NAME VARCHAR(10), N92 NUMERIC(9,2));
+CREATE TABLE E (ID INTEGER, NAME VARCHAR(10));
 COMMIT;
 INSERT INTO T VALUES (1, 1,    'ok',   0);
 INSERT INTO T VALUES (2, 2,    'open', 0.5);
@@ -282,6 +283,34 @@ both "the row pass short-circuits on FALSE" "ID = 99 AND NAME LIKE ? ESCAPE '!'"
 both "a NULL NAME gates the check off (row 4)" "ID = 4 AND NAME LIKE ? ESCAPE '!'" '["a!bc"]'
 both "a FALSE invariant written first wins" "? IS NULL AND ? LIKE ? ESCAPE '!'" '[5,"x","a!bc"]'
 both "... even written second" "NAME LIKE ? ESCAPE '!' AND ? LIKE 'z'" '["a!bc","x"]'
+# a LITERAL bad-escape pattern gates on the LENIENT PREFIX even with a
+# `?` tested side (probed: bound 'zz' answers [] - 'zz' does not start
+# with the lenient 'abc' - where bound 'abc' raises, pinned in 8b)
+both "a literal bad escape misses the bound value: no raise" "? LIKE 'a!bc' ESCAPE '!'" '["zz"]'
+# the two OR shapes the invariant pass once broke (probed: the engine
+# short-circuits the invariant OR once at open, and the row pass stops
+# at ID>0 before ever reaching the division)
+both "a TRUE invariant OR-group never reaches the division" "(1 = 1 OR 1 / 0 = 1) AND ID > 0" '[]'
+both "a row passing ID>0 short-circuits the OR" "ID > 0 OR 1 / 0 = 1" '[]'
+
+# --- 8d. zero rows do not gate the INVARIANT conjuncts off ------------
+# probed over an EMPTY table: `? LIKE ?` with a bad bound pattern
+# raises with zero rows (the invariant conjunct evaluates ONCE at
+# open), while the row-dependent `NAME LIKE ?bad` answers [] - the
+# raise-or-answer split is invariance, not rows
+a=$(query "SELECT ID FROM E WHERE ? LIKE ? ESCAPE '!'" '["x","a!bc"]' "$PORT" "$A")
+b=$(query "SELECT ID FROM E WHERE ? LIKE ? ESCAPE '!'" '["x","a!bc"]' "$REAL" "$B")
+case "$a:$b" in
+    ERR*:ERR*) echo "OK   ? LIKE ?bad raises over ZERO rows on BOTH" ;;
+    *) echo "DIFF empty-table invariant raise: fcwire [$a] engine [$b]"; fail=1 ;;
+esac
+a=$(query "SELECT ID FROM E WHERE NAME LIKE ? ESCAPE '!'" '["a!bc"]' "$PORT" "$A")
+b=$(query "SELECT ID FROM E WHERE NAME LIKE ? ESCAPE '!'" '["a!bc"]' "$REAL" "$B")
+if [ "$a" = "$b" ] && [ "$a" = "[]" ]; then
+    echo "OK   the row-dependent bad escape answers [] over zero rows"
+else
+    echo "DIFF empty-table row-gated: fcwire [$a] engine [$b]"; fail=1
+fi
 
 # --- 9. refusals kept, engine answers recorded ------------------------
 # each of these the ENGINE answers (see the gate header); fire-crab
