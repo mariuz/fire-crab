@@ -13,6 +13,35 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-02 — The client's declaration is the contract
+
+fire-crab had been reading and discarding the client's declared output
+message BLR - answering full values where the engine, honoring the
+client's own too-narrow declaration, raises per-row truncation.
+
+### Converted
+- `isc_dpb_lc_ctype` parsed at attach (absent = NONE); the out-BLR
+  parsed at op_fetch/op_execute2 (mirroring parse_param_blr); the row
+  encode enforces the engine's probed capacity rule: transliterate
+  path exempt entirely, silent trailing-blank trim delivering
+  padded-to-cap, else the exact status vector with the UNTRIMMED
+  actual (a CHAR(5) 'ab' raises expected 1, actual 5). Rows before the
+  failing row still ship; INSERT..RETURNING raises and does not
+  persist, on both sides.
+- Expression describes gained the charset dimension the probe table
+  demanded: UPPER(V6) stays NONE while V6||'x' announces UTF8 at 4
+  bytes per char - the live describe path is answer_prepare, not the
+  test-only build_describe the spec first anchored.
+- New qa/serve-real-outblr.sh (26 checks) running the SAME statements
+  through the stock 2.11.0 driver (must get the same error at the
+  same row) and the patched 2.14.1 (must get the same rows).
+
+### Found, not fixed (recorded in the roadmap)
+- EXECUTE PROCEDURE on an ENGINE-created FB6 procedure fails "no such
+  procedure" - likely PUBLIC-schema lookup.
+- qa/auth-srp.sh harness bugs ($0-relative NF path, dead default
+  port, short security-db wait).
+
 ## 2026-08-02 — What the second refuters found
 
 An adversarial pass over the day's two implementation increments

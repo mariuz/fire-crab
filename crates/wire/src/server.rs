@@ -432,7 +432,7 @@ fn respond_prepare(s: &mut TcpStream, enc: &mut Option<Rc4>, describe: &[u8]) ->
 /// client's describe parser. Each column carries its SQL type, length,
 /// its symbolic field name (16) and its alias (19); clients key result
 /// columns by the alias, so multi-column results need it.
-fn build_describe(cols: &[ProjCol], params: &[Descriptor]) -> Vec<u8> {
+fn build_describe(cols: &[ProjCol], params: &[Descriptor], att: AttCs) -> Vec<u8> {
     let mut d = Vec::new();
     fn int_item(d: &mut Vec<u8>, code: u8, val: i32) {
         d.push(code);
@@ -449,11 +449,18 @@ fn build_describe(cols: &[ProjCol], params: &[Descriptor]) -> Vec<u8> {
     d.push(4); // isc_info_sql_select
     int_item(&mut d, 7, cols.len() as i32); // describe_vars: N columns
     for (i, c) in cols.iter().enumerate() {
+        // an attachment-charset text column resolves to the dpb's
+        // charset, width in its bytes - same law as [answer_prepare]
+        let (sub_type, length) = if c.sub_type == ATT_SUBTYPE {
+            (att.id as i32, c.length * att.bpc as i32)
+        } else {
+            (c.sub_type, c.length)
+        };
         int_item(&mut d, 9, (i + 1) as i32); // sqlda_seq
         int_item(&mut d, 11, c.sql_type); // type
-        int_item(&mut d, 12, c.sub_type); // sub_type (blob text/binary)
+        int_item(&mut d, 12, sub_type); // sub_type (blob text/binary, text ttype)
         int_item(&mut d, 13, c.scale); // scale (client divides scaled ints)
-        int_item(&mut d, 14, c.length); // length
+        int_item(&mut d, 14, length); // length
         str_item(&mut d, 16, c.fname.as_deref().unwrap_or(&c.name)); // field name
         str_item(&mut d, 19, &c.name); // alias (the client's column key)
         d.push(8); // describe_end (column)
@@ -1127,6 +1134,15 @@ impl RowSource {
         RowSource::Sort { input: Box::new(filtered), keys }
     }
 }
+
+/// The sentinel `sub_type` for a text column typed in the ATTACHMENT's
+/// charset (the engine's ttype_dynamic): a literal, a user CAST to text,
+/// or a mixed-charset combination - probed with SQLDA_DISPLAY under a
+/// UTF8 attachment, `'ab'` is TEXT length 8 CHARSET UTF8 where a NONE
+/// column stays NONE. Resolved to the live attachment charset at
+/// describe emission and in the output capacity check; a real column's
+/// ttype is never negative.
+const ATT_SUBTYPE: i32 = -1;
 
 /// One column of a projection: its name, the field id that indexes the
 /// decoded record, and how it is described/encoded on the wire. `scale`
@@ -3518,10 +3534,45 @@ fn pad_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
         return e;
     }
     match text_form(&e, descs) {
-        Some((false, w)) if w > 0 => {
-            Expr::Cast(Box::new(e), CastTarget::Text { len: w as usize, pad: true })
+        Some((false, w, _)) if w > 0 => {
+            Expr::Cast(
+                Box::new(e),
+                CastTarget::Text { len: w as usize, pad: true, synthetic: true },
+            )
         }
         _ => e,
+    }
+}
+
+/// The CHARSET of a text-valued expression, alongside [text_form]'s
+/// width and form. Probed with `SET SQLDA_DISPLAY` under a UTF8
+/// attachment: a literal is ATTACHMENT-charset (`'ab'` -> TEXT 8 UTF8),
+/// a NONE column stays NONE through UPPER/TRIM/SUBSTRING/`||` with
+/// itself (`UPPER(V6)` -> 6 NONE, `V6||V6` -> 12 NONE), and mixing a
+/// NONE operand with an attachment-charset one takes the attachment
+/// (`V6||'x'` -> 28 UTF8, `COALESCE(V6,'x')` -> 24 UTF8).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TfCs {
+    /// the described ttype - charset in the low byte
+    Ttype(i32),
+    /// the attachment charset (ttype_dynamic): announced and
+    /// capacity-checked as whatever the dpb named, see [ATT_SUBTYPE]
+    Att,
+}
+
+/// Join two operands' charsets the way the engine types a combination:
+/// same charset keeps it, CHARACTER SET NONE yields to the other side,
+/// and two different real charsets take the attachment's.
+fn cs_join(a: TfCs, b: TfCs) -> TfCs {
+    let id = |c: TfCs| match c {
+        TfCs::Att => -1,
+        TfCs::Ttype(t) => t & 0xFF,
+    };
+    match (id(a), id(b)) {
+        (x, y) if x == y => a,
+        (0, _) => b,
+        (_, 0) => a,
+        _ => TfCs::Att,
     }
 }
 
@@ -3541,23 +3592,41 @@ fn pad_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
 /// So the width is the MAXIMUM over the branches and the form is VARYING
 /// if ANY branch is varying. None means "no statically known width",
 /// which keeps the old catch-all declaration.
-fn text_form(e: &Expr, descs: &[Descriptor]) -> Option<(bool, i32)> {
-    let widen = |a: Option<(bool, i32)>, b: Option<(bool, i32)>| match (a, b) {
-        (Some((va, wa)), Some((vb, wb))) => Some((va || vb, wa.max(wb))),
+fn text_form(e: &Expr, descs: &[Descriptor]) -> Option<(bool, i32, TfCs)> {
+    let widen = |a: Option<(bool, i32, TfCs)>, b: Option<(bool, i32, TfCs)>| match (a, b) {
+        (Some((va, wa, ca)), Some((vb, wb, cb))) => {
+            Some((va || vb, wa.max(wb), cs_join(ca, cb)))
+        }
         _ => None,
     };
     match e {
-        Expr::Str(s) => Some((false, s.chars().count() as i32)),
+        Expr::Str(s) => Some((false, s.chars().count() as i32, TfCs::Att)),
         Expr::Col(fid) => {
             let d = descs.get(*fid)?;
             match d.dtype {
-                dtype::TEXT => Some((false, d.length as i32)),
+                dtype::TEXT => {
+                    Some((false, d.length as i32, TfCs::Ttype(d.sub_type as i32)))
+                }
                 // a VARYING descriptor's length carries its 2-byte count
-                dtype::VARYING => Some((true, (d.length as i32 - 2).max(0))),
+                dtype::VARYING => Some((
+                    true,
+                    (d.length as i32 - 2).max(0),
+                    TfCs::Ttype(d.sub_type as i32),
+                )),
                 _ => None,
             }
         }
-        Expr::Cast(_, CastTarget::Text { len, pad }) => Some((!*pad, *len as i32)),
+        Expr::Cast(inner, CastTarget::Text { len, pad, synthetic }) => {
+            // a USER cast is typed in the attachment charset; the
+            // synthetic pad wrap keeps its branches' charset (see
+            // [CastTarget::Text])
+            let cs = if *synthetic {
+                text_form(inner, descs).map(|(_, _, c)| c).unwrap_or(TfCs::Att)
+            } else {
+                TfCs::Att
+            };
+            Some((!*pad, *len as i32, cs))
+        }
         // a conditional is as wide as its widest branch
         Expr::Coalesce(v) => v
             .iter()
@@ -3568,9 +3637,9 @@ fn text_form(e: &Expr, descs: &[Descriptor]) -> Option<(bool, i32)> {
         // CONCATENATION is always VARYING and as wide as the SUM of its
         // operands (probed: CHAR(6) || VARCHAR(6) is VARYING(12))
         Expr::Concat(a, b) => {
-            let (_, wa) = text_form(a, descs)?;
-            let (_, wb) = text_form(b, descs)?;
-            Some((true, wa + wb))
+            let (_, wa, ca) = text_form(a, descs)?;
+            let (_, wb, cb) = text_form(b, descs)?;
+            Some((true, wa + wb, cs_join(ca, cb)))
         }
         // Text-returning FUNCTIONS, each rule probed with SQLDA_DISPLAY:
         //
@@ -3593,22 +3662,26 @@ fn text_form(e: &Expr, descs: &[Descriptor]) -> Option<(bool, i32)> {
             };
             match f {
                 SysFn::Upper | SysFn::Lower => arg(0),
-                SysFn::Trim(_) => arg(1).map(|(_, w)| (true, w)),
+                SysFn::Trim(_) => arg(1).map(|(_, w, c)| (true, w, c)),
                 SysFn::Left | SysFn::Right | SysFn::Reverse => {
-                    arg(0).map(|(_, w)| (true, w))
+                    arg(0).map(|(_, w, c)| (true, w, c))
                 }
                 SysFn::Substring => match (arg(0), lit(2)) {
-                    (Some((_, w)), None) if args.len() == 2 => Some((true, w)),
-                    (Some(_), Some(n)) => Some((true, n)),
+                    (Some((_, w, c)), None) if args.len() == 2 => Some((true, w, c)),
+                    (Some((_, _, c)), Some(n)) => Some((true, n, c)),
                     _ => None,
                 },
-                SysFn::Lpad | SysFn::Rpad => lit(1).map(|n| (true, n)),
+                SysFn::Lpad | SysFn::Rpad => lit(1).map(|n| {
+                    // the pad keeps the SOURCE's charset (a padded NONE
+                    // column stays NONE)
+                    (true, n, arg(0).map(|(_, _, c)| c).unwrap_or(TfCs::Att))
+                }),
                 _ => None,
             }
         }
         Expr::Iif(_, a, b) => widen(text_form(a, descs), text_form(b, descs)),
         Expr::Case(branches, else_) => {
-            let mut acc: Option<(bool, i32)> = None;
+            let mut acc: Option<(bool, i32, TfCs)> = None;
             for (_, t) in branches {
                 acc = match acc {
                     None => text_form(t, descs),
@@ -3666,7 +3739,7 @@ fn build_expr_col(
         ExprType::Text => match text_form(&e, descs) {
             // the VALUE is padded where the conditional is resolved (see
             // `pad_conditional`); here only the WIDTH is announced
-            Some((_, w)) => (Wire::Varying, nullable(448), w, 0),
+            Some((_, w, _)) => (Wire::Varying, nullable(448), w, 0),
             // no statically known width: the maximum is the only safe
             // declaration, which is what every text expression got before
             None => (Wire::Varying, nullable(448), 32765, 0),
@@ -3681,6 +3754,22 @@ fn build_expr_col(
         ExprType::Temporal(TKind::Date) => (Wire::Date, nullable(570), 4, 0),
         ExprType::Temporal(TKind::Time) => (Wire::Time, nullable(560), 4, 0),
         ExprType::Temporal(TKind::Timestamp) => (Wire::Timestamp, nullable(510), 8, 0),
+    };
+    // a text result carries its CHARSET too (probed with SQLDA_DISPLAY):
+    // the described ttype when the operands pin one, or the attachment
+    // sentinel - resolved to the dpb's charset at describe emission.
+    // For a text_form the width above is in the ttype's own bytes; the
+    // attachment-charset widths are characters, scaled by the
+    // attachment's bytes-per-character where the sentinel resolves.
+    let sub_type = if matches!(e.type_of(descs), Some(ExprType::Text)) {
+        match text_form(&e, descs) {
+            Some((_, _, TfCs::Ttype(t))) => t,
+            Some((_, _, TfCs::Att)) => ATT_SUBTYPE,
+            // the 32765 catch-all stays NONE: its cap never fires
+            None => 0,
+        }
+    } else {
+        0
     };
     Some(ProjCol {
         name: name.to_string(),
@@ -3697,7 +3786,7 @@ fn build_expr_col(
         sql_type,
         length,
         scale,
-        sub_type: 0,
+        sub_type,
         expr: Some(e),
     })
 }
@@ -8591,6 +8680,212 @@ fn read_param_message(
         });
     }
     Ok(out)
+}
+
+/// One field of the client's declared OUTPUT-message BLR: only the text
+/// slots matter - their declared byte length and, for `blr_text2`/
+/// `blr_varying2`, the declared charset - because the engine's per-row
+/// capacity check (cvt.cpp:507-533 `validateLength`) runs only on text
+/// destinations. Every other decodable dtype is a non-text slot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OutSlot {
+    /// `Some((declared byte length, declared charset))` for a text slot;
+    /// the charset is `None` for bare `blr_text`/`blr_varying`, which the
+    /// engine resolves to the ATTACHMENT charset (ttype_dynamic) - the
+    /// resolution that makes node-firebird trip the capacity rule where
+    /// libfbclient (which always declares text2/varying2) never does.
+    text: Option<(u16, Option<u16>)>,
+}
+
+/// The client's declared output format for one statement: the parsed
+/// out-BLR slots plus the attachment charset the bare slots resolve to.
+struct OutFmt {
+    slots: Vec<OutSlot>,
+    att: AttCs,
+}
+
+/// Parse the client's OUTPUT-message BLR (op_fetch / op_execute2) -
+/// the same `blr_version4|5, blr_begin, blr_message, <msg#>, <word
+/// count>` framing as [parse_param_blr], fields in value/null-short
+/// pairs. Unlike the input path, `None` here never drops the connection:
+/// the out-BLR does not change the request's wire length, so an
+/// undecodable one simply means "no capacity check for this statement".
+fn parse_out_blr(b: &[u8]) -> Option<Vec<OutSlot>> {
+    if b.len() < 6 || !matches!(b[0], 4 | 5) || b[1] != 2 || b[2] != 4 {
+        return None;
+    }
+    let count = u16::from_le_bytes([b[4], b[5]]) as usize;
+    if count % 2 != 0 {
+        return None;
+    }
+    let mut slots = Vec::with_capacity(count / 2);
+    let mut i = 6;
+    for field in 0..count {
+        let dt = *b.get(i)?;
+        i += 1;
+        let slot = match dt {
+            14 => {
+                // blr_text: word length
+                let len = u16::from_le_bytes([*b.get(i)?, *b.get(i + 1)?]);
+                i += 2;
+                OutSlot { text: Some((len, None)) }
+            }
+            15 => {
+                // blr_text2: charset word then length word
+                let cs = u16::from_le_bytes([*b.get(i)?, *b.get(i + 1)?]);
+                let len = u16::from_le_bytes([*b.get(i + 2)?, *b.get(i + 3)?]);
+                i += 4;
+                OutSlot { text: Some((len, Some(cs))) }
+            }
+            37 => {
+                // blr_varying: word length
+                let len = u16::from_le_bytes([*b.get(i)?, *b.get(i + 1)?]);
+                i += 2;
+                OutSlot { text: Some((len, None)) }
+            }
+            38 => {
+                // blr_varying2: charset word then length word
+                let cs = u16::from_le_bytes([*b.get(i)?, *b.get(i + 1)?]);
+                let len = u16::from_le_bytes([*b.get(i + 2)?, *b.get(i + 3)?]);
+                i += 4;
+                OutSlot { text: Some((len, Some(cs))) }
+            }
+            // scale-carrying numerics: short/long/quad/int64/int128
+            7 | 8 | 9 | 16 | 26 => {
+                i += 1;
+                OutSlot { text: None }
+            }
+            // no-operand dtypes: float/d_float/double, date/time/
+            // timestamp, bool, dec64/dec128, the tz forms
+            10 | 11 | 27 | 12 | 13 | 35 | 23 | 24 | 25 | 28 | 29 | 30 | 31 => {
+                OutSlot { text: None }
+            }
+            17 => {
+                // blr_blob2: subtype word then charset word
+                i += 4;
+                OutSlot { text: None }
+            }
+            _ => return None,
+        };
+        if field % 2 == 0 {
+            slots.push(slot);
+        } else if dt != 7 {
+            return None; // the pair's second field must be the null short
+        }
+    }
+    Some(slots)
+}
+
+/// The attachment's character set - what the dpb's `isc_dpb_lc_ctype`
+/// named at op_attach, and what a bare `blr_text`/`blr_varying` output
+/// slot resolves to (the engine's ttype_dynamic).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AttCs {
+    id: u8,
+    /// maximum bytes per character - the divisor in the engine's
+    /// capacity rule `destChars = floor(L / maxBytesPerChar)`
+    bpc: u8,
+    /// a multibyte destination is capacity-checked even when the value's
+    /// bytes fit the slot (cvt.cpp:516: the check runs `if multibyte or
+    /// value_bytes > L`)
+    multibyte: bool,
+}
+
+impl AttCs {
+    /// No `isc_dpb_lc_ctype` in the dpb = CHARACTER SET NONE.
+    const NONE: AttCs = AttCs { id: 0, bpc: 1, multibyte: false };
+
+    fn by_id(id: u8) -> AttCs {
+        let bpc = fire_crab_ods::intl::bytes_per_char(id);
+        AttCs { id, bpc, multibyte: bpc > 1 }
+    }
+
+    /// The charset a dpb names, by its catalogue name. An unknown name
+    /// maps to id 255 / single-byte: the attach is not refused (the
+    /// engine validates, this server never has), and a single-byte
+    /// destination degrades the capacity rule to byte-overflow-only -
+    /// engine-like for every single-byte set.
+    fn by_name(name: &str) -> AttCs {
+        let id: u8 = match name.to_ascii_uppercase().as_str() {
+            "NONE" => 0,
+            "OCTETS" | "BINARY" => 1,
+            "ASCII" => 2,
+            "UNICODE_FSS" => 3,
+            "UTF8" => 4,
+            "SJIS_0208" => 5,
+            "EUCJ_0208" => 6,
+            "DOS737" => 9,
+            "DOS437" => 10,
+            "DOS850" => 11,
+            "DOS865" => 12,
+            "DOS860" => 13,
+            "DOS863" => 14,
+            "DOS775" => 15,
+            "DOS858" => 16,
+            "DOS862" => 17,
+            "DOS864" => 18,
+            "NEXT" => 19,
+            "ISO8859_1" | "LATIN1" => 21,
+            "ISO8859_2" | "LATIN2" => 22,
+            "ISO8859_3" => 23,
+            "ISO8859_4" => 34,
+            "ISO8859_5" => 35,
+            "ISO8859_6" => 36,
+            "ISO8859_7" => 37,
+            "ISO8859_8" => 38,
+            "ISO8859_9" => 39,
+            "ISO8859_13" => 40,
+            "KSC_5601" => 44,
+            "DOS852" => 45,
+            "DOS857" => 46,
+            "DOS861" => 47,
+            "DOS866" => 48,
+            "DOS869" => 49,
+            "CYRL" => 50,
+            "WIN1250" => 51,
+            "WIN1251" => 52,
+            "WIN1252" => 53,
+            "WIN1253" => 54,
+            "WIN1254" => 55,
+            "BIG_5" => 56,
+            "GB_2312" => 57,
+            "WIN1255" => 58,
+            "WIN1256" => 59,
+            "WIN1257" => 60,
+            "KOI8R" => 63,
+            "KOI8U" => 64,
+            "WIN1258" => 65,
+            "TIS620" => 66,
+            "GBK" => 67,
+            "CP943C" => 68,
+            "GB18030" => 69,
+            _ => 255,
+        };
+        AttCs::by_id(id)
+    }
+}
+
+/// Read `isc_dpb_lc_ctype` (tag 48) out of an attach/create dpb: byte 0
+/// is the dpb version (1), then `(tag, len, payload)` items. Absent tag,
+/// or a dpb this parser cannot walk, = CHARACTER SET NONE - the engine's
+/// own default for an attachment that names no charset.
+fn parse_dpb_lc_ctype(dpb: &[u8]) -> AttCs {
+    if dpb.first() != Some(&1) {
+        return AttCs::NONE;
+    }
+    let mut i = 1;
+    while i + 1 < dpb.len() {
+        let (tag, len) = (dpb[i], dpb[i + 1] as usize);
+        let end = i + 2 + len;
+        if end > dpb.len() {
+            break;
+        }
+        if tag == 48 {
+            return AttCs::by_name(&String::from_utf8_lossy(&dpb[i + 2..end]));
+        }
+        i = end;
+    }
+    AttCs::NONE
 }
 
 /// Whether a column can be a parameter target: everything the wire
@@ -16641,17 +16936,17 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
 
 /// The describe buffer for a plan: one BIGINT for `Scalar`, the projected
 /// columns for `Project`, the output columns for `Group`.
-fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
+fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
     match plan {
         Plan::Scalar(..) | Plan::GenIdIncrement { .. } => describe_one_bigint(params),
         // the procedure's output parameters, described like a projection
-        Plan::ProcCall { cols, .. } | Plan::ProcInvoke { cols, .. } => build_describe(cols, params),
+        Plan::ProcCall { cols, .. } | Plan::ProcInvoke { cols, .. } => build_describe(cols, params, att),
         Plan::Union { cols, .. }
         | Plan::ProcSelect { cols, .. }
         | Plan::ProcRows { cols, .. }
         | Plan::Modified { cols, .. }
-        | Plan::Derived { cols, .. } => build_describe(cols, params),
-        Plan::Refused | Plan::RefusedEval(_) => build_describe(&[], params),
+        | Plan::Derived { cols, .. } => build_describe(cols, params, att),
+        Plan::Refused | Plan::RefusedEval(_) => build_describe(&[], params, att),
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
@@ -16681,16 +16976,16 @@ fn describe_for(plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
         Plan::UpdateOrInsert { .. } => describe_dml(2, params),
         Plan::Update { .. } => describe_dml(3, params), // isc_info_sql_stmt_update
         Plan::Delete { .. } => describe_dml(4, params), // isc_info_sql_stmt_delete
-        Plan::Project { cols, .. } => build_describe(cols, params),
-        Plan::Join { cols, .. } | Plan::JoinGroup { cols, .. } => build_describe(cols, params),
-        Plan::Group { cols, .. } => build_describe(cols, params),
-        Plan::VirtualEmpty { .. } => build_describe(&output_cols_of(plan), params),
-        Plan::Rows { cols, .. } => build_describe(cols, params),
-        Plan::Returning { cols, .. } => build_describe(cols, params),
+        Plan::Project { cols, .. } => build_describe(cols, params, att),
+        Plan::Join { cols, .. } | Plan::JoinGroup { cols, .. } => build_describe(cols, params, att),
+        Plan::Group { cols, .. } => build_describe(cols, params, att),
+        Plan::VirtualEmpty { .. } => build_describe(&output_cols_of(plan), params, att),
+        Plan::Rows { cols, .. } => build_describe(cols, params, att),
+        Plan::Returning { cols, .. } => build_describe(cols, params, att),
         Plan::SetGenerator { stmt_type, .. } => describe_dml(*stmt_type, params),
         Plan::InsertSelect { .. } => describe_dml(2, params), // isc_info_sql_stmt_insert
         // isc_info_sql_stmt_commit (?) - no columns either way
-        Plan::TxControl { .. } | Plan::Savepoint { .. } => build_describe(&[], params),
+        Plan::TxControl { .. } | Plan::Savepoint { .. } => build_describe(&[], params, att),
     }
 }
 
@@ -16860,7 +17155,7 @@ fn count_top_level_cols(proj: &str) -> usize {
 /// every var is answered with the requested items in requested order,
 /// closed by describe_end - the shape node-firebird's tag-driven
 /// parser reads equally happily.
-fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
+fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
     fn int_item(d: &mut Vec<u8>, code: u8, val: i32) {
         d.push(code);
         d.extend_from_slice(&4u16.to_le_bytes());
@@ -16889,15 +17184,26 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
     }
     let out_vars: Vec<Var> = output_cols_of(plan)
         .into_iter()
-        .map(|c| Var {
-            sql_type: c.sql_type,
-            sub_type: c.sub_type,
-            scale: c.scale,
-            length: c.length,
-            fname: c.fname.clone().unwrap_or_else(|| c.name.clone()),
-            name: c.name,
-            relation: c.relation.unwrap_or_default(),
-            rel_alias: c.rel_alias.unwrap_or_default(),
+        .map(|c| {
+            // an attachment-charset text variable announces the dpb's
+            // charset and its width in that charset's BYTES - probed:
+            // 'ab' under a UTF8 attachment is length 8 CHARSET UTF8,
+            // under NONE it is length 2 CHARSET NONE
+            let (sub_type, length) = if c.sub_type == ATT_SUBTYPE {
+                (att.id as i32, c.length * att.bpc as i32)
+            } else {
+                (c.sub_type, c.length)
+            };
+            Var {
+                sql_type: c.sql_type,
+                sub_type,
+                scale: c.scale,
+                length,
+                fname: c.fname.clone().unwrap_or_else(|| c.name.clone()),
+                name: c.name,
+                relation: c.relation.unwrap_or_default(),
+                rel_alias: c.rel_alias.unwrap_or_default(),
+            }
         })
         .collect();
     let bind_vars: Vec<Var> = params
@@ -17120,6 +17426,14 @@ const GDS_INTEGER_OVERFLOW: i32 = 335544779;
 const GDS_BAD_SUBSTRING_LENGTH: i32 = 335544853;
 const ISC_ARG_NUMBER: i32 = 4;
 
+/// isc_string_truncation - "string right truncation" - and
+/// isc_trunc_limits - "expected length @1, actual @2" (SQLSTATE 22001):
+/// the engine's fetch-time capacity vector when a text value cannot fit
+/// the client-declared output slot (cvt.cpp:527-531); both limits
+/// travel as isc_arg_number so the client's formatter fills @1/@2.
+const GDS_STRING_TRUNCATION: i32 = 335544914;
+const GDS_TRUNC_LIMITS: i32 = 335545033;
+
 /// Write, into the fetch reply stream, the op_response the engine sends
 /// when a row's evaluation raises `e` - mirroring `respond_error`'s layout
 /// but carrying the matching status vector, so the client raises the same
@@ -17186,6 +17500,18 @@ fn eval_status_vector(w: &mut W, e: &EvalErr) {
                 .int(GDS_PRIMARY_KEY_REQUIRED)
                 .int(2) // isc_arg_string
                 .bytes(table.as_bytes());
+        }
+        EvalErr::StringTruncation { expected, actual } => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_ARITH_EXCEPT)
+                .int(1) // isc_arg_gds
+                .int(GDS_STRING_TRUNCATION)
+                .int(1) // isc_arg_gds
+                .int(GDS_TRUNC_LIMITS)
+                .int(ISC_ARG_NUMBER)
+                .int(*expected as i32)
+                .int(ISC_ARG_NUMBER)
+                .int(*actual as i32);
         }
     }
     w.int(0); // isc_arg_end
@@ -17307,13 +17633,14 @@ fn emit_rows(
     db: &Option<Database>,
     args: &[WireParam],
     gen_writes: &mut Vec<(String, i64)>,
+    out: Option<&OutFmt>,
 ) {
     // a filter bind failure emits no rows, only the terminator -
     // op_execute already validated the bind and reported any error, so
     // reaching fetch with a bad bind means the client ignored it; an
     // arithmetic exception mid-cursor is reported like the engine, with
     // an error op_response in place of the terminator
-    match emit_rows_inner(w, plan, db, args, gen_writes) {
+    match emit_rows_inner(w, plan, db, args, gen_writes, out) {
         Ok(()) | Err(EmitErr::Bind) => {
             // end-of-cursor terminator
             w.int(OP_FETCH_RESPONSE).int(100).int(0);
@@ -17328,6 +17655,7 @@ fn emit_rows_inner(
     db: &Option<Database>,
     args: &[WireParam],
     gen_writes: &mut Vec<(String, i64)>,
+    out: Option<&OutFmt>,
 ) -> Result<(), EmitErr> {
     match plan {
         // DML, DDL and generator writes have no cursor: terminator only.
@@ -17400,13 +17728,13 @@ fn emit_rows_inner(
                     });
                 }
                 for r in rows.iter().skip(*skip).take(take.unwrap_or(usize::MAX)) {
-                    encode_row(w, cols, r)?;
+                    encode_row(w, cols, r, out)?;
                 }
             }
         }
         Plan::ProcRows { cols, rows } => {
             for r in rows {
-                encode_row(w, cols, r)?;
+                encode_row(w, cols, r, out)?;
             }
         }
         Plan::Union { cols, branches, distinct, order_by } => {
@@ -17442,7 +17770,7 @@ fn emit_rows_inner(
                     });
                 }
                 for r in &rows {
-                    encode_row(w, cols, r)?;
+                    encode_row(w, cols, r, out)?;
                 }
             }
         }
@@ -17450,13 +17778,13 @@ fn emit_rows_inner(
             // one row: the procedure's output parameters, already
             // computed. ProjCol.field_id is the index into `values`.
             // encode_row writes its own op_fetch_response header.
-            if encode_row(w, cols, values).is_err() {
+            if encode_row(w, cols, values, out).is_err() {
                 return Err(EmitErr::Eval(EvalErr::ConversionError(None)));
             }
         }
         Plan::Rows { cols, rows } => {
             for r in rows {
-                encode_row(w, cols, r)?;
+                encode_row(w, cols, r, out)?;
             }
         }
         // the DML has NOT run yet if a fetch arrives here: op_execute
@@ -17546,7 +17874,7 @@ fn emit_rows_inner(
                         gen_writes.push((k, v));
                     }
                     for values in rows {
-                        encode_row(w, cols, &values)?;
+                        encode_row(w, cols, &values, out)?;
                     }
                 } else if order_by.is_empty() {
                     // stream matching rows; an evaluation error on any row
@@ -17559,7 +17887,7 @@ fn emit_rows_inner(
                         }
                         match accepts(values) {
                             Ok(true) => {
-                                if let Err(e) = encode_row(w, cols, values) {
+                                if let Err(e) = encode_row(w, cols, values, out) {
                                     eval_err = Some(e);
                                 }
                             }
@@ -17584,7 +17912,7 @@ fn emit_rows_inner(
                     .rows(db)
                     .map_err(EmitErr::Eval)?;
                     for values in &rows {
-                        encode_row(w, cols, values)?;
+                        encode_row(w, cols, values, out)?;
                     }
                 }
             }
@@ -17596,7 +17924,7 @@ fn emit_rows_inner(
                 // Rows -> Filter -> Sort the grouped join builds
                 let rows = branch_rows(inner, db, args)
                     .ok_or(EmitErr::Eval(EvalErr::ConversionError(None)))?;
-                let out = RowSource::Sort {
+                let sorted = RowSource::Sort {
                     input: Box::new(RowSource::Filter {
                         input: Box::new(RowSource::Rows(rows)),
                         pred: bind_filter(filter, args)?,
@@ -17605,8 +17933,8 @@ fn emit_rows_inner(
                 }
                 .rows(db)
                 .map_err(EmitErr::Eval)?;
-                for values in &out {
-                    encode_row(w, cols, values)?;
+                for values in &sorted {
+                    encode_row(w, cols, values, out)?;
                 }
             }
         }
@@ -17627,7 +17955,7 @@ fn emit_rows_inner(
                     sort_rows(&mut rows, order_by).map_err(EmitErr::Eval)?;
                 }
                 for values in &rows {
-                    encode_row(w, cols, values)?;
+                    encode_row(w, cols, values, out)?;
                 }
             }
         }
@@ -17664,7 +17992,7 @@ fn emit_rows_inner(
                 .rows(db)
                 .map_err(EmitErr::Eval)?;
                 for values in &rows {
-                    encode_row(w, cols, values)?;
+                    encode_row(w, cols, values, out)?;
                 }
             }
         }
@@ -17702,9 +18030,87 @@ fn emit_rows_inner(
                 .rows(db)
                 .map_err(EmitErr::Eval)?;
                 for values in &rows {
-                    encode_row(w, cols, values)?;
+                    encode_row(w, cols, values, out)?;
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// The engine's per-row capacity rule for text output slots, keyed on
+/// the CLIENT-DECLARED out-BLR (`EngineCallbacks::validateLength`,
+/// cvt.cpp:507-533, reached through the byte-copy branch of
+/// `INTL_convert_string`, intl.cpp:636-641). Per text slot, with `L` the
+/// declared byte length, `dest` the declared charset (varying2/text2)
+/// else the attachment charset, `src` the column's described charset -
+/// all probed differentially against the live engine:
+///
+///   * src and dest a real pair of DIFFERENT charsets: the transliterate
+///     path - converted and delivered with NO length enforcement at all
+///     (a WIN1252 'abcdef' passes a declared-6 slot, even grown bytes).
+///   * otherwise (src NONE/OCTETS, dest NONE/OCTETS, or src == dest),
+///     and dest multibyte or the value's bytes overflow L:
+///     `destChars = floor(L / maxBytesPerChar(dest))`; a value of more
+///     characters is TRAILING-BLANK-TRIMMED, then blank-padded back to
+///     destChars and delivered SILENTLY if the trim fit (a VARCHAR of
+///     two spaces answers ONE space); else the row raises
+///     `string right truncation, expected {destChars}, actual {chars}`
+///     with `actual` the UNTRIMMED count - a CHAR counts its padding.
+///
+/// Mutates `vals` in place (the trim/pad case); NULLs and non-text
+/// slots pass untouched. A slot-count mismatch means the declared BLR
+/// does not describe this projection - no check, deliver as-is.
+fn enforce_out_capacity(
+    cols: &[ProjCol],
+    vals: &mut [Value],
+    out: &OutFmt,
+) -> Result<(), EvalErr> {
+    if out.slots.len() != cols.len() {
+        return Ok(());
+    }
+    for (i, c) in cols.iter().enumerate() {
+        let Some((l, decl_cs)) = out.slots[i].text else { continue };
+        if !matches!(c.wire, Wire::Varying) || matches!(vals[i], Value::Null) {
+            continue;
+        }
+        // varying2/text2 wins; a bare slot resolves to the attachment
+        // charset (ttype_dynamic). The declared word is a ttype: charset
+        // in the low byte.
+        let dest = match decl_cs {
+            Some(t) => AttCs::by_id((t & 0xFF) as u8),
+            None => out.att,
+        };
+        // the described source charset; ATT_SUBTYPE marks a column the
+        // describe already resolved to the attachment charset
+        let src_id = if c.sub_type == ATT_SUBTYPE {
+            out.att.id
+        } else {
+            fire_crab_ods::intl::charset_id(c.sub_type as i16)
+        };
+        if src_id != dest.id && src_id > 1 && dest.id > 1 {
+            continue; // transliterate path: no length enforcement
+        }
+        let s = vals[i].render();
+        if !(dest.multibyte || s.len() > l as usize) {
+            continue;
+        }
+        let dest_chars = l as usize / dest.bpc as usize;
+        let src_chars = s.chars().count();
+        if src_chars <= dest_chars {
+            continue;
+        }
+        let t = s.trim_end_matches(' ');
+        let tc = t.chars().count();
+        if tc <= dest_chars {
+            let mut fitted = t.to_string();
+            fitted.extend(std::iter::repeat(' ').take(dest_chars - tc));
+            vals[i] = Value::Text(fitted);
+        } else {
+            return Err(EvalErr::StringTruncation {
+                expected: dest_chars as i64,
+                actual: src_chars as i64,
+            });
         }
     }
     Ok(())
@@ -17721,13 +18127,23 @@ fn emit_rows_inner(
 /// before the header, so the caller can emit the error response cleanly in
 /// place of the row, exactly as the engine does: it ships no fetch_response
 /// for the failing row, only the error op_response).
-fn encode_row(w: &mut W, cols: &[ProjCol], values: &[Value]) -> Result<(), EvalErr> {
+fn encode_row(
+    w: &mut W,
+    cols: &[ProjCol],
+    values: &[Value],
+    out: Option<&OutFmt>,
+) -> Result<(), EvalErr> {
     // each column's value: an expression's result, or the record field.
     // Computed up front so a divide-by-zero aborts before any byte lands.
-    let vals: Vec<Value> = cols
+    let mut vals: Vec<Value> = cols
         .iter()
         .map(|c| c.value_of(values))
         .collect::<Result<_, _>>()?;
+    // the client-declared output capacity, enforced per row exactly like
+    // the expression errors above: before any byte of the row lands
+    if let Some(out) = out {
+        enforce_out_capacity(cols, &mut vals, out)?;
+    }
     w.int(OP_FETCH_RESPONSE).int(0).int(1);
     encode_row_body(w, cols, &vals);
     Ok(())
@@ -18452,7 +18868,12 @@ enum CastTarget {
     /// promotes a multiplication or division around it to INT128 (the
     /// engine's DSC_multiply_result), while SMALLINT/INTEGER stay long
     Int { wide: bool },
-    Text { len: usize, pad: bool },
+    /// `synthetic` marks the pad wrap [pad_conditional] adds around a
+    /// CHAR-formed conditional: it must keep the branches' charset,
+    /// where a USER cast to text is typed in the ATTACHMENT charset
+    /// (probed: CAST('ab' AS VARCHAR(6)) is 24 bytes UTF8 under a UTF8
+    /// attachment)
+    Text { len: usize, pad: bool, synthetic: bool },
     /// `NUMERIC(p, s)` / `DECIMAL(p, s)` - the declared SCALE is what the
     /// value is rounded to (half away from zero, probed: 12.55 to scale
     /// -1 is 12.6 and -12.55 is -12.6); `wide` marks a precision past 18,
@@ -19674,7 +20095,7 @@ fn parse_cast_target(b: &[char], pos: &mut usize) -> Option<CastTarget> {
         return None;
     }
     *pos += 1;
-    Some(CastTarget::Text { len, pad })
+    Some(CastTarget::Text { len, pad, synthetic: false })
 }
 
 /// Resolve a raw expression's column names to field ids against the
@@ -20003,7 +20424,7 @@ enum ArithOp {
 /// A per-row evaluation failure. The fetch path maps each to the engine's
 /// own status vector, so a client raises the same SQL error the real
 /// server would.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum EvalErr {
     /// integer divide by zero: `isc_arith_except` /
     /// `isc_exception_integer_divide_by_zero`
@@ -20044,6 +20465,13 @@ enum EvalErr {
     /// (SQLSTATE 22000), the schema-qualified table name as the
     /// message argument - the engine raises this at PREPARE
     PrimaryKeyRequired(String),
+    /// a text value past the client-declared output slot's character
+    /// capacity: `isc_arith_except` + `isc_string_truncation` +
+    /// `isc_trunc_limits` (SQLSTATE 22001, cvt.cpp:527-531). `expected`
+    /// is `floor(L / maxBytesPerChar)` of the declared slot; `actual` is
+    /// the value's UNTRIMMED character count - a CHAR counts its blank
+    /// padding (probed: CHAR(5) holding 'ab' raises (1, 5))
+    StringTruncation { expected: i64, actual: i64 },
 }
 
 /// What an expression's result is typed as - which drives its wire form
@@ -21532,7 +21960,7 @@ impl Expr {
                     }
                     // to a text width: render the value, refuse if it does
                     // not fit (the engine's convert error), pad for CHAR
-                    CastTarget::Text { len, pad } => {
+                    CastTarget::Text { len, pad, .. } => {
                         // A BOOLEAN casts to the WORD IN CAPITALS -
                         // `CAST(B AS VARCHAR(6))` is 'TRUE', while isql
                         // DISPLAYS the same column as `<true>`. Two
@@ -27066,7 +27494,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     }
     read_int(&mut s, &mut dec)?; // 0
     let path_bytes = read_wire_bytes(&mut s, &mut dec)?; // db path
-    read_wire_bytes(&mut s, &mut dec)?; // dpb
+    // the dpb's isc_dpb_lc_ctype is the ATTACHMENT CHARSET - what a bare
+    // blr_text/blr_varying output slot resolves to (ttype_dynamic), and
+    // the charset literals and user CASTs are described in
+    let att_cs = parse_dpb_lc_ctype(&read_wire_bytes(&mut s, &mut dec)?);
     // the name the client attached to, then the FILE it denotes: a name
     // matching a databases.conf alias resolves to that alias's path,
     // exactly as the engine resolves it (so `employee` reaches the
@@ -27331,7 +27762,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                     continue;
                 }
-                read_wire_bytes(&mut s, &mut dec)?; // out_blr
+                // out_blr: this path answers only Plan::Scalar - a single
+                // BIGINT, never a text slot - so the declared output
+                // capacity has nothing to check here
+                read_wire_bytes(&mut s, &mut dec)?;
                 read_int(&mut s, &mut dec)?; // p_sqlst_out_message_number
                 if best >= 20 {
                     read_int(&mut s, &mut dec)?; // p_sqlst_inline_blob_size
@@ -27412,7 +27846,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 {
                     // SET GENERATOR / SET STATISTICS - DDL that begins with
                     // SET, so it is not caught by the DDL/DML verb list
-                    let describe = answer_prepare(&prep_items, &p, &ps);
+                    let describe = answer_prepare(&prep_items, &p, &ps, att_cs);
                     plan = p;
                     stmt_params = ps;
                     respond_prepare(&mut s, &mut enc, &describe)?;
@@ -27454,7 +27888,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         .or_else(|| plan_alter_sequence(&stmt_sql));
                     match planned {
                         Some((p, ps)) => {
-                            let describe = answer_prepare(&prep_items, &p, &ps);
+                            let describe = answer_prepare(&prep_items, &p, &ps, att_cs);
                             plan = p;
                             stmt_params = ps;
                             respond_prepare(&mut s, &mut enc, &describe)?;
@@ -27503,7 +27937,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             respond_eval_error(&mut s, &mut enc, &e)?;
                         }
                         Some((p, ps)) => {
-                            let describe = answer_prepare(&prep_items, &p, &ps);
+                            let describe = answer_prepare(&prep_items, &p, &ps, att_cs);
                             plan = p;
                             stmt_params = ps;
                             respond_prepare(&mut s, &mut enc, &describe)?;
@@ -27543,7 +27977,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     } else {
                         plan = p;
                         stmt_params = ps;
-                        let describe = answer_prepare(&prep_items, &plan, &stmt_params);
+                        let describe = answer_prepare(&prep_items, &plan, &stmt_params, att_cs);
                         respond_prepare(&mut s, &mut enc, &describe)?;
                     }
                 }
@@ -28023,7 +28457,14 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
             x if x == OP_FETCH => {
                 let h = read_int(&mut s, &mut dec)?; // stmt
                 use_stmt!(h);
-                read_wire_bytes(&mut s, &mut dec)?; // blr
+                // the client's declared OUTPUT-message BLR travels on
+                // EVERY fetch; its text slots carry the capacity the
+                // engine enforces per row. No BLR / an undecodable one =
+                // no check (the message length does not depend on it, so
+                // the stream stays in sync either way).
+                let out_blr = read_wire_bytes(&mut s, &mut dec)?;
+                let out_fmt = parse_out_blr(&out_blr)
+                    .map(|slots| OutFmt { slots, att: att_cs });
                 read_int(&mut s, &mut dec)?; // msg number
                 let want = read_int(&mut s, &mut dec)?; // count
                 if std::env::var("FC_SRV_TRACE").is_ok() {
@@ -28183,7 +28624,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     let batch: Vec<Vec<Value>> = rows.drain(..n).collect();
                     let mut err = None;
                     for r in &batch {
-                        if let Err(e) = encode_row(&mut w, cols, r) {
+                        if let Err(e) = encode_row(&mut w, cols, r, out_fmt.as_ref()) {
                             err = Some(e);
                             break;
                         }
@@ -28212,7 +28653,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     w.send(&mut s, &mut enc)?;
                     continue;
                 }
-                emit_rows(&mut w, &plan, &database, &bound_args, &mut gen_writes);
+                emit_rows(&mut w, &plan, &database, &bound_args, &mut gen_writes, out_fmt.as_ref());
                 // a materialised cursor is CONSUMED by its fetch: the rows
                 // exist once. Re-emitting them on the next fetch is what a
                 // driver's fetch-until-empty loop turns into duplicates.
@@ -28522,7 +28963,13 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     })?;
                     read_param_message(&mut s, &mut dec, &slots)?;
                 }
-                read_wire_bytes(&mut s, &mut dec)?; // OUT blr
+                // the declared OUTPUT-message BLR: the singleton row is
+                // capacity-checked against it exactly as a fetched row
+                // is (the engine checks inline and answers a bare error
+                // op_response in place of the sql_response)
+                let out_blr = read_wire_bytes(&mut s, &mut dec)?;
+                let out_fmt = parse_out_blr(&out_blr)
+                    .map(|slots| OutFmt { slots, att: att_cs });
                 read_int(&mut s, &mut dec)?; // out message number
                 if best >= 16 {
                     read_int(&mut s, &mut dec)?; // p_sqldata_timeout
@@ -28550,8 +28997,16 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     // the OO clients drive EXECUTE PROCEDURE through
                     match try_procedure_blr(&database, &pname, &pargs) {
                         BlrProcOutcome::Rows(rows, finals) => {
-                            let values =
+                            let mut values =
                                 rows.into_iter().next().unwrap_or(finals);
+                            if let Some(out) = out_fmt.as_ref() {
+                                if let Err(e) =
+                                    enforce_out_capacity(&pcols, &mut values, out)
+                                {
+                                    respond_eval_error(&mut s, &mut enc, &e)?;
+                                    continue;
+                                }
+                            }
                             let mut w = W::default();
                             if pcols.is_empty() {
                                 w.int(OP_SQL_RESPONSE).int(0);
@@ -28576,9 +29031,17 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         BlrProcOutcome::Outside => {}
                     }
                     match run_procedure(&mut database, &pname, &pargs, &ctx) {
-                        Ok((values, _rows)) => {
+                        Ok((mut values, _rows)) => {
                             if std::env::var("FC_SRV_TRACE").is_ok() {
                                 eprintln!("[srv] op_execute2 {} -> {:?}", pname, values);
+                            }
+                            if let Some(out) = out_fmt.as_ref() {
+                                if let Err(e) =
+                                    enforce_out_capacity(&pcols, &mut values, out)
+                                {
+                                    respond_eval_error(&mut s, &mut enc, &e)?;
+                                    continue;
+                                }
                             }
                             let mut w = W::default();
                             if pcols.is_empty() {
@@ -29913,25 +30376,26 @@ mod tests {
         let descs = vec![d(dtype::TEXT, 6), d(dtype::VARYING, 8)];
         let lit = |t: &str| Expr::Str(t.to_string());
 
-        // a LITERAL is a CHAR of its own width
-        assert_eq!(text_form(&lit("abc"), &descs), Some((false, 3)));
+        // a LITERAL is a CHAR of its own width, in the ATTACHMENT charset
+        assert_eq!(text_form(&lit("abc"), &descs), Some((false, 3, TfCs::Att)));
         // a CHAR column is CHAR; a VARCHAR column is VARYING, and its
-        // width excludes the count bytes
-        assert_eq!(text_form(&Expr::Col(0), &descs), Some((false, 6)));
-        assert_eq!(text_form(&Expr::Col(1), &descs), Some((true, 6)));
+        // width excludes the count bytes; both keep their described ttype
+        assert_eq!(text_form(&Expr::Col(0), &descs), Some((false, 6, TfCs::Ttype(0))));
+        assert_eq!(text_form(&Expr::Col(1), &descs), Some((true, 6, TfCs::Ttype(0))));
 
         // a conditional is as wide as its WIDEST branch...
         let all_char = Expr::Coalesce(vec![lit("ab"), lit("abcdef")]);
-        assert_eq!(text_form(&all_char, &descs), Some((false, 6)));
-        // ... and ONE varying branch makes the whole thing varying
+        assert_eq!(text_form(&all_char, &descs), Some((false, 6, TfCs::Att)));
+        // ... and ONE varying branch makes the whole thing varying; a
+        // NONE branch yields its charset to the attachment-charset one
         let mixed = Expr::Coalesce(vec![Expr::Col(1), lit("zzzzzzzzzz")]);
-        assert_eq!(text_form(&mixed, &descs), Some((true, 10)));
+        assert_eq!(text_form(&mixed, &descs), Some((true, 10, TfCs::Att)));
 
         // a CHAR-formed conditional is PADDED, a varying one is not
         let padded = pad_conditional(all_char, &descs);
         assert!(matches!(
             padded,
-            Expr::Cast(_, CastTarget::Text { len: 6, pad: true })
+            Expr::Cast(_, CastTarget::Text { len: 6, pad: true, .. })
         ));
         assert_eq!(padded.eval(&[]).unwrap(), Value::Text("ab    ".into()));
         assert!(!matches!(pad_conditional(mixed, &descs), Expr::Cast(..)));
@@ -29940,27 +30404,27 @@ mod tests {
         let f = |sf: SysFn, a: Vec<Expr>| text_form(&Expr::Func(sf, a), &descs);
         // UPPER keeps the argument's FORM: over a CHAR column it is CHAR
         // and therefore pads; over a VARCHAR it does not
-        assert_eq!(f(SysFn::Upper, vec![Expr::Col(0)]), Some((false, 6)));
-        assert_eq!(f(SysFn::Upper, vec![Expr::Col(1)]), Some((true, 6)));
+        assert_eq!(f(SysFn::Upper, vec![Expr::Col(0)]), Some((false, 6, TfCs::Ttype(0))));
+        assert_eq!(f(SysFn::Upper, vec![Expr::Col(1)]), Some((true, 6, TfCs::Ttype(0))));
         // TRIM is always VARYING, at the argument's width
         assert_eq!(
             f(SysFn::Trim(TrimSide::Both), vec![lit(" "), Expr::Col(0)]),
-            Some((true, 6))
+            Some((true, 6, TfCs::Ttype(0)))
         );
         // LEFT takes the SOURCE's width, NOT the count - the surprise
-        assert_eq!(f(SysFn::Left, vec![Expr::Col(1), Expr::Int(3)]), Some((true, 6)));
-        assert_eq!(f(SysFn::Reverse, vec![Expr::Col(0)]), Some((true, 6)));
+        assert_eq!(f(SysFn::Left, vec![Expr::Col(1), Expr::Int(3)]), Some((true, 6, TfCs::Ttype(0))));
+        assert_eq!(f(SysFn::Reverse, vec![Expr::Col(0)]), Some((true, 6, TfCs::Ttype(0))));
         // SUBSTRING takes its literal FOR length, or the source's width
         assert_eq!(
             f(SysFn::Substring, vec![Expr::Col(0), Expr::Int(1), Expr::Int(3)]),
-            Some((true, 3))
+            Some((true, 3, TfCs::Ttype(0)))
         );
         assert_eq!(
             f(SysFn::Substring, vec![Expr::Col(0), Expr::Int(2)]),
-            Some((true, 6))
+            Some((true, 6, TfCs::Ttype(0)))
         );
         // LPAD takes its pad length
-        assert_eq!(f(SysFn::Lpad, vec![Expr::Col(1), Expr::Int(9)]), Some((true, 9)));
+        assert_eq!(f(SysFn::Lpad, vec![Expr::Col(1), Expr::Int(9)]), Some((true, 9, TfCs::Ttype(0))));
         // and REPLACE is deliberately unsized: one probe is not a law
         assert_eq!(
             f(SysFn::Replace, vec![Expr::Col(1), lit("a"), lit("bb")]),
@@ -29972,7 +30436,7 @@ mod tests {
                 &Expr::Concat(Box::new(Expr::Col(0)), Box::new(Expr::Col(1))),
                 &descs
             ),
-            Some((true, 12))
+            Some((true, 12, TfCs::Ttype(0)))
         );
     }
 
@@ -30829,7 +31293,7 @@ mod tests {
             sub_type: 0,
             expr: None,
         };
-        let d = build_describe(&[pc], &[]);
+        let d = build_describe(&[pc], &[], AttCs::NONE);
         let find = |code: u8| -> String {
             let mut i = 0;
             while i < d.len() {
@@ -30875,7 +31339,7 @@ mod tests {
             ],
             rows: Vec::new(),
         };
-        let d = answer_prepare(&[4, 9, 17, 18, 25, 33, 8], &plan, &[]);
+        let d = answer_prepare(&[4, 9, 17, 18, 25, 33, 8], &plan, &[], AttCs::NONE);
         // every answered item is code + u16 length + payload; the
         // section tag (4), each var's describe_end (8) and the final
         // isc_info_end (1) travel bare
@@ -30916,7 +31380,7 @@ mod tests {
         assert_eq!(var(2, 25), "");
         assert_eq!(var(2, 33), ""); // no relation, no schema
         // 34 names no item: the writer omits it rather than answering
-        let d = answer_prepare(&[4, 34, 8], &plan, &[]);
+        let d = answer_prepare(&[4, 34, 8], &plan, &[], AttCs::NONE);
         assert_eq!(d, vec![4, 8, 8, 8, 1]);
     }
 
@@ -31797,7 +32261,7 @@ mod tests {
         };
         let enc = |col: ProjCol, v: Value| {
             let mut w = W::default();
-            encode_row(&mut w, &[col], &[v]).unwrap();
+            encode_row(&mut w, &[col], &[v], None).unwrap();
             // skip the 12-byte op_fetch_response header + 4-byte null bitmap
             w.buf[16..].to_vec()
         };
@@ -31840,12 +32304,134 @@ mod tests {
         ];
         let values = vec![Value::Int(7), Value::Null];
         let mut w = W::default();
-        encode_row(&mut w, &cols, &values).unwrap();
+        encode_row(&mut w, &cols, &values, None).unwrap();
         // a 12-byte op_fetch_response header (op, status 0, count 1), then
         // bitmap: byte0 = 0b10 (col1 null), 3 pad bytes, then 8-byte BE 7
         assert_eq!(&w.buf[12..16], &[0b10, 0, 0, 0]);
         assert_eq!(&w.buf[16..24], &7i64.to_be_bytes());
         assert_eq!(w.buf.len(), 24); // null col contributes no data
+    }
+
+    #[test]
+    fn dpb_lc_ctype_names_the_attachment_charset() {
+        // isc_dpb_version1, then (tag 48 = isc_dpb_lc_ctype, len, name)
+        let dpb = |name: &str| {
+            let mut d = vec![1u8, 48, name.len() as u8];
+            d.extend_from_slice(name.as_bytes());
+            d
+        };
+        assert_eq!(parse_dpb_lc_ctype(&dpb("UTF8")), AttCs { id: 4, bpc: 4, multibyte: true });
+        assert_eq!(parse_dpb_lc_ctype(&dpb("NONE")), AttCs::NONE);
+        assert_eq!(parse_dpb_lc_ctype(&dpb("UNICODE_FSS")), AttCs { id: 3, bpc: 3, multibyte: true });
+        assert_eq!(parse_dpb_lc_ctype(&dpb("WIN1252")), AttCs { id: 53, bpc: 1, multibyte: false });
+        // an unknown name degrades to single-byte, never an attach refusal
+        assert_eq!(parse_dpb_lc_ctype(&dpb("X_USER_SET")), AttCs { id: 255, bpc: 1, multibyte: false });
+        // no lc_ctype item, an empty dpb, a version this parser cannot
+        // walk: all CHARACTER SET NONE
+        assert_eq!(parse_dpb_lc_ctype(&[1, 28, 1, 0]), AttCs::NONE);
+        assert_eq!(parse_dpb_lc_ctype(&[]), AttCs::NONE);
+        assert_eq!(parse_dpb_lc_ctype(&[2, 48, 4, b'U', b'T', b'F', b'8']), AttCs::NONE);
+    }
+
+    #[test]
+    fn parses_the_client_declared_out_blr() {
+        // node-firebird's CalcBlr shape: version5, begin, message 0,
+        // word count = vars*2, each var followed by its blr_short 0
+        // null slot, then blr_end + blr_eoc
+        let blr = |vars: &[&[u8]]| {
+            let mut b = vec![5u8, 2, 4, 0];
+            b.extend_from_slice(&((vars.len() * 2) as u16).to_le_bytes());
+            for v in vars {
+                b.extend_from_slice(v);
+                b.extend_from_slice(&[7, 0]); // blr_short scale 0
+            }
+            b.extend_from_slice(&[255, 76]);
+            b
+        };
+        // blr_varying(6) + blr_short: what 2.11.0 declares for VARCHAR(6)
+        let got = parse_out_blr(&blr(&[&[37, 6, 0], &[8, 0]])).unwrap();
+        assert_eq!(got[0], OutSlot { text: Some((6, None)) });
+        assert_eq!(got[1], OutSlot { text: None });
+        // blr_varying2 carries its charset word (libfbclient's form)
+        let got = parse_out_blr(&blr(&[&[38, 4, 0, 24, 0]])).unwrap();
+        assert_eq!(got[0], OutSlot { text: Some((24, Some(4))) });
+        // blr_text / blr_text2
+        let got = parse_out_blr(&blr(&[&[14, 5, 0], &[15, 0, 0, 5, 0]])).unwrap();
+        assert_eq!(got[0], OutSlot { text: Some((5, None)) });
+        assert_eq!(got[1], OutSlot { text: Some((5, Some(0))) });
+        // an empty or undecodable BLR = no check, never a dropped
+        // connection (dtype 99 does not exist)
+        assert_eq!(parse_out_blr(&[]), None);
+        assert_eq!(parse_out_blr(&blr(&[&[99]])), None);
+    }
+
+    /// The probed capacity/trim table from the live engine (UTF8
+    /// attachment, node-2.11.0 channel): every pin here was measured,
+    /// not derived - see qa/serve-real-outblr.sh for the wire twin.
+    #[test]
+    fn output_capacity_matches_the_probed_engine_rule() {
+        let col = |sub_type: i32| ProjCol {
+            name: "C".into(), fname: None, relation: None, rel_alias: None,
+            field_id: 0, wire: Wire::Varying, sql_type: 448, length: 6,
+            scale: 0, sub_type, expr: None,
+        };
+        let utf8 = AttCs { id: 4, bpc: 4, multibyte: true };
+        let run = |sub_type: i32, l: u16, att: AttCs, v: &str| {
+            let cols = [col(sub_type)];
+            let mut vals = [Value::Text(v.into())];
+            let out = OutFmt { slots: vec![OutSlot { text: Some((l, None)) }], att };
+            enforce_out_capacity(&cols, &mut vals, &out).map(|_| vals[0].render())
+        };
+        let err = |e: i64, a: i64| Err(EvalErr::StringTruncation { expected: e, actual: a });
+        // VARCHAR(6) NONE under UTF8: cap floor(6/4) = 1
+        assert_eq!(run(0, 6, utf8, "a"), Ok("a".into()));
+        assert_eq!(run(0, 6, utf8, ""), Ok("".into()));
+        assert_eq!(run(0, 6, utf8, "ab"), err(1, 2));
+        assert_eq!(run(0, 6, utf8, "abcdef"), err(1, 6));
+        // trailing blanks trim silently, then pad back to the cap:
+        // 'a     ' -> "a", two spaces -> ONE space
+        assert_eq!(run(0, 6, utf8, "a     "), Ok("a".into()));
+        assert_eq!(run(0, 6, utf8, "  "), Ok(" ".into()));
+        // CHAR(5): `actual` counts the blank padding - (1, 5)
+        assert_eq!(run(0, 5, utf8, "a    "), Ok("a".into()));
+        assert_eq!(run(0, 5, utf8, "ab   "), err(1, 5));
+        assert_eq!(run(0, 5, utf8, "     "), Ok(" ".into()));
+        // VARCHAR(3) NONE: cap 0 - any non-blank value raises (0, n)
+        assert_eq!(run(0, 3, utf8, "a"), err(0, 1));
+        assert_eq!(run(0, 3, utf8, ""), Ok("".into()));
+        // OCTETS is capacity-checked like NONE
+        assert_eq!(run(1, 6, utf8, "AB"), err(1, 2));
+        // a real charset != dest transliterates with NO enforcement
+        assert_eq!(run(53, 6, utf8, "abcdef"), Ok("abcdef".into()));
+        // same-charset UTF8 col: L is already chars x 4, never raises
+        assert_eq!(run(4, 24, utf8, "abcdef"), Ok("abcdef".into()));
+        // NONE attachment: dest single-byte, bytes fit - no check
+        assert_eq!(run(0, 6, AttCs::NONE, "a     "), Ok("a     ".into()));
+        // a NULL slot and a non-text slot pass untouched
+        let cols = [col(0)];
+        let mut vals = [Value::Null];
+        let out = OutFmt { slots: vec![OutSlot { text: Some((6, None)) }], att: utf8 };
+        assert!(enforce_out_capacity(&cols, &mut vals, &out).is_ok());
+        let out = OutFmt { slots: vec![OutSlot { text: None }], att: utf8 };
+        let mut vals = [Value::Text("abcdef".into())];
+        assert!(enforce_out_capacity(&cols, &mut vals, &out).is_ok());
+        // slot count != column count: not this projection's BLR, no check
+        let out = OutFmt { slots: vec![], att: utf8 };
+        let mut vals = [Value::Text("abcdef".into())];
+        assert!(enforce_out_capacity(&cols, &mut vals, &out).is_ok());
+    }
+
+    #[test]
+    fn string_truncation_status_vector_is_the_engines() {
+        // gds codes 335544321 / 335544914 / 335545033, then the two
+        // limits as isc_arg_number - byte-identical to the engine's
+        // vector (verified against node's firebird.msg.json rendering)
+        let mut w = W::default();
+        eval_status_vector(&mut w, &EvalErr::StringTruncation { expected: 1, actual: 5 });
+        let ints: Vec<i32> = w.buf.chunks(4)
+            .map(|c| i32::from_be_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(ints, vec![1, 335544321, 1, 335544914, 1, 335545033, 4, 1, 4, 5, 0]);
     }
 
     fn dbctx() -> DbInfoCtx {
@@ -33746,8 +34332,8 @@ mod tests {
         };
         assert!(matches!(target("INTEGER"), Some(CastTarget::Int { wide: false })));
         assert!(matches!(target("BIGINT"), Some(CastTarget::Int { wide: true })));
-        assert!(matches!(target("VARCHAR(10)"), Some(CastTarget::Text { len: 10, pad: false })));
-        assert!(matches!(target("CHAR(5)"), Some(CastTarget::Text { len: 5, pad: true })));
+        assert!(matches!(target("VARCHAR(10)"), Some(CastTarget::Text { len: 10, pad: false, .. })));
+        assert!(matches!(target("CHAR(5)"), Some(CastTarget::Text { len: 5, pad: true, .. })));
         assert!(matches!(target("DOUBLE PRECISION"), Some(CastTarget::Approx)));
         assert!(matches!(target("FLOAT"), Some(CastTarget::Approx)));
         assert!(matches!(target("DATE"), Some(CastTarget::Temporal(TKind::Date))));

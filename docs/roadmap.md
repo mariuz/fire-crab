@@ -241,7 +241,37 @@ four; R7 is the removal of what they replaced.
   `encoding:"NONE"` now (driver-proof) and answer 359/0 and 36/0
   under either driver.
 
-- **fire-crab IGNORES the client's declared output message format.**
+- ~~fire-crab IGNORES the client's declared output message format~~ —
+  *fixed*. The attach's `isc_dpb_lc_ctype` is parsed (absent = NONE),
+  the out-BLR is parsed where op_fetch/op_execute2 discarded it, and
+  the row encode enforces the engine's probed rule: transliterate-skip
+  when source and destination are distinct REAL charsets (no length
+  enforcement at all — probed); else cap = declared_len /
+  bytes_per_char(dest) when dest is multibyte or the value exceeds the
+  slot; a value over cap first TRIMS TRAILING BLANKS and delivers
+  padded-to-cap SILENTLY if it then fits; else raises the engine's
+  exact vector (arith_except << string_truncation << trunc_limits <<
+  cap << UNTRIMMED actual - a CHAR(5) 'ab' raises (1, 5)). Rows before
+  the failing row still ship; INSERT..RETURNING raises AND does not
+  persist on either side. The describe grew a charset dimension on the
+  way: expression columns announce the ATTACHMENT charset where the
+  engine does (UPPER(V6) stays NONE, `V6||'x'` goes UTF8 at 4
+  bytes/char - probed table in the gate). `qa/serve-real-outblr.sh`
+  runs the same statements through BOTH driver generations.
+
+- **`EXECUTE PROCEDURE` on an ENGINE-created FB6 procedure fails "no
+  such procedure".** Found by the out-BLR probe pass; fc-created
+  procedures work, engine-created ones do not resolve — likely the
+  PUBLIC-schema qualifier in the FB6 catalog row. Unclaimed.
+
+- **`qa/auth-srp.sh` has harness bugs**: its NF path is $0-relative
+  (node resolves it as a module unless invoked by absolute path), its
+  default port has no listener on this box, and the 30 s security-db
+  wait is occasionally short. Green (13 OK) when invoked by absolute
+  path. Unclaimed.
+
+- **(superseded by the fix above, kept for the record)** fire-crab
+  IGNORED the client's declared output message format.
   Found by the drift diagnosis: op_fetch discards the client's BLR
   (`server.rs` "read_wire_bytes // blr"), as do op_exec_immediate2 and
   op_execute2's out_blr — rows encode from fire-crab's own formats. So
