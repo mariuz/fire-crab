@@ -602,8 +602,18 @@ plus *the subsystem is now on the path*.
       retrieves through the index now. It had its own scan rather than
       going through `for_each_record`, which is why it never appeared in
       the count.
-    - `eval_subquery` / `build_correlated_lookup` — a subquery's own
-      retrieval.
+    - ~~`eval_subquery` / `build_correlated_lookup` — a subquery's own
+      retrieval~~ *(done)*: the inner residual WHERE drives
+      `choose_index` through a reconstructed de-aliased statement
+      (fcopt refuses aliased FROM — converting that would delete the
+      reconstruction); the fold model stays, because the engine itself
+      hash-joins over an inner NATURAL scan for the plain correlated
+      semi-join (probed plans in the gate). Still open in this family:
+      the OUTER query of a folded subquery scans (`plan_query_inner`
+      hands the ORIGINAL text to `choose_index` and fcopt refuses
+      anything containing `(SELECT`; `plan_correlated_select`
+      hard-codes `index: None` on its outer Project) — hand the FOLDED
+      token text to that call.
     - the JOIN's inner side.
   - **A predicted bug that measurement did not confirm, recorded as
     such.** `ods::ddl::index_itype` maps every TEXT/VARYING column to

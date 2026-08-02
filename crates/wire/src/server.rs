@@ -16884,6 +16884,7 @@ fn order_cmp(a: &[Value], b: &[Value], keys: &[OrderKey]) -> std::cmp::Ordering 
 /// even when empty - SQL's global aggregate shape (COUNT = 0, MIN/MAX/SUM
 /// = NULL over no rows) - though a HAVING can still reject it.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn group_output(
     db: &Database,
     rel: u16,
@@ -16894,16 +16895,15 @@ fn group_output(
     synth_base: usize,
     filter: &Option<Predicate>,
     having: &Option<Predicate>,
+    index: &Option<IndexAccess>,
 ) -> Result<Vec<Vec<Value>>, EvalErr> {
-    // scan -> filter -> aggregate, as a ROW SOURCE TREE. This function
-    // used to spell those three out; it now names them.
+    // retrieve -> filter -> aggregate, as a ROW SOURCE TREE. The leaf is
+    // the optimizer's choice - the same rule every other tree follows -
+    // and the Filter above it still applies the whole predicate, so the
+    // index narrows what is read, never what is answered.
     RowSource::Aggregate {
         input: Box::new(RowSource::Filter {
-            input: Box::new(RowSource::TableScan {
-                rel,
-                formats: formats.to_vec(),
-                width: None,
-            }),
+            input: Box::new(leaf_source(rel, formats.to_vec(), index)),
             pred: filter.clone(),
         }),
         gitems: gitems.to_vec(),
@@ -22778,6 +22778,63 @@ fn value_literal(v: &Value) -> Option<String> {
     })
 }
 
+/// Render a residual WHERE token stream back to SQL text - the form
+/// `fire_crab_opt::plan_query` accepts. The text feeds ONLY the
+/// gatekeeper: the bands are built from the already-resolved
+/// [Predicate], so an unrenderable token costs the index (None -> a
+/// scan), never a row.
+fn render_toks(toks: &[Tok]) -> Option<String> {
+    let mut parts: Vec<String> = Vec::with_capacity(toks.len());
+    for t in toks {
+        parts.push(match t {
+            Tok::Ident(s) => s.clone(),
+            Tok::Int(i) => i.to_string(),
+            // a Dec's scale is always negative (the tokenizer keeps
+            // `12.50` as (1250, -2)), which is the half value_literal
+            // spells; a non-negative scale answers None there and the
+            // None propagates
+            Tok::Dec(raw, scale) => value_literal(&Value::Scaled(*raw, *scale))?,
+            Tok::Str(s) => format!("'{}'", s.replace('\'', "''")),
+            Tok::Cmp(c) => match c {
+                Cmp::Eq => "=",
+                Cmp::Ne => "<>",
+                Cmp::Lt => "<",
+                Cmp::Le => "<=",
+                Cmp::Gt => ">",
+                Cmp::Ge => ">=",
+            }
+            .to_string(),
+            Tok::And => "AND".to_string(),
+            Tok::Or => "OR".to_string(),
+            Tok::Is => "IS".to_string(),
+            Tok::Not => "NOT".to_string(),
+            Tok::Null => "NULL".to_string(),
+            Tok::Like => "LIKE".to_string(),
+            Tok::Between => "BETWEEN".to_string(),
+            Tok::In => "IN".to_string(),
+            Tok::Escape => "ESCAPE".to_string(),
+            Tok::LParen => "(".to_string(),
+            Tok::RParen => ")".to_string(),
+            Tok::Comma => ",".to_string(),
+            Tok::Plus => "+".to_string(),
+            Tok::Minus => "-".to_string(),
+            Tok::Star => "*".to_string(),
+            Tok::Slash => "/".to_string(),
+            // no faithful spelling: a `?` has no value yet, a lifted
+            // subquery's text is gone, a decided leaf and a function
+            // call have no token-level source, an aggregate is not
+            // legal in a WHERE anyway
+            Tok::Param
+            | Tok::Subq(_)
+            | Tok::Exists
+            | Tok::Const(_)
+            | Tok::FnExpr(_)
+            | Tok::Agg(..) => return None,
+        });
+    }
+    Some(parts.join(" "))
+}
+
 /// Plan a SELECT whose select list holds ONE CORRELATED subquery.
 ///
 /// The outer query is planned as an ordinary projection; the correlated
@@ -23084,6 +23141,7 @@ fn build_correlated_lookup(
     });
 
     // the residual WHERE filters the inner table on its own
+    let residual_for_opt = residual.clone();
     let mut np = 0usize;
     let filter = match residual {
         None => None,
@@ -23091,6 +23149,36 @@ fn build_correlated_lookup(
     };
     if np != 0 {
         return None; // a `?` inside a correlated subquery
+    }
+
+    // The access path for the ONE inner scan, keyed off the RESIDUAL
+    // WHERE only. The fold below gathers EVERY correlation key - the
+    // engine's own semi-join strategy is one NATURAL scan of the inner
+    // table, so the correlation column cannot narrow this walk; only
+    // the residual can, and with no residual the statement handed to
+    // the gatekeeper has no WHERE and fcopt answers NATURAL.
+    let opt_sql = match &residual_for_opt {
+        None => Some(format!(
+            "SELECT {} FROM {}",
+            strip_inner_all(proj_s, &inner_names),
+            table
+        )),
+        Some(toks) => render_toks(toks).map(|w| {
+            format!(
+                "SELECT {} FROM {} WHERE {}",
+                strip_inner_all(proj_s, &inner_names),
+                table,
+                w
+            )
+        }),
+    };
+    let index =
+        opt_sql.and_then(|s| choose_index(db, rel, table, &descs, &filter, &s, &[]));
+    if trace_on() {
+        match &index {
+            Some(p) => eprintln!("[srv] subq index: rel={} {}", rel, p.describe()),
+            None => eprintln!("[srv] subq natural: rel={}", rel),
+        }
     }
 
     // what the inner query projects: an aggregate, or one bare column
@@ -23102,7 +23190,7 @@ fn build_correlated_lookup(
     // gather the inner rows per correlation key
     let mut buckets: Vec<(Value, Vec<Vec<Value>>)> = Vec::new();
     let mut bad = false;
-    for_each_record(db, rel, &formats, |vals| {
+    for_each_candidate(db, rel, &formats, &index, |vals| {
         if bad {
             return;
         }
@@ -23513,6 +23601,28 @@ fn eval_subquery(
         }
     };
 
+    // The inner retrieval's access path, chosen the way every other
+    // single-relation retrieval chooses one. The statement handed to the
+    // gatekeeper is RECONSTRUCTED - bare table name, qualifiers already
+    // stripped, correlation leaf already removed - because fcopt refuses
+    // an aliased FROM, and the de-correlated residual is what the
+    // engine's inner stream retrieves by. The text feeds only the plan
+    // choice; the bands come from the resolved filter, so a rendering
+    // infidelity costs an index, not a row.
+    let opt_sql = match &where_toks {
+        None => Some(format!("SELECT {} FROM {}", proj_s, table)),
+        Some(toks) => render_toks(toks)
+            .map(|w| format!("SELECT {} FROM {} WHERE {}", proj_s, table, w)),
+    };
+    let index =
+        opt_sql.and_then(|s| choose_index(db, rel, table, &descs, &filter, &s, &[]));
+    if trace_on() {
+        match &index {
+            Some(p) => eprintln!("[srv] subq index: rel={} {}", rel, p.describe()),
+            None => eprintln!("[srv] subq natural: rel={}", rel),
+        }
+    }
+
     // An aggregate subquery answers one value. It goes through the GROUP
     // machinery with no keys - the whole table as one group - rather than
     // the scalar integer helper, because that helper folds i64 only: it
@@ -23565,7 +23675,8 @@ fn eval_subquery(
             return None; // only COUNT(DISTINCT) is answered
         }
         let gitems = vec![GItem::Agg(func, src, distinct)];
-        let rows = group_output(db, rel, &formats, &gitems, &[], &[], 1, &filter, &None).ok()?;
+        let rows =
+            group_output(db, rel, &formats, &gitems, &[], &[], 1, &filter, &None, &index).ok()?;
         // no rows at all still yields ONE row (the global aggregate's
         // shape: COUNT 0, everything else NULL)
         let v = rows.first().and_then(|r| r.first()).cloned().unwrap_or(Value::Null);
@@ -23578,7 +23689,7 @@ fn eval_subquery(
     if existence_only && want_fid.is_none() {
         let mut any = false;
         let mut ferr = false;
-        for_each_record(db, rel, &formats, |v| {
+        for_each_candidate(db, rel, &formats, &index, |v| {
             if !any
                 && !ferr
                 && match filter.as_ref().map_or(Ok(true), |p| p.matches(v)) {
@@ -23601,7 +23712,7 @@ fn eval_subquery(
     let mut values = Vec::new();
     let mut any = false;
     let mut ferr = false;
-    for_each_record(db, rel, &formats, |v| {
+    for_each_candidate(db, rel, &formats, &index, |v| {
         if ferr {
             return;
         }
@@ -32213,6 +32324,58 @@ mod tests {
         // an aggregate name NOT followed by parens is a plain identifier
         let toks = tokenize("COUNT = 1").unwrap();
         assert!(matches!(&parse_predicate(&toks, &mut 0).unwrap()[0][0].lhs, RawLhs::Col(c) if c == "COUNT"));
+    }
+
+    #[test]
+    fn render_toks_round_trips_renderable_streams() {
+        // tokenize -> render must be a FIXED POINT under re-tokenizing:
+        // the rendered text is the statement the optimizer gatekeeper
+        // is asked about, so it must mean what the tokens meant
+        let rt = |s: &str| -> String {
+            let out = render_toks(&tokenize(s).unwrap()).unwrap();
+            let again = render_toks(&tokenize(&out).unwrap()).unwrap();
+            assert_eq!(out, again, "rendering is not a fixed point for {s:?}");
+            out
+        };
+        assert_eq!(rt("K = 5"), "K = 5");
+        assert_eq!(
+            rt("K>=1 AND V<>-3 OR S IS NOT NULL"),
+            "K >= 1 AND V <> -3 OR S IS NOT NULL"
+        );
+        assert_eq!(rt("K BETWEEN 3 AND 5"), "K BETWEEN 3 AND 5");
+        assert_eq!(rt("K NOT IN (1,2)"), "K NOT IN ( 1 , 2 )");
+        // a Dec keeps its written scale, trailing zero included
+        assert_eq!(rt("P = 12.50"), "P = 12.50");
+        assert_eq!(rt("P < -0.25"), "P < -0.25");
+        // a quote inside a string is doubled back out
+        assert_eq!(rt("S = 'a''b'"), "S = 'a''b'");
+        assert_eq!(rt("S LIKE 'a%' ESCAPE '!'"), "S LIKE 'a%' ESCAPE '!'");
+        assert_eq!(rt("A + 1 > B * 2 - C / 3"), "A + 1 > B * 2 - C / 3");
+        assert_eq!(rt("( K = 1 OR K = 2 )"), "( K = 1 OR K = 2 )");
+    }
+
+    #[test]
+    fn render_toks_refuses_unrenderable_kinds() {
+        // None, never a guess: an unrenderable WHERE costs the index
+        // (the caller scans), so every refusal here is a safe answer
+        assert!(render_toks(&tokenize("K = ?").unwrap()).is_none()); // Param
+        assert!(render_toks(&tokenize("UPPER(S) = 'X'").unwrap()).is_none()); // FnExpr
+        assert!(render_toks(&tokenize("V > 1e3").unwrap()).is_none()); // Double -> FnExpr
+        assert!(render_toks(&tokenize("COUNT(*) > 1").unwrap()).is_none()); // Agg
+        assert!(render_toks(&[Tok::Subq(0)]).is_none());
+        assert!(render_toks(&[Tok::Exists, Tok::Subq(0)]).is_none());
+        assert!(render_toks(&[Tok::Const(true)]).is_none());
+        // a non-negative Dec scale has no literal spelling; the
+        // tokenizer never builds one, and rendering one must refuse
+        // rather than misprint it
+        assert!(render_toks(&[
+            Tok::Ident("P".to_string()),
+            Tok::Cmp(Cmp::Eq),
+            Tok::Dec(5, 0)
+        ])
+        .is_none());
+        // ... and the refusal poisons the WHOLE stream, not one leaf
+        assert!(render_toks(&tokenize("K = 5 AND V = ?").unwrap()).is_none());
     }
 
     #[test]

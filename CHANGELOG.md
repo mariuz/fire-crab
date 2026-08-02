@@ -13,6 +13,44 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-02 — W1 reaches the subquery
+
+The subquery surface never consulted the optimizer: all three inner
+evaluators walked their tables with full scans. The engine, probed,
+drives the inner table's index whenever the subquery's OWN WHERE names
+an indexed column - and does NOT for the plain correlated semi-join
+(it hash-joins over an inner NATURAL scan, exactly fire-crab's fold
+model), so the fold stays; the slice is the inner residual WHERE only.
+
+### Converted
+- render_toks renders the de-aliased, de-correlated residual WHERE
+  back to SQL for fcopt's gatekeeper (unrenderable tokens = scan,
+  never a guess - fcopt refuses aliased FROM, which is why the text
+  is reconstructed); eval_subquery's two walks and
+  build_correlated_lookup's one became for_each_candidate with the
+  chosen index; group_output takes the index through leaf_source.
+  The candidates-not-answers law is inherited from records_for - the
+  closures' predicates are byte-identical, and the recno dedup is
+  what keeps a scalar subquery ALIVE after a key UPDATE (a stale
+  double-return would refuse as multi-row where the engine answers).
+- New qa/serve-real-subqindex.sh (54 checks): band-edge behavior vs
+  the engine, coverage via the new "[srv] subq index:" trace
+  (deliberately NOT containing the "index scan:" substring the index
+  gate's zero-assertion greps), natural-shape non-coverage, DML
+  stale-entry probes, FC_NO_INDEX twin three-way equality.
+
+### Fixed
+- qa/opt-plans.sh was red at clean HEAD: fcopt no longer refuses two
+  populated-join statements and matches the engine's plans - the
+  stale prefuse expectations became pcheck equalities.
+
+### Recorded
+- The OUTER query of a folded subquery still scans (plan_query_inner
+  hands the ORIGINAL text to choose_index; fcopt refuses subqueries) -
+  the adjacent follow-up, answers already engine-identical.
+- fcopt's aliased-FROM refusal: converting it would delete the
+  reconstruction.
+
 ## 2026-08-02 — Three truth values, in written order
 
 The engine evaluates INVARIANT conjuncts - parameters-only,

@@ -252,33 +252,18 @@ SQL
         fail=1
     fi
 }
-prefuse() { # <sql> - a populated JOIN: fcopt refuses, and we RECORD
-           # the engine's own plan so the frontier is documented
-    eng=$("$ISQL" -q -user "$U" -pas "$P" "$DBP" 2>&1 <<SQL | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | head -1
-SET PLANONLY ON;
-$1;
-SQL
-)
-    got=$("$FCOPT" plan "$DBP" "$1" 2>&1)
-    case "$got" in
-        REFUSED*)
-            echo "OK   (populated) refused, engine says: $eng" ;;
-        *)
-            echo "DIFF (populated) [$1] expected REFUSED, got: $got"; fail=1 ;;
-    esac
-}
-
 pcheck "SELECT K FROM BIG WHERE FLAT = 1"
 pcheck "SELECT K FROM BIG WHERE UNIQ = 7"
 pcheck "SELECT K FROM BIG WHERE K = 1"
 pcheck "SELECT K FROM BIG ORDER BY UNIQ"
 pcheck "SELECT K FROM BIG WHERE FLAT = 1 AND UNIQ = 7"
 pcheck "SELECT COUNT(*) FROM BIG"
-# the cost cases: the engine drives the SMALL side, and hashes when
-# both sides grow - fcopt refuses both rather than guess
-# the cost cases in the BAND the crate does not model
-prefuse "SELECT A.K FROM BIG A JOIN SMALL B ON A.UNIQ = B.S"
-prefuse "SELECT B.S FROM SMALL B JOIN BIG A ON A.UNIQ = B.S"
+# the cost cases: the engine drives the SMALL side regardless of SQL
+# order. These sat behind prefuse while the crate refused populated
+# joins; it plans them now, so the check is the stronger one - the plan
+# must BE the engine's, either way round
+pcheck "SELECT A.K FROM BIG A JOIN SMALL B ON A.UNIQ = B.S"
+pcheck "SELECT B.S FROM SMALL B JOIN BIG A ON A.UNIQ = B.S"
 
 # ======================================================================
 # PHASE 3: the CARDINALITY GRID - 36 cells, and never a wrong plan
