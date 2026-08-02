@@ -1975,6 +1975,12 @@ enum Rhs {
     /// an exact-numeric literal as (raw, scale) - what a decimal
     /// literal or an integer against a scaled/INT128 column becomes
     Num(i64, i8),
+    /// an APPROXIMATE value - built ONLY at bind, for a blr_double
+    /// parameter against a TEXT column ([Term::TextNumCmp]'s double
+    /// domain; probed: `S = ?` bound 4.5 answers the '4.5' row). The
+    /// parser never produces it, so every other consumer treats it as
+    /// unreachable-defensive.
+    Dbl(f64),
     Str(String),
     Null,
     Param(usize, ColKind),
@@ -2017,6 +2023,25 @@ enum Term {
     /// residual: an INDEXED empty table, where the engine raises at
     /// open and fc answers [].
     CmpConvErr(usize, String),
+    /// A TEXT COLUMN against a NUMERIC side: the engine coerces the
+    /// COLUMN's text to a number PER ROW, VALUE-GATED (cvt2.cpp
+    /// `cmp_numeric_string` -> cvt.cpp `CVT_get_numeric`), with the
+    /// LENIENT compare grammar ([text_col_num]) - probed: `S = 5`
+    /// matches '5', ' 5', '5.0', '05', '+5', '5e0', '0.5e1' and
+    /// '  5  ' alike, `S = 10` matches '1 0', and a non-convertible
+    /// row raises 22018 MID-SCAN carrying the raw (CHAR-padded)
+    /// value. NULL is UNKNOWN with no raise; the comparison is EXACT
+    /// (the two bigints ...806/...807 pick different rows, a 39-digit
+    /// spelling stays exact) except where an e/E delegates the whole
+    /// string to the double grammar. Row-DEPENDENT under
+    /// [term_row_independent]'s default, exactly like
+    /// [Term::CmpConvErr] - that hands every probed timing law (dead
+    /// conjunct, indexed protection, written-order short-circuit, OR
+    /// left-to-right, FIRST 1, empty table, DML atomicity) to the
+    /// existing conjunct machinery. Never keyed by [pick_for_terms],
+    /// so it scans NATURAL - the engine's own plan (PLANONLY probed:
+    /// a text index is never banded by a numeric compare).
+    TextNumCmp(usize, Cmp, Rhs),
     IsNull(usize),
     IsNotNull(usize),
     /// `<col> [NOT] LIKE <pattern> [ESCAPE <c>]`: pattern is a string
@@ -2374,6 +2399,8 @@ impl Predicate {
                     None => None,
                     Some(Rhs::Int(n)) => Some(Expr::Int(n)),
                     Some(Rhs::Num(r, sc)) => Some(Expr::Dec(r, sc)),
+                    // unreachable-defensive: bind_rhs never builds Dbl
+                    Some(Rhs::Dbl(d)) => Some(Expr::Double(d)),
                     Some(Rhs::Str(t)) => Some(Expr::Str(t)),
                     Some(Rhs::Null | Rhs::Param(..)) => Some(Expr::Null),
                 },
@@ -2384,6 +2411,38 @@ impl Predicate {
             let mut terms = Vec::new();
             for t in g {
                 terms.push(match t {
+                    // A NUMERIC wire value against a TEXT column: the
+                    // engine coerces the COLUMN per row
+                    // ([Term::TextNumCmp]; probed: `S = ?` bound 5
+                    // answers the '5'/' 5'/'5.0'/'05' class, bound 4.5
+                    // the '4.5' row, and raises 22018 mid-scan on a
+                    // non-convertible row). A text bind stays the
+                    // plain text compare (control probed: ['5'] takes
+                    // only the '5' row). blr_bool and temporal binds
+                    // KEEP the refusal below - genuine blr_bool
+                    // against a text column is unprobed on any
+                    // available channel; the probed JS booleans arrive
+                    // as blr_long 1/0 on this wire and land in the Int
+                    // arm, raising 22018 from the first non-NULL row
+                    // exactly as the engine does (both binds probed
+                    // raising from the same first value).
+                    Term::Cmp(fid, op, Rhs::Param(idx, kind @ ColKind::Text)) => {
+                        match args.get(*idx).ok_or("missing parameter value")? {
+                            WireParam::Int(v, 0) => {
+                                Term::TextNumCmp(*fid, *op, Rhs::Int(*v))
+                            }
+                            WireParam::Int(v, ws) => {
+                                Term::TextNumCmp(*fid, *op, Rhs::Num(*v, *ws))
+                            }
+                            WireParam::Double(d) => {
+                                Term::TextNumCmp(*fid, *op, Rhs::Dbl(*d))
+                            }
+                            _ => match bind_rhs(idx, kind)? {
+                                None => Term::Unknown,
+                                Some(rhs) => Term::Cmp(*fid, *op, rhs),
+                            },
+                        }
+                    }
                     Term::Cmp(fid, op, Rhs::Param(idx, kind)) => match bind_rhs(idx, kind)? {
                         None => Term::Unknown,
                         // A text parameter can bind a FRACTION into an
@@ -2557,16 +2616,39 @@ impl Predicate {
                     }
                     // an expression side against a parameter: the value
                     // becomes a literal expression and the term an
-                    // ordinary three-valued comparison
+                    // ordinary three-valued comparison. A NUMERIC
+                    // value against a TEXT-TYPED side wraps the side
+                    // in the per-row coercion ([Expr::TextNum]) -
+                    // mechanism-consistent with [cmp_sides]' wrap for
+                    // the literal spelling of the same comparison
+                    // (the gate pins the plain-column rows).
                     Term::ExprParam(lhs, op, idx, kind) => {
-                        match bind_literal(idx, kind)? {
-                            None => Term::Unknown, // compared with NULL: UNKNOWN
-                            Some(lit) => {
-                                Term::ExprCond(Box::new(Cond2::Cmp(
-                                    lhs.clone(),
-                                    *op,
-                                    Box::new(lit),
-                                )))
+                        let num_lit = if matches!(kind, ColKind::Text) {
+                            match args.get(*idx).ok_or("missing parameter value")? {
+                                WireParam::Int(v, 0) => Some(Expr::Int(*v)),
+                                WireParam::Int(v, ws) => Some(Expr::Dec(*v, *ws)),
+                                WireParam::Double(d) => Some(Expr::Double(*d)),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(lit) = num_lit {
+                            Term::ExprCond(Box::new(Cond2::Cmp(
+                                Box::new(Expr::TextNum(lhs.clone())),
+                                *op,
+                                Box::new(lit),
+                            )))
+                        } else {
+                            match bind_literal(idx, kind)? {
+                                None => Term::Unknown, // compared with NULL: UNKNOWN
+                                Some(lit) => {
+                                    Term::ExprCond(Box::new(Cond2::Cmp(
+                                        lhs.clone(),
+                                        *op,
+                                        Box::new(lit),
+                                    )))
+                                }
                             }
                         }
                     }
@@ -2668,6 +2750,10 @@ fn term_row_independent(t: &Term) -> bool {
 fn expr_has_col(e: &Expr) -> bool {
     match e {
         Expr::Col(_) | Expr::GenVal(_) => true,
+        // the per-row coercion wrappers read whatever they wrap - a
+        // wrapped COLUMN must keep its term row-DEPENDENT, or the
+        // invariant pass would raise a value-gated 22018 over no row
+        Expr::TextNum(a) | Expr::TextBool(a) => expr_has_col(a),
         Expr::Neg(a) | Expr::Cast(a, _) => expr_has_col(a),
         Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
             expr_has_col(a) || expr_has_col(b)
@@ -2768,6 +2854,7 @@ impl Term {
             // before evaluating; this is the defensive answer)
             Term::Cmp(_, _, Rhs::Param(..)) => None,
             Term::Cmp(_, _, Rhs::Num(..)) => None, // Num travels in NumCmp
+            Term::Cmp(_, _, Rhs::Dbl(_)) => None, // Dbl in TextNumCmp only
             // the value gate: NULL (or a missing slot) is UNKNOWN with
             // no raise; ANY value raises the engine's conversion error,
             // its argument the original literal (probed: `ID=5 AND
@@ -2776,6 +2863,18 @@ impl Term {
             Term::CmpConvErr(fid, s) => match values.get(*fid) {
                 None | Some(Value::Null) => None,
                 Some(_) => return Err(EvalErr::ConversionError(Some(s.clone()))),
+            },
+            // the per-row COLUMN coercion (see the variant): NULL (or a
+            // missing slot) is UNKNOWN with no raise; a text value
+            // converts with the lenient compare grammar and compares
+            // exactly, raising 22018 mid-scan when it cannot (probed:
+            // `ID < 3 AND S = 5` answers [1] over a NULL row with an
+            // 'abc' row excluded by the index; unprotected, it raises)
+            Term::TextNumCmp(fid, op, rhs) => match values.get(*fid) {
+                None | Some(Value::Null) => None,
+                Some(Value::Text(s)) => text_num_matches(s, *op, rhs)?,
+                // a non-text value in a text slot: defensive UNKNOWN
+                Some(_) => None,
             },
             // exact numeric compare, any exact shape on either side;
             // NULL or a non-numeric value is UNKNOWN
@@ -19038,6 +19137,102 @@ fn emit_rows_inner(
         Plan::ProcSelect { .. } => return Err(EmitErr::Eval(EvalErr::ConversionError(None))),
         Plan::Modified { inner, cols, distinct, skip, take } => {
             if let Some(db) = db {
+                // FIRST/SKIP over an UNSORTED, non-DISTINCT scan STOPS
+                // THE CURSOR: the engine closes it after `skip + take`
+                // accepted rows, so a LATER bad row never evaluates
+                // (probed: `SELECT FIRST 1 ID FROM T WHERE S = 5`
+                // answers [1] though an 'abc' row follows it). The
+                // materialising path below reads every row first, which
+                // turned that answer into a raise - and threw the 22018
+                // argument away through branch_rows' Option on the way.
+                if let Plan::Project {
+                    rel, formats, filter, order_by, gen_cols, index, defer, ..
+                } = &**inner
+                {
+                    // a generator-advancing Project keeps the
+                    // branch_rows refusal below - see that function
+                    if gen_cols.is_empty() {
+                        if !*distinct
+                            && order_by.is_empty()
+                            && take.is_some()
+                        {
+                            let filter = bind_filter(filter, args)?;
+                            let descs_now: Vec<Descriptor> = formats
+                                .iter()
+                                .max_by_key(|(n, _)| *n)
+                                .map(|(_, d)| d.clone())
+                                .unwrap_or_default();
+                            let index = &resolve_access(
+                                index, defer, db, *rel, &descs_now, &filter, order_by,
+                            );
+                            let stop_at = skip.saturating_add(take.unwrap_or(0));
+                            let mut accepted = 0usize;
+                            let mut eval_err: Option<EvalErr> = None;
+                            for_each_candidate(db, *rel, formats, index, |values| {
+                                if eval_err.is_some() || accepted >= stop_at {
+                                    return; // the cursor is closed: no more
+                                            // evaluation, no more raising
+                                }
+                                let keep = match &filter {
+                                    None => Ok(true),
+                                    Some(p) => p.matches(values),
+                                };
+                                match keep {
+                                    Ok(true) => {
+                                        accepted += 1;
+                                        if accepted > *skip {
+                                            if let Err(e) = encode_row(w, cols, values, out) {
+                                                eval_err = Some(e);
+                                            }
+                                        }
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => eval_err = Some(e),
+                                }
+                            });
+                            if let Some(e) = eval_err {
+                                return Err(EmitErr::Eval(e));
+                            }
+                            return Ok(());
+                        }
+                        // DISTINCT or a sort must read the whole cursor
+                        // (the engine sorts before it slices, so a bad row
+                        // raises even under FIRST) - materialise through
+                        // the error-PRESERVING row-source path, so the
+                        // 22018 keeps its argument
+                        let filter = bind_filter(filter, args)?;
+                        let mut rows_v: Vec<Vec<Value>> = Vec::new();
+                        let src = RowSource::scan_filter_sort(
+                            *rel,
+                            formats.clone(),
+                            filter,
+                            order_by.clone(),
+                            index.clone(),
+                        );
+                        for values in src.rows(db).map_err(EmitErr::Eval)? {
+                            let mut row = Vec::with_capacity(cols.len());
+                            for c in cols {
+                                row.push(c.value_of(&values).map_err(EmitErr::Eval)?);
+                            }
+                            rows_v.push(row);
+                        }
+                        if *distinct {
+                            let mut seen: Vec<Vec<Value>> = Vec::new();
+                            rows_v.retain(|r| {
+                                if seen.iter().any(|s| rows_equal(s, r)) {
+                                    false
+                                } else {
+                                    seen.push(r.clone());
+                                    true
+                                }
+                            });
+                        }
+                        for r in rows_v.iter().skip(*skip).take(take.unwrap_or(usize::MAX)) {
+                            encode_row(w, cols, r, out)?;
+                        }
+                        return Ok(());
+                    }
+                }
                 let mut rows = branch_rows(inner, db, args)
                     .ok_or(EmitErr::Eval(EvalErr::ConversionError(None)))?;
                 // DISTINCT compares whole projected rows with NULL equal
@@ -20120,6 +20315,16 @@ enum RawExpr {
     /// means (probed: `B IS UNKNOWN` and `B IS NULL` select the same
     /// rows)
     Bool(bool),
+    /// The parse-time desugar of a BARE column used as a condition
+    /// (`WHERE B`, `CASE WHEN B THEN ...`): means `= TRUE`, but ONLY a
+    /// BOOLEAN side may take it - the engine refuses any other type AT
+    /// PREPARE ("invalid usage of boolean expression"), while an
+    /// EXPLICITLY WRITTEN `= TRUE` coerces a TEXT side per row
+    /// ([Expr::TextBool]; probed: `S = TRUE` answers the 'true' rows
+    /// and raises 22018 from a '1' row, `WHERE S` refuses). The parse
+    /// erases the spelling, so this marker is what keeps the two
+    /// apart at resolution.
+    BareTrue,
     /// a CONDITION used as a VALUE - `SELECT B AND C`, `SELECT ID > 2`.
     /// Firebird makes every predicate an expression of type BOOLEAN, so
     /// the two grammars meet here
@@ -20578,7 +20783,10 @@ fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
         return Some(RawCond::Cmp(
             Box::new(left),
             Cmp::Eq,
-            Box::new(RawExpr::Bool(true)),
+            // the BARE marker: only a BOOLEAN column qualifies at
+            // resolution - an explicit `= TRUE` coerces text per row,
+            // a bare `CASE WHEN NAME` must keep refusing
+            Box::new(RawExpr::BareTrue),
         ));
     }
     // a comparison operator, longest match first
@@ -21106,7 +21314,7 @@ fn raw_bad_substring_len(e: &RawExpr) -> Option<i64> {
             .filter(|n| *n < 0)
             .or_else(|| walk_all(args)),
         RawExpr::Func(_, args) | RawExpr::Coalesce(args) => walk_all(args),
-        RawExpr::Double(_) | RawExpr::Bool(_) => None,
+        RawExpr::Double(_) | RawExpr::Bool(_) | RawExpr::BareTrue => None,
         RawExpr::Cond(c) => raw_cond_bad_substring_len(c),
         RawExpr::Neg(a) | RawExpr::Cast(a, _) => raw_bad_substring_len(a),
         RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => {
@@ -21598,11 +21806,19 @@ fn resolve_raw_cond(
         // every row, where the engine raises "Invalid usage of boolean
         // expression".
         RawCond::Cmp(a, op, b) => {
-            let (l, r) = cmp_sides(
-                resolve_expr(a, columns, descs)?,
-                resolve_expr(b, columns, descs)?,
-                descs,
-            )?;
+            let l = resolve_expr(a, columns, descs)?;
+            // the bare-column desugar (`CASE WHEN B`): only a BOOLEAN
+            // side takes it - the engine refuses `CASE WHEN NAME` at
+            // prepare, where the explicit `NAME = TRUE` coerces per row
+            let rb = if matches!(**b, RawExpr::BareTrue) {
+                if !matches!(l.type_of(descs), Some(ExprType::Bool)) {
+                    return None;
+                }
+                Expr::Bool(true)
+            } else {
+                resolve_expr(b, columns, descs)?
+            };
+            let (l, r) = cmp_sides(l, rb, descs)?;
             Cond2::Cmp(Box::new(l), *op, Box::new(r))
         }
         RawCond::Like(a, pat, esc, negated) => Cond2::Like(
@@ -21680,6 +21896,11 @@ fn resolve_expr_inner(
         RawExpr::Dec(raw, scale) => Expr::Dec(*raw, *scale),
         RawExpr::Double(d) => Expr::Double(*d),
         RawExpr::Bool(b) => Expr::Bool(*b),
+        // the bare-column-as-condition marker resolves ONLY at the two
+        // sites that check the tested side is BOOLEAN; anywhere else it
+        // refuses (the engine's prepare-time "invalid usage of boolean
+        // expression")
+        RawExpr::BareTrue => return None,
         RawExpr::Cond(c) => Expr::Cond(Box::new(resolve_raw_cond(c, columns, descs)?)),
         RawExpr::Str(s) => Expr::Str(s.clone()),
         RawExpr::Null => Expr::Null,
@@ -21817,6 +22038,22 @@ enum Expr {
     DateLit(i32),
     TimeLit(u32),
     TsLit(i32, u32),
+    /// A TEXT side of a comparison whose OTHER side is numeric,
+    /// wrapped by [cmp_sides]: the engine coerces the TEXT side to a
+    /// number PER ROW with the lenient compare grammar
+    /// ([text_col_num]), raising 22018 on a value that will not
+    /// convert. Eval: NULL passes; text becomes the exact
+    /// `Value::Int128` (a scale past i8 approximates as Double - a
+    /// documented edge), an e/E spelling the double it parsed to, and
+    /// capital-X hex an orders-high sentinel. This is what fixes
+    /// `5 = S`, `NAME = ID`, `ON A.S = B.ID` and `S = D` - all probed
+    /// wrong (rendered-text rows or refusals) before it.
+    TextNum(Box<Expr>),
+    /// The BOOLEAN sibling: a text side against a BOOLEAN side
+    /// converts per row by trimmed case-insensitive TRUE/FALSE
+    /// (probed: 'true', ' True ', 'FALSE' convert; '1', 't', '5'
+    /// raise 22018; NULL is UNKNOWN).
+    TextBool(Box<Expr>),
 }
 
 /// A resolved [RawCond].
@@ -22423,6 +22660,261 @@ fn literal_num_rhs(s: &str, int_col: bool) -> LitNum {
     }
 }
 
+/// A text COLUMN value classified for a comparison against a numeric
+/// side - the engine's COMPARE grammar (cvt.cpp `CVT_get_numeric` via
+/// cvt2.cpp `cmp_numeric_string`), which is LENIENT and deliberately
+/// NOT the store grammar [text_number]: interior spaces convert here
+/// (probed: `S = 10` matches '1 0', '1 2 3' is 123, '- 5' is -5,
+/// '5 . 0' is 5), where the store side and the literal side
+/// ([literal_num_rhs]) refuse them. The split is uniform because a
+/// numeric compare never bands a text index (PLANONLY probed NATURAL),
+/// so no index dependence reaches the column side.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ColNum {
+    /// an exact decimal `mantissa x 10^scale` - i128/i32 because the
+    /// compare stays exact through 39 digits (probed: a 39-digit
+    /// `1.0..01` != 1 while a 40-digit one = 1, the dec128 rounding
+    /// this reproduces by HALF-EVEN rounding to 34 significant digits
+    /// once the mantissa outruns i128)
+    Exact(i128, i32),
+    /// an e/E spelling: the WHOLE string went through the double
+    /// grammar (cvt.cpp `CVT_get_double`), which forbids interior
+    /// spaces ('1e3' converts, '1 e 3' and '1e 3' raise - probed);
+    /// overflow is +-inf, correct for ordering and never equal
+    Dbl(f64),
+    /// capital-X hex (`'0X10'`, checked on the RAW bytes - a leading
+    /// space instead raises, per the main loop): the live engine reads
+    /// UNINITIALIZED MEMORY here (probed ~1.9e25, different per
+    /// string). fc answers an orders-high sentinel instead; only the
+    /// equality-miss is pinned, never the garbage ordering.
+    HexHigh,
+    /// SQLSTATE 22018, per row, carrying the RAW (CHAR-padded) value
+    Raise,
+}
+
+/// Read one stored text value with the engine's compare-side grammar
+/// (cvt.cpp:228-275, each law probed): spaces skip ANYWHERE in a
+/// no-exponent spelling; one sign before any digit, dot or prior sign;
+/// one dot; a NUL terminates the scan; an e/E delegates the whole
+/// string to the double grammar; anything else - and a string with no
+/// digit - raises.
+fn text_col_num(raw: &str) -> ColNum {
+    let b = raw.as_bytes();
+    // capital-X hex on the raw bytes, before any space skipping
+    // (probed: '0X10' takes the garbage path, ' 0X10' raises)
+    if b.len() > 2 && b[0] == b'0' && b[1] == b'X' {
+        return ColNum::HexHigh;
+    }
+    let mut digits: Vec<u8> = Vec::new();
+    let mut frac_len: i64 = 0;
+    let mut neg = false;
+    let mut seen_sign = false;
+    let mut seen_dot = false;
+    for &c in b {
+        match c {
+            b' ' => {}
+            b'0'..=b'9' => {
+                digits.push(c);
+                if seen_dot {
+                    frac_len += 1;
+                }
+            }
+            b'.' => {
+                if seen_dot {
+                    return ColNum::Raise; // '5.5.5' raises (probed)
+                }
+                seen_dot = true;
+            }
+            b'+' | b'-' => {
+                // one sign, before any digit, dot or prior sign
+                // ('--5' raises, '- 5' converts - both probed)
+                if seen_sign || seen_dot || !digits.is_empty() {
+                    return ColNum::Raise;
+                }
+                seen_sign = true;
+                neg = c == b'-';
+            }
+            // a NUL terminates the scan - cvt reads C strings
+            b'\0' => break,
+            b'e' | b'E' => return exp_col_num(raw),
+            _ => return ColNum::Raise,
+        }
+    }
+    if digits.is_empty() {
+        return ColNum::Raise; // '', '   ', '.', '-' all raise (probed)
+    }
+    // strip leading zeros: significance is what decides exactness
+    let first = digits.iter().position(|&d| d != b'0').unwrap_or(digits.len() - 1);
+    let sig = &digits[first..];
+    let scale = -frac_len;
+    let fold = |ds: &[u8]| -> Option<i128> {
+        let mut m: i128 = 0;
+        for &d in ds {
+            m = m.checked_mul(10)?.checked_add((d - b'0') as i128)?;
+        }
+        Some(m)
+    };
+    let (mantissa, scale) = match fold(sig) {
+        // fits i128: exact - the int128 path (39 digits can fit)
+        Some(m) => (m, scale),
+        // past i128: the dec128 path - HALF-EVEN to 34 significant
+        // digits, the scale absorbing the dropped places (probed: a
+        // 40-digit 1.0..01 = 1)
+        None => {
+            let keep = 34;
+            let mut m = fold(&sig[..keep]).unwrap_or(0);
+            let rest = &sig[keep..];
+            let up = match rest.first() {
+                Some(&d) if d > b'5' => true,
+                Some(&d) if d < b'5' => false,
+                // exactly half: to EVEN
+                _ => rest[1..].iter().any(|&d| d != b'0') || m % 2 == 1,
+            };
+            if up {
+                m += 1;
+            }
+            (m, scale + rest.len() as i64)
+        }
+    };
+    let mantissa = if neg { -mantissa } else { mantissa };
+    // the scale is bounded by the string length; a WHERE value is at
+    // most 32765 bytes, comfortably inside i32
+    ColNum::Exact(mantissa, scale.clamp(i32::MIN as i64, i32::MAX as i64) as i32)
+}
+
+/// The exponent path of [text_col_num]: the WHOLE string through the
+/// double grammar - outer spaces trimmed, NO interior spaces, shape
+/// `[+-]?(digits[.digits*]? | .digits)[eE][+-]?digits` - then Rust's
+/// correctly-rounded f64 parse. The engine's own accumulating parse is
+/// up to 1 ulp HIGH past 16 significant digits (measured in
+/// serve-real-textnum's wide-decimal section); fc is deliberately the
+/// MORE accurate of the two, the same stance the store side took.
+fn exp_col_num(raw: &str) -> ColNum {
+    let t = raw.trim_matches(' ');
+    let b = t.as_bytes();
+    let mut i = 0;
+    if matches!(b.get(i), Some(b'+' | b'-')) {
+        i += 1;
+    }
+    let d0 = i;
+    while matches!(b.get(i), Some(c) if c.is_ascii_digit()) {
+        i += 1;
+    }
+    let int_digits = i - d0;
+    let mut frac_digits = 0;
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        let f0 = i;
+        while matches!(b.get(i), Some(c) if c.is_ascii_digit()) {
+            i += 1;
+        }
+        frac_digits = i - f0;
+        // '.e3' has no digit anywhere - raise below
+        if int_digits == 0 && frac_digits == 0 {
+            return ColNum::Raise;
+        }
+    }
+    if int_digits == 0 && frac_digits == 0 {
+        return ColNum::Raise;
+    }
+    if !matches!(b.get(i), Some(b'e' | b'E')) {
+        return ColNum::Raise; // an interior space landed here (probed)
+    }
+    i += 1;
+    if matches!(b.get(i), Some(b'+' | b'-')) {
+        i += 1;
+    }
+    let e0 = i;
+    while matches!(b.get(i), Some(c) if c.is_ascii_digit()) {
+        i += 1;
+    }
+    if i == e0 || i != b.len() {
+        return ColNum::Raise; // no exponent digits, or trailing junk
+    }
+    match t.parse::<f64>() {
+        Ok(d) => ColNum::Dbl(d),
+        Err(_) => ColNum::Raise,
+    }
+}
+
+/// [num_cmp]'s exact alignment widened to i128 mantissas with i32
+/// scales - what [ColNum::Exact] needs (a spelled fraction can outrun
+/// i8). Same zero-first check and single-side saturation: 0 x 10^k is
+/// 0 for every k, and a non-zero value that saturates keeps its side.
+fn wide_num_cmp(ra: i128, sa: i32, rb: i128, sb: i32) -> std::cmp::Ordering {
+    let up = |v: i128, by: i32| {
+        if v == 0 {
+            return 0;
+        }
+        u32::try_from(by.max(0))
+            .ok()
+            .and_then(|p| 10i128.checked_pow(p))
+            .and_then(|p| v.checked_mul(p))
+            .unwrap_or(if v < 0 { i128::MIN } else { i128::MAX })
+    };
+    up(ra, sa.saturating_sub(sb)).cmp(&up(rb, sb.saturating_sub(sa)))
+}
+
+/// An exact (raw, scale) pair as f64, the negative scale by DIVISION -
+/// mirroring `CVT_get_double`'s numeric branch, which divides by the
+/// power rather than multiplying by its reciprocal.
+fn exact_to_f64(raw: i128, scale: i32) -> f64 {
+    if scale >= 0 {
+        raw as f64 * 10f64.powi(scale)
+    } else {
+        raw as f64 / 10f64.powi(-scale)
+    }
+}
+
+/// [Term::TextNumCmp]'s per-row verdict: convert the stored text with
+/// the compare grammar, then compare exactly (or in the double domain
+/// where either side is approximate). `Err` is the engine's per-row
+/// 22018 carrying the RAW value - CHAR padding included (probed:
+/// `"abc   "` for CHAR(6)).
+fn text_num_matches(s: &str, op: Cmp, rhs: &Rhs) -> Result<Option<bool>, EvalErr> {
+    let conv = text_col_num(s);
+    if matches!(conv, ColNum::Raise) {
+        return Err(EvalErr::ConversionError(Some(s.to_string())));
+    }
+    // the hex sentinel sits above every representable rhs: every
+    // probed engine answer for the supported domain has Eq/Lt/Le
+    // false and Ne/Gt/Ge true (only the equality-miss is gate-pinned)
+    if matches!(conv, ColNum::HexHigh) {
+        return Ok(Some(matches!(op, Cmp::Ne | Cmp::Gt | Cmp::Ge)));
+    }
+    Ok(Some(match (conv, rhs) {
+        (ColNum::Exact(m, sc), Rhs::Int(n)) => {
+            ord_ok(wide_num_cmp(m, sc, *n as i128, 0), op)
+        }
+        (ColNum::Exact(m, sc), Rhs::Num(r, rs)) => {
+            ord_ok(wide_num_cmp(m, sc, *r as i128, *rs as i32), op)
+        }
+        // a DOUBLE on either side moves the compare to the double
+        // domain (probed: `S = D` matched '2.50' against 2.5)
+        (ColNum::Exact(m, sc), Rhs::Dbl(d)) => {
+            match exact_to_f64(m, sc).partial_cmp(d) {
+                Some(o) => ord_ok(o, op),
+                None => return Ok(None), // NaN rhs: no ordering
+            }
+        }
+        (ColNum::Dbl(x), rhs) => {
+            let y = match rhs {
+                Rhs::Int(n) => *n as f64,
+                Rhs::Num(r, rs) => exact_to_f64(*r as i128, *rs as i32),
+                Rhs::Dbl(d) => *d,
+                // Str/Null/Param never reach a TextNumCmp (defensive)
+                _ => return Ok(None),
+            };
+            match x.partial_cmp(&y) {
+                Some(o) => ord_ok(o, op),
+                None => return Ok(None),
+            }
+        }
+        // Raise and HexHigh returned above; Str/Null/Param defensive
+        _ => return Ok(None),
+    }))
+}
+
 /// A text parameter into an EXACT numeric column: the stored value, or
 /// `None` for the engine's refusal.
 ///
@@ -22926,6 +23418,11 @@ impl Expr {
             Expr::Double(_) => Some(ExprType::Approx),
             Expr::Bool(_) | Expr::Cond(_) => Some(ExprType::Bool),
             Expr::Str(_) => Some(ExprType::Text),
+            // the wrapped text side answers a NUMBER (a BOOLEAN for
+            // the sibling) - that is the point of the wrap; the inner
+            // side must still type
+            Expr::TextNum(e) => e.type_of(descs).map(|_| ExprType::Numeric),
+            Expr::TextBool(e) => e.type_of(descs).map(|_| ExprType::Bool),
             Expr::Null => Some(ExprType::Int),
             Expr::DateLit(_) => Some(ExprType::Temporal(TKind::Date)),
             Expr::TimeLit(_) => Some(ExprType::Temporal(TKind::Time)),
@@ -23212,6 +23709,10 @@ impl Expr {
             // an APPROXIMATE or BOOLEAN value has no exact rank - width
             // is not what decides its wire form
             Expr::Double(_) | Expr::Bool(_) | Expr::Cond(_) => None,
+            // the per-row coercion wrappers have no STATIC rank - the
+            // value's width is decided by each row's text. They live
+            // only inside WHERE comparisons, never in a describe.
+            Expr::TextNum(_) | Expr::TextBool(_) => None,
             Expr::Coalesce(args) => args.iter().filter_map(|a| a.rank_of(descs)).max(),
             Expr::Case(branches, else_) => branches
                 .iter()
@@ -23392,6 +23893,44 @@ impl Expr {
             }
             Expr::Col(fid) => values.get(*fid).cloned().unwrap_or(Value::Null),
             Expr::GenVal(i) => values.get(*i).cloned().unwrap_or(Value::Null),
+            // the per-row text-to-number coercion (see the variant):
+            // NULL is UNKNOWN downstream, an exact spelling compares
+            // exactly through num_cmp, a double one through the
+            // approx promotion, and a bad one raises 22018 carrying
+            // the raw (CHAR-padded) value
+            Expr::TextNum(e) => match e.eval(values)? {
+                Value::Null => Value::Null,
+                Value::Text(s) => match text_col_num(&s) {
+                    ColNum::Exact(m, sc) => match i8::try_from(sc) {
+                        Ok(sc8) => Value::Int128(m, sc8),
+                        // a fraction past 127 digits cannot ride the
+                        // i8-scaled shape: approximate (documented
+                        // edge - the value is far below any i64 rim)
+                        Err(_) => Value::Double(exact_to_f64(m, sc)),
+                    },
+                    ColNum::Dbl(d) => Value::Double(d),
+                    ColNum::HexHigh => Value::Double(f64::MAX),
+                    ColNum::Raise => {
+                        return Err(EvalErr::ConversionError(Some(s)))
+                    }
+                },
+                v => v, // a non-text value passes through (defensive)
+            },
+            // the boolean sibling: trimmed case-insensitive TRUE/FALSE
+            Expr::TextBool(e) => match e.eval(values)? {
+                Value::Null => Value::Null,
+                Value::Text(s) => {
+                    let t = s.trim();
+                    if t.eq_ignore_ascii_case("true") {
+                        Value::Bool(true)
+                    } else if t.eq_ignore_ascii_case("false") {
+                        Value::Bool(false)
+                    } else {
+                        return Err(EvalErr::ConversionError(Some(s)));
+                    }
+                }
+                v => v,
+            },
             Expr::Int(n) => Value::Int(*n),
             Expr::Dec(raw, scale) => Value::Scaled(*raw, *scale),
             Expr::Str(s) => Value::Text(s.clone()),
@@ -25789,7 +26328,7 @@ fn default_expr_name(raw: &RawExpr) -> String {
         }
         RawExpr::Neg(_) => "",
         RawExpr::Int(_) | RawExpr::Dec(..) | RawExpr::Double(_) | RawExpr::Str(_)
-        | RawExpr::Bool(_) | RawExpr::Null => "CONSTANT",
+        | RawExpr::Bool(_) | RawExpr::BareTrue | RawExpr::Null => "CONSTANT",
         // every boolean-valued expression is named BOOL, whatever
         // produced it - `B AND C`, `ID > 2`, `NOT B`, `B IS NULL`,
         // `ID BETWEEN 1 AND 2`, `ID IN (1, 2)` all describe as BOOL
@@ -26826,7 +27365,8 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                     Rhs::Num(v, s) => RawExpr::Dec(*v, *s),
                     Rhs::Str(s) => RawExpr::Str(s.clone()),
                     Rhs::Null => RawExpr::Null,
-                    Rhs::Param(..) => return None,
+                    // Dbl exists only at bind - the parser never sees it
+                    Rhs::Dbl(_) | Rhs::Param(..) => return None,
                 })
             };
             match t.get(p3) {
@@ -27022,12 +27562,14 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
     // first parenthesised group as a sub-predicate, where `A + 8` is
     // followed by `)` and would otherwise become `A + 8 = TRUE`.
     // Resolution refuses a non-boolean column, so `WHERE NAME` still
-    // fails rather than testing emptiness.
+    // fails rather than testing emptiness - the BARE marker
+    // ([RawExpr::BareTrue]) is what says so now that an EXPLICIT
+    // `NAME = TRUE` coerces the text column per row instead.
     if !negated
         && matches!(lhs, RawLhs::Col(_))
         && matches!(t.get(*pos), None | Some(Tok::And | Tok::Or | Tok::RParen))
     {
-        return Some(leaf(RawKind::CmpExpr(Cmp::Eq, RawExpr::Bool(true))));
+        return Some(leaf(RawKind::CmpExpr(Cmp::Eq, RawExpr::BareTrue)));
     }
     match t.get(*pos)? {
         Tok::Cmp(op) if !negated => {
@@ -28330,14 +28872,29 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
         RawKind::CmpExpr(..) => return None,
         RawKind::Cmp(op, Rhs::Int(n)) => match kind {
             ColKind::Int => Term::Cmp(idx, op, Rhs::Int(n)),
+            // a numeric literal against a TEXT column coerces the
+            // COLUMN per row with the LENIENT compare grammar
+            // ([Term::TextNumCmp]; probed: `S = 5` answers the
+            // '5'/' 5'/'5.0'/'05'/'+5'/'5e0' class and raises 22018
+            // on a non-convertible row). This one arm lights WHERE,
+            // the BETWEEN/IN desugars and HAVING over text group keys
+            // (where the raise argument is the group's key - probed,
+            // NULL group silent).
+            ColKind::Text => Term::TextNumCmp(idx, op, Rhs::Int(n)),
             _ => return None,
         },
         // a decimal literal against an integer column compares exactly
         // (A > 1.5 is meaningful, A = 1.5 simply never matches)
         RawKind::Cmp(op, Rhs::Num(r, s)) => match kind {
             ColKind::Int => Term::NumCmp(idx, op, Rhs::Num(r, s)),
+            // same per-row column coercion as the integer arm above
+            // (probed: `S = 2.5` answers the '2.5' row)
+            ColKind::Text => Term::TextNumCmp(idx, op, Rhs::Num(r, s)),
             _ => return None,
         },
+        // Rhs::Dbl exists only at bind ([Predicate::bind]'s text-column
+        // parameter arm); the parser never writes it here
+        RawKind::Cmp(_, Rhs::Dbl(_)) => return None,
         RawKind::Cmp(op, Rhs::Str(v)) => match kind {
             ColKind::Text => Term::Cmp(idx, op, Rhs::Str(v)),
             // a text LITERAL against an INTEGER column converts at
@@ -28572,7 +29129,8 @@ fn resolve_expr_term(
             Rhs::Num(r, s) => Expr::Dec(*r, *s),
             Rhs::Str(s) => Expr::Str(s.clone()),
             Rhs::Null => Expr::Null,
-            Rhs::Param(..) => return None,
+            // Dbl exists only at bind - unreachable-defensive here
+            Rhs::Dbl(_) | Rhs::Param(..) => return None,
         })
     };
     let term = match &rt.kind {
@@ -28621,7 +29179,18 @@ fn resolve_expr_term(
             Term::ExprCond(Box::new(Cond2::Cmp(Box::new(l), *op, Box::new(r))))
         }
         RawKind::CmpExpr(op, e) => {
-            let (l, r) = cmp_sides(lhs, resolve_expr(e, columns, descs)?, descs)?;
+            // the bare-column desugar (`WHERE B`): only a BOOLEAN side
+            // takes it - the engine refuses `WHERE NAME` at prepare,
+            // where the explicit `NAME = TRUE` coerces per row
+            let rhs = if matches!(e, RawExpr::BareTrue) {
+                if !matches!(lhs.type_of(descs), Some(ExprType::Bool)) {
+                    return None;
+                }
+                Expr::Bool(true)
+            } else {
+                resolve_expr(e, columns, descs)?
+            };
+            let (l, r) = cmp_sides(lhs, rhs, descs)?;
             Term::ExprCond(Box::new(Cond2::Cmp(Box::new(l), *op, Box::new(r))))
         }
         RawKind::IsNull => Term::ExprCond(Box::new(Cond2::IsNull(Box::new(lhs)))),
@@ -28776,27 +29345,50 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
         // string (probed: `DP > '1.5'` is the same as `DP > 1.5`, and
         // `DP > 'x'` raises 22018). Parse it here, at prepare; one that
         // will not parse refuses instead of reaching the text compare.
+        // A text COLUMN or expression converts PER ROW instead - the
+        // [Expr::TextNum] wrap; its Double result meets the approx
+        // side through value_cmp's promotion (probed: `S = D` matched
+        // '2.50' against the stored 2.5 - the double domain).
         (ExprType::Approx, ExprType::Text) => {
-            let r = approx_literal(&rhs)?;
-            Some((lhs, r))
+            if matches!(rhs, Expr::Str(_)) {
+                let r = approx_literal(&rhs)?;
+                Some((lhs, r))
+            } else {
+                Some((lhs, Expr::TextNum(Box::new(rhs))))
+            }
         }
         (ExprType::Text, ExprType::Approx) => {
-            let l = approx_literal(&lhs)?;
-            Some((l, rhs))
+            if matches!(lhs, Expr::Str(_)) {
+                let l = approx_literal(&lhs)?;
+                Some((l, rhs))
+            } else {
+                Some((Expr::TextNum(Box::new(lhs)), rhs))
+            }
         }
         (ExprType::Approx, _) | (_, ExprType::Approx) => None,
         // BOOLEAN meets BOOLEAN, or a string the engine converts
         // (probed: `B = 'TRUE'` selects the true rows). A NUMBER does
         // not: the engine renders the boolean and fails the conversion
         // (`B = 1` is SQLSTATE 22018), so there is no answer to give.
+        // A text COLUMN or expression converts PER ROW - the
+        // [Expr::TextBool] wrap (probed: `S = TRUE` answers the
+        // 'true'/' True ' rows and raises 22018 from a '1' row).
         (ExprType::Bool, ExprType::Bool) => Some((lhs, rhs)),
         (ExprType::Bool, ExprType::Text) => {
-            let r = bool_literal(&rhs)?;
-            Some((lhs, r))
+            if matches!(rhs, Expr::Str(_)) {
+                let r = bool_literal(&rhs)?;
+                Some((lhs, r))
+            } else {
+                Some((lhs, Expr::TextBool(Box::new(rhs))))
+            }
         }
         (ExprType::Text, ExprType::Bool) => {
-            let l = bool_literal(&lhs)?;
-            Some((l, rhs))
+            if matches!(lhs, Expr::Str(_)) {
+                let l = bool_literal(&lhs)?;
+                Some((l, rhs))
+            } else {
+                Some((Expr::TextBool(Box::new(lhs)), rhs))
+            }
         }
         (ExprType::Bool, _) | (_, ExprType::Bool) => None,
         // an exact-NUMERIC side against a text LITERAL: the engine
@@ -28804,18 +29396,25 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
         // 100 rows and `N92 + 0 = '0.5'` the 0.50 row - before this arm
         // both pairs fell to value_cmp's rendered-text fallback, which
         // compared "10" < "9" and answered [] with no error). Converted
-        // HERE, at prepare; a literal that will not convert refuses the
-        // STATEMENT (priced: the engine raises per row, but only
-        // plain-column terms carry the value-gated raiser). A text
-        // COLUMN or expression against a numeric side still falls
-        // through - out of this slice, the engine converts per row
-        // there too.
+        // HERE, at prepare, with the STRICT grammar; a literal that
+        // will not convert refuses the STATEMENT (priced: the engine
+        // raises per row, but only plain-column terms carry the
+        // value-gated raiser). A text COLUMN or expression converts
+        // PER ROW with the LENIENT compare grammar instead - the
+        // [Expr::TextNum] wrap (probed: `5 = S` answers the class,
+        // `NAME = ID` matches '02' against 2 and raises on 'x3',
+        // `ON A.S = B.ID` raises on 'abc' - before the wrap all three
+        // fell to value_cmp's rendered-text fallback and answered
+        // string-ordered rows). The literal/column grammar split is
+        // the engine's own (probed: interior spaces convert on the
+        // column side, and the literal slice sided with the INDEXED
+        // engine's strict store grammar).
         (ExprType::Int | ExprType::Numeric, ExprType::Text) => {
             if let Expr::Str(s) = &rhs {
                 let r = num_literal_expr(s)?;
                 Some((lhs, r))
             } else {
-                Some((lhs, rhs))
+                Some((lhs, Expr::TextNum(Box::new(rhs))))
             }
         }
         (ExprType::Text, ExprType::Int | ExprType::Numeric) => {
@@ -28823,7 +29422,7 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
                 let l = num_literal_expr(s)?;
                 Some((l, rhs))
             } else {
-                Some((lhs, rhs))
+                Some((Expr::TextNum(Box::new(lhs)), rhs))
             }
         }
         _ => Some((lhs, rhs)),
@@ -28905,6 +29504,11 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
         | Expr::TsLit(..) => true,
         // a condition as a value raises only where its own operands do
         Expr::Cond(c) => cond_no_raise(c, descs),
+        // the per-row coercions raise 22018 by design - that raise is
+        // exactly their value-gated engine behavior, carried by the
+        // error-propagating term paths, never admitted where a raise
+        // cannot travel
+        Expr::TextNum(_) | Expr::TextBool(_) => false,
         Expr::Neg(x) => expr_no_raise(x, descs),
         // arithmetic can overflow / divide by zero; CAST can fail
         Expr::Bin(..) | Expr::Cast(..) => false,
@@ -29037,6 +29641,8 @@ fn numeric_term(
             LitNum::Raise(s) => Term::CmpConvErr(idx, s),
             LitNum::Refuse => return None,
         },
+        // Dbl exists only at bind - the parser never writes it
+        RawKind::Cmp(_, Rhs::Dbl(_)) => return None,
         RawKind::IsNull => Term::IsNull(idx),
         RawKind::IsNotNull => Term::IsNotNull(idx),
         RawKind::Like(Rhs::Str(p), escape, negated) => {
@@ -33286,6 +33892,196 @@ mod tests {
         assert!(!term_row_independent(&t));
     }
 
+    // The COMPARE-side column grammar (cvt.cpp CVT_get_numeric via
+    // cvt2.cpp cmp_numeric_string) - LENIENT, and deliberately not the
+    // store grammar: every verdict below quotes a probed engine answer
+    // (isql/node against FB6, see qa/serve-real-textcolcmp.sh).
+    #[test]
+    fn text_col_num_reads_the_lenient_compare_grammar() {
+        use ColNum::*;
+        // the `S = 5` equivalence class, spaces skipped ANYWHERE
+        assert_eq!(text_col_num("5"), Exact(5, 0));
+        assert_eq!(text_col_num(" 5"), Exact(5, 0));
+        assert_eq!(text_col_num("5.0"), Exact(50, -1));
+        assert_eq!(text_col_num("05"), Exact(5, 0));
+        assert_eq!(text_col_num("+5"), Exact(5, 0));
+        assert_eq!(text_col_num("  5  "), Exact(5, 0));
+        assert_eq!(text_col_num("1 0"), Exact(10, 0)); // = 10, probed
+        assert_eq!(text_col_num("1 2 3"), Exact(123, 0));
+        assert_eq!(text_col_num("- 5"), Exact(-5, 0));
+        assert_eq!(text_col_num("5 . 0"), Exact(50, -1));
+        assert_eq!(text_col_num(".5"), Exact(5, -1));
+        assert_eq!(text_col_num("+.5"), Exact(5, -1));
+        assert_eq!(text_col_num("5."), Exact(5, 0));
+        assert_eq!(text_col_num("-0"), Exact(0, 0));
+        // an e/E hands the WHOLE string to the double grammar
+        assert_eq!(text_col_num("1e3"), Dbl(1000.0));
+        assert_eq!(text_col_num("1E3"), Dbl(1000.0));
+        assert_eq!(text_col_num("1e-3"), Dbl(0.001));
+        assert_eq!(text_col_num("0.5e1"), Dbl(5.0));
+        assert_eq!(text_col_num("1.5e2"), Dbl(150.0));
+        assert_eq!(text_col_num("5e0"), Dbl(5.0));
+        assert_eq!(text_col_num(" 5e0 "), Dbl(5.0)); // outer spaces fine
+        assert_eq!(text_col_num("1e400"), Dbl(f64::INFINITY)); // > 1e300
+        // ... and THAT grammar forbids interior spaces (probed: both
+        // raise while the space-free '1e3' matches 1000)
+        assert_eq!(text_col_num("1 e 3"), Raise);
+        assert_eq!(text_col_num("1e 3"), Raise);
+        // the raisers, each quoted from a probed 22018
+        for bad in ["", "   ", "abc", "inf", "NaN", "1,5", "5.5.5", "--5",
+                    ".", "-", "+", "0x10", "1e", "e1", "x3"] {
+            assert_eq!(text_col_num(bad), Raise, "{:?} must raise", bad);
+        }
+        // capital-X hex on the RAW bytes takes the sentinel path; a
+        // leading space instead runs the main loop and raises
+        assert_eq!(text_col_num("0X10"), HexHigh);
+        assert_eq!(text_col_num(" 0X10"), Raise);
+    }
+
+    // The compare is EXACT, not double - the i128/i32 alignment - with
+    // the dec128 rounding boundary where a mantissa outruns i128.
+    #[test]
+    fn text_col_num_compares_exactly_at_the_boundaries() {
+        let eq = |s: &str, rhs: &Rhs| text_num_matches(s, Cmp::Eq, rhs).unwrap().unwrap();
+        // the two bigints are ONE double, and each string picks its row
+        assert!(eq("9223372036854775806", &Rhs::Int(9223372036854775806)));
+        assert!(!eq("9223372036854775806", &Rhs::Int(i64::MAX)));
+        assert!(eq("9223372036854775807", &Rhs::Int(i64::MAX)));
+        // '...806.5' sits strictly BETWEEN them (probed)
+        let mid = "9223372036854775806.5";
+        assert!(text_num_matches(mid, Cmp::Gt, &Rhs::Int(9223372036854775806)).unwrap().unwrap());
+        assert!(text_num_matches(mid, Cmp::Lt, &Rhs::Int(i64::MAX)).unwrap().unwrap());
+        // 17 digits stay exact: != 0.1, = its own spelling
+        assert!(!eq("0.10000000000000001", &Rhs::Num(1, -1)));
+        assert!(eq("0.10000000000000001", &Rhs::Num(10000000000000001, -17)));
+        // 39 significant digits fit i128 and stay exact (probed: != 1)
+        let d39 = format!("1.{}1", "0".repeat(37)); // 1.0..01, 39 digits
+        assert!(!eq(&d39, &Rhs::Int(1)));
+        // 40 digits outrun i128: HALF-EVEN to 34 significant digits,
+        // the dec128 collapse (probed: = 1)
+        let d40 = format!("1.{}1", "0".repeat(38));
+        assert!(eq(&d40, &Rhs::Int(1)));
+        // the hex sentinel: equality-miss, orders high (only the miss
+        // is engine-pinned - the live value is uninitialized memory)
+        for (op, want) in [(Cmp::Eq, false), (Cmp::Lt, false), (Cmp::Le, false),
+                           (Cmp::Ne, true), (Cmp::Gt, true), (Cmp::Ge, true)] {
+            assert_eq!(text_num_matches("0X10", op, &Rhs::Int(16)).unwrap(), Some(want));
+        }
+        // the double domain: a blr_double bind meets the exact spelling
+        assert!(eq("4.5", &Rhs::Dbl(4.5)));
+        assert!(eq(" 2.50 ", &Rhs::Dbl(2.5)));
+        assert!(!eq("4", &Rhs::Dbl(4.5)));
+    }
+
+    // The value gate on the per-row column coercion: NULL and a missing
+    // slot are UNKNOWN with no raise; a bad value raises 22018 carrying
+    // the RAW stored text - CHAR padding included (probed "abc   ").
+    #[test]
+    fn text_num_cmp_is_value_gated() {
+        let t = Term::TextNumCmp(0, Cmp::Eq, Rhs::Int(5));
+        assert_eq!(t.matches(&[Value::Null]).unwrap(), None);
+        assert_eq!(t.matches(&[]).unwrap(), None);
+        assert_eq!(t.matches(&[Value::Text("05".into())]).unwrap(), Some(true));
+        assert_eq!(t.matches(&[Value::Text("5.0".into())]).unwrap(), Some(true));
+        assert_eq!(t.matches(&[Value::Text("6".into())]).unwrap(), Some(false));
+        assert_eq!(
+            t.matches(&[Value::Text("abc   ".into())]),
+            Err(EvalErr::ConversionError(Some("abc   ".into())))
+        );
+        // row-DEPENDENT, like CmpConvErr - what hands every timing law
+        // (dead conjunct, empty table, DML atomicity) to the machinery
+        assert!(!term_row_independent(&t));
+    }
+
+    // The raise TIMING rides the existing conjunct machinery: FALSE
+    // short-circuits in WRITTEN order, OR is left-to-right, UNKNOWN
+    // does not suppress a later raiser (all probed).
+    #[test]
+    fn text_num_cmp_rides_the_conjunct_machinery() {
+        let raiser = || Term::TextNumCmp(1, Cmp::Eq, Rhs::Int(5));
+        let gate = || Term::Cmp(0, Cmp::Lt, Rhs::Int(3));
+        // gate written first: a failing row never reaches the raiser
+        // (probed: `ID + 0 < 3 AND S = 5` answers [1])
+        let p = Predicate::dnf(vec![vec![gate(), raiser()]]);
+        assert!(!p.matches(&[Value::Int(5), Value::Text("abc".into())]).unwrap());
+        assert!(p.matches(&[Value::Int(1), Value::Text(" 5".into())]).unwrap());
+        // ... and a passing row still raises
+        assert!(p.matches(&[Value::Int(1), Value::Text("abc".into())]).is_err());
+        // reversed order: the raiser evaluates first (probed: raises)
+        let p = Predicate::dnf(vec![vec![raiser(), gate()]]);
+        assert!(p.matches(&[Value::Int(5), Value::Text("abc".into())]).is_err());
+        // OR left-to-right: a TRUE alternative short-circuits (probed:
+        // `ID = 3 OR S = 5` answers [1,3,4]; reversed raises)
+        let p = Predicate::dnf(vec![
+            vec![Term::Cmp(0, Cmp::Eq, Rhs::Int(3))],
+            vec![raiser()],
+        ]);
+        assert!(p.matches(&[Value::Int(3), Value::Text("abc".into())]).unwrap());
+        assert!(p.matches(&[Value::Int(1), Value::Text("abc".into())]).is_err());
+        // a NULL value is UNKNOWN, not a raise, and fails the row
+        let p = Predicate::dnf(vec![vec![raiser()]]);
+        assert!(!p.matches(&[Value::Int(1), Value::Null]).unwrap());
+    }
+
+    // The expression-side wraps: TextNum answers the exact Int128 (or
+    // the parsed double for e-spellings, the orders-high sentinel for
+    // capital-X hex), TextBool the trimmed TRUE/FALSE match; both are
+    // NULL-transparent and raise 22018 with the raw value otherwise.
+    #[test]
+    fn expr_textnum_and_textbool_convert_per_row() {
+        let tn = Expr::TextNum(Box::new(Expr::Col(0)));
+        assert_eq!(tn.eval(&[Value::Text("5.0".into())]).unwrap(), Value::Int128(50, -1));
+        assert_eq!(tn.eval(&[Value::Text("02".into())]).unwrap(), Value::Int128(2, 0));
+        assert_eq!(tn.eval(&[Value::Text("1e3".into())]).unwrap(), Value::Double(1000.0));
+        assert_eq!(tn.eval(&[Value::Text("0X10".into())]).unwrap(), Value::Double(f64::MAX));
+        assert_eq!(tn.eval(&[Value::Null]).unwrap(), Value::Null);
+        assert_eq!(
+            tn.eval(&[Value::Text("x3".into())]),
+            Err(EvalErr::ConversionError(Some("x3".into())))
+        );
+        // the wrap keeps its term row-dependent - the value gate
+        assert!(expr_has_col(&tn));
+        let tb = Expr::TextBool(Box::new(Expr::Col(0)));
+        assert_eq!(tb.eval(&[Value::Text(" True ".into())]).unwrap(), Value::Bool(true));
+        assert_eq!(tb.eval(&[Value::Text("FALSE".into())]).unwrap(), Value::Bool(false));
+        assert_eq!(tb.eval(&[Value::Null]).unwrap(), Value::Null);
+        assert_eq!(
+            tb.eval(&[Value::Text("1".into())]),
+            Err(EvalErr::ConversionError(Some("1".into())))
+        );
+        assert!(expr_has_col(&tb));
+    }
+
+    // Arm C: a NUMERIC wire value against a TEXT column binds into the
+    // per-row coercion term; a text bind stays the plain text compare
+    // (control probed); genuine blr_bool keeps the refusal (unprobed).
+    #[test]
+    fn bind_numeric_wire_value_against_text_column() {
+        let p = Predicate::dnf(vec![vec![Term::Cmp(0, Cmp::Eq, Rhs::Param(0, ColKind::Text))]]);
+        // blr_long 5: the full equivalence class, raising mid-scan
+        let b = p.bind(&[WireParam::Int(5, 0)]).unwrap();
+        assert!(b.matches(&[Value::Text("05".into())]).unwrap());
+        assert!(b.matches(&[Value::Text("5e0".into())]).unwrap());
+        assert!(!b.matches(&[Value::Text("6".into())]).unwrap());
+        assert!(b.matches(&[Value::Text("abc".into())]).is_err());
+        // blr_double 4.5: the '4.5' row (probed)
+        let b = p.bind(&[WireParam::Double(4.5)]).unwrap();
+        assert!(b.matches(&[Value::Text(" 4.5 ".into())]).unwrap());
+        assert!(!b.matches(&[Value::Text("4".into())]).unwrap());
+        // a scaled exact bind compares exactly
+        let b = p.bind(&[WireParam::Int(45, -1)]).unwrap();
+        assert!(b.matches(&[Value::Text("4.50".into())]).unwrap());
+        // a TEXT bind is the plain pad-trimmed text compare - no
+        // coercion (control probed: ['5'] answers only the '5' row)
+        let b = p.bind(&[WireParam::Text("5".into())]).unwrap();
+        assert!(b.matches(&[Value::Text("5".into())]).unwrap());
+        assert!(!b.matches(&[Value::Text(" 5".into())]).unwrap());
+        // NULL binds per-row UNKNOWN; genuine blr_bool refuses
+        let b = p.bind(&[WireParam::Null]).unwrap();
+        assert!(!b.matches(&[Value::Text("5".into())]).unwrap());
+        assert!(p.bind(&[WireParam::Bool(true)]).is_err());
+    }
+
     // Scale alignment across a gap past 38: 0 x 10^k is 0 for every k.
     // The checked_pow saturation used to turn a ZERO into i128::MAX
     // (probed: N92 > '1e-50' keeps the N92 = 0 row OUT - engine
@@ -36933,21 +37729,42 @@ mod tests {
             assert_eq!(default_expr_name(&parse_raw_expr_any(src).unwrap()), "BOOL", "{src}");
         }
 
-        // a non-boolean column is not a condition: the side typing
-        // refuses it rather than comparing rendered text (which
-        // answered FALSE for every row)
+        // a non-boolean column is not a condition ON ITS OWN: the BARE
+        // desugar marker refuses at resolution (the engine's
+        // prepare-time "invalid usage of boolean expression") ...
         let raw = parse_raw_expr_any("NAME").unwrap();
         assert!(matches!(raw, RawExpr::Col(_))); // an expression, not a condition
         assert!(resolve_raw_cond(
             &RawCond::Cmp(
                 Box::new(RawExpr::Col("NAME".into())),
                 Cmp::Eq,
-                Box::new(RawExpr::Bool(true)),
+                Box::new(RawExpr::BareTrue),
             ),
             &columns,
             &descs
         )
         .is_none());
+        // ... while an EXPLICITLY WRITTEN `NAME = TRUE` coerces the
+        // text column per row ([Expr::TextBool]; probed: `S = TRUE`
+        // answers the 'true' rows and raises 22018 from a '1' row)
+        let explicit = resolve_raw_cond(
+            &RawCond::Cmp(
+                Box::new(RawExpr::Col("NAME".into())),
+                Cmp::Eq,
+                Box::new(RawExpr::Bool(true)),
+            ),
+            &columns,
+            &descs,
+        )
+        .unwrap();
+        let named_row = |s: &str| {
+            vec![Value::Null, Value::Null, Value::Int(0), Value::Text(s.into())]
+        };
+        assert_eq!(explicit.eval(&named_row(" True ")).unwrap(), Some(true));
+        assert_eq!(
+            explicit.eval(&named_row("1")),
+            Err(EvalErr::ConversionError(Some("1".into())))
+        );
     }
 
     #[test]

@@ -472,7 +472,21 @@ four; R7 is the removal of what they replaced.
   text_number for Int/Numeric columns with per-row error timing —
   unblocked, unclaimed. Param twins already agree.
 
-- **A NON-TEXT parameter against a TEXT column** — `WHERE S_VC = 5`,
+- ~~A NON-TEXT parameter against a TEXT column / text-column
+  render-compare~~ — *fixed*. The engine coerces the COLUMN's text
+  per row with the lenient compare grammar (spaces anywhere, '5' ≡
+  ' 5' ≡ '5.0' ≡ '05'), raising 22018 mid-scan with the raw
+  CHAR-padded value; fc's Term::TextNumCmp and the Expr::TextNum
+  wraps replace the rendered-text fall-through (NAME > N answered
+  string-ordered rows), and Int/Double binds against text columns
+  coerce the column too. The gate DIFF also forced the FIRST-1
+  streaming law: the engine stops evaluating after the take limit, so
+  fc's Modified arm now streams unsorted take-limited inners.
+  qa/serve-real-textcolcmp.sh, 92 checks. Residuals: blr_bool/
+  temporal binds refuse (unprobed); FOR SELECT feeders still
+  materialize under FIRST (unpinned).
+
+- **(superseded)** A NON-TEXT parameter against a TEXT column — `WHERE S_VC = 5`,
   `WHERE S_VC = ?` with a boolean — is refused; the engine answers it.
   And it is not "render the value as text": the engine coerces the
   **column** to a number, per row, so that predicate matches `'5'`,

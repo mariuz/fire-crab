@@ -318,14 +318,15 @@ else
     fail=1
 fi
 
-# --- what is STILL refused, deliberately, and recorded here -----------
-# A NON-TEXT parameter against a TEXT column. The engine does not render
-# the value as text - it coerces the COLUMN to a number, PER ROW:
-# `WHERE S_VC = 5` matches '5', ' 5', '5.0' and '05' alike, and RAISES
-# mid-scan if any row holds a non-numeric string. That is a comparison
-# rule, not a conversion, and fire-crab refuses the statement instead.
-# An outage, not a wrong answer - and asserted so it cannot become one
-# quietly.
+# --- a NON-TEXT parameter against a TEXT column: answered now ---------
+# The engine does not render the value as text - it coerces the COLUMN
+# to a number, PER ROW: `WHERE S_VC = 5` matches '5', ' 5', '5.0' and
+# '05' alike, and RAISES mid-scan if any row holds a non-numeric
+# string. fire-crab used to refuse these three; the per-row coercion
+# ([Term::TextNumCmp], gate qa/serve-real-textcolcmp.sh) answers them
+# with engine parity now - a JS boolean arrives as blr_long 1/0 on
+# this wire, so [true]/[false] are the numeric case, matching the '1'
+# and '0' rows here (raising only where a row cannot convert).
 cat > "$D/fc-tn-refuse.js" <<'EOF'
 const fb=require('node-firebird');
 const port=parseInt(process.argv[2],10), db=process.argv[3];
@@ -336,18 +337,21 @@ fb.attach({host:'127.0.0.1',port,database:db,user:'SYSDBA',password:'masterkey'}
  const next=()=>{
   if(i===cases.length){d.detach();return}
   const [w,p]=cases[i++];
-  d.query("SELECT ID FROM P WHERE "+w,p,(e)=>{console.log(`${w} ${JSON.stringify(p)} ${e?'REFUSED':'ANSWERED'}`);next();});
+  d.query("SELECT ID FROM P WHERE "+w+" ORDER BY ID",p,(e,r)=>{
+   console.log(`${w}\t${JSON.stringify(p)}\t${e?'ERR '+(e.message||'').split('\n')[0].slice(0,60):'['+r.map(x=>x.ID).join(',')+']'}`);next();
+  });
  };
  next();
 });
 EOF
 ran=$((ran + 1))
-r=$(timeout 120 node "$D/fc-tn-refuse.js" "$PORT" "$FC" 2>&1)
-if [ "$(printf '%s\n' "$r" | grep -c REFUSED)" = "3" ]; then
-    echo "OK   a non-text parameter against a TEXT column still refuses (per-row column coercion, unimplemented)"
+a=$(timeout 120 node "$D/fc-tn-refuse.js" "$PORT" "$FC" 2>&1)
+b=$(timeout 120 node "$D/fc-tn-refuse.js" 3050 "$RE" 2>&1)
+if [ "$a" = "$b" ] && [ "$(printf '%s\n' "$b" | grep -c .)" = "3" ]; then
+    echo "OK   non-text parameters against the TEXT column answer with engine parity (3 predicates)"
 else
-    echo "DIFF fire-crab answered a predicate whose semantics it does not implement:"
-    printf '%s\n' "$r" | sed 's/^/     /'
+    echo "DIFF non-text parameters against the TEXT column:"
+    diff <(printf '%s\n' "$a") <(printf '%s\n' "$b") | head -8 | sed 's/^/     /'
     fail=1
 fi
 
