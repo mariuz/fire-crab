@@ -13,6 +13,41 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-02 — What the second refuters found
+
+An adversarial pass over the day's two implementation increments
+refuted both; three findings fixed, one boundary priced and recorded.
+
+### Fixed
+- **Invalid ESCAPE sequences matched as literals where the engine
+  raises 22025.** The engine validates a LIKE pattern's escapes at
+  EXECUTE — the escape must precede `%`, `_` or itself, and may not
+  end the pattern — and only against a non-NULL tested value (a NULL
+  bind answers no rows on both sides, which is why the check lives in
+  the bind, not the parse). `invalid_escape` + the ParamLike bind arm.
+- **Item 33 was decided by a bare `RDB$` name-prefix**: `SEC$USERS`
+  answered PUBLIC where the engine says SYSTEM. The prefix set is now
+  RDB$/MON$/SEC$; the true discriminator is the relation's SYSTEM
+  FLAG, so a USER table quoted into an `RDB$` name still answers
+  SYSTEM here and PUBLIC there — a recorded boundary.
+- **A derived side's RENAME hid the base field name in JOINs** — the
+  residual recorded since the fname increment, now closed for free by
+  the machinery this slice added: `JoinSide` carries per-column
+  `fnames` from its inner plan, and the named-col, star and grouped-key
+  producers let the inner symbol shine through (probed:
+  `(SELECT X AS C FROM T) D` joined answers field X).
+
+### Recorded (fail-closed, its own slice)
+- **DOUBLE binds refuse where the engine answers** on every
+  param-tested shape (`? BETWEEN 1 AND 3` bound 1.5 — engine: all
+  rows; fc: refuses at execute) — and the root is pre-existing in the
+  mirrored comparison leaves (`? >= 1.5` bound 1.5 refuses too, so the
+  previous increment's "already answered every mirrored comparison"
+  overclaimed: it held for text and integer binds only). Matching the
+  engine needs its double-to-text/exact-compare rendering rules — the
+  known minefield — so the refusal stands, priced: a JS client binding
+  a fractional number gets an error, never a wrong row.
+
 ## 2026-08-02 — The describe names its sources
 
 Items 17 (relation), 18 (owner), 25 (relation_alias) and 33 (schema)

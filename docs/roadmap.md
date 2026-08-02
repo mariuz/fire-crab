@@ -53,7 +53,14 @@ four; R7 is the removal of what they replaced.
   TYPE-BLIND; NULL binds are UNKNOWN under both polarities everywhere;
   `? BETWEEN 1 AND 3` takes `'2.5'` and raises a conversion error on
   `'x'` at EXECUTE on both sides; `? NOT IN (1, NULL)` is never true.
-  `qa/serve-real-paramshapes.sh`, 83 checks. Refused deliberately, with
+  `qa/serve-real-paramshapes.sh`, 87 checks. **A DOUBLE bind refuses
+  where the engine answers** on every param-tested shape (`? BETWEEN 1
+  AND 3` bound 1.5 — engine all rows, fc refuses at execute), and the
+  root is pre-existing in the mirrored comparison leaves (`? >= 1.5`
+  bound a double refuses too — "the mirrored comparisons already
+  answered" held only for text and integer binds). Matching it needs
+  the engine's double rendering/compare rules; fail-closed until then.
+  Refused deliberately, with
   the engine's answers recorded in the gate: `? IN (?, 2)` (the engine
   types the inner `?` from the list), `? IN (1, 'a')` (per-bind
   conversion semantics), `? BETWEEN 1 AND 'x'` (conversion deferred to

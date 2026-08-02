@@ -206,6 +206,16 @@ both "COUNT over a join" "SELECT COUNT(*) AS N FROM T A JOIN T B ON A.X = B.X"
 both "a selectable procedure's output" "SELECT R FROM PR"
 both "... aliased (the alias was dropped once)" "SELECT R AS RR FROM PR"
 
+# --- 9b. what the refuters found ---------------------------------------
+# a derived side's RENAME lets the base field shine through in a JOIN
+# (this answered the rename until an adversarial pass caught it), and a
+# SEC$ system table is schema SYSTEM, not PUBLIC (the discriminator is
+# a prefix set here - a USER table quoted into an RDB$ name is a
+# recorded boundary the engine decides by system flag instead)
+both "a renamed derived column in a join keeps the base field" "SELECT D.C, U.Y FROM (SELECT X AS C FROM T) D JOIN U ON D.C = U.Y"
+both "... and grouped above it" "SELECT D.C, COUNT(*) FROM (SELECT X AS C FROM T) D JOIN U ON D.C = U.Y GROUP BY D.C"
+both "a SEC\$ table is schema SYSTEM" "SELECT SEC\$USER_NAME FROM SEC\$USERS"
+
 # --- 10. unions ---------------------------------------------------------
 # the field name is EMPTY only when some branch's item is an
 # EXPRESSION; an all-plain-column union keeps the FIRST branch's column

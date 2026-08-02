@@ -2236,9 +2236,18 @@ impl Predicate {
                             _ => None,
                         };
                         match pat {
-                            Some(p) => Term::Const(
-                                like_match(&val, &p, *escape) != *negated,
-                            ),
+                            Some(p) => {
+                                // the engine validates the pattern's
+                                // escapes HERE - at execute, and only
+                                // against a non-NULL value (probed;
+                                // see invalid_escape)
+                                if invalid_escape(&p, *escape) {
+                                    return Err("Invalid ESCAPE sequence".into());
+                                }
+                                Term::Const(
+                                    like_match(&val, &p, *escape) != *negated,
+                                )
+                            }
                             None => Term::Never,
                         }
                     }
@@ -2441,6 +2450,30 @@ impl Term {
             | Term::ExprStartingParam(..) => false,
         })
     }
+}
+
+/// The engine's ESCAPE validity rule (probed, SQLSTATE 22025): the
+/// escape character must precede `%`, `_` or ITSELF, and may not end
+/// the pattern. Raised at EXECUTE, and only when the tested value is
+/// non-NULL (a NULL bind answers no rows on both sides) - which is why
+/// the check lives in the bind, not the parse. Found by an adversarial
+/// pass: `like_match` accepts any escaped character, so an invalid
+/// pattern silently matched as literals where the engine raises.
+fn invalid_escape(pattern: &str, escape: Option<char>) -> bool {
+    let Some(esc) = escape else { return false };
+    let p: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < p.len() {
+        if p[i] == esc {
+            match p.get(i + 1) {
+                Some(&c) if c == '%' || c == '_' || c == esc => i += 2,
+                _ => return true, // trailing or mis-escaped
+            }
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 /// SQL LIKE, per CHARACTER (multi-byte text: `_` is one character, not
@@ -11221,6 +11254,12 @@ struct JoinSide {
     /// `descs`: one name for a whole table or view side, per-column for
     /// a derived or bound side (whose inner query names its own)
     rels: Vec<Option<String>>,
+    /// the FIELD NAME (describe item 16) each column carries out of a
+    /// derived/bound side - the inner item's symbol, which the engine
+    /// lets shine through a rename (probed: `(SELECT X AS C FROM T) D`
+    /// in a join answers field X). None = the resolved column name,
+    /// right for table and view sides.
+    fnames: Vec<Option<String>>,
     /// the alias binding this side into the FROM - the user's alias, a
     /// derived table's, or a CTE's name; a table's or view's OWN name
     /// is not one (probed: bare V1 in a join answers "")
@@ -11571,6 +11610,10 @@ fn plan_join_bound(
                 // the inner columns' own relations shine through; the
                 // derived table's alias (mandatory here) binds them
                 rels: inner_cols.iter().map(|c| c.relation.clone()).collect(),
+                fnames: inner_cols
+                    .iter()
+                    .map(|c| Some(c.fname.clone().unwrap_or_else(|| c.name.clone())))
+                    .collect(),
                 rel_alias: tr.alias.map(str::to_string),
                 merged_away: Vec::new(),
             });
@@ -11592,6 +11635,10 @@ fn plan_join_bound(
                 // plan_view stamped the view's name on every column;
                 // its OWN name never doubles as the binding alias
                 rels: view_cols.iter().map(|c| c.relation.clone()).collect(),
+                fnames: view_cols
+                    .iter()
+                    .map(|c| Some(c.fname.clone().unwrap_or_else(|| c.name.clone())))
+                    .collect(),
                 rel_alias: tr.alias.map(str::to_string),
                 merged_away: Vec::new(),
             });
@@ -11611,6 +11658,10 @@ fn plan_join_bound(
                     // a CTE's name IS a binding alias, unlike a view's
                     // (probed: a bare recursive CTE R answers R)
                     rels: bcols.iter().map(|c| c.relation.clone()).collect(),
+                    fnames: bcols
+                        .iter()
+                        .map(|c| Some(c.fname.clone().unwrap_or_else(|| c.name.clone())))
+                        .collect(),
                     rel_alias: Some(tr.alias.unwrap_or(tr.table).to_string()),
                     merged_away: Vec::new(),
                 });
@@ -11635,6 +11686,7 @@ fn plan_join_bound(
         // side's columns landed on top of the second's.
         let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
         let rels = vec![Some(tr.table.to_string()); descs.len()];
+        let fnames = vec![None; descs.len()];
         sides.push(JoinSide {
             key: tr.alias.unwrap_or(tr.table).to_string(),
             src: RowSource::TableScan {
@@ -11645,6 +11697,7 @@ fn plan_join_bound(
             columns,
             descs,
             offset,
+            fnames,
             rels,
             rel_alias: tr.alias.map(str::to_string),
             merged_away: Vec::new(),
@@ -11790,6 +11843,12 @@ fn plan_join_bound(
                     ) {
                         c.relation = side.rels.get(fid - side.offset).cloned().flatten();
                         c.rel_alias = side.rel_alias.clone();
+                        // the rename shines through grouped keys too
+                        if let Some(f) =
+                            side.fnames.get(fid - side.offset).cloned().flatten()
+                        {
+                            c.fname = Some(f);
+                        }
                     }
                 }
             }
@@ -11862,7 +11921,7 @@ fn plan_join_bound(
                         });
                     cols.push(ProjCol {
                         name: rc.name.clone(),
-                        fname: None,
+                        fname: side.fnames.get(rc.field_id as usize).cloned().flatten(),
                         // each starred column reads from ITS side's
                         // relation (probed: `T JOIN U` answers T,T,U,U
                         // per column, side aliases riding along)
@@ -11918,9 +11977,17 @@ fn plan_join_bound(
                     name: alias.clone().unwrap_or_else(|| colname.to_string()),
                     // the resolved base column shines through as the
                     // field name (probed: A.X AS AX is field X, alias
-                    // AX; a VIEW side is right by construction because
-                    // plan_view renames both)
-                    fname: Some(colname.to_string()),
+                    // AX) - and through a derived/bound side's RENAME
+                    // too, so the side's own fnames win over the
+                    // resolved name (probed: `(SELECT X AS C FROM T) D`
+                    // joined answers field X, found by an adversarial
+                    // pass; a VIEW side carries its renamed fnames)
+                    fname: side
+                        .fnames
+                        .get(idx - side.offset)
+                        .cloned()
+                        .flatten()
+                        .or_else(|| Some(colname.to_string())),
                     relation: side.rels.get(idx - side.offset).cloned().flatten(),
                     rel_alias: side.rel_alias.clone(),
                     field_id: idx,
@@ -16920,7 +16987,16 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor]) -> Vec<u8> {
                                 33,
                                 if v.relation.is_empty() {
                                     ""
-                                } else if v.relation.starts_with("RDB$") {
+                                } else if v.relation.starts_with("RDB$")
+                                    || v.relation.starts_with("MON$")
+                                    || v.relation.starts_with("SEC$")
+                                {
+                                    // the engine's discriminator is the
+                                    // relation's SYSTEM FLAG, not its
+                                    // name: a USER table quoted into an
+                                    // RDB$ name answers PUBLIC there and
+                                    // SYSTEM here - a recorded boundary
+                                    // (found by an adversarial pass)
                                     "SYSTEM"
                                 } else {
                                     "PUBLIC"
@@ -31460,6 +31536,7 @@ mod tests {
                 descs: vec![d(dtype::LONG), d(dtype::LONG), d(dtype::VARYING)],
                 offset: 0,
                 rels: vec![Some("EMP".into()); 3],
+                fnames: vec![None; 3],
                 rel_alias: Some("E".into()),
                 merged_away: Vec::new(),
             },
@@ -31473,6 +31550,7 @@ mod tests {
                 descs: vec![d(dtype::LONG), d(dtype::VARYING)],
                 offset: 3,
                 rels: vec![Some("DEPT".into()); 2],
+                fnames: vec![None; 2],
                 rel_alias: Some("D".into()),
                 merged_away: Vec::new(),
             },

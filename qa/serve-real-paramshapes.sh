@@ -213,6 +213,23 @@ for pair in "? BETWEEN 1 AND 3|[\"x\"]" "? IN (1, 2)|[\"0x1\"]"; do
     esac
 done
 
+# --- 8b. invalid ESCAPE sequences raise at EXECUTE on both ------------
+# (the escape must precede %, _ or itself, and may not end the pattern;
+# probed: the engine raises 22025 only against a non-NULL tested value,
+# so the NULL bind answers no rows on both sides. Found by an
+# adversarial pass - fire-crab had matched the bad escapes as literals.)
+for pair in "? LIKE 'a!bc' ESCAPE '!'|[\"abc\"]" "? LIKE 'ab!' ESCAPE '!'|[\"ab\"]" \
+            "? NOT LIKE 'a!bc' ESCAPE '!'|[\"zz\"]"; do
+    pred="${pair%%|*}"; args="${pair##*|}"
+    a=$(query "SELECT ID FROM T WHERE $pred ORDER BY ID" "$args" "$PORT" "$A")
+    b=$(query "SELECT ID FROM T WHERE $pred ORDER BY ID" "$args" "$REAL" "$B")
+    case "$a:$b" in
+        ERR*:ERR*) echo "OK   $pred $args raises on BOTH (invalid escape)" ;;
+        *) echo "DIFF $pred $args: fcwire [$a] engine [$b]"; fail=1 ;;
+    esac
+done
+both "an invalid escape with a NULL bind answers, not raises" "? LIKE 'a!bc' ESCAPE '!'" '[null]'
+
 # --- 9. refusals kept, engine answers recorded ------------------------
 # each of these the ENGINE answers (see the gate header); fire-crab
 # refuses rather than risk the engine's wilder semantics
