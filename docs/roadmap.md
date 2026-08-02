@@ -662,7 +662,25 @@ plus *the subsystem is now on the path*.
       hands the ORIGINAL text to `choose_index` and fcopt refuses
       anything containing `(SELECT`; `plan_correlated_select`
       hard-codes `index: None` on its outer Project) — hand the FOLDED
-      token text to that call.
+      token text to that call. *(done)*: the WHERE-side fold is
+      hoisted and rendered into a reconstructed statement at all four
+      choose_index sites and both DeferredAccess constructions; the
+      select-list fold's re-plan already indexed (verified, pinned);
+      plan_correlated_select's outer takes index/defer now; and
+      plan_update/plan_delete's choose_index calls — DEAD WEIGHT since
+      W1 began (fcopt: "not a SELECT") — get the same reconstruction
+      with their own "[srv] dml index:" trace. Activating the DML walk
+      exposed a LATENT MISSED-WRITE bug: dml_targets_at claimed the
+      recno BEFORE the staleness check, so a band covering a moved
+      key's old+new entries skipped the current one — the engine
+      writes the row, fc didn't. Fixed per the for_each_candidate law
+      (verify only when the walk IS the order; the current image
+      decides; recno dedup stops the double write). Follow-ups
+      recorded: param'd DML WHERE needs a defer field on the DML
+      plans; temporal/double scalar folds arrive as Tok::FnExpr
+      (unrenderable → outer scan); IN-subquery outers deliberately
+      stay NATURAL (the engine hashes there — model pins in the
+      gate).
     - the JOIN's inner side.
   - **A predicted bug that measurement did not confirm, recorded as
     such.** `ods::ddl::index_itype` maps every TEXT/VARYING column to

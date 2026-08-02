@@ -9879,6 +9879,12 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     }
     // WHERE `?` slots number after the SET list's
     let mut next_param = params.len();
+    // the WHERE rendered back to text - subqueries folded away - for
+    // the gatekeeper below: fcopt refuses the raw UPDATE outright
+    // ("not a SELECT"), so the reconstruction is the ONLY text that
+    // can ever drive a DML index. Rendered for the subquery-free
+    // stream too: the raw text never worked, folded or not.
+    let mut folded_where: Option<String> = None;
     let filter = match where_kw {
         None => None,
         // A DML WHERE may carry SUBQUERIES, exactly as a SELECT's does -
@@ -9892,11 +9898,13 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                 extract_subqueries(ws)
                     .and_then(|(rewritten, subs)| {
                         let toks = tokenize(&rewritten)?;
-                        if subs.is_empty() {
-                            Some(toks)
+                        let folded = if subs.is_empty() {
+                            toks
                         } else {
-                            resolve_subqueries(&toks, &subs, db, &columns)
-                        }
+                            resolve_subqueries(&toks, &subs, db, &columns)?
+                        };
+                        folded_where = render_toks(&folded);
+                        Some(folded)
                     })
                     .and_then(|t| parse_predicate(&t, &mut next_param))
                     .and_then(|raw| resolve_predicate(raw, &columns, descs, &mut params))?,
@@ -9927,7 +9935,25 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     let touched = |fk: &FkPartner| fk.my_fids.iter().any(|f| set_fids.contains(f));
     let fk_refs: Vec<FkPartner> = fk_refs.into_iter().filter(|fk| touched(fk)).collect();
     let fk_children: Vec<FkPartner> = fk_children.into_iter().filter(|fk| touched(fk)).collect();
-    let index = choose_index(db, rel, table, descs, &filter, sql, &[]);
+    // The DML walk's access path, keyed off the reconstructed SELECT
+    // over the same WHERE (the raw UPDATE text was refused unread -
+    // fcopt's "not a SELECT" made this call dead weight until now).
+    // The trace pair is DISTINCT from "index scan:" on purpose:
+    // serve-real-index's FC_NO_INDEX twin asserts ZERO "index scan:"
+    // lines over a log full of plain DML, and a distinct string keeps
+    // that claim and this one independently greppable. Plan::Update
+    // has no defer field, so a param'd WHERE stays a scan at prepare
+    // (the engine indexes it - an enumerated follow-up, not W1).
+    let opt_sql = folded_where.as_ref().map(|w| format!("SELECT 1 FROM {} WHERE {}", table, w));
+    let index = opt_sql
+        .as_deref()
+        .and_then(|s| choose_index(db, rel, table, descs, &filter, s, &[]));
+    if trace_on() {
+        match &index {
+            Some(p) => eprintln!("[srv] dml index: rel={} {}", rel, p.describe()),
+            None => eprintln!("[srv] dml natural: rel={}", rel),
+        }
+    }
     Some((
         Plan::Update {
             rel,
@@ -9975,6 +10001,10 @@ fn plan_delete(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
     let mut params: Vec<Option<Descriptor>> = Vec::new();
     let mut next_param = 0usize;
+    // the WHERE rendered back to text for the gatekeeper - same law as
+    // plan_update: fcopt refuses the raw DELETE, so only the
+    // reconstruction can drive the walk's index
+    let mut folded_where: Option<String> = None;
     let filter = match where_kw {
         None => None,
         // the same subquery lifting the SELECT and UPDATE paths use
@@ -9984,11 +10014,13 @@ fn plan_delete(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                 extract_subqueries(ws)
                     .and_then(|(rewritten, subs)| {
                         let toks = tokenize(&rewritten)?;
-                        if subs.is_empty() {
-                            Some(toks)
+                        let folded = if subs.is_empty() {
+                            toks
                         } else {
-                            resolve_subqueries(&toks, &subs, db, &columns)
-                        }
+                            resolve_subqueries(&toks, &subs, db, &columns)?
+                        };
+                        folded_where = render_toks(&folded);
+                        Some(folded)
                     })
                     .and_then(|t| parse_predicate(&t, &mut next_param))
                     .and_then(|raw| resolve_predicate(raw, &columns, descs, &mut params))?,
@@ -10003,7 +10035,18 @@ fn plan_delete(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     // NO ACTION FKs referencing this table: each deleted row's key must
     // be checked for child references at execute
     let (_, fk_children) = fk_partners(db, table, &columns)?;
-    let index = choose_index(db, rel, table, descs, &filter, sql, &[]);
+    // the same reconstruction and the same DISTINCT trace pair as
+    // plan_update - see the law stated there
+    let opt_sql = folded_where.as_ref().map(|w| format!("SELECT 1 FROM {} WHERE {}", table, w));
+    let index = opt_sql
+        .as_deref()
+        .and_then(|s| choose_index(db, rel, table, descs, &filter, s, &[]));
+    if trace_on() {
+        match &index {
+            Some(p) => eprintln!("[srv] dml index: rel={} {}", rel, p.describe()),
+            None => eprintln!("[srv] dml natural: rel={}", rel),
+        }
+    }
     Some((Plan::Delete { rel, formats, filter, fk_children, index }, params))
 }
 
@@ -10045,16 +10088,28 @@ fn dml_targets_at(
     // a SET, for the same reason as `records_for`'s: consulted once per
     // candidate, so a linear scan makes this quadratic
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let candidates: Vec<(&IndexPick, Vec<u8>, u64)> = access
+    // CANDIDATES, NOT ANSWERS - and the entry key decides NOTHING. A
+    // stale entry (an UPDATE leaves the old key behind) names a record
+    // whose CURRENT image the filter judges; the record-number dedup is
+    // what stops the double write when a band covers the old AND the
+    // new key of a moved row. Verifying the entry against the image
+    // here - the SELECT walk's navigation-only check - MISSED the
+    // moved row instead (measured: after `UPDATE T SET ID = 12 WHERE
+    // ID = 7`, `UPDATE ... WHERE ID BETWEEN 6 AND 13` left row 12
+    // unwritten where the engine writes it, because the stale entry
+    // claimed the record number before the current entry arrived). A
+    // DML walk never navigates, so per the law stated at
+    // [for_each_candidate]'s verify: no verification belongs here.
+    let candidates: Vec<u64> = access
         .picks
         .iter()
         .flat_map(|p| {
             p.candidates(&db.bytes, db.page_size, rel)
                 .into_iter()
-                .map(move |(k, r)| (p, k, r))
+                .map(|(_, r)| r)
         })
         .collect();
-    for (pick, entry_key, recno) in candidates {
+    for recno in candidates {
         if !seen.insert(recno) {
             continue;
         }
@@ -10086,11 +10141,6 @@ fn dml_targets_at(
             .or_else(|| formats.iter().max_by_key(|(n, _)| *n));
         let Some((_, descs)) = descs else { continue };
         let values = decode_record(&image, descs);
-        // an entry the record no longer answers to would write the same
-        // row twice (an UPDATE leaves the old entry behind)
-        if !pick.entry_is_current(&entry_key, &values) {
-            continue;
-        }
         if filter.as_ref().map_or(Ok(true), |p| p.matches(&values))? {
             out.push((dp_no, r.slot, r.format, image));
         }
@@ -15178,6 +15228,16 @@ fn plan_query_inner(
 
     // parse + resolve the optional WHERE clause
     let mut next_param = 0usize;
+    // When subqueries FOLD, the original text still spells `(SELECT`,
+    // which the optimizer gatekeeper refuses - the outer retrieval
+    // would always scan (probed: engine T INDEX (RDB$PRIMARY1) where
+    // fc scanned). So the FOLDED token stream is rendered back to text
+    // here and a reconstructed statement stands in for `sql` at every
+    // choose_index below. The text feeds ONLY the gatekeeper - the
+    // bands come from the resolved Predicate - so an unrenderable fold
+    // costs the index (None -> the original text -> a scan), never a
+    // row.
+    let mut folded_where: Option<String> = None;
     let filter = match where_s {
         None => None,
         // a WHERE may carry subqueries: lift them out of the text, then
@@ -15189,7 +15249,9 @@ fn plan_query_inner(
                 if subs.is_empty() {
                     Some(toks)
                 } else {
-                    resolve_subqueries(&toks, &subs, db, &columns)
+                    let folded = resolve_subqueries(&toks, &subs, db, &columns)?;
+                    folded_where = render_toks(&folded);
+                    Some(folded)
                 }
             })
             .and_then(|t| parse_predicate(&t, &mut next_param))
@@ -15201,6 +15263,22 @@ fn plan_query_inner(
                 return None; // unsupported WHERE: do not answer wrong
             }
         },
+    };
+    // The reconstructed gatekeeper statement. `SELECT 1` deliberately:
+    // fcopt ignores the select list (probed), and a folded string
+    // literal could itself contain " FROM ". ORDER BY rides along
+    // because navigation comes off the text (probed: engine answers
+    // `ID > (fold) ORDER BY ID` with T ORDER RDB$PRIMARY1, and fcopt
+    // answers ORDER for the reconstruction). With no fold this IS the
+    // original text and nothing changes.
+    let opt_sql: String = match &folded_where {
+        Some(w) => format!(
+            "SELECT 1 FROM {} WHERE {}{}",
+            table,
+            w,
+            order_s.map(|o| format!(" ORDER BY {}", o)).unwrap_or_default()
+        ),
+        None => sql.to_string(),
     };
 
     let items = match proj {
@@ -15238,7 +15316,7 @@ fn plan_query_inner(
                     |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
                 )?,
             };
-            let index = choose_index(db, rel, table, &descs, &filter, sql, &order_by);
+            let index = choose_index(db, rel, table, &descs, &filter, &opt_sql, &order_by);
             if trace {
                 match &index {
                     Some(p) => eprintln!("[srv] index scan: rel={} {}", rel, p.describe()),
@@ -15247,7 +15325,10 @@ fn plan_query_inner(
             }
             let defer = (index.is_none() && filter_has_params(&filter)).then(|| DeferredAccess {
                 table: table.to_string(),
-                sql: sql.to_string(),
+                // the RECONSTRUCTED text: execute-time resolve_access
+                // re-runs choose_index over it, and the original would
+                // still spell the `(SELECT` the gatekeeper refuses
+                sql: opt_sql.clone(),
             });
             return Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols: Vec::new(), index, defer });
         }
@@ -15294,7 +15375,7 @@ fn plan_query_inner(
             // declines (MIN/MAX over text or temporal, SUM/AVG over
             // scaled numerics, COUNT(DISTINCT)) fall THROUGH to the
             // group machinery, which types and computes them at fetch
-            let agg_index = choose_index(db, rel, table, &descs, &filter, sql, &[]);
+            let agg_index = choose_index(db, rel, table, &descs, &filter, &opt_sql, &[]);
             if trace {
                 match &agg_index {
                     Some(p) => eprintln!("[srv] index scan: rel={} {}", rel, p.describe()),
@@ -15501,7 +15582,7 @@ fn plan_query_inner(
         {
             return None;
         }
-        let index = choose_index(db, rel, table, &descs, &filter, sql, &order_by);
+        let index = choose_index(db, rel, table, &descs, &filter, &opt_sql, &order_by);
         if trace {
             match &index {
                 Some(p) => eprintln!("[srv] index scan: rel={} {}", rel, p.describe()),
@@ -15510,7 +15591,9 @@ fn plan_query_inner(
         }
         let defer = (index.is_none() && filter_has_params(&filter)).then(|| DeferredAccess {
             table: table.to_string(),
-            sql: sql.to_string(),
+            // the reconstructed text, for the same reason as the star
+            // branch: the deferred re-plan must not see `(SELECT`
+            sql: opt_sql.clone(),
         });
         return Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols, index, defer });
     }
@@ -15536,7 +15619,7 @@ fn plan_query_inner(
         }) => {
             // the same choice the projection makes, at the same moment:
             // a fold reads its input through a retrieval like any other
-            let index = choose_index(db, rel, table, &descs, &filter, sql, &[]);
+            let index = choose_index(db, rel, table, &descs, &filter, &opt_sql, &[]);
             if trace {
                 match &index {
                     Some(p) => eprintln!("[srv] index scan: rel={} {}", rel, p.describe()),
@@ -23308,16 +23391,23 @@ fn render_toks(toks: &[Tok]) -> Option<String> {
             Tok::Minus => "-".to_string(),
             Tok::Star => "*".to_string(),
             Tok::Slash => "/".to_string(),
-            // no faithful spelling: a `?` has no value yet, a lifted
-            // subquery's text is gone, a decided leaf and a function
-            // call have no token-level source, an aggregate is not
-            // legal in a WHERE anyway
-            Tok::Param
-            | Tok::Subq(_)
-            | Tok::Exists
-            | Tok::Const(_)
-            | Tok::FnExpr(_)
-            | Tok::Agg(..) => return None,
+            // a `?` passes through verbatim: fcopt accepts a parameter
+            // marker (probed: `ID = 100 AND V = ?` answers INDEX
+            // (RDB$PRIMARY1, T_V)), and the band for it is built at
+            // EXECUTE from the bound Predicate, never from this text
+            Tok::Param => "?".to_string(),
+            // a DECIDED conjunct (a folded uncorrelated EXISTS) has no
+            // token-level source; its gatekeeper-only spelling is an
+            // always/never-true comparison (probed: fcopt answers
+            // `0 = 0 AND ID = 5` INDEX - a non-column conjunct is a
+            // non-matchable no-op - and inside an OR the branch turns
+            // non-matchable -> NATURAL, matching both the band
+            // builder's own refusal and the engine's hash choice)
+            Tok::Const(b) => if *b { "0 = 0" } else { "0 = 1" }.to_string(),
+            // no faithful spelling: a lifted subquery's text is gone, a
+            // function call has no token-level source, an aggregate is
+            // not legal in a WHERE anyway
+            Tok::Subq(_) | Tok::Exists | Tok::FnExpr(_) | Tok::Agg(..) => return None,
         });
     }
     Some(parts.join(" "))
@@ -23396,18 +23486,23 @@ fn plan_correlated_select(
     }
     let unq = |t: &str| unqualify_single(t, &allowed).unwrap_or_else(|| t.to_string());
 
-    // the outer WHERE, resolved the ordinary way
+    // the outer WHERE, resolved the ordinary way; its unqualified text
+    // is kept alongside - it seeds the gatekeeper statement the OUTER
+    // access path is chosen from below
     let mut np = 0usize;
+    let mut ws_unq: Option<String> = None;
     let filter = match where_s {
         None => None,
         Some(ws) => {
             let ws = unq(ws);
-            Some(resolve_predicate(
+            let f = resolve_predicate(
                 tokenize(&ws).and_then(|t| parse_predicate(&t, &mut np))?,
                 &columns,
                 &descs,
                 params,
-            )?)
+            )?;
+            ws_unq = Some(ws);
+            Some(f)
         }
     };
 
@@ -23484,7 +23579,41 @@ fn plan_correlated_select(
             |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
         )?,
     };
-    Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols: Vec::new(), index: None, defer: None })
+    // The OUTER retrieval's access path, chosen the way every other
+    // single-relation retrieval chooses one. Gated on a WHERE existing
+    // because the engine answers the NO-WHERE ordered correlated
+    // select with `PLAN SORT (T NATURAL)`, not navigation (probed) -
+    // so with no WHERE fc must not navigate either. WITH one the
+    // engine navigates (`ID > 3 ORDER BY ID` -> T ORDER RDB$PRIMARY1),
+    // which passing `&order_by` reproduces. The outer WHERE here can
+    // never hold a subquery - only the select list was extracted, and
+    // a `(SELECT` in it already refused at the predicate parse above.
+    let opt_sql = ws_unq.as_ref().map(|w| {
+        format!(
+            "SELECT 1 FROM {} WHERE {}{}",
+            table,
+            w,
+            order_s.map(|o| format!(" ORDER BY {}", unq(o))).unwrap_or_default()
+        )
+    });
+    let index = opt_sql
+        .as_deref()
+        .and_then(|s| choose_index(db, rel, table, &descs, &filter, s, &order_by));
+    if trace {
+        match &index {
+            Some(p) => eprintln!("[srv] index scan: rel={} {}", rel, p.describe()),
+            None => eprintln!("[srv] natural scan: rel={}", rel),
+        }
+    }
+    // a param'd outer WHERE with no band yet builds one at EXECUTE -
+    // Plan::Project's execute arm binds, resolves the deferred access
+    // and re-verifies every candidate, so candidates-not-answers (and
+    // the "(deferred)" trace) is inherited with no new code here
+    let defer = (index.is_none() && filter_has_params(&filter)).then(|| DeferredAccess {
+        table: table.to_string(),
+        sql: opt_sql.clone().unwrap_or_default(),
+    });
+    Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols: Vec::new(), index, defer })
 }
 
 /// The (field name, alias) a subquery's own select item gives its
@@ -33414,19 +33543,37 @@ mod tests {
         assert_eq!(rt("S LIKE 'a%' ESCAPE '!'"), "S LIKE 'a%' ESCAPE '!'");
         assert_eq!(rt("A + 1 > B * 2 - C / 3"), "A + 1 > B * 2 - C / 3");
         assert_eq!(rt("( K = 1 OR K = 2 )"), "( K = 1 OR K = 2 )");
+        // a `?` renders verbatim - the gatekeeper accepts a marker and
+        // the band for it is built at EXECUTE, never from this text
+        assert_eq!(rt("K = ?"), "K = ?");
+        assert_eq!(rt("K = 5 AND V = ?"), "K = 5 AND V = ?");
+        // a decided conjunct spells as an always/never-true comparison
+        // whose text form is itself a fixed point
+        assert_eq!(render_toks(&[Tok::Const(true)]).unwrap(), "0 = 0");
+        assert_eq!(render_toks(&[Tok::Const(false)]).unwrap(), "0 = 1");
+        assert_eq!(rt("0 = 0 AND K = 5"), "0 = 0 AND K = 5");
+        assert_eq!(
+            render_toks(&[
+                Tok::Const(true),
+                Tok::And,
+                Tok::Ident("K".to_string()),
+                Tok::Cmp(Cmp::Eq),
+                Tok::Int(5)
+            ])
+            .unwrap(),
+            "0 = 0 AND K = 5"
+        );
     }
 
     #[test]
     fn render_toks_refuses_unrenderable_kinds() {
         // None, never a guess: an unrenderable WHERE costs the index
         // (the caller scans), so every refusal here is a safe answer
-        assert!(render_toks(&tokenize("K = ?").unwrap()).is_none()); // Param
         assert!(render_toks(&tokenize("UPPER(S) = 'X'").unwrap()).is_none()); // FnExpr
         assert!(render_toks(&tokenize("V > 1e3").unwrap()).is_none()); // Double -> FnExpr
         assert!(render_toks(&tokenize("COUNT(*) > 1").unwrap()).is_none()); // Agg
         assert!(render_toks(&[Tok::Subq(0)]).is_none());
         assert!(render_toks(&[Tok::Exists, Tok::Subq(0)]).is_none());
-        assert!(render_toks(&[Tok::Const(true)]).is_none());
         // a non-negative Dec scale has no literal spelling; the
         // tokenizer never builds one, and rendering one must refuse
         // rather than misprint it
@@ -33437,7 +33584,7 @@ mod tests {
         ])
         .is_none());
         // ... and the refusal poisons the WHOLE stream, not one leaf
-        assert!(render_toks(&tokenize("K = 5 AND V = ?").unwrap()).is_none());
+        assert!(render_toks(&tokenize("K = 5 AND UPPER(S) = 'X'").unwrap()).is_none());
     }
 
     #[test]

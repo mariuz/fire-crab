@@ -17,6 +17,13 @@
 # while tracing NO "subq index:" line at all, so the assertions above
 # are ones that can fail.
 #
+# Section 8 asserts the OUTER side of the same statements: after the
+# fold the outer retrieval indexes through a RECONSTRUCTED gatekeeper
+# text ("index scan:"/"natural scan:"), DML target walks through their
+# own pair ("dml index:"/"dml natural:"), and parameters beside a fold
+# defer their band to EXECUTE (node drives those; the engine answers
+# through its inet listener on FC_REAL_PORT, default 3050).
+#
 #   qa/serve-real-subqindex.sh [port]     (the twin runs on port+1)
 #
 # Builds two identical scratch databases; both are chmod 666 so either
@@ -126,6 +133,69 @@ subq_natural() { # <label> <sql> - answers alike AND the inner walk scanned
         echo "OK   ... and the subquery scanned, as the engine does"
     else
         echo "DIFF $1: expected a natural inner scan (index $bi->$ai, natural $bn->$an)"
+        fail=1
+    fi
+}
+# The OUTER retrieval's strings are the ordinary projection pair -
+# "index scan:"/"natural scan:" - because after the fold the outer IS
+# an ordinary retrieval through the same Plan machinery. Safe against
+# cross-gate bleed: every gate's log is its own per-port file, and the
+# only other gates that grep these strings run no subquery statements.
+# Note "subq index: rel=" does NOT contain "index scan: rel=" - the
+# four counters below never see each other's lines.
+outer_indexed() { # <label> <sql> - answers alike AND the OUTER walk drove an index
+    before=$(count_line "index scan: rel=")
+    same "$1" "$2"
+    after=$(count_line "index scan: rel=")
+    ran=$((ran + 1))
+    if [ "$after" -gt "$before" ]; then
+        echo "OK   ... and the OUTER retrieval drove an INDEX"
+    else
+        echo "DIFF $1: the outer retrieval did NOT drive an index"
+        fail=1
+    fi
+}
+outer_natural() { # <label> <sql> - answers alike AND the outer scanned
+    bi=$(count_line "index scan: rel=")
+    bn=$(count_line "natural scan: rel=")
+    same "$1" "$2"
+    ai=$(count_line "index scan: rel=")
+    an=$(count_line "natural scan: rel=")
+    ran=$((ran + 1))
+    if [ "$ai" -eq "$bi" ] && [ "$an" -gt "$bn" ]; then
+        echo "OK   ... and the outer scanned, matching the engine's plan"
+    else
+        echo "DIFF $1: expected a natural outer scan (index $bi->$ai, natural $bn->$an)"
+        fail=1
+    fi
+}
+# The DML walk's pair is DISTINCT - "dml index:"/"dml natural:" - so
+# serve-real-index's zero-"index scan:" claim over its FC_NO_INDEX twin
+# (a log full of plain DML) and this gate's DML coverage stay
+# independently greppable.
+dml_indexed() { # <label> <sql> - alike AND the DML target walk drove an index
+    before=$(count_line "dml index: rel=")
+    same "$1" "$2"
+    after=$(count_line "dml index: rel=")
+    ran=$((ran + 1))
+    if [ "$after" -gt "$before" ]; then
+        echo "OK   ... and the DML walk drove an INDEX"
+    else
+        echo "DIFF $1: the DML walk did NOT drive an index"
+        fail=1
+    fi
+}
+dml_natural() { # <label> <sql> - alike AND the DML target walk scanned
+    bi=$(count_line "dml index: rel=")
+    bn=$(count_line "dml natural: rel=")
+    same "$1" "$2"
+    ai=$(count_line "dml index: rel=")
+    an=$(count_line "dml natural: rel=")
+    ran=$((ran + 1))
+    if [ "$ai" -eq "$bi" ] && [ "$an" -gt "$bn" ]; then
+        echo "OK   ... and the DML walk scanned, as it must"
+    else
+        echo "DIFF $1: expected a natural DML walk (index $bi->$ai, natural $bn->$an)"
         fail=1
     fi
 }
@@ -266,6 +336,209 @@ same3 "select-list correlated COUNT with an indexed residual" \
     "SELECT ID, (SELECT COUNT(*) FROM BIG X WHERE X.K = T.ID AND X.V = 5) FROM T ORDER BY ID"
 same3 "a band covering the old and the new key" \
     "SELECT ID FROM T WHERE ID = (SELECT V FROM U WHERE K BETWEEN 65 AND 79)"
+
+# --- 8. THE OUTER QUERY'S OWN INDEX OVER FOLDED SUBQUERIES --------------
+# The fold rewrites the WHERE's TOKENS, but every choose_index call used
+# to receive the ORIGINAL text, whose `(SELECT` the optimizer gatekeeper
+# refuses - so the outer always scanned where the engine indexes
+# (probed: `ID = (SELECT MAX(K) FROM U)` is T INDEX (RDB$PRIMARY1)).
+# Now the folded stream is rendered back into a reconstructed statement
+# and the outer retrieval chooses like any other.
+#
+# First the fixture speaks its spec'd keys again: section 6 moved U's
+# key 70 to 75. The move BACK is itself the first DML ever to drive an
+# index here (fcopt refuses a raw UPDATE - "not a SELECT" - so both DML
+# choose_index calls were dead weight until the reconstruction), and
+# its band K = 75 already covers a current-and-stale entry pair of the
+# same record, putting the record-number dedup on the path at once.
+dml_indexed "the key moves back (the FIRST DML ever to drive an index)" \
+    "UPDATE U SET K = 70 WHERE K = 75"
+
+# 8a. WHERE-side scalar folds: mid-band, both band EDGES, and a band
+# past the top key (zero rows both ways - an empty band, not an error)
+outer_indexed "outer = scalar fold, mid-band" \
+    "SELECT ID FROM T WHERE ID = (SELECT V FROM U WHERE K = 70)"
+outer_indexed "outer = scalar fold at the BOTTOM key" \
+    "SELECT ID FROM T WHERE ID = (SELECT MIN(V) FROM U)"
+outer_indexed "outer = scalar fold at the TOP key" \
+    "SELECT ID FROM T WHERE ID = (SELECT MAX(V) FROM U)"
+outer_indexed "outer = scalar fold PAST the top key (empty band)" \
+    "SELECT ID FROM T WHERE ID = (SELECT MAX(K) FROM U)"
+# navigation comes off the reconstructed text too (engine: T ORDER
+# RDB$PRIMARY1 for a folded range under ORDER BY)
+outer_indexed "outer range fold under ORDER BY (navigation)" \
+    "SELECT ID FROM T WHERE ID > (SELECT MAX(V) FROM U WHERE K < 40) ORDER BY ID"
+outer_indexed "an OR of two folds (two bands of one index)" \
+    "SELECT ID FROM T WHERE ID = (SELECT MIN(V) FROM U) OR ID = (SELECT MAX(V) FROM U)"
+
+# 8b. the shapes the ENGINE does not index: IN/NOT IN fold to an
+# IN-list whose parens fcopt refuses, and the engine HASHES these
+# (probed: PLAN HASH (T NATURAL, U NATURAL) / T NATURAL) - so the scan
+# is the CORRECT plan, and this pins it against anyone teaching fcopt
+# IN-lists later, which would index where the engine hashes.
+outer_natural "IN (subquery) stays a hash-shaped scan" \
+    "SELECT ID FROM T WHERE ID IN (SELECT V FROM U)"
+outer_natural "NOT IN (subquery) stays a scan" \
+    "SELECT ID FROM T WHERE ID NOT IN (SELECT V FROM U)"
+
+# 8c. folded EXISTS. An uncorrelated EXISTS folds to a DECIDED conjunct,
+# rendered as its truth's no-op comparison - beside an indexable
+# conjunct the index survives (engine: T INDEX (RDB$PRIMARY1)). In an
+# OR the decided branch is non-matchable and the band builder refuses -
+# a scan, which is also the engine's own choice for the OR. The
+# CORRELATED EXISTS rewrite is an IN-list - paren-bound, so the outer
+# scans where the engine indexes: rows equal, the scan is the fold's
+# price until fcopt learns IN-lists (divergence PINNED, not hidden).
+outer_indexed "folded EXISTS beside an indexable conjunct" \
+    "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM U WHERE K = 70) AND ID = 5"
+outer_natural "folded EXISTS in an OR scans" \
+    "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM U WHERE K = 70) OR ID = 5"
+outer_natural "correlated EXISTS beside an equality scans (engine indexes; rows equal - the fold's price)" \
+    "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM BIG X WHERE X.K = T.ID AND X.V = 5) AND ID = 5"
+
+# 8d. select-list folds. The uncorrelated fold re-plans through the
+# rewritten text and already indexed its outer when the WHERE was clean
+# (regression-pinned here); a WHERE-side fold beside it lands on the
+# reconstruction; the CORRELATED select-list outer used to hard-code
+# index: None. The no-WHERE ordered correlated select must NOT navigate:
+# the engine answers it PLAN SORT (T NATURAL) - probed.
+outer_indexed "uncorrelated select-list fold + literal WHERE (the pinned win)" \
+    "SELECT ID, (SELECT COUNT(*) FROM U) FROM T WHERE ID = 5"
+outer_indexed "select-list fold + WHERE-side fold together" \
+    "SELECT ID, (SELECT COUNT(*) FROM U) FROM T WHERE ID = (SELECT MAX(V) FROM U)"
+outer_indexed "correlated select-list + literal WHERE" \
+    "SELECT ID, (SELECT COUNT(*) FROM BIG X WHERE X.K = T.ID AND X.V = 5) FROM T WHERE ID = 5"
+outer_natural "correlated select-list, ORDER BY, no WHERE (engine: SORT NATURAL)" \
+    "SELECT ID, (SELECT COUNT(*) FROM BIG X WHERE X.K = T.ID) FROM T ORDER BY ID"
+
+# 8e. parameters beside a fold - isql cannot bind, so node drives both
+# servers (the engine through its inet listener). The deferred text is
+# the RECONSTRUCTION: at execute the re-plan must not see `(SELECT`.
+REAL="${FC_REAL_PORT:-3050}"
+if command -v node >/dev/null 2>&1; then
+    pquery() { # <sql> <port> <db> <json-args>
+        n=0
+        while [ $n -lt 6 ]; do
+            r=$(timeout 25 env FC_Q="$1" FC_PORT="$2" FC_DB="$3" FC_ARGS="$4" node -e '
+              process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(0); });
+              const F=require("node-firebird");
+              F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
+                        user:"SYSDBA",password:"masterkey",encoding:"NONE"},(e,db)=>{
+                if(e){console.log("CONN_ERR");process.exit(0);}
+                db.query(process.env.FC_Q,JSON.parse(process.env.FC_ARGS),(e2,r)=>{
+                  if(e2){console.log("ERR "+(e2.message||"").split("\n")[0].slice(0,50));db.detach();process.exit(0);}
+                  console.log(JSON.stringify(Array.isArray(r)?r:(r?[r]:[])));
+                  db.detach();process.exit(0);});});' 2>/dev/null)
+            case "$r" in
+                CONN_ERR|"") n=$((n + 1)); sleep 0.3 ;;
+                *) printf '%s' "$r"; return ;;
+            esac
+        done
+        printf 'CONN_ERR'
+    }
+    pfold() { # <label> <sql> <json-args> <coverage: index|deferred|rows-only>
+        ran=$((ran + 1))
+        bidx=$(count_line "index scan: rel=")
+        bdef=$(count_line "(deferred)")
+        a=$(pquery "$2" "$PORT" "$A" "$3")
+        b=$(pquery "$2" "$REAL" "$B" "$3")
+        if [ "$a" = "$b" ]; then
+            echo "OK   $1: $a"
+        else
+            echo "DIFF $1"; echo "     fcwire: $a"; echo "     engine: $b"; fail=1
+        fi
+        aidx=$(count_line "index scan: rel=")
+        adef=$(count_line "(deferred)")
+        case "$4" in
+        index)
+            ran=$((ran + 1))
+            if [ "$aidx" -gt "$bidx" ]; then
+                echo "OK   ... and an index line appeared (prepare-time band beside the ?)"
+            else
+                echo "DIFF $1: no outer index line"; fail=1
+            fi ;;
+        deferred)
+            ran=$((ran + 1))
+            if [ "$adef" -gt "$bdef" ]; then
+                echo "OK   ... and its band was built at EXECUTE over the reconstruction"
+            else
+                echo "DIFF $1: no (deferred) line - the reconstructed text did not reach resolve_access"
+                fail=1
+            fi ;;
+        esac
+    }
+    # the fold names the band, the ? narrows further: the band exists at
+    # PREPARE and the bound conjunct is re-checked per candidate
+    pfold "a fold beside a ? (band at prepare, candidates re-checked)" \
+        "SELECT ID FROM T WHERE ID = (SELECT V FROM U WHERE K = 70) AND NAME = ?" '["n7"]' index
+    # only the ? could bound: no band at prepare, DeferredAccess carries
+    # the reconstructed text, the band arrives at EXECUTE
+    pfold "a ? beside a decided fold (band at EXECUTE)" \
+        "SELECT ID FROM T WHERE ID = ? AND 5 = (SELECT V FROM U WHERE K = 50)" "[7]" deferred
+    pfold "... and NULL bound matches nothing, like the engine" \
+        "SELECT ID FROM T WHERE ID = ? AND 5 = (SELECT V FROM U WHERE K = 50)" "[null]" rows-only
+else
+    echo "DIFF node not found - the parameter checks cannot run"
+    fail=1
+fi
+
+# 8f. DML through the reconstruction - the walk that was never reachable
+# before. The moved-key cases exercise dml_targets_at's stale-entry law:
+# an index entry outlives the version that wrote it, so a band can name
+# one record through its OLD and its NEW key - the record-number dedup
+# writes it ONCE, and the CURRENT image (not the entry key) decides the
+# filter, or a moved row is silently skipped (measured: verifying the
+# entry against the image dropped row 12 from `ID BETWEEN 6 AND 13`
+# where the engine writes it).
+dml_indexed "UPDATE through a scalar fold" \
+    "UPDATE T SET NAME = 'z' WHERE ID = (SELECT V FROM U WHERE K = 70)"
+same "... and the row it wrote" "SELECT ID, NAME FROM T ORDER BY ID"
+dml_indexed "DELETE through an empty band deletes nothing" \
+    "DELETE FROM T WHERE ID = (SELECT MAX(K) FROM U)"
+dml_natural "an unindexed DML WHERE scans" \
+    "UPDATE T SET NAME = 'n1' WHERE NAME = 'n1'"
+# move U's key: the subquery's walk then sees stale+current entries
+dml_indexed "the key moves forward again" \
+    "UPDATE U SET K = 75 WHERE K = 70"
+dml_indexed "UPDATE through a band over the moved key (subq dedups, DML indexes)" \
+    "UPDATE T SET NAME = 'y' WHERE ID = (SELECT V FROM U WHERE K BETWEEN 65 AND 79)"
+# move T's OWN key: the DML target index now holds a stale entry at 7
+# and a current one at 12 for the SAME record
+dml_indexed "a plain DML equality drives the index too" \
+    "UPDATE T SET ID = 12 WHERE ID = 7"
+dml_indexed "a band covering the OLD and NEW key writes the moved row ONCE" \
+    "UPDATE T SET NAME = 'q' WHERE ID BETWEEN 6 AND 13"
+dml_indexed "DELETE aimed at the STALE key deletes nothing (the image decides)" \
+    "DELETE FROM T WHERE ID = 7"
+same "the whole table after the DML section" \
+    "SELECT ID, NAME FROM T ORDER BY ID"
+
+# 8g. the twin re-answers the outer-index statements (state has moved
+# on: T's 7 is now 12, U's key is at 75)
+same3 "outer scalar fold at the bottom key" \
+    "SELECT ID FROM T WHERE ID = (SELECT MIN(V) FROM U)"
+same3 "outer scalar fold through the moved key (empty: its T row moved too)" \
+    "SELECT ID FROM T WHERE ID = (SELECT V FROM U WHERE K = 75)"
+same3 "outer range fold under ORDER BY" \
+    "SELECT ID FROM T WHERE ID > (SELECT MAX(V) FROM U WHERE K < 40) ORDER BY ID"
+same3 "an OR of two folds" \
+    "SELECT ID FROM T WHERE ID = (SELECT MIN(V) FROM U) OR ID = (SELECT MAX(V) FROM U)"
+same3 "IN (subquery) over the moved state" \
+    "SELECT ID FROM T WHERE ID IN (SELECT V FROM U)"
+same3 "folded EXISTS beside an indexable conjunct" \
+    "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM U WHERE K = 75) AND ID = 5"
+same3 "uncorrelated select-list fold + literal WHERE" \
+    "SELECT ID, (SELECT COUNT(*) FROM U) FROM T WHERE ID = 5"
+same3 "correlated select-list + literal WHERE" \
+    "SELECT ID, (SELECT COUNT(*) FROM BIG X WHERE X.K = T.ID AND X.V = 5) FROM T WHERE ID = 5"
+# a DML all three ways: fc applies it twice to A (idempotent by
+# construction), the engine once to B - the STATE check right after is
+# what the equality means
+same3 "a DML through the twin (idempotent, so the double apply is safe)" \
+    "UPDATE T SET NAME = 'w' WHERE ID = (SELECT MIN(V) FROM U)"
+same3 "the whole table, all three ways" \
+    "SELECT ID, NAME FROM T ORDER BY ID"
+
 # the switch really did switch it off - and the twin still traced its
 # scans, so the zero below is "no index", not "no trace"
 ran=$((ran + 1))
@@ -282,10 +555,42 @@ else
     echo "DIFF the scan-only server traced nothing - its zero above is blindness, not proof"
     fail=1
 fi
+# the OUTER and DML claims get the same teeth: the twin answered the
+# section-8 statements identically while driving NO outer index and NO
+# DML index anywhere in its whole log - while still tracing its scans,
+# so each zero is "no index", not "no trace"
+ran=$((ran + 1))
+if [ "$(grep -c 'index scan:' "$LOG2" 2>/dev/null || true)" -eq 0 ]; then
+    echo "OK   the scan-only server drove NO outer index either"
+else
+    echo "DIFF FC_NO_INDEX did not disable the outer index path"
+    fail=1
+fi
+ran=$((ran + 1))
+if [ "$(grep -c 'dml index:' "$LOG2" 2>/dev/null || true)" -eq 0 ]; then
+    echo "OK   ... and NO DML index"
+else
+    echo "DIFF FC_NO_INDEX did not disable the DML index path"
+    fail=1
+fi
+ran=$((ran + 1))
+if [ "$(grep -c 'natural scan:' "$LOG2" 2>/dev/null || true)" -gt 0 ]; then
+    echo "OK   ... while still tracing its natural outer scans"
+else
+    echo "DIFF the scan-only server traced no outer scans - the zeros above are blindness"
+    fail=1
+fi
+ran=$((ran + 1))
+if [ "$(grep -c 'dml natural:' "$LOG2" 2>/dev/null || true)" -gt 0 ]; then
+    echo "OK   ... and its natural DML walks"
+else
+    echo "DIFF the scan-only server traced no DML walks - the DML zero above is blindness"
+    fail=1
+fi
 
 rm -f "$A" "$B"
-if [ "$ran" -lt 54 ]; then
-    echo "DIFF only $ran checks ran (expected at least 54) - did one silently skip?"
+if [ "$ran" -lt 122 ]; then
+    echo "DIFF only $ran checks ran (expected at least 122) - did one silently skip?"
     fail=1
 fi
 exit $fail
