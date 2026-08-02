@@ -1996,6 +1996,22 @@ enum Term {
     /// [numeric_parts] and align scales in i128 ([num_cmp]), the
     /// engine's dialect-3 exact compare
     NumCmp(usize, Cmp, Rhs),
+    /// A text LITERAL against an exact-numeric column that the grammar
+    /// refuses (`N = 'x'`): the engine's 22018 is PER ROW and
+    /// VALUE-GATED (probed: an empty table, a row whose column is NULL
+    /// and a dead `AND 1=0` group all answer with no raise; any
+    /// non-NULL value raises, even under NOT or beside `OR ID=1`).
+    /// Carries the ORIGINAL untrimmed literal - the engine's
+    /// status-vector argument. Row-DEPENDENT under
+    /// [term_row_independent]'s default, which is exactly what hands
+    /// dead-group suppression, empty-table silence and the NULL gate to
+    /// the invariant/conjunct machinery with no extra logic; UPDATE and
+    /// DELETE inherit atomicity because [collect_dml_targets] collects
+    /// fully before any write. Never keyed by [pick_for_terms], so it
+    /// scans and raises at the first non-NULL row - the one priced
+    /// residual: an INDEXED empty table, where the engine raises at
+    /// open and fc answers [].
+    CmpConvErr(usize, String),
     IsNull(usize),
     IsNotNull(usize),
     /// `<col> [NOT] LIKE <pattern> [ESCAPE <c>]`: pattern is a string
@@ -2739,6 +2755,15 @@ impl Term {
             // before evaluating; this is the defensive answer)
             Term::Cmp(_, _, Rhs::Param(..)) => None,
             Term::Cmp(_, _, Rhs::Num(..)) => None, // Num travels in NumCmp
+            // the value gate: NULL (or a missing slot) is UNKNOWN with
+            // no raise; ANY value raises the engine's conversion error,
+            // its argument the original literal (probed: `ID=5 AND
+            // N='x'` answers [] over the NULL-N row; `N='x' OR ID=1`
+            // raises)
+            Term::CmpConvErr(fid, s) => match values.get(*fid) {
+                None | Some(Value::Null) => None,
+                Some(_) => return Err(EvalErr::ConversionError(Some(s.clone()))),
+            },
             // exact numeric compare, any exact shape on either side;
             // NULL or a non-numeric value is UNKNOWN
             Term::NumCmp(fid, op, Rhs::Num(r, s)) => {
@@ -12220,12 +12245,22 @@ fn resolve_join_predicate(
                 // whole query, which is how a NUMERIC salary in the
                 // scratch fixture hid a working join.
                 None => {
+                    // the view carries the QUALIFIED spelling too, and
+                    // it is the one that resolves when both sides have
+                    // a column of that name (a self-join's `A.N92` -
+                    // the bare `N92` was dropped as ambiguous); the
+                    // bare form is the fallback, same order as the
+                    // expression branch above
                     let bare = col.rsplit('.').next().unwrap_or(col);
-                    if !comb_cols.iter().any(|c| c.name.eq_ignore_ascii_case(bare)) {
+                    let name = if comb_cols.iter().any(|c| c.name.eq_ignore_ascii_case(col)) {
+                        col.as_str()
+                    } else if comb_cols.iter().any(|c| c.name.eq_ignore_ascii_case(bare)) {
+                        bare
+                    } else {
                         return None; // ambiguous, or not in the view
-                    }
+                    };
                     let rt2 = RawTerm {
-                        lhs: RawLhs::Col(bare.to_string()),
+                        lhs: RawLhs::Col(name.to_string()),
                         kind: rt.kind,
                     };
                     terms.push(resolve_expr_term(&rt2, &comb_cols, &comb_descs, params)?);
@@ -21284,6 +21319,88 @@ fn text_number(s: &str) -> Option<TextNum> {
     })
 }
 
+/// A text LITERAL against an exact-numeric side, classified at prepare.
+/// Distinct from the PARAMETER path ([Predicate::bind]'s `bind_rhs`): a
+/// bound text value converts with the strict grammar and raises AT
+/// EXECUTE even over an empty table (probed: `N = ?` with 'x'), while a
+/// literal's conversion error is PER ROW and VALUE-GATED - so a literal
+/// that does not convert must travel to the scan as a raiser
+/// ([Term::CmpConvErr]), never raise at prepare.
+enum LitNum {
+    /// converts: an ordinary exact-numeric right-hand side
+    Rhs(Rhs),
+    /// the engine's per-row 22018, carrying the ORIGINAL untrimmed
+    /// literal - the engine's own status-vector argument
+    Raise(String),
+    /// a spelling whose engine answer this server will not reproduce:
+    /// the statement refuses at prepare rather than guess
+    Refuse,
+}
+
+/// Classify a text literal compared against an exact-numeric column or
+/// expression.
+///
+/// ONE grammar ([text_number]) everywhere in fc - deliberately NARROWER
+/// than the engine's compare-side grammar (jrd/cvt.cpp CVT_get_numeric),
+/// which SKIPS interior spaces: unindexed `N = '1 0'` answers the N=10
+/// row, but the same statement over an INDEXED column raises 22018 (the
+/// key is built with the strict store grammar, probed both ways). fc
+/// raises per row for those spellings, siding with the indexed engine.
+///
+/// - `Raise`: whatever `text_number` refuses ('x', '', ' ', '.', '--2',
+///   '2,', '2.5.5', '2e', 'e2', and the interior-space forms) - the
+///   engine's 22018 *conversion error from string "<original>"*.
+/// - Hex => `Refuse`: the engine's answer is op-, arity- and
+///   index-dependent (probed: unindexed `N = '0XA'` is false for every
+///   row yet `N < '0XA'` is true for every non-NULL row - a
+///   NaN-that-sorts-high - while `N IN ('0XA','2')` converts the same
+///   string to 10 and an indexed `N = '0XA'` raises). Never guess.
+/// - E-notation with a mantissa past 2^53 => `Refuse`: the engine runs
+///   the literal through DOUBLE (probed: `NBIG = '9223372036854775806e0'`
+///   answers [] though the row exists - the double rounds to ...808 -
+///   yet the 20-digit '92233720368547758070e-1' matches row ...807
+///   EXACTLY via the int128 overflow path). Inside the window the
+///   double is exact and the exact compare answers identically.
+/// - A mantissa past i64, or an exponent past i8 after folding, =>
+///   `Refuse`: `Rhs::Num` cannot carry it (covers
+///   '9223372036854775806.5', whose compare the engine does exactly).
+///
+/// A convertible literal against an INTEGER column with scale 0 becomes
+/// `Rhs::Int` - the keyable shape [pick_for_terms] turns into an index
+/// band, exactly as the engine keys `N = '2'` (PLANONLY probed).
+fn literal_num_rhs(s: &str, int_col: bool) -> LitNum {
+    let Some(n) = text_number(s) else {
+        return LitNum::Raise(s.to_string());
+    };
+    let TextNum::Dec { mantissa, exp } = n else {
+        return LitNum::Refuse; // hex
+    };
+    if s.contains(['e', 'E']) && mantissa.unsigned_abs() > 1 << 53 {
+        return LitNum::Refuse; // the double-rounding window
+    }
+    // fold a positive exponent into the mantissa: Rhs::Num carries
+    // (raw, scale) with scale <= 0, the storage convention
+    let (mantissa, exp) = if exp > 0 {
+        match 10i128
+            .checked_pow(exp as u32)
+            .and_then(|p| mantissa.checked_mul(p))
+        {
+            Some(m) => (m, 0),
+            None => return LitNum::Refuse,
+        }
+    } else {
+        (mantissa, exp)
+    };
+    let (Ok(m), Ok(sc)) = (i64::try_from(mantissa), i8::try_from(exp)) else {
+        return LitNum::Refuse;
+    };
+    if sc == 0 && int_col {
+        LitNum::Rhs(Rhs::Int(m))
+    } else {
+        LitNum::Rhs(Rhs::Num(m, sc))
+    }
+}
+
 /// A text parameter into an EXACT numeric column: the stored value, or
 /// `None` for the engine's refusal.
 ///
@@ -27110,6 +27227,18 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
         },
         RawKind::Cmp(op, Rhs::Str(v)) => match kind {
             ColKind::Text => Term::Cmp(idx, op, Rhs::Str(v)),
+            // a text LITERAL against an INTEGER column converts at
+            // prepare with the one strict grammar (probed: `N = '2'`,
+            // `' 2 '`, `'2.'`, `'2e0'` answer the same rows as their
+            // numeric spellings; `N > '1.5'` keeps the fraction). One
+            // that does not convert raises PER ROW, value-gated
+            // ([Term::CmpConvErr]); hex and the double-window refuse.
+            ColKind::Int => match literal_num_rhs(&v, true) {
+                LitNum::Rhs(Rhs::Int(n)) => Term::Cmp(idx, op, Rhs::Int(n)),
+                LitNum::Rhs(rhs) => Term::NumCmp(idx, op, rhs),
+                LitNum::Raise(s) => Term::CmpConvErr(idx, s),
+                LitNum::Refuse => return None,
+            },
             _ => return None,
         },
         // comparison against a NULL literal: legal SQL, UNKNOWN per row
@@ -27557,7 +27686,49 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
             Some((l, rhs))
         }
         (ExprType::Bool, _) | (_, ExprType::Bool) => None,
+        // an exact-NUMERIC side against a text LITERAL: the engine
+        // converts the string (probed: `N + 0 > '9'` answers the 10 and
+        // 100 rows and `N92 + 0 = '0.5'` the 0.50 row - before this arm
+        // both pairs fell to value_cmp's rendered-text fallback, which
+        // compared "10" < "9" and answered [] with no error). Converted
+        // HERE, at prepare; a literal that will not convert refuses the
+        // STATEMENT (priced: the engine raises per row, but only
+        // plain-column terms carry the value-gated raiser). A text
+        // COLUMN or expression against a numeric side still falls
+        // through - out of this slice, the engine converts per row
+        // there too.
+        (ExprType::Int | ExprType::Numeric, ExprType::Text) => {
+            if let Expr::Str(s) = &rhs {
+                let r = num_literal_expr(s)?;
+                Some((lhs, r))
+            } else {
+                Some((lhs, rhs))
+            }
+        }
+        (ExprType::Text, ExprType::Int | ExprType::Numeric) => {
+            if let Expr::Str(s) = &lhs {
+                let l = num_literal_expr(s)?;
+                Some((l, rhs))
+            } else {
+                Some((lhs, rhs))
+            }
+        }
         _ => Some((lhs, rhs)),
+    }
+}
+
+/// A string literal read as an exact-numeric literal expression, for
+/// the side of a comparison whose other side is one. `None` refuses the
+/// statement - both the Raise and the Refuse classifications land here,
+/// because an expression term's bool cannot carry the engine's per-row
+/// error ([Term::ExprCond]).
+fn num_literal_expr(s: &str) -> Option<Expr> {
+    match literal_num_rhs(s, false) {
+        // scale 0 collapses to the plain integer literal, the same
+        // normalization scaled_value applies to computed results
+        LitNum::Rhs(Rhs::Int(n)) | LitNum::Rhs(Rhs::Num(n, 0)) => Some(Expr::Int(n)),
+        LitNum::Rhs(Rhs::Num(r, sc)) => Some(Expr::Dec(r, sc)),
+        _ => None,
     }
 }
 
@@ -27743,7 +27914,16 @@ fn numeric_term(
             params[slot] = Some(d.clone());
             Term::NumCmp(idx, op, Rhs::Param(slot, ColKind::Numeric))
         }
-        RawKind::Cmp(_, Rhs::Str(_)) => return None, // no text coercion here
+        // a text LITERAL converts with the same strict grammar the
+        // INTEGER arm uses; the exact compare aligns scales in i128
+        // either way (probed: `N92 = '0.5'`/`'.5'`/`'5e-1'` all answer
+        // the 0.50 row, `N382 = '0.5'` through INT128 storage too, and
+        // `NSM > '1.999999'` keeps the fraction with no range check)
+        RawKind::Cmp(op, Rhs::Str(v)) => match literal_num_rhs(&v, false) {
+            LitNum::Rhs(rhs) => Term::NumCmp(idx, op, rhs),
+            LitNum::Raise(s) => Term::CmpConvErr(idx, s),
+            LitNum::Refuse => return None,
+        },
         RawKind::IsNull => Term::IsNull(idx),
         RawKind::IsNotNull => Term::IsNotNull(idx),
         RawKind::Like(Rhs::Str(p), escape, negated) => {
@@ -28010,6 +28190,20 @@ fn resolve_having(
                             }
                             RawKind::Cmp(op, Rhs::Num(r, sc)) => {
                                 Term::NumCmp(idx, op, Rhs::Num(r, sc))
+                            }
+                            // a text literal against a numeric aggregate
+                            // converts as in WHERE (probed: `HAVING
+                            // SUM(N92) = '0.5'` answers the 0.50 group;
+                            // an unconvertible one raises per GROUP,
+                            // value-gated - [] over an empty grouped
+                            // table). Int/Text group keys ride the
+                            // typed_term reuse below.
+                            RawKind::Cmp(op, Rhs::Str(s)) => {
+                                match literal_num_rhs(&s, false) {
+                                    LitNum::Rhs(rhs) => Term::NumCmp(idx, op, rhs),
+                                    LitNum::Raise(orig) => Term::CmpConvErr(idx, orig),
+                                    LitNum::Refuse => return None,
+                                }
                             }
                             RawKind::Cmp(_, Rhs::Null) => Term::Never,
                             RawKind::IsNull => Term::IsNull(idx),
@@ -31752,6 +31946,96 @@ mod tests {
         assert!(text_number("0x10000000000000000").is_none()); // 17 digits
     }
 
+    // The compare-side literal classifier: every verdict below mirrors
+    // a probed engine answer (WHERE over a fixture with the row
+    // present), except the deliberate refusals, which are priced in
+    // the classifier's own comment.
+    #[test]
+    fn literal_num_rhs_converts_raises_and_refuses() {
+        use LitNum::*;
+        // convertible spellings, integer column: the keyable shape
+        assert!(matches!(literal_num_rhs("2", true), Rhs(super::Rhs::Int(2))));
+        assert!(matches!(literal_num_rhs(" 2 ", true), Rhs(super::Rhs::Int(2))));
+        assert!(matches!(literal_num_rhs("+2", true), Rhs(super::Rhs::Int(2))));
+        assert!(matches!(literal_num_rhs("-5", true), Rhs(super::Rhs::Int(-5))));
+        assert!(matches!(literal_num_rhs("2.", true), Rhs(super::Rhs::Int(2))));
+        assert!(matches!(literal_num_rhs("00002", true), Rhs(super::Rhs::Int(2))));
+        // a fraction against an integer column compares exactly
+        assert!(matches!(literal_num_rhs("1.5", true), Rhs(super::Rhs::Num(15, -1))));
+        assert!(matches!(literal_num_rhs(".5", true), Rhs(super::Rhs::Num(5, -1))));
+        assert!(matches!(literal_num_rhs("2.0", true), Rhs(super::Rhs::Num(20, -1))));
+        // a scaled column never takes the Int shape, scale 0 included
+        assert!(matches!(literal_num_rhs("2", false), Rhs(super::Rhs::Num(2, 0))));
+        assert!(matches!(literal_num_rhs("0.50", false), Rhs(super::Rhs::Num(50, -2))));
+        // e-notation inside the 2^53 window: exact, the exponent folds
+        assert!(matches!(literal_num_rhs("2e0", true), Rhs(super::Rhs::Int(2))));
+        assert!(matches!(literal_num_rhs("2e3", true), Rhs(super::Rhs::Int(2000))));
+        assert!(matches!(literal_num_rhs("2.5e0", true), Rhs(super::Rhs::Num(25, -1))));
+        assert!(matches!(literal_num_rhs("5e-1", false), Rhs(super::Rhs::Num(5, -1))));
+        assert!(matches!(literal_num_rhs("0.5e1", true), Rhs(super::Rhs::Int(5))));
+        // exact at the i64 rim WITHOUT e-notation - the engine keeps
+        // ...806 and ...807 distinct rows, not one double
+        assert!(matches!(
+            literal_num_rhs("9223372036854775806", true),
+            Rhs(super::Rhs::Int(9223372036854775806))
+        ));
+        assert!(matches!(
+            literal_num_rhs("9223372036854775807", true),
+            Rhs(super::Rhs::Int(i64::MAX))
+        ));
+        // the double-rounding window: an e-notation mantissa past 2^53
+        // runs through DOUBLE on the engine (probed: '...806e0' answers
+        // no row though the row exists) - refused, never guessed
+        assert!(matches!(literal_num_rhs("9223372036854775806e0", true), Refuse));
+        assert!(matches!(literal_num_rhs("92233720368547758070e-1", true), Refuse));
+        assert!(matches!(literal_num_rhs("9007199254740993e0", true), Refuse)); // 2^53+1
+        assert!(matches!(literal_num_rhs("9007199254740992e0", true), Rhs(_))); // 2^53
+        // past i64, or a scale past i8 after folding: Rhs cannot carry it
+        assert!(matches!(literal_num_rhs("9223372036854775806.5", true), Refuse));
+        assert!(matches!(literal_num_rhs("99999999999999999999", true), Refuse));
+        assert!(matches!(literal_num_rhs("1e-200", true), Refuse));
+        assert!(matches!(literal_num_rhs("1e400", true), Refuse));
+        // hex refuses whatever the column - the engine's answer is op-,
+        // arity- and index-dependent
+        assert!(matches!(literal_num_rhs("0XA", true), Refuse));
+        assert!(matches!(literal_num_rhs("0x10", true), Refuse));
+        assert!(matches!(literal_num_rhs("0xFFFF", false), Refuse));
+        // refusal spellings raise PER ROW, and the error string is the
+        // ORIGINAL untrimmed literal - the engine's own argument
+        for bad in ["x", "", " ", ".", "--2", "2,", "2.5.5", "2e", "e2", "2e 0"] {
+            assert!(
+                matches!(literal_num_rhs(bad, true), Raise(ref s) if s == bad),
+                "{:?} should raise with itself as the argument",
+                bad
+            );
+        }
+        // interior spaces raise too: the strict grammar sides with the
+        // INDEXED engine (unindexed, the engine skips them - priced)
+        assert!(matches!(literal_num_rhs("1 0", true), Raise(ref s) if s == "1 0"));
+        assert!(matches!(literal_num_rhs(" x ", true), Raise(ref s) if s == " x "));
+    }
+
+    // The value gate on the per-row raiser: NULL and a missing slot are
+    // UNKNOWN with no raise; any value raises 22018 carrying the
+    // original literal.
+    #[test]
+    fn cmp_conv_err_is_value_gated() {
+        let t = Term::CmpConvErr(0, " x ".into());
+        assert_eq!(t.matches(&[Value::Null]).unwrap(), None);
+        assert_eq!(t.matches(&[]).unwrap(), None);
+        assert_eq!(
+            t.matches(&[Value::Int(1)]),
+            Err(EvalErr::ConversionError(Some(" x ".into())))
+        );
+        assert_eq!(
+            t.matches(&[Value::Scaled(50, -2)]),
+            Err(EvalErr::ConversionError(Some(" x ".into())))
+        );
+        // row-DEPENDENT: the invariant pass must not evaluate it over
+        // no row, or an empty table would raise
+        assert!(!term_row_independent(&t));
+    }
+
     #[test]
     fn text_to_exact_checks_the_mantissa_before_it_rescales() {
         let ex = |s: &str, dt: u8, sc: i8| text_to_exact(text_number(s).unwrap(), dt, sc);
@@ -33176,9 +33460,20 @@ mod tests {
         assert!(matches!(gitems[3], GItem::Agg(AggFn::Min, AggSrc::Field(1), false)));
         assert!(p.matches(&[Value::Null, Value::Null, Value::Null, Value::Text("ann  ".into())]).unwrap());
         assert!(!p.matches(&[Value::Null, Value::Null, Value::Null, Value::Text("bob".into())]).unwrap());
-        // an aggregate compared against a string literal is a type mismatch
+        // an aggregate against an UNCONVERTIBLE string literal is the
+        // per-group raiser, value-gated (probed: `HAVING N = 'x'`
+        // raises with groups and answers [] over an empty grouped
+        // table); a convertible one compares exactly (probed:
+        // `HAVING SUM(N92) = '0.5'` answers the 0.50 group)
         let raw = parse_predicate(&tokenize("COUNT(*) = 'x'").unwrap(), &mut 0).unwrap();
-        assert!(resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).is_none());
+        let p = resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).unwrap();
+        assert_eq!(
+            p.matches(&[Value::Int(1), Value::Int(4)]),
+            Err(EvalErr::ConversionError(Some("x".into())))
+        );
+        let raw = parse_predicate(&tokenize("SUM(SALARY) = '200'").unwrap(), &mut 0).unwrap();
+        let p = resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).unwrap();
+        assert!(p.matches(&[Value::Int(1), Value::Int(4), Value::Int(200)]).unwrap());
         // ...and WHERE resolution rejects aggregates outright
         let raw = parse_predicate(&tokenize("COUNT(*) > 3").unwrap(), &mut 0).unwrap();
         assert!(resolve_predicate(raw, &columns, &descs, &mut Vec::new()).is_none());
@@ -33722,8 +34017,22 @@ mod tests {
         let null_row = vec![Value::Int(10), Value::Null, Value::Int128(42, 0)];
         assert!(!resolve("N = 12.50").unwrap().matches(&null_row).unwrap());
         assert!(resolve("N IS NULL").unwrap().matches(&null_row).unwrap());
-        // out of surface: text against numerics
-        assert!(resolve("N = 'x'").is_none());
+        // a text literal converts at prepare with the strict grammar
+        // (probed: `N92 = '0.5'` answers the 0.50 row); one that does
+        // not convert raises PER ROW, value-gated - NULL answers
+        // UNKNOWN, a value raises 22018 with the original literal
+        assert!(hits("N = '12.50'"));
+        assert!(hits("N = '12.5'"));
+        assert!(!hits("N = '12.49'"));
+        assert!(hits("N > ' 3 '"));
+        assert_eq!(
+            resolve("N = 'x'").unwrap().matches(&row),
+            Err(EvalErr::ConversionError(Some("x".into())))
+        );
+        assert!(!resolve("N = 'x'").unwrap().matches(&null_row).unwrap());
+        // hex refuses the statement - the engine's answer is index- and
+        // op-dependent, so there is nothing safe to resolve to
+        assert!(resolve("N = '0XA'").is_none());
         // LIKE/STARTING on a scaled column render it per row (probed:
         // NUMERIC(9,2) 12.5 renders '12.50', so '1%' and '%.50' match
         // and '12.5' - no trailing zero - does not)

@@ -444,7 +444,26 @@ four; R7 is the removal of what they replaced.
   coordinates so expressions evaluate against filled slots); and the
   batch path's positional patch is gone with it.
 
-- **Text LITERALS against numeric columns** — `N BETWEEN '1' AND '3'`
+- ~~Text LITERALS against numeric columns~~ — *fixed*. The compare
+  side uses a DIFFERENT grammar from the store side (cvt2.cpp's
+  cmp_numeric_string, not cvt_decompose): interior spaces SKIP
+  (`N = '1 0'` matches 10 — unindexed; an INDEX makes the same
+  spelling raise, so fc sides with the strict grammar and the gate
+  excludes the index-dependent spellings), e-notation goes through
+  DOUBLE with a rounding window past 2^53 (refused), hex is
+  op/arity/index-incoherent (refused). Conversion errors are PER ROW
+  and VALUE-GATED — `Term::CmpConvErr` inherits dead-group/
+  empty-table/NULL suppression from the conjunct machinery free. The
+  probe pass also caught a LIVE wrong-answer bug: cmp_sides'
+  rendered-text fallback compared digits as strings (`N + 0 > '9'`
+  answered [] vs engine's rows) — expression-side literals convert
+  now. Params were already correct and untouched.
+  `qa/serve-real-textnumwhere.sh`, 70 checks. Residuals priced: text
+  COLUMN vs numeric side still render-compares (its own slice);
+  indexed EMPTY table + unconvertible literal raises at open on the
+  engine, answers [] here.
+
+- **(superseded)** Text LITERALS against numeric columns — `N BETWEEN '1' AND '3'`
   → 1,2,3; `N IN ('1','2')`; `N = '2'`; `N > '1.5'` (fraction kept);
   `N92 = '0.5'` — engine answers all, fc refuses at prepare; and
   `N = 'x'` raises a conversion error UNLESS a dead group suppresses
