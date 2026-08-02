@@ -229,6 +229,13 @@ same "integer division rounds toward zero" "EXECUTE PROCEDURE ARITH(7, 2)"
 same "schema-qualified call, bare"          "EXECUTE PROCEDURE PUBLIC.ADD2(2, 3)"
 same "schema-qualified call, quoted schema" "EXECUTE PROCEDURE \"PUBLIC\".ADD2(2, 3)"
 same "schema-qualified call, both quoted"   "EXECUTE PROCEDURE \"PUBLIC\".\"ADD2\"(2, 3)"
+# ... and the dot is its own token: the engine answers EVERY spacing
+# around it (probed). The old span-scanner stopped at the first blank,
+# handed the splitter a bare PUBLIC, and refused all three.
+same "whitespace around the dot"            "EXECUTE PROCEDURE PUBLIC . ADD2(2, 3)"
+same "whitespace before the dot only"       "EXECUTE PROCEDURE PUBLIC .ADD2(2, 3)"
+same "whitespace after the dot only"        "EXECUTE PROCEDURE PUBLIC. ADD2(2, 3)"
+same "spaced dot, both parts quoted"        "EXECUTE PROCEDURE \"PUBLIC\" . \"ADD2\" (2, 3)"
 
 # a FOREIGN schema must FAIL on BOTH sides. The error texts differ (the
 # engine raises -204 Procedure unknown "SYSTEM"."ADD2"; fc answers its

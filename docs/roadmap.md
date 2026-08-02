@@ -540,6 +540,70 @@ four; R7 is the removal of what they replaced.
   must stay small) and was also bounding OR growth (additive, one group
   per value). Separate bounds now.
 
+- **UNIQUE/PK enforcement is FINAL-STATE, the engine's is WALK-ORDER —
+  a self-overlapping key-shift UPDATE commits here where the engine
+  refuses 23000.** Probed: from identical fixtures (`W`: PK 1..10;
+  `U2`: UNIQUE 10,20..100), `UPDATE W SET ID = ID + 1 WHERE ID >= 5`
+  — engine `SQLSTATE 23000 ... ("ID" = 6), Records affected: 0`; fc
+  `Records affected: 6`, durable state `{1,2,3,4,6..11}` vs the
+  engine's untouched `{1..10}`, gfix -v -full clean on fc's file (the
+  divergence is silent and semantic). Same on `U2 SET K = K + 10`.
+  The executor rewrites all collected record images FIRST and
+  `unique_conflict` (crates/wire/src/server.rs, the enforce path
+  around it) judges uniqueness from the CURRENT images — a deferred
+  final-state check — while the engine enforces row-at-a-time in walk
+  order. Direction-aware by accident: `SET ID = ID - 1 WHERE ID <= 4`
+  matches (both succeed), and a shift into an UNTOUCHED row is refused
+  by both with full rollback; only the self-overlapping,
+  conflict-free-final-state shape diverges. Shared with the
+  FC_NO_INDEX build, so it is the common write path, not the index
+  walk. Pre-existing, durable, structurally clean — a real
+  enforcement-order slice in the write path. Unclaimed.
+
+- **Packaged-procedure calls refuse** — `EXECUTE PROCEDURE
+  RDB$PROFILER.FLUSH` (and the 3-part `SYSTEM.RDB$PROFILER.FLUSH`):
+  the engine prepares TYPE 8 and executes (`NONE []`); fc refuses. A
+  package qualifier is not a schema qualifier, and the PUBLIC rule
+  currently swallows both. Pre-existing, refusal-only. Unclaimed.
+
+- **`INSERT ... SELECT ... RETURNING` refuses at EXECUTE** — fc
+  prepares it TYPE 1 (matching the engine) but execution answers
+  `Dynamic SQL Error` with no write where the engine answers
+  `ARR [{"ID":201}]` and writes; the op_execute Returning arm never
+  learned the InsertSelect plan. When a script runs both sides the
+  states fork. Unclaimed.
+
+- **`UPDATE OR INSERT ... MATCHING ... RETURNING` fails at PREPARE** —
+  `dml_table_name` reads the token after UPDATE and takes `OR` as the
+  table name; the engine prepares TYPE 1 and answers. Parse bug,
+  refusal-only. Unclaimed.
+
+- **An IDENTITY-column INSERT refuses** — `INSERT INTO IDT (V) VALUES
+  ('x')` refuses even without RETURNING where the engine answers and
+  generates `ID=1`. The identity generator never fires on fc's insert
+  path. Unclaimed.
+
+- **Constraint errors surface as generic 42000 `Dynamic SQL Error`,
+  never 23000 with the constraint/key detail** — a duplicate-key
+  INSERT and a PK-moving UPDATE alike; the engine's vector names the
+  index (`violation of PRIMARY or UNIQUE KEY constraint "INTEG_2" ...
+  Problematic key value is ("ID" = 6)`). Both sides fail, so no wrong
+  write — but drivers that dispatch on SQLSTATE see the wrong class.
+  Unclaimed.
+
+- **Text COLUMN vs numeric side still render-compares** (restated so
+  the wrong-answer class is not lost behind the fixed literal slice):
+  `NAME > N` answers six rendered-text rows and `NAME = ID` answers
+  `[]` where the engine raises 22018 PER ROW (it coerces the COLUMN
+  to a number row by row). Declared out-of-slice in the cmp_sides
+  comment, but it is a wrong ANSWER, not a refusal. Unclaimed.
+
+- **A tab in a failing text literal renders RAW in the error argument**
+  — fc's conversion-error vector carries `"\t2"` where the engine
+  escapes the control byte as `#x09` (`"#x092"`). Cosmetic-adjacent
+  but it is a visible status-vector divergence on every driver that
+  prints the argument. Unclaimed.
+
 ## The two programmes
 
 ### Programme R — the engine's execution shape

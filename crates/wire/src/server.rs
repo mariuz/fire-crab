@@ -1890,7 +1890,7 @@ enum SetVal {
 
 /// How a join treats partnerless rows: INNER drops them; LEFT keeps
 /// every left row (right side NULL-padded), RIGHT the mirror, FULL both.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum JoinKind {
     Inner,
     Left,
@@ -2697,6 +2697,14 @@ fn num_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     let (ra, sa) = numeric_parts(a)?;
     let (rb, sb) = numeric_parts(b)?;
     let up = |v: i128, by: i8| {
+        // 0 x 10^k is 0 for EVERY k - checked first, because a scale gap
+        // past 38 makes checked_pow overflow and the saturation below
+        // would turn a ZERO into i128::MAX (probed: N92 > '1e-50' keeps
+        // the N92 = 0 row OUT - engine [2,4,6,7] - and N92 < '1e-50'
+        // keeps it IN - engine [1,3]; this closure said 0 > 1e-50)
+        if v == 0 {
+            return 0;
+        }
         10i128
             .checked_pow(by.max(0) as u32)
             .and_then(|p| v.checked_mul(p))
@@ -8579,6 +8587,40 @@ fn split_returning(sql: &str) -> (String, Option<String>) {
     }
 }
 
+/// One identifier off the front of a RETURNING item, KEEPING its
+/// quotedness: (name, was_quoted, rest). A quoted part unescapes `""`
+/// and keeps its case; a bare part is returned as spelled. The caller
+/// needs the flag because the two kinds MATCH differently (probed:
+/// `RETURNING "id"` is `Column unknown "id"` where `RETURNING id`
+/// answers - quoted names compare exactly, bare ones fold).
+fn returning_ident(s: &str) -> Option<(String, bool, &str)> {
+    let s = s.trim_start();
+    if let Some(q) = s.strip_prefix('"') {
+        let b = q.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'"' {
+                if b.get(i + 1) == Some(&b'"') {
+                    i += 2; // escaped quote, part of the name
+                    continue;
+                }
+                let name = q[..i].replace("\"\"", "\"");
+                return if name.is_empty() { None } else { Some((name, true, &q[i + 1..])) };
+            }
+            i += 1;
+        }
+        None // unterminated quote
+    } else {
+        let end = s
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+            .unwrap_or(s.len());
+        if end == 0 {
+            return None;
+        }
+        Some((s[..end].to_string(), false, &s[end..]))
+    }
+}
+
 /// Wrap a planned DML in its `RETURNING` clause.
 ///
 /// Only plain column references are converted - `RETURNING ID, AMT`, with
@@ -8586,6 +8628,13 @@ fn split_returning(sql: &str) -> (String, Option<String>) {
 /// contexts are named. An expression there (`RETURNING AMT * 2`) is
 /// refused rather than guessed: the value would look right and the type
 /// in the describe would not.
+///
+/// Identifier matching is the engine's (probed): a QUOTED name compares
+/// EXACTLY against the catalog - `RETURNING "id"` is `Column unknown,
+/// "id"` and writes NOTHING while `RETURNING ID`/`"ID"`/`id` answer -
+/// and a bare name folds (case-insensitive here, as everywhere else in
+/// this file). The same rule gates the table qualifier: `"rt".ID`
+/// refuses where `rt.ID` and `"RT".ID` answer.
 fn wrap_returning(
     plan: Plan,
     params: Vec<Descriptor>,
@@ -8600,27 +8649,47 @@ fn wrap_returning(
     let columns = fire_crab_ods::relation_columns(&dbr.bytes, dbr.page_size, table);
     let mut cols = Vec::new();
     let mut fields = Vec::new();
+    // the CATALOG's spelling of the target table, for the quoted
+    // qualifier's exact compare (`table` is the statement's spelling,
+    // whose case a bare identifier does not preserve)
+    let canon = fire_crab_ods::list_relations(&dbr.bytes, dbr.page_size)
+        .into_iter()
+        .find(|(id, _)| *id == rel)
+        .map(|(_, n)| n)?;
     for item in list.split(',') {
         let item = item.trim();
+        let (first, first_q, rest) = returning_ident(item)?;
+        let rest = rest.trim_start();
+        let (qual, bare, bare_q) = if rest.is_empty() {
+            (None, first, first_q)
+        } else {
+            let rest = rest.strip_prefix('.')?;
+            let (second, second_q, tail) = returning_ident(rest)?;
+            if !tail.trim().is_empty() {
+                return None; // an expression, or a three-part name
+            }
+            (Some((first, first_q)), second, second_q)
+        };
         // A qualifier is allowed only when it names the TARGET TABLE
         // (`RETURNING T.ID` works); `NEW.`/`OLD.` do NOT exist in DSQL -
         // they are the PSQL trigger contexts, and the engine answers
         // `Column unknown, "NEW"."ID"`. Accepting them would return rows
         // for a statement the engine refuses, and write a row it never
         // wrote (probed, and caught by the gate's twin-database check).
-        if let Some((qual, _)) = item.rsplit_once('.') {
-            let q = qual.trim().trim_matches('"');
-            if !q.eq_ignore_ascii_case(table) {
+        // A QUOTED qualifier compares exactly against the catalog name
+        // (probed: `RETURNING "rt".ID` is `Column unknown "rt"."ID"`).
+        if let Some((q, quoted)) = &qual {
+            let ok = if *quoted { *q == canon } else { q.eq_ignore_ascii_case(table) };
+            if !ok {
                 return None;
             }
         }
-        let bare = item.rsplit('.').next()?.trim().trim_matches('"');
-        if bare.is_empty() || !ident_ok(bare) {
+        if !bare_q && !ident_ok(&bare) {
             return None;
         }
-        let c = columns
-            .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(bare))?;
+        let c = columns.iter().find(|c| {
+            if bare_q { c.name == bare } else { c.name.eq_ignore_ascii_case(&bare) }
+        })?;
         let fid = c.field_id as usize;
         let d = descs.get(fid)?;
         let (wire, sql_type, length, scale, sub_type) = wire_for(d);
@@ -17054,6 +17123,24 @@ fn join_step(
     let mut right_matched = vec![false; rrows.len()];
     for l in &acc {
         let mut matched = false;
+        // An EMPTY inner stream does not silence the ON condition: the
+        // engine still walks its outer stream and evaluates the ON per
+        // outer row, so a value-gated raiser (`ON A.ID = B.ID AND
+        // A.N = 'x'`) raises 22018 with zero inner rows too - for LEFT,
+        // INNER and FULL alike, whose outer stream is the accumulated
+        // side (probed: all three raise over T A ... EMPTY_T B; a RIGHT
+        // join walks the RIGHT stream instead, so its empty right side
+        // answers [] with no raise - that case is the mirror loop
+        // below). Evaluated on the NULL-padded row: the raiser stays
+        // value-gated (an all-NULL A.N answers, probed) and a FALSE
+        // conjunct still short-circuits it (`AND A.ID = -1 AND
+        // A.N = 'x'` answers all rows padded, probed). The boolean is
+        // discarded - with no partner the row cannot match.
+        if rrows.is_empty() && !matches!(part.kind, JoinKind::Right) {
+            let mut row = l.clone();
+            row.resize(acc_width + part.width, Value::Null);
+            part.on.matches(&row)?;
+        }
         for (ri, r) in rrows.iter().enumerate() {
             let mut row = l.clone();
             row.extend(r.iter().cloned());
@@ -17079,6 +17166,15 @@ fn join_step(
             }
             let mut row = vec![Value::Null; acc_width];
             row.extend(r.iter().cloned());
+            // the mirror of the empty-inner rule above: a RIGHT (or the
+            // right-preserved pass of a FULL) join walks the RIGHT
+            // stream, so with an EMPTY accumulated side the ON still
+            // evaluates once per right row (probed: EMPTY_T A RIGHT
+            // JOIN T B ON A.ID = B.ID AND B.N = 'x' raises; with the
+            // raiser on the all-NULL A side it answers every B row)
+            if acc.is_empty() {
+                part.on.matches(&row)?;
+            }
             out.push(row);
         }
     }
@@ -18971,6 +19067,30 @@ fn parse_gen_id_query(proj_s: &str, table_s: &str) -> Option<(String, i64)> {
     Some((name, step))
 }
 
+/// The `<seq>` span of a `NEXT VALUE FOR <seq>` projection item, or None
+/// when the item is not that shape. The span is EVERYTHING after `FOR`,
+/// not the next whitespace-delimited token: the sequence name may be
+/// dotted with whitespace around the dot (`NEXT VALUE FOR PUBLIC .
+/// SEQ5`, which the engine answers - probed, every spacing), and the
+/// full span is what [strip_gen_name]'s splitter validates - trailing
+/// text it cannot read as one or two identifiers still refuses there.
+fn next_value_for_span(p: &str) -> Option<&str> {
+    let p = p.trim();
+    let up = p.to_ascii_uppercase();
+    if find_word(&up, "NEXT", 0) != Some(0) {
+        return None;
+    }
+    let v = find_word(&up, "VALUE", "NEXT".len())?;
+    if !up["NEXT".len()..v].trim().is_empty() {
+        return None; // something other than whitespace between the keywords
+    }
+    let f = find_word(&up, "FOR", v + "VALUE".len())?;
+    if !up[v + "VALUE".len()..f].trim().is_empty() {
+        return None;
+    }
+    Some(p[f + "FOR".len()..].trim())
+}
+
 /// Recognise `SELECT NEXT VALUE FOR <seq> FROM [SYSTEM.]RDB$DATABASE` and
 /// return the bare sequence name. `NEXT VALUE FOR` is `GEN_ID(seq, <the
 /// sequence's own increment>)` - the increment is read at execute.
@@ -18980,15 +19100,7 @@ fn parse_next_value(proj_s: &str, table_s: &str) -> Option<String> {
     if bare != "RDB$DATABASE" {
         return None;
     }
-    let toks: Vec<&str> = proj_s.split_whitespace().collect();
-    if toks.len() != 4
-        || !toks[0].eq_ignore_ascii_case("NEXT")
-        || !toks[1].eq_ignore_ascii_case("VALUE")
-        || !toks[2].eq_ignore_ascii_case("FOR")
-    {
-        return None;
-    }
-    let name = strip_gen_name(toks[3]);
+    let name = strip_gen_name(next_value_for_span(proj_s)?);
     if name.is_empty() {
         None
     } else {
@@ -19003,14 +19115,10 @@ fn parse_next_value(proj_s: &str, table_s: &str) -> Option<String> {
 /// so the ordinary column/expression parsing handles it.
 fn parse_gen_sel_item(part: &str) -> Option<(String, Option<i64>)> {
     let p = part.trim();
-    // NEXT VALUE FOR <seq>
-    let toks: Vec<&str> = p.split_whitespace().collect();
-    if toks.len() == 4
-        && toks[0].eq_ignore_ascii_case("NEXT")
-        && toks[1].eq_ignore_ascii_case("VALUE")
-        && toks[2].eq_ignore_ascii_case("FOR")
-    {
-        let name = strip_gen_name(toks[3]);
+    // NEXT VALUE FOR <seq> - the whole tail is the name span (it may be
+    // dotted with whitespace around the dot, see [next_value_for_span])
+    if let Some(seq) = next_value_for_span(p) {
+        let name = strip_gen_name(seq);
         return if name.is_empty() { None } else { Some((name, None)) };
     }
     // GEN_ID ( <name> , <step> )
@@ -19153,6 +19261,10 @@ fn assign_gen_slots(
 /// loop takes SEGMENTS (quoted or bare) joined by dots, so a QUOTED
 /// qualifier (`"PUBLIC"."SQ1"` - the form the engine answers, probed)
 /// is captured whole rather than stopping at the first closing quote.
+/// Whitespace around the joining dot is part of the span (`PUBLIC .
+/// SQ1` names the same generator, probed) - the lookahead crosses it
+/// only when a dot follows, so a name at the end of its expression
+/// (`NEXT VALUE FOR SEQ + 1`, `GEN_ID(SEQ, 0)`) still stops clean.
 fn parse_gen_ref(b: &[char], pos: &mut usize) -> Option<String> {
     skip_ws(b, pos);
     let start = *pos;
@@ -19184,8 +19296,13 @@ fn parse_gen_ref(b: &[char], pos: &mut usize) -> Option<String> {
                 return None;
             }
         }
-        if b.get(*pos) == Some(&'.') {
-            *pos += 1;
+        let mut la = *pos;
+        while b.get(la).is_some_and(|c| c.is_whitespace()) {
+            la += 1;
+        }
+        if b.get(la) == Some(&'.') {
+            *pos = la + 1;
+            skip_ws(b, pos);
             continue;
         }
         break;
@@ -19195,6 +19312,58 @@ fn parse_gen_ref(b: &[char], pos: &mut usize) -> Option<String> {
     if name.is_empty() { None } else { Some(name) }
 }
 
+/// Byte length of the qualified-name span at the head of `s`:
+/// identifier segments (bare or quoted) joined by dots, with whitespace
+/// allowed AROUND each dot - the dot is its own token to the engine, so
+/// `PUBLIC . PADD` names the same procedure as `PUBLIC.PADD` (probed:
+/// the engine answers every spacing of `EXECUTE PROCEDURE PUBLIC .
+/// PADD(2, 3)` and `NEXT VALUE FOR PUBLIC . SEQ5`). The span-scanners
+/// that used to stop at the first blank truncated the name to `PUBLIC`
+/// before [split_qualified_name] - which itself trims per part - ever
+/// ran; this scanner hands it the full dotted span, exactly as the
+/// GEN_ID probe path always has.
+fn qualified_name_span(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    loop {
+        if b.get(i) == Some(&b'"') {
+            i += 1;
+            loop {
+                match b.get(i) {
+                    None => return None, // unterminated quote
+                    Some(b'"') if b.get(i + 1) == Some(&b'"') => i += 2,
+                    Some(b'"') => {
+                        i += 1;
+                        break;
+                    }
+                    _ => i += 1,
+                }
+            }
+        } else {
+            let seg = i;
+            while b.get(i).is_some_and(|c| is_ident_byte(*c)) {
+                i += 1;
+            }
+            if i == seg {
+                return None; // no identifier where one is required
+            }
+        }
+        // whitespace-tolerant lookahead: only a DOT continues the span
+        let mut la = i;
+        while b.get(la).is_some_and(|c| c.is_ascii_whitespace()) {
+            la += 1;
+        }
+        if b.get(la) == Some(&b'.') {
+            i = la + 1;
+            while b.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
+                i += 1;
+            }
+        } else {
+            return Some(i);
+        }
+    }
+}
+
 /// Split a possibly schema-qualified object reference into (qualifier,
 /// object name). Each part is either a `"quoted"` identifier (`""`
 /// unescapes to `"`, case KEPT - the engine matches quoted names
@@ -19202,7 +19371,8 @@ fn parse_gen_ref(b: &[char], pos: &mut usize) -> Option<String> {
 /// unquoted identifiers); the parts are joined by `.`, and a dot INSIDE
 /// a quoted part never splits (probed: `"a.b"` is one name). None when
 /// the text is not one or two identifiers - an empty part, an
-/// unterminated quote, a three-part name, or trailing text.
+/// unterminated quote, a three-part name, or trailing text. Whitespace
+/// around the dot is the engine's (each part is trimmed).
 fn split_qualified_name(s: &str) -> Option<(Option<String>, String)> {
     /// One identifier off the front; (name, rest).
     fn take_part(s: &str) -> Option<(String, &str)> {
@@ -21540,12 +21710,15 @@ enum LitNum {
 ///   row yet `N < '0XA'` is true for every non-NULL row - a
 ///   NaN-that-sorts-high - while `N IN ('0XA','2')` converts the same
 ///   string to 10 and an indexed `N = '0XA'` raises). Never guess.
-/// - E-notation with a mantissa past 2^53 => `Refuse`: the engine runs
-///   the literal through DOUBLE (probed: `NBIG = '9223372036854775806e0'`
-///   answers [] though the row exists - the double rounds to ...808 -
-///   yet the 20-digit '92233720368547758070e-1' matches row ...807
-///   EXACTLY via the int128 overflow path). Inside the window the
-///   double is exact and the exact compare answers identically.
+/// - E-notation whose FOLDED value (mantissa x 10^exp) is past 2^53 =>
+///   `Refuse`: the engine runs the literal through DOUBLE (probed:
+///   `NBIG = '9223372036854775806e0'` answers [] though the row exists -
+///   the double rounds to ...808 - and `NB = '9007199254740991e3'`, whose
+///   spelled mantissa fits the window but whose folded ...991000 does
+///   not, matches BOTH stored BIGINTs ...991000 and ...990976 through
+///   the collapse; yet the 20-digit '92233720368547758070e-1' matches
+///   row ...807 EXACTLY via the int128 overflow path). Inside the window
+///   the double is exact and the exact compare answers identically.
 /// - A mantissa past i64, or an exponent past i8 after folding, =>
 ///   `Refuse`: `Rhs::Num` cannot carry it (covers
 ///   '9223372036854775806.5', whose compare the engine does exactly).
@@ -21560,9 +21733,6 @@ fn literal_num_rhs(s: &str, int_col: bool) -> LitNum {
     let TextNum::Dec { mantissa, exp } = n else {
         return LitNum::Refuse; // hex
     };
-    if s.contains(['e', 'E']) && mantissa.unsigned_abs() > 1 << 53 {
-        return LitNum::Refuse; // the double-rounding window
-    }
     // fold a positive exponent into the mantissa: Rhs::Num carries
     // (raw, scale) with scale <= 0, the storage convention
     let (mantissa, exp) = if exp > 0 {
@@ -21576,6 +21746,16 @@ fn literal_num_rhs(s: &str, int_col: bool) -> LitNum {
     } else {
         (mantissa, exp)
     };
+    // The 2^53 double window tests the FOLDED value, after the exponent
+    // is in: it is the whole magnitude the engine's DOUBLE must carry,
+    // not the spelled mantissa (probed: NB = '9007199254740991e3' - the
+    // mantissa sits inside 2^53, the folded ...991000 does not, and the
+    // engine's double collapse matches BOTH stored BIGINTs ...991000 AND
+    // ...990976 where the exact compare matches one; '900719925474099e1'
+    // folds inside the window and answers [] on both sides).
+    if s.contains(['e', 'E']) && mantissa.unsigned_abs() > 1 << 53 {
+        return LitNum::Refuse; // the double-rounding window
+    }
     let (Ok(m), Ok(sc)) = (i64::try_from(mantissa), i8::try_from(exp)) else {
         return LitNum::Refuse;
     };
@@ -27426,11 +27606,12 @@ fn parse_execute_procedure(sql: &str) -> Option<(Option<String>, String, Vec<Opt
     }
     let p = find_word(&up, "PROCEDURE", "EXECUTE".len())?;
     let rest = s[p + "PROCEDURE".len()..].trim();
-    // the name runs to whitespace or '(' - which keeps a dotted,
-    // quoted span (`"PUBLIC"."PADD"`) intact for the splitter
-    let end = rest
-        .find(|c: char| c.is_whitespace() || c == '(')
-        .unwrap_or(rest.len());
+    // the name span keeps a dotted, quoted span (`"PUBLIC"."PADD"`)
+    // intact for the splitter, WHITESPACE AROUND THE DOT included -
+    // stopping at the first blank handed the splitter a bare `PUBLIC`
+    // and refused `EXECUTE PROCEDURE PUBLIC . PADD(2, 3)`, which the
+    // engine answers (probed, every spacing)
+    let end = qualified_name_span(rest)?;
     let (qual, name) = split_qualified_name(rest[..end].trim())?;
     if name.is_empty() {
         return None;
@@ -32390,6 +32571,17 @@ mod tests {
         assert!(matches!(literal_num_rhs("92233720368547758070e-1", true), Refuse));
         assert!(matches!(literal_num_rhs("9007199254740993e0", true), Refuse)); // 2^53+1
         assert!(matches!(literal_num_rhs("9007199254740992e0", true), Rhs(_))); // 2^53
+        // the window tests the FOLDED value, not the spelled mantissa:
+        // 9007199254740991 sits inside 2^53 but x10^3 does not, and the
+        // engine's double collapse matches BOTH stored BIGINTs
+        // 9007199254740991000 and ...990976 (probed) - never guessed
+        assert!(matches!(literal_num_rhs("9007199254740991e3", true), Refuse));
+        assert!(matches!(literal_num_rhs("9007199254740991e3", false), Refuse));
+        // folding INSIDE the window still converts exactly
+        assert!(matches!(
+            literal_num_rhs("900719925474099e1", true),
+            Rhs(super::Rhs::Int(9007199254740990))
+        ));
         // past i64, or a scale past i8 after folding: Rhs cannot carry it
         assert!(matches!(literal_num_rhs("9223372036854775806.5", true), Refuse));
         assert!(matches!(literal_num_rhs("99999999999999999999", true), Refuse));
@@ -32434,6 +32626,27 @@ mod tests {
         // row-DEPENDENT: the invariant pass must not evaluate it over
         // no row, or an empty table would raise
         assert!(!term_row_independent(&t));
+    }
+
+    // Scale alignment across a gap past 38: 0 x 10^k is 0 for every k.
+    // The checked_pow saturation used to turn a ZERO into i128::MAX
+    // (probed: N92 > '1e-50' keeps the N92 = 0 row OUT - engine
+    // [2,4,6,7] - and N92 < '1e-50' keeps it IN - engine [1,3]).
+    #[test]
+    fn num_cmp_zero_survives_a_huge_scale_gap() {
+        use std::cmp::Ordering::*;
+        let tiny = Value::Scaled(1, -50); // the literal '1e-50'
+        assert_eq!(num_cmp(&Value::Scaled(0, -2), &tiny), Some(Less));
+        assert_eq!(num_cmp(&tiny, &Value::Scaled(0, -2)), Some(Greater));
+        assert_eq!(num_cmp(&Value::Int(0), &tiny), Some(Less));
+        // non-zero values keep their sides of it
+        assert_eq!(num_cmp(&Value::Scaled(50, -2), &tiny), Some(Greater));
+        assert_eq!(num_cmp(&Value::Scaled(-150, -2), &tiny), Some(Less));
+        // INT128 storage (NUMERIC(38,2)) with a wider gap - N382 > '1e-60'
+        assert_eq!(num_cmp(&Value::Int128(0, -2), &Value::Scaled(1, -60)), Some(Less));
+        assert_eq!(num_cmp(&Value::Int128(50, -2), &Value::Scaled(1, -60)), Some(Greater));
+        // both zero: equal whatever the scales say
+        assert_eq!(num_cmp(&Value::Scaled(0, -2), &Value::Scaled(0, -50)), Some(Equal));
     }
 
     #[test]
@@ -33774,6 +33987,78 @@ mod tests {
         let out = join_step(acc, 2, &rrows2, &part(JoinKind::Right)).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[1], vec![Value::Null, Value::Null, Value::Int(77)]);
+    }
+
+    // An EMPTY inner stream does not silence the ON condition: the
+    // engine walks its OUTER stream and evaluates the ON per outer row,
+    // so a value-gated raiser (`ON A.ID = B.ID AND A.N = 'x'`) raises
+    // its 22018 with zero inner rows too. All probed on FB6: LEFT,
+    // INNER and FULL raise over `T A ... EMPTY_T B`; zero OUTER rows
+    // answer [] with no raise; a RIGHT join walks the RIGHT stream, so
+    // its empty right side answers [] while its empty LEFT side still
+    // raises a right-side raiser.
+    #[test]
+    fn join_step_evaluates_the_on_over_an_empty_inner_stream() {
+        // ON acc[1] = new[2] AND <raiser gated on acc[0]>
+        let raiser_part = |kind| JoinPart {
+            kind,
+            src: RowSource::Rows(Vec::new()),
+            width: 1,
+            on: Predicate::dnf(vec![vec![
+                Term::ExprCond(Box::new(Cond2::Cmp(
+                    Box::new(Expr::Col(1)),
+                    Cmp::Eq,
+                    Box::new(Expr::Col(2)),
+                ))),
+                Term::CmpConvErr(0, "x".into()),
+            ]]),
+        };
+        let acc = vec![vec![Value::Int(1), Value::Int(10)]];
+        let none: Vec<Vec<Value>> = Vec::new();
+        // LEFT, INNER and FULL walk the accumulated side: the raiser fires
+        for kind in [JoinKind::Left, JoinKind::Inner, JoinKind::Full] {
+            assert!(
+                join_step(acc.clone(), 2, &none, &raiser_part(kind)).is_err(),
+                "{:?} over an empty inner stream must raise",
+                kind
+            );
+        }
+        // RIGHT walks the (empty) right stream: no row, no evaluation
+        assert_eq!(join_step(acc.clone(), 2, &none, &raiser_part(JoinKind::Right)).unwrap(), Vec::<Vec<Value>>::new());
+        // zero OUTER rows: nothing evaluates, [] not an error
+        assert_eq!(join_step(Vec::new(), 2, &none, &raiser_part(JoinKind::Left)).unwrap(), Vec::<Vec<Value>>::new());
+        // the raiser stays VALUE-GATED on the padded row: an all-NULL
+        // gating column answers the padded row instead of raising
+        let null_acc = vec![vec![Value::Null, Value::Int(10)]];
+        let out = join_step(null_acc, 2, &none, &raiser_part(JoinKind::Left)).unwrap();
+        assert_eq!(out, vec![vec![Value::Null, Value::Int(10), Value::Null]]);
+        // ... and a FALSE conjunct short-circuits it (probed: `ON A.ID =
+        // B.ID AND A.ID = -1 AND A.N = 'x'` answers every row padded)
+        let sc_part = JoinPart {
+            kind: JoinKind::Left,
+            src: RowSource::Rows(Vec::new()),
+            width: 1,
+            on: Predicate::dnf(vec![vec![
+                Term::ExprCond(Box::new(Cond2::Cmp(
+                    Box::new(Expr::Col(0)),
+                    Cmp::Eq,
+                    Box::new(Expr::Int(-1)),
+                ))),
+                Term::CmpConvErr(0, "x".into()),
+            ]]),
+        };
+        let out = join_step(acc, 2, &none, &sc_part).unwrap();
+        assert_eq!(out, vec![vec![Value::Int(1), Value::Int(10), Value::Null]]);
+        // RIGHT with an EMPTY accumulated side: the right stream is the
+        // outer one, so a raiser gated on ITS column fires
+        let rt_raiser = JoinPart {
+            kind: JoinKind::Right,
+            src: RowSource::Rows(Vec::new()),
+            width: 1,
+            on: Predicate::dnf(vec![vec![Term::CmpConvErr(2, "x".into())]]),
+        };
+        let rrows = vec![vec![Value::Int(7)]];
+        assert!(join_step(Vec::new(), 2, &rrows, &rt_raiser).is_err());
     }
 
     #[test]
@@ -36931,6 +37216,87 @@ mod tests {
         // no-argument and semicolon forms keep parsing
         let (q, n, a) = parse_execute_procedure("EXECUTE PROCEDURE FLUSH;").unwrap();
         assert_eq!((q, n.as_str(), a.len()), (None, "FLUSH", 0));
+        // whitespace around the qualifier dot: the dot is its own token
+        // to the engine, which answers every spacing (probed) - the old
+        // span-scanner stopped at the first blank and refused them all
+        for sql in [
+            "EXECUTE PROCEDURE PUBLIC . PADD(2, 3)",
+            "EXECUTE PROCEDURE PUBLIC .PADD(2, 3)",
+            "EXECUTE PROCEDURE PUBLIC. PADD(2, 3)",
+            "EXECUTE PROCEDURE \"PUBLIC\" . \"PADD\" (2, 3)",
+        ] {
+            let (q, n, a) = parse_execute_procedure(sql).unwrap();
+            assert_eq!(
+                (q.as_deref(), n.as_str(), a.len()),
+                (Some("PUBLIC"), "PADD", 2),
+                "{sql}"
+            );
+        }
+        // ... and the spaced FOREIGN qualifier still parses whole, for
+        // the caller's ordinary no-such-procedure refusal (engine -204)
+        let (q, n, _) = parse_execute_procedure("EXECUTE PROCEDURE NOSCHEMA . PADD(2, 3)").unwrap();
+        assert_eq!((q.as_deref(), n.as_str()), (Some("NOSCHEMA"), "PADD"));
+        // argument-without-parens forms are not eaten by the lookahead
+        let (q, n, a) = parse_execute_procedure("EXECUTE PROCEDURE SUMTO 5").unwrap();
+        assert_eq!((q, n.as_str(), a), (None, "SUMTO", vec![Some(Value::Int(5))]));
+    }
+
+    #[test]
+    fn qualified_name_span_crosses_whitespace_only_at_a_dot() {
+        fn span(s: &str) -> Option<&str> {
+            qualified_name_span(s).map(|e| &s[..e])
+        }
+        assert_eq!(span("PADD(2, 3)"), Some("PADD"));
+        assert_eq!(span("PUBLIC.PADD(2, 3)"), Some("PUBLIC.PADD"));
+        assert_eq!(span("PUBLIC . PADD (2, 3)"), Some("PUBLIC . PADD"));
+        assert_eq!(span("\"PUBLIC\" . \"PADD\"(2)"), Some("\"PUBLIC\" . \"PADD\""));
+        // no dot past the whitespace: the span stops at the name
+        assert_eq!(span("SUMTO 5"), Some("SUMTO"));
+        assert_eq!(span("SEQ + 1"), Some("SEQ"));
+        // malformed heads refuse
+        assert_eq!(span(""), None);
+        assert_eq!(span("\"PADD"), None); // unterminated quote
+        assert_eq!(span("PUBLIC . "), None); // a dot with no second part
+    }
+
+    #[test]
+    fn next_value_for_takes_the_whole_tail_as_the_name_span() {
+        // the single-item RDB$DATABASE recognizer (probed: the engine
+        // answers NEXT VALUE FOR PUBLIC . SEQ5 and durably advances)
+        assert_eq!(parse_next_value("NEXT VALUE FOR SEQ5", "RDB$DATABASE"), Some("SEQ5".into()));
+        assert_eq!(
+            parse_next_value("NEXT VALUE FOR PUBLIC . SEQ5", "RDB$DATABASE"),
+            Some("SEQ5".into())
+        );
+        assert_eq!(
+            parse_next_value("NEXT VALUE FOR \"PUBLIC\" . \"SEQ5\"", "RDB$DATABASE"),
+            Some("SEQ5".into())
+        );
+        // a foreign qualifier refuses under the PUBLIC rule, spaced or not
+        assert_eq!(parse_next_value("NEXT VALUE FOR NOSCHEMA . SEQ5", "RDB$DATABASE"), None);
+        // trailing text is not a name (the splitter's tail check)
+        assert_eq!(parse_next_value("NEXT VALUE FOR SEQ5 EXTRA", "RDB$DATABASE"), None);
+        // and the select-list item parser follows the same span rule
+        assert_eq!(
+            parse_gen_sel_item("NEXT VALUE FOR PUBLIC . SEQ"),
+            Some(("SEQ".to_string(), None))
+        );
+        assert_eq!(parse_gen_sel_item("NEXT VALUE FOR SEQ + 1"), None); // an expression
+    }
+
+    // The RETURNING identifier reader keeps QUOTEDNESS - the flag the
+    // matching rules turn on (probed: `RETURNING "id"` is `Column
+    // unknown "id"` where `RETURNING ID`/`id`/`"ID"` answer).
+    #[test]
+    fn returning_ident_keeps_quotedness() {
+        assert_eq!(returning_ident("ID"), Some(("ID".to_string(), false, "")));
+        assert_eq!(returning_ident("id, amt"), Some(("id".to_string(), false, ", amt")));
+        assert_eq!(returning_ident("\"id\""), Some(("id".to_string(), true, "")));
+        assert_eq!(returning_ident("\"T\".ID"), Some(("T".to_string(), true, ".ID")));
+        assert_eq!(returning_ident("\"a\"\"b\""), Some(("a\"b".to_string(), true, "")));
+        assert_eq!(returning_ident("\"unterminated"), None);
+        assert_eq!(returning_ident("\"\""), None); // empty quoted name
+        assert_eq!(returning_ident(""), None);
     }
 
     #[test]

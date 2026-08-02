@@ -189,6 +189,18 @@ check "GEN_ID with a bare PUBLIC qualifier (step 0 read)" \
 check "GEN_ID with a QUOTED PUBLIC qualifier" \
     "$(fc_rows 'SELECT GEN_ID("PUBLIC".SEQ, 0) FROM RDB$DATABASE')" \
     "$(en_rows 'SELECT GEN_ID("PUBLIC".SEQ, 0) FROM RDB$DATABASE')"
+# the dot is its own token: the engine answers whitespace around it in
+# every generator reference (probed) - the NEXT VALUE FOR parsers used
+# to truncate the name at the first blank while GEN_ID's path answered
+check "GEN_ID with a SPACED qualifier dot (step 0 read)" \
+    "$(fc_rows 'SELECT GEN_ID(PUBLIC . SEQ, 0) FROM RDB$DATABASE')" \
+    "$(en_rows 'SELECT GEN_ID(PUBLIC . SEQ, 0) FROM RDB$DATABASE')"
+check "NEXT VALUE FOR with a SPACED qualifier dot (advances in lockstep)" \
+    "$(fc_rows 'SELECT NEXT VALUE FOR PUBLIC . SEQ FROM RDB$DATABASE')" \
+    "$(en_rows 'SELECT NEXT VALUE FOR PUBLIC . SEQ FROM RDB$DATABASE')"
+check "NEXT VALUE FOR, spaced dot, both parts quoted" \
+    "$(fc_rows 'SELECT NEXT VALUE FOR "PUBLIC" . "SEQ" FROM RDB$DATABASE')" \
+    "$(en_rows 'SELECT NEXT VALUE FOR "PUBLIC" . "SEQ" FROM RDB$DATABASE')"
 r=$(fc_rows 'SELECT GEN_ID(NOSCHEMA.SEQ, 0) FROM RDB$DATABASE')
 e=$("$ISQL" -q -b -user "$U" -pas "$P" "$REF" 2>&1 <<'SQL' | tr -s ' \n' ' '
 SELECT GEN_ID(NOSCHEMA.SEQ, 0) FROM RDB$DATABASE;

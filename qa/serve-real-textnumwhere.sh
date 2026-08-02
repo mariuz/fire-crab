@@ -32,8 +32,10 @@
 #     index-dependent (a NaN-that-sorts-high unindexed, a raise
 #     indexed, a store-grammar 10 in a multi-IN) - fc refuses the
 #     statement.
-#   - e-notation mantissas past 2^53 (`'9223372036854775806e0'`): the
-#     engine double-rounds to a wrong-row answer - fc refuses.
+#   - e-notation whose FOLDED value (mantissa x 10^exp) is past 2^53
+#     (`'9223372036854775806e0'`, `'9007199254740991e3'`): the engine
+#     double-rounds to a wrong-row answer - the second spelling matches
+#     BOTH TB rows through the collapse - fc refuses.
 #   - mantissas past i64 / scales past i8: fc refuses.
 #   - an INDEXED EMPTY table with a bad literal: the engine raises at
 #     open, fc answers [] (priced residual; EMPTY_T here is unindexed).
@@ -65,6 +67,7 @@ CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE T (ID INTEGER, N INTEGER, NSM SMALLINT, NBIG BIGINT,
                 N92 NUMERIC(9,2), N382 NUMERIC(38,2), NAME VARCHAR(10));
 CREATE TABLE EMPTY_T (ID INTEGER, N INTEGER);
+CREATE TABLE TB (ID INTEGER, NB BIGINT);
 CREATE TABLE TI (ID INTEGER, N INTEGER, N92 NUMERIC(9,2));
 CREATE INDEX IDX_TI_N ON TI(N);
 CREATE INDEX IDX_TI_N92 ON TI(N92);
@@ -77,6 +80,8 @@ INSERT INTO T VALUES (5, NULL, NULL, NULL,                NULL,    NULL,    NULL
 INSERT INTO T VALUES (6, 100,  100,  9223372036854775807, 1234.56, 1234.56, 'zeta');
 INSERT INTO T VALUES (7, -5,   -5,   -5,                  1.5,     1.5,     'eta');
 INSERT INTO TI SELECT ID, N, N92 FROM T;
+INSERT INTO TB VALUES (1, 9007199254740991000);
+INSERT INTO TB VALUES (2, 9007199254740990976);
 COMMIT;
 EOF
     chmod 666 "$1"
@@ -140,6 +145,16 @@ raises() { # <label> <full sql> - both sides must error
         *) echo "DIFF $1: fcwire [$a] engine [$b]"; fail=1 ;;
     esac
 }
+fcrefuses() { # <label> <full sql> - a PRICED refusal: fc must refuse a
+    # spelling whose engine answer fc will not reproduce (the engine's
+    # side is deliberately NOT compared - it answers double-collapsed
+    # rows an exact compare never would)
+    a=$(query "$2" "[]" "$PORT" "$A")
+    case "$a" in
+        ERR*) echo "OK   $1 refuses (priced)" ;;
+        *) echo "DIFF $1: fcwire answered [$a]"; fail=1 ;;
+    esac
+}
 
 # --- 1. exact conversion, INTEGER column --------------------------------
 where "N = '2'" "N = '2'"
@@ -181,6 +196,24 @@ where "NSM > '1.999999' - no range check" "NSM > '1.999999'"
 where "NSM = '99999' - [] not an error" "NSM = '99999'"
 where "NBIG = '...806' is ITS row" "NBIG = '9223372036854775806'"
 where "NBIG = '...807' is the OTHER row" "NBIG = '9223372036854775807'"
+# a ZERO column value across a scale gap past 38: 0 x 10^k is 0, and the
+# alignment must not saturate it to i128::MAX (probed rows; the zero
+# N92/N382 row is ID 1, the negative one ID 3)
+where "N92 > '1e-50' keeps the zero row OUT" "N92 > '1e-50'"
+where "N92 >= '1e-50' likewise" "N92 >= '1e-50'"
+where "N92 < '1e-50' keeps the zero row IN" "N92 < '1e-50'"
+where "'1e-50' < N92 - the reversed side" "'1e-50' < N92"
+where "N92 = '1e-50' matches nothing" "N92 = '1e-50'"
+where "N382 > '1e-60' (INT128 storage)" "N382 > '1e-60'"
+# the 2^53 double window tests the FOLDED value: TB's two BIGINTs
+# 9007199254740991000 and ...990976 are ONE double, and the engine's
+# e-notation collapse matches BOTH where the exact spelling matches one
+both "plain '...991000' is ITS row only" \
+     "SELECT ID FROM TB WHERE NB = '9007199254740991000' ORDER BY ID"
+both "e-notation folding INSIDE the window converts" \
+     "SELECT ID FROM TB WHERE NB = '900719925474099e1' ORDER BY ID"
+fcrefuses "a mantissa inside 2^53 whose FOLDED value is not" \
+     "SELECT ID FROM TB WHERE NB = '9007199254740991e3' ORDER BY ID"
 
 # --- 4. unconvertible literals raise on BOTH ----------------------------
 for bad in "x" "" " " "." "--2" "2," "2.5.5" "2e" "e2"; do
@@ -203,6 +236,27 @@ where "no surviving row, no raise" "ID = 99 AND N = 'x'"
 both  "a 0-row DELETE succeeds" "DELETE FROM EMPTY_T WHERE N = 'x'"
 both  "LEFT JOIN an empty side: all outer rows" \
       "SELECT A.ID FROM T A LEFT JOIN EMPTY_T B ON B.N = 'x' AND A.ID = B.ID ORDER BY A.ID"
+# ... but an EMPTY inner stream does not silence a raiser gated on the
+# PRESERVED side: the engine walks its outer stream and evaluates the
+# ON per outer row (probed: LEFT, INNER and FULL raise; a RIGHT join
+# walks the RIGHT stream, so ITS empty side answers []; zero outer
+# rows answer []; a FALSE conjunct beside the raiser short-circuits)
+raises "LEFT JOIN empty inner, preserved-side raiser" \
+       "SELECT A.ID FROM T A LEFT JOIN EMPTY_T B ON A.ID = B.ID AND A.N = 'x' ORDER BY A.ID"
+raises "INNER JOIN empty inner, left-side raiser" \
+       "SELECT A.ID FROM T A JOIN EMPTY_T B ON A.ID = B.ID AND A.N = 'x' ORDER BY A.ID"
+raises "FULL JOIN empty inner, left-side raiser" \
+       "SELECT A.ID FROM T A FULL JOIN EMPTY_T B ON A.ID = B.ID AND A.N = 'x' ORDER BY A.ID"
+both   "zero preserved rows answer [] with no raise" \
+       "SELECT A.ID FROM EMPTY_T A LEFT JOIN EMPTY_T B ON A.ID = B.ID AND A.N = 'x'"
+both   "RIGHT JOIN's empty preserved side answers []" \
+       "SELECT A.ID FROM T A RIGHT JOIN EMPTY_T B ON A.ID = B.ID AND A.N = 'x'"
+raises "RIGHT JOIN walks its right stream: empty LEFT still raises" \
+       "SELECT B.ID FROM EMPTY_T A RIGHT JOIN T B ON A.ID = B.ID AND B.N = 'x' ORDER BY B.ID"
+both   "a FALSE conjunct short-circuits the empty-inner raiser" \
+       "SELECT A.ID FROM T A LEFT JOIN EMPTY_T B ON A.ID = B.ID AND A.ID = -1 AND A.N = 'x' ORDER BY A.ID"
+both   "convertible on the preserved side: all rows padded" \
+       "SELECT A.ID FROM T A LEFT JOIN EMPTY_T B ON A.ID = B.ID AND A.N = ' 2 ' ORDER BY A.ID"
 
 # --- 6. HAVING, joins and expression sides convert ----------------------
 both "HAVING N > '50'" "SELECT N FROM T GROUP BY N HAVING N > '50'"

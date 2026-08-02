@@ -267,5 +267,61 @@ case "$a:$b:$aft_a:$aft_b" in
     *) echo "DIFF NEW.<col>: fcwire [$a] engine [$b] rows [$aft_a] [$aft_b]"; fail=1 ;;
 esac
 
+# --- QUOTED-IDENTIFIER CASE in the RETURNING list ----------------------
+# The engine matches a QUOTED name EXACTLY against the catalog and folds
+# a bare one (probed): `RETURNING "id"` is -206 `Column unknown, "id"` -
+# and writes NOTHING - while `RETURNING ID`, `id` and `"ID"` all answer.
+# The same rule gates the table qualifier: `"t".ID` refuses where `t.ID`
+# and `"T".ID` answer. fc used to strip the quotes and match
+# case-insensitively - rows returned AND a row written for statements
+# the engine refuses, this clause's worst outcome, so the refusing forms
+# check the TABLE as well as the error.
+refused_no_write() { # <label> <sql> <id>
+    a=$(query "$2" "$PORT" "$A")
+    b=$(query "$2" "$REAL" "$B")
+    aft_a=$(query "SELECT COUNT(*) FROM T WHERE ID = $3" "$PORT" "$A")
+    aft_b=$(query "SELECT COUNT(*) FROM T WHERE ID = $3" "$REAL" "$B")
+    case "$a:$b:$aft_a:$aft_b" in
+        ERR*:ERR*:*'"COUNT":0'*:*'"COUNT":0'*)
+            echo "OK   $1 is refused by BOTH, and neither wrote the row" ;;
+        *) echo "DIFF $1: fcwire [$a] engine [$b] rows [$aft_a] [$aft_b]"; fail=1 ;;
+    esac
+}
+refused_no_write 'INSERT ... RETURNING "id" (quoted-lowercase)' \
+    "INSERT INTO T VALUES (80, 800, 'q1') RETURNING \"id\"" 80
+refused_no_write 'INSERT ... RETURNING "t".ID (quoted-lowercase table)' \
+    "INSERT INTO T VALUES (81, 810, 'q2') RETURNING \"t\".ID" 81
+both 'RETURNING "ID" (quoted-uppercase) answers' \
+     "INSERT INTO T VALUES (82, 820, 'q3') RETURNING \"ID\""
+both 'RETURNING id (bare lowercase) folds and answers' \
+     "INSERT INTO T VALUES (83, 830, 'q4') RETURNING id"
+both 'RETURNING "T".ID (quoted-uppercase table) answers' \
+     "INSERT INTO T VALUES (84, 840, 'q5') RETURNING \"T\".ID"
+both 'RETURNING t."ID" (bare table, quoted column) answers' \
+     "INSERT INTO T VALUES (85, 850, 'q6') RETURNING t.\"ID\""
+# UPDATE and DELETE run the same matching
+a=$(query "UPDATE T SET AMT = AMT WHERE ID = 1 RETURNING \"amt\"" "$PORT" "$A")
+b=$(query "UPDATE T SET AMT = AMT WHERE ID = 1 RETURNING \"amt\"" "$REAL" "$B")
+case "$a:$b" in
+    ERR*:ERR*) echo 'OK   UPDATE ... RETURNING "amt" is refused by BOTH' ;;
+    *) echo "DIFF UPDATE RETURNING \"amt\": fcwire [$a] engine [$b]"; fail=1 ;;
+esac
+both 'UPDATE ... RETURNING "AMT" answers' \
+     "UPDATE T SET AMT = AMT + 1 WHERE ID = 85 RETURNING \"AMT\""
+# a refused DELETE must leave its target row IN PLACE on both sides
+a=$(query "DELETE FROM T WHERE ID = 1 RETURNING \"id\"" "$PORT" "$A")
+b=$(query "DELETE FROM T WHERE ID = 1 RETURNING \"id\"" "$REAL" "$B")
+aft_a=$(query "SELECT COUNT(*) FROM T WHERE ID = 1" "$PORT" "$A")
+aft_b=$(query "SELECT COUNT(*) FROM T WHERE ID = 1" "$REAL" "$B")
+case "$a:$b:$aft_a:$aft_b" in
+    ERR*:ERR*:*'"COUNT":1'*:*'"COUNT":1'*)
+        echo 'OK   DELETE ... RETURNING "id" is refused by BOTH, row kept' ;;
+    *) echo "DIFF DELETE RETURNING \"id\": fcwire [$a] engine [$b] rows [$aft_a] [$aft_b]"; fail=1 ;;
+esac
+both 'DELETE ... RETURNING "ID" answers' \
+     "DELETE FROM T WHERE ID = 85 RETURNING \"ID\""
+both "the table after the quoted-identifier block" \
+     "SELECT ID, AMT, NAME FROM T ORDER BY ID"
+
 rm -f "$A" "$B"
 exit $fail
