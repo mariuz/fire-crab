@@ -3096,6 +3096,55 @@ fn not_null_fids(db: &Database, table: &str) -> Vec<usize> {
     out
 }
 
+/// The IDENTITY columns of a table: `(field id, backing generator
+/// name, identity type)` with type 0 = GENERATED ALWAYS, 1 = BY
+/// DEFAULT - read from RDB$RELATION_FIELDS.RDB$GENERATOR_NAME /
+/// RDB$IDENTITY_TYPE through the computed system format (the same walk
+/// `not_null_fids` does; rows whose identity type is NULL are ordinary
+/// columns and skipped). What the engine's insert draws the next value
+/// from: an identity column omitted from the column list takes
+/// `GEN_ID(RDB$n, increment)`, an explicit value into an ALWAYS column
+/// without OVERRIDING refuses at prepare (probed).
+fn identity_columns(db: &Database, table: &str) -> Vec<(usize, String, i64)> {
+    use fire_crab_ods::format::Value;
+    let Some(formats) =
+        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes, db.page_size, "RDB$RELATION_FIELDS")
+    else {
+        return Vec::new();
+    };
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else {
+        return Vec::new();
+    };
+    let cols = relation_columns(&db.bytes, db.page_size, "RDB$RELATION_FIELDS");
+    let fid_of = |name: &str| {
+        cols.iter()
+            .find(|c| c.name == name)
+            .map(|c| c.field_id as usize)
+    };
+    let (Some(rel_fid), Some(id_fid), Some(gen_fid), Some(idt_fid)) = (
+        fid_of("RDB$RELATION_NAME"),
+        fid_of("RDB$FIELD_ID"),
+        fid_of("RDB$GENERATOR_NAME"),
+        fid_of("RDB$IDENTITY_TYPE"),
+    ) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let fmts = vec![(0u8, descs.clone())];
+    for_each_record(db, 5, &fmts, |values| {
+        let is_rel = matches!(values.get(rel_fid), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(table));
+        if !is_rel {
+            return;
+        }
+        let Some(Value::Int(idtype)) = values.get(idt_fid) else { return };
+        let Some(Value::Text(gen)) = values.get(gen_fid) else { return };
+        if let Some(Value::Int(id)) = values.get(id_fid) {
+            out.push((*id as usize, gen.trim_end().to_string(), *idtype));
+        }
+    });
+    out
+}
+
 /// Whether a table column is COMPUTED: its descriptor sits at offset 0
 /// with a real type. No stored field can live at offset 0 (the null
 /// flags do), and a DROPPED-field placeholder there is all-zero. A
@@ -8916,7 +8965,26 @@ fn dml_table_name(sql: &str) -> Option<String> {
     let (kw, after) = if find_word(&masked, "INSERT", 0) == Some(0) {
         ("INTO", find_word(&masked, "INTO", 0)?)
     } else if find_word(&masked, "UPDATE", 0) == Some(0) {
-        ("UPDATE", 0)
+        // `UPDATE OR INSERT INTO <t> ...`: the token after UPDATE is
+        // `OR`, not the table. The same head walk plan_upsert does -
+        // OR, INSERT, INTO, with nothing between - resolves the table
+        // after INTO. (Before this, wrap_returning was handed `OR` as
+        // the relation and every upsert RETURNING refused at prepare
+        // while the engine answers the after-image as a cursor.)
+        let upsert_into = find_word(&masked, "OR", "UPDATE".len())
+            .filter(|&or| masked["UPDATE".len()..or].trim().is_empty())
+            .and_then(|or| {
+                find_word(&masked, "INSERT", or + "OR".len())
+                    .filter(|&ins| masked[or + "OR".len()..ins].trim().is_empty())
+            })
+            .and_then(|ins| {
+                find_word(&masked, "INTO", ins + "INSERT".len())
+                    .filter(|&into| masked[ins + "INSERT".len()..into].trim().is_empty())
+            });
+        match upsert_into {
+            Some(into) => ("INTO", into),
+            None => ("UPDATE", 0),
+        }
     } else if find_word(&masked, "DELETE", 0) == Some(0) {
         ("FROM", find_word(&masked, "FROM", 0)?)
     } else {
@@ -9101,6 +9169,47 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                 gen_fields.push((rc.field_id as usize, name.clone(), *step));
             }
             _ => {}
+        }
+    }
+    // IDENTITY columns (probed against FB6):
+    //   * OMITTED from the column list -> the next value from the
+    //     backing RDB$n generator, advanced by its own declared
+    //     increment - the ordinary gen_fields bump, which patches the
+    //     image BEFORE the Affected push and NOT-NULL validation, so
+    //     RETURNING answers the assigned id and validation passes.
+    //     START WITH / INCREMENT BY come free: the slot is primed to
+    //     start - increment (gate-verified in serve-real-identity.sh).
+    //   * an explicit value into a GENERATED ALWAYS column WITHOUT
+    //     OVERRIDING -> the engine refuses AT PREPARE with
+    //     isc_overriding_missing (335545137), and the IMPLICIT column
+    //     list counts too. fc used to accept and WRITE that row - the
+    //     one wrong write of this slice.
+    //   * an explicit value into a BY DEFAULT column -> stored as
+    //     given, the generator NOT advanced (probed: GEN_ID unmoved
+    //     after inserting 50 explicitly; later inserts may collide -
+    //     engine-faithful, keep).
+    for (fid, gen_name, idtype) in identity_columns(db, table) {
+        if targets.iter().any(|rc| rc.field_id as usize == fid) {
+            if idtype == 0 {
+                return Some((
+                    Plan::RefusedEval(EvalErr::OverridingMissing(format!(
+                        "\"PUBLIC\".\"{}\"",
+                        table.to_ascii_uppercase()
+                    ))),
+                    Vec::new(),
+                ));
+            }
+            // BY DEFAULT with an explicit value: leave alone
+        } else {
+            // the same prepare-time rules as an explicit GEN_ID
+            // target: an integer column, and a generator that exists -
+            // refuse rather than fail mid-write
+            let d = descs.get(fid)?;
+            if !matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64) || d.scale != 0 {
+                return None;
+            }
+            generator_info(db, &gen_name)?;
+            gen_fields.push((fid, gen_name, None));
         }
     }
     let params: Vec<Descriptor> = params.into_iter().collect::<Option<_>>()?;
@@ -10010,6 +10119,14 @@ fn plan_upsert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     if !ups.is_empty() || !ips.is_empty() {
         return None;
     }
+    // the insert half can plan to a REFUSAL (an explicit value into a
+    // GENERATED ALWAYS identity) - wrapping that in UpdateOrInsert
+    // would move the error to execute time, AFTER the update half ran.
+    // The upsert form of that error is unprobed, so refuse generically
+    // at prepare: an error either way, and nothing written.
+    if matches!(insert, Plan::RefusedEval(_)) {
+        return None;
+    }
     Some((
         Plan::UpdateOrInsert { update: Box::new(update), insert: Box::new(insert) },
         Vec::new(),
@@ -10538,14 +10655,30 @@ fn execute_dml_collecting(
     // the upsert recurses BEFORE the working copy is taken: each half
     // commits through the ordinary path, and the row count of the
     // update half decides whether the insert half runs at all - the
-    // engine's try-update, test row_count, store plan
+    // engine's try-update, test row_count, store plan. `affected`
+    // threads through BOTH halves: with RETURNING wrapped around the
+    // upsert the engine answers the AFTER image of whichever half ran,
+    // one row per updated row (probed: a MATCHING that updates two
+    // NOPK rows returns BOTH - a cursor, no singleton error in FB6).
     if let Plan::UpdateOrInsert { update, insert } = plan {
-        let (_, updated, _) = execute_dml(update, database, args, ctx)?;
+        let (_, updated, _) =
+            execute_dml_collecting(update, database, args, ctx, affected.as_deref_mut())?;
         if updated > 0 {
             return Ok((0, updated, 0));
         }
-        let (inserted, _, _) = execute_dml(insert, database, args, ctx)?;
+        let (inserted, _, _) = execute_dml_collecting(insert, database, args, ctx, affected)?;
         return Ok((inserted, 0, 0));
+    }
+    // INSERT INTO ... SELECT: materialise the query's rows and store
+    // each through the ORDINARY insert path (defaults, NOT NULL,
+    // CHECK, FK, identity and index maintenance all apply). It runs
+    // BEFORE the working copy is taken because every row re-enters
+    // this function; RETURNING collects each stored image in insertion
+    // order (probed: the engine writes the source rows and returns ALL
+    // of them as a cursor, in select order; a zero-row source is an
+    // empty cursor with records affected 0).
+    if let Plan::InsertSelect { table, cols, query } = plan {
+        return insert_select(table, cols, query, database, ctx, affected).map(|n| (n, 0, 0));
     }
     if let Plan::RefusedEval(e) = plan {
         return Err(ExecErr::Eval(e.clone()));
@@ -18548,6 +18681,10 @@ const GDS_FOREIGN_KEY: i32 = 335544466;
 const GDS_FK_TARGET_MISSING: i32 = 335544838;
 const GDS_FK_REFS_PRESENT: i32 = 335544839;
 const GDS_NOT_VALID: i32 = 335544347;
+/// `isc_overriding_missing` (jrd.h msg 817, -902, SQLSTATE 42000):
+/// an explicit value into a GENERATED ALWAYS identity column without
+/// OVERRIDING - the engine raises it at PREPARE
+const GDS_OVERRIDING_MISSING: i32 = 335545137;
 const GDS_CHECK_CONSTRAINT: i32 = 335544558;
 const GDS_STACK_TRACE: i32 = 335544842;
 
@@ -18677,6 +18814,16 @@ fn eval_status_vector(w: &mut W, e: &EvalErr) {
                 .bytes(column.as_bytes())
                 .int(2) // isc_arg_string - `*** null ***`, unquoted
                 .bytes(value.as_bytes());
+        }
+        EvalErr::OverridingMissing(table) => {
+            // no GDS_DSQL_ERROR wrapper (unlike PrimaryKeyRequired):
+            // the engine ships the one code and its table argument -
+            // isql renders a single line, and the node channel
+            // surfaces 335545137 as the dispatch code
+            w.int(1) // isc_arg_gds
+                .int(GDS_OVERRIDING_MISSING)
+                .int(2) // isc_arg_string
+                .bytes(table.as_bytes());
         }
         EvalErr::CheckViolation { constraint, table, trigger } => {
             w.int(1) // isc_arg_gds
@@ -21841,6 +21988,16 @@ enum EvalErr {
     /// column and the value text - `*** null ***`, NOT quoted (the one
     /// unquoted argument in the family, per the raw capture)
     NotValid { column: String, value: String },
+    /// an explicit value into a `GENERATED ALWAYS` identity column
+    /// without an OVERRIDING clause: `isc_overriding_missing`
+    /// (335545137, SQLSTATE 42000), the schema-qualified table name as
+    /// the message argument - the engine raises this at PREPARE, and
+    /// the IMPLICIT column list counts too (probed: `INSERT INTO IDA
+    /// VALUES (60,'q')` raises the same error). No `isc_dsql_error`
+    /// wrapper: the engine renders the one line alone (micro-probed
+    /// via isql - a single SQLSTATE 42000 message, no "Dynamic SQL
+    /// Error" item before it)
+    OverridingMissing(String),
     /// a CHECK constraint violation: `isc_check_constraint` + the
     /// `isc_stack_trace` "At trigger ..." item naming the check trigger
     /// that fired (omitted when the trigger name is unknown)
@@ -27569,6 +27726,7 @@ fn insert_select(
     query: &str,
     database: &mut Option<Database>,
     ctx: &SessionCtx,
+    mut affected: Option<&mut Affected>,
 ) -> Result<i32, ExecErr> {
     // the target's column names, when the statement did not list them
     let target: Vec<String> = if cols.is_empty() {
@@ -27616,8 +27774,13 @@ fn insert_select(
             );
             let (plan, _) = plan_insert(&sql, database).ok_or("row insert refused")?;
             // the row's own error propagates TYPED - a 23000 vector
-            // must survive to the wire, not be flattened to text
-            execute_dml(&plan, database, &[], ctx)?;
+            // must survive to the wire, not be flattened to text.
+            // Collecting: each row's Insert arm pushes its stored
+            // image (post-defaults, post-generator) in insertion
+            // order, which is the order the engine's RETURNING cursor
+            // answered in the probe. On a row failure the local
+            // Affected is dropped with the error - no phantom rows.
+            execute_dml_collecting(&plan, database, &[], ctx, affected.as_deref_mut())?;
             Ok(())
         })();
         if let Err(e) = step {
@@ -29813,6 +29976,16 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         _ => plan_delete(&dml_sql, &database),
                     };
                     let planned = match (planned, &returning) {
+                        // VECTOR-AT-PREPARE: wrap_returning over a
+                        // refused plan would produce Returning{inner:
+                        // RefusedEval}, prepare would succeed, and the
+                        // vector would surface at EXECUTE - where the
+                        // engine raises primary-key-required /
+                        // overriding-missing at PREPARE even with a
+                        // RETURNING clause (probed). Pass the refusal
+                        // through unwrapped so the RefusedEval arm
+                        // below answers it at prepare.
+                        (Some((p @ Plan::RefusedEval(_), ps)), Some(_)) => Some((p, ps)),
                         (Some((p, ps)), Some(list)) => match dml_table_name(&dml_sql)
                             .and_then(|t| wrap_returning(p, ps, list, &t, &database))
                         {
@@ -29985,12 +30158,11 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 ) {
                     // DML and DDL execute here (not at fetch): write the
                     // new versions (or the new catalog) into a copy of
-                    // the page image, swap it in and flush back
-                    // INSERT ... SELECT: materialise the query's rows,
-                    // then insert each one through the ORDINARY insert
-                    // path so defaults, NOT NULL, CHECK, FK and index
-                    // maintenance all apply. Done here rather than inside
-                    // execute_dml because each row re-enters it.
+                    // the page image, swap it in and flush back.
+                    // INSERT ... SELECT rides the generic execute_dml
+                    // path below - execute_dml_collecting's own arm
+                    // materialises the query's rows and re-enters per
+                    // row, so bare and RETURNING forms share one path.
                     if let Plan::Savepoint { kind, name } = &plan {
                         let pos = savepoints.iter().position(|(n, _)| n.eq_ignore_ascii_case(name));
                         if std::env::var("FC_SRV_TRACE").is_ok() {
@@ -30047,34 +30219,6 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         }
                         last_dml = (0, 0, 0);
                         respond(&mut s, &mut enc, TX_HANDLE)?;
-                    } else if let Plan::InsertSelect { table, cols, query } = &plan {
-                        let ctx = SessionCtx { user, attach_id };
-                        match insert_select(table, cols, query, &mut database, &ctx) {
-                            Ok(n) => {
-                                last_dml = (n, 0, 0);
-                                if std::env::var("FC_SRV_TRACE").is_ok() {
-                                    eprintln!("[srv] insert-select: {} inserted", n);
-                                }
-                                respond(&mut s, &mut enc, TX_HANDLE)?;
-                            }
-                            Err(e) => {
-                                last_dml = (0, 0, 0);
-                                if std::env::var("FC_SRV_TRACE").is_ok() {
-                                    eprintln!("[srv] insert-select failed: {}", e);
-                                }
-                                // the same Eval/Text split as the other
-                                // DML arms: the failing row's 23000
-                                // vector ships verbatim
-                                match e {
-                                    ExecErr::Eval(ev) => {
-                                        respond_eval_error(&mut s, &mut enc, &ev)?
-                                    }
-                                    ExecErr::Text(_) => {
-                                        respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
-                                    }
-                                }
-                            }
-                        }
                     } else if let Plan::Returning { inner, cols, fields } = &plan {
                         // the DML runs HERE, like every other write, and
                         // the rows it touched become the cursor the client
@@ -37939,6 +38083,129 @@ mod tests {
             }),
             4
         );
+    }
+
+    // `dml_table_name` used to take the token after UPDATE as the
+    // table, so `UPDATE OR INSERT ...` resolved relation `OR` and every
+    // upsert RETURNING refused at prepare (probed PREP_ERR) while the
+    // engine answers the after-image as a cursor. The fix walks the
+    // OR/INSERT/INTO head exactly as plan_upsert does.
+    #[test]
+    fn dml_table_name_resolves_the_upsert_head() {
+        assert_eq!(
+            dml_table_name("UPDATE OR INSERT INTO WPK (A, B) VALUES (5, 'five')").as_deref(),
+            Some("WPK")
+        );
+        assert_eq!(
+            dml_table_name("UPDATE OR INSERT INTO NOPK (A, B) VALUES (9, 'z') MATCHING (A)")
+                .as_deref(),
+            Some("NOPK")
+        );
+        // a quoted table keeps its spelling (quotes stripped)
+        assert_eq!(
+            dml_table_name("UPDATE OR INSERT INTO \"T2\" (A) VALUES (1)").as_deref(),
+            Some("T2")
+        );
+        // a plain UPDATE still answers its own table - including one
+        // whose name merely STARTS with OR (find_word is word-exact)
+        assert_eq!(dml_table_name("UPDATE T SET A = 1").as_deref(), Some("T"));
+        assert_eq!(
+            dml_table_name("UPDATE ORDERS SET A = 1").as_deref(),
+            Some("ORDERS")
+        );
+        // INSERT and DELETE are untouched
+        assert_eq!(
+            dml_table_name("INSERT INTO T (A) VALUES (1)").as_deref(),
+            Some("T")
+        );
+        assert_eq!(dml_table_name("DELETE FROM T WHERE A = 1").as_deref(), Some("T"));
+    }
+
+    // probed against FB6 through node's newStatement().type: the
+    // RETURNING forms of upsert and insert-select are type-1 CURSORS
+    // (the engine returns one row per touched row - two for a MATCHING
+    // that updates two rows, three for a three-row source), while the
+    // bare forms stay type 2 (insert).
+    #[test]
+    fn upsert_and_insert_select_returning_announce_cursors() {
+        let insert = || {
+            Box::new(Plan::Insert {
+                rel: 128,
+                table: "T".into(),
+                format_no: 0,
+                image: Vec::new(),
+                descs: Vec::new(),
+                index_ops: Vec::new(),
+                param_fields: Vec::new(),
+                gen_fields: Vec::new(),
+                not_null: Vec::new(),
+                checks: Vec::new(),
+                fk_refs: Vec::new(),
+                default_fields: Vec::new(),
+            })
+        };
+        let update = || {
+            Box::new(Plan::Update {
+                rel: 128,
+                table: "T".into(),
+                format_no: 0,
+                formats: Vec::new(),
+                sets: Vec::new(),
+                filter: None,
+                index_ops: Vec::new(),
+                not_null: Vec::new(),
+                checks: Vec::new(),
+                fk_refs: Vec::new(),
+                fk_children: Vec::new(),
+                index: None,
+            })
+        };
+        let upsert = Plan::UpdateOrInsert { update: update(), insert: insert() };
+        let insel = Plan::InsertSelect {
+            table: "DST".into(),
+            cols: Vec::new(),
+            query: "SELECT X FROM SRC".into(),
+        };
+        assert_eq!(stmt_type_of(&upsert), 2);
+        assert_eq!(stmt_type_of(&insel), 2);
+        let wrap = |p: Plan| Plan::Returning {
+            inner: Box::new(p),
+            cols: Vec::new(),
+            fields: Vec::new(),
+        };
+        assert_eq!(
+            stmt_type_of(&wrap(Plan::UpdateOrInsert { update: update(), insert: insert() })),
+            1
+        );
+        assert_eq!(
+            stmt_type_of(&wrap(Plan::InsertSelect {
+                table: "DST".into(),
+                cols: Vec::new(),
+                query: "SELECT X FROM SRC".into(),
+            })),
+            1
+        );
+    }
+
+    // the isc_overriding_missing vector, byte for byte: ONE gds code
+    // (335545137) and the schema-qualified table - no isc_dsql_error
+    // wrapper, unlike PrimaryKeyRequired (micro-probed: isql renders a
+    // single SQLSTATE 42000 line, no "Dynamic SQL Error" item)
+    #[test]
+    fn overriding_missing_vector_matches_the_probe() {
+        let mut w = W::default();
+        eval_status_vector(&mut w, &EvalErr::OverridingMissing("\"PUBLIC\".\"IDA\"".into()));
+        let mut want = Vec::new();
+        let int = |b: &mut Vec<u8>, v: i32| b.extend_from_slice(&v.to_be_bytes());
+        int(&mut want, 1); // isc_arg_gds
+        int(&mut want, 335545137);
+        int(&mut want, 2); // isc_arg_string, XDR counted + padded
+        let t = "\"PUBLIC\".\"IDA\"";
+        int(&mut want, t.len() as i32);
+        want.extend_from_slice(t.as_bytes());
+        want.extend(std::iter::repeat(0).take((4 - t.len() % 4) % 4));
+        int(&mut want, 0); // isc_arg_end
+        assert_eq!(w.buf, want);
     }
 
     #[test]

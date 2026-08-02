@@ -47,10 +47,19 @@ make_db() {
 CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE T (ID INTEGER, AMT INTEGER, NAME VARCHAR(20));
 CREATE TABLE G (ID INTEGER NOT NULL PRIMARY KEY, N INTEGER DEFAULT 7);
+CREATE TABLE WPK (A INTEGER NOT NULL PRIMARY KEY, B VARCHAR(10));
+CREATE TABLE NOPK (A INTEGER, B VARCHAR(10));
+CREATE TABLE SRC (X INTEGER, Y VARCHAR(10));
+CREATE TABLE DST (X INTEGER, Y VARCHAR(10));
 COMMIT;
 INSERT INTO T VALUES (1, 10, 'aa');
 INSERT INTO T VALUES (2, 20, 'bb');
 INSERT INTO T VALUES (3, NULL, 'cc');
+INSERT INTO NOPK VALUES (9, 'a');
+INSERT INTO NOPK VALUES (9, 'b');
+INSERT INTO SRC VALUES (1, 'u');
+INSERT INTO SRC VALUES (2, 'v');
+INSERT INTO SRC VALUES (3, 'w');
 COMMIT;
 EOF
     chmod 666 "$1"
@@ -322,6 +331,79 @@ both 'DELETE ... RETURNING "ID" answers' \
      "DELETE FROM T WHERE ID = 85 RETURNING \"ID\""
 both "the table after the quoted-identifier block" \
      "SELECT ID, AMT, NAME FROM T ORDER BY ID"
+
+# --- UPDATE OR INSERT ... RETURNING ------------------------------------
+# probed against FB6: the upsert's RETURNING is a 1-row CURSOR (ARR, not
+# the insert-values OBJ singleton) - the insert branch answers the
+# STORED row, the update branch the AFTER image; a MATCHING that updates
+# TWO rows returns BOTH (one row per updated row - no singleton error in
+# FB6). fc used to refuse all of these at prepare: dml_table_name took
+# the token after UPDATE - `OR` - as the table.
+both "upsert RETURNING, insert branch (ARR, the stored row)" \
+     "UPDATE OR INSERT INTO WPK (A, B) VALUES (1, 'one') RETURNING A, B"
+both "upsert RETURNING, update branch (ARR, the AFTER image)" \
+     "UPDATE OR INSERT INTO WPK (A, B) VALUES (1, 'uno') RETURNING A, B"
+a=$(query "UPDATE OR INSERT INTO NOPK (A, B) VALUES (9, 'z') MATCHING (A) RETURNING A, B" "$PORT" "$A")
+b=$(query "UPDATE OR INSERT INTO NOPK (A, B) VALUES (9, 'z') MATCHING (A) RETURNING A, B" "$REAL" "$B")
+want='ARR [{"A":9,"B":"z"},{"A":9,"B":"z"}]'
+if [ "$a" = "$b" ] && [ "$a" = "$want" ]; then
+    echo "OK   MATCHING multi-match returns one row PER updated row: $a"
+else
+    echo "DIFF MATCHING multi-match RETURNING"
+    echo "     fcwire: $a"; echo "     engine: $b"; echo "     want:   $want"; fail=1
+fi
+both "both files' NOPK after the multi-match" "SELECT A, B FROM NOPK ORDER BY A, B"
+# PK-less upsert without MATCHING refuses AT PREPARE - with RETURNING
+# wrapped around it the vector must NOT move to execute time (the
+# pass-through: wrap_returning never sees a RefusedEval plan)
+a=$(query "UPDATE OR INSERT INTO NOPK (A, B) VALUES (1, 'x') RETURNING A" "$PORT" "$A")
+b=$(query "UPDATE OR INSERT INTO NOPK (A, B) VALUES (1, 'x') RETURNING A" "$REAL" "$B")
+aft_a=$(query "SELECT COUNT(*) FROM NOPK WHERE A = 1" "$PORT" "$A")
+aft_b=$(query "SELECT COUNT(*) FROM NOPK WHERE A = 1" "$REAL" "$B")
+case "$a:$b:$aft_a:$aft_b" in
+    ERR*"Primary key required on table"*:ERR*"Primary key required on table"*:*'"COUNT":0'*:*'"COUNT":0'*)
+        echo "OK   PK-less upsert RETURNING refuses at prepare with the engine's vector, nothing written" ;;
+    *) echo "DIFF PK-less upsert RETURNING: fcwire [$a] engine [$b] rows [$aft_a] [$aft_b]"; fail=1 ;;
+esac
+
+# --- INSERT INTO ... SELECT ... RETURNING ------------------------------
+# probed: multi-row RETURNING is real in FB6 - a three-row source writes
+# three rows and returns ALL THREE as a cursor, in select order; a
+# zero-row source answers an EMPTY cursor (records affected 0), not an
+# error. fc used to prepare this and then die at execute (no InsertSelect
+# arm in execute_dml_collecting) - writing NOTHING while announcing a
+# cursor.
+a=$(query "INSERT INTO DST (X, Y) SELECT X, Y FROM SRC RETURNING X, Y" "$PORT" "$A")
+b=$(query "INSERT INTO DST (X, Y) SELECT X, Y FROM SRC RETURNING X, Y" "$REAL" "$B")
+want='ARR [{"X":1,"Y":"u"},{"X":2,"Y":"v"},{"X":3,"Y":"w"}]'
+if [ "$a" = "$b" ] && [ "$a" = "$want" ]; then
+    echo "OK   INSERT..SELECT..RETURNING returns every inserted row, in select order: $a"
+else
+    echo "DIFF INSERT..SELECT..RETURNING"
+    echo "     fcwire: $a"; echo "     engine: $b"; echo "     want:   $want"; fail=1
+fi
+both "zero-row source: an EMPTY cursor, and nothing written" \
+     "INSERT INTO DST (X, Y) SELECT X, Y FROM SRC WHERE X > 999 RETURNING X, Y"
+both "both files' DST after the insert-selects" "SELECT X, Y FROM DST ORDER BY X"
+
+# --- the announced types of the new forms ------------------------------
+# probed [node-eng newStatement().type]: plain upsert and bare
+# insert-select are type 2 (insert); BOTH RETURNING forms are type-1
+# CURSORS - unlike insert-values RETURNING, which is the type-8
+# singleton pinned above
+for probe in "UPDATE OR INSERT INTO WPK (A, B) VALUES (5, 'five'):TYPE 2" \
+             "UPDATE OR INSERT INTO WPK (A, B) VALUES (5, 'five') RETURNING A, B:TYPE 1" \
+             "INSERT INTO DST (X, Y) SELECT X, Y FROM SRC:TYPE 2" \
+             "INSERT INTO DST (X, Y) SELECT X, Y FROM SRC RETURNING X, Y:TYPE 1"; do
+    sql=${probe%:*}; wanttype=${probe##*:}
+    a=$(tprobe "$sql" "$PORT" "$A")
+    b=$(tprobe "$sql" "$REAL" "$B")
+    if [ "$a" = "$b" ] && [ "$a" = "$wanttype" ]; then
+        echo "OK   announced type $a: $sql"
+    else
+        echo "DIFF announced type of [$sql]: fcwire [$a] engine [$b] want [$wanttype]"; fail=1
+    fi
+done
 
 rm -f "$A" "$B"
 exit $fail

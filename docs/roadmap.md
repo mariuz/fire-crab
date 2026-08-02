@@ -579,22 +579,21 @@ four; R7 is the removal of what they replaced.
   package qualifier is not a schema qualifier, and the PUBLIC rule
   currently swallows both. Pre-existing, refusal-only. Unclaimed.
 
-- **`INSERT ... SELECT ... RETURNING` refuses at EXECUTE** — fc
-  prepares it TYPE 1 (matching the engine) but execution answers
-  `Dynamic SQL Error` with no write where the engine answers
-  `ARR [{"ID":201}]` and writes; the op_execute Returning arm never
-  learned the InsertSelect plan. When a script runs both sides the
-  states fork. Unclaimed.
+- ~~`INSERT ... SELECT ... RETURNING` refuses at EXECUTE~~ — *fixed*:
+  the multi-row cursor answers in select order through the one
+  insert_select path (the bare special case deleted).
 
-- **`UPDATE OR INSERT ... MATCHING ... RETURNING` fails at PREPARE** —
-  `dml_table_name` reads the token after UPDATE and takes `OR` as the
-  table name; the engine prepares TYPE 1 and answers. Parse bug,
-  refusal-only. Unclaimed.
+- ~~`UPDATE OR INSERT ... MATCHING ... RETURNING` fails at PREPARE~~ —
+  *fixed*: dml_table_name walks the OR/INSERT/INTO head; a multi-match
+  MATCHING answers one row per updated row.
 
-- **An IDENTITY-column INSERT refuses** — `INSERT INTO IDT (V) VALUES
-  ('x')` refuses even without RETURNING where the engine answers and
-  generates `ID=1`. The identity generator never fires on fc's insert
-  path. Unclaimed.
+- ~~An IDENTITY-column INSERT refuses~~ — *fixed*: an omitted
+  identity column generates through the shared generator substrate
+  (RETURNING and NOT NULL come free); an explicit value into
+  GENERATED ALWAYS refuses with the engine's vector (335545137) — a
+  wrong write closed. OVERRIDING SYSTEM|USER VALUE, INSERT DEFAULT
+  VALUES, params in an INSERT..SELECT source, and the
+  rollback-generator durability class stay recorded.
 
 - **Constraint errors surface as generic 42000 `Dynamic SQL Error`,
   never 23000 with the constraint/key detail** — a duplicate-key
