@@ -498,7 +498,37 @@ four; R7 is the removal of what they replaced.
   only up to sixteen significant digits and checks correctness directly
   beyond that.
 
-- **`RETURNING` comes back in a different shape.** Through node-firebird
+- ~~`RETURNING` comes back in a different shape~~ — *fixed*. The
+  engine announces `INSERT ... RETURNING` (values form) as statement
+  type 8 (exec_procedure) and answers the row INLINE on op_execute2;
+  node-firebird branches object-vs-array on exactly that. fc announces
+  8 for the Insert inner now and answers the ProcInvoke framing at
+  execute2 (capacity enforcement moved to execute2-time, driver
+  rollback keeps the outblr persistence check honest);
+  UPDATE/DELETE RETURNING stay type 1 (probed).
+
+- ~~`EXECUTE PROCEDURE` on an engine-created FB6 procedure fails~~ —
+  *fixed, and the diagnosis was wrong twice*: every procedure is
+  engine-created (fc has no CREATE PROCEDURE), and the failing shape
+  was the SCHEMA-QUALIFIED call. Three name-handling defects:
+  `parse_execute_procedure` swallowed the dot; `split_proc_call`
+  refused it; and the catalog scans matched by BARE name, merging
+  FB6's packaged SYSTEM rows (`RDB$PROFILER.FLUSH` collided with a
+  user FLUSH → arity error). `catalog_row_public` filters both scans
+  now (package/schema NULL-or-PUBLIC, absent-column tolerant for
+  pre-schema ODS). `strip_gen_name` had the same disease plus a WRONG
+  ANSWER: a foreign-qualifier `GEN_ID(NOSCHEMA.SQ1,0)` answered where
+  the engine raises — refuses now.
+
+- **Qualified TABLE/VIEW references still refuse everywhere**
+  (`FROM PUBLIC.T`, `INSERT INTO PUBLIC.T`, `SYSTEM.RDB$RELATIONS`) —
+  its own slice; refusals, no wrong-answer risk.
+
+- **A non-selectable procedure in FROM answers `[]`** where the
+  engine raises "not selectable (no SUSPEND)" — a pre-existing wrong
+  answer found by the qualified-call probes. Unclaimed.
+
+- **(superseded)** `RETURNING` comes back in a different shape. Through node-firebird
   the engine answers an `INSERT ... RETURNING` as a single object and
   fire-crab as an array of one. The values agree; the statement's
   announced *type* apparently does not. Noticed while diffing 495

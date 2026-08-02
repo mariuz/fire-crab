@@ -12854,23 +12854,25 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
 // join or another view, an expression or aggregate in the view's select
 // list, `*`, and GROUP BY/HAVING/ORDER BY inside the view.
 
-/// Split a FROM item that is a procedure call: `P` or `P(1, 2)`.
-/// Returns the name and the argument text, if any.
+/// Split a FROM item that is a procedure call: `P` or `P(1, 2)`,
+/// possibly schema-qualified (`PUBLIC.P(1)`, `"PUBLIC"."P"(1)` - the
+/// engine answers these, probed). [public_object_name] applies the
+/// PUBLIC rule: a foreign qualifier is None, and so is any non-name -
+/// the caller then tries the item as a view or table. A qualified name
+/// whose PROCEDURE does not exist also falls through there, exactly as
+/// an unqualified one always has (load_procedure decides).
 fn split_proc_call(table_s: &str) -> Option<(String, Option<String>)> {
     let t = table_s.trim();
     match t.find('(') {
         None => {
-            let n = t.trim_matches('"');
-            if ident_ok(n) { Some((n.to_string(), None)) } else { None }
+            let n = public_object_name(t)?;
+            Some((n, None))
         }
         Some(at) => {
-            let name = t[..at].trim().trim_matches('"');
+            let name = public_object_name(t[..at].trim())?;
             let rest = t[at + 1..].trim();
             let inner = rest.strip_suffix(')')?;
-            if !ident_ok(name) {
-                return None;
-            }
-            Some((name.to_string(), Some(inner.trim().to_string())))
+            Some((name, Some(inner.trim().to_string())))
         }
     }
 }
@@ -14507,12 +14509,22 @@ fn plan_query_inner(
     }
     // EXECUTE PROCEDURE is not a SELECT, but isql prepares and FETCHES
     // it like one, so it resolves to a plan here (see PSQL EXECUTION).
-    if let Some((pname, pargs)) = parse_execute_procedure(sql) {
+    if let Some((qual, pname, pargs)) = parse_execute_procedure(sql) {
         let db = db.as_ref()?;
         // a `?` argument would have to arrive with op_execute; this
         // slice takes literals only
         let args: Vec<Value> = pargs.into_iter().collect::<Option<Vec<_>>>()?;
-        let Some(meta) = load_procedure(db, &pname) else {
+        // THE PUBLIC RULE: a foreign schema qualifier (`SYSTEM.PADD`,
+        // `NOSCHEMA.PADD`) names an object this catalog does not hold,
+        // and the engine refuses it too (probed: -204 Procedure
+        // unknown) - so the lookup is skipped and the same refusal
+        // answers. Message texts differ exactly as they already do for
+        // an unqualified unknown name - a recorded divergence.
+        let meta = match &qual {
+            Some(q) if q != "PUBLIC" => None,
+            _ => load_procedure(db, &pname),
+        };
+        let Some(meta) = meta else {
             if trace {
                 eprintln!("[srv] plan: no such procedure {:?}", pname);
             }
@@ -17500,11 +17512,23 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::Refused
         | Plan::RefusedEval(_)
         | Plan::VirtualEmpty { .. }
-        // a DML with RETURNING is a CURSOR in Firebird 5, so it is typed
-        // as a SELECT - a client dispatches on this, and announcing the
-        // DML type instead makes it fetch nothing
-        | Plan::Rows { .. }
-        | Plan::Returning { .. } => 1,
+        // a DML with RETURNING is a CURSOR, so it is typed as a SELECT -
+        // a client dispatches on this, and announcing the DML type
+        // instead makes it fetch nothing
+        | Plan::Rows { .. } => 1,
+        // ... EXCEPT the INSERT ... VALUES flavor, which the engine
+        // announces as exec_procedure (probed via node's
+        // newStatement().type against FB6: insert-values RETURNING is 8;
+        // UPDATE/DELETE/INSERT..SELECT RETURNING stay 1). Both driver
+        // generations dispatch on the 8 to op_execute2 and deliver the
+        // ONE returned row as a single object, not an array - so this
+        // switch must never land without the op_execute2 Returning arm
+        // that serves the singleton. fc's Plan::Insert is exactly the
+        // VALUES flavor; InsertSelect is its own plan and wrap_returning
+        // can wrap it - that combination stays 1, matching the engine.
+        Plan::Returning { inner, .. } => {
+            if matches!(inner.as_ref(), Plan::Insert { .. }) { 8 } else { 1 }
+        }
         Plan::Insert { .. } | Plan::UpdateOrInsert { .. } => 2,
         Plan::Update { .. } => 3,
         Plan::Delete { .. } => 4,
@@ -19042,49 +19066,127 @@ fn assign_gen_slots(
 
 /// Read a generator reference from the char-level expression parser -
 /// an identifier, possibly quoted and possibly qualified - and reduce
-/// it through [strip_gen_name] to the bare catalog name.
+/// it through [strip_gen_name] to the bare catalog name. The capture
+/// loop takes SEGMENTS (quoted or bare) joined by dots, so a QUOTED
+/// qualifier (`"PUBLIC"."SQ1"` - the form the engine answers, probed)
+/// is captured whole rather than stopping at the first closing quote.
 fn parse_gen_ref(b: &[char], pos: &mut usize) -> Option<String> {
     skip_ws(b, pos);
     let start = *pos;
-    if b.get(*pos) == Some(&'"') {
-        *pos += 1;
-        while *pos < b.len() && b[*pos] != '"' {
+    loop {
+        if b.get(*pos) == Some(&'"') {
             *pos += 1;
+            loop {
+                if *pos >= b.len() {
+                    return None; // unterminated quote
+                }
+                if b[*pos] == '"' {
+                    if b.get(*pos + 1) == Some(&'"') {
+                        *pos += 2; // an escaped quote is part of the name
+                        continue;
+                    }
+                    *pos += 1; // the closing quote
+                    break;
+                }
+                *pos += 1;
+            }
+        } else {
+            let seg = *pos;
+            while *pos < b.len()
+                && (b[*pos].is_alphanumeric() || b[*pos] == '_' || b[*pos] == '$')
+            {
+                *pos += 1;
+            }
+            if *pos == seg {
+                return None;
+            }
         }
-        if b.get(*pos) != Some(&'"') {
-            return None;
-        }
-        *pos += 1;
-    } else {
-        while *pos < b.len()
-            && (b[*pos].is_alphanumeric() || b[*pos] == '_' || b[*pos] == '$' || b[*pos] == '.'
-                || b[*pos] == '"')
-        {
+        if b.get(*pos) == Some(&'.') {
             *pos += 1;
+            continue;
         }
+        break;
     }
     let text: String = b[start..*pos].iter().collect();
     let name = strip_gen_name(&text);
     if name.is_empty() { None } else { Some(name) }
 }
 
-/// Reduce a possibly schema/package-qualified, possibly quoted generator
-/// reference (`PUBLIC.MYGEN`, `PUBLIC."MyGen"`, `MYGEN`, `"MyGen"`) to the
-/// bare object name the catalog stores.
-fn strip_gen_name(arg: &str) -> String {
-    let s = arg.trim();
-    // Drop a leading qualifier: the last '.' whose preceding qualifier is
-    // not itself quoted (isql emits bare uppercase schema/package names).
-    let obj = match s.find('.') {
-        Some(dot) if !s[..dot].contains('"') => &s[dot + 1..],
-        _ => s,
-    };
-    let obj = obj.trim();
-    if obj.len() >= 2 && obj.starts_with('"') && obj.ends_with('"') {
-        obj[1..obj.len() - 1].replace("\"\"", "\"")
-    } else {
-        obj.to_string()
+/// Split a possibly schema-qualified object reference into (qualifier,
+/// object name). Each part is either a `"quoted"` identifier (`""`
+/// unescapes to `"`, case KEPT - the engine matches quoted names
+/// exactly) or a bare one (folded to uppercase, as the engine folds
+/// unquoted identifiers); the parts are joined by `.`, and a dot INSIDE
+/// a quoted part never splits (probed: `"a.b"` is one name). None when
+/// the text is not one or two identifiers - an empty part, an
+/// unterminated quote, a three-part name, or trailing text.
+fn split_qualified_name(s: &str) -> Option<(Option<String>, String)> {
+    /// One identifier off the front; (name, rest).
+    fn take_part(s: &str) -> Option<(String, &str)> {
+        let s = s.trim_start();
+        if let Some(q) = s.strip_prefix('"') {
+            let b = q.as_bytes();
+            let mut i = 0;
+            while i < b.len() {
+                if b[i] == b'"' {
+                    if b.get(i + 1) == Some(&b'"') {
+                        i += 2; // escaped quote, part of the name
+                        continue;
+                    }
+                    let name = q[..i].replace("\"\"", "\"");
+                    return if name.is_empty() { None } else { Some((name, &q[i + 1..])) };
+                }
+                i += 1;
+            }
+            None // unterminated quote
+        } else {
+            let end = s
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+                .unwrap_or(s.len());
+            if end == 0 {
+                return None;
+            }
+            Some((s[..end].to_ascii_uppercase(), &s[end..]))
+        }
     }
+    let (first, rest) = take_part(s.trim())?;
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        return Some((None, first));
+    }
+    let rest = rest.strip_prefix('.')?;
+    let (second, tail) = take_part(rest)?;
+    if !tail.trim().is_empty() {
+        return None; // trailing text, or a three-part name
+    }
+    Some((Some(first), second))
+}
+
+/// THE PUBLIC RULE (probed against FB6): every user object lives in the
+/// PUBLIC schema, and isql's SHOW output prints the QUALIFIED name -
+/// `PUBLIC.X`, `"PUBLIC".X` and `"PUBLIC"."X"` all name the object the
+/// catalog stores as bare X, so a PUBLIC qualifier strips. Any OTHER
+/// qualifier names an object this catalog does not hold - the engine
+/// raises (probed: `GEN_ID(NOSCHEMA.SQ1, 0)` is "Generator ... is not
+/// defined", `SYSTEM.PADD` is "-204 Procedure unknown") - so None:
+/// the caller must REFUSE, never strip. A quoted qualifier keeps its
+/// case, so `"public"` is NOT the PUBLIC schema (the engine agrees).
+fn public_object_name(s: &str) -> Option<String> {
+    match split_qualified_name(s)? {
+        (None, name) => Some(name),
+        (Some(q), name) if q == "PUBLIC" => Some(name),
+        _ => None,
+    }
+}
+
+/// Reduce a possibly schema-qualified, possibly quoted generator
+/// reference (`PUBLIC.MYGEN`, `"PUBLIC"."MyGen"`, `MYGEN`, `"MyGen"`) to
+/// the bare object name the catalog stores, under [public_object_name]'s
+/// PUBLIC rule. "" means REFUSE: the old any-qualifier strip made fc
+/// ANSWER `GEN_ID(NOSCHEMA.SQ1, 0)` where the engine raises "Generator
+/// ... is not defined" - a wrong answer, worse than a refusal.
+fn strip_gen_name(arg: &str) -> String {
+    public_object_name(arg).unwrap_or_default()
 }
 
 #[derive(Clone)]
@@ -26360,6 +26462,27 @@ fn sys_rel(db: &Database, name: &str) -> Option<(Vec<RelationColumn>, Vec<Descri
     Some((relation_columns(&db.bytes, db.page_size, name), descs.clone()))
 }
 
+/// Is this catalog row a plain PUBLIC-schema, package-less object?
+/// FB6 seeds SYSTEM-schema PACKAGED procedures (RDB$PROFILER.FLUSH,
+/// RDB$BLOB_UTIL.CANCEL_BLOB, ...) into the SAME RDB$PROCEDURES /
+/// RDB$PROCEDURE_PARAMETERS relations a user procedure lands in, so a
+/// bare-name scan MERGES them: an engine-created FLUSH picked up the
+/// packaged FLUSH's parameter rows too (probed: "expects 2 input
+/// parameter(s), got 1" where the engine answers the row). Only a
+/// package-less row whose schema is PUBLIC is what a DSQL name can
+/// mean here. A pre-schema ODS has NEITHER column, and fc never writes
+/// these rows itself - so an ABSENT column (or a NULL value) accepts,
+/// which keeps older files readable.
+fn catalog_row_public(v: &[Value], schema_f: Option<usize>, pkg_f: Option<usize>) -> bool {
+    let pkg_ok = matches!(pkg_f.and_then(|i| v.get(i)), None | Some(Value::Null));
+    let schema_ok = match schema_f.and_then(|i| v.get(i)) {
+        None | Some(Value::Null) => true,
+        Some(Value::Text(t)) => t.trim_end() == "PUBLIC",
+        _ => false,
+    };
+    pkg_ok && schema_ok
+}
+
 /// Load a procedure's parameters and body source from the catalog.
 /// None when the procedure does not exist, or when a parameter's type is
 /// outside the interpreter's surface.
@@ -26370,12 +26493,14 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     let (pcols, pdescs) = sys_rel(db, "RDB$PROCEDURES")?;
     let pfid = |n: &str| pcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
     let (name_f, src_f) = (pfid("RDB$PROCEDURE_NAME")?, pfid("RDB$PROCEDURE_SOURCE")?);
+    // schema/package columns exist only on an FB6 (schema-aware) ODS
+    let (schema_f, pkg_f) = (pfid("RDB$SCHEMA_NAME"), pfid("RDB$PACKAGE_NAME"));
     let pfmts = vec![(0u8, pdescs)];
     let mut source: Option<String> = None;
     for_each_record(db, 26, &pfmts, |v| {
         let hit = matches!(v.get(name_f),
             Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
-        if !hit || source.is_some() {
+        if !hit || source.is_some() || !catalog_row_public(v, schema_f, pkg_f) {
             return;
         }
         if let Some(Value::Blob(r, n)) = v.get(src_f) {
@@ -26398,11 +26523,15 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     // (parameter type 0=in/1=out, number, name, field source)
     let mut raw: Vec<(i64, i64, String, String)> = Vec::new();
     let pname_f = cfid("RDB$PARAMETER_NAME")?;
+    // the same schema/package filter as the source scan: FB6's packaged
+    // SYSTEM parameters (RDB$PROFILER.FLUSH's among them) share this
+    // relation, and merging them in was the probed arity error
+    let (cschema_f, cpkg_f) = (cfid("RDB$SCHEMA_NAME"), cfid("RDB$PACKAGE_NAME"));
     let cfmts = vec![(0u8, cdescs)];
     for_each_record(db, 27, &cfmts, |v| {
         let hit = matches!(v.get(pn_f),
             Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
-        if !hit {
+        if !hit || !catalog_row_public(v, cschema_f, cpkg_f) {
             return;
         }
         if let (
@@ -27151,10 +27280,16 @@ fn declared_var_names(header: &str) -> Vec<String> {
 }
 
 /// Parse `EXECUTE PROCEDURE <name> [(<v>, ...)]` / `EXECUTE PROCEDURE
-/// <name> <v>, ...` into the procedure name and its literal arguments.
+/// <name> <v>, ...` into the procedure's schema qualifier (if any), its
+/// bare name, and its literal arguments. The name span may be
+/// schema-qualified in any quoting (`PUBLIC.PADD`, `"PUBLIC"."PADD"` -
+/// the form FB6's own SHOW PROCEDURES teaches, probed); it is split by
+/// [split_qualified_name] and the CALLER applies the PUBLIC rule, so a
+/// foreign qualifier still parses and lands in the ordinary
+/// no-such-procedure refusal rather than a parse failure.
 /// A `?` argument yields None for that slot, to be filled from the
 /// execute message.
-fn parse_execute_procedure(sql: &str) -> Option<(String, Vec<Option<Value>>)> {
+fn parse_execute_procedure(sql: &str) -> Option<(Option<String>, String, Vec<Option<Value>>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
     if find_word(&up, "EXECUTE", 0) != Some(0) {
@@ -27162,11 +27297,12 @@ fn parse_execute_procedure(sql: &str) -> Option<(String, Vec<Option<Value>>)> {
     }
     let p = find_word(&up, "PROCEDURE", "EXECUTE".len())?;
     let rest = s[p + "PROCEDURE".len()..].trim();
-    // the name runs to whitespace or '('
+    // the name runs to whitespace or '(' - which keeps a dotted,
+    // quoted span (`"PUBLIC"."PADD"`) intact for the splitter
     let end = rest
         .find(|c: char| c.is_whitespace() || c == '(')
         .unwrap_or(rest.len());
-    let name = rest[..end].trim().trim_matches('"').to_string();
+    let (qual, name) = split_qualified_name(rest[..end].trim())?;
     if name.is_empty() {
         return None;
     }
@@ -27189,7 +27325,7 @@ fn parse_execute_procedure(sql: &str) -> Option<(String, Vec<Option<Value>>)> {
             });
         }
     }
-    Some((name, args))
+    Some((qual, name, args))
 }
 
 fn col_kind(d: &Descriptor) -> Option<ColKind> {
@@ -29905,19 +30041,25 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 let in_blr = read_wire_bytes(&mut s, &mut dec)?; // input blr
                 read_int(&mut s, &mut dec)?; // msg number
                 let messages = read_int(&mut s, &mut dec)?; // message count
-                if messages > 0 {
+                let exec2_args: Vec<WireParam> = if messages > 0 {
                     // the input message follows, laid out by the client's
                     // own BLR; an undecodable BLR makes its length
                     // unknowable, so the connection must drop rather
-                    // than desync (the same rule op_execute follows)
+                    // than desync (the same rule op_execute follows).
+                    // The VALUES are kept: a parameterized
+                    // `INSERT ... VALUES (?, ?) RETURNING ...` executes
+                    // through THIS op (it announces stmt type 8), and
+                    // discarding them bound nothing.
                     let slots = parse_param_blr(&in_blr).ok_or_else(|| {
                         std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "undecodable input-message BLR",
                         )
                     })?;
-                    read_param_message(&mut s, &mut dec, &slots)?;
-                }
+                    read_param_message(&mut s, &mut dec, &slots)?
+                } else {
+                    Vec::new()
+                };
                 // the declared OUTPUT-message BLR: the singleton row is
                 // capacity-checked against it exactly as a fetched row
                 // is (the engine checks inline and answers a bare error
@@ -30020,6 +30162,135 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                 eprintln!("[srv] op_execute2 procedure failed: {}", e);
                             }
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                        }
+                    }
+                } else if matches!(&plan, Plan::Returning { inner, .. }
+                    if matches!(inner.as_ref(), Plan::Insert { .. }))
+                {
+                    // `INSERT ... VALUES ... RETURNING` announces stmt
+                    // type 8 (exec_procedure - probed against FB6), so a
+                    // driver executes it HERE and reads the singleton
+                    // row from the op_sql_response, never opening a
+                    // cursor. The op_execute Returning arm stays: a
+                    // client that ignores the type and drives
+                    // execute+fetch still gets the cursor.
+                    let (inner, rcols) = match &plan {
+                        Plan::Returning { inner, cols, .. } => {
+                            (inner.as_ref().clone(), cols.clone())
+                        }
+                        _ => unreachable!(),
+                    };
+                    // the client must supply exactly the parameters the
+                    // describe announced - fewer or more is an error,
+                    // not a guess (the same rule op_execute enforces)
+                    if exec2_args.len() != stmt_params.len() {
+                        last_dml = (0, 0, 0);
+                        respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                        continue;
+                    }
+                    let ctx = SessionCtx { user, attach_id };
+                    let mut affected = Affected::default();
+                    match execute_dml_collecting(
+                        &inner,
+                        &mut database,
+                        &exec2_args,
+                        &ctx,
+                        Some(&mut affected),
+                    ) {
+                        Ok(counts) => {
+                            // the driver's next op_info_sql asks
+                            // RECORDS_INFO for a type-8 statement -
+                            // answered from last_dml
+                            last_dml = counts;
+                            // the ONE stored row, decoded whole: each
+                            // ProjCol projects the full record by its
+                            // own field_id (wrap_returning refuses
+                            // expression columns at prepare, so
+                            // value_of cannot raise here - kept as a
+                            // Result all the same)
+                            let record = affected
+                                .images
+                                .first()
+                                .map(|img| decode_record(img, &affected.descs));
+                            let projected: Result<Vec<Value>, EvalErr> = match &record {
+                                None => Ok(Vec::new()),
+                                Some(r) => rcols.iter().map(|c| c.value_of(r)).collect(),
+                            };
+                            match projected {
+                                Err(e) => {
+                                    respond_eval_error(&mut s, &mut enc, &e)?;
+                                }
+                                Ok(mut values) => {
+                                    // the client-declared output capacity,
+                                    // enforced on the singleton exactly as
+                                    // a fetched row is - the raise moves
+                                    // from fetch-time to execute2-time
+                                    // with the SAME vector, and the
+                                    // driver's rollback then restores the
+                                    // snapshot (the outblr gate's COUNT-0
+                                    // persistence check)
+                                    if let Some(out) = out_fmt.as_ref() {
+                                        if let Err(e) = enforce_out_capacity(
+                                            &rcols, &mut values, out,
+                                        ) {
+                                            respond_eval_error(&mut s, &mut enc, &e)?;
+                                            continue;
+                                        }
+                                    }
+                                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                                        eprintln!(
+                                            "[srv] op_execute2 returning -> {:?}",
+                                            values
+                                        );
+                                    }
+                                    // byte-identical framing to the
+                                    // ProcInvoke singleton above
+                                    let mut w = W::default();
+                                    if record.is_none() {
+                                        w.int(OP_SQL_RESPONSE).int(0); // no message
+                                    } else {
+                                        w.int(OP_SQL_RESPONSE).int(1);
+                                        encode_row_body(&mut w, &rcols, &values);
+                                    }
+                                    w.int(OP_RESPONSE)
+                                        .int(TX_HANDLE)
+                                        .int(0)
+                                        .int(0)
+                                        .int(0)
+                                        .int(0);
+                                    w.send(&mut s, &mut enc)?;
+                                    // the singleton IS the statement now:
+                                    // a stray fetch and a post-execute
+                                    // stmt_type info behave like the proc
+                                    // path. ProcCall's field_id indexes
+                                    // `values` (the Returning cols index
+                                    // the RECORD), so re-index
+                                    // positionally.
+                                    let cols: Vec<ProjCol> = rcols
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, c)| ProjCol {
+                                            field_id: i,
+                                            ..c.clone()
+                                        })
+                                        .collect();
+                                    plan = Plan::ProcCall { cols, values };
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            last_dml = (0, 0, 0);
+                            if std::env::var("FC_SRV_TRACE").is_ok() {
+                                eprintln!("[srv] op_execute2 returning failed: {:?}", e);
+                            }
+                            match e {
+                                ExecErr::Eval(ev) => {
+                                    respond_eval_error(&mut s, &mut enc, &ev)?
+                                }
+                                ExecErr::Text(_) => {
+                                    respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
+                                }
+                            }
                         }
                     }
                 } else {
@@ -36413,19 +36684,233 @@ mod tests {
     }
 
     #[test]
-    fn strip_gen_name_drops_qualifier_and_quotes() {
+    fn strip_gen_name_applies_the_public_rule() {
         // schema-qualified, bare object name
         assert_eq!(strip_gen_name("PUBLIC.MYGEN"), "MYGEN");
         // schema-qualified, quoted mixed-case object name
         assert_eq!(strip_gen_name("PUBLIC.\"MyGen\""), "MyGen");
-        // bare unqualified name
+        // a QUOTED qualifier strips too - `GEN_ID("PUBLIC"."SQ1", 0)`
+        // works on the engine (probed); the old splitter kept the dot
+        assert_eq!(strip_gen_name("\"PUBLIC\".SQ1"), "SQ1");
+        assert_eq!(strip_gen_name("\"PUBLIC\".\"MyGen\""), "MyGen");
+        // bare unqualified name; a bare ident folds up as the engine folds
         assert_eq!(strip_gen_name("MYGEN"), "MYGEN");
-        // quoted unqualified name
+        assert_eq!(strip_gen_name("mygen"), "MYGEN");
+        // quoted unqualified name keeps its case
         assert_eq!(strip_gen_name("\"MyGen\""), "MyGen");
         // a quoted name containing a dot is not split on that dot
         assert_eq!(strip_gen_name("\"a.b\""), "a.b");
         // an escaped double-quote inside a quoted name
         assert_eq!(strip_gen_name("\"a\"\"b\""), "a\"b");
+        // a FOREIGN qualifier refuses ("" = unknown): the old strip made
+        // fc ANSWER GEN_ID(NOSCHEMA.SQ1, 0) where the engine raises
+        // "Generator ... is not defined" (probed)
+        assert_eq!(strip_gen_name("NOSCHEMA.SQ1"), "");
+        // a quoted qualifier keeps case, so "public" is NOT PUBLIC
+        assert_eq!(strip_gen_name("\"public\".SQ1"), "");
+    }
+
+    #[test]
+    fn split_qualified_name_takes_one_or_two_identifier_parts() {
+        assert_eq!(split_qualified_name("PADD"), Some((None, "PADD".to_string())));
+        // a bare part folds to uppercase, as the engine folds
+        assert_eq!(split_qualified_name("padd"), Some((None, "PADD".to_string())));
+        assert_eq!(
+            split_qualified_name("PUBLIC.PADD"),
+            Some((Some("PUBLIC".to_string()), "PADD".to_string()))
+        );
+        // every quoting mix of the qualified form
+        assert_eq!(
+            split_qualified_name("\"PUBLIC\".PADD"),
+            Some((Some("PUBLIC".to_string()), "PADD".to_string()))
+        );
+        assert_eq!(
+            split_qualified_name("PUBLIC.\"Padd\""),
+            Some((Some("PUBLIC".to_string()), "Padd".to_string()))
+        );
+        assert_eq!(
+            split_qualified_name("\"PUBLIC\".\"PADD\""),
+            Some((Some("PUBLIC".to_string()), "PADD".to_string()))
+        );
+        // quoted parts keep case and unescape doubled quotes
+        assert_eq!(
+            split_qualified_name("\"a\"\"b\""),
+            Some((None, "a\"b".to_string()))
+        );
+        // malformed shapes refuse: empty, unterminated quote, empty
+        // part, three parts, trailing text
+        assert_eq!(split_qualified_name(""), None);
+        assert_eq!(split_qualified_name("\"PADD"), None);
+        assert_eq!(split_qualified_name("PUBLIC."), None);
+        assert_eq!(split_qualified_name(".PADD"), None);
+        assert_eq!(split_qualified_name("A.B.C"), None);
+        assert_eq!(split_qualified_name("PADD extra"), None);
+    }
+
+    #[test]
+    fn public_object_name_strips_public_and_refuses_the_rest() {
+        assert_eq!(public_object_name("PADD"), Some("PADD".to_string()));
+        assert_eq!(public_object_name("PUBLIC.PADD"), Some("PADD".to_string()));
+        assert_eq!(
+            public_object_name("\"PUBLIC\".\"PADD\""),
+            Some("PADD".to_string())
+        );
+        // a bare qualifier folds up before the comparison
+        assert_eq!(public_object_name("public.PADD"), Some("PADD".to_string()));
+        // a foreign schema is an object this catalog does not hold
+        assert_eq!(public_object_name("SYSTEM.PADD"), None);
+        assert_eq!(public_object_name("NOSCHEMA.PADD"), None);
+        // and a QUOTED lowercase "public" is a different (unknown) schema
+        assert_eq!(public_object_name("\"public\".PADD"), None);
+    }
+
+    #[test]
+    fn parse_execute_procedure_takes_qualified_names() {
+        // the unqualified form is unchanged
+        let (q, n, a) = parse_execute_procedure("EXECUTE PROCEDURE PADD(2, 3)").unwrap();
+        assert_eq!((q, n.as_str(), a.len()), (None, "PADD", 2));
+        // isql's SHOW PROCEDURES teaches PUBLIC.PADD; the engine answers
+        // it and every quoting of it (probed)
+        let (q, n, _) = parse_execute_procedure("EXECUTE PROCEDURE PUBLIC.PADD(2, 3)").unwrap();
+        assert_eq!((q.as_deref(), n.as_str()), (Some("PUBLIC"), "PADD"));
+        let (q, n, _) =
+            parse_execute_procedure("EXECUTE PROCEDURE \"PUBLIC\".\"PADD\"(2, 3)").unwrap();
+        assert_eq!((q.as_deref(), n.as_str()), (Some("PUBLIC"), "PADD"));
+        // a FOREIGN qualifier still PARSES - the caller's PUBLIC rule
+        // sends it down the no-such-procedure refusal, matching the
+        // engine's -204 (probed), not a parse fallback
+        let (q, n, _) = parse_execute_procedure("EXECUTE PROCEDURE SYSTEM.PADD(2, 3)").unwrap();
+        assert_eq!((q.as_deref(), n.as_str()), (Some("SYSTEM"), "PADD"));
+        // no-argument and semicolon forms keep parsing
+        let (q, n, a) = parse_execute_procedure("EXECUTE PROCEDURE FLUSH;").unwrap();
+        assert_eq!((q, n.as_str(), a.len()), (None, "FLUSH", 0));
+    }
+
+    #[test]
+    fn split_proc_call_takes_qualified_names() {
+        assert_eq!(
+            split_proc_call("PSEL(5)"),
+            Some(("PSEL".to_string(), Some("5".to_string())))
+        );
+        // `SELECT ... FROM PUBLIC.PSEL(5)` - the engine answers rows
+        // (probed); the old ident_ok refused the dot
+        assert_eq!(
+            split_proc_call("PUBLIC.PSEL(5)"),
+            Some(("PSEL".to_string(), Some("5".to_string())))
+        );
+        assert_eq!(
+            split_proc_call("\"PUBLIC\".\"PSEL\"(5)"),
+            Some(("PSEL".to_string(), Some("5".to_string())))
+        );
+        assert_eq!(
+            split_proc_call("PUBLIC.ONEROW"),
+            Some(("ONEROW".to_string(), None))
+        );
+        // a foreign qualifier is not a callable this catalog holds
+        assert_eq!(split_proc_call("NOSCHEMA.PSEL(5)"), None);
+        // a derived table is not a call
+        assert_eq!(split_proc_call("(SELECT 1 FROM RDB$DATABASE) X"), None);
+    }
+
+    #[test]
+    fn gen_parsers_inherit_the_public_rule() {
+        // quoted-PUBLIC qualifier now recognised on the SHOW GENERATORS
+        // probe shape ...
+        assert_eq!(
+            parse_gen_id_query("GEN_ID(\"PUBLIC\".SEQ_A, 0)", "RDB$DATABASE"),
+            Some(("SEQ_A".to_string(), 0))
+        );
+        // ... and a foreign qualifier refuses (falls to the ordinary
+        // planner, which refuses the statement - the engine raises)
+        assert_eq!(
+            parse_gen_id_query("GEN_ID(NOSCHEMA.SEQ_A, 0)", "RDB$DATABASE"),
+            None
+        );
+        assert_eq!(
+            parse_gen_sel_item("GEN_ID(\"PUBLIC\".SEQ_A, 1)"),
+            Some(("SEQ_A".to_string(), Some(1)))
+        );
+        assert_eq!(parse_gen_sel_item("GEN_ID(NOSCHEMA.SEQ_A, 1)"), None);
+        assert_eq!(
+            parse_next_value("NEXT VALUE FOR \"PUBLIC\".SEQ5", "RDB$DATABASE"),
+            Some("SEQ5".to_string())
+        );
+        assert_eq!(
+            parse_next_value("NEXT VALUE FOR NOSCHEMA.SEQ5", "RDB$DATABASE"),
+            None
+        );
+    }
+
+    #[test]
+    fn catalog_row_public_filters_packaged_and_foreign_schema_rows() {
+        use fire_crab_ods::format::Value as V;
+        let row = |schema: V, pkg: V| vec![V::Text("FLUSH".into()), schema, pkg];
+        // an engine-created user procedure: PUBLIC schema, no package
+        assert!(catalog_row_public(&row(V::Text("PUBLIC ".into()), V::Null), Some(1), Some(2)));
+        // FB6's packaged twin (SYSTEM.RDB$PROFILER.FLUSH) must NOT merge
+        assert!(!catalog_row_public(
+            &row(V::Text("SYSTEM ".into()), V::Text("RDB$PROFILER".into())),
+            Some(1),
+            Some(2)
+        ));
+        // packaged even in PUBLIC refuses; foreign schema refuses
+        assert!(!catalog_row_public(
+            &row(V::Text("PUBLIC".into()), V::Text("PKG".into())),
+            Some(1),
+            Some(2)
+        ));
+        assert!(!catalog_row_public(&row(V::Text("SYSTEM".into()), V::Null), Some(1), Some(2)));
+        // a pre-schema ODS has neither column: absent accepts
+        assert!(catalog_row_public(&row(V::Null, V::Null), None, None));
+        // NULL schema on a schema-aware ODS accepts (fc never writes
+        // these rows; a NULL is not a foreign schema)
+        assert!(catalog_row_public(&row(V::Null, V::Null), Some(1), Some(2)));
+    }
+
+    #[test]
+    fn insert_values_returning_announces_exec_procedure_type() {
+        let insert = Plan::Insert {
+            rel: 128,
+            format_no: 0,
+            image: Vec::new(),
+            descs: Vec::new(),
+            index_ops: Vec::new(),
+            param_fields: Vec::new(),
+            gen_fields: Vec::new(),
+            not_null: Vec::new(),
+            checks: Vec::new(),
+            fk_refs: Vec::new(),
+            default_fields: Vec::new(),
+        };
+        let delete = Plan::Delete {
+            rel: 128,
+            formats: Vec::new(),
+            filter: None,
+            fk_children: Vec::new(),
+            index: None,
+        };
+        let wrap = |p: Plan| Plan::Returning {
+            inner: Box::new(p),
+            cols: Vec::new(),
+            fields: Vec::new(),
+        };
+        // probed against FB6 through node's newStatement().type:
+        // insert-values RETURNING is 8 (exec_procedure) - both driver
+        // generations dispatch on it to op_execute2 and a single object
+        assert_eq!(stmt_type_of(&wrap(insert)), 8);
+        // ... while DELETE (and UPDATE) RETURNING stay a cursor (1)
+        assert_eq!(stmt_type_of(&wrap(delete)), 1);
+        // and the bare plans keep their DML types
+        assert_eq!(
+            stmt_type_of(&Plan::Delete {
+                rel: 128,
+                formats: Vec::new(),
+                filter: None,
+                fk_children: Vec::new(),
+                index: None,
+            }),
+            4
+        );
     }
 
     #[test]

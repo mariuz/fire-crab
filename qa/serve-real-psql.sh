@@ -47,6 +47,10 @@ CREATE PROCEDURE ADD2 (A INTEGER, B INTEGER) RETURNS (R INTEGER) AS
 BEGIN
   R = A + B;
 END^
+CREATE PROCEDURE FLUSH (A INTEGER) RETURNS (R INTEGER) AS
+BEGIN
+  R = A * 2;
+END^
 CREATE PROCEDURE ARITH (A INTEGER, B INTEGER)
   RETURNS (S INTEGER, D INTEGER, M INTEGER, Q INTEGER) AS
 BEGIN
@@ -216,6 +220,47 @@ same "negative input"          "EXECUTE PROCEDURE ADD2(10, -4)"
 same "zeroes"                  "EXECUTE PROCEDURE ADD2(0, 0)"
 same "four outputs at once"    "EXECUTE PROCEDURE ARITH(12, 4)"
 same "integer division rounds toward zero" "EXECUTE PROCEDURE ARITH(7, 2)"
+
+# --- THE FB6 SCHEMA-QUALIFIED CALL -------------------------------------
+# isql itself teaches this form: SHOW PROCEDURES prints PUBLIC.ADD2
+# (probed), and pasting that name into EXECUTE PROCEDURE is exactly the
+# roadmap's "no such procedure" reproduction - the engine answers 5 for
+# every quoting of the qualifier.
+same "schema-qualified call, bare"          "EXECUTE PROCEDURE PUBLIC.ADD2(2, 3)"
+same "schema-qualified call, quoted schema" "EXECUTE PROCEDURE \"PUBLIC\".ADD2(2, 3)"
+same "schema-qualified call, both quoted"   "EXECUTE PROCEDURE \"PUBLIC\".\"ADD2\"(2, 3)"
+
+# a FOREIGN schema must FAIL on BOTH sides. The error texts differ (the
+# engine raises -204 Procedure unknown "SYSTEM"."ADD2"; fc answers its
+# bare Dynamic SQL Error - a recorded divergence, like the existing
+# teeth checks), so this compares failure-ness only.
+fcq=$(printf 'EXECUTE PROCEDURE SYSTEM.ADD2(2, 3);\n' |
+      "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
+enq=$(printf 'EXECUTE PROCEDURE SYSTEM.ADD2(2, 3);\n' |
+      "$ISQL" -q -b -user "$U" -pas "$P" "$DB" 2>&1 | tr -s ' \n' ' ')
+fc_failed=0; en_failed=0
+case "$fcq" in *"Statement failed"*|*error*|*ERROR*) fc_failed=1 ;; esac
+case "$enq" in *"Statement failed"*|*error*|*ERROR*) en_failed=1 ;; esac
+if [ "$fc_failed" = "1" ] && [ "$en_failed" = "1" ]; then
+    echo "OK   teeth: a foreign schema (SYSTEM.ADD2) is refused by BOTH sides"
+else
+    echo "DIFF SYSTEM.ADD2: fc [$fcq] engine [$enq]"; fail=1
+fi
+
+# --- a PACKAGED SYSTEM NAME collides with a user procedure -------------
+# FB6 seeds SYSTEM.RDB$PROFILER.FLUSH into the same RDB$PROCEDURES /
+# RDB$PROCEDURE_PARAMETERS relations; a bare-name catalog scan merged
+# its parameter rows into the engine-created FLUSH and answered an
+# ARITY error ("expects 2 input parameter(s), got 1") where the engine
+# answers the row.
+same "packaged-name collision (FLUSH)" "EXECUTE PROCEDURE FLUSH(21)"
+flv=$(printf 'SET HEADING OFF;\nEXECUTE PROCEDURE FLUSH(21);\n' |
+      "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -d ' \n')
+if [ "$flv" = "42" ]; then
+    echo "OK   teeth: FLUSH(21) really computes 42, not an arity error"
+else
+    echo "DIFF FLUSH(21) answered [$flv], want 42"; fail=1
+fi
 
 # --- IF / ELSE ---------------------------------------------------------
 same "IF takes the THEN arm"   "EXECUTE PROCEDURE MAXOF(9, 3)"

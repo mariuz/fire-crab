@@ -31,6 +31,13 @@ A="$D/fc-ret-crab.fdb"
 B="$D/fc-ret-engine.fdb"
 
 command -v node >/dev/null 2>&1 || { echo "SKIP node not found"; exit 0; }
+# both driver generations (the outblr pattern): stock 2.11.0 and the
+# patched 2.14.1 dispatch IDENTICALLY on the announced statement type,
+# so the singleton shape must hold through both
+N211="${N211:-/home/ubuntu/conceptual-architecture-for-firebird-paper/samples/nodejs/node_modules}"
+N214="${N214:-${NODE_PATH:-/home/ubuntu/work}}"
+NODE_PATH="$N211" node -e "require('node-firebird')" 2>/dev/null || { echo "SKIP node-firebird 2.11.0 not found"; exit 0; }
+NODE_PATH="$N214" node -e "require('node-firebird')" 2>/dev/null || { echo "SKIP node-firebird 2.14.1 not found"; exit 0; }
 mkdir -p "$D"
 fail=0
 
@@ -67,10 +74,10 @@ kill -0 $srv 2>/dev/null || {
     exit 1
 }
 
-query() { # <sql> <port> <db>
+query() { # <sql> <port> <db> [node_modules-path]
     n=0
     while [ $n -lt 6 ]; do
-        r=$(timeout 25 env FC_Q="$1" FC_PORT="$2" FC_DB="$3" node -e '
+        r=$(timeout 25 env NODE_PATH="${4:-${NODE_PATH:-}}" FC_Q="$1" FC_PORT="$2" FC_DB="$3" node -e '
           process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(0); });
           const F=require("node-firebird");
           F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
@@ -79,8 +86,58 @@ query() { # <sql> <port> <db>
             db.query(process.env.FC_Q,(e2,r)=>{
               if(e2){console.log("ERR "+(e2.message||"").split("\n")[0].slice(0,60));db.detach();process.exit(0);}
               const rows=Array.isArray(r)?r:(r?[r]:[]);
-              console.log(JSON.stringify(rows));
+              // THE SHAPE IS PART OF THE ANSWER: the engine delivers
+              // insert-values RETURNING as ONE OBJECT (stmt type 8 ->
+              // op_execute2 singleton) and UPDATE/DELETE RETURNING as an
+              // ARRAY. This marker used to be normalized away, which is
+              // exactly how the array-of-one divergence survived the gate.
+              console.log((Array.isArray(r)?"ARR ":"OBJ ")+JSON.stringify(rows));
               db.detach();process.exit(0);});});' 2>/dev/null)
+        case "$r" in
+            CONN_ERR|"") n=$((n + 1)); sleep 0.3 ;;
+            *) printf '%s' "$r"; return ;;
+        esac
+    done
+    printf 'CONN_ERR'
+}
+
+qparam() { # <sql> <json-params> <port> <db>
+    n=0
+    while [ $n -lt 6 ]; do
+        r=$(timeout 25 env FC_Q="$1" FC_PARAMS="$2" FC_PORT="$3" FC_DB="$4" node -e '
+          process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(0); });
+          const F=require("node-firebird");
+          F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
+                    user:"SYSDBA",password:"masterkey"},(e,db)=>{
+            if(e){console.log("CONN_ERR");process.exit(0);}
+            db.query(process.env.FC_Q,JSON.parse(process.env.FC_PARAMS),(e2,r)=>{
+              if(e2){console.log("ERR "+(e2.message||"").split("\n")[0].slice(0,60));db.detach();process.exit(0);}
+              const rows=Array.isArray(r)?r:(r?[r]:[]);
+              console.log((Array.isArray(r)?"ARR ":"OBJ ")+JSON.stringify(rows));
+              db.detach();process.exit(0);});});' 2>/dev/null)
+        case "$r" in
+            CONN_ERR|"") n=$((n + 1)); sleep 0.3 ;;
+            *) printf '%s' "$r"; return ;;
+        esac
+    done
+    printf 'CONN_ERR'
+}
+
+tprobe() { # <sql> <port> <db> - prepare only, print the ANNOUNCED type
+    n=0
+    while [ $n -lt 6 ]; do
+        r=$(timeout 25 env FC_Q="$1" FC_PORT="$2" FC_DB="$3" node -e '
+          process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(0); });
+          const F=require("node-firebird");
+          F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
+                    user:"SYSDBA",password:"masterkey"},(e,db)=>{
+            if(e){console.log("CONN_ERR");process.exit(0);}
+            db.transaction(F.ISOLATION_READ_COMMITTED,(e1,tr)=>{
+              if(e1){console.log("TR_ERR");process.exit(0);}
+              tr.newStatement(process.env.FC_Q,(e2,st)=>{
+                if(e2){console.log("PREP_ERR");process.exit(0);}
+                console.log("TYPE "+st.type);
+                tr.rollback(()=>{db.detach();process.exit(0);});});});});' 2>/dev/null)
         case "$r" in
             CONN_ERR|"") n=$((n + 1)); sleep 0.3 ;;
             *) printf '%s' "$r"; return ;;
@@ -134,6 +191,54 @@ both "a TABLE-qualified column in the list" \
 both "the table after every statement above" \
      "SELECT ID, AMT, NAME FROM T ORDER BY ID"
 both "and the second table" "SELECT ID, N FROM G ORDER BY ID"
+
+# --- THE ANNOUNCED STATEMENT TYPE --------------------------------------
+# probed against FB6: the engine types INSERT ... VALUES ... RETURNING
+# as isc_info_sql_stmt_exec_procedure (8) - the driver dispatches on it
+# to op_execute2 and delivers ONE OBJECT - while UPDATE and DELETE
+# RETURNING stay cursors (1, fetchAll, an array). fc announced 1 for
+# all three; the OBJ/ARR markers above pin the delivered shape, this
+# block pins the type that DRIVES it. Prepare-only, rolled back.
+for probe in "INSERT INTO T VALUES (30, 300, 'tt') RETURNING ID:TYPE 8" \
+             "UPDATE T SET AMT = AMT WHERE ID = 1 RETURNING ID:TYPE 1" \
+             "DELETE FROM T WHERE ID = 99999 RETURNING ID:TYPE 1"; do
+    sql=${probe%:*}; wanttype=${probe##*:}
+    a=$(tprobe "$sql" "$PORT" "$A")
+    b=$(tprobe "$sql" "$REAL" "$B")
+    if [ "$a" = "$b" ] && [ "$a" = "$wanttype" ]; then
+        echo "OK   announced type $a: $sql"
+    else
+        echo "DIFF announced type of [$sql]: fcwire [$a] engine [$b] want [$wanttype]"; fail=1
+    fi
+done
+
+# --- a PARAMETERIZED singleton: the input message must BIND ------------
+# type 8 sends the parameters through op_execute2, whose input message
+# fc used to read and DISCARD - this is the check that path binds
+a=$(qparam "INSERT INTO T (ID, AMT) VALUES (?, ?) RETURNING ID, AMT" "[60, 61]" "$PORT" "$A")
+b=$(qparam "INSERT INTO T (ID, AMT) VALUES (?, ?) RETURNING ID, AMT" "[60, 61]" "$REAL" "$B")
+if [ "$a" = "$b" ] && [ "${a#OBJ }" != "$a" ]; then
+    echo "OK   parameterized INSERT ... RETURNING binds through execute2: $a"
+else
+    echo "DIFF parameterized INSERT ... RETURNING"
+    echo "     fcwire: $a"; echo "     engine: $b"; fail=1
+fi
+
+# --- the singleton through BOTH driver generations ---------------------
+# stock 2.11.0 gates its op_execute2 dispatch on protocol >= 13 and the
+# patched 2.14.1 dispatches unconditionally; fc negotiates 20, so both
+# must see the SAME single object
+for NP in "$N211" "$N214"; do
+    gen=$(NODE_PATH="$NP" node -e 'console.log(require("node-firebird/package.json").version)' 2>/dev/null)
+    a=$(query "INSERT INTO T (ID, AMT, NAME) VALUES (70, 700, 'g') RETURNING ID, AMT" "$PORT" "$A" "$NP")
+    b=$(query "INSERT INTO T (ID, AMT, NAME) VALUES (70, 700, 'g') RETURNING ID, AMT" "$REAL" "$B" "$NP")
+    if [ "$a" = "$b" ] && [ "${a#OBJ }" != "$a" ]; then
+        echo "OK   node-firebird $gen delivers the singleton as ONE OBJECT: $a"
+    else
+        echo "DIFF singleton through node-firebird $gen"
+        echo "     fcwire: $a"; echo "     engine: $b"; fail=1
+    fi
+done
 
 # --- refusals ----------------------------------------------------------
 # an expression in the RETURNING list is not converted; the statement must

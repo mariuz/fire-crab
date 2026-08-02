@@ -176,6 +176,35 @@ Q10="SELECT GEN_ID(SEQ5, 5) + 1, X FROM SRC ORDER BY X DESC"
 check "GEN_ID with a step inside arithmetic" \
     "$(fc_rows "$Q10")" "$(en_rows "SELECT (GEN_ID(SEQ5, 5) + 1) || '|' || X FROM SRC ORDER BY X DESC")"
 
+# THE FB6 SCHEMA QUALIFIER on a generator reference - the form SHOW
+# GENERATORS itself emits. A PUBLIC qualifier (bare or quoted) strips
+# to the bare catalog name; any OTHER qualifier must FAIL on BOTH
+# sides: the old strip took ANY qualifier off, so fc ANSWERED
+# GEN_ID(NOSCHEMA.SEQ, 0) where the engine raises "Generator
+# "NOSCHEMA"."SEQ" is not defined" - a wrong answer, not an outage.
+# Step 0 is a pure read, so the twins stay in lockstep.
+check "GEN_ID with a bare PUBLIC qualifier (step 0 read)" \
+    "$(fc_rows 'SELECT GEN_ID(PUBLIC.SEQ, 0) FROM RDB$DATABASE')" \
+    "$(en_rows 'SELECT GEN_ID(PUBLIC.SEQ, 0) FROM RDB$DATABASE')"
+check "GEN_ID with a QUOTED PUBLIC qualifier" \
+    "$(fc_rows 'SELECT GEN_ID("PUBLIC".SEQ, 0) FROM RDB$DATABASE')" \
+    "$(en_rows 'SELECT GEN_ID("PUBLIC".SEQ, 0) FROM RDB$DATABASE')"
+r=$(fc_rows 'SELECT GEN_ID(NOSCHEMA.SEQ, 0) FROM RDB$DATABASE')
+e=$("$ISQL" -q -b -user "$U" -pas "$P" "$REF" 2>&1 <<'SQL' | tr -s ' \n' ' '
+SELECT GEN_ID(NOSCHEMA.SEQ, 0) FROM RDB$DATABASE;
+SQL
+)
+en_failed=0
+case "$e" in *"Statement failed"*|*"not defined"*|*error*|*ERROR*) en_failed=1 ;; esac
+case "$r" in
+    *ERR*) if [ "$en_failed" = "1" ]; then
+               echo "OK   a foreign qualifier (NOSCHEMA.SEQ) fails on BOTH sides"
+           else
+               echo "DIFF engine ANSWERED NOSCHEMA.SEQ: [$e]"; fail=1
+           fi ;;
+    *) echo "DIFF fc answered a foreign-qualified generator: [$r] (engine: [$e])"; fail=1 ;;
+esac
+
 # A GENERATOR ACROSS FETCH BATCHES. The three-row checks above all fit in
 # one batch; this one does not, and the two halves of the interaction it
 # pins are the two that were broken:

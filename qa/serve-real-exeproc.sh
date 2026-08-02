@@ -122,6 +122,12 @@ check "LAG over the wire"                       "SELECT * FROM PW3"
 check "ROWS BETWEEN frame over the wire"        "SELECT * FROM PW4"
 check "correlated EXISTS over the wire"         "SELECT * FROM PW5"
 check "parameterized procedure over the wire"   "SELECT * FROM PW6(5)"
+# THE FB6 SCHEMA QUALIFIER: SHOW PROCEDURES prints PUBLIC.PW6 (probed),
+# and the engine answers the qualified call in every quoting - fc used
+# to refuse both while the bare form worked, which is how the roadmap's
+# "engine-created procedures fail" misattribution survived.
+check "PUBLIC-qualified procedure in the FROM"  "SELECT R1 FROM PUBLIC.PW6(5)"
+check "quoted-qualified procedure in the FROM"  "SELECT R1 FROM \"PUBLIC\".\"PW6\"(5)"
 check "FULL JOIN over the wire"                 "SELECT * FROM PW7"
 check "RECURSIVE cte over the wire"            "SELECT * FROM PW9"
 check "multi-column recursion over the wire"   "SELECT * FROM PWA"
