@@ -13,6 +13,42 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-02 — Three truth values, in written order
+
+The engine evaluates INVARIANT conjuncts - parameters-only,
+literals-only - BEFORE the scan, in written order, with FALSE beating
+error beating UNKNOWN (probed: `1=0 AND 1/0=1` answers no rows where
+`1=NULL AND 1/0=1` raises). fire-crab's two-valued Term::matches could
+not express that law; it is tri-state now.
+
+### Fixed
+- Term::matches answers Result<Option<bool>> - UNKNOWN is distinct
+  from FALSE, and Term::Never split into invariant-dead vs per-row
+  Unknown (they answered alike and the engine does not treat them
+  alike). The invariant pass in Predicate::bind walks row-independent
+  terms in written order; a dead group is dropped, a fully-TRUE
+  invariant OR-group suppresses later groups' errors (`1=1 OR bad`
+  never raises - probed).
+- The literal bad-escape bug: `NAME LIKE 'a!bc' ESCAPE '!'` had been
+  ANSWERING wrong rows; invalid_escape now raises value-gated in the
+  Like eval arms, and the wire says 22025/335544702 instead of a
+  generic error. The pre-existing `ID=99 AND 1/0=1` twin gap closed
+  free.
+- `N LIKE ?` and the literal `N LIKE '1%'` family on INTEGER columns;
+  scaled NUMERIC/INT128 columns under STARTING/LIKE, literal and
+  param (fc's Value::Scaled render matches the engine's CAST matrix -
+  probed before trusting); `UPPER(NAME) LIKE ?` via the same arm.
+
+### Converted
+- paramshapes grew to 109 checks (constant-law section: five
+  raise-on-both, five answer-on-both pairs); new
+  qa/serve-real-intlike.sh (28 checks) for the literal shapes.
+
+### Recorded
+- Text literals against numeric columns (`N BETWEEN '1' AND '3'`,
+  `N = '2'`...) - engine answers, probes attached, unblocked by this
+  machinery but its own slice.
+
 ## 2026-08-02 — The client's declaration is the contract
 
 fire-crab had been reading and discarding the client's declared output

@@ -444,6 +444,15 @@ four; R7 is the removal of what they replaced.
   coordinates so expressions evaluate against filled slots); and the
   batch path's positional patch is gone with it.
 
+- **Text LITERALS against numeric columns** — `N BETWEEN '1' AND '3'`
+  → 1,2,3; `N IN ('1','2')`; `N = '2'`; `N > '1.5'` (fraction kept);
+  `N92 = '0.5'` — engine answers all, fc refuses at prepare; and
+  `N = 'x'` raises a conversion error UNLESS a dead group suppresses
+  it (`N='x' AND 1=0` → []), the constant-evaluation law now
+  implemented. The fix is routing typed_term's Rhs::Str through
+  text_number for Int/Numeric columns with per-row error timing —
+  unblocked, unclaimed. Param twins already agree.
+
 - **A NON-TEXT parameter against a TEXT column** — `WHERE S_VC = 5`,
   `WHERE S_VC = ?` with a boolean — is refused; the engine answers it.
   And it is not "render the value as text": the engine coerces the

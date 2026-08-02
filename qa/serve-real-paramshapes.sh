@@ -26,12 +26,23 @@
 #   * `N STARTING WITH ?` (N INTEGER): the slot is TEXT; '1' matches
 #     N=1 AND N=10, '' matches every non-NULL N, ' 1' none; a
 #     blr_long 1 binds as '1'.
+#   * `N LIKE ?` (N INTEGER) is the same render against a bound
+#     PATTERN: '1%' takes 1 and 10, an int bind 1 is the exact
+#     pattern '1' (takes N=1, not N=10), NULL is UNKNOWN.
+#   * a SCALED column renders its zero-padded fixed-point text under
+#     both: NUMERIC(9,2) 0.5 is '0.50', so STARTING '1.' takes only
+#     the 1.5x rows and LIKE '%.5%' takes the .50s.
+#   * invalid ESCAPE (22025) raises at first real evaluation, VALUE-
+#     gated, and the invariant (no-column) conjuncts evaluate BEFORE
+#     the scan in written order with FALSE > error > UNKNOWN: `?bad
+#     AND 1=0` raises, `1=0 AND ?bad` does not, `ID=NULL AND ...bad`
+#     raises per row where `ID=99 AND ...bad` short-circuits false.
 #
 # Deliberate refusals kept (engine answers; recorded for later
 # slices): `? IN (?, 2)` (the engine types the inner ? from the
 # list), `? IN (1, 'a')` (mixed - per-bind conversion semantics),
 # `? BETWEEN 1 AND 'x'` (conversion deferred to execute),
-# `? IS DISTINCT FROM 5`, `N LIKE ?`. Shared refusals (both sides
+# `? IS DISTINCT FROM 5`. Shared refusals (both sides
 # refuse): `? BETWEEN ? AND ?`, `? = ?`.
 #
 #   qa/serve-real-paramshapes.sh [port]
@@ -53,13 +64,13 @@ make_db() {
     rm -f "$1"
     "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
 CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
-CREATE TABLE T (ID INTEGER, N INTEGER, NAME VARCHAR(10));
+CREATE TABLE T (ID INTEGER, N INTEGER, NAME VARCHAR(10), N92 NUMERIC(9,2));
 COMMIT;
-INSERT INTO T VALUES (1, 1,    'ok');
-INSERT INTO T VALUES (2, 2,    'open');
-INSERT INTO T VALUES (3, 3,    'x');
-INSERT INTO T VALUES (4, 10,   NULL);
-INSERT INTO T VALUES (5, NULL, 'aa');
+INSERT INTO T VALUES (1, 1,    'ok',   0);
+INSERT INTO T VALUES (2, 2,    'open', 0.5);
+INSERT INTO T VALUES (3, 3,    'x',    -1.5);
+INSERT INTO T VALUES (4, 10,   NULL,   10);
+INSERT INTO T VALUES (5, NULL, 'aa',   NULL);
 COMMIT;
 EOF
     chmod 666 "$1"
@@ -202,6 +213,23 @@ both "NOT with the int column" "N NOT STARTING WITH ?" '["1"]'
 both "NOT with a NULL prefix" "N NOT STARTING WITH ?" '[null]'
 both "the literal twin still answers" "N STARTING WITH '1'" '[]'
 
+# --- 7b. N LIKE ? (INTEGER column, text slot) -------------------------
+both "int col LIKE ?" "N LIKE ?" '["1%"]'
+both "a suffix pattern" "N LIKE ?" '["%0"]'
+both "the empty pattern takes nothing" "N LIKE ?" '[""]'
+both "a NULL pattern" "N LIKE ?" '[null]'
+both "an int BIND is the exact pattern" "N LIKE ?" '[1]'
+both "an int BIND is the exact pattern" "N LIKE ?" '[10]'
+both "NOT LIKE with the int column" "N NOT LIKE ?" '["1%"]'
+
+# --- 7c. scaled columns render for STARTING/LIKE ----------------------
+both "N92 STARTING WITH ?" "N92 STARTING WITH ?" '["1"]'
+both "the render pads its scale ('1.' = 1.5x)" "N92 STARTING WITH ?" '["1."]'
+both "a NULL prefix on the scaled column" "N92 STARTING WITH ?" '[null]'
+both "an int BIND renders to text" "N92 STARTING WITH ?" '[1]'
+both "N92 LIKE ?" "N92 LIKE ?" '["1%"]'
+both "the fraction digits are in the text" "N92 LIKE ?" '["%.5%"]'
+
 # --- 8. error parity: conversion raises at EXECUTE on both ------------
 for pair in "? BETWEEN 1 AND 3|[\"x\"]" "? IN (1, 2)|[\"0x1\"]"; do
     pred="${pair%%|*}"; args="${pair##*|}"
@@ -230,11 +258,36 @@ for pair in "? LIKE 'a!bc' ESCAPE '!'|[\"abc\"]" "? LIKE 'ab!' ESCAPE '!'|[\"ab\
 done
 both "an invalid escape with a NULL bind answers, not raises" "? LIKE 'a!bc' ESCAPE '!'" '[null]'
 
+# --- 8c. the constant-evaluation law around the bad escape ------------
+# probed: invariant (no-column) conjuncts evaluate BEFORE the scan in
+# written order, FALSE > error > UNKNOWN; on the row pass AND
+# short-circuits on FALSE only, never on UNKNOWN, and the escape check
+# is value-gated per row. Each raise below raises on BOTH sides; each
+# answer answers [] on BOTH.
+for pair in "NAME LIKE ? ESCAPE '!'|[\"a!bc\"]" \
+            "NAME LIKE ? ESCAPE '!' AND ID = 99|[\"a!bc\"]" \
+            "NAME LIKE ? ESCAPE '!' OR ID = 1|[\"a!bc\"]" \
+            "ID = NULL AND NAME LIKE ? ESCAPE '!'|[\"a!bc\"]" \
+            "? LIKE ? ESCAPE '!' AND 1 = 0|[\"x\",\"a!bc\"]"; do
+    pred="${pair%%|*}"; args="${pair##*|}"
+    a=$(query "SELECT ID FROM T WHERE $pred ORDER BY ID" "$args" "$PORT" "$A")
+    b=$(query "SELECT ID FROM T WHERE $pred ORDER BY ID" "$args" "$REAL" "$B")
+    case "$a:$b" in
+        ERR*:ERR*) echo "OK   $pred $args raises on BOTH" ;;
+        *) echo "DIFF $pred $args: fcwire [$a] engine [$b]"; fail=1 ;;
+    esac
+done
+both "a FALSE invariant kills the bad escape" "NAME LIKE ? ESCAPE '!' AND 1 = 0" '["a!bc"]'
+both "the row pass short-circuits on FALSE" "ID = 99 AND NAME LIKE ? ESCAPE '!'" '["a!bc"]'
+both "a NULL NAME gates the check off (row 4)" "ID = 4 AND NAME LIKE ? ESCAPE '!'" '["a!bc"]'
+both "a FALSE invariant written first wins" "? IS NULL AND ? LIKE ? ESCAPE '!'" '[5,"x","a!bc"]'
+both "... even written second" "NAME LIKE ? ESCAPE '!' AND ? LIKE 'z'" '["a!bc","x"]'
+
 # --- 9. refusals kept, engine answers recorded ------------------------
 # each of these the ENGINE answers (see the gate header); fire-crab
 # refuses rather than risk the engine's wilder semantics
 for pair in "? IN (?, 2)|[1,1]" "? IN (1, 'a')|[\"a\"]" "? BETWEEN 1 AND 'x'|[2]" \
-            "? IS DISTINCT FROM 5|[4]" "N LIKE ?|[\"1%\"]"; do
+            "? IS DISTINCT FROM 5|[4]"; do
     pred="${pair%%|*}"; args="${pair##*|}"
     a=$(query "SELECT ID FROM T WHERE $pred ORDER BY ID" "$args" "$PORT" "$A")
     case "$a" in

@@ -1952,9 +1952,14 @@ enum Rhs {
 /// all the way into the leaves at parse time (De Morgan through the
 /// DNF conversion), so a term only ever answers "definitely true" -
 /// SQL UNKNOWN and false both exclude the row, and `negated` LIKE is
-/// its own leaf state rather than a runtime NOT. `Never` is what a
-/// comparison against NULL (literal or bound parameter) becomes -
-/// always UNKNOWN, the row is excluded.
+/// its own leaf state rather than a runtime NOT. UNKNOWN comes in two
+/// leaf shapes, and the engine treats them differently (probed): a
+/// ROW-INDEPENDENT unknown (`? LIKE NULL`, a NULL bind on a `?`-tested
+/// side) is `Never` - the invariant pass in [Predicate::bind] deadens
+/// the whole group before the scan - while a column-side unknown
+/// (`ID = NULL`, a NULL bind against a column term) is `Unknown`,
+/// evaluated PER ROW, where it does NOT short-circuit the conjunction:
+/// an error in a later term of the same row still raises.
 #[derive(Clone)]
 enum Term {
     Cmp(usize, Cmp, Rhs),
@@ -1981,7 +1986,16 @@ enum Term {
     /// A row-independent decision - an evaluated subquery's verdict.
     /// See [RawKind::Const].
     Const(bool),
+    /// INVARIANT unknown - a `?`-tested side that bound NULL, or
+    /// `? LIKE NULL`. Row-independent: the constant pass drops the
+    /// group before the scan, so nothing after it evaluates per row.
     Never,
+    /// PER-ROW unknown - a column term against a NULL (literal or
+    /// bound). Probed: the engine's AND short-circuits on FALSE only,
+    /// never on UNKNOWN - `ID = NULL AND <a raising term>` raises on
+    /// every row - so this must stay in the group and answer UNKNOWN
+    /// per row rather than deaden the group the way `Never` does.
+    Unknown,
     /// An EXPRESSION predicate - a built-in function call on either
     /// side, evaluated per row through the select-list expression
     /// machinery ([Cond2]: three-valued, exact numeric alignment,
@@ -2024,6 +2038,12 @@ enum Term {
     /// matches N=1 and N=10, '' matches every non-NULL N, a blr_long 1
     /// binds as '1'); becomes [Term::ExprStarting] at bind.
     ExprStartingParam(Box<Expr>, usize, bool),
+    /// `<integer/numeric column or expression> [NOT] LIKE ? [ESCAPE c]`
+    /// - the left side rendered to its decimal text against the BOUND
+    /// pattern (probed: `'1%'` takes N=1,10,100; an int bind 1 is the
+    /// pattern `'1'`, exact, not a prefix; the slot describes as text);
+    /// becomes [Term::ExprLike] at bind.
+    ExprLikeParam(Box<Expr>, usize, Option<char>, bool),
 }
 
 /// A resolved WHERE predicate in disjunctive normal form (OR of ANDs),
@@ -2042,9 +2062,19 @@ impl Predicate {
         for group in &self.0 {
             let mut all = true;
             for t in group {
-                if !t.matches(values)? {
-                    all = false;
-                    break;
+                match t.matches(values)? {
+                    Some(true) => {}
+                    // probed: the engine's AND short-circuits on FALSE
+                    // only - `ID = 99 AND <bad LIKE>` answers no rows
+                    // while `<bad LIKE> AND ID = 99` raises
+                    Some(false) => {
+                        all = false;
+                        break;
+                    }
+                    // ... and NOT on UNKNOWN: `ID = NULL AND <bad
+                    // LIKE>` raises, so the remaining terms still
+                    // evaluate even though the group cannot succeed
+                    None => all = false,
                 }
             }
             if all {
@@ -2055,11 +2085,17 @@ impl Predicate {
     }
 
     /// Substitute every parameter slot with the value that arrived at
-    /// execute. A NULL parameter in a comparison binds to `Term::Never`
-    /// (comparison with NULL is UNKNOWN); a value whose wire type does
-    /// not match the column kind is an error - never a silent wrong
-    /// filter.
-    fn bind(&self, args: &[WireParam]) -> Result<Predicate, String> {
+    /// execute. A NULL parameter against a COLUMN term binds to
+    /// `Term::Unknown` (per-row UNKNOWN), one on a `?`-tested side to
+    /// `Term::Never` (invariant); a value whose wire type does not
+    /// match the column kind is an error - never a silent wrong
+    /// filter. After each group's terms are bound, the INVARIANT PASS
+    /// runs (probed): the engine evaluates row-independent conjuncts
+    /// BEFORE the scan, left to right, and the first FALSE kills the
+    /// group with no raise, an error raises, and UNKNOWN deadens the
+    /// group while the walk continues - `1=0 AND 1/0=1` answers no
+    /// rows where `1=NULL AND 1/0=1` raises.
+    fn bind(&self, args: &[WireParam]) -> Result<Predicate, ExecErr> {
         let bind_rhs = |idx: &usize, kind: &ColKind| -> Result<Option<Rhs>, String> {
             let arg = args.get(*idx).ok_or("missing parameter value")?;
             Ok(match (kind, arg) {
@@ -2186,12 +2222,18 @@ impl Predicate {
             })
         };
         let mut groups = Vec::new();
+        // an all-invariant TRUE group already seen: the predicate is
+        // decided, and the engine's OR short-circuits at it for every
+        // row - invariants in groups written after it never evaluate
+        // and never raise (probed: `1=1 OR <bad LIKE>` answers every
+        // row, no raise; `<bad LIKE> OR 1=1` raises)
+        let mut decided = false;
         for g in &self.0 {
             let mut terms = Vec::new();
             for t in g {
                 terms.push(match t {
                     Term::Cmp(fid, op, Rhs::Param(idx, kind)) => match bind_rhs(idx, kind)? {
-                        None => Term::Never,
+                        None => Term::Unknown,
                         // A text parameter can bind a FRACTION into an
                         // integer column's term - `WHERE N_INT > ?` with
                         // `'1.5'`. Rounding it to fit `Rhs::Int` would
@@ -2202,12 +2244,15 @@ impl Predicate {
                         Some(rhs) => Term::Cmp(*fid, *op, rhs),
                     },
                     Term::NumCmp(fid, op, Rhs::Param(idx, kind)) => match bind_rhs(idx, kind)? {
-                        None => Term::Never,
+                        None => Term::Unknown,
                         Some(rhs) => Term::NumCmp(*fid, *op, rhs),
                     },
                     Term::Like(fid, Rhs::Param(idx, _), escape, negated) => {
                         match bind_rhs(idx, &ColKind::Text)? {
-                            None => Term::Never, // LIKE NULL is UNKNOWN
+                            // LIKE NULL is UNKNOWN - per row, on the
+                            // column side (probed: a later bad-escape
+                            // term in the same conjunction still raises)
+                            None => Term::Unknown,
                             Some(rhs) => Term::Like(*fid, rhs, *escape, *negated),
                         }
                     }
@@ -2215,7 +2260,7 @@ impl Predicate {
                         match bind_rhs(idx, &ColKind::Text)? {
                             // STARTING WITH NULL is UNKNOWN under both
                             // polarities (probed: zero rows either way)
-                            None => Term::Never,
+                            None => Term::Unknown,
                             Some(rhs) => Term::Starting(*fid, rhs, *negated),
                         }
                     }
@@ -2252,17 +2297,24 @@ impl Predicate {
                             _ => None,
                         };
                         match pat {
+                            // probed: an invalid ESCAPE in a
+                            // row-independent conjunct raises IN
+                            // WRITTEN ORDER with the other invariants
+                            // - a FALSE written before it suppresses
+                            // the raise (`? IS NULL [5] AND ? LIKE
+                            // ?bad` answers no rows, the reverse order
+                            // raises) - so the bad shape stays a term:
+                            // a no-column ExprLike the invariant pass
+                            // below evaluates in its place, raising
+                            // 22025 value-gated
+                            Some(p) if invalid_escape(&p, *escape) => Term::ExprLike(
+                                Box::new(Expr::Str(val)),
+                                p,
+                                *escape,
+                                *negated,
+                            ),
                             Some(p) => {
-                                // the engine validates the pattern's
-                                // escapes HERE - at execute, and only
-                                // against a non-NULL value (probed;
-                                // see invalid_escape)
-                                if invalid_escape(&p, *escape) {
-                                    return Err("Invalid ESCAPE sequence".into());
-                                }
-                                Term::Const(
-                                    like_match(&val, &p, *escape) != *negated,
-                                )
+                                Term::Const(like_match(&val, &p, *escape) != *negated)
                             }
                             None => Term::Never,
                         }
@@ -2299,7 +2351,7 @@ impl Predicate {
                     // per-row column-to-text render
                     Term::ExprStartingParam(e, slot, negated) => {
                         match args.get(*slot).ok_or("missing parameter value")? {
-                            WireParam::Null => Term::Never,
+                            WireParam::Null => Term::Unknown,
                             WireParam::Text(t) => {
                                 Term::ExprStarting(e.clone(), t.clone(), *negated)
                             }
@@ -2314,12 +2366,34 @@ impl Predicate {
                             }
                         }
                     }
+                    // `<int/numeric col or expression> LIKE ?`: the
+                    // bound pattern becomes the literal and the term
+                    // the ordinary per-row render-and-match
+                    Term::ExprLikeParam(e, slot, escape, negated) => {
+                        match args.get(*slot).ok_or("missing parameter value")? {
+                            WireParam::Null => Term::Unknown,
+                            WireParam::Text(t) => {
+                                Term::ExprLike(e.clone(), t.clone(), *escape, *negated)
+                            }
+                            // probed: an int bind 1 is the pattern '1'
+                            // - exact, not a prefix (N=1 answers, N=10
+                            // does not)
+                            WireParam::Int(v, 0) => {
+                                Term::ExprLike(e.clone(), v.to_string(), *escape, *negated)
+                            }
+                            _ => {
+                                return Err(
+                                    "parameter type does not match its column".into()
+                                )
+                            }
+                        }
+                    }
                     // an expression side against a parameter: the value
                     // becomes a literal expression and the term an
                     // ordinary three-valued comparison
                     Term::ExprParam(lhs, op, idx, kind) => {
                         match bind_literal(idx, kind)? {
-                            None => Term::Never, // compared with NULL: UNKNOWN
+                            None => Term::Unknown, // compared with NULL: UNKNOWN
                             Some(lit) => {
                                 Term::ExprCond(Box::new(Cond2::Cmp(
                                     lhs.clone(),
@@ -2332,7 +2406,39 @@ impl Predicate {
                     other => other.clone(),
                 });
             }
-            groups.push(terms);
+            if decided {
+                groups.push(terms);
+                continue;
+            }
+            // the invariant pass, in term order (probed): the first
+            // FALSE drops the group with no raise - even ahead of a
+            // constant that would raise; an error raises; UNKNOWN
+            // deadens the group for rows but the walk continues, so a
+            // later invariant error still raises in written order
+            // (`1=0 AND 1/0=1` answers no rows, `1=NULL AND 1/0=1`
+            // raises). Row-dependent terms are stepped over - a FALSE
+            // invariant written after one still kills the group.
+            let mut keep = true;
+            let mut dead = false;
+            for t in &terms {
+                if !term_row_independent(t) {
+                    continue;
+                }
+                match t.matches(&[]).map_err(ExecErr::Eval)? {
+                    Some(false) => {
+                        keep = false;
+                        break;
+                    }
+                    None => dead = true,
+                    Some(true) => {}
+                }
+            }
+            if keep && !dead {
+                decided = terms.iter().all(term_row_independent);
+                groups.push(terms);
+            }
+            // a dropped group leaves nothing behind: Predicate(vec![])
+            // answers false everywhere, which is `WHERE 1=0`
         }
         Ok(Predicate(groups))
     }
@@ -2342,10 +2448,54 @@ impl Predicate {
 fn bind_filter(
     filter: &Option<Predicate>,
     args: &[WireParam],
-) -> Result<Option<Predicate>, String> {
+) -> Result<Option<Predicate>, ExecErr> {
     match filter {
         None => Ok(None),
         Some(p) => p.bind(args).map(Some),
+    }
+}
+
+/// May this term's verdict depend on the row? The invariant pass in
+/// [Predicate::bind] walks exactly the terms this clears: constants,
+/// the invariant unknown, and expression terms whose expressions read
+/// no row slot. `Term::Unknown` is NOT one of them - it stands for a
+/// column against NULL, which the engine evaluates per row.
+fn term_row_independent(t: &Term) -> bool {
+    match t {
+        Term::Const(_) | Term::Never => true,
+        Term::ExprCond(c) => !cond_has_col(c),
+        Term::ExprLike(e, ..) | Term::ExprStarting(e, ..) => !expr_has_col(e),
+        _ => false,
+    }
+}
+
+/// Does this resolved expression read a row slot anywhere - a column
+/// or a generator value? Modeled on [expr_contains_genval].
+fn expr_has_col(e: &Expr) -> bool {
+    match e {
+        Expr::Col(_) | Expr::GenVal(_) => true,
+        Expr::Neg(a) | Expr::Cast(a, _) => expr_has_col(a),
+        Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
+            expr_has_col(a) || expr_has_col(b)
+        }
+        Expr::Coalesce(args) | Expr::Func(_, args) => args.iter().any(expr_has_col),
+        Expr::Cond(c) => cond_has_col(c),
+        Expr::Iif(c, a, b) => cond_has_col(c) || expr_has_col(a) || expr_has_col(b),
+        Expr::Case(branches, else_) => {
+            branches.iter().any(|(c, t)| cond_has_col(c) || expr_has_col(t))
+                || else_.as_deref().is_some_and(expr_has_col)
+        }
+        Expr::Lookup { key, .. } => expr_has_col(key),
+        _ => false,
+    }
+}
+
+fn cond_has_col(c: &Cond2) -> bool {
+    match c {
+        Cond2::Cmp(a, _, b) => expr_has_col(a) || expr_has_col(b),
+        Cond2::IsNull(a) | Cond2::IsNotNull(a) | Cond2::Like(a, ..) => expr_has_col(a),
+        Cond2::Not(inner) => cond_has_col(inner),
+        Cond2::And(parts) | Cond2::Or(parts) => parts.iter().any(cond_has_col),
     }
 }
 
@@ -2379,33 +2529,43 @@ fn ord_ok(o: std::cmp::Ordering, op: Cmp) -> bool {
 }
 
 impl Term {
-    fn matches(&self, values: &[Value]) -> Result<bool, EvalErr> {
+    /// Three-valued: `Some(true)` keeps the row, `Some(false)` is a
+    /// decided miss, `None` is UNKNOWN - a NULL operand or an unbound
+    /// parameter. The caller must keep the last two apart (probed):
+    /// the engine's AND short-circuits on FALSE only, so an UNKNOWN
+    /// must not stop a later term from raising. An eval error
+    /// PROPAGATES - the engine raises WHERE A / 0 = 1 mid-statement,
+    /// and so do we.
+    fn matches(&self, values: &[Value]) -> Result<Option<bool>, EvalErr> {
         Ok(match self {
             // out-of-range / missing column reads as NULL
-            Term::IsNull(fid) => matches!(values.get(*fid), Some(Value::Null) | None),
+            Term::IsNull(fid) => {
+                Some(matches!(values.get(*fid), Some(Value::Null) | None))
+            }
             Term::IsNotNull(fid) => {
-                matches!(values.get(*fid), Some(v) if !matches!(v, Value::Null))
+                Some(matches!(values.get(*fid), Some(v) if !matches!(v, Value::Null)))
             }
             // comparison with NULL, or a type that does not match the
-            // literal, is UNKNOWN - i.e. not true, the row is excluded
+            // literal, is UNKNOWN
             Term::Cmp(fid, op, Rhs::Int(lit)) => match values.get(*fid) {
-                Some(Value::Int(i)) => ord_ok(i.cmp(lit), *op),
-                _ => false,
+                Some(Value::Int(i)) => Some(ord_ok(i.cmp(lit), *op)),
+                _ => None,
             },
             Term::Cmp(fid, op, Rhs::Str(lit)) => match values.get(*fid) {
                 // trailing blanks are not significant in Firebird text
                 // comparisons (CHAR padding); trim both sides
-                Some(Value::Text(s)) => {
-                    ord_ok(s.trim_end_matches(' ').cmp(lit.trim_end_matches(' ')), *op)
-                }
-                _ => false,
+                Some(Value::Text(s)) => Some(ord_ok(
+                    s.trim_end_matches(' ').cmp(lit.trim_end_matches(' ')),
+                    *op,
+                )),
+                _ => None,
             },
             // comparison against NULL is UNKNOWN - excluded either way
-            Term::Cmp(_, _, Rhs::Null) => false,
+            Term::Cmp(_, _, Rhs::Null) => None,
             // an unbound parameter never matches (the execute path binds
             // before evaluating; this is the defensive answer)
-            Term::Cmp(_, _, Rhs::Param(..)) => false,
-            Term::Cmp(_, _, Rhs::Num(..)) => false, // Num travels in NumCmp
+            Term::Cmp(_, _, Rhs::Param(..)) => None,
+            Term::Cmp(_, _, Rhs::Num(..)) => None, // Num travels in NumCmp
             // exact numeric compare, any exact shape on either side;
             // NULL or a non-numeric value is UNKNOWN
             Term::NumCmp(fid, op, Rhs::Num(r, s)) => {
@@ -2416,54 +2576,68 @@ impl Term {
                     // literal to f64, which is the engine's conversion.
                     // (This is the HAVING side of an approximate
                     // aggregate: `HAVING AVG(DP) > 1.8`.)
-                    Some(v) if approx_of(v).is_some() => ord_ok(value_cmp(v, &rhs), *op),
-                    Some(v) => match num_cmp(v, &rhs) {
-                        Some(o) => ord_ok(o, *op),
-                        None => false,
-                    },
-                    None => false,
+                    Some(v) if approx_of(v).is_some() => {
+                        Some(ord_ok(value_cmp(v, &rhs), *op))
+                    }
+                    Some(v) => num_cmp(v, &rhs).map(|o| ord_ok(o, *op)),
+                    None => None,
                 }
             }
-            Term::NumCmp(..) => false, // unbound parameter / wrong shape
+            Term::NumCmp(..) => None, // unbound parameter / wrong shape
             Term::Like(fid, pattern, escape, negated) => match (values.get(*fid), pattern) {
                 // NO pad trim: the engine matches the stored value,
                 // padding included (differentially confirmed)
-                (Some(Value::Text(s)), Rhs::Str(p)) => like_match(s, p, *escape) != *negated,
+                (Some(Value::Text(s)), Rhs::Str(p)) => {
+                    // probed: the engine validates the pattern's escapes
+                    // at first real evaluation, VALUE-GATED - a NULL
+                    // tested value answers UNKNOWN with no raise, a
+                    // non-NULL one raises 22025 before any matching
+                    if invalid_escape(p, *escape) {
+                        return Err(EvalErr::InvalidEscape);
+                    }
+                    Some(like_match(s, p, *escape) != *negated)
+                }
                 // NULL value or NULL/unbound pattern: UNKNOWN
-                _ => false,
+                _ => None,
             },
             Term::Starting(fid, prefix, negated) => match (values.get(*fid), prefix) {
                 // per-byte prefix on the STORED value, padding included
                 // on both sides - the engine's starts() does no trimming
                 // (probed: VARCHAR 'ab' does not start with 'ab ')
-                (Some(Value::Text(s)), Rhs::Str(p)) => s.starts_with(p.as_str()) != *negated,
+                (Some(Value::Text(s)), Rhs::Str(p)) => {
+                    Some(s.starts_with(p.as_str()) != *negated)
+                }
                 // NULL value or NULL/unbound prefix: UNKNOWN
-                _ => false,
+                _ => None,
             },
-            Term::Const(b) => *b,
-            Term::Never => false,
-            // TRUE keeps the row; false and UNKNOWN exclude it; an eval
-            // error PROPAGATES - the engine raises WHERE A / 0 = 1
-            // mid-statement, and so do we
-            Term::ExprCond(c) => c.eval(values)? == Some(true),
+            Term::Const(b) => Some(*b),
+            Term::Never | Term::Unknown => None,
+            Term::ExprCond(c) => c.eval(values)?,
             Term::ExprLike(e, pattern, escape, negated) => match e.eval(values)? {
-                Value::Null => false,
-                v => like_match(&v.render(), pattern, *escape) != *negated,
+                Value::Null => None,
+                v => {
+                    // value-gated, exactly as Term::Like above
+                    if invalid_escape(pattern, *escape) {
+                        return Err(EvalErr::InvalidEscape);
+                    }
+                    Some(like_match(&v.render(), pattern, *escape) != *negated)
+                }
             },
             Term::ExprStarting(e, prefix, negated) => match e.eval(values)? {
-                Value::Null => false,
+                Value::Null => None,
                 // rendered to text as the engine coerces (an INTEGER
                 // becomes its decimal text: 1 -> '1', 10 -> '10'), then
                 // a per-byte prefix test
-                v => v.render().starts_with(prefix.as_str()) != *negated,
+                v => Some(v.render().starts_with(prefix.as_str()) != *negated),
             },
             // an unbound parameter never matches (the execute path
             // binds before evaluating; this is the defensive answer)
-            Term::ExprParam(..) => false,
+            Term::ExprParam(..) => None,
             Term::ParamIsNull(..)
             | Term::ParamLike(..)
             | Term::ParamStarting(..)
-            | Term::ExprStartingParam(..) => false,
+            | Term::ExprStartingParam(..)
+            | Term::ExprLikeParam(..) => None,
         })
     }
 }
@@ -9701,6 +9875,7 @@ fn collect_dml_targets(
 /// per-row EVAL error whose engine status vector the responder ships
 /// verbatim (UPDATE ... WHERE A / 0 = 1 answers the same 22012 the
 /// engine raises).
+#[derive(Debug)]
 enum ExecErr {
     Text(String),
     Eval(EvalErr),
@@ -10736,6 +10911,7 @@ fn filter_has_params(filter: &Option<Predicate>) -> bool {
                     | Term::ParamLike(..)
                     | Term::ParamStarting(..)
                     | Term::ExprStartingParam(..)
+                    | Term::ExprLikeParam(..)
             )
         })
     })
@@ -11140,7 +11316,7 @@ fn resolve_index_ops(db: &Database, rel: u16, descs: &[Descriptor]) -> Option<Ve
 /// Check a parameterised SELECT's values against its plan by binding
 /// every filter now: the answer is an error at op_execute, not a wrong
 /// row set at fetch. Plans without parameters validate trivially.
-fn validate_select_bind(plan: &Plan, args: &[WireParam]) -> Result<(), String> {
+fn validate_select_bind(plan: &Plan, args: &[WireParam]) -> Result<(), ExecErr> {
     match plan {
         Plan::Project { filter, .. }
         | Plan::Group { filter, .. }
@@ -17395,6 +17571,21 @@ impl From<EvalErr> for EmitErr {
     }
 }
 
+/// A filter bind failure crossing into the emit path: a descriptive
+/// text was already reported at op_execute (`Bind`), an EVAL-shaped
+/// one (the invariant pass raising where the engine's constant
+/// evaluation does) carries its status vector to the fetch reply -
+/// Derived plans skip [validate_select_bind], so this is the only road
+/// their bind errors have to the wire.
+impl From<ExecErr> for EmitErr {
+    fn from(e: ExecErr) -> Self {
+        match e {
+            ExecErr::Text(_) => EmitErr::Bind,
+            ExecErr::Eval(ev) => EmitErr::Eval(ev),
+        }
+    }
+}
+
 /// isc_arith_except and isc_exception_integer_divide_by_zero - the status
 /// vector the engine posts for an integer divide by zero (ExprNodes.cpp:2615,
 /// iberror.h). isql renders it "arithmetic exception ... / Integer divide
@@ -17433,6 +17624,11 @@ const ISC_ARG_NUMBER: i32 = 4;
 /// travel as isc_arg_number so the client's formatter fills @1/@2.
 const GDS_STRING_TRUNCATION: i32 = 335544914;
 const GDS_TRUNC_LIMITS: i32 = 335545033;
+
+/// isc_escape_invalid - "Invalid ESCAPE sequence" (SQLSTATE 22025,
+/// impl/msg/jrd.h:383): the pattern compiler's refusal of an escape
+/// character that does not precede `%`, `_` or itself.
+const GDS_ESCAPE_INVALID: i32 = 335544702;
 
 /// Write, into the fetch reply stream, the op_response the engine sends
 /// when a row's evaluation raises `e` - mirroring `respond_error`'s layout
@@ -17512,6 +17708,10 @@ fn eval_status_vector(w: &mut W, e: &EvalErr) {
                 .int(*expected as i32)
                 .int(ISC_ARG_NUMBER)
                 .int(*actual as i32);
+        }
+        EvalErr::InvalidEscape => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_ESCAPE_INVALID);
         }
     }
     w.int(0); // isc_arg_end
@@ -20365,7 +20565,15 @@ impl Cond2 {
             // rather than of the three-valued result
             Cond2::Like(a, pat, esc, negated) => match a.eval(values)? {
                 Value::Null => None,
-                v => Some(like_match(&v.render(), pat, *esc) != *negated),
+                v => {
+                    // probed: escape validation happens at first real
+                    // evaluation, VALUE-GATED - a NULL operand answers
+                    // UNKNOWN with no raise (see Term::Like)
+                    if invalid_escape(pat, *esc) {
+                        return Err(EvalErr::InvalidEscape);
+                    }
+                    Some(like_match(&v.render(), pat, *esc) != *negated)
+                }
             },
             Cond2::Not(c) => c.eval(values)?.map(|b| !b),
             Cond2::And(parts) => {
@@ -20472,6 +20680,12 @@ enum EvalErr {
     /// the value's UNTRIMMED character count - a CHAR counts its blank
     /// padding (probed: CHAR(5) holding 'ab' raises (1, 5))
     StringTruncation { expected: i64, actual: i64 },
+    /// an ESCAPE sequence the pattern compiler rejects - the escape
+    /// character not followed by `%`, `_` or itself, or ending the
+    /// pattern: `isc_escape_invalid`, "Invalid ESCAPE sequence"
+    /// (SQLSTATE 22025, jrd/evl_string.h:349). Raised at first real
+    /// evaluation, value-gated (see [invalid_escape])
+    InvalidEscape,
 }
 
 /// What an expression's result is typed as - which drives its wire form
@@ -26469,15 +26683,23 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
             ColKind::Text => Term::Cmp(idx, op, Rhs::Str(v)),
             _ => return None,
         },
-        // comparison against a NULL literal: legal SQL, always UNKNOWN
-        RawKind::Cmp(_, Rhs::Null) => Term::Never,
+        // comparison against a NULL literal: legal SQL, UNKNOWN per row
+        // (probed: it does not deaden the conjunction - a raising term
+        // written after it still raises)
+        RawKind::Cmp(_, Rhs::Null) => Term::Unknown,
         RawKind::Cmp(_, Rhs::Param(..)) => return None,
         RawKind::IsNull => Term::IsNull(idx),
         RawKind::IsNotNull => Term::IsNotNull(idx),
         RawKind::Like(pattern, escape, negated) => match (kind, pattern) {
             (ColKind::Text, Rhs::Str(p)) => Term::Like(idx, Rhs::Str(p), escape, negated),
+            // an INTEGER column coerces to its decimal text per row
+            // (probed: '1%' takes N=1,10,100; '-%' takes -5; '_' the
+            // single digits; '' and NULL take nothing)
+            (ColKind::Int, Rhs::Str(p)) => {
+                Term::ExprLike(Box::new(Expr::Col(idx)), p, escape, negated)
+            }
             // <col> LIKE NULL is UNKNOWN for every row
-            (ColKind::Text, Rhs::Null) => Term::Never,
+            (_, Rhs::Null) => Term::Unknown,
             _ => return None,
         },
         RawKind::Starting(prefix, negated) => match (kind, prefix) {
@@ -26488,7 +26710,7 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
                 Term::ExprStarting(Box::new(Expr::Col(idx)), p, negated)
             }
             // <col> STARTING WITH NULL is UNKNOWN for every row
-            (_, Rhs::Null) => Term::Never,
+            (_, Rhs::Null) => Term::Unknown,
             _ => return None,
         },
     })
@@ -26729,7 +26951,29 @@ fn resolve_expr_term(
         RawKind::Like(Rhs::Str(p), escape, negated) => {
             Term::ExprLike(Box::new(lhs), p.clone(), *escape, *negated)
         }
-        RawKind::Like(..) => return None, // non-literal pattern
+        // `<expression> LIKE ?` - the evaluated side rendered against
+        // the BOUND pattern (probed: `UPPER(NAME) LIKE ?` with 'A%'
+        // answers). Text and integer sides only, the same restriction
+        // the literal STARTING arm carries; the slot claims the
+        // synthesized text descriptor.
+        RawKind::Like(Rhs::Param(slot, _), escape, negated) => {
+            if !matches!(lhs.type_of(descs)?, ExprType::Text | ExprType::Int) {
+                return None;
+            }
+            if params.len() <= *slot {
+                params.resize(*slot + 1, None);
+            }
+            params[*slot] = Some(Descriptor {
+                dtype: dtype::VARYING,
+                scale: 0,
+                length: 32765,
+                sub_type: 0,
+                flags: 0,
+                offset: 4,
+            });
+            Term::ExprLikeParam(Box::new(lhs), *slot, *escape, *negated)
+        }
+        RawKind::Like(..) => return None, // NULL pattern
         RawKind::Starting(Rhs::Str(p), negated) => {
             // temporal/approx/bool/numeric rendering under a prefix test
             // is unprobed - refuse those, answer text and integer sides
@@ -27005,20 +27249,42 @@ fn cond_no_raise(c: &Cond2, descs: &[Descriptor]) -> bool {
 /// [typed_term] for a scaled NUMERIC/DECIMAL or INT128 column - the
 /// kinds [col_kind] does not classify. Comparisons take integer and
 /// decimal literals (exact, scale-aligned - the engine's dialect-3
-/// compare), the NULL tests work as anywhere, LIKE stays text-only,
-/// and a `?` claims its slot binding as [ColKind::Numeric].
+/// compare), the NULL tests work as anywhere, and a `?` claims its
+/// slot binding as [ColKind::Numeric]. LIKE and STARTING render the
+/// column per row (probed: the render is exactly [Value::render]'s
+/// zero-padded fixed-point text - NUMERIC(9,2) 1234.56 is '1234.56',
+/// 0.5 is '0.50', -1.5 is '-1.50', identically for INT64 and INT128
+/// storage - so `STARTING WITH '1.5'` and `'1.50'` both take the 1.5
+/// row and `'1.500'` takes none); the pattern/prefix `?` claims the
+/// SYNTHESIZED text slot, as for an INTEGER column.
 fn numeric_term(
     idx: usize,
     raw: RawKind,
     d: &Descriptor,
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Term> {
+    // the engine describes the pattern slot of ANY numeric-LHS
+    // LIKE/STARTING as plain VARYING text, not the column's own shape
+    // - param_target_ok vets column targets and does not apply
+    let mut claim_text = |slot: usize| {
+        if params.len() <= slot {
+            params.resize(slot + 1, None);
+        }
+        params[slot] = Some(Descriptor {
+            dtype: dtype::VARYING,
+            scale: 0,
+            length: 32765,
+            sub_type: 0,
+            flags: 0,
+            offset: 4,
+        });
+    };
     Some(match raw {
         RawKind::Const(b) => Term::Const(b),
         RawKind::CmpExpr(..) => return None, // see typed_term
         RawKind::Cmp(op, Rhs::Int(n)) => Term::NumCmp(idx, op, Rhs::Num(n, 0)),
         RawKind::Cmp(op, Rhs::Num(r, s)) => Term::NumCmp(idx, op, Rhs::Num(r, s)),
-        RawKind::Cmp(_, Rhs::Null) => Term::Never,
+        RawKind::Cmp(_, Rhs::Null) => Term::Unknown,
         RawKind::Cmp(op, Rhs::Param(slot, _)) => {
             if !param_target_ok(d) {
                 return None;
@@ -27032,9 +27298,23 @@ fn numeric_term(
         RawKind::Cmp(_, Rhs::Str(_)) => return None, // no text coercion here
         RawKind::IsNull => Term::IsNull(idx),
         RawKind::IsNotNull => Term::IsNotNull(idx),
+        RawKind::Like(Rhs::Str(p), escape, negated) => {
+            Term::ExprLike(Box::new(Expr::Col(idx)), p, escape, negated)
+        }
+        RawKind::Like(Rhs::Param(slot, _), escape, negated) => {
+            claim_text(slot);
+            Term::ExprLikeParam(Box::new(Expr::Col(idx)), slot, escape, negated)
+        }
+        RawKind::Like(Rhs::Null, ..) => Term::Unknown,
         RawKind::Like(..) => return None,
-        // a scaled NUMERIC's rendered text under a prefix test is
-        // unprobed - refuse
+        RawKind::Starting(Rhs::Str(p), negated) => {
+            Term::ExprStarting(Box::new(Expr::Col(idx)), p, negated)
+        }
+        RawKind::Starting(Rhs::Param(slot, _), negated) => {
+            claim_text(slot);
+            Term::ExprStartingParam(Box::new(Expr::Col(idx)), slot, negated)
+        }
+        RawKind::Starting(Rhs::Null, _) => Term::Unknown,
         RawKind::Starting(..) => return None,
     })
 }
@@ -27064,13 +27344,38 @@ fn param_or_typed_term(
             claim(slot)?;
             Some(Term::Cmp(idx, op, Rhs::Param(slot, kind)))
         }
-        RawKind::Like(Rhs::Param(slot, _), escape, negated) => {
-            if kind != ColKind::Text {
-                return None;
+        RawKind::Like(Rhs::Param(slot, _), escape, negated) => match kind {
+            ColKind::Text => {
+                claim(slot)?;
+                Some(Term::Like(idx, Rhs::Param(slot, ColKind::Text), escape, negated))
             }
-            claim(slot)?;
-            Some(Term::Like(idx, Rhs::Param(slot, ColKind::Text), escape, negated))
-        }
+            // an INTEGER column: the engine renders the column to its
+            // decimal text and describes the SLOT as TEXT, same as
+            // STARTING below (probed: `N LIKE ?` with '1%' takes
+            // N=1,10,100; an int bind 1 is the exact pattern '1').
+            // The slot claims the SYNTHESIZED text descriptor, not the
+            // column's - param_target_ok does not apply.
+            ColKind::Int => {
+                if params.len() <= slot {
+                    params.resize(slot + 1, None);
+                }
+                params[slot] = Some(Descriptor {
+                    dtype: dtype::VARYING,
+                    scale: 0,
+                    length: 32765,
+                    sub_type: 0,
+                    flags: 0,
+                    offset: 4,
+                });
+                Some(Term::ExprLikeParam(
+                    Box::new(Expr::Col(idx)),
+                    slot,
+                    escape,
+                    negated,
+                ))
+            }
+            _ => None,
+        },
         RawKind::Starting(Rhs::Param(slot, _), negated) => match kind {
             ColKind::Text => {
                 claim(slot)?;
@@ -28429,11 +28734,18 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 } else if let Err(e) = validate_select_bind(&plan, &bound_args) {
                     // a parameterised SELECT whose values cannot bind
                     // (type mismatch) fails HERE, visibly - never an
-                    // unfiltered or empty answer at fetch
+                    // unfiltered or empty answer at fetch. An
+                    // EVAL-shaped failure (the invariant pass raising
+                    // where the engine's pre-scan constant evaluation
+                    // does - an invalid ESCAPE, 1/0) ships its own
+                    // status vector, not the generic SQL error.
                     if std::env::var("FC_SRV_TRACE").is_ok() {
                         eprintln!("[srv] select bind failed: {}", e);
                     }
-                    respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                    match e {
+                        ExecErr::Text(_) => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
+                        ExecErr::Eval(ev) => respond_eval_error(&mut s, &mut enc, &ev)?,
+                    }
                 } else {
                     respond(&mut s, &mut enc, TX_HANDLE)?;
                 }
@@ -31408,24 +31720,24 @@ mod tests {
         // side (probed: VARCHAR 'ab' does not start with 'ab ';
         // CHAR(5) stores 'ab   ' and matches 'ab ' and 'ab   ')
         let t = Term::Starting(0, Rhs::Str("ab ".into()), false);
-        assert!(!t.matches(&[Value::Text("ab".into())]).unwrap());
-        assert!(t.matches(&[Value::Text("ab   ".into())]).unwrap());
+        assert_eq!(t.matches(&[Value::Text("ab".into())]).unwrap(), Some(false));
+        assert_eq!(t.matches(&[Value::Text("ab   ".into())]).unwrap(), Some(true));
         let t = Term::Starting(0, Rhs::Str("ab    ".into()), false);
-        assert!(!t.matches(&[Value::Text("ab   ".into())]).unwrap());
+        assert_eq!(t.matches(&[Value::Text("ab   ".into())]).unwrap(), Some(false));
         // the empty prefix matches every non-NULL value; NULL is UNKNOWN
         // under both polarities
         let t = Term::Starting(0, Rhs::Str(String::new()), false);
-        assert!(t.matches(&[Value::Text(String::new())]).unwrap());
-        assert!(!t.matches(&[Value::Null]).unwrap());
+        assert_eq!(t.matches(&[Value::Text(String::new())]).unwrap(), Some(true));
+        assert_eq!(t.matches(&[Value::Null]).unwrap(), None);
         let t = Term::Starting(0, Rhs::Str("ab".into()), true);
-        assert!(!t.matches(&[Value::Null]).unwrap());
-        assert!(t.matches(&[Value::Text("xy".into())]).unwrap());
+        assert_eq!(t.matches(&[Value::Null]).unwrap(), None);
+        assert_eq!(t.matches(&[Value::Text("xy".into())]).unwrap(), Some(true));
         // an INTEGER side renders to decimal text (probed: 1 and 10
         // both match prefix '1', 25 does not)
         let t = Term::ExprStarting(Box::new(Expr::Col(0)), "1".into(), false);
-        assert!(t.matches(&[Value::Int(1)]).unwrap());
-        assert!(t.matches(&[Value::Int(10)]).unwrap());
-        assert!(!t.matches(&[Value::Int(25)]).unwrap());
+        assert_eq!(t.matches(&[Value::Int(1)]).unwrap(), Some(true));
+        assert_eq!(t.matches(&[Value::Int(10)]).unwrap(), Some(true));
+        assert_eq!(t.matches(&[Value::Int(25)]).unwrap(), Some(false));
         // a bound NULL prefix is Never (UNKNOWN both ways)
         let toks = tokenize("V STARTING WITH ?").unwrap();
         let mut np = 0;
@@ -32213,9 +32525,195 @@ mod tests {
         assert!(!p.matches(&[Value::Int(4), Value::Text("x".into())]).unwrap()); // 4 < 5
         assert!(!p.matches(&[Value::Int(9), Value::Text("y".into())]).unwrap()); // text differs
         // NULL comparison is UNKNOWN (excluded); IS NULL catches it
-        assert!(!Term::Cmp(0, Cmp::Eq, Rhs::Int(1)).matches(&[Value::Null]).unwrap());
-        assert!(Term::IsNull(0).matches(&[Value::Null]).unwrap());
-        assert!(Term::IsNotNull(0).matches(&[Value::Int(0)]).unwrap());
+        assert_eq!(Term::Cmp(0, Cmp::Eq, Rhs::Int(1)).matches(&[Value::Null]).unwrap(), None);
+        assert_eq!(Term::IsNull(0).matches(&[Value::Null]).unwrap(), Some(true));
+        assert_eq!(Term::IsNotNull(0).matches(&[Value::Int(0)]).unwrap(), Some(true));
+    }
+
+    #[test]
+    fn invariant_pass_orders_false_error_unknown() {
+        // probed: row-independent (no-column) conjuncts evaluate
+        // BEFORE the scan, in written order - the first FALSE kills
+        // the group with no raise, an error raises, UNKNOWN deadens
+        // the group while the walk continues
+        let columns = vec![RelationColumn { name: "ID".into(), field_id: 0, position: 0 }];
+        let descs = vec![Descriptor {
+            dtype: dtype::LONG, scale: 0, length: 4, sub_type: 0, flags: 0, offset: 4,
+        }];
+        let resolve = |s: &str| -> Option<Predicate> {
+            let toks = tokenize(s)?;
+            let mut np = 0usize;
+            let raw = parse_predicate(&toks, &mut np)?;
+            resolve_predicate(raw, &columns, &descs, &mut Vec::new())
+        };
+        // FALSE beats the error when written first
+        let b = resolve("1 = 0 AND 1 / 0 = 1").unwrap().bind(&[]).unwrap();
+        assert!(!b.matches(&[Value::Int(1)]).unwrap());
+        // ... and the error beats a FALSE written after it
+        assert!(matches!(
+            resolve("1 / 0 = 1 AND 1 = 0").unwrap().bind(&[]),
+            Err(ExecErr::Eval(EvalErr::DivideByZero))
+        ));
+        // UNKNOWN does not suppress a later invariant error
+        assert!(matches!(
+            resolve("1 = NULL AND 1 / 0 = 1").unwrap().bind(&[]),
+            Err(ExecErr::Eval(EvalErr::DivideByZero))
+        ));
+        // ... nor does a row-dependent conjunct written before it -
+        // the constant raises even though ID = 99 is false everywhere
+        assert!(matches!(
+            resolve("ID = 99 AND 1 / 0 = 1").unwrap().bind(&[]),
+            Err(ExecErr::Eval(EvalErr::DivideByZero))
+        ));
+        // an UNKNOWN invariant alone deadens the group, no raise
+        let b = resolve("1 = NULL AND ID = 1").unwrap().bind(&[]).unwrap();
+        assert!(!b.matches(&[Value::Int(1)]).unwrap());
+        // an all-true invariant group decides the predicate: groups
+        // written after it never evaluate, so their constants never
+        // raise; written before, the error comes first
+        let b = resolve("1 = 1 OR 1 / 0 = 1").unwrap().bind(&[]).unwrap();
+        assert!(b.matches(&[Value::Int(1)]).unwrap());
+        assert!(matches!(
+            resolve("1 / 0 = 1 OR 1 = 1").unwrap().bind(&[]),
+            Err(ExecErr::Eval(EvalErr::DivideByZero))
+        ));
+        // per row the same precedence holds: FALSE short-circuits ...
+        let b = resolve("ID = 99 AND ID / 0 = 1").unwrap().bind(&[]).unwrap();
+        assert!(!b.matches(&[Value::Int(1)]).unwrap());
+        // ... and UNKNOWN does not - `ID = NULL AND <raising term>`
+        // raises on every row
+        let b = resolve("ID = NULL AND ID / 0 = 1").unwrap().bind(&[]).unwrap();
+        assert!(matches!(b.matches(&[Value::Int(1)]), Err(EvalErr::DivideByZero)));
+    }
+
+    #[test]
+    fn invalid_escape_raises_value_gated() {
+        // probed: 22025 raises at first REAL evaluation - only against
+        // a non-NULL tested value; a NULL answers UNKNOWN, no raise
+        let t = Term::Like(0, Rhs::Str("a!bc".into()), Some('!'), false);
+        assert!(matches!(
+            t.matches(&[Value::Text("abc".into())]),
+            Err(EvalErr::InvalidEscape)
+        ));
+        assert_eq!(t.matches(&[Value::Null]).unwrap(), None);
+        // NOT LIKE gates and raises identically
+        let t = Term::Like(0, Rhs::Str("ab!".into()), Some('!'), true);
+        assert!(matches!(
+            t.matches(&[Value::Text("zz".into())]),
+            Err(EvalErr::InvalidEscape)
+        ));
+        assert_eq!(t.matches(&[Value::Null]).unwrap(), None);
+        // a valid escape still matches its literal
+        let t = Term::Like(0, Rhs::Str("a!%b".into()), Some('!'), false);
+        assert_eq!(t.matches(&[Value::Text("a%b".into())]).unwrap(), Some(true));
+        // the rendered-expression arm (int/numeric LHS) gates the same
+        let t = Term::ExprLike(Box::new(Expr::Col(0)), "1!2".into(), Some('!'), false);
+        assert!(matches!(t.matches(&[Value::Int(1)]), Err(EvalErr::InvalidEscape)));
+        assert_eq!(t.matches(&[Value::Null]).unwrap(), None);
+        // `? LIKE ?` with a bad bound pattern raises as an IN-ORDER
+        // invariant: alone it raises typed ...
+        let like = Term::ParamLike(0, Rhs::Param(1, ColKind::Text), Some('!'), false);
+        let p = Predicate(vec![vec![like.clone()]]);
+        let bad = [WireParam::Text("x".into()), WireParam::Text("a!bc".into())];
+        assert!(matches!(p.bind(&bad), Err(ExecErr::Eval(EvalErr::InvalidEscape))));
+        // ... a NULL tested value gates it off entirely ...
+        let nul = [WireParam::Null, WireParam::Text("a!bc".into())];
+        assert!(!p.bind(&nul).unwrap().matches(&[]).unwrap());
+        // ... a FALSE written before it suppresses the raise, one
+        // written after does not
+        let p = Predicate(vec![vec![Term::Const(false), like.clone()]]);
+        assert!(!p.bind(&bad).unwrap().matches(&[]).unwrap());
+        let p = Predicate(vec![vec![like, Term::Const(false)]]);
+        assert!(matches!(p.bind(&bad), Err(ExecErr::Eval(EvalErr::InvalidEscape))));
+    }
+
+    #[test]
+    fn scaled_render_matches_engine_cast_matrix() {
+        // probed (isql CAST matrix): NUMERIC(9,2) renders 0.00 / 0.50 /
+        // -1.50 / 10.00 / 1234.56 / 1.50, DECIMAL(18,4) 0.0000 ..., and
+        // the INT64/INT128 storages render the same shapes - which is
+        // what LIKE/STARTING on a scaled column match against
+        for (raw, scale, want) in [
+            (0i64, -2i8, "0.00"),
+            (50, -2, "0.50"),
+            (-150, -2, "-1.50"),
+            (1000, -2, "10.00"),
+            (123456, -2, "1234.56"),
+            (150, -2, "1.50"),
+            (0, -4, "0.0000"),
+            (5000, -4, "0.5000"),
+        ] {
+            assert_eq!(Value::Scaled(raw, scale).render(), want, "raw {raw} scale {scale}");
+        }
+        for (raw, scale, want) in
+            [(150i128, -2i8, "1.50"), (123456, -2, "1234.56"), (-150, -2, "-1.50")]
+        {
+            assert_eq!(Value::Int128(raw, scale).render(), want, "raw {raw} scale {scale}");
+        }
+        // scale 0 renders bare - NUMERIC(9,0) is the plain Int path
+        assert_eq!(Value::Int(123).render(), "123");
+    }
+
+    #[test]
+    fn int_like_renders_the_column_text() {
+        // N INTEGER, NAME VARCHAR - probed: `N LIKE '1%'` takes
+        // 1,10,100; '-%' takes -5; '_' one digit; '' and NULL nothing
+        let columns = vec![
+            RelationColumn { name: "N".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "NAME".into(), field_id: 1, position: 1 },
+        ];
+        let d = |dt: u8, len: u16| Descriptor {
+            dtype: dt, scale: 0, length: len, sub_type: 0, flags: 0, offset: 4,
+        };
+        let descs = vec![d(dtype::LONG, 4), d(dtype::VARYING, 10)];
+        let resolve = |s: &str| -> Option<(Predicate, Vec<Option<Descriptor>>)> {
+            let toks = tokenize(s)?;
+            let mut np = 0usize;
+            let raw = parse_predicate(&toks, &mut np)?;
+            let mut params = Vec::new();
+            let p = resolve_predicate(raw, &columns, &descs, &mut params)?;
+            Some((p, params))
+        };
+        let hit = |s: &str, n: i64| {
+            resolve(s).unwrap().0.matches(&[Value::Int(n), Value::Null]).unwrap()
+        };
+        assert!(hit("N LIKE '1%'", 1));
+        assert!(hit("N LIKE '1%'", 10));
+        assert!(hit("N LIKE '1%'", 100));
+        assert!(!hit("N LIKE '1%'", 2));
+        assert!(hit("N LIKE '%0'", 10));
+        assert!(hit("N LIKE '_'", 3));
+        assert!(!hit("N LIKE '_'", 10));
+        assert!(hit("N LIKE '-%'", -5));
+        assert!(!hit("N LIKE ''", 1));
+        assert!(!hit("N NOT LIKE '1%'", 1));
+        assert!(hit("N NOT LIKE '1%'", 2));
+        // no int text contains a literal % - the escaped form misses
+        assert!(!hit("N LIKE '1!%' ESCAPE '!'", 1));
+        // N LIKE NULL is UNKNOWN per row
+        assert!(!hit("N LIKE NULL", 1));
+        // the bound pattern claims the SYNTHESIZED text slot ...
+        let (p, params) = resolve("N LIKE ?").unwrap();
+        assert_eq!(params.len(), 1);
+        let pd = params[0].as_ref().unwrap();
+        assert_eq!((pd.dtype, pd.length), (dtype::VARYING, 32765));
+        // ... a text bind matches the render, an int bind 1 is the
+        // EXACT pattern '1' (probed: takes N=1, not N=10), NULL is
+        // UNKNOWN
+        let row = |n: i64| vec![Value::Int(n), Value::Null];
+        let b = p.bind(&[WireParam::Text("1%".into())]).unwrap();
+        assert!(b.matches(&row(10)).unwrap());
+        let b = p.bind(&[WireParam::Int(1, 0)]).unwrap();
+        assert!(b.matches(&row(1)).unwrap());
+        assert!(!b.matches(&row(10)).unwrap());
+        assert!(!p.bind(&[WireParam::Null]).unwrap().matches(&row(1)).unwrap());
+        // `UPPER(NAME) LIKE ?` reaches the same bound term through the
+        // expression resolver (probed: the engine answers it)
+        let (p, params) = resolve("UPPER(NAME) LIKE ?").unwrap();
+        assert_eq!(params.len(), 1);
+        let b = p.bind(&[WireParam::Text("A%".into())]).unwrap();
+        assert!(b.matches(&[Value::Int(1), Value::Text("aa".into())]).unwrap());
+        assert!(!b.matches(&[Value::Int(1), Value::Text("bb".into())]).unwrap());
     }
 
     #[test]
@@ -32554,9 +33052,20 @@ mod tests {
         let null_row = vec![Value::Int(10), Value::Null, Value::Int128(42, 0)];
         assert!(!resolve("N = 12.50").unwrap().matches(&null_row).unwrap());
         assert!(resolve("N IS NULL").unwrap().matches(&null_row).unwrap());
-        // out of surface: text against numerics, LIKE on numerics
+        // out of surface: text against numerics
         assert!(resolve("N = 'x'").is_none());
-        assert!(resolve("N LIKE '1%'").is_none());
+        // LIKE/STARTING on a scaled column render it per row (probed:
+        // NUMERIC(9,2) 12.5 renders '12.50', so '1%' and '%.50' match
+        // and '12.5' - no trailing zero - does not)
+        assert!(hits("N LIKE '1%'"));
+        assert!(hits("N LIKE '%.50'"));
+        assert!(!hits("N LIKE '12.5'"));
+        assert!(hits("N LIKE '12.50'"));
+        assert!(hits("N STARTING WITH '12.5'"));
+        assert!(!hits("N STARTING WITH '12.500'"));
+        // ... and the INT128 shape renders identically
+        assert!(hits("I LIKE '4%'"));
+        assert!(hits("I STARTING WITH '42'"));
         // a parameter claims the numeric column's descriptor and binds
         // with its wire scale (12.5 arriving as raw 125 scale -1)
         let toks = tokenize("N = ?").unwrap();
