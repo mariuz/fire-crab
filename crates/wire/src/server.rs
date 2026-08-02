@@ -1687,6 +1687,9 @@ AlterDomainRename {
     /// file's pages
     Insert {
         rel: u16,
+        /// the target table's name - the 23000 status vectors name it
+        /// (schema-qualified and quoted) in every constraint refusal
+        table: String,
         format_no: u8,
         image: Vec<u8>,
         descs: Vec<Descriptor>,
@@ -1701,7 +1704,7 @@ AlterDomainRename {
         not_null: Vec<usize>,
         /// the table's CHECK constraints as NEGATED predicates - a match
         /// on the final row is a violation ([check_predicates])
-        checks: Vec<Predicate>,
+        checks: Vec<TableCheck>,
         /// the FOREIGN KEYS on this table: the bound row's key must
         /// reference an existing parent row ([fk_check_child_row])
         fk_refs: Vec<FkPartner>,
@@ -1716,6 +1719,8 @@ AlterDomainRename {
     /// chained over its old one
     Update {
         rel: u16,
+        /// the target table's name, for the 23000 vectors' arguments
+        table: String,
         format_no: u8,
         formats: Vec<(u8, Vec<Descriptor>)>,
         sets: Vec<(usize, SetVal)>,
@@ -1723,7 +1728,7 @@ AlterDomainRename {
         index_ops: Vec<IndexOp>,
         not_null: Vec<usize>,
         /// NEGATED check predicates, evaluated on each PATCHED row
-        checks: Vec<Predicate>,
+        checks: Vec<TableCheck>,
         /// FKs ON this table whose columns the SET list touches - the
         /// patched row's key must still reference an existing parent
         fk_refs: Vec<FkPartner>,
@@ -3463,6 +3468,16 @@ struct FkPartner {
     other_formats: Vec<(u8, Vec<Descriptor>)>,
     other_fids: Vec<usize>,
     my_fids: Vec<usize>,
+    /// the CHILD's FK constraint name - the engine's 23000 vector names
+    /// it on BOTH directions (a parent-side refusal still says the
+    /// child's constraint and table; only the KEY columns are the
+    /// parent's - captured raw from the live wire)
+    constraint: String,
+    /// the CHILD table's canonical (catalog) name, unquoted
+    child_table: String,
+    /// the column NAMES behind `my_fids` - this table's side of the
+    /// partnership, which is what the refusal's key text prints
+    my_cols: Vec<String>,
 }
 
 /// The FOREIGN KEY partnerships `table` participates in, as
@@ -3562,6 +3577,9 @@ fn fk_partners(
             other_formats: relation_formats(&db.bytes, db.page_size, orel),
             other_fids,
             my_fids: Vec::new(), // the caller fills its own side
+            constraint: String::new(),
+            child_table: String::new(),
+            my_cols: Vec::new(),
         })
     };
     let mut as_child = Vec::new();
@@ -3570,24 +3588,38 @@ fn fk_partners(
         let Some(pname) = fkp else { continue };
         // the partner (unique, parent-side) index row must resolve
         let (p_ix, p_rn, _) = rows.iter().find(|(n, _, _)| n.eq_ignore_ascii_case(pname))?;
+        // the CHILD's constraint name (RDB$RELATION_CONSTRAINTS by the
+        // FK index) - the engine names it in both refusal directions;
+        // the index's own name stands in if no constraint row exists
+        let cname = constraint_for_index(db, ix).unwrap_or_else(|| ix.clone());
         if rn.eq_ignore_ascii_case(table) {
             // `table` is the child: its FK columns reference p_rn
-            let my_fids: Vec<usize> = segs_of(ix).iter().map(my_fid).collect::<Option<_>>()?;
+            let my_cols = segs_of(ix);
+            let my_fids: Vec<usize> = my_cols.iter().map(my_fid).collect::<Option<_>>()?;
             let mut p = other_side(p_rn, &segs_of(p_ix))?;
             if my_fids.is_empty() || my_fids.len() != p.other_fids.len() {
                 return None;
             }
             p.my_fids = my_fids;
+            p.my_cols = my_cols;
+            p.constraint = cname.clone();
+            p.child_table = rn.clone();
             as_child.push(p);
         }
         if p_rn.eq_ignore_ascii_case(table) {
-            // `table` is the parent: rows of rn reference its key
-            let my_fids: Vec<usize> = segs_of(p_ix).iter().map(my_fid).collect::<Option<_>>()?;
+            // `table` is the parent: rows of rn reference its key. The
+            // key text prints the PARENT's own columns, but constraint
+            // and table stay the CHILD's (probed - P11b).
+            let my_cols = segs_of(p_ix);
+            let my_fids: Vec<usize> = my_cols.iter().map(my_fid).collect::<Option<_>>()?;
             let mut c = other_side(rn, &segs_of(ix))?;
             if my_fids.is_empty() || my_fids.len() != c.other_fids.len() {
                 return None;
             }
             c.my_fids = my_fids;
+            c.my_cols = my_cols;
+            c.constraint = cname;
+            c.child_table = rn.clone();
             as_parent.push(c);
         }
     }
@@ -3682,7 +3714,7 @@ fn fk_partner_lookup(db: &Database, fk: &FkPartner, key: &[&Value]) -> Option<Ve
 /// whose key is fully non-NULL must reference an existing parent row
 /// (MATCH SIMPLE - a NULL component passes the check, as the engine's
 /// idx.epp does).
-fn fk_check_child_row(db: &Database, fks: &[FkPartner], row: &[Value]) -> Result<(), String> {
+fn fk_check_child_row(db: &Database, fks: &[FkPartner], row: &[Value]) -> Result<(), EvalErr> {
     for fk in fks {
         let key: Vec<&Value> = fk
             .my_fids
@@ -3693,13 +3725,29 @@ fn fk_check_child_row(db: &Database, fks: &[FkPartner], row: &[Value]) -> Result
             continue;
         }
         if !fk_partner_has(db, fk, &key) {
-            return Err(
-                "violation of FOREIGN KEY constraint: Foreign key reference target does not exist"
-                    .into(),
-            );
+            // the child-side refusal: the written row's OWN key columns
+            return Err(fk_violation_err(fk, &key, true));
         }
     }
     Ok(())
+}
+
+/// The engine's FK status vector for one failed partnership:
+/// `isc_foreign_key` naming the CHILD's constraint and table, the
+/// direction item, and the failing side's key columns (captured raw).
+fn fk_violation_err(fk: &FkPartner, key: &[&Value], missing_target: bool) -> EvalErr {
+    let parts: Vec<(String, &Value)> = fk
+        .my_cols
+        .iter()
+        .cloned()
+        .zip(key.iter().copied())
+        .collect();
+    EvalErr::ForeignKeyViolation {
+        constraint: quoted_bare(&fk.constraint),
+        table: quoted_qualified(&fk.child_table),
+        missing_target,
+        key: constraint_key_text(&parts),
+    }
 }
 
 /// Parent-side (NO ACTION/RESTRICT) partner check: the key of a row
@@ -3711,7 +3759,7 @@ fn fk_check_parent_row(
     fks: &[FkPartner],
     old_row: &[Value],
     new_row: Option<&[Value]>,
-) -> Result<(), String> {
+) -> Result<(), EvalErr> {
     for fk in fks {
         let key: Vec<&Value> = fk
             .my_fids
@@ -3731,10 +3779,9 @@ fn fk_check_parent_row(
             }
         }
         if fk_partner_has(db, fk, &key) {
-            return Err(
-                "violation of FOREIGN KEY constraint: Foreign key references are present for the record"
-                    .into(),
-            );
+            // the parent-side refusal: still the CHILD's constraint and
+            // table, but the PARENT row's key columns (probed)
+            return Err(fk_violation_err(fk, &key, false));
         }
     }
     Ok(())
@@ -3767,7 +3814,7 @@ fn check_predicates(
     columns: &[RelationColumn],
     descs: &[Descriptor],
     dml: DmlGuard,
-) -> Option<Vec<Predicate>> {
+) -> Option<Vec<TableCheck>> {
     use fire_crab_ods::format::Value;
     let t_formats =
         fire_crab_ods::sysfmt::system_relation_formats(&db.bytes, db.page_size, "RDB$TRIGGERS")?;
@@ -3782,7 +3829,10 @@ fn check_predicates(
         tfid("RDB$TRIGGER_TYPE")?,
     );
     let trel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, "RDB$TRIGGERS")?;
-    let mut blobs: Vec<(u16, u64)> = Vec::new();
+    // each check trigger: (trigger name, trigger type, source blob) -
+    // the name feeds the 23000 vector's "At trigger" stack item and the
+    // RDB$CHECK_CONSTRAINTS constraint-name lookup
+    let mut blobs: Vec<(String, i64, u16, u64)> = Vec::new();
     let mut user_trigger = false;
     let mut fk_on_delete = false;
     let mut fk_unknown = false;
@@ -3819,7 +3869,15 @@ fn check_predicates(
             return;
         }
         if let Some(Value::Blob(r, n)) = values.get(src_f) {
-            blobs.push((*r, *n));
+            let name = match values.get(name_f) {
+                Some(Value::Text(t)) => t.trim_end().to_string(),
+                _ => String::new(),
+            };
+            let ttype = match values.get(typ_f) {
+                Some(Value::Int(t)) => *t,
+                _ => 0,
+            };
+            blobs.push((name, ttype, *r, *n));
         }
     });
     if user_trigger || fk_unknown {
@@ -3851,17 +3909,33 @@ fn check_predicates(
             }
         }
     }
-    // the two triggers of a pair carry the SAME source - dedup by text
-    let mut sources: Vec<String> = Vec::new();
-    for (r, n) in blobs {
+    // the two triggers of a pair carry the SAME source - dedup by text,
+    // keeping the trigger that FIRES for this statement kind (BEFORE
+    // INSERT = type 1, BEFORE UPDATE = type 3): the engine's refusal
+    // names the fired trigger in its stack-trace item
+    let want_type: i64 = match dml {
+        DmlGuard::Insert => 1,
+        DmlGuard::Update(_) => 3,
+        DmlGuard::Delete => 1, // unreachable - Delete returned above
+    };
+    let mut sources: Vec<(String, String)> = Vec::new(); // (source, trigger)
+    for (trig, ttype, r, n) in blobs {
         let bytes = fire_crab_blb::read_blob_content(&db.bytes, db.page_size, r, n)?;
         let text = String::from_utf8(bytes).ok()?;
-        if !sources.contains(&text) {
-            sources.push(text);
+        match sources.iter_mut().find(|(s, _)| *s == text) {
+            Some(entry) => {
+                if ttype == want_type {
+                    entry.1 = trig;
+                }
+            }
+            None => sources.push((text, trig)),
         }
     }
+    // trigger name -> owning constraint (RDB$CHECK_CONSTRAINTS carries
+    // both); a missing row leaves the trigger's own name standing in
+    let cnames = check_constraint_names(db).unwrap_or_default();
     let mut out = Vec::new();
-    for src in sources {
+    for (src, trig) in sources {
         let t = src.trim_start();
         if t.len() < 5 || !t[..5].eq_ignore_ascii_case("CHECK") {
             return None; // a check trigger whose source is not CHECK (...)
@@ -3878,9 +3952,119 @@ fn check_predicates(
         if !params.is_empty() {
             return None;
         }
-        out.push(p);
+        let constraint = cnames
+            .iter()
+            .find(|(tn, _)| tn.eq_ignore_ascii_case(&trig))
+            .map(|(_, cn)| cn.clone())
+            .unwrap_or_else(|| trig.clone());
+        let trigger = if trig.is_empty() { None } else { Some(trig) };
+        out.push(TableCheck { constraint, trigger, pred: p });
     }
     Some(out)
+}
+
+/// One CHECK constraint of a table: the NEGATED predicate (a match is a
+/// violation - see [check_predicates]) plus the two names the engine's
+/// 23000 vector ships - the constraint's own and the check trigger that
+/// fires for the statement kind (`isc_stack_trace`'s "At trigger ...").
+#[derive(Clone)]
+struct TableCheck {
+    constraint: String,
+    trigger: Option<String>,
+    pred: Predicate,
+}
+
+/// RDB$CHECK_CONSTRAINTS rows as (trigger name, constraint name) - the
+/// engine's own map from a firing check trigger to the constraint its
+/// error vector names.
+fn check_constraint_names(db: &Database) -> Option<Vec<(String, String)>> {
+    let formats = fire_crab_ods::sysfmt::system_relation_formats(
+        &db.bytes,
+        db.page_size,
+        "RDB$CHECK_CONSTRAINTS",
+    )?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(&db.bytes, db.page_size, "RDB$CHECK_CONSTRAINTS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (cn_f, tn_f) = (fid("RDB$CONSTRAINT_NAME")?, fid("RDB$TRIGGER_NAME")?);
+    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, "RDB$CHECK_CONSTRAINTS")?;
+    let fmts = vec![(0u8, descs.clone())];
+    let mut out = Vec::new();
+    for_each_record(db, rel, &fmts, |values| {
+        if let (Some(Value::Text(t)), Some(Value::Text(c))) = (values.get(tn_f), values.get(cn_f)) {
+            out.push((t.trim_end().to_string(), c.trim_end().to_string()));
+        }
+    });
+    Some(out)
+}
+
+/// RDB$RELATION_CONSTRAINTS by RDB$INDEX_NAME -> RDB$CONSTRAINT_NAME:
+/// the `MET_lookup_cnstrt_for_index` twin. None means the index backs
+/// no constraint (a bare CREATE UNIQUE INDEX - a DIFFERENT primary
+/// error code, probed P8a/P8b).
+fn constraint_for_index(db: &Database, index_name: &str) -> Option<String> {
+    let formats = fire_crab_ods::sysfmt::system_relation_formats(
+        &db.bytes,
+        db.page_size,
+        "RDB$RELATION_CONSTRAINTS",
+    )?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(&db.bytes, db.page_size, "RDB$RELATION_CONSTRAINTS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (cn_f, ix_f) = (fid("RDB$CONSTRAINT_NAME")?, fid("RDB$INDEX_NAME")?);
+    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, "RDB$RELATION_CONSTRAINTS")?;
+    let fmts = vec![(0u8, descs.clone())];
+    let mut found: Option<String> = None;
+    for_each_record(db, rel, &fmts, |values| {
+        if found.is_some() {
+            return;
+        }
+        let hit = matches!(values.get(ix_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(index_name));
+        if hit {
+            if let Some(Value::Text(n)) = values.get(cn_f) {
+                found = Some(n.trim_end().to_string());
+            }
+        }
+    });
+    found
+}
+
+/// `"{name}"` and `"PUBLIC"."{name}"` - FB6 ships every 23000 argument
+/// PRE-QUOTED and schema-qualified (captured raw); fc hard-codes PUBLIC
+/// exactly as the [EvalErr::PrimaryKeyRequired] site already does.
+/// Unquoted identifiers are stored uppercase, so the parsed name is
+/// uppercased here.
+fn quoted_bare(name: &str) -> String {
+    format!("\"{}\"", name.trim_matches('"').trim_end().to_ascii_uppercase())
+}
+fn quoted_qualified(name: &str) -> String {
+    format!("\"PUBLIC\".\"{}\"", name.trim_matches('"').trim_end().to_ascii_uppercase())
+}
+
+/// The engine's `print_key` (btr.cpp ~7128): `("COL" = v[, ...])`,
+/// the whole text capped at 250 chars. None when a value cannot render
+/// as a literal - the engine omits the key item when print_key throws,
+/// and inventing a rendering would diverge from it.
+fn constraint_key_text(parts: &[(String, &Value)]) -> Option<String> {
+    let mut segs = Vec::with_capacity(parts.len());
+    for (name, v) in parts {
+        // NULL prints BARE (probed P15: a partial-NULL compound key is
+        // refused and its key text says `"B" = NULL`); everything else
+        // renders as the SQL literal that names it - which is the same
+        // rule [psql_literal] already encodes (text single-quoted,
+        // scaled with its decimals, booleans by keyword)
+        let rendered = psql_literal(v)?;
+        segs.push(format!(
+            "\"{}\" = {}",
+            name.trim_matches('"').trim_end().to_ascii_uppercase(),
+            rendered
+        ));
+    }
+    let mut s = format!("({})", segs.join(", "));
+    if s.len() > 250 {
+        s.truncate(250);
+    }
+    Some(s)
 }
 
 /// Build the projected-column list from a select list and the relation's
@@ -8935,6 +9119,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     Some((
         Plan::Insert {
             rel,
+            table: table.to_string(),
             format_no: *format_no,
             image,
             descs,
@@ -10026,6 +10211,7 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     Some((
         Plan::Update {
             rel,
+            table: table.to_string(),
             format_no,
             formats,
             sets,
@@ -10153,7 +10339,9 @@ fn dml_targets_at(
                 Some((dp.sequence, no))
             })
             .collect();
-    let mut out = Vec::new();
+    // collected WITH the record number, because the walk's answer must
+    // leave here in record-number order - see the sort below
+    let mut out: Vec<(u64, u32, u16, u8, Vec<u8>)> = Vec::new();
     // a SET, for the same reason as `records_for`'s: consulted once per
     // candidate, so a linear scan makes this quadratic
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -10211,10 +10399,26 @@ fn dml_targets_at(
         let Some((_, descs)) = descs else { continue };
         let values = decode_record(&image, descs);
         if filter.as_ref().map_or(Ok(true), |p| p.matches(&values))? {
-            out.push((dp_no, r.slot, r.format, image));
+            out.push((recno, dp_no, r.slot, r.format, image));
         }
     }
-    Ok(out)
+    sort_targets_recno(&mut out);
+    Ok(out.into_iter().map(|(_, p, s, f, i)| (p, s, f, i)).collect())
+}
+
+/// THE WRITE WALK IS RECORD-NUMBER ORDER, NOT INDEX ORDER (probed:
+/// rows inserted physically descending take `SET ID = ID + 1` cleanly
+/// - P3 - and the same shift under a forced index PLAN still refuses
+/// naming the recno-order collision key - P10: bitmap retrieval). The
+/// index path's candidates arrive in INDEX order, so this sort is
+/// load-bearing: row-at-a-time constraint enforcement must see the
+/// rows in the order the engine writes them or a refusal names a
+/// different key than the engine's. Sorted by RECNO, never by page
+/// number - pointer-page SEQUENCE, not page number, is the storage
+/// order (the page-scan path in [collect_dml_targets] is
+/// recno-ascending by the same rule, no sort needed).
+fn sort_targets_recno(out: &mut [(u64, u32, u16, u8, Vec<u8>)]) {
+    out.sort_by_key(|(recno, ..)| *recno);
 }
 
 fn collect_dml_targets(
@@ -10632,7 +10836,7 @@ fn execute_dml_collecting(
             )?;
             (0, 0, 0)
         }
-        Plan::Insert { rel, format_no, image, descs, index_ops, param_fields, gen_fields, not_null, checks, fk_refs, default_fields } => {
+        Plan::Insert { rel, table, format_no, image, descs, index_ops, param_fields, gen_fields, not_null, checks, fk_refs, default_fields } => {
             let mut image = image.clone();
             for (fid, slot) in param_fields {
                 let d = descs.get(*fid).ok_or("field beyond format")?;
@@ -10712,7 +10916,7 @@ fn execute_dml_collecting(
             // NOT NULL validation, where the engine validates: at store
             for fid in not_null {
                 if image[fid / 8] & (1 << (fid % 8)) != 0 {
-                    return Err("validation error: NOT NULL column is NULL".into());
+                    return Err(not_valid_err(db, table, *fid));
                 }
             }
             // CHECK constraints, where the engine's triggers fire: the
@@ -10721,10 +10925,8 @@ fn execute_dml_collecting(
             if !checks.is_empty() {
                 let values = decode_record(&image, descs);
                 for c in checks {
-                    match c.matches(&values) {
-                        Ok(true) => {
-                            return Err("Operation violates CHECK constraint".into())
-                        }
+                    match c.pred.matches(&values) {
+                        Ok(true) => return Err(check_violation_err(table, c)),
                         Ok(false) => {}
                         Err(e) => return Err(ExecErr::Eval(e)),
                     }
@@ -10735,7 +10937,7 @@ fn execute_dml_collecting(
             // existing parent row (a NULL component passes)
             if !fk_refs.is_empty() {
                 let values = decode_record(&image, descs);
-                fk_check_child_row(db, fk_refs, &values)?;
+                fk_check_child_row(db, fk_refs, &values).map_err(ExecErr::Eval)?;
             }
             let image = &image;
             if let Some(a) = affected.as_deref_mut() {
@@ -10756,12 +10958,13 @@ fn execute_dml_collecting(
                     // by entries whose records are GONE is not taken
                     insert_entry_verified(
                         &mut work, db.page_size, *rel, op, &key, recno, all_null,
-                    )?;
+                    )
+                    .map_err(|e| entry_err_to_exec(db, table, op, &values, e))?;
                 }
             }
             (1, 0, 0)
         }
-        Plan::Update { rel, format_no, formats, sets, filter, index_ops, not_null, checks, fk_refs, fk_children, index } => {
+        Plan::Update { rel, table, format_no, formats, sets, filter, index_ops, not_null, checks, fk_refs, fk_children, index } => {
             let descs = formats
                 .iter()
                 .find(|(n, _)| n == format_no)
@@ -10791,6 +10994,27 @@ fn execute_dml_collecting(
             }
             let sets = &bound_sets;
             let filter = &bind_filter(filter, args)?;
+            // fmt_length, exactly as met.epp:1071 derives it (the last
+            // stored descriptor's offset + length, no rounding) - see
+            // the law stated at [build_insert_image]. A STORED record
+            // can be LONGER than this: dpm.epp zero-pads every record
+            // it stores to RHDF_SIZE (`fill`, dpm.epp:471), so a
+            // single-INT row's 8-byte image arrives from the page as 9
+            // bytes. Storing those 9 bytes RLE-packed is how an UPDATE
+            // corrupted the table: the engine unpacks into a buffer of
+            // EXACTLY fmt_length and BUGCHECKs 179 ("decompression
+            // overran buffer", sqz.cpp) - measured live on
+            // `W(ID INT NOT NULL PRIMARY KEY)`, gfix red, every read a
+            // consistency check. The patched image is therefore trimmed
+            // back to fmt_length before it is stored (only ever a ZERO
+            // tail - anything else is left alone for the refusal paths
+            // to catch).
+            let fmt_len = descs
+                .iter()
+                .filter(|d| d.offset != 0)
+                .last()
+                .map(|d| d.offset as usize + d.length as usize)
+                .unwrap_or(0);
             let mut targets: Vec<(u32, u16, Vec<u8>)> = Vec::new();
             let mut old_images: Vec<Vec<u8>> = Vec::new();
             for (page, slot, fmt, image) in
@@ -10868,7 +11092,7 @@ fn execute_dml_collecting(
                 }
                 for fid in not_null {
                     if img[fid / 8] & (1 << (fid % 8)) != 0 {
-                        return Err("validation error: NOT NULL column is NULL".into());
+                        return Err(not_valid_err(db, table, *fid));
                     }
                 }
                 // CHECK constraints on the PATCHED row (negated - a
@@ -10876,10 +11100,8 @@ fn execute_dml_collecting(
                 if !checks.is_empty() {
                     let new_values = decode_record(&img, descs);
                     for c in checks {
-                        match c.matches(&new_values) {
-                            Ok(true) => {
-                                return Err("Operation violates CHECK constraint".into())
-                            }
+                        match c.pred.matches(&new_values) {
+                            Ok(true) => return Err(check_violation_err(table, c)),
                             Ok(false) => {}
                             Err(e) => return Err(ExecErr::Eval(e)),
                         }
@@ -10892,8 +11114,16 @@ fn execute_dml_collecting(
                 if !fk_refs.is_empty() || !fk_children.is_empty() {
                     let old_values = decode_record(&image, descs);
                     let new_values = decode_record(&img, descs);
-                    fk_check_child_row(db, fk_refs, &new_values)?;
-                    fk_check_parent_row(db, fk_children, &old_values, Some(&new_values))?;
+                    fk_check_child_row(db, fk_refs, &new_values).map_err(ExecErr::Eval)?;
+                    fk_check_parent_row(db, fk_children, &old_values, Some(&new_values))
+                        .map_err(ExecErr::Eval)?;
+                }
+                // the RHDF fill trim - see fmt_len above
+                if fmt_len != 0
+                    && fmt_len < img.len()
+                    && img[fmt_len..].iter().all(|b| *b == 0)
+                {
+                    img.truncate(fmt_len);
                 }
                 old_images.push(image);
                 // the PATCHED row is what RETURNING gives back for an
@@ -10904,31 +11134,54 @@ fn execute_dml_collecting(
                 }
                 targets.push((page, slot, img));
             }
-            let out =
-                fire_crab_ods::update_records(&mut work, db.page_size, *rel, &targets, *format_no)?;
-            // IDX_modify: an entry is ADDED for every key the update
-            // changed; the old entry stays until garbage collection
-            if !index_ops.is_empty() {
+            // THE WRITE WALK ENFORCES UNIQUENESS ROW AT A TIME, IN
+            // RECORD-NUMBER ORDER (probed P1-P4/P10): each row is
+            // rewritten and its changed index keys inserted BEFORE the
+            // next row is touched, all under the one statement
+            // transaction. `unique_conflict` then judges a new key
+            // against rows this statement already rewrote (their NEW
+            // images - a stale old-key entry verifies clean, which is
+            // why the shift-down and the physically-descending shift-up
+            // pass for free) and rows not yet written (their OLD images
+            // - the ascending shift-up and the two-row swap refuse at
+            // the FIRST colliding write, naming its NEW key, exactly as
+            // the engine does). The bulk-write-then-verify order this
+            // replaces judged the FINAL state and silently committed
+            // the engine-refused `SET ID = ID + 1` shift. Statement
+            // rollback is unchanged: `work` is discarded on Err.
+            let affected = targets.len();
+            if !targets.is_empty() {
+                let tx = fire_crab_ods::begin_committed_tx(&mut work, db.page_size)?;
                 for ((page, slot, new_img), old_img) in targets.iter().zip(&old_images) {
-                    let recno = recno_of(&work, db.page_size, *page, *slot)?;
-                    let old_values = decode_record(old_img, descs);
-                    let new_values = decode_record(new_img, descs);
-                    for op in index_ops {
-                        let (old_key, _) = op
-                            .key_for(&old_values)
-                            .ok_or("unsupported value for an index key")?;
-                        let (new_key, all_null) = op
-                            .key_for(&new_values)
-                            .ok_or("unsupported value for an index key")?;
-                        if new_key != old_key {
-                            insert_entry_verified(
-                                &mut work, db.page_size, *rel, op, &new_key, recno, all_null,
-                            )?;
+                    fire_crab_ods::update_record_under(
+                        &mut work, db.page_size, *rel, tx, *page, *slot, new_img, *format_no,
+                    )?;
+                    // IDX_modify: an entry is ADDED for every key the
+                    // update changed; the old one stays until GC
+                    if !index_ops.is_empty() {
+                        let recno = recno_of(&work, db.page_size, *page, *slot)?;
+                        let old_values = decode_record(old_img, descs);
+                        let new_values = decode_record(new_img, descs);
+                        for op in index_ops {
+                            let (old_key, _) = op
+                                .key_for(&old_values)
+                                .ok_or("unsupported value for an index key")?;
+                            let (new_key, all_null) = op
+                                .key_for(&new_values)
+                                .ok_or("unsupported value for an index key")?;
+                            if new_key != old_key {
+                                insert_entry_verified(
+                                    &mut work, db.page_size, *rel, op, &new_key, recno, all_null,
+                                )
+                                .map_err(|e| {
+                                    entry_err_to_exec(db, table, op, &new_values, e)
+                                })?;
+                            }
                         }
                     }
                 }
             }
-            (0, out.affected as i32, 0)
+            (0, affected as i32, 0)
         }
         Plan::Delete { rel, formats, filter, fk_children, index } => {
             let filter = &bind_filter(filter, args)?;
@@ -10947,7 +11200,8 @@ fn execute_dml_collecting(
                         .map(|(_, d)| d)
                         .ok_or("no format for a matching record")?;
                     let values = decode_record(&image, descs);
-                    fk_check_parent_row(db, fk_children, &values, None)?;
+                    fk_check_parent_row(db, fk_children, &values, None)
+                        .map_err(ExecErr::Eval)?;
                 }
                 // a DELETE returns the row AS IT WAS
                 if let Some(a) = affected.as_deref_mut() {
@@ -11752,29 +12006,169 @@ fn insert_entry_verified(
     key: &[u8],
     recno: u64,
     all_null: bool,
-) -> Result<(), String> {
+) -> Result<(), EntryErr> {
     let enforce = op.unique && !all_null;
     match fire_crab_ods::btw::insert_index_entry(
         work, page_size, rel, op.id, key, recno, enforce, op.descending,
     ) {
         Ok(()) => Ok(()),
-        Err(e) => {
+        // the entry-level uniqueness rejection, and ONLY that one, is
+        // re-examined - any other failure is an ODS problem, and calling
+        // it a duplicate would dress a broken page as a 23000
+        Err(e) if enforce && e == "duplicate key in unique index" => {
             // the formats are read only on a REJECTION, and from the
             // work copy: a conflicting record may carry any stored
             // format, and decoding it with the newest one is how a
             // verification becomes a second bug
             let formats = fire_crab_ods::relation_formats(work, page_size, rel);
-            if enforce && !unique_conflict(work, page_size, rel, op, &formats, key, recno) {
+            if !unique_conflict(work, page_size, rel, op, &formats, key, recno) {
                 // every entry holding this key names a record that is
                 // gone, or no longer carries it
                 fire_crab_ods::btw::insert_index_entry(
                     work, page_size, rel, op.id, key, recno, false, op.descending,
                 )
+                .map_err(EntryErr::Ods)
             } else {
-                Err(e)
+                Err(EntryErr::Duplicate)
             }
         }
+        Err(e) => Err(EntryErr::Ods(e)),
     }
+}
+
+/// A rejected index-entry insert, split by cause: a VERIFIED duplicate
+/// in a unique index (the caller ships the engine's 23000 vector,
+/// built from the row it was writing) against an ODS-level failure
+/// (descriptive text, as before).
+enum EntryErr {
+    Duplicate,
+    Ods(String),
+}
+
+/// Map a rejected entry to the wire error. A verified duplicate becomes
+/// the engine's own 23000 vector naming THIS row's key - for an UPDATE
+/// that is the NEW key of the first colliding write, which is exactly
+/// the key the engine names (probed P1: the shift-up refusal says
+/// `("ID" = 6)`, the first patched value, not the pre-image). Falls
+/// back to descriptive text when the catalog cannot name the index.
+fn entry_err_to_exec(
+    db: &Database,
+    table: &str,
+    op: &IndexOp,
+    values: &[Value],
+    e: EntryErr,
+) -> ExecErr {
+    match e {
+        EntryErr::Duplicate => match unique_violation_err(db, table, op, values) {
+            Some(ev) => ExecErr::Eval(ev),
+            None => ExecErr::Text("violation of PRIMARY or UNIQUE KEY constraint".into()),
+        },
+        EntryErr::Ods(s) => ExecErr::Text(s),
+    }
+}
+
+/// The engine's NOT NULL refusal: `isc_not_valid` with the quoted
+/// fully-qualified column and the UNQUOTED `*** null ***` value text -
+/// the one unquoted argument in the 23000 family (captured raw).
+/// Descriptive text stands in when the column has no catalog name.
+fn not_valid_err(db: &Database, table: &str, fid: usize) -> ExecErr {
+    let name = relation_columns(&db.bytes, db.page_size, table)
+        .into_iter()
+        .find(|c| c.field_id as usize == fid)
+        .map(|c| c.name);
+    match name {
+        Some(n) => ExecErr::Eval(EvalErr::NotValid {
+            column: format!(
+                "\"PUBLIC\".\"{}\".\"{}\"",
+                table.trim_matches('"').to_ascii_uppercase(),
+                n.trim_end()
+            ),
+            value: "*** null ***".into(),
+        }),
+        None => ExecErr::Text("validation error: NOT NULL column is NULL".into()),
+    }
+}
+
+/// The engine's CHECK refusal: `isc_check_constraint` naming the
+/// constraint and table, plus the `isc_stack_trace` "At trigger" item
+/// naming the check trigger that fired (omitted when unknown - clients
+/// derive the 23000 from the first item either way).
+fn check_violation_err(table: &str, c: &TableCheck) -> ExecErr {
+    ExecErr::Eval(EvalErr::CheckViolation {
+        constraint: quoted_bare(&c.constraint),
+        table: quoted_qualified(table),
+        trigger: c.trigger.as_deref().map(quoted_qualified),
+    })
+}
+
+/// Build the 23000 payload for a verified duplicate: a CONSTRAINT-backed
+/// index answers `isc_unique_key_violation` naming the constraint; a
+/// bare `CREATE UNIQUE INDEX` answers `isc_no_dup` naming the
+/// schema-qualified index (probed P8a/P8b - two different primary
+/// codes). The key text is the written row's own values on the index's
+/// columns; when it cannot render, the key item is omitted, as the
+/// engine omits it when `print_key` throws.
+fn unique_violation_err(
+    db: &Database,
+    table: &str,
+    op: &IndexOp,
+    values: &[Value],
+) -> Option<EvalErr> {
+    let (ix_name, constraint) = index_error_names(db, table, op.id)?;
+    let cols = relation_columns(&db.bytes, db.page_size, table);
+    let parts: Option<Vec<(String, &Value)>> = op
+        .segs
+        .iter()
+        .map(|(fid, _, _)| {
+            cols.iter()
+                .find(|c| c.field_id as usize == *fid)
+                .map(|c| (c.name.clone(), values.get(*fid).unwrap_or(&Value::Null)))
+        })
+        .collect();
+    let key = parts.as_deref().and_then(constraint_key_text);
+    Some(match constraint {
+        Some(c) => EvalErr::UniqueKeyViolation {
+            constraint: quoted_bare(&c),
+            table: quoted_qualified(table),
+            key,
+        },
+        None => EvalErr::NoDup { index: quoted_qualified(&ix_name), key },
+    })
+}
+
+/// The `MET_lookup_cnstrt_for_index` walk's first leg: an index id (the
+/// index-root SLOT this server plans by) back to its catalog name -
+/// `RDB$INDEX_ID` stores the slot + 1, both here and in the engine -
+/// then on to the owning constraint, when one exists.
+fn index_error_names(db: &Database, table: &str, index_id: u8) -> Option<(String, Option<String>)> {
+    let formats =
+        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes, db.page_size, "RDB$INDICES")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(&db.bytes, db.page_size, "RDB$INDICES");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (nm_f, rn_f, id_f) = (
+        fid("RDB$INDEX_NAME")?,
+        fid("RDB$RELATION_NAME")?,
+        fid("RDB$INDEX_ID")?,
+    );
+    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, "RDB$INDICES")?;
+    let fmts = vec![(0u8, descs.clone())];
+    let mut found: Option<String> = None;
+    for_each_record(db, rel, &fmts, |values| {
+        if found.is_some() {
+            return;
+        }
+        let on_rel = matches!(values.get(rn_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(table));
+        let on_id = matches!(values.get(id_f), Some(Value::Int(i)) if *i == index_id as i64 + 1);
+        if on_rel && on_id {
+            if let Some(Value::Text(n)) = values.get(nm_f) {
+                found = Some(n.trim_end().to_string());
+            }
+        }
+    });
+    let ix_name = found?;
+    let constraint = constraint_for_index(db, &ix_name);
+    Some((ix_name, constraint))
 }
 
 /// Is `key` already held by a LIVE record other than `recno`?
@@ -18132,6 +18526,31 @@ const GDS_TRUNC_LIMITS: i32 = 335545033;
 /// character that does not precede `%`, `_` or itself.
 const GDS_ESCAPE_INVALID: i32 = 335544702;
 
+/// The 23000 constraint-violation family, codes confirmed against
+/// `impl/msg/jrd.h` (code = 335544320 + msg#) and captured raw from
+/// LI-T6.0.0.2076's wire (the arg strings arrive PRE-QUOTED - the
+/// quotes are part of the argument, not client-side decoration):
+///
+/// - `isc_unique_key_violation` "violation of PRIMARY or UNIQUE KEY
+///   constraint @1 on table @2" - a CONSTRAINT-backed index;
+/// - `isc_no_dup` "attempt to store duplicate value ... in unique index
+///   @1" - a bare `CREATE UNIQUE INDEX` takes this code instead;
+/// - `isc_idx_key_value` "Problematic key value is @1" - the trailing
+///   key item both of the above (and FK) append when the key renders;
+/// - `isc_foreign_key` + the direction item (`_target_doesnt_exist` on
+///   a child write, `_references_present` on a parent delete/update);
+/// - `isc_not_valid` "validation error for column @1, value @2";
+/// - `isc_check_constraint` + `isc_stack_trace` ("At trigger ...").
+const GDS_UNIQUE_KEY_VIOLATION: i32 = 335544665;
+const GDS_NO_DUP: i32 = 335544349;
+const GDS_IDX_KEY_VALUE: i32 = 335545072;
+const GDS_FOREIGN_KEY: i32 = 335544466;
+const GDS_FK_TARGET_MISSING: i32 = 335544838;
+const GDS_FK_REFS_PRESENT: i32 = 335544839;
+const GDS_NOT_VALID: i32 = 335544347;
+const GDS_CHECK_CONSTRAINT: i32 = 335544558;
+const GDS_STACK_TRACE: i32 = 335544842;
+
 /// Write, into the fetch reply stream, the op_response the engine sends
 /// when a row's evaluation raises `e` - mirroring `respond_error`'s layout
 /// but carrying the matching status vector, so the client raises the same
@@ -18214,6 +18633,64 @@ fn eval_status_vector(w: &mut W, e: &EvalErr) {
         EvalErr::InvalidEscape => {
             w.int(1) // isc_arg_gds
                 .int(GDS_ESCAPE_INVALID);
+        }
+        // the 23000 family: every arg string below is ALREADY QUOTED by
+        // the error's builder, exactly as captured from the engine's
+        // wire; the key item is appended only when the key rendered
+        EvalErr::UniqueKeyViolation { constraint, table, key } => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_UNIQUE_KEY_VIOLATION)
+                .int(2) // isc_arg_string
+                .bytes(constraint.as_bytes())
+                .int(2) // isc_arg_string
+                .bytes(table.as_bytes());
+            if let Some(k) = key {
+                w.int(1).int(GDS_IDX_KEY_VALUE).int(2).bytes(k.as_bytes());
+            }
+        }
+        EvalErr::NoDup { index, key } => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_NO_DUP)
+                .int(2) // isc_arg_string
+                .bytes(index.as_bytes());
+            if let Some(k) = key {
+                w.int(1).int(GDS_IDX_KEY_VALUE).int(2).bytes(k.as_bytes());
+            }
+        }
+        EvalErr::ForeignKeyViolation { constraint, table, missing_target, key } => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_FOREIGN_KEY)
+                .int(2) // isc_arg_string
+                .bytes(constraint.as_bytes())
+                .int(2) // isc_arg_string
+                .bytes(table.as_bytes())
+                .int(1) // isc_arg_gds - the direction item
+                .int(if *missing_target { GDS_FK_TARGET_MISSING } else { GDS_FK_REFS_PRESENT });
+            if let Some(k) = key {
+                w.int(1).int(GDS_IDX_KEY_VALUE).int(2).bytes(k.as_bytes());
+            }
+        }
+        EvalErr::NotValid { column, value } => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_NOT_VALID)
+                .int(2) // isc_arg_string
+                .bytes(column.as_bytes())
+                .int(2) // isc_arg_string - `*** null ***`, unquoted
+                .bytes(value.as_bytes());
+        }
+        EvalErr::CheckViolation { constraint, table, trigger } => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_CHECK_CONSTRAINT)
+                .int(2) // isc_arg_string
+                .bytes(constraint.as_bytes())
+                .int(2) // isc_arg_string
+                .bytes(table.as_bytes());
+            if let Some(t) = trigger {
+                w.int(1)
+                    .int(GDS_STACK_TRACE)
+                    .int(2)
+                    .bytes(format!("At trigger {}", t).as_bytes());
+            }
         }
     }
     w.int(0); // isc_arg_end
@@ -21345,6 +21822,29 @@ enum EvalErr {
     /// (SQLSTATE 22025, jrd/evl_string.h:349). Raised at first real
     /// evaluation, value-gated (see [invalid_escape])
     InvalidEscape,
+    /// a duplicate key in a CONSTRAINT-backed unique index (PK or
+    /// UNIQUE constraint): `isc_unique_key_violation` (SQLSTATE 23000)
+    /// + the key item when the key renders. Every string is stored
+    /// PRE-QUOTED, exactly as the engine ships it (`"INTEG_2"`,
+    /// `"PUBLIC"."W"`, `("ID" = 6)`) - the client does not add quotes.
+    UniqueKeyViolation { constraint: String, table: String, key: Option<String> },
+    /// a duplicate key in a BARE unique index (no constraint row):
+    /// `isc_no_dup` with the schema-qualified index name - a different
+    /// primary code than the constraint case, probed live (P8a/P8b)
+    NoDup { index: String, key: Option<String> },
+    /// a FOREIGN KEY partner failure: `isc_foreign_key` + the direction
+    /// item. `constraint`/`table` are ALWAYS the child's, even on the
+    /// parent-side refusal (probed: a parent DELETE names the CHILD's
+    /// constraint and table, but the PARENT row's key columns).
+    ForeignKeyViolation { constraint: String, table: String, missing_target: bool, key: Option<String> },
+    /// a NOT NULL violation: `isc_not_valid` with the fully-qualified
+    /// column and the value text - `*** null ***`, NOT quoted (the one
+    /// unquoted argument in the family, per the raw capture)
+    NotValid { column: String, value: String },
+    /// a CHECK constraint violation: `isc_check_constraint` + the
+    /// `isc_stack_trace` "At trigger ..." item naming the check trigger
+    /// that fired (omitted when the trigger name is unknown)
+    CheckViolation { constraint: String, table: String, trigger: Option<String> },
 }
 
 /// What an expression's result is typed as - which drives its wire form
@@ -27058,16 +27558,18 @@ fn restore_db(database: &mut Option<Database>, snap: Option<Vec<u8>>) {
 /// literal INSERT through the ordinary path. Returns the row count.
 ///
 /// A row that fails (a duplicate key, a CHECK, a NOT NULL) stops the
-/// statement where it is - the rows already written stay written, which
-/// is what this server's whole-file-per-statement model gives; the
-/// engine would roll the statement back.
+/// statement and the snapshot below rolls the earlier rows back - the
+/// engine's statement atomicity. The error is the FAILING ROW's own
+/// [ExecErr], kept typed so a constraint refusal ships its 23000
+/// vector (the engine names the first duplicate in SELECT-output
+/// order - probed P6 - which is exactly the row this loop stops at).
 fn insert_select(
     table: &str,
     cols: &[String],
     query: &str,
     database: &mut Option<Database>,
     ctx: &SessionCtx,
-) -> Result<i32, String> {
+) -> Result<i32, ExecErr> {
     // the target's column names, when the statement did not list them
     let target: Vec<String> = if cols.is_empty() {
         let db = database.as_ref().ok_or("no database attached")?;
@@ -27097,7 +27599,7 @@ fn insert_select(
     let snap = snapshot_db(database);
     let mut n = 0i32;
     for row in rows {
-        let step = (|| -> Result<(), String> {
+        let step = (|| -> Result<(), ExecErr> {
             if row.len() != target.len() {
                 return Err("the SELECT's column count does not match the INSERT's".into());
             }
@@ -27113,7 +27615,9 @@ fn insert_select(
                 vals.join(", ")
             );
             let (plan, _) = plan_insert(&sql, database).ok_or("row insert refused")?;
-            execute_dml(&plan, database, &[], ctx).map_err(|e| e.to_string())?;
+            // the row's own error propagates TYPED - a 23000 vector
+            // must survive to the wire, not be flattened to text
+            execute_dml(&plan, database, &[], ctx)?;
             Ok(())
         })();
         if let Err(e) = step {
@@ -29558,7 +30062,17 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                 if std::env::var("FC_SRV_TRACE").is_ok() {
                                     eprintln!("[srv] insert-select failed: {}", e);
                                 }
-                                respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                                // the same Eval/Text split as the other
+                                // DML arms: the failing row's 23000
+                                // vector ships verbatim
+                                match e {
+                                    ExecErr::Eval(ev) => {
+                                        respond_eval_error(&mut s, &mut enc, &ev)?
+                                    }
+                                    ExecErr::Text(_) => {
+                                        respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
+                                    }
+                                }
                             }
                         }
                     } else if let Plan::Returning { inner, cols, fields } = &plan {
@@ -37384,6 +37898,7 @@ mod tests {
     fn insert_values_returning_announces_exec_procedure_type() {
         let insert = Plan::Insert {
             rel: 128,
+            table: "T".into(),
             format_no: 0,
             image: Vec::new(),
             descs: Vec::new(),
@@ -37423,6 +37938,170 @@ mod tests {
                 index: None,
             }),
             4
+        );
+    }
+
+    #[test]
+    fn dml_targets_sort_by_record_number_not_page_number() {
+        // the probed law (P3/P10): the write walk is RECORD-NUMBER
+        // order. Page numbers here ANTI-correlate with recnos, so a
+        // page-number sort would answer the exact reverse - which is
+        // what makes the assertion mean something.
+        let mut targets: Vec<(u64, u32, u16, u8, Vec<u8>)> = vec![
+            (30, 3, 0, 1, vec![3]),
+            (10, 9, 0, 1, vec![1]),
+            (20, 7, 1, 1, vec![2]),
+        ];
+        sort_targets_recno(&mut targets);
+        let recnos: Vec<u64> = targets.iter().map(|t| t.0).collect();
+        assert_eq!(recnos, vec![10, 20, 30]);
+        let pages: Vec<u32> = targets.iter().map(|t| t.1).collect();
+        assert_eq!(pages, vec![9, 7, 3]);
+    }
+
+    #[test]
+    fn constraint_key_text_prints_like_print_key() {
+        let null = Value::Null;
+        let one = Value::Int(1);
+        let txt = Value::Text("abc".into());
+        // a NULL segment prints BARE - the engine enforces (and names)
+        // partial-NULL compound keys (probed P15)
+        let parts = vec![("A".to_string(), &one), ("B".to_string(), &null)];
+        assert_eq!(
+            constraint_key_text(&parts).as_deref(),
+            Some("(\"A\" = 1, \"B\" = NULL)")
+        );
+        // text keys are single-quoted (probed P14)
+        let parts = vec![("NAME".to_string(), &txt)];
+        assert_eq!(constraint_key_text(&parts).as_deref(), Some("(\"NAME\" = 'abc')"));
+        // a value with no literal rendering drops the whole key item -
+        // the engine omits it when print_key throws
+        let blob = Value::Blob(0, 0);
+        let parts = vec![("B".to_string(), &blob)];
+        assert_eq!(constraint_key_text(&parts), None);
+        // the 250-char cap, like btr.cpp print_key's
+        let long = Value::Text("x".repeat(300));
+        let parts = vec![("T".to_string(), &long)];
+        assert_eq!(constraint_key_text(&parts).unwrap().len(), 250);
+    }
+
+    #[test]
+    fn constraint_status_vectors_match_the_captured_wire_shapes() {
+        fn vec_of(e: &EvalErr) -> Vec<u8> {
+            let mut w = W::default();
+            eval_status_vector(&mut w, e);
+            w.buf
+        }
+        fn int(b: &mut Vec<u8>, v: i32) {
+            b.extend_from_slice(&v.to_be_bytes());
+        }
+        fn arg(b: &mut Vec<u8>, t: &str) {
+            int(b, t.len() as i32);
+            b.extend_from_slice(t.as_bytes());
+            b.extend(std::iter::repeat(0).take((4 - t.len() % 4) % 4));
+        }
+        // PK/UNIQUE constraint (captured raw from LI-T6.0.0.2076): gds
+        // 335544665 with PRE-QUOTED constraint and table args, then the
+        // key item, then isc_arg_end
+        let mut want = Vec::new();
+        int(&mut want, 1);
+        int(&mut want, 335544665);
+        int(&mut want, 2);
+        arg(&mut want, "\"INTEG_2\"");
+        int(&mut want, 2);
+        arg(&mut want, "\"PUBLIC\".\"W\"");
+        int(&mut want, 1);
+        int(&mut want, 335545072);
+        int(&mut want, 2);
+        arg(&mut want, "(\"ID\" = 6)");
+        int(&mut want, 0);
+        assert_eq!(
+            vec_of(&EvalErr::UniqueKeyViolation {
+                constraint: "\"INTEG_2\"".into(),
+                table: "\"PUBLIC\".\"W\"".into(),
+                key: Some("(\"ID\" = 6)".into()),
+            }),
+            want
+        );
+        // a bare unique INDEX takes a DIFFERENT primary code (P8b)
+        let mut want = Vec::new();
+        int(&mut want, 1);
+        int(&mut want, 335544349);
+        int(&mut want, 2);
+        arg(&mut want, "\"PUBLIC\".\"X_IDX\"");
+        int(&mut want, 1);
+        int(&mut want, 335545072);
+        int(&mut want, 2);
+        arg(&mut want, "(\"ID\" = 1)");
+        int(&mut want, 0);
+        assert_eq!(
+            vec_of(&EvalErr::NoDup {
+                index: "\"PUBLIC\".\"X_IDX\"".into(),
+                key: Some("(\"ID\" = 1)".into()),
+            }),
+            want
+        );
+        // FK child write: the direction item rides between the table
+        // arg and the key item; constraint and table are the CHILD's
+        let mut want = Vec::new();
+        int(&mut want, 1);
+        int(&mut want, 335544466);
+        int(&mut want, 2);
+        arg(&mut want, "\"C_FK\"");
+        int(&mut want, 2);
+        arg(&mut want, "\"PUBLIC\".\"C\"");
+        int(&mut want, 1);
+        int(&mut want, 335544838);
+        int(&mut want, 1);
+        int(&mut want, 335545072);
+        int(&mut want, 2);
+        arg(&mut want, "(\"WID\" = 999)");
+        int(&mut want, 0);
+        assert_eq!(
+            vec_of(&EvalErr::ForeignKeyViolation {
+                constraint: "\"C_FK\"".into(),
+                table: "\"PUBLIC\".\"C\"".into(),
+                missing_target: true,
+                key: Some("(\"WID\" = 999)".into()),
+            }),
+            want
+        );
+        // NOT NULL: the value arg is the one UNQUOTED string
+        let mut want = Vec::new();
+        int(&mut want, 1);
+        int(&mut want, 335544347);
+        int(&mut want, 2);
+        arg(&mut want, "\"PUBLIC\".\"W\".\"ID\"");
+        int(&mut want, 2);
+        arg(&mut want, "*** null ***");
+        int(&mut want, 0);
+        assert_eq!(
+            vec_of(&EvalErr::NotValid {
+                column: "\"PUBLIC\".\"W\".\"ID\"".into(),
+                value: "*** null ***".into(),
+            }),
+            want
+        );
+        // CHECK: the stack-trace item says `At trigger <name>`
+        let mut want = Vec::new();
+        int(&mut want, 1);
+        int(&mut want, 335544558);
+        int(&mut want, 2);
+        arg(&mut want, "\"K_CHK\"");
+        int(&mut want, 2);
+        arg(&mut want, "\"PUBLIC\".\"K\"");
+        int(&mut want, 1);
+        int(&mut want, 335544842);
+        int(&mut want, 2);
+        arg(&mut want, "At trigger \"PUBLIC\".\"CHECK_1\"");
+        int(&mut want, 0);
+        assert_eq!(
+            vec_of(&EvalErr::CheckViolation {
+                constraint: "\"K_CHK\"".into(),
+                table: "\"PUBLIC\".\"K\"".into(),
+                trigger: Some("\"PUBLIC\".\"CHECK_1\"".into()),
+            }),
+            want
         );
     }
 

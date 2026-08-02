@@ -41,7 +41,7 @@
 //! pointer-page bookkeeping allocation touches - and `gfix -sweep`
 //! must garbage-collect the very version chains written here.
 
-use crate::data::{flags, DataPage, DPG_RPT_OFFSET, RHD_DATA_OFFSET};
+use crate::data::{flags, DataPage, DPG_RPT_OFFSET, RHDF_DATA_OFFSET, RHD_DATA_OFFSET};
 use crate::format::data_pages_per_pp;
 use crate::pages::{PageHeader, PageType};
 use crate::pip::{PipPage, PIP_BITS_OFFSET};
@@ -720,25 +720,64 @@ pub fn update_records(
     if targets.is_empty() {
         return Ok(DmlOutcome { tx_id: 0, affected: 0 });
     }
+    let tx = begin_committed_tx(file, page_size)?;
+    for (page_no, slot, image) in targets {
+        update_record_under(file, page_size, rel, tx, *page_no, *slot, image, format_no)?;
+    }
+    Ok(DmlOutcome { tx_id: tx as u64, affected: targets.len() })
+}
+
+/// Allocate ONE committed transaction id for a statement's writes - the
+/// prologue [update_records] ran inline before it was split out so a
+/// caller can interleave its per-row writes with per-row constraint
+/// checks (the engine enforces UNIQUE/PK row at a time, in record-number
+/// order, seeing the rows the same statement already rewrote).
+pub fn begin_committed_tx(file: &mut Vec<u8>, page_size: usize) -> Result<u32, String> {
     let tx = allocate_committed_tx(file, page_size)?;
     if tx > u32::MAX as u64 {
         return Err("64-bit transaction ids (rhde) not supported yet".into());
     }
-    for (page_no, slot, image) in targets {
-        let (b_page, b_line, _) = push_back_version(file, page_size, rel, *page_no, *slot)?;
-        // RLE-pack the new version, as the engine stores records: the
-        // primary must stay at its positional slot, so a NOT_PACKED
-        // (uncompressed) image can overflow a tight page - packed, it is
-        // the same size class as the original the slot already held
-        let packed = crate::sqz::pack(image);
-        let rec = if packed.len() < image.len() {
-            rhd_bytes(tx as u32, b_page, b_line, 0, format_no, &packed)
-        } else {
-            rhd_bytes(tx as u32, b_page, b_line, flags::NOT_PACKED, format_no, image)
-        };
-        rewrite_primary(file, page_size, *page_no, *slot, &rec)?;
+    Ok(tx as u32)
+}
+
+/// Rewrite ONE primary record version under an already-allocated
+/// transaction - the loop body of [update_records], exposed so the wire
+/// server can write and then index-check each row before touching the
+/// next.
+pub fn update_record_under(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    rel: u16,
+    tx: u32,
+    page_no: u32,
+    slot: u16,
+    image: &[u8],
+    format_no: u8,
+) -> Result<(), String> {
+    let (b_page, b_line, _) = push_back_version(file, page_size, rel, page_no, slot)?;
+    // RLE-pack the new version, as the engine stores records: the
+    // primary must stay at its positional slot, so a NOT_PACKED
+    // (uncompressed) image can overflow a tight page - packed, it is
+    // the same size class as the original the slot already held
+    let packed = crate::sqz::pack(image);
+    let mut rec = if packed.len() < image.len() {
+        rhd_bytes(tx, b_page, b_line, 0, format_no, &packed)
+    } else {
+        rhd_bytes(tx, b_page, b_line, flags::NOT_PACKED, format_no, image)
+    };
+    // dpm.epp's FILL: the engine zero-pads every stored record to
+    // RHDF_SIZE (`fill = (RHDF_SIZE - header_size) - size`, dpm.epp:471)
+    // so any slot can later become a fragment header in place. The pad
+    // is legal on both encodings - validation forgives a zero tail on a
+    // NOT_PACKED record, and a 0x00 control byte in an RLE stream is a
+    // zero-length literal, a no-op (the engine memsets the fill AFTER
+    // dcc.pack, so its own packed records carry the same tail). A
+    // single-INT record written here without it is byte-shorter than
+    // the engine's, harmless today but a gratuitous divergence.
+    if rec.len() < RHDF_DATA_OFFSET {
+        rec.resize(RHDF_DATA_OFFSET, 0);
     }
-    Ok(DmlOutcome { tx_id: tx, affected: targets.len() })
+    rewrite_primary(file, page_size, page_no, slot, &rec)
 }
 
 /// Delete the primary record versions at `targets` under ONE freshly

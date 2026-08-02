@@ -558,7 +558,20 @@ four; R7 is the removal of what they replaced.
   conflict-free-final-state shape diverges. Shared with the
   FC_NO_INDEX build, so it is the common write path, not the index
   walk. Pre-existing, durable, structurally clean — a real
-  enforcement-order slice in the write path. Unclaimed.
+  enforcement-order slice in the write path. — *FIXED*: enforcement is
+  now row-at-a-time in RECNO order (probed: the engine's walk is
+  record-number order even under an index-driven UPDATE) through one
+  interleaved write-then-index loop seeing the partially-updated
+  state, and every constraint refusal carries the engine's 23000
+  vector byte-exact (constraint vs bare-index codes, FK direction
+  items, print_key's format). **The gate's engine re-reads also
+  exposed a pre-existing FILE CORRUPTION at clean HEAD: any UPDATE of
+  a table whose record data is under 9 bytes re-stored the RHDF fill
+  RLE-packed and the engine then unpacked past fmt_length — BUGCHECK
+  179. Fixed (trim to fmt_length + the RHDF fill in ods).** Residuals:
+  PSQL bodies flatten constraint errors to strings; INSERT images may
+  carry the fill byte (NOT_PACKED, engine-forgiven); FK cascades and
+  param'd UPDATE defer unchanged. `qa/serve-real-uniqueorder.sh`.
 
 - **Packaged-procedure calls refuse** — `EXECUTE PROCEDURE
   RDB$PROFILER.FLUSH` (and the 3-part `SYSTEM.RDB$PROFILER.FLUSH`):
