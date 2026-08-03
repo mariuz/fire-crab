@@ -22,6 +22,20 @@
 #      (the pair used to fall to a rendered-text compare: "10" < "9").
 #   5. Over an INDEXED column (table TI) convertible spellings answer
 #      the same rows as the scan - the engine keys `N = '2'`.
+#   6. An INDEX turns the conversion into an OPEN-time one: the engine
+#      builds the retrieval's bounds before the first record, so an
+#      unconvertible literal on a KEYED column raises over an EMPTY
+#      table (EMPTY_TI, EMPTY_TD, EMPTY_TC) where the same statement
+#      over an unindexed one answers []. Keyed means a bound (=, <, <=,
+#      >, >=, BETWEEN, IN) on an index's LEADING segment - `<>`, LIKE,
+#      STARTING WITH and a trailing segment are not keyed - and the
+#      invariant pass still decides FIRST.
+#   7. A PARTNERLESS row still meets the ON: the engine evaluates the
+#      join condition per row of the stream it walks, so a raiser gated
+#      on a row with no partner fires - which the pair walk never
+#      reaches, its FALSE key comparison short-circuiting where the
+#      NULL-padded row's is UNKNOWN. A WHERE conjunct naming that ONE
+#      side runs first and gates it.
 #
 # EXCLUDED, deliberately (fc refuses or raises where the engine's
 # answer is not one thing):
@@ -37,8 +51,12 @@
 #     double-rounds to a wrong-row answer - the second spelling matches
 #     BOTH TB rows through the collapse - fc refuses.
 #   - mantissas past i64 / scales past i8: fc refuses.
-#   - an INDEXED EMPTY table with a bad literal: the engine raises at
-#     open, fc answers [] (priced residual; EMPTY_T here is unindexed).
+#   - `COUNT(*)` over a JOIN: fc refuses the shape outright, so the
+#     partnerless-row raise cannot be asked for through it.
+#   - an unconvertible literal inside a SUBQUERY that FOLDS at prepare
+#     (`WHERE EXISTS (SELECT 1 FROM EMPTY_TI WHERE N = 'x')`): the fold
+#     answers the subquery before any filter binds, so fc answers where
+#     the engine raises at the inner open (priced residual).
 #
 #   qa/serve-real-textnumwhere.sh [port]
 set -u
@@ -57,9 +75,12 @@ fail=0
 
 # the probe fixture: T spans every exact width (SMALLINT to
 # NUMERIC(38,2)) with a NULL row and the two i64-rim BIGINTs; EMPTY_T
-# is the value gate's zero-row case (UNINDEXED - the indexed-empty
-# shape is the priced residual above); TI carries INDEXES on N and N92
-# because index presence is load-bearing on the engine
+# is the value gate's zero-row case, UNINDEXED, and the EMPTY_TI /
+# EMPTY_TD / EMPTY_TC / EMPTY_TO quartet is the same zero rows behind
+# an ASCENDING, a DESCENDING, a COMPOUND and a WRONG-COLUMN index -
+# index presence is load-bearing on the engine, at open as well as per
+# row; TI carries INDEXES on N and N92; J1/J2 are the join pair whose
+# outer row 2 has NO partner
 make_db() {
     rm -f "$1"
     "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
@@ -67,11 +88,25 @@ CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE T (ID INTEGER, N INTEGER, NSM SMALLINT, NBIG BIGINT,
                 N92 NUMERIC(9,2), N382 NUMERIC(38,2), NAME VARCHAR(10));
 CREATE TABLE EMPTY_T (ID INTEGER, N INTEGER);
+CREATE TABLE EMPTY_TI (ID INTEGER, N INTEGER);
+CREATE INDEX IDX_EMPTY_TI_N ON EMPTY_TI(N);
+CREATE TABLE EMPTY_TD (ID INTEGER, N INTEGER);
+CREATE DESCENDING INDEX IDX_EMPTY_TD_N ON EMPTY_TD(N);
+CREATE TABLE EMPTY_TC (A INTEGER, B INTEGER);
+CREATE INDEX IDX_EMPTY_TC_AB ON EMPTY_TC(A, B);
+CREATE TABLE EMPTY_TO (N INTEGER, J INTEGER);
+CREATE INDEX IDX_EMPTY_TO_J ON EMPTY_TO(J);
 CREATE TABLE TB (ID INTEGER, NB BIGINT);
 CREATE TABLE TI (ID INTEGER, N INTEGER, N92 NUMERIC(9,2));
 CREATE INDEX IDX_TI_N ON TI(N);
 CREATE INDEX IDX_TI_N92 ON TI(N92);
+CREATE TABLE J1 (ID INTEGER, K INTEGER, S VARCHAR(5));
+CREATE TABLE J2 (ID INTEGER NOT NULL PRIMARY KEY, N VARCHAR(5));
 COMMIT;
+INSERT INTO J1 VALUES (1, 1,   '5');
+INSERT INTO J1 VALUES (2, 999, 'x');
+INSERT INTO J2 VALUES (1, '5');
+INSERT INTO J2 VALUES (3, 'c');
 INSERT INTO T VALUES (1, 1,    1,    1,                   0,       0,       'alpha');
 INSERT INTO T VALUES (2, 2,    2,    2,                   0.5,     0.5,     'beta');
 INSERT INTO T VALUES (3, 3,    3,    3,                   -1.5,    -1.5,    'gamma');
@@ -258,6 +293,54 @@ both   "a FALSE conjunct short-circuits the empty-inner raiser" \
 both   "convertible on the preserved side: all rows padded" \
        "SELECT A.ID FROM T A LEFT JOIN EMPTY_T B ON A.ID = B.ID AND A.N = ' 2 ' ORDER BY A.ID"
 
+# ... and an inner stream WITH rows does not silence it either: J1's
+# row 2 (K=999) finds no partner in J2, and the engine evaluates the ON
+# for it anyway - the pair walk never reaches the raiser, because the
+# FALSE key comparison short-circuits where the NULL-padded row's is
+# UNKNOWN. Probed for every kind and for both sides of a RIGHT/FULL.
+raises "LEFT JOIN, partnerless outer row, outer-side raiser" \
+       "SELECT J1.ID AS A, J2.ID AS B FROM J1 LEFT JOIN J2 ON J2.ID = J1.K AND J1.S > 0"
+raises "INNER JOIN, partnerless outer row, outer-side raiser" \
+       "SELECT J1.ID AS A, J2.ID AS B FROM J1 JOIN J2 ON J2.ID = J1.K AND J1.S > 0"
+raises "FULL JOIN, partnerless outer row, outer-side raiser" \
+       "SELECT J1.ID AS A, J2.ID AS B FROM J1 FULL JOIN J2 ON J2.ID = J1.K AND J1.S > 0"
+raises "RIGHT JOIN's right stream has rows, so the LEFT one opens too" \
+       "SELECT J1.ID AS A, J2.ID AS B FROM J1 RIGHT JOIN J2 ON J2.ID = J1.K AND J1.S > 0"
+raises "RIGHT JOIN, partnerless preserved row, its own raiser" \
+       "SELECT J1.ID AS A, J2.ID AS B FROM J1 RIGHT JOIN J2 ON J2.ID = J1.K AND J2.N > 0"
+raises "FULL JOIN, partnerless right row, right-side raiser" \
+       "SELECT J1.ID AS A, J2.ID AS B FROM J1 FULL JOIN J2 ON J2.ID = J1.K AND J2.N > 0"
+raises "the raiser a MATCHED pair reaches still raises first" \
+       "SELECT J1.ID AS A, J2.ID AS B FROM J1 LEFT JOIN J2 ON J2.ID = J1.K AND J1.S > 0 AND J2.N > 0"
+both   "the padded row keeps the value gate: an inner-side raiser is NULL" \
+       "SELECT J1.ID AS A, J2.ID AS B FROM J1 LEFT JOIN J2 ON J2.ID = J1.K AND J2.N > 0"
+both   "a FALSE conjunct short-circuits the partnerless raiser too" \
+       "SELECT J1.ID AS A, J2.ID AS B FROM J1 LEFT JOIN J2 ON J2.ID = J1.K AND J1.ID = -1 AND J1.S > 0"
+# the WHERE above the join runs FIRST on the stream it names: a
+# top-level conjunct all of whose columns are one side's gates that
+# side's ON raising; one naming the other side, or spanning both, does
+# not
+both "WHERE on the outer side gates it" \
+     "SELECT J1.ID AS A, J2.ID AS B FROM J1 LEFT JOIN J2 ON J2.ID = J1.K AND J1.S > 0 WHERE J1.ID = 1"
+both "... the complement of it, too" \
+     "SELECT J1.ID AS A, J2.ID AS B FROM J1 LEFT JOIN J2 ON J2.ID = J1.K AND J1.S > 0 WHERE J1.ID <> 2"
+both "... and an outer-side WHERE on the raiser's own column" \
+     "SELECT J1.ID AS A, J2.ID AS B FROM J1 LEFT JOIN J2 ON J2.ID = J1.K AND J1.S > 0 WHERE J1.S = '5'"
+both "a WHERE that keeps the row does not gate it" \
+     "SELECT J1.ID AS A, J2.ID AS B FROM J1 LEFT JOIN J2 ON J2.ID = J1.K AND J1.S > 0 WHERE J1.ID = 2"
+both "a WHERE naming the INNER side does not gate it" \
+     "SELECT J1.ID AS A, J2.ID AS B FROM J1 LEFT JOIN J2 ON J2.ID = J1.K AND J1.S > 0 WHERE J2.ID IS NOT NULL"
+both "... nor the anti-join spelling of it" \
+     "SELECT J1.ID AS A, J2.ID AS B FROM J1 LEFT JOIN J2 ON J2.ID = J1.K AND J1.S > 0 WHERE J2.ID IS NULL"
+both "nor one conjunct spanning BOTH sides" \
+     "SELECT J1.ID AS A, J2.ID AS B FROM J1 LEFT JOIN J2 ON J2.ID = J1.K AND J1.S > 0 WHERE J1.ID = 1 OR J2.N = '5'"
+both "a WHERE nothing survives gates it" \
+     "SELECT J1.ID AS A, J2.ID AS B FROM J1 LEFT JOIN J2 ON J2.ID = J1.K AND J1.S > 0 WHERE 1 = 0"
+both "the right-side WHERE gates the right-side raiser" \
+     "SELECT J1.ID AS A, J2.ID AS B FROM J1 RIGHT JOIN J2 ON J2.ID = J1.K AND J2.N > 0 WHERE J2.ID = 1"
+both "... and does not when the partnerless row survives it" \
+     "SELECT J1.ID AS A, J2.ID AS B FROM J1 RIGHT JOIN J2 ON J2.ID = J1.K AND J2.N > 0 WHERE J2.ID = 3"
+
 # --- 6. HAVING, joins and expression sides convert ----------------------
 both "HAVING N > '50'" "SELECT N FROM T GROUP BY N HAVING N > '50'"
 both "HAVING SUM(N92) = '0.5'" "SELECT ID FROM T GROUP BY ID HAVING SUM(N92) = '0.5' ORDER BY ID"
@@ -276,6 +359,88 @@ ti "indexed N > '1.5'" "N > '1.5'"
 ti "indexed N92 = '0.5'" "N92 = '0.5'"
 ti "indexed IN ('1','2')" "N IN ('1','2')"
 ti "indexed N = ' 2 '" "N = ' 2 '"
+
+# --- 8. the index key converts at OPEN ----------------------------------
+# The bounds of an index retrieval are built before the first record, so
+# on a KEYED column an unconvertible literal raises over ZERO rows -
+# where EMPTY_T, the same table without the index, answers []. Every
+# cell below was probed against the engine.
+ei() { # <label> <predicate over the empty INDEXED table>
+    both "$1" "SELECT ID FROM EMPTY_TI WHERE $2"
+}
+raises "indexed empty: N = 'x'"           "SELECT ID FROM EMPTY_TI WHERE N = 'x'"
+raises "indexed empty: N > 'x'"           "SELECT ID FROM EMPTY_TI WHERE N > 'x'"
+raises "indexed empty: N < 'x'"           "SELECT ID FROM EMPTY_TI WHERE N < 'x'"
+raises "indexed empty: N <= 'x'"          "SELECT ID FROM EMPTY_TI WHERE N <= 'x'"
+raises "indexed empty: N >= 'x'"          "SELECT ID FROM EMPTY_TI WHERE N >= 'x'"
+raises "indexed empty: BETWEEN 'x' AND 'x'" "SELECT ID FROM EMPTY_TI WHERE N BETWEEN 'x' AND 'x'"
+raises "indexed empty: IN ('x')"          "SELECT ID FROM EMPTY_TI WHERE N IN ('x')"
+raises "indexed empty: IN ('1','x')"      "SELECT ID FROM EMPTY_TI WHERE N IN ('1','x')"
+raises "indexed empty: both OR arms keyed" "SELECT ID FROM EMPTY_TI WHERE N = 'x' OR N = 1"
+raises "indexed empty: IS NULL is a keyed arm" "SELECT ID FROM EMPTY_TI WHERE N = 'x' OR N IS NULL"
+raises "indexed empty: a DESCENDING index keys it too" "SELECT ID FROM EMPTY_TD WHERE N = 'x'"
+raises "indexed empty: a compound index's LEADING segment" "SELECT A FROM EMPTY_TC WHERE A = 'x'"
+raises "indexed empty: COUNT(*) is no exception" "SELECT COUNT(*) FROM EMPTY_TI WHERE N = 'x'"
+raises "indexed empty: MAX(N) likewise"   "SELECT MAX(N) FROM EMPTY_TI WHERE N = 'x'"
+raises "indexed empty: GROUP BY"          "SELECT N FROM EMPTY_TI WHERE N = 'x' GROUP BY N"
+raises "indexed empty: ORDER BY"          "SELECT ID FROM EMPTY_TI WHERE N = 'x' ORDER BY ID"
+raises "indexed empty: FIRST 1"           "SELECT FIRST 1 ID FROM EMPTY_TI WHERE N = 'x'"
+raises "indexed empty: DELETE"            "DELETE FROM EMPTY_TI WHERE N = 'x'"
+raises "indexed empty: UPDATE"            "UPDATE EMPTY_TI SET ID = 1 WHERE N = 'x'"
+# the ends of a range convert in WRITTEN order - the argument names the
+# literal the engine reached
+both "indexed empty: BETWEEN 'x' AND '9' names the lower end" \
+     "SELECT ID FROM EMPTY_TI WHERE N BETWEEN 'x' AND '9'"
+both "indexed empty: BETWEEN '1' AND 'y' names the upper one" \
+     "SELECT ID FROM EMPTY_TI WHERE N BETWEEN '1' AND 'y'"
+# and the shapes that key NOTHING answer [] over the same zero rows
+both "unindexed empty answers [] for the same literal" "SELECT ID FROM EMPTY_T WHERE N = 'x'"
+ei "indexed empty: <> is two ranges, not a key" "N <> 'x'"
+ei "indexed empty: NOT (N = 'x') either"        "NOT (N = 'x')"
+ei "indexed empty: LIKE over a numeric segment" "N LIKE 'x'"
+ei "indexed empty: STARTING WITH likewise"      "N STARTING WITH 'x'"
+ei "indexed empty: a convertible literal"       "N = '2'"
+ei "indexed empty: the compare grammar's blanks" "N = ' 2 '"
+both "indexed empty: a compound index's TRAILING segment" \
+     "SELECT A FROM EMPTY_TC WHERE B = 'x'"
+both "indexed empty: an index on the OTHER column" \
+     "SELECT N FROM EMPTY_TO WHERE N = 'x'"
+raises "indexed empty: ... and the indexed one beside it" \
+     "SELECT N FROM EMPTY_TO WHERE J = 'x'"
+# the invariant pass still decides FIRST: it runs over the whole
+# predicate before any retrieval is opened
+ei "indexed empty: a FALSE invariant kills it"   "N = 'x' AND 1 = 0"
+ei "indexed empty: written the other way round"  "1 = 0 AND N = 'x'"
+ei "indexed empty: an UNKNOWN invariant dooms it" "N = 'x' AND 1 = NULL"
+both "indexed empty: an invariant DIVISION raises INSTEAD" \
+     "SELECT ID FROM EMPTY_TI WHERE N = 'x' AND 1/0 = 1"
+both "... whichever side of the raiser it is written" \
+     "SELECT ID FROM EMPTY_TI WHERE 1/0 = 1 AND N = 'x'"
+# every branch of a disjunction must be servable or there is no
+# inversion at all, and one segment holds ONE lower and ONE upper
+# value - the LAST match written overwrites the others
+ei "indexed empty: an unservable OR arm drops the inversion" "N = 'x' OR 1 = 1"
+ei "indexed empty: ... an expression arm too"    "N = 'x' OR N + 0 = 1"
+ei "indexed empty: the LAST equality is the key"  "N = 'x' AND N = 5"
+raises "indexed empty: ... and the other order raises" \
+       "SELECT ID FROM EMPTY_TI WHERE N = 5 AND N = 'x'"
+both "indexed empty: the last of two bad ones is named" \
+     "SELECT ID FROM EMPTY_TI WHERE N = 'w' AND N = 'x'"
+ei "indexed empty: a distributed DNF puts the number last" \
+   "(N = 'x' OR N = 1) AND N = 4"
+raises "indexed empty: a range beside the equality does not overwrite it" \
+       "SELECT ID FROM EMPTY_TI WHERE N = 'x' AND N > 3"
+ei "indexed empty: IS NULL matches without writing the value" "N = 'x' AND N IS NULL"
+# with ROWS the band decides, not the table: TI's empty band never
+# reaches the residual raiser, and the same pair written the other way
+# round makes the raiser the key. The first of the two is the ONE check
+# here that needs fire-crab's own retrieval to take the band - the
+# raises above are read off the CATALOG and stand under FC_NO_INDEX=1,
+# where this one scans into the residual and raises.
+both "indexed rows, EMPTY band: the residual never runs" \
+     "SELECT ID FROM TI WHERE N = 'x' AND N = 999 ORDER BY ID"
+raises "indexed rows, the raiser as the key" \
+       "SELECT ID FROM TI WHERE N = 999 AND N = 'x' ORDER BY ID"
 
 rm -f "$A" "$B"
 exit $fail

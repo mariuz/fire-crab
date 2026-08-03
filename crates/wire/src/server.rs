@@ -984,6 +984,12 @@ enum RowSource {
         left_width: usize,
         right: Box<RowSource>,
         part: Box<JoinPart>,
+        /// the WHERE that filters ABOVE this join. It is carried DOWN
+        /// because the engine does not only apply it above: a top-level
+        /// conjunct naming ONE side rides that side's stream, where it
+        /// runs BEFORE the ON's own booleans and gates their raising
+        /// (see [join_step]).
+        above: Option<Predicate>,
     },
     /// the engine's AggregatedStream: `input` folded into one row per
     /// distinct key, with HAVING filtering the FOLDED rows rather than
@@ -1049,10 +1055,10 @@ impl RowSource {
                 branch_rows(plan, db, &[]).ok_or(EvalErr::ConversionError(None))
             }
             RowSource::Rows(rows) => Ok(rows.clone()),
-            RowSource::NestedLoopJoin { left, left_width, right, part } => {
+            RowSource::NestedLoopJoin { left, left_width, right, part, above } => {
                 let l = left.rows(db)?;
                 let r = right.rows(db)?;
-                join_step(l, *left_width, &r, part)
+                join_step(l, *left_width, &r, part, above)
             }
             RowSource::Aggregate {
                 input,
@@ -2025,10 +2031,12 @@ enum Term {
     /// the invariant/conjunct machinery with no extra logic; UPDATE and
     /// DELETE inherit atomicity because [collect_dml_targets] collects
     /// fully before any write. Never keyed by [pick_for_terms], so it
-    /// scans and raises at the first non-NULL row - the one priced
-    /// residual: an INDEXED empty table, where the engine raises at
-    /// open and fc answers [].
-    CmpConvErr(usize, String),
+    /// scans and raises at the first non-NULL row - EXCEPT where the
+    /// engine's own retrieval keys the column, which converts the
+    /// literal at open whatever the rows are ([Predicate::key_conversion]
+    /// - hence the comparison operator, which decides whether a segment
+    /// can match at all).
+    CmpConvErr(usize, Cmp, String),
     /// A TEXT COLUMN against a NUMERIC side: the engine coerces the
     /// COLUMN's text to a number PER ROW, VALUE-GATED (cvt2.cpp
     /// `cmp_numeric_string` -> cvt.cpp `CVT_get_numeric`), with the
@@ -2158,10 +2166,17 @@ enum Term {
 /// first row that fails `ID>3` (both probed) - so [Predicate::matches]
 /// and the bind-time invariant pass walk the conjuncts, not the raw
 /// groups.
+///
+/// `keys` is the retrieval's side of that: the columns the ENGINE can
+/// match to an index segment ([index_key_fids]), which decides where
+/// [Predicate::key_conversion] converts a literal at OPEN. It is empty
+/// wherever a relation's catalog is not in hand (a CHECK constraint, a
+/// join's combined row), and an empty one converts nothing.
 #[derive(Clone)]
 struct Predicate {
     groups: Vec<Vec<Term>>,
     tags: Vec<Vec<u32>>,
+    keys: Vec<usize>,
 }
 
 impl Predicate {
@@ -2176,7 +2191,7 @@ impl Predicate {
         } else {
             groups.iter().map(|g| vec![0; g.len()]).collect()
         };
-        Predicate { groups, tags }
+        Predicate { groups, tags, keys: Vec::new() }
     }
 
     fn tagged(groups: Vec<Vec<Term>>, tags: Vec<Vec<u32>>) -> Predicate {
@@ -2184,12 +2199,19 @@ impl Predicate {
             groups.iter().map(Vec::len).collect::<Vec<_>>(),
             tags.iter().map(Vec::len).collect::<Vec<_>>(),
         );
-        Predicate { groups, tags }
+        Predicate { groups, tags, keys: Vec::new() }
     }
 
     /// `WHERE 1=0`: no group to satisfy, matches nothing.
     fn empty() -> Predicate {
-        Predicate { groups: vec![], tags: vec![] }
+        Predicate { groups: vec![], tags: vec![], keys: Vec::new() }
+    }
+
+    /// The keyable columns of the relation this filter reads, for the
+    /// open-time [Predicate::key_conversion].
+    fn with_keys(mut self, keys: Vec<usize>) -> Predicate {
+        self.keys = keys;
+        self
     }
 
     /// One conjunct's verdict: OR over the groups (in written order) of
@@ -2663,7 +2685,7 @@ impl Predicate {
             }
             groups.push(terms);
         }
-        let bound = Predicate::tagged(groups, self.tags.clone());
+        let bound = Predicate::tagged(groups, self.tags.clone()).with_keys(self.keys.clone());
         // the invariant pass, conjunct by conjunct in written order.
         // A conjunct is INVARIANT when every term it contributed to
         // the DNF is row-independent; its verdict is the same
@@ -2702,8 +2724,10 @@ impl Predicate {
             return Ok(Predicate::empty());
         }
         if strip.is_empty() {
+            bound.key_conversion()?;
             return Ok(bound);
         }
+        let keys = bound.keys.clone();
         let mut groups = Vec::new();
         let mut tags = Vec::new();
         for (g, gt) in bound.groups.into_iter().zip(bound.tags) {
@@ -2720,8 +2744,108 @@ impl Predicate {
             groups.push(g);
             tags.push(gt);
         }
-        Ok(Predicate::tagged(groups, tags))
+        let stripped = Predicate::tagged(groups, tags).with_keys(keys);
+        stripped.key_conversion()?;
+        Ok(stripped)
     }
+
+    /// The bounds of an index retrieval are built ONCE, at OPEN, before
+    /// the first record - so a literal that cannot convert to the keyed
+    /// column's type raises there, over an EMPTY table, where the
+    /// per-row [Term::CmpConvErr] never fires. Probed the matrix:
+    /// `K = 'zz'` over an empty INTEGER table answers [] with no index
+    /// and raises with one (ascending, descending, or compound with K
+    /// leading), for `=`, `<`, `<=`, `>`, `>=`, BETWEEN and IN but NOT
+    /// for `<>`, LIKE or STARTING WITH - and a non-empty table raises
+    /// either way, per row. Strictly LATER than the invariant pass,
+    /// whose verdict the engine reaches first: `K = 'zz' AND 1=0`
+    /// answers [] and `K = 'zz' AND 1/0=1` raises the DIVISION, both
+    /// orders round.
+    fn key_conversion(&self) -> Result<(), ExecErr> {
+        if self.keys.is_empty() {
+            return Ok(());
+        }
+        // what the optimizer can match to a segment: a bound on a keyed
+        // column, or IS NULL. `<>` is two ranges and LIKE/STARTING over
+        // a numeric segment is nothing - neither matches (probed:
+        // `K='zz' OR K<>3` and `K='zz' OR K LIKE '1'` answer [] where
+        // `K='zz' OR K IS NULL` raises).
+        let matched = |t: &Term| -> Option<(usize, Option<Cmp>)> {
+            match t {
+                Term::Cmp(fid, cmp, _)
+                | Term::NumCmp(fid, cmp, _)
+                | Term::CmpConvErr(fid, cmp, _)
+                    if self.keys.contains(fid) && !matches!(cmp, Cmp::Ne) =>
+                {
+                    Some((*fid, Some(*cmp)))
+                }
+                Term::IsNull(fid) if self.keys.contains(fid) => Some((*fid, None)),
+                _ => None,
+            }
+        };
+        // EVERY branch of the disjunction must be servable or there is
+        // no inversion at all and nothing converts (probed: `K = 'zz'
+        // OR 1=1`, `K = 'zz' OR K+0 = 1` and `J = 'zz' OR K = 1` with
+        // only J indexed all answer []).
+        if !self.groups.iter().all(|g| g.iter().any(|t| matched(t).is_some())) {
+            return Ok(());
+        }
+        for g in &self.groups {
+            // ONE lower and ONE upper value per segment, LAST writer
+            // wins: a later match overwrites an earlier one and the
+            // overwritten literal is never converted. Observable -
+            // `K = 'zz' AND K = 5` answers [] where `K = 5 AND
+            // K = 'zz'` raises, and `(K='zz' OR K=1) AND K=4`, whose
+            // DNF puts the 4 last in both groups, answers [].
+            let mut live: Vec<(usize, usize)> = Vec::new();
+            for (i, t) in g.iter().enumerate() {
+                let Some((fid, Some(cmp))) = matched(t) else { continue };
+                // IS NULL matches a segment without writing its value:
+                // `K = 'zz' AND K IS NULL` still raises, both orders.
+                let sides: &[usize] = match cmp {
+                    Cmp::Eq => &[0, 1],
+                    Cmp::Gt | Cmp::Ge => &[0],
+                    Cmp::Lt | Cmp::Le => &[1],
+                    Cmp::Ne => continue,
+                };
+                for s in sides {
+                    let slot = fid * 2 + s;
+                    match live.iter_mut().find(|(k, _)| *k == slot) {
+                        Some(e) => e.1 = i,
+                        None => live.push((slot, i)),
+                    }
+                }
+            }
+            // the surviving bounds in WRITTEN order, the order the
+            // engine builds them in (`K BETWEEN 'zz' AND '9'` and
+            // `K = 'yy' AND K = 'zz'` each name the literal they reach)
+            let mut order: Vec<usize> = live.iter().map(|(_, i)| *i).collect();
+            order.sort_unstable();
+            order.dedup();
+            for i in order {
+                if let Term::CmpConvErr(_, _, s) = &g[i] {
+                    return Err(ExecErr::Eval(EvalErr::ConversionError(Some(s.clone()))));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The columns the ENGINE can match to an index segment: the LEADING
+/// segment of every index on the relation. A compound index orders by
+/// its first column, so only that one can be matched (probed: an
+/// equality on the second segment of `(A,B)` converts nothing), and a
+/// DESCENDING index is matched like any other here - it is only
+/// fire-crab's own retrieval that declines those ([pick_for_terms]),
+/// while the engine keys them and raises. An index this cannot read is
+/// simply not keyed: the cost is a missing raise, never a wrong row.
+fn index_key_fids(db: &Database, rel: u16, descs: &[Descriptor]) -> Vec<usize> {
+    resolve_index_ops(db, rel, descs)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|op| op.segs.first().map(|(fid, _, _)| *fid))
+        .collect()
 }
 
 /// Bind an optional filter's parameters, if it has any.
@@ -2754,35 +2878,111 @@ fn term_row_independent(t: &Term) -> bool {
 /// Does this resolved expression read a row slot anywhere - a column
 /// or a generator value? Modeled on [expr_contains_genval].
 fn expr_has_col(e: &Expr) -> bool {
+    expr_reads(e, &|_| true)
+}
+
+/// Does this resolved expression read a row slot the test accepts? A
+/// generator value counts as read whatever the test says - it is a slot
+/// with no field of its own. The whole-expression question is
+/// [expr_has_col]; a WINDOW of fields is how [term_side_only] asks
+/// which side of a join a term belongs to.
+fn expr_reads(e: &Expr, f: &dyn Fn(usize) -> bool) -> bool {
     match e {
-        Expr::Col(_) | Expr::GenVal(_) => true,
+        Expr::Col(fid) => f(*fid),
+        Expr::GenVal(_) => true,
         // the per-row coercion wrappers read whatever they wrap - a
         // wrapped COLUMN must keep its term row-DEPENDENT, or the
         // invariant pass would raise a value-gated 22018 over no row
-        Expr::TextNum(a) | Expr::TextBool(a) => expr_has_col(a),
-        Expr::Neg(a) | Expr::Cast(a, _) => expr_has_col(a),
+        Expr::TextNum(a) | Expr::TextBool(a) => expr_reads(a, f),
+        Expr::Neg(a) | Expr::Cast(a, _) => expr_reads(a, f),
         Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
-            expr_has_col(a) || expr_has_col(b)
+            expr_reads(a, f) || expr_reads(b, f)
         }
-        Expr::Coalesce(args) | Expr::Func(_, args) => args.iter().any(expr_has_col),
-        Expr::Cond(c) => cond_has_col(c),
-        Expr::Iif(c, a, b) => cond_has_col(c) || expr_has_col(a) || expr_has_col(b),
+        Expr::Coalesce(args) | Expr::Func(_, args) => args.iter().any(|a| expr_reads(a, f)),
+        Expr::Cond(c) => cond_reads(c, f),
+        Expr::Iif(c, a, b) => cond_reads(c, f) || expr_reads(a, f) || expr_reads(b, f),
         Expr::Case(branches, else_) => {
-            branches.iter().any(|(c, t)| cond_has_col(c) || expr_has_col(t))
-                || else_.as_deref().is_some_and(expr_has_col)
+            branches.iter().any(|(c, t)| cond_reads(c, f) || expr_reads(t, f))
+                || else_.as_deref().is_some_and(|e| expr_reads(e, f))
         }
-        Expr::Lookup { key, .. } => expr_has_col(key),
+        Expr::Lookup { key, .. } => expr_reads(key, f),
         _ => false,
     }
 }
 
 fn cond_has_col(c: &Cond2) -> bool {
+    cond_reads(c, &|_| true)
+}
+
+fn cond_reads(c: &Cond2, f: &dyn Fn(usize) -> bool) -> bool {
     match c {
-        Cond2::Cmp(a, _, b) => expr_has_col(a) || expr_has_col(b),
-        Cond2::IsNull(a) | Cond2::IsNotNull(a) | Cond2::Like(a, ..) => expr_has_col(a),
-        Cond2::Not(inner) => cond_has_col(inner),
-        Cond2::And(parts) | Cond2::Or(parts) => parts.iter().any(cond_has_col),
+        Cond2::Cmp(a, _, b) => expr_reads(a, f) || expr_reads(b, f),
+        Cond2::IsNull(a) | Cond2::IsNotNull(a) | Cond2::Like(a, ..) => expr_reads(a, f),
+        Cond2::Not(inner) => cond_reads(inner, f),
+        Cond2::And(parts) | Cond2::Or(parts) => parts.iter().any(|p| cond_reads(p, f)),
     }
+}
+
+/// Does this term read ONLY fields inside the window - is it a term of
+/// that one side of a join? A term with no field at all (a constant, a
+/// decided subquery) belongs to every side; a shape whose fields this
+/// cannot enumerate (a bound parameter's slot) belongs to none, which
+/// leaves the ON's own raising ungated - the answer fire-crab already
+/// gives.
+fn term_side_only(t: &Term, win: &std::ops::Range<usize>) -> bool {
+    let outside = |fid: usize| !win.contains(&fid);
+    match t {
+        Term::Const(_) | Term::Never | Term::Unknown => true,
+        Term::Cmp(fid, ..)
+        | Term::NumCmp(fid, ..)
+        | Term::CmpConvErr(fid, ..)
+        | Term::TextNumCmp(fid, ..)
+        | Term::IsNull(fid)
+        | Term::IsNotNull(fid)
+        | Term::Like(fid, ..)
+        | Term::BadLike(fid, ..)
+        | Term::Starting(fid, ..) => win.contains(fid),
+        Term::ExprCond(c) => !cond_reads(c, &outside),
+        Term::ExprLike(e, ..) | Term::ExprStarting(e, ..) | Term::BadExprLike(e, ..) => {
+            !expr_reads(e, &outside)
+        }
+        _ => false,
+    }
+}
+
+/// The part of a join's WHERE that names ONE side: the top-level
+/// conjuncts every term of which reads inside the window. Evaluating
+/// the result evaluates exactly those conjuncts - [Predicate::conjunct]
+/// answers TRUE for a group holding no term of its tag, which is what
+/// dropping the other tags' terms leaves behind - and a filter with no
+/// side-only conjunct at all evaluates TRUE, an open gate.
+fn side_filter(filter: &Option<Predicate>, win: std::ops::Range<usize>) -> Option<Predicate> {
+    let p = filter.as_ref()?;
+    let keep: Vec<u32> = p
+        .conjunct_tags()
+        .into_iter()
+        .filter(|tag| {
+            p.groups
+                .iter()
+                .zip(&p.tags)
+                .flat_map(|(g, gt)| g.iter().zip(gt))
+                .filter(|(_, tt)| *tt == tag)
+                .all(|(t, _)| term_side_only(t, &win))
+        })
+        .collect();
+    let mut groups = Vec::with_capacity(p.groups.len());
+    let mut tags = Vec::with_capacity(p.tags.len());
+    for (g, gt) in p.groups.iter().zip(&p.tags) {
+        let (kg, kt): (Vec<Term>, Vec<u32>) = g
+            .iter()
+            .zip(gt)
+            .filter(|(_, tt)| keep.contains(tt))
+            .map(|(t, tt)| (t.clone(), *tt))
+            .unzip();
+        groups.push(kg);
+        tags.push(kt);
+    }
+    Some(Predicate::tagged(groups, tags))
 }
 
 /// Compare two exact-numeric values: decompose via [numeric_parts] and
@@ -2866,7 +3066,7 @@ impl Term {
             // its argument the original literal (probed: `ID=5 AND
             // N='x'` answers [] over the NULL-N row; `N='x' OR ID=1`
             // raises)
-            Term::CmpConvErr(fid, s) => match values.get(*fid) {
+            Term::CmpConvErr(fid, _, s) => match values.get(*fid) {
                 None | Some(Value::Null) => None,
                 Some(_) => return Err(EvalErr::ConversionError(Some(s.clone()))),
             },
@@ -4272,8 +4472,24 @@ fn text_line_col(hay: &str, part: &str) -> Option<(i64, i64)> {
     }
     let at = p - h;
     let before = hay.get(..at)?;
-    let line = 1 + before.matches('\n').count() as i64;
-    let col = 1 + before.rsplit('\n').next().unwrap_or("").chars().count() as i64;
+    // A LINE ENDS ON CR, ON LF, OR ON CRLF - AND CRLF COUNTS ONCE. The
+    // engine's lexer bumps its line counter on either character and
+    // swallows the LF that follows a CR, so counting only LF puts every
+    // position after a bare CR on the wrong line AND at a column that
+    // measures the whole text before it (probed: `SELECT *<CR>FROM
+    // PNOOUT` is line 2 column 6, and `SELECT *<CR><LF>FROM PNOOUT` is
+    // the SAME line 2 column 6, not line 3).
+    let (mut line, mut col) = (1i64, 1i64);
+    let mut after_cr = false;
+    for c in before.chars() {
+        match c {
+            '\r' => (line, col) = (line + 1, 1),
+            '\n' if after_cr => {}
+            '\n' => (line, col) = (line + 1, 1),
+            _ => col += 1,
+        }
+        after_cr = c == '\r';
+    }
     Some((line, col))
 }
 
@@ -9304,17 +9520,39 @@ fn unqualify_dml(sql: &str, db: &Option<Database>) -> Option<String> {
 /// lookup [wrap_returning] does) rather than upper-casing the
 /// statement's own spelling.
 ///
-/// Every relation fire-crab writes lives in PUBLIC today. Recorded hole,
-/// pre-existing and NOT closed by this slice: [identity_columns] and
-/// `not_null_fids` match `RDB$RELATION_FIELDS` on the relation NAME with
-/// no `RDB$SCHEMA_NAME` filter, so a same-named table in a second schema
-/// would misfire - the qualifier here would still say PUBLIC.
+/// The SCHEMA half is READ, not assumed: `INSERT INTO S1.TZ3 (ID,B)
+/// OVERRIDING SYSTEM VALUE VALUES (1,'s')` names `"S1"."TZ3"` on the
+/// engine. It used to be the literal `PUBLIC`, which only ever looked
+/// right because every relation fire-crab writes had been in PUBLIC.
+/// [relation_schema] is the same catalog read the qualified-name slice
+/// uses, and its None (a relation whose schema cannot be read) refuses
+/// here rather than guessing at a qualifier.
+///
+/// None for a VIEW target, and that is the point: the OVERRIDING /
+/// identity vectors are a TABLE verdict. A view has no identity column
+/// of its own, so the metadata check would confidently answer 335545134
+/// where the engine merges the view and writes the BASE table (probed:
+/// `INSERT INTO VTA (ID,B) OVERRIDING SYSTEM VALUE VALUES (4444,'v9')`
+/// succeeds, and the engine's ALWAYS refusals on a view name the base
+/// table, not the view). fire-crab has no view-INSERT surface at all, so
+/// the honest answer is the generic refusal this None falls through to -
+/// a turned-off wrong verdict beats a confident wrong verdict.
+///
+/// Recorded hole, pre-existing and NOT closed by this slice:
+/// [identity_columns] and `not_null_fids` match `RDB$RELATION_FIELDS` on
+/// the relation NAME with no `RDB$SCHEMA_NAME` filter, so a same-named
+/// table in a second schema still misfires - the qualifier is right now,
+/// the columns it is built from are still schema-blind.
 fn qualified_relation_name(db: &Database, rel: u16) -> Option<String> {
     let canon = fire_crab_ods::list_relations(&db.bytes, db.page_size)
         .into_iter()
         .find(|(id, _)| *id == rel)
         .map(|(_, n)| n)?;
-    Some(format!("\"PUBLIC\".\"{}\"", canon.trim_end()))
+    let canon = canon.trim_end();
+    if view_of(db, canon).is_some() {
+        return None;
+    }
+    Some(format!("\"{}\".\"{}\"", relation_schema(db, canon)?, canon))
 }
 
 /// Split an INSERT head - the text between `INTO` and `VALUES`/`SELECT` -
@@ -10912,13 +11150,29 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                         let folded = if subs.is_empty() {
                             toks
                         } else {
-                            resolve_subqueries(&toks, &subs, db, &columns)?
+                            // the binding a correlated reference inside
+                            // those subqueries must spell: a DML target
+                            // takes no alias in this grammar, so the
+                            // relation name is the key and the 3-part
+                            // form is always available (as
+                            // [unqualify_dml] builds it)
+                            let bind = ColBinding {
+                                key: table,
+                                qual: ws
+                                    .contains('.')
+                                    .then(|| relation_schema(db, table).map(|s| (s, table)))
+                                    .flatten(),
+                            };
+                            resolve_subqueries(&toks, &subs, db, &columns, &bind)?
                         };
                         folded_where = render_toks(&folded);
                         Some(folded)
                     })
                     .and_then(|t| parse_predicate(&t, &mut next_param))
-                    .and_then(|raw| resolve_predicate(raw, &columns, descs, &mut params))?,
+                    .and_then(|raw| resolve_predicate(raw, &columns, descs, &mut params))
+                    // the engine's own keyable columns: an unconvertible
+                    // literal on one of them raises at OPEN
+                    .map(|p| p.with_keys(index_key_fids(db, rel, descs)))?,
             )
         }
     };
@@ -11027,13 +11281,24 @@ fn plan_delete(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                         let folded = if subs.is_empty() {
                             toks
                         } else {
-                            resolve_subqueries(&toks, &subs, db, &columns)?
+                            // the same outer binding plan_update builds
+                            let bind = ColBinding {
+                                key: table,
+                                qual: ws
+                                    .contains('.')
+                                    .then(|| relation_schema(db, table).map(|s| (s, table)))
+                                    .flatten(),
+                            };
+                            resolve_subqueries(&toks, &subs, db, &columns, &bind)?
                         };
                         folded_where = render_toks(&folded);
                         Some(folded)
                     })
                     .and_then(|t| parse_predicate(&t, &mut next_param))
-                    .and_then(|raw| resolve_predicate(raw, &columns, descs, &mut params))?,
+                    .and_then(|raw| resolve_predicate(raw, &columns, descs, &mut params))
+                    // the engine's own keyable columns: an unconvertible
+                    // literal on one of them raises at OPEN
+                    .map(|p| p.with_keys(index_key_fids(db, rel, descs)))?,
             )
         }
     };
@@ -15043,6 +15308,37 @@ struct ColBinding<'a> {
     qual: Option<(String, &'a str)>,
 }
 
+impl ColBinding<'_> {
+    /// Does this binding answer to the qualifier AS WRITTEN? The same
+    /// rule [unqualify_single] applies while stripping, asked as a
+    /// question so a NESTED scope can apply it too: a correlated
+    /// reference inside a subquery must spell the outer relation the way
+    /// the outer FROM bound it, and nothing else resolves.
+    fn answers_to(&self, qual: &str) -> bool {
+        let mut it = qual.rsplitn(2, '.');
+        let last = it.next().unwrap_or(qual);
+        match it.next() {
+            // SCHEMA.RELATION - available only when the FROM item is
+            // unaliased, since an alias is exclusive
+            Some(sch) => self.qual.as_ref().is_some_and(|(s, r)| {
+                part_is((sch.trim_matches('"'), sch.starts_with('"')), s)
+                    && last.trim_matches('"').eq_ignore_ascii_case(r)
+            }),
+            // the 2-part form, with the quoting rule `wrap_returning`
+            // spells out: a quoted qualifier compares exactly, against
+            // the key as written and against its folded form
+            None => {
+                let bare = last.trim_matches('"');
+                if last.starts_with('"') {
+                    bare == self.key || bare == self.key.to_ascii_uppercase()
+                } else {
+                    self.key.eq_ignore_ascii_case(bare)
+                }
+            }
+        }
+    }
+}
+
 /// The identifier (bare or `"quoted"`) starting at `at`, and the index
 /// just past it - the same identifier rule [unqualify_single]'s main
 /// walk uses, so the two cannot disagree about where a name ends.
@@ -16376,7 +16672,7 @@ fn plan_query_inner(
                         up.ends_with("EXISTS").then(|| head.len() - "EXISTS".len())
                     });
                     if let Some(cut) = exists_at {
-                        let Some(rows) = eval_subquery(sub, dbr, None, true) else {
+                        let Some(rows) = eval_subquery(sub, dbr, None, None, true) else {
                             if trace {
                                 eprintln!("[srv] plan: EXISTS subquery {:?} not answerable", sub);
                             }
@@ -16407,7 +16703,7 @@ fn plan_query_inner(
                     // `corr: None` - a CORRELATED subquery cannot resolve
                     // its outer column here and refuses, since its value
                     // differs per row and this fold is once per statement
-                    let Some(rows) = eval_subquery(sub, dbr, None, false) else {
+                    let Some(rows) = eval_subquery(sub, dbr, None, None, false) else {
                         // not a constant - it may be CORRELATED, which
                         // is answered per row from a lookup table rather
                         // than folded into the text
@@ -16980,13 +17276,26 @@ fn plan_query_inner(
                 if subs.is_empty() {
                     Some(toks)
                 } else {
-                    let folded = resolve_subqueries(&toks, &subs, db, &columns)?;
+                    // the OUTER binding a correlated reference inside
+                    // those subqueries must spell (an alias is exclusive
+                    // there too - see [ColBinding::answers_to])
+                    let bind = ColBinding {
+                        key: left.alias.unwrap_or(table),
+                        qual: match (left.alias, ws.contains('.')) {
+                            (None, true) => relation_schema(db, table).map(|s| (s, table)),
+                            _ => None,
+                        },
+                    };
+                    let folded = resolve_subqueries(&toks, &subs, db, &columns, &bind)?;
                     folded_where = render_toks(&folded);
                     Some(folded)
                 }
             })
             .and_then(|t| parse_predicate(&t, &mut next_param))
             .and_then(|raw| resolve_predicate(raw, &columns, &descs, params))
+            // the engine's own keyable columns: an unconvertible literal
+            // on one of them raises at OPEN
+            .map(|p| p.with_keys(index_key_fids(db, rel, &descs)))
         {
             Some(p) => Some(p),
             None => {
@@ -17113,22 +17422,29 @@ fn plan_query_inner(
                     None => eprintln!("[srv] natural scan: rel={}", rel),
                 }
             }
-            if let Some(v) =
-                aggregate(db, rel, &formats, &columns, &descs, *func, target, &filter, &agg_index)
-            {
-                // the engine names a lone aggregate's column by its
-                // function (probed) - CONSTANT here was a standing
-                // difference the aggfn gate's header checks surfaced
-                let fname = match func {
-                    AggFn::Count => "COUNT",
-                    AggFn::Min => "MIN",
-                    AggFn::Max => "MAX",
-                    AggFn::Sum => "SUM",
-                    AggFn::Avg => "AVG",
+            // a filter the engine's own retrieval cannot even OPEN is
+            // no prepare-time constant: `SELECT COUNT(*) FROM T WHERE
+            // <keyed col> = 'zz'` raises rather than answering 0, so it
+            // drops through to the group machinery, which binds at
+            // fetch and raises there ([Predicate::key_conversion])
+            if filter.as_ref().is_none_or(|p| p.key_conversion().is_ok()) {
+                if let Some(v) =
+                    aggregate(db, rel, &formats, &columns, &descs, *func, target, &filter, &agg_index)
+                {
+                    // the engine names a lone aggregate's column by its
+                    // function (probed) - CONSTANT here was a standing
+                    // difference the aggfn gate's header checks surfaced
+                    let fname = match func {
+                        AggFn::Count => "COUNT",
+                        AggFn::Min => "MIN",
+                        AggFn::Max => "MAX",
+                        AggFn::Sum => "SUM",
+                        AggFn::Avg => "AVG",
+                    }
+                    .to_string();
+                    let name = alias.clone().unwrap_or_else(|| fname.clone());
+                    return Some(Plan::Scalar(v, name, Some(fname)));
                 }
-                .to_string();
-                let name = alias.clone().unwrap_or_else(|| fname.clone());
-                return Some(Plan::Scalar(v, name, Some(fname)));
             }
         }
     }
@@ -18765,6 +19081,7 @@ fn join_rows(
             left_width,
             right: Box::new(part.src.clone()),
             part: Box::new(part.clone()),
+            above: filter.clone(),
         };
         left_width += part.width;
     }
@@ -18780,29 +19097,28 @@ fn join_step(
     acc_width: usize,
     rrows: &[Vec<Value>],
     part: &JoinPart,
+    above: &Option<Predicate>,
 ) -> Result<Vec<Vec<Value>>, EvalErr> {
     let mut out = Vec::new();
     let mut right_matched = vec![false; rrows.len()];
+    // The WHERE above the join runs BEFORE the ON on the stream it
+    // names: a top-level conjunct all of whose columns are one side's
+    // rides that side's retrieval, so a row it rejects never reaches
+    // the ON and never raises there. Probed: the statement below that
+    // raises on OU row 2 answers `[{A:1,B:1}]` under `WHERE OU.ID = 1`,
+    // `WHERE OU.ID <> 2`, `WHERE OU.S = '5'` and `WHERE 1=0` alike -
+    // and still RAISES under `WHERE IN2.ID IS NOT NULL` or
+    // `WHERE OU.ID = 1 OR IN2.N = 'a'`, neither of which names one
+    // side. The gate decides only whether the ON may raise; the rows
+    // are filtered above the join as before.
+    let lgate = side_filter(above, 0..acc_width);
+    let rgate = side_filter(above, acc_width..acc_width + part.width);
+    let open = |g: &Option<Predicate>, row: &[Value]| match g {
+        None => Ok(true),
+        Some(p) => p.matches(row),
+    };
     for l in &acc {
         let mut matched = false;
-        // An EMPTY inner stream does not silence the ON condition: the
-        // engine still walks its outer stream and evaluates the ON per
-        // outer row, so a value-gated raiser (`ON A.ID = B.ID AND
-        // A.N = 'x'`) raises 22018 with zero inner rows too - for LEFT,
-        // INNER and FULL alike, whose outer stream is the accumulated
-        // side (probed: all three raise over T A ... EMPTY_T B; a RIGHT
-        // join walks the RIGHT stream instead, so its empty right side
-        // answers [] with no raise - that case is the mirror loop
-        // below). Evaluated on the NULL-padded row: the raiser stays
-        // value-gated (an all-NULL A.N answers, probed) and a FALSE
-        // conjunct still short-circuits it (`AND A.ID = -1 AND
-        // A.N = 'x'` answers all rows padded, probed). The boolean is
-        // discarded - with no partner the row cannot match.
-        if rrows.is_empty() && !matches!(part.kind, JoinKind::Right) {
-            let mut row = l.clone();
-            row.resize(acc_width + part.width, Value::Null);
-            part.on.matches(&row)?;
-        }
         for (ri, r) in rrows.iter().enumerate() {
             let mut row = l.clone();
             row.extend(r.iter().cloned());
@@ -18815,10 +19131,33 @@ fn join_step(
             right_matched[ri] = true;
             out.push(row);
         }
-        if !matched && matches!(part.kind, JoinKind::Left | JoinKind::Full) {
+        // A PARTNERLESS outer row still meets the ON: the engine walks
+        // its outer stream and evaluates the condition per outer row,
+        // so a value-gated raiser (`ON A.ID = B.ID AND A.N = 'x'`)
+        // raises 22018 for a row with no partner - which the pair walk
+        // above never reaches, because the FALSE key comparison
+        // short-circuits it, where on the NULL-padded row that same
+        // comparison is UNKNOWN and the walk goes on. Probed for LEFT,
+        // INNER and FULL, whose outer stream is the accumulated side,
+        // with an EMPTY inner stream and with a non-empty one that
+        // simply has no partner; a RIGHT join walks the RIGHT stream
+        // instead, so an empty right side never opens the accumulated
+        // one and answers [] with no raise - but a right side WITH rows
+        // does open it, and an unpartnered accumulated row raises there
+        // too (all probed). Evaluated on the NULL-padded row, the
+        // raiser stays value-gated (an all-NULL A.N answers) and a
+        // FALSE conjunct still short-circuits it (`AND A.ID = -1 AND
+        // A.N = 'x'` answers all rows padded). The boolean is
+        // discarded - with no partner the row cannot match.
+        if !matched && !(rrows.is_empty() && matches!(part.kind, JoinKind::Right)) {
             let mut row = l.clone();
             row.resize(acc_width + part.width, Value::Null);
-            out.push(row);
+            if open(&lgate, &row)? {
+                part.on.matches(&row)?;
+            }
+            if matches!(part.kind, JoinKind::Left | JoinKind::Full) {
+                out.push(row);
+            }
         }
     }
     if matches!(part.kind, JoinKind::Right | JoinKind::Full) {
@@ -18828,13 +19167,14 @@ fn join_step(
             }
             let mut row = vec![Value::Null; acc_width];
             row.extend(r.iter().cloned());
-            // the mirror of the empty-inner rule above: a RIGHT (or the
+            // the mirror of the rule above: a RIGHT (or the
             // right-preserved pass of a FULL) join walks the RIGHT
-            // stream, so with an EMPTY accumulated side the ON still
-            // evaluates once per right row (probed: EMPTY_T A RIGHT
-            // JOIN T B ON A.ID = B.ID AND B.N = 'x' raises; with the
-            // raiser on the all-NULL A side it answers every B row)
-            if acc.is_empty() {
+            // stream, so every partnerless right row meets the ON there
+            // (probed: EMPTY_T A RIGHT JOIN T B ON A.ID = B.ID AND
+            // B.N = 'x' raises, and so does a FULL join over a right
+            // row that simply found no partner; with the raiser on the
+            // all-NULL A side it answers every B row)
+            if open(&rgate, &row)? {
                 part.on.matches(&row)?;
             }
             out.push(row);
@@ -20981,6 +21321,67 @@ fn bare_ident_ok(s: &str) -> bool {
 
 fn is_ident_byte(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
+}
+
+/// Does the statement carry a SPACE-LIKE CHARACTER THE ENGINE'S LEXER
+/// DOES NOT KNOW? Its whitespace class is exactly five characters -
+/// SPACE, TAB, LF, FF (0x0C) and CR - and every other character Rust
+/// calls whitespace is a `-104 Token unknown` there, at the column of
+/// the character itself (probed against the live engine: VERTICAL TAB
+/// 0x0B, NBSP U+00A0, LINE/PARAGRAPH SEPARATOR U+2028/U+2029 and EM
+/// SPACE U+2003 are all refused; FF is accepted by both sides and must
+/// stay).
+///
+/// This server does not lex: it finds clause keywords on IDENTIFIER
+/// boundaries ([find_word]) and trims items with `str::trim`, whose
+/// class is the UNICODE one. So such a character silently separated two
+/// tokens and the statement ANSWERED - `SELECT ID<VT>FROM T` returned
+/// the rows and `INSERT INTO T<VT>(ID) VALUES (6)` COMMITTED - where
+/// the engine refuses. Checking the text once, where it arrives, puts
+/// those statements back in the same class as every other Token unknown
+/// this server meets (a fourth dotted name part, a `#`): refused with
+/// the generic Dynamic SQL Error rather than answered wrong.
+///
+/// Only what the LEXER sees counts. A string literal, a delimited
+/// identifier and either comment form may hold any character at all
+/// (probed: `SELECT 'a<VT>b' FROM T` answers on both sides), so those
+/// spans are skipped.
+fn has_unknown_space(sql: &str) -> bool {
+    let b: Vec<char> = sql.chars().collect();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            q @ ('\'' | '"') => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == q {
+                        if b.get(i + 1) == Some(&q) {
+                            i += 2; // a doubled quote escapes itself
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            '-' if b.get(i + 1) == Some(&'-') => {
+                while i < b.len() && b[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if b.get(i + 1) == Some(&'*') => {
+                i += 2;
+                while i < b.len() && !(b[i] == '*' && b.get(i + 1) == Some(&'/')) {
+                    i += 1;
+                }
+                i += 2;
+            }
+            c if c.is_whitespace() && !c.is_ascii_whitespace() => return true,
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 /// Find `word` (already uppercase) occurring as a whole word (identifier
@@ -26159,6 +26560,24 @@ fn plan_correlated_select(
     if descs.is_empty() {
         return Some(Plan::Refused);
     }
+    // the same ALIAS-IS-EXCLUSIVE binding the general single-relation
+    // path builds, with the 3-part prefix available only when the outer
+    // FROM item carries no alias of its own (see [ColBinding]). It is
+    // built BEFORE the lookups because each correlated sub is checked
+    // against it: the outer relation is in scope inside the subquery
+    // only under the name the outer FROM bound it to.
+    let bind = ColBinding {
+        key: from.alias.unwrap_or(table),
+        qual: match from.alias {
+            None if table_s.contains('.')
+                || where_s.is_some_and(|w| w.contains('.'))
+                || correlated.iter().any(|(_, sub)| sub.contains('.')) =>
+            {
+                relation_schema(db, table).map(|s| (s, table))
+            }
+            _ => None,
+        },
+    };
     // one lookup table per correlated item, each scanned once here
     #[allow(clippy::type_complexity)]
     let mut lookups: Vec<(
@@ -26169,7 +26588,8 @@ fn plan_correlated_select(
         (Option<String>, Option<String>),
     )> = Vec::new();
     for (marker, sub) in correlated {
-        let Some((lookup, result_desc)) = build_correlated_lookup(sub, db, &columns, &descs)
+        let Some((lookup, result_desc)) =
+            build_correlated_lookup(sub, db, &columns, &bind, &descs)
         else {
             if trace {
                 eprintln!("[srv] plan: correlated subquery {:?} not answerable", sub);
@@ -26193,18 +26613,6 @@ fn plan_correlated_select(
     // INSIDE the subquery - where `D.ID` becoming a bare `ID` would
     // resolve against the INNER table instead, silently changing which
     // column the correlation names.
-    // the same ALIAS-IS-EXCLUSIVE binding the general single-relation
-    // path builds, with the 3-part prefix available only when the outer
-    // FROM item carries no alias of its own (see [ColBinding])
-    let bind = ColBinding {
-        key: from.alias.unwrap_or(table),
-        qual: match from.alias {
-            None if table_s.contains('.') || where_s.is_some_and(|w| w.contains('.')) => {
-                relation_schema(db, table).map(|s| (s, table))
-            }
-            _ => None,
-        },
-    };
     let unq = |t: &str| unqualify_single(t, &bind).unwrap_or_else(|| t.to_string());
 
     // the outer WHERE, resolved the ordinary way; its unqualified text
@@ -26420,6 +26828,7 @@ fn build_correlated_lookup(
     sub: &str,
     db: &Database,
     outer_cols: &[RelationColumn],
+    outer_bind: &ColBinding<'_>,
     outer_descs: &[Descriptor],
 ) -> Option<(Expr, Descriptor)> {
     let (proj_s, table_s, where_s, group_s, having_s, order_s) = split_query(sub)?;
@@ -26431,6 +26840,14 @@ fn build_correlated_lookup(
         return None;
     }
     let table = from.table;
+    // the same two-way catalog check [eval_subquery] makes: a
+    // correlated subquery's FROM is a nested FROM like any other
+    if !relation_qualifier_ok(db, from.schema, table) {
+        return None;
+    }
+    if view_of(db, table).is_some() {
+        return None; // the same empty-storage guard [eval_subquery] makes
+    }
     let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
     let columns = relation_columns(&db.bytes, db.page_size, table);
     let formats = select_formats(db, table, rel);
@@ -26448,7 +26865,7 @@ fn build_correlated_lookup(
     }
     let toks = tokenize(ws)?;
     let (corr_fid, outer_name, residual) =
-        split_correlation(&toks, table, from.alias, &columns, outer_cols)?;
+        split_correlation(&toks, table, from.alias, &columns, outer_cols, Some(outer_bind))?;
 
     // The residual WHERE names the INNER table, often by its alias
     // (`AND E.SALARY > 150`). The correlation split needed those
@@ -26725,12 +27142,20 @@ fn strip_inner_all(text: &str, names: &[&str]) -> String {
 /// a correlated EXISTS over tables sharing a column name came to refuse.
 /// An UNQUALIFIED name present in both tables stays ambiguous, and more
 /// than one correlation pair refuses rather than picking one.
+///
+/// `outer_bind` is the OUTER query's [ColBinding], and it is what makes
+/// an alias exclusive INSIDE the subquery too: after `FROM T AS Q` the
+/// base name T is not a binding anywhere in the statement, so
+/// `EXISTS (SELECT 1 FROM U WHERE U.C = T.C)` is a -206 and not a
+/// correlation. Without it this pass read every unrecognised qualifier
+/// as "the outer one" and ANSWERED where the engine raises.
 fn split_correlation(
     toks: &[Tok],
     table: &str,
     alias: Option<&str>,
     columns: &[RelationColumn],
     outer_cols: &[RelationColumn],
+    outer_bind: Option<&ColBinding<'_>>,
 ) -> Option<(usize, String, Option<Vec<Tok>>)> {
     let parts = split_top_and(toks);
     let mut kept: Vec<Vec<Tok>> = Vec::new();
@@ -26757,6 +27182,24 @@ fn split_correlation(
                     None => false,
                 }
             };
+            // A QUALIFIER THAT NAMES NEITHER SCOPE RESOLVES NOWHERE.
+            // The pair rule below decides the inner side from `_in`
+            // alone, so a bogus outer half would ride along unchecked -
+            // which is exactly how `FROM T AS Q ... (SELECT 1 FROM U
+            // WHERE U.C = T.C)` came to answer. Refuse the whole
+            // correlation instead; the caller then refuses the
+            // statement, which is the -206 the engine raises.
+            let qual_known = |q: &str| -> bool {
+                match qual_of(q) {
+                    None => true,
+                    Some(t) => {
+                        in_tbl(q) || outer_bind.map_or(true, |b| b.answers_to(&t))
+                    }
+                }
+            };
+            if !qual_known(a) || !qual_known(b) {
+                return None;
+            }
             let a_in = in_tbl(a)
                 || (qual_of(a).is_none()
                     && columns.iter().any(|c| c.name.eq_ignore_ascii_case(&an)));
@@ -26817,6 +27260,7 @@ fn eval_subquery(
     sql: &str,
     db: &Database,
     corr: Option<&[RelationColumn]>,
+    outer_bind: Option<&ColBinding<'_>>,
     existence_only: bool,
 ) -> Option<SubqRows> {
     let (proj_s, table_s, where_s, group_s, having_s, order_s) = split_query(sql)?;
@@ -26828,6 +27272,25 @@ fn eval_subquery(
         return None; // a subquery over a join
     }
     let table = from.table;
+    // THE SCHEMA HALF, HERE TOO. A nested query expression is its own
+    // FROM and gets the same two-way catalog check the top-level one
+    // gets: `IN (SELECT C FROM SYSTEM.U)` is a -204 even though U
+    // exists, and a wrongly qualified VIEW must refuse here rather than
+    // reach the scan - a view has an id and no records of its own, so it
+    // would answer ZERO ROWS, a wrong answer wearing an empty result's
+    // clothes.
+    if !relation_qualifier_ok(db, from.schema, table) {
+        return None;
+    }
+    // A VIEW HAS NO RECORDS OF ITS OWN, so scanning its storage answers
+    // ZERO ROWS - and a nested query expression never expanded one, it
+    // just scanned. `IN (SELECT C FROM V2)` therefore answered no rows
+    // where the engine answers every row, and `NOT IN` the reverse.
+    // The lone-view guard the top-level FROM already carries, applied
+    // where the nested FROM resolves.
+    if view_of(db, table).is_some() {
+        return None;
+    }
     let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
     let columns = relation_columns(&db.bytes, db.page_size, table);
     let formats = select_formats(db, table, rel);
@@ -26855,7 +27318,7 @@ fn eval_subquery(
     if let Some(outer_cols) = corr {
         let toks = where_toks.take()?; // correlated EXISTS needs a WHERE
         let (fid, _outer_name, residual) =
-            split_correlation(&toks, table, from.alias, &columns, outer_cols)?;
+            split_correlation(&toks, table, from.alias, &columns, outer_cols, outer_bind)?;
         corr_inner_fid = Some(fid);
         where_toks = residual;
     }
@@ -26870,10 +27333,22 @@ fn eval_subquery(
         Some(a) => vec![table, a],
         None => vec![table],
     };
+    // The 3-PART spelling of the inner table, legal only while the FROM
+    // item is UNALIASED (an alias is exclusive): the engine answers
+    // `EXISTS (SELECT 1 FROM PUBLIC.U WHERE PUBLIC.U.C = 1)`. Built from
+    // the RESOLVED schema, as [ColBinding.qual] is, and asked for only
+    // when the text could carry a dotted name at all.
+    let inner_qual: Option<String> = match (from.alias, sql.contains('.')) {
+        (None, true) => relation_schema(db, table).map(|s| format!("{}.{}", s, table)),
+        _ => None,
+    };
     let strip_inner = |t: &str| -> String {
         let bare = t.rsplit('.').next().unwrap_or(t);
         match t.rsplitn(2, '.').nth(1) {
-            Some(q) if inner_names.iter().any(|n| n.eq_ignore_ascii_case(q)) => {
+            Some(q)
+                if inner_names.iter().any(|n| n.eq_ignore_ascii_case(q))
+                    || inner_qual.as_deref().is_some_and(|i| i.eq_ignore_ascii_case(q)) =>
+            {
                 bare.to_string()
             }
             _ => t.to_string(),
@@ -27078,6 +27553,7 @@ fn resolve_subqueries(
     subs: &[String],
     db: &Database,
     outer_cols: &[RelationColumn],
+    outer_bind: &ColBinding<'_>,
 ) -> Option<Vec<Tok>> {
     // a set of values becomes the body of an IN list
     let list_tokens = |vals: &[Value]| -> Option<Vec<Tok>> {
@@ -27116,11 +27592,11 @@ fn resolve_subqueries(
                     out.pop();
                 }
                 // try the correlated (semi-join) reading first
-                match eval_subquery(sql, db, Some(outer_cols), true) {
+                match eval_subquery(sql, db, Some(outer_cols), Some(outer_bind), true) {
                     Some(rows) => {
                         // the outer column the correlation named: recover
                         // it from the inner WHERE the same way
-                        let outer = correlated_outer_col(sql, db, outer_cols)?;
+                        let outer = correlated_outer_col(sql, db, outer_cols, outer_bind)?;
                         // NULLs must NOT reach the IN list here. A semi-
                         // join asks "is there an inner row with inner.c =
                         // outer.c", and `NULL = anything` is UNKNOWN, so
@@ -27168,7 +27644,7 @@ fn resolve_subqueries(
                     }
                     // uncorrelated: the verdict is the same for every row
                     None => {
-                        let rows = eval_subquery(sql, db, None, true)?;
+                        let rows = eval_subquery(sql, db, None, Some(outer_bind), true)?;
                         out.push(Tok::Const(rows.any != negated));
                     }
                 }
@@ -27181,7 +27657,7 @@ fn resolve_subqueries(
                     i += 1;
                     continue;
                 };
-                let rows = eval_subquery(subs.get(*n)?, db, None, false)?;
+                let rows = eval_subquery(subs.get(*n)?, db, None, Some(outer_bind), false)?;
                 if rows.values.is_empty() {
                     // `x IN (nothing)` is FALSE, `x NOT IN (nothing)`
                     // TRUE - and the column reference must go too
@@ -27209,7 +27685,7 @@ fn resolve_subqueries(
                     i += 1;
                     continue;
                 };
-                let rows = eval_subquery(subs.get(*n)?, db, None, false)?;
+                let rows = eval_subquery(subs.get(*n)?, db, None, Some(outer_bind), false)?;
                 // more than one row is a runtime error in the engine;
                 // refuse rather than pick one
                 if rows.values.len() != 1 {
@@ -27236,6 +27712,7 @@ fn correlated_outer_col(
     sql: &str,
     db: &Database,
     outer_cols: &[RelationColumn],
+    outer_bind: &ColBinding<'_>,
 ) -> Option<String> {
     // ONE implementation of "which side is which". This used to carry
     // its own copy of the rule and compared a qualifier against the
@@ -27249,7 +27726,7 @@ fn correlated_outer_col(
     let columns = relation_columns(&db.bytes, db.page_size, from.table);
     let toks = tokenize(where_s?)?;
     let (_, outer, _) =
-        split_correlation(&toks, from.table, from.alias, &columns, outer_cols)?;
+        split_correlation(&toks, from.table, from.alias, &columns, outer_cols, Some(outer_bind))?;
     Some(outer)
 }
 
@@ -30319,7 +30796,7 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
             ColKind::Int => match literal_num_rhs(&v, true) {
                 LitNum::Rhs(Rhs::Int(n)) => Term::Cmp(idx, op, Rhs::Int(n)),
                 LitNum::Rhs(rhs) => Term::NumCmp(idx, op, rhs),
-                LitNum::Raise(s) => Term::CmpConvErr(idx, s),
+                LitNum::Raise(s) => Term::CmpConvErr(idx, op, s),
                 LitNum::Refuse => return None,
             },
             _ => return None,
@@ -31051,7 +31528,7 @@ fn numeric_term(
         // `NSM > '1.999999'` keeps the fraction with no range check)
         RawKind::Cmp(op, Rhs::Str(v)) => match literal_num_rhs(&v, false) {
             LitNum::Rhs(rhs) => Term::NumCmp(idx, op, rhs),
-            LitNum::Raise(s) => Term::CmpConvErr(idx, s),
+            LitNum::Raise(s) => Term::CmpConvErr(idx, op, s),
             LitNum::Refuse => return None,
         },
         // Dbl exists only at bind - the parser never writes it
@@ -31333,7 +31810,7 @@ fn resolve_having(
                             RawKind::Cmp(op, Rhs::Str(s)) => {
                                 match literal_num_rhs(&s, false) {
                                     LitNum::Rhs(rhs) => Term::NumCmp(idx, op, rhs),
-                                    LitNum::Raise(orig) => Term::CmpConvErr(idx, orig),
+                                    LitNum::Raise(orig) => Term::CmpConvErr(idx, op, orig),
                                     LitNum::Refuse => return None,
                                 }
                             }
@@ -31742,6 +32219,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     read_int(&mut s, &mut dec)?; // p_sqlst_flags
                 }
                 let text = String::from_utf8_lossy(&sql).into_owned();
+                // the lexer refuses before anything is planned or written
+                // (see [has_unknown_space])
+                if has_unknown_space(&text) {
+                    respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                    continue;
+                }
                 let up = text.trim_start().to_ascii_uppercase();
                 let ddl_kw = ["CREATE", "ALTER", "DROP", "RECREATE", "COMMENT", "GRANT", "REVOKE"]
                     .into_iter()
@@ -31860,6 +32343,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     read_int(&mut s, &mut dec)?; // p_sqlst_flags
                 }
                 let text = String::from_utf8_lossy(&sql).into_owned();
+                // the lexer refuses before anything is planned or written
+                // (see [has_unknown_space])
+                if has_unknown_space(&text) {
+                    respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                    continue;
+                }
                 let (p, _ps) = plan_query(&text, &database);
                 // op_sql_response carries the single output message (a
                 // scalar row: 4-byte null bitmap then the BIGINT), then a
@@ -31914,6 +32403,14 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 }
                 last_dml = (0, 0, 0);
                 bound_args.clear();
+                // the lexer refuses before anything is planned or written
+                // (see [has_unknown_space])
+                if has_unknown_space(&stmt_sql) {
+                    plan = Plan::Refused;
+                    stmt_params = Vec::new();
+                    respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                    continue;
+                }
                 let up = stmt_sql.trim_start().to_ascii_uppercase();
                 let ddl_kw = ["CREATE", "ALTER", "DROP", "RECREATE", "COMMENT", "GRANT", "REVOKE"]
                     .into_iter()
@@ -34509,6 +35006,7 @@ mod tests {
             left_width: 2,
             right: Box::new(r.clone()),
             part: part(kind, on),
+            above: None,
         }
         .rows(&db)
         .unwrap();
@@ -35372,7 +35870,7 @@ mod tests {
     // original literal.
     #[test]
     fn cmp_conv_err_is_value_gated() {
-        let t = Term::CmpConvErr(0, " x ".into());
+        let t = Term::CmpConvErr(0, Cmp::Eq, " x ".into());
         assert_eq!(t.matches(&[Value::Null]).unwrap(), None);
         assert_eq!(t.matches(&[]).unwrap(), None);
         assert_eq!(
@@ -36951,19 +37449,19 @@ mod tests {
         ];
         let rrows = vec![vec![Value::Int(10)]];
         // INNER drops the unmatched accumulated row
-        let out = join_step(acc.clone(), 2, &rrows, &part(JoinKind::Inner)).unwrap();
+        let out = join_step(acc.clone(), 2, &rrows, &part(JoinKind::Inner), &None).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0], vec![Value::Int(1), Value::Int(10), Value::Int(10)]);
         // LEFT keeps it, padded to the FULL accumulated width plus the
         // new side's - the padding is what a chain gets wrong when it
         // remembers only the previous step's width
-        let out = join_step(acc.clone(), 2, &rrows, &part(JoinKind::Left)).unwrap();
+        let out = join_step(acc.clone(), 2, &rrows, &part(JoinKind::Left), &None).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[1], vec![Value::Int(2), Value::Int(99), Value::Null]);
         // RIGHT emits the unmatched NEW row with the accumulated side
         // NULLed, again at the full width
         let rrows2 = vec![vec![Value::Int(10)], vec![Value::Int(77)]];
-        let out = join_step(acc, 2, &rrows2, &part(JoinKind::Right)).unwrap();
+        let out = join_step(acc, 2, &rrows2, &part(JoinKind::Right), &None).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[1], vec![Value::Null, Value::Null, Value::Int(77)]);
     }
@@ -36989,7 +37487,7 @@ mod tests {
                     Cmp::Eq,
                     Box::new(Expr::Col(2)),
                 ))),
-                Term::CmpConvErr(0, "x".into()),
+                Term::CmpConvErr(0, Cmp::Eq, "x".into()),
             ]]),
         };
         let acc = vec![vec![Value::Int(1), Value::Int(10)]];
@@ -36997,19 +37495,19 @@ mod tests {
         // LEFT, INNER and FULL walk the accumulated side: the raiser fires
         for kind in [JoinKind::Left, JoinKind::Inner, JoinKind::Full] {
             assert!(
-                join_step(acc.clone(), 2, &none, &raiser_part(kind)).is_err(),
+                join_step(acc.clone(), 2, &none, &raiser_part(kind), &None).is_err(),
                 "{:?} over an empty inner stream must raise",
                 kind
             );
         }
         // RIGHT walks the (empty) right stream: no row, no evaluation
-        assert_eq!(join_step(acc.clone(), 2, &none, &raiser_part(JoinKind::Right)).unwrap(), Vec::<Vec<Value>>::new());
+        assert_eq!(join_step(acc.clone(), 2, &none, &raiser_part(JoinKind::Right), &None).unwrap(), Vec::<Vec<Value>>::new());
         // zero OUTER rows: nothing evaluates, [] not an error
-        assert_eq!(join_step(Vec::new(), 2, &none, &raiser_part(JoinKind::Left)).unwrap(), Vec::<Vec<Value>>::new());
+        assert_eq!(join_step(Vec::new(), 2, &none, &raiser_part(JoinKind::Left), &None).unwrap(), Vec::<Vec<Value>>::new());
         // the raiser stays VALUE-GATED on the padded row: an all-NULL
         // gating column answers the padded row instead of raising
         let null_acc = vec![vec![Value::Null, Value::Int(10)]];
-        let out = join_step(null_acc, 2, &none, &raiser_part(JoinKind::Left)).unwrap();
+        let out = join_step(null_acc, 2, &none, &raiser_part(JoinKind::Left), &None).unwrap();
         assert_eq!(out, vec![vec![Value::Null, Value::Int(10), Value::Null]]);
         // ... and a FALSE conjunct short-circuits it (probed: `ON A.ID =
         // B.ID AND A.ID = -1 AND A.N = 'x'` answers every row padded)
@@ -37023,10 +37521,10 @@ mod tests {
                     Cmp::Eq,
                     Box::new(Expr::Int(-1)),
                 ))),
-                Term::CmpConvErr(0, "x".into()),
+                Term::CmpConvErr(0, Cmp::Eq, "x".into()),
             ]]),
         };
-        let out = join_step(acc, 2, &none, &sc_part).unwrap();
+        let out = join_step(acc, 2, &none, &sc_part, &None).unwrap();
         assert_eq!(out, vec![vec![Value::Int(1), Value::Int(10), Value::Null]]);
         // RIGHT with an EMPTY accumulated side: the right stream is the
         // outer one, so a raiser gated on ITS column fires
@@ -37034,10 +37532,57 @@ mod tests {
             kind: JoinKind::Right,
             src: RowSource::Rows(Vec::new()),
             width: 1,
-            on: Predicate::dnf(vec![vec![Term::CmpConvErr(2, "x".into())]]),
+            on: Predicate::dnf(vec![vec![Term::CmpConvErr(2, Cmp::Eq, "x".into())]]),
         };
         let rrows = vec![vec![Value::Int(7)]];
-        assert!(join_step(Vec::new(), 2, &rrows, &rt_raiser).is_err());
+        assert!(join_step(Vec::new(), 2, &rrows, &rt_raiser, &None).is_err());
+    }
+
+    // A PARTNERLESS row meets the ON the same way, whether the inner
+    // stream is empty or simply holds nothing that matches - the pair
+    // walk's FALSE key comparison short-circuits the raiser where the
+    // NULL-padded row's UNKNOWN one does not. The WHERE above the join
+    // gates it when (and only when) the conjunct names that one side:
+    // the engine pushes it onto that side's stream, ahead of the ON.
+    #[test]
+    fn join_step_evaluates_the_on_for_a_partnerless_row() {
+        // ON acc[1] = new[2] AND <raiser gated on acc[0]>
+        let raiser_part = |kind| JoinPart {
+            kind,
+            src: RowSource::Rows(Vec::new()),
+            width: 1,
+            on: Predicate::dnf(vec![vec![
+                Term::ExprCond(Box::new(Cond2::Cmp(
+                    Box::new(Expr::Col(1)),
+                    Cmp::Eq,
+                    Box::new(Expr::Col(2)),
+                ))),
+                Term::CmpConvErr(0, Cmp::Eq, "x".into()),
+            ]]),
+        };
+        let acc = vec![vec![Value::Int(1), Value::Int(10)]];
+        // the inner stream HAS a row, and it is not this one's partner
+        let rrows = vec![vec![Value::Int(77)]];
+        for kind in [JoinKind::Left, JoinKind::Inner, JoinKind::Full, JoinKind::Right] {
+            assert!(
+                join_step(acc.clone(), 2, &rrows, &raiser_part(kind), &None).is_err(),
+                "{:?} must raise for the partnerless row",
+                kind
+            );
+        }
+        // a WHERE naming ONLY the accumulated side runs first: FALSE
+        // there and the ON is never reached
+        let closed = Predicate::dnf(vec![vec![Term::Cmp(0, Cmp::Eq, Rhs::Int(99))]]);
+        let out = join_step(acc.clone(), 2, &rrows, &raiser_part(JoinKind::Left), &Some(closed))
+            .unwrap();
+        assert_eq!(out, vec![vec![Value::Int(1), Value::Int(10), Value::Null]]);
+        // ... TRUE there and it is
+        let open = Predicate::dnf(vec![vec![Term::Cmp(0, Cmp::Eq, Rhs::Int(1))]]);
+        assert!(join_step(acc.clone(), 2, &rrows, &raiser_part(JoinKind::Left), &Some(open))
+            .is_err());
+        // ... and a conjunct naming the OTHER side gates nothing
+        let other = Predicate::dnf(vec![vec![Term::IsNotNull(2)]]);
+        assert!(join_step(acc, 2, &rrows, &raiser_part(JoinKind::Left), &Some(other)).is_err());
     }
 
     #[test]
@@ -37231,6 +37776,59 @@ mod tests {
         // raises on every row
         let b = resolve("ID = NULL AND ID / 0 = 1").unwrap().bind(&[]).unwrap();
         assert!(matches!(b.matches(&[Value::Int(1)]), Err(EvalErr::DivideByZero)));
+    }
+
+    #[test]
+    fn the_index_key_converts_at_open_after_the_invariant_pass() {
+        // probed: the bounds of an index retrieval are built before the
+        // first record, so an unconvertible literal on a KEYED column
+        // raises over ZERO rows - where the same statement over an
+        // unkeyed one answers []
+        let columns = vec![RelationColumn { name: "N".into(), field_id: 0, position: 0 }];
+        let descs = vec![Descriptor {
+            dtype: dtype::LONG, scale: 0, length: 4, sub_type: 0, flags: 0, offset: 4,
+        }];
+        let keyed = |s: &str| -> Result<Predicate, ExecErr> {
+            let toks = tokenize(s).unwrap();
+            let raw = parse_predicate(&toks, &mut 0).unwrap();
+            resolve_predicate(raw, &columns, &descs, &mut Vec::new())
+                .unwrap()
+                .with_keys(vec![0])
+                .bind(&[])
+        };
+        let unkeyed = |s: &str| -> Result<Predicate, ExecErr> {
+            let toks = tokenize(s).unwrap();
+            let raw = parse_predicate(&toks, &mut 0).unwrap();
+            resolve_predicate(raw, &columns, &descs, &mut Vec::new()).unwrap().bind(&[])
+        };
+        let conv = |r: Result<Predicate, ExecErr>| {
+            matches!(r, Err(ExecErr::Eval(EvalErr::ConversionError(Some(s)))) if s == "x")
+        };
+        // every bound keys; `<>`, LIKE and STARTING WITH do not
+        for s in ["N = 'x'", "N > 'x'", "N <= 'x'", "N BETWEEN 'x' AND '9'", "N IN ('x')"] {
+            assert!(conv(keyed(s)), "{} must convert at open", s);
+            assert!(unkeyed(s).is_ok(), "{} without a key must not", s);
+        }
+        for s in ["N <> 'x'", "N LIKE 'x'", "N STARTING WITH 'x'"] {
+            assert!(keyed(s).is_ok(), "{} keys nothing", s);
+        }
+        // the invariant pass decides FIRST, whichever order it is written
+        assert!(keyed("N = 'x' AND 1 = 0").is_ok());
+        assert!(keyed("N = 'x' AND 1 = NULL").is_ok());
+        assert!(matches!(
+            keyed("N = 'x' AND 1 / 0 = 1"),
+            Err(ExecErr::Eval(EvalErr::DivideByZero))
+        ));
+        // every branch of a disjunction must be servable, and one
+        // segment holds ONE value per side - the last match written wins
+        assert!(conv(keyed("N = 'x' OR N = 1")));
+        assert!(keyed("N = 'x' OR 1 = 1").is_ok());
+        assert!(keyed("N = 'x' AND N = 5").is_ok());
+        assert!(conv(keyed("N = 5 AND N = 'x'")));
+        assert!(conv(keyed("N = 'x' AND N > 3")));
+        // IS NULL matches a segment without writing its value
+        assert!(conv(keyed("N = 'x' OR N IS NULL")));
+        assert!(conv(keyed("N = 'x' AND N IS NULL")));
     }
 
     #[test]
@@ -40909,6 +41507,53 @@ mod tests {
         // trustworthy position, which is the signal to refuse generically
         let rewritten = String::from("PNOOUT");
         assert_eq!(text_line_col(sql, &rewritten), None);
+    }
+
+    // A BARE CR ends a line too, and CRLF ends exactly one (probed
+    // against the engine, which reports the same 2,6 for both forms).
+    #[test]
+    fn text_line_col_counts_cr_lf_and_crlf_each_once() {
+        for (sql, want) in [
+            ("SELECT *\rFROM PNOOUT", (2, 6)),
+            ("SELECT *\r\nFROM PNOOUT", (2, 6)),
+            ("\rSELECT * FROM PNOOUT", (2, 15)),
+            ("SELECT *\rFROM\rPNOOUT", (3, 1)),
+            ("SELECT *\rFROM\n  PNOOUT", (3, 3)),
+        ] {
+            let (_, t, ..) = split_query(sql).unwrap();
+            assert_eq!(text_line_col(sql, t), Some(want), "{:?}", sql);
+        }
+    }
+
+    // The engine's lexer whitespace class is those five characters and
+    // no others, and only OUTSIDE a literal, a delimited identifier or
+    // a comment.
+    #[test]
+    fn unknown_space_is_every_space_the_engine_lexer_refuses() {
+        for ok in [
+            "SELECT ID FROM T",
+            "SELECT ID\tFROM T",
+            "SELECT ID\nFROM T",
+            "SELECT ID\rFROM T",
+            "SELECT ID\x0cFROM T",   // FORM FEED: accepted by both sides
+            "SELECT 'a\x0bb' FROM T", // inside a literal
+            "SELECT \"a\u{a0}b\" FROM T", // inside a delimited identifier
+            "SELECT ID FROM T -- x\x0by",
+            "SELECT ID /*\u{2028}*/ FROM T",
+            "SELECT 'it''s\x0b' FROM T", // the doubled quote does not end it
+        ] {
+            assert!(!has_unknown_space(ok), "{:?}", ok);
+        }
+        for bad in [
+            "SELECT ID\x0bFROM T",
+            "SELECT ID\u{a0}FROM T",
+            "SELECT ID\u{2003}FROM T",
+            "SELECT ID\u{2028}FROM T",
+            "SELECT ID\u{2029}FROM T",
+            "INSERT INTO T\x0b(ID) VALUES (6)",
+        ] {
+            assert!(has_unknown_space(bad), "{:?}", bad);
+        }
     }
 
     // The not-selectable vector, byte for byte: TWO gds codes and

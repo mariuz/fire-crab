@@ -20,7 +20,8 @@
 #      with a LOWERCASE 'procedure' against LAW 1's capital P. Driven
 #      purely by RDB$PROCEDURE_OUTPUTS, never by the body, and the
 #      line/column point at the FIRST CHARACTER OF THE FROM ITEM as
-#      written (qualifier and opening quote included).
+#      written (qualifier and opening quote included). A LINE ENDS ON
+#      CR, ON LF, OR ON CRLF - and CRLF counts ONCE.
 #   3. WRONG ARITY: [isc_dsql_error, isc_prcmismat(name)], SQLCODE
 #      -902 - and it BEATS the not-selectable refusal, for selectable
 #      and non-selectable procedures alike, so an implementation that
@@ -292,6 +293,33 @@ check "B7. PNOOUT's INSERT never happened (engine reads fc's file)" \
       "$(col "$WORK" "SELECT COUNT(*) FROM T")" "0"
 check "B8. ... and not on the ref copy either" \
       "$(col "$REF" "SELECT COUNT(*) FROM T")" "0"
+# A LINE ENDS ON CR, ON LF, OR ON CRLF - AND CRLF COUNTS ONCE. fc
+# counted only LF, so everything after a bare CR was reported on line 1
+# at a column that measured the whole text. The statement text is the
+# point of these, so the label spells the shape rather than echoing a
+# statement with a CR in it.
+layout() { # <label> <stmt>
+    got=$(vec_run "$PORT" "$WORK" "$2")
+    want=$(vec_run "$ENGPORT" "$REF" "$2")
+    check "$1" "$got" "$want"
+}
+layout "B9. a bare CR ends the line"          "SELECT *"$'\r'"FROM PNOOUT"
+layout "B10. a LEADING bare CR"               $'\r'"SELECT * FROM PNOOUT"
+layout "B11. two bare CRs, two lines"         "SELECT *"$'\r'"FROM"$'\r'"PNOOUT"
+layout "B12. a CR and a later LF each count"  "SELECT *"$'\r'"FROM"$'\n'"  PNOOUT"
+layout "B13. CRLF is ONE break, not two"      "SELECT *"$'\r\n'"FROM PNOOUT"
+# the rest of the position story, pinned beside them: none of these
+# shapes may move now that the counter changed
+layout "B14. a leading LF"                    $'\n'"SELECT * FROM PNOOUT"
+layout "B15. leading spaces"                  "  SELECT * FROM PNOOUT"
+layout "B16. a TAB is one column"             "SELECT"$'\t'"* FROM PNOOUT"
+layout "B17. a FORM FEED is space, not a break" "SELECT *"$'\x0c'"FROM PNOOUT"
+layout "B18. extra internal spaces"           "SELECT  *   FROM   PNOOUT"
+layout "B19. an inline /* */ comment"         "SELECT * /* c */ FROM PNOOUT"
+layout "B20. a /* */ comment spanning a line" "SELECT * /* a"$'\n'"b */ FROM PNOOUT"
+layout "B21. a mid-statement -- comment"      "SELECT * -- x"$'\n'"FROM PNOOUT"
+layout "B22. a trailing semicolon"            "SELECT * FROM PNOOUT;"
+layout "B23. lower-case SQL"                  "select * from pnoout"
 
 # --- C. LAW 10: arity beats both -------------------------------------
 both "C1. too few arguments"                 "SELECT * FROM PNSARG(1)"
@@ -415,8 +443,8 @@ esac
 ran=$((ran + 1))
 
 # --- the ran counter ---------------------------------------------------
-if [ "$ran" -ne 67 ]; then
-    echo "DIFF $ran checks ran (expected exactly 67) - did one silently skip?"
+if [ "$ran" -ne 82 ]; then
+    echo "DIFF $ran checks ran (expected exactly 82) - did one silently skip?"
     fail=1
 fi
 

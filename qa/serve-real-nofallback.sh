@@ -13,6 +13,11 @@
 # (Inc161) and conditional expressions (Inc164). Each time it was found by
 # accident. This gate looks for it on purpose.
 #
+# A sixth surface joined them: the LEXER'S WHITESPACE CLASS. A statement
+# does not have to be planned wrong to be honoured wrong - it only has to
+# be SPLIT wrong, and a VERTICAL TAB was splitting statements the engine
+# refuses outright.
+#
 # Two properties are checked over every query below:
 #
 #   1. a query the server SUPPORTS must not contain 4242 in its answer;
@@ -85,6 +90,9 @@ kill -0 $srv 2>/dev/null || {
 fail=0
 ask() { printf 'SET HEADING OFF;\n%s;\n' "$1" |
         "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' '; }
+# the same statement straight at the engine, on the SAME file
+eng() { printf 'SET HEADING OFF;\n%s;\n' "$1" |
+        "$ISQL" -q -b -user "$U" -pas "$P" "$DB" 2>&1 | tr -s ' \n' ' '; }
 
 # a query the server ANSWERS: the answer must not be the fallback, and it
 # must match the engine
@@ -110,6 +118,25 @@ refuses() { # <sql>
         *"Statement failed"*|*error*|*ERROR*)
             echo "OK   refuses cleanly: $1" ;;
         *) echo "DIFF [$1] answered [$out] instead of raising"; fail=1 ;;
+    esac
+}
+# the ENGINE refuses it too, and so must fire-crab. Only the FACT of the
+# refusal is compared: the engine spells the whole -104 Token unknown
+# and fc answers the generic Dynamic SQL Error, which is the recorded
+# boundary for EVERY token this server's grammar does not know (a fourth
+# dotted name part, a `#`, a `~`). The label carries the shape because
+# the statement itself holds an unprintable character.
+both_refuse() { # <label> <sql>
+    en=$(eng "$2")
+    case "$en" in
+        *"Statement failed"*) ;;
+        *) echo "DIFF $1 - the ENGINE accepted it, so the case is wrong: [$en]"; fail=1; return ;;
+    esac
+    out=$(ask "$2")
+    case "$out" in
+        *4242*) echo "DIFF FALLBACK LEAKED: $1 answered [$out]"; fail=1 ;;
+        *"Statement failed"*) echo "OK   both refuse: $1" ;;
+        *) echo "DIFF $1 - the engine refuses it but fc answered [$out]"; fail=1 ;;
     esac
 }
 
@@ -181,6 +208,41 @@ refuses "SELECT COUNT(*) FROM T UNION ALL SELECT ID FROM U2"
 refuses "SELECT K FROM GEN(5) WHERE K > 2"
 # a rollback to a savepoint that was never set
 refuses "ROLLBACK TO NOSUCHPOINT"
+
+# --- the lexer's whitespace class --------------------------------------
+# THE ENGINE'S LEXER KNOWS FIVE WHITESPACE CHARACTERS - space, TAB, LF,
+# FF (0x0C) and CR - and calls every other character Rust calls
+# whitespace a -104 Token unknown. This server does not lex: it finds
+# clause keywords on IDENTIFIER boundaries and trims items with
+# str::trim, whose class is the UNICODE one, so such a character quietly
+# separated two tokens and the statement was HONOURED. That is this
+# gate's law 2 exactly - a statement the server must not honour reaching
+# the client as a row - which is why the lexer's class is pinned here.
+VT=$(printf '\013'); FF=$(printf '\014')
+NBSP=$(printf '\302\240'); LSEP=$(printf '\342\200\250')
+PSEP=$(printf '\342\200\251'); EMSP=$(printf '\342\200\203')
+both_refuse "VERTICAL TAB 0x0B as a separator" "SELECT ID${VT}FROM T"
+both_refuse "NBSP U+00A0 as a separator"       "SELECT ID${NBSP}FROM T"
+both_refuse "LINE SEPARATOR U+2028"            "SELECT ID${LSEP}FROM T"
+both_refuse "PARAGRAPH SEPARATOR U+2029"       "SELECT ID${PSEP}FROM T"
+both_refuse "EM SPACE U+2003"                  "SELECT ID${EMSP}FROM T"
+both_refuse "a VERTICAL TAB inside a WRITE"    "INSERT INTO T${VT}(ID) VALUES (6)"
+# ... and the refused write must not be THERE. Read back through the
+# ENGINE, out of the very file fire-crab served.
+n6=$(eng "SELECT COUNT(*) FROM T WHERE ID = 6" | tr -dc '0-9')
+if [ "$n6" = "0" ]; then
+    echo "OK   the refused INSERT wrote nothing (engine reads fc's file)"
+else
+    echo "DIFF the refused INSERT COMMITTED a row: COUNT = [$n6]"; fail=1
+fi
+# the class must not be over-tightened either: FF really is whitespace
+# to both sides, and inside a string literal ANY character is legal.
+# The literal case is the SINGLE-BYTE one on purpose - a MULTI-BYTE
+# literal is a separate, pre-existing divergence over isql (fc truncates
+# 'aéb' to 'aé' and drops the connection on an NBSP), and pinning it
+# here would hide it in a gate about the lexer.
+answers "SELECT ID${FF}FROM T ORDER BY ID"
+answers "SELECT 'a${VT}b' FROM T WHERE ID = 1"
 
 # --- teeth -------------------------------------------------------------
 # the fallback must be reachable AT ALL for this gate to mean anything:

@@ -50,6 +50,13 @@
 #      IN-subqueries, derived tables and CTE bodies.
 #  10. Every DML shape takes a qualified target and 3-part refs in its
 #      SET / WHERE / RETURNING.
+#  11. A NESTED QUERY EXPRESSION IS NOT AN EXEMPTION (sections H-J). The
+#      FROM of an IN / NOT IN / EXISTS / NOT EXISTS / scalar subquery
+#      gets laws 1, 2 and 5 whole - including inside an UPDATE, a DELETE
+#      and an INSERT ... SELECT, where ignoring the qualifier did not
+#      merely answer wrongly, it WROTE. And law 7 reaches into the
+#      subquery: after `FROM T AS Q` the base name T is not a binding in
+#      the correlated comparison either.
 #
 # Recorded boundaries this gate encodes rather than hides:
 #   * fire-crab emits the -204 vector for a SELECT's FROM item only.
@@ -58,6 +65,16 @@
 #     so those checks assert only that BOTH sides raise ("refuse").
 #   * fire-crab holds one user schema, so the cross-schema ambiguity
 #     vector (336003085) and SET SEARCH_PATH are unreachable here.
+#   * the NESTED contexts keep the generic Dynamic SQL Error rather than
+#     the engine's -204 with its argument and line/column: the subquery
+#     text is lifted out of the statement before it is resolved, so the
+#     span a positional vector needs is gone. Sections H-J therefore
+#     assert "refuse", which is the part that matters - answering rows,
+#     answering [], or writing is what a wrong qualifier used to do.
+#   * a nested query expression does not EXPAND a view (section K). It
+#     refuses one instead of scanning its recordless storage, which is
+#     what made `IN (SELECT C FROM V2)` answer [] where the engine
+#     answers every row.
 #
 #   qa/serve-real-qualname.sh [port]
 set -u
@@ -200,6 +217,23 @@ refuse() { # <label> <sql>
     fi
 }
 
+# fire-crab REFUSES where the engine ANSWERS - a recorded boundary,
+# asserted in BOTH directions so it cannot silently rot into a wrong
+# answer again. (It is not a `refuse`: the engine does not refuse.)
+boundary() { # <label> <sql>
+    a=$(query "$2" "$PORT" "$A")
+    b=$(query "$2" "$REAL" "$B")
+    ran=$((ran + 1))
+    if [ "${a#ERR}" != "$a" ] && [ "${b#ERR}" = "$b" ]; then
+        echo "OK   $1 (fcwire refuses, engine answers)"
+    else
+        echo "DIFF $1"
+        echo "     fcwire: $a"
+        echo "     engine: $b"
+        fail=1
+    fi
+}
+
 desc() { # <label> <sql> - every describe item, compared exactly
     a=$(describe "$2" "$PORT" "$A")
     b=$(describe "$2" "$REAL" "$B")
@@ -315,7 +349,123 @@ desc "a qualified JOIN" \
 desc "a qualified INSERT ... RETURNING keeps the BARE relation" \
      "INSERT INTO PUBLIC.T (C,D) VALUES (900,'x') RETURNING PUBLIC.T.C"
 
-# --- H. DML (LAST: it mutates) -----------------------------------------
+# --- H. THE NESTED QUERY EXPRESSION GETS THE SAME CHECK ----------------
+# A subquery's FROM is a FROM. It used to IGNORE the qualifier entirely -
+# no catalog read, no view guard - so `IN (SELECT C FROM SYSTEM.U)`
+# answered rows the engine refuses, and the DML shapes of it WROTE.
+refuse "IN over a wrongly qualified inner FROM" \
+       "SELECT * FROM T WHERE C IN (SELECT C FROM SYSTEM.U)"
+refuse "IN over an unknown schema" \
+       "SELECT * FROM T WHERE C IN (SELECT C FROM NOSUCH.U)"
+refuse "NOT IN over a wrongly qualified inner FROM" \
+       "SELECT * FROM T WHERE C NOT IN (SELECT C FROM SYSTEM.U)"
+refuse "NOT IN over an unknown schema" \
+       "SELECT * FROM T WHERE C NOT IN (SELECT C FROM NOSUCH.U)"
+refuse "EXISTS over a wrongly qualified inner FROM" \
+       "SELECT * FROM T WHERE EXISTS (SELECT 1 FROM SYSTEM.U)"
+refuse "NOT EXISTS over a wrongly qualified inner FROM" \
+       "SELECT * FROM T WHERE NOT EXISTS (SELECT 1 FROM SYSTEM.U)"
+refuse "a CORRELATED EXISTS over a wrongly qualified inner FROM" \
+       "SELECT * FROM T WHERE EXISTS (SELECT 1 FROM SYSTEM.U WHERE U.C = T.C)"
+refuse "a scalar subquery over a wrongly qualified inner FROM" \
+       "SELECT (SELECT MAX(C) FROM SYSTEM.U) FROM T"
+refuse "a CORRELATED scalar subquery over a wrongly qualified inner FROM" \
+       "SELECT (SELECT COUNT(*) FROM SYSTEM.U WHERE U.C = T.C) FROM T"
+refuse "a quoted lower-case schema does NOT fold inside a subquery" \
+       "SELECT * FROM T WHERE C IN (SELECT C FROM \"public\".U)"
+# THE VIEW GUARD, inside a subquery: a view has an id and no records, so
+# a wrong qualifier that reached the scan answered [] - an empty result
+# wearing a wrong answer's clothes
+refuse "THE VIEW GUARD in an IN-subquery (was [], not a refusal)" \
+       "SELECT * FROM T WHERE C IN (SELECT C FROM SYSTEM.V2)"
+refuse "THE VIEW GUARD in an EXISTS-subquery" \
+       "SELECT * FROM T WHERE EXISTS (SELECT 1 FROM SYSTEM.V1)"
+# the RIGHT qualifier still answers - the check is two-way, not a strip
+both "NOT IN over a correctly qualified inner FROM" \
+     "SELECT * FROM T WHERE C NOT IN (SELECT C FROM PUBLIC.U) ORDER BY C"
+both "a scalar subquery over a correctly qualified inner FROM" \
+     "SELECT (SELECT MAX(C) FROM PUBLIC.U) AS M FROM T"
+both "a correlated subquery over a correctly qualified inner FROM" \
+     "SELECT C, (SELECT COUNT(*) FROM PUBLIC.U WHERE U.C = T.C) AS N FROM T ORDER BY C"
+# law 6 INSIDE a subquery: the inner relation is reachable 3-part too
+both "a 3-part ref to the INNER table, inside the subquery" \
+     "SELECT C FROM T WHERE EXISTS (SELECT 1 FROM PUBLIC.U WHERE PUBLIC.U.C = 1) ORDER BY C"
+both "a 3-part ref to the INNER table of a scalar subquery" \
+     "SELECT (SELECT COUNT(*) FROM PUBLIC.U WHERE PUBLIC.U.C = 1) AS N FROM T"
+
+# --- I. AN ALIAS IS EXCLUSIVE INSIDE A SUBQUERY TOO --------------------
+# Law 7 again, in the one place it leaked: the CORRELATED COMPARISON.
+# After `FROM T AS Q` the base name T is not a binding ANYWHERE in the
+# statement, so an outer reference spelled T.C is a -206 and not a
+# correlation - fire-crab used to read every unrecognised qualifier as
+# "the outer one" and answer.
+refuse "the base name in a correlated EXISTS after AS Q" \
+       "SELECT C FROM T AS Q WHERE EXISTS (SELECT 1 FROM U WHERE U.C = T.C)"
+refuse "the 3-part base name in a correlated EXISTS after AS Q" \
+       "SELECT C FROM T AS Q WHERE EXISTS (SELECT 1 FROM U WHERE U.C = PUBLIC.T.C)"
+refuse "the alias is not reachable 3-part inside a subquery either" \
+       "SELECT C FROM T AS Q WHERE EXISTS (SELECT 1 FROM U WHERE U.C = PUBLIC.Q.C)"
+refuse "the select-list scalar form of the same leak" \
+       "SELECT (SELECT COUNT(*) FROM U WHERE U.C = T.C) FROM T AS Q"
+refuse "the select-list scalar form, spelled 3-part" \
+       "SELECT (SELECT COUNT(*) FROM U WHERE U.C = PUBLIC.T.C) FROM PUBLIC.T AS Q"
+# the shapes that ALREADY refused - kept so a future change cannot
+# silently flip them back
+refuse "control: the base name in a NON-correlation leaf" \
+       "SELECT C FROM T AS Q WHERE EXISTS (SELECT 1 FROM U WHERE T.C = 1)"
+refuse "control: the same leaf under a scalar comparison" \
+       "SELECT C FROM T AS Q WHERE 1 = (SELECT COUNT(*) FROM U WHERE U.C = T.C)"
+refuse "control: the base name in a HAVING" \
+       "SELECT C FROM T AS Q GROUP BY 1 HAVING PUBLIC.T.C > 1"
+refuse "control: the DELETE ... AS Q variant" \
+       "DELETE FROM T AS Q WHERE C IN (SELECT C FROM U WHERE U.C = T.C)"
+refuse "control: the UPDATE ... AS Q variant" \
+       "UPDATE T AS Q SET D = 'x' WHERE C IN (SELECT C FROM U WHERE U.C = T.C)"
+both "the AS Q controls wrote nothing (fresh attachment)" \
+     "SELECT * FROM T ORDER BY C"
+# the spellings that DO resolve must keep resolving
+both "the alias itself is the correlation's outer key" \
+     "SELECT C FROM T AS Q WHERE EXISTS (SELECT 1 FROM U WHERE U.C = Q.C) ORDER BY C"
+both "an UNALIASED outer FROM answers to its base name" \
+     "SELECT C FROM T WHERE EXISTS (SELECT 1 FROM U WHERE U.C = T.C) ORDER BY C"
+both "an UNALIASED outer FROM answers 3-part" \
+     "SELECT C FROM T WHERE EXISTS (SELECT 1 FROM U WHERE U.C = PUBLIC.T.C) ORDER BY C"
+
+# --- J. A SUBQUERY INSIDE DML MUST NOT WRITE ---------------------------
+# The project law: re-read the file through the engine after every write
+# phase. Each of these used to DELETE or UPDATE the row the engine
+# refuses to touch.
+refuse "DELETE whose IN-subquery is wrongly qualified" \
+       "DELETE FROM T WHERE C IN (SELECT C FROM SYSTEM.U)"
+both "T is untouched (fresh attachment)" "SELECT * FROM T ORDER BY C"
+refuse "UPDATE whose IN-subquery is wrongly qualified" \
+       "UPDATE T SET D = 'x' WHERE C IN (SELECT C FROM SYSTEM.U)"
+both "T is untouched (fresh attachment)" "SELECT * FROM T ORDER BY C"
+refuse "DELETE whose EXISTS-subquery names an unknown schema" \
+       "DELETE FROM T WHERE EXISTS (SELECT 1 FROM NOSUCH.U)"
+both "T is untouched (fresh attachment)" "SELECT * FROM T ORDER BY C"
+refuse "UPDATE whose CORRELATED EXISTS is wrongly qualified" \
+       "UPDATE T SET D = 'x' WHERE EXISTS (SELECT 1 FROM SYSTEM.U WHERE U.C = T.C)"
+both "T is untouched (fresh attachment)" "SELECT * FROM T ORDER BY C"
+refuse "INSERT ... SELECT whose WHERE holds a wrongly qualified subquery" \
+       "INSERT INTO U (C,E) SELECT C, D FROM T WHERE C IN (SELECT C FROM SYSTEM.U)"
+both "U is untouched (fresh attachment)" "SELECT * FROM U ORDER BY C"
+
+# --- K. the view-in-a-subquery boundary, locked ------------------------
+# The nested path does not EXPAND a view, and a view has no records of
+# its own: scanning its storage answered ZERO ROWS where the engine
+# answers every row. Refusing is the honest reply, and these lock it so
+# the lie cannot come back unnoticed.
+boundary "a view inside an IN-subquery" \
+         "SELECT * FROM T WHERE C IN (SELECT C FROM V2)"
+boundary "a view inside an EXISTS-subquery" \
+         "SELECT * FROM T WHERE EXISTS (SELECT 1 FROM V2)"
+boundary "a view inside a scalar subquery" \
+         "SELECT (SELECT MAX(C) FROM V2) AS M FROM T"
+boundary "a CORRECTLY qualified view inside a subquery" \
+         "SELECT * FROM T WHERE C IN (SELECT C FROM PUBLIC.V2)"
+
+# --- L. DML (LAST: it mutates) -----------------------------------------
 both "INSERT into a qualified target" "INSERT INTO PUBLIC.T (C,D) VALUES (9,'nine')"
 both "the row landed (fresh attachment)" "SELECT * FROM T ORDER BY C"
 both "UPDATE with a 3-part SET and a 3-part WHERE" \
@@ -330,9 +480,9 @@ both "DELETE the rest" "DELETE FROM PUBLIC.T WHERE PUBLIC.T.C > 2"
 both "the table is back to its two rows (fresh attachment)" \
      "SELECT * FROM T ORDER BY C"
 
-# --- I. the ran counter -------------------------------------------------
-if [ "$ran" -ne 70 ]; then
-    echo "DIFF $ran checks ran (expected exactly 70) - did one silently skip?"
+# --- M. the ran counter -------------------------------------------------
+if [ "$ran" -ne 115 ]; then
+    echo "DIFF $ran checks ran (expected exactly 115) - did one silently skip?"
     fail=1
 fi
 

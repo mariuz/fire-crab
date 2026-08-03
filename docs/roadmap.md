@@ -259,10 +259,12 @@ four; R7 is the removal of what they replaced.
   bytes/char - probed table in the gate). `qa/serve-real-outblr.sh`
   runs the same statements through BOTH driver generations.
 
-- **`EXECUTE PROCEDURE` on an ENGINE-created FB6 procedure fails "no
-  such procedure".** Found by the out-BLR probe pass; fc-created
-  procedures work, engine-created ones do not resolve — likely the
-  PUBLIC-schema qualifier in the FB6 catalog row. Unclaimed.
+- ~~`EXECUTE PROCEDURE` on an ENGINE-created FB6 procedure fails "no
+  such procedure"~~ — *stale, and the entry's own hypothesis was what
+  closed it*: the qualifier WAS the bug, and the schema-qualified-call
+  fix struck it out further down. Re-probed on engine-created
+  procedures, selectable and not, bare and `PUBLIC.`-qualified, in
+  `EXECUTE PROCEDURE` and in `FROM` — byte-identical on both sides.
 
 - **`qa/auth-srp.sh` has harness bugs**: its NF path is $0-relative
   (node resolves it as a module unless invoked by absolute path), its
@@ -458,10 +460,24 @@ four; R7 is the removal of what they replaced.
   rendered-text fallback compared digits as strings (`N + 0 > '9'`
   answered [] vs engine's rows) — expression-side literals convert
   now. Params were already correct and untouched.
-  `qa/serve-real-textnumwhere.sh`, 70 checks. Residuals priced: text
-  COLUMN vs numeric side still render-compares (its own slice);
-  indexed EMPTY table + unconvertible literal raises at open on the
-  engine, answers [] here.
+  `qa/serve-real-textnumwhere.sh`, 152 checks. Residuals priced: text
+  COLUMN vs numeric side still render-compares (its own slice).
+  The indexed-EMPTY-table residual is CLOSED: an index makes the
+  conversion an OPEN-time one, because the retrieval's bounds are
+  built before the first record. `Predicate::key_conversion` mirrors
+  that off the CATALOG (so it holds under `FC_NO_INDEX=1` too), after
+  the invariant pass, for the LEADING segment of any index -
+  ascending, descending or compound - keyed by a bound (`=`, `<`,
+  `<=`, `>`, `>=`, BETWEEN, IN) but not by `<>`, LIKE or STARTING
+  WITH; every branch of a disjunction must be servable or nothing
+  converts, and one segment holds ONE value per side, so the LAST
+  match written wins (`N = 'x' AND N = 5` answers [] where the other
+  order raises). The same slice closed the JOIN twin: a PARTNERLESS
+  row still meets the ON, because the engine evaluates the condition
+  per row of the stream it walks - the pair walk's FALSE key
+  comparison short-circuits the raiser where the NULL-padded row's
+  UNKNOWN one does not - gated by a WHERE conjunct that names that
+  ONE side, which the engine runs on that stream first.
 
 - **(superseded)** Text LITERALS against numeric columns — `N BETWEEN '1' AND '3'`
   → 1,2,3; `N IN ('1','2')`; `N = '2'`; `N > '1.5'` (fraction kept);
@@ -584,6 +600,36 @@ four; R7 is the removal of what they replaced.
   cross-schema ambiguity vector (336003085) and `SET SEARCH_PATH` are
   unreachable.
 
+  **THE REFUTE PASS BROKE IT, one level down** (and the fix is in the
+  same gate, now 115 checks). Both laws were installed at the OUTERMOST
+  FROM only; a nested query expression — `IN`, `NOT IN`, `EXISTS`, `NOT
+  EXISTS`, a scalar subquery, and those same shapes inside an
+  UPDATE/DELETE/`INSERT…SELECT` WHERE — resolved by BARE name and threw
+  the schema half away. `… WHERE C IN (SELECT C FROM SYSTEM.U)`
+  answered rows against the engine's −204; `SYSTEM.V2` answered `[]`,
+  which is precisely the empty result the view guard exists to prevent;
+  and **`DELETE FROM T WHERE C IN (SELECT C FROM SYSTEM.U)` DELETED THE
+  ROW the engine refuses to touch** — a wrong WRITE. The alias leaked
+  the same way: after `FROM T AS Q`, a correlated `… WHERE U.C = T.C`
+  answered where the engine raises −206, because the correlation split
+  decided the inner side from the pair alone and never asked the outer
+  binding. One shared question — `ColBinding::answers_to` — now answers
+  it for every nested site, `relation_qualifier_ok` and the view guard
+  are called where the nested FROM resolves, and the inner relation's
+  own three-part spelling resolves inside the subquery.
+  **LAW (the sharpest form yet of "vary the shape"): when a slice
+  installs a CHECK, enumerate every CONTEXT that reaches the same
+  machinery, not just every spelling. Ten laws held at the top level
+  and none of them held one nesting level down.**
+
+  *Found while fixing, recorded not fixed*: a VIEW inside a nested
+  query expression answered `[]` at HEAD — **unqualified too**, where
+  the engine answers every row, because a subquery never expanded one,
+  it just scanned the view's empty storage. It REFUSES now (the same
+  fail-closed guard), which trades a wrong answer for a boundary;
+  expanding it needs the subquery evaluator to accept a planned row
+  source the way `plan_over_source` does, which is its own slice.
+
 - ~~A non-selectable procedure in FROM answers `[]`~~ — *fixed, with a
   stated surface* (`qa/serve-real-nosuspend.sh`). Selectability is
   `RDB$PROCEDURES.RDB$PROCEDURE_TYPE`, a LEXICAL DDL-time property: a
@@ -628,6 +674,54 @@ four; R7 is the removal of what they replaced.
   `EXIT` (`SELECT * FROM PEXIT` refuses where the engine answers `[]`),
   and an empty `BEGIN END` body is outside its surface (`EXECUTE
   PROCEDURE PEMPTY` refuses where the engine succeeds silently).
+
+  **The refute pass held the BLR arithmetic and broke the line
+  counter** (gate now 82 checks). The reconstructed `isc_invalid_blr`
+  offset survived every shape it ships one for — four outputs, a
+  three-of-four subset, a column named twice, a 30-character name, a
+  quoted name, the smallint/i32 rims — and every wrapper it cannot
+  reconstruct honestly still downgrades rather than invent a number.
+  What fell was the position: **a bare CR is a line terminator to
+  Firebird's lexer and was not to fire-crab's reconstruction** (`SELECT
+  *<CR>FROM P` reported 1,15 against the engine's 2,6), so
+  `text_line_col` now ends a line on CR, on LF, or on CRLF counted
+  once. Priced, not fixed: the `-84` vector fires only for a narrow
+  textual shape (`FIRST 1`, an alias, a JOIN, a leading `--` comment
+  all downgrade it where the engine keeps it), and the arity vector
+  only for integer-parameter procedures — both refusals on both sides.
+  A procedure in a non-PUBLIC schema does not resolve in FROM at all,
+  so the `len(schema)` term of the arithmetic is asserted by no probe;
+  the engine's own offset 28 for `S1.PQ` confirms the term is right in
+  principle.
+
+- ~~fire-crab's lexer accepts whitespace the engine's does not~~ —
+  *fixed, and it was a WRONG WRITE*, found while attacking the line
+  counter. Firebird's lexer knows exactly five space characters —
+  SPACE, TAB, LF, FF (0x0C) and CR — and rejects everything else as
+  `-104 Token unknown`, including VERTICAL TAB (0x0B). fire-crab's
+  parser trims with Rust's UNICODE class, so `SELECT ID<VT>FROM T`
+  answered rows and `INSERT INTO T<VT>(ID) VALUES (6)` **committed a
+  row the engine refuses**. The cause was NOT the whitespace predicate
+  the suspicion pointed at (`find_word` splits on identifier
+  boundaries, so a VT separates two tokens whatever that predicate
+  says, and Rust's `is_ascii_whitespace` happens to BE the engine's
+  five): it is the several-hundred `str::trim` calls, whose class is
+  the Unicode one. `has_unknown_space` therefore asks the question once
+  at the three wire entry points — is there a Unicode space that is not
+  one of the engine's five, outside literals, delimited identifiers and
+  comments — and refuses before anything is planned. fire-crab still
+  answers the GENERIC error where the engine spells `-104, Token
+  unknown - line 1, column N`, which is what it already does for every
+  other unknown token (`#`, `~`, a fourth dotted part); emitting the
+  real vector needs a token scanner with a position.
+
+  *Found beside it, unfixed and unpinned*: through isql, fire-crab
+  mishandles MULTI-BYTE string literals — `SELECT 'aéb' FROM T` answers
+  `aé` against the engine's `aéb`, and a literal holding NBSP DROPS THE
+  CONNECTION (`SQLSTATE 08006`). Both are correct through
+  node-firebird, so it is the isql/describe width path, not the literal
+  parser. Its own slice; deliberately NOT pinned in the lexer gate,
+  where it would have been hidden behind a passing check.
 
 - **(superseded)** `RETURNING` comes back in a different shape. Through node-firebird
   the engine answers an `INSERT ... RETURNING` as a single object and
@@ -739,6 +833,36 @@ four; R7 is the removal of what they replaced.
   `-104` / `-204` / `-206` / `-804` details are not reproduced —
   fire-crab ships the generic Dynamic SQL Error at the same TIME.
 
+  **The refute pass found the vectors FABRICATING two things** (gate
+  now 117 checks, 11 boundaries). The identity semantics themselves
+  survived everything thrown at them, generator readings included; the
+  message argument did not. *The schema was assumed, not read* — all
+  three vectors formatted a literal `"PUBLIC"` because every gate cell
+  used a PUBLIC table, so `INSERT INTO S1.TZ3 … OVERRIDING SYSTEM
+  VALUE` named `"PUBLIC"."TZ3"` where the engine names `"S1"."TZ3"` —
+  and fire-crab had resolved the S1 table correctly enough for the
+  SUCCESSFUL spelling of the same insert to work, so only the message
+  was wrong. It comes from the catalog now, through the read the
+  qualified-name slice already uses. *And a typed verdict was asserted
+  where there is no surface at all* — fire-crab cannot INSERT through a
+  view (a priced boundary; the engine writes the base table), but the
+  new metadata check ran FIRST, asked a table-only catalog reader about
+  a view's identity columns, found none, and confidently answered
+  335545134 naming the view. The engine attributes the ALWAYS refusal
+  to the BASE table, so even the name would have been wrong. A view
+  target returns None now and falls through to the generic boundary.
+  **LAW: a refusal fire-crab cannot justify must be GENERIC — a
+  confident wrong verdict is worse than an admitted one, because it is
+  the one a driver will act on.**
+
+  *Surprises worth keeping*: the `RDB$<n>` identity-generator counter is
+  GLOBAL across schemas while the generator lands in the TABLE's schema
+  (S1.RDB$1, S1.RDB$2, PUBLIC.RDB$3), so an unqualified
+  `GEN_ID(RDB$1,0)` does not see an S1 table's generator. And
+  `EvalErr::PrimaryKeyRequired` in the upsert path still formats
+  `"PUBLIC"` from the statement's own spelling — the same fabrication
+  in a different vector, left alone to keep the diff to this slice.
+
 - **The generator-durability class stays recorded** — the engine treats
   generators as non-transactional: an advance survives ROLLBACK,
   ROLLBACK TO SAVEPOINT, a PSQL `WHEN ANY` undo, statement undo, and a
@@ -753,22 +877,29 @@ four; R7 is the removal of what they replaced.
   forward out of a failed statement's discarded work buffer — in a
   design whose whole isolation story is "the image is the truth", and
   they interact with DDL rollback. Its own slice, with its own gate;
-  the reasoning is pinned at `restore_db`. Unclaimed.
+  the reasoning is pinned at `restore_db`. Unclaimed. **Re-measured,
+  and it is worse than "recorded": the divergence is READABLE. After
+  an identity INSERT that fails the PK check identically on both
+  sides, `SELECT GEN_ID(G1,0)` answers 0 here and 12 on the engine —
+  a wrong ANSWER to an ordinary SELECT, not merely a durability
+  footnote. (And a PSQL `WHEN ANY` block that draws then divides by
+  zero answers `X = 5` on the engine, leaving the generator at 5,
+  where fire-crab refuses the whole block.) It should be priced as a
+  wrong answer when the queue is next ordered.**
 
-- **Constraint errors surface as generic 42000 `Dynamic SQL Error`,
-  never 23000 with the constraint/key detail** — a duplicate-key
-  INSERT and a PK-moving UPDATE alike; the engine's vector names the
-  index (`violation of PRIMARY or UNIQUE KEY constraint "INTEG_2" ...
-  Problematic key value is ("ID" = 6)`). Both sides fail, so no wrong
-  write — but drivers that dispatch on SQLSTATE see the wrong class.
-  Unclaimed.
+- ~~Constraint errors surface as generic 42000 `Dynamic SQL Error`,
+  never 23000 with the constraint/key detail~~ — *stale, closed by the
+  enforcement-order slice above and re-probed*: the duplicate-key
+  INSERT and the PK-moving UPDATE the entry names both ship the
+  engine's vector verbatim now (`... constraint "INTEG_2" on table
+  "PUBLIC"."T", Problematic key value is ("ID" = 1)`), on two
+  different indexes. The entry had been contradicting its own sibling.
 
-- **Text COLUMN vs numeric side still render-compares** (restated so
-  the wrong-answer class is not lost behind the fixed literal slice):
-  `NAME > N` answers six rendered-text rows and `NAME = ID` answers
-  `[]` where the engine raises 22018 PER ROW (it coerces the COLUMN
-  to a number row by row). Declared out-of-slice in the cmp_sides
-  comment, but it is a wrong ANSWER, not a refusal. Unclaimed.
+- ~~Text COLUMN vs numeric side still render-compares~~ — *stale,
+  closed by the per-row coercion slice above and re-probed*: `NAME >
+  N`, `NAME = ID` and `NAME = N` all raise the engine's 22018 with the
+  same argument on both sides. This was the loudest wrong-answer claim
+  left on the open list, and it had been dead since that slice landed.
 
 - **A tab in a failing text literal renders RAW in the error argument**
   — fc's conversion-error vector carries `"\t2"` where the engine
@@ -917,7 +1048,42 @@ plus *the subsystem is now on the path*.
       (unrenderable → outer scan); IN-subquery outers deliberately
       stay NATURAL (the engine hashes there — model pins in the
       gate).
-    - the JOIN's inner side.
+    - **the JOIN's inner side — ADJUDICATED against the engine's own
+      plans, and it is TWO items, not one.** `SET PLANONLY ON` over a
+      fixture with an indexed inner column (P 200 rows, C 2000 rows
+      with a non-unique index on the FK, Q 2000 rows unindexed):
+
+      *INNER, comma, self, three-table — DO NOT CONVERT.* The engine
+      HASHes every inner-join shape fire-crab can reach: `Q ⋈ P` on a
+      unique PK is `PLAN HASH (Q NATURAL, P NATURAL)`, so is the
+      self-join, so is the comma spelling, and the three-table INNER
+      hashes its first pair. In the ONE inner shape that does say JOIN
+      (`C ⋈ P`) the engine drives the 200-row side and indexes the
+      2000-row one — the DRIVER IS SWAPPED relative to fire-crab's
+      left-deep fold, which cannot reproduce it without moving row
+      order. Converting these would model a plan the engine does not
+      have; the correlated-subquery precedent applies verbatim. **A
+      pin, not code.**
+
+      *LEFT — the slice is ON.* A LEFT JOIN never hashes. In every
+      probe the engine's plan IS fire-crab's execution tree: driver =
+      the syntactic left, inner = the syntactic right, `INDEX` on the
+      inner's ON column when one exists (unique or not, and for `>` as
+      well as `=`), NATURAL when none does, chains staying left-deep in
+      SQL order with every inner indexed, and a view or derived inner
+      FLATTENED rather than materialised. Two boundaries decide the
+      scope: a WHERE naming the inner side FLIPS the driver (back to
+      the inner-join shape, so out of scope), and the smallest honest
+      first slice is a two-table `A LEFT JOIN B ON B.<col> = A.<col>`
+      over plain relations with a single conjunctive equality and an
+      ascending single-segment index `pick_for_terms` already keys —
+      probe once per outer row, fall back to today's materialised inner
+      whenever the band cannot be built. Spec written and banked;
+      obligations are the W1 standard ones (candidates are not answers,
+      the fetched record must still carry the entry's key, dedup across
+      bands, a NULL inner key, and the padded row must still be emitted
+      — the last of which is why the partnerless-ON wrong answer above
+      had to be fixed BEFORE this slice could be gated).
   - **A predicted bug that measurement did not confirm, recorded as
     such.** `ods::ddl::index_itype` maps every TEXT/VARYING column to
     `idx_string`, ignoring the charset, so a `CREATE INDEX` issued to
@@ -946,6 +1112,17 @@ plus *the subsystem is now on the path*.
     BIGINT of exactly `i64::MIN` carries an index entry the engine's own
     lookups may not find. Closing it means reading the engine's actual
     key bytes for that value, which is a probe of its own.
+    **Re-measured: the stated hazard is UNREACHABLE, because a prior
+    refusal blocks the write.** `INSERT INTO BM VALUES
+    (-9223372036854775808,…)`, the `CAST('…' AS BIGINT)` spelling and a
+    string-bound parameter all get a Dynamic SQL Error here where the
+    engine writes the row — the literal parse overflows on the unsigned
+    half before the key is ever built. Retrieval is fine (after isql
+    wrote the row into fire-crab's own file, fire-crab found it). So
+    what is actually open is SMALLER and different from what the entry
+    says: fire-crab refuses a value the engine accepts. Fix the literal
+    parse and the write-key divergence becomes live again — do both in
+    one slice, or neither.
   - **`OR` and `IN`** *(done)*: a disjunction is a UNION OF BANDS, one
     per DNF branch, with every branch required to be servable (a partial
     union is a missing set of rows) and candidates deduplicated ACROSS
