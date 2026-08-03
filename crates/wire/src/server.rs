@@ -1057,8 +1057,53 @@ impl RowSource {
             RowSource::Rows(rows) => Ok(rows.clone()),
             RowSource::NestedLoopJoin { left, left_width, right, part, above } => {
                 let l = left.rows(db)?;
-                let r = right.rows(db)?;
-                join_step(l, *left_width, &r, part, above)
+                let Some(probe) = part.probe.as_ref() else {
+                    let r = right.rows(db)?;
+                    return join_step(l, *left_width, &r, part, above);
+                };
+                // ONE BAND PER OUTER ROW, and [join_step] called with a
+                // ONE-ROW accumulated side so the padded row, the
+                // partnerless ON evaluation and the row order stay
+                // decided exactly where they are decided today.
+                // Concatenating the per-row results IS the whole-acc
+                // result for JoinKind::Left, whose loop body reads only
+                // `l`, `rrows` and `part` - which is why the probe is
+                // LEFT-only and why join_step is untouched.
+                let mut fallback: Option<Vec<Vec<Value>>> = None;
+                let mut out = Vec::new();
+                for row in l {
+                    match probe.band(db, &row) {
+                        Band::Index(access) => {
+                            // through IndexScan rather than records_for
+                            // directly: the width resize the scanned
+                            // side applies is applied here too, from
+                            // one place
+                            let rrows = RowSource::IndexScan {
+                                rel: probe.src.rel,
+                                formats: probe.src.formats.clone(),
+                                access,
+                                width: Some(part.width),
+                            }
+                            .rows(db)?;
+                            out.extend(join_step(vec![row], *left_width, &rrows, part, above)?);
+                        }
+                        Band::Nothing => {
+                            out.extend(join_step(vec![row], *left_width, &[], part, above)?);
+                        }
+                        Band::Scan => {
+                            // ONCE per join node, lazily: a per-row
+                            // materialisation would make one unbuildable
+                            // key cost a full scan for every outer row -
+                            // a pessimisation dressed as a fallback
+                            if fallback.is_none() {
+                                fallback = Some(right.rows(db)?);
+                            }
+                            let r = fallback.as_deref().unwrap_or(&[]);
+                            out.extend(join_step(vec![row], *left_width, r, part, above)?);
+                        }
+                    }
+                }
+                Ok(out)
             }
             RowSource::Aggregate {
                 input,
@@ -1881,6 +1926,98 @@ struct JoinPart {
     src: RowSource,
     width: usize,
     on: Predicate,
+    /// the inner side's INDEX PROBE, when the optimizer blessed one -
+    /// see [JoinProbe]. None is today's materialised scan of `src`.
+    probe: Option<JoinProbe>,
+}
+
+/// What a plain-relation join side would need to be probed by record
+/// number instead of scanned: the relation, its BARE name (fcopt
+/// refuses an aliased single-table FROM, and a join is full of
+/// aliases) and the formats a fetch decodes with. A derived, view or
+/// CTE side has none - its rows come from an inner plan.
+#[derive(Clone)]
+struct ProbeSrc {
+    rel: u16,
+    table: String,
+    formats: Vec<(u8, Vec<Descriptor>)>,
+}
+
+/// The index probe for a LEFT join's inner side: everything the
+/// planning-time `JoinSide` knows that `JoinPart` used to drop.
+///
+/// The engine plans a LEFT join as exactly this tree - driver = the
+/// syntactic left, inner = the syntactic right, INDEX on the inner's ON
+/// column when one exists and NATURAL otherwise, never a hash (probed
+/// with SET PLANONLY over unique and non-unique inner indexes alike) -
+/// which is what licenses probing it once per outer row. An INNER,
+/// comma or self join is NOT this shape: the engine HASHes those, and
+/// where it does pick JOIN it swaps the driver to the side this
+/// executor loops as the outer, so they stay a materialised scan.
+///
+/// `outer_fid` is a COMBINED-row index into the accumulated side;
+/// `inner_fid` is this side's OWN field id (`ri - offset`), because the
+/// band is built against the relation, not against the combined row.
+#[derive(Clone)]
+struct JoinProbe {
+    src: ProbeSrc,
+    descs: Vec<Descriptor>,
+    outer_fid: usize,
+    inner_fid: usize,
+    /// the index the gatekeeper blessed, for the trace only - the real
+    /// band is rebuilt per outer row from that row's own value
+    index_id: u8,
+    column: String,
+}
+
+/// What one outer row's probe yields.
+enum Band {
+    /// the index names these candidates - and only NAMES them: the ON
+    /// still decides, over the FETCHED values
+    Index(IndexAccess),
+    /// a NULL outer key names none. That is the ANSWER, not a reason to
+    /// scan: the equality is UNKNOWN for every inner row, so a scan
+    /// would evaluate the whole relation to reach the same nothing.
+    Nothing,
+    /// the key cannot be built byte-exactly, so SCAN - a key this
+    /// server cannot spell the way the engine did does not refuse, it
+    /// MISSES, and a missed inner row is a wrong LEFT-join answer
+    Scan,
+}
+
+impl JoinProbe {
+    /// The band this outer row names on the inner side.
+    fn band(&self, db: &Database, row: &[Value]) -> Band {
+        let Some(v) = row.get(self.outer_fid) else { return Band::Scan };
+        let rhs = match v {
+            Value::Null => return Band::Nothing,
+            Value::Int(i) => Rhs::Int(*i),
+            // an exact numeric AT SCALE 0 is the same integer; a scaled
+            // one is not, and neither is anything else this first slice
+            // can hand to the key builder
+            Value::Scaled(raw, 0) => Rhs::Int(*raw),
+            Value::Int128(raw, 0) => match i64::try_from(*raw) {
+                Ok(i) => Rhs::Int(i),
+                Err(_) => return Band::Scan,
+            },
+            _ => return Band::Scan,
+        };
+        // REUSED VERBATIM, not re-implemented: every guard in it
+        // (ascending only, keyable itypes only, scale 0, i64::MIN
+        // refused) is a measured missed row, and a second key encoder
+        // would have to re-learn all of them.
+        match pick_for_terms(
+            db,
+            self.src.rel,
+            &self.src.table,
+            &self.descs,
+            &[Term::Cmp(self.inner_fid, Cmp::Eq, rhs)],
+            &[],
+        ) {
+            Some(p) => Band::Index(IndexAccess::one(p)),
+            None => Band::Scan,
+        }
+    }
 }
 
 /// How a generator write sets its value: `Absolute(n)` stores `n` (`SET
@@ -13684,6 +13821,9 @@ struct JoinSide {
     /// but a bare name means the other side's, and `*` emits the pair
     /// once
     merged_away: Vec<u16>,
+    /// what an index probe of this side would need ([ProbeSrc]), which
+    /// `JoinPart` used to drop. Only a PLAIN RELATION has one.
+    probe_src: Option<ProbeSrc>,
 }
 
 /// Resolve a (possibly qualified) column name against the two join sides
@@ -13993,6 +14133,104 @@ fn plan_join(
     plan_join_bound(proj, left, joins, where_s, group_s, having_s, order_s, db, db_opt, params, None)
 }
 
+/// Decide whether this step's inner side may be PROBED per outer row
+/// instead of materialised, or None for today's scan.
+///
+/// The seven gates are the whole soundness story, and each one is a
+/// shape the engine does NOT execute the way this executor would:
+///
+///  1. LEFT only. A LEFT join never hashes and the engine's plan IS
+///     this tree; an INNER, comma or self join HASHes, and where the
+///     engine does pick JOIN it drives the side this loop treats as the
+///     inner (both re-probed with SET PLANONLY).
+///  2. A plain relation. A view or derived side is FLATTENED into the
+///     engine's join and MATERIALISED here, so an index on it models a
+///     shape that is not being executed.
+///  3. ONE DNF branch. Within a conjunction every row satisfying the
+///     whole ON also satisfies the equality, so the band is a SUPERSET
+///     of the matches; across an OR it is not, and a narrowed band
+///     would be a MISSING SET OF ROWS.
+///  4. Exactly one column-equality across the join boundary. Two would
+///     need two bands intersected; `Cmp` other than `Eq` would need a
+///     range band, whose lower bound does not exclude the NULL entries
+///     Firebird also indexes.
+///  5. The inner fid is this side's OWN, `ri - offset` - the band is
+///     built against the relation, not the combined row.
+///  6. The table and column spell as bare unquoted identifiers, since
+///     the reconstruction below re-spells them.
+///  7. The gatekeeper blesses ONE band. If not, scan.
+fn build_join_probe(
+    db: &Database,
+    kind: JoinKind,
+    on: &Predicate,
+    side: &JoinSide,
+) -> Option<JoinProbe> {
+    if !matches!(kind, JoinKind::Left) {
+        return None;
+    }
+    let src = side.probe_src.clone()?;
+    if !matches!(side.src, RowSource::TableScan { .. }) {
+        return None;
+    }
+    let [terms] = on.groups.as_slice() else { return None };
+    // where this side's fields begin in the combined row - the same sum
+    // `join_rows` accumulates into `left_width`, step by step
+    let offset = side.offset;
+    let mut found: Option<(usize, usize)> = None;
+    for t in terms {
+        let Term::ExprCond(c) = t else { continue };
+        let Cond2::Cmp(a, Cmp::Eq, b) = c.as_ref() else { continue };
+        let (Expr::Col(x), Expr::Col(y)) = (a.as_ref(), b.as_ref()) else { continue };
+        // either orientation is one equality across the boundary; a
+        // pair on the same side of it is not one at all
+        let (outer_fid, ri) = match (*x < offset, *y < offset) {
+            (true, false) => (*x, *y),
+            (false, true) => (*y, *x),
+            _ => continue,
+        };
+        let inner_fid = ri - offset;
+        if inner_fid >= side.descs.len() || found.is_some() {
+            return None;
+        }
+        found = Some((outer_fid, inner_fid));
+    }
+    let (outer_fid, inner_fid) = found?;
+    let col = side.columns.iter().find(|c| c.field_id as usize == inner_fid)?;
+    // an UNQUOTED identifier is stored folded up, so a name carrying a
+    // lower-case letter was quoted and cannot be re-spelt bare
+    let bare = |s: &str| ident_ok(s) && !s.chars().any(|c| c.is_ascii_lowercase());
+    if !bare(&src.table) || !bare(&col.name) {
+        return None;
+    }
+    // A SINGLE-TABLE statement for the inner side alone. Never a join
+    // text: `choose_index` takes only a one-stream answer, and fcopt's
+    // join ordering is known-divergent from the engine's in exactly the
+    // two places this would care about (a WHERE does not move its join
+    // order, and it does not demote a LEFT join whose inner carries
+    // one), so trusting its stream order to pick a side would turn two
+    // harmless optimizer divergences into wrong plans.
+    //
+    // The sentinel literal is sound because fcopt's answer for the
+    // equality shape is VALUE-INDEPENDENT (probed: `K = 0` and
+    // `K = 12345678` answer the same PLAN). It buys the gatekeeper's
+    // blessing only - the real band is rebuilt per outer row from that
+    // row's own value. `SELECT 1` for the reason the projection site
+    // states: fcopt ignores the select list, and a rendered literal
+    // could itself contain " FROM ".
+    let opt_sql = format!("SELECT 1 FROM {} WHERE {} = 0", src.table, col.name);
+    let filter = Predicate::dnf(vec![vec![Term::Cmp(inner_fid, Cmp::Eq, Rhs::Int(0))]]);
+    let index = choose_index(db, src.rel, &src.table, &side.descs, &Some(filter), &opt_sql, &[])?;
+    let [pick] = index.picks.as_slice() else { return None };
+    Some(JoinProbe {
+        index_id: pick.op.id,
+        descs: side.descs.clone(),
+        column: col.name.clone(),
+        src,
+        outer_fid,
+        inner_fid,
+    })
+}
+
 fn plan_join_bound(
     proj: &Proj,
     left: &TableRef<'_>,
@@ -14074,6 +14312,7 @@ fn plan_join_bound(
                     .collect(),
                 rel_alias: tr.alias.map(str::to_string),
                 merged_away: Vec::new(),
+                probe_src: None,
             });
             continue;
         }
@@ -14111,6 +14350,7 @@ fn plan_join_bound(
                     .collect(),
                 rel_alias: tr.alias.map(str::to_string),
                 merged_away: Vec::new(),
+                probe_src: None,
             });
             continue;
         }
@@ -14138,6 +14378,7 @@ fn plan_join_bound(
                         .collect(),
                     rel_alias: Some(tr.alias.unwrap_or(tr.table).to_string()),
                     merged_away: Vec::new(),
+                    probe_src: None,
                 });
                 continue;
             }
@@ -14161,6 +14402,13 @@ fn plan_join_bound(
         let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
         let rels = vec![Some(tr.table.to_string()); descs.len()];
         let fnames = vec![None; descs.len()];
+        // the BARE table name, not `key`: `key` is the ALIAS when there
+        // is one, and fcopt refuses an aliased single-table FROM
+        let probe_src = Some(ProbeSrc {
+            rel,
+            table: tr.table.to_string(),
+            formats: formats.clone(),
+        });
         sides.push(JoinSide {
             key: tr.alias.unwrap_or(tr.table).to_string(),
             schema: tr.alias.is_none().then(|| relation_schema(db, tr.table)).flatten(),
@@ -14176,6 +14424,7 @@ fn plan_join_bound(
             rels,
             rel_alias: tr.alias.map(str::to_string),
             merged_away: Vec::new(),
+            probe_src,
         });
     }
     // every side must be distinguishable by qualifier
@@ -14230,11 +14479,22 @@ fn plan_join_bound(
             natural_shared.push(Vec::new());
             parse_on(on_s, visible)?
         };
+        let probe = build_join_probe(db, *kind, &on, &sides[k + 1]);
+        if trace_on() {
+            match &probe {
+                Some(p) => eprintln!(
+                    "[srv] join index: rel={} index={} col={}",
+                    p.src.rel, p.index_id, p.column
+                ),
+                None => eprintln!("[srv] join natural: side={}", sides[k + 1].key),
+            }
+        }
         parts.push(JoinPart {
             kind: *kind,
             src: sides[k + 1].src.clone(),
             width: sides[k + 1].descs.len(),
             on,
+            probe,
         });
     }
     // The merged names are hidden on the side that was joined IN: they
@@ -20104,6 +20364,36 @@ const GDS_FLOAT_OVERFLOW: i32 = 335544775;
 /// CAST that cannot convert (SQLSTATE 22018).
 const GDS_CONVERT_ERROR: i32 = 335544334;
 
+/// The engine does not put the offending text into the 22018 vector RAW:
+/// `CVT_conversion_error` renders it first, and every byte it will not
+/// print travels as `#x` + TWO LOWERCASE hex digits - so `N = '<TAB>2'`
+/// reaches the client as `#x092`, the escape followed by the literal
+/// '2'. Probed byte by byte against the live engine (both a literal and
+/// a column value, at the start, in the middle and at the end):
+///
+/// - 0x00-0x1f and 0x80-0xff escape; 0x20-0x7e travel raw - a CHAR's
+///   trailing blanks stay blanks - and so, alone above the band, does
+///   0x7f (DEL);
+/// - the escape is PER BYTE, not per character: a UTF-8 `é` prints
+///   `#xc3#xa9` and `€` prints `#xe2#x82#xac`;
+/// - the case is fixed lowercase (`#x0a`, `#xff`), the width fixed at
+///   two digits (`#x09`, never `#x9`).
+///
+/// It belongs to THIS vector only: the 23000 key value (print_key), the
+/// -204/-206 unknown-name arguments and the -104 token all carry the
+/// raw byte on the engine's own wire.
+fn conversion_error_arg(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for b in text.bytes() {
+        if (0x20..=0x7f).contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("#x{:02x}", b));
+        }
+    }
+    out
+}
+
 /// isc_sing_select_err - "multiple rows in singleton select" (SQLSTATE
 /// 21000): a scalar subquery that answers more than one row is an ERROR,
 /// not a first-row-wins.
@@ -20253,8 +20543,9 @@ fn eval_status_vector(w: &mut W, e: &EvalErr) {
             w.int(1) // isc_arg_gds
                 .int(GDS_CONVERT_ERROR);
             if let Some(text) = arg {
-                // isc_arg_string travels as an XDR counted string
-                w.int(2).bytes(text.as_bytes());
+                // isc_arg_string travels as an XDR counted string, and
+                // the engine escapes the unprintable bytes on the way in
+                w.int(2).bytes(conversion_error_arg(text).as_bytes());
             }
         }
         EvalErr::IntegerOverflow => {
@@ -34996,6 +35287,7 @@ mod tests {
                 kind,
                 src: RowSource::Rows(Vec::new()),
                 width: 2,
+                probe: None,
                 on: Predicate::dnf(vec![vec![Term::Const(on)]]),
             })
         };
@@ -35985,6 +36277,26 @@ mod tests {
         // row-DEPENDENT, like CmpConvErr - what hands every timing law
         // (dead conjunct, empty table, DML atomicity) to the machinery
         assert!(!term_row_independent(&t));
+    }
+
+    // The error keeps the RAW text above, because the ESCAPING happens
+    // where the argument enters the status vector - `#x` + two
+    // lowercase hex digits per unprintable BYTE, 0x20..=0x7f raw (DEL
+    // included), so a CHAR's padding survives and a multi-byte
+    // character escapes once per byte. Every cell probed.
+    #[test]
+    fn the_conversion_argument_escapes_by_byte() {
+        assert_eq!(conversion_error_arg("\t2"), "#x092");
+        assert_eq!(conversion_error_arg("2\t2"), "2#x092");
+        assert_eq!(conversion_error_arg("2\t"), "2#x09");
+        assert_eq!(conversion_error_arg("\n\r\x0b\x0c"), "#x0a#x0d#x0b#x0c");
+        assert_eq!(conversion_error_arg("\x01\x1f"), "#x01#x1f");
+        // the printable band travels untouched, DEL with it
+        assert_eq!(conversion_error_arg("abc   "), "abc   ");
+        assert_eq!(conversion_error_arg("!~\x7f"), "!~\x7f");
+        // per BYTE, not per character, and lowercase
+        assert_eq!(conversion_error_arg("\u{e9}9"), "#xc3#xa99");
+        assert_eq!(conversion_error_arg("\u{20ac}"), "#xe2#x82#xac");
     }
 
     // The raise TIMING rides the existing conjunct machinery: FALSE
@@ -37350,6 +37662,7 @@ mod tests {
                 fnames: vec![None; 3],
                 rel_alias: Some("E".into()),
                 merged_away: Vec::new(),
+                probe_src: None,
             },
             JoinSide {
                 key: "D".into(),
@@ -37365,6 +37678,7 @@ mod tests {
                 fnames: vec![None; 2],
                 rel_alias: Some("D".into()),
                 merged_away: Vec::new(),
+                probe_src: None,
             },
         ]
     }
@@ -37436,6 +37750,7 @@ mod tests {
             kind,
             src: RowSource::Rows(Vec::new()),
             width: 1,
+            probe: None,
             // ON acc[1] = new[0] - index 2 is the new side's only column
             on: Predicate::dnf(vec![vec![Term::ExprCond(Box::new(Cond2::Cmp(
                 Box::new(Expr::Col(1)),
@@ -37466,6 +37781,47 @@ mod tests {
         assert_eq!(out[1], vec![Value::Null, Value::Null, Value::Int(77)]);
     }
 
+    // The identity the INDEX PROBE stands on: for a LEFT step, calling
+    // join_step once per outer row and concatenating is the same answer,
+    // IN THE SAME ORDER, as calling it over the whole accumulated side.
+    // That is what lets the probe hand each outer row its OWN inner
+    // stream while the padding, the partnerless ON evaluation and the
+    // row order stay decided inside join_step. It is NOT true of RIGHT
+    // or FULL, whose mirror pass is over the whole inner stream - which
+    // is a second reason the probe is LEFT-only.
+    #[test]
+    fn join_step_per_outer_row_concatenates_to_the_whole_pass_for_left() {
+        let part = JoinPart {
+            kind: JoinKind::Left,
+            src: RowSource::Rows(Vec::new()),
+            width: 1,
+            probe: None,
+            on: Predicate::dnf(vec![vec![Term::ExprCond(Box::new(Cond2::Cmp(
+                Box::new(Expr::Col(1)),
+                Cmp::Eq,
+                Box::new(Expr::Col(2)),
+            )))]]),
+        };
+        let acc = vec![
+            vec![Value::Int(1), Value::Int(10)],
+            vec![Value::Int(2), Value::Int(99)], // no partner: padded
+            vec![Value::Int(3), Value::Null],    // NULL key: never joins
+            vec![Value::Int(4), Value::Int(10)], // two partners
+        ];
+        let rrows = vec![vec![Value::Int(10)], vec![Value::Int(77)], vec![Value::Int(10)]];
+        let whole = join_step(acc.clone(), 2, &rrows, &part, &None).unwrap();
+        let mut piecewise = Vec::new();
+        for row in acc {
+            piecewise.extend(join_step(vec![row], 2, &rrows, &part, &None).unwrap());
+        }
+        assert_eq!(whole, piecewise);
+        // ... and the per-row form still pads the partnerless rows, and
+        // still emits BOTH partners of a duplicated inner key
+        assert_eq!(piecewise.len(), 6);
+        assert_eq!(piecewise[2], vec![Value::Int(2), Value::Int(99), Value::Null]);
+        assert_eq!(piecewise[3], vec![Value::Int(3), Value::Null, Value::Null]);
+    }
+
     // An EMPTY inner stream does not silence the ON condition: the
     // engine walks its OUTER stream and evaluates the ON per outer row,
     // so a value-gated raiser (`ON A.ID = B.ID AND A.N = 'x'`) raises
@@ -37481,6 +37837,7 @@ mod tests {
             kind,
             src: RowSource::Rows(Vec::new()),
             width: 1,
+            probe: None,
             on: Predicate::dnf(vec![vec![
                 Term::ExprCond(Box::new(Cond2::Cmp(
                     Box::new(Expr::Col(1)),
@@ -37515,6 +37872,7 @@ mod tests {
             kind: JoinKind::Left,
             src: RowSource::Rows(Vec::new()),
             width: 1,
+            probe: None,
             on: Predicate::dnf(vec![vec![
                 Term::ExprCond(Box::new(Cond2::Cmp(
                     Box::new(Expr::Col(0)),
@@ -37532,6 +37890,7 @@ mod tests {
             kind: JoinKind::Right,
             src: RowSource::Rows(Vec::new()),
             width: 1,
+            probe: None,
             on: Predicate::dnf(vec![vec![Term::CmpConvErr(2, Cmp::Eq, "x".into())]]),
         };
         let rrows = vec![vec![Value::Int(7)]];
@@ -37551,6 +37910,7 @@ mod tests {
             kind,
             src: RowSource::Rows(Vec::new()),
             width: 1,
+            probe: None,
             on: Predicate::dnf(vec![vec![
                 Term::ExprCond(Box::new(Cond2::Cmp(
                     Box::new(Expr::Col(1)),

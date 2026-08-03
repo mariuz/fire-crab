@@ -37,6 +37,10 @@
 #   6. Capital-X hex ('0X10') reads UNINITIALIZED MEMORY in the live
 #      engine (~1.9e25, different per string): only the equality-miss
 #      (`= 16` answers [], no raise) is pinned, never the ordering.
+#   7. The 22018 ARGUMENT is ESCAPED on the way into the status vector:
+#      `#x` + two lowercase hex digits for every byte outside
+#      0x20..0x7f, PER BYTE - and no other vector escapes (the 23000
+#      key value carries the raw one).
 #
 #   qa/serve-real-textcolcmp.sh [port]
 set -u
@@ -63,7 +67,10 @@ ran=0
 # TDBL text-vs-DOUBLE-column; TIDX carries an INDEX on S; TB the
 # boolean spellings (with a NULL row); TCH a CHAR(6) whose raise
 # argument must keep its padding; TG one grammar spelling per PK; TBIG
-# the two i64-rim BIGINT spellings.
+# the two i64-rim BIGINT spellings. TCTL is the unprintable-byte table -
+# one CLEAN row here, its control-byte row seeded through both servers
+# below (no shell heredoc carries those bytes into isql intact) - and
+# TCTLK the text PRIMARY KEY whose 23000 vector must NOT escape.
 make_db() {
     rm -f "$1"
     "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
@@ -81,6 +88,10 @@ CREATE TABLE TCH    (ID INTEGER NOT NULL PRIMARY KEY, C CHAR(6));
 CREATE TABLE TDBL   (ID INTEGER NOT NULL PRIMARY KEY, S VARCHAR(10), D DOUBLE PRECISION);
 CREATE TABLE TG     (ID INTEGER NOT NULL PRIMARY KEY, S VARCHAR(45));
 CREATE TABLE TBIG   (ID INTEGER NOT NULL PRIMARY KEY, S VARCHAR(25));
+CREATE TABLE TCTL   (ID INTEGER NOT NULL PRIMARY KEY, N INTEGER,
+                     S VARCHAR(20), C CHAR(6),
+                     U VARCHAR(20) CHARACTER SET UTF8);
+CREATE TABLE TCTLK  (S VARCHAR(20) NOT NULL PRIMARY KEY);
 COMMIT;
 INSERT INTO TCLEAN VALUES (1, '5');
 INSERT INTO TCLEAN VALUES (2, ' 5');
@@ -155,6 +166,7 @@ INSERT INTO TG VALUES (27, '1.00000000000000000000000000000000000001');
 INSERT INTO TG VALUES (28, '0X10');
 INSERT INTO TBIG VALUES (1, '9223372036854775806');
 INSERT INTO TBIG VALUES (2, '9223372036854775807');
+INSERT INTO TCTL VALUES (1, 2, '5', '5', '5');
 COMMIT;
 EOF
     chmod 666 "$1"
@@ -187,7 +199,9 @@ query() { # <sql> <json args> <port> <db>
                     user:"SYSDBA",password:"masterkey"},(e,db)=>{
             if(e){console.log("CONN_ERR");process.exit(0);}
             db.query(process.env.FC_Q,JSON.parse(process.env.FC_A),(e2,r)=>{
-              if(e2){console.log("ERR "+(e2.message||"").split("\n")[0].slice(0,80));db.detach();process.exit(0);}
+              // 200, not 80: the 23000 key value sits at column 108 of
+              // its message, and its RAW byte is under test below
+              if(e2){console.log("ERR "+(e2.message||"").split("\n")[0].slice(0,200));db.detach();process.exit(0);}
               console.log(JSON.stringify(Array.isArray(r)?r:(r?[r]:[])));
               db.detach();process.exit(0);});});' 2>/dev/null)
         case "$r" in
@@ -348,6 +362,57 @@ both "CHAR raise argument is padded 'abc   '" "SELECT ID FROM TCH WHERE C = 5 OR
 both "'0X10' = 16 answers [] with no raise" \
      "SELECT ID FROM TG WHERE ID = 28 AND S = 16"
 
+# --- 15. the 22018 ARGUMENT escapes the unprintable bytes --------------
+# The engine renders the offending text before it reaches the status
+# vector (CVT_conversion_error): every byte it will not print travels as
+# `#x` + TWO LOWERCASE hex digits, so `N = '<TAB>2'` names "#x092" - the
+# escape, then the literal '2'. Probed byte by byte against the live
+# engine, literal side and column side, at the start, in the middle and
+# at the end of the text:
+#   - 0x00-0x1f and 0x80-0xff escape; 0x20-0x7e travel raw (a CHAR's
+#     padding stays blanks) and so does 0x7f (DEL), alone above the band;
+#   - the escape is PER BYTE, not per character: a UTF-8 'e' with an
+#     acute prints "#xc3#xa9", the euro sign "#xe2#x82#xac";
+#   - and it belongs to THIS vector ONLY - the 23000 key value
+#     (print_key) carries the raw byte on the engine's own wire.
+#
+# EXCLUDED: a RAW high byte in the SQL text (0x80-0xff outside UTF-8) -
+# fc decodes the statement text as UTF-8 and replaces it with U+FFFD, so
+# its argument reads "#xef#xbf#xbd" where the engine's reads "#x80"; a
+# text-DECODING residual, not an escaping one. And NUL, which no shell
+# variable carries.
+TAB=$'\t'; LF=$'\n'; CR=$'\r'; VT=$'\v'; FF=$'\f'
+SOH=$'\001'; US=$'\037'; ESC=$'\033'; DEL=$'\177'
+EACUTE=$'\xc3\xa9'; EURO=$'\xe2\x82\xac'
+lit() { both "$1" "SELECT ID FROM TCTL WHERE N = '$2'"; }
+both "the control-byte row, seeded through both servers" \
+     "INSERT INTO TCTL VALUES (2, NULL, '${TAB}x', '${TAB}a', '${EACUTE}9')"
+lit "a TAB before the digit is #x09" "${TAB}2"
+lit "... in the MIDDLE of the text" "2${TAB}2"
+lit "... and at the END of it" "2${TAB}"
+lit "LF" "${LF}2"
+lit "CR" "${CR}2"
+lit "VT" "${VT}2"
+lit "FF" "${FF}2"
+lit "0x01, the bottom of the escaped band" "${SOH}2"
+lit "0x1f, the top of it" "${US}2"
+lit "ESC 0x1b" "${ESC}2"
+lit "two escapes run together" "${TAB}${TAB}2"
+lit "DEL 0x7f travels RAW" "${DEL}2"
+lit "'!' 0x21 raw, the printable band's floor" "!2"
+lit "'~' 0x7e raw, its ceiling" "~2"
+lit "an e-acute escapes PER BYTE" "${EACUTE}2"
+lit "the euro sign, three bytes, three escapes" "${EURO}2"
+both "a TAB in the COLUMN value, mid-scan" "SELECT ID FROM TCTL WHERE S = 5"
+both "... a CHAR column keeps its padding beside it" \
+     "SELECT ID FROM TCTL WHERE C = 5"
+both "... a UTF8 column escapes per byte too" "SELECT ID FROM TCTL WHERE U = 5"
+both "... and a numeric PARAMETER raises the same argument" \
+     "SELECT ID FROM TCTL WHERE S = ?" "[5]"
+both "the text key, seeded" "INSERT INTO TCTLK VALUES ('${TAB}a')"
+both "the 23000 key value does NOT escape it" \
+     "INSERT INTO TCTLK VALUES ('${TAB}a')"
+
 # --- 10. durable DML atomicity (LAST: it mutates) ----------------------
 both "raising UPDATE errors on both" "UPDATE TDIRTY SET S = '9' WHERE S = 5"
 both "raising DELETE errors on both" "DELETE FROM TDIRTY WHERE S = 5"
@@ -362,8 +427,8 @@ both "the class collapsed to '5' (fresh attachment)" \
      "SELECT ID, S FROM TCLEAN ORDER BY ID"
 
 # --- 14. the ran counter -----------------------------------------------
-if [ "$ran" -ne 92 ]; then
-    echo "DIFF $ran checks ran (expected exactly 92) - did one silently skip?"
+if [ "$ran" -ne 115 ]; then
+    echo "DIFF $ran checks ran (expected exactly 115) - did one silently skip?"
     fail=1
 fi
 

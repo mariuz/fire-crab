@@ -901,11 +901,50 @@ four; R7 is the removal of what they replaced.
   same argument on both sides. This was the loudest wrong-answer claim
   left on the open list, and it had been dead since that slice landed.
 
-- **A tab in a failing text literal renders RAW in the error argument**
-  — fc's conversion-error vector carries `"\t2"` where the engine
-  escapes the control byte as `#x09` (`"#x092"`). Cosmetic-adjacent
-  but it is a visible status-vector divergence on every driver that
-  prints the argument. Unclaimed.
+- ~~A tab in a failing text literal renders RAW in the error argument~~
+  — *closed, and the rule was PROBED before it was written*: the 22018
+  argument now goes through `conversion_error_arg` on its way into the
+  status vector, which is where the engine escapes it too
+  (`CVT_conversion_error`). `#x` + two LOWERCASE hex digits for every
+  byte outside `0x20..=0x7f`, PER BYTE — a UTF-8 `é` prints
+  `#xc3#xa9`, the euro sign `#xe2#x82#xac` — with `0x7f` (DEL) alone
+  above the printable band travelling raw and a CHAR's padding staying
+  blanks. It is THIS vector only: the 23000 key value (print_key), the
+  -204/-206 unknown-name arguments and the -104 token all carry the raw
+  byte on the engine's own wire, so nothing else moved.
+  `qa/serve-real-textcolcmp.sh` grew the whole matrix (115 checks, 17
+  of them DIFF against the pre-fix binary).
+
+- **A RAW high byte is lost before any error can name it** — the
+  escaping slice above measured it in the SQL TEXT: fc decodes the
+  statement as UTF-8 lossily, so a NONE-charset literal carrying `0x80`
+  (or `0xff`) reaches the argument as U+FFFD and prints `#xef#xbf#xbd`
+  where the engine prints `#x80`. **The refute pass then showed the
+  residual is WIDER than the note said: it reproduces from a STORED
+  COLUMN VALUE in a charset-NONE database (`WHERE S > 1` over a row
+  holding `0x80`), where no statement text is involved at all** — so
+  the lossy step is the byte→String decode of the RECORD IMAGE as much
+  as of the SQL. A text-decoding defect, not an escaping one; it wants
+  the charset honoured on both paths. Unclaimed.
+
+- **A text→number conversion longer than 52 characters raises the wrong
+  CLASS** — measured beside the escaping matrix: at 53 source
+  characters the engine stops with 22001 (`string right truncation -
+  expected length 52, actual 53`) BEFORE its conversion error can be
+  built, while fire-crab has no cap and raises 22018 carrying the whole
+  string. The boundary is exact (52 agrees byte for byte, 53 diverges)
+  and it is CAST-specific — the comparison vector has no cap on either
+  side. Both sides fail, so no wrong write. Unclaimed.
+
+- **`CAST('<TAB>2' AS INTEGER)` answers 2 where the engine raises**
+  — found beside the escaping slice: the cast/literal grammar trims
+  Rust's whitespace class (TAB, LF, VT, FF, CR), the engine's skips
+  only 0x20, so every control byte the WHERE-literal path correctly
+  refuses converts silently through a CAST. A wrong ANSWER, not a
+  message. (The same probe found the parameter-bind path answering a
+  bare `Dynamic SQL Error` where the engine raises 22018 with the
+  escaped argument — `SELECT ... WHERE N = ?` bound `'<TAB>2'`.)
+  Unclaimed.
 
 ## The two programmes
 
@@ -1078,12 +1117,62 @@ plus *the subsystem is now on the path*.
       over plain relations with a single conjunctive equality and an
       ascending single-segment index `pick_for_terms` already keys —
       probe once per outer row, fall back to today's materialised inner
-      whenever the band cannot be built. Spec written and banked;
-      obligations are the W1 standard ones (candidates are not answers,
-      the fetched record must still carry the entry's key, dedup across
-      bands, a NULL inner key, and the padded row must still be emitted
-      — the last of which is why the partnerless-ON wrong answer above
-      had to be fixed BEFORE this slice could be gated).
+      whenever the band cannot be built. Obligations are the W1 standard
+      ones (candidates are not answers, the fetched record must still
+      carry the entry's key, dedup across bands, a NULL inner key, and
+      the padded row must still be emitted — the last of which is why
+      the partnerless-ON wrong answer above had to be fixed BEFORE this
+      slice could be gated).
+
+      *Slice A is DONE.* `JoinPart` now carries a `JoinProbe`;
+      `build_join_probe` gates on LEFT + plain relation + one DNF
+      branch + exactly one boundary column-equality + a bare-spellable
+      table and column + a single-band blessing from `choose_index`
+      over the reconstructed `SELECT 1 FROM <t> WHERE <c> = 0`, and the
+      `NestedLoopJoin` arm calls `join_step` with a ONE-ROW accumulated
+      side per outer row so the padding, the partnerless ON evaluation
+      and the row order stay decided where they were.
+      `qa/serve-real-leftjoinindex.sh` (114 checks) gates it, moved keys
+      and all; the LEFT CHAIN came free, because the probe is decided
+      per part off `sides[k+1].offset`, and the engine plans that chain
+      left-deep with both inners indexed. Measured on C 2000 ⋈ BIG
+      10000: 2.96 s → 0.39 s wall (engine 0.04 s). Two follow-ups
+      recorded: (a) `records_for` rebuilds `page_sequence_map` per
+      call, so a probe pays it once per outer row — hoist it behind the
+      same function when it starts to dominate; (b) a WHERE naming the
+      inner side still probes here, because this executor's tree is
+      fixed by the SQL and cannot reproduce the engine's driver flip —
+      the rows are the engine's, only the plan shape diverges, and it
+      diverged that way before the probe too.
+
+      *The refute pass (265 probes) confirmed the rows and falsified a
+      SENTENCE.* Moved keys, keys at every type rim, all-NULL inner
+      keys, MVCC, an index built after a DROP COLUMN, the join inside a
+      subquery, a CTE and a view body — the row sets held everywhere,
+      and the INNER/comma/self pins stayed unprobed. What did not hold
+      is W1's usual phrasing, "an index narrows what is READ, never
+      what is ANSWERED": an ON that RAISES is value-gated by the band,
+      so `ONEN LEFT JOIN RZ ON RZ.K = O.K AND RZ.T > 0` answers the
+      padded row under the probe and raises 22018 under `FC_NO_INDEX=1`.
+      **The probe is the ENGINE'S answer** — the engine indexes that
+      inner side too — so the invariant was reworded (…*and with it
+      WHICH ON EVALUATIONS HAPPEN*…) rather than the code changed. It
+      is the first place in W1 where the two retrieval paths of the
+      same server legitimately differ, and the FC_NO_INDEX twin is an
+      equivalence oracle only for non-raising ONs from here on.
+
+      *And it measured the gap, which is the shape of Slice B*: SEVEN
+      inner sides the engine INDEXES and this probe declines — a
+      DESCENDING index, `NUMERIC(9,2)`, `NUMERIC(38,0)`, a VIEW inner
+      (the engine flattens it), a DERIVED inner, an expression in the
+      ON (`RZ.K = O.K + 0`), an OR in the ON, and the engine's bitmap
+      AND of two indexes. Their rows agree today; with a raising ON
+      they do not, so each is a shape where identical SQL raises or
+      answers depending on whether fire-crab's heuristics bless the
+      inner. `pick_for_terms`, not the fcopt gatekeeper, is what
+      refuses most of them (fcopt blesses `NUMERIC(9,2)` happily) —
+      which is why the band is built through `choose_index` rather than
+      trusted from the plan text.
   - **A predicted bug that measurement did not confirm, recorded as
     such.** `ods::ddl::index_itype` maps every TEXT/VARYING column to
     `idx_string`, ignoring the charset, so a `CREATE INDEX` issued to
