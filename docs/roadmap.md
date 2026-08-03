@@ -863,29 +863,102 @@ four; R7 is the removal of what they replaced.
   `"PUBLIC"` from the statement's own spelling — the same fabrication
   in a different vector, left alone to keep the diff to this slice.
 
-- **The generator-durability class stays recorded** — the engine treats
-  generators as non-transactional: an advance survives ROLLBACK,
-  ROLLBACK TO SAVEPOINT, a PSQL `WHEN ANY` undo, statement undo, and a
-  statement that FAILED (a PK-violating identity INSERT moves GEN_ID
-  2→3 *before* raising 335544665), and `ALTER SEQUENCE ... RESTART
-  WITH n` / `SET GENERATOR ... TO n` survive a rollback verbatim — the
-  post-image wins, not the maximum. fire-crab's only undo is the
-  whole-image snapshot in `restore_db`, so every advance inside the
-  undone window retreats with the file. Matching it needs two
-  deliberate carve-outs fire-crab does not have — carrying the
-  generator vector FORWARD across a restore, and writing a drawn value
-  forward out of a failed statement's discarded work buffer — in a
-  design whose whole isolation story is "the image is the truth", and
-  they interact with DDL rollback. Its own slice, with its own gate;
-  the reasoning is pinned at `restore_db`. Unclaimed. **Re-measured,
-  and it is worse than "recorded": the divergence is READABLE. After
-  an identity INSERT that fails the PK check identically on both
-  sides, `SELECT GEN_ID(G1,0)` answers 0 here and 12 on the engine —
-  a wrong ANSWER to an ordinary SELECT, not merely a durability
-  footnote. (And a PSQL `WHEN ANY` block that draws then divides by
-  zero answers `X = 5` on the engine, leaving the generator at 5,
-  where fire-crab refuses the whole block.) It should be priced as a
-  wrong answer when the queue is next ordered.**
+- ~~The generator-durability class stays recorded~~ — *closed by the
+  generator-burn slice, and HALF THE ENTRY'S OWN LAW WAS WRONG*. The
+  advance half held on re-probe: `GEN_ID(g,n)`, `NEXT VALUE FOR g` and
+  an identity column's implicit draw are non-transactional and survive
+  ROLLBACK, ROLLBACK TO SAVEPOINT, statement undo and a statement that
+  FAILED (two dup-PK inserts drawing 7 then 5 leave the generator at 12
+  with the table empty). The *absolute set* half did not: `SET
+  GENERATOR ... TO n` and `ALTER SEQUENCE ... RESTART WITH n` are
+  ORDINARY TRANSACTIONAL WRITES that a ROLLBACK undoes. They looked
+  durable because the original probe ran through isql with **AUTODDL
+  ON**, which committed them before the rollback could reach them; with
+  `SET AUTODDL OFF` a rolled-back `RESTART WITH 3` leaves the generator
+  exactly where it was. **LAW: an isql probe of anything transactional
+  must set AUTODDL OFF first — the default silently commits the very
+  statement under test, and the entry that came out of it had fire-crab
+  aiming at a law the engine does not have.**
+
+  AND THE ABSOLUTE-SET HALF HAS A SHAPE, which the first cut of this
+  slice missed by one axis and which four wrong answers then made
+  visible. An absolute set does not merely "get rolled back": it leaves
+  a COMPENSATING UNDO RECORD naming the value it FOUND, and an undo
+  replays those records in reverse. So **undoing a window puts the
+  generator back to the value it held just before that window's FIRST
+  absolute set, and leaves the cell exactly where it is when the window
+  holds none.** Two cases pull against each other and only that rule
+  gets both: advance to 51, `RESTART WITH 3`, ROLLBACK leaves **51**
+  (the pre-set value), while `SET GENERATOR TO 3`, advance to 4,
+  ROLLBACK leaves **50** — the compensating record outlives the later
+  draw, so "replay the draws made inside the window" answers 4 and is
+  wrong. A record scoped to the TRANSACTION instead of to the window is
+  wrong the other way: `GEN_ID(G1,10)`, `SET GENERATOR G1 TO 3`, a
+  FAILED statement, COMMIT must leave **3** — the undone window is the
+  statement, which holds neither a draw nor a set — and it answered 10.
+
+  So the record is a STACK, `Database::gen_windows`, one `GenWindow` per
+  open undo window with window 0 the transaction: `draw` (name → the
+  value its last advance inside reached, written by `burn_generator`)
+  and `pre_set` (name → the value found by the window's first absolute
+  set, written by `mark_generator_set` from the `SetGenerator` and
+  `AlterColumnRestart` arms). `gen_window_push` opens one wherever a
+  snapshot is taken — every statement, `insert_select`'s all-or-nothing
+  loop, a PSQL body, a savepoint mark, the transaction — and
+  `gen_window_unwind` closes it: an UNDONE window has its settled values
+  written over the restored image (`pre_set` first, `draw` where there
+  is none) and its compensating records die with it, a CLOSED one hands
+  both halves to its parent, `draw` overwriting and `pre_set` only where
+  the parent has none of its own. A statement is its own window, which
+  is what stops a later failure from dragging back a set nothing undid;
+  COMMIT clears the stack, because the commit made that image the new
+  base. The DDL guard falls out of writing BY NAME into the restored
+  image: a rolled-back `CREATE SEQUENCE` leaves no name, so its advance
+  dies with it, while a rolled-back `DROP SEQUENCE` puts the name back
+  and keeps the advance.
+
+  The readable divergences are gone with it: the rolled-back identity
+  INSERT that used to hand its id back (fire-crab wrote `ID 1` where
+  the engine writes `ID 3`) now writes the engine's row, and so does an
+  identity column whose `ALTER TABLE ... RESTART WITH 100` is followed
+  by a failed statement (`ID 100`, where the window-blind record wrote
+  `ID 3`). `qa/serve-real-gendurable.sh` — **263 checks, 44 DIFF
+  against the pre-slice binary** — reads every generator back **through
+  the engine out of fire-crab's own file** in every phase, and its
+  INTERACTION section crosses the three absolute-set spellings against
+  five kinds of undo against BOTH orderings of the set and the draw:
+  that last axis is the one the original 94 checks never varied, and it
+  is why they missed this.
+
+  *Still open, and none of them is the carve-out*: `INSERT ... SELECT`
+  with a `GEN_ID` in the SELECT LIST refuses at prepare (the succeeding
+  and the failing spellings alike — a select-list generator feeding a
+  write is not on the surface); a PSQL `WHEN ANY` block that draws then
+  divides by zero still refuses whole where the engine answers `X = 5`;
+  a PSQL assignment `V = GEN_ID(g,1)` inside a body that then RAISES
+  does not record its draw at all (probed: engine 4, fire-crab 3 —
+  pre-slice does the same, so the PSQL evaluator simply never reaches
+  `burn_generator`); and `UPDATE OR INSERT ... VALUES (1, GEN_ID(g,2))`
+  refuses whole, so nothing is drawn and the row that should collide
+  never lands (engine writes `(1,5)`, fire-crab `(1,9)` — also
+  pre-slice). All four are the PSQL/insert-select/upsert surface.
+
+- **The compensating undo of an absolute set is DEFERRED in the engine
+  and EAGER here** — a divergence this slice's probing found and did
+  NOT introduce (identical on the pre-slice binary). The engine runs an
+  absolute set's compensating record at TRANSACTION END: read the
+  generator between a `ROLLBACK TO SAVEPOINT` that undid the set and
+  the commit, and the engine still answers the *un-compensated* value.
+  `SAVEPOINT SP; ALTER TABLE AID ALTER COLUMN ID RESTART WITH 100;
+  ROLLBACK TO SP; INSERT INTO AID (V) VALUES (3);` writes `ID 100` on
+  the engine and `ID 2` here; the same shape through `ALTER SEQUENCE`
+  answers 101 against 51. Put a `COMMIT` after the `ROLLBACK TO SP` and
+  both sides agree again, which is why every phase of
+  `qa/serve-real-gendurable.sh` — all of which read after a commit —
+  is green. Matching it needs the record to fire at transaction end
+  rather than at the savepoint undo, and to fire on COMMIT as well as
+  ROLLBACK when the window that held it was undone; that is a
+  visibility model, not a value model, and it is its own slice.
 
 - ~~Constraint errors surface as generic 42000 `Dynamic SQL Error`,
   never 23000 with the constraint/key detail~~ — *stale, closed by the
@@ -928,22 +1001,95 @@ four; R7 is the removal of what they replaced.
   the charset honoured on both paths. Unclaimed.
 
 - **A text→number conversion longer than 52 characters raises the wrong
-  CLASS** — measured beside the escaping matrix: at 53 source
-  characters the engine stops with 22001 (`string right truncation -
-  expected length 52, actual 53`) BEFORE its conversion error can be
-  built, while fire-crab has no cap and raises 22018 carrying the whole
-  string. The boundary is exact (52 agrees byte for byte, 53 diverges)
-  and it is CAST-specific — the comparison vector has no cap on either
-  side. Both sides fail, so no wrong write. Unclaimed.
+  CLASS** — measured beside the escaping matrix, and the CAST slice
+  below then PROBED THE RULE OUT, which corrected two thirds of this
+  note. The cap is a temporary BUFFER the engine moves the source into
+  before `cvt_decompose` reads it, so:
+  **it depends on the TARGET's width** — 22 bytes for a 16-bit target
+  (`SMALLINT`, `NUMERIC`/`DECIMAL` precision ≤ 4: probed 22 converts,
+  23 raises), 52 for a 32- or 64-bit one (`INTEGER`, `BIGINT`,
+  precision 5..18), and **no cap at all** past that (`NUMERIC(19,0)`
+  and up — the INT128 path — `FLOAT`, `DOUBLE PRECISION`, `BOOLEAN`,
+  `DATE`, `TIMESTAMP` all raise 22018 carrying the whole 53-character
+  string, exactly as fire-crab does);
+  **it counts BYTES, not characters** (a UTF8 source of 53 characters
+  and 54 bytes reports `actual 54`);
+  **TRAILING BLANKS are forgiven first** — `CAST(CAST('2' AS CHAR(53))
+  AS INTEGER)` is 2, and a VARCHAR holding `'2'` + 60 spaces converts,
+  while 52 spaces THEN `'2'` (no trailing blank to drop) raises;
+  **it fires BEFORE the grammar**, so a perfectly valid 53-character
+  `'000…02'` raises it too;
+  and **it is NOT CAST-specific** — `INSERT INTO T (N) VALUES
+  ('<53 chars>')` raises the same 22001, so it belongs to the whole
+  `CVT_move` grammar, CAST and STORE; only the COMPARISON vector
+  (`cmp_numeric_string`) has no cap on either side, which is the third
+  place those two grammars part company.
+  Still unclaimed, and the reason is now precise rather than vague:
+  fire-crab's `CastTarget::Int { wide }` does not distinguish SMALLINT
+  from INTEGER, so it cannot spell the 22-byte cap — and the same gap
+  already shows as a wrong ANSWER one step further on
+  (`CAST('99999' AS SMALLINT)` answers 99999 where the engine raises
+  *numeric value is out of range*, and `CAST('3000000000' AS INTEGER)`
+  likewise). Give `CastTarget` its width first; the cap and the range
+  check then fall out of the same field.
 
-- **`CAST('<TAB>2' AS INTEGER)` answers 2 where the engine raises**
-  — found beside the escaping slice: the cast/literal grammar trims
-  Rust's whitespace class (TAB, LF, VT, FF, CR), the engine's skips
-  only 0x20, so every control byte the WHERE-literal path correctly
-  refuses converts silently through a CAST. A wrong ANSWER, not a
-  message. (The same probe found the parameter-bind path answering a
-  bare `Dynamic SQL Error` where the engine raises 22018 with the
-  escaped argument — `SELECT ... WHERE N = ?` bound `'<TAB>2'`.)
+- ~~`CAST('<TAB>2' AS INTEGER)` answers 2 where the engine raises~~
+  — *closed*. Three call sites were trimming Rust's `White_Space`
+  class where the engine's `cvt_decompose` skips **0x20 and nothing
+  else**: `decimal_parts` (the CAST to an exact scaled target), the
+  CAST-to-integer arm's `parse::<i64>`, and the CAST-to-approximate
+  arm's `parse::<f64>`. All three take `trim_matches(' ')` now, and
+  the whole matrix agrees — TAB, LF, VT, FF, CR **and** the Unicode
+  blanks a `char`-wise trim also ate (NBSP `#xc2#xa0`, EM SPACE,
+  IDEOGRAPHIC SPACE, NEL), at the START and at the END, two adjacent,
+  across SMALLINT / INTEGER / BIGINT / NUMERIC(9,2) / DOUBLE
+  PRECISION, from a stored COLUMN and from a statement LITERAL.
+  The three grammars in this server are now distinct and each right on
+  its own vector, which the gate pins with ONE value: `'1 0'` compares
+  equal to 10 and casts to a conversion error, in adjacent checks.
+  The store and parameter grammars were already 0x20-only and did not
+  move. `qa/serve-real-textcolcmp.sh` grew section 16 (205 checks, 70
+  of them DIFF against the pre-fix binary).
+  A fourth site went with them: `approx_literal`, the literal side of
+  a comparison against a DOUBLE column, had `DP = '<TAB>2'` ANSWERING
+  the 2 row. It refuses at prepare now instead of answering wrongly —
+  the engine raises 22018 there, so this is a message residual, not a
+  wrong answer: an approximate column has no `Term::CmpConvErr` twin
+  (`pick_for_terms` only routes `ColKind::Int` through
+  `literal_num_rhs`), and giving it one is the slice that would close
+  it.
+  One twin site was left ALONE on purpose: `crates/exe`'s BLR cast
+  (`blr_cast` to `DT_SHORT`/`DT_LONG`/`DT_INT64`) trims the same wrong
+  class, and renders its 22018 argument from the TRIMMED text rather
+  than the original besides. It is reachable only through the stored
+  procedure path (`fire_crab_exe::bind_and_execute`), which no gate
+  drives, so there is no oracle for it yet; a procedure-body CAST gate
+  is what should carry that change.
+
+- **The parameter-bind and STORE vectors refuse with a bare `Dynamic
+  SQL Error` where the engine raises 22018 with the argument** — the
+  CAST slice above chased this and it is A DIFFERENT MACHINE, not the
+  whitespace grammar: the grammar there is already 0x20-only and
+  correctly REFUSES `'<TAB>2'`; what is missing is the error. And it
+  is not TAB-specific — `SELECT … WHERE N = ?` bound `'abc'`, and
+  `INSERT INTO T (N) VALUES ('abc')`, answer the same bare message.
+  Both sides fail, so no wrong write; it is the prepare-time refusal
+  path that needs the engine's status vector, which the per-row
+  `Term::CmpConvErr` path already builds. Unclaimed.
+
+- **`CAST(? AS INTEGER)` refuses outright**, whatever is bound
+  (probed with `'2'` and with the integer 2) — the cast target is not
+  applied to a parameter slot at all. Unclaimed.
+
+- **`CAST('2.5' AS INTEGER)` raises where the engine answers 3** — the
+  opposite failure to the whitespace one, in the same arm: the
+  integer CAST reads its text with `parse::<i64>`, which is NARROWER
+  than the engine's grammar, so every fractional or e-notation
+  spelling the engine ROUNDS into an integer (`'2.5'` → 3, `'1e3'` →
+  1000) is a conversion error here. A wrong refusal, not a wrong
+  answer. `decimal_parts` + `round_scaled_to_int` — already the
+  NUMERIC arm's pair — is the shape of the fix for the fractions, and
+  `text_number` (which does read an exponent) for the rest.
   Unclaimed.
 
 ## The two programmes

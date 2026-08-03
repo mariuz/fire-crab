@@ -15,6 +15,18 @@
 #   qa/serve-real-selectexpr.sh [port]
 #
 # Builds its own scratch database.
+#
+# The last block is here because the select-list ITEM PARSER, not the
+# charset layer, is what a multi-byte expression used to break: the item
+# was tested for the DECODE builtin by slicing its first six BYTES, and
+# `'ABCDe-acute' || 'x'` has a character straddling byte 6. Slicing a
+# Rust str off a character boundary PANICS, and a panic in a connection
+# thread drops the client (libfbclient has been seen to segfault on it).
+# So those checks run the once-panicking statements as ordinary
+# differentials, keep a genuine DECODE call as the control that the
+# recognition still works, and end by asking a FRESH attachment to
+# answer - the failure mode was a dropped connection, so liveness after
+# the fact is the check that matters most.
 
 set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
@@ -33,11 +45,22 @@ rm -f "$SRC" "$CLEAN" "$WORK"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF || { echo "FAIL scratch db creation"; exit 1; }
 CREATE DATABASE '$SRC' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE E (ID INTEGER NOT NULL, A INTEGER, B INTEGER, S VARCHAR(10), N NUMERIC(9,2), M NUMERIC(9,4), K BIGINT, U NUMERIC(10,2), I INT128);
+-- a table of its own for the multi-byte block: table E's rows are
+-- positional and adding a column to them would rewrite every INSERT
+CREATE TABLE MB (ID INTEGER NOT NULL, D INTEGER, S8 VARCHAR(10) CHARACTER SET UTF8);
 COMMIT;
 INSERT INTO E VALUES (1, 10, 3, 'x', 12.50, 1.2345, 4000000000, 9.75, 900000000000);
 INSERT INTO E VALUES (2, 5, 100, 'y', -3.25, 4.0000, 5, -2.50, 7);
 INSERT INTO E VALUES (3, NULL, 7, 'z', NULL, 2.0000, NULL, NULL, NULL);
 INSERT INTO E VALUES (4, -8, 2, 'w', 13.50, 0.5000, 3100000000, 100.00, 123456);
+COMMIT;
+EOF
+# the multi-byte rows go in over a UTF8 connection: a NONE attachment
+# would hand the engine bytes it is entitled to reject on the way in
+"$ISQL" -q -b -ch UTF8 -user "$U" -pas "$P" "$SRC" <<EOF || { echo "FAIL multi-byte rows"; exit 1; }
+INSERT INTO MB VALUES (1, 1, 'ABCDé');
+INSERT INTO MB VALUES (2, 2, 'ăîșță');
+INSERT INTO MB VALUES (3, 3, 'plain');
 COMMIT;
 EOF
 "$ISQL" -q -b -user "$U" -pas "$P" "$SRC" >/dev/null 2>&1 <<'EOF'
@@ -62,16 +85,27 @@ kill -0 $srv 2>/dev/null || {
 }
 
 strip() { sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
-run_isql() { "$ISQL" -q -b -user "$U" -pas "$P" "$WORK"; }
+# CH selects the ATTACHMENT character set for both sides at once, empty
+# for the default (NONE). An untyped literal takes the attachment's
+# charset, so 'ABCDé' is six octets to a NONE connection and five
+# characters to a UTF8 one - both sides must be asked the same way or
+# the compare measures the connection rather than the server.
+CH=""
+run_isql() {
+    if [ -n "$CH" ]; then "$ISQL" -q -b -ch "$CH" -user "$U" -pas "$P" "$WORK"
+    else "$ISQL" -q -b -user "$U" -pas "$P" "$WORK"; fi
+}
 
 # node: run <query>, print header (column titles) then each row, values
 # joined by '|', so both the column NAME and the values are compared
 node_once() {
-    FC_DB="$WORK" FC_PORT="$PORT" FC_Q="$1" timeout 15 node -e '
+    FC_DB="$WORK" FC_PORT="$PORT" FC_Q="$1" FC_CH="$CH" timeout 15 node -e '
       process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(1); });
       const F=require("node-firebird");
-      F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
-                user:"SYSDBA",password:"masterkey"},(e,db)=>{
+      const o={host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
+               user:"SYSDBA",password:"masterkey"};
+      if(process.env.FC_CH) o.charset=process.env.FC_CH;
+      F.attach(o,(e,db)=>{
         if(e){console.log("CONN_ERR");process.exit(1);}
         db.query(process.env.FC_Q,(e2,r)=>{
           if(e2){console.log("ERR "+(e2.message||"").split("\n")[0]);db.detach();process.exit(0);}
@@ -280,6 +314,60 @@ comparen "wide cast rank"               "SELECT ID, CAST(N AS BIGINT) * B FROM E
 comparen "narrow cast rank stays"       "SELECT ID, CAST(N AS INT) * B FROM E WHERE ID <> 2 ORDER BY ID"
 comparen "past-i64 value via text"      "SELECT ID, CAST(K * K AS VARCHAR(30)) AS T FROM E ORDER BY ID"
 comparen "negative wide via text"       "SELECT ID, CAST(-I * 3 AS VARCHAR(45)) AS T FROM E ORDER BY ID"
+
+# --- multi-byte select-list items: the item parser must not INDEX the
+#     item's bytes. Every check here is an ordinary differential; the
+#     first two are the statements that used to panic the connection
+#     thread (byte 6 of `'ABCDé' || 'x'` is inside the é), and the
+#     DECODE block is the control that the six-byte builtin test still
+#     recognises what it is for. Run over a UTF8 attachment on BOTH
+#     sides so the literals mean characters, not octets.
+CH=UTF8
+compare  "mb concat literal"      "SELECT 'ABCDé' || 'x' AS X FROM RDB\$DATABASE"
+compare  "mb concat unaliased"    "SELECT 'ABCDé' || 'x' FROM RDB\$DATABASE"
+compare  "mb concat two-char lit" "SELECT 'é' || 'x' AS X FROM RDB\$DATABASE"
+compare  "mb concat column"       "SELECT ID, S8 || '!' AS X FROM MB ORDER BY ID"
+compare  "mb upper/lower literal" "SELECT UPPER('ABCDé') AS U, LOWER('ABCDÉ') AS L FROM RDB\$DATABASE"
+compare  "mb upper/lower column"  "SELECT ID, UPPER(S8) AS U, LOWER(S8) AS L FROM MB ORDER BY ID"
+compare  "mb lengths literal"     "SELECT CHAR_LENGTH('ABCDé') AS C, OCTET_LENGTH('ABCDé') AS O FROM RDB\$DATABASE"
+compare  "mb lengths column"      "SELECT ID, CHAR_LENGTH(S8) AS C, OCTET_LENGTH(S8) AS O FROM MB ORDER BY ID"
+compare  "mb substring literal"   "SELECT SUBSTRING('ABCDéfg' FROM 4 FOR 3) AS X FROM RDB\$DATABASE"
+compare  "mb substring column"    "SELECT ID, SUBSTRING(S8 FROM 2 FOR 2) AS X FROM MB ORDER BY ID"
+# the control: DECODE is still recognised (un-aliased it keeps its own
+# name even though it desugars to CASE), including with multi-byte
+# results and a multi-byte subject, and `DECODE(...) + 1` is still an ADD
+compare  "DECODE named DECODE"    "SELECT ID, DECODE(D, 1, 'a', 2, 'b', 'z') FROM MB ORDER BY ID"
+compare  "DECODE mb results"      "SELECT ID, DECODE(D, 1, 'ă', 2, 'é', 'ș') FROM MB ORDER BY ID"
+compare  "DECODE mb subject"      "SELECT ID, DECODE(S8, 'ABCDé', 'hit', 'miss') AS X FROM MB ORDER BY ID"
+compare  "DECODE plus one is ADD" "SELECT ID, DECODE(D, 1, 10, 20) + 1 FROM MB ORDER BY ID"
+# a non-breaking space is two bytes and lands the 7th byte mid-character
+# too; here BOTH sides refuse - the engine with a conversion error, and
+# fire-crab because ABS over text is not on its surface. What is under
+# test is that the refusal is an ERROR and not a dead connection.
+NBSP=$'\xc2\xa0'
+mbrej() { # <label> <select>
+    fc=$(node_run "$2")
+    is=$("$ISQL" -q -b -ch UTF8 -user "$U" -pas "$P" "$WORK" 2>&1 <<EOF
+$2;
+EOF
+)
+    if printf '%s' "$fc" | grep -qi "ERR" && ! printf '%s' "$fc" | grep -q "CONN_ERR" \
+       && printf '%s' "$is" | grep -qi "conversion error"; then
+        echo "OK   $1 (both reject, connection kept)"
+    else
+        echo "DIFF $1"
+        echo "     isql: $(echo $is)"
+        echo "     fc:   $(echo $fc)"
+        fail=1
+    fi
+}
+mbrej "mb ABS over NBSP text" "SELECT ABS('${NBSP}2') AS X FROM RDB\$DATABASE"
+# liveness: the failure mode was a PANICKED CONNECTION THREAD, so a fresh
+# attachment answering after all of the above is the check that counts
+kill -0 $srv 2>/dev/null || { echo "FAIL fcwire died on a multi-byte item"; exit 1; }
+compare  "alive after multi-byte" "SELECT 1 AS ALIVE FROM RDB\$DATABASE"
+grep -q 'panicked' /tmp/fc-serve-selexpr.log && { echo "FAIL a connection thread panicked"; fail=1; }
+CH=""
 
 # --- runtime errors: BOTH the engine and fire-crab reject the row rather
 #     than answering. Divide-by-zero is the arithmetic exception (SQLSTATE

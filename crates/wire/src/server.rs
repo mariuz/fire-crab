@@ -493,6 +493,200 @@ struct Database {
     /// ODS version from the header (for op_info_database)
     ods_major: u16,
     ods_minor: u16,
+    /// One entry per open UNDO WINDOW, outermost (the transaction)
+    /// first, in step with the image snapshots that undo them - see
+    /// [GenWindow] for why a generator record has to be scoped that way
+    /// and not to the transaction.
+    gen_windows: Vec<GenWindow>,
+}
+
+/// What one undo window did to the generators inside it.
+///
+/// ENGINE LAW, probed against a live engine with `SET AUTODDL OFF` and
+/// the two kinds of write kept apart:
+///
+///  * A DRAW - `GEN_ID(g,n)`, `NEXT VALUE FOR g`, an identity column's
+///    implicit bump - is NON-TRANSACTIONAL and pushes NO undo record.
+///    It survives ROLLBACK, ROLLBACK TO SAVEPOINT and a statement that
+///    FAILED (two dup-PK inserts drawing 7 then 5 leave the generator
+///    at 12 with the table empty). The LAST drawn value wins, not the
+///    maximum: a negative step is a draw too (10, then `GEN_ID(g,-4)`,
+///    then ROLLBACK leaves 6).
+///  * An ABSOLUTE SET - `SET GENERATOR ... TO n`, `ALTER SEQUENCE ...
+///    RESTART WITH n`, `ALTER TABLE ... ALTER COLUMN ... RESTART WITH
+///    n` - writes the same cell but pushes a COMPENSATING undo record
+///    "put back the value you found". It is undone by a rollback of the
+///    window it was made in, and by nothing else.
+///
+/// So undoing a window restores the cell to the value it held just
+/// before that window's FIRST absolute set, and leaves the cell exactly
+/// where it is when the window holds none. That single rule is what the
+/// probe matrix says, and it decides the two cases that pull against
+/// each other:
+///
+///   advance to 51, RESTART WITH 3, ROLLBACK          -> 51 (pre_set)
+///   SET GENERATOR TO 3, advance to 4, ROLLBACK       -> 50 (pre_set,
+///        NOT the later draw - the compensating record outlives it)
+///   advance to 10, SET GENERATOR TO 3, a FAILED
+///        statement, COMMIT                           -> 3 (the undone
+///        window is the statement, which holds neither)
+///
+/// fire-crab's only undo is the whole-image snapshot, which puts the
+/// cell back to the WINDOW START value, so both halves have to be
+/// written forward over the restored image by name.
+#[derive(Default)]
+struct GenWindow {
+    /// upper-cased name -> the value its LAST draw inside this window
+    /// reached
+    draw: std::collections::HashMap<String, i64>,
+    /// upper-cased name -> the value the cell held immediately before
+    /// this window's FIRST absolute set of it
+    pre_set: std::collections::HashMap<String, i64>,
+}
+
+/// Record that `name` was ADVANCED to `value` inside the innermost open
+/// window. See [GenWindow].
+fn burn_generator(db: &mut Database, name: &str, value: i64) {
+    if let Some(w) = db.gen_windows.last_mut() {
+        w.draw.insert(name.to_ascii_uppercase(), value);
+    }
+}
+
+/// Record that `name` is about to be written ABSOLUTELY, keeping the
+/// value it holds now as the compensating record for the innermost open
+/// window. Only the FIRST set in a window is kept: the engine replays
+/// its undo records in reverse, so the earliest one has the last word
+/// (probed: `SET GENERATOR TO 3` then `TO 7` then ROLLBACK leaves the
+/// value from before the 3). See [GenWindow].
+fn mark_generator_set(db: &mut Database, name: &str) {
+    let Some(current) = read_generator_value(db, name) else { return };
+    if let Some(w) = db.gen_windows.last_mut() {
+        w.pre_set.entry(name.to_ascii_uppercase()).or_insert(current);
+    }
+}
+
+/// Open a new undo window, in step with a snapshot being taken. Returns
+/// the depth to hand back to [gen_window_unwind].
+fn gen_window_push(database: &mut Option<Database>) -> usize {
+    let Some(db) = database.as_mut() else { return 0 };
+    db.gen_windows.push(GenWindow::default());
+    db.gen_windows.len() - 1
+}
+
+/// Close every window from `mark` inward, in step with a snapshot being
+/// put back (`undone`) or simply dropped.
+///
+/// When the windows were UNDONE their generator writes are settled here
+/// - [write_gen_window] decides the value - and their compensating
+/// records die with them: the set they would put back has just been put
+/// back, and an outer rollback must not do it a second time (probed:
+/// advance to 51, mark, SET TO 3, ROLLBACK TO the mark, ROLLBACK leaves
+/// 51, not the pre-transaction value).
+///
+/// When they were merely CLOSED - a RELEASE, a statement that succeeded
+/// - the parent inherits both halves: an inner draw is still a draw
+/// inside the parent's window, and an inner set is still pending its
+/// undo, as the FIRST one the parent saw if the parent has none of its
+/// own.
+fn gen_window_unwind(database: &mut Option<Database>, mark: usize, undone: bool) {
+    let Some(db) = database.as_mut() else { return };
+    if db.gen_windows.len() <= mark {
+        return;
+    }
+    let inner: Vec<GenWindow> = db.gen_windows.split_off(mark);
+    // ascending is chronological: an inner window is opened after every
+    // write its parent had already made, and is closed before the next
+    let mut merged = GenWindow::default();
+    for w in inner {
+        for (k, v) in w.draw {
+            merged.draw.insert(k, v);
+        }
+        for (k, v) in w.pre_set {
+            merged.pre_set.entry(k).or_insert(v);
+        }
+    }
+    if undone {
+        write_gen_window(db, &merged);
+    }
+    match db.gen_windows.last_mut() {
+        Some(parent) => {
+            for (k, v) in merged.draw {
+                parent.draw.insert(k, v);
+            }
+            if !undone {
+                for (k, v) in merged.pre_set {
+                    parent.pre_set.entry(k).or_insert(v);
+                }
+            }
+        }
+        // the transaction's own window was the one undone
+        None => db.gen_windows.push(GenWindow::default()),
+    }
+}
+
+/// Merge the window at `idx` into its parent without undoing it - what
+/// re-declaring a savepoint name does to the mark it displaces.
+fn gen_window_collapse(database: &mut Option<Database>, idx: usize) {
+    let Some(db) = database.as_mut() else { return };
+    if idx == 0 || idx >= db.gen_windows.len() {
+        return;
+    }
+    let w = db.gen_windows.remove(idx);
+    let parent = &mut db.gen_windows[idx - 1];
+    for (k, v) in w.draw {
+        parent.draw.insert(k, v);
+    }
+    for (k, v) in w.pre_set {
+        parent.pre_set.entry(k).or_insert(v);
+    }
+}
+
+/// Write an undone window's settled generator values over the image as
+/// it now stands, and flush.
+///
+/// THE DDL GUARD: a generator is only written if it still EXISTS in the
+/// restored image. A `CREATE SEQUENCE` that is rolled back must leave no
+/// generator behind (probed with AUTODDL OFF - the name is gone and
+/// `GEN_ID` on it raises), so a draw from a generator that the restore
+/// un-created is dropped with it. A rolled-back `DROP SEQUENCE` goes the
+/// other way: the generator is back in the image and keeps the draw
+/// (probed: 6, advance to 7, DROP, ROLLBACK leaves 7).
+fn write_gen_window(db: &mut Database, w: &GenWindow) {
+    let mut targets: Vec<(&String, i64)> =
+        w.pre_set.iter().map(|(k, v)| (k, *v)).collect();
+    targets.extend(
+        w.draw
+            .iter()
+            .filter(|(k, _)| !w.pre_set.contains_key(*k))
+            .map(|(k, v)| (k, *v)),
+    );
+    if targets.is_empty() {
+        return;
+    }
+    let mut work = db.bytes.clone();
+    let mut moved = false;
+    for (name, value) in targets {
+        if let Some(id) = generator_id(db, name) {
+            if write_generator_value(&mut work, db.page_size, id, value).is_ok() {
+                moved = true;
+            }
+        }
+    }
+    if moved {
+        db.bytes = work;
+        let _ = std::fs::write(&db.path, &db.bytes);
+    }
+}
+
+/// COMMIT (and the start of the next transaction) makes the current
+/// image the new base: every draw is already in it and every pending
+/// compensating record is now unreachable, so all of them stop being
+/// replayed.
+fn reset_gen_windows(database: &mut Option<Database>) {
+    if let Some(db) = database.as_mut() {
+        db.gen_windows.clear();
+        db.gen_windows.push(GenWindow::default());
+    }
 }
 
 /// Open the file the client named in op_attach, if it exists and looks
@@ -516,6 +710,7 @@ fn load_database(path: &str) -> Option<Database> {
         path: p.to_string(),
         ods_major: h.ods_major(),
         ods_minor: h.ods_minor,
+        gen_windows: vec![GenWindow::default()],
     })
 }
 
@@ -4428,7 +4623,9 @@ fn check_predicates(
     let mut out = Vec::new();
     for (src, trig) in sources {
         let t = src.trim_start();
-        if t.len() < 5 || !t[..5].eq_ignore_ascii_case("CHECK") {
+        // `get` and not `[..5]`: a stored source whose 6th byte is inside a
+        // character must be REFUSED, not panic the thread
+        if !t.get(..5).is_some_and(|h| h.eq_ignore_ascii_case("CHECK")) {
             return None; // a check trigger whose source is not CHECK (...)
         }
         let negated = format!("NOT {}", &t[5..]);
@@ -5144,8 +5341,10 @@ impl Overriding {
 /// valid as `COMPUTED (A+B)`.
 fn strip_kw<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
     let t = s.trim_start();
-    if t.len() > kw.len()
-        && t[..kw.len()].eq_ignore_ascii_case(kw)
+    // `get` and not `[..kw.len()]`: the keyword's length can land inside a
+    // character of a multi-byte column definition, and that would panic
+    if t.get(..kw.len()).is_some_and(|h| h.eq_ignore_ascii_case(kw))
+        && t.len() > kw.len()
         && t[kw.len()..].starts_with(|c: char| c.is_whitespace() || c == '(')
     {
         Some(&t[kw.len()..])
@@ -8400,7 +8599,9 @@ fn parse_grantee_list(s: &str) -> Option<Vec<String>> {
     for part in s.split(',') {
         let mut p = part.trim();
         for kw in ["USER ", "ROLE ", "GROUP "] {
-            if p.len() >= kw.len() && p[..kw.len()].eq_ignore_ascii_case(kw) {
+            // `get`: a quoted grantee of multi-byte letters can put the
+            // keyword's length inside a character (`"ÉÉÉÉ"`), which panics
+            if p.get(..kw.len()).is_some_and(|h| h.eq_ignore_ascii_case(kw)) {
                 p = p[kw.len()..].trim();
             }
         }
@@ -11680,7 +11881,28 @@ fn execute_dml(
     execute_dml_collecting(plan, database, args, ctx, None)
 }
 
+/// A DML statement that fails writes NOTHING - except the generator
+/// values it drew before it failed. The work buffer is discarded whole
+/// on the error path, which puts the generators back where the
+/// STATEMENT found them, so the statement is its own undo window: what
+/// it drew is written forward over the surviving image, and what it did
+/// NOT touch is left alone. That second half is the point - an absolute
+/// set made earlier in the transaction must survive a later statement's
+/// failure (see [GenWindow]).
 fn execute_dml_collecting(
+    plan: &Plan,
+    database: &mut Option<Database>,
+    args: &[WireParam],
+    ctx: &SessionCtx,
+    affected: Option<&mut Affected>,
+) -> Result<(i32, i32, i32), ExecErr> {
+    let mark = gen_window_push(database);
+    let out = execute_dml_collecting_inner(plan, database, args, ctx, affected);
+    gen_window_unwind(database, mark, out.is_err());
+    out
+}
+
+fn execute_dml_collecting_inner(
     plan: &Plan,
     database: &mut Option<Database>,
     args: &[WireParam],
@@ -11977,6 +12199,20 @@ fn execute_dml_collecting(
             (0, 0, 0)
         }
         Plan::AlterColumnRestart { table, column, with_value } => {
+            // RESTART WITH on an identity column is the same absolute
+            // set, reaching the backing RDB$<n> generator, and it leaves
+            // the same compensating record - see [GenWindow]
+            let want = column.trim().trim_matches('"');
+            let fid = relation_columns(&db.bytes, db.page_size, table)
+                .into_iter()
+                .find(|c| c.name.eq_ignore_ascii_case(want))
+                .map(|c| c.field_id as usize);
+            if let Some((_, gen, _)) = identity_columns(db, table)
+                .into_iter()
+                .find(|(id, _, _)| Some(*id) == fid)
+            {
+                mark_generator_set(db, &gen);
+            }
             fire_crab_ods::ddl::alter_column_restart(
                 &mut work,
                 db.page_size,
@@ -12034,6 +12270,11 @@ fn execute_dml_collecting(
                 let (id, incr) = generator_info(db, name).ok_or("no such generator")?;
                 let new_val =
                     fire_crab_ods::gen::bump(&mut work, db.page_size, id, step.unwrap_or(incr))?;
+                // the draw is BURNED here, before the row is validated:
+                // the engine's PK-violating insert has already moved the
+                // generator when it raises, and `work` is about to be
+                // thrown away on that path - see [burn_generator]
+                burn_generator(db, name, new_val);
                 let d = descs.get(*fid).ok_or("field beyond format")?;
                 match encode_wire_value(d, &WireParam::Int(new_val, 0))
                     .ok_or("generator value does not fit its column")?
@@ -12402,6 +12643,10 @@ fn execute_dml_collecting(
                 GenWrite::Absolute(n) => *n,
                 GenWrite::Restart(n) => n - incr,
             };
+            // an absolute set is TRANSACTIONAL: it leaves a compensating
+            // record naming the value it found, and a rollback of this
+            // window puts that value back - see [GenWindow]
+            mark_generator_set(db, name);
             write_generator_value(&mut work, db.page_size, id, value)?;
             (0, 0, 0)
         }
@@ -20771,6 +21016,9 @@ fn persist_generators(db: Option<&mut Database>, writes: &[(String, i64)]) {
     }
     if ok {
         db.bytes = work;
+        for (name, val) in writes {
+            burn_generator(db, name, *val);
+        }
         let _ = std::fs::write(&db.path, &db.bytes);
     }
 }
@@ -25027,8 +25275,14 @@ fn text_to_approx(n: TextNum, s: &str) -> Option<f64> {
 /// text to a numeric type starts from. Rejects anything that is not
 /// `[+-]?digits[.digits]?` so the caller can raise the engine's 22018
 /// rather than silently reading a prefix.
+///
+/// The blanks the engine's cvt grammar skips are 0x20 SPACES ONLY, so
+/// this cannot use `str::trim` (Unicode White_Space): a TAB, LF, VT, FF
+/// or CR at either end is a conversion error there, and trimming it
+/// here would answer a number where the engine raises 22018 (probed for
+/// every whitespace byte, both ends, every numeric target).
 fn decimal_parts(s: &str) -> Option<(i128, i8)> {
-    let t = s.trim();
+    let t = s.trim_matches(' ');
     let (neg, body) = match t.strip_prefix('-') {
         Some(r) => (true, r),
         None => (false, t.strip_prefix('+').unwrap_or(t)),
@@ -26112,8 +26366,11 @@ impl Expr {
                 match t {
                     // to the integer family: an integer is kept, a scaled
                     // numeric is rounded half away from zero, a string is
-                    // trimmed and parsed (a non-numeric string, or a value
-                    // that overflows i64, is the conversion error)
+                    // SPACE-trimmed and parsed (a non-numeric string, or a
+                    // value that overflows i64, is the conversion error).
+                    // 0x20 and nothing else: `str::trim` would take the
+                    // whole Unicode White_Space class, and the engine's
+                    // cvt grammar raises 22018 on every one of those bytes
                     CastTarget::Int { .. } => {
                         let narrow = |x: i128| match i64::try_from(x) {
                             Ok(n) => Ok(Value::Int(n)),
@@ -26127,7 +26384,7 @@ impl Expr {
                             Value::Int128(raw, scale) => {
                                 narrow(round_scaled_to_int(raw, scale))?
                             }
-                            Value::Text(s) => match s.trim().parse::<i64>() {
+                            Value::Text(s) => match s.trim_matches(' ').parse::<i64>() {
                                 Ok(n) => Value::Int(n),
                                 Err(_) => {
                                     return Err(EvalErr::ConversionError(Some(s)))
@@ -26212,12 +26469,14 @@ impl Expr {
                     }
                     // to the APPROXIMATE family: every exact shape
                     // converts, a string parses (a non-numeric one is
-                    // the engine's 22018)
+                    // the engine's 22018). SPACE-trimmed, like the exact
+                    // targets: cvt.cpp's double grammar skips 0x20 and
+                    // no other blank
                     CastTarget::Approx => match &v {
                         v if approx_of(v).is_some() => {
                             Value::Double(approx_of(v).unwrap_or(0.0))
                         }
-                        Value::Text(t) => match t.trim().parse::<f64>() {
+                        Value::Text(t) => match t.trim_matches(' ').parse::<f64>() {
                             Ok(d) => Value::Double(d),
                             Err(_) => return Err(EvalErr::ConversionError(Some(t.clone()))),
                         },
@@ -28260,7 +28519,10 @@ fn parse_projection(proj: &str) -> Option<Proj> {
                 // ... and ONLY when the whole item IS the call:
                 // `DECODE(...) + 1` is an ADD, which the engine names
                 // after its top operator like any other expression
-                t.len() > 6 && t[..6].eq_ignore_ascii_case("DECODE") && {
+                // `get` and not `[..6]`: the 7th BYTE of an expression like
+                // 'ABCDé' || 'x' is INSIDE a character, and slicing a str
+                // off a boundary panics the connection thread
+                t.get(..6).is_some_and(|h| h.eq_ignore_ascii_case("DECODE")) && {
                     let rest = t[6..].trim_start();
                     let at = t.len() - rest.len();
                     rest.starts_with('(')
@@ -30392,29 +30654,12 @@ fn snapshot_db(database: &Option<Database>) -> Option<Vec<u8>> {
 }
 
 /// Put a snapshot back and flush it, undoing everything a failed
-/// statement wrote.
-///
-/// RECORDED DIVERGENCE - generator durability. The engine treats
-/// generators as NON-TRANSACTIONAL: an advance survives ROLLBACK,
-/// ROLLBACK TO SAVEPOINT, a PSQL `WHEN ANY` savepoint undo, statement
-/// undo, and even a statement that FAILED (probed six ways - a
-/// PK-violating identity INSERT moves GEN_ID 2 -> 3 before raising
-/// 335544665, and `ALTER SEQUENCE ... RESTART WITH n` / `SET GENERATOR
-/// ... TO n` survive a ROLLBACK verbatim, not by maximum). fire-crab's
-/// only undo mechanism is this whole-image snapshot, so every generator
-/// advance inside the undone window RETREATS with the file.
-///
-/// Matching it needs a durability model fire-crab does not have: the
-/// generator vector would have to be carried FORWARD across a restore
-/// (harvest every id in RDB$GENERATORS from the post-image and replay
-/// it verbatim into the restored one), and separately a failed
-/// [Plan::Insert] would have to write its drawn value forward out of the
-/// discarded `work` buffer - the one place a forward write happens on an
-/// error path. Both are deliberate carve-outs in a design whose whole
-/// isolation story is "the image is the truth", and they interact with
-/// DDL rollback (a generator created inside the window, a generator page
-/// allocated inside it). Left unbuilt rather than half-built; it is its
-/// own slice, with its own gate.
+/// statement wrote - EXCEPT the generators, whose settled values the
+/// matching [gen_window_unwind] writes forward over the restored image.
+/// That carve-out is the one exception to this server's "the image is
+/// the truth" isolation story, and every restore therefore sits between
+/// a [gen_window_push] and its unwind: the pair is what makes the
+/// carve-out as wide as the engine's law and no wider. See [GenWindow].
 fn restore_db(database: &mut Option<Database>, snap: Option<Vec<u8>>) {
     if let (Some(db), Some(bytes)) = (database.as_mut(), snap) {
         db.bytes = bytes;
@@ -30439,10 +30684,10 @@ fn restore_db(database: &mut Option<Database>, snap: Option<Vec<u8>>) {
 /// vector (the engine names the first duplicate in SELECT-output
 /// order - probed P6 - which is exactly the row this loop stops at).
 ///
-/// DIVERGENCE, recorded: that snapshot restore also un-draws any
-/// generator value the failed rows consumed. The engine BURNS them - a
-/// generator advance survives ROLLBACK, statement undo and savepoint
-/// undo alike (probed six ways). See the note at [restore_db].
+/// The generator values the failed rows drew are NOT undone with them:
+/// the engine BURNS an advance through statement undo, savepoint undo
+/// and ROLLBACK alike, and [restore_db] carries them over the restored
+/// image. See [burn_generator].
 fn insert_select(
     table: &str,
     cols: &[String],
@@ -30463,6 +30708,7 @@ fn insert_select(
 
     // all-or-nothing: any row that fails undoes the ones before it
     let snap = snapshot_db(database);
+    let mark = gen_window_push(database);
     let mut n = 0i32;
     for row in rows {
         let step = (|| -> Result<(), ExecErr> {
@@ -30508,10 +30754,12 @@ fn insert_select(
         })();
         if let Err(e) = step {
             restore_db(database, snap);
+            gen_window_unwind(database, mark, true);
             return Err(e);
         }
         n += 1;
     }
+    gen_window_unwind(database, mark, false);
     Ok(n)
 }
 
@@ -30920,11 +31168,13 @@ fn run_procedure(
     // a body is ALL-OR-NOTHING: a statement that fails partway undoes
     // everything the body wrote before it, as the engine does
     let snap = snapshot_db(database);
+    let mark = gen_window_push(database);
     let mut steps = 0u32;
     let outcome = exec_psql_stmt(&body, &mut frame, &mut steps, database, ctx);
     if outcome.is_err() {
         restore_db(database, snap);
     }
+    gen_window_unwind(database, mark, outcome.is_err());
     match outcome {
         Ok(()) => {}
         Err(PsqlStop::Raise(ex)) => return Err(format!("exception {}", ex)),
@@ -30961,8 +31211,11 @@ fn declared_var_names(header: &str) -> Vec<String> {
     while let Some(d) = find_word(&up, "DECLARE", at) {
         let mut rest = header[d + "DECLARE".len()..].trim_start();
         // the VARIABLE keyword is optional
-        if rest.len() >= "VARIABLE".len()
-            && rest[.."VARIABLE".len()].eq_ignore_ascii_case("VARIABLE")
+        // `get`: `DECLARE "ÉÉÉÉ" INTEGER` puts byte 8 inside a character,
+        // and a str slice off a boundary panics rather than not matching
+        if rest
+            .get(.."VARIABLE".len())
+            .is_some_and(|h| h.eq_ignore_ascii_case("VARIABLE"))
         {
             rest = rest["VARIABLE".len()..].trim_start();
         }
@@ -31645,9 +31898,15 @@ fn bool_literal(e: &Expr) -> Option<Expr> {
 /// or does not parse, answers None and refuses the statement - the
 /// engine raises SQLSTATE 22018 there, and the one thing neither may do
 /// is compare the two as text.
+///
+/// SPACE-trimmed, not `str::trim`: the engine's double grammar skips
+/// 0x20 and no other blank, so `DP = '<TAB>2'` raises 22018 there -
+/// under Rust's whitespace class this ANSWERED the 2 row (probed).
+/// Refusing is not yet the engine's message; it is at least not a
+/// wrong answer.
 fn approx_literal(e: &Expr) -> Option<Expr> {
     match e {
-        Expr::Str(s) => s.trim().parse::<f64>().ok().map(Expr::Double),
+        Expr::Str(s) => s.trim_matches(' ').parse::<f64>().ok().map(Expr::Double),
         _ => None,
     }
 }
@@ -32984,14 +33243,24 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         if std::env::var("FC_SRV_TRACE").is_ok() {
                             eprintln!("[srv] savepoint op on {:?}, known={:?}", name, pos);
                         }
+                        // A MARK IS AN UNDO WINDOW, and the generator
+                        // record is stacked the same way the images are:
+                        // mark `i` owns generator window `i + 1`, window
+                        // 0 being the transaction's. See [GenWindow].
                         let ok = match kind {
                             SavepointOp::Set => {
                                 if let Some(i) = pos {
+                                    // re-declaring a name RELEASES the
+                                    // mark it displaces - its work, and
+                                    // its pending undo records, fold
+                                    // into the enclosing window
                                     savepoints.remove(i);
+                                    gen_window_collapse(&mut database, i + 1);
                                 }
                                 match snapshot_db(&database) {
                                     Some(img) => {
                                         savepoints.push((name.clone(), img));
+                                        gen_window_push(&mut database);
                                         true
                                     }
                                     None => false,
@@ -33002,6 +33271,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                     let img = savepoints[i].1.clone();
                                     savepoints.truncate(i + 1);
                                     restore_db(&mut database, Some(img));
+                                    gen_window_unwind(&mut database, i + 1, true);
+                                    // ROLLBACK TO keeps the mark, so the
+                                    // window it names reopens empty
+                                    gen_window_push(&mut database);
                                     true
                                 }
                                 None => false,
@@ -33009,6 +33282,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             SavepointOp::Release => match pos {
                                 Some(i) => {
                                     savepoints.truncate(i);
+                                    gen_window_unwind(&mut database, i + 1, false);
                                     true
                                 }
                                 None => false,
@@ -33027,11 +33301,16 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             let snap = tx_snapshot.take();
                             let undone = snap.is_some();
                             restore_db(&mut database, snap);
+                            // the transaction is window 0, so the whole
+                            // stack unwinds against the restored image
+                            gen_window_unwind(&mut database, 0, undone);
+                            reset_gen_windows(&mut database);
                             if std::env::var("FC_SRV_TRACE").is_ok() {
                                 eprintln!("[srv] ROLLBACK - transaction undone: {}", undone);
                             }
                         } else {
                             tx_snapshot = snapshot_db(&database);
+                            reset_gen_windows(&mut database);
                         }
                         last_dml = (0, 0, 0);
                         respond(&mut s, &mut enc, TX_HANDLE)?;
@@ -33561,17 +33840,25 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
             }
             x if x == OP_COMMIT || x == OP_ROLLBACK => {
                 read_int(&mut s, &mut dec)?; // tr
+                // ending the transaction discards every mark, the same
+                // way the `COMMIT`/`ROLLBACK` statements do - and the
+                // generator windows are stacked one per mark, so the two
+                // lists have to end together
+                savepoints.clear();
                 if x == OP_ROLLBACK {
                     // put the file back as the transaction found it
                     let snap = tx_snapshot.take();
                     let undone = snap.is_some();
                     restore_db(&mut database, snap);
+                    gen_window_unwind(&mut database, 0, undone);
+                    reset_gen_windows(&mut database);
                     if undone && std::env::var("FC_SRV_TRACE").is_ok() {
                         eprintln!("[srv] op_rollback - transaction undone");
                     }
                 } else {
                     // committed: this image is the new starting point
                     tx_snapshot = snapshot_db(&database);
+                    reset_gen_windows(&mut database);
                 }
                 respond(&mut s, &mut enc, 0)?;
             }
@@ -34975,6 +35262,7 @@ fn gen_id_increment(
     let mut work = db.bytes.clone();
     write_generator_value(&mut work, db.page_size, id, new_val)?;
     db.bytes = work;
+    burn_generator(db, name, new_val);
     std::fs::write(&db.path, &db.bytes).map_err(|e| e.to_string())?;
     Ok(new_val)
 }
@@ -35232,6 +35520,7 @@ mod tests {
             path: String::new(),
             ods_major: 0,
             ods_minor: 0,
+            gen_windows: vec![GenWindow::default()],
         };
         let row = |a: i64, b: i64| vec![Value::Int(a), Value::Int(b)];
         let base = RowSource::Rows(vec![row(1, 30), row(2, 10), row(3, 20)]);
@@ -40541,6 +40830,16 @@ mod tests {
         assert_eq!(decimal_parts("1.5e3"), None);
         assert_eq!(decimal_parts(""), None);
         assert_eq!(decimal_parts("."), None);
+        // the blanks the engine skips are 0x20 and NOTHING else, at
+        // EITHER end - `str::trim` would take all of these and answer a
+        // number where the engine raises 22018 (probed for every
+        // numeric target)
+        for w in ["\t", "\n", "\x0b", "\x0c", "\r"] {
+            assert_eq!(decimal_parts(&format!("{w}2")), None, "{w:?} leading");
+            assert_eq!(decimal_parts(&format!("2{w}")), None, "{w:?} trailing");
+        }
+        assert_eq!(decimal_parts("\t\t2"), None);
+        assert_eq!(decimal_parts("  2  "), Some((2, 0))); // SPACES still skip
     }
 
     #[test]

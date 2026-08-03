@@ -41,6 +41,13 @@
 #      `#x` + two lowercase hex digits for every byte outside
 #      0x20..0x7f, PER BYTE - and no other vector escapes (the 23000
 #      key value carries the raw one).
+#   8. The CAST/store grammar skips 0x20 SPACE and NOTHING ELSE at
+#      either end: TAB, LF, VT, FF, CR - and the Unicode blanks NBSP,
+#      EM SPACE, IDEOGRAPHIC SPACE, NEL - all raise 22018 there, for
+#      every numeric target and at BOTH ends. It is the third grammar
+#      in this file and it does NOT follow the compare side: '1 0' is
+#      10 to a comparison and a conversion error to a CAST, ONE value
+#      answering two ways in one statement pair.
 #
 #   qa/serve-real-textcolcmp.sh [port]
 set -u
@@ -71,6 +78,10 @@ ran=0
 # one CLEAN row here, its control-byte row seeded through both servers
 # below (no shell heredoc carries those bytes into isql intact) - and
 # TCTLK the text PRIMARY KEY whose 23000 vector must NOT escape.
+# TCAST is the CAST-grammar table (law 8): every blank byte the ENGINE
+# refuses, spelled with ASCII_CHAR so the byte is built INSIDE the
+# engine and no shell or isql rewrite can touch it; TCN the numeric
+# columns the store and literal vectors write and read.
 make_db() {
     rm -f "$1"
     "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
@@ -92,6 +103,9 @@ CREATE TABLE TCTL   (ID INTEGER NOT NULL PRIMARY KEY, N INTEGER,
                      S VARCHAR(20), C CHAR(6),
                      U VARCHAR(20) CHARACTER SET UTF8);
 CREATE TABLE TCTLK  (S VARCHAR(20) NOT NULL PRIMARY KEY);
+CREATE TABLE TCAST  (ID INTEGER NOT NULL PRIMARY KEY, S VARCHAR(30));
+CREATE TABLE TCN    (ID INTEGER NOT NULL PRIMARY KEY, N INTEGER,
+                     Q NUMERIC(9,2), D DOUBLE PRECISION);
 COMMIT;
 INSERT INTO TCLEAN VALUES (1, '5');
 INSERT INTO TCLEAN VALUES (2, ' 5');
@@ -167,6 +181,28 @@ INSERT INTO TG VALUES (28, '0X10');
 INSERT INTO TBIG VALUES (1, '9223372036854775806');
 INSERT INTO TBIG VALUES (2, '9223372036854775807');
 INSERT INTO TCTL VALUES (1, 2, '5', '5', '5');
+INSERT INTO TCAST VALUES (1,  ASCII_CHAR(9) || '2');
+INSERT INTO TCAST VALUES (2,  '2' || ASCII_CHAR(9));
+INSERT INTO TCAST VALUES (3,  ASCII_CHAR(10) || '2');
+INSERT INTO TCAST VALUES (4,  '2' || ASCII_CHAR(10));
+INSERT INTO TCAST VALUES (5,  ASCII_CHAR(11) || '2');
+INSERT INTO TCAST VALUES (6,  '2' || ASCII_CHAR(11));
+INSERT INTO TCAST VALUES (7,  ASCII_CHAR(12) || '2');
+INSERT INTO TCAST VALUES (8,  '2' || ASCII_CHAR(12));
+INSERT INTO TCAST VALUES (9,  ASCII_CHAR(13) || '2');
+INSERT INTO TCAST VALUES (10, '2' || ASCII_CHAR(13));
+INSERT INTO TCAST VALUES (11, ASCII_CHAR(9) || ASCII_CHAR(9) || '2');
+INSERT INTO TCAST VALUES (12, '2' || ASCII_CHAR(9) || ASCII_CHAR(9));
+INSERT INTO TCAST VALUES (13, '  2  ');
+INSERT INTO TCAST VALUES (14, ' 2.5 ');
+INSERT INTO TCAST VALUES (15, ASCII_CHAR(194) || ASCII_CHAR(160) || '2');
+INSERT INTO TCAST VALUES (16, ASCII_CHAR(226) || ASCII_CHAR(128) || ASCII_CHAR(131) || '2');
+INSERT INTO TCAST VALUES (17, ASCII_CHAR(227) || ASCII_CHAR(128) || ASCII_CHAR(128) || '2');
+INSERT INTO TCAST VALUES (18, ASCII_CHAR(194) || ASCII_CHAR(133) || '2');
+INSERT INTO TCAST VALUES (19, '2' || ASCII_CHAR(194) || ASCII_CHAR(160));
+INSERT INTO TCAST VALUES (20, '1 0');
+INSERT INTO TCN VALUES (1, 2, 2.00, 2);
+INSERT INTO TCN VALUES (2, 10, 10.00, 10);
 COMMIT;
 EOF
     chmod 666 "$1"
@@ -413,6 +449,61 @@ both "the text key, seeded" "INSERT INTO TCTLK VALUES ('${TAB}a')"
 both "the 23000 key value does NOT escape it" \
      "INSERT INTO TCTLK VALUES ('${TAB}a')"
 
+# --- 16. the CAST grammar: 0x20 and NOTHING else -----------------------
+# The THIRD grammar in this file. The compare side above skips interior
+# spaces and converts freely; cvt.cpp's `cvt_decompose` - the one a CAST
+# and a STORE go through - skips 0x20 only, so a TAB, LF, VT, FF or CR
+# at EITHER end is a conversion error, and so is every Unicode blank
+# (NBSP, EM SPACE, IDEOGRAPHIC SPACE, NEL) that a Unicode whitespace
+# class would have eaten. TCAST's rows are built with ASCII_CHAR inside
+# the engine, so the byte under test never passes through a shell.
+# The pairs to read together: id 13 ('  2  ') converts everywhere, so
+# the refusals are about the BYTE and not about blanks in general; and
+# id 20 ('1 0') answers 10 to the comparison two lines below the CAST
+# that refuses it - the two grammars disagreeing over ONE stored value.
+cst() { # <id> <target> - one row, one numeric target
+    both "CAST(S AS $2) over TCAST id $1" \
+         "SELECT CAST(S AS $2) AS V FROM TCAST WHERE ID = $1"
+}
+for tgt in SMALLINT INTEGER BIGINT "NUMERIC(9,2)" "DOUBLE PRECISION"; do
+    for id in 1 2 3 4 5 6 7 8 9 10 11 12 13; do cst $id "$tgt"; done
+done
+# ' 2.5 ' only to the SCALED targets: fc's integer CAST refuses a
+# fraction the engine ROUNDS (`CAST('2.5' AS INTEGER)` is 3 there) -
+# a narrow-grammar residual of its own, recorded, not this slice's
+cst 14 "NUMERIC(9,2)"
+cst 14 "DOUBLE PRECISION"
+for id in 15 16 17 18 19; do cst $id INTEGER; done
+cst 15 "DOUBLE PRECISION"
+# the same grammar reached from a LITERAL in the statement text
+both "CAST literal, TAB then the digit" \
+     "SELECT CAST('${TAB}2' AS INTEGER) AS V FROM RDB\$DATABASE"
+both "CAST literal, the digit then TAB" \
+     "SELECT CAST('2${TAB}' AS DOUBLE PRECISION) AS V FROM RDB\$DATABASE"
+both "CAST literal, LF" \
+     "SELECT CAST('${LF}2' AS BIGINT) AS V FROM RDB\$DATABASE"
+both "CAST literal, two TABs run together" \
+     "SELECT CAST('${TAB}${TAB}2' AS NUMERIC(9,2)) AS V FROM RDB\$DATABASE"
+both "CAST literal, SPACES still convert" \
+     "SELECT CAST('  2  ' AS INTEGER) AS V FROM RDB\$DATABASE"
+both "CAST literal, SPACES round a scaled one" \
+     "SELECT CAST('  2.5  ' AS NUMERIC(9,2)) AS V FROM RDB\$DATABASE"
+# the COMPARE vector over the same rows must NOT have moved
+both "compare over the TAB row still raises" \
+     "SELECT ID FROM TCAST WHERE ID = 1 AND S > 1"
+both "compare over the SPACES row still answers" \
+     "SELECT ID FROM TCAST WHERE ID = 13 AND S = 2"
+both "compare converts the interior space ('1 0' is 10)" \
+     "SELECT ID FROM TCAST WHERE ID = 20 AND S = 10"
+both "... and the CAST of that same value refuses it" \
+     "SELECT CAST(S AS INTEGER) AS V FROM TCAST WHERE ID = 20"
+both "a spacey literal against an INTEGER column still answers" \
+     "SELECT ID FROM TCN WHERE N = ' 2 '"
+both "... against a NUMERIC column" "SELECT ID FROM TCN WHERE Q = ' 2.00 '"
+both "... against a DOUBLE column" "SELECT ID FROM TCN WHERE D = ' 2 '"
+both "... and bound as a text PARAMETER" \
+     "SELECT ID FROM TCN WHERE N = ?" '["  2  "]'
+
 # --- 10. durable DML atomicity (LAST: it mutates) ----------------------
 both "raising UPDATE errors on both" "UPDATE TDIRTY SET S = '9' WHERE S = 5"
 both "raising DELETE errors on both" "DELETE FROM TDIRTY WHERE S = 5"
@@ -425,10 +516,17 @@ both "the protected write IS durable (fresh attachment)" \
 both "bound UPDATE over the clean table" "UPDATE TCLEAN SET S = '5' WHERE S = ?" "[5]"
 both "the class collapsed to '5' (fresh attachment)" \
      "SELECT ID, S FROM TCLEAN ORDER BY ID"
+# the STORE side of law 8: the spacey spellings still write, to every
+# numeric column, through both INSERT and UPDATE
+both "a spacey literal STORES into all three numeric columns" \
+     "INSERT INTO TCN VALUES (3, ' 5 ', ' 5.50 ', ' 5.5 ')"
+both "... and UPDATEs one" "UPDATE TCN SET N = ' 6 ' WHERE ID = 3"
+both "the stored numbers read back (fresh attachment)" \
+     "SELECT ID, N, Q, D FROM TCN ORDER BY ID"
 
 # --- 14. the ran counter -----------------------------------------------
-if [ "$ran" -ne 115 ]; then
-    echo "DIFF $ran checks ran (expected exactly 115) - did one silently skip?"
+if [ "$ran" -ne 205 ]; then
+    echo "DIFF $ran checks ran (expected exactly 205) - did one silently skip?"
     fail=1
 fi
 
