@@ -1359,16 +1359,22 @@ enum Plan {
         kind: SavepointOp,
         name: String,
     },
-    /// `INSERT INTO <t> [(cols)] SELECT ...` - a write fed by a query.
-    /// The query is planned by the ORDINARY planner at execute, its rows
-    /// are materialised, and each one is then inserted through the
-    /// ordinary INSERT path, so column defaults, NOT NULL, CHECK, FK
-    /// enforcement and index maintenance all apply exactly as they do to
-    /// a client's own INSERT - no second write path.
+    /// `INSERT INTO <t> [(cols)] [OVERRIDING ...] SELECT ...` - a write
+    /// fed by a query. The source is planned by the ORDINARY planner AT
+    /// PREPARE (where the engine resolves it, and the only place its `?`
+    /// descriptors exist), its rows are materialised at execute, and
+    /// each one is then inserted through the ordinary INSERT path, so
+    /// column defaults, NOT NULL, CHECK, FK enforcement, the identity /
+    /// OVERRIDING decision and index maintenance all apply exactly as
+    /// they do to a client's own INSERT - no second write path.
     InsertSelect {
         table: String,
+        /// the RESOLVED target list: the named columns, or the implicit
+        /// one (declaration order, COMPUTED columns excluded). Always
+        /// non-empty after prepare - execute never recomputes it.
         cols: Vec<String>,
-        query: String,
+        ov: Overriding,
+        src: Box<Plan>,
     },
     /// A query with RESULT MODIFIERS: `FIRST n` / `SKIP n` / `DISTINCT`
     /// (in that order, which is the engine's grammar) and the trailing
@@ -4189,6 +4195,88 @@ fn quoted_qualified(name: &str) -> String {
     format!("\"PUBLIC\".\"{}\"", name.trim_matches('"').trim_end().to_ascii_uppercase())
 }
 
+/// The engine's `isc_invalid_blr` offset for `SELECT <n cols> FROM
+/// <proc>(<args>)` - a byte offset into BLR THIS SERVER NEVER GENERATED,
+/// so it is reconstructed from the statement's shape. Probed across name
+/// lengths 1/3/10/15, one to three integer outputs, zero to three
+/// arguments and both literal widths; the base `24 + len(schema) +
+/// len(name)` is the bare no-argument form (LAW 9), `4` is one extra
+/// blr_field per SELECTED column past the first (duplicates count -
+/// `SELECT X, X` costs the same as two distinct columns), `3` opens the
+/// argument list and each literal costs its own blr:
+/// blr_null = 1, blr_literal blr_long = 7, blr_literal blr_int64 = 11.
+///
+/// Probed INVARIANT (all identical to the bare form): the select list's
+/// case, a `PUBLIC.`/`"PUBLIC"."..."` qualifier, an alias, WHERE, ORDER
+/// BY, FIRST/SKIP/DISTINCT/ROWS.
+///
+/// Valid ONLY for the shape this branch plans: PUBLIC schema, integer
+/// outputs, integer/NULL literal arguments, no aggregate, no GROUP BY,
+/// not nested. Probed counter-examples, each refused generically
+/// instead: a VARCHAR/CHAR output is +3 per column, COUNT(*) and GROUP
+/// BY are +4, a derived table is +19+len(name), and every JOIN /
+/// subquery / CTE / UNION context has its own arithmetic.
+fn proc_blr_offset(name: &str, n_cols: usize, args: &[Value]) -> i64 {
+    // fc hard-codes PUBLIC exactly as quoted_qualified above does
+    let mut off = 24 + "PUBLIC".len() as i64 + name.trim_matches('"').trim_end().chars().count() as i64;
+    off += 4 * (n_cols as i64 - 1);
+    if !args.is_empty() {
+        off += 3;
+        for a in args {
+            off += match a {
+                Value::Null => 1,
+                Value::Int(v) if i32::try_from(*v).is_ok() => 7,
+                _ => 11,
+            };
+        }
+    }
+    off
+}
+
+/// A refusal whose vector encodes a POSITION IN THE TEXT (the -84
+/// line/column) or a BLR OFFSET (the -104 one) is only true of the text
+/// it was computed from. Every planner site that RE-PLANS REWRITTEN SQL
+/// - the CTE materialisation, the select-list subquery fold, the
+/// qualifier strip - must therefore hand back the GENERIC refusal
+/// instead of shipping a fabricated number: both sides still error, and
+/// the boundary is recorded rather than answered wrong.
+///
+/// The modifier wrapper is the one deliberate exception, and only for
+/// the two vectors probed NOT to move under FIRST/SKIP/DISTINCT/ROWS.
+fn downgrade_rewritten(p: Plan) -> Plan {
+    match p {
+        Plan::RefusedEval(
+            EvalErr::NotSelectable { .. }
+            | EvalErr::ProcNoOutputs { .. }
+            | EvalErr::TableUnknown { .. }
+            | EvalErr::ProcArgMismatch(_),
+        ) => Plan::Refused,
+        other => other,
+    }
+}
+
+/// The 1-based (line, column) of a SUBSLICE inside the statement text,
+/// the way `isc_dsql_line_col_error` counts: the position of the FIRST
+/// CHARACTER of the FROM item AS WRITTEN, qualifier and opening quote
+/// included (probed: `PUBLIC.PNOOUT` and `"PUBLIC"."PNOOUT"` both report
+/// column 15, the start of the whole item).
+///
+/// `part` must be a slice OF `hay` - [split_query] hands back borrowed
+/// slices, so it is. None when it is not: that is the signal that the
+/// text was REWRITTEN (a stripped modifier, a derived-table inner, a CTE
+/// or view expansion) and the position would be a fabricated number.
+fn text_line_col(hay: &str, part: &str) -> Option<(i64, i64)> {
+    let (h, p) = (hay.as_ptr() as usize, part.as_ptr() as usize);
+    if p < h || p + part.len() > h + hay.len() {
+        return None;
+    }
+    let at = p - h;
+    let before = hay.get(..at)?;
+    let line = 1 + before.matches('\n').count() as i64;
+    let col = 1 + before.rsplit('\n').next().unwrap_or("").chars().count() as i64;
+    Some((line, col))
+}
+
 /// The engine's `print_key` (btr.cpp ~7128): `("COL" = v[, ...])`,
 /// the whole text capped at 250 chars. None when a value cannot render
 /// as a literal - the engine omits the key item when print_key throws,
@@ -4661,6 +4749,41 @@ enum InsVal {
     /// `GenId(name, step)`: `None` step = `NEXT VALUE FOR` (use the
     /// sequence's own increment), `Some(n)` = `GEN_ID(name, n)`.
     GenId(String, Option<i64>),
+    /// the `DEFAULT` keyword in a VALUES list. The column takes its
+    /// column DEFAULT - or, for an identity column, the backing
+    /// generator. It is the sanctioned escape from the ALWAYS rule
+    /// (probed CELL 10: `INSERT INTO TA (ID,B) VALUES (DEFAULT,'x')`
+    /// succeeds where any other expression, NULL included, is refused
+    /// with 335545137), and OVERRIDING does NOT make it literal (CELL
+    /// 11/23). A DEFAULT-valued column is therefore LISTED but not
+    /// NAMED: it behaves exactly like an omitted column.
+    Default,
+}
+
+/// The `OVERRIDING` clause of an INSERT, as written. Its meaning is the
+/// opposite of how it reads (probed):
+///   * `SYSTEM` - take the USER's value literally and do NOT advance the
+///     generator (CELL 05: the sequence silently falls behind the table);
+///   * `USER` - DISCARD the user's value silently and draw from the
+///     generator (CELL 06: `VALUES (1006,'x')` stores id 2 and 1006
+///     appears nowhere; RETURNING confirms it).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Overriding {
+    None,
+    System,
+    User,
+}
+
+impl Overriding {
+    /// The clause as SQL text, for the per-row INSERT that
+    /// [insert_select] re-plans (`""` when there is none).
+    fn sql(self) -> &'static str {
+        match self {
+            Overriding::None => "",
+            Overriding::System => " OVERRIDING SYSTEM VALUE",
+            Overriding::User => " OVERRIDING USER VALUE",
+        }
+    }
 }
 
 /// Strip a leading keyword (case-insensitive) from `s`, which must be
@@ -9023,6 +9146,18 @@ fn wrap_returning(
             if bare_q { c.name == bare } else { c.name.eq_ignore_ascii_case(&bare) }
         })?;
         let fid = c.field_id as usize;
+        // A COMPUTED column has no stored bytes: its descriptor sits at
+        // offset 0, over the null flags. The RETURNING rows are decoded
+        // from the STORED image (`decode_record(img, &affected.descs)`),
+        // so projecting one would answer the NULL-FLAG BYTES as data -
+        // a wrong answer, silently, for e.g. `INSERT INTO D_COMP DEFAULT
+        // VALUES RETURNING A, C`. The engine returns the evaluated
+        // expression (A=3, C=30). Refuse: answering wrongly is worse
+        // than refusing, and this is a recorded boundary until the
+        // returning path evaluates computed sources.
+        if is_computed_fid(descs, fid) {
+            return None;
+        }
         let d = descs.get(fid)?;
         let (wire, sql_type, length, scale, sub_type) = wire_for(d);
         cols.push(ProjCol {
@@ -9056,8 +9191,43 @@ fn wrap_returning(
     ))
 }
 
-/// The table a DML plan writes to, for resolving a RETURNING list.
-fn dml_table_name(sql: &str) -> Option<String> {
+/// A DML target's (schema, BARE name). The head span is taken with
+/// [qualified_name_span], so `PUBLIC . T` and `"PUBLIC"."T"` parse, and
+/// the schema comes back UNAPPLIED - the caller checks it against the
+/// relation with [relation_qualifier_ok], the same division of labour
+/// `parse_execute_procedure` uses. None when the text is not exactly one
+/// one-or-two-part name: DML has its own parser, and a trailing alias or
+/// keyword there has always refused.
+///
+/// The engine accepts a qualified target in EVERY DML shape (probed:
+/// `INSERT INTO PUBLIC.T`, `UPDATE PUBLIC.T SET ...`, `DELETE FROM
+/// PUBLIC.T`, `UPDATE OR INSERT INTO PUBLIC.T ... RETURNING`), and each
+/// keeps its unqualified wire statement type (2/3/4/8) - that comes free
+/// here, since the type is derived from the verb and not from the name.
+fn dml_target_name(head: &str) -> Option<(Option<NamePart<'_>>, &str)> {
+    let t = head.trim();
+    let (parts, len) = split_name_parts(t, 2)?;
+    if len != t.len() {
+        return None; // trailing text - not a bare target
+    }
+    let (schema, name) = match parts.as_slice() {
+        [n] => (None, *n),
+        [q, n] => (Some(*q), *n),
+        _ => return None,
+    };
+    // a BARE name keeps the ident_ok gate every one of these scanners
+    // has always had; a QUOTED one is taken verbatim
+    if !name.1 && !ident_ok(name.0) {
+        return None;
+    }
+    Some((schema, name.0))
+}
+
+/// The (schema, bare name) a DML statement writes to - the head walk
+/// [dml_table_name] and [unqualify_dml] share, so the RETURNING resolver
+/// and the qualifier strip cannot disagree about which relation is the
+/// target.
+fn dml_target(sql: &str) -> Option<(Option<NamePart<'_>>, &str)> {
     let s = sql.trim();
     let up = s.to_ascii_uppercase();
     let masked = mask_literals(&up);
@@ -9091,16 +9261,328 @@ fn dml_table_name(sql: &str) -> Option<String> {
     };
     let start = after + kw.len();
     let rest = s[start..].trim_start();
-    let end = rest
-        .char_indices()
-        .find(|(_, c)| c.is_whitespace() || *c == '(')
-        .map(|(i, _)| i)
-        .unwrap_or(rest.len());
-    let name = rest[..end].trim().trim_matches('"');
-    if name.is_empty() || !ident_ok(name) {
+    // the NAME SPAN, not "up to the first blank": the dot is its own
+    // token, so `INSERT INTO PUBLIC . T` names PUBLIC.T (probed)
+    let end = qualified_name_span(rest)?;
+    dml_target_name(&rest[..end])
+}
+
+/// The table a DML plan writes to, for resolving a RETURNING list -
+/// the BARE name, since the qualifier never leaves the parser. The
+/// planners have already checked the schema by the time this runs
+/// (a refused plan never reaches `wrap_returning`).
+fn dml_table_name(sql: &str) -> Option<String> {
+    dml_target(sql).map(|(_, n)| n.to_string())
+}
+
+/// Strip a DML statement's 3-part column references before its planner
+/// sees them. The DML planners each have their own column resolver, so
+/// the qualifier is taken off the WHOLE statement at once - which makes
+/// `SET PUBLIC.T.D = ...`, `WHERE PUBLIC.T.C = ...` and `RETURNING
+/// PUBLIC.T.C` all work through one pass, exactly as the SELECT path's
+/// [unqualify_single] does.
+///
+/// The TARGET's own `SCHEMA.` prefix survives untouched: it is not
+/// followed by a further dot, so neither of [unqualify_single]'s rules
+/// matches it, and the planner still gets the qualifier to check.
+fn unqualify_dml(sql: &str, db: &Option<Database>) -> Option<String> {
+    if !sql.contains('.') {
         return None;
     }
-    Some(name.to_string())
+    let dbr = db.as_ref()?;
+    let (_, table) = dml_target(sql)?;
+    // a DML target takes no alias in this server's grammar, so the
+    // relation name is the key and the 3-part form is always available
+    let bind = ColBinding { key: table, qual: relation_schema(dbr, table).map(|s| (s, table)) };
+    unqualify_single(sql, &bind)
+}
+
+/// The CATALOG's spelling of a relation, schema-qualified and
+/// PRE-QUOTED the way the engine's own message arguments arrive on the
+/// wire: `"PUBLIC"."TA"`. The three OVERRIDING vectors carry exactly
+/// this one string, so it is derived from `list_relations` (the same
+/// lookup [wrap_returning] does) rather than upper-casing the
+/// statement's own spelling.
+///
+/// Every relation fire-crab writes lives in PUBLIC today. Recorded hole,
+/// pre-existing and NOT closed by this slice: [identity_columns] and
+/// `not_null_fids` match `RDB$RELATION_FIELDS` on the relation NAME with
+/// no `RDB$SCHEMA_NAME` filter, so a same-named table in a second schema
+/// would misfire - the qualifier here would still say PUBLIC.
+fn qualified_relation_name(db: &Database, rel: u16) -> Option<String> {
+    let canon = fire_crab_ods::list_relations(&db.bytes, db.page_size)
+        .into_iter()
+        .find(|(id, _)| *id == rel)
+        .map(|(_, n)| n)?;
+    Some(format!("\"PUBLIC\".\"{}\"", canon.trim_end()))
+}
+
+/// Split an INSERT head - the text between `INTO` and `VALUES`/`SELECT` -
+/// into `<table>`, its optional `(column list)`, and its OVERRIDING
+/// clause.
+///
+/// The clause's position is FIXED by the grammar and probed: after the
+/// column list, before VALUES/SELECT. The keywords fold (`overriding
+/// system value` works), and column-list ORDER is free - `(B,ID)` is as
+/// good as `(ID,B)`, because the caller resolves each name against the
+/// catalog and never assumes a position.
+///
+/// The clause must PARSE even when it is illegal: `INSERT INTO TA (B)
+/// OVERRIDING SYSTEM VALUE ...` and `INSERT INTO PLAIN (A,B) OVERRIDING
+/// ...` (a table with no identity at all) both have to reach the planner
+/// so it can answer 335545134 - refusing them here would ship a generic
+/// Dynamic SQL Error where the engine ships a named vector.
+///
+/// Recorded boundary: a REPEATED column refuses generically (the
+/// caller's catalog lookup accepts it and the arity check or the image
+/// build rejects it); the engine's `-206 Column ... cannot be repeated`
+/// detail is not reproduced.
+fn split_insert_head(
+    head: &str,
+) -> Option<(Option<NamePart<'_>>, &str, Option<Vec<String>>, Overriding)> {
+    let up = head.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    let (name_end, collist, after) = match masked.find('(') {
+        Some(open) => {
+            // the matching close paren, on the MASKED text
+            let mut depth = 0i32;
+            let mut close = None;
+            for (i, ch) in masked[open..].char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(open + i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let close = close?;
+            (open, Some(split_ident_list(&head[open + 1..close])?), close + 1)
+        }
+        // no column list: the table name runs to OVERRIDING, or to the
+        // end of the head
+        None => {
+            let o = find_word(&masked, "OVERRIDING", 0).unwrap_or(head.len());
+            (o, None, o)
+        }
+    };
+    let (schema, table) = dml_target_name(&head[..name_end])?;
+    let rest = head[after..].trim();
+    if rest.is_empty() {
+        return Some((schema, table, collist, Overriding::None));
+    }
+    // `OVERRIDING SYSTEM VALUE` / `OVERRIDING USER VALUE` and nothing
+    // else - any other token after OVERRIDING refuses
+    let mut w = rest.split_whitespace();
+    let ov = match (w.next(), w.next(), w.next(), w.next()) {
+        (Some(a), Some(b), Some(c), None)
+            if a.eq_ignore_ascii_case("OVERRIDING") && c.eq_ignore_ascii_case("VALUE") =>
+        {
+            if b.eq_ignore_ascii_case("SYSTEM") {
+                Overriding::System
+            } else if b.eq_ignore_ascii_case("USER") {
+                Overriding::User
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    Some((schema, table, collist, ov))
+}
+
+/// The OVERRIDING / identity decision, exactly as probed across the
+/// 24-cell matrix.
+///
+/// `idcols` is [identity_columns]' `(field id, generator name, identity
+/// type)` - type 0 is GENERATED ALWAYS, 1 is GENERATED BY DEFAULT.
+/// `listed` is every field id in the INSERT's field list (the IMPLICIT
+/// list counts too). `named` is the subset carrying an EXPLICIT value: a
+/// `DEFAULT`-keyword column is listed but NOT named, and that one
+/// distinction is what makes CELL 10 succeed where CELL 04 refuses.
+///
+/// Returns the identity columns whose value the GENERATOR must supply,
+/// or the refusal vector.
+///
+/// Evaluation order is METADATA FIRST, VALUES LAST. That ordering is not
+/// cosmetic: it is what makes CELL 20 (`INSERT INTO TD (ID,B) OVERRIDING
+/// SYSTEM VALUE VALUES (NULL,'x')`) answer 335545135 at PREPARE instead
+/// of the 335544347 that CELL 19 answers at EXECUTE for the same NULL.
+fn overriding_plan(
+    idcols: &[(usize, String, i64)],
+    listed: &[usize],
+    named: &[usize],
+    ov: Overriding,
+    qualified_table: &str,
+) -> Result<Vec<usize>, EvalErr> {
+    let listed_ids: Vec<&(usize, String, i64)> =
+        idcols.iter().filter(|(fid, _, _)| listed.contains(fid)).collect();
+    // 1. OVERRIDING is illegal unless the field list itself names an
+    //    identity column - CELL 02/03 and 14/15 (identity omitted), and
+    //    a table with NO identity at all. The check is on the FIELD
+    //    LIST, not on the identity kind and not on the table.
+    if ov != Overriding::None && listed_ids.is_empty() {
+        return Err(EvalErr::OverridingWithoutIdentity(qualified_table.to_string()));
+    }
+    // 2. OVERRIDING SYSTEM VALUE is legal only against GENERATED ALWAYS
+    //    - CELL 17, 20, 23. Purely metadata-driven: it never looks at
+    //    the value, which is why the DEFAULT keyword is refused too.
+    if ov == Overriding::System && listed_ids.iter().any(|(_, _, t)| *t == 1) {
+        return Err(EvalErr::OverridingSystemInvalid(qualified_table.to_string()));
+    }
+    // 3. a GENERATED ALWAYS column NAMED with an explicit value and no
+    //    OVERRIDING - CELL 04 and CELL 07 (an explicit NULL is an
+    //    explicit value, not a request for the default).
+    if ov == Overriding::None
+        && listed_ids
+            .iter()
+            .any(|(fid, _, t)| *t == 0 && named.contains(fid))
+    {
+        return Err(EvalErr::OverridingMissing(qualified_table.to_string()));
+    }
+    // 4. who draws from the generator: an OMITTED column (CELL 01/13 and
+    //    DEFAULT VALUES), a DEFAULT-keyword column (CELL 10/11/12/22/24),
+    //    or ANY identity column under OVERRIDING USER VALUE - which
+    //    silently DISCARDS the supplied value (CELL 06/09/18/21).
+    //    Everything else leaves the value literal and the generator
+    //    UNTOUCHED: OSV on an ALWAYS column (CELL 05/08) and a plain
+    //    explicit value into a BY DEFAULT column (CELL 16/19).
+    Ok(idcols
+        .iter()
+        .filter(|(fid, _, _)| {
+            !listed.contains(fid) || !named.contains(fid) || ov == Overriding::User
+        })
+        .map(|(fid, _, _)| *fid)
+        .collect())
+}
+
+/// Plan `INSERT INTO <t> [(cols)] [OVERRIDING ...] SELECT ...`.
+///
+/// Everything is resolved HERE, at prepare, because that is where the
+/// engine resolves it: an unknown table, an unknown column, and every
+/// OVERRIDING refusal are prepare-time (probed under `SET PLANONLY ON`),
+/// and the source's `?` descriptors only exist at prepare.
+fn plan_insert_select(
+    s: &str,
+    masked: &str,
+    into: usize,
+    sel: usize,
+    db: &Option<Database>,
+) -> Option<(Plan, Vec<Descriptor>)> {
+    let (schema, table, collist, ov) = split_insert_head(s[into + "INTO".len()..sel].trim())?;
+    let dbr = db.as_ref()?;
+    // THE SCHEMA HALF: `INSERT INTO PUBLIC.T ... SELECT` answers on the
+    // engine, `INSERT INTO SYSTEM.T` is its -204. Checked before the
+    // relation is resolved, the same order the SELECT path uses.
+    if !relation_qualifier_ok(dbr, schema, table) {
+        return None;
+    }
+    // Resolved at PREPARE. `INSERT INTO NOSUCH SELECT X,Y FROM SRC` is a
+    // prepare-time refusal on the engine (SQLSTATE 42S02, -204, `Table
+    // unknown "NOSUCH"`), never an execute-time failure; this branch used
+    // to defer the whole resolution to execute. Recorded boundary: the
+    // TIMING now matches, the `-204 Table unknown` VECTOR does not -
+    // fire-crab answers the generic Dynamic SQL Error.
+    let rel = fire_crab_ods::resolve_relation(&dbr.bytes, dbr.page_size, table)?;
+    let columns = relation_columns(&dbr.bytes, dbr.page_size, table);
+    let formats = relation_formats(&dbr.bytes, dbr.page_size, rel);
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    // The target list, resolved ONCE - execute never recomputes it. The
+    // implicit list is `relation_columns` order, which is
+    // RDB$FIELD_POSITION (declaration order, what SELECT * returns),
+    // MINUS computed columns - the SAME expression the VALUES branch
+    // uses. insert_select used to re-derive it at execute sorted by
+    // FIELD_ID and with no computed filter: on a table that has been
+    // through ALTER COLUMN ... POSITION (or DROP+ADD) the two orders
+    // differ and the source columns landed in the WRONG targets - a
+    // silent wrong write, not an arity error.
+    let mut cols: Vec<String> = Vec::new();
+    let mut listed: Vec<usize> = Vec::new();
+    match &collist {
+        Some(names) => {
+            for n in names {
+                let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(n))?;
+                // a computed column is read-only ("attempted update of
+                // read-only column") - refuse
+                if is_computed_fid(descs, rc.field_id as usize) {
+                    return None;
+                }
+                // a repeated column is `-206` on the engine (see the
+                // same guard in the VALUES branch)
+                if listed.contains(&(rc.field_id as usize)) {
+                    return None;
+                }
+                cols.push(rc.name.clone());
+                listed.push(rc.field_id as usize);
+            }
+        }
+        None => {
+            for c in columns
+                .iter()
+                .filter(|c| !is_computed_fid(descs, c.field_id as usize))
+            {
+                cols.push(c.name.clone());
+                listed.push(c.field_id as usize);
+            }
+        }
+    }
+    if cols.is_empty() {
+        return None;
+    }
+    // a SELECT list has no DEFAULT keyword, so every LISTED column is
+    // also NAMED - the same three vectors as the VALUES form, at the
+    // same (prepare) time. Probed: `INSERT INTO TA (ID,B) SELECT X+400,Y
+    // FROM SRC` -> 335545137; `INSERT INTO TA (B) OVERRIDING SYSTEM
+    // VALUE SELECT Y FROM SRC` -> 335545134; the BY DEFAULT form
+    // succeeds with the generator unmoved.
+    let qualified = qualified_relation_name(dbr, rel)?;
+    if let Err(e) = overriding_plan(&identity_columns(dbr, table), &listed, &listed, ov, &qualified)
+    {
+        return Some((Plan::RefusedEval(e), Vec::new()));
+    }
+    // A `?` in the SELECT LIST is typed by the engine from the INSERT
+    // TARGET COLUMN - type, scale, subtype, charset AND the nullability
+    // bit (probed: `INSERT INTO PT SELECT ?,?,?,? FROM RDB$DATABASE`
+    // describes `496 LONG Nullable`, `448 VARYING Nullable len 10`,
+    // `570 SQL DATE Nullable`, `496 LONG Nullable scale -3 subtype 1`;
+    // and a `?` aimed at an identity column is described NON-nullable).
+    // fire-crab's projection parser has no parameter atom at all
+    // (`texpr` says so in as many words), so it would answer None here
+    // anyway - refuse EXPLICITLY so the boundary is one traceable place.
+    // The same refusal covers `? + 1`, `COALESCE(?, X)`, `CAST(? AS
+    // SMALLINT)` and `FIRST ? SKIP ?` (the last described `580 INT64`
+    // NON-nullable, unlike every other parameter in the statement).
+    // Giving a projection target-column typing is a projection-planner
+    // slice, not this one.
+    let from_kw = find_word(masked, "FROM", sel).unwrap_or(masked.len());
+    if masked[sel..from_kw].contains('?') {
+        return None;
+    }
+    // The source is planned HERE. Its WHERE-clause `?`s are typed from
+    // the compared COLUMN and land in the input SQLDA in textual order
+    // (probed: `... SELECT X, Y FROM SRC WHERE X = ? AND Y = ?` ->
+    // `496 LONG`, then `448 VARYING len 10`).
+    let mut sink: Vec<Option<Descriptor>> = Vec::new();
+    let src = plan_query_inner(s[sel..].trim(), db, &mut sink)?;
+    // an untypeable `?` (a param-to-param compare, a UNION leg, a CTE,
+    // an IN-subquery, ORDER BY ?) refuses. The engine refuses those too,
+    // at prepare, with `-804 / HY004 Data type unknown`; fire-crab's
+    // vector is the generic Dynamic SQL Error - the timing matches, the
+    // vector is a recorded boundary.
+    let params: Vec<Descriptor> = sink.into_iter().collect::<Option<_>>()?;
+    Some((
+        Plan::InsertSelect {
+            table: table.to_string(),
+            cols,
+            ov,
+            src: Box::new(src),
+        },
+        params,
+    ))
 }
 
 fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
@@ -9115,97 +9597,93 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     if let Some(sel) = find_word(&masked, "SELECT", into + "INTO".len()) {
         let vals = find_word(&masked, "VALUES", into + "INTO".len());
         if vals.is_none_or(|v| sel < v) {
-            let head = s[into + "INTO".len()..sel].trim();
-            let (table, collist) = match head.find('(') {
-                Some(pos) => (head[..pos].trim(), Some(head[pos..].trim())),
-                None => (head, None),
-            };
-            let table = table.trim().trim_matches('"');
-            if !ident_ok(table) {
-                return None;
-            }
-            let cols: Vec<String> = match collist {
-                None => Vec::new(), // every column, in field order
-                Some(l) => split_ident_list(l.trim_start_matches('(').trim_end_matches(')'))?,
-            };
-            return Some((
-                Plan::InsertSelect {
-                    table: table.to_string(),
-                    cols,
-                    query: s[sel..].trim().to_string(),
-                },
-                Vec::new(),
-            ));
+            return plan_insert_select(s, &masked, into, sel, db);
         }
     }
     let vals_kw = find_word(&masked, "VALUES", into + "INTO".len())?;
-    // between INTO and VALUES: the table name + optional (column list)
-    let head = s[into + "INTO".len()..vals_kw].trim();
-    let (table, collist) = match head.find('(') {
-        Some(pos) => {
-            let rest = head[pos..].trim();
-            if !rest.ends_with(')') {
-                return None;
-            }
-            let mut cols = Vec::new();
-            for part in rest[1..rest.len() - 1].split(',') {
-                let n = part.trim().trim_matches('"');
-                if !ident_ok(n) {
-                    return None;
-                }
-                cols.push(n.to_string());
-            }
-            if cols.is_empty() {
-                return None;
-            }
-            (head[..pos].trim(), Some(cols))
+    // `INSERT INTO <t> DEFAULT VALUES` - the grammar admits NO column
+    // list and NO OVERRIDING clause (probed: both are -104 token
+    // unknown), and nothing may sit between DEFAULT and VALUES or after
+    // VALUES. It reduces to an INSERT with an EMPTY field list and an
+    // EMPTY value list, and every downstream mechanism - column
+    // defaults, the identity generator, NOT NULL, CHECK, PK, FK, index
+    // maintenance, RETURNING - then produces the probed behaviour with
+    // no code of its own.
+    let default_values = find_word(&masked, "DEFAULT", into + "INTO".len()).filter(|&d| {
+        d < vals_kw
+            && masked[d + "DEFAULT".len()..vals_kw].trim().is_empty()
+            && s[vals_kw + "VALUES".len()..].trim().is_empty()
+    });
+    // between INTO and VALUES (or DEFAULT): the table name + optional
+    // (column list) + optional OVERRIDING clause
+    let head = s[into + "INTO".len()..default_values.unwrap_or(vals_kw)].trim();
+    let (schema, table, collist, ov) = match default_values {
+        // DEFAULT VALUES: the head must be a BARE table name. A '('
+        // (`INSERT INTO D_DEF () DEFAULT VALUES`) or an OVERRIDING word
+        // (`INSERT INTO TA OVERRIDING SYSTEM VALUE DEFAULT VALUES`)
+        // leaves a paren or a space in `head`, which ident_ok rejects.
+        // Both are -104 on the engine; both are the generic Dynamic SQL
+        // Error here - recorded boundary, the token detail is not
+        // reproduced.
+        Some(_) => {
+            let (q, t) = dml_target_name(head)?;
+            (q, t, None, Overriding::None)
         }
-        None => (head, None),
+        None => split_insert_head(head)?,
     };
-    let table = table.trim_matches('"');
-    if !ident_ok(table) {
-        return None;
-    }
-    // after VALUES: exactly one parenthesised literal list
-    let tail = s[vals_kw + "VALUES".len()..].trim();
-    if !tail.starts_with('(') || !tail.ends_with(')') {
-        return None;
-    }
-    let toks = tokenize(&tail[1..tail.len() - 1])?;
     let mut vals: Vec<InsVal> = Vec::new();
     let mut nparams = 0usize;
-    // a comma inside GEN_ID(name, n) is not a value separator: split only
-    // on top-level (paren-depth-0) commas
-    for part in split_top_commas(&toks) {
-        vals.push(match part {
-            [Tok::Int(n)] => InsVal::Int(*n),
-            [Tok::Dec(r, s)] => InsVal::Dec(*r, *s),
-            [Tok::Str(v)] => InsVal::Str(v.clone()),
-            [Tok::FnExpr(RawExpr::Bool(b))] => InsVal::Bool(*b),
-            [Tok::Null] => InsVal::Null,
-            [Tok::Param] => {
-                nparams += 1;
-                InsVal::Param(nparams - 1)
-            }
-            // NEXT VALUE FOR <seq> - advance by the sequence's own increment
-            [Tok::Ident(a), Tok::Ident(b), Tok::Ident(c), Tok::Ident(seq)]
-                if a.eq_ignore_ascii_case("NEXT")
-                    && b.eq_ignore_ascii_case("VALUE")
-                    && c.eq_ignore_ascii_case("FOR") =>
-            {
-                InsVal::GenId(seq.trim_matches('"').to_string(), None)
-            }
-            // GEN_ID(<name>, <step>) - advance by an explicit step
-            [Tok::Ident(g), Tok::LParen, Tok::Ident(name), Tok::Comma, Tok::Int(n), Tok::RParen]
-                if g.eq_ignore_ascii_case("GEN_ID") =>
-            {
-                InsVal::GenId(name.trim_matches('"').to_string(), Some(*n))
-            }
-            _ => return None,
-        });
+    if default_values.is_none() {
+        // after VALUES: exactly one parenthesised literal list. Firebird
+        // has NO multi-row VALUES - `VALUES (..),(..)` is a -104 there
+        // and refuses here too.
+        let tail = s[vals_kw + "VALUES".len()..].trim();
+        if !tail.starts_with('(') || !tail.ends_with(')') {
+            return None;
+        }
+        let toks = tokenize(&tail[1..tail.len() - 1])?;
+        // a comma inside GEN_ID(name, n) is not a value separator: split only
+        // on top-level (paren-depth-0) commas
+        for part in split_top_commas(&toks) {
+            vals.push(match part {
+                [Tok::Int(n)] => InsVal::Int(*n),
+                [Tok::Dec(r, s)] => InsVal::Dec(*r, *s),
+                [Tok::Str(v)] => InsVal::Str(v.clone()),
+                [Tok::FnExpr(RawExpr::Bool(b))] => InsVal::Bool(*b),
+                [Tok::Null] => InsVal::Null,
+                // the DEFAULT keyword: the column takes its column
+                // DEFAULT, or the backing generator for an identity
+                [Tok::Ident(k)] if k.eq_ignore_ascii_case("DEFAULT") => InsVal::Default,
+                [Tok::Param] => {
+                    nparams += 1;
+                    InsVal::Param(nparams - 1)
+                }
+                // NEXT VALUE FOR <seq> - advance by the sequence's own increment
+                [Tok::Ident(a), Tok::Ident(b), Tok::Ident(c), Tok::Ident(seq)]
+                    if a.eq_ignore_ascii_case("NEXT")
+                        && b.eq_ignore_ascii_case("VALUE")
+                        && c.eq_ignore_ascii_case("FOR") =>
+                {
+                    InsVal::GenId(seq.trim_matches('"').to_string(), None)
+                }
+                // GEN_ID(<name>, <step>) - advance by an explicit step
+                [Tok::Ident(g), Tok::LParen, Tok::Ident(name), Tok::Comma, Tok::Int(n), Tok::RParen]
+                    if g.eq_ignore_ascii_case("GEN_ID") =>
+                {
+                    InsVal::GenId(name.trim_matches('"').to_string(), Some(*n))
+                }
+                _ => return None,
+            });
+        }
     }
 
     let db = db.as_ref()?;
+    // THE SCHEMA HALF, before the relation is resolved (see
+    // [relation_qualifier_ok]): `INSERT INTO SYSTEM.T` is a -204 on the
+    // engine even though a relation T exists.
+    if !relation_qualifier_ok(db, schema, table) {
+        return None;
+    }
     let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
     let columns = relation_columns(&db.bytes, db.page_size, table);
     let formats = relation_formats(&db.bytes, db.page_size, rel);
@@ -9225,10 +9703,22 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                 if is_computed_fid(descs, rc.field_id as usize) {
                     return None;
                 }
+                // a REPEATED column is invalid SQL: the engine answers
+                // `-206 Column "PUBLIC"."TA".ID cannot be repeated in
+                // INSERT statement` at prepare. This used to accept
+                // `INSERT INTO T (A,A) VALUES (1,2)` and WRITE A=2 - a
+                // row the engine never stores. Refuse (recorded
+                // boundary: the -206 detail is not reproduced).
+                if v.iter().any(|c: &&RelationColumn| c.field_id == rc.field_id) {
+                    return None;
+                }
                 v.push(rc);
             }
             v
         }
+        // DEFAULT VALUES: NO column at all - not "every column". The
+        // empty field list is the whole feature.
+        None if default_values.is_some() => Vec::new(),
         // no column list = every column, declared order - MINUS computed
         // columns, which the engine's implicit list excludes too
         None => columns
@@ -9239,24 +9729,72 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     if targets.len() != vals.len() {
         return None;
     }
-    let image = build_insert_image(&targets, &vals, descs, db, rel, *format_no)?;
+    // The OVERRIDING / identity decision, before a single byte is
+    // encoded. `listed` is the whole field list (the implicit one
+    // included); `named` is the subset carrying an EXPLICIT value - a
+    // DEFAULT-keyword column is listed but not named.
+    let listed: Vec<usize> = targets.iter().map(|rc| rc.field_id as usize).collect();
+    let named: Vec<usize> = targets
+        .iter()
+        .zip(&vals)
+        .filter(|(_, v)| !matches!(v, InsVal::Default))
+        .map(|(rc, _)| rc.field_id as usize)
+        .collect();
+    let qualified = qualified_relation_name(db, rel)?;
+    let idcols = identity_columns(db, table);
+    let generated: Vec<usize> = match overriding_plan(&idcols, &listed, &named, ov, &qualified) {
+        Ok(v) => v,
+        Err(e) => return Some((Plan::RefusedEval(e), Vec::new())),
+    };
+    // The values that actually LAND. A DEFAULT-keyword column is not one
+    // of them (it falls to insert_defaults / the generator exactly as an
+    // omitted column does), and neither is a column the generator is
+    // about to supply: OVERRIDING USER VALUE DISCARDS the supplied value
+    // SILENTLY (probed CELL 06 - `VALUES (1006,'x')` stores id 2 and
+    // 1006 appears nowhere in the table, with no warning).
+    let landing: Vec<(&RelationColumn, &InsVal)> = targets
+        .iter()
+        .zip(&vals)
+        .filter(|(rc, v)| {
+            !matches!(v, InsVal::Default) && !generated.contains(&(rc.field_id as usize))
+        })
+        .map(|(rc, v)| (*rc, v))
+        .collect();
+    let image = build_insert_image(&landing, descs, db, rel, *format_no)?;
     // parameter targets in VALUES (= slot) order, each a bindable type;
     // generator targets, each a bump evaluated at execute
     let mut param_fields = Vec::new();
     let mut gen_fields = Vec::new();
     let mut params = vec![None; nparams];
     for (rc, v) in targets.iter().zip(&vals) {
+        let fid = rc.field_id as usize;
+        let discarded = generated.contains(&fid);
         match v {
             InsVal::Param(slot) => {
-                let d = descs.get(rc.field_id as usize)?;
+                let d = descs.get(fid)?;
                 if !param_target_ok(d) {
                     return None;
                 }
-                param_fields.push((rc.field_id as usize, *slot));
+                // A DISCARDED value must still BIND: the engine
+                // describes and consumes the parameter either way
+                // (re-probed: `INSERT INTO TA (ID,B) OVERRIDING USER
+                // VALUE VALUES (?,?)` describes 2 input fields, param 1
+                // `496 LONG` non-nullable - the describe is identical to
+                // the OSV form). So the descriptor is registered
+                // unconditionally and only the WRITE is skipped; the
+                // bound bytes never reach the image.
+                if !discarded {
+                    param_fields.push((fid, *slot));
+                }
                 params[*slot] = Some(d.clone());
             }
+            // an explicit generator advance into a column OVERRIDING
+            // USER VALUE is about to discard: whether the engine still
+            // draws from that OTHER sequence is UNPROBED, so refuse
+            // rather than guess which way the sequence moves
+            InsVal::GenId(..) if discarded => return None,
             InsVal::GenId(name, step) => {
-                let d = descs.get(rc.field_id as usize)?;
+                let d = descs.get(fid)?;
                 // a generator yields a SINT64; the column must hold an
                 // integer (the engine coerces, but we store exact)
                 if !matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64) || d.scale != 0 {
@@ -9265,51 +9803,37 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                 // the generator must exist at prepare - else refuse rather
                 // than fail mid-write
                 generator_info(db, name)?;
-                gen_fields.push((rc.field_id as usize, name.clone(), *step));
+                gen_fields.push((fid, name.clone(), *step));
             }
             _ => {}
         }
     }
-    // IDENTITY columns (probed against FB6):
-    //   * OMITTED from the column list -> the next value from the
-    //     backing RDB$n generator, advanced by its own declared
-    //     increment - the ordinary gen_fields bump, which patches the
-    //     image BEFORE the Affected push and NOT-NULL validation, so
-    //     RETURNING answers the assigned id and validation passes.
-    //     START WITH / INCREMENT BY come free: the slot is primed to
-    //     start - increment (gate-verified in serve-real-identity.sh).
-    //   * an explicit value into a GENERATED ALWAYS column WITHOUT
-    //     OVERRIDING -> the engine refuses AT PREPARE with
-    //     isc_overriding_missing (335545137), and the IMPLICIT column
-    //     list counts too. fc used to accept and WRITE that row - the
-    //     one wrong write of this slice.
-    //   * an explicit value into a BY DEFAULT column -> stored as
-    //     given, the generator NOT advanced (probed: GEN_ID unmoved
-    //     after inserting 50 explicitly; later inserts may collide -
-    //     engine-faithful, keep).
-    for (fid, gen_name, idtype) in identity_columns(db, table) {
-        if targets.iter().any(|rc| rc.field_id as usize == fid) {
-            if idtype == 0 {
-                return Some((
-                    Plan::RefusedEval(EvalErr::OverridingMissing(format!(
-                        "\"PUBLIC\".\"{}\"",
-                        table.to_ascii_uppercase()
-                    ))),
-                    Vec::new(),
-                ));
-            }
-            // BY DEFAULT with an explicit value: leave alone
-        } else {
-            // the same prepare-time rules as an explicit GEN_ID
-            // target: an integer column, and a generator that exists -
-            // refuse rather than fail mid-write
-            let d = descs.get(fid)?;
-            if !matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64) || d.scale != 0 {
-                return None;
-            }
-            generator_info(db, &gen_name)?;
-            gen_fields.push((fid, gen_name, None));
+    // The identity columns [overriding_plan] handed to the GENERATOR.
+    // Each becomes an ordinary gen_fields bump, which patches the image
+    // BEFORE the Affected push and NOT-NULL validation, so RETURNING
+    // answers the value that actually landed (probed: OUV's RETURNING ID
+    // gives the GENERATED 10 for a supplied 9999) and the identity's
+    // implicit NOT NULL passes. START WITH / INCREMENT BY come free: the
+    // slot is primed to start - increment (gate-verified in
+    // serve-real-identity.sh).
+    //
+    // The columns NOT here keep their literal value and leave the
+    // generator alone - which is the engine's behaviour and its hazard:
+    // OSV and a plain explicit value into a BY DEFAULT column both let
+    // the sequence fall silently behind the table (probed: TA held 1005,
+    // 7001-7003 and 8888 while its generator was still at 10). Firebird
+    // never auto-syncs, so neither does this.
+    for fid in &generated {
+        let (_, gen_name, _) = idcols.iter().find(|(f, _, _)| f == fid)?;
+        // the same prepare-time rules as an explicit GEN_ID target: an
+        // integer column, and a generator that exists - refuse rather
+        // than fail mid-write
+        let d = descs.get(*fid)?;
+        if !matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64) || d.scale != 0 {
+            return None;
         }
+        generator_info(db, gen_name)?;
+        gen_fields.push((*fid, gen_name.clone(), None));
     }
     let params: Vec<Descriptor> = params.into_iter().collect::<Option<_>>()?;
     // the table's CHECK constraints; a check this server cannot
@@ -9321,9 +9845,11 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     // parent keys; an unresolvable FK catalog refuses, never bypasses
     let (fk_refs, _) = fk_partners(db, table, &columns)?;
     // the omitted columns' DEFAULTs - an unevaluatable one (a session
-    // id, an expression) refuses rather than writing a wrong NULL
-    let targeted: Vec<usize> = targets.iter().map(|rc| rc.field_id as usize).collect();
-    let default_fields = insert_defaults(db, table, &columns, &descs, &targeted)?;
+    // id, an expression) refuses rather than writing a wrong NULL.
+    // "Omitted" is `named`, not `listed`: a DEFAULT-keyword column asks
+    // for exactly this treatment, and `INSERT INTO T DEFAULT VALUES`
+    // names nothing at all, so every non-computed column is filled.
+    let default_fields = insert_defaults(db, table, &columns, &descs, &named)?;
     Some((
         Plan::Insert {
             rel,
@@ -9349,8 +9875,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
 /// table has one (the authoritative fmt_length); an empty table falls
 /// back to the aligned end of the last field.
 fn build_insert_image(
-    targets: &[&RelationColumn],
-    vals: &[InsVal],
+    landing: &[(&RelationColumn, &InsVal)],
     descs: &[Descriptor],
     db: &Database,
     rel: u16,
@@ -9393,7 +9918,11 @@ fn build_insert_image(
     for i in 0..descs.len() {
         image[i / 8] |= 1 << (i % 8);
     }
-    for (rc, v) in targets.iter().zip(vals) {
+    // `landing` is only the columns whose SUPPLIED value is written: the
+    // caller has already dropped the DEFAULT-keyword columns and the
+    // ones OVERRIDING USER VALUE discards, so those stay NULL-flagged
+    // here and are filled by insert_defaults / the generator at execute.
+    for &(rc, v) in landing {
         if matches!(v, InsVal::Param(_) | InsVal::GenId(..)) {
             continue; // stays NULL-flagged; execute binds/advances the value
         }
@@ -9424,8 +9953,12 @@ fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
         InsVal::Dec(r, s) => WireParam::Int(*r, *s),
         InsVal::Str(text) => WireParam::Text(text.clone()),
         InsVal::Bool(b) => WireParam::Bool(*b),
-        // parameters bind, generators advance, at execute - not here
-        InsVal::Param(_) | InsVal::GenId(..) => return None,
+        // parameters bind, generators advance, at execute - not here.
+        // DEFAULT never reaches an encoder at all: plan_insert drops a
+        // DEFAULT-valued column out of the image targets so the column
+        // falls to insert_defaults / the identity generator. This arm is
+        // the belt-and-braces refusal if it ever did.
+        InsVal::Param(_) | InsVal::GenId(..) | InsVal::Default => return None,
     };
     encode_wire_value(d, &wp)
 }
@@ -10088,19 +10621,16 @@ fn plan_upsert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     // the list is REQUIRED here (without it the engine reads the
     // column set from the catalog in field order; unconverted)
     let head = s[into_kw + "INTO".len()..vals_kw].trim();
-    let open = head.find('(')?;
-    let table = head[..open].trim().trim_matches('"').to_ascii_uppercase();
-    if !ident_ok(&table) {
+    // the same head grammar an INSERT has, OVERRIDING clause included -
+    // probed: `UPDATE OR INSERT INTO TA (ID,B) OVERRIDING SYSTEM VALUE
+    // VALUES (4242,'uoi') MATCHING (ID)` succeeds where the same
+    // statement without the clause answers 335545137
+    let (schema, tbl, collist, ov) = split_insert_head(head)?;
+    if !db.as_ref().is_some_and(|dbr| relation_qualifier_ok(dbr, schema, tbl)) {
         return None;
     }
-    let rest = head[open..].trim();
-    if !rest.ends_with(')') {
-        return None;
-    }
-    let cols = split_ident_list(&rest[1..rest.len() - 1])?;
-    if cols.is_empty() {
-        return None;
-    }
+    let table = tbl.to_ascii_uppercase();
+    let cols = collist?;
     // the (value list) - paren depth on the MASKED text, so parens
     // and commas inside string literals do not count
     let vopen = masked[vals_kw..].find('(')? + vals_kw;
@@ -10208,9 +10738,10 @@ fn plan_upsert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         wheres.join(" AND ")
     );
     let ins_sql = format!(
-        "INSERT INTO {} ({}) VALUES ({})",
+        "INSERT INTO {} ({}){} VALUES ({})",
         table,
         cols.join(", "),
+        ov.sql(),
         vals.join(", ")
     );
     let (update, ups) = plan_update(&upd_sql, db)?;
@@ -10218,13 +10749,16 @@ fn plan_upsert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     if !ups.is_empty() || !ips.is_empty() {
         return None;
     }
-    // the insert half can plan to a REFUSAL (an explicit value into a
-    // GENERATED ALWAYS identity) - wrapping that in UpdateOrInsert
-    // would move the error to execute time, AFTER the update half ran.
-    // The upsert form of that error is unprobed, so refuse generically
-    // at prepare: an error either way, and nothing written.
-    if matches!(insert, Plan::RefusedEval(_)) {
-        return None;
+    // The insert half can plan to a REFUSAL (an OVERRIDING / identity
+    // decision). Wrapping it in UpdateOrInsert would move the error to
+    // execute time, AFTER the update half ran; this used to refuse
+    // GENERICALLY instead, which is an error either way but the wrong
+    // vector. It is now probed: `UPDATE OR INSERT INTO TA (ID,B) VALUES
+    // (4242,'uoi') MATCHING (ID)` answers 335545137 - so ship the
+    // typed refusal at PREPARE, which is also correct because the
+    // update half must not have run.
+    if let Plan::RefusedEval(e) = insert {
+        return Some((Plan::RefusedEval(e), Vec::new()));
     }
     Some((
         Plan::UpdateOrInsert { update: Box::new(update), insert: Box::new(insert) },
@@ -10240,13 +10774,13 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         return None;
     }
     let set_kw = find_word(&masked, "SET", "UPDATE".len())?;
-    let table = s["UPDATE".len()..set_kw].trim().trim_matches('"');
-    if !ident_ok(table) {
-        return None;
-    }
+    let (schema, table) = dml_target_name(&s["UPDATE".len()..set_kw])?;
     let where_kw = find_word(&masked, "WHERE", set_kw + "SET".len());
 
     let db = db.as_ref()?;
+    if !relation_qualifier_ok(db, schema, table) {
+        return None;
+    }
     let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
     let columns = relation_columns(&db.bytes, db.page_size, table);
     let formats = relation_formats(&db.bytes, db.page_size, rel);
@@ -10327,7 +10861,14 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
             return None; // the same column set twice is invalid SQL
         }
         // a computed column is read-only - refuse rather than write
-        // into the null-flag area its offset-0 descriptor points at
+        // into the null-flag area its offset-0 descriptor points at.
+        //
+        // An IDENTITY column, by contrast, is NOT protected here and
+        // must not become so: GENERATED ALWAYS is enforced only on an
+        // INSERT's field list. Probed - `UPDATE TA SET ID = ID + 100000
+        // WHERE B = 'pov'` succeeds with no OVERRIDING clause and no
+        // error, turning 777777 into 877777. Do not "fix" this into an
+        // overriding_missing refusal; the engine allows it.
         if is_computed_fid(descs, fid) {
             return None;
         }
@@ -10454,13 +10995,11 @@ fn plan_delete(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     }
     let from_kw = find_word(&masked, "FROM", "DELETE".len())?;
     let where_kw = find_word(&masked, "WHERE", from_kw + "FROM".len());
-    let table = s[from_kw + "FROM".len()..where_kw.unwrap_or(s.len())]
-        .trim()
-        .trim_matches('"');
-    if !ident_ok(table) {
+    let (schema, table) = dml_target_name(&s[from_kw + "FROM".len()..where_kw.unwrap_or(s.len())])?;
+    let db = db.as_ref()?;
+    if !relation_qualifier_ok(db, schema, table) {
         return None;
     }
-    let db = db.as_ref()?;
     let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
     // no index guard here: DELETE never touches indexes - the engine's
     // VIO_erase does not either (entries outlive their records until
@@ -10776,8 +11315,9 @@ fn execute_dml_collecting(
     // order (probed: the engine writes the source rows and returns ALL
     // of them as a cursor, in select order; a zero-row source is an
     // empty cursor with records affected 0).
-    if let Plan::InsertSelect { table, cols, query } = plan {
-        return insert_select(table, cols, query, database, ctx, affected).map(|n| (n, 0, 0));
+    if let Plan::InsertSelect { table, cols, ov, src } = plan {
+        return insert_select(table, cols, *ov, src, database, args, ctx, affected)
+            .map(|n| (n, 0, 0));
     }
     if let Plan::RefusedEval(e) = plan {
         return Err(ExecErr::Eval(e.clone()));
@@ -12468,13 +13008,59 @@ fn select_formats(db: &Database, table: &str, rel: u16) -> Vec<(u8, Vec<Descript
     fire_crab_ods::system_relation_formats(&db.bytes, db.page_size, table).unwrap_or_default()
 }
 
-/// One side of a FROM clause: a table name and its optional alias.
+/// One side of a FROM clause: a relation name, its optional SCHEMA
+/// qualifier, and its optional alias.
+///
+/// THE QUALIFIER NEVER LEAVES THE PARSER. Everything downstream reads
+/// `table`, which is the BARE name, because qualification is INVISIBLE
+/// in the engine's describe: probed, `SELECT * FROM T` and `SELECT *
+/// FROM PUBLIC.T` describe byte-identically (item 17 the bare relation,
+/// item 25 the alias-or-empty-string, item 33 the schema). Leaking
+/// `PUBLIC.T` into a `ProjCol.relation` is a silent describe corruption
+/// no row-comparison gate would catch.
 struct TableRef<'a> {
+    /// the BARE relation name - a subslice of the SQL with its quotes
+    /// stripped. `splice_ctes` turns this back into a byte offset by
+    /// pointer arithmetic, so it must never become owned.
     table: &'a str,
+    /// was the relation half written QUOTED? Only the -204 rendering
+    /// needs it. The LOOKUP stays case-insensitive: `resolve_relation`
+    /// compares with `eq_ignore_ascii_case`, so `FROM "t"` answers here
+    /// where the engine raises. Pre-existing asymmetry, NOT widened by
+    /// this slice - the schema half below does honour case.
+    quoted: bool,
+    /// the SCHEMA half AS WRITTEN (quotes stripped, the quoted flag
+    /// kept - the engine matches a quoted schema case-sensitively).
+    /// None for an unqualified item, and that None is what every
+    /// namespace test downstream keys on: a QUALIFIED reference bypasses
+    /// the CTE/bound namespace entirely (probed: `FROM PUBLIC.C1` is
+    /// -204 even with a CTE C1, and `FROM PUBLIC.T` SHADOWS a CTE T).
+    schema: Option<NamePart<'a>>,
+    /// the whole dotted span exactly as written - a subslice, so
+    /// [text_line_col] can place the -204's line/column at the START of
+    /// the qualifier, which is where the engine points it (probed:
+    /// `SELECT COUNT(*) FROM PUBLIC.RDB$RELATIONS` reports column 22,
+    /// the `P` of PUBLIC)
+    span: &'a str,
     alias: Option<&'a str>,
 }
 
-/// Parse a table reference: `NAME` or `NAME ALIAS`.
+impl<'a> TableRef<'a> {
+    /// The reference as the engine's -204 argument spells it: one part
+    /// when the user wrote one, two when the user wrote two. Probed: the
+    /// arity of the name in the message mirrors the arity WRITTEN.
+    fn quoted_name(&self) -> String {
+        let mut parts: Vec<NamePart<'_>> = Vec::new();
+        if let Some(q) = self.schema {
+            parts.push(q);
+        }
+        parts.push((self.table, self.quoted));
+        quoted_name_parts(&parts)
+    }
+}
+
+/// Parse a table reference: `[SCHEMA.]NAME`, optionally followed by
+/// `[AS] ALIAS`.
 fn parse_table_ref(s: &str) -> Option<TableRef<'_>> {
     // A DERIVED TABLE is a table reference whose "name" is a whole
     // query. Splitting on whitespace would tear it apart, so the paren
@@ -12506,22 +13092,58 @@ fn parse_table_ref(s: &str) -> Option<TableRef<'_>> {
         if !ident_ok(alias) {
             return None;
         }
-        return Some(TableRef { table: &t[..span_end], alias: Some(alias) });
+        return Some(TableRef {
+            table: &t[..span_end],
+            quoted: false,
+            schema: None,
+            span: &t[..span_end],
+            alias: Some(alias),
+        });
     }
-    let toks: Vec<&str> = s.split_whitespace().collect();
-    let (table, alias) = match toks.as_slice() {
-        [t] => (t.trim_matches('"'), None),
-        [t, a] => (t.trim_matches('"'), Some(a.trim_matches('"'))),
-        // `FROM EMP AS E` - the keyword form of the same alias
-        [t, kw, a] if kw.eq_ignore_ascii_case("AS") => {
-            (t.trim_matches('"'), Some(a.trim_matches('"')))
-        }
+    // A QUALIFIED NAME IS ONE SPAN WITH DOTS IN IT, and the dot is its
+    // own token to the engine - `PUBLIC . T` and `PUBLIC\n.T` name the
+    // same relation (probed). Splitting on whitespace, which is what
+    // this used to do, made `PUBLIC . T` three tokens and `PUBLIC.T` a
+    // name `ident_ok` rejected for its dot. `split_name_parts` measures
+    // the whole span; the ALIAS is whatever follows it.
+    let (parts, span_len) = split_name_parts(t, 2)?;
+    let (schema, name) = match parts.as_slice() {
+        [n] => (None, *n),
+        [q, n] => (Some(*q), *n),
+        // three parts is a packaged selectable procedure
+        // (`SYSTEM.RDB$TIME_ZONE_UTIL.TRANSITIONS(...)`), not a
+        // relation - out of slice, and refusing keeps it that way
         _ => return None,
     };
-    if !ident_ok(table) || alias.is_some_and(|a| !ident_ok(a)) {
+    // a BARE name keeps today's `ident_ok` gate; a QUOTED one is taken
+    // verbatim, which is how `"Emp"` has always worked here
+    if !name.1 && !ident_ok(name.0) {
         return None;
     }
-    Some(TableRef { table, alias })
+    let rest = t[span_len..].trim();
+    let alias = if rest.is_empty() {
+        None
+    } else {
+        // `FROM EMP AS E` - the keyword form of the same alias
+        let a = match rest.split_once(char::is_whitespace) {
+            Some((kw, tail)) if kw.eq_ignore_ascii_case("AS") => tail.trim(),
+            _ => rest,
+        };
+        // ONE token after the name, or this is not a table reference at
+        // all. In particular `FROM PUBLIC.PW6(5)` must still be None so
+        // `split_proc_call` stays the only handler for a procedure call
+        // in the FROM - fire-crab must not assume a dotted FROM item is
+        // a table.
+        if a.split_whitespace().count() != 1 {
+            return None;
+        }
+        let a = a.trim_matches('"');
+        if !ident_ok(a) {
+            return None;
+        }
+        Some(a)
+    };
+    Some(TableRef { table: name.0, quoted: name.1, schema, span: &t[..span_len], alias })
 }
 
 /// Parse a FROM clause into its left table and - if there is one - the
@@ -12708,12 +13330,27 @@ fn parse_from(
     Some((left, vec![(kind, right, on_s, 0)]))
 }
 
-/// Split a possibly-qualified column name into (qualifier, column), each
-/// stripped of double quotes.
-fn split_qual(name: &str) -> (Option<&str>, &str) {
-    match name.split_once('.') {
-        Some((q, c)) => (Some(q.trim_matches('"')), c.trim_matches('"')),
-        None => (None, name.trim_matches('"')),
+/// Split a column reference into (schema, relation-or-alias, column).
+///
+/// THE COLUMN IS THE LAST PART, so the split is from the RIGHT: a 2-part
+/// reference is always TABLE.COLUMN and never SCHEMA.COLUMN. Probed:
+/// `SELECT PUBLIC.C FROM PUBLIC.T` is -206 `"PUBLIC"."C"` even though a
+/// schema of that name exists and is the only sensible reading of it.
+///
+/// Text that is not a dotted name at all (an expression, a `*`, a
+/// literal) comes back as a bare column, which is the fall-through the
+/// callers have always had.
+fn split_col_ref(name: &str) -> (Option<NamePart<'_>>, Option<NamePart<'_>>, &str) {
+    let t = name.trim();
+    let whole = match split_name_parts(t, 3) {
+        Some((parts, len)) if len == t.len() => parts,
+        _ => return (None, None, t.trim_matches('"')),
+    };
+    match whole.as_slice() {
+        [c] => (None, None, c.0),
+        [q, c] => (None, Some(*q), c.0),
+        [s, q, c] => (Some(*s), Some(*q), c.0),
+        _ => (None, None, t.trim_matches('"')),
     }
 }
 
@@ -12724,16 +13361,23 @@ fn split_qual(name: &str) -> (Option<&str>, &str) {
 /// (an arithmetic expression like `N + 1.5`, a bare literal) falls through
 /// to expression parsing instead.
 fn is_qualified_col(body: &str) -> bool {
-    match body.split_once('.') {
-        Some((q, c)) => {
-            let q = q.trim_matches('"');
-            let c = c.trim_matches('"');
-            matches!(q.chars().next(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_' || ch == '$')
-                && ident_ok(q)
-                && ident_ok(c)
-        }
-        None => false,
+    let t = body.trim();
+    // TWO OR THREE parts: `SCHEMA.TABLE.COLUMN` is legal wherever
+    // `TABLE.COLUMN` is (probed, in the select list, WHERE, GROUP BY,
+    // HAVING and ORDER BY alike). Without the three-part case a join's
+    // select list drops such an item into the expression parser, which
+    // refuses it.
+    let Some((parts, len)) = split_name_parts(t, 3) else {
+        return false;
+    };
+    if len != t.len() || parts.len() < 2 {
+        return false;
     }
+    // the FIRST part must START like an identifier - a leading digit
+    // makes `1.5` a decimal literal, not a qualified column
+    let head = parts[0];
+    (head.1 || matches!(head.0.chars().next(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_' || ch == '$'))
+        && parts.iter().all(|p| p.1 || ident_ok(p.0))
 }
 
 /// One side of a join during planning: the name a qualifier must match
@@ -12742,6 +13386,14 @@ fn is_qualified_col(body: &str) -> bool {
 /// descriptors, and this side's offset into the combined row.
 struct JoinSide {
     key: String,
+    /// the schema a 3-PART qualifier must name to reach this side: the
+    /// relation's own schema, and only for an UNALIASED table or view
+    /// side. A derived, CTE or bound side has none - its binding alias
+    /// is the only way in, which is what the engine does too, and an
+    /// ALIAS IS EXCLUSIVE there as everywhere (probed: after `FROM
+    /// PUBLIC.T AS X` all of `T.C`, `PUBLIC.T.C` and `PUBLIC.X.C` are
+    /// -206).
+    schema: Option<String>,
     /// where this side's rows come from - a relation to scan, or an
     /// inner plan when the side is a DERIVED TABLE
     src: RowSource,
@@ -12776,7 +13428,7 @@ fn resolve_join_col<'a>(
     sides: &'a [JoinSide],
     name: &str,
 ) -> Option<(usize, &'a Descriptor, &'a str)> {
-    let (qual, col) = split_qual(name);
+    let (schema, qual, col) = split_col_ref(name);
     let hit = |side: &'a JoinSide| -> Option<(usize, &'a Descriptor, &'a str)> {
         let rc = side.columns.iter().find(|c| {
             c.name.eq_ignore_ascii_case(col)
@@ -12790,11 +13442,26 @@ fn resolve_join_col<'a>(
         let d = side.descs.get(rc.field_id as usize)?;
         Some((side.offset + rc.field_id as usize, d, rc.name.as_str()))
     };
-    match qual {
-        Some(q) => hit(sides.iter().find(|s| s.key.eq_ignore_ascii_case(q))?),
+    match (schema, qual) {
+        // A 3-PART reference names (schema, relation) and reaches only a
+        // side that HAS a schema - an unaliased table or view. Note the
+        // engine's ambiguity law (`SELECT T.C FROM PUBLIC.T, S1.T` is
+        // gdscode 336003085, a vector of its own with no dsql_error
+        // wrapper and no line/col): fire-crab holds ONE user schema, so
+        // two same-named relations cannot occur here and that vector is
+        // UNREACHABLE - recorded, not implemented.
+        (Some(s), Some(q)) => hit(sides.iter().find(|side| {
+            side.schema.as_deref().is_some_and(|sc| part_is(s, sc))
+                && side.key.eq_ignore_ascii_case(q.0)
+        })?),
+        // `side.key` is already alias-or-relation, so ALIAS EXCLUSIVITY
+        // is right here without a change: once a side is aliased its
+        // relation name is not a key at all
+        (None, Some(q)) => hit(sides.iter().find(|s| s.key.eq_ignore_ascii_case(q.0))?),
+        (Some(_), None) => None,
         // a bare name must hit EXACTLY ONE side - with three tables in
         // the FROM there are three chances to be ambiguous, not one
-        None => {
+        (None, None) => {
             let mut found = None;
             for side in sides {
                 if let Some(h) = hit(side) {
@@ -12902,6 +13569,20 @@ fn combined_view(sides: &[JoinSide]) -> (Vec<RelationColumn>, Vec<Descriptor>) {
                 field_id: idx as u16,
                 position: idx as u16,
             });
+            // and the 3-PART spelling, for a side a schema can reach -
+            // an UNALIASED table or view. The expression resolvers
+            // (`ON PUBLIC.T.C = PUBLIC.U.C`, a WHERE, a GROUP BY key)
+            // match this view by NAME, so the qualified form has to be
+            // in it or a legal reference falls through to the bare name
+            // and is refused as ambiguous. Never ambiguous itself: one
+            // user schema, and the side keys already differ.
+            if let Some(sc) = &side.schema {
+                comb_cols.push(RelationColumn {
+                    name: format!("{}.{}.{}", sc, side.key, rc.name),
+                    field_id: idx as u16,
+                    position: idx as u16,
+                });
+            }
             // a merged-away column is not a second column of that name -
             // a NATURAL join made the pair ONE - so it does not make the
             // bare name ambiguous
@@ -13112,6 +13793,9 @@ fn plan_join_bound(
             let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
             sides.push(JoinSide {
                 key: tr.alias?.to_string(),
+                // a DERIVED side has no relation and so no schema: its
+                // mandatory alias is the only way to name it
+                schema: None,
                 src: RowSource::PlanRows(std::rc::Rc::new(inner)),
                 columns,
                 descs,
@@ -13128,6 +13812,15 @@ fn plan_join_bound(
             });
             continue;
         }
+        // THE SCHEMA HALF, again and for the same reason as the lone
+        // FROM item: a wrongly qualified VIEW that slipped past here
+        // would reach `resolve_relation` and scan a view's empty
+        // storage. `plan_query_inner`'s gate has already spoken for an
+        // ordinary statement; this covers the paths that reach a join
+        // through rewritten text (a bound CTE, a view row source).
+        if !relation_qualifier_ok(db, tr.schema, tr.table) {
+            return None;
+        }
         // A VIEW is a side whose rows come from a PLAN. It has to be
         // tried BEFORE `resolve_relation`, because a view IS a relation
         // with an id - and one with no records of its own, so scanning
@@ -13137,6 +13830,9 @@ fn plan_join_bound(
             let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
             sides.push(JoinSide {
                 key: tr.alias.unwrap_or(tr.table).to_string(),
+                // a view is a relation like any other, and an ALIAS
+                // kills the 3-part binding as it kills the bare one
+                schema: tr.alias.is_none().then(|| relation_schema(db, tr.table)).flatten(),
                 src: RowSource::PlanRows(std::rc::Rc::new(inner)),
                 columns,
                 descs,
@@ -13153,13 +13849,17 @@ fn plan_join_bound(
             });
             continue;
         }
-        // the BOUND name is a side whose rows are already here
+        // the BOUND name is a side whose rows are already here - and
+        // only ever under its BARE name: a CTE cannot be referenced
+        // qualified, so `PUBLIC.C1` names no CTE (see splice_ctes)
         if let Some((bname, bcols, bsrc)) = bound {
-            if tr.table.eq_ignore_ascii_case(bname) {
+            if tr.schema.is_none() && tr.table.eq_ignore_ascii_case(bname) {
                 let (columns, descs) = derived_view(bcols);
                 let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
                 sides.push(JoinSide {
                     key: tr.alias.unwrap_or(tr.table).to_string(),
+                    // a CTE lives in the statement, not in a schema
+                    schema: None,
                     src: bsrc.clone(),
                     columns,
                     descs,
@@ -13198,6 +13898,7 @@ fn plan_join_bound(
         let fnames = vec![None; descs.len()];
         sides.push(JoinSide {
             key: tr.alias.unwrap_or(tr.table).to_string(),
+            schema: tr.alias.is_none().then(|| relation_schema(db, tr.table)).flatten(),
             src: RowSource::TableScan {
                 rel,
                 formats,
@@ -13686,6 +14387,16 @@ fn splice_ctes(sql: &str, ctes: &[(String, ViewDef)]) -> Option<String> {
     // move a later one's position
     let mut splices: Vec<(usize, usize, String)> = Vec::new();
     for tr in std::iter::once(&from).chain(join.iter().map(|(_, r, _, _)| r)) {
+        // A QUALIFIED REFERENCE BYPASSES THE CTE NAMESPACE. A CTE name
+        // can be neither defined nor referenced with a schema (probed:
+        // `WITH PUBLIC.C1 AS ...` is a -104 at the dot, `FROM PUBLIC.C1`
+        // a plain -204 Table unknown), and a qualified reference SHADOWS
+        // a same-named CTE - `WITH T AS (...) SELECT * FROM PUBLIC.T`
+        // answers the BASE TABLE's rows. Splicing the body in here would
+        // answer the CTE instead.
+        if tr.schema.is_some() {
+            continue;
+        }
         let Some((_, def)) = ctes.iter().find(|(n, _)| n.eq_ignore_ascii_case(tr.table)) else {
             continue;
         };
@@ -13861,8 +14572,11 @@ fn plan_over_source(
             Some((name, cols, &src.into_row_source())),
         );
     }
-    if !from.table.eq_ignore_ascii_case(name) {
-        return None; // the bound name must BE the FROM
+    // the bound name must BE the FROM - and BARE: a bound name is a CTE,
+    // a derived table or a view standing in for itself, none of which a
+    // schema qualifier can reach (see splice_ctes)
+    if from.schema.is_some() || !from.table.eq_ignore_ascii_case(name) {
+        return None;
     }
     let alias = from.alias.unwrap_or(from.table);
     // the OUTERMOST binding wins (probed: `((...) D1) D2` answers D2,
@@ -13879,7 +14593,10 @@ fn plan_over_source(
     // straight on top of them.
     // the alias qualifies these columns - or the name, when the FROM
     // item carries no alias of its own
-    let unq = |t: &str| unqualify_single(t, &[alias]).unwrap_or_else(|| t.to_string());
+    // a BOUND source - a CTE, a derived table, a view standing in for
+    // itself - lives in no schema, so it has no 3-part binding
+    let bind = ColBinding { key: alias, qual: None };
+    let unq = |t: &str| unqualify_single(t, &bind).unwrap_or_else(|| t.to_string());
     let items_for_group = match parse_projection(&unq(proj_s))?
     {
         Proj::Items(v) => Some(v),
@@ -14059,9 +14776,11 @@ fn bound_refs(sql: &str, name: &str) -> usize {
     let Some((from, joins)) = parse_from(table_s) else {
         return 0;
     };
-    std::iter::once(from.table)
-        .chain(joins.iter().map(|(_, r, _, _)| r.table))
-        .filter(|t| t.eq_ignore_ascii_case(name))
+    // a QUALIFIED item never names the CTE (probed: `FROM PUBLIC.C1` is
+    // -204), so it is not a self-reference either
+    std::iter::once(&from)
+        .chain(joins.iter().map(|(_, r, _, _)| r))
+        .filter(|tr| tr.schema.is_none() && tr.table.eq_ignore_ascii_case(name))
         .count()
 }
 
@@ -14240,6 +14959,117 @@ fn view_of(db: &Database, name: &str) -> Option<ViewDef> {
     Some(ViewDef { source, cols: cols.into_iter().map(|(_, n)| n).collect() })
 }
 
+/// The schema a relation ACTUALLY lives in, read out of RDB$RELATIONS
+/// the way [view_of] reads RDB$VIEW_SOURCE: `RDB$SCHEMA_NAME` when the
+/// ODS carries that column, else the SYSTEM/PUBLIC split of
+/// `RDB$SYSTEM_FLAG`. None when neither column is there (a pre-schema
+/// ODS) or the relation is absent - the caller must then REFUSE a
+/// qualified spelling rather than guess at one.
+///
+/// THIS IS A REAL CATALOG READ, not the `RDB$`/`MON$`/`SEC$` name prefix
+/// describe item 33 uses. Probed this session: `CREATE TABLE "RDB$FOO"`
+/// is accepted and lands in PUBLIC with `RDB$SYSTEM_FLAG` 0, so the
+/// prefix rule would ANSWER `SELECT COUNT(*) FROM SYSTEM."RDB$FOO"`
+/// where the engine raises -204 - a wrong answer, which this file's
+/// convention forbids.
+///
+/// Costs one RDB$RELATIONS scan. Paid ONLY by a FROM item that carries a
+/// qualifier or by a 3-part column reference; an unqualified query never
+/// reaches here. Accepted cost.
+fn relation_schema(db: &Database, name: &str) -> Option<String> {
+    let (rcols, rdescs) = sys_rel(db, "RDB$RELATIONS")?;
+    let fid = |n: &str| rcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let name_f = fid("RDB$RELATION_NAME")?;
+    let schema_f = fid("RDB$SCHEMA_NAME");
+    let flag_f = fid("RDB$SYSTEM_FLAG");
+    let fmts = vec![(0u8, rdescs)];
+    let mut found: Option<String> = None;
+    for_each_record(db, 6, &fmts, |v| {
+        let hit = matches!(v.get(name_f),
+            Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
+        if !hit || found.is_some() {
+            return;
+        }
+        // the stored schema wins when the ODS has it; the system flag is
+        // the pre-schema stand-in, and fire-crab holds exactly one
+        // schema of each kind (see the one-user-schema boundary)
+        found = match schema_f.and_then(|i| v.get(i)) {
+            Some(Value::Text(t)) => Some(t.trim_end().to_string()),
+            _ => match flag_f.and_then(|i| v.get(i)) {
+                Some(Value::Int(0)) => Some("PUBLIC".to_string()),
+                Some(Value::Int(_)) => Some("SYSTEM".to_string()),
+                _ => None,
+            },
+        };
+    });
+    found
+}
+
+/// THE RELATION SCHEMA RULE, and it is a TWO-WAY CHECK rather than a
+/// strip. An UNQUALIFIED name always resolves - the default search path
+/// is `"PUBLIC", "SYSTEM"` and fire-crab holds one schema of each kind.
+/// A QUALIFIED one resolves only when the qualifier names the schema the
+/// relation is ACTUALLY in: probed, `SYSTEM.RDB$RELATIONS` answers while
+/// `PUBLIC.RDB$RELATIONS` and `SYSTEM.T` both raise -204.
+///
+/// [public_object_name]'s strip-PUBLIC-else-refuse rule - right for
+/// procedures and generators, which fire-crab only ever holds in PUBLIC
+/// - is WRONG here for exactly that reason and must not be reused.
+fn relation_qualifier_ok(db: &Database, schema: Option<NamePart<'_>>, relation: &str) -> bool {
+    match schema {
+        None => true,
+        Some(q) => relation_schema(db, relation).is_some_and(|s| part_is(q, &s)),
+    }
+}
+
+/// What a column qualifier may name in a ONE-RELATION query.
+///
+/// AN ALIAS IS EXCLUSIVE. After `FROM PUBLIC.T AS X` the engine resolves
+/// only `X.C`: `T.C`, `PUBLIC.T.C` and `PUBLIC.X.C` are all -206
+/// (probed). So the alias, when there is one, is the ONLY key and the
+/// 3-part form is unavailable - which is also why this is a single
+/// `key` and not the two-element allow-list it replaced. That list made
+/// fire-crab ANSWER `SELECT T.C FROM T X` where the engine raises; the
+/// statement now refuses, a tightening a differential gate cannot have
+/// depended on.
+struct ColBinding<'a> {
+    /// the 2-part qualifier that resolves: the alias, else the relation
+    key: &'a str,
+    /// the 3-part (schema, relation) prefix - Some only when the FROM
+    /// item is UNALIASED. Built from the RESOLVED schema, never from the
+    /// FROM text, because `SELECT PUBLIC.T.C FROM T` is legal too: the
+    /// reference is matched against the (schema, relation) pair the
+    /// context resolved to (probed).
+    qual: Option<(String, &'a str)>,
+}
+
+/// The identifier (bare or `"quoted"`) starting at `at`, and the index
+/// just past it - the same identifier rule [unqualify_single]'s main
+/// walk uses, so the two cannot disagree about where a name ends.
+fn ident_span(b: &[char], at: usize) -> Option<(String, usize)> {
+    let mut i = at;
+    if i >= b.len() {
+        return None;
+    }
+    if b[i] == '"' {
+        i += 1;
+        while i < b.len() && b[i] != '"' {
+            i += 1;
+        }
+        if i >= b.len() {
+            return None;
+        }
+        i += 1;
+    } else if b[i].is_alphabetic() || b[i] == '_' {
+        while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$') {
+            i += 1;
+        }
+    } else {
+        return None;
+    }
+    Some((b[at..i].iter().collect(), i))
+}
+
 /// Drop a qualifier that names the query's ONE relation: `E.ID` and
 /// `EMP.ID` both mean `ID` when the FROM is `EMP E`.
 ///
@@ -14255,7 +15085,7 @@ fn view_of(db: &Database, name: &str) -> Option<ViewDef> {
 /// this pass runs before anything knows what is in scope there.
 ///
 /// Returns None when there was nothing to strip.
-fn unqualify_single(text: &str, allowed: &[&str]) -> Option<String> {
+fn unqualify_single(text: &str, bind: &ColBinding<'_>) -> Option<String> {
     let b: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
     let mut i = 0usize;
@@ -14331,17 +15161,65 @@ fn unqualify_single(text: &str, allowed: &[&str]) -> Option<String> {
                 }
             }
             let word: String = b[start..i].iter().collect();
+            let quoted = word.starts_with('"');
             let bare = word.trim_matches('"');
             // a qualifier is an identifier immediately followed by a dot
             // and another identifier (or a star)
-            let qualifies = i < b.len()
-                && b[i] == '.'
-                && i + 1 < b.len()
-                && (b[i + 1].is_alphabetic() || b[i + 1] == '_' || b[i + 1] == '"' || b[i + 1] == '*');
-            if qualifies && allowed.iter().any(|a| a.eq_ignore_ascii_case(bare)) {
-                i += 1; // the dot goes with the qualifier
-                hit = true;
-                continue;
+            let follows = |at: usize| {
+                at < b.len()
+                    && b[at] == '.'
+                    && at + 1 < b.len()
+                    && (b[at + 1].is_alphabetic()
+                        || b[at + 1] == '_'
+                        || b[at + 1] == '"'
+                        || b[at + 1] == '*')
+            };
+            // A QUALIFIER IS NEVER ITSELF QUALIFIED. When an identifier
+            // is preceded by a dot it is the MIDDLE of a longer dotted
+            // name whose head did not match, and stripping it would
+            // corrupt the name rather than resolve it: `"public".T.C`
+            // would become `"public".C`, and `PUBLIC.X.C` (an alias X,
+            // which the engine answers -206 for) would become
+            // `PUBLIC.C`. Both must stay whole so the refusal stands.
+            let inner = start > 0 && b[start - 1] == '.';
+            if follows(i) && !inner {
+                // THE 3-PART PREFIX IS TRIED FIRST, and the ordering is
+                // load-bearing. With the 2-part rule alone, `PUBLIC.T.C`
+                // scans PUBLIC (not the key, so emitted verbatim) then T
+                // (the key, so stripped) and produces the corrupted
+                // `PUBLIC.C` no resolver can match.
+                if let Some((sch, rel)) = &bind.qual {
+                    if part_is((bare, quoted), sch) {
+                        if let Some((seg, after)) = ident_span(&b, i + 1) {
+                            // the relation half stays case-insensitive,
+                            // as `resolve_relation` is; only the SCHEMA
+                            // half honours quoting (see TableRef.quoted)
+                            if seg.trim_matches('"').eq_ignore_ascii_case(rel) && follows(after) {
+                                i = after + 1; // both segments, both dots
+                                hit = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                // A QUOTED qualifier compares EXACTLY, the rule
+                // `wrap_returning` already spells out for the DML side
+                // (probed: `RETURNING "t".ID` is -206 `"t"."ID"` while
+                // `"T".ID` and `t.ID` both answer). It is compared
+                // against the key AS WRITTEN *and* against its folded
+                // form, because a bare FROM item does not preserve the
+                // catalog's case - `FROM t` binds the relation T, and
+                // `"T".C` over it is the engine's own spelling.
+                let key_hit = if quoted {
+                    bare == bind.key || bare == bind.key.to_ascii_uppercase()
+                } else {
+                    bind.key.eq_ignore_ascii_case(bare)
+                };
+                if key_hit {
+                    i += 1; // the dot goes with the qualifier
+                    hit = true;
+                    continue;
+                }
             }
             out.push_str(&word);
             continue;
@@ -15148,9 +16026,16 @@ fn plan_query_inner(
             let names_cte = split_query(&cur)
                 .and_then(|(_, t, _, _, _, _)| parse_from(t))
                 .map(|(from, join)| {
-                    std::iter::once(from.table)
-                        .chain(join.iter().map(|(_, r, _, _)| r.table))
-                        .any(|t| ctes.iter().any(|(n, _)| n.eq_ignore_ascii_case(t)))
+                    // a QUALIFIED item names a BASE RELATION even when a
+                    // CTE shares its name - without this test `WITH T AS
+                    // (...) SELECT * FROM PUBLIC.T` would refuse here
+                    // where the engine answers the base table
+                    std::iter::once(&from)
+                        .chain(join.iter().map(|(_, r, _, _)| r))
+                        .any(|tr| {
+                            tr.schema.is_none()
+                                && ctes.iter().any(|(n, _)| n.eq_ignore_ascii_case(tr.table))
+                        })
                 })
                 .unwrap_or(false)
                 || parse_derived_table(
@@ -15187,7 +16072,10 @@ fn plan_query_inner(
                 eprintln!("[srv] plan: WITH expanded to {:?}", cur);
             }
             params.clear();
-            return plan_query_inner(&cur, db, params);
+            // the CTE text is REWRITTEN - a positional refusal computed
+            // against it would name the wrong column (see
+            // [downgrade_rewritten])
+            return plan_query_inner(&cur, db, params).map(downgrade_rewritten);
         }
     }
 
@@ -15203,6 +16091,24 @@ fn plan_query_inner(
         let Some(plan) = plan_query_inner(&inner_sql, db, params) else {
             return Some(Plan::Refused);
         };
+        // A SPECIFIC refusal from the inner plan travels UP unchanged -
+        // but only for the POSITION-FREE vectors. Probed:
+        // FIRST/SKIP/DISTINCT/ROWS do not move the isc_invalid_blr
+        // offset at all (`SELECT FIRST 1 * FROM ABO(1,2)` and
+        // `SELECT * FROM ABO(1,2)` both report 54; `DISTINCT X` reports
+        // 50 because the SELECT LIST shrank, which proc_blr_offset
+        // already counts), and the arity vector carries no position.
+        // The -84 vector DOES carry a line/column and the modifier MOVES
+        // it (probed: column 15 bare, 23 under `FIRST 1`) - inner_sql is
+        // rewritten text, so that one stays downgraded to the generic
+        // refusal by the allow-list below.
+        if matches!(
+            plan,
+            Plan::RefusedEval(EvalErr::NotSelectable { .. })
+                | Plan::RefusedEval(EvalErr::ProcArgMismatch(_))
+        ) {
+            return Some(plan);
+        }
         // ProcSelect is the DEFERRED form of a selectable procedure: the
         // body runs at op_execute and the plan becomes ProcRows, so a
         // modifier may wrap one and the execute hook unwraps a level.
@@ -15561,7 +16467,9 @@ fn plan_query_inner(
                     eprintln!("[srv] plan: select-list subqueries folded to {:?}", out);
                 }
                 params.clear();
-                let mut plan = plan_query_inner(&out, db, params)?;
+                // folded text: the FROM item has moved, so a positional
+                // refusal from it is downgraded ([downgrade_rewritten])
+                let mut plan = downgrade_rewritten(plan_query_inner(&out, db, params)?);
                 for (idx, fname, rel, ralias) in &fname_patches {
                     match &mut plan {
                         Plan::Project { cols, .. }
@@ -15593,6 +16501,64 @@ fn plan_query_inner(
         }
     }
 
+    // THE SCHEMA HALF, DECIDED AGAINST THE CATALOG, AND DECIDED HERE.
+    // `parse_table_ref` hands the qualifier through unapplied; this is
+    // the one place that checks it, and it runs BEFORE everything that
+    // resolves a FROM item - the qualifier strip, the MON$ shortcut, the
+    // selectable-procedure branch, the view row source and
+    // `resolve_relation` itself.
+    //
+    // It has to be before the VIEW branch in particular: a view is a
+    // relation with an id and NO records of its own, so a wrongly
+    // qualified view that reached `resolve_relation` would scan empty
+    // storage and answer ZERO ROWS - a wrong answer wearing an empty
+    // result's clothes.
+    if let Some(dbr) = db.as_ref() {
+        if let Some((from, join)) = parse_from(table_s) {
+            let refs: Vec<&TableRef<'_>> = std::iter::once(&from)
+                .chain(join.iter().map(|(_, r, _, _)| r))
+                .collect();
+            // an unqualified query pays nothing: `relation_schema` is a
+            // full RDB$RELATIONS scan and only a qualifier needs it
+            if refs.iter().any(|tr| tr.schema.is_some()) {
+                // A qualified FROM item may be a SELECTABLE PROCEDURE
+                // rather than a relation (probed: `FROM
+                // SYSTEM.RDB$TIME_ZONE_UTIL.TRANSITIONS(...)` answers),
+                // so `split_proc_call`'s PUBLIC rule keeps first refusal
+                // on it - the same ordering `PUBLIC.PW6(5)` relies on.
+                let is_proc = join.is_empty()
+                    && split_proc_call(table_s)
+                        .is_some_and(|(n, _)| load_procedure(dbr, &n).is_some());
+                if !is_proc {
+                    for tr in &refs {
+                        if relation_qualifier_ok(dbr, tr.schema, tr.table) {
+                            continue;
+                        }
+                        if trace {
+                            eprintln!(
+                                "[srv] plan: {} is not in schema {:?}",
+                                tr.table,
+                                tr.schema.map(|q| q.0)
+                            );
+                        }
+                        return Some(match text_line_col(sql, tr.span) {
+                            Some((line, col)) => Plan::RefusedEval(EvalErr::TableUnknown {
+                                name: tr.quoted_name(),
+                                line,
+                                col,
+                            }),
+                            // REWRITTEN text: the column would be a
+                            // fabricated number in a status vector this
+                            // file compares byte for byte, so the
+                            // generic refusal stands
+                            None => Plan::Refused,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     // A QUALIFIED column in a ONE-TABLE query - `SELECT E.ID FROM EMP E`
     // - is stripped to its bare name and the whole statement re-planned,
     // so every clause gets it at once rather than each resolver learning
@@ -15600,16 +16566,28 @@ fn plan_query_inner(
     // anything else is left for whoever owns it.
     if let Some((from1, join1)) = parse_from(table_s) {
         if join1.is_empty() {
-            let mut allowed: Vec<&str> = vec![from1.table];
-            if let Some(a) = from1.alias {
-                allowed.push(a);
-            }
-            if let Some(rewritten) = unqualify_single(sql, &allowed) {
+            // the ALIAS, when there is one, is the ONLY key - and it
+            // kills the 3-part form with it (see [ColBinding])
+            let bind = ColBinding {
+                key: from1.alias.unwrap_or(from1.table),
+                // `relation_schema` is a full RDB$RELATIONS scan, so it
+                // is asked only when the text could carry a dotted name
+                // at all - a query without one pays nothing
+                qual: match (from1.alias, db.as_ref()) {
+                    (None, Some(dbr)) if sql.contains('.') => {
+                        relation_schema(dbr, from1.table).map(|s| (s, from1.table))
+                    }
+                    _ => None,
+                },
+            };
+            if let Some(rewritten) = unqualify_single(sql, &bind) {
                 if trace {
                     eprintln!("[srv] plan: unqualified to {:?}", rewritten);
                 }
                 params.clear();
-                return plan_query_inner(&rewritten, db, params);
+                // the qualifier strip moves every later character, so a
+                // positional refusal is downgraded ([downgrade_rewritten])
+                return plan_query_inner(&rewritten, db, params).map(downgrade_rewritten);
             }
         }
     }
@@ -15673,11 +16651,15 @@ fn plan_query_inner(
         if let Some((_, table_s, w_s, g_s, h_s, o_s)) = split_query(sql) {
             if let Some((pname, pargs_text)) = split_proc_call(table_s) {
                 if let Some(meta) = load_procedure(dbr, &pname) {
-                    // no WHERE/GROUP/HAVING/ORDER over the call in this
-                    // slice - refuse rather than answer a wrong row set
-                    if w_s.is_some() || g_s.is_some() || h_s.is_some() || o_s.is_some() {
-                        return Some(Plan::Refused);
-                    }
+                    // THE ENGINE'S ORDER IS zero-outputs -> arity ->
+                    // (DSQL binding errors) -> not-selectable, so the
+                    // arguments are parsed FIRST and the metadata
+                    // refusals come out BEFORE this slice's clause
+                    // refusal - which would otherwise preempt all three
+                    // (probed: `... WHERE 1=1` does not change any of
+                    // the vectors, and `WHERE 1=0` does not suppress
+                    // them). A parse failure keeps the generic refusal:
+                    // the argument grammar is not this slice.
                     let args: Vec<Value> = match pargs_text {
                         None => Vec::new(),
                         Some(t) => match parse_proc_args(&t) {
@@ -15685,7 +16667,45 @@ fn plan_query_inner(
                             None => return Some(Plan::Refused),
                         },
                     };
-                    if args.len() != meta.ins.len() || meta.outs.is_empty() {
+                    // ZERO OUTPUTS FIRST, and it beats the arity check
+                    // too. Re-probed on the live engine, against the
+                    // slice spec, which had the two the other way round:
+                    // a 0-input/0-output procedure called with the wrong
+                    // arity - `SELECT * FROM PNOUTARG` (one declared
+                    // input, none passed), `(1,2)` (one too many) - all
+                    // answer -84, never isc_prcmismat. The spec's
+                    // counter-example (`SELECT * FROM P8_NSP`) has ONE
+                    // output, so it never exercised this order.
+                    //
+                    // Decided by RDB$PROCEDURE_OUTPUTS alone - never by
+                    // the body, and never the not-selectable vector
+                    if meta.outs.is_empty() {
+                        return Some(match text_line_col(sql, table_s) {
+                            Some((line, col)) => Plan::RefusedEval(EvalErr::ProcNoOutputs {
+                                procedure: quoted_qualified(&pname),
+                                line,
+                                col,
+                            }),
+                            // the text was REWRITTEN before this planner
+                            // saw it: the column would be a FABRICATED
+                            // number in a status vector this file
+                            // compares byte for byte, so the generic
+                            // refusal stands - recorded boundary
+                            None => Plan::Refused,
+                        });
+                    }
+                    // ARITY beats the not-selectable refusal (probed:
+                    // `SELECT * FROM P2_RET(1)` and `SELECT * FROM
+                    // PSELP` with one declared input answer this, for
+                    // selectable and non-selectable procedures alike)
+                    if args.len() != meta.ins.len() {
+                        return Some(Plan::RefusedEval(EvalErr::ProcArgMismatch(quoted_qualified(
+                            &pname,
+                        ))));
+                    }
+                    // no WHERE/GROUP/HAVING/ORDER over the call in this
+                    // slice - refuse rather than answer a wrong row set
+                    if w_s.is_some() || g_s.is_some() || h_s.is_some() || o_s.is_some() {
                         return Some(Plan::Refused);
                     }
                     // the projection picks output parameters by name
@@ -15737,6 +16757,22 @@ fn plan_query_inner(
                         .collect();
                     let picks: Vec<usize> = picked.iter().map(|(p, _)| *p).collect();
                     params.clear();
+                    // NOT SELECTABLE (RDB$PROCEDURE_TYPE = 2): the
+                    // engine refuses at PREPARE, at BLR COMPILE, and
+                    // never runs the body - so this sits LAST, after
+                    // every DSQL-shaped refusal above (an unknown column
+                    // in the projection must answer ITS error, which is
+                    // what the engine does: probed -206, not -104), and
+                    // after `picks`, which is the count the offset needs.
+                    // Only an EXPLICIT 2 refuses: NULL or an absent
+                    // column (a pre-schema ODS) passes, exactly as
+                    // catalog_row_public tolerates them.
+                    if meta.prc_type == Some(2) {
+                        return Some(Plan::RefusedEval(EvalErr::NotSelectable {
+                            procedure: quoted_qualified(&pname),
+                            offset: proc_blr_offset(&pname, picks.len(), &args),
+                        }));
+                    }
                     return Some(Plan::ProcSelect { name: pname, args, cols, picks });
                 }
             }
@@ -18745,6 +19781,43 @@ const GDS_INTEGER_OVERFLOW: i32 = 335544779;
 const GDS_BAD_SUBSTRING_LENGTH: i32 = 335544853;
 const ISC_ARG_NUMBER: i32 = 4;
 
+/// The NON-SELECTABLE PROCEDURE family, captured raw off LI-T6.0.0.2076's
+/// wire for `SELECT ... FROM <proc>` (see the three EvalErr variants).
+/// The engine splits ONE user mistake across three unrelated vectors,
+/// decided by RDB$PROCEDURE_OUTPUTS and by arity, not by SUSPEND:
+///
+/// - `isc_invalid_blr` "invalid request BLR at offset @1" (jrd.h msg 23,
+///   SQLCODE -104) + `isc_illegal_prc_type` "Procedure @1 is not
+///   selectable (it does not contain a SUSPEND statement)" (msg 548) -
+///   outputs > 0 and RDB$PROCEDURE_TYPE = 2. The @1 of the first is a
+///   BYTE OFFSET into BLR the engine generated; fc reproduces it from
+///   the statement's shape ([proc_blr_offset]). Note the CAPITAL P of
+///   "Procedure", against the lowercase 'procedure' of the -84 text.
+/// - `isc_sqlerr` "SQL error code = @1" + `isc_dsql_procedure_use_err`
+///   "procedure @1 does not return any values" (msg 348) +
+///   `isc_dsql_line_col_error` "At line @1, column @2" - zero outputs,
+///   under the usual `isc_dsql_error` wrapper, SQLCODE -84.
+/// - `isc_prcmismat` "Parameter mismatch for procedure @1" (msg 192) -
+///   wrong argument count, SQLCODE -902, and it BEATS both of the above.
+const GDS_INVALID_BLR: i32 = 335544343;
+const GDS_ILLEGAL_PRC_TYPE: i32 = 335544868;
+const GDS_SQLERR: i32 = 335544436;
+const GDS_PRCMISMAT: i32 = 335544512;
+const GDS_DSQL_PROCEDURE_USE_ERR: i32 = 335544668;
+const GDS_DSQL_LINE_COL_ERROR: i32 = 336397208;
+
+/// The -204 "Table unknown" family, captured off LI-T6.0.0.2076 for a
+/// QUALIFIED relation reference that resolves to nothing:
+/// `isc_dsql_error` / `isc_sqlerr(-204)` / `isc_dsql_relation_err` /
+/// `isc_random(<pre-quoted name>)` / `isc_dsql_line_col_error(l, c)`.
+///
+/// Probed: an unknown SCHEMA and an unknown TABLE are the IDENTICAL
+/// vector - `NOSUCH.T`, `PUBLIC.NOSUCHTAB` and `SYSTEM.T` all produce
+/// it. The engine has NO "schema unknown" diagnostic, so fire-crab must
+/// not invent one.
+const GDS_DSQL_RELATION_ERR: i32 = 335544580;
+const GDS_RANDOM: i32 = 335544382;
+
 /// isc_string_truncation - "string right truncation" - and
 /// isc_trunc_limits - "expected length @1, actual @2" (SQLSTATE 22001):
 /// the engine's fetch-time capacity vector when a text value cannot fit
@@ -18784,6 +19857,14 @@ const GDS_NOT_VALID: i32 = 335544347;
 /// an explicit value into a GENERATED ALWAYS identity column without
 /// OVERRIDING - the engine raises it at PREPARE
 const GDS_OVERRIDING_MISSING: i32 = 335545137;
+/// `isc_overriding_without_identity` (jrd.h msg 814, -902, SQLSTATE
+/// 42000): an OVERRIDING clause whose field list names no identity
+/// column. gdscode = `0x14000000 | 814`.
+const GDS_OVERRIDING_WITHOUT_IDENTITY: i32 = 335545134;
+/// `isc_overriding_system_invalid` (jrd.h msg 815, -902, SQLSTATE
+/// 42000): OVERRIDING SYSTEM VALUE against a GENERATED BY DEFAULT
+/// identity column. gdscode = `0x14000000 | 815`.
+const GDS_OVERRIDING_SYSTEM_INVALID: i32 = 335545135;
 const GDS_CHECK_CONSTRAINT: i32 = 335544558;
 const GDS_STACK_TRACE: i32 = 335544842;
 
@@ -18924,6 +20005,23 @@ fn eval_status_vector(w: &mut W, e: &EvalErr) {
                 .int(2) // isc_arg_string
                 .bytes(table.as_bytes());
         }
+        // the sibling vectors, identical in shape - one gds code, one
+        // pre-quoted schema-qualified table argument, no wrapper. Which
+        // of the THREE fires is decided by METADATA, never by the value
+        // (probed: CELL 20 answers 335545135 for a NULL that CELL 19
+        // answers 335544347 for)
+        EvalErr::OverridingWithoutIdentity(table) => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_OVERRIDING_WITHOUT_IDENTITY)
+                .int(2) // isc_arg_string
+                .bytes(table.as_bytes());
+        }
+        EvalErr::OverridingSystemInvalid(table) => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_OVERRIDING_SYSTEM_INVALID)
+                .int(2) // isc_arg_string
+                .bytes(table.as_bytes());
+        }
         EvalErr::CheckViolation { constraint, table, trigger } => {
             w.int(1) // isc_arg_gds
                 .int(GDS_CHECK_CONSTRAINT)
@@ -18937,6 +20035,64 @@ fn eval_status_vector(w: &mut W, e: &EvalErr) {
                     .int(2)
                     .bytes(format!("At trigger {}", t).as_bytes());
             }
+        }
+        EvalErr::NotSelectable { procedure, offset } => {
+            // the ONE vector in this file with no wrapper of any kind:
+            // two gds items, an isc_arg_number then an isc_arg_string
+            w.int(1) // isc_arg_gds
+                .int(GDS_INVALID_BLR)
+                .int(ISC_ARG_NUMBER)
+                .int(*offset as i32)
+                .int(1) // isc_arg_gds
+                .int(GDS_ILLEGAL_PRC_TYPE)
+                .int(2) // isc_arg_string - PRE-QUOTED "SCHEMA"."NAME"
+                .bytes(procedure.as_bytes());
+        }
+        EvalErr::ProcNoOutputs { procedure, line, col } => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-84)
+                .int(1) // isc_arg_gds
+                .int(GDS_DSQL_PROCEDURE_USE_ERR)
+                .int(2) // isc_arg_string
+                .bytes(procedure.as_bytes())
+                .int(1) // isc_arg_gds
+                .int(GDS_DSQL_LINE_COL_ERROR)
+                .int(ISC_ARG_NUMBER)
+                .int(*line as i32)
+                .int(ISC_ARG_NUMBER)
+                .int(*col as i32);
+        }
+        EvalErr::TableUnknown { name, line, col } => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-204)
+                .int(1) // isc_arg_gds
+                .int(GDS_DSQL_RELATION_ERR)
+                .int(1) // isc_arg_gds
+                .int(GDS_RANDOM)
+                .int(2) // isc_arg_string - PRE-QUOTED "SCHEMA"."NAME"
+                .bytes(name.as_bytes())
+                .int(1) // isc_arg_gds
+                .int(GDS_DSQL_LINE_COL_ERROR)
+                .int(ISC_ARG_NUMBER)
+                .int(*line as i32)
+                .int(ISC_ARG_NUMBER)
+                .int(*col as i32);
+        }
+        EvalErr::ProcArgMismatch(procedure) => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds
+                .int(GDS_PRCMISMAT)
+                .int(2) // isc_arg_string
+                .bytes(procedure.as_bytes());
         }
     }
     w.int(0); // isc_arg_end
@@ -19856,6 +21012,13 @@ fn find_word(up: &str, word: &str, from: usize) -> Option<usize> {
 /// other projection returns None so the ordinary planner handles it.
 fn parse_gen_id_query(proj_s: &str, table_s: &str) -> Option<(String, i64)> {
     // FROM must name RDB$DATABASE, optionally SYSTEM.-qualified/quoted.
+    // This hand-strip predates the general schema rule and now AGREES
+    // with it: RDB$DATABASE really does live in SYSTEM, so
+    // `relation_qualifier_ok` has already accepted the qualifier by the
+    // time this runs and the two cannot disagree. It stays because this
+    // probe is matched on TEXT (isql's `SELECT GEN_ID(<n>, 0) FROM
+    // SYSTEM.RDB$DATABASE`, show.epp:4668) before any relation is
+    // resolved - but it must never be widened past SYSTEM.
     let up = table_s.trim().to_ascii_uppercase().replace('"', "");
     let bare = up.strip_prefix("SYSTEM.").unwrap_or(&up).trim();
     if bare != "RDB$DATABASE" {
@@ -20181,6 +21344,111 @@ fn qualified_name_span(s: &str) -> Option<usize> {
             return Some(i);
         }
     }
+}
+
+/// One part of a dotted name AS WRITTEN: the text with its surrounding
+/// quotes removed - a SUBSLICE of the input - and whether it was
+/// quoted. The subslice is not a convenience: [TableRef]'s bare name is
+/// one of these and `splice_ctes` turns it back into a byte offset by
+/// pointer arithmetic, so an owned part would produce a garbage splice.
+/// A part carrying an ESCAPED quote (`""`) cannot be a subslice and is
+/// refused here - exactly the refusal the `trim_matches('"')` this
+/// replaces already gave it (recorded boundary).
+type NamePart<'a> = (&'a str, bool);
+
+/// Split the qualified-name span at the head of `s` (as measured by
+/// [qualified_name_span], so whitespace and newlines around each dot are
+/// the engine's - probed: `PUBLIC . T` and `PUBLIC\n.T` name the same
+/// relation) into at most `max` dot-separated [NamePart]s, and return
+/// them with the byte length of the span. None when there is no name, a
+/// part is empty, a quote is unterminated, a part carries an escaped
+/// quote, or the name has MORE than `max` parts - the engine caps the
+/// grammar at three and calls a fourth dot a -104 Token unknown.
+///
+/// Distinct from [split_qualified_name], which hands back OWNED,
+/// case-folded parts and caps at two: that one belongs to procedures and
+/// generators, and `parse_execute_procedure` / `split_proc_call` /
+/// `strip_gen_name` all depend on a three-part name REFUSING there.
+fn split_name_parts(s: &str, max: usize) -> Option<(Vec<NamePart<'_>>, usize)> {
+    let span_len = qualified_name_span(s)?;
+    let span = &s[..span_len];
+    let b = span.as_bytes();
+    let mut parts: Vec<NamePart<'_>> = Vec::new();
+    let mut i = 0usize;
+    loop {
+        while b.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
+            i += 1;
+        }
+        let part: NamePart<'_> = if b.get(i) == Some(&b'"') {
+            let start = i + 1;
+            let mut j = start;
+            loop {
+                match b.get(j) {
+                    None => return None, // unterminated quote
+                    // `"a""b"` unescapes to a name the span does not
+                    // spell - it cannot be a subslice, so it refuses
+                    Some(b'"') if b.get(j + 1) == Some(&b'"') => return None,
+                    Some(b'"') => break,
+                    _ => j += 1,
+                }
+            }
+            i = j + 1;
+            (&span[start..j], true)
+        } else {
+            let start = i;
+            while b.get(i).is_some_and(|c| is_ident_byte(*c)) {
+                i += 1;
+            }
+            (&span[start..i], false)
+        };
+        if part.0.is_empty() {
+            return None;
+        }
+        parts.push(part);
+        if parts.len() > max {
+            return None;
+        }
+        while b.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
+            i += 1;
+        }
+        match b.get(i) {
+            Some(b'.') => i += 1,
+            None => break,
+            _ => return None,
+        }
+    }
+    Some((parts, span_len))
+}
+
+/// Does this name part denote the catalog name `want` (already upper
+/// case)? A BARE part FOLDS to upper case, the way the engine folds an
+/// unquoted identifier; a QUOTED one must match EXACTLY - probed:
+/// `FROM "public".T` is -204 while `FROM public.t` answers.
+fn part_is(part: NamePart<'_>, want: &str) -> bool {
+    if part.1 {
+        part.0 == want
+    } else {
+        part.0.eq_ignore_ascii_case(want)
+    }
+}
+
+/// A dotted name rendered the way the engine's own -204 argument is:
+/// every half quoted whether or not the user wrote quotes, a BARE part
+/// folded to upper case and a QUOTED one kept in the USER'S case
+/// (probed: `FROM "public".T` reports `"public"."T"`, not
+/// `"PUBLIC"."T"`).
+fn quoted_name_parts(parts: &[NamePart<'_>]) -> String {
+    parts
+        .iter()
+        .map(|(t, q)| {
+            if *q {
+                format!("\"{}\"", t)
+            } else {
+                format!("\"{}\"", t.to_ascii_uppercase())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// Split a possibly schema-qualified object reference into (qualifier,
@@ -22235,10 +23503,79 @@ enum EvalErr {
     /// via isql - a single SQLSTATE 42000 message, no "Dynamic SQL
     /// Error" item before it)
     OverridingMissing(String),
+    /// an OVERRIDING clause whose INSERT field list names NO identity
+    /// column - including a table that has no identity column at all.
+    /// `isc_overriding_without_identity` (335545134, SQLCODE -902,
+    /// SQLSTATE 42000), raised at PREPARE, one pre-quoted
+    /// schema-qualified table argument, no `isc_dsql_error` wrapper -
+    /// the same vector shape as [EvalErr::OverridingMissing]. Probed:
+    /// `INSERT INTO TA (B) OVERRIDING SYSTEM VALUE VALUES ('a')` and
+    /// `INSERT INTO PLAIN (A,B) OVERRIDING USER VALUE VALUES (1,'p')`
+    /// both answer it; the check is on the FIELD LIST, not on whether
+    /// the table has an identity.
+    OverridingWithoutIdentity(String),
+    /// `OVERRIDING SYSTEM VALUE` against a `GENERATED BY DEFAULT`
+    /// identity column. `isc_overriding_system_invalid` (335545135,
+    /// SQLCODE -902, SQLSTATE 42000). Probed CELL 20: it fires at
+    /// PREPARE, BEFORE any NOT NULL evaluation - `INSERT INTO TD (ID,B)
+    /// OVERRIDING SYSTEM VALUE VALUES (NULL,'x')` answers 335545135,
+    /// not the 335544347 the same statement without OVERRIDING gives.
+    /// The check is metadata-only: CELL 23 shows it does not even look
+    /// at the value (the DEFAULT keyword is refused too).
+    OverridingSystemInvalid(String),
     /// a CHECK constraint violation: `isc_check_constraint` + the
     /// `isc_stack_trace` "At trigger ..." item naming the check trigger
     /// that fired (omitted when the trigger name is unknown)
     CheckViolation { constraint: String, table: String, trigger: Option<String> },
+    /// a NON-SELECTABLE procedure (RDB$PROCEDURE_TYPE = 2) that HAS
+    /// output parameters, used as a FROM item: `isc_invalid_blr` +
+    /// `isc_illegal_prc_type` (SQLCODE -104, SQLSTATE 42000). NO
+    /// `isc_dsql_error` wrapper, NO `isc_sqlerr`, NO line/column - it is
+    /// a BLR-COMPILE refusal, not a DSQL one, which is also why every
+    /// DSQL-detected error in the statement preempts it (probed: an
+    /// unknown column beside a non-selectable procedure answers -206).
+    /// `offset` is the engine's BLR byte offset, reproduced by
+    /// [proc_blr_offset]; `procedure` is the pre-quoted "SCHEMA"."NAME"
+    NotSelectable { procedure: String, offset: i64 },
+    /// a ZERO-OUTPUT procedure used as a FROM item: `isc_dsql_error` +
+    /// `isc_sqlerr`(-84) + `isc_dsql_procedure_use_err` +
+    /// `isc_dsql_line_col_error`. Driven purely by
+    /// RDB$PROCEDURE_OUTPUTS = 0, never by SUSPEND (probed: `BEGIN END`
+    /// and a 0-output procedure WITH an input give the identical
+    /// vector), and disjoint from [EvalErr::NotSelectable] because
+    /// SUSPEND without RETURNS is rejected at DDL time. line/col are the
+    /// 1-based position of the FROM ITEM in the ORIGINAL statement text,
+    /// so this variant is only ever built from un-rewritten SQL
+    ProcNoOutputs { procedure: String, line: i64, col: i64 },
+    /// A QUALIFIED relation reference that names no relation reachable
+    /// under that schema: the engine's -204 "Table unknown"
+    /// (`isc_dsql_error` + `isc_sqlerr`(-204) + `isc_dsql_relation_err`
+    /// + `isc_random` + `isc_dsql_line_col_error`).
+    ///
+    /// `name` is PRE-QUOTED exactly as the engine renders it -
+    /// `"NOSUCH"."T"`, `"public"."T"` - a quoted half keeping the USER's
+    /// case and a bare one folding ([quoted_name_parts]). `line`/`col`
+    /// point at the START OF THE QUALIFIER, not at the relation token
+    /// (probed: `SELECT COUNT(*) FROM PUBLIC.RDB$RELATIONS` reports
+    /// column 22, the `P` of PUBLIC), so this variant is only ever built
+    /// from un-rewritten SQL and [downgrade_rewritten] drops it.
+    ///
+    /// Raised ONLY when the relation LOOKUP itself failed. A statement
+    /// refused for some other reason over a qualified FROM keeps the
+    /// generic Dynamic SQL Error: answering "Table unknown" to an
+    /// unsupported ORDER BY would be a wrong error.
+    TableUnknown { name: String, line: i64, col: i64 },
+    /// a wrong argument count in a FROM-item procedure call:
+    /// `isc_dsql_error` + `isc_prcmismat` (SQLCODE -902, SQLSTATE
+    /// 07001). Fires BEFORE both of the above, for selectable and
+    /// non-selectable procedures alike and for 0-output ones (probed:
+    /// `SELECT * FROM P8_NSP` with one declared input and no argument
+    /// answers this, not the not-selectable vector). The EXECUTE
+    /// PROCEDURE form of the same mistake carries a DIFFERENT vector
+    /// (-170, `isc_prcmismat` FIRST with no wrapper, then one
+    /// `isc_param_no_default_not_specified` per missing parameter) and
+    /// is NOT this variant
+    ProcArgMismatch(String),
 }
 
 /// What an expression's result is typed as - which drives its wire form
@@ -24856,11 +26193,19 @@ fn plan_correlated_select(
     // INSIDE the subquery - where `D.ID` becoming a bare `ID` would
     // resolve against the INNER table instead, silently changing which
     // column the correlation names.
-    let mut allowed: Vec<&str> = vec![table];
-    if let Some(a) = from.alias {
-        allowed.push(a);
-    }
-    let unq = |t: &str| unqualify_single(t, &allowed).unwrap_or_else(|| t.to_string());
+    // the same ALIAS-IS-EXCLUSIVE binding the general single-relation
+    // path builds, with the 3-part prefix available only when the outer
+    // FROM item carries no alias of its own (see [ColBinding])
+    let bind = ColBinding {
+        key: from.alias.unwrap_or(table),
+        qual: match from.alias {
+            None if table_s.contains('.') || where_s.is_some_and(|w| w.contains('.')) => {
+                relation_schema(db, table).map(|s| (s, table))
+            }
+            _ => None,
+        },
+    };
+    let unq = |t: &str| unqualify_single(t, &bind).unwrap_or_else(|| t.to_string());
 
     // the outer WHERE, resolved the ordinary way; its unqualified text
     // is kept alongside - it seeds the gatekeeper statement the OUTER
@@ -26720,9 +28065,15 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                 while i < b.len() && is_ident_byte(b[i]) {
                     i += 1;
                 }
-                // a qualified column IDENT.IDENT is ONE token; the
-                // resolver splits it on the dot
-                if i < b.len()
+                // a qualified column IDENT.IDENT is ONE token - and so
+                // is the 3-part SCHEMA.TABLE.COLUMN, which is legal
+                // wherever the 2-part form is (probed: an ON, a WHERE,
+                // a GROUP BY all take it). The resolver splits it from
+                // the RIGHT ([split_col_ref]); TWO dots is the cap the
+                // engine's grammar has (a fourth part is -104).
+                let mut dots = 0;
+                while dots < 2
+                    && i < b.len()
                     && b[i] == b'.'
                     && b.get(i + 1).is_some_and(|n| is_ident_byte(*n))
                 {
@@ -26730,6 +28081,9 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                     while i < b.len() && is_ident_byte(b[i]) {
                         i += 1;
                     }
+                    dots += 1;
+                }
+                if dots > 0 {
                     out.push(Tok::Ident(s[start..i].to_string()));
                     continue;
                 }
@@ -27960,6 +29314,19 @@ struct ProcMeta {
     outs: Vec<ProcParam>,
     /// the `BEGIN ... END` body text
     source: String,
+    /// RDB$PROCEDURES.RDB$PROCEDURE_TYPE: 1 = selectable, 2 = executable.
+    /// SELECTABILITY IS LEXICAL AND DDL-TIME - the parser only asks
+    /// whether the token SUSPEND appears anywhere in the body, never
+    /// whether it can be reached, so a SUSPEND inside `IF (1=0)`, inside
+    /// `WHILE (1=0)`, inside a FOR over an empty table or after an EXIT
+    /// is still TYPE = 1 and legitimately answers zero rows (probed).
+    /// The body text is therefore NEVER consulted here.
+    ///
+    /// None on a pre-schema ODS without the column, or on a NULL value:
+    /// selectability is then UNKNOWN and the old path is kept, the same
+    /// absent-column tolerance [catalog_row_public] applies - refusing
+    /// on a missing column would start refusing valid procedures.
+    prc_type: Option<i64>,
 }
 
 /// Read one system relation's (columns, newest descriptors) pair - the
@@ -28003,13 +29370,26 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     let (name_f, src_f) = (pfid("RDB$PROCEDURE_NAME")?, pfid("RDB$PROCEDURE_SOURCE")?);
     // schema/package columns exist only on an FB6 (schema-aware) ODS
     let (schema_f, pkg_f) = (pfid("RDB$SCHEMA_NAME"), pfid("RDB$PACKAGE_NAME"));
+    // field_id 11 on an FB6 ODS, NULLABLE - absent on a pre-schema one
+    let type_f = pfid("RDB$PROCEDURE_TYPE");
     let pfmts = vec![(0u8, pdescs)];
     let mut source: Option<String> = None;
+    let mut prc_type: Option<i64> = None;
+    // the FIRST accepted row is taken WHOLE: keying the guard off
+    // `source.is_some()` (as it did) would let a LATER row supply the
+    // type for the body this one read
+    let mut found = false;
     for_each_record(db, 26, &pfmts, |v| {
         let hit = matches!(v.get(name_f),
             Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
-        if !hit || source.is_some() || !catalog_row_public(v, schema_f, pkg_f) {
+        if !hit || found || !catalog_row_public(v, schema_f, pkg_f) {
             return;
+        }
+        found = true;
+        // read before the blob: a procedure whose source blob will not
+        // read must still fail exactly the way it does today (`source?`)
+        if let Some(Value::Int(t)) = type_f.and_then(|i| v.get(i)) {
+            prc_type = Some(*t);
         }
         if let Some(Value::Blob(r, n)) = v.get(src_f) {
             if let Some(bytes) = fire_crab_blb::read_blob_content(&db.bytes, db.page_size, *r, *n) {
@@ -28090,7 +29470,7 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
             outs.push(p)
         }
     }
-    Some(ProcMeta { ins, outs, source })
+    Some(ProcMeta { ins, outs, source, prc_type })
 }
 
 /// The interpreter's variable frame: one slot per parameter, in the
@@ -28245,6 +29625,28 @@ fn snapshot_db(database: &Option<Database>) -> Option<Vec<u8>> {
 
 /// Put a snapshot back and flush it, undoing everything a failed
 /// statement wrote.
+///
+/// RECORDED DIVERGENCE - generator durability. The engine treats
+/// generators as NON-TRANSACTIONAL: an advance survives ROLLBACK,
+/// ROLLBACK TO SAVEPOINT, a PSQL `WHEN ANY` savepoint undo, statement
+/// undo, and even a statement that FAILED (probed six ways - a
+/// PK-violating identity INSERT moves GEN_ID 2 -> 3 before raising
+/// 335544665, and `ALTER SEQUENCE ... RESTART WITH n` / `SET GENERATOR
+/// ... TO n` survive a ROLLBACK verbatim, not by maximum). fire-crab's
+/// only undo mechanism is this whole-image snapshot, so every generator
+/// advance inside the undone window RETREATS with the file.
+///
+/// Matching it needs a durability model fire-crab does not have: the
+/// generator vector would have to be carried FORWARD across a restore
+/// (harvest every id in RDB$GENERATORS from the post-image and replay
+/// it verbatim into the restored one), and separately a failed
+/// [Plan::Insert] would have to write its drawn value forward out of the
+/// discarded `work` buffer - the one place a forward write happens on an
+/// error path. Both are deliberate carve-outs in a design whose whole
+/// isolation story is "the image is the truth", and they interact with
+/// DDL rollback (a generator created inside the window, a generator page
+/// allocated inside it). Left unbuilt rather than half-built; it is its
+/// own slice, with its own gate.
 fn restore_db(database: &mut Option<Database>, snap: Option<Vec<u8>>) {
     if let (Some(db), Some(bytes)) = (database.as_mut(), snap) {
         db.bytes = bytes;
@@ -28252,9 +29654,15 @@ fn restore_db(database: &mut Option<Database>, snap: Option<Vec<u8>>) {
     }
 }
 
-/// Run `INSERT INTO <t> [(cols)] SELECT ...`: plan the query with the
-/// ordinary planner, materialise its rows, then insert each one as a
-/// literal INSERT through the ordinary path. Returns the row count.
+/// Run `INSERT INTO <t> (cols) [OVERRIDING ...] SELECT ...`: materialise
+/// the PREPARED source plan's rows, then insert each one as a literal
+/// INSERT through the ordinary path. Returns the row count.
+///
+/// `cols` is authoritative - it was resolved at prepare, in declaration
+/// order and with computed columns excluded. This function used to
+/// re-derive an implicit list sorted by FIELD_ID and without the
+/// computed filter, which on a repositioned table mapped the source
+/// columns to the WRONG targets.
 ///
 /// A row that fails (a duplicate key, a CHECK, a NOT NULL) stops the
 /// statement and the snapshot below rolls the earlier rows back - the
@@ -28262,36 +29670,26 @@ fn restore_db(database: &mut Option<Database>, snap: Option<Vec<u8>>) {
 /// [ExecErr], kept typed so a constraint refusal ships its 23000
 /// vector (the engine names the first duplicate in SELECT-output
 /// order - probed P6 - which is exactly the row this loop stops at).
+///
+/// DIVERGENCE, recorded: that snapshot restore also un-draws any
+/// generator value the failed rows consumed. The engine BURNS them - a
+/// generator advance survives ROLLBACK, statement undo and savepoint
+/// undo alike (probed six ways). See the note at [restore_db].
 fn insert_select(
     table: &str,
     cols: &[String],
-    query: &str,
+    ov: Overriding,
+    src: &Plan,
     database: &mut Option<Database>,
+    args: &[WireParam],
     ctx: &SessionCtx,
     mut affected: Option<&mut Affected>,
 ) -> Result<i32, ExecErr> {
-    // the target's column names, when the statement did not list them
-    let target: Vec<String> = if cols.is_empty() {
-        let db = database.as_ref().ok_or("no database attached")?;
-        let mut c: Vec<(u16, String)> = relation_columns(&db.bytes, db.page_size, table)
-            .into_iter()
-            .map(|c| (c.field_id, c.name))
-            .collect();
-        c.sort_by_key(|(f, _)| *f);
-        c.into_iter().map(|(_, n)| n).collect()
-    } else {
-        cols.to_vec()
-    };
-
     let rows = {
-        let mut sink: Vec<Option<Descriptor>> = Vec::new();
-        let plan = plan_query_inner(query, &*database, &mut sink)
-            .ok_or("the SELECT feeding this INSERT is not one this server can run")?;
-        if !sink.is_empty() {
-            return Err("a parameter inside INSERT ... SELECT is not supported".into());
-        }
         let db = database.as_ref().ok_or("no database attached")?;
-        branch_rows(&plan, db, &[])
+        // `args` reaches the source now: a WHERE-clause `?` binds here
+        // exactly as it does in a bare SELECT
+        branch_rows(src, db, args)
             .ok_or("the SELECT feeding this INSERT is not one this server can run")?
     };
 
@@ -28300,7 +29698,7 @@ fn insert_select(
     let mut n = 0i32;
     for row in rows {
         let step = (|| -> Result<(), ExecErr> {
-            if row.len() != target.len() {
+            if row.len() != cols.len() {
                 return Err("the SELECT's column count does not match the INSERT's".into());
             }
             let vals: Vec<String> = row
@@ -28308,13 +29706,28 @@ fn insert_select(
                 .map(psql_literal)
                 .collect::<Option<Vec<_>>>()
                 .ok_or("a selected value cannot be written as a literal")?;
+            // The OVERRIDING clause rides the per-row statement, so the
+            // identity decision is taken ONCE PER ROW by the same
+            // helper the VALUES form uses. Probed: OSV lands the source
+            // values and leaves the generator alone (3 rows 7001-7003,
+            // GEN_ID 6 -> 6); OUV discards every source value and
+            // advances the generator ONCE PER ROW (ids 7,8,9, GEN_ID
+            // 6 -> 9).
             let sql = format!(
-                "INSERT INTO {} ({}) VALUES ({})",
+                "INSERT INTO {} ({}){} VALUES ({})",
                 table,
-                target.join(", "),
+                cols.join(", "),
+                ov.sql(),
                 vals.join(", ")
             );
             let (plan, _) = plan_insert(&sql, database).ok_or("row insert refused")?;
+            // an OVERRIDING / identity refusal ships its OWN vector, not
+            // a flattened generic 42000. Unreachable after prepare took
+            // the same decision, but a flattened vector is exactly the
+            // failure mode this slice removes.
+            if let Plan::RefusedEval(e) = &plan {
+                return Err(ExecErr::Eval(e.clone()));
+            }
             // the row's own error propagates TYPED - a 23000 vector
             // must survive to the wire, not be flattened to text.
             // Collecting: each row's Insert arm pushes its stored
@@ -30574,6 +31987,15 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     // WITHOUT the clause, then wraps it - so every
                     // constraint, index and trigger path stays exactly the
                     // one an unadorned statement takes
+                    // 3-PART COLUMN REFERENCES INSIDE DML are stripped
+                    // before any planner sees them: the DML side of the
+                    // server has its own column resolvers, and one pass
+                    // over the whole statement makes `SET PUBLIC.T.D =`,
+                    // `WHERE PUBLIC.T.C =` and `RETURNING PUBLIC.T.C`
+                    // work at once. The target's own `SCHEMA.` prefix
+                    // survives it - see [unqualify_dml].
+                    let stmt_sql =
+                        unqualify_dml(&stmt_sql, &database).unwrap_or_else(|| stmt_sql.clone());
                     let (dml_sql, returning) = split_returning(&stmt_sql);
                     let planned = match kw {
                         "INSERT" => plan_insert(&dml_sql, &database),
@@ -33651,14 +35073,16 @@ mod tests {
 
     #[test]
     fn one_relation_qualifiers_are_stripped() {
-        let a = ["EMP", "E"];
+        // AN ALIAS IS EXCLUSIVE: with `EMP E` the alias is the only key
+        let a = ColBinding { key: "E", qual: None };
         assert_eq!(
             unqualify_single("SELECT E.ID FROM EMP E ORDER BY E.ID", &a).unwrap(),
             "SELECT ID FROM EMP E ORDER BY ID"
         );
-        // the table's own name qualifies too
+        // the table's own name qualifies when there is NO alias
+        let t = ColBinding { key: "EMP", qual: None };
         assert_eq!(
-            unqualify_single("SELECT EMP.ID FROM EMP", &a).unwrap(),
+            unqualify_single("SELECT EMP.ID FROM EMP", &t).unwrap(),
             "SELECT ID FROM EMP"
         );
         assert_eq!(
@@ -33679,6 +35103,78 @@ mod tests {
         assert!(unqualify_single("SELECT 1.5 FROM EMP", &a).is_none());
         // and a string literal is not identifier text
         assert!(unqualify_single("SELECT ID FROM EMP WHERE N = 'E.ID'", &a).is_none());
+    }
+
+    #[test]
+    fn unqualify_single_strips_the_three_part_prefix() {
+        // THE ORDERING IS THE POINT. Trying the 2-part rule first would
+        // emit PUBLIC verbatim, strip T, and leave `PUBLIC.C` - a name
+        // no resolver can match.
+        let b = ColBinding { key: "T", qual: Some(("PUBLIC".to_string(), "T")) };
+        assert_eq!(
+            unqualify_single("SELECT PUBLIC.T.C FROM PUBLIC.T", &b).unwrap(),
+            "SELECT C FROM PUBLIC.T"
+        );
+        // the 3-part ref is legal over an UNQUALIFIED FROM too (probed):
+        // the prefix is built from the RESOLVED schema, not the text
+        assert_eq!(
+            unqualify_single("SELECT PUBLIC.T.C FROM T", &b).unwrap(),
+            "SELECT C FROM T"
+        );
+        // every clause at once, and the star form
+        assert_eq!(
+            unqualify_single(
+                "SELECT PUBLIC.T.* FROM PUBLIC.T WHERE PUBLIC.T.C = 1 GROUP BY PUBLIC.T.C",
+                &b
+            )
+            .unwrap(),
+            "SELECT * FROM PUBLIC.T WHERE C = 1 GROUP BY C"
+        );
+        // quoting: the SCHEMA half is matched exactly when quoted
+        assert_eq!(
+            unqualify_single("SELECT \"PUBLIC\".T.C FROM T", &b).unwrap(),
+            "SELECT C FROM T"
+        );
+        assert!(unqualify_single("SELECT \"public\".T.C FROM T", &b).is_none());
+        // a 2-part ref is TABLE.COLUMN, never SCHEMA.COLUMN: PUBLIC.C is
+        // left alone (the engine answers -206 for it)
+        assert!(unqualify_single("SELECT PUBLIC.C FROM PUBLIC.T", &b).is_none());
+    }
+
+    #[test]
+    fn unqualify_single_compares_a_quoted_qualifier_exactly() {
+        // the same rule `wrap_returning` applies (probed: `RETURNING
+        // "t".ID` is -206 while `"T".ID` and `t.ID` answer) - stripping
+        // "t" would ANSWER a statement the engine refuses
+        let b = ColBinding { key: "T", qual: None };
+        assert!(unqualify_single("UPDATE T SET \"t\".D = 1", &b).is_none());
+        assert_eq!(
+            unqualify_single("UPDATE T SET \"T\".D = 1", &b).unwrap(),
+            "UPDATE T SET D = 1"
+        );
+        assert_eq!(unqualify_single("UPDATE T SET t.D = 1", &b).unwrap(), "UPDATE T SET D = 1");
+        // a FROM item written bare does not preserve the catalog's
+        // case, so the quoted CATALOG spelling still reaches it
+        let l = ColBinding { key: "t", qual: None };
+        assert_eq!(
+            unqualify_single("SELECT \"T\".C FROM t", &l).unwrap(),
+            "SELECT C FROM t"
+        );
+    }
+
+    #[test]
+    fn unqualify_single_honours_alias_exclusivity() {
+        // after `FROM T X` the engine resolves only X.C: T.C and
+        // PUBLIC.T.C are both -206, so neither is stripped and the
+        // statement refuses instead of answering (it used to answer)
+        let b = ColBinding { key: "X", qual: None };
+        assert!(unqualify_single("SELECT T.C FROM T X", &b).is_none());
+        assert!(unqualify_single("SELECT PUBLIC.T.C FROM PUBLIC.T AS X", &b).is_none());
+        assert!(unqualify_single("SELECT PUBLIC.X.C FROM PUBLIC.T AS X", &b).is_none());
+        assert_eq!(
+            unqualify_single("SELECT X.C FROM PUBLIC.T AS X", &b).unwrap(),
+            "SELECT C FROM PUBLIC.T AS X"
+        );
     }
 
     // The tests that stood here exercised the TEXTUAL VIEW REWRITING -
@@ -35342,6 +36838,8 @@ mod tests {
         [
             JoinSide {
                 key: "E".into(),
+                // aliased, so no 3-part binding (an alias is exclusive)
+                schema: None,
                 src: RowSource::TableScan { rel: 10, formats: vec![(1, vec![d(dtype::LONG), d(dtype::LONG), d(dtype::VARYING)])], width: None },
                 columns: vec![
                     RelationColumn { name: "ID".into(), field_id: 0, position: 0 },
@@ -35357,6 +36855,7 @@ mod tests {
             },
             JoinSide {
                 key: "D".into(),
+                schema: None,
                 src: RowSource::TableScan { rel: 11, formats: vec![(1, vec![d(dtype::LONG), d(dtype::VARYING)])], width: None },
                 columns: vec![
                     RelationColumn { name: "ID".into(), field_id: 0, position: 0 },
@@ -35386,6 +36885,32 @@ mod tests {
         // unknown qualifier or column
         assert!(resolve_join_col(&sides, "X.ID").is_none());
         assert!(resolve_join_col(&sides, "E.BOGUS").is_none());
+        // a 3-part ref needs a side that HAS a schema; both of these
+        // are ALIASED, and an alias kills the qualified binding too
+        assert!(resolve_join_col(&sides, "PUBLIC.E.ID").is_none());
+    }
+
+    #[test]
+    fn resolves_three_part_join_columns() {
+        let mut sides = join_sides();
+        // unaliased sides: the relation name is the key and the
+        // relation's own schema is reachable 3-part
+        sides[0].key = "EMP".into();
+        sides[0].schema = Some("PUBLIC".into());
+        sides[1].key = "DEPT".into();
+        sides[1].schema = Some("PUBLIC".into());
+        assert_eq!(resolve_join_col(&sides, "PUBLIC.EMP.ID").map(|(i, _, _)| i), Some(0));
+        assert_eq!(resolve_join_col(&sides, "public.dept.id").map(|(i, _, _)| i), Some(3));
+        // a QUOTED schema half matches exactly (probed: "public" is -204)
+        assert_eq!(
+            resolve_join_col(&sides, "\"PUBLIC\".EMP.ID").map(|(i, _, _)| i),
+            Some(0)
+        );
+        assert!(resolve_join_col(&sides, "\"public\".EMP.ID").is_none());
+        // the wrong schema reaches nothing
+        assert!(resolve_join_col(&sides, "SYSTEM.EMP.ID").is_none());
+        // the 2-part form still works alongside it
+        assert_eq!(resolve_join_col(&sides, "EMP.ID").map(|(i, _, _)| i), Some(0));
     }
 
     #[test]
@@ -38735,6 +40260,182 @@ mod tests {
     }
 
     #[test]
+    fn split_name_parts_returns_subslices() {
+        let src = String::from("PUBLIC . \"T\" AS X");
+        let (parts, len) = split_name_parts(&src, 2).unwrap();
+        assert_eq!(len, "PUBLIC . \"T\"".len());
+        assert_eq!(parts, vec![("PUBLIC", false), ("T", true)]);
+        // EVERY PART IS A SUBSLICE - splice_ctes turns the bare name
+        // back into a byte offset by pointer arithmetic (I2), so an
+        // owned part would splice at a garbage position
+        let (lo, hi) = (src.as_ptr() as usize, src.as_ptr() as usize + src.len());
+        for (t, _) in &parts {
+            let at = t.as_ptr() as usize;
+            assert!(at >= lo && at + t.len() <= hi);
+        }
+        // an ESCAPED QUOTE cannot be a subslice, so it refuses - the
+        // same refusal the trim_matches('"') this replaced gave it
+        assert!(split_name_parts("\"a\"\"b\"", 2).is_none());
+        // an empty part, an unterminated quote, one part too many
+        assert!(split_name_parts("PUBLIC..T", 2).is_none());
+        assert!(split_name_parts("\"PUBLIC", 2).is_none());
+        assert!(split_name_parts("A.B.C", 2).is_none());
+        assert!(split_name_parts("A.B.C.D", 3).is_none());
+        assert_eq!(split_name_parts("A.B.C", 3).unwrap().0.len(), 3);
+    }
+
+    #[test]
+    fn part_is_folds_bare_and_matches_quoted_exactly() {
+        // an unquoted identifier folds, a quoted one does not (probed:
+        // `FROM public.t` answers while `FROM "public".T` is -204)
+        assert!(part_is(("public", false), "PUBLIC"));
+        assert!(part_is(("PUBLIC", false), "PUBLIC"));
+        assert!(part_is(("PUBLIC", true), "PUBLIC"));
+        assert!(!part_is(("public", true), "PUBLIC"));
+        // and the -204 argument keeps the USER's case for a quoted half
+        assert_eq!(
+            quoted_name_parts(&[("public", true), ("t", false)]),
+            "\"public\".\"T\""
+        );
+        assert_eq!(quoted_name_parts(&[("NOSUCH", false), ("T", false)]), "\"NOSUCH\".\"T\"");
+    }
+
+    #[test]
+    fn parse_table_ref_takes_qualified_names() {
+        let tr = |s| parse_table_ref(s).map(|t| (t.schema.map(|q| q.0), t.table, t.alias));
+        // every spelling the engine answers, and the dot's whitespace
+        // is its own token there
+        assert_eq!(tr("T"), Some((None, "T", None)));
+        assert_eq!(tr("PUBLIC.T"), Some((Some("PUBLIC"), "T", None)));
+        assert_eq!(tr("public.t"), Some((Some("public"), "t", None)));
+        assert_eq!(tr("PUBLIC . T"), Some((Some("PUBLIC"), "T", None)));
+        assert_eq!(tr("PUBLIC\n.T"), Some((Some("PUBLIC"), "T", None)));
+        assert_eq!(tr("\"PUBLIC\".T"), Some((Some("PUBLIC"), "T", None)));
+        assert_eq!(tr("\"PUBLIC\".\"T\""), Some((Some("PUBLIC"), "T", None)));
+        // aliased, with and without AS
+        assert_eq!(tr("PUBLIC.T X"), Some((Some("PUBLIC"), "T", Some("X"))));
+        assert_eq!(tr("PUBLIC.T AS X"), Some((Some("PUBLIC"), "T", Some("X"))));
+        assert_eq!(tr("\"PUBLIC\".\"T\" as \"X\""), Some((Some("PUBLIC"), "T", Some("X"))));
+        // a PROCEDURE CALL is not a table reference - split_proc_call
+        // owns it, qualified or not
+        assert!(tr("PUBLIC.PW6(5)").is_none());
+        assert!(tr("T(5)").is_none());
+        // three parts is a packaged routine, out of slice
+        assert!(tr("A.B.C").is_none());
+        // and the derived-table branch is untouched
+        assert_eq!(tr("(SELECT 1 FROM T) D").map(|(q, _, a)| (q, a)), Some((None, Some("D"))));
+    }
+
+    #[test]
+    fn parse_table_ref_keeps_the_bare_name_as_a_subslice() {
+        // I2: splice_ctes computes `tr.table.as_ptr() - sql.as_ptr()`,
+        // so the bare name must point INTO the input
+        let sql = String::from("  \"PUBLIC\" . \"EMP\"  E  ");
+        let tr = parse_table_ref(&sql).unwrap();
+        let (lo, hi) = (sql.as_ptr() as usize, sql.as_ptr() as usize + sql.len());
+        for part in [tr.table, tr.alias.unwrap(), tr.span] {
+            let at = part.as_ptr() as usize;
+            assert!(at >= lo && at + part.len() <= hi, "{:?} is not a subslice", part);
+        }
+        assert_eq!(tr.table, "EMP");
+        assert_eq!(tr.span, "\"PUBLIC\" . \"EMP\"");
+        assert_eq!(tr.quoted_name(), "\"PUBLIC\".\"EMP\"");
+    }
+
+    #[test]
+    fn split_col_ref_splits_from_the_right() {
+        let f = |s| {
+            let (a, b, c) = split_col_ref(s);
+            (a.map(|p| p.0), b.map(|p| p.0), c)
+        };
+        assert_eq!(f("PUBLIC.T.C"), (Some("PUBLIC"), Some("T"), "C"));
+        assert_eq!(f("T.C"), (None, Some("T"), "C"));
+        // NEVER schema.column: a 2-part ref is always TABLE.COLUMN
+        // (probed: `SELECT PUBLIC.C FROM PUBLIC.T` is -206 "PUBLIC"."C")
+        assert_eq!(f("PUBLIC.C"), (None, Some("PUBLIC"), "C"));
+        assert_eq!(f("C"), (None, None, "C"));
+        assert_eq!(f("\"T\".\"C\""), (None, Some("T"), "C"));
+        // four parts is not a name at all - it falls through bare and
+        // then resolves to nothing
+        assert_eq!(f("A.B.C.D"), (None, None, "A.B.C.D"));
+    }
+
+    #[test]
+    fn is_qualified_col_takes_three_parts() {
+        assert!(is_qualified_col("T.C"));
+        assert!(is_qualified_col("PUBLIC.T.C"));
+        assert!(is_qualified_col("\"PUBLIC\".\"T\".\"C\""));
+        // a decimal literal is not a qualified column
+        assert!(!is_qualified_col("1.5"));
+        assert!(!is_qualified_col("N + 1.5"));
+        assert!(!is_qualified_col("C"));
+    }
+
+    #[test]
+    fn dml_target_name_takes_qualified_names() {
+        let f = |s| dml_target_name(s).map(|(q, n)| (q.map(|p| p.0), n));
+        assert_eq!(f("T"), Some((None, "T")));
+        assert_eq!(f(" PUBLIC.T "), Some((Some("PUBLIC"), "T")));
+        assert_eq!(f("PUBLIC . T"), Some((Some("PUBLIC"), "T")));
+        assert_eq!(f("\"PUBLIC\".\"T\""), Some((Some("PUBLIC"), "T")));
+        assert_eq!(f("public.t"), Some((Some("public"), "t")));
+        // a trailing anything is not a DML target in this grammar
+        assert!(f("PUBLIC.T X").is_none());
+        assert!(f("A.B.C").is_none());
+        assert!(f("").is_none());
+    }
+
+    #[test]
+    fn split_qualified_name_still_refuses_three_parts() {
+        // GUARD: the procedure/generator splitter must NOT have been
+        // widened along with the relation one - parse_execute_procedure,
+        // split_proc_call and strip_gen_name all depend on a three-part
+        // name refusing there
+        assert!(split_qualified_name("PUBLIC.PKG.P").is_none());
+        assert_eq!(
+            split_qualified_name("PUBLIC.PADD"),
+            Some((Some("PUBLIC".to_string()), "PADD".to_string()))
+        );
+    }
+
+    #[test]
+    fn table_unknown_vector_matches_the_engine() {
+        // the five status items of -204 Table unknown, in order, with
+        // the pre-quoted name and the qualifier's line/column
+        let mut w = W::default();
+        eval_status_vector(
+            &mut w,
+            &EvalErr::TableUnknown { name: "\"NOSUCH\".\"T\"".into(), line: 1, col: 15 },
+        );
+        let got: Vec<i32> = w
+            .buf
+            .chunks_exact(4)
+            .map(|c| i32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(got[0..2], [1, GDS_DSQL_ERROR]);
+        assert_eq!(got[2..6], [1, GDS_SQLERR, ISC_ARG_NUMBER, -204]);
+        assert_eq!(got[6..8], [1, GDS_DSQL_RELATION_ERR]);
+        assert_eq!(got[8..11], [1, GDS_RANDOM, 2]);
+        // the line/col ride at the tail, after the string's XDR padding
+        // and before the isc_arg_end
+        let n = got.len();
+        assert_eq!(
+            got[n - 7..n - 1],
+            [1, GDS_DSQL_LINE_COL_ERROR, ISC_ARG_NUMBER, 1, ISC_ARG_NUMBER, 15]
+        );
+        assert_eq!(got[n - 1], 0); // isc_arg_end
+        // the position is only true of UN-REWRITTEN text
+        assert!(matches!(
+            downgrade_rewritten(Plan::RefusedEval(EvalErr::TableUnknown {
+                name: "\"PUBLIC\".\"C1\"".into(),
+                line: 1,
+                col: 15
+            })),
+            Plan::Refused
+        ));
+    }
+
+    #[test]
     fn next_value_for_takes_the_whole_tail_as_the_name_span() {
         // the single-item RDB$DATABASE recognizer (probed: the engine
         // answers NEXT VALUE FOR PUBLIC . SEQ5 and durably advances)
@@ -38980,8 +40681,9 @@ mod tests {
         let upsert = Plan::UpdateOrInsert { update: update(), insert: insert() };
         let insel = Plan::InsertSelect {
             table: "DST".into(),
-            cols: Vec::new(),
-            query: "SELECT X FROM SRC".into(),
+            cols: vec!["X".into()],
+            ov: Overriding::None,
+            src: Box::new(Plan::Scalar(Some(1), "X".into(), None)),
         };
         assert_eq!(stmt_type_of(&upsert), 2);
         assert_eq!(stmt_type_of(&insel), 2);
@@ -38997,8 +40699,9 @@ mod tests {
         assert_eq!(
             stmt_type_of(&wrap(Plan::InsertSelect {
                 table: "DST".into(),
-                cols: Vec::new(),
-                query: "SELECT X FROM SRC".into(),
+                cols: vec!["X".into()],
+                ov: Overriding::None,
+                src: Box::new(Plan::Scalar(Some(1), "X".into(), None)),
             })),
             1
         );
@@ -39023,6 +40726,243 @@ mod tests {
         want.extend(std::iter::repeat(0).take((4 - t.len() % 4) % 4));
         int(&mut want, 0); // isc_arg_end
         assert_eq!(w.buf, want);
+    }
+
+    // The two SIBLING overriding vectors, same shape as the one above:
+    // one gds code, one pre-quoted schema-qualified table argument, no
+    // isc_dsql_error wrapper. 814 -> 335545134, 815 -> 335545135.
+    #[test]
+    fn the_other_two_overriding_vectors_match_the_probe() {
+        let one = |e: &EvalErr| {
+            let mut w = W::default();
+            eval_status_vector(&mut w, e);
+            w.buf
+        };
+        let want = |code: i32, t: &str| {
+            let mut b = Vec::new();
+            let int = |b: &mut Vec<u8>, v: i32| b.extend_from_slice(&v.to_be_bytes());
+            int(&mut b, 1); // isc_arg_gds
+            int(&mut b, code);
+            int(&mut b, 2); // isc_arg_string
+            int(&mut b, t.len() as i32);
+            b.extend_from_slice(t.as_bytes());
+            b.extend(std::iter::repeat(0).take((4 - t.len() % 4) % 4));
+            int(&mut b, 0); // isc_arg_end
+            b
+        };
+        assert_eq!(
+            one(&EvalErr::OverridingWithoutIdentity("\"PUBLIC\".\"TA\"".into())),
+            want(335545134, "\"PUBLIC\".\"TA\"")
+        );
+        assert_eq!(
+            one(&EvalErr::OverridingSystemInvalid("\"PUBLIC\".\"TD\"".into())),
+            want(335545135, "\"PUBLIC\".\"TD\"")
+        );
+    }
+
+    // The INSERT head grammar: table, optional column list, optional
+    // OVERRIDING clause - the clause folds, may appear with or without a
+    // column list, and anything else after the list refuses.
+    #[test]
+    fn split_insert_head_parses_the_overriding_clause() {
+        let owned = |h: &str| {
+            split_insert_head(h).map(|(_, t, c, o)| (t.to_string(), c, o))
+        };
+        assert_eq!(owned("TA"), Some(("TA".into(), None, Overriding::None)));
+        assert_eq!(
+            owned("TA (ID, B)"),
+            Some(("TA".into(), Some(vec!["ID".into(), "B".into()]), Overriding::None))
+        );
+        // with a list, and without one - the second must PARSE so the
+        // planner can answer 335545134 instead of a syntax refusal
+        assert_eq!(
+            owned("TA (ID,B) OVERRIDING SYSTEM VALUE"),
+            Some(("TA".into(), Some(vec!["ID".into(), "B".into()]), Overriding::System))
+        );
+        assert_eq!(
+            owned("TA OVERRIDING USER VALUE"),
+            Some(("TA".into(), None, Overriding::User))
+        );
+        // the keywords fold, and the list order is preserved verbatim
+        assert_eq!(
+            owned("ta (B,ID) overriding system value"),
+            Some(("ta".into(), Some(vec!["B".into(), "ID".into()]), Overriding::System))
+        );
+        // anything else after OVERRIDING, or after the list, refuses
+        assert_eq!(owned("TA (ID) OVERRIDING WHATEVER VALUE"), None);
+        assert_eq!(owned("TA (ID) OVERRIDING SYSTEM"), None);
+        assert_eq!(owned("TA (ID) JUNK"), None);
+        assert_eq!(owned("TA ()"), None);
+        assert_eq!(owned("TA (ID"), None);
+    }
+
+    // The 24-cell decision table. idtype 0 = GENERATED ALWAYS, 1 = BY
+    // DEFAULT; fid 0 is the identity column, fid 1 an ordinary one.
+    #[test]
+    fn overriding_plan_reproduces_the_probed_matrix() {
+        let always = [(0usize, "RDB$1".to_string(), 0i64)];
+        let bydflt = [(0usize, "RDB$2".to_string(), 1i64)];
+        let plain: [(usize, String, i64); 0] = [];
+        let q = "\"PUBLIC\".\"TA\"";
+        let code = |r: &Result<Vec<usize>, EvalErr>| match r {
+            Err(EvalErr::OverridingWithoutIdentity(_)) => 335545134,
+            Err(EvalErr::OverridingSystemInvalid(_)) => 335545135,
+            Err(EvalErr::OverridingMissing(_)) => 335545137,
+            Err(_) => -1,
+            Ok(_) => 0,
+        };
+        let run = |ids: &[(usize, String, i64)], listed: &[usize], named: &[usize], ov| {
+            overriding_plan(ids, listed, named, ov, q)
+        };
+        // CELL 01 / 13: omitted, no OVERRIDING -> the generator draws
+        assert_eq!(run(&always, &[1], &[1], Overriding::None), Ok(vec![0]));
+        assert_eq!(run(&bydflt, &[1], &[1], Overriding::None), Ok(vec![0]));
+        // CELL 02/03, 14/15 and the no-identity table: 335545134
+        for ov in [Overriding::System, Overriding::User] {
+            assert_eq!(code(&run(&always, &[1], &[1], ov)), 335545134);
+            assert_eq!(code(&run(&bydflt, &[1], &[1], ov)), 335545134);
+            assert_eq!(code(&run(&plain, &[0, 1], &[0, 1], ov)), 335545134);
+        }
+        // CELL 04 / 07: ALWAYS named with an explicit value (NULL is one
+        // too), no OVERRIDING -> 335545137
+        assert_eq!(code(&run(&always, &[0, 1], &[0, 1], Overriding::None)), 335545137);
+        // CELL 05 / 08: OSV on ALWAYS - the value lands, generator still
+        assert_eq!(run(&always, &[0, 1], &[0, 1], Overriding::System), Ok(vec![]));
+        // CELL 06 / 09: OUV discards the value and draws
+        assert_eq!(run(&always, &[0, 1], &[0, 1], Overriding::User), Ok(vec![0]));
+        // CELL 10 / 11 / 12: the DEFAULT keyword - LISTED but not NAMED.
+        // No refusal without OVERRIDING, and OSV does not make it
+        // literal: all three draw.
+        assert_eq!(run(&always, &[0, 1], &[1], Overriding::None), Ok(vec![0]));
+        assert_eq!(run(&always, &[0, 1], &[1], Overriding::System), Ok(vec![0]));
+        assert_eq!(run(&always, &[0, 1], &[1], Overriding::User), Ok(vec![0]));
+        // CELL 16 / 19: BY DEFAULT named, no OVERRIDING - the value
+        // lands (a NULL therefore reaches NOT NULL at EXECUTE)
+        assert_eq!(run(&bydflt, &[0, 1], &[0, 1], Overriding::None), Ok(vec![]));
+        // CELL 17 / 20 / 23: OSV against BY DEFAULT - metadata only, so
+        // the DEFAULT-keyword form (listed, not named) refuses too
+        assert_eq!(code(&run(&bydflt, &[0, 1], &[0, 1], Overriding::System)), 335545135);
+        assert_eq!(code(&run(&bydflt, &[0, 1], &[1], Overriding::System)), 335545135);
+        // CELL 18 / 21 / 22 / 24
+        assert_eq!(run(&bydflt, &[0, 1], &[0, 1], Overriding::User), Ok(vec![0]));
+        assert_eq!(run(&bydflt, &[0, 1], &[1], Overriding::None), Ok(vec![0]));
+        assert_eq!(run(&bydflt, &[0, 1], &[1], Overriding::User), Ok(vec![0]));
+        // INSERT INTO T DEFAULT VALUES: nothing listed, nothing named
+        assert_eq!(run(&always, &[], &[], Overriding::None), Ok(vec![0]));
+        assert_eq!(run(&bydflt, &[], &[], Overriding::None), Ok(vec![0]));
+    }
+
+    // The isc_invalid_blr offset, against the twenty statements probed
+    // on the live engine (LI-T6.0.0.2076, schema PUBLIC so the constant
+    // part is 30). Every pair here is an OBSERVED [num N], not an
+    // extrapolation.
+    #[test]
+    fn proc_blr_offset_matches_the_engine() {
+        let n = Value::Null;
+        let i = |v: i64| Value::Int(v);
+        // (name, selected columns, arguments, the engine's offset)
+        let cases: Vec<(&str, usize, Vec<Value>, i64)> = vec![
+            ("A", 1, vec![], 31),                     // SELECT * FROM A
+            ("ABC", 1, vec![], 33),                   // SELECT * FROM ABC
+            ("ABD", 2, vec![], 37),                   // 2 INTEGER outputs
+            ("ABE", 3, vec![], 41),                   // 3 INTEGER outputs
+            ("ABD", 1, vec![], 33),                   // SELECT X FROM ABD
+            ("ABC", 2, vec![], 37),                   // SELECT X, X - dupes count
+            ("ABM", 2, vec![], 37),                   // BIGINT + SMALLINT
+            ("ABN", 1, vec![], 33),                   // NUMERIC(9,2), scale 0 path
+            ("ABCDEFGHIJ", 1, vec![], 40),            // a 10-char name
+            ("ABJ", 1, vec![i(1)], 43),               // one blr_long literal
+            ("ABJ", 1, vec![n.clone()], 37),          // blr_null is cheaper
+            ("ABJ", 1, vec![i(2147483647)], 43),      // the i32 rim, inclusive
+            ("ABJ", 1, vec![i(2147483648)], 47),      // past it: blr_int64
+            ("ABJ", 1, vec![i(-2147483648)], 43),     // the negative rim
+            ("ABK", 1, vec![i(1), i(2)], 50),
+            ("ABK", 1, vec![i(1), n.clone()], 44),
+            ("ABL", 1, vec![n.clone(), n.clone(), n.clone()], 39),
+            ("ABO", 2, vec![i(1), i(2)], 54),         // 2 outputs AND 2 arguments
+            ("ABO", 1, vec![i(1), i(2)], 50),         // SELECT X FROM ABO(1,2)
+            ("LONGNAMEPROCXYZ", 3, vec![i(5)], 63),
+            ("LONGNAMEPROCXYZ", 3, vec![n.clone()], 57),
+        ];
+        for (name, cols, args, want) in cases {
+            assert_eq!(proc_blr_offset(name, cols, &args), want, "{} x{} {:?}", name, cols, args);
+        }
+    }
+
+    // isc_dsql_line_col_error counts 1-based from the FIRST CHARACTER of
+    // the FROM item as written, in the ORIGINAL text - and says so only
+    // when the text really is the original.
+    #[test]
+    fn text_line_col_is_one_based_and_counts_lines() {
+        let sql = "SELECT * FROM PNOOUT";
+        let (_, table_s, ..) = split_query(sql).unwrap();
+        assert_eq!(text_line_col(sql, table_s), Some((1, 15)));
+        // the qualifier's first character, not the name's (probed:
+        // PUBLIC.PNOOUT and "PUBLIC"."PNOOUT" both report column 15)
+        let q = "SELECT * FROM PUBLIC.PNOOUT";
+        let (_, qt, ..) = split_query(q).unwrap();
+        assert_eq!(text_line_col(q, qt), Some((1, 15)));
+        let ml = "SELECT\n  *\n  FROM PNOOUT";
+        let (_, mt, ..) = split_query(ml).unwrap();
+        assert_eq!(text_line_col(ml, mt), Some((3, 8)));
+        // a REWRITTEN item - not a slice of the statement - has no
+        // trustworthy position, which is the signal to refuse generically
+        let rewritten = String::from("PNOOUT");
+        assert_eq!(text_line_col(sql, &rewritten), None);
+    }
+
+    // The not-selectable vector, byte for byte: TWO gds codes and
+    // nothing else - no isc_dsql_error wrapper, no isc_sqlerr, no
+    // line/column. The offset rides as an isc_arg_number, the
+    // pre-quoted name as an isc_arg_string.
+    #[test]
+    fn not_selectable_vector_bytes() {
+        let mut w = W::default();
+        eval_status_vector(
+            &mut w,
+            &EvalErr::NotSelectable { procedure: "\"PUBLIC\".\"PNS\"".into(), offset: 33 },
+        );
+        let mut want = Vec::new();
+        let int = |b: &mut Vec<u8>, v: i32| b.extend_from_slice(&v.to_be_bytes());
+        int(&mut want, 1); // isc_arg_gds
+        int(&mut want, 335544343); // isc_invalid_blr
+        int(&mut want, 4); // isc_arg_number
+        int(&mut want, 33);
+        int(&mut want, 1); // isc_arg_gds
+        int(&mut want, 335544868); // isc_illegal_prc_type
+        int(&mut want, 2); // isc_arg_string
+        let t = "\"PUBLIC\".\"PNS\"";
+        int(&mut want, t.len() as i32);
+        want.extend_from_slice(t.as_bytes());
+        want.extend(std::iter::repeat(0).take((4 - t.len() % 4) % 4));
+        int(&mut want, 0); // isc_arg_end
+        assert_eq!(w.buf, want);
+    }
+
+    // Every one of the three procedure vectors is computed against a
+    // SPECIFIC statement text (a position, or a BLR offset that counts
+    // the select list and the argument literals), so a site that
+    // re-plans REWRITTEN sql must hand back the generic refusal.
+    // Everything else travels unchanged.
+    #[test]
+    fn downgrade_rewritten_drops_only_the_text_dependent_refusals() {
+        for e in [
+            EvalErr::NotSelectable { procedure: "\"PUBLIC\".\"P\"".into(), offset: 31 },
+            EvalErr::ProcNoOutputs { procedure: "\"PUBLIC\".\"P\"".into(), line: 1, col: 15 },
+            EvalErr::ProcArgMismatch("\"PUBLIC\".\"P\"".into()),
+        ] {
+            assert!(
+                matches!(downgrade_rewritten(Plan::RefusedEval(e.clone())), Plan::Refused),
+                "{:?} must not survive a rewrite",
+                e
+            );
+        }
+        // an unrelated specific refusal is NOT text-dependent
+        assert!(matches!(
+            downgrade_rewritten(Plan::RefusedEval(EvalErr::SingletonSelect)),
+            Plan::RefusedEval(EvalErr::SingletonSelect)
+        ));
+        assert!(matches!(downgrade_rewritten(Plan::Refused), Plan::Refused));
     }
 
     #[test]

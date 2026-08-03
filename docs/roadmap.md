@@ -534,13 +534,100 @@ four; R7 is the removal of what they replaced.
   ANSWER: a foreign-qualifier `GEN_ID(NOSCHEMA.SQ1,0)` answered where
   the engine raises — refuses now.
 
-- **Qualified TABLE/VIEW references still refuse everywhere**
-  (`FROM PUBLIC.T`, `INSERT INTO PUBLIC.T`, `SYSTEM.RDB$RELATIONS`) —
-  its own slice; refusals, no wrong-answer risk.
+- ~~Qualified TABLE/VIEW references still refuse everywhere~~ —
+  *fixed* (`qa/serve-real-qualname.sh`, 70 checks). `SCHEMA.TABLE`
+  wherever a relation is named, plus the three-part column reference
+  `SCHEMA.TABLE.COLUMN` that goes with it, in the select list, WHERE,
+  GROUP BY, HAVING, ORDER BY, as a star, on either side of a join, in
+  comma lists, IN-subqueries, derived tables, CTE bodies, a stored
+  view body, and every DML shape's target, SET, WHERE and RETURNING.
+  Four laws carry it:
 
-- **A non-selectable procedure in FROM answers `[]`** where the
-  engine raises "not selectable (no SUSPEND)" — a pre-existing wrong
-  answer found by the qualified-call probes. Unclaimed.
+  **The qualifier is a TWO-WAY CATALOG CHECK, not a strip** — the rule
+  that works for procedures (drop a `PUBLIC.`) is wrong for relations.
+  `SYSTEM.RDB$RELATIONS` answers, `PUBLIC.RDB$RELATIONS` and
+  `SYSTEM.T` both raise −204, and it must be a real catalog read
+  rather than an `RDB$` name test: `CREATE TABLE "RDB$FOO"` lands in
+  PUBLIC, so a prefix rule would answer `SYSTEM."RDB$FOO"`.
+  **THE VIEW GUARD** is why this matters more than a refusal count — a
+  view is a relation with an id and no records of its own, so a
+  wrongly-qualified view that reached the scan would answer ZERO ROWS
+  rather than raise: a wrong answer wearing an empty result's clothes.
+
+  **Unquoted halves fold, a quoted half does not** — `PUBLIC.T`,
+  `public.t`, `"PUBLIC".T`, `"PUBLIC"."T"` and `PUBLIC . T` all name
+  the same relation; `"public".T` is −204. An unknown schema and an
+  unknown table are the IDENTICAL vector (−204,
+  `isc_dsql_relation_err`, `"S"."T"`, line and column), and the column
+  points at the START OF THE QUALIFIER — there is no "schema unknown"
+  diagnostic.
+
+  **QUALIFICATION IS INVISIBLE IN THE DESCRIBE** — `FROM T` and `FROM
+  PUBLIC.T` describe byte-identically (item 17 the BARE relation, 25
+  the alias, 33 the schema). A qualifier leaking into any of the ~7
+  sites that stamp a relation is a silent describe corruption no row
+  gate catches, so section G prepares and compares them item by item.
+
+  **An alias is exclusive, and a qualified reference SHADOWS a CTE** —
+  after `FROM PUBLIC.T AS X` all of `T.C`, `PUBLIC.T.C` and
+  `PUBLIC.X.C` raise −206 (`SELECT T.C FROM T X` is the same law, and
+  closes a PRE-EXISTING wrong answer: fire-crab used to answer it). An
+  alias may itself be named PUBLIC and then shadows the schema. A CTE
+  can be neither defined nor referenced qualified, and `WITH T AS (…)
+  SELECT * FROM PUBLIC.T` answers the BASE TABLE. A two-part reference
+  is always TABLE.COLUMN, never SCHEMA.COLUMN.
+
+  *Priced boundaries*: fire-crab emits the −204 vector for a SELECT's
+  FROM item only — a −206, a qualified DML target and a qualified CTE
+  reference keep the generic Dynamic SQL Error, so the gate asserts
+  only that both sides raise. fire-crab holds one user schema, so the
+  cross-schema ambiguity vector (336003085) and `SET SEARCH_PATH` are
+  unreachable.
+
+- ~~A non-selectable procedure in FROM answers `[]`~~ — *fixed, with a
+  stated surface* (`qa/serve-real-nosuspend.sh`). Selectability is
+  `RDB$PROCEDURES.RDB$PROCEDURE_TYPE`, a LEXICAL DDL-time property: a
+  SUSPEND inside `IF (1=0)`/`WHILE (1=0)`/a FOR over an empty table, or
+  dead after `EXIT`, is still `TYPE = 1` and its `[]` is CORRECT — the
+  fix is metadata-driven, never "no rows came back". And the one user
+  mistake splits across THREE vectors in a fixed order,
+  **zero-outputs → arity → not-selectable**:
+
+  *Matched byte for byte*, `SELECT <*|cols> FROM <proc>[(<int|NULL
+  literals>)]` with integer outputs, optionally under
+  `FIRST`/`SKIP`/`DISTINCT`/`ROWS`: `isc_dsql_error` +
+  `isc_prcmismat` (-902) for a wrong argument count; `isc_dsql_error` +
+  `isc_sqlerr`(-84) + `isc_dsql_procedure_use_err` +
+  `isc_dsql_line_col_error` for zero outputs, *including* the 1-based
+  line/column of the FROM item as written; and the bare
+  `isc_invalid_blr` + `isc_illegal_prc_type` pair (-104, no DSQL
+  wrapper at all) for a `TYPE = 2` procedure with outputs — *including*
+  the `isc_invalid_blr` BYTE OFFSET, which fire-crab never generated
+  and reconstructs as `24 + len(schema) + len(name) + 4·(cols−1) +
+  (args ? 3 + Σ(1|7|11) : 0)`, validated on 20 probed statements.
+
+  *Refused generically* (both sides error, texts differ — no wrong
+  answer): WHERE/GROUP BY/HAVING/ORDER BY over the call; an aggregate
+  or expression in the select list (offset +4); a non-integer output or
+  parameter (`load_procedure` refuses first; text columns are +3 each);
+  every LAW-7 context — JOIN, IN/EXISTS subquery, derived table, CTE,
+  UNION arm, `INSERT…SELECT`, MERGE, LATERAL — each with its own
+  arithmetic and only one `split_proc_call` call site; any wrapper that
+  REWRITES the text (derived inner `+19+len(name)`, CTE
+  materialisation, select-list fold, qualifier strip), where the
+  position or offset would be a fabricated number
+  (`downgrade_rewritten`); and empty parentheses `P()` (engine: token
+  unknown at the `)`).
+
+  *Not implemented*: the `EXECUTE PROCEDURE` arity vector (-170,
+  `isc_prcmismat` first, one `isc_param_no_default_not_specified` per
+  missing parameter) — a different error family.
+
+  Two PRE-EXISTING, unrelated boundaries surfaced while gating this and
+  are pinned in it as refusals: fire-crab's PSQL interpreter has no
+  `EXIT` (`SELECT * FROM PEXIT` refuses where the engine answers `[]`),
+  and an empty `BEGIN END` body is outside its surface (`EXECUTE
+  PROCEDURE PEMPTY` refuses where the engine succeeds silently).
 
 - **(superseded)** `RETURNING` comes back in a different shape. Through node-firebird
   the engine answers an `INSERT ... RETURNING` as a single object and
@@ -605,9 +692,68 @@ four; R7 is the removal of what they replaced.
   identity column generates through the shared generator substrate
   (RETURNING and NOT NULL come free); an explicit value into
   GENERATED ALWAYS refuses with the engine's vector (335545137) — a
-  wrong write closed. OVERRIDING SYSTEM|USER VALUE, INSERT DEFAULT
-  VALUES, params in an INSERT..SELECT source, and the
-  rollback-generator durability class stay recorded.
+  wrong write closed.
+
+- ~~OVERRIDING SYSTEM|USER VALUE, INSERT DEFAULT VALUES, params in an
+  INSERT..SELECT source~~ — *fixed* (`qa/serve-real-overriding.sh`,
+  101 differential checks). The 24-cell matrix matches cell for cell,
+  including the generator readings that are the only thing separating
+  several of them. Three points worth keeping:
+
+  **OVERRIDING USER VALUE means the opposite of what it reads like** —
+  it silently DISCARDS the supplied value and draws from the generator
+  (`VALUES (1006,'x')` stores id 2; RETURNING confirms it), while
+  OVERRIDING SYSTEM VALUE takes the value literally and leaves the
+  sequence BEHIND the table. The `DEFAULT` keyword is the sanctioned
+  escape from the ALWAYS rule and OVERRIDING does not make it literal;
+  an explicit NULL never is.
+
+  **Three vectors, chosen by metadata, never by the value** —
+  335545134 (no identity in the field list, including a table with no
+  identity at all), 335545135 (OSV against BY DEFAULT), 335545137
+  (ALWAYS named without OVERRIDING). All prepare-time, one pre-quoted
+  `"PUBLIC"."TBL"`, no `isc_dsql_error` wrapper. The metadata-first
+  ordering is what makes `OSV + NULL` on a BY DEFAULT column answer
+  335545135 where the same NULL without OVERRIDING answers 335544347
+  at execute. `UPDATE OR INSERT` ships the typed vector at prepare
+  instead of refusing generically; `UPDATE` is deliberately NOT
+  protected (probed: `SET ID = ID + 100000` succeeds).
+
+  **INSERT..SELECT resolves at prepare**, which closed two silent
+  wrong writes: the implicit target list is now DECLARATION (position)
+  order with COMPUTED columns excluded — execute used to re-derive it
+  in FIELD_ID order with no filter, so a repositioned table landed
+  every source column in the wrong target — and a repeated column in
+  an explicit field list is refused instead of writing the last value.
+  A `?` in the source WHERE now describes from the compared column and
+  binds; the source plan and its input SQLDA are built once, at
+  prepare, where the engine builds them.
+
+  *Priced boundaries, refusals not wrong answers*: a `?` in the SELECT
+  LIST (the engine types it from the INSERT target column — type,
+  scale, subtype, charset and the nullability bit — which is a
+  projection-planner slice); `? + 1` / `COALESCE(?, X)` / `CAST(? AS
+  SMALLINT)` / `FIRST ? SKIP ?` with it; MERGE in any form; `RETURNING
+  *`; `RETURNING <computed column>`, which was a WRONG ANSWER (the
+  null-flag bytes decoded as data) and is now a refusal. The engine's
+  `-104` / `-204` / `-206` / `-804` details are not reproduced —
+  fire-crab ships the generic Dynamic SQL Error at the same TIME.
+
+- **The generator-durability class stays recorded** — the engine treats
+  generators as non-transactional: an advance survives ROLLBACK,
+  ROLLBACK TO SAVEPOINT, a PSQL `WHEN ANY` undo, statement undo, and a
+  statement that FAILED (a PK-violating identity INSERT moves GEN_ID
+  2→3 *before* raising 335544665), and `ALTER SEQUENCE ... RESTART
+  WITH n` / `SET GENERATOR ... TO n` survive a rollback verbatim — the
+  post-image wins, not the maximum. fire-crab's only undo is the
+  whole-image snapshot in `restore_db`, so every advance inside the
+  undone window retreats with the file. Matching it needs two
+  deliberate carve-outs fire-crab does not have — carrying the
+  generator vector FORWARD across a restore, and writing a drawn value
+  forward out of a failed statement's discarded work buffer — in a
+  design whose whole isolation story is "the image is the truth", and
+  they interact with DDL rollback. Its own slice, with its own gate;
+  the reasoning is pinned at `restore_db`. Unclaimed.
 
 - **Constraint errors surface as generic 42000 `Dynamic SQL Error`,
   never 23000 with the constraint/key detail** — a duplicate-key
