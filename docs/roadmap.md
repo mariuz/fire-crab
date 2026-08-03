@@ -450,8 +450,11 @@ four; R7 is the removal of what they replaced.
   side uses a DIFFERENT grammar from the store side (cvt2.cpp's
   cmp_numeric_string, not cvt_decompose): interior spaces SKIP
   (`N = '1 0'` matches 10 — unindexed; an INDEX makes the same
-  spelling raise, so fc sides with the strict grammar and the gate
-  excludes the index-dependent spellings), e-notation goes through
+  spelling raise. **That half is now IMPLEMENTED rather than sided
+  with** — see the two-grammar entry below; this entry's "fc sides
+  with the strict grammar and the gate excludes the index-dependent
+  spellings" was a stopgap and is no longer what the code does),
+  e-notation goes through
   DOUBLE with a rounding window past 2^53 (refused), hex is
   op/arity/index-incoherent (refused). Conversion errors are PER ROW
   and VALUE-GATED — `Term::CmpConvErr` inherits dead-group/
@@ -960,6 +963,76 @@ four; R7 is the removal of what they replaced.
   ROLLBACK when the window that held it was undone; that is a
   visibility model, not a value model, and it is its own slice.
 
+- ~~A generator DRAWN IN A DML STATEMENT never advances~~ — *closed by
+  the DML-draw slice, and **the counting law is the whole question***.
+  `UPDATE T SET V = GEN_ID(G1,3)` and `DELETE FROM T WHERE ID =
+  GEN_ID(G1,1)` both refused at prepare; the engine advances, and not
+  "once per statement". Probed:
+
+  - a draw in the **SET LIST** advances **once per UPDATED row** — over
+    5 rows `SET V = GEN_ID(G,3)` leaves 15 and stores 3,6,9,12,15;
+    behind a WHERE matching 2 of 5 it leaves 6; matching none, and over
+    an empty table, it leaves the generator alone. The ACCESS PATH does
+    not gate it (an index-driven range still draws once per row it
+    writes), and two draws in one assignment evaluate left to right
+    (`GEN_ID(G,1) + GEN_ID(G,1)` stores 3, 7, 11, ...).
+  - a draw in the **WHERE** advances **once per row COMPARED**, matching
+    or not — 5 rows leave 5, 2 rows leave 2, an empty table leaves 0,
+    and a predicate NO row satisfies still leaves a full table's worth.
+    A NULL column compares UNKNOWN *after* it has drawn.
+  - per row the **WHERE's draw comes first** and the SET's follows only
+    when that row matched: `UPDATE T SET V = GEN_ID(G,1) WHERE ID =
+    GEN_ID(G,1)` over 5 rows leaves **6**, with `V = 2` in the one row
+    that matched. `NEXT VALUE FOR` is the same law; `GEN_ID(g,0)` is a
+    read and advances nothing.
+  - and the draw is made **as the row is written**: an UPDATE raising on
+    its first row burns one draw, on its second burns two, and writes no
+    row either way — the durability carve-out above, met from the DML
+    side.
+
+  **THREE ENGINE BEHAVIOURS fire-crab REFUSES rather than answer a
+  different number of advances**, each proved to raise and to leave the
+  generator where it stood. (1) **An INDEX RETRIEVAL changes the count
+  outright**: with a PRIMARY KEY on ID, `DELETE FROM TP WHERE ID =
+  GEN_ID(G,1)` over 5 rows draws **twice** and deletes **nothing** (the
+  bound is drawn, then the one retrieved row is re-tested against a
+  second draw), where `PLAN (TP NATURAL)` draws 5 and deletes every row
+  — so a WHERE draw on a relation with ANY index refuses. (2) **AND/OR
+  SHORT-CIRCUIT**: `WHERE ID > 99 AND ID = GEN_ID(G,1)` leaves the
+  generator at **0** and the same two conjuncts reversed leave it at
+  **5**; the DNF the predicate parser builds has lost that order, so a
+  connective beside a draw refuses. (3) **Uniqueness is judged after the
+  patch walk here**, so a drawing SET list that rewrites a UNIQUE key
+  over a row set the WHERE has not pinned to one row refuses (the
+  upsert's own shape — a full unique-key equality — is exactly the
+  pinned case, and still works). A silently different generator value is
+  a wrong answer no client can see coming; a refusal is one it can.
+
+  `qa/serve-real-genwrite.sh` — **194 checks, 65 DIFF against the
+  pre-slice binary** — carries the whole matrix, reading every generator
+  back **through the engine out of fire-crab's own file** after every
+  phase, with the engine's own numbers pinned as teeth so a phase where
+  both sides move together still fails.
+
+  **THE ONE COUNT THAT STILL DIVERGES, now RECORDED rather than left to
+  be rediscovered: a statement that FAILS mid-walk.** The engine draws
+  AS IT WALKS, so a raise on row k has exactly k draws behind it;
+  fire-crab draws for every row while COLLECTING the targets and only
+  then writes, so it has drawn for all of them. `UPDATE TNN SET ID =
+  NULL WHERE ID = GEN_ID(G1,1)` over three rows leaves the engine at
+  **1** and fire-crab at **3**; a CHECK failing on row 2 and a division
+  by zero on row 2 both leave the engine at **2**; and in the SET LIST,
+  `SET ID = 1/(ID-3), V = GEN_ID(G1,1)` leaves the engine at **2**
+  because the items are evaluated in WRITTEN order and row 3's first
+  item raises before the second draws. Rows are identical on both sides
+  (the statement is atomic either way) — only the sequence a client
+  reads back afterwards differs. This is NOT a regression: the pre-slice
+  binary answered **0** here, having no WHERE draw at all. Closing it
+  means interleaving the draw with the WRITE walk — the same reshaping
+  Inc366 did for uniqueness enforcement — and is its own slice; until
+  then both numbers are asserted in the gate so either one moving is
+  visible.
+
 - ~~Constraint errors surface as generic 42000 `Dynamic SQL Error`,
   never 23000 with the constraint/key detail~~ — *stale, closed by the
   enforcement-order slice above and re-probed*: the duplicate-key
@@ -988,6 +1061,32 @@ four; R7 is the removal of what they replaced.
   `qa/serve-real-textcolcmp.sh` grew the whole matrix (115 checks, 17
   of them DIFF against the pre-fix binary).
 
+- ~~A DML `SET` list's evaluation failure answers 42000 where the engine
+  answers 22012~~ — *closed, one line, and the interesting part is why
+  it lived so long*. `ExecErr` has carried an `Eval(EvalErr)` arm since
+  the day its doc comment promised that "`UPDATE ... WHERE A / 0 = 1`
+  answers the same 22012 the engine raises", and the WHERE half does
+  exactly that — but the SET half called `map_err(|_| "expression
+  failed")`, flattening the typed error into text and out through the
+  generic vector. **The two halves of one UPDATE disagreed with each
+  other**, and `SET V = 1/(ID-2)` answered `Dynamic SQL Error` where
+  `WHERE 1/(ID-2) = 1` answered `-Integer divide by zero`.
+
+  **The gate that should have caught it had the case and could not see
+  it.** `qa/serve-real-setexpr.sh` names `SET A = A / 0` in its header
+  teeth and has tested it since the slice landed — but its `same`
+  helper compares the two resulting TABLES, and a statement that fails
+  on both sides leaves both tables untouched, so the check passes
+  whatever either side SAID. A new `vect` helper compares the SQLSTATE
+  line as well as the table (9 checks: the raiser hit on the first row
+  and on a later one, the header's own tooth, a NUMERIC divide, `MOD`
+  by zero, the WHERE half, both halves at once, and two controls — a
+  division that succeeds and a NULL numerator that must propagate).
+  6 DIFF against the pre-fix binary, 0 after.
+  **LAW, and it applies to more gates than this one: a gate that
+  compares only END STATE cannot see an error's CLASS. Where both sides
+  fail, the table is identical by construction and proves nothing.**
+
 - **A RAW high byte is lost before any error can name it** — the
   escaping slice above measured it in the SQL TEXT: fc decodes the
   statement as UTF-8 lossily, so a NONE-charset literal carrying `0x80`
@@ -1000,38 +1099,152 @@ four; R7 is the removal of what they replaced.
   as of the SQL. A text-decoding defect, not an escaping one; it wants
   the charset honoured on both paths. Unclaimed.
 
-- **A text→number conversion longer than 52 characters raises the wrong
-  CLASS** — measured beside the escaping matrix, and the CAST slice
-  below then PROBED THE RULE OUT, which corrected two thirds of this
-  note. The cap is a temporary BUFFER the engine moves the source into
-  before `cvt_decompose` reads it, so:
-  **it depends on the TARGET's width** — 22 bytes for a 16-bit target
-  (`SMALLINT`, `NUMERIC`/`DECIMAL` precision ≤ 4: probed 22 converts,
-  23 raises), 52 for a 32- or 64-bit one (`INTEGER`, `BIGINT`,
-  precision 5..18), and **no cap at all** past that (`NUMERIC(19,0)`
-  and up — the INT128 path — `FLOAT`, `DOUBLE PRECISION`, `BOOLEAN`,
-  `DATE`, `TIMESTAMP` all raise 22018 carrying the whole 53-character
-  string, exactly as fire-crab does);
-  **it counts BYTES, not characters** (a UTF8 source of 53 characters
-  and 54 bytes reports `actual 54`);
-  **TRAILING BLANKS are forgiven first** — `CAST(CAST('2' AS CHAR(53))
-  AS INTEGER)` is 2, and a VARCHAR holding `'2'` + 60 spaces converts,
-  while 52 spaces THEN `'2'` (no trailing blank to drop) raises;
-  **it fires BEFORE the grammar**, so a perfectly valid 53-character
-  `'000…02'` raises it too;
-  and **it is NOT CAST-specific** — `INSERT INTO T (N) VALUES
-  ('<53 chars>')` raises the same 22001, so it belongs to the whole
-  `CVT_move` grammar, CAST and STORE; only the COMPARISON vector
-  (`cmp_numeric_string`) has no cap on either side, which is the third
-  place those two grammars part company.
-  Still unclaimed, and the reason is now precise rather than vague:
-  fire-crab's `CastTarget::Int { wide }` does not distinguish SMALLINT
-  from INTEGER, so it cannot spell the 22-byte cap — and the same gap
-  already shows as a wrong ANSWER one step further on
-  (`CAST('99999' AS SMALLINT)` answers 99999 where the engine raises
-  *numeric value is out of range*, and `CAST('3000000000' AS INTEGER)`
-  likewise). Give `CastTarget` its width first; the cap and the range
-  check then fall out of the same field.
+- ~~The compare grammar refuses interior blanks the engine accepts~~ —
+  *closed*, and the comment that said otherwise is gone. The claim in
+  the tree had been that fire-crab's compare grammar is WIDER than its
+  CAST grammar and that the gate's compare controls proved it. They
+  proved it for the COLUMN side only: the interior-blank vector on the
+  LITERAL side never reached `text_col_num` at all, because
+  `literal_num_rhs` classified the literal `Raise` at prepare and the
+  statement either raised per row or refused. fire-crab's LITERAL
+  grammar was NARROWER than its CAST grammar, the opposite of the
+  recorded law.
+  What the engine does, probed both ways over an INTEGER column
+  holding 12: the literal side is converted TWICE, by two grammars,
+  and an INDEX decides which one the statement sees. Unindexed,
+  `I = '1 2'`, `' 1 2 '`, `'5 . 0'`, `'- 5'`, `Q = '1 2.0 0'`,
+  `I + 0 = '1 2'` and a text PARAMETER bound `'1 2'` all ANSWER the
+  row; with an index on the column every one of them raises 22018,
+  because the optimizer builds the key with the strict store grammar
+  at OPEN. `Term::CmpConvErr` carries the lenient reading beside the
+  original string now (`lenient_num_rhs`), so it compares per row and
+  `key_conversion` raises unchanged — every timing law (dead group,
+  NULL row, empty table, DML atomicity) rides the machinery that was
+  already there.
+  Two side laws fell out of the probe pass. **A multi-value `IN` is
+  not the OR it desugars to**: the engine compiles its list once with
+  the STRICT grammar, so `I IN ('1 2', '9')` raises where
+  `I = '1 2' OR I = '9'` answers and `I IN ('1 2')` answers — the OR
+  desugar cannot carry that, so a multi-value IN holding a
+  blanks-and-digits string REFUSES the statement rather than answer
+  the OR's rows. **And two unconvertible bounds on one keyed segment
+  name the UPPER one**, whichever order they are written in (`K >= 'zz'
+  AND K <= 'yy'` and its mirror both name 'yy'), which `key_conversion`
+  now orders by; `K BETWEEN 'zz' AND '9'` still names 'zz'.
+  `qa/serve-real-textcolcmp.sh` law 10, 339 checks.
+  Residual priced: a DOUBLE column's literal side (`D = '1 2'`) still
+  REFUSES here — the approximate predicate path has no per-row raiser
+  and no key conversion, and the engine's answer there is
+  index-dependent too (probed: unindexed answers, indexed raises), so
+  converting it without that machinery would ship a wrong answer.
+  Also unrelated but measured beside it: a text PARAMETER neither
+  grammar takes (`I = ?` bound `'x'`) answers *Dynamic SQL Error* where
+  the engine raises *Conversion error from string "x"* — the bind path
+  reports through `ExecErr::Text`, which has no status vector.
+
+- ~~The lenient literal grammar leaked through a SUBQUERY FOLD, and
+  WROTE~~ — *closed; it was a regression of the entry above.* A
+  subquery is folded to a literal before the predicate is built, and
+  the new lenient grammar then read the folded value as if the user
+  had spelled it: `UPDATE J1 SET A = 77 WHERE A IN (SELECT T FROM J2)`
+  over a VARCHAR holding `'1 2'` COMMITTED `A = 77` where the engine
+  raises 22018 and writes nothing; `DELETE` removed the row; `SELECT`
+  and the correlated `EXISTS` spelling answered it.
+  The rule is NOT "a fold is strict" — that was the hypothesis, and the
+  engine refuted it in four cells. **The rule is that the STRICT
+  grammar belongs to a KEY, and a SEMI-JOIN'S HASH KEY is the third
+  kind of key** (after the index key and the store/CAST target). `SET
+  PLANONLY ON` is the discriminator, and it is exact: a POSITIVE `IN
+  (<subquery>)` / `= ANY` / correlated `EXISTS` written as a TOP-LEVEL
+  CONJUNCT is `PLAN HASH` and raises; the same subquery under an `OR`
+  or a `NOT`, `NOT IN`, `NOT EXISTS`, `= ALL` and a SCALAR subquery
+  drop to two plain plans and ANSWER the row with the lenient grammar.
+  An `OR` in a SIBLING conjunct does not count.
+  The raise has a different gate from every other 22018 in this file:
+  it is the hash BUILD that fails, not a comparison, so an outer table
+  holding only a NULL still raises (where `Term::CmpConvErr` would say
+  UNKNOWN) while an EMPTY outer raises nothing, and one bad key sinks a
+  list whose other keys convert and match. `Tok::StrKey` marks the
+  folded value at the one site that knows the shape
+  (`conjunctive_position`), `Term::KeyConvErr` raises ungated, and the
+  refused spellings are written FIRST into the desugared OR so the
+  raising group is reached before any group can answer.
+  `qa/serve-real-textcolcmp.sh` law 11 and `qa/serve-real-dmlsubq.sh`
+  (339 and 36 checks; 8 and 14 DIFF against the same tree with the
+  marking disabled — the dmlsubq half being WRONG WRITES, visible only
+  because every phase is re-read through the ENGINE).
+  **Recorded, not fixed: the engine hashes an INNER JOIN's key too.**
+  `FROM TNI JOIN TK ON TK.S = TNI.N` and the comma spelling both raise
+  on the engine and answer here, at HEAD as well as after this fix — the
+  join path compares those two columns per row with the lenient
+  grammar and does not know which of its equalities the engine turns
+  into hash keys. Pinned on both sides at the end of law 11. Closing it
+  is a join-path slice, not a fold one. Beside it: `= ANY` / `= ALL`
+  have no surface at all here, and an `INSERT ... SELECT` whose WHERE
+  carries ANY per-row conversion raiser refuses at prepare rather than
+  raising it (`WHERE ID = 'x'` does the same, and did before).
+
+- ~~A text→number conversion longer than 52 characters raises the wrong
+  CLASS~~ — *closed*, and the note that asked for it was wrong twice
+  over: it is not one cap, and the targets it called uncapped are not.
+  The cap is the CALLER's stack buffer that `CVT_make_string` copies
+  the source into before `cvt_decompose` reads a character of it —
+  `sizeof(VaryStr<N>)` = N + 2, which is why the numbers are 22, 52 and
+  130 rather than 20, 50 and 128 — so it follows the CONVERSION
+  ROUTINE, that is, the target's STORAGE WIDTH:
+  **22** for `CVT_get_short` (`SMALLINT`, `NUMERIC(p ≤ 4)`);
+  **52** for `CVT_get_long`/`CVT_get_int64` (`INTEGER`, `BIGINT`,
+  precision 5..18 — **and `DECIMAL(p ≤ 4)`, which is a LONG where
+  `NUMERIC(p ≤ 4)` is a SHORT**: one keyword apart, two caps, probed);
+  **130** for `CVT_get_double` — `FLOAT`, `DOUBLE PRECISION` — **and
+  for the TEMPORAL targets and BOOLEAN with it**, where the old note
+  said "no cap at all" (probed: 120 blanks then `'2020-01-01'` casts
+  to a DATE, 121 raise 22001, and the 22001 REPLACES the 22018 a
+  nonsense source of that length earns);
+  **none** on the INT128 path (`NUMERIC(19,0)` and up takes a 201-byte
+  source).
+  The rest of the old note held: BYTES not characters (53 characters /
+  54 bytes reports `actual 54`); TRAILING blanks drop BEFORE the test
+  and count INTO the reported `actual` (52 blanks + `'2'` + 200 blanks
+  is *expected 52, actual 253*); it fires BEFORE the grammar; and the
+  COMPARISON vector has no cap on either side.
+  `CastTarget::Int`/`Numeric` carry the storage width now (`bytes`),
+  `CastTarget::cvt_cap` spells the buffer and the CAST path raises
+  `EvalErr::StringTruncation` through the vector that already existed.
+  `qa/serve-real-textcolcmp.sh` law 9, 339 checks (47 DIFF against the
+  pre-fix binary).
+  Residuals, both priced rather than guessed:
+  **the STORE path is still uncapped** — `INSERT INTO T (N) VALUES
+  ('<53 bytes>')` raises the same 22001 on the engine, but fire-crab's
+  store conversion answers `Option` (a prepare-time refusal), not an
+  `EvalErr`, so spelling the vector there is a store-path slice;
+  and **the KEY build caps at 130 too** — an indexed `I = '<200
+  blanks>12'` raises *expected 130, actual 202* because the optimizer
+  converts through the DOUBLE routine whatever the column's type,
+  where fire-crab answers the row (the keyed term keeps no original
+  string to measure).
+  Still open beside it, and unrelated to the cap: `CastTarget` has its
+  width now but no RANGE check, so `CAST('99999' AS SMALLINT)` answers
+  99999 where the engine raises *numeric value is out of range* — one
+  `match bytes` away, in the same field this slice added.
+
+- **`CAST(? AS <type>)` is refused outright** — measured, unimplemented,
+  and the describe is the interesting half. The engine types the SLOT
+  as the CAST TARGET itself (probed: `SELECT CAST(? AS SMALLINT)`
+  describes `500 SHORT len 2`, INTEGER `496 LONG len 4`, BIGINT `580
+  INT64 len 8`, `NUMERIC(9,2)` `496 subtype 1 scale -2`, DOUBLE
+  PRECISION `480 len 8`, `VARCHAR(5)` `448 subtype 4 len 20` under a
+  UTF8 attachment, DATE `570 len 4` — all nullable), and node-firebird
+  then sends its own value-derived BLR anyway, so the CAST GRAMMAR is
+  what converts the bound value: `'  2  '` answers 2, `'1 2'` raises
+  *Conversion error from string "1 2"*, `2.5` answers 3, NULL answers
+  NULL. fire-crab answers *Dynamic SQL Error* to every one of them.
+  The blocker is not the cast: the projection parser has no PARAMETER
+  ATOM at all, and the input SQLDA for a select list is built from the
+  WHERE clause's slots only. It is the projection-planner slice the
+  `plan_insert_select` comment already names — a `?` atom, a sink for
+  its descriptor in textual order, and an execute-time bind of the
+  projection expressions beside `bind_filter`'s.
 
 - ~~`CAST('<TAB>2' AS INTEGER)` answers 2 where the engine raises~~
   — *closed*. Three call sites were trimming Rust's `White_Space`

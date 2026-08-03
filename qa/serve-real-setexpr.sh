@@ -191,6 +191,48 @@ case "$plan" in
     *) echo "DIFF index lookup after the update gave [$plan]"; fail=1 ;;
 esac
 
+# --- THE RAISE'S CLASS, not just its existence -----------------------
+# `same` compares the two TABLES, so a statement that fails on both sides
+# passes it whatever either side said - which is how the SET list came to
+# answer a generic 42000 where the engine answers 22012 and nobody
+# noticed for four increments. The header's own tooth (`SET A = A / 0`
+# must raise) was one of those: it raised, with the wrong vector.
+#
+# The engine's classes here: an integer divide is
+# `arithmetic exception ... -Integer divide by zero` under SQLSTATE
+# 22012, and it is the SAME class the WHERE half of the same statement
+# has always answered - the two halves of one UPDATE must not disagree.
+vect() { # <label> <sql> - the SQLSTATE line AND the table, both compared
+    rm -f "$W" "$R"; cp "$SRC" "$W"; cp "$SRC" "$R"
+    a=$(printf '%s;\nCOMMIT;\n' "$2" |
+        "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$W" 2>&1 |
+        grep -E "SQLSTATE|divide" | tr -s ' \n' ' ')
+    b=$(printf '%s;\nCOMMIT;\n' "$2" |
+        "$ISQL" -q -b -user "$U" -pas "$P" "$R" 2>&1 |
+        grep -E "SQLSTATE|divide" | tr -s ' \n' ' ')
+    ours=$(dump "$W"); theirs=$(dump "$R")
+    if [ "$a" = "$b" ] && [ "$ours" = "$theirs" ]; then
+        echo "OK   $1"
+    else
+        echo "DIFF $1"
+        echo "     engine: [$b] table [$theirs]"
+        echo "     fc:     [$a] table [$ours]"
+        fail=1
+    fi
+}
+vect "a SET-list integer divide by zero" "UPDATE T SET B = 1 / (ID - 2)"
+vect "the same raiser reached on the FIRST row" "UPDATE T SET B = 1 / (ID - 1)"
+vect "the header's own tooth, now with its class" "UPDATE T SET A = A / 0"
+vect "a NUMERIC divide by zero" "UPDATE T SET N = N / 0"
+vect "the WHERE half of the same statement" "UPDATE T SET B = 1 WHERE 1 / (ID - 2) = 1"
+vect "both halves at once" "UPDATE T SET B = 1 / (ID - 2) WHERE ID > 0"
+vect "a MOD by zero" "UPDATE T SET B = MOD(A, 0)"
+# controls: division that WORKS must still work, and a NULL operand must
+# still propagate rather than raise
+vect "control: a division that succeeds" "UPDATE T SET B = 100 / ID"
+vect "control: a NULL numerator does not raise" "UPDATE T SET B = A / 2"
+
+
 # 4. a computed column is read-only - SET on one must be refused
 "$ISQL" -q -b -user "$U" -pas "$P" "$SRC" >/dev/null 2>&1 <<'SQL'
 ALTER TABLE T ADD C COMPUTED BY (A + B);

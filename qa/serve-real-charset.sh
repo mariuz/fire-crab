@@ -276,10 +276,150 @@ else
     fail=1
 fi
 
+# --- 6. a LITERAL announces the width it ships ------------------------
+# An untyped literal is typed in the CLIENT's lc_ctype, and its declared
+# width is the length of the source text IN THAT CHARSET. The same
+# `'<three A-grave>'` is therefore
+#
+#   3 characters to a UTF8 attachment      -> TEXT length 12 CHARSET UTF8
+#   6 characters to a NONE one             -> TEXT length 6  CHARSET NONE
+#   6 characters to a WIN1252 one          -> TEXT length 6  CHARSET WIN1252
+#
+# (probed with SQLDA_DISPLAY on all three.) fire-crab announced the
+# UTF8 CHARACTER count under every attachment, so a NONE client was told
+# 3 and then handed 6 bytes: libfbclient read a prefix, the XDR stream
+# desynchronised, and the session died with SQLSTATE 08006 - the worst
+# thing this server can do to a client, and the failure mode libfbclient
+# has been seen to segfault on.
+#
+# EVERY CHECK RUNS UNDER BOTH ATTACHMENT CHARSETS, and both sides are
+# asked the SAME way: measure the two sides through differently-typed
+# connections and you measure the CLIENT, not the server. isql is the
+# instrument here rather than node-firebird because node-firebird's
+# attachment charset is the `encoding` option (default UTF8) and it
+# IGNORES `charset` - a gate that passes `charset` believes it varied
+# something it did not. isql's -ch varies it for real, and isql is
+# libfbclient, the client whose XDR fails.
+#
+# Every check ends on a FRESH attachment that has to answer: a dropped
+# connection is the failure being gated, so liveness AFTER the fact is
+# the part that counts.
+CH=""
+isql_at() { # <db path or host/port:path> - SQL on stdin
+    if [ -n "$CH" ]; then "$ISQL" -q -b -ch "$CH" -user "$U" -pas "$P" "$1"
+    else "$ISQL" -q -b -user "$U" -pas "$P" "$1"; fi
+}
+alive() {
+    printf 'SELECT 1 AS ALIVE FROM RDB$DATABASE;\n' \
+        | isql_at "127.0.0.1/$PORT:$FC" 2>&1 | grep -q '^ *1 *$'
+}
+# the VALUE, byte for byte: isql pads a text column to its DECLARED
+# width, so the raw octets carry the announced width and the trailing
+# blanks of a CHAR-formed result at once
+mb_val() { # <label> <select>
+    ran=$((ran + 1))
+    a=$(printf '%s;\n' "$2" | isql_at "127.0.0.1/$PORT:$FC" 2>&1 | od -An -c)
+    b=$(printf '%s;\n' "$2" | isql_at "$RE" 2>&1 | od -An -c)
+    if [ "$a" != "$b" ]; then
+        echo "DIFF [${CH:-NONE}] $1"
+        echo "     fcwire: $(printf '%s' "$a" | tr -s ' \n' ' ' | head -c 160)"
+        echo "     engine: $(printf '%s' "$b" | tr -s ' \n' ' ' | head -c 160)"
+        fail=1
+    elif ! alive; then
+        echo "DIFF [${CH:-NONE}] $1 - the connection died after it"
+        fail=1
+    else
+        echo "OK   [${CH:-NONE}] $1"
+    fi
+}
+# the DESCRIBE's width and charset. fire-crab deliberately announces
+# every expression VARYING and nullable where the engine may answer TEXT
+# (see build_expr_col), so only the two fields under test are compared.
+mb_desc() { # <label> <select>
+    ran=$((ran + 1))
+    sq() {
+        printf 'SET SQLDA_DISPLAY ON;\nSET PLANONLY ON;\n%s;\n' "$2" \
+            | isql_at "$1" 2>&1 | sed -n 's/.*\(len: [0-9]*\) charset: \([0-9]*\).*/\1 cs\2/p'
+    }
+    a=$(sq "127.0.0.1/$PORT:$FC" "$2")
+    b=$(sq "$RE" "$2")
+    if [ -z "$b" ]; then
+        echo "DIFF [${CH:-NONE}] $1 - the ENGINE described nothing (probe broken)"
+        fail=1
+    elif [ "$a" != "$b" ]; then
+        echo "DIFF [${CH:-NONE}] $1 announced width/charset"
+        echo "     fcwire: $a"
+        echo "     engine: $b"
+        fail=1
+    elif ! alive; then
+        echo "DIFF [${CH:-NONE}] $1 - the connection died after it"
+        fail=1
+    else
+        echo "OK   [${CH:-NONE}] $1 ($a)"
+    fi
+}
+A3="\xc3\x80\xc3\x80\xc3\x80"           # three A-grave: 3 chars, 6 octets
+E3="\xe2\x82\xac\xe2\x82\xac\xe2\x82\xac" # three euro signs: 3 chars, 9 octets
+R4="\xc4\x83\xc3\xae\xc8\x99\xc8\x9b"   # four two-byte letters: 4 chars, 8 octets
+A3=$(printf "$A3"); E3=$(printf "$E3"); R4=$(printf "$R4")
+for CH in "" UTF8; do
+    mb_desc "a 3-char 6-octet literal"   "SELECT '$A3' FROM RDB\$DATABASE"
+    mb_desc "a 3-char 9-octet literal"   "SELECT '$E3' FROM RDB\$DATABASE"
+    mb_desc "literal || literal"         "SELECT '$A3' || 'x' FROM RDB\$DATABASE"
+    # the control that localised the defect: a CAST declares its own
+    # width and was RIGHT all along, so the literal's inferred length is
+    # what this section is about
+    mb_desc "CAST declares its own width" \
+        "SELECT CAST('$A3' AS VARCHAR(10)) FROM RDB\$DATABASE"
+    # the widest branch under one measure is not the widest under the
+    # other: 12 characters against a CHAR(5) UTF8 column is 12 vs 5, but
+    # 24 octets against 5 - and the octet count wins under NONE
+    mb_desc "a conditional takes the widest branch" \
+        "SELECT COALESCE(C5, '$A3$A3$A3$A3') FROM T WHERE ID = 3"
+    mb_val  "a 3-char 6-octet literal"   "SELECT '$A3' AS X FROM RDB\$DATABASE"
+    mb_val  "a 1-char 2-octet literal"   "SELECT 'x$A3' AS X FROM RDB\$DATABASE"
+    mb_val  "a 3-char 9-octet literal"   "SELECT '$E3' AS X FROM RDB\$DATABASE"
+    mb_val  "literal || literal"         "SELECT '$A3' || 'x' AS X FROM RDB\$DATABASE"
+    # DECODE desugars to CASE, and a CHAR-formed conditional PADS to its
+    # declared width - which is a width in the attachment's characters
+    # too. This shipped two characters and then died.
+    mb_val  "DECODE over multi-byte results" \
+        "SELECT DECODE(1, 1, '$R4', 'nu') AS X FROM RDB\$DATABASE"
+    mb_val  "a CHAR conditional pads to its BYTE width" \
+        "SELECT CASE WHEN 1 = 1 THEN '$A3' ELSE 'abcdefg' END AS X FROM RDB\$DATABASE"
+    mb_val  "a multi-byte literal through a column" \
+        "SELECT COALESCE(C5, '$A3') AS X FROM T WHERE ID = 3"
+done
+# The residual, stated rather than hidden: fire-crab reads a literal as
+# UTF8 CHARACTERS whatever lc_ctype asked for, so a NONE attachment gets
+# UTF8 answers from UPPER / CHAR_LENGTH / SUBSTRING where the engine
+# treats the same literal as octets (the engine leaves a two-byte letter
+# alone; fire-crab upper-cases it). The WIDTH is right either way, which
+# is what the fix above was about, so what this asserts is that the
+# divergence stays a VALUE difference and never a dead connection.
+CH=""
+ran=$((ran + 1))
+u_fc=$(printf "SELECT UPPER('%s') AS X FROM RDB\$DATABASE;\n" "$(printf '\xc3\xa0\xc3\xa0')" \
+    | isql_at "127.0.0.1/$PORT:$FC" 2>&1)
+u_re=$(printf "SELECT UPPER('%s') AS X FROM RDB\$DATABASE;\n" "$(printf '\xc3\xa0\xc3\xa0')" \
+    | isql_at "$RE" 2>&1)
+if printf '%s' "$u_fc$u_re" | grep -q "SQLSTATE"; then
+    echo "DIFF UPPER over a multi-byte literal errored: $(printf '%s' "$u_fc$u_re" | grep SQLSTATE | head -1)"
+    fail=1
+elif ! alive; then
+    echo "DIFF the connection died on UPPER over a multi-byte literal"
+    fail=1
+elif [ "$u_fc" = "$u_re" ]; then
+    echo "DIFF the NONE-attachment UPPER residual is GONE - retire this check"
+    fail=1
+else
+    echo "OK   the UTF8-literal residual is a value difference, not a dropped connection"
+fi
+
 kill $srv 2>/dev/null; srv=""
 rm -f "$RE" "$FC" "$D"/fc-cs-*.js
-if [ "$ran" -lt 18 ]; then
-    echo "DIFF only $ran checks ran (expected at least 18) - did one silently skip?"
+if [ "$ran" -lt 43 ]; then
+    echo "DIFF only $ran checks ran (expected at least 43) - did one silently skip?"
     fail=1
 fi
 exit $fail

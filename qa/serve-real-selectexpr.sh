@@ -85,11 +85,17 @@ kill -0 $srv 2>/dev/null || {
 }
 
 strip() { sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
-# CH selects the ATTACHMENT character set for both sides at once, empty
-# for the default (NONE). An untyped literal takes the attachment's
-# charset, so 'ABCDé' is six octets to a NONE connection and five
-# characters to a UTF8 one - both sides must be asked the same way or
-# the compare measures the connection rather than the server.
+# CH selects the ATTACHMENT character set for both sides at once. An
+# untyped literal takes the attachment's charset, so 'ABCDé' is six
+# octets to a NONE connection and five characters to a UTF8 one - both
+# sides must be asked the same way or the compare measures the connection
+# rather than the server.
+#
+# EMPTY IS NOT "NONE ON BOTH SIDES": isql with no -ch attaches NONE,
+# node-firebird with no `encoding` attaches UTF8. The blocks below that
+# leave CH empty are ASCII-only, where the two agree; anything
+# multi-byte either sets CH (which both sides then honour) or uses the
+# isql-on-both-sides comparator further down.
 CH=""
 run_isql() {
     if [ -n "$CH" ]; then "$ISQL" -q -b -ch "$CH" -user "$U" -pas "$P" "$WORK"
@@ -104,7 +110,9 @@ node_once() {
       const F=require("node-firebird");
       const o={host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
                user:"SYSDBA",password:"masterkey"};
-      if(process.env.FC_CH) o.charset=process.env.FC_CH;
+      // node-firebird names the attachment charset `encoding`, and
+      // defaults it to UTF8; a `charset` property is silently ignored
+      if(process.env.FC_CH) o.encoding=process.env.FC_CH;
       F.attach(o,(e,db)=>{
         if(e){console.log("CONN_ERR");process.exit(1);}
         db.query(process.env.FC_Q,(e2,r)=>{
@@ -368,6 +376,74 @@ kill -0 $srv 2>/dev/null || { echo "FAIL fcwire died on a multi-byte item"; exit
 compare  "alive after multi-byte" "SELECT 1 AS ALIVE FROM RDB\$DATABASE"
 grep -q 'panicked' /tmp/fc-serve-selexpr.log && { echo "FAIL a connection thread panicked"; fail=1; }
 CH=""
+
+# --- a multi-byte QUOTED IDENTIFIER: the sixth byte-slicing site ------
+# The five sites the earlier audit fixed all sliced a str at a constant
+# byte offset and were found by grepping for that. This one is a
+# DIFFERENT SHAPE and the grep could not see it: `split_union` walked the
+# statement as a Vec<char> and then used the CHARACTER position as a BYTE
+# index into the same string, so any multi-byte character anywhere before
+# a scan position panicked the connection thread - and a quoted
+# identifier may hold ANY character.
+#
+#   SELECT 1 AS "<two two-byte letters>" FROM RDB$DATABASE
+#     -> panicked at "byte index 14 is not a char boundary", then 08006
+#        on that statement and on every statement after it
+#
+# Both sides are asked through isql here, not node-firebird: the
+# attachment charset must be varied for real on BOTH sides, and
+# node-firebird's attachment charset is its `encoding` option (default
+# UTF8) - it ignores `charset` entirely, so a node side cannot be moved
+# off UTF8 by the CH the isql side follows. isql is also libfbclient,
+# the client that a panicked connection thread has been seen to segfault.
+mb_alive() {
+    printf 'SELECT 1 AS ALIVE FROM RDB$DATABASE;\n' \
+        | "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$WORK" 2>&1 \
+        | grep -q '^ *1 *$'
+}
+mbid() { # <label> <select> - both sides through isql, under $CH
+    at() { # <target>
+        if [ -n "$CH" ]; then "$ISQL" -q -b -ch "$CH" -user "$U" -pas "$P" "$1"
+        else "$ISQL" -q -b -user "$U" -pas "$P" "$1"; fi
+    }
+    a=$(printf '%s;\n' "$2" | at "127.0.0.1/$PORT:$WORK" 2>&1 | strip | grep -v '^$' \
+        | tr -s ' ' | grep -v '^=*$')
+    b=$(printf '%s;\n' "$2" | at "$WORK" 2>&1 | strip | grep -v '^$' \
+        | tr -s ' ' | grep -v '^=*$')
+    if printf '%s' "$a" | grep -q "SQLSTATE"; then
+        echo "DIFF [${CH:-NONE}] $1 - fcwire raised: $(printf '%s' "$a" | tr '\n' '|')"
+        fail=1
+    elif [ "$a" != "$b" ]; then
+        echo "DIFF [${CH:-NONE}] $1"
+        echo "     isql: $(echo $b)"
+        echo "     fc:   $(echo $a)"
+        fail=1
+    elif ! mb_alive; then
+        echo "DIFF [${CH:-NONE}] $1 - the NEXT attachment could not connect"
+        fail=1
+    else
+        echo "OK   [${CH:-NONE}] $1"
+    fi
+}
+MB2=$(printf '\xc4\x83\xc3\xae')          # two two-byte letters
+EUR=$(printf '\xe2\x82\xac')              # one three-byte character
+for CH in "" UTF8; do
+    mbid "quoted alias, multi-byte" "SELECT 1 AS \"$MB2\" FROM RDB\$DATABASE"
+    mbid "quoted alias, 3-byte char" "SELECT 1 AS \"$EUR\" FROM RDB\$DATABASE"
+    # the same scan on a statement that really IS a union: the cut
+    # offsets it hands back are byte offsets into the ORIGINAL text
+    mbid "quoted alias over a UNION ALL" \
+        "SELECT 1 AS \"${MB2}B\" FROM RDB\$DATABASE UNION ALL SELECT 2 FROM RDB\$DATABASE"
+    mbid "multi-byte literal in a UNION branch" \
+        "SELECT '$MB2' AS X FROM RDB\$DATABASE UNION ALL SELECT 'x' FROM RDB\$DATABASE"
+    mbid "multi-byte identifier AND literal" \
+        "SELECT '$MB2' AS \"$MB2\" FROM RDB\$DATABASE"
+    mbid "quoted alias, multi-byte, ORDER BY" \
+        "SELECT 1 AS \"$MB2\" FROM RDB\$DATABASE ORDER BY 1"
+done
+CH=""
+grep -q 'panicked' /tmp/fc-serve-selexpr.log && {
+    echo "FAIL a connection thread panicked on a multi-byte identifier"; fail=1; }
 
 # --- runtime errors: BOTH the engine and fire-crab reject the row rather
 #     than answering. Divide-by-zero is the arithmetic exception (SQLSTATE

@@ -452,7 +452,7 @@ fn build_describe(cols: &[ProjCol], params: &[Descriptor], att: AttCs) -> Vec<u8
         // an attachment-charset or real-charset-expression text column
         // resolves to its announced charset, width in its bytes - same
         // law as [answer_prepare] (see [resolve_text_cs])
-        let (sub_type, length) = resolve_text_cs(c.sub_type, c.length, &att);
+        let (sub_type, length) = resolve_text_cs(c.sub_type, c.length, c.oct_length, &att);
         int_item(&mut d, 9, (i + 1) as i32); // sqlda_seq
         int_item(&mut d, 11, c.sql_type); // type
         int_item(&mut d, 12, sub_type); // sub_type (blob text/binary, text ttype)
@@ -1403,7 +1403,19 @@ fn enc_real_cs(cs: u8) -> i32 {
 /// Resolve a text column's `(sub_type, length)` for the describe: the
 /// two negative sentinels scale their character count into the bytes of
 /// the charset they resolve to; a plain ttype passes through.
-fn resolve_text_cs(sub: i32, len: i32, att: &AttCs) -> (i32, i32) {
+///
+/// `oct` is the same width with every LITERAL measured in the octets of
+/// its source text ([text_form_oct]) - the count a SINGLE-BYTE
+/// attachment gives it, since there one octet is one character. Which
+/// width applies is decided by the ATTACHMENT, not by the charset the
+/// expression resolves to: under a NONE attachment
+/// `COALESCE(<VARCHAR(10) UTF8>, '<12 two-byte letters>')` announces 96
+/// = max(10, 24) x 4 - the literal counted as 24 octets even though the
+/// result stays UTF8 (probed).
+fn resolve_text_cs(sub: i32, len: i32, oct: i32, att: &AttCs) -> (i32, i32) {
+    // only an EXPRESSION carries the second width; a plain column's
+    // declared length is already the one the engine announces
+    let len = if att.bpc == 1 && sub < 0 { oct } else { len };
     if sub == ATT_SUBTYPE {
         (att.id as i32, len * att.bpc as i32)
     } else if sub <= -2 {
@@ -1453,6 +1465,12 @@ struct ProjCol {
     wire: Wire,
     sql_type: i32,
     length: i32,
+    /// the same width for an attachment that measures a literal in
+    /// OCTETS - every single-byte `lc_ctype` (see [text_form_oct]).
+    /// Equal to `length` for everything but a text expression holding a
+    /// multi-byte literal; only the negative charset sentinels ever read
+    /// it ([resolve_text_cs]).
+    oct_length: i32,
     scale: i32,
     /// describe item 12 - the blob sub_type (text/binary) for blob
     /// columns, 0 elsewhere
@@ -1989,6 +2007,9 @@ AlterDomainRename {
         fk_children: Vec<FkPartner>,
         /// the access path for finding the rows to update
         index: Option<IndexAccess>,
+        /// set instead of `filter` when the WHERE holds a generator
+        /// draw - see [Plan::Delete]'s field of the same name
+        gen_filter: Option<GenFilter>,
     },
     /// `UPDATE OR INSERT INTO <t> (cols) VALUES (...) [MATCHING
     /// (cols)]`: the engine's own execution plan - try the update whose
@@ -2013,6 +2034,10 @@ AlterDomainRename {
         /// reads before it writes, and that read is a retrieval like
         /// any other
         index: Option<IndexAccess>,
+        /// set instead of `filter` when the WHERE holds a generator
+        /// draw: the walk must ADVANCE the generator once per row it
+        /// compares, which the [Predicate] machinery cannot do
+        gen_filter: Option<GenFilter>,
     },
     Project {
         rel: u16,
@@ -2235,6 +2260,33 @@ enum SetVal {
     /// literal or parameter is bound once before the scan; an expression
     /// cannot be, which is why it is its own arm.
     Expr(Expr),
+    /// `SET <col> = GEN_ID(<g>, <n>)` / `= NEXT VALUE FOR <g>` - a
+    /// GENERATOR DRAW, and the whole right-hand side (a draw buried in a
+    /// larger expression is refused: `Expr::eval` cannot reach a
+    /// generator, and answering a different number of advances is worse
+    /// than refusing). The engine draws ONCE PER UPDATED ROW - not once
+    /// per statement - so this is its own arm, bumped inside the target
+    /// loop exactly where `Plan::Insert`'s `gen_fields` bumps.
+    Gen(String, Option<i64>),
+}
+
+/// A GENERATOR DRAWN IN A DML `WHERE` clause: `DELETE FROM T WHERE ID =
+/// GEN_ID(G,1)`. The engine draws ONCE PER ROW COMPARED, matching or
+/// not, before it tests the row - probed over 2, 3 and 5 rows, over an
+/// empty table (0 draws) and over a predicate no row satisfies (a full
+/// table's worth of draws, 0 rows touched). See [parse_gen_where] for
+/// the shapes this is allowed to carry and the two the engine answers
+/// differently.
+#[derive(Clone)]
+struct GenFilter {
+    /// the compared column's field id - an exact integer, scale 0
+    fid: usize,
+    /// the comparison as the COLUMN sees it (a draw written on the left
+    /// arrives mirrored)
+    op: Cmp,
+    name: String,
+    /// `None` = `NEXT VALUE FOR`: the generator's own increment
+    step: Option<i64>,
 }
 
 /// How a join treats partnerless rows: INNER drops them; LEFT keeps
@@ -2326,6 +2378,11 @@ enum Rhs {
     /// unreachable-defensive.
     Dbl(f64),
     Str(String),
+    /// the same text, carrying [Tok::StrKey]'s marker: read by the
+    /// STRICT grammar only. A PARSE-TIME shape - resolution turns it
+    /// into an ordinary [Rhs] or into [Term::KeyConvErr], so no
+    /// evaluator ever meets one.
+    StrKey(String),
     Null,
     Param(usize, ColKind),
 }
@@ -2368,7 +2425,32 @@ enum Term {
     /// literal at open whatever the rows are ([Predicate::key_conversion]
     /// - hence the comparison operator, which decides whether a segment
     /// can match at all).
-    CmpConvErr(usize, Cmp, String),
+    ///
+    /// The fourth field is the SAME literal read by the engine's OTHER
+    /// grammar, the lenient per-row one ([lenient_num_rhs]): `Some` for
+    /// a spelling only that grammar takes (`N = '1 2'`, `'5 . 0'`,
+    /// `'- 5'`), and then this term COMPARES with that value per row
+    /// instead of raising - while `key_conversion` still raises at open
+    /// when an index keys the column, because the KEY is built with the
+    /// strict grammar. One literal, two conversions, the index deciding
+    /// which one the statement sees - all four cases probed.
+    CmpConvErr(usize, Cmp, String, Option<Rhs>),
+    /// A SEMI-JOIN's hash key that the STRICT grammar refuses - what a
+    /// [Tok::StrKey] against a numeric column becomes.
+    ///
+    /// It raises for EVERY row it is evaluated over, the column's own
+    /// value included, because the engine is not comparing here: it is
+    /// building a hash table out of the inner stream, and the whole
+    /// build fails on the first key that will not convert. Probed at the
+    /// three cells that tell the two gates apart - an outer table
+    /// holding ONLY a NULL still raises (where [Term::CmpConvErr] would
+    /// answer UNKNOWN), an EMPTY outer table raises nothing (the build
+    /// waits for the first outer row), and a FALSE conjunct written in
+    /// front of it silences it (`A = 99 AND A IN (SELECT ...)` over a
+    /// table holding only 12), which the conjunct-order machinery
+    /// already gives. Row-DEPENDENT under [term_row_independent]'s
+    /// default, or the invariant pass would raise over that empty table.
+    KeyConvErr(String),
     /// A TEXT COLUMN against a NUMERIC side: the engine coerces the
     /// COLUMN's text to a number PER ROW, VALUE-GATED (cvt2.cpp
     /// `cmp_numeric_string` -> cvt.cpp `CVT_get_numeric`), with the
@@ -2761,10 +2843,32 @@ impl Predicate {
                     Some(Rhs::Num(r, sc)) => Some(Expr::Dec(r, sc)),
                     // unreachable-defensive: bind_rhs never builds Dbl
                     Some(Rhs::Dbl(d)) => Some(Expr::Double(d)),
-                    Some(Rhs::Str(t)) => Some(Expr::Str(t)),
+                    // StrKey is a parse-time marker; bind_rhs, which
+                    // reads WIRE values, cannot build one
+                    Some(Rhs::Str(t) | Rhs::StrKey(t)) => Some(Expr::Str(t)),
                     Some(Rhs::Null | Rhs::Param(..)) => Some(Expr::Null),
                 },
             })
+        };
+        // A TEXT parameter against an exact-numeric column whose value
+        // the STRICT grammar refuses and the LENIENT compare grammar
+        // takes. The engine reads a BOUND value by exactly the two
+        // grammars it reads a spelled literal by (probed: `I = ?` bound
+        // '1 2' answers the 12 row unindexed and raises 22018 with an
+        // index on I), so the bind produces the same two-grammar term
+        // the literal path produces and every timing law rides along.
+        // None here means "not that case" and the ordinary bind decides.
+        let lenient_param = |idx: &usize, fid: usize, op: Cmp, kind: &ColKind| -> Option<Term> {
+            if !matches!(kind, ColKind::Int | ColKind::Numeric) {
+                return None;
+            }
+            let WireParam::Text(s) = args.get(*idx)? else {
+                return None;
+            };
+            if text_number(s).is_some() {
+                return None;
+            }
+            Some(Term::CmpConvErr(fid, op, s.clone(), Some(lenient_num_rhs(s)?)))
         };
         let mut groups = Vec::new();
         for g in &self.groups {
@@ -2803,21 +2907,31 @@ impl Predicate {
                             },
                         }
                     }
-                    Term::Cmp(fid, op, Rhs::Param(idx, kind)) => match bind_rhs(idx, kind)? {
-                        None => Term::Unknown,
-                        // A text parameter can bind a FRACTION into an
-                        // integer column's term - `WHERE N_INT > ?` with
-                        // `'1.5'`. Rounding it to fit `Rhs::Int` would
-                        // move the boundary, so the term switches to the
-                        // exact path instead, which [Term::NumCmp]
-                        // documents as covering plain integer columns.
-                        Some(rhs @ Rhs::Num(..)) => Term::NumCmp(*fid, *op, rhs),
-                        Some(rhs) => Term::Cmp(*fid, *op, rhs),
-                    },
-                    Term::NumCmp(fid, op, Rhs::Param(idx, kind)) => match bind_rhs(idx, kind)? {
-                        None => Term::Unknown,
-                        Some(rhs) => Term::NumCmp(*fid, *op, rhs),
-                    },
+                    Term::Cmp(fid, op, Rhs::Param(idx, kind)) => {
+                        match lenient_param(idx, *fid, *op, kind) {
+                            Some(t) => t,
+                            None => match bind_rhs(idx, kind)? {
+                                None => Term::Unknown,
+                                // A text parameter can bind a FRACTION into an
+                                // integer column's term - `WHERE N_INT > ?` with
+                                // `'1.5'`. Rounding it to fit `Rhs::Int` would
+                                // move the boundary, so the term switches to the
+                                // exact path instead, which [Term::NumCmp]
+                                // documents as covering plain integer columns.
+                                Some(rhs @ Rhs::Num(..)) => Term::NumCmp(*fid, *op, rhs),
+                                Some(rhs) => Term::Cmp(*fid, *op, rhs),
+                            },
+                        }
+                    }
+                    Term::NumCmp(fid, op, Rhs::Param(idx, kind)) => {
+                        match lenient_param(idx, *fid, *op, kind) {
+                            Some(t) => t,
+                            None => match bind_rhs(idx, kind)? {
+                                None => Term::Unknown,
+                                Some(rhs) => Term::NumCmp(*fid, *op, rhs),
+                            },
+                        }
+                    }
                     Term::Like(fid, Rhs::Param(idx, _), escape, negated) => {
                         match bind_rhs(idx, &ColKind::Text)? {
                             // LIKE NULL is UNKNOWN - per row, on the
@@ -3106,7 +3220,7 @@ impl Predicate {
             match t {
                 Term::Cmp(fid, cmp, _)
                 | Term::NumCmp(fid, cmp, _)
-                | Term::CmpConvErr(fid, cmp, _)
+                | Term::CmpConvErr(fid, cmp, ..)
                     if self.keys.contains(fid) && !matches!(cmp, Cmp::Ne) =>
                 {
                     Some((*fid, Some(*cmp)))
@@ -3148,14 +3262,29 @@ impl Predicate {
                     }
                 }
             }
-            // the surviving bounds in WRITTEN order, the order the
-            // engine builds them in (`K BETWEEN 'zz' AND '9'` and
-            // `K = 'yy' AND K = 'zz'` each name the literal they reach)
-            let mut order: Vec<usize> = live.iter().map(|(_, i)| *i).collect();
+            // the surviving bounds in the order the engine BUILDS them:
+            // the UPPER bound of a segment first, then the lower, and
+            // written order inside each. The upper-first half is what
+            // two literals neither grammar takes measure - `K >= 'zz'
+            // AND K <= 'yy'` and `K <= 'yy' AND K >= 'zz'` BOTH name
+            // 'yy', and `K > 'zz' AND K < 'yy'` with them - while
+            // `K BETWEEN 'zz' AND '9'` still names 'zz' (the upper
+            // converts, the lower is the one that cannot) and
+            // `K = 'aa' AND K > 'bb'` names 'aa' (the upper slot the
+            // equality wrote, which `> 'bb'` never overwrites). Ordering
+            // ACROSS segments is unprobed - a second keyed column needs
+            // a second index - so written order carries it.
+            let mut order: Vec<(usize, usize)> =
+                live.iter().map(|(slot, i)| (1 - slot % 2, *i)).collect();
             order.sort_unstable();
             order.dedup();
+            let order: Vec<usize> = order.into_iter().map(|(_, i)| i).collect();
             for i in order {
-                if let Term::CmpConvErr(_, _, s) = &g[i] {
+                // the KEY is built with the STRICT grammar, so a
+                // literal the lenient one would have compared raises
+                // here just the same (probed: an INDEX on the column
+                // turns `I = '1 2'` from an answer into 22018)
+                if let Term::CmpConvErr(_, _, s, _) = &g[i] {
                     return Err(ExecErr::Eval(EvalErr::ConversionError(Some(s.clone()))));
                 }
             }
@@ -3392,16 +3521,28 @@ impl Term {
             // before evaluating; this is the defensive answer)
             Term::Cmp(_, _, Rhs::Param(..)) => None,
             Term::Cmp(_, _, Rhs::Num(..)) => None, // Num travels in NumCmp
+            // resolution turns StrKey into a plain term or a
+            // KeyConvErr; one reaching a Term is unreachable-defensive
+            Term::Cmp(_, _, Rhs::StrKey(_)) => None,
             Term::Cmp(_, _, Rhs::Dbl(_)) => None, // Dbl in TextNumCmp only
             // the value gate: NULL (or a missing slot) is UNKNOWN with
             // no raise; ANY value raises the engine's conversion error,
             // its argument the original literal (probed: `ID=5 AND
             // N='x'` answers [] over the NULL-N row; `N='x' OR ID=1`
             // raises)
-            Term::CmpConvErr(fid, _, s) => match values.get(*fid) {
+            Term::CmpConvErr(fid, op, s, lenient) => match values.get(*fid) {
                 None | Some(Value::Null) => None,
-                Some(_) => return Err(EvalErr::ConversionError(Some(s.clone()))),
+                // the engine's OTHER conversion of this literal: the
+                // per-row compare takes the lenient grammar's value and
+                // never raises - nothing keyed the column, or
+                // `key_conversion` would have raised at open
+                Some(_) => match lenient {
+                    Some(rhs) => Term::NumCmp(*fid, *op, rhs.clone()).matches(values)?,
+                    None => return Err(EvalErr::ConversionError(Some(s.clone()))),
+                },
             },
+            // no value gate at all - see the variant
+            Term::KeyConvErr(s) => return Err(EvalErr::ConversionError(Some(s.clone()))),
             // the per-row COLUMN coercion (see the variant): NULL (or a
             // missing slot) is UNKNOWN with no raise; a text value
             // converts with the lenient compare grammar and compares
@@ -4752,7 +4893,12 @@ fn quoted_qualified(name: &str) -> String {
 /// subquery / CTE / UNION context has its own arithmetic.
 fn proc_blr_offset(name: &str, n_cols: usize, args: &[Value]) -> i64 {
     // fc hard-codes PUBLIC exactly as quoted_qualified above does
-    let mut off = 24 + "PUBLIC".len() as i64 + name.trim_matches('"').trim_end().chars().count() as i64;
+    // the name's length here is its length IN BYTES: the BLR carries the
+    // string, not its characters. Probed - a 3-character name holding
+    // one 2-byte letter answers offset 34 where a 3-ASCII-character one
+    // answers 33, so a character count under-counts by exactly the
+    // continuation bytes.
+    let mut off = 24 + "PUBLIC".len() as i64 + name.trim_matches('"').trim_end().len() as i64;
     off += 4 * (n_cols as i64 - 1);
     if !args.is_empty() {
         off += 3;
@@ -5009,6 +5155,34 @@ fn cs_join(a: TfCs, b: TfCs) -> TfCs {
 /// if ANY branch is varying. None means "no statically known width",
 /// which keeps the old catch-all declaration.
 fn text_form(e: &Expr, descs: &[Descriptor]) -> Option<(bool, i32, TfCs)> {
+    text_form_m(e, descs, |s| s.chars().count() as i32)
+}
+
+/// The same widths, with a LITERAL measured the way a SINGLE-BYTE
+/// attachment measures one: every OCTET of the source text is a
+/// character of it.
+///
+/// An untyped literal is typed in the CLIENT's `lc_ctype`, and its
+/// declared width is the length of the source text IN THAT CHARSET -
+/// so the same `'<3 two-byte letters>'` is 3 characters (12 bytes) to a
+/// UTF8 attachment and 6 characters (6 bytes) to a NONE or WIN1252 one,
+/// probed with SQLDA_DISPLAY on all three. Which of the two widths the
+/// describe announces cannot be decided where the plan is built - the
+/// attachment is only known at emission - so both travel, exactly like
+/// the charset sentinels ([resolve_text_cs] picks).
+///
+/// Every other leaf measures identically under both: a column's width is
+/// already a character count and a CAST's is its declared one.
+fn text_form_oct(e: &Expr, descs: &[Descriptor]) -> Option<(bool, i32, TfCs)> {
+    text_form_m(e, descs, |s| s.len() as i32)
+}
+
+fn text_form_m(
+    e: &Expr,
+    descs: &[Descriptor],
+    lit_w: fn(&str) -> i32,
+) -> Option<(bool, i32, TfCs)> {
+    let text_form = |e: &Expr, descs: &[Descriptor]| text_form_m(e, descs, lit_w);
     let widen = |a: Option<(bool, i32, TfCs)>, b: Option<(bool, i32, TfCs)>| match (a, b) {
         (Some((va, wa, ca)), Some((vb, wb, cb))) => {
             Some((va || vb, wa.max(wb), cs_join(ca, cb)))
@@ -5016,7 +5190,7 @@ fn text_form(e: &Expr, descs: &[Descriptor]) -> Option<(bool, i32, TfCs)> {
         _ => None,
     };
     match e {
-        Expr::Str(s) => Some((false, s.chars().count() as i32, TfCs::Att)),
+        Expr::Str(s) => Some((false, lit_w(s), TfCs::Att)),
         // a column's descriptor length is BYTES; the width here is
         // CHARACTERS, so a multibyte charset divides by its
         // bytes-per-character (CHAR(6) UTF8 stores 24 bytes, is 6 wide)
@@ -5039,15 +5213,20 @@ fn text_form(e: &Expr, descs: &[Descriptor]) -> Option<(bool, i32, TfCs)> {
             }
         }
         Expr::Cast(inner, CastTarget::Text { len, pad, synthetic }) => {
-            // a USER cast is typed in the attachment charset; the
-            // synthetic pad wrap keeps its branches' charset (see
-            // [CastTarget::Text])
-            let cs = if *synthetic {
-                text_form(inner, descs).map(|(_, _, c)| c).unwrap_or(TfCs::Att)
-            } else {
-                TfCs::Att
-            };
-            Some((!*pad, *len as i32, cs))
+            // a USER cast is typed in the attachment charset and declares
+            // its own width, in characters of it either way.
+            //
+            // The synthetic pad wrap is MEASURED THROUGH instead: its
+            // `len` is a copy of the conditional's own character width
+            // ([pad_conditional]), so reading it back would hide the
+            // literals underneath from the octet measure and announce
+            // 4 for `DECODE(1, 1, '<4 two-byte letters>', 'nu')` where
+            // the engine announces 8. Under the character measure this
+            // is the same number it always was.
+            if *synthetic {
+                return text_form(inner, descs).map(|(_, w, c)| (!*pad, w, c));
+            }
+            Some((!*pad, *len as i32, TfCs::Att))
         }
         // a conditional is as wide as its widest branch
         Expr::Coalesce(v) => v
@@ -5205,8 +5384,19 @@ fn build_expr_col(
     } else {
         0
     };
+    // THE ANNOUNCED WIDTH AND THE SHIPPED BYTES MUST AGREE. The width
+    // above counts a literal in CHARACTERS, which is what a multi-byte
+    // attachment announces; a single-byte one counts the same literal in
+    // OCTETS, and announcing 3 for a 6-byte value shipped a prefix and
+    // then desynchronised the wire (SQLSTATE 08006, connection gone).
+    // Both widths travel; the attachment picks at emission.
+    let oct_length = match text_form_oct(&e, descs) {
+        Some((_, w, _)) if matches!(e.type_of(descs), Some(ExprType::Text)) => w,
+        _ => length,
+    };
     Some(ProjCol {
         name: name.to_string(),
+        oct_length,
         // the caller knows what the expression WAS (the parse-time
         // symbolic name, before DECODE desugared to CASE) - it assigns
         // fname after this returns
@@ -5272,6 +5462,7 @@ fn build_projcols(
             wire,
             sql_type: nullable(sql_type),
             length,
+            oct_length: length,
             scale,
             sub_type,
             expr: None,
@@ -9726,6 +9917,7 @@ fn wrap_returning(
             wire,
             sql_type,
             length,
+            oct_length: length,
             scale,
             sub_type,
             expr: None,
@@ -11411,6 +11603,29 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                 if rhs.contains('?') {
                     return None;
                 }
+                let rc0 = columns.iter().find(|c| c.name.eq_ignore_ascii_case(&col))?;
+                let fid0 = rc0.field_id as usize;
+                // `SET <col> = GEN_ID(g,n)` / `= NEXT VALUE FOR g`: a
+                // GENERATOR DRAW, made once per UPDATED row. It is its
+                // own SetVal because `Expr::eval` has no generator to
+                // reach - see [SetVal::Gen].
+                if let Some((gen, step)) = parse_gen_sel_item(rhs) {
+                    let d = descs.get(fid0)?;
+                    if !matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64)
+                        || d.scale != 0
+                    {
+                        return None;
+                    }
+                    generator_info(db, &gen)?;
+                    if sets.iter().any(|(f, _)| *f == fid0) {
+                        return None;
+                    }
+                    if is_computed_fid(descs, fid0) {
+                        return None;
+                    }
+                    sets.push((fid0, SetVal::Gen(gen, step)));
+                    continue;
+                }
                 // `_any` also accepts a BARE column reference, which
                 // `parse_raw_expr` refuses (it exists for select-list
                 // expressions, where a bare column is a plain column).
@@ -11418,8 +11633,7 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                 // `SET A = B, B = A`.
                 let raw = parse_raw_expr_any(rhs)?;
                 let e = resolve_expr(&raw, &columns, descs)?;
-                let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(&col))?;
-                let fid = rc.field_id as usize;
+                let fid = fid0;
                 if sets.iter().any(|(f, _)| *f == fid) {
                     return None;
                 }
@@ -11464,6 +11678,27 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     if sets.is_empty() {
         return None;
     }
+    // A GENERATOR DRAWN IN THE WHERE takes the walk over from the
+    // predicate machinery: it must ADVANCE once per row compared, which
+    // no [Predicate] can. Recognised BEFORE the predicate parser, which
+    // would only refuse the GEN_ID call.
+    let gen_filter = where_kw
+        .and_then(|w| parse_gen_where(db, rel, &s[w + "WHERE".len()..], &columns, descs));
+    if let Some(g) = &gen_filter {
+        // Same generator in the SET list and the WHERE: the engine
+        // INTERLEAVES the two draws row by row - the WHERE's first, then
+        // the SET's only when that row matched (probed: `UPDATE T SET V
+        // = GEN_ID(G1,1) WHERE ID = GEN_ID(G1,1)` over 5 rows leaves 6,
+        // with V=2 in the one row that matched). This walk collects the
+        // whole target set before it patches, so it can only draw all
+        // the WHERE's then all the SET's - a different sequence of
+        // values. Refuse rather than answer it.
+        if sets.iter().any(|(_, sv)| {
+            matches!(sv, SetVal::Gen(n, _) if n.eq_ignore_ascii_case(&g.name))
+        }) {
+            return None;
+        }
+    }
     // WHERE `?` slots number after the SET list's
     let mut next_param = params.len();
     // the WHERE rendered back to text - subqueries folded away - for
@@ -11472,7 +11707,7 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     // can ever drive a DML index. Rendered for the subquery-free
     // stream too: the raw text never worked, folded or not.
     let mut folded_where: Option<String> = None;
-    let filter = match where_kw {
+    let filter = match where_kw.filter(|_| gen_filter.is_none()) {
         None => None,
         // A DML WHERE may carry SUBQUERIES, exactly as a SELECT's does -
         // `UPDATE T SET ... WHERE ID IN (SELECT UID FROM U)` is the same
@@ -11515,6 +11750,29 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         }
     };
     let params: Vec<Descriptor> = params.into_iter().collect::<Option<_>>()?;
+    // A SET-LIST DRAW BESIDE A UNIQUE KEY THIS STATEMENT REWRITES.
+    // The engine draws AS IT WRITES each row, so a duplicate-key raise on
+    // the SECOND row leaves exactly 2 draws behind (probed: `UPDATE TP
+    // SET V = GEN_ID(G,1), ID = 1` over 3 rows burns 2, not 3). fire-crab
+    // patches every target image - drawing as it goes - and only then
+    // runs the row-at-a-time write walk that judges uniqueness, so it
+    // would burn one draw per MATCHED row however early the collision is.
+    // Every other per-row refusal (NOT NULL, CHECK, FK) is raised in the
+    // patch loop itself and stops at the right row; uniqueness alone is
+    // deferred, and it can only fire when the SET list touches a UNIQUE
+    // key column. A statement that can match AT MOST ONE ROW is safe
+    // either way - the one draw is made before the one write - so the
+    // refusal is exactly "a drawing SET list that rewrites a unique key
+    // over a row set the WHERE has not pinned to a single row".
+    if sets.iter().any(|(_, sv)| matches!(sv, SetVal::Gen(..))) {
+        let set_fids: Vec<usize> = sets.iter().map(|(f, _)| *f).collect();
+        let rewrites_unique = index_ops
+            .iter()
+            .any(|op| op.unique && op.segs.iter().any(|(f, _, _)| set_fids.contains(f)));
+        if rewrites_unique && !filter_pins_one_row(&filter, &index_ops) {
+            return None;
+        }
+    }
     // the table's CHECK constraints (an unevaluatable one refuses) and
     // the trigger guard: the SET column names let an FK-parent table
     // take updates that never touch a referenced key column
@@ -11571,6 +11829,7 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
             fk_refs,
             fk_children,
             index,
+            gen_filter,
         },
         params,
     ))
@@ -11603,11 +11862,15 @@ fn plan_delete(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
     let mut params: Vec<Option<Descriptor>> = Vec::new();
     let mut next_param = 0usize;
+    // a generator drawn in the WHERE takes the walk over - see
+    // [parse_gen_where] and the same hook in plan_update
+    let gen_filter = where_kw
+        .and_then(|w| parse_gen_where(db, rel, &s[w + "WHERE".len()..], &columns, descs));
     // the WHERE rendered back to text for the gatekeeper - same law as
     // plan_update: fcopt refuses the raw DELETE, so only the
     // reconstruction can drive the walk's index
     let mut folded_where: Option<String> = None;
-    let filter = match where_kw {
+    let filter = match where_kw.filter(|_| gen_filter.is_none()) {
         None => None,
         // the same subquery lifting the SELECT and UPDATE paths use
         Some(w) => {
@@ -11660,7 +11923,7 @@ fn plan_delete(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
             None => eprintln!("[srv] dml natural: rel={}", rel),
         }
     }
-    Some((Plan::Delete { rel, formats, filter, fk_children, index }, params))
+    Some((Plan::Delete { rel, formats, filter, fk_children, index, gen_filter }, params))
 }
 
 /// The DML target walk: every committed primary record of `rel` the
@@ -11777,6 +12040,204 @@ fn dml_targets_at(
 /// recno-ascending by the same rule, no sort needed).
 fn sort_targets_recno(out: &mut [(u64, u32, u16, u8, Vec<u8>)]) {
     out.sort_by_key(|(recno, ..)| *recno);
+}
+
+/// Can this filter match AT MOST ONE ROW? True when it is a single
+/// conjunction that pins every segment of some UNIQUE index to a value -
+/// the shape `UPDATE OR INSERT`'s desugared update half always has, and
+/// the one that lets a drawing SET list rewrite a unique key safely (see
+/// the refusal in [plan_update]).
+fn filter_pins_one_row(filter: &Option<Predicate>, index_ops: &[IndexOp]) -> bool {
+    let Some(p) = filter else { return false };
+    // several groups are a top-level OR - two rows, two chances
+    if p.groups.len() != 1 {
+        return false;
+    }
+    let pinned = |fid: usize| {
+        p.groups[0].iter().any(|t| {
+            matches!(t,
+                Term::Cmp(f, Cmp::Eq, r) | Term::NumCmp(f, Cmp::Eq, r)
+                    if *f == fid && !matches!(r, Rhs::Null))
+        })
+    };
+    index_ops
+        .iter()
+        .any(|op| op.unique && !op.segs.is_empty() && op.segs.iter().all(|(f, _, _)| pinned(*f)))
+}
+
+/// Recognise a DML `WHERE` that is EXACTLY one comparison against a
+/// generator draw - `WHERE ID = GEN_ID(G,1)`, `WHERE NEXT VALUE FOR G >
+/// ID` - and nothing else.
+///
+/// The narrowness is the law, not laziness. Probed against the engine:
+///
+///  * the draw advances ONCE PER ROW COMPARED, so anything that changes
+///    WHICH rows are compared changes the count. The engine SHORT-CIRCUITS
+///    AND/OR left to right: `WHERE ID > 99 AND ID = GEN_ID(G,1)` over 5
+///    rows leaves the generator at 0 (the left conjunct is false first and
+///    the draw is never reached), while `WHERE ID = GEN_ID(G,1) AND ID >
+///    99` leaves it at 5. A connective is therefore refused - the DNF the
+///    predicate parser builds has already lost the order that decides it.
+///  * an INDEX RETRIEVAL changes the count outright: with a PRIMARY KEY on
+///    ID, `DELETE FROM TP WHERE ID = GEN_ID(G,1)` over 5 rows draws TWICE
+///    and deletes NOTHING (the bound is drawn once, then the retrieved row
+///    is re-tested against a second draw), where the same statement under
+///    `PLAN (TP NATURAL)` draws 5 times and deletes every row. fire-crab
+///    cannot reproduce the engine's choice of path, so a relation with ANY
+///    index refuses: with no index the engine has only NATURAL, which is
+///    the walk below.
+///  * the compared column must be a plain integer, scale 0 - the draw is a
+///    SINT64 and this compares them exactly, with no coercion grammar to
+///    get wrong.
+fn parse_gen_where(
+    db: &Database,
+    rel: u16,
+    where_text: &str,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+) -> Option<GenFilter> {
+    let s = where_text.trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    // a connective anywhere kills it - see the short-circuit law above
+    for kw in ["AND", "OR", "NOT"] {
+        if find_word(&masked, kw, 0).is_some() {
+            return None;
+        }
+    }
+    // a `?` would have to bind mid-walk
+    if s.contains('?') {
+        return None;
+    }
+    // split at the top-level comparison operator. `GEN_ID(G,1)` and
+    // `NEXT VALUE FOR G` contain none of these characters, and neither
+    // does a column name, so the FIRST one outside parens is it.
+    let b = masked.as_bytes();
+    let mut depth = 0i32;
+    let mut cut = None;
+    for i in 0..b.len() {
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'<' | b'>' | b'=' if depth == 0 => {
+                let two = &s[i..(i + 2).min(s.len())];
+                let (op, len) = match two {
+                    "<>" => (Cmp::Ne, 2),
+                    "<=" => (Cmp::Le, 2),
+                    ">=" => (Cmp::Ge, 2),
+                    _ => match b[i] {
+                        b'<' => (Cmp::Lt, 1),
+                        b'>' => (Cmp::Gt, 1),
+                        _ => (Cmp::Eq, 1),
+                    },
+                };
+                cut = Some((i, len, op));
+                break;
+            }
+            _ => {}
+        }
+    }
+    let (at, oplen, op) = cut?;
+    let (lhs, rhs) = (s[..at].trim(), s[at + oplen..].trim());
+    // the draw on the right keeps the operator; on the left it mirrors,
+    // because [GenFilter::op] is written as the COLUMN sees it
+    let (col_text, gen, op) = match parse_gen_sel_item(rhs) {
+        Some(g) => (lhs, g, op),
+        None => {
+            let g = parse_gen_sel_item(lhs)?;
+            let mirrored = match op {
+                Cmp::Eq => Cmp::Eq,
+                Cmp::Ne => Cmp::Ne,
+                Cmp::Lt => Cmp::Gt,
+                Cmp::Le => Cmp::Ge,
+                Cmp::Gt => Cmp::Lt,
+                Cmp::Ge => Cmp::Le,
+            };
+            (rhs, g, mirrored)
+        }
+    };
+    let col = col_text.trim().trim_matches('"');
+    if !ident_ok(col) {
+        return None;
+    }
+    let fid = columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(col))
+        .map(|c| c.field_id as usize)?;
+    if is_computed_fid(descs, fid) {
+        return None;
+    }
+    let d = descs.get(fid)?;
+    if !matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64) || d.scale != 0 {
+        return None;
+    }
+    // the index refusal - see above
+    if !index_key_fids(db, rel, descs).is_empty() {
+        return None;
+    }
+    // the generator must exist at prepare, else refuse rather than fail
+    // mid-walk with half the draws made
+    generator_info(db, &gen.0)?;
+    Some(GenFilter { fid, op, name: gen.0, step: gen.1 })
+}
+
+/// The DML target walk when the WHERE holds a GENERATOR DRAW. Identical
+/// to [collect_dml_targets]'s page scan except that every row COMPARED
+/// advances the generator first and is then tested against the value it
+/// drew - the engine's law, probed: three rows and `WHERE ID =
+/// GEN_ID(G,1)` leave the generator at 3 whether two rows match, none
+/// do, or one of them holds a NULL (a NULL column compares UNKNOWN and
+/// is kept, but it has already drawn).
+///
+/// The bump lands in `work`, the statement's working copy, so a
+/// statement that fails later throws the ROWS away and keeps the DRAWS
+/// - what [execute_dml_collecting] already promises. Returns the last
+/// value drawn, for the caller's [burn_generator].
+fn collect_dml_targets_drawing(
+    db: &Database,
+    work: &mut [u8],
+    rel: u16,
+    formats: &[(u8, Vec<Descriptor>)],
+    g: &GenFilter,
+) -> Result<(Vec<(u32, u16, u8, Vec<u8>)>, Option<i64>), ExecErr> {
+    let (id, incr) = generator_info(db, &g.name).ok_or("no such generator")?;
+    let step = g.step.unwrap_or(incr);
+    let mut last = None;
+    let mut out = Vec::new();
+    for dp_no in relation_data_pages(&db.bytes, db.page_size, rel) {
+        let start = dp_no as usize * db.page_size;
+        let Some(dp) = db
+            .bytes
+            .get(start..start + db.page_size)
+            .and_then(DataPage::decode)
+        else {
+            continue;
+        };
+        for r in dp.records() {
+            if !r.is_primary_record() {
+                continue;
+            }
+            let Some(image) = fire_crab_ods::data::assembled_image(&db.bytes, db.page_size, &r) else { continue };
+            let descs = formats
+                .iter()
+                .find(|(n, _)| *n == r.format)
+                .or_else(|| formats.iter().max_by_key(|(n, _)| *n));
+            let Some((_, descs)) = descs else { continue };
+            let values = decode_record(&image, descs);
+            let drawn = fire_crab_ods::gen::bump(work, db.page_size, id, step)?;
+            last = Some(drawn);
+            // three-valued, like every other comparison: a NULL column
+            // is UNKNOWN, which keeps no row
+            let keep = match values.get(g.fid) {
+                Some(Value::Int(n)) => ord_ok(n.cmp(&drawn), g.op),
+                _ => false,
+            };
+            if keep {
+                out.push((dp_no, r.slot, r.format, image));
+            }
+        }
+    }
+    Ok((out, last))
 }
 
 fn collect_dml_targets(
@@ -12379,7 +12840,7 @@ fn execute_dml_collecting_inner(
             }
             (1, 0, 0)
         }
-        Plan::Update { rel, table, format_no, formats, sets, filter, index_ops, not_null, checks, fk_refs, fk_children, index } => {
+        Plan::Update { rel, table, format_no, formats, sets, filter, index_ops, not_null, checks, fk_refs, fk_children, index, gen_filter } => {
             let descs = formats
                 .iter()
                 .find(|(n, _)| n == format_no)
@@ -12391,6 +12852,11 @@ fn execute_dml_collecting_inner(
             // inside the scan instead
             let mut bound_sets: Vec<(usize, Option<Vec<u8>>)> = Vec::new();
             let mut expr_sets: Vec<(usize, &Expr)> = Vec::new();
+            // the generator draws, in SET-LIST order: the engine
+            // evaluates a row's assignments left to right (probed: `SET
+            // V = GEN_ID(G,1) + GEN_ID(G,1)` stores 3, 7, 11 ... over
+            // five rows)
+            let mut gen_sets: Vec<(usize, &str, Option<i64>)> = Vec::new();
             for (fid, sv) in sets {
                 let bytes = match sv {
                     SetVal::Lit(b) => b.clone(),
@@ -12402,6 +12868,10 @@ fn execute_dml_collecting_inner(
                     }
                     SetVal::Expr(e) => {
                         expr_sets.push((*fid, e));
+                        continue;
+                    }
+                    SetVal::Gen(name, step) => {
+                        gen_sets.push((*fid, name.as_str(), *step));
                         continue;
                     }
                 };
@@ -12432,9 +12902,19 @@ fn execute_dml_collecting_inner(
                 .unwrap_or(0);
             let mut targets: Vec<(u32, u16, Vec<u8>)> = Vec::new();
             let mut old_images: Vec<Vec<u8>> = Vec::new();
-            for (page, slot, fmt, image) in
-                collect_dml_targets(db, *rel, formats, filter, index).map_err(ExecErr::Eval)?
-            {
+            let found = match gen_filter {
+                Some(g) => {
+                    let (rows, last) =
+                        collect_dml_targets_drawing(db, &mut work, *rel, formats, g)?;
+                    if let Some(v) = last {
+                        burn_generator(db, &g.name, v);
+                    }
+                    rows
+                }
+                None => collect_dml_targets(db, *rel, formats, filter, index)
+                    .map_err(ExecErr::Eval)?,
+            };
+            for (page, slot, fmt, image) in found {
                 // the SET offsets were resolved in the NEWEST format; a
                 // record still stored in an older one would patch wrong
                 // bytes - refuse the whole statement instead
@@ -12455,6 +12935,39 @@ fn execute_dml_collecting_inner(
                         }
                     }
                 }
+                // GENERATOR DRAWS: once per UPDATED row - the engine
+                // advances the sequence for each row it writes and for
+                // no other (probed: `SET V = GEN_ID(G,3)` over 5 rows
+                // leaves 15 and stores 3,6,9,12,15; the same statement
+                // behind a WHERE that matches 2 of 5 leaves 6, and one
+                // that matches none leaves the generator untouched).
+                // Persisted into `work` beside the row it feeds and
+                // BURNED, exactly as Plan::Insert's gen_fields are: a
+                // statement that raises later keeps the draws it made.
+                for (fid, name, step) in &gen_sets {
+                    let (id, incr) = generator_info(db, name).ok_or("no such generator")?;
+                    let new_val = fire_crab_ods::gen::bump(
+                        &mut work,
+                        db.page_size,
+                        id,
+                        step.unwrap_or(incr),
+                    )?;
+                    burn_generator(db, name, new_val);
+                    let d = descs.get(*fid).ok_or("field beyond format")?;
+                    match encode_wire_value(d, &WireParam::Int(new_val, 0))
+                        .ok_or("generator value does not fit its column")?
+                    {
+                        None => {}
+                        Some(b) => {
+                            let at = d.offset as usize;
+                            if at + b.len() > img.len() {
+                                return Err("record image shorter than its format".into());
+                            }
+                            img[at..at + b.len()].copy_from_slice(&b);
+                            img[fid / 8] &= !(1 << (fid % 8));
+                        }
+                    }
+                }
                 // per-row expressions, evaluated against the row as it
                 // was BEFORE this statement - `SET N = N + 5` reads the
                 // N it replaces, and two assignments in one SET list
@@ -12463,9 +12976,15 @@ fn execute_dml_collecting_inner(
                     let old_values = decode_record(&image, descs);
                     for (fid, e) in &expr_sets {
                         let d = descs.get(*fid).ok_or("field beyond format")?;
-                        let v = e
-                            .eval(&old_values)
-                            .map_err(|_| "expression failed".to_string())?;
+                        // THE SET LIST RAISES WHAT THE WHERE RAISES. A
+                        // per-row evaluation failure carries the engine's
+                        // own vector (`SET V = 1/(ID-2)` is 22012 with
+                        // isc_integer_divide, not a generic 42000) - the
+                        // WHERE side of this same statement has answered
+                        // that way since [ExecErr] gained its Eval arm,
+                        // and flattening it here was the one place the
+                        // two halves of an UPDATE disagreed.
+                        let v = e.eval(&old_values).map_err(ExecErr::Eval)?;
                         let wp = match &v {
                             Value::Null => WireParam::Null,
                             Value::Int(n) => WireParam::Int(*n, 0),
@@ -12598,12 +13117,24 @@ fn execute_dml_collecting_inner(
             }
             (0, affected as i32, 0)
         }
-        Plan::Delete { rel, formats, filter, fk_children, index } => {
+        Plan::Delete { rel, formats, filter, fk_children, index, gen_filter } => {
             let filter = &bind_filter(filter, args)?;
             let mut targets: Vec<(u32, u16)> = Vec::new();
-            for (page, slot, fmt, image) in
-                collect_dml_targets(db, *rel, formats, filter, index).map_err(ExecErr::Eval)?
-            {
+            // a generator drawn in the WHERE advances ONCE PER ROW
+            // COMPARED, matching or not - see [collect_dml_targets_drawing]
+            let found = match gen_filter {
+                Some(g) => {
+                    let (rows, last) =
+                        collect_dml_targets_drawing(db, &mut work, *rel, formats, g)?;
+                    if let Some(v) = last {
+                        burn_generator(db, &g.name, v);
+                    }
+                    rows
+                }
+                None => collect_dml_targets(db, *rel, formats, filter, index)
+                    .map_err(ExecErr::Eval)?,
+            };
+            for (page, slot, fmt, image) in found {
                 // NO ACTION partner check, per deleted row: its key
                 // must not be referenced by any child (the row's own
                 // stored format decodes it, like the target walk did)
@@ -14911,6 +15442,7 @@ fn plan_join_bound(
                         wire,
                         sql_type: nullable(sql_type),
                         length,
+                        oct_length: length,
                         scale,
                         sub_type,
                         expr,
@@ -14974,6 +15506,7 @@ fn plan_join_bound(
                     wire,
                     sql_type: nullable(sql_type),
                     length,
+                    oct_length: length,
                     scale,
                     sub_type,
                     expr: None,
@@ -16175,31 +16708,47 @@ fn strip_modifiers(sql: &str) -> Option<(String, bool, usize, Option<usize>, boo
 fn split_union(sql: &str) -> Option<(Vec<String>, bool)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = mask_literals(&s.to_ascii_uppercase());
-    // find depth-0 UNION keywords
-    let b: Vec<char> = up.chars().collect();
+    // find depth-0 UNION keywords.
+    //
+    // A CHARACTER POSITION IS NOT A BYTE OFFSET. The scan walks
+    // characters (a keyword's neighbours are tested as characters) but
+    // every slice of `up`/`s` below is a BYTE index, and a quoted
+    // identifier may hold any character at all - `SELECT 1 AS "ai" FROM
+    // ...` with two-byte letters put byte 14 inside one and panicked the
+    // connection thread, which drops the client. char_indices carries
+    // both numbers, so the two are never confused again: `.0` is the
+    // byte offset, the Vec position is the character.
+    // (`mask_literals` and `to_ascii_uppercase` are both byte-length
+    // preserving, so an offset into `up` is the same offset into `s`.)
+    let b: Vec<(usize, char)> = up.char_indices().collect();
+    // the byte offset one past the last character, for an end position
+    let byte_at = |k: usize| b.get(k).map(|(o, _)| *o).unwrap_or(up.len());
     let mut depth = 0i32;
-    let mut cuts: Vec<(usize, usize, bool)> = Vec::new(); // (start, end, all)
+    let mut cuts: Vec<(usize, usize, bool)> = Vec::new(); // (start, end, all) - BYTES
     let mut i = 0usize;
     while i < b.len() {
-        match b[i] {
+        match b[i].1 {
             '(' => depth += 1,
             ')' => depth -= 1,
             _ => {}
         }
-        if depth == 0 && up[i..].starts_with("UNION") {
-            let before_ok = i == 0 || !(b[i - 1].is_alphanumeric() || b[i - 1] == '_');
+        if depth == 0 && up[b[i].0..].starts_with("UNION") {
+            let before_ok = i == 0 || !(b[i - 1].1.is_alphanumeric() || b[i - 1].1 == '_');
+            // UNION is ASCII, so its length in characters is its length
+            // in bytes and `after` stays a character position
             let after = i + "UNION".len();
-            let after_ok = after >= b.len() || !(b[after].is_alphanumeric() || b[after] == '_');
+            let after_ok = after >= b.len() || !(b[after].1.is_alphanumeric() || b[after].1 == '_');
             if before_ok && after_ok {
                 // an optional ALL follows
                 let mut j = after;
-                while j < b.len() && b[j].is_whitespace() {
+                while j < b.len() && b[j].1.is_whitespace() {
                     j += 1;
                 }
-                let is_all = up[j..].starts_with("ALL")
-                    && (j + 3 >= b.len() && true || !(b[j + 3].is_alphanumeric() || b[j + 3] == '_'));
+                let is_all = up[byte_at(j)..].starts_with("ALL")
+                    && (j + 3 >= b.len()
+                        || !(b[j + 3].1.is_alphanumeric() || b[j + 3].1 == '_'));
                 let end = if is_all { j + 3 } else { after };
-                cuts.push((i, end, is_all));
+                cuts.push((b[i].0, byte_at(end), is_all));
                 i = end;
                 continue;
             }
@@ -16998,6 +17547,7 @@ fn plan_query_inner(
                 wire: Wire::Int64,
                 sql_type: 581, // nullable - see wire_for
                 length: 8,
+                oct_length: 8,
                 scale: 0,
                 sub_type: 0,
                 expr: None,
@@ -17551,6 +18101,7 @@ fn plan_query_inner(
                             wire: Wire::Int64,
                             sql_type: 581,
                             length: 8,
+                            oct_length: 8,
                             scale: 0,
                             sub_type: 0,
                             expr: None,
@@ -18052,6 +18603,7 @@ fn plan_query_inner(
                             // its message from.
                             sql_type: if step.is_none() { 580 } else { 581 },
                             length: 8,
+                            oct_length: 8,
                             scale: 0,
                             sub_type: 0,
                             expr: None,
@@ -18586,6 +19138,7 @@ fn build_group_items(
                     wire: Wire::Int64,
                     sql_type: 581,
                     length: 8,
+                    oct_length: 8,
                     scale: 0,
                     sub_type: 0,
                     expr: None,
@@ -18609,6 +19162,7 @@ fn build_group_items(
                     wire: pc.wire,
                     sql_type: pc.sql_type,
                     length: pc.length,
+                    oct_length: pc.oct_length,
                     scale: pc.scale,
                     sub_type: pc.sub_type,
                     expr: None,
@@ -18644,6 +19198,7 @@ fn build_group_items(
                     wire,
                     sql_type: nullable(sql_type),
                     length,
+                    oct_length: length,
                     scale,
                     sub_type,
                     expr: None,
@@ -18793,6 +19348,7 @@ fn build_group_items(
                     wire,
                     sql_type: nullable(sql_type),
                     length,
+                    oct_length: length,
                     scale,
                     sub_type,
                     expr: None,
@@ -20255,6 +20811,7 @@ fn bigint_col(n: usize) -> ProjCol {
         wire: Wire::Int64,
         sql_type: 581, // nullable - see wire_for
         length: 8,
+        oct_length: 8,
         scale: 0,
         sub_type: 0,
         expr: None,
@@ -20280,6 +20837,7 @@ fn output_cols_of(plan: &Plan) -> Vec<ProjCol> {
             wire: Wire::Int64,
             sql_type: 581,
             length: 8,
+            oct_length: 8,
             scale: 0,
             sub_type: 0,
             expr: None,
@@ -20296,6 +20854,7 @@ fn output_cols_of(plan: &Plan) -> Vec<ProjCol> {
             wire: Wire::Int64,
             sql_type: 581,
             length: 8,
+            oct_length: 8,
             scale: 0,
             sub_type: 0,
             expr: None,
@@ -20378,7 +20937,7 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor], att: AttCs) 
             // 'ab' under a UTF8 attachment is length 8 CHARSET UTF8,
             // under NONE it is length 2 CHARSET NONE; a real-charset
             // EXPRESSION resolves the same way (see [resolve_text_cs])
-            let (sub_type, length) = resolve_text_cs(c.sub_type, c.length, &att);
+            let (sub_type, length) = resolve_text_cs(c.sub_type, c.length, c.oct_length, &att);
             Var {
                 sql_type: c.sql_type,
                 sub_type,
@@ -21657,12 +22216,23 @@ fn enforce_out_capacity(
             continue;
         }
         let dest_chars = l as usize / dest.bpc as usize;
-        let src_chars = s.chars().count();
+        // A SINGLE-BYTE DESTINATION COUNTS OCTETS: one character IS one
+        // byte there, so a value with more octets than the slot holds
+        // does not fit however few CHARACTERS it has. Measuring it in
+        // characters let a multi-byte value be written past the client's
+        // buffer, and an over-long varying desynchronises the wire
+        // (08006, connection gone) - far worse than the truncation the
+        // engine raises. Trailing blanks are one octet either way, so
+        // the re-fit below lands on the engine's own answer: a CHAR
+        // conditional padded to its CHARACTER width comes back trimmed
+        // and re-padded to its byte width.
+        let count = |x: &str| if dest.bpc == 1 { x.len() } else { x.chars().count() };
+        let src_chars = count(&s);
         if src_chars <= dest_chars {
             continue;
         }
         let t = s.trim_end_matches(' ');
-        let tc = t.chars().count();
+        let tc = count(t);
         if tc <= dest_chars {
             let mut fitted = t.to_string();
             fitted.extend(std::iter::repeat(' ').take(dest_chars - tc));
@@ -22760,10 +23330,13 @@ enum RawCond {
 /// select-list arithmetic already does - the displayed value is identical.
 #[derive(Clone, Copy, PartialEq)]
 enum CastTarget {
-    /// an integer-family target; `wide` marks BIGINT, whose int64 rank
+    /// an integer-family target. `bytes` is the STORAGE WIDTH the
+    /// keyword names - 2 SMALLINT, 4 INTEGER, 8 BIGINT - and it decides
+    /// two things the collapsed value cannot: BIGINT's int64 rank
     /// promotes a multiplication or division around it to INT128 (the
-    /// engine's DSC_multiply_result), while SMALLINT/INTEGER stay long
-    Int { wide: bool },
+    /// engine's DSC_multiply_result), and the width picks the engine's
+    /// text-conversion buffer ([CastTarget::cvt_cap])
+    Int { bytes: u8 },
     /// `synthetic` marks the pad wrap [pad_conditional] adds around a
     /// CHAR-formed conditional: it must keep the branches' charset,
     /// where a USER cast to text is typed in the ATTACHMENT charset
@@ -22772,13 +23345,86 @@ enum CastTarget {
     Text { len: usize, pad: bool, synthetic: bool },
     /// `NUMERIC(p, s)` / `DECIMAL(p, s)` - the declared SCALE is what the
     /// value is rounded to (half away from zero, probed: 12.55 to scale
-    /// -1 is 12.6 and -12.55 is -12.6); `wide` marks a precision past 18,
-    /// which stores as INT128
-    Numeric { scale: i8, wide: bool },
+    /// -1 is 12.6 and -12.55 is -12.6); `bytes` is the storage width the
+    /// PRECISION names (16 = the INT128 path), which is also this
+    /// target's conversion buffer ([CastTarget::cvt_cap])
+    Numeric { scale: i8, bytes: u8 },
     /// `FLOAT` / `DOUBLE PRECISION` - both announce DOUBLE
     Approx,
     /// `DATE` / `TIME` / `TIMESTAMP`
     Temporal(TKind),
+}
+
+impl CastTarget {
+    /// How many BYTES of text source the engine's conversion of this
+    /// target can hold, `None` where it holds any length.
+    ///
+    /// ENGINE LAW, probed boundary by boundary. cvt.cpp moves a text
+    /// source into the CALLER's stack buffer (`CVT_make_string` into a
+    /// `VaryStr<N>`) before `cvt_decompose` reads a single character of
+    /// it, and a source too long for that buffer is SQLSTATE 22001
+    /// *string right truncation* BEFORE any grammar runs - a perfectly
+    /// spelled `'000...02'` raises it exactly as `'   ...x'` does. The
+    /// reported `expected` is `sizeof(VaryStr<N>)` = N + 2, which is
+    /// why the numbers are 22 / 52 / 130 and not 20 / 50 / 128:
+    ///
+    ///   * 22   - `CVT_get_short`: SMALLINT and NUMERIC(p <= 4)
+    ///            (probed: 21 leading blanks convert, 22 raise);
+    ///   * 52   - `CVT_get_long` / `CVT_get_int64`: INTEGER, BIGINT,
+    ///            NUMERIC/DECIMAL of precision 5..18 - and DECIMAL(p <= 4)
+    ///            with them, because DECIMAL never stores as a SHORT
+    ///            (probed: NUMERIC(4,0) caps at 22 where DECIMAL(4,0)
+    ///            caps at 52 - one keyword apart, two different caps);
+    ///   * 130  - `CVT_get_double`: FLOAT and DOUBLE PRECISION (probed:
+    ///            129 leading blanks convert, 130 raise) - and the
+    ///            TEMPORAL targets with them, DATE/TIME/TIMESTAMP, whose
+    ///            date-time scanner takes the same 128-byte buffer
+    ///            (probed: 120 blanks then '2020-01-01' converts, 121
+    ///            raise, and the 22001 REPLACES the 22018 a nonsense
+    ///            source of that length would have earned);
+    ///   * none - the INT128 path (precision 19..38) reads the string
+    ///            where it lies (probed: NUMERIC(19,0) takes a 201-byte
+    ///            source), and so does a text target.
+    ///
+    /// TRAILING BLANKS are dropped BEFORE the test and counted INTO the
+    /// reported `actual`: `'2'` + 200 blanks converts to a SMALLINT,
+    /// while 52 blanks + `'2'` + 200 blanks raises *expected 52,
+    /// actual 253*. The count is BYTES, not characters (a UTF8 source
+    /// of 53 characters and 54 bytes reports `actual 54`).
+    ///
+    /// The COMPARISON vector has no cap on either side (probed: an
+    /// unindexed `I = '<200 blanks>12'` answers its row) - except where
+    /// an INDEX makes the engine build a key, which converts through
+    /// the DOUBLE routine and caps at 130 whatever the column's type.
+    fn cvt_cap(&self) -> Option<usize> {
+        match self {
+            CastTarget::Int { bytes } | CastTarget::Numeric { bytes, .. } => match bytes {
+                2 => Some(22),
+                16 => None,
+                _ => Some(52),
+            },
+            CastTarget::Approx | CastTarget::Temporal(_) => Some(130),
+            CastTarget::Text { .. } => None,
+        }
+    }
+}
+
+/// The 22001 the [CastTarget::cvt_cap] buffer raises on a text source
+/// too long for it - `Ok(())` when the source fits. The engine drops
+/// TRAILING blanks first and then reports the UNSTRIPPED byte length as
+/// `actual`, both probed.
+fn cvt_cap_check(s: &str, cap: Option<usize>) -> Result<(), EvalErr> {
+    let cap = match cap {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+    if s.trim_end_matches(' ').len() > cap {
+        return Err(EvalErr::StringTruncation {
+            expected: cap as i64,
+            actual: s.len() as i64,
+        });
+    }
+    Ok(())
 }
 
 /// Parse an arithmetic expression: `+`/`-` (lowest precedence) over
@@ -23920,7 +24566,13 @@ fn parse_cast_target(b: &[char], pos: &mut usize) -> Option<CastTarget> {
     let kw: String = b[start..*pos].iter().collect();
     let ku = kw.to_ascii_uppercase();
     if matches!(ku.as_str(), "SMALLINT" | "INTEGER" | "INT" | "BIGINT") {
-        return Some(CastTarget::Int { wide: ku == "BIGINT" });
+        return Some(CastTarget::Int {
+            bytes: match ku.as_str() {
+                "SMALLINT" => 2,
+                "BIGINT" => 8,
+                _ => 4,
+            },
+        });
     }
     if matches!(ku.as_str(), "DATE" | "TIME" | "TIMESTAMP") {
         return Some(CastTarget::Temporal(match ku.as_str() {
@@ -23969,7 +24621,17 @@ fn parse_cast_target(b: &[char], pos: &mut usize) -> Option<CastTarget> {
         }
         return Some(CastTarget::Numeric {
             scale: -(scale as i8),
-            wide: prec > 18,
+            // the storage width the PRECISION names. `NUMERIC(p <= 4)`
+            // is the one SHORT-backed exact type in the language, and
+            // `DECIMAL` never takes that width whatever its precision -
+            // an engine quirk with an observable consequence, the
+            // 22-vs-52 conversion cap ([CastTarget::cvt_cap])
+            bytes: match prec {
+                p if p <= 4 && ku == "NUMERIC" => 2,
+                p if p <= 9 => 4,
+                p if p <= 18 => 8,
+                _ => 16,
+            },
         });
     }
     let pad = match ku.as_str() {
@@ -24864,18 +25526,24 @@ enum LitNum {
 }
 
 /// Classify a text literal compared against an exact-numeric column or
-/// expression.
+/// expression, with the STORE/CAST grammar ([text_number]).
 ///
-/// ONE grammar ([text_number]) everywhere in fc - deliberately NARROWER
-/// than the engine's compare-side grammar (jrd/cvt.cpp CVT_get_numeric),
-/// which SKIPS interior spaces: unindexed `N = '1 0'` answers the N=10
-/// row, but the same statement over an INDEXED column raises 22018 (the
-/// key is built with the strict store grammar, probed both ways). fc
-/// raises per row for those spellings, siding with the indexed engine.
+/// The literal side of a comparison is converted TWICE by the engine,
+/// by two different grammars, and which one decides is the INDEX's
+/// business (probed both ways): the per-row comparison runs the lenient
+/// `CVT_get_numeric`, where blanks skip anywhere - unindexed
+/// `N = '1 0'` answers the N=10 row and `N = '5 . 0'` the 5 row - while
+/// an INDEX makes the optimizer build a key with the strict store
+/// grammar at OPEN, and the same statement then raises 22018. So
+/// `Raise` here does NOT mean "raise": it means *the strict grammar
+/// refuses this spelling*, and the caller pairs it with
+/// [lenient_num_rhs] - the value the per-row compare uses when nothing
+/// keys the column ([Term::CmpConvErr]'s fourth field).
 ///
 /// - `Raise`: whatever `text_number` refuses ('x', '', ' ', '.', '--2',
-///   '2,', '2.5.5', '2e', 'e2', and the interior-space forms) - the
-///   engine's 22018 *conversion error from string "<original>"*.
+///   '2,', '2.5.5', '2e', 'e2', and the blank-bearing forms) - the
+///   engine's 22018 *conversion error from string "<original>"* when
+///   the lenient grammar refuses it too, or when a key is built.
 /// - Hex => `Refuse`: the engine's answer is op-, arity- and
 ///   index-dependent (probed: unindexed `N = '0XA'` is false for every
 ///   row yet `N < '0XA'` is true for every non-NULL row - a
@@ -24937,15 +25605,52 @@ fn literal_num_rhs(s: &str, int_col: bool) -> LitNum {
     }
 }
 
+/// The value the LENIENT compare grammar reads out of a text side the
+/// strict [text_number] refused - `None` where both refuse, or where
+/// the value will not fit an [Rhs].
+///
+/// This is the second of the engine's two conversions of one literal
+/// (see [literal_num_rhs]): the per-row comparison. Probed against the
+/// live engine over an unindexed INTEGER column holding 12 - `I = '1 2'`,
+/// `' 1 2 '` and `'1 2 '` all answer the row, `Q = '1 2.0 0'` answers
+/// the 12.00 NUMERIC row, `I + 0 = '1 2'` answers on the EXPRESSION
+/// side, and a text PARAMETER bound '1 2' answers too. Every one of
+/// them raises 22018 the moment an INDEX on the column lets the
+/// optimizer build a key, which is why the caller keeps the original
+/// string beside this value rather than replacing it.
+///
+/// The hex, e-notation and out-of-range verdicts stay with the strict
+/// classifier: this is reached only where it said `Raise`, so a
+/// spelling BOTH grammars refuse ('x', '1 e 3', '5.5.5') still raises,
+/// and one only this grammar takes converts.
+/// Always the SCALED shape, never the keyable `Rhs::Int`: this value
+/// exists only for the per-row compare ([Term::NumCmp] aligns it in
+/// i128 against a plain integer column as readily as a scaled one), and
+/// a keyable shape would invite an index band the engine does not
+/// build for it.
+fn lenient_num_rhs(s: &str) -> Option<Rhs> {
+    let ColNum::Exact(mantissa, exp) = text_col_num(s) else {
+        return None; // Raise, hex, and the double path keep their verdicts
+    };
+    let (Ok(m), Ok(sc)) = (i64::try_from(mantissa), i8::try_from(exp)) else {
+        return None;
+    };
+    Some(Rhs::Num(m, sc))
+}
+
 /// A text COLUMN value classified for a comparison against a numeric
 /// side - the engine's COMPARE grammar (cvt.cpp `CVT_get_numeric` via
 /// cvt2.cpp `cmp_numeric_string`), which is LENIENT and deliberately
 /// NOT the store grammar [text_number]: interior spaces convert here
 /// (probed: `S = 10` matches '1 0', '1 2 3' is 123, '- 5' is -5,
-/// '5 . 0' is 5), where the store side and the literal side
-/// ([literal_num_rhs]) refuse them. The split is uniform because a
-/// numeric compare never bands a text index (PLANONLY probed NATURAL),
-/// so no index dependence reaches the column side.
+/// '5 . 0' is 5), where the store and CAST side refuse them.
+///
+/// The COLUMN side is where that split is unconditional: a numeric
+/// compare never bands a text index (PLANONLY probed NATURAL), so no
+/// key is ever built from a stored text value and no index dependence
+/// reaches it. The LITERAL side is the opposite - it converts through
+/// this grammar per row and through the strict one whenever a key is
+/// built ([literal_num_rhs], [Predicate::key_conversion]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ColNum {
     /// an exact decimal `mantissa x 10^scale` - i128/i32 because the
@@ -26057,11 +26762,11 @@ impl Expr {
                 // BIGINT ranks I64; a NUMERIC past precision 18 is stored
                 // as INT128 and must announce that width, or the value
                 // travels in a slot too narrow to hold it
-                CastTarget::Int { wide } => {
-                    Some(if *wide { NumRank::I64 } else { NumRank::Long })
+                CastTarget::Int { bytes } => {
+                    Some(if *bytes == 8 { NumRank::I64 } else { NumRank::Long })
                 }
-                CastTarget::Numeric { wide, .. } => {
-                    Some(if *wide { NumRank::I128 } else { NumRank::Long })
+                CastTarget::Numeric { bytes, .. } => {
+                    Some(if *bytes == 16 { NumRank::I128 } else { NumRank::Long })
                 }
                 CastTarget::Text { .. } | CastTarget::Approx | CastTarget::Temporal(_) => None,
             },
@@ -26363,6 +27068,15 @@ impl Expr {
                 if matches!(v, Value::Null) {
                     return Ok(Value::Null); // NULL casts to NULL of any type
                 }
+                // The engine moves a TEXT source into the target's
+                // fixed conversion buffer BEFORE its grammar reads a
+                // character of it, so a source too long for that buffer
+                // is 22001 *string right truncation* and never the
+                // 22018 the spelling would have earned
+                // ([CastTarget::cvt_cap]).
+                if let Value::Text(s) = &v {
+                    cvt_cap_check(s, t.cvt_cap())?;
+                }
                 match t {
                     // to the integer family: an integer is kept, a scaled
                     // numeric is rounded half away from zero, a string is
@@ -26439,7 +27153,7 @@ impl Expr {
                     // source is decomposed to (raw, scale) and rescaled
                     // with the engine's rounding - HALF AWAY FROM ZERO
                     // (probed: 12.55 to scale 1 is 12.6, -12.55 is -12.6)
-                    CastTarget::Numeric { scale, wide } => {
+                    CastTarget::Numeric { scale, bytes } => {
                         let (raw, from) = match &v {
                             Value::Text(t) => decimal_parts(t)
                                 .ok_or_else(|| EvalErr::ConversionError(Some(t.clone())))?,
@@ -26458,7 +27172,7 @@ impl Expr {
                                 .ok_or(EvalErr::ConversionError(None))?,
                         };
                         let out = rescale(raw, from, *scale)?;
-                        if *wide {
+                        if *bytes == 16 {
                             Value::Int128(out, *scale)
                         } else {
                             match i64::try_from(out) {
@@ -26945,11 +27659,17 @@ fn split_top_and(toks: &[Tok]) -> Vec<Vec<Tok>> {
 /// from a literal. Types this server cannot write as a literal (blobs,
 /// DECFLOAT, timezone-bearing temporals) refuse, so the subquery falls
 /// back rather than comparing something it invented.
-fn value_to_tok(v: &Value) -> Option<Tok> {
+///
+/// `key` says the fold sits where the engine builds a SEMI-JOIN's hash
+/// key ([conjunctive_position]), which decides the CONVERSION GRAMMAR a
+/// text value is read by - see [Tok::StrKey]. Nothing else in the
+/// mapping depends on it: only text has two grammars.
+fn value_to_tok(v: &Value, key: bool) -> Option<Tok> {
     Some(match v {
         Value::Null => Tok::Null,
         Value::Int(n) => Tok::Int(*n),
         Value::Scaled(raw, scale) => Tok::Dec(*raw, *scale),
+        Value::Text(s) if key => Tok::StrKey(s.clone()),
         Value::Text(s) => Tok::Str(s.clone()),
         // a BOOLEAN answer folds back as the literal it is: as an
         // integer it would meet the engine's own refusal (`B = 1` is a
@@ -27029,7 +27749,7 @@ fn render_toks(toks: &[Tok]) -> Option<String> {
             // spells; a non-negative scale answers None there and the
             // None propagates
             Tok::Dec(raw, scale) => value_literal(&Value::Scaled(*raw, *scale))?,
-            Tok::Str(s) => format!("'{}'", s.replace('\'', "''")),
+            Tok::Str(s) | Tok::StrKey(s) => format!("'{}'", s.replace('\'', "''")),
             Tok::Cmp(c) => match c {
                 Cmp::Eq => "=",
                 Cmp::Ne => "<>",
@@ -27211,6 +27931,7 @@ fn plan_correlated_select(
                 wire,
                 sql_type: nullable(sql_type),
                 length,
+                oct_length: length,
                 scale,
                 sub_type,
                 expr: Some(lookup.clone()),
@@ -28094,6 +28815,52 @@ fn eval_subquery(
     Some(SubqRows { values, any })
 }
 
+/// Is the token at `at` reached through nothing but top-level `AND`s -
+/// no enclosing `OR`, no enclosing `NOT`?
+///
+/// THE LAW THIS ANSWERS: the engine turns a POSITIVE `IN (<subquery>)` /
+/// `= ANY` / correlated `EXISTS` written as a top-level conjunct into a
+/// SEMI-JOIN, and the semi-join's keys are converted with the STRICT
+/// store grammar as its hash table is built - the same law the INDEX key
+/// obeys ([Predicate::key_conversion]). Anywhere else the subquery stays
+/// a per-row comparison and the LENIENT compare grammar decides.
+///
+/// `SET PLANONLY ON` says it exactly, over an INTEGER column against a
+/// VARCHAR one holding '1 2' (probed cell by cell): `WHERE A IN (SELECT
+/// T FROM J2)` and `(A IN (SELECT ...))` are `PLAN HASH` and raise
+/// 22018; `... OR 1=0` and `NOT (A IN (SELECT ...))` drop to two plain
+/// plans and answer the row. An `OR` inside a SIBLING conjunct does not
+/// count - `A IN (SELECT ...) AND (B=1 OR B=2)` still hashes - which is
+/// why this asks about the ENCLOSING groups only.
+fn conjunctive_position(toks: &[Tok], at: usize) -> bool {
+    // the open-paren indexes enclosing `at`, outermost first
+    let mut stack: Vec<usize> = Vec::new();
+    let mut chain: Vec<usize> = Vec::new();
+    // every OR with the group that owns it (usize::MAX = the top level)
+    let mut ors: Vec<usize> = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        if i == at {
+            chain = stack.clone();
+        }
+        match t {
+            Tok::LParen => stack.push(i),
+            Tok::RParen => {
+                stack.pop();
+            }
+            Tok::Or => ors.push(stack.last().copied().unwrap_or(usize::MAX)),
+            _ => {}
+        }
+    }
+    if ors.iter().any(|o| *o == usize::MAX || chain.contains(o)) {
+        return false;
+    }
+    // a NOT in front of `at` itself or of any group it sits inside
+    !chain
+        .iter()
+        .chain(std::iter::once(&at))
+        .any(|&g| g > 0 && matches!(toks[g - 1], Tok::Not))
+}
+
 /// Replace every [Tok::Subq] in a WHERE token stream with the tokens its
 /// answer folds into. See the module comment above for the rewrites.
 /// None whenever a subquery's shape or context is outside the surface -
@@ -28105,16 +28872,31 @@ fn resolve_subqueries(
     outer_cols: &[RelationColumn],
     outer_bind: &ColBinding<'_>,
 ) -> Option<Vec<Tok>> {
-    // a set of values becomes the body of an IN list
-    let list_tokens = |vals: &[Value]| -> Option<Vec<Tok>> {
+    // a set of values becomes the body of an IN list; `key` marks the
+    // text ones as HASH KEYS (see [conjunctive_position])
+    let list_tokens = |vals: &[Value], key: bool| -> Option<Vec<Tok>> {
         let mut out = vec![Tok::LParen];
         // duplicates change nothing for membership and cost time
         let mut seen: Vec<Tok> = Vec::new();
         for v in vals {
-            let t = value_to_tok(v)?;
+            let t = value_to_tok(v, key)?;
             if !seen.iter().any(|s| tok_eq(s, &t)) {
                 seen.push(t);
             }
+        }
+        // A HASH KEY THE STRICT GRAMMAR REFUSES SINKS THE WHOLE BUILD,
+        // whatever the other keys do: the engine raises for `A IN
+        // (SELECT T FROM J2)` over J2 = {'1 2','12'} even though '12'
+        // matches the row (probed). The desugared OR is evaluated group
+        // by group and stops at the first TRUE one, so the refused
+        // spellings are written FIRST and reach [Term::KeyConvErr]
+        // before any group can answer. OR is commutative; only which
+        // group raises depends on this order.
+        if key {
+            seen.sort_by_key(|t| match t {
+                Tok::StrKey(s) => text_number(s).is_some(),
+                _ => true,
+            });
         }
         for (i, t) in seen.iter().enumerate() {
             if i > 0 {
@@ -28184,12 +28966,15 @@ fn resolve_subqueries(
                             out.push(Tok::Ident(outer));
                             out.push(Tok::Not);
                             out.push(Tok::In);
-                            out.extend(list_tokens(&vals)?);
+                            // NOT EXISTS is an ANTI-join: the engine
+                            // never hashes it, so the values keep the
+                            // lenient grammar (probed)
+                            out.extend(list_tokens(&vals, false)?);
                             out.push(Tok::RParen);
                         } else {
                             out.push(Tok::Ident(outer));
                             out.push(Tok::In);
-                            out.extend(list_tokens(&vals)?);
+                            out.extend(list_tokens(&vals, conjunctive_position(toks, i))?);
                         }
                     }
                     // uncorrelated: the verdict is the same for every row
@@ -28224,7 +29009,12 @@ fn resolve_subqueries(
                     out.push(Tok::Const(negated));
                 } else {
                     out.push(Tok::In);
-                    out.extend(list_tokens(&rows.values)?);
+                    // a NOT still standing in front of the column makes
+                    // this an anti-join, which the engine does not hash
+                    let negated = toks.get(i.wrapping_sub(1)).is_some_and(|t| matches!(t, Tok::Not));
+                    out.extend(
+                        list_tokens(&rows.values, !negated && conjunctive_position(toks, i))?,
+                    );
                 }
                 i += 2;
             }
@@ -28242,7 +29032,10 @@ fn resolve_subqueries(
                     return None;
                 }
                 out.push(Tok::Cmp(*op));
-                out.push(value_to_tok(&rows.values[0])?);
+                // a SCALAR subquery is a singleton stream, never a hash
+                // key: `A = (SELECT T FROM J2)` answers where the same
+                // value through `A IN (SELECT T FROM J2)` raises (probed)
+                out.push(value_to_tok(&rows.values[0], false)?);
                 i += 2;
             }
             // a subquery anywhere else (bare, or as an LHS) is unsupported
@@ -28285,7 +29078,7 @@ fn tok_eq(a: &Tok, b: &Tok) -> bool {
     match (a, b) {
         (Tok::Int(x), Tok::Int(y)) => x == y,
         (Tok::Dec(x, sx), Tok::Dec(y, sy)) => x == y && sx == sy,
-        (Tok::Str(x), Tok::Str(y)) => x == y,
+        (Tok::Str(x), Tok::Str(y)) | (Tok::StrKey(x), Tok::StrKey(y)) => x == y,
         (Tok::Null, Tok::Null) => true,
         _ => false,
     }
@@ -28860,6 +29653,16 @@ enum Tok {
     /// - trailing zeros count, like the expression parser's literals
     Dec(i64, i8),
     Str(String),
+    /// A text value a SUBQUERY FOLD put here, at a position the engine
+    /// turns into a SEMI-JOIN - `PLAN HASH` ([conjunctive_position]).
+    /// Identical to [Tok::Str] everywhere except the conversion
+    /// grammar: the engine converts a hash key with the STRICT store
+    /// grammar, exactly as it converts an INDEX key, so a spelling only
+    /// the lenient compare grammar takes raises here (see
+    /// [Term::KeyConvErr]). The marker exists because the fold has
+    /// erased the difference by the time the predicate is built - the
+    /// same reason [RawExpr::BareTrue] exists.
+    StrKey(String),
     Cmp(Cmp),
     And,
     Or,
@@ -29515,6 +30318,7 @@ fn parse_value(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Rhs> {
         Tok::Int(n) => Rhs::Int(*n),
         Tok::Dec(r, s) => Rhs::Num(*r, *s),
         Tok::Str(s) => Rhs::Str(s.clone()),
+        Tok::StrKey(s) => Rhs::StrKey(s.clone()),
         Tok::Null => Rhs::Null,
         Tok::Param => {
             *np += 1;
@@ -29749,8 +30553,10 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                     Rhs::Num(v, s) => RawExpr::Dec(*v, *s),
                     Rhs::Str(s) => RawExpr::Str(s.clone()),
                     Rhs::Null => RawExpr::Null,
-                    // Dbl exists only at bind - the parser never sees it
-                    Rhs::Dbl(_) | Rhs::Param(..) => return None,
+                    // Dbl exists only at bind - the parser never sees
+                    // it; a StrKey would LOSE its grammar marker on the
+                    // way into a RawExpr, so it refuses instead
+                    Rhs::Dbl(_) | Rhs::Param(..) | Rhs::StrKey(_) => return None,
                 })
             };
             match t.get(p3) {
@@ -30117,15 +30923,39 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                 return None;
             }
             *pos += 1;
-            let mut items = vec![leaf(side_kind(Cmp::Eq, parse_side(t, pos, np)?))];
+            let mut sides = vec![parse_side(t, pos, np)?];
             while matches!(t.get(*pos), Some(Tok::Comma)) {
                 *pos += 1;
-                items.push(leaf(side_kind(Cmp::Eq, parse_side(t, pos, np)?)));
+                sides.push(parse_side(t, pos, np)?);
             }
             if !matches!(t.get(*pos), Some(Tok::RParen)) {
                 return None;
             }
             *pos += 1;
+            // A MULTI-VALUE IN is NOT the OR it desugars to, on one
+            // vector: the engine compiles its list once, with the
+            // STRICT conversion grammar, so a blank-bearing numeric
+            // string RAISES there where the spelled-out OR answers
+            // (probed against an unindexed INTEGER column holding 12:
+            // `I IN ('1 2', '9')` and `I IN ('9', '1 2')` raise 22018,
+            // `I IN ('1 2')` and `I = '1 2' OR I = '9'` answer the row;
+            // the raise is still per row and value-gated - `AND 1=0`
+            // suppresses it). The OR desugar cannot carry that, and the
+            // column's type is not known here, so the STATEMENT refuses
+            // for exactly the spellings the two grammars disagree over -
+            // digits and blanks, never a word.
+            if sides.len() > 1
+                && sides.iter().any(|s| match s {
+                    Side::Val(Rhs::Str(v)) => {
+                        text_number(v).is_none() && lenient_num_rhs(v).is_some()
+                    }
+                    _ => false,
+                })
+            {
+                return None;
+            }
+            let items: Vec<Ast> =
+                sides.into_iter().map(|s| leaf(side_kind(Cmp::Eq, s))).collect();
             let body = Ast::Or(items);
             Some(if negated { Ast::Not(Box::new(body)) } else { body })
         }
@@ -31340,7 +32170,28 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
             ColKind::Int => match literal_num_rhs(&v, true) {
                 LitNum::Rhs(Rhs::Int(n)) => Term::Cmp(idx, op, Rhs::Int(n)),
                 LitNum::Rhs(rhs) => Term::NumCmp(idx, op, rhs),
-                LitNum::Raise(s) => Term::CmpConvErr(idx, op, s),
+                // a spelling the STRICT grammar refuses converts for
+                // the per-row compare through the LENIENT one, and
+                // raises only where a key is built (probed: unindexed
+                // `N = '1 2'` answers the 12 row, indexed it raises)
+                LitNum::Raise(s) => {
+                    let lenient = lenient_num_rhs(&s);
+                    Term::CmpConvErr(idx, op, s, lenient)
+                }
+                LitNum::Refuse => return None,
+            },
+            _ => return None,
+        },
+        // the SAME text, arriving as a SEMI-JOIN's HASH KEY: only the
+        // strict grammar reads it, and what that grammar refuses raises
+        // ungated ([Term::KeyConvErr]). A TEXT column hashes its keys as
+        // text, so nothing converts there and the arm is the plain one.
+        RawKind::Cmp(op, Rhs::StrKey(v)) => match kind {
+            ColKind::Text => Term::Cmp(idx, op, Rhs::Str(v)),
+            ColKind::Int => match literal_num_rhs(&v, true) {
+                LitNum::Rhs(Rhs::Int(n)) => Term::Cmp(idx, op, Rhs::Int(n)),
+                LitNum::Rhs(rhs) => Term::NumCmp(idx, op, rhs),
+                LitNum::Raise(s) => Term::KeyConvErr(s),
                 LitNum::Refuse => return None,
             },
             _ => return None,
@@ -31563,8 +32414,9 @@ fn resolve_expr_term(
             Rhs::Num(r, s) => Expr::Dec(*r, *s),
             Rhs::Str(s) => Expr::Str(s.clone()),
             Rhs::Null => Expr::Null,
-            // Dbl exists only at bind - unreachable-defensive here
-            Rhs::Dbl(_) | Rhs::Param(..) => return None,
+            // Dbl exists only at bind - unreachable-defensive here; a
+            // StrKey refuses rather than drop its grammar marker
+            Rhs::Dbl(_) | Rhs::Param(..) | Rhs::StrKey(_) => return None,
         })
     };
     let term = match &rt.kind {
@@ -31830,19 +32682,19 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
         // 100 rows and `N92 + 0 = '0.5'` the 0.50 row - before this arm
         // both pairs fell to value_cmp's rendered-text fallback, which
         // compared "10" < "9" and answered [] with no error). Converted
-        // HERE, at prepare, with the STRICT grammar; a literal that
-        // will not convert refuses the STATEMENT (priced: the engine
-        // raises per row, but only plain-column terms carry the
-        // value-gated raiser). A text COLUMN or expression converts
-        // PER ROW with the LENIENT compare grammar instead - the
-        // [Expr::TextNum] wrap (probed: `5 = S` answers the class,
-        // `NAME = ID` matches '02' against 2 and raises on 'x3',
-        // `ON A.S = B.ID` raises on 'abc' - before the wrap all three
-        // fell to value_cmp's rendered-text fallback and answered
-        // string-ordered rows). The literal/column grammar split is
-        // the engine's own (probed: interior spaces convert on the
-        // column side, and the literal slice sided with the INDEXED
-        // engine's strict store grammar).
+        // HERE, at prepare, by [num_literal_expr] - which takes the
+        // LENIENT compare grammar for a spelling the strict one refuses,
+        // because an EXPRESSION side is never keyed and the engine
+        // therefore never converts it strictly (probed: `I + 0 = '1 2'`
+        // answers the 12 row). A literal NEITHER grammar takes refuses
+        // the STATEMENT (priced: the engine raises per row, but only
+        // plain-column terms carry the value-gated raiser). A text
+        // COLUMN or expression converts PER ROW with the same lenient
+        // grammar - the [Expr::TextNum] wrap (probed: `5 = S` answers
+        // the class, `NAME = ID` matches '02' against 2 and raises on
+        // 'x3', `ON A.S = B.ID` raises on 'abc' - before the wrap all
+        // three fell to value_cmp's rendered-text fallback and answered
+        // string-ordered rows).
         (ExprType::Int | ExprType::Numeric, ExprType::Text) => {
             if let Expr::Str(s) = &rhs {
                 let r = num_literal_expr(s)?;
@@ -31865,15 +32717,26 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
 
 /// A string literal read as an exact-numeric literal expression, for
 /// the side of a comparison whose other side is one. `None` refuses the
-/// statement - both the Raise and the Refuse classifications land here,
-/// because an expression term's bool cannot carry the engine's per-row
-/// error ([Term::ExprCond]).
+/// statement - the Refuse classification and an un-convertible Raise
+/// both land there, because an expression term's bool cannot carry the
+/// engine's per-row error ([Term::ExprCond]).
+///
+/// An EXPRESSION side is never keyed - no index segment matches
+/// `I + 0` - so the lenient grammar is the only one the engine runs
+/// here, and its value stands with no raiser beside it (probed:
+/// `I + 0 = '1 2'` answers the 12 row where this had refused the
+/// statement).
 fn num_literal_expr(s: &str) -> Option<Expr> {
-    match literal_num_rhs(s, false) {
+    let rhs = match literal_num_rhs(s, false) {
+        LitNum::Rhs(rhs) => rhs,
+        LitNum::Raise(orig) => lenient_num_rhs(&orig)?,
+        LitNum::Refuse => return None,
+    };
+    match rhs {
         // scale 0 collapses to the plain integer literal, the same
         // normalization scaled_value applies to computed results
-        LitNum::Rhs(Rhs::Int(n)) | LitNum::Rhs(Rhs::Num(n, 0)) => Some(Expr::Int(n)),
-        LitNum::Rhs(Rhs::Num(r, sc)) => Some(Expr::Dec(r, sc)),
+        Rhs::Int(n) | Rhs::Num(n, 0) => Some(Expr::Int(n)),
+        Rhs::Num(r, sc) => Some(Expr::Dec(r, sc)),
         _ => None,
     }
 }
@@ -32078,7 +32941,17 @@ fn numeric_term(
         // `NSM > '1.999999'` keeps the fraction with no range check)
         RawKind::Cmp(op, Rhs::Str(v)) => match literal_num_rhs(&v, false) {
             LitNum::Rhs(rhs) => Term::NumCmp(idx, op, rhs),
-            LitNum::Raise(s) => Term::CmpConvErr(idx, op, s),
+            LitNum::Raise(s) => {
+                let lenient = lenient_num_rhs(&s);
+                Term::CmpConvErr(idx, op, s, lenient)
+            }
+            LitNum::Refuse => return None,
+        },
+        // a HASH KEY takes the strict grammar alone - see the INTEGER
+        // column's arm in [typed_term]
+        RawKind::Cmp(op, Rhs::StrKey(v)) => match literal_num_rhs(&v, false) {
+            LitNum::Rhs(rhs) => Term::NumCmp(idx, op, rhs),
+            LitNum::Raise(s) => Term::KeyConvErr(s),
             LitNum::Refuse => return None,
         },
         // Dbl exists only at bind - the parser never writes it
@@ -32360,7 +33233,10 @@ fn resolve_having(
                             RawKind::Cmp(op, Rhs::Str(s)) => {
                                 match literal_num_rhs(&s, false) {
                                     LitNum::Rhs(rhs) => Term::NumCmp(idx, op, rhs),
-                                    LitNum::Raise(orig) => Term::CmpConvErr(idx, op, orig),
+                                    LitNum::Raise(orig) => {
+                                        let lenient = lenient_num_rhs(&orig);
+                                        Term::CmpConvErr(idx, op, orig, lenient)
+                                    }
                                     LitNum::Refuse => return None,
                                 }
                             }
@@ -35795,14 +36671,77 @@ mod tests {
         let w1252 = AttCs { id: 53, bpc: 1, multibyte: false };
         let none = AttCs::NONE;
         let real_utf8 = enc_real_cs(4);
-        assert_eq!(resolve_text_cs(real_utf8, 3, &utf8), (4, 12));
-        assert_eq!(resolve_text_cs(real_utf8, 3, &w1252), (53, 3));
-        assert_eq!(resolve_text_cs(real_utf8, 3, &none), (4, 12));
-        assert_eq!(resolve_text_cs(ATT_SUBTYPE, 3, &utf8), (4, 12));
-        assert_eq!(resolve_text_cs(ATT_SUBTYPE, 3, &none), (0, 3));
+        assert_eq!(resolve_text_cs(real_utf8, 3, 3, &utf8), (4, 12));
+        assert_eq!(resolve_text_cs(real_utf8, 3, 3, &w1252), (53, 3));
+        assert_eq!(resolve_text_cs(real_utf8, 3, 3, &none), (4, 12));
+        assert_eq!(resolve_text_cs(ATT_SUBTYPE, 3, 3, &utf8), (4, 12));
+        assert_eq!(resolve_text_cs(ATT_SUBTYPE, 3, 3, &none), (0, 3));
         // a plain NONE expression and a stored column pass through
-        assert_eq!(resolve_text_cs(0, 6, &utf8), (0, 6));
-        assert_eq!(resolve_text_cs(4, 24, &utf8), (4, 24));
+        assert_eq!(resolve_text_cs(0, 6, 6, &utf8), (0, 6));
+        assert_eq!(resolve_text_cs(4, 24, 24, &utf8), (4, 24));
+        // AND THE SECOND WIDTH: a literal is measured in the CHARSET THE
+        // CLIENT ASKED FOR, so `'<3 two-byte letters>'` is 3 characters
+        // to a UTF8 attachment and 6 to a single-byte one (probed with
+        // SQLDA_DISPLAY under UTF8, NONE and WIN1252 - 12, 6 and 6).
+        // The ATTACHMENT decides, not the charset the expression
+        // resolves to: a real-charset expression under a NONE
+        // attachment takes the octet count too.
+        assert_eq!(resolve_text_cs(ATT_SUBTYPE, 3, 6, &utf8), (4, 12));
+        assert_eq!(resolve_text_cs(ATT_SUBTYPE, 3, 6, &none), (0, 6));
+        assert_eq!(resolve_text_cs(ATT_SUBTYPE, 3, 6, &w1252), (53, 6));
+        assert_eq!(resolve_text_cs(real_utf8, 12, 24, &none), (4, 96));
+        assert_eq!(resolve_text_cs(real_utf8, 12, 24, &w1252), (53, 24));
+        assert_eq!(resolve_text_cs(real_utf8, 12, 24, &utf8), (4, 48));
+    }
+
+    #[test]
+    fn a_literal_carries_both_of_its_widths() {
+        // one column: VARCHAR(10) UTF8 - 10 x 4 payload bytes + the
+        // 2-byte count
+        let descs = vec![Descriptor {
+            dtype: dtype::VARYING, scale: 0, length: 42, sub_type: 4, flags: 0, offset: 8,
+        }];
+        let lit = |s: &str| Expr::Str(s.to_string());
+        // three two-byte letters: 3 characters, 6 octets
+        let three = "\u{c0}\u{c0}\u{c0}";
+        assert_eq!(text_form(&lit(three), &descs), Some((false, 3, TfCs::Att)));
+        assert_eq!(text_form_oct(&lit(three), &descs), Some((false, 6, TfCs::Att)));
+        // ASCII measures the same either way
+        assert_eq!(text_form_oct(&lit("abc"), &descs), Some((false, 3, TfCs::Att)));
+        // the algebra carries both: CONCAT sums, a conditional takes the
+        // widest - and the widest under one measure is not the widest
+        // under the other (probed: COALESCE(<VARCHAR(10) UTF8>, <12
+        // two-byte letters>) announces 48 under UTF8 and 96 under NONE)
+        let cat = Expr::Concat(Box::new(lit(three)), Box::new(lit("x")));
+        assert_eq!(text_form(&cat, &descs), Some((true, 4, TfCs::Att)));
+        assert_eq!(text_form_oct(&cat, &descs), Some((true, 7, TfCs::Att)));
+        let co = Expr::Coalesce(vec![Expr::Col(0), lit(&three.repeat(4))]);
+        assert_eq!(text_form(&co, &descs), Some((true, 12, TfCs::Ttype(4))));
+        assert_eq!(text_form_oct(&co, &descs), Some((true, 24, TfCs::Ttype(4))));
+        // the SYNTHETIC pad wrap is measured THROUGH: its declared len is
+        // the character width, and reading it back would hide the
+        // literals from the octet measure (DECODE's CASE announced 4
+        // where the engine announces 8, and shipped 8 bytes into it)
+        let cond = pad_conditional(
+            Expr::Case(
+                vec![(
+                    Cond2::Cmp(Box::new(Expr::Int(1)), Cmp::Eq, Box::new(Expr::Int(1))),
+                    lit(three),
+                )],
+                Some(Box::new(lit("nu"))),
+            ),
+            &descs,
+        );
+        assert!(matches!(cond, Expr::Cast(_, CastTarget::Text { len: 3, pad: true, .. })));
+        assert_eq!(text_form(&cond, &descs), Some((false, 3, TfCs::Att)));
+        assert_eq!(text_form_oct(&cond, &descs), Some((false, 6, TfCs::Att)));
+        // a USER cast declares its own width in either measure
+        let cast = Expr::Cast(
+            Box::new(lit(three)),
+            CastTarget::Text { len: 10, pad: false, synthetic: false },
+        );
+        assert_eq!(text_form(&cast, &descs), Some((true, 10, TfCs::Att)));
+        assert_eq!(text_form_oct(&cast, &descs), Some((true, 10, TfCs::Att)));
     }
 
     #[test]
@@ -36440,10 +37379,88 @@ mod tests {
                 bad
             );
         }
-        // interior spaces raise too: the strict grammar sides with the
-        // INDEXED engine (unindexed, the engine skips them - priced)
+        // interior spaces are a `Raise` HERE - the strict grammar is
+        // the KEY builder's - and the caller pairs it with the lenient
+        // reading below
         assert!(matches!(literal_num_rhs("1 0", true), Raise(ref s) if s == "1 0"));
         assert!(matches!(literal_num_rhs(" x ", true), Raise(ref s) if s == " x "));
+    }
+
+    // The engine's SECOND reading of the same literal: the per-row
+    // compare grammar, which every one of these answered a row for on
+    // the live engine (unindexed) and raised 22018 for with an index.
+    #[test]
+    fn lenient_num_rhs_reads_what_the_strict_grammar_refused() {
+        use super::Rhs::Num;
+        let len = |s: &str| match lenient_num_rhs(s) {
+            Some(Num(r, sc)) => Some((r, sc)),
+            _ => None,
+        };
+        assert_eq!(len("1 2"), Some((12, 0)));
+        assert_eq!(len(" 1 2 "), Some((12, 0)));
+        assert_eq!(len("1 2 "), Some((12, 0)));
+        assert_eq!(len("- 5"), Some((-5, 0)));
+        assert_eq!(len("5 . 0"), Some((50, -1)));
+        assert_eq!(len("1 2.0 0"), Some((1200, -2)));
+        // never the keyable Int shape, even at scale 0
+        assert!(matches!(lenient_num_rhs("1 2"), Some(Num(_, 0))));
+        // what BOTH grammars refuse keeps the raise
+        for bad in ["x", "", " ", ".", "--2", "2,", "2.5.5", "1 e 3", "1e 3", "0X10"] {
+            assert!(lenient_num_rhs(bad).is_none(), "{:?} must not convert", bad);
+        }
+        // a value too wide for the Rhs is not guessed at either
+        assert!(lenient_num_rhs("9 9999999999999999999").is_none());
+
+        // and the term built from the pair compares instead of raising,
+        // while the value gate is exactly the raiser's
+        let t = Term::CmpConvErr(0, Cmp::Eq, "1 2".into(), lenient_num_rhs("1 2"));
+        assert_eq!(t.matches(&[Value::Int(12)]).unwrap(), Some(true));
+        assert_eq!(t.matches(&[Value::Int(5)]).unwrap(), Some(false));
+        assert_eq!(t.matches(&[Value::Scaled(1200, -2)]).unwrap(), Some(true));
+        assert_eq!(t.matches(&[Value::Null]).unwrap(), None);
+    }
+
+    // The hash key has NO value gate: the engine fails building the
+    // table, not comparing a row, so the column's own value never
+    // enters it - and it is still row-DEPENDENT, or an empty outer
+    // table would raise where the engine says nothing.
+    #[test]
+    fn key_conv_err_has_no_value_gate() {
+        let t = Term::KeyConvErr("1 2".into());
+        for v in [vec![Value::Null], vec![], vec![Value::Int(12)]] {
+            assert_eq!(
+                t.matches(&v),
+                Err(EvalErr::ConversionError(Some("1 2".into())))
+            );
+        }
+        assert!(!term_row_independent(&t));
+    }
+
+    // Which fold positions the engine turns into a semi-join: no
+    // enclosing OR, no enclosing NOT. An OR in a SIBLING group does not
+    // count - `A IN (..) AND (B=1 OR B=2)` still hashes.
+    #[test]
+    fn conjunctive_position_reads_the_enclosing_groups_only() {
+        let toks = |w: &str| tokenize(w).expect("tokenizes");
+        let at_in = |w: &str| {
+            let t = toks(w);
+            let i = t
+                .iter()
+                .position(|x| matches!(x, Tok::In))
+                .expect("has an IN");
+            conjunctive_position(&t, i)
+        };
+        assert!(at_in("A IN (1)"));
+        assert!(at_in("(A IN (1))"));
+        assert!(at_in("A IN (1) AND B = 2"));
+        assert!(at_in("A IN (1) AND (B = 1 OR B = 2)"));
+        assert!(at_in("((A IN (1)) AND B = 2)"));
+        assert!(!at_in("A IN (1) OR B = 2"));
+        assert!(!at_in("B = 2 OR A IN (1)"));
+        assert!(!at_in("A NOT IN (1)"));
+        assert!(!at_in("NOT (A IN (1))"));
+        assert!(!at_in("(A IN (1)) OR B = 2"));
+        assert!(!at_in("(A IN (1) OR B = 2) AND C = 3"));
     }
 
     // The value gate on the per-row raiser: NULL and a missing slot are
@@ -36451,7 +37468,7 @@ mod tests {
     // original literal.
     #[test]
     fn cmp_conv_err_is_value_gated() {
-        let t = Term::CmpConvErr(0, Cmp::Eq, " x ".into());
+        let t = Term::CmpConvErr(0, Cmp::Eq, " x ".into(), None);
         assert_eq!(t.matches(&[Value::Null]).unwrap(), None);
         assert_eq!(t.matches(&[]).unwrap(), None);
         assert_eq!(
@@ -37165,6 +38182,7 @@ mod tests {
             wire: Wire::Int64,
             sql_type: 580,
             length: 8,
+            oct_length: 8,
             scale: 0,
             sub_type: 0,
             expr: None,
@@ -37203,6 +38221,7 @@ mod tests {
             wire: Wire::Int64,
             sql_type: 580,
             length: 8,
+            oct_length: 8,
             scale: 0,
             sub_type: 0,
             expr: None,
@@ -37539,8 +38558,8 @@ mod tests {
         );
         // ORDER BY resolution: ordinal into the projection, and by name
         let cols = vec![
-            ProjCol { name: "ID".into(), fname: None, relation: None, rel_alias: None, field_id: 3, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0, sub_type: 0, expr: None },
-            ProjCol { name: "NAME".into(), fname: None, relation: None, rel_alias: None, field_id: 1, wire: Wire::Varying, sql_type: 448, length: 32765, scale: 0, sub_type: 0, expr: None },
+            ProjCol { name: "ID".into(), fname: None, relation: None, rel_alias: None, field_id: 3, wire: Wire::Int64, sql_type: 580, length: 8, oct_length: 8, scale: 0, sub_type: 0, expr: None },
+            ProjCol { name: "NAME".into(), fname: None, relation: None, rel_alias: None, field_id: 1, wire: Wire::Varying, sql_type: 448, length: 32765, oct_length: 32765, scale: 0, sub_type: 0, expr: None },
         ];
         let columns = vec![
             RelationColumn { name: "ID".into(), field_id: 3, position: 0 },
@@ -38133,7 +39152,7 @@ mod tests {
                     Cmp::Eq,
                     Box::new(Expr::Col(2)),
                 ))),
-                Term::CmpConvErr(0, Cmp::Eq, "x".into()),
+                Term::CmpConvErr(0, Cmp::Eq, "x".into(), None),
             ]]),
         };
         let acc = vec![vec![Value::Int(1), Value::Int(10)]];
@@ -38168,7 +39187,7 @@ mod tests {
                     Cmp::Eq,
                     Box::new(Expr::Int(-1)),
                 ))),
-                Term::CmpConvErr(0, Cmp::Eq, "x".into()),
+                Term::CmpConvErr(0, Cmp::Eq, "x".into(), None),
             ]]),
         };
         let out = join_step(acc, 2, &none, &sc_part, &None).unwrap();
@@ -38180,7 +39199,7 @@ mod tests {
             src: RowSource::Rows(Vec::new()),
             width: 1,
             probe: None,
-            on: Predicate::dnf(vec![vec![Term::CmpConvErr(2, Cmp::Eq, "x".into())]]),
+            on: Predicate::dnf(vec![vec![Term::CmpConvErr(2, Cmp::Eq, "x".into(), None)]]),
         };
         let rrows = vec![vec![Value::Int(7)]];
         assert!(join_step(Vec::new(), 2, &rrows, &rt_raiser, &None).is_err());
@@ -38206,7 +39225,7 @@ mod tests {
                     Cmp::Eq,
                     Box::new(Expr::Col(2)),
                 ))),
-                Term::CmpConvErr(0, Cmp::Eq, "x".into()),
+                Term::CmpConvErr(0, Cmp::Eq, "x".into(), None),
             ]]),
         };
         let acc = vec![vec![Value::Int(1), Value::Int(10)]];
@@ -38649,7 +39668,8 @@ mod tests {
             fname: None,
             relation: None,
             rel_alias: None,
-            name: "C".into(), field_id: 0, wire, sql_type, length, scale, sub_type: 0, expr: None,
+            name: "C".into(), field_id: 0, wire, sql_type, length, oct_length: length,
+            scale, sub_type: 0, expr: None,
         };
         let enc = |col: ProjCol, v: Value| {
             let mut w = W::default();
@@ -38691,8 +39711,8 @@ mod tests {
     fn encodes_row_bitmap_and_values() {
         // two INT64 cols, second null: 4-byte bitmap (bit 1 set) + one 8-byte value
         let cols = vec![
-            ProjCol { name: "A".into(), fname: None, relation: None, rel_alias: None, field_id: 0, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0, sub_type: 0, expr: None },
-            ProjCol { name: "B".into(), fname: None, relation: None, rel_alias: None, field_id: 1, wire: Wire::Int64, sql_type: 580, length: 8, scale: 0, sub_type: 0, expr: None },
+            ProjCol { name: "A".into(), fname: None, relation: None, rel_alias: None, field_id: 0, wire: Wire::Int64, sql_type: 580, length: 8, oct_length: 8, scale: 0, sub_type: 0, expr: None },
+            ProjCol { name: "B".into(), fname: None, relation: None, rel_alias: None, field_id: 1, wire: Wire::Int64, sql_type: 580, length: 8, oct_length: 8, scale: 0, sub_type: 0, expr: None },
         ];
         let values = vec![Value::Int(7), Value::Null];
         let mut w = W::default();
@@ -38764,7 +39784,7 @@ mod tests {
     fn output_capacity_matches_the_probed_engine_rule() {
         let col = |sub_type: i32| ProjCol {
             name: "C".into(), fname: None, relation: None, rel_alias: None,
-            field_id: 0, wire: Wire::Varying, sql_type: 448, length: 6,
+            field_id: 0, wire: Wire::Varying, sql_type: 448, length: 6, oct_length: 6,
             scale: 0, sub_type, expr: None,
         };
         let utf8 = AttCs { id: 4, bpc: 4, multibyte: true };
@@ -40337,6 +41357,7 @@ mod tests {
             wire: Wire::Int64,
             sql_type: 580,
             length: 8,
+            oct_length: 8,
             scale: 0,
             sub_type: 0,
             expr: None,
@@ -40768,8 +41789,9 @@ mod tests {
             let mut p = 0usize;
             parse_cast_target(&b, &mut p)
         };
-        assert!(matches!(target("INTEGER"), Some(CastTarget::Int { wide: false })));
-        assert!(matches!(target("BIGINT"), Some(CastTarget::Int { wide: true })));
+        assert!(matches!(target("SMALLINT"), Some(CastTarget::Int { bytes: 2 })));
+        assert!(matches!(target("INTEGER"), Some(CastTarget::Int { bytes: 4 })));
+        assert!(matches!(target("BIGINT"), Some(CastTarget::Int { bytes: 8 })));
         assert!(matches!(target("VARCHAR(10)"), Some(CastTarget::Text { len: 10, pad: false, .. })));
         assert!(matches!(target("CHAR(5)"), Some(CastTarget::Text { len: 5, pad: true, .. })));
         assert!(matches!(target("DOUBLE PRECISION"), Some(CastTarget::Approx)));
@@ -40780,21 +41802,67 @@ mod tests {
         // past 18 stores as INT128 and has to announce that width
         assert!(matches!(
             target("NUMERIC(9,2)"),
-            Some(CastTarget::Numeric { scale: -2, wide: false })
+            Some(CastTarget::Numeric { scale: -2, bytes: 4 })
         ));
         assert!(matches!(
             target("DECIMAL(20,3)"),
-            Some(CastTarget::Numeric { scale: -3, wide: true })
+            Some(CastTarget::Numeric { scale: -3, bytes: 16 })
         ));
         // bare NUMERIC is (9, 0), and `(p)` alone is scale 0
         assert!(matches!(
             target("NUMERIC"),
-            Some(CastTarget::Numeric { scale: 0, wide: false })
+            Some(CastTarget::Numeric { scale: 0, bytes: 4 })
         ));
         assert!(matches!(
             target("NUMERIC(5)"),
-            Some(CastTarget::Numeric { scale: 0, wide: false })
+            Some(CastTarget::Numeric { scale: 0, bytes: 4 })
         ));
+        // the SHORT-backed corner and its DECIMAL twin: one keyword
+        // apart, two storage widths, two conversion caps
+        assert!(matches!(
+            target("NUMERIC(4,0)"),
+            Some(CastTarget::Numeric { scale: 0, bytes: 2 })
+        ));
+        assert!(matches!(
+            target("DECIMAL(4,0)"),
+            Some(CastTarget::Numeric { scale: 0, bytes: 4 })
+        ));
+        assert!(matches!(
+            target("NUMERIC(18,0)"),
+            Some(CastTarget::Numeric { scale: 0, bytes: 8 })
+        ));
+
+        // the conversion buffer each of those targets converts THROUGH,
+        // every number probed on the live engine (see [CastTarget::cvt_cap])
+        let cap = |s: &str| target(s).and_then(|t| t.cvt_cap());
+        assert_eq!(cap("SMALLINT"), Some(22));
+        assert_eq!(cap("NUMERIC(4,0)"), Some(22));
+        assert_eq!(cap("INTEGER"), Some(52));
+        assert_eq!(cap("BIGINT"), Some(52));
+        assert_eq!(cap("DECIMAL(4,0)"), Some(52));
+        assert_eq!(cap("NUMERIC(9,2)"), Some(52));
+        assert_eq!(cap("NUMERIC(18,0)"), Some(52));
+        assert_eq!(cap("NUMERIC(19,0)"), None); // the INT128 path
+        assert_eq!(cap("DOUBLE PRECISION"), Some(130));
+        assert_eq!(cap("FLOAT"), Some(130));
+        assert_eq!(cap("DATE"), Some(130));
+        assert_eq!(cap("TIMESTAMP"), Some(130));
+        assert_eq!(cap("VARCHAR(10)"), None);
+        // TRAILING blanks are dropped before the test, and the vector
+        // reports the UNSTRIPPED byte length
+        let over = |s: &str, c: usize| match cvt_cap_check(s, Some(c)) {
+            Err(EvalErr::StringTruncation { expected, actual }) => Some((expected, actual)),
+            _ => None,
+        };
+        assert_eq!(over(&format!("{}2", " ".repeat(51)), 52), None);
+        assert_eq!(over(&format!("{}2", " ".repeat(52)), 52), Some((52, 53)));
+        assert_eq!(over(&format!("2{}", " ".repeat(200)), 22), None);
+        assert_eq!(
+            over(&format!("{}2{}", " ".repeat(52), " ".repeat(200)), 52),
+            Some((52, 253))
+        );
+        // BYTES, not characters: a 53-character UTF8 source of 54 bytes
+        assert_eq!(over(&format!("{}\u{e9}2", " ".repeat(51)), 52), Some((52, 54)));
         // `DOUBLE` without PRECISION is not a type, and a scale past the
         // precision is not one either - refuse rather than guess
         assert!(target("DOUBLE").is_none());
@@ -41835,6 +42903,7 @@ mod tests {
             filter: None,
             fk_children: Vec::new(),
             index: None,
+            gen_filter: None,
         };
         let wrap = |p: Plan| Plan::Returning {
             inner: Box::new(p),
@@ -41855,6 +42924,7 @@ mod tests {
                 filter: None,
                 fk_children: Vec::new(),
                 index: None,
+                gen_filter: None,
             }),
             4
         );
@@ -41933,6 +43003,7 @@ mod tests {
                 fk_refs: Vec::new(),
                 fk_children: Vec::new(),
                 index: None,
+                gen_filter: None,
             })
         };
         let upsert = Plan::UpdateOrInsert { update: update(), insert: insert() };
@@ -42140,6 +43211,9 @@ mod tests {
             ("ABO", 1, vec![i(1), i(2)], 50),         // SELECT X FROM ABO(1,2)
             ("LONGNAMEPROCXYZ", 3, vec![i(5)], 63),
             ("LONGNAMEPROCXYZ", 3, vec![n.clone()], 57),
+            // the name travels as BYTES: three characters, one of them
+            // two bytes, answers 34 where three ASCII ones answer 33
+            ("A\u{102}C", 1, vec![], 34),
         ];
         for (name, cols, args, want) in cases {
             assert_eq!(proc_blr_offset(name, cols, &args), want, "{} x{} {:?}", name, cols, args);
@@ -43666,6 +44740,49 @@ mod tests {
         };
         assert!(matches!(items[0], SelItem::Gen(ref n, None, _) if n == "SEQ"));
         assert!(matches!(items[1], SelItem::Col(ref c, None) if c == "X"));
+    }
+
+    /// The gate on a drawing SET list that rewrites a UNIQUE key: the
+    /// engine draws AS IT WRITES, so only a WHERE that pins ONE row
+    /// makes fire-crab's patch-then-write order indistinguishable.
+    #[test]
+    fn filter_pins_one_row_wants_a_full_unique_key_equality() {
+        let uniq = IndexOp { id: 1, segs: vec![(0, 8, 0)], descending: false, unique: true };
+        let compound =
+            IndexOp { id: 2, segs: vec![(0, 8, 0), (1, 8, 0)], descending: false, unique: true };
+        let nonuniq = IndexOp { id: 3, segs: vec![(0, 8, 0)], descending: false, unique: false };
+        let eq0 = || Term::Cmp(0, Cmp::Eq, Rhs::Int(3));
+        let eq1 = || Term::Cmp(1, Cmp::Eq, Rhs::Int(4));
+        // no WHERE at all is the whole table
+        assert!(!filter_pins_one_row(&None, &[uniq.clone()]));
+        // the upsert's shape: an equality on the whole unique key
+        assert!(filter_pins_one_row(&Some(Predicate::dnf(vec![vec![eq0()]])), &[uniq.clone()]));
+        // ... but only when the index IS unique
+        assert!(!filter_pins_one_row(&Some(Predicate::dnf(vec![vec![eq0()]])), &[nonuniq]));
+        // a compound key needs EVERY segment pinned
+        assert!(!filter_pins_one_row(
+            &Some(Predicate::dnf(vec![vec![eq0()]])),
+            &[compound.clone()]
+        ));
+        assert!(filter_pins_one_row(
+            &Some(Predicate::dnf(vec![vec![eq0(), eq1()]])),
+            &[compound]
+        ));
+        // a top-level OR is two rows' worth of chances
+        assert!(!filter_pins_one_row(
+            &Some(Predicate::dnf(vec![vec![eq0()], vec![eq1()]])),
+            &[uniq.clone()]
+        ));
+        // an inequality pins nothing
+        assert!(!filter_pins_one_row(
+            &Some(Predicate::dnf(vec![vec![Term::Cmp(0, Cmp::Gt, Rhs::Int(3))]])),
+            &[uniq.clone()]
+        ));
+        // and `= NULL` matches no row rather than one - never a pin
+        assert!(!filter_pins_one_row(
+            &Some(Predicate::dnf(vec![vec![Term::Cmp(0, Cmp::Eq, Rhs::Null)]])),
+            &[uniq]
+        ));
     }
 
     #[test]

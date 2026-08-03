@@ -9,11 +9,13 @@
 #
 # The laws under test, each probed against the engine first:
 #
-#   1. The compare grammar is LENIENT - NOT the store/literal grammar:
+#   1. The compare grammar is LENIENT - NOT the store/CAST grammar:
 #      interior spaces convert ('1 0' = 10, '1 2 3' = 123, '- 5' = -5),
 #      one sign before digits, one dot; an e/E hands the WHOLE string
 #      to the stricter double grammar ('1e3' converts, '1 e 3' and
-#      '1e 3' raise).
+#      '1e 3' raise). It reads the LITERAL side too (law 10) - on the
+#      COLUMN side unconditionally, on the literal side wherever no
+#      index makes the engine build a key.
 #   2. The comparison is EXACT, not double: the two BIGINTs ...806 and
 #      ...807 pick different rows, '...806.5' sits strictly between,
 #      a 39-digit spelling stays exact while a 40-digit one rounds to
@@ -48,6 +50,43 @@
 #      in this file and it does NOT follow the compare side: '1 0' is
 #      10 to a comparison and a conversion error to a CAST, ONE value
 #      answering two ways in one statement pair.
+#   9. A CONVERSION CAP that is not a grammar at all: the engine moves
+#      a text source into the TARGET's fixed buffer before reading a
+#      character of it, so a source longer than that buffer is 22001
+#      *string right truncation* whatever it spells. 22 bytes for the
+#      16-bit routine (SMALLINT, NUMERIC(p<=4)), 52 for the 32/64-bit
+#      one (INTEGER, BIGINT, NUMERIC/DECIMAL 5..18 - and DECIMAL(4,0),
+#      which is a LONG where NUMERIC(4,0) is a SHORT), 130 for the
+#      double and temporal ones, and NO cap on the INT128 path.
+#      Trailing blanks drop BEFORE the test and count INTO the reported
+#      `actual`; the count is BYTES; and the comparison vector has no
+#      cap at all.
+#  10. ONE LITERAL, TWO GRAMMARS, THE INDEX DECIDING. The literal side
+#      of a comparison is converted twice: the per-row compare takes
+#      the LENIENT grammar (`N = '1 2'` answers the 12 row, `'5 . 0'`
+#      the 5 row, on an INTEGER, a NUMERIC and through a bound
+#      parameter alike) and the optimizer's key build takes the STRICT
+#      one, so the SAME statement over an INDEXED column raises 22018 -
+#      TNI and TNIX differ only by that index. An expression side is
+#      never keyed and only ever converts leniently. The gate's
+#      omissions are deliberate and both measured: a MULTI-VALUE `IN`
+#      converts its list strictly (fire-crab refuses those spellings
+#      rather than answer the OR's rows), and a DOUBLE column's literal
+#      side still refuses here.
+#  11. A THIRD SITE FOR THE STRICT GRAMMAR: A SEMI-JOIN'S HASH KEY. The
+#      engine turns a POSITIVE `IN (<subquery>)` / `= ANY` / correlated
+#      `EXISTS` written as a TOP-LEVEL CONJUNCT into a semi-join (`SET
+#      PLANONLY ON` says HASH) and converts its keys as it builds the
+#      hash table - strictly, so a value that came out of a COLUMN and
+#      that only the lenient grammar takes raises 22018 where the same
+#      value SPELLED AS A LITERAL answers. Everything the engine does
+#      not hash keeps the lenient compare: the same IN under an OR or a
+#      NOT, `NOT IN`, `NOT EXISTS`, `= ALL`, and a SCALAR subquery. The
+#      raise is not value-gated - it is the BUILD that fails, so an
+#      outer table holding only a NULL raises while an EMPTY outer
+#      raises nothing, and one bad key sinks a list whose other keys
+#      convert and match. Two shapes fire-crab still answers where the
+#      engine hashes are RECORDED, not fixed, at the end of section 19.
 #
 #   qa/serve-real-textcolcmp.sh [port]
 set -u
@@ -106,6 +145,16 @@ CREATE TABLE TCTLK  (S VARCHAR(20) NOT NULL PRIMARY KEY);
 CREATE TABLE TCAST  (ID INTEGER NOT NULL PRIMARY KEY, S VARCHAR(30));
 CREATE TABLE TCN    (ID INTEGER NOT NULL PRIMARY KEY, N INTEGER,
                      Q NUMERIC(9,2), D DOUBLE PRECISION);
+CREATE TABLE TNI    (ID INTEGER NOT NULL PRIMARY KEY, N INTEGER, Q NUMERIC(9,2));
+CREATE TABLE TNIX   (ID INTEGER NOT NULL PRIMARY KEY, N INTEGER, Q NUMERIC(9,2));
+CREATE INDEX IDX_TNIX_N ON TNIX(N);
+CREATE INDEX IDX_TNIX_Q ON TNIX(Q);
+CREATE TABLE TLONG  (ID INTEGER NOT NULL PRIMARY KEY, S VARCHAR(210),
+                     U VARCHAR(100) CHARACTER SET UTF8);
+CREATE TABLE TK     (S VARCHAR(20));
+CREATE TABLE TKOK   (S VARCHAR(20));
+CREATE TABLE TKMIX  (S VARCHAR(20));
+CREATE TABLE TKNUL  (N INTEGER);
 COMMIT;
 INSERT INTO TCLEAN VALUES (1, '5');
 INSERT INTO TCLEAN VALUES (2, ' 5');
@@ -203,6 +252,36 @@ INSERT INTO TCAST VALUES (19, '2' || ASCII_CHAR(194) || ASCII_CHAR(160));
 INSERT INTO TCAST VALUES (20, '1 0');
 INSERT INTO TCN VALUES (1, 2, 2.00, 2);
 INSERT INTO TCN VALUES (2, 10, 10.00, 10);
+INSERT INTO TNI VALUES (1, 12, 12.00);
+INSERT INTO TNI VALUES (2, 5, 5.00);
+INSERT INTO TNI VALUES (3, NULL, NULL);
+INSERT INTO TNIX VALUES (1, 12, 12.00);
+INSERT INTO TNIX VALUES (2, 5, 5.00);
+INSERT INTO TNIX VALUES (3, NULL, NULL);
+INSERT INTO TK VALUES ('1 2');
+INSERT INTO TKOK VALUES ('12');
+INSERT INTO TKMIX VALUES ('12');
+INSERT INTO TKMIX VALUES ('1 2');
+INSERT INTO TKNUL VALUES (NULL);
+/* the conversion-cap sources, built INSIDE the engine so no shell
+   carries a 200-byte run of blanks: LPAD to the exact byte count the
+   caps sit on. id 4's UTF8 column is 53 CHARACTERS and 54 BYTES - the
+   pair that says which of the two the engine counts. */
+INSERT INTO TLONG VALUES (1, LPAD('2', 52), NULL);
+INSERT INTO TLONG VALUES (2, LPAD('2', 53), NULL);
+INSERT INTO TLONG VALUES (3, RPAD('2', 61), NULL);
+INSERT INTO TLONG VALUES (4, NULL, LPAD('é2', 53));
+INSERT INTO TLONG VALUES (5, LPAD('2', 22), NULL);
+INSERT INTO TLONG VALUES (6, LPAD('2', 23), NULL);
+INSERT INTO TLONG VALUES (7, RPAD(LPAD('2', 53), 253), NULL);
+INSERT INTO TLONG VALUES (8, LPAD('2', 130), NULL);
+INSERT INTO TLONG VALUES (9, LPAD('2', 131), NULL);
+INSERT INTO TLONG VALUES (10, LPAD('x', 53), NULL);
+INSERT INTO TLONG VALUES (11, LPAD('2', 53, '0'), NULL);
+INSERT INTO TLONG VALUES (12, LPAD('2', 52, '0'), NULL);
+INSERT INTO TLONG VALUES (13, LPAD('2020-01-01', 130), NULL);
+INSERT INTO TLONG VALUES (14, LPAD('2020-01-01', 131), NULL);
+INSERT INTO TLONG VALUES (15, LPAD('2', 201), NULL);
 COMMIT;
 EOF
     chmod 666 "$1"
@@ -504,6 +583,245 @@ both "... against a DOUBLE column" "SELECT ID FROM TCN WHERE D = ' 2 '"
 both "... and bound as a text PARAMETER" \
      "SELECT ID FROM TCN WHERE N = ?" '["  2  "]'
 
+# --- 17. the CONVERSION CAP: a buffer, not a grammar (law 9) -----------
+# The FOURTH thing this file measures about a text-to-number conversion,
+# and the only one that is not about spelling at all: the engine moves
+# the source into the target's fixed stack buffer BEFORE the grammar
+# reads it, so a source too long for that buffer is 22001 *string right
+# truncation* whatever it spells. The buffer belongs to the CONVERSION
+# ROUTINE, so the cap follows the target's STORAGE WIDTH and not its
+# family - the pair to read together is NUMERIC(4,0) (a SHORT, 22) and
+# DECIMAL(4,0) (a LONG, 52), one keyword apart.
+cap() { both "$1" "SELECT CAST('$2' AS $3) AS V FROM RDB\$DATABASE"; }
+sp() { printf '%*s' "$1" ''; }
+# the 16-bit routine: 21 blanks convert, 22 raise
+cap "SMALLINT takes 22 bytes"        "$(sp 21)2" SMALLINT
+cap "SMALLINT refuses 23"            "$(sp 22)2" SMALLINT
+cap "NUMERIC(4,0) is a SHORT too"    "$(sp 21)2" "NUMERIC(4,0)"
+cap "... and refuses 23 with it"     "$(sp 22)2" "NUMERIC(4,0)"
+# the 32/64-bit routine: 51 blanks convert, 52 raise
+cap "INTEGER takes 52 bytes"         "$(sp 51)2" INTEGER
+cap "INTEGER refuses 53"             "$(sp 52)2" INTEGER
+cap "BIGINT takes the same 52"       "$(sp 51)2" BIGINT
+cap "BIGINT refuses 53"              "$(sp 52)2" BIGINT
+cap "NUMERIC(9,2) takes 52"          "$(sp 51)2" "NUMERIC(9,2)"
+cap "NUMERIC(9,2) refuses 53"        "$(sp 52)2" "NUMERIC(9,2)"
+cap "NUMERIC(18,0) refuses 53"       "$(sp 52)2" "NUMERIC(18,0)"
+cap "DECIMAL(4,0) is a LONG: 22 fine" "$(sp 22)2" "DECIMAL(4,0)"
+cap "... 52 fine"                    "$(sp 51)2" "DECIMAL(4,0)"
+cap "... 53 raises"                  "$(sp 52)2" "DECIMAL(4,0)"
+# the INT128 routine reads the string where it lies - no cap at all
+cap "NUMERIC(19,0) takes 201 bytes"  "$(sp 200)2" "NUMERIC(19,0)"
+cap "NUMERIC(38,2) takes 201 bytes"  "$(sp 200)2" "NUMERIC(38,2)"
+# the double routine: 129 blanks convert, 130 raise
+cap "DOUBLE takes 130 bytes"         "$(sp 129)2" "DOUBLE PRECISION"
+cap "DOUBLE refuses 131"             "$(sp 130)2" "DOUBLE PRECISION"
+cap "FLOAT takes the same 130"       "$(sp 129)2" FLOAT
+cap "FLOAT refuses 131"              "$(sp 130)2" FLOAT
+# the temporal scanner shares the double's buffer, and the 22001
+# REPLACES the 22018 the spelling would have earned
+cap "DATE takes 130 bytes"           "$(sp 120)2020-01-01" DATE
+cap "DATE refuses 131"               "$(sp 121)2020-01-01" DATE
+cap "TIMESTAMP refuses 131"          "$(sp 121)2020-01-01" TIMESTAMP
+cap "a 130-byte nonsense is still 22018" "$(sp 129)x" DATE
+# the cap fires BEFORE the grammar: a perfectly spelled source and a
+# nonsense one of the same length take the SAME error
+cap "53 bytes of DIGITS raise too"   "$(printf '0%.0s' $(seq 1 52))2" INTEGER
+cap "52 bytes of digits convert"     "$(printf '0%.0s' $(seq 1 51))2" INTEGER
+cap "53 bytes of nonsense: 22001, not 22018" "$(sp 52)x" INTEGER
+cap "23 bytes of nonsense, SMALLINT" "$(sp 22)x" SMALLINT
+# TRAILING blanks are dropped BEFORE the test and counted INTO the
+# reported `actual`
+cap "200 trailing blanks never count" "2$(sp 200)" SMALLINT
+cap "... nor at the 52-byte target"   "2$(sp 200)" INTEGER
+cap "51 lead + 200 trail converts"    "$(sp 51)2$(sp 200)" INTEGER
+cap "52 lead + 200 trail raises, actual 253" "$(sp 52)2$(sp 200)" INTEGER
+# and the same cap reached from a stored COLUMN
+lng() { both "$1" "SELECT CAST(S AS $3) AS V FROM TLONG WHERE ID = $2"; }
+lng "a 52-byte column value converts"  1 INTEGER
+lng "a 53-byte one raises"             2 INTEGER
+lng "trailing blanks converted (61)"   3 INTEGER
+lng "22 bytes into a SMALLINT"         5 SMALLINT
+lng "23 bytes into a SMALLINT"         6 SMALLINT
+lng "53 real + 200 trailing"           7 INTEGER
+lng "130 bytes into a DOUBLE"          8 "DOUBLE PRECISION"
+lng "131 bytes into a DOUBLE"          9 "DOUBLE PRECISION"
+lng "53 bytes of nonsense"            10 INTEGER
+lng "53 bytes of leading zeros"       11 INTEGER
+lng "52 bytes of leading zeros"       12 INTEGER
+lng "130 bytes of DATE"               13 DATE
+lng "131 bytes of DATE"               14 DATE
+lng "201 bytes into an INT128 target" 15 "NUMERIC(19,0)"
+lng "201 bytes into a BIGINT"         15 BIGINT
+# BYTES, not characters: id 4's UTF8 value is one character shorter
+# than it is bytes long, and the vector reports the BYTES
+both "the UTF8 source's characters and bytes" \
+     "SELECT CHAR_LENGTH(U) AS C, OCTET_LENGTH(U) AS O FROM TLONG WHERE ID = 4"
+both "... and the cap counts the BYTES" \
+     "SELECT CAST(U AS INTEGER) AS V FROM TLONG WHERE ID = 4"
+# the COMPARISON vector has NO cap on either side - the third place the
+# two grammars part company (the store side is priced in the header)
+both "a 201-byte literal compares with no cap" \
+     "SELECT ID FROM TCN WHERE N = '$(sp 200)2'"
+both "... and a 201-byte COLUMN value does too" \
+     "SELECT ID FROM TLONG WHERE S = 2"
+
+# --- 18. one literal, two grammars, the INDEX deciding (law 10) --------
+# The engine converts the LITERAL side of a comparison twice: the
+# per-row compare takes the lenient grammar (blanks anywhere), and the
+# optimizer's key build takes the strict store one. Which of the two the
+# statement sees is decided by an INDEX on the compared column - TNI and
+# TNIX hold the same three rows and differ only by that index, and every
+# spelling below answers on one and raises 22018 on the other.
+lax() { both "unindexed $1" "SELECT ID FROM TNI WHERE $2"; }
+idx() { both "indexed   $1" "SELECT ID FROM TNIX WHERE $2"; }
+for w in "N = '1 2'" "N = ' 1 2 '" "N = '1 2 '" "N = '5 . 0'" "N = '- 5'" \
+         "N = '1 . 2'" "N > '1 1'" "N IN ('1 2')" "N BETWEEN '1 1' AND '9'" \
+         "Q = '1 2'" "Q = '1 2.0 0'" "Q = '5 . 0'"; do
+    lax "$w" "$w"
+    idx "$w" "$w"
+done
+# the spellings BOTH grammars refuse still raise, indexed or not
+for w in "N = 'x'" "N = '1 e 3'" "N = '5.5.5'" "N = '1,5'" "N = '--5'" "N = ''"; do
+    lax "$w" "$w"
+    idx "$w" "$w"
+done
+# the timing laws ride along, exactly as they do for a raising literal:
+# the NULL row is silent, a dead group suppresses, an empty table says
+# nothing, and the value-gate is per row
+lax "the NULL row is UNKNOWN, not a match" "N = '1 2' OR N = '5 . 0'"
+lax "a dead group suppresses the whole term" "N = '1 2' AND 1 = 0"
+idx "a dead group suppresses the indexed RAISE too" "N = '1 2' AND 1 = 0"
+lax "IS NULL beside it" "N IS NULL OR N = '1 2'"
+both "an EMPTY table is silent either way" \
+     "SELECT ID FROM TEMPTY WHERE ID = '1 2'"
+# the literal on the LEFT, and the same value through a PARAMETER
+lax "the literal on the left" "'1 2' = N"
+both "unindexed, bound as a text parameter" \
+     "SELECT ID FROM TNI WHERE N = ?" '["1 2"]'
+both "indexed, bound as a text parameter" \
+     "SELECT ID FROM TNIX WHERE N = ?" '["1 2"]'
+both "unindexed, a bound NUMERIC-column parameter" \
+     "SELECT ID FROM TNI WHERE Q = ?" '["1 2"]'
+both "indexed, a bound NUMERIC-column parameter" \
+     "SELECT ID FROM TNIX WHERE Q = ?" '["1 2"]'
+# the keyed BOUND order, where two bad bounds meet: the engine builds
+# the UPPER one first, whichever order they are written in
+idx "two bad bounds name the UPPER" "N >= 'zz' AND N <= 'yy'"
+idx "... written the other way round" "N <= 'yy' AND N >= 'zz'"
+idx "... strict operators too" "N > 'zz' AND N < 'yy'"
+idx "an equality's upper slot survives a later lower bound" "N = 'aa' AND N > 'bb'"
+idx "BETWEEN whose LOWER is the bad one names it" "N BETWEEN 'zz' AND '9'"
+# an EXPRESSION side is never keyed, so only the lenient grammar runs
+lax "an expression side takes it" "N + 0 = '1 2'"
+lax "... and the other orientation" "'1 2' = N + 0"
+# ONE value, three answers in three adjacent statements: the comparison
+# converts it, the CAST refuses it, and the index turns the comparison
+# into the CAST's refusal
+both "the CAST of that same literal refuses it" \
+     "SELECT CAST('1 2' AS INTEGER) AS V FROM RDB\$DATABASE"
+both "... and the CAST of the blanks-only sibling converts" \
+     "SELECT CAST(' 12 ' AS INTEGER) AS V FROM RDB\$DATABASE"
+
+# --- 19. THE THIRD KEY: a SEMI-JOIN's hash key (law 11) ----------------
+# Same literal, same column, a THIRD conversion site. The engine turns a
+# POSITIVE `IN (<subquery>)` / `= ANY` / correlated `EXISTS` written as a
+# top-level conjunct into a SEMI-JOIN - `SET PLANONLY ON` says HASH - and
+# converts its keys as it builds the hash table, with the STRICT store
+# grammar. Every shape it does NOT hash keeps the lenient per-row
+# compare, and the plan is the discriminator, cell for cell:
+#
+#   PLAN HASH, raises 22018      PLAN (..) PLAN (..), answers the row
+#   ----------------------       ----------------------------------
+#   N IN (SELECT S FROM TK)      N IN (SELECT ...) OR 1=0
+#   (N IN (SELECT ...))          NOT (N IN (SELECT ...))
+#   ... AND 1=1                  N NOT IN (SELECT ...)
+#   EXISTS (correlated)          N = (SELECT S FROM TK)   [scalar]
+#                                NOT EXISTS (correlated)
+#                                N = ALL (SELECT ...)
+#
+# The gate is here rather than in serve-real-subquery.sh because the law
+# is this file's own: ONE literal, now THREE grammars, and the SHAPE
+# chooses which - an index for the retrieval key, a semi-join for the
+# hash key, nothing for the per-row compare.
+bothk() { both "$1" "SELECT ID FROM TNI WHERE $2"; }
+# the hashed half
+bothk "IN a subquery hashes: the strict grammar raises" \
+      "N IN (SELECT S FROM TK)"
+bothk "... parenthesised is still a top-level conjunct" \
+      "(N IN (SELECT S FROM TK))"
+bothk "... beside a TRUE conjunct" "N IN (SELECT S FROM TK) AND 1=1"
+bothk "... beside a sibling OR that does not enclose it" \
+      "N IN (SELECT S FROM TK) AND (ID = 1 OR ID = 2)"
+bothk "a correlated EXISTS is the same semi-join" \
+      "EXISTS (SELECT 1 FROM TK WHERE TK.S = TNI.N)"
+# the un-hashed half - the lenient grammar, the row answered
+bothk "under OR the semi-join is gone and the compare is lenient" \
+      "N IN (SELECT S FROM TK) OR 1=0"
+bothk "... an enclosing NOT the same" "NOT (N IN (SELECT S FROM TK))"
+bothk "NOT IN is an anti-join, never hashed" "N NOT IN (SELECT S FROM TK)"
+bothk "NOT EXISTS likewise" \
+      "NOT EXISTS (SELECT 1 FROM TK WHERE TK.S = TNI.N)"
+bothk "a correlated EXISTS under OR" \
+      "EXISTS (SELECT 1 FROM TK WHERE TK.S = TNI.N) OR 1=0"
+bothk "a SCALAR subquery is a singleton, not a key" "N = (SELECT S FROM TK)"
+bothk "... against a NUMERIC column" "Q = (SELECT S FROM TK)"
+# the gates on the raise: it is the BUILD that fails, so it does not
+# read the outer row's value - but it never runs without one
+both "a NULL-only outer still raises (no value gate)" \
+     "SELECT N FROM TKNUL WHERE N IN (SELECT S FROM TK)"
+both "an EMPTY outer raises nothing" \
+     "SELECT ID FROM TEMPTY WHERE ID IN (SELECT S FROM TK)"
+bothk "an empty INNER decides FALSE with no conversion" \
+      "N IN (SELECT S FROM TK WHERE S = 'nope')"
+# one bad key sinks the whole build, whatever the others do
+bothk "a list the strict grammar takes converts and answers" \
+      "N IN (SELECT S FROM TKOK)"
+bothk "one bad key among good ones still sinks it" \
+      "N IN (SELECT S FROM TKMIX)"
+# the index does not change a hash key's grammar - it was strict already
+both "the indexed twin raises the same" \
+     "SELECT ID FROM TNIX WHERE N IN (SELECT S FROM TK)"
+# and the LITERAL spelled out, beside it: the same value, answered
+bothk "the same value written as a LITERAL answers" "N IN ('1 2')"
+
+# A LEFT join is the control the plan itself names: the engine NEVER
+# hashes one (`PLAN JOIN`), so the same two columns compare leniently
+# and every outer row comes back.
+both "a LEFT join's ON is not a hash key" \
+     "SELECT ID FROM TNI LEFT JOIN TK ON TK.S = TNI.N ORDER BY ID"
+
+# --- RECORDED BOUNDARIES: the hashes fire-crab does not reach ----------
+# The engine hashes an INNER join's key too, and converts it exactly as
+# it converts a semi-join's. fire-crab compares those two columns per
+# row with the lenient grammar and ANSWERS. This is NOT the fold's
+# regression - the HEAD binary answers here as well - and closing it
+# means teaching the join path which of its equalities the engine turns
+# into hash keys, which is its own slice. Pinned on BOTH sides so that
+# either one moving is visible. `= ANY` / `= ALL` have no surface at
+# all here; the refusal is pinned so it cannot quietly become an answer.
+krec() { # <label> <sql> <fc-today> <engine-today>
+    a=$(query "$2" "[]" "$PORT" "$A")
+    b=$(query "$2" "[]" "$REAL" "$B")
+    ran=$((ran + 2))
+    if [ "$a" = "$3" ]; then echo "BOUND $1 | fc: $a"
+    else echo "DIFF $1 - fire-crab moved"; echo "     got:  $a"; echo "     was:  $3"; fail=1; fi
+    if [ "$b" = "$4" ]; then echo "BOUND $1 | engine: $b"
+    else echo "DIFF $1 - the ENGINE moved"; echo "     got:  $b"; echo "     was:  $4"; fail=1; fi
+}
+krec "an INNER join's ON is a hash key on the engine, a compare here" \
+     "SELECT ID FROM TNI JOIN TK ON TK.S = TNI.N" \
+     '[{"ID":1}]' 'ERR Conversion error from string "1 2"'
+krec "... the comma spelling of the same join" \
+     "SELECT ID FROM TNI, TK WHERE TNI.N = TK.S" \
+     '[{"ID":1}]' 'ERR Conversion error from string "1 2"'
+krec "= ANY hashes on the engine; fire-crab has no surface for it" \
+     "SELECT ID FROM TNI WHERE N = ANY (SELECT S FROM TK)" \
+     'ERR Dynamic SQL Error' 'ERR Conversion error from string "1 2"'
+krec "= ALL is not hashed, and fire-crab refuses that too" \
+     "SELECT ID FROM TNI WHERE N = ALL (SELECT S FROM TK)" \
+     'ERR Dynamic SQL Error' '[{"ID":1}]'
+
 # --- 10. durable DML atomicity (LAST: it mutates) ----------------------
 both "raising UPDATE errors on both" "UPDATE TDIRTY SET S = '9' WHERE S = 5"
 both "raising DELETE errors on both" "DELETE FROM TDIRTY WHERE S = 5"
@@ -525,8 +843,8 @@ both "the stored numbers read back (fresh attachment)" \
      "SELECT ID, N, Q, D FROM TCN ORDER BY ID"
 
 # --- 14. the ran counter -----------------------------------------------
-if [ "$ran" -ne 205 ]; then
-    echo "DIFF $ran checks ran (expected exactly 205) - did one silently skip?"
+if [ "$ran" -ne 339 ]; then
+    echo "DIFF $ran checks ran (expected exactly 339) - did one silently skip?"
     fail=1
 fi
 
