@@ -1382,11 +1382,38 @@ four; R7 is the removal of what they replaced.
   the pre-existing lenient answer stands. Both are gated, and both pass
   against the PRE-FIX binary too — they test the guards, not the fix.
 
-  *Found while building, recorded*: `LEFT JOIN … WHERE J1.A = J2.T`
-  raises on the engine, because a WHERE that requires a non-NULL right
-  row degrades the LEFT join to an inner one and it then hashes.
-  Pre-existing here (this slice only strictens all-inner chains) and it
-  needs join simplification in the planner.
+  ~~*Found while building*: `LEFT JOIN … WHERE J1.A = J2.T` raises on
+  the engine~~ — *closed*: a LEFT join whose padding cannot survive the
+  WHERE **is** an inner join, and the engine plans it as one (`PLAN
+  JOIN` → `PLAN HASH`, probed; the ANTI-JOIN idiom `WHERE J2.ID IS
+  NULL` and a conjunct under an OR both stay `PLAN JOIN`, and both are
+  excluded). The ROWS are identical either way — a padded row fails a
+  null-rejecting conjunct — so what changes is which EVALUATIONS
+  happen: the ON stops running over partnerless rows, the inner side
+  stops being probed, and the key becomes a hash key read strictly.
+
+  Two traps, both caught by controls rather than by reasoning. The
+  first attempt did not fire on the shape it was built for, because by
+  resolution time `cmp_sides` has WRAPPED the text side — the term is
+  `Cmp(Col, TextNum(Col))`, so a "bare column" test sees no column;
+  `null_rejecting` reads through the coercion wraps now. Then the gate
+  caught the opposite error: `… ON TK.S = TNI.N WHERE TK.S = '34'`
+  raised where the engine answers `[]`, because a conjunct that filters
+  the KEY'S OWN STREAM is applied before the hash is built. That
+  silencer existed for the ON's conjuncts; the WHERE's are only visible
+  at the degradation site — and a same-side conjunct is exactly what
+  degraded the join. `qa/serve-real-textcolcmp.sh` 342, 1 DIFF against
+  the pre-fix binary with four negative controls green on BOTH.
+
+- **Derived-table FLATTENING is the wrong way to close the sorted-raiser
+  residual** — recorded so it is not attempted again. Merging `SELECT …
+  FROM (SELECT …) X` into one statement would close it and would let an
+  index reach through a derived table, but it is EXACTLY the text
+  expansion R7 removed (`splice_ctes`: "the old path EXPANDED a
+  definition … this moves ONE FROM ITEM and hands the body to the
+  planner as a query of its own"). The residual belongs to programme R:
+  the sort must carry UNPROJECTED records and apply the projection at
+  delivery, which is the lazy row-source tree, not a rewrite.
 
   **The older measurement, kept for the cells that held:**
   `SET PLANONLY ON` confirms the split: `J1 JOIN J2 ON J2.T = J1.A` and

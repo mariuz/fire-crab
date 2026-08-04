@@ -816,6 +816,22 @@ both "a filter on the key's own stream silences it" \
 # and the LEFT join must NOT have moved: it is a nested loop, not a hash
 both "a LEFT join of the same pair stays lenient" \
      "SELECT ID FROM TNI LEFT JOIN TK ON TK.S = TNI.N ORDER BY ID"
+# ... UNLESS THE WHERE KILLS ITS PADDING. A conjunct that rejects a NULL
+# from the right side makes the padded row unreachable, so the engine
+# plans an inner join - PLAN HASH, probed - and the key is then read
+# strictly. The rows are identical either way, which is what makes this
+# safe: what changes is which evaluations happen.
+both "a LEFT join whose WHERE rejects the padding degrades to inner" \
+     "SELECT ID FROM TNI LEFT JOIN TK ON 1=1 WHERE TNI.N = TK.S"
+both "... and the same through an explicit ON key" \
+     "SELECT ID FROM TNI LEFT JOIN TK ON TK.S = TNI.N WHERE TK.S = '34'"
+# the two idioms that must NOT degrade, both PLAN JOIN on the engine
+both "the ANTI-JOIN idiom keeps its padding" \
+     "SELECT ID FROM TNI LEFT JOIN TK ON TK.S = TNI.N WHERE TK.S IS NULL ORDER BY ID"
+both "a conjunct under an OR is not null-rejecting" \
+     "SELECT ID FROM TNI LEFT JOIN TK ON TK.S = TNI.N WHERE TK.S = '34' OR 1=1 ORDER BY ID"
+both "control: a plain LEFT join still pads" \
+     "SELECT ID FROM TNI LEFT JOIN TKOK ON TKOK.S = TNI.N ORDER BY ID"
 
 # --- RECORDED BOUNDARIES: the hashes fire-crab does not reach ----------
 # WHICH SIDE the engine builds the hash from is the OPTIMIZER'S choice
@@ -866,8 +882,8 @@ both "the stored numbers read back (fresh attachment)" \
      "SELECT ID, N, Q, D FROM TCN ORDER BY ID"
 
 # --- 14. the ran counter -----------------------------------------------
-if [ "$ran" -ne 341 ]; then
-    echo "DIFF $ran checks ran (expected exactly 341) - did one silently skip?"
+if [ "$ran" -ne 346 ]; then
+    echo "DIFF $ran checks ran (expected exactly 346) - did one silently skip?"
     fail=1
 fi
 

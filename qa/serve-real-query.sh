@@ -62,7 +62,13 @@ for t in $tables; do
                     user:process.env.FC_U,password:process.env.FC_P},(e,db)=>{
             if(e){console.log("CONN_ERR");process.exit(1);}
             db.query("SELECT COUNT(*) FROM "+process.env.FC_T,(e2,r)=>{
-              console.log(e2?"CONN_ERR":r[0][Object.keys(r[0])[0]]);db.detach();process.exit(0);});
+              // String(): console.log of a NUMBER goes through
+              // util.inspect, which COLOURISES when FORCE_COLOR is set
+              // in the environment - even into a pipe. This gate then
+              // compared a yellow-wrapped 8 against the plain 8 from
+              // isql and reported ten identical counts as ten
+              // differences. A string prints as itself.
+              console.log(e2?"CONN_ERR":String(r[0][Object.keys(r[0])[0]]));db.detach();process.exit(0);});
           });' 2>/dev/null)
         case "$fc" in *CONN_ERR*|"") n=$((n + 1)); sleep 0.3 ;; *) break ;; esac
     done

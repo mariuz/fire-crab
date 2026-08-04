@@ -14954,6 +14954,57 @@ fn plan_join(
 /// makes the whole predicate a filter (`build_join_probe` refuses one
 /// for the same reason), and a conjunct comparing one side to a
 /// CONSTANT is not the join's key at all.
+/// Does this term REJECT a NULL from the window - is it false or unknown
+/// whenever those fields are NULL?
+///
+/// That is what turns a LEFT join into an inner one: a padded right row
+/// cannot survive it, so the padding is dead weight and the engine
+/// plans the join as a hash instead (probed: `LEFT JOIN … WHERE J2.ID =
+/// 1` is PLAN HASH, while the ANTI-JOIN idiom `WHERE J2.ID IS NULL` and
+/// a conjunct under an OR both stay PLAN JOIN).
+///
+/// Deliberately narrow: a bare column in a comparison, on either side,
+/// including the CROSS-BOUNDARY spelling `J1.A = J2.T` that started
+/// this. `IS NULL` is excluded - it is the anti-join - and so is
+/// anything whose NULL behaviour this cannot read off the shape, since
+/// declining leaves today's answer (a LEFT join) rather than inventing
+/// one. `COALESCE(J2.T,'x') = 'x'` is exactly such a shape: it names
+/// the side and does NOT reject its NULLs.
+fn null_rejecting(t: &Term, win: &std::ops::Range<usize>) -> bool {
+    match t {
+        Term::Cmp(fid, ..)
+        | Term::NumCmp(fid, ..)
+        | Term::TextNumCmp(fid, ..)
+        | Term::CmpConvErr(fid, ..)
+        | Term::Like(fid, ..)
+        | Term::Starting(fid, ..)
+        | Term::IsNotNull(fid) => win.contains(fid),
+        Term::ExprCond(c) => match c.as_ref() {
+            Cond2::Cmp(l, _, r) => {
+                // through the COERCION WRAPS [cmp_sides] puts on a text
+                // side compared with a numeric one: the column under
+                // them is still the column, and its NULL still
+                // propagates. Missing that made `LEFT JOIN … WHERE
+                // J1.A = J2.T` - the very shape this pass exists for -
+                // fail to degrade, because by resolution time the right
+                // side is `TextNum(Col)` and not `Col`.
+                fn bare(e: &Expr, win: &std::ops::Range<usize>) -> bool {
+                    match e {
+                        Expr::Col(i) => win.contains(i),
+                        Expr::TextNum(inner)
+                        | Expr::TextNumKey(inner)
+                        | Expr::TextBool(inner) => bare(inner, win),
+                        _ => false,
+                    }
+                }
+                bare(l, win) || bare(r, win)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn mark_hash_keys(on: &mut Predicate, offset: usize, part_width: usize) {
     if on.groups.len() != 1 {
         return; // an OR: not a key, and the engine does not hash it
@@ -15392,6 +15443,50 @@ fn plan_join_bound(
                 .and_then(|raw| resolve_join_predicate(raw, &sides, params))?,
         ),
     };
+
+    // A LEFT JOIN WHOSE PADDING CANNOT SURVIVE THE WHERE IS AN INNER
+    // JOIN, and the engine plans it as one - `LEFT JOIN … WHERE J2.ID =
+    // 1` is PLAN HASH where the same join without that WHERE is PLAN
+    // JOIN (probed; the anti-join `WHERE J2.ID IS NULL` and a conjunct
+    // under an OR both stay PLAN JOIN, and both are excluded here).
+    //
+    // The ROWS are the same either way - a padded row fails a
+    // null-rejecting conjunct - so this changes which EVALUATIONS
+    // happen, not the answer: the ON stops being evaluated over
+    // partnerless rows (the engine's own behaviour once it has
+    // degraded), the inner side stops being probed (the engine hashes
+    // an inner join), and the join's key becomes a HASH KEY, read with
+    // the strict conversion grammar. That last is the point: `LEFT JOIN
+    // … WHERE J1.A = J2.T` answered here and raised on the engine.
+    if let Some(f) = filter.as_ref() {
+        if f.groups.len() == 1 {
+            let mut at = sides[0].descs.len();
+            for p in parts.iter_mut() {
+                let win = at..at + p.width;
+                if matches!(p.kind, JoinKind::Left)
+                    && f.groups[0].iter().any(|t| null_rejecting(t, &win))
+                {
+                    p.kind = JoinKind::Inner;
+                    p.probe = None;
+                    // THE SILENCER APPLIES FROM THE WHERE TOO. A
+                    // conjunct that filters the KEY'S OWN STREAM is
+                    // applied to that stream before the hash is built,
+                    // so the unconvertible row never reaches the key -
+                    // `… ON TK.S = TNI.N WHERE TK.S = '34'` answers []
+                    // on the engine rather than raising. mark_hash_keys
+                    // knows that rule for the ON's own conjuncts; the
+                    // WHERE's are only visible here, and a same-side
+                    // conjunct is exactly what degraded the join in the
+                    // first place.
+                    let filtered = f.groups[0].iter().any(|t| term_side_only(t, &win));
+                    if !filtered {
+                        mark_hash_keys(&mut p.on, at, p.width);
+                    }
+                }
+                at += p.width;
+            }
+        }
+    }
 
     // An AGGREGATE in the projection (or any GROUP BY) folds the joined
     // rows instead of emitting them. The fold is the same machinery a
