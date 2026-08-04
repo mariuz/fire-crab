@@ -27926,6 +27926,19 @@ struct SubqRows {
     values: Vec<Value>,
     /// the inner query matched at least one row
     any: bool,
+    /// For a CORRELATED read: the OUTER column the correlation leaf
+    /// named. The caller needs it to build the membership test, and it
+    /// used to re-derive it by calling [correlated_outer_col], which
+    /// resolved the inner columns with `relation_columns` - a PHYSICAL
+    /// lookup. A view has catalog rows so that worked; a DERIVED table
+    /// has none, so the columns came back empty, the split found no
+    /// correlation, and a subquery this server had just evaluated
+    /// correctly was refused by the code asking it what it had done.
+    ///
+    /// The rule for "which side is which" was already stated once, in
+    /// [split_correlation]. What was stated twice is where the inner
+    /// COLUMNS come from - so the answer travels with the rows now.
+    outer: Option<String>,
 }
 
 /// Render a value as the SQL LITERAL that means it, for folding a
@@ -28818,30 +28831,59 @@ fn eval_subquery_corr_planned(
     if group_s.is_some() || having_s.is_some() || order_s.is_some() {
         return None;
     }
-    let (from, join) = parse_from(table_s)?;
-    if !join.is_empty() {
-        return None;
-    }
-    let table = from.table;
-    // the same two-way catalog check every nested FROM gets
-    if !relation_qualifier_ok(db, from.schema, table) {
-        return None;
-    }
-    // only a view for now: a derived table in a correlated subquery
-    // would need its inner text planned here too, which is the same
-    // machinery pointed at a different source
-    let (inner_plan, inner_cols) = plan_view(db_opt, db, table)?;
+    // THE SOURCE, whatever it is. A DERIVED TABLE is its own statement
+    // and is planned as one; a VIEW is planned by name. Both end as an
+    // inner plan plus its DESCRIBE, which is all the correlation split
+    // below needs - it never asked for a rel id, only for columns.
+    let (inner_plan, inner_cols, table, alias): (Plan, Vec<ProjCol>, String, Option<&str>) =
+        if let Some((inner_sql, dalias, declared)) = parse_derived_table(table_s) {
+            let mut ip: Vec<Option<Descriptor>> = Vec::new();
+            let plan = plan_query_inner(&inner_sql, db_opt, &mut ip)?;
+            if !ip.is_empty() || matches!(plan, Plan::Refused) {
+                return None; // a `?` inside, or a shape not planned
+            }
+            let mut cols = output_cols_of(&plan);
+            if cols.is_empty() {
+                return None;
+            }
+            // `(SELECT ...) D (A, B)` renames them, and the engine
+            // counts them
+            if !declared.is_empty() {
+                if declared.len() != cols.len() {
+                    return None;
+                }
+                for (c, n) in cols.iter_mut().zip(declared.iter()) {
+                    c.name = n.clone();
+                }
+            }
+            // a derived table's ALIAS is its only name, and SQL requires
+            // one - so it is both the "table" the correlation splits on
+            // and the qualifier the residual carries
+            (plan, cols, dalias, None)
+        } else {
+            let (from, join) = parse_from(table_s)?;
+            if !join.is_empty() {
+                return None;
+            }
+            // the same two-way catalog check every nested FROM gets
+            if !relation_qualifier_ok(db, from.schema, from.table) {
+                return None;
+            }
+            let (plan, cols) = plan_view(db_opt, db, from.table)?;
+            (plan, cols, from.table.to_string(), from.alias)
+        };
+    let table = table.as_str();
     let (columns, descs) = derived_view(&inner_cols);
     let ws = where_s?; // a correlated subquery needs a WHERE to correlate
     if !extract_subqueries(ws)?.1.is_empty() {
         return None; // a subquery inside the subquery
     }
     let toks = tokenize(ws)?;
-    let (corr_fid, _outer_name, residual) =
-        split_correlation(&toks, table, from.alias, &columns, outer_cols, outer_bind)?;
+    let (corr_fid, outer_name, residual) =
+        split_correlation(&toks, table, alias, &columns, outer_cols, outer_bind)?;
     // the inner name/alias qualifiers come off the residual, as they do
     // in the relation path - the split needed them, the resolver does not
-    let inner_names: Vec<&str> = match from.alias {
+    let inner_names: Vec<&str> = match alias {
         Some(a) => vec![table, a],
         None => vec![table],
     };
@@ -28889,7 +28931,7 @@ fn eval_subquery_corr_planned(
             Err(_) => return None, // the relation path refuses here too
         }
     }
-    Some(SubqRows { values, any })
+    Some(SubqRows { values, any, outer: Some(outer_name) })
 }
 
 /// The uncorrelated subquery as a PLANNED STATEMENT: one column, its
@@ -28922,7 +28964,7 @@ fn eval_subquery_planned(
             .map(|r| r.first().cloned().unwrap_or(Value::Null))
             .collect()
     };
-    Some(SubqRows { values, any })
+    Some(SubqRows { values, any, outer: None })
 }
 
 fn eval_subquery_rel(
@@ -28984,11 +29026,13 @@ fn eval_subquery_rel(
             Some(tokenize(ws)?)
         }
     };
+    let mut corr_outer: Option<String> = None;
     if let Some(outer_cols) = corr {
         let toks = where_toks.take()?; // correlated EXISTS needs a WHERE
-        let (fid, _outer_name, residual) =
+        let (fid, outer_name, residual) =
             split_correlation(&toks, table, from.alias, &columns, outer_cols, outer_bind)?;
         corr_inner_fid = Some(fid);
+        corr_outer = Some(outer_name);
         where_toks = residual;
     }
 
@@ -29165,6 +29209,7 @@ fn eval_subquery_rel(
         return Some(SubqRows {
             values: vec![v],
             any: true,
+            outer: corr_outer.clone(),
         });
     }
 
@@ -29188,7 +29233,7 @@ fn eval_subquery_rel(
         if ferr {
             return None;
         }
-        return Some(SubqRows { values: Vec::new(), any });
+        return Some(SubqRows { values: Vec::new(), any, outer: corr_outer.clone() });
     }
     let fid = want_fid?;
     let mut values = Vec::new();
@@ -29210,7 +29255,7 @@ fn eval_subquery_rel(
             values.push(v.get(fid).cloned().unwrap_or(Value::Null));
         }
     });
-    Some(SubqRows { values, any })
+    Some(SubqRows { values, any, outer: corr_outer })
 }
 
 /// Is the token at `at` reached through nothing but top-level `AND`s -
@@ -29336,7 +29381,12 @@ fn resolve_subqueries(
                     Some(rows) => {
                         // the outer column the correlation named: recover
                         // it from the inner WHERE the same way
-                        let outer = correlated_outer_col(sql, db, outer_cols, outer_bind)?;
+                        // the name the evaluator ALREADY found; only a
+                        // reading that did not record one re-derives it
+                        let outer = match rows.outer.clone() {
+                            Some(o) => o,
+                            None => correlated_outer_col(sql, db, outer_cols, outer_bind)?,
+                        };
                         // NULLs must NOT reach the IN list here. A semi-
                         // join asks "is there an inner row with inner.c =
                         // outer.c", and `NULL = anything` is UNKNOWN, so

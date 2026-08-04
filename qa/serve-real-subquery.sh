@@ -182,6 +182,24 @@ same "correlated through an ALIAS on the view" \
      "SELECT ID FROM A WHERE EXISTS (SELECT 1 FROM VB V WHERE V.AID = A.ID) ORDER BY ID"
 same "the NULL row: a correlated match against a NULL outer value" \
      "SELECT ID FROM A WHERE EXISTS (SELECT 1 FROM VB WHERE VB.AID = A.N) ORDER BY ID"
+# A DERIVED TABLE as the correlated source. Same machinery, different
+# source - but it needed a SECOND place to stop resolving columns
+# physically: the caller re-derived the correlated OUTER column with
+# relation_columns, which a view has (catalog rows) and a derived table
+# has not, so a subquery this server had just evaluated correctly was
+# refused by the code asking it what it had done. The name travels with
+# the rows now.
+same "correlated EXISTS over a derived table" \
+     "SELECT ID FROM A WHERE EXISTS (SELECT 1 FROM (SELECT AID AS K FROM B) D WHERE D.K = A.ID) ORDER BY ID"
+same "correlated NOT EXISTS over a derived table" \
+     "SELECT ID FROM A WHERE NOT EXISTS (SELECT 1 FROM (SELECT AID AS K FROM B) D WHERE D.K = A.ID) ORDER BY ID"
+same "correlated over a derived table with its own WHERE" \
+     "SELECT ID FROM A WHERE EXISTS (SELECT 1 FROM (SELECT AID AS K FROM B WHERE M >= 200) D WHERE D.K = A.ID) ORDER BY ID"
+same "correlated over a derived table with DECLARED column names" \
+     "SELECT ID FROM A WHERE EXISTS (SELECT 1 FROM (SELECT AID FROM B) D (K) WHERE D.K = A.ID) ORDER BY ID"
+same "correlated over a derived table, residual conjunct beside it" \
+     "SELECT ID FROM A WHERE EXISTS (SELECT 1 FROM (SELECT AID AS K FROM B) D WHERE D.K = A.ID AND D.K > 1) ORDER BY ID"
+
 # the controls that must not move: the same correlations over a TABLE
 same "control: correlated EXISTS over the base table" \
      "SELECT ID FROM A WHERE EXISTS (SELECT 1 FROM B WHERE B.AID = A.ID) ORDER BY ID"

@@ -678,9 +678,27 @@ four; R7 is the removal of what they replaced.
   engine's answer was already known and the second branch only made the
   check blind.
 
-  *Still open*: a DERIVED TABLE in a correlated subquery — the same
-  machinery pointed at a different source. The function refuses it
-  explicitly rather than guessing.
+  ~~*Still open*: a DERIVED TABLE in a correlated subquery~~ —
+  *closed, and the second half of it is the lesson.* Pointing the
+  source planner at `parse_derived_table` was mechanical (the
+  `(SELECT …) D (K)` declared-names form included, which the engine
+  counts). What blocked it was a SECOND place that resolved columns
+  PHYSICALLY: after the evaluator answered, the caller re-derived the
+  correlated OUTER column through `correlated_outer_col`, which calls
+  `relation_columns` — a view has catalog rows so it worked, a derived
+  table has none, so the columns came back empty, the split found no
+  correlation, and **a subquery this server had just evaluated
+  correctly was refused by the code asking it what it had done**.
+
+  That function's own comment warns "a rule stated twice is a rule that
+  drifts; a rule stated three times drifts twice" — and the rule for
+  *which side is which* WAS stated once, in `split_correlation`. What
+  was stated twice is where the inner COLUMNS come from. **De-duplicating
+  a rule is not enough while its INPUTS are still fetched
+  independently**: `SubqRows` carries the outer column now, and only a
+  reading that did not record one re-derives it.
+  `qa/serve-real-subquery.sh` 46 → 51, 5 DIFF against the pre-fix
+  binary.
 
 - ~~A non-selectable procedure in FROM answers `[]`~~ — *fixed, with a
   stated surface* (`qa/serve-real-nosuspend.sh`). Selectability is
