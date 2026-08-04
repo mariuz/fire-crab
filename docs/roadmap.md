@@ -1668,6 +1668,50 @@ pulled by the fetch.
   needs the planner to bind N names at once rather than one; the
   refusals it still carries are listed with it.
 
+- **R8 — the fetch PULLS the tree.** *(the walk exists)* R1-R7 built
+  the tree and retired the rewriting it replaced, but every node
+  returned a `Vec`, so this programme's own sentence — "built by the
+  planner and PULLED BY THE FETCH" — was half true. A node that
+  materialises cannot express the engine's laziness, and this project
+  has now measured that the laziness is OBSERVABLE, not an
+  implementation detail:
+
+  * a raiser three rows into a derived table delivers the two rows
+    before it;
+  * a SORT materialises its KEY, so a raiser in the key raises before
+    any row while one in the PROJECTION does not — `ORDER BY ID DESC`
+    delivers row 4 and then raises on row 3, in sorted order;
+  * DISTINCT and a distinct UNION block, and the engine answers no rows
+    there either.
+
+  `RowSource::for_each` walks the tree handing each row to a sink, with
+  a `Flow::Stop` a consumer can end the walk with; `rows()` is a thin
+  collecting wrapper over it, so there is ONE traversal to reason about
+  rather than two that can drift. What the split makes explicit rather
+  than incidental: `TableScan`, `IndexScan`, `Filter` and `Rows` pass
+  rows through; `Aggregate` and `Sort` BLOCK, as the engine's do;
+  `NestedLoopJoin` still materialises, because its RIGHT/FULL mirror
+  needs the whole accumulated side (`join_step`).
+
+  *No behaviour change — the gates are the proof*, which is R1's
+  standard and the right one for a step whose value is what it makes
+  possible. What it makes possible, in the order it should be taken:
+
+  1. **`FIRST n` stops the scan.** `Flow::Stop` is threaded but not yet
+     exploited: the leaves honour it by SKIPPING their remaining input
+     rather than breaking out of `for_each_record`, which needs a
+     walker that can stop. Today's early-exit is a special case in the
+     `Modified` arm; it becomes the general one.
+  2. **`NestedLoopJoin` streams for LEFT and INNER.** The probe path
+     already relies on "concatenating the per-row results IS the
+     whole-acc result" for LEFT; RIGHT and FULL keep the
+     materialisation their mirror needs.
+  3. **Projection at delivery above `Sort`** — the sorted-raiser
+     residual. The sort must carry UNPROJECTED records and project as
+     each row leaves, which is what the engine does and what a text
+     flattening would only fake. It is the last thing on this list
+     because it is the one that changes what a client SEES.
+
 ### Programme W — wire the converted subsystems in
 
 Each of these is "the model exists and is right; make the server use

@@ -1082,6 +1082,15 @@ enum Wire {
     TimestampTz,
 }
 
+/// Whether a walk should carry on. `Stop` is how a consumer ends a
+/// pull early - `FIRST n` having taken its n - without the producer
+/// knowing what the consumer wanted.
+#[derive(Clone, Copy, PartialEq)]
+enum Flow {
+    Continue,
+    Stop,
+}
+
 // ===================================================================
 // ROW SOURCES - the engine's execution shape
 //
@@ -1207,7 +1216,113 @@ impl RowSource {
     /// FIRST/ROWS wrapper can stop a scan early - which is a later
     /// slice, and is why this returns a Vec rather than an iterator
     /// today rather than pretending otherwise.
+    /// Walk this source, HANDING each row to `sink` as it is produced.
+    ///
+    /// R8: the tree exists (R1-R7) but every node returned a `Vec`, so
+    /// "built by the planner and PULLED BY THE FETCH" - this
+    /// programme's own sentence - was only half true. A node that
+    /// materialises cannot express the engine's laziness, and the
+    /// laziness is OBSERVABLE: a raiser three rows in delivers the two
+    /// rows before it, and `FIRST 1` stops the scan rather than
+    /// filtering a materialised list.
+    ///
+    /// The split this makes explicit, rather than incidental:
+    /// `TableScan`, `IndexScan`, `Filter` and `Rows` PASS ROWS THROUGH;
+    /// `Aggregate` and `Sort` are BLOCKING - the engine's are too, which
+    /// is why a raiser in a sort KEY raises before any row while one in
+    /// the projection does not - and `NestedLoopJoin` materialises for
+    /// now because its RIGHT/FULL mirror needs the whole accumulated
+    /// side (see [join_step]).
+    ///
+    /// `Flow::Stop` lets a consumer end the walk; the leaves honour it
+    /// by skipping the rest of their input rather than by breaking out
+    /// of [for_each_record], which is the next slice's work.
+    fn for_each(
+        &self,
+        db: &Database,
+        sink: &mut dyn FnMut(Vec<Value>) -> Result<Flow, EvalErr>,
+    ) -> Result<Flow, EvalErr> {
+        match self {
+            RowSource::TableScan { rel, formats, width } => {
+                let mut flow = Flow::Continue;
+                let mut err: Option<EvalErr> = None;
+                for_each_record(db, *rel, formats, |values| {
+                    if matches!(flow, Flow::Stop) || err.is_some() {
+                        return;
+                    }
+                    let mut row = values.to_vec();
+                    if let Some(w) = width {
+                        row.resize(*w, Value::Null);
+                    }
+                    match sink(row) {
+                        Ok(f) => flow = f,
+                        Err(e) => err = Some(e),
+                    }
+                });
+                match err {
+                    Some(e) => Err(e),
+                    None => Ok(flow),
+                }
+            }
+            RowSource::IndexScan { rel, formats, access, width } => {
+                for values in records_for(db, *rel, formats, access) {
+                    let mut row = values;
+                    if let Some(w) = width {
+                        row.resize(*w, Value::Null);
+                    }
+                    if matches!(sink(row)?, Flow::Stop) {
+                        return Ok(Flow::Stop);
+                    }
+                }
+                Ok(Flow::Continue)
+            }
+            RowSource::Filter { input, pred } => {
+                let Some(p) = pred else { return input.for_each(db, sink) };
+                input.for_each(db, &mut |r| {
+                    // a per-row evaluation error is the engine's, raised
+                    // where the engine raises it - never a dropped row
+                    if p.matches(&r)? {
+                        sink(r)
+                    } else {
+                        Ok(Flow::Continue)
+                    }
+                })
+            }
+            RowSource::Rows(rows) => {
+                for r in rows {
+                    if matches!(sink(r.clone())?, Flow::Stop) {
+                        return Ok(Flow::Stop);
+                    }
+                }
+                Ok(Flow::Continue)
+            }
+            // the blocking and not-yet-converted nodes: one
+            // materialisation, then the same delivery every other node
+            // makes. Keeping them here rather than in `rows` is what
+            // makes `rows` a THIN wrapper and leaves one walk to change.
+            other => {
+                for r in other.rows_materialised(db)? {
+                    if matches!(sink(r)?, Flow::Stop) {
+                        return Ok(Flow::Stop);
+                    }
+                }
+                Ok(Flow::Continue)
+            }
+        }
+    }
+
+    /// Collect the whole walk. Every caller that wants a `Vec` goes
+    /// through here, so there is ONE traversal to reason about.
     fn rows(&self, db: &Database) -> Result<Vec<Vec<Value>>, EvalErr> {
+        let mut out = Vec::new();
+        self.for_each(db, &mut |r| {
+            out.push(r);
+            Ok(Flow::Continue)
+        })?;
+        Ok(out)
+    }
+
+    fn rows_materialised(&self, db: &Database) -> Result<Vec<Vec<Value>>, EvalErr> {
         match self {
             RowSource::TableScan { rel, formats, width } => {
                 let mut out = Vec::new();
