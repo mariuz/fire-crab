@@ -21343,14 +21343,35 @@ fn eval_status_vector(w: &mut W, e: &EvalErr) {
             w.int(1) // isc_arg_gds
                 .int(GDS_SING_SELECT);
         }
-        EvalErr::ConversionError(arg) => {
+        // AN ARGUMENT-LESS CONVERSION ERROR IS NOT ONE. The engine's
+        // message for isc_convert_error is "Conversion error from
+        // string @1" and it always fills the slot, so shipping the
+        // gdscode without an isc_arg_string makes every client render
+        // the TEMPLATE: `Conversion error from string "@1"`, which is
+        // what a view over an unplannable body answered. The None arm
+        // is not a conversion failure at all - it is what a dozen
+        // "this shape is outside the surface" sites reach for when
+        // they have no error of their own to raise (the honest example
+        // is [branch_rows], whose Option loses a real EvalErr on the
+        // way out and leaves the caller inventing this one).
+        //
+        // So it degrades to the generic vector, by the rule this
+        // server already follows for the identity verdicts: a refusal
+        // it cannot justify must be GENERIC, because a confident wrong
+        // answer is the one a driver acts on. Filling the argument at
+        // those sites - or giving branch_rows a real error channel -
+        // is the fix that makes them typed again.
+        EvalErr::ConversionError(Some(text)) => {
             w.int(1) // isc_arg_gds
-                .int(GDS_CONVERT_ERROR);
-            if let Some(text) = arg {
+                .int(GDS_CONVERT_ERROR)
                 // isc_arg_string travels as an XDR counted string, and
                 // the engine escapes the unprintable bytes on the way in
-                w.int(2).bytes(conversion_error_arg(text).as_bytes());
-            }
+                .int(2)
+                .bytes(conversion_error_arg(text).as_bytes());
+        }
+        EvalErr::ConversionError(None) => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_DSQL_ERROR);
         }
         EvalErr::IntegerOverflow => {
             w.int(1) // isc_arg_gds

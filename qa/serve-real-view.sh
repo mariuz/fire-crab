@@ -38,16 +38,26 @@ mkdir -p "$D"; rm -f "$DB"
 CREATE DATABASE '$DB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE T (ID INTEGER NOT NULL PRIMARY KEY, A INTEGER, S VARCHAR(10), N NUMERIC(9,2));
 COMMIT;
+CREATE TABLE TT (T VARCHAR(20));
+COMMIT;
+INSERT INTO TT VALUES ('1 2');
 INSERT INTO T VALUES (1, 10, 'x', 12.50);
 INSERT INTO T VALUES (2, 20, 'y', 1.25);
 INSERT INTO T VALUES (3, 30, 'z', 13.50);
 INSERT INTO T VALUES (4, NULL, NULL, NULL);
+
 COMMIT;
 CREATE VIEW V AS SELECT ID, A, S FROM T;
 CREATE VIEW VW AS SELECT ID, A FROM T WHERE A > 15;
 CREATE VIEW VR (K, VAL) AS SELECT ID, A FROM T;
 CREATE VIEW VRW (K, VAL) AS SELECT ID, A FROM T WHERE A IS NOT NULL;
 CREATE VIEW VSUB AS SELECT ID, N FROM T;
+-- a body this server plans but cannot ANSWER: the semi-join's key
+-- is a text column against a numeric one, which the engine reads
+-- leniently here (its plan for a view body is two plain plans, NOT
+-- a hash) and fire-crab refuses. The refusal is the recorded
+-- boundary; what is gated below is its SHAPE.
+CREATE VIEW VKEY AS SELECT ID, A FROM T WHERE A IN (SELECT T FROM TT);
 COMMIT;
 EOF
 
@@ -166,5 +176,60 @@ for q in 'SELECT ID, W FROM VJ ORDER BY ID' 'SELECT COUNT(*) FROM VJ' \
         fail=1
     fi
 done
+
+# --- a refusal must not ship a message template ------------------------
+# An argument-less isc_convert_error renders as the ENGINE'S TEMPLATE on
+# every client - `Conversion error from string "@1"`, the slot unfilled -
+# because the engine always fills that slot and the client only has the
+# template. fire-crab reached for that gdscode wherever a shape was
+# outside its surface and it had no error of its own (branch_rows returns
+# an Option, so a real EvalErr is LOST on the way out and the caller
+# invents one), so a view it cannot answer said `@1` at the user.
+#
+# A refusal this server cannot justify must be GENERIC - the same rule
+# the identity vectors follow. The engine ANSWERS this view, so the
+# refusal itself stays a recorded boundary; the template must not.
+out=$(printf 'SET HEADING OFF;\nSELECT ID, A FROM VKEY;\n' |
+      "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
+case "$out" in
+    *"@1"*)
+        echo "DIFF a refused view leaked the message template: [$out]"; fail=1 ;;
+    *"Dynamic SQL Error"*)
+        echo "OK   a view fire-crab cannot answer refuses GENERICALLY, no template" ;;
+    *)
+        # answering it is BETTER than refusing - the engine does - but
+        # then the rows must be the engine's
+        en=$(printf 'SET HEADING OFF;\nSELECT ID, A FROM VKEY;\n' |
+             "$ISQL" -q -user "$U" -pas "$P" "$DB" 2>&1 | tr -s ' \n' ' ')
+        if [ "$out" = "$en" ]; then
+            echo "OK   a view over a semi-join key now ANSWERS, and matches"
+        else
+            echo "DIFF VKEY answered [$out], engine [$en]"; fail=1
+        fi ;;
+esac
+# and a REAL conversion error still carries its string. The semi-join's
+# key is unconvertible and BOTH streams have rows, which is when the
+# engine's hash build reads it and raises.
+same "a real conversion error keeps its argument" \
+     "SELECT ID FROM T WHERE A IN (SELECT T FROM TT)"
+# RECORDED, found by the check that used to sit here: a same-side filter
+# that EMPTIES the outer silences the engine's raise, because the hash is
+# never built - `WHERE A = '1 2' AND A IN (SELECT T FROM TT)` answers []
+# there (the literal reads leniently as 12, which matches no row) and
+# raises here. fire-crab's key raiser is ungated by the outer going
+# empty. It is the same family as the FALSE-conjunct cell the invariant
+# pass already handles, one step weaker: not a constant-false conjunct,
+# just a filter that happens to match nothing.
+out=$(printf 'SET HEADING OFF;\nSELECT ID FROM T WHERE A = '"'"'1 2'"'"' AND A IN (SELECT T FROM TT);\n' |
+      "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
+en=$(printf 'SET HEADING OFF;\nSELECT ID FROM T WHERE A = '"'"'1 2'"'"' AND A IN (SELECT T FROM TT);\n' |
+     "$ISQL" -q -user "$U" -pas "$P" "$DB" 2>&1 | tr -s ' \n' ' ')
+if [ "$out" = "$en" ]; then
+    echo "OK   an emptied outer silences the key raise (both [$en])"
+else
+    echo "BOUND an emptied outer silences the engine's key raise, not ours"
+    echo "      engine: [$en]"
+    echo "      fc:     [$out]"
+fi
 
 exit $fail

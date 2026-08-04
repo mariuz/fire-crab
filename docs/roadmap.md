@@ -1061,6 +1061,39 @@ four; R7 is the removal of what they replaced.
   `qa/serve-real-textcolcmp.sh` grew the whole matrix (115 checks, 17
   of them DIFF against the pre-fix binary).
 
+- ~~A refusal ships the engine's MESSAGE TEMPLATE at the user~~ —
+  *closed at the responder*. `EvalErr::ConversionError(None)` shipped
+  `isc_convert_error` with NO `isc_arg_string`, and the engine's text
+  for that code is "Conversion error from string @1" — so the CLIENT
+  rendered the unfilled slot: node-firebird printed `"@1"` and isql
+  `"<Missing arg #1 - possibly status vector overflow>"`. A view whose
+  body this server cannot answer said that at the user.
+
+  The `None` arm was never a conversion failure: a dozen "this shape is
+  outside the surface" sites reach for it when they have no error of
+  their own, the honest example being `branch_rows`, whose `Option`
+  return LOSES a real `EvalErr` on the way out and leaves the caller
+  inventing one. It degrades to the generic vector now, by the rule the
+  identity verdicts already follow — **a refusal this server cannot
+  justify must be GENERIC, because a confident wrong answer is the one
+  a driver acts on**. A conversion error that HAS its string is
+  untouched and still matches the engine byte for byte.
+  `qa/serve-real-view.sh` gates both halves (29 checks, 1 DIFF against
+  the pre-fix binary). *Follow-ups, both now precisely sized*: give
+  `branch_rows` a real error channel (13 call sites) so those sites can
+  be typed again, and keep the strict grammar out of a view body (13
+  call sites on `plan_query_inner`), which is what makes this view
+  refuse at all — the engine plans a view body's semi-join as two plain
+  plans, never a hash.
+
+  *Found by a control while gating it, and pinned there*: a same-side
+  filter that EMPTIES the outer silences the engine's key raise, because
+  the hash is never built. `WHERE A = '1 2' AND A IN (SELECT T FROM TT)`
+  answers `[]` on the engine — the literal reads leniently as 12 and
+  matches no row — and raises here. One step weaker than the
+  FALSE-conjunct cell the invariant pass already handles: not a constant
+  false, just a filter that matches nothing.
+
 - ~~A DML `SET` list's evaluation failure answers 42000 where the engine
   answers 22012~~ — *closed, one line, and the interesting part is why
   it lived so long*. `ExecErr` has carried an `Eval(EvalErr)` arm since
@@ -1173,7 +1206,40 @@ four; R7 is the removal of what they replaced.
   (339 and 36 checks; 8 and 14 DIFF against the same tree with the
   marking disabled — the dmlsubq half being WRONG WRITES, visible only
   because every phase is re-read through the ENGINE).
-  **Recorded, not fixed: the engine hashes an INNER JOIN's key too.**
+  **The INNER JOIN's hash key, now MEASURED (its law, ready to build).**
+  `SET PLANONLY ON` confirms the split: `J1 JOIN J2 ON J2.T = J1.A` and
+  the comma spelling are `PLAN HASH`, a LEFT JOIN of the same pair is
+  `PLAN JOIN`, and a semi-join inside a VIEW BODY is neither — two
+  plain plans. So the strict grammar reaches the first two and must NOT
+  reach the other two (fire-crab answers the hashed pair today and is
+  over-strict inside the view body, where its message even leaks the
+  raw `@1` template slot).
+
+  The GATING, probed cell by cell, and two of these rule out the
+  obvious implementation:
+  * both sides non-empty → RAISES; either side EMPTY → no raise, count
+    0. So it is not a prepare-time refusal.
+  * **it raises with NO MATCHING PAIR AT ALL** (`N1 = {12, 999}` against
+    `S1 = {'1 2', '34'}` raises) — the hash BUILD reads the key, so a
+    per-pair comparison is the wrong unit of evaluation, or at least
+    must not be gated on matching.
+  * **filtering the bad row off its OWN stream silences it**: `... ON
+    S1.T = N1.A AND S1.T = '34'` answers 0, and so does the derived
+    spelling `JOIN (SELECT T FROM S1 WHERE T = '34') X`. The engine
+    applies a single-side conjunct to that stream BEFORE the hash — the
+    same pushdown `side_filter` already implements for the partnerless
+    ON raiser, which is where the implementation should start.
+  * a FALSE sibling conjunct (`AND 1=0`) silences it, which the
+    invariant pass gives for free.
+
+  Not built yet: it needs a strict twin of the `Expr::TextNum` wrap
+  (with arms in all of `type_of`/`rank_of`/`result_scale`/`eval`, per
+  this file's own law about new variants), the boundary equality of an
+  INNER or comma join rewritten to use it, and same-side ON conjuncts
+  pushed onto their stream first. Its own slice; the measurement above
+  is the expensive half and is done.
+
+  **The older note, kept:**
   `FROM TNI JOIN TK ON TK.S = TNI.N` and the comma spelling both raise
   on the engine and answer here, at HEAD as well as after this fix — the
   join path compares those two columns per row with the lenient
