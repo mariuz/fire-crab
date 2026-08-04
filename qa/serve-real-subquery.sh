@@ -162,29 +162,31 @@ same "a scalar subquery over a view" "SELECT ID FROM A WHERE ID = (SELECT MIN(AI
 same "an aggregate over a view"      "SELECT ID FROM A WHERE ID < (SELECT MAX(AID) FROM VB) ORDER BY ID"
 same "IN over a UNION"               "SELECT ID FROM A WHERE ID IN (SELECT AID FROM B UNION SELECT ID FROM B) ORDER BY ID"
 same "IN over a JOIN"                "SELECT ID FROM A WHERE ID IN (SELECT B.AID FROM B JOIN A ON A.ID = B.AID) ORDER BY ID"
-# RECORDED BOUNDARY: a CORRELATED subquery over a view. Its WHERE names
-# the OUTER row, so it is not a statement on its own and the planned
-# fallback cannot take it; the relation path still owns it, and that
-# path refuses a view. The engine answers. Closing it means splitting
-# the correlation against the VIEW'S OUTPUT columns and materialising
-# the body once - the same split the relation path does, over
-# synthesised columns rather than a rel id.
-#
-# Pinned on both sides so either moving is visible, and written as a
-# boundary rather than an equality: an equality here would have to
-# assert the refusal, which is exactly the thing that should change.
-cb=$(printf 'SET HEADING OFF;\nSELECT ID FROM A WHERE EXISTS (SELECT 1 FROM VB WHERE VB.AID = A.ID) ORDER BY ID;\n' |
-     "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
-eb=$(printf 'SET HEADING OFF;\nSELECT ID FROM A WHERE EXISTS (SELECT 1 FROM VB WHERE VB.AID = A.ID) ORDER BY ID;\n' |
-     "$ISQL" -q -user "$U" -pas "$P" "$DB" 2>&1 | tr -s ' \n' ' ')
-case "$cb" in
-    *"Dynamic SQL Error"*) echo "BOUND a correlated subquery over a view refuses here; engine: [$eb]" ;;
-    *) if [ "$cb" = "$eb" ]; then
-           echo "OK   a correlated subquery over a view now ANSWERS, and matches"
-       else
-           echo "DIFF correlated-over-view answered [$cb], engine [$eb]"; fail=1
-       fi ;;
-esac
+# A CORRELATED subquery over a view. Its WHERE names the OUTER row, so
+# it is not a statement on its own - but its SOURCE is, and that was
+# the only part the relation path could not walk. The source is planned
+# and materialised once, then the correlation splits against its OUTPUT
+# columns exactly as it splits against a relation's, which is what
+# makes these agree with the engine on NULLs and on the residual WHERE.
+same "correlated EXISTS over a view" \
+     "SELECT ID FROM A WHERE EXISTS (SELECT 1 FROM VB WHERE VB.AID = A.ID) ORDER BY ID"
+same "correlated NOT EXISTS over a view" \
+     "SELECT ID FROM A WHERE NOT EXISTS (SELECT 1 FROM VB WHERE VB.AID = A.ID) ORDER BY ID"
+same "correlated over a view with its own WHERE" \
+     "SELECT ID FROM A WHERE EXISTS (SELECT 1 FROM VBW WHERE VBW.AID = A.ID) ORDER BY ID"
+same "correlated over a view with RENAMED columns" \
+     "SELECT ID FROM A WHERE EXISTS (SELECT 1 FROM VBR WHERE VBR.K = A.ID) ORDER BY ID"
+same "correlated with a residual WHERE beside the correlation" \
+     "SELECT ID FROM A WHERE EXISTS (SELECT 1 FROM VB WHERE VB.AID = A.ID AND VB.AID > 1) ORDER BY ID"
+same "correlated through an ALIAS on the view" \
+     "SELECT ID FROM A WHERE EXISTS (SELECT 1 FROM VB V WHERE V.AID = A.ID) ORDER BY ID"
+same "the NULL row: a correlated match against a NULL outer value" \
+     "SELECT ID FROM A WHERE EXISTS (SELECT 1 FROM VB WHERE VB.AID = A.N) ORDER BY ID"
+# the controls that must not move: the same correlations over a TABLE
+same "control: correlated EXISTS over the base table" \
+     "SELECT ID FROM A WHERE EXISTS (SELECT 1 FROM B WHERE B.AID = A.ID) ORDER BY ID"
+same "control: correlated NOT EXISTS over the base table" \
+     "SELECT ID FROM A WHERE NOT EXISTS (SELECT 1 FROM B WHERE B.AID = A.ID) ORDER BY ID"
 
 # non-vacuity: a subquery filter must not just return every row
 all=$(printf 'SET HEADING OFF;\nSELECT COUNT(*) FROM A;\n' |

@@ -28786,10 +28786,110 @@ fn eval_subquery(
     // A CORRELATED subquery is not attempted here: its WHERE names the
     // outer row, so it is not a statement on its own, and the
     // correlation split above is what makes it one.
-    if corr.is_some() {
+    match corr {
+        None => eval_subquery_planned(sql, db, db_opt, existence_only),
+        // A CORRELATED subquery is not a statement on its own - its
+        // WHERE names the outer row - but its SOURCE is, and that is
+        // the only part the relation path could not walk. So the source
+        // is planned and materialised ONCE, and the correlation split
+        // then runs against the source's OUTPUT columns exactly as it
+        // runs against a relation's.
+        Some(outer_cols) => {
+            eval_subquery_corr_planned(sql, db, db_opt, outer_cols, outer_bind)
+        }
+    }
+}
+
+/// A CORRELATED subquery whose FROM this server cannot walk as a
+/// relation - today a VIEW. See the fallback comment in [eval_subquery].
+///
+/// The rows come from the planned source; everything after that is the
+/// relation path's own logic over [derived_view]'s synthesised columns,
+/// which is what makes the two agree on NULLs, on the residual WHERE
+/// and on what a semi-join collects.
+fn eval_subquery_corr_planned(
+    sql: &str,
+    db: &Database,
+    db_opt: &Option<Database>,
+    outer_cols: &[RelationColumn],
+    outer_bind: Option<&ColBinding<'_>>,
+) -> Option<SubqRows> {
+    let (_proj_s, table_s, where_s, group_s, having_s, order_s) = split_query(sql)?;
+    if group_s.is_some() || having_s.is_some() || order_s.is_some() {
         return None;
     }
-    eval_subquery_planned(sql, db, db_opt, existence_only)
+    let (from, join) = parse_from(table_s)?;
+    if !join.is_empty() {
+        return None;
+    }
+    let table = from.table;
+    // the same two-way catalog check every nested FROM gets
+    if !relation_qualifier_ok(db, from.schema, table) {
+        return None;
+    }
+    // only a view for now: a derived table in a correlated subquery
+    // would need its inner text planned here too, which is the same
+    // machinery pointed at a different source
+    let (inner_plan, inner_cols) = plan_view(db_opt, db, table)?;
+    let (columns, descs) = derived_view(&inner_cols);
+    let ws = where_s?; // a correlated subquery needs a WHERE to correlate
+    if !extract_subqueries(ws)?.1.is_empty() {
+        return None; // a subquery inside the subquery
+    }
+    let toks = tokenize(ws)?;
+    let (corr_fid, _outer_name, residual) =
+        split_correlation(&toks, table, from.alias, &columns, outer_cols, outer_bind)?;
+    // the inner name/alias qualifiers come off the residual, as they do
+    // in the relation path - the split needed them, the resolver does not
+    let inner_names: Vec<&str> = match from.alias {
+        Some(a) => vec![table, a],
+        None => vec![table],
+    };
+    let residual = residual.map(|toks| {
+        toks.into_iter()
+            .map(|t| match t {
+                Tok::Ident(n) => {
+                    let bare = n.rsplit('.').next().unwrap_or(&n).to_string();
+                    match n.rsplitn(2, '.').nth(1) {
+                        Some(q) if inner_names.iter().any(|m| m.eq_ignore_ascii_case(q)) => {
+                            Tok::Ident(bare)
+                        }
+                        _ => Tok::Ident(n),
+                    }
+                }
+                other => other,
+            })
+            .collect::<Vec<Tok>>()
+    });
+    let filter = match &residual {
+        None => None,
+        Some(toks) => {
+            if toks.iter().any(|t| matches!(t, Tok::Param)) {
+                return None; // a `?` here claims no outer slot
+            }
+            let mut np = 0usize;
+            let raw = parse_predicate(toks, &mut np)?;
+            if np != 0 {
+                return None;
+            }
+            let mut sink: Vec<Option<Descriptor>> = Vec::new();
+            Some(resolve_predicate(raw, &columns, &descs, &mut sink)?)
+        }
+    };
+    let rows = branch_rows_res(&inner_plan, db, &[]).ok()?;
+    let mut values = Vec::new();
+    let mut any = false;
+    for r in &rows {
+        match filter.as_ref().map_or(Ok(true), |p| p.matches(r)) {
+            Ok(true) => {
+                any = true;
+                values.push(r.get(corr_fid).cloned().unwrap_or(Value::Null));
+            }
+            Ok(false) => {}
+            Err(_) => return None, // the relation path refuses here too
+        }
+    }
+    Some(SubqRows { values, any })
 }
 
 /// The uncorrelated subquery as a PLANNED STATEMENT: one column, its

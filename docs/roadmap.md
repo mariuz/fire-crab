@@ -653,15 +653,34 @@ four; R7 is the removal of what they replaced.
   catalog check lives at the top-level FROM), the semi-join key is
   still read strictly, and NOT IN stays lenient.
 
-  *Recorded boundary*: a CORRELATED subquery over a view still refuses,
-  where the engine answers. Its WHERE names the OUTER row, so it is not
-  a statement on its own and the fallback cannot take it; the relation
-  path owns it and cannot walk a view. Closing it means splitting the
-  correlation against the VIEW'S OUTPUT columns — the same split the
-  relation path does, over synthesised columns rather than a rel id.
-  Pinned in the gate with both sides printed, deliberately NOT as an
-  equality: an equality there would have to assert the refusal, which
-  is the thing that should change.
+  *That increment's recorded boundary — a CORRELATED subquery over a
+  view — closed in the next one*, and the reason it was reachable is
+  worth stating: "correlated" and "not a plain table" are SEPARATE
+  limitations, and only the second was structural. A correlated
+  subquery is not a statement on its own, but its SOURCE is, and the
+  source was the only part the relation path could not walk. So the
+  source is planned and materialised once, and the correlation then
+  splits against its OUTPUT columns (`derived_view`, the same helper
+  the top-level planner uses for a derived table) exactly as it splits
+  against a relation's — which is what makes the two paths agree on
+  NULLs, on a residual conjunct beside the correlation, and on what a
+  semi-join collects. Seven shapes gated, plus two base-table controls
+  that pass on BOTH binaries; 7 DIFF against the pre-fix binary, one
+  per shape.
+
+  **The boundary check is why this was cheap to pick up.** It was
+  written as a `case` accepting the refusal OR a matching answer, with
+  both sides printed — so when the fix landed it printed *"a correlated
+  subquery over a view now ANSWERS, and matches"* by itself. That is
+  the right shape for a boundary you EXPECT to close: it records
+  today's behaviour without blessing it. It is the opposite of the
+  two-branch check corrected in `serve-real-view.sh`, where the
+  engine's answer was already known and the second branch only made the
+  check blind.
+
+  *Still open*: a DERIVED TABLE in a correlated subquery — the same
+  machinery pointed at a different source. The function refuses it
+  explicitly rather than guessing.
 
 - ~~A non-selectable procedure in FROM answers `[]`~~ — *fixed, with a
   stated surface* (`qa/serve-real-nosuspend.sh`). Selectability is
