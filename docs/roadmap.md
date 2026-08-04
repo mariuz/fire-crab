@@ -1168,11 +1168,45 @@ four; R7 is the removal of what they replaced.
   NOT raise) passing on both binaries so the section cannot pass by
   failing everything.
 
-  *Recorded beside it, unfixed*: the engine EMITS ROW 1 and then raises,
-  where fire-crab materialises the derived table and raises before any
-  row ships. Both report the same error, so a row-set comparison agrees
-  and the gates are green — it is the lazy-cursor divergence this file
-  already records for `FIRST n`, in a second place.
+  ~~*Recorded beside it*: the engine EMITS ROW 1 and then raises~~ —
+  *closed for the shapes that do not block*, and the probing is what
+  made it small. The law is finer than "materialise or stream":
+
+      derived, raiser on row 3   ->  rows 1,2 then the raise
+      ORDER BY ID DESC           ->  row 4 then the raise on row 3
+      raiser IN the sort key     ->  no rows at all
+      DISTINCT                   ->  no rows at all
+      UNION ALL                  ->  all of branch 1, then branch 2
+                                     up to its raiser
+
+  `ORDER BY ID DESC` is the decisive cell: the plan says `SORT` and rows
+  still arrive, in SORTED order. **A sort materialises its KEY, not the
+  projection** — the select-list expression is evaluated as each row is
+  DELIVERED — while a raiser in the KEY, or under DISTINCT, must fire
+  before anything, because every key has to exist before the first
+  delivery.
+
+  That maps onto what this server already does: `src.rows(db)`
+  materialises RECORDS (sort included) and the projection runs after.
+  So `branch_rows_each` only had to PUSH each projected row as it is
+  produced, and the derived and `UNION ALL` emit paths stream through
+  it; the blocking shapes fall through to the collecting path, which is
+  the faithful reading there rather than a shortcut.
+  `qa/serve-real-derived.sh` 52 → 57 (+2 boundaries), 3 DIFF against
+  the pre-fix binary.
+
+  **These checks cannot go through node-firebird**: it buffers the whole
+  result, so a partial delivery and a clean refusal look identical to
+  it. isql prints rows as they arrive and is the only oracle, so the
+  section compares whole session text.
+
+  *Two residuals, both pinned*: an outer ORDER BY over a derived table
+  still blocks here, because the engine FLATTENS the derived table into
+  one pipeline and sorts base records while fire-crab's outer sort is a
+  real blocking node over already-projected rows; and on the blocking
+  shapes the engine raises at OPEN where fire-crab announces the result
+  set and raises at the first FETCH (one blank line in isql, the same
+  lazy/eager split one level up, pre-existing).
 
 - ~~The strict grammar reaches a VIEW BODY, where the engine does not
   hash~~ — *closed, and it cost two edits rather than the thirteen the

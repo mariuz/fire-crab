@@ -17119,6 +17119,69 @@ fn branch_rows_res(
     Ok(out)
 }
 
+/// [branch_rows_res], PUSHING each row as it is produced instead of
+/// returning them all.
+///
+/// THE ENGINE'S CURSOR IS LAZY, and the difference is observable
+/// through an error: `SELECT * FROM (SELECT ID, 10/(ID-3) AS Q FROM T)
+/// X` delivers rows 1 and 2 and THEN raises on row 3, where collecting
+/// the inner rows first raises before any row ships. Probed further,
+/// the rule is finer than "materialise or not":
+///
+/// * a SORT materialises its KEY, not the projection - `ORDER BY ID
+///   DESC` over the same query delivers row 4 and then raises on row 3,
+///   in SORTED order, because the select-list expression is evaluated
+///   as each row is DELIVERED;
+/// * a raiser IN THE SORT KEY, or under DISTINCT, raises before any row
+///   at all, because every key must exist before the first delivery.
+///
+/// That is exactly the shape below: the record source materialises
+/// (sort included), and the PROJECTION runs per row on the way out. The
+/// only thing this adds over the collecting version is that the sink
+/// has already seen the earlier rows when a later one raises.
+fn branch_rows_each(
+    plan: &Plan,
+    db: &Database,
+    args: &[WireParam],
+    sink: &mut dyn FnMut(Vec<Value>) -> Result<(), EvalErr>,
+) -> Result<(), EvalErr> {
+    // UNION ALL is a pipeline of pipelines: the engine delivers every
+    // row of branch 1, then branch 2's rows up to its raiser (probed).
+    // A DISTINCT union blocks instead, and falls through to the
+    // collecting path below with the rest of the blocking shapes.
+    if let Plan::Union { branches, distinct: false, order_by: None, .. } = plan {
+        for b in branches {
+            branch_rows_each(b, db, args, sink)?;
+        }
+        return Ok(());
+    }
+    if let Plan::Project { rel, formats, cols, filter, order_by, index, .. } = plan {
+        let filter = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
+        let src = RowSource::scan_filter_sort(
+            *rel,
+            formats.clone(),
+            filter,
+            order_by.clone(),
+            index.clone(),
+        );
+        for values in &src.rows(db)? {
+            let mut row = Vec::with_capacity(cols.len());
+            for c in cols {
+                row.push(c.value_of(values)?);
+            }
+            sink(row)?;
+        }
+        return Ok(());
+    }
+    // everything else - grouped, distinct, sorted unions, procedure
+    // rows - is a BLOCKING shape on the engine too, so collecting it
+    // first is the faithful reading, not a shortcut
+    for row in branch_rows_res(plan, db, args)? {
+        sink(row)?;
+    }
+    Ok(())
+}
+
 /// Two projected rows are the same row for UNION's set semantics -
 /// compared column by column, with NULL equal to NULL (a set operation
 /// treats them as the same value, unlike `= NULL` in a predicate).
@@ -22030,6 +22093,24 @@ fn emit_rows_inner(
         }
         Plan::Union { cols, branches, distinct, order_by } => {
             if let Some(db) = db {
+                // UNION ALL WITHOUT AN ORDER BY IS A PIPELINE OF
+                // PIPELINES: the engine delivers every row of branch 1,
+                // then branch 2's rows up to its raiser (probed - the
+                // whole of `SELECT ID FROM T` arrives before the second
+                // branch's divide-by-zero). Nothing blocks, so nothing
+                // is collected. DISTINCT and ORDER BY are blocking
+                // nodes and take the collecting path below, which is
+                // what the engine does there too: both answer no rows
+                // at all before the raise.
+                if !*distinct && order_by.is_none() {
+                    for b in branches {
+                        branch_rows_each(b, db, args, &mut |row| {
+                            encode_row(w, cols, &row, out)
+                        })
+                        .map_err(EmitErr::Eval)?;
+                    }
+                    return Ok(());
+                }
                 let mut rows: Vec<Vec<Value>> = Vec::new();
                 for b in branches {
                     // a branch that RAISES raises the union, with its
@@ -22216,19 +22297,41 @@ fn emit_rows_inner(
                 // the inner plan's rows are a MATERIALISED LEAF; the
                 // outer WHERE and ORDER BY are nodes above it - the same
                 // Rows -> Filter -> Sort the grouped join builds
-                // the inner rows' OWN error, not an invented one
-                let rows = branch_rows_res(inner, db, args).map_err(EmitErr::Eval)?;
-                let sorted = RowSource::Sort {
-                    input: Box::new(RowSource::Filter {
-                        input: Box::new(RowSource::Rows(rows)),
-                        pred: bind_filter(filter, args)?,
-                    }),
-                    keys: order_by.clone(),
-                }
-                .rows(db)
-                .map_err(EmitErr::Eval)?;
-                for values in &sorted {
-                    encode_row(w, cols, values, out)?;
+                let pred = bind_filter(filter, args)?;
+                if order_by.is_empty() {
+                    // NOTHING BLOCKS, so the rows go out as they are
+                    // produced - the engine delivers rows 1 and 2 of a
+                    // derived table whose row 3 raises, and collecting
+                    // them first raised before any row shipped. See
+                    // [branch_rows_each] for the probed law.
+                    //
+                    branch_rows_each(inner, db, args, &mut |row| {
+                        if pred.as_ref().map_or(Ok(true), |p| p.matches(&row))? {
+                            encode_row(w, cols, &row, out)?;
+                        }
+                        Ok(())
+                    })
+                    .map_err(EmitErr::Eval)?;
+                } else {
+                    // an ORDER BY above the derived table is a BLOCKING
+                    // node here: every inner row must exist before the
+                    // first can be delivered. The engine flattens the
+                    // derived table into ONE pipeline and sorts the base
+                    // records, so it still delivers rows before a raiser
+                    // in the inner projection - recorded, not matched.
+                    let rows = branch_rows_res(inner, db, args).map_err(EmitErr::Eval)?;
+                    let sorted = RowSource::Sort {
+                        input: Box::new(RowSource::Filter {
+                            input: Box::new(RowSource::Rows(rows)),
+                            pred,
+                        }),
+                        keys: order_by.clone(),
+                    }
+                    .rows(db)
+                    .map_err(EmitErr::Eval)?;
+                    for values in &sorted {
+                        encode_row(w, cols, values, out)?;
+                    }
                 }
             }
         }

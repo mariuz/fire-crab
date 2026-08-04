@@ -295,12 +295,84 @@ both "control: a union that does not raise" \
 both "control: a derived table with a division that succeeds" \
      "SELECT * FROM (SELECT ID, 100/ID AS Q FROM EMP) X ORDER BY ID"
 
+
+# --- THE CURSOR IS LAZY: rows before the raise ------------------------
+# The engine delivers the rows that PRECEDE a raiser and then raises;
+# collecting the inner rows first raised before any row shipped. Probed,
+# the law is finer than "materialise or not":
+#
+#   ORDER BY ID DESC over a raising projection  -> row 4, THEN the raise
+#                                                  (the SORT materialises
+#                                                   its KEY, and the
+#                                                   projection is
+#                                                   evaluated at DELIVERY)
+#   a raiser IN THE SORT KEY, or DISTINCT       -> no rows at all
+#   UNION ALL                                   -> every row of branch 1,
+#                                                  then branch 2 up to its
+#                                                  raiser
+#
+# THESE CANNOT BE CHECKED THROUGH node-firebird: it buffers the whole
+# result, so a partial delivery and a clean refusal look identical to
+# it. isql prints rows as they arrive, which is the only oracle here -
+# so `stream` compares the WHOLE session text, rows and error together.
+stream() { # <label> <sql>
+    ran=$((ran + 1))
+    a=$(printf 'SET HEADING OFF;\n%s;\n' "$2" |
+        "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 | tr -s ' \n' ' ')
+    b=$(printf 'SET HEADING OFF;\n%s;\n' "$2" |
+        "$ISQL" -q -user "$U" -pas "$P" "$B" 2>&1 | tr -s ' \n' ' ')
+    if [ "$a" = "$b" ]; then
+        echo "OK   $1"
+    else
+        echo "DIFF $1"; echo "     engine: [$b]"; echo "     fc:     [$a]"; fail=1
+    fi
+}
+stream "a derived table delivers the rows before its raiser" \
+       "SELECT * FROM (SELECT ID, 10/(ID-3) AS Q FROM EMP) X"
+stream "the same with a WHERE above it" \
+       "SELECT * FROM (SELECT ID, 10/(ID-3) AS Q FROM EMP) X WHERE ID < 5"
+stream "UNION ALL delivers branch 1 whole, then branch 2 up to its raiser" \
+       "SELECT ID FROM EMP UNION ALL SELECT 10/(ID-3) FROM EMP"
+stream "control: a derived table with no raiser" \
+       "SELECT * FROM (SELECT ID, SALARY FROM EMP) X"
+stream "control: a UNION ALL with no raiser" \
+       "SELECT ID FROM EMP UNION ALL SELECT SALARY FROM EMP"
+# THE BLOCKING SHAPES. Neither side delivers a row, which is the
+# substantive half and is what `blocks` asserts. What differs is one
+# blank line: the engine raises at OPEN, before isql prints anything,
+# while fire-crab announces the result set and raises at the first
+# FETCH - the same lazy/eager split one level up, pre-existing (the
+# HEAD binary does it too) and recorded rather than folded in here.
+blocks() { # <label> <sql>
+    ran=$((ran + 1))
+    a=$(printf 'SET HEADING OFF;\n%s;\n' "$2" |
+        "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 | tr -s ' \n' ' ')
+    b=$(printf 'SET HEADING OFF;\n%s;\n' "$2" |
+        "$ISQL" -q -user "$U" -pas "$P" "$B" 2>&1 | tr -s ' \n' ' ')
+    # no DATA row on either side: everything before the failure is blank
+    ar=$(printf '%s' "$a" | sed 's/Statement failed.*//' | tr -d ' ')
+    br=$(printf '%s' "$b" | sed 's/Statement failed.*//' | tr -d ' ')
+    if [ -n "$ar" ] || [ -n "$br" ]; then
+        echo "DIFF $1 - a row was delivered before the raise"
+        echo "     engine: [$b]"; echo "     fc:     [$a]"; fail=1
+    elif [ "$a" = "$b" ]; then
+        echo "OK   $1"
+    else
+        echo "BOUND $1 - neither delivers a row; fire-crab announces the"
+        echo "      result set first (raises at FETCH, the engine at OPEN)"
+    fi
+}
+blocks "DISTINCT blocks - no rows before the raise" \
+       "SELECT DISTINCT * FROM (SELECT ID, 10/(ID-3) AS Q FROM EMP) X"
+blocks "a distinct UNION blocks" \
+       "SELECT ID FROM EMP UNION SELECT 10/(ID-3) FROM EMP"
+
 rm -f "$A" "$B"
 
 
 
-if [ "$ran" -lt 48 ]; then
-    echo "DIFF only $ran checks ran (expected at least 48) - did one silently skip?"
+if [ "$ran" -lt 55 ]; then
+    echo "DIFF only $ran checks ran (expected at least 55) - did one silently skip?"
     fail=1
 fi
 exit $fail
