@@ -625,13 +625,43 @@ four; R7 is the removal of what they replaced.
   machinery, not just every spelling. Ten laws held at the top level
   and none of them held one nesting level down.**
 
-  *Found while fixing, recorded not fixed*: a VIEW inside a nested
-  query expression answered `[]` at HEAD — **unqualified too**, where
-  the engine answers every row, because a subquery never expanded one,
-  it just scanned the view's empty storage. It REFUSES now (the same
-  fail-closed guard), which trades a wrong answer for a boundary;
-  expanding it needs the subquery evaluator to accept a planned row
-  source the way `plan_over_source` does, which is its own slice.
+  *Found while fixing, and now CLOSED*: a VIEW inside a nested query
+  expression answered `[]` at HEAD — **unqualified too** — because a
+  subquery never expanded one, it just scanned the view's empty
+  storage. It became a fail-closed refusal, and then a real answer:
+
+- ~~A subquery must be ONE PHYSICAL TABLE~~ — *closed, by planning it
+  instead of walking it*. `eval_subquery` resolved a rel id, read its
+  formats and walked its records, so every shape that is not a plain
+  table refused — a VIEW (an id with no records, hence the guard), a
+  DERIVED table, a CTE, a JOIN, a UNION. The engine answers all of
+  them.
+
+  An UNCORRELATED subquery, though, **is a statement**, so when the
+  relation path declines the text is planned as one and materialised
+  through `branch_rows_res` — the function that gained a real error
+  channel one increment earlier, so a subquery whose rows RAISE now
+  raises instead of collapsing into "unsupported". Twelve shapes closed
+  at once (`qa/serve-real-subquery.sh` 25 → 37, `qa/serve-real-view.sh`
+  31 → 34; 12 and 3 DIFF against the pre-fix binary): views plain, with
+  their own WHERE and with renamed columns; derived tables; unions;
+  joins; scalar and aggregate subqueries; in IN, NOT IN, EXISTS and
+  NOT EXISTS.
+
+  The GUARDS hold because the PLANNER enforces them rather than the
+  evaluator: a wrongly qualified view still refuses (the two-way
+  catalog check lives at the top-level FROM), the semi-join key is
+  still read strictly, and NOT IN stays lenient.
+
+  *Recorded boundary*: a CORRELATED subquery over a view still refuses,
+  where the engine answers. Its WHERE names the OUTER row, so it is not
+  a statement on its own and the fallback cannot take it; the relation
+  path owns it and cannot walk a view. Closing it means splitting the
+  correlation against the VIEW'S OUTPUT columns — the same split the
+  relation path does, over synthesised columns rather than a rel id.
+  Pinned in the gate with both sides printed, deliberately NOT as an
+  equality: an equality there would have to assert the refusal, which
+  is the thing that should change.
 
 - ~~A non-selectable procedure in FROM answers `[]`~~ — *fixed, with a
   stated surface* (`qa/serve-real-nosuspend.sh`). Selectability is

@@ -11536,7 +11536,8 @@ fn plan_upsert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     ))
 }
 
-fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
+fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
+    let db = db_outer;
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
     let masked = mask_literals(&up);
@@ -11738,7 +11739,7 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                                     .then(|| relation_schema(db, table).map(|s| (s, table)))
                                     .flatten(),
                             };
-                            resolve_subqueries(&toks, &subs, db, &columns, &bind, true)?
+                            resolve_subqueries(&toks, &subs, db, db_outer, &columns, &bind, true)?
                         };
                         folded_where = render_toks(&folded);
                         Some(folded)
@@ -11839,7 +11840,8 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
 
 /// Parse `DELETE FROM <t> [WHERE <pred>]` and resolve it. Same
 /// contract as `plan_update`: None means SQL error, never a fallback.
-fn plan_delete(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
+fn plan_delete(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
+    let db = db_outer;
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
     let masked = mask_literals(&up);
@@ -11892,7 +11894,7 @@ fn plan_delete(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                                     .then(|| relation_schema(db, table).map(|s| (s, table)))
                                     .flatten(),
                             };
-                            resolve_subqueries(&toks, &subs, db, &columns, &bind, true)?
+                            resolve_subqueries(&toks, &subs, db, db_outer, &columns, &bind, true)?
                         };
                         folded_where = render_toks(&folded);
                         Some(folded)
@@ -17880,7 +17882,7 @@ fn plan_query_inner_ctx(
                         up.ends_with("EXISTS").then(|| head.len() - "EXISTS".len())
                     });
                     if let Some(cut) = exists_at {
-                        let Some(rows) = eval_subquery(sub, dbr, None, None, true) else {
+                        let Some(rows) = eval_subquery(sub, dbr, db, None, None, true) else {
                             if trace {
                                 eprintln!("[srv] plan: EXISTS subquery {:?} not answerable", sub);
                             }
@@ -17911,7 +17913,7 @@ fn plan_query_inner_ctx(
                     // `corr: None` - a CORRELATED subquery cannot resolve
                     // its outer column here and refuses, since its value
                     // differs per row and this fold is once per statement
-                    let Some(rows) = eval_subquery(sub, dbr, None, None, false) else {
+                    let Some(rows) = eval_subquery(sub, dbr, db, None, None, false) else {
                         // not a constant - it may be CORRELATED, which
                         // is answered per row from a lookup table rather
                         // than folded into the text
@@ -18495,7 +18497,7 @@ fn plan_query_inner_ctx(
                             _ => None,
                         },
                     };
-                    let folded = resolve_subqueries(&toks, &subs, db, &columns, &bind, !in_view)?;
+                    let folded = resolve_subqueries(&toks, &subs, db, db_all, &columns, &bind, !in_view)?;
                     folded_where = render_toks(&folded);
                     Some(folded)
                 }
@@ -28759,6 +28761,73 @@ fn split_correlation(
 fn eval_subquery(
     sql: &str,
     db: &Database,
+    db_opt: &Option<Database>,
+    corr: Option<&[RelationColumn]>,
+    outer_bind: Option<&ColBinding<'_>>,
+    existence_only: bool,
+) -> Option<SubqRows> {
+    if let Some(r) = eval_subquery_rel(sql, db, corr, outer_bind, existence_only) {
+        return Some(r);
+    }
+    // THE PLANNED FALLBACK. The path above is built around ONE PHYSICAL
+    // RELATION - it resolves a rel id, reads its formats and walks its
+    // records - so every shape that is not a plain table refused: a
+    // VIEW (which has an id and no records, so it had to refuse rather
+    // than answer zero rows), a DERIVED table, a CTE, a join. The
+    // engine answers all of them.
+    //
+    // An UNCORRELATED subquery, though, is just a statement whose rows
+    // this server already knows how to plan and materialise. So when
+    // the relation path declines, the text is planned as a statement
+    // and its rows are taken through [branch_rows_res] - which, since
+    // it gained a real error channel, RAISES what the rows raise
+    // instead of collapsing to "unsupported".
+    //
+    // A CORRELATED subquery is not attempted here: its WHERE names the
+    // outer row, so it is not a statement on its own, and the
+    // correlation split above is what makes it one.
+    if corr.is_some() {
+        return None;
+    }
+    eval_subquery_planned(sql, db, db_opt, existence_only)
+}
+
+/// The uncorrelated subquery as a PLANNED STATEMENT: one column, its
+/// rows materialised. See the fallback comment in [eval_subquery].
+fn eval_subquery_planned(
+    sql: &str,
+    db: &Database,
+    db_opt: &Option<Database>,
+    existence_only: bool,
+) -> Option<SubqRows> {
+    // a `?` inside claims no outer slot, as in the relation path
+    let mut params: Vec<Option<Descriptor>> = Vec::new();
+    let plan = plan_query_inner(sql, db_opt, &mut params)?;
+    if !params.is_empty() || matches!(plan, Plan::Refused) {
+        return None;
+    }
+    // one column only - the value a scalar/IN subquery contributes.
+    // EXISTS asks only whether a row survived, so its projection may be
+    // anything (`SELECT 1` usually is not a column at all).
+    let cols = output_cols_of(&plan);
+    if !existence_only && cols.len() != 1 {
+        return None;
+    }
+    let rows = branch_rows_res(&plan, db, &[]).ok()?;
+    let any = !rows.is_empty();
+    let values = if existence_only {
+        Vec::new()
+    } else {
+        rows.iter()
+            .map(|r| r.first().cloned().unwrap_or(Value::Null))
+            .collect()
+    };
+    Some(SubqRows { values, any })
+}
+
+fn eval_subquery_rel(
+    sql: &str,
+    db: &Database,
     corr: Option<&[RelationColumn]>,
     outer_bind: Option<&ColBinding<'_>>,
     existence_only: bool,
@@ -29098,6 +29167,10 @@ fn resolve_subqueries(
     toks: &[Tok],
     subs: &[String],
     db: &Database,
+    // the same database as `db`, in the shape the PLANNER takes: the
+    // uncorrelated fallback in [eval_subquery] plans the subquery as a
+    // statement, and this is what it plans against
+    db_opt: &Option<Database>,
     outer_cols: &[RelationColumn],
     outer_bind: &ColBinding<'_>,
     // Whether a semi-join HERE is one the engine would HASH. It is, in
@@ -29159,7 +29232,7 @@ fn resolve_subqueries(
                     out.pop();
                 }
                 // try the correlated (semi-join) reading first
-                match eval_subquery(sql, db, Some(outer_cols), Some(outer_bind), true) {
+                match eval_subquery(sql, db, db_opt, Some(outer_cols), Some(outer_bind), true) {
                     Some(rows) => {
                         // the outer column the correlation named: recover
                         // it from the inner WHERE the same way
@@ -29214,7 +29287,7 @@ fn resolve_subqueries(
                     }
                     // uncorrelated: the verdict is the same for every row
                     None => {
-                        let rows = eval_subquery(sql, db, None, Some(outer_bind), true)?;
+                        let rows = eval_subquery(sql, db, db_opt, None, Some(outer_bind), true)?;
                         out.push(Tok::Const(rows.any != negated));
                     }
                 }
@@ -29227,7 +29300,7 @@ fn resolve_subqueries(
                     i += 1;
                     continue;
                 };
-                let rows = eval_subquery(subs.get(*n)?, db, None, Some(outer_bind), false)?;
+                let rows = eval_subquery(subs.get(*n)?, db, db_opt, None, Some(outer_bind), false)?;
                 if rows.values.is_empty() {
                     // `x IN (nothing)` is FALSE, `x NOT IN (nothing)`
                     // TRUE - and the column reference must go too
@@ -29260,7 +29333,7 @@ fn resolve_subqueries(
                     i += 1;
                     continue;
                 };
-                let rows = eval_subquery(subs.get(*n)?, db, None, Some(outer_bind), false)?;
+                let rows = eval_subquery(subs.get(*n)?, db, db_opt, None, Some(outer_bind), false)?;
                 // more than one row is a runtime error in the engine;
                 // refuse rather than pick one
                 if rows.values.len() != 1 {

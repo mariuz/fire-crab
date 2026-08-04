@@ -40,6 +40,12 @@ CREATE DATABASE '$DB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE A (ID INTEGER NOT NULL PRIMARY KEY, N INTEGER, S VARCHAR(10));
 CREATE TABLE B (ID INTEGER NOT NULL PRIMARY KEY, AID INTEGER, M INTEGER, T VARCHAR(10));
 COMMIT;
+-- the shapes the subquery evaluator could not reach while it was built
+-- around one physical relation
+CREATE VIEW VB AS SELECT AID FROM B;
+CREATE VIEW VBW AS SELECT AID FROM B WHERE M >= 200;
+CREATE VIEW VBR (K) AS SELECT AID FROM B;
+COMMIT;
 INSERT INTO A VALUES (1, 10, 'x');
 INSERT INTO A VALUES (2, 20, 'y');
 INSERT INTO A VALUES (3, 30, 'z');
@@ -131,6 +137,54 @@ if [ "$ni" != "$ne" ]; then
 else
     echo "DIFF NOT IN and NOT EXISTS agree - the NULL case is not being exercised"; fail=1
 fi
+
+
+# --- a subquery over something that is NOT a plain relation ------------
+# The evaluator resolved a rel id and walked its records, so a VIEW (an
+# id with NO records of its own) had to REFUSE rather than answer zero
+# rows, and a derived table or a CTE refused with it. An UNCORRELATED
+# subquery is a statement, so it is planned as one and materialised -
+# through the same branch_rows that now carries a real error.
+same "IN over a VIEW"                "SELECT ID FROM A WHERE ID IN (SELECT AID FROM VB) ORDER BY ID"
+same "IN over a view with its own WHERE" \
+     "SELECT ID FROM A WHERE ID IN (SELECT AID FROM VBW) ORDER BY ID"
+same "IN over a view with RENAMED columns" \
+     "SELECT ID FROM A WHERE ID IN (SELECT K FROM VBR) ORDER BY ID"
+same "NOT IN over a view (inner NULLs decide)" \
+     "SELECT ID FROM A WHERE ID NOT IN (SELECT AID FROM VB) ORDER BY ID"
+same "EXISTS over a view"            "SELECT ID FROM A WHERE EXISTS (SELECT 1 FROM VB) ORDER BY ID"
+same "NOT EXISTS over an empty-ish view" \
+     "SELECT ID FROM A WHERE NOT EXISTS (SELECT 1 FROM VBW WHERE AID > 99) ORDER BY ID"
+same "IN over a DERIVED table"       "SELECT ID FROM A WHERE ID IN (SELECT X FROM (SELECT AID AS X FROM B) D) ORDER BY ID"
+same "IN over a derived table with a WHERE" \
+     "SELECT ID FROM A WHERE ID IN (SELECT X FROM (SELECT AID AS X FROM B WHERE M >= 200) D) ORDER BY ID"
+same "a scalar subquery over a view" "SELECT ID FROM A WHERE ID = (SELECT MIN(AID) FROM VB) ORDER BY ID"
+same "an aggregate over a view"      "SELECT ID FROM A WHERE ID < (SELECT MAX(AID) FROM VB) ORDER BY ID"
+same "IN over a UNION"               "SELECT ID FROM A WHERE ID IN (SELECT AID FROM B UNION SELECT ID FROM B) ORDER BY ID"
+same "IN over a JOIN"                "SELECT ID FROM A WHERE ID IN (SELECT B.AID FROM B JOIN A ON A.ID = B.AID) ORDER BY ID"
+# RECORDED BOUNDARY: a CORRELATED subquery over a view. Its WHERE names
+# the OUTER row, so it is not a statement on its own and the planned
+# fallback cannot take it; the relation path still owns it, and that
+# path refuses a view. The engine answers. Closing it means splitting
+# the correlation against the VIEW'S OUTPUT columns and materialising
+# the body once - the same split the relation path does, over
+# synthesised columns rather than a rel id.
+#
+# Pinned on both sides so either moving is visible, and written as a
+# boundary rather than an equality: an equality here would have to
+# assert the refusal, which is exactly the thing that should change.
+cb=$(printf 'SET HEADING OFF;\nSELECT ID FROM A WHERE EXISTS (SELECT 1 FROM VB WHERE VB.AID = A.ID) ORDER BY ID;\n' |
+     "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
+eb=$(printf 'SET HEADING OFF;\nSELECT ID FROM A WHERE EXISTS (SELECT 1 FROM VB WHERE VB.AID = A.ID) ORDER BY ID;\n' |
+     "$ISQL" -q -user "$U" -pas "$P" "$DB" 2>&1 | tr -s ' \n' ' ')
+case "$cb" in
+    *"Dynamic SQL Error"*) echo "BOUND a correlated subquery over a view refuses here; engine: [$eb]" ;;
+    *) if [ "$cb" = "$eb" ]; then
+           echo "OK   a correlated subquery over a view now ANSWERS, and matches"
+       else
+           echo "DIFF correlated-over-view answered [$cb], engine [$eb]"; fail=1
+       fi ;;
+esac
 
 # non-vacuity: a subquery filter must not just return every row
 all=$(printf 'SET HEADING OFF;\nSELECT COUNT(*) FROM A;\n' |

@@ -226,10 +226,17 @@ notemplate() { # <label> <sql>
         *) echo "OK   $1 says nothing about @1" ;;
     esac
 }
-# a view inside a subquery is a recorded boundary (the subquery
-# evaluator takes no planned row source yet) - it may refuse, but not
-# like that
-notemplate "a view inside a subquery" "SELECT ID FROM T WHERE ID IN (SELECT ID FROM VKEY)"
+# A VIEW INSIDE A SUBQUERY used to be a recorded boundary: the subquery
+# evaluator was built around one physical relation, so a view - an id
+# with no records of its own - had to refuse rather than answer zero
+# rows. An uncorrelated subquery is a statement, though, so it is
+# planned as one and materialised; these are equalities now.
+same "a view inside a subquery" \
+     "SELECT ID FROM T WHERE ID IN (SELECT ID FROM VKEY) ORDER BY ID"
+same "a view inside an EXISTS" \
+     "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM VKEY) ORDER BY ID"
+same "a view inside a NOT IN" \
+     "SELECT ID FROM T WHERE ID NOT IN (SELECT ID FROM VKEY) ORDER BY ID"
 notemplate "a view in a derived table" "SELECT * FROM (SELECT ID FROM VKEY) X"
 notemplate "the view itself" "SELECT ID, A FROM VKEY"
 
