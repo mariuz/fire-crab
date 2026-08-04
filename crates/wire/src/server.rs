@@ -11736,7 +11736,7 @@ fn plan_update(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                                     .then(|| relation_schema(db, table).map(|s| (s, table)))
                                     .flatten(),
                             };
-                            resolve_subqueries(&toks, &subs, db, &columns, &bind)?
+                            resolve_subqueries(&toks, &subs, db, &columns, &bind, true)?
                         };
                         folded_where = render_toks(&folded);
                         Some(folded)
@@ -11890,7 +11890,7 @@ fn plan_delete(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                                     .then(|| relation_schema(db, table).map(|s| (s, table)))
                                     .flatten(),
                             };
-                            resolve_subqueries(&toks, &subs, db, &columns, &bind)?
+                            resolve_subqueries(&toks, &subs, db, &columns, &bind, true)?
                         };
                         folded_where = render_toks(&folded);
                         Some(folded)
@@ -15773,7 +15773,9 @@ fn splice_ctes(sql: &str, ctes: &[(String, ViewDef)]) -> Option<String> {
 fn plan_view(db: &Option<Database>, dbr: &Database, name: &str) -> Option<(Plan, Vec<ProjCol>)> {
     let vd = view_of(dbr, name)?;
     let mut vparams: Vec<Option<Descriptor>> = Vec::new();
-    let inner = plan_query_inner(&vd.source, db, &mut vparams)?;
+    // the body is a VIEW's, so its semi-joins are NOT hashed - see
+    // [plan_query_inner_ctx]
+    let inner = plan_query_inner_ctx(&vd.source, db, &mut vparams, true)?;
     if !vparams.is_empty() || matches!(inner, Plan::Refused) {
         return None;
     }
@@ -17139,6 +17141,30 @@ fn plan_query_inner(
     db: &Option<Database>,
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Plan> {
+    plan_query_inner_ctx(sql, db, params, false)
+}
+
+/// [plan_query_inner], told whether the text it is planning is a VIEW
+/// BODY.
+///
+/// Only one thing turns on it, and only because the ENGINE's plan does:
+/// a positive IN-subquery or correlated EXISTS in an ordinary statement
+/// becomes a semi-join the engine HASHES, and a hash key is read with
+/// the STRICT conversion grammar - but the same body inside a view is
+/// planned as two plain plans (probed with SET PLANONLY ON), so the
+/// LENIENT grammar decides there. Marking it either way is a wrong
+/// answer in the other place: strict inside a view refused
+/// `SELECT * FROM V` where the engine answers every row.
+///
+/// A wrapper rather than a thirteenth parameter on every caller: the
+/// view planner is the only site that knows, and the flag reaches
+/// exactly one call.
+fn plan_query_inner_ctx(
+    sql: &str,
+    db: &Option<Database>,
+    params: &mut Vec<Option<Descriptor>>,
+    in_view: bool,
+) -> Option<Plan> {
     let trace = std::env::var("FC_SRV_TRACE").is_ok();
     {
         let up = sql.trim().trim_end_matches(';').trim().to_ascii_uppercase();
@@ -18342,7 +18368,7 @@ fn plan_query_inner(
                             _ => None,
                         },
                     };
-                    let folded = resolve_subqueries(&toks, &subs, db, &columns, &bind)?;
+                    let folded = resolve_subqueries(&toks, &subs, db, &columns, &bind, !in_view)?;
                     folded_where = render_toks(&folded);
                     Some(folded)
                 }
@@ -28892,6 +28918,12 @@ fn resolve_subqueries(
     db: &Database,
     outer_cols: &[RelationColumn],
     outer_bind: &ColBinding<'_>,
+    // Whether a semi-join HERE is one the engine would HASH. It is, in
+    // an ordinary statement - but NOT inside a VIEW BODY, where
+    // `SET PLANONLY ON` shows two plain plans and no hash, so the
+    // lenient grammar decides and a body this server marked as a key
+    // refused a view the engine answers.
+    keys: bool,
 ) -> Option<Vec<Tok>> {
     // a set of values becomes the body of an IN list; `key` marks the
     // text ones as HASH KEYS (see [conjunctive_position])
@@ -28995,7 +29027,7 @@ fn resolve_subqueries(
                         } else {
                             out.push(Tok::Ident(outer));
                             out.push(Tok::In);
-                            out.extend(list_tokens(&vals, conjunctive_position(toks, i))?);
+                            out.extend(list_tokens(&vals, keys && conjunctive_position(toks, i))?);
                         }
                     }
                     // uncorrelated: the verdict is the same for every row
@@ -29034,7 +29066,7 @@ fn resolve_subqueries(
                     // this an anti-join, which the engine does not hash
                     let negated = toks.get(i.wrapping_sub(1)).is_some_and(|t| matches!(t, Tok::Not));
                     out.extend(
-                        list_tokens(&rows.values, !negated && conjunctive_position(toks, i))?,
+                        list_tokens(&rows.values, keys && !negated && conjunctive_position(toks, i))?,
                     );
                 }
                 i += 2;

@@ -189,24 +189,50 @@ done
 # A refusal this server cannot justify must be GENERIC - the same rule
 # the identity vectors follow. The engine ANSWERS this view, so the
 # refusal itself stays a recorded boundary; the template must not.
-out=$(printf 'SET HEADING OFF;\nSELECT ID, A FROM VKEY;\n' |
-      "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
-case "$out" in
-    *"@1"*)
-        echo "DIFF a refused view leaked the message template: [$out]"; fail=1 ;;
-    *"Dynamic SQL Error"*)
-        echo "OK   a view fire-crab cannot answer refuses GENERICALLY, no template" ;;
-    *)
-        # answering it is BETTER than refusing - the engine does - but
-        # then the rows must be the engine's
-        en=$(printf 'SET HEADING OFF;\nSELECT ID, A FROM VKEY;\n' |
-             "$ISQL" -q -user "$U" -pas "$P" "$DB" 2>&1 | tr -s ' \n' ' ')
-        if [ "$out" = "$en" ]; then
-            echo "OK   a view over a semi-join key now ANSWERS, and matches"
-        else
-            echo "DIFF VKEY answered [$out], engine [$en]"; fail=1
-        fi ;;
-esac
+# The engine ANSWERS this view - its body's semi-join is planned as two
+# plain plans, not a hash - so the lenient grammar decides inside a view
+# body and the rows must match. This was a REFUSAL until the view
+# planner started telling the body which it was ([plan_query_inner_ctx]).
+#
+# It is written as an equality and not as "refuses OR answers": while
+# the engine's behaviour was unknown a two-branch check was honest, but
+# once it is known, accepting the refusal too makes the check blind to
+# the regression - it passed both ways when I A/B'd it, which is how
+# this comment came to be here.
+same "a view body's semi-join key is NOT hashed - the view answers" \
+     "SELECT ID, A FROM VKEY"
+
+# A REFUSAL MUST NEVER RENDER A MESSAGE TEMPLATE. An argument-less
+# isc_convert_error makes the client print the engine's own text with
+# the slot unfilled - `"@1"` through node-firebird, `<Missing arg #1 ...>`
+# through isql - so whatever this server refuses, it must not say that.
+#
+# HONEST LABEL: these three are a TRIPWIRE, not a proof. They caught the
+# leak when VKEY still refused (1 DIFF against the argument-less
+# responder), and then the view fix in the same increment removed this
+# gate's only statement that reaches an argument-less error at all - so
+# they pass either way TODAY. They are kept because the sites that
+# reach for that error are a dozen scattered "outside the surface"
+# paths, and any of them surfacing here again is what this catches. The
+# proof that the responder change matters lives in that A/B, recorded
+# in the commit; whoever gives [branch_rows] a real error channel
+# should re-point these at a shape that reaches it.
+notemplate() { # <label> <sql>
+    o=$(printf 'SET HEADING OFF;\n%s;\n' "$2" |
+        "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
+    case "$o" in
+        *"@1"*|*"Missing arg"*)
+            echo "DIFF $1 leaked a message template: [$o]"; fail=1 ;;
+        *) echo "OK   $1 says nothing about @1" ;;
+    esac
+}
+# a view inside a subquery is a recorded boundary (the subquery
+# evaluator takes no planned row source yet) - it may refuse, but not
+# like that
+notemplate "a view inside a subquery" "SELECT ID FROM T WHERE ID IN (SELECT ID FROM VKEY)"
+notemplate "a view in a derived table" "SELECT * FROM (SELECT ID FROM VKEY) X"
+notemplate "the view itself" "SELECT ID, A FROM VKEY"
+
 # and a REAL conversion error still carries its string. The semi-join's
 # key is unconvertible and BOTH streams have rows, which is when the
 # engine's hash build reads it and raises.

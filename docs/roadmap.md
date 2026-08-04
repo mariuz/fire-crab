@@ -1078,13 +1078,28 @@ four; R7 is the removal of what they replaced.
   justify must be GENERIC, because a confident wrong answer is the one
   a driver acts on**. A conversion error that HAS its string is
   untouched and still matches the engine byte for byte.
-  `qa/serve-real-view.sh` gates both halves (29 checks, 1 DIFF against
-  the pre-fix binary). *Follow-ups, both now precisely sized*: give
-  `branch_rows` a real error channel (13 call sites) so those sites can
-  be typed again, and keep the strict grammar out of a view body (13
-  call sites on `plan_query_inner`), which is what makes this view
-  refuse at all — the engine plans a view body's semi-join as two plain
-  plans, never a hash.
+  `qa/serve-real-view.sh` gates both halves (32 checks, 1 DIFF against
+  the pre-fix binary). *Follow-up*: give `branch_rows` a real error
+  channel (13 call sites) so those sites can be typed again rather than
+  generic.
+
+- ~~The strict grammar reaches a VIEW BODY, where the engine does not
+  hash~~ — *closed, and it cost two edits rather than the thirteen the
+  symptom suggested*. `SELECT * FROM V` refused where the engine
+  answers every row, because the view's body was marked for the strict
+  grammar like any statement's. The marking turned out to be reachable
+  from exactly THREE places (`plan_update`, `plan_delete`, and
+  `plan_query_inner`'s own body), so a `plan_query_inner_ctx` wrapper
+  carrying one `in_view` flag, plus the single call in `plan_view`,
+  does it — the other twelve callers never learn the flag exists.
+  **Trace what actually reaches the site before pricing a fix by its
+  call-site count.**
+
+  The gate check for it is written as an EQUALITY on purpose. It began
+  as "refuses generically OR answers and matches", which was honest
+  while the engine's behaviour was unknown — and passed BOTH WAYS when
+  A/B'd, catching nothing. Once the engine's answer is known, a
+  two-branch check is a blind one.
 
   *Found by a control while gating it, and pinned there*: a same-side
   filter that EMPTIES the outer silences the engine's key raise, because
