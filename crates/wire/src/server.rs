@@ -1307,6 +1307,61 @@ impl RowSource {
             // relation - and raise on a row the engine never reaches.
             // It passes rows through, which is what it does to them.
             RowSource::Sort { input, keys } if keys.is_empty() => input.for_each(db, sink),
+            // A LEFT or INNER join STREAMS ITS DRIVER. Both read only
+            // the outer row in hand, so "concatenating the per-row
+            // results IS the whole-pass result" - the identity the
+            // index probe already relies on, now used for the walk
+            // itself. RIGHT and FULL fall through to the materialising
+            // arm: their MIRROR emits the unmatched rows of the OTHER
+            // side, which is not knowable one outer row at a time.
+            RowSource::NestedLoopJoin { left, left_width, right, part, above }
+                if matches!(part.kind, JoinKind::Left | JoinKind::Inner) =>
+            {
+                // both sides of the inner stream are built at most ONCE,
+                // lazily: a per-row materialisation would make one
+                // unbuildable key cost a full scan for every outer row
+                let mut whole: Option<Vec<Vec<Value>>> = None;
+                let mut fallback: Option<Vec<Vec<Value>>> = None;
+                left.for_each(db, &mut |row| {
+                    let paired = match part.probe.as_ref() {
+                        None => {
+                            if whole.is_none() {
+                                whole = Some(right.rows(db)?);
+                            }
+                            let r = whole.as_deref().unwrap_or(&[]);
+                            join_step(vec![row], *left_width, r, part, above)?
+                        }
+                        Some(probe) => match probe.band(db, &row) {
+                            Band::Index(access) => {
+                                let rrows = RowSource::IndexScan {
+                                    rel: probe.src.rel,
+                                    formats: probe.src.formats.clone(),
+                                    access,
+                                    width: Some(part.width),
+                                }
+                                .rows(db)?;
+                                join_step(vec![row], *left_width, &rrows, part, above)?
+                            }
+                            Band::Nothing => {
+                                join_step(vec![row], *left_width, &[], part, above)?
+                            }
+                            Band::Scan => {
+                                if fallback.is_none() {
+                                    fallback = Some(right.rows(db)?);
+                                }
+                                let r = fallback.as_deref().unwrap_or(&[]);
+                                join_step(vec![row], *left_width, r, part, above)?
+                            }
+                        },
+                    };
+                    for out_row in paired {
+                        if matches!(sink(out_row)?, Flow::Stop) {
+                            return Ok(Flow::Stop);
+                        }
+                    }
+                    Ok(Flow::Continue)
+                })
+            }
             // the blocking and not-yet-converted nodes: one
             // materialisation, then the same delivery every other node
             // makes. Keeping them here rather than in `rows` is what

@@ -1721,10 +1721,14 @@ pulled by the fetch.
      and `FIRST 1 WHERE ID > 79999`, which must scan everything, timed
      FASTER than a plain `FIRST 1`. The claim is therefore made by a
      unit test that COUNTS what the sink saw, not by a benchmark.
-  2. **`NestedLoopJoin` streams for LEFT and INNER.** The probe path
-     already relies on "concatenating the per-row results IS the
-     whole-acc result" for LEFT; RIGHT and FULL keep the
-     materialisation their mirror needs.
+  2. ~~**`NestedLoopJoin` streams for LEFT and INNER.**~~ *(done)* Both
+     kinds read only the outer row in hand, so "concatenating the
+     per-row results IS the whole-pass result" - the identity the index
+     probe already relied on, now used for the walk itself. RIGHT and
+     FULL fall through to the materialising arm: their MIRROR emits the
+     unmatched rows of the OTHER side, which is not knowable one outer
+     row at a time. Both inner streams are still built at most ONCE,
+     lazily, so an unbuildable key cannot cost a scan per outer row.
   3. **Projection at delivery above `Sort`** — the sorted-raiser
      residual. The sort must carry UNPROJECTED records and project as
      each row leaves, which is what the engine does and what a text
