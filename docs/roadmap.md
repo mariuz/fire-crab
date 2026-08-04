@@ -1697,11 +1697,30 @@ pulled by the fetch.
   standard and the right one for a step whose value is what it makes
   possible. What it makes possible, in the order it should be taken:
 
-  1. **`FIRST n` stops the scan.** `Flow::Stop` is threaded but not yet
-     exploited: the leaves honour it by SKIPPING their remaining input
-     rather than breaking out of `for_each_record`, which needs a
-     walker that can stop. Today's early-exit is a special case in the
-     `Modified` arm; it becomes the general one.
+  1. ~~**`FIRST n` stops the scan.**~~ *(done)* `for_each_record_while`
+     is the walker that can end - a SIBLING of the existing one rather
+     than a signature change, since 23 of its callers are catalog walks
+     that do not care - and the `Modified` arm's hand-rolled early exit
+     is gone: it used to keep reading the relation and discard the
+     rest, which is the right answer at the cost of the scan the engine
+     does not do. The filter moved out of that closure into the tree.
+
+     **It also caught a node LYING about which kind it was.**
+     `scan_filter_sort` builds a `Sort` unconditionally, so an unsorted
+     `FIRST n` went through a node classed as blocking, materialised
+     the whole relation, and raised on a row the engine never reaches -
+     the one gate check that measures laziness through an error
+     (`SELECT FIRST 1 ID FROM TDIRTY WHERE S = 5`). **A sort with no
+     keys is not a sort**, and passes rows through. Under the old code
+     that distinction was invisible, because everything materialised
+     and only the hand-rolled counter made FIRST behave; making the
+     split load-bearing is what exposed it.
+
+     *Measured honestly*: wall-clock cannot show the stop at any size
+     this box can build - per-statement cost swamps an 80k-row scan,
+     and `FIRST 1 WHERE ID > 79999`, which must scan everything, timed
+     FASTER than a plain `FIRST 1`. The claim is therefore made by a
+     unit test that COUNTS what the sink saw, not by a benchmark.
   2. **`NestedLoopJoin` streams for LEFT and INNER.** The probe path
      already relies on "concatenating the per-row results IS the
      whole-acc result" for LEFT; RIGHT and FULL keep the

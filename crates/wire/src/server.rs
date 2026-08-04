@@ -1244,19 +1244,24 @@ impl RowSource {
     ) -> Result<Flow, EvalErr> {
         match self {
             RowSource::TableScan { rel, formats, width } => {
+                // the walk ENDS on Stop now, rather than reading the
+                // rest of the relation and discarding it
                 let mut flow = Flow::Continue;
                 let mut err: Option<EvalErr> = None;
-                for_each_record(db, *rel, formats, |values| {
-                    if matches!(flow, Flow::Stop) || err.is_some() {
-                        return;
-                    }
+                for_each_record_while(db, *rel, formats, |values| {
                     let mut row = values.to_vec();
                     if let Some(w) = width {
                         row.resize(*w, Value::Null);
                     }
                     match sink(row) {
-                        Ok(f) => flow = f,
-                        Err(e) => err = Some(e),
+                        Ok(f) => {
+                            flow = f;
+                            f
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            Flow::Stop
+                        }
                     }
                 });
                 match err {
@@ -1296,6 +1301,12 @@ impl RowSource {
                 }
                 Ok(Flow::Continue)
             }
+            // A SORT WITH NO KEYS IS NOT A SORT. `scan_filter_sort`
+            // builds the node unconditionally, so treating it as
+            // blocking made an unsorted FIRST n materialise the whole
+            // relation - and raise on a row the engine never reaches.
+            // It passes rows through, which is what it does to them.
+            RowSource::Sort { input, keys } if keys.is_empty() => input.for_each(db, sink),
             // the blocking and not-yet-converted nodes: one
             // materialisation, then the same delivery every other node
             // makes. Keeping them here rather than in `rows` is what
@@ -20500,6 +20511,50 @@ fn for_each_candidate<F: FnMut(&[Value])>(
     }
 }
 
+/// [for_each_record], with a walk the consumer can END.
+///
+/// R8: a pull needs a producer that can be told to stop - `FIRST 1`
+/// over a million-row table should read one record, not a million and
+/// then a slice. The existing walker takes a closure returning `()`
+/// and has 23 callers that do not care, so this is the one that can
+/// stop and that one delegates to it. Same page walk, same record
+/// filtering, one extra question per row.
+fn for_each_record_while<F: FnMut(&[Value]) -> Flow>(
+    db: &Database,
+    rel: u16,
+    formats: &[(u8, Vec<Descriptor>)],
+    mut f: F,
+) {
+    for dp_no in relation_data_pages(&db.bytes, db.page_size, rel) {
+        let start = dp_no as usize * db.page_size;
+        let Some(dp) = db
+            .bytes
+            .get(start..start + db.page_size)
+            .and_then(DataPage::decode)
+        else {
+            continue;
+        };
+        for r in dp.records() {
+            if !r.is_primary_record() {
+                continue;
+            }
+            let Some(image) = fire_crab_ods::data::assembled_image(&db.bytes, db.page_size, &r)
+            else {
+                continue;
+            };
+            let descs = formats
+                .iter()
+                .find(|(n, _)| *n == r.format)
+                .or_else(|| formats.iter().max_by_key(|(n, _)| *n));
+            let Some((_, descs)) = descs else { continue };
+            let values = decode_record(&image, descs);
+            if matches!(f(&values), Flow::Stop) {
+                return;
+            }
+        }
+    }
+}
+
 fn for_each_record<F: FnMut(&[Value])>(
     db: &Database,
     rel: u16,
@@ -22210,30 +22265,38 @@ fn emit_rows_inner(
                             );
                             let stop_at = skip.saturating_add(take.unwrap_or(0));
                             let mut accepted = 0usize;
-                            let mut eval_err: Option<EvalErr> = None;
-                            for_each_candidate(db, *rel, formats, index, |values| {
-                                if eval_err.is_some() || accepted >= stop_at {
-                                    return; // the cursor is closed: no more
-                                            // evaluation, no more raising
-                                }
-                                let keep = match &filter {
-                                    None => Ok(true),
-                                    Some(p) => p.matches(values),
-                                };
-                                match keep {
-                                    Ok(true) => {
-                                        accepted += 1;
-                                        if accepted > *skip {
-                                            if let Err(e) = encode_row(w, cols, values, out) {
-                                                eval_err = Some(e);
-                                            }
-                                        }
+                            // R8: the walk itself STOPS. This used to be
+                            // a hand-rolled early exit that kept reading
+                            // the relation and threw the rest away - the
+                            // right answer, at the cost of the scan the
+                            // engine does not do. `Flow::Stop` travels
+                            // down the tree to the leaf, which ends its
+                            // page walk, and the FILTER lives in the
+                            // tree rather than in this closure.
+                            let src = RowSource::scan_filter_sort(
+                                *rel,
+                                formats.clone(),
+                                filter,
+                                Vec::new(), // unsorted: this branch's whole premise
+                                index.clone(),
+                            );
+                            let mut enc: Option<EvalErr> = None;
+                            src.for_each(db, &mut |values| {
+                                accepted += 1;
+                                if accepted > *skip {
+                                    if let Err(e) = encode_row(w, cols, &values, out) {
+                                        enc = Some(e);
+                                        return Ok(Flow::Stop);
                                     }
-                                    Ok(false) => {}
-                                    Err(e) => eval_err = Some(e),
                                 }
-                            });
-                            if let Some(e) = eval_err {
+                                Ok(if accepted >= stop_at {
+                                    Flow::Stop
+                                } else {
+                                    Flow::Continue
+                                })
+                            })
+                            .map_err(EmitErr::Eval)?;
+                            if let Some(e) = enc {
                                 return Err(EmitErr::Eval(e));
                             }
                             return Ok(());
@@ -39972,6 +40035,47 @@ mod tests {
     // row order stay decided inside join_step. It is NOT true of RIGHT
     // or FULL, whose mirror pass is over the whole inner stream - which
     // is a second reason the probe is LEFT-only.
+    #[test]
+    fn a_sink_that_stops_ends_the_walk() {
+        // R8's claim is that Flow::Stop travels: a consumer that has
+        // what it needs stops the PRODUCER, rather than the producer
+        // handing over rows nobody reads. Wall-clock cannot show this
+        // at any size this box can build - per-statement cost swamps
+        // an 80k-row scan - so it is counted instead.
+        let rows: Vec<Vec<Value>> = (0..100).map(|i| vec![Value::Int(i)]).collect();
+        let db = Database {
+            bytes: Vec::new(),
+            page_size: 4096,
+            path: String::new(),
+            ods_major: 14,
+            ods_minor: 0,
+            gen_windows: Vec::new(),
+        };
+        let src = RowSource::Filter {
+            input: Box::new(RowSource::Rows(rows)),
+            pred: None,
+        };
+        let mut seen = 0usize;
+        let flow = src
+            .for_each(&db, &mut |_| {
+                seen += 1;
+                Ok(if seen == 3 { Flow::Stop } else { Flow::Continue })
+            })
+            .unwrap();
+        assert_eq!(seen, 3, "the walk kept producing after Stop");
+        assert!(matches!(flow, Flow::Stop), "Stop did not reach the caller");
+
+        // and the whole walk when nobody stops it
+        let src2 = RowSource::Rows((0..7).map(|i| vec![Value::Int(i)]).collect());
+        let mut all = 0usize;
+        src2.for_each(&db, &mut |_| {
+            all += 1;
+            Ok(Flow::Continue)
+        })
+        .unwrap();
+        assert_eq!(all, 7);
+    }
+
     #[test]
     fn join_step_per_outer_row_concatenates_to_the_whole_pass_for_left() {
         let part = JoinPart {
