@@ -28209,6 +28209,7 @@ fn render_toks(toks: &[Tok]) -> Option<String> {
             Tok::Like => "LIKE".to_string(),
             Tok::Between => "BETWEEN".to_string(),
             Tok::In => "IN".to_string(),
+            Tok::Quant(all) => if *all { "ALL".to_string() } else { "ANY".to_string() },
             Tok::Escape => "ESCAPE".to_string(),
             Tok::LParen => "(".to_string(),
             Tok::RParen => ")".to_string(),
@@ -29641,6 +29642,103 @@ fn resolve_subqueries(
                 }
                 i += 2;
             }
+            // <col> <op> ANY|SOME|ALL <subq> - a QUANTIFIED comparison.
+            //
+            // Measured against the engine rather than assumed, because
+            // three of the corners are not what a reading of "any" and
+            // "all" suggests:
+            //   `= ANY` is exactly IN, and `<> ALL` exactly NOT IN, so
+            //     both go through that path and inherit its hash-key
+            //     marking (a semi-join IS hashed; probed);
+            //   an EMPTY set makes ALL vacuously TRUE - including for a
+            //     NULL outer value, which `> ALL (empty)` returns - and
+            //     ANY FALSE;
+            //   a NULL IN THE SET makes ALL unknown, while ANY simply
+            //     ignores it (`> ANY {1,NULL}` answers what `> ANY {1}`
+            //     answers, because an UNKNOWN disjunct cannot turn a
+            //     TRUE into anything else and a row that matches nothing
+            //     is dropped either way).
+            //
+            // UNKNOWN and FALSE part company under a NOT, and this token
+            // stream can only say FALSE - so a NOT in front of a
+            // quantified comparison over a NULL-bearing set REFUSES
+            // rather than answer the wrong rows.
+            Tok::Cmp(op)
+                if matches!(toks.get(i + 1), Some(Tok::Quant(_)))
+                    && matches!(toks.get(i + 2), Some(Tok::Subq(_))) =>
+            {
+                let Some(Tok::Quant(all)) = toks.get(i + 1).cloned() else {
+                    return None;
+                };
+                let Some(Tok::Subq(n)) = toks.get(i + 2).cloned() else {
+                    return None;
+                };
+                // the LHS is already in `out`; only a single column
+                // reference is taken, as the IN path does
+                let Some(Tok::Ident(lhs)) = out.last().cloned() else {
+                    return None;
+                };
+                // A NOT can govern from further away than the previous
+                // token - `NOT (V = ANY (…))` puts a paren in between -
+                // and UNKNOWN only differs from FALSE under one. So the
+                // test is the same one the hash-key marking uses for
+                // "is this a plain conjunct": anything else (an
+                // enclosing NOT, an enclosing OR) counts as governed.
+                let plain = conjunctive_position(toks, i);
+                let negated = matches!(out.get(out.len().wrapping_sub(2)), Some(Tok::Not));
+                let rows = eval_subquery(subs.get(n)?, db, db_opt, None, Some(outer_bind), false)?;
+                let has_null = rows.values.iter().any(|v| matches!(v, Value::Null));
+                let vals: Vec<Value> = rows
+                    .values
+                    .iter()
+                    .filter(|v| !matches!(v, Value::Null))
+                    .cloned()
+                    .collect();
+                if has_null && (negated || !plain) {
+                    return None; // UNKNOWN under a NOT: refuse, never guess
+                }
+                out.pop(); // the LHS token, rebuilt below
+                if negated {
+                    out.pop();
+                }
+                if rows.values.is_empty() {
+                    // vacuous: ALL is TRUE of everything, ANY FALSE
+                    out.push(Tok::Const(all != negated));
+                } else if all && has_null {
+                    out.push(Tok::Const(negated)); // UNKNOWN -> the row goes
+                } else if vals.is_empty() {
+                    out.push(Tok::Const(negated)); // ANY over only NULLs
+                } else if !all && matches!(op, Cmp::Eq) && !negated {
+                    // = ANY IS `IN`, marking and all
+                    out.push(Tok::Ident(lhs));
+                    out.push(Tok::In);
+                    out.extend(list_tokens(&vals, conjunctive_position(toks, i))?);
+                } else if all && matches!(op, Cmp::Ne) && !negated {
+                    // <> ALL IS `NOT IN` - never hashed, so never marked
+                    out.push(Tok::Not);
+                    out.push(Tok::Ident(lhs));
+                    out.push(Tok::In);
+                    out.extend(list_tokens(&vals, false)?);
+                } else {
+                    // the general form: AND of comparisons for ALL, OR
+                    // for ANY, each one the LHS against a value
+                    if negated {
+                        out.push(Tok::Not);
+                    }
+                    out.push(Tok::LParen);
+                    for (k, v) in vals.iter().enumerate() {
+                        if k > 0 {
+                            out.push(if all { Tok::And } else { Tok::Or });
+                        }
+                        out.push(Tok::Ident(lhs.clone()));
+                        out.push(Tok::Cmp(*op));
+                        out.push(value_to_tok(v, false)?);
+                    }
+                    out.push(Tok::RParen);
+                }
+                i += 3;
+                continue;
+            }
             // <col> [NOT] IN <subq>
             Tok::In => {
                 let Some(Tok::Subq(n)) = toks.get(i + 1) else {
@@ -30341,6 +30439,10 @@ enum Tok {
     Subq(usize),
     /// a decided leaf - see [RawKind::Const]
     Const(bool),
+    /// `ANY` / `SOME` / `ALL` in front of a subquery: the QUANTIFIER of
+    /// a comparison. `true` is ALL. Reserved words on the engine, so
+    /// they can never be a column name here.
+    Quant(bool),
     Escape,
     /// a built-in function call lexed as ONE token - the whole call
     /// (balanced parens, string literals skipped) parsed by the
@@ -30678,6 +30780,8 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                     "IN" => out.push(Tok::In),
                     "ESCAPE" => out.push(Tok::Escape),
                     "EXISTS" => out.push(Tok::Exists),
+                    "ANY" | "SOME" => out.push(Tok::Quant(false)),
+                    "ALL" => out.push(Tok::Quant(true)),
                     // the placeholder [extract_subqueries] left behind
                     _ if word.to_ascii_uppercase().starts_with(SUBQ_MARK) => {
                         let n = word[SUBQ_MARK.len()..].parse::<usize>().ok()?;

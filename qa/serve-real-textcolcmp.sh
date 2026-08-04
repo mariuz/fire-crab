@@ -854,12 +854,16 @@ krec() { # <label> <sql> <fc-today> <engine-today>
     if [ "$b" = "$4" ]; then echo "BOUND $1 | engine: $b"
     else echo "DIFF $1 - the ENGINE moved"; echo "     got:  $b"; echo "     was:  $4"; fail=1; fi
 }
-krec "= ANY hashes on the engine; fire-crab has no surface for it" \
-     "SELECT ID FROM TNI WHERE N = ANY (SELECT S FROM TK)" \
-     'ERR Dynamic SQL Error' 'ERR Conversion error from string "1 2"'
-krec "= ALL is not hashed, and fire-crab refuses that too" \
-     "SELECT ID FROM TNI WHERE N = ALL (SELECT S FROM TK)" \
-     'ERR Dynamic SQL Error' '[{"ID":1}]'
+# `= ANY` IS a semi-join, so it hashes and its key is read strictly;
+# `= ALL` is not one, so it stays lenient. Both were "no surface at all"
+# until the quantified comparisons landed, and this asymmetry is what
+# proves `= ANY` goes through the IN path rather than beside it.
+both "= ANY inherits the semi-join's strict key" \
+     "SELECT ID FROM TNI WHERE N = ANY (SELECT S FROM TK)"
+both "= ALL is not hashed, so it stays lenient" \
+     "SELECT ID FROM TNI WHERE N = ALL (SELECT S FROM TK)"
+both "<> ALL is NOT IN, and never hashed" \
+     "SELECT ID FROM TNI WHERE N <> ALL (SELECT S FROM TK)"
 
 # --- 10. durable DML atomicity (LAST: it mutates) ----------------------
 both "raising UPDATE errors on both" "UPDATE TDIRTY SET S = '9' WHERE S = 5"
@@ -882,8 +886,8 @@ both "the stored numbers read back (fresh attachment)" \
      "SELECT ID, N, Q, D FROM TCN ORDER BY ID"
 
 # --- 14. the ran counter -----------------------------------------------
-if [ "$ran" -ne 346 ]; then
-    echo "DIFF $ran checks ran (expected exactly 346) - did one silently skip?"
+if [ "$ran" -ne 345 ]; then
+    echo "DIFF $ran checks ran (expected exactly 345) - did one silently skip?"
     fail=1
 fi
 

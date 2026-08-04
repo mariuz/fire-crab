@@ -1405,6 +1405,38 @@ four; R7 is the removal of what they replaced.
   degraded the join. `qa/serve-real-textcolcmp.sh` 342, 1 DIFF against
   the pre-fix binary with four negative controls green on BOTH.
 
+- ~~`<op> ANY | SOME | ALL (<subquery>)` has no surface at all~~ —
+  *implemented, measured first*. Every spelling answered `Dynamic SQL
+  Error`; the engine answers all of them. Three corners are not what
+  the words suggest, and all three were probed before a line was
+  written:
+
+  * **`= ANY` IS `IN`, and `<> ALL` IS `NOT IN`** (`= SOME` is the
+    synonym), so both route through that path and INHERIT ITS HASH-KEY
+    MARKING — which is why `= ANY` reads its key strictly and `= ALL`
+    stays lenient, the asymmetry an earlier refute pass had recorded as
+    two boundary pins.
+  * **An EMPTY set makes ALL vacuously TRUE — including for a NULL
+    outer value** (`> ALL (empty)` returns the NULL row), and ANY
+    FALSE.
+  * **A NULL in the set makes ALL unknown; ANY ignores it** — `> ANY
+    {1,NULL}` answers exactly what `> ANY {1}` answers, because an
+    UNKNOWN disjunct cannot change a TRUE and a row that matches
+    nothing is dropped either way.
+
+  Everything else is the general desugar: an AND of comparisons for
+  ALL, an OR for ANY, each the left side against one value.
+
+  **UNKNOWN and FALSE part company under a NOT**, and a token stream
+  can only say FALSE — so a quantified comparison over a NULL-bearing
+  set REFUSES there rather than answer the wrong rows. That guard first
+  tested for a `Not` immediately before the expression and never fired,
+  because `NOT (V = ANY …)` puts a paren in between; it uses the same
+  "is this a plain conjunct" test the hash-key marking uses now, which
+  sees an enclosing NOT or OR. `qa/serve-real-subquery.sh` 51 → 70 (19
+  DIFF against the pre-fix binary) and `qa/serve-real-textcolcmp.sh`
+  345 (3 DIFF), the latter being the two pins turned into checks.
+
 - **Derived-table FLATTENING is the wrong way to close the sorted-raiser
   residual** — recorded so it is not attempted again. Merging `SELECT …
   FROM (SELECT …) X` into one statement would close it and would let an

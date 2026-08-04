@@ -45,6 +45,11 @@ COMMIT;
 CREATE VIEW VB AS SELECT AID FROM B;
 CREATE VIEW VBW AS SELECT AID FROM B WHERE M >= 200;
 CREATE VIEW VBR (K) AS SELECT AID FROM B;
+CREATE TABLE QE (K INTEGER);
+CREATE TABLE QN (K INTEGER);
+COMMIT;
+INSERT INTO QN VALUES (1);
+INSERT INTO QN VALUES (NULL);
 COMMIT;
 INSERT INTO A VALUES (1, 10, 'x');
 INSERT INTO A VALUES (2, 20, 'y');
@@ -205,6 +210,58 @@ same "control: correlated EXISTS over the base table" \
      "SELECT ID FROM A WHERE EXISTS (SELECT 1 FROM B WHERE B.AID = A.ID) ORDER BY ID"
 same "control: correlated NOT EXISTS over the base table" \
      "SELECT ID FROM A WHERE NOT EXISTS (SELECT 1 FROM B WHERE B.AID = A.ID) ORDER BY ID"
+
+
+# --- QUANTIFIED COMPARISONS: <op> ANY | SOME | ALL --------------------
+# Measured against the engine before a line was written, because three
+# corners are not what the words suggest: `= ANY` is exactly IN and
+# `<> ALL` exactly NOT IN (so both go through that path and inherit its
+# hash-key marking); an EMPTY set makes ALL vacuously TRUE - including
+# for a NULL outer value - and ANY FALSE; and a NULL in the set makes
+# ALL unknown while ANY simply ignores it.
+same "= ANY is IN"            "SELECT ID FROM A WHERE ID = ANY (SELECT AID FROM B) ORDER BY ID"
+same "= SOME is the synonym"  "SELECT ID FROM A WHERE ID = SOME (SELECT AID FROM B) ORDER BY ID"
+same "<> ALL is NOT IN"       "SELECT ID FROM A WHERE ID <> ALL (SELECT AID FROM B) ORDER BY ID"
+same "= ALL over one value"   "SELECT ID FROM A WHERE ID = ALL (SELECT AID FROM B WHERE M >= 300) ORDER BY ID"
+same "= ALL over several"     "SELECT ID FROM A WHERE ID = ALL (SELECT AID FROM B) ORDER BY ID"
+same "<> ANY"                 "SELECT ID FROM A WHERE ID <> ANY (SELECT AID FROM B) ORDER BY ID"
+same "> ANY beats the least"  "SELECT ID FROM A WHERE ID > ANY (SELECT AID FROM B) ORDER BY ID"
+same "> ALL beats them all"   "SELECT ID FROM A WHERE ID > ALL (SELECT AID FROM B) ORDER BY ID"
+same ">= ALL"                 "SELECT ID FROM A WHERE ID >= ALL (SELECT AID FROM B) ORDER BY ID"
+same "< ANY"                  "SELECT ID FROM A WHERE ID < ANY (SELECT AID FROM B) ORDER BY ID"
+same "<= ANY"                 "SELECT ID FROM A WHERE ID <= ANY (SELECT AID FROM B) ORDER BY ID"
+# the EMPTY set: ALL is vacuously true OF EVERY ROW, the NULL one too
+same "= ALL over an empty set" "SELECT ID FROM A WHERE ID = ALL (SELECT K FROM QE) ORDER BY ID"
+same "> ALL over an empty set" "SELECT ID FROM A WHERE ID > ALL (SELECT K FROM QE) ORDER BY ID"
+same "= ANY over an empty set" "SELECT ID FROM A WHERE ID = ANY (SELECT K FROM QE) ORDER BY ID"
+# a NULL IN THE SET
+same "= ANY ignores a NULL"    "SELECT ID FROM A WHERE ID = ANY (SELECT K FROM QN) ORDER BY ID"
+same "> ANY ignores a NULL"    "SELECT ID FROM A WHERE ID > ANY (SELECT K FROM QN) ORDER BY ID"
+same "= ALL is unknown with a NULL" "SELECT ID FROM A WHERE ID = ALL (SELECT K FROM QN) ORDER BY ID"
+same "<> ALL is unknown with a NULL" "SELECT ID FROM A WHERE ID <> ALL (SELECT K FROM QN) ORDER BY ID"
+# A NOT IN FRONT is where UNKNOWN and FALSE part company, and this
+# token stream can only say FALSE. Over a set with NO NULL the answer
+# is exact, so it is an equality; over a NULL-bearing one fire-crab
+# REFUSES rather than answer the wrong rows, and that is a boundary.
+#
+# (B.AID holds a NULL, which is why the clean case has to say so
+# explicitly - the first version of this check called B clean, and the
+# refusal it got was the design working, not a defect.)
+same "NOT over a quantified comparison, a set with no NULL" \
+     "SELECT ID FROM A WHERE NOT (ID = ANY (SELECT AID FROM B WHERE AID IS NOT NULL)) ORDER BY ID"
+nn=$(printf 'SET HEADING OFF;\nSELECT ID FROM A WHERE NOT (ID = ANY (SELECT AID FROM B)) ORDER BY ID;\n' |
+     "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
+ne=$(printf 'SET HEADING OFF;\nSELECT ID FROM A WHERE NOT (ID = ANY (SELECT AID FROM B)) ORDER BY ID;\n' |
+     "$ISQL" -q -user "$U" -pas "$P" "$DB" 2>&1 | tr -s ' \n' ' ')
+case "$nn" in
+    *"Dynamic SQL Error"*)
+        echo "BOUND NOT over a NULL-bearing quantified set refuses here; engine: [$ne]" ;;
+    *) if [ "$nn" = "$ne" ]; then
+           echo "OK   NOT over a NULL-bearing quantified set now ANSWERS, and matches"
+       else
+           echo "DIFF NOT over a NULL-bearing set answered [$nn], engine [$ne]"; fail=1
+       fi ;;
+esac
 
 # non-vacuity: a subquery filter must not just return every row
 all=$(printf 'SET HEADING OFF;\nSELECT COUNT(*) FROM A;\n' |
