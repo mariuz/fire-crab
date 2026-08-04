@@ -1729,11 +1729,37 @@ pulled by the fetch.
      unmatched rows of the OTHER side, which is not knowable one outer
      row at a time. Both inner streams are still built at most ONCE,
      lazily, so an unbuildable key cannot cost a scan per outer row.
-  3. **Projection at delivery above `Sort`** — the sorted-raiser
-     residual. The sort must carry UNPROJECTED records and project as
-     each row leaves, which is what the engine does and what a text
-     flattening would only fake. It is the last thing on this list
-     because it is the one that changes what a client SEES.
+  3. ~~**Projection at delivery above `Sort`**~~ *(done)* — the
+     sorted-raiser residual, and PROBING NARROWED IT from what this
+     entry assumed. A plain scan with an outer ORDER BY was ALREADY
+     right: that path materialises RECORDS and projects at encode,
+     which is the engine's rule arrived at independently. A raiser in
+     the sort KEY, and DISTINCT, block on both sides. The one real case
+     was a DERIVED TABLE under an outer sort, where fire-crab sorted
+     ALREADY-PROJECTED rows and so ran the inner projection for every
+     row before the first shipped.
+
+     A sort above a derived table now sorts the BASE RECORDS and runs
+     the inner projection at delivery. The rewrite fires only when
+     every outer key is a plain FIELD naming a plain inner column, so
+     its record `field_id` exists; a key that needs the EXPRESSION
+     (`ORDER BY Q` where Q is the raiser) falls through to the blocking
+     path, and that is the ENGINE'S behaviour, not a shortfall - it
+     must compute the key before sorting too. `qa/serve-real-derived.sh`
+     57 → 61 checks and 3 boundaries, 2 DIFF against the pre-fix
+     binary, with both controls and the new blocking check green on
+     BOTH binaries.
+
+  **R8's published steps are done.** What the programme has not taken:
+  `NestedLoopJoin` for RIGHT and FULL still materialises (their mirror
+  emits the other side's unmatched rows), `Aggregate` and `Sort` are
+  blocking by nature, and the fetch still asks for a whole batch rather
+  than pulling row by row across the wire - the walk is a PUSH with a
+  `Flow::Stop`, which is observationally equal for errors and early
+  exit but is not the engine's iterator. The next thing worth doing
+  here is a boundary the gates already pin: the engine raises a
+  blocking node's error at OPEN, where this server announces the result
+  set and raises at the first FETCH.
 
 ### Programme W — wire the converted subsystems in
 

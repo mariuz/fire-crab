@@ -337,6 +337,21 @@ stream "control: a derived table with no raiser" \
        "SELECT * FROM (SELECT ID, SALARY FROM EMP) X"
 stream "control: a UNION ALL with no raiser" \
        "SELECT ID FROM EMP UNION ALL SELECT SALARY FROM EMP"
+# A SORT ABOVE A DERIVED TABLE sorts the BASE RECORDS and runs the
+# inner projection at DELIVERY - so the rows that precede the raiser IN
+# SORTED ORDER still ship. Sorting already-projected rows cannot do
+# that: the projection has run for every row before the first ships.
+# The rewrite is exact only when every outer key is a plain FIELD
+# naming a plain inner column; a key that needs the EXPRESSION must be
+# computed before the sort on the engine too, and blocks on both sides.
+stream "a sorted derived table still delivers before its raiser" \
+       "SELECT * FROM (SELECT ID, 10/(ID-3) AS Q FROM EMP) X ORDER BY ID"
+stream "... and DESC, where sorted order decides WHICH rows ship" \
+       "SELECT * FROM (SELECT ID, 10/(ID-3) AS Q FROM EMP) X ORDER BY ID DESC"
+stream "control: a sorted derived table with no raiser" \
+       "SELECT * FROM (SELECT ID, SALARY FROM EMP) X ORDER BY ID DESC"
+stream "control: an outer WHERE above the sort" \
+       "SELECT * FROM (SELECT ID, SALARY FROM EMP) X WHERE ID > 1 ORDER BY SALARY"
 # THE BLOCKING SHAPES. Neither side delivers a row, which is the
 # substantive half and is what `blocks` asserts. What differs is one
 # blank line: the engine raises at OPEN, before isql prints anything,
@@ -366,13 +381,15 @@ blocks "DISTINCT blocks - no rows before the raise" \
        "SELECT DISTINCT * FROM (SELECT ID, 10/(ID-3) AS Q FROM EMP) X"
 blocks "a distinct UNION blocks" \
        "SELECT ID FROM EMP UNION SELECT 10/(ID-3) FROM EMP"
+blocks "a sort key that IS the raiser blocks" \
+       "SELECT * FROM (SELECT ID, 10/(ID-3) AS Q FROM EMP) X ORDER BY Q"
 
 rm -f "$A" "$B"
 
 
 
-if [ "$ran" -lt 55 ]; then
-    echo "DIFF only $ran checks ran (expected at least 55) - did one silently skip?"
+if [ "$ran" -lt 60 ]; then
+    echo "DIFF only $ran checks ran (expected at least 60) - did one silently skip?"
     fail=1
 fi
 exit $fail

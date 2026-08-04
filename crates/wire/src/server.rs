@@ -22641,12 +22641,72 @@ fn emit_rows_inner(
                     })
                     .map_err(EmitErr::Eval)?;
                 } else {
-                    // an ORDER BY above the derived table is a BLOCKING
-                    // node here: every inner row must exist before the
-                    // first can be delivered. The engine flattens the
-                    // derived table into ONE pipeline and sorts the base
-                    // records, so it still delivers rows before a raiser
-                    // in the inner projection - recorded, not matched.
+                    // R8 STEP 3: SORT THE RECORDS, PROJECT AT DELIVERY.
+                    //
+                    // The engine flattens a derived table into ONE
+                    // pipeline - it sorts BASE RECORDS and evaluates the
+                    // projection as each row leaves - so a raiser in the
+                    // inner projection fires AFTER the rows that precede
+                    // it in sorted order. Sorting already-projected rows
+                    // cannot do that: the projection has run for every
+                    // row before the first one ships.
+                    //
+                    // The rewrite is exact only when every outer key can
+                    // be re-expressed over the records: a plain FIELD
+                    // key naming a plain inner column. A key that needs
+                    // an EXPRESSION must be computed before the sort on
+                    // the engine too, so blocking there is its behaviour
+                    // rather than a shortfall - and it falls through.
+                    if let Plan::Project {
+                        rel, formats, cols: icols, filter: ifilter, index, gen_cols, ..
+                    } = &**inner
+                    {
+                        let rkeys: Option<Vec<OrderKey>> = if gen_cols.is_empty() {
+                            order_by
+                                .iter()
+                                .map(|k| {
+                                    if k.expr.is_some() {
+                                        return None;
+                                    }
+                                    let ic = icols.get(k.field)?;
+                                    if ic.expr.is_some() {
+                                        return None;
+                                    }
+                                    Some(OrderKey {
+                                        field: ic.field_id,
+                                        expr: None,
+                                        desc: k.desc,
+                                        nulls: k.nulls,
+                                    })
+                                })
+                                .collect()
+                        } else {
+                            None
+                        };
+                        if let Some(rkeys) = rkeys {
+                            let ifilter = bind_filter(ifilter, args)?;
+                            let src = RowSource::scan_filter_sort(
+                                *rel,
+                                formats.clone(),
+                                ifilter,
+                                rkeys,
+                                index.clone(),
+                            );
+                            let pred = bind_filter(filter, args)?;
+                            src.for_each(db, &mut |values| {
+                                let mut row = Vec::with_capacity(icols.len());
+                                for c in icols {
+                                    row.push(c.value_of(&values)?);
+                                }
+                                if pred.as_ref().map_or(Ok(true), |p| p.matches(&row))? {
+                                    encode_row(w, cols, &row, out)?;
+                                }
+                                Ok(Flow::Continue)
+                            })
+                            .map_err(EmitErr::Eval)?;
+                            return Ok(());
+                        }
+                    }
                     let rows = branch_rows_res(inner, db, args).map_err(EmitErr::Eval)?;
                     let sorted = RowSource::Sort {
                         input: Box::new(RowSource::Filter {
