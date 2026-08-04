@@ -791,15 +791,44 @@ bothk "the same value written as a LITERAL answers" "N IN ('1 2')"
 both "a LEFT join's ON is not a hash key" \
      "SELECT ID FROM TNI LEFT JOIN TK ON TK.S = TNI.N ORDER BY ID"
 
+# --- THE INNER JOIN'S KEY IS HASHED, AND NOW READ STRICTLY -------------
+# The engine hashes an INNER (and comma) join's key and builds it with
+# the CAST grammar, so an unconvertible text value RAISES where the
+# LEFT join of the same pair - a nested loop - answers. Both spellings
+# are real checks now; the ON form and the WHERE form are marked at
+# different sites (the ON at the join step, the WHERE at the plan, for
+# the comma join whose key never appears in an ON).
+both "an INNER join's key is read strictly" \
+     "SELECT ID FROM TNI JOIN TK ON TK.S = TNI.N"
+both "... the comma spelling, whose key lives in the WHERE" \
+     "SELECT ID FROM TNI, TK WHERE TNI.N = TK.S"
+both "... and the equality written the other way round" \
+     "SELECT ID FROM TNI JOIN TK ON TNI.N = TK.S"
+# THE TWO SILENCERS, measured: the engine answers 0 rather than raising
+# when a sibling conjunct is INVARIANT (it never builds the hash) and
+# when a conjunct filters the KEY'S OWN STREAM (applied to that stream
+# before the build). fire-crab declines to mark in both cases, which
+# leaves the lenient answer - the same answer the engine gives.
+both "a FALSE sibling conjunct silences the key raise" \
+     "SELECT COUNT(*) FROM TNI JOIN TK ON TK.S = TNI.N AND 1=0"
+both "a filter on the key's own stream silences it" \
+     "SELECT COUNT(*) FROM TNI JOIN TK ON TK.S = TNI.N AND TK.S = '34'"
+# and the LEFT join must NOT have moved: it is a nested loop, not a hash
+both "a LEFT join of the same pair stays lenient" \
+     "SELECT ID FROM TNI LEFT JOIN TK ON TK.S = TNI.N ORDER BY ID"
+
 # --- RECORDED BOUNDARIES: the hashes fire-crab does not reach ----------
-# The engine hashes an INNER join's key too, and converts it exactly as
-# it converts a semi-join's. fire-crab compares those two columns per
-# row with the lenient grammar and ANSWERS. This is NOT the fold's
-# regression - the HEAD binary answers here as well - and closing it
-# means teaching the join path which of its equalities the engine turns
-# into hash keys, which is its own slice. Pinned on BOTH sides so that
-# either one moving is visible. `= ANY` / `= ALL` have no surface at
-# all here; the refusal is pinned so it cannot quietly become an answer.
+# WHICH SIDE the engine builds the hash from is the OPTIMIZER'S choice
+# and it moves with CARDINALITY - probed: with one row in the text
+# table the plan is `HASH (NE NATURAL, S1 NATURAL)` and an empty other
+# side answers 0, with two rows it is `HASH (S1 NATURAL, NE NATURAL)`
+# and the SAME query RAISES, because the build side is read whether or
+# not the other side has a row. fire-crab evaluates per PAIR, so it can
+# never raise with an empty stream. Reproducing that needs the hash
+# build AND a model of the side choice; until then this under-raises,
+# which is the direction that answers rather than invents.
+# `= ANY` / `= ALL` have no surface at all here; the refusal is pinned
+# so it cannot quietly become an answer.
 krec() { # <label> <sql> <fc-today> <engine-today>
     a=$(query "$2" "[]" "$PORT" "$A")
     b=$(query "$2" "[]" "$REAL" "$B")
@@ -809,12 +838,6 @@ krec() { # <label> <sql> <fc-today> <engine-today>
     if [ "$b" = "$4" ]; then echo "BOUND $1 | engine: $b"
     else echo "DIFF $1 - the ENGINE moved"; echo "     got:  $b"; echo "     was:  $4"; fail=1; fi
 }
-krec "an INNER join's ON is a hash key on the engine, a compare here" \
-     "SELECT ID FROM TNI JOIN TK ON TK.S = TNI.N" \
-     '[{"ID":1}]' 'ERR Conversion error from string "1 2"'
-krec "... the comma spelling of the same join" \
-     "SELECT ID FROM TNI, TK WHERE TNI.N = TK.S" \
-     '[{"ID":1}]' 'ERR Conversion error from string "1 2"'
 krec "= ANY hashes on the engine; fire-crab has no surface for it" \
      "SELECT ID FROM TNI WHERE N = ANY (SELECT S FROM TK)" \
      'ERR Dynamic SQL Error' 'ERR Conversion error from string "1 2"'
@@ -843,8 +866,8 @@ both "the stored numbers read back (fresh attachment)" \
      "SELECT ID, N, Q, D FROM TCN ORDER BY ID"
 
 # --- 14. the ran counter -----------------------------------------------
-if [ "$ran" -ne 339 ]; then
-    echo "DIFF $ran checks ran (expected exactly 339) - did one silently skip?"
+if [ "$ran" -ne 341 ]; then
+    echo "DIFF $ran checks ran (expected exactly 341) - did one silently skip?"
     fail=1
 fi
 

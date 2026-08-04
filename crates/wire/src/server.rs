@@ -3356,7 +3356,7 @@ fn expr_reads(e: &Expr, f: &dyn Fn(usize) -> bool) -> bool {
         // the per-row coercion wrappers read whatever they wrap - a
         // wrapped COLUMN must keep its term row-DEPENDENT, or the
         // invariant pass would raise a value-gated 22018 over no row
-        Expr::TextNum(a) | Expr::TextBool(a) => expr_reads(a, f),
+        Expr::TextNum(a) | Expr::TextNumKey(a) | Expr::TextBool(a) => expr_reads(a, f),
         Expr::Neg(a) | Expr::Cast(a, _) => expr_reads(a, f),
         Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
             expr_reads(a, f) || expr_reads(b, f)
@@ -14937,6 +14937,84 @@ fn plan_join(
 ///  6. The table and column spell as bare unquoted identifiers, since
 ///     the reconstruction below re-spells them.
 ///  7. The gatekeeper blesses ONE band. If not, scan.
+/// Mark an INNER join's boundary equality as a HASH KEY, so its text
+/// side is read with the strict conversion grammar.
+///
+/// The engine plans `A JOIN B ON B.T = A.N` (and the comma spelling)
+/// as `PLAN HASH`, and it builds that hash from the key - with the
+/// CAST/store grammar, which refuses the interior blanks the compare
+/// grammar skips. So `'1 2'` matched 12 here and raised there, on a
+/// SELECT and on the UPDATE/DELETE built from it. A LEFT join of the
+/// same pair is `PLAN JOIN` and keeps the lenient wrap, which is why
+/// this is gated on the kind and not applied to every ON.
+///
+/// Only a boundary equality in a plain conjunction is a key: an OR
+/// makes the whole predicate a filter (`build_join_probe` refuses one
+/// for the same reason), and a conjunct comparing one side to a
+/// CONSTANT is not the join's key at all.
+fn mark_hash_keys(on: &mut Predicate, offset: usize, part_width: usize) {
+    if on.groups.len() != 1 {
+        return; // an OR: not a key, and the engine does not hash it
+    }
+    // TWO CONSERVATIVE SILENCERS, both measured against the engine. It
+    // answers 0 rather than raising when a sibling conjunct is
+    // INVARIANT (`AND 1=0`: the hash is never built) and when a
+    // conjunct FILTERS THE KEY'S OWN STREAM (`AND S1.T = '34'`: the
+    // engine applies it to that stream first, so the unconvertible row
+    // never reaches the build). Marking either would make this server
+    // RAISE where the engine answers - a NEW wrong answer traded for an
+    // old one - so it declines to mark and leaves the pre-existing
+    // lenient answer, which is merely the old one.
+    if on.groups[0].iter().any(term_row_independent) {
+        return;
+    }
+    let crosses = |a: usize, b: usize| (a < offset) != (b < offset);
+    let mut marks: Vec<usize> = Vec::new();
+    for (i, t) in on.groups[0].iter().enumerate() {
+        let Term::ExprCond(c) = t else { continue };
+        let Cond2::Cmp(l, Cmp::Eq, r) = c.as_ref() else { continue };
+        // the text-wrapped side and the plain column it is compared to
+        let pair = match (l.as_ref(), r.as_ref()) {
+            (Expr::TextNum(inner), Expr::Col(j)) => match inner.as_ref() {
+                Expr::Col(i2) => Some((*i2, *j)),
+                _ => None,
+            },
+            (Expr::Col(j), Expr::TextNum(inner)) => match inner.as_ref() {
+                Expr::Col(i2) => Some((*i2, *j)),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some((text_fid, other_fid)) = pair else { continue };
+        if !crosses(text_fid, other_fid) {
+            continue; // not the join's key
+        }
+        // the stream the key is read from, and whether anything else
+        // filters it before the build
+        let win = if text_fid >= offset {
+            offset..offset + part_width
+        } else {
+            0..offset
+        };
+        let filtered = on.groups[0]
+            .iter()
+            .enumerate()
+            .any(|(j, o)| j != i && term_side_only(o, &win));
+        if !filtered {
+            marks.push(i);
+        }
+    }
+    for i in marks {
+        let Term::ExprCond(c) = &mut on.groups[0][i] else { continue };
+        let Cond2::Cmp(l, _, r) = c.as_mut() else { continue };
+        if let Expr::TextNum(inner) = l.as_ref() {
+            **l = Expr::TextNumKey(inner.clone());
+        } else if let Expr::TextNum(inner) = r.as_ref() {
+            **r = Expr::TextNumKey(inner.clone());
+        }
+    }
+}
+
 fn build_join_probe(
     db: &Database,
     kind: JoinKind,
@@ -15257,6 +15335,12 @@ fn plan_join_bound(
             natural_shared.push(Vec::new());
             parse_on(on_s, visible)?
         };
+        // an INNER or comma join's key is HASHED, so its text side is
+        // read strictly - see [mark_hash_keys]
+        let mut on = on;
+        if matches!(kind, JoinKind::Inner) {
+            mark_hash_keys(&mut on, sides[k + 1].offset, sides[k + 1].descs.len());
+        }
         let probe = build_join_probe(db, *kind, &on, &sides[k + 1]);
         if trace_on() {
             match &probe {
@@ -15534,6 +15618,23 @@ fn plan_join_bound(
             |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &ord_cols, &ord_descs)),
         )?,
     };
+
+    // A COMMA JOIN CARRIES ITS KEY IN THE WHERE, not in an ON, and the
+    // engine hashes it just the same (`FROM A, B WHERE A.N = B.T` is
+    // PLAN HASH, probed). So the same marking the ON gets is applied to
+    // the WHERE's boundary equalities - but only when EVERY step is an
+    // inner join, since a LEFT step is planned as a nested loop and its
+    // text side stays lenient.
+    let mut filter = filter;
+    if parts.iter().all(|p| matches!(p.kind, JoinKind::Inner)) {
+        if let Some(f) = filter.as_mut() {
+            let mut at = sides[0].descs.len();
+            for p in parts.iter() {
+                mark_hash_keys(f, at, p.width);
+                at += p.width;
+            }
+        }
+    }
 
     Some(Plan::Join {
         base: sides[0].src.clone(),
@@ -24995,6 +25096,24 @@ enum Expr {
     /// `5 = S`, `NAME = ID`, `ON A.S = B.ID` and `S = D` - all probed
     /// wrong (rendered-text rows or refusals) before it.
     TextNum(Box<Expr>),
+    /// The STRICT twin of [Expr::TextNum], for a text side that the
+    /// engine reads as a HASH KEY rather than as a comparison operand.
+    ///
+    /// An INNER or comma join of a text column against a numeric one is
+    /// `PLAN HASH` (probed with SET PLANONLY ON; the LEFT join of the
+    /// same pair is `PLAN JOIN`, and a view body's semi-join is neither)
+    /// - and a key is built with the CAST/store grammar, not the compare
+    /// one. So `'1 2'` matches 12 through [Expr::TextNum] and RAISES
+    /// through this: the two grammars differ exactly in the interior
+    /// blanks the compare side skips ([text_number] against
+    /// [text_col_num]).
+    ///
+    /// It is a separate variant rather than a flag because every arm
+    /// that reads a value has to choose: this one raises where its
+    /// sibling answers, and a silent fallback in `type_of`/`rank_of`/
+    /// `result_scale` would be a wrong ANSWER rather than a compile
+    /// error - the law this file states for every new [Expr].
+    TextNumKey(Box<Expr>),
     /// The BOOLEAN sibling: a text side against a BOOLEAN side
     /// converts per row by trimmed case-insensitive TRUE/FALSE
     /// (probed: 'true', ' True ', 'FALSE' convert; '1', 't', '5'
@@ -26497,7 +26616,9 @@ impl Expr {
             // the wrapped text side answers a NUMBER (a BOOLEAN for
             // the sibling) - that is the point of the wrap; the inner
             // side must still type
-            Expr::TextNum(e) => e.type_of(descs).map(|_| ExprType::Numeric),
+            Expr::TextNum(e) | Expr::TextNumKey(e) => {
+                e.type_of(descs).map(|_| ExprType::Numeric)
+            }
             Expr::TextBool(e) => e.type_of(descs).map(|_| ExprType::Bool),
             Expr::Null => Some(ExprType::Int),
             Expr::DateLit(_) => Some(ExprType::Temporal(TKind::Date)),
@@ -26788,7 +26909,7 @@ impl Expr {
             // the per-row coercion wrappers have no STATIC rank - the
             // value's width is decided by each row's text. They live
             // only inside WHERE comparisons, never in a describe.
-            Expr::TextNum(_) | Expr::TextBool(_) => None,
+            Expr::TextNum(_) | Expr::TextNumKey(_) | Expr::TextBool(_) => None,
             Expr::Coalesce(args) => args.iter().filter_map(|a| a.rank_of(descs)).max(),
             Expr::Case(branches, else_) => branches
                 .iter()
@@ -26989,6 +27110,26 @@ impl Expr {
                     ColNum::Raise => {
                         return Err(EvalErr::ConversionError(Some(s)))
                     }
+                },
+                v => v, // a non-text value passes through (defensive)
+            },
+            // the KEY twin: the CAST/store grammar decides, so a
+            // spelling the compare grammar would have taken (interior
+            // blanks) raises here, as the engine's hash build does
+            Expr::TextNumKey(e) => match e.eval(values)? {
+                Value::Null => Value::Null,
+                Value::Text(s) => match text_number(&s) {
+                    // the same shapes [Expr::TextNum] produces, so the
+                    // two wraps compare alike once the value converts -
+                    // they differ only in WHICH spellings convert
+                    Some(TextNum::Dec { mantissa, exp }) => match i8::try_from(-exp) {
+                        Ok(sc) => Value::Int128(mantissa, sc),
+                        Err(_) => Value::Double(exact_to_f64(mantissa, -exp)),
+                    },
+                    // a hex literal is the orders-high sentinel its
+                    // sibling uses, not a value
+                    Some(TextNum::Hex { .. }) => Value::Double(f64::MAX),
+                    None => return Err(EvalErr::ConversionError(Some(s))),
                 },
                 v => v, // a non-text value passes through (defensive)
             },
@@ -32905,7 +33046,7 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
         // exactly their value-gated engine behavior, carried by the
         // error-propagating term paths, never admitted where a raise
         // cannot travel
-        Expr::TextNum(_) | Expr::TextBool(_) => false,
+        Expr::TextNum(_) | Expr::TextNumKey(_) | Expr::TextBool(_) => false,
         Expr::Neg(x) => expr_no_raise(x, descs),
         // arithmetic can overflow / divide by zero; CAST can fail
         Expr::Bin(..) | Expr::Cast(..) => false,

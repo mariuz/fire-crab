@@ -1245,7 +1245,49 @@ four; R7 is the removal of what they replaced.
   (339 and 36 checks; 8 and 14 DIFF against the same tree with the
   marking disabled — the dmlsubq half being WRONG WRITES, visible only
   because every phase is re-read through the ENGINE).
-  **The INNER JOIN's hash key, now MEASURED (its law, ready to build).**
+  ~~**The INNER JOIN's hash key**~~ — *built, and the law I recorded for
+  it had a WRONG CELL that the build found.* `Expr::TextNumKey` is the
+  strict twin of the `TextNum` wrap; `mark_hash_keys` rewrites the
+  boundary equality of an INNER or comma join to use it, at TWO sites —
+  the ON at the join step, and the plan's WHERE for the comma spelling,
+  whose key never appears in an ON (and only when every step in the
+  chain is inner, since a LEFT step is a nested loop). Three spellings
+  that answered now raise with the engine's own vector; `textcolcmp`'s
+  boundary pins became real checks (341, 3 DIFF pre-fix).
+
+  **THE CELL THAT WAS WRONG: "either side EMPTY → no raise".** It was
+  measured on a one-row fixture and it does not generalise, because
+  WHICH SIDE the engine builds the hash from is the OPTIMIZER'S choice
+  and it moves with CARDINALITY:
+
+      S1 = 1 row : PLAN HASH ("NE" NATURAL, "S1" NATURAL)  -> answers 0
+      S1 = 2 rows: PLAN HASH ("S1" NATURAL, "NE" NATURAL)  -> RAISES
+
+  with `NE` empty in both. The build side is read whether or not the
+  other side has a row. fire-crab evaluates per PAIR, so it cannot
+  raise with an empty stream at all; matching this needs the hash build
+  AND a model of the side choice. It therefore UNDER-raises there —
+  the direction that answers rather than invents — and both plans are
+  quoted in the gate. *(The project's own law, earned again: a rule
+  probed on ONE shape is a hypothesis. This one survived two
+  increments and a roadmap entry before the second shape refuted it.)*
+
+  **Two conservative silencers keep it from trading one wrong answer
+  for another.** The engine answers 0 rather than raising when a
+  sibling conjunct is INVARIANT (`AND 1=0`: the hash is never built)
+  and when a conjunct filters the KEY'S OWN STREAM (`AND S1.T = '34'`:
+  applied to that stream before the build). Marking either would make
+  this server RAISE where the engine answers; it declines to mark, so
+  the pre-existing lenient answer stands. Both are gated, and both pass
+  against the PRE-FIX binary too — they test the guards, not the fix.
+
+  *Found while building, recorded*: `LEFT JOIN … WHERE J1.A = J2.T`
+  raises on the engine, because a WHERE that requires a non-NULL right
+  row degrades the LEFT join to an inner one and it then hashes.
+  Pre-existing here (this slice only strictens all-inner chains) and it
+  needs join simplification in the planner.
+
+  **The older measurement, kept for the cells that held:**
   `SET PLANONLY ON` confirms the split: `J1 JOIN J2 ON J2.T = J1.A` and
   the comma spelling are `PLAN HASH`, a LEFT JOIN of the same pair is
   `PLAN JOIN`, and a semi-join inside a VIEW BODY is neither — two
