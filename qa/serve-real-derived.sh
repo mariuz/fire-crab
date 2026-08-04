@@ -264,9 +264,43 @@ both "a select-list subquery still splits" \
 both "SUBSTRING's own FROM keyword still splits" \
      "SELECT COUNT(*) FROM EMP WHERE SUBSTRING(NAME FROM 1 FOR 1) = 'a'"
 
+# --- a materialised row source carries its rows' OWN error ------------
+# branch_rows answered an Option, so "this shape is unserved" and "the
+# rows RAISED" came back identically - and every caller that needed an
+# error to return invented an argument-less isc_convert_error, which
+# renders as the engine's UNFILLED MESSAGE TEMPLATE at the client. A
+# derived table, a view and a union branch are all materialised through
+# that one function, so all three said the wrong thing about the same
+# raise. The row's own vector travels now; the genuinely unserved shape
+# is the generic refusal, which is what it always should have been.
+#
+# `both` compares the whole error text, so these compare the VECTOR and
+# not merely that both sides failed - the distinction that let a wrong
+# error class hide in this suite for four increments.
+both "a derived table whose rows raise" \
+     "SELECT * FROM (SELECT ID, 10/(ID-2) AS Q FROM EMP) X"
+both "a derived table raising on its FIRST row" \
+     "SELECT * FROM (SELECT ID, 10/(ID-1) AS Q FROM EMP) X"
+both "a union branch that raises" \
+     "SELECT ID FROM EMP UNION SELECT 10/(ID-2) FROM EMP"
+both "a union ALL branch that raises" \
+     "SELECT ID FROM EMP UNION ALL SELECT 10/(ID-2) FROM EMP"
+both "a derived table over a union that raises" \
+     "SELECT * FROM (SELECT ID FROM EMP UNION SELECT 10/(ID-2) FROM EMP) X"
+# and the controls: the same shapes that do NOT raise must be unmoved
+both "control: a derived table that does not raise" \
+     "SELECT * FROM (SELECT ID FROM EMP) X ORDER BY ID"
+both "control: a union that does not raise" \
+     "SELECT ID FROM EMP UNION SELECT ID + 10 FROM EMP"
+both "control: a derived table with a division that succeeds" \
+     "SELECT * FROM (SELECT ID, 100/ID AS Q FROM EMP) X ORDER BY ID"
+
 rm -f "$A" "$B"
-if [ "$ran" -lt 40 ]; then
-    echo "DIFF only $ran checks ran (expected at least 40) - did one silently skip?"
+
+
+
+if [ "$ran" -lt 48 ]; then
+    echo "DIFF only $ran checks ran (expected at least 48) - did one silently skip?"
     fail=1
 fi
 exit $fail

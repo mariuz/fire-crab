@@ -1079,9 +1079,33 @@ four; R7 is the removal of what they replaced.
   a driver acts on**. A conversion error that HAS its string is
   untouched and still matches the engine byte for byte.
   `qa/serve-real-view.sh` gates both halves (32 checks, 1 DIFF against
-  the pre-fix binary). *Follow-up*: give `branch_rows` a real error
-  channel (13 call sites) so those sites can be typed again rather than
-  generic.
+  the pre-fix binary).
+
+- ~~`branch_rows` loses a real error on the way out~~ — *closed, and it
+  was the cause behind the template leak above*. Its `Option` could not
+  say whether a shape was UNSERVED or whether its rows RAISED, so every
+  caller that owed an error invented one. `branch_rows_res` returns
+  `Result<_, EvalErr>` now, with a new `EvalErr::Unsupported` (the
+  generic vector) for the first case and the row's own error for the
+  second; the twelve callers that legitimately want a fallback keep
+  their `Option` face through a one-line wrapper, so only the sites
+  that owed an error changed. Four `.ok()` calls inside the row
+  builders were discarding column-evaluation errors the same way and
+  now propagate too.
+
+  What it fixes, measured: a DERIVED TABLE, a VIEW and a UNION BRANCH
+  whose rows raise all said `Dynamic SQL Error` where the engine says
+  `arithmetic exception … Integer divide by zero`. All three ship the
+  engine's vector now. `qa/serve-real-derived.sh` 44 → 52 checks, 5
+  DIFF against the pre-fix binary, with three controls (shapes that do
+  NOT raise) passing on both binaries so the section cannot pass by
+  failing everything.
+
+  *Recorded beside it, unfixed*: the engine EMITS ROW 1 and then raises,
+  where fire-crab materialises the derived table and raises before any
+  row ships. Both report the same error, so a row-set comparison agrees
+  and the gates are green — it is the lazy-cursor divergence this file
+  already records for `FIRST n`, in a second place.
 
 - ~~The strict grammar reaches a VIEW BODY, where the engine does not
   hash~~ — *closed, and it cost two edits rather than the thirteen the

@@ -1247,7 +1247,9 @@ impl RowSource {
             RowSource::PlanRows(plan) => {
                 // a derived side refuses `?` at plan time, so there are
                 // no bound arguments to thread through here
-                branch_rows(plan, db, &[]).ok_or(EvalErr::ConversionError(None))
+                // the row source's OWN error, not an invented one:
+                // [branch_rows_res] tells "unserved" from "raised"
+                branch_rows_res(plan, db, &[])
             }
             RowSource::Rows(rows) => Ok(rows.clone()),
             RowSource::NestedLoopJoin { left, left_width, right, part, above } => {
@@ -16784,6 +16786,25 @@ fn branch_rows(
     db: &Database,
     args: &[WireParam],
 ) -> Option<Vec<Vec<Value>>> {
+    // Twelve callers want "no rows I can give you, fall back" and get it
+    // unchanged. Only the row-source arm needs to tell the two apart -
+    // see [branch_rows_res].
+    branch_rows_res(plan, db, args).ok()
+}
+
+/// [branch_rows], keeping the reason it failed.
+///
+/// An `Option` cannot say whether a shape was UNSERVED or whether its
+/// rows RAISED, so the caller that had to produce an error invented one
+/// - and an argument-less conversion error renders as the engine's
+/// unfilled message template at the user. The distinction is the whole
+/// point of this variant: [EvalErr::Unsupported] for the first, the
+/// row's own error for the second.
+fn branch_rows_res(
+    plan: &Plan,
+    db: &Database,
+    args: &[WireParam],
+) -> Result<Vec<Vec<Value>>, EvalErr> {
     // A GENERATOR-ADVANCING PROJECT IS NOT A ROW SOURCE HERE. This
     // function destructures Project with `..` and knows nothing of
     // gen_cols, so a generator column would come back NULL and the
@@ -16792,7 +16813,7 @@ fn branch_rows(
     // FOR SELECT, INSERT ... SELECT, a recursive CTE level) refuses
     // until someone converts it deliberately.
     if matches!(plan, Plan::Project { gen_cols, .. } if !gen_cols.is_empty()) {
-        return None;
+        return Err(EvalErr::Unsupported);
     }
     // a UNION is a row source too - and so is a nested one, since this
     // recurses. Everything that materialises rows (INSERT ... SELECT, a
@@ -16801,7 +16822,7 @@ fn branch_rows(
     if let Plan::Union { branches, distinct, order_by, .. } = plan {
         let mut rows: Vec<Vec<Value>> = Vec::new();
         for b in branches {
-            rows.append(&mut branch_rows(b, db, args)?);
+            rows.append(&mut branch_rows_res(b, db, args)?);
         }
         if *distinct {
             let mut seen: Vec<Vec<Value>> = Vec::new();
@@ -16821,17 +16842,17 @@ fn branch_rows(
                 o
             });
         }
-        return Some(rows);
+        return Ok(rows);
     }
     if let Plan::ProcRows { rows, .. } = plan {
-        return Some(rows.clone());
+        return Ok(rows.clone());
     }
     // A SCALAR is a row source too - one row of one column. It is what a
     // lone aggregate plans to (`SELECT MIN(ID) FROM T`), so without this
     // an aggregate could not seed a recursive CTE or feed an
     // INSERT ... SELECT, even though it answers perfectly on its own.
     if let Plan::Scalar(v, ..) = plan {
-        return Some(vec![vec![match v {
+        return Ok(vec![vec![match v {
             Some(n) => Value::Int(*n),
             None => Value::Null,
         }]]);
@@ -16839,7 +16860,7 @@ fn branch_rows(
     // a modified plan is a row source too, so DISTINCT/FIRST can feed a
     // FOR SELECT loop or an INSERT ... SELECT
     if let Plan::Modified { inner, distinct, skip, take, .. } = plan {
-        let mut rows = branch_rows(inner, db, args)?;
+        let mut rows = branch_rows_res(inner, db, args)?;
         if *distinct {
             let mut seen: Vec<Vec<Value>> = Vec::new();
             rows.retain(|r| {
@@ -16851,7 +16872,7 @@ fn branch_rows(
                 }
             });
         }
-        return Some(rows.into_iter().skip(*skip).take(take.unwrap_or(usize::MAX)).collect());
+        return Ok(rows.into_iter().skip(*skip).take(take.unwrap_or(usize::MAX)).collect());
     }
     // A GROUPED plan is a row source too. It could not be one before the
     // fold became a node: materialising a grouped query meant repeating
@@ -16874,7 +16895,7 @@ fn branch_rows(
         let rows = RowSource::aggregate_sorted(
             RowSource::Filter {
                 input: Box::new(leaf_source(*rel, formats.to_vec(), index)),
-                pred: bind_filter(filter, args).ok()?,
+                pred: bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?,
             },
             gitems,
             key_fids,
@@ -16883,27 +16904,29 @@ fn branch_rows(
             having,
             order_by,
         )
-        .rows(db)
-        .ok()?;
+        .rows(db)?;
         return rows
             .iter()
-            .map(|values| cols.iter().map(|c| c.value_of(values).ok()).collect())
+            // a column's own evaluation error travels too - this used
+            // to be `.ok()`, which turned a raise into a missing row
+            .map(|values| cols.iter().map(|c| c.value_of(values)).collect())
             .collect();
     }
     if let Plan::Derived { inner, cols, filter, order_by } = plan {
-        let rows = branch_rows(inner, db, args)?;
+        let rows = branch_rows_res(inner, db, args)?;
         let out = RowSource::Sort {
             input: Box::new(RowSource::Filter {
                 input: Box::new(RowSource::Rows(rows)),
-                pred: bind_filter(filter, args).ok()?,
+                pred: bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?,
             }),
             keys: order_by.clone(),
         }
-        .rows(db)
-        .ok()?;
+        .rows(db)?;
         return out
             .iter()
-            .map(|values| cols.iter().map(|c| c.value_of(values).ok()).collect())
+            // a column's own evaluation error travels too - this used
+            // to be `.ok()`, which turned a raise into a missing row
+            .map(|values| cols.iter().map(|c| c.value_of(values)).collect())
             .collect();
     }
     // A JOIN is a row source too, so DISTINCT/FIRST/SKIP/ROWS may wrap
@@ -16912,15 +16935,17 @@ fn branch_rows(
     // ORDER BY indexes it, not the projection) and then projected, the
     // same two steps `Plan::Project` takes below.
     if let Plan::Join { base, base_width, parts, cols, filter, order_by } = plan {
-        let filter = bind_filter(filter, args).ok()?;
+        let filter = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
         let mut rows =
-            join_rows(db, base, *base_width, parts, &filter).ok()?;
+            join_rows(db, base, *base_width, parts, &filter)?;
         if !order_by.is_empty() {
-            sort_rows(&mut rows, order_by).ok()?;
+            sort_rows(&mut rows, order_by)?;
         }
         return rows
             .iter()
-            .map(|values| cols.iter().map(|c| c.value_of(values).ok()).collect())
+            // a column's own evaluation error travels too - this used
+            // to be `.ok()`, which turned a raise into a missing row
+            .map(|values| cols.iter().map(|c| c.value_of(values)).collect())
             .collect();
     }
     if let Plan::JoinGroup {
@@ -16937,8 +16962,8 @@ fn branch_rows(
         order_by,
     } = plan
     {
-        let filter = bind_filter(filter, args).ok()?;
-        let input = join_rows(db, base, *base_width, parts, &filter).ok()?;
+        let filter = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
+        let input = join_rows(db, base, *base_width, parts, &filter)?;
         // the joined rows are a materialised leaf; the fold and the sort
         // above them are tree nodes (a NestedLoopJoin leaf is R3)
         let rows = RowSource::aggregate_sorted(
@@ -16950,17 +16975,18 @@ fn branch_rows(
             having,
             order_by,
         )
-        .rows(db)
-        .ok()?;
+        .rows(db)?;
         return rows
             .iter()
-            .map(|values| cols.iter().map(|c| c.value_of(values).ok()).collect())
+            // a column's own evaluation error travels too - this used
+            // to be `.ok()`, which turned a raise into a missing row
+            .map(|values| cols.iter().map(|c| c.value_of(values)).collect())
             .collect();
     }
     let Plan::Project { rel, formats, cols, filter, .. } = plan else {
-        return None;
+        return Err(EvalErr::Unsupported);
     };
-    let filter = bind_filter(filter, args).ok()?;
+    let filter = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
     // The ROW SOURCE TREE does the scan, the filter and the sort - the
     // three nodes this function used to spell out by hand. THE SORT
     // BELONGS INSIDE IT because ORDER BY indexes the RECORD's fields and
@@ -16978,16 +17004,16 @@ fn branch_rows(
         _ => None,
     };
     let src = RowSource::scan_filter_sort(*rel, formats.clone(), filter, order_by, index);
-    let records = src.rows(db).ok()?;
+    let records = src.rows(db)?;
     let mut out = Vec::with_capacity(records.len());
     for values in &records {
         let mut row = Vec::with_capacity(cols.len());
         for c in cols {
-            row.push(c.value_of(values).ok()?);
+            row.push(c.value_of(values)?);
         }
         out.push(row);
     }
-    Some(out)
+    Ok(out)
 }
 
 /// Two projected rows are the same row for UNION's set semantics -
@@ -21395,7 +21421,7 @@ fn eval_status_vector(w: &mut W, e: &EvalErr) {
                 .int(2)
                 .bytes(conversion_error_arg(text).as_bytes());
         }
-        EvalErr::ConversionError(None) => {
+        EvalErr::ConversionError(None) | EvalErr::Unsupported => {
             w.int(1) // isc_arg_gds
                 .int(GDS_DSQL_ERROR);
         }
@@ -21874,8 +21900,8 @@ fn emit_rows_inner(
                         return Ok(());
                     }
                 }
-                let mut rows = branch_rows(inner, db, args)
-                    .ok_or(EmitErr::Eval(EvalErr::ConversionError(None)))?;
+                // the inner rows' OWN error, not an invented one
+                let mut rows = branch_rows_res(inner, db, args).map_err(EmitErr::Eval)?;
                 // DISTINCT compares whole projected rows with NULL equal
                 // to NULL - the same set semantics UNION uses
                 if *distinct {
@@ -21903,9 +21929,12 @@ fn emit_rows_inner(
             if let Some(db) = db {
                 let mut rows: Vec<Vec<Value>> = Vec::new();
                 for b in branches {
-                    match branch_rows(b, db, args) {
-                        Some(mut r) => rows.append(&mut r),
-                        None => return Err(EmitErr::Eval(EvalErr::ConversionError(None))),
+                    // a branch that RAISES raises the union, with its
+                    // own vector; a branch this server cannot serve is
+                    // the generic refusal [EvalErr::Unsupported] carries
+                    match branch_rows_res(b, db, args) {
+                        Ok(mut r) => rows.append(&mut r),
+                        Err(e) => return Err(EmitErr::Eval(e)),
                     }
                 }
                 // UNION removes duplicates; UNION ALL is the whole
@@ -22084,8 +22113,8 @@ fn emit_rows_inner(
                 // the inner plan's rows are a MATERIALISED LEAF; the
                 // outer WHERE and ORDER BY are nodes above it - the same
                 // Rows -> Filter -> Sort the grouped join builds
-                let rows = branch_rows(inner, db, args)
-                    .ok_or(EmitErr::Eval(EvalErr::ConversionError(None)))?;
+                // the inner rows' OWN error, not an invented one
+                let rows = branch_rows_res(inner, db, args).map_err(EmitErr::Eval)?;
                 let sorted = RowSource::Sort {
                     input: Box::new(RowSource::Filter {
                         input: Box::new(RowSource::Rows(rows)),
@@ -25110,6 +25139,18 @@ enum EvalErr {
     /// (SQLSTATE 22000), the schema-qualified table name as the
     /// message argument - the engine raises this at PREPARE
     PrimaryKeyRequired(String),
+    /// NOT an engine error: a shape this server does not serve, reached
+    /// where the caller must return SOMETHING of this type. It ships the
+    /// generic `isc_dsql_error`, which is the honest answer - a refusal
+    /// this server cannot justify must not borrow a typed vector, since
+    /// the typed one is what a driver acts on.
+    ///
+    /// It exists because [branch_rows] used to answer `None` for both
+    /// "unsupported" and "the rows raised", so its callers invented an
+    /// argument-less `ConversionError` for both and the client rendered
+    /// the engine's unfilled message template. Now the raise travels and
+    /// only the genuinely unsupported case lands here.
+    Unsupported,
     /// a text value past the client-declared output slot's character
     /// capacity: `isc_arith_except` + `isc_string_truncation` +
     /// `isc_trunc_limits` (SQLSTATE 22001, cvt.cpp:527-531). `expected`
