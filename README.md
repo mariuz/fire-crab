@@ -294,7 +294,9 @@ GSTAT=/opt/firebird/bin/gstat bench/compare.sh /path/to/db.fdb
   baseline.
 - `crates/lck` — the lock manager's table policy (`src/lock/lock.cpp`),
   pinned against the engine's own source and the live server's
-  reservations; deep doc in
+  reservations, and **wired**: fire-crab's own attachments wait on each
+  other through it, and its wait-for scan denies the cycle when two
+  transactions wait on each other. Deep doc in
   [docs/lock-manager-conversion.md](docs/lock-manager-conversion.md).
 - `crates/blb` — blob storage (`src/jrd/blb.cpp`): blh/blp codecs, the
   three address levels, creation through level 1; deep doc in

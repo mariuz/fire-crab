@@ -13,8 +13,10 @@
 # because every reader walks past a version whose transaction it does
 # not count to the one behind it. THAT IS WHAT THE ENGINE DOES TOO, and
 # this gate holds fire-crab to the engine's own answers on all of it:
-# the rows are gone, the file is valid, and the engine's sweep collects
-# the dead versions.
+# the rows are gone, the file is valid, and the engine's own sweep
+# collects the dead versions. (A plain SELECT often collects them too -
+# Firebird's cooperative GC - but WHETHER it does is the engine's
+# scheduling, so that one is reported and not asserted.)
 #
 # THE CARVE-OUT IS MEASURED, NOT ASSUMED. An image is still what undoes
 # a DDL statement - this server's catalog rows are settled as they are
@@ -132,22 +134,20 @@ F.attach(o,(e,d)=>{ if(e){console.log("ERR");process.exit(0);}
 check "fc: COUNT(*) counts rows, not the headers a rollback left" "$fc_count" "2"
 check "fc: the ENGINE reads 2 rows after the rollback" "$(rows "$A")" "2"
 check "fc: and gfix -v -full finds nothing wrong" "$(valid "$A")" ""
-# ...AND THAT READ COLLECTED THEM. Firebird garbage-collects
-# COOPERATIVELY: a SELECT that walks past a dead version takes it with
-# it. The engine treats a transaction fire-crab marked `tra_dead`
-# exactly as it treats its own - which is a stronger statement than
-# "the rows are hidden", and it is why the count above is taken first.
+# ...AND THAT READ MAY HAVE COLLECTED THEM. Firebird garbage-collects
+# COOPERATIVELY - a SELECT that walks past a dead version can take it
+# with it - and measured here it usually does (202 versions down to 34).
+# It is NOT asserted: whether a given read collects is the engine's own
+# scheduling, and it has been observed collecting nothing. Reported so
+# the number is visible; the law is the sweep below.
 read_gc=$("$FCSTAT" versions "$A" "$rel" 2>/dev/null)
-ran=$((ran + 1))
-if [ "${read_gc:-999}" -lt "${after:-0}" ]; then
-    echo "OK   fc: the engine's own SELECT collected them ($after -> $read_gc)"
-else
-    echo "DIFF fc: the engine's read collected nothing ($after -> $read_gc)"; fail=1
-fi
-# ...and its sweep takes whatever the read did not
+echo "note fc: after the engine's read, $after -> $read_gc versions (cooperative GC)"
+# THE LAW: the engine's garbage collector treats a transaction fire-crab
+# marked `tra_dead` exactly as it treats its own, and `gfix -sweep` says
+# so every time.
 "$GFIX" -sweep -user "$U" -pas "$P" "$A" >/dev/null 2>&1
 swept=$("$FCSTAT" versions "$A" "$rel" 2>/dev/null)
-check "fc: and the sweep takes the rest" "$swept" "$live_before"
+check "fc: the engine's own sweep collects every rolled-back version" "$swept" "$live_before"
 check "fc: and the table still reads 2 rows" "$(rows "$A")" "2"
 
 # --- 3. COVERAGE: the rollback wrote a PAGE, not the database ----------

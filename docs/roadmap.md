@@ -16,15 +16,19 @@ matters more than the row count:
 |---|---|---|
 | **done** | on-disk structures, record decode + RLE, PIP, pointer/data pages, B-tree decode, TIP/MVCC, GC/sweep, BLR decode | converted and held against an oracle; the server depends on them |
 | **converted, wired** | `ods`, `blb`, `auth`, `svc`, `exe`, `dsql` | the running server links and uses them |
-| **converted, NOT wired** | `lck`, `evt` | a real conversion of a real law, with a gate — that the server never calls. `lck` is UNBLOCKED now: attachments share one page image per file and a transaction's records stay invisible until it commits, so there is both a resource to arbitrate and a conflict to detect — what `lck` adds is GRANULARITY, in place of one write side per database (W4) |
+| **converted, NOT wired** | `evt` | a real conversion of a real law, with a gate — that the server never calls |
+| **wired** | `lck` | a writer that meets another transaction's uncommitted row waits on that transaction's own lock and then re-reads, and two waiting on each other are denied by the wait-for scan with the engine's `isc_deadlock` (W4) |
 | **being wired** | `opt`, `cch`, `pio` | the server asks `opt` for the access path and takes an index when it says so (W1); the pages of a file live once per process in `cch`'s buffer pool and are flushed in its careful write order (W2), and written with `pio`, in the open mode the header's Forced Writes flag calls for (W3) |
 
-That third row was the honest headline, and W1 has begun on it.
-`crates/wire/Cargo.toml` still does not depend on `-lck` or `-evt`. It DOES depend on `fire-crab-opt` now, and the optimizer's
+That third row was the honest headline, and it is one crate long now:
+`crates/wire/Cargo.toml` depends on `-lck` as well as `-opt`, `-cch`
+and `-pio`; only `-evt` is still a conversion nothing calls. The optimizer's
 choice is executed rather than merely printed — for the one shape W1
-covers so far. The lock manager
-decodes a lock table it never enqueues into. The page cache models a
-careful-write graph the read path does not go through.
+covers so far. The lock manager arbitrates the rows two transactions
+both want, and denies the cycle when they wait on each other. The page
+cache holds the file's pages once for every attachment, and flushes them
+in its careful order — what it does not do yet is hand them out one page
+at a time.
 
 And inside the SQL layer there is a second structural gap: the server
 answers views, CTEs and constant subqueries by **rewriting SQL text and
@@ -2213,10 +2217,9 @@ plus *the subsystem is now on the path*.
   with it on against 38.3s off, so the sync was never the cost. Still to
   do: the READ path (the pool holds the image; `pio` is not the one
   reading it in).
-- **W4 — the lock manager participating** (`lck`): enqueue, dequeue,
-  AST callbacks. Written as "what makes concurrent attachments correct
-  rather than accidentally correct", then **measured, and it was
-  neither** — and the finding was not a missing lock manager but a
+- **W4 — the lock manager participating** (`lck`). *(done)* Written as
+  "what makes concurrent attachments correct rather than accidentally
+  correct", then **measured, and it was neither** — and the finding was not a missing lock manager but a
   missing *shared resource*: every attachment held a private
   `std::fs::read` copy of the file, so two attachments were two
   databases that shared a filename. `qa/serve-real-concurrency.sh` is
@@ -2295,24 +2298,39 @@ plus *the subsystem is now on the path*.
      file was committed — so a refused statement's rolled-back row came
      back as `COUNT(*) = 1`. Nothing about the count was new; what was
      new was a file that finally contained a row nobody should see.
-  2. **A statement-scoped write side.** Once (1) lands, the exclusive
-     window shrinks to the read-modify-write of one statement, so two
-     transactions can be open and writing at once. That alone turns the
-     gate's last divergence — an unrelated writer WAITS where the
-     engine is fast — into the engine's answer.
-  3. **Then the conflict, and then `lck`.** Two transactions writing at
-     once can now touch the SAME row, which the engine refuses or
-     blocks. The detection is already in place: a DML target whose
-     chain head belongs to a transaction that is still `tra_active` is
-     the conflict. `lck` is what turns that into the engine's
-     behaviour rather than an ad-hoc check — `enqueue` per record with
-     the TPB's wait/no-wait, `Verdict::Deadlock` from its wait-for
-     scan, `purge_owner` when an attachment goes. Its table is
-     `&mut self` and in-process, so the server wraps one per database.
+  2. **A statement-scoped write side.** *(done)* The exclusive window
+     is the read-modify-write of ONE statement now, released between
+     requests, so two transactions can be open and writing at once. A
+     transaction whose undo still needs an image keeps it — and the
+     image it would put back is refreshed at each statement boundary
+     until then, since restoring the one from transaction start would
+     undo another connection's commits that landed in between.
+  3. **The conflict, through `lck`.** *(done)* And the engine's
+     mechanism turned out not to be a lock per record at all: a writer
+     that meets a version belonging to another transaction reads that
+     transaction's STATE, and waits on the lock that transaction holds
+     over its own id (`LCK_tra`). `crates/wire/dblocks.rs` is those two
+     calls; `with_conflict_wait` drops the write side, waits, and runs
+     the statement again — the engine's WAIT and re-read. Two
+     transactions waiting on each other close a cycle in the wait-for
+     graph and one is denied with the engine's own `isc_deadlock`.
 
   Written this way round because the tempting order — enqueue first —
-  would produce locks that arbitrate a resource nothing else can reach
-  during a transaction, and every single-session gate would pass.
+  would have produced locks that arbitrate a resource nothing else can
+  reach during a transaction, and every single-session gate would pass.
+
+  And it cost one bug worth keeping: **"has this transaction written?"
+  had been answered by "does it hold the write side"**, which was the
+  same question until the side became one statement long. A transaction
+  that wrote and then read held nothing, so its rollback believed there
+  was nothing to undo and skipped the generator compensations —
+  `qa/serve-real-genwrite.sh` said so. The transaction carries the
+  answer itself now.
+
+  **What is left of W4** is the shape of the answer, not the answer:
+  the engine's deadlock vector carries two more items after the code
+  (`isc_update_conflict` and the concurrent transaction's number), and
+  the TPB's NO WAIT / LOCK TIMEOUT are read as WAIT.
 - **W5 — event delivery** (`evt`): the shared-memory arena, the watcher,
   and the wire path.
 - **W6 — depth in `exe` and `svc`**: the request lifecycle, cursors and

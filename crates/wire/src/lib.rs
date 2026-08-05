@@ -21,6 +21,7 @@
 //! only carry the messages. See `docs/subsystem-map.md` for what remains
 //! unconverted (ChaCha wire crypt, the services surface).
 
+pub mod dblocks;
 pub mod gdscodes;
 pub mod server;
 

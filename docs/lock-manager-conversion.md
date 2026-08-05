@@ -431,9 +431,18 @@ comes back to the head — not at a null.
 
 ## Roadmap
 
-1. **Series semantics** — bring `jrd/lck.cpp`'s typed layer over,
-   so fire-crab's wire server can arbitrate two of ITS OWN
-   attachments through this table.
+1. **Series semantics** — bring `jrd/lck.cpp`'s typed layer over.
+   **The server arbitrates two of its own attachments through this
+   table now**, and what it needed turned out to be one series:
+   `LCK_tra`. Firebird does not lock records — a writer that meets a
+   version belonging to another transaction reads that transaction's
+   state and, if it is still active, waits on the lock that transaction
+   holds over its own id. So the wiring is `enqueue` (exclusive, at a
+   transaction's first write), `enqueue_deadline` (shared, by the
+   waiter), `dequeue` the moment it is granted, and `purge_owner` when
+   the transaction ends — with `Verdict::Deadlock` from the wait-for
+   scan answering as the engine's `isc_deadlock`. The typed layer is
+   still worth having for the rest of the series.
 
    **There is now something to arbitrate.** When this list was written
    the server gave every attachment a private `std::fs::read` copy of

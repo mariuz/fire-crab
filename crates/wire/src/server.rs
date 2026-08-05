@@ -206,6 +206,16 @@ fn respond_error(s: &mut TcpStream, enc: &mut Option<Rc4>, gds: i32) -> std::io:
 /// isc_dsql_error - the generic "Dynamic SQL Error" the server answers
 /// for statements it cannot honour rather than answering them wrong.
 const GDS_DSQL_ERROR: i32 = 335544569;
+
+/// isc_deadlock - what the engine posts when two transactions wait on
+/// each other and its scan denies one of them (iberror: 335544336, the
+/// SQLSTATE 40001 the drivers report as "deadlock").
+const GDS_DEADLOCK: i32 = 335544336;
+
+/// isc_lock_conflict - "lock conflict on no wait transaction", the
+/// engine's answer when a wait it will not make would be needed
+/// (iberror: 335544345).
+const GDS_LOCK_CONFLICT: i32 = 335544345;
 /// `isc_wish_list` - "feature is not supported yet". The engine's own
 /// code for an operation it understands but does not perform, which is
 /// exactly what a service ACTION is to fire-crab.
@@ -515,6 +525,18 @@ struct Database {
     /// write of a transaction, which is why a reader that has not
     /// written counts only committed work.
     tx: Option<u32>,
+    /// whether this TRANSACTION has written anything at all - which is
+    /// not the same as holding the write side, now that the write side
+    /// is one statement long. A rollback asks this to know whether
+    /// there is anything to undo, and the generator windows ask it to
+    /// know whether to write their compensations forward.
+    touched: bool,
+    /// this database's lock table, and this attachment's identity in
+    /// it: a transaction holds a lock on its own id while it lives, and
+    /// a writer that meets one of its versions waits on that - see
+    /// [crate::dblocks]
+    locks: std::sync::Arc<crate::dblocks::DbLocks>,
+    lock_owner: fire_crab_lck::OwnerId,
     /// whether this transaction has done something only an IMAGE can
     /// undo - a DDL statement (its catalog rows are settled as they are
     /// written, since DDL is not transactional here) or a SAVEPOINT
@@ -563,6 +585,9 @@ impl Database {
     /// second install silently drops the first's rows.
     fn work_copy(&mut self) -> Result<Vec<u8>, String> {
         self.take_write_side()?;
+        // every write in this server starts here, so this is where the
+        // transaction stops being a reader
+        self.touched = true;
         Ok(self.bytes().as_ref().clone())
     }
 
@@ -612,9 +637,19 @@ impl Database {
         Ok((work, tx as u32))
     }
 
+    /// This transaction is real from here on: it owns its id in the
+    /// file AND holds the lock on it, which is what another writer
+    /// waits on when it meets one of its versions.
+    fn hold_tx_lock(&mut self, tx: u32) {
+        self.locks.hold_transaction(self.lock_owner, tx);
+    }
+
     /// The statement installed its work, so the id it reserved is now
     /// this attachment's transaction - held until commit or rollback.
     fn adopt_tx(&mut self, tx: u32) {
+        if self.tx != Some(tx) {
+            self.hold_tx_lock(tx);
+        }
         self.tx = Some(tx);
     }
 
@@ -653,12 +688,19 @@ impl Database {
         Ok(())
     }
 
-    /// Whether this connection has written in the current transaction -
-    /// i.e. whether it has anything to roll back. A connection that
-    /// never wrote must not "restore" an image over anybody else's
-    /// work.
+    /// Whether this TRANSACTION has written - i.e. whether it has
+    /// anything to roll back. A connection that never wrote must not
+    /// "restore" an image over anybody else's work.
+    ///
+    /// It used to answer "does it hold the write side", which was the
+    /// same thing while the side was held from a transaction's first
+    /// write to its end. It is not the same thing now: the side is one
+    /// statement long, so a transaction that wrote and then answered a
+    /// SELECT holds nothing - and a rollback that believed it had
+    /// written nothing skipped the generator compensations, which
+    /// `qa/serve-real-genwrite.sh` caught.
     fn wrote(&self) -> bool {
-        self.write.is_some()
+        self.touched
     }
 
     /// The transaction ended (commit or rollback): let the next writer
@@ -666,7 +708,10 @@ impl Database {
     fn end_write(&mut self) {
         self.write = None;
         self.tx = None;
+        self.touched = false;
         self.image_undo = false;
+        // whoever was waiting for this transaction can go now
+        self.locks.release(self.lock_owner);
     }
 
     /// COMMIT: flip this transaction's TIP bits to `tra_committed`, so
@@ -676,6 +721,13 @@ impl Database {
     /// commit publishes is the two bits that say they are real.
     fn commit_tx(&mut self) -> Result<(), String> {
         let Some(tx) = self.tx else { return Ok(()) };
+        // THE WRITE SIDE, EVEN FOR TWO BITS. A commit is a
+        // read-modify-write of the image like any other, and since the
+        // side is released between statements this is the one place it
+        // has to be taken again - without it, a commit lands over
+        // whatever another connection installed while this transaction
+        // was thinking.
+        self.take_write_side()?;
         let mut work = self.bytes().as_ref().clone();
         fire_crab_ods::dml::set_tx_state(
             &mut work,
@@ -702,6 +754,7 @@ impl Database {
     /// allocated staying allocated.
     fn kill_tx(&mut self) -> Result<(), String> {
         let Some(tx) = self.tx else { return Ok(()) };
+        self.take_write_side()?; // see [Database::commit_tx]
         let mut work = self.bytes().as_ref().clone();
         fire_crab_ods::dml::set_tx_state(
             &mut work,
@@ -943,10 +996,15 @@ fn load_database(path: &str) -> Option<Database> {
     if page_size == 0 {
         return None;
     }
+    let locks = crate::dblocks::for_path(p);
+    let lock_owner = locks.owner();
     Some(Database {
         shared,
         write: None,
         tx: None,
+        touched: false,
+        locks,
+        lock_owner,
         image_undo: false,
         page_size,
         path: p.to_string(),
@@ -12670,6 +12728,41 @@ fn collect_dml_targets_drawing(
     Ok((out, last))
 }
 
+/// The transaction blocking this write, if one is.
+///
+/// A row whose chain HEAD belongs to a transaction that is still
+/// `tra_active` is somebody else's uncommitted work: the engine does
+/// not write over it, it waits for that transaction and then re-reads.
+/// Our own is not a conflict (a statement may rewrite what the ones
+/// before it in the same transaction wrote), and neither is a dead or
+/// committed one - the version behind it is what this reader saw, and
+/// rewriting the head is exactly right.
+fn blocking_transaction(db: &Database, targets: &[(u32, u16, u8, Vec<u8>)]) -> Option<u32> {
+    if targets.is_empty() {
+        return None;
+    }
+    let image = db.bytes();
+    let tips = fire_crab_ods::tra::TipChain::read(&image, db.page_size)?;
+    for (page, slot, _, _) in targets {
+        let start = *page as usize * db.page_size;
+        let Some(head) = image
+            .get(start..start + db.page_size)
+            .and_then(DataPage::decode)
+            .and_then(|dp| dp.record(*slot))
+        else {
+            continue;
+        };
+        let owner = head.transaction;
+        if owner == 0 || Some(owner) == db.tx.map(u64::from) {
+            continue;
+        }
+        if tips.state(owner) == Some(fire_crab_ods::tip::TxState::Active) {
+            return Some(owner as u32);
+        }
+    }
+    None
+}
+
 fn collect_dml_targets(
     db: &Database,
     rel: u16,
@@ -12733,6 +12826,16 @@ fn collect_dml_targets(
 enum ExecErr {
     Text(String),
     Eval(EvalErr),
+    /// an error carrying the ENGINE'S OWN status code - a deadlock, a
+    /// lock conflict - where the generic SQL error would lose what the
+    /// driver needs to decide whether to retry
+    Gds(i32, String),
+    /// this statement met a row belonging to another transaction that
+    /// has not finished - the engine WAITS for it and re-reads. Carries
+    /// that transaction's id; [execute_dml] does the waiting and runs
+    /// the statement again, which is why nothing has been written when
+    /// it is raised.
+    Conflict(u32),
 }
 impl From<String> for ExecErr {
     fn from(t: String) -> Self {
@@ -12748,7 +12851,9 @@ impl std::fmt::Display for ExecErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ExecErr::Text(t) => f.write_str(t),
+            ExecErr::Gds(code, t) => write!(f, "{} ({})", t, code),
             ExecErr::Eval(e) => write!(f, "evaluation error: {:?}", e),
+            ExecErr::Conflict(tx) => write!(f, "waiting for transaction {}", tx),
         }
     }
 }
@@ -12769,7 +12874,83 @@ fn execute_dml(
     args: &[WireParam],
     ctx: &SessionCtx,
 ) -> Result<(i32, i32, i32), ExecErr> {
-    execute_dml_collecting(plan, database, args, ctx, None)
+    with_conflict_wait(database, |db| execute_dml_collecting(plan, db, args, ctx, None))
+}
+
+/// How long a statement waits for the transaction holding a row it
+/// wants. The engine's default is WAIT, forever; this waits long enough
+/// to be that in practice and still answers rather than hanging a
+/// connection when the holder never ends.
+fn conflict_wait() -> std::time::Duration {
+    let secs = std::env::var("FC_LOCK_WAIT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(60);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Run a statement, and when it meets another transaction's
+/// uncommitted row: **let go of the database, wait for that
+/// transaction, and run the statement again** - the engine's WAIT
+/// followed by its re-read.
+///
+/// Letting go is the part that has to be right. The transaction being
+/// waited for needs the write side to commit, so a waiter that kept it
+/// would be waiting for something that cannot happen - and the lock
+/// table could not see that deadlock, because the write side is not a
+/// lock it knows about. Nothing has been written when a conflict is
+/// raised, so dropping the working copy costs only the work of
+/// collecting the targets again.
+///
+/// A transaction whose undo is an IMAGE (DDL, an open savepoint) keeps
+/// the write side throughout, which is exactly why it can never be the
+/// one waiting: nobody else can be writing.
+fn with_conflict_wait<F>(
+    database: &mut Option<Database>,
+    mut run: F,
+) -> Result<(i32, i32, i32), ExecErr>
+where
+    F: FnMut(&mut Option<Database>) -> Result<(i32, i32, i32), ExecErr>,
+{
+    loop {
+        match run(database) {
+            Err(ExecErr::Conflict(other)) => {
+                let Some(db) = database.as_mut() else {
+                    return Err("no database attached".into());
+                };
+                if db.image_undo {
+                    // cannot let go, and cannot have got here either
+                    return Err(ExecErr::Text(
+                        "lock conflict inside a statement that holds the database".into(),
+                    ));
+                }
+                db.write = None; // the write side goes back FIRST
+                let waited =
+                    db.locks
+                        .wait_for_transaction(db.lock_owner, other, conflict_wait());
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] waited for transaction {}: {:?}", other, waited);
+                }
+                match waited {
+                    crate::dblocks::Waited::Ended => continue,
+                    // THE ENGINE'S OWN CODES, not a generic SQL error:
+                    // a driver reads 335544336 as SQLSTATE 40001 and
+                    // retries the transaction, which is the whole point
+                    // of saying "deadlock" rather than "it failed"
+                    crate::dblocks::Waited::Deadlock => {
+                        return Err(ExecErr::Gds(GDS_DEADLOCK, "deadlock".into()))
+                    }
+                    crate::dblocks::Waited::TimedOut => {
+                        return Err(ExecErr::Gds(
+                            GDS_LOCK_CONFLICT,
+                            "lock conflict on no wait transaction".into(),
+                        ))
+                    }
+                }
+            }
+            other => return other,
+        }
+    }
 }
 
 /// A DML statement that fails writes NOTHING - except the generator
@@ -13372,6 +13553,13 @@ fn execute_dml_collecting_inner(
                 None => collect_dml_targets(db, *rel, formats, filter, index)
                     .map_err(ExecErr::Eval)?,
             };
+            // NOTHING HAS BEEN WRITTEN YET, which is what makes the
+            // wait possible: [execute_dml] releases the database's
+            // write side, waits for the transaction that holds the row,
+            // and runs this statement again.
+            if let Some(other) = blocking_transaction(db, &found) {
+                return Err(ExecErr::Conflict(other));
+            }
             for (page, slot, fmt, image) in found {
                 // the SET offsets were resolved in the NEWEST format; a
                 // record still stored in an older one would patch wrong
@@ -13593,6 +13781,11 @@ fn execute_dml_collecting_inner(
                 None => collect_dml_targets(db, *rel, formats, filter, index)
                     .map_err(ExecErr::Eval)?,
             };
+            // the same wait an UPDATE makes: a row another transaction
+            // is still holding is not this statement's to delete
+            if let Some(other) = blocking_transaction(db, &found) {
+                return Err(ExecErr::Conflict(other));
+            }
             for (page, slot, fmt, image) in found {
                 // NO ACTION partner check, per deleted row: its key
                 // must not be referenced by any child (the row's own
@@ -22209,8 +22402,11 @@ impl From<EvalErr> for EmitErr {
 impl From<ExecErr> for EmitErr {
     fn from(e: ExecErr) -> Self {
         match e {
-            ExecErr::Text(_) => EmitErr::Bind,
+            ExecErr::Text(_) | ExecErr::Gds(..) => EmitErr::Bind,
             ExecErr::Eval(ev) => EmitErr::Eval(ev),
+            // a conflict never leaves [execute_dml] - it waits there
+            // and runs the statement again
+            ExecErr::Conflict(_) => EmitErr::Bind,
         }
     }
 }
@@ -33230,6 +33426,18 @@ fn dml_tx(stmt_tx: Option<u32>) -> Result<u32, String> {
     stmt_tx.ok_or_else(|| "no transaction reserved for a record write".to_string())
 }
 
+/// Let go of the database between requests, unless this transaction's
+/// undo needs the image it started from. The TRANSACTION is untouched -
+/// its id, its lock and its rows all stand; what goes back is only the
+/// right to be the one writing.
+fn release_write_side(database: &mut Option<Database>) {
+    if let Some(db) = database.as_mut() {
+        if !db.image_undo {
+            db.write = None;
+        }
+    }
+}
+
 /// The transaction ended - COMMIT or ROLLBACK, statement or wire op -
 /// so the database's write side goes back and the next writer gets in.
 ///
@@ -35306,6 +35514,9 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
         // `write-waits` counts writers that had to queue behind
         // another. Both zero means nothing is being shared.
         eprintln!("[srv] pool: {}", fire_crab_cch::pool::stats_line());
+        // ...and the lock table's, for the same reason: a lock manager
+        // that never arbitrates anything passes every behaviour gate
+        eprintln!("[srv] locks: {}", crate::dblocks::stats_line());
     }
     let attach_id = ATTACH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     respond(&mut s, &mut enc, 1)?; // attachment handle 1
@@ -35379,6 +35590,33 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
 
     // --- the op loop (encrypted) ---
     loop {
+        // BETWEEN REQUESTS, THE DATABASE IS NOT HELD. The write side
+        // covers the read-modify-write of ONE statement; holding it for
+        // the whole transaction was only ever needed because a rollback
+        // put an image back, and a transaction whose undo is its own
+        // state does not. So two transactions can now be open and
+        // writing at once, and what arbitrates a row they both want is
+        // the lock table (see [with_conflict_wait]).
+        //
+        // A transaction that still needs an IMAGE to undo - DDL, or an
+        // open savepoint - keeps it, because that image must not be put
+        // back over anybody else's committed work.
+        release_write_side(&mut database);
+        // AND THE IMAGE A ROLLBACK WOULD PUT BACK IS REFRESHED HERE.
+        // While a transaction's undo is its own state, the snapshot is
+        // unused; the moment a statement makes it need an IMAGE (DDL, a
+        // savepoint) the right image is the one from JUST BEFORE that
+        // statement - not from the transaction's start, because another
+        // connection may have committed in between and restoring over
+        // that would undo work that was never this transaction's.
+        // Records this transaction wrote before then are in the
+        // snapshot too, and stay dead by their transaction state.
+        //
+        // It costs a refcount bump, which is the other reason snapshots
+        // stopped being copies.
+        if database.as_ref().is_some_and(|d| !d.image_undo) {
+            tx_snapshot = snapshot_db(&database);
+        }
         let op = match read_int(&mut s, &mut dec) {
             Ok(o) => o,
             Err(_) => break,
@@ -35510,7 +35748,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             Err(ExecErr::Eval(ev)) => {
                                 respond_eval_error(&mut s, &mut enc, &ev)?
                             }
-                            Err(ExecErr::Text(_)) => {
+                            Err(ExecErr::Gds(code, _)) => {
+                                respond_error(&mut s, &mut enc, code)?
+                            }
+                            Err(ExecErr::Text(_)) | Err(ExecErr::Conflict(_)) => {
                                 respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
                             }
                         }
@@ -36006,13 +36247,11 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         let inner = inner.clone();
                         let cols = cols.clone();
                         let fields = fields.clone();
-                        match execute_dml_collecting(
-                            &inner,
-                            &mut database,
-                            &bound_args,
-                            &ctx,
-                            Some(&mut affected),
-                        ) {
+                        // RETURNING waits and re-reads too - the write
+                        // inside it is the same write
+                        match with_conflict_wait(&mut database, |db| {
+                            execute_dml_collecting(&inner, db, &bound_args, &ctx, Some(&mut affected))
+                        }) {
                             Ok(counts) => {
                                 last_dml = counts;
                                 // the FULL decoded record per row: a ProjCol
@@ -36045,7 +36284,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                     ExecErr::Eval(ev) => {
                                         respond_eval_error(&mut s, &mut enc, &ev)?
                                     }
-                                    ExecErr::Text(_) => {
+                                    ExecErr::Gds(code, _) => {
+                                        respond_error(&mut s, &mut enc, code)?
+                                    }
+                                    ExecErr::Text(_) | ExecErr::Conflict(_) => {
                                         respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
                                     }
                                 }
@@ -36076,7 +36318,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                 ExecErr::Eval(ev) => {
                                     respond_eval_error(&mut s, &mut enc, &ev)?
                                 }
-                                ExecErr::Text(_) => {
+                                ExecErr::Gds(code, _) => respond_error(&mut s, &mut enc, code)?,
+                                ExecErr::Text(_) | ExecErr::Conflict(_) => {
                                     respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
                                 }
                             }
@@ -36268,7 +36511,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         eprintln!("[srv] select bind failed: {}", e);
                     }
                     match e {
-                        ExecErr::Text(_) => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
+                        ExecErr::Gds(code, _) => respond_error(&mut s, &mut enc, code)?,
+                        ExecErr::Text(_) | ExecErr::Conflict(_) => {
+                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
+                        }
                         ExecErr::Eval(ev) => respond_eval_error(&mut s, &mut enc, &ev)?,
                     }
                 } else {
@@ -36948,13 +37194,9 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     }
                     let ctx = SessionCtx { user, attach_id };
                     let mut affected = Affected::default();
-                    match execute_dml_collecting(
-                        &inner,
-                        &mut database,
-                        &exec2_args,
-                        &ctx,
-                        Some(&mut affected),
-                    ) {
+                    match with_conflict_wait(&mut database, |db| {
+                        execute_dml_collecting(&inner, db, &exec2_args, &ctx, Some(&mut affected))
+                    }) {
                         Ok(counts) => {
                             // the driver's next op_info_sql asks
                             // RECORDS_INFO for a type-8 statement -
@@ -37045,7 +37287,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                 ExecErr::Eval(ev) => {
                                     respond_eval_error(&mut s, &mut enc, &ev)?
                                 }
-                                ExecErr::Text(_) => {
+                                ExecErr::Gds(code, _) => respond_error(&mut s, &mut enc, code)?,
+                                ExecErr::Text(_) | ExecErr::Conflict(_) => {
                                     respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
                                 }
                             }
@@ -38225,6 +38468,9 @@ mod tests {
             shared: fire_crab_cch::pool::detached(Vec::new()),
             write: None,
             tx: None,
+            touched: false,
+            locks: crate::dblocks::for_path("/nonexistent/fc-rowsource-test"),
+            lock_owner: 0,
             image_undo: false,
             page_size: 8192,
             path: String::new(),
@@ -41028,6 +41274,9 @@ mod tests {
             shared: fire_crab_cch::pool::detached(Vec::new()),
             write: None,
             tx: None,
+            touched: false,
+            locks: crate::dblocks::for_path("/nonexistent/fc-rowsource-test"),
+            lock_owner: 0,
             image_undo: false,
             page_size: 4096,
             path: String::new(),

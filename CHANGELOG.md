@@ -13,6 +13,70 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-05 — The lock manager, participating
+
+### Converted
+- **W4 is done: `lck` is wired, and the write side is one statement
+  long.** The database's write side used to be held from a
+  transaction's first write to its commit, because a rollback put an
+  image back; now that a rollback is two bits, it covers the
+  read-modify-write of ONE statement and is released between requests.
+  Two transactions can be open and writing at once — and what
+  arbitrates a row they both want is the lock table.
+- **The engine's own mechanism, not a lock per record.** Firebird does
+  not lock records: a writer that meets a version belonging to another
+  transaction reads that transaction's STATE, and if it is still active
+  it waits — on a lock the transaction holds over its own id
+  (`LCK_tra`, series 4) for as long as it lives. `crates/wire/dblocks.rs`
+  is that, in two calls: `hold_transaction` at a transaction's first
+  write, `wait_for_transaction` by a writer that met one. When the
+  holder ends, the waiter wakes, **re-reads the row and applies its
+  write to what it now finds** — the engine's WAIT and re-read, in
+  `with_conflict_wait`, which is also where the write side is dropped
+  before waiting (the transaction being waited for needs it to commit,
+  and that deadlock is not one the lock table could see).
+- **And the deadlock scan answers.** Two transactions each waiting on
+  the other close a cycle in the wait-for graph, and `fire_crab_lck`
+  denies the second rather than letting it hang — reported with the
+  engine's own `isc_deadlock` (335544336), so a driver reads SQLSTATE
+  40001 and retries; a wait that runs out of time gets
+  `isc_lock_conflict` (335544345). The table's deadline machinery
+  (`enqueue_deadline` + `expire`) is what bounds the wait, converted
+  long ago with nothing calling it.
+- **Measured, against the engine, on every probe**
+  (`qa/serve-real-concurrency.sh`, 20 checks — all of them now the
+  engine's answers rather than recorded divergences):
+
+  | probe | engine | fire-crab |
+  |---|---|---|
+  | an uncommitted row, from another attachment | invisible | invisible |
+  | a writer wanting an UNRELATED row | not held up | not held up |
+  | a writer wanting a row another transaction holds | waits, then writes | waits, then writes |
+  | two transactions waiting on each other | exactly one denied | exactly one denied |
+  | the deadlock's status code | 335544336 | 335544336 |
+
+  Plus the coverage half, read out of the server log: `locks: holds 10
+  waits 3 grants 2 deadlocks 1` — the lock table was on the path, and
+  the wait-for scan really denied a cycle.
+- **A snapshot taken when it is needed, not at transaction start.** A
+  transaction whose undo is an image (DDL, an open savepoint) keeps the
+  write side, and the image it would put back is refreshed at every
+  statement boundary until then — restoring the transaction's opening
+  image would otherwise undo another connection's commits that landed
+  in between. It costs a refcount bump, which is the other reason
+  snapshots stopped being copies.
+
+### Fixed
+- **"Has this transaction written?" stopped meaning "does it hold the
+  write side".** They were the same question while the side was held
+  from a transaction's first write to its end; once it became one
+  statement long, a transaction that wrote and then answered a SELECT
+  held nothing — and its ROLLBACK concluded there was nothing to undo,
+  so the GENERATOR COMPENSATIONS never ran and a rolled-back
+  `SET GENERATOR` kept its value. `qa/serve-real-genwrite.sh` and
+  `qa/serve-real-gendurable.sh` caught it (17 checks between them). The
+  transaction now carries the answer itself.
+
 ## 2026-08-05 — A rollback is two bits
 
 ### Converted
@@ -24,16 +88,18 @@ was caught), **Guarded** (a wrong-answer path closed by refusal).
   allocated stay allocated, and none of it counts, because every reader
   walks past a version whose transaction it does not count. **That is
   what the engine leaves behind too.**
-- **The engine collects it, and does so on a plain SELECT.** New gate
-  `qa/serve-real-undo.sh` (17 checks): after fire-crab rolls back 200
-  inserts, all 202 versions are still on the pages (counted before the
-  engine is let near the file), the engine reads 2 rows, `gfix -v -full`
-  finds nothing wrong — and **that read collected them**, 202 → 34,
-  because Firebird garbage-collects COOPERATIVELY: a SELECT walking past
-  a dead version takes it with it. The engine treats a transaction
-  fire-crab marked dead exactly as it treats its own, which is a
-  stronger statement than "the rows are hidden". `gfix -sweep` takes the
-  rest.
+- **The engine's own garbage collector takes them.** New gate
+  `qa/serve-real-undo.sh` (16 checks + one observation): after fire-crab
+  rolls back 200 inserts, all 202 versions are still on the pages
+  (counted before the engine is let near the file), the engine reads 2
+  rows, `gfix -v -full` finds nothing wrong, and `gfix -sweep` collects
+  every rolled-back version — the engine treats a transaction fire-crab
+  marked dead exactly as it treats its own, which is a stronger
+  statement than "the rows are hidden". A plain SELECT usually collects
+  them too (202 → 34: Firebird's COOPERATIVE GC, a read taking dead
+  versions with it), but **whether a given read collects is the
+  engine's own scheduling** — it was seen collecting nothing — so the
+  gate reports that number and asserts the sweep.
 - **Measured**: a rollback flushes ONE page instead of the database (the
   gate asserts it from the careful-flush trace), and 200 rolled-back
   inserts on a 20MB database cost 32ms before and 11ms now — the
