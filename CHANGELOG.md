@@ -13,6 +13,58 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-05 — A rollback is two bits
+
+### Converted
+- **Undo by transaction STATE, not by image.** A transaction that wrote
+  only records is rolled back by marking it `tra_dead` — two bits in
+  the TIP — where it used to be undone by putting back the whole
+  database image the transaction started from. The rows stay on the
+  pages, the index entries naming them stay in the trees, the pages it
+  allocated stay allocated, and none of it counts, because every reader
+  walks past a version whose transaction it does not count. **That is
+  what the engine leaves behind too.**
+- **The engine collects it, and does so on a plain SELECT.** New gate
+  `qa/serve-real-undo.sh` (17 checks): after fire-crab rolls back 200
+  inserts, all 202 versions are still on the pages (counted before the
+  engine is let near the file), the engine reads 2 rows, `gfix -v -full`
+  finds nothing wrong — and **that read collected them**, 202 → 34,
+  because Firebird garbage-collects COOPERATIVELY: a SELECT walking past
+  a dead version takes it with it. The engine treats a transaction
+  fire-crab marked dead exactly as it treats its own, which is a
+  stronger statement than "the rows are hidden". `gfix -sweep` takes the
+  rest.
+- **Measured**: a rollback flushes ONE page instead of the database (the
+  gate asserts it from the careful-flush trace), and 200 rolled-back
+  inserts on a 20MB database cost 32ms before and 11ms now — the
+  remainder being the whole-image copy every write still makes, which is
+  what W2's per-page fetch removes.
+- **Snapshots are free now.** A published image is never edited in
+  place, so a transaction that may need to put the file back keeps a
+  REFERENCE (`Arc<Vec<u8>>`) rather than a copy: `snapshot_db` costs a
+  refcount bump where it used to copy the whole database, once per
+  transaction and once per savepoint.
+- **The carve-out is measured, not assumed.** An image is still what
+  undoes a DDL statement — this server's catalog rows are settled as
+  they are written — and a `ROLLBACK TO` a mark, which asks a
+  transaction to undo part of itself; those transactions carry
+  `Database::image_undo` and take the old path. The gate holds both
+  against the engine.
+
+### Fixed
+- **`SELECT COUNT(*)` counted record HEADERS, not rows.** With no
+  filter it took a decode-free fast path over live primary headers,
+  which was right only while every transaction in the file was
+  committed. The moment a rollback stopped rewriting the database, the
+  rows it left behind were still headers — and a refused
+  `INSERT ... RETURNING` whose transaction the driver rolled back came
+  back as `COUNT(*) = 1` against the engine's 0.
+  `qa/serve-real-outblr.sh` caught it. The fast path now walks the
+  version chain through `tra::visible_exists` — the same walk the
+  decoding path does, with the images left alone, because a count needs
+  the answer and not the bytes — and `qa/serve-real-undo.sh` asks
+  fire-crab for the count itself rather than only asking the engine.
+
 ## 2026-08-05 — A transaction that has not committed
 
 ### Converted

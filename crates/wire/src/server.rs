@@ -515,6 +515,13 @@ struct Database {
     /// write of a transaction, which is why a reader that has not
     /// written counts only committed work.
     tx: Option<u32>,
+    /// whether this transaction has done something only an IMAGE can
+    /// undo - a DDL statement (its catalog rows are settled as they are
+    /// written, since DDL is not transactional here) or a SAVEPOINT
+    /// (one transaction id cannot say "undo the last three
+    /// statements"). A transaction that only wrote RECORDS is undone by
+    /// its own transaction state instead, and needs no snapshot at all.
+    image_undo: bool,
     page_size: usize,
     /// where the bytes came from - an INSERT flushes back here
     path: String,
@@ -627,6 +634,14 @@ impl Database {
         self.note_disk();
     }
 
+    /// [Database::install_flushed] for an image the caller already
+    /// holds - a snapshot being put back.
+    fn install_flushed_image(&mut self, img: std::sync::Arc<Vec<u8>>) {
+        self.shared.publish_image(std::sync::Arc::clone(&img));
+        self.shared.note_flushed(img);
+        self.note_disk();
+    }
+
     /// Flush the changed pages of `work` in the engine's precedence
     /// order and install it. The baseline is the image ON DISK: an
     /// earlier install that was never flushed - the transaction id's
@@ -651,6 +666,7 @@ impl Database {
     fn end_write(&mut self) {
         self.write = None;
         self.tx = None;
+        self.image_undo = false;
     }
 
     /// COMMIT: flip this transaction's TIP bits to `tra_committed`, so
@@ -671,11 +687,19 @@ impl Database {
         Ok(())
     }
 
-    /// ROLLBACK, when there is no image snapshot to put back: mark the
-    /// transaction `tra_dead`, which is how the engine ends one it will
-    /// not honour. The rows stay on the pages and stop counting - a
-    /// reader walks past them to the version behind, exactly as it does
-    /// for an active one.
+    /// ROLLBACK BY TRANSACTION STATE: mark it `tra_dead`, which is how
+    /// the engine ends one it will not honour. The rows stay on the
+    /// pages and stop counting - a reader walks past them to the
+    /// version behind, exactly as it does for an active one - and the
+    /// engine's own sweep collects them later.
+    ///
+    /// This is the whole of a rollback for a transaction that wrote
+    /// only RECORDS, and it costs two bits where restoring an image
+    /// costs a rewrite of the database. What it leaves behind is what
+    /// the engine leaves behind: dead versions until the sweep, index
+    /// entries naming records nobody can see (harmless - an index names
+    /// candidates and the record decides), and pages that were
+    /// allocated staying allocated.
     fn kill_tx(&mut self) -> Result<(), String> {
         let Some(tx) = self.tx else { return Ok(()) };
         let mut work = self.bytes().as_ref().clone();
@@ -923,6 +947,7 @@ fn load_database(path: &str) -> Option<Database> {
         shared,
         write: None,
         tx: None,
+        image_undo: false,
         page_size,
         path: p.to_string(),
         ods_major: h.ods_major(),
@@ -12830,7 +12855,16 @@ fn execute_dml_collecting_inner(
             let (w, tx) = db.work_copy_with_tx()?;
             (w, Some(tx))
         }
-        _ => (db.work_copy()?, None),
+        // A CATALOG WRITE IS SETTLED AS IT IS WRITTEN - this server's
+        // DDL is not transactional - so nothing but the image the
+        // transaction started from can undo it. A generator is the
+        // exception: its undo is a value written FORWARD by the
+        // generator windows, which is why it does not ask for one.
+        Plan::SetGenerator { .. } => (db.work_copy()?, None),
+        _ => {
+            db.image_undo = true;
+            (db.work_copy()?, None)
+        }
     };
     let counts = match plan {
         Plan::CreateTable { name, cols, constraints, fks, relation_type } => {
@@ -20646,9 +20680,17 @@ fn aggregate(
     // filter it counts record headers without decoding - which is also the
     // only way it works on system relations (whose format is not in
     // RDB$FORMATS, so for_each_record would decode nothing).
+    //
+    // IT STILL HAS TO ASK WHOSE ROWS THEY ARE. Counting live primary
+    // headers was right only while every transaction in the file was
+    // committed; once a rollback stopped rewriting the database, the
+    // rows it left behind were still headers, and this counted them.
+    // `visible_exists` is the same walk the decoding path does, with
+    // the images left alone - the header says whether the version this
+    // reader counts is a row or a deleted stub.
     if let (AggFn::Count, AggTarget::Star) = (func, target) {
         let n = match filter {
-            None => fire_crab_ods::count_primary_records(&db.bytes(), db.page_size, rel) as i64,
+            None => count_visible_records(db, rel),
             Some(_) => {
                 let mut n = 0i64;
                 for_each_candidate(db, rel, formats, index, |v| {
@@ -21068,6 +21110,35 @@ fn for_each_record_while<F: FnMut(&[Value]) -> Flow>(
             }
         }
     }
+}
+
+/// Rows of `rel` this attachment counts - the decode-free walk behind
+/// `SELECT COUNT(*)` with no filter. See [ReadView] for whose rows they
+/// are; the only difference here is that no image is assembled, because
+/// a count needs the answer and not the bytes.
+fn count_visible_records(db: &Database, rel: u16) -> i64 {
+    let db_image = db.bytes();
+    let Some(tips) = fire_crab_ods::tra::TipChain::read(&db_image, db.page_size) else {
+        // no transaction inventory to consult: what the walk did before
+        return fire_crab_ods::count_primary_records(&db_image, db.page_size, rel) as i64;
+    };
+    let own = db.tx.map(u64::from);
+    let mut n = 0i64;
+    for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
+        let start = dp_no as usize * db.page_size;
+        let Some(dp) = db_image
+            .get(start..start + db.page_size)
+            .and_then(DataPage::decode)
+        else {
+            continue;
+        };
+        for r in dp.records() {
+            if fire_crab_ods::tra::visible_exists(&db_image, db.page_size, &r, &tips, own) {
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 fn for_each_record<F: FnMut(&[Value])>(
@@ -33075,8 +33146,13 @@ fn run_body_dml(
 // is the cost model this server already runs on.
 
 /// The page image as it stands, to be restored if a statement fails.
-fn snapshot_db(database: &Option<Database>) -> Option<Vec<u8>> {
-    database.as_ref().map(|d| d.bytes().as_ref().clone())
+fn snapshot_db(database: &Option<Database>) -> Option<std::sync::Arc<Vec<u8>>> {
+    // A REFERENCE, NOT A COPY. A published image is never edited in
+    // place, so holding one keeps the file as it was however many
+    // installs follow - and taking the snapshot costs a refcount bump
+    // where it used to cost a copy of the whole database, once per
+    // transaction and once per savepoint.
+    database.as_ref().map(|d| d.bytes())
 }
 
 /// Put a snapshot back and flush it, undoing everything a failed
@@ -33094,19 +33170,57 @@ fn snapshot_db(database: &Option<Database>) -> Option<Vec<u8>> {
 /// is what says whether this connection wrote, and it is held from the
 /// transaction's first write until here, so no other writer can have
 /// committed inside the window this restore covers.
-fn restore_db(database: &mut Option<Database>, snap: Option<Vec<u8>>) -> bool {
+fn restore_db(database: &mut Option<Database>, snap: Option<std::sync::Arc<Vec<u8>>>) -> bool {
     if let (Some(db), Some(bytes)) = (database.as_mut(), snap) {
         if !db.wrote() {
             return false;
         }
-        let _ = std::fs::write(&db.path, &bytes);
-        db.install_flushed(bytes);
+        let _ = std::fs::write(&db.path, bytes.as_slice());
+        db.install_flushed_image(bytes);
         // the restored image carries the header and the TIP as they
         // were, so the id this attachment reserved may no longer exist
         db.retune_tx();
         return true;
     }
     false
+}
+
+/// Undo the transaction, and say how.
+///
+/// **A transaction that wrote only RECORDS is undone by its own
+/// transaction state**: `tra_dead` in the TIP, two bits, and every
+/// reader walks past its versions to the ones behind them. The rows
+/// stay on the pages, the index entries naming them stay in the trees,
+/// and the pages it allocated stay allocated - all of which is what the
+/// engine leaves behind too, and what its sweep collects.
+///
+/// The IMAGE is still what undoes anything else: a DDL statement,
+/// whose catalog rows are settled as they are written, and a
+/// ROLLBACK TO a mark, which asks a transaction to undo part of itself.
+/// Those transactions carry [Database::image_undo] and take the old
+/// path - restore the file the transaction started from.
+///
+/// Returns the outcome for [end_transaction] and whether anything was
+/// undone at all (which the generator windows need: their values are
+/// written forward over whatever the rollback left).
+fn rollback_now(
+    database: &mut Option<Database>,
+    tx_snapshot: &mut Option<std::sync::Arc<Vec<u8>>>,
+) -> (TxEnd, bool) {
+    let by_image = database.as_ref().is_some_and(|d| d.image_undo);
+    let wrote = database.as_ref().is_some_and(|d| d.wrote());
+    if by_image {
+        let snap = tx_snapshot.take();
+        let undone = snap.is_some();
+        let put_back = restore_db(database, snap);
+        return (
+            if put_back { TxEnd::RolledBackImage } else { TxEnd::RollbackNoImage },
+            undone,
+        );
+    }
+    // nothing an image is needed for: the transaction state says it all
+    *tx_snapshot = None;
+    (TxEnd::RollbackNoImage, wrote)
 }
 
 /// The transaction a record write runs under. `None` here would mean a
@@ -33137,10 +33251,11 @@ fn end_transaction(database: &mut Option<Database>, outcome: TxEnd) {
         // counting the rows the moment it lands.
         TxEnd::Commit => db.commit_tx(),
         // A rollback that put an image back has already undone the
-        // transaction, TIP entry and all. One that had no snapshot to
-        // put back ends the transaction the other way the engine can:
-        // `tra_dead`, which stops the rows counting exactly as an
-        // active one does, permanently.
+        // transaction, TIP entry and all. Every other rollback ends it
+        // the way the engine does: `tra_dead`, which stops the rows
+        // counting exactly as an active one does, permanently - and is
+        // the WHOLE of a rollback for a transaction that wrote only
+        // records (see [rollback_now]).
         TxEnd::RolledBackImage => Ok(()),
         TxEnd::RollbackNoImage => db.kill_tx(),
     };
@@ -35214,12 +35329,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // takes the snapshot, op_rollback restores it, op_commit drops it.
     // One clone per transaction - the same cost model statement-level
     // rollback already runs on.
-    let mut tx_snapshot: Option<Vec<u8>> = None;
+    let mut tx_snapshot: Option<std::sync::Arc<Vec<u8>>> = None;
     // Named marks inside the transaction, oldest first: the image as it
     // stood when each mark was made. ROLLBACK TO puts that image back and
     // KEEPS the mark; RELEASE forgets the mark but keeps the work. Both
     // discard the marks made AFTER the named one.
-    let mut savepoints: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut savepoints: Vec<(String, std::sync::Arc<Vec<u8>>)> = Vec::new();
     let mut stmts: std::collections::HashMap<i32, StmtSlot> = std::collections::HashMap::new();
     let mut cur_stmt: i32 = 3;
     // handles run 3, 4, 5, ... - starting at 3 keeps the first one the
@@ -35813,6 +35928,15 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                 }
                                 match snapshot_db(&database) {
                                     Some(img) => {
+                                        // ROLLBACK TO a mark is an
+                                        // image restore - one
+                                        // transaction id cannot undo
+                                        // part of itself - so this
+                                        // transaction keeps its
+                                        // snapshot path to the end
+                                        if let Some(db) = database.as_mut() {
+                                            db.image_undo = true;
+                                        }
                                         savepoints.push((name.clone(), img));
                                         gen_window_push(&mut database);
                                         true
@@ -35852,17 +35976,16 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         // ending the transaction discards every mark
                         savepoints.clear();
                         let outcome = if *rollback {
-                            let snap = tx_snapshot.take();
-                            let undone = snap.is_some();
-                            let put_back = restore_db(&mut database, snap);
+                            let (outcome, undone) = rollback_now(&mut database, &mut tx_snapshot);
                             // the transaction is window 0, so the whole
-                            // stack unwinds against the restored image
+                            // stack unwinds against the image the
+                            // rollback left behind
                             gen_window_unwind(&mut database, 0, undone);
                             reset_gen_windows(&mut database);
                             if std::env::var("FC_SRV_TRACE").is_ok() {
                                 eprintln!("[srv] ROLLBACK - transaction undone: {}", undone);
                             }
-                            if put_back { TxEnd::RolledBackImage } else { TxEnd::RollbackNoImage }
+                            outcome
                         } else {
                             tx_snapshot = snapshot_db(&database);
                             reset_gen_windows(&mut database);
@@ -36406,16 +36529,13 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 // lists have to end together
                 savepoints.clear();
                 let outcome = if x == OP_ROLLBACK {
-                    // put the file back as the transaction found it
-                    let snap = tx_snapshot.take();
-                    let undone = snap.is_some();
-                    let put_back = restore_db(&mut database, snap);
+                    let (outcome, undone) = rollback_now(&mut database, &mut tx_snapshot);
                     gen_window_unwind(&mut database, 0, undone);
                     reset_gen_windows(&mut database);
                     if undone && std::env::var("FC_SRV_TRACE").is_ok() {
                         eprintln!("[srv] op_rollback - transaction undone");
                     }
-                    if put_back { TxEnd::RolledBackImage } else { TxEnd::RollbackNoImage }
+                    outcome
                 } else {
                     // committed: this image is the new starting point
                     tx_snapshot = snapshot_db(&database);
@@ -38105,6 +38225,7 @@ mod tests {
             shared: fire_crab_cch::pool::detached(Vec::new()),
             write: None,
             tx: None,
+            image_undo: false,
             page_size: 8192,
             path: String::new(),
             ods_major: 0,
@@ -40907,6 +41028,7 @@ mod tests {
             shared: fire_crab_cch::pool::detached(Vec::new()),
             write: None,
             tx: None,
+            image_undo: false,
             page_size: 4096,
             path: String::new(),
             ods_major: 14,

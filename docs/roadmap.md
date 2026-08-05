@@ -2269,18 +2269,32 @@ plus *the subsystem is now on the path*.
   the locking.** That is the dependency worth writing down before
   anything is enqueued, because `lck` is not the first step:
 
-  1. **Rollback by STATE, not by image.** A transaction-level ROLLBACK
-     restores the image the transaction started from — which is only
-     safe while nobody else can have committed inside that window,
-     which is why the write side is held to the commit. With real
-     transaction state that restore is no longer needed for RECORDS:
-     `tra_dead` says the same thing, and stale index entries and
-     leaked pages are what the engine itself leaves behind (the
-     "candidates, not answers" rule already makes a stale entry
-     harmless). What still needs an image is a SAVEPOINT — one
-     transaction id cannot say "undo the last three statements" — so
-     the transaction-scoped write side survives exactly as long as a
-     mark is open, and no longer.
+  1. **Rollback by STATE, not by image.** *(done)* A transaction that
+     wrote only records is undone by `tra_dead` — two bits — instead of
+     putting back the whole image; the rows, the index entries naming
+     them and the pages they allocated all stay, and none of it counts,
+     which is what the engine leaves behind too. `qa/serve-real-undo.sh`
+     holds it: 202 versions still on the pages after the rollback, the
+     engine reading 2 rows, `gfix -v -full` clean — **and that read
+     collecting them, 202 → 34, because Firebird garbage-collects
+     cooperatively**; the sweep takes the rest. One page flushed instead
+     of the database; 32ms → 11ms to roll back 200 inserts on a 20MB
+     file. Snapshots became free on the way (a reference to an immutable
+     published image, not a copy).
+
+     What still needs an image: DDL, whose catalog rows are settled as
+     they are written, and `ROLLBACK TO` a mark — one transaction id
+     cannot say "undo the last three statements". Those transactions
+     carry `Database::image_undo`, and it is what step 2 will keep the
+     transaction-scoped write side for.
+
+     It also found a bug of the kind this whole programme is for: the
+     rows a rollback now LEAVES behind were still being counted.
+     `SELECT COUNT(*)` with no filter took a decode-free fast path over
+     live primary headers — right only while every transaction in the
+     file was committed — so a refused statement's rolled-back row came
+     back as `COUNT(*) = 1`. Nothing about the count was new; what was
+     new was a file that finally contained a row nobody should see.
   2. **A statement-scoped write side.** Once (1) lands, the exclusive
      window shrinks to the read-modify-write of one statement, so two
      transactions can be open and writing at once. That alone turns the

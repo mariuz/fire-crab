@@ -160,9 +160,20 @@ impl SharedImage {
     /// [`SharedImage::image`].
     pub fn publish(&self, bytes: Vec<u8>) -> Arc<Vec<u8>> {
         let arc = Arc::new(bytes);
-        *lock(&self.image) = Arc::clone(&arc);
-        stats().publishes.fetch_add(1, Ordering::Relaxed);
+        self.publish_image(Arc::clone(&arc));
         arc
+    }
+
+    /// Install an image the caller already holds a reference to.
+    ///
+    /// A published image is never edited in place - a writer works on a
+    /// copy and installs it - so a reference to one stays valid however
+    /// many installs follow, which is what makes a SNAPSHOT free: the
+    /// transaction that may need to put the file back keeps a reference
+    /// rather than a copy, and putting it back is this call.
+    pub fn publish_image(&self, img: Arc<Vec<u8>>) {
+        *lock(&self.image) = img;
+        stats().publishes.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The image as it stands ON DISK - the baseline for the next

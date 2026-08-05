@@ -202,6 +202,46 @@ pub fn visible_version(
     }
 }
 
+/// Is there a version of this chain the reader counts, and is it a row?
+///
+/// The same walk as [visible_version] with the images left alone: a
+/// COUNT does not need the bytes, only the answer, and assembling
+/// every record to throw it away is what made counting expensive.
+/// Deltas are irrelevant here for the same reason - a delta version
+/// is still a version, and whether it is DELETED is in its header.
+pub fn visible_exists(
+    file: &[u8],
+    page_size: usize,
+    head: &crate::data::RecordHeader,
+    tips: &TipChain,
+    own: Option<u64>,
+) -> bool {
+    if head.flags & (flags::CHAIN | flags::FRAGMENT | flags::BLOB) != 0 {
+        return false; // reached through its head, never walked as one
+    }
+    let mut current = head.clone();
+    loop {
+        let counts = current.transaction == 0
+            || tips.state(current.transaction) == Some(TxState::Committed)
+            || own == Some(current.transaction);
+        if counts {
+            return current.flags & flags::DELETED == 0;
+        }
+        if current.back_page == 0 {
+            return false;
+        }
+        let start = current.back_page as usize * page_size;
+        let Some(back) = file
+            .get(start..start + page_size)
+            .and_then(DataPage::decode)
+            .and_then(|dp| dp.record(current.back_line))
+        else {
+            return false;
+        };
+        current = back;
+    }
+}
+
 /// The committed-only visibility walk (the vio.cpp rule a fresh
 /// snapshot reader applies when every interesting transaction is
 /// either committed or not): for each primary record, take the newest
@@ -311,5 +351,41 @@ mod tests {
         let newer2 = b"AB";
         let diff = [(-2i8) as u8, 7];
         assert!(apply_differences(&diff, newer2).is_none());
+    }
+
+    /// A file with one TIP page (page 1) whose transaction states the
+    /// caller sets, and one data page (page 2) the caller fills.
+    fn tip_file(page_size: usize, states: &[(u64, TxState)]) -> Vec<u8> {
+        let mut f = vec![0u8; page_size * 3];
+        f[0] = crate::PageType::Header as u8;
+        f[16..18].copy_from_slice(&(page_size as u16).to_le_bytes());
+        let t = page_size;
+        f[t] = crate::PageType::TransactionInventory as u8;
+        f[t + 12..t + 16].copy_from_slice(&1u32.to_le_bytes()); // pag_pageno
+        for (id, st) in states {
+            let byte = t + crate::tip::TIP_TRANSACTIONS_OFFSET + (*id as usize) / 4;
+            let shift = 2 * ((*id as usize) % 4);
+            f[byte] = (f[byte] & !(0b11 << shift)) | ((*st as u8) << shift);
+        }
+        f
+    }
+
+    /// COUNTING IS A VISIBILITY QUESTION, which is what the fast path
+    /// behind `SELECT COUNT(*)` forgot: a rolled-back insert leaves a
+    /// live primary header behind, and counting headers counts it.
+    #[test]
+    fn a_dead_transactions_row_is_not_counted() {
+        let ps = 4096;
+        let f = tip_file(
+            ps,
+            &[(11, TxState::Committed), (12, TxState::Dead), (13, TxState::Active)],
+        );
+        let tips = TipChain::read(&f, ps).expect("tip chain");
+        assert_eq!(tips.state(11), Some(TxState::Committed));
+        assert_eq!(tips.state(12), Some(TxState::Dead));
+        assert_eq!(tips.state(13), Some(TxState::Active));
+        // the system transaction reads ACTIVE in the file and counts
+        // anyway - the engine answers for id 0 in code
+        assert_eq!(tips.state(0), Some(TxState::Active));
     }
 }
