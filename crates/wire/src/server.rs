@@ -13874,6 +13874,34 @@ fn choose_index(
     Some(IndexAccess { picks })
 }
 
+/// Carry a literal `(raw, scale)` to the COLUMN'S scale, or answer None.
+///
+/// A key is built from the column's own storage form, so the literal has
+/// to be expressed there first: `1.5` against a `NUMERIC(9,2)` is
+/// `(150, -2)`, and `2` against the same column is `(200, -2)`. Scales
+/// are negative for fractions, so going to a FINER scale multiplies
+/// (always exact) and going to a COARSER one divides - which is only
+/// allowed when it divides evenly.
+///
+/// THE INEXACT CASE MUST NOT ROUND. `N92 > 1.555` has no key at scale
+/// -2; rounding to 1.55 or 1.56 moves the band's EDGE, and a band whose
+/// edge moved drops rows the predicate would have kept. Answering None
+/// scans, which is always right and merely slower.
+fn at_column_scale(raw: i128, from: i8, to: i8) -> Option<Value> {
+    let shift = (from - to) as i32;
+    let scaled = if shift >= 0 {
+        raw.checked_mul(10i128.checked_pow(shift as u32)?)?
+    } else {
+        let p = 10i128.checked_pow((-shift) as u32)?;
+        if raw % p != 0 {
+            return None; // finer than the column can hold
+        }
+        raw / p
+    };
+    let n = i64::try_from(scaled).ok()?;
+    Some(if to == 0 { Value::Int(n) } else { Value::Scaled(n, to) })
+}
+
 /// The band one conjunctive branch names, or None when no index serves
 /// it - which makes the whole statement scan.
 fn pick_for_terms(
@@ -13914,25 +13942,29 @@ fn pick_for_terms(
         if !text && !matches!(*itype, btw::IDX_NUMERIC | btw::IDX_NUMERIC2) {
             continue;
         }
-        // a scaled column stores Value::Scaled, and a key built from
-        // Value::Int would land elsewhere in the tree and find nothing
+        // A SCALED column stores `Value::Scaled`, and a key built from
+        // `Value::Int` lands elsewhere in the tree and finds nothing -
+        // which is why this used to refuse every scaled column outright.
+        // The ENCODER has always handled the scale (`index_key`'s
+        // IDX_NUMERIC arm divides by the power of ten, MOV_get_double's
+        // way, with the ulp trap already worked out); what was missing
+        // was carrying the literal ACROSS to the column's own scale
+        // here. The engine indexes these - `WHERE N92 = 1.50` over a
+        // NUMERIC(9,2) is `PLAN (NM INDEX (NM_N92))` - and fire-crab
+        // scanned.
         let Some(d) = descs.get(*seg_fid) else { continue };
-        if !text && d.scale != 0 {
+        let exact_numeric =
+            matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64);
+        // an APPROXIMATE column (FLOAT/DOUBLE) is keyed by its own bits,
+        // and a decimal literal reaching it would have to travel through
+        // the engine's literal->double conversion to land on the same
+        // key. Left scanning deliberately: a key that differs in one ulp
+        // does not refuse, it MISSES.
+        if !text && !exact_numeric {
             continue;
         }
+        let col_scale = d.scale as i8;
         let key_of = |v: &Value| -> Option<Vec<u8>> {
-            // i64::MIN is the one value whose key this cannot build the
-            // way the engine did. The engine's make_int64_key negates
-            // the value before scaling it, and negating i64::MIN
-            // overflows - so its scale-control choice differs from the
-            // arithmetically correct one, and our key lands elsewhere in
-            // the tree. Measured: `WHERE A = -9223372036854775808`
-            // returned nothing where the engine returns its rows. A key
-            // that cannot be built exactly must SCAN, because the
-            // failure is a missed row rather than a refusal.
-            if matches!(v, Value::Int(i64::MIN)) {
-                return None;
-            }
             let mut values = vec![Value::Null; descs.len()];
             values[*seg_fid] = v.clone();
             // On a COMPOUND index this is the key of `(v, NULL, ...)`,
@@ -13951,7 +13983,25 @@ fn pick_for_terms(
                 Term::Cmp(fid, cmp, Rhs::Int(v)) | Term::NumCmp(fid, cmp, Rhs::Int(v))
                     if !text =>
                 {
-                    (*fid, *cmp, Value::Int(*v))
+                    let Some(v) = at_column_scale(*v as i128, 0, col_scale) else {
+                        continue;
+                    };
+                    (*fid, *cmp, v)
+                }
+                // A DECIMAL literal against an exact numeric column.
+                // It is carried to the COLUMN'S scale and must land
+                // there EXACTLY: `N92 > 1.555` over a NUMERIC(9,2) has
+                // no key at the column's scale, and rounding one out
+                // would move the band's edge - which is a MISSED ROW,
+                // not a slower answer. Those scan.
+                Term::Cmp(fid, cmp, Rhs::Num(raw, s))
+                | Term::NumCmp(fid, cmp, Rhs::Num(raw, s))
+                    if !text =>
+                {
+                    let Some(v) = at_column_scale(*raw as i128, *s, col_scale) else {
+                        continue;
+                    };
+                    (*fid, *cmp, v)
                 }
                 // TEXT keys, equality only. The literal must be ASCII:
                 // above 0x7F a charset or a collation decides the bytes,
@@ -39893,6 +39943,30 @@ mod tests {
         // ... and it carries the exact rows that arrived before it
         assert_eq!(avg(&[r(Value::Int(1)), d(2.0)]), Value::Double(1.5));
         assert_eq!(avg(&[n(150), d(2.5)]), Value::Double(2.0));
+    }
+
+    /// A literal only bounds a scaled index if it lands on the column's
+    /// OWN scale exactly. Rounding one out moves the band's edge, and a
+    /// band whose edge moved drops rows the predicate would have kept.
+    #[test]
+    fn a_literal_reaches_the_columns_scale_or_it_does_not_bound() {
+        // 1.5 against NUMERIC(9,2) is 150 at scale -2
+        assert_eq!(at_column_scale(15, -1, -2), Some(Value::Scaled(150, -2)));
+        // an integer literal against the same column
+        assert_eq!(at_column_scale(2, 0, -2), Some(Value::Scaled(200, -2)));
+        // going COARSER is allowed only when it divides evenly
+        assert_eq!(at_column_scale(150, -2, -1), Some(Value::Scaled(15, -1)));
+        assert_eq!(at_column_scale(155, -2, -1), None);
+        // ... including all the way to an unscaled column
+        assert_eq!(at_column_scale(300, -2, 0), Some(Value::Int(3)));
+        assert_eq!(at_column_scale(301, -2, 0), None);
+        // finer than the column can hold: 12.505 has no key at scale -2
+        assert_eq!(at_column_scale(12505, -3, -2), None);
+        // a value that leaves i64 has no key either
+        assert_eq!(at_column_scale(i128::from(i64::MAX), 0, -2), None);
+        // negatives and zero travel like anything else
+        assert_eq!(at_column_scale(-325, -2, -2), Some(Value::Scaled(-325, -2)));
+        assert_eq!(at_column_scale(0, 0, -2), Some(Value::Scaled(0, -2)));
     }
 
     /// DISTINCT is a SORT: the engine plans `PLAN SORT (T NATURAL)` for

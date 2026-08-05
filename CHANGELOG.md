@@ -15,6 +15,20 @@ was caught), **Guarded** (a wrong-answer path closed by refusal).
 
 ## 2026-08-05 — The key the engine files in the wrong place
 
+### Converted
+- **Scaled NUMERIC/DECIMAL columns are keyed now.** A `NUMERIC(9,2)` is
+  a LONG at scale -2 whose key is the DOUBLE 12.5; a `NUMERIC(18,2)` is
+  an INT64 taking the `INT64_KEY` form. The encoder always handled both
+  — what was missing was carrying the LITERAL to the column's own scale
+  before asking for a key, so `pick_for_terms` refused every scaled
+  column and the engine indexed `WHERE N92 = 1.50` where fire-crab
+  scanned. A literal that does not land on the column's scale EXACTLY
+  still scans: `N > 12.505` has no key at scale -2, and rounding one out
+  moves the band's edge, which drops rows no filter above can recover.
+  FLOAT/DOUBLE columns keep scanning — their key is the value's own
+  bits. `qa/serve-real-index.sh` 359 → 387 checks, 14 DIFF against the
+  previous commit, all of them coverage and none of them answers.
+
 ### Fixed
 - **`i64::MIN` can be written now, and it is keyed where the ENGINE
   files it.** Two halves the roadmap had said to do together or not at

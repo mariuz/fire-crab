@@ -56,15 +56,21 @@
 #
 # AND THE SIZE OF THE REMAINING GAP, measured by that same refute pass
 # and stated here because section 5 would otherwise read as a clean
-# bill: seven inner sides the ENGINE indexes and this probe declines -
-# a DESCENDING index, a NUMERIC(9,2) index, NUMERIC(38,0), a VIEW inner
-# (the engine flattens it), a DERIVED inner, an expression in the ON
-# (`RZ.K = O.K + 0`), an OR in the ON, and the engine's bitmap AND of
+# bill: SEVEN inner sides the ENGINE indexes and this probe declined -
+# a DESCENDING index, ~~a NUMERIC(9,2) index~~, NUMERIC(38,0), a VIEW
+# inner (the engine flattens it), a DERIVED inner, an expression in the
+# ON (`RZ.K = O.K + 0`), an OR in the ON, and the engine's bitmap AND of
 # two indexes. Their ROWS agree, which is what section 5 asserts and
 # all it asserts; with a RAISING ON they do not, because fire-crab
 # scans where the engine keys. Every one is a candidate for Slice B,
 # and each is one more shape where identical SQL raises or answers
 # depending on whether this server's heuristics bless the inner.
+#
+# SIX now. The scaled NUMERIC inner side is CLOSED: the refusal was
+# never about the join at all - `pick_for_terms` declined every column
+# with a non-zero scale, so a plain `WHERE N92 = 1.50` scanned too. The
+# literal is carried to the column's own scale now and the probe takes
+# that inner side like any other (section 5 asserts it INDEXED).
 #
 #   qa/serve-real-leftjoinindex.sh [port]     (the twin runs on port+1)
 #
@@ -95,8 +101,9 @@ ran=0
 #   EMPT  indexed but EMPTY - every outer row's band is empty
 #   DESCT indexed DESCENDING only - a band this server cannot build
 #         byte-exactly (its keys are complemented), so it must scan
-#   WIDEK one index per family: BIGINT (keyable), NUMERIC(9,2) (scale
-#         != 0) and VARCHAR (a text key against a numeric outer value)
+#   WIDEK one index per family: BIGINT (keyable), NUMERIC(9,2) (scaled,
+#         keyable since the literal is carried to the column's scale)
+#         and VARCHAR (a text key against a numeric outer value)
 #   VPAR  a view over PAR - the engine FLATTENS it into the join and
 #         fire-crab MATERIALISES it, so it must not be probed
 make_db() {
@@ -308,8 +315,16 @@ join_natural "no index on the inner column" \
     "SELECT CHI.ID, NOIX.N FROM CHI LEFT JOIN NOIX ON NOIX.K = CHI.K ORDER BY CHI.ID"
 join_natural "a DESCENDING-only inner index (its keys are complemented)" \
     "SELECT CHI.ID, DESCT.N FROM CHI LEFT JOIN DESCT ON DESCT.K = CHI.K ORDER BY CHI.ID"
-join_natural "a scaled NUMERIC inner index (a key built from an integer lands elsewhere)" \
-    "SELECT COUNT(*) FROM CHI LEFT JOIN WIDEK W ON W.NM = CHI.K"
+# ...and this one is no longer among them. A scaled NUMERIC inner index
+# was one of the SEVEN shapes the refute pass measured as "the engine
+# indexes it and this probe declines"; the literal now reaches the
+# column's own scale, so the band builds and the probe takes it. The
+# outer value here is an INTEGER meeting a NUMERIC(9,2) inner - exactly
+# the carry that was missing.
+join_indexed "a scaled NUMERIC inner index" \
+    "SELECT COUNT(*) FROM CHI LEFT JOIN WIDEK W ON W.NM = CHI.K" 1
+join_indexed "... and its rows, ordered" \
+    "SELECT CHI.ID, W.T FROM CHI LEFT JOIN WIDEK W ON W.NM = CHI.K ORDER BY CHI.ID" 1
 join_natural "a TEXT inner index against a numeric outer value" \
     "SELECT COUNT(*) FROM CHI LEFT JOIN WIDEK W ON W.T = CHI.N"
 join_natural "a NON-EQUALITY ON (a range band does not exclude the NULL entries)" \

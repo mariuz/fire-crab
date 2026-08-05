@@ -1992,8 +1992,12 @@ plus *the subsystem is now on the path*.
       equivalence oracle only for non-raising ONs from here on.
 
       *And it measured the gap, which is the shape of Slice B*: SEVEN
-      inner sides the engine INDEXES and this probe declines — a
-      DESCENDING index, `NUMERIC(9,2)`, `NUMERIC(38,0)`, a VIEW inner
+      inner sides the engine INDEXES and this probe declines — **six
+      now**, since the scaled-NUMERIC keys above closed `NUMERIC(9,2)`,
+      and closed it OUTSIDE the join: `pick_for_terms` refused every
+      column with a non-zero scale, so a plain `WHERE N92 = 1.50`
+      scanned too. The rest: a
+      DESCENDING index, `NUMERIC(38,0)`, a VIEW inner
       (the engine flattens it), a DERIVED inner, an expression in the
       ON (`RZ.K = O.K + 0`), an OR in the ON, and the engine's bitmap
       AND of two indexes. Their rows agree today; with a raising ON
@@ -2016,6 +2020,28 @@ plus *the subsystem is now on the path*.
     gate now pins with an empty-string lookup, the one byte where
     `idx_string` (0x20) and `idx_metadata` (0x00) disagree. It remains a
     metadata divergence worth closing, not a wrong answer.
+  - **Scaled NUMERIC/DECIMAL keys** *(done)*. A `NUMERIC(9,2)` is a LONG
+    holding 1250 at scale -2 and its key is the DOUBLE 12.5 — the same
+    bytes a `DOUBLE PRECISION 12.5` gets; a `NUMERIC(18,2)` is an INT64
+    and takes the `INT64_KEY` form. **The ENCODER always handled both**
+    (`index_key`'s IDX_NUMERIC arm divides by the power of ten, which is
+    `MOV_get_double`'s way — multiplying by 10⁻ⁿ differs in the last ulp
+    for about a third of the raws at scale 1, and a key one bit off is a
+    key the engine never wrote). What was missing was one step earlier:
+    carrying the LITERAL to the column's own scale before asking for a
+    key. `pick_for_terms` refused every column with `scale != 0`
+    outright, so the engine indexed `WHERE N92 = 1.50` and fire-crab
+    scanned. `at_column_scale` now moves a literal there — `1.5` and `2`
+    both reach a `NUMERIC(9,2)` — and **a literal that does not land
+    exactly still scans**: `N > 12.505` has no key at scale -2, and
+    rounding one out moves the band's EDGE, which drops rows no filter
+    above can recover. FLOAT/DOUBLE columns keep scanning for the same
+    reason from the other side: their key is the value's own bits, and a
+    decimal literal would have to travel the engine's literal→double
+    conversion to land on them. `qa/serve-real-index.sh` 359 → 387
+    checks, 14 DIFF against the previous commit — **all of them
+    COVERAGE, none of them answers**, which is the right shape for a
+    slice that changes which path is taken and not what is returned.
   - **Compound prefixes and text keys** *(done)*: an equality on an
     ascending compound index's LEADING segment is a band whose upper
     bound is the prefix's EXCLUSIVE SUCCESSOR (an inclusive one drops

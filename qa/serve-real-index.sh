@@ -450,18 +450,53 @@ natural "an equality on the SECOND segment of a compound index" \
 indexed "a BIGINT key" "SELECT T FROM WIDE WHERE K = 9000000000 ORDER BY T"
 indexed "a NEGATIVE BIGINT key" "SELECT T FROM WIDE WHERE K = -9000000000"
 indexed "the LARGEST BIGINT key" "SELECT T FROM WIDE WHERE K = 9223372036854775807"
-# i64::MIN is the ONE value whose key cannot be built the way the engine
-# built it: the engine's make_int64_key NEGATES the value before scaling
-# it, and negating i64::MIN overflows, so its scale-control choice
-# differs from the arithmetically correct one and our key lands
-# elsewhere in the tree. Measured: this returned NOTHING where the
-# engine returns its rows. A key that cannot be built exactly must SCAN,
-# because the failure mode is a missed row rather than a refusal.
-natural "i64::MIN, whose key the engine builds through an overflow" \
+# i64::MIN's key IS buildable - it just is not the arithmetically
+# correct one. The engine's make_int64_key overflows on the negation,
+# which sends its scale loop one bucket on, and `q *= 10` wraps to
+# exactly zero: THE ENGINE FILES i64::MIN UNDER ZERO'S KEY (read off its
+# own index, `800000000000000080` for both). Matching those bytes is
+# what lets the engine find a row fire-crab wrote, so the band is built
+# and the retrieval is indexed like any other. The band lands on zero's
+# key, so the ZERO ROWS come back as candidates and the PREDICATE drops
+# them - "an index names candidates, the predicate decides", exactly as
+# it does for a hash collision.
+indexed "i64::MIN, filed by the engine under zero's key" \
         "SELECT T FROM WIDE WHERE K = -9223372036854775808"
+indexed "... and zero itself, which shares that key" \
+        "SELECT T FROM WIDE WHERE K = 0"
 indexed "a SMALLINT key" "SELECT T FROM WIDE WHERE S = 7 ORDER BY T"
 indexed "a NEGATIVE SMALLINT key" "SELECT T FROM WIDE WHERE S = -7"
-natural "a SCALED numeric key" "SELECT T FROM WIDE WHERE N = 12.50 ORDER BY T"
+
+# --- 3a-bis. SCALED NUMERIC KEYS ---------------------------------------
+# A NUMERIC(9,2) is a LONG holding 1250 with scale -2, and its key is the
+# DOUBLE 12.5 (`bff8`-style, the same bytes a DOUBLE PRECISION 12.5
+# gets); a NUMERIC(18,2) is an INT64 and takes the INT64_KEY form. The
+# ENCODER always handled both - what was missing was carrying the
+# LITERAL to the column's own scale before asking for a key, so every
+# scaled column scanned while the engine indexed it.
+#
+# The literal must land on the column's scale EXACTLY. `N > 12.505` has
+# no key at scale -2, and rounding one out moves the band's EDGE, which
+# drops rows no filter above can recover - so those still scan, and the
+# checks below have rows on both sides of every bound.
+indexed "a SCALED numeric key" "SELECT T FROM WIDE WHERE N = 12.50 ORDER BY T"
+indexed "... written with fewer digits than the column holds" \
+        "SELECT T FROM WIDE WHERE N = 12.5 ORDER BY T"
+indexed "... an INTEGER literal against a scaled column" \
+        "SELECT T FROM WIDE WHERE N = 1 ORDER BY T"
+indexed "a NEGATIVE scaled key" "SELECT T FROM WIDE WHERE N = -3.25"
+indexed "ZERO at a scale" "SELECT T FROM WIDE WHERE N = 0.00"
+indexed "a scaled RANGE, both bounds" \
+        "SELECT T FROM WIDE WHERE N > 0 AND N < 13 ORDER BY T"
+indexed "... the inclusive one" "SELECT T FROM WIDE WHERE N >= 12.50 ORDER BY T"
+indexed "... and below zero" "SELECT T FROM WIDE WHERE N < 0 ORDER BY T"
+indexed "a scaled BETWEEN" \
+        "SELECT T FROM WIDE WHERE N BETWEEN -3.25 AND 1.00 ORDER BY T"
+indexed "a scaled key with no rows" "SELECT T FROM WIDE WHERE N = 7.77"
+# what a scaled column must still NOT serve
+natural "a literal FINER than the column's scale" \
+        "SELECT T FROM WIDE WHERE N > 12.505 ORDER BY T"
+natural "... and its equality" "SELECT T FROM WIDE WHERE N = 12.505"
 # text WAS excluded here; it is keyed now (see the text section below),
 # so this asserts the capability rather than its absence
 indexed "a TEXT key" "SELECT K FROM WIDE WHERE T = 'aa'"
@@ -942,10 +977,16 @@ navigated "... and a navigated order is not shifted by it" \
 # Dropping one costs a row.
 indexed "a row beside a scaled DECIMAL column" "SELECT ID FROM UNJ WHERE A = 3"
 indexed "... and all of them" "SELECT COUNT(*) AS K FROM UNJ WHERE A >= 1"
-# an index ON a scaled column cannot be keyed at all (the stored value
-# is Scaled(raw, scale) and a literal would build a different key), so
-# it scans - and must still be RIGHT
-natural "an index ON the scaled column" "SELECT ID FROM UNJ WHERE D = 0.2"
+# An index ON a scaled column IS keyed now - the literal is carried to
+# the column's own scale first (see 3a-bis). DECIMAL(4,1) is the shape
+# the encoder's ulp comment is about: `MOV_get_double` DIVIDES by the
+# power of ten, and multiplying by 10^-n instead differs in the last ulp
+# for about a third of the raws at scale 1 - a key one bit off is a key
+# the engine never wrote. These values sit on that line.
+indexed "an index ON the scaled column" "SELECT ID FROM UNJ WHERE D = 0.2"
+indexed "... a raw whose double differs by an ulp if built wrong" \
+        "SELECT ID FROM UNJ WHERE D = 0.3"
+indexed "... and another" "SELECT ID FROM UNJ WHERE D = 0.7"
 indexed "a compound index holding a FLOAT segment" \
         "SELECT ID FROM UNJ WHERE A = 1 ORDER BY ID"
 # a row holding i64::MIN in a column the retrieval does NOT key on: its
