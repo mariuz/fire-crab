@@ -13,6 +13,62 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-05 — A modifier that dropped the select list, and a set that is a sort
+
+Two wrong answers under `FIRST`/`SKIP`/`DISTINCT`, both found by asking
+a question the gate had been phrased to avoid, and one queued roadmap
+item retired as an artefact of the measurement rather than a divergence.
+
+### Fixed
+- **A modifier must still run the SELECT LIST.** The modifier's own
+  columns are POSITIONAL over rows the inner plan has already projected
+  (`field_id: i, expr: None`); one path fed them BASE RECORDS instead,
+  so every select-list EXPRESSION was dropped and column *i* of the
+  TABLE answered in its place. `SELECT FIRST 2 CAST(S AS INTEGER) FROM
+  TE` returned the ID column — 1 and 2 — where the engine returns 10 and
+  20, and `SELECT DISTINCT CAST(S AS INTEGER) FROM TE` returned four
+  rows where the engine raises. **It hid behind the batch fetch**, which
+  materialises the cursor through `branch_rows` first and only falls
+  through to this path when THAT returns `None` — which happens exactly
+  when some row RAISES. So one unconvertible row silently corrupted the
+  answer for every good one, and a fixture without a raiser could never
+  see it. The inner `Project`'s own `cols` now turn each record into a
+  projected row before the modifier's positional columns read it.
+- **`SKIP` without `FIRST` streams too** — there is no stop, but no
+  reason to materialise: the engine delivers row 2 of `SKIP 1 <raiser>`
+  before it raises on row 3.
+- **`DISTINCT` is a SORT, not a filter.** The engine does not remove
+  duplicates in place, it sorts and drops equal neighbours — `PLAN SORT
+  (TD NATURAL)`, with or without an index available — so the set arrives
+  ASCENDING over every output column left to right, NULLs first. `UNION`
+  is the same node; `UNION ALL` does not sort. fire-crab kept scan
+  order. **Not cosmetic: a modifier SLICES that sequence**, so `SELECT
+  FIRST 2 DISTINCT A FROM T` answered 30 and 10 where the engine answers
+  NULL and 10 — a different ROW SET out of a difference in row ORDER.
+  An explicit `ORDER BY` REPLACES that sort rather than sitting under it
+  (there is one sort in the engine's plan and those are its keys); the
+  first attempt at this re-sorted after de-duplicating and broke exactly
+  that case, which the gate caught.
+- **Why no gate saw either.** Every `DISTINCT` check in
+  `qa/serve-real-modifiers.sh` pinned the order with `ORDER BY 1`, which
+  the file's own header states as a deliberate choice — and it is the
+  right one for `FIRST`/`SKIP`, where "the first two" is undefined
+  without it. For `DISTINCT` it removed the question instead of
+  answering it. The gate is 48 → 66 checks; 18 DIFF against the pre-fix
+  binary.
+
+### Guarded
+- **A differential must hold the TRANSPORT fixed** — the fourth time
+  this suite has measured its own environment (after `NODE_PATH` drift,
+  isql `AUTODDL` and `FORCE_COLOR`). The roadmap's queued R8 item said
+  the engine raises a blocking node's error at OPEN where this server
+  announces the result set and raises at the first FETCH. Asked over the
+  same transport, it does not: a bare FILE PATH attaches the EMBEDDED
+  engine (`MON$REMOTE_PROTOCOL` NULL), which raises at open, while the
+  SAME engine on the SAME file over `localhost/3050:` announces and
+  raises at fetch, exactly as fire-crab does. The item is retired and
+  the gate now reaches both servers over TCP.
+
 ## 2026-08-02 — Three refutations, three laws re-probed
 
 Three adversarially-confirmed divergences, each re-probed against the

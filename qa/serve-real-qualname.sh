@@ -71,10 +71,15 @@
 #     span a positional vector needs is gone. Sections H-J therefore
 #     assert "refuse", which is the part that matters - answering rows,
 #     answering [], or writing is what a wrong qualifier used to do.
-#   * a nested query expression does not EXPAND a view (section K). It
+#   * ~~a nested query expression does not EXPAND a view (section K). It
 #     refuses one instead of scanning its recordless storage, which is
 #     what made `IN (SELECT C FROM V2)` answer [] where the engine
-#     answers every row.
+#     answers every row.~~ CLOSED by R7 - a VIEW IS A ROW SOURCE, so a
+#     subquery over one plans it like any other consumer. Section K
+#     asserts AGREEMENT now, over a FILTERING view so the check can tell
+#     a body that ran from storage that was scanned. What is still open
+#     there is a TYPE, not a row: `(SELECT MAX(C) FROM V2)` describes as
+#     BIGINT where the engine describes the column's own INTEGER.
 #
 #   qa/serve-real-qualname.sh [port]
 set -u
@@ -111,6 +116,11 @@ INSERT INTO U VALUES (1,'uno');
 COMMIT;
 CREATE VIEW V1 AS SELECT C, D FROM PUBLIC.T;
 CREATE VIEW V2 AS SELECT C FROM T;
+-- VF FILTERS. V2 selects every row, so a subquery over it cannot tell
+-- "ran the view's body" from "scanned something that happened to hold
+-- the same rows"; VF's answer is wrong under both of the ways this used
+-- to be wrong (zero rows, or all of them).
+CREATE VIEW VF AS SELECT C FROM T WHERE C > 1;
 COMMIT;
 EOF
     chmod 666 "$1"
@@ -451,19 +461,43 @@ refuse "INSERT ... SELECT whose WHERE holds a wrongly qualified subquery" \
        "INSERT INTO U (C,E) SELECT C, D FROM T WHERE C IN (SELECT C FROM SYSTEM.U)"
 both "U is untouched (fresh attachment)" "SELECT * FROM U ORDER BY C"
 
-# --- K. the view-in-a-subquery boundary, locked ------------------------
-# The nested path does not EXPAND a view, and a view has no records of
-# its own: scanning its storage answered ZERO ROWS where the engine
-# answers every row. Refusing is the honest reply, and these lock it so
-# the lie cannot come back unnoticed.
-boundary "a view inside an IN-subquery" \
-         "SELECT * FROM T WHERE C IN (SELECT C FROM V2)"
-boundary "a view inside an EXISTS-subquery" \
-         "SELECT * FROM T WHERE EXISTS (SELECT 1 FROM V2)"
-boundary "a view inside a scalar subquery" \
-         "SELECT (SELECT MAX(C) FROM V2) AS M FROM T"
-boundary "a CORRECTLY qualified view inside a subquery" \
-         "SELECT * FROM T WHERE C IN (SELECT C FROM PUBLIC.V2)"
+# --- K. a view inside a subquery: the boundary is CLOSED ----------------
+# These were `boundary` checks - fire-crab REFUSES, the engine answers -
+# recorded because the nested path did not EXPAND a view, and a view has
+# no records of its own, so scanning its storage answered ZERO ROWS.
+# **R7 closed it**: a VIEW IS A ROW SOURCE, planned on its own and
+# resolved through its DESCRIBE, and a subquery gets that for free like
+# every other consumer. Nobody came back to the gate, so four checks went
+# on asserting a refusal that no longer happens - a gate failing because
+# the server got BETTER, which reads exactly like a regression until you
+# run the old binary (the same 4 DIFFs appear there, which is what says
+# it is not one).
+#
+# They assert AGREEMENT now, and VF is here so they can tell the
+# difference between running the body and not: it selects C > 1, so a
+# storage scan (zero rows) and a bare "answer everything" both fail it.
+both "a view inside an IN-subquery" \
+     "SELECT * FROM T WHERE C IN (SELECT C FROM V2) ORDER BY C"
+both "a view inside an EXISTS-subquery" \
+     "SELECT * FROM T WHERE EXISTS (SELECT 1 FROM V2) ORDER BY C"
+both "a CORRECTLY qualified view inside a subquery" \
+     "SELECT * FROM T WHERE C IN (SELECT C FROM PUBLIC.V2) ORDER BY C"
+both "a FILTERING view inside an IN-subquery" \
+     "SELECT * FROM T WHERE C IN (SELECT C FROM VF) ORDER BY C"
+both "a FILTERING view inside a NOT IN-subquery" \
+     "SELECT * FROM T WHERE C NOT IN (SELECT C FROM VF) ORDER BY C"
+both "a filtering view's own count" "SELECT COUNT(*) FROM VF"
+# The scalar-subquery spelling still DIFFERS, and not in its values: the
+# rows agree (fire-crab and the engine both answer the same MAX for every
+# row) and the DESCRIBE does not - `(SELECT MAX(C) FROM VF)` is announced
+# as a BIGINT where the engine announces the column's own INTEGER. That
+# is the prepare-time aggregate fold's type, it predates this gate's
+# closure and it reproduces on a binary from before it, so it is recorded
+# as its own gap rather than smuggled in here. Its ROWS are checked, and
+# the type is NOT asserted - a check that is expected to fail is not a
+# check, and the divergence is written down where open gaps live:
+both "a view inside a scalar subquery (rows only)" \
+     "SELECT (SELECT MAX(C) FROM V2) AS M FROM T"
 
 # --- L. DML (LAST: it mutates) -----------------------------------------
 both "INSERT into a qualified target" "INSERT INTO PUBLIC.T (C,D) VALUES (9,'nine')"
@@ -481,8 +515,8 @@ both "the table is back to its two rows (fresh attachment)" \
      "SELECT * FROM T ORDER BY C"
 
 # --- M. the ran counter -------------------------------------------------
-if [ "$ran" -ne 115 ]; then
-    echo "DIFF $ran checks ran (expected exactly 115) - did one silently skip?"
+if [ "$ran" -ne 118 ]; then
+    echo "DIFF $ran checks ran (expected exactly 118) - did one silently skip?"
     fail=1
 fi
 

@@ -37,6 +37,54 @@ four; R7 is the removal of what they replaced.
 
 ## Measured gaps that are nobody's slice yet
 
+- **A scalar subquery's aggregate describes as BIGINT.** `SELECT (SELECT
+  MAX(C) FROM V) AS M FROM T` announces an INT64 where the engine
+  announces the source column's own INTEGER; the ROWS agree on every
+  probe. It is the prepare-time aggregate fold's type (`Plan::Scalar` is
+  "a single BIGINT computed at prepare" by construction), so the slice is
+  MIN/MAX/SUM carrying their source's type rather than the fold's, which
+  touches every consumer of that fold and is not a one-line widening.
+  Reproduces on binaries from before it was noticed — recorded, not new.
+  Found while adjudicating a gate that was failing because the server had
+  got BETTER, below.
+
+- **A REFUSAL THAT WAS CLOSED AND NOT UNRECORDED.** `qa/serve-real-qualname.sh`
+  section K asserted that a view inside an IN / EXISTS / scalar subquery
+  REFUSES — true when written, because the nested path did not expand a
+  view and a view has no records of its own. **R7 closed it** (a VIEW IS
+  A ROW SOURCE, so a subquery plans one like every other consumer) and
+  nobody returned to the gate, so four checks went on asserting a refusal
+  that no longer happens. *A gate failing because the server improved
+  reads exactly like a regression* — what distinguishes them is running
+  the OLD binary, where the same four DIFFs appear. They assert agreement
+  now, over a FILTERING view (`C > 1`) so the check can tell a body that
+  RAN from storage that was SCANNED: both old failure modes — zero rows,
+  and everything — get that one wrong. 115 → 118 checks.
+
+- ~~A modifier dropped the SELECT LIST, and a set was not a sort~~ —
+  *both fixed*, and both were found by asking a question the gate had
+  been phrased to avoid. `SELECT FIRST 2 CAST(S AS INTEGER) FROM TE`
+  answered the ID column where the engine answers the cast, because the
+  modifier's columns are POSITIONAL over rows the inner plan has already
+  projected and one path handed them BASE RECORDS. **It hid behind the
+  batch fetch**, which materialises through `branch_rows` first and only
+  falls through when THAT returns `None` — which happens exactly when
+  some row RAISES, so one unconvertible row silently corrupted the
+  answer for every good one. And `DISTINCT` is a SORT in the engine
+  (`PLAN SORT (T NATURAL)`, index or no index): the set arrives
+  ascending over every output column, NULLs first, where this server
+  kept scan order — which a modifier then SLICES, so `SELECT FIRST 2
+  DISTINCT A FROM T` returned a different ROW SET, not merely a
+  different order. `UNION` is the same node; `UNION ALL` does not sort;
+  an explicit `ORDER BY` REPLACES that sort rather than sitting under
+  it. **Why no gate saw it**: every `DISTINCT` check in
+  `qa/serve-real-modifiers.sh` pinned the order with `ORDER BY 1`, which
+  that file's header states as a deliberate choice — and it is the right
+  one for `FIRST`/`SKIP`, where "the first two" is undefined without an
+  order. For `DISTINCT` it removed the question instead of answering it.
+  48 → 66 checks, 18 DIFF against the pre-fix binary. *A gate's stated
+  convention is worth re-reading for the case it was not written about.*
+
 - ~~A bare boolean parameter as a whole predicate~~ — *fixed*. `WHERE ?`
   is `TRUE = ?` with the `TRUE =` elided: the engine describes the slot
   as `SQL_BOOLEAN` and answers ordinary three-valued logic, and that leaf
@@ -1756,10 +1804,33 @@ pulled by the fetch.
   blocking by nature, and the fetch still asks for a whole batch rather
   than pulling row by row across the wire - the walk is a PUSH with a
   `Flow::Stop`, which is observationally equal for errors and early
-  exit but is not the engine's iterator. The next thing worth doing
-  here is a boundary the gates already pin: the engine raises a
-  blocking node's error at OPEN, where this server announces the result
-  set and raises at the first FETCH.
+  exit but is not the engine's iterator.
+
+  ~~The next thing worth doing here is a boundary the gates already pin:
+  the engine raises a blocking node's error at OPEN, where this server
+  announces the result set and raises at the first FETCH.~~
+  **REFUTED BY MEASUREMENT — that boundary was an artefact of comparing
+  two different TRANSPORTS.** Asked over the SAME transport fire-crab
+  speaks, the engine does exactly what this server does. `SELECT DISTINCT
+  CAST(S AS INTEGER) FROM TR` with one unconvertible row:
+
+  | attachment | `MON$REMOTE_PROTOCOL` | what isql shows |
+  |---|---|---|
+  | bare path (embedded) | `<null>` | the error, no result set announced — **raised at OPEN** |
+  | `localhost/3050:` (remote) | `TCPv4` | a blank line, then the error — **announced, raised at FETCH** |
+  | fire-crab, `127.0.0.1/<port>:` | `TCPv4` | a blank line, then the error — identical |
+
+  The engine's own remote layer does not run a blocking node at
+  `op_execute`; the cursor materialises on the first `op_fetch`, and the
+  error arrives there. Since fire-crab speaks only the remote protocol,
+  there is nothing here to converge on. **What this leaves is a GATE
+  rule, and it is the fourth time this suite has measured its own
+  environment** (after `NODE_PATH` drift, isql `AUTODDL` and
+  `FORCE_COLOR`): *a differential must hold the transport fixed*. Handing
+  isql a bare FILE PATH for the engine side and a `host/port:` string for
+  fire-crab is not one difference but two, and the second one talks.
+  `qa/serve-real-modifiers.sh` was doing exactly that and now reaches
+  both servers over TCP.
 
 ### Programme W — wire the converted subsystems in
 

@@ -17204,15 +17204,7 @@ fn branch_rows_res(
             rows.append(&mut branch_rows_res(b, db, args)?);
         }
         if *distinct {
-            let mut seen: Vec<Vec<Value>> = Vec::new();
-            rows.retain(|r| {
-                if seen.iter().any(|s| rows_equal(s, r)) {
-                    false
-                } else {
-                    seen.push(r.clone());
-                    true
-                }
-            });
+            distinct_rows(&mut rows, order_by.is_some());
         }
         if let Some(key) = order_by {
             let keys = [key.clone()];
@@ -17241,15 +17233,7 @@ fn branch_rows_res(
     if let Plan::Modified { inner, distinct, skip, take, .. } = plan {
         let mut rows = branch_rows_res(inner, db, args)?;
         if *distinct {
-            let mut seen: Vec<Vec<Value>> = Vec::new();
-            rows.retain(|r| {
-                if seen.iter().any(|s| rows_equal(s, r)) {
-                    false
-                } else {
-                    seen.push(r.clone());
-                    true
-                }
-            });
+            distinct_rows(&mut rows, plan_is_ordered(inner));
         }
         return Ok(rows.into_iter().skip(*skip).take(take.unwrap_or(usize::MAX)).collect());
     }
@@ -17468,6 +17452,62 @@ fn rows_equal(a: &[Value], b: &[Value]) -> bool {
             (Value::Null, _) | (_, Value::Null) => false,
             _ => value_cmp(x, y) == std::cmp::Ordering::Equal,
         })
+}
+
+/// Reduce projected rows to a SET - and leave them in the order the
+/// engine leaves them in, which is SORTED.
+///
+/// `DISTINCT` and a distinct `UNION` are not filters in Firebird, they
+/// are a SORT with duplicates dropped: `PLAN SORT (TD NATURAL)` for
+/// `SELECT DISTINCT N FROM TD`, and the rows come back ascending over
+/// EVERY output column left to right with NULLs FIRST - which is what an
+/// ascending sort does here, since NULLs are low. `UNION` behaves the
+/// same way and `UNION ALL` does not sort at all.
+///
+/// Keeping scan order was not merely a cosmetic difference. A modifier
+/// SLICES this sequence, so `SELECT FIRST 2 DISTINCT N FROM TD` answered
+/// 30 and 10 where the engine answers NULL and 10 - a different ROW SET
+/// from a difference in row ORDER.
+///
+/// AN EXPLICIT `ORDER BY` REPLACES THE SORT, it does not sit under it -
+/// there is ONE sort in the engine's plan, and the statement's own keys
+/// are the ones it uses. `SELECT DISTINCT S FROM TD ORDER BY S DESC`
+/// answers descending, so `ordered` says whether something else has
+/// already decided the row order; only when nothing has does the set's
+/// own ascending order show through.
+fn distinct_rows(rows: &mut Vec<Vec<Value>>, ordered: bool) {
+    let mut seen: Vec<Vec<Value>> = Vec::new();
+    rows.retain(|r| {
+        if seen.iter().any(|s| rows_equal(s, r)) {
+            false
+        } else {
+            seen.push(r.clone());
+            true
+        }
+    });
+    if ordered {
+        return;
+    }
+    let width = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    let keys: Vec<OrderKey> = (0..width)
+        .map(|i| OrderKey::field(i, false, NullsAt::Default))
+        .collect();
+    rows.sort_by(|a, b| order_cmp(a, b, &keys));
+}
+
+/// Does this plan decide its own row order? A `DISTINCT` above one that
+/// does must not re-sort - see [distinct_rows].
+fn plan_is_ordered(plan: &Plan) -> bool {
+    match plan {
+        Plan::Project { order_by, .. }
+        | Plan::Derived { order_by, .. }
+        | Plan::Join { order_by, .. }
+        | Plan::JoinGroup { order_by, .. }
+        | Plan::Group { order_by, .. } => !order_by.is_empty(),
+        Plan::Union { order_by, .. } => order_by.is_some(),
+        Plan::Modified { inner, .. } => plan_is_ordered(inner),
+        _ => false,
+    }
 }
 
 /// Plan `<select> UNION [ALL] <select> [...] [ORDER BY <n>]`.
@@ -22298,17 +22338,31 @@ fn emit_rows_inner(
                 // materialising path below reads every row first, which
                 // turned that answer into a raise - and threw the 22018
                 // argument away through branch_rows' Option on the way.
+                // THE INNER PROJECTION IS NOT OPTIONAL. `cols` here are
+                // the MODIFIER'S columns, and a modifier's columns are
+                // POSITIONAL over the rows the inner plan ALREADY
+                // PROJECTED (`field_id: i, expr: None` - see where
+                // `Plan::Modified` is built). This shortcut reads BASE
+                // RECORDS, so the inner Project's own `cols` have to
+                // turn each record into a projected row FIRST; applying
+                // the modifier's positional columns straight to a record
+                // reads field `i` of the table and drops every select-list
+                // EXPRESSION on the floor. That is what it did:
+                // `SELECT FIRST 2 CAST(S AS INTEGER) FROM TR` answered
+                // the ID column, 1 and 2, where the engine answers 10 and
+                // 20. It was invisible because the batch fetch
+                // materialises through `branch_rows` first and only falls
+                // here when THAT returns None - which happens exactly
+                // when some row RAISES, so the price of one bad row was a
+                // silently wrong answer for every good one.
                 if let Plan::Project {
-                    rel, formats, filter, order_by, gen_cols, index, defer, ..
+                    rel, formats, cols: icols, filter, order_by, gen_cols, index, defer,
                 } = &**inner
                 {
                     // a generator-advancing Project keeps the
                     // branch_rows refusal below - see that function
                     if gen_cols.is_empty() {
-                        if !*distinct
-                            && order_by.is_empty()
-                            && take.is_some()
-                        {
+                        if !*distinct && order_by.is_empty() {
                             let filter = bind_filter(filter, args)?;
                             let descs_now: Vec<Descriptor> = formats
                                 .iter()
@@ -22318,7 +22372,11 @@ fn emit_rows_inner(
                             let index = &resolve_access(
                                 index, defer, db, *rel, &descs_now, &filter, order_by,
                             );
-                            let stop_at = skip.saturating_add(take.unwrap_or(0));
+                            // SKIP WITHOUT FIRST STREAMS TOO: there is no
+                            // stop, but there is no reason to materialise
+                            // either, and the engine delivers row 2 of
+                            // `SKIP 1 <raiser>` before it raises on row 3.
+                            let stop_at = take.map(|t| skip.saturating_add(t));
                             let mut accepted = 0usize;
                             // R8: the walk itself STOPS. This used to be
                             // a hand-rolled early exit that kept reading
@@ -22337,17 +22395,31 @@ fn emit_rows_inner(
                             );
                             let mut enc: Option<EvalErr> = None;
                             src.for_each(db, &mut |values| {
+                                // the record becomes a PROJECTED row here
+                                // - and it is evaluated only for a row
+                                // this modifier actually delivers, which
+                                // is why a raiser past `FIRST n` stays
+                                // unevaluated
                                 accepted += 1;
                                 if accepted > *skip {
-                                    if let Err(e) = encode_row(w, cols, &values, out) {
+                                    let mut row = Vec::with_capacity(icols.len());
+                                    for c in icols {
+                                        match c.value_of(&values) {
+                                            Ok(v) => row.push(v),
+                                            Err(e) => {
+                                                enc = Some(e);
+                                                return Ok(Flow::Stop);
+                                            }
+                                        }
+                                    }
+                                    if let Err(e) = encode_row(w, cols, &row, out) {
                                         enc = Some(e);
                                         return Ok(Flow::Stop);
                                     }
                                 }
-                                Ok(if accepted >= stop_at {
-                                    Flow::Stop
-                                } else {
-                                    Flow::Continue
+                                Ok(match stop_at {
+                                    Some(n) if accepted >= n => Flow::Stop,
+                                    _ => Flow::Continue,
                                 })
                             })
                             .map_err(EmitErr::Eval)?;
@@ -22371,22 +22443,18 @@ fn emit_rows_inner(
                             index.clone(),
                         );
                         for values in src.rows(db).map_err(EmitErr::Eval)? {
-                            let mut row = Vec::with_capacity(cols.len());
-                            for c in cols {
+                            // the INNER projection, for the same reason
+                            // as the streaming branch above: DISTINCT
+                            // compares what the select list PRODUCES, and
+                            // this used to compare table fields
+                            let mut row = Vec::with_capacity(icols.len());
+                            for c in icols {
                                 row.push(c.value_of(&values).map_err(EmitErr::Eval)?);
                             }
                             rows_v.push(row);
                         }
                         if *distinct {
-                            let mut seen: Vec<Vec<Value>> = Vec::new();
-                            rows_v.retain(|r| {
-                                if seen.iter().any(|s| rows_equal(s, r)) {
-                                    false
-                                } else {
-                                    seen.push(r.clone());
-                                    true
-                                }
-                            });
+                            distinct_rows(&mut rows_v, !order_by.is_empty());
                         }
                         for r in rows_v.iter().skip(*skip).take(take.unwrap_or(usize::MAX)) {
                             encode_row(w, cols, r, out)?;
@@ -22399,15 +22467,7 @@ fn emit_rows_inner(
                 // DISTINCT compares whole projected rows with NULL equal
                 // to NULL - the same set semantics UNION uses
                 if *distinct {
-                    let mut seen: Vec<Vec<Value>> = Vec::new();
-                    rows.retain(|r| {
-                        if seen.iter().any(|s| rows_equal(s, r)) {
-                            false
-                        } else {
-                            seen.push(r.clone());
-                            true
-                        }
-                    });
+                    distinct_rows(&mut rows, plan_is_ordered(inner));
                 }
                 for r in rows.iter().skip(*skip).take(take.unwrap_or(usize::MAX)) {
                     encode_row(w, cols, r, out)?;
@@ -22455,15 +22515,7 @@ fn emit_rows_inner(
                 // duplicates of each other here (SQL's set semantics),
                 // unlike `= NULL` in a predicate.
                 if *distinct {
-                    let mut seen: Vec<Vec<Value>> = Vec::new();
-                    rows.retain(|r| {
-                        if seen.iter().any(|s| rows_equal(s, r)) {
-                            false
-                        } else {
-                            seen.push(r.clone());
-                            true
-                        }
-                    });
+                    distinct_rows(&mut rows, order_by.is_some());
                 }
                 if let Some(key) = order_by {
                     let keys = [key.clone()];
@@ -39762,6 +39814,67 @@ mod tests {
         // ... and it carries the exact rows that arrived before it
         assert_eq!(avg(&[r(Value::Int(1)), d(2.0)]), Value::Double(1.5));
         assert_eq!(avg(&[n(150), d(2.5)]), Value::Double(2.0));
+    }
+
+    /// DISTINCT is a SORT: the engine plans `PLAN SORT (T NATURAL)` for
+    /// it and drops equal neighbours, so the set comes back ascending
+    /// over EVERY output column left to right with NULLs first - not in
+    /// scan order with duplicates filtered out.
+    #[test]
+    fn distinct_delivers_the_set_sorted() {
+        let mut rows = vec![
+            vec![Value::Int(30)],
+            vec![Value::Int(10)],
+            vec![Value::Int(30)],
+            vec![Value::Null],
+            vec![Value::Int(20)],
+            vec![Value::Null],
+        ];
+        distinct_rows(&mut rows, false);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Null],
+                vec![Value::Int(10)],
+                vec![Value::Int(20)],
+                vec![Value::Int(30)],
+            ]
+        );
+        // the second column decides a tie on the first
+        let mut two = vec![
+            vec![Value::Int(2), Value::Int(9)],
+            vec![Value::Int(1), Value::Int(5)],
+            vec![Value::Int(2), Value::Int(1)],
+            vec![Value::Int(1), Value::Int(5)],
+        ];
+        distinct_rows(&mut two, false);
+        assert_eq!(
+            two,
+            vec![
+                vec![Value::Int(1), Value::Int(5)],
+                vec![Value::Int(2), Value::Int(1)],
+                vec![Value::Int(2), Value::Int(9)],
+            ]
+        );
+    }
+
+    /// ...and an explicit ORDER BY REPLACES that sort rather than
+    /// sitting under it, so the de-duplication must leave the order it
+    /// was given alone. (The first fix for the case above re-sorted
+    /// unconditionally and turned `ORDER BY 1 DESC` back into ascending.)
+    #[test]
+    fn an_ordered_distinct_keeps_the_order_it_was_given() {
+        let mut rows = vec![
+            vec![Value::Int(30)],
+            vec![Value::Int(20)],
+            vec![Value::Int(20)],
+            vec![Value::Int(10)],
+        ];
+        distinct_rows(&mut rows, true);
+        assert_eq!(
+            rows,
+            vec![vec![Value::Int(30)], vec![Value::Int(20)], vec![Value::Int(10)]]
+        );
     }
 
     #[test]
