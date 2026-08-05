@@ -2353,8 +2353,17 @@ plus *the subsystem is now on the path*.
   DDL-then-DML script through the engine, through fire-crab and through
   fire-crab with `FC_NO_MDC=1`, and all three must agree.
 
-  Still to hold: the checks, foreign keys and triggers a plan gathers
-  are not in it yet, and they are most of the 1.8ms that is left.
+  Then the rest of the plan, phase by phase: `plan:defaults` was
+  1277us of the 1852us that remained — a walk of the whole of
+  `RDB$RELATION_FIELDS` and a blob per default, for an answer that
+  depends on the table and not the statement. Split into a cached
+  `table_defaults` (with a per-column "exists and cannot be evaluated"
+  marker, so a statement that omits the column still refuses) and a
+  per-statement filter; the FK partnerships and check predicates
+  followed. **Plan 5498us → 402us, INSERT 8.2ms → 3.06ms.**
+
+  Still outside it: the triggers a statement gathers, and the SELECT
+  planner's own catalog reads.
 - **W5 — event delivery** (`evt`): the shared-memory arena, the watcher,
   and the wire path.
 - **W6 — depth in `exe` and `svc`**: the request lifecycle, cursors and

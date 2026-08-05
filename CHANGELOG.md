@@ -33,8 +33,22 @@ was caught), **Guarded** (a wrong-answer path closed by refusal).
   are. It also follows the buffer pool's EPOCH: a file the pool
   re-read is a different database, and everything derived from the old
   one goes.
-- **Measured after: plan 4857us → 1809us, and the INSERT 7.4ms →
-  4.3ms (-41%)**, on the same two-row table.
+- **Measured after the first pass: plan 4857us → 1809us, and the
+  INSERT 7.4ms → 4.3ms**, on the same two-row table.
+- **And then the rest of the plan, measured phase by phase.** With the
+  first cache in, `plan(dml)` was 1852us: `plan:defaults` **1277us**,
+  checks 207us, FKs 195us, NOT NULL 24us, index operations 0 (cached).
+  The defaults walk the whole of `RDB$RELATION_FIELDS` — a row per
+  column of every relation in the database — and read a blob per
+  default, for an answer that depends on the TABLE, not the statement;
+  only which columns the statement NAMED is per statement. Split in
+  two: `table_defaults` is cached, with a per-column "there is a
+  default here and it cannot be evaluated" marker so a statement that
+  omits that column still refuses and one that supplies it still does
+  not care. The FK partnerships and the check predicates followed (the
+  latter keyed by the guard as well as the table, since an UPDATE's
+  answer depends on which columns it sets).
+- **Plan 5498us → 402us, and the INSERT 8.2ms → 3.06ms.**
 - **`qa/serve-real-metadata.sh`** (5 checks) runs a DDL-then-DML script
   — add a column and write it, create an index and write through it,
   add a foreign key and write across it — three ways: through the

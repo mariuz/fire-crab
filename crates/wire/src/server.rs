@@ -4753,6 +4753,15 @@ fn now_date_time() -> (i32, u32) {
 /// (RDB$RELATION_FIELDS), else its domain's (RDB$FIELDS) - decoded.
 /// None = an omitted column carries a default this server cannot
 /// evaluate; the statement must refuse, never insert a wrong NULL.
+/// The columns a statement did not name, and what to put in them.
+///
+/// The CATALOG half of this - which columns have a default, and what it
+/// evaluates to - is the same for every statement against the table, so
+/// it is held in the metadata cache ([table_defaults]); the statement
+/// half is only which columns it named. It was worth separating:
+/// `plan:defaults` was 1277us of an 1852us plan, because the walk goes
+/// over the whole of `RDB$RELATION_FIELDS` - a row per column of every
+/// relation in the database - and then reads a blob per default.
 fn insert_defaults(
     db: &Database,
     table: &str,
@@ -4760,6 +4769,38 @@ fn insert_defaults(
     descs: &[Descriptor],
     targeted: &[usize],
 ) -> Option<Vec<(usize, DefaultVal)>> {
+    let all = db.meta_memo("defaults", table, || {
+        table_defaults(db, table, columns, descs)
+    });
+    let all = all.as_ref().as_ref()?;
+    let mut out = Vec::new();
+    for (fid, val) in all {
+        if targeted.contains(fid) {
+            continue; // the statement supplies it; its default is moot
+        }
+        match val {
+            Some(dv) => out.push((*fid, dv.clone())),
+            // A DEFAULT THAT EXISTS AND CANNOT BE EVALUATED refuses the
+            // statement - but only when the column is actually omitted,
+            // which is why the outcome is kept per column instead of
+            // folded into the whole answer.
+            None => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Every non-computed column's DEFAULT as the catalog gives it - the
+/// column's own, or the domain's when the column has none. A `None`
+/// value means "there is a default here and it cannot be evaluated".
+/// Columns with no default at all (or an explicit NULL one, which is
+/// the same thing) are absent.
+fn table_defaults(
+    db: &Database,
+    table: &str,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+) -> Option<Vec<(usize, Option<DefaultVal>)>> {
     let rf_formats = fire_crab_ods::sysfmt::system_relation_formats(
         &db.bytes(),
         db.page_size,
@@ -4790,7 +4831,7 @@ fn insert_defaults(
             return;
         };
         let fid = rc.field_id as usize;
-        if targeted.contains(&fid) || is_computed_fid(descs, fid) {
+        if is_computed_fid(descs, fid) {
             return;
         }
         let blob = match values.get(def_f) {
@@ -4803,15 +4844,17 @@ fn insert_defaults(
         };
         omitted.push((fid, blob, src));
     });
-    let mut out = Vec::new();
+    let mut out: Vec<(usize, Option<DefaultVal>)> = Vec::new();
     let mut pending: Vec<(usize, String)> = Vec::new();
     for (fid, blob, src) in omitted {
         match blob {
             Some((r, n)) => {
-                let bytes = fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, r, n)?;
-                match decode_default_blr(&bytes)? {
-                    DefaultVal::Null => {} // same as no default
-                    dv => out.push((fid, dv)),
+                match fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, r, n)
+                    .and_then(|bytes| decode_default_blr(&bytes))
+                {
+                    Some(DefaultVal::Null) => {} // same as no default
+                    Some(dv) => out.push((fid, Some(dv))),
+                    None => out.push((fid, None)), // exists, unevaluatable
                 }
             }
             None => pending.push((fid, src)), // the domain may carry one
@@ -4841,10 +4884,12 @@ fn insert_defaults(
             }
         });
         for (fid, r, n) in blobs {
-            let bytes = fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, r, n)?;
-            match decode_default_blr(&bytes)? {
-                DefaultVal::Null => {}
-                dv => out.push((fid, dv)),
+            match fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, r, n)
+                .and_then(|bytes| decode_default_blr(&bytes))
+            {
+                Some(DefaultVal::Null) => {}
+                Some(dv) => out.push((fid, Some(dv))),
+                None => out.push((fid, None)),
             }
         }
     }
@@ -4857,6 +4902,7 @@ fn insert_defaults(
 /// MET_lookup_partner walks. `my_fids` are the key fields in the DML
 /// target table, `other_fids` the partner relation's, segment by
 /// segment in RDB$FIELD_POSITION order.
+#[derive(Clone)]
 struct FkPartner {
     other_rel: u16,
     other_formats: Vec<(u8, Vec<Descriptor>)>,
@@ -4882,7 +4928,22 @@ struct FkPartner {
 /// INDEX checks, not triggers, so the flag-4 trigger guard never sees
 /// them). None when the catalog cannot be resolved - the DML planner
 /// must refuse, never bypass.
+/// [fk_partners_uncached], held in the metadata cache: which foreign
+/// keys a table is on either side of is catalog, and a DML statement
+/// asks once per statement.
 fn fk_partners(
+    db: &Database,
+    table: &str,
+    columns: &[RelationColumn],
+) -> Option<(Vec<FkPartner>, Vec<FkPartner>)> {
+    db.meta_memo("fk-partners", table, || {
+        fk_partners_uncached(db, table, columns)
+    })
+    .as_ref()
+    .clone()
+}
+
+fn fk_partners_uncached(
     db: &Database,
     table: &str,
     columns: &[RelationColumn],
@@ -5204,7 +5265,32 @@ fn fk_check_parent_row(
 /// list touches a guarded parent-key column (from the trigger's own
 /// RDB$DEPENDENCIES rows). A DELETE evaluates no checks - the guard is
 /// the only thing [plan_delete] needs from here.
+/// [check_predicates_uncached], held in the metadata cache.
+///
+/// The key carries the GUARD as well as the table, because an UPDATE's
+/// answer depends on which columns it sets - an action trigger only
+/// guards a parent key the statement actually touches. Same statement
+/// shape, same answer; a different SET list is a different key.
 fn check_predicates(
+    db: &Database,
+    table: &str,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    dml: DmlGuard,
+) -> Option<Vec<TableCheck>> {
+    let about = match &dml {
+        DmlGuard::Insert => format!("{}/I", table),
+        DmlGuard::Delete => format!("{}/D", table),
+        DmlGuard::Update(cols) => format!("{}/U:{}", table, cols.join(",")),
+    };
+    db.meta_memo("checks", &about, || {
+        check_predicates_uncached(db, table, columns, descs, dml)
+    })
+    .as_ref()
+    .clone()
+}
+
+fn check_predicates_uncached(
     db: &Database,
     table: &str,
     columns: &[RelationColumn],
@@ -11051,7 +11137,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     // ascending on a supported type) or the statement is refused - a
     // record without its index entries would be silently invisible to
     // the engine's index scans
-    let index_ops = resolve_index_ops(db, rel, descs)?;
+    let index_ops = timed("plan:index-ops", || resolve_index_ops(db, rel, descs))?;
     let targets: Vec<&RelationColumn> = match &collist {
         Some(names) => {
             let mut v = Vec::new();
@@ -11197,18 +11283,21 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     let params: Vec<Descriptor> = params.into_iter().collect::<Option<_>>()?;
     // the table's CHECK constraints; a check this server cannot
     // evaluate refuses the whole statement - never bypass
-    let checks = check_predicates(db, table, &columns, descs, DmlGuard::Insert)?;
+    let checks = timed("plan:checks", || {
+        check_predicates(db, table, &columns, descs, DmlGuard::Insert)
+    })?;
     let descs = descs.clone();
-    let not_null = not_null_fids(db, table);
+    let not_null = timed("plan:not-null", || not_null_fids(db, table));
     // the FKs on this table: the stored row must reference existing
     // parent keys; an unresolvable FK catalog refuses, never bypasses
-    let (fk_refs, _) = fk_partners(db, table, &columns)?;
+    let (fk_refs, _) = timed("plan:fks", || fk_partners(db, table, &columns))?;
     // the omitted columns' DEFAULTs - an unevaluatable one (a session
     // id, an expression) refuses rather than writing a wrong NULL.
     // "Omitted" is `named`, not `listed`: a DEFAULT-keyword column asks
     // for exactly this treatment, and `INSERT INTO T DEFAULT VALUES`
     // names nothing at all, so every non-computed column is filled.
-    let default_fields = insert_defaults(db, table, &columns, &descs, &named)?;
+    let default_fields =
+        timed("plan:defaults", || insert_defaults(db, table, &columns, &descs, &named))?;
     Some((
         Plan::Insert {
             rel,
@@ -12150,7 +12239,7 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
     let columns = meta.columns.as_ref().clone();
     let formats = meta.formats.as_ref().clone();
     let (format_no, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
-    let index_ops = resolve_index_ops(db, rel, descs)?;
+    let index_ops = timed("plan:index-ops", || resolve_index_ops(db, rel, descs))?;
 
     let set_end = where_kw.unwrap_or(s.len());
     let set_text = &s[set_kw + "SET".len()..set_end];
