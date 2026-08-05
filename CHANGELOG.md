@@ -49,6 +49,18 @@ was caught), **Guarded** (a wrong-answer path closed by refusal).
   latter keyed by the guard as well as the table, since an UPDATE's
   answer depends on which columns it sets).
 - **Plan 5498us → 402us, and the INSERT 8.2ms → 3.06ms.**
+- **The SELECT planner had the same problem**, and the timer said so:
+  `plan(select)` was 902us of a 1.20ms SELECT. Its own id and columns
+  read, the formats it decodes with (`select_formats` — the system
+  relations' bootstrap walk when `RDB$FORMATS` has nothing) and the
+  computed-column sources now come from the same cache. Left uncached
+  deliberately: `choose_index`, 232us, which depends on the
+  statement's filter and ORDER BY and not only on the schema.
+- **Where the session's statements ended up**, timers off:
+  **SELECT 1.24ms → 0.94ms, INSERT ~7.9ms → 2.78ms.** And the timing
+  switch itself reads its environment variable ONCE, in a `OnceLock` —
+  it wraps hot paths, and `env::var` per call would have made the
+  instrument part of what it measures.
 - **`qa/serve-real-metadata.sh`** (5 checks) runs a DDL-then-DML script
   — add a column and write it, create an index and write through it,
   add a foreign key and write across it — three ways: through the

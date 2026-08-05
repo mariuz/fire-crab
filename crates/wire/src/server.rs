@@ -488,7 +488,11 @@ const FIXED_ANSWER: i64 = 4242;
 /// (5 pages against a whole-file write); what a statement actually
 /// spends is measured here rather than guessed.
 fn timed<T>(label: &str, f: impl FnOnce() -> T) -> T {
-    if std::env::var("FC_SRV_TIME").is_err() {
+    // THE SWITCH IS READ ONCE. This wraps hot paths - the index
+    // choice, every fetch - and `env::var` on each call would make the
+    // instrument part of what it measures.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("FC_SRV_TIME").is_ok()) {
         return f();
     }
     let t0 = std::time::Instant::now();
@@ -4504,7 +4508,17 @@ fn is_computed_fid(descs: &[Descriptor], fid: usize) -> bool {
 /// `RDB$COMPUTED_SOURCE` text (`(expr)`), read through
 /// `RDB$RELATION_FIELDS` -> `RDB$FIELDS`. The SELECT path parses each
 /// as the scalar expression it is and evaluates it per fetched row.
+/// [computed_sources_uncached], held in the metadata cache.
 fn computed_sources(db: &Database, table: &str) -> std::collections::HashMap<usize, String> {
+    db.meta_memo("computed", table, || computed_sources_uncached(db, table))
+        .as_ref()
+        .clone()
+}
+
+fn computed_sources_uncached(
+    db: &Database,
+    table: &str,
+) -> std::collections::HashMap<usize, String> {
     use fire_crab_ods::format::Value;
     let mut out = std::collections::HashMap::new();
     let Some(rf_formats) = fire_crab_ods::sysfmt::system_relation_formats(
@@ -14503,6 +14517,21 @@ fn choose_index(
     sql: &str,
     order_by: &[OrderKey],
 ) -> Option<IndexAccess> {
+    timed("plan:choose-index", || {
+        choose_index_inner(db, rel, table, descs, filter, sql, order_by)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn choose_index_inner(
+    db: &Database,
+    rel: u16,
+    table: &str,
+    descs: &[Descriptor],
+    filter: &Option<Predicate>,
+    sql: &str,
+    order_by: &[OrderKey],
+) -> Option<IndexAccess> {
     use fire_crab_ods::btw;
     // FC_NO_INDEX forces the scan. It exists for the GATE: a coverage
     // check that cannot fail is worth nothing, and the only way to show
@@ -15158,12 +15187,20 @@ fn recno_of(work: &[u8], page_size: usize, page_no: u32, slot: u16) -> Result<u6
 /// `RDB$RELATION_FIELDS`/`RDB$FIELDS` rows). DML planners deliberately
 /// keep plain `relation_formats`: the fallback must never make system
 /// relations writable.
+/// The formats a SELECT decodes with - the relation's own, or, for a
+/// system relation whose formats are not in `RDB$FORMATS`, the ones the
+/// engine's bootstrap walk computes. Held in the metadata cache: that
+/// bootstrap walk is the expensive half, and both halves are catalog.
 fn select_formats(db: &Database, table: &str, rel: u16) -> Vec<(u8, Vec<Descriptor>)> {
-    let formats = relation_formats(&db.bytes(), db.page_size, rel);
-    if !formats.is_empty() {
-        return formats;
-    }
-    fire_crab_ods::system_relation_formats(&db.bytes(), db.page_size, table).unwrap_or_default()
+    db.meta_memo("select-formats", table, || {
+        let formats = relation_formats(&db.bytes(), db.page_size, rel);
+        if !formats.is_empty() {
+            return formats;
+        }
+        fire_crab_ods::system_relation_formats(&db.bytes(), db.page_size, table).unwrap_or_default()
+    })
+    .as_ref()
+    .clone()
 }
 
 /// One side of a FROM clause: a relation name, its optional SCHEMA
@@ -16734,7 +16771,7 @@ fn plan_join_bound(
 /// a visible count mismatch instead of a silently wrong answer).
 fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
     let mut params = Vec::new();
-    let planned = plan_query_inner(sql, db, &mut params);
+    let planned = timed("plan:query-inner", || plan_query_inner(sql, db, &mut params));
     match (planned, params.into_iter().collect::<Option<Vec<_>>>()) {
         (Some(p), Some(ps)) => (p, ps),
         // A QUERY THIS SERVER CANNOT PLAN RAISES. It used to answer
@@ -19616,8 +19653,10 @@ fn plan_query_inner_ctx(
         };
     }
     let table = left.table;
-    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, table)?;
-    let columns = relation_columns(&db.bytes(), db.page_size, table);
+    // through the metadata cache, like the DML planners - see [crate::mdc]
+    let meta = db.relation_meta(table)?;
+    let rel = meta.id;
+    let columns = meta.columns.as_ref().clone();
     let formats = select_formats(db, table, rel);
     let descs = formats
         .iter()
@@ -23145,7 +23184,19 @@ fn advance_generators(
 /// Emit a cursor's rows. `gen_writes` collects the (generator name, final
 /// value) each generator column reached - the caller persists them after
 /// the fetch, mirroring the engine's mid-fetch generator advance.
+/// [emit_rows_inner] with the fetch timed - see [timed].
 fn emit_rows(
+    w: &mut W,
+    plan: &Plan,
+    db: &Option<Database>,
+    args: &[WireParam],
+    gen_writes: &mut Vec<(String, i64)>,
+    out: Option<&OutFmt>,
+) {
+    timed("fetch", || emit_rows_uncounted(w, plan, db, args, gen_writes, out))
+}
+
+fn emit_rows_uncounted(
     w: &mut W,
     plan: &Plan,
     db: &Option<Database>,
@@ -36227,7 +36278,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         }
                     }
                 } else {
-                    let (p, ps) = plan_query(&stmt_sql, &database);
+                    let (p, ps) = timed("plan(select)", || plan_query(&stmt_sql, &database));
                     // A REFUSED STATEMENT FAILS AT PREPARE, which is where
                     // the engine fails an unsupported one too. Answering
                     // the prepare and then raising at fetch left the error

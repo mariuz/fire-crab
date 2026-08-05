@@ -2362,8 +2362,16 @@ plus *the subsystem is now on the path*.
   per-statement filter; the FK partnerships and check predicates
   followed. **Plan 5498us → 402us, INSERT 8.2ms → 3.06ms.**
 
-  Still outside it: the triggers a statement gathers, and the SELECT
-  planner's own catalog reads.
+  The SELECT planner followed - its own id and columns, the formats it
+  decodes with (the system relations' bootstrap walk included) and the
+  computed-column sources - taking `plan(select)` from 902us to 657us
+  and the statement from 1.24ms to 0.94ms.
+
+  Still outside it, deliberately: `choose_index` (232us) depends on the
+  statement's filter and ORDER BY, not only on the schema. Still
+  outside it, not deliberately: the triggers a statement gathers, and
+  the per-statement CLONE of the cached check predicates (127us) -
+  the answer is shared, the copy is not.
 - **W5 — event delivery** (`evt`): the shared-memory arena, the watcher,
   and the wire path.
 - **W6 — depth in `exe` and `svc`**: the request lifecycle, cursors and
