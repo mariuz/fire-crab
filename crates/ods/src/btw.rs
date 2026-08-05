@@ -138,16 +138,42 @@ fn flipped_int_key(be: &[u8]) -> Vec<u8> {
 /// `make_int64_key` (btr.cpp:7056) + the int64 emission and munging in
 /// `compress`.
 fn int64_key(raw: i64, scale: i16) -> Option<Vec<u8>> {
-    // i64::MIN has no faithful key here: the engine's make_int64_key
-    // NEGATES the value before choosing a scale factor, and negating
-    // i64::MIN overflows, so its choice is not the arithmetically
-    // correct one. Returning None makes every caller ABSTAIN - the
-    // search key is not built (so the retrieval scans) and a candidate
-    // holding this value is not judged (so it is kept, and the
-    // predicate decides). Answering with our own bytes instead dropped
-    // any row that merely CONTAINED i64::MIN in an indexed segment.
+    // i64::MIN IS KEYED AS ZERO, and that is READ OFF THE ENGINE'S OWN
+    // INDEX rather than derived. This used to abstain, on the reasoning
+    // that `make_int64_key` NEGATES before choosing a scale factor and
+    // negating i64::MIN overflows, so its choice "is not the
+    // arithmetically correct one" - true, and it stopped one step too
+    // early. What the engine actually WRITES was never looked at.
+    //
+    // Written by the engine, one value per database, dumped with
+    // `fcstat index-walk`:
+    //
+    //     -9223372036854775808 -> 800000000000000080
+    //                        0 -> 800000000000000080
+    //     -9223372036854775807 -> 3cf5c91d14e3bcd76951
+    //                        1 -> bf1a36e2eb1c432d80
+    //                       -1 -> 40e5c91d14e3bcd280
+    //
+    // THE ENGINE FILES i64::MIN UNDER ZERO'S KEY. The overflow does not
+    // merely perturb the scale choice - it sends the loop one bucket
+    // further, and `q *= 10` on i64::MIN wraps to exactly 0 (10 * 2^63
+    // is a multiple of 2^64), so both the double and the short part come
+    // out zero. `0 / powerof10(scale)` is zero at every scale, which is
+    // why this needs no scale of its own.
+    //
+    // It is a DEFECT and it is observable in the engine ALONE: equality
+    // finds the row (both sides compute the same wrong key) while every
+    // RANGE misses it, because the entry sits at zero's position. On the
+    // engine, `A < -9223372036854775807` answers nothing though the row
+    // exists, and `A+0 < -9223372036854775807` - the same predicate, no
+    // index - returns it.
+    //
+    // Matching it is not endorsing it: a key is an ADDRESS in a shared
+    // file. A row fire-crab writes under a different address is a row
+    // the engine's own lookups cannot find, which is a lost record
+    // rather than a slower one.
     if raw == i64::MIN {
-        return None;
+        return int64_key(0, scale);
     }
     let mut n = 0;
     let uq = raw.unsigned_abs();
@@ -949,6 +975,26 @@ mod tests {
         assert_eq!(node_cmp_desc(&[0xC0], 0, &node(&[0xC0])), Ordering::Equal);
         // an empty key (a NULL) is the extreme case of a prefix
         assert_eq!(node_cmp_desc(&[], 0, &node(&[0xC0])), Ordering::Greater);
+    }
+
+    /// THE ENGINE'S OWN BYTES, read back off indexes it wrote itself -
+    /// one value per database, `fcstat index-walk`. i64::MIN is filed
+    /// under ZERO'S KEY, which is a defect in the engine (equality finds
+    /// such a row, every RANGE misses it) and is nonetheless the address
+    /// a shared file agrees on. Writing our own bytes there would make
+    /// the row invisible to the engine's lookups.
+    #[test]
+    fn i64_min_is_keyed_where_the_engine_files_it() {
+        let hex = |v: &[u8]| v.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        let key = |n: i64| int64_key(n, 0).expect("every int64 has a key");
+        assert_eq!(hex(&key(i64::MIN)), "800000000000000080");
+        assert_eq!(hex(&key(0)), "800000000000000080");
+        // its neighbour is NOT special - the collision is i64::MIN alone
+        assert_eq!(hex(&key(-9223372036854775807)), "3cf5c91d14e3bcd76951");
+        assert_eq!(hex(&key(1)), "bf1a36e2eb1c432d80");
+        assert_eq!(hex(&key(-1)), "40e5c91d14e3bcd280");
+        // zero's key carries no scale, so neither does this one
+        assert_eq!(int64_key(i64::MIN, -2), int64_key(0, -2));
     }
 
     #[test]

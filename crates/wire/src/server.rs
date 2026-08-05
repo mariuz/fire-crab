@@ -24457,10 +24457,77 @@ fn expr_mul(b: &[char], pos: &mut usize) -> Option<RawExpr> {
     Some(left)
 }
 
+/// `2^63` written out - the ONE magnitude whose type depends on the sign
+/// in front of it.
+const I64_MIN_DIGITS: &str = "9223372036854775808";
+
+/// Consume `<digits of 2^63>` under a unary minus, parentheses and space
+/// included, and answer `i64::MIN`.
+///
+/// The literal parser reads a digit run WITHOUT its sign, because a
+/// leading `-` is a separate unary node - so this one magnitude overflows
+/// `i64` and the whole statement was REFUSED, though the value it names
+/// is perfectly representable. Measured, the engine folds the sign into
+/// the literal before it types it:
+///
+/// * `-9223372036854775808`, `- 9223372036854775808` and
+///   `-(9223372036854775808)` all describe as **INT64** and answer;
+/// * the bare `9223372036854775808` is **INT128**, and so is
+///   `-9223372036854775809` - which is why this recognises the exact
+///   magnitude and nothing wider: everything else stays refused until
+///   INT128 literals are their own slice;
+/// * `- -9223372036854775808` describes INT64 and raises 22003 at
+///   RUNTIME, which is what negating this value does here too.
+///
+/// A `.` or an exponent after the digits makes it another kind of
+/// literal entirely, so this must not fire on those.
+fn neg_i64_min(b: &[char], pos: &mut usize) -> Option<RawExpr> {
+    let mut p = *pos;
+    let mut opens = 0usize;
+    loop {
+        while b.get(p).is_some_and(|c| c.is_whitespace()) {
+            p += 1;
+        }
+        if b.get(p) == Some(&'(') {
+            opens += 1;
+            p += 1;
+        } else {
+            break;
+        }
+    }
+    if !b[p.min(b.len())..].starts_with(I64_MIN_DIGITS.chars().collect::<Vec<_>>().as_slice()) {
+        return None;
+    }
+    p += I64_MIN_DIGITS.len();
+    // a longer digit run, a decimal point or an exponent is a DIFFERENT
+    // literal - do not swallow its leading digits
+    if b.get(p).is_some_and(|c| c.is_ascii_digit() || *c == '.' || *c == 'e' || *c == 'E') {
+        return None;
+    }
+    for _ in 0..opens {
+        while b.get(p).is_some_and(|c| c.is_whitespace()) {
+            p += 1;
+        }
+        if b.get(p) != Some(&')') {
+            return None;
+        }
+        p += 1;
+    }
+    *pos = p;
+    Some(RawExpr::Int(i64::MIN))
+}
+
 fn expr_unary(b: &[char], pos: &mut usize) -> Option<RawExpr> {
     skip_ws(b, pos);
     if b.get(*pos) == Some(&'-') {
         *pos += 1;
+        // the sign folds into the literal before the type is chosen -
+        // see [neg_i64_min]
+        let after_minus = *pos;
+        if let Some(e) = neg_i64_min(b, pos) {
+            return Some(e);
+        }
+        *pos = after_minus;
         return Some(RawExpr::Neg(Box::new(expr_unary(b, pos)?)));
     }
     if b.get(*pos) == Some(&'+') {
@@ -27700,10 +27767,22 @@ impl Expr {
             Expr::DateLit(d) => Value::Date(*d),
             Expr::TimeLit(t) => Value::Time(*t),
             Expr::TsLit(d, t) => Value::Timestamp(*d, *t),
+            // NEGATION OVERFLOWS AT EXACTLY ONE VALUE, and it wrapped
+            // there silently while `+` and `-` beside it have always
+            // raised. Nothing could reach it until `-9223372036854775808`
+            // became spellable (see [neg_i64_min]); the engine describes
+            // `- -9223372036854775808` as INT64 and raises 22003 when the
+            // row is built, which is this arm.
             Expr::Neg(e) => match e.eval(values)? {
-                Value::Int(n) => Value::Int(n.wrapping_neg()),
-                Value::Scaled(r, s) => Value::Scaled(r.wrapping_neg(), s),
-                Value::Int128(r, s) => Value::Int128(-r, s),
+                Value::Int(n) => {
+                    Value::Int(n.checked_neg().ok_or(EvalErr::IntegerOverflow)?)
+                }
+                Value::Scaled(r, s) => {
+                    Value::Scaled(r.checked_neg().ok_or(EvalErr::IntegerOverflow)?, s)
+                }
+                Value::Int128(r, s) => {
+                    Value::Int128(r.checked_neg().ok_or(EvalErr::IntegerOverflow)?, s)
+                }
                 Value::Double(d) => Value::Double(-d),
                 Value::Float(f) => Value::Float(-f),
                 _ => Value::Null,

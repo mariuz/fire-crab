@@ -13,6 +13,33 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-05 — The key the engine files in the wrong place
+
+### Fixed
+- **`i64::MIN` can be written now, and it is keyed where the ENGINE
+  files it.** Two halves the roadmap had said to do together or not at
+  all. The literal parse read a digit run WITHOUT its sign (a leading
+  `-` is a separate unary node), so `9223372036854775808` overflowed
+  `i64` and the statement was REFUSED though the value is
+  representable — measured, the engine folds the sign in before typing:
+  `-<digits>`, `- <digits>` and `-(<digits>)` all describe INT64, the
+  bare magnitude is INT128, past 2¹²⁷ it is DECFLOAT(34). And the write
+  key, which the entry had guessed at: read off indexes the engine wrote
+  itself, `-9223372036854775808` and `0` share the key
+  `800000000000000080`. **The engine files `i64::MIN` under zero's
+  key** — the overflow sends the scale loop one bucket on, and `q *= 10`
+  on `i64::MIN` wraps to exactly 0. It is a defect and it is the
+  engine's alone: equality finds such a row, every RANGE misses it
+  (`A < -9223372036854775807` answers nothing though the row exists;
+  the same predicate with `A+0` returns it). fire-crab matches it,
+  because a key is an ADDRESS in a shared file and a row written
+  elsewhere is one the engine cannot find. Gated by writing the row with
+  fire-crab and reading it back with the engine, plus `gfix -v -full`.
+- **`Expr::Neg` wrapped silently** where `+` and `-` beside it have
+  always raised. Nothing could reach it until the literal became
+  spellable; the engine describes `- -9223372036854775808` as INT64 and
+  raises 22003 at the row, which that arm now does.
+
 ## 2026-08-05 — A modifier that dropped the select list, and a set that is a sort
 
 Two wrong answers under `FIRST`/`SKIP`/`DISTINCT`, both found by asking

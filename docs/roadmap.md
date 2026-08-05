@@ -2021,27 +2021,73 @@ plus *the subsystem is now on the path*.
     bound is the prefix's EXCLUSIVE SUCCESSOR (an inclusive one drops
     every row with a non-NULL trailing segment), and text equality is
     keyed for ASCII literals on `idx_string` and `idx_metadata`.
-  - **A named, measured write-path divergence at `i64::MIN`.**
-    `btw::int64_key` builds a key for `-9223372036854775808` that is not
-    the one the engine wrote: the engine's `make_int64_key` NEGATES the
-    value before choosing a scale, and negating `i64::MIN` overflows, so
-    its choice differs from the arithmetically correct one. Retrieval
-    now SCANS for that value, which restores the right answers; the
-    WRITE path still stores our key, so a row fire-crab inserts with a
-    BIGINT of exactly `i64::MIN` carries an index entry the engine's own
-    lookups may not find. Closing it means reading the engine's actual
-    key bytes for that value, which is a probe of its own.
-    **Re-measured: the stated hazard is UNREACHABLE, because a prior
-    refusal blocks the write.** `INSERT INTO BM VALUES
-    (-9223372036854775808,…)`, the `CAST('…' AS BIGINT)` spelling and a
-    string-bound parameter all get a Dynamic SQL Error here where the
-    engine writes the row — the literal parse overflows on the unsigned
-    half before the key is ever built. Retrieval is fine (after isql
-    wrote the row into fire-crab's own file, fire-crab found it). So
-    what is actually open is SMALLER and different from what the entry
-    says: fire-crab refuses a value the engine accepts. Fix the literal
-    parse and the write-key divergence becomes live again — do both in
-    one slice, or neither.
+  - ~~**A named, measured write-path divergence at `i64::MIN`.**~~
+    *(done — and the premise was backwards)*. The entry said
+    `btw::int64_key` builds a key the engine did not write, because
+    `make_int64_key` NEGATES before choosing a scale and negating
+    `i64::MIN` overflows, "so its choice differs from the arithmetically
+    correct one" — true, and it stopped one step short. **What the
+    engine actually WRITES was never read.** Written by the engine, one
+    value per database, dumped with `fcstat index-walk`:
+
+    | value | stored key |
+    |---|---|
+    | `-9223372036854775808` | `800000000000000080` |
+    | `0` | `800000000000000080` |
+    | `-9223372036854775807` | `3cf5c91d14e3bcd76951` |
+    | `1` | `bf1a36e2eb1c432d80` |
+    | `-1` | `40e5c91d14e3bcd280` |
+
+    **THE ENGINE FILES `i64::MIN` UNDER ZERO'S KEY.** The overflow does
+    not perturb the scale choice, it sends the loop one bucket on, and
+    `q *= 10` on `i64::MIN` wraps to exactly 0 (10·2⁶³ is a multiple of
+    2⁶⁴), so both parts come out zero — at every scale, since
+    `0 / powerof10(scale)` is 0.
+
+    **It is a DEFECT, and it is the ENGINE'S ALONE**: equality finds
+    such a row (both sides compute the same wrong key) while every RANGE
+    misses it, because the entry sits at zero's position. On the engine,
+    `A < -9223372036854775807` answers NOTHING though the row exists,
+    and `A+0 < -9223372036854775807` — the same predicate with the index
+    taken away — returns it. Matching it is not endorsing it: **a key is
+    an ADDRESS in a shared file**, and a row written at a different
+    address is one the engine's own lookups cannot find, which is a lost
+    record rather than a slower one. So `int64_key` answers zero's key
+    here instead of abstaining, `fcstat`-dumped bytes are pinned in a
+    unit test, and `qa/serve-real-btree.sh` writes the row with
+    fire-crab and reads it back **with the engine** (plus `gfix -v
+    -full`, which cross-checks every record against every index entry).
+
+    The blocked half is unblocked too. The literal parse read a digit
+    run WITHOUT its sign — a leading `-` is a separate unary node — so
+    `9223372036854775808` overflowed `i64` and the whole statement was
+    REFUSED, though the value it names is representable. Measured, the
+    engine folds the sign in before it types the literal: `-<digits>`,
+    `- <digits>` and `-(<digits>)` all describe as **INT64**, while the
+    bare magnitude and anything wider are **INT128** (and past 2¹²⁷,
+    DECFLOAT(34)). Only the exact magnitude is folded; everything wider
+    stays refused until INT128 literals are their own slice, which is a
+    real one — `Rhs` carries an `i64` raw across 113 sites.
+
+    **It also uncovered a silent wraparound.** `Expr::Neg` used
+    `wrapping_neg` where `+` and `-` beside it have always raised, and
+    nothing could reach it until this value became spellable. The engine
+    describes `- -9223372036854775808` as INT64 and raises 22003 at the
+    row; that arm now does the same.
+
+    *This is the SECOND place where fire-crab's two retrieval paths
+    legitimately differ* (after the raising ON). `FC_NO_INDEX=1` answers
+    the arithmetically correct rows for a range over `i64::MIN`; the
+    index path answers the engine's. The twin is an equivalence oracle
+    everywhere except this value and a raising ON.
+
+    *Residual, pinned in the gate rather than left silent*: the WHERE
+    clause has its OWN tokeniser and the fold lives in the select list's
+    parser, so `WHERE A = -(9223372036854775808)` still refuses where the
+    engine answers. The BARE spelling works on both sides everywhere.
+    Closing it means teaching the token lexer the same magnitude — a
+    refusal, never a wrong answer, and the check says so.
+
   - **`OR` and `IN`** *(done)*: a disjunction is a UNION OF BANDS, one
     per DNF branch, with every branch required to be servable (a partial
     union is a missing set of rows) and candidates deduplicated ACROSS

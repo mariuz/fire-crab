@@ -79,6 +79,14 @@ run_isql() { "$ISQL" -q -b -user "$U" -pas "$P" "$WORK"; }
 isql_q() {
     printf 'SET HEADING OFF;\n%s\n' "$1" | run_isql | strip | grep -v '^$'
 }
+# The same, against FIRE-CRAB over the wire. node_run cannot be used for
+# a 64-bit value: node-firebird hands a BIGINT back as a JavaScript
+# Number, so -9223372036854775808 reads as -9223372036854776000 - a
+# precision loss in the DRIVER that looks exactly like a wrong answer.
+fc_isql_q() {
+    printf 'SET HEADING OFF;\n%s\n' "$1" |
+        "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$WORK" 2>&1 | strip | grep -v '^$'
+}
 
 node_once() {
     FC_DB="$WORK" FC_PORT="$PORT" FC_U="$U" FC_P="$P" FC_Q="$1" timeout 20 node -e '
@@ -180,6 +188,73 @@ check "  ..count after delete" "$(node_run "SELECT COUNT(*) FROM T")" "1993"
 check "DESCENDING-index table accepts DML now" \
     "$(node_run "INSERT INTO TDESC VALUES (1)")" "<no rows>"
 
+# --- phase 5: i64::MIN, THE ONE KEY THE ENGINE FILES IN THE WRONG PLACE
+# A BIGINT index key is an INT64_KEY: a double part and a short part,
+# built by make_int64_key (btr.cpp:7056). That function takes the
+# absolute value with `(q >= 0) ? q : -q` and negating i64::MIN
+# OVERFLOWS - which sends the scale-control loop one bucket further, and
+# `q *= 10` on i64::MIN wraps to exactly 0 (10 * 2^63 is a multiple of
+# 2^64). Both parts come out zero.
+#
+# THE ENGINE THEREFORE FILES i64::MIN UNDER ZERO'S KEY. Read off indexes
+# the engine wrote itself, one value per database:
+#
+#     -9223372036854775808 -> 800000000000000080
+#                        0 -> 800000000000000080
+#     -9223372036854775807 -> 3cf5c91d14e3bcd76951
+#
+# It is a DEFECT, and it is the ENGINE'S: equality finds such a row
+# (both sides compute the same wrong key) while every RANGE misses it,
+# because the entry sits at zero's position. The checks below assert the
+# engine's behaviour, INCLUDING the miss - a key is an ADDRESS in a
+# shared file, and a row fire-crab writes at a different address is one
+# the engine's own lookups cannot find.
+#
+# fire-crab used to ABSTAIN here (no key, so retrieval scanned) and to
+# REFUSE the write outright, which is why the value could not be
+# inserted at all: the literal `-9223372036854775808` overflowed the
+# parser's unsigned half before any key was built.
+"$ISQL" -q -b -user "$U" -pas "$P" "$WORK" <<'EOF' >/dev/null 2>&1
+CREATE TABLE TMIN (A BIGINT, T VARCHAR(10));
+COMMIT;
+CREATE INDEX TMIN_A ON TMIN (A);
+COMMIT;
+EOF
+# fire-crab writes every row, i64::MIN included
+mw=$(node_run "INSERT INTO TMIN VALUES (-9223372036854775808, 'min')")
+check "fire-crab WRITES i64::MIN" "$mw" "<no rows>"
+node_run "INSERT INTO TMIN VALUES (-9223372036854775807, 'min1')" >/dev/null
+node_run "INSERT INTO TMIN VALUES (0, 'zero')" >/dev/null
+node_run "INSERT INTO TMIN VALUES (9223372036854775807, 'max')" >/dev/null
+# the literal itself, in the shapes the engine types as INT64
+check "the literal answers" \
+      "$(fc_isql_q "SELECT -9223372036854775808 AS X FROM RDB\$DATABASE;")" "-9223372036854775808"
+check "parenthesised, the sign still folds in" \
+      "$(fc_isql_q "SELECT -(9223372036854775808) AS X FROM RDB\$DATABASE;")" "-9223372036854775808"
+check "across whitespace too" \
+      "$(fc_isql_q "SELECT - 9223372036854775808 AS X FROM RDB\$DATABASE;")" "-9223372036854775808"
+check "and it is a value, not a spelling - arithmetic keeps it" \
+      "$(fc_isql_q "SELECT -9223372036854775808 + 0 AS X FROM RDB\$DATABASE;")" "-9223372036854775808"
+check "the BARE magnitude is INT128 and stays refused" \
+      "$(fc_isql_q "SELECT 9223372036854775808 AS X FROM RDB\$DATABASE;" | head -1 | cut -c1-16)" "Statement failed"
+# negating it overflows - the engine describes INT64 and raises 22003 at
+# the row. This arm used to WRAP silently; nothing could reach it until
+# the literal became spellable.
+check "double negation raises rather than wrapping" \
+      "$(fc_isql_q "SELECT - -9223372036854775808 AS X FROM RDB\$DATABASE;" | head -1 | cut -c1-16)" "Statement failed"
+check "and so does arithmetic that leaves the range" \
+      "$(fc_isql_q "SELECT -9223372036854775808 - 1 AS X FROM RDB\$DATABASE;" | head -1 | cut -c1-16)" "Statement failed"
+# A RECORDED REFUSAL, not a wrong answer. The WHERE clause has its OWN
+# tokeniser, and the fold lives in the select list's parser - so the
+# PARENTHESISED spelling under a WHERE still refuses where the engine
+# answers. The bare one works on both sides (checked above and below).
+# This is pinned so it cannot quietly turn into a wrong ANSWER; closing
+# it means teaching the token lexer the same magnitude.
+check "bare, a WHERE takes it" \
+      "$(fc_isql_q "SELECT T FROM TMIN WHERE A = -9223372036854775808;")" "min"
+check "parenthesised under a WHERE is REFUSED (engine answers)" \
+      "$(fc_isql_q "SELECT T FROM TMIN WHERE A = -(9223372036854775808);" | head -1 | cut -c1-16)" "Statement failed"
+
 # --- phase 2: the ENGINE reads through the indexes fire-crab wrote -----
 kill $srv 2>/dev/null; wait $srv 2>/dev/null
 
@@ -239,4 +314,23 @@ if "$GBAK" -b -g -user "$U" -pas "$P" "$WORK" /tmp/fc-btree-work.fbk >/dev/null 
 else
     echo "DIFF gbak backs the file up"; fail=1
 fi
+
+# THE ENGINE reads what fire-crab wrote - the real oracle for a key
+check "the engine reads i64::MIN back" \
+      "$(isql_q "SELECT T FROM TMIN WHERE A = -9223372036854775808;")" "min"
+check "the engine sorts it first" \
+      "$(isql_q "SELECT T FROM TMIN ORDER BY A;" | tr '\n' ',')" "min,min1,zero,max,"
+check "and the boundary neighbours still work" \
+      "$(isql_q "SELECT T FROM TMIN WHERE A = 9223372036854775807;")" "max"
+# THE ENGINE'S OWN MISS, asserted so it cannot be mistaken for ours: the
+# row exists and a RANGE covering it does not return it.
+check "a range over i64::MIN misses it - the engine's defect, matched" \
+      "$(isql_q "SELECT T FROM TMIN WHERE A < -9223372036854775807;")" ""
+check "...while the same predicate off the index finds it" \
+      "$(isql_q "SELECT T FROM TMIN WHERE A+0 < -9223372036854775807;")" "min"
+# gfix cross-checks every record against every index entry: one wrong
+# key byte and this screams. It is what says our bytes ARE the engine's.
+val=$("$GFIX" -v -full -user "$U" -pas "$P" "$WORK" 2>&1)
+check "gfix accepts the i64::MIN entry" "$(printf '%s' "$val" | strip)" ""
+
 exit $fail
