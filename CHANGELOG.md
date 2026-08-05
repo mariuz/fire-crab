@@ -16,6 +16,23 @@ was caught), **Guarded** (a wrong-answer path closed by refusal).
 ## 2026-08-05 — The key the engine files in the wrong place
 
 ### Converted
+- **DESCENDING indexes are keyed now**, and the arithmetic was READ off
+  the engine's own index rather than derived. An ascending and a
+  descending index over the same values: `1 → bff0 / 400f`,
+  `2 → c0 / 3f`, `'ab' → 6162 / 9e9d`, `'abc' → 616263 / 9e9d9c` — the
+  descending key is the bitwise COMPLEMENT of the ascending one, taken
+  after the ascending zero-chop and not re-chopped, which is exactly
+  what the write side already produced. Two things follow: the BOUNDS
+  SWAP (a larger value is a smaller key), and the comparison is not
+  `memcmp` — a shorter key pads with **0xFF**, so a key that is a byte
+  PREFIX of another sorts AFTER it. That second rule is both recorded
+  misses, and it explains why the integer one looked unrelated to the
+  text one: a zero-chopped key like 2's `c0` IS a prefix of 3's `c008`.
+  The rule is `btw::key_cmp_desc` — the write side had it, and
+  `lookup_range` asks for it rather than restating it, which also closed
+  a latent flaw in `lookup_key`, where a UNIQUE or FK descending index
+  compared its bounds with plain `memcmp`. Compound descending indexes
+  still scan.
 - **Scaled NUMERIC/DECIMAL columns are keyed now.** A `NUMERIC(9,2)` is
   a LONG at scale -2 whose key is the DOUBLE 12.5; a `NUMERIC(18,2)` is
   an INT64 taking the `INT64_KEY` form. The encoder always handled both

@@ -684,8 +684,15 @@ fn node_cmp(key: &[u8], recno: u64, n: &BtNode) -> std::cmp::Ordering {
 /// that held it, `ORDER BY D DESC` came back out of order) and that
 /// `gfix -v -full` reported as index page errors.
 fn node_cmp_desc(key: &[u8], recno: u64, n: &BtNode) -> std::cmp::Ordering {
-    let a = key;
-    let b = &n.key;
+    key_cmp_desc(key, &n.key).then(recno.cmp(&n.recno))
+}
+
+/// Two DESCENDING keys in stored order - the rule above, stated ONCE
+/// because the RETRIEVAL needs it as much as the write does. A band on a
+/// descending index that compares its bounds with plain `memcmp` walks
+/// past the rows it wants exactly where this differs: `btr::lookup_range`
+/// takes it as `desc`.
+pub fn key_cmp_desc(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     let len = a.len().max(b.len());
     for i in 0..len {
         // the missing bytes of the shorter key are 0xFF here, not 0x00
@@ -695,7 +702,7 @@ fn node_cmp_desc(key: &[u8], recno: u64, n: &BtNode) -> std::cmp::Ordering {
             return x.cmp(&y);
         }
     }
-    recno.cmp(&n.recno)
+    std::cmp::Ordering::Equal
 }
 
 /// Insert one (key, recno) into index `index_id` of `rel` -

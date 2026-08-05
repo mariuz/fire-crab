@@ -345,6 +345,7 @@ pub fn lookup_key(
     relation: u16,
     index_id: u8,
     key: &[u8],
+    descending: bool,
 ) -> Option<Vec<(Vec<u8>, u64)>> {
     lookup_range(
         file,
@@ -353,6 +354,7 @@ pub fn lookup_key(
         index_id,
         Some((key, true)),
         Some((key, true)),
+        descending,
     )
 }
 
@@ -396,7 +398,28 @@ pub fn lookup_range(
     index_id: u8,
     lo: Option<(&[u8], bool)>,
     hi: Option<(&[u8], bool)>,
+    descending: bool,
 ) -> Option<Vec<(Vec<u8>, u64)>> {
+    // A DESCENDING index stores its keys COMPLEMENTED, so they are laid
+    // out in descending VALUE order and plain `memcmp` almost reads
+    // them - except where one key is a byte PREFIX of another, which
+    // ordinary comparison pads with 0x00 and the engine pads with 0xFF.
+    // That is not a text-only corner: an INTEGER key is zero-chopped, so
+    // 2's key `c0` IS a prefix of 3's `c008`, and complemented `3f` is a
+    // prefix of `3ff7`. Both recorded misses - an equality on a
+    // descending text index finding NOTHING, and one on a descending
+    // integer index missing rows - are this one comparison.
+    //
+    // The rule is `btw::key_cmp_desc`, which is the rule the WRITE side
+    // orders nodes by; asking for it here rather than restating it is
+    // what keeps the two halves from drifting apart.
+    let kcmp = |a: &[u8], b: &[u8]| -> std::cmp::Ordering {
+        if descending {
+            crate::btw::key_cmp_desc(a, b)
+        } else {
+            a.cmp(b)
+        }
+    };
     let root_no = find_index_root(file, page_size, relation)?
         .entry(index_id)?
         .root_page;
@@ -438,7 +461,9 @@ pub fn lookup_range(
                 // can contain the FIRST occurrence is the last one whose
                 // key is strictly less than the target (or the leftmost,
                 // when even that is not less).
-                if chosen.is_some() && node_key.as_slice() >= lo_key {
+                if chosen.is_some()
+                    && kcmp(node_key.as_slice(), lo_key) != std::cmp::Ordering::Less
+                {
                     break;
                 }
             } else if chosen.is_some() {
@@ -475,7 +500,7 @@ pub fn lookup_range(
             leaf_key.truncate(node.prefix as usize);
             leaf_key.extend_from_slice(&bytes[node.data_at..node.data_at + node.length as usize]);
             if let Some((hi_key, incl)) = hi {
-                let past = match leaf_key.as_slice().cmp(hi_key) {
+                let past = match kcmp(leaf_key.as_slice(), hi_key) {
                     std::cmp::Ordering::Greater => true,
                     std::cmp::Ordering::Equal => !incl,
                     std::cmp::Ordering::Less => false,
@@ -486,7 +511,7 @@ pub fn lookup_range(
             }
             let admitted = match lo {
                 None => true,
-                Some((lo_key, incl)) => match leaf_key.as_slice().cmp(lo_key) {
+                Some((lo_key, incl)) => match kcmp(leaf_key.as_slice(), lo_key) {
                     std::cmp::Ordering::Less => false,
                     std::cmp::Ordering::Equal => incl,
                     std::cmp::Ordering::Greater => true,
@@ -546,17 +571,17 @@ mod tests {
         }
 
         // a key with one entry
-        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(5))), vec![50]);
+        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(5), false)), vec![50]);
         // the first and the last, which are where a descent goes wrong
-        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(1))), vec![10]);
-        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(7))), vec![70]);
+        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(1), false)), vec![10]);
+        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(7), false)), vec![70]);
         // DUPLICATES come back together, in record-number order
-        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(3))), vec![30, 31]);
+        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(3), false)), vec![30, 31]);
         // a key that is not there is an EMPTY answer, not a nearby one -
         // returning the neighbour is how an index lookup invents rows
-        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(4))), Vec::<u64>::new());
-        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(0))), Vec::<u64>::new());
-        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(9))), Vec::<u64>::new());
+        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(4), false)), Vec::<u64>::new());
+        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(0), false)), Vec::<u64>::new());
+        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(9), false)), Vec::<u64>::new());
         // and the whole level still walks, so the two agree
         let all = walk_index_leaves(&file, page_size, rel, 0).unwrap();
         assert_eq!(all.len(), 5);
@@ -596,6 +621,7 @@ mod tests {
                 0,
                 lk.as_ref().map(|(k, i)| (k.as_slice(), *i)),
                 hk.as_ref().map(|(k, i)| (k.as_slice(), *i)),
+                false,
             )
             .unwrap()
             .into_iter()
@@ -621,7 +647,7 @@ mod tests {
         // and an equality is the degenerate range, which is what
         // `lookup_key` asks for
         assert_eq!(range(Some((5, true)), Some((5, true))), vec![50]);
-        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(5))), vec![50]);
+        assert_eq!(recnos_of(lookup_key(&file, page_size, rel, 0, &key(5), false)), vec![50]);
     }
 
     // A DUPLICATE RUN THAT SPANS LEAF PAGES - the descent's page

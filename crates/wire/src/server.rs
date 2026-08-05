@@ -4717,7 +4717,9 @@ fn fk_partner_lookup(db: &Database, fk: &FkPartner, key: &[&Value]) -> Option<Ve
     if all_null {
         return None;
     }
-    fire_crab_ods::btr::lookup_key(&db.bytes, db.page_size, fk.other_rel, op.id, &ikey)
+    fire_crab_ods::btr::lookup_key(
+        &db.bytes, db.page_size, fk.other_rel, op.id, &ikey, op.descending,
+    )
 }
 
 /// Child-side partner check at store time: every FK on the row's table
@@ -13755,6 +13757,7 @@ impl IndexPick {
             self.op.id,
             self.lo.as_ref().map(|(k, i)| (k.as_slice(), *i)),
             self.hi.as_ref().map(|(k, i)| (k.as_slice(), *i)),
+            self.op.descending,
         )
         .unwrap_or_default()
     }
@@ -13926,16 +13929,32 @@ fn pick_for_terms(
         // second, so an equality on the first names a CONTIGUOUS BAND.
         let Some((seg_fid, itype, _)) = op.segs.first() else { continue };
         let compound = op.segs.len() > 1;
-        // A DESCENDING index is not keyed AT ALL, and this is measured
-        // rather than cautious. Its keys are complemented, which
-        // reverses byte order - so bounds must swap - but the
-        // complement also destroys the PREFIX relationship that
-        // variable-length keys rely on: with 'ab' and 'abc' in the same
-        // descending text index, an equality on 'ab' found NOTHING.
-        // Equality on a descending INTEGER index missed rows too. Two
-        // measured misses in one arithmetic is enough: it scans until
-        // the key layout has been read back off the engine's own index.
-        if op.descending {
+        // A DESCENDING index IS keyed now, and the arithmetic was read
+        // back off the engine's own index rather than derived. Dumping
+        // an ascending and a descending index over the same values:
+        //
+        //     value 1  ASC bff0              DESC 400f
+        //     value 2  ASC c0                DESC 3f
+        //     'ab'     ASC 6162              DESC 9e9d
+        //     'abc'    ASC 616263            DESC 9e9d9c
+        //
+        // THE DESCENDING KEY IS THE BITWISE COMPLEMENT OF THE ASCENDING
+        // ONE, complemented AFTER the ascending zero-chop and not
+        // re-chopped - which is exactly what `build_index_key` already
+        // wrote, so `key_of` produces the right bytes with no change.
+        //
+        // Two things had to follow it. The COMPARISON is not `memcmp`:
+        // a shorter key pads with 0xFF, so a key that is a byte prefix
+        // of another sorts AFTER it (`btw::key_cmp_desc`, the rule the
+        // write side already ordered nodes by, now asked for by
+        // `lookup_range` too). And the BOUNDS SWAP: complementing
+        // reverses the order, so a larger VALUE is a smaller KEY and
+        // `A > v` bounds the walk from ABOVE.
+        //
+        // COMPOUND descending indexes still scan: the prefix band's
+        // successor arithmetic is computed in ascending key space, and
+        // one rule for two directions is how a missed row ships.
+        if op.descending && compound {
             continue;
         }
         let text = matches!(*itype, btw::IDX_STRING | btw::IDX_METADATA);
@@ -14027,13 +14046,25 @@ fn pick_for_terms(
             }
             let Some(key) = key_of(&v) else { continue };
             // tighter wins: a conjunction can only narrow
-            let tighten = |slot: &mut Option<(Vec<u8>, bool)>,
+            // "tighter" is decided in KEY order, so it takes the same
+            // descending rule the walk does - a prefix sorts AFTER the
+            // key it prefixes, and plain `cmp` would pick the wrong
+            // bound of two where one prefixes the other.
+            let desc = op.descending;
+            let tighten = move |slot: &mut Option<(Vec<u8>, bool)>,
                            k: Vec<u8>,
                            incl: bool,
                            upper: bool| {
+                let kcmp = |a: &[u8], b: &[u8]| {
+                    if desc {
+                        fire_crab_ods::btw::key_cmp_desc(a, b)
+                    } else {
+                        a.cmp(b)
+                    }
+                };
                 let better = match slot.as_ref() {
                     None => true,
-                    Some((cur, cur_incl)) => match k.cmp(cur) {
+                    Some((cur, cur_incl)) => match kcmp(&k, cur) {
                         std::cmp::Ordering::Equal => *cur_incl && !incl,
                         std::cmp::Ordering::Less => upper,
                         std::cmp::Ordering::Greater => !upper,
@@ -14042,6 +14073,20 @@ fn pick_for_terms(
                 if better {
                     *slot = Some((k, incl));
                 }
+            };
+            // ON A DESCENDING INDEX A LARGER VALUE IS A SMALLER KEY, so
+            // the operator that bounds from below in VALUE order bounds
+            // from above in KEY order. Equality is unaffected.
+            let cmp = if op.descending {
+                match cmp {
+                    Cmp::Gt => Cmp::Lt,
+                    Cmp::Ge => Cmp::Le,
+                    Cmp::Lt => Cmp::Gt,
+                    Cmp::Le => Cmp::Ge,
+                    other => other,
+                }
+            } else {
+                cmp
             };
             match cmp {
                 // On a COMPOUND index an equality is a BAND, not a
@@ -14378,7 +14423,7 @@ fn unique_conflict(
     recno: u64,
 ) -> bool {
     let Some(candidates) =
-        fire_crab_ods::btr::lookup_key(work, page_size, rel, op.id, key)
+        fire_crab_ods::btr::lookup_key(work, page_size, rel, op.id, key, op.descending)
     else {
         // the index cannot be read: fall back to the entry-level check
         // inside `insert_index_entry` rather than allowing a duplicate

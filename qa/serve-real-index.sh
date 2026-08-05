@@ -533,24 +533,35 @@ indexed "a range on a NON-UNIQUE index, with duplicates inside it" \
 # predicate above throws them out - a wasted fetch, never a wrong row
 indexed "an upper-bounded range over a column that has NULLs" \
         "SELECT ID FROM EMP WHERE DEPT_ID < 3 ORDER BY ID"
-# a DESCENDING index complements its keys, so the tree's byte order is
-# the reverse of the value order and the bounds swap
-# A DESCENDING index is not keyed at all, and that is MEASURED rather
-# than cautious. Its keys are complemented, which reverses byte order -
-# so bounds must swap - but the complement also destroys the PREFIX
-# relationship variable-length keys rely on: with 'ab' and 'abc' in one
-# descending text index, an equality on 'ab' found NOTHING, and equality
-# on a descending INTEGER index missed rows too. Two measured misses in
-# one piece of arithmetic is enough.
+# A DESCENDING INDEX IS KEYED NOW, and the arithmetic was READ OFF the
+# engine's own index rather than derived. The same values in an ascending
+# and a descending index over one table:
+#
+#     value 1  ASC bff0     DESC 400f       'ab'  ASC 6162    DESC 9e9d
+#     value 2  ASC c0       DESC 3f         'abc' ASC 616263  DESC 9e9d9c
+#
+# The descending key is the BITWISE COMPLEMENT of the ascending one,
+# taken AFTER the ascending zero-chop and not re-chopped - which is
+# exactly what the write side already produced. Two things follow it:
+# the BOUNDS SWAP (a larger value is a smaller key), and the COMPARISON
+# is not memcmp - a shorter key pads with 0xFF, so a key that is a byte
+# PREFIX of another sorts AFTER it. That second rule is both recorded
+# misses: 'ab' against 'abc' is the obvious one, and the integer case is
+# the same shape, because a zero-chopped key like 2's `c0` IS a prefix
+# of 3's `c008`.
+#
 # DS carries ONLY a descending index, so nothing else can serve these -
 # on S, which has an ascending twin, the ascending one is used and the
 # assertion would be about the wrong index.
-natural "a range where only a DESCENDING index exists" \
+indexed "a range where only a DESCENDING index exists" \
         "SELECT T FROM WIDE WHERE DS > 2 ORDER BY T"
-natural "... and the other way" "SELECT T FROM WIDE WHERE DS < 5 ORDER BY T"
-natural "... and between" "SELECT T FROM WIDE WHERE DS BETWEEN 2 AND 5 ORDER BY T"
-natural "EQUALITY on a descending integer index, which missed rows" \
+indexed "... and the other way" "SELECT T FROM WIDE WHERE DS < 5 ORDER BY T"
+indexed "... and between" "SELECT T FROM WIDE WHERE DS BETWEEN 2 AND 5 ORDER BY T"
+indexed "EQUALITY on a descending integer index, which used to miss rows" \
         "SELECT T FROM WIDE WHERE DS = 4"
+indexed "... the lowest descending key" "SELECT T FROM WIDE WHERE DS = 1"
+indexed "... and the highest" "SELECT T FROM WIDE WHERE DS = 6"
+indexed "... one that is not there" "SELECT T FROM WIDE WHERE DS = 99"
 # on a column that ALSO has an ascending index, the ascending one serves
 both "the ascending twin of a descending index still answers" \
      "SELECT T FROM WIDE WHERE S = 7 ORDER BY T"
@@ -684,12 +695,16 @@ natural "a NON-ASCII literal, which must not be keyed" \
         "SELECT C FROM CP WHERE S = 'ää'"
 natural "IS NULL on a text column" "SELECT C FROM CP WHERE S IS NULL ORDER BY C"
 natural "a text RANGE" "SELECT C FROM CP WHERE S > 'a' ORDER BY C"
-# (iii) a DESCENDING text index holding a value that EXTENDS another:
-# complementing the bytes destroys the prefix relationship, and the
-# equality found nothing
-natural "equality on a descending TEXT index, where one value extends another" \
+# (iii) a DESCENDING text index holding a value that EXTENDS another -
+# the case the prefix rule exists for. Complemented, 'ab' is `9e9d` and
+# 'abc' is `9e9d9c`, so one key is a byte PREFIX of the other; padding
+# the shorter with 0x00 (plain memcmp) puts it on the wrong side of the
+# band and the equality found NOTHING. Padding with 0xFF, which is what
+# the engine does and what the write side already ordered by, puts it
+# where the walk can reach it.
+indexed "equality on a descending TEXT index, where one value extends another" \
         "SELECT ID FROM TD WHERE C = 'ab'"
-natural "... and the longer one" "SELECT ID FROM TD WHERE C = 'abc'"
+indexed "... and the longer one" "SELECT ID FROM TD WHERE C = 'abc'"
 
 
 # --- 3f. A DUPLICATE RUN THAT SPANS LEAF PAGES ------------------------

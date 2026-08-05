@@ -313,8 +313,10 @@ join_indexed "... and its rows, ordered" \
 # work, never a row.
 join_natural "no index on the inner column" \
     "SELECT CHI.ID, NOIX.N FROM CHI LEFT JOIN NOIX ON NOIX.K = CHI.K ORDER BY CHI.ID"
-join_natural "a DESCENDING-only inner index (its keys are complemented)" \
-    "SELECT CHI.ID, DESCT.N FROM CHI LEFT JOIN DESCT ON DESCT.K = CHI.K ORDER BY CHI.ID"
+# ...nor this one. A DESCENDING inner index was the first of the seven;
+# its keys are complemented, which the band arithmetic now follows.
+join_indexed "a DESCENDING-only inner index" \
+    "SELECT CHI.ID, DESCT.N FROM CHI LEFT JOIN DESCT ON DESCT.K = CHI.K ORDER BY CHI.ID" 1
 # ...and this one is no longer among them. A scaled NUMERIC inner index
 # was one of the SEVEN shapes the refute pass measured as "the engine
 # indexes it and this probe declines"; the literal now reaches the

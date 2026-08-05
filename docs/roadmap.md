@@ -1860,15 +1860,28 @@ plus *the subsystem is now on the path*.
   (`btr::lookup_key`, new) instead of scanning. The predicate above the
   leaf is unchanged, so an index narrows what is READ and never what is
   ANSWERED.
-  - Scope so far: a single-segment integer index at scale 0, on the
-    projection's retrieval — equality and RANGES (`>`, `>=`, `<`, `<=`,
-    `BETWEEN`), including descending indexes (their keys are
-    complemented, so the bounds swap) and multiple bounds on one column
-    (a conjunction narrows), and DESCENDING indexes are NOT keyed - two
-    measured misses (equality on a descending integer index, and
-    equality on a descending text index holding a value that extends
-    the searched one) say the complement's arithmetic has not been
-    established. Both the PROJECTION's retrieval and the
+  - Scope so far: a single-segment index on the projection's retrieval —
+    equality and RANGES (`>`, `>=`, `<`, `<=`, `BETWEEN`), multiple
+    bounds on one column (a conjunction narrows), any exact-numeric
+    SCALE, and **DESCENDING indexes, whose arithmetic is established
+    now**. It was read off the engine's own index rather than derived:
+    dumping an ascending and a descending index over the same values
+    gives `1 → bff0 / 400f`, `2 → c0 / 3f`, `'ab' → 6162 / 9e9d`,
+    `'abc' → 616263 / 9e9d9c`, so **the descending key is the bitwise
+    COMPLEMENT of the ascending one**, taken after the ascending
+    zero-chop and not re-chopped — which is what `build_index_key`
+    already wrote. Two things follow it: the BOUNDS SWAP (a larger value
+    is a smaller key), and the COMPARISON is not `memcmp` — a shorter
+    key pads with **0xFF**, so a key that is a byte PREFIX of another
+    sorts AFTER it. That second rule is BOTH recorded misses, and the
+    integer one is the same shape as the text one for a reason that was
+    not obvious: a zero-chopped key like 2's `c0` IS a prefix of 3's
+    `c008`. The rule itself is `btw::key_cmp_desc` — the write side had
+    it already, and `lookup_range` asks for it rather than restating it.
+    Compound descending indexes still scan (the prefix band's successor
+    arithmetic is computed in ascending key space, and one rule for two
+    directions is how a missed row ships). Both the PROJECTION's
+    retrieval and the
     FOLD's - a grouped query and the prepare-time aggregate fast path
     read their candidates through the same leaf. A key this cannot
     build byte-exactly would be a MISSED ROW rather than a refusal,
@@ -1992,12 +2005,13 @@ plus *the subsystem is now on the path*.
       equivalence oracle only for non-raising ONs from here on.
 
       *And it measured the gap, which is the shape of Slice B*: SEVEN
-      inner sides the engine INDEXES and this probe declines — **six
-      now**, since the scaled-NUMERIC keys above closed `NUMERIC(9,2)`,
-      and closed it OUTSIDE the join: `pick_for_terms` refused every
-      column with a non-zero scale, so a plain `WHERE N92 = 1.50`
-      scanned too. The rest: a
-      DESCENDING index, `NUMERIC(38,0)`, a VIEW inner
+      inner sides the engine INDEXES and this probe declines — **five
+      now**: the scaled-NUMERIC keys closed `NUMERIC(9,2)` and the
+      descending arithmetic closed the DESCENDING index, both of them
+      OUTSIDE the join, because neither refusal was ever about the join
+      (`pick_for_terms` declined every scaled column and every
+      descending one, so plain `WHERE` retrievals scanned too). The
+      rest: `NUMERIC(38,0)`, a VIEW inner
       (the engine flattens it), a DERIVED inner, an expression in the
       ON (`RZ.K = O.K + 0`), an OR in the ON, and the engine's bitmap
       AND of two indexes. Their rows agree today; with a raising ON
