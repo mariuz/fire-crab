@@ -480,6 +480,23 @@ fn build_describe(cols: &[ProjCol], params: &[Descriptor], att: AttCs) -> Vec<u8
 /// resolve from the database (or no database is loaded).
 const FIXED_ANSWER: i64 = 4242;
 
+/// WHERE THE TIME GOES, when `FC_SRV_TIME` is set: one line per phase
+/// of a statement, in microseconds.
+///
+/// It exists because the answer was not what the shapes suggested. The
+/// careful flush, the obvious suspect, turned out to be the FAST path
+/// (5 pages against a whole-file write); what a statement actually
+/// spends is measured here rather than guessed.
+fn timed<T>(label: &str, f: impl FnOnce() -> T) -> T {
+    if std::env::var("FC_SRV_TIME").is_err() {
+        return f();
+    }
+    let t0 = std::time::Instant::now();
+    let out = f();
+    eprintln!("[time] {:<18} {:>8} us", label, t0.elapsed().as_micros());
+    out
+}
+
 /// A monotonic attachment id, one per op_attach, so `con.info.id`
 /// (isc_info_attachment_id) is distinct per connection - the
 /// firebird-qa bootstrap opens two employee connections and names both
@@ -531,6 +548,9 @@ struct Database {
     /// there is anything to undo, and the generator windows ask it to
     /// know whether to write their compensations forward.
     touched: bool,
+    /// this database's metadata cache - what the catalog says about a
+    /// relation, held until DDL changes it (see [crate::mdc])
+    meta: std::sync::Arc<crate::mdc::DbMetadata>,
     /// this database's lock table, and this attachment's identity in
     /// it: a transaction holds a lock on its own id while it lives, and
     /// a writer that meets one of its versions waits on that - see
@@ -571,6 +591,46 @@ fn write_wait() -> std::time::Duration {
 }
 
 impl Database {
+    /// What the catalog says about a relation - from the metadata
+    /// cache, or read off the pages once and held there until DDL.
+    ///
+    /// This is the seam the plan builders go through. Reading it per
+    /// statement is what made planning an INSERT cost 5.6ms of its
+    /// 8.2ms: `RDB$RELATIONS` for the id, `RDB$RELATION_FIELDS` +
+    /// `RDB$FIELDS` for the columns, `RDB$FORMATS` for the descriptors,
+    /// every one of them a walk of a system relation's pages, for an
+    /// answer that only DDL can change.
+    fn relation_meta(&self, table: &str) -> Option<std::sync::Arc<crate::mdc::Relation>> {
+        let image = self.bytes();
+        let ps = self.page_size;
+        self.meta.relation(table, || {
+            let id = fire_crab_ods::resolve_relation(&image, ps, table)?;
+            Some(crate::mdc::Relation {
+                id,
+                columns: std::sync::Arc::new(relation_columns(&image, ps, table)),
+                formats: std::sync::Arc::new(relation_formats(&image, ps, id)),
+            })
+        })
+    }
+
+    /// The schema may have changed: everything the metadata cache holds
+    /// was about the old one.
+    fn invalidate_meta(&self) {
+        self.meta.invalidate();
+    }
+
+    /// One more catalog-derived answer, held until DDL - the index
+    /// operations of a relation, its NOT NULL fields, its identity
+    /// column, its qualified name. Each of those is a walk of a system
+    /// relation, and each is asked once per statement.
+    fn meta_memo<T, F>(&self, kind: &'static str, about: &str, read: F) -> std::sync::Arc<T>
+    where
+        T: Send + Sync + 'static,
+        F: FnOnce() -> T,
+    {
+        self.meta.memo(kind, about, read)
+    }
+
     /// The pages as they stand. Reference counted: the caller reads
     /// without holding a lock, and a writer installing a new image
     /// never changes one out from under a read in progress.
@@ -588,7 +648,8 @@ impl Database {
         // every write in this server starts here, so this is where the
         // transaction stops being a reader
         self.touched = true;
-        Ok(self.bytes().as_ref().clone())
+        let image = self.bytes();
+        Ok(timed("work-copy", || image.as_ref().clone()))
     }
 
     /// Take the database's write side if this transaction has not
@@ -683,7 +744,8 @@ impl Database {
     /// own reservation, for one - left its pages dirty, and diffing
     /// against the current image would drop them silently.
     fn flush_and_install(&mut self, work: Vec<u8>) -> Result<(), String> {
-        flush_careful(&self.path, &self.shared.flushed(), &work, self.page_size)?;
+        let flushed = self.shared.flushed();
+        timed("flush", || flush_careful(&self.path, &flushed, &work, self.page_size))?;
         self.install_flushed(work);
         Ok(())
     }
@@ -998,11 +1060,17 @@ fn load_database(path: &str) -> Option<Database> {
     }
     let locks = crate::dblocks::for_path(p);
     let lock_owner = locks.owner();
+    let meta = crate::mdc::for_path(p);
+    // the pool may have just RE-READ this file (a gate deleting and
+    // re-creating its scratch database, the engine writing it): what
+    // the cache holds was about the file that is gone
+    meta.sync_epoch(shared.epoch());
     Some(Database {
         shared,
         write: None,
         tx: None,
         touched: false,
+        meta,
         locks,
         lock_owner,
         image_undo: false,
@@ -4320,7 +4388,15 @@ fn wire_for(d: &Descriptor) -> (Wire, i32, i32, i32, i32) {
 /// format - what the engine's validation (the RSR_field_not_null
 /// runtime segment) enforces; the server checks the same at DML
 /// execute.
+/// [not_null_fids_uncached], held in the metadata cache: which fields
+/// a table refuses NULL in cannot change without DDL.
 fn not_null_fids(db: &Database, table: &str) -> Vec<usize> {
+    db.meta_memo("not-null", table, || not_null_fids_uncached(db, table))
+        .as_ref()
+        .clone()
+}
+
+fn not_null_fids_uncached(db: &Database, table: &str) -> Vec<usize> {
     use fire_crab_ods::format::Value;
     let Some(formats) =
         fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, "RDB$RELATION_FIELDS")
@@ -4367,7 +4443,14 @@ fn not_null_fids(db: &Database, table: &str) -> Vec<usize> {
 /// from: an identity column omitted from the column list takes
 /// `GEN_ID(RDB$n, increment)`, an explicit value into an ALWAYS column
 /// without OVERRIDING refuses at prepare (probed).
+/// [identity_columns_uncached], held in the metadata cache.
 fn identity_columns(db: &Database, table: &str) -> Vec<(usize, String, i64)> {
+    db.meta_memo("identity", table, || identity_columns_uncached(db, table))
+        .as_ref()
+        .clone()
+}
+
+fn identity_columns_uncached(db: &Database, table: &str) -> Vec<(usize, String, i64)> {
     use fire_crab_ods::format::Value;
     let Some(formats) =
         fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, "RDB$RELATION_FIELDS")
@@ -7598,8 +7681,9 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     // may ASSIGN to NEW (the engine's rules)
     let db = db.as_ref()?;
     let columns = relation_columns(&db.bytes(), db.page_size, table);
-    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, table)?;
-    let formats = relation_formats(&db.bytes(), db.page_size, rel);
+    let meta = db.relation_meta(table)?; // see [crate::mdc]
+    let rel = meta.id;
+    let formats = meta.formats.as_ref().clone();
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
     let col_ok = |n: &str| {
         let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(n))?;
@@ -9659,8 +9743,9 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
     if let Some((cname, source)) = parse_check_clause(tail) {
         let db = db.as_ref()?;
         let columns = relation_columns(&db.bytes(), db.page_size, table);
-        let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, table)?;
-        let formats = relation_formats(&db.bytes(), db.page_size, rel);
+        let meta = db.relation_meta(table)?; // see [crate::mdc]
+        let rel = meta.id;
+        let formats = meta.formats.as_ref().clone();
         let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
         let cond = parse_cond(&source["CHECK".len()..])?;
         let field_rank = |name: &str| {
@@ -9703,8 +9788,9 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
     if let Some((cname, src)) = parse_computed_item(tail) {
         let db = db.as_ref()?;
         let columns = relation_columns(&db.bytes(), db.page_size, table);
-        let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, table)?;
-        let formats = relation_formats(&db.bytes(), db.page_size, rel);
+        let meta = db.relation_meta(table)?; // see [crate::mdc]
+        let rel = meta.id;
+        let formats = meta.formats.as_ref().clone();
         let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
         let expr = parse_expr(&src)?;
         // a reference types as a plain stored exact-integer column: not
@@ -10559,7 +10645,16 @@ fn unqualify_dml(sql: &str, db: &Option<Database>) -> Option<String> {
 /// the relation NAME with no `RDB$SCHEMA_NAME` filter, so a same-named
 /// table in a second schema still misfires - the qualifier is right now,
 /// the columns it is built from are still schema-blind.
+/// [qualified_relation_name_uncached], held in the metadata cache.
 fn qualified_relation_name(db: &Database, rel: u16) -> Option<String> {
+    db.meta_memo("qual-name", &rel.to_string(), || {
+        qualified_relation_name_uncached(db, rel)
+    })
+    .as_ref()
+    .clone()
+}
+
+fn qualified_relation_name_uncached(db: &Database, rel: u16) -> Option<String> {
     let canon = fire_crab_ods::list_relations(&db.bytes(), db.page_size)
         .into_iter()
         .find(|(id, _)| *id == rel)
@@ -10741,9 +10836,14 @@ fn plan_insert_select(
     // to defer the whole resolution to execute. Recorded boundary: the
     // TIMING now matches, the `-204 Table unknown` VECTOR does not -
     // fire-crab answers the generic Dynamic SQL Error.
-    let rel = fire_crab_ods::resolve_relation(&dbr.bytes(), dbr.page_size, table)?;
-    let columns = relation_columns(&dbr.bytes(), dbr.page_size, table);
-    let formats = relation_formats(&dbr.bytes(), dbr.page_size, rel);
+    // THROUGH THE METADATA CACHE - the id, the columns and the
+    // formats are what the catalog says about this table, and
+    // only DDL changes that (see [crate::mdc]). Reading them
+    // off the pages per statement was 5.6ms of an 8.2ms INSERT.
+    let meta = dbr.relation_meta(table)?;
+    let rel = meta.id;
+    let columns = meta.columns.as_ref().clone();
+    let formats = meta.formats.as_ref().clone();
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
     // The target list, resolved ONCE - execute never recomputes it. The
     // implicit list is `relation_columns` order, which is
@@ -10938,9 +11038,14 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     if !relation_qualifier_ok(db, schema, table) {
         return None;
     }
-    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, table)?;
-    let columns = relation_columns(&db.bytes(), db.page_size, table);
-    let formats = relation_formats(&db.bytes(), db.page_size, rel);
+    // THROUGH THE METADATA CACHE - the id, the columns and the
+    // formats are what the catalog says about this table, and
+    // only DDL changes that (see [crate::mdc]). Reading them
+    // off the pages per statement was 5.6ms of an 8.2ms INSERT.
+    let meta = db.relation_meta(table)?;
+    let rel = meta.id;
+    let columns = meta.columns.as_ref().clone();
+    let formats = meta.formats.as_ref().clone();
     let (format_no, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
     // every index on the relation must be maintainable (single-segment
     // ascending on a supported type) or the statement is refused - a
@@ -12036,9 +12141,14 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
     if !relation_qualifier_ok(db, schema, table) {
         return None;
     }
-    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, table)?;
-    let columns = relation_columns(&db.bytes(), db.page_size, table);
-    let formats = relation_formats(&db.bytes(), db.page_size, rel);
+    // THROUGH THE METADATA CACHE - the id, the columns and the
+    // formats are what the catalog says about this table, and
+    // only DDL changes that (see [crate::mdc]). Reading them
+    // off the pages per statement was 5.6ms of an 8.2ms INSERT.
+    let meta = db.relation_meta(table)?;
+    let rel = meta.id;
+    let columns = meta.columns.as_ref().clone();
+    let formats = meta.formats.as_ref().clone();
     let (format_no, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
     let index_ops = resolve_index_ops(db, rel, descs)?;
 
@@ -13044,6 +13154,12 @@ fn execute_dml_collecting_inner(
         Plan::SetGenerator { .. } => (db.work_copy()?, None),
         _ => {
             db.image_undo = true;
+            // ...AND EVERY ANSWER THE METADATA CACHE HOLDS WAS ABOUT
+            // THE OLD SCHEMA. Invalidated before the statement runs,
+            // not after: the DDL itself reads the catalog as it works,
+            // and a plan built from a cached answer mid-change would be
+            // built from the schema this statement is replacing.
+            db.invalidate_meta();
             (db.work_copy()?, None)
         }
     };
@@ -13843,6 +13959,10 @@ fn execute_dml_collecting_inner(
     // never got here, which is exactly the point
     if let Some(tx) = stmt_tx {
         db.adopt_tx(tx);
+    } else {
+        // a DDL statement that LANDED: invalidate again, because what
+        // is cacheable now is what it wrote
+        db.invalidate_meta();
     }
     Ok(counts)
 }
@@ -14610,7 +14730,19 @@ fn pick_for_terms(
     None
 }
 
+/// [resolve_index_ops_uncached], held in the metadata cache: which
+/// indexes a relation has, and how each one builds its key, is catalog
+/// - the descriptors it is resolved against come from the same cached
+/// formats, so one answer per relation per schema is the whole story.
 fn resolve_index_ops(db: &Database, rel: u16, descs: &[Descriptor]) -> Option<Vec<IndexOp>> {
+    db.meta_memo("index-ops", &rel.to_string(), || {
+        resolve_index_ops_uncached(db, rel, descs)
+    })
+    .as_ref()
+    .clone()
+}
+
+fn resolve_index_ops_uncached(db: &Database, rel: u16, descs: &[Descriptor]) -> Option<Vec<IndexOp>> {
     use fire_crab_ods::btw;
     let db_image = db.bytes();
     let Some(irt) = fire_crab_ods::btr::find_index_root(&db_image, db.page_size, rel) else {
@@ -35517,6 +35649,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
         // ...and the lock table's, for the same reason: a lock manager
         // that never arbitrates anything passes every behaviour gate
         eprintln!("[srv] locks: {}", crate::dblocks::stats_line());
+        eprintln!("[srv] mdc: {}", crate::mdc::stats_line());
     }
     let attach_id = ATTACH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     respond(&mut s, &mut enc, 1)?; // attachment handle 1
@@ -35954,12 +36087,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     let stmt_sql =
                         unqualify_dml(&stmt_sql, &database).unwrap_or_else(|| stmt_sql.clone());
                     let (dml_sql, returning) = split_returning(&stmt_sql);
-                    let planned = match kw {
+                    let planned = timed("plan(dml)", || match kw {
                         "INSERT" => plan_insert(&dml_sql, &database),
                         "UPDATE" => plan_upsert(&dml_sql, &database)
                             .or_else(|| plan_update(&dml_sql, &database)),
                         _ => plan_delete(&dml_sql, &database),
-                    };
+                    });
                     let planned = match (planned, &returning) {
                         // VECTOR-AT-PREPARE: wrap_returning over a
                         // refused plan would produce Returning{inner:
@@ -36294,7 +36427,9 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             }
                         }
                     } else {
-                    match execute_dml(&plan, &mut database, &bound_args, &SessionCtx { user, attach_id }) {
+                    match timed("execute", || {
+                        execute_dml(&plan, &mut database, &bound_args, &SessionCtx { user, attach_id })
+                    }) {
                         Ok(counts) => {
                             last_dml = counts;
                             if std::env::var("FC_SRV_TRACE").is_ok() {
@@ -37194,8 +37329,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     }
                     let ctx = SessionCtx { user, attach_id };
                     let mut affected = Affected::default();
-                    match with_conflict_wait(&mut database, |db| {
-                        execute_dml_collecting(&inner, db, &exec2_args, &ctx, Some(&mut affected))
+                    match timed("execute(returning)", || {
+                        with_conflict_wait(&mut database, |db| {
+                            execute_dml_collecting(&inner, db, &exec2_args, &ctx, Some(&mut affected))
+                        })
                     }) {
                         Ok(counts) => {
                             // the driver's next op_info_sql asks
@@ -37321,6 +37458,15 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // the pages and count for nobody, which is what a rollback means
     // here, and the engine's own sweep collects them later. Left
     // ACTIVE, they would be a transaction that never ends.
+    // THE COUNTERS ARE WORTH READING AT THE END, not at the start: the
+    // attach trace prints them before the connection has done
+    // anything, so a gate that greps the last line off a one-connection
+    // run reads zeros. Here they say what the connection actually did.
+    if std::env::var("FC_SRV_TRACE").is_ok() {
+        eprintln!("[srv] pool: {}", fire_crab_cch::pool::stats_line());
+        eprintln!("[srv] locks: {}", crate::dblocks::stats_line());
+        eprintln!("[srv] mdc: {}", crate::mdc::stats_line());
+    }
     if let Some(db) = database.as_mut() {
         if db.tx.is_some() {
             if std::env::var("FC_SRV_TRACE").is_ok() {
@@ -38469,6 +38615,7 @@ mod tests {
             write: None,
             tx: None,
             touched: false,
+            meta: crate::mdc::for_path("/nonexistent/fc-rowsource-test"),
             locks: crate::dblocks::for_path("/nonexistent/fc-rowsource-test"),
             lock_owner: 0,
             image_undo: false,
@@ -41275,6 +41422,7 @@ mod tests {
             write: None,
             tx: None,
             touched: false,
+            meta: crate::mdc::for_path("/nonexistent/fc-rowsource-test"),
             locks: crate::dblocks::for_path("/nonexistent/fc-rowsource-test"),
             lock_owner: 0,
             image_undo: false,

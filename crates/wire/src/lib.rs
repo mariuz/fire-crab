@@ -22,6 +22,7 @@
 //! unconverted (ChaCha wire crypt, the services surface).
 
 pub mod dblocks;
+pub mod mdc;
 pub mod gdscodes;
 pub mod server;
 

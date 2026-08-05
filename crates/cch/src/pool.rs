@@ -120,6 +120,11 @@ struct WriteState {
 /// The pages of one database file, shared by every attachment to it.
 pub struct SharedImage {
     path: String,
+    /// bumped whenever the pool RE-READS this file - the image is of a
+    /// different file than the one it held, so anything derived from
+    /// the old one (a metadata cache, say) is about a database that is
+    /// no longer there
+    epoch: AtomicU64,
     image: Mutex<Arc<Vec<u8>>>,
     /// the image as it is ON DISK - what a careful flush must diff
     /// against, since an install that is not itself flushed leaves its
@@ -153,6 +158,13 @@ impl SharedImage {
     /// The file this image came from.
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    /// How many times the pool has re-read this file. A caller holding
+    /// anything derived from the image compares this against what it
+    /// derived from.
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
     }
 
     /// Install a new image. The caller must hold the write token: this
@@ -296,6 +308,7 @@ pub fn open(path: &str) -> Option<Arc<SharedImage>> {
         // longer matches its file is re-read, not served.
         let bytes = std::fs::read(path).ok()?;
         stats().reloads.fetch_add(1, Ordering::Relaxed);
+        sh.epoch.fetch_add(1, Ordering::Relaxed);
         let arc = Arc::new(bytes);
         *lock(&sh.image) = Arc::clone(&arc);
         *lock(&sh.flushed) = arc;
@@ -305,6 +318,7 @@ pub fn open(path: &str) -> Option<Arc<SharedImage>> {
     let bytes = Arc::new(std::fs::read(path).ok()?);
     let sh = Arc::new(SharedImage {
         path: path.to_string(),
+        epoch: AtomicU64::new(0),
         image: Mutex::new(Arc::clone(&bytes)),
         flushed: Mutex::new(bytes),
         disk: Mutex::new(fp),
@@ -323,6 +337,7 @@ pub fn detached(bytes: Vec<u8>) -> Arc<SharedImage> {
     let arc = Arc::new(bytes);
     Arc::new(SharedImage {
         path: String::new(),
+        epoch: AtomicU64::new(0),
         image: Mutex::new(Arc::clone(&arc)),
         flushed: Mutex::new(arc),
         disk: Mutex::new(None),

@@ -13,6 +13,37 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-05 — The metadata cache
+
+### Converted
+- **The catalog is read once per schema, not once per statement.**
+  Measured first, with a new `FC_SRV_TIME=1` switch that times a
+  statement's phases: an INSERT cost 8.2ms, of which **5.6ms was
+  building the plan** — the work copy 111us and the careful flush
+  957us. Planning was that expensive because every plan re-derived the
+  table from the FILE: `RDB$RELATIONS` for the id,
+  `RDB$RELATION_FIELDS` + `RDB$FIELDS` for the columns, `RDB$FORMATS`
+  for the descriptors, then `RDB$INDICES` and its segments for the
+  index operations, the NOT NULL fields, the identity column, the
+  qualified name — each a walk of a system relation, for an answer only
+  DDL can change.
+- **So `crates/wire/mdc.rs` holds them**, per database, keyed by a
+  GENERATION that only DDL advances — the engine's own metadata-cache
+  rule, since a million inserts do not change what a table's columns
+  are. It also follows the buffer pool's EPOCH: a file the pool
+  re-read is a different database, and everything derived from the old
+  one goes.
+- **Measured after: plan 4857us → 1809us, and the INSERT 7.4ms →
+  4.3ms (-41%)**, on the same two-row table.
+- **`qa/serve-real-metadata.sh`** (5 checks) runs a DDL-then-DML script
+  — add a column and write it, create an index and write through it,
+  add a foreign key and write across it — three ways: through the
+  engine, through fire-crab, and through fire-crab with `FC_NO_MDC=1`.
+  All three must agree, which is what says the cache changed no
+  answers; and the pool's counters (`mdc: hits 19 misses 27
+  invalidations 12`, read at the connection's END rather than its
+  start) say it was used and that DDL really dropped it.
+
 ## 2026-08-05 — The lock manager, participating
 
 ### Converted

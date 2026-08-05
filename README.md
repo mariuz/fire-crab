@@ -292,6 +292,9 @@ GSTAT=/opt/firebird/bin/gstat bench/compare.sh /path/to/db.fdb
   the concurrency oracle found missing, with the writers over it
   serialized per database and the on-disk image kept as the flush
   baseline.
+- `crates/wire/mdc.rs` — the metadata cache: what the catalog says
+  about a relation, held per database until DDL changes it, because
+  re-reading it was 5.6ms of an 8.2ms INSERT.
 - `crates/lck` — the lock manager's table policy (`src/lock/lock.cpp`),
   pinned against the engine's own source and the live server's
   reservations, and **wired**: fire-crab's own attachments wait on each

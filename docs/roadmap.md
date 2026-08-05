@@ -2195,6 +2195,16 @@ plus *the subsystem is now on the path*.
   rest of W2, and the seam for them is the single `SharedImage::image`
   every read now goes through. Also still: a file that GROWS is written
   whole (extending is its own careful-write question).
+
+  **MEASURED BEFORE DOING IT, and it is not where the time is.** With
+  `FC_SRV_TIME=1` on a two-row table, an INSERT cost 8.2ms: the work
+  copy 111us (1.3%), the careful flush 957us, and **building the plan
+  5.6ms**. The whole-image copy per write is real and grows with the
+  file (~0.39ms/MB, so ~40ms on a 100MB database — it will have to go),
+  but the statement in front of it was spending five times as much
+  re-reading the catalog. That is what the metadata cache below
+  answered, and per-page fetch is worth doing for the SCALING, not for
+  the fixed cost.
 - **W2 (as it stood) — the careful write order.** The server's DML
   flush writes PAGES in `cch`'s precedence order and syncs each before
   the page that references it, instead of dumping the whole file — so
@@ -2331,6 +2341,20 @@ plus *the subsystem is now on the path*.
   the engine's deadlock vector carries two more items after the code
   (`isc_update_conflict` and the concurrent transaction's number), and
   the TPB's NO WAIT / LOCK TIMEOUT are read as WAIT.
+- **W7 — the metadata cache** (`mdc`). *(done, and it was the
+  measurement that put it here)* Every plan re-derived its table from
+  the file — id, columns, descriptors, index operations, NOT NULL
+  fields, identity column, qualified name, each a walk of a system
+  relation — and `FC_SRV_TIME=1` put 5.6ms of an 8.2ms INSERT in
+  planning. `crates/wire/mdc.rs` holds those answers per database,
+  keyed by a generation only DDL advances (and the buffer pool's epoch,
+  since a re-read file is a different database). Plan 4857us → 1809us,
+  INSERT 7.4ms → 4.3ms. `qa/serve-real-metadata.sh` runs a
+  DDL-then-DML script through the engine, through fire-crab and through
+  fire-crab with `FC_NO_MDC=1`, and all three must agree.
+
+  Still to hold: the checks, foreign keys and triggers a plan gathers
+  are not in it yet, and they are most of the 1.8ms that is left.
 - **W5 — event delivery** (`evt`): the shared-memory arena, the watcher,
   and the wire path.
 - **W6 — depth in `exe` and `svc`**: the request lifecycle, cursors and
