@@ -13,6 +13,45 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-05 — One file, one image
+
+### Converted
+- **The buffer pool** (`fire_crab_cch::pool`) — the shared resource the
+  concurrency oracle found missing the day before. The pages of a
+  database now live **once per file per process** instead of once per
+  attachment: `load_database` goes through the pool rather than
+  `std::fs::read`, readers take a reference-counted snapshot of the
+  image (so a writer installing a new one never changes it under a read
+  in progress), and **writers are serialized per database** — the write
+  side is taken at a transaction's FIRST write and held until it commits
+  or rolls back, because this server undoes a rollback by restoring a
+  whole-image snapshot and must not be able to restore over another
+  connection's committed rows. A connection that never wrote no longer
+  "restores" anything. The pool re-reads a file that changed underneath
+  it (every gate deletes and re-creates its scratch database against a
+  running server) and forgets a dropped one.
+- **Both divergences the oracle recorded are gone**, measured by the
+  same probes with the engine's half asserted alongside: an attachment
+  opened BEFORE another's commit now sees it (was: frozen at attach, for
+  the life of the connection), and 20 concurrent inserts across two
+  attachments now leave **all 20 rows** (was: 10, one image landing
+  whole over the top of the other) — with `gfix -v -full` still finding
+  nothing wrong with the file. `qa/serve-real-concurrency.sh` was
+  rewritten around what is left, and gained a COVERAGE section that
+  reads the pool's own counters out of the server log: attachments that
+  found the image resident, and writers that queued behind another.
+  Both non-zero is what makes the behaviour checks evidence about the
+  pool rather than about a process that happened to be alone.
+- **What is still different, and now measured rather than assumed.**
+  The serialization is DATABASE-wide where the engine's is row-wide (a
+  second writer waits even for an unrelated row), and an uncommitted row
+  is VISIBLE to other attachments — fire-crab marks a write's
+  transaction committed in the TIP as it writes it, so there is no
+  in-flight state for a reader to skip. While the image was private
+  neither could be seen from outside. The first is what W4 (`lck`) makes
+  row-granular; the second wants real transaction state, not more
+  locking. **W4 is unblocked**: there is a shared resource to arbitrate.
+
 ## 2026-08-05 — Two attachments are two databases
 
 ### Guarded

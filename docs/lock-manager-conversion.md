@@ -434,6 +434,18 @@ comes back to the head — not at a null.
 1. **Series semantics** — bring `jrd/lck.cpp`'s typed layer over,
    so fire-crab's wire server can arbitrate two of ITS OWN
    attachments through this table.
+
+   **There is now something to arbitrate.** When this list was written
+   the server gave every attachment a private `std::fs::read` copy of
+   the database file, so a lock over it would have protected nothing —
+   `qa/serve-real-concurrency.sh` measured exactly that. The pages now
+   live once per file per process (`fire_crab_cch::pool`) and the
+   writers over them are serialized **per database**: one write side,
+   taken at a transaction's first write, held to its commit. What this
+   crate's typed layer buys is the granularity — the engine blocks a
+   second writer only on a CONFLICTING row, and the gate records
+   fire-crab making an unrelated writer wait as the divergence that
+   closing this item removes.
 2. **`-w`, the "waiting for" cycles** — `prt_owner_wait_cycle` walks from a
    blocked owner to whoever holds what it wants, recursively, and prints the
    chain that a deadlock scan would follow. The data is all decoded now; the

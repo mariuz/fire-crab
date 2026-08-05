@@ -27,6 +27,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+/// The buffer pool: one image per FILE per process, shared by every
+/// attachment to it, with the writers over it serialized. See
+/// [`pool`] for why a private image per attachment was not a cache at
+/// all.
+pub mod pool;
+
 /// `related()`'s bounded search depth (cch.cpp caps the transitive
 /// walk; past the limit it assumes a relationship exists and forces
 /// the write - "force it now when in doubt")

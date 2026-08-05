@@ -285,9 +285,12 @@ GSTAT=/opt/firebird/bin/gstat bench/compare.sh /path/to/db.fdb
 - `crates/exe` — BLR execution (`src/jrd/exe.cpp` + `src/jrd/recsrc/`),
   running the stored bytes the dsql crate matches, rows differentially
   tested against the engine executing the same procedure.
-- `crates/cch` — the page cache's careful-write precedence graph
+- `crates/cch` — the page cache: the careful-write precedence graph
   (`src/jrd/cch.cpp`), crash-safety proven by validating every write
-  prefix with the engine's own tools.
+  prefix with the engine's own tools, and the **buffer pool** that holds
+  a database's pages once per file per process — the shared resource
+  the concurrency oracle found missing, with the writers over it
+  serialized per database.
 - `crates/lck` — the lock manager's table policy (`src/lock/lock.cpp`),
   pinned against the engine's own source and the live server's
   reservations; deep doc in

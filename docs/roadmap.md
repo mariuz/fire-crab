@@ -16,8 +16,8 @@ matters more than the row count:
 |---|---|---|
 | **done** | on-disk structures, record decode + RLE, PIP, pointer/data pages, B-tree decode, TIP/MVCC, GC/sweep, BLR decode | converted and held against an oracle; the server depends on them |
 | **converted, wired** | `ods`, `blb`, `auth`, `svc`, `exe`, `dsql` | the running server links and uses them |
-| **converted, NOT wired** | `lck`, `evt` | a real conversion of a real law, with a gate — that the server never calls. `lck` cannot be wired yet: attachments do not share a page image, so there is nothing to arbitrate (W4) |
-| **being wired** | `opt`, `cch`, `pio` | the server asks `opt` for the access path and takes an index when it says so (W1); it flushes through `cch`'s careful write order (W2), and writes those pages with `pio`, in the open mode the header's Forced Writes flag calls for (W3) |
+| **converted, NOT wired** | `lck`, `evt` | a real conversion of a real law, with a gate — that the server never calls. `lck` is UNBLOCKED now: attachments share one page image per file, so there is a resource to arbitrate — what it would make row-granular is a database-wide write side (W4) |
+| **being wired** | `opt`, `cch`, `pio` | the server asks `opt` for the access path and takes an index when it says so (W1); the pages of a file live once per process in `cch`'s buffer pool and are flushed in its careful write order (W2), and written with `pio`, in the open mode the header's Forced Writes flag calls for (W3) |
 
 That third row was the honest headline, and W1 has begun on it.
 `crates/wire/Cargo.toml` still does not depend on `-lck` or `-evt`. It DOES depend on `fire-crab-opt` now, and the optimizer's
@@ -2164,7 +2164,34 @@ plus *the subsystem is now on the path*.
     records, so re-inserting a deleted key was refused against an engine
     that accepts it. The conflicting records are fetched and checked now
     — the same "candidates, not answers" rule.
-- **W2 — the page cache.** *(the write order done)* The server's DML
+- **W2 — the page cache.** *(the write order done; the image now
+  SHARED)* **The buffer pool landed** (`fire_crab_cch::pool`): the pages
+  of a database live **once per file per process** instead of once per
+  attachment. `load_database` opens through the pool, readers take a
+  reference-counted snapshot of the image, and writers are **serialized
+  per database** — the write side is taken at a transaction's first
+  write and held to its commit or rollback, because a rollback here
+  restores a whole-image snapshot and must not be able to restore over
+  another connection's committed rows. A connection that never wrote no
+  longer restores anything at all. The pool re-reads a file that
+  changed underneath it and forgets a dropped one.
+
+  That closed both divergences W4's oracle had recorded — an attachment
+  opened before another's commit sees it, and 20 concurrent inserts
+  across two attachments leave 20 rows — and `qa/serve-real-concurrency.sh`
+  now asserts the engine's answers on both, plus a COVERAGE section
+  reading the pool's own counters (attachments that found the image
+  resident, writers that queued) out of the server log, because the
+  behaviour checks would also pass against a server whose probes never
+  overlapped.
+
+  Still to do here: **per-page fetch**. The unit of sharing is the whole
+  image, not `Cache`'s buffer descriptors — reads still slice, they just
+  slice pages nobody else can lose. Hit accounting and eviction are the
+  rest of W2, and the seam for them is the single `SharedImage::image`
+  every read now goes through. Also still: a file that GROWS is written
+  whole (extending is its own careful-write question).
+- **W2 (as it stood) — the careful write order.** The server's DML
   flush writes PAGES in `cch`'s precedence order and syncs each before
   the page that references it, instead of dumping the whole file — so
   every prefix of the write sequence is a database the engine can open,
@@ -2172,14 +2199,10 @@ plus *the subsystem is now on the path*.
   about a model nothing called. `crates/wire` depends on
   `fire-crab-cch` now. Measured: five pages per statement instead of the
   whole file, and no speed change (the per-page sync cancels the smaller
-  write) — this buys crash behaviour, not throughput. Still to do: a
-  file that GROWS is written whole (extending is its own careful-write
-  question), and the READ path still slices the image directly rather
-  than fetching through buffers. **That read path is now known to be
-  W4'S PREREQUISITE, not a parallel item** — see W4 for the measurement.
-  It is also the largest single piece of work left in programme W, since
-  every read site in the server assumes the private `Vec<u8>` it would
-  replace.
+  write) — this buys crash behaviour, not throughput. The read path that
+  this left "slicing the image directly" was afterwards found to be
+  **W4's prerequisite rather than a parallel item**, and is what the
+  buffer pool above answers.
 - **W3 — platform I/O.** *(the write path done)* The careful flush
   writes its pages through `fire-crab-pio`, opened with
   `plan_for_header(<the header's flags>)`. That fixed a rule the flush
@@ -2188,44 +2211,48 @@ plus *the subsystem is now on the path*.
   header says so and does nothing per write when it does not, while the
   flush had been syncing every page unconditionally. Measured: 38.4s
   with it on against 38.3s off, so the sync was never the cost. Still to
-  do: the READ path (the server still slices the image directly).
+  do: the READ path (the pool holds the image; `pio` is not the one
+  reading it in).
 - **W4 — the lock manager participating** (`lck`): enqueue, dequeue,
-  AST callbacks. This was written as "what makes concurrent attachments
-  correct rather than accidentally correct". **MEASURED, IT IS NEITHER,
-  AND W4 CANNOT BE STARTED — there is nothing yet for a lock manager to
-  arbitrate.**
+  AST callbacks. Written as "what makes concurrent attachments correct
+  rather than accidentally correct", then **measured, and it was
+  neither** — and the finding was not a missing lock manager but a
+  missing *shared resource*: every attachment held a private
+  `std::fs::read` copy of the file, so two attachments were two
+  databases that shared a filename. `qa/serve-real-concurrency.sh` is
+  the first gate in this suite that opens TWO of them, which is why none
+  of the other 183 ever said anything about it.
 
-  `load_database` does `std::fs::read(path)` into an owned `Vec<u8>`,
-  once per connection thread, so **every attachment holds a private
-  full-file copy** and its flush writes that copy's pages back. Two
-  attachments are two databases that share a filename. The new
-  `qa/serve-real-concurrency.sh` is the first gate in this suite that
-  opens TWO of them, which is why none of the other 183 ever said
-  anything about this:
+  **The buffer pool (W2) is that resource, and it is in.** What the same
+  probes answer now:
 
-  | probe | engine | fire-crab |
-  |---|---|---|
-  | writer sees its own write | 555 | 555 |
-  | an attachment opened BEFORE the commit | 555 | **100** — frozen at attach, for the life of the connection |
-  | one opened AFTER | 555 | 555 |
-  | the engine reading the file | 555 | 555 — the write IS durable and correctly on disk |
-  | second writer on a held row | **BLOCKS** (default WAIT) | accepted silently |
-  | 20 concurrent inserts, 10 per attachment | all 20 rows | **10** — one image overwrote the other |
-  | `gfix -v -full` on the result | clean | **clean** |
+  | probe | engine | fire-crab, before | fire-crab, now |
+  |---|---|---|---|
+  | writer sees its own write | 555 | 555 | 555 |
+  | an attachment opened BEFORE the commit | 555 | **100** — frozen at attach | 555 |
+  | one opened AFTER | 555 | 555 | 555 |
+  | the engine reading the file | 555 | 555 — durable and correctly on disk | 555 |
+  | 20 concurrent inserts, 10 per attachment | all 20 rows | **10** — one image overwrote the other | all 20 rows |
+  | `gfix -v -full` on the result | clean | clean (that is what made it silent) | clean |
+  | an uncommitted row, read from another attachment | invisible | invisible — nothing was shared | **visible** |
+  | a second writer, on an UNRELATED row | does not block | did not block | **waits** |
 
-  That last row is what makes it silent: the survivor is one writer's
-  *consistent* image, whole, over the top of the other's, so nothing is
-  corrupt and nothing complains. Which side wins is a race — the gate
-  asserts that exactly ONE survived rather than which.
+  The last two rows are W4's actual work, and both are now *measured*
+  rather than assumed. fire-crab serializes writers on the DATABASE (the
+  write side is held from a transaction's first write to its commit,
+  because rollback here restores a whole-image snapshot); the engine
+  blocks only on a conflicting ROW, through `lck` plus the record's
+  transaction state. Correct and coarse is the honest step from silently
+  wrong.
 
-  **THE PREREQUISITE IS W2'S READ PATH**, which this roadmap lists as an
-  independent item: "the READ path still slices the image directly
-  rather than fetching through buffers". Shared buffers first, then
-  locking over them. Until an attachment reads through `cch` instead of
-  its own `Vec<u8>`, enqueueing a lock would protect nothing — and the
-  order matters more than the effort, because a lock manager over
-  private images would LOOK correct in every single-session gate while
-  changing none of the rows above.
+  So W4 is: enqueue a lock per record (or per relation) instead of one
+  per database, and refuse or wait per the TPB rather than always
+  waiting. Its other half is **not locking at all** — an uncommitted row
+  is visible because this server marks a write's transaction committed
+  in the TIP as it writes it, so there is no in-flight state for a
+  reader to skip. Deferring that commit is what makes the row invisible,
+  and it is a prerequisite for row locks meaning what they mean on the
+  engine.
 - **W5 — event delivery** (`evt`): the shared-memory arena, the watcher,
   and the wire path.
 - **W6 — depth in `exe` and `svc`**: the request lifecycle, cursors and

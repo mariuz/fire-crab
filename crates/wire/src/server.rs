@@ -483,10 +483,32 @@ static ATTACH_COUNTER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI
 const TX_HANDLE: i32 = 2;
 
 /// A database file the server has opened for the current attachment: the
-/// raw bytes plus the page size read from its header. The `ods` crate
+/// page image plus the page size read from its header. The `ods` crate
 /// decodes everything from this slice.
+///
+/// THE IMAGE IS NOT THIS ATTACHMENT'S. It used to be: `load_database`
+/// read the whole file into an owned `Vec<u8>` per connection thread,
+/// and `qa/serve-real-concurrency.sh` measured what that costs - an
+/// attachment opened before another's commit never saw it, and two
+/// attachments writing at once each flushed their own copy, so one
+/// side's committed rows were silently gone under a file `gfix` called
+/// perfectly valid. It was: one writer's consistent image, whole, over
+/// the top of the other's.
+///
+/// Now the pages live once per FILE per process, in
+/// `fire_crab_cch::pool`, and this holds a handle to them. Reads take a
+/// reference-counted snapshot ([Database::bytes]); writes take the
+/// database's WRITE SIDE first ([Database::work_copy]) and hold it until
+/// the transaction ends, because this server's rollback restores an
+/// image snapshot and must not be able to restore over another
+/// connection's committed work.
 struct Database {
-    bytes: Vec<u8>,
+    /// the shared pages - one per file, not one per attachment
+    shared: std::sync::Arc<fire_crab_cch::pool::SharedImage>,
+    /// held from this transaction's first write to its commit/rollback;
+    /// dropping it (including when the connection thread ends) lets the
+    /// next writer in
+    write: Option<fire_crab_cch::pool::WriteToken>,
     page_size: usize,
     /// where the bytes came from - an INSERT flushes back here
     path: String,
@@ -498,6 +520,70 @@ struct Database {
     /// [GenWindow] for why a generator record has to be scoped that way
     /// and not to the transaction.
     gen_windows: Vec<GenWindow>,
+}
+
+/// How long a writer waits for the connection that holds the database's
+/// write side before giving up. The engine's default is WAIT, forever;
+/// this waits long enough to be that in practice and still refuses
+/// rather than wedging a connection for good if a client disappears
+/// mid-transaction without its thread ending.
+fn write_wait() -> std::time::Duration {
+    let secs = std::env::var("FC_WRITE_WAIT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(60);
+    std::time::Duration::from_secs(secs)
+}
+
+impl Database {
+    /// The pages as they stand. Reference counted: the caller reads
+    /// without holding a lock, and a writer installing a new image
+    /// never changes one out from under a read in progress.
+    fn bytes(&self) -> std::sync::Arc<Vec<u8>> {
+        self.shared.image()
+    }
+
+    /// Start a write: take the database's write side (if this
+    /// transaction has not already) and hand back a working copy to
+    /// edit. The order matters - the copy has to be taken while the
+    /// write side is held, or two writers clone the same base and the
+    /// second install silently drops the first's rows.
+    fn work_copy(&mut self) -> Result<Vec<u8>, String> {
+        if self.write.is_none() {
+            self.write = Some(
+                self.shared
+                    .begin_write(write_wait())
+                    .ok_or("lock conflict: another attachment is writing this database")?,
+            );
+        }
+        Ok(self.bytes().as_ref().clone())
+    }
+
+    /// Install an edited image. Only ever called with the write side
+    /// held, from [Database::work_copy]'s copy.
+    fn install(&mut self, bytes: Vec<u8>) {
+        self.shared.publish(bytes);
+    }
+
+    /// Whether this connection has written in the current transaction -
+    /// i.e. whether it has anything to roll back. A connection that
+    /// never wrote must not "restore" an image over anybody else's
+    /// work.
+    fn wrote(&self) -> bool {
+        self.write.is_some()
+    }
+
+    /// The transaction ended (commit or rollback): let the next writer
+    /// in.
+    fn end_write(&mut self) {
+        self.write = None;
+    }
+
+    /// Record the file as the server just wrote it, so the pool does
+    /// not read back its own flush as somebody else's change.
+    fn note_disk(&self) {
+        self.shared.note_disk();
+    }
 }
 
 /// What one undo window did to the generators inside it.
@@ -663,7 +749,7 @@ fn write_gen_window(db: &mut Database, w: &GenWindow) {
     if targets.is_empty() {
         return;
     }
-    let mut work = db.bytes.clone();
+    let Ok(mut work) = db.work_copy() else { return };
     let mut moved = false;
     for (name, value) in targets {
         if let Some(id) = generator_id(db, name) {
@@ -673,8 +759,9 @@ fn write_gen_window(db: &mut Database, w: &GenWindow) {
         }
     }
     if moved {
-        db.bytes = work;
-        let _ = std::fs::write(&db.path, &db.bytes);
+        let _ = std::fs::write(&db.path, &work);
+        db.install(work);
+        db.note_disk();
     }
 }
 
@@ -698,14 +785,17 @@ fn load_database(path: &str) -> Option<Database> {
     if p.is_empty() {
         return None;
     }
-    let bytes = std::fs::read(p).ok()?;
-    let h = fire_crab_ods::header::HeaderPage::decode(&bytes)?;
+    // THROUGH THE POOL, not `fs::read`: the pages of one file are one
+    // image, shared by every attachment to it. See [Database].
+    let shared = fire_crab_cch::pool::open(p)?;
+    let h = fire_crab_ods::header::HeaderPage::decode(&shared.image())?;
     let page_size = h.page_size as usize;
     if page_size == 0 {
         return None;
     }
     Some(Database {
-        bytes,
+        shared,
+        write: None,
         page_size,
         path: p.to_string(),
         ods_major: h.ods_major(),
@@ -731,6 +821,7 @@ fn create_database_file(path: &str) -> Result<(), String> {
         return Ok(());
     }
     let _ = std::fs::remove_file(p);
+    fire_crab_cch::pool::forget(p);
     let isql = std::env::var("FC_ISQL").unwrap_or_else(|_| "isql".to_string());
     let user = std::env::var("FC_CREATE_USER").unwrap_or_else(|_| "SYSDBA".to_string());
     let pass = std::env::var("FC_CREATE_PASSWORD").unwrap_or_else(|_| "masterkey".to_string());
@@ -4022,14 +4113,14 @@ fn wire_for(d: &Descriptor) -> (Wire, i32, i32, i32, i32) {
 fn not_null_fids(db: &Database, table: &str) -> Vec<usize> {
     use fire_crab_ods::format::Value;
     let Some(formats) =
-        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes, db.page_size, "RDB$RELATION_FIELDS")
+        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, "RDB$RELATION_FIELDS")
     else {
         return Vec::new();
     };
     let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else {
         return Vec::new();
     };
-    let cols = relation_columns(&db.bytes, db.page_size, "RDB$RELATION_FIELDS");
+    let cols = relation_columns(&db.bytes(), db.page_size, "RDB$RELATION_FIELDS");
     let fid_of = |name: &str| {
         cols.iter()
             .find(|c| c.name == name)
@@ -4069,14 +4160,14 @@ fn not_null_fids(db: &Database, table: &str) -> Vec<usize> {
 fn identity_columns(db: &Database, table: &str) -> Vec<(usize, String, i64)> {
     use fire_crab_ods::format::Value;
     let Some(formats) =
-        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes, db.page_size, "RDB$RELATION_FIELDS")
+        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, "RDB$RELATION_FIELDS")
     else {
         return Vec::new();
     };
     let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else {
         return Vec::new();
     };
-    let cols = relation_columns(&db.bytes, db.page_size, "RDB$RELATION_FIELDS");
+    let cols = relation_columns(&db.bytes(), db.page_size, "RDB$RELATION_FIELDS");
     let fid_of = |name: &str| {
         cols.iter()
             .find(|c| c.name == name)
@@ -4124,7 +4215,7 @@ fn computed_sources(db: &Database, table: &str) -> std::collections::HashMap<usi
     use fire_crab_ods::format::Value;
     let mut out = std::collections::HashMap::new();
     let Some(rf_formats) = fire_crab_ods::sysfmt::system_relation_formats(
-        &db.bytes,
+        &db.bytes(),
         db.page_size,
         "RDB$RELATION_FIELDS",
     ) else {
@@ -4133,7 +4224,7 @@ fn computed_sources(db: &Database, table: &str) -> std::collections::HashMap<usi
     let Some((_, rf_descs)) = rf_formats.iter().max_by_key(|(n, _)| *n) else {
         return out;
     };
-    let cols = relation_columns(&db.bytes, db.page_size, "RDB$RELATION_FIELDS");
+    let cols = relation_columns(&db.bytes(), db.page_size, "RDB$RELATION_FIELDS");
     let fid_of = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
     let (Some(rel_f), Some(id_f), Some(src_f)) = (
         fid_of("RDB$RELATION_NAME"),
@@ -4161,14 +4252,14 @@ fn computed_sources(db: &Database, table: &str) -> std::collections::HashMap<usi
     }
     // each source's RDB$COMPUTED_SOURCE blob, if it has one
     let Some(f_formats) =
-        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes, db.page_size, "RDB$FIELDS")
+        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, "RDB$FIELDS")
     else {
         return out;
     };
     let Some((_, f_descs)) = f_formats.iter().max_by_key(|(n, _)| *n) else {
         return out;
     };
-    let fcols = relation_columns(&db.bytes, db.page_size, "RDB$FIELDS");
+    let fcols = relation_columns(&db.bytes(), db.page_size, "RDB$FIELDS");
     let ffid = |n: &str| fcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
     let (Some(name_f), Some(csrc_f)) = (ffid("RDB$FIELD_NAME"), ffid("RDB$COMPUTED_SOURCE"))
     else {
@@ -4188,7 +4279,7 @@ fn computed_sources(db: &Database, table: &str) -> std::collections::HashMap<usi
         }
     });
     for (id, r, n) in blobs {
-        if let Some(bytes) = fire_crab_blb::read_blob_content(&db.bytes, db.page_size, r, n) {
+        if let Some(bytes) = fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, r, n) {
             if let Ok(text) = String::from_utf8(bytes) {
                 out.insert(id, text);
             }
@@ -4219,19 +4310,19 @@ enum DmlGuard<'a> {
 fn fk_trigger_parent_cols(db: &Database, table: &str, trigs: &[String]) -> Option<Vec<String>> {
     use fire_crab_ods::format::Value;
     let formats = fire_crab_ods::sysfmt::system_relation_formats(
-        &db.bytes,
+        &db.bytes(),
         db.page_size,
         "RDB$DEPENDENCIES",
     )?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
-    let cols = relation_columns(&db.bytes, db.page_size, "RDB$DEPENDENCIES");
+    let cols = relation_columns(&db.bytes(), db.page_size, "RDB$DEPENDENCIES");
     let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
     let (dep_f, on_f, fld_f) = (
         fid("RDB$DEPENDENT_NAME")?,
         fid("RDB$DEPENDED_ON_NAME")?,
         fid("RDB$FIELD_NAME")?,
     );
-    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, "RDB$DEPENDENCIES")?;
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$DEPENDENCIES")?;
     let fmts = vec![(0u8, descs.clone())];
     let mut out: Vec<String> = Vec::new();
     for_each_record(db, rel, &fmts, |values| {
@@ -4377,12 +4468,12 @@ fn insert_defaults(
     targeted: &[usize],
 ) -> Option<Vec<(usize, DefaultVal)>> {
     let rf_formats = fire_crab_ods::sysfmt::system_relation_formats(
-        &db.bytes,
+        &db.bytes(),
         db.page_size,
         "RDB$RELATION_FIELDS",
     )?;
     let (_, rf_descs) = rf_formats.iter().max_by_key(|(n, _)| *n)?;
-    let rf_cols = relation_columns(&db.bytes, db.page_size, "RDB$RELATION_FIELDS");
+    let rf_cols = relation_columns(&db.bytes(), db.page_size, "RDB$RELATION_FIELDS");
     let rfid = |n: &str| rf_cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
     let (rel_f, name_f, src_f, def_f) = (
         rfid("RDB$RELATION_NAME")?,
@@ -4424,7 +4515,7 @@ fn insert_defaults(
     for (fid, blob, src) in omitted {
         match blob {
             Some((r, n)) => {
-                let bytes = fire_crab_blb::read_blob_content(&db.bytes, db.page_size, r, n)?;
+                let bytes = fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, r, n)?;
                 match decode_default_blr(&bytes)? {
                     DefaultVal::Null => {} // same as no default
                     dv => out.push((fid, dv)),
@@ -4435,12 +4526,12 @@ fn insert_defaults(
     }
     if !pending.is_empty() {
         let f_formats = fire_crab_ods::sysfmt::system_relation_formats(
-            &db.bytes,
+            &db.bytes(),
             db.page_size,
             "RDB$FIELDS",
         )?;
         let (_, f_descs) = f_formats.iter().max_by_key(|(n, _)| *n)?;
-        let f_cols = relation_columns(&db.bytes, db.page_size, "RDB$FIELDS");
+        let f_cols = relation_columns(&db.bytes(), db.page_size, "RDB$FIELDS");
         let ffid = |n: &str| f_cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
         let (fname_f, fdef_f) = (ffid("RDB$FIELD_NAME")?, ffid("RDB$DEFAULT_VALUE")?);
         let f_fmts = vec![(0u8, f_descs.clone())];
@@ -4457,7 +4548,7 @@ fn insert_defaults(
             }
         });
         for (fid, r, n) in blobs {
-            let bytes = fire_crab_blb::read_blob_content(&db.bytes, db.page_size, r, n)?;
+            let bytes = fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, r, n)?;
             match decode_default_blr(&bytes)? {
                 DefaultVal::Null => {}
                 dv => out.push((fid, dv)),
@@ -4505,16 +4596,16 @@ fn fk_partners(
 ) -> Option<(Vec<FkPartner>, Vec<FkPartner>)> {
     // every index row: (index name, relation name, partner index name)
     let i_formats =
-        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes, db.page_size, "RDB$INDICES")?;
+        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, "RDB$INDICES")?;
     let (_, i_descs) = i_formats.iter().max_by_key(|(n, _)| *n)?;
-    let icols = relation_columns(&db.bytes, db.page_size, "RDB$INDICES");
+    let icols = relation_columns(&db.bytes(), db.page_size, "RDB$INDICES");
     let ifid = |n: &str| icols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
     let (ix_f, rn_f, fk_f) = (
         ifid("RDB$INDEX_NAME")?,
         ifid("RDB$RELATION_NAME")?,
         ifid("RDB$FOREIGN_KEY")?,
     );
-    let irel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, "RDB$INDICES")?;
+    let irel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$INDICES")?;
     let ifmts = vec![(0u8, i_descs.clone())];
     let mut rows: Vec<(String, String, Option<String>)> = Vec::new();
     for_each_record(db, irel, &ifmts, |values| {
@@ -4531,19 +4622,19 @@ fn fk_partners(
     }
     // every segment row: (index name, position, column name)
     let s_formats = fire_crab_ods::sysfmt::system_relation_formats(
-        &db.bytes,
+        &db.bytes(),
         db.page_size,
         "RDB$INDEX_SEGMENTS",
     )?;
     let (_, s_descs) = s_formats.iter().max_by_key(|(n, _)| *n)?;
-    let scols = relation_columns(&db.bytes, db.page_size, "RDB$INDEX_SEGMENTS");
+    let scols = relation_columns(&db.bytes(), db.page_size, "RDB$INDEX_SEGMENTS");
     let sfid = |n: &str| scols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
     let (sn_f, sc_f, sp_f) = (
         sfid("RDB$INDEX_NAME")?,
         sfid("RDB$FIELD_NAME")?,
         sfid("RDB$FIELD_POSITION")?,
     );
-    let srel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, "RDB$INDEX_SEGMENTS")?;
+    let srel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$INDEX_SEGMENTS")?;
     let sfmts = vec![(0u8, s_descs.clone())];
     let mut segrows: Vec<(String, i64, String)> = Vec::new();
     for_each_record(db, srel, &sfmts, |values| {
@@ -4571,8 +4662,8 @@ fn fk_partners(
             .map(|c| c.field_id as usize)
     };
     let other_side = |name: &str, key_cols: &[String]| -> Option<FkPartner> {
-        let orel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, name)?;
-        let ocols = relation_columns(&db.bytes, db.page_size, name);
+        let orel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, name)?;
+        let ocols = relation_columns(&db.bytes(), db.page_size, name);
         let other_fids: Vec<usize> = key_cols
             .iter()
             .map(|c| {
@@ -4584,7 +4675,7 @@ fn fk_partners(
             .collect::<Option<_>>()?;
         Some(FkPartner {
             other_rel: orel,
-            other_formats: relation_formats(&db.bytes, db.page_size, orel),
+            other_formats: relation_formats(&db.bytes(), db.page_size, orel),
             other_fids,
             my_fids: Vec::new(), // the caller fills its own side
             constraint: String::new(),
@@ -4718,7 +4809,7 @@ fn fk_partner_lookup(db: &Database, fk: &FkPartner, key: &[&Value]) -> Option<Ve
         return None;
     }
     fire_crab_ods::btr::lookup_key(
-        &db.bytes, db.page_size, fk.other_rel, op.id, &ikey, op.descending,
+        &db.bytes(), db.page_size, fk.other_rel, op.id, &ikey, op.descending,
     )
 }
 
@@ -4829,9 +4920,9 @@ fn check_predicates(
 ) -> Option<Vec<TableCheck>> {
     use fire_crab_ods::format::Value;
     let t_formats =
-        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes, db.page_size, "RDB$TRIGGERS")?;
+        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, "RDB$TRIGGERS")?;
     let (_, t_descs) = t_formats.iter().max_by_key(|(n, _)| *n)?;
-    let tcols = relation_columns(&db.bytes, db.page_size, "RDB$TRIGGERS");
+    let tcols = relation_columns(&db.bytes(), db.page_size, "RDB$TRIGGERS");
     let tfid = |n: &str| tcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
     let (rel_f, src_f, sys_f, name_f, typ_f) = (
         tfid("RDB$RELATION_NAME")?,
@@ -4840,7 +4931,7 @@ fn check_predicates(
         tfid("RDB$TRIGGER_NAME")?,
         tfid("RDB$TRIGGER_TYPE")?,
     );
-    let trel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, "RDB$TRIGGERS")?;
+    let trel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$TRIGGERS")?;
     // each check trigger: (trigger name, trigger type, source blob) -
     // the name feeds the 23000 vector's "At trigger" stack item and the
     // RDB$CHECK_CONSTRAINTS constraint-name lookup
@@ -4932,7 +5023,7 @@ fn check_predicates(
     };
     let mut sources: Vec<(String, String)> = Vec::new(); // (source, trigger)
     for (trig, ttype, r, n) in blobs {
-        let bytes = fire_crab_blb::read_blob_content(&db.bytes, db.page_size, r, n)?;
+        let bytes = fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, r, n)?;
         let text = String::from_utf8(bytes).ok()?;
         match sources.iter_mut().find(|(s, _)| *s == text) {
             Some(entry) => {
@@ -4993,15 +5084,15 @@ struct TableCheck {
 /// error vector names.
 fn check_constraint_names(db: &Database) -> Option<Vec<(String, String)>> {
     let formats = fire_crab_ods::sysfmt::system_relation_formats(
-        &db.bytes,
+        &db.bytes(),
         db.page_size,
         "RDB$CHECK_CONSTRAINTS",
     )?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
-    let cols = relation_columns(&db.bytes, db.page_size, "RDB$CHECK_CONSTRAINTS");
+    let cols = relation_columns(&db.bytes(), db.page_size, "RDB$CHECK_CONSTRAINTS");
     let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
     let (cn_f, tn_f) = (fid("RDB$CONSTRAINT_NAME")?, fid("RDB$TRIGGER_NAME")?);
-    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, "RDB$CHECK_CONSTRAINTS")?;
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$CHECK_CONSTRAINTS")?;
     let fmts = vec![(0u8, descs.clone())];
     let mut out = Vec::new();
     for_each_record(db, rel, &fmts, |values| {
@@ -5018,15 +5109,15 @@ fn check_constraint_names(db: &Database) -> Option<Vec<(String, String)>> {
 /// error code, probed P8a/P8b).
 fn constraint_for_index(db: &Database, index_name: &str) -> Option<String> {
     let formats = fire_crab_ods::sysfmt::system_relation_formats(
-        &db.bytes,
+        &db.bytes(),
         db.page_size,
         "RDB$RELATION_CONSTRAINTS",
     )?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
-    let cols = relation_columns(&db.bytes, db.page_size, "RDB$RELATION_CONSTRAINTS");
+    let cols = relation_columns(&db.bytes(), db.page_size, "RDB$RELATION_CONSTRAINTS");
     let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
     let (cn_f, ix_f) = (fid("RDB$CONSTRAINT_NAME")?, fid("RDB$INDEX_NAME")?);
-    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, "RDB$RELATION_CONSTRAINTS")?;
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$RELATION_CONSTRAINTS")?;
     let fmts = vec![(0u8, descs.clone())];
     let mut found: Option<String> = None;
     for_each_record(db, rel, &fmts, |values| {
@@ -7296,9 +7387,9 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     // OLD row, a DELETE trigger no NEW, and only a BEFORE INSERT/UPDATE
     // may ASSIGN to NEW (the engine's rules)
     let db = db.as_ref()?;
-    let columns = relation_columns(&db.bytes, db.page_size, table);
-    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
-    let formats = relation_formats(&db.bytes, db.page_size, rel);
+    let columns = relation_columns(&db.bytes(), db.page_size, table);
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, table)?;
+    let formats = relation_formats(&db.bytes(), db.page_size, rel);
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
     let col_ok = |n: &str| {
         let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(n))?;
@@ -7460,12 +7551,12 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     let mut store_deps: Vec<(String, Vec<String>)> = Vec::new();
     for st in &stores {
         let TrigStmt::Store { table: stab, cols, .. } = st else { continue };
-        let scols = relation_columns(&db.bytes, db.page_size, stab);
-        let srel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, stab)?;
+        let scols = relation_columns(&db.bytes(), db.page_size, stab);
+        let srel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, stab)?;
         if srel < 128 {
             return None; // system relations are not store targets
         }
-        let sformats = relation_formats(&db.bytes, db.page_size, srel);
+        let sformats = relation_formats(&db.bytes(), db.page_size, srel);
         let (_, sdescs) = sformats.iter().max_by_key(|(n, _)| *n)?;
         for c in cols {
             let rc = scols.iter().find(|rc| rc.name.eq_ignore_ascii_case(c))?;
@@ -7497,12 +7588,12 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
                 TrigStmt::Delete { table, wher, .. } => (table, None, wher),
                 _ => continue,
             };
-        let dcols = relation_columns(&db.bytes, db.page_size, dtab);
-        let drel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, dtab)?;
+        let dcols = relation_columns(&db.bytes(), db.page_size, dtab);
+        let drel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, dtab)?;
         if drel < 128 {
             return None; // system relations are not DML targets
         }
-        let dformats = relation_formats(&db.bytes, db.page_size, drel);
+        let dformats = relation_formats(&db.bytes(), db.page_size, drel);
         let (_, ddescs) = dformats.iter().max_by_key(|(n, _)| *n)?;
         let target_col_ok = |n: &str| -> Option<()> {
             let rc = dcols.iter().find(|rc| rc.name.eq_ignore_ascii_case(n))?;
@@ -7599,14 +7690,14 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
 /// `EXCEPTION <name>` in a trigger body must name a real one.
 fn exception_exists(db: &Database, name: &str) -> bool {
     let Some(formats) =
-        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes, db.page_size, "RDB$EXCEPTIONS")
+        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, "RDB$EXCEPTIONS")
     else {
         return false;
     };
     let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else {
         return false;
     };
-    let cols = relation_columns(&db.bytes, db.page_size, "RDB$EXCEPTIONS");
+    let cols = relation_columns(&db.bytes(), db.page_size, "RDB$EXCEPTIONS");
     let Some(name_f) = cols
         .iter()
         .find(|c| c.name == "RDB$EXCEPTION_NAME")
@@ -7614,7 +7705,7 @@ fn exception_exists(db: &Database, name: &str) -> bool {
     else {
         return false;
     };
-    let Some(rel) = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, "RDB$EXCEPTIONS")
+    let Some(rel) = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$EXCEPTIONS")
     else {
         return false;
     };
@@ -9357,9 +9448,9 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
     // CATALOG's columns (needs the attached database)
     if let Some((cname, source)) = parse_check_clause(tail) {
         let db = db.as_ref()?;
-        let columns = relation_columns(&db.bytes, db.page_size, table);
-        let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
-        let formats = relation_formats(&db.bytes, db.page_size, rel);
+        let columns = relation_columns(&db.bytes(), db.page_size, table);
+        let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, table)?;
+        let formats = relation_formats(&db.bytes(), db.page_size, rel);
         let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
         let cond = parse_cond(&source["CHECK".len()..])?;
         let field_rank = |name: &str| {
@@ -9401,9 +9492,9 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
     // (needs the attached database - the statement's text has no types)
     if let Some((cname, src)) = parse_computed_item(tail) {
         let db = db.as_ref()?;
-        let columns = relation_columns(&db.bytes, db.page_size, table);
-        let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
-        let formats = relation_formats(&db.bytes, db.page_size, rel);
+        let columns = relation_columns(&db.bytes(), db.page_size, table);
+        let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, table)?;
+        let formats = relation_formats(&db.bytes(), db.page_size, rel);
         let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
         let expr = parse_expr(&src)?;
         // a reference types as a plain stored exact-integer column: not
@@ -10028,16 +10119,16 @@ fn wrap_returning(
     db: &Option<Database>,
 ) -> Option<(Plan, Vec<Descriptor>)> {
     let dbr = db.as_ref()?;
-    let rel = fire_crab_ods::resolve_relation(&dbr.bytes, dbr.page_size, table)?;
-    let formats = fire_crab_ods::relation_formats(&dbr.bytes, dbr.page_size, rel);
+    let rel = fire_crab_ods::resolve_relation(&dbr.bytes(), dbr.page_size, table)?;
+    let formats = fire_crab_ods::relation_formats(&dbr.bytes(), dbr.page_size, rel);
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
-    let columns = fire_crab_ods::relation_columns(&dbr.bytes, dbr.page_size, table);
+    let columns = fire_crab_ods::relation_columns(&dbr.bytes(), dbr.page_size, table);
     let mut cols = Vec::new();
     let mut fields = Vec::new();
     // the CATALOG's spelling of the target table, for the quoted
     // qualifier's exact compare (`table` is the statement's spelling,
     // whose case a bare identifier does not preserve)
-    let canon = fire_crab_ods::list_relations(&dbr.bytes, dbr.page_size)
+    let canon = fire_crab_ods::list_relations(&dbr.bytes(), dbr.page_size)
         .into_iter()
         .find(|(id, _)| *id == rel)
         .map(|(_, n)| n)?;
@@ -10259,7 +10350,7 @@ fn unqualify_dml(sql: &str, db: &Option<Database>) -> Option<String> {
 /// table in a second schema still misfires - the qualifier is right now,
 /// the columns it is built from are still schema-blind.
 fn qualified_relation_name(db: &Database, rel: u16) -> Option<String> {
-    let canon = fire_crab_ods::list_relations(&db.bytes, db.page_size)
+    let canon = fire_crab_ods::list_relations(&db.bytes(), db.page_size)
         .into_iter()
         .find(|(id, _)| *id == rel)
         .map(|(_, n)| n)?;
@@ -10440,9 +10531,9 @@ fn plan_insert_select(
     // to defer the whole resolution to execute. Recorded boundary: the
     // TIMING now matches, the `-204 Table unknown` VECTOR does not -
     // fire-crab answers the generic Dynamic SQL Error.
-    let rel = fire_crab_ods::resolve_relation(&dbr.bytes, dbr.page_size, table)?;
-    let columns = relation_columns(&dbr.bytes, dbr.page_size, table);
-    let formats = relation_formats(&dbr.bytes, dbr.page_size, rel);
+    let rel = fire_crab_ods::resolve_relation(&dbr.bytes(), dbr.page_size, table)?;
+    let columns = relation_columns(&dbr.bytes(), dbr.page_size, table);
+    let formats = relation_formats(&dbr.bytes(), dbr.page_size, rel);
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
     // The target list, resolved ONCE - execute never recomputes it. The
     // implicit list is `relation_columns` order, which is
@@ -10637,9 +10728,9 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     if !relation_qualifier_ok(db, schema, table) {
         return None;
     }
-    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
-    let columns = relation_columns(&db.bytes, db.page_size, table);
-    let formats = relation_formats(&db.bytes, db.page_size, rel);
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, table)?;
+    let columns = relation_columns(&db.bytes(), db.page_size, table);
+    let formats = relation_formats(&db.bytes(), db.page_size, rel);
     let (format_no, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
     // every index on the relation must be maintainable (single-segment
     // ascending on a supported type) or the statement is refused - a
@@ -11465,10 +11556,10 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
 /// The unpacked image length of an existing primary record in this
 /// format, if the relation has one.
 fn sample_image_len(db: &Database, rel: u16, format_no: u8) -> Option<usize> {
-    for dp_no in relation_data_pages(&db.bytes, db.page_size, rel) {
+    let db_image = db.bytes();
+    for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
         let start = dp_no as usize * db.page_size;
-        let Some(dp) = db
-            .bytes
+        let Some(dp) = db_image
             .get(start..start + db.page_size)
             .and_then(DataPage::decode)
         else {
@@ -11476,7 +11567,7 @@ fn sample_image_len(db: &Database, rel: u16, format_no: u8) -> Option<usize> {
         };
         for r in dp.records() {
             if r.is_primary_record() && r.format == format_no {
-                if let Some(img) = fire_crab_ods::data::assembled_image(&db.bytes, db.page_size, &r) {
+                if let Some(img) = fire_crab_ods::data::assembled_image(&db_image, db.page_size, &r) {
                     return Some(img.len());
                 }
             }
@@ -11652,7 +11743,7 @@ fn plan_upsert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         Some(list) if !list.is_empty() => list,
         Some(_) => return None,
         None => match fire_crab_ods::ddl::primary_key_columns(
-            &dbr.bytes,
+            &dbr.bytes(),
             dbr.page_size,
             &table,
         ) {
@@ -11735,9 +11826,9 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
     if !relation_qualifier_ok(db, schema, table) {
         return None;
     }
-    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
-    let columns = relation_columns(&db.bytes, db.page_size, table);
-    let formats = relation_formats(&db.bytes, db.page_size, rel);
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, table)?;
+    let columns = relation_columns(&db.bytes(), db.page_size, table);
+    let formats = relation_formats(&db.bytes(), db.page_size, rel);
     let (format_no, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
     let index_ops = resolve_index_ops(db, rel, descs)?;
 
@@ -12038,12 +12129,12 @@ fn plan_delete(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
     if !relation_qualifier_ok(db, schema, table) {
         return None;
     }
-    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, table)?;
     // no index guard here: DELETE never touches indexes - the engine's
     // VIO_erase does not either (entries outlive their records until
     // garbage collection removes both)
-    let columns = relation_columns(&db.bytes, db.page_size, table);
-    let formats = relation_formats(&db.bytes, db.page_size, rel);
+    let columns = relation_columns(&db.bytes(), db.page_size, table);
+    let formats = relation_formats(&db.bytes(), db.page_size, rel);
     // a relation with no RDB$FORMATS entry (a system relation) cannot
     // be walked by format - refuse rather than silently delete nothing
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
@@ -12135,13 +12226,13 @@ fn dml_targets_at(
         return Ok(Vec::new());
     }
     // sequence -> page number, by LOOKUP: see `records_at_in`
+    let db_image = db.bytes();
     let pages: std::collections::HashMap<u32, u32> =
-        relation_data_pages(&db.bytes, db.page_size, rel)
+        relation_data_pages(&db_image, db.page_size, rel)
             .into_iter()
             .filter_map(|no| {
                 let start = no as usize * db.page_size;
-                let dp = db
-                    .bytes
+                let dp = db_image
                     .get(start..start + db.page_size)
                     .and_then(DataPage::decode)?;
                 Some((dp.sequence, no))
@@ -12169,7 +12260,7 @@ fn dml_targets_at(
         .picks
         .iter()
         .flat_map(|p| {
-            p.candidates(&db.bytes, db.page_size, rel)
+            p.candidates(&db.bytes(), db.page_size, rel)
                 .into_iter()
                 .map(|(_, r)| r)
         })
@@ -12182,8 +12273,7 @@ fn dml_targets_at(
         let slot = (recno % per_page) as u16;
         let Some(&dp_no) = pages.get(&seq) else { continue };
         let start = dp_no as usize * db.page_size;
-        let Some(dp) = db
-            .bytes
+        let Some(dp) = db_image
             .get(start..start + db.page_size)
             .and_then(DataPage::decode)
         else {
@@ -12199,7 +12289,7 @@ fn dml_targets_at(
         if !r.is_primary_record() {
             continue;
         }
-        let Some(image) = fire_crab_ods::data::assembled_image(&db.bytes, db.page_size, &r) else { continue };
+        let Some(image) = fire_crab_ods::data::assembled_image(&db_image, db.page_size, &r) else { continue };
         let descs = formats
             .iter()
             .find(|(n, _)| *n == r.format)
@@ -12391,10 +12481,10 @@ fn collect_dml_targets_drawing(
     let step = g.step.unwrap_or(incr);
     let mut last = None;
     let mut out = Vec::new();
-    for dp_no in relation_data_pages(&db.bytes, db.page_size, rel) {
+    let db_image = db.bytes();
+    for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
         let start = dp_no as usize * db.page_size;
-        let Some(dp) = db
-            .bytes
+        let Some(dp) = db_image
             .get(start..start + db.page_size)
             .and_then(DataPage::decode)
         else {
@@ -12404,7 +12494,7 @@ fn collect_dml_targets_drawing(
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = fire_crab_ods::data::assembled_image(&db.bytes, db.page_size, &r) else { continue };
+            let Some(image) = fire_crab_ods::data::assembled_image(&db_image, db.page_size, &r) else { continue };
             let descs = formats
                 .iter()
                 .find(|(n, _)| *n == r.format)
@@ -12443,10 +12533,10 @@ fn collect_dml_targets(
         return dml_targets_at(db, rel, formats, filter, access);
     }
     let mut out = Vec::new();
-    for dp_no in relation_data_pages(&db.bytes, db.page_size, rel) {
+    let db_image = db.bytes();
+    for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
         let start = dp_no as usize * db.page_size;
-        let Some(dp) = db
-            .bytes
+        let Some(dp) = db_image
             .get(start..start + db.page_size)
             .and_then(DataPage::decode)
         else {
@@ -12456,7 +12546,7 @@ fn collect_dml_targets(
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = fire_crab_ods::data::assembled_image(&db.bytes, db.page_size, &r) else { continue };
+            let Some(image) = fire_crab_ods::data::assembled_image(&db_image, db.page_size, &r) else { continue };
             let descs = formats
                 .iter()
                 .find(|(n, _)| *n == r.format)
@@ -12595,7 +12685,12 @@ fn execute_dml_collecting_inner(
         return Err(ExecErr::Eval(e.clone()));
     }
     let db = database.as_mut().ok_or("no database attached")?;
-    let mut work = db.bytes.clone();
+    // THE WRITE SIDE COMES FIRST, and the working copy is taken under
+    // it: two writers that clone the same base both install a whole
+    // image, and the second one silently drops the first's rows. The
+    // token is recursive (a row-by-row statement re-enters here) and is
+    // held until this transaction commits or rolls back.
+    let mut work = db.work_copy()?;
     let counts = match plan {
         Plan::CreateTable { name, cols, constraints, fks, relation_type } => {
             fire_crab_ods::ddl::create_table(
@@ -12851,7 +12946,7 @@ fn execute_dml_collecting_inner(
             // set, reaching the backing RDB$<n> generator, and it leaves
             // the same compensating record - see [GenWindow]
             let want = column.trim().trim_matches('"');
-            let fid = relation_columns(&db.bytes, db.page_size, table)
+            let fid = relation_columns(&db.bytes(), db.page_size, table)
                 .into_iter()
                 .find(|c| c.name.eq_ignore_ascii_case(want))
                 .map(|c| c.field_id as usize);
@@ -13370,8 +13465,9 @@ fn execute_dml_collecting_inner(
         }
         _ => return Err("not a DML plan".into()),
     };
-    flush_careful(&db.path, &db.bytes, &work, db.page_size)?;
-    db.bytes = work;
+    flush_careful(&db.path, &db.bytes(), &work, db.page_size)?;
+    db.install(work);
+    db.note_disk();
     Ok(counts)
 }
 
@@ -13843,7 +13939,7 @@ fn choose_index(
     // ORDER BY the index already delivers is reason enough to walk it.
     // What would the engine do here? opt answers from the same catalog
     // and the same rules its PLAN gate holds against the live server.
-    let plan = fire_crab_opt::plan_query(&db.bytes, db.page_size, sql).ok()?;
+    let plan = fire_crab_opt::plan_query(&db.bytes(), db.page_size, sql).ok()?;
     // `Access::Index` is a retrieval; `Access::Order` is the engine
     // NAVIGATING an index for the ORDER BY, which it does with the same
     // predicate as bounds - so both mean "an index serves this". Only
@@ -14140,13 +14236,14 @@ fn pick_for_terms(
 
 fn resolve_index_ops(db: &Database, rel: u16, descs: &[Descriptor]) -> Option<Vec<IndexOp>> {
     use fire_crab_ods::btw;
-    let Some(irt) = fire_crab_ods::btr::find_index_root(&db.bytes, db.page_size, rel) else {
+    let db_image = db.bytes();
+    let Some(irt) = fire_crab_ods::btr::find_index_root(&db_image, db.page_size, rel) else {
         return Some(Vec::new());
     };
     let mut ops = Vec::new();
     for e in irt.live_entries() {
         let (segs, iflags) = btw::index_segments(
-            &db.bytes,
+            &db.bytes(),
             db.page_size,
             rel,
             e.id,
@@ -14302,7 +14399,7 @@ fn entry_err_to_exec(
 /// the one unquoted argument in the 23000 family (captured raw).
 /// Descriptive text stands in when the column has no catalog name.
 fn not_valid_err(db: &Database, table: &str, fid: usize) -> ExecErr {
-    let name = relation_columns(&db.bytes, db.page_size, table)
+    let name = relation_columns(&db.bytes(), db.page_size, table)
         .into_iter()
         .find(|c| c.field_id as usize == fid)
         .map(|c| c.name);
@@ -14345,7 +14442,7 @@ fn unique_violation_err(
     values: &[Value],
 ) -> Option<EvalErr> {
     let (ix_name, constraint) = index_error_names(db, table, op.id)?;
-    let cols = relation_columns(&db.bytes, db.page_size, table);
+    let cols = relation_columns(&db.bytes(), db.page_size, table);
     let parts: Option<Vec<(String, &Value)>> = op
         .segs
         .iter()
@@ -14372,16 +14469,16 @@ fn unique_violation_err(
 /// then on to the owning constraint, when one exists.
 fn index_error_names(db: &Database, table: &str, index_id: u8) -> Option<(String, Option<String>)> {
     let formats =
-        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes, db.page_size, "RDB$INDICES")?;
+        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, "RDB$INDICES")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
-    let cols = relation_columns(&db.bytes, db.page_size, "RDB$INDICES");
+    let cols = relation_columns(&db.bytes(), db.page_size, "RDB$INDICES");
     let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
     let (nm_f, rn_f, id_f) = (
         fid("RDB$INDEX_NAME")?,
         fid("RDB$RELATION_NAME")?,
         fid("RDB$INDEX_ID")?,
     );
-    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, "RDB$INDICES")?;
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$INDICES")?;
     let fmts = vec![(0u8, descs.clone())];
     let mut found: Option<String> = None;
     for_each_record(db, rel, &fmts, |values| {
@@ -14459,11 +14556,11 @@ fn recno_of(work: &[u8], page_size: usize, page_no: u32, slot: u16) -> Result<u6
 /// keep plain `relation_formats`: the fallback must never make system
 /// relations writable.
 fn select_formats(db: &Database, table: &str, rel: u16) -> Vec<(u8, Vec<Descriptor>)> {
-    let formats = relation_formats(&db.bytes, db.page_size, rel);
+    let formats = relation_formats(&db.bytes(), db.page_size, rel);
     if !formats.is_empty() {
         return formats;
     }
-    fire_crab_ods::system_relation_formats(&db.bytes, db.page_size, table).unwrap_or_default()
+    fire_crab_ods::system_relation_formats(&db.bytes(), db.page_size, table).unwrap_or_default()
 }
 
 /// One side of a FROM clause: a relation name, its optional SCHEMA
@@ -15568,8 +15665,8 @@ fn plan_join_bound(
                 continue;
             }
         }
-        let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, tr.table)?;
-        let columns = relation_columns(&db.bytes, db.page_size, tr.table);
+        let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, tr.table)?;
+        let columns = relation_columns(&db.bytes(), db.page_size, tr.table);
         let formats = select_formats(db, tr.table, rel);
         // joining needs decodable records
         if formats.is_empty() {
@@ -16725,14 +16822,14 @@ fn view_of(db: &Database, name: &str) -> Option<ViewDef> {
             return;
         }
         if let Some(Value::Blob(r, n)) = v.get(src_f) {
-            if let Some(b) = fire_crab_blb::read_blob_content(&db.bytes, db.page_size, *r, *n) {
+            if let Some(b) = fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n) {
                 source = Some(String::from_utf8_lossy(&b).into_owned());
             }
         }
     });
     let source = source?;
     // the view's own columns, in field-id order
-    let mut cols: Vec<(u16, String)> = relation_columns(&db.bytes, db.page_size, name)
+    let mut cols: Vec<(u16, String)> = relation_columns(&db.bytes(), db.page_size, name)
         .into_iter()
         .map(|c| (c.field_id, c.name))
         .collect();
@@ -18916,8 +19013,8 @@ fn plan_query_inner_ctx(
         };
     }
     let table = left.table;
-    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
-    let columns = relation_columns(&db.bytes, db.page_size, table);
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, table)?;
+    let columns = relation_columns(&db.bytes(), db.page_size, table);
     let formats = select_formats(db, table, rel);
     let descs = formats
         .iter()
@@ -20396,7 +20493,7 @@ fn aggregate(
     // RDB$FORMATS, so for_each_record would decode nothing).
     if let (AggFn::Count, AggTarget::Star) = (func, target) {
         let n = match filter {
-            None => fire_crab_ods::count_primary_records(&db.bytes, db.page_size, rel) as i64,
+            None => fire_crab_ods::count_primary_records(&db.bytes(), db.page_size, rel) as i64,
             Some(_) => {
                 let mut n = 0i64;
                 for_each_candidate(db, rel, formats, index, |v| {
@@ -20489,7 +20586,7 @@ fn records_at(
     formats: &[(u8, Vec<Descriptor>)],
     recnos: &[u64],
 ) -> Vec<Vec<Value>> {
-    records_at_in(&db.bytes, db.page_size, rel, formats, recnos)
+    records_at_in(&db.bytes(), db.page_size, rel, formats, recnos)
 }
 
 /// The records a PICK's candidates name, with every candidate whose
@@ -20518,7 +20615,7 @@ fn records_for(
     // dedup belongs on ACCEPTANCE, below.
     let mut cands: Vec<(&IndexPick, Vec<u8>, u64)> = Vec::new();
     for pick in &access.picks {
-        for (entry_key, recno) in pick.candidates(&db.bytes, db.page_size, rel) {
+        for (entry_key, recno) in pick.candidates(&db.bytes(), db.page_size, rel) {
             cands.push((pick, entry_key, recno));
         }
     }
@@ -20557,7 +20654,7 @@ fn records_for(
     if per_page == 0 {
         return out;
     }
-    let pages = page_sequence_map(&db.bytes, db.page_size, rel);
+    let pages = page_sequence_map(&db.bytes(), db.page_size, rel);
     // a SET, not a Vec scanned linearly: the dedup is consulted once per
     // candidate, so `contains` on a Vec makes the acceptance loop
     // quadratic in the candidate count
@@ -20567,7 +20664,7 @@ fn records_for(
             continue;
         }
         for values in
-            records_at_in_with(&db.bytes, db.page_size, formats, &pages, per_page, &[recno])
+            records_at_in_with(&db.bytes(), db.page_size, formats, &pages, per_page, &[recno])
         {
             if !verify || pick.entry_is_current(&entry_key, &values) {
                 seen.insert(recno);
@@ -20715,10 +20812,10 @@ fn for_each_record_while<F: FnMut(&[Value]) -> Flow>(
     formats: &[(u8, Vec<Descriptor>)],
     mut f: F,
 ) {
-    for dp_no in relation_data_pages(&db.bytes, db.page_size, rel) {
+    let db_image = db.bytes();
+    for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
         let start = dp_no as usize * db.page_size;
-        let Some(dp) = db
-            .bytes
+        let Some(dp) = db_image
             .get(start..start + db.page_size)
             .and_then(DataPage::decode)
         else {
@@ -20728,7 +20825,7 @@ fn for_each_record_while<F: FnMut(&[Value]) -> Flow>(
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = fire_crab_ods::data::assembled_image(&db.bytes, db.page_size, &r)
+            let Some(image) = fire_crab_ods::data::assembled_image(&db_image, db.page_size, &r)
             else {
                 continue;
             };
@@ -20751,10 +20848,10 @@ fn for_each_record<F: FnMut(&[Value])>(
     formats: &[(u8, Vec<Descriptor>)],
     mut f: F,
 ) {
-    for dp_no in relation_data_pages(&db.bytes, db.page_size, rel) {
+    let db_image = db.bytes();
+    for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
         let start = dp_no as usize * db.page_size;
-        let Some(dp) = db
-            .bytes
+        let Some(dp) = db_image
             .get(start..start + db.page_size)
             .and_then(DataPage::decode)
         else {
@@ -20764,7 +20861,7 @@ fn for_each_record<F: FnMut(&[Value])>(
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = fire_crab_ods::data::assembled_image(&db.bytes, db.page_size, &r)
+            let Some(image) = fire_crab_ods::data::assembled_image(&db_image, db.page_size, &r)
             else {
                 continue;
             };
@@ -22255,7 +22352,7 @@ fn persist_generators(db: Option<&mut Database>, writes: &[(String, i64)]) {
         return;
     }
     let Some(db) = db else { return };
-    let mut work = db.bytes.clone();
+    let Ok(mut work) = db.work_copy() else { return };
     let mut ok = true;
     for (name, val) in writes {
         match generator_id(db, name) {
@@ -22268,11 +22365,12 @@ fn persist_generators(db: Option<&mut Database>, writes: &[(String, i64)]) {
         }
     }
     if ok {
-        db.bytes = work;
+        let _ = std::fs::write(&db.path, &work);
+        db.install(work);
+        db.note_disk();
         for (name, val) in writes {
             burn_generator(db, name, *val);
         }
-        let _ = std::fs::write(&db.path, &db.bytes);
     }
 }
 
@@ -28781,8 +28879,8 @@ fn plan_correlated_select(
         return Some(Plan::Refused); // a correlated subquery over a join
     }
     let table = from.table;
-    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
-    let columns = relation_columns(&db.bytes, db.page_size, table);
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, table)?;
+    let columns = relation_columns(&db.bytes(), db.page_size, table);
     let formats = select_formats(db, table, rel);
     let descs = formats
         .iter()
@@ -29081,8 +29179,8 @@ fn build_correlated_lookup(
     if view_of(db, table).is_some() {
         return None; // the same empty-storage guard [eval_subquery] makes
     }
-    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
-    let columns = relation_columns(&db.bytes, db.page_size, table);
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, table)?;
+    let columns = relation_columns(&db.bytes(), db.page_size, table);
     let formats = select_formats(db, table, rel);
     let descs = formats
         .iter()
@@ -29720,8 +29818,8 @@ fn eval_subquery_rel(
     if view_of(db, table).is_some() {
         return None;
     }
-    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, table)?;
-    let columns = relation_columns(&db.bytes, db.page_size, table);
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, table)?;
+    let columns = relation_columns(&db.bytes(), db.page_size, table);
     let formats = select_formats(db, table, rel);
     let descs = formats
         .iter()
@@ -30339,7 +30437,7 @@ fn correlated_outer_col(
     // three times drifts twice.
     let (_, table_s, where_s, _, _, _) = split_query(sql)?;
     let (from, _) = parse_from(table_s)?;
-    let columns = relation_columns(&db.bytes, db.page_size, from.table);
+    let columns = relation_columns(&db.bytes(), db.page_size, from.table);
     let toks = tokenize(where_s?)?;
     let (_, outer, _) =
         split_correlation(&toks, from.table, from.alias, &columns, outer_cols, Some(outer_bind))?;
@@ -32471,9 +32569,9 @@ struct ProcMeta {
 /// Read one system relation's (columns, newest descriptors) pair - the
 /// preamble every catalog walk here needs.
 fn sys_rel(db: &Database, name: &str) -> Option<(Vec<RelationColumn>, Vec<Descriptor>)> {
-    let formats = fire_crab_ods::sysfmt::system_relation_formats(&db.bytes, db.page_size, name)?;
+    let formats = fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, name)?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
-    Some((relation_columns(&db.bytes, db.page_size, name), descs.clone()))
+    Some((relation_columns(&db.bytes(), db.page_size, name), descs.clone()))
 }
 
 /// Is this catalog row a plain PUBLIC-schema, package-less object?
@@ -32531,7 +32629,7 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
             prc_type = Some(*t);
         }
         if let Some(Value::Blob(r, n)) = v.get(src_f) {
-            if let Some(bytes) = fire_crab_blb::read_blob_content(&db.bytes, db.page_size, *r, *n) {
+            if let Some(bytes) = fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n) {
                 source = Some(String::from_utf8_lossy(&bytes).into_owned());
             }
         }
@@ -32581,7 +32679,7 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     // RDB$FIELDS row (the same walk the DDL side uses)
     let domain_desc = |dom: &str| -> Option<Descriptor> {
         let (ft, len, scale, sub) =
-            fire_crab_ods::ddl::domain_type_info(&db.bytes, db.page_size, dom)?;
+            fire_crab_ods::ddl::domain_type_info(&db.bytes(), db.page_size, dom)?;
         Some(Descriptor {
             dtype: fire_crab_ods::ddl::field_type_to_dtype(ft)?,
             scale,
@@ -32759,7 +32857,7 @@ fn run_body_dml(
 
 /// The page image as it stands, to be restored if a statement fails.
 fn snapshot_db(database: &Option<Database>) -> Option<Vec<u8>> {
-    database.as_ref().map(|d| d.bytes.clone())
+    database.as_ref().map(|d| d.bytes().as_ref().clone())
 }
 
 /// Put a snapshot back and flush it, undoing everything a failed
@@ -32769,10 +32867,40 @@ fn snapshot_db(database: &Option<Database>) -> Option<Vec<u8>> {
 /// the truth" isolation story, and every restore therefore sits between
 /// a [gen_window_push] and its unwind: the pair is what makes the
 /// carve-out as wide as the engine's law and no wider. See [GenWindow].
+///
+/// A CONNECTION THAT NEVER WROTE HAS NOTHING TO UNDO, and since the
+/// image is now shared it must not pretend otherwise: restoring a
+/// snapshot taken at transaction start would put back a whole file over
+/// ANOTHER attachment's committed rows. The write side ([Database::wrote])
+/// is what says whether this connection wrote, and it is held from the
+/// transaction's first write until here, so no other writer can have
+/// committed inside the window this restore covers.
 fn restore_db(database: &mut Option<Database>, snap: Option<Vec<u8>>) {
     if let (Some(db), Some(bytes)) = (database.as_mut(), snap) {
-        db.bytes = bytes;
-        let _ = std::fs::write(&db.path, &db.bytes);
+        if !db.wrote() {
+            return;
+        }
+        let _ = std::fs::write(&db.path, &bytes);
+        db.install(bytes);
+        db.note_disk();
+    }
+}
+
+/// The transaction ended - COMMIT or ROLLBACK, statement or wire op -
+/// so the database's write side goes back and the next writer gets in.
+///
+/// It is held from the transaction's FIRST WRITE (see
+/// [Database::work_copy]) and not one statement at a time, because a
+/// rollback in this server restores a whole-image snapshot taken at
+/// transaction start: another connection committing inside that window
+/// would be undone by it. Holding the write side across the window is
+/// what makes the snapshot mean what it says.
+///
+/// Every caller sits AFTER the generator windows have been written
+/// forward, since that write needs the write side too.
+fn end_transaction(database: &mut Option<Database>) {
+    if let Some(db) = database.as_mut() {
+        db.end_write();
     }
 }
 
@@ -33163,7 +33291,7 @@ fn try_procedure_blr(
     let Some(db) = database.as_ref() else {
         return BlrProcOutcome::Outside;
     };
-    let Ok(blr) = fire_crab_exe::procedure_blr(&db.bytes, db.page_size, name) else {
+    let Ok(blr) = fire_crab_exe::procedure_blr(&db.bytes(), db.page_size, name) else {
         return BlrProcOutcome::Outside;
     };
     let Ok(req) = fire_crab_exe::parse(&blr) else {
@@ -33176,7 +33304,7 @@ fn try_procedure_blr(
         return BlrProcOutcome::Outside;
     }
     let sends =
-        match fire_crab_exe::bind_and_execute(&db.bytes, db.page_size, &req, args) {
+        match fire_crab_exe::bind_and_execute(&db.bytes(), db.page_size, &req, args) {
             Ok(s) => s,
             Err(e) => {
                 // the runtime classes surface with the engine's own
@@ -34798,6 +34926,13 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 None => "not loaded (fixed-answer fallback)".to_string(),
             }
         );
+        // THE COVERAGE HALF OF A WIRING SLICE. A subsystem that is
+        // wired in but never used passes every behaviour gate, so the
+        // pool says how much sharing actually happened: `shared` counts
+        // attachments that found the image already resident, and
+        // `write-waits` counts writers that had to queue behind
+        // another. Both zero means nothing is being shared.
+        eprintln!("[srv] pool: {}", fire_crab_cch::pool::stats_line());
     }
     let attach_id = ATTACH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     respond(&mut s, &mut enc, 1)?; // attachment handle 1
@@ -34889,6 +35024,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
             x if x == OP_DROP_DATABASE => {
                 read_int(&mut s, &mut dec)?; // db handle
                 let gone = std::fs::remove_file(&db_path).is_ok();
+                // the pool holds pages per FILE; a dropped file's pages
+                // are not a database anybody can attach to, and the
+                // next CREATE of the same name is a different file
+                if gone {
+                    fire_crab_cch::pool::forget(&db_path);
+                }
                 if std::env::var("FC_SRV_TRACE").is_ok() {
                     eprintln!("[srv] op_drop_database '{}' {}", db_path,
                         if gone { "removed" } else { "FAILED" });
@@ -35467,6 +35608,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             tx_snapshot = snapshot_db(&database);
                             reset_gen_windows(&mut database);
                         }
+                        // the write side goes back AFTER the generators
+                        // have been written forward over the restored
+                        // image - that write needs it too
+                        end_transaction(&mut database);
                         last_dml = (0, 0, 0);
                         respond(&mut s, &mut enc, TX_HANDLE)?;
                     } else if let Plan::Returning { inner, cols, fields } = &plan {
@@ -36015,6 +36160,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     tx_snapshot = snapshot_db(&database);
                     reset_gen_windows(&mut database);
                 }
+                end_transaction(&mut database);
                 respond(&mut s, &mut enc, 0)?;
             }
             x if x == OP_CANCEL => {
@@ -36035,7 +36181,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 let id = read_n(&mut s, &mut dec, 8)?;
                 let (rel, num) = decode_blob_id(&id);
                 let content = database.as_ref().and_then(|db| {
-                    fire_crab_blb::read_blob_content(&db.bytes, db.page_size, rel, num)
+                    fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, rel, num)
                 });
                 match content {
                     Some(data) => {
@@ -36102,7 +36248,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     page_size: database.as_ref().map_or(8192, |d| d.page_size as u32),
                     replica_mode: database
                         .as_ref()
-                        .and_then(|d| d.bytes.get(26).copied())
+                        .and_then(|d| d.bytes().get(26).copied())
                         .unwrap_or(0),
                 };
                 let info = build_db_info(&items, &ctx);
@@ -36131,8 +36277,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 // CURRENT_TRANSACTION session default resolves to)
                 let tra_id = database
                     .as_ref()
-                    .and_then(|d| d.bytes.get(40..44))
-                    .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]).wrapping_add(1))
+                    .and_then(|d| {
+                        d.bytes()
+                            .get(40..44)
+                            .map(|b| [b[0], b[1], b[2], b[3]])
+                    })
+                    .map(|b| i32::from_le_bytes(b).wrapping_add(1))
                     .unwrap_or(1);
                 let mut info: Vec<u8> = Vec::new();
                 for &code in items.iter() {
@@ -37099,11 +37249,11 @@ fn exec_blr_stmt(
             let mut streams: Vec<StreamData> = Vec::new();
             for (ctx, relname) in &rse.streams {
                 let Some(rel) =
-                    fire_crab_ods::resolve_relation(&db.bytes, db.page_size, relname)
+                    fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, relname)
                 else {
                     return;
                 };
-                let columns = relation_columns(&db.bytes, db.page_size, relname);
+                let columns = relation_columns(&db.bytes(), db.page_size, relname);
                 let formats = select_formats(db, relname, rel);
                 if formats.is_empty() {
                     return;
@@ -37351,9 +37501,9 @@ fn sleuth_match(value: &str, pattern: &str) -> bool {
 /// `RESTART WITH n` subtracts to store `n - increment`. None if the
 /// generator does not exist.
 fn generator_info(db: &Database, name: &str) -> Option<(i64, i64)> {
-    let rel = fire_crab_ods::resolve_relation(&db.bytes, db.page_size, "RDB$GENERATORS")?;
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$GENERATORS")?;
     let formats = select_formats(db, "RDB$GENERATORS", rel);
-    let cols = relation_columns(&db.bytes, db.page_size, "RDB$GENERATORS");
+    let cols = relation_columns(&db.bytes(), db.page_size, "RDB$GENERATORS");
     let field = |n: &str| {
         cols.iter()
             .find(|c| c.name.eq_ignore_ascii_case(n))
@@ -37414,11 +37564,12 @@ fn gen_id_increment(
     let (id, incr) = generator_info(db, name).ok_or("no such generator")?;
     let current = read_generator_value(db, name).unwrap_or(0);
     let new_val = current.wrapping_add(step.unwrap_or(incr));
-    let mut work = db.bytes.clone();
+    let mut work = db.work_copy()?;
     write_generator_value(&mut work, db.page_size, id, new_val)?;
-    db.bytes = work;
+    std::fs::write(&db.path, &work).map_err(|e| e.to_string())?;
+    db.install(work);
+    db.note_disk();
     burn_generator(db, name, new_val);
-    std::fs::write(&db.path, &db.bytes).map_err(|e| e.to_string())?;
     Ok(new_val)
 }
 
@@ -37436,7 +37587,7 @@ fn read_generator_value(db: &Database, name: &str) -> Option<i64> {
     let id = generator_id(db, name)?;
     // a generator whose page has not been allocated yet reads 0 - the
     // engine's zero-initialised slot
-    Some(fire_crab_ods::gen::read(&db.bytes, db.page_size, id))
+    Some(fire_crab_ods::gen::read(&db.bytes(), db.page_size, id))
 }
 
 /// Encode one output message field by field, per xdr_datum
@@ -37670,7 +37821,8 @@ mod tests {
         // cheap constructor here, and the Rows leaf answers before the
         // recursion ever reaches one, so the argument is unused.
         let db = Database {
-            bytes: Vec::new(),
+            shared: fire_crab_cch::pool::detached(Vec::new()),
+            write: None,
             page_size: 8192,
             path: String::new(),
             ods_major: 0,
@@ -40470,7 +40622,8 @@ mod tests {
         // an 80k-row scan - so it is counted instead.
         let rows: Vec<Vec<Value>> = (0..100).map(|i| vec![Value::Int(i)]).collect();
         let db = Database {
-            bytes: Vec::new(),
+            shared: fire_crab_cch::pool::detached(Vec::new()),
+            write: None,
             page_size: 4096,
             path: String::new(),
             ods_major: 14,
