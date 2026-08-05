@@ -16,7 +16,7 @@ matters more than the row count:
 |---|---|---|
 | **done** | on-disk structures, record decode + RLE, PIP, pointer/data pages, B-tree decode, TIP/MVCC, GC/sweep, BLR decode | converted and held against an oracle; the server depends on them |
 | **converted, wired** | `ods`, `blb`, `auth`, `svc`, `exe`, `dsql` | the running server links and uses them |
-| **converted, NOT wired** | `lck`, `evt` | a real conversion of a real law, with a gate — that the server never calls |
+| **converted, NOT wired** | `lck`, `evt` | a real conversion of a real law, with a gate — that the server never calls. `lck` cannot be wired yet: attachments do not share a page image, so there is nothing to arbitrate (W4) |
 | **being wired** | `opt`, `cch`, `pio` | the server asks `opt` for the access path and takes an index when it says so (W1); it flushes through `cch`'s careful write order (W2), and writes those pages with `pio`, in the open mode the header's Forced Writes flag calls for (W3) |
 
 That third row was the honest headline, and W1 has begun on it.
@@ -2175,7 +2175,11 @@ plus *the subsystem is now on the path*.
   write) — this buys crash behaviour, not throughput. Still to do: a
   file that GROWS is written whole (extending is its own careful-write
   question), and the READ path still slices the image directly rather
-  than fetching through buffers.
+  than fetching through buffers. **That read path is now known to be
+  W4'S PREREQUISITE, not a parallel item** — see W4 for the measurement.
+  It is also the largest single piece of work left in programme W, since
+  every read site in the server assumes the private `Vec<u8>` it would
+  replace.
 - **W3 — platform I/O.** *(the write path done)* The careful flush
   writes its pages through `fire-crab-pio`, opened with
   `plan_for_header(<the header's flags>)`. That fixed a rule the flush
@@ -2186,8 +2190,42 @@ plus *the subsystem is now on the path*.
   with it on against 38.3s off, so the sync was never the cost. Still to
   do: the READ path (the server still slices the image directly).
 - **W4 — the lock manager participating** (`lck`): enqueue, dequeue,
-  AST callbacks. This is what makes concurrent attachments correct
-  rather than accidentally correct.
+  AST callbacks. This was written as "what makes concurrent attachments
+  correct rather than accidentally correct". **MEASURED, IT IS NEITHER,
+  AND W4 CANNOT BE STARTED — there is nothing yet for a lock manager to
+  arbitrate.**
+
+  `load_database` does `std::fs::read(path)` into an owned `Vec<u8>`,
+  once per connection thread, so **every attachment holds a private
+  full-file copy** and its flush writes that copy's pages back. Two
+  attachments are two databases that share a filename. The new
+  `qa/serve-real-concurrency.sh` is the first gate in this suite that
+  opens TWO of them, which is why none of the other 183 ever said
+  anything about this:
+
+  | probe | engine | fire-crab |
+  |---|---|---|
+  | writer sees its own write | 555 | 555 |
+  | an attachment opened BEFORE the commit | 555 | **100** — frozen at attach, for the life of the connection |
+  | one opened AFTER | 555 | 555 |
+  | the engine reading the file | 555 | 555 — the write IS durable and correctly on disk |
+  | second writer on a held row | **BLOCKS** (default WAIT) | accepted silently |
+  | 20 concurrent inserts, 10 per attachment | all 20 rows | **10** — one image overwrote the other |
+  | `gfix -v -full` on the result | clean | **clean** |
+
+  That last row is what makes it silent: the survivor is one writer's
+  *consistent* image, whole, over the top of the other's, so nothing is
+  corrupt and nothing complains. Which side wins is a race — the gate
+  asserts that exactly ONE survived rather than which.
+
+  **THE PREREQUISITE IS W2'S READ PATH**, which this roadmap lists as an
+  independent item: "the READ path still slices the image directly
+  rather than fetching through buffers". Shared buffers first, then
+  locking over them. Until an attachment reads through `cch` instead of
+  its own `Vec<u8>`, enqueueing a lock would protect nothing — and the
+  order matters more than the effort, because a lock manager over
+  private images would LOOK correct in every single-session gate while
+  changing none of the rows above.
 - **W5 — event delivery** (`evt`): the shared-memory arena, the watcher,
   and the wire path.
 - **W6 — depth in `exe` and `svc`**: the request lifecycle, cursors and

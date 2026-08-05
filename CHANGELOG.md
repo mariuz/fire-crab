@@ -13,6 +13,27 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-05 — Two attachments are two databases
+
+### Guarded
+- **The concurrency oracle, and what it found.** Every gate in this
+  suite compared ONE session's answers, so nothing had ever asked what
+  two attachments do to each other — which is exactly the question W4
+  exists to answer. `qa/serve-real-concurrency.sh` opens two and
+  measures both servers. The engine BLOCKS a second writer (default
+  WAIT). fire-crab does not, and the reason is not a missing lock
+  manager: `load_database` does `std::fs::read(path)` into an owned
+  `Vec<u8>` once per connection thread, so **every attachment holds a
+  private full-file copy**. An attachment opened before another's commit
+  never sees it (the write is durable and on disk — one opened after
+  sees it, and so does the engine); two attachments inserting 10 rows
+  each end with 10 rows, one image having overwritten the other; and
+  `gfix -v -full` calls the result perfectly valid, because it is one
+  writer's *consistent* image, whole, over the top of the other's.
+  **W4 therefore cannot be started** — a lock manager arbitrates a
+  shared resource and there is not one yet. Its prerequisite is W2's
+  read path, which the roadmap had listed as an independent item.
+
 ## 2026-08-05 — The key the engine files in the wrong place
 
 ### Converted
