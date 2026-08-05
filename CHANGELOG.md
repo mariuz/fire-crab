@@ -13,6 +13,74 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-05 — A transaction that has not committed
+
+### Converted
+- **Real transaction state.** A transaction now reserves ONE id at its
+  first record write and leaves it `tra_active` in the TIP; every
+  record it writes carries that id; **COMMIT is the two bits** that flip
+  it to `tra_committed`. A rollback still restores the image snapshot,
+  and when there is none to restore the transaction is marked
+  `tra_dead` — the other way the engine ends one it will not honour.
+  New in `ods::dml`: `begin_active_tx`, `set_tx_state`,
+  `insert_record_under`, `delete_records_under` (the TIP slot
+  arithmetic the committed path already had, deduplicated into
+  `tip_bits_at`).
+- **Every record walk reads through the version chain**, which wires
+  `fire_crab_ods::tra` — converted and gated since the MVCC increment,
+  never called by the server. `ReadView` asks
+  `tra::visible_version` for the newest version whose transaction this
+  attachment counts (committed, its own, or the system transaction) and
+  decodes it with THAT version's format, not the chain head's. It
+  replaces `is_primary_record()` in the full-relation walks, the
+  record-number fetch, the index-candidate fetch, the DML target
+  collectors and the uniqueness check — a write reads what its own
+  transaction sees, so it neither updates nor duplicate-refuses against
+  rows nobody has committed.
+- **The system transaction is committed by definition.** Measured: id
+  0's two bits read `tra_active` in every real database, because it is
+  not a transaction anybody started — the engine answers for it in code
+  (tra.cpp's snapshot-state lookup). Reading it as active would have
+  hidden `RDB$PAGES` and with it the catalog.
+- **Result** (`qa/serve-real-concurrency.sh`): an uncommitted row is now
+  **invisible** to other attachments, the engine's own answer, where the
+  previous increment had exposed it as this server's one remaining
+  isolation divergence. What is left is blocking GRANULARITY — the
+  engine blocks a second writer only on a conflicting row; this still
+  holds one write side per database — which is what `lck` is for.
+
+- **A connection that vanishes mid-transaction leaves it DEAD, not
+  open.** The engine ends an uncommitted transaction when its
+  attachment goes; the connection loop now marks one `tra_dead` on the
+  way out, so its rows count for nobody and the engine's own sweep can
+  collect them. Left active, they would be a transaction that never
+  ends.
+- **Cost: none measurable.** The transaction id is reserved inside the
+  statement's own working copy rather than an install of its own, so a
+  write still clones the image once — 300 inserts, five alternating
+  rounds against the pre-change binary: 8.55ms/row against 8.65ms;
+  point queries and scans unchanged. It also means a statement that
+  FAILS burns no transaction: its copy is dropped, the header still
+  reads what it read, and the next write reserves the same number.
+- **The engine is the oracle for all of it.** `qa/serve-real-concurrency.sh`
+  (14 checks) holds a transaction open in fire-crab and asks ISQL what
+  is in the file: the row is already on the pages — every statement
+  flushes — so the only thing hiding it is the TIP entry, read by the
+  engine's own code. It does not see the row, and sees it the moment
+  fire-crab commits.
+
+### Fixed
+- **A careful flush must diff against the FILE, not the last thing
+  published.** Found by `qa/serve-real-update.sh` the moment a
+  transaction id was reserved in an install of its own: the header and
+  TIP pages it changed were equal in both halves of the next
+  statement's comparison, so the flush found nothing changed and **they
+  never reached the disk** — leaving records whose transaction id was
+  above the file's `hdr_next_transaction`, 16 record-level errors from
+  `gfix -v -full`, and a sweep that collected nothing. The pool now
+  keeps the image as it stands ON DISK (`SharedImage::flushed`) and
+  every flush diffs against that.
+
 ## 2026-08-05 — One file, one image
 
 ### Converted

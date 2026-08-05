@@ -109,6 +109,99 @@ pub struct VisibleRow {
     pub deltas_applied: u32,
 }
 
+/// The version of one record chain a reader should see, and the image
+/// it decodes from: the newest version whose transaction the reader
+/// COUNTS - committed, or the reader's own uncommitted work - walking
+/// the back-version chain (`rhd_b_page`/`rhd_b_line`) and
+/// reconstructing delta versions (the NEWER version's `rhd_delta` flag
+/// says its prior is stored as differences).
+///
+/// `None` means the reader sees no row here at all: the version it
+/// would see is a deleted stub, or there is no such version (an insert
+/// by a transaction it does not count).
+///
+/// `own` is the reader's OWN transaction, which it must see the
+/// uncommitted work of - a statement reads what the statements before
+/// it in the same transaction wrote. Pass `None` for the pure
+/// committed-only walk (what a tool reading a quiet file wants).
+///
+/// The returned `format` is the FOUND VERSION's, not the chain head's:
+/// an older version can carry an older format, and decoding it with
+/// the head's descriptors reads the wrong bytes.
+pub struct VisibleVersion {
+    pub image: Vec<u8>,
+    pub format: u8,
+    /// chain steps back to it (0 = the primary version)
+    pub walked: u32,
+    pub deltas: u32,
+}
+
+pub fn visible_version(
+    file: &[u8],
+    page_size: usize,
+    head: &crate::data::RecordHeader,
+    tips: &TipChain,
+    own: Option<u64>,
+) -> Option<VisibleVersion> {
+    let fetch_page = |no: u32| {
+        let start = no as usize * page_size;
+        file.get(start..start + page_size)
+            .and_then(DataPage::decode)
+    };
+    let mut current = head.clone();
+    let mut image: Option<Vec<u8>> = if current.flags & flags::DELETED != 0 {
+        None // deleted stubs carry no data
+    } else {
+        crate::data::assembled_image(file, page_size, &current)
+    };
+    let mut walked = 0u32;
+    let mut deltas = 0u32;
+    loop {
+        // THE SYSTEM TRANSACTION IS COMMITTED BY DEFINITION. Its TIP
+        // slot reads `tra_active` in every real database (measured: id
+        // 0's two bits are 0 while 1..n read 3), because it is not a
+        // transaction anybody ever started - the engine answers for it
+        // in code instead (tra.cpp's snapshot-state lookup returns
+        // committed for number 0). The rows that carry it are the ones
+        // only the system transaction may write, `RDB$PAGES` first
+        // among them, so reading it as active would hide the catalog.
+        let counts = current.transaction == 0
+            || tips.state(current.transaction) == Some(TxState::Committed)
+            || own == Some(current.transaction);
+        if counts {
+            if current.flags & flags::DELETED != 0 {
+                return None; // the reader's row is a deleted stub
+            }
+            return Some(VisibleVersion {
+                image: image?,
+                format: current.format,
+                walked,
+                deltas,
+            });
+        }
+        // not counted: step to the back version
+        if current.back_page == 0 {
+            return None; // an insert this reader does not count
+        }
+        let back = fetch_page(current.back_page)?.record(current.back_line)?;
+        // ASSEMBLED. A fragmented BACK version used to end the walk,
+        // dropping the row even when the primary was perfectly
+        // readable - and the delta path below would then have applied
+        // against an image that was never fetched.
+        let back_data = crate::data::assembled_image(file, page_size, &back)?;
+        image = if current.flags & flags::DELTA != 0 {
+            // prior version stored as differences against the CURRENT
+            // image (ods.h:1012)
+            deltas += 1;
+            Some(apply_differences(&back_data, image.as_deref()?)?)
+        } else {
+            Some(back_data)
+        };
+        current = back;
+        walked += 1;
+    }
+}
+
 /// The committed-only visibility walk (the vio.cpp rule a fresh
 /// snapshot reader applies when every interesting transaction is
 /// either committed or not): for each primary record, take the newest
@@ -127,14 +220,12 @@ pub fn visible_rows(
     let recs_per_dp = crate::format::max_recs_per_dp(page_size);
     let mut out = Vec::new();
 
-    let fetch_page = |no: u32| {
-        let start = no as usize * page_size;
-        file.get(start..start + page_size)
-            .and_then(DataPage::decode)
-    };
-
     for dp_no in relation_data_pages(file, page_size, relation) {
-        let Some(dp) = fetch_page(dp_no) else {
+        let start = dp_no as usize * page_size;
+        let Some(dp) = file
+            .get(start..start + page_size)
+            .and_then(DataPage::decode)
+        else {
             continue;
         };
         for r in dp.records() {
@@ -142,74 +233,22 @@ pub fn visible_rows(
             // through their primaries. A FRAGMENT is skipped here for the
             // same reason - it is reached through its head, which carries
             // rhd_incomplete and is NOT filtered out - and the head's
-            // image is assembled below.
+            // image is assembled by the walk below.
             if r.flags & (flags::CHAIN | flags::BLOB | flags::FRAGMENT) != 0 {
                 continue;
             }
             let recno = dp.sequence as u64 * recs_per_dp + r.slot as u64;
-
-            let mut current = r.clone();
-            let mut image: Option<Vec<u8>> = if current.flags & flags::DELETED != 0 {
-                None // deleted stubs carry no data
-            } else {
-                crate::data::assembled_image(file, page_size, &current)
+            // committed-only: a reader with no transaction of its own
+            let Some(v) = visible_version(file, page_size, &r, tips, None) else {
+                continue;
             };
-            let mut walked = 0u32;
-            let mut deltas = 0u32;
-
-            loop {
-                let committed = tips.state(current.transaction) == Some(TxState::Committed);
-                if committed {
-                    if current.flags & flags::DELETED == 0 {
-                        if let Some(img) = image {
-                            out.push(VisibleRow {
-                                recno,
-                                values: decode_record(&img, descs),
-                                image: img,
-                                versions_walked: walked,
-                                deltas_applied: deltas,
-                            });
-                        }
-                    }
-                    break;
-                }
-                // not committed: step to the back version
-                if current.back_page == 0 {
-                    break; // uncommitted insert - no committed version
-                }
-                let Some(bdp) = fetch_page(current.back_page) else {
-                    break;
-                };
-                let Some(back) = bdp.record(current.back_line) else {
-                    break;
-                };
-                // ASSEMBLED. A fragmented BACK version used to `break`
-                // here, dropping the row even when the primary was
-                // perfectly readable - and the delta path below would
-                // then have applied against an image that was never
-                // fetched.
-                let Some(back_data) = crate::data::assembled_image(file, page_size, &back)
-                else {
-                    break;
-                };
-
-                image = if current.flags & flags::DELTA != 0 {
-                    // prior version stored as differences against the
-                    // CURRENT image (ods.h:1012)
-                    deltas += 1;
-                    match image
-                        .as_deref()
-                        .and_then(|img| apply_differences(&back_data, img))
-                    {
-                        Some(prior) => Some(prior),
-                        None => break,
-                    }
-                } else {
-                    Some(back_data)
-                };
-                current = back;
-                walked += 1;
-            }
+            out.push(VisibleRow {
+                recno,
+                values: decode_record(&v.image, descs),
+                image: v.image,
+                versions_walked: v.walked,
+                deltas_applied: v.deltas,
+            });
         }
     }
     out

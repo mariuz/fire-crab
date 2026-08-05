@@ -75,16 +75,11 @@ fn put_u64(file: &mut [u8], at: usize, v: u64) {
     file[at..at + 8].copy_from_slice(&v.to_le_bytes());
 }
 
-/// Allocate a fresh transaction id and mark it committed in the TIP.
-/// The id is `hdr_next_transaction + 1` and the header is advanced to
-/// it - correct whether the field holds the last id assigned or the
-/// next to assign (the allocated id is unused either way, and future
-/// engine transactions start above it).
-pub(crate) fn allocate_committed_tx(file: &mut [u8], page_size: usize) -> Result<u64, String> {
-    let tx = u64::from_le_bytes(file[40..48].try_into().unwrap()) + 1; // hdr_next_transaction @40
-    // find the TIP page holding this transaction's two bits: TIP pages
-    // chain via tip_next; the head is the one no other TIP points to
-    // (the same walk TipChain does, done index-wise so we can mutate)
+/// Where transaction `tx`'s two bits live: the byte index in the file
+/// and the shift within it. TIP pages chain via `tip_next`; the head is
+/// the one no other TIP points to (the same walk `TipChain` does, done
+/// index-wise so the caller can mutate).
+fn tip_bits_at(file: &[u8], page_size: usize, tx: u64) -> Result<(usize, u32), String> {
     let tips: Vec<(usize, u32, u32)> = file
         .chunks_exact(page_size)
         .enumerate()
@@ -113,10 +108,59 @@ pub(crate) fn allocate_committed_tx(file: &mut [u8], page_size: usize) -> Result
         .get(tx as usize / per_page)
         .ok_or("transaction id beyond the TIP chain")?;
     let within = tx as usize % per_page;
-    let byte = tip_idx * page_size + TIP_TRANSACTIONS_OFFSET + within / 4;
-    let shift = 2 * (within % 4);
-    // tra_committed = 3; a fresh slot reads 0 (active), so OR suffices
-    file[byte] |= 3u8 << shift;
+    Ok((
+        tip_idx * page_size + TIP_TRANSACTIONS_OFFSET + within / 4,
+        2 * (within % 4) as u32,
+    ))
+}
+
+/// Put a transaction into a state in the TIP - `tra_active` 0,
+/// `tra_limbo` 1, `tra_dead` 2, `tra_committed` 3 (tra.h:487).
+///
+/// The bits are CLEARED before the new state goes in: a commit follows
+/// an active slot, and OR-ing onto whatever was there is only correct
+/// when the slot reads zero.
+pub fn set_tx_state(
+    file: &mut [u8],
+    page_size: usize,
+    tx: u64,
+    state: crate::tip::TxState,
+) -> Result<(), String> {
+    let (byte, shift) = tip_bits_at(file, page_size, tx)?;
+    let b = file.get_mut(byte).ok_or("TIP byte outside the file")?;
+    *b = (*b & !(0b11 << shift)) | ((state as u8) << shift);
+    Ok(())
+}
+
+/// Reserve a fresh transaction id, leaving it ACTIVE in the TIP - what
+/// a transaction that has begun writing but not committed looks like to
+/// everybody else, which is the whole point: a reader that walks the
+/// versions skips a record written under it and takes the committed one
+/// behind it.
+///
+/// The id is `hdr_next_transaction + 1`, and the header is advanced to
+/// it so nobody else reserves the same one.
+pub fn begin_active_tx(file: &mut [u8], page_size: usize) -> Result<u64, String> {
+    let tx = u64::from_le_bytes(file[40..48].try_into().unwrap()) + 1;
+    // it must EXIST in the chain before the header claims it
+    set_tx_state(file, page_size, tx, crate::tip::TxState::Active)?;
+    put_u64(file, 40, tx);
+    Ok(tx)
+}
+
+/// Allocate a fresh transaction id and mark it committed in the TIP.
+/// The id is `hdr_next_transaction + 1` and the header is advanced to
+/// it - correct whether the field holds the last id assigned or the
+/// next to assign (the allocated id is unused either way, and future
+/// engine transactions start above it).
+///
+/// This is the SETTLED write's allocation - a catalog row, a generator
+/// page, anything whose visibility is not the transaction's to decide.
+/// A user-table write in an open transaction takes [begin_active_tx]
+/// instead and is committed at COMMIT.
+pub(crate) fn allocate_committed_tx(file: &mut [u8], page_size: usize) -> Result<u64, String> {
+    let tx = u64::from_le_bytes(file[40..48].try_into().unwrap()) + 1; // hdr_next_transaction @40
+    set_tx_state(file, page_size, tx, crate::tip::TxState::Committed)?;
     put_u64(file, 40, tx);
     Ok(tx)
 }
@@ -324,6 +368,25 @@ pub fn insert_record(
         return Err("record larger than a page".into());
     }
     insert_record_as(file, page_size, rel, format_no, image, None)
+}
+
+/// [insert_record] under a transaction the CALLER owns - the wire
+/// server's open transaction, still active in the TIP, so the row is
+/// invisible to everybody else until that transaction commits.
+pub fn insert_record_under(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    rel: u16,
+    format_no: u8,
+    image: &[u8],
+    tx: u32,
+) -> Result<InsertOutcome, String> {
+    if u64::from(u16::try_from(RHD_DATA_OFFSET + image.len()).map_err(|_| "record too large")?)
+        > page_size as u64
+    {
+        return Err("record larger than a page".into());
+    }
+    insert_record_as(file, page_size, rel, format_no, image, Some(tx))
 }
 
 /// [insert_record] under the SYSTEM transaction (id 0, no TIP work):
@@ -792,6 +855,9 @@ pub fn delete_records(
     rel: u16,
     targets: &[(u32, u16)],
 ) -> Result<DmlOutcome, String> {
+    // the empty check comes FIRST: a statement that deletes nothing
+    // burns no transaction id (a unit test holds this - it is what
+    // makes `DELETE ... WHERE <no match>` free)
     if targets.is_empty() {
         return Ok(DmlOutcome { tx_id: 0, affected: 0 });
     }
@@ -799,12 +865,30 @@ pub fn delete_records(
     if tx > u32::MAX as u64 {
         return Err("64-bit transaction ids (rhde) not supported yet".into());
     }
+    delete_records_under(file, page_size, rel, targets, tx as u32)
+}
+
+/// [delete_records] under a transaction the CALLER owns and will
+/// commit later - the wire server's open transaction. The stub is
+/// written the same way; what changes is that a reader who does not
+/// count that transaction walks past the stub to the version behind
+/// it and still sees the row.
+pub fn delete_records_under(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    rel: u16,
+    targets: &[(u32, u16)],
+    tx: u32,
+) -> Result<DmlOutcome, String> {
+    if targets.is_empty() {
+        return Ok(DmlOutcome { tx_id: 0, affected: 0 });
+    }
     for (page_no, slot) in targets {
         let (b_page, b_line, format) = push_back_version(file, page_size, rel, *page_no, *slot)?;
-        let stub = rhd_bytes(tx as u32, b_page, b_line, flags::DELETED, format, &[]);
+        let stub = rhd_bytes(tx, b_page, b_line, flags::DELETED, format, &[]);
         rewrite_primary(file, page_size, *page_no, *slot, &stub)?;
     }
-    Ok(DmlOutcome { tx_id: tx, affected: targets.len() })
+    Ok(DmlOutcome { tx_id: tx as u64, affected: targets.len() })
 }
 
 #[cfg(test)]
@@ -844,6 +928,55 @@ mod tests {
         put_u16(&mut f, d + 24, off as u16);
         put_u16(&mut f, d + 26, 20);
         f
+    }
+
+    /// AN OPEN TRANSACTION LOOKS DIFFERENT IN THE FILE, which is the
+    /// whole reason for it: its records are on the pages and its slot
+    /// in the TIP reads `tra_active`, so a reader that walks the
+    /// versions skips them until the commit flips the bits.
+    #[test]
+    fn a_transaction_is_active_until_it_is_committed() {
+        let ps = 4096;
+        let mut f = scratch_file(ps);
+        let tx = begin_active_tx(&mut f, ps).unwrap();
+        assert_eq!(tx, 11);
+        assert_eq!(u64::from_le_bytes(f[40..48].try_into().unwrap()), 11); // header claimed it
+        let bits = |f: &[u8], id: usize| (f[ps + TIP_TRANSACTIONS_OFFSET + id / 4] >> (2 * (id % 4))) & 3;
+        assert_eq!(bits(&f, 11), 0, "tra_active");
+
+        let image = vec![0u8, 7, 7, 7, 1, 2, 3, 4];
+        let out = insert_record_under(&mut f, ps, 42, 1, &image, tx as u32).unwrap();
+        assert_eq!(out.tx_id, 11, "the row carries the OPEN transaction");
+        assert_eq!(bits(&f, 11), 0, "and writing did not commit it");
+        let dp = DataPage::decode(&f[ps * 3..ps * 4]).unwrap();
+        assert_eq!(dp.record(1).unwrap().transaction, 11);
+
+        // commit: the same slot, the same row, two bits later
+        set_tx_state(&mut f, ps, tx, crate::tip::TxState::Committed).unwrap();
+        assert_eq!(bits(&f, 11), 3, "tra_committed");
+        // and a rollback is a state too - the bits are CLEARED first,
+        // so 3 -> 2 works and does not read as committed-or-dead
+        set_tx_state(&mut f, ps, tx, crate::tip::TxState::Dead).unwrap();
+        assert_eq!(bits(&f, 11), 2, "tra_dead");
+    }
+
+    /// A statement-owned delete writes the same stub as the settled
+    /// one; what differs is whose transaction it carries.
+    #[test]
+    fn a_delete_can_carry_an_open_transaction() {
+        let ps = 4096;
+        let mut f = scratch_file(ps);
+        let image = vec![0u8, 7, 7, 7, 9, 9];
+        let ins = insert_record(&mut f, ps, 42, 1, &image).unwrap();
+        let tx = begin_active_tx(&mut f, ps).unwrap();
+        let out = delete_records_under(&mut f, ps, 42, &[(ins.page_no, ins.slot)], tx as u32).unwrap();
+        assert_eq!(out.affected, 1);
+        let dp = DataPage::decode(&f[ps * 3..ps * 4]).unwrap();
+        let stub = dp.record(ins.slot).unwrap();
+        assert!(stub.flags & flags::DELETED != 0);
+        assert_eq!(stub.transaction, tx);
+        let byte = ps + TIP_TRANSACTIONS_OFFSET + (tx as usize) / 4;
+        assert_eq!((f[byte] >> (2 * (tx as usize % 4))) & 3, 0, "still active");
     }
 
     #[test]

@@ -32,13 +32,14 @@
 #     and coarse - W4 (`lck`) is what makes it row-granular, and it now
 #     has a shared resource to arbitrate, which is what it was waiting
 #     for.
-#   * AN UNCOMMITTED ROW IS VISIBLE to other attachments. fire-crab
-#     marks a write's transaction COMMITTED in the TIP as it writes it
-#     and undoes a rollback by restoring an image snapshot, so there is
-#     no "in flight" state for a reader to skip. While the image was
-#     private this could not be seen from outside; sharing it exposes
-#     it. The fix is real transaction state (deferring the TIP commit),
-#     not more locking.
+#   * ...but AN UNCOMMITTED ROW IS ALREADY INVISIBLE, as on the engine.
+#     A transaction reserves ONE id at its first write, leaves it
+#     `tra_active` in the TIP while it writes, and flips it to
+#     `tra_committed` at COMMIT; every record walk reads through
+#     `fire_crab_ods::tra`'s version chain and takes the newest version
+#     whose transaction it counts - committed, or its own. So blocking
+#     GRANULARITY is all that is left of the divergence, which is
+#     exactly what `lck` is for.
 #
 # THE ENGINE'S SIDE OF EVERY CHECK IS ASSERTED TOO, and that is the point
 # of the file: the divergences are only meaningful against a target that
@@ -222,17 +223,49 @@ val=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 check "fc: and gfix finds nothing wrong with the result" \
       "$(printf '%s' "$val" | tr -d ' \n')" ""
 
-# --- 3. THE TWO DIVERGENCES THAT ARE LEFT ------------------------------
+# --- 3. THE HALF THAT MATCHES, AND THE HALF THAT DOES NOT --------------
 # Written as the value fire-crab GIVES with the engine's named in the
 # label, so the day either changes this gate says so.
 make_db "$A" || { echo "FAIL scratch crab db"; exit 1; }
 fc_hold=$(FC_PORT="$PORT" FC_DB="$A" timeout 90 node -e "$HOLD" 2>/dev/null)
-# W4 DIVERGENCE: the engine answers "0|fast" - it hides an uncommitted
-# row (real transaction state) and blocks only on a CONFLICTING row
-# (row-granular locking). fire-crab has neither yet: no in-flight state,
-# and one write side per database.
-check "fc: an uncommitted row is visible and an unrelated writer waits (engine: 0|fast)" \
-      "$fc_hold" "1|waited"
+# FIRST FIELD: the engine's own answer. The row is on the page already,
+# and invisible, because the transaction that wrote it is still
+# `tra_active` in the TIP and the reader walks past its version to the
+# one behind it (or finds none, as here).
+# SECOND FIELD: W4's remaining work. The engine blocks a second writer
+# only on a CONFLICTING row; this holds one write side per DATABASE, so
+# an unrelated writer waits for the commit.
+check "fc: an uncommitted row is invisible, but an unrelated writer still waits (engine: 0|fast)" \
+      "$fc_hold" "0|waited"
+
+# --- 3b. THE ENGINE READS THE OPEN TRANSACTION -------------------------
+# The check above is fire-crab agreeing with itself. This one asks the
+# ENGINE what is in the file while fire-crab holds a transaction open:
+# the row is already ON THE PAGES (every statement flushes), so what
+# hides it is the TIP entry alone - and the engine reads that TIP with
+# its own code. If the state fire-crab writes were not the state the
+# engine understands, this is where it shows.
+make_db "$A" || { echo "FAIL scratch crab db"; exit 1; }
+engine_count() { # what the ENGINE finds in the file right now
+    printf 'SET HEADING OFF;\nSELECT COUNT(*) FROM W WHERE ID = 42;\n' |
+        "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>/dev/null | tr -d ' \n'
+}
+FC_PORT="$PORT" FC_DB="$A" timeout 60 node -e '
+const F=require("node-firebird");
+const Q=String.fromCharCode(39);
+const o={host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
+         user:"SYSDBA",password:"masterkey"};
+F.attach(o,(e,d)=>{ if(e){process.exit(1);}
+  d.transaction(F.ISOLATION_READ_COMMITTED,(e2,t)=>{ if(e2){process.exit(1);}
+    t.query("INSERT INTO W VALUES (42, "+Q+"A"+Q+")",()=>{
+      // hold it open, then commit
+      setTimeout(()=>t.commit(()=>process.exit(0)), 4000); }); }); });' \
+  >/dev/null 2>&1 &
+holder=$!
+sleep 2
+check "the ENGINE does not see fire-crab's uncommitted row" "$(engine_count "$A")" "0"
+wait $holder 2>/dev/null
+check "...and sees it the moment fire-crab commits" "$(engine_count "$A")" "1"
 
 # --- 4. THE ORACLE'S OWN TEETH -----------------------------------------
 # A gate that cannot fail is a source of false confidence. Sections 1

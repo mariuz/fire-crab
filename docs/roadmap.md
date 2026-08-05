@@ -16,7 +16,7 @@ matters more than the row count:
 |---|---|---|
 | **done** | on-disk structures, record decode + RLE, PIP, pointer/data pages, B-tree decode, TIP/MVCC, GC/sweep, BLR decode | converted and held against an oracle; the server depends on them |
 | **converted, wired** | `ods`, `blb`, `auth`, `svc`, `exe`, `dsql` | the running server links and uses them |
-| **converted, NOT wired** | `lck`, `evt` | a real conversion of a real law, with a gate — that the server never calls. `lck` is UNBLOCKED now: attachments share one page image per file, so there is a resource to arbitrate — what it would make row-granular is a database-wide write side (W4) |
+| **converted, NOT wired** | `lck`, `evt` | a real conversion of a real law, with a gate — that the server never calls. `lck` is UNBLOCKED now: attachments share one page image per file and a transaction's records stay invisible until it commits, so there is both a resource to arbitrate and a conflict to detect — what `lck` adds is GRANULARITY, in place of one write side per database (W4) |
 | **being wired** | `opt`, `cch`, `pio` | the server asks `opt` for the access path and takes an index when it says so (W1); the pages of a file live once per process in `cch`'s buffer pool and are flushed in its careful write order (W2), and written with `pio`, in the open mode the header's Forced Writes flag calls for (W3) |
 
 That third row was the honest headline, and W1 has begun on it.
@@ -2226,33 +2226,79 @@ plus *the subsystem is now on the path*.
   **The buffer pool (W2) is that resource, and it is in.** What the same
   probes answer now:
 
-  | probe | engine | fire-crab, before | fire-crab, now |
-  |---|---|---|---|
-  | writer sees its own write | 555 | 555 | 555 |
-  | an attachment opened BEFORE the commit | 555 | **100** — frozen at attach | 555 |
-  | one opened AFTER | 555 | 555 | 555 |
-  | the engine reading the file | 555 | 555 — durable and correctly on disk | 555 |
-  | 20 concurrent inserts, 10 per attachment | all 20 rows | **10** — one image overwrote the other | all 20 rows |
-  | `gfix -v -full` on the result | clean | clean (that is what made it silent) | clean |
-  | an uncommitted row, read from another attachment | invisible | invisible — nothing was shared | **visible** |
-  | a second writer, on an UNRELATED row | does not block | did not block | **waits** |
+  | probe | engine | before the pool | with the pool | with transaction state |
+  |---|---|---|---|---|
+  | writer sees its own write | 555 | 555 | 555 | 555 |
+  | an attachment opened BEFORE the commit | 555 | **100** — frozen at attach | 555 | 555 |
+  | one opened AFTER | 555 | 555 | 555 | 555 |
+  | the engine reading the file | 555 | 555 — durable and correctly on disk | 555 | 555 |
+  | 20 concurrent inserts, 10 per attachment | all 20 rows | **10** — one image overwrote the other | all 20 rows | all 20 rows |
+  | `gfix -v -full` on the result | clean | clean (that is what made it silent) | clean | clean |
+  | an uncommitted row, read from another attachment | invisible | invisible — nothing was shared | **visible** | invisible |
+  | a second writer, on an UNRELATED row | does not block | did not block | **waits** | **waits** |
 
-  The last two rows are W4's actual work, and both are now *measured*
-  rather than assumed. fire-crab serializes writers on the DATABASE (the
-  write side is held from a transaction's first write to its commit,
-  because rollback here restores a whole-image snapshot); the engine
-  blocks only on a conflicting ROW, through `lck` plus the record's
-  transaction state. Correct and coarse is the honest step from silently
-  wrong.
+  **The second-to-last row closed with real transaction state**, which
+  is the half of W4 that is not locking at all. A transaction reserves
+  one id at its first write and leaves it `tra_active` in the TIP;
+  COMMIT is the two bits that flip it; every record walk goes through
+  `fire_crab_ods::tra::visible_version` and takes the newest version
+  whose transaction it counts — committed, its own, or the system
+  transaction (id 0, whose slot reads active in every real database
+  because the engine answers for it in code). That wired `tra`, which
+  had been converted and gated since the MVCC increment with nothing
+  calling it.
 
-  So W4 is: enqueue a lock per record (or per relation) instead of one
-  per database, and refuse or wait per the TPB rather than always
-  waiting. Its other half is **not locking at all** — an uncommitted row
-  is visible because this server marks a write's transaction committed
-  in the TIP as it writes it, so there is no in-flight state for a
-  reader to skip. Deferring that commit is what makes the row invisible,
-  and it is a prerequisite for row locks meaning what they mean on the
-  engine.
+  Two rules came with it, both the engine's: a connection that detaches
+  with work uncommitted has its transaction marked `tra_dead` rather
+  than left open for good, and the system transaction (id 0) counts as
+  committed although its TIP slot reads active. And one bug came out of
+  it — reserving the id in an install of its own exposed that a careful
+  flush was diffing against the last image PUBLISHED rather than the one
+  on DISK, so pages changed by an install that was not itself flushed
+  never reached the file. `qa/serve-real-update.sh` caught it as 16
+  record-level errors from `gfix -v -full`; the pool now keeps the
+  on-disk image as the flush baseline.
+
+  **What is left is granularity.** fire-crab serializes writers on the
+  DATABASE — the write side is held from a transaction's first write to
+  its commit, because rollback here restores a whole-image snapshot —
+  where the engine blocks only on a CONFLICTING row, through `lck` plus
+  the record's transaction state.
+
+  **And the reason the write side is held that long is the rollback, not
+  the locking.** That is the dependency worth writing down before
+  anything is enqueued, because `lck` is not the first step:
+
+  1. **Rollback by STATE, not by image.** A transaction-level ROLLBACK
+     restores the image the transaction started from — which is only
+     safe while nobody else can have committed inside that window,
+     which is why the write side is held to the commit. With real
+     transaction state that restore is no longer needed for RECORDS:
+     `tra_dead` says the same thing, and stale index entries and
+     leaked pages are what the engine itself leaves behind (the
+     "candidates, not answers" rule already makes a stale entry
+     harmless). What still needs an image is a SAVEPOINT — one
+     transaction id cannot say "undo the last three statements" — so
+     the transaction-scoped write side survives exactly as long as a
+     mark is open, and no longer.
+  2. **A statement-scoped write side.** Once (1) lands, the exclusive
+     window shrinks to the read-modify-write of one statement, so two
+     transactions can be open and writing at once. That alone turns the
+     gate's last divergence — an unrelated writer WAITS where the
+     engine is fast — into the engine's answer.
+  3. **Then the conflict, and then `lck`.** Two transactions writing at
+     once can now touch the SAME row, which the engine refuses or
+     blocks. The detection is already in place: a DML target whose
+     chain head belongs to a transaction that is still `tra_active` is
+     the conflict. `lck` is what turns that into the engine's
+     behaviour rather than an ad-hoc check — `enqueue` per record with
+     the TPB's wait/no-wait, `Verdict::Deadlock` from its wait-for
+     scan, `purge_owner` when an attachment goes. Its table is
+     `&mut self` and in-process, so the server wraps one per database.
+
+  Written this way round because the tempting order — enqueue first —
+  would produce locks that arbitrate a resource nothing else can reach
+  during a transaction, and every single-session gate would pass.
 - **W5 — event delivery** (`evt`): the shared-memory arena, the watcher,
   and the wire path.
 - **W6 — depth in `exe` and `svc`**: the request lifecycle, cursors and

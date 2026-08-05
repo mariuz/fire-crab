@@ -509,6 +509,12 @@ struct Database {
     /// dropping it (including when the connection thread ends) lets the
     /// next writer in
     write: Option<fire_crab_cch::pool::WriteToken>,
+    /// this transaction's id, reserved ACTIVE in the TIP at its first
+    /// write and flipped to committed at COMMIT - what makes its rows
+    /// invisible to everybody else until then. `None` before the first
+    /// write of a transaction, which is why a reader that has not
+    /// written counts only committed work.
+    tx: Option<u32>,
     page_size: usize,
     /// where the bytes came from - an INSERT flushes back here
     path: String,
@@ -549,6 +555,15 @@ impl Database {
     /// write side is held, or two writers clone the same base and the
     /// second install silently drops the first's rows.
     fn work_copy(&mut self) -> Result<Vec<u8>, String> {
+        self.take_write_side()?;
+        Ok(self.bytes().as_ref().clone())
+    }
+
+    /// Take the database's write side if this transaction has not
+    /// already. Separate from [Database::work_copy] because a caller
+    /// that only needs the SIDE - reserving the transaction id, say -
+    /// should not clone a whole database image to get it.
+    fn take_write_side(&mut self) -> Result<(), String> {
         if self.write.is_none() {
             self.write = Some(
                 self.shared
@@ -556,13 +571,71 @@ impl Database {
                     .ok_or("lock conflict: another attachment is writing this database")?,
             );
         }
-        Ok(self.bytes().as_ref().clone())
+        Ok(())
     }
 
-    /// Install an edited image. Only ever called with the write side
-    /// held, from [Database::work_copy]'s copy.
+    /// A working copy plus the transaction its records will carry,
+    /// reserving one IN THAT COPY when this is the transaction's first
+    /// write. It stays ACTIVE in the TIP until COMMIT.
+    ///
+    /// The reservation rides in the statement's own copy rather than an
+    /// install of its own - one clone of the image per statement, not
+    /// two - and this attachment only ADOPTS the id once the statement
+    /// installs its work ([Database::adopt_tx]). A statement that fails
+    /// therefore burns nothing: its copy is dropped, the header still
+    /// reads what it read, and the next write reserves the same number.
+    ///
+    /// Nobody else can reserve it in between, because the write side is
+    /// held from here to the commit.
+    ///
+    /// Only RECORD writes ask for this. A generator write, or a DDL
+    /// statement whose catalog rows are settled as they are written,
+    /// takes [Database::work_copy] alone and burns no transaction -
+    /// otherwise a rolled-back statement's generator flush would leave
+    /// an active transaction in the file that nothing wrote a row under.
+    fn work_copy_with_tx(&mut self) -> Result<(Vec<u8>, u32), String> {
+        let mut work = self.work_copy()?;
+        if let Some(tx) = self.tx {
+            return Ok((work, tx));
+        }
+        let tx = fire_crab_ods::dml::begin_active_tx(&mut work, self.page_size)?;
+        if tx > u32::MAX as u64 {
+            return Err("64-bit transaction ids (rhde) not supported yet".into());
+        }
+        Ok((work, tx as u32))
+    }
+
+    /// The statement installed its work, so the id it reserved is now
+    /// this attachment's transaction - held until commit or rollback.
+    fn adopt_tx(&mut self, tx: u32) {
+        self.tx = Some(tx);
+    }
+
+    /// Install an edited image, leaving its changed pages DIRTY - on
+    /// the shared image, not yet on the file. The next flush writes
+    /// them, because a careful flush diffs against what is on disk and
+    /// not against the last thing published.
     fn install(&mut self, bytes: Vec<u8>) {
         self.shared.publish(bytes);
+    }
+
+    /// Install an image the caller has just written to the file WHOLE,
+    /// so nothing about it is dirty any more.
+    fn install_flushed(&mut self, bytes: Vec<u8>) {
+        let arc = self.shared.publish(bytes);
+        self.shared.note_flushed(arc);
+        self.note_disk();
+    }
+
+    /// Flush the changed pages of `work` in the engine's precedence
+    /// order and install it. The baseline is the image ON DISK: an
+    /// earlier install that was never flushed - the transaction id's
+    /// own reservation, for one - left its pages dirty, and diffing
+    /// against the current image would drop them silently.
+    fn flush_and_install(&mut self, work: Vec<u8>) -> Result<(), String> {
+        flush_careful(&self.path, &self.shared.flushed(), &work, self.page_size)?;
+        self.install_flushed(work);
+        Ok(())
     }
 
     /// Whether this connection has written in the current transaction -
@@ -577,6 +650,60 @@ impl Database {
     /// in.
     fn end_write(&mut self) {
         self.write = None;
+        self.tx = None;
+    }
+
+    /// COMMIT: flip this transaction's TIP bits to `tra_committed`, so
+    /// every other attachment starts counting its rows. This is the
+    /// whole of a commit in this server - the records are already on
+    /// the pages, and were the moment each statement ran; what the
+    /// commit publishes is the two bits that say they are real.
+    fn commit_tx(&mut self) -> Result<(), String> {
+        let Some(tx) = self.tx else { return Ok(()) };
+        let mut work = self.bytes().as_ref().clone();
+        fire_crab_ods::dml::set_tx_state(
+            &mut work,
+            self.page_size,
+            tx as u64,
+            fire_crab_ods::tip::TxState::Committed,
+        )?;
+        self.flush_and_install(work)?;
+        Ok(())
+    }
+
+    /// ROLLBACK, when there is no image snapshot to put back: mark the
+    /// transaction `tra_dead`, which is how the engine ends one it will
+    /// not honour. The rows stay on the pages and stop counting - a
+    /// reader walks past them to the version behind, exactly as it does
+    /// for an active one.
+    fn kill_tx(&mut self) -> Result<(), String> {
+        let Some(tx) = self.tx else { return Ok(()) };
+        let mut work = self.bytes().as_ref().clone();
+        fire_crab_ods::dml::set_tx_state(
+            &mut work,
+            self.page_size,
+            tx as u64,
+            fire_crab_ods::tip::TxState::Dead,
+        )?;
+        self.flush_and_install(work)?;
+        Ok(())
+    }
+
+    /// After an image was restored over this transaction's work: the
+    /// restored header may predate the id this attachment reserved, and
+    /// writing more records under a number the file has not handed out
+    /// leaves rows from the future. When that is what happened, the
+    /// transaction is forgotten and the next write reserves a new one.
+    fn retune_tx(&mut self) {
+        let Some(tx) = self.tx else { return };
+        let image = self.bytes();
+        let next = image
+            .get(40..48)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+            .unwrap_or(0);
+        if next < tx as u64 {
+            self.tx = None;
+        }
     }
 
     /// Record the file as the server just wrote it, so the pool does
@@ -760,8 +887,7 @@ fn write_gen_window(db: &mut Database, w: &GenWindow) {
     }
     if moved {
         let _ = std::fs::write(&db.path, &work);
-        db.install(work);
-        db.note_disk();
+        db.install_flushed(work);
     }
 }
 
@@ -796,6 +922,7 @@ fn load_database(path: &str) -> Option<Database> {
     Some(Database {
         shared,
         write: None,
+        tx: None,
         page_size,
         path: p.to_string(),
         ods_major: h.ods_major(),
@@ -12227,6 +12354,7 @@ fn dml_targets_at(
     }
     // sequence -> page number, by LOOKUP: see `records_at_in`
     let db_image = db.bytes();
+    let view = ReadView::of(db, &db_image);
     let pages: std::collections::HashMap<u32, u32> =
         relation_data_pages(&db_image, db.page_size, rel)
             .into_iter()
@@ -12286,18 +12414,18 @@ fn dml_targets_at(
         // record - which is worse than missing one, because the wrong
         // row can satisfy the predicate and be written or returned.
         let Some(r) = dp.record(slot) else { continue };
-        if !r.is_primary_record() {
-            continue;
-        }
-        let Some(image) = fire_crab_ods::data::assembled_image(&db_image, db.page_size, &r) else { continue };
+        // A WRITE READS FIRST, and it reads what this transaction sees:
+        // rows another attachment has written but not committed are not
+        // this statement's to update or delete.
+        let Some((image, format)) = view.version(&db_image, db.page_size, &r) else { continue };
         let descs = formats
             .iter()
-            .find(|(n, _)| *n == r.format)
+            .find(|(n, _)| *n == format)
             .or_else(|| formats.iter().max_by_key(|(n, _)| *n));
         let Some((_, descs)) = descs else { continue };
         let values = decode_record(&image, descs);
         if filter.as_ref().map_or(Ok(true), |p| p.matches(&values))? {
-            out.push((recno, dp_no, r.slot, r.format, image));
+            out.push((recno, dp_no, r.slot, format, image));
         }
     }
     sort_targets_recno(&mut out);
@@ -12482,6 +12610,7 @@ fn collect_dml_targets_drawing(
     let mut last = None;
     let mut out = Vec::new();
     let db_image = db.bytes();
+    let view = ReadView::of(db, &db_image);
     for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
         let start = dp_no as usize * db.page_size;
         let Some(dp) = db_image
@@ -12491,13 +12620,12 @@ fn collect_dml_targets_drawing(
             continue;
         };
         for r in dp.records() {
-            if !r.is_primary_record() {
+            let Some((image, format)) = view.version(&db_image, db.page_size, &r) else {
                 continue;
-            }
-            let Some(image) = fire_crab_ods::data::assembled_image(&db_image, db.page_size, &r) else { continue };
+            };
             let descs = formats
                 .iter()
-                .find(|(n, _)| *n == r.format)
+                .find(|(n, _)| *n == format)
                 .or_else(|| formats.iter().max_by_key(|(n, _)| *n));
             let Some((_, descs)) = descs else { continue };
             let values = decode_record(&image, descs);
@@ -12510,7 +12638,7 @@ fn collect_dml_targets_drawing(
                 _ => false,
             };
             if keep {
-                out.push((dp_no, r.slot, r.format, image));
+                out.push((dp_no, r.slot, format, image));
             }
         }
     }
@@ -12534,6 +12662,7 @@ fn collect_dml_targets(
     }
     let mut out = Vec::new();
     let db_image = db.bytes();
+    let view = ReadView::of(db, &db_image);
     for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
         let start = dp_no as usize * db.page_size;
         let Some(dp) = db_image
@@ -12543,20 +12672,19 @@ fn collect_dml_targets(
             continue;
         };
         for r in dp.records() {
-            if !r.is_primary_record() {
+            let Some((image, format)) = view.version(&db_image, db.page_size, &r) else {
                 continue;
-            }
-            let Some(image) = fire_crab_ods::data::assembled_image(&db_image, db.page_size, &r) else { continue };
+            };
             let descs = formats
                 .iter()
-                .find(|(n, _)| *n == r.format)
+                .find(|(n, _)| *n == format)
                 .or_else(|| formats.iter().max_by_key(|(n, _)| *n));
             let Some((_, descs)) = descs else { continue };
             let values = decode_record(&image, descs);
             // a WHERE eval error (divide by zero) aborts the DML like
             // the engine's - never a partial row set
             if filter.as_ref().map_or(Ok(true), |p| p.matches(&values))? {
-                out.push((dp_no, r.slot, r.format, image));
+                out.push((dp_no, r.slot, format, image));
             }
         }
     }
@@ -12690,7 +12818,20 @@ fn execute_dml_collecting_inner(
     // image, and the second one silently drops the first's rows. The
     // token is recursive (a row-by-row statement re-enters here) and is
     // held until this transaction commits or rolls back.
-    let mut work = db.work_copy()?;
+    // Every RECORD this statement writes carries the TRANSACTION'S id,
+    // not one of its own, and that id is still ACTIVE in the TIP: the
+    // rows are on the pages immediately and count for nobody else until
+    // COMMIT flips the bits. DDL is the exception - a catalog row is
+    // written under a settled transaction of its own, because this
+    // server's DDL is not transactional - so only the three verbs ask,
+    // and only they burn an id.
+    let (mut work, stmt_tx) = match plan {
+        Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. } => {
+            let (w, tx) = db.work_copy_with_tx()?;
+            (w, Some(tx))
+        }
+        _ => (db.work_copy()?, None),
+    };
     let counts = match plan {
         Plan::CreateTable { name, cols, constraints, fks, relation_type } => {
             fire_crab_ods::ddl::create_table(
@@ -13102,8 +13243,9 @@ fn execute_dml_collecting_inner(
                 a.descs = descs.clone();
                 a.images.push(image.clone());
             }
-            let out =
-                fire_crab_ods::insert_record(&mut work, db.page_size, *rel, *format_no, image)?;
+            let out = fire_crab_ods::insert_record_under(
+                &mut work, db.page_size, *rel, *format_no, image, dml_tx(stmt_tx)?,
+            )?;
             if !index_ops.is_empty() {
                 let recno = recno_of(&work, db.page_size, out.page_no, out.slot)?;
                 let values = decode_record(image, descs);
@@ -13115,7 +13257,7 @@ fn execute_dml_collecting_inner(
                     // (btr.cpp:5629 key_all_nulls) - and a key held only
                     // by entries whose records are GONE is not taken
                     insert_entry_verified(
-                        &mut work, db.page_size, *rel, op, &key, recno, all_null,
+                        &mut work, db.page_size, *rel, op, &key, recno, all_null, stmt_tx,
                     )
                     .map_err(|e| entry_err_to_exec(db, table, op, &values, e))?;
                 }
@@ -13367,7 +13509,7 @@ fn execute_dml_collecting_inner(
             // rollback is unchanged: `work` is discarded on Err.
             let affected = targets.len();
             if !targets.is_empty() {
-                let tx = fire_crab_ods::begin_committed_tx(&mut work, db.page_size)?;
+                let tx = dml_tx(stmt_tx)?;
                 for ((page, slot, new_img), old_img) in targets.iter().zip(&old_images) {
                     fire_crab_ods::update_record_under(
                         &mut work, db.page_size, *rel, tx, *page, *slot, new_img, *format_no,
@@ -13388,6 +13530,7 @@ fn execute_dml_collecting_inner(
                             if new_key != old_key {
                                 insert_entry_verified(
                                     &mut work, db.page_size, *rel, op, &new_key, recno, all_null,
+                                    stmt_tx,
                                 )
                                 .map_err(|e| {
                                     entry_err_to_exec(db, table, op, &new_values, e)
@@ -13444,7 +13587,9 @@ fn execute_dml_collecting_inner(
                 }
                 targets.push((page, slot));
             }
-            let out = fire_crab_ods::delete_records(&mut work, db.page_size, *rel, &targets)?;
+            let out = fire_crab_ods::delete_records_under(
+                &mut work, db.page_size, *rel, &targets, dml_tx(stmt_tx)?,
+            )?;
             (0, 0, out.affected as i32)
         }
         Plan::SetGenerator { name, mode, .. } => {
@@ -13465,9 +13610,13 @@ fn execute_dml_collecting_inner(
         }
         _ => return Err("not a DML plan".into()),
     };
-    flush_careful(&db.path, &db.bytes(), &work, db.page_size)?;
-    db.install(work);
-    db.note_disk();
+    db.flush_and_install(work)?;
+    // the statement's work is installed, so the id it reserved is this
+    // attachment's transaction now - and a statement that failed above
+    // never got here, which is exactly the point
+    if let Some(tx) = stmt_tx {
+        db.adopt_tx(tx);
+    }
     Ok(counts)
 }
 
@@ -14333,6 +14482,7 @@ fn insert_entry_verified(
     key: &[u8],
     recno: u64,
     all_null: bool,
+    own: Option<u32>,
 ) -> Result<(), EntryErr> {
     let enforce = op.unique && !all_null;
     match fire_crab_ods::btw::insert_index_entry(
@@ -14348,7 +14498,7 @@ fn insert_entry_verified(
             // format, and decoding it with the newest one is how a
             // verification becomes a second bug
             let formats = fire_crab_ods::relation_formats(work, page_size, rel);
-            if !unique_conflict(work, page_size, rel, op, &formats, key, recno) {
+            if !unique_conflict(work, page_size, rel, op, &formats, key, recno, own) {
                 // every entry holding this key names a record that is
                 // gone, or no longer carries it
                 fire_crab_ods::btw::insert_index_entry(
@@ -14518,6 +14668,7 @@ fn unique_conflict(
     formats: &[(u8, Vec<Descriptor>)],
     key: &[u8],
     recno: u64,
+    own: Option<u32>,
 ) -> bool {
     let Some(candidates) =
         fire_crab_ods::btr::lookup_key(work, page_size, rel, op.id, key, op.descending)
@@ -14534,7 +14685,11 @@ fn unique_conflict(
     if others.is_empty() {
         return false;
     }
-    records_at_in(work, page_size, rel, formats, &others)
+    // THE WRITER'S OWN VIEW: its uncommitted rows count (this statement
+    // may have written them), and a row left behind by a transaction
+    // that never committed does not.
+    let view = ReadView::over(work, page_size, own);
+    records_at_in(work, page_size, rel, formats, &others, &view)
         .iter()
         .any(|values| op.key_for(values).is_some_and(|(k, _)| k == key))
 }
@@ -20586,7 +20741,8 @@ fn records_at(
     formats: &[(u8, Vec<Descriptor>)],
     recnos: &[u64],
 ) -> Vec<Vec<Value>> {
-    records_at_in(&db.bytes(), db.page_size, rel, formats, recnos)
+    let image = db.bytes();
+    records_at_in(&image, db.page_size, rel, formats, recnos, &ReadView::of(db, &image))
 }
 
 /// The records a PICK's candidates name, with every candidate whose
@@ -20654,7 +20810,9 @@ fn records_for(
     if per_page == 0 {
         return out;
     }
-    let pages = page_sequence_map(&db.bytes(), db.page_size, rel);
+    let image = db.bytes();
+    let view = ReadView::of(db, &image);
+    let pages = page_sequence_map(&image, db.page_size, rel);
     // a SET, not a Vec scanned linearly: the dedup is consulted once per
     // candidate, so `contains` on a Vec makes the acceptance loop
     // quadratic in the candidate count
@@ -20664,7 +20822,7 @@ fn records_for(
             continue;
         }
         for values in
-            records_at_in_with(&db.bytes(), db.page_size, formats, &pages, per_page, &[recno])
+            records_at_in_with(&image, db.page_size, formats, &pages, per_page, &[recno], &view)
         {
             if !verify || pick.entry_is_current(&entry_key, &values) {
                 seen.insert(recno);
@@ -20726,13 +20884,99 @@ fn records_at_in(
     rel: u16,
     formats: &[(u8, Vec<Descriptor>)],
     recnos: &[u64],
+    view: &ReadView,
 ) -> Vec<Vec<Value>> {
     let per_page = fire_crab_ods::format::max_recs_per_dp(page_size);
     if per_page == 0 {
         return Vec::new();
     }
     let pages = page_sequence_map(bytes, page_size, rel);
-    records_at_in_with(bytes, page_size, formats, &pages, per_page, recnos)
+    records_at_in_with(bytes, page_size, formats, &pages, per_page, recnos, view)
+}
+
+/// WHAT THIS ATTACHMENT COUNTS AS A ROW.
+///
+/// Every record walk used to take the chain HEAD if it was a live
+/// primary version, which is only right when every transaction in the
+/// file is committed - and it was, because this server marked each
+/// write committed as it wrote it. Now a transaction stays ACTIVE in
+/// the TIP until its COMMIT, so the head can belong to work that is not
+/// this reader's to see: somebody else's open transaction, or one that
+/// died with its connection. The version behind it is then the row.
+///
+/// `own` is this attachment's own transaction, whose uncommitted work
+/// it must see (a statement reads what the earlier statements of its
+/// own transaction wrote).
+///
+/// `tips` is `None` only for a file with no transaction inventory at
+/// all, in which case the walk falls back to what it did before -
+/// nothing to consult, so the head stands.
+struct ReadView<'a> {
+    tips: Option<fire_crab_ods::tra::TipChain<'a>>,
+    own: Option<u64>,
+}
+
+impl<'a> ReadView<'a> {
+    fn of(db: &Database, image: &'a [u8]) -> ReadView<'a> {
+        ReadView::over(image, db.page_size, db.tx)
+    }
+
+    /// The same view over an image the caller holds directly - a
+    /// statement's WORK COPY, which is not yet anybody's shared image
+    /// but is what its own constraint checks must read.
+    fn over(image: &'a [u8], page_size: usize, own: Option<u32>) -> ReadView<'a> {
+        ReadView {
+            tips: fire_crab_ods::tra::TipChain::read(image, page_size),
+            own: own.map(u64::from),
+        }
+    }
+
+    /// The visible version's image and format, or `None` when this
+    /// reader has no row here (a delete it counts, or an insert it does
+    /// not).
+    fn version(
+        &self,
+        bytes: &[u8],
+        page_size: usize,
+        r: &fire_crab_ods::RecordHeader,
+    ) -> Option<(Vec<u8>, u8)> {
+        // back versions, fragments and blobs are reached THROUGH their
+        // head, never walked as one
+        if r.flags & (fire_crab_ods::data::flags::CHAIN
+            | fire_crab_ods::data::flags::FRAGMENT
+            | fire_crab_ods::data::flags::BLOB)
+            != 0
+        {
+            return None;
+        }
+        match &self.tips {
+            Some(tips) => fire_crab_ods::tra::visible_version(bytes, page_size, r, tips, self.own)
+                .map(|v| (v.image, v.format)),
+            None => {
+                if !r.is_primary_record() {
+                    return None;
+                }
+                fire_crab_ods::data::assembled_image(bytes, page_size, r).map(|i| (i, r.format))
+            }
+        }
+    }
+
+    /// ...decoded with the descriptors of THE VERSION FOUND, which need
+    /// not be the head's: an older version can carry an older format.
+    fn values(
+        &self,
+        bytes: &[u8],
+        page_size: usize,
+        formats: &[(u8, Vec<Descriptor>)],
+        r: &fire_crab_ods::RecordHeader,
+    ) -> Option<Vec<Value>> {
+        let (image, format) = self.version(bytes, page_size, r)?;
+        let descs = formats
+            .iter()
+            .find(|(n, _)| *n == format)
+            .or_else(|| formats.iter().max_by_key(|(n, _)| *n))?;
+        Some(decode_record(&image, &descs.1))
+    }
 }
 
 /// [records_at_in] with the page map already built - the form a
@@ -20745,6 +20989,7 @@ fn records_at_in_with(
     pages: &std::collections::HashMap<u32, u32>,
     per_page: u64,
     recnos: &[u64],
+    view: &ReadView,
 ) -> Vec<Vec<Value>> {
     let mut out = Vec::with_capacity(recnos.len());
     for &recno in recnos {
@@ -20759,16 +21004,8 @@ fn records_at_in_with(
         // `records()` skips released slots, so nth() shifts after a
         // garbage collection and fetches the wrong record entirely.
         let Some(r) = dp.record(slot as u16) else { continue };
-        if !r.is_primary_record() {
-            continue;
-        }
-        let Some(image) = fire_crab_ods::data::assembled_image(bytes, page_size, &r) else { continue };
-        let descs = formats
-            .iter()
-            .find(|(n, _)| *n == r.format)
-            .or_else(|| formats.iter().max_by_key(|(n, _)| *n));
-        let Some((_, descs)) = descs else { continue };
-        out.push(decode_record(&image, descs));
+        let Some(values) = view.values(bytes, page_size, formats, &r) else { continue };
+        out.push(values);
     }
     out
 }
@@ -20813,6 +21050,7 @@ fn for_each_record_while<F: FnMut(&[Value]) -> Flow>(
     mut f: F,
 ) {
     let db_image = db.bytes();
+    let view = ReadView::of(db, &db_image);
     for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
         let start = dp_no as usize * db.page_size;
         let Some(dp) = db_image
@@ -20822,19 +21060,9 @@ fn for_each_record_while<F: FnMut(&[Value]) -> Flow>(
             continue;
         };
         for r in dp.records() {
-            if !r.is_primary_record() {
-                continue;
-            }
-            let Some(image) = fire_crab_ods::data::assembled_image(&db_image, db.page_size, &r)
-            else {
+            let Some(values) = view.values(&db_image, db.page_size, formats, &r) else {
                 continue;
             };
-            let descs = formats
-                .iter()
-                .find(|(n, _)| *n == r.format)
-                .or_else(|| formats.iter().max_by_key(|(n, _)| *n));
-            let Some((_, descs)) = descs else { continue };
-            let values = decode_record(&image, descs);
             if matches!(f(&values), Flow::Stop) {
                 return;
             }
@@ -20849,6 +21077,7 @@ fn for_each_record<F: FnMut(&[Value])>(
     mut f: F,
 ) {
     let db_image = db.bytes();
+    let view = ReadView::of(db, &db_image);
     for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
         let start = dp_no as usize * db.page_size;
         let Some(dp) = db_image
@@ -20858,19 +21087,10 @@ fn for_each_record<F: FnMut(&[Value])>(
             continue;
         };
         for r in dp.records() {
-            if !r.is_primary_record() {
-                continue;
-            }
-            let Some(image) = fire_crab_ods::data::assembled_image(&db_image, db.page_size, &r)
-            else {
+            let Some(values) = view.values(&db_image, db.page_size, formats, &r) else {
                 continue;
             };
-            let descs = formats
-                .iter()
-                .find(|(n, _)| *n == r.format)
-                .or_else(|| formats.iter().max_by_key(|(n, _)| *n));
-            let Some((_, descs)) = descs else { continue };
-            f(&decode_record(&image, descs));
+            f(&values);
         }
     }
 }
@@ -22366,8 +22586,7 @@ fn persist_generators(db: Option<&mut Database>, writes: &[(String, i64)]) {
     }
     if ok {
         let _ = std::fs::write(&db.path, &work);
-        db.install(work);
-        db.note_disk();
+        db.install_flushed(work);
         for (name, val) in writes {
             burn_generator(db, name, *val);
         }
@@ -32875,15 +33094,26 @@ fn snapshot_db(database: &Option<Database>) -> Option<Vec<u8>> {
 /// is what says whether this connection wrote, and it is held from the
 /// transaction's first write until here, so no other writer can have
 /// committed inside the window this restore covers.
-fn restore_db(database: &mut Option<Database>, snap: Option<Vec<u8>>) {
+fn restore_db(database: &mut Option<Database>, snap: Option<Vec<u8>>) -> bool {
     if let (Some(db), Some(bytes)) = (database.as_mut(), snap) {
         if !db.wrote() {
-            return;
+            return false;
         }
         let _ = std::fs::write(&db.path, &bytes);
-        db.install(bytes);
-        db.note_disk();
+        db.install_flushed(bytes);
+        // the restored image carries the header and the TIP as they
+        // were, so the id this attachment reserved may no longer exist
+        db.retune_tx();
+        return true;
     }
+    false
+}
+
+/// The transaction a record write runs under. `None` here would mean a
+/// DML arm was reached without one being reserved, which is a bug in
+/// the match above rather than anything a client can provoke.
+fn dml_tx(stmt_tx: Option<u32>) -> Result<u32, String> {
+    stmt_tx.ok_or_else(|| "no transaction reserved for a record write".to_string())
 }
 
 /// The transaction ended - COMMIT or ROLLBACK, statement or wire op -
@@ -32898,10 +33128,38 @@ fn restore_db(database: &mut Option<Database>, snap: Option<Vec<u8>>) {
 ///
 /// Every caller sits AFTER the generator windows have been written
 /// forward, since that write needs the write side too.
-fn end_transaction(database: &mut Option<Database>) {
-    if let Some(db) = database.as_mut() {
-        db.end_write();
+fn end_transaction(database: &mut Option<Database>, outcome: TxEnd) {
+    let Some(db) = database.as_mut() else { return };
+    let r = match outcome {
+        // COMMIT IS TWO BITS. The records have been on the pages since
+        // the statements that wrote them; what the commit publishes is
+        // the transaction's state, and every other attachment starts
+        // counting the rows the moment it lands.
+        TxEnd::Commit => db.commit_tx(),
+        // A rollback that put an image back has already undone the
+        // transaction, TIP entry and all. One that had no snapshot to
+        // put back ends the transaction the other way the engine can:
+        // `tra_dead`, which stops the rows counting exactly as an
+        // active one does, permanently.
+        TxEnd::RolledBackImage => Ok(()),
+        TxEnd::RollbackNoImage => db.kill_tx(),
+    };
+    if let Err(e) = r {
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] ending the transaction: {}", e);
+        }
     }
+    db.end_write();
+}
+
+/// How a transaction ended, which decides what its TIP entry becomes.
+#[derive(Clone, Copy)]
+enum TxEnd {
+    Commit,
+    /// rolled back by restoring the image the transaction started from
+    RolledBackImage,
+    /// rolled back with no image to restore
+    RollbackNoImage,
 }
 
 /// Run `INSERT INTO <t> (cols) [OVERRIDING ...] SELECT ...`: materialise
@@ -35593,10 +35851,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     } else if let Plan::TxControl { rollback } = &plan {
                         // ending the transaction discards every mark
                         savepoints.clear();
-                        if *rollback {
+                        let outcome = if *rollback {
                             let snap = tx_snapshot.take();
                             let undone = snap.is_some();
-                            restore_db(&mut database, snap);
+                            let put_back = restore_db(&mut database, snap);
                             // the transaction is window 0, so the whole
                             // stack unwinds against the restored image
                             gen_window_unwind(&mut database, 0, undone);
@@ -35604,14 +35862,16 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             if std::env::var("FC_SRV_TRACE").is_ok() {
                                 eprintln!("[srv] ROLLBACK - transaction undone: {}", undone);
                             }
+                            if put_back { TxEnd::RolledBackImage } else { TxEnd::RollbackNoImage }
                         } else {
                             tx_snapshot = snapshot_db(&database);
                             reset_gen_windows(&mut database);
-                        }
+                            TxEnd::Commit
+                        };
                         // the write side goes back AFTER the generators
                         // have been written forward over the restored
                         // image - that write needs it too
-                        end_transaction(&mut database);
+                        end_transaction(&mut database, outcome);
                         last_dml = (0, 0, 0);
                         respond(&mut s, &mut enc, TX_HANDLE)?;
                     } else if let Plan::Returning { inner, cols, fields } = &plan {
@@ -36145,22 +36405,24 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 // generator windows are stacked one per mark, so the two
                 // lists have to end together
                 savepoints.clear();
-                if x == OP_ROLLBACK {
+                let outcome = if x == OP_ROLLBACK {
                     // put the file back as the transaction found it
                     let snap = tx_snapshot.take();
                     let undone = snap.is_some();
-                    restore_db(&mut database, snap);
+                    let put_back = restore_db(&mut database, snap);
                     gen_window_unwind(&mut database, 0, undone);
                     reset_gen_windows(&mut database);
                     if undone && std::env::var("FC_SRV_TRACE").is_ok() {
                         eprintln!("[srv] op_rollback - transaction undone");
                     }
+                    if put_back { TxEnd::RolledBackImage } else { TxEnd::RollbackNoImage }
                 } else {
                     // committed: this image is the new starting point
                     tx_snapshot = snapshot_db(&database);
                     reset_gen_windows(&mut database);
-                }
-                end_transaction(&mut database);
+                    TxEnd::Commit
+                };
+                end_transaction(&mut database, outcome);
                 respond(&mut s, &mut enc, 0)?;
             }
             x if x == OP_CANCEL => {
@@ -36687,6 +36949,26 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                 break;
             }
+        }
+    }
+    // THE CONNECTION IS GOING, AND SO IS ITS TRANSACTION. A client that
+    // detaches - or vanishes - with work uncommitted has not committed
+    // it, and the engine ends such a transaction rather than leaving it
+    // open for good. `tra_dead` says so in the file: the rows stay on
+    // the pages and count for nobody, which is what a rollback means
+    // here, and the engine's own sweep collects them later. Left
+    // ACTIVE, they would be a transaction that never ends.
+    if let Some(db) = database.as_mut() {
+        if db.tx.is_some() {
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                eprintln!("[srv] detach with an open transaction - marking it dead");
+            }
+            if let Err(e) = db.kill_tx() {
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] ...could not: {}", e);
+                }
+            }
+            db.end_write();
         }
     }
     Ok(())
@@ -37567,8 +37849,7 @@ fn gen_id_increment(
     let mut work = db.work_copy()?;
     write_generator_value(&mut work, db.page_size, id, new_val)?;
     std::fs::write(&db.path, &work).map_err(|e| e.to_string())?;
-    db.install(work);
-    db.note_disk();
+    db.install_flushed(work);
     burn_generator(db, name, new_val);
     Ok(new_val)
 }
@@ -37823,6 +38104,7 @@ mod tests {
         let db = Database {
             shared: fire_crab_cch::pool::detached(Vec::new()),
             write: None,
+            tx: None,
             page_size: 8192,
             path: String::new(),
             ods_major: 0,
@@ -40624,6 +40906,7 @@ mod tests {
         let db = Database {
             shared: fire_crab_cch::pool::detached(Vec::new()),
             write: None,
+            tx: None,
             page_size: 4096,
             path: String::new(),
             ods_major: 14,

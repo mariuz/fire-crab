@@ -121,6 +121,13 @@ struct WriteState {
 pub struct SharedImage {
     path: String,
     image: Mutex<Arc<Vec<u8>>>,
+    /// the image as it is ON DISK - what a careful flush must diff
+    /// against, since an install that is not itself flushed leaves its
+    /// pages dirty for the next one to write. Diffing against the
+    /// CURRENT image instead loses them: they are equal in both halves
+    /// of that comparison, so the flush finds nothing changed and the
+    /// pages never reach the file.
+    flushed: Mutex<Arc<Vec<u8>>>,
     disk: Mutex<Option<Fingerprint>>,
     write: Mutex<WriteState>,
     wake: Condvar,
@@ -151,9 +158,22 @@ impl SharedImage {
     /// Install a new image. The caller must hold the write token: this
     /// is the second half of a read-modify-write that started with
     /// [`SharedImage::image`].
-    pub fn publish(&self, bytes: Vec<u8>) {
-        *lock(&self.image) = Arc::new(bytes);
+    pub fn publish(&self, bytes: Vec<u8>) -> Arc<Vec<u8>> {
+        let arc = Arc::new(bytes);
+        *lock(&self.image) = Arc::clone(&arc);
         stats().publishes.fetch_add(1, Ordering::Relaxed);
+        arc
+    }
+
+    /// The image as it stands ON DISK - the baseline for the next
+    /// careful flush.
+    pub fn flushed(&self) -> Arc<Vec<u8>> {
+        lock(&self.flushed).clone()
+    }
+
+    /// Record that `img` is what the file now holds.
+    pub fn note_flushed(&self, img: Arc<Vec<u8>>) {
+        *lock(&self.flushed) = img;
     }
 
     /// Record the file's fingerprint after the server itself wrote it,
@@ -265,14 +285,17 @@ pub fn open(path: &str) -> Option<Arc<SharedImage>> {
         // longer matches its file is re-read, not served.
         let bytes = std::fs::read(path).ok()?;
         stats().reloads.fetch_add(1, Ordering::Relaxed);
-        *lock(&sh.image) = Arc::new(bytes);
+        let arc = Arc::new(bytes);
+        *lock(&sh.image) = Arc::clone(&arc);
+        *lock(&sh.flushed) = arc;
         *lock(&sh.disk) = fp;
         return Some(Arc::clone(sh));
     }
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = Arc::new(std::fs::read(path).ok()?);
     let sh = Arc::new(SharedImage {
         path: path.to_string(),
-        image: Mutex::new(Arc::new(bytes)),
+        image: Mutex::new(Arc::clone(&bytes)),
+        flushed: Mutex::new(bytes),
         disk: Mutex::new(fp),
         write: Mutex::new(WriteState::default()),
         wake: Condvar::new(),
@@ -286,9 +309,11 @@ pub fn open(path: &str) -> Option<Arc<SharedImage>> {
 /// a database-shaped value without a database - the row-source tree's
 /// tests reach one only to prove they never touch it.
 pub fn detached(bytes: Vec<u8>) -> Arc<SharedImage> {
+    let arc = Arc::new(bytes);
     Arc::new(SharedImage {
         path: String::new(),
-        image: Mutex::new(Arc::new(bytes)),
+        image: Mutex::new(Arc::clone(&arc)),
+        flushed: Mutex::new(arc),
         disk: Mutex::new(None),
         write: Mutex::new(WriteState::default()),
         wake: Condvar::new(),

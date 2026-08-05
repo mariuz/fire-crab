@@ -290,7 +290,8 @@ GSTAT=/opt/firebird/bin/gstat bench/compare.sh /path/to/db.fdb
   prefix with the engine's own tools, and the **buffer pool** that holds
   a database's pages once per file per process — the shared resource
   the concurrency oracle found missing, with the writers over it
-  serialized per database.
+  serialized per database and the on-disk image kept as the flush
+  baseline.
 - `crates/lck` — the lock manager's table policy (`src/lock/lock.cpp`),
   pinned against the engine's own source and the live server's
   reservations; deep doc in
