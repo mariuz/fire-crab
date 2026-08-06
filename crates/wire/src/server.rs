@@ -7012,6 +7012,17 @@ enum TrigStmt {
     },
     /// `EXCEPTION <name>;` - blr_abort, condition 2 (exception), name
     Raise { name: String, src_off: usize },
+    /// `EXECUTE PROCEDURE <name> [(<args>)] [RETURNING_VALUES :v[, :v]];`
+    /// - a NESTED CALL: its own frame, its own cursors, its own
+    /// transaction-visible writes, and an error that the CALLER may
+    /// catch (probed: a WHEN ANY around the call catches what the
+    /// callee raised).
+    CallProc {
+        name: String,
+        args: Vec<fire_crab_ods::expr::Expr>,
+        into: Vec<u16>,
+        src_off: usize,
+    },
     /// `OPEN <cursor>;` - plan the declared query and run it, holding
     /// its rows for FETCH. The engine materialises lazily; this reads
     /// the whole set at OPEN, which is what the FOR SELECT loop already
@@ -7466,7 +7477,8 @@ fn body_has_uninterpretable_blr(st: &TrigStmt) -> bool {
         | TrigStmt::Fetch { .. }
         | TrigStmt::Close { .. }
         | TrigStmt::Leave { .. }
-        | TrigStmt::Exit { .. } => true,
+        | TrigStmt::Exit { .. }
+        | TrigStmt::CallProc { .. } => true,
         TrigStmt::If { then, otherwise, .. } => {
             body_has_uninterpretable_blr(then)
                 || otherwise.as_ref().is_some_and(|e| body_has_uninterpretable_blr(e))
@@ -7624,6 +7636,48 @@ fn parse_trig_stmt(
             return None;
         }
         return Some(TrigStmt::Raise { name, src_off: start });
+    }
+    if find_word(&up, "EXECUTE", 0) == Some(0) {
+        let proc_kw = find_word(&up, "PROCEDURE", "EXECUTE".len())?;
+        if up["EXECUTE".len()..proc_kw].trim() != "" {
+            return None;
+        }
+        let after = proc_kw + "PROCEDURE".len();
+        // RETURNING_VALUES splits the call from the slots it fills
+        let rv = find_word(&up, "RETURNING_VALUES", after);
+        let call = &text[after..rv.unwrap_or(text.len())];
+        let (name_part, arg_part) = match call.find('(') {
+            Some(o) => {
+                let close = call.rfind(')')?;
+                (&call[..o], Some(call[o + 1..close].trim()))
+            }
+            None => (call, None),
+        };
+        let name = name_part.trim().trim_matches('"').to_ascii_uppercase();
+        if !ident_ok(&name) {
+            return None;
+        }
+        let mut args = Vec::new();
+        if let Some(a) = arg_part.filter(|a| !a.is_empty()) {
+            for part in a.split(',') {
+                // bare names resolve here - unlike an embedded INSERT's
+                // VALUES, where the engine demands the `:` (probed)
+                let e = parse_expr(part.trim().trim_start_matches(':').trim())?;
+                args.push(expr_resolve_vars(&e, vars));
+            }
+        }
+        let mut into = Vec::new();
+        if let Some(rv) = rv {
+            for part in text[rv + "RETURNING_VALUES".len()..].split(',') {
+                let v = part.trim().trim_start_matches(':').trim().trim_matches('"');
+                let slot = vars.iter().position(|n| n.eq_ignore_ascii_case(v))?;
+                into.push(slot as u16);
+            }
+            if into.is_empty() {
+                return None;
+            }
+        }
+        return Some(TrigStmt::CallProc { name, args, into, src_off: start });
     }
     if find_word(&up, "OPEN", 0) == Some(0) {
         let name = text["OPEN".len()..].trim().trim_matches('"').to_ascii_uppercase();
@@ -7885,7 +7939,8 @@ fn emit_trigger_stmt(
         | TrigStmt::Fetch { .. }
         | TrigStmt::Close { .. }
         | TrigStmt::Leave { .. }
-        | TrigStmt::Exit { .. } => {}
+        | TrigStmt::Exit { .. }
+        | TrigStmt::CallProc { .. } => {}
         TrigStmt::Assign { target, expr, src_off } => {
             dbg.push((*src_off, b.len()));
             b.push(1); // blr_assignment
@@ -8289,7 +8344,8 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | TrigStmt::Fetch { .. }
             | TrigStmt::Close { .. }
             | TrigStmt::Leave { .. }
-            | TrigStmt::Exit { .. } => {}
+            | TrigStmt::Exit { .. }
+            | TrigStmt::CallProc { .. } => {}
             TrigStmt::Assign { expr, .. } => out.push(expr),
             TrigStmt::If { cond, then, otherwise, .. } => {
                 out.extend(cond.operands());
@@ -8325,7 +8381,8 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | TrigStmt::Fetch { .. }
             | TrigStmt::Close { .. }
             | TrigStmt::Leave { .. }
-            | TrigStmt::Exit { .. } => {}
+            | TrigStmt::Exit { .. }
+            | TrigStmt::CallProc { .. } => {}
             TrigStmt::Assign { target, .. } => out.push(target),
             TrigStmt::If { then, otherwise, .. } => {
                 stmt_targets(then, out);
@@ -8362,7 +8419,8 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | TrigStmt::Fetch { .. }
             | TrigStmt::Close { .. }
             | TrigStmt::Leave { .. }
-            | TrigStmt::Exit { .. } => {}
+            | TrigStmt::Exit { .. }
+            | TrigStmt::CallProc { .. } => {}
             TrigStmt::Assign { .. } => {}
             TrigStmt::If { then, otherwise, .. } => {
                 stmt_specials(then, stores, raises, hexcs, dmls);
@@ -34677,7 +34735,7 @@ fn run_body_dml(
     db: &mut Option<Database>,
     ctx: &SessionCtx,
     kind: DmlKind,
-) -> Result<(), PsqlStop> {
+) -> Result<i64, PsqlStop> {
     if std::env::var("FC_SRV_TRACE").is_ok() {
         eprintln!("[srv] psql dml: {}", sql);
     }
@@ -34688,7 +34746,10 @@ fn run_body_dml(
     };
     let (plan, _params) = planned.ok_or(PsqlStop::Unsupported)?;
     match execute_dml(&plan, db, &[], ctx) {
-        Ok(_) => Ok(()),
+        // (inserted, updated, deleted) - ROW_COUNT is whichever of the
+        // three this statement was, and the engine answers 0 for a DML
+        // that matched nothing rather than leaving the previous count
+        Ok((i, u, d)) => Ok(i64::from(i + u + d)),
         Err(e) => {
             if std::env::var("FC_SRV_TRACE").is_ok() {
                 eprintln!("[srv] psql dml failed: {}", e);
@@ -35090,6 +35151,85 @@ fn exec_psql_stmt(
     r
 }
 
+/// HOW DEEP A BODY MAY CALL. A procedure that calls itself is legal
+/// SQL and this interpreter recurses on the Rust stack, so without a
+/// ceiling a runaway body takes the whole server down rather than
+/// failing one statement. The engine has its own limit and answers
+/// "Too many concurrent executions of the same request"; refusing is
+/// the honest stand-in until that error is converted.
+fn psql_depth_guard<T>(run: impl FnOnce() -> T) -> Result<T, PsqlStop> {
+    thread_local! {
+        static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    const LIMIT: u32 = 48;
+    let over = DEPTH.with(|d| {
+        if d.get() >= LIMIT {
+            true
+        } else {
+            d.set(d.get() + 1);
+            false
+        }
+    });
+    if over {
+        return Err(PsqlStop::Unsupported);
+    }
+    let out = run();
+    DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    Ok(out)
+}
+
+/// Add this frame's `At procedure` lines to an error that may already
+/// carry some.
+///
+/// THE JOIN IS MEASURED, NOT DERIVED. Two raise points in ONE body
+/// travel as TWO `isc_stack_trace` items (a client prints each with its
+/// own leading dash), but a NESTED CALL's outer frame is APPENDED TO
+/// THE CALLEE'S LAST ITEM with a newline - the engine's own output for
+/// an uncaught error two frames deep is
+///
+/// ```text
+/// -At procedure "PUBLIC"."INNER_RAISE" line: 3, col: 14
+/// At procedure "PUBLIC"."N_UNCAUGHT" line: 3, col: 14
+/// ```
+///
+/// with no dash on the second line. So frames join and raise points do
+/// not, and a converter that guessed either way would print the wrong
+/// shape for the other.
+fn wrap_at_procedure(inner: EvalErr, at: Vec<String>) -> EvalErr {
+    if at.is_empty() {
+        return inner;
+    }
+    match inner {
+        EvalErr::AtProcedure { inner, at: mut below } => {
+            // this frame's first line continues the callee's last item
+            let mut lines = at.into_iter();
+            if let (Some(last), Some(first)) = (below.last_mut(), lines.next()) {
+                last.push('\n');
+                last.push_str(&first);
+            }
+            below.extend(lines);
+            EvalErr::AtProcedure { inner, at: below }
+        }
+        inner => EvalErr::AtProcedure { inner: Box::new(inner), at },
+    }
+}
+
+/// Put `n` in the frame's ROW_COUNT slot, if the body has one.
+///
+/// The engine's ROW_COUNT is "what the LAST statement touched", which is
+/// why a FETCH sets it to 1 or 0 and a DML sets it to the rows it
+/// changed - including 0 for a DELETE that matched nothing (probed),
+/// rather than leaving the previous statement's count in place.
+fn set_row_count(f: &mut PsqlFrame, n: i64) {
+    if let Some(rc) = f.row_count_slot {
+        let at = rc as usize;
+        if at >= f.vars.len() {
+            f.vars.resize(at + 1, Value::Null);
+        }
+        f.vars[at] = Value::Int(n);
+    }
+}
+
 /// A statement's offset in the body source - what the `At procedure`
 /// item is computed from.
 fn stmt_src_off(s: &TrigStmt) -> usize {
@@ -35110,7 +35250,8 @@ fn stmt_src_off(s: &TrigStmt) -> usize {
         | TrigStmt::Fetch { src_off, .. }
         | TrigStmt::Close { src_off, .. }
         | TrigStmt::Leave { src_off, .. }
-        | TrigStmt::Exit { src_off, .. } => *src_off,
+        | TrigStmt::Exit { src_off, .. }
+        | TrigStmt::CallProc { src_off, .. } => *src_off,
     }
 }
 
@@ -35350,6 +35491,43 @@ fn exec_psql_stmt_inner(
             state.at = 0;
             Ok(())
         }
+        // A NESTED CALL. `run_procedure` builds the callee its own frame
+        // - its own variables, cursors and ROW_COUNT - and the write it
+        // does is this transaction's write, so a callee that INSERTs and
+        // a caller that rolls back behave as one statement.
+        //
+        // WHAT THE CALLEE RAISES, THE CALLER MAY CATCH (probed: a WHEN
+        // ANY around the call catches a division by zero inside the
+        // callee), so its error comes back as a Raise rather than a
+        // refusal - carrying the callee's own status vector, `At
+        // procedure` items and all, which is why an uncaught one names
+        // BOTH frames the way the engine does.
+        TrigStmt::CallProc { name, args, into, src_off } => {
+            let vals = args
+                .iter()
+                .map(|e| eval_psql_expr(e, f))
+                .collect::<Result<Vec<_>, _>>()?;
+            let out = psql_depth_guard(|| run_procedure(db, name, &vals, ctx))?;
+            match out {
+                Ok((values, _rows)) => {
+                    for (slot, v) in into.iter().zip(values.into_iter()) {
+                        let at = *slot as usize;
+                        if at >= f.vars.len() {
+                            f.vars.resize(at + 1, Value::Null);
+                        }
+                        f.vars[at] = v;
+                    }
+                    Ok(())
+                }
+                // the callee's own frames are inside `err` already; what
+                // this frame adds is the position of the CALL
+                Err(ProcErr { status: Some(err), .. }) => Err(PsqlStop::Raise(Thrown::Runtime {
+                    err,
+                    trace: vec![*src_off],
+                })),
+                Err(_) => Err(PsqlStop::Unsupported),
+            }
+        }
         TrigStmt::Leave { .. } => Err(PsqlStop::Leave),
         TrigStmt::Exit { .. } => Err(PsqlStop::Exit),
         // a BEGIN..END block - which every body is, and which nests.
@@ -35429,7 +35607,7 @@ fn exec_psql_stmt_inner(
                 cols.join(", "),
                 vals.join(", ")
             );
-            run_body_dml(&sql, db, ctx, DmlKind::Insert)
+            run_body_dml(&sql, db, ctx, DmlKind::Insert).map(|n| set_row_count(f, n))
         }
         TrigStmt::Update { table, sets, wher, .. } => {
             let assigns = sets
@@ -35442,7 +35620,7 @@ fn exec_psql_stmt_inner(
                 sql.push_str(" WHERE ");
                 sql.push_str(&render_psql_cond(c, f).ok_or(PsqlStop::Unsupported)?);
             }
-            run_body_dml(&sql, db, ctx, DmlKind::Update)
+            run_body_dml(&sql, db, ctx, DmlKind::Update).map(|n| set_row_count(f, n))
         }
         TrigStmt::Delete { table, wher, .. } => {
             let mut sql = format!("DELETE FROM {}", table);
@@ -35450,7 +35628,7 @@ fn exec_psql_stmt_inner(
                 sql.push_str(" WHERE ");
                 sql.push_str(&render_psql_cond(c, f).ok_or(PsqlStop::Unsupported)?);
             }
-            run_body_dml(&sql, db, ctx, DmlKind::Delete)
+            run_body_dml(&sql, db, ctx, DmlKind::Delete).map(|n| set_row_count(f, n))
         }
         // SUSPEND, cursors, FOR SELECT, EXECUTE STATEMENT, nested calls
         _ => Err(PsqlStop::Unsupported),
@@ -35711,11 +35889,7 @@ fn run_procedure(
                     Thrown::User(r) => format!("exception {}", r.name),
                     Thrown::Runtime { err, .. } => format!("{:?}", err),
                 },
-                status: Some(if at.is_empty() {
-                    inner
-                } else {
-                    EvalErr::AtProcedure { inner: Box::new(inner), at }
-                }),
+                status: Some(wrap_at_procedure(inner, at)),
             });
         }
         Err(PsqlStop::Failed(e)) => return Err(ProcErr::from(e)),

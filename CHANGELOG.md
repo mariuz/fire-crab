@@ -13,6 +13,46 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-07 — a body calling a body, and what ROW_COUNT means
+
+### Converted
+- **`EXECUTE PROCEDURE` inside PSQL**, with arguments and
+  `RETURNING_VALUES`. The callee gets its OWN frame — variables,
+  cursors, ROW_COUNT — and its writes are this transaction's writes, so
+  a callee that INSERTs and a caller that fails leave nothing behind.
+  Arguments may be expressions over the caller's variables, and BARE
+  names resolve there (unlike an embedded INSERT's VALUES, where the
+  engine demands the `:`).
+- **What the callee raises, the caller may catch** — `WHEN ANY` and the
+  callee's own SQLSTATE both catch a division by zero raised one frame
+  down, because the call returns a raise rather than a refusal.
+- **`ROW_COUNT` after DML**: the rows an INSERT, UPDATE or DELETE
+  touched, and **0 for one that matched nothing** rather than the
+  previous statement's count. It is the same frame slot a FETCH sets.
+- **A depth ceiling on nested calls.** This interpreter recurses on the
+  Rust stack, so a self-calling body would take the server down rather
+  than fail one statement; past 48 frames it refuses.
+
+### Found
+- **Raise points join differently from FRAMES, and the difference is
+  visible in the bytes.** Two raise points in one body travel as TWO
+  `isc_stack_trace` items — a client prints each with its own leading
+  dash — but a nested call's outer frame is APPENDED TO THE CALLEE'S
+  LAST ITEM with a newline, so the engine's two-frame output has no
+  dash on its second line. Measured against the engine and reproduced;
+  a converter guessing either rule prints the wrong shape for the other.
+- **String literals are outside the embedded-DML surface** — an
+  `UPDATE ... SET S = 'z'` inside a body is refused where the numeric
+  form is not. Pre-existing, unrelated to this slice, found because the
+  first ROW_COUNT probe used one. The gate uses numeric DML and says so.
+
+### Gated
+- **`qa/serve-real-callproc.sh`** (15 checks): the call with arguments
+  and returned values, expression arguments, a call in a loop, the
+  callee's error caught two ways and uncaught naming both frames, a
+  callee's write dying with the caller's failure, and ROW_COUNT after
+  each kind of DML including the one that matched nothing.
+
 ## 2026-08-07 — explicit cursors, and the loop they are for
 
 ### Converted

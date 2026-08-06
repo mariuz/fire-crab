@@ -2527,12 +2527,15 @@ plus *the subsystem is now on the path*.
     planned by the ordinary planner, so it sees joins and expressions
     for free; a fetch past the end leaves the variables alone, which is
     the part that would silently answer wrongly if guessed;
-  * **`EXECUTE PROCEDURE` inside a body** (a nested frame) and
-    **`EXECUTE STATEMENT`** (a whole planner call from PSQL);
+  * ~~`EXECUTE PROCEDURE` inside a body~~ **DONE** (sixth slice), with
+    `ROW_COUNT` for DML alongside it (`qa/serve-real-callproc.sh`, 15
+    checks). **`EXECUTE STATEMENT`** - a whole planner call from PSQL -
+    is what is left of that pair;
   * **`IN AUTONOMOUS TRANSACTION`**, which needs a second transaction
     while one is open;
-  * **`ROW_COUNT`**, which needs the DML paths to report what they
-    touched back into the frame.
+  * ~~`ROW_COUNT`~~ **DONE** with the slice above - the DML paths report
+    what they touched back into the frame, and a statement that matched
+    nothing answers 0 rather than leaving the previous count.
 
   Also found while gating: **fire-crab announces every procedure OUTPUT
   PARAMETER as BIGINT**, where the engine announces the declared type -
