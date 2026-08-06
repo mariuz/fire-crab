@@ -13,6 +13,63 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-07 — runtime errors have an identity, and can be caught
+
+### Converted
+- **Every error the interpreter raises now carries a gdscode, a SQLCODE
+  and a SQLSTATE**, which is what the three remaining handler forms
+  compare against. `WHEN SQLCODE`, `WHEN GDSCODE` and `WHEN SQLSTATE`
+  work; `WHEN SQLSTATE` is new to the parser as well.
+- **A division by zero inside a body is an ERROR, not a refusal.** It
+  used to stop the body with "this server does not interpret", which no
+  handler can catch and which tells a client nothing.
+- **An arithmetic overflow was answering NULL** — the one thing a
+  converted engine may never do. It raises `isc_exception_integer_
+  overflow` (SQLSTATE 22003) and is catchable.
+- **`crates/wire/src/gdscodes.rs` regenerated with the whole identity**:
+  1543 codes with gdscode, SQLCODE and SQLSTATE, from the engine's own
+  `msg/*.h`, the gdscode computed its way
+  (`0x14000000 | facility << 16 | number`).
+- **`sqlstate_of` ports `fb_sqlstate`** (gds.cpp:2464): skip
+  `isc_random`/`isc_sqlerr`, ignore `00000`, and keep scanning past the
+  general `22000`/`42000`/`HY000` for something specific.
+- **An error's identity is read back out of the status vector the
+  server would send**, not listed a second time — so a `WHEN GDSCODE`
+  can never catch something the client was not told about.
+
+### Found
+- **The two condition forms see different depths of the same error, in
+  opposite directions.** `WHEN GDSCODE` matches the FIRST code and no
+  other, so `arith_except` catches a division by zero and
+  `exception_integer_divide_by_zero` does not. `WHEN SQLSTATE` matches
+  the state derived from the WHOLE vector, so `'22012'` catches it and
+  `'22000'` — the first code's own state — does not. A server that gave
+  each error one identity would get exactly one of the two right.
+- **Appending to a terminated status vector kills the connection.** The
+  `At procedure` wrapper wrote the inner error with
+  `eval_status_vector`, which ends with `isc_arg_end`, then added its
+  items after it. The client read the error correctly, stopped at the
+  terminator, and took the leftovers as the next message: right text,
+  dead connection, and a hang that showed up several ops later and
+  pointed nowhere near the cause. Split into `eval_status_items` (no
+  terminator) and `eval_status_vector` (items + terminator).
+- **A wrong diagnosis, recorded because it cost a cycle**: the hang was
+  first blamed on a `continue` that short-circuits the `op_execute2`
+  loop, and separately on a write-side deadlock in the re-run that
+  recovers a raise position. Both were tested and neither was the
+  cause; the re-run works fine now that the vector is well formed.
+- **A BIGINT literal is outside the PSQL surface** — `Expr::IntLiteral`
+  is an `i32`. Widening it changes BLR encoding and type ranking, so it
+  is its own increment; the gate reaches an overflow by multiplying up
+  from small literals instead, and says why.
+
+### Gated
+- **`qa/serve-real-psqlerrors.sh`** (15 checks): each condition form
+  catching a division by zero, both non-matches above, a user
+  exception's identity in all three forms, the uncaught error's text and
+  position, a bare `EXCEPTION;` re-raising a runtime error with both
+  positions, and an overflow caught by SQLSTATE and by `WHEN ANY`.
+
 ## 2026-08-06 — exceptions: catching them, and what reaches the client
 
 ### Converted

@@ -2514,12 +2514,13 @@ plus *the subsystem is now on the path*.
   shapes were run against both servers; ten were refused, one worked.
   What is left, in the order the measurement suggests:
 
-  * **runtime errors as catchable conditions** - `WHEN SQLCODE`, `WHEN
-    GDSCODE`, `WHEN SQLSTATE`, and a division by zero inside a body
-    being caught at all. The handler CONDITIONS already parse and
-    compile; what is missing is an error identity (gdscode, sqlcode,
-    sqlstate) on the interpreter's own failures, which is also what
-    would let `WHEN GDSCODE except` catch a user exception;
+  * ~~runtime errors as catchable conditions~~ **DONE** (fourth
+    slice): every error the interpreter raises carries a gdscode, a
+    SQLCODE and a SQLSTATE, so all three condition forms work, a
+    division by zero is catchable, and an overflow that used to answer
+    NULL raises 22003 (`qa/serve-real-psqlerrors.sh`, 15 checks). The
+    identity is read back out of the vector the server would send, so
+    the two can never disagree;
   * **explicit cursors** - `DECLARE ... CURSOR FOR`, `OPEN`, `FETCH
     ... INTO`, `CLOSE`. `FOR SELECT ... AS CURSOR` already works, so
     the row source is there and the state machine is not;
@@ -2531,9 +2532,11 @@ plus *the subsystem is now on the path*.
   * **`ROW_COUNT`**, which needs the DML paths to report what they
     touched back into the frame.
 
-  Also found while gating: **`INSERT ... VALUES` without a column list**
-  is outside the PSQL surface, and **`CREATE PROCEDURE` is not
-  supported at all** - every gate builds its procedures with the engine
+  Also found while gating: **a BIGINT literal is outside the PSQL
+  surface** (`Expr::IntLiteral` is an `i32`, and widening it changes BLR
+  encoding and type ranking - its own increment), **`INSERT ... VALUES`
+  without a column list** is outside it too, and **`CREATE PROCEDURE` is
+  not supported at all** - every gate builds its procedures with the engine
   and executes them through fire-crab, which is why the interpreter is
   well covered and the DDL is not.
 

@@ -5841,12 +5841,12 @@ fn source_line_col(src: &str, off: usize) -> (usize, usize) {
 /// differ by however much header the DDL had, and the difference is not
 /// a constant: a statement on the body's FIRST line is also shifted
 /// sideways, by however far along that line the body began. Both shifts
-/// are read off one fact - where the body's BEGIN is in the DDL, which
-/// the debug blob's first entry records - so
+/// are read off one fact - where the body's FIRST byte is in the DDL,
+/// which the debug blob's first entry records - so
 ///
-/// * every line moves down by (BEGIN's DDL line - BEGIN's body line);
-/// * a statement sharing BEGIN's body line ALSO moves right, by
-///   (BEGIN's DDL column - BEGIN's body column).
+/// * every line moves down by (its DDL line - its body line);
+/// * a statement sharing that body line ALSO moves right, by the
+///   matching column difference.
 ///
 /// Measured against the engine: the same body reports line 2 col 12
 /// under a one-line header, line 6 col 12 under a five-line one, and
@@ -5855,13 +5855,21 @@ fn source_line_col(src: &str, off: usize) -> (usize, usize) {
 /// `None` when the blob had no position: the item is then left out
 /// entirely, because a stack trace pointing at the wrong line is worse
 /// than none.
-fn ddl_position(meta: &ProcMeta, begin_at: usize, off: usize) -> Option<(usize, usize)> {
-    let (begin_line_ddl, begin_col_ddl) = meta.body_at?;
-    let (begin_line, begin_col) = source_line_col(&meta.source, begin_at);
+fn ddl_position(meta: &ProcMeta, off: usize) -> Option<(usize, usize)> {
+    let (first_line_ddl, first_col_ddl) = meta.body_at?;
+    // THE ANCHOR IS THE START OF THE STORED SOURCE, not its BEGIN. The
+    // first debug entry is the first thing the body's compiler emitted,
+    // and with `DECLARE`s before the BEGIN that is a variable
+    // initialisation sitting at the DECLARE - so anchoring on BEGIN
+    // subtracted a line that was not there and lost the item entirely
+    // (measured: the At-procedure line vanished for every procedure with
+    // a DECLARE, which is most of the ones that can raise).
+    let anchor = meta.source.find(|c: char| !c.is_whitespace()).unwrap_or(0);
+    let (anchor_line, anchor_col) = source_line_col(&meta.source, anchor);
     let (line, col) = source_line_col(&meta.source, off);
-    let out_line = line + begin_line_ddl.checked_sub(begin_line)?;
-    let out_col = if line == begin_line {
-        col + begin_col_ddl.checked_sub(begin_col)?
+    let out_line = line + first_line_ddl.checked_sub(anchor_line)?;
+    let out_col = if line == anchor_line {
+        col + first_col_ddl.checked_sub(anchor_col)?
     } else {
         col
     };
@@ -6976,6 +6984,11 @@ enum HandlerCond {
     Exception(String),
     Gds(String),
     Sql(i16),
+    /// `WHEN SQLSTATE '22012'` - INTERPRETED ONLY. Its BLR shape has
+    /// not been probed, so a trigger body carrying one is refused at
+    /// CREATE rather than stored as BLR missing a condition its own
+    /// source contains ([body_has_uninterpretable_blr]).
+    SqlState(String),
 }
 
 enum TrigStmt {
@@ -7386,6 +7399,16 @@ fn parse_trig_block(
                             HandlerCond::Gds(n)
                         }
                         ["SQLCODE", n] => HandlerCond::Sql(n.parse().ok()?),
+                        // SQLSTATE '<5 chars>' - the engine takes a
+                        // string literal, and the state is compared
+                        // against the WHOLE vector's derived value
+                        ["SQLSTATE", n] => {
+                            let v = n.trim_matches('\'').to_ascii_uppercase();
+                            if v.len() != 5 || !v.chars().all(|c| c.is_ascii_alphanumeric()) {
+                                return None;
+                            }
+                            HandlerCond::SqlState(v)
+                        }
                         _ => return None,
                     });
                 }
@@ -7426,7 +7449,13 @@ fn body_has_uninterpretable_blr(st: &TrigStmt) -> bool {
         TrigStmt::While { body, .. } => body_has_uninterpretable_blr(body),
         TrigStmt::Block { stmts, handlers, .. } => {
             stmts.iter().any(body_has_uninterpretable_blr)
-                || handlers.iter().any(|(_, h)| body_has_uninterpretable_blr(h))
+                || handlers.iter().any(|(conds, h)| {
+                    body_has_uninterpretable_blr(h)
+                        // a SQLSTATE condition has no probed BLR shape,
+                        // and a handler stored without its condition
+                        // would catch things the source never asked it to
+                        || conds.iter().any(|c| matches!(c, HandlerCond::SqlState(_)))
+                })
         }
         _ => false,
     }
@@ -7977,6 +8006,9 @@ fn emit_trigger_stmt(
                                     b.push(1);
                                     b.extend_from_slice(&v.to_le_bytes());
                                 }
+                                // unreachable: a body holding one never
+                                // reaches the emitter (see the variant)
+                                HandlerCond::SqlState(_) => {}
                             }
                         }
                     }
@@ -23426,6 +23458,22 @@ fn write_eval_error(w: &mut W, e: &EvalErr) {
 /// header - shared by the mid-cursor path above and the prepare-time
 /// refusal ([Plan::RefusedEval]).
 fn eval_status_vector(w: &mut W, e: &EvalErr) {
+    eval_status_items(w, e);
+    w.int(0); // isc_arg_end
+}
+
+/// The ITEMS of an eval error's status vector, WITHOUT the terminator -
+/// so that a wrapper ([EvalErr::AtProcedure]) can append its own items
+/// after them.
+///
+/// The split is not cosmetic. Writing a terminated vector and then
+/// appending more items put bytes AFTER the `isc_arg_end`: the client
+/// read the error correctly, stopped at the terminator, and then took
+/// the leftovers as the start of the next message - so the text was
+/// right and the connection was dead. It cost a gate that had been
+/// passing, and the symptom (a hang, several ops later) pointed
+/// nowhere near the cause.
+fn eval_status_items(w: &mut W, e: &EvalErr) {
     match e {
         EvalErr::DivideByZero => {
             w.int(1) // isc_arg_gds
@@ -23483,7 +23531,16 @@ fn eval_status_vector(w: &mut W, e: &EvalErr) {
             w.int(1) // isc_arg_gds
                 .int(GDS_INTEGER_OVERFLOW);
         }
-        EvalErr::UserException { number, name, message, stack } => {
+        EvalErr::AtProcedure { inner, at } => {
+            eval_status_items(w, inner);
+            for line in at {
+                w.int(1) // isc_arg_gds
+                    .int(GDS_STACK_TRACE)
+                    .int(2) // isc_arg_string
+                    .bytes(line.as_bytes());
+            }
+        }
+        EvalErr::UserException { number, name, message } => {
             w.int(1) // isc_arg_gds
                 .int(GDS_EXCEPT)
                 .int(ISC_ARG_NUMBER)
@@ -23496,12 +23553,6 @@ fn eval_status_vector(w: &mut W, e: &EvalErr) {
                 .int(GDS_RANDOM)
                 .int(2) // isc_arg_string
                 .bytes(message.as_bytes());
-            for at in stack {
-                w.int(1) // isc_arg_gds
-                    .int(GDS_STACK_TRACE)
-                    .int(2) // isc_arg_string
-                    .bytes(at.as_bytes());
-            }
         }
         EvalErr::InvalidLength(n) => {
             w.int(1) // isc_arg_gds
@@ -23677,7 +23728,76 @@ fn eval_status_vector(w: &mut W, e: &EvalErr) {
                 .bytes(procedure.as_bytes());
         }
     }
-    w.int(0); // isc_arg_end
+}
+
+/// WHAT AN ERROR IS, for a PSQL handler to compare against: the
+/// gdscodes its status vector carries, in order.
+///
+/// It is READ BACK OUT OF THE VECTOR THE SERVER WOULD SEND rather than
+/// listed a second time. A parallel table of "which codes does this
+/// EvalErr mean" would be a second source of truth for two dozen
+/// variants, and the day the two disagreed a `WHEN GDSCODE` would catch
+/// something the client was never told about.
+///
+/// The grammar is the status vector's own: `1 <gdscode>` (isc_arg_gds),
+/// `4 <number>` (isc_arg_number), `2 <length> <bytes, padded to 4>`
+/// (isc_arg_string).
+fn eval_gds_codes(e: &EvalErr) -> Vec<i32> {
+    let mut w = W::default();
+    eval_status_vector(&mut w, e);
+    let b = &w.buf;
+    let int = |at: usize| -> Option<i32> {
+        Some(i32::from_be_bytes([
+            *b.get(at)?,
+            *b.get(at + 1)?,
+            *b.get(at + 2)?,
+            *b.get(at + 3)?,
+        ]))
+    };
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at + 4 <= b.len() {
+        let item = int(at).unwrap_or(0);
+        at += 4;
+        match item {
+            1 => {
+                // isc_arg_gds
+                match int(at) {
+                    Some(c) => out.push(c),
+                    None => break,
+                }
+                at += 4;
+            }
+            4 => at += 4, // isc_arg_number
+            2 => {
+                // isc_arg_string: counted, padded to a 4-byte boundary
+                let len = match int(at) {
+                    Some(n) if n >= 0 => n as usize,
+                    _ => break,
+                };
+                at += 4 + len + ((4 - len % 4) % 4);
+            }
+            _ => break, // isc_arg_end, or an item shape this does not know
+        }
+    }
+    out
+}
+
+/// The SQLCODE and SQLSTATE a PSQL handler compares against.
+///
+/// SQLCODE is the FIRST code's - the engine posts `isc_sqlerr` from it
+/// and `WHEN SQLCODE -802` catches a division by zero, whose first code
+/// is `isc_arith_except`. SQLSTATE is derived from the WHOLE chain
+/// ([fire_crab_wire::gdscodes::sqlstate_of]), which is why the two see
+/// different depths of the same error.
+fn eval_identity(e: &EvalErr) -> (Vec<i32>, Option<i32>, &'static str) {
+    let codes = eval_gds_codes(e);
+    let sqlcode = codes
+        .first()
+        .and_then(|c| crate::gdscodes::entry_by_code(*c))
+        .map(|e| e.sqlcode);
+    let state = crate::gdscodes::sqlstate_of(&codes);
+    (codes, sqlcode, state)
 }
 
 /// [respond_error], but with an eval error's full status vector - how a
@@ -27581,9 +27701,15 @@ enum EvalErr {
         number: i64,
         name: String,
         message: String,
-        /// one per raise point, outermost raise first
-        stack: Vec<String>,
     },
+    /// ANY error, with the PSQL positions it passed through appended -
+    /// the `At procedure "PUBLIC"."P" line: L, col: C` items, one per
+    /// raise point, outermost raise first.
+    ///
+    /// It wraps rather than being a field of each variant because every
+    /// error a body can raise gets them: measured, a division by zero
+    /// inside a procedure carries the same item a user exception does.
+    AtProcedure { inner: Box<EvalErr>, at: Vec<String> },
 }
 
 /// What an expression's result is typed as - which drives its wire form
@@ -34206,7 +34332,7 @@ struct PsqlFrame {
     /// WHAT THE ENCLOSING HANDLER CAUGHT, while its body runs - what a
     /// bare `EXCEPTION;` re-raises. Handlers nest, so this is saved and
     /// restored around each one rather than simply set.
-    caught: Option<Raised>,
+    caught: Option<Thrown>,
 }
 
 /// A raised user exception, with the identity the client is owed: the
@@ -34259,10 +34385,81 @@ impl std::fmt::Display for ProcErr {
     }
 }
 
+/// WHAT A BODY THREW - and the two are handled alike from here on,
+/// because the engine treats them alike: a `WHEN ANY` catches either, a
+/// bare `EXCEPTION;` re-raises either, and either reaches the client
+/// with a status vector and one `At procedure` item per raise point.
+#[derive(Clone)]
+enum Thrown {
+    /// `EXCEPTION <name>` - a user exception, with its catalog identity
+    User(Raised),
+    /// an error the interpreter itself raised - a division by zero, an
+    /// integer overflow. `trace` is its raise points, as [Raised]'s is.
+    Runtime { err: EvalErr, trace: Vec<usize> },
+}
+
+impl Thrown {
+    fn trace(&self) -> &[usize] {
+        match self {
+            Thrown::User(r) => &r.trace,
+            Thrown::Runtime { trace, .. } => trace,
+        }
+    }
+
+    fn push_raise(&mut self, off: usize) {
+        match self {
+            Thrown::User(r) => r.trace.push(off),
+            Thrown::Runtime { trace, .. } => trace.push(off),
+        }
+    }
+
+    /// The status vector this reaches the client with, before the
+    /// `At procedure` items are wrapped around it.
+    fn as_eval_err(&self) -> EvalErr {
+        match self {
+            Thrown::User(r) => EvalErr::UserException {
+                number: r.number,
+                name: quoted_qualified(&r.name),
+                message: r.message.clone(),
+            },
+            Thrown::Runtime { err, .. } => err.clone(),
+        }
+    }
+
+    /// Whether a `WHEN` condition names THIS - the engine's rules, one
+    /// per condition kind (StmtNodes.cpp:735-761):
+    ///
+    /// * `EXCEPTION <name>`: only a user exception, matched by the
+    ///   catalog NUMBER the raise carries;
+    /// * `GDSCODE <name>`: the FIRST code of the vector and no other,
+    ///   so `WHEN GDSCODE exception_integer_divide_by_zero` does NOT
+    ///   catch a division by zero (whose first code is
+    ///   `isc_arith_except`) - measured against the engine;
+    /// * `SQLCODE <n>`: that first code's SQLCODE;
+    /// * `SQLSTATE '<s>'`: the WHOLE vector's derived state, which sees
+    ///   deeper than GDSCODE does - `'22012'` catches the division by
+    ///   zero that `'22000'` does not.
+    fn matches(&self, c: &HandlerCond) -> bool {
+        let err = self.as_eval_err();
+        let (codes, sqlcode, state) = eval_identity(&err);
+        match c {
+            HandlerCond::Exception(n) => match self {
+                Thrown::User(r) => n.eq_ignore_ascii_case(&r.name),
+                Thrown::Runtime { .. } => false,
+            },
+            HandlerCond::Gds(n) => crate::gdscodes::entry_by_name(n)
+                .is_some_and(|e| codes.first() == Some(&e.gds)),
+            HandlerCond::Sql(v) => sqlcode == Some(*v as i32),
+            HandlerCond::SqlState(want) => want.eq_ignore_ascii_case(state),
+        }
+    }
+}
+
 /// What stopped a body early.
 enum PsqlStop {
-    /// `EXCEPTION <name>` - carrying the identity the client is owed
-    Raise(Raised),
+    /// a raise - user exception or runtime error - carrying the
+    /// identity the client is owed
+    Raise(Thrown),
     /// a construct the interpreter does not implement; the statement
     /// fails whole rather than half-running
     Unsupported,
@@ -34275,11 +34472,21 @@ enum PsqlStop {
 /// NULL-propagating (the engine's rule: any NULL operand gives NULL).
 fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value, PsqlStop> {
     use fire_crab_ods::expr::Expr as E;
+    // AN ARITHMETIC RESULT THAT DOES NOT FIT IS AN ERROR, NOT A NULL.
+    // This answered NULL, which is the one thing a converted engine may
+    // never do: measured, the engine raises `isc_exception_integer_
+    // overflow` (SQLSTATE 22003, "Integer overflow. The result of an
+    // integer operation caused the most significant bit of the result to
+    // carry") and a body can catch it.
     let bin = |a: &E, b: &E, op: fn(i64, i64) -> Option<i64>| -> Result<Value, PsqlStop> {
         match (eval_psql_expr(a, f)?, eval_psql_expr(b, f)?) {
-            (Value::Int(x), Value::Int(y)) => {
-                Ok(op(x, y).map_or(Value::Null, Value::Int))
-            }
+            (Value::Int(x), Value::Int(y)) => match op(x, y) {
+                Some(v) => Ok(Value::Int(v)),
+                None => Err(PsqlStop::Raise(Thrown::Runtime {
+                    err: EvalErr::IntegerOverflow,
+                    trace: Vec::new(),
+                })),
+            },
             (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
             _ => Err(PsqlStop::Unsupported),
         }
@@ -34294,7 +34501,14 @@ fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value,
         E::Multiply(a, b) => bin(a, b, |x, y| x.checked_mul(y)),
         // division by zero is an error in SQL, not a NULL
         E::Divide(a, b) => match (eval_psql_expr(a, f)?, eval_psql_expr(b, f)?) {
-            (Value::Int(_), Value::Int(0)) => Err(PsqlStop::Unsupported),
+            // it was an error already - but a REFUSAL, which no handler
+            // can catch and which reaches the client as "this server
+            // could not run that". It is the engine's arithmetic
+            // exception now, and a body may catch it.
+            (Value::Int(_), Value::Int(0)) => Err(PsqlStop::Raise(Thrown::Runtime {
+                err: EvalErr::DivideByZero,
+                trace: Vec::new(),
+            })),
             (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x / y)),
             (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
             _ => Err(PsqlStop::Unsupported),
@@ -34745,7 +34959,50 @@ fn render_psql_cond(c: &fire_crab_ods::expr::Cond, f: &PsqlFrame) -> Option<Stri
 
 /// Run one statement of a body. A loop is bounded so a runaway WHILE
 /// cannot hang the connection.
+/// WHERE A RUNTIME ERROR WAS RAISED is the STATEMENT, not the
+/// expression inside it: the engine reports a division by zero in
+/// `N = 1/Z;` at the column of the `N`, not of the `/`. So an error
+/// thrown from an expression arrives here with an empty trace and this
+/// stamps the statement it came out of - the first one it passes, which
+/// is the innermost.
 fn exec_psql_stmt(
+    s: &TrigStmt,
+    f: &mut PsqlFrame,
+    steps: &mut u32,
+    db: &mut Option<Database>,
+    ctx: &SessionCtx,
+) -> Result<(), PsqlStop> {
+    let r = exec_psql_stmt_inner(s, f, steps, db, ctx);
+    if let Err(PsqlStop::Raise(t)) = &r {
+        if t.trace().is_empty() {
+            let mut t = t.clone();
+            t.push_raise(stmt_src_off(s));
+            return Err(PsqlStop::Raise(t));
+        }
+    }
+    r
+}
+
+/// A statement's offset in the body source - what the `At procedure`
+/// item is computed from.
+fn stmt_src_off(s: &TrigStmt) -> usize {
+    match s {
+        TrigStmt::Assign { src_off, .. }
+        | TrigStmt::If { src_off, .. }
+        | TrigStmt::While { src_off, .. }
+        | TrigStmt::Raise { src_off, .. }
+        | TrigStmt::Reraise { src_off, .. }
+        | TrigStmt::PostEvent { src_off, .. }
+        | TrigStmt::Store { src_off, .. }
+        | TrigStmt::Update { src_off, .. }
+        | TrigStmt::Delete { src_off, .. }
+        | TrigStmt::ForSelect { src_off, .. }
+        | TrigStmt::Suspend { src_off, .. }
+        | TrigStmt::Block { src_off, .. } => *src_off,
+    }
+}
+
+fn exec_psql_stmt_inner(
     s: &TrigStmt,
     f: &mut PsqlFrame,
     steps: &mut u32,
@@ -34798,12 +35055,12 @@ fn exec_psql_stmt(
             let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
             let (number, message) =
                 exception_identity(dbr, name).ok_or(PsqlStop::Unsupported)?;
-            Err(PsqlStop::Raise(Raised {
+            Err(PsqlStop::Raise(Thrown::User(Raised {
                 name: name.clone(),
                 number,
                 message,
                 trace: vec![*src_off],
-            }))
+            })))
         }
         // a bare EXCEPTION; re-raises what the enclosing handler caught,
         // IDENTITY INTACT - the client must see the original exception,
@@ -34813,7 +35070,7 @@ fn exec_psql_stmt(
         TrigStmt::Reraise { src_off } => match &f.caught {
             Some(ex) => {
                 let mut again = ex.clone();
-                again.trace.push(*src_off);
+                again.push_raise(*src_off);
                 Err(PsqlStop::Raise(again))
             }
             None => Err(PsqlStop::Unsupported),
@@ -34918,50 +35175,32 @@ fn exec_psql_stmt(
                     //     answers from the ANY, though the named one is
                     //     first AND matches;
                     //   * among several `WHEN ANY`, the LAST one wins;
-                    //   * with no `WHEN ANY`, the FIRST matching named
-                    //     handler wins, in source order (`WHEN EXCEPTION
-                    //     E_O ... WHEN EXCEPTION E_M ... WHEN EXCEPTION
-                    //     E_O` answers from the middle one).
+                    //   * with no `WHEN ANY`, the FIRST handler whose
+                    //     conditions match wins, in source order.
                     //
                     // So the list the engine walks is evidently not the
                     // source-order one; what is reproduced here is the
                     // OBSERVED rule, which `qa/serve-real-exceptions.sh`
-                    // holds against the live engine in each of those
-                    // shapes.
-                    let matches = |conds: &Vec<HandlerCond>| {
-                        conds.is_empty()
-                            || conds.iter().any(|c| match c {
-                                HandlerCond::Exception(n) => n.eq_ignore_ascii_case(&ex.name),
-                                // SQLCODE/GDSCODE name ENGINE errors, and
-                                // a user exception is not one of those.
-                                // (A raise does carry isc_except/-836, so
-                                // `WHEN GDSCODE except` catches it in the
-                                // engine; matching that needs the runtime
-                                // errors this slice does not model, and
-                                // claiming the match without them would
-                                // catch the wrong things.)
-                                HandlerCond::Gds(_) | HandlerCond::Sql(_) => false,
-                            })
-                    };
-                    // the last WHEN ANY, if there is one; otherwise the
-                    // first handler whose conditions match
+                    // and `qa/serve-real-psqlerrors.sh` hold against the
+                    // live engine in each shape that distinguishes it.
                     let chosen = handlers
                         .iter()
                         .rev()
                         .find(|(conds, _)| conds.is_empty())
-                        .or_else(|| handlers.iter().find(|(conds, _)| matches(conds)));
-                    for (conds, body) in chosen {
-                        let _ = conds;
-                        {
-                            // the handler's body runs with the caught
-                            // exception in scope, so a bare EXCEPTION;
-                            // inside it re-raises THIS one; nested
-                            // handlers save and restore around their own
-                            let outer = f.caught.replace(ex);
-                            let r = exec_psql_stmt(body, f, steps, db, ctx);
-                            f.caught = outer;
-                            return r;
-                        }
+                        .or_else(|| {
+                            handlers
+                                .iter()
+                                .find(|(conds, _)| conds.iter().any(|c| ex.matches(c)))
+                        });
+                    if let Some((_, body)) = chosen {
+                        // the handler's body runs with what it caught in
+                        // scope, so a bare EXCEPTION; inside it re-raises
+                        // THAT; nested handlers save and restore around
+                        // their own
+                        let outer = f.caught.replace(ex);
+                        let r = exec_psql_stmt(body, f, steps, db, ctx);
+                        f.caught = outer;
+                        return r;
                     }
                     Err(PsqlStop::Raise(ex))
                 }
@@ -35045,6 +35284,39 @@ enum BlrProcOutcome {
     /// interpreter that answered rows here would mask the engine's
     /// own behavior)
     Runtime(EvalErr),
+}
+
+/// THE SAME RUNTIME ERROR, WITH THE POSITION IT WAS RAISED AT.
+///
+/// There are two execution paths - `fire-crab-exe`'s BLR interpreter,
+/// which runs first, and the source interpreter behind it - and only the
+/// second knows where in the BODY it is: the BLR one holds a byte offset
+/// into BLR, which would have to go through the debug blob's
+/// `fb_dbg_map_src2blr` entries to become a line and column.
+///
+/// Until it does, the body is re-run through the source interpreter when
+/// the BLR path raises, purely to recover the `At procedure ... line: L,
+/// col: C` item the engine prints. Re-running is safe HERE and nowhere
+/// else: the BLR executor works on an overlay that persists nothing, so
+/// the second run is the first that could write, and `run_procedure`
+/// undoes a body that fails anyway.
+///
+/// If the source interpreter cannot run the body, or raises something
+/// else, the BLR error stands unchanged - a position is worth having,
+/// never worth inventing.
+fn runtime_with_position(
+    database: &mut Option<Database>,
+    name: &str,
+    args: &[Value],
+    ctx: &SessionCtx,
+    e: EvalErr,
+) -> EvalErr {
+    match run_procedure(database, name, args, ctx) {
+        Err(ProcErr { status: Some(EvalErr::AtProcedure { inner, at }), .. }) if *inner == e => {
+            EvalErr::AtProcedure { inner, at }
+        }
+        _ => e,
+    }
 }
 
 fn try_procedure_blr(
@@ -35180,30 +35452,34 @@ fn run_procedure(
     match outcome {
         Ok(()) => {}
         // A RAISE IS NOT A REFUSAL. The body did what its source says,
-        // so the client gets the engine's own vector for it: the
-        // exception's number, its quoted name, its message, and the
-        // `At procedure ... line: L, col: C` item that says where in
-        // the body it came from.
+        // so the client gets the engine's own vector for it - a user
+        // exception's number, quoted name and message, or a runtime
+        // error's own codes - and one `At procedure ... line: L, col: C`
+        // item per raise point.
         Err(PsqlStop::Raise(ex)) => {
+            let at: Vec<String> = ex
+                .trace()
+                .iter()
+                .filter_map(|off| ddl_position(&meta, *off))
+                .map(|(line, col)| {
+                    format!(
+                        "At procedure {} line: {}, col: {}",
+                        quoted_qualified(name),
+                        line,
+                        col
+                    )
+                })
+                .collect();
+            let inner = ex.as_eval_err();
             return Err(ProcErr {
-                text: format!("exception {}", ex.name),
-                status: Some(EvalErr::UserException {
-                    number: ex.number,
-                    name: quoted_qualified(&ex.name),
-                    message: ex.message.clone(),
-                    stack: ex
-                        .trace
-                        .iter()
-                        .filter_map(|off| ddl_position(&meta, begin_at, *off))
-                        .map(|(line, col)| {
-                            format!(
-                                "At procedure {} line: {}, col: {}",
-                                quoted_qualified(name),
-                                line,
-                                col
-                            )
-                        })
-                        .collect(),
+                text: match &ex {
+                    Thrown::User(r) => format!("exception {}", r.name),
+                    Thrown::Runtime { err, .. } => format!("{:?}", err),
+                },
+                status: Some(if at.is_empty() {
+                    inner
+                } else {
+                    EvalErr::AtProcedure { inner: Box::new(inner), at }
                 }),
             });
         }
@@ -37728,6 +38004,9 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             continue;
                         }
                         BlrProcOutcome::Runtime(e) => {
+                            let e = runtime_with_position(
+                                &mut database, &pname, &pargs, &ctx, e,
+                            );
                             respond_eval_error(&mut s, &mut enc, &e)?;
                             continue;
                         }
@@ -37786,6 +38065,9 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             continue;
                         }
                         BlrProcOutcome::Runtime(e) => {
+                            let e = runtime_with_position(
+                                &mut database, &pname, &pargs, &ctx, e,
+                            );
                             respond_eval_error(&mut s, &mut enc, &e)?;
                             continue;
                         }
@@ -38464,6 +38746,9 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             continue;
                         }
                         BlrProcOutcome::Runtime(e) => {
+                            let e = runtime_with_position(
+                                &mut database, &pname, &pargs, &ctx, e,
+                            );
                             respond_eval_error(&mut s, &mut enc, &e)?;
                             continue;
                         }
