@@ -2220,6 +2220,27 @@ plus *the subsystem is now on the path*.
   is left that scales with the file is the per-write COPY of the image,
   which is what per-page fetch removes.
 
+  **WHERE A STATEMENT'S TIME GOES NOW**, measured on an indexed table
+  (`FC_SRV_TIME=1`, INSERT 3.6ms end to end):
+
+  | phase | cost |
+  |---|---|
+  | the careful flush | 2234us |
+  | the SELECT plan | 1003us, of which `choose_index` 544us |
+  | the DML plan | 420us |
+  | executing the write | 118us — the record write itself 2us, index maintenance 6us |
+  | the image copy per write | 84us |
+
+  Two things follow. **The flush is the physics of the disk**: Forced
+  Writes means a synchronous write per page, and the engine is in the
+  same regime — fewer pages per transaction is the only lever, and the
+  commit already batches a transaction's statements into one. **And
+  `choose_index` calls the optimizer per statement**, which re-derives
+  its plan from the SQL text and the index metadata every time. That is
+  a STATEMENT CACHE - the paper has a chapter on it, the engine has one,
+  and fire-crab has none: the next item after this one, with its own
+  invalidation (DDL, as here) and its own bound.
+
   **MEASURED BEFORE DOING IT, and it is not where the time is.** With
   `FC_SRV_TIME=1` on a two-row table, an INSERT cost 8.2ms: the work
   copy 111us (1.3%), the careful flush 957us, and **building the plan

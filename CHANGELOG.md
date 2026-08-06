@@ -13,6 +13,24 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-06 — Where a statement's time goes
+
+### Converted
+- **The phase timer reaches inside the write**, with a scope form
+  (`TimeSpan`) as well as the call form, so a phase can be timed
+  without wrapping the code in a closure that swallows its errors.
+  Measured on an indexed table, an INSERT of 3.6ms: the careful flush
+  2234us, the SELECT plan 1003us (of which `choose_index` 544us), the
+  DML plan 420us, executing the write 118us — **the record write itself
+  2us and the index maintenance 6us** — and the image copy 84us.
+- **What that says about the next items.** The flush is the disk:
+  Forced Writes is a synchronous write per page and the engine is in
+  the same regime, with the commit already batching a transaction's
+  statements into one. `choose_index` calls the optimizer per
+  statement, which re-derives its plan from the SQL and the index
+  metadata every time — a STATEMENT CACHE, which the engine has and
+  fire-crab does not, and which the roadmap now names as the next item.
+
 ## 2026-08-06 — The last whole-file write
 
 ### Converted

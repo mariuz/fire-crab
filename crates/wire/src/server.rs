@@ -501,6 +501,32 @@ fn timed<T>(label: &str, f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// [timed] for a scope rather than a call - reports when it drops.
+struct TimeSpan {
+    label: &'static str,
+    at: std::time::Instant,
+    on: bool,
+}
+
+impl TimeSpan {
+    fn start(label: &'static str) -> TimeSpan {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        TimeSpan {
+            label,
+            at: std::time::Instant::now(),
+            on: *ON.get_or_init(|| std::env::var("FC_SRV_TIME").is_ok()),
+        }
+    }
+}
+
+impl Drop for TimeSpan {
+    fn drop(&mut self) {
+        if self.on {
+            eprintln!("[time] {:<18} {:>8} us", self.label, self.at.elapsed().as_micros());
+        }
+    }
+}
+
 /// A monotonic attachment id, one per op_attach, so `con.info.id`
 /// (isc_info_attachment_id) is distinct per connection - the
 /// firebird-qa bootstrap opens two employee connections and names both
@@ -13740,10 +13766,18 @@ fn execute_dml_collecting_inner(
                 a.descs = descs.clone();
                 a.images.push(image.clone());
             }
-            let out = fire_crab_ods::insert_record_under(
-                &mut work, db.page_size, *rel, *format_no, image, dml_tx(stmt_tx)?,
-            )?;
+            let out = {
+                // timed as a SCOPE, so the error the write returns is
+                // still the error the statement raises - wrapping it in
+                // a closure that swallowed it into `None` would have
+                // turned every ODS refusal into "insert failed"
+                let _t = TimeSpan::start("exec:insert-record");
+                fire_crab_ods::insert_record_under(
+                    &mut work, db.page_size, *rel, *format_no, image, dml_tx(stmt_tx)?,
+                )?
+            };
             if !index_ops.is_empty() {
+                let _t = TimeSpan::start("exec:index-maint");
                 let recno = recno_of(&work, db.page_size, out.page_no, out.slot)?;
                 let values = decode_record(image, descs);
                 for op in index_ops {
