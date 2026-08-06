@@ -23,6 +23,7 @@
 
 pub mod dblocks;
 pub mod mdc;
+pub mod stmc;
 pub mod gdscodes;
 pub mod server;
 

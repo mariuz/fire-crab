@@ -13,6 +13,31 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-06 — The statement cache, and why it is not wired
+
+### Converted
+- **`crates/wire/stmc.rs`**: the plan a statement resolves to, kept per
+  attachment, keyed by the SAME generation the metadata cache uses so
+  one DDL drops both — bounded at 256 entries (a client that inlines
+  its literals makes a new entry per statement, and a cache without a
+  ceiling inside a long-lived server is a leak with good manners), and
+  refusals deliberately not remembered. Four unit tests; `FC_NO_STMTCACHE`
+  to turn it off.
+- **NOT WIRED, and the reason is worth more than the cache.** Wiring it
+  made a statement answer wrongly: **a plan is not a pure function of
+  (schema, text)**. An unfiltered `SELECT COUNT(*)` is FOLDED TO A
+  CONSTANT at prepare time — the planner counts the records and answers
+  `Plan::Scalar(n)` — so a cached plan freezes the count. Measured with
+  the cache on: one row, insert a row, ask again, one. The same query
+  WITH a filter, which is not folded, answered two.
+- **What it would buy, measured before it was taken out again**:
+  `plan(select)` 1104us → 299us, the statement 1.40ms → 0.50ms.
+- **The next step is precise**: move the unfiltered COUNT(*) fold from
+  prepare to execute — it should plan to the aggregate the filtered one
+  already plans to — and the cache goes in unchanged. `Plan` and the
+  DDL payload types gained `Clone` on the way, which is what a cache
+  needs of them.
+
 ## 2026-08-06 — Where a statement's time goes
 
 ### Converted

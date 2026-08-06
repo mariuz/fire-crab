@@ -192,6 +192,7 @@ pub fn null_default_blr() -> Vec<u8> {
 /// a `UNIQUE`, named or not. Both are backed by a unique index; the
 /// engine names that index after the constraint when the constraint is
 /// named, and generates `RDB$PRIMARY<n>` / `RDB$<n>` when it is not.
+#[derive(Clone)]
 pub struct KeyDef {
     /// constraint name, empty when the statement did not name it
     pub name: String,
@@ -207,6 +208,7 @@ pub struct KeyDef {
 /// if-failed-raise wrapper - [crate::expr::check_trigger_blr]), and the
 /// fields the condition references, first-seen order (the trigger's
 /// `RDB$DEPENDENCIES` rows).
+#[derive(Clone)]
 pub struct CheckDef {
     /// constraint name, empty when the statement did not name it
     pub name: String,
@@ -219,6 +221,7 @@ pub struct CheckDef {
 /// the order the engine's generated INTEG_<n> names follow (probed: a
 /// CHECK declared between a NOT NULL column and the PRIMARY KEY numbers
 /// between them).
+#[derive(Clone)]
 pub enum TableConstraint {
     Key(KeyDef),
     Check(CheckDef),
@@ -2941,6 +2944,7 @@ impl RefAction {
 /// [ON UPDATE <action>] [ON DELETE <action>]` clause of a CREATE TABLE.
 /// `name` is the constraint name (also the FK index name, as the engine
 /// names them the same).
+#[derive(Clone)]
 pub struct ForeignKeyDef {
     pub name: String,
     pub columns: Vec<String>,
@@ -3499,6 +3503,7 @@ fn write_check(
 /// A user `CREATE TRIGGER`, compiled: the catalog values plus the three
 /// blobs (verbatim source from `AS` on, the body BLR, and the
 /// `RDB$DEBUG_INFO` source-to-BLR map the engine writes for PSQL).
+#[derive(Clone)]
 pub struct UserTriggerDef {
     pub name: String,
     /// 1 = BEFORE INSERT, 3 = BEFORE UPDATE (the slice this writer
@@ -3810,6 +3815,7 @@ pub fn drop_index(file: &mut Vec<u8>, page_size: usize, index_name: &str) -> Res
 
 /// What a `COMMENT ON` targets - the object whose `RDB$DESCRIPTION`
 /// column is written.
+#[derive(Clone)]
 pub enum CommentTarget {
     /// `COMMENT ON TABLE <name>` - the `RDB$RELATIONS` row
     Table(String),

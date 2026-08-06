@@ -581,6 +581,20 @@ struct Database {
     /// this database's metadata cache - what the catalog says about a
     /// relation, held until DDL changes it (see [crate::mdc])
     meta: std::sync::Arc<crate::mdc::DbMetadata>,
+    /// ...and this ATTACHMENT's prepared statements - CONVERTED AND
+    /// NOT WIRED, see [crate::stmc] for the measurement that asked for
+    /// it and the one that stopped it: an unfiltered `SELECT COUNT(*)`
+    /// is folded to a CONSTANT at prepare time, so a plan is not a pure
+    /// function of (schema, text) and caching one freezes the count.
+    ///
+    /// Per connection rather than per database, when it is wired: a
+    /// `Plan` holds `Rc`s and cannot cross a thread, and a client
+    /// re-prepares its statements on its OWN connection, which is where
+    /// the hits are. Correctness would still come from the shared
+    /// generation - another connection's DDL moves it, and every plan
+    /// compiled under the old one becomes unreachable by key.
+    #[allow(dead_code)]
+    stmts: crate::stmc::DbStatements<Plan, Descriptor>,
     /// this database's lock table, and this attachment's identity in
     /// it: a transaction holds a lock on its own id while it lives, and
     /// a writer that meets one of its versions waits on that - see
@@ -647,6 +661,10 @@ impl Database {
     /// was about the old one.
     fn invalidate_meta(&self) {
         self.meta.invalidate();
+        // every plan in the statement cache was compiled against the
+        // schema that just changed - the generation key would hide them
+        // anyway, and clearing says so in the counters
+        self.stmts.invalidate();
     }
 
     /// One more catalog-derived answer, held until DDL - the index
@@ -1164,6 +1182,7 @@ fn load_database(path: &str) -> Option<Database> {
         tx: None,
         touched: false,
         meta,
+        stmts: Default::default(),
         locks,
         lock_owner,
         image_undo: false,
@@ -2214,6 +2233,7 @@ enum SavepointOp {
     Release,
 }
 
+#[derive(Clone)]
 enum Plan {
     /// (value, output-column name): the engine names a lone aggregate's
     /// column by its FUNCTION (COUNT/MIN/MAX/SUM), a bare literal
@@ -2897,6 +2917,7 @@ enum GenWrite {
 
 /// One UPDATE SET value: encoded at prepare (literal - `None` inside =
 /// SQL NULL), or a parameter slot bound at execute.
+#[derive(Clone)]
 enum SetVal {
     Lit(Option<Vec<u8>>),
     Param(usize),
@@ -36382,6 +36403,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         }
                     }
                 } else {
+                    // NOT through the statement cache - see [crate::stmc]
+                    // for what has to move first.
                     let (p, ps) = timed("plan(select)", || plan_query(&stmt_sql, &database));
                     // A REFUSED STATEMENT FAILS AT PREPARE, which is where
                     // the engine fails an unsupported one too. Answering
@@ -38859,6 +38882,7 @@ mod tests {
             tx: None,
             touched: false,
             meta: crate::mdc::for_path("/nonexistent/fc-rowsource-test"),
+            stmts: Default::default(),
             locks: crate::dblocks::for_path("/nonexistent/fc-rowsource-test"),
             lock_owner: 0,
             image_undo: false,
@@ -41666,6 +41690,7 @@ mod tests {
             tx: None,
             touched: false,
             meta: crate::mdc::for_path("/nonexistent/fc-rowsource-test"),
+            stmts: Default::default(),
             locks: crate::dblocks::for_path("/nonexistent/fc-rowsource-test"),
             lock_owner: 0,
             image_undo: false,
