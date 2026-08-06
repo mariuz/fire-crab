@@ -35769,8 +35769,8 @@ fn resolve_having(
 // against this map whenever an op names a different statement.
 struct StmtSlot {
     sql: String,
-    plan: Plan,
-    params: Vec<Descriptor>,
+    plan: std::rc::Rc<Plan>,
+    params: std::rc::Rc<Vec<Descriptor>>,
     bound: Vec<WireParam>,
     last_dml: (i32, i32, i32),
 }
@@ -35782,8 +35782,8 @@ fn switch_stmt(
     cur: &mut i32,
     slots: &mut std::collections::HashMap<i32, StmtSlot>,
     sql: &mut String,
-    plan: &mut Plan,
-    params: &mut Vec<Descriptor>,
+    plan: &mut std::rc::Rc<Plan>,
+    params: &mut std::rc::Rc<Vec<Descriptor>>,
     bound: &mut Vec<WireParam>,
     last_dml: &mut (i32, i32, i32),
 ) {
@@ -35794,7 +35794,14 @@ fn switch_stmt(
         *cur,
         StmtSlot {
             sql: std::mem::take(sql),
-            plan: std::mem::replace(plan, Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None)),
+            plan: std::mem::replace(
+                plan,
+                std::rc::Rc::new(Plan::Scalar(
+                    ScalarVal::Fixed(Some(FIXED_ANSWER)),
+                    "CONSTANT".to_string(),
+                    None,
+                )),
+            ),
             params: std::mem::take(params),
             bound: std::mem::take(bound),
             last_dml: *last_dml,
@@ -35811,8 +35818,12 @@ fn switch_stmt(
         // a handle the client allocated but never prepared
         None => {
             sql.clear();
-            *plan = Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None);
-            params.clear();
+            *plan = std::rc::Rc::new(Plan::Scalar(
+                ScalarVal::Fixed(Some(FIXED_ANSWER)),
+                "CONSTANT".to_string(),
+                None,
+            ));
+            *params = std::rc::Rc::new(Vec::new());
             bound.clear();
             *last_dml = (0, 0, 0);
         }
@@ -36029,8 +36040,14 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // the last op_execute carried for them, and the last DML's per-verb
     // affected counts (what isc_info_sql_records reports).
     let mut stmt_sql = String::new();
-    let mut plan = Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None);
-    let mut stmt_params: Vec<Descriptor> = Vec::new();
+    // Rc, so a cached plan is ADOPTED rather than copied: cloning the
+    // plan out of the statement cache was most of what a hit cost.
+    let mut plan: std::rc::Rc<Plan> = std::rc::Rc::new(Plan::Scalar(
+        ScalarVal::Fixed(Some(FIXED_ANSWER)),
+        "CONSTANT".to_string(),
+        None,
+    ));
+    let mut stmt_params: std::rc::Rc<Vec<Descriptor>> = std::rc::Rc::new(Vec::new());
     let mut bound_args: Vec<WireParam> = Vec::new();
     let mut last_dml = (0i32, 0i32, 0i32); // (inserted, updated, deleted)
     // The five locals above are the LIVE statement's working set;
@@ -36370,8 +36387,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 // the lexer refuses before anything is planned or written
                 // (see [has_unknown_space])
                 if has_unknown_space(&stmt_sql) {
-                    plan = Plan::Refused;
-                    stmt_params = Vec::new();
+                    plan = std::rc::Rc::new(Plan::Refused);
+                    stmt_params = std::rc::Rc::new(Vec::new());
                     respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                     continue;
                 }
@@ -36382,8 +36399,9 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 let dml_kw = ["INSERT", "UPDATE", "DELETE"]
                     .into_iter()
                     .find(|k| find_word(&up, k, 0) == Some(0));
-                if let Some((p, ps)) =
-                    plan_set_generator(&stmt_sql).or_else(|| plan_set_statistics(&stmt_sql))
+                if let Some((p, ps)) = plan_set_generator(&stmt_sql)
+                    .or_else(|| plan_set_statistics(&stmt_sql))
+                    .map(|(p, ps)| (std::rc::Rc::new(p), std::rc::Rc::new(ps)))
                 {
                     // SET GENERATOR / SET STATISTICS - DDL that begins with
                     // SET, so it is not caught by the DDL/DML verb list
@@ -36426,17 +36444,21 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         .or_else(|| plan_alter_column_generated(&stmt_sql))
                         .or_else(|| plan_alter_column_drop_identity(&stmt_sql))
                         .or_else(|| plan_alter_column_position(&stmt_sql))
-                        .or_else(|| plan_alter_sequence(&stmt_sql));
+                        .or_else(|| plan_alter_sequence(&stmt_sql))
+                        // one shape for every branch: the loop adopts an
+                        // Rc, whether it came from a planner or a cache
+                        .map(|(p, ps)| (std::rc::Rc::new(p), std::rc::Rc::new(ps)));
                     match planned {
                         Some((p, ps)) => {
+                            // DDL is not cached, so this pair is owned
                             let describe = answer_prepare(&prep_items, &p, &ps, att_cs);
                             plan = p;
                             stmt_params = ps;
                             respond_prepare(&mut s, &mut enc, &describe)?;
                         }
                         None => {
-                            plan = Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None);
-                            stmt_params = Vec::new();
+                            plan = std::rc::Rc::new(Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None));
+                            stmt_params = std::rc::Rc::new(Vec::new());
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
                     }
@@ -36470,7 +36492,9 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         };
                         match database.as_ref() {
                             Some(db) => db.stmts.plan(gen, &dml_sql, build),
-                            None => build(),
+                            None => build().map(|(p, d)| {
+                                (std::rc::Rc::new(p), std::rc::Rc::new(d))
+                            }),
                         }
                     });
                     let planned = match (planned, &returning) {
@@ -36483,9 +36507,22 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         // RETURNING clause (probed). Pass the refusal
                         // through unwrapped so the RefusedEval arm
                         // below answers it at prepare.
-                        (Some((p @ Plan::RefusedEval(_), ps)), Some(_)) => Some((p, ps)),
+                        (Some((p, ps)), Some(_)) if matches!(&*p, Plan::RefusedEval(_)) => {
+                            Some((p, ps))
+                        }
+                        // RETURNING WRAPS THE PLAN, so this one path
+                        // needs it owned - out of the Rc, and only here
                         (Some((p, ps)), Some(list)) => match dml_table_name(&dml_sql)
-                            .and_then(|t| wrap_returning(p, ps, list, &t, &database))
+                            .and_then(|t| {
+                                wrap_returning(
+                                    (*p).clone(),
+                                    (*ps).clone(),
+                                    list,
+                                    &t,
+                                    &database,
+                                )
+                            })
+                            .map(|(w, wp)| (std::rc::Rc::new(w), std::rc::Rc::new(wp)))
                         {
                             Some(w) => Some(w),
                             // a RETURNING list this slice does not convert
@@ -36500,20 +36537,23 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         // UPDATE OR INSERT on a PK-less table without
                         // MATCHING: the engine's specific vector at
                         // prepare, not the generic Dynamic SQL Error
-                        Some((Plan::RefusedEval(e), _)) => {
-                            plan = Plan::Refused;
-                            stmt_params = Vec::new();
+                        Some((p, _)) if matches!(&*p, Plan::RefusedEval(_)) => {
+                            let Plan::RefusedEval(e) = &*p else { unreachable!() };
+                            let e = e.clone();
+                            plan = std::rc::Rc::new(Plan::Refused);
+                            stmt_params = std::rc::Rc::new(Vec::new());
                             respond_eval_error(&mut s, &mut enc, &e)?;
                         }
                         Some((p, ps)) => {
+                            // adopted, not copied - both are already Rc
                             let describe = answer_prepare(&prep_items, &p, &ps, att_cs);
                             plan = p;
                             stmt_params = ps;
                             respond_prepare(&mut s, &mut enc, &describe)?;
                         }
                         None => {
-                            plan = Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None);
-                            stmt_params = Vec::new();
+                            plan = std::rc::Rc::new(Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None));
+                            stmt_params = std::rc::Rc::new(Vec::new());
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
                     }
@@ -36532,7 +36572,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             .stmts
                             .plan(gen, &stmt_sql, || Some(plan_query(&stmt_sql, &database)))
                             .expect("the planner answers every text"),
-                        None => plan_query(&stmt_sql, &database),
+                        None => {
+                            let (p, ps) = plan_query(&stmt_sql, &database);
+                            (std::rc::Rc::new(p), std::rc::Rc::new(ps))
+                        }
                     });
                     // A REFUSED STATEMENT FAILS AT PREPARE, which is where
                     // the engine fails an unsupported one too. Answering
@@ -36541,27 +36584,27 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     // "request synchronization error" and drop the
                     // connection instead of showing a SQL error, and a
                     // dropped connection is what libfbclient segfaults on.
-                    if matches!(p, Plan::Refused) {
+                    if matches!(&*p, Plan::Refused) {
                         if std::env::var("FC_SRV_TRACE").is_ok() {
                             eprintln!("[srv] prepare refused: {:?}", stmt_sql);
                         }
-                        plan = Plan::Refused;
-                        stmt_params = Vec::new();
+                        plan = std::rc::Rc::new(Plan::Refused);
+                        stmt_params = std::rc::Rc::new(Vec::new());
                         respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
-                    } else if let Plan::RefusedEval(e) = p {
+                    } else if let Plan::RefusedEval(e) = &*p {
                         // refused with the engine's own vector - a
                         // literal negative SUBSTRING length fails the
                         // engine's describe, so it fails this prepare
                         if std::env::var("FC_SRV_TRACE").is_ok() {
                             eprintln!("[srv] prepare refused ({:?}): {:?}", e, stmt_sql);
                         }
-                        plan = Plan::Refused;
-                        stmt_params = Vec::new();
+                        plan = std::rc::Rc::new(Plan::Refused);
+                        stmt_params = std::rc::Rc::new(Vec::new());
                         respond_eval_error(&mut s, &mut enc, &e)?;
                     } else {
                         plan = p;
                         stmt_params = ps;
-                        let describe = answer_prepare(&prep_items, &plan, &stmt_params, att_cs);
+                        let describe = answer_prepare(&prep_items, &*plan, &stmt_params, att_cs);
                         respond_prepare(&mut s, &mut enc, &describe)?;
                     }
                 }
@@ -36615,7 +36658,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     last_dml = (0, 0, 0);
                     respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                 } else if matches!(
-                    plan,
+                    &*plan,
                     Plan::Insert { .. }
                         | Plan::UpdateOrInsert { .. }
                         // a RETURNING statement is a DML that also has a
@@ -36676,7 +36719,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     // path below - execute_dml_collecting's own arm
                     // materialises the query's rows and re-enters per
                     // row, so bare and RETURNING forms share one path.
-                    if let Plan::Savepoint { kind, name } = &plan {
+                    if let Plan::Savepoint { kind, name } = &*plan {
                         let pos = savepoints.iter().position(|(n, _)| n.eq_ignore_ascii_case(name));
                         if std::env::var("FC_SRV_TRACE").is_ok() {
                             eprintln!("[srv] savepoint op on {:?}, known={:?}", name, pos);
@@ -36741,7 +36784,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         } else {
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
-                    } else if let Plan::TxControl { rollback } = &plan {
+                    } else if let Plan::TxControl { rollback } = &*plan {
                         // ending the transaction discards every mark
                         savepoints.clear();
                         let outcome = if *rollback {
@@ -36766,7 +36809,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         end_transaction(&mut database, outcome);
                         last_dml = (0, 0, 0);
                         respond(&mut s, &mut enc, TX_HANDLE)?;
-                    } else if let Plan::Returning { inner, cols, fields } = &plan {
+                    } else if let Plan::Returning { inner, cols, fields } = &*plan {
                         // the DML runs HERE, like every other write, and
                         // the rows it touched become the cursor the client
                         // fetches next
@@ -36803,7 +36846,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                 // a fetch serves them, and a second fetch
                                 // finds the cursor empty rather than
                                 // running the write again
-                                plan = Plan::Rows { cols, rows };
+                                plan = std::rc::Rc::new(Plan::Rows { cols, rows });
                                 respond(&mut s, &mut enc, TX_HANDLE)?;
                             }
                             Err(e) => {
@@ -36823,7 +36866,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         }
                     } else {
                     match timed("execute", || {
-                        execute_dml(&plan, &mut database, &bound_args, &SessionCtx { user, attach_id })
+                        execute_dml(&*plan, &mut database, &bound_args, &SessionCtx { user, attach_id })
                     }) {
                         Ok(counts) => {
                             last_dml = counts;
@@ -36856,7 +36899,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         }
                     }
                     }
-                } else if matches!(&plan, Plan::Modified { inner, .. }
+                } else if matches!(&*plan, Plan::Modified { inner, .. }
                     if matches!(**inner, Plan::ProcSelect { .. }))
                 {
                     // A MODIFIER OVER A SELECTABLE PROCEDURE. The inner
@@ -36866,7 +36909,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     if std::env::var("FC_SRV_TRACE").is_ok() {
                         eprintln!("[srv] modifier over a procedure: running the body");
                     }
-                    let (pname, pargs, icols, picks, outer) = match &plan {
+                    let (pname, pargs, icols, picks, outer) = match &*plan {
                         Plan::Modified { inner, cols, distinct, skip, take } => match &**inner {
                             Plan::ProcSelect { name, args, cols: ic, picks } => (
                                 name.clone(),
@@ -36892,13 +36935,13 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                 })
                                 .collect();
                             let (mcols, distinct, skip, take) = outer;
-                            plan = Plan::Modified {
+                            plan = std::rc::Rc::new(Plan::Modified {
                                 inner: Box::new(Plan::ProcRows { cols: icols, rows }),
                                 cols: mcols,
                                 distinct,
                                 skip,
                                 take,
-                            };
+                            });
                             respond(&mut s, &mut enc, TX_HANDLE)?;
                         }
                         Err(e) => {
@@ -36908,10 +36951,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
                     }
-                } else if matches!(plan, Plan::ProcSelect { .. }) {
+                } else if matches!(&*plan, Plan::ProcSelect { .. }) {
                     // a selectable procedure: run the body HERE (it may
                     // write) and keep the rows it SUSPENDed for the fetch
-                    let (pname, pargs, pcols, picks) = match &plan {
+                    let (pname, pargs, pcols, picks) = match &*plan {
                         Plan::ProcSelect { name, args, cols, picks } => {
                             (name.clone(), args.clone(), cols.clone(), picks.clone())
                         }
@@ -36935,7 +36978,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                         .collect()
                                 })
                                 .collect();
-                            plan = Plan::ProcRows { cols: pcols, rows };
+                            plan = std::rc::Rc::new(Plan::ProcRows { cols: pcols, rows });
                             respond(&mut s, &mut enc, TX_HANDLE)?;
                             continue;
                         }
@@ -36958,7 +37001,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                         .collect()
                                 })
                                 .collect();
-                            plan = Plan::ProcRows { cols: pcols, rows };
+                            plan = std::rc::Rc::new(Plan::ProcRows { cols: pcols, rows });
                             respond(&mut s, &mut enc, TX_HANDLE)?;
                         }
                         Err(e) => {
@@ -36968,11 +37011,11 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
                     }
-                } else if matches!(plan, Plan::ProcInvoke { .. }) {
+                } else if matches!(&*plan, Plan::ProcInvoke { .. }) {
                     // EXECUTE PROCEDURE runs HERE, because a body may
                     // WRITE, and becomes the row its output parameters
                     // make for the fetch
-                    let (pname, pargs, pcols) = match &plan {
+                    let (pname, pargs, pcols) = match &*plan {
                         Plan::ProcInvoke { name, args, cols } => {
                             (name.clone(), args.clone(), cols.clone())
                         }
@@ -36987,7 +37030,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         BlrProcOutcome::Rows(rows, finals) => {
                             let values =
                                 rows.into_iter().next().unwrap_or(finals);
-                            plan = Plan::ProcCall { cols: pcols, values };
+                            plan = std::rc::Rc::new(Plan::ProcCall { cols: pcols, values });
                             respond(&mut s, &mut enc, TX_HANDLE)?;
                             continue;
                         }
@@ -36999,7 +37042,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     }
                     match run_procedure(&mut database, &pname, &pargs, &ctx) {
                         Ok((values, _rows)) => {
-                            plan = Plan::ProcCall { cols: pcols, values };
+                            plan = std::rc::Rc::new(Plan::ProcCall { cols: pcols, values });
                             respond(&mut s, &mut enc, TX_HANDLE)?;
                         }
                         Err(e) => {
@@ -37009,17 +37052,17 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
                     }
-                } else if matches!(plan, Plan::GenIdIncrement { .. }) {
+                } else if matches!(&*plan, Plan::GenIdIncrement { .. }) {
                     // a generator-incrementing SELECT writes HERE, then
                     // becomes the Scalar of its new value for the fetch
-                    let (name, step) = match &plan {
+                    let (name, step) = match &*plan {
                         Plan::GenIdIncrement { name, step } => (name.clone(), *step),
                         _ => unreachable!(),
                     };
                     match gen_id_increment(&mut database, &name, step) {
                         Ok(new_val) => {
                             let n = if step.is_none() { "NEXT_VALUE" } else { "GEN_ID" };
-                            plan = Plan::Scalar(ScalarVal::Fixed(Some(new_val)), n.to_string(), None);
+                            plan = std::rc::Rc::new(Plan::Scalar(ScalarVal::Fixed(Some(new_val)), n.to_string(), None));
                             respond(&mut s, &mut enc, TX_HANDLE)?;
                         }
                         Err(e) => {
@@ -37029,7 +37072,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
                     }
-                } else if let Err(e) = validate_select_bind(&plan, &bound_args) {
+                } else if let Err(e) = validate_select_bind(&*plan, &bound_args) {
                     // a parameterised SELECT whose values cannot bind
                     // (type mismatch) fails HERE, visibly - never an
                     // unfiltered or empty answer at fetch. An
@@ -37062,7 +37105,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 if std::env::var("FC_SRV_TRACE").is_ok() {
                     eprintln!("[srv] op_info_sql items: {:?}", items);
                 }
-                let info = answer_info_sql(&items, &plan, last_dml);
+                let info = answer_info_sql(&items, &*plan, last_dml);
                 let mut w = W::default();
                 w.int(OP_RESPONSE).int(0).int(0).int(0).bytes(&info).int(0);
                 w.send(&mut s, &mut enc)?;
@@ -37100,10 +37143,15 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 // A DEFERRED access must be resolved BEFORE the cursor is
                 // materialised: materialising runs the retrieval, and a
                 // retrieval that has not been given its bands scans.
+                // PATCHED THROUGH `make_mut`, so a plan shared with the
+                // statement cache is COPIED before it is changed. Writing
+                // the resolved index into the cached plan would hand the
+                // next statement an access path chosen for this one's
+                // parameter values.
                 if let (
                     Plan::Project { rel, formats, filter, order_by, index, defer, .. },
                     Some(db),
-                ) = (&mut plan, database.as_ref())
+                ) = (std::rc::Rc::make_mut(&mut plan), database.as_ref())
                 {
                     if index.is_none() && defer.is_some() {
                         if let Ok(bound) = bind_filter(filter, &bound_args) {
@@ -37144,7 +37192,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 // encode_row then evaluates each output column against
                 // the filled row, exactly as the streaming path does.
                 if want > 0 {
-                    let gen_batch = match (&plan, database.as_ref()) {
+                    let gen_batch = match (&*plan, database.as_ref()) {
                         (
                             Plan::Project {
                                 rel, formats, cols, filter, order_by, gen_cols, index, ..
@@ -37203,12 +37251,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     };
                     if let Some((cols, rows, writes)) = gen_batch {
                         gen_writes = writes;
-                        plan = Plan::Rows { cols, rows };
+                        plan = std::rc::Rc::new(Plan::Rows { cols, rows });
                     }
                 }
-                if want > 0 && !matches!(plan, Plan::Rows { .. }) {
+                if want > 0 && !matches!(&*plan, Plan::Rows { .. }) {
                     if let Some(db) = database.as_ref() {
-                        if let Some(rows) = branch_rows(&plan, db, &bound_args) {
+                        if let Some(rows) = branch_rows(&*plan, db, &bound_args) {
                             // `branch_rows` hands back rows that are
                             // ALREADY PROJECTED - one value per output
                             // column, in output order - so the columns
@@ -37216,20 +37264,23 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             // their original field ids makes each one
                             // read the record it no longer has, and
                             // every value comes back NULL.
-                            let cols: Vec<ProjCol> = output_cols_of(&plan)
+                            let cols: Vec<ProjCol> = output_cols_of(&*plan)
                                 .iter()
                                 .enumerate()
                                 .map(|(i, c)| ProjCol { field_id: i, expr: None, ..c.clone() })
                                 .collect();
                             if !cols.is_empty() {
-                                plan = Plan::Rows { cols, rows };
+                                plan = std::rc::Rc::new(Plan::Rows { cols, rows });
                             }
                         }
                     }
                 }
                 let mut w = W::default();
                 persist_generators(database.as_mut(), &gen_writes);
-                if let (Plan::Rows { cols, rows }, true) = (&mut plan, want > 0) {
+                // the same copy-before-change rule as the deferred index
+                if let (Plan::Rows { cols, rows }, true) =
+                    (std::rc::Rc::make_mut(&mut plan), want > 0)
+                {
                     // one batch, and the terminator ONLY when the cursor
                     // is empty - a terminator with rows still to come is
                     // a truncated answer
@@ -37266,12 +37317,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     w.send(&mut s, &mut enc)?;
                     continue;
                 }
-                emit_rows(&mut w, &plan, &database, &bound_args, &mut gen_writes, out_fmt.as_ref());
+                emit_rows(&mut w, &*plan, &database, &bound_args, &mut gen_writes, out_fmt.as_ref());
                 // a materialised cursor is CONSUMED by its fetch: the rows
                 // exist once. Re-emitting them on the next fetch is what a
                 // driver's fetch-until-empty loop turns into duplicates.
-                if let Plan::Rows { cols, .. } = &plan {
-                    plan = Plan::Rows { cols: cols.clone(), rows: Vec::new() };
+                if let Plan::Rows { cols, .. } = &*plan {
+                    plan = std::rc::Rc::new(Plan::Rows { cols: cols.clone(), rows: Vec::new() });
                 }
                 // a generator-advancing SELECT (NEXT VALUE FOR / GEN_ID in
                 // the select list) writes its generators' final values as
@@ -37289,8 +37340,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     stmts.remove(&h);
                     if h == cur_stmt {
                         stmt_sql.clear();
-                        plan = Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None);
-                        stmt_params.clear();
+                        plan = std::rc::Rc::new(Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None));
+                        stmt_params = std::rc::Rc::new(Vec::new());
                         bound_args.clear();
                         last_dml = (0, 0, 0);
                     }
@@ -37616,8 +37667,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 // isc_info_sql_stmt_exec_procedure, so the client uses
                 // this rather than opening a cursor). Run the body, send
                 // the outputs as op_sql_response, then the op_response.
-                if matches!(plan, Plan::ProcInvoke { .. }) {
-                    let (pname, pargs, pcols) = match &plan {
+                if matches!(&*plan, Plan::ProcInvoke { .. }) {
+                    let (pname, pargs, pcols) = match &*plan {
                         Plan::ProcInvoke { name, args, cols } => {
                             (name.clone(), args.clone(), cols.clone())
                         }
@@ -37652,7 +37703,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                 .int(0)
                                 .int(0);
                             w.send(&mut s, &mut enc)?;
-                            plan = Plan::ProcCall { cols: pcols, values };
+                            plan = std::rc::Rc::new(Plan::ProcCall { cols: pcols, values });
                             continue;
                         }
                         BlrProcOutcome::Runtime(e) => {
@@ -37689,7 +37740,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                 .int(0)
                                 .int(0);
                             w.send(&mut s, &mut enc)?;
-                            plan = Plan::ProcCall { cols: pcols, values };
+                            plan = std::rc::Rc::new(Plan::ProcCall { cols: pcols, values });
                         }
                         Err(e) => {
                             if std::env::var("FC_SRV_TRACE").is_ok() {
@@ -37698,7 +37749,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
                     }
-                } else if matches!(&plan, Plan::Returning { inner, .. }
+                } else if matches!(&*plan, Plan::Returning { inner, .. }
                     if matches!(inner.as_ref(), Plan::Insert { .. }))
                 {
                     // `INSERT ... VALUES ... RETURNING` announces stmt
@@ -37708,7 +37759,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     // cursor. The op_execute Returning arm stays: a
                     // client that ignores the type and drives
                     // execute+fetch still gets the cursor.
-                    let (inner, rcols) = match &plan {
+                    let (inner, rcols) = match &*plan {
                         Plan::Returning { inner, cols, .. } => {
                             (inner.as_ref().clone(), cols.clone())
                         }
@@ -37806,7 +37857,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                             ..c.clone()
                                         })
                                         .collect();
-                                    plan = Plan::ProcCall { cols, values };
+                                    plan = std::rc::Rc::new(Plan::ProcCall { cols, values });
                                 }
                             }
                         }
@@ -46464,7 +46515,7 @@ mod tests {
         )
         .unwrap()
         .0;
-        match plan {
+        match &plan {
             Plan::CreateTable { cols, constraints, .. } => {
                 let keys: Vec<_> = constraints
                     .iter()
@@ -46502,7 +46553,7 @@ mod tests {
         let plan = plan_create_table("CREATE TABLE P (A INTEGER, B INTEGER, PRIMARY KEY (A, B))")
             .unwrap()
             .0;
-        match plan {
+        match &plan {
             Plan::CreateTable { cols, .. } => {
                 assert!(cols[0].not_null && !cols[0].not_null_constraint);
                 assert!(cols[1].not_null && !cols[1].not_null_constraint);

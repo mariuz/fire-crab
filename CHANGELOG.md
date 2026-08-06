@@ -13,6 +13,31 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-06 — A cached plan is adopted, not copied
+
+### Converted
+- **The statement cache hands back a reference.** It stored
+  `Arc<(Plan, Vec<Descriptor>)>` and CLONED both out on every hit; it
+  keeps `(Rc<Plan>, Rc<Vec<Descriptor>>)` now and the connection adopts
+  them — `Rc` and not `Arc` because a `Plan` holds `Rc`s and belongs to
+  one connection anyway. The live statement, the parked statement slots
+  and the switch between them all carry `Rc`s.
+- **What that is worth, measured rather than assumed: 3.3us per prepare
+  on a bulky plan** (five indexes, three checks, a default) **and 0.2us
+  on a small one — against 0.0us after.** That is 0.03% of a 9ms
+  statement. **The earlier claim that "the clone is the cached path's
+  cost" was wrong**, and wrong in an instructive way: it came from
+  comparing averages that a single cache MISS dominated. Timing the
+  warm path directly says a hit was already ~0.2us and is now
+  unmeasurable.
+- **What is worth having is the shape, not the microseconds.** A hit is
+  constant-time whatever the plan's size, and the two places that patch
+  a live plan in place — the deferred index, the `Rows` cursor — go
+  through `Rc::make_mut`, so a plan shared with the cache is copied
+  before it is changed rather than mutated underneath it.
+- **The statement itself, all hits**: a repeated SELECT is 0.26ms
+  against 1.34ms with `FC_NO_STMTCACHE=1`.
+
 ## 2026-08-06 — What to compute, not what was computed
 
 ### Converted

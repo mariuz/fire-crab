@@ -62,9 +62,11 @@
 //! CLONES the plan out of the cache, and a DML plan is not small.
 //! Handing back an `Arc` instead is the next thing to do here.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::OnceLock;
 
 /// How many prepared statements one database keeps. The engine's own
 /// cache is bounded by memory; this is bounded by count, and when it
@@ -102,24 +104,26 @@ fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var("FC_NO_STMTCACHE").is_err())
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// One database's prepared statements.
+/// One attachment's prepared statements.
+///
+/// `Rc`, not `Arc`, and a `RefCell` rather than a `Mutex`: this belongs
+/// to one connection - a `Plan` holds `Rc`s and cannot cross a thread
+/// anyway - and a hit hands back a REFERENCE. Cloning the plan out was
+/// most of what a hit cost: 291us of a cached SELECT plan, against a
+/// lookup that should be a hash and a refcount.
 pub struct DbStatements<P, D> {
-    cache: Mutex<HashMap<(u64, String), Arc<(P, Vec<D>)>>>,
+    cache: RefCell<HashMap<(u64, String), (Rc<P>, Rc<Vec<D>>)>>,
 }
 
 impl<P, D> Default for DbStatements<P, D> {
     fn default() -> Self {
         DbStatements {
-            cache: Mutex::new(HashMap::new()),
+            cache: RefCell::new(HashMap::new()),
         }
     }
 }
 
-impl<P: Clone, D: Clone> DbStatements<P, D> {
+impl<P, D> DbStatements<P, D> {
     /// The plan this text resolves to under `generation`, from the
     /// cache or from `plan`.
     ///
@@ -128,21 +132,23 @@ impl<P: Clone, D: Clone> DbStatements<P, D> {
     /// dangerous to remember (the next attempt may be against a schema
     /// that can answer it - the generation covers DDL, but not the
     /// reasons a planner declines).
-    pub fn plan<F>(&self, generation: u64, sql: &str, plan: F) -> Option<(P, Vec<D>)>
+    pub fn plan<F>(&self, generation: u64, sql: &str, plan: F) -> Option<(Rc<P>, Rc<Vec<D>>)>
     where
         F: FnOnce() -> Option<(P, Vec<D>)>,
     {
         if !enabled() {
-            return plan();
+            let (p, d) = plan()?;
+            return Some((Rc::new(p), Rc::new(d)));
         }
         let key = (generation, sql.to_string());
-        if let Some(hit) = lock(&self.cache).get(&key) {
+        if let Some((p, d)) = self.cache.borrow().get(&key) {
             stats().hits.fetch_add(1, Ordering::Relaxed);
-            return Some((hit.0.clone(), hit.1.clone()));
+            return Some((Rc::clone(p), Rc::clone(d)));
         }
         stats().misses.fetch_add(1, Ordering::Relaxed);
-        let built = plan()?;
-        let mut c = lock(&self.cache);
+        let (p, d) = plan()?;
+        let built = (Rc::new(p), Rc::new(d));
+        let mut c = self.cache.borrow_mut();
         if c.len() >= CAPACITY {
             // full: everything here was planned against some generation,
             // and dropping the lot costs one re-plan each rather than a
@@ -150,14 +156,14 @@ impl<P: Clone, D: Clone> DbStatements<P, D> {
             c.clear();
             stats().evictions.fetch_add(1, Ordering::Relaxed);
         }
-        c.insert(key, Arc::new((built.0.clone(), built.1.clone())));
+        c.insert(key, (Rc::clone(&built.0), Rc::clone(&built.1)));
         Some(built)
     }
 
     /// The schema changed: every plan here was compiled against the old
     /// one.
     pub fn invalidate(&self) {
-        let mut c = lock(&self.cache);
+        let mut c = self.cache.borrow_mut();
         if !c.is_empty() {
             c.clear();
             stats().invalidations.fetch_add(1, Ordering::Relaxed);
@@ -165,7 +171,7 @@ impl<P: Clone, D: Clone> DbStatements<P, D> {
     }
 
     pub fn len(&self) -> usize {
-        lock(&self.cache).len()
+        self.cache.borrow().len()
     }
 
     pub fn is_empty(&self) -> bool {

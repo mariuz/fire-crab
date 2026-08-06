@@ -2240,7 +2240,18 @@ plus *the subsystem is now on the path*.
   `ScalarVal` now - what to compute, not what was computed - and the
   fetch works it out, which is where the engine works it out. Measured:
   `plan(select)` 984us → 291us and the statement 1.22ms → 0.50ms;
-  `plan(dml)` 645us → 514us on a repeated parameterised INSERT. An unfiltered
+  `plan(dml)` 645us → 514us on a repeated parameterised INSERT. Timed on
+  the WARM path rather than as an average, a repeated SELECT is 0.26ms
+  against 1.34ms uncached and the hit itself is unmeasurable: the cache
+  hands back an `Rc` rather than cloning the plan out, worth 3.3us per
+  prepare on a bulky plan and 0.2us on a small one.
+
+  **An average over a cold start is not a measurement of the warm
+  path.** "The clone is what a hit costs" was inferred from averages a
+  single MISS dominated, and it was wrong by two orders of magnitude.
+  Time the thing itself.
+
+  An unfiltered
   `SELECT COUNT(*)` is folded to a CONSTANT at prepare time, so a
   cached plan freezes the count - measured, with the cache on: one row,
   insert a row, ask again, one. The same query with a filter, which is
