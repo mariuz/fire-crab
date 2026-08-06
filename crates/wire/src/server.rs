@@ -581,11 +581,11 @@ struct Database {
     /// this database's metadata cache - what the catalog says about a
     /// relation, held until DDL changes it (see [crate::mdc])
     meta: std::sync::Arc<crate::mdc::DbMetadata>,
-    /// ...and this ATTACHMENT's prepared statements - CONVERTED AND
-    /// NOT WIRED, see [crate::stmc] for the measurement that asked for
-    /// it and the one that stopped it: an unfiltered `SELECT COUNT(*)`
-    /// is folded to a CONSTANT at prepare time, so a plan is not a pure
-    /// function of (schema, text) and caching one freezes the count.
+    /// ...and this ATTACHMENT's prepared DML statements. DML only: a
+    /// DML plan is a pure function of (schema, text), while a SELECT
+    /// plan is not - an unfiltered `SELECT COUNT(*)` and a `GEN_ID`
+    /// read are folded to CONSTANTS at prepare, so caching one freezes
+    /// the answer. See [crate::stmc].
     ///
     /// Per connection rather than per database, when it is wired: a
     /// `Plan` holds `Rc`s and cannot cross a thread, and a client
@@ -593,7 +593,6 @@ struct Database {
     /// the hits are. Correctness would still come from the shared
     /// generation - another connection's DDL moves it, and every plan
     /// compiled under the old one becomes unreachable by key.
-    #[allow(dead_code)]
     stmts: crate::stmc::DbStatements<Plan, Descriptor>,
     /// this database's lock table, and this attachment's identity in
     /// it: a transaction holds a lock on its own id while it lives, and
@@ -36352,11 +36351,28 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     let stmt_sql =
                         unqualify_dml(&stmt_sql, &database).unwrap_or_else(|| stmt_sql.clone());
                     let (dml_sql, returning) = split_returning(&stmt_sql);
-                    let planned = timed("plan(dml)", || match kw {
-                        "INSERT" => plan_insert(&dml_sql, &database),
-                        "UPDATE" => plan_upsert(&dml_sql, &database)
-                            .or_else(|| plan_update(&dml_sql, &database)),
-                        _ => plan_delete(&dml_sql, &database),
+                    // THROUGH THE STATEMENT CACHE - for DML only, and the
+                    // asymmetry is the point. A DML plan IS a pure
+                    // function of (schema, text): its defaults are kept
+                    // as CurrentTimestamp/User VARIANTS and evaluated at
+                    // execute, and its checks, foreign keys, index
+                    // operations and formats are catalog. A SELECT plan
+                    // is not - an unfiltered COUNT(*) and a GEN_ID read
+                    // are FOLDED to constants at prepare - so the SELECT
+                    // branch above stays out until those folds move to
+                    // execute. See [crate::stmc].
+                    let gen = database.as_ref().map_or(0, |d| d.meta.generation());
+                    let planned = timed("plan(dml)", || {
+                        let build = || match kw {
+                            "INSERT" => plan_insert(&dml_sql, &database),
+                            "UPDATE" => plan_upsert(&dml_sql, &database)
+                                .or_else(|| plan_update(&dml_sql, &database)),
+                            _ => plan_delete(&dml_sql, &database),
+                        };
+                        match database.as_ref() {
+                            Some(db) => db.stmts.plan(gen, &dml_sql, build),
+                            None => build(),
+                        }
                     });
                     let planned = match (planned, &returning) {
                         // VECTOR-AT-PREPARE: wrap_returning over a

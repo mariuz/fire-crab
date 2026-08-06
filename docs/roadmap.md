@@ -16,7 +16,8 @@ matters more than the row count:
 |---|---|---|
 | **done** | on-disk structures, record decode + RLE, PIP, pointer/data pages, B-tree decode, TIP/MVCC, GC/sweep, BLR decode | converted and held against an oracle; the server depends on them |
 | **converted, wired** | `ods`, `blb`, `auth`, `svc`, `exe`, `dsql` | the running server links and uses them |
-| **converted, NOT wired** | `evt`, `stmc` | a real conversion of a real law, with a gate — that the server never calls. `stmc` (the statement cache) is not wired because wiring it answered a statement WRONGLY: an unfiltered `SELECT COUNT(*)` is folded to a constant at prepare, so a cached plan freezes the count — the fold has to move to execute first |
+| **converted, NOT wired** | `evt` | a real conversion of a real law, with a gate — that the server never calls |
+| **wired for half of it** | `stmc` | DML plans are cached (a DML plan IS a pure function of schema and text); SELECT plans are not, because an unfiltered `COUNT(*)` and a `GEN_ID` read are folded to constants at prepare and a cached plan would freeze them — the folds have to move to execute first |
 | **wired** | `lck` | a writer that meets another transaction's uncommitted row waits on that transaction's own lock and then re-reads, and two waiting on each other are denied by the wait-for scan with the engine's `isc_deadlock` (W4) |
 | **being wired** | `opt`, `cch`, `pio` | the server asks `opt` for the access path and takes an index when it says so (W1); the pages of a file live once per process in `cch`'s buffer pool and are flushed in its careful write order (W2), and written with `pio`, in the open mode the header's Forced Writes flag calls for (W3) |
 
@@ -2231,10 +2232,13 @@ plus *the subsystem is now on the path*.
   | executing the write | 118us — the record write itself 2us, index maintenance 6us |
   | the image copy per write | 84us |
 
-  **The statement cache was written and is NOT wired** (`crates/wire/stmc.rs`,
-  4 unit tests, `FC_NO_STMTCACHE` switch). Wiring it made a statement
-  answer wrongly, and the reason is worth more than the cache: **a plan
-  is not a pure function of (schema, text)**. An unfiltered
+  **The statement cache is wired for DML and not for SELECT**
+  (`crates/wire/stmc.rs`, 4 unit tests, `FC_NO_STMTCACHE` switch), and
+  the asymmetry is the finding: **a plan is not always a pure function
+  of (schema, text)**. A DML plan is one - its defaults are variants
+  evaluated at execute, everything else it holds is catalog - and
+  measured on a repeated parameterised INSERT it saves `plan(dml)`
+  645us → 514us. A SELECT plan is not one. An unfiltered
   `SELECT COUNT(*)` is folded to a CONSTANT at prepare time, so a
   cached plan freezes the count - measured, with the cache on: one row,
   insert a row, ask again, one. The same query with a filter, which is

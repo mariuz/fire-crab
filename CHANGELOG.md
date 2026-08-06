@@ -13,6 +13,25 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-06 — The statement cache, wired where it is sound
+
+### Converted
+- **DML plans are cached now**, and the asymmetry is the finding: **a
+  DML plan is a pure function of (schema, text)** — its defaults are
+  kept as `CurrentTimestamp`/`User` variants and evaluated at execute,
+  its checks, foreign keys, index operations and formats are catalog —
+  while a SELECT plan is not, because an unfiltered `COUNT(*)` and a
+  `GEN_ID` read are folded to constants at prepare. So the DML side
+  goes in and the SELECT side waits for those folds to move to execute.
+  `qa/serve-real-defaultcurrent.sh` (20 checks) is what says the
+  defaults still happen per row.
+- **Measured on a repeated parameterised INSERT** — the shape a cache
+  is for, since a client that inlines its literals sends a new text
+  every time: `plan(dml)` 645us → 514us, the statement 3.08ms → 3.00ms.
+  The saving is smaller than the planning it skips because a hit CLONES
+  the plan out of the cache and a DML plan is not small; handing back an
+  `Arc` is the next thing to do there.
+
 ## 2026-08-06 — The statement cache, and why it is not wired
 
 ### Converted

@@ -23,7 +23,16 @@
 //! `FC_NO_STMTCACHE=1` turns it off, so a gate can show the same
 //! answers with and without it.
 //!
-//! # Why this is CONVERTED AND NOT WIRED
+//! # Wired for DML, and not for SELECT
+//!
+//! The asymmetry is the finding. **A DML plan IS a pure function of
+//! (schema, text)**: its defaults are kept as `CurrentTimestamp`/`User`
+//! VARIANTS and evaluated at execute, and its checks, foreign keys,
+//! index operations and formats are catalog. So DML plans are cached,
+//! and `qa/serve-real-defaultcurrent.sh` is the check that says the
+//! defaults still happen per row.
+//!
+//! A SELECT plan is not, which is what stopped this the first time:
 //!
 //! Wiring it made a statement answer wrongly, which is exactly what a
 //! cache must never do, and the reason is worth more than the cache:
@@ -35,8 +44,8 @@
 //! again - 1. The same query WITH a filter, which is not folded,
 //! answered 2 correctly.
 //!
-//! So the prepare-time fold has to move to EXECUTE before this can be
-//! on the path, and that is the next step: an unfiltered COUNT(*)
+//! So the prepare-time fold has to move to EXECUTE before the SELECT
+//! side can be cached, and that is the next step: an unfiltered COUNT(*)
 //! should plan to the aggregate the FILTERED one already plans to, and
 //! the fetch should compute it. Then the cache holds only what the
 //! schema decides, and this module goes in unchanged - it is written
@@ -45,6 +54,13 @@
 //! (The same question is worth asking of every other plan-time
 //! shortcut before it is trusted: what did the planner READ that the
 //! schema does not decide?)
+//!
+//! MEASURED, on a repeated parameterised INSERT - the shape a cache is
+//! for, since a client that inlines its literals sends a new text every
+//! time: `plan(dml)` 645us -> 514us, the statement 3.08ms -> 3.00ms.
+//! The saving is smaller than the planning it skips because a hit
+//! CLONES the plan out of the cache, and a DML plan is not small.
+//! Handing back an `Arc` instead is the next thing to do here.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
