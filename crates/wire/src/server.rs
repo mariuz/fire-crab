@@ -663,6 +663,43 @@ fn write_wait() -> std::time::Duration {
 }
 
 impl Database {
+    /// Set or clear the header's FORCED WRITES flag (hdr_force_write,
+    /// ods.h:724) - what `gfix -write sync|async` asks for. Answers
+    /// whether it moved.
+    ///
+    /// It is a write like any other: the write side, a working copy, the
+    /// careful flush. The flag decides the OPEN MODE of every flush after
+    /// it, so it has to be on the disk before the next one reads it -
+    /// and it decides THIS one too, since `flush_careful` reads the flag
+    /// out of the image it is about to write.
+    ///
+    /// THE ORDERING LAW, and why nothing extra is needed for it. The
+    /// engine flushes the file FIRST when turning forced writes ON
+    /// (`PIO_force_write`, unix.cpp:449): pages already in the operating
+    /// system's cache were written under the old promise, and the new
+    /// one does not reach back for them. fire-crab has nothing
+    /// outstanding to make good - its unforced careful flush ends with
+    /// `sync_all` over the whole file, so every page it has ever written
+    /// is on the disk before this one runs.
+    fn set_force_write(&mut self, on: bool) -> Result<bool, String> {
+        const FORCE_WRITE: u16 = fire_crab_ods::header::hdr_flags::FORCE_WRITE;
+        let current = fire_crab_ods::header::HeaderPage::decode(&self.bytes())
+            .map(|h| h.flags & FORCE_WRITE != 0)
+            .ok_or("no header page")?;
+        if current == on {
+            return Ok(false);
+        }
+        let mut work = self.work_copy()?;
+        let flags = u16::from_le_bytes([work[22], work[23]]);
+        let next = if on { flags | FORCE_WRITE } else { flags & !FORCE_WRITE };
+        work[22..24].copy_from_slice(&next.to_le_bytes());
+        self.flush_and_install(work)?;
+        // the attachment holds no transaction here - this is a header
+        // write on its own, and the write side goes back with it
+        self.end_write();
+        Ok(true)
+    }
+
     /// The key this attachment's event POSTS are filed under.
     ///
     /// A transaction that only posts events writes no records, so it
@@ -12026,6 +12063,40 @@ fn parse_dpb_lc_ctype(dpb: &[u8]) -> AttCs {
         i = end;
     }
     AttCs::NONE
+}
+
+/// `isc_dpb_force_write` (dpb tag 24), if the attachment asked for one.
+///
+/// THIS IS HOW `gfix -write` TALKS. It does not use the services API at
+/// all - it ATTACHES, carrying the new mode in the DPB, and detaches -
+/// which is why a server that answers only the services manager still
+/// leaves `gfix -write sync` doing nothing.
+///
+/// The value is a number: 0 asynchronous, 1 synchronous. `None` means
+/// the attachment said nothing about it, which is every ordinary
+/// client.
+fn parse_dpb_force_write(dpb: &[u8]) -> Option<bool> {
+    if dpb.first() != Some(&1) {
+        return None;
+    }
+    let mut i = 1;
+    while i + 1 < dpb.len() {
+        let (tag, len) = (dpb[i], dpb[i + 1] as usize);
+        let end = i + 2 + len;
+        if end > dpb.len() {
+            break;
+        }
+        if tag == 24 {
+            // a DPB number is little-endian over its own length
+            let mut v: u64 = 0;
+            for (k, b) in dpb[i + 2..end].iter().enumerate() {
+                v |= (*b as u64) << (8 * k);
+            }
+            return Some(v != 0);
+        }
+        i = end;
+    }
+    None
 }
 
 /// Whether a column can be a parameter target: everything the wire
@@ -36114,7 +36185,9 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // the dpb's isc_dpb_lc_ctype is the ATTACHMENT CHARSET - what a bare
     // blr_text/blr_varying output slot resolves to (ttype_dynamic), and
     // the charset literals and user CASTs are described in
-    let att_cs = parse_dpb_lc_ctype(&read_wire_bytes(&mut s, &mut dec)?);
+    let dpb = read_wire_bytes(&mut s, &mut dec)?;
+    let att_cs = parse_dpb_lc_ctype(&dpb);
+    let want_force_write = parse_dpb_force_write(&dpb);
     // the name the client attached to, then the FILE it denotes: a name
     // matching a databases.conf alias resolves to that alias's path,
     // exactly as the engine resolves it (so `employee` reaches the
@@ -36143,6 +36216,25 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // client attached to a name with no file behind it), the server falls
     // back to the fixed constant so the pipeline still round-trips.
     let mut database: Option<Database> = load_database(&db_path);
+    // `gfix -write sync|async` IS an attachment carrying isc_dpb_force_write.
+    // The flag lives in the header (hdr_force_write, ods.h:724) and decides
+    // the open mode every later flush uses - `fire_crab_pio::plan_for_header`
+    // has read it since it was converted; this is what lets a client CHANGE
+    // it, which is the whole of what that gfix switch does.
+    if let (Some(force), Some(db)) = (want_force_write, database.as_mut()) {
+        match db.set_force_write(force) {
+            Ok(changed) => {
+                if changed && std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] isc_dpb_force_write: forced writes now {}", force);
+                }
+            }
+            Err(e) => {
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] isc_dpb_force_write failed: {}", e);
+                }
+            }
+        }
+    }
     if std::env::var("FC_SRV_TRACE").is_ok() {
         eprintln!(
             "[srv] op_attach ok, handle 1 ({}); database '{}' {}",

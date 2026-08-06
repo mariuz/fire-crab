@@ -2501,7 +2501,25 @@ plus *the subsystem is now on the path*.
   would be the gate. Nothing about it is observable until all of it
   works, which is why it is its own slice rather than a half-step.
 - **W6 — depth in `exe` and `svc`**: the request lifecycle, cursors and
-  exceptions; then gbak/gfix/nbackup as services.
+  exceptions; then gbak/gfix/nbackup as services. *(first slice done,
+  and it corrected the sentence above)*
+
+  **`gfix -write sync|async` is not a service at all.** Filing the
+  tools under "as services" was a guess, and this one is wrong: gfix
+  ATTACHES, carrying the mode in the DPB as `isc_dpb_force_write` (tag
+  24, consts_pub.h:59), and detaches. A server that answered only the
+  service manager would leave the switch silently doing nothing. What
+  it asks for is one bit - `hdr_force_write` (ods.h:724) in the header
+  page - which `fire_crab_pio::plan_for_header` has read since it was
+  converted to decide whether a flush opens the file with SYNC; what
+  was missing was only the ability to CHANGE it
+  (`qa/serve-real-forcewrite.sh`, 9 checks, `gstat -h` as the oracle).
+
+  The lesson generalises to the rest of the tier: **before writing a
+  service, check whether the tool uses one.** gfix's other switches
+  (`-housekeeping`, `-sweep interval`, `-mode read_only`) look like the
+  same shape - DPB or header, not SPB - and gbak/nbackup genuinely are
+  services.
 
 ## How these slices are gated
 

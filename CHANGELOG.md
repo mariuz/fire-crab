@@ -13,6 +13,38 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-06 — `gfix -write` is not a service (W6, first slice)
+
+### Converted
+- **`isc_dpb_force_write` is honoured at attach**, which is what
+  `gfix -write sync|async` actually sends. The roadmap had gfix filed
+  under "gbak/gfix/nbackup as services" and that was a guess: gfix does
+  not open the service manager for this switch at all — it ATTACHES
+  with DPB tag 24 (consts_pub.h:59) carrying 0 or 1, and detaches. A
+  server that answered only the service manager would have left the
+  switch looking like it worked while changing nothing.
+- **One bit, and most of it was already there.** The switch asks for
+  `hdr_force_write` (ods.h:724) in the header page, which
+  `fire_crab_pio::plan_for_header` has read since it was converted — it
+  is what decides whether a flush opens the file with SYNC. What was
+  missing was only the ability to change it: decode the flag, flip it
+  in a work copy, flush the header carefully, and the very next flush
+  already obeys the new mode.
+- **`qa/serve-real-forcewrite.sh`** (9 checks) runs the engine's own
+  tool against both servers and reads the result with the engine's
+  other tool: `gstat -h` prints `Attributes force write` when the bit
+  is on and nothing when it is off. async then sync, both directions,
+  both servers, plus `gfix -v -full` on the database afterwards; the
+  coverage check requires the server log to show a flush in *each*
+  mode, since the behaviour checks alone would pass against a server
+  that wrote the bit and went on flushing the way it always had.
+
+### Found
+- **Before writing a service, check whether the tool uses one.** The
+  same question is now open for gfix's other switches
+  (`-housekeeping`, `-sweep interval`, `-mode read_only`), which look
+  like the same shape — DPB or header, not SPB.
+
 ## 2026-08-06 — POST_EVENT is a statement now (W5, first slice)
 
 ### Converted

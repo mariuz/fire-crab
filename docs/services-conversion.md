@@ -233,6 +233,46 @@ The ordering matters and is deliberate: the conflict check runs BEFORE
 fire-crab's own capability check, so a malformed request gets the engine's
 answer rather than "fire-crab cannot do that".
 
+## Not everything a utility does is a service
+
+Worth checking before any of the frontier below is built: **a switch on a
+utility is not evidence that the utility used a service to deliver it.**
+`gfix -write sync|async` is the case that proved it. It looks like a
+maintenance action, it is documented alongside ones that are, and it goes
+through no service manager at all — gfix ATTACHES to the database, carrying
+the mode in the DPB as `isc_dpb_force_write` (tag 24, consts_pub.h:59), and
+detaches. What it asks for is one bit in the header page,
+`hdr_force_write` (ods.h:724), and it is honoured at attach
+(`qa/serve-real-forcewrite.sh`).
+
+The failure mode is quiet, which is why it is written here: a server that
+implemented the SPB action and not the DPB item would pass every service
+gate and leave the switch doing nothing. So for each item below, the first
+question is not "how is this action shaped" but **"does the tool send an
+action at all?"**
+
+For gfix the engine's own source answers it, and the answer is *none of
+them do*: `src/alice/exe.cpp:211-344` builds ONE DPB and attaches with it,
+and every switch is an item in it — `isc_dpb_sweep`, `isc_dpb_verify`,
+`isc_dpb_sweep_interval`, `isc_dpb_set_page_buffers`, `isc_dpb_force_write`,
+`isc_dpb_no_reserve`, `isc_dpb_set_db_readonly`, `isc_dpb_shutdown`,
+`isc_dpb_online`, `isc_dpb_set_db_sql_dialect`, `isc_dpb_set_db_replica`,
+`isc_dpb_parallel_workers`, `isc_dpb_nolinger`. The whole utility is an
+attach with `isc_dpb_gfix_attach` set, and `EXE_action` (exe.cpp:71) is its
+only path — there is no service branch to take.
+
+The switch table (aliceswi.h:162-294) does carry an `isc_spb_prp_*` code
+per switch, which is the trap: nothing in `src/alice/` ever reads that
+field. It is the SAME PROPERTY reachable two ways, and the other way
+belongs to a different client — `fbsvcmgr action_properties
+prp_page_buffers ...` (fbsvcmgr.cpp:470-478) sends the SPB. So both are
+worth having and **neither substitutes for the other**: the SPB action
+alone leaves gfix silently doing nothing, and the DPB items alone leave
+fbsvcmgr unanswered.
+
+That also says where the work is: most of those items are **one field of
+the header page**, which is why `gstat -h` is the oracle for all of them.
+
 ## Frontier
 
 * **The remaining actions**: `gbak`'s backup and restore, `gfix`'s repair and
