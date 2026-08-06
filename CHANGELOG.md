@@ -13,6 +13,30 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-06 — What to compute, not what was computed
+
+### Converted
+- **The two prepare-time folds moved to fetch, and the statement cache
+  went in whole.** A lone aggregate (`SELECT COUNT(*)`, `MAX(ID)`, ...)
+  was COMPUTED by the planner and carried in `Plan::Scalar`, and so was
+  a `GEN_ID(g, 0)` read. `Plan::Scalar` now holds a **`ScalarVal`** —
+  `Fixed` for a value that genuinely is constant, `GenRead(name)` for a
+  generator, `Agg(AggPlan)` for an aggregate — and one `scalar_value`
+  works it out at fetch, which is where the engine works it out too.
+- **The probe stays at prepare and the value does not.** Asking
+  `aggregate` is how that branch learns whether the shape is one it can
+  do at all — the shapes it declines fall through to the group
+  machinery, which types and computes them at fetch — so the call is
+  still made and its ANSWER thrown away.
+- **SELECT plans are cached now**: `plan(select)` 984us → 291us and the
+  statement 1.22ms → 0.50ms, with the same rows before and after
+  (`FC_NO_STMTCACHE=1` to compare). Together with the DML side, a
+  repeated statement no longer re-plans at all.
+- **`qa/serve-real-metadata.sh` gained the check that would have caught
+  it**: the same text twice with a write in between — `COUNT(*)` and a
+  `GEN_ID` read — and both servers must move. It is the check that
+  turns "the cache is sound" from an argument into a measurement.
+
 ## 2026-08-06 — The statement cache, wired where it is sound
 
 ### Converted

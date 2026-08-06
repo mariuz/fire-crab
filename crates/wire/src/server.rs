@@ -2232,6 +2232,42 @@ enum SavepointOp {
     Release,
 }
 
+/// WHAT A ONE-ROW, ONE-COLUMN ANSWER IS, and when it is worked out.
+///
+/// It used to be an `Option<i64>` the PLANNER had already computed - a
+/// lone `SELECT COUNT(*)` counted the records at prepare and a
+/// `GEN_ID(g,0)` read the generator there. That made a plan depend on
+/// the DATA, which is fine until something keeps the plan: the
+/// statement cache froze the count at whatever it was when the text was
+/// first seen (measured: one row, insert a row, ask again, one).
+///
+/// So the plan carries what to compute, and the FETCH computes it -
+/// which is also where the engine computes it.
+#[derive(Clone)]
+enum ScalarVal {
+    /// a value that is genuinely constant: a literal, the fixed answer
+    Fixed(Option<i64>),
+    /// `GEN_ID(<name>, 0)` - the generator's current value, read at fetch
+    GenRead(String),
+    /// a lone aggregate over one relation, computed at fetch
+    Agg(Box<AggPlan>),
+}
+
+/// Everything [aggregate] needs, kept so it can run at fetch instead of
+/// at prepare. All of it is schema (or the statement's own literals),
+/// which is what makes a plan holding one cacheable.
+#[derive(Clone)]
+struct AggPlan {
+    rel: u16,
+    formats: Vec<(u8, Vec<Descriptor>)>,
+    columns: Vec<RelationColumn>,
+    descs: Vec<Descriptor>,
+    func: AggFn,
+    target: AggTarget,
+    filter: Option<Predicate>,
+    index: Option<IndexAccess>,
+}
+
 #[derive(Clone)]
 enum Plan {
     /// (value, output-column name): the engine names a lone aggregate's
@@ -2240,7 +2276,7 @@ enum Plan {
     /// third field: describe item 16, the SYMBOLIC field name, when
     /// it differs from the output name (an aliased aggregate fast
     /// path: COUNT(*) AS N is field COUNT, alias N). None = same.
-    Scalar(Option<i64>, String, Option<String>),
+    Scalar(ScalarVal, String, Option<String>),
     /// `EXECUTE PROCEDURE <name> [(args)]` - the procedure's OUTPUT
     /// parameters as one row. isql prepares this like any other
     /// statement and then FETCHES it (probed: op_prepare, op_execute,
@@ -16903,7 +16939,7 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
         // it: a connection with no database behind it, where the wire
         // pipeline must still round-trip.
         _ if db.is_some() => (Plan::Refused, Vec::new()),
-        _ => (Plan::Scalar(Some(FIXED_ANSWER), "CONSTANT".into(), None), Vec::new()),
+        _ => (Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".into(), None), Vec::new()),
     }
 }
 
@@ -18172,8 +18208,9 @@ fn branch_rows_res(
     // an aggregate could not seed a recursive CTE or feed an
     // INSERT ... SELECT, even though it answers perfectly on its own.
     if let Plan::Scalar(v, ..) = plan {
-        return Ok(vec![vec![match v {
-            Some(n) => Value::Int(*n),
+        let n = scalar_value(v, Some(db)).map_err(|_| EvalErr::Unsupported)?;
+        return Ok(vec![vec![match n {
+            Some(n) => Value::Int(n),
             None => Value::Null,
         }]]);
     }
@@ -19462,8 +19499,17 @@ fn plan_query_inner_ctx(
                     // engine raises "generator ... is not defined"; a
                     // NULL answer here read as a legitimate value
                     // (caught by the aggexpr slice's header probes)
+                    // THE READ HAPPENS AT FETCH. Whether the generator
+                    // EXISTS is schema and is decided here - a missing
+                    // one raises, as the engine does - but its VALUE is
+                    // data, and a plan that carried it would answer the
+                    // same number for ever once anything kept the plan.
                     return match read_generator_value(db.as_ref()?, &gen_name) {
-                        Some(v) => Some(Plan::Scalar(Some(v), "GEN_ID".into(), None)),
+                        Some(_) => Some(Plan::Scalar(
+                            ScalarVal::GenRead(gen_name),
+                            "GEN_ID".into(),
+                            None,
+                        )),
                         None => Some(Plan::Refused),
                     };
                 }
@@ -19752,7 +19798,11 @@ fn plan_query_inner_ctx(
                     let n = join_rows(db, &base, base_width, &parts, &filter)
                     .ok()?
                     .len();
-                    return Some(Plan::Scalar(Some(n as i64), "COUNT".to_string(), None));
+                    return Some(Plan::Scalar(
+                        ScalarVal::Fixed(Some(n as i64)),
+                        "COUNT".to_string(),
+                        None,
+                    ));
                 }
                 return from_names_view.then_some(Plan::Refused);
             }
@@ -19969,8 +20019,17 @@ fn plan_query_inner_ctx(
             // drops through to the group machinery, which binds at
             // fetch and raises there ([Predicate::key_conversion])
             if filter.as_ref().is_none_or(|p| p.key_conversion().is_ok()) {
-                if let Some(v) =
-                    aggregate(db, rel, &formats, &columns, &descs, *func, target, &filter, &agg_index)
+                // THE PROBE STAYS AT PREPARE, THE VALUE MOVES TO FETCH.
+                // Asking is how this branch learns whether the shape is
+                // one it can do at all - the ones it declines fall
+                // through to the group machinery, which types and
+                // computes them there - so the call is made and its
+                // ANSWER thrown away. What the plan carries is what to
+                // compute, not what was computed: a plan that carried
+                // the number answered it for ever once the statement
+                // cache kept the plan.
+                if aggregate(db, rel, &formats, &columns, &descs, *func, target, &filter, &agg_index)
+                    .is_some()
                 {
                     // the engine names a lone aggregate's column by its
                     // function (probed) - CONSTANT here was a standing
@@ -19984,7 +20043,20 @@ fn plan_query_inner_ctx(
                     }
                     .to_string();
                     let name = alias.clone().unwrap_or_else(|| fname.clone());
-                    return Some(Plan::Scalar(v, name, Some(fname)));
+                    return Some(Plan::Scalar(
+                        ScalarVal::Agg(Box::new(AggPlan {
+                            rel,
+                            formats: formats.clone(),
+                            columns: columns.clone(),
+                            descs: descs.clone(),
+                            func: *func,
+                            target: target.clone(),
+                            filter: filter.clone(),
+                            index: agg_index,
+                        })),
+                        name,
+                        Some(fname),
+                    ));
                 }
             }
         }
@@ -21213,6 +21285,37 @@ fn parse_group_by(
         None
     } else {
         Some((fids, key_exprs))
+    }
+}
+
+/// The value a [ScalarVal] stands for, worked out NOW.
+///
+/// `None` means the answer is SQL NULL. The error case is a plan that
+/// can no longer be computed at all - a generator dropped since the
+/// statement was prepared, an aggregate shape that has stopped being
+/// supported - which the caller reports as it reports a bind failure.
+fn scalar_value(v: &ScalarVal, db: Option<&Database>) -> Result<Option<i64>, ()> {
+    match v {
+        ScalarVal::Fixed(n) => Ok(*n),
+        ScalarVal::GenRead(name) => {
+            let db = db.ok_or(())?;
+            read_generator_value(db, name).map(Some).ok_or(())
+        }
+        ScalarVal::Agg(a) => {
+            let db = db.ok_or(())?;
+            aggregate(
+                db,
+                a.rel,
+                &a.formats,
+                &a.columns,
+                &a.descs,
+                a.func,
+                &a.target,
+                &a.filter,
+                &a.index,
+            )
+            .ok_or(())
+        }
     }
 }
 
@@ -23374,8 +23477,10 @@ fn emit_rows_inner(
         | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. } | Plan::AlterColumnDropIdentity { .. } | Plan::AlterColumnPosition { .. }
         | Plan::GenIdIncrement { .. } | Plan::SetGenerator { .. } => {}
         Plan::Scalar(v, ..) => {
+            // WORKED OUT HERE, not at prepare - see [ScalarVal]
+            let n = scalar_value(v, db.as_ref()).map_err(|_| EmitErr::Bind)?;
             w.int(OP_FETCH_RESPONSE).int(0).int(1);
-            match v {
+            match n {
                 Some(n) => {
                     w.raw(&[0u8; 4]); // null bitmap (1 col, not null), padded to 4
                     w.raw(&n.to_be_bytes());
@@ -35689,7 +35794,7 @@ fn switch_stmt(
         *cur,
         StmtSlot {
             sql: std::mem::take(sql),
-            plan: std::mem::replace(plan, Plan::Scalar(Some(FIXED_ANSWER), "CONSTANT".to_string(), None)),
+            plan: std::mem::replace(plan, Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None)),
             params: std::mem::take(params),
             bound: std::mem::take(bound),
             last_dml: *last_dml,
@@ -35706,7 +35811,7 @@ fn switch_stmt(
         // a handle the client allocated but never prepared
         None => {
             sql.clear();
-            *plan = Plan::Scalar(Some(FIXED_ANSWER), "CONSTANT".to_string(), None);
+            *plan = Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None);
             params.clear();
             bound.clear();
             *last_dml = (0, 0, 0);
@@ -35924,7 +36029,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // the last op_execute carried for them, and the last DML's per-verb
     // affected counts (what isc_info_sql_records reports).
     let mut stmt_sql = String::new();
-    let mut plan = Plan::Scalar(Some(FIXED_ANSWER), "CONSTANT".to_string(), None);
+    let mut plan = Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None);
     let mut stmt_params: Vec<Descriptor> = Vec::new();
     let mut bound_args: Vec<WireParam> = Vec::new();
     let mut last_dml = (0i32, 0i32, 0i32); // (inserted, updated, deleted)
@@ -36215,8 +36320,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 let mut w = W::default();
                 match &p {
                     Plan::Scalar(v, ..) => {
+                        // worked out here, not at prepare - see [ScalarVal]
+                        let n = scalar_value(v, database.as_ref()).unwrap_or(None);
                         w.int(OP_SQL_RESPONSE).int(1);
-                        match v {
+                        match n {
                             Some(n) => {
                                 w.raw(&[0u8; 4]); // null bitmap: 1 col, not null
                                 w.raw(&n.to_be_bytes());
@@ -36328,7 +36435,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             respond_prepare(&mut s, &mut enc, &describe)?;
                         }
                         None => {
-                            plan = Plan::Scalar(Some(FIXED_ANSWER), "CONSTANT".to_string(), None);
+                            plan = Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None);
                             stmt_params = Vec::new();
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
@@ -36351,16 +36458,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     let stmt_sql =
                         unqualify_dml(&stmt_sql, &database).unwrap_or_else(|| stmt_sql.clone());
                     let (dml_sql, returning) = split_returning(&stmt_sql);
-                    // THROUGH THE STATEMENT CACHE - for DML only, and the
-                    // asymmetry is the point. A DML plan IS a pure
-                    // function of (schema, text): its defaults are kept
-                    // as CurrentTimestamp/User VARIANTS and evaluated at
-                    // execute, and its checks, foreign keys, index
-                    // operations and formats are catalog. A SELECT plan
-                    // is not - an unfiltered COUNT(*) and a GEN_ID read
-                    // are FOLDED to constants at prepare - so the SELECT
-                    // branch above stays out until those folds move to
-                    // execute. See [crate::stmc].
+                    // through the statement cache, like the SELECT
+                    // branch above - see [crate::stmc]
                     let gen = database.as_ref().map_or(0, |d| d.meta.generation());
                     let planned = timed("plan(dml)", || {
                         let build = || match kw {
@@ -36413,15 +36512,28 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             respond_prepare(&mut s, &mut enc, &describe)?;
                         }
                         None => {
-                            plan = Plan::Scalar(Some(FIXED_ANSWER), "CONSTANT".to_string(), None);
+                            plan = Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None);
                             stmt_params = Vec::new();
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
                     }
                 } else {
-                    // NOT through the statement cache - see [crate::stmc]
-                    // for what has to move first.
-                    let (p, ps) = timed("plan(select)", || plan_query(&stmt_sql, &database));
+                    // THROUGH THE STATEMENT CACHE. It could not be until
+                    // the prepare-time folds moved to fetch: a lone
+                    // aggregate and a `GEN_ID` read used to be COMPUTED
+                    // here and carried in the plan, so a kept plan
+                    // answered the same number for ever. They are
+                    // [ScalarVal]s now - what to compute, not what was
+                    // computed - and a plan is a function of the schema
+                    // and the text again.
+                    let gen = database.as_ref().map_or(0, |d| d.meta.generation());
+                    let (p, ps) = timed("plan(select)", || match database.as_ref() {
+                        Some(db) => db
+                            .stmts
+                            .plan(gen, &stmt_sql, || Some(plan_query(&stmt_sql, &database)))
+                            .expect("the planner answers every text"),
+                        None => plan_query(&stmt_sql, &database),
+                    });
                     // A REFUSED STATEMENT FAILS AT PREPARE, which is where
                     // the engine fails an unsupported one too. Answering
                     // the prepare and then raising at fetch left the error
@@ -36907,7 +37019,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     match gen_id_increment(&mut database, &name, step) {
                         Ok(new_val) => {
                             let n = if step.is_none() { "NEXT_VALUE" } else { "GEN_ID" };
-                            plan = Plan::Scalar(Some(new_val), n.to_string(), None);
+                            plan = Plan::Scalar(ScalarVal::Fixed(Some(new_val)), n.to_string(), None);
                             respond(&mut s, &mut enc, TX_HANDLE)?;
                         }
                         Err(e) => {
@@ -37177,7 +37289,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     stmts.remove(&h);
                     if h == cur_stmt {
                         stmt_sql.clear();
-                        plan = Plan::Scalar(Some(FIXED_ANSWER), "CONSTANT".to_string(), None);
+                        plan = Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None);
                         stmt_params.clear();
                         bound_args.clear();
                         last_dml = (0, 0, 0);
@@ -41346,9 +41458,9 @@ mod tests {
     #[test]
     fn plan_falls_back_to_scalar_without_database() {
         // with no database loaded, everything plans to the fixed scalar
-        assert!(matches!(plan_query("SELECT COUNT(*) FROM DEPT", &None).0, Plan::Scalar(Some(FIXED_ANSWER), ..)));
-        assert!(matches!(plan_query("SELECT ID, NAME FROM EMP WHERE ID > 5", &None).0, Plan::Scalar(Some(FIXED_ANSWER), ..)));
-        assert!(matches!(plan_query("SELECT CAST(1 AS BIGINT) FROM RDB$DATABASE", &None).0, Plan::Scalar(Some(FIXED_ANSWER), ..)));
+        assert!(matches!(plan_query("SELECT COUNT(*) FROM DEPT", &None).0, Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), ..)));
+        assert!(matches!(plan_query("SELECT ID, NAME FROM EMP WHERE ID > 5", &None).0, Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), ..)));
+        assert!(matches!(plan_query("SELECT CAST(1 AS BIGINT) FROM RDB$DATABASE", &None).0, Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), ..)));
     }
 
     #[test]
@@ -45655,7 +45767,7 @@ mod tests {
             table: "DST".into(),
             cols: vec!["X".into()],
             ov: Overriding::None,
-            src: Box::new(Plan::Scalar(Some(1), "X".into(), None)),
+            src: Box::new(Plan::Scalar(ScalarVal::Fixed(Some(1)), "X".into(), None)),
         };
         assert_eq!(stmt_type_of(&upsert), 2);
         assert_eq!(stmt_type_of(&insel), 2);
@@ -45673,7 +45785,7 @@ mod tests {
                 table: "DST".into(),
                 cols: vec!["X".into()],
                 ov: Overriding::None,
-                src: Box::new(Plan::Scalar(Some(1), "X".into(), None)),
+                src: Box::new(Plan::Scalar(ScalarVal::Fixed(Some(1)), "X".into(), None)),
             })),
             1
         );

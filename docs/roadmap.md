@@ -17,7 +17,7 @@ matters more than the row count:
 | **done** | on-disk structures, record decode + RLE, PIP, pointer/data pages, B-tree decode, TIP/MVCC, GC/sweep, BLR decode | converted and held against an oracle; the server depends on them |
 | **converted, wired** | `ods`, `blb`, `auth`, `svc`, `exe`, `dsql` | the running server links and uses them |
 | **converted, NOT wired** | `evt` | a real conversion of a real law, with a gate — that the server never calls |
-| **wired for half of it** | `stmc` | DML plans are cached (a DML plan IS a pure function of schema and text); SELECT plans are not, because an unfiltered `COUNT(*)` and a `GEN_ID` read are folded to constants at prepare and a cached plan would freeze them — the folds have to move to execute first |
+| **converted, wired** | `stmc` | the plan a statement resolves to is kept per attachment and dropped by DDL. It took moving the two prepare-time FOLDS to fetch first — a lone aggregate and a `GEN_ID` read were computed by the planner and carried in the plan, so a kept plan answered the same number for ever |
 | **wired** | `lck` | a writer that meets another transaction's uncommitted row waits on that transaction's own lock and then re-reads, and two waiting on each other are denied by the wait-for scan with the engine's `isc_deadlock` (W4) |
 | **being wired** | `opt`, `cch`, `pio` | the server asks `opt` for the access path and takes an index when it says so (W1); the pages of a file live once per process in `cch`'s buffer pool and are flushed in its careful write order (W2), and written with `pio`, in the open mode the header's Forced Writes flag calls for (W3) |
 
@@ -2232,13 +2232,15 @@ plus *the subsystem is now on the path*.
   | executing the write | 118us — the record write itself 2us, index maintenance 6us |
   | the image copy per write | 84us |
 
-  **The statement cache is wired for DML and not for SELECT**
-  (`crates/wire/stmc.rs`, 4 unit tests, `FC_NO_STMTCACHE` switch), and
-  the asymmetry is the finding: **a plan is not always a pure function
-  of (schema, text)**. A DML plan is one - its defaults are variants
-  evaluated at execute, everything else it holds is catalog - and
-  measured on a repeated parameterised INSERT it saves `plan(dml)`
-  645us → 514us. A SELECT plan is not one. An unfiltered
+  **The statement cache is in, for DML and SELECT alike**
+  (`crates/wire/stmc.rs`, 4 unit tests, `FC_NO_STMTCACHE` switch). It
+  took a correction first: **a plan was not always a pure function of
+  (schema, text)**, because a lone aggregate and a `GEN_ID` read were
+  COMPUTED at prepare and carried in the plan. `Plan::Scalar` holds a
+  `ScalarVal` now - what to compute, not what was computed - and the
+  fetch works it out, which is where the engine works it out. Measured:
+  `plan(select)` 984us → 291us and the statement 1.22ms → 0.50ms;
+  `plan(dml)` 645us → 514us on a repeated parameterised INSERT. An unfiltered
   `SELECT COUNT(*)` is folded to a CONSTANT at prepare time, so a
   cached plan freezes the count - measured, with the cache on: one row,
   insert a row, ask again, one. The same query with a filter, which is

@@ -151,5 +151,43 @@ else
     echo "DIFF coverage: DDL never dropped the cache [$mdc]"; fail=1
 fi
 
+# --- 4. THE ANSWERS A KEPT PLAN MUST NOT FREEZE -------------------------
+# The statement cache keeps the plan a text resolves to. That is only
+# sound while a plan says WHAT TO COMPUTE rather than WHAT WAS COMPUTED,
+# and it did not: an unfiltered COUNT(*) and a GEN_ID read were worked
+# out at PREPARE and carried in the plan, so the second ask answered the
+# first ask's number. The same text is sent twice here with a write in
+# between, and both servers must move.
+FRESH='SET HEADING OFF;
+CREATE TABLE F (ID INTEGER);
+CREATE SEQUENCE FG;
+COMMIT;
+INSERT INTO F VALUES (1);
+COMMIT;
+SELECT COUNT(*) FROM F;
+SELECT GEN_ID(FG, 0) FROM RDB$DATABASE;
+INSERT INTO F VALUES (2);
+SELECT GEN_ID(FG, 5) FROM RDB$DATABASE;
+COMMIT;
+SELECT COUNT(*) FROM F;
+SELECT GEN_ID(FG, 0) FROM RDB$DATABASE;'
+fresh() { # <conn>
+    printf '%s\n' "$FRESH" | "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 |
+        sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | tr '\n' ','
+}
+E2="$D/fc-meta-fresh-engine.fdb"; rm -f "$E2"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CREATE DATABASE '$E2' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+EOF
+chmod 666 "$E2"
+eng_fresh=$(fresh "$E2")
+A2="$D/fc-meta-fresh-crab.fdb"; rm -f "$A2"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CREATE DATABASE '$A2' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+EOF
+chmod 666 "$A2"
+check "a kept plan does not freeze COUNT(*) or a GEN_ID read" \
+      "$(fresh "127.0.0.1/$PORT:$A2")" "$eng_fresh"
+
 echo "ran $ran checks"
 exit $fail
