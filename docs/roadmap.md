@@ -2273,6 +2273,41 @@ plus *the subsystem is now on the path*.
   and fire-crab has none: the next item after this one, with its own
   invalidation (DDL, as here) and its own bound.
 
+  **MEASURED AT SIZE, and both of the costs are O(FILE).** With
+  `FC_SRV_TIME=1`, one INSERT:
+
+  | database | INSERT | work copy | careful flush | execute |
+  |---|---|---|---|---|
+  | 6MB | 4.0ms | 259us | 2449us | 300us |
+  | 33MB | 32.0ms | 6550us | 13660us | 6677us |
+
+  Two costs scale, not one. The **image copy** every write makes, and
+  the **flush's diff** — `changed_pages` compares the work image with
+  the file page by page over the WHOLE file to find the handful that
+  moved. At 33MB they are about two thirds of the statement.
+
+  **And the shortcuts do not work, which is why this needs the real
+  thing.** A private per-TRANSACTION working image would make the copy
+  once per transaction instead of once per statement — but a private
+  image is exactly what the buffer pool removed: two transactions each
+  publishing a whole image at commit lose each other's rows, unless the
+  write side is held for the whole transaction again, which is what W4
+  stopped doing so that two writers could work at once.
+  `Arc::make_mut` cannot win either while the pool holds a reference of
+  its own. **The blocker is that `ods` addresses a database as one
+  contiguous `&[u8]` with absolute offsets** — `resolve_relation(file,
+  page_size, name)`, `assembled_image(file, ...)`, `u32_at(file, off)` —
+  so the pages cannot be stored, shared or copied one at a time while
+  that is the shape of the API.
+
+  So the work is: give `ods` a page-addressed image (`Vec<Arc<[u8]>>`
+  behind a `pages(n) -> &[u8]` accessor), convert its readers and
+  writers to it, and let the pool publish by replacing the pages that
+  changed — which also gives the flush its changed set for free and
+  ends the diff. It is the largest single piece left in programme W,
+  and it is worth what the table above says: at 33MB, ~20ms of a 32ms
+  statement.
+
   **MEASURED BEFORE DOING IT, and it is not where the time is.** With
   `FC_SRV_TIME=1` on a two-row table, an INSERT cost 8.2ms: the work
   copy 111us (1.3%), the careful flush 957us, and **building the plan

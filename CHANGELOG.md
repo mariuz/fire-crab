@@ -13,6 +13,32 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-06 — What per-page fetch is actually worth, and what blocks it
+
+### Measured
+- **Two costs scale with the database, not one.** One INSERT, timed
+  with `FC_SRV_TIME=1`: at 6MB the work copy is 259us and the careful
+  flush 2449us; **at 33MB they are 6550us and 13660us of a 32ms
+  statement**. The second one is the flush's DIFF — `changed_pages`
+  compares the work image against the file page by page over the whole
+  file to find the handful that moved.
+- **The shortcuts do not work, and knowing why is the useful part.** A
+  private per-transaction working image would copy once per transaction
+  rather than once per statement — but that is exactly what the buffer
+  pool removed: two transactions each publishing a whole image at
+  commit lose each other's rows unless the write side is held for the
+  whole transaction, which is what W4 stopped doing so two writers
+  could work at once. `Arc::make_mut` cannot win while the pool holds a
+  reference of its own.
+- **The blocker is the shape of the `ods` API**: a database is one
+  contiguous `&[u8]` addressed by absolute offsets. Pages cannot be
+  stored, shared or copied one at a time until that changes — so the
+  work is a page-addressed image (`Vec<Arc<[u8]>>` behind a
+  `pages(n) -> &[u8]`), its readers and writers converted, and a pool
+  that publishes the pages that changed (which hands the flush its
+  changed set and ends the diff). The roadmap carries the plan and the
+  number it is worth: ~20ms of a 32ms statement at 33MB.
+
 ## 2026-08-06 — A cached plan is adopted, not copied
 
 ### Converted
