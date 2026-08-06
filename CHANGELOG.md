@@ -13,6 +13,61 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-06 — the rest of gfix's header switches, and `hdr_end`
+
+### Converted
+- **`-use full|reserve`, `-buffers N`, `-housekeeping N`** — the other
+  three header items a gfix attach can carry: `isc_dpb_no_reserve` (27)
+  → `hdr_no_reserve` (0x8), `isc_dpb_set_page_buffers` (61) →
+  `hdr_page_buffers` at offset 32, `isc_dpb_sweep_interval` (22) → a
+  CLUMPLET in the variable header. Read back with `gstat -h` against
+  the engine's own database after the same commands.
+- **`store_clumplet`** in `fire-crab-ods` — `storeClump`
+  (pag.cpp:213-266) with its three cases kept in the engine's order:
+  same length overwrites in place, a different length is removed and
+  re-appended (so a resized entry migrates to the end), absent is
+  appended. It refuses with `isc_hdr_overflow` rather than writing past
+  the page, and `find` keeps the LAST match as the engine's does.
+- **A no-op gfix writes no page.** What would change is decided before
+  the work copy is taken, so a switch asking for what is already true
+  costs no image copy, no flush and no write side.
+
+### Found
+- **`hdr_end` (offset 36) is a field only a WRITER needs, and getting
+  it wrong is silent corruption rather than a wrong answer.** Nothing
+  that reads the variable header uses it — `variable_header` walks to
+  the terminator — but the engine APPENDS AT IT
+  (`HeaderClumplet::add`, pag.cpp:150). A clumplet added without moving
+  `hdr_end` is overwritten by the engine's next header write. The gate
+  makes the engine perform exactly that write (`ALTER DATABASE ADD
+  DIFFERENCE FILE`, which inserts at the front and memmoves the rest by
+  `hdr_end`, pag.cpp:425) against a database fire-crab wrote, and
+  requires both entries to survive. **Checked by breaking it**: with
+  the update removed, that entry reads `Sweep interval: 0` — the check
+  can fail.
+- **`store_clumplet` refuses a header that disagrees with itself** —
+  `hdr_end` not naming the terminator the walk found. That is the only
+  safe answer: picking either one corrupts the other.
+- **gfix sends ONE item per run, and not the one you would guess.**
+  `buildDpb` (exe.cpp:207-344) is a single else-if chain, so several
+  switches on one command line collapse to whichever comes first IN THE
+  CHAIN — not in argv — and the rest are dropped silently with rc=0.
+  Measured: `gfix -buffers 700 -housekeeping 999` sets the sweep
+  interval and leaves the buffers alone, from either order; `-use full
+  -buffers 700` sets the buffers and leaves the attribute alone. **This
+  gate caught its own premise**: it was written asserting that three
+  switches are one header write, and the engine said otherwise.
+- The dpb itself has no such rule, so the parser reads all four items
+  and one attach applies them in one write. No gfix command line can
+  produce that, so it is a unit test rather than a gate.
+
+### Gated
+- **`qa/serve-real-gfixheader.sh`** (23 checks): each switch against
+  both servers with `gstat -h` as the oracle, the else-if chain's
+  precedence in both argv orders, the `hdr_end` teeth above, coverage
+  that every attach carried exactly one item and that the repeat wrote
+  nothing, then `gfix -v -full`.
+
 ## 2026-08-06 — `gfix -write` is not a service (W6, first slice)
 
 ### Converted

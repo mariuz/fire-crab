@@ -2516,10 +2516,28 @@ plus *the subsystem is now on the path*.
   (`qa/serve-real-forcewrite.sh`, 9 checks, `gstat -h` as the oracle).
 
   The lesson generalises to the rest of the tier: **before writing a
-  service, check whether the tool uses one.** gfix's other switches
-  (`-housekeeping`, `-sweep interval`, `-mode read_only`) look like the
-  same shape - DPB or header, not SPB - and gbak/nbackup genuinely are
-  services.
+  service, check whether the tool uses one.** gbak/nbackup genuinely
+  are services; gfix is not, for any of its switches.
+
+  *(second slice done)* The other three header items followed - `-use
+  full|reserve` (`hdr_no_reserve`), `-buffers N` (`hdr_page_buffers`)
+  and `-housekeeping N` (a CLUMPLET, which meant porting `storeClump`
+  and maintaining `hdr_end` - the field only a writer needs, whose
+  absence is silent corruption rather than a wrong answer). 23 checks
+  in `qa/serve-real-gfixheader.sh`.
+
+  It also corrected an assumption worth keeping visible: **gfix sends
+  one item per run.** `buildDpb` (exe.cpp:207-344) is an else-if chain,
+  so several switches collapse to whichever the CHAIN reaches first and
+  the rest are dropped with rc=0.
+
+  What is left of gfix is no longer header fields: `-shut`/`-online`
+  (`isc_dpb_shutdown`/`isc_dpb_online`, a mode plus a delay, and the
+  attachment refusals that go with them), `-mode read_only` (the flag
+  is one bit but the refusal path behind it is the work), `-sweep` and
+  `-validate` (whole page walks - `fcstat census` already does the
+  reading half offline), and the limbo-transaction switches, which need
+  two-phase commit first.
 
 ## How these slices are gated
 

@@ -663,15 +663,19 @@ fn write_wait() -> std::time::Duration {
 }
 
 impl Database {
-    /// Set or clear the header's FORCED WRITES flag (hdr_force_write,
-    /// ods.h:724) - what `gfix -write sync|async` asks for. Answers
-    /// whether it moved.
+    /// Apply the header changes an attachment's DPB asked for - what
+    /// `gfix` IS. Answers what actually moved, for the trace.
+    ///
+    /// ONE WORK COPY AND ONE FLUSH for all of them, because that is the
+    /// shape of the thing being converted: gfix builds a SINGLE dpb and
+    /// attaches once (`EXE_action`, src/alice/exe.cpp:71), so two
+    /// switches on one command line are one header write, not two.
     ///
     /// It is a write like any other: the write side, a working copy, the
-    /// careful flush. The flag decides the OPEN MODE of every flush after
-    /// it, so it has to be on the disk before the next one reads it -
-    /// and it decides THIS one too, since `flush_careful` reads the flag
-    /// out of the image it is about to write.
+    /// careful flush. Forced writes decides the OPEN MODE of every flush
+    /// after it, so it has to be on the disk before the next one reads
+    /// it - and it decides THIS one too, since `flush_careful` reads the
+    /// flag out of the image it is about to write.
     ///
     /// THE ORDERING LAW, and why nothing extra is needed for it. The
     /// engine flushes the file FIRST when turning forced writes ON
@@ -681,23 +685,70 @@ impl Database {
     /// outstanding to make good - its unforced careful flush ends with
     /// `sync_all` over the whole file, so every page it has ever written
     /// is on the disk before this one runs.
-    fn set_force_write(&mut self, on: bool) -> Result<bool, String> {
-        const FORCE_WRITE: u16 = fire_crab_ods::header::hdr_flags::FORCE_WRITE;
-        let current = fire_crab_ods::header::HeaderPage::decode(&self.bytes())
-            .map(|h| h.flags & FORCE_WRITE != 0)
-            .ok_or("no header page")?;
-        if current == on {
-            return Ok(false);
+    fn apply_header_dpb(&mut self, want: &HeaderDpb) -> Result<Vec<String>, String> {
+        use fire_crab_ods::header::{hdr_clump, hdr_flags, store_clumplet, HeaderPage};
+        if !want.any() {
+            return Ok(Vec::new());
         }
+        let head = HeaderPage::decode(&self.bytes()).ok_or("no header page")?;
+        let mut moves: Vec<String> = Vec::new();
+
+        // Decide what would change BEFORE taking a work copy: an
+        // attachment that asks for what is already true (every `gfix`
+        // run that changes nothing, and the second of two identical
+        // ones) must not write a page or take the write side.
+        let mut flags = head.flags;
+        for (want_on, bit, name) in [
+            (want.force_write, hdr_flags::FORCE_WRITE, "forced writes"),
+            (want.no_reserve, hdr_flags::NO_RESERVE, "no reserve"),
+        ] {
+            if let Some(on) = want_on {
+                if (flags & bit != 0) != on {
+                    flags = if on { flags | bit } else { flags & !bit };
+                    moves.push(format!("{} {}", name, if on { "on" } else { "off" }));
+                }
+            }
+        }
+        let buffers = want.page_buffers.filter(|n| *n != head.page_buffers);
+        if let Some(n) = buffers {
+            moves.push(format!("page buffers {}", n));
+        }
+        // the sweep interval is not a FIELD, it is a clumplet in the
+        // variable header, and a fresh database has none at all
+        let sweep = want.sweep_interval.filter(|n| {
+            fire_crab_ods::header::variable_header(&self.bytes())
+                .iter()
+                .filter(|c| c.tag == hdr_clump::SWEEP_INTERVAL && c.data.len() >= 4)
+                .last()
+                .map(|c| i32::from_le_bytes([c.data[0], c.data[1], c.data[2], c.data[3]]) != *n)
+                .unwrap_or(true)
+        });
+        if let Some(n) = sweep {
+            moves.push(format!("sweep interval {}", n));
+        }
+        if moves.is_empty() {
+            return Ok(moves);
+        }
+
         let mut work = self.work_copy()?;
-        let flags = u16::from_le_bytes([work[22], work[23]]);
-        let next = if on { flags | FORCE_WRITE } else { flags & !FORCE_WRITE };
-        work[22..24].copy_from_slice(&next.to_le_bytes());
+        work[22..24].copy_from_slice(&flags.to_le_bytes());
+        if let Some(n) = buffers {
+            work[32..36].copy_from_slice(&n.to_le_bytes());
+        }
+        if let Some(n) = sweep {
+            let page_size = self.page_size;
+            store_clumplet(
+                &mut work,
+                page_size,
+                hdr_clump::SWEEP_INTERVAL,
+                &n.to_le_bytes(),
+            )?;
+        }
         self.flush_and_install(work)?;
         // the attachment holds no transaction here - this is a header
         // write on its own, and the write side goes back with it
         self.end_write();
-        Ok(true)
+        Ok(moves)
     }
 
     /// The key this attachment's event POSTS are filed under.
@@ -12065,19 +12116,62 @@ fn parse_dpb_lc_ctype(dpb: &[u8]) -> AttCs {
     AttCs::NONE
 }
 
-/// `isc_dpb_force_write` (dpb tag 24), if the attachment asked for one.
+/// What an attachment's DPB asks to change IN THE HEADER PAGE - which
+/// is what `gfix` is.
 ///
-/// THIS IS HOW `gfix -write` TALKS. It does not use the services API at
-/// all - it ATTACHES, carrying the new mode in the DPB, and detaches -
-/// which is why a server that answers only the services manager still
-/// leaves `gfix -write sync` doing nothing.
+/// THIS IS HOW gfix TALKS. It does not use the services API at all: it
+/// builds ONE dpb, attaches with it, and detaches (`EXE_action`,
+/// src/alice/exe.cpp:71), and every switch is an item in that dpb. A
+/// server that answers only the services manager leaves `gfix -write
+/// sync` doing nothing while looking like it worked.
 ///
-/// The value is a number: 0 asynchronous, 1 synchronous. `None` means
-/// the attachment said nothing about it, which is every ordinary
-/// client.
-fn parse_dpb_force_write(dpb: &[u8]) -> Option<bool> {
+/// The trap that makes it look like a service is in gfix's own switch
+/// table: `aliceswi.h:162-294` carries an `isc_spb_prp_*` code beside
+/// every switch, and NOTHING in `src/alice/` reads that field. It is the
+/// same property reachable by a different client - `fbsvcmgr
+/// action_properties prp_page_buffers ...` sends the SPB - so both are
+/// worth having and neither substitutes for the other.
+///
+/// ONE ITEM PER gfix RUN, WHICHEVER THE CHAIN PICKS. `buildDpb`
+/// (exe.cpp:207-344) is a single else-if chain, so a command line with
+/// several switches sends only the one that comes first IN THE CHAIN -
+/// not the first, or the last, on the command line - and drops the rest
+/// SILENTLY with rc=0. `gfix -buffers 700 -housekeeping 999` sets the
+/// sweep interval and leaves the buffers alone, from either order.
+/// `qa/serve-real-gfixheader.sh` holds that against the live engine.
+///
+/// The dpb itself has no such rule, so this reads all four and
+/// `apply_header_dpb` writes them in one go; a client using the API
+/// directly can ask for several at once even though gfix never does.
+///
+/// `None` everywhere is every ordinary client.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct HeaderDpb {
+    /// tag 24, `gfix -write sync|async`: hdr_force_write (0x2)
+    force_write: Option<bool>,
+    /// tag 27, `gfix -use full|reserve`: hdr_no_reserve (0x8)
+    no_reserve: Option<bool>,
+    /// tag 61, `gfix -buffers N`: hdr_page_buffers, offset 32
+    page_buffers: Option<u32>,
+    /// tag 22, `gfix -housekeeping N`: the HDR_sweep_interval CLUMPLET
+    /// in the variable header, which a fresh database does not have
+    sweep_interval: Option<i32>,
+}
+
+impl HeaderDpb {
+    fn any(&self) -> bool {
+        self.force_write.is_some()
+            || self.no_reserve.is_some()
+            || self.page_buffers.is_some()
+            || self.sweep_interval.is_some()
+    }
+}
+
+/// Read the header items out of a DPB in one walk.
+fn parse_dpb_header(dpb: &[u8]) -> HeaderDpb {
+    let mut want = HeaderDpb::default();
     if dpb.first() != Some(&1) {
-        return None;
+        return want;
     }
     let mut i = 1;
     while i + 1 < dpb.len() {
@@ -12086,17 +12180,22 @@ fn parse_dpb_force_write(dpb: &[u8]) -> Option<bool> {
         if end > dpb.len() {
             break;
         }
-        if tag == 24 {
-            // a DPB number is little-endian over its own length
-            let mut v: u64 = 0;
-            for (k, b) in dpb[i + 2..end].iter().enumerate() {
-                v |= (*b as u64) << (8 * k);
-            }
-            return Some(v != 0);
+        // a DPB number is little-endian over its own length, which is
+        // one byte for the flags and four for the counts
+        let mut v: u64 = 0;
+        for (k, b) in dpb[i + 2..end].iter().enumerate() {
+            v |= (*b as u64) << (8 * k);
+        }
+        match tag {
+            24 => want.force_write = Some(v != 0),
+            27 => want.no_reserve = Some(v != 0),
+            61 => want.page_buffers = Some(v as u32),
+            22 => want.sweep_interval = Some(v as i32),
+            _ => {}
         }
         i = end;
     }
-    None
+    want
 }
 
 /// Whether a column can be a parameter target: everything the wire
@@ -36187,7 +36286,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // the charset literals and user CASTs are described in
     let dpb = read_wire_bytes(&mut s, &mut dec)?;
     let att_cs = parse_dpb_lc_ctype(&dpb);
-    let want_force_write = parse_dpb_force_write(&dpb);
+    let want_header = parse_dpb_header(&dpb);
     // the name the client attached to, then the FILE it denotes: a name
     // matching a databases.conf alias resolves to that alias's path,
     // exactly as the engine resolves it (so `employee` reaches the
@@ -36216,22 +36315,30 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // client attached to a name with no file behind it), the server falls
     // back to the fixed constant so the pipeline still round-trips.
     let mut database: Option<Database> = load_database(&db_path);
-    // `gfix -write sync|async` IS an attachment carrying isc_dpb_force_write.
-    // The flag lives in the header (hdr_force_write, ods.h:724) and decides
-    // the open mode every later flush uses - `fire_crab_pio::plan_for_header`
-    // has read it since it was converted; this is what lets a client CHANGE
-    // it, which is the whole of what that gfix switch does.
-    if let (Some(force), Some(db)) = (want_force_write, database.as_mut()) {
-        match db.set_force_write(force) {
-            Ok(changed) => {
-                if changed && std::env::var("FC_SRV_TRACE").is_ok() {
-                    eprintln!("[srv] isc_dpb_force_write: forced writes now {}", force);
+    // `gfix` IS an attachment carrying header items in its DPB - forced
+    // writes, space reservation, page buffers, the sweep interval. They
+    // live in the header page, they are what those switches mean, and
+    // one attach applies all of them in one write.
+    if let Some(db) = database.as_mut() {
+        if want_header.any() {
+            match db.apply_header_dpb(&want_header) {
+                Ok(moves) if std::env::var("FC_SRV_TRACE").is_ok() => {
+                    eprintln!(
+                        "[srv] header dpb {:?}: {}",
+                        want_header,
+                        if moves.is_empty() {
+                            "already so, nothing written".to_string()
+                        } else {
+                            moves.join(", ")
+                        }
+                    );
                 }
-            }
-            Err(e) => {
-                if std::env::var("FC_SRV_TRACE").is_ok() {
-                    eprintln!("[srv] isc_dpb_force_write failed: {}", e);
+                Err(e) => {
+                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!("[srv] header dpb failed: {}", e);
+                    }
                 }
+                _ => {}
             }
         }
     }
@@ -39273,6 +39380,45 @@ pub fn serve(addr: &str, user: &str, password: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The DPB items gfix's switches turn into, read out of a dpb.
+    ///
+    /// The MULTI-ITEM case is here rather than in a gate because no
+    /// gfix command line can produce it: `buildDpb` (exe.cpp:207-344)
+    /// is one else-if chain, so exactly one item ever reaches the dpb
+    /// and the other switches are dropped silently. The dpb ITSELF has
+    /// no such rule - `fbsvcmgr` and any client using the API can send
+    /// several - so the parser reads them all, and this is what says
+    /// so.
+    #[test]
+    fn the_header_items_are_read_out_of_a_dpb() {
+        let mut dpb = vec![1u8]; // isc_dpb_version1
+        dpb.extend_from_slice(&[24, 1, 0]); // force_write async
+        dpb.extend_from_slice(&[27, 1, 1]); // no_reserve on
+        dpb.extend_from_slice(&[61, 4]); // page buffers...
+        dpb.extend_from_slice(&500u32.to_le_bytes()); // ...little-endian
+        dpb.extend_from_slice(&[22, 4]); // sweep interval...
+        dpb.extend_from_slice(&12345i32.to_le_bytes());
+        dpb.extend_from_slice(&[48, 5, b'U', b'T', b'F', b'8', 0]); // lc_ctype, ignored here
+        assert_eq!(
+            parse_dpb_header(&dpb),
+            HeaderDpb {
+                force_write: Some(false),
+                no_reserve: Some(true),
+                page_buffers: Some(500),
+                sweep_interval: Some(12345),
+            }
+        );
+
+        // an ordinary client's dpb asks for none of it, and must not be
+        // read as asking for zero
+        let plain = [1u8, 48, 5, b'U', b'T', b'F', b'8', 0];
+        assert!(!parse_dpb_header(&plain).any());
+        assert_eq!(parse_dpb_header(&plain), HeaderDpb::default());
+
+        // a truncated item is where a parser invents values
+        assert!(!parse_dpb_header(&[1u8, 61, 4, 0, 0]).any());
+    }
 
     #[test]
     fn a_row_source_tree_scans_filters_sorts_aggregates_and_joins() {

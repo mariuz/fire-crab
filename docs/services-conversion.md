@@ -273,6 +273,16 @@ fbsvcmgr unanswered.
 That also says where the work is: most of those items are **one field of
 the header page**, which is why `gstat -h` is the oracle for all of them.
 
+One more thing that only shows up if you read `buildDpb` (exe.cpp:207-344)
+rather than assuming: it is a single **else-if chain**, so gfix puts
+exactly ONE item in the dpb. Several switches on one command line collapse
+to whichever the chain reaches first — `-buffers 700 -housekeeping 999`
+sets the sweep interval and leaves the buffers alone, from either argv
+order — and the dropped ones are dropped silently, rc=0. The dpb has no
+such rule, and `fbsvcmgr` can ask for several properties in one request,
+so a server should apply everything it is sent; it just never sees more
+than one from gfix.
+
 ## Frontier
 
 * **The remaining actions**: `gbak`'s backup and restore, `gfix`'s repair and

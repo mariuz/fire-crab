@@ -340,6 +340,110 @@ pub fn variable_header(page: &[u8]) -> Vec<HeaderClumplet> {
     out
 }
 
+/// `hdr_end` (offset 36, ods.h:683): WHERE THE `HDR_end` BYTE IS.
+///
+/// The reader above does not need it - it walks to the terminator - but
+/// a WRITER does, and getting this wrong is silent corruption rather
+/// than a wrong answer: `HeaderClumplet::add` (pag.cpp:150) appends AT
+/// `hdr_end` and asserts the byte there is the terminator. A clumplet
+/// added without moving `hdr_end` would be overwritten by the engine's
+/// very next header write, which would append on top of it.
+pub const HDR_END_OFFSET: usize = 36;
+
+/// Store a clumplet in the variable header, replacing one of the same
+/// type - `storeClump` (pag.cpp:213-266), which is what
+/// `isc_dpb_sweep_interval` reaches.
+///
+/// The engine's three cases, in its order:
+///
+/// * present and THE SAME LENGTH - overwritten in place, nothing moves;
+/// * present at a different length - REMOVED (the tail memmoved down
+///   over it, terminator included) and then appended as a new entry, so
+///   a resized clumplet migrates to the end of the list;
+/// * absent - appended at `hdr_end`, with a fresh terminator after it.
+///
+/// `find` keeps the LAST match rather than the first (pag.cpp:123-137),
+/// which is only observable on a page that already holds two of a type;
+/// this keeps that, because a writer that picked the first one would
+/// leave the engine reading the other.
+///
+/// Answers whether anything changed. Refuses - `isc_hdr_overflow`, the
+/// error the engine raises - rather than write past the page.
+pub fn store_clumplet(
+    page: &mut [u8],
+    page_size: usize,
+    tag: u8,
+    data: &[u8],
+) -> Result<bool, String> {
+    if tag == hdr_clump::END || data.len() > u8::MAX as usize {
+        return Err("not a storable clumplet".to_string());
+    }
+    let page_size = page_size.min(page.len());
+    if page_size <= HDR_DATA_OFFSET {
+        return Err("header page too small".to_string());
+    }
+    // walk to the terminator, keeping the last entry of this type
+    let mut at = HDR_DATA_OFFSET;
+    let mut found: Option<usize> = None;
+    while at + 1 < page_size {
+        if page[at] == hdr_clump::END {
+            break;
+        }
+        let len = page[at + 1] as usize;
+        if at + 2 + len > page_size {
+            return Err("a clumplet runs past the page".to_string());
+        }
+        if page[at] == tag {
+            found = Some(at);
+        }
+        at += 2 + len;
+    }
+    if at >= page_size || page[at] != hdr_clump::END {
+        return Err("the variable header has no terminator".to_string());
+    }
+    // THE FIELD THE READER NEVER NEEDED. `hdr_end` must name the byte
+    // the walk stopped on; if the file disagrees with itself, this
+    // refuses rather than picking one and corrupting the other.
+    let hdr_end = u16_at(page, HDR_END_OFFSET) as usize;
+    if hdr_end != at {
+        return Err(format!(
+            "hdr_end says {} but the terminator is at {}",
+            hdr_end, at
+        ));
+    }
+    let mut end = at;
+
+    if let Some(entry) = found {
+        let org_len = page[entry + 1] as usize;
+        if org_len == data.len() {
+            if page[entry + 2..entry + 2 + org_len] == *data {
+                return Ok(false); // already what was asked for
+            }
+            page[entry + 2..entry + 2 + org_len].copy_from_slice(data);
+            return Ok(true);
+        }
+        // remove: the tail slides down over it, terminator included
+        let tail = entry + 2 + org_len;
+        page.copy_within(tail..end + 1, entry);
+        end -= 2 + org_len;
+        let new_end = end as u16;
+        page[HDR_END_OFFSET..HDR_END_OFFSET + 2].copy_from_slice(&new_end.to_le_bytes());
+    }
+
+    // append at the terminator - `checkSpace` wants room for the entry
+    // AND the terminator that follows it (pag.cpp:141)
+    if page_size - end <= 2 + data.len() {
+        return Err("isc_hdr_overflow: no room in the header page".to_string());
+    }
+    page[end] = tag;
+    page[end + 1] = data.len() as u8;
+    page[end + 2..end + 2 + data.len()].copy_from_slice(data);
+    page[end + 2 + data.len()] = hdr_clump::END;
+    let new_end = (end + 2 + data.len()) as u16;
+    page[HDR_END_OFFSET..HDR_END_OFFSET + 2].copy_from_slice(&new_end.to_le_bytes());
+    Ok(true)
+}
+
 /// `gstat -h`'s report for a header page, byte for byte - the conversion
 /// of `PPG_print_header` (`src/utilities/gstat/ppg.cpp:56-287`).
 ///
@@ -564,5 +668,120 @@ mod tests {
         let mut page = vec![0u8; 8192];
         page[0] = 5; // a data page
         assert!(HeaderPage::decode(&page).is_none());
+    }
+
+    /// A page whose variable header holds `clumps`, with `hdr_end`
+    /// pointing at the terminator the way the engine keeps it.
+    fn with_clumplets(clumps: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut page = vec![0u8; 8192];
+        page[0] = 1;
+        page[16..18].copy_from_slice(&8192u16.to_le_bytes());
+        page[18..20].copy_from_slice(&0x800eu16.to_le_bytes());
+        let mut at = HDR_DATA_OFFSET;
+        for (tag, data) in clumps {
+            page[at] = *tag;
+            page[at + 1] = data.len() as u8;
+            page[at + 2..at + 2 + data.len()].copy_from_slice(data);
+            at += 2 + data.len();
+        }
+        page[at] = hdr_clump::END;
+        page[HDR_END_OFFSET..HDR_END_OFFSET + 2].copy_from_slice(&(at as u16).to_le_bytes());
+        page
+    }
+
+    fn tags(page: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        variable_header(page)
+            .into_iter()
+            .map(|c| (c.tag, c.data))
+            .collect()
+    }
+
+    /// `hdr_end` must name the terminator after every write, or the
+    /// engine's next header write appends on top of what was stored.
+    fn end_is_consistent(page: &[u8]) {
+        let e = u16_at(page, HDR_END_OFFSET) as usize;
+        assert_eq!(page[e], hdr_clump::END, "hdr_end must name the terminator");
+        let walked = {
+            let mut at = HDR_DATA_OFFSET;
+            while page[at] != hdr_clump::END {
+                at += 2 + page[at + 1] as usize;
+            }
+            at
+        };
+        assert_eq!(e, walked, "hdr_end disagrees with the walk");
+    }
+
+    #[test]
+    fn a_clumplet_is_added_when_it_is_not_there() {
+        // a fresh database has NO sweep-interval clumplet - measured:
+        // `gstat -h` prints no such line until `gfix -housekeeping` runs
+        let mut page = with_clumplets(&[]);
+        assert!(store_clumplet(&mut page, 8192, hdr_clump::SWEEP_INTERVAL, &12345i32.to_le_bytes()).unwrap());
+        assert_eq!(
+            tags(&page),
+            vec![(hdr_clump::SWEEP_INTERVAL, 12345i32.to_le_bytes().to_vec())]
+        );
+        end_is_consistent(&page);
+        assert!(header_report(&page, true).unwrap().contains("\tSweep interval:\t\t12345\n"));
+    }
+
+    #[test]
+    fn the_same_length_is_overwritten_in_place() {
+        let mut page = with_clumplets(&[
+            (hdr_clump::SWEEP_INTERVAL, &20000i32.to_le_bytes()),
+            (hdr_clump::ROOT_FILE_NAME, b"/db/x.fdb"),
+        ]);
+        let before = u16_at(&page, HDR_END_OFFSET);
+        assert!(store_clumplet(&mut page, 8192, hdr_clump::SWEEP_INTERVAL, &7i32.to_le_bytes()).unwrap());
+        // nothing moved: the entry is still first and hdr_end is unchanged
+        assert_eq!(
+            tags(&page),
+            vec![
+                (hdr_clump::SWEEP_INTERVAL, 7i32.to_le_bytes().to_vec()),
+                (hdr_clump::ROOT_FILE_NAME, b"/db/x.fdb".to_vec()),
+            ]
+        );
+        assert_eq!(u16_at(&page, HDR_END_OFFSET), before);
+        // ...and writing what is already there is not a change at all
+        assert!(!store_clumplet(&mut page, 8192, hdr_clump::SWEEP_INTERVAL, &7i32.to_le_bytes()).unwrap());
+    }
+
+    #[test]
+    fn a_resized_clumplet_moves_to_the_end() {
+        // storeClump removes and re-adds when the length differs
+        // (pag.cpp:245-266), so the entry migrates past the ones after it
+        let mut page = with_clumplets(&[
+            (hdr_clump::ROOT_FILE_NAME, b"/db/x.fdb"),
+            (hdr_clump::SWEEP_INTERVAL, &20000i32.to_le_bytes()),
+            (hdr_clump::BACKUP_GUID, &[9u8; 16]),
+        ]);
+        assert!(store_clumplet(&mut page, 8192, hdr_clump::ROOT_FILE_NAME, b"/db/longer-name.fdb").unwrap());
+        assert_eq!(
+            tags(&page),
+            vec![
+                (hdr_clump::SWEEP_INTERVAL, 20000i32.to_le_bytes().to_vec()),
+                (hdr_clump::BACKUP_GUID, vec![9u8; 16]),
+                (hdr_clump::ROOT_FILE_NAME, b"/db/longer-name.fdb".to_vec()),
+            ]
+        );
+        end_is_consistent(&page);
+    }
+
+    #[test]
+    fn a_header_that_disagrees_with_itself_is_refused() {
+        let mut page = with_clumplets(&[(hdr_clump::SWEEP_INTERVAL, &20000i32.to_le_bytes())]);
+        page[HDR_END_OFFSET..HDR_END_OFFSET + 2].copy_from_slice(&999u16.to_le_bytes());
+        assert!(store_clumplet(&mut page, 8192, hdr_clump::SWEEP_INTERVAL, &1i32.to_le_bytes()).is_err());
+    }
+
+    #[test]
+    fn it_refuses_rather_than_write_past_the_page() {
+        // isc_hdr_overflow: the engine's own answer when the variable
+        // header cannot take another entry
+        let mut page = with_clumplets(&[]);
+        let mut size = HDR_DATA_OFFSET + 3; // room for a 0-length entry and no more
+        assert!(store_clumplet(&mut page, size, hdr_clump::SWEEP_INTERVAL, &[1, 2, 3, 4]).is_err());
+        size = HDR_DATA_OFFSET + 7;
+        assert!(store_clumplet(&mut page, size, hdr_clump::SWEEP_INTERVAL, &[1, 2, 3, 4]).unwrap());
     }
 }
