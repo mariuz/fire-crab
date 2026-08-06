@@ -16,7 +16,7 @@ matters more than the row count:
 |---|---|---|
 | **done** | on-disk structures, record decode + RLE, PIP, pointer/data pages, B-tree decode, TIP/MVCC, GC/sweep, BLR decode | converted and held against an oracle; the server depends on them |
 | **converted, wired** | `ods`, `blb`, `auth`, `svc`, `exe`, `dsql` | the running server links and uses them |
-| **converted, NOT wired** | `evt` | a real conversion of a real law, with a gate — that the server never calls |
+| **converted, half wired** | `evt` | `POST_EVENT` posts into it and commits move its counters; what the server cannot do yet is CARRY a delivery, which needs the auxiliary connection (W5) |
 | **converted, wired** | `stmc` | the plan a statement resolves to is kept per attachment and dropped by DDL. It took moving the two prepare-time FOLDS to fetch first — a lone aggregate and a `GEN_ID` read were computed by the planner and carried in the plan, so a kept plan answered the same number for ever |
 | **wired** | `lck` | a writer that meets another transaction's uncommitted row waits on that transaction's own lock and then re-reads, and two waiting on each other are denied by the wait-for scan with the engine's `isc_deadlock` (W4) |
 | **being wired** | `opt`, `cch`, `pio` | the server asks `opt` for the access path and takes an index when it says so (W1); the pages of a file live once per process in `cch`'s buffer pool and are flushed in its careful write order (W2), and written with `pio`, in the open mode the header's Forced Writes flag calls for (W3) |
@@ -2484,8 +2484,22 @@ plus *the subsystem is now on the path*.
   outside it, not deliberately: the triggers a statement gathers, and
   the per-statement CLONE of the cached check predicates (127us) -
   the answer is shared, the copy is not.
-- **W5 — event delivery** (`evt`): the shared-memory arena, the watcher,
-  and the wire path.
+- **W5 — event delivery** (`evt`). *(first slice done)* `POST_EVENT` is
+  a PSQL statement now - a procedure containing one used to be refused
+  whole - and `fire_crab_evt` is on the path behind it: the post is
+  filed under the transaction, the COMMIT moves the counter, a ROLLBACK
+  swallows it, and the table is per database so a poster in one
+  attachment moves what a listener in another is watching
+  (`qa/serve-real-events.sh`, 7 checks).
+
+  **What is left is the carrying, and it is all protocol**: a client
+  learns about an event over an AUXILIARY connection - the server
+  answers `op_connect_request` with a port, the client opens a second
+  socket, `op_que_events` registers a one-shot interest with an EPB of
+  names and counts, and each delivery is an `op_event` frame pushed on
+  that socket. `samples/nodejs/events.js` drives exactly that dance and
+  would be the gate. Nothing about it is observable until all of it
+  works, which is why it is its own slice rather than a half-step.
 - **W6 — depth in `exe` and `svc`**: the request lifecycle, cursors and
   exceptions; then gbak/gfix/nbackup as services.
 

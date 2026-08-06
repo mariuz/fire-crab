@@ -13,6 +13,35 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-06 — POST_EVENT is a statement now (W5, first slice)
+
+### Converted
+- **`POST_EVENT` joined the PSQL surface**, and `fire_crab_evt` is on
+  the path with it. A procedure containing one used to be refused
+  whole — *body is outside this server's PSQL surface* — which took the
+  procedure's other statements down with it; it parses, emits
+  `blr_post` (blr.h:128) when compiled, and posts when interpreted.
+- **The engine's law, end to end**: a post changes nothing on its own,
+  the COMMIT moves the counter, a ROLLBACK swallows it, and several
+  posts of one name in one transaction move the counter by that many.
+  Measured through the server: 1, then 3, then a rolled-back post
+  leaving it at 3.
+- **The event table is per database**, keyed the way the buffer pool,
+  the lock table and the caches are — a poster in one attachment moves
+  the counter a listener in another is watching. A transaction that
+  only posts writes no records and so reserves no transaction id, so
+  posts are filed under the attachment's own key, kept far above any
+  real transaction number.
+- **`qa/serve-real-events.sh`** (7 checks): both servers run the same
+  posting procedure and must answer the same, on commit and on
+  rollback; fire-crab's counter is then read out of its own log and
+  must move by the posts and not at all on a rollback.
+- **What is NOT here, named rather than assumed: DELIVERY.** A client
+  learns about an event over an AUXILIARY connection —
+  `op_connect_request`, a second socket, `op_que_events`, `op_event` —
+  and this server speaks none of it. The counter is what a delivery
+  would carry, and it is right; the carrying is the next slice.
+
 ## 2026-08-06 — What per-page fetch is actually worth, and what blocks it
 
 ### Measured

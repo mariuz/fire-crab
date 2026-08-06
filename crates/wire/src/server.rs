@@ -594,6 +594,18 @@ struct Database {
     /// generation - another connection's DDL moves it, and every plan
     /// compiled under the old one becomes unreachable by key.
     stmts: crate::stmc::DbStatements<Plan, Descriptor>,
+    /// the event names this transaction has posted, so its commit can
+    /// say what the counters became - the only thing observable about an
+    /// event until the auxiliary connection carries deliveries.
+    ///
+    /// A `RefCell` because POST_EVENT runs where the database is a `&`:
+    /// the PSQL interpreter reads the database, it does not write it,
+    /// and an event post is the one thing it files rather than stores.
+    posted: std::cell::RefCell<Vec<String>>,
+    /// this database's event manager: `POST_EVENT` posts into it and the
+    /// COMMIT turns those posts into counter moves (see [crate::server]'s
+    /// `events_for` and `fire_crab_evt`)
+    events: std::sync::Arc<std::sync::Mutex<fire_crab_evt::EventTable>>,
     /// this database's lock table, and this attachment's identity in
     /// it: a transaction holds a lock on its own id while it lives, and
     /// a writer that meets one of its versions waits on that - see
@@ -620,6 +632,23 @@ struct Database {
     gen_windows: Vec<GenWindow>,
 }
 
+/// THE EVENT MANAGER OF ONE DATABASE, shared by its attachments - keyed
+/// the way the buffer pool, the lock table and the caches are, because
+/// an event is a counter in one shared place and a poster in one
+/// attachment moves the counter a listener in another is watching.
+fn events_for(path: &str) -> std::sync::Arc<std::sync::Mutex<fire_crab_evt::EventTable>> {
+    type Registry = std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<fire_crab_evt::EventTable>>>,
+    >;
+    static R: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
+    let key = std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string());
+    let reg = R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut g = reg.lock().unwrap_or_else(|e| e.into_inner());
+    std::sync::Arc::clone(g.entry(key).or_default())
+}
+
 /// How long a writer waits for the connection that holds the database's
 /// write side before giving up. The engine's default is WAIT, forever;
 /// this waits long enough to be that in practice and still refuses
@@ -634,6 +663,20 @@ fn write_wait() -> std::time::Duration {
 }
 
 impl Database {
+    /// The key this attachment's event POSTS are filed under.
+    ///
+    /// A transaction that only posts events writes no records, so it
+    /// reserves no transaction id - and its posts still have to be
+    /// counted at its commit and swallowed by its rollback. When there
+    /// is no id the attachment's own is used, kept far above any real
+    /// transaction number so the two can never collide.
+    fn event_tx(&self) -> u64 {
+        match self.tx {
+            Some(tx) => u64::from(tx),
+            None => u64::MAX / 2 + self.lock_owner as u64,
+        }
+    }
+
     /// What the catalog says about a relation - from the metadata
     /// cache, or read off the pages once and held there until DDL.
     ///
@@ -1171,6 +1214,7 @@ fn load_database(path: &str) -> Option<Database> {
     let locks = crate::dblocks::for_path(p);
     let lock_owner = locks.owner();
     let meta = crate::mdc::for_path(p);
+    let events = events_for(p);
     // the pool may have just RE-READ this file (a gate deleting and
     // re-creating its scratch database, the engine writing it): what
     // the cache holds was about the file that is gone
@@ -1180,6 +1224,8 @@ fn load_database(path: &str) -> Option<Database> {
         write: None,
         tx: None,
         touched: false,
+        posted: std::cell::RefCell::new(Vec::new()),
+        events,
         meta,
         stmts: Default::default(),
         locks,
@@ -6815,6 +6861,11 @@ enum TrigStmt {
     },
     /// `EXCEPTION <name>;` - blr_abort, condition 2 (exception), name
     Raise { name: String, src_off: usize },
+    /// `POST_EVENT <name>;` - blr_post (blr.h:128) over the name as a
+    /// literal. AN EVENT IS A COUNTER, NOT A MESSAGE: the post moves
+    /// nothing visible on its own, the COMMIT moves the counter, and a
+    /// rollback swallows it (see `fire_crab_evt`).
+    PostEvent { name: String, src_off: usize },
     /// `INSERT INTO <t> (<cols>) VALUES (<exprs>);` - blr_store over a
     /// blr_relation with its own context (2, 3, ... per store), the
     /// assignments reading the trigger's NEW/OLD contexts
@@ -7370,6 +7421,22 @@ fn parse_trig_stmt(
         }
         return Some(TrigStmt::Raise { name, src_off: start });
     }
+    if find_word(&up, "POST_EVENT", 0) == Some(0) {
+        // POST_EVENT <name> - a string literal, or an identifier the
+        // engine also accepts. The NAME is what the event manager
+        // counts; anything this cannot read is refused rather than
+        // posted under a wrong name.
+        let rest = text["POST_EVENT".len()..].trim();
+        let name = if rest.len() >= 2 && rest.starts_with('\'') && rest.ends_with('\'') {
+            rest[1..rest.len() - 1].replace("''", "'")
+        } else {
+            return None;
+        };
+        if name.is_empty() {
+            return None;
+        }
+        return Some(TrigStmt::PostEvent { name, src_off: start });
+    }
     if find_word(&up, "UPDATE", 0) == Some(0) {
         // UPDATE <t> SET <col> = <expr>[, ...] [WHERE <cond>]
         let set_kw = find_word(&up, "SET", "UPDATE".len())?;
@@ -7608,6 +7675,17 @@ fn emit_trigger_stmt(
             b.push(18); // blr_leave (the else branch: condition false)
             b.push(n);
             b.push(255); // end of the loop's begin
+        }
+        TrigStmt::PostEvent { name, src_off } => {
+            // blr_post (blr.h:128) followed by the event name as a
+            // literal - the shape the engine stores for POST_EVENT
+            dbg.push((*src_off, b.len()));
+            b.push(20); // blr_post
+            b.push(21); // blr_literal
+            b.push(14); // blr_text
+            let bytes = name.as_bytes();
+            b.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+            b.extend_from_slice(bytes);
         }
         TrigStmt::Raise { name, src_off } => {
             dbg.push((*src_off, b.len()));
@@ -7959,7 +8037,8 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
                 out.extend(cond.operands());
                 stmt_exprs(body, out);
             }
-            TrigStmt::Raise { .. } => {}
+            TrigStmt::Raise { .. }
+            | TrigStmt::PostEvent { .. } | TrigStmt::PostEvent { .. } => {}
             TrigStmt::Store { exprs, .. } => out.extend(exprs.iter()),
             // an Update/Delete's expressions hold TARGET-table plain
             // references - validated against the target separately
@@ -7973,7 +8052,9 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     }
     fn stmt_targets<'a>(st: &'a TrigStmt, out: &mut Vec<&'a TrigTarget>) {
         match st {
-            TrigStmt::Suspend { .. } | TrigStmt::ForSelect { .. } => {}
+            TrigStmt::Suspend { .. }
+            | TrigStmt::ForSelect { .. }
+            | TrigStmt::PostEvent { .. } => {}
             TrigStmt::Assign { target, .. } => out.push(target),
             TrigStmt::If { then, otherwise, .. } => {
                 stmt_targets(then, out);
@@ -8013,6 +8094,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             }
             TrigStmt::While { body, .. } => stmt_specials(body, stores, raises, hexcs, dmls),
             TrigStmt::Raise { name, .. } => raises.push(name),
+            TrigStmt::PostEvent { .. } => {}
             TrigStmt::Store { .. } => stores.push(st),
             TrigStmt::Update { .. } | TrigStmt::Delete { .. } => dmls.push(st),
             TrigStmt::Block { stmts, handlers, .. } => {
@@ -33950,6 +34032,35 @@ fn release_write_side(database: &mut Option<Database>) {
 /// forward, since that write needs the write side too.
 fn end_transaction(database: &mut Option<Database>, outcome: TxEnd) {
     let Some(db) = database.as_mut() else { return };
+    // AN EVENT IS COUNTED AT COMMIT, and swallowed by a rollback. The
+    // transaction's posts have been sitting in the event table since the
+    // statements that made them; this is where they become counter moves
+    // - which is what a listener is waiting for (delivery over the
+    // auxiliary connection is the next slice; the counting is this one).
+    {
+        let tx = db.event_tx();
+        let posted = std::mem::take(&mut *db.posted.borrow_mut());
+        let mut t = db.events.lock().unwrap_or_else(|e| e.into_inner());
+        match outcome {
+            TxEnd::Commit => {
+                let delivered = t.commit(tx);
+                if std::env::var("FC_SRV_TRACE").is_ok() && !posted.is_empty() {
+                    for name in &posted {
+                        eprintln!("[srv] event {:?} counter {}", name, t.count(name));
+                    }
+                    eprintln!("[srv] events: {} delivery(ies) at commit", delivered.len());
+                }
+            }
+            _ => {
+                t.rollback(tx);
+                if std::env::var("FC_SRV_TRACE").is_ok() && !posted.is_empty() {
+                    for name in &posted {
+                        eprintln!("[srv] event {:?} counter {} (rolled back)", name, t.count(name));
+                    }
+                }
+            }
+        }
+    }
     let r = match outcome {
         // COMMIT IS TWO BITS. The records have been on the pages since
         // the statements that wrote them; what the commit publishes is
@@ -34206,6 +34317,29 @@ fn exec_psql_stmt(
             Ok(())
         }
         TrigStmt::Raise { name, .. } => Err(PsqlStop::Raise(name.clone())),
+        // POST_EVENT: nothing happens NOW. The post is filed under this
+        // transaction, and the COMMIT is what moves the counter - a
+        // rollback swallows it, which is the law `fire_crab_evt` holds
+        // and the engine's own (event.cpp's commit-time delivery).
+        TrigStmt::PostEvent { name, .. } => {
+            if let Some(db) = db.as_ref() {
+                let tx = db.event_tx();
+                {
+                    let mut t = db.events.lock().unwrap_or_else(|e| e.into_inner());
+                    t.post(tx, name);
+                }
+                {
+                    let mut p = db.posted.borrow_mut();
+                    if !p.iter().any(|n| n == name) {
+                        p.push(name.clone());
+                    }
+                }
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] POST_EVENT {:?} under transaction {}", name, tx);
+                }
+            }
+            Ok(())
+        }
         // FOR SELECT: plan the query with the ORDINARY planner, collect
         // its rows, then run the body once per row with the projected
         // values assigned into the INTO variables. Planning it the normal
@@ -39060,6 +39194,8 @@ mod tests {
             write: None,
             tx: None,
             touched: false,
+            posted: std::cell::RefCell::new(Vec::new()),
+            events: events_for("/nonexistent/fc-rowsource-test"),
             meta: crate::mdc::for_path("/nonexistent/fc-rowsource-test"),
             stmts: Default::default(),
             locks: crate::dblocks::for_path("/nonexistent/fc-rowsource-test"),
@@ -41868,6 +42004,8 @@ mod tests {
             write: None,
             tx: None,
             touched: false,
+            posted: std::cell::RefCell::new(Vec::new()),
+            events: events_for("/nonexistent/fc-rowsource-test"),
             meta: crate::mdc::for_path("/nonexistent/fc-rowsource-test"),
             stmts: Default::default(),
             locks: crate::dblocks::for_path("/nonexistent/fc-rowsource-test"),

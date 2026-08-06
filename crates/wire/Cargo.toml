@@ -15,6 +15,7 @@ fire-crab-exe = { path = "../exe" }
 fire-crab-opt = { path = "../opt" }
 fire-crab-cch = { path = "../cch" }
 fire-crab-lck = { path = "../lck" }
+fire-crab-evt = { path = "../evt" }
 fire-crab-pio = { path = "../pio" }
 
 [[bin]]
