@@ -13,6 +13,61 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-06 — exceptions: catching them, and what reaches the client
+
+### Converted
+- **`WHEN EXCEPTION <name> DO`** — a handler with a condition used to be
+  refused outright, so `WHEN ANY` was the whole of PSQL exception
+  handling. The condition is matched against the raise's identity now.
+- **A bare `EXCEPTION;` re-raises**, identity intact: the client sees
+  the original exception, not a new one. The handler's body runs with
+  what it caught in scope, saved and restored around nested handlers.
+  It is interpreted-only — its BLR shape has not been probed — so
+  `CREATE TRIGGER` refuses a body holding one rather than store BLR
+  that silently drops a statement its own source contains.
+- **An uncaught exception reaches the client as the ENGINE'S ERROR**,
+  not as a generic Dynamic SQL Error: `isc_except` + the exception's
+  catalog NUMBER, `isc_random` + its quoted name, `isc_random` + its
+  message, then one `isc_stack_trace` per raise point
+  (StmtNodes.cpp:5958). That distinction is the point of the slice — a
+  driver cannot tell "your data raised E_MINE" from "this server could
+  not run that procedure" when both arrive as -104.
+- **The identity is read AT RAISE TIME**, as `MET_lookup_exception`
+  does, so an `ALTER EXCEPTION` is visible to the very next raise
+  rather than frozen when the body was parsed. Gated both ways.
+
+### Found
+- **`At procedure ... line: L, col: C` counts the DDL statement, and
+  the catalog stores only the body.** The identical body reports line 2
+  under a one-line header, line 6 under a five-line one, and line 1 col
+  59 when the whole `CREATE PROCEDURE` was one line. fire-crab recovers
+  the difference from the procedure's own `RDB$DEBUG_INFO` — the format
+  it already writes for its own triggers — by reading where the body's
+  BEGIN sat in the DDL. Version 1 of that blob packed line and column
+  into 16 bits and version 2 widened both to 32; a reader assuming one
+  width walks off the item boundary on the other.
+- **A re-raise reports BOTH raise points**, in order — one stack item
+  per raise, not one per exception.
+- **Which handler runs is not what the engine's own loop suggests.**
+  `StmtNodes.cpp:604` walks a block's handlers and takes the first
+  whose conditions match; measured, `WHEN EXCEPTION E_M ... WHEN ANY
+  ...` answers from the ANY, though the named one is first and matches.
+  So the list that loop walks is not the source-order one. What the
+  engine does, in each shape that distinguishes a rule: a `WHEN ANY`
+  beats a named handler from either side, the LAST of several `WHEN
+  ANY` wins, and with no `WHEN ANY` the first matching named handler
+  wins — including one in the middle. All five are gated.
+- **`INSERT ... VALUES` without a column list is outside the PSQL
+  surface** — found while writing the gate, unrelated to exceptions,
+  and noted where the gate works around it.
+
+### Gated
+- **`qa/serve-real-exceptions.sh`** (19 checks): every handler form and
+  precedence shape, uncaught and re-raised error text compared line for
+  line, nesting in both directions, the three DDL shapes, the ALTER
+  EXCEPTION visibility, and that a body which wrote before raising
+  leaves nothing behind.
+
 ## 2026-08-06 — the rest of gfix's header switches, and `hdr_end`
 
 ### Converted

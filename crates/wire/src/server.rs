@@ -5818,6 +5818,56 @@ fn quoted_qualified(name: &str) -> String {
     format!("\"PUBLIC\".\"{}\"", name.trim_matches('"').trim_end().to_ascii_uppercase())
 }
 
+/// The 1-BASED line and column of a byte offset in a body's source -
+/// what the engine's `At procedure ... line: L, col: C` item counts.
+///
+/// It counts the SOURCE AS STORED (`RDB$PROCEDURE_SOURCE`), which is
+/// why the numbers come out the engine's way: the source starts after
+/// the `AS`, so a one-line body reported at "line: 2" is counting the
+/// newline the DDL left in front of it.
+fn source_line_col(src: &str, off: usize) -> (usize, usize) {
+    let off = off.min(src.len());
+    let before = &src[..off];
+    let line = before.matches('\n').count() + 1;
+    let col = before.rfind('\n').map(|n| off - n - 1).unwrap_or(off) + 1;
+    (line, col)
+}
+
+/// Where a byte of a procedure's stored body sat in the ORIGINAL
+/// `CREATE PROCEDURE` text - the 1-based (line, col) the engine's `At
+/// procedure ...` item carries.
+///
+/// The catalog stores the body alone, so the two coordinate systems
+/// differ by however much header the DDL had, and the difference is not
+/// a constant: a statement on the body's FIRST line is also shifted
+/// sideways, by however far along that line the body began. Both shifts
+/// are read off one fact - where the body's BEGIN is in the DDL, which
+/// the debug blob's first entry records - so
+///
+/// * every line moves down by (BEGIN's DDL line - BEGIN's body line);
+/// * a statement sharing BEGIN's body line ALSO moves right, by
+///   (BEGIN's DDL column - BEGIN's body column).
+///
+/// Measured against the engine: the same body reports line 2 col 12
+/// under a one-line header, line 6 col 12 under a five-line one, and
+/// line 1 col 59 when the whole DDL was one line.
+///
+/// `None` when the blob had no position: the item is then left out
+/// entirely, because a stack trace pointing at the wrong line is worse
+/// than none.
+fn ddl_position(meta: &ProcMeta, begin_at: usize, off: usize) -> Option<(usize, usize)> {
+    let (begin_line_ddl, begin_col_ddl) = meta.body_at?;
+    let (begin_line, begin_col) = source_line_col(&meta.source, begin_at);
+    let (line, col) = source_line_col(&meta.source, off);
+    let out_line = line + begin_line_ddl.checked_sub(begin_line)?;
+    let out_col = if line == begin_line {
+        col + begin_col_ddl.checked_sub(begin_col)?
+    } else {
+        col
+    };
+    Some((out_line, out_col))
+}
+
 /// The engine's `isc_invalid_blr` offset for `SELECT <n cols> FROM
 /// <proc>(<args>)` - a byte offset into BLR THIS SERVER NEVER GENERATED,
 /// so it is reconstructed from the statement's shape. Probed across name
@@ -6949,6 +6999,11 @@ enum TrigStmt {
     },
     /// `EXCEPTION <name>;` - blr_abort, condition 2 (exception), name
     Raise { name: String, src_off: usize },
+    /// A BARE `EXCEPTION;` - re-raise what the enclosing handler caught,
+    /// with its identity intact (the client sees the ORIGINAL exception,
+    /// not a new one). Outside a handler there is nothing to re-raise
+    /// and the interpreter refuses, as the engine refuses to compile it.
+    Reraise { src_off: usize },
     /// `POST_EVENT <name>;` - blr_post (blr.h:128) over the name as a
     /// literal. AN EVENT IS A COUNTER, NOT A MESSAGE: the post moves
     /// nothing visible on its own, the COMMIT moves the counter, and a
@@ -7363,7 +7418,7 @@ fn parse_trig_block(
 /// FOR SELECT it accepts, so this is a real limit, honestly refused.)
 fn body_has_uninterpretable_blr(st: &TrigStmt) -> bool {
     match st {
-        TrigStmt::Suspend { .. } | TrigStmt::ForSelect { .. } => true,
+        TrigStmt::Suspend { .. } | TrigStmt::ForSelect { .. } | TrigStmt::Reraise { .. } => true,
         TrigStmt::If { then, otherwise, .. } => {
             body_has_uninterpretable_blr(then)
                 || otherwise.as_ref().is_some_and(|e| body_has_uninterpretable_blr(e))
@@ -7502,8 +7557,15 @@ fn parse_trig_stmt(
         return Some(TrigStmt::Suspend { src_off: start });
     }
     if find_word(&up, "EXCEPTION", 0) == Some(0) {
-        // EXCEPTION <name>
-        let name = text["EXCEPTION".len()..].trim().trim_matches('"').to_ascii_uppercase();
+        // EXCEPTION <name>, or BARE `EXCEPTION` - which is a RE-RAISE of
+        // whatever the enclosing handler caught, and means nothing
+        // anywhere else (the engine refuses it outside a handler at
+        // compile time).
+        let rest = text["EXCEPTION".len()..].trim();
+        if rest.is_empty() {
+            return Some(TrigStmt::Reraise { src_off: start });
+        }
+        let name = rest.trim_matches('"').to_ascii_uppercase();
         if !ident_ok(&name) {
             return None;
         }
@@ -7717,8 +7779,12 @@ fn emit_trigger_stmt(
 ) {
     match st {
         // a trigger cannot contain SUSPEND - only a selectable procedure
-        // can, and that path is interpreted, never compiled to BLR
-        TrigStmt::Suspend { .. } | TrigStmt::ForSelect { .. } => {}
+        // can, and that path is interpreted, never compiled to BLR.
+        // A bare EXCEPTION; is interpreted-only for a different reason:
+        // its BLR shape has not been probed, and CREATE TRIGGER refuses
+        // a body holding one rather than store BLR missing a statement
+        // its own source contains ([body_has_uninterpretable_blr]).
+        TrigStmt::Suspend { .. } | TrigStmt::ForSelect { .. } | TrigStmt::Reraise { .. } => {}
         TrigStmt::Assign { target, expr, src_off } => {
             dbg.push((*src_off, b.len()));
             b.push(1); // blr_assignment
@@ -8112,7 +8178,9 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     };
     fn stmt_exprs<'a>(st: &'a TrigStmt, out: &mut Vec<&'a fire_crab_ods::expr::Expr>) {
         match st {
-            TrigStmt::Suspend { .. } | TrigStmt::ForSelect { .. } => {}
+            TrigStmt::Suspend { .. }
+            | TrigStmt::ForSelect { .. }
+            | TrigStmt::Reraise { .. } => {}
             TrigStmt::Assign { expr, .. } => out.push(expr),
             TrigStmt::If { cond, then, otherwise, .. } => {
                 out.extend(cond.operands());
@@ -8142,7 +8210,8 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         match st {
             TrigStmt::Suspend { .. }
             | TrigStmt::ForSelect { .. }
-            | TrigStmt::PostEvent { .. } => {}
+            | TrigStmt::PostEvent { .. }
+            | TrigStmt::Reraise { .. } => {}
             TrigStmt::Assign { target, .. } => out.push(target),
             TrigStmt::If { then, otherwise, .. } => {
                 stmt_targets(then, out);
@@ -8172,7 +8241,9 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         dmls: &mut Vec<&'a TrigStmt>,
     ) {
         match st {
-            TrigStmt::Suspend { .. } | TrigStmt::ForSelect { .. } => {}
+            TrigStmt::Suspend { .. }
+            | TrigStmt::ForSelect { .. }
+            | TrigStmt::Reraise { .. } => {}
             TrigStmt::Assign { .. } => {}
             TrigStmt::If { then, otherwise, .. } => {
                 stmt_specials(then, stores, raises, hexcs, dmls);
@@ -8393,6 +8464,49 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         },
         Vec::new(),
     ))
+}
+
+/// What the catalog says a user exception IS: its number and its
+/// message, which is what a raise ships to the client.
+///
+/// The engine looks these up at raise time (`MET_lookup_exception`,
+/// StmtNodes.cpp:5947) rather than binding them when the body was
+/// compiled, so an `ALTER EXCEPTION` between the two is visible to the
+/// very next raise - and reading them here rather than at parse keeps
+/// that.
+fn exception_identity(db: &Database, name: &str) -> Option<(i64, String)> {
+    let formats =
+        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, "RDB$EXCEPTIONS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(&db.bytes(), db.page_size, "RDB$EXCEPTIONS");
+    let fid = |c: &str| {
+        cols.iter()
+            .find(|f| f.name == c)
+            .map(|f| f.field_id as usize)
+    };
+    let name_f = fid("RDB$EXCEPTION_NAME")?;
+    let number_f = fid("RDB$EXCEPTION_NUMBER")?;
+    let message_f = fid("RDB$MESSAGE")?;
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$EXCEPTIONS")?;
+    let fmts = vec![(0u8, descs.clone())];
+    let mut found = None;
+    for_each_record(db, rel, &fmts, |values| {
+        let is_it = matches!(values.get(name_f),
+            Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
+        if !is_it {
+            return;
+        }
+        let number = match values.get(number_f) {
+            Some(Value::Int(n)) => *n,
+            _ => 0,
+        };
+        let message = match values.get(message_f) {
+            Some(Value::Text(t)) => t.trim_end().to_string(),
+            _ => String::new(),
+        };
+        found = Some((number, message));
+    });
+    found
 }
 
 /// Whether a user exception of this name exists (RDB$EXCEPTIONS) - an
@@ -23290,6 +23404,9 @@ const GDS_OVERRIDING_WITHOUT_IDENTITY: i32 = 335545134;
 const GDS_OVERRIDING_SYSTEM_INVALID: i32 = 335545135;
 const GDS_CHECK_CONSTRAINT: i32 = 335544558;
 const GDS_STACK_TRACE: i32 = 335544842;
+/// `isc_except`, "exception @1" - the head of every raised user
+/// exception's status vector (Firebird.pas:5241).
+const GDS_EXCEPT: i32 = 335544517;
 
 /// Write, into the fetch reply stream, the op_response the engine sends
 /// when a row's evaluation raises `e` - mirroring `respond_error`'s layout
@@ -23365,6 +23482,26 @@ fn eval_status_vector(w: &mut W, e: &EvalErr) {
         EvalErr::IntegerOverflow => {
             w.int(1) // isc_arg_gds
                 .int(GDS_INTEGER_OVERFLOW);
+        }
+        EvalErr::UserException { number, name, message, stack } => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_EXCEPT)
+                .int(ISC_ARG_NUMBER)
+                .int(*number as i32)
+                .int(1) // isc_arg_gds
+                .int(GDS_RANDOM)
+                .int(2) // isc_arg_string
+                .bytes(name.as_bytes())
+                .int(1) // isc_arg_gds
+                .int(GDS_RANDOM)
+                .int(2) // isc_arg_string
+                .bytes(message.as_bytes());
+            for at in stack {
+                w.int(1) // isc_arg_gds
+                    .int(GDS_STACK_TRACE)
+                    .int(2) // isc_arg_string
+                    .bytes(at.as_bytes());
+            }
         }
         EvalErr::InvalidLength(n) => {
             w.int(1) // isc_arg_gds
@@ -27421,6 +27558,32 @@ enum EvalErr {
     /// `isc_param_no_default_not_specified` per missing parameter) and
     /// is NOT this variant
     ProcArgMismatch(String),
+    /// A USER EXCEPTION that reached the client - `EXCEPTION <name>` in
+    /// a body with no handler that caught it.
+    ///
+    /// The vector is `StmtNodes.cpp:5958-5974`, and the branch taken
+    /// depends on what the exception HAS: with both a name and a
+    /// message (every `CREATE EXCEPTION`, since the message is
+    /// mandatory) it is
+    ///
+    /// ```text
+    /// isc_except      <number>          -- "exception @1"
+    /// isc_random      "SCHEMA"."NAME"   -- the quoted name
+    /// isc_random      <message text>
+    /// ```
+    ///
+    /// then one `isc_stack_trace` item per PSQL frame the exception
+    /// passed through, which is what makes isql print `At procedure
+    /// "PUBLIC"."P" line: 2, col: 12`. `number` is the catalog's
+    /// RDB$EXCEPTION_NUMBER, not a position; `name` and `stack` are
+    /// PRE-QUOTED as the engine renders them.
+    UserException {
+        number: i64,
+        name: String,
+        message: String,
+        /// one per raise point, outermost raise first
+        stack: Vec<String>,
+    },
 }
 
 /// What an expression's result is typed as - which drives its wire form
@@ -33782,6 +33945,21 @@ struct ProcMeta {
     outs: Vec<ProcParam>,
     /// the `BEGIN ... END` body text
     source: String,
+    /// WHERE THAT SOURCE SAT IN THE ORIGINAL `CREATE PROCEDURE` TEXT,
+    /// as the 1-based (line, column) of its first byte - read from the
+    /// procedure's own `RDB$DEBUG_INFO`.
+    ///
+    /// It is needed because the engine's `At procedure ... line: L,
+    /// col: C` counts the DDL STATEMENT, and the catalog stores only
+    /// the BODY: measured, the same body reported line 2 col 12 under a
+    /// one-line header and line 6 col 12 under a five-line one, and
+    /// line 1 col 59 when the whole thing was one line. The debug blob
+    /// is where the engine kept that, in the very format fire-crab
+    /// already WRITES for its own triggers ([trigger_debug_blob]).
+    ///
+    /// `None` when the blob is absent or unreadable - then the stack
+    /// item is left out rather than guessed.
+    body_at: Option<(usize, usize)>,
     /// RDB$PROCEDURES.RDB$PROCEDURE_TYPE: 1 = selectable, 2 = executable.
     /// SELECTABILITY IS LEXICAL AND DDL-TIME - the parser only asks
     /// whether the token SUSPEND appears anywhere in the body, never
@@ -33841,8 +34019,10 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     // field_id 11 on an FB6 ODS, NULLABLE - absent on a pre-schema one
     let type_f = pfid("RDB$PROCEDURE_TYPE");
     let pfmts = vec![(0u8, pdescs)];
+    let dbg_f = pfid("RDB$DEBUG_INFO");
     let mut source: Option<String> = None;
     let mut prc_type: Option<i64> = None;
+    let mut body_at: Option<(usize, usize)> = None;
     // the FIRST accepted row is taken WHOLE: keying the guard off
     // `source.is_some()` (as it did) would let a LATER row supply the
     // type for the body this one read
@@ -33862,6 +34042,11 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
         if let Some(Value::Blob(r, n)) = v.get(src_f) {
             if let Some(bytes) = fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n) {
                 source = Some(String::from_utf8_lossy(&bytes).into_owned());
+            }
+        }
+        if let Some(Value::Blob(r, n)) = dbg_f.and_then(|i| v.get(i)) {
+            if let Some(bytes) = fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n) {
+                body_at = first_debug_position(&bytes);
             }
         }
     });
@@ -33938,7 +34123,73 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
             outs.push(p)
         }
     }
-    Some(ProcMeta { ins, outs, source, prc_type })
+    Some(ProcMeta { ins, outs, source, prc_type, body_at })
+}
+
+/// The (line, column) of the FIRST source-to-BLR entry in an
+/// `RDB$DEBUG_INFO` blob - the position, IN THE ORIGINAL DDL, of the
+/// first thing the body's compiler emitted, which is its opening BEGIN.
+///
+/// The format is the one [trigger_debug_blob] writes, read back:
+/// `01 02` (fb_dbg version 2), then items - `03 <slot u16> <len u8>
+/// <name>` for a variable name, `02 <line u32> <col u32> <blr u32>` for
+/// a statement - terminated by `FF`. Anything unrecognised stops the
+/// walk rather than being skipped by a guessed length.
+fn first_debug_position(blob: &[u8]) -> Option<(usize, usize)> {
+    if blob.len() < 3 || blob[0] != 1 || *blob.last()? != 0xFF {
+        return None; // fb_dbg_version ... fb_dbg_end, as the engine checks
+    }
+    let version = blob[1];
+    if version == 0 || version > 2 {
+        return None;
+    }
+    // VERSION 1 PACKED LINE AND COLUMN INTO 16 BITS EACH; version 2
+    // widened both to 32 (DebugInterface.cpp:71). A reader that assumed
+    // one width would walk off the item boundary on the other.
+    let wide = version > 1;
+    let num = |at: usize| -> Option<usize> {
+        if wide {
+            Some(u32::from_le_bytes([
+                *blob.get(at)?,
+                *blob.get(at + 1)?,
+                *blob.get(at + 2)?,
+                *blob.get(at + 3)?,
+            ]) as usize)
+        } else {
+            Some(u16::from_le_bytes([*blob.get(at)?, *blob.get(at + 1)?]) as usize)
+        }
+    };
+    let w = if wide { 4 } else { 2 };
+    let mut at = 2;
+    while at < blob.len() {
+        let code = blob[at];
+        at += 1;
+        match code {
+            0xFF => return None,             // fb_dbg_end
+            2 => return Some((num(at)?, num(at + w)?)), // fb_dbg_map_src2blr
+            // fb_dbg_map_varname / fb_dbg_map_curname: index u16, then a
+            // counted name
+            3 | 7 => {
+                let len = *blob.get(at + 2)? as usize;
+                at += 3 + len;
+            }
+            // fb_dbg_map_argument: type u8, index u16, counted name
+            4 => {
+                let len = *blob.get(at + 3)? as usize;
+                at += 4 + len;
+            }
+            // fb_dbg_map_for_curname: offset u32, counted name
+            8 => {
+                let len = *blob.get(at + 4)? as usize;
+                at += 5 + len;
+            }
+            // fb_dbg_subproc / fb_dbg_subfunc carry a whole nested blob;
+            // the first src2blr entry of the OUTER body always precedes
+            // them, so reaching one means there was none to find
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// The interpreter's variable frame: one slot per parameter, in the
@@ -33952,12 +34203,66 @@ struct PsqlFrame {
     /// the rows SUSPEND has emitted so far - a selectable procedure's
     /// result set, in the order the body produced them
     suspended: Vec<Vec<Value>>,
+    /// WHAT THE ENCLOSING HANDLER CAUGHT, while its body runs - what a
+    /// bare `EXCEPTION;` re-raises. Handlers nest, so this is saved and
+    /// restored around each one rather than simply set.
+    caught: Option<Raised>,
+}
+
+/// A raised user exception, with the identity the client is owed: the
+/// engine ships the exception's NUMBER, its quoted NAME and its MESSAGE
+/// (StmtNodes.cpp:5958), not just the name the body wrote.
+///
+/// `trace` is EVERY raise point the exception has passed, in the order
+/// it passed them - the raise itself, then each bare `EXCEPTION;` that
+/// re-threw it - because the engine prints one `At procedure ... line:
+/// L, col: C` item per raise point, not one per exception (measured: a
+/// handler that re-raises reports the original raise AND the re-raise,
+/// in that order). Offsets are into the body source.
+#[derive(Clone)]
+struct Raised {
+    name: String,
+    number: i64,
+    message: String,
+    trace: Vec<usize>,
+}
+
+/// WHY A PROCEDURE CALL FAILED, and what the client is owed for it.
+///
+/// Most failures are this server's own refusals, and they travel as
+/// text for the trace and a generic Dynamic SQL Error on the wire. A
+/// USER EXCEPTION is different: it is not a refusal at all, it is the
+/// body doing exactly what its source says, and the client must get the
+/// engine's own status vector for it - the exception's number, name and
+/// message - or a driver cannot tell "your data raised E_MINE" from
+/// "this server could not run the procedure".
+struct ProcErr {
+    text: String,
+    status: Option<EvalErr>,
+}
+
+impl From<String> for ProcErr {
+    fn from(text: String) -> ProcErr {
+        ProcErr { text, status: None }
+    }
+}
+
+impl From<&str> for ProcErr {
+    fn from(text: &str) -> ProcErr {
+        ProcErr { text: text.to_string(), status: None }
+    }
+}
+
+impl std::fmt::Display for ProcErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
 }
 
 /// What stopped a body early.
 enum PsqlStop {
-    /// `EXCEPTION <name>` - the message is looked up like the engine's
-    Raise(String),
+    /// `EXCEPTION <name>` - carrying the identity the client is owed
+    Raise(Raised),
     /// a construct the interpreter does not implement; the statement
     /// fails whole rather than half-running
     Unsupported,
@@ -34486,7 +34791,33 @@ fn exec_psql_stmt(
             }
             Ok(())
         }
-        TrigStmt::Raise { name, .. } => Err(PsqlStop::Raise(name.clone())),
+        // EXCEPTION <name>: the identity comes from the CATALOG, read
+        // now rather than when the body was parsed, because that is
+        // when the engine reads it too.
+        TrigStmt::Raise { name, src_off } => {
+            let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
+            let (number, message) =
+                exception_identity(dbr, name).ok_or(PsqlStop::Unsupported)?;
+            Err(PsqlStop::Raise(Raised {
+                name: name.clone(),
+                number,
+                message,
+                trace: vec![*src_off],
+            }))
+        }
+        // a bare EXCEPTION; re-raises what the enclosing handler caught,
+        // IDENTITY INTACT - the client must see the original exception,
+        // not a new one. Outside a handler there is nothing to re-raise;
+        // the engine refuses that at compile time and this refuses it
+        // here rather than inventing an exception to throw.
+        TrigStmt::Reraise { src_off } => match &f.caught {
+            Some(ex) => {
+                let mut again = ex.clone();
+                again.trace.push(*src_off);
+                Err(PsqlStop::Raise(again))
+            }
+            None => Err(PsqlStop::Unsupported),
+        },
         // POST_EVENT: nothing happens NOW. The post is filed under this
         // transaction, and the COMMIT is what moves the counter - a
         // rollback swallows it, which is the law `fire_crab_evt` holds
@@ -34577,12 +34908,59 @@ fn exec_psql_stmt(
             match run() {
                 Ok(()) => Ok(()),
                 Err(PsqlStop::Raise(ex)) if !handlers.is_empty() => {
-                    // this slice matches a handler only when it is a
-                    // catch-all (WHEN ANY); a named condition would need
-                    // the raise's identity compared against it
-                    for (conds, body) in handlers {
-                        if conds.is_empty() {
-                            return exec_psql_stmt(body, f, steps, db, ctx);
+                    // WHICH HANDLER RUNS, measured rather than assumed -
+                    // and it is NOT what the engine's own loop over a
+                    // block's handlers looks like (StmtNodes.cpp:604,
+                    // first match in list order):
+                    //
+                    //   * a `WHEN ANY` BEATS a named handler wherever it
+                    //     sits. `WHEN EXCEPTION E_M ... WHEN ANY ...`
+                    //     answers from the ANY, though the named one is
+                    //     first AND matches;
+                    //   * among several `WHEN ANY`, the LAST one wins;
+                    //   * with no `WHEN ANY`, the FIRST matching named
+                    //     handler wins, in source order (`WHEN EXCEPTION
+                    //     E_O ... WHEN EXCEPTION E_M ... WHEN EXCEPTION
+                    //     E_O` answers from the middle one).
+                    //
+                    // So the list the engine walks is evidently not the
+                    // source-order one; what is reproduced here is the
+                    // OBSERVED rule, which `qa/serve-real-exceptions.sh`
+                    // holds against the live engine in each of those
+                    // shapes.
+                    let matches = |conds: &Vec<HandlerCond>| {
+                        conds.is_empty()
+                            || conds.iter().any(|c| match c {
+                                HandlerCond::Exception(n) => n.eq_ignore_ascii_case(&ex.name),
+                                // SQLCODE/GDSCODE name ENGINE errors, and
+                                // a user exception is not one of those.
+                                // (A raise does carry isc_except/-836, so
+                                // `WHEN GDSCODE except` catches it in the
+                                // engine; matching that needs the runtime
+                                // errors this slice does not model, and
+                                // claiming the match without them would
+                                // catch the wrong things.)
+                                HandlerCond::Gds(_) | HandlerCond::Sql(_) => false,
+                            })
+                    };
+                    // the last WHEN ANY, if there is one; otherwise the
+                    // first handler whose conditions match
+                    let chosen = handlers
+                        .iter()
+                        .rev()
+                        .find(|(conds, _)| conds.is_empty())
+                        .or_else(|| handlers.iter().find(|(conds, _)| matches(conds)));
+                    for (conds, body) in chosen {
+                        let _ = conds;
+                        {
+                            // the handler's body runs with the caught
+                            // exception in scope, so a bare EXCEPTION;
+                            // inside it re-raises THIS one; nested
+                            // handlers save and restore around their own
+                            let outer = f.caught.replace(ex);
+                            let r = exec_psql_stmt(body, f, steps, db, ctx);
+                            f.caught = outer;
+                            return r;
                         }
                     }
                     Err(PsqlStop::Raise(ex))
@@ -34750,17 +35128,17 @@ fn run_procedure(
     name: &str,
     args: &[Value],
     ctx: &SessionCtx,
-) -> Result<(Vec<Value>, Vec<Vec<Value>>), String> {
+) -> Result<(Vec<Value>, Vec<Vec<Value>>), ProcErr> {
     let db = database.as_ref().ok_or("no database attached")?;
     let meta = load_procedure(db, name)
         .ok_or_else(|| format!("procedure {} is not one this server can run", name))?;
     if args.len() != meta.ins.len() {
-        return Err(format!(
+        return Err(ProcErr::from(format!(
             "procedure {} expects {} input parameter(s), got {}",
             name,
             meta.ins.len(),
             args.len()
-        ));
+        )));
     }
     // the parser numbers variables in the order it is given them:
     // inputs, then outputs - the same order the body's identifiers
@@ -34784,6 +35162,7 @@ fn run_procedure(
         out_at: meta.ins.len(),
         out_len: meta.outs.len(),
         suspended: Vec::new(),
+        caught: None,
     };
     frame.vars.extend(args.iter().cloned());
     frame.vars.resize(names.len(), Value::Null);
@@ -34800,13 +35179,40 @@ fn run_procedure(
     gen_window_unwind(database, mark, outcome.is_err());
     match outcome {
         Ok(()) => {}
-        Err(PsqlStop::Raise(ex)) => return Err(format!("exception {}", ex)),
-        Err(PsqlStop::Failed(e)) => return Err(e),
+        // A RAISE IS NOT A REFUSAL. The body did what its source says,
+        // so the client gets the engine's own vector for it: the
+        // exception's number, its quoted name, its message, and the
+        // `At procedure ... line: L, col: C` item that says where in
+        // the body it came from.
+        Err(PsqlStop::Raise(ex)) => {
+            return Err(ProcErr {
+                text: format!("exception {}", ex.name),
+                status: Some(EvalErr::UserException {
+                    number: ex.number,
+                    name: quoted_qualified(&ex.name),
+                    message: ex.message.clone(),
+                    stack: ex
+                        .trace
+                        .iter()
+                        .filter_map(|off| ddl_position(&meta, begin_at, *off))
+                        .map(|(line, col)| {
+                            format!(
+                                "At procedure {} line: {}, col: {}",
+                                quoted_qualified(name),
+                                line,
+                                col
+                            )
+                        })
+                        .collect(),
+                }),
+            });
+        }
+        Err(PsqlStop::Failed(e)) => return Err(ProcErr::from(e)),
         Err(PsqlStop::Unsupported) => {
-            return Err(format!(
+            return Err(ProcErr::from(format!(
                 "procedure {} uses PSQL this server does not interpret",
                 name
-            ))
+            )))
         }
     }
     // a SELECTABLE procedure's result is what SUSPEND emitted; a plain
@@ -37281,7 +37687,13 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             if std::env::var("FC_SRV_TRACE").is_ok() {
                                 eprintln!("[srv] modified procedure failed: {}", e);
                             }
-                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                            // a RAISED EXCEPTION carries the engine's own
+                            // vector; everything else is this server's
+                            // refusal and stays generic
+                            match &e.status {
+                                Some(ev) => respond_eval_error(&mut s, &mut enc, ev)?,
+                                None => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
+                            }
                         }
                     }
                 } else if matches!(&*plan, Plan::ProcSelect { .. }) {
@@ -37341,7 +37753,13 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             if std::env::var("FC_SRV_TRACE").is_ok() {
                                 eprintln!("[srv] select from procedure failed: {}", e);
                             }
-                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                            // a RAISED EXCEPTION carries the engine's own
+                            // vector; everything else is this server's
+                            // refusal and stays generic
+                            match &e.status {
+                                Some(ev) => respond_eval_error(&mut s, &mut enc, ev)?,
+                                None => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
+                            }
                         }
                     }
                 } else if matches!(&*plan, Plan::ProcInvoke { .. }) {
@@ -37382,7 +37800,13 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             if std::env::var("FC_SRV_TRACE").is_ok() {
                                 eprintln!("[srv] execute procedure failed: {}", e);
                             }
-                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                            // a RAISED EXCEPTION carries the engine's own
+                            // vector; everything else is this server's
+                            // refusal and stays generic
+                            match &e.status {
+                                Some(ev) => respond_eval_error(&mut s, &mut enc, ev)?,
+                                None => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
+                            }
                         }
                     }
                 } else if matches!(&*plan, Plan::GenIdIncrement { .. }) {
@@ -38079,7 +38503,13 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             if std::env::var("FC_SRV_TRACE").is_ok() {
                                 eprintln!("[srv] op_execute2 procedure failed: {}", e);
                             }
-                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                            // a RAISED EXCEPTION carries the engine's own
+                            // vector; everything else is this server's
+                            // refusal and stays generic
+                            match &e.status {
+                                Some(ev) => respond_eval_error(&mut s, &mut enc, ev)?,
+                                None => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
+                            }
                         }
                     }
                 } else if matches!(&*plan, Plan::Returning { inner, .. }

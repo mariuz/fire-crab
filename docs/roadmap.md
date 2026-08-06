@@ -2501,8 +2501,41 @@ plus *the subsystem is now on the path*.
   would be the gate. Nothing about it is observable until all of it
   works, which is why it is its own slice rather than a half-step.
 - **W6 — depth in `exe` and `svc`**: the request lifecycle, cursors and
-  exceptions; then gbak/gfix/nbackup as services. *(first slice done,
-  and it corrected the sentence above)*
+  exceptions; then gbak/gfix/nbackup as services. *(three slices done;
+  the first corrected the sentence above)*
+
+  **EXCEPTIONS ARE DONE for the user-exception half** (third slice):
+  named handlers, a bare `EXCEPTION;` re-raise, and - the point of it -
+  an uncaught exception reaching the client as the engine's own error
+  rather than a generic Dynamic SQL Error, `At procedure ... line: L,
+  col: C` included (`qa/serve-real-exceptions.sh`, 19 checks).
+
+  **The rest of `exe`, measured rather than guessed.** Eleven PSQL
+  shapes were run against both servers; ten were refused, one worked.
+  What is left, in the order the measurement suggests:
+
+  * **runtime errors as catchable conditions** - `WHEN SQLCODE`, `WHEN
+    GDSCODE`, `WHEN SQLSTATE`, and a division by zero inside a body
+    being caught at all. The handler CONDITIONS already parse and
+    compile; what is missing is an error identity (gdscode, sqlcode,
+    sqlstate) on the interpreter's own failures, which is also what
+    would let `WHEN GDSCODE except` catch a user exception;
+  * **explicit cursors** - `DECLARE ... CURSOR FOR`, `OPEN`, `FETCH
+    ... INTO`, `CLOSE`. `FOR SELECT ... AS CURSOR` already works, so
+    the row source is there and the state machine is not;
+  * **`LEAVE` and `EXIT`**, which pair with the loops already in;
+  * **`EXECUTE PROCEDURE` inside a body** (a nested frame) and
+    **`EXECUTE STATEMENT`** (a whole planner call from PSQL);
+  * **`IN AUTONOMOUS TRANSACTION`**, which needs a second transaction
+    while one is open;
+  * **`ROW_COUNT`**, which needs the DML paths to report what they
+    touched back into the frame.
+
+  Also found while gating: **`INSERT ... VALUES` without a column list**
+  is outside the PSQL surface, and **`CREATE PROCEDURE` is not
+  supported at all** - every gate builds its procedures with the engine
+  and executes them through fire-crab, which is why the interpreter is
+  well covered and the DDL is not.
 
   **`gfix -write sync|async` is not a service at all.** Filing the
   tools under "as services" was a guess, and this one is wrong: gfix
