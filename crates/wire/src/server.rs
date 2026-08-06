@@ -774,6 +774,25 @@ impl Database {
         self.install(work);
     }
 
+    /// Put whatever is dirty on the disk, without touching any
+    /// transaction's state.
+    ///
+    /// The ROLLBACK-BY-IMAGE path needs this: it restores the image and
+    /// then the generator windows write their settled values FORWARD
+    /// over it - a generator is not transactional, so a draw survives
+    /// the undo - and with the flush deferred to commit, nothing else
+    /// would ever write them. `qa/serve-real-gendurable.sh` caught it
+    /// as a draw that came back after a rollback: the engine answers
+    /// 51, fire-crab answered 50.
+    fn flush_dirty(&mut self) -> Result<(), String> {
+        if !self.touched {
+            return Ok(());
+        }
+        self.take_write_side()?;
+        let work = self.bytes().as_ref().clone();
+        self.flush_and_install(work)
+    }
+
     /// Whether this TRANSACTION has written - i.e. whether it has
     /// anything to roll back. A connection that never wrote must not
     /// "restore" an image over anybody else's work.
@@ -1066,8 +1085,15 @@ fn write_gen_window(db: &mut Database, w: &GenWindow) {
         }
     }
     if moved {
-        let _ = std::fs::write(&db.path, &work);
-        db.install_flushed(work);
+        // INTO THE POOL, NOT ONTO THE FILE. A generator write used to
+        // rewrite the whole database: measured, a single draw cost
+        // 5.5ms on a 2MB file and 26.4ms on a 5MB one, which is the
+        // shape of an `fs::write` of the image and nothing else. The
+        // commit flushes it with everything else the transaction
+        // dirtied - and a generator's value is not transactional, so
+        // what reaches the disk is what the windows settled, which is
+        // what [write_gen_window] is writing here.
+        db.install_dirty(work);
     }
 }
 
@@ -23149,8 +23175,7 @@ fn persist_generators(db: Option<&mut Database>, writes: &[(String, i64)]) {
         }
     }
     if ok {
-        let _ = std::fs::write(&db.path, &work);
-        db.install_flushed(work);
+        db.install_dirty(work); // the commit writes it - see [write_gen_window]
         for (name, val) in writes {
             burn_generator(db, name, *val);
         }
@@ -33680,7 +33705,12 @@ fn restore_db(database: &mut Option<Database>, snap: Option<std::sync::Arc<Vec<u
         if !db.wrote() {
             return false;
         }
-        let _ = std::fs::write(&db.path, bytes.as_slice());
+        // THE PAGES THAT DIFFER, not the file. Putting an image back
+        // is a write like any other, and the careful flush compares it
+        // against what is on the disk; `fs::write` of the whole image
+        // was O(database) for an undo of a few pages.
+        let flushed = db.shared.flushed();
+        let _ = flush_careful(&db.path, &flushed, &bytes, db.page_size);
         db.install_flushed_image(bytes);
         // the restored image carries the header and the TIP as they
         // were, so the id this attachment reserved may no longer exist
@@ -33773,7 +33803,10 @@ fn end_transaction(database: &mut Option<Database>, outcome: TxEnd) {
         // counting exactly as an active one does, permanently - and is
         // the WHOLE of a rollback for a transaction that wrote only
         // records (see [rollback_now]).
-        TxEnd::RolledBackImage => Ok(()),
+        // the image is back, and the generator windows have written
+        // their values forward over it - that is dirty state nothing
+        // else will write
+        TxEnd::RolledBackImage => db.flush_dirty(),
         TxEnd::RollbackNoImage => db.kill_tx(),
     };
     if let Err(e) = r {
@@ -38534,8 +38567,7 @@ fn gen_id_increment(
     let new_val = current.wrapping_add(step.unwrap_or(incr));
     let mut work = db.work_copy()?;
     write_generator_value(&mut work, db.page_size, id, new_val)?;
-    std::fs::write(&db.path, &work).map_err(|e| e.to_string())?;
-    db.install_flushed(work);
+    db.install_dirty(work); // the commit writes it - see [write_gen_window]
     burn_generator(db, name, new_val);
     Ok(new_val)
 }

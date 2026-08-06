@@ -2213,6 +2213,13 @@ plus *the subsystem is now on the path*.
   reading the file answered *Table unknown*. **Deferring a write means
   every path that ends a transaction has to know it owns a flush.**
 
+  **The last whole-file write went with it.** A generator draw did
+  `fs::write` of the image - 5.5ms on a 2MB database, 26.4ms on a 5MB
+  one - and so did putting a snapshot back. Both go through the pool
+  and its careful flush now: 2.12ms and 3.68ms for the same draws. What
+  is left that scales with the file is the per-write COPY of the image,
+  which is what per-page fetch removes.
+
   **MEASURED BEFORE DOING IT, and it is not where the time is.** With
   `FC_SRV_TIME=1` on a two-row table, an INSERT cost 8.2ms: the work
   copy 111us (1.3%), the careful flush 957us, and **building the plan

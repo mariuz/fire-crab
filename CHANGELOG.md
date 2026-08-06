@@ -13,6 +13,31 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-06 — The last whole-file write
+
+### Converted
+- **A generator draw stopped rewriting the database.** It was the last
+  `fs::write` of the whole image left in the write path, and it showed:
+  measured, one `GEN_ID` cost **5.5ms on a 2MB database and 26.4ms on a
+  5MB one** — the shape of an image write and nothing else. Draws now
+  install into the pool like every other write and the commit flushes
+  them: **2.12ms and 3.68ms** on the same two files.
+- **And so did putting an image back.** `restore_db` wrote the whole
+  file to undo a few pages; it goes through the careful flush now,
+  which compares against the disk and writes what differs.
+- **A committed draw survives `kill -9`**, and `gfix -v -full` finds
+  nothing wrong with the file afterwards.
+
+### Fixed
+- **The image-path rollback owns a flush too.** A generator is not
+  transactional: a rolled-back transaction's DRAW survives, which the
+  generator windows implement by writing the settled value FORWARD over
+  the restored image. With the flush deferred to commit, nothing then
+  carried it to the disk — and `qa/serve-real-gendurable.sh` said so
+  precisely, the engine answering 51 where fire-crab answered 50. The
+  same lesson as the DDL commit, one path further along: every route
+  out of a transaction has to know whether it owns a flush.
+
 ## 2026-08-06 — The commit is what writes
 
 ### Converted
