@@ -343,19 +343,15 @@ both "D1. a real selectable procedure"       "SELECT * FROM PSEL"
 both "D2. SUSPEND inside IF (1=0)"           "SELECT * FROM PIF"
 both "D3. SUSPEND inside a FOR over an empty table" "SELECT * FROM PFOR"
 both "D4. SUSPEND inside WHILE (1=0)"        "SELECT * FROM PWHILE"
-# PEXIT is TYPE 1 and the engine answers [] - but fc's PSQL
-# interpreter has no EXIT and refuses at execute. A PRE-EXISTING,
-# unrelated boundary (verified against the pre-change binary): a
-# refusal is not a wrong answer, but it must stay a refusal.
-d5_fc=$(vec_run "$PORT" "$WORK" "SELECT * FROM PEXIT")
-d5_en=$(vec_run "$ENGPORT" "$REF" "SELECT * FROM PEXIT")
-ran=$((ran + 1))
-if [ "$d5_en" = "OK []" ] && case "$d5_fc" in ERR*) true ;; *) false ;; esac; then
-    echo "OK   D5. SUSPEND dead after EXIT: engine [], fc refuses (recorded boundary)"
-else
-    echo "DIFF D5. the EXIT boundary moved"; echo "     engine: $d5_en"; echo "     fc:     $d5_fc"
-    fail=1
-fi
+# PEXIT is TYPE 1 and the engine answers []. This used to be a RECORDED
+# BOUNDARY - fc's interpreter had no EXIT and refused at execute - and
+# the boundary is gone: EXIT is converted (qa/serve-real-cursors.sh), so
+# the two agree and this is an ordinary differential check again.
+#
+# The gate caught that itself, which is the point of writing a boundary
+# down as an assertion rather than a comment: when the difference
+# disappeared, the sweep said so instead of quietly passing.
+both "D5. a SUSPEND made dead by EXIT still answers []" "SELECT * FROM PEXIT"
 both "D6. a modifier over a selectable one"  "SELECT FIRST 3 X FROM PSEL"
 both "D7. a modifier over an unreachable SUSPEND" "SELECT FIRST 3 X FROM PIF"
 both "D8. LAW 14: NULL arguments flow through" "SELECT * FROM PSELARG(NULL,2)"

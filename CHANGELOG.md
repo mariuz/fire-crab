@@ -13,6 +13,50 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-07 — explicit cursors, and the loop they are for
+
+### Converted
+- **`DECLARE ... CURSOR FOR (...)`, `OPEN`, `FETCH ... INTO`, `CLOSE`**
+  — the declared cursor, which was refused whole, taking every body
+  that drives one with it. The cursor's query goes through the ORDINARY
+  planner, exactly as a `FOR SELECT`'s does, so a cursor sees joins,
+  filters and expressions for free.
+- **`ROW_COUNT`, `LEAVE` and `EXIT`**, because the canonical cursor
+  loop needs all three: fetch, ask whether anything came, get out.
+  `ROW_COUNT` is not a declared variable but reads exactly like one, so
+  it takes a slot at the end of the body's name list and the ordinary
+  resolution turns it into that slot — a body that never mentions it
+  never pays for it.
+- **A FETCH past the end LEAVES THE VARIABLES ALONE** — probed: a
+  variable holding 1 still holds 1 after a fetch that found nothing,
+  and `ROW_COUNT` is how the body tells the two apart. Nulling them
+  would be a wrong answer that only shows up at the end of a loop.
+- **`LEAVE` ends the innermost loop only**, in `WHILE` and in
+  `FOR SELECT`; **`EXIT` ends the body** from any depth, and a
+  selectable procedure keeps the rows it has already SUSPENDed. A
+  `LEAVE` that escapes every loop is refused, which is what the engine
+  rejects at compile time.
+
+### Found
+- **Inside `DECLARE ... CURSOR FOR (...)`, an expression in the select
+  list MUST BE ALIASED.** `SELECT A.ID * B.W AS P FROM ...` compiles;
+  the identical statement without `AS P` is *Invalid command*, though it
+  runs standalone. Found by writing the gate, and it is why the first
+  version of the join check would not create.
+- **A procedure with two output columns reveals a divergence that has
+  nothing to do with cursors**: fire-crab announces every output
+  parameter as BIGINT, so a client pads the columns differently from
+  the engine's INTEGER. The values agree, the widths do not. Named in
+  the gate so it is not read as a cursor bug, and split into
+  single-column procedures so the cursor semantics stay strictly gated.
+
+### Gated
+- **`qa/serve-real-cursors.sh`** (14 checks): the three statements, the
+  canonical loop, past-the-end behaviour and its ROW_COUNT, a cursor
+  over a join with a filter and an expression, what `LEAVE` and `EXIT`
+  each end, a selectable procedure driven by a cursor, and one that
+  EXITs midway keeping its suspended rows.
+
 ## 2026-08-07 — runtime errors have an identity, and can be caught
 
 ### Converted

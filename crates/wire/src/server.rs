@@ -7012,6 +7012,24 @@ enum TrigStmt {
     },
     /// `EXCEPTION <name>;` - blr_abort, condition 2 (exception), name
     Raise { name: String, src_off: usize },
+    /// `OPEN <cursor>;` - plan the declared query and run it, holding
+    /// its rows for FETCH. The engine materialises lazily; this reads
+    /// the whole set at OPEN, which is what the FOR SELECT loop already
+    /// does and is the same answer for every body that cannot see the
+    /// table change underneath it.
+    Open { cursor: String, src_off: usize },
+    /// `FETCH <cursor> INTO :v[, :v];` - the next row into those slots.
+    /// PAST THE END THE SLOTS ARE LEFT ALONE (probed: a variable that
+    /// held 1 still holds 1 after a fetch that found nothing) and
+    /// ROW_COUNT becomes 0.
+    Fetch { cursor: String, into: Vec<u16>, src_off: usize },
+    /// `CLOSE <cursor>;`
+    Close { cursor: String, src_off: usize },
+    /// `LEAVE;` - end the innermost loop.
+    Leave { src_off: usize },
+    /// `EXIT;` - end the body. A selectable procedure keeps the rows it
+    /// has already SUSPENDed.
+    Exit { src_off: usize },
     /// A BARE `EXCEPTION;` - re-raise what the enclosing handler caught,
     /// with its identity intact (the client sees the ORIGINAL exception,
     /// not a new one). Outside a handler there is nothing to re-raise
@@ -7441,7 +7459,14 @@ fn parse_trig_block(
 /// FOR SELECT it accepts, so this is a real limit, honestly refused.)
 fn body_has_uninterpretable_blr(st: &TrigStmt) -> bool {
     match st {
-        TrigStmt::Suspend { .. } | TrigStmt::ForSelect { .. } | TrigStmt::Reraise { .. } => true,
+        TrigStmt::Suspend { .. }
+        | TrigStmt::ForSelect { .. }
+        | TrigStmt::Reraise { .. }
+        | TrigStmt::Open { .. }
+        | TrigStmt::Fetch { .. }
+        | TrigStmt::Close { .. }
+        | TrigStmt::Leave { .. }
+        | TrigStmt::Exit { .. } => true,
         TrigStmt::If { then, otherwise, .. } => {
             body_has_uninterpretable_blr(then)
                 || otherwise.as_ref().is_some_and(|e| body_has_uninterpretable_blr(e))
@@ -7599,6 +7624,46 @@ fn parse_trig_stmt(
             return None;
         }
         return Some(TrigStmt::Raise { name, src_off: start });
+    }
+    if find_word(&up, "OPEN", 0) == Some(0) {
+        let name = text["OPEN".len()..].trim().trim_matches('"').to_ascii_uppercase();
+        if !ident_ok(&name) {
+            return None;
+        }
+        return Some(TrigStmt::Open { cursor: name, src_off: start });
+    }
+    if find_word(&up, "CLOSE", 0) == Some(0) {
+        let name = text["CLOSE".len()..].trim().trim_matches('"').to_ascii_uppercase();
+        if !ident_ok(&name) {
+            return None;
+        }
+        return Some(TrigStmt::Close { cursor: name, src_off: start });
+    }
+    if find_word(&up, "LEAVE", 0) == Some(0) && text.trim().len() == "LEAVE".len() {
+        // a LABELLED leave (`LEAVE outer`) names a loop this surface
+        // does not have, so only the bare form is taken
+        return Some(TrigStmt::Leave { src_off: start });
+    }
+    if find_word(&up, "EXIT", 0) == Some(0) && text.trim().len() == "EXIT".len() {
+        return Some(TrigStmt::Exit { src_off: start });
+    }
+    if find_word(&up, "FETCH", 0) == Some(0) {
+        // FETCH <cursor> INTO :v[, :v]
+        let into = find_word(&up, "INTO", "FETCH".len())?;
+        let name = text["FETCH".len()..into].trim().trim_matches('"').to_ascii_uppercase();
+        if !ident_ok(&name) {
+            return None;
+        }
+        let mut slots = Vec::new();
+        for part in text[into + "INTO".len()..].split(',') {
+            let v = part.trim().trim_start_matches(':').trim().trim_matches('"');
+            let slot = vars.iter().position(|n| n.eq_ignore_ascii_case(v))?;
+            slots.push(slot as u16);
+        }
+        if slots.is_empty() {
+            return None;
+        }
+        return Some(TrigStmt::Fetch { cursor: name, into: slots, src_off: start });
     }
     if find_word(&up, "POST_EVENT", 0) == Some(0) {
         // POST_EVENT <name> - a string literal, or an identifier the
@@ -7813,7 +7878,14 @@ fn emit_trigger_stmt(
         // its BLR shape has not been probed, and CREATE TRIGGER refuses
         // a body holding one rather than store BLR missing a statement
         // its own source contains ([body_has_uninterpretable_blr]).
-        TrigStmt::Suspend { .. } | TrigStmt::ForSelect { .. } | TrigStmt::Reraise { .. } => {}
+        TrigStmt::Suspend { .. }
+        | TrigStmt::ForSelect { .. }
+        | TrigStmt::Reraise { .. }
+        | TrigStmt::Open { .. }
+        | TrigStmt::Fetch { .. }
+        | TrigStmt::Close { .. }
+        | TrigStmt::Leave { .. }
+        | TrigStmt::Exit { .. } => {}
         TrigStmt::Assign { target, expr, src_off } => {
             dbg.push((*src_off, b.len()));
             b.push(1); // blr_assignment
@@ -8212,7 +8284,12 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         match st {
             TrigStmt::Suspend { .. }
             | TrigStmt::ForSelect { .. }
-            | TrigStmt::Reraise { .. } => {}
+            | TrigStmt::Reraise { .. }
+            | TrigStmt::Open { .. }
+            | TrigStmt::Fetch { .. }
+            | TrigStmt::Close { .. }
+            | TrigStmt::Leave { .. }
+            | TrigStmt::Exit { .. } => {}
             TrigStmt::Assign { expr, .. } => out.push(expr),
             TrigStmt::If { cond, then, otherwise, .. } => {
                 out.extend(cond.operands());
@@ -8243,7 +8320,12 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             TrigStmt::Suspend { .. }
             | TrigStmt::ForSelect { .. }
             | TrigStmt::PostEvent { .. }
-            | TrigStmt::Reraise { .. } => {}
+            | TrigStmt::Reraise { .. }
+            | TrigStmt::Open { .. }
+            | TrigStmt::Fetch { .. }
+            | TrigStmt::Close { .. }
+            | TrigStmt::Leave { .. }
+            | TrigStmt::Exit { .. } => {}
             TrigStmt::Assign { target, .. } => out.push(target),
             TrigStmt::If { then, otherwise, .. } => {
                 stmt_targets(then, out);
@@ -8275,7 +8357,12 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         match st {
             TrigStmt::Suspend { .. }
             | TrigStmt::ForSelect { .. }
-            | TrigStmt::Reraise { .. } => {}
+            | TrigStmt::Reraise { .. }
+            | TrigStmt::Open { .. }
+            | TrigStmt::Fetch { .. }
+            | TrigStmt::Close { .. }
+            | TrigStmt::Leave { .. }
+            | TrigStmt::Exit { .. } => {}
             TrigStmt::Assign { .. } => {}
             TrigStmt::If { then, otherwise, .. } => {
                 stmt_specials(then, stores, raises, hexcs, dmls);
@@ -34333,6 +34420,21 @@ struct PsqlFrame {
     /// bare `EXCEPTION;` re-raises. Handlers nest, so this is saved and
     /// restored around each one rather than simply set.
     caught: Option<Thrown>,
+    /// the declared cursors, by name: the query text, and the rows and
+    /// position once OPEN has run
+    cursors: std::collections::HashMap<String, CursorState>,
+    /// the slot `ROW_COUNT` resolves to, if the body mentions it
+    row_count_slot: Option<u16>,
+}
+
+/// One declared cursor. `rows` is Some only between OPEN and CLOSE, so
+/// a FETCH outside that is refused rather than answered from a stale
+/// set - the engine raises "cursor is not open" and this refuses, which
+/// is the honest half of that until the error is converted.
+struct CursorState {
+    query: String,
+    rows: Option<Vec<Vec<Value>>>,
+    at: usize,
 }
 
 /// A raised user exception, with the identity the client is owed: the
@@ -34460,6 +34562,11 @@ enum PsqlStop {
     /// a raise - user exception or runtime error - carrying the
     /// identity the client is owed
     Raise(Thrown),
+    /// `LEAVE` - not a failure at all, a jump: the innermost loop
+    /// catches it and everything else passes it up.
+    Leave,
+    /// `EXIT` - the same, caught by the body itself.
+    Exit,
     /// a construct the interpreter does not implement; the statement
     /// fails whole rather than half-running
     Unsupported,
@@ -34998,7 +35105,12 @@ fn stmt_src_off(s: &TrigStmt) -> usize {
         | TrigStmt::Delete { src_off, .. }
         | TrigStmt::ForSelect { src_off, .. }
         | TrigStmt::Suspend { src_off, .. }
-        | TrigStmt::Block { src_off, .. } => *src_off,
+        | TrigStmt::Block { src_off, .. }
+        | TrigStmt::Open { src_off, .. }
+        | TrigStmt::Fetch { src_off, .. }
+        | TrigStmt::Close { src_off, .. }
+        | TrigStmt::Leave { src_off, .. }
+        | TrigStmt::Exit { src_off, .. } => *src_off,
     }
 }
 
@@ -35040,7 +35152,13 @@ fn exec_psql_stmt_inner(
         }
         TrigStmt::While { cond, body, .. } => {
             while eval_psql_cond(cond, f)? == Some(true) {
-                exec_psql_stmt(body, f, steps, db, ctx)?;
+                // LEAVE ends THIS loop and nothing further: the
+                // innermost one catches it, an EXIT passes through
+                match exec_psql_stmt(body, f, steps, db, ctx) {
+                    Ok(()) => {}
+                    Err(PsqlStop::Leave) => break,
+                    Err(e) => return Err(e),
+                }
                 *steps += 1;
                 if *steps > 1_000_000 {
                     return Err(PsqlStop::Unsupported);
@@ -35134,7 +35252,11 @@ fn exec_psql_stmt_inner(
                     }
                     f.vars[n] = v;
                 }
-                exec_psql_stmt(body, f, steps, db, ctx)?;
+                match exec_psql_stmt(body, f, steps, db, ctx) {
+                    Ok(()) => {}
+                    Err(PsqlStop::Leave) => break,
+                    Err(e) => return Err(e),
+                }
                 *steps += 1;
                 if *steps > 1_000_000 {
                     return Err(PsqlStop::Unsupported);
@@ -35152,6 +35274,84 @@ fn exec_psql_stmt_inner(
             f.suspended.push(row);
             Ok(())
         }
+        // OPEN: plan the cursor's query with the ORDINARY planner and
+        // read its rows, exactly as FOR SELECT does - so a cursor sees
+        // everything a client SELECT does, for free.
+        TrigStmt::Open { cursor, .. } => {
+            let Some(state) = f.cursors.get(cursor) else {
+                return Err(PsqlStop::Unsupported); // no such cursor
+            };
+            if state.rows.is_some() {
+                return Err(PsqlStop::Unsupported); // already open
+            }
+            let query = state.query.clone();
+            let rows = {
+                let mut sink: Vec<Option<Descriptor>> = Vec::new();
+                let plan = plan_query_inner(&query, &*db, &mut sink)
+                    .ok_or(PsqlStop::Unsupported)?;
+                if !sink.is_empty() {
+                    return Err(PsqlStop::Unsupported); // a `?` in a cursor query
+                }
+                let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
+                branch_rows(&plan, dbr, &[]).ok_or(PsqlStop::Unsupported)?
+            };
+            let state = f.cursors.get_mut(cursor).ok_or(PsqlStop::Unsupported)?;
+            state.rows = Some(rows);
+            state.at = 0;
+            Ok(())
+        }
+        // FETCH: the next row, or nothing. PAST THE END THE SLOTS KEEP
+        // WHAT THEY HELD - probed against the engine, which leaves a
+        // variable alone rather than nulling it - and ROW_COUNT says
+        // which of the two happened.
+        TrigStmt::Fetch { cursor, into, .. } => {
+            let Some(state) = f.cursors.get_mut(cursor) else {
+                return Err(PsqlStop::Unsupported);
+            };
+            let Some(rows) = state.rows.as_ref() else {
+                return Err(PsqlStop::Unsupported); // fetch from a closed cursor
+            };
+            let row = rows.get(state.at).cloned();
+            if row.is_some() {
+                state.at += 1;
+            }
+            let got = match row {
+                Some(r) => {
+                    if r.len() != into.len() {
+                        return Err(PsqlStop::Unsupported);
+                    }
+                    for (slot, v) in into.iter().zip(r.into_iter()) {
+                        let n = *slot as usize;
+                        if n >= f.vars.len() {
+                            f.vars.resize(n + 1, Value::Null);
+                        }
+                        f.vars[n] = v;
+                    }
+                    1
+                }
+                None => 0,
+            };
+            if let Some(rc) = f.row_count_slot {
+                let n = rc as usize;
+                if n >= f.vars.len() {
+                    f.vars.resize(n + 1, Value::Null);
+                }
+                f.vars[n] = Value::Int(got);
+            }
+            Ok(())
+        }
+        TrigStmt::Close { cursor, .. } => {
+            let Some(state) = f.cursors.get_mut(cursor) else {
+                return Err(PsqlStop::Unsupported);
+            };
+            if state.rows.take().is_none() {
+                return Err(PsqlStop::Unsupported); // close of a closed cursor
+            }
+            state.at = 0;
+            Ok(())
+        }
+        TrigStmt::Leave { .. } => Err(PsqlStop::Leave),
+        TrigStmt::Exit { .. } => Err(PsqlStop::Exit),
         // a BEGIN..END block - which every body is, and which nests.
         // A WHEN handler catches a raise from inside its own block, the
         // way the engine's error_handler does.
@@ -35426,6 +35626,27 @@ fn run_procedure(
     // appended to the name list: the parser numbers variables by their
     // position in that list, and the frame is indexed the same way.
     names.extend(declared_var_names(&meta.source[..begin_at]));
+    // THE CURSORS the header declares, and ROW_COUNT.
+    //
+    // ROW_COUNT is not a variable the body declares, but it reads
+    // exactly like one - so it gets a slot of its own at the end of the
+    // list, and the ordinary name resolution turns `ROW_COUNT` into
+    // that slot with nothing else to teach. A body that never mentions
+    // it never pays for it.
+    let cursors = declared_cursors(&meta.source[..begin_at]);
+    let row_count_slot = {
+        let up = meta.source.to_ascii_uppercase();
+        if find_word(&up, "ROW_COUNT", 0).is_some() {
+            names.push("ROW_COUNT".to_string());
+            Some((names.len() - 1) as u16)
+        } else {
+            None
+        }
+    };
+    let cursor_states: std::collections::HashMap<String, CursorState> = cursors
+        .into_iter()
+        .map(|(name, query)| (name, CursorState { query, rows: None, at: 0 }))
+        .collect();
     let body = parse_trigger_body(&meta.source, begin_at, meta.source.trim_end().len(), &names)
         .ok_or_else(|| format!("procedure {}'s body is outside this server's PSQL surface", name))?;
 
@@ -35435,6 +35656,8 @@ fn run_procedure(
         out_len: meta.outs.len(),
         suspended: Vec::new(),
         caught: None,
+        cursors: cursor_states,
+        row_count_slot,
     };
     frame.vars.extend(args.iter().cloned());
     frame.vars.resize(names.len(), Value::Null);
@@ -35450,7 +35673,19 @@ fn run_procedure(
     }
     gen_window_unwind(database, mark, outcome.is_err());
     match outcome {
-        Ok(()) => {}
+        // EXIT ends the body, and what it leaves behind IS the answer -
+        // the output parameters as they stand, and whatever SUSPEND has
+        // already emitted
+        Ok(()) | Err(PsqlStop::Exit) => {}
+        // a LEAVE that reached here was outside every loop, which the
+        // engine refuses to compile; refusing to run it is the honest
+        // equivalent
+        Err(PsqlStop::Leave) => {
+            return Err(ProcErr::from(format!(
+                "procedure {}: LEAVE outside a loop",
+                name
+            )))
+        }
         // A RAISE IS NOT A REFUSAL. The body did what its source says,
         // so the client gets the engine's own vector for it - a user
         // exception's number, quoted name and message, or a runtime
@@ -35506,6 +35741,68 @@ fn run_procedure(
     }
 }
 
+/// One `DECLARE <name> CURSOR FOR (<select>)` at `at`, if that is what
+/// the DECLARE is: the cursor's name and the query text inside the
+/// parentheses.
+///
+/// The engine requires the parentheses (probed against FB6: without
+/// them it is a syntax error), which is what makes the query easy to
+/// take verbatim - it is planned by the ordinary planner when the
+/// cursor is OPENed, exactly as a FOR SELECT's is.
+fn declared_cursor_at(header: &str, at: usize) -> Option<(String, String)> {
+    let up = header.to_ascii_uppercase();
+    let rest = &header[at + "DECLARE".len()..];
+    let rest_up = &up[at + "DECLARE".len()..];
+    let name_start = rest.len() - rest.trim_start().len();
+    let name_end = rest[name_start..]
+        .find(|c: char| c.is_whitespace())
+        .map(|i| name_start + i)?;
+    let name = rest[name_start..name_end].trim_matches('"').to_ascii_uppercase();
+    if !ident_ok(&name) {
+        return None;
+    }
+    let cursor = find_word(rest_up, "CURSOR", name_end)?;
+    if rest_up[name_end..cursor].trim() != "" {
+        return None;
+    }
+    let for_kw = find_word(rest_up, "FOR", cursor + "CURSOR".len())?;
+    if rest_up[cursor + "CURSOR".len()..for_kw].trim() != "" {
+        return None;
+    }
+    let open = rest[for_kw + "FOR".len()..].find('(')? + for_kw + "FOR".len();
+    // the matching close paren, so a subquery inside the SELECT keeps its own
+    let mut depth = 0i32;
+    let mut close = None;
+    for (i, c) in rest[open..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some((name, rest[open + 1..close?].trim().to_string()))
+}
+
+/// Every cursor a procedure's header declares, in order.
+fn declared_cursors(header: &str) -> Vec<(String, String)> {
+    let up = header.to_ascii_uppercase();
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while let Some(d) = find_word(&up, "DECLARE", at) {
+        if let Some(c) = declared_cursor_at(header, d) {
+            out.push(c);
+        }
+        at = d + "DECLARE".len();
+    }
+    out
+}
+
 /// The names a procedure's `DECLARE [VARIABLE] <name> <type>;` header
 /// declares, in order. Anything that is not a DECLARE is skipped, so a
 /// comment or blank line between them is harmless.
@@ -35514,6 +35811,13 @@ fn declared_var_names(header: &str) -> Vec<String> {
     let up = header.to_ascii_uppercase();
     let mut at = 0usize;
     while let Some(d) = find_word(&up, "DECLARE", at) {
+        // `DECLARE <name> CURSOR FOR (...)` declares a CURSOR, not a
+        // variable, and taking its name as one would give the body a
+        // slot nothing ever assigns - and silently shadow the cursor
+        if declared_cursor_at(header, d).is_some() {
+            at = d + "DECLARE".len();
+            continue;
+        }
         let mut rest = header[d + "DECLARE".len()..].trim_start();
         // the VARIABLE keyword is optional
         // `get`: `DECLARE "ÉÉÉÉ" INTEGER` puts byte 8 inside a character,

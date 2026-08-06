@@ -2521,10 +2521,12 @@ plus *the subsystem is now on the path*.
     NULL raises 22003 (`qa/serve-real-psqlerrors.sh`, 15 checks). The
     identity is read back out of the vector the server would send, so
     the two can never disagree;
-  * **explicit cursors** - `DECLARE ... CURSOR FOR`, `OPEN`, `FETCH
-    ... INTO`, `CLOSE`. `FOR SELECT ... AS CURSOR` already works, so
-    the row source is there and the state machine is not;
-  * **`LEAVE` and `EXIT`**, which pair with the loops already in;
+  * ~~explicit cursors~~ **DONE** (fifth slice), and `LEAVE`/`EXIT`/
+    `ROW_COUNT` with them, since the canonical loop needs all three
+    (`qa/serve-real-cursors.sh`, 14 checks). The cursor's query is
+    planned by the ordinary planner, so it sees joins and expressions
+    for free; a fetch past the end leaves the variables alone, which is
+    the part that would silently answer wrongly if guessed;
   * **`EXECUTE PROCEDURE` inside a body** (a nested frame) and
     **`EXECUTE STATEMENT`** (a whole planner call from PSQL);
   * **`IN AUTONOMOUS TRANSACTION`**, which needs a second transaction
@@ -2532,7 +2534,13 @@ plus *the subsystem is now on the path*.
   * **`ROW_COUNT`**, which needs the DML paths to report what they
     touched back into the frame.
 
-  Also found while gating: **a BIGINT literal is outside the PSQL
+  Also found while gating: **fire-crab announces every procedure OUTPUT
+  PARAMETER as BIGINT**, where the engine announces the declared type -
+  the values agree, the column widths a client prints do not, which is
+  visible the moment a procedure has two output columns; **an
+  expression in a `DECLARE ... CURSOR FOR (...)` select list must be
+  ALIASED** or the engine answers "Invalid command" (the identical
+  SELECT runs standalone); **a BIGINT literal is outside the PSQL
   surface** (`Expr::IntLiteral` is an `i32`, and widening it changes BLR
   encoding and type ranking - its own increment), **`INSERT ... VALUES`
   without a column list** is outside it too, and **`CREATE PROCEDURE` is
