@@ -2196,6 +2196,23 @@ plus *the subsystem is now on the path*.
   every read now goes through. Also still: a file that GROWS is written
   whole (extending is its own careful-write question).
 
+  **AND THE COMMIT IS WHAT WRITES NOW.** A statement installs its pages
+  into the pool and leaves them dirty; the COMMIT flushes them, in one
+  careful pass that carries the transaction's two bits as well. An
+  autocommit INSERT was paying two flushes (~866us each of 2.78ms), a
+  multi-statement transaction one per statement; both pay one now. It
+  is also the durability the engine has: pages no commit reached are
+  pages a crash may lose, and killing the server mid-transaction leaves
+  the file holding exactly the committed rows.
+
+  And the bug that came with it is the kind worth writing down: the
+  commit returned early when the transaction had reserved no
+  transaction ID, which is precisely what a DDL-only transaction looks
+  like - its catalog rows are settled as they are written, so it never
+  asks for one. Its pages stayed dirty and unwritten, and the engine
+  reading the file answered *Table unknown*. **Deferring a write means
+  every path that ends a transaction has to know it owns a flush.**
+
   **MEASURED BEFORE DOING IT, and it is not where the time is.** With
   `FC_SRV_TIME=1` on a two-row table, an INSERT cost 8.2ms: the work
   copy 111us (1.3%), the careful flush 957us, and **building the plan

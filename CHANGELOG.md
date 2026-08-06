@@ -13,6 +13,40 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-06 — The commit is what writes
+
+### Converted
+- **A statement's write stops at the pool.** Its pages are installed
+  for every attachment to see and left DIRTY; the COMMIT is the one
+  careful flush that puts them on the disk, carrying the transaction's
+  own two bits with them. That is what a page cache is for, and the
+  measurement said so: an autocommit INSERT was paying TWO flushes,
+  ~866us each of a 2.78ms statement — one for the statement and one for
+  the commit. A transaction with many statements now pays one.
+- **It is also the right durability.** Pages no commit has reached are
+  pages a crash is entitled to lose: killing the server mid-transaction
+  now leaves the file with exactly the committed rows and `gfix -v
+  -full` finding nothing wrong, where before the uncommitted rows were
+  already on disk (invisible, but there). And what must never be
+  reordered — the data before the TIP bits that make it real — is the
+  careful flush's own business, which now sees the whole set at once
+  rather than one statement at a time: `qa/serve-real-carefulflush.sh`
+  is unchanged and green, largest flush 5 pages.
+- **A transaction id is not what makes a commit** — the bug the gates
+  caught the moment the flush moved. `commit_tx` returned early when
+  the transaction had reserved no id, which is exactly what a DDL-only
+  transaction looks like: its catalog rows are settled as they are
+  written, so it never needs one. Its PAGES were dirty in the pool all
+  the same, and nothing put them on the disk — `qa/serve-real-alterdefault.sh`,
+  `alterdomaintype` and `altercomputed` said so in the plainest way
+  available, the engine reading the file and answering *Table unknown*.
+  The commit now flushes whatever the transaction dirtied, id or no id,
+  and skips the work entirely when it wrote nothing at all.
+- **INSERT 2.78ms → 2.52ms.** `qa/serve-real-undo.sh`'s coverage check
+  was re-pinned: a rollback's flush now carries what the transaction
+  dirtied as well as its two bits, so the number is a handful of pages —
+  bounded by the work, not by the database — rather than exactly one.
+
 ## 2026-08-05 — The metadata cache
 
 ### Converted

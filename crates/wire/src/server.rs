@@ -754,6 +754,26 @@ impl Database {
         Ok(())
     }
 
+    /// A STATEMENT'S WRITE STOPS AT THE POOL. Its pages are installed
+    /// for every attachment to see and left DIRTY; the COMMIT is what
+    /// puts them on the disk, in one careful flush that also carries
+    /// the transaction's own two bits.
+    ///
+    /// That is what a page cache is for, and it halves the fsyncs an
+    /// autocommit statement pays: measured, a statement flushed once
+    /// and its commit flushed again, ~866us each of a 2.78ms INSERT.
+    /// A transaction with many statements now pays one flush, not one
+    /// per statement.
+    ///
+    /// It is also the right durability: pages that no commit has
+    /// reached are pages a crash is entitled to lose. What must never
+    /// be reordered - the data before the TIP bits that make it real -
+    /// is the careful flush's own business, and it sees the whole set
+    /// at once now rather than one statement at a time.
+    fn install_dirty(&mut self, work: Vec<u8>) {
+        self.install(work);
+    }
+
     /// Whether this TRANSACTION has written - i.e. whether it has
     /// anything to roll back. A connection that never wrote must not
     /// "restore" an image over anybody else's work.
@@ -786,7 +806,12 @@ impl Database {
     /// the pages, and were the moment each statement ran; what the
     /// commit publishes is the two bits that say they are real.
     fn commit_tx(&mut self) -> Result<(), String> {
-        let Some(tx) = self.tx else { return Ok(()) };
+        // A TRANSACTION THAT WROTE NOTHING HAS NOTHING TO COMMIT - and
+        // asking is cheap where flushing is not, since the flush has to
+        // compare the image against the file to find its pages.
+        if !self.touched {
+            return Ok(());
+        }
         // THE WRITE SIDE, EVEN FOR TWO BITS. A commit is a
         // read-modify-write of the image like any other, and since the
         // side is released between statements this is the one place it
@@ -795,12 +820,20 @@ impl Database {
         // was thinking.
         self.take_write_side()?;
         let mut work = self.bytes().as_ref().clone();
-        fire_crab_ods::dml::set_tx_state(
-            &mut work,
-            self.page_size,
-            tx as u64,
-            fire_crab_ods::tip::TxState::Committed,
-        )?;
+        // A TRANSACTION ID IS NOT WHAT MAKES A COMMIT. One that only did
+        // DDL never reserved one - its catalog rows are settled as they
+        // are written - but its PAGES are dirty in the pool all the
+        // same, and the commit is what puts them on the disk. Returning
+        // early when there was no id left them there: the file did not
+        // have the table, and the engine reading it said so.
+        if let Some(tx) = self.tx {
+            fire_crab_ods::dml::set_tx_state(
+                &mut work,
+                self.page_size,
+                tx as u64,
+                fire_crab_ods::tip::TxState::Committed,
+            )?;
+        }
         self.flush_and_install(work)?;
         Ok(())
     }
@@ -819,15 +852,19 @@ impl Database {
     /// candidates and the record decides), and pages that were
     /// allocated staying allocated.
     fn kill_tx(&mut self) -> Result<(), String> {
-        let Some(tx) = self.tx else { return Ok(()) };
+        if !self.touched {
+            return Ok(());
+        }
         self.take_write_side()?; // see [Database::commit_tx]
         let mut work = self.bytes().as_ref().clone();
-        fire_crab_ods::dml::set_tx_state(
-            &mut work,
-            self.page_size,
-            tx as u64,
-            fire_crab_ods::tip::TxState::Dead,
-        )?;
+        if let Some(tx) = self.tx {
+            fire_crab_ods::dml::set_tx_state(
+                &mut work,
+                self.page_size,
+                tx as u64,
+                fire_crab_ods::tip::TxState::Dead,
+            )?;
+        }
         self.flush_and_install(work)?;
         Ok(())
     }
@@ -14056,7 +14093,7 @@ fn execute_dml_collecting_inner(
         }
         _ => return Err("not a DML plan".into()),
     };
-    db.flush_and_install(work)?;
+    db.install_dirty(work);
     // the statement's work is installed, so the id it reserved is this
     // attachment's transaction now - and a statement that failed above
     // never got here, which is exactly the point

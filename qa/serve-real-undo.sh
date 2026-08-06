@@ -150,16 +150,21 @@ swept=$("$FCSTAT" versions "$A" "$rel" 2>/dev/null)
 check "fc: the engine's own sweep collects every rolled-back version" "$swept" "$live_before"
 check "fc: and the table still reads 2 rows" "$(rows "$A")" "2"
 
-# --- 3. COVERAGE: the rollback wrote a PAGE, not the database ----------
-# The old undo put back the whole image with one fs::write. The new one
-# flips two bits in the TIP, so the careful flush reports ONE page. If
-# this ever reports the file again, the rollback is back to O(database).
+# --- 3. COVERAGE: the undo wrote PAGES, not the database ---------------
+# The old undo put back the whole image with one fs::write - a rewrite
+# of the database to undo two hundred rows. The new one flips two bits
+# in the TIP, and the flush that carries them also carries whatever the
+# transaction had dirtied and not yet written (statements install into
+# the pool now; the commit or the rollback is what reaches the disk).
+# So the number is a HANDFUL - bounded by the work, not by the file. If
+# it ever grows with the database again, the undo is back to
+# O(database).
 pages=$(grep 'careful flush:' "$LOG" | tail -1 | sed -n 's/.*flush: \([0-9]*\) pages.*/\1/p')
 ran=$((ran + 1))
-if [ -n "$pages" ] && [ "$pages" -le 2 ]; then
-    echo "OK   coverage: the rollback flushed $pages page(s), not the database"
+if [ -n "$pages" ] && [ "$pages" -le 32 ]; then
+    echo "OK   coverage: the undo flushed $pages page(s), not the database"
 else
-    echo "DIFF coverage: the rollback flushed [$pages] pages"; fail=1
+    echo "DIFF coverage: the undo flushed [$pages] pages"; fail=1
 fi
 
 # --- 4. TEETH: the same batch COMMITTED keeps its rows ------------------
