@@ -2762,9 +2762,22 @@ plus *the subsystem is now on the path*.
   client polls output with line + stdin TOGETHER, the stdin answered
   numeric 0. The incremental chain (level > 0, SCN tracking, the main
   header's backup GUID, `RDB$BACKUP_HISTORY`) is the recorded boundary.
-  **gbak as a service is the remaining half of this front**: the burp
-  (.fbk) format, reader and writer, with cross-restore against the real
-  gbak as the oracle - a larger conversion with its own slices.
+  **gbak as a service: the WRITER's first slice is DONE**
+  (`qa/serve-real-gbak.sh`, 19 checks): `crates/burp` writes a `.fbk`
+  the REAL `gbak -c` restores - the format pinned byte-by-byte from an
+  annotated real file before the writer existed, and the first output
+  restored on the first try. The surface is FAIL-CLOSED (a database
+  holding anything the writer cannot carry - a sequence, view, index,
+  trigger, procedure - refuses the WHOLE backup, because a backup
+  missing tables is worse than none), plain tables of the five integer
+  and text types with NULLs. Measured along the way: an existing .fbk
+  is OVERWRITTEN (the opposite of nbackup's refusal law), and `gbak
+  -se` speaks an older protocol - the command line rides the version-3
+  ATTACH SPB with 0xff separators and the start SPB is a bare action
+  byte. Next slices, in value order: the RESTORE half
+  (`isc_action_svc_restore`, fire-crab reading a .fbk - the other
+  direction of the same differential), NOT NULL and PK/index records,
+  the -se command-line protocol, verbose streaming, blobs.
 
 ## A savepoint is a transaction (done)
 

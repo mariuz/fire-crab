@@ -1,0 +1,7 @@
+[package]
+name = "fire-crab-burp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fire-crab-ods = { path = "../ods" }

@@ -13,6 +13,75 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-08 — the logical backup, first slice: a .fbk the real gbak restores
+
+### Converted
+- **`isc_action_svc_backup`** — fbsvcmgr's `action_backup` — writing the
+  burp format: `crates/burp` (fire-crab-burp), a new subsystem crate
+  mirroring `src/burp/`. The format was PINNED BEFORE THE WRITER EXISTED:
+  a real FB6 `.fbk` parsed byte by byte — major records (burp.h:84) each
+  carrying `[att byte][u8 length][data]` attribute lists ("low byte
+  first, as in VAX", backup.epp:put_int32), `rec_relation_end` and
+  `rec_end` bare, the order of battle as burp.h:133 documents it. Data
+  rows ride `rec_data` in the TRANSPORTABLE encoding: the message
+  XDR-canonicalized — numbers big-endian, a VARCHAR as a 4-byte length +
+  bytes padded to 4 (a NULL row is SHORTER, not zero-padded — XDR is
+  self-describing), one 4-byte null indicator per field TRAILING the
+  values — then RLE-compressed with the positive-literal /
+  negative-repeat scheme `fire_crab_ods::sqz` already emits.
+- **The first fbk restored on the first try** — `gbak -c` accepted the
+  writer's output whole, NULLs included — which is what pinning a format
+  from an annotated real file buys over guessing from source.
+- Verified across SMALLINT / INTEGER / BIGINT / CHAR / VARCHAR, extreme
+  values (i64::MIN), NULL rows, multiple tables, and an empty table.
+  Domain names are INVENTED (RDB$1, RDB$2, ...): gbak restore binds
+  columns to domains by name WITHIN the file, so consistency is all that
+  matters.
+
+### Guarded
+- **The surface is fail-closed, and that is most of the point.** A backup
+  missing tables — or carrying a table where a view was — is worse than
+  no backup: the client holds a file it believes is its data. A database
+  holding a sequence, view, index (a restored table silently missing its
+  PRIMARY KEY is a meaning change), trigger, procedure, exception,
+  function or role refuses the WHOLE backup. Each check resolves its
+  system relation and its RDB$SYSTEM_FLAG column BY NAME — relation ids
+  and field positions are ODS facts to read, not guess (RDB$GENERATORS
+  is relation 20, not the 10 a first guess said; and a system relation's
+  formats come from the sysfmt bootstrap, not RDB$FORMATS — both caught
+  by the probe loop).
+- A VERBOSE request refuses rather than answering silence — the gfix -v
+  lesson (a report that cannot fail) applied before the failure mode
+  ships rather than after. skip_data/include_data likewise.
+
+### Found
+- **An existing target is OVERWRITTEN — the opposite of nbackup's law.**
+  The engine's action_backup replaces an existing `.fbk` silently where
+  its action_nbak refuses one; a converter copying either tool's rule
+  onto the other ships it as a bug. Both gates assert their own.
+- **`gbak -se` speaks an OLDER protocol**: its whole command line rides
+  the version-3 ATTACH SPB as `isc_spb_command_line` with 0xff
+  separators, and `op_service_start` carries a BARE ACTION BYTE. That
+  protocol (and the stdout-streaming backup it enables) is its own
+  slice; until then the shape arrives with no dbname and refuses,
+  asserted in the gate.
+
+### Named, not converted
+- NOT NULL is not carried (the constraint records rec_rel_constraint +
+  rec_chk_constraint are their own slice): a column restored from
+  fire-crab's backup accepts NULL where the engine's restore refuses it
+  — asserted from both ends, with the data rows agreeing. The RESTORE
+  half (fire-crab reading a .fbk) is the front's next slice.
+
+### Gated
+- **`qa/serve-real-gbak.sh`** (19 checks): both servers back up THE SAME
+  database and the real `gbak -c` restores both, the engine reading the
+  same rows from both results; `gfix -v -full` on the restored file;
+  point-in-time teeth; five fail-closed refusals each asserted against
+  the engine's success; the NOT NULL boundary both ways; the -se and
+  VERBOSE refusals; and the overwrite law with the overwritten backup
+  carrying the current rows.
+
 ## 2026-08-07 — the physical backup: nbackup as a service
 
 ### Converted

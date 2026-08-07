@@ -246,8 +246,10 @@ pub fn start_clumplet_type(action: u8, tag: u8) -> Option<ClumpletType> {
             _ => None,
         },
         action::BACKUP | action::RESTORE => match tag {
-            spb::DBNAME => Some(StringSpb),
-            spb::OPTIONS | spb::VERBINT => Some(IntSpb),
+            spb::DBNAME | bkp::FILE | bkp::SKIP_DATA | bkp::INCLUDE_DATA => Some(StringSpb),
+            spb::OPTIONS | spb::VERBINT | bkp::FACTOR | bkp::LENGTH | bkp::PARALLEL => {
+                Some(IntSpb)
+            }
             spb::VERBOSE => Some(Single),
             _ => None,
         },
@@ -268,6 +270,16 @@ pub fn start_clumplet_type(action: u8, tag: u8) -> Option<ClumpletType> {
         action::GET_FB_LOG => None,
         _ => None,
     }
+}
+
+/// `isc_spb_bkp_*` - the gbak actions' own tags (consts_pub.h:425+).
+pub mod bkp {
+    pub const FILE: u8 = 5;
+    pub const FACTOR: u8 = 6;
+    pub const LENGTH: u8 = 7;
+    pub const SKIP_DATA: u8 = 8;
+    pub const INCLUDE_DATA: u8 = 9;
+    pub const PARALLEL: u8 = 21;
 }
 
 /// `isc_spb_nbk_*` - the nbackup action's own tags (consts_pub.h:642-651).

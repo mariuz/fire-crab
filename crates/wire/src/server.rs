@@ -2198,6 +2198,12 @@ fn serve_service(
                 read_int(s, dec)?; // object
                 read_int(s, dec)?; // incarnation
                 let spb = read_wire_bytes(s, dec)?; // the action
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!(
+                        "[srv] start SPB: {}",
+                        spb.iter().map(|x| format!("{:02x}", x)).collect::<String>()
+                    );
+                }
                 // An action is a REQUEST TO DO SOMETHING. A clean
                 // op_response here says "done", so an action fire-crab
                 // cannot perform must be REFUSED - otherwise the client
@@ -2278,6 +2284,9 @@ fn run_service_action(spb: &[u8]) -> Result<String, i32> {
         GDS_WISH_LIST
     })?;
     let action = b.items.first().map(|c| c.tag).unwrap_or(0);
+    if action == fire_crab_svc::action::BACKUP {
+        return run_gbak_backup(&b);
+    }
     if action == fire_crab_svc::action::NBAK {
         return run_nbak(&b);
     }
@@ -2339,6 +2348,76 @@ fn run_service_action(spb: &[u8]) -> Result<String, i32> {
         "\nDatabase \"{}\"\nGstat execution time {}\n\n{}Gstat completion time {}\n",
         db, stamp, report, stamp
     ))
+}
+
+/// `isc_action_svc_backup`: the LOGICAL backup - a `.fbk` the real
+/// `gbak -c` restores, written by [fire_crab_burp::write_backup].
+///
+/// This is the fbsvcmgr-shaped route (a proper start SPB: dbname,
+/// bkp_file, options). `gbak -se` itself speaks an OLDER protocol - its
+/// whole command line rides the version-3 ATTACH SPB as
+/// `isc_spb_command_line` with 0xff separators, and op_service_start
+/// carries a bare action byte - which is its own slice; until then that
+/// shape arrives here with no dbname and refuses.
+///
+/// The image read is the same consistent `Arc` the physical backup
+/// takes; the SURFACE check is inside the writer, fail-closed - a
+/// database holding anything the format writer cannot carry refuses the
+/// WHOLE backup, because a backup missing tables is worse than none.
+fn run_gbak_backup(b: &fire_crab_svc::Buffer) -> Result<String, i32> {
+    let db = b.text(fire_crab_svc::spb::DBNAME).ok_or(GDS_WISH_LIST)?;
+    let file = b.text(fire_crab_svc::bkp::FILE).ok_or(GDS_WISH_LIST)?;
+    // options this writer cannot honour refuse rather than being
+    // silently dropped: skip/include-data change what the file MEANS,
+    // and a VERBOSE request answered with silence is the gfix -v
+    // failure mode again - a report that cannot fail
+    if b.items.iter().any(|c| {
+        matches!(
+            c.tag,
+            fire_crab_svc::bkp::SKIP_DATA
+                | fire_crab_svc::bkp::INCLUDE_DATA
+                | fire_crab_svc::bkp::FACTOR
+                | fire_crab_svc::bkp::LENGTH
+                | fire_crab_svc::bkp::PARALLEL
+        ) || c.tag == fire_crab_svc::spb::VERBOSE
+    }) {
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] gbak backup: an unsupported option refuses");
+        }
+        return Err(GDS_WISH_LIST);
+    }
+    let shared = fire_crab_cch::pool::open(&db).ok_or(GDS_IO_ERROR)?;
+    let image = shared.image();
+    let page_size = fire_crab_ods::header::HeaderPage::decode(&image)
+        .map(|h| h.page_size as usize)
+        .ok_or(GDS_IO_ERROR)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let fbk = fire_crab_burp::write_backup(&image, page_size, &db, &file, now).map_err(|e| {
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] gbak backup refused: {}", e.0);
+        }
+        GDS_WISH_LIST
+    })?;
+    // OVERWRITE, measured: the engine's action_backup replaces an
+    // existing .fbk silently (rc 0) - the OPPOSITE of nbackup's
+    // refusal, and a difference a converter copying one tool onto the
+    // other ships as a bug
+    let mut out = std::fs::File::create(&file).map_err(|e| {
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] gbak backup cannot create {}: {}", file, e);
+        }
+        GDS_IO_ERROR
+    })?;
+    use std::io::Write as _;
+    out.write_all(&fbk).and_then(|_| out.sync_all()).map_err(|_| GDS_IO_ERROR)?;
+    if std::env::var("FC_SRV_TRACE").is_ok() {
+        eprintln!("[srv] gbak backup: {} bytes to {}", fbk.len(), file);
+    }
+    // without VERBOSE the engine's backup streams nothing
+    Ok(String::new())
 }
 
 /// `isc_action_svc_nbak`, level 0: the PHYSICAL backup, which in this
