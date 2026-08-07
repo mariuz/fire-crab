@@ -17,8 +17,16 @@ fn main() {
     }
     let mut t = EventTable::new();
     let s = t.create_session();
-    let baseline = t.count("FC_EVT");
-    let first = t.queue(s, "FC_EVT", baseline);
+    // SUBSCRIBE THE WAY EVERY DRIVER DOES: register, take the delivery
+    // that fires at once as the baseline, and register again at it.
+    // Registration always fires on a fresh event (the engine's test is
+    // `rint_count <= evnt_count`) and carries `evnt_count + 1`, so the
+    // baseline a client holds is 1 and not 0.
+    let first = t.queue(s, "FC_EVT", 0);
+    let baseline = first.first().map(|d| d.count).unwrap_or(0);
+    if baseline != 0 {
+        t.queue(s, "FC_EVT", baseline);
+    }
     println!("subscribed baseline={} immediate={}", baseline, first.len());
 
     // post then ROLLBACK: nobody hears it

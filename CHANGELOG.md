@@ -13,6 +13,70 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-07 — the carrying: event delivery over the auxiliary connection
+
+### Converted
+- **The auxiliary connection, end to end.** `op_connect_request` opens a
+  listener and answers its sockaddr; the client connects on a SECOND
+  socket; `op_que_events` registers an interest from an EPB;
+  `op_cancel_events` takes it down; and every delivery is an `op_event`
+  frame pushed on that second socket. The frame's event buffer is the
+  shape a client parses by hand — a version byte, then per event a name
+  length, the name, and the counter as a **little-endian** 32-bit value,
+  little-endian inside a protocol that is big-endian everywhere else
+  because the engine builds those four bytes itself (event.cpp:885-888).
+- **A delivery is written by whichever attachment's COMMIT moved the
+  counter** — another connection, on another thread — so the sockets
+  live in a per-database registry beside the event table rather than on
+  the connection that made them.
+- **`EXECUTE BLOCK AS ... BEGIN ... END`**, because the paper's own
+  event client posts with one and this server had none. It is the PSQL
+  interpreter's surface with the DDL taken away: the block's text IS the
+  body, it has no catalog row, and it runs at execute because it may
+  write. Its errors carry the engine's own `At block line: L, col: C`
+  item — computed from the WHOLE statement text, which a block has in
+  hand where a procedure must recover it from `RDB$DEBUG_INFO`.
+
+### Fixed
+- **A delivery carries `evnt_count + 1`, not the counter.** `const SLONG
+  count = event->evnt_count + 1;` (event.cpp:884). A subscriber to an
+  event nobody has posted is told **1**, and the paper's client prints
+  `baseline counter = 1` and then `counter=4` after three posts. The
+  converted table shipped the raw counter, so it would have printed 0
+  and 3 — agreeing on the DELTA, which is exactly what hid it, and
+  disagreeing on every absolute number a client sees.
+- **A post to a name nobody has ever listened for is DROPPED.**
+  `postEvent` looks the name up and does nothing when there is no event
+  block (`if (event)`, event.cpp:376); the block is made by a
+  SUBSCRIPTION. Measured live: two posts before anybody subscribed left
+  the next subscriber's baseline at 1, not 3.
+- The fire test is `rint_count <= evnt_count` (event.cpp:303, 388), not
+  `<`. That is why a fresh interest at 0 over a counter at 0 fires at
+  once, which is what gives a subscriber its baseline.
+
+### Found
+- The two counter laws were invisible for as long as they were, because
+  the only gate that could see them had to compare **deltas** —
+  `qa/evt-semantics.sh` says so in its own header: "absolute counters
+  depend on the database's history". The delivery path is what makes the
+  absolute number observable, and it disagreed immediately.
+- `serve-real-events.sh` was asserting fire-crab's own invention: it
+  required the counter to move for posts NO ONE was listening to. It
+  now asserts the engine's law instead, and the delivery gate is where
+  a moving counter is checked.
+
+### Gated
+- **`qa/serve-real-eventdelivery.sh`** (10 checks): the paper's own
+  `samples/nodejs/events.js` run against the live engine and against
+  fire-crab, output required to match **line for line** — a stronger
+  statement than any assertion the gate could write itself, because the
+  client was not written for it. Plus the individual laws, so a shared
+  failure cannot read as agreement, and log teeth for the whole dance.
+- **`qa/serve-real-execblock.sh`** (11 checks): a block that writes and
+  whose write the transaction owns, locals and loops, a failure inside
+  it carrying the engine's error and its `At block` position, and the
+  parameterised and `RETURNS` forms refused as recorded boundaries.
+
 ## 2026-08-07 — a transaction inside a transaction
 
 ### Converted

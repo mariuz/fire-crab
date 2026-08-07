@@ -104,14 +104,21 @@ check "ENGINE: and one whose transaction rolls back" "$eng_rb" "42,"
 check "fc: the same" "$(run "127.0.0.1/$PORT:$A" "$ROLLED")" "$eng_rb"
 
 # --- 2. THE COUNTER, out of fire-crab's own event table -----------------
-# The engine's counter lives in shared memory and is only observable
-# through a delivery, which needs the auxiliary connection; fire-crab's
-# is read from the server log. What is asserted is the LAW the engine
-# documents and `qa/evt-semantics.sh` holds against it: commit moves the
-# counter by the number of posts, rollback moves it not at all.
+# The counter is read from the server log (the engine's lives in shared
+# memory and is only observable through a delivery - which this server
+# now speaks too, gated by `qa/serve-real-eventdelivery.sh`).
+#
+# THIS ASSERTED THE WRONG LAW UNTIL THE DELIVERY SLICE MEASURED IT.
+# `EventManager::postEvent` looks the name up and does NOTHING when
+# there is no event block (`if (event)`, event.cpp:376), and the block
+# is made by a SUBSCRIPTION. Nobody is listening here, so the engine
+# would count none of these posts - and the counter this gate used to
+# require (1, then 3) was fire-crab's own invention. It stays at 0, and
+# what proves the posts still ARRIVE is the teeth below plus the
+# delivery gate, where a listener exists and the counter does move.
 counters=$(grep '\[srv\] event "demo_event" counter' "$LOG" | sed -n 's/.*counter \([0-9]*\).*/\1/p' | tr '\n' ',')
-check "fc: the counter moved 1, then 2 more, and a rollback moved it none" \
-      "$counters" "1,3,3,"
+check "fc: no listener, no event block, no counter (event.cpp:376)" \
+      "$counters" "0,0,0,"
 rolled=$(grep -c 'rolled back' "$LOG")
 ran=$((ran + 1))
 if [ "$rolled" -ge 1 ]; then

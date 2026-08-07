@@ -30,6 +30,10 @@ use crate::{
     OP_SERVICE_ATTACH, OP_SERVICE_DETACH, OP_SERVICE_INFO, OP_SERVICE_START, OP_TRANSACTION,
 };
 
+const OP_QUE_EVENTS: i32 = 48;
+const OP_CANCEL_EVENTS: i32 = 49;
+const OP_EVENT: i32 = 52;
+const OP_CONNECT_REQUEST: i32 = 53;
 const OP_ALLOCATE_STATEMENT: i32 = 62;
 const OP_EXEC_IMMEDIATE: i32 = 64;
 // prepare+execute+return one output message in a single round-trip - the
@@ -538,6 +542,9 @@ static ATTACH_COUNTER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI
 /// transaction's rtr_id - the OO client reads it as the live
 /// transaction and nulls its ITransaction on a 0).
 const TX_HANDLE: i32 = 2;
+/// the attachment handle this server answers op_attach with, and the one
+/// an `op_event` frame names
+const DB_HANDLE: i32 = 1;
 
 /// A database file the server has opened for the current attachment: the
 /// page image plus the page size read from its header. The `ods` crate
@@ -673,6 +680,115 @@ fn events_for(path: &str) -> std::sync::Arc<std::sync::Mutex<fire_crab_evt::Even
     let reg = R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut g = reg.lock().unwrap_or_else(|e| e.into_inner());
     std::sync::Arc::clone(g.entry(key).or_default())
+}
+
+/// One listener's AUXILIARY CONNECTION - the second socket an event
+/// client opens, and the only thing `op_event` is ever written to.
+///
+/// The main connection is request/response; a delivery is neither, it
+/// is the server speaking first. That is what the second socket is for,
+/// and why it lives in a registry rather than on the connection that
+/// made it: the transaction whose COMMIT moves the counter belongs to
+/// ANOTHER attachment, on another thread, and it is that thread that
+/// has to do the writing.
+struct AuxSink {
+    sock: std::net::TcpStream,
+    /// the client's own event id, echoed in every `op_event` (node
+    /// hands it back to its event manager, which matches it)
+    event_id: i32,
+}
+
+/// Parse an event parameter block: a version byte, then one
+/// `(length, name, count-seen)` triple per event, the count
+/// LITTLE-ENDIAN (event.cpp writes those four bytes by hand). A
+/// malformed block yields the names it could read and stops, which is
+/// what refusing to guess looks like here.
+fn parse_epb(epb: &[u8]) -> Vec<(String, i64)> {
+    let mut out = Vec::new();
+    let mut i = 1usize; // the version byte
+    while i < epb.len() {
+        let len = epb[i] as usize;
+        i += 1;
+        if i + len + 4 > epb.len() {
+            break;
+        }
+        let Ok(name) = std::str::from_utf8(&epb[i..i + len]) else { break };
+        i += len;
+        let count = i32::from_le_bytes([epb[i], epb[i + 1], epb[i + 2], epb[i + 3]]);
+        i += 4;
+        out.push((name.to_string(), count as i64));
+    }
+    out
+}
+
+/// The auxiliary connections open on one database, by event session.
+type AuxTable = std::sync::Mutex<std::collections::HashMap<u32, AuxSink>>;
+
+/// The aux table for a database file, shared by every attachment to it -
+/// the same per-path registry shape [events_for] uses, and keyed the
+/// same way, because a delivery needs both halves and they must agree
+/// on which database they are talking about.
+fn aux_for(path: &str) -> std::sync::Arc<AuxTable> {
+    type Registry =
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<AuxTable>>>;
+    static R: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
+    let key = std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string());
+    let reg = R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut g = reg.lock().unwrap_or_else(|e| e.into_inner());
+    std::sync::Arc::clone(g.entry(key).or_default())
+}
+
+/// Write the deliveries out as `op_event` frames on the sockets of the
+/// sessions they belong to.
+///
+/// The frame is `op_event, database handle, the counted event buffer,
+/// an 8-byte AST field nobody reads, and the client's event id`. The
+/// BUFFER is the shape a client parses one byte at a time: a leading
+/// version byte, then per event a name length, the name, and the
+/// counter as a LITTLE-ENDIAN 32-bit value - little-endian inside a
+/// protocol that is big-endian everywhere else, because the engine
+/// builds these four bytes by hand (`*p++ = (UCHAR) (count >> 8)`,
+/// event.cpp:885-888) rather than through XDR.
+///
+/// A socket that has gone away drops its session: the client is not
+/// listening any more, and a delivery nobody can receive must not keep
+/// an interest alive.
+fn deliver_events(path: &str, db_handle: i32, deliveries: &[fire_crab_evt::Delivery]) {
+    if deliveries.is_empty() {
+        return;
+    }
+    use std::io::Write;
+    let table = aux_for(path);
+    let mut g = table.lock().unwrap_or_else(|e| e.into_inner());
+    let mut gone: Vec<u32> = Vec::new();
+    for d in deliveries {
+        let Some(sink) = g.get(&d.session) else { continue };
+        let mut buf: Vec<u8> = vec![1]; // epb_version
+        buf.push(d.name.len() as u8);
+        buf.extend_from_slice(d.name.as_bytes());
+        buf.extend_from_slice(&(d.count as i32).to_le_bytes());
+        let mut w = W::default();
+        w.int(OP_EVENT)
+            .int(db_handle)
+            .bytes(&buf)
+            .int(0) // AST info, high half
+            .int(0) // AST info, low half
+            .int(sink.event_id);
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!(
+                "[srv] op_event session {} {:?} count {}",
+                d.session, d.name, d.count
+            );
+        }
+        if (&mut &sink.sock).write_all(&w.buf).is_err() {
+            gone.push(d.session);
+        }
+    }
+    for s in gone {
+        g.remove(&s);
+    }
 }
 
 /// How long a writer waits for the connection that holds the database's
@@ -2500,6 +2616,16 @@ enum Plan {
         name: String,
         args: Vec<Value>,
         cols: Vec<ProjCol>,
+    },
+    /// `EXECUTE BLOCK AS ... BEGIN ... END` - a body with no name and no
+    /// catalog row. Like [Plan::ProcInvoke] it runs at op_execute
+    /// because it may WRITE, and it projects nothing: the parameterised
+    /// and `RETURNS` forms are refused at prepare.
+    ExecBlock {
+        source: String,
+        /// the body's (line, column) in the whole statement text - what
+        /// the engine's `At block` item counts
+        body_at: (usize, usize),
     },
     /// `SELECT ... FROM <proc>(args)` before the body has run - a
     /// SELECTABLE procedure as a row source. Like ProcInvoke it executes
@@ -19965,6 +20091,11 @@ fn plan_query_inner_ctx(
             }
         }
     }
+    // EXECUTE BLOCK is a body with no DDL around it - prepared like any
+    // statement, run at execute because it may write.
+    if let Some((source, body_at)) = parse_execute_block(sql) {
+        return Some(Plan::ExecBlock { source, body_at });
+    }
     // EXECUTE PROCEDURE is not a SELECT, but isql prepares and FETCHES
     // it like one, so it resolves to a plan here (see PSQL EXECUTION).
     if let Some((qual, pname, pargs)) = parse_execute_procedure(sql) {
@@ -23388,6 +23519,8 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         Plan::SetGenerator { stmt_type, .. } => describe_dml(*stmt_type, params),
         Plan::InsertSelect { .. } => describe_dml(2, params), // isc_info_sql_stmt_insert
         // isc_info_sql_stmt_commit (?) - no columns either way
+        // a block projects nothing: no cursor, no columns
+        Plan::ExecBlock { .. } => build_describe(&[], params, att),
         Plan::TxControl { .. } | Plan::Savepoint { .. } => build_describe(&[], params, att),
     }
 }
@@ -23402,6 +23535,9 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         // already run. 8 makes it a singleton: op_execute2 carries the
         // output message back, or plain op_execute when there is none.
         Plan::ProcCall { .. } | Plan::ProcInvoke { .. } => 8,
+        // isc_info_sql_stmt_exec_procedure too: a block runs and answers
+        // nothing, which is the singleton shape with no output message
+        Plan::ExecBlock { .. } => 8,
         Plan::InsertSelect { .. } => 2, // isc_info_sql_stmt_insert
         // isc_info_sql_stmt_commit = 5, rollback = 6
         // inf_pub.h:524-527 - commit 10, rollback 11, savepoint 14.
@@ -24523,6 +24659,7 @@ fn emit_rows_inner(
         // GenIdIncrement is replaced by a Scalar at op_execute, so it never
         // reaches fetch as itself; the arm keeps the match exhaustive.
         Plan::TxControl { .. }
+        | Plan::ExecBlock { .. }
         | Plan::Savepoint { .. }
         | Plan::InsertSelect { .. }
         | Plan::Insert { .. } | Plan::UpdateOrInsert { .. }
@@ -35445,6 +35582,7 @@ fn end_transaction(database: &mut Option<Database>, outcome: TxEnd) {
     {
         let tx = db.event_tx();
         let posted = std::mem::take(&mut *db.posted.borrow_mut());
+        let path = db.path.clone();
         let mut t = db.events.lock().unwrap_or_else(|e| e.into_inner());
         match outcome {
             TxEnd::Commit => {
@@ -35455,6 +35593,15 @@ fn end_transaction(database: &mut Option<Database>, outcome: TxEnd) {
                     }
                     eprintln!("[srv] events: {} delivery(ies) at commit", delivered.len());
                 }
+                // AND THIS IS WHERE A LISTENER HEARS IT. The counter
+                // moved on THIS thread, in THIS attachment's commit;
+                // the sockets it has to be written to belong to other
+                // attachments entirely, which is what the aux registry
+                // is for. The event table's lock is dropped first: the
+                // write can block, and nothing else should wait behind
+                // a socket for it.
+                drop(t);
+                deliver_events(&path, DB_HANDLE, &delivered);
             }
             _ => {
                 t.rollback(tx);
@@ -36675,6 +36822,49 @@ fn run_procedure(
     let db = database.as_ref().ok_or("no database attached")?;
     let meta = load_procedure(db, name)
         .ok_or_else(|| format!("procedure {} is not one this server can run", name))?;
+    run_body_source(database, name, &meta, args, ctx)
+}
+
+/// `EXECUTE BLOCK AS ... BEGIN ... END` - a procedure with no name and
+/// no catalog row, run where it stands.
+///
+/// It is the interpreter's own surface with the DDL taken away, so it
+/// borrows a [ProcMeta] rather than inventing a second body runner:
+/// the block's text IS the body, and it has no parameters. The forms
+/// carrying `(<params>)` or `RETURNS (...)` are refused - the first
+/// needs the message the client sends with them, the second makes the
+/// block SELECTABLE and its rows a result set.
+fn run_execute_block(
+    database: &mut Option<Database>,
+    source: &str,
+    body_at: (usize, usize),
+    ctx: &SessionCtx,
+) -> Result<(), ProcErr> {
+    let meta = ProcMeta {
+        ins: Vec::new(),
+        outs: Vec::new(),
+        source: source.to_string(),
+        body_at: Some(body_at),
+        prc_type: None,
+    };
+    run_body_source(database, ANONYMOUS_BLOCK, &meta, &[], ctx).map(|_| ())
+}
+
+/// The name [run_body_source] runs an anonymous block under. The engine
+/// writes its stack item WITHOUT a name - `At block line: L, col: C` -
+/// where a procedure's carries the quoted schema-qualified one.
+const ANONYMOUS_BLOCK: &str = "";
+
+/// Run a body the caller already holds the metadata for - the whole of
+/// [run_procedure] once the catalog lookup is done, and what an
+/// anonymous block borrows.
+fn run_body_source(
+    database: &mut Option<Database>,
+    name: &str,
+    meta: &ProcMeta,
+    args: &[Value],
+    ctx: &SessionCtx,
+) -> Result<(Vec<Value>, Vec<Vec<Value>>), ProcErr> {
     if args.len() != meta.ins.len() {
         return Err(ProcErr::from(format!(
             "procedure {} expects {} input parameter(s), got {}",
@@ -36777,12 +36967,16 @@ fn run_procedure(
                 .iter()
                 .filter_map(|off| ddl_position(&meta, *off))
                 .map(|(line, col)| {
-                    format!(
-                        "At procedure {} line: {}, col: {}",
-                        quoted_qualified(name),
-                        line,
-                        col
-                    )
+                    if name == ANONYMOUS_BLOCK {
+                        format!("At block line: {}, col: {}", line, col)
+                    } else {
+                        format!(
+                            "At procedure {} line: {}, col: {}",
+                            quoted_qualified(name),
+                            line,
+                            col
+                        )
+                    }
                 })
                 .collect();
             let inner = ex.as_eval_err();
@@ -36943,6 +37137,47 @@ fn declared_var_names(header: &str) -> Vec<String> {
 /// no-such-procedure refusal rather than a parse failure.
 /// A `?` argument yields None for that slot, to be filled from the
 /// execute message.
+/// `EXECUTE BLOCK AS <declarations> BEGIN ... END` - the body text, if
+/// this is a block this server can run.
+///
+/// Only the form with NO input parameters and NO `RETURNS` is taken:
+/// the parameterised form arrives with a message the client built for
+/// it, and `RETURNS` makes the block SELECTABLE, so its rows are a
+/// result set rather than nothing. Both refuse rather than run half of
+/// what was asked.
+///
+/// The text handed back is what a procedure's catalog source looks
+/// like - declarations then `BEGIN ... END` - because that is what the
+/// body runner reads.
+fn parse_execute_block(sql: &str) -> Option<(String, (usize, usize))> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "EXECUTE", 0) != Some(0) {
+        return None;
+    }
+    let block = find_word(&masked, "BLOCK", "EXECUTE".len())?;
+    if up["EXECUTE".len()..block].trim() != "" {
+        return None;
+    }
+    let after = block + "BLOCK".len();
+    let as_kw = find_word(&masked, "AS", after)?;
+    // anything between BLOCK and AS is a parameter list or RETURNS
+    if up[after..as_kw].trim() != "" {
+        return None;
+    }
+    let body_off = as_kw + "AS".len();
+    let lead = s[body_off..].len() - s[body_off..].trim_start().len();
+    // WHERE THE BODY SITS IN THE STATEMENT, which is what the engine's
+    // `At block line: L, col: C` counts - the WHOLE text, `EXECUTE
+    // BLOCK AS` included (probed: a one-line block reports the column of
+    // its INSERT, 24 for `EXECUTE BLOCK AS BEGIN INSERT ...`). A
+    // procedure has to recover this from its RDB$DEBUG_INFO because the
+    // catalog keeps only the body; a block has the statement in hand.
+    let at = source_line_col(s, body_off + lead);
+    Some((s[body_off..].trim().to_string(), at))
+}
+
 fn parse_execute_procedure(sql: &str) -> Option<(Option<String>, String, Vec<Option<Value>>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
@@ -38477,6 +38712,15 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // KEEPS the mark; RELEASE forgets the mark but keeps the work. Both
     // discard the marks made AFTER the named one.
     let mut savepoints: Vec<(String, std::sync::Arc<Vec<u8>>)> = Vec::new();
+    // THE AUXILIARY CONNECTION, in the two halves it arrives in: the
+    // listener `op_connect_request` opens and hands the client a port
+    // for, and the socket the client then connects on - accepted
+    // lazily at `op_que_events`, by which time the client has certainly
+    // connected, because it will not register an interest before it
+    // has. One event SESSION per connection, so a re-queue after each
+    // delivery (which is what every driver does) keeps the same one.
+    let mut aux_listener: Option<std::net::TcpListener> = None;
+    let mut event_session: Option<u32> = None;
     let mut stmts: std::collections::HashMap<i32, StmtSlot> = std::collections::HashMap::new();
     let mut cur_stmt: i32 = 3;
     // handles run 3, 4, 5, ... - starting at 3 keeps the first one the
@@ -39386,6 +39630,28 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             }
                         }
                     }
+                } else if matches!(&*plan, Plan::ExecBlock { .. }) {
+                    // AN ANONYMOUS BODY RUNS HERE, for the reason
+                    // EXECUTE PROCEDURE does: it may WRITE. It projects
+                    // nothing, so there is no plan to replace it with -
+                    // the response is the whole answer.
+                    let (source, body_at) = match &*plan {
+                        Plan::ExecBlock { source, body_at } => (source.clone(), *body_at),
+                        _ => unreachable!(),
+                    };
+                    let ctx = SessionCtx { user, attach_id };
+                    match run_execute_block(&mut database, &source, body_at, &ctx) {
+                        Ok(()) => respond(&mut s, &mut enc, TX_HANDLE)?,
+                        Err(e) => {
+                            if std::env::var("FC_SRV_TRACE").is_ok() {
+                                eprintln!("[srv] execute block failed: {}", e);
+                            }
+                            match &e.status {
+                                Some(ev) => respond_eval_error(&mut s, &mut enc, ev)?,
+                                None => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
+                            }
+                        }
+                    }
                 } else if matches!(&*plan, Plan::ProcInvoke { .. }) {
                     // EXECUTE PROCEDURE runs HERE, because a body may
                     // WRITE, and becomes the row its output parameters
@@ -39730,6 +39996,123 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         last_dml = (0, 0, 0);
                     }
                 }
+                respond(&mut s, &mut enc, 0)?;
+            }
+            // THE AUXILIARY CONNECTION IS REQUESTED HERE. The client
+            // asks for somewhere to be told things, and the answer is a
+            // sockaddr: a listener of our own on the loopback, whose
+            // port the client reads out of the response data and
+            // connects to. The engine answers the same shape from
+            // `INET_connect` - family, port and address, port and
+            // address in NETWORK order because they came from a real
+            // sockaddr_in.
+            x if x == OP_CONNECT_REQUEST => {
+                read_int(&mut s, &mut dec)?; // p_req_type (1 = async)
+                read_int(&mut s, &mut dec)?; // database handle
+                read_int(&mut s, &mut dec)?; // the client's event id
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").ok();
+                let port = listener.as_ref().and_then(|l| l.local_addr().ok()).map(|a| a.port());
+                match (listener, port) {
+                    (Some(l), Some(port)) => {
+                        let _ = l.set_nonblocking(true);
+                        aux_listener = Some(l);
+                        // sockaddr_in: family (AF_INET), port, address,
+                        // then the eight bytes of padding a real one has
+                        let mut addr = Vec::with_capacity(16);
+                        addr.extend_from_slice(&2u16.to_be_bytes());
+                        addr.extend_from_slice(&port.to_be_bytes());
+                        addr.extend_from_slice(&[127, 0, 0, 1]);
+                        addr.extend_from_slice(&[0u8; 8]);
+                        if std::env::var("FC_SRV_TRACE").is_ok() {
+                            eprintln!("[srv] op_connect_request: aux port {}", port);
+                        }
+                        let mut w = W::default();
+                        w.int(OP_RESPONSE)
+                            .int(0)
+                            .int(0)
+                            .int(0) // blob id
+                            .bytes(&addr)
+                            .int(0); // isc_arg_end
+                        w.send(&mut s, &mut enc)?;
+                    }
+                    _ => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
+                }
+            }
+            // AN INTEREST, and the delivery it may fire at once. The EPB
+            // carries a version byte and then one (name, count-seen)
+            // pair per event, the count LITTLE-ENDIAN as the engine
+            // writes it by hand.
+            x if x == OP_QUE_EVENTS => {
+                read_int(&mut s, &mut dec)?; // database handle
+                let epb = read_wire_bytes(&mut s, &mut dec)?;
+                read_int(&mut s, &mut dec)?; // ast
+                read_int(&mut s, &mut dec)?; // ast argument
+                let event_id = read_int(&mut s, &mut dec)?;
+                // the client connected to the port we handed it as soon
+                // as it read the response; take that socket now
+                if let Some(l) = aux_listener.take() {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let mut got = None;
+                    while std::time::Instant::now() < deadline {
+                        match l.accept() {
+                            Ok((sock, _)) => {
+                                let _ = sock.set_nodelay(true);
+                                got = Some(sock);
+                                break;
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    match (got, database.as_ref()) {
+                        (Some(sock), Some(db)) => {
+                            let session = {
+                                let mut t = db.events.lock().unwrap_or_else(|e| e.into_inner());
+                                *event_session.get_or_insert_with(|| t.create_session())
+                            };
+                            let table = aux_for(&db_path);
+                            let mut g = table.lock().unwrap_or_else(|e| e.into_inner());
+                            g.insert(session, AuxSink { sock, event_id });
+                        }
+                        _ => {
+                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                            continue;
+                        }
+                    }
+                }
+                let mut fired: Vec<fire_crab_evt::Delivery> = Vec::new();
+                if let Some(db) = database.as_ref() {
+                    let session = {
+                        let mut t = db.events.lock().unwrap_or_else(|e| e.into_inner());
+                        *event_session.get_or_insert_with(|| t.create_session())
+                    };
+                    let mut t = db.events.lock().unwrap_or_else(|e| e.into_inner());
+                    for (name, seen) in parse_epb(&epb) {
+                        if std::env::var("FC_SRV_TRACE").is_ok() {
+                            eprintln!("[srv] op_que_events {:?} seen {}", name, seen);
+                        }
+                        fired.extend(t.queue(session, &name, seen));
+                    }
+                }
+                // the response first, then the delivery: the client is
+                // waiting on this socket for the one and reading the
+                // other on a socket of its own
+                respond(&mut s, &mut enc, event_id)?;
+                deliver_events(&db_path, DB_HANDLE, &fired);
+            }
+            x if x == OP_CANCEL_EVENTS => {
+                read_int(&mut s, &mut dec)?; // database handle
+                let _event_id = read_int(&mut s, &mut dec)?;
+                if let (Some(db), Some(session)) = (database.as_ref(), event_session) {
+                    let mut t = db.events.lock().unwrap_or_else(|e| e.into_inner());
+                    t.cancel(session);
+                    let table = aux_for(&db_path);
+                    let mut g = table.lock().unwrap_or_else(|e| e.into_inner());
+                    g.remove(&session);
+                }
+                event_session = None;
                 respond(&mut s, &mut enc, 0)?;
             }
             x if x == OP_COMMIT || x == OP_ROLLBACK => {

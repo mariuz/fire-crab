@@ -2484,7 +2484,7 @@ plus *the subsystem is now on the path*.
   outside it, not deliberately: the triggers a statement gathers, and
   the per-statement CLONE of the cached check predicates (127us) -
   the answer is shared, the copy is not.
-- **W5 — event delivery** (`evt`). *(first slice done)* `POST_EVENT` is
+- **W5 — event delivery** (`evt`). *(done)* `POST_EVENT` is
   a PSQL statement now - a procedure containing one used to be refused
   whole - and `fire_crab_evt` is on the path behind it: the post is
   filed under the transaction, the COMMIT moves the counter, a ROLLBACK
@@ -2492,14 +2492,37 @@ plus *the subsystem is now on the path*.
   attachment moves what a listener in another is watching
   (`qa/serve-real-events.sh`, 7 checks).
 
-  **What is left is the carrying, and it is all protocol**: a client
-  learns about an event over an AUXILIARY connection - the server
-  answers `op_connect_request` with a port, the client opens a second
-  socket, `op_que_events` registers a one-shot interest with an EPB of
-  names and counts, and each delivery is an `op_event` frame pushed on
-  that socket. `samples/nodejs/events.js` drives exactly that dance and
-  would be the gate. Nothing about it is observable until all of it
-  works, which is why it is its own slice rather than a half-step.
+  ~~**What is left is the carrying**~~ **DONE** (second slice, and W5
+  with it). `op_connect_request` answers a sockaddr for a listener of
+  the server's own; the client opens the second socket; `op_que_events`
+  registers an interest from an EPB; `op_cancel_events` takes it down;
+  and each delivery is an `op_event` frame pushed on that socket by
+  whichever attachment's COMMIT moved the counter - another connection,
+  on another thread, which is why the sockets live in a per-database
+  registry beside the event table.
+
+  **The gate is the paper's own client**, as this section predicted:
+  `samples/nodejs/events.js` runs against the live engine and against
+  fire-crab and the two outputs must match LINE FOR LINE
+  (`qa/serve-real-eventdelivery.sh`, 10 checks). That is a stronger
+  statement than an assertion of our own, because the client was not
+  written for it.
+
+  **It also corrected two counter laws that no gate could see before.**
+  A delivery carries `evnt_count + 1` (event.cpp:884), so a subscriber
+  to an event nobody has posted is told 1; and a post to a name with no
+  event block is DROPPED WHOLE (`if (event)`, event.cpp:376), the block
+  being made by a subscription. Both were invisible while the only
+  available differential compared DELTAS - which `qa/evt-semantics.sh`
+  had to, having no delivery path to read an absolute number from. The
+  carrying is what made them observable, and they disagreed at once.
+
+  `EXECUTE BLOCK AS ... BEGIN ... END` came with it, because the
+  paper's client posts with one: the interpreter's own surface with the
+  DDL taken away, running at execute because it may write, its errors
+  carrying the engine's `At block line: L, col: C`
+  (`qa/serve-real-execblock.sh`, 11 checks). The parameterised and
+  `RETURNS` forms are refused and gated as boundaries.
 - **W6 — depth in `exe` and `svc`**: the request lifecycle, cursors and
   exceptions; then gbak/gfix/nbackup as services. *(three slices done;
   the first corrected the sentence above)*
