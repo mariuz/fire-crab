@@ -2668,13 +2668,41 @@ plus *the subsystem is now on the path*.
   so several switches collapse to whichever the CHAIN reaches first and
   the rest are dropped with rc=0.
 
-  What is left of gfix is no longer header fields: `-shut`/`-online`
-  (`isc_dpb_shutdown`/`isc_dpb_online`, a mode plus a delay, and the
-  attachment refusals that go with them), `-mode read_only` (the flag
-  is one bit but the refusal path behind it is the work), `-sweep` and
-  `-validate` (whole page walks - `fcstat census` already does the
-  reading half offline), and the limbo-transaction switches, which need
-  two-phase commit first.
+  *(third slice done)* **`-mode read_only|read_write`** - the flag is one
+  bit (`hdr_read_only`, 0x20) and the refusal path behind it was the
+  work, which is why it went last. Three laws had to be measured rather
+  than assumed, and each one is a place a converter guesses wrong:
+  the mode switch takes the database EXCLUSIVELY and is the ONLY gfix
+  switch that does (`-write`, `-buffers` and `-housekeeping` change the
+  header with an attachment held; `-mode` answers `isc_lock_timeout` +
+  `isc_obj_in_use` naming the file, immediately); it takes it BEFORE
+  deciding whether the mode would change, so a no-op `-mode` still
+  refuses while somebody is attached - the opposite of this server's own
+  "a no-op gfix writes no page" rule; and a write on a read-only database
+  gets `isc_read_only_database` in TWO shapes, bare for DML and behind
+  `isc_dsql_error` for the DDL the engine refuses at prepare.
+  `Database::work_copy` is the floor under all of it - the one funnel
+  every write goes through - so a write path added later cannot forget
+  the mode. 34 checks in `qa/serve-real-readonly.sh`.
+
+  It also found a bug the other four switches could not reach: **the
+  careful flush took its open mode from the image it was about to
+  write**, so setting the read-only bit made the file refuse the very
+  page that says "read only". The rule is the TRANSITION - a flush that
+  CHANGES the bit is the switch and opens read-write - and it is not the
+  same rule forced writes has, whose new promise deliberately governs
+  the write that turns it on. And **an attach that could not do what its
+  DPB asked was answering OK**: the refusal was traced and dropped,
+  which made gfix report success (rc=0) for a switch that changed
+  nothing.
+
+  What is left of gfix is now only the page-walking and multi-attachment
+  half: `-shut`/`-online` (`isc_dpb_shutdown`/`isc_dpb_online`, a mode
+  plus a delay, and the attachment refusals that go with them - the
+  attachment REGISTRY that `-mode` needed is in place now, which is most
+  of what `-shut -attach` asks about), `-sweep` and `-validate` (whole
+  page walks - `fcstat census` already does the reading half offline),
+  and the limbo-transaction switches, which need two-phase commit first.
 
 ## A savepoint is a transaction (done)
 

@@ -13,6 +13,87 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-07 — a read-only database, and the switch that makes one
+
+### Converted
+- **`gfix -mode read_only|read_write`** — `isc_dpb_set_db_readonly` (tag
+  64, a byte) → `hdr_read_only` (0x20) in the header page. The bit was
+  never the work; the REFUSAL PATH is, and it is why this switch was left
+  for last while the other four header switches landed.
+- **THE MODE SWITCH TAKES THE DATABASE EXCLUSIVELY, and it is the only
+  gfix switch that does** (`CCH_exclusive`, jrd.cpp:2181). Measured both
+  ways against the live engine with an attachment held open: `-write`,
+  `-buffers` and `-housekeeping` change the header regardless, `-mode`
+  answers `isc_lock_timeout` + `isc_obj_in_use` naming the FILE — and
+  answers it **immediately**, not after a wait. New `attachments_for`
+  registry, keyed like the buffer pool and the lock table, incremented by
+  `load_database` and decremented by `impl Drop for Database` so no error
+  path can leave the count too high.
+- **...and the check comes BEFORE deciding whether anything would
+  change.** `gfix -mode read_only` on a database that is ALREADY
+  read-only still refuses while somebody is attached — which is exactly
+  the opposite of this server's own "a no-op gfix writes no page" rule,
+  and had to be measured rather than assumed.
+- **A read-only database refuses every write, in the engine's two vector
+  shapes.** The bare `isc_read_only_database` for DML, an identity draw, a
+  `NEXT VALUE FOR` and an `EXECUTE BLOCK` that writes (the block adds its
+  own `At block line: 1, col: 24` item, which this server's wrapper
+  already produced); `isc_dsql_error` in front of it for the DDL the
+  engine refuses at prepare — `CREATE TABLE`, `COMMENT ON`, `GRANT`,
+  `SET GENERATOR`, `ALTER SEQUENCE ... RESTART`. A `SELECT` still answers,
+  and so does `GEN_ID(g, 0)`, the zero-increment READ.
+- **`Database::work_copy` is the floor under all of it.** Every write in
+  this server goes through that one funnel — records, catalog rows,
+  generators, index pages, the header's own clumplets — so refusing there
+  means a path added later cannot forget the mode. The typed refusals sit
+  in front of it for the two families whose error text the engine
+  specifies; `-mode read_write` takes `work_copy_unchecked`, being the one
+  write a read-only file must still allow.
+
+### Found
+- **The exclusivity this converts is PER PROCESS.** `attachments_for`
+  counts the attachments *this server* has; the engine's `CCH_exclusive`
+  goes through the lock manager, so it sees attachments in other
+  processes too. For fire-crab, whose attachments are all threads of one
+  server, the two agree — until a second fire-crab process opens the same
+  file, which nothing else in this server is safe for either (the buffer
+  pool and the lock table are per process as well). Named so it is not
+  mistaken for finished; the converted lock manager is where the
+  cross-process version would go.
+
+### Fixed
+- **THE CAREFUL FLUSH TOOK ITS OPEN MODE FROM THE IMAGE IT WAS ABOUT TO
+  WRITE, so `gfix -mode read_only` refused the very page that says "read
+  only".** `plan_for_header` was handed the AFTER image's flags — right
+  for forced writes, whose new promise governs this write too, and wrong
+  for read-only, which decides whether the process may write the file at
+  all. Taking it from the image on disk would have broken the mirror case
+  (`-mode read_write` on a file that is still read-only). The rule is the
+  TRANSITION: a flush that CHANGES the bit is the switch itself and opens
+  read-write; a flush that leaves it set is an ordinary write to a
+  read-only file and must not be happening.
+- **An attach that could not do what its DPB asked was answering OK.**
+  `apply_header_dpb`'s error was traced and dropped — and gfix's exit
+  status IS its attach's status, so a refused switch reported success
+  (rc=0) while changing nothing. The attach now answers the refusal's own
+  status vector and detaches, which is what makes rc=1 mean something.
+
+### Gated
+- **`qa/serve-real-readonly.sh`** (34 checks): every law above, with
+  `gstat -h`'s Attributes line as the oracle for the bit itself and gfix's
+  own rc+output compared side by side; an attachment held open through a
+  fifo-fed isql on BOTH servers for the exclusivity half; and teeth that
+  the same statements are accepted once the mode is off.
+- **Recorded boundaries, asserted:** `ALTER TABLE` and `DROP TABLE` are
+  refused INSIDE the engine's metadata machinery and come wrapped in
+  `isc_no_meta_update` + "<statement> failed" — and DROP carries the
+  Dynamic SQL Error inside that wrapper where ALTER does not. This server
+  has no `no_meta_update` wrapper for ANY DDL failure yet, so both shapes
+  are held as differences with the engine's exact text in the gate.
+  `CREATE VIEW` is outside this server's DDL surface altogether, so its
+  refusal is the generic one either way — asserted, so the day CREATE VIEW
+  lands, the gate says the read-only vector has to come with it.
+
 ## 2026-08-07 — a savepoint is a transaction
 
 ### Converted

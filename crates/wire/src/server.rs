@@ -216,6 +216,18 @@ const GDS_DSQL_ERROR: i32 = 335544569;
 /// SQLSTATE 40001 the drivers report as "deadlock").
 const GDS_DEADLOCK: i32 = 335544336;
 
+/// `isc_read_only_database` - "attempted update on read-only database"
+/// (SQLSTATE 42000, SQLCODE -817), what every write answers on a
+/// database `gfix -mode read_only` has marked.
+const GDS_READ_ONLY_DATABASE: i32 = 335544765;
+/// `isc_lock_timeout` - "lock time-out on wait transaction", the first
+/// item of the pair `gfix -mode` answers when it cannot take the
+/// database exclusively.
+const GDS_LOCK_TIMEOUT: i32 = 335544510;
+/// `isc_obj_in_use` - "object @1 is in use", the second item of that
+/// pair, and its argument is the database FILE.
+const GDS_OBJ_IN_USE: i32 = 335544453;
+
 /// isc_lock_conflict - "lock conflict on no wait transaction", the
 /// engine's answer when a wait it will not make would be needed
 /// (iberror: 335544345).
@@ -579,6 +591,11 @@ struct Database {
     /// write of a transaction, which is why a reader that has not
     /// written counts only committed work.
     tx: Option<u32>,
+    /// how many attachments this FILE has right now, this one included -
+    /// see [attachments_for]. Held as a handle so the count follows the
+    /// connection's life without anybody having to remember to
+    /// decrement it (see `impl Drop for Database`).
+    attachments: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// EVERY NESTED ID THIS TRANSACTION HAS RESERVED and not killed -
     /// one per undo window that wrote (see [UndoWindow]).
     ///
@@ -671,6 +688,16 @@ struct Database {
     windows: Vec<UndoWindow>,
 }
 
+/// A connection ending takes its attachment off the file's count,
+/// whatever ended it - a detach, a dropped socket, a panicking thread.
+/// Anything that has to ask "is anybody else attached?" ([attachments_for])
+/// reads a number that no error path can leave too high.
+impl Drop for Database {
+    fn drop(&mut self) {
+        self.attachments.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// THE EVENT MANAGER OF ONE DATABASE, shared by its attachments - keyed
 /// the way the buffer pool, the lock table and the caches are, because
 /// an event is a counter in one shared place and a poster in one
@@ -679,6 +706,42 @@ fn events_for(path: &str) -> std::sync::Arc<std::sync::Mutex<fire_crab_evt::Even
     type Registry = std::sync::Mutex<
         std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<fire_crab_evt::EventTable>>>,
     >;
+    static R: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
+    let key = std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string());
+    let reg = R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut g = reg.lock().unwrap_or_else(|e| e.into_inner());
+    std::sync::Arc::clone(g.entry(key).or_default())
+}
+
+/// LIVE ATTACHMENTS TO ONE DATABASE FILE - keyed the way the buffer
+/// pool, the lock table and the event table are, because the question it
+/// answers is about the FILE and not about a connection: **is anybody
+/// else attached?**
+///
+/// One switch asks it. `gfix -mode read_only|read_write` takes the
+/// database EXCLUSIVELY before it touches the header (`CCH_exclusive`,
+/// jrd.cpp:2181) and refuses when it cannot; every other gfix switch
+/// changes the header with attachments in place. Measured both ways
+/// against the live engine - `-write`, `-buffers` and `-housekeeping`
+/// succeed with an attachment held, `-mode` answers `isc_lock_timeout`
+/// + `isc_obj_in_use` and writes nothing.
+///
+/// The count is incremented by [load_database] and decremented when the
+/// `Database` is dropped, which happens when the connection's thread
+/// ends however it ends.
+///
+/// PER PROCESS, and that is a real difference: the engine's
+/// `CCH_exclusive` goes through the lock manager and sees attachments in
+/// OTHER processes. Every attachment to this server is a thread of it, so
+/// the two agree here - until a second fire-crab opens the same file,
+/// which the buffer pool and the lock table are no safer for. The
+/// converted `fire_crab_lck` table is where the cross-process version
+/// would go.
+fn attachments_for(path: &str) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    type Registry =
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicUsize>>>;
     static R: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
     let key = std::fs::canonicalize(path)
         .map(|p| p.to_string_lossy().into_owned())
@@ -833,12 +896,32 @@ impl Database {
     /// outstanding to make good - its unforced careful flush ends with
     /// `sync_all` over the whole file, so every page it has ever written
     /// is on the disk before this one runs.
-    fn apply_header_dpb(&mut self, want: &HeaderDpb) -> Result<Vec<String>, String> {
+    fn apply_header_dpb(&mut self, want: &HeaderDpb) -> Result<Vec<String>, HeaderDpbErr> {
         use fire_crab_ods::header::{hdr_clump, hdr_flags, store_clumplet, HeaderPage};
         if !want.any() {
             return Ok(Vec::new());
         }
-        let head = HeaderPage::decode(&self.bytes()).ok_or("no header page")?;
+        // THE MODE SWITCH TAKES THE DATABASE EXCLUSIVELY, AND IT DOES SO
+        // FIRST - before anything has decided whether the mode would even
+        // change. Measured: `gfix -mode read_only` on a database that is
+        // ALREADY read-only still answers "object ... is in use" while
+        // another attachment is open, so the check cannot be folded into
+        // the would-anything-move test below (which this server does
+        // early on purpose, so a no-op gfix writes no page).
+        if want.read_only.is_some()
+            && self.attachments.load(std::sync::atomic::Ordering::SeqCst) > 1
+        {
+            return Err(HeaderDpbErr::InUse(self.path.clone()));
+        }
+        // ...AND EVERY OTHER HEADER WRITE IS A WRITE. A read-only
+        // database answers `isc_read_only_database` for `-write`,
+        // `-buffers` and `-housekeeping` alike (measured; the sweep
+        // interval was left at its old value), while the mode itself
+        // still goes through - it is how the file gets out of read-only.
+        if want.any_but_mode() && self.is_read_only() {
+            return Err(HeaderDpbErr::ReadOnly);
+        }
+        let head = HeaderPage::decode(&self.bytes()).ok_or(HeaderDpbErr::NoHeader)?;
         let mut moves: Vec<String> = Vec::new();
 
         // Decide what would change BEFORE taking a work copy: an
@@ -849,6 +932,7 @@ impl Database {
         for (want_on, bit, name) in [
             (want.force_write, hdr_flags::FORCE_WRITE, "forced writes"),
             (want.no_reserve, hdr_flags::NO_RESERVE, "no reserve"),
+            (want.read_only, hdr_flags::READ_ONLY, "read only"),
         ] {
             if let Some(on) = want_on {
                 if (flags & bit != 0) != on {
@@ -878,7 +962,10 @@ impl Database {
             return Ok(moves);
         }
 
-        let mut work = self.work_copy()?;
+        // UNCHECKED, because the one write a read-only database allows is
+        // the one that clears the flag - and the check above has already
+        // refused every other item
+        let mut work = self.work_copy_unchecked().map_err(HeaderDpbErr::Other)?;
         work[22..24].copy_from_slice(&flags.to_le_bytes());
         if let Some(n) = buffers {
             work[32..36].copy_from_slice(&n.to_le_bytes());
@@ -890,9 +977,10 @@ impl Database {
                 page_size,
                 hdr_clump::SWEEP_INTERVAL,
                 &n.to_le_bytes(),
-            )?;
+            )
+            .map_err(HeaderDpbErr::Other)?;
         }
-        self.flush_and_install(work)?;
+        self.flush_and_install(work).map_err(HeaderDpbErr::Other)?;
         // the attachment holds no transaction here - this is a header
         // write on its own, and the write side goes back with it
         self.end_write();
@@ -970,6 +1058,26 @@ impl Database {
     /// write side is held, or two writers clone the same base and the
     /// second install silently drops the first's rows.
     fn work_copy(&mut self) -> Result<Vec<u8>, String> {
+        // A READ-ONLY DATABASE HAS NO WRITE PATH AT ALL, and this is the
+        // one funnel every write goes through - records, catalog rows,
+        // generators, index pages, the header's own clumplets. Refusing
+        // here is what makes the mode a property of the FILE rather than
+        // a list of statements somebody remembered to check: a path this
+        // server grows later cannot forget it. The statement families
+        // whose ERROR TEXT the engine specifies are refused earlier, with
+        // its own vector (see [EvalErr::ReadOnlyDatabase]); this is the
+        // floor under them.
+        if self.is_read_only() {
+            return Err("attempted update on read-only database".into());
+        }
+        self.work_copy_unchecked()
+    }
+
+    /// [Database::work_copy] without the read-only refusal - for the ONE
+    /// write a read-only database allows, which is the one that turns the
+    /// mode off again (`gfix -mode read_write`, measured to work on a
+    /// read-only file where `gfix -write sync` on the same file does not).
+    fn work_copy_unchecked(&mut self) -> Result<Vec<u8>, String> {
         self.take_write_side()?;
         // every write in this server starts here, so this is where the
         // transaction stops being a reader
@@ -1117,6 +1225,23 @@ impl Database {
             own.push(u64::from(tx));
         }
         own
+    }
+
+    /// Is this database READ-ONLY - `hdr_read_only` (0x20) in the header
+    /// page's flags, which is what `gfix -mode read_only` sets?
+    ///
+    /// Read off the image rather than cached, because the flag can be
+    /// turned off by another attachment while this one is open, and the
+    /// answer must be the file's and not this connection's memory of it.
+    fn is_read_only(&self) -> bool {
+        // THE TWO FLAG BYTES, not a decode of the whole header page. Every
+        // write asks this - a row-by-row statement asks it per row - and
+        // `hdr_flags` is at offset 22, which is where [Database::apply_header_dpb]
+        // writes it.
+        self.bytes()
+            .get(22..24)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .is_some_and(|f| f & fire_crab_ods::header::hdr_flags::READ_ONLY != 0)
     }
 
     /// Every id this transaction is answerable for at its end - its own
@@ -1736,11 +1861,17 @@ fn load_database(path: &str) -> Option<Database> {
     let lock_owner = locks.owner();
     let meta = crate::mdc::for_path(p);
     let events = events_for(p);
+    // ...and this attachment joins the file's count, which is what
+    // `gfix -mode` asks about (see [attachments_for]). The matching
+    // decrement is `impl Drop for Database`.
+    let attachments = attachments_for(p);
+    attachments.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     // the pool may have just RE-READ this file (a gate deleting and
     // re-creating its scratch database, the engine writing it): what
     // the cache holds was about the file that is gone
     meta.sync_epoch(shared.epoch());
     Some(Database {
+        attachments,
         shared,
         write: None,
         tx: None,
@@ -13218,6 +13349,15 @@ struct HeaderDpb {
     /// tag 22, `gfix -housekeeping N`: the HDR_sweep_interval CLUMPLET
     /// in the variable header, which a fresh database does not have
     sweep_interval: Option<i32>,
+    /// tag 64, `gfix -mode read_only|read_write`: hdr_read_only (0x20).
+    ///
+    /// THE ODD ONE OUT, in three ways the engine measures: it takes the
+    /// database EXCLUSIVELY first (so it refuses while anybody else is
+    /// attached, *even when the mode is already what it asks for*), it is
+    /// the one header write a READ-ONLY database still allows (every
+    /// other one answers `isc_read_only_database`), and it is what
+    /// decides whether the database answers a write at all.
+    read_only: Option<bool>,
 }
 
 impl HeaderDpb {
@@ -13226,6 +13366,73 @@ impl HeaderDpb {
             || self.no_reserve.is_some()
             || self.page_buffers.is_some()
             || self.sweep_interval.is_some()
+            || self.read_only.is_some()
+    }
+
+    /// Everything EXCEPT the mode - the items a read-only database
+    /// refuses.
+    fn any_but_mode(&self) -> bool {
+        self.force_write.is_some()
+            || self.no_reserve.is_some()
+            || self.page_buffers.is_some()
+            || self.sweep_interval.is_some()
+    }
+}
+
+/// WHY A HEADER DPB CAN BE REFUSED, and with which of the engine's own
+/// vectors - because gfix's exit status IS the attach's status, and a
+/// switch that silently did nothing is the failure this whole family of
+/// slices exists to avoid.
+///
+/// Both refusals were measured against the live engine, over TCP, with a
+/// second attachment held open through a fifo-fed isql (see
+/// `qa/serve-real-readonly.sh`).
+enum HeaderDpbErr {
+    /// `gfix -mode ...` while somebody else is attached: `isc_lock_timeout`
+    /// then `isc_obj_in_use` naming the FILE - "lock time-out on wait
+    /// transaction / -object <path> is in use", and the header unchanged.
+    /// Immediate, not after a wait (measured at 0s).
+    InUse(String),
+    /// any OTHER header switch on a read-only database: the bare
+    /// `isc_read_only_database`, the same vector a DML statement gets.
+    ReadOnly,
+    /// the file has no readable header page
+    NoHeader,
+    /// the write itself failed - a full header page, an I/O error
+    Other(String),
+}
+
+impl HeaderDpbErr {
+    /// Write the status vector this refusal ships, into an op_response
+    /// the attach answers with.
+    fn write_items(&self, w: &mut W) {
+        match self {
+            HeaderDpbErr::InUse(path) => {
+                w.int(1) // isc_arg_gds
+                    .int(GDS_LOCK_TIMEOUT)
+                    .int(1) // isc_arg_gds
+                    .int(GDS_OBJ_IN_USE)
+                    .int(2) // isc_arg_string - the object, which is the file
+                    .bytes(path.as_bytes());
+            }
+            HeaderDpbErr::ReadOnly => {
+                w.int(1).int(GDS_READ_ONLY_DATABASE);
+            }
+            HeaderDpbErr::NoHeader | HeaderDpbErr::Other(_) => {
+                w.int(1).int(GDS_DSQL_ERROR);
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for HeaderDpbErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HeaderDpbErr::InUse(p) => write!(f, "object {} is in use", p),
+            HeaderDpbErr::ReadOnly => f.write_str("attempted update on read-only database"),
+            HeaderDpbErr::NoHeader => f.write_str("no header page"),
+            HeaderDpbErr::Other(e) => f.write_str(e),
+        }
     }
 }
 
@@ -13253,6 +13460,7 @@ fn parse_dpb_header(dpb: &[u8]) -> HeaderDpb {
             27 => want.no_reserve = Some(v != 0),
             61 => want.page_buffers = Some(v as u32),
             22 => want.sweep_interval = Some(v as i32),
+            64 => want.read_only = Some(v != 0),
             _ => {}
         }
         i = end;
@@ -14696,6 +14904,20 @@ fn execute_dml_collecting_inner(
         return Err(ExecErr::Eval(e.clone()));
     }
     let db = database.as_mut().ok_or("no database attached")?;
+    // A READ-ONLY DATABASE REFUSES EVERY STATEMENT THAT WOULD WRITE, and
+    // in the ENGINE'S OWN TWO SHAPES: a DML statement gets the code
+    // alone, a DDL statement gets it behind `isc_dsql_error` because the
+    // engine refuses that one at prepare (see
+    // [EvalErr::ReadOnlyDatabase]). [Database::work_copy] refuses
+    // underneath this as the floor; what this adds is the vector, which
+    // is what a client acts on.
+    if db.is_read_only() {
+        let dsql = !matches!(
+            plan,
+            Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
+        );
+        return Err(ExecErr::Eval(EvalErr::ReadOnlyDatabase { dsql }));
+    }
     // THE WRITE SIDE COMES FIRST, and the working copy is taken under
     // it: two writers that clone the same base both install a whole
     // image, and the second one silently drops the first's rows. The
@@ -15608,7 +15830,23 @@ fn flush_careful(path: &str, before: &[u8], after: &[u8], page_size: usize) -> R
     let flags = fire_crab_ods::header::HeaderPage::decode(&after[..page_size.min(after.len())])
         .map(|h| h.flags)
         .unwrap_or(0);
-    let plan = fire_crab_pio::plan_for_header(flags, false);
+    let mut plan = fire_crab_pio::plan_for_header(flags, false);
+    // ...AND READ-ONLY IS THE OTHER WAY ROUND, because it decides whether
+    // this process may write the file AT ALL and the mode SWITCH is
+    // itself a write. Taking it from the image about to be written made
+    // `gfix -mode read_only` refuse the very page that says "read only" -
+    // the flush opened the file read-only and then could not write it -
+    // and taking it from the image on disk would refuse `-mode
+    // read_write` for the mirror-image reason. So the rule is the
+    // TRANSITION: a flush that CHANGES the bit is the switch and opens
+    // read-write; a flush that leaves it set is an ordinary write to a
+    // read-only file and must not happen (see [Database::work_copy],
+    // which is what stops it before it gets here).
+    let ro_before = fire_crab_ods::header::HeaderPage::decode(&before[..page_size.min(before.len())])
+        .map(|h| h.flags & fire_crab_ods::header::hdr_flags::READ_ONLY != 0)
+        .unwrap_or(false);
+    plan.read_only = plan.read_only && ro_before;
+    let plan = plan;
     let forced = plan.force_write;
     let pio = fire_crab_pio::Pio::open(path, page_size as u32, plan)?;
     for page in &order {
@@ -18263,6 +18501,24 @@ fn plan_join_bound(
 fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
     let mut params = Vec::new();
     let planned = timed("plan:query-inner", || plan_query_inner(sql, db, &mut params));
+    // A SELECT THAT DRAWS A GENERATOR IS A WRITE, and a read-only
+    // database refuses it with the engine's own vector - the same bare
+    // `isc_read_only_database` a DML statement gets (measured: `SELECT
+    // NEXT VALUE FOR G FROM RDB$DATABASE` on a read-only file, while
+    // `SELECT GEN_ID(G, 0)` - the zero-increment READ - answers 0).
+    //
+    // Here rather than at the draw: the value is drawn while the rows are
+    // being built, where nothing can be un-answered, and a draw the file
+    // will not accept must not reach a row at all. Without it the client
+    // was told a number the sequence never moved to.
+    if let (Some(p), Some(d)) = (planned.as_ref(), db.as_ref()) {
+        if plan_draws_generator(p) && d.is_read_only() {
+            return (
+                Plan::RefusedEval(EvalErr::ReadOnlyDatabase { dsql: false }),
+                Vec::new(),
+            );
+        }
+    }
     match (planned, params.into_iter().collect::<Option<Vec<_>>>()) {
         (Some(p), Some(ps)) => (p, ps),
         // A QUERY THIS SERVER CANNOT PLAN RAISES. It used to answer
@@ -19501,6 +19757,17 @@ fn branch_rows(
 /// - and an argument-less conversion error renders as the engine's
 /// unfilled message template at the user. The distinction is the whole
 /// point of this variant: [EvalErr::Unsupported] for the first, the
+/// Does this plan ADVANCE a generator when it runs? `Plan::Project` is
+/// the only carrier (`gen_cols`), and the modifiers wrap it - which is
+/// why this recurses rather than matching one shape.
+fn plan_draws_generator(plan: &Plan) -> bool {
+    match plan {
+        Plan::Project { gen_cols, .. } => !gen_cols.is_empty(),
+        Plan::Modified { inner, .. } => plan_draws_generator(inner),
+        _ => false,
+    }
+}
+
 /// row's own error for the second.
 fn branch_rows_res(
     plan: &Plan,
@@ -24506,6 +24773,12 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
             w.int(1) // isc_arg_gds
                 .int(GDS_INTEGER_OVERFLOW);
         }
+        EvalErr::ReadOnlyDatabase { dsql } => {
+            if *dsql {
+                w.int(1).int(GDS_DSQL_ERROR);
+            }
+            w.int(1).int(GDS_READ_ONLY_DATABASE);
+        }
         EvalErr::AtProcedure { inner, at } => {
             eval_status_items(w, inner);
             for line in at {
@@ -28524,6 +28797,30 @@ enum EvalErr {
     /// VARCHAR variable and a literal `''` give the identical vector,
     /// because concatenation with NULL is NULL and both arrive empty).
     EmptyStatementText,
+    /// A WRITE ON A READ-ONLY DATABASE: `isc_read_only_database`
+    /// ("attempted update on read-only database", SQLSTATE 42000).
+    ///
+    /// `dsql` chooses between the two shapes the engine ships, and it is
+    /// not a detail - MEASURED, one statement at a time, against a
+    /// database `gfix -mode read_only` had marked:
+    ///
+    ///   * a DML statement, an identity draw, a `NEXT VALUE FOR` and an
+    ///     `EXECUTE BLOCK` that writes all get the code ALONE (the block
+    ///     adds its own `At block line` item on top, which this server's
+    ///     wrapper already does);
+    ///   * `CREATE TABLE`/`VIEW`/`SEQUENCE`, `COMMENT ON`, `GRANT`,
+    ///     `SET GENERATOR` and `ALTER SEQUENCE ... RESTART` are refused
+    ///     at PREPARE and carry `isc_dsql_error` in front of it -
+    ///     "Dynamic SQL Error / -attempted update on read-only database".
+    ///
+    /// Not covered, and recorded in the gate instead: `ALTER TABLE` and
+    /// `DROP TABLE` are refused INSIDE the metadata machinery and come
+    /// wrapped in `isc_no_meta_update` + "<statement> failed" - and DROP
+    /// carries the Dynamic SQL Error inside that wrapper where ALTER does
+    /// not. This server has no `no_meta_update` wrapper for ANY DDL
+    /// failure yet, so those two shapes are a boundary rather than a
+    /// guess.
+    ReadOnlyDatabase { dsql: bool },
     /// a scalar subquery answered MORE THAN ONE ROW - the engine's
     /// `isc_sing_select_err`, "multiple rows in singleton select"
     /// (SQLSTATE 21000). Taking the first row would be a wrong answer
@@ -38990,10 +39287,22 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         }
                     );
                 }
+                // THE ATTACH FAILS, and that is the whole point: gfix's
+                // exit status IS its attach's status, so a refusal that
+                // only got traced left the switch silently doing nothing
+                // and the tool saying it had worked (rc=0). The engine
+                // answers the refusal here and detaches, and so does
+                // this.
                 Err(e) => {
                     if std::env::var("FC_SRV_TRACE").is_ok() {
-                        eprintln!("[srv] header dpb failed: {}", e);
+                        eprintln!("[srv] header dpb refused: {}", e);
                     }
+                    let mut w = W::default();
+                    w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+                    e.write_items(&mut w);
+                    w.int(0); // isc_arg_end
+                    w.send(&mut s, &mut enc)?;
+                    return Ok(());
                 }
                 _ => {}
             }
@@ -40081,7 +40390,22 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             if std::env::var("FC_SRV_TRACE").is_ok() {
                                 eprintln!("[srv] gen_id increment failed: {}", e);
                             }
-                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                            // A DRAW IS A WRITE, so on a read-only
+                            // database it is the engine's own refusal and
+                            // not a generic SQL error - the bare
+                            // `isc_read_only_database`, the same vector
+                            // `INSERT` gets (measured: `SELECT NEXT VALUE
+                            // FOR G` on a read-only file, while `GEN_ID(G,
+                            // 0)` - which draws nothing - answers).
+                            if database.as_ref().is_some_and(|d| d.is_read_only()) {
+                                respond_eval_error(
+                                    &mut s,
+                                    &mut enc,
+                                    &EvalErr::ReadOnlyDatabase { dsql: false },
+                                )?;
+                            } else {
+                                respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                            }
                         }
                     }
                 } else if let Err(e) = validate_select_bind(&*plan, &bound_args) {
@@ -42210,6 +42534,7 @@ mod tests {
         dpb.extend_from_slice(&500u32.to_le_bytes()); // ...little-endian
         dpb.extend_from_slice(&[22, 4]); // sweep interval...
         dpb.extend_from_slice(&12345i32.to_le_bytes());
+        dpb.extend_from_slice(&[64, 1, 1]); // set_db_readonly = read_only
         dpb.extend_from_slice(&[48, 5, b'U', b'T', b'F', b'8', 0]); // lc_ctype, ignored here
         assert_eq!(
             parse_dpb_header(&dpb),
@@ -42218,8 +42543,21 @@ mod tests {
                 no_reserve: Some(true),
                 page_buffers: Some(500),
                 sweep_interval: Some(12345),
+                read_only: Some(true),
             }
         );
+        // ...and the mode's OTHER direction is a zero byte, not an absent
+        // item: `gfix -mode read_write` sends tag 64 with 0, which must
+        // read as Some(false) and not as None (which would make the
+        // switch do nothing at all).
+        assert_eq!(
+            parse_dpb_header(&[1u8, 64, 1, 0]).read_only,
+            Some(false)
+        );
+        // the mode is the only item that needs the database to itself,
+        // so it is also the only one `any_but_mode` leaves out
+        let mode_only = parse_dpb_header(&[1u8, 64, 1, 1]);
+        assert!(mode_only.any() && !mode_only.any_but_mode());
 
         // an ordinary client's dpb asks for none of it, and must not be
         // read as asking for zero
@@ -42252,6 +42590,7 @@ mod tests {
             lock_owner: 0,
             image_undo: false,
             ddl_undo: false,
+            attachments: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             nested_tx: Vec::new(),
             page_size: 8192,
             path: String::new(),
@@ -45065,6 +45404,7 @@ mod tests {
             lock_owner: 0,
             image_undo: false,
             ddl_undo: false,
+            attachments: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             nested_tx: Vec::new(),
             page_size: 4096,
             path: String::new(),
@@ -51186,6 +51526,7 @@ mod tests {
             lock_owner: 0,
             image_undo: false,
             ddl_undo: false,
+            attachments: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             nested_tx: Vec::new(),
             page_size: 4096,
             path: String::new(),
