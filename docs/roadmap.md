@@ -2696,13 +2696,29 @@ plus *the subsystem is now on the path*.
   which made gfix report success (rc=0) for a switch that changed
   nothing.
 
-  What is left of gfix is now only the page-walking and multi-attachment
-  half: `-shut`/`-online` (`isc_dpb_shutdown`/`isc_dpb_online`, a mode
-  plus a delay, and the attachment refusals that go with them - the
-  attachment REGISTRY that `-mode` needed is in place now, which is most
-  of what `-shut -attach` asks about), `-sweep` and `-validate` (whole
-  page walks - `fcstat census` already does the reading half offline),
-  and the limbo-transaction switches, which need two-phase commit first.
+  *(fourth slice done)* **`-shut`/`-online`** - the mode ladder over
+  `hdr_shutdown_mode` (the byte at offset 25), and everything around it
+  that had to be measured: the ladder is STRICT in both directions and
+  the SAME mode again is refused (the source's `same_mode` reads as if
+  it succeeds; this build's IGNORE_SAME_MODE is compiled false); a bare
+  `-shut` is MULTI where a bare `-online` is NORMAL (mode bits 0x00,
+  normalized at DPB-parse time - jrd.cpp:7187 - one file away from the
+  validation that would refuse it); FULL refuses every attach except one
+  carrying the mode switches themselves; SINGLE holds one attachment and
+  even `-online` is a second attach while the slot is held; and a FORCED
+  shutdown KICKS - each survivor's next statement answers 08003
+  `connection shutdown` / `-Database is shutdown.`, implemented as a
+  generation number on the per-file gate because "kicked" is relative.
+  `-attach N`/`-tran N` with a stayer fail with `isc_shutfail` and write
+  nothing. 42 checks in `qa/serve-real-shutdown.sh`. The locksmith half
+  is vacuous here (fcwire authenticates one configured user), and the
+  engine counts READ transactions in `-tran`'s wait where fire-crab has
+  ids only for writers - both named in the gate.
+
+  What is left of gfix is the page-walking half: `-sweep` and
+  `-validate` (whole page walks - `fcstat census` already does the
+  reading half offline), and the limbo-transaction switches, which need
+  two-phase commit first.
 
 ## A savepoint is a transaction (done)
 

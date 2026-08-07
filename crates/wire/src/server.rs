@@ -207,6 +207,25 @@ fn respond_error(s: &mut TcpStream, enc: &mut Option<Rc4>, gds: i32) -> std::io:
     w.send(s, enc)
 }
 
+/// The vector a KICKED attachment's next statement answers - measured on
+/// a held isql whose next SELECT after a `gfix -shut -force 0` printed
+/// `SQLSTATE = 08003 / connection shutdown / -Database is shutdown.`:
+/// `isc_att_shutdown` with `isc_att_shut_db_down` as the reason item.
+fn respond_kicked(s: &mut TcpStream, enc: &mut Option<Rc4>) -> std::io::Result<()> {
+    let mut w = W::default();
+    w.int(OP_RESPONSE)
+        .int(0)
+        .int(0)
+        .int(0) // blob id
+        .int(0) // response data length
+        .int(1) // isc_arg_gds
+        .int(GDS_ATT_SHUTDOWN)
+        .int(1) // isc_arg_gds
+        .int(GDS_ATT_SHUT_DB_DOWN)
+        .int(0); // isc_arg_end
+    w.send(s, enc)
+}
+
 /// isc_dsql_error - the generic "Dynamic SQL Error" the server answers
 /// for statements it cannot honour rather than answering them wrong.
 const GDS_DSQL_ERROR: i32 = 335544569;
@@ -227,6 +246,26 @@ const GDS_LOCK_TIMEOUT: i32 = 335544510;
 /// `isc_obj_in_use` - "object @1 is in use", the second item of that
 /// pair, and its argument is the database FILE.
 const GDS_OBJ_IN_USE: i32 = 335544453;
+
+/// `isc_shutdown` - "database @1 shutdown" (HY000): what an attach to a
+/// shut-down database answers - every attach under FULL, a second one
+/// under SINGLE.
+const GDS_SHUTDOWN: i32 = 335544528;
+/// `isc_shutfail` - "database shutdown unsuccessful" (HY000): a `-shut
+/// -attach N` / `-tran N` whose wait ran out.
+const GDS_SHUTFAIL: i32 = 335544557;
+/// `isc_bad_shutdown_mode` - `Target shutdown mode is invalid for
+/// database "@1"` (08007, the quotes live in the message template): a
+/// transition the mode ladder refuses - INCLUDING the same mode again,
+/// measured (the source's IGNORE_SAME_MODE reads as if it succeeds;
+/// this build refuses).
+const GDS_BAD_SHUTDOWN_MODE: i32 = 335544835;
+/// `isc_att_shutdown` - "connection shutdown" (08003): what a KICKED
+/// attachment's next statement answers...
+const GDS_ATT_SHUTDOWN: i32 = 335544856;
+/// `isc_att_shut_db_down` - "Database is shutdown." - ...with this as
+/// the reason item behind it (measured on a held isql).
+const GDS_ATT_SHUT_DB_DOWN: i32 = 335545132;
 
 /// isc_lock_conflict - "lock conflict on no wait transaction", the
 /// engine's answer when a wait it will not make would be needed
@@ -592,10 +631,17 @@ struct Database {
     /// written counts only committed work.
     tx: Option<u32>,
     /// how many attachments this FILE has right now, this one included -
-    /// see [attachments_for]. Held as a handle so the count follows the
-    /// connection's life without anybody having to remember to
-    /// decrement it (see `impl Drop for Database`).
-    attachments: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// see [attachments_for] and [DbGate]. Held as a handle so the count
+    /// follows the connection's life without anybody having to remember
+    /// to decrement it (see `impl Drop for Database`).
+    attachments: std::sync::Arc<DbGate>,
+    /// the kick generation this attachment was made under; older than
+    /// the gate's current one = a forced shutdown has told this
+    /// attachment to go (see [DbGate::kick_gen])
+    my_kick_gen: u64,
+    /// whether this attachment currently counts in [DbGate::active_tx] -
+    /// set at its transaction's first write, cleared when it ends
+    counted_tx: bool,
     /// EVERY NESTED ID THIS TRANSACTION HAS RESERVED and not killed -
     /// one per undo window that wrote (see [UndoWindow]).
     ///
@@ -694,7 +740,17 @@ struct Database {
 /// reads a number that no error path can leave too high.
 impl Drop for Database {
     fn drop(&mut self) {
-        self.attachments.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        // a transaction this connection still counts ends with it
+        if self.counted_tx {
+            self.attachments.active_tx.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        // A KICKED attachment was already taken off the count BY THE
+        // SHUTDOWN that kicked it (which set the count to its own 1) -
+        // decrementing again would let the count go stale low, and the
+        // single-user attach test reads it.
+        if !self.kicked() {
+            self.attachments.attaches.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
@@ -739,9 +795,8 @@ fn events_for(path: &str) -> std::sync::Arc<std::sync::Mutex<fire_crab_evt::Even
 /// which the buffer pool and the lock table are no safer for. The
 /// converted `fire_crab_lck` table is where the cross-process version
 /// would go.
-fn attachments_for(path: &str) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
-    type Registry =
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicUsize>>>;
+fn attachments_for(path: &str) -> std::sync::Arc<DbGate> {
+    type Registry = std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<DbGate>>>;
     static R: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
     let key = std::fs::canonicalize(path)
         .map(|p| p.to_string_lossy().into_owned())
@@ -749,6 +804,31 @@ fn attachments_for(path: &str) -> std::sync::Arc<std::sync::atomic::AtomicUsize>
     let reg = R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut g = reg.lock().unwrap_or_else(|e| e.into_inner());
     std::sync::Arc::clone(g.entry(key).or_default())
+}
+
+/// WHO IS AT ONE DATABASE FILE, for the questions only a shutdown asks:
+/// how many attachments, how many open transactions among them, and the
+/// KICK - the announcement a forced shutdown makes to every attachment
+/// but its own.
+///
+/// The kick is a GENERATION NUMBER rather than a flag, because "kicked"
+/// is relative: an attachment made after the shutdown is not kicked by
+/// it (the header's mode governs it instead), and a second shutdown
+/// kicks the survivors of the first. Each attachment records the
+/// generation it attached under; one that reads a NEWER generation has
+/// been told to go, and its next statement answers the engine's own
+/// vector (`isc_att_shutdown` / "Database is shutdown.") - measured on a
+/// held isql whose next SELECT got exactly that, SQLSTATE 08003.
+#[derive(Default)]
+struct DbGate {
+    /// live attachments to this file, this process
+    attaches: std::sync::atomic::AtomicUsize,
+    /// how many of them hold an open transaction right now - what
+    /// `gfix -shut -tran N` waits on
+    active_tx: std::sync::atomic::AtomicUsize,
+    /// bumped by a forced shutdown; an attachment whose recorded value
+    /// is older has been kicked
+    kick_gen: std::sync::atomic::AtomicU64,
 }
 
 /// One listener's AUXILIARY CONNECTION - the second socket an event
@@ -909,7 +989,7 @@ impl Database {
         // the would-anything-move test below (which this server does
         // early on purpose, so a no-op gfix writes no page).
         if want.read_only.is_some()
-            && self.attachments.load(std::sync::atomic::Ordering::SeqCst) > 1
+            && self.attachments.attaches.load(std::sync::atomic::Ordering::SeqCst) > 1
         {
             return Err(HeaderDpbErr::InUse(self.path.clone()));
         }
@@ -1186,6 +1266,7 @@ impl Database {
             return;
         }
         self.hold_tx_lock(tx);
+        self.note_tx_begun();
         match self.owning_window() {
             Some(i) => {
                 self.windows[i].tx = Some(tx);
@@ -1225,6 +1306,31 @@ impl Database {
             own.push(u64::from(tx));
         }
         own
+    }
+
+    /// Has a forced shutdown told this attachment to go? Its next
+    /// statement answers `isc_att_shutdown` and does no work - see
+    /// [DbGate::kick_gen].
+    fn kicked(&self) -> bool {
+        self.my_kick_gen
+            < self.attachments.kick_gen.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The header's shutdown mode - `hdr_shutdown_mode`, the byte at
+    /// offset 25 (ods.h:647): 0 none, 1 multi, 2 single, 3 full. Read
+    /// off the image like [Database::is_read_only], and for the same
+    /// reason: another attachment can change it while this one is open.
+    fn shutdown_mode(&self) -> u8 {
+        self.bytes().get(25).copied().unwrap_or(0)
+    }
+
+    /// This attachment's transaction became real - count it where
+    /// `gfix -shut -tran N` looks (see [DbGate::active_tx]).
+    fn note_tx_begun(&mut self) {
+        if !self.counted_tx {
+            self.attachments.active_tx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.counted_tx = true;
+        }
     }
 
     /// Is this database READ-ONLY - `hdr_read_only` (0x20) in the header
@@ -1351,6 +1457,10 @@ impl Database {
         self.image_undo = false;
         self.ddl_undo = false;
         self.nested_tx.clear();
+        if self.counted_tx {
+            self.attachments.active_tx.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            self.counted_tx = false;
+        }
         // the autonomous carve-out has done its work: those pages are on
         // the disk, and no undo of a LATER transaction reaches back past
         // a snapshot taken after them
@@ -1865,13 +1975,16 @@ fn load_database(path: &str) -> Option<Database> {
     // `gfix -mode` asks about (see [attachments_for]). The matching
     // decrement is `impl Drop for Database`.
     let attachments = attachments_for(p);
-    attachments.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    attachments.attaches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let my_kick_gen = attachments.kick_gen.load(std::sync::atomic::Ordering::SeqCst);
     // the pool may have just RE-READ this file (a gate deleting and
     // re-creating its scratch database, the engine writing it): what
     // the cache holds was about the file that is gone
     meta.sync_epoch(shared.epoch());
     Some(Database {
         attachments,
+        my_kick_gen,
+        counted_tx: false,
         shared,
         write: None,
         tx: None,
@@ -13379,6 +13492,108 @@ impl HeaderDpb {
     }
 }
 
+impl Database {
+    /// Perform the `-shut`/`-online` an attach's DPB asked for - what
+    /// `SHUT_database`/`SHUT_online` (jrd/shut.cpp) do, reduced to the
+    /// halves this server has: the mode ladder, the wait, the kick, and
+    /// the header byte.
+    ///
+    /// THE LADDER IS STRICT IN BOTH DIRECTIONS, and that was measured
+    /// rather than read: a `-shut` must TIGHTEN (none < multi < single <
+    /// full) and an `-online` must LOOSEN, and the SAME mode again is
+    /// refused too - `gfix -shut multi -force 0` twice answers `Target
+    /// shutdown mode is invalid` the second time, though shut.cpp's
+    /// `same_mode` reads as if it silently succeeds (its IGNORE_SAME_MODE
+    /// is compiled false in this build).
+    ///
+    /// The wait: `-attach N` waits up to N seconds for the OTHER
+    /// attachments to leave, `-tran N` for their open transactions to
+    /// end, and refuses with `isc_shutfail` when the wait runs out -
+    /// header untouched. `-force N` waits and then KICKS: the gate's
+    /// generation is bumped, every other attachment's next statement
+    /// answers `isc_att_shutdown`, and the count becomes this
+    /// attachment's own 1 (the engine purges them; a kicked zombie must
+    /// not keep the single-user slot occupied). The successful -attach
+    /// and -tran forms kick too, as the engine's final force-notify
+    /// does - a straggler that raced the wait is told to go rather than
+    /// left inside a database whose header now says shut.
+    fn apply_shutdown_dpb(&mut self, want: &ShutDpb) -> Result<String, HeaderDpbErr> {
+        use std::sync::atomic::Ordering;
+        let current = self.shutdown_mode();
+        let bad = || HeaderDpbErr::BadShutdownMode(self.path.clone());
+        let (target, is_shut, flags) = if let Some(b) = want.shutdown {
+            let target = shut_mode_rank(b).ok_or_else(bad)?;
+            (target, true, b & 0x0e)
+        } else if let Some(b) = want.online {
+            // an online byte with NO mode bits is NORMAL - not a
+            // refusal: the engine normalizes it at DPB-parse time
+            // (jrd.cpp:7187 "Enforce default"), and plain `gfix -online`
+            // sends exactly that byte (measured: 0x00)
+            let b = if b & 0x70 == 0 { b | 0x10 } else { b };
+            (shut_mode_rank(b).ok_or_else(bad)?, false, 0)
+        } else {
+            return Ok(String::new());
+        };
+        // the ladder: tighten by -shut, loosen by -online, never stand still
+        if is_shut {
+            if target <= current {
+                return Err(bad());
+            }
+        } else if target >= current {
+            return Err(bad());
+        }
+        // THE WAIT, for the two flags that have one. `-force` waits too,
+        // but cannot fail - when the delay runs out it kicks.
+        let gate = &self.attachments;
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(want.delay.max(0) as u64);
+        let others_left = |g: &DbGate| g.attaches.load(Ordering::SeqCst) <= 1;
+        let tx_done = |g: &DbGate| g.active_tx.load(Ordering::SeqCst) == 0;
+        if is_shut {
+            let (wait_ok, what): (&dyn Fn(&DbGate) -> bool, &str) = if flags & 0x2 != 0 {
+                (&others_left, "attachments")
+            } else if flags & 0x4 != 0 {
+                (&tx_done, "transactions")
+            } else {
+                // -force, or an API caller with no flag: the engine's
+                // loop breaks straight to the forced notify either way
+                (&others_left, "force")
+            };
+            while !wait_ok(gate) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if !wait_ok(gate) && flags & (0x2 | 0x4) != 0 {
+                let _ = what;
+                return Err(HeaderDpbErr::ShutFail);
+            }
+            // THE KICK - unconditional on the successful path, as the
+            // engine's closing force-notify is: whoever is still here
+            // is told to go, and the count becomes this attachment's own
+            let gen = gate.kick_gen.fetch_add(1, Ordering::SeqCst) + 1;
+            self.my_kick_gen = gen;
+            gate.attaches.store(1, Ordering::SeqCst);
+            gate.active_tx.store(0, Ordering::SeqCst);
+            if self.counted_tx {
+                // ours was zeroed with the rest; re-count it
+                gate.active_tx.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        // the byte itself - offset 25, and the write is exempt from the
+        // read-only refusal exactly as the mode switch is (SHUT_database
+        // never calls ensureDbWritable)
+        let mut work = self.work_copy_unchecked().map_err(HeaderDpbErr::Other)?;
+        work[25] = target;
+        self.flush_and_install(work).map_err(HeaderDpbErr::Other)?;
+        self.end_write();
+        Ok(format!(
+            "shutdown mode {} -> {} ({})",
+            current,
+            target,
+            if is_shut { "shut" } else { "online" }
+        ))
+    }
+}
+
 /// WHY A HEADER DPB CAN BE REFUSED, and with which of the engine's own
 /// vectors - because gfix's exit status IS the attach's status, and a
 /// switch that silently did nothing is the failure this whole family of
@@ -13396,6 +13611,13 @@ enum HeaderDpbErr {
     /// any OTHER header switch on a read-only database: the bare
     /// `isc_read_only_database`, the same vector a DML statement gets.
     ReadOnly,
+    /// a shutdown-mode transition off the ladder - including the same
+    /// mode again (measured): `isc_bad_shutdown_mode`, the FILE as its
+    /// argument, the quotes around it living in the message template
+    BadShutdownMode(String),
+    /// a `-shut -attach N`/`-tran N` whose wait ran out: `isc_shutfail`,
+    /// no arguments, and the header untouched
+    ShutFail,
     /// the file has no readable header page
     NoHeader,
     /// the write itself failed - a full header page, an I/O error
@@ -13418,6 +13640,15 @@ impl HeaderDpbErr {
             HeaderDpbErr::ReadOnly => {
                 w.int(1).int(GDS_READ_ONLY_DATABASE);
             }
+            HeaderDpbErr::BadShutdownMode(path) => {
+                w.int(1)
+                    .int(GDS_BAD_SHUTDOWN_MODE)
+                    .int(2) // isc_arg_string - the file; the template quotes it
+                    .bytes(path.as_bytes());
+            }
+            HeaderDpbErr::ShutFail => {
+                w.int(1).int(GDS_SHUTFAIL);
+            }
             HeaderDpbErr::NoHeader | HeaderDpbErr::Other(_) => {
                 w.int(1).int(GDS_DSQL_ERROR);
             }
@@ -13430,6 +13661,10 @@ impl std::fmt::Display for HeaderDpbErr {
         match self {
             HeaderDpbErr::InUse(p) => write!(f, "object {} is in use", p),
             HeaderDpbErr::ReadOnly => f.write_str("attempted update on read-only database"),
+            HeaderDpbErr::BadShutdownMode(p) => {
+                write!(f, "target shutdown mode is invalid for database \"{}\"", p)
+            }
+            HeaderDpbErr::ShutFail => f.write_str("database shutdown unsuccessful"),
             HeaderDpbErr::NoHeader => f.write_str("no header page"),
             HeaderDpbErr::Other(e) => f.write_str(e),
         }
@@ -13468,7 +13703,79 @@ fn parse_dpb_header(dpb: &[u8]) -> HeaderDpb {
     want
 }
 
-/// Whether a column can be a parameter target: everything the wire
+/// What an attach's DPB asks the SHUTDOWN machinery - kept apart from
+/// [HeaderDpb] because these are not "write a header field": they have a
+/// transition ladder, a wait, and a kick.
+///
+/// `gfix -shut <mode> -force|-attach|-tran N` is `isc_dpb_shutdown` (50,
+/// a byte: flag bits 0x2 attach / 0x4 tran / 0x8 force, mode bits 0x70)
+/// plus `isc_dpb_shutdown_delay` (52, an int). `gfix -online [<mode>]`
+/// is `isc_dpb_online` (51, a byte of mode bits alone). alice/exe.cpp
+/// builds all three.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct ShutDpb {
+    /// tag 50: the mode+flags byte of a `-shut`
+    shutdown: Option<u8>,
+    /// tag 52: the `-force/-attach/-tran` delay, seconds
+    delay: i32,
+    /// tag 51: the mode byte of an `-online`
+    online: Option<u8>,
+}
+
+impl ShutDpb {
+    fn any(&self) -> bool {
+        self.shutdown.is_some() || self.online.is_some()
+    }
+}
+
+/// Read the shutdown items out of a DPB, in the same walk shape as
+/// [parse_dpb_header].
+fn parse_dpb_shut(dpb: &[u8]) -> ShutDpb {
+    let mut want = ShutDpb::default();
+    if dpb.first() != Some(&1) {
+        return want;
+    }
+    let mut i = 1;
+    while i + 1 < dpb.len() {
+        let (tag, len) = (dpb[i], dpb[i + 1] as usize);
+        let end = i + 2 + len;
+        if end > dpb.len() {
+            break;
+        }
+        let mut v: u64 = 0;
+        for (k, b) in dpb[i + 2..end].iter().enumerate() {
+            v |= (*b as u64) << (8 * k);
+        }
+        match tag {
+            50 => want.shutdown = Some(v as u8),
+            51 => want.online = Some(v as u8),
+            52 => want.delay = v as i32,
+            _ => {}
+        }
+        i = end;
+    }
+    want
+}
+
+/// THE MODE LADDER: none 0, multi 1, single 2, full 3 - both the header
+/// byte's own values (ods.h:738-741) and the SEVERITY ORDER the
+/// transitions are judged by.
+///
+/// The dpb spells a mode differently (0x10 normal / 0x20 multi / 0x30
+/// single / 0x40 full, isc_dpb_shut_mode_mask 0x70), and a `-shut` with
+/// NO mode bits is MULTI - the legacy `gfix -shut -force 0` form,
+/// measured ("multi-user maintenance").
+fn shut_mode_rank(dpb_bits: u8) -> Option<u8> {
+    match dpb_bits & 0x70 {
+        0x00 | 0x20 => Some(1), // default = multi (measured), multi
+        0x10 => Some(0),        // normal - only -online can name it
+        0x30 => Some(2),        // single
+        0x40 => Some(3),        // full
+        _ => None,
+    }
+}
+
+/// Whether a column can be a parameter target: everything the wire/// Whether a column can be a parameter target: everything the wire
 /// value encoder can produce bytes for. Blob columns would need the
 /// blob-write ops, and INT128/DECFLOAT/TZ an encoder for their layouts
 /// - a plan naming one is refused, never half-supported.
@@ -37091,6 +37398,7 @@ fn run_autonomous(
         // it (and nothing outside it)
         d.windows[mark].tx = Some(tx as u32);
         d.hold_tx_lock(tx as u32);
+        d.note_tx_begun();
         Ok(tx)
     })();
     let tx_opened = match opened {
@@ -39241,6 +39549,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     let dpb = read_wire_bytes(&mut s, &mut dec)?;
     let att_cs = parse_dpb_lc_ctype(&dpb);
     let want_header = parse_dpb_header(&dpb);
+    let want_shut = parse_dpb_shut(&dpb);
     // the name the client attached to, then the FILE it denotes: a name
     // matching a databases.conf alias resolves to that alias's path,
     // exactly as the engine resolves it (so `employee` reaches the
@@ -39269,6 +39578,66 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // client attached to a name with no file behind it), the server falls
     // back to the fixed constant so the pipeline still round-trips.
     let mut database: Option<Database> = load_database(&db_path);
+    // A SHUT-DOWN DATABASE REFUSES THE ATTACH ITSELF, before any of the
+    // DPB's work - and the order of the two exemptions was MEASURED, not
+    // assumed: an attach carrying `-shut`/`-online` gets past the FULL
+    // deny (that is how a full-shut database is ever brought back), but
+    // NOT past the single-user slot - `gfix -online` on a single-shut
+    // database somebody is attached to answers "database ... shutdown"
+    // like any other second attach. `isc_shutdown` carries the FILE.
+    if let Some(db) = database.as_ref() {
+        let mode = db.shutdown_mode();
+        let single_held = mode == 2
+            && db
+                .attachments
+                .attaches
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 1;
+        let full_denied = mode == 3 && !want_shut.any();
+        if single_held || full_denied {
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                eprintln!(
+                    "[srv] attach refused: shutdown mode {} ({})",
+                    mode,
+                    if single_held { "single-user slot held" } else { "full" }
+                );
+            }
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1) // isc_arg_gds
+                .int(GDS_SHUTDOWN)
+                .int(2) // isc_arg_string - the file
+                .bytes(db.path.as_bytes());
+            w.int(0); // isc_arg_end
+            w.send(&mut s, &mut enc)?;
+            return Ok(());
+        }
+    }
+    // ...and the `-shut`/`-online` themselves, refused or performed
+    // BEFORE the header items: a refused transition fails the attach,
+    // which is gfix's own exit status.
+    if want_shut.any() {
+        if let Some(db) = database.as_mut() {
+            match db.apply_shutdown_dpb(&want_shut) {
+                Ok(m) => {
+                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!("[srv] {}", m);
+                    }
+                }
+                Err(e) => {
+                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!("[srv] shutdown dpb {:?} refused: {}", want_shut, e);
+                    }
+                    let mut w = W::default();
+                    w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+                    e.write_items(&mut w);
+                    w.int(0); // isc_arg_end
+                    w.send(&mut s, &mut enc)?;
+                    return Ok(());
+                }
+            }
+        }
+    }
     // `gfix` IS an attachment carrying header items in its DPB - forced
     // writes, space reservation, page buffers, the sweep interval. They
     // live in the header page, they are what those switches mean, and
@@ -39487,6 +39856,15 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 }
                 read_int(&mut s, &mut dec)?; // db handle
                 read_wire_bytes(&mut s, &mut dec)?; // tpb
+                // A KICKED ATTACHMENT DOES NO MORE WORK - see [DbGate].
+                // The check sits AFTER the payload reads at every site,
+                // because answering before consuming the op's arguments
+                // desyncs the stream (the Inc411 lesson, the other way
+                // around).
+                if database.as_ref().is_some_and(|d| d.kicked()) {
+                    respond_kicked(&mut s, &mut enc)?;
+                    continue;
+                }
                 respond(&mut s, &mut enc, TX_HANDLE)?; // transaction handle (distinct from attach 1)
             }
             x if x == OP_EXEC_IMMEDIATE => {
@@ -39503,6 +39881,11 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     read_int(&mut s, &mut dec)?; // p_sqlst_flags
                 }
                 let text = String::from_utf8_lossy(&sql).into_owned();
+                // kicked by a forced shutdown: the engine's vector, no work
+                if database.as_ref().is_some_and(|d| d.kicked()) {
+                    respond_kicked(&mut s, &mut enc)?;
+                    continue;
+                }
                 // the lexer refuses before anything is planned or written
                 // (see [has_unknown_space])
                 if has_unknown_space(&text) {
@@ -39573,11 +39956,18 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 read_int(&mut s, &mut dec)?; // dialect
                 let sql = read_wire_bytes(&mut s, &mut dec)?;
                 read_wire_bytes(&mut s, &mut dec)?; // items
+                // (the kick check for this op sits after the remaining
+                // tail below, with the others)
                 read_int(&mut s, &mut dec)?; // buffer length
                 if best >= 20 {
                     read_int(&mut s, &mut dec)?; // p_sqlst_flags
                 }
                 let text = String::from_utf8_lossy(&sql).into_owned();
+                // kicked by a forced shutdown: the engine's vector, no work
+                if database.as_ref().is_some_and(|d| d.kicked()) {
+                    respond_kicked(&mut s, &mut enc)?;
+                    continue;
+                }
                 // the lexer refuses before anything is planned or written
                 // (see [has_unknown_space])
                 if has_unknown_space(&text) {
@@ -39637,6 +40027,11 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 stmt_sql = String::from_utf8_lossy(&sql).into_owned();
                 if std::env::var("FC_SRV_TRACE").is_ok() {
                     eprintln!("[srv] prepare sql = {:?}", stmt_sql);
+                }
+                // kicked by a forced shutdown: the engine's vector, no work
+                if database.as_ref().is_some_and(|d| d.kicked()) {
+                    respond_kicked(&mut s, &mut enc)?;
+                    continue;
                 }
                 last_dml = (0, 0, 0);
                 bound_args.clear();
@@ -39906,6 +40301,11 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 }
                 if std::env::var("FC_SRV_TRACE").is_ok() && !bound_args.is_empty() {
                     eprintln!("[srv] execute params: {:?}", bound_args);
+                }
+                // kicked by a forced shutdown: the engine's vector, no work
+                if database.as_ref().is_some_and(|d| d.kicked()) {
+                    respond_kicked(&mut s, &mut enc)?;
+                    continue;
                 }
                 // the client must supply exactly the parameters the
                 // describe announced - fewer or more is an error, not a
@@ -40461,6 +40861,11 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 let want = read_int(&mut s, &mut dec)?; // count
                 if std::env::var("FC_SRV_TRACE").is_ok() {
                     eprintln!("[srv] fetch: {:?} (want {})", stmt_sql.trim(), want);
+                }
+                // kicked by a forced shutdown: the engine's vector, no work
+                if database.as_ref().is_some_and(|d| d.kicked()) {
+                    respond_kicked(&mut s, &mut enc)?;
+                    continue;
                 }
                 // THE COUNT IS THE CLIENT'S BATCH SIZE, and ignoring it
                 // DEADLOCKS the pair. The server used to answer every
@@ -41114,6 +41519,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 }
                 if best >= 19 {
                     read_int(&mut s, &mut dec)?; // p_sqldata_inline_blob_size
+                }
+                // kicked by a forced shutdown: the engine's vector, no work
+                if database.as_ref().is_some_and(|d| d.kicked()) {
+                    let _ = (&exec2_args, &out_fmt);
+                    respond_kicked(&mut s, &mut enc)?;
+                    continue;
                 }
                 // A singleton execute: EXECUTE PROCEDURE with output
                 // parameters comes here (the statement announces
@@ -42569,6 +42980,36 @@ mod tests {
         assert!(!parse_dpb_header(&[1u8, 61, 4, 0, 0]).any());
     }
 
+    /// The shutdown DPB's spellings, and the ladder's two directions.
+    ///
+    /// The mode bits mean different things bare: a `-shut` with none is
+    /// MULTI (the legacy `gfix -shut -force 0`, measured), an `-online`
+    /// with none is NORMAL (jrd.cpp:7187 normalizes it at parse; plain
+    /// `gfix -online` sends exactly 0x00 - also measured, the hard way).
+    #[test]
+    fn the_shutdown_dpb_and_its_ladder() {
+        // tag 50 = shutdown byte, tag 52 = delay, tag 51 = online byte
+        let dpb = [1u8, 50, 1, 0x38, 52, 4, 5, 0, 0, 0];
+        let want = parse_dpb_shut(&dpb);
+        assert_eq!(want.shutdown, Some(0x38)); // single + force
+        assert_eq!(want.delay, 5);
+        assert_eq!(want.online, None);
+        assert!(want.any());
+        assert_eq!(parse_dpb_shut(&[1u8, 51, 1, 0x10]).online, Some(0x10));
+        assert!(!parse_dpb_shut(&[1u8, 48, 5, b'U', b'T', b'F', b'8', 0]).any());
+
+        // the rank ladder: none 0, multi 1, single 2, full 3 - and the
+        // bare -shut mode is multi
+        assert_eq!(shut_mode_rank(0x00), Some(1));
+        assert_eq!(shut_mode_rank(0x20), Some(1));
+        assert_eq!(shut_mode_rank(0x10), Some(0));
+        assert_eq!(shut_mode_rank(0x30), Some(2));
+        assert_eq!(shut_mode_rank(0x40), Some(3));
+        // the flag bits ride the same byte and must not disturb the mode
+        assert_eq!(shut_mode_rank(0x38), Some(2)); // single + force
+        assert_eq!(shut_mode_rank(0x22), Some(1)); // multi + attach
+    }
+
     #[test]
     fn a_row_source_tree_scans_filters_sorts_aggregates_and_joins() {
         // The tree is exercised without a database behind it, which is
@@ -42590,7 +43031,13 @@ mod tests {
             lock_owner: 0,
             image_undo: false,
             ddl_undo: false,
-            attachments: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            attachments: {
+                let g = std::sync::Arc::new(DbGate::default());
+                g.attaches.store(1, std::sync::atomic::Ordering::SeqCst);
+                g
+            },
+            my_kick_gen: 0,
+            counted_tx: false,
             nested_tx: Vec::new(),
             page_size: 8192,
             path: String::new(),
@@ -45404,7 +45851,13 @@ mod tests {
             lock_owner: 0,
             image_undo: false,
             ddl_undo: false,
-            attachments: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            attachments: {
+                let g = std::sync::Arc::new(DbGate::default());
+                g.attaches.store(1, std::sync::atomic::Ordering::SeqCst);
+                g
+            },
+            my_kick_gen: 0,
+            counted_tx: false,
             nested_tx: Vec::new(),
             page_size: 4096,
             path: String::new(),
@@ -51526,7 +51979,13 @@ mod tests {
             lock_owner: 0,
             image_undo: false,
             ddl_undo: false,
-            attachments: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            attachments: {
+                let g = std::sync::Arc::new(DbGate::default());
+                g.attaches.store(1, std::sync::atomic::Ordering::SeqCst);
+                g
+            },
+            my_kick_gen: 0,
+            counted_tx: false,
             nested_tx: Vec::new(),
             page_size: 4096,
             path: String::new(),

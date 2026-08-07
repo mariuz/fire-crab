@@ -13,6 +13,71 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-07 — the mode ladder: gfix -shut and -online
+
+### Converted
+- **`gfix -shut [multi|single|full] -force|-attach|-tran N` and
+  `gfix -online [normal|multi|single]`** — `isc_dpb_shutdown` (50, one
+  byte: flag bits 0x2/0x4/0x8, mode bits 0x70) + `isc_dpb_shutdown_delay`
+  (52) and `isc_dpb_online` (51), over `hdr_shutdown_mode`, the byte at
+  offset 25 (none 0, multi 1, single 2, full 3).
+- **THE LADDER IS STRICT IN BOTH DIRECTIONS, and the same mode again is
+  REFUSED** — measured, and it beats the source: shut.cpp's `same_mode`
+  reads as if it silently succeeds ("gbak relies on that"), but this
+  build's `IGNORE_SAME_MODE` is compiled false and `gfix -shut multi
+  -force 0` twice answers `Target shutdown mode is invalid for database
+  "<file>"` the second time. `-shut` must tighten, `-online` must loosen,
+  the refusal is `isc_bad_shutdown_mode` with the quotes living in the
+  message template, and the header is untouched.
+- **The bare spellings differ per direction.** A `-shut` with no mode
+  word is MULTI (the legacy `gfix -shut -force 0`); a bare `-online` is
+  NORMAL — and it arrives as mode bits 0x00, which jrd.cpp:7187
+  normalizes at DPB-parse time rather than refusing. Found the hard way:
+  the first build refused plain `gfix -online`, because SHUT_online's own
+  switch would too — the normalization lives in the DPB parser, one file
+  away from the validation.
+- **What each mode refuses at ATTACH.** FULL refuses every attach
+  (`isc_shutdown` naming the file) including a non-mode gfix like
+  `-buffers` — EXCEPT an attach carrying `-shut`/`-online`, which is how
+  the database ever comes back. SINGLE holds ONE attachment: the second
+  is refused with the same vector, and even `gfix -online` is that second
+  attach while the slot is held (measured — the ladder never gets to
+  run). The maintenance attachment can WRITE, because maintenance is what
+  the mode is for.
+- **THE FORCE KICK.** `-shut <mode> -force 0` succeeds immediately with
+  attachments present; each of their NEXT statements answers SQLSTATE
+  08003 — `connection shutdown` / `-Database is shutdown.`
+  (`isc_att_shutdown` + `isc_att_shut_db_down`) — and the kicked
+  attachment stops occupying the single-user slot. Implemented as a
+  GENERATION NUMBER on the per-file gate (`DbGate::kick_gen`), because
+  "kicked" is relative: an attachment made after the shutdown is governed
+  by the header instead, and a second shutdown kicks the survivors of the
+  first. The checks sit AFTER each op's payload reads — answering before
+  consuming the arguments desyncs the stream (the Inc411 lesson, the
+  other way round).
+- **`-attach N` / `-tran N` with a stayer fail** with `isc_shutfail`
+  ("database shutdown unsuccessful") and write nothing; the successful
+  forms kick the stragglers exactly as the engine's closing force-notify
+  does. `-tran` waits on the gate's count of OPEN TRANSACTIONS, fed by
+  the transaction bookkeeping (`note_tx_begun` at the first adopt,
+  released at end).
+
+### Gated
+- **`qa/serve-real-shutdown.sh`** (42 checks): the full ladder in both
+  directions with every refusal's text compared (file names normalized to
+  `<db>` since each server has its own), the offline `gstat -h`
+  Attributes line as the header oracle, fifo-held attachments on BOTH
+  sides for the single-slot and kick halves, the kicked attachment's own
+  next-statement output compared engine-vs-fc, and shutfail leaving the
+  header untouched.
+
+### Named, not converted
+- The locksmith half (`CHANGE_SHUTDOWN_MODE`, `isc_no_priv`) is vacuous
+  here: fcwire authenticates exactly one configured user, so there is
+  nobody unprivileged to refuse. The engine also counts READ transactions
+  in `-tran`'s wait; fire-crab reserves transaction ids only at the first
+  write, so a pure reader does not hold that wait.
+
 ## 2026-08-07 — a read-only database, and the switch that makes one
 
 ### Converted
