@@ -2529,10 +2529,37 @@ plus *the subsystem is now on the path*.
     the part that would silently answer wrongly if guessed;
   * ~~`EXECUTE PROCEDURE` inside a body~~ **DONE** (sixth slice), with
     `ROW_COUNT` for DML alongside it (`qa/serve-real-callproc.sh`, 15
-    checks). **`EXECUTE STATEMENT`** - a whole planner call from PSQL -
-    is what is left of that pair;
+    checks);
+  * ~~`EXECUTE STATEMENT`~~ **DONE** (seventh slice), in all three
+    shapes - bare, `INTO` for a singleton, and the `FOR EXECUTE
+    STATEMENT` loop (`qa/serve-real-execstmt.sh`, 33 checks). It is
+    `isc_dsql_execute_immediate` seen from the inside, so it goes down
+    the SAME plan chain a client's statement does - the chain was
+    EXTRACTED from the `op_exec_immediate` handler rather than copied,
+    because two lists of what a server can execute would drift, and the
+    direction they drift is a body silently refusing DDL a client is
+    served. What had to be measured rather than guessed: **a dynamic
+    DML does not touch `ROW_COUNT`** (the count stays that of the last
+    STATIC statement), a singleton that matched nothing leaves its slots
+    alone, one that matched several raises 21000 rather than taking the
+    first, the INTO slots must equal the projected columns exactly -
+    including a query with NO INTO, which is the same "Output parameters
+    mismatch" - and a NULL or empty text is the engine's -104, not a
+    no-op. Two things came with it because the feature is unusable
+    without them: a **text assignment** (`S = 'SELECT ...' || :K`), since
+    `Expr` is arithmetic and has no string literal, and **a body's DML
+    failure carrying the engine's own error** instead of a generic
+    Dynamic SQL Error - which is what lets a handler catch what the
+    dynamic statement raised, and which fixed the static form too. The
+    text surface also surfaced a WRONG ANSWER that predates it: `N =
+    '5'` into an INTEGER output is a conversion the engine performs, and
+    the row encoder renders a text value into an integer slot as 0, so
+    the client was told 5 is 0. Both the source interpreter and the BLR
+    executor now refuse it instead;
   * **`IN AUTONOMOUS TRANSACTION`**, which needs a second transaction
-    while one is open;
+    while one is open. `EXECUTE STATEMENT ... WITH AUTONOMOUS
+    TRANSACTION` is the same requirement wearing the other syntax, and
+    both are refused and gated as boundaries until it lands;
   * ~~`ROW_COUNT`~~ **DONE** with the slice above - the DML paths report
     what they touched back into the frame, and a statement that matched
     nothing answers 0 rather than leaving the previous count.
@@ -2543,8 +2570,10 @@ plus *the subsystem is now on the path*.
   visible the moment a procedure has two output columns; **an
   expression in a `DECLARE ... CURSOR FOR (...)` select list must be
   ALIASED** or the engine answers "Invalid command" (the identical
-  SELECT runs standalone); **a BIGINT literal is outside the PSQL
-  surface** (`Expr::IntLiteral` is an `i32`, and widening it changes BLR
+  SELECT runs standalone); **`SELECT ... INTO :v` - the STATIC singleton
+  - is outside the surface**, which the dynamic form's gate found by
+  contrast (the same query through `EXECUTE STATEMENT ... INTO` works);
+  **a BIGINT literal is outside the PSQL surface** (`Expr::IntLiteral` is an `i32`, and widening it changes BLR
   encoding and type ranking - its own increment), **`INSERT ... VALUES`
   without a column list** is outside it too, and **`CREATE PROCEDURE` is
   not supported at all** - every gate builds its procedures with the engine

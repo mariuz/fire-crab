@@ -13,6 +13,104 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-07 — the statement a body builds at runtime
+
+### Converted
+- **`EXECUTE STATEMENT`**, in all three shapes: a bare one (DML and
+  DDL), `... INTO :v[, ...]` for a singleton, and `FOR EXECUTE
+  STATEMENT ... INTO ... DO <stmt>` for the loop, `LEAVE` included. It
+  is `isc_dsql_execute_immediate` seen from the inside, so the text goes
+  down the SAME plan chain a client's statement does (`plan_immediate`,
+  extracted from the `op_exec_immediate` handler rather than copied) and
+  a query goes down the ordinary planner — which is why a dynamic
+  `CREATE TABLE`, then an `INSERT` into it, then a `SELECT` from it all
+  work in one body.
+- **A text operand that is actually built.** `Expr` is arithmetic — it
+  has no string literal — so `S = 'SELECT ...'` refused the whole body,
+  and with it the canonical way this feature is written. A TEXT
+  ASSIGNMENT now stands beside the arithmetic one: literals, variables
+  and `||` between them, the same surface the `EXECUTE STATEMENT`
+  operand takes. An integer variable renders as its digits and a CHAR
+  variable's blank padding is dropped, both probed.
+- **A body's DML failure carries the engine's own error.** A duplicate
+  key, a NOT NULL, a CHECK — the write path already builds the typed
+  vector and the interpreter threw it away for a generic Dynamic SQL
+  Error, which no handler can catch. Now `WHEN ANY` and `WHEN SQLSTATE
+  '23000'` catch it and an uncaught one names the constraint, the table
+  and the offending key exactly as the engine does. This is what makes
+  "catch what the dynamic statement raised" possible at all.
+- **`ROW_COUNT` starts at 0, not NULL** (probed: a body whose first
+  statement tests `ROW_COUNT IS NULL` answers 0).
+- Two new error identities, both read off the engine's own message
+  table: `isc_eds_output_prm_mismatch` ("Output parameters mismatch")
+  and the `isc_dsql_error` + `isc_sqlerr`(-104) + `isc_command_end_err2`
+  vector an empty statement text prepares to.
+
+### Found
+- **`EXECUTE STATEMENT` DOES NOT TOUCH `ROW_COUNT`** — measured, and it
+  is the rule a converter gets wrong for free. A body that updates two
+  rows, then runs a dynamic update that changes one, then reads
+  `ROW_COUNT`, answers **2**: the count belongs to the last STATIC
+  statement.
+- **The INTO contract is three separate rules, each of which would
+  silently answer wrongly if guessed.** A singleton that matched nothing
+  LEAVES THE SLOTS ALONE (as a FETCH past the end does); one that
+  matched more than one row RAISES `isc_sing_select_err` rather than
+  taking the first; and the slot count must equal the projected column
+  count exactly — **including a query with no INTO at all**, which is
+  the same "Output parameters mismatch", not a discarded row.
+- **A NULL or empty statement text is not a no-op**: the engine prepares
+  it like any other and its parser hits the end at once, -104
+  "Unexpected end of command - line 1, column 1". A NULL variable and a
+  literal `''` give the identical vector.
+- **A statement's terminating semicolon must be found OUTSIDE its string
+  literals.** A body's statement rarely carries a literal, which is why
+  a plain scan served until now — but an `EXECUTE STATEMENT`'s operand
+  is nothing but a literal, and `'INSERT ...; '` would be cut in half.
+- **`SELECT ... INTO :v` (the STATIC singleton) is outside the PSQL
+  surface** — found while gating, pre-existing and unrelated: the
+  dynamic form works and the static one refuses.
+- **A WRONG ANSWER, found by asking what the new text surface could
+  reach.** `N = '5'` into an INTEGER output is a conversion the ENGINE
+  performs — and the row encoder renders a text value into a 4-byte
+  integer slot as **0**, so the client was told 5 is 0. It came from
+  the BLR executor, which runs BEFORE the source interpreter and
+  decodes string literals faithfully, so it predates this slice
+  entirely; the text assignment is what made it reachable from the
+  source side too.
+
+### Guarded
+- **Text in a non-text output parameter now REFUSES rather than
+  answers.** Both paths carry the check — the source interpreter before
+  it builds its row, and the BLR executor, which falls back to the
+  interpreter (and its refusal) rather than shipping the value. The
+  engine's CVT is what closes this properly; until it is converted, a
+  refusal is the honest answer, and it is gated as a boundary so the
+  day CVT lands the gate says so.
+
+### Gated
+- **`qa/serve-real-execstmt.sh`** (33 checks): the three shapes, the
+  text built from a variable and by concatenation, ROW_COUNT untouched
+  by a dynamic DML and 0 before anything ran, all four INTO rules, the
+  NULL and empty texts, the dynamic statement seeing this transaction's
+  uncommitted rows, DDL through it, its write dying with the body that
+  failed, `EXECUTE PROCEDURE` through a dynamic string, what it raises
+  caught and uncaught, and the static DML-failure identities that
+  enable those.
+- **The sweep caught a recorded boundary moving, again.**
+  `serve-real-nofallback` asserted that a body holding an `EXECUTE
+  STATEMENT` must RAISE rather than answer — an assertion, not a
+  comment — so it failed the moment the feature landed. Its body moved
+  to the far side of the same statement (`ON EXTERNAL DATA SOURCE`,
+  which needs a whole external-connection subsystem) rather than the
+  check being dropped.
+- Four **recorded boundaries, written as ASSERTIONS** so the gate fails
+  rather than quietly agrees when one moves: a parameter list after the
+  text, `WITH AUTONOMOUS TRANSACTION`, a string assigned to a numeric
+  output, and a dynamic statement that fails to PREPARE — the last because this server cannot yet tell "your
+  column does not exist" (the engine's -206) from "this shape is outside
+  my surface", and a refusal it cannot justify must stay generic.
+
 ## 2026-08-07 — a body calling a body, and what ROW_COUNT means
 
 ### Converted

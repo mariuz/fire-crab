@@ -6991,6 +6991,23 @@ enum HandlerCond {
     SqlState(String),
 }
 
+/// One piece of an `EXECUTE STATEMENT`'s text operand: a string
+/// literal, or a variable whose value is spliced in.
+///
+/// THE TEXT IS A STRING EXPRESSION AND THIS SERVER'S `Expr` IS NOT.
+/// `Expr` carries integers - `IntLiteral` is an `i32` and every operator
+/// is arithmetic - so a string literal has no home in it, and widening
+/// it is its own increment (it changes BLR encoding and type ranking for
+/// everything that emits BLR). What a body actually builds is a
+/// concatenation of literals and its own variables, so that is the
+/// surface: `'SELECT V FROM T WHERE ID = ' || :K` and nothing wider.
+/// Anything else is refused rather than half-understood.
+#[derive(Clone)]
+enum DynPart {
+    Lit(String),
+    Var(u16),
+}
+
 enum TrigStmt {
     /// `NEW.<col> = <expr>;` or `<var> = <expr>;`
     Assign { target: TrigTarget, expr: fire_crab_ods::expr::Expr, src_off: usize },
@@ -7103,6 +7120,35 @@ enum TrigStmt {
     /// Only a SELECTABLE PROCEDURE can contain one; a trigger cannot, so
     /// the BLR emitter refuses it and only the interpreter acts on it.
     Suspend { src_off: usize },
+    /// `<var> = <text>;` where the right-hand side is a STRING
+    /// expression - a literal, a variable, or a `||` chain of them.
+    /// Interpreted only: it exists so a body can build the statement it
+    /// is about to `EXECUTE STATEMENT`, which is how that feature is
+    /// actually written.
+    AssignText { slot: u16, text: Vec<DynPart>, src_off: usize },
+    /// `EXECUTE STATEMENT <text> [INTO :v[, :v]];` - the statement the
+    /// body BUILDS, prepared and run where it stands. It is
+    /// `isc_dsql_execute_immediate` from the inside, so it goes down the
+    /// same plan chain a client's statement does ([plan_immediate]) and
+    /// a query goes down the ordinary planner.
+    ///
+    /// Three semantics were probed rather than guessed, because each
+    /// would silently answer wrongly the other way: a singleton whose
+    /// query matched NOTHING leaves the slots alone; one that matched
+    /// MORE THAN ONE ROW raises `isc_sing_select_err` rather than taking
+    /// the first; and the number of INTO slots must equal the projected
+    /// column count exactly - a mismatch, INCLUDING a query with no INTO
+    /// at all, is "Output parameters mismatch".
+    ExecStmt { text: Vec<DynPart>, into: Vec<u16>, src_off: usize },
+    /// `FOR EXECUTE STATEMENT <text> INTO :v[, ...] DO <stmt>;` - the
+    /// loop over a dynamic query, LEAVE and all, exactly as the
+    /// [TrigStmt::ForSelect] loop runs over a static one.
+    ForExecStmt {
+        text: Vec<DynPart>,
+        into: Vec<u16>,
+        body: Box<TrigStmt>,
+        src_off: usize,
+    },
     Block {
         stmts: Vec<TrigStmt>,
         handlers: Vec<(Vec<HandlerCond>, TrigStmt)>,
@@ -7478,6 +7524,9 @@ fn body_has_uninterpretable_blr(st: &TrigStmt) -> bool {
         | TrigStmt::Close { .. }
         | TrigStmt::Leave { .. }
         | TrigStmt::Exit { .. }
+        | TrigStmt::AssignText { .. }
+        | TrigStmt::ExecStmt { .. }
+        | TrigStmt::ForExecStmt { .. }
         | TrigStmt::CallProc { .. } => true,
         TrigStmt::If { then, otherwise, .. } => {
             body_has_uninterpretable_blr(then)
@@ -7496,6 +7545,106 @@ fn body_has_uninterpretable_blr(st: &TrigStmt) -> bool {
         }
         _ => false,
     }
+}
+
+/// The semicolon that ends a simple statement, IGNORING the ones inside
+/// string literals.
+///
+/// A body's statement almost never carries a literal, which is why a
+/// plain `find(';')` served until now - but an `EXECUTE STATEMENT`'s
+/// operand is nothing BUT a literal, and a dynamic `'INSERT ...; '`
+/// would otherwise be cut in half. A doubled quote (SQL's escape) needs
+/// no special case: the pair toggles the state off and straight back on.
+fn find_stmt_semi(s: &str, from: usize, limit: usize) -> Option<usize> {
+    let mut in_str = false;
+    for (i, c) in s[from..limit].char_indices() {
+        match c {
+            '\'' => in_str = !in_str,
+            ';' if !in_str => return Some(from + i),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parse an `EXECUTE STATEMENT` text operand: string literals and
+/// variables joined by `||`, optionally wrapped in one pair of
+/// parentheses (the engine's `EXECUTE STATEMENT ('...')` form).
+///
+/// Returning None REFUSES the body, which is what carries the forms this
+/// slice does not serve: a parameter list after the parenthesised text
+/// (`(...) (a := :k)`), `ON EXTERNAL`, `AS USER`, and anything else that
+/// is not a literal-or-variable concatenation.
+fn parse_dyn_text(t: &str, vars: &[String]) -> Option<Vec<DynPart>> {
+    let mut t = t.trim();
+    // one wrapping paren pair, when it wraps the WHOLE operand - not the
+    // first of two groups, which is the parameterised form
+    if t.starts_with('(') {
+        let mut depth = 0i32;
+        let mut close = None;
+        let mut in_str = false;
+        for (i, c) in t.char_indices() {
+            match c {
+                '\'' => in_str = !in_str,
+                '(' if !in_str => depth += 1,
+                ')' if !in_str => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = close?;
+        if t[close + 1..].trim().is_empty() {
+            t = t[1..close].trim();
+        } else {
+            return None; // a parameter list follows: not this slice's shape
+        }
+    }
+    // split on `||` outside literals
+    let b = t.as_bytes();
+    let mut parts: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    let mut in_str = false;
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'\'' {
+            in_str = !in_str;
+        } else if !in_str && b[i] == b'|' && b.get(i + 1) == Some(&b'|') {
+            parts.push(&t[start..i]);
+            i += 2;
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    if in_str {
+        return None;
+    }
+    parts.push(&t[start..]);
+    let mut out = Vec::new();
+    for p in parts {
+        let p = p.trim();
+        if p.is_empty() {
+            return None;
+        }
+        if let Some(inner) = p.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+            // a doubled quote is one quote; an unescaped one inside means
+            // this was two literals with something between them
+            if inner.split("''").any(|seg| seg.contains('\'')) {
+                return None;
+            }
+            out.push(DynPart::Lit(inner.replace("''", "'")));
+        } else {
+            let name = p.trim_start_matches(':').trim().trim_matches('"');
+            let slot = vars.iter().position(|v| v.eq_ignore_ascii_case(name))?;
+            out.push(DynPart::Var(slot as u16));
+        }
+    }
+    Some(out)
 }
 
 /// One statement at the cursor: a nested block, IF/WHILE (whose inner
@@ -7518,6 +7667,37 @@ fn parse_trig_stmt(
         // FOR SELECT <query> INTO :v[, ...] DO <stmt>
         let after_for = start + "FOR".len();
         let up_all = s[..limit].to_ascii_uppercase();
+        // FOR EXECUTE STATEMENT <text> INTO :v[, ...] DO <stmt> - the
+        // same loop over a query the body builds at runtime
+        let mut at = after_for;
+        skip_trig_ws(s, &mut at, limit);
+        if peek_trig_word(s, at, limit).as_deref() == Some("EXECUTE") {
+            let masked = mask_literals(&up_all);
+            let stmt_kw = find_word(&masked, "STATEMENT", at)?;
+            if up_all[at + "EXECUTE".len()..stmt_kw].trim() != "" {
+                return None;
+            }
+            let after = stmt_kw + "STATEMENT".len();
+            let into_kw = find_word(&masked, "INTO", after)?;
+            let do_kw = find_word(&masked, "DO", into_kw + "INTO".len())?;
+            let text = parse_dyn_text(&s[after..into_kw], vars)?;
+            let mut into = Vec::new();
+            for part in s[into_kw + "INTO".len()..do_kw].split(',') {
+                let name = part.trim().trim_start_matches(':').trim().trim_matches('"');
+                into.push(vars.iter().position(|v| v.eq_ignore_ascii_case(name))? as u16);
+            }
+            if into.is_empty() {
+                return None;
+            }
+            *pos = do_kw + "DO".len();
+            let body = parse_trig_stmt(s, pos, limit, vars)?;
+            return Some(TrigStmt::ForExecStmt {
+                text,
+                into,
+                body: Box::new(body),
+                src_off: start,
+            });
+        }
         if find_word(&up_all, "SELECT", after_for)? != after_for + 1
             && s[after_for..].trim_start().to_ascii_uppercase().find("SELECT") != Some(0)
         {
@@ -7614,8 +7794,8 @@ fn parse_trig_stmt(
         };
         return Some(TrigStmt::If { cond, then: Box::new(inner), otherwise, src_off: start });
     }
-    // simple statements run to the next semicolon
-    let semi = s[start..limit].find(';')? + start;
+    // simple statements run to the next semicolon OUTSIDE a literal
+    let semi = find_stmt_semi(s, start, limit)?;
     let text = &s[start..semi];
     let up = text.to_ascii_uppercase();
     *pos = semi + 1;
@@ -7636,6 +7816,28 @@ fn parse_trig_stmt(
             return None;
         }
         return Some(TrigStmt::Raise { name, src_off: start });
+    }
+    if find_word(&up, "EXECUTE", 0) == Some(0)
+        && find_word(&mask_literals(&up), "STATEMENT", "EXECUTE".len())
+            .is_some_and(|k| up["EXECUTE".len()..k].trim() == "")
+    {
+        // EXECUTE STATEMENT <text> [INTO :v[, :v]]
+        let masked = mask_literals(&up);
+        let stmt_kw = find_word(&masked, "STATEMENT", "EXECUTE".len())?;
+        let after = stmt_kw + "STATEMENT".len();
+        let into_kw = find_word(&masked, "INTO", after);
+        let dyn_text = parse_dyn_text(&text[after..into_kw.unwrap_or(text.len())], vars)?;
+        let mut into = Vec::new();
+        if let Some(k) = into_kw {
+            for part in text[k + "INTO".len()..].split(',') {
+                let name = part.trim().trim_start_matches(':').trim().trim_matches('"');
+                into.push(vars.iter().position(|v| v.eq_ignore_ascii_case(name))? as u16);
+            }
+            if into.is_empty() {
+                return None;
+            }
+        }
+        return Some(TrigStmt::ExecStmt { text: dyn_text, into, src_off: start });
     }
     if find_word(&up, "EXECUTE", 0) == Some(0) {
         let proc_kw = find_word(&up, "PROCEDURE", "EXECUTE".len())?;
@@ -7878,8 +8080,28 @@ fn parse_trig_stmt(
         let slot = vars.iter().position(|v| v == &name)?;
         TrigTarget::Var(slot as u16)
     };
-    let expr = expr_resolve_vars(&parse_expr(text[eq + 1..].trim())?, vars);
-    Some(TrigStmt::Assign { target, expr, src_off: start })
+    let rhs = text[eq + 1..].trim();
+    match parse_expr(rhs) {
+        Some(e) => {
+            Some(TrigStmt::Assign { target, expr: expr_resolve_vars(&e, vars), src_off: start })
+        }
+        // A TEXT ASSIGNMENT. `Expr` is arithmetic - it has no string
+        // literal - so `S = 'SELECT ...'` used to refuse the whole body,
+        // and with it the CANONICAL EXECUTE STATEMENT: build the
+        // statement in a variable, then run it. This is the same
+        // literal-or-variable concatenation the EXECUTE STATEMENT
+        // operand is ([DynPart]), assigned to a variable, and nothing
+        // wider - a text expression this server cannot read still
+        // refuses, as it did before.
+        None => match target {
+            TrigTarget::Var(slot) => Some(TrigStmt::AssignText {
+                slot,
+                text: parse_dyn_text(rhs, vars)?,
+                src_off: start,
+            }),
+            TrigTarget::Field(_) => None,
+        },
+    }
 }
 
 /// Emit a user trigger's BLR (probed): `version5, begin,` then for a
@@ -7940,6 +8162,9 @@ fn emit_trigger_stmt(
         | TrigStmt::Close { .. }
         | TrigStmt::Leave { .. }
         | TrigStmt::Exit { .. }
+        | TrigStmt::AssignText { .. }
+        | TrigStmt::ExecStmt { .. }
+        | TrigStmt::ForExecStmt { .. }
         | TrigStmt::CallProc { .. } => {}
         TrigStmt::Assign { target, expr, src_off } => {
             dbg.push((*src_off, b.len()));
@@ -8345,6 +8570,9 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | TrigStmt::Close { .. }
             | TrigStmt::Leave { .. }
             | TrigStmt::Exit { .. }
+            | TrigStmt::AssignText { .. }
+            | TrigStmt::ExecStmt { .. }
+            | TrigStmt::ForExecStmt { .. }
             | TrigStmt::CallProc { .. } => {}
             TrigStmt::Assign { expr, .. } => out.push(expr),
             TrigStmt::If { cond, then, otherwise, .. } => {
@@ -8382,6 +8610,9 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | TrigStmt::Close { .. }
             | TrigStmt::Leave { .. }
             | TrigStmt::Exit { .. }
+            | TrigStmt::AssignText { .. }
+            | TrigStmt::ExecStmt { .. }
+            | TrigStmt::ForExecStmt { .. }
             | TrigStmt::CallProc { .. } => {}
             TrigStmt::Assign { target, .. } => out.push(target),
             TrigStmt::If { then, otherwise, .. } => {
@@ -8420,6 +8651,9 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | TrigStmt::Close { .. }
             | TrigStmt::Leave { .. }
             | TrigStmt::Exit { .. }
+            | TrigStmt::AssignText { .. }
+            | TrigStmt::ExecStmt { .. }
+            | TrigStmt::ForExecStmt { .. }
             | TrigStmt::CallProc { .. } => {}
             TrigStmt::Assign { .. } => {}
             TrigStmt::If { then, otherwise, .. } => {
@@ -23482,6 +23716,12 @@ fn conversion_error_arg(text: &str) -> String {
 /// 21000): a scalar subquery that answers more than one row is an ERROR,
 /// not a first-row-wins.
 const GDS_SING_SELECT: i32 = 335544652;
+/// `isc_eds_output_prm_mismatch` (JRD 608) - "Output parameters
+/// mismatch", what an EXECUTE STATEMENT's INTO list is measured against
+const GDS_EDS_OUTPUT_PRM_MISMATCH: i32 = 335544928;
+/// `isc_command_end_err2` (JRD 531) - "Unexpected end of command - line
+/// @1, column @2", which an empty statement text reaches at once
+const GDS_COMMAND_END_ERR2: i32 = 335544851;
 
 /// isc_exception_integer_overflow - "Integer overflow. The result of an
 /// integer operation caused the most significant bit of the result to
@@ -23641,6 +23881,25 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
         EvalErr::SingletonSelect => {
             w.int(1) // isc_arg_gds
                 .int(GDS_SING_SELECT);
+        }
+        EvalErr::OutputParamsMismatch => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_EDS_OUTPUT_PRM_MISMATCH);
+        }
+        EvalErr::EmptyStatementText => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-104)
+                .int(1) // isc_arg_gds
+                .int(GDS_COMMAND_END_ERR2)
+                // the parser has read nothing, so it is always 1, 1
+                .int(ISC_ARG_NUMBER)
+                .int(1)
+                .int(ISC_ARG_NUMBER)
+                .int(1);
         }
         // AN ARGUMENT-LESS CONVERSION ERROR IS NOT ONE. The engine's
         // message for isc_convert_error is "Conversion error from
@@ -27678,6 +27937,21 @@ enum EvalErr {
     /// 42000 "must be zero or positive" on LPAD/RPAD/POSITION bounds -
     /// an error either way, never a wrong row
     InvalidLength(i64),
+    /// The INTO slots an `EXECUTE STATEMENT` names do not match what its
+    /// statement projects: `isc_eds_output_prm_mismatch` (JRD 608,
+    /// SQLSTATE 42000, "Output parameters mismatch"), one code with no
+    /// arguments. Probed both ways - two projected columns into one
+    /// slot, and a QUERY WITH NO INTO AT ALL, which is the same error
+    /// (an `EXECUTE STATEMENT 'SELECT ...'` that discards its row is not
+    /// a legal statement).
+    OutputParamsMismatch,
+    /// An `EXECUTE STATEMENT` whose text was NULL or empty. The engine
+    /// prepares it like any other and its parser hits the end
+    /// immediately: `isc_dsql_error` + `isc_sqlerr`(-104) +
+    /// `isc_command_end_err2` at line 1, column 1 (measured: an unset
+    /// VARCHAR variable and a literal `''` give the identical vector,
+    /// because concatenation with NULL is NULL and both arrive empty).
+    EmptyStatementText,
     /// a scalar subquery answered MORE THAN ONE ROW - the engine's
     /// `isc_sing_select_err`, "multiple rows in singleton select"
     /// (SQLSTATE 21000). Taking the first row would be a wrong answer
@@ -34727,6 +35001,80 @@ enum DmlKind {
     Delete,
 }
 
+/// Which verb family a statement opens with: (DDL, DML). The two lists
+/// are the engine's own split between `isc_dsql_execute_immediate`'s DDL
+/// and DML paths, and a statement in neither is a SET or a query.
+fn immediate_verb(text: &str) -> (bool, bool) {
+    let up = text.trim_start().to_ascii_uppercase();
+    let ddl = ["CREATE", "ALTER", "DROP", "RECREATE", "COMMENT", "GRANT", "REVOKE"]
+        .into_iter()
+        .any(|k| find_word(&up, k, 0) == Some(0));
+    let dml = ["INSERT", "UPDATE", "DELETE"]
+        .into_iter()
+        .any(|k| find_word(&up, k, 0) == Some(0));
+    (ddl, dml)
+}
+
+/// Plan one statement the way `op_exec_immediate` does - every DDL and
+/// DML verb a client can send without a cursor.
+///
+/// `EXECUTE STATEMENT` inside a body is the SAME operation seen from the
+/// other side (the engine routes both through
+/// `isc_dsql_execute_immediate`), so the two share this chain rather
+/// than keeping two lists of what this server can execute - which would
+/// drift, and the direction it would drift is a body silently refusing
+/// DDL a client is served.
+fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
+    let (ddl_kw, dml_kw) = immediate_verb(text);
+    // SET GENERATOR / ALTER SEQUENCE RESTART are generator writes; the
+    // ALTER form also begins with a DDL verb.
+    plan_set_generator(text)
+        .or_else(|| plan_set_statistics(text))
+        .or_else(|| {
+            if ddl_kw {
+                plan_comment(text)
+                    .or_else(|| plan_grant_procedure(text))
+                    .or_else(|| plan_grant_usage(text))
+                    .or_else(|| plan_grant(text))
+                    .or_else(|| plan_grant_role(text))
+                    .or_else(|| plan_create_table(text))
+                    .or_else(|| plan_create_trigger(text, database))
+                    .or_else(|| plan_create_index(text))
+                    .or_else(|| plan_drop_table(text))
+                    .or_else(|| plan_drop_index(text))
+                    .or_else(|| plan_create_sequence(text))
+                    .or_else(|| plan_drop_sequence(text))
+                    .or_else(|| plan_create_exception(text))
+                    .or_else(|| plan_drop_exception(text))
+                    .or_else(|| plan_alter_exception(text))
+                    .or_else(|| plan_create_or_alter_exception(text))
+                    .or_else(|| plan_create_role(text))
+                    .or_else(|| plan_drop_role(text))
+                    .or_else(|| plan_create_domain(text))
+                    .or_else(|| plan_drop_domain(text))
+                    .or_else(|| plan_alter_domain(text))
+                    .or_else(|| plan_alter_index(text))
+                    .or_else(|| plan_alter_table_add(text, database))
+                    .or_else(|| plan_alter_table_drop(text))
+                    .or_else(|| plan_alter_table_alter_type(text))
+                    .or_else(|| plan_alter_column_null(text))
+                    .or_else(|| plan_alter_column_default(text))
+                    .or_else(|| plan_alter_column_restart(text))
+                    .or_else(|| plan_alter_column_generated(text))
+                    .or_else(|| plan_alter_column_drop_identity(text))
+                    .or_else(|| plan_alter_column_position(text))
+                    .or_else(|| plan_alter_sequence(text))
+            } else if dml_kw {
+                plan_insert(text, database)
+                    .or_else(|| plan_upsert(text, database))
+                    .or_else(|| plan_update(text, database))
+                    .or_else(|| plan_delete(text, database))
+            } else {
+                None
+            }
+        })
+}
+
 /// Plan and execute one statement a body rendered. A statement the
 /// planners refuse, or a write that fails (a constraint, a duplicate
 /// key), stops the body - it never runs on and never reports success.
@@ -34754,7 +35102,27 @@ fn run_body_dml(
             if std::env::var("FC_SRV_TRACE").is_ok() {
                 eprintln!("[srv] psql dml failed: {}", e);
             }
-            Err(PsqlStop::Failed(e.to_string()))
+            match e {
+                // A CONSTRAINT VIOLATION IS A RAISE, NOT A REFUSAL.
+                // The write path already builds the engine's own error
+                // - `isc_unique_key_violation` with the constraint, the
+                // table and the offending key, `isc_not_valid` for a
+                // NOT NULL, `isc_check_constraint` for a CHECK - and
+                // this used to throw all of it away and report the
+                // generic Dynamic SQL Error, which no handler can catch
+                // and which tells a client nothing about what its data
+                // did wrong. Measured against the engine: a body whose
+                // INSERT duplicates a key answers SQLSTATE 23000 with
+                // the key value, and `WHEN ANY` / `WHEN SQLSTATE
+                // '23000'` catch it. Carrying the identity here is what
+                // makes both true, and the empty trace lets
+                // [exec_psql_stmt] stamp the STATEMENT's position, which
+                // is what the engine's `At procedure` item names.
+                ExecErr::Eval(ev) => {
+                    Err(PsqlStop::Raise(Thrown::Runtime { err: ev, trace: Vec::new() }))
+                }
+                other => Err(PsqlStop::Failed(other.to_string())),
+            }
         }
     }
 }
@@ -35251,6 +35619,9 @@ fn stmt_src_off(s: &TrigStmt) -> usize {
         | TrigStmt::Close { src_off, .. }
         | TrigStmt::Leave { src_off, .. }
         | TrigStmt::Exit { src_off, .. }
+        | TrigStmt::AssignText { src_off, .. }
+        | TrigStmt::ExecStmt { src_off, .. }
+        | TrigStmt::ForExecStmt { src_off, .. }
         | TrigStmt::CallProc { src_off, .. } => *src_off,
     }
 }
@@ -35630,9 +36001,188 @@ fn exec_psql_stmt_inner(
             }
             run_body_dml(&sql, db, ctx, DmlKind::Delete).map(|n| set_row_count(f, n))
         }
-        // SUSPEND, cursors, FOR SELECT, EXECUTE STATEMENT, nested calls
+        // a TEXT assignment - what builds the statement a body is about
+        // to run
+        TrigStmt::AssignText { slot, text, .. } => {
+            let v = render_dyn_text(text, f)?;
+            let n = *slot as usize;
+            if n >= f.vars.len() {
+                f.vars.resize(n + 1, Value::Null);
+            }
+            f.vars[n] = v.map_or(Value::Null, Value::Text);
+            Ok(())
+        }
+        // EXECUTE STATEMENT: the statement the body BUILT, run where it
+        // stands. `run_dyn_statement` is the whole of it; what is left
+        // here is the INTO contract, and every rule in it was measured.
+        //
+        // ROW_COUNT IS NOT TOUCHED, which is the one a converter would
+        // get wrong for free: a dynamic UPDATE that changed one row
+        // leaves ROW_COUNT saying what the last STATIC statement did
+        // (probed - a body that updates two rows, then runs a dynamic
+        // update, then reads ROW_COUNT, answers 2).
+        TrigStmt::ExecStmt { text, into, .. } => {
+            // a NULL text is the engine's -104 exactly as an empty one
+            // is, because concatenation with NULL is NULL and both reach
+            // the parser with nothing to read (probed)
+            let sql = render_dyn_text(text, f)?.unwrap_or_default();
+            let rows = run_dyn_statement(&sql, db, ctx)?;
+            match (rows, into.is_empty()) {
+                // a statement with nothing to project and nothing asked
+                (None, true) => Ok(()),
+                // a query whose row nobody takes, or an INTO over a
+                // statement that projects nothing: the same error
+                (None, false) | (Some(_), true) => Err(psql_raise(EvalErr::OutputParamsMismatch)),
+                (Some(rows), false) => {
+                    if rows.len() > 1 {
+                        // taking the first row would be a wrong answer
+                        return Err(psql_raise(EvalErr::SingletonSelect));
+                    }
+                    match rows.into_iter().next() {
+                        // PAST THE END THE SLOTS ARE LEFT ALONE, exactly
+                        // as a FETCH that found nothing leaves them
+                        None => Ok(()),
+                        Some(row) => assign_into(f, into, row),
+                    }
+                }
+            }
+        }
+        // FOR EXECUTE STATEMENT: the same loop the static FOR SELECT
+        // runs, over a query built at runtime - LEAVE included.
+        TrigStmt::ForExecStmt { text, into, body, .. } => {
+            let sql = render_dyn_text(text, f)?.unwrap_or_default();
+            let rows = run_dyn_statement(&sql, db, ctx)?
+                .ok_or_else(|| psql_raise(EvalErr::OutputParamsMismatch))?;
+            for row in rows {
+                assign_into(f, into, row)?;
+                match exec_psql_stmt(body, f, steps, db, ctx) {
+                    Ok(()) => {}
+                    Err(PsqlStop::Leave) => break,
+                    Err(e) => return Err(e),
+                }
+                *steps += 1;
+                if *steps > 1_000_000 {
+                    return Err(PsqlStop::Unsupported);
+                }
+            }
+            Ok(())
+        }
+        // SUSPEND, cursors, FOR SELECT, nested calls
         _ => Err(PsqlStop::Unsupported),
     }
+}
+
+/// A runtime error raised from a statement, with the position left for
+/// [exec_psql_stmt] to stamp.
+fn psql_raise(err: EvalErr) -> PsqlStop {
+    PsqlStop::Raise(Thrown::Runtime { err, trace: Vec::new() })
+}
+
+/// Put one projected row into the INTO slots. The engine measures the
+/// two counts and raises "Output parameters mismatch" when they differ,
+/// rather than filling what it can.
+fn assign_into(f: &mut PsqlFrame, into: &[u16], row: Vec<Value>) -> Result<(), PsqlStop> {
+    if row.len() != into.len() {
+        return Err(psql_raise(EvalErr::OutputParamsMismatch));
+    }
+    for (slot, v) in into.iter().zip(row.into_iter()) {
+        let n = *slot as usize;
+        if n >= f.vars.len() {
+            f.vars.resize(n + 1, Value::Null);
+        }
+        f.vars[n] = v;
+    }
+    Ok(())
+}
+
+/// Render an `EXECUTE STATEMENT`'s text operand. A NULL anywhere in the
+/// concatenation makes the whole text NULL, which the engine then fails
+/// to prepare exactly as it fails on `''` - so both arrive here as an
+/// empty string and raise the same vector.
+fn render_dyn_text(parts: &[DynPart], f: &PsqlFrame) -> Result<Option<String>, PsqlStop> {
+    let mut out = String::new();
+    for p in parts {
+        match p {
+            DynPart::Lit(t) => out.push_str(t),
+            DynPart::Var(n) => match f.vars.get(*n as usize) {
+                // a CHAR variable arrives blank-padded and the padding is
+                // no part of the statement (probed: a CHAR(40) holding a
+                // SELECT runs)
+                Some(Value::Text(t)) => out.push_str(t.trim_end()),
+                Some(Value::Int(v)) => out.push_str(&v.to_string()),
+                // NULL || anything is NULL
+                Some(Value::Null) | None => return Ok(None),
+                // a date, a blob, a scaled decimal spliced into SQL text
+                // would each need the engine's own literal rendering
+                Some(_) => return Err(PsqlStop::Unsupported),
+            },
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Prepare and run one statement a body built at runtime.
+///
+/// Answers the projected rows when the text was a QUERY, and `None` when
+/// it was a statement that projects nothing (DDL, DML, SET) - which is
+/// what the caller's INTO contract is measured against.
+///
+/// The DDL and DML chain is [plan_immediate], the one a client's
+/// `isc_dsql_execute_immediate` goes down, because that is what this is:
+/// the engine routes both through the same call.
+fn run_dyn_statement(
+    sql: &str,
+    db: &mut Option<Database>,
+    ctx: &SessionCtx,
+) -> Result<Option<Vec<Vec<Value>>>, PsqlStop> {
+    if std::env::var("FC_SRV_TRACE").is_ok() {
+        eprintln!("[srv] psql execute statement: {:?}", sql);
+    }
+    let sql = sql.trim();
+    if sql.is_empty() {
+        return Err(psql_raise(EvalErr::EmptyStatementText));
+    }
+    if has_unknown_space(sql) {
+        return Err(PsqlStop::Unsupported);
+    }
+    let up = sql.trim_start().to_ascii_uppercase();
+    // EXECUTE PROCEDURE through a dynamic string is a call like any
+    // other, and its outputs are the row it projects
+    if find_word(&up, "EXECUTE", 0) == Some(0) && find_word(&up, "PROCEDURE", 0).is_some() {
+        let (_, name, args) = parse_execute_procedure(sql).ok_or(PsqlStop::Unsupported)?;
+        // a `?` argument has nothing to bind to from inside a body
+        let args: Vec<Value> =
+            args.into_iter().collect::<Option<Vec<_>>>().ok_or(PsqlStop::Unsupported)?;
+        let out = psql_depth_guard(|| run_procedure(db, &name, &args, ctx))?;
+        return match out {
+            Ok((values, _rows)) => Ok(Some(vec![values])),
+            Err(ProcErr { status: Some(err), .. }) => {
+                Err(PsqlStop::Raise(Thrown::Runtime { err, trace: Vec::new() }))
+            }
+            Err(_) => Err(PsqlStop::Unsupported),
+        };
+    }
+    let (ddl_kw, dml_kw) = immediate_verb(sql);
+    if ddl_kw || dml_kw {
+        let (plan, params) = plan_immediate(sql, &*db).ok_or(PsqlStop::Unsupported)?;
+        if !params.is_empty() {
+            return Err(PsqlStop::Unsupported); // a `?` this surface cannot bind
+        }
+        return match execute_dml(&plan, db, &[], ctx) {
+            Ok(_) => Ok(None),
+            Err(ExecErr::Eval(ev)) => Err(psql_raise(ev)),
+            Err(e) => Err(PsqlStop::Failed(e.to_string())),
+        };
+    }
+    // anything else is a query: the ORDINARY planner, so a dynamic
+    // SELECT sees joins, views and expressions exactly as a client's does
+    let mut sink: Vec<Option<Descriptor>> = Vec::new();
+    let plan = plan_query_inner(sql, &*db, &mut sink).ok_or(PsqlStop::Unsupported)?;
+    if !sink.is_empty() {
+        return Err(PsqlStop::Unsupported); // a `?` this surface cannot bind
+    }
+    let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
+    Ok(Some(branch_rows(&plan, dbr, &[]).ok_or(PsqlStop::Unsupported)?))
 }
 
 /// Execute `EXECUTE PROCEDURE <name> [(<args>)]` and return the output
@@ -35770,7 +36320,41 @@ fn try_procedure_blr(
             finals = decode(&buf);
         }
     }
+    // A TEXT VALUE IN A NON-TEXT OUTPUT SLOT MUST NOT BE ANSWERED. The
+    // BLR carries string literals (`N = '5'`, which the ENGINE converts
+    // to 5) and this executor decodes them faithfully - but the row
+    // encoder renders a non-numeric into an Int32 slot as ZERO, so the
+    // client would be told 5 is 0. Falling back leaves it to the source
+    // interpreter, which refuses. The engine's CVT is what closes this
+    // properly; until it is converted, a refusal is the honest answer.
+    if rows.iter().chain(std::iter::once(&finals)).any(|r| {
+        r.iter().any(|v| matches!(v, Value::Text(_)))
+    }) {
+        let Some(meta) = load_procedure(db, name) else {
+            return BlrProcOutcome::Outside;
+        };
+        if rows
+            .iter()
+            .chain(std::iter::once(&finals))
+            .any(|r| text_in_nontext_output(r, &meta.outs))
+        {
+            return BlrProcOutcome::Outside;
+        }
+    }
     BlrProcOutcome::Rows(rows, finals)
+}
+
+/// Would this row put a TEXT value where the procedure declares
+/// something that is not text? The frame and the BLR executor are both
+/// untyped - they carry `Value`s - and the row encoder renders a text
+/// value into a numeric wire slot as 0, so this is the check that turns
+/// a wrong answer into a refusal.
+fn text_in_nontext_output(row: &[Value], outs: &[ProcParam]) -> bool {
+    use fire_crab_ods::format::dtype;
+    row.iter().zip(outs.iter()).any(|(v, p)| {
+        matches!(v, Value::Text(_))
+            && !matches!(p.desc.dtype, dtype::TEXT | dtype::VARYING | dtype::BLOB)
+    })
 }
 
 fn run_procedure(
@@ -35839,6 +36423,13 @@ fn run_procedure(
     };
     frame.vars.extend(args.iter().cloned());
     frame.vars.resize(names.len(), Value::Null);
+    // ROW_COUNT BEFORE ANY STATEMENT IS 0, NOT NULL (probed: a body
+    // whose first statement tests `ROW_COUNT IS NULL` answers 0). Every
+    // other slot starts NULL; this one is a counter the engine has
+    // already zeroed.
+    if let Some(rc) = row_count_slot {
+        frame.vars[rc as usize] = Value::Int(0);
+    }
 
     // a body is ALL-OR-NOTHING: a statement that fails partway undoes
     // everything the body wrote before it, as the engine does
@@ -35907,6 +36498,23 @@ fn run_procedure(
     let final_row: Vec<Value> = (0..meta.outs.len())
         .map(|i| frame.vars.get(meta.ins.len() + i).cloned().unwrap_or(Value::Null))
         .collect();
+    // A TEXT VALUE IN A NUMERIC OUTPUT SLOT IS A WRONG ANSWER WAITING TO
+    // HAPPEN, and it must be a refusal instead. The frame is untyped -
+    // it holds `Value`s, not declared types - so a body that assigns a
+    // string to an INTEGER output (`N = '5'`, which the ENGINE converts)
+    // would reach the row encoder, where an Int32 slot renders a
+    // non-numeric as 0. This is the only path by which a text value
+    // leaves the interpreter: arithmetic and comparison already refuse
+    // one. Refusing here is the honest half of the engine's CVT until
+    // the conversion itself is converted.
+    if text_in_nontext_output(&final_row, &meta.outs)
+        || frame.suspended.iter().any(|r| text_in_nontext_output(r, &meta.outs))
+    {
+        return Err(ProcErr::from(format!(
+            "procedure {} puts text in a non-text output parameter",
+            name
+        )));
+    }
     if frame.suspended.is_empty() {
         Ok((final_row, Vec::new()))
     } else {
@@ -37694,60 +38302,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                     continue;
                 }
-                let up = text.trim_start().to_ascii_uppercase();
-                let ddl_kw = ["CREATE", "ALTER", "DROP", "RECREATE", "COMMENT", "GRANT", "REVOKE"]
-                    .into_iter()
-                    .any(|k| find_word(&up, k, 0) == Some(0));
-                let dml_kw = ["INSERT", "UPDATE", "DELETE"]
-                    .into_iter()
-                    .any(|k| find_word(&up, k, 0) == Some(0));
-                // SET GENERATOR / ALTER SEQUENCE RESTART are generator
-                // writes; the ALTER form also begins with a DDL verb.
-                let planned = plan_set_generator(&text)
-                    .or_else(|| plan_set_statistics(&text))
-                    .or_else(|| {
-                    if ddl_kw {
-                        plan_comment(&text)
-                            .or_else(|| plan_grant_procedure(&text))
-                            .or_else(|| plan_grant_usage(&text))
-                            .or_else(|| plan_grant(&text))
-                            .or_else(|| plan_grant_role(&text))
-                            .or_else(|| plan_create_table(&text))
-                            .or_else(|| plan_create_trigger(&text, &database))
-                            .or_else(|| plan_create_index(&text))
-                            .or_else(|| plan_drop_table(&text))
-                            .or_else(|| plan_drop_index(&text))
-                            .or_else(|| plan_create_sequence(&text))
-                            .or_else(|| plan_drop_sequence(&text))
-                            .or_else(|| plan_create_exception(&text))
-                            .or_else(|| plan_drop_exception(&text))
-                            .or_else(|| plan_alter_exception(&text))
-                            .or_else(|| plan_create_or_alter_exception(&text))
-                            .or_else(|| plan_create_role(&text))
-                            .or_else(|| plan_drop_role(&text))
-                            .or_else(|| plan_create_domain(&text))
-                            .or_else(|| plan_drop_domain(&text))
-                            .or_else(|| plan_alter_domain(&text))
-                            .or_else(|| plan_alter_index(&text))
-                            .or_else(|| plan_alter_table_add(&text, &database))
-                            .or_else(|| plan_alter_table_drop(&text))
-                            .or_else(|| plan_alter_table_alter_type(&text))
-                            .or_else(|| plan_alter_column_null(&text))
-                            .or_else(|| plan_alter_column_default(&text))
-                            .or_else(|| plan_alter_column_restart(&text))
-                            .or_else(|| plan_alter_column_generated(&text))
-                            .or_else(|| plan_alter_column_drop_identity(&text))
-                            .or_else(|| plan_alter_column_position(&text))
-                            .or_else(|| plan_alter_sequence(&text))
-                    } else if dml_kw {
-                        plan_insert(&text, &database)
-                            .or_else(|| plan_upsert(&text, &database))
-                            .or_else(|| plan_update(&text, &database))
-                            .or_else(|| plan_delete(&text, &database))
-                    } else {
-                        None
-                    }
-                });
+                let (ddl_kw, dml_kw) = immediate_verb(&text);
+                let planned = plan_immediate(&text, &database);
                 match planned {
                     // execute only zero-parameter statements here
                     // (op_exec_immediate carries no message)
@@ -46895,6 +47451,76 @@ mod tests {
         assert_eq!(public_object_name("NOSCHEMA.PADD"), None);
         // and a QUOTED lowercase "public" is a different (unknown) schema
         assert_eq!(public_object_name("\"public\".PADD"), None);
+    }
+
+    /// The EXECUTE STATEMENT text operand: what it reads, and - the half
+    /// that matters - what it refuses, since a form read WRONG would run
+    /// a statement the body did not write.
+    #[test]
+    fn dyn_text_reads_literals_variables_and_concatenations() {
+        let vars = vec!["K".to_string(), "S".to_string()];
+        let one = |t: &str| parse_dyn_text(t, &vars);
+        let render = |parts: &[DynPart], k: Value, s: Value| {
+            let f = PsqlFrame {
+                vars: vec![k, s],
+                out_at: 0,
+                out_len: 0,
+                suspended: Vec::new(),
+                caught: None,
+                cursors: std::collections::HashMap::new(),
+                row_count_slot: None,
+            };
+            render_dyn_text(parts, &f).ok().expect("the text renders")
+        };
+        // a plain literal, with SQL's doubled-quote escape
+        let p = one("'SELECT 1'").unwrap();
+        assert_eq!(render(&p, Value::Null, Value::Null).as_deref(), Some("SELECT 1"));
+        let p = one("'IT''S'").unwrap();
+        assert_eq!(render(&p, Value::Null, Value::Null).as_deref(), Some("IT'S"));
+        // a variable spliced in, bare or with the PSQL colon, and an
+        // INTEGER rendered as its digits
+        for t in ["'ID = ' || K", "'ID = ' || :K"] {
+            let p = one(t).unwrap();
+            assert_eq!(
+                render(&p, Value::Int(7), Value::Null).as_deref(),
+                Some("ID = 7")
+            );
+        }
+        // a CHAR variable's blank padding is no part of the statement
+        let p = one("S").unwrap();
+        assert_eq!(
+            render(&p, Value::Null, Value::Text("SELECT 1   ".into())).as_deref(),
+            Some("SELECT 1")
+        );
+        // NULL anywhere makes the whole text NULL - which the caller then
+        // fails to prepare exactly as it fails on ''
+        let p = one("'ID = ' || K").unwrap();
+        assert_eq!(render(&p, Value::Null, Value::Null), None);
+        // one wrapping paren pair is the engine's own form...
+        let p = one("('SELECT 1')").unwrap();
+        assert_eq!(render(&p, Value::Null, Value::Null).as_deref(), Some("SELECT 1"));
+        // ...but a PARAMETER LIST after it is a shape this slice does not
+        // serve, and must refuse rather than run the text without its
+        // parameters
+        assert!(one("('SELECT :a') (a := K)").is_none());
+        // an unknown name is not a variable, and a half-closed literal is
+        // not a literal
+        assert!(one("'a' || NOSUCH").is_none());
+        assert!(one("'a").is_none());
+    }
+
+    /// A statement ends at the semicolon OUTSIDE its literals - the
+    /// difference between running a dynamic statement and running its
+    /// first half.
+    #[test]
+    fn stmt_semicolon_ignores_the_ones_inside_literals() {
+        let s = "EXECUTE STATEMENT 'INSERT INTO T VALUES (1); '; N = 1;";
+        let semi = find_stmt_semi(s, 0, s.len()).unwrap();
+        assert_eq!(&s[..semi], "EXECUTE STATEMENT 'INSERT INTO T VALUES (1); '");
+        // a doubled quote is an escape, not a state change
+        let s2 = "S = 'it''s; here'; X = 2;";
+        let semi = find_stmt_semi(s2, 0, s2.len()).unwrap();
+        assert_eq!(&s2[..semi], "S = 'it''s; here'");
     }
 
     #[test]

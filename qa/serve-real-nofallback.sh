@@ -61,10 +61,19 @@ BEGIN
     K = I; SUSPEND; I = I + 1;
   END
 END^
+/* A body outside the interpreted surface. This used to be a plain
+   EXECUTE STATEMENT, which is now CONVERTED - the gate caught that by
+   failing, which is what a recorded refusal is for. The shape moved to
+   the far side of the same statement: ON EXTERNAL DATA SOURCE needs a
+   whole external-connection subsystem, so this stays a refusal for as
+   long as the point of the check does. */
 CREATE PROCEDURE UNSUP RETURNS (R INTEGER) AS
 DECLARE VARIABLE C INTEGER;
 BEGIN
-  EXECUTE STATEMENT 'SELECT 1 FROM RDB\$DATABASE' INTO :C;
+  EXECUTE STATEMENT 'SELECT 1 FROM RDB\$DATABASE'
+    ON EXTERNAL DATA SOURCE 'nosuchhost:/nosuch.fdb'
+    AS USER 'SYSDBA' PASSWORD 'masterkey'
+    INTO :C;
   R = C;
 END^
 SET TERM ;^
@@ -186,7 +195,9 @@ answers "SELECT ID, W FROM VJ"
 answers "SELECT COUNT(*) FROM VJ"
 
 # --- NOT supported: each must raise ------------------------------------
-# a PSQL body outside the interpreted surface
+# a PSQL body outside the interpreted surface (see UNSUP above: the
+# EXECUTE STATEMENT it used to hold is converted, so the body moved to
+# the ON EXTERNAL DATA SOURCE form rather than the check being dropped)
 refuses "EXECUTE PROCEDURE UNSUP"
 # a procedure that does not exist
 refuses "EXECUTE PROCEDURE NOSUCHPROC"
