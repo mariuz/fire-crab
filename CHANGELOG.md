@@ -13,6 +13,64 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-07 — validation, and what its silence means: gfix -v
+
+### Converted
+- **`gfix -v [-full] [-n]`** — `isc_dpb_verify` (tag 9) — as a page walk
+  that counts what is broken into the sixteen categories gfix reads back
+  through `isc_database_info` (alice/exe.cpp's `val_errors` list, items
+  54–60 and 115–123), printing one line per non-zero counter. **A clean
+  database is SILENCE — which is what made the unconverted server
+  dangerous: fcwire skipped info items it did not know, gfix printed the
+  same silence a genuinely clean file gets, and `gfix -v` against
+  fire-crab was a validation that could not fail.** The counters are only
+  answered when THIS attachment ran a walk: a counter of 0 and no counter
+  at all read the same to gfix, but only one of them is a claim.
+- **The taxonomy was measured, one corruption at a time**, and held
+  byte-identical on the SAME corrupted file (`-n` never writes, so both
+  servers can validate one copy): a data page with a zeroed type byte is
+  1 "database page error" and NO warning, under `-full` and plain `-v`
+  alike; an absurd record directory is 1 "data page error" — per page,
+  not per entry; a broken pointer or btree page is 1 error + 1 warning
+  (the orphaned subtree is the warning); a record's back pointer aimed
+  PAST THE FILE under `-full` is not a count at all — the attach fails
+  with `I/O error / File size is less than expected`, because the engine
+  reads the page the pointer names — while plain `-v` walks no records
+  and stays silent.
+- **A broken TIP fails the attach with the corruption vector, naming the
+  page and both type names** — `database file appears corrupt / -wrong
+  page type / -page 287 is of wrong type (expected transaction
+  inventory, found purposely undefined)` — with the page found the way
+  the engine finds it: **RDB$PAGES declares the TIP pages**, and the walk
+  reads that map STATE-BLIND (chain heads as they stand), because the
+  transaction states are exactly what the wreck took away. The type
+  names come from the engine's own `pagtype()` table (jrd/ods.cpp:130).
+- **The walk takes the catalog route for the same reason**: a pointer
+  page whose type byte is gone is invisible to a scan for pointer pages
+  — the corruption hides itself from the scan that would report it — so
+  relations and their pages come from RDB$PAGES.
+- `isc_info_db_read_only` (63) now answers the header's real flag — it
+  had been a hardcoded 0 since before the mode existed.
+
+### Named, not converted
+- **The SCN cascade**: page 2 zeroed makes the engine fail every
+  SCN-consulted check too (296 errors on a 313-page fixture) where
+  fire-crab counts the broken page itself: exactly 1. Asserted as a
+  boundary with both numbers. And the warning taxonomy is per-relation in
+  ways the probes only sampled: a SYSTEM relation's broken data page
+  drew a warning where T's did not — the gate corrupts deterministic
+  targets (T's own pages, found through RDB$PAGES) for exactly that
+  reason. `walk_index_leaves` descends the leftmost path and the leaf
+  level, so an interior page off the leftmost path of a deep tree is not
+  visited — stated in the code, and every fixture this project can build
+  has depth <= 1.
+
+### Gated
+- **`qa/serve-real-validate.sh`** (12 checks): the byte-equal cases
+  above, the SCN boundary, and teeth that the walk actually RAN (the
+  trace line), because the old failure mode — silence that means nothing
+  — is precisely what this gate exists to prevent.
+
 ## 2026-08-07 — the sweep performed: gfix -sweep
 
 ### Converted

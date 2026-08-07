@@ -267,6 +267,23 @@ const GDS_ATT_SHUTDOWN: i32 = 335544856;
 /// the reason item behind it (measured on a held isql).
 const GDS_ATT_SHUT_DB_DOWN: i32 = 335545132;
 
+/// `isc_db_corrupt` - "database file appears corrupt (@1)": the head of
+/// the vector a verify attach fails with when the file's TRANSACTION
+/// INVENTORY cannot be read...
+const GDS_DB_CORRUPT: i32 = 335544335;
+/// `isc_page_type_err` - "wrong page type" - ...the middle item...
+const GDS_PAGE_TYPE_ERR: i32 = 335544650;
+/// `isc_badpagtyp` - "page @1 is of wrong type (expected @2, found @3)"
+/// - ...and the detail, its type names from the engine's own pagtype()
+/// table (jrd/ods.cpp:130).
+const GDS_BADPAGTYP: i32 = 335544403;
+
+/// `isc_block_size` - "File size is less than expected": what a read
+/// past the end of the file raises, and therefore what a `-full`
+/// validation walking a pointer aimed past EOF fails the ATTACH with
+/// (measured - the engine reads the page the pointer names).
+const GDS_BLOCK_SIZE: i32 = 335545273;
+
 /// `isc_sweep_unable_to_run` - "Unable to run sweep" (42000), the head
 /// of the pair a refused `gfix -sweep` answers...
 const GDS_SWEEP_UNABLE_TO_RUN: i32 = 335545308;
@@ -649,6 +666,10 @@ struct Database {
     /// whether this attachment currently counts in [DbGate::active_tx] -
     /// set at its transaction's first write, cleared when it ends
     counted_tx: bool,
+    /// what the verify attach counted, for `op_info_database` to answer
+    /// gfix's sixteen validation items from - `None` on every attachment
+    /// that did not carry `isc_dpb_verify`
+    val_counts: Option<fire_crab_ods::val::ValCounts>,
     /// EVERY NESTED ID THIS TRANSACTION HAS RESERVED and not killed -
     /// one per undo window that wrote (see [UndoWindow]).
     ///
@@ -1992,6 +2013,7 @@ fn load_database(path: &str) -> Option<Database> {
         attachments,
         my_kick_gen,
         counted_tx: false,
+        val_counts: None,
         shared,
         write: None,
         tx: None,
@@ -13764,6 +13786,11 @@ struct ShutDpb {
     /// it carries (`isc_dpb_records`) is the only value gfix ever
     /// sends, so it is a flag here.
     sweep: bool,
+    /// tag 9, `gfix -v`: the verify byte - pages 0x1, records 0x2
+    /// (`-full`), no_update 0x10 (`-n`), repair 0x20 (`-mend`), ignore
+    /// 0x40. This walk never writes, so the only bit that changes what
+    /// it DOES is records.
+    verify: Option<u8>,
 }
 
 impl ShutDpb {
@@ -13795,6 +13822,7 @@ fn parse_dpb_shut(dpb: &[u8]) -> ShutDpb {
             51 => want.online = Some(v as u8),
             52 => want.delay = v as i32,
             10 => want.sweep = true,
+            9 => want.verify = Some(v as u8),
             _ => {}
         }
         i = end;
@@ -39716,6 +39744,91 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
             }
         }
     }
+    // `gfix -v [-full]`: validate during the attach, as the engine does
+    // (jrd's VAL_validate runs in the verify attach; gfix reads the
+    // sixteen counters back through op_info_database and prints the
+    // non-zero ones). The walk never writes; what can still FAIL the
+    // attach is a pointer aimed past the end of the file, which the
+    // engine turns into a hard read error rather than a count.
+    if let Some(verify) = want_shut.verify {
+        if let Some(db) = database.as_mut() {
+            let full = verify & 0x2 != 0; // isc_dpb_records = -full
+            match fire_crab_ods::val::validate(&db.bytes(), db.page_size, full) {
+                Ok(counts) => {
+                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!(
+                            "[srv] validate (full={}): {}",
+                            full,
+                            if counts.clean() { "clean".to_string() } else { format!("{:?}", counts) }
+                        );
+                    }
+                    db.val_counts = Some(counts);
+                }
+                Err(fire_crab_ods::val::ValAbort::PastEof { page }) => {
+                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!("[srv] validate aborted: page {} past EOF", page);
+                    }
+                    // the engine's own shape: the READ fails, so the
+                    // attach fails - `I/O error during "read" operation
+                    // for file "<f>" / -File size is less than expected`
+                    let path = db.path.clone();
+                    let mut w = W::default();
+                    w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+                    w.int(1) // isc_arg_gds
+                        .int(GDS_IO_ERROR)
+                        .int(2) // isc_arg_string - the operation
+                        .bytes(b"read")
+                        .int(2) // isc_arg_string - the file
+                        .bytes(path.as_bytes())
+                        .int(1) // isc_arg_gds
+                        .int(GDS_BLOCK_SIZE)
+                        .int(0); // isc_arg_end
+                    w.send(&mut s, &mut enc)?;
+                    return Ok(());
+                }
+                Err(fire_crab_ods::val::ValAbort::WrongPageType { page, expected, found }) => {
+                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!(
+                            "[srv] validate aborted: page {} expected type {} found {}",
+                            page, expected, found
+                        );
+                    }
+                    // the engine cannot attach a file whose transaction
+                    // states it cannot read: `database file appears
+                    // corrupt (<f>) / -wrong page type / -page N is of
+                    // wrong type (expected X, found Y)` - measured on a
+                    // zeroed TIP, byte for byte
+                    let path = database.as_ref().map(|d| d.path.clone()).unwrap_or_default();
+                    let mut w = W::default();
+                    w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+                    w.int(1) // isc_arg_gds
+                        .int(GDS_DB_CORRUPT)
+                        .int(2) // isc_arg_string - the file
+                        .bytes(path.as_bytes())
+                        .int(1) // isc_arg_gds
+                        .int(GDS_PAGE_TYPE_ERR)
+                        .int(1) // isc_arg_gds
+                        .int(GDS_BADPAGTYP)
+                        .int(ISC_ARG_NUMBER)
+                        .int(page as i32)
+                        .int(2) // isc_arg_string - expected
+                        .bytes(fire_crab_ods::val::page_type_name(expected).as_bytes())
+                        .int(2) // isc_arg_string - found
+                        .bytes(fire_crab_ods::val::page_type_name(found).as_bytes())
+                        .int(0); // isc_arg_end
+                    w.send(&mut s, &mut enc)?;
+                    return Ok(());
+                }
+                Err(fire_crab_ods::val::ValAbort::Broken(e)) => {
+                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!("[srv] validate aborted: {}", e);
+                    }
+                    respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                    return Ok(());
+                }
+            }
+        }
+    }
     // `gfix` IS an attachment carrying header items in its DPB - forced
     // writes, space reservation, page buffers, the sweep interval. They
     // live in the header page, they are what those switches mean, and
@@ -41395,6 +41508,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         .as_ref()
                         .and_then(|d| d.bytes().get(26).copied())
                         .unwrap_or(0),
+                    val_counts: database.as_ref().and_then(|d| d.val_counts),
+                    read_only: database.as_ref().is_some_and(|d| d.is_read_only()),
                 };
                 let info = build_db_info(&items, &ctx);
                 let mut w = W::default();
@@ -42885,6 +43000,16 @@ fn build_db_info(items: &[u8], ctx: &DbInfoCtx) -> Vec<u8> {
         out.extend_from_slice(&val.to_le_bytes());
     }
     for &code in items {
+        // gfix -v's sixteen counters, answered only when THIS attachment
+        // ran a validation - see [DbInfoCtx::val_counts]. A counter of 0
+        // and no counter at all read the same to gfix, but only one of
+        // them is a claim, so an ordinary attachment still skips them.
+        if let Some(counts) = ctx.val_counts.as_ref() {
+            if let Some((_, v)) = counts.items().iter().find(|(c, _)| *c == code) {
+                put_int(&mut out, code, *v as i32);
+                continue;
+            }
+        }
         match code {
             62 => {
                 // isc_info_db_sql_dialect: a ONE-byte value (probe-pinned)
@@ -42900,7 +43025,9 @@ fn build_db_info(items: &[u8], ctx: &DbInfoCtx) -> Vec<u8> {
             6 => put_int(&mut out, 6, 0),                      // isc_info_writes
             7 => put_int(&mut out, 7, 1000),                   // isc_info_fetches
             8 => put_int(&mut out, 8, 0),                      // isc_info_marks
-            63 => put_int(&mut out, 63, 0),                    // isc_info_db_read_only
+            // isc_info_db_read_only: the header's own flag, now that
+            // `gfix -mode read_only` can set it
+            63 => put_int(&mut out, 63, i32::from(ctx.read_only)),
             // fb_info_replica_mode (inf_pub.h:174): isql reads it with
             // getBigInt and prints NONE / READ_ONLY / READ_WRITE; the
             // value is the header's own replica byte, so a replica file
@@ -42956,6 +43083,12 @@ struct DbInfoCtx {
     /// 1 read-only, 2 read-write - what `fb_info_replica_mode` answers
     /// and isql's SHOW DATABASE prints as its "Replica mode:" line
     replica_mode: u8,
+    /// what THIS attachment's verify walk counted, if it carried
+    /// `isc_dpb_verify`: the sixteen items gfix -v reads back
+    val_counts: Option<fire_crab_ods::val::ValCounts>,
+    /// `hdr_read_only` off the header - `isc_info_db_read_only` (63)
+    /// answered 0 unconditionally until the mode existed
+    read_only: bool,
 }
 
 /// Run the fire-crab wire server on `addr` (e.g. "127.0.0.1:3051"),
@@ -43116,6 +43249,7 @@ mod tests {
             },
             my_kick_gen: 0,
             counted_tx: false,
+            val_counts: None,
             nested_tx: Vec::new(),
             page_size: 8192,
             path: String::new(),
@@ -45936,6 +46070,7 @@ mod tests {
             },
             my_kick_gen: 0,
             counted_tx: false,
+            val_counts: None,
             nested_tx: Vec::new(),
             page_size: 4096,
             path: String::new(),
@@ -46718,7 +46853,10 @@ mod tests {
     }
 
     fn dbctx() -> DbInfoCtx {
+        #[allow(clippy::needless_update)]
         DbInfoCtx {
+            val_counts: None,
+            read_only: false,
             db_path: "/tmp/x.fdb".into(),
             attach_id: 7,
             ods_major: 14,
@@ -52064,6 +52202,7 @@ mod tests {
             },
             my_kick_gen: 0,
             counted_tx: false,
+            val_counts: None,
             nested_tx: Vec::new(),
             page_size: 4096,
             path: String::new(),

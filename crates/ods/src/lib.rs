@@ -44,6 +44,7 @@ pub mod sqz;
 pub mod sysfmt;
 pub mod tip;
 pub mod tra;
+pub mod val;
 pub mod tz;
 
 pub use blr::{decode as decode_blr, BlrDecode};

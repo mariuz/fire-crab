@@ -2731,9 +2731,24 @@ plus *the subsystem is now on the path*.
   relations left whole - the blob walk is its own slice, asserted as a
   difference in `qa/serve-real-gfixsweep.sh` (13 checks).
 
-  What is left of gfix is `-validate` (a page walk that only reads,
-  which `fcstat census` half-does offline already) and the
-  limbo-transaction switches, which need two-phase commit first.
+  *(sixth slice done)* **`-v [-full] [-n]`** - the page walk behind
+  validation, and the discovery that made it urgent: fcwire SKIPPED the
+  sixteen info items gfix reads its counters from, so `gfix -v` against
+  fire-crab printed the same silence a clean file gets - a validation
+  that could not fail. The taxonomy was measured one corruption at a
+  time and is held BYTE-IDENTICAL on the same corrupted file: a broken
+  data page is one error and no warning, a broken pointer or btree page
+  is one error plus one warning, a mad record directory is one data-page
+  error per page, a back pointer past EOF fails the attach with the I/O
+  vector under -full and is silent under plain -v, and a broken TIP
+  fails the attach with the corruption vector naming the page and both
+  type names - found through RDB$PAGES read STATE-BLIND, since the
+  transaction states are what the wreck took away. The SCN cascade is
+  the recorded boundary (engine 296, fc 1). 12 checks in
+  `qa/serve-real-validate.sh`.
+
+  What is left of gfix is the limbo-transaction switches, which need
+  two-phase commit first.
 
 ## A savepoint is a transaction (done)
 
