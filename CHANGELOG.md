@@ -13,6 +13,79 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-07 — a transaction inside a transaction
+
+### Converted
+- **`IN AUTONOMOUS TRANSACTION DO <stmt>`** — the block runs under a
+  transaction of its OWN: a fresh id reserved ACTIVE in the TIP, flipped
+  to committed when the block finishes and to dead when it raises, and
+  flushed either way. `EXECUTE STATEMENT ... WITH AUTONOMOUS
+  TRANSACTION` is the same requirement in the engine's other syntax and
+  is parsed into the same block.
+- **What the block committed SURVIVES the failure of the body around
+  it** — the point of the feature, and the hard part here, because every
+  undo in this server is "put an image back". The pages the block
+  committed are kept as a carve-out and written FORWARD over whatever
+  the enclosing undo restores, exactly as the generator windows write
+  their settled values forward.
+- **The block cannot see the outer transaction's uncommitted rows.**
+  That one came free: this server's visibility rule is "committed, or my
+  own", so running the block's reads under the block's id is the whole
+  of it.
+- **An error inside the block rolls the block back and then escapes**,
+  so the caller may catch it and nothing the block wrote remains.
+- **Comments in a PSQL body** — `/* ... */` and `--` — are skipped
+  between statements. See below for how that was found.
+
+### Found
+- **THE CARVE-OUT'S BASELINE HAS TO PREDATE THE ID RESERVATION, and
+  getting it wrong is silent.** Reserving the transaction writes the
+  HEADER (`hdr_next_transaction`) and a TIP page; a carve-out captured
+  after them keeps the block's ROWS while letting the header go back, so
+  the next autonomous block reserves the SAME id, marks it dead when it
+  fails, and the row that was committed quietly stops counting. Measured
+  exactly that way — the trace showed one id opened twice.
+- **A COMMENT REFUSED THE BODY THAT EXPLAINED IT.** This gate's own
+  `/* duplicate key */` note made its procedure unparseable: the
+  statement walk skipped whitespace and not comments, so the cursor
+  landed on `/` and the block parse gave up. It had been invisible
+  because a body of nothing but ASSIGNMENTS is answered by the BLR
+  executor, which never consults the source parser — only a body that
+  also WRITES reaches it. A comment INSIDE a statement is still outside
+  the surface, and that is now written down rather than assumed.
+
+### Guarded
+- **A body that has already written REFUSES the block.** The enclosing
+  undo would put back an image without the body's writes, and the page
+  carve-out would carry them straight back in — a failed statement's own
+  rows, still visible to its transaction. Undoing those needs them to
+  have a transaction of their own to kill (the engine's savepoint
+  model), which this server does not have; until it does, the block is
+  refused rather than answered. A block inside a block is the same
+  problem with the outer block as the writer.
+
+### Gated
+- **`qa/serve-real-autonomous.sh`** (22 checks): the commit, the
+  survival of the body's failure, the error inside the block caught and
+  uncaught with nothing left behind, several statements committing
+  together, DDL and assignment inside the block, and the `EXECUTE
+  STATEMENT` syntax for the same thing.
+- It is the **only serve-real gate that holds each server's database
+  apart**, and it says why: every other one runs both servers over the
+  same file because a rollback puts the file back, and an autonomous
+  commit is precisely what a rollback does not put back — the engine's
+  run would seed fire-crab's, and every later check would meet a
+  duplicate key.
+- Three recorded boundaries as assertions: the body-wrote-first refusal,
+  the nested block, and **the outer transaction reading what the block
+  committed** — the engine answers 0 because its transaction took a
+  snapshot before the block existed, and this server answers 1 because a
+  reader counts what is committed when it reads. That is the isolation
+  model rather than this slice, written down where it first shows.
+- `qa/serve-real-execstmt.sh`'s `WITH AUTONOMOUS TRANSACTION` boundary
+  failed the day this landed, as a boundary written as an assertion
+  should, and is an ordinary check now.
+
 ## 2026-08-07 — the statement a body builds at runtime
 
 ### Converted

@@ -52,6 +52,9 @@ CREATE TABLE T (ID INTEGER NOT NULL PRIMARY KEY, V INTEGER);
    the enclosing ROLLBACK cannot take back - correctly - and a teeth
    count over the shared table would move under it. */
 CREATE TABLE TT (ID INTEGER NOT NULL PRIMARY KEY, V INTEGER);
+/* no primary key: an autonomous commit survives the rollback, so the
+   two servers' runs must not collide on a key (see B_AUTONOMOUS) */
+CREATE TABLE AUTOLOG (V INTEGER);
 COMMIT;
 INSERT INTO T VALUES (1,10);
 INSERT INTO T VALUES (2,20);
@@ -219,9 +222,18 @@ BEGIN
   K = 3;
   EXECUTE STATEMENT ('SELECT V FROM T WHERE ID = ?') (K) INTO :N;
 END^
+/* WITH AUTONOMOUS TRANSACTION was a recorded boundary here until the
+   autonomous slice landed, and this gate failed the day it did - which
+   is what a boundary written as an assertion is for. It is an ordinary
+   check now. It writes to AUTOLOG, which has NO primary key, because an
+   autonomous commit is precisely what the rollback between the two
+   servers' runs does not take back: with a key, the second server to
+   run would meet its own duplicate of the first's row.
+   qa/serve-real-autonomous.sh gates the semantics; this only says the
+   clause is understood where the statement is parsed. */
 CREATE PROCEDURE B_AUTONOMOUS RETURNS (N INTEGER) AS
 BEGIN
-  EXECUTE STATEMENT 'INSERT INTO T (ID, V) VALUES (77, 777)'
+  EXECUTE STATEMENT 'INSERT INTO AUTOLOG (V) VALUES (777)'
     WITH AUTONOMOUS TRANSACTION;
   N = 1;
 END^
@@ -341,6 +353,9 @@ both "...and the row is not there afterwards" "SET HEADING OFF;
 EXECUTE PROCEDURE E_WRITETHENFAIL;
 SELECT COUNT(*) FROM T WHERE ID = 60;"
 call "EXECUTE PROCEDURE through a dynamic string" E_CALL
+# WITH AUTONOMOUS TRANSACTION: understood where the statement is parsed;
+# qa/serve-real-autonomous.sh is where its semantics are gated
+call "...WITH AUTONOMOUS TRANSACTION" B_AUTONOMOUS
 
 # --- 7. what it raises, the body may catch -------------------------------
 call "WHEN ANY catches what the dynamic statement raised" E_DUPCATCH
@@ -380,7 +395,6 @@ ROLLBACK;")
 # column does not exist" (the engine's -206) from "this shape is outside
 # my surface" - so it must not borrow the typed vector.
 boundary "EXECUTE STATEMENT (...) (params)" B_PARM "Dynamic SQL Error"
-boundary "WITH AUTONOMOUS TRANSACTION" B_AUTONOMOUS "Dynamic SQL Error"
 boundary "a dynamic statement that fails to PREPARE" B_BADPREPARE "Dynamic SQL Error"
 # and the guard the text surface needed: the engine CONVERTS '5' into an
 # INTEGER output; the wire's integer slot renders a text value as 0, so a

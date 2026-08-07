@@ -572,6 +572,32 @@ struct Database {
     /// write of a transaction, which is why a reader that has not
     /// written counts only committed work.
     tx: Option<u32>,
+    /// The AUTONOMOUS transaction running right now, if a body is inside
+    /// an `IN AUTONOMOUS TRANSACTION` block. While it is set, record
+    /// writes carry IT rather than [Database::tx] and reads count it as
+    /// their own - which is what makes the two rules the engine holds
+    /// true here: the block cannot see the outer transaction's
+    /// uncommitted rows, and the block's rows are committed by the block
+    /// rather than by the outer COMMIT.
+    auto_tx: Option<u32>,
+    /// The pages an autonomous transaction COMMITTED, by page number.
+    ///
+    /// An autonomous transaction is committed - that is the whole point
+    /// of it - so an enclosing undo must not take it back, and every
+    /// undo in this server is "put an image back". These are written
+    /// FORWARD over the restored image, exactly as the generator
+    /// windows' settled values are ([write_gen_window]). Cleared when
+    /// the transaction ends, by which time they are on the disk.
+    auto_pages: std::collections::HashMap<u32, Vec<u8>>,
+    /// The image each open undo window started from, innermost last.
+    ///
+    /// An autonomous block asks this whether the BODY AROUND IT has
+    /// already written: if it has, the enclosing undo would put back an
+    /// image holding those writes and the page-level carve-out above
+    /// would carry them forward with the autonomous ones, leaving a
+    /// failed body's own rows visible. That is a wrong answer, so the
+    /// block is refused instead (see [TrigStmt::Autonomous]).
+    undo_base: Vec<std::sync::Arc<Vec<u8>>>,
     /// whether this TRANSACTION has written anything at all - which is
     /// not the same as holding the write side, now that the write side
     /// is one statement long. A rollback asks this to know whether
@@ -866,6 +892,11 @@ impl Database {
     /// an active transaction in the file that nothing wrote a row under.
     fn work_copy_with_tx(&mut self) -> Result<(Vec<u8>, u32), String> {
         let mut work = self.work_copy()?;
+        // inside an autonomous block the rows belong to ITS transaction,
+        // which was reserved when the block opened
+        if let Some(tx) = self.auto_tx {
+            return Ok((work, tx));
+        }
         if let Some(tx) = self.tx {
             return Ok((work, tx));
         }
@@ -885,11 +916,26 @@ impl Database {
 
     /// The statement installed its work, so the id it reserved is now
     /// this attachment's transaction - held until commit or rollback.
+    ///
+    /// An AUTONOMOUS transaction is never adopted: it is not this
+    /// attachment's transaction, it is one the block opened and the
+    /// block will end. Adopting it would make the outer COMMIT commit
+    /// it a second time and the outer ROLLBACK kill rows the engine
+    /// keeps.
     fn adopt_tx(&mut self, tx: u32) {
+        if self.auto_tx == Some(tx) {
+            return;
+        }
         if self.tx != Some(tx) {
             self.hold_tx_lock(tx);
         }
         self.tx = Some(tx);
+    }
+
+    /// Whose rows this attachment counts as its own right now: the
+    /// autonomous transaction while a block is open, otherwise its own.
+    fn own_tx(&self) -> Option<u32> {
+        self.auto_tx.or(self.tx)
     }
 
     /// Install an edited image, leaving its changed pages DIRTY - on
@@ -989,6 +1035,11 @@ impl Database {
         self.tx = None;
         self.touched = false;
         self.image_undo = false;
+        // the autonomous carve-out has done its work: those pages are on
+        // the disk, and no undo of a LATER transaction reaches back past
+        // a snapshot taken after them
+        self.auto_pages.clear();
+        self.undo_base.clear();
         // whoever was waiting for this transaction can go now
         self.locks.release(self.lock_owner);
     }
@@ -1148,6 +1199,21 @@ fn mark_generator_set(db: &mut Database, name: &str) {
     let Some(current) = read_generator_value(db, name) else { return };
     if let Some(w) = db.gen_windows.last_mut() {
         w.pre_set.entry(name.to_ascii_uppercase()).or_insert(current);
+    }
+}
+
+/// Remember the image an undo window starts from, so an autonomous
+/// block can ask whether the body around it has written since. Paired
+/// with [undo_base_pop] wherever a snapshot is taken and put back.
+fn undo_base_push(database: &mut Option<Database>, snap: &Option<std::sync::Arc<Vec<u8>>>) {
+    if let (Some(db), Some(s)) = (database.as_mut(), snap.as_ref()) {
+        db.undo_base.push(std::sync::Arc::clone(s));
+    }
+}
+
+fn undo_base_pop(database: &mut Option<Database>, snap: &Option<std::sync::Arc<Vec<u8>>>) {
+    if let (Some(db), Some(_)) = (database.as_mut(), snap.as_ref()) {
+        db.undo_base.pop();
     }
 }
 
@@ -1311,6 +1377,9 @@ fn load_database(path: &str) -> Option<Database> {
         shared,
         write: None,
         tx: None,
+        auto_tx: None,
+        auto_pages: std::collections::HashMap::new(),
+        undo_base: Vec::new(),
         touched: false,
         posted: std::cell::RefCell::new(Vec::new()),
         events,
@@ -7126,6 +7195,13 @@ enum TrigStmt {
     /// is about to `EXECUTE STATEMENT`, which is how that feature is
     /// actually written.
     AssignText { slot: u16, text: Vec<DynPart>, src_off: usize },
+    /// `IN AUTONOMOUS TRANSACTION DO <stmt>;` - the statement runs in a
+    /// TRANSACTION OF ITS OWN, which commits when it finishes and rolls
+    /// back if it raises. What the engine holds and this reproduces:
+    /// what the block committed SURVIVES the failure of the body around
+    /// it, and the block CANNOT SEE the outer transaction's uncommitted
+    /// rows (both probed).
+    Autonomous { body: Box<TrigStmt>, src_off: usize },
     /// `EXECUTE STATEMENT <text> [INTO :v[, :v]];` - the statement the
     /// body BUILDS, prepared and run where it stands. It is
     /// `isc_dsql_execute_immediate` from the inside, so it goes down the
@@ -7404,10 +7480,47 @@ fn parse_trigger_body(
     Some(body)
 }
 
+/// Whitespace AND COMMENTS - `/* ... */` and `-- to end of line`.
+///
+/// The comments matter because this walks BETWEEN statements, and a
+/// comment after the last one refused the whole body: the cursor landed
+/// on `/`, which is not the start of a word, and the block parse gave
+/// up. It was invisible for a long time because a body of nothing but
+/// assignments is answered by the BLR executor, which never consults
+/// this parser - so only a body that also WRITES showed it (found by
+/// this project's own gate, whose `/* duplicate key */` note refused the
+/// procedure it was explaining).
+///
+/// A comment INSIDE a statement is still outside the surface: the
+/// statement text is taken verbatim between semicolons and handed to
+/// parsers that do not know comments either.
 fn skip_trig_ws(s: &str, pos: &mut usize, limit: usize) {
     let b = s.as_bytes();
-    while *pos < limit && b[*pos].is_ascii_whitespace() {
-        *pos += 1;
+    loop {
+        while *pos < limit && b[*pos].is_ascii_whitespace() {
+            *pos += 1;
+        }
+        if *pos + 1 < limit && b[*pos] == b'/' && b[*pos + 1] == b'*' {
+            match s[*pos + 2..limit].find("*/") {
+                Some(end) => *pos += 2 + end + 2,
+                None => {
+                    *pos = limit; // unterminated: nothing left to read
+                    return;
+                }
+            }
+            continue;
+        }
+        if *pos + 1 < limit && b[*pos] == b'-' && b[*pos + 1] == b'-' {
+            match s[*pos..limit].find('\n') {
+                Some(end) => *pos += end + 1,
+                None => {
+                    *pos = limit;
+                    return;
+                }
+            }
+            continue;
+        }
+        return;
     }
 }
 
@@ -7525,6 +7638,7 @@ fn body_has_uninterpretable_blr(st: &TrigStmt) -> bool {
         | TrigStmt::Leave { .. }
         | TrigStmt::Exit { .. }
         | TrigStmt::AssignText { .. }
+        | TrigStmt::Autonomous { .. }
         | TrigStmt::ExecStmt { .. }
         | TrigStmt::ForExecStmt { .. }
         | TrigStmt::CallProc { .. } => true,
@@ -7662,6 +7776,26 @@ fn parse_trig_stmt(
     if word == "BEGIN" {
         *pos = start + "BEGIN".len();
         return parse_trig_block(s, pos, limit, vars, start);
+    }
+    if word == "IN" {
+        // IN AUTONOMOUS TRANSACTION DO <stmt>
+        let up_all = s[..limit].to_ascii_uppercase();
+        let masked = mask_literals(&up_all);
+        let auto_kw = find_word(&masked, "AUTONOMOUS", start + "IN".len())?;
+        if up_all[start + "IN".len()..auto_kw].trim() != "" {
+            return None;
+        }
+        let tra_kw = find_word(&masked, "TRANSACTION", auto_kw + "AUTONOMOUS".len())?;
+        if up_all[auto_kw + "AUTONOMOUS".len()..tra_kw].trim() != "" {
+            return None;
+        }
+        let do_kw = find_word(&masked, "DO", tra_kw + "TRANSACTION".len())?;
+        if up_all[tra_kw + "TRANSACTION".len()..do_kw].trim() != "" {
+            return None;
+        }
+        *pos = do_kw + "DO".len();
+        let body = parse_trig_stmt(s, pos, limit, vars)?;
+        return Some(TrigStmt::Autonomous { body: Box::new(body), src_off: start });
     }
     if word == "FOR" {
         // FOR SELECT <query> INTO :v[, ...] DO <stmt>
@@ -7826,7 +7960,24 @@ fn parse_trig_stmt(
         let stmt_kw = find_word(&masked, "STATEMENT", "EXECUTE".len())?;
         let after = stmt_kw + "STATEMENT".len();
         let into_kw = find_word(&masked, "INTO", after);
-        let dyn_text = parse_dyn_text(&text[after..into_kw.unwrap_or(text.len())], vars)?;
+        // `WITH AUTONOMOUS TRANSACTION` sits between the text and the
+        // INTO (the engine's grammar), so it has to come off the operand
+        // before the operand is read. Any OTHER `WITH` clause - COMMON
+        // TRANSACTION, CALLER PRIVILEGES - is refused rather than
+        // ignored: ignoring one changes what the statement does.
+        let operand_end = into_kw.unwrap_or(text.len());
+        let (operand_end, autonomous) = match find_word(&masked, "WITH", after) {
+            Some(w) if w < operand_end => {
+                if masked[w + "WITH".len()..operand_end].split_whitespace().collect::<Vec<_>>()
+                    != ["AUTONOMOUS", "TRANSACTION"]
+                {
+                    return None;
+                }
+                (w, true)
+            }
+            _ => (operand_end, false),
+        };
+        let dyn_text = parse_dyn_text(&text[after..operand_end], vars)?;
         let mut into = Vec::new();
         if let Some(k) = into_kw {
             for part in text[k + "INTO".len()..].split(',') {
@@ -7837,7 +7988,12 @@ fn parse_trig_stmt(
                 return None;
             }
         }
-        return Some(TrigStmt::ExecStmt { text: dyn_text, into, src_off: start });
+        let exec = TrigStmt::ExecStmt { text: dyn_text, into, src_off: start };
+        return Some(if autonomous {
+            TrigStmt::Autonomous { body: Box::new(exec), src_off: start }
+        } else {
+            exec
+        });
     }
     if find_word(&up, "EXECUTE", 0) == Some(0) {
         let proc_kw = find_word(&up, "PROCEDURE", "EXECUTE".len())?;
@@ -8163,6 +8319,7 @@ fn emit_trigger_stmt(
         | TrigStmt::Leave { .. }
         | TrigStmt::Exit { .. }
         | TrigStmt::AssignText { .. }
+        | TrigStmt::Autonomous { .. }
         | TrigStmt::ExecStmt { .. }
         | TrigStmt::ForExecStmt { .. }
         | TrigStmt::CallProc { .. } => {}
@@ -8571,6 +8728,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | TrigStmt::Leave { .. }
             | TrigStmt::Exit { .. }
             | TrigStmt::AssignText { .. }
+            | TrigStmt::Autonomous { .. }
             | TrigStmt::ExecStmt { .. }
             | TrigStmt::ForExecStmt { .. }
             | TrigStmt::CallProc { .. } => {}
@@ -8611,6 +8769,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | TrigStmt::Leave { .. }
             | TrigStmt::Exit { .. }
             | TrigStmt::AssignText { .. }
+            | TrigStmt::Autonomous { .. }
             | TrigStmt::ExecStmt { .. }
             | TrigStmt::ForExecStmt { .. }
             | TrigStmt::CallProc { .. } => {}
@@ -8652,6 +8811,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | TrigStmt::Leave { .. }
             | TrigStmt::Exit { .. }
             | TrigStmt::AssignText { .. }
+            | TrigStmt::Autonomous { .. }
             | TrigStmt::ExecStmt { .. }
             | TrigStmt::ForExecStmt { .. }
             | TrigStmt::CallProc { .. } => {}
@@ -13888,7 +14048,7 @@ fn blocking_transaction(db: &Database, targets: &[(u32, u16, u8, Vec<u8>)]) -> O
             continue;
         };
         let owner = head.transaction;
-        if owner == 0 || Some(owner) == db.tx.map(u64::from) {
+        if owner == 0 || Some(owner) == db.own_tx().map(u64::from) {
             continue;
         }
         if tips.state(owner) == Some(fire_crab_ods::tip::TxState::Active) {
@@ -22410,7 +22570,7 @@ struct ReadView<'a> {
 
 impl<'a> ReadView<'a> {
     fn of(db: &Database, image: &'a [u8]) -> ReadView<'a> {
-        ReadView::over(image, db.page_size, db.tx)
+        ReadView::over(image, db.page_size, db.own_tx())
     }
 
     /// The same view over an image the caller holds directly - a
@@ -22572,7 +22732,7 @@ fn count_visible_records(db: &Database, rel: u16) -> i64 {
         // no transaction inventory to consult: what the walk did before
         return fire_crab_ods::count_primary_records(&db_image, db.page_size, rel) as i64;
     };
-    let own = db.tx.map(u64::from);
+    let own = db.own_tx().map(u64::from);
     let mut n = 0i64;
     for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
         let start = dp_no as usize * db.page_size;
@@ -35171,6 +35331,26 @@ fn restore_db(database: &mut Option<Database>, snap: Option<std::sync::Arc<Vec<u
         if !db.wrote() {
             return false;
         }
+        // AN AUTONOMOUS TRANSACTION IS NOT UNDONE BY THE BODY AROUND IT.
+        // Its pages are written FORWARD over the image being put back -
+        // the same carve-out the generator windows have, for the same
+        // reason: the engine keeps what an autonomous transaction
+        // committed however the enclosing statement ends (probed - a
+        // block that logs a row and a body that then divides by zero
+        // leaves the row behind).
+        let bytes = if db.auto_pages.is_empty() {
+            bytes
+        } else {
+            let mut img = bytes.as_ref().clone();
+            for (page, data) in &db.auto_pages {
+                let at = *page as usize * db.page_size;
+                if at + data.len() > img.len() {
+                    img.resize(at + data.len(), 0);
+                }
+                img[at..at + data.len()].copy_from_slice(data);
+            }
+            std::sync::Arc::new(img)
+        };
         // THE PAGES THAT DIFFER, not the file. Putting an image back
         // is a write like any other, and the careful flush compares it
         // against what is on the disk; `fs::write` of the whole image
@@ -35620,6 +35800,7 @@ fn stmt_src_off(s: &TrigStmt) -> usize {
         | TrigStmt::Leave { src_off, .. }
         | TrigStmt::Exit { src_off, .. }
         | TrigStmt::AssignText { src_off, .. }
+        | TrigStmt::Autonomous { src_off, .. }
         | TrigStmt::ExecStmt { src_off, .. }
         | TrigStmt::ForExecStmt { src_off, .. }
         | TrigStmt::CallProc { src_off, .. } => *src_off,
@@ -36012,6 +36193,14 @@ fn exec_psql_stmt_inner(
             f.vars[n] = v.map_or(Value::Null, Value::Text);
             Ok(())
         }
+        // IN AUTONOMOUS TRANSACTION: the block runs under a transaction
+        // of its OWN, which commits when the block finishes and dies if
+        // it raises. See [run_autonomous] for the whole of it.
+        TrigStmt::Autonomous { body, .. } => {
+            run_autonomous(f, steps, db, ctx, |f, steps, db, ctx| {
+                exec_psql_stmt(body, f, steps, db, ctx)
+            })
+        }
         // EXECUTE STATEMENT: the statement the body BUILT, run where it
         // stands. `run_dyn_statement` is the whole of it; what is left
         // here is the INTO contract, and every rule in it was measured.
@@ -36070,6 +36259,126 @@ fn exec_psql_stmt_inner(
         // SUSPEND, cursors, FOR SELECT, nested calls
         _ => Err(PsqlStop::Unsupported),
     }
+}
+
+/// Run `run` inside an AUTONOMOUS TRANSACTION: its own id, its own
+/// commit, its own rollback.
+///
+/// The three engine rules this reproduces, all probed:
+///
+///   * the block CANNOT SEE the outer transaction's uncommitted rows -
+///     it is a different transaction, and this server's visibility rule
+///     ("committed, or my own") gives that for free once the reads run
+///     under the block's id ([Database::own_tx]);
+///   * what the block COMMITTED survives the failure of the body around
+///     it - the pages it wrote are kept as a carve-out and written
+///     forward over whatever an enclosing undo puts back
+///     ([Database::auto_pages]);
+///   * an error inside the block ROLLS IT BACK and then escapes, so the
+///     caller may catch it and nothing the block wrote remains.
+///
+/// THE ONE SHAPE IT REFUSES, and why it is a refusal rather than an
+/// answer: if the BODY AROUND THE BLOCK has already written, the
+/// enclosing undo would put back an image without those writes and the
+/// page carve-out would carry them straight back in - the body's own
+/// rows, on the same pages as the autonomous ones, visible to a
+/// transaction whose statement failed. Undoing them needs the body's
+/// writes to have a transaction of their own to kill (the engine's
+/// savepoint model), which this server does not have yet. So the block
+/// is served when the body has not written and refused when it has.
+fn run_autonomous(
+    f: &mut PsqlFrame,
+    steps: &mut u32,
+    db: &mut Option<Database>,
+    ctx: &SessionCtx,
+    run: impl FnOnce(&mut PsqlFrame, &mut u32, &mut Option<Database>, &SessionCtx) -> Result<(), PsqlStop>,
+) -> Result<(), PsqlStop> {
+    {
+        let d = db.as_ref().ok_or(PsqlStop::Unsupported)?;
+        // one autonomous transaction at a time: a nested block would
+        // have the same undo problem, its parent being the writer
+        if d.auto_tx.is_some() {
+            return Err(PsqlStop::Unsupported);
+        }
+        // has the body around this block written since the undo window
+        // opened? (a different image is published for every write; a
+        // read publishes nothing)
+        if let Some(base) = d.undo_base.last() {
+            if !std::sync::Arc::ptr_eq(base, &d.bytes()) {
+                return Err(PsqlStop::Unsupported);
+            }
+        }
+    }
+    // OPEN IT: a fresh id, ACTIVE in the TIP, installed so the reads
+    // inside the block see a file that has it.
+    //
+    // THE CARVE-OUT'S BASELINE IS TAKEN HERE, BEFORE THE RESERVATION,
+    // and that is not a detail: the id costs a HEADER write
+    // (`hdr_next_transaction`) and a TIP write, and a carve-out that
+    // starts after them carries the rows forward while letting the
+    // header go back - so the NEXT autonomous block reserves the same
+    // id, marks it dead when it fails, and the row that was committed
+    // silently stops counting. Measured exactly that way.
+    let before = db.as_ref().map(|d| d.bytes()).ok_or(PsqlStop::Unsupported)?;
+    {
+        let d = db.as_mut().ok_or(PsqlStop::Unsupported)?;
+        let mut work = d.work_copy().map_err(PsqlStop::Failed)?;
+        let tx = fire_crab_ods::dml::begin_active_tx(&mut work, d.page_size)
+            .map_err(PsqlStop::Failed)?;
+        if tx > u32::MAX as u64 {
+            return Err(PsqlStop::Unsupported);
+        }
+        d.install_dirty(work);
+        d.auto_tx = Some(tx as u32);
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] autonomous transaction {} opened", tx);
+        }
+    }
+    let outcome = run(f, steps, db, ctx);
+    let Some(d) = db.as_mut() else { return Err(PsqlStop::Unsupported) };
+    let Some(tx) = d.auto_tx.take() else { return Err(PsqlStop::Unsupported) };
+    // END IT: committed or dead, and on the disk either way - an
+    // autonomous transaction that only reached the page pool would be
+    // undone by the enclosing rollback's flush.
+    let state = if outcome.is_ok() {
+        fire_crab_ods::tip::TxState::Committed
+    } else {
+        fire_crab_ods::tip::TxState::Dead
+    };
+    let end = (|| -> Result<(), String> {
+        let mut work = d.work_copy()?;
+        fire_crab_ods::dml::set_tx_state(&mut work, d.page_size, tx as u64, state)?;
+        d.flush_and_install(work)
+    })();
+    if let Err(e) = end {
+        return Err(PsqlStop::Failed(e));
+    }
+    if std::env::var("FC_SRV_TRACE").is_ok() {
+        eprintln!("[srv] autonomous transaction {} {:?}", tx, state);
+    }
+    // THE CARVE-OUT, and only for a commit: a dead transaction's pages
+    // have nothing an enclosing undo must keep.
+    if outcome.is_ok() {
+        let after = d.bytes();
+        let ps = d.page_size;
+        let pages = after.len().div_ceil(ps);
+        let mut changed = std::collections::HashMap::new();
+        for p in 0..pages {
+            let at = p * ps;
+            let new = &after[at..(at + ps).min(after.len())];
+            let old = before.get(at..(at + ps).min(before.len())).unwrap_or(&[]);
+            if new != old {
+                changed.insert(p as u32, new.to_vec());
+            }
+        }
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] autonomous carve-out: {} pages", changed.len());
+        }
+        for (p, bytes) in changed {
+            d.auto_pages.insert(p, bytes);
+        }
+    }
+    outcome
 }
 
 /// A runtime error raised from a statement, with the position left for
@@ -36435,8 +36744,10 @@ fn run_procedure(
     // everything the body wrote before it, as the engine does
     let snap = snapshot_db(database);
     let mark = gen_window_push(database);
+    undo_base_push(database, &snap);
     let mut steps = 0u32;
     let outcome = exec_psql_stmt(&body, &mut frame, &mut steps, database, ctx);
+    undo_base_pop(database, &snap);
     if outcome.is_err() {
         restore_db(database, snap);
     }
@@ -41180,6 +41491,9 @@ mod tests {
             shared: fire_crab_cch::pool::detached(Vec::new()),
             write: None,
             tx: None,
+            auto_tx: None,
+            auto_pages: std::collections::HashMap::new(),
+            undo_base: Vec::new(),
             touched: false,
             posted: std::cell::RefCell::new(Vec::new()),
             events: events_for("/nonexistent/fc-rowsource-test"),
@@ -43990,6 +44304,9 @@ mod tests {
             shared: fire_crab_cch::pool::detached(Vec::new()),
             write: None,
             tx: None,
+            auto_tx: None,
+            auto_pages: std::collections::HashMap::new(),
+            undo_base: Vec::new(),
             touched: false,
             posted: std::cell::RefCell::new(Vec::new()),
             events: events_for("/nonexistent/fc-rowsource-test"),
@@ -47507,6 +47824,27 @@ mod tests {
         // not a literal
         assert!(one("'a' || NOSUCH").is_none());
         assert!(one("'a").is_none());
+    }
+
+    /// A comment between statements is skipped, not met. It refused
+    /// whole bodies before - and only bodies that WRITE, since a body
+    /// of assignments never reaches this parser at all.
+    #[test]
+    fn body_whitespace_skips_comments() {
+        let at = |s: &str| {
+            let mut p = 0usize;
+            skip_trig_ws(s, &mut p, s.len());
+            p
+        };
+        assert_eq!(at("  /* a note */ END"), "  /* a note */ ".len());
+        assert_eq!(at("-- a line\n  END"), "-- a line\n  ".len());
+        // several in a row, mixed with whitespace
+        assert_eq!(at(" /* one */ -- two\n /* three */X"), " /* one */ -- two\n /* three */".len());
+        // nothing to skip
+        assert_eq!(at("END"), 0);
+        // an unterminated comment leaves nothing to read rather than
+        // looping or reading past the end
+        assert_eq!(at("/* never closed"), "/* never closed".len());
     }
 
     /// A statement ends at the semicolon OUTSIDE its literals - the

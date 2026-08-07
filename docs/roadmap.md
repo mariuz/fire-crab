@@ -2556,10 +2556,38 @@ plus *the subsystem is now on the path*.
     the row encoder renders a text value into an integer slot as 0, so
     the client was told 5 is 0. Both the source interpreter and the BLR
     executor now refuse it instead;
-  * **`IN AUTONOMOUS TRANSACTION`**, which needs a second transaction
-    while one is open. `EXECUTE STATEMENT ... WITH AUTONOMOUS
-    TRANSACTION` is the same requirement wearing the other syntax, and
-    both are refused and gated as boundaries until it lands;
+  * ~~`IN AUTONOMOUS TRANSACTION`~~ **DONE** (eighth slice), and
+    `EXECUTE STATEMENT ... WITH AUTONOMOUS TRANSACTION` with it, since
+    it is the same requirement wearing the other syntax
+    (`qa/serve-real-autonomous.sh`, 22 checks). The block reserves its
+    own id, commits or dies on its own, and - the part that took the
+    work - **what it committed survives the failure of the body around
+    it**, because every undo in this server is "put an image back" and
+    the block's pages therefore have to be written FORWARD over what the
+    undo restores, the way the generator windows already write their
+    settled values. The other direction came free: the block cannot see
+    the outer transaction's uncommitted rows, since visibility here is
+    "committed, or my own" and the block's reads run under the block's
+    id.
+
+    **What it refuses, and what would lift the refusal.** If the BODY
+    AROUND the block has already written, the enclosing undo restores an
+    image without those writes and the page carve-out carries them
+    straight back in - a failed statement's own rows, still visible to
+    its transaction. Undoing them needs them to have a transaction of
+    their own to KILL, which is the engine's savepoint model
+    (`tra.cpp`'s undo records / `VIO_verb_cleanup`): a body's writes
+    under a nested transaction id that the outer COMMIT commits and the
+    outer ROLLBACK kills. That is its own increment, and it is what the
+    body-wrote-first and nested-block boundaries are waiting on. It
+    would also be the first piece of REAL savepoint support, which
+    `ROLLBACK TO` currently gets by restoring images.
+
+    It also found where the ISOLATION MODEL first shows: the outer
+    transaction reading what the block committed answers 0 in the engine
+    (its snapshot predates the block) and 1 here (a reader counts what is
+    committed when it reads). Snapshot isolation is not converted; the
+    gate asserts the divergence rather than letting it pass;
   * ~~`ROW_COUNT`~~ **DONE** with the slice above - the DML paths report
     what they touched back into the frame, and a statement that matched
     nothing answers 0 rather than leaving the previous count.
@@ -2579,6 +2607,16 @@ plus *the subsystem is now on the path*.
   not supported at all** - every gate builds its procedures with the engine
   and executes them through fire-crab, which is why the interpreter is
   well covered and the DDL is not.
+
+  And one that had been hiding: **a COMMENT in a body refused the whole
+  body**, because the statement walk skipped whitespace and not `/* */`
+  or `--`. It survived this long because a body of nothing but
+  ASSIGNMENTS never reaches the source parser at all - the BLR executor
+  answers it - so only a body that also WRITES showed it. Fixed with the
+  autonomous slice, whose gate found it by commenting one of its own
+  procedures. **A comment INSIDE a statement is still outside the
+  surface**: the statement text is taken verbatim between semicolons and
+  handed to parsers that do not know comments either.
 
   **`gfix -write sync|async` is not a service at all.** Filing the
   tools under "as services" was a guess, and this one is wrong: gfix
