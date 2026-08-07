@@ -13,6 +13,69 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-07 — the sweep performed: gfix -sweep
+
+### Converted
+- **`gfix -sweep`** — `isc_dpb_sweep` (tag 10) — as the WRITE half of the
+  garbage collection `crates/ods/src/gc.rs` has predicted since it was
+  converted (`qa/diff-sweep.sh` holds the prediction; the new gate holds
+  the performance). `gc::sweep` walks every relation off the pointer
+  pages, catalog-free, and per chain: a rolled-back INSERT vanishes whole
+  (the slot's directory entry zeroed — the bytes stay, as the engine's
+  own lazily-compacted pages do); a rolled-back UPDATE is **backed out by
+  PROMOTION** — the back version's image (reconstructed through
+  `apply_differences` when the dead head carries `rhd_delta`) is repacked
+  under dml's own RLE coin (packed when it shrinks, raw + NOT_PACKED when
+  it does not) and rewritten into the head's slot, then the back slot is
+  freed, then the NEW head is judged afresh (a stack of dead versions
+  unwinds one promotion at a time); a committed DELETED stub is expunged
+  with its whole chain; and a live head's history is collected, its back
+  pointer cut. One liberty, stated: this server has no snapshots, so the
+  oldest-snapshot threshold that gates the engine's collection is always
+  "everything" here.
+- **An ACTIVE transaction is judged by its LOCK.** `gfix -sweep` skips a
+  version whose transaction somebody still holds and backs out one whose
+  owner is gone — the engine's own probe is the transaction lock, so
+  `DbLocks::transaction_is_held` asks the same table the real waits
+  arbitrate on (a no-wait SharedRead probe against the holder's
+  Exclusive, dropped either way), not a second bookkeeping that could
+  drift. A stale active is marked DEAD in the TIP on the way.
+- **Measured laws the shape comes from** (a fire-crab-written file with
+  real `tra_dead` entries, swept by the LIVE engine): versions collapse
+  to the live count with rows unchanged; **the TIP's dead entries STAY
+  dead** — a sweep advances `hdr_oldest_transaction` PAST them rather
+  than rewriting history; OAT and OST land at next-transaction. fire-crab
+  burns no id, so its postcondition is OIT = OAT = OST = next.
+- The read-only refusal is the engine's own pair, measured: "Unable to
+  run sweep / -Database in read only state" (`isc_sweep_unable_to_run` +
+  `isc_sweep_read_only`).
+
+### Guarded
+- **Fail-closed per chain, and the ORDER is the guarantee**: a promotion
+  is rewritten into the head slot BEFORE the back slot is freed, so a
+  page with no room refuses with nothing half-done. A chain with a
+  fragmented member, a LIMBO transaction, a 64-bit id (the 32-bit header
+  slot would truncate it), or an unreconstructable delta is left whole
+  and counted. A relation whose pages carry BLOB records is left whole
+  too — freeing a version without freeing its blobs leaks them, and the
+  blob walk is its own slice; the gate asserts the difference against the
+  engine, which does collect them.
+
+### Gated
+- **`qa/serve-real-gfixsweep.sh`** (13 checks): each server builds the
+  same history through ITSELF and sweeps its own file — the BEFORE counts
+  legitimately differ (the engine backs a rollback out at ROLLBACK time
+  through its undo log; fire-crab's rollback is two TIP bits and its
+  garbage waits for the sweep), the AFTER counts must be equal and the
+  rows must read identically THROUGH THE ENGINE. Plus the header law read
+  offline before any engine attach can move it, dead TIP entries
+  surviving, `gfix -v -full` on the swept file, a held transaction's row
+  surviving the sweep and committing after it on BOTH servers, the
+  read-only pair, idempotence, and the blob boundary.
+- Unit tests in `gc.rs` build the four shapes on a synthetic four-page
+  file and check the promotion BY BYTES (the rolled-back update reads its
+  prior value again), plus idempotence — a second sweep finds nothing.
+
 ## 2026-08-07 — the mode ladder: gfix -shut and -online
 
 ### Converted

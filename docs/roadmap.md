@@ -2715,10 +2715,25 @@ plus *the subsystem is now on the path*.
   engine counts READ transactions in `-tran`'s wait where fire-crab has
   ids only for writers - both named in the gate.
 
-  What is left of gfix is the page-walking half: `-sweep` and
-  `-validate` (whole page walks - `fcstat census` already does the
-  reading half offline), and the limbo-transaction switches, which need
-  two-phase commit first.
+  *(fifth slice done)* **`-sweep`** - the WRITE half of the garbage
+  collection `gc.rs` had only predicted: rolled-back inserts vanish
+  whole, rolled-back updates are backed out BY PROMOTION (the back
+  version rewritten into the head's slot, delta reconstruction included,
+  then judged afresh - a stack of dead versions unwinds one promotion at
+  a time), deleted stubs are expunged with their chains, live heads'
+  history is collected. An ACTIVE transaction is judged by its LOCK -
+  `DbLocks::transaction_is_held` asks the same table the real waits
+  arbitrate on - and a stale one is marked dead on the way. Measured
+  first on a fire-crab file swept by the live engine: the TIP's dead
+  entries STAY dead (a sweep advances OIT past them, it does not rewrite
+  history), and OAT/OST land at next. Fail-closed per chain with the
+  ORDER as the guarantee (promote before free), and blob-carrying
+  relations left whole - the blob walk is its own slice, asserted as a
+  difference in `qa/serve-real-gfixsweep.sh` (13 checks).
+
+  What is left of gfix is `-validate` (a page walk that only reads,
+  which `fcstat census` half-does offline already) and the
+  limbo-transaction switches, which need two-phase commit first.
 
 ## A savepoint is a transaction (done)
 

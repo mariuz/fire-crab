@@ -174,6 +174,31 @@ impl DbLocks {
         outcome
     }
 
+    /// Does anybody HOLD this transaction's lock right now - i.e. is it
+    /// a live transaction of some attachment, as opposed to one left
+    /// ACTIVE in the TIP by a connection that never came back?
+    ///
+    /// The sweep asks this before backing a version out: an active
+    /// transaction with a living owner is skipped, one without is
+    /// garbage (the engine's own probe is the same lock - it waits on
+    /// it to decide whether "active" means anything).
+    ///
+    /// Asked BY ASKING - a no-wait SharedRead probe against the
+    /// holder's Exclusive, dropped either way - so the answer comes
+    /// from the same table that arbitrates the real waits, not from a
+    /// second bookkeeping that could drift.
+    pub fn transaction_is_held(&self, tx: u32) -> bool {
+        let mut t = lock(&self.table);
+        let probe = t.create_owner();
+        let verdict = t.enqueue(probe, series::TRA, &tra_key(tx), Mode::SharedRead, false);
+        let held = !matches!(verdict, Verdict::Granted);
+        t.purge_owner(probe);
+        drop(t);
+        // the probe may have briefly queued; whoever was behind it re-tests
+        self.wake.notify_all();
+        held
+    }
+
     /// The transaction ended, or the attachment did: drop everything
     /// this owner holds and wake whoever was waiting for it.
     pub fn release(&self, owner: OwnerId) {

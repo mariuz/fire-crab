@@ -712,7 +712,7 @@ fn push_back_version(
 /// The new body may be longer than the old (an RLE-packed record's
 /// unpacked successor usually is), so space is re-found on the page
 /// with the old body's bytes counted as free.
-fn rewrite_primary(
+pub(crate) fn rewrite_primary(
     file: &mut [u8],
     page_size: usize,
     page_no: u32,

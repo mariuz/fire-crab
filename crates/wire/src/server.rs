@@ -267,6 +267,13 @@ const GDS_ATT_SHUTDOWN: i32 = 335544856;
 /// the reason item behind it (measured on a held isql).
 const GDS_ATT_SHUT_DB_DOWN: i32 = 335545132;
 
+/// `isc_sweep_unable_to_run` - "Unable to run sweep" (42000), the head
+/// of the pair a refused `gfix -sweep` answers...
+const GDS_SWEEP_UNABLE_TO_RUN: i32 = 335545308;
+/// `isc_sweep_read_only` - "Database in read only state" - ...with this
+/// behind it when the reason is the mode.
+const GDS_SWEEP_READ_ONLY: i32 = 335545310;
+
 /// isc_lock_conflict - "lock conflict on no wait transaction", the
 /// engine's answer when a wait it will not make would be needed
 /// (iberror: 335544345).
@@ -13592,6 +13599,29 @@ impl Database {
             if is_shut { "shut" } else { "online" }
         ))
     }
+
+    /// Perform `gfix -sweep`: the write half of garbage collection,
+    /// converted in [fire_crab_ods::gc::sweep]. What this wrapper owns
+    /// is the SERVER's part of the question: the read-only refusal
+    /// (with the engine's own pair, measured), the write side, and the
+    /// answer to "is this ACTIVE transaction anybody's live work?" -
+    /// which is the lock table's question ([crate::dblocks]), asked of
+    /// the same table the real waits arbitrate on.
+    fn run_sweep(&mut self) -> Result<fire_crab_ods::gc::SweepOutcome, HeaderDpbErr> {
+        if self.is_read_only() {
+            return Err(HeaderDpbErr::SweepReadOnly);
+        }
+        let mut work = self.work_copy().map_err(HeaderDpbErr::Other)?;
+        let locks = std::sync::Arc::clone(&self.locks);
+        let held = move |tx: u64| {
+            u32::try_from(tx).map(|t| locks.transaction_is_held(t)).unwrap_or(true)
+        };
+        let out = fire_crab_ods::gc::sweep(&mut work, self.page_size, &held)
+            .map_err(HeaderDpbErr::Other)?;
+        self.flush_and_install(work).map_err(HeaderDpbErr::Other)?;
+        self.end_write();
+        Ok(out)
+    }
 }
 
 /// WHY A HEADER DPB CAN BE REFUSED, and with which of the engine's own
@@ -13618,6 +13648,9 @@ enum HeaderDpbErr {
     /// a `-shut -attach N`/`-tran N` whose wait ran out: `isc_shutfail`,
     /// no arguments, and the header untouched
     ShutFail,
+    /// `gfix -sweep` on a read-only database: the engine's own pair,
+    /// "Unable to run sweep / -Database in read only state" (measured)
+    SweepReadOnly,
     /// the file has no readable header page
     NoHeader,
     /// the write itself failed - a full header page, an I/O error
@@ -13649,6 +13682,12 @@ impl HeaderDpbErr {
             HeaderDpbErr::ShutFail => {
                 w.int(1).int(GDS_SHUTFAIL);
             }
+            HeaderDpbErr::SweepReadOnly => {
+                w.int(1)
+                    .int(GDS_SWEEP_UNABLE_TO_RUN)
+                    .int(1)
+                    .int(GDS_SWEEP_READ_ONLY);
+            }
             HeaderDpbErr::NoHeader | HeaderDpbErr::Other(_) => {
                 w.int(1).int(GDS_DSQL_ERROR);
             }
@@ -13665,6 +13704,7 @@ impl std::fmt::Display for HeaderDpbErr {
                 write!(f, "target shutdown mode is invalid for database \"{}\"", p)
             }
             HeaderDpbErr::ShutFail => f.write_str("database shutdown unsuccessful"),
+            HeaderDpbErr::SweepReadOnly => f.write_str("unable to run sweep: read-only database"),
             HeaderDpbErr::NoHeader => f.write_str("no header page"),
             HeaderDpbErr::Other(e) => f.write_str(e),
         }
@@ -13720,6 +13760,10 @@ struct ShutDpb {
     delay: i32,
     /// tag 51: the mode byte of an `-online`
     online: Option<u8>,
+    /// tag 10, `gfix -sweep`: garbage-collect the whole file. The byte
+    /// it carries (`isc_dpb_records`) is the only value gfix ever
+    /// sends, so it is a flag here.
+    sweep: bool,
 }
 
 impl ShutDpb {
@@ -13750,6 +13794,7 @@ fn parse_dpb_shut(dpb: &[u8]) -> ShutDpb {
             50 => want.shutdown = Some(v as u8),
             51 => want.online = Some(v as u8),
             52 => want.delay = v as i32,
+            10 => want.sweep = true,
             _ => {}
         }
         i = end;
@@ -39627,6 +39672,39 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 Err(e) => {
                     if std::env::var("FC_SRV_TRACE").is_ok() {
                         eprintln!("[srv] shutdown dpb {:?} refused: {}", want_shut, e);
+                    }
+                    let mut w = W::default();
+                    w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+                    e.write_items(&mut w);
+                    w.int(0); // isc_arg_end
+                    w.send(&mut s, &mut enc)?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+    // `gfix -sweep`: garbage-collect the file, then carry on attaching
+    // (the tool detaches right after; the attach is the vehicle).
+    if want_shut.sweep {
+        if let Some(db) = database.as_mut() {
+            match db.run_sweep() {
+                Ok(out) => {
+                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!(
+                            "[srv] sweep: {} relations, {} versions removed, {} records removed, \
+                             {} chains skipped, {} blob relations skipped, {} stale actives",
+                            out.relations_swept,
+                            out.versions_removed,
+                            out.records_removed,
+                            out.chains_skipped,
+                            out.relations_skipped_blob,
+                            out.stale_actives,
+                        );
+                    }
+                }
+                Err(e) => {
+                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!("[srv] sweep refused: {}", e);
                     }
                     let mut w = W::default();
                     w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
