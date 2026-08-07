@@ -16,7 +16,7 @@ matters more than the row count:
 |---|---|---|
 | **done** | on-disk structures, record decode + RLE, PIP, pointer/data pages, B-tree decode, TIP/MVCC, GC/sweep, BLR decode | converted and held against an oracle; the server depends on them |
 | **converted, wired** | `ods`, `blb`, `auth`, `svc`, `exe`, `dsql` | the running server links and uses them |
-| **converted, half wired** | `evt` | `POST_EVENT` posts into it and commits move its counters; what the server cannot do yet is CARRY a delivery, which needs the auxiliary connection (W5) |
+| **converted, wired** | `evt` | `POST_EVENT` posts into it, commits move its counters, and the delivery is CARRIED over the auxiliary connection - the paper's own `samples/nodejs/events.js` prints the same lines against fire-crab as against the engine (W5 done) |
 | **converted, wired** | `stmc` | the plan a statement resolves to is kept per attachment and dropped by DDL. It took moving the two prepare-time FOLDS to fetch first — a lone aggregate and a `GEN_ID` read were computed by the planner and carried in the plan, so a kept plan answered the same number for ever |
 | **wired** | `lck` | a writer that meets another transaction's uncommitted row waits on that transaction's own lock and then re-reads, and two waiting on each other are denied by the wait-for scan with the engine's `isc_deadlock` (W4) |
 | **being wired** | `opt`, `cch`, `pio` | the server asks `opt` for the access path and takes an index when it says so (W1); the pages of a file live once per process in `cch`'s buffer pool and are flushed in its careful write order (W2), and written with `pio`, in the open mode the header's Forced Writes flag calls for (W3) |
@@ -2593,18 +2593,18 @@ plus *the subsystem is now on the path*.
     "committed, or my own" and the block's reads run under the block's
     id.
 
-    **What it refuses, and what would lift the refusal.** If the BODY
-    AROUND the block has already written, the enclosing undo restores an
-    image without those writes and the page carve-out carries them
-    straight back in - a failed statement's own rows, still visible to
-    its transaction. Undoing them needs them to have a transaction of
-    their own to KILL, which is the engine's savepoint model
-    (`tra.cpp`'s undo records / `VIO_verb_cleanup`): a body's writes
-    under a nested transaction id that the outer COMMIT commits and the
-    outer ROLLBACK kills. That is its own increment, and it is what the
-    body-wrote-first and nested-block boundaries are waiting on. It
-    would also be the first piece of REAL savepoint support, which
-    `ROLLBACK TO` currently gets by restoring images.
+    **What it refused, and what lifted it - DONE, the increment after
+    it.** If the BODY AROUND the block had already written, the enclosing
+    undo restored an image without those writes and the page carve-out
+    carried them straight back in - a failed statement's own rows, still
+    visible to its transaction. Undoing them needed them to have a
+    transaction of their own to KILL, which is the engine's savepoint
+    model (`tra.cpp`'s undo records / `VIO_verb_cleanup`). **That is now
+    what every undo window is** (see *A savepoint is a transaction*
+    below): the body's writes carry a nested id, killing it is the undo,
+    and both the body-wrote-first and the block-inside-a-block boundary
+    are ordinary differential checks. What is still refused is the two of
+    them meeting the IMAGE path - a transaction that has done DDL.
 
     It also found where the ISOLATION MODEL first shows: the outer
     transaction reading what the block committed answers 0 in the engine
@@ -2675,6 +2675,109 @@ plus *the subsystem is now on the path*.
   `-validate` (whole page walks - `fcstat census` already does the
   reading half offline), and the limbo-transaction switches, which need
   two-phase commit first.
+
+## A savepoint is a transaction (done)
+
+This was the named architectural next step, and it is the one that
+changes what the server IS rather than what it answers.
+
+**The problem.** Every undo in this server was *put the image back*. It
+worked, and for a transaction it was even cheap once snapshots became
+refcount bumps - but it has three properties nothing can fix from
+outside:
+
+1. the image was taken **before the window's first write**, so another
+   attachment committing inside the window is undone by putting it back
+   (which is why an open savepoint had to HOLD the write side, and why
+   nobody else could write while one was open);
+2. it undoes a window by undoing the FILE, so anything that must survive
+   the undo has to be carved out of it by hand - which is what the
+   generator windows do, and what the autonomous block's `auto_pages`
+   do, and each carve-out is a place to get the width wrong;
+3. it cannot express *undo part of this transaction*, because one
+   transaction id has one state.
+
+**The mechanism, which was already there.** A transaction's rollback had
+stopped being an image two days earlier: `tra_dead` in the TIP, two bits, and
+every reader walks past a version whose transaction it does not count to
+the one behind it. The version behind a savepoint's write **is** the
+pre-savepoint value of the row. So an undo window only needs an id of
+its own:
+
+- each window that installs its writes as it goes - a `SAVEPOINT`, a
+  PSQL body, `INSERT ... SELECT`, an `IN AUTONOMOUS TRANSACTION` block -
+  reserves a nested id at its **first record write** (a window that
+  writes nothing costs nothing, and a single-statement window never
+  reserves one at all: its undo is dropping a working copy);
+- undoing the window is `tra_dead` on that id;
+- closing it successfully hands the id to the window around it, because
+  the rows are the transaction's uncommitted work still;
+- COMMIT flips **every** id the transaction holds in one work copy and
+  one flush, so no other attachment can read half a commit.
+
+Visibility therefore stopped being one number: `fire_crab_ods::tra::OwnTx`
+is the set a reader counts as its own, and an AUTONOMOUS window stops
+the walk INCLUSIVELY - which is where the engine's "a block cannot see
+the uncommitted rows of the transaction around it" now comes from,
+instead of a special case.
+
+**What it lifted.** Both boundaries the autonomous slice recorded: a body
+that had already written before the block, and a block inside a block.
+Both are ordinary differential checks now, each held by the DIVISION it
+turns on - the failed body's own UPDATE goes back, the block's INSERT
+stays; the inner block commits, the outer one dies.
+
+**What still needs the image, and why that is right.** DDL. A catalog row
+here is settled as it is written - this server's DDL is not
+transactional - so no transaction state can take it back.
+`Database::ddl_undo` says an undo needs the image; `Database::image_undo`
+now says only *hold the write side, because an image may still be put
+back*. A savepoint sets the second and not the first: it keeps its base
+image as the fallback for a transaction that later does DDL, and pays the
+write side for it. Removing that last cost means making the fallback
+image safe to take LATE, which is its own question.
+
+**What was found on the way**, all of it by the gates rather than by
+reading:
+
+- **A writer must count the transaction's WHOLE set of ids.** A row
+  inserted before a mark carries the transaction's id and the mark's
+  rows a nested one, so a uniqueness check that consulted only the id it
+  was writing under could not see the earlier row - and would accept a
+  duplicate primary key. Asserted in both directions now: the key of an
+  undone window can come back, the key of a pre-mark row cannot.
+- **A statement after the undo must read the VISIBLE version.**
+  `SET V = V + 1` after a `ROLLBACK TO` computes from the version behind
+  the dead one (6) and not from the dead one (21). It was already right -
+  `collect_dml_targets` carries the visible image - but nothing said so
+  until this gate did.
+- **Two ways to lose a nested id, both caught in the first gate run.**
+  Window 0 IS the transaction (its records carry the transaction's own
+  id, or every statement burns one), and the ids must live somewhere the
+  window stack's reset at COMMIT cannot take with it - the reset ran
+  BEFORE the transaction ended, so a committed batch of 200 rows read
+  back as 2. Both are the same shape of bug: *an id nobody flips*, and
+  its symptom is rows that quietly stop counting.
+
+**Recorded divergence.** A writing window burns a transaction id the
+engine does not: the engine's savepoint has no id of its own, so
+`hdr_next_transaction` advances further here than there for the same
+work. Nothing a client reads through SQL depends on it (fire-crab's
+`CURRENT_TRANSACTION` was already "the header's next id + 1" rather than
+a transaction-long constant), but `gstat -h` counts differently and that
+is worth knowing before it is discovered. It also reaches the end of the
+TIP chain sooner - this server cannot GROW that chain, and
+`tip_bits_at` answers "transaction id beyond the TIP chain" rather than
+writing outside it, so the limit fails closed. On an 8 KB page that is
+some 32,000 ids, which no gate approaches; a workload that opens a
+savepoint per statement would.
+
+**What it opens.** Snapshot isolation is now the interesting gap rather
+than an impossible one: a reader that counts a SET of transactions is one
+step from a reader that counts *the set as of a moment*, which is what
+`serve-real-autonomous.sh`'s last recorded boundary (the outer
+transaction reading what the block committed: engine 0, fire-crab 1) is
+waiting on. It also needs the TPB parsed, which nothing does yet.
 
 ## How these slices are gated
 

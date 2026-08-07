@@ -25,7 +25,11 @@
 #   * several statements in one block commit together;
 #   * `EXECUTE STATEMENT ... WITH AUTONOMOUS TRANSACTION` is the same
 #     requirement in the engine's other syntax, and behaves the same;
-#   * DDL through it, and a plain assignment inside it.
+#   * DDL through it, and a plain assignment inside it;
+#   * a BODY THAT HAS ALREADY WRITTEN around it, and a BLOCK INSIDE A
+#     BLOCK - both refused until an undo window became a transaction of
+#     its own, and both measured here by the DIVISION they turn on: the
+#     failed body's own writes go back, the block's stay.
 #
 #   qa/serve-real-autonomous.sh [port]
 
@@ -130,14 +134,29 @@ BEGIN
   EXECUTE STATEMENT 'SELECT COUNT(*) FROM LOG WHERE ID = 99' INTO :C;
   N = C + 1;
 END^
-/* --- RECORDED BOUNDARIES --- */
-/* the body writes BEFORE the block */
+/* --- A BODY THAT HAS ALREADY WRITTEN, and a BLOCK INSIDE A BLOCK: both
+   were refused while an undo window's only undo was an image restore.
+   A window is a TRANSACTION now, so both are answered - and what has to
+   be measured is the DIVISION: the body's own writes go, the block's
+   stay. --- */
 CREATE PROCEDURE B_WROTEFIRST RETURNS (N INTEGER) AS
 BEGIN
   UPDATE T SET V = V WHERE ID > 0;
   IN AUTONOMOUS TRANSACTION DO
     INSERT INTO LOG (ID, V) VALUES (8, 800);
   N = ROW_COUNT;
+END^
+/* the body writes, the block commits, THEN the body fails: the body's
+   UPDATE must be undone and the block's INSERT must not. An image
+   restore plus a page carve-out gets this wrong in the one direction
+   that is silent - it carries the body's own rows forward with the
+   autonomous ones. */
+CREATE PROCEDURE B_WROTETHENFAILS RETURNS (N INTEGER) AS
+BEGIN
+  UPDATE T SET V = 999 WHERE ID = 1;
+  IN AUTONOMOUS TRANSACTION DO
+    INSERT INTO LOG (ID, V) VALUES (20, 2000);
+  N = 1 / 0;
 END^
 /* a block inside a block */
 CREATE PROCEDURE B_NESTED RETURNS (N INTEGER) AS
@@ -147,6 +166,18 @@ BEGIN
     INSERT INTO LOG (ID, V) VALUES (9, 900);
     IN AUTONOMOUS TRANSACTION DO
       INSERT INTO LOG (ID, V) VALUES (10, 1000);
+  END
+  N = 1;
+END^
+/* ...and the inner one commits while the OUTER one dies */
+CREATE PROCEDURE B_NESTEDOUTERFAILS RETURNS (N INTEGER) AS
+BEGIN
+  IN AUTONOMOUS TRANSACTION DO
+  BEGIN
+    INSERT INTO LOG (ID, V) VALUES (21, 2100);
+    IN AUTONOMOUS TRANSACTION DO
+      INSERT INTO LOG (ID, V) VALUES (22, 2200);
+    N = 1 / 0;
   END
   N = 1;
 END^
@@ -252,16 +283,30 @@ ROLLBACK;")
         fail=1
     fi
 }
-# A BODY THAT HAS ALREADY WRITTEN. The enclosing undo is an image
-# restore, and the carve-out that keeps the autonomous pages would carry
-# the BODY's own rows back with them - a failed statement's rows, still
-# visible. Undoing those needs them to have a transaction of their own to
-# kill (the engine's savepoint model), which this server does not have,
-# so the block is refused rather than answered.
-boundary "the body wrote before the block" B_WROTEFIRST "Dynamic SQL Error"
-# A BLOCK INSIDE A BLOCK is the same problem with the outer block as the
-# writer.
-boundary "a block inside a block" B_NESTED "Dynamic SQL Error"
+# --- 7a. WHAT A SAVEPOINT-AS-A-TRANSACTION LIFTED ------------------------
+# Both of these were RECORDED BOUNDARIES here, refused because the body's
+# own writes could only be undone by putting an image back and the
+# carve-out that keeps the autonomous pages would have carried them
+# forward with it. An undo window has a transaction id of its own now, so
+# the body's writes are killed by two bits and the block's are untouched.
+call "the body wrote before the block" B_WROTEFIRST
+both "...and the block's row is there" "SET HEADING OFF;
+SELECT V FROM LOG WHERE ID = 8;"
+# THE DIVISION ITSELF, which is the whole of this: the body fails AFTER
+# both writes, so its UPDATE goes back to 10 and the block's INSERT stays.
+call "the body wrote, the block committed, then the body failed" B_WROTETHENFAILS
+both "...the block's row survives" "SET HEADING OFF;
+SELECT V FROM LOG WHERE ID = 20;"
+both "...and the BODY's own UPDATE is undone" "SET HEADING OFF;
+SELECT V FROM T WHERE ID = 1;"
+call "a block inside a block" B_NESTED
+both "...both rows are there" "SET HEADING OFF;
+SELECT COUNT(*) FROM LOG WHERE ID IN (9, 10);"
+call "the inner block commits, the outer one dies" B_NESTEDOUTERFAILS
+both "...the inner block's row survives" "SET HEADING OFF;
+SELECT V FROM LOG WHERE ID = 22;"
+both "...and the outer block's does not" "SET HEADING OFF;
+SELECT COUNT(*) FROM LOG WHERE ID = 21;"
 # THE OUTER TRANSACTION READING WHAT THE BLOCK COMMITTED. The engine
 # answers 0: its transaction took its snapshot before the block existed.
 # This server has no snapshot - a reader counts what is committed WHEN IT

@@ -13,6 +13,93 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-07 — a savepoint is a transaction
+
+### Converted
+- **AN UNDO WINDOW IS A TRANSACTION.** Every window that installs its
+  writes as it goes — a `SAVEPOINT`, a PSQL body, a row-by-row statement
+  (`INSERT ... SELECT`), an `IN AUTONOMOUS TRANSACTION` block — now
+  reserves a **nested transaction id** at its first record write, and
+  undoing the window is `tra_dead` on that id and nothing else. A reader
+  walks past a version whose transaction it does not count to the one
+  behind it, which is precisely the pre-savepoint value of the row. That
+  is the engine's savepoint model (`tra.cpp`'s undo records,
+  `VIO_verb_cleanup`) reached through the one mechanism this server has,
+  rather than the record-level surgery the engine's own undo needs.
+- **Visibility is a SET of own transactions, not one id.**
+  `fire_crab_ods::tra::OwnTx` replaces the `Option<u64>` that
+  `visible_version` and `visible_exists` took: a reader counts the
+  transaction's own id plus one per undo window that wrote. All of them
+  are flipped **in one work copy and one flush** at COMMIT, so no other
+  attachment can read a transaction half committed.
+- **A block inside a block, and a body that had already written**, both
+  of which the autonomous slice refused a day ago. The refusals existed
+  because the enclosing undo put an IMAGE back and the page carve-out
+  that keeps an autonomous commit would have carried the body's own rows
+  forward with it. With a nested id the body's writes are killed by two
+  bits and the block's are untouched, so both shapes are answered.
+- **`ROLLBACK TO SAVEPOINT` is real** rather than an image restore.
+  Which is not only cheaper: an image restore is taken before the
+  window's first write, so another attachment committing inside the
+  window would be undone by putting it back. Two bits belonging to this
+  transaction cannot do that.
+
+### Guarded
+- **The image is the FALLBACK, not the rule.** A DDL statement's catalog
+  rows are settled as they are written here — no transaction state can
+  take them back — so a window that contains one still undoes by
+  restoring its base image (`Database::ddl_undo`, kept apart from
+  `image_undo`, which now says only "hold the write side, because that
+  image may still be put back"). The one shape still refused is an
+  autonomous block inside a body that has written **while the
+  transaction is on the image path**.
+
+### Fixed
+- **A writer must count the transaction's WHOLE set of ids**, not the
+  one it is writing under. Caught by asking what the uniqueness check
+  reads: a row inserted BEFORE a mark carries the transaction's id and
+  the mark's rows carry a nested one, so a check that consulted only the
+  statement's id could not see the earlier row — and would have accepted
+  a duplicate primary key. The index-maintenance path now builds its
+  view from `own_tx()` plus the id this statement reserved.
+- **Two bugs the gate caught within a minute of each other**, both of
+  the same family — a nested id that nobody flips: window 0 IS the
+  transaction (its records carry `Database::tx`, not a nested id, or
+  every statement burns one), and the ids have to live somewhere the
+  window stack's reset at COMMIT cannot take with it
+  (`Database::nested_tx`) — `reset_gen_windows` ran BEFORE
+  `end_transaction`, so a committed batch of 200 rows read back as 2.
+
+### Found
+- **A writing window burns a transaction id the engine does not.** The
+  engine's savepoint has no id of its own, so `hdr_next_transaction`
+  advances further here than there for the same work. Nothing a client
+  reads through SQL depends on it — fire-crab's `CURRENT_TRANSACTION` was
+  already the header's next id rather than a transaction-long constant —
+  but `gstat -h` counts differently, and the TIP chain (which this server
+  cannot grow) is reached sooner. It fails closed when it is:
+  `tip_bits_at` answers "transaction id beyond the TIP chain" rather than
+  writing past it. Some 32,000 ids on an 8 KB page.
+
+### Gated
+- **`qa/serve-real-savepointtx.sh`** (30 checks): the work before a mark
+  against the work after it, for INSERT, UPDATE and DELETE; **a
+  statement after the undo reading the RESTORED value** (`SET V = V + 1`
+  answers 6, not the rolled-back 21 — a writer that reads the chain head
+  instead of the visible version gets this wrong silently); a key
+  re-inserted after its window died, and a duplicate of a pre-mark row
+  still refused; nested marks, `RELEASE`, a second undo to the same
+  mark, a full `ROLLBACK` over them; **a body inside a mark**, whose own
+  window's id folds into the mark's (undone with it, committed when it is
+  released); DDL inside a mark falling back to the image; log teeth that
+  the undo was **state and not an image**; and `gfix -v -full` on the file
+  the nested ids were written into.
+- **`qa/serve-real-autonomous.sh`** 22 → 30 checks: the two recorded
+  boundaries became ordinary differential checks, each with the DIVISION
+  it turns on — a body that writes, a block that commits, then a body
+  that fails, where the body's UPDATE must go back and the block's INSERT
+  must stay; and an inner block that commits while the outer one dies.
+
 ## 2026-08-07 — the carrying: event delivery over the auxiliary connection
 
 ### Converted

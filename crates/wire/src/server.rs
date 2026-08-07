@@ -579,14 +579,15 @@ struct Database {
     /// write of a transaction, which is why a reader that has not
     /// written counts only committed work.
     tx: Option<u32>,
-    /// The AUTONOMOUS transaction running right now, if a body is inside
-    /// an `IN AUTONOMOUS TRANSACTION` block. While it is set, record
-    /// writes carry IT rather than [Database::tx] and reads count it as
-    /// their own - which is what makes the two rules the engine holds
-    /// true here: the block cannot see the outer transaction's
-    /// uncommitted rows, and the block's rows are committed by the block
-    /// rather than by the outer COMMIT.
-    auto_tx: Option<u32>,
+    /// EVERY NESTED ID THIS TRANSACTION HAS RESERVED and not killed -
+    /// one per undo window that wrote (see [UndoWindow]).
+    ///
+    /// Kept beside the windows and not only in them, because the window
+    /// stack is reset when the transaction ends and these ids are
+    /// exactly what its COMMIT has to flip: they are read after the
+    /// stack is gone. A window's own copy says what ITS undo kills; this
+    /// says what the transaction is answerable for.
+    nested_tx: Vec<u32>,
     /// The pages an autonomous transaction COMMITTED, by page number.
     ///
     /// An autonomous transaction is committed - that is the whole point
@@ -596,15 +597,6 @@ struct Database {
     /// windows' settled values are ([write_gen_window]). Cleared when
     /// the transaction ends, by which time they are on the disk.
     auto_pages: std::collections::HashMap<u32, Vec<u8>>,
-    /// The image each open undo window started from, innermost last.
-    ///
-    /// An autonomous block asks this whether the BODY AROUND IT has
-    /// already written: if it has, the enclosing undo would put back an
-    /// image holding those writes and the page-level carve-out above
-    /// would carry them forward with the autonomous ones, leaving a
-    /// failed body's own rows visible. That is a wrong answer, so the
-    /// block is refused instead (see [TrigStmt::Autonomous]).
-    undo_base: Vec<std::sync::Arc<Vec<u8>>>,
     /// whether this TRANSACTION has written anything at all - which is
     /// not the same as holding the write side, now that the write side
     /// is one statement long. A rollback asks this to know whether
@@ -645,13 +637,26 @@ struct Database {
     /// [crate::dblocks]
     locks: std::sync::Arc<crate::dblocks::DbLocks>,
     lock_owner: fire_crab_lck::OwnerId,
-    /// whether this transaction has done something only an IMAGE can
-    /// undo - a DDL statement (its catalog rows are settled as they are
-    /// written, since DDL is not transactional here) or a SAVEPOINT
-    /// (one transaction id cannot say "undo the last three
-    /// statements"). A transaction that only wrote RECORDS is undone by
-    /// its own transaction state instead, and needs no snapshot at all.
+    /// whether this transaction must HOLD THE WRITE SIDE to the end,
+    /// because an image it may put back was taken while it held it: a
+    /// DDL statement, or an open SAVEPOINT (whose base image is the
+    /// fallback when the window cannot be undone by state). Nothing
+    /// else may commit inside such a window, or the restore would land
+    /// on top of it.
     image_undo: bool,
+    /// ...and whether an undo actually NEEDS that image. Only a SETTLED
+    /// write does: a DDL statement's catalog rows are committed as they
+    /// are written, since DDL is not transactional here, so no
+    /// transaction state can take them back. Everything a transaction
+    /// writes as RECORDS is undone by [Database::kill_tx] on the id
+    /// that wrote it - the transaction's own, or an undo window's
+    /// nested one (see [UndoWindow]).
+    ///
+    /// Kept apart from [Database::image_undo] because a savepoint has
+    /// to hold the write side (its image is the fallback) without
+    /// giving up state-based undo, which is the whole point of a
+    /// savepoint being a transaction.
+    ddl_undo: bool,
     page_size: usize,
     /// where the bytes came from - an INSERT flushes back here
     path: String,
@@ -660,9 +665,10 @@ struct Database {
     ods_minor: u16,
     /// One entry per open UNDO WINDOW, outermost (the transaction)
     /// first, in step with the image snapshots that undo them - see
-    /// [GenWindow] for why a generator record has to be scoped that way
-    /// and not to the transaction.
-    gen_windows: Vec<GenWindow>,
+    /// [UndoWindow] for the transaction id a window writes under and
+    /// [GenWindow] for why a generator record has to be scoped to a
+    /// window and not to the transaction.
+    windows: Vec<UndoWindow>,
 }
 
 /// THE EVENT MANAGER OF ONE DATABASE, shared by its attachments - keyed
@@ -1008,12 +1014,12 @@ impl Database {
     /// an active transaction in the file that nothing wrote a row under.
     fn work_copy_with_tx(&mut self) -> Result<(Vec<u8>, u32), String> {
         let mut work = self.work_copy()?;
-        // inside an autonomous block the rows belong to ITS transaction,
-        // which was reserved when the block opened
-        if let Some(tx) = self.auto_tx {
-            return Ok((work, tx));
-        }
-        if let Some(tx) = self.tx {
+        // THE INNERMOST UNDO WINDOW THAT OWNS IDS is the one whose id
+        // these records carry - a savepoint's, a body's, an autonomous
+        // block's - and the transaction's own when no such window is
+        // open. That is what makes undoing the window two bits: nothing
+        // outside it wrote under this number.
+        if let Some(tx) = self.write_tx() {
             return Ok((work, tx));
         }
         let tx = fire_crab_ods::dml::begin_active_tx(&mut work, self.page_size)?;
@@ -1030,28 +1036,95 @@ impl Database {
         self.locks.hold_transaction(self.lock_owner, tx);
     }
 
-    /// The statement installed its work, so the id it reserved is now
-    /// this attachment's transaction - held until commit or rollback.
-    ///
-    /// An AUTONOMOUS transaction is never adopted: it is not this
-    /// attachment's transaction, it is one the block opened and the
-    /// block will end. Adopting it would make the outer COMMIT commit
-    /// it a second time and the outer ROLLBACK kill rows the engine
-    /// keeps.
-    fn adopt_tx(&mut self, tx: u32) {
-        if self.auto_tx == Some(tx) {
-            return;
-        }
-        if self.tx != Some(tx) {
-            self.hold_tx_lock(tx);
-        }
-        self.tx = Some(tx);
+    /// The innermost open window that RECORDS ARE WRITTEN UNDER, as an
+    /// index into [Database::windows] - `None` when the transaction's
+    /// own id is the one. A [WindowKind::Statement] window is
+    /// transparent here: its undo is dropping a working copy, so it
+    /// needs no id of its own and would burn one per statement.
+    fn owning_window(&self) -> Option<usize> {
+        self.windows
+            .iter()
+            .rposition(|w| matches!(w.kind, WindowKind::Nested | WindowKind::Autonomous))
     }
 
-    /// Whose rows this attachment counts as its own right now: the
-    /// autonomous transaction while a block is open, otherwise its own.
-    fn own_tx(&self) -> Option<u32> {
-        self.auto_tx.or(self.tx)
+    /// Is a block open? Then the ids reserved inside it are the BLOCK's
+    /// to commit or kill, and the transaction around it must not flip
+    /// them at its own end.
+    fn under_autonomous(&self) -> bool {
+        self.windows.iter().any(|w| w.kind == WindowKind::Autonomous)
+    }
+
+    /// The id a record write carries right now, if one has been
+    /// reserved for it yet.
+    fn write_tx(&self) -> Option<u32> {
+        match self.owning_window() {
+            Some(i) => self.windows[i].tx,
+            None => self.tx,
+        }
+    }
+
+    /// The statement installed its work, so the id it reserved belongs
+    /// to whoever is writing: the innermost owning window, or the
+    /// transaction itself. Held - and locked, so another writer that
+    /// meets one of its rows has something to wait on - until that
+    /// window is undone or the transaction ends.
+    ///
+    /// An AUTONOMOUS window's id is never taken over by the transaction
+    /// around it: the block opened it and the block will end it, and
+    /// adopting it would make the outer COMMIT commit it a second time
+    /// and the outer ROLLBACK kill rows the engine keeps.
+    fn adopt_tx(&mut self, tx: u32) {
+        if self.write_tx() == Some(tx) {
+            return;
+        }
+        self.hold_tx_lock(tx);
+        match self.owning_window() {
+            Some(i) => {
+                self.windows[i].tx = Some(tx);
+                // ...and the transaction is answerable for it at its
+                // end - unless it belongs to a block, which ends itself
+                if !self.under_autonomous() {
+                    self.nested_tx.push(tx);
+                }
+            }
+            None => self.tx = Some(tx),
+        }
+    }
+
+    /// WHOSE ROWS THIS ATTACHMENT COUNTS AS ITS OWN right now.
+    ///
+    /// Every id it has written under and not killed: the transaction's,
+    /// plus one per undo window that wrote (open, or closed into the
+    /// window around it). A statement reads what the statements before
+    /// it wrote, and a nested id does not change that.
+    ///
+    /// An AUTONOMOUS window stops the walk, and stops it INCLUSIVELY:
+    /// inside a block the reader counts the block's ids and nothing
+    /// else, which is the rule the engine holds - the block cannot see
+    /// the uncommitted rows of the transaction around it. That is also
+    /// the whole of the isolation, and it comes out of the same walk.
+    fn own_tx(&self) -> fire_crab_ods::tra::OwnTx {
+        let mut own = fire_crab_ods::tra::OwnTx::none();
+        for w in self.windows.iter().rev() {
+            for id in w.ids() {
+                own.push(u64::from(id));
+            }
+            if w.kind == WindowKind::Autonomous {
+                return own;
+            }
+        }
+        if let Some(tx) = self.tx {
+            own.push(u64::from(tx));
+        }
+        own
+    }
+
+    /// Every id this transaction is answerable for at its end - its own
+    /// and every window's - which is what a COMMIT flips together.
+    fn all_tx(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self.tx.into_iter().collect();
+        ids.extend(self.nested_tx.iter().copied());
+        ids
     }
 
     /// Install an edited image, leaving its changed pages DIRTY - on
@@ -1151,11 +1224,12 @@ impl Database {
         self.tx = None;
         self.touched = false;
         self.image_undo = false;
+        self.ddl_undo = false;
+        self.nested_tx.clear();
         // the autonomous carve-out has done its work: those pages are on
         // the disk, and no undo of a LATER transaction reaches back past
         // a snapshot taken after them
         self.auto_pages.clear();
-        self.undo_base.clear();
         // whoever was waiting for this transaction can go now
         self.locks.release(self.lock_owner);
     }
@@ -1186,7 +1260,12 @@ impl Database {
         // same, and the commit is what puts them on the disk. Returning
         // early when there was no id left them there: the file did not
         // have the table, and the engine reading it said so.
-        if let Some(tx) = self.tx {
+        // EVERY ID AT ONCE, IN ONE WORK COPY AND ONE FLUSH. A
+        // transaction that opened undo windows wrote under a nested id
+        // per window (see [UndoWindow]), and all of them become real
+        // together: committing them one flush at a time would let
+        // another attachment read a transaction half committed.
+        for tx in self.all_tx() {
             fire_crab_ods::dml::set_tx_state(
                 &mut work,
                 self.page_size,
@@ -1217,7 +1296,9 @@ impl Database {
         }
         self.take_write_side()?; // see [Database::commit_tx]
         let mut work = self.bytes().as_ref().clone();
-        if let Some(tx) = self.tx {
+        // ...and every window's id with it: a rollback kills what a
+        // commit would have made real
+        for tx in self.all_tx() {
             fire_crab_ods::dml::set_tx_state(
                 &mut work,
                 self.page_size,
@@ -1235,15 +1316,23 @@ impl Database {
     /// leaves rows from the future. When that is what happened, the
     /// transaction is forgotten and the next write reserves a new one.
     fn retune_tx(&mut self) {
-        let Some(tx) = self.tx else { return };
         let image = self.bytes();
         let next = image
             .get(40..48)
             .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
             .unwrap_or(0);
-        if next < tx as u64 {
+        if self.tx.is_some_and(|tx| next < u64::from(tx)) {
             self.tx = None;
         }
+        // the windows' nested ids go the same way, and for the same
+        // reason: a restored header may predate them
+        for w in &mut self.windows {
+            if w.tx.is_some_and(|tx| next < u64::from(tx)) {
+                w.tx = None;
+            }
+            w.folded.retain(|id| u64::from(*id) <= next);
+        }
+        self.nested_tx.retain(|id| u64::from(*id) <= next);
     }
 
     /// Record the file as the server just wrote it, so the pool does
@@ -1284,9 +1373,9 @@ impl Database {
 ///        statement, COMMIT                           -> 3 (the undone
 ///        window is the statement, which holds neither)
 ///
-/// fire-crab's only undo is the whole-image snapshot, which puts the
-/// cell back to the WINDOW START value, so both halves have to be
-/// written forward over the restored image by name.
+/// A generator is not undone by transaction state either way - the cell
+/// is one number and carries no versions - so both halves are written
+/// forward over whatever the window's undo left behind, by name.
 #[derive(Default)]
 struct GenWindow {
     /// upper-cased name -> the value its LAST draw inside this window
@@ -1297,11 +1386,93 @@ struct GenWindow {
     pre_set: std::collections::HashMap<String, i64>,
 }
 
+/// WHAT KIND OF UNDO WINDOW THIS IS - which decides whether the records
+/// written inside it get a TRANSACTION ID OF THEIR OWN.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum WindowKind {
+    /// THE TRANSACTION'S OWN window, always index 0. Its records carry
+    /// the transaction's id ([Database::tx]) rather than a nested one -
+    /// undoing it IS the rollback.
+    Transaction,
+    /// ONE STATEMENT, undone by dropping its working copy: nothing it
+    /// wrote was ever installed, so it needs no id and its records
+    /// carry the id of the window around it. (A statement that
+    /// re-enters per row - `INSERT ... SELECT` - opens a [Nested] one
+    /// instead, because its earlier rows ARE installed.)
+    Statement,
+    /// A window whose writes are INSTALLED as it goes and must be
+    /// undoable afterwards: a SAVEPOINT, a PSQL body, a row-by-row
+    /// statement. Its records carry a nested id, and undoing it is
+    /// `tra_dead` on that id and nothing else.
+    Nested,
+    /// A nested window that is a TRANSACTION IN ITS OWN RIGHT: `IN
+    /// AUTONOMOUS TRANSACTION`. Reads inside it count only its own ids,
+    /// and it commits or dies by itself instead of folding into the
+    /// window around it.
+    Autonomous,
+}
+
+/// ONE OPEN UNDO WINDOW - the engine's savepoint, converted to the one
+/// mechanism this server has for making writes stop counting.
+///
+/// **A SAVEPOINT IS A TRANSACTION HERE.** The engine keeps an undo
+/// record per changed record inside a savepoint and replays them
+/// backwards (`tra.cpp`'s verb machinery, `VIO_verb_cleanup`), which
+/// needs a writer that can take a record version off a page. This
+/// server has no such writer - but it has the thing that makes a
+/// transaction's rows stop counting, two bits in the TIP, and that
+/// works for a NESTED id exactly as it works for the transaction's own:
+/// a reader walks past a version whose transaction it does not count to
+/// the one behind it, which is the previous value of the row.
+///
+/// So each window that can be undone AFTER its writes are installed
+/// reserves an id of its own at its first record write. Undoing it is
+/// `tra_dead` on that id; closing it successfully hands the id to the
+/// window around it ([UndoWindow::folded]), because the rows are still
+/// this transaction's uncommitted work and it is the outer COMMIT that
+/// makes them real. Every id the transaction holds is flipped together,
+/// in one work copy and one flush, so no other attachment can see half
+/// a commit.
+///
+/// What this replaces is an image restore per window, and with it the
+/// hole an image restore always had: the image was taken before the
+/// window's first write, and another attachment committing in between
+/// would be undone by putting it back. Transaction state cannot do
+/// that - it touches two bits belonging to this transaction alone.
+struct UndoWindow {
+    /// the generator draws and absolute sets made inside it
+    gen: GenWindow,
+    kind: WindowKind,
+    /// the nested id records written inside this window carry, reserved
+    /// at its FIRST record write - `None` while it has written none.
+    /// A [WindowKind::Statement] window never has one.
+    tx: Option<u32>,
+    /// the ids of inner windows that CLOSED SUCCESSFULLY inside this
+    /// one: their rows are uncommitted work still, so they are counted
+    /// as this reader's own and killed with this window if it is undone
+    folded: Vec<u32>,
+    /// the image this window started from, put back only when the undo
+    /// cannot be done by state (a settled write went before - see
+    /// [Database::ddl_undo])
+    base: Option<std::sync::Arc<Vec<u8>>>,
+}
+
+impl UndoWindow {
+    fn new(kind: WindowKind) -> UndoWindow {
+        UndoWindow { gen: GenWindow::default(), kind, tx: None, folded: Vec::new(), base: None }
+    }
+
+    /// every id this window is answerable for
+    fn ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.tx.into_iter().chain(self.folded.iter().copied())
+    }
+}
+
 /// Record that `name` was ADVANCED to `value` inside the innermost open
 /// window. See [GenWindow].
 fn burn_generator(db: &mut Database, name: &str, value: i64) {
-    if let Some(w) = db.gen_windows.last_mut() {
-        w.draw.insert(name.to_ascii_uppercase(), value);
+    if let Some(w) = db.windows.last_mut() {
+        w.gen.draw.insert(name.to_ascii_uppercase(), value);
     }
 }
 
@@ -1313,32 +1484,87 @@ fn burn_generator(db: &mut Database, name: &str, value: i64) {
 /// value from before the 3). See [GenWindow].
 fn mark_generator_set(db: &mut Database, name: &str) {
     let Some(current) = read_generator_value(db, name) else { return };
-    if let Some(w) = db.gen_windows.last_mut() {
-        w.pre_set.entry(name.to_ascii_uppercase()).or_insert(current);
-    }
-}
-
-/// Remember the image an undo window starts from, so an autonomous
-/// block can ask whether the body around it has written since. Paired
-/// with [undo_base_pop] wherever a snapshot is taken and put back.
-fn undo_base_push(database: &mut Option<Database>, snap: &Option<std::sync::Arc<Vec<u8>>>) {
-    if let (Some(db), Some(s)) = (database.as_mut(), snap.as_ref()) {
-        db.undo_base.push(std::sync::Arc::clone(s));
-    }
-}
-
-fn undo_base_pop(database: &mut Option<Database>, snap: &Option<std::sync::Arc<Vec<u8>>>) {
-    if let (Some(db), Some(_)) = (database.as_mut(), snap.as_ref()) {
-        db.undo_base.pop();
+    if let Some(w) = db.windows.last_mut() {
+        w.gen.pre_set.entry(name.to_ascii_uppercase()).or_insert(current);
     }
 }
 
 /// Open a new undo window, in step with a snapshot being taken. Returns
-/// the depth to hand back to [gen_window_unwind].
-fn gen_window_push(database: &mut Option<Database>) -> usize {
+/// the depth to hand back to [undo_window_unwind].
+///
+/// `kind` says whether the writes inside it need a transaction id of
+/// their own - see [WindowKind]. `base` is the image the window starts
+/// from, kept only as the fallback for a window whose undo cannot be
+/// done by state.
+fn undo_window_push(
+    database: &mut Option<Database>,
+    kind: WindowKind,
+    base: Option<std::sync::Arc<Vec<u8>>>,
+) -> usize {
     let Some(db) = database.as_mut() else { return 0 };
-    db.gen_windows.push(GenWindow::default());
-    db.gen_windows.len() - 1
+    let mut w = UndoWindow::new(kind);
+    w.base = base;
+    db.windows.push(w);
+    db.windows.len() - 1
+}
+
+/// Undo every window from `mark` inward BY TRANSACTION STATE: `tra_dead`
+/// on each id they wrote under, which is the whole of it - the rows stay
+/// on the pages and stop counting, exactly as a rolled-back
+/// transaction's do.
+///
+/// Returns whether anything was undone. `false` means those windows
+/// wrote no records at all, so there was nothing for an id to be
+/// reserved for.
+///
+/// The ids are flipped in ONE work copy, and left DIRTY rather than
+/// flushed: they are already invisible to every reader the moment the
+/// pool has them, and the transaction's own end writes the pages out
+/// with everything else it dirtied. Ids the image no longer contains -
+/// a restore put back a header from before they were reserved - are
+/// skipped, not failed on.
+///
+/// AND THEY LEAVE THE TRANSACTION'S SET EITHER WAY. If the work copy
+/// cannot be taken at all (another attachment holds the write side -
+/// nearly unreachable, since a transaction with an open window is
+/// holding it), the ids stay ACTIVE in the file rather than becoming
+/// dead. That is the fail-safe direction: an active transaction's rows
+/// count for nobody, so the undo still holds; what is lost is only the
+/// transaction ENDING, which a sweep would otherwise collect. The
+/// direction that must never happen is the other one - an id the
+/// transaction still believes it owns, which its COMMIT would then make
+/// real.
+fn kill_window_ids(db: &mut Database, ids: &[u32]) -> bool {
+    if ids.is_empty() {
+        return false;
+    }
+    let Ok(mut work) = db.work_copy() else { return false };
+    let next = u64::from_le_bytes(work.get(40..48).and_then(|b| b.try_into().ok()).unwrap_or([0; 8]));
+    let mut killed = false;
+    for id in ids {
+        if u64::from(*id) > next {
+            continue; // the file has not handed this number out (any more)
+        }
+        if fire_crab_ods::dml::set_tx_state(
+            &mut work,
+            db.page_size,
+            u64::from(*id),
+            fire_crab_ods::tip::TxState::Dead,
+        )
+        .is_ok()
+        {
+            killed = true;
+        }
+    }
+    if killed {
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] undo window: transactions {:?} dead", ids);
+        }
+        db.install_dirty(work);
+    }
+    // dead is final: the transaction's own end must not flip them back
+    db.nested_tx.retain(|id| !ids.contains(id));
+    killed
 }
 
 /// Close every window from `mark` inward, in step with a snapshot being
@@ -1356,56 +1582,81 @@ fn gen_window_push(database: &mut Option<Database>) -> usize {
 /// inside the parent's window, and an inner set is still pending its
 /// undo, as the FIRST one the parent saw if the parent has none of its
 /// own.
-fn gen_window_unwind(database: &mut Option<Database>, mark: usize, undone: bool) {
+/// THE TRANSACTION HALF: a window that was UNDONE has its ids killed,
+/// which is what makes its rows stop counting; one that merely CLOSED
+/// hands them to the parent, because they are the transaction's
+/// uncommitted work still and it is the outer COMMIT that makes them
+/// real. An AUTONOMOUS window does neither - it ended itself.
+///
+/// `mark == 0` is the transaction's own window, whose ids the
+/// transaction's end flips ([Database::commit_tx] / [Database::kill_tx]),
+/// so they are left alone here.
+fn undo_window_unwind(database: &mut Option<Database>, mark: usize, undone: bool) {
     let Some(db) = database.as_mut() else { return };
-    if db.gen_windows.len() <= mark {
+    if db.windows.len() <= mark {
         return;
     }
-    let inner: Vec<GenWindow> = db.gen_windows.split_off(mark);
+    let inner: Vec<UndoWindow> = db.windows.split_off(mark);
     // ascending is chronological: an inner window is opened after every
     // write its parent had already made, and is closed before the next
     let mut merged = GenWindow::default();
+    let mut ids: Vec<u32> = Vec::new();
     for w in inner {
-        for (k, v) in w.draw {
+        if w.kind != WindowKind::Autonomous {
+            ids.extend(w.ids());
+        }
+        for (k, v) in w.gen.draw {
             merged.draw.insert(k, v);
         }
-        for (k, v) in w.pre_set {
+        for (k, v) in w.gen.pre_set {
             merged.pre_set.entry(k).or_insert(v);
         }
     }
     if undone {
+        if mark > 0 {
+            kill_window_ids(db, &ids);
+        }
+        // the generators go the other way: their values are written
+        // FORWARD over whatever the undo left, because a generator
+        // carries no versions for a dead transaction to hide
         write_gen_window(db, &merged);
     }
-    match db.gen_windows.last_mut() {
+    match db.windows.last_mut() {
         Some(parent) => {
+            if !undone {
+                parent.folded.extend(ids);
+            }
             for (k, v) in merged.draw {
-                parent.draw.insert(k, v);
+                parent.gen.draw.insert(k, v);
             }
             if !undone {
                 for (k, v) in merged.pre_set {
-                    parent.pre_set.entry(k).or_insert(v);
+                    parent.gen.pre_set.entry(k).or_insert(v);
                 }
             }
         }
         // the transaction's own window was the one undone
-        None => db.gen_windows.push(GenWindow::default()),
+        None => db.windows.push(UndoWindow::new(WindowKind::Transaction)),
     }
 }
 
 /// Merge the window at `idx` into its parent without undoing it - what
 /// re-declaring a savepoint name does to the mark it displaces.
-fn gen_window_collapse(database: &mut Option<Database>, idx: usize) {
+fn undo_window_collapse(database: &mut Option<Database>, idx: usize) {
     let Some(db) = database.as_mut() else { return };
-    if idx == 0 || idx >= db.gen_windows.len() {
+    if idx == 0 || idx >= db.windows.len() {
         return;
     }
-    let w = db.gen_windows.remove(idx);
-    let parent = &mut db.gen_windows[idx - 1];
-    for (k, v) in w.draw {
-        parent.draw.insert(k, v);
+    let w = db.windows.remove(idx);
+    let parent = &mut db.windows[idx - 1];
+    // its rows keep counting and are committed with the transaction, so
+    // the ids go up with the generator record
+    parent.folded.extend(w.ids());
+    for (k, v) in w.gen.draw {
+        parent.gen.draw.insert(k, v);
     }
-    for (k, v) in w.pre_set {
-        parent.pre_set.entry(k).or_insert(v);
+    for (k, v) in w.gen.pre_set {
+        parent.gen.pre_set.entry(k).or_insert(v);
     }
 }
 
@@ -1459,8 +1710,8 @@ fn write_gen_window(db: &mut Database, w: &GenWindow) {
 /// replayed.
 fn reset_gen_windows(database: &mut Option<Database>) {
     if let Some(db) = database.as_mut() {
-        db.gen_windows.clear();
-        db.gen_windows.push(GenWindow::default());
+        db.windows.clear();
+        db.windows.push(UndoWindow::new(WindowKind::Transaction));
     }
 }
 
@@ -1493,9 +1744,7 @@ fn load_database(path: &str) -> Option<Database> {
         shared,
         write: None,
         tx: None,
-        auto_tx: None,
         auto_pages: std::collections::HashMap::new(),
-        undo_base: Vec::new(),
         touched: false,
         posted: std::cell::RefCell::new(Vec::new()),
         events,
@@ -1504,11 +1753,13 @@ fn load_database(path: &str) -> Option<Database> {
         locks,
         lock_owner,
         image_undo: false,
+        ddl_undo: false,
+        nested_tx: Vec::new(),
         page_size,
         path: p.to_string(),
         ods_major: h.ods_major(),
         ods_minor: h.ods_minor,
-        gen_windows: vec![GenWindow::default()],
+        windows: vec![UndoWindow::new(WindowKind::Transaction)],
     })
 }
 
@@ -14164,6 +14415,8 @@ fn blocking_transaction(db: &Database, targets: &[(u32, u16, u8, Vec<u8>)]) -> O
     }
     let image = db.bytes();
     let tips = fire_crab_ods::tra::TipChain::read(&image, db.page_size)?;
+    // once, not per row: this is a set now (one id per open undo window)
+    let own = db.own_tx();
     for (page, slot, _, _) in targets {
         let start = *page as usize * db.page_size;
         let Some(head) = image
@@ -14174,7 +14427,7 @@ fn blocking_transaction(db: &Database, targets: &[(u32, u16, u8, Vec<u8>)]) -> O
             continue;
         };
         let owner = head.transaction;
-        if owner == 0 || Some(owner) == db.own_tx().map(u64::from) {
+        if owner == 0 || own.contains(owner) {
             continue;
         }
         if tips.state(owner) == Some(fire_crab_ods::tip::TxState::Active) {
@@ -14389,9 +14642,12 @@ fn execute_dml_collecting(
     ctx: &SessionCtx,
     affected: Option<&mut Affected>,
 ) -> Result<(i32, i32, i32), ExecErr> {
-    let mark = gen_window_push(database);
+    // ONE STATEMENT IS ITS OWN UNDO WINDOW, and it needs no id: its
+    // records live in a working copy that is dropped whole if any part
+    // of it fails (see [WindowKind::Statement]).
+    let mark = undo_window_push(database, WindowKind::Statement, None);
     let out = execute_dml_collecting_inner(plan, database, args, ctx, affected);
-    gen_window_unwind(database, mark, out.is_err());
+    undo_window_unwind(database, mark, out.is_err());
     out
 }
 
@@ -14464,7 +14720,12 @@ fn execute_dml_collecting_inner(
         // generator windows, which is why it does not ask for one.
         Plan::SetGenerator { .. } => (db.work_copy()?, None),
         _ => {
+            // A SETTLED WRITE: only the image can take it back, which is
+            // what [Database::ddl_undo] says, and the write side has to
+            // be held to the end so nothing else commits inside the
+            // window that image covers ([Database::image_undo]).
             db.image_undo = true;
+            db.ddl_undo = true;
             // ...AND EVERY ANSWER THE METADATA CACHE HOLDS WAS ABOUT
             // THE OLD SCHEMA. Invalidated before the statement runs,
             // not after: the DDL itself reads the catalog as it works,
@@ -14473,6 +14734,20 @@ fn execute_dml_collecting_inner(
             db.invalidate_meta();
             (db.work_copy()?, None)
         }
+    };
+    // WHOSE ROWS THIS STATEMENT COUNTS while it writes - what the
+    // uniqueness check reads to decide whether a key is really taken.
+    // It is the transaction's whole set of ids, not the one this
+    // statement writes under: a row inserted before a SAVEPOINT carries
+    // the OUTER id, and a duplicate of it is still a duplicate. The
+    // statement's own id joins it because the first write of a
+    // transaction has not adopted it yet.
+    let stmt_own = {
+        let mut own = db.own_tx();
+        if let Some(tx) = stmt_tx {
+            own.push(u64::from(tx));
+        }
+        own
     };
     let counts = match plan {
         Plan::CreateTable { name, cols, constraints, fks, relation_type } => {
@@ -14907,7 +15182,7 @@ fn execute_dml_collecting_inner(
                     // (btr.cpp:5629 key_all_nulls) - and a key held only
                     // by entries whose records are GONE is not taken
                     insert_entry_verified(
-                        &mut work, db.page_size, *rel, op, &key, recno, all_null, stmt_tx,
+                        &mut work, db.page_size, *rel, op, &key, recno, all_null, &stmt_own,
                     )
                     .map_err(|e| entry_err_to_exec(db, table, op, &values, e))?;
                 }
@@ -15187,7 +15462,7 @@ fn execute_dml_collecting_inner(
                             if new_key != old_key {
                                 insert_entry_verified(
                                     &mut work, db.page_size, *rel, op, &new_key, recno, all_null,
-                                    stmt_tx,
+                                    &stmt_own,
                                 )
                                 .map_err(|e| {
                                     entry_err_to_exec(db, table, op, &new_values, e)
@@ -16175,7 +16450,7 @@ fn insert_entry_verified(
     key: &[u8],
     recno: u64,
     all_null: bool,
-    own: Option<u32>,
+    own: &fire_crab_ods::tra::OwnTx,
 ) -> Result<(), EntryErr> {
     let enforce = op.unique && !all_null;
     match fire_crab_ods::btw::insert_index_entry(
@@ -16361,7 +16636,7 @@ fn unique_conflict(
     formats: &[(u8, Vec<Descriptor>)],
     key: &[u8],
     recno: u64,
-    own: Option<u32>,
+    own: &fire_crab_ods::tra::OwnTx,
 ) -> bool {
     let Some(candidates) =
         fire_crab_ods::btr::lookup_key(work, page_size, rel, op.id, key, op.descending)
@@ -16381,7 +16656,7 @@ fn unique_conflict(
     // THE WRITER'S OWN VIEW: its uncommitted rows count (this statement
     // may have written them), and a row left behind by a transaction
     // that never committed does not.
-    let view = ReadView::over(work, page_size, own);
+    let view = ReadView::over(work, page_size, own.clone());
     records_at_in(work, page_size, rel, formats, &others, &view)
         .iter()
         .any(|values| op.key_for(values).is_some_and(|(k, _)| k == key))
@@ -22696,7 +22971,7 @@ fn records_at_in(
 /// nothing to consult, so the head stands.
 struct ReadView<'a> {
     tips: Option<fire_crab_ods::tra::TipChain<'a>>,
-    own: Option<u64>,
+    own: fire_crab_ods::tra::OwnTx,
 }
 
 impl<'a> ReadView<'a> {
@@ -22707,10 +22982,10 @@ impl<'a> ReadView<'a> {
     /// The same view over an image the caller holds directly - a
     /// statement's WORK COPY, which is not yet anybody's shared image
     /// but is what its own constraint checks must read.
-    fn over(image: &'a [u8], page_size: usize, own: Option<u32>) -> ReadView<'a> {
+    fn over(image: &'a [u8], page_size: usize, own: fire_crab_ods::tra::OwnTx) -> ReadView<'a> {
         ReadView {
             tips: fire_crab_ods::tra::TipChain::read(image, page_size),
-            own: own.map(u64::from),
+            own,
         }
     }
 
@@ -22733,7 +23008,7 @@ impl<'a> ReadView<'a> {
             return None;
         }
         match &self.tips {
-            Some(tips) => fire_crab_ods::tra::visible_version(bytes, page_size, r, tips, self.own)
+            Some(tips) => fire_crab_ods::tra::visible_version(bytes, page_size, r, tips, &self.own)
                 .map(|v| (v.image, v.format)),
             None => {
                 if !r.is_primary_record() {
@@ -22863,7 +23138,7 @@ fn count_visible_records(db: &Database, rel: u16) -> i64 {
         // no transaction inventory to consult: what the walk did before
         return fire_crab_ods::count_primary_records(&db_image, db.page_size, rel) as i64;
     };
-    let own = db.own_tx().map(u64::from);
+    let own = db.own_tx();
     let mut n = 0i64;
     for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
         let start = dp_no as usize * db.page_size;
@@ -22874,7 +23149,7 @@ fn count_visible_records(db: &Database, rel: u16) -> i64 {
             continue;
         };
         for r in dp.records() {
-            if fire_crab_ods::tra::visible_exists(&db_image, db.page_size, &r, &tips, own) {
+            if fire_crab_ods::tra::visible_exists(&db_image, db.page_size, &r, &tips, &own) {
                 n += 1;
             }
         }
@@ -35450,10 +35725,10 @@ fn snapshot_db(database: &Option<Database>) -> Option<std::sync::Arc<Vec<u8>>> {
 
 /// Put a snapshot back and flush it, undoing everything a failed
 /// statement wrote - EXCEPT the generators, whose settled values the
-/// matching [gen_window_unwind] writes forward over the restored image.
+/// matching [undo_window_unwind] writes forward over the restored image.
 /// That carve-out is the one exception to this server's "the image is
 /// the truth" isolation story, and every restore therefore sits between
-/// a [gen_window_push] and its unwind: the pair is what makes the
+/// an [undo_window_push] and its unwind: the pair is what makes the
 /// carve-out as wide as the engine's law and no wider. See [GenWindow].
 ///
 /// A CONNECTION THAT NEVER WROTE HAS NOTHING TO UNDO, and since the
@@ -35503,6 +35778,34 @@ fn restore_db(database: &mut Option<Database>, snap: Option<std::sync::Arc<Vec<u
     false
 }
 
+/// UNDO ONE WINDOW, and choose how: by TRANSACTION STATE when what it
+/// wrote were records - `tra_dead` on the id those records carry, which
+/// is two bits and touches nothing else - and by putting the IMAGE back
+/// when they were not.
+///
+/// The image is the fallback now rather than the rule, and only a
+/// SETTLED write needs it: a DDL statement commits its catalog rows as
+/// it writes them, so no transaction state can take them back
+/// ([Database::ddl_undo]).
+///
+/// Which matters beyond the cost, because an image restore has a hole
+/// that transaction state does not: the image was taken before the
+/// window's first write, and another attachment committing in between
+/// would be undone by putting it back. The state path cannot do that -
+/// it flips bits belonging to this transaction alone.
+fn undo_window(
+    database: &mut Option<Database>,
+    mark: usize,
+    base: Option<std::sync::Arc<Vec<u8>>>,
+) {
+    if database.as_ref().is_some_and(|d| d.ddl_undo) {
+        restore_db(database, base);
+    }
+    // the ids die here, and the generator values are written forward
+    // over whatever is left - see [undo_window_unwind]
+    undo_window_unwind(database, mark, true);
+}
+
 /// Undo the transaction, and say how.
 ///
 /// **A transaction that wrote only RECORDS is undone by its own
@@ -35525,7 +35828,7 @@ fn rollback_now(
     database: &mut Option<Database>,
     tx_snapshot: &mut Option<std::sync::Arc<Vec<u8>>>,
 ) -> (TxEnd, bool) {
-    let by_image = database.as_ref().is_some_and(|d| d.image_undo);
+    let by_image = database.as_ref().is_some_and(|d| d.ddl_undo);
     let wrote = database.as_ref().is_some_and(|d| d.wrote());
     if by_image {
         let snap = tx_snapshot.take();
@@ -35688,9 +35991,14 @@ fn insert_select(
             .ok_or("the SELECT feeding this INSERT is not one this server can run")?
     };
 
-    // all-or-nothing: any row that fails undoes the ones before it
+    // ALL-OR-NOTHING, AND ITS OWN TRANSACTION FOR IT: this statement
+    // installs a row at a time, so a failure partway cannot be undone
+    // by dropping a working copy the way a single-row INSERT is. The
+    // rows carry a nested id and the failure kills it (the image is
+    // kept as the fallback for a transaction that has done DDL - see
+    // [undo_window]).
     let snap = snapshot_db(database);
-    let mark = gen_window_push(database);
+    let mark = undo_window_push(database, WindowKind::Nested, snap.clone());
     let mut n = 0i32;
     for row in rows {
         let step = (|| -> Result<(), ExecErr> {
@@ -35735,13 +36043,12 @@ fn insert_select(
             Ok(())
         })();
         if let Err(e) = step {
-            restore_db(database, snap);
-            gen_window_unwind(database, mark, true);
+            undo_window(database, mark, snap);
             return Err(e);
         }
         n += 1;
     }
-    gen_window_unwind(database, mark, false);
+    undo_window_unwind(database, mark, false);
     Ok(n)
 }
 
@@ -36411,28 +36718,32 @@ fn exec_psql_stmt_inner(
 /// Run `run` inside an AUTONOMOUS TRANSACTION: its own id, its own
 /// commit, its own rollback.
 ///
-/// The three engine rules this reproduces, all probed:
+/// The engine rules this reproduces, all probed:
 ///
 ///   * the block CANNOT SEE the outer transaction's uncommitted rows -
 ///     it is a different transaction, and this server's visibility rule
 ///     ("committed, or my own") gives that for free once the reads run
-///     under the block's id ([Database::own_tx]);
+///     under the block's ids and only those ([Database::own_tx] stops
+///     its walk at an autonomous window);
 ///   * what the block COMMITTED survives the failure of the body around
-///     it - the pages it wrote are kept as a carve-out and written
-///     forward over whatever an enclosing undo puts back
-///     ([Database::auto_pages]);
+///     it - because that failure kills the id THE BODY wrote under and
+///     the block's rows carry a different one. Only a body whose undo
+///     is an IMAGE still needs the page carve-out
+///     ([Database::auto_pages]), and that is now the exception rather
+///     than the rule;
 ///   * an error inside the block ROLLS IT BACK and then escapes, so the
 ///     caller may catch it and nothing the block wrote remains.
 ///
-/// THE ONE SHAPE IT REFUSES, and why it is a refusal rather than an
-/// answer: if the BODY AROUND THE BLOCK has already written, the
-/// enclosing undo would put back an image without those writes and the
-/// page carve-out would carry them straight back in - the body's own
-/// rows, on the same pages as the autonomous ones, visible to a
-/// transaction whose statement failed. Undoing them needs the body's
-/// writes to have a transaction of their own to kill (the engine's
-/// savepoint model), which this server does not have yet. So the block
-/// is served when the body has not written and refused when it has.
+/// A BLOCK IS A WINDOW ON THE SAME STACK as a savepoint and a body (see
+/// [UndoWindow]), which is what lifts the two shapes this used to
+/// refuse: a body that had ALREADY WRITTEN before the block (its writes
+/// have a nested id to kill now), and a BLOCK INSIDE A BLOCK (each
+/// frame ends itself, and the inner one's rows are not the outer one's
+/// to keep or lose). What is still refused is the two of them meeting
+/// an IMAGE: if the transaction has done DDL, the enclosing undo puts
+/// the image back and the carve-out would carry the body's own rows
+/// forward with the autonomous ones - a failed statement's rows, still
+/// visible to its transaction.
 fn run_autonomous(
     f: &mut PsqlFrame,
     steps: &mut u32,
@@ -36442,17 +36753,15 @@ fn run_autonomous(
 ) -> Result<(), PsqlStop> {
     {
         let d = db.as_ref().ok_or(PsqlStop::Unsupported)?;
-        // one autonomous transaction at a time: a nested block would
-        // have the same undo problem, its parent being the writer
-        if d.auto_tx.is_some() {
-            return Err(PsqlStop::Unsupported);
-        }
-        // has the body around this block written since the undo window
-        // opened? (a different image is published for every write; a
-        // read publishes nothing)
-        if let Some(base) = d.undo_base.last() {
-            if !std::sync::Arc::ptr_eq(base, &d.bytes()) {
-                return Err(PsqlStop::Unsupported);
+        // THE ONE SHAPE LEFT: an enclosing undo that puts an IMAGE back
+        // (this transaction has done DDL) over a body that has already
+        // written. Has it? A different image is published for every
+        // write; a read publishes nothing.
+        if d.ddl_undo {
+            if let Some(base) = d.windows.last().and_then(|w| w.base.as_ref()) {
+                if !std::sync::Arc::ptr_eq(base, &d.bytes()) {
+                    return Err(PsqlStop::Unsupported);
+                }
             }
         }
     }
@@ -36467,7 +36776,11 @@ fn run_autonomous(
     // id, marks it dead when it fails, and the row that was committed
     // silently stops counting. Measured exactly that way.
     let before = db.as_ref().map(|d| d.bytes()).ok_or(PsqlStop::Unsupported)?;
-    {
+    let mark = undo_window_push(db, WindowKind::Autonomous, Some(std::sync::Arc::clone(&before)));
+    // OPENING IT CAN FAIL, and the window must not outlive the attempt:
+    // an autonomous window left on the stack would stop every later read
+    // in this transaction from counting the transaction's own rows.
+    let opened = (|| -> Result<u64, PsqlStop> {
         let d = db.as_mut().ok_or(PsqlStop::Unsupported)?;
         let mut work = d.work_copy().map_err(PsqlStop::Failed)?;
         let tx = fire_crab_ods::dml::begin_active_tx(&mut work, d.page_size)
@@ -36476,14 +36789,41 @@ fn run_autonomous(
             return Err(PsqlStop::Unsupported);
         }
         d.install_dirty(work);
-        d.auto_tx = Some(tx as u32);
-        if std::env::var("FC_SRV_TRACE").is_ok() {
-            eprintln!("[srv] autonomous transaction {} opened", tx);
+        // the block's window OWNS the id - which is what makes every
+        // write inside it carry that id and every read inside it count
+        // it (and nothing outside it)
+        d.windows[mark].tx = Some(tx as u32);
+        d.hold_tx_lock(tx as u32);
+        Ok(tx)
+    })();
+    let tx_opened = match opened {
+        Ok(tx) => tx,
+        Err(e) => {
+            if let Some(d) = db.as_mut() {
+                d.windows.truncate(mark);
+            }
+            return Err(e);
         }
+    };
+    if std::env::var("FC_SRV_TRACE").is_ok() {
+        eprintln!("[srv] autonomous transaction {} opened", tx_opened);
     }
     let outcome = run(f, steps, db, ctx);
+    // CLOSE THE FRAME FIRST, and take the ids with it: a block inside
+    // this one has already ended itself, and a body that ran inside it
+    // folded its nested ids into this window - all of them are ended by
+    // the block, not by the transaction around it.
+    let ids: Vec<u32> = {
+        let d = db.as_mut().ok_or(PsqlStop::Unsupported)?;
+        if d.windows.len() <= mark {
+            return Err(PsqlStop::Unsupported);
+        }
+        let w = d.windows.remove(mark);
+        d.windows.truncate(mark);
+        w.ids().collect()
+    };
     let Some(d) = db.as_mut() else { return Err(PsqlStop::Unsupported) };
-    let Some(tx) = d.auto_tx.take() else { return Err(PsqlStop::Unsupported) };
+    let Some(tx) = ids.first().copied() else { return Err(PsqlStop::Unsupported) };
     // END IT: committed or dead, and on the disk either way - an
     // autonomous transaction that only reached the page pool would be
     // undone by the enclosing rollback's flush.
@@ -36494,14 +36834,16 @@ fn run_autonomous(
     };
     let end = (|| -> Result<(), String> {
         let mut work = d.work_copy()?;
-        fire_crab_ods::dml::set_tx_state(&mut work, d.page_size, tx as u64, state)?;
+        for id in &ids {
+            fire_crab_ods::dml::set_tx_state(&mut work, d.page_size, u64::from(*id), state)?;
+        }
         d.flush_and_install(work)
     })();
     if let Err(e) = end {
         return Err(PsqlStop::Failed(e));
     }
     if std::env::var("FC_SRV_TRACE").is_ok() {
-        eprintln!("[srv] autonomous transaction {} {:?}", tx, state);
+        eprintln!("[srv] autonomous transaction {} {:?} (ids {:?})", tx, state, ids);
     }
     // THE CARVE-OUT, and only for a commit: a dead transaction's pages
     // have nothing an enclosing undo must keep.
@@ -36930,18 +37272,19 @@ fn run_body_source(
         frame.vars[rc as usize] = Value::Int(0);
     }
 
-    // a body is ALL-OR-NOTHING: a statement that fails partway undoes
-    // everything the body wrote before it, as the engine does
+    // A BODY IS ALL-OR-NOTHING, and a transaction of its own to say so:
+    // a statement that fails partway undoes everything the body wrote
+    // before it, as the engine does - by killing the id those rows
+    // carry, since they were installed statement by statement.
     let snap = snapshot_db(database);
-    let mark = gen_window_push(database);
-    undo_base_push(database, &snap);
+    let mark = undo_window_push(database, WindowKind::Nested, snap.clone());
     let mut steps = 0u32;
     let outcome = exec_psql_stmt(&body, &mut frame, &mut steps, database, ctx);
-    undo_base_pop(database, &snap);
     if outcome.is_err() {
-        restore_db(database, snap);
+        undo_window(database, mark, snap);
+    } else {
+        undo_window_unwind(database, mark, false);
     }
-    gen_window_unwind(database, mark, outcome.is_err());
     match outcome {
         // EXIT ends the body, and what it leaves behind IS the answer -
         // the output parameters as they stand, and whatever SUSPEND has
@@ -39328,33 +39671,41 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         if std::env::var("FC_SRV_TRACE").is_ok() {
                             eprintln!("[srv] savepoint op on {:?}, known={:?}", name, pos);
                         }
-                        // A MARK IS AN UNDO WINDOW, and the generator
-                        // record is stacked the same way the images are:
-                        // mark `i` owns generator window `i + 1`, window
-                        // 0 being the transaction's. See [GenWindow].
+                        // A MARK IS AN UNDO WINDOW, and every window
+                        // stack is in step with it: mark `i` owns
+                        // window `i + 1`, window 0 being the
+                        // transaction's. See [UndoWindow].
                         let ok = match kind {
                             SavepointOp::Set => {
                                 if let Some(i) = pos {
                                     // re-declaring a name RELEASES the
-                                    // mark it displaces - its work, and
-                                    // its pending undo records, fold
-                                    // into the enclosing window
+                                    // mark it displaces - its work, its
+                                    // transaction id and its pending
+                                    // undo records fold into the
+                                    // enclosing window
                                     savepoints.remove(i);
-                                    gen_window_collapse(&mut database, i + 1);
+                                    undo_window_collapse(&mut database, i + 1);
                                 }
                                 match snapshot_db(&database) {
                                     Some(img) => {
-                                        // ROLLBACK TO a mark is an
-                                        // image restore - one
-                                        // transaction id cannot undo
-                                        // part of itself - so this
-                                        // transaction keeps its
-                                        // snapshot path to the end
+                                        // A MARK IS A TRANSACTION: the
+                                        // rows written after it carry
+                                        // an id of their own and
+                                        // ROLLBACK TO kills it. The
+                                        // image is kept as the fallback
+                                        // for a transaction that has
+                                        // done DDL, and the write side
+                                        // is held while it could still
+                                        // be put back.
                                         if let Some(db) = database.as_mut() {
                                             db.image_undo = true;
                                         }
-                                        savepoints.push((name.clone(), img));
-                                        gen_window_push(&mut database);
+                                        savepoints.push((name.clone(), std::sync::Arc::clone(&img)));
+                                        undo_window_push(
+                                            &mut database,
+                                            WindowKind::Nested,
+                                            Some(img),
+                                        );
                                         true
                                     }
                                     None => false,
@@ -39364,11 +39715,22 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                 Some(i) => {
                                     let img = savepoints[i].1.clone();
                                     savepoints.truncate(i + 1);
-                                    restore_db(&mut database, Some(img));
-                                    gen_window_unwind(&mut database, i + 1, true);
-                                    // ROLLBACK TO keeps the mark, so the
-                                    // window it names reopens empty
-                                    gen_window_push(&mut database);
+                                    undo_window(
+                                        &mut database,
+                                        i + 1,
+                                        Some(std::sync::Arc::clone(&img)),
+                                    );
+                                    // ROLLBACK TO KEEPS THE MARK, so the
+                                    // window it names reopens empty -
+                                    // with the MARK's image, not the
+                                    // current one, because a second
+                                    // ROLLBACK TO the same mark must go
+                                    // back to the same place
+                                    undo_window_push(
+                                        &mut database,
+                                        WindowKind::Nested,
+                                        Some(img),
+                                    );
                                     true
                                 }
                                 None => false,
@@ -39376,7 +39738,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             SavepointOp::Release => match pos {
                                 Some(i) => {
                                     savepoints.truncate(i);
-                                    gen_window_unwind(&mut database, i + 1, false);
+                                    undo_window_unwind(&mut database, i + 1, false);
                                     true
                                 }
                                 None => false,
@@ -39396,7 +39758,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             // the transaction is window 0, so the whole
                             // stack unwinds against the image the
                             // rollback left behind
-                            gen_window_unwind(&mut database, 0, undone);
+                            undo_window_unwind(&mut database, 0, undone);
                             reset_gen_windows(&mut database);
                             if std::env::var("FC_SRV_TRACE").is_ok() {
                                 eprintln!("[srv] ROLLBACK - transaction undone: {}", undone);
@@ -40124,7 +40486,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 savepoints.clear();
                 let outcome = if x == OP_ROLLBACK {
                     let (outcome, undone) = rollback_now(&mut database, &mut tx_snapshot);
-                    gen_window_unwind(&mut database, 0, undone);
+                    undo_window_unwind(&mut database, 0, undone);
                     reset_gen_windows(&mut database);
                     if undone && std::env::var("FC_SRV_TRACE").is_ok() {
                         eprintln!("[srv] op_rollback - transaction undone");
@@ -40690,7 +41052,13 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
         eprintln!("[srv] mdc: {}", crate::mdc::stats_line());
     }
     if let Some(db) = database.as_mut() {
-        if db.tx.is_some() {
+        // ...AND A TRANSACTION WHOSE ONLY WRITES WENT THROUGH AN UNDO
+        // WINDOW HAS NO `tx` OF ITS OWN - a PSQL body's rows carry the
+        // window's nested id. Asking only about `tx` left those ACTIVE in
+        // the file for ever, which is not a wrong answer (nobody counts
+        // an active transaction's rows) but is a transaction that never
+        // ends, and the engine's sweep waits behind it.
+        if !db.all_tx().is_empty() {
             if std::env::var("FC_SRV_TRACE").is_ok() {
                 eprintln!("[srv] detach with an open transaction - marking it dead");
             }
@@ -41874,9 +42242,7 @@ mod tests {
             shared: fire_crab_cch::pool::detached(Vec::new()),
             write: None,
             tx: None,
-            auto_tx: None,
             auto_pages: std::collections::HashMap::new(),
-            undo_base: Vec::new(),
             touched: false,
             posted: std::cell::RefCell::new(Vec::new()),
             events: events_for("/nonexistent/fc-rowsource-test"),
@@ -41885,11 +42251,13 @@ mod tests {
             locks: crate::dblocks::for_path("/nonexistent/fc-rowsource-test"),
             lock_owner: 0,
             image_undo: false,
+            ddl_undo: false,
+            nested_tx: Vec::new(),
             page_size: 8192,
             path: String::new(),
             ods_major: 0,
             ods_minor: 0,
-            gen_windows: vec![GenWindow::default()],
+            windows: vec![UndoWindow::new(WindowKind::Transaction)],
         };
         let row = |a: i64, b: i64| vec![Value::Int(a), Value::Int(b)];
         let base = RowSource::Rows(vec![row(1, 30), row(2, 10), row(3, 20)]);
@@ -44687,9 +45055,7 @@ mod tests {
             shared: fire_crab_cch::pool::detached(Vec::new()),
             write: None,
             tx: None,
-            auto_tx: None,
             auto_pages: std::collections::HashMap::new(),
-            undo_base: Vec::new(),
             touched: false,
             posted: std::cell::RefCell::new(Vec::new()),
             events: events_for("/nonexistent/fc-rowsource-test"),
@@ -44698,11 +45064,13 @@ mod tests {
             locks: crate::dblocks::for_path("/nonexistent/fc-rowsource-test"),
             lock_owner: 0,
             image_undo: false,
+            ddl_undo: false,
+            nested_tx: Vec::new(),
             page_size: 4096,
             path: String::new(),
             ods_major: 14,
             ods_minor: 0,
-            gen_windows: Vec::new(),
+            windows: Vec::new(),
         };
         let src = RowSource::Filter {
             input: Box::new(RowSource::Rows(rows)),
@@ -50799,6 +51167,97 @@ mod tests {
         assert_eq!(unquote_ident("\"MyGen\"").as_deref(), Some("MyGen"));
         assert_eq!(unquote_ident("\"a\"\"b\"").as_deref(), Some("a\"b"));
         assert_eq!(unquote_ident(""), None);
+    }
+
+    /// A bare `Database` over a detached pool - enough for the
+    /// bookkeeping below, which touches no page.
+    fn bookkeeping_db(tag: &str) -> Database {
+        Database {
+            shared: fire_crab_cch::pool::detached(Vec::new()),
+            write: None,
+            tx: None,
+            auto_pages: std::collections::HashMap::new(),
+            touched: false,
+            posted: std::cell::RefCell::new(Vec::new()),
+            events: events_for(tag),
+            meta: crate::mdc::for_path(tag),
+            stmts: Default::default(),
+            locks: crate::dblocks::for_path(tag),
+            lock_owner: 0,
+            image_undo: false,
+            ddl_undo: false,
+            nested_tx: Vec::new(),
+            page_size: 4096,
+            path: String::new(),
+            ods_major: 14,
+            ods_minor: 0,
+            windows: vec![UndoWindow::new(WindowKind::Transaction)],
+        }
+    }
+
+    /// WHICH ID A WRITE CARRIES, and which ids a reader counts.
+    ///
+    /// The rules, and each one is a bug that has been made here: a
+    /// STATEMENT window is transparent (it would otherwise burn an id
+    /// per statement, since its undo is dropping a working copy); the
+    /// transaction's own window is not a nested one (its id is
+    /// `Database::tx`); and a window that closes SUCCESSFULLY keeps its
+    /// id alive, because the rows are the transaction's uncommitted work
+    /// and the outer COMMIT is what makes them real.
+    #[test]
+    fn a_window_writes_under_its_own_id() {
+        let mut db = bookkeeping_db("/nonexistent/fc-window-test");
+        // the transaction itself: no nested window, so the id is its own
+        assert_eq!(db.owning_window(), None);
+        db.adopt_tx(101);
+        assert_eq!(db.tx, Some(101));
+        assert_eq!(db.write_tx(), Some(101));
+        assert_eq!(db.nested_tx, Vec::<u32>::new());
+        // a STATEMENT window changes nothing - it is transparent
+        db.windows.push(UndoWindow::new(WindowKind::Statement));
+        assert_eq!(db.owning_window(), None);
+        assert_eq!(db.write_tx(), Some(101));
+        db.windows.pop();
+        // a NESTED window owns the writes made inside it
+        db.windows.push(UndoWindow::new(WindowKind::Nested));
+        assert_eq!(db.write_tx(), None); // nothing written in it yet
+        db.adopt_tx(102);
+        assert_eq!(db.write_tx(), Some(102));
+        assert_eq!(db.tx, Some(101)); // ...and the transaction's own is untouched
+        // a reader counts both, and the COMMIT flips both
+        assert!(db.own_tx().contains(101) && db.own_tx().contains(102));
+        let mut all = db.all_tx();
+        all.sort_unstable();
+        assert_eq!(all, vec![101, 102]);
+        // ...and a statement inside the window still writes under it
+        db.windows.push(UndoWindow::new(WindowKind::Statement));
+        assert_eq!(db.write_tx(), Some(102));
+    }
+
+    /// A BLOCK READS ITS OWN IDS AND NOTHING ELSE - the engine's rule
+    /// that `IN AUTONOMOUS TRANSACTION` cannot see the uncommitted rows
+    /// of the transaction around it, which here is a property of the
+    /// walk rather than a special case: an autonomous window stops it,
+    /// inclusively.
+    #[test]
+    fn a_block_counts_only_its_own() {
+        let mut db = bookkeeping_db("/nonexistent/fc-block-test");
+        db.adopt_tx(201); // the outer transaction has written
+        db.windows.push(UndoWindow::new(WindowKind::Autonomous));
+        db.windows.last_mut().unwrap().tx = Some(202);
+        let own = db.own_tx();
+        assert!(own.contains(202));
+        assert!(!own.contains(201), "the block must not see the outer transaction");
+        // a body inside the block writes under ITS window, and the block
+        // counts that too
+        db.windows.push(UndoWindow::new(WindowKind::Nested));
+        db.adopt_tx(203);
+        let own = db.own_tx();
+        assert!(own.contains(202) && own.contains(203));
+        assert!(!own.contains(201));
+        // the ids reserved inside a block are the BLOCK's to end: the
+        // transaction around it must not flip them at its own commit
+        assert_eq!(db.all_tx(), vec![201]);
     }
 }
 

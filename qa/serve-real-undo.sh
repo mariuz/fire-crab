@@ -20,8 +20,10 @@
 #
 # THE CARVE-OUT IS MEASURED, NOT ASSUMED. An image is still what undoes
 # a DDL statement - this server's catalog rows are settled as they are
-# written - and a ROLLBACK TO a mark, which asks a transaction to undo
-# part of itself. The last section holds those.
+# written. A ROLLBACK TO a mark used to need one too, and does not any
+# more: an undo window reserves a transaction id of its own and killing
+# that id is the undo (see qa/serve-real-savepointtx.sh). The last
+# section holds both.
 #
 #   qa/serve-real-undo.sh [port]
 
@@ -192,7 +194,9 @@ make_db "$A" >/dev/null || { echo "FAIL scratch crab db"; exit 1; }
 check "fc: a rolled-back CREATE TABLE leaves no relation (the image path)" \
       "$(ddl_rollback "127.0.0.1/$PORT:$A")" "0"
 
-# ...and a ROLLBACK TO a mark, which one transaction id cannot express
+# ...and a ROLLBACK TO a mark, which ONE transaction id cannot express -
+# so the mark gets one of its own, and this holds that the answer is the
+# same as the image restore used to give
 sp_rollback() { # <conn>
     printf 'INSERT INTO T VALUES (9, %s);\nSAVEPOINT S;\nINSERT INTO T VALUES (10, %s);\nROLLBACK TO S;\nCOMMIT;\n' "'a'" "'b'" |
         "$ISQL" -q -b -user "$U" -pas "$P" "$1" >/dev/null 2>&1
@@ -202,7 +206,7 @@ sp_rollback() { # <conn>
 make_db "$B" >/dev/null || { echo "FAIL scratch engine db"; exit 1; }
 check "ENGINE: ROLLBACK TO a mark keeps the work before it" "$(sp_rollback "$B")" "3"
 make_db "$A" >/dev/null || { echo "FAIL scratch crab db"; exit 1; }
-check "fc: ROLLBACK TO a mark keeps the work before it (the image path)" \
+check "fc: ROLLBACK TO a mark keeps the work before it (the mark's own id)" \
       "$(sp_rollback "127.0.0.1/$PORT:$A" "$A")" "3"
 
 # --- 6. THE KEY A ROLLED-BACK ROW LEFT IN THE INDEX ---------------------

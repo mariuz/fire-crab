@@ -95,6 +95,70 @@ pub fn apply_differences(diff: &[u8], newer_image: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// THE TRANSACTIONS A READER COUNTS AS ITS OWN - not one id, a SET.
+///
+/// A reader must see the uncommitted work of its own transaction, and
+/// for a long time that was one number, because one attachment wrote
+/// under one id. It is a set now because an UNDO WINDOW inside a
+/// transaction - a savepoint, a PSQL body, a row-by-row statement -
+/// writes under a NESTED id of its own, so that undoing the window is
+/// `tra_dead` on that id and nothing else (the engine's savepoint
+/// model, `tra.cpp`'s undo records seen from the durable side). All of
+/// those ids belong to the same reader; a transaction that commits
+/// flips every one of them, and one that rolls a window back flips
+/// only that window's.
+///
+/// Order does not matter and the sets are tiny (one per open window),
+/// so this is a `Vec` and the test is a linear scan - a `HashSet` here
+/// costs more than it saves, and this is on the per-record path.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OwnTx {
+    ids: Vec<u64>,
+}
+
+impl OwnTx {
+    /// The committed-only walk: a reader with no transaction of its
+    /// own, which is what a tool reading a quiet file is.
+    pub fn none() -> OwnTx {
+        OwnTx { ids: Vec::new() }
+    }
+
+    pub fn one(id: u64) -> OwnTx {
+        OwnTx { ids: vec![id] }
+    }
+
+    pub fn of<I: IntoIterator<Item = u64>>(ids: I) -> OwnTx {
+        OwnTx { ids: ids.into_iter().collect() }
+    }
+
+    pub fn push(&mut self, id: u64) {
+        if !self.contains(id) {
+            self.ids.push(id);
+        }
+    }
+
+    pub fn contains(&self, id: u64) -> bool {
+        self.ids.contains(&id)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    pub fn ids(&self) -> &[u64] {
+        &self.ids
+    }
+}
+
+impl From<Option<u64>> for OwnTx {
+    fn from(id: Option<u64>) -> OwnTx {
+        match id {
+            Some(id) => OwnTx::one(id),
+            None => OwnTx::none(),
+        }
+    }
+}
+
 /// One visible row: its record number and decoded values.
 pub struct VisibleRow {
     pub recno: u64,
@@ -120,9 +184,10 @@ pub struct VisibleRow {
 /// would see is a deleted stub, or there is no such version (an insert
 /// by a transaction it does not count).
 ///
-/// `own` is the reader's OWN transaction, which it must see the
-/// uncommitted work of - a statement reads what the statements before
-/// it in the same transaction wrote. Pass `None` for the pure
+/// `own` is the reader's OWN transactions, whose uncommitted work it
+/// must see - a statement reads what the statements before it in the
+/// same transaction wrote, INCLUDING the ones an undo window inside it
+/// wrote under a nested id. Pass [OwnTx::none] for the pure
 /// committed-only walk (what a tool reading a quiet file wants).
 ///
 /// The returned `format` is the FOUND VERSION's, not the chain head's:
@@ -141,7 +206,7 @@ pub fn visible_version(
     page_size: usize,
     head: &crate::data::RecordHeader,
     tips: &TipChain,
-    own: Option<u64>,
+    own: &OwnTx,
 ) -> Option<VisibleVersion> {
     let fetch_page = |no: u32| {
         let start = no as usize * page_size;
@@ -167,7 +232,7 @@ pub fn visible_version(
         // among them, so reading it as active would hide the catalog.
         let counts = current.transaction == 0
             || tips.state(current.transaction) == Some(TxState::Committed)
-            || own == Some(current.transaction);
+            || own.contains(current.transaction);
         if counts {
             if current.flags & flags::DELETED != 0 {
                 return None; // the reader's row is a deleted stub
@@ -214,7 +279,7 @@ pub fn visible_exists(
     page_size: usize,
     head: &crate::data::RecordHeader,
     tips: &TipChain,
-    own: Option<u64>,
+    own: &OwnTx,
 ) -> bool {
     if head.flags & (flags::CHAIN | flags::FRAGMENT | flags::BLOB) != 0 {
         return false; // reached through its head, never walked as one
@@ -223,7 +288,7 @@ pub fn visible_exists(
     loop {
         let counts = current.transaction == 0
             || tips.state(current.transaction) == Some(TxState::Committed)
-            || own == Some(current.transaction);
+            || own.contains(current.transaction);
         if counts {
             return current.flags & flags::DELETED == 0;
         }
@@ -279,7 +344,7 @@ pub fn visible_rows(
             }
             let recno = dp.sequence as u64 * recs_per_dp + r.slot as u64;
             // committed-only: a reader with no transaction of its own
-            let Some(v) = visible_version(file, page_size, &r, tips, None) else {
+            let Some(v) = visible_version(file, page_size, &r, tips, &OwnTx::none()) else {
                 continue;
             };
             out.push(VisibleRow {
@@ -331,6 +396,30 @@ pub fn page_size_of(file: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The set a reader counts as its own. It was one id for as long as
+    /// one attachment wrote under one transaction; an undo window writes
+    /// under a nested one, so it is a set - and `None` (a tool reading a
+    /// quiet file) must stay the EMPTY set rather than becoming
+    /// "everything", which is the direction that would make a rolled-back
+    /// row visible to `fcstat`.
+    #[test]
+    fn own_tx_is_a_set_and_none_is_empty() {
+        let none = OwnTx::none();
+        assert!(none.is_empty());
+        assert!(!none.contains(0));
+        assert!(!none.contains(7));
+        assert_eq!(OwnTx::from(None), none);
+        assert_eq!(OwnTx::from(Some(7)), OwnTx::one(7));
+
+        let mut own = OwnTx::of([7u64, 9]);
+        assert!(own.contains(7) && own.contains(9) && !own.contains(8));
+        // pushing is idempotent: a window whose id is already counted
+        // must not grow the set every time it is asked
+        own.push(9);
+        own.push(11);
+        assert_eq!(own.ids(), &[7, 9, 11]);
+    }
 
     #[test]
     fn apply_differences_matches_sqz_cpp() {
