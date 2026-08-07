@@ -13,6 +13,63 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-07 — the physical backup: nbackup as a service
+
+### Converted
+- **`isc_action_svc_nbak` / `isc_action_svc_nrest`, level 0** — the
+  service actions behind `fbsvcmgr action_nbak`/`action_nrest`, and for
+  fire-crab they are not a convenience: direct `nbackup -B` refuses a
+  remote path ("nbackup needs local access to database file") and a bare
+  path attaches the EMBEDDED engine, so the service is the only road a
+  physical backup can reach any server by.
+- **The consistency the engine engineers, this architecture has by
+  construction.** The engine's backup needs BEGIN/END BACKUP around its
+  copy because the file changes underneath — the mode diverts writes to a
+  `.delta`, the copy reads a frozen file, END BACKUP merges. What that
+  buys is a consistent point-in-time image, and fire-crab's buffer pool
+  already IS one: a published image is never edited in place, so the
+  `Arc` the action takes cannot change however many writers commit while
+  the copy runs. The backup is one read of an `Arc`.
+- **Measured shape of a level-0 `.nbk`**: the database with
+  `hdr_backup_mode` STALLED inside it (the engine's own `.nbk` differs
+  from the live file in exactly that byte plus the counters END BACKUP
+  advanced afterwards) — **plus the backup GUID clumplet
+  (`HDR_backup_guid`, tag 7), which is not decoration: `nbackup -R`
+  REFUSES a level-0 file without one** ("Cannot get backup guid clumplet
+  from L0 backup"), because the GUID is how a level-1 file later names
+  the backup it increments. Found the hard way — the first build's backup
+  restored only on databases the engine had already backed up once.
+- **Restore is a fixup copy**: `hdr_backup_mode` cleared and a FRESH
+  database GUID (the engine writes one on every restore — the restored
+  database is a NEW database that happens to hold the same rows).
+  `nrest` streams NO output; `nbak` streams the three stat lines,
+  byte-identical including the counts.
+- **The client polls with `isc_info_svc_line` + `isc_info_svc_stdin`
+  together** — and stdin must answer numeric 0 ("no input wanted",
+  svc.cpp:1337-1348) rather than being refused: the first build's actions
+  succeeded and then reported "feature is not supported", because the
+  info query after them died on the stdin item.
+
+### Named, not converted
+- **The incremental chain — one feature, not three.** A level > 0 backup
+  (or `-B <GUID>`) needs SCN tracking, a backup GUID in the MAIN header
+  and an `RDB$BACKUP_HISTORY` row — bookkeeping the engine writes even
+  for a level-0 backup. fire-crab refuses level > 0 and leaves the main
+  file UNTOUCHED by its own backup (the GUID goes into the copy alone);
+  the gate asserts both halves of the difference: after the engine's
+  nbak the main file gains a history row, after fire-crab's it gains
+  nothing.
+
+### Gated
+- **`qa/serve-real-nbackup.sh`** (15 checks): the service output
+  byte-identical (elapsed time normalized); the CROSS-RESTORES both ways
+  — the REAL `nbackup -R` restores fire-crab's backup and fire-crab's
+  `nrest` restores the engine's, with the engine reading the rows from
+  both results and `gfix -v -full` accepting them; the fresh-GUID law;
+  point-in-time teeth (a row written after the backup is not in it);
+  refusals onto existing files compared; the incremental boundary; and
+  the live database clean after its own backups.
+
 ## 2026-08-07 — validation, and what its silence means: gfix -v
 
 ### Converted

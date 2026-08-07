@@ -256,9 +256,34 @@ pub fn start_clumplet_type(action: u8, tag: u8) -> Option<ClumpletType> {
             spb::OPTIONS => Some(IntSpb),
             _ => None,
         },
+        // the engine's own framing table (ClumpletReader.cpp:440-457):
+        // strings for the file names and the GUID, ints for the level
+        // and the history knobs, a bare tag for clean_history
+        action::NBAK | action::NREST => match tag {
+            nbk::FILE | nbk::DIRECT | spb::DBNAME | nbk::GUID => Some(StringSpb),
+            nbk::LEVEL | spb::OPTIONS | nbk::KEEP_DAYS | nbk::KEEP_ROWS => Some(IntSpb),
+            nbk::CLEAN_HISTORY => Some(Single),
+            _ => None,
+        },
         action::GET_FB_LOG => None,
         _ => None,
     }
+}
+
+/// `isc_spb_nbk_*` - the nbackup action's own tags (consts_pub.h:642-651).
+pub mod nbk {
+    pub const LEVEL: u8 = 5;
+    pub const FILE: u8 = 6;
+    pub const DIRECT: u8 = 7;
+    pub const GUID: u8 = 8;
+    pub const CLEAN_HISTORY: u8 = 9;
+    pub const KEEP_DAYS: u8 = 10;
+    pub const KEEP_ROWS: u8 = 11;
+    /// `isc_spb_nbk_no_triggers` - an OPTIONS bit, not a tag
+    pub const OPT_NO_TRIGGERS: u32 = 0x01;
+    /// `isc_spb_nbk_inplace` - restore onto an existing database
+    pub const OPT_INPLACE: u32 = 0x02;
+    pub const OPT_SEQUENCE: u32 = 0x04;
 }
 
 /// Build the start SPB for `db_stats` on one database - what `gstat`
@@ -665,6 +690,36 @@ impl Output {
 ///
 /// The buffer length bounds the answer the same way every other info item
 /// is bounded, so a `to_eof` of a long report comes back in several polls.
+/// Answer a poll whose receive items are the OUTPUT-STREAM family -
+/// `isc_info_svc_line` / `to_eof`, optionally with `isc_info_svc_stdin`
+/// alongside, which is exactly how nbackup's client polls (measured:
+/// recv = 3e 4e). `stdin` answers a numeric 0 - "the server wants no
+/// stdin" (svc.cpp:1337-1348, ADD_SPB_NUMERIC(info, 0)) - and a client
+/// that is told anything else waits to send input the action will never
+/// read.
+pub fn answer_output_items(recv: &[u8], out: &mut Output, buffer_length: usize) -> Vec<u8> {
+    let mut r = InfoResponse::new(buffer_length);
+    let room = buffer_length.saturating_sub(5);
+    for &item in recv {
+        match item {
+            info::LINE => {
+                let line = out.next_line();
+                r.string(item, &line);
+            }
+            info::TO_EOF => {
+                let chunk = out.to_eof(room);
+                r.string(item, &chunk);
+            }
+            info::STDIN => {
+                r.numeric(item, 0);
+            }
+            1 => break, // isc_info_end in the request
+            _ => {}
+        }
+    }
+    r.finish()
+}
+
 pub fn answer_output(item: u8, out: &mut Output, buffer_length: usize) -> Vec<u8> {
     let mut r = InfoResponse::new(buffer_length);
     // room for the tag, the length word and isc_info_end
@@ -897,6 +952,52 @@ pub fn attach_spb(user: &str, password: &str, process: &str, client_version: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The nbackup actions' framing (ClumpletReader.cpp:440-457), and
+    /// the poll shape its client uses: line + stdin TOGETHER, the stdin
+    /// answered numeric 0 - a server that refuses the pair fails an
+    /// action that already succeeded.
+    #[test]
+    fn nbackup_framing_and_the_line_stdin_poll() {
+        assert_eq!(
+            start_clumplet_type(action::NBAK, nbk::FILE),
+            Some(ClumpletType::StringSpb)
+        );
+        assert_eq!(
+            start_clumplet_type(action::NBAK, nbk::LEVEL),
+            Some(ClumpletType::IntSpb)
+        );
+        assert_eq!(
+            start_clumplet_type(action::NREST, spb::DBNAME),
+            Some(ClumpletType::StringSpb)
+        );
+        assert_eq!(start_clumplet_type(action::NBAK, 99), None);
+
+        // a start SPB the way fbsvcmgr builds one: action, level 0,
+        // dbname, nbk_file
+        let mut v = vec![action::NBAK, nbk::LEVEL];
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.push(spb::DBNAME);
+        v.extend_from_slice(&2u16.to_le_bytes());
+        v.extend_from_slice(b"db");
+        v.push(nbk::FILE);
+        v.extend_from_slice(&3u16.to_le_bytes());
+        v.extend_from_slice(b"nbk");
+        let b = parse(Grammar::SpbStart, &v).unwrap();
+        assert_eq!(b.number(nbk::LEVEL), Some(0));
+        assert_eq!(b.text(spb::DBNAME).as_deref(), Some("db"));
+        assert_eq!(b.text(nbk::FILE).as_deref(), Some("nbk"));
+
+        // the poll: recv = [line, stdin] answers a line item AND a
+        // numeric-0 stdin item, then isc_info_end
+        let mut out = Output::new("hello\nworld\n");
+        let ans = answer_output_items(&[info::LINE, info::STDIN], &mut out, 512);
+        assert_eq!(ans[0], info::LINE);
+        let len = u16::from_le_bytes([ans[1], ans[2]]) as usize;
+        assert_eq!(&ans[3..3 + len], b"hello ");
+        assert_eq!(ans[3 + len], info::STDIN);
+        assert_eq!(&ans[4 + len..8 + len], &0u32.to_le_bytes());
+    }
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())

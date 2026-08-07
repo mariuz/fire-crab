@@ -2139,21 +2139,35 @@ fn serve_service(
                     );
                 }
                 // a poll of a running action's output stream is answered
-                // from the session's output, not from the server-info table
-                if recv.len() == 1
-                    && (recv[0] == fire_crab_svc::info::LINE
-                        || recv[0] == fire_crab_svc::info::TO_EOF)
+                // from the session's output, not from the server-info
+                // table. The receive items may carry isc_info_svc_stdin
+                // beside the line/to_eof item - nbackup's client polls
+                // with exactly that pair - and stdin is answered 0 ("no
+                // input wanted") rather than refused.
+                if !recv.is_empty()
+                    && recv.iter().all(|i| {
+                        matches!(
+                            *i,
+                            fire_crab_svc::info::LINE
+                                | fire_crab_svc::info::TO_EOF
+                                | fire_crab_svc::info::STDIN
+                                | 1
+                        )
+                    })
+                    && recv
+                        .iter()
+                        .any(|i| *i == fire_crab_svc::info::LINE || *i == fire_crab_svc::info::TO_EOF)
                 {
                     let info = match output.as_mut() {
-                        Some(o) => fire_crab_svc::answer_output(
-                            recv[0],
+                        Some(o) => fire_crab_svc::answer_output_items(
+                            &recv,
                             o,
                             buflen.max(0) as usize,
                         ),
                         // no action has been started: the stream is empty,
                         // which is end-of-output, not an error
-                        None => fire_crab_svc::answer_output(
-                            recv[0],
+                        None => fire_crab_svc::answer_output_items(
+                            &recv,
                             &mut fire_crab_svc::Output::new(""),
                             buflen.max(0) as usize,
                         ),
@@ -2264,6 +2278,12 @@ fn run_service_action(spb: &[u8]) -> Result<String, i32> {
         GDS_WISH_LIST
     })?;
     let action = b.items.first().map(|c| c.tag).unwrap_or(0);
+    if action == fire_crab_svc::action::NBAK {
+        return run_nbak(&b);
+    }
+    if action == fire_crab_svc::action::NREST {
+        return run_nrest(&b);
+    }
     if action != fire_crab_svc::action::DB_STATS {
         if std::env::var("FC_SRV_TRACE").is_ok() {
             eprintln!("[srv] action {} not converted", action);
@@ -2319,6 +2339,163 @@ fn run_service_action(spb: &[u8]) -> Result<String, i32> {
         "\nDatabase \"{}\"\nGstat execution time {}\n\n{}Gstat completion time {}\n",
         db, stamp, report, stamp
     ))
+}
+
+/// `isc_action_svc_nbak`, level 0: the PHYSICAL backup, which in this
+/// server is one read of an `Arc`.
+///
+/// The engine's nbackup needs BEGIN BACKUP / END BACKUP around its copy
+/// because the file changes under it: the mode diverts writes to a
+/// `.delta`, the copy reads a frozen main file, END BACKUP merges. What
+/// that machinery BUYS is a consistent point-in-time image - and
+/// fire-crab's buffer pool already IS one: a published image is never
+/// edited in place, so the `Arc` this function takes cannot change
+/// however many writers commit while the copy runs. The consistency the
+/// engine engineers, this architecture has by construction.
+///
+/// The backup FILE is the image as it stands with `hdr_backup_mode`
+/// STALLED inside it - measured: the engine's level-0 `.nbk` differs
+/// from the live database in exactly the backup-mode byte and the
+/// counters END BACKUP's own writes advanced afterwards. The MAIN file
+/// is not touched at all.
+///
+/// LEVEL 0 ONLY, and the boundary is one feature, not three: an
+/// incremental backup (level > 0, or `-B <GUID>`) needs SCN tracking, a
+/// backup GUID in the main header and an `RDB$BACKUP_HISTORY` row - the
+/// chain bookkeeping the engine writes even for a level-0 backup, and
+/// fire-crab deliberately does not (`qa/serve-real-nbackup.sh` asserts
+/// that difference rather than hiding it).
+fn run_nbak(b: &fire_crab_svc::Buffer) -> Result<String, i32> {
+    use fire_crab_svc::nbk;
+    let db = b.text(fire_crab_svc::spb::DBNAME).ok_or(GDS_WISH_LIST)?;
+    let file = b.text(nbk::FILE).ok_or(GDS_WISH_LIST)?;
+    let level = b.number(nbk::LEVEL);
+    if level != Some(0) || b.text(nbk::GUID).is_some() {
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] nbak level {:?} refused - level 0 only", level);
+        }
+        return Err(GDS_WISH_LIST);
+    }
+    let shared = fire_crab_cch::pool::open(&db).ok_or(GDS_IO_ERROR)?;
+    let image = shared.image();
+    let page_size = fire_crab_ods::header::HeaderPage::decode(&image)
+        .map(|h| h.page_size as usize)
+        .ok_or(GDS_IO_ERROR)?;
+    if page_size == 0 {
+        return Err(GDS_IO_ERROR);
+    }
+    let mut copy = image.as_ref().clone();
+    if copy.len() > 24 {
+        copy[24] = 1; // hdr_backup_mode = stalled, as the engine's .nbk carries
+    }
+    // THE BACKUP GUID CLUMPLET (HDR_backup_guid, tag 7) - not decoration:
+    // `nbackup -R` REFUSES a level-0 file without one ("Cannot get backup
+    // guid clumplet from L0 backup"), because the GUID is how a level-1
+    // file later names the backup it increments. The engine writes it
+    // into the MAIN header at BEGIN BACKUP (nbak.cpp:337) and the copy
+    // inherits it; fire-crab writes it into the COPY alone - its backup
+    // leaves the main file untouched, which the gate asserts as the same
+    // boundary the missing history row belongs to.
+    fire_crab_ods::header::store_clumplet(
+        &mut copy,
+        page_size,
+        fire_crab_ods::header::hdr_clump::BACKUP_GUID,
+        &fresh_guid(),
+    )
+    .map_err(|_| GDS_IO_ERROR)?;
+    // the target must be FRESH - overwriting a backup somebody has is
+    // worse than refusing (the engine refuses too; the gate compares)
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&file)
+        .map_err(|e| {
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                eprintln!("[srv] nbak cannot create {}: {}", file, e);
+            }
+            GDS_IO_ERROR
+        })?;
+    use std::io::Write as _;
+    out.write_all(&copy).and_then(|_| out.sync_all()).map_err(|_| GDS_IO_ERROR)?;
+    let pages = copy.len() / page_size;
+    // nbackup's own stat lines, streamed back the way the engine's
+    // server-side nbackup streams them: reads count the header probe
+    // plus every page, writes count the pages written
+    Ok(format!(
+        "time elapsed	0 sec 
+page reads	{} 
+page writes	{}
+",
+        pages + 1,
+        pages
+    ))
+}
+
+/// `isc_action_svc_nrest`, one level-0 file: the FIXUP restore.
+///
+/// Measured against the engine's own `-R`: the restored file is the
+/// backup with `hdr_backup_mode` cleared and a FRESH database GUID -
+/// the restored database is a NEW database that happens to hold the
+/// same rows, which is what lets replication and backup chains tell the
+/// two apart. A restore onto an EXISTING file refuses; a chain of more
+/// than one file is the incremental feature, refused with the level-0
+/// boundary above. The engine's own nrest streams NO output (measured:
+/// fbsvcmgr prints nothing, rc 0).
+fn run_nrest(b: &fire_crab_svc::Buffer) -> Result<String, i32> {
+    use fire_crab_svc::nbk;
+    let db = b.text(fire_crab_svc::spb::DBNAME).ok_or(GDS_WISH_LIST)?;
+    let files: Vec<String> = b
+        .items
+        .iter()
+        .filter(|c| c.tag == nbk::FILE)
+        .map(|c| c.text())
+        .collect();
+    if files.len() != 1 {
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] nrest with {} files refused - one level-0 file only", files.len());
+        }
+        return Err(GDS_WISH_LIST);
+    }
+    let mut image = std::fs::read(&files[0]).map_err(|e| {
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] nrest cannot read {}: {}", files[0], e);
+        }
+        GDS_IO_ERROR
+    })?;
+    if fire_crab_ods::header::HeaderPage::decode(&image).is_none() {
+        return Err(GDS_IO_ERROR);
+    }
+    if image.len() > 24 {
+        image[24] = 0; // hdr_backup_mode = none: the fixup
+    }
+    // A FRESH DATABASE GUID (offset 84, 16 bytes) - the engine writes
+    // one on every restore, and the gate asserts it CHANGED.
+    if image.len() >= 100 {
+        image[84..100].copy_from_slice(&fresh_guid());
+    }
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&db)
+        .map_err(|e| {
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                eprintln!("[srv] nrest cannot create {}: {}", db, e);
+            }
+            GDS_IO_ERROR
+        })?;
+    use std::io::Write as _;
+    out.write_all(&image).and_then(|_| out.sync_all()).map_err(|_| GDS_IO_ERROR)?;
+    Ok(String::new())
+}
+
+/// A fresh v4 UUID: random bytes with the version and variant bits set.
+fn fresh_guid() -> [u8; 16] {
+    let mut guid = [0u8; 16];
+    let _ = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut guid));
+    guid[6] = (guid[6] & 0x0f) | 0x40;
+    guid[8] = (guid[8] & 0x3f) | 0x80;
+    guid
 }
 
 /// A `ctime`-shaped stamp - "Thu Jul 30 05:15:05 2026" - in UTC.

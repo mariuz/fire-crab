@@ -2750,6 +2750,22 @@ plus *the subsystem is now on the path*.
   What is left of gfix is the limbo-transaction switches, which need
   two-phase commit first.
 
+  **nbackup as a service is DONE for level 0**
+  (`qa/serve-real-nbackup.sh`, 15 checks): `isc_action_svc_nbak`/`nrest`,
+  the only road a physical backup can reach any server by (direct
+  `nbackup -B` refuses remote paths and bare paths attach the embedded
+  engine). The consistency the engine engineers with BEGIN/END BACKUP
+  and the delta file, fire-crab's buffer pool has by construction - the
+  backup is one read of an `Arc` that cannot change under it. Two
+  measured teeth marks: a level-0 `.nbk` must carry the
+  `HDR_backup_guid` clumplet or `nbackup -R` refuses it, and the
+  client polls output with line + stdin TOGETHER, the stdin answered
+  numeric 0. The incremental chain (level > 0, SCN tracking, the main
+  header's backup GUID, `RDB$BACKUP_HISTORY`) is the recorded boundary.
+  **gbak as a service is the remaining half of this front**: the burp
+  (.fbk) format, reader and writer, with cross-restore against the real
+  gbak as the oracle - a larger conversion with its own slices.
+
 ## A savepoint is a transaction (done)
 
 This was the named architectural next step, and it is the one that
