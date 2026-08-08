@@ -2557,6 +2557,40 @@ fn run_gbak_restore_inner(b: &fire_crab_svc::Buffer) -> Result<String, RestoreEr
                 let image = restore_row_image(row, descs)?;
                 fire_crab_ods::dml::insert_record(&mut file, page_size, rel, *format_no, &image)?;
             }
+            // THE INDEXES COME AFTER THE ROWS, backfilled - the order the
+            // engine's own restore uses, and here it is forced by the
+            // machinery: dml::insert_record does no index maintenance, so
+            // an index made first would be EMPTY over a full table, which
+            // reads as rows silently missing through any indexed access.
+            // The PK's index arrives through the constraint (which also
+            // enforces uniqueness and NOT NULL as it backfills); the rest
+            // through create_index.
+            for ix in &t.indexes {
+                if t.pk_index.as_deref() == Some(ix.name.as_str()) {
+                    fire_crab_ods::ddl::alter_table_add_key(
+                        &mut file,
+                        page_size,
+                        &t.name,
+                        &fire_crab_ods::ddl::KeyDef {
+                            name: String::new(),
+                            columns: ix.segments.clone(),
+                            primary: true,
+                        },
+                    )?;
+                } else {
+                    fire_crab_ods::ddl::create_index(
+                        &mut file,
+                        page_size,
+                        &t.name,
+                        &ix.name,
+                        &ix.segments,
+                        ix.unique,
+                        ix.descending,
+                        false,
+                        None,
+                    )?;
+                }
+            }
         }
         std::fs::write(&db, &file).map_err(|e| e.to_string())?;
         Ok(())

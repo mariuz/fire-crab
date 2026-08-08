@@ -33,6 +33,7 @@ mod rec {
     pub const GLOBAL_FIELD: u8 = 2;
     pub const RELATION: u8 = 3;
     pub const FIELD: u8 = 4;
+    pub const INDEX: u8 = 5;
     pub const DATA: u8 = 6;
     pub const RELATION_DATA: u8 = 8;
     pub const RELATION_END: u8 = 9;
@@ -237,13 +238,20 @@ pub fn write_backup(
         ("a sequence", "RDB$GENERATORS"),
         ("an exception", "RDB$EXCEPTIONS"),
         ("a user function", "RDB$FUNCTIONS"),
-        ("an index", "RDB$INDICES"),
         ("a role", "RDB$ROLES"),
     ] {
         if user_rows_in(image, page_size, rel_name) > 0 {
             return Err(Refused(format!("{} is outside this backup's surface", what)));
         }
     }
+    // CONSTRAINTS are checked by TYPE: NOT NULL and PRIMARY KEY ride the
+    // file; UNIQUE / FOREIGN KEY / CHECK constraints are their own
+    // slices (an FK needs cross-table restore ordering, a UNIQUE
+    // constraint is more than its index - dropping either silently
+    // changes what the schema MEANS).
+    let constraints = read_constraints(image, page_size)?;
+    // ...and the INDEXES, per relation, segments in order
+    let indexes = read_indexes(image, page_size)?;
     // ...and USER DOMAINS: this writer invents its column sources
     // (RDB$1, RDB$2, ...), so a named domain would restore as a plain
     // type - the data right, the schema silently changed. Refuse.
@@ -399,6 +407,22 @@ pub fn write_backup(
             .text(21, "PUBLIC")
             .text(1, name)
             .end();
+        // THE INDEXES, before the data - the reference file's own order
+        // (burp.h:146: "<rel attributes> <gen id> <indices> <data>").
+        // Attributes pinned from a real PK+two-index file: name(1),
+        // segment count(2), inactive(3), unique(4), one att 5 PER
+        // SEGMENT in key order, index type(7).
+        for ix in indexes.iter().filter(|i| &i.relation == name) {
+            let mut r = Rec::new(&mut out, rec::INDEX)
+                .text(1, &ix.name)
+                .int(2, ix.segments.len() as i32)
+                .int(3, 0)
+                .int(4, i32::from(ix.unique));
+            for seg in &ix.segments {
+                r = r.text(5, seg);
+            }
+            r.int(7, ix.itype).end();
+        }
         let descs: Vec<Descriptor> = cols.iter().map(|c| c.desc.clone()).collect();
         let rows = match tips.as_ref() {
             Some(t) => fire_crab_ods::tra::visible_rows(image, page_size, *id, &descs, t),
@@ -419,6 +443,22 @@ pub fn write_backup(
             out.extend_from_slice(&fire_crab_ods::sqz::pack(&xdr));
         }
         out.push(rec::RELATION_END);
+    }
+
+    // --- PRIMARY KEY constraints: the rel_constraint names its INDEX
+    // (att 6), which is how the restore knows which rec_index is the
+    // key. The constraint NAME is the catalog's own - it is read
+    // anyway, and the engine's file carries the real one.
+    for c in &constraints {
+        Rec::new(&mut out, rec::REL_CONSTRAINT)
+            .text(7, "PUBLIC")
+            .text(1, &c.name)
+            .text(2, "PRIMARY KEY")
+            .text(3, &c.relation)
+            .text(4, "NO")
+            .text(5, "NO")
+            .text(6, &c.index)
+            .end();
     }
 
     // --- NOT NULL as the engine carries it: an INTEG rel_constraint +
@@ -454,6 +494,145 @@ pub fn write_backup(
     // file's tail shows
     while out.len() % 512 != 0 {
         out.push(0);
+    }
+    Ok(out)
+}
+
+/// One user index, as the writer carries it.
+struct UIndex {
+    name: String,
+    relation: String,
+    unique: bool,
+    /// RDB$INDEX_TYPE: 1 = descending
+    itype: i32,
+    /// segment field names, in key order
+    segments: Vec<String>,
+}
+
+/// One PRIMARY KEY constraint.
+struct UPk {
+    name: String,
+    relation: String,
+    index: String,
+}
+
+/// The user constraints, typed: PRIMARY KEY rides the file, NOT NULL is
+/// carried separately, and anything else refuses the backup whole.
+fn read_constraints(image: &[u8], page_size: usize) -> Result<Vec<UPk>, Refused> {
+    let Some((cols, rows)) = sys_rows(image, page_size, "RDB$RELATION_CONSTRAINTS") else {
+        return Ok(Vec::new());
+    };
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    let (Some(name_at), Some(type_at), Some(rel_at)) = (
+        at("RDB$CONSTRAINT_NAME"),
+        at("RDB$CONSTRAINT_TYPE"),
+        at("RDB$RELATION_NAME"),
+    ) else {
+        return Ok(Vec::new());
+    };
+    let index_at = at("RDB$INDEX_NAME");
+    let text = |r: &fire_crab_ods::tra::VisibleRow, i: usize| match r.values.get(i) {
+        Some(fire_crab_ods::format::Value::Text(t)) => t.trim_end().to_string(),
+        _ => String::new(),
+    };
+    let mut out = Vec::new();
+    for r in &rows {
+        let rel = text(r, rel_at);
+        if rel.starts_with("RDB$") || rel.starts_with("SEC$") || rel.starts_with("MON$") {
+            continue; // a system table's own constraints
+        }
+        let kind = text(r, type_at);
+        match kind.as_str() {
+            "NOT NULL" => {} // carried through the field records
+            "PRIMARY KEY" => out.push(UPk {
+                name: text(r, name_at),
+                relation: rel,
+                index: index_at.map(|i| text(r, i)).unwrap_or_default(),
+            }),
+            other => {
+                return Err(Refused(format!(
+                    "a {} constraint is outside this backup's surface",
+                    other
+                )))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The user indexes with their segments, key order preserved. An FK
+/// index or an inactive one refuses - both are states this file format
+/// slice cannot say.
+fn read_indexes(image: &[u8], page_size: usize) -> Result<Vec<UIndex>, Refused> {
+    let Some((cols, rows)) = sys_rows(image, page_size, "RDB$INDICES") else {
+        return Ok(Vec::new());
+    };
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    let (Some(name_at), Some(rel_at)) = (at("RDB$INDEX_NAME"), at("RDB$RELATION_NAME")) else {
+        return Ok(Vec::new());
+    };
+    let uniq_at = at("RDB$UNIQUE_FLAG");
+    let type_at = at("RDB$INDEX_TYPE");
+    let inactive_at = at("RDB$INDEX_INACTIVE");
+    let fk_at = at("RDB$FOREIGN_KEY");
+    let flag_at = at("RDB$SYSTEM_FLAG");
+    let text = |r: &fire_crab_ods::tra::VisibleRow, i: usize| match r.values.get(i) {
+        Some(fire_crab_ods::format::Value::Text(t)) => t.trim_end().to_string(),
+        _ => String::new(),
+    };
+    let num = |r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>| match i.and_then(|i| r.values.get(i)) {
+        Some(fire_crab_ods::format::Value::Int(n)) => *n,
+        _ => 0,
+    };
+    // segments: index name -> (position, field)
+    let mut segs: Vec<(String, i64, String)> = Vec::new();
+    if let Some((scols, srows)) = sys_rows(image, page_size, "RDB$INDEX_SEGMENTS") {
+        let sat = |n: &str| scols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+        if let (Some(ix_at), Some(fld_at)) = (sat("RDB$INDEX_NAME"), sat("RDB$FIELD_NAME")) {
+            let pos_at = sat("RDB$FIELD_POSITION");
+            for r in &srows {
+                segs.push((text(r, ix_at), num(r, pos_at), text(r, fld_at)));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for r in &rows {
+        let system = matches!(
+            flag_at.and_then(|i| r.values.get(i)),
+            Some(fire_crab_ods::format::Value::Int(n)) if *n != 0
+        );
+        let rel = text(r, rel_at);
+        if system || rel.starts_with("RDB$") || rel.starts_with("SEC$") || rel.starts_with("MON$")
+        {
+            continue;
+        }
+        let name = text(r, name_at);
+        if fk_at.is_some_and(|i| matches!(r.values.get(i), Some(fire_crab_ods::format::Value::Text(_))))
+        {
+            return Err(Refused(format!(
+                "index {} backs a FOREIGN KEY - outside this backup's surface",
+                name
+            )));
+        }
+        if num(r, inactive_at) != 0 {
+            return Err(Refused(format!(
+                "index {} is inactive - a state this backup cannot say",
+                name
+            )));
+        }
+        let mut mine: Vec<(i64, String)> = segs
+            .iter()
+            .filter(|(ix, _, _)| ix == &name)
+            .map(|(_, p, f)| (*p, f.clone()))
+            .collect();
+        mine.sort_by_key(|(p, _)| *p);
+        out.push(UIndex {
+            name,
+            relation: rel,
+            unique: num(r, uniq_at) != 0,
+            itype: num(r, type_at) as i32,
+            segments: mine.into_iter().map(|(_, f)| f).collect(),
+        });
     }
     Ok(out)
 }
@@ -671,11 +850,22 @@ pub struct RCol {
     pub not_null: bool,
 }
 
+/// One restored index.
+pub struct RIndex {
+    pub name: String,
+    pub unique: bool,
+    pub descending: bool,
+    pub segments: Vec<String>,
+}
+
 /// One restored table.
 pub struct RTable {
     pub name: String,
     pub cols: Vec<RCol>,
     pub rows: Vec<Vec<RVal>>,
+    pub indexes: Vec<RIndex>,
+    /// the index name the PRIMARY KEY constraint points at, if one does
+    pub pk_index: Option<String>,
 }
 
 /// What a .fbk holds, as far as this slice carries it.
@@ -828,7 +1018,13 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 let name = att(&atts, 1)
                     .map(|a| a.text())
                     .ok_or_else(|| Refused("a relation with no name".into()))?;
-                out.tables.push(RTable { name, cols: Vec::new(), rows: Vec::new() });
+                out.tables.push(RTable {
+                    name,
+                    cols: Vec::new(),
+                    rows: Vec::new(),
+                    indexes: Vec::new(),
+                    pk_index: None,
+                });
                 current_rel = Some(out.tables.len() - 1);
             }
             rec::FIELD => {
@@ -866,6 +1062,31 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 if data_rel.is_none() {
                     return Err(Refused(format!("data for an unknown relation {}", name)));
                 }
+            }
+            rec::INDEX => {
+                let t = data_rel
+                    .ok_or_else(|| Refused("an index outside relation data".into()))?;
+                let atts = read_atts(f, &mut at)?;
+                let segments: Vec<String> = atts
+                    .iter()
+                    .filter(|a| a.tag == 5)
+                    .map(|a| a.text())
+                    .collect();
+                if segments.is_empty() {
+                    return Err(Refused("an index with no segments".into()));
+                }
+                let itype = att(&atts, 7).map(|a| a.int()).unwrap_or(0);
+                if !matches!(itype, 0 | 1) {
+                    return Err(Refused("an expression index is outside this restore's surface".into()));
+                }
+                out.tables[t].indexes.push(RIndex {
+                    name: att(&atts, 1)
+                        .map(|a| a.text())
+                        .ok_or_else(|| Refused("an index with no name".into()))?,
+                    unique: att(&atts, 4).map(|a| a.int() == 1).unwrap_or(false),
+                    descending: itype == 1,
+                    segments,
+                });
             }
             rec::DATA => {
                 let t = data_rel.ok_or_else(|| Refused("data outside relation data".into()))?;
@@ -915,15 +1136,23 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 let kind = att(&atts, 2).map(|a| a.text()).unwrap_or_default();
                 let cname = att(&atts, 1).map(|a| a.text()).unwrap_or_default();
                 let table = att(&atts, 3).map(|a| a.text()).unwrap_or_default();
-                if kind.trim() == "NOT NULL" {
-                    cons_table.push((cname, table));
-                } else {
-                    // PRIMARY KEY / UNIQUE / FOREIGN KEY constraints need
-                    // the index records this slice refuses anyway
-                    return Err(Refused(format!(
-                        "a {} constraint is outside this restore's surface",
-                        kind.trim()
-                    )));
+                match kind.trim() {
+                    "NOT NULL" => cons_table.push((cname, table)),
+                    "PRIMARY KEY" => {
+                        let index = att(&atts, 6).map(|a| a.text()).unwrap_or_default();
+                        if let Some(t) = out.tables.iter_mut().find(|t| t.name == table) {
+                            t.pk_index = Some(index);
+                        }
+                    }
+                    other => {
+                        // UNIQUE / FOREIGN KEY / CHECK are their own
+                        // slices - dropping one silently changes what
+                        // the schema means
+                        return Err(Refused(format!(
+                            "a {} constraint is outside this restore's surface",
+                            other
+                        )));
+                    }
                 }
             }
             rec::CHK_CONSTRAINT => {
@@ -1017,6 +1246,40 @@ mod read_tests {
         assert_eq!(t.rows.len(), 1);
         assert_eq!(t.rows[0][0], RVal::Int(1));
         assert_eq!(t.rows[0][1], RVal::Bytes(b"one".to_vec()));
+
+        // indexes and the PRIMARY KEY constraint ride the file: one
+        // rec_index inside relation data, the PK rel_constraint naming
+        // its index at the tail
+        let mut f2 = Vec::new();
+        Rec::new(&mut f2, rec::BURP).int(2, 12).int(4, 1).int(5, 1).end();
+        Rec::new(&mut f2, rec::RELATION).text(21, "PUBLIC").text(1, "K").end();
+        Rec::new(&mut f2, rec::FIELD).text(1, "ID").int(13, 0).int(8, 8).int(10, 4).int(9, 0).end();
+        f2.push(rec::RELATION_END);
+        Rec::new(&mut f2, rec::RELATION_DATA).text(21, "PUBLIC").text(1, "K").end();
+        Rec::new(&mut f2, rec::INDEX)
+            .text(1, "RDB$PRIMARY1")
+            .int(2, 1)
+            .int(3, 0)
+            .int(4, 1)
+            .text(5, "ID")
+            .int(7, 0)
+            .end();
+        f2.push(rec::RELATION_END);
+        Rec::new(&mut f2, rec::REL_CONSTRAINT)
+            .text(7, "PUBLIC")
+            .text(1, "INTEG_2")
+            .text(2, "PRIMARY KEY")
+            .text(3, "K")
+            .text(4, "NO")
+            .text(5, "NO")
+            .text(6, "RDB$PRIMARY1")
+            .end();
+        f2.push(rec::END);
+        let r2 = read_backup(&f2).unwrap();
+        assert_eq!(r2.tables[0].indexes.len(), 1);
+        assert!(r2.tables[0].indexes[0].unique);
+        assert_eq!(r2.tables[0].indexes[0].segments, vec!["ID".to_string()]);
+        assert_eq!(r2.tables[0].pk_index.as_deref(), Some("RDB$PRIMARY1"));
 
         // an unknown RECORD refuses whole - mis-stepping the walk would
         // turn everything after into nonsense

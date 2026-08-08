@@ -13,10 +13,11 @@
 # missing tables - or carrying a table where a view was - is worse than
 # no backup: the client holds a file it believes is its data. So a
 # database holding ANYTHING the writer cannot carry refuses the WHOLE
-# backup: a sequence, a view, an index (a restored table silently
-# missing its PRIMARY KEY is a meaning change, not a detail), a
-# trigger, a procedure, an exception, a function, a role. Each refusal
-# is asserted here against the engine's success on the same database.
+# backup: a sequence, a view, a trigger, a procedure, an exception, a
+# UNIQUE / FOREIGN KEY / CHECK constraint. A PRIMARY KEY and plain or
+# unique INDEXES ride the file (rec_index + the PRIMARY KEY
+# rel_constraint). Each refusal is asserted here against the engine's
+# success on the same database.
 #
 # RECORDED BOUNDARIES:
 #   * `gbak -se` itself speaks an OLDER protocol (its command line rides
@@ -139,7 +140,13 @@ EOF
 }
 refusal "a sequence" "CREATE SEQUENCE G;"
 refusal "a view" "CREATE VIEW VW AS SELECT X FROM T;"
-refusal "an index (a PK is one)" "CREATE TABLE PKT (ID INTEGER NOT NULL PRIMARY KEY);"
+# a PRIMARY KEY and plain/unique indexes RIDE THE FILE now (rec_index +
+# the PRIMARY KEY rel_constraint) - what still refuses is the constraint
+# kinds whose meaning is more than an index
+refusal "a UNIQUE constraint" "CREATE TABLE UQT (X INTEGER NOT NULL, CONSTRAINT UQ_X UNIQUE (X));"
+refusal "a FOREIGN KEY" "CREATE TABLE PARENT (ID INTEGER NOT NULL PRIMARY KEY);
+CREATE TABLE CHILD (PID INTEGER REFERENCES PARENT (ID));"
+refusal "a CHECK constraint" "CREATE TABLE CKT (X INTEGER CHECK (X > 0));"
 refusal "a trigger" "SET TERM ^;
 CREATE TRIGGER TR FOR T BEFORE INSERT AS BEGIN NEW.X = 1; END^
 SET TERM ;^"

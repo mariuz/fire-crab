@@ -2783,8 +2783,14 @@ plus *the subsystem is now on the path*.
   file BOTH WAYS now (att 38 + the INTEG constraint pair), flipping the
   writer gate's recorded boundary to the equality it promised to become;
   the writer also gained the user-domain refusal it was missing.
-  Remaining slices: PK/index records, the -se command-line protocol,
-  verbose streaming, blobs.
+  **PK/index records are DONE** (gbakrestore 26, gbak 21):
+  rec_index + the PRIMARY KEY rel_constraint ride the file both ways,
+  with the build order as part of the law - rows first, indexes
+  backfilled after, because dml::insert_record does no index
+  maintenance and the other order leaves empty indexes over full
+  tables. UNIQUE / FOREIGN KEY / CHECK constraints still refuse, typed.
+  Remaining slices: blobs, the -se command-line protocol, verbose
+  streaming.
 
 ## A savepoint is a transaction (done)
 

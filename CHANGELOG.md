@@ -13,6 +13,45 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-08 — keys and indexes ride the file
+
+### Converted
+- **`rec_index` and the PRIMARY KEY `rel_constraint`**, both directions —
+  lifting the boundary both gbak gates held. The grammar, pinned from a
+  real PK-plus-two-indexes file: name(1), segment count(2), inactive(3),
+  unique(4), ONE att 5 PER SEGMENT in key order, index type(7 — 1 is
+  descending); the indexes sit inside relation_data BEFORE the data
+  (burp.h:146's own order), and the PRIMARY KEY constraint names its
+  index through att 6.
+- **The writer reads the real catalog**: user indexes from RDB$INDICES +
+  RDB$INDEX_SEGMENTS (segments ordered by position), PK constraints from
+  RDB$RELATION_CONSTRAINTS — all columns resolved by name. The
+  constraint check is TYPED now: NOT NULL and PRIMARY KEY ride the file;
+  UNIQUE, FOREIGN KEY and CHECK constraints refuse the whole backup (an
+  FK needs cross-table restore ordering; a UNIQUE constraint is more
+  than its index — dropping either silently changes what the schema
+  means). An FK-backing or INACTIVE index refuses too.
+- **The reader's BUILD ORDER is part of the law**: rows first, indexes
+  after, BACKFILLED — and here the machinery forces what the engine's
+  restore chooses, because `dml::insert_record` does no index
+  maintenance: an index created before the rows would be EMPTY over a
+  full table, which reads as rows silently missing through any indexed
+  access. The PK arrives through `alter_table_add_key` (uniqueness and
+  NOT NULL enforced as it backfills), the rest through `create_index`.
+- Verified beyond row equality: the engine's own planner USES an index
+  fire-crab's restore built (`PLAN (T INDEX (IDX_V))` on the restored
+  database), and a duplicate key refuses in all four restore
+  combinations.
+
+### Gated
+- `qa/serve-real-gbakrestore.sh` 22 → 26 checks: the KEYED fixture (PK +
+  plain index + two-segment unique index) through the four-way matrix,
+  with the duplicate-key refusal and the index list asserted in every
+  result; the fail-closed representative is a FOREIGN-KEY fbk now.
+  `qa/serve-real-gbak.sh` 19 → 21: the index refusal became three
+  constraint refusals (UNIQUE, FK, CHECK), each against the engine's
+  success.
+
 ## 2026-08-08 — the logical restore: fire-crab reads a .fbk
 
 ### Converted
