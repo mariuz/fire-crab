@@ -251,6 +251,28 @@ pub fn write_backup(
     fbk_path: &str,
     now_secs: i64,
 ) -> Result<Vec<u8>, Refused> {
+    write_backup_verbose(image, page_size, db_path, fbk_path, now_secs, &mut Vec::new())
+}
+
+/// [write_backup] with gbak's own commentary: every line the engine's
+/// `-v` stream prints for the work THIS writer performs is pushed to
+/// `log`, phrased from the live captures (the message text carries the
+/// `gbak:` prefix on the wire - fbsvcmgr trims the framing space, the
+/// gbak client does not). The category headers are UNCONDITIONAL, as
+/// the engine's are - "writing functions" prints over an empty set -
+/// which is honest here because the surface check above refuses any
+/// database where those sets are NOT empty. Per-record lines print only
+/// for records actually written; this writer emits no privilege
+/// records, so no privilege lines - the one difference from the
+/// engine's stream on the same source, and the gate's recorded filter.
+pub fn write_backup_verbose(
+    image: &[u8],
+    page_size: usize,
+    db_path: &str,
+    fbk_path: &str,
+    now_secs: i64,
+    log: &mut Vec<String>,
+) -> Result<Vec<u8>, Refused> {
     let head = fire_crab_ods::header::HeaderPage::decode(image)
         .ok_or_else(|| Refused("not a database image".into()))?;
 
@@ -330,6 +352,8 @@ pub fn write_backup(
         .byte(21, 0)
         .end();
     // --- rec_schema: PUBLIC ----------------------------------------------
+    log.push("gbak:writing schemas".into());
+    log.push("gbak:writing schema \"PUBLIC\"".into());
     Rec::new(&mut out, rec::SCHEMA).text(1, "PUBLIC").end();
 
     // --- the relations' columns, and their invented domains --------------
@@ -383,8 +407,10 @@ pub fn write_backup(
     }
 
     // --- rec_global_field: one per column, in file order ------------------
+    log.push("gbak:writing domains".into());
     for (_, _, cols) in &rel_cols {
         for c in cols {
+            log.push(format!("gbak:    writing domain \"PUBLIC\".\"{}\"", c.source));
             let t = rdb_field_type(&c.desc).unwrap();
             // FOR A BLOB THE SCALE SLOT (att 9) CARRIES THE SUB_TYPE -
             // measured: the TEXT blob's records say 9=1 where the
@@ -419,7 +445,15 @@ pub fn write_backup(
     }
 
     // --- per relation: rec_relation + fields + end -----------------------
+    log.push("gbak:writing shadow files".into());
+    log.push("gbak:writing character sets".into());
+    log.push("gbak:writing collations".into());
+    log.push("gbak:writing tables".into());
     for (_, name, cols) in &rel_cols {
+        log.push(format!("gbak:    writing table \"PUBLIC\".\"{}\"", name));
+        for c in cols.iter() {
+            log.push(format!("gbak:         writing column \"{}\"", c.name));
+        }
         Rec::new(&mut out, rec::RELATION)
             .text(21, "PUBLIC")
             .text(1, name)
@@ -459,8 +493,21 @@ pub fn write_backup(
     }
 
     // --- per relation: the data ------------------------------------------
+    log.push("gbak:writing types".into());
+    log.push("gbak:writing filters".into());
+    log.push("gbak:writing id generators".into());
+    log.push("gbak:writing exceptions".into());
+    log.push("gbak:writing functions".into());
+    log.push("gbak:writing stored procedures".into());
+    log.push("gbak:writing packages".into());
     let tips = fire_crab_ods::tra::TipChain::read(image, page_size);
-    for (id, name, cols) in &rel_cols {
+    // THE DATA PHASE WALKS THE RELATIONS IN REVERSE CREATION ORDER -
+    // burp prepends each relation to its list and the data pass walks
+    // the list head-first (a 3-table probe: metadata A,B,C; data
+    // C,B,A). The restore maps blocks by name, so only the bytes'
+    // ORDER carries the engine's shape - and the verbose stream shows
+    // it.
+    for (id, name, cols) in rel_cols.iter().rev() {
         Rec::new(&mut out, rec::RELATION_DATA)
             .text(21, "PUBLIC")
             .text(1, name)
@@ -471,6 +518,7 @@ pub fn write_backup(
         // segment count(2), inactive(3), unique(4), one att 5 PER
         // SEGMENT in key order, index type(7).
         for ix in indexes.iter().filter(|i| &i.relation == name) {
+            log.push(format!("gbak:    writing index \"PUBLIC\".\"{}\"", ix.name));
             let mut r = Rec::new(&mut out, rec::INDEX)
                 .text(1, &ix.name)
                 .int(2, ix.segments.len() as i32)
@@ -486,6 +534,7 @@ pub fn write_backup(
             Some(t) => fire_crab_ods::tra::visible_rows(image, page_size, *id, &descs, t),
             None => Vec::new(),
         };
+        log.push(format!("gbak:    writing data for table \"PUBLIC\".\"{}\"", name));
         // the null bitmap sits at the front of the record image
         let nulls_at = 0usize;
         let _ = flag_bytes(cols.len());
@@ -554,53 +603,58 @@ pub fn write_backup(
                 }
             }
         }
+        log.push(format!("gbak:{} records written", rows.len()));
         out.push(rec::RELATION_END);
     }
 
-    // --- PRIMARY KEY constraints: the rel_constraint names its INDEX
-    // (att 6), which is how the restore knows which rec_index is the
-    // key. The constraint NAME is the catalog's own - it is read
-    // anyway, and the engine's file carries the real one.
+    log.push("gbak:writing triggers".into());
+    log.push("gbak:writing trigger messages".into());
+    log.push("gbak:writing security classes".into());
+    log.push("gbak:writing table constraints".into());
+    // --- the table constraints, in CATALOG ROW ORDER (the engine's own
+    // file order - a NOT NULL created before the PRIMARY KEY rides
+    // before it). The names are the catalog's real ones now, not
+    // invented: the PRIMARY KEY names its INDEX through att 6, and a
+    // NOT NULL is a rel_constraint + chk_constraint pair whose second
+    // record names the COLUMN.
     for c in &constraints {
-        Rec::new(&mut out, rec::REL_CONSTRAINT)
-            .text(7, "PUBLIC")
-            .text(1, &c.name)
-            .text(2, "PRIMARY KEY")
-            .text(3, &c.relation)
-            .text(4, "NO")
-            .text(5, "NO")
-            .text(6, &c.index)
-            .end();
-    }
-
-    // --- NOT NULL as the engine carries it: an INTEG rel_constraint +
-    // chk_constraint pair per column, after the data (the reference
-    // file's own position). The names are invented like the sources -
-    // the restore regenerates its own INTEG names anyway.
-    let mut integ = 1usize;
-    for (_, name, cols) in &rel_cols {
-        for c in cols {
-            if !c.not_null {
-                continue;
+        log.push(format!("gbak:writing constraint \"PUBLIC\".\"{}\"", c.name));
+        match c.kind {
+            UConsKind::PrimaryKey => {
+                Rec::new(&mut out, rec::REL_CONSTRAINT)
+                    .text(7, "PUBLIC")
+                    .text(1, &c.name)
+                    .text(2, "PRIMARY KEY")
+                    .text(3, &c.relation)
+                    .text(4, "NO")
+                    .text(5, "NO")
+                    .text(6, &c.index)
+                    .end();
             }
-            let cname = format!("INTEG_{}", integ);
-            integ += 1;
-            Rec::new(&mut out, rec::REL_CONSTRAINT)
-                .text(7, "PUBLIC")
-                .text(1, &cname)
-                .text(2, "NOT NULL")
-                .text(3, name)
-                .text(4, "NO")
-                .text(5, "NO")
-                .end();
-            Rec::new(&mut out, rec::CHK_CONSTRAINT)
-                .text(3, "PUBLIC")
-                .text(1, &cname)
-                .text(2, &c.name)
-                .end();
+            UConsKind::NotNull => {
+                Rec::new(&mut out, rec::REL_CONSTRAINT)
+                    .text(7, "PUBLIC")
+                    .text(1, &c.name)
+                    .text(2, "NOT NULL")
+                    .text(3, &c.relation)
+                    .text(4, "NO")
+                    .text(5, "NO")
+                    .end();
+                Rec::new(&mut out, rec::CHK_CONSTRAINT)
+                    .text(3, "PUBLIC")
+                    .text(1, &c.name)
+                    .text(2, &c.column)
+                    .end();
+            }
         }
     }
 
+    log.push("gbak:writing referential constraints".into());
+    log.push("gbak:writing check constraints".into());
+    log.push("gbak:writing SQL roles".into());
+    log.push("gbak:writing names mapping".into());
+    log.push("gbak:writing publications".into());
+    log.push("gbak:writing constants".into());
     out.push(rec::END);
     // gbak pads its last block with zeros; 512 is what the reference
     // file's tail shows
@@ -621,16 +675,27 @@ struct UIndex {
     segments: Vec<String>,
 }
 
-/// One PRIMARY KEY constraint.
-struct UPk {
+#[derive(PartialEq)]
+enum UConsKind {
+    PrimaryKey,
+    NotNull,
+}
+
+/// One table constraint, in catalog row order - which IS the file
+/// order the engine writes.
+struct UCons {
+    kind: UConsKind,
     name: String,
     relation: String,
+    /// the PRIMARY KEY's index name (att 6)
     index: String,
+    /// the NOT NULL's column (RDB$CHECK_CONSTRAINTS' trigger-name slot)
+    column: String,
 }
 
 /// The user constraints, typed: PRIMARY KEY rides the file, NOT NULL is
 /// carried separately, and anything else refuses the backup whole.
-fn read_constraints(image: &[u8], page_size: usize) -> Result<Vec<UPk>, Refused> {
+fn read_constraints(image: &[u8], page_size: usize) -> Result<Vec<UCons>, Refused> {
     let Some((cols, rows)) = sys_rows(image, page_size, "RDB$RELATION_CONSTRAINTS") else {
         return Ok(Vec::new());
     };
@@ -647,6 +712,32 @@ fn read_constraints(image: &[u8], page_size: usize) -> Result<Vec<UPk>, Refused>
         Some(fire_crab_ods::format::Value::Text(t)) => t.trim_end().to_string(),
         _ => String::new(),
     };
+    // NOT NULL constraints name their COLUMN through the check-
+    // constraints table: for a NOT NULL, RDB$TRIGGER_NAME carries the
+    // field name, not a trigger's
+    let col_of: Vec<(String, String)> = sys_rows(image, page_size, "RDB$CHECK_CONSTRAINTS")
+        .map(|(ccols, crows)| {
+            let cat = |n: &str| {
+                ccols
+                    .iter()
+                    .find(|(c, _)| c.eq_ignore_ascii_case(n))
+                    .map(|(_, i)| *i)
+            };
+            let (Some(cn), Some(tn)) = (cat("RDB$CONSTRAINT_NAME"), cat("RDB$TRIGGER_NAME"))
+            else {
+                return Vec::new();
+            };
+            let t = |r: &fire_crab_ods::tra::VisibleRow, i: usize| match r.values.get(i) {
+                Some(fire_crab_ods::format::Value::Text(t)) => t.trim_end().to_string(),
+                _ => String::new(),
+            };
+            crows.iter().map(|r| (t(r, cn), t(r, tn))).collect()
+        })
+        .unwrap_or_default();
+    // CATALOG ROW ORDER IS THE FILE ORDER: the engine writes its
+    // rel_constraint records straight off RDB$RELATION_CONSTRAINTS, so
+    // a NOT NULL created before the PRIMARY KEY rides before it - the
+    // verbose stream showed the order and the file agrees
     let mut out = Vec::new();
     for r in &rows {
         let rel = text(r, rel_at);
@@ -654,12 +745,25 @@ fn read_constraints(image: &[u8], page_size: usize) -> Result<Vec<UPk>, Refused>
             continue; // a system table's own constraints
         }
         let kind = text(r, type_at);
+        let name = text(r, name_at);
         match kind.as_str() {
-            "NOT NULL" => {} // carried through the field records
-            "PRIMARY KEY" => out.push(UPk {
-                name: text(r, name_at),
+            "NOT NULL" => out.push(UCons {
+                column: col_of
+                    .iter()
+                    .find(|(c, _)| c == &name)
+                    .map(|(_, f)| f.clone())
+                    .unwrap_or_default(),
+                name,
+                kind: UConsKind::NotNull,
+                relation: rel,
+                index: String::new(),
+            }),
+            "PRIMARY KEY" => out.push(UCons {
+                name,
+                kind: UConsKind::PrimaryKey,
                 relation: rel,
                 index: index_at.map(|i| text(r, i)).unwrap_or_default(),
+                column: String::new(),
             }),
             other => {
                 return Err(Refused(format!(
@@ -1000,6 +1104,15 @@ pub struct RTable {
 /// What a .fbk holds, as far as this slice carries it.
 pub struct Restored {
     pub page_size: Option<u32>,
+    /// att_backup_format from rec_burp - "backup version is N"
+    pub format: Option<i64>,
+    /// global-field (domain) names, in file order - what the engine's
+    /// verbose restore lists as "restoring domain"
+    pub domains: Vec<String>,
+    /// indexes into `tables` in the order their DATA blocks appear -
+    /// the engine writes them in reverse creation order, and its
+    /// verbose restore narrates that order
+    pub data_order: Vec<usize>,
     pub tables: Vec<RTable>,
     /// privilege records seen and set aside - the count keeps the
     /// omission visible in the trace instead of silent
@@ -1113,7 +1226,14 @@ fn xdr_decode(xdr: &[u8], cols: &[RCol]) -> Result<Vec<RVal>, Refused> {
 /// Read a whole .fbk.
 pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
     let mut at = 0usize;
-    let mut out = Restored { page_size: None, tables: Vec::new(), privileges_skipped: 0 };
+    let mut out = Restored {
+        page_size: None,
+        format: None,
+        domains: Vec::new(),
+        data_order: Vec::new(),
+        tables: Vec::new(),
+        privileges_skipped: 0,
+    };
     // (schema, source name) -> not-null flag learned from constraints
     let mut current_rel: Option<usize> = None; // index into out.tables (metadata phase)
     let mut data_rel: Option<usize> = None; // index (data phase)
@@ -1140,15 +1260,24 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         return Err(Refused("an uncompressed backup".into()));
                     }
                 }
+                out.format = att(&atts, 2).map(|a| a.int());
             }
             rec::PHYSICAL_DB => {
                 let atts = read_atts(f, &mut at)?;
                 out.page_size = att(&atts, 5).map(|a| a.int() as u32);
             }
-            rec::DATABASE | rec::SCHEMA | rec::GLOBAL_FIELD => {
-                // domains arrive re-derived from the field records; the
-                // database attributes this slice carries are defaults
+            rec::DATABASE | rec::SCHEMA => {
+                // the database attributes this slice carries are defaults
                 let _ = read_atts(f, &mut at)?;
+            }
+            rec::GLOBAL_FIELD => {
+                // the column types arrive re-derived from the field
+                // records; the domain NAME is kept for the verbose
+                // stream's "restoring domain" lines
+                let atts = read_atts(f, &mut at)?;
+                if let Some(a) = att(&atts, 1) {
+                    out.domains.push(a.text());
+                }
             }
             rec::RELATION => {
                 let atts = read_atts(f, &mut at)?;
@@ -1208,8 +1337,11 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                     .map(|a| a.text())
                     .ok_or_else(|| Refused("relation data with no name".into()))?;
                 data_rel = out.tables.iter().position(|t| t.name == name);
-                if data_rel.is_none() {
-                    return Err(Refused(format!("data for an unknown relation {}", name)));
+                match data_rel {
+                    Some(i) => out.data_order.push(i),
+                    None => {
+                        return Err(Refused(format!("data for an unknown relation {}", name)))
+                    }
                 }
             }
             rec::INDEX => {

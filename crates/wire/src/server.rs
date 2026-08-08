@@ -2339,16 +2339,18 @@ fn run_service_action_with_cmdline(
             .is_some();
         if !has_spb_params {
             if let Some(args) = cmdline {
-                // VERBOSE arrives as a bare tag after the action byte -
-                // refused rather than silenced (the streaming is its own
-                // slice), exactly as the SPB route refuses it
-                if spb.len() > 1 {
+                // -v arrives TWICE on this route: as `-v` in the shipped
+                // command line AND as a bare verbose tag (107) after the
+                // action byte. The tag is the contract; anything else
+                // after the action (verbint's 114 + 4 bytes) refuses.
+                let verbose = spb.get(1) == Some(&fire_crab_svc::spb::VERBOSE);
+                if spb.len() > 1 && !(verbose && spb.len() == 2) {
                     if std::env::var("FC_SRV_TRACE").is_ok() {
-                        eprintln!("[srv] -se with verbose/verbint refused");
+                        eprintln!("[srv] -se start SPB beyond the action refused");
                     }
                     return Err(SpecialErr::Plain(GDS_WISH_LIST));
                 }
-                return run_gbak_cmdline(action, args);
+                return run_gbak_cmdline(action, args, verbose);
             }
         }
     }
@@ -2359,8 +2361,9 @@ fn run_service_action_with_cmdline(
 /// what the user typed after `gbak` (minus -se and the credentials,
 /// which the client consumed): switches, then the two positionals -
 /// database-then-file for a backup, FILE-THEN-DATABASE for a restore.
-fn run_gbak_cmdline(action: u8, args: &[String]) -> Result<String, SpecialErr> {
+fn run_gbak_cmdline(action: u8, args: &[String], verbose: bool) -> Result<String, SpecialErr> {
     let mut replace = false;
+    let mut verbose = verbose;
     let mut positionals: Vec<&str> = Vec::new();
     let mut skip_value = false;
     for a in args {
@@ -2385,6 +2388,9 @@ fn run_gbak_cmdline(action: u8, args: &[String]) -> Result<String, SpecialErr> {
                 replace = false;
             } else if sw.len() >= 3 && "replace_database".starts_with(&sw) {
                 replace = true;
+            } else if "verbose".starts_with(&sw) && !sw.is_empty() {
+                // the client also set the bare tag; either source counts
+                verbose = true;
             } else if sw.len() >= 2
                 && ["user", "password", "role", "fetch_password"]
                     .iter()
@@ -2414,11 +2420,12 @@ fn run_gbak_cmdline(action: u8, args: &[String]) -> Result<String, SpecialErr> {
     }
     if action == fire_crab_svc::action::BACKUP {
         let empty = fire_crab_svc::Buffer { version: None, items: Vec::new() };
-        run_gbak_backup_at(&empty, positionals[0], positionals[1]).map_err(SpecialErr::Plain)
+        run_gbak_backup_at(&empty, positionals[0], positionals[1], verbose)
+            .map_err(SpecialErr::Plain)
     } else {
         // the positionals REVERSE for a restore: <file> then <database>
         // (the core takes database first)
-        run_gbak_restore_core(positionals[1], positionals[0], replace).map_err(|e| match e {
+        run_gbak_restore_core(positionals[1], positionals[0], replace, verbose).map_err(|e| match e {
             RestoreErr::Gds(code) => SpecialErr::Plain(code),
             RestoreErr::DbExists(db) => SpecialErr::DbExists(db),
         })
@@ -2531,20 +2538,21 @@ fn run_service_action(spb: &[u8]) -> Result<String, SpecialErr> {
 fn run_gbak_backup(b: &fire_crab_svc::Buffer) -> Result<String, i32> {
     let db = b.text(fire_crab_svc::spb::DBNAME).ok_or(GDS_WISH_LIST)?;
     let file = b.text(fire_crab_svc::bkp::FILE).ok_or(GDS_WISH_LIST)?;
-    run_gbak_backup_at(b, &db, &file)
+    let verbose = b.first(fire_crab_svc::spb::VERBOSE).is_some();
+    run_gbak_backup_at(b, &db, &file, verbose)
 }
 
 fn run_gbak_backup_at(
     b: &fire_crab_svc::Buffer,
     db: &str,
     file: &str,
+    verbose: bool,
 ) -> Result<String, i32> {
     let db = db.to_string();
     let file = file.to_string();
     // options this writer cannot honour refuse rather than being
-    // silently dropped: skip/include-data change what the file MEANS,
-    // and a VERBOSE request answered with silence is the gfix -v
-    // failure mode again - a report that cannot fail
+    // silently dropped: skip/include-data change what the file MEANS
+    // (VERBINT is a verbosity contract this server does not keep either)
     if b.items.iter().any(|c| {
         matches!(
             c.tag,
@@ -2553,7 +2561,7 @@ fn run_gbak_backup_at(
                 | fire_crab_svc::bkp::FACTOR
                 | fire_crab_svc::bkp::LENGTH
                 | fire_crab_svc::bkp::PARALLEL
-        ) || c.tag == fire_crab_svc::spb::VERBOSE
+        ) || c.tag == fire_crab_svc::spb::VERBINT
     }) {
         if std::env::var("FC_SRV_TRACE").is_ok() {
             eprintln!("[srv] gbak backup: an unsupported option refuses");
@@ -2569,12 +2577,32 @@ fn run_gbak_backup_at(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let fbk = fire_crab_burp::write_backup(&image, page_size, &db, &file, now).map_err(|e| {
-        if std::env::var("FC_SRV_TRACE").is_ok() {
-            eprintln!("[srv] gbak backup refused: {}", e.0);
-        }
-        GDS_WISH_LIST
-    })?;
+    // THE VERBOSE STREAM, phrased from the live captures. The preamble
+    // order is the engine's own: readied, creating, transaction,
+    // workers, page size - then the writer's per-record commentary,
+    // then the closing line carrying the bytes actually written.
+    let mut log: Vec<String> = Vec::new();
+    if verbose {
+        log.push(format!("gbak:readied database {} for backup", db));
+        log.push(format!("gbak:creating file {}", file));
+        log.push("gbak:starting transaction".into());
+        log.push("gbak:use up to 1 parallel workers".into());
+        log.push(format!(
+            "gbak:database {} has a page size of {} bytes.",
+            db, page_size
+        ));
+    }
+    let mut body: Vec<String> = Vec::new();
+    let fbk = fire_crab_burp::write_backup_verbose(&image, page_size, &db, &file, now, &mut body)
+        .map_err(|e| {
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                eprintln!("[srv] gbak backup refused: {}", e.0);
+            }
+            GDS_WISH_LIST
+        })?;
+    if verbose {
+        log.append(&mut body);
+    }
     // OVERWRITE, measured: the engine's action_backup replaces an
     // existing .fbk silently (rc 0) - the OPPOSITE of nbackup's
     // refusal, and a difference a converter copying one tool onto the
@@ -2589,6 +2617,17 @@ fn run_gbak_backup_at(
     out.write_all(&fbk).and_then(|_| out.sync_all()).map_err(|_| GDS_IO_ERROR)?;
     if std::env::var("FC_SRV_TRACE").is_ok() {
         eprintln!("[srv] gbak backup: {} bytes to {}", fbk.len(), file);
+    }
+    if verbose {
+        log.push(format!(
+            "gbak:closing file, committing, and finishing. {} bytes written",
+            fbk.len()
+        ));
+        // the trailing newline matters: every wire line carries the
+        // framing space the engine puts after it, INCLUDING the last
+        let mut text = log.join("\n");
+        text.push('\n');
+        return Ok(text);
     }
     // without VERBOSE the engine's backup streams nothing
     Ok(String::new())
@@ -2642,13 +2681,22 @@ fn run_gbak_restore_inner(b: &fire_crab_svc::Buffer) -> Result<String, RestoreEr
         return Err(Gds(GDS_WISH_LIST));
     }
     let options = b.number(fire_crab_svc::spb::OPTIONS).unwrap_or(0) as u32;
-    run_gbak_restore_core(&db, &files[0], options & 0x1000 != 0)
+    let verbose = b.first(fire_crab_svc::spb::VERBOSE).is_some();
+    if b.first(fire_crab_svc::spb::VERBINT).is_some() {
+        return Err(Gds(GDS_WISH_LIST));
+    }
+    run_gbak_restore_core(&db, &files[0], options & 0x1000 != 0, verbose)
 }
 
 /// The restore itself, shared by the SPB route (fbsvcmgr's dbname /
 /// bkp_file / res_replace) and the command-line route (`gbak -c|-rep
 /// -se`, whose arguments arrive through the version-3 attach SPB).
-fn run_gbak_restore_core(db: &str, file: &str, replace: bool) -> Result<String, RestoreErr> {
+fn run_gbak_restore_core(
+    db: &str,
+    file: &str,
+    replace: bool,
+    verbose: bool,
+) -> Result<String, RestoreErr> {
     use RestoreErr::Gds;
     let db = db.to_string();
     let files = [file.to_string()];
@@ -2807,6 +2855,76 @@ fn run_gbak_restore_core(db: &str, file: &str, replace: bool) -> Result<String, 
         }
         let _ = std::fs::remove_file(&db); // no half-restored databases
         return Err(Gds(GDS_IO_ERROR));
+    }
+    if verbose {
+        // THE VERBOSE STREAM, phrased from the live captures and built
+        // AFTER the build succeeded - every line describes work that
+        // actually happened, in the engine's own narrative order (the
+        // fixed phase markers print unconditionally, exactly as the
+        // engine prints them over an fbk with nothing in the phase; the
+        // per-record lines print per record). One recorded difference:
+        // privileges are SET ASIDE here, so no "restoring privilege"
+        // lines - the gate filters the engine's.
+        let shell_ps = std::fs::read(&db)
+            .ok()
+            .and_then(|f| fire_crab_ods::header::HeaderPage::decode(&f).map(|h| h.page_size))
+            .unwrap_or(0);
+        let mut log: Vec<String> = Vec::new();
+        log.push(format!("gbak:opened file {}", files[0]));
+        log.push("gbak:use up to 1 parallel workers".into());
+        log.push("gbak:transportable backup -- data in XDR format".into());
+        log.push("gbak:\t\tbackup file is compressed".into());
+        log.push(format!(
+            "gbak:backup version is {}",
+            restored.format.unwrap_or(12)
+        ));
+        log.push(format!(
+            "gbak:created database {}, page_size {} bytes",
+            db, shell_ps
+        ));
+        log.push("gbak:started transaction".into());
+        log.push("gbak:restoring schema \"PUBLIC\"".into());
+        for d in &restored.domains {
+            log.push(format!("gbak:restoring domain \"PUBLIC\".\"{}\"", d));
+        }
+        log.push("gbak:committing metadata".into());
+        for t in &restored.tables {
+            log.push(format!("gbak:restoring table \"PUBLIC\".\"{}\"", t.name));
+            for c in &t.cols {
+                log.push(format!("gbak:    restoring column \"{}\"", c.name));
+            }
+        }
+        log.push("gbak:committing metadata".into());
+        // the data blocks (and so their indexes) in FILE order - the
+        // engine writes them reverse-of-creation and narrates that
+        for i in &restored.data_order {
+            let t = &restored.tables[*i];
+            for ix in &t.indexes {
+                log.push(format!("gbak:    restoring index \"PUBLIC\".\"{}\"", ix.name));
+            }
+            log.push(format!("gbak:restoring data for table \"PUBLIC\".\"{}\"", t.name));
+            log.push(format!("gbak:   {} records restored", t.rows.len()));
+        }
+        log.push("gbak:creating indexes".into());
+        log.push("gbak:committing metadata".into());
+        for i in &restored.data_order {
+            let t = &restored.tables[*i];
+            for ix in &t.indexes {
+                log.push(format!(
+                    "gbak:    activating and creating deferred index \"PUBLIC\".\"{}\"",
+                    ix.name
+                ));
+            }
+        }
+        log.push("gbak:adjusting views dbkey length".into());
+        log.push("gbak:updating ownership of packages, procedures and tables".into());
+        log.push("gbak:adding missing privileges".into());
+        log.push("gbak:adjusting system generators".into());
+        log.push("gbak:finishing, closing, and going home".into());
+        log.push("gbak:adjusting the ONLINE and FORCED WRITES flags".into());
+        let mut text = log.join("\n");
+        text.push('\n');
+        return Ok(text);
     }
     Ok(String::new())
 }

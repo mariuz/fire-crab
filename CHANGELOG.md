@@ -13,6 +13,43 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-08 — the commentary is part of the protocol
+
+### Converted
+- **gbak's VERBOSE stream, both directions and both transports.** With
+  `-v` (a bare `isc_spb_verbose` after the action byte on the -se
+  route, the tagged clumplet on fbsvcmgr's) the service streams gbak's
+  own lines through `isc_info_svc_line` polls — the machinery the
+  nbackup gate already proved, fed by commentary the cores now
+  produce, phrased from live captures. The framing carries a trailing
+  space per line (fbsvcmgr trims it, the gbak client prints it) and
+  the LAST line needs its newline too, or its framing space vanishes.
+- **The commentary taught two laws of the FILE, and the writer now
+  matches both**: data blocks ride in REVERSE creation order (a
+  3-table probe: metadata A,B,C — data C,B,A; burp prepends each
+  relation to its list and the data pass walks it head-first), and
+  table constraints ride in CATALOG ROW ORDER with their REAL names —
+  the NOT NULL's column read from RDB$CHECK_CONSTRAINTS' trigger-name
+  slot — where the writer had invented INTEG_n names and put the
+  PRIMARY KEY first.
+- The category headers are UNCONDITIONAL, as the engine's are
+  ("writing functions" prints over an empty set) — honest here because
+  the surface check refuses any database where those sets are NOT
+  empty. Phase markers print unconditionally too ("adding missing
+  privileges" rides even a privilege-free restore); per-record lines
+  print per record.
+
+### Gated
+- `qa/serve-real-gbakverbose.sh` (new, 14): backup streams byte-equal
+  on the same source (privilege lines filtered — fire-crab writes no
+  privilege records — and the closing byte-count normalized); restore
+  streams on the engine's fbk byte-equal (per-privilege lines
+  filtered, set aside and counted); restore streams on FIRE-CRAB's fbk
+  **byte-identical with nothing filtered**; fbsvcmgr's tagged route
+  line-for-line; no `-v` stays silent; `verbint` refuses. The two
+  standing gates' recorded boundaries FLIPPED again: "a VERBOSE backup
+  is refused" became "a VERBOSE backup streams gbak's closing line".
+
 ## 2026-08-08 — gbak -se: the command line in the attach SPB
 
 ### Converted

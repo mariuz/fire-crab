@@ -17,8 +17,8 @@
 #     mapping that assumed the backup order would get silently wrong;
 #   * restoring onto an existing database without -rep fails with
 #     gbak's own vector (isc_gbak_db_exists), byte-compared;
-#   * `-v -se` refuses rather than silences (verbose streaming is its
-#     own slice), and the streaming forms (stdout/stdin) refuse too.
+#   * `-v -se` streams (gated in full in serve-real-gbakverbose.sh; a
+#     seam check here), and the streaming forms (stdout/stdin) refuse.
 #
 #   qa/serve-real-gbakse.sh [port]
 
@@ -103,9 +103,9 @@ check "...and the replaced database reads right" \
     "$(rows "$D/fc-gbakse-r3.fdb")" "$(rows "$D/fc-gbakse-r2.fdb")"
 
 # --- 3. the refusals ----------------------------------------------------------
-check "boundary: -v -se refuses rather than silences" \
-    "$(se "$FMGR" -b -v "$SRC" "$D/fc-gbakse-v.fbk" | sed 's/|rc=1$//;s/gbak: ERROR:feature is not supported.*/REFUSED/')" \
-    "REFUSED"
+check "-v -se streams gbak's own closing line" \
+    "$(se "$FMGR" -b -v "$SRC" "$D/fc-gbakse-v.fbk" | grep -c 'closing file, committing, and finishing')" \
+    "1"
 check "boundary: a backup to stdout refuses" \
     "$(se "$FMGR" -b "$SRC" stdout | sed 's/|rc=1$//;s/gbak: ERROR:feature is not supported.*/REFUSED/')" \
     "REFUSED"

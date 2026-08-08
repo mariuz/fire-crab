@@ -196,8 +196,11 @@ rm -f "$NN"
 # --- 5. the OLD protocol answers too (the full gate is serve-real-gbakse.sh) --
 out=$("$GBAK" -b -se "127.0.0.1/$PORT:service_mgr" -user "$U" -pas "$P" "$SRC" "$D/fc-gbak-se.fbk" 2>&1); serc=$?
 check "gbak -se's command-line protocol backs up too" "$out|rc=$serc" "|rc=0"
-check "boundary: a VERBOSE backup is refused, not silenced" \
-    "$(svc_backup "$FMGR" "$SRC" "$D/fc-gbak-v.fbk" verbose)" "feature is not supported|rc=1"
+# verbose STREAMS now (its own gate: serve-real-gbakverbose.sh); here
+# one seam check holds that the tagged route answers lines at all
+out=$(svc_backup "$FMGR" "$SRC" "$D/fc-gbak-v.fbk" verbose)
+check "a VERBOSE backup streams gbak's own closing line" \
+    "$(printf '%s' "$out" | grep -c "closing file, committing, and finishing")" "1"
 
 # --- 6. an existing target is OVERWRITTEN on both -----------------------------
 # Measured, and the OPPOSITE of nbackup's law: the engine's

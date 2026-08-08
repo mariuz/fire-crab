@@ -2800,7 +2800,17 @@ plus *the subsystem is now on the path*.
   line (UtilSvc.h:159), the bare action byte in op_service_start, the
   reversed restore positionals - argv mapped onto the same cores, with
   unknown switches (and -r, whose overwrite-ness is a guess) refusing
-  the whole action. Remaining slice: verbose streaming.
+  the whole action.
+  **Verbose streaming is DONE** (serve-real-gbakverbose.sh, 14) - and
+  with it EVERY NAMED gbak SLICE. The commentary is deterministic and
+  differential: backup streams byte-equal on the same source modulo
+  the privilege records fire-crab does not write; restore streams on
+  fire-crab's own fbk BYTE-IDENTICAL between the two servers. Matching
+  the stream taught two file laws the writer now keeps: data blocks in
+  reverse creation order, constraints in catalog order under their
+  real names. Still refused, each its own recorded boundary: verbint,
+  skip/include-data, factor/length/parallel, stdout/stdin streaming,
+  -r/-recreate.
 
 ## A savepoint is a transaction (done)
 
