@@ -2217,11 +2217,30 @@ fn serve_service(
                         output = Some(fire_crab_svc::Output::new(text));
                         respond(s, enc, 0)?;
                     }
-                    Err(gds) => {
+                    Err(SpecialErr::Plain(gds)) => {
                         if std::env::var("FC_SRV_TRACE").is_ok() {
                             eprintln!("[srv] op_service_start REFUSED gds {}", gds);
                         }
                         respond_error(s, enc, gds)?;
+                    }
+                    Err(SpecialErr::DbExists(db)) => {
+                        // gbak's own pair, measured with the rc taken
+                        // from fbsvcmgr itself: isc_gbak_db_exists
+                        // naming the file, then "Exiting before
+                        // completion due to errors"
+                        if std::env::var("FC_SRV_TRACE").is_ok() {
+                            eprintln!("[srv] op_service_start REFUSED: {} exists", db);
+                        }
+                        let mut w = W::default();
+                        w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+                        w.int(1) // isc_arg_gds
+                            .int(GDS_GBAK_DB_EXISTS)
+                            .int(2) // isc_arg_string - the file
+                            .bytes(db.as_bytes())
+                            .int(1) // isc_arg_gds
+                            .int(GDS_GBAK_EXITING)
+                            .int(0); // isc_arg_end
+                        w.send(s, enc)?;
                     }
                 }
             }
@@ -2267,6 +2286,14 @@ fn server_info() -> fire_crab_svc::ServerInfo {
     }
 }
 
+/// A refused service action: a plain gds code, or the one shape that
+/// needs a real VECTOR - gbak's already-exists refusal, which carries
+/// the file as an argument and a second message item behind it.
+enum SpecialErr {
+    Plain(i32),
+    DbExists(String),
+}
+
 /// Run a service ACTION and return the text it streams back, or the gds
 /// code to refuse it with.
 ///
@@ -2276,32 +2303,38 @@ fn server_info() -> fire_crab_svc::ServerInfo {
 /// conversion of gstat's own `PPG_print_header`. Every other statistics
 /// option (data pages, indexes, record versions, encryption) is REFUSED,
 /// because an empty section reads as "this database has no data pages".
-fn run_service_action(spb: &[u8]) -> Result<String, i32> {
+fn run_service_action(spb: &[u8]) -> Result<String, SpecialErr> {
     let b = fire_crab_svc::parse(fire_crab_svc::Grammar::SpbStart, spb).map_err(|e| {
         if std::env::var("FC_SRV_TRACE").is_ok() {
             eprintln!("[srv] start SPB refused: {}", e);
         }
-        GDS_WISH_LIST
+        SpecialErr::Plain(GDS_WISH_LIST)
     })?;
     let action = b.items.first().map(|c| c.tag).unwrap_or(0);
     if action == fire_crab_svc::action::BACKUP {
-        return run_gbak_backup(&b);
+        return run_gbak_backup(&b).map_err(SpecialErr::Plain);
+    }
+    if action == fire_crab_svc::action::RESTORE {
+        return run_gbak_restore_inner(&b).map_err(|e| match e {
+            RestoreErr::Gds(code) => SpecialErr::Plain(code),
+            RestoreErr::DbExists(db) => SpecialErr::DbExists(db),
+        });
     }
     if action == fire_crab_svc::action::NBAK {
-        return run_nbak(&b);
+        return run_nbak(&b).map_err(SpecialErr::Plain);
     }
     if action == fire_crab_svc::action::NREST {
-        return run_nrest(&b);
+        return run_nrest(&b).map_err(SpecialErr::Plain);
     }
     if action != fire_crab_svc::action::DB_STATS {
         if std::env::var("FC_SRV_TRACE").is_ok() {
             eprintln!("[srv] action {} not converted", action);
         }
-        return Err(GDS_WISH_LIST);
+        return Err(SpecialErr::Plain(GDS_WISH_LIST));
     }
     let db = b
         .text(fire_crab_svc::spb::DBNAME)
-        .ok_or(GDS_WISH_LIST)?;
+        .ok_or(SpecialErr::Plain(GDS_WISH_LIST))?;
     let options = b.number(fire_crab_svc::spb::OPTIONS).unwrap_or(0) as u32;
     use fire_crab_svc::sts;
     // The engine's own validation first, with the engine's own code: a
@@ -2313,7 +2346,7 @@ fn run_service_action(spb: &[u8]) -> Result<String, i32> {
         if std::env::var("FC_SRV_TRACE").is_ok() {
             eprintln!("[srv] db_stats options {:#x} conflict (hdr + another analysis)", options);
         }
-        return Err(fire_crab_svc::GSTAT_HDR_INCOMPATIBLE);
+        return Err(SpecialErr::Plain(fire_crab_svc::GSTAT_HDR_INCOMPATIBLE));
     }
     // the options we cannot answer - refuse rather than print nothing
     let unsupported = sts::DATA_PAGES
@@ -2325,19 +2358,19 @@ fn run_service_action(spb: &[u8]) -> Result<String, i32> {
         if std::env::var("FC_SRV_TRACE").is_ok() {
             eprintln!("[srv] db_stats options {:#x} include unconverted analyses", options);
         }
-        return Err(GDS_WISH_LIST);
+        return Err(SpecialErr::Plain(GDS_WISH_LIST));
     }
     if options & sts::HDR_PAGES == 0 {
-        return Err(GDS_WISH_LIST);
+        return Err(SpecialErr::Plain(GDS_WISH_LIST));
     }
     let data = std::fs::read(&db).map_err(|e| {
         if std::env::var("FC_SRV_TRACE").is_ok() {
             eprintln!("[srv] db_stats cannot read {}: {}", db, e);
         }
-        GDS_IO_ERROR
+        SpecialErr::Plain(GDS_IO_ERROR)
     })?;
     let report = fire_crab_ods::header_report(&data, options & sts::NOCREATION != 0)
-        .ok_or(GDS_IO_ERROR)?;
+        .ok_or(SpecialErr::Plain(GDS_IO_ERROR))?;
     // gstat's own framing around the report: the engine's service prints
     // these lines too (read off the wire with `fcsvc stats --raw`).
     // DEVIATION, stated rather than hidden: the timestamps are UTC, where
@@ -2418,6 +2451,223 @@ fn run_gbak_backup(b: &fire_crab_svc::Buffer) -> Result<String, i32> {
     }
     // without VERBOSE the engine's backup streams nothing
     Ok(String::new())
+}
+
+/// `isc_action_svc_restore`: build a database from a `.fbk` - the
+/// engine's, or this server's own - through fire-crab's OWN machinery:
+/// [fire_crab_burp::read_backup] decodes the file, `ddl::create_table`
+/// lays the tables into a fresh shell, and each row goes through
+/// `dml::insert_record` exactly as an INSERT's would.
+///
+/// The create/replace law, measured through fbsvcmgr: a FRESH target
+/// restores silently; an EXISTING one without `res_replace` STREAMS
+/// "database <f> already exists. To replace it, use the -REP switch"
+/// as OUTPUT (fbsvcmgr exits 0 - the failure is gbak's text, not a
+/// status vector); with `res_replace` (0x1000) it overwrites.
+///
+/// FAIL-CLOSED BY RECORD TYPE, in the reader: an index, a trigger, a
+/// PRIMARY KEY constraint - anything whose omission would change what
+/// the restored database MEANS - refuses the whole restore. Privileges
+/// are the exception: parsed, counted, and set aside (access metadata,
+/// not data), the count in the trace.
+/// Why a restore refused - the already-exists case carries the engine's
+/// own TWO-item vector (`isc_gbak_db_exists` naming the file, then
+/// GBAK's "Exiting before completion due to errors"), which a single
+/// gds code cannot say.
+enum RestoreErr {
+    Gds(i32),
+    DbExists(String),
+}
+
+/// `isc_gbak_db_exists` - `database @1 already exists.  To replace it,
+/// use the -REP switch` (GBAK 14). Measured with the rc taken from
+/// fbsvcmgr ITSELF, not from the tr behind a pipe: the engine answers a
+/// STATUS VECTOR (rc 1), not streamed text - the first probe misread
+/// its own pipeline.
+const GDS_GBAK_DB_EXISTS: i32 = 336330766;
+/// GBAK 83 - "Exiting before completion due to errors", the second item.
+const GDS_GBAK_EXITING: i32 = 336330835;
+
+fn run_gbak_restore_inner(b: &fire_crab_svc::Buffer) -> Result<String, RestoreErr> {
+    use RestoreErr::Gds;
+    let db = b.text(fire_crab_svc::spb::DBNAME).ok_or(Gds(GDS_WISH_LIST))?;
+    let files: Vec<String> = b
+        .items
+        .iter()
+        .filter(|c| c.tag == fire_crab_svc::bkp::FILE)
+        .map(|c| c.text())
+        .collect();
+    if files.len() != 1 {
+        return Err(Gds(GDS_WISH_LIST));
+    }
+    let options = b.number(fire_crab_svc::spb::OPTIONS).unwrap_or(0) as u32;
+    let replace = options & 0x1000 != 0; // isc_spb_res_replace
+    if std::path::Path::new(&db).exists() && !replace {
+        return Err(RestoreErr::DbExists(db));
+    }
+    let fbk = std::fs::read(&files[0]).map_err(|e| {
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] gbak restore cannot read {}: {}", files[0], e);
+        }
+        Gds(GDS_IO_ERROR)
+    })?;
+    let restored = fire_crab_burp::read_backup(&fbk).map_err(|e| {
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] gbak restore refused: {}", e.0);
+        }
+        Gds(GDS_WISH_LIST)
+    })?;
+    if std::env::var("FC_SRV_TRACE").is_ok() && restored.privileges_skipped > 0 {
+        eprintln!(
+            "[srv] gbak restore: {} privilege record(s) set aside",
+            restored.privileges_skipped
+        );
+    }
+    // a fresh shell - the same engine-made empty database op_create uses
+    if replace {
+        let _ = std::fs::remove_file(&db);
+        fire_crab_cch::pool::forget(&db);
+    }
+    create_database_file(&db).map_err(|e| {
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] gbak restore cannot create {}: {}", db, e);
+        }
+        Gds(GDS_IO_ERROR)
+    })?;
+    let build = (|| -> Result<(), String> {
+        let mut file = std::fs::read(&db).map_err(|e| e.to_string())?;
+        let page_size = fire_crab_ods::header::HeaderPage::decode(&file)
+            .map(|h| h.page_size as usize)
+            .ok_or("the fresh shell has no header")?;
+        for t in &restored.tables {
+            let cols: Vec<fire_crab_ods::ddl::ColumnDef> = t
+                .cols
+                .iter()
+                .map(|c| restore_column_def(c))
+                .collect::<Result<_, _>>()?;
+            fire_crab_ods::ddl::create_table(&mut file, page_size, &t.name, &cols, &[], &[], 0)?;
+            let rel = fire_crab_ods::resolve_relation(&file, page_size, &t.name)
+                .ok_or("the created table cannot be found")?;
+            let formats = fire_crab_ods::relation_formats(&file, page_size, rel);
+            let (format_no, descs) = formats
+                .iter()
+                .max_by_key(|(n, _)| *n)
+                .ok_or("the created table has no format")?;
+            for row in &t.rows {
+                let image = restore_row_image(row, descs)?;
+                fire_crab_ods::dml::insert_record(&mut file, page_size, rel, *format_no, &image)?;
+            }
+        }
+        std::fs::write(&db, &file).map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    // however it went, the pool must not keep the half-known image
+    fire_crab_cch::pool::forget(&db);
+    if let Err(e) = build {
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] gbak restore failed mid-build: {}", e);
+        }
+        let _ = std::fs::remove_file(&db); // no half-restored databases
+        return Err(Gds(GDS_IO_ERROR));
+    }
+    Ok(String::new())
+}
+
+/// A restored column as `ddl::create_table` wants it. VARCHAR's stored
+/// length includes the count word; the fbk's att 10 carries the
+/// CHARACTER length (charset NONE: == bytes).
+fn restore_column_def(
+    c: &fire_crab_burp::RCol,
+) -> Result<fire_crab_ods::ddl::ColumnDef, String> {
+    use fire_crab_ods::format::dtype;
+    let (dt, length, char_len, precision) = match c.field_type {
+        7 => (dtype::SHORT, 2u16, None, Some(0)),
+        8 => (dtype::LONG, 4, None, Some(0)),
+        16 => (dtype::INT64, 8, None, Some(0)),
+        14 => (dtype::TEXT, c.length, Some(c.length), None),
+        37 => (dtype::VARYING, c.length + 2, Some(c.length), None),
+        t => return Err(format!("field type {} in restore", t)),
+    };
+    Ok(fire_crab_ods::ddl::ColumnDef {
+        name: c.name.clone(),
+        field_type: c.field_type as i16,
+        dtype: dt,
+        length,
+        scale: c.scale,
+        sub_type: 0,
+        precision,
+        char_len,
+        not_null: c.not_null,
+        not_null_constraint: c.not_null,
+        default: None,
+        domain: None,
+        identity: None,
+        computed: None,
+    })
+}
+
+/// One restored row as a record image: the null bitmap, then each value
+/// at its descriptor's offset - the layout `decode_record` reads back.
+fn restore_row_image(
+    row: &[fire_crab_burp::RVal],
+    descs: &[Descriptor],
+) -> Result<Vec<u8>, String> {
+    use fire_crab_burp::RVal;
+    if row.len() != descs.len() {
+        return Err("a row with the wrong column count".into());
+    }
+    let mut end = 0usize;
+    for d in descs {
+        if d.offset != 0 {
+            end = end.max(d.offset as usize + d.length as usize);
+        }
+    }
+    let mut img = vec![0u8; end];
+    for (i, (v, d)) in row.iter().zip(descs.iter()).enumerate() {
+        let off = d.offset as usize;
+        match v {
+            RVal::Null => {
+                img[i / 8] |= 1 << (i % 8);
+                // a TEXT slot under a null still holds blanks, as the
+                // engine leaves it
+                if d.dtype == fire_crab_ods::format::dtype::TEXT {
+                    img[off..off + d.length as usize].fill(b' ');
+                }
+            }
+            RVal::Int(n) => match d.dtype {
+                fire_crab_ods::format::dtype::SHORT => {
+                    img[off..off + 2].copy_from_slice(&(*n as i16).to_le_bytes())
+                }
+                fire_crab_ods::format::dtype::LONG => {
+                    img[off..off + 4].copy_from_slice(&(*n as i32).to_le_bytes())
+                }
+                fire_crab_ods::format::dtype::INT64 => {
+                    img[off..off + 8].copy_from_slice(&n.to_le_bytes())
+                }
+                _ => return Err("an integer into a non-integer column".into()),
+            },
+            RVal::Bytes(bts) => match d.dtype {
+                fire_crab_ods::format::dtype::VARYING => {
+                    let cap = d.length as usize - 2;
+                    if bts.len() > cap {
+                        return Err("a varchar longer than its slot".into());
+                    }
+                    img[off..off + 2].copy_from_slice(&(bts.len() as u16).to_le_bytes());
+                    img[off + 2..off + 2 + bts.len()].copy_from_slice(bts);
+                }
+                fire_crab_ods::format::dtype::TEXT => {
+                    let n = d.length as usize;
+                    if bts.len() > n {
+                        return Err("a char longer than its slot".into());
+                    }
+                    img[off..off + n].fill(b' ');
+                    img[off..off + bts.len()].copy_from_slice(bts);
+                }
+                _ => return Err("text into a non-text column".into()),
+            },
+        }
+    }
+    Ok(img)
 }
 
 /// `isc_action_svc_nbak`, level 0: the PHYSICAL backup, which in this

@@ -13,6 +13,59 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-08 — the logical restore: fire-crab reads a .fbk
+
+### Converted
+- **`isc_action_svc_restore`** — the read side of `crates/burp`, closing
+  the differential the writer opened. With both sides able to back up
+  AND restore, the four combinations (engine.fbk × fc-restore, fc.fbk ×
+  engine-restore, and each side round-tripping itself) all produce
+  databases the ENGINE reads the same rows from — an encoding bug would
+  show in one diagonal, a decoding bug in the other. The restore goes
+  through fire-crab's OWN machinery: `read_backup` decodes the stream,
+  `ddl::create_table` lays the tables into a fresh shell, and every row
+  goes through `dml::insert_record` exactly as an INSERT's would, so
+  `gfix -v -full` on the result checks that machinery, not a copied
+  file.
+- **The reader is TOLERANT OF ATTRIBUTES and STRICT ABOUT RECORDS.** An
+  unknown attribute skips by its own length — the self-describing
+  grammar, and how the engine's restore survives newer files. An unknown
+  RECORD refuses the whole restore: some records are bare and some carry
+  raw payloads, so mis-stepping the walk turns everything after it into
+  nonsense. Privileges are the deliberate exception — parsed, counted,
+  set aside (access metadata, not data), the count in the trace rather
+  than silent.
+- **NOT NULL rides the file both ways now** — the writer emits att 38 on
+  the field record plus the INTEG `rel_constraint`/`chk_constraint`
+  pair (read from RDB$RELATION_FIELDS null flags), the reader folds the
+  pair back onto the columns — so all four restored databases refuse a
+  NULL, and the writer gate's recorded boundary flipped to the equality
+  it promised to become. The writer also gained a missing surface check:
+  a USER DOMAIN refuses (this writer invents its column sources, so a
+  named domain would restore as a plain type — data right, schema
+  silently changed).
+- The create/replace law, measured: a fresh target restores silently; an
+  existing one without `res_replace` fails with gbak's own vector —
+  `isc_gbak_db_exists` naming the file, then "Exiting before completion
+  due to errors" — and with `res_replace` (0x1000) it overwrites. A
+  refused or failed restore leaves NO half-restored database behind.
+
+### Fixed
+- **A probe that misreads its own pipeline pins the wrong law.** The
+  first already-exists probe took `rc=$?` after a `| head`, read 0, and
+  the restore was built to STREAM the message as output — the gate
+  caught the mismatch against the engine's real rc=1 immediately. The
+  same bug the sweep runner had, in a new place; the rc must come from
+  fbsvcmgr itself.
+
+### Gated
+- **`qa/serve-real-gbakrestore.sh`** (22 checks): the four-way
+  cross-restore matrix with the engine as the reader of record;
+  `gfix -v -full` on fc's restores; NOT NULL enforced in all four; the
+  exists/replace laws byte-compared; the PRIMARY-KEY and garbage-file
+  refusals with no half-restored file left; and the privilege omission
+  visible in the trace, not silent.
+
 ## 2026-08-08 — the logical backup, first slice: a .fbk the real gbak restores
 
 ### Converted

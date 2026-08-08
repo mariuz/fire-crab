@@ -19,9 +19,6 @@
 # is asserted here against the engine's success on the same database.
 #
 # RECORDED BOUNDARIES:
-#   * NOT NULL is not carried (the constraint records are their own
-#     slice): a column restored from fire-crab's backup accepts NULL
-#     where the engine's restore refuses it - asserted both ways;
 #   * `gbak -se` itself speaks an OLDER protocol (its command line rides
 #     the version-3 ATTACH SPB with 0xff separators; op_service_start
 #     carries a bare action byte) - refused, asserted;
@@ -174,13 +171,16 @@ tries_null() { # <db> - can a NULL go into N.A?
 check "...and the DATA rows agree" \
     "$(printf 'SET HEADING OFF;\nSELECT A, B FROM N;\n' | "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-gbak-rnf.fdb" 2>&1 | tr -s ' \n' ' ')" \
     "$(printf 'SET HEADING OFF;\nSELECT A, B FROM N;\n' | "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-gbak-rne.fdb" 2>&1 | tr -s ' \n' ' ')"
+# THE BOUNDARY FLIPPED: the writer carries NOT NULL now (att 38 on the
+# field record + the INTEG rel_constraint/chk_constraint pair), so BOTH
+# restored databases refuse a NULL - asserted as the equality the old
+# boundary check promised to become.
 ran=$((ran + 1))
 fnull=$(tries_null "$D/fc-gbak-rnf.fdb"); enull=$(tries_null "$D/fc-gbak-rne.fdb")
-if [ "$fnull" = "0" ] && [ "$enull" = "1" ]; then
-    echo "OK   boundary: NOT NULL is not carried (fc's restore accepts NULL, the engine's refuses)"
+if [ "$fnull" = "1" ] && [ "$enull" = "1" ]; then
+    echo "OK   NOT NULL is carried: both restored databases refuse a NULL"
 else
-    echo "DIFF boundary MOVED: NOT NULL - fc-restore refusals=$fnull engine-restore refusals=$enull"
-    echo "     (if the constraint records are written now, this check must flip)"
+    echo "DIFF NOT NULL: fc-restore refusals=$fnull engine-restore refusals=$enull (want 1/1)"
     fail=1
 fi
 rm -f "$NN"

@@ -38,6 +38,8 @@ mod rec {
     pub const RELATION_END: u8 = 9;
     pub const END: u8 = 10;
     pub const PHYSICAL_DB: u8 = 14;
+    pub const REL_CONSTRAINT: u8 = 31;
+    pub const CHK_CONSTRAINT: u8 = 33;
     pub const SCHEMA: u8 = 42;
 }
 
@@ -86,6 +88,10 @@ struct Col {
     source: String,
     position: u16,
     desc: Descriptor,
+    /// RDB$RELATION_FIELDS.RDB$NULL_FLAG - carried as the same three
+    /// pieces the engine writes: att 38 on the field record, and an
+    /// INTEG "NOT NULL" rel_constraint + chk_constraint pair
+    not_null: bool,
 }
 
 /// RDB$FIELDS.RDB$FIELD_TYPE for a descriptor's dtype - the values the
@@ -203,6 +209,7 @@ fn backup_date(now_secs: i64) -> String {
 }
 
 /// What the backup REFUSED and why - one line for the service trace.
+#[derive(Debug)]
 pub struct Refused(pub String);
 
 /// Write a `.fbk` of the database image. `db_path` and `fbk_path` are
@@ -235,6 +242,28 @@ pub fn write_backup(
     ] {
         if user_rows_in(image, page_size, rel_name) > 0 {
             return Err(Refused(format!("{} is outside this backup's surface", what)));
+        }
+    }
+    // ...and USER DOMAINS: this writer invents its column sources
+    // (RDB$1, RDB$2, ...), so a named domain would restore as a plain
+    // type - the data right, the schema silently changed. Refuse.
+    if let Some((cols, rows)) = sys_rows(image, page_size, "RDB$FIELDS") {
+        let name_at = cols
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("RDB$FIELD_NAME"))
+            .map(|(_, i)| *i);
+        for r in &rows {
+            if let Some(fire_crab_ods::format::Value::Text(t)) =
+                name_at.and_then(|i| r.values.get(i))
+            {
+                let t = t.trim_end();
+                if !t.starts_with("RDB$") && !t.starts_with("SEC$") && !t.starts_with("MON$") {
+                    return Err(Refused(format!(
+                        "domain {} is outside this backup's surface",
+                        t
+                    )));
+                }
+            }
         }
     }
     let user_rels: Vec<(u16, String)> = user_tables(image, page_size)?;
@@ -286,6 +315,7 @@ pub fn write_backup(
                 descs.len()
             )));
         }
+        let not_nulls = not_null_columns(image, page_size, name);
         let mut cols = Vec::new();
         for (i, d) in descs.iter().enumerate() {
             if rdb_field_type(d).is_none() {
@@ -299,6 +329,7 @@ pub fn write_backup(
                 source: format!("RDB${}", next_source),
                 position: names[i].position,
                 desc: d.clone(),
+                not_null: not_nulls.iter().any(|n| n == &names[i].name),
             });
             next_source += 1;
         }
@@ -336,7 +367,7 @@ pub fn write_backup(
             .int(18, 0) // relation type: persistent
             .end();
         for (i, c) in cols.iter().enumerate() {
-            let r = Rec::new(&mut out, rec::FIELD)
+            let mut r = Rec::new(&mut out, rec::FIELD)
                 .text(1, &c.name)
                 .text(48, "PUBLIC")
                 .text(2, &c.source)
@@ -348,6 +379,11 @@ pub fn write_backup(
                 .int(22, (i + 1) as i32)
                 .int(24, 0)
                 .int(34, 1);
+            if c.not_null {
+                // att 38 - the field-level NULL_FLAG the reference file
+                // carries on its NOT NULL column
+                r = r.int(38, 1);
+            }
             match c.desc.dtype {
                 dtype::VARYING | dtype::TEXT => r.int(42, 0).int(43, 0).end(),
                 _ => r.int(43, 0).end(),
@@ -385,6 +421,34 @@ pub fn write_backup(
         out.push(rec::RELATION_END);
     }
 
+    // --- NOT NULL as the engine carries it: an INTEG rel_constraint +
+    // chk_constraint pair per column, after the data (the reference
+    // file's own position). The names are invented like the sources -
+    // the restore regenerates its own INTEG names anyway.
+    let mut integ = 1usize;
+    for (_, name, cols) in &rel_cols {
+        for c in cols {
+            if !c.not_null {
+                continue;
+            }
+            let cname = format!("INTEG_{}", integ);
+            integ += 1;
+            Rec::new(&mut out, rec::REL_CONSTRAINT)
+                .text(7, "PUBLIC")
+                .text(1, &cname)
+                .text(2, "NOT NULL")
+                .text(3, name)
+                .text(4, "NO")
+                .text(5, "NO")
+                .end();
+            Rec::new(&mut out, rec::CHK_CONSTRAINT)
+                .text(3, "PUBLIC")
+                .text(1, &cname)
+                .text(2, &c.name)
+                .end();
+        }
+    }
+
     out.push(rec::END);
     // gbak pads its last block with zeros; 512 is what the reference
     // file's tail shows
@@ -392,6 +456,32 @@ pub fn write_backup(
         out.push(0);
     }
     Ok(out)
+}
+
+/// The NOT NULL columns of one relation - RDB$RELATION_FIELDS rows
+/// whose RDB$NULL_FLAG is 1, matched by name.
+fn not_null_columns(image: &[u8], page_size: usize, rel_name: &str) -> Vec<String> {
+    let Some((cols, rows)) = sys_rows(image, page_size, "RDB$RELATION_FIELDS") else {
+        return Vec::new();
+    };
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    let (Some(rel_at), Some(fld_at), Some(null_at)) = (
+        at("RDB$RELATION_NAME"),
+        at("RDB$FIELD_NAME"),
+        at("RDB$NULL_FLAG"),
+    ) else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter(|r| {
+            matches!(r.values.get(rel_at), Some(fire_crab_ods::format::Value::Text(t)) if t.trim_end() == rel_name)
+                && matches!(r.values.get(null_at), Some(fire_crab_ods::format::Value::Int(1)))
+        })
+        .filter_map(|r| match r.values.get(fld_at) {
+            Some(fire_crab_ods::format::Value::Text(t)) => Some(t.trim_end().to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// A system relation's rows plus its column-name -> value-index map -
@@ -513,12 +603,14 @@ mod tests {
                 source: "RDB$1".into(),
                 position: 0,
                 desc: Descriptor { dtype: dtype::LONG, scale: 0, length: 4, sub_type: 0, flags: 0, offset: 4 },
+                not_null: false,
             },
             Col {
                 name: "V".into(),
                 source: "RDB$2".into(),
                 position: 1,
                 desc: Descriptor { dtype: dtype::VARYING, scale: 0, length: 10, sub_type: 0, flags: 0, offset: 8 },
+                not_null: false,
             },
         ];
         let xdr = xdr_row(&img, &cols, 0).unwrap();
@@ -542,5 +634,395 @@ mod tests {
         assert_eq!(&xdr2[4..8], &[0, 0, 0, 0]); // empty varchar
         assert_eq!(&xdr2[8..12], &[0, 0, 0, 0]); // ID not null
         assert_eq!(&xdr2[12..16], &[0xff, 0xff, 0xff, 0xff]);
+    }
+}
+
+// ===================================================================
+// THE READ SIDE: a .fbk - the engine's or this crate's own - decoded
+// back into tables and rows, for `isc_action_svc_restore`.
+//
+// The reader is TOLERANT OF ATTRIBUTES and STRICT ABOUT RECORDS. An
+// attribute it does not know is skipped by its own length - the
+// grammar is self-describing, and that is how the engine's restore
+// survives files from newer engines. A RECORD type it does not know
+// cannot be skipped (some records are bare, some carry raw payloads),
+// and mis-stepping the walk turns everything after into nonsense - so
+// an unknown record refuses the WHOLE restore. Records this slice
+// understands but does not carry (privileges) are parsed and set
+// aside; records that would change what the database MEANS if dropped
+// (indexes, triggers, generators, views) refuse.
+
+/// One value out of a data row, as the XDR carries it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RVal {
+    Null,
+    Int(i64),
+    /// text bytes, exactly as stored (CHAR keeps its padding)
+    Bytes(Vec<u8>),
+}
+
+/// One restored column.
+pub struct RCol {
+    pub name: String,
+    /// RDB$FIELD_TYPE: 7 smallint, 8 integer, 16 int64, 14 text, 37 varying
+    pub field_type: i32,
+    pub length: u16,
+    pub scale: i8,
+    pub not_null: bool,
+}
+
+/// One restored table.
+pub struct RTable {
+    pub name: String,
+    pub cols: Vec<RCol>,
+    pub rows: Vec<Vec<RVal>>,
+}
+
+/// What a .fbk holds, as far as this slice carries it.
+pub struct Restored {
+    pub page_size: Option<u32>,
+    pub tables: Vec<RTable>,
+    /// privilege records seen and set aside - the count keeps the
+    /// omission visible in the trace instead of silent
+    pub privileges_skipped: u64,
+}
+
+/// One parsed attribute.
+struct Att {
+    tag: u8,
+    data: Vec<u8>,
+}
+
+impl Att {
+    fn int(&self) -> i64 {
+        let mut v: i64 = 0;
+        for (k, b) in self.data.iter().enumerate().take(8) {
+            v |= (*b as i64) << (8 * k);
+        }
+        v
+    }
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.data).into_owned()
+    }
+}
+
+/// Read one attribute list (up to att_end). Tolerant: unknown tags ride
+/// along with their data for the caller to pick from.
+fn read_atts(f: &[u8], at: &mut usize) -> Result<Vec<Att>, Refused> {
+    let mut out = Vec::new();
+    loop {
+        let tag = *f.get(*at).ok_or_else(|| Refused("truncated attribute list".into()))?;
+        *at += 1;
+        if tag == 0 {
+            return Ok(out);
+        }
+        let len = *f.get(*at).ok_or_else(|| Refused("truncated attribute".into()))? as usize;
+        *at += 1;
+        let data = f
+            .get(*at..*at + len)
+            .ok_or_else(|| Refused("attribute data past the end".into()))?
+            .to_vec();
+        *at += len;
+        out.push(Att { tag, data });
+    }
+}
+
+fn att<'a>(atts: &'a [Att], tag: u8) -> Option<&'a Att> {
+    atts.iter().find(|a| a.tag == tag)
+}
+
+/// Decode one XDR row (the transportable encoding, big-endian, null
+/// indicators trailing - the exact mirror of [xdr_row]).
+fn xdr_decode(xdr: &[u8], cols: &[RCol]) -> Result<Vec<RVal>, Refused> {
+    let mut vals = Vec::with_capacity(cols.len());
+    let mut at = 0usize;
+    let take = |at: &mut usize, n: usize| -> Result<Vec<u8>, Refused> {
+        let d = xdr
+            .get(*at..*at + n)
+            .ok_or_else(|| Refused("a data row ended mid-field".into()))?
+            .to_vec();
+        *at += n;
+        Ok(d)
+    };
+    for c in cols {
+        match c.field_type {
+            7 | 8 => {
+                let b = take(&mut at, 4)?;
+                vals.push(RVal::Int(i32::from_be_bytes(b.try_into().unwrap()) as i64));
+            }
+            16 => {
+                let b = take(&mut at, 8)?;
+                vals.push(RVal::Int(i64::from_be_bytes(b.try_into().unwrap())));
+            }
+            37 => {
+                let b = take(&mut at, 4)?;
+                let n = u32::from_be_bytes(b.try_into().unwrap()) as usize;
+                if n > c.length as usize {
+                    return Err(Refused("a varchar longer than its column".into()));
+                }
+                let d = take(&mut at, n)?;
+                at += (4 - n % 4) % 4; // the pad
+                vals.push(RVal::Bytes(d));
+            }
+            14 => {
+                let n = c.length as usize;
+                let d = take(&mut at, n)?;
+                at += (4 - n % 4) % 4;
+                vals.push(RVal::Bytes(d));
+            }
+            _ => return Err(Refused("a field type outside this restore's surface".into())),
+        }
+    }
+    // the trailing null indicators, one per field
+    for v in vals.iter_mut() {
+        let b = take(&mut at, 4)?;
+        if u32::from_be_bytes(b.try_into().unwrap()) != 0 {
+            *v = RVal::Null;
+        }
+    }
+    Ok(vals)
+}
+
+/// Read a whole .fbk.
+pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
+    let mut at = 0usize;
+    let mut out = Restored { page_size: None, tables: Vec::new(), privileges_skipped: 0 };
+    // (schema, source name) -> not-null flag learned from constraints
+    let mut current_rel: Option<usize> = None; // index into out.tables (metadata phase)
+    let mut data_rel: Option<usize> = None; // index (data phase)
+    // constraint pairs: name -> table, and name -> column
+    let mut cons_table: Vec<(String, String)> = Vec::new();
+    let mut cons_column: Vec<(String, String)> = Vec::new();
+    // field-record not-null (att 38) rides the column directly
+    loop {
+        let r = *f.get(at).ok_or_else(|| Refused("no rec_end - a truncated backup".into()))?;
+        at += 1;
+        match r {
+            rec::BURP => {
+                let atts = read_atts(f, &mut at)?;
+                // transportable is the only encoding this reader speaks;
+                // a non-transportable file's data is in the WRITER's
+                // byte order and must refuse rather than misread
+                if let Some(a) = att(&atts, 5) {
+                    if a.int() == 0 {
+                        return Err(Refused("a non-transportable backup".into()));
+                    }
+                }
+                if let Some(a) = att(&atts, 4) {
+                    if a.int() == 0 {
+                        return Err(Refused("an uncompressed backup".into()));
+                    }
+                }
+            }
+            rec::PHYSICAL_DB => {
+                let atts = read_atts(f, &mut at)?;
+                out.page_size = att(&atts, 5).map(|a| a.int() as u32);
+            }
+            rec::DATABASE | rec::SCHEMA | rec::GLOBAL_FIELD => {
+                // domains arrive re-derived from the field records; the
+                // database attributes this slice carries are defaults
+                let _ = read_atts(f, &mut at)?;
+            }
+            rec::RELATION => {
+                let atts = read_atts(f, &mut at)?;
+                let name = att(&atts, 1)
+                    .map(|a| a.text())
+                    .ok_or_else(|| Refused("a relation with no name".into()))?;
+                out.tables.push(RTable { name, cols: Vec::new(), rows: Vec::new() });
+                current_rel = Some(out.tables.len() - 1);
+            }
+            rec::FIELD => {
+                let atts = read_atts(f, &mut at)?;
+                let t = current_rel.ok_or_else(|| Refused("a field outside a relation".into()))?;
+                let ftype = att(&atts, 8)
+                    .map(|a| a.int() as i32)
+                    .ok_or_else(|| Refused("a field with no type".into()))?;
+                if !matches!(ftype, 7 | 8 | 16 | 14 | 37) {
+                    return Err(Refused(format!(
+                        "field type {} is outside this restore's surface",
+                        ftype
+                    )));
+                }
+                out.tables[t].cols.push(RCol {
+                    name: att(&atts, 1)
+                        .map(|a| a.text())
+                        .ok_or_else(|| Refused("a field with no name".into()))?,
+                    field_type: ftype,
+                    length: att(&atts, 10).map(|a| a.int() as u16).unwrap_or(0),
+                    scale: att(&atts, 9).map(|a| a.int() as i8).unwrap_or(0),
+                    not_null: att(&atts, 38).map(|a| a.int() == 1).unwrap_or(false),
+                });
+            }
+            rec::RELATION_END => {
+                current_rel = None;
+                data_rel = None;
+            }
+            rec::RELATION_DATA => {
+                let atts = read_atts(f, &mut at)?;
+                let name = att(&atts, 1)
+                    .map(|a| a.text())
+                    .ok_or_else(|| Refused("relation data with no name".into()))?;
+                data_rel = out.tables.iter().position(|t| t.name == name);
+                if data_rel.is_none() {
+                    return Err(Refused(format!("data for an unknown relation {}", name)));
+                }
+            }
+            rec::DATA => {
+                let t = data_rel.ok_or_else(|| Refused("data outside relation data".into()))?;
+                // att_data_length, att_xdr_length, then the raw block
+                let mut lens = [0i64; 2];
+                for slot in lens.iter_mut() {
+                    let tag = *f.get(at).ok_or_else(|| Refused("truncated data record".into()))?;
+                    let len = *f.get(at + 1).ok_or_else(|| Refused("truncated data record".into()))? as usize;
+                    let a = Att {
+                        tag,
+                        data: f
+                            .get(at + 2..at + 2 + len)
+                            .ok_or_else(|| Refused("truncated data record".into()))?
+                            .to_vec(),
+                    };
+                    at += 2 + len;
+                    *slot = a.int();
+                    let _ = tag;
+                }
+                let want = lens[1] as usize; // att_xdr_length
+                if *f.get(at).ok_or_else(|| Refused("truncated data record".into()))? != 2 {
+                    return Err(Refused("a data record without att_data_data".into()));
+                }
+                at += 1;
+                // the RLE stream: positive = literals, negative = repeat
+                let mut xdr = Vec::with_capacity(want);
+                while xdr.len() < want {
+                    let c = *f.get(at).ok_or_else(|| Refused("a data row ended mid-stream".into()))?;
+                    at += 1;
+                    if c < 128 {
+                        let d = f
+                            .get(at..at + c as usize)
+                            .ok_or_else(|| Refused("a data row ended mid-run".into()))?;
+                        xdr.extend_from_slice(d);
+                        at += c as usize;
+                    } else {
+                        let b = *f.get(at).ok_or_else(|| Refused("a data row ended mid-repeat".into()))?;
+                        at += 1;
+                        xdr.extend(std::iter::repeat(b).take(256 - c as usize));
+                    }
+                }
+                let row = xdr_decode(&xdr, &out.tables[t].cols)?;
+                out.tables[t].rows.push(row);
+            }
+            rec::REL_CONSTRAINT => {
+                let atts = read_atts(f, &mut at)?;
+                let kind = att(&atts, 2).map(|a| a.text()).unwrap_or_default();
+                let cname = att(&atts, 1).map(|a| a.text()).unwrap_or_default();
+                let table = att(&atts, 3).map(|a| a.text()).unwrap_or_default();
+                if kind.trim() == "NOT NULL" {
+                    cons_table.push((cname, table));
+                } else {
+                    // PRIMARY KEY / UNIQUE / FOREIGN KEY constraints need
+                    // the index records this slice refuses anyway
+                    return Err(Refused(format!(
+                        "a {} constraint is outside this restore's surface",
+                        kind.trim()
+                    )));
+                }
+            }
+            rec::CHK_CONSTRAINT => {
+                let atts = read_atts(f, &mut at)?;
+                let cname = att(&atts, 1).map(|a| a.text()).unwrap_or_default();
+                let col = att(&atts, 2).map(|a| a.text()).unwrap_or_default();
+                cons_column.push((cname, col));
+            }
+            22 => {
+                // rec_user_privilege: parsed and set aside. GRANTs are
+                // access metadata, not data; the count keeps the
+                // omission visible.
+                let _ = read_atts(f, &mut at)?;
+                out.privileges_skipped += 1;
+            }
+            rec::END => break,
+            other => {
+                return Err(Refused(format!(
+                    "record type {} is outside this restore's surface",
+                    other
+                )));
+            }
+        }
+    }
+    // fold the NOT NULL constraint pairs onto the columns
+    for (cname, table) in &cons_table {
+        let Some(col) = cons_column.iter().find(|(n, _)| n == cname).map(|(_, c)| c) else {
+            continue;
+        };
+        if let Some(t) = out.tables.iter_mut().find(|t| &t.name == table) {
+            if let Some(c) = t.cols.iter_mut().find(|c| &c.name == col) {
+                c.not_null = true;
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+
+    /// The round trip is the unit test: what the writer produces, the
+    /// reader decodes - tables, types, rows, NULLs and NOT NULL alike.
+    #[test]
+    fn the_reader_decodes_what_the_writer_wrote() {
+        // a synthetic fbk via the writer's own building blocks
+        let mut f = Vec::new();
+        Rec::new(&mut f, rec::BURP).int(2, 12).int(4, 1).int(5, 1).end();
+        Rec::new(&mut f, rec::PHYSICAL_DB).int(5, 8192).end();
+        Rec::new(&mut f, rec::DATABASE).text(11, "NONE").end();
+        Rec::new(&mut f, rec::RELATION).text(21, "PUBLIC").text(1, "T").end();
+        Rec::new(&mut f, rec::FIELD)
+            .text(1, "ID")
+            .int(13, 0)
+            .int(8, 8)
+            .int(10, 4)
+            .int(9, 0)
+            .int(38, 1)
+            .end();
+        Rec::new(&mut f, rec::FIELD)
+            .text(1, "V")
+            .int(13, 1)
+            .int(8, 37)
+            .int(10, 10)
+            .int(9, 0)
+            .end();
+        f.push(rec::RELATION_END);
+        Rec::new(&mut f, rec::RELATION_DATA).text(21, "PUBLIC").text(1, "T").end();
+        let xdr: Vec<u8> = vec![
+            0, 0, 0, 1, // ID = 1
+            0, 0, 0, 3, b'o', b'n', b'e', 0, // V = 'one'
+            0, 0, 0, 0, 0, 0, 0, 0, // not null
+        ];
+        Rec::new(&mut f, rec::DATA)
+            .int(1, xdr.len() as i32)
+            .int(17, xdr.len() as i32);
+        f.push(2);
+        f.extend_from_slice(&fire_crab_ods::sqz::pack(&xdr));
+        f.push(rec::RELATION_END);
+        f.push(rec::END);
+
+        let r = read_backup(&f).unwrap();
+        assert_eq!(r.page_size, Some(8192));
+        assert_eq!(r.tables.len(), 1);
+        let t = &r.tables[0];
+        assert_eq!(t.name, "T");
+        assert_eq!(t.cols.len(), 2);
+        assert!(t.cols[0].not_null, "att 38 carries NOT NULL");
+        assert!(!t.cols[1].not_null);
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(t.rows[0][0], RVal::Int(1));
+        assert_eq!(t.rows[0][1], RVal::Bytes(b"one".to_vec()));
+
+        // an unknown RECORD refuses whole - mis-stepping the walk would
+        // turn everything after into nonsense
+        let mut bad = f.clone();
+        let end = bad.len() - 1;
+        bad[end] = 13; // rec_trigger where rec_end was
+        assert!(read_backup(&bad).is_err());
     }
 }

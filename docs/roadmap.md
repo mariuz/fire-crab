@@ -2774,10 +2774,17 @@ plus *the subsystem is now on the path*.
   is OVERWRITTEN (the opposite of nbackup's refusal law), and `gbak
   -se` speaks an older protocol - the command line rides the version-3
   ATTACH SPB with 0xff separators and the start SPB is a bare action
-  byte. Next slices, in value order: the RESTORE half
-  (`isc_action_svc_restore`, fire-crab reading a .fbk - the other
-  direction of the same differential), NOT NULL and PK/index records,
-  the -se command-line protocol, verbose streaming, blobs.
+  byte. **The RESTORE half is DONE**
+  (`qa/serve-real-gbakrestore.sh`, 22 checks): the four-way
+  cross-restore matrix - engine.fbk x fc-restore, fc.fbk x
+  engine-restore, each side round-tripping itself - all read identically
+  through the engine, with fc's restore built from its own machinery
+  (create_table + insert_record into a fresh shell). NOT NULL rides the
+  file BOTH WAYS now (att 38 + the INTEG constraint pair), flipping the
+  writer gate's recorded boundary to the equality it promised to become;
+  the writer also gained the user-domain refusal it was missing.
+  Remaining slices: PK/index records, the -se command-line protocol,
+  verbose streaming, blobs.
 
 ## A savepoint is a transaction (done)
 
