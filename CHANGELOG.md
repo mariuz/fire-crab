@@ -13,6 +13,36 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-08 — text meets the condition
+
+### Converted
+- **Text comparisons in PSQL conditions** — `IF (B = 'x')` and its
+  family, found refused by the SELECT INTO gate's first draft. `Expr`
+  gained its first non-arithmetic node (`TextLiteral`), the condition
+  evaluator compares text the way the engine does — **PAD SPACE**,
+  measured: `'x' = 'x '` is TRUE, both sides space-padded to the
+  longer and the bytes decide; case-sensitive under NONE; ordering is
+  the same padded byte order; a NULL operand is UNKNOWN. Variables
+  against literals, variables against variables, mixed freely with
+  integer conditions, and an embedded UPDATE's WHERE takes text too
+  (it renders through the ordinary planner).
+
+### Guarded
+- **A text literal has no probed BLR**, so a body carrying one is
+  INTERPRETED, never stored: `body_has_uninterpretable_blr` now
+  inspects conditions and assignment/store expressions, and the CHECK
+  constraint surface stays int-only by rank — a `CHECK (V = 'x')`
+  refuses exactly as it always did. (The re-routing this caused —
+  `B = 'x'` now parses as a plain assignment instead of the AssignText
+  special case — runs through the same interpreter arm either way; all
+  seven PSQL gates held.) Found and recorded: `B = NULL` — assigning
+  the NULL keyword — is still outside the surface, its own slice.
+
+### Gated
+- `qa/serve-real-psqltext.sh` (new, 12): the seven comparison laws,
+  the quote escape, the mixed-condition and embedded-UPDATE shapes,
+  and the CHECK boundary.
+
 ## 2026-08-08 — the static singleton
 
 ### Converted

@@ -8330,6 +8330,8 @@ fn infer_int_rank(
         Expr::Field { name, .. } => field_rank(name),
         Expr::Variable(_) => None, // no variables outside a trigger body
         Expr::IntLiteral(_) => Some(IntRank::Long),
+        Expr::TextLiteral(_) => None, // the CHECK surface is INT-ONLY
+
         Expr::Add(l, r) | Expr::Subtract(l, r) => {
             let (lr, rr) = (infer_int_rank(l, field_rank)?, infer_int_rank(r, field_rank)?);
             Some(if lr == IntRank::Int128 || rr == IntRank::Int128 {
@@ -8897,7 +8899,9 @@ fn expr_resolve_vars(
                 None => e.clone(),
             }
         }
-        Expr::Field { .. } | Expr::Variable(_) | Expr::IntLiteral(_) => e.clone(),
+        Expr::Field { .. } | Expr::Variable(_) | Expr::IntLiteral(_) | Expr::TextLiteral(_) => {
+            e.clone()
+        }
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_resolve_vars(l, vars)),
             Box::new(expr_resolve_vars(r, vars)),
@@ -9013,7 +9017,9 @@ fn expr_plain_ctx(e: &fire_crab_ods::expr::Expr, ctx: u8) -> fire_crab_ods::expr
         Expr::Field { context, name } if *context == CTX_PLAIN => {
             Expr::Field { context: ctx, name: name.clone() }
         }
-        Expr::Field { .. } | Expr::Variable(_) | Expr::IntLiteral(_) => e.clone(),
+        Expr::Field { .. } | Expr::Variable(_) | Expr::IntLiteral(_) | Expr::TextLiteral(_) => {
+            e.clone()
+        }
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_plain_ctx(l, ctx)),
             Box::new(expr_plain_ctx(r, ctx)),
@@ -9067,7 +9073,9 @@ fn expr_resolve_marked(
                 None => e.clone(),
             }
         }
-        Expr::Field { .. } | Expr::Variable(_) | Expr::IntLiteral(_) => e.clone(),
+        Expr::Field { .. } | Expr::Variable(_) | Expr::IntLiteral(_) | Expr::TextLiteral(_) => {
+            e.clone()
+        }
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_resolve_marked(l, vars, marked)),
             Box::new(expr_resolve_marked(r, vars, marked)),
@@ -9293,11 +9301,21 @@ fn body_has_uninterpretable_blr(st: &TrigStmt) -> bool {
         | TrigStmt::SelectInto { .. }
         | TrigStmt::ForExecStmt { .. }
         | TrigStmt::CallProc { .. } => true,
-        TrigStmt::If { then, otherwise, .. } => {
-            body_has_uninterpretable_blr(then)
+        TrigStmt::If { cond, then, otherwise, .. } => {
+            cond_has_text(cond)
+                || body_has_uninterpretable_blr(then)
                 || otherwise.as_ref().is_some_and(|e| body_has_uninterpretable_blr(e))
         }
-        TrigStmt::While { body, .. } => body_has_uninterpretable_blr(body),
+        TrigStmt::While { cond, body, .. } => {
+            cond_has_text(cond) || body_has_uninterpretable_blr(body)
+        }
+        // A TEXT LITERAL HAS NO PROBED BLR: the interpreter compares
+        // and assigns it (PAD SPACE, measured), but the emitter's shape
+        // for `blr_literal blr_text` has never been held against the
+        // engine's - so a body carrying one is interpreted, never
+        // stored, exactly as an AssignText body always was
+        TrigStmt::Assign { expr, .. } => expr_has_text(expr),
+        TrigStmt::Store { exprs, .. } => exprs.iter().any(expr_has_text),
         TrigStmt::Block { stmts, handlers, .. } => {
             stmts.iter().any(body_has_uninterpretable_blr)
                 || handlers.iter().any(|(conds, h)| {
@@ -9309,6 +9327,30 @@ fn body_has_uninterpretable_blr(st: &TrigStmt) -> bool {
                 })
         }
         _ => false,
+    }
+}
+
+/// Does this expression carry a text literal anywhere? (see the
+/// [TrigStmt::Assign] arm of [body_has_uninterpretable_blr])
+fn expr_has_text(e: &fire_crab_ods::expr::Expr) -> bool {
+    use fire_crab_ods::expr::Expr;
+    match e {
+        Expr::TextLiteral(_) => true,
+        Expr::Field { .. } | Expr::Variable(_) | Expr::IntLiteral(_) => false,
+        Expr::Add(l, r) | Expr::Subtract(l, r) | Expr::Multiply(l, r) | Expr::Divide(l, r) => {
+            expr_has_text(l) || expr_has_text(r)
+        }
+    }
+}
+
+/// [expr_has_text] over a whole condition.
+fn cond_has_text(c: &fire_crab_ods::expr::Cond) -> bool {
+    use fire_crab_ods::expr::Cond;
+    match c {
+        Cond::Cmp(_, l, r) => expr_has_text(l) || expr_has_text(r),
+        Cond::And(a, b) | Cond::Or(a, b) => cond_has_text(a) || cond_has_text(b),
+        Cond::Not(i) => cond_has_text(i),
+        Cond::Missing(e) | Cond::NotMissing(e) => expr_has_text(e),
     }
 }
 
@@ -10551,7 +10593,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         use fire_crab_ods::expr::Expr;
         match e {
             Expr::Field { context, name } => out.push((*context, name.clone())),
-            Expr::Variable(_) | Expr::IntLiteral(_) => {}
+            Expr::Variable(_) | Expr::IntLiteral(_) | Expr::TextLiteral(_) => {}
             Expr::Add(l, r) | Expr::Subtract(l, r) | Expr::Multiply(l, r) | Expr::Divide(l, r) => {
                 expr_fields(l, out);
                 expr_fields(r, out);
@@ -11513,6 +11555,8 @@ fn parse_default_clause(
 enum ETok {
     Num(i32),
     Id(String),
+    /// a 'quoted string' ('' = a literal quote)
+    Text(String),
     Plus,
     Minus,
     Star,
@@ -11592,6 +11636,26 @@ fn tokenize_expr(s: &str) -> Option<Vec<ETok>> {
                     return None;
                 }
                 out.push(ETok::Id(std::str::from_utf8(&b[st..i]).ok()?.to_string()));
+            }
+            b'\'' => {
+                // a string literal, '' unescaping to one quote
+                i += 1;
+                let mut lit = Vec::new();
+                loop {
+                    match b.get(i) {
+                        Some(b'\'') if b.get(i + 1) == Some(&b'\'') => {
+                            lit.push(b'\'');
+                            i += 2;
+                        }
+                        Some(b'\'') => break,
+                        Some(c) => {
+                            lit.push(*c);
+                            i += 1;
+                        }
+                        None => return None,
+                    }
+                }
+                out.push(ETok::Text(String::from_utf8(lit).ok()?));
             }
             _ if c.is_ascii_alphabetic() || c == b'_' => {
                 let st = i;
@@ -11723,6 +11787,7 @@ fn expr_with_context(e: &fire_crab_ods::expr::Expr, context: u8) -> fire_crab_od
         Expr::Field { name, .. } => Expr::Field { context, name: name.clone() },
         Expr::Variable(n) => Expr::Variable(*n),
         Expr::IntLiteral(v) => Expr::IntLiteral(*v),
+        Expr::TextLiteral(t) => Expr::TextLiteral(t.clone()),
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_with_context(l, context)),
             Box::new(expr_with_context(r, context)),
@@ -11773,6 +11838,7 @@ fn expr_all_plain(e: &fire_crab_ods::expr::Expr) -> bool {
         Expr::Field { context, .. } => *context == CTX_PLAIN,
         Expr::Variable(_) => false, // only a trigger body has variables
         Expr::IntLiteral(_) => true,
+        Expr::TextLiteral(_) => true,
         Expr::Add(l, r) | Expr::Subtract(l, r) | Expr::Multiply(l, r) | Expr::Divide(l, r) => {
             expr_all_plain(l) && expr_all_plain(r)
         }
@@ -11887,6 +11953,11 @@ fn blr_expr_factor(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Exp
             let v = *n;
             *p += 1;
             Some(Expr::IntLiteral(v))
+        }
+        ETok::Text(t) => {
+            let t = t.clone();
+            *p += 1;
+            Some(Expr::TextLiteral(t))
         }
         ETok::Id(name) => {
             let name = name.clone();
@@ -37371,6 +37442,7 @@ fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value,
     };
     match e {
         E::IntLiteral(v) => Ok(Value::Int(*v as i64)),
+        E::TextLiteral(t) => Ok(Value::Text(t.clone())),
         E::Variable(n) => Ok(f.vars.get(*n as usize).cloned().unwrap_or(Value::Null)),
         // a bare column reference has no row to read inside a procedure
         E::Field { .. } => Err(PsqlStop::Unsupported),
@@ -37427,6 +37499,26 @@ fn eval_psql_cond(
                     CmpOp::Gtr => x > y,
                     CmpOp::Geq => x >= y,
                 }),
+                // SQL text comparison is PAD SPACE (measured: 'x' and
+                // 'x ' are EQUAL, 'x' and 'X' are not): both sides are
+                // space-padded to the longer and the bytes decide
+                (Value::Text(x), Value::Text(y)) => {
+                    let n = x.len().max(y.len());
+                    let pad = |t: &str| {
+                        let mut v = t.as_bytes().to_vec();
+                        v.resize(n, b' ');
+                        v
+                    };
+                    let (a, b) = (pad(&x), pad(&y));
+                    Some(match op {
+                        CmpOp::Eql => a == b,
+                        CmpOp::Neq => a != b,
+                        CmpOp::Lss => a < b,
+                        CmpOp::Leq => a <= b,
+                        CmpOp::Gtr => a > b,
+                        CmpOp::Geq => a >= b,
+                    })
+                }
                 _ => return Err(PsqlStop::Unsupported),
             }
         }
@@ -37960,6 +38052,8 @@ fn render_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Option<Stri
     }
     Some(match e {
         E::IntLiteral(v) => v.to_string(),
+        // re-quoted the way the lexer unquoted it
+        E::TextLiteral(t) => format!("'{}'", t.replace('\'', "''")),
         E::Variable(n) => psql_literal(f.vars.get(*n as usize).unwrap_or(&Value::Null))?,
         E::Field { name, .. } => name.clone(),
         E::Add(a, b) => format!("({} + {})", render_psql_expr(a, f)?, render_psql_expr(b, f)?),

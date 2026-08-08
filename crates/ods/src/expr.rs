@@ -48,6 +48,12 @@ pub enum Expr {
     Variable(u16),
     /// `blr_literal blr_long`: a 32-bit integer, scale 0.
     IntLiteral(i32),
+    /// A quoted string. PSQL conditions compare text with PAD-SPACE
+    /// semantics (measured: `'x' = 'x '` is TRUE, `'x' = 'X'` is not).
+    /// The CHECK-constraint surface stays INT-ONLY: `infer_int_rank`
+    /// answers None for this node, so a CHECK carrying one refuses as
+    /// it always did, and the BLR below is never stored.
+    TextLiteral(String),
     Add(Box<Expr>, Box<Expr>),
     Subtract(Box<Expr>, Box<Expr>),
     Multiply(Box<Expr>, Box<Expr>),
@@ -74,6 +80,17 @@ impl Expr {
                 out.push(BLR_LONG);
                 out.push(0); // scale
                 out.extend_from_slice(&v.to_le_bytes());
+            }
+            Expr::TextLiteral(t) => {
+                // blr_literal blr_text <u16 len> <bytes> - shaped like
+                // the engine's, but UNREACHABLE from any stored-BLR
+                // path: the CHECK surface refuses text (int-rank None)
+                // before this emitter runs, and PSQL bodies are
+                // interpreted, never stored
+                out.push(BLR_LITERAL);
+                out.push(14); // blr_text
+                out.extend_from_slice(&(t.len() as u16).to_le_bytes());
+                out.extend_from_slice(t.as_bytes());
             }
             Expr::Add(l, r) => Self::binop(out, BLR_ADD, l, r),
             Expr::Subtract(l, r) => Self::binop(out, BLR_SUBTRACT, l, r),
@@ -112,7 +129,7 @@ impl Expr {
                     refs.push(name.clone());
                 }
             }
-            Expr::IntLiteral(_) | Expr::Variable(_) => {}
+            Expr::IntLiteral(_) | Expr::TextLiteral(_) | Expr::Variable(_) => {}
             Expr::Add(l, r)
             | Expr::Subtract(l, r)
             | Expr::Multiply(l, r)

@@ -2632,9 +2632,13 @@ plus *the subsystem is now on the path*.
   count-mismatch vector, judged against the PLAN's projection so an
   empty result still refuses. The engine raises the -313 at PREPARE of
   the block, this server when the statement runs - same locationless
-  vector, later moment, the recorded difference. Found on the way: a
+  vector, later moment, the recorded difference. ~~Found on the way: a
   TEXT comparison in an IF condition is outside the interpreter's cond
-  surface (`IF (B = 'x')` refuses where `IF (A = 1)` and IS NULL run);
+  surface~~ **DONE the increment after** (qa/serve-real-psqltext.sh,
+  12): PAD SPACE semantics measured and kept, the stored-BLR boundary
+  guarded (a text literal has no probed BLR - bodies carrying one are
+  interpreted, never emitted; CHECK stays int-only). Still outside:
+  `B = NULL` (assigning the NULL keyword), its own slice;
   **a BIGINT literal is outside the PSQL surface** (`Expr::IntLiteral` is an `i32`, and widening it changes BLR
   encoding and type ranking - its own increment), **`INSERT ... VALUES`
   without a column list** is outside it too, and **`CREATE PROCEDURE` is
