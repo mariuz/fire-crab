@@ -42,7 +42,15 @@ four; R7 is the removal of what they replaced.
 
 ## Measured gaps that are nobody's slice yet
 
-- **A scalar subquery's aggregate describes as BIGINT.** `SELECT (SELECT
+- ~~A scalar subquery's aggregate describes as BIGINT~~ **The lone
+  and subquery-scalar halves are DONE** (qa/serve-real-aggdescribe.sh,
+  8): Plan::Scalar carries a ScalarTy - MIN/MAX from the source
+  column via wire_for, SUM/AVG INT64, COUNT the engine's own
+  NOT-NULLABLE 580 - and the announced type decides the wire slot.
+  What remains of the original entry: GROUPED aggregates' cols and
+  any fold consumer not routed through Plan::Scalar.
+  The original entry:
+  **A scalar subquery's aggregate describes as BIGINT.** `SELECT (SELECT
   MAX(C) FROM V) AS M FROM T` announces an INT64 where the engine
   announces the source column's own INTEGER; the ROWS agree on every
   probe. It is the prepare-time aggregate fold's type (`Plan::Scalar` is
@@ -2618,8 +2626,12 @@ plus *the subsystem is now on the path*.
   ~~fire-crab announces every procedure OUTPUT
   PARAMETER as BIGINT~~ **DONE** (qa/serve-real-procdescribe.sh, 7):
   proc_out_col rides wire_for, both call shapes render byte-identical
-  to the engine, TEXT outputs ride now (text INPUTS stay refused - the
-  arg parsers are integer-and-NULL, a recorded boundary), and the
+  to the engine, TEXT outputs ride now, and TEXT INPUTS the
+  increment after (gate 7 -> 13: quote-aware parse_call_args - 'a,b'
+  broke the naive split - shared bind_proc_args on BOTH executor
+  paths, CHAR padding, the locationless 22001 truncation vector, and
+  the announced-then-raised-at-fetch law for selectable bodies;
+  cross-type stays refused where the engine converts), and the
   VARYING count-word normalization in domain_desc came out of the
   first differential render; **an
   expression in a `DECLARE ... CURSOR FOR (...)` select list must be

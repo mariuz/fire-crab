@@ -55,6 +55,21 @@ BEGIN
   N = 1;
   SUSPEND;
 END^
+CREATE PROCEDURE PTIN2 (K INTEGER) RETURNS (N INTEGER) AS
+BEGIN
+  N = K;
+  SUSPEND;
+END^
+CREATE PROCEDURE PSHOW (S VARCHAR(5)) RETURNS (R VARCHAR(10)) AS
+BEGIN
+  R = S;
+  SUSPEND;
+END^
+CREATE PROCEDURE PCHR (S CHAR(5)) RETURNS (R VARCHAR(10)) AS
+BEGIN
+  R = S;
+  SUSPEND;
+END^
 SET TERM ; ^
 COMMIT;
 EOF
@@ -100,9 +115,27 @@ check "a text output arrives with its declared width" \
 check "...through EXECUTE PROCEDURE as well" \
     "$(run "$F" 'EXECUTE PROCEDURE PTXT;')" "$(run "$E" 'EXECUTE PROCEDURE PTXT;')"
 
-# --- 3. the boundary: a text INPUT still refuses ---------------------------------
-out=$(run "$F" "SELECT * FROM PTIN('ab');" | head -2 | tr -s ' \n' ' ')
-check "boundary: a text INPUT parameter refuses rather than coerces" \
+# --- 3. text INPUT arguments (the increment after the describes) ---------------
+# the split is QUOTE-AWARE now: 'a,b' carries a comma INSIDE the
+# literal, which the old naive split(',') could not even delimit
+check "a text argument binds" \
+    "$(run "$F" "SELECT * FROM PTIN('ab');")" "$(run "$E" "SELECT * FROM PTIN('ab');")"
+check "...with a comma inside the literal" \
+    "$(run "$F" "SELECT * FROM PSHOW('a,b');")" "$(run "$E" "SELECT * FROM PSHOW('a,b');")"
+check "...and the doubled-quote escape" \
+    "$(run "$F" "SELECT * FROM PSHOW('it''s');")" "$(run "$E" "SELECT * FROM PSHOW('it''s');")"
+check "a CHAR parameter PADS its argument (raw bytes compared)" \
+    "$(run "$F" 'SELECT * FROM PCHR('"'"'ab'"'"');')" "$(run "$E" 'SELECT * FROM PCHR('"'"'ab'"'"');')"
+check "an overlong argument raises the truncation vector AFTER the header" \
+    "$(run "$F" "SELECT * FROM PSHOW('far-too-long-for-five');")" \
+    "$(run "$E" "SELECT * FROM PSHOW('far-too-long-for-five');")"
+check "...and immediately on the EXECUTE PROCEDURE shape" \
+    "$(run "$F" "EXECUTE PROCEDURE PSHOW('far-too-long-for-five');")" \
+    "$(run "$E" "EXECUTE PROCEDURE PSHOW('far-too-long-for-five');")"
+# the engine CONVERTS a text argument into an integer parameter ('12'
+# becomes 12); a conversion this surface has not measured refuses
+out=$(run "$F" "SELECT N FROM PTIN2('12');" | head -2 | tr -s ' \n' ' ')
+check "boundary: a cross-type argument refuses rather than coerces" \
     "$out" "Statement failed, SQLSTATE = 42000 Dynamic SQL Error "
 
 echo "ran $ran checks"

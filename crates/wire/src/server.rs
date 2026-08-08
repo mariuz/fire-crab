@@ -4111,7 +4111,7 @@ enum Plan {
     /// third field: describe item 16, the SYMBOLIC field name, when
     /// it differs from the output name (an aliased aggregate fast
     /// path: COUNT(*) AS N is field COUNT, alias N). None = same.
-    Scalar(ScalarVal, String, Option<String>),
+    Scalar(ScalarVal, String, Option<String>, ScalarTy),
     /// `EXECUTE PROCEDURE <name> [(args)]` - the procedure's OUTPUT
     /// parameters as one row. isql prepares this like any other
     /// statement and then FETCHES it (probed: op_prepare, op_execute,
@@ -20089,7 +20089,7 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
         // it: a connection with no database behind it, where the wire
         // pipeline must still round-trip.
         _ if db.is_some() => (Plan::Refused, Vec::new()),
-        _ => (Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".into(), None), Vec::new()),
+        _ => (Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".into(), None, ScalarTy::int64()), Vec::new()),
     }
 }
 
@@ -20145,16 +20145,79 @@ fn split_proc_call(table_s: &str) -> Option<(String, Option<String>)> {
 /// Literal procedure arguments: integers and NULL, as the EXECUTE
 /// PROCEDURE parser takes them.
 fn parse_proc_args(text: &str) -> Option<Vec<Value>> {
+    parse_call_args(text, false)?.into_iter().collect()
+}
+
+/// Split a call's argument list and read each one: NULL, an integer
+/// literal, a 'text' literal ('' unescaping to one quote), or - when
+/// the caller allows it - a `?` placeholder (None in the answer).
+///
+/// The split is QUOTE-AWARE, and that is the whole reason this exists:
+/// `PT('a,b')` carries a comma INSIDE the literal, and the naive
+/// `split(',')` the two call sites used made text arguments impossible
+/// to even delimit, let alone read.
+fn parse_call_args(text: &str, allow_placeholder: bool) -> Option<Vec<Option<Value>>> {
+    let text = text.trim();
     if text.is_empty() {
         return Some(Vec::new());
     }
-    text.split(',')
+    // split on commas OUTSIDE quotes
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if in_quote && chars.peek() == Some(&'\'') => {
+                cur.push('\'');
+                cur.push('\'');
+                chars.next();
+            }
+            '\'' => {
+                in_quote = !in_quote;
+                cur.push('\'');
+            }
+            ',' if !in_quote => {
+                parts.push(std::mem::take(&mut cur));
+            }
+            _ => cur.push(c),
+        }
+    }
+    if in_quote {
+        return None; // an unclosed literal
+    }
+    parts.push(cur);
+    parts
+        .into_iter()
         .map(|p| {
             let t = p.trim();
-            if t.eq_ignore_ascii_case("NULL") {
-                Some(Value::Null)
+            if t == "?" && allow_placeholder {
+                Some(None)
+            } else if t.eq_ignore_ascii_case("NULL") {
+                Some(Some(Value::Null))
+            } else if let Ok(n) = t.parse::<i64>() {
+                Some(Some(Value::Int(n)))
+            } else if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
+                // the '' escape undone; interior single quotes only ever
+                // arrive doubled (the split above kept them that way)
+                let inner = &t[1..t.len() - 1];
+                let mut lit = String::new();
+                let mut cs = inner.chars().peekable();
+                while let Some(c) = cs.next() {
+                    if c == '\'' {
+                        if cs.peek() == Some(&'\'') {
+                            cs.next();
+                            lit.push('\'');
+                        } else {
+                            return None; // a lone quote mid-literal
+                        }
+                    } else {
+                        lit.push(c);
+                    }
+                }
+                Some(Some(Value::Text(lit)))
             } else {
-                t.parse::<i64>().ok().map(Value::Int)
+                None
             }
         })
         .collect()
@@ -22518,7 +22581,7 @@ fn plan_query_inner_ctx(
                         // Scalar - only aggregate/expression subs (all
                         // relation-empty, like Scalar's own column)
                         // reach this arm, so fname is the whole patch
-                        Plan::Scalar(_, _, f) if *idx == 0 => {
+                        Plan::Scalar(_, _, f, _) if *idx == 0 => {
                             *f = Some(fname.clone());
                         }
                         _ => {}
@@ -22666,6 +22729,7 @@ fn plan_query_inner_ctx(
                             ScalarVal::GenRead(gen_name),
                             "GEN_ID".into(),
                             None,
+                        ScalarTy::int64(),
                         )),
                         None => Some(Plan::Refused),
                     };
@@ -22954,6 +23018,7 @@ fn plan_query_inner_ctx(
                         ScalarVal::Fixed(Some(n as i64)),
                         "COUNT".to_string(),
                         None,
+                        ScalarTy::count(),
                     ));
                 }
                 return from_names_view.then_some(Plan::Refused);
@@ -23198,6 +23263,23 @@ fn plan_query_inner_ctx(
                     }
                     .to_string();
                     let name = alias.clone().unwrap_or_else(|| fname.clone());
+                    // MEASURED: MIN/MAX announce the SOURCE column's
+                    // own type; SUM widens to INT64; COUNT is INT64
+                    // and NOT nullable - the only aggregate without
+                    // the flag
+                    let sty = match func {
+                        AggFn::Count => ScalarTy::count(),
+                        AggFn::Min | AggFn::Max => match target {
+                            AggTarget::Col(cn) => columns
+                                .iter()
+                                .find(|c| c.name.eq_ignore_ascii_case(cn))
+                                .and_then(|c| descs.get(c.field_id as usize))
+                                .map(ScalarTy::of_desc)
+                                .unwrap_or_else(ScalarTy::int64),
+                            _ => ScalarTy::int64(),
+                        },
+                        AggFn::Sum | AggFn::Avg => ScalarTy::int64(),
+                    };
                     return Some(Plan::Scalar(
                         ScalarVal::Agg(Box::new(AggPlan {
                             rel,
@@ -23211,6 +23293,7 @@ fn plan_query_inner_ctx(
                         })),
                         name,
                         Some(fname),
+                        sty,
                     ));
                 }
             }
@@ -25643,7 +25726,10 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
 /// columns for `Project`, the output columns for `Group`.
 fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
     match plan {
-        Plan::Scalar(..) | Plan::GenIdIncrement { .. } => describe_one_bigint(params),
+        Plan::Scalar(_, name, fname, ty) => {
+            build_describe(&[scalar_col(name, fname, *ty)], params, att)
+        }
+        Plan::GenIdIncrement { .. } => describe_one_bigint(params),
         // the procedure's output parameters, described like a projection
         Plan::ProcCall { cols, .. } | Plan::ProcInvoke { cols, .. } => build_describe(cols, params, att),
         Plan::Union { cols, .. }
@@ -25779,6 +25865,53 @@ fn stmt_type_of(plan: &Plan) -> i32 {
 
 /// One projected BIGINT column named `Cn` - what a virtual-empty query's
 /// columns describe as.
+/// The announced type of a [Plan::Scalar]'s one column. MEASURED:
+/// MIN/MAX carry their SOURCE column's type (MAX over an INTEGER
+/// describes 496 LONG, over a SMALLINT 500 SHORT); SUM and AVG widen
+/// to INT64 regardless of source; COUNT is INT64 and the ONE aggregate
+/// the engine announces NOT NULLABLE; GEN_ID reads stay the nullable
+/// INT64 they were probed as.
+#[derive(Clone, Copy, PartialEq)]
+struct ScalarTy {
+    wire: Wire,
+    sql_type: i32,
+    length: i32,
+}
+
+impl ScalarTy {
+    /// nullable INT64 - the fold's own type, and the old blanket answer
+    fn int64() -> ScalarTy {
+        ScalarTy { wire: Wire::Int64, sql_type: 581, length: 8 }
+    }
+    /// COUNT's type: INT64, NOT nullable (580 even - measured)
+    fn count() -> ScalarTy {
+        ScalarTy { wire: Wire::Int64, sql_type: 580, length: 8 }
+    }
+    /// a MIN/MAX result: the SOURCE column's own type, nullable
+    fn of_desc(d: &Descriptor) -> ScalarTy {
+        let (wire, sql_type, length, _, _) = wire_for(d);
+        ScalarTy { wire, sql_type: nullable(sql_type), length }
+    }
+}
+
+/// The [ProjCol] a [Plan::Scalar] projects.
+fn scalar_col(name: &str, fname: &Option<String>, ty: ScalarTy) -> ProjCol {
+    ProjCol {
+        name: name.to_string(),
+        fname: fname.clone(),
+        relation: None,
+        rel_alias: None,
+        field_id: 0,
+        wire: ty.wire,
+        sql_type: ty.sql_type,
+        length: ty.length,
+        oct_length: ty.length,
+        scale: 0,
+        sub_type: 0,
+        expr: None,
+    }
+}
+
 fn bigint_col(n: usize) -> ProjCol {
     ProjCol {
         name: format!("C{}", n),
@@ -25806,20 +25939,7 @@ fn output_cols_of(plan: &Plan) -> Vec<ProjCol> {
         | Plan::Group { cols, .. } => {
             cols.clone()
         }
-        Plan::Scalar(_, name, fname) => vec![ProjCol {
-            name: name.clone(),
-            fname: fname.clone(),
-            relation: None,
-            rel_alias: None,
-            field_id: 0,
-            wire: Wire::Int64,
-            sql_type: 581,
-            length: 8,
-            oct_length: 8,
-            scale: 0,
-            sub_type: 0,
-            expr: None,
-        }],
+        Plan::Scalar(_, name, fname, ty) => vec![scalar_col(name, fname, *ty)],
         Plan::GenIdIncrement { step, .. } => vec![ProjCol {
             // the spelling names the column (probed: NEXT VALUE FOR G1
             // FROM RDB$DATABASE is NEXT_VALUE/NEXT_VALUE, GEN_ID(G1, 1)
@@ -26879,7 +26999,7 @@ fn emit_rows_inner(
         | Plan::AlterTableDrop { .. }
         | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. } | Plan::AlterColumnDropIdentity { .. } | Plan::AlterColumnPosition { .. }
         | Plan::GenIdIncrement { .. } | Plan::SetGenerator { .. } => {}
-        Plan::Scalar(v, ..) => {
+        Plan::Scalar(v, _, _, ty) => {
             // WORKED OUT HERE, not at prepare - see [ScalarVal]
             let n = scalar_value(v, db.as_ref()).map_err(|e| match e {
                 ScalarErr::Limbo(id) => EmitErr::Eval(EvalErr::RecInLimbo(id)),
@@ -26889,7 +27009,13 @@ fn emit_rows_inner(
             match n {
                 Some(n) => {
                     w.raw(&[0u8; 4]); // null bitmap (1 col, not null), padded to 4
-                    w.raw(&n.to_be_bytes());
+                    // THE ANNOUNCED TYPE DECIDES THE SLOT: a MIN/MAX
+                    // that described as its source column travels in
+                    // the 4-byte XDR slot when the describe said so
+                    match ty.wire {
+                        Wire::Int32 => w.raw(&(n as i32).to_be_bytes()),
+                        _ => w.raw(&n.to_be_bytes()),
+                    };
                 }
                 None => {
                     w.raw(&[1u8, 0, 0, 0]); // null bitmap: col 0 is NULL, no data
@@ -26897,10 +27023,16 @@ fn emit_rows_inner(
             }
         }
         // the refusal is raised as the fetch's error response, the same
-        // way a mid-cursor evaluation error is
+        // way a mid-cursor evaluation error is. A TYPED one keeps its
+        // vector: a selectable procedure's body error lands here now,
+        // because the engine runs those bodies LAZILY - the cursor
+        // ANNOUNCES at execute and the error arrives at the first
+        // fetch, header already printed (measured with the truncation
+        // raise: the engine shows the column header, then the vector)
+        Plan::RefusedEval(e) => return Err(EmitErr::Eval(e.clone())),
         // ProcInvoke is replaced at op_execute; reaching a fetch still
         // holding one means the statement was never executed
-        Plan::Refused | Plan::RefusedEval(_) | Plan::ProcInvoke { .. } => {
+        Plan::Refused | Plan::ProcInvoke { .. } => {
             return Err(EmitErr::Eval(EvalErr::ConversionError(None)))
         }
         // ProcSelect is replaced at op_execute; reaching a fetch still
@@ -37197,19 +37329,14 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     raw.sort_by_key(|(t, n, _, _)| (*t, *n));
     for (typ, _, pnm, fs) in raw {
         let desc = domain_desc(&fs)?;
-        // INPUTS are integer-only still: the call-site argument parsers
-        // read integer literals and NULL, and a silently coerced text
-        // argument would be a wrong answer rather than a refusal.
-        // OUTPUTS take text too now - the frame's variables have been
-        // Value slots all along, the body assigns and compares text
-        // since the text increments, and the describe carries the
-        // declared type (see proc_out_col).
-        let ok = match col_kind(&desc) {
-            Some(ColKind::Int) => true,
-            Some(ColKind::Text) => typ != 0,
-            _ => false,
-        };
-        if !ok {
+        // INTEGER and TEXT parameters, both directions: the frame's
+        // variables have been Value slots all along, the body assigns
+        // and compares text since the text increments, the describe
+        // carries the declared type (proc_out_col), and the ARGUMENT
+        // BINDING pads CHAR inputs, raises the truncation vector on
+        // overlength, and refuses cross-type rather than coercing
+        // (see run_body_source). Anything else stays refused.
+        if col_kind(&desc).is_none() {
             return None;
         }
         let p = ProcParam { name: pnm, desc };
@@ -39100,6 +39227,18 @@ fn try_procedure_blr(
     let Ok(blr) = fire_crab_exe::procedure_blr(&db.bytes(), db.page_size, name) else {
         return BlrProcOutcome::Outside;
     };
+    // THE SAME BINDING AS THE SOURCE PATH, or the two disagree about
+    // one call: the truncation raise is typed, everything else falls
+    // to the source interpreter to refuse in its own words
+    let bound_args = match load_procedure(db, name) {
+        Some(meta) => match bind_proc_args(name, &meta, args) {
+            Ok(b) => b,
+            Err(ProcErr { status: Some(ev), .. }) => return BlrProcOutcome::Runtime(ev),
+            Err(_) => return BlrProcOutcome::Outside,
+        },
+        None => return BlrProcOutcome::Outside,
+    };
+    let args = &bound_args[..];
     let Ok(req) = fire_crab_exe::parse(&blr) else {
         return BlrProcOutcome::Outside;
     };
@@ -39197,6 +39336,62 @@ fn text_in_nontext_output(row: &[Value], outs: &[ProcParam]) -> bool {
         matches!(v, Value::Text(_))
             && !matches!(p.desc.dtype, dtype::TEXT | dtype::VARYING | dtype::BLOB)
     })
+}
+
+/// Bind a call's arguments to the DECLARED parameters - the same rules
+/// on BOTH executor paths (stored BLR and the source interpreter), or
+/// the two would disagree about the same call. Measured: a CHAR input
+/// PADS its argument (CHAR_LENGTH('ab') answers 5 inside a CHAR(5)
+/// parameter's body), an overlong one raises the LOCATIONLESS 22001
+/// truncation vector naming expected and actual lengths, and NULL
+/// passes into any type. A CROSS-TYPE argument refuses where the
+/// engine would convert ('12' into an INTEGER parameter) - a
+/// conversion this surface has not measured, and a silently wrong one
+/// would be worse than the refusal.
+fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value]) -> Result<Vec<Value>, ProcErr> {
+    let mut bound: Vec<Value> = Vec::with_capacity(args.len());
+    for (arg, param) in args.iter().zip(meta.ins.iter()) {
+        let d = &param.desc;
+        let declared_chars = match d.dtype {
+            fire_crab_ods::format::dtype::VARYING => (d.length as usize).saturating_sub(2),
+            _ => d.length as usize,
+        };
+        bound.push(match (arg, col_kind(d)) {
+            (Value::Null, _) => Value::Null,
+            (Value::Int(n), Some(ColKind::Int)) => Value::Int(*n),
+            (Value::Text(t), Some(ColKind::Text)) => {
+                if t.chars().count() > declared_chars {
+                    return Err(ProcErr {
+                        text: format!(
+                            "procedure {}: argument longer than parameter {}",
+                            name, param.name
+                        ),
+                        status: Some(EvalErr::StringTruncation {
+                            expected: declared_chars as i64,
+                            actual: t.chars().count() as i64,
+                        }),
+                    });
+                }
+                if d.dtype == fire_crab_ods::format::dtype::TEXT {
+                    // a CHAR parameter is its declared width, always
+                    let mut padded = t.clone();
+                    while padded.chars().count() < declared_chars {
+                        padded.push(' ');
+                    }
+                    Value::Text(padded)
+                } else {
+                    Value::Text(t.clone())
+                }
+            }
+            _ => {
+                return Err(ProcErr::from(format!(
+                    "procedure {}: argument type does not match parameter {}",
+                    name, param.name
+                )))
+            }
+        });
+    }
+    Ok(bound)
 }
 
 fn run_procedure(
@@ -39306,7 +39501,8 @@ fn run_body_source(
         cursors: cursor_states,
         row_count_slot,
     };
-    frame.vars.extend(args.iter().cloned());
+    let bound = bind_proc_args(name, meta, args)?;
+    frame.vars.extend(bound);
     frame.vars.resize(names.len(), Value::Null);
     // ROW_COUNT BEFORE ANY STATEMENT IS 0, NOT NULL (probed: a body
     // whose first statement tests `ROW_COUNT IS NULL` answers 0). Every
@@ -39595,18 +39791,7 @@ fn parse_execute_procedure(sql: &str) -> Option<(Option<String>, String, Vec<Opt
     }
     let mut args = Vec::new();
     if !arg_text.is_empty() {
-        for part in arg_text.split(',') {
-            let t = part.trim();
-            args.push(if t == "?" {
-                None
-            } else if t.eq_ignore_ascii_case("NULL") {
-                Some(Value::Null)
-            } else if let Ok(n) = t.parse::<i64>() {
-                Some(Value::Int(n))
-            } else {
-                return None; // integer literals and NULL in this slice
-            });
-        }
+        args = parse_call_args(arg_text, true)?;
     }
     Some((qual, name, args))
 }
@@ -40811,6 +40996,7 @@ fn switch_stmt(
                     ScalarVal::Fixed(Some(FIXED_ANSWER)),
                     "CONSTANT".to_string(),
                     None,
+                ScalarTy::int64(),
                 )),
             ),
             params: std::mem::take(params),
@@ -40833,6 +41019,7 @@ fn switch_stmt(
                 ScalarVal::Fixed(Some(FIXED_ANSWER)),
                 "CONSTANT".to_string(),
                 None,
+            ScalarTy::int64(),
             ));
             *params = std::rc::Rc::new(Vec::new());
             bound.clear();
@@ -41277,6 +41464,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
         ScalarVal::Fixed(Some(FIXED_ANSWER)),
         "CONSTANT".to_string(),
         None,
+    ScalarTy::int64(),
     ));
     let mut stmt_params: std::rc::Rc<Vec<Descriptor>> = std::rc::Rc::new(Vec::new());
     let mut bound_args: Vec<WireParam> = Vec::new();
@@ -41562,7 +41750,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 // no message.
                 let mut w = W::default();
                 match &p {
-                    Plan::Scalar(v, ..) => {
+                    Plan::Scalar(v, _, _, sty) => {
                         // worked out here, not at prepare - see [ScalarVal]
                         // a limbo hit is the engine's typed raise, not
                         // a NULL - see [ScalarErr]
@@ -41581,7 +41769,11 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         match n {
                             Some(n) => {
                                 w.raw(&[0u8; 4]); // null bitmap: 1 col, not null
-                                w.raw(&n.to_be_bytes());
+                                // the announced type decides the slot
+                                match sty.wire {
+                                    Wire::Int32 => w.raw(&(n as i32).to_be_bytes()),
+                                    _ => w.raw(&n.to_be_bytes()),
+                                };
                             }
                             None => {
                                 w.raw(&[1u8, 0, 0, 0]); // col 0 NULL, no data
@@ -41700,7 +41892,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             respond_prepare(&mut s, &mut enc, &describe)?;
                         }
                         None => {
-                            plan = std::rc::Rc::new(Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None));
+                            plan = std::rc::Rc::new(Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None, ScalarTy::int64()));
                             stmt_params = std::rc::Rc::new(Vec::new());
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
@@ -41795,7 +41987,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             respond_prepare(&mut s, &mut enc, &describe)?;
                         }
                         None => {
-                            plan = std::rc::Rc::new(Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None));
+                            plan = std::rc::Rc::new(Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None, ScalarTy::int64()));
                             stmt_params = std::rc::Rc::new(Vec::new());
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
@@ -42261,10 +42453,14 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             continue;
                         }
                         BlrProcOutcome::Runtime(e) => {
+                            // ANNOUNCED, RAISED AT FETCH: the engine
+                            // runs a selectable body lazily, so its
+                            // error follows the header
                             let e = runtime_with_position(
                                 &mut database, &pname, &pargs, &ctx, e,
                             );
-                            respond_eval_error(&mut s, &mut enc, &e)?;
+                            plan = std::rc::Rc::new(Plan::RefusedEval(e));
+                            respond(&mut s, &mut enc, TX_HANDLE)?;
                             continue;
                         }
                         BlrProcOutcome::Outside => {}
@@ -42289,11 +42485,18 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             if std::env::var("FC_SRV_TRACE").is_ok() {
                                 eprintln!("[srv] select from procedure failed: {}", e);
                             }
-                            // a RAISED EXCEPTION carries the engine's own
-                            // vector; everything else is this server's
-                            // refusal and stays generic
+                            // a RAISED EXCEPTION carries the engine's
+                            // own vector - DEFERRED to the fetch,
+                            // because a selectable body runs lazily
+                            // there and the header has already gone
+                            // out; a refusal stays generic and
+                            // immediate
                             match &e.status {
-                                Some(ev) => respond_eval_error(&mut s, &mut enc, ev)?,
+                                Some(ev) => {
+                                    plan =
+                                        std::rc::Rc::new(Plan::RefusedEval(ev.clone()));
+                                    respond(&mut s, &mut enc, TX_HANDLE)?;
+                                }
                                 None => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
                             }
                         }
@@ -42380,7 +42583,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     match gen_id_increment(&mut database, &name, step) {
                         Ok(new_val) => {
                             let n = if step.is_none() { "NEXT_VALUE" } else { "GEN_ID" };
-                            plan = std::rc::Rc::new(Plan::Scalar(ScalarVal::Fixed(Some(new_val)), n.to_string(), None));
+                            plan = std::rc::Rc::new(Plan::Scalar(ScalarVal::Fixed(Some(new_val)), n.to_string(), None, ScalarTy::int64()));
                             respond(&mut s, &mut enc, TX_HANDLE)?;
                         }
                         Err(e) => {
@@ -42678,7 +42881,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     stmts.remove(&h);
                     if h == cur_stmt {
                         stmt_sql.clear();
-                        plan = std::rc::Rc::new(Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None));
+                        plan = std::rc::Rc::new(Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None, ScalarTy::int64()));
                         stmt_params = std::rc::Rc::new(Vec::new());
                         bound_args.clear();
                         last_dml = (0, 0, 0);
@@ -51646,7 +51849,7 @@ mod tests {
             table: "DST".into(),
             cols: vec!["X".into()],
             ov: Overriding::None,
-            src: Box::new(Plan::Scalar(ScalarVal::Fixed(Some(1)), "X".into(), None)),
+            src: Box::new(Plan::Scalar(ScalarVal::Fixed(Some(1)), "X".into(), None, ScalarTy::int64())),
         };
         assert_eq!(stmt_type_of(&upsert), 2);
         assert_eq!(stmt_type_of(&insel), 2);
@@ -51664,7 +51867,7 @@ mod tests {
                 table: "DST".into(),
                 cols: vec!["X".into()],
                 ov: Overriding::None,
-                src: Box::new(Plan::Scalar(ScalarVal::Fixed(Some(1)), "X".into(), None)),
+                src: Box::new(Plan::Scalar(ScalarVal::Fixed(Some(1)), "X".into(), None, ScalarTy::int64())),
             })),
             1
         );

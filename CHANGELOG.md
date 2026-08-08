@@ -13,6 +13,55 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-08 — an aggregate says its source's type
+
+### Converted
+- **MIN and MAX describe their SOURCE column's type** — over an
+  INTEGER they announce 496 LONG, over a SMALLINT 500 SHORT — where
+  every `Plan::Scalar` used to announce the fold's own BIGINT (581).
+  Measured shape by shape: SUM and AVG genuinely widen to INT64;
+  **COUNT is INT64 and the one aggregate the engine announces NOT
+  NULLABLE** (580 even); an aggregate inside arithmetic widens. The
+  plan carries a `ScalarTy` now, the describe builds from it, and
+  **the announced type decides the wire slot** — a MAX that said LONG
+  travels in XDR's 4-byte slot, because saying one thing and sending
+  another desyncs every driver.
+
+### Gated
+- `qa/serve-real-aggdescribe.sh` (new, 8): the SQLDA_DISPLAY lines and
+  the fetched rows compared together, per shape.
+
+## 2026-08-08 — an argument in its own words
+
+### Converted
+- **Text arguments to procedures**, lifting the previous increment's
+  boundary. The obstacle was never the types — it was the SPLIT:
+  `PT('a,b')` carries a comma INSIDE the literal, and both call sites
+  read arguments with a naive `split(',')`. A quote-aware tokenizer
+  (`parse_call_args`) now serves both shapes: NULL, integers, 'text'
+  with the doubled-quote escape, and `?` where placeholders are legal.
+- **The binding is shared by BOTH executor paths** (`bind_proc_args`,
+  used by the stored-BLR runner and the source interpreter — or the
+  two would disagree about one call), and it keeps the measured laws:
+  a CHAR parameter PADS its argument to declared width; an overlong
+  one raises the LOCATIONLESS 22001 truncation vector naming expected
+  and actual lengths; NULL passes into any type; a CROSS-TYPE argument
+  refuses where the engine would convert ('12' into an INTEGER
+  parameter) — a conversion this surface has not measured.
+- **A selectable body's error is ANNOUNCED, then RAISED AT FETCH** —
+  the engine runs those bodies lazily, so the column header goes out
+  before the vector (measured with the truncation raise). The execute
+  arm defers a typed body error into the cursor
+  (`Plan::RefusedEval` now raises its OWN vector at the fetch instead
+  of collapsing to a generic conversion error); `EXECUTE PROCEDURE`
+  raises immediately, as the engine does — no cursor, no deferral.
+
+### Gated
+- `qa/serve-real-procdescribe.sh` 7 → 13: the input-refusal boundary
+  FLIPPED to a binding check, plus the comma-in-literal, escape,
+  CHAR-pad (raw bytes), both truncation shapes, and the cross-type
+  refusal boundary.
+
 ## 2026-08-08 — a procedure says what it declared
 
 ### Converted
