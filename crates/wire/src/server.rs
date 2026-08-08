@@ -60,6 +60,9 @@ const OP_INFO_DATABASE: i32 = 40;
 /// which libfbclient turns into a teardown SEGFAULT.
 const OP_INFO_TRANSACTION: i32 = 42;
 const OP_INFO_SQL: i32 = 70;
+const OP_PREPARE_TX: i32 = 32; // op_prepare - two-phase commit, phase one
+const OP_RECONNECT: i32 = 33; // op_reconnect - pick a limbo transaction back up
+const OP_PREPARE2: i32 = 51; // op_prepare with a TDR message
 const OP_OPEN_BLOB: i32 = 35;
 const OP_GET_SEGMENT: i32 = 36;
 const OP_CLOSE_BLOB: i32 = 39;
@@ -303,6 +306,16 @@ const GDS_WISH_LIST: i32 = 335544378;
 /// the database it was given (the real server answers exactly this for a
 /// file its own user cannot read).
 const GDS_IO_ERROR: i32 = 335544344;
+/// "invalid database handle (no active connection)"
+const GDS_BAD_DB_HANDLE: i32 = 335544324;
+/// "transaction is not in limbo" - reconnecting an id that is not one
+const GDS_NO_RECON: i32 = 335544353;
+/// "transaction @1 is @2" - the second item of the bad-reconnect pair
+const GDS_TRA_STATE: i32 = 335544468;
+/// "no transaction for request" - a statement under a PREPARED transaction
+const GDS_REQ_NO_TRANS: i32 = 335544363;
+/// "record from transaction @1 is stuck in limbo" - the reader's law
+const GDS_REC_IN_LIMBO: i32 = 335544459;
 /// isc_primary_key_required - "Primary key required on table @1"
 /// (SQLSTATE 22000): UPDATE OR INSERT without MATCHING on a PK-less
 /// table, raised at prepare exactly as the engine raises it
@@ -1573,6 +1586,58 @@ impl Database {
         Ok(())
     }
 
+    /// PREPARE - the first phase of a two-phase commit (TRA_prepare):
+    /// every id this transaction wrote under goes to `tra_limbo` ON THE
+    /// DISK, because the whole point of limbo is surviving the death of
+    /// the process that prepared it. A transaction that never reserved
+    /// an id reserves one now - measured: a no-write prepare still
+    /// lists in limbo. `touched` is left SET, so the commit or rollback
+    /// that later resolves it cannot be skipped by the nothing-to-do
+    /// guard.
+    fn prepare_tx(&mut self) -> Result<(), String> {
+        self.take_write_side()?;
+        let mut work = self.bytes().as_ref().clone();
+        if self.tx.is_none() {
+            let tx = fire_crab_ods::dml::begin_active_tx(&mut work, self.page_size)?;
+            if tx > u32::MAX as u64 {
+                return Err("64-bit transaction ids (rhde) not supported yet".into());
+            }
+            self.adopt_tx(tx as u32);
+        }
+        for tx in self.all_tx() {
+            fire_crab_ods::dml::set_tx_state(
+                &mut work,
+                self.page_size,
+                tx as u64,
+                fire_crab_ods::tip::TxState::Limbo,
+            )?;
+        }
+        self.flush_and_install(work)?;
+        self.touched = true;
+        Ok(())
+    }
+
+    /// Resolve a RECONNECTED limbo transaction - somebody else's id,
+    /// not this attachment's: flip its TIP state and flush. A commit
+    /// makes its rows count; a rollback marks it dead and the sweep
+    /// collects the versions later, exactly as an ordinary rollback-by-
+    /// state does.
+    fn resolve_tx(&mut self, id: u64, commit: bool) -> Result<(), String> {
+        self.take_write_side()?;
+        let mut work = self.bytes().as_ref().clone();
+        fire_crab_ods::dml::set_tx_state(
+            &mut work,
+            self.page_size,
+            id,
+            if commit {
+                fire_crab_ods::tip::TxState::Committed
+            } else {
+                fire_crab_ods::tip::TxState::Dead
+            },
+        )?;
+        self.flush_and_install(work)
+    }
+
     /// After an image was restored over this transaction's work: the
     /// restored header may predate the id this attachment reserved, and
     /// writing more records under a number the file has not handed out
@@ -2247,6 +2312,21 @@ fn serve_service(
                         }
                         respond_error(s, enc, gds)?;
                     }
+                    Err(SpecialErr::Limbo(id)) => {
+                        // the engine's backup dies mid-stream on the
+                        // limbo record; the vector is the reader's own
+                        if std::env::var("FC_SRV_TRACE").is_ok() {
+                            eprintln!("[srv] op_service_start REFUSED: limbo {}", id);
+                        }
+                        let mut w = W::default();
+                        w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+                        w.int(1) // isc_arg_gds
+                            .int(GDS_REC_IN_LIMBO)
+                            .int(4) // isc_arg_number
+                            .int(id as i32)
+                            .int(0); // isc_arg_end
+                        w.send(s, enc)?;
+                    }
                     Err(SpecialErr::DbExists(db)) => {
                         // gbak's own pair, measured with the rc taken
                         // from fbsvcmgr itself: isc_gbak_db_exists
@@ -2316,6 +2396,9 @@ fn server_info() -> fire_crab_svc::ServerInfo {
 enum SpecialErr {
     Plain(i32),
     DbExists(String),
+    /// `isc_rec_in_limbo` naming the transaction - what a backup that
+    /// meets an unresolved two-phase commit answers
+    Limbo(u64),
 }
 
 /// [run_service_action], with the OLD protocol in front: when the start
@@ -2421,7 +2504,6 @@ fn run_gbak_cmdline(action: u8, args: &[String], verbose: bool) -> Result<String
     if action == fire_crab_svc::action::BACKUP {
         let empty = fire_crab_svc::Buffer { version: None, items: Vec::new() };
         run_gbak_backup_at(&empty, positionals[0], positionals[1], verbose)
-            .map_err(SpecialErr::Plain)
     } else {
         // the positionals REVERSE for a restore: <file> then <database>
         // (the core takes database first)
@@ -2450,7 +2532,7 @@ fn run_service_action(spb: &[u8]) -> Result<String, SpecialErr> {
     })?;
     let action = b.items.first().map(|c| c.tag).unwrap_or(0);
     if action == fire_crab_svc::action::BACKUP {
-        return run_gbak_backup(&b).map_err(SpecialErr::Plain);
+        return run_gbak_backup(&b);
     }
     if action == fire_crab_svc::action::RESTORE {
         return run_gbak_restore_inner(&b).map_err(|e| match e {
@@ -2535,9 +2617,13 @@ fn run_service_action(spb: &[u8]) -> Result<String, SpecialErr> {
 /// takes; the SURFACE check is inside the writer, fail-closed - a
 /// database holding anything the format writer cannot carry refuses the
 /// WHOLE backup, because a backup missing tables is worse than none.
-fn run_gbak_backup(b: &fire_crab_svc::Buffer) -> Result<String, i32> {
-    let db = b.text(fire_crab_svc::spb::DBNAME).ok_or(GDS_WISH_LIST)?;
-    let file = b.text(fire_crab_svc::bkp::FILE).ok_or(GDS_WISH_LIST)?;
+fn run_gbak_backup(b: &fire_crab_svc::Buffer) -> Result<String, SpecialErr> {
+    let db = b
+        .text(fire_crab_svc::spb::DBNAME)
+        .ok_or(SpecialErr::Plain(GDS_WISH_LIST))?;
+    let file = b
+        .text(fire_crab_svc::bkp::FILE)
+        .ok_or(SpecialErr::Plain(GDS_WISH_LIST))?;
     let verbose = b.first(fire_crab_svc::spb::VERBOSE).is_some();
     run_gbak_backup_at(b, &db, &file, verbose)
 }
@@ -2547,7 +2633,7 @@ fn run_gbak_backup_at(
     db: &str,
     file: &str,
     verbose: bool,
-) -> Result<String, i32> {
+) -> Result<String, SpecialErr> {
     let db = db.to_string();
     let file = file.to_string();
     // options this writer cannot honour refuse rather than being
@@ -2566,13 +2652,13 @@ fn run_gbak_backup_at(
         if std::env::var("FC_SRV_TRACE").is_ok() {
             eprintln!("[srv] gbak backup: an unsupported option refuses");
         }
-        return Err(GDS_WISH_LIST);
+        return Err(SpecialErr::Plain(GDS_WISH_LIST));
     }
-    let shared = fire_crab_cch::pool::open(&db).ok_or(GDS_IO_ERROR)?;
+    let shared = fire_crab_cch::pool::open(&db).ok_or(SpecialErr::Plain(GDS_IO_ERROR))?;
     let image = shared.image();
     let page_size = fire_crab_ods::header::HeaderPage::decode(&image)
         .map(|h| h.page_size as usize)
-        .ok_or(GDS_IO_ERROR)?;
+        .ok_or(SpecialErr::Plain(GDS_IO_ERROR))?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -2598,7 +2684,17 @@ fn run_gbak_backup_at(
             if std::env::var("FC_SRV_TRACE").is_ok() {
                 eprintln!("[srv] gbak backup refused: {}", e.0);
             }
-            GDS_WISH_LIST
+            // the limbo refusal is TYPED: the engine's backup answers
+            // isc_rec_in_limbo naming the transaction, not a wish-list
+            match e
+                .0
+                .strip_prefix("record from transaction ")
+                .and_then(|r| r.strip_suffix(" is stuck in limbo"))
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                Some(id) => SpecialErr::Limbo(id),
+                None => SpecialErr::Plain(GDS_WISH_LIST),
+            }
         })?;
     if verbose {
         log.append(&mut body);
@@ -2611,10 +2707,12 @@ fn run_gbak_backup_at(
         if std::env::var("FC_SRV_TRACE").is_ok() {
             eprintln!("[srv] gbak backup cannot create {}: {}", file, e);
         }
-        GDS_IO_ERROR
+        SpecialErr::Plain(GDS_IO_ERROR)
     })?;
     use std::io::Write as _;
-    out.write_all(&fbk).and_then(|_| out.sync_all()).map_err(|_| GDS_IO_ERROR)?;
+    out.write_all(&fbk)
+        .and_then(|_| out.sync_all())
+        .map_err(|_| SpecialErr::Plain(GDS_IO_ERROR))?;
     if std::env::var("FC_SRV_TRACE").is_ok() {
         eprintln!("[srv] gbak backup: {} bytes to {}", fbk.len(), file);
     }
@@ -3449,7 +3547,7 @@ impl RowSource {
                 // rest of the relation and discarding it
                 let mut flow = Flow::Continue;
                 let mut err: Option<EvalErr> = None;
-                for_each_record_while(db, *rel, formats, |values| {
+                let limbo = for_each_record_while(db, *rel, formats, |values| {
                     let mut row = values.to_vec();
                     if let Some(w) = width {
                         row.resize(*w, Value::Null);
@@ -3465,6 +3563,9 @@ impl RowSource {
                         }
                     }
                 });
+                if limbo != 0 && err.is_none() {
+                    err = Some(EvalErr::RecInLimbo(limbo));
+                }
                 match err {
                     Some(e) => Err(e),
                     None => Ok(flow),
@@ -24497,6 +24598,10 @@ fn records_at_in(
 struct ReadView<'a> {
     tips: Option<fire_crab_ods::tra::TipChain<'a>>,
     own: fire_crab_ods::tra::OwnTx,
+    /// the first LIMBO transaction a walk met (0 = none): the walkers
+    /// stop on it and their callers raise `isc_rec_in_limbo` - walking
+    /// past would silently hide a row the engine refuses to adjudicate
+    limbo: std::cell::Cell<u64>,
 }
 
 impl<'a> ReadView<'a> {
@@ -24511,6 +24616,7 @@ impl<'a> ReadView<'a> {
         ReadView {
             tips: fire_crab_ods::tra::TipChain::read(image, page_size),
             own,
+            limbo: std::cell::Cell::new(0),
         }
     }
 
@@ -24533,8 +24639,15 @@ impl<'a> ReadView<'a> {
             return None;
         }
         match &self.tips {
-            Some(tips) => fire_crab_ods::tra::visible_version(bytes, page_size, r, tips, &self.own)
-                .map(|v| (v.image, v.format)),
+            Some(tips) => match fire_crab_ods::tra::visible_version_2pc(
+                bytes, page_size, r, tips, &self.own, true,
+            ) {
+                Ok(v) => v.map(|v| (v.image, v.format)),
+                Err(id) => {
+                    self.limbo.set(id);
+                    None
+                }
+            },
             None => {
                 if !r.is_primary_record() {
                     return None;
@@ -24602,20 +24715,24 @@ fn records_at_in_with(
 /// READ, never what is ANSWERED, so a stale entry costs a wasted fetch
 /// and a missed entry is the only way to be wrong - which is why
 /// `choose_index` is narrow about the keys it will build.
+/// Returns the LIMBO transaction a natural walk stopped on (0 = none) -
+/// see [for_each_record_while]. An INDEX walk does not detect limbo yet
+/// (records_for materialises through its own view); the natural walk is
+/// where the gate's law lives, and the boundary is recorded there.
 fn for_each_candidate<F: FnMut(&[Value])>(
     db: &Database,
     rel: u16,
     formats: &[(u8, Vec<Descriptor>)],
     index: &Option<IndexAccess>,
     mut f: F,
-) {
+) -> u64 {
     let Some(access) = index else {
-        for_each_record(db, rel, formats, f);
-        return;
+        return for_each_record(db, rel, formats, f);
     };
     for values in records_for(db, rel, formats, access) {
         f(&values);
     }
+    0
 }
 
 /// [for_each_record], with a walk the consumer can END.
@@ -24626,12 +24743,15 @@ fn for_each_candidate<F: FnMut(&[Value])>(
 /// and has 23 callers that do not care, so this is the one that can
 /// stop and that one delegates to it. Same page walk, same record
 /// filtering, one extra question per row.
+/// Returns the LIMBO transaction the walk stopped on, 0 when none: a
+/// record in limbo ends the scan exactly where the engine's does, and
+/// the caller raises `isc_rec_in_limbo` naming it.
 fn for_each_record_while<F: FnMut(&[Value]) -> Flow>(
     db: &Database,
     rel: u16,
     formats: &[(u8, Vec<Descriptor>)],
     mut f: F,
-) {
+) -> u64 {
     let db_image = db.bytes();
     let view = ReadView::of(db, &db_image);
     for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
@@ -24644,13 +24764,17 @@ fn for_each_record_while<F: FnMut(&[Value]) -> Flow>(
         };
         for r in dp.records() {
             let Some(values) = view.values(&db_image, db.page_size, formats, &r) else {
+                if view.limbo.get() != 0 {
+                    return view.limbo.get();
+                }
                 continue;
             };
             if matches!(f(&values), Flow::Stop) {
-                return;
+                return 0;
             }
         }
     }
+    0
 }
 
 /// Rows of `rel` this attachment counts - the decode-free walk behind
@@ -24682,12 +24806,16 @@ fn count_visible_records(db: &Database, rel: u16) -> i64 {
     n
 }
 
+/// Returns the LIMBO transaction the walk stopped on, 0 when none -
+/// the same law as [for_each_record_while]. The catalog walks among
+/// its callers ignore the return, rightly: a user transaction cannot
+/// leave system rows in limbo.
 fn for_each_record<F: FnMut(&[Value])>(
     db: &Database,
     rel: u16,
     formats: &[(u8, Vec<Descriptor>)],
     mut f: F,
-) {
+) -> u64 {
     let db_image = db.bytes();
     let view = ReadView::of(db, &db_image);
     for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
@@ -24700,11 +24828,15 @@ fn for_each_record<F: FnMut(&[Value])>(
         };
         for r in dp.records() {
             let Some(values) = view.values(&db_image, db.page_size, formats, &r) else {
+                if view.limbo.get() != 0 {
+                    return view.limbo.get();
+                }
                 continue;
             };
             f(&values);
         }
     }
+    0
 }
 
 /// Compute the joined rows: a nested-loop equi-join. Each side's
@@ -26066,6 +26198,12 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(ISC_ARG_NUMBER)
                 .int(*n as i32);
         }
+        EvalErr::RecInLimbo(id) => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_REC_IN_LIMBO)
+                .int(ISC_ARG_NUMBER)
+                .int(*id as i32);
+        }
         EvalErr::PrimaryKeyRequired(table) => {
             w.int(1) // isc_arg_gds
                 .int(GDS_DSQL_ERROR)
@@ -26791,7 +26929,7 @@ fn emit_rows_inner(
                     // handed back for the caller to persist.
                     let mut rows: Vec<Vec<Value>> = Vec::new();
                     let mut ferr: Option<EvalErr> = None;
-                    for_each_candidate(db, *rel, formats, index, |values| {
+                    let limbo = for_each_candidate(db, *rel, formats, index, |values| {
                         if ferr.is_some() {
                             return;
                         }
@@ -26801,6 +26939,9 @@ fn emit_rows_inner(
                             Err(e) => ferr = Some(e),
                         }
                     });
+                    if limbo != 0 && ferr.is_none() {
+                        ferr = Some(EvalErr::RecInLimbo(limbo));
+                    }
                     if let Some(e) = ferr {
                         return Err(EmitErr::Eval(e));
                     }
@@ -26824,7 +26965,7 @@ fn emit_rows_inner(
                     // (divide by zero, a failed cast) stops the walk and is
                     // reported after it
                     let mut eval_err: Option<EvalErr> = None;
-                    for_each_candidate(db, *rel, formats, index, |values| {
+                    let limbo = for_each_candidate(db, *rel, formats, index, |values| {
                         if eval_err.is_some() {
                             return;
                         }
@@ -26838,6 +26979,9 @@ fn emit_rows_inner(
                             Err(e) => eval_err = Some(e),
                         }
                     });
+                    if limbo != 0 && eval_err.is_none() {
+                        eval_err = Some(EvalErr::RecInLimbo(limbo));
+                    }
                     if let Some(e) = eval_err {
                         return Err(EmitErr::Eval(e));
                     }
@@ -30079,6 +30223,12 @@ enum EvalErr {
     /// failure yet, so those two shapes are a boundary rather than a
     /// guess.
     ReadOnlyDatabase { dsql: bool },
+    /// a reader MET a record whose transaction is PREPARED and
+    /// unresolved: `isc_rec_in_limbo` naming the transaction (SQLSTATE
+    /// HY000, "record from transaction @1 is stuck in limbo"). Walking
+    /// past it would be a wrong answer - the row is neither there nor
+    /// not-there until somebody resolves the two-phase commit.
+    RecInLimbo(u64),
     /// a scalar subquery answered MORE THAN ONE ROW - the engine's
     /// `isc_sing_select_err`, "multiple rows in singleton select"
     /// (SQLSTATE 21000). Taking the first row would be a wrong answer
@@ -40802,6 +40952,11 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // KEEPS the mark; RELEASE forgets the mark but keeps the work. Both
     // discard the marks made AFTER the named one.
     let mut savepoints: Vec<(String, std::sync::Arc<Vec<u8>>)> = Vec::new();
+    // TWO-PHASE COMMIT state: this connection's transaction has been
+    // PREPARED (limbo on disk; only commit/rollback may follow), or
+    // this connection RECONNECTED somebody else's limbo id to resolve
+    let mut prepared = false;
+    let mut reconnected: Option<u64> = None;
     // THE AUXILIARY CONNECTION, in the two halves it arrives in: the
     // listener `op_connect_request` opens and hands the client a port
     // for, and the socket the client then connects on - accepted
@@ -40955,6 +41110,13 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     respond_kicked(&mut s, &mut enc)?;
                     continue;
                 }
+                // a PREPARED transaction takes no more statements - only
+                // its commit or rollback (measured: "no transaction for
+                // request", and the limbo entry survives the refusal)
+                if prepared {
+                    respond_error(&mut s, &mut enc, GDS_REQ_NO_TRANS)?;
+                    continue;
+                }
                 // the lexer refuses before anything is planned or written
                 // (see [has_unknown_space])
                 if has_unknown_space(&text) {
@@ -41035,6 +41197,11 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 // kicked by a forced shutdown: the engine's vector, no work
                 if database.as_ref().is_some_and(|d| d.kicked()) {
                     respond_kicked(&mut s, &mut enc)?;
+                    continue;
+                }
+                // a PREPARED transaction takes no more statements
+                if prepared {
+                    respond_error(&mut s, &mut enc, GDS_REQ_NO_TRANS)?;
                     continue;
                 }
                 // the lexer refuses before anything is planned or written
@@ -41374,6 +41541,11 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 // kicked by a forced shutdown: the engine's vector, no work
                 if database.as_ref().is_some_and(|d| d.kicked()) {
                     respond_kicked(&mut s, &mut enc)?;
+                    continue;
+                }
+                // a PREPARED transaction takes no more statements
+                if prepared {
+                    respond_error(&mut s, &mut enc, GDS_REQ_NO_TRANS)?;
                     continue;
                 }
                 // the client must supply exactly the parameters the
@@ -42275,8 +42447,104 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 event_session = None;
                 respond(&mut s, &mut enc, 0)?;
             }
+            x if x == OP_PREPARE_TX || x == OP_PREPARE2 => {
+                read_int(&mut s, &mut dec)?; // tr
+                let msg = if x == OP_PREPARE2 {
+                    read_wire_bytes(&mut s, &mut dec)?
+                } else {
+                    Vec::new()
+                };
+                // a DDL transaction's undo is an image in THIS process's
+                // memory - it cannot survive the death limbo promises to
+                // survive, so it refuses rather than half-promises
+                if database.as_ref().is_some_and(|d| d.ddl_undo || d.image_undo) {
+                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!("[srv] op_prepare on a DDL transaction refused");
+                    }
+                    respond_error(&mut s, &mut enc, GDS_WISH_LIST)?;
+                    continue;
+                }
+                match database.as_mut().map(|d| d.prepare_tx()) {
+                    Some(Ok(())) => {
+                        // the TDR message (host/db description) is set
+                        // aside, like a privilege record: the limbo
+                        // LIST is the answer, the description is
+                        // metadata this server does not store
+                        if std::env::var("FC_SRV_TRACE").is_ok() {
+                            eprintln!(
+                                "[srv] op_prepare{}: transaction in limbo ({} TDR bytes set aside)",
+                                if x == OP_PREPARE2 { "2" } else { "" },
+                                msg.len()
+                            );
+                        }
+                        prepared = true;
+                        respond(&mut s, &mut enc, 0)?;
+                    }
+                    Some(Err(e)) => {
+                        if std::env::var("FC_SRV_TRACE").is_ok() {
+                            eprintln!("[srv] op_prepare failed: {}", e);
+                        }
+                        respond_error(&mut s, &mut enc, GDS_IO_ERROR)?;
+                    }
+                    None => respond_error(&mut s, &mut enc, GDS_BAD_DB_HANDLE)?,
+                }
+            }
+            x if x == OP_RECONNECT => {
+                read_int(&mut s, &mut dec)?; // db handle
+                let idb = read_wire_bytes(&mut s, &mut dec)?; // the id, VAX/LE
+                let mut id = 0u64;
+                for (k, b) in idb.iter().enumerate().take(8) {
+                    id |= (*b as u64) << (8 * k);
+                }
+                let in_limbo = database.as_ref().is_some_and(|d| {
+                    fire_crab_ods::tra::limbo_ids(&d.bytes(), d.page_size).contains(&id)
+                });
+                if !in_limbo {
+                    // the engine's own pair: "transaction is not in
+                    // limbo" + "transaction @1 is @2" (ill-defined) -
+                    // measured through isc_reconnect_transaction
+                    let mut w = W::default();
+                    w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+                    w.int(1) // isc_arg_gds
+                        .int(GDS_NO_RECON)
+                        .int(1) // isc_arg_gds
+                        .int(GDS_TRA_STATE)
+                        .int(4) // isc_arg_number - the id
+                        .int(id as i32)
+                        .int(2) // isc_arg_string
+                        .bytes(b"in an ill-defined state")
+                        .int(0);
+                    w.send(&mut s, &mut enc)?;
+                    continue;
+                }
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] op_reconnect: limbo transaction {}", id);
+                }
+                reconnected = Some(id);
+                respond(&mut s, &mut enc, 1)?; // the reconnected handle
+            }
             x if x == OP_COMMIT || x == OP_ROLLBACK => {
                 read_int(&mut s, &mut dec)?; // tr
+                // A RECONNECTED LIMBO TRANSACTION: the commit or
+                // rollback IS the resolution - somebody else's id, so
+                // none of this connection's own machinery applies
+                if let Some(id) = reconnected.take() {
+                    match database.as_mut().map(|d| d.resolve_tx(id, x == OP_COMMIT)) {
+                        Some(Ok(())) => {
+                            if std::env::var("FC_SRV_TRACE").is_ok() {
+                                eprintln!(
+                                    "[srv] limbo {} resolved: {}",
+                                    id,
+                                    if x == OP_COMMIT { "committed" } else { "rolled back" }
+                                );
+                            }
+                            respond(&mut s, &mut enc, 0)?;
+                        }
+                        _ => respond_error(&mut s, &mut enc, GDS_IO_ERROR)?,
+                    }
+                    continue;
+                }
+                prepared = false;
                 // ending the transaction discards every mark, the same
                 // way the `COMMIT`/`ROLLBACK` statements do - and the
                 // generator windows are stacked one per mark, so the two
@@ -42379,6 +42647,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 let ctx = DbInfoCtx {
                     db_path: db_path.clone(),
                     attach_id,
+                    limbo: database
+                        .as_ref()
+                        .map(|d| fire_crab_ods::tra::limbo_ids(&d.bytes(), d.page_size))
+                        .unwrap_or_default(),
                     ods_major: database.as_ref().map_or(14, |d| d.ods_major),
                     ods_minor: database.as_ref().map_or(0, |d| d.ods_minor),
                     page_size: database.as_ref().map_or(8192, |d| d.page_size as u32),
@@ -42595,6 +42867,11 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 if database.as_ref().is_some_and(|d| d.kicked()) {
                     let _ = (&exec2_args, &out_fmt);
                     respond_kicked(&mut s, &mut enc)?;
+                    continue;
+                }
+                // a PREPARED transaction takes no more statements
+                if prepared {
+                    respond_error(&mut s, &mut enc, GDS_REQ_NO_TRANS)?;
                     continue;
                 }
                 // A singleton execute: EXECUTE PROCEDURE with output
@@ -42864,7 +43141,20 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
         // the file for ever, which is not a wrong answer (nobody counts
         // an active transaction's rows) but is a transaction that never
         // ends, and the engine's sweep waits behind it.
-        if !db.all_tx().is_empty() {
+        // ...UNLESS IT IS PREPARED. Surviving exactly this death is
+        // what the first phase of a two-phase commit PROMISES: the
+        // limbo state is already on the disk, and killing it here
+        // would resolve a transaction whose resolution belongs to
+        // whoever reconnects it (gfix -commit/-rollback).
+        if prepared {
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                eprintln!("[srv] detach with a PREPARED transaction - left in limbo");
+            }
+            // the TIP already says limbo; what goes back is only the
+            // in-memory side - the write right and the row locks, which
+            // die with the process anyway and must not outlive it here
+            db.end_write();
+        } else if !db.all_tx().is_empty() {
             if std::env::var("FC_SRV_TRACE").is_ok() {
                 eprintln!("[srv] detach with an open transaction - marking it dead");
             }
@@ -43895,6 +44185,13 @@ fn build_db_info(items: &[u8], ctx: &DbInfoCtx) -> Vec<u8> {
                 out.extend_from_slice(&1u16.to_le_bytes());
                 out.push(3);
             }
+            16 => {
+                // isc_info_limbo: ONE CLUSTER PER LIMBO TRANSACTION,
+                // absent when there are none (INF_database_info's walk)
+                for id in &ctx.limbo {
+                    put_int(&mut out, 16, *id as i32);
+                }
+            }
             32 => put_int(&mut out, 32, ctx.ods_major as i32), // isc_info_ods_version
             33 => put_int(&mut out, 33, ctx.ods_minor as i32), // isc_info_ods_minor_version
             14 => put_int(&mut out, 14, ctx.page_size as i32), // isc_info_page_size
@@ -43954,6 +44251,9 @@ fn build_db_info(items: &[u8], ctx: &DbInfoCtx) -> Vec<u8> {
 struct DbInfoCtx {
     db_path: String,
     attach_id: i32,
+    /// every transaction the TIP holds in limbo - `isc_info_limbo` (16)
+    /// answers one cluster per id, which is how `gfix -list` finds them
+    limbo: Vec<u64>,
     ods_major: u16,
     ods_minor: u16,
     page_size: u32,
@@ -47733,6 +48033,7 @@ mod tests {
     fn dbctx() -> DbInfoCtx {
         #[allow(clippy::needless_update)]
         DbInfoCtx {
+            limbo: Vec::new(),
             val_counts: None,
             read_only: false,
             db_path: "/tmp/x.fdb".into(),

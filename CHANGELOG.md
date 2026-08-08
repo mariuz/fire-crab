@@ -13,6 +13,49 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-08 — a transaction that survives its own death
+
+### Converted
+- **Two-phase commit, and the LIMBO it leaves.** `op_prepare` (32) /
+  `op_prepare2` (51 — the form the client always sends, the TDR
+  message set aside like a privilege record): every id the transaction
+  wrote under goes to `tra_limbo` ON THE DISK, and the detach cleanup
+  now leaves a prepared transaction alone — surviving exactly that
+  death is what the first phase promises. A no-write prepare reserves
+  an id and goes to limbo too (measured). `op_reconnect` (33) picks a
+  limbo id back up — the id rides VAX/LE in the TPB slot — and the
+  commit or rollback that follows IS the resolution, which is how
+  `gfix -commit`/`-rollback` work unchanged; `gfix -list` reads
+  `isc_info_limbo` (16), one cluster per id.
+- **A reader that MEETS a limbo record RAISES** `isc_rec_in_limbo`
+  naming the transaction — the row is neither there nor not-there
+  until somebody resolves it, and walking past would be a silent wrong
+  answer. The strict walk lives in `ods::tra` (`visible_*_2pc`); the
+  scan paths (row-source TableScan and the legacy emit walkers) stop
+  on the hit and ship the typed vector; settled rows BEFORE the limbo
+  record still arrive, exactly as the engine delivers them. gbak dies
+  on the same law (`SpecialErr::Limbo`), and a statement under a
+  PREPARED transaction refuses with "no transaction for request",
+  the limbo surviving the refusal.
+
+### Guarded
+- Reconnecting an id that is NOT in limbo answers the engine's own
+  pair: "transaction is not in limbo" + "transaction @1 is in an
+  ill-defined state". A DDL transaction's prepare refuses — its undo
+  is an image in this process's memory, which cannot survive the death
+  limbo promises to survive. Recorded boundaries: the COUNT(*) fold
+  and an INDEX-driven scan do not detect limbo yet (natural scans do),
+  and the TDR description is not stored (gfix -list shows the bare
+  line).
+
+### Gated
+- `qa/serve-real-limbo.sh` (new, 13): isql cannot speak 2PC, so the
+  gate compiles its own client (`qa/fb2pc.c`, libfbclient) and runs it
+  against BOTH servers — prepare-and-die, gfix -list, info clusters,
+  the reader raise (byte-compared modulo the id), the gbak death, the
+  statement refusal, resolve by commit and by gfix -rollback, and the
+  bad-reconnect pair. Skips when no cc/libfbclient.
+
 ## 2026-08-08 — the commentary is part of the protocol
 
 ### Converted

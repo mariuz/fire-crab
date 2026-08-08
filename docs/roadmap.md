@@ -2747,8 +2747,19 @@ plus *the subsystem is now on the path*.
   the recorded boundary (engine 296, fc 1). 12 checks in
   `qa/serve-real-validate.sh`.
 
-  What is left of gfix is the limbo-transaction switches, which need
-  two-phase commit first.
+  **The limbo switches are DONE, and two-phase commit under them**
+  (`qa/serve-real-limbo.sh`, 13 checks, its client compiled from
+  qa/fb2pc.c because isql cannot speak 2PC): op_prepare/op_prepare2
+  write tra_limbo to the disk and the detach cleanup leaves a prepared
+  transaction alone; op_reconnect + commit/rollback resolve it, which
+  is all gfix -commit/-rollback/-list are; a reader meeting a limbo
+  record raises isc_rec_in_limbo naming the transaction, gbak dies on
+  the same law, and a statement under a prepared transaction refuses
+  with the limbo intact. Boundaries: COUNT(*)/index scans do not
+  detect limbo yet; the TDR description is set aside; a DDL
+  transaction's prepare refuses (its undo is an in-memory image).
+  With this, EVERY gfix FAMILY the tool ships is either converted or
+  typed-refused.
 
   **nbackup as a service is DONE for level 0**
   (`qa/serve-real-nbackup.sh`, 15 checks): `isc_action_svc_nbak`/`nrest`,

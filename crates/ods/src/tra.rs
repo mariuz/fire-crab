@@ -208,6 +208,23 @@ pub fn visible_version(
     tips: &TipChain,
     own: &OwnTx,
 ) -> Option<VisibleVersion> {
+    visible_version_2pc(file, page_size, head, tips, own, false).unwrap_or(None)
+}
+
+/// [visible_version] with the engine's LIMBO law: a reader that MEETS a
+/// version whose transaction is in limbo does not walk past it - it
+/// RAISES `isc_rec_in_limbo` naming the transaction (vio.cpp's
+/// tra_limbo arm; only `isc_tpb_ignore_limbo`, which nothing here
+/// speaks yet, walks past). `strict` false is the old walk - what the
+/// tools that must read a wrecked file want.
+pub fn visible_version_2pc(
+    file: &[u8],
+    page_size: usize,
+    head: &crate::data::RecordHeader,
+    tips: &TipChain,
+    own: &OwnTx,
+    strict: bool,
+) -> Result<Option<VisibleVersion>, u64> {
     let fetch_page = |no: u32| {
         let start = no as usize * page_size;
         file.get(start..start + page_size)
@@ -235,36 +252,69 @@ pub fn visible_version(
             || own.contains(current.transaction);
         if counts {
             if current.flags & flags::DELETED != 0 {
-                return None; // the reader's row is a deleted stub
+                return Ok(None); // the reader's row is a deleted stub
             }
-            return Some(VisibleVersion {
-                image: image?,
-                format: current.format,
-                walked,
-                deltas,
+            return Ok(match image {
+                Some(image) => Some(VisibleVersion {
+                    image,
+                    format: current.format,
+                    walked,
+                    deltas,
+                }),
+                None => None,
             });
+        }
+        if strict
+            && !own.contains(current.transaction)
+            && tips.state(current.transaction) == Some(TxState::Limbo)
+        {
+            return Err(current.transaction);
         }
         // not counted: step to the back version
         if current.back_page == 0 {
-            return None; // an insert this reader does not count
+            return Ok(None); // an insert this reader does not count
         }
-        let back = fetch_page(current.back_page)?.record(current.back_line)?;
+        let Some(back) = fetch_page(current.back_page).and_then(|p| p.record(current.back_line))
+        else {
+            return Ok(None);
+        };
         // ASSEMBLED. A fragmented BACK version used to end the walk,
         // dropping the row even when the primary was perfectly
         // readable - and the delta path below would then have applied
         // against an image that was never fetched.
-        let back_data = crate::data::assembled_image(file, page_size, &back)?;
+        let Some(back_data) = crate::data::assembled_image(file, page_size, &back) else {
+            return Ok(None);
+        };
         image = if current.flags & flags::DELTA != 0 {
             // prior version stored as differences against the CURRENT
             // image (ods.h:1012)
             deltas += 1;
-            Some(apply_differences(&back_data, image.as_deref()?)?)
+            match image.as_deref().and_then(|i| apply_differences(&back_data, i)) {
+                Some(applied) => Some(applied),
+                None => return Ok(None),
+            }
         } else {
             Some(back_data)
         };
         current = back;
         walked += 1;
     }
+}
+
+/// Every transaction the inventory holds in LIMBO, oldest first - what
+/// `isc_info_limbo` answers one cluster per id, and what `gfix -list`
+/// prints. The range is 1..the header's next id (offset 40, u64 LE).
+pub fn limbo_ids(file: &[u8], page_size: usize) -> Vec<u64> {
+    let Some(tips) = TipChain::read(file, page_size) else {
+        return Vec::new();
+    };
+    let next = file
+        .get(40..48)
+        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+        .unwrap_or(0);
+    (1..=next)
+        .filter(|id| tips.state(*id) == Some(TxState::Limbo))
+        .collect()
 }
 
 /// Is there a version of this chain the reader counts, and is it a row?
@@ -281,8 +331,20 @@ pub fn visible_exists(
     tips: &TipChain,
     own: &OwnTx,
 ) -> bool {
+    visible_exists_2pc(file, page_size, head, tips, own, false).unwrap_or(false)
+}
+
+/// [visible_exists] under the limbo law - see [visible_version_2pc].
+pub fn visible_exists_2pc(
+    file: &[u8],
+    page_size: usize,
+    head: &crate::data::RecordHeader,
+    tips: &TipChain,
+    own: &OwnTx,
+    strict: bool,
+) -> Result<bool, u64> {
     if head.flags & (flags::CHAIN | flags::FRAGMENT | flags::BLOB) != 0 {
-        return false; // reached through its head, never walked as one
+        return Ok(false); // reached through its head, never walked as one
     }
     let mut current = head.clone();
     loop {
@@ -290,10 +352,13 @@ pub fn visible_exists(
             || tips.state(current.transaction) == Some(TxState::Committed)
             || own.contains(current.transaction);
         if counts {
-            return current.flags & flags::DELETED == 0;
+            return Ok(current.flags & flags::DELETED == 0);
+        }
+        if strict && tips.state(current.transaction) == Some(TxState::Limbo) {
+            return Err(current.transaction);
         }
         if current.back_page == 0 {
-            return false;
+            return Ok(false);
         }
         let start = current.back_page as usize * page_size;
         let Some(back) = file
@@ -301,7 +366,7 @@ pub fn visible_exists(
             .and_then(DataPage::decode)
             .and_then(|dp| dp.record(current.back_line))
         else {
-            return false;
+            return Ok(false);
         };
         current = back;
     }
@@ -322,6 +387,20 @@ pub fn visible_rows(
     descs: &[Descriptor],
     tips: &TipChain,
 ) -> Vec<VisibleRow> {
+    visible_rows_2pc(file, page_size, relation, descs, tips, false).unwrap_or_default()
+}
+
+/// [visible_rows] under the limbo law - what gbak's read is: the
+/// engine's backup DIES on "record from transaction N is stuck in
+/// limbo" rather than writing a file that silently lacks the rows.
+pub fn visible_rows_2pc(
+    file: &[u8],
+    page_size: usize,
+    relation: u16,
+    descs: &[Descriptor],
+    tips: &TipChain,
+    strict: bool,
+) -> Result<Vec<VisibleRow>, u64> {
     let recs_per_dp = crate::format::max_recs_per_dp(page_size);
     let mut out = Vec::new();
 
@@ -344,7 +423,9 @@ pub fn visible_rows(
             }
             let recno = dp.sequence as u64 * recs_per_dp + r.slot as u64;
             // committed-only: a reader with no transaction of its own
-            let Some(v) = visible_version(file, page_size, &r, tips, &OwnTx::none()) else {
+            let Some(v) =
+                visible_version_2pc(file, page_size, &r, tips, &OwnTx::none(), strict)?
+            else {
                 continue;
             };
             out.push(VisibleRow {
@@ -356,7 +437,7 @@ pub fn visible_rows(
             });
         }
     }
-    out
+    Ok(out)
 }
 
 /// Header-vs-TIP invariants a healthy database file satisfies; each

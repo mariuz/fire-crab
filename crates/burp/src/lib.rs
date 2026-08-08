@@ -531,7 +531,16 @@ pub fn write_backup_verbose(
         }
         let descs: Vec<Descriptor> = cols.iter().map(|c| c.desc.clone()).collect();
         let rows = match tips.as_ref() {
-            Some(t) => fire_crab_ods::tra::visible_rows(image, page_size, *id, &descs, t),
+            // THE LIMBO LAW RIDES THE BACKUP TOO: the engine's gbak
+            // dies on "record from transaction N is stuck in limbo"
+            // rather than writing a file that silently lacks the rows
+            // nobody has adjudicated yet
+            Some(t) => {
+                fire_crab_ods::tra::visible_rows_2pc(image, page_size, *id, &descs, t, true)
+                    .map_err(|tx| {
+                        Refused(format!("record from transaction {} is stuck in limbo", tx))
+                    })?
+            }
             None => Vec::new(),
         };
         log.push(format!("gbak:    writing data for table \"PUBLIC\".\"{}\"", name));
