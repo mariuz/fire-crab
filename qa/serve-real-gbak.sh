@@ -20,9 +20,10 @@
 # success on the same database.
 #
 # RECORDED BOUNDARIES:
-#   * `gbak -se` itself speaks an OLDER protocol (its command line rides
-#     the version-3 ATTACH SPB with 0xff separators; op_service_start
-#     carries a bare action byte) - refused, asserted;
+#   * `gbak -se` speaks an OLDER protocol (its command line rides the
+#     version-3 ATTACH SPB with 0xff separators; op_service_start
+#     carries a bare action byte) - carried, and gated on its own in
+#     qa/serve-real-gbakse.sh; here one -b smoke check holds the seam;
 #   * a VERBOSE request refuses rather than answering silence - the
 #     gfix -v lesson (a report that cannot fail) applied before the
 #     failure mode ships rather than after.
@@ -192,10 +193,9 @@ else
 fi
 rm -f "$NN"
 
-# --- 5. the OTHER protocols refuse rather than half-work ---------------------
-out=$("$GBAK" -b -se "127.0.0.1/$PORT:service_mgr" -user "$U" -pas "$P" "$SRC" "$D/fc-gbak-se.fbk" 2>&1 | head -1)
-check "boundary: gbak -se's command-line protocol is refused" \
-    "$out" "gbak: ERROR:feature is not supported"
+# --- 5. the OLD protocol answers too (the full gate is serve-real-gbakse.sh) --
+out=$("$GBAK" -b -se "127.0.0.1/$PORT:service_mgr" -user "$U" -pas "$P" "$SRC" "$D/fc-gbak-se.fbk" 2>&1); serc=$?
+check "gbak -se's command-line protocol backs up too" "$out|rc=$serc" "|rc=0"
 check "boundary: a VERBOSE backup is refused, not silenced" \
     "$(svc_backup "$FMGR" "$SRC" "$D/fc-gbak-v.fbk" verbose)" "feature is not supported|rc=1"
 

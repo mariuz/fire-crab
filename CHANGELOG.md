@@ -13,6 +13,83 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-08 — gbak -se: the command line in the attach SPB
+
+### Converted
+- **`gbak -se`'s command-line protocol.** The oldest of the three gbak
+  transports sends no dbname/bkp_file tags at all: the WHOLE COMMAND
+  LINE rides the attach SPB as `isc_spb_command_line`, every argument
+  wrapped in 0xFF (internal 0xFFs doubled — `addStringWithSvcTrmntr`,
+  UtilSvc.h:159) with a space after each, and `op_service_start`
+  carries a BARE ACTION BYTE. That attach SPB is **version 3**, which
+  widens every clumplet length to u32 LE — the version exists because a
+  command line is longer than a byte can say. `SpbAttach` grew the
+  version-3 arm, `parse_command_line` undoes the 0xFF wrapping
+  (paths-with-spaces intact), and the argv maps onto the same backup /
+  restore cores the tagged protocol calls.
+- The argv mapping knows the trap in the positionals: a backup is
+  `<database> <file>`, a restore is `<file> <database>` — REVERSED — and
+  `-c*` / `-rep*` are matched by gbak's own prefix-abbreviation rule.
+
+### Guarded
+- Unknown switches refuse the whole action — a dropped switch is a
+  backup that means something else. `-r`/`-recreate` stays refused BY
+  NAME: its overwrite-ness depends on a following bare `o[verwrite]`
+  token, and guessing it either way silently changes whether a database
+  is replaced. `-v` refuses (verbose streaming is its own slice), and
+  stdout/stdin names refuse as before.
+
+### Gated
+- `qa/serve-real-gbakse.sh` (new, 12): `-b`/`-c`/`-rep` through `-se`
+  against both servers, cross-restored; the exists-without-`-rep` vector
+  byte-compared against the engine's; the `-v`, stdout and `-r`
+  refusals. `serve-real-gbak.sh`'s recorded boundary FLIPPED: "gbak -se
+  is refused" became "gbak -se backs up too".
+
+## 2026-08-08 — blobs ride the file
+
+### Converted
+- **Blob columns in the burp format, both directions.** Three laws the
+  reference file taught, each one a silent wrong answer if guessed: **a
+  table with blobs reorders itself** — the field records arrive
+  BLOBS-FIRST with att 13 carrying the true position, the data rows lead
+  with the blob quads and the null flags keep that same order, so the
+  restore re-sorts by position while decoding in file order; **for a
+  blob the scale slot (att 9) carries the SUB_TYPE**, since scale means
+  nothing to a quad; and the quad itself is XDR's view of the on-disk id
+  — two big-endian longs of the two little-endian words `blob_id_bytes`
+  lays down (relation at 0, recno high byte at 3, low word at 4).
+- **`rec_blob` follows its row**: field number (att 3, matching the
+  field record's att 22), max segment, segment count, type (segmented /
+  stream), then a BARE `att_blob_data` tag and u16-LE-framed segments —
+  no att_end on the record at all. A NULL blob writes NO record
+  ("It will be restored as null", backup.epp's own comment) — the quad
+  is zeros and the flag rides the row. A non-null EMPTY blob is a
+  rec_blob with zero segments.
+- The writer reads segments faithfully through `blb::read_blob` (a
+  stream blob's raw bytes carry no frames, so it ships as one chunk —
+  the engine rechunks streams itself and says so); the restore writes
+  through `blb::create_blob`, which grades to level 1 and 2 as the
+  payload grows — the first build used `dml::insert_blob`, the INLINE
+  level-0 form, and a 30 KB blob refused with "blob header larger than
+  a data-page slot".
+
+### Fixed
+- **The null bitmap is bit-per-descriptor in CREATION order, and the
+  emitted column order is not that.** With blobs sorted first, reading
+  the bitmap by emitted index made a NULL blob look live — quad 0:0,
+  "blob 0:0 unreadable" — and would have flagged the wrong columns null
+  on any mixed row. Each column carries its descriptor index now, and
+  every null test goes through it.
+- `subtype_carried` gained 261: a restored text blob's sub_type lands in
+  RDB$FIELDS, where it had silently stayed NULL.
+
+### Gated
+- `qa/serve-real-gbakrestore.sh` 26 → 29: the BT fixture — text and
+  binary blobs; null, empty, short and a 30000-byte multi-segment blob —
+  with a per-blob digest (length, head, tail) compared across all four
+  restore combinations.
+
 ## 2026-08-08 — keys and indexes ride the file
 
 ### Converted

@@ -24,6 +24,12 @@
 #     tr behind a pipe); with res_replace it overwrites;
 #   * NOT NULL rides the file both ways now (att 38 + the INTEG
 #     constraint pair): all four restored databases refuse a NULL;
+#   * BLOBS ride the file in both directions: the field records arrive
+#     BLOBS-FIRST (att 13 carries the true position, so the restore
+#     re-sorts), a row leads with the blob quads, and each non-null
+#     blob's rec_blob follows its row with u16-framed segments - a NULL
+#     blob writes no record at all. The digest below covers null, empty,
+#     short and a 30000-byte multi-segment blob, text and binary;
 #   * privileges are parsed and SET ASIDE (access metadata, not data) -
 #     the count is in the trace, and the restored databases differ from
 #     the engine's restore exactly there.
@@ -63,9 +69,14 @@ CREATE TABLE EMPTYT (X INTEGER);
 CREATE TABLE KEYED (ID INTEGER NOT NULL PRIMARY KEY, W VARCHAR(8));
 CREATE INDEX KX_W ON KEYED (W);
 CREATE UNIQUE INDEX KU_2 ON KEYED (W, ID);
+CREATE TABLE BT (ID INTEGER, TXT BLOB SUB_TYPE TEXT, BIN BLOB SUB_TYPE 0, W VARCHAR(6));
 COMMIT;
 INSERT INTO KEYED VALUES (1, 'aa');
 INSERT INTO KEYED VALUES (2, 'bb');
+INSERT INTO BT VALUES (1, 'hello blob', NULL, 'w1');
+INSERT INTO BT VALUES (2, NULL, NULL, NULL);
+INSERT INTO BT VALUES (3, CAST(LPAD('', 30000, 'abcdefghij') AS BLOB SUB_TYPE TEXT), 'binbytes', 'w3');
+INSERT INTO BT VALUES (4, '', NULL, 'w4');
 COMMIT;
 INSERT INTO MIXED VALUES (-5, 100000, 9000000000, 'abc', 'hello world');
 INSERT INTO MIXED VALUES (NULL, 1, NULL, NULL, NULL);
@@ -102,6 +113,11 @@ rows() { # <db file>
     printf 'SET HEADING OFF;\nSELECT S, I, B, C, V FROM MIXED ORDER BY I;\nSELECT COUNT(*) FROM EMPTYT;\nSELECT ID, W FROM KEYED ORDER BY ID;\n' |
         "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 | tr -s ' \n' ' '
 }
+blobs() { # <db file> - a digest of every blob: null/empty/short/30k
+    grab "$1"
+    printf 'SET HEADING OFF;\nSELECT ID, CHAR_LENGTH(TXT), CAST(SUBSTRING(TXT FROM 1 FOR 10) AS VARCHAR(10)), CAST(SUBSTRING(TXT FROM 29996) AS VARCHAR(5)), CAST(BIN AS VARCHAR(10)), W FROM BT ORDER BY ID;\n' |
+        "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 | tr -s ' \n' ' '
+}
 pk_and_indexes() { # <db>: "dup-refusals/index-list"
     local dup ix
     dup=$(printf 'INSERT INTO KEYED VALUES (1, %s);\n' "'x'" |
@@ -129,6 +145,10 @@ base=$(rows "$D/fc-gbr-r4.fdb")
 check "engine.fbk x fc-restore reads the same rows" "$(rows "$D/fc-gbr-r1.fdb")" "$base"
 check "fc.fbk x fc-restore reads the same rows" "$(rows "$D/fc-gbr-r2.fdb")" "$base"
 check "fc.fbk x engine-restore reads the same rows" "$(rows "$D/fc-gbr-r3.fdb")" "$base"
+bbase=$(blobs "$D/fc-gbr-r4.fdb")
+check "the BLOBS read identically from fc's restore of the engine's fbk" "$(blobs "$D/fc-gbr-r1.fdb")" "$bbase"
+check "...and from fc's round trip" "$(blobs "$D/fc-gbr-r2.fdb")" "$bbase"
+check "...and from the engine's restore of fc's fbk" "$(blobs "$D/fc-gbr-r3.fdb")" "$bbase"
 for r in r1 r2; do
     ran=$((ran + 1))
     v=$("$GFIX" -v -full -user "$U" -pas "$P" "$D/fc-gbr-$r.fdb" 2>&1 | tr -d ' \n')

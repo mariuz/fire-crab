@@ -2789,8 +2789,18 @@ plus *the subsystem is now on the path*.
   backfilled after, because dml::insert_record does no index
   maintenance and the other order leaves empty indexes over full
   tables. UNIQUE / FOREIGN KEY / CHECK constraints still refuse, typed.
-  Remaining slices: blobs, the -se command-line protocol, verbose
-  streaming.
+  **Blobs are DONE** (gbakrestore 29): the
+  blobs-first row reordering, att 9 as the blob's SUB_TYPE, the quad as
+  XDR's view of blob_id_bytes, rec_blob's u16-framed segments after a
+  bare data tag, NULL blobs as absence - all measured, and the restore
+  writes through blb::create_blob so a 30 KB blob grades to a real
+  multi-page level rather than refusing.
+  **The -se command-line protocol is DONE** (serve-real-gbakse.sh):
+  the version-3 attach SPB (u32 lengths), the 0xFF-wrapped command
+  line (UtilSvc.h:159), the bare action byte in op_service_start, the
+  reversed restore positionals - argv mapped onto the same cores, with
+  unknown switches (and -r, whose overwrite-ness is a guess) refusing
+  the whole action. Remaining slice: verbose streaming.
 
 ## A savepoint is a transaction (done)
 

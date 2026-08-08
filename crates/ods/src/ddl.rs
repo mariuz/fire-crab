@@ -54,7 +54,8 @@ use crate::{u16_at, u32_at, Descriptor};
 /// exact-int family and text; FLOAT/DOUBLE/DATE/TIME/TIMESTAMP/BOOLEAN
 /// rows keep it NULL (probed).
 fn subtype_carried(field_type: i16) -> bool {
-    matches!(field_type, 7 | 8 | 16 | 26 | 14 | 37)
+    // 261 = blob, whose sub_type is the whole point of the column
+    matches!(field_type, 7 | 8 | 16 | 26 | 14 | 37 | 261)
 }
 
 /// One column of a CREATE TABLE: its name, the external catalog type

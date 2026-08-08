@@ -310,6 +310,47 @@ pub fn build_start_db_stats(db: &str, options: u32) -> Vec<u8> {
     v
 }
 
+/// Split `isc_spb_command_line` back into arguments - the inverse of
+/// `addStringWithSvcTrmntr` (UtilSvc.h:159): every argument is wrapped
+/// in SVC_TRMNTR (0xFF), internal 0xFFs are DOUBLED, and a space
+/// follows each wrapped argument (the last one rtrimmed away). This is
+/// how `gbak -se` ships "-b <db> <fbk>" inside the version-3 attach
+/// SPB, paths-with-spaces intact.
+pub fn parse_command_line(data: &[u8]) -> Result<Vec<String>, String> {
+    const T: u8 = 0xff;
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while at < data.len() {
+        if data[at] == b' ' {
+            at += 1; // the separator between wrapped arguments
+            continue;
+        }
+        if data[at] != T {
+            return Err(format!("argument at {} does not start with SVC_TRMNTR", at));
+        }
+        at += 1;
+        let mut arg = Vec::new();
+        loop {
+            let b = *data
+                .get(at)
+                .ok_or("an argument with no closing SVC_TRMNTR")?;
+            at += 1;
+            if b == T {
+                if data.get(at) == Some(&T) {
+                    arg.push(T); // a doubled terminator is a literal one
+                    at += 1;
+                } else {
+                    break; // the closing terminator
+                }
+            } else {
+                arg.push(b);
+            }
+        }
+        out.push(String::from_utf8_lossy(&arg).into_owned());
+    }
+    Ok(out)
+}
+
 /// Which grammar a buffer follows (`ClumpletReader::Kind`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Grammar {
@@ -471,11 +512,24 @@ pub fn parse(grammar: Grammar, buf: &[u8]) -> Result<Buffer, String> {
                 at = end;
             }
             Grammar::SpbAttach => {
-                let len = *buf
-                    .get(at)
-                    .ok_or_else(|| format!("clumplet {} has no length byte", tag))?
-                    as usize;
-                at += 1;
+                // VERSION 3 WIDENS EVERY LENGTH TO u32 LE - the form
+                // `gbak -se` attaches with (its whole command line rides
+                // one clumplet, longer than a byte can say). Version 2
+                // keeps the traditional single byte.
+                let len = if version == Some(spb::VERSION3) {
+                    let b = buf
+                        .get(at..at + 4)
+                        .ok_or_else(|| format!("clumplet {} has no u32 length", tag))?;
+                    at += 4;
+                    u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize
+                } else {
+                    let l = *buf
+                        .get(at)
+                        .ok_or_else(|| format!("clumplet {} has no length byte", tag))?
+                        as usize;
+                    at += 1;
+                    l
+                };
                 let end = at + len;
                 if end > buf.len() {
                     return Err(format!(
@@ -1009,6 +1063,42 @@ mod tests {
         assert_eq!(&ans[3..3 + len], b"hello ");
         assert_eq!(ans[3 + len], info::STDIN);
         assert_eq!(&ans[4 + len..8 + len], &0u32.to_le_bytes());
+    }
+
+    /// The version-3 attach SPB and the command line inside it - what
+    /// `gbak -se` sends (UtilSvc.h:159 wraps every argument in 0xFF,
+    /// doubles internal 0xFFs, appends a space, rtrims the last).
+    #[test]
+    fn version3_spb_and_the_command_line_inside() {
+        // version 3 widens every clumplet length to u32 LE
+        let mut v = vec![spb::VERSION, spb::VERSION3];
+        v.push(spb::COMMAND_LINE);
+        let cl = b"\xff-b\xff \xffa b\xff \xffx\xff\xffy\xff";
+        v.extend_from_slice(&(cl.len() as u32).to_le_bytes());
+        v.extend_from_slice(cl);
+        let b = parse(Grammar::SpbAttach, &v).unwrap();
+        assert_eq!(b.version, Some(spb::VERSION3));
+        let args = parse_command_line(&b.first(spb::COMMAND_LINE).unwrap().data).unwrap();
+        // a path with a space survives, a doubled 0xFF is a literal one
+        assert_eq!(args, vec!["-b", "a b", "x\u{fffd}y"]);
+
+        // version 2 keeps the single length byte - the same tag parses
+        // under the traditional grammar
+        let v2 = [
+            spb::VERSION,
+            spb::CURRENT_VERSION,
+            spb::COMMAND_LINE,
+            2,
+            b'-',
+            b'b',
+        ];
+        let b2 = parse(Grammar::SpbAttach, &v2).unwrap();
+        assert_eq!(b2.first(spb::COMMAND_LINE).unwrap().data, b"-b");
+
+        // fail closed: an argument that never opens, one that never closes
+        assert!(parse_command_line(b"-b").is_err());
+        assert!(parse_command_line(b"\xff-b").is_err());
+        assert_eq!(parse_command_line(b"").unwrap(), Vec::<String>::new());
     }
 
     fn hex(s: &str) -> Vec<u8> {

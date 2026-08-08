@@ -2113,6 +2113,30 @@ fn serve_service(
     if std::env::var("FC_SRV_TRACE").is_ok() {
         eprintln!("[srv] op_service_attach ok, handle 1");
     }
+    // `gbak -se` SPEAKS THE OLD PROTOCOL: its whole command line rides
+    // the version-3 attach SPB as isc_spb_command_line (each argument
+    // wrapped in 0xFF, UtilSvc.h:159) and op_service_start carries a
+    // BARE ACTION BYTE - the parameters live HERE, from attach to start.
+    let cmdline: Option<Vec<String>> = fire_crab_svc::parse(fire_crab_svc::Grammar::SpbAttach, &spb)
+        .ok()
+        .and_then(|b| {
+            b.first(fire_crab_svc::spb::COMMAND_LINE)
+                .map(|c| c.data.clone())
+        })
+        .and_then(|data| match fire_crab_svc::parse_command_line(&data) {
+            Ok(args) => {
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] service command line: {:?}", args);
+                }
+                Some(args)
+            }
+            Err(e) => {
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] service command line unreadable: {}", e);
+                }
+                None
+            }
+        });
     // the output of the action this session started, if any: a service
     // session is stateful, and `isc_info_svc_line` reads from exactly this
     let mut output: Option<fire_crab_svc::Output> = None;
@@ -2209,7 +2233,7 @@ fn serve_service(
                 // cannot perform must be REFUSED - otherwise the client
                 // polls an empty output stream and reports a successful
                 // backup that never happened.
-                match run_service_action(&spb) {
+                match run_service_action_with_cmdline(&spb, cmdline.as_deref()) {
                     Ok(text) => {
                         if std::env::var("FC_SRV_TRACE").is_ok() {
                             eprintln!("[srv] op_service_start ok, {} bytes of output", text.len());
@@ -2292,6 +2316,113 @@ fn server_info() -> fire_crab_svc::ServerInfo {
 enum SpecialErr {
     Plain(i32),
     DbExists(String),
+}
+
+/// [run_service_action], with the OLD protocol in front: when the start
+/// SPB is a gbak action whose parameters are NOT in the SPB (the bare
+/// action byte `gbak -se` sends), they come from the attach's command
+/// line instead.
+fn run_service_action_with_cmdline(
+    spb: &[u8],
+    cmdline: Option<&[String]>,
+) -> Result<String, SpecialErr> {
+    let action = spb.first().copied().unwrap_or(0);
+    if matches!(
+        action,
+        a if a == fire_crab_svc::action::BACKUP || a == fire_crab_svc::action::RESTORE
+    ) {
+        // does the start SPB itself carry a dbname? Then it is the
+        // fbsvcmgr route and the command line (if any) is not for us
+        let has_spb_params = fire_crab_svc::parse(fire_crab_svc::Grammar::SpbStart, spb)
+            .ok()
+            .and_then(|b| b.text(fire_crab_svc::spb::DBNAME))
+            .is_some();
+        if !has_spb_params {
+            if let Some(args) = cmdline {
+                // VERBOSE arrives as a bare tag after the action byte -
+                // refused rather than silenced (the streaming is its own
+                // slice), exactly as the SPB route refuses it
+                if spb.len() > 1 {
+                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!("[srv] -se with verbose/verbint refused");
+                    }
+                    return Err(SpecialErr::Plain(GDS_WISH_LIST));
+                }
+                return run_gbak_cmdline(action, args);
+            }
+        }
+    }
+    run_service_action(spb)
+}
+
+/// Map gbak's own argv onto the backup/restore cores. What arrives is
+/// what the user typed after `gbak` (minus -se and the credentials,
+/// which the client consumed): switches, then the two positionals -
+/// database-then-file for a backup, FILE-THEN-DATABASE for a restore.
+fn run_gbak_cmdline(action: u8, args: &[String]) -> Result<String, SpecialErr> {
+    let mut replace = false;
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut skip_value = false;
+    for a in args {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if let Some(sw) = a.strip_prefix('-') {
+            let sw = sw.to_ascii_lowercase();
+            // gbak abbreviates switches by prefix; this carries exactly
+            // the families the cores implement and REFUSES the rest - a
+            // dropped switch is a backup that means something else.
+            // `-r`/`-recreate` stays refused: its overwrite-ness depends
+            // on a following bare `o[verwrite]` token, and guessing it
+            // either way silently changes whether a database is replaced.
+            if !sw.is_empty() && "backup_database".starts_with(&sw) {
+                // the action byte already said so
+            } else if !sw.is_empty()
+                && !sw.starts_with('r')
+                && "create_database".starts_with(&sw)
+            {
+                replace = false;
+            } else if sw.len() >= 3 && "replace_database".starts_with(&sw) {
+                replace = true;
+            } else if sw.len() >= 2
+                && ["user", "password", "role", "fetch_password"]
+                    .iter()
+                    .any(|k| k.starts_with(&sw))
+            {
+                skip_value = true; // consumed by the client, but be safe
+            } else {
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] -se switch -{} refused", sw);
+                }
+                return Err(SpecialErr::Plain(GDS_WISH_LIST));
+            }
+        } else {
+            positionals.push(a);
+        }
+    }
+    if positionals.len() != 2 {
+        return Err(SpecialErr::Plain(GDS_WISH_LIST));
+    }
+    if positionals
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case("stdout") || p.eq_ignore_ascii_case("stdin"))
+    {
+        // the streaming forms need the query channel as a data pipe -
+        // their own slice
+        return Err(SpecialErr::Plain(GDS_WISH_LIST));
+    }
+    if action == fire_crab_svc::action::BACKUP {
+        let empty = fire_crab_svc::Buffer { version: None, items: Vec::new() };
+        run_gbak_backup_at(&empty, positionals[0], positionals[1]).map_err(SpecialErr::Plain)
+    } else {
+        // the positionals REVERSE for a restore: <file> then <database>
+        // (the core takes database first)
+        run_gbak_restore_core(positionals[1], positionals[0], replace).map_err(|e| match e {
+            RestoreErr::Gds(code) => SpecialErr::Plain(code),
+            RestoreErr::DbExists(db) => SpecialErr::DbExists(db),
+        })
+    }
 }
 
 /// Run a service ACTION and return the text it streams back, or the gds
@@ -2400,6 +2531,16 @@ fn run_service_action(spb: &[u8]) -> Result<String, SpecialErr> {
 fn run_gbak_backup(b: &fire_crab_svc::Buffer) -> Result<String, i32> {
     let db = b.text(fire_crab_svc::spb::DBNAME).ok_or(GDS_WISH_LIST)?;
     let file = b.text(fire_crab_svc::bkp::FILE).ok_or(GDS_WISH_LIST)?;
+    run_gbak_backup_at(b, &db, &file)
+}
+
+fn run_gbak_backup_at(
+    b: &fire_crab_svc::Buffer,
+    db: &str,
+    file: &str,
+) -> Result<String, i32> {
+    let db = db.to_string();
+    let file = file.to_string();
     // options this writer cannot honour refuse rather than being
     // silently dropped: skip/include-data change what the file MEANS,
     // and a VERBOSE request answered with silence is the gfix -v
@@ -2501,7 +2642,16 @@ fn run_gbak_restore_inner(b: &fire_crab_svc::Buffer) -> Result<String, RestoreEr
         return Err(Gds(GDS_WISH_LIST));
     }
     let options = b.number(fire_crab_svc::spb::OPTIONS).unwrap_or(0) as u32;
-    let replace = options & 0x1000 != 0; // isc_spb_res_replace
+    run_gbak_restore_core(&db, &files[0], options & 0x1000 != 0)
+}
+
+/// The restore itself, shared by the SPB route (fbsvcmgr's dbname /
+/// bkp_file / res_replace) and the command-line route (`gbak -c|-rep
+/// -se`, whose arguments arrive through the version-3 attach SPB).
+fn run_gbak_restore_core(db: &str, file: &str, replace: bool) -> Result<String, RestoreErr> {
+    use RestoreErr::Gds;
+    let db = db.to_string();
+    let files = [file.to_string()];
     if std::path::Path::new(&db).exists() && !replace {
         return Err(RestoreErr::DbExists(db));
     }
@@ -2540,10 +2690,15 @@ fn run_gbak_restore_inner(b: &fire_crab_svc::Buffer) -> Result<String, RestoreEr
             .map(|h| h.page_size as usize)
             .ok_or("the fresh shell has no header")?;
         for t in &restored.tables {
-            let cols: Vec<fire_crab_ods::ddl::ColumnDef> = t
-                .cols
+            // FIELD RECORDS ARRIVE BLOBS-FIRST (the engine's own file
+            // order), and att 13 carries the true position - so the
+            // table is created in POSITION order and each row's values
+            // are mapped from file order to position order.
+            let mut order: Vec<usize> = (0..t.cols.len()).collect();
+            order.sort_by_key(|i| t.cols[*i].position);
+            let cols: Vec<fire_crab_ods::ddl::ColumnDef> = order
                 .iter()
-                .map(|c| restore_column_def(c))
+                .map(|i| restore_column_def(&t.cols[*i]))
                 .collect::<Result<_, _>>()?;
             fire_crab_ods::ddl::create_table(&mut file, page_size, &t.name, &cols, &[], &[], 0)?;
             let rel = fire_crab_ods::resolve_relation(&file, page_size, &t.name)
@@ -2554,7 +2709,56 @@ fn run_gbak_restore_inner(b: &fire_crab_svc::Buffer) -> Result<String, RestoreEr
                 .max_by_key(|(n, _)| *n)
                 .ok_or("the created table has no format")?;
             for row in &t.rows {
-                let image = restore_row_image(row, descs)?;
+                if row.len() != t.cols.len() {
+                    return Err("a row with the wrong column count".to_string());
+                }
+                // blobs first: each becomes a real blob in the file and
+                // its column's value becomes the 8-byte id the record
+                // image carries (the same layout blob_id_bytes writes:
+                // relation LE at 0, recno high byte at 3, low word at 4)
+                let mut vals: Vec<RestoreVal> = Vec::with_capacity(row.len());
+                for (v, c) in row.iter().zip(t.cols.iter()) {
+                    vals.push(match v {
+                        fire_crab_burp::RVal::Blob { stream, segments } => {
+                            // blb's writer, not dml's: it grades to
+                            // level 1 and 2 as the payload grows, where
+                            // dml::insert_blob is the inline level-0
+                            // form and refuses a big blob outright.
+                            // Charset 0 - a NONE database's user blobs.
+                            let recno = if *stream {
+                                fire_crab_blb::create_stream_blob(
+                                    &mut file,
+                                    page_size,
+                                    rel,
+                                    &segments.concat(),
+                                    c.sub_type as u16,
+                                    0,
+                                )?
+                            } else {
+                                fire_crab_blb::create_blob(
+                                    &mut file,
+                                    page_size,
+                                    rel,
+                                    segments,
+                                    c.sub_type as u16,
+                                    0,
+                                )?
+                            };
+                            let mut id = [0u8; 8];
+                            id[0..2].copy_from_slice(&rel.to_le_bytes());
+                            id[3] = (recno >> 32) as u8;
+                            id[4..8].copy_from_slice(&(recno as u32).to_le_bytes());
+                            RestoreVal::BlobId(id)
+                        }
+                        fire_crab_burp::RVal::Null => RestoreVal::Null,
+                        fire_crab_burp::RVal::Int(n) => RestoreVal::Int(*n),
+                        fire_crab_burp::RVal::Bytes(b) => RestoreVal::Bytes(b.clone()),
+                    });
+                }
+                // ...then reordered to position order, which is what the
+                // created table's descriptors follow
+                let by_position: Vec<&RestoreVal> = order.iter().map(|i| &vals[*i]).collect();
+                let image = restore_row_image(&by_position, descs)?;
                 fire_crab_ods::dml::insert_record(&mut file, page_size, rel, *format_no, &image)?;
             }
             // THE INDEXES COME AFTER THE ROWS, backfilled - the order the
@@ -2620,6 +2824,7 @@ fn restore_column_def(
         16 => (dtype::INT64, 8, None, Some(0)),
         14 => (dtype::TEXT, c.length, Some(c.length), None),
         37 => (dtype::VARYING, c.length + 2, Some(c.length), None),
+        261 => (dtype::BLOB, 8, None, None),
         t => return Err(format!("field type {} in restore", t)),
     };
     Ok(fire_crab_ods::ddl::ColumnDef {
@@ -2628,7 +2833,7 @@ fn restore_column_def(
         dtype: dt,
         length,
         scale: c.scale,
-        sub_type: 0,
+        sub_type: c.sub_type,
         precision,
         char_len,
         not_null: c.not_null,
@@ -2640,13 +2845,22 @@ fn restore_column_def(
     })
 }
 
+/// A row value with blobs already RESOLVED to their on-disk ids - what
+/// the image builder consumes.
+enum RestoreVal {
+    Null,
+    Int(i64),
+    Bytes(Vec<u8>),
+    BlobId([u8; 8]),
+}
+
 /// One restored row as a record image: the null bitmap, then each value
 /// at its descriptor's offset - the layout `decode_record` reads back.
 fn restore_row_image(
-    row: &[fire_crab_burp::RVal],
+    row: &[&RestoreVal],
     descs: &[Descriptor],
 ) -> Result<Vec<u8>, String> {
-    use fire_crab_burp::RVal;
+    use RestoreVal as RVal;
     if row.len() != descs.len() {
         return Err("a row with the wrong column count".into());
     }
@@ -2659,7 +2873,7 @@ fn restore_row_image(
     let mut img = vec![0u8; end];
     for (i, (v, d)) in row.iter().zip(descs.iter()).enumerate() {
         let off = d.offset as usize;
-        match v {
+        match *v {
             RVal::Null => {
                 img[i / 8] |= 1 << (i % 8);
                 // a TEXT slot under a null still holds blanks, as the
@@ -2699,6 +2913,12 @@ fn restore_row_image(
                 }
                 _ => return Err("text into a non-text column".into()),
             },
+            RVal::BlobId(id) => {
+                if d.dtype != fire_crab_ods::format::dtype::BLOB {
+                    return Err("a blob into a non-blob column".into());
+                }
+                img[off..off + 8].copy_from_slice(id);
+            }
         }
     }
     Ok(img)

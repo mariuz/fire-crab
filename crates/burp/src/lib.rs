@@ -35,6 +35,7 @@ mod rec {
     pub const FIELD: u8 = 4;
     pub const INDEX: u8 = 5;
     pub const DATA: u8 = 6;
+    pub const BLOB: u8 = 7;
     pub const RELATION_DATA: u8 = 8;
     pub const RELATION_END: u8 = 9;
     pub const END: u8 = 10;
@@ -83,6 +84,12 @@ impl<'a> Rec<'a> {
 /// and the row encoder need.
 struct Col {
     name: String,
+    /// att 22 - the field id rec_blob's field number points at
+    field_id: i32,
+    /// the ORIGINAL descriptor index - the record image's null bitmap
+    /// is bit-per-descriptor in CREATION order, and the emitted column
+    /// order is not that (blobs come first)
+    bitmap_bit: usize,
     /// the invented domain name (RDB$1, RDB$2, ... - gbak restore binds
     /// columns to domains by NAME WITHIN THE FILE, so consistency is
     /// all that matters)
@@ -104,6 +111,7 @@ fn rdb_field_type(d: &Descriptor) -> Option<i32> {
         dtype::INT64 => 16,
         dtype::TEXT => 14,
         dtype::VARYING => 37,
+        dtype::BLOB => 261,
         _ => return None,
     })
 }
@@ -112,10 +120,15 @@ fn rdb_field_type(d: &Descriptor) -> Option<i32> {
 /// field order, then one 4-byte null indicator per field.
 fn xdr_row(image: &[u8], cols: &[Col], nulls_at: usize) -> Option<Vec<u8>> {
     let mut out = Vec::new();
-    let null = |i: usize| image.get(nulls_at + i / 8).is_some_and(|b| b & (1 << (i % 8)) != 0);
-    for (i, c) in cols.iter().enumerate() {
+    // THE BITMAP BIT IS THE DESCRIPTOR INDEX, NOT THE EMITTED INDEX -
+    // with blobs sorted first the two part company, and reading the
+    // wrong bit made a NULL blob look live (quad 0:0, "unreadable")
+    let null = |bit: usize| {
+        image.get(nulls_at + bit / 8).is_some_and(|b| b & (1 << (bit % 8)) != 0)
+    };
+    for c in cols.iter() {
         let off = c.desc.offset as usize;
-        let is_null = null(i);
+        let is_null = null(c.bitmap_bit);
         match c.desc.dtype {
             dtype::SHORT => {
                 let v = if is_null || image.len() < off + 2 {
@@ -165,11 +178,26 @@ fn xdr_row(image: &[u8], cols: &[Col], nulls_at: usize) -> Option<Vec<u8>> {
                 }
                 out.extend(std::iter::repeat(0u8).take((4 - n % 4) % 4));
             }
+            dtype::BLOB => {
+                // the QUAD, canonicalized as two big-endian longs of its
+                // two stored little-endian words - measured: the first
+                // blob of relation 128 rides as 00000080 00000000
+                let (hi, lo) = if is_null || image.len() < off + 8 {
+                    (0u32, 0u32)
+                } else {
+                    (
+                        u32::from_le_bytes(image[off..off + 4].try_into().ok()?),
+                        u32::from_le_bytes(image[off + 4..off + 8].try_into().ok()?),
+                    )
+                };
+                out.extend_from_slice(&hi.to_be_bytes());
+                out.extend_from_slice(&lo.to_be_bytes());
+            }
             _ => return None,
         }
     }
-    for i in 0..cols.len() {
-        let flag: u32 = if null(i) { 0xffff_ffff } else { 0 };
+    for c in cols.iter() {
+        let flag: u32 = if null(c.bitmap_bit) { 0xffff_ffff } else { 0 };
         out.extend_from_slice(&flag.to_be_bytes());
     }
     Some(out)
@@ -334,6 +362,11 @@ pub fn write_backup(
             }
             cols.push(Col {
                 name: names[i].name.clone(),
+                // the field id follows CREATION order - the reference
+                // file's ID column keeps id 1 though its record comes
+                // after the blobs'
+                field_id: (i + 1) as i32,
+                bitmap_bit: i,
                 source: format!("RDB${}", next_source),
                 position: names[i].position,
                 desc: d.clone(),
@@ -341,6 +374,11 @@ pub fn write_backup(
             });
             next_source += 1;
         }
+        // BLOBS FIRST - the measured field-record order of a real file
+        // (TXT pos 1, BIN pos 2, ID pos 0), which the DATA rows follow:
+        // blob quads lead the XDR row and the null flags keep the same
+        // order. Stable within each group, so positions stay readable.
+        cols.sort_by_key(|c| (c.desc.dtype != dtype::BLOB, c.position));
         rel_cols.push((*id, name.clone(), cols));
     }
 
@@ -348,12 +386,22 @@ pub fn write_backup(
     for (_, _, cols) in &rel_cols {
         for c in cols {
             let t = rdb_field_type(&c.desc).unwrap();
+            // FOR A BLOB THE SCALE SLOT (att 9) CARRIES THE SUB_TYPE -
+            // measured: the TEXT blob's records say 9=1 where the
+            // binary one's say 9=0, and the scale is meaningless for a
+            // quad. att 12 is the segment length (the engine snapshots
+            // its default 80).
+            let att9 = if c.desc.dtype == dtype::BLOB {
+                c.desc.sub_type as i32
+            } else {
+                c.desc.scale as i32
+            };
             let r = Rec::new(&mut out, rec::GLOBAL_FIELD)
                 .text(48, "PUBLIC")
                 .text(1, &c.source)
                 .int(8, t)
                 .int(10, c.desc.length as i32)
-                .int(9, c.desc.scale as i32)
+                .int(9, att9)
                 .int(11, 0);
             match c.desc.dtype {
                 dtype::VARYING | dtype::TEXT => r
@@ -361,6 +409,10 @@ pub fn write_backup(
                     .int(42, 0) // character set NONE
                     .int(43, 0) // collation
                     .end(),
+                dtype::BLOB if c.desc.sub_type == 1 => {
+                    r.int(12, 80).int(42, 0).int(43, 0).end()
+                }
+                dtype::BLOB => r.int(12, 80).end(),
                 _ => r.int(44, 0).end(),
             }
         }
@@ -374,7 +426,12 @@ pub fn write_backup(
             .int(16, 1) // att_relation_flags (pinned from the reference file)
             .int(18, 0) // relation type: persistent
             .end();
-        for (i, c) in cols.iter().enumerate() {
+        for c in cols.iter() {
+            let att9 = if c.desc.dtype == dtype::BLOB {
+                c.desc.sub_type as i32
+            } else {
+                c.desc.scale as i32
+            };
             let mut r = Rec::new(&mut out, rec::FIELD)
                 .text(1, &c.name)
                 .text(48, "PUBLIC")
@@ -382,9 +439,9 @@ pub fn write_backup(
                 .int(13, c.position as i32)
                 .int(8, rdb_field_type(&c.desc).unwrap())
                 .int(10, c.desc.length as i32)
-                .int(9, c.desc.scale as i32)
+                .int(9, att9)
                 .int(11, 0)
-                .int(22, (i + 1) as i32)
+                .int(22, c.field_id)
                 .int(24, 0)
                 .int(34, 1);
             if c.not_null {
@@ -394,6 +451,7 @@ pub fn write_backup(
             }
             match c.desc.dtype {
                 dtype::VARYING | dtype::TEXT => r.int(42, 0).int(43, 0).end(),
+                dtype::BLOB if c.desc.sub_type == 1 => r.int(42, 0).int(43, 0).end(),
                 _ => r.int(43, 0).end(),
             }
         }
@@ -441,6 +499,60 @@ pub fn write_backup(
             // no att_end, the compressed block follows the data tag)
             out.push(2); // att_data_data
             out.extend_from_slice(&fire_crab_ods::sqz::pack(&xdr));
+            // THE ROW'S BLOBS, each a rec_blob directly after its row
+            // (put_data's own order). A NULL blob writes NO record -
+            // "It will be restored as null" (backup.epp) - and its quad
+            // above was zeros with the flag set.
+            for c in cols.iter() {
+                if c.desc.dtype != dtype::BLOB {
+                    continue;
+                }
+                let is_null = row
+                    .image
+                    .get(nulls_at + c.bitmap_bit / 8)
+                    .is_some_and(|b| b & (1 << (c.bitmap_bit % 8)) != 0);
+                let off = c.desc.offset as usize;
+                if is_null || row.image.len() < off + 8 {
+                    continue;
+                }
+                let rel_word = u16::from_le_bytes([row.image[off], row.image[off + 1]]);
+                let recno = ((row.image[off + 3] as u64) << 32)
+                    | u32::from_le_bytes(row.image[off + 4..off + 8].try_into().unwrap()) as u64;
+                let blob = fire_crab_blb::read_blob(image, page_size, rel_word, recno)
+                    .map_err(|e| {
+                        Refused(format!("relation {}: blob {}:{} unreadable: {}", name, rel_word, recno, e))
+                    })?;
+                // segments() deframes SEGMENTED blobs; a STREAM blob's
+                // raw bytes carry no frames, so it ships as one chunk
+                // (the engine rechunks streams by max_segment itself
+                // and says so in put_data's own comment)
+                let is_stream = blob.header.is_stream();
+                let segments: Vec<Vec<u8>> = if is_stream {
+                    let c = blob.content();
+                    if c.is_empty() { Vec::new() } else { vec![c] }
+                } else {
+                    blob.segments().map(|s| s.to_vec()).collect()
+                };
+                let max_seg = segments.iter().map(|s| s.len()).max().unwrap_or(0);
+                if max_seg > u16::MAX as usize {
+                    return Err(Refused(format!(
+                        "relation {}: a blob segment larger than 64K",
+                        name
+                    )));
+                }
+                Rec::new(&mut out, rec::BLOB)
+                    .int(3, c.field_id) // att_blob_field_number
+                    .int(6, max_seg as i32) // att_blob_max_segment
+                    .int(5, segments.len() as i32) // att_blob_number_segments
+                    .int(4, i32::from(is_stream)); // att_blob_type
+                // att_blob_data: a BARE tag, then u16 LE length + bytes
+                // per segment - NO att_end on this record at all
+                out.push(7);
+                for seg in &segments {
+                    out.extend_from_slice(&(seg.len() as u16).to_le_bytes());
+                    out.extend_from_slice(seg);
+                }
+            }
         }
         out.push(rec::RELATION_END);
     }
@@ -779,6 +891,8 @@ mod tests {
         let cols = vec![
             Col {
                 name: "ID".into(),
+                field_id: 1,
+                bitmap_bit: 0,
                 source: "RDB$1".into(),
                 position: 0,
                 desc: Descriptor { dtype: dtype::LONG, scale: 0, length: 4, sub_type: 0, flags: 0, offset: 4 },
@@ -786,6 +900,8 @@ mod tests {
             },
             Col {
                 name: "V".into(),
+                field_id: 2,
+                bitmap_bit: 1,
                 source: "RDB$2".into(),
                 position: 1,
                 desc: Descriptor { dtype: dtype::VARYING, scale: 0, length: 10, sub_type: 0, flags: 0, offset: 8 },
@@ -838,15 +954,28 @@ pub enum RVal {
     Int(i64),
     /// text bytes, exactly as stored (CHAR keeps its padding)
     Bytes(Vec<u8>),
+    /// a blob's SEGMENTS, filled by the rec_blob that follows the row -
+    /// a non-null blob starts as an empty segment list (which is also
+    /// what a non-null EMPTY blob legitimately stays). `stream` is the
+    /// rec_blob's att 4 - the restored blob keeps its kind.
+    Blob { stream: bool, segments: Vec<Vec<u8>> },
 }
 
 /// One restored column.
 pub struct RCol {
     pub name: String,
-    /// RDB$FIELD_TYPE: 7 smallint, 8 integer, 16 int64, 14 text, 37 varying
+    /// RDB$FIELD_TYPE: 7 smallint, 8 integer, 16 int64, 14 text,
+    /// 37 varying, 261 blob
     pub field_type: i32,
     pub length: u16,
     pub scale: i8,
+    /// for a blob, att 9 carries the SUB_TYPE where scale would sit
+    pub sub_type: i16,
+    /// att 13 - the TRUE column position: field records arrive
+    /// blobs-first, so file order is not declaration order
+    pub position: i32,
+    /// att 22 - what a rec_blob's field number points at
+    pub field_id: i32,
     pub not_null: bool,
 }
 
@@ -960,6 +1089,14 @@ fn xdr_decode(xdr: &[u8], cols: &[RCol]) -> Result<Vec<RVal>, Refused> {
                 at += (4 - n % 4) % 4;
                 vals.push(RVal::Bytes(d));
             }
+            261 => {
+                // the quad rides as two BE longs; its VALUE is the
+                // source database's blob id, replaced wholesale on
+                // restore - the rec_blob records that follow the row
+                // carry the content
+                let _ = take(&mut at, 8)?;
+                vals.push(RVal::Blob { stream: false, segments: Vec::new() });
+            }
             _ => return Err(Refused("a field type outside this restore's surface".into())),
         }
     }
@@ -1033,19 +1170,31 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 let ftype = att(&atts, 8)
                     .map(|a| a.int() as i32)
                     .ok_or_else(|| Refused("a field with no type".into()))?;
-                if !matches!(ftype, 7 | 8 | 16 | 14 | 37) {
+                if !matches!(ftype, 7 | 8 | 16 | 14 | 37 | 261) {
                     return Err(Refused(format!(
                         "field type {} is outside this restore's surface",
                         ftype
                     )));
                 }
+                let n = out.tables[t].cols.len();
                 out.tables[t].cols.push(RCol {
                     name: att(&atts, 1)
                         .map(|a| a.text())
                         .ok_or_else(|| Refused("a field with no name".into()))?,
                     field_type: ftype,
                     length: att(&atts, 10).map(|a| a.int() as u16).unwrap_or(0),
-                    scale: att(&atts, 9).map(|a| a.int() as i8).unwrap_or(0),
+                    scale: if ftype == 261 {
+                        0
+                    } else {
+                        att(&atts, 9).map(|a| a.int() as i8).unwrap_or(0)
+                    },
+                    sub_type: if ftype == 261 {
+                        att(&atts, 9).map(|a| a.int() as i16).unwrap_or(0)
+                    } else {
+                        0
+                    },
+                    position: att(&atts, 13).map(|a| a.int() as i32).unwrap_or(n as i32),
+                    field_id: att(&atts, 22).map(|a| a.int() as i32).unwrap_or((n + 1) as i32),
                     not_null: att(&atts, 38).map(|a| a.int() == 1).unwrap_or(false),
                 });
             }
@@ -1130,6 +1279,70 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 }
                 let row = xdr_decode(&xdr, &out.tables[t].cols)?;
                 out.tables[t].rows.push(row);
+            }
+            rec::BLOB => {
+                // attributes until the BARE att_blob_data tag (7), then
+                // u16 LE length + bytes per segment - no att_end at all
+                let t = data_rel.ok_or_else(|| Refused("a blob outside relation data".into()))?;
+                let mut field_no: i64 = 0;
+                let mut nseg: i64 = 0;
+                let mut stream = false;
+                loop {
+                    let tag = *f.get(at).ok_or_else(|| Refused("truncated blob record".into()))?;
+                    at += 1;
+                    if tag == 7 {
+                        break;
+                    }
+                    let len = *f.get(at).ok_or_else(|| Refused("truncated blob record".into()))? as usize;
+                    at += 1;
+                    let a = Att {
+                        tag,
+                        data: f
+                            .get(at..at + len)
+                            .ok_or_else(|| Refused("truncated blob record".into()))?
+                            .to_vec(),
+                    };
+                    at += len;
+                    match a.tag {
+                        3 => field_no = a.int(),
+                        5 => nseg = a.int(),
+                        4 => stream = a.int() == 1,
+                        _ => {}
+                    }
+                }
+                let mut segments = Vec::with_capacity(nseg.max(0) as usize);
+                for _ in 0..nseg {
+                    let lb = f
+                        .get(at..at + 2)
+                        .ok_or_else(|| Refused("a blob ended mid-segment".into()))?;
+                    let n = u16::from_le_bytes([lb[0], lb[1]]) as usize;
+                    at += 2;
+                    let d = f
+                        .get(at..at + n)
+                        .ok_or_else(|| Refused("a blob segment past the end".into()))?
+                        .to_vec();
+                    at += n;
+                    segments.push(d);
+                }
+                // the blob belongs to the LAST row, at the column whose
+                // field id the record names
+                let table = &mut out.tables[t];
+                let col = table
+                    .cols
+                    .iter()
+                    .position(|c| c.field_id as i64 == field_no)
+                    .ok_or_else(|| Refused("a blob for an unknown field".into()))?;
+                let row = table
+                    .rows
+                    .last_mut()
+                    .ok_or_else(|| Refused("a blob before any row".into()))?;
+                match row.get_mut(col) {
+                    Some(RVal::Blob { stream: st, segments: sg }) => {
+                        *st = stream;
+                        *sg = segments;
+                    }
+                    _ => return Err(Refused("a blob for a non-blob value".into())),
+                }
             }
             rec::REL_CONSTRAINT => {
                 let atts = read_atts(f, &mut at)?;
