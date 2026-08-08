@@ -3572,7 +3572,8 @@ impl RowSource {
                 }
             }
             RowSource::IndexScan { rel, formats, access, width } => {
-                for values in records_for(db, *rel, formats, access) {
+                let (rows, limbo) = records_for_2pc(db, *rel, formats, access);
+                for values in rows {
                     let mut row = values;
                     if let Some(w) = width {
                         row.resize(*w, Value::Null);
@@ -3580,6 +3581,11 @@ impl RowSource {
                     if matches!(sink(row)?, Flow::Stop) {
                         return Ok(Flow::Stop);
                     }
+                }
+                // the index narrows what is READ, and limbo raises only
+                // when a named record was read - measured both ways
+                if limbo != 0 {
+                    return Err(EvalErr::RecInLimbo(limbo));
                 }
                 Ok(Flow::Continue)
             }
@@ -3704,13 +3710,17 @@ impl RowSource {
                 Ok(out)
             }
             RowSource::IndexScan { rel, formats, access, width } => {
+                let (rows, limbo) = records_for_2pc(db, *rel, formats, access);
                 let mut out = Vec::new();
-                for values in records_for(db, *rel, formats, access) {
+                for values in rows {
                     let mut row = values;
                     if let Some(w) = width {
                         row.resize(*w, Value::Null);
                     }
                     out.push(row);
+                }
+                if limbo != 0 {
+                    return Err(EvalErr::RecInLimbo(limbo));
                 }
                 Ok(out)
             }
@@ -15739,7 +15749,15 @@ fn dml_targets_at(
         // A WRITE READS FIRST, and it reads what this transaction sees:
         // rows another attachment has written but not committed are not
         // this statement's to update or delete.
-        let Some((image, format)) = view.version(&db_image, db.page_size, &r) else { continue };
+        let Some((image, format)) = view.version(&db_image, db.page_size, &r) else {
+            // the index narrows what is READ, and limbo raises only
+            // when read (measured: a probe AWAY from the limbo key
+            // answers; a probe AT it, or a range crossing it, raises)
+            if view.limbo.get() != 0 {
+                return Err(EvalErr::RecInLimbo(view.limbo.get()));
+            }
+            continue;
+        };
         let descs = formats
             .iter()
             .find(|(n, _)| *n == format)
@@ -16032,6 +16050,13 @@ fn collect_dml_targets(
         };
         for r in dp.records() {
             let Some((image, format)) = view.version(&db_image, db.page_size, &r) else {
+                // A WRITE'S SCAN MEETS THE LIMBO LAW TOO - measured:
+                // even an UPDATE of a SETTLED row raises when the scan
+                // walks into a limbo record, and a DELETE that matches
+                // nothing raises the same way
+                if view.limbo.get() != 0 {
+                    return Err(EvalErr::RecInLimbo(view.limbo.get()));
+                }
                 continue;
             };
             let descs = formats
@@ -21172,7 +21197,10 @@ fn branch_rows_res(
     // an aggregate could not seed a recursive CTE or feed an
     // INSERT ... SELECT, even though it answers perfectly on its own.
     if let Plan::Scalar(v, ..) = plan {
-        let n = scalar_value(v, Some(db)).map_err(|_| EvalErr::Unsupported)?;
+        let n = scalar_value(v, Some(db)).map_err(|e| match e {
+            ScalarErr::Limbo(id) => EvalErr::RecInLimbo(id),
+            ScalarErr::Gone => EvalErr::Unsupported,
+        })?;
         return Ok(vec![vec![match n {
             Some(n) => Value::Int(n),
             None => Value::Null,
@@ -22997,8 +23025,11 @@ fn plan_query_inner_ctx(
                 // compute, not what was computed: a plan that carried
                 // the number answered it for ever once the statement
                 // cache kept the plan.
-                if aggregate(db, rel, &formats, &columns, &descs, *func, target, &filter, &agg_index)
-                    .is_some()
+                if aggregate(
+                    db, rel, &formats, &columns, &descs, *func, target, &filter, &agg_index,
+                    &std::cell::Cell::new(0),
+                )
+                .is_some()
                 {
                     // the engine names a lone aggregate's column by its
                     // function (probed) - CONSTANT here was a standing
@@ -24263,16 +24294,17 @@ fn parse_group_by(
 /// can no longer be computed at all - a generator dropped since the
 /// statement was prepared, an aggregate shape that has stopped being
 /// supported - which the caller reports as it reports a bind failure.
-fn scalar_value(v: &ScalarVal, db: Option<&Database>) -> Result<Option<i64>, ()> {
+fn scalar_value(v: &ScalarVal, db: Option<&Database>) -> Result<Option<i64>, ScalarErr> {
     match v {
         ScalarVal::Fixed(n) => Ok(*n),
         ScalarVal::GenRead(name) => {
-            let db = db.ok_or(())?;
-            read_generator_value(db, name).map(Some).ok_or(())
+            let db = db.ok_or(ScalarErr::Gone)?;
+            read_generator_value(db, name).map(Some).ok_or(ScalarErr::Gone)
         }
         ScalarVal::Agg(a) => {
-            let db = db.ok_or(())?;
-            aggregate(
+            let db = db.ok_or(ScalarErr::Gone)?;
+            let limbo = std::cell::Cell::new(0u64);
+            let r = aggregate(
                 db,
                 a.rel,
                 &a.formats,
@@ -24282,10 +24314,23 @@ fn scalar_value(v: &ScalarVal, db: Option<&Database>) -> Result<Option<i64>, ()>
                 &a.target,
                 &a.filter,
                 &a.index,
-            )
-            .ok_or(())
+                &limbo,
+            );
+            if limbo.get() != 0 {
+                return Err(ScalarErr::Limbo(limbo.get()));
+            }
+            r.ok_or(ScalarErr::Gone)
         }
     }
+}
+
+/// Why a [ScalarVal] could not be computed: the plan's referent is gone
+/// (a dropped generator, an unsupported shape - the caller reports it
+/// as a bind failure, as ever), or the fold's scan MET A LIMBO RECORD -
+/// which is the engine's typed raise, not a fallback.
+enum ScalarErr {
+    Gone,
+    Limbo(u64),
 }
 
 /// Compute a scalar aggregate over the matching rows. COUNT works on any
@@ -24304,6 +24349,7 @@ fn aggregate(
     target: &AggTarget,
     filter: &Option<Predicate>,
     index: &Option<IndexAccess>,
+    limbo: &std::cell::Cell<u64>,
 ) -> Option<Option<i64>> {
     // an eval error in the filter DECLINES the prepare-time fast path
     // (poisons the flag); the caller then routes through the group
@@ -24332,14 +24378,24 @@ fn aggregate(
     // reader counts is a row or a deleted stub.
     if let (AggFn::Count, AggTarget::Star) = (func, target) {
         let n = match filter {
-            None => count_visible_records(db, rel),
+            None => match count_visible_records(db, rel) {
+                Ok(n) => n,
+                Err(id) => {
+                    limbo.set(id);
+                    return None;
+                }
+            },
             Some(_) => {
                 let mut n = 0i64;
-                for_each_candidate(db, rel, formats, index, |v| {
+                let hit = for_each_candidate(db, rel, formats, index, |v| {
                     if matches(v) {
                         n += 1;
                     }
                 });
+                if hit != 0 {
+                    limbo.set(hit);
+                    return None;
+                }
                 n
             }
         };
@@ -24363,11 +24419,15 @@ fn aggregate(
     // COUNT(col) counts non-null values; MIN/MAX/SUM need an integer column
     if matches!(func, AggFn::Count) {
         let mut n = 0i64;
-        for_each_candidate(db, rel, formats, index, |v| {
+        let hit = for_each_candidate(db, rel, formats, index, |v| {
             if matches(v) && matches!(v.get(fid), Some(x) if !matches!(x, Value::Null)) {
                 n += 1;
             }
         });
+        if hit != 0 {
+            limbo.set(hit);
+            return None;
+        }
         if ferr.get() {
             return None;
         }
@@ -24388,7 +24448,7 @@ fn aggregate(
         return None;
     }
     let mut acc: Option<i64> = None;
-    for_each_candidate(db, rel, formats, index, |v| {
+    let hit = for_each_candidate(db, rel, formats, index, |v| {
         if !matches(v) {
             return;
         }
@@ -24403,6 +24463,10 @@ fn aggregate(
             (AggFn::Count | AggFn::Avg, _) => unreachable!(),
         });
     });
+    if hit != 0 {
+        limbo.set(hit);
+        return None;
+    }
     if ferr.get() {
         return None;
     }
@@ -24439,6 +24503,20 @@ fn records_for(
     formats: &[(u8, Vec<Descriptor>)],
     access: &IndexAccess,
 ) -> Vec<Vec<Value>> {
+    let (out, _limbo) = records_for_2pc(db, rel, formats, access);
+    out
+}
+
+/// [records_for] with the limbo hit SURFACED: the second element is the
+/// limbo transaction a FETCHED record belonged to (0 = none). The index
+/// narrows what is read, and limbo raises only when read - a probe away
+/// from the limbo key answers normally, measured.
+fn records_for_2pc(
+    db: &Database,
+    rel: u16,
+    formats: &[(u8, Vec<Descriptor>)],
+    access: &IndexAccess,
+) -> (Vec<Vec<Value>>, u64) {
     let mut out = Vec::new();
     // ONE ROW PER RECORD, however many entries name it. `insert_index_entry`
     // skips an entry it already holds, but only within the leaf page it
@@ -24492,7 +24570,7 @@ fn records_for(
     // [page_sequence_map] for the measurements.
     let per_page = fire_crab_ods::format::max_recs_per_dp(db.page_size);
     if per_page == 0 {
-        return out;
+        return (out, 0);
     }
     let image = db.bytes();
     let view = ReadView::of(db, &image);
@@ -24513,8 +24591,11 @@ fn records_for(
                 out.push(values);
             }
         }
+        if view.limbo.get() != 0 {
+            return (out, view.limbo.get());
+        }
     }
-    out
+    (out, view.limbo.get())
 }
 
 /// The relation's `sequence -> page number` map.
@@ -24729,10 +24810,11 @@ fn for_each_candidate<F: FnMut(&[Value])>(
     let Some(access) = index else {
         return for_each_record(db, rel, formats, f);
     };
-    for values in records_for(db, rel, formats, access) {
+    let (rows, limbo) = records_for_2pc(db, rel, formats, access);
+    for values in rows {
         f(&values);
     }
-    0
+    limbo
 }
 
 /// [for_each_record], with a walk the consumer can END.
@@ -24781,11 +24863,11 @@ fn for_each_record_while<F: FnMut(&[Value]) -> Flow>(
 /// `SELECT COUNT(*)` with no filter. See [ReadView] for whose rows they
 /// are; the only difference here is that no image is assembled, because
 /// a count needs the answer and not the bytes.
-fn count_visible_records(db: &Database, rel: u16) -> i64 {
+fn count_visible_records(db: &Database, rel: u16) -> Result<i64, u64> {
     let db_image = db.bytes();
     let Some(tips) = fire_crab_ods::tra::TipChain::read(&db_image, db.page_size) else {
         // no transaction inventory to consult: what the walk did before
-        return fire_crab_ods::count_primary_records(&db_image, db.page_size, rel) as i64;
+        return Ok(fire_crab_ods::count_primary_records(&db_image, db.page_size, rel) as i64);
     };
     let own = db.own_tx();
     let mut n = 0i64;
@@ -24798,12 +24880,14 @@ fn count_visible_records(db: &Database, rel: u16) -> i64 {
             continue;
         };
         for r in dp.records() {
-            if fire_crab_ods::tra::visible_exists(&db_image, db.page_size, &r, &tips, &own) {
+            // a COUNT meets the limbo law too - measured, the engine
+            // raises rather than answering a number nobody can stand by
+            if fire_crab_ods::tra::visible_exists_2pc(&db_image, db.page_size, &r, &tips, &own, true)? {
                 n += 1;
             }
         }
     }
-    n
+    Ok(n)
 }
 
 /// Returns the LIMBO transaction the walk stopped on, 0 when none -
@@ -26632,7 +26716,10 @@ fn emit_rows_inner(
         | Plan::GenIdIncrement { .. } | Plan::SetGenerator { .. } => {}
         Plan::Scalar(v, ..) => {
             // WORKED OUT HERE, not at prepare - see [ScalarVal]
-            let n = scalar_value(v, db.as_ref()).map_err(|_| EmitErr::Bind)?;
+            let n = scalar_value(v, db.as_ref()).map_err(|e| match e {
+                ScalarErr::Limbo(id) => EmitErr::Eval(EvalErr::RecInLimbo(id)),
+                ScalarErr::Gone => EmitErr::Bind,
+            })?;
             w.int(OP_FETCH_RESPONSE).int(0).int(1);
             match n {
                 Some(n) => {
@@ -41220,6 +41307,18 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 match &p {
                     Plan::Scalar(v, ..) => {
                         // worked out here, not at prepare - see [ScalarVal]
+                        // a limbo hit is the engine's typed raise, not
+                        // a NULL - see [ScalarErr]
+                        if let Err(ScalarErr::Limbo(id)) =
+                            scalar_value(v, database.as_ref())
+                        {
+                            respond_eval_error(
+                                &mut s,
+                                &mut enc,
+                                &EvalErr::RecInLimbo(id),
+                            )?;
+                            continue;
+                        }
                         let n = scalar_value(v, database.as_ref()).unwrap_or(None);
                         w.int(OP_SQL_RESPONSE).int(1);
                         match n {

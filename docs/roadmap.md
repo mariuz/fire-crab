@@ -2755,9 +2755,12 @@ plus *the subsystem is now on the path*.
   is all gfix -commit/-rollback/-list are; a reader meeting a limbo
   record raises isc_rec_in_limbo naming the transaction, gbak dies on
   the same law, and a statement under a prepared transaction refuses
-  with the limbo intact. Boundaries: COUNT(*)/index scans do not
-  detect limbo yet; the TDR description is set aside; a DDL
-  transaction's prepare refuses (its undo is an in-memory image).
+  with the limbo intact. The COUNT(*)/index/DML boundaries closed in
+  the increment after (gate 13 -> 20): every reader path raises, and
+  the index raises exactly when it READS the limbo record - a probe
+  away from its key answers, measured both ways. Still recorded: the
+  TDR description is set aside; a DDL transaction's prepare refuses
+  (its undo is an in-memory image).
   With this, EVERY gfix FAMILY the tool ships is either converted or
   typed-refused.
 

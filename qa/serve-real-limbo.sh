@@ -56,7 +56,10 @@ mkdb() { # <path>
     "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
 CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE T2PC (ID INTEGER, V VARCHAR(10));
+CREATE TABLE TIX (ID INTEGER, V VARCHAR(10));
+CREATE INDEX IX_TIX ON TIX (ID);
 COMMIT;
+INSERT INTO TIX VALUES (0, 'settled');
 INSERT INTO T2PC VALUES (0, 'settled');
 COMMIT;
 EOF
@@ -132,7 +135,31 @@ check "...the rolled-back row is gone and the list is empty, both" \
     "$(rd "$F")|$("$GFIX" -list -user "$U" -pas "$P" "$F" 2>&1)" \
     "$(rd "$E")|$("$GFIX" -list -user "$U" -pas "$P" "$E" 2>&1)"
 
-# --- 5. the refusal for an id that is not in limbo -----------------------------
+# --- 5. every reader meets the law: COUNT, aggregates, DML, the index ---------
+# fresh limbo rows - one in the plain table, one in the INDEXED one
+"$RIG" limbo "$E" >/dev/null 2>&1
+"$RIG" limbo "$F" >/dev/null 2>&1
+FB2PC_INSERT="INSERT INTO TIX (ID, V) VALUES (5, 'lp')" "$RIG" limbo "$E" >/dev/null 2>&1
+FB2PC_INSERT="INSERT INTO TIX (ID, V) VALUES (5, 'lp')" "$RIG" limbo "$F" >/dev/null 2>&1
+qn() { # <conn> <sql> - normalized (the ids differ per server)
+    printf 'SET HEADING OFF;
+%s
+' "$2" |
+        "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 |
+        tr -s ' 
+' ' ' | sed 's/transaction [0-9]*/transaction N/'
+}
+for sql in 'SELECT COUNT(*) FROM T2PC;' 'SELECT MAX(ID) FROM T2PC;'     "UPDATE T2PC SET V='y' WHERE ID=0;" 'DELETE FROM T2PC WHERE ID=99;'; do
+    check "the law holds for: $sql" "$(qn "$F" "$sql")" "$(qn "$E" "$sql")"
+done
+# THE INDEX NARROWS WHAT IS READ, AND LIMBO RAISES ONLY WHEN READ:
+# a probe away from the limbo key answers, a probe at it or a range
+# crossing it raises - measured, and the exact seam of W1's sentence
+for sql in 'SELECT V FROM TIX WHERE ID = 0;' 'SELECT V FROM TIX WHERE ID = 5;'     'SELECT V FROM TIX WHERE ID > 2;'; do
+    check "the index law holds for: $sql" "$(qn "$F" "$sql")" "$(qn "$E" "$sql")"
+done
+
+# --- 6. the refusal for an id that is not in limbo -----------------------------
 check "reconnecting a non-limbo id answers the engine's own pair" \
     "$("$RIG" resolve "$F" 999999 c 2>&1 | tail -2)" \
     "$("$RIG" resolve "$E" 999999 c 2>&1 | tail -2)"

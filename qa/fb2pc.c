@@ -93,10 +93,13 @@ int main(int argc, char **argv) {
         printf("transaction id %ld\n", tid);
     }
 
+    /* FB2PC_INSERT overrides the write - the index-law probes put the
+     * limbo row into an INDEXED table */
+    const char *ins = getenv("FB2PC_INSERT")
+        ? getenv("FB2PC_INSERT")
+        : "INSERT INTO T2PC (ID, V) VALUES (1, 'p')";
     if (strcmp(mode, "noop") != 0 &&
-        isc_dsql_execute_immediate(st, &db, &tr, 0,
-            "INSERT INTO T2PC (ID, V) VALUES (1, 'p')",
-            3, NULL))
+        isc_dsql_execute_immediate(st, &db, &tr, 0, ins, 3, NULL))
         die("insert", st);
 
     if (argc >= 4 && strcmp(mode, "limbo") == 0) {

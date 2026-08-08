@@ -13,6 +13,29 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-08 — every reader meets the limbo law
+
+### Converted
+- **The paths Inc429 recorded as boundaries, closed.** COUNT(*) (both
+  the header-count fast path and the filtered fold), MIN/MAX/SUM, the
+  UPDATE/DELETE target walks (measured: even an UPDATE of a SETTLED
+  row raises when its scan walks into a limbo record, and a DELETE
+  that matches nothing raises the same way), and the INDEX-driven
+  retrieval - where the law has a finer grain, measured both ways:
+  **the index narrows what is READ, and limbo raises only when a named
+  record is read.** A probe away from the limbo key answers normally;
+  a probe at it, or a range crossing it, raises. That is exactly W1's
+  sentence ("an index narrows what is READ and never what is
+  ANSWERED") meeting the two-phase law.
+- The scalar fold ships the TYPED vector through a new [ScalarErr]:
+  a lone aggregate computed at fetch raises `isc_rec_in_limbo` naming
+  the transaction instead of answering NULL or falling back.
+
+### Gated
+- `qa/serve-real-limbo.sh` 13 → 20: COUNT / MAX / UPDATE-of-settled /
+  no-match-DELETE compared against the engine verbatim (ids
+  normalized), and the three index shapes - away, at, crossing.
+
 ## 2026-08-08 — a transaction that survives its own death
 
 ### Converted
