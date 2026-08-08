@@ -2637,8 +2637,9 @@ plus *the subsystem is now on the path*.
   surface~~ **DONE the increment after** (qa/serve-real-psqltext.sh,
   12): PAD SPACE semantics measured and kept, the stored-BLR boundary
   guarded (a text literal has no probed BLR - bodies carrying one are
-  interpreted, never emitted; CHECK stays int-only). Still outside:
-  `B = NULL` (assigning the NULL keyword), its own slice;
+  interpreted, never emitted; CHECK stays int-only). ~~Still outside: `B = NULL`~~ DONE the
+  increment after (gate 12 -> 16): Expr::NullLiteral, whose blr_null
+  byte was already probed by the DECLARE null-init emission;
   **a BIGINT literal is outside the PSQL surface** (`Expr::IntLiteral` is an `i32`, and widening it changes BLR
   encoding and type ranking - its own increment), **`INSERT ... VALUES`
   without a column list** is outside it too, and **`CREATE PROCEDURE` is

@@ -87,6 +87,17 @@ both "an embedded UPDATE's WHERE takes text" \
     "UPDATE T SET ID = 9 WHERE V = 'one'; IF (ROW_COUNT = 1) THEN EXCEPTION E_T;"
 both "the doubled-quote escape survives" "B='it''s'; IF (B = 'it''s') THEN EXCEPTION E_T;"
 
+# --- NULL is a value the keyword can say ----------------------------------------
+# (the increment after the text one: B = NULL used to refuse the body)
+both "the NULL keyword assigns NULL to a text variable" \
+    "B='x'; B=NULL; IF (B IS NULL) THEN EXCEPTION E_T;"
+both "...and to an integer variable" \
+    "A=5; A=NULL; IF (A IS NULL) THEN EXCEPTION E_T;"
+both "comparing WITH the NULL keyword is UNKNOWN - the IF skips" \
+    "B='x'; IF (B = NULL) THEN EXCEPTION E_T;"
+both "NULL propagates through arithmetic" \
+    "A=NULL; A=A+1; IF (A IS NULL) THEN EXCEPTION E_T;"
+
 # --- the stored-BLR boundary stays closed --------------------------------------
 out=$(printf "CREATE TABLE TCX (V VARCHAR(5) CHECK (V = 'x'));\n" |
     "$ISQL" -q -b -user "$U" -pas "$P" "$F" 2>&1 | head -1)

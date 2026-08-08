@@ -13,6 +13,21 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-08 — NULL is a value the keyword can say
+
+### Converted
+- **`B = NULL` — assigning the NULL keyword** — the gap the text
+  increment recorded. `Expr::NullLiteral`, whose BLR is the one
+  already-probed byte (`blr_null`, 45 — the same byte the engine's own
+  DECLARE null-init assignments carry, which this emitter has written
+  since triggers were converted). Assignment to text and integer
+  variables, comparison with the keyword (UNKNOWN — the IF skips), and
+  propagation through arithmetic all match the engine; the CHECK
+  surface keeps refusing NULL comparisons by rank, as it always did.
+
+### Gated
+- `qa/serve-real-psqltext.sh` 12 → 16.
+
 ## 2026-08-08 — text meets the condition
 
 ### Converted

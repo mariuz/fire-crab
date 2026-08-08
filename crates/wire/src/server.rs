@@ -8331,6 +8331,7 @@ fn infer_int_rank(
         Expr::Variable(_) => None, // no variables outside a trigger body
         Expr::IntLiteral(_) => Some(IntRank::Long),
         Expr::TextLiteral(_) => None, // the CHECK surface is INT-ONLY
+        Expr::NullLiteral => None,    // ...and NULL comparisons stay refused there
 
         Expr::Add(l, r) | Expr::Subtract(l, r) => {
             let (lr, rr) = (infer_int_rank(l, field_rank)?, infer_int_rank(r, field_rank)?);
@@ -8899,9 +8900,11 @@ fn expr_resolve_vars(
                 None => e.clone(),
             }
         }
-        Expr::Field { .. } | Expr::Variable(_) | Expr::IntLiteral(_) | Expr::TextLiteral(_) => {
-            e.clone()
-        }
+        Expr::Field { .. }
+        | Expr::Variable(_)
+        | Expr::IntLiteral(_)
+        | Expr::TextLiteral(_)
+        | Expr::NullLiteral => e.clone(),
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_resolve_vars(l, vars)),
             Box::new(expr_resolve_vars(r, vars)),
@@ -9017,9 +9020,11 @@ fn expr_plain_ctx(e: &fire_crab_ods::expr::Expr, ctx: u8) -> fire_crab_ods::expr
         Expr::Field { context, name } if *context == CTX_PLAIN => {
             Expr::Field { context: ctx, name: name.clone() }
         }
-        Expr::Field { .. } | Expr::Variable(_) | Expr::IntLiteral(_) | Expr::TextLiteral(_) => {
-            e.clone()
-        }
+        Expr::Field { .. }
+        | Expr::Variable(_)
+        | Expr::IntLiteral(_)
+        | Expr::TextLiteral(_)
+        | Expr::NullLiteral => e.clone(),
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_plain_ctx(l, ctx)),
             Box::new(expr_plain_ctx(r, ctx)),
@@ -9073,9 +9078,11 @@ fn expr_resolve_marked(
                 None => e.clone(),
             }
         }
-        Expr::Field { .. } | Expr::Variable(_) | Expr::IntLiteral(_) | Expr::TextLiteral(_) => {
-            e.clone()
-        }
+        Expr::Field { .. }
+        | Expr::Variable(_)
+        | Expr::IntLiteral(_)
+        | Expr::TextLiteral(_)
+        | Expr::NullLiteral => e.clone(),
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_resolve_marked(l, vars, marked)),
             Box::new(expr_resolve_marked(r, vars, marked)),
@@ -9336,7 +9343,7 @@ fn expr_has_text(e: &fire_crab_ods::expr::Expr) -> bool {
     use fire_crab_ods::expr::Expr;
     match e {
         Expr::TextLiteral(_) => true,
-        Expr::Field { .. } | Expr::Variable(_) | Expr::IntLiteral(_) => false,
+        Expr::Field { .. } | Expr::Variable(_) | Expr::IntLiteral(_) | Expr::NullLiteral => false,
         Expr::Add(l, r) | Expr::Subtract(l, r) | Expr::Multiply(l, r) | Expr::Divide(l, r) => {
             expr_has_text(l) || expr_has_text(r)
         }
@@ -10593,7 +10600,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         use fire_crab_ods::expr::Expr;
         match e {
             Expr::Field { context, name } => out.push((*context, name.clone())),
-            Expr::Variable(_) | Expr::IntLiteral(_) | Expr::TextLiteral(_) => {}
+            Expr::Variable(_) | Expr::IntLiteral(_) | Expr::TextLiteral(_) | Expr::NullLiteral => {}
             Expr::Add(l, r) | Expr::Subtract(l, r) | Expr::Multiply(l, r) | Expr::Divide(l, r) => {
                 expr_fields(l, out);
                 expr_fields(r, out);
@@ -11788,6 +11795,7 @@ fn expr_with_context(e: &fire_crab_ods::expr::Expr, context: u8) -> fire_crab_od
         Expr::Variable(n) => Expr::Variable(*n),
         Expr::IntLiteral(v) => Expr::IntLiteral(*v),
         Expr::TextLiteral(t) => Expr::TextLiteral(t.clone()),
+        Expr::NullLiteral => Expr::NullLiteral,
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_with_context(l, context)),
             Box::new(expr_with_context(r, context)),
@@ -11839,6 +11847,7 @@ fn expr_all_plain(e: &fire_crab_ods::expr::Expr) -> bool {
         Expr::Variable(_) => false, // only a trigger body has variables
         Expr::IntLiteral(_) => true,
         Expr::TextLiteral(_) => true,
+        Expr::NullLiteral => true,
         Expr::Add(l, r) | Expr::Subtract(l, r) | Expr::Multiply(l, r) | Expr::Divide(l, r) => {
             expr_all_plain(l) && expr_all_plain(r)
         }
@@ -11958,6 +11967,10 @@ fn blr_expr_factor(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Exp
             let t = t.clone();
             *p += 1;
             Some(Expr::TextLiteral(t))
+        }
+        ETok::Id(name) if name == "NULL" => {
+            *p += 1;
+            Some(Expr::NullLiteral)
         }
         ETok::Id(name) => {
             let name = name.clone();
@@ -37443,6 +37456,7 @@ fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value,
     match e {
         E::IntLiteral(v) => Ok(Value::Int(*v as i64)),
         E::TextLiteral(t) => Ok(Value::Text(t.clone())),
+        E::NullLiteral => Ok(Value::Null),
         E::Variable(n) => Ok(f.vars.get(*n as usize).cloned().unwrap_or(Value::Null)),
         // a bare column reference has no row to read inside a procedure
         E::Field { .. } => Err(PsqlStop::Unsupported),
@@ -38054,6 +38068,7 @@ fn render_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Option<Stri
         E::IntLiteral(v) => v.to_string(),
         // re-quoted the way the lexer unquoted it
         E::TextLiteral(t) => format!("'{}'", t.replace('\'', "''")),
+        E::NullLiteral => "NULL".to_string(),
         E::Variable(n) => psql_literal(f.vars.get(*n as usize).unwrap_or(&Value::Null))?,
         E::Field { name, .. } => name.clone(),
         E::Add(a, b) => format!("({} + {})", render_psql_expr(a, f)?, render_psql_expr(b, f)?),

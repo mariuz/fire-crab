@@ -48,6 +48,9 @@ pub enum Expr {
     Variable(u16),
     /// `blr_literal blr_long`: a 32-bit integer, scale 0.
     IntLiteral(i32),
+    /// `blr_null` (45): the NULL keyword as a value - probed, it is the
+    /// same byte the engine's own DECLARE null-init assignments carry.
+    NullLiteral,
     /// A quoted string. PSQL conditions compare text with PAD-SPACE
     /// semantics (measured: `'x' = 'x '` is TRUE, `'x' = 'X'` is not).
     /// The CHECK-constraint surface stays INT-ONLY: `infer_int_rank`
@@ -81,6 +84,7 @@ impl Expr {
                 out.push(0); // scale
                 out.extend_from_slice(&v.to_le_bytes());
             }
+            Expr::NullLiteral => out.push(45), // blr_null - probed
             Expr::TextLiteral(t) => {
                 // blr_literal blr_text <u16 len> <bytes> - shaped like
                 // the engine's, but UNREACHABLE from any stored-BLR
@@ -129,7 +133,7 @@ impl Expr {
                     refs.push(name.clone());
                 }
             }
-            Expr::IntLiteral(_) | Expr::TextLiteral(_) | Expr::Variable(_) => {}
+            Expr::IntLiteral(_) | Expr::TextLiteral(_) | Expr::NullLiteral | Expr::Variable(_) => {}
             Expr::Add(l, r)
             | Expr::Subtract(l, r)
             | Expr::Multiply(l, r)
