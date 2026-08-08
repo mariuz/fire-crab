@@ -13,6 +13,35 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-08 — a procedure says what it declared
+
+### Converted
+- **Procedure output parameters describe their DECLARED types.** Every
+  output was announced as BIGINT (581/8): the values agreed, the
+  widths a client renders did not — visible the moment a procedure has
+  two output columns. `proc_out_col` now rides `wire_for`, the same
+  descriptor-to-wire mapping every table column uses, for both the
+  `SELECT * FROM P` projection and the `EXECUTE PROCEDURE` describe —
+  isql output is byte-identical to the engine's, underlines included.
+- **TEXT output parameters ride now** — the interpreter's variables
+  have been Value slots all along, and the loader's int-only check
+  predates the text increments. Text INPUTS stay refused: the call
+  sites parse integer literals and NULL, and a silently coerced text
+  argument would be a wrong answer (recorded boundary).
+
+### Fixed
+- RDB$FIELD_LENGTH is the PAYLOAD; a record descriptor's VARYING
+  length carries the 2-byte count word on top, and the describe
+  subtracts it back — without the normalization in `domain_desc` a
+  VARCHAR(7) output announced as 5 and isql drew the column a width
+  short. Caught by the first differential render.
+
+### Gated
+- `qa/serve-real-procdescribe.sh` (new, 7): mixed-type outputs
+  byte-identical through both call shapes, projections and aliases
+  keeping their columns' types, the text-output round trip, and the
+  text-input refusal.
+
 ## 2026-08-08 — NULL is a value the keyword can say
 
 ### Converted

@@ -2615,10 +2615,13 @@ plus *the subsystem is now on the path*.
     what they touched back into the frame, and a statement that matched
     nothing answers 0 rather than leaving the previous count.
 
-  Also found while gating: **fire-crab announces every procedure OUTPUT
-  PARAMETER as BIGINT**, where the engine announces the declared type -
-  the values agree, the column widths a client prints do not, which is
-  visible the moment a procedure has two output columns; **an
+  ~~fire-crab announces every procedure OUTPUT
+  PARAMETER as BIGINT~~ **DONE** (qa/serve-real-procdescribe.sh, 7):
+  proc_out_col rides wire_for, both call shapes render byte-identical
+  to the engine, TEXT outputs ride now (text INPUTS stay refused - the
+  arg parsers are integer-and-NULL, a recorded boundary), and the
+  VARYING count-word normalization in domain_desc came out of the
+  first differential render; **an
   expression in a `DECLARE ... CURSOR FOR (...)` select list must be
   ALIASED** or the engine answers "Invalid command" (the identical
   SELECT runs standalone); ~~`SELECT ... INTO :v` - the STATIC

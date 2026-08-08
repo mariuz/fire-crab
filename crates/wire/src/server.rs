@@ -6321,6 +6321,36 @@ fn nullable(sql_type: i32) -> i32 {
     sql_type | 1
 }
 
+/// A procedure OUTPUT PARAMETER's projection column: the DECLARED
+/// type, not a BIGINT stand-in. The engine announces what the DDL
+/// declared (measured: A INTEGER, B VARCHAR(7), C SMALLINT print at
+/// their own widths through isql) - the VALUES always agreed, the
+/// widths a client renders did not, which is visible the moment a
+/// procedure has two output columns.
+fn proc_out_col(
+    name: String,
+    fname: Option<String>,
+    pname: &str,
+    i: usize,
+    d: &Descriptor,
+) -> ProjCol {
+    let (wire, sql_type, length, scale, sub_type) = wire_for(d);
+    ProjCol {
+        name,
+        fname,
+        relation: Some(pname.to_string()),
+        rel_alias: None,
+        field_id: i,
+        wire,
+        sql_type: nullable(sql_type),
+        length,
+        oct_length: length,
+        scale,
+        sub_type,
+        expr: None,
+    }
+}
+
 fn wire_for(d: &Descriptor) -> (Wire, i32, i32, i32, i32) {
     let scale = d.scale as i32;
     match d.dtype {
@@ -22195,22 +22225,10 @@ fn plan_query_inner_ctx(
             .outs
             .iter()
             .enumerate()
-            .map(|(i, p)| ProjCol {
-                name: p.name.clone(),
-                fname: None,
-                // probed: EXECUTE PROCEDURE P answers the procedure as
-                // the relation of each output parameter, no alias
-                relation: Some(pname.clone()),
-                rel_alias: None,
-                field_id: i,
-                wire: Wire::Int64,
-                sql_type: 581, // nullable - see wire_for
-                length: 8,
-                oct_length: 8,
-                scale: 0,
-                sub_type: 0,
-                expr: None,
-            })
+            // probed: EXECUTE PROCEDURE P answers the procedure as
+            // the relation of each output parameter, no alias - and
+            // each parameter describes its DECLARED type
+            .map(|(i, p)| proc_out_col(p.name.clone(), None, &pname, i, &p.desc))
             .collect();
         // the body runs at EXECUTE, not here: it may write
         return Some(Plan::ProcInvoke { name: pname, args, cols });
@@ -22756,23 +22774,18 @@ fn plan_query_inner_ctx(
                     let cols: Vec<ProjCol> = picked
                         .iter()
                         .enumerate()
-                        .map(|(i, (p, alias))| ProjCol {
-                            name: alias.clone().unwrap_or_else(|| out_names[*p].clone()),
-                            // the declared output parameter is the field
-                            // name (probed: R AS RR is field R, alias RR)
-                            fname: Some(out_names[*p].clone()),
-                            // probed: `FROM P(1)` answers the PROCEDURE
-                            // as the relation, and no binding alias
-                            relation: Some(pname.clone()),
-                            rel_alias: None,
-                            field_id: i,
-                            wire: Wire::Int64,
-                            sql_type: 581,
-                            length: 8,
-                            oct_length: 8,
-                            scale: 0,
-                            sub_type: 0,
-                            expr: None,
+                        .map(|(i, (p, alias))| {
+                            proc_out_col(
+                                alias.clone().unwrap_or_else(|| out_names[*p].clone()),
+                                // the declared output parameter is the
+                                // field name (probed: R AS RR is field
+                                // R, alias RR); `FROM P(1)` answers the
+                                // PROCEDURE as the relation, no alias
+                                Some(out_names[*p].clone()),
+                                &pname,
+                                i,
+                                &meta.outs[*p].desc,
+                            )
                         })
                         .collect();
                     let picks: Vec<usize> = picked.iter().map(|(p, _)| *p).collect();
@@ -37164,10 +37177,16 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     let domain_desc = |dom: &str| -> Option<Descriptor> {
         let (ft, len, scale, sub) =
             fire_crab_ods::ddl::domain_type_info(&db.bytes(), db.page_size, dom)?;
+        let dtype = fire_crab_ods::ddl::field_type_to_dtype(ft)?;
+        // RDB$FIELD_LENGTH is the PAYLOAD; a record descriptor's VARYING
+        // length carries the 2-byte count word on top, and wire_for
+        // (the describe) subtracts it back - without this a VARCHAR(7)
+        // output announced as 5 and isql drew the column a width short
+        let length = if dtype == dtype::VARYING { len + 2 } else { len };
         Some(Descriptor {
-            dtype: fire_crab_ods::ddl::field_type_to_dtype(ft)?,
+            dtype,
             scale,
-            length: len,
+            length,
             sub_type: sub,
             flags: 0,
             offset: 0,
@@ -37178,10 +37197,19 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     raw.sort_by_key(|(t, n, _, _)| (*t, *n));
     for (typ, _, pnm, fs) in raw {
         let desc = domain_desc(&fs)?;
-        // integer parameters only - the interpreter's Expr is integer
-        // arithmetic, and a silently coerced text parameter would be a
-        // wrong answer rather than a refusal
-        if !matches!(col_kind(&desc), Some(ColKind::Int)) {
+        // INPUTS are integer-only still: the call-site argument parsers
+        // read integer literals and NULL, and a silently coerced text
+        // argument would be a wrong answer rather than a refusal.
+        // OUTPUTS take text too now - the frame's variables have been
+        // Value slots all along, the body assigns and compares text
+        // since the text increments, and the describe carries the
+        // declared type (see proc_out_col).
+        let ok = match col_kind(&desc) {
+            Some(ColKind::Int) => true,
+            Some(ColKind::Text) => typ != 0,
+            _ => false,
+        };
+        if !ok {
             return None;
         }
         let p = ProcParam { name: pnm, desc };
