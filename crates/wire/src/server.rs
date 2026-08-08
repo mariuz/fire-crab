@@ -316,6 +316,9 @@ const GDS_TRA_STATE: i32 = 335544468;
 const GDS_REQ_NO_TRANS: i32 = 335544363;
 /// "record from transaction @1 is stuck in limbo" - the reader's law
 const GDS_REC_IN_LIMBO: i32 = 335544459;
+/// "count of column list and variable list do not match" (JRD 349,
+/// SQLCODE -313) - a static SELECT INTO whose lists disagree
+const GDS_DSQL_COUNT_MISMATCH: i32 = 335544669;
 /// isc_primary_key_required - "Primary key required on table @1"
 /// (SQLSTATE 22000): UPDATE OR INSERT without MATCHING on a PK-less
 /// table, raised at prepare exactly as the engine raises it
@@ -8855,6 +8858,14 @@ enum TrigStmt {
     /// column count exactly - a mismatch, INCLUDING a query with no INTO
     /// at all, is "Output parameters mismatch".
     ExecStmt { text: Vec<DynPart>, into: Vec<u16>, src_off: usize },
+    /// `SELECT ... INTO :v[, :v];` - the STATIC singleton. Same fetch
+    /// contract as [TrigStmt::ExecStmt]'s INTO (one row assigns - NULLs
+    /// included - none leaves the slots alone, several raise 21000) with
+    /// the two measured divergences: the static form SETS `ROW_COUNT`
+    /// (1 on a match, 0 on none) where the dynamic form leaves it, and
+    /// an arity mismatch is the -313 "count of column list and variable
+    /// list do not match" vector, not the dynamic 42000.
+    SelectInto { sql: String, into: Vec<u16>, src_off: usize },
     /// `FOR EXECUTE STATEMENT <text> INTO :v[, ...] DO <stmt>;` - the
     /// loop over a dynamic query, LEAVE and all, exactly as the
     /// [TrigStmt::ForSelect] loop runs over a static one.
@@ -9279,6 +9290,7 @@ fn body_has_uninterpretable_blr(st: &TrigStmt) -> bool {
         | TrigStmt::AssignText { .. }
         | TrigStmt::Autonomous { .. }
         | TrigStmt::ExecStmt { .. }
+        | TrigStmt::SelectInto { .. }
         | TrigStmt::ForExecStmt { .. }
         | TrigStmt::CallProc { .. } => true,
         TrigStmt::If { then, otherwise, .. } => {
@@ -9589,6 +9601,48 @@ fn parse_trig_stmt(
             return None;
         }
         return Some(TrigStmt::Raise { name, src_off: start });
+    }
+    if find_word(&up, "SELECT", 0) == Some(0) {
+        // SELECT ... INTO :v[, :v] - the STATIC singleton. The INTO
+        // clause is LAST in the engine's grammar and illegal inside a
+        // subquery, so the split point is the last top-level INTO of
+        // the literal-masked text at paren depth 0.
+        let masked = mask_literals(&up);
+        let mut depth = 0i32;
+        let mut into_at: Option<usize> = None;
+        let bytes = masked.as_bytes();
+        let mut k = 0usize;
+        while k < bytes.len() {
+            match bytes[k] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                b'I' if depth == 0
+                    && masked[k..].starts_with("INTO")
+                    && k > 0
+                    && !bytes[k - 1].is_ascii_alphanumeric()
+                    && bytes[k - 1] != b'$'
+                    && bytes[k - 1] != b'_'
+                    && bytes
+                        .get(k + 4)
+                        .is_some_and(|c| !c.is_ascii_alphanumeric() && *c != b'$' && *c != b'_') =>
+                {
+                    into_at = Some(k);
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        let into_kw = into_at?;
+        let sql = text[..into_kw].trim().to_string();
+        let mut into = Vec::new();
+        for part in text[into_kw + "INTO".len()..].split(',') {
+            let name = part.trim().trim_start_matches(':').trim().trim_matches('"');
+            into.push(vars.iter().position(|v| v.eq_ignore_ascii_case(name))? as u16);
+        }
+        if into.is_empty() {
+            return None;
+        }
+        return Some(TrigStmt::SelectInto { sql, into, src_off: start });
     }
     if find_word(&up, "EXECUTE", 0) == Some(0)
         && find_word(&mask_literals(&up), "STATEMENT", "EXECUTE".len())
@@ -9960,6 +10014,7 @@ fn emit_trigger_stmt(
         | TrigStmt::AssignText { .. }
         | TrigStmt::Autonomous { .. }
         | TrigStmt::ExecStmt { .. }
+        | TrigStmt::SelectInto { .. }
         | TrigStmt::ForExecStmt { .. }
         | TrigStmt::CallProc { .. } => {}
         TrigStmt::Assign { target, expr, src_off } => {
@@ -10369,6 +10424,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | TrigStmt::AssignText { .. }
             | TrigStmt::Autonomous { .. }
             | TrigStmt::ExecStmt { .. }
+            | TrigStmt::SelectInto { .. }
             | TrigStmt::ForExecStmt { .. }
             | TrigStmt::CallProc { .. } => {}
             TrigStmt::Assign { expr, .. } => out.push(expr),
@@ -10410,6 +10466,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | TrigStmt::AssignText { .. }
             | TrigStmt::Autonomous { .. }
             | TrigStmt::ExecStmt { .. }
+            | TrigStmt::SelectInto { .. }
             | TrigStmt::ForExecStmt { .. }
             | TrigStmt::CallProc { .. } => {}
             TrigStmt::Assign { target, .. } => out.push(target),
@@ -10452,6 +10509,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | TrigStmt::AssignText { .. }
             | TrigStmt::Autonomous { .. }
             | TrigStmt::ExecStmt { .. }
+            | TrigStmt::SelectInto { .. }
             | TrigStmt::ForExecStmt { .. }
             | TrigStmt::CallProc { .. } => {}
             TrigStmt::Assign { .. } => {}
@@ -26288,6 +26346,16 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(ISC_ARG_NUMBER)
                 .int(*id as i32);
         }
+        EvalErr::DsqlCountMismatch => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-313)
+                .int(1) // isc_arg_gds
+                .int(GDS_DSQL_COUNT_MISMATCH);
+        }
         EvalErr::PrimaryKeyRequired(table) => {
             w.int(1) // isc_arg_gds
                 .int(GDS_DSQL_ERROR)
@@ -30310,6 +30378,13 @@ enum EvalErr {
     /// failure yet, so those two shapes are a boundary rather than a
     /// guess.
     ReadOnlyDatabase { dsql: bool },
+    /// a static `SELECT ... INTO` whose select list and variable list
+    /// disagree: `isc_dsql_error` + `isc_sqlerr`(-313) +
+    /// `isc_dsql_count_mismatch` (SQLSTATE 07002) - the engine raises
+    /// this at PREPARE of the block; this server's source interpreter
+    /// raises the same vector when the statement runs, the recorded
+    /// difference being the MOMENT, not the message
+    DsqlCountMismatch,
     /// a reader MET a record whose transaction is PREPARED and
     /// unresolved: `isc_rec_in_limbo` naming the transaction (SQLSTATE
     /// HY000, "record from transaction @1 is stuck in limbo"). Walking
@@ -38048,6 +38123,7 @@ fn stmt_src_off(s: &TrigStmt) -> usize {
         | TrigStmt::AssignText { src_off, .. }
         | TrigStmt::Autonomous { src_off, .. }
         | TrigStmt::ExecStmt { src_off, .. }
+        | TrigStmt::SelectInto { src_off, .. }
         | TrigStmt::ForExecStmt { src_off, .. }
         | TrigStmt::CallProc { src_off, .. } => *src_off,
     }
@@ -38479,6 +38555,44 @@ fn exec_psql_stmt_inner(
                         None => Ok(()),
                         Some(row) => assign_into(f, into, row),
                     }
+                }
+            }
+        }
+        // THE STATIC SINGLETON: the same fetch contract as the dynamic
+        // INTO above, with the two measured divergences - ROW_COUNT is
+        // SET (1 on a match, 0 on none) where the dynamic form leaves
+        // it, and the arity is judged against the PLAN's projection
+        // (so an empty result still refuses a mismatched list, the
+        // -313 the engine raises at prepare).
+        TrigStmt::SelectInto { sql, into, .. } => {
+            let mut sink: Vec<Option<Descriptor>> = Vec::new();
+            let plan =
+                plan_query_inner(sql, &*db, &mut sink).ok_or(PsqlStop::Unsupported)?;
+            if !sink.is_empty() {
+                return Err(PsqlStop::Unsupported); // a `?` this surface cannot bind
+            }
+            if output_cols_of(&plan).len() != into.len() {
+                return Err(psql_raise(EvalErr::DsqlCountMismatch));
+            }
+            let rows = {
+                let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
+                branch_rows(&plan, dbr, &[]).ok_or(PsqlStop::Unsupported)?
+            };
+            if rows.len() > 1 {
+                // taking the first row would be a wrong answer
+                return Err(psql_raise(EvalErr::SingletonSelect));
+            }
+            match rows.into_iter().next() {
+                // no match: the slots are LEFT ALONE - but the count
+                // says what happened, which the dynamic form's does not
+                None => {
+                    set_row_count(f, 0);
+                    Ok(())
+                }
+                Some(row) => {
+                    assign_into(f, into, row)?;
+                    set_row_count(f, 1);
+                    Ok(())
                 }
             }
         }
@@ -39098,8 +39212,14 @@ fn run_body_source(
         // error's own codes - and one `At procedure ... line: L, col: C`
         // item per raise point.
         Err(PsqlStop::Raise(ex)) => {
-            let at: Vec<String> = ex
-                .trace()
+            // THE -313 CARRIES NO LOCATION: the engine raises the
+            // count-mismatch at PREPARE of the block, before there is a
+            // line to name. This server's source interpreter meets it
+            // when the statement runs - same vector, later moment - and
+            // stamping a line onto it would ship an item the engine's
+            // has nowhere to carry.
+            let locationless = matches!(ex.as_eval_err(), EvalErr::DsqlCountMismatch);
+            let at: Vec<String> = if locationless { Vec::new() } else { ex.trace().to_vec() }
                 .iter()
                 .filter_map(|off| ddl_position(&meta, *off))
                 .map(|(line, col)| {

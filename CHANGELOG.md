@@ -13,6 +13,35 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-08 — the static singleton
+
+### Converted
+- **`SELECT ... INTO :v[, :v];` inside a body** — the dynamic form
+  (`EXECUTE STATEMENT ... INTO`) had the fetch contract already; the
+  static form was outside the surface, and its laws are NOT the
+  dynamic form's, each measured first. A match assigns every value,
+  NULLs included; no match leaves the slots alone; several rows raise
+  21000. The divergences: **the static form SETS `ROW_COUNT`** (1 on a
+  match, 0 on none) where the dynamic form leaves it at the last
+  static statement's count, and **an arity mismatch is the -313
+  "count of column list and variable list do not match" vector**
+  (SQLSTATE 07002), not the dynamic 42000 — judged against the PLAN's
+  projection, so an empty result still refuses a mismatched list. The
+  engine raises the -313 at PREPARE of the block; this server's source
+  interpreter raises the same LOCATIONLESS vector when the statement
+  runs — the moment is the recorded difference, never the message.
+- Parsed in the statement walk: the INTO clause is last in the
+  engine's grammar and illegal inside a subquery, so the split point
+  is the last paren-depth-0 INTO of the literal-masked text; the query
+  goes down the ORDINARY planner, so joins and expressions come free.
+
+### Gated
+- `qa/serve-real-selectinto.sh` (new, 8): all five laws differential
+  via EXECUTE BLOCK, the variables observed through conditional
+  exception raises (blocks with RETURNS and `:var` in INSERT VALUES
+  are outside the block surface — and a TEXT comparison in an IF
+  condition turned out to be too, found by this gate's first draft).
+
 ## 2026-08-08 — every reader meets the limbo law
 
 ### Converted

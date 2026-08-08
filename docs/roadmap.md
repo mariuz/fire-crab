@@ -2621,9 +2621,20 @@ plus *the subsystem is now on the path*.
   visible the moment a procedure has two output columns; **an
   expression in a `DECLARE ... CURSOR FOR (...)` select list must be
   ALIASED** or the engine answers "Invalid command" (the identical
-  SELECT runs standalone); **`SELECT ... INTO :v` - the STATIC singleton
-  - is outside the surface**, which the dynamic form's gate found by
-  contrast (the same query through `EXECUTE STATEMENT ... INTO` works);
+  SELECT runs standalone); ~~`SELECT ... INTO :v` - the STATIC
+  singleton - is outside the surface~~ **DONE**
+  (`qa/serve-real-selectinto.sh`, 8 checks): parsed in the statement
+  walk (the INTO clause is last in the grammar and illegal in a
+  subquery, so the split is the last paren-depth-0 INTO), planned
+  through the ordinary query planner, and its laws are NOT the dynamic
+  form's - the static form SETS `ROW_COUNT` (1 on a match, 0 on none)
+  where the dynamic form leaves it, and an arity mismatch is the -313
+  count-mismatch vector, judged against the PLAN's projection so an
+  empty result still refuses. The engine raises the -313 at PREPARE of
+  the block, this server when the statement runs - same locationless
+  vector, later moment, the recorded difference. Found on the way: a
+  TEXT comparison in an IF condition is outside the interpreter's cond
+  surface (`IF (B = 'x')` refuses where `IF (A = 1)` and IS NULL run);
   **a BIGINT literal is outside the PSQL surface** (`Expr::IntLiteral` is an `i32`, and widening it changes BLR
   encoding and type ranking - its own increment), **`INSERT ... VALUES`
   without a column list** is outside it too, and **`CREATE PROCEDURE` is
