@@ -48,6 +48,11 @@ pub enum Expr {
     Variable(u16),
     /// `blr_literal blr_long`: a 32-bit integer, scale 0.
     IntLiteral(i32),
+    /// `blr_literal blr_int64`: a 64-bit integer literal, scale 0 - the
+    /// shape the exe decoder reads out of engine-written BLR (scale
+    /// byte, then 8 LE bytes), emitted only for values OUTSIDE i32 so
+    /// every existing stored shape keeps its exact bytes.
+    Int64Literal(i64),
     /// `blr_null` (45): the NULL keyword as a value - probed, it is the
     /// same byte the engine's own DECLARE null-init assignments carry.
     NullLiteral,
@@ -81,6 +86,12 @@ impl Expr {
             Expr::IntLiteral(v) => {
                 out.push(BLR_LITERAL);
                 out.push(BLR_LONG);
+                out.push(0); // scale
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Expr::Int64Literal(v) => {
+                out.push(BLR_LITERAL);
+                out.push(16); // blr_int64
                 out.push(0); // scale
                 out.extend_from_slice(&v.to_le_bytes());
             }
@@ -133,7 +144,11 @@ impl Expr {
                     refs.push(name.clone());
                 }
             }
-            Expr::IntLiteral(_) | Expr::TextLiteral(_) | Expr::NullLiteral | Expr::Variable(_) => {}
+            Expr::IntLiteral(_)
+            | Expr::Int64Literal(_)
+            | Expr::TextLiteral(_)
+            | Expr::NullLiteral
+            | Expr::Variable(_) => {}
             Expr::Add(l, r)
             | Expr::Subtract(l, r)
             | Expr::Multiply(l, r)

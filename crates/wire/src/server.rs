@@ -8360,6 +8360,7 @@ fn infer_int_rank(
         Expr::Field { name, .. } => field_rank(name),
         Expr::Variable(_) => None, // no variables outside a trigger body
         Expr::IntLiteral(_) => Some(IntRank::Long),
+        Expr::Int64Literal(_) => Some(IntRank::Int64),
         Expr::TextLiteral(_) => None, // the CHECK surface is INT-ONLY
         Expr::NullLiteral => None,    // ...and NULL comparisons stay refused there
 
@@ -8933,6 +8934,7 @@ fn expr_resolve_vars(
         Expr::Field { .. }
         | Expr::Variable(_)
         | Expr::IntLiteral(_)
+        | Expr::Int64Literal(_)
         | Expr::TextLiteral(_)
         | Expr::NullLiteral => e.clone(),
         Expr::Add(l, r) => Expr::Add(
@@ -9053,6 +9055,7 @@ fn expr_plain_ctx(e: &fire_crab_ods::expr::Expr, ctx: u8) -> fire_crab_ods::expr
         Expr::Field { .. }
         | Expr::Variable(_)
         | Expr::IntLiteral(_)
+        | Expr::Int64Literal(_)
         | Expr::TextLiteral(_)
         | Expr::NullLiteral => e.clone(),
         Expr::Add(l, r) => Expr::Add(
@@ -9111,6 +9114,7 @@ fn expr_resolve_marked(
         Expr::Field { .. }
         | Expr::Variable(_)
         | Expr::IntLiteral(_)
+        | Expr::Int64Literal(_)
         | Expr::TextLiteral(_)
         | Expr::NullLiteral => e.clone(),
         Expr::Add(l, r) => Expr::Add(
@@ -9373,7 +9377,11 @@ fn expr_has_text(e: &fire_crab_ods::expr::Expr) -> bool {
     use fire_crab_ods::expr::Expr;
     match e {
         Expr::TextLiteral(_) => true,
-        Expr::Field { .. } | Expr::Variable(_) | Expr::IntLiteral(_) | Expr::NullLiteral => false,
+        Expr::Field { .. }
+        | Expr::Variable(_)
+        | Expr::IntLiteral(_)
+        | Expr::Int64Literal(_)
+        | Expr::NullLiteral => false,
         Expr::Add(l, r) | Expr::Subtract(l, r) | Expr::Multiply(l, r) | Expr::Divide(l, r) => {
             expr_has_text(l) || expr_has_text(r)
         }
@@ -10630,7 +10638,11 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         use fire_crab_ods::expr::Expr;
         match e {
             Expr::Field { context, name } => out.push((*context, name.clone())),
-            Expr::Variable(_) | Expr::IntLiteral(_) | Expr::TextLiteral(_) | Expr::NullLiteral => {}
+            Expr::Variable(_)
+            | Expr::IntLiteral(_)
+            | Expr::Int64Literal(_)
+            | Expr::TextLiteral(_)
+            | Expr::NullLiteral => {}
             Expr::Add(l, r) | Expr::Subtract(l, r) | Expr::Multiply(l, r) | Expr::Divide(l, r) => {
                 expr_fields(l, out);
                 expr_fields(r, out);
@@ -11590,7 +11602,7 @@ fn parse_default_clause(
 
 /// A token of a scalar arithmetic expression or a boolean condition.
 enum ETok {
-    Num(i32),
+    Num(i64),
     Id(String),
     /// a 'quoted string' ('' = a literal quote)
     Text(String),
@@ -11825,6 +11837,7 @@ fn expr_with_context(e: &fire_crab_ods::expr::Expr, context: u8) -> fire_crab_od
         Expr::Variable(n) => Expr::Variable(*n),
         Expr::IntLiteral(v) => Expr::IntLiteral(*v),
         Expr::TextLiteral(t) => Expr::TextLiteral(t.clone()),
+        Expr::Int64Literal(v) => Expr::Int64Literal(*v),
         Expr::NullLiteral => Expr::NullLiteral,
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_with_context(l, context)),
@@ -11876,6 +11889,7 @@ fn expr_all_plain(e: &fire_crab_ods::expr::Expr) -> bool {
         Expr::Field { context, .. } => *context == CTX_PLAIN,
         Expr::Variable(_) => false, // only a trigger body has variables
         Expr::IntLiteral(_) => true,
+        Expr::Int64Literal(_) => true,
         Expr::TextLiteral(_) => true,
         Expr::NullLiteral => true,
         Expr::Add(l, r) | Expr::Subtract(l, r) | Expr::Multiply(l, r) | Expr::Divide(l, r) => {
@@ -11973,6 +11987,17 @@ fn blr_expr_mul(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Expr> 
     Some(left)
 }
 
+/// The narrowest literal that holds the value: i32 keeps every stored
+/// shape's exact BLR bytes; only a value outside it takes the 64-bit
+/// form the engine writes as blr_literal blr_int64.
+fn int_literal(v: i64) -> fire_crab_ods::expr::Expr {
+    use fire_crab_ods::expr::Expr;
+    match i32::try_from(v) {
+        Ok(n) => Expr::IntLiteral(n),
+        Err(_) => Expr::Int64Literal(v),
+    }
+}
+
 fn blr_expr_factor(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Expr> {
     use fire_crab_ods::expr::Expr;
     match t.get(*p)? {
@@ -11983,7 +12008,7 @@ fn blr_expr_factor(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Exp
                 ETok::Num(n) => {
                     let v = -*n;
                     *p += 1;
-                    Some(Expr::IntLiteral(v))
+                    Some(int_literal(v))
                 }
                 _ => None,
             }
@@ -11991,7 +12016,7 @@ fn blr_expr_factor(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Exp
         ETok::Num(n) => {
             let v = *n;
             *p += 1;
-            Some(Expr::IntLiteral(v))
+            Some(int_literal(v))
         }
         ETok::Text(t) => {
             let t = t.clone();
@@ -37643,6 +37668,7 @@ fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value,
     };
     match e {
         E::IntLiteral(v) => Ok(Value::Int(*v as i64)),
+        E::Int64Literal(v) => Ok(Value::Int(*v)),
         E::TextLiteral(t) => Ok(Value::Text(t.clone())),
         E::NullLiteral => Ok(Value::Null),
         E::Variable(n) => Ok(f.vars.get(*n as usize).cloned().unwrap_or(Value::Null)),
@@ -38256,6 +38282,7 @@ fn render_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Option<Stri
         E::IntLiteral(v) => v.to_string(),
         // re-quoted the way the lexer unquoted it
         E::TextLiteral(t) => format!("'{}'", t.replace('\'', "''")),
+        E::Int64Literal(v) => v.to_string(),
         E::NullLiteral => "NULL".to_string(),
         E::Variable(n) => psql_literal(f.vars.get(*n as usize).unwrap_or(&Value::Null))?,
         E::Field { name, .. } => name.clone(),

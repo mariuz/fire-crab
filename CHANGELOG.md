@@ -31,6 +31,25 @@ was caught), **Guarded** (a wrong-answer path closed by refusal).
 - `qa/serve-real-aggdescribe.sh` (new, 8): the SQLDA_DISPLAY lines and
   the fetched rows compared together, per shape.
 
+## 2026-08-09 — a number bigger than the lexer
+
+### Converted
+- **BIGINT literals in PSQL** — `A = 3000000000` refused the whole
+  body, because `ETok::Num` was an i32. The lexer reads i64 now, and
+  the parser picks THE NARROWEST LITERAL THAT HOLDS THE VALUE:
+  everything in i32 range stays `IntLiteral` — every stored shape
+  keeps its exact BLR bytes — and only an out-of-range value takes
+  `Int64Literal`, whose `blr_literal blr_int64` emission is the very
+  shape the BLR executor already decodes out of engine-written bodies
+  (scale byte, then 8 LE bytes — pinned by symmetry). Assignment,
+  comparison, arithmetic, negatives, embedded-DML WHERE and the DSQL
+  path all match the engine; the CHECK-constraint surface still
+  refuses a big literal, as it refused before (its own recorded
+  family, alongside text and NULL comparisons).
+
+### Gated
+- `qa/serve-real-psqltext.sh` 16 → 19.
+
 ## 2026-08-08 — the grouped half, and the subquery's flag
 
 ### Converted

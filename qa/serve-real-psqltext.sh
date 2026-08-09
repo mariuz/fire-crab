@@ -98,6 +98,21 @@ both "comparing WITH the NULL keyword is UNKNOWN - the IF skips" \
 both "NULL propagates through arithmetic" \
     "A=NULL; A=A+1; IF (A IS NULL) THEN EXCEPTION E_T;"
 
+# --- BIGINT literals (the increment after NULL) --------------------------------
+# ETok::Num was an i32 and 3000000000 refused the whole body; the
+# narrowest literal that holds the value keeps every stored shape's
+# exact BLR bytes, and only an out-of-range one takes blr_int64
+bl() { # <conn> <body> - BIGINT declare instead of the default frame
+    printf 'SET TERM ^ ;\nEXECUTE BLOCK AS\nDECLARE G BIGINT;\nBEGIN\n%s\nEND^\nSET TERM ; ^\n' "$2" |
+        "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 | tr -s ' \n' ' '
+}
+bboth() { check "$1" "$(bl "$F" "$2")" "$(bl "$E" "$2")"; }
+bboth "a BIGINT literal assigns and compares" \
+    "G = 3000000000; IF (G = 3000000000) THEN EXCEPTION E_T;"
+bboth "...and negative" "G = -3000000000; IF (G < 0) THEN EXCEPTION E_T;"
+bboth "...and through arithmetic" \
+    "G = 9000000000 + 1; IF (G > 9000000000) THEN EXCEPTION E_T;"
+
 # --- the stored-BLR boundary stays closed --------------------------------------
 out=$(printf "CREATE TABLE TCX (V VARCHAR(5) CHECK (V = 'x'));\n" |
     "$ISQL" -q -b -user "$U" -pas "$P" "$F" 2>&1 | head -1)

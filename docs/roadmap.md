@@ -2656,8 +2656,12 @@ plus *the subsystem is now on the path*.
   interpreted, never emitted; CHECK stays int-only). ~~Still outside: `B = NULL`~~ DONE the
   increment after (gate 12 -> 16): Expr::NullLiteral, whose blr_null
   byte was already probed by the DECLARE null-init emission;
-  **a BIGINT literal is outside the PSQL surface** (`Expr::IntLiteral` is an `i32`, and widening it changes BLR
-  encoding and type ranking - its own increment), **`INSERT ... VALUES`
+  ~~a BIGINT literal is outside the PSQL surface~~ **DONE** (gate 16
+  -> 19): the lexer reads i64 and the parser picks the narrowest
+  literal - i32 keeps every stored shape's exact bytes, an
+  out-of-range value takes blr_int64, the shape the BLR executor
+  already decodes (pinned by symmetry); the CHECK surface still
+  refuses big literals, its own recorded family, **`INSERT ... VALUES`
   without a column list** is outside it too, and **`CREATE PROCEDURE` is
   not supported at all** - every gate builds its procedures with the engine
   and executes them through fire-crab, which is why the interpreter is
