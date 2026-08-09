@@ -31,6 +31,29 @@ was caught), **Guarded** (a wrong-answer path closed by refusal).
 - `qa/serve-real-aggdescribe.sh` (new, 8): the SQLDA_DISPLAY lines and
   the fetched rows compared together, per shape.
 
+## 2026-08-09 — no waiting
+
+### Converted
+- **TPB NO WAIT** — the last of W4. A WAIT transaction that meets a row
+  another ACTIVE transaction holds blocks until that one ends (the lock
+  manager, unchanged); a NO WAIT transaction does not block — the
+  engine raises the update-conflict AT ONCE, naming the blocker, the
+  SAME `deadlock / update conflicts with concurrent update / concurrent
+  transaction number is @1` vector as a committed conflict, and the
+  same under BOTH isolations (measured). `isc_tpb_nowait` is read from
+  the TPB at op_transaction onto the connection's `wait` flag, and
+  `with_conflict_wait` short-circuits to `EvalErr::UpdateConflict` when
+  it is set instead of dropping the write side and waiting.
+
+### Boundaries recorded
+- `isc_tpb_lock_timeout` (wait N seconds, then the conflict) is still
+  read as plain WAIT — its own slice.
+
+### Gated
+- `qa/serve-real-nowait.sh` (new, 3): NO WAIT under both isolations,
+  differential against the engine through a rig that holds one
+  transaction's write open while another (NO WAIT) hits the row.
+
 ## 2026-08-09 — the write that came too late
 
 ### Converted

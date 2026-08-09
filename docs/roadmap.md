@@ -2462,8 +2462,10 @@ plus *the subsystem is now on the path*.
   (`isc_update_conflict` and the concurrent transaction's number) are
   carried now, as the UPDATE-CONFLICT under snapshot
   (qa/serve-real-updateconflict.sh) - a snapshot cannot write over a
-  row committed after it began. What remains of W4: the TPB's NO WAIT /
-  LOCK TIMEOUT are still read as WAIT.
+  row committed after it began. What remains of W4: NO WAIT is honored now
+  (qa/serve-real-nowait.sh - an immediate update-conflict instead of a
+  block); only LOCK TIMEOUT (wait N then conflict) is still read as
+  plain WAIT.
 - **W7 — the metadata cache** (`mdc`). *(done, and it was the
   measurement that put it here)* Every plan re-derived its table from
   the file — id, columns, descriptors, index operations, NOT NULL

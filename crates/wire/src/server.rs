@@ -900,6 +900,11 @@ struct Database {
     /// stable view: reads do not see what another transaction commits
     /// after this one began. Cleared when the transaction ends.
     snapshot: Option<fire_crab_ods::tra::Snapshot>,
+    /// isc_tpb_wait (the default) vs isc_tpb_nowait: a NO WAIT
+    /// transaction that meets a row another ACTIVE transaction holds
+    /// does not block - it raises the update-conflict at once, naming
+    /// the blocker. Read from the TPB at op_transaction.
+    wait: bool,
 }
 
 /// A connection ending takes its attachment off the file's count,
@@ -2229,6 +2234,7 @@ fn load_database(path: &str) -> Option<Database> {
         ods_minor: h.ods_minor,
         windows: vec![UndoWindow::new(WindowKind::Transaction)],
         snapshot: None,
+        wait: true,
     })
 }
 
@@ -16775,6 +16781,13 @@ where
                     return Err(ExecErr::Text(
                         "lock conflict inside a statement that holds the database".into(),
                     ));
+                }
+                // NO WAIT does not block: the engine raises the
+                // update-conflict at once, naming the transaction that
+                // holds the row (measured, same vector as a committed
+                // conflict, both isolations)
+                if !db.wait {
+                    return Err(ExecErr::Eval(EvalErr::UpdateConflict(other as u64)));
                 }
                 db.write = None; // the write side goes back FIRST
                 let waited =
@@ -42140,7 +42153,11 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 // a false read-committed merely keeps the old behaviour
                 // for that transaction, never a crash).
                 let read_committed = tpb.get(1..).is_some_and(|o| o.contains(&15));
+                // isc_tpb_nowait (7) turns a lock wait into an immediate
+                // conflict; its absence is WAIT, the default
+                let nowait = tpb.get(1..).is_some_and(|o| o.contains(&7));
                 if let Some(db) = database.as_mut() {
+                    db.wait = !nowait;
                     db.snapshot = if read_committed {
                         None
                     } else {
@@ -48381,6 +48398,7 @@ mod tests {
             ods_minor: 0,
             windows: Vec::new(),
             snapshot: None,
+            wait: true,
         };
         let src = RowSource::Filter {
             input: Box::new(RowSource::Rows(rows)),
