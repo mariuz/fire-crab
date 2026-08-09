@@ -97,13 +97,15 @@ impl Expr {
             }
             Expr::NullLiteral => out.push(45), // blr_null - probed
             Expr::TextLiteral(t) => {
-                // blr_literal blr_text <u16 len> <bytes> - shaped like
-                // the engine's, but UNREACHABLE from any stored-BLR
-                // path: the CHECK surface refuses text (int-rank None)
-                // before this emitter runs, and PSQL bodies are
-                // interpreted, never stored
+                // GOLD-PINNED from an engine-created CHECK (V = 'x'):
+                // blr_literal blr_text2, charset u16 LE (0 = NONE),
+                // length u16 LE, then the bytes - the first guess here
+                // used plain blr_text with no charset and stayed
+                // guarded out of every stored path until the real
+                // bytes were probed
                 out.push(BLR_LITERAL);
-                out.push(14); // blr_text
+                out.push(15); // blr_text2
+                out.extend_from_slice(&0u16.to_le_bytes()); // charset NONE
                 out.extend_from_slice(&(t.len() as u16).to_le_bytes());
                 out.extend_from_slice(t.as_bytes());
             }

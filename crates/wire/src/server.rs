@@ -8395,6 +8395,63 @@ fn dtype_rank(dt: u8) -> Option<IntRank> {
     }
 }
 
+/// What a CHECK-condition operand IS, for the compile's type gate:
+/// Int (the original surface), Text (a plain NONE-charset text column
+/// or a text literal - the stored blr_text2 shape is gold-pinned now),
+/// or Null (the keyword, comparable with anything). A comparison must
+/// pair compatible classes; arithmetic stays int-only through
+/// infer_int_rank as before.
+#[derive(PartialEq, Clone, Copy)]
+enum CheckClass {
+    Int,
+    Text,
+    Null,
+}
+
+fn check_operand_class(
+    e: &fire_crab_ods::expr::Expr,
+    field_rank: &dyn Fn(&str) -> Option<IntRank>,
+    field_is_text: &dyn Fn(&str) -> bool,
+) -> Option<CheckClass> {
+    use fire_crab_ods::expr::Expr;
+    match e {
+        Expr::NullLiteral => Some(CheckClass::Null),
+        Expr::TextLiteral(_) => Some(CheckClass::Text),
+        Expr::Field { name, .. } if field_is_text(name) => Some(CheckClass::Text),
+        _ => infer_int_rank(e, field_rank).map(|_| CheckClass::Int),
+    }
+}
+
+/// Both operands of every comparison in `cond` typecheck: Int with
+/// Int, Text with Text, Null with anything. IS [NOT] NULL takes any
+/// single classifiable operand.
+fn check_cond_typechecks(
+    cond: &fire_crab_ods::expr::Cond,
+    field_rank: &dyn Fn(&str) -> Option<IntRank>,
+    field_is_text: &dyn Fn(&str) -> bool,
+) -> bool {
+    use fire_crab_ods::expr::Cond;
+    match cond {
+        Cond::Cmp(_, l, r) => {
+            let (Some(a), Some(b)) = (
+                check_operand_class(l, field_rank, field_is_text),
+                check_operand_class(r, field_rank, field_is_text),
+            ) else {
+                return false;
+            };
+            a == b || a == CheckClass::Null || b == CheckClass::Null
+        }
+        Cond::And(a, b) | Cond::Or(a, b) => {
+            check_cond_typechecks(a, field_rank, field_is_text)
+                && check_cond_typechecks(b, field_rank, field_is_text)
+        }
+        Cond::Not(i) => check_cond_typechecks(i, field_rank, field_is_text),
+        Cond::Missing(e) | Cond::NotMissing(e) => {
+            check_operand_class(e, field_rank, field_is_text).is_some()
+        }
+    }
+}
+
 /// The catalog type of a computed column: `(RDB$FIELD_TYPE, dsc dtype,
 /// length, RDB$FIELD_PRECISION)` for the expression's result rank.
 /// The precisions are the engine's (probed: SHORT 4, LONG 9, INT64 18,
@@ -11068,6 +11125,46 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             constraints.push(fire_crab_ods::ddl::TableConstraint::Key(key));
             continue;
         }
+        // an INLINE column-level CHECK - `V VARCHAR(5) CHECK (V = 'x')` -
+        // is the table-level constraint wearing column syntax: split it
+        // off (top-level, outside literals) and let the column part
+        // parse alone. The engine's own desugaring, and the reason the
+        // first text-CHECK probes looked like a type refusal when they
+        // were a parse gap.
+        let item_owned;
+        let item = {
+            let masked = mask_literals(&up_item);
+            match masked.find(" CHECK") {
+                Some(at)
+                    if !up_item.trim_start().starts_with("CHECK")
+                        // at TOP LEVEL: the parens before it (a type's
+                        // VARCHAR(5), a DEFAULT's) are balanced
+                        && masked[..at].matches('(').count()
+                            == masked[..at].matches(')').count()
+                        // a keyed/fk clause never carries CHECK
+                        && parse_fk_clause(&up_item).is_none()
+                        && parse_key_clause(&up_item).is_none() =>
+                {
+                    if let Some((cname, source)) = parse_check_clause(item[at..].trim()) {
+                        check_items.push((constraints.len(), source.clone()));
+                        constraints.push(fire_crab_ods::ddl::TableConstraint::Check(
+                            fire_crab_ods::ddl::CheckDef {
+                                name: cname,
+                                source,
+                                trigger_blr: Vec::new(),
+                                fields: Vec::new(),
+                            },
+                        ));
+                        item_owned = item[..at].to_string();
+                        item_owned.as_str()
+                    } else {
+                        item
+                    }
+                }
+                _ => item,
+            }
+        };
+        let up_item = item.trim().to_ascii_uppercase();
         // a [CONSTRAINT <name>] CHECK (<condition>), compiled after the
         // column loop (it may reference columns declared after it)
         if let Some((cname, source)) = parse_check_clause(item) {
@@ -11170,12 +11267,29 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             }
             dtype_rank(c.dtype)
         };
+        // a plain NONE-charset text column may meet a text literal now
+        // (the stored literal shape is gold-pinned); anything else
+        // outside the int surface still refuses
+        let field_is_text = |name: &str| {
+            cols.iter().any(|c| {
+                c.name.eq_ignore_ascii_case(name)
+                    && c.domain.is_none()
+                    && c.computed.is_none()
+                    && c.sub_type == 0
+                    && matches!(
+                        c.dtype,
+                        fire_crab_ods::format::dtype::TEXT | fire_crab_ods::format::dtype::VARYING
+                    )
+            })
+        };
+        if !check_cond_typechecks(&cond, &field_rank, &field_is_text) {
+            return None;
+        }
         let mut fields: Vec<String> = Vec::new();
         for e in cond.operands() {
             if !expr_all_plain(e) {
                 return None; // NEW./OLD. do not exist in a CHECK
             }
-            infer_int_rank(e, &field_rank)?;
             for f in e.field_refs() {
                 if !fields.iter().any(|n| n == &f) {
                     fields.push(f);
@@ -12754,12 +12868,29 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
             }
             dtype_rank(d.dtype)
         };
+        let field_is_text = |name: &str| {
+            columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(name))
+                .and_then(|rc| descs.get(rc.field_id as usize))
+                .is_some_and(|d| {
+                    !(d.offset == 0 && d.length != 0)
+                        && d.sub_type == 0
+                        && matches!(
+                            d.dtype,
+                            fire_crab_ods::format::dtype::TEXT
+                                | fire_crab_ods::format::dtype::VARYING
+                        )
+                })
+        };
+        if !check_cond_typechecks(&cond, &field_rank, &field_is_text) {
+            return None;
+        }
         let mut fields: Vec<String> = Vec::new();
         for e in cond.operands() {
             if !expr_all_plain(e) {
                 return None; // NEW./OLD. do not exist in a CHECK
             }
-            infer_int_rank(e, &field_rank)?;
             for f in e.field_refs() {
                 if !fields.iter().any(|n| n == &f) {
                     fields.push(f);

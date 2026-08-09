@@ -2660,8 +2660,12 @@ plus *the subsystem is now on the path*.
   -> 19): the lexer reads i64 and the parser picks the narrowest
   literal - i32 keeps every stored shape's exact bytes, an
   out-of-range value takes blr_int64, the shape the BLR executor
-  already decodes (pinned by symmetry); the CHECK surface still
-  refuses big literals, its own recorded family, **`INSERT ... VALUES`
+  already decodes (pinned by symmetry); the CHECK family closed the
+  increment after (qa/serve-real-checktext.sh, 13): text/NULL/BIGINT
+  comparisons compile now, the stored text literal GOLD-PINNED
+  (blr_text2 + charset), and the real wall was the INLINE column
+  CHECK's parse, not the types - with the engine itself enforcing
+  fire-crab's stored trigger as the closing oracle, **`INSERT ... VALUES`
   without a column list** is outside it too, and **`CREATE PROCEDURE` is
   not supported at all** - every gate builds its procedures with the engine
   and executes them through fire-crab, which is why the interpreter is

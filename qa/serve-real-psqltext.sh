@@ -126,11 +126,11 @@ both "a quoted '--' is data, not a comment" \
 both "a quoted '/*' too" \
     "B = '/*x*/'; IF (B = '/*x*/') THEN EXCEPTION E_T;"
 
-# --- the stored-BLR boundary stays closed --------------------------------------
-out=$(printf "CREATE TABLE TCX (V VARCHAR(5) CHECK (V = 'x'));\n" |
-    "$ISQL" -q -b -user "$U" -pas "$P" "$F" 2>&1 | head -1)
-check "boundary: a CHECK with a text comparison still refuses" \
-    "$out" "Statement failed, SQLSTATE = 42000"
+# --- the stored-BLR boundary LIFTED: text CHECKs are gold-pinned now ----------
+# (the full gate is serve-real-checktext.sh; one seam check here)
+out=$(printf "CREATE TABLE TCX (V VARCHAR(5) CHECK (V = 'x'));\nINSERT INTO TCX VALUES ('y');\n" |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$F" 2>&1 | grep -c "23000")
+check "a text CHECK stores and enforces now" "$out" "1"
 
 echo "ran $ran checks"
 exit $fail

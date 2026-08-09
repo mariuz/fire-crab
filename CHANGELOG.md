@@ -31,6 +31,29 @@ was caught), **Guarded** (a wrong-answer path closed by refusal).
 - `qa/serve-real-aggdescribe.sh` (new, 8): the SQLDA_DISPLAY lines and
   the fetched rows compared together, per shape.
 
+## 2026-08-09 — the check learns three more words
+
+### Converted
+- **CHECK constraints take TEXT, NULL and BIGINT comparisons** — and
+  the INLINE column-level form, which turned out to be the real wall:
+  the first text probes looked like a type refusal and were a PARSE
+  gap (`V VARCHAR(5) CHECK (...)` never split the clause off the
+  column; it desugars to the table-level constraint now, parens
+  balanced so a type's own don't fool the split). The stored text
+  literal is GOLD-PINNED from an engine-created CHECK — `blr_literal
+  blr_text2, charset u16 LE, length u16 LE, bytes` — replacing the
+  guessed blr_text shape that had rightly stayed guarded; blr_int64's
+  scale-plus-8LE emission is engine-gold-confirmed on the way. The
+  compile gate types comparisons by class (Int/Text/Null, Null pairing
+  with anything); enforcement already ran through the ordinary
+  predicate machinery.
+
+### Gated
+- `qa/serve-real-checktext.sh` (new, 13), ending on the strongest
+  oracle this suite has: **the ENGINE enforcing fire-crab's stored
+  trigger** — rejecting a violating INSERT with its own 23000 vector,
+  through fire-crab's file.
+
 ## 2026-08-09 — the comment inside the statement
 
 ### Converted
