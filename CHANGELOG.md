@@ -31,6 +31,28 @@ was caught), **Guarded** (a wrong-answer path closed by refusal).
 - `qa/serve-real-aggdescribe.sh` (new, 8): the SQLDA_DISPLAY lines and
   the fetched rows compared together, per shape.
 
+## 2026-08-09 — the drop that names what is missing
+
+### Converted
+- **The no-meta-update wrapper for a missing DROP** — the irregular
+  half the duplicate-CREATE wrapper left generic, and now the whole
+  family, all four object types. Each reason is its own shape: an
+  EXCEPTION's carries NO name ("Exception not found"), a SEQUENCE's is
+  the generator's "@1 is not defined" (isc_gennotdef), a PROCEDURE's
+  names it ("Procedure @1 not found", dyn_proc_not_found — the dyn_dup
+  formula again), and a TABLE's is a NESTED chain: isc_sqlerr(-607)
+  "SQL error code = -607", isc_dsql_command_err "Invalid command",
+  then isc_dsql_table_not_found "Table @1 does not exist" (which
+  carries the SQLSTATE 42S02 isql prints). All four match the engine's
+  full `unsuccessful metadata update / -DROP <VERB> "PUBLIC"."NAME"
+  failed / -<reason>` vector. Routed by Plan variant, so a dependency
+  refusal ("there are N dependencies") never misfires — it says
+  neither "already exists", "not found" nor "is not defined".
+
+### Gated
+- `qa/serve-real-metaupdate.sh` 5 → 8 (four duplicate creates, four
+  missing drops).
+
 ## 2026-08-09 — unsuccessful metadata update
 
 ### Converted

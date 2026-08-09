@@ -354,25 +354,80 @@ fn respond_ddl_meta(
     plan: &Plan,
     err_text: &str,
 ) -> std::io::Result<bool> {
-    if !err_text.to_ascii_lowercase().contains("already exists") {
-        return Ok(false);
+    let q = |n: &str| {
+        format!("\"PUBLIC\".\"{}\"", n.trim().trim_matches('"').to_ascii_uppercase())
+    };
+    let lc = err_text.to_ascii_lowercase();
+    // DROP TABLE of a missing name is the ONE nested reason: after the
+    // "DROP TABLE @1 failed" wrapper the engine adds isc_dsql_command_err
+    // (-607, "Invalid command") and a "-Table @1 does not exist" string
+    // - four items, not the three the others carry.
+    if lc.contains("not found") {
+        if let Plan::DropTable { name } = plan {
+            let qn = format!(
+                "\"PUBLIC\".\"{}\"",
+                name.trim().trim_matches('"').to_ascii_uppercase()
+            );
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1)
+                .int(GDS_NO_META_UPDATE)
+                .int(1)
+                .int(336397288) // isc_dsql_drop_table_failed
+                .int(2)
+                .bytes(qn.as_bytes())
+                .int(1)
+                .int(335544436) // isc_sqlerr - "SQL error code = @1"
+                .int(4) // isc_arg_number
+                .int(-607)
+                .int(1)
+                .int(335544570) // isc_dsql_command_err - "Invalid command"
+                .int(1)
+                .int(336397206) // isc_dsql_table_not_found - "Table @1 does not exist", 42S02
+                .int(2)
+                .bytes(qn.as_bytes())
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
     }
-    let Some((failed, reason, qn)) = ddl_dup_codes(plan) else {
+    // (verb-failed code, qualified name, reason code, reason-carries-name)
+    let parts: Option<(i32, String, i32, bool)> = if lc.contains("already exists") {
+        // a DUPLICATE create - uniform across every object type
+        ddl_dup_codes(plan).map(|(f, r, qn)| (f, qn, r, true))
+    } else if lc.contains("not found") || lc.contains("is not defined") {
+        // a DROP of a name that is not there. The reasons are irregular
+        // per type: an exception's carries NO name, a sequence's is the
+        // generator's "is not defined", a procedure's names it. A DROP
+        // TABLE's -607 shape is not carried (it stays generic), and a
+        // dependency refusal ("there are N dependencies") never reaches
+        // this arm - it says neither "already exists" nor "not found".
+        match plan {
+            Plan::DropException { name } => Some((336397284, q(name), 336068752, false)),
+            Plan::DropSequence { name } => Some((336397303, q(name), 335544463, true)),
+            Plan::DropProcedure { name } => Some((336397268, q(name), 336068748, true)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let Some((failed, qn, reason, reason_named)) = parts else {
         return Ok(false);
     };
     let mut w = W::default();
     w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
-    w.int(1) // isc_arg_gds
+    w.int(1) // isc_arg_gds - unsuccessful metadata update
         .int(GDS_NO_META_UPDATE)
-        .int(1)
+        .int(1) // isc_arg_gds - <VERB> @1 failed
         .int(failed)
         .int(2) // isc_arg_string - the qualified name
         .bytes(qn.as_bytes())
-        .int(1)
-        .int(reason)
-        .int(2)
-        .bytes(qn.as_bytes())
-        .int(0); // isc_arg_end
+        .int(1) // isc_arg_gds - the specific reason
+        .int(reason);
+    if reason_named {
+        w.int(2).bytes(qn.as_bytes());
+    }
+    w.int(0); // isc_arg_end
     w.send(s, enc)?;
     Ok(true)
 }

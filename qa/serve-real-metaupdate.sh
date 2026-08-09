@@ -8,11 +8,10 @@
 # SQLSTATE (42S01 for a table, 42000 otherwise), because the SQLSTATE
 # follows the reason code.
 #
-# DROP-of-a-missing name still refuses on both but with fire-crab's
-# generic vector - the drop reasons are irregular per object type
-# (a table "does not exist" behind -607, a sequence "is not defined",
-# an exception "not found"), a recorded boundary of their own; the
-# seam check here holds only that both refuse.
+# DROP-of-a-missing name: the reasons are irregular per type - an
+# exception carries no name, a sequence is the generator's "is not
+# defined", a procedure names it, and a table nests isc_sqlerr(-607) +
+# "Invalid command" + "Table @1 does not exist" - all four matched.
 #
 #   qa/serve-real-metaupdate.sh [port]
 set -u
@@ -52,10 +51,16 @@ both "a duplicate EXCEPTION" "CREATE EXCEPTION E_X 'b';"
 both "a duplicate SEQUENCE" "CREATE SEQUENCE SQ;"
 both "a duplicate PROCEDURE" "SET TERM ^ ; CREATE PROCEDURE P AS BEGIN EXIT; END^ SET TERM ; ^"
 
-# the drop-missing seam: both refuse (the vectors are the recorded
-# irregular-reason boundary, not compared here)
-refuses() { printf '%s\n' "$2" | "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 | grep -c "Statement failed"; }
-check "DROP of a missing table refuses on both" "$(refuses "$F" "DROP TABLE NOPE;")" "$(refuses "$E" "DROP TABLE NOPE;")"
+# DROP of a missing name - the reasons are irregular per type, and
+# three of them are carried now (exception carries no name, sequence is
+# the generator's "is not defined", procedure names it)
+both "a missing EXCEPTION - full vector" "DROP EXCEPTION NOPE;"
+both "a missing SEQUENCE - generator is-not-defined" "DROP SEQUENCE NOPE;"
+both "a missing PROCEDURE - names it" "DROP PROCEDURE NOPE;"
+# DROP TABLE's reason is the ONE nested shape - isc_sqlerr(-607) +
+# "Invalid command" + "Table @1 does not exist" (42S02) - carried now,
+# so the whole DROP-missing family is byte-matched
+both "a missing TABLE - the nested -607 vector, SQLSTATE 42S02" "DROP TABLE NOPE;"
 
 echo "ran $ran checks"
 exit $fail
