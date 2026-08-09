@@ -7474,6 +7474,153 @@ fn find_exception(
     found
 }
 
+/// One parameter of a CREATE PROCEDURE, in the catalog's own terms.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcParamDef {
+    pub name: String,
+    pub field_type: i16,
+    pub length: u16,
+    pub scale: i16,
+    pub sub_type: i16,
+}
+
+/// `CREATE PROCEDURE` - the catalog rows the engine writes, measured
+/// off an engine-created pair (P0/P1): an RDB$PROCEDURES row whose id
+/// comes from the RDB$PROCEDURES generator, whose SOURCE blob is the
+/// body text from its first non-space byte and whose BLR blob is the
+/// dsql crate's byte-for-byte compile; one invented RDB$n domain per
+/// parameter (the same counter table columns draw from); and one
+/// RDB$PROCEDURE_PARAMETERS row per parameter, FIELD_SOURCE naming the
+/// domain, mechanism 0. PROCEDURE_TYPE is 1 when a SUSPEND makes it
+/// selectable, 2 otherwise; VALID_BLR is 1 - the engine executes what
+/// this stores.
+#[allow(clippy::too_many_arguments)]
+pub fn create_procedure(
+    file: &mut Vec<u8>,
+    page_size: usize,
+    name: &str,
+    ins: &[ProcParamDef],
+    outs: &[ProcParamDef],
+    selectable: bool,
+    source: &str,
+    blr: &[u8],
+) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    if want.is_empty() {
+        return Err("a procedure needs a name".into());
+    }
+    let prel = crate::resolve_relation(file, page_size, "RDB$PROCEDURES")
+        .ok_or("no RDB$PROCEDURES relation")?;
+    // already exists? refuse before any row lands
+    {
+        let formats = system_relation_formats(file, page_size, "RDB$PROCEDURES")
+            .ok_or("no RDB$PROCEDURES format")?;
+        let (_, descs) = formats
+            .iter()
+            .max_by_key(|(n, _)| *n)
+            .ok_or("no RDB$PROCEDURES format")?;
+        let cols = relation_columns(file, page_size, "RDB$PROCEDURES");
+        let name_f = cols
+            .iter()
+            .find(|c| c.name == "RDB$PROCEDURE_NAME")
+            .map(|c| c.field_id as usize)
+            .ok_or("no RDB$PROCEDURE_NAME column")?;
+        let mut dup = false;
+        walk_rows(file, page_size, prel, descs, |v| {
+            if text_eq(v.get(name_f), &want) {
+                dup = true;
+            }
+        });
+        if dup {
+            return Err(format!("Procedure {} already exists", want));
+        }
+    }
+    let slot = generator_id_by_name(file, page_size, "RDB$PROCEDURES")
+        .ok_or("no RDB$PROCEDURES generator")?;
+    let id = gen::bump(file, page_size, slot, 1)?;
+    let class = next_security_class(file, page_size, ACL_SEQUENCE_OWNER)?;
+    let src_blob =
+        dml::insert_blob_cs(file, page_size, prel, &[source.as_bytes().to_vec()], 1, 4)?;
+    let blr_blob = dml::insert_blob(file, page_size, prel, &[blr.to_vec()], 2)?;
+    sys_insert(
+        file,
+        page_size,
+        "RDB$PROCEDURES",
+        prel,
+        &[
+            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+            ("RDB$PROCEDURE_NAME", SysVal::S(&want)),
+            ("RDB$PROCEDURE_ID", SysVal::I(id)),
+            ("RDB$PROCEDURE_INPUTS", SysVal::I(ins.len() as i64)),
+            ("RDB$PROCEDURE_OUTPUTS", SysVal::I(outs.len() as i64)),
+            ("RDB$PROCEDURE_SOURCE", SysVal::B(blob_id_bytes(prel, src_blob))),
+            ("RDB$PROCEDURE_BLR", SysVal::B(blob_id_bytes(prel, blr_blob))),
+            ("RDB$SECURITY_CLASS", SysVal::S(&class)),
+            ("RDB$OWNER_NAME", SysVal::S(OWNER)),
+            ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+            (
+                "RDB$PROCEDURE_TYPE",
+                SysVal::I(if selectable { 1 } else { 2 }),
+            ),
+            ("RDB$VALID_BLR", SysVal::I(1)),
+        ],
+    )?;
+    // parameters: an invented domain each, then the parameter row
+    let pprel = crate::resolve_relation(file, page_size, "RDB$PROCEDURE_PARAMETERS")
+        .ok_or("no RDB$PROCEDURE_PARAMETERS relation")?;
+    for (ptype, list) in [(0i64, ins), (1i64, outs)] {
+        for (num, p) in list.iter().enumerate() {
+            let domain_num = next_domain_number(file, page_size)?;
+            let dom = format!("RDB${}", domain_num);
+            let mut field_vals: Vec<(&str, SysVal<'_>)> = vec![
+                ("RDB$FIELD_NAME", SysVal::S(&dom)),
+                ("RDB$FIELD_TYPE", SysVal::I(p.field_type as i64)),
+                ("RDB$FIELD_LENGTH", SysVal::I(p.length as i64)),
+                ("RDB$FIELD_SCALE", SysVal::I(p.scale as i64)),
+                ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+                ("RDB$OWNER_NAME", SysVal::S(OWNER)),
+                ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+            ];
+            if subtype_carried(p.field_type) {
+                field_vals.push(("RDB$FIELD_SUB_TYPE", SysVal::I(p.sub_type as i64)));
+            }
+            // an exact-numeric parameter domain carries PRECISION 0 (an
+            // engine-created INTEGER param row measured 0, not the 9 a
+            // computed column gets) - a NULL here is what crashed the
+            // engine's executor reading an fc-authored procedure
+            if matches!(p.field_type, 7 | 8 | 16 | 26) {
+                field_vals.push(("RDB$FIELD_PRECISION", SysVal::I(0)));
+            }
+            if matches!(p.field_type, 14 | 37) {
+                field_vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(0)));
+                field_vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(p.length as i64)));
+            }
+            let frel = crate::resolve_relation(file, page_size, "RDB$FIELDS")
+                .ok_or("no RDB$FIELDS relation")?;
+            sys_insert(file, page_size, "RDB$FIELDS", frel, &field_vals)?;
+            sys_insert(
+                file,
+                page_size,
+                "RDB$PROCEDURE_PARAMETERS",
+                pprel,
+                &[
+                    ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+                    ("RDB$PARAMETER_NAME", SysVal::S(&p.name)),
+                    ("RDB$PROCEDURE_NAME", SysVal::S(&want)),
+                    ("RDB$PARAMETER_NUMBER", SysVal::I(num as i64)),
+                    ("RDB$PARAMETER_TYPE", SysVal::I(ptype)),
+                    ("RDB$FIELD_SOURCE", SysVal::S(&dom)),
+                    ("RDB$PARAMETER_MECHANISM", SysVal::I(0)),
+                    ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+                ],
+            )?;
+        }
+    }
+    // the owner's EXECUTE grant, object type 5
+    store_privileges(file, page_size, &want, 5, &["X"])?;
+    advance_oldest_transactions(file, page_size)
+}
+
 /// `CREATE EXCEPTION <name> <message>` - `CreateAlterExceptionNode`
 /// (DdlNodes.epp) against the file image. The mirror of CREATE SEQUENCE:
 /// a `RDB$EXCEPTIONS` row whose number comes from the system generator

@@ -18,6 +18,7 @@ fire-crab-cch = { path = "../cch" }
 fire-crab-lck = { path = "../lck" }
 fire-crab-evt = { path = "../evt" }
 fire-crab-pio = { path = "../pio" }
+fire-crab-dsql = { path = "../dsql" }
 
 [[bin]]
 name = "fcwire"

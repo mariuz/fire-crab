@@ -4308,6 +4308,18 @@ enum Plan {
     /// from the RDB$EXCEPTIONS generator), its security class and the
     /// owner's USAGE grant
     CreateException { name: String, message: String },
+    /// `CREATE PROCEDURE ...` - the BLR is the dsql crate's
+    /// byte-for-byte compile (None from it refuses the whole
+    /// statement, so the DDL surface and the BLR oracle cannot drift),
+    /// and the catalog rows mirror an engine-created pair, measured.
+    CreateProcedure {
+        name: String,
+        ins: Vec<fire_crab_ods::ddl::ProcParamDef>,
+        outs: Vec<fire_crab_ods::ddl::ProcParamDef>,
+        selectable: bool,
+        source: String,
+        blr: Vec<u8>,
+    },
     /// `ALTER EXCEPTION <name> <message>`: rewrite the message in place
     AlterException { name: String, message: String },
     /// `CREATE OR ALTER EXCEPTION <name> <message>`: alter if it exists,
@@ -11675,6 +11687,37 @@ fn parse_exception_stmt(sql: &str, lead: &str) -> Option<(String, String)> {
     Some((name, message))
 }
 
+/// Parse and COMPILE `CREATE PROCEDURE ...`: the dsql crate's
+/// engine-byte compiler decides the surface - what it cannot compile,
+/// this DDL refuses whole.
+fn plan_create_procedure(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let up = sql.trim_start().to_ascii_uppercase();
+    if find_word(&up, "CREATE", 0) != Some(0)
+        || find_word(&up, "PROCEDURE", "CREATE".len()).is_none_or(|k| up["CREATE".len()..k].trim() != "")
+    {
+        return None;
+    }
+    let c = fire_crab_dsql::compile_procedure_full(sql)?;
+    let conv = |m: &fire_crab_dsql::ProcParamMeta| fire_crab_ods::ddl::ProcParamDef {
+        name: m.name.clone(),
+        field_type: m.field_type,
+        length: m.length,
+        scale: m.scale,
+        sub_type: m.sub_type,
+    };
+    Some((
+        Plan::CreateProcedure {
+            name: c.name.clone(),
+            ins: c.ins.iter().map(&conv).collect(),
+            outs: c.outs.iter().map(&conv).collect(),
+            selectable: c.selectable,
+            source: c.source,
+            blr: c.blob,
+        },
+        Vec::new(),
+    ))
+}
+
 /// Parse `CREATE EXCEPTION <name> <message>`.
 fn plan_create_exception(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let (name, message) = parse_exception_stmt(sql, "CREATE")?;
@@ -16784,6 +16827,19 @@ fn execute_dml_collecting_inner(
         }
         Plan::CreateException { name, message } => {
             fire_crab_ods::ddl::create_exception(&mut work, db.page_size, name, message)?;
+            (0, 0, 0)
+        }
+        Plan::CreateProcedure { name, ins, outs, selectable, source, blr } => {
+            fire_crab_ods::ddl::create_procedure(
+                &mut work,
+                db.page_size,
+                name,
+                ins,
+                outs,
+                *selectable,
+                source,
+                blr,
+            )?;
             (0, 0, 0)
         }
         Plan::AlterException { name, message } => {
@@ -25992,7 +26048,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
-        | Plan::CreateException { .. } | Plan::DropException { .. }
+        | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropException { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
@@ -26092,7 +26148,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
-        | Plan::CreateException { .. } | Plan::DropException { .. }
+        | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropException { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
@@ -27231,7 +27287,7 @@ fn emit_rows_inner(
         | Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
-        | Plan::CreateException { .. } | Plan::DropException { .. }
+        | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropException { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
@@ -37995,6 +38051,7 @@ fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<
                     .or_else(|| plan_drop_table(text))
                     .or_else(|| plan_drop_index(text))
                     .or_else(|| plan_create_sequence(text))
+                    .or_else(|| plan_create_procedure(text))
                     .or_else(|| plan_drop_sequence(text))
                     .or_else(|| plan_create_exception(text))
                     .or_else(|| plan_drop_exception(text))
@@ -42113,6 +42170,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         .or_else(|| plan_drop_index(&stmt_sql))
                         .or_else(|| plan_create_sequence(&stmt_sql))
                         .or_else(|| plan_drop_sequence(&stmt_sql))
+                        .or_else(|| plan_create_procedure(&stmt_sql))
                         .or_else(|| plan_create_exception(&stmt_sql))
                         .or_else(|| plan_drop_exception(&stmt_sql))
                         .or_else(|| plan_alter_exception(&stmt_sql))
@@ -42377,6 +42435,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::CreateSequence { .. }
                         | Plan::DropSequence { .. }
                         | Plan::CreateException { .. }
+                        | Plan::CreateProcedure { .. }
                         | Plan::AlterException { .. }
                         | Plan::CreateOrAlterException { .. }
                         | Plan::DropException { .. }
@@ -53005,8 +53064,12 @@ mod tests {
             &ck.trigger_blr[3..8],
             &[58, 48, 23, 1, 1] // blr_and, blr_neq, blr_field ctx 1 ...
         );
-        // out-of-surface conditions refuse the whole statement
-        assert!(plan_create_table("CREATE TABLE T (A VARCHAR(5), CHECK (A > 'x'))").is_none());
+        // a TEXT-ordering CHECK compiles now (the CHECK surface took
+        // text/NULL/bigint - the stored literal gold-pinned as
+        // blr_text2); still out of surface: a comparison across
+        // incompatible classes, refused whole
+        assert!(plan_create_table("CREATE TABLE T (A VARCHAR(5), CHECK (A > 'x'))").is_some());
+        assert!(plan_create_table("CREATE TABLE T (A INTEGER, CHECK (A > 'x'))").is_none());
         // CHECK (A IS NOT NULL) stores its negation as blr_missing -
         // engine bytes probed; the IS NULL surface arrived with the
         // trigger-surface slice

@@ -3760,8 +3760,8 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
 /// declaration needs to describe it.
 struct BodyOut {
     blob: Vec<u8>,
-    ins: Vec<String>,
-    outs: Vec<String>,
+    ins: Vec<(String, Dsc)>,
+    outs: Vec<(String, Dsc)>,
     selectable: bool,
     deterministic: bool,
 }
@@ -4048,8 +4048,8 @@ fn body_compile(p: &mut P, func: bool, sub: bool) -> Option<BodyOut> {
     out.push(blr::EOC);
     Some(BodyOut {
         blob: out,
-        ins: inputs.into_iter().map(|(n, _)| n).collect(),
-        outs: params.into_iter().map(|(n, _)| n).collect(),
+        ins: inputs,
+        outs: params,
         selectable: p.saw_suspend,
         deterministic,
     })
@@ -6687,7 +6687,7 @@ impl<'a> P<'a> {
         });
         for list in [&bo.ins, &bo.outs] {
             blob.extend_from_slice(&(list.len() as u16).to_le_bytes());
-            for n in list.iter() {
+            for (n, _) in list.iter() {
                 blob.push(n.len() as u8);
                 blob.extend_from_slice(n.as_bytes());
                 blob.push(0); // no default clause
@@ -9456,6 +9456,101 @@ pub fn compile_trigger_hex(sql: &str) -> Option<String> {
             .map(|b| format!("{:02X}", b))
             .collect(),
     )
+}
+
+/// One parameter of a compiled procedure, shaped for the catalog rows
+/// a CREATE PROCEDURE writes: the name and the RDB$FIELDS facts its
+/// invented RDB$n domain needs (RDB$FIELD_TYPE / LENGTH / SCALE /
+/// SUB_TYPE - the same catalog language table columns speak).
+pub struct ProcParamMeta {
+    pub name: String,
+    pub field_type: i16,
+    pub length: u16,
+    pub scale: i16,
+    pub sub_type: i16,
+}
+
+fn dsc_to_meta(name: &str, d: &Dsc) -> ProcParamMeta {
+    let (field_type, length, scale) = match d {
+        Dsc::Num(7, sc) => (7, 2, *sc as i16),
+        Dsc::Num(8, sc) => (8, 4, *sc as i16),
+        Dsc::Num(_, sc) => (16, 8, *sc as i16),
+        Dsc::Text(l) => (14, *l, 0),
+        Dsc::Varying(l) => (37, *l, 0),
+        Dsc::Date => (12, 4, 0),
+        Dsc::Time => (13, 4, 0),
+        Dsc::Timestamp => (35, 8, 0),
+    };
+    ProcParamMeta {
+        name: name.to_string(),
+        field_type,
+        length,
+        scale,
+        sub_type: 0,
+    }
+}
+
+/// A compiled CREATE PROCEDURE, everything the DDL's catalog writes
+/// need: the engine-byte BLR, the parameters both ways, whether a
+/// SUSPEND makes it selectable (RDB$PROCEDURE_TYPE 1) or not (2), and
+/// the body SOURCE (from its first non-space byte - what the engine
+/// stores in RDB$PROCEDURE_SOURCE, and what the source interpreter
+/// reads back).
+pub struct ProcCompiled {
+    pub name: String,
+    pub blob: Vec<u8>,
+    pub ins: Vec<ProcParamMeta>,
+    pub outs: Vec<ProcParamMeta>,
+    pub selectable: bool,
+    pub source: String,
+}
+
+/// [compile_procedure] with the catalog metadata kept - None exactly
+/// when compile_procedure refuses, so the DDL surface and the BLR
+/// oracle can never drift.
+pub fn compile_procedure_full(sql: &str) -> Option<ProcCompiled> {
+    let trimmed = sql.trim().trim_end_matches(';');
+    let toks = lex(trimmed)?;
+    let mut p = P::fresh(&toks);
+    if !(p.kw("CREATE") && p.kw("PROCEDURE")) {
+        return None;
+    }
+    let name = match p.t.get(p.i)? {
+        Tok::Ident(w) if !is_keyword(w) => {
+            p.i += 1;
+            w.to_ascii_uppercase()
+        }
+        _ => return None,
+    };
+    let bo = body_compile(&mut p, false, false)?;
+    // the stored source is the text from AS onward, first non-space:
+    // the engine keeps the body (declares + BEGIN..END), which is also
+    // exactly what load-by-source interpreters expect
+    let up = trimmed.to_ascii_uppercase();
+    let bytes = up.as_bytes();
+    let mut as_at = None;
+    let mut k = 0usize;
+    while let Some(rel) = up[k..].find("AS") {
+        let at = k + rel;
+        let before_ok = at == 0 || !bytes[at - 1].is_ascii_alphanumeric() && bytes[at - 1] != b'_' && bytes[at - 1] != b'$';
+        let after_ok = bytes
+            .get(at + 2)
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && *c != b'_' && *c != b'$');
+        if before_ok && after_ok {
+            as_at = Some(at);
+            break;
+        }
+        k = at + 2;
+    }
+    let source = trimmed[as_at? + 2..].trim_start().to_string();
+    Some(ProcCompiled {
+        name,
+        blob: bo.blob,
+        ins: bo.ins.iter().map(|(n, d)| dsc_to_meta(n, d)).collect(),
+        outs: bo.outs.iter().map(|(n, d)| dsc_to_meta(n, d)).collect(),
+        selectable: bo.selectable,
+        source,
+    })
 }
 
 /// `compile_procedure` as uppercase hex.

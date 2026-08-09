@@ -2666,8 +2666,15 @@ plus *the subsystem is now on the path*.
   (blr_text2 + charset), and the real wall was the INLINE column
   CHECK's parse, not the types - with the engine itself enforcing
   fire-crab's stored trigger as the closing oracle, **`INSERT ... VALUES`
-  without a column list** is outside it too, and **`CREATE PROCEDURE` is
-  not supported at all** - every gate builds its procedures with the engine
+  without a column list** is outside it too, and ~~`CREATE PROCEDURE` is
+  not supported at all~~ **DONE** (qa/serve-real-createproc.sh, 10):
+  dsql::compile_procedure - the BLR oracle - wired to DDL through
+  compile_procedure_full + ods::create_procedure, the stored
+  RDB$PROCEDURE_BLR BYTE-IDENTICAL to the engine's; boundaries: the
+  engine executing an fc-authored procedure still crashes its loader
+  (deeper catalog fidelity), and a duplicate refuses without the
+  no-meta-update wrapper. The old note stood: every gate builds its
+  procedures with the engine
   and executes them through fire-crab, which is why the interpreter is
   well covered and the DDL is not.
 

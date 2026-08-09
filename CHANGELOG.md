@@ -31,6 +31,46 @@ was caught), **Guarded** (a wrong-answer path closed by refusal).
 - `qa/serve-real-aggdescribe.sh` (new, 8): the SQLDA_DISPLAY lines and
   the fetched rows compared together, per shape.
 
+## 2026-08-09 — CREATE PROCEDURE
+
+### Converted
+- **`CREATE PROCEDURE`**, the roadmap's standing "not supported at all"
+  — every PSQL gate before this built its procedures with the engine.
+  The hard half already existed: `dsql::compile_procedure`, the DSQL
+  BLR oracle, was never wired to DDL. Exposed as
+  `compile_procedure_full` (the BLR plus the catalog metadata, None
+  exactly when the compiler refuses, so the DDL surface and the oracle
+  cannot drift), it now feeds `ods::create_procedure`, which writes the
+  RDB$PROCEDURES / RDB$PROCEDURE_PARAMETERS / RDB$FIELDS rows an
+  engine-created procedure leaves — id from the RDB$PROCEDURES
+  generator, an invented RDB$n domain per parameter, PROCEDURE_TYPE 1
+  when a SUSPEND makes it selectable.
+- **The stored `RDB$PROCEDURE_BLR` is BYTE-IDENTICAL to the engine's**
+  for the same DDL, checked in the gate through the blob reader; the
+  gate spans FOR-SELECT, input/output, expression-body and
+  text-returning procedures, all creating and running with rows equal
+  to the engine's.
+
+### Boundaries recorded
+- The ENGINE executing an fc-AUTHORED procedure crashes its own
+  metadata loader — the BLR is identical and fire-crab runs the
+  procedure, but the engine's executor wants more of the catalog than
+  this writes (an undiagnosed field beyond RDB$FIELD_PRECISION, which
+  matching did not settle); a deeper metadata-fidelity slice of its
+  own. A duplicate `CREATE PROCEDURE` refuses on both, but fire-crab's
+  vector is generic where the engine ships its no-meta-update wrapper —
+  the same wrapper no DDL failure carries yet.
+
+### Fixed
+- A unit test asserting a text CHECK refuses (`CHECK (A > 'x')`) —
+  stale since the CHECK-surface increment lifted exactly that, and
+  masked at the time by a summary that summed the failure line's
+  passed-count; it asserts the compile now, with a cross-class
+  comparison still refusing.
+
+### Gated
+- `qa/serve-real-createproc.sh` (new, 10).
+
 ## 2026-08-09 — the check learns three more words
 
 ### Converted
