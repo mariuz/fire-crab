@@ -31,6 +31,35 @@ was caught), **Guarded** (a wrong-answer path closed by refusal).
 - `qa/serve-real-aggdescribe.sh` (new, 8): the SQLDA_DISPLAY lines and
   the fetched rows compared together, per shape.
 
+## 2026-08-09 — unsuccessful metadata update
+
+### Converted
+- **The no-meta-update wrapper for a duplicate CREATE** — the DDL-error
+  family CREATE PROCEDURE and DROP had each hit as a boundary. A
+  duplicate is the one reason shape uniform across every object type:
+  the engine answers `unsuccessful metadata update / -<VERB>
+  "PUBLIC"."NAME" failed / -<Object> "PUBLIC"."NAME" already exists`,
+  and fire-crab emits the same three gds items now for TABLE,
+  EXCEPTION, SEQUENCE and PROCEDURE. isql renders identical text AND
+  the same SQLSTATE (42S01 for a table, 42000 otherwise), because the
+  SQLSTATE follows the reason code — the dyn_dup_* family, whose codes
+  follow the probed `dyn_dup_table + (dyn# − 132)`, checked against
+  `dyn_dup_index`.
+
+### Boundaries recorded
+- DROP of a missing name still refuses with fire-crab's generic vector:
+  the drop reasons are irregular per type (a table "does not exist"
+  behind -607, a sequence "is not defined", an exception/procedure
+  "not found"), unlike the uniform duplicate — their own slice.
+- The engine executing an fc-AUTHORED procedure still crashes its
+  loader; investigated further this round (the catalog is byte-identical
+  bar RDB$DEBUG_INFO, and a non-null debug blob did not settle it —
+  fc-authored triggers already execute on the engine, so the debug
+  format is not the cause), and it remains a deeper slice.
+
+### Gated
+- `qa/serve-real-metaupdate.sh` (new, 5).
+
 ## 2026-08-09 — drop, then create again
 
 ### Converted

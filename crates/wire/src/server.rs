@@ -319,6 +319,63 @@ const GDS_REC_IN_LIMBO: i32 = 335544459;
 /// "count of column list and variable list do not match" (JRD 349,
 /// SQLCODE -313) - a static SELECT INTO whose lists disagree
 const GDS_DSQL_COUNT_MISMATCH: i32 = 335544669;
+
+/// "unsuccessful metadata update" - the wrapper every DDL failure
+/// carries (isc_no_meta_update). The middle item is the verb's own
+/// `<VERB> @1 failed` code, the last the specific reason; isql renders
+/// the three and derives the SQLSTATE from the reason.
+const GDS_NO_META_UPDATE: i32 = 335544351;
+
+/// The `(<CREATE> @1 failed, <reason> @1)` code pair for a DUPLICATE
+/// create, by object - all measured, the reason being the DYN
+/// `@1 already exists` family (dyn_dup_* ; the numeric codes follow the
+/// probed dyn_dup_table + (dyn# - 132), checked against dyn_dup_index).
+/// `None` for a plan this wrapper does not carry: it falls through to
+/// the generic vector, unchanged.
+fn ddl_dup_codes(plan: &Plan) -> Option<(i32, i32, String)> {
+    let q = |n: &str| format!("\"PUBLIC\".\"{}\"", n.trim().trim_matches('"').to_ascii_uppercase());
+    match plan {
+        Plan::CreateTable { name, .. } => Some((336397286, 336068740, q(name))),
+        Plan::CreateException { name, .. } => Some((336397280, 336068861, q(name))),
+        Plan::CreateSequence { name, .. } => Some((336397285, 336068862, q(name))),
+        Plan::CreateProcedure { name, .. } => Some((336397265, 336068743, q(name))),
+        _ => None,
+    }
+}
+
+/// Answer a DDL error the engine's way when it is a DUPLICATE create -
+/// the no-meta-update wrapper - and report whether it did (the caller
+/// falls back to the generic vector when not). A duplicate is the one
+/// reason shared, uniform, and measured across all four object types;
+/// the drop-missing reasons are irregular per type and stay generic.
+fn respond_ddl_meta(
+    s: &mut TcpStream,
+    enc: &mut Option<Rc4>,
+    plan: &Plan,
+    err_text: &str,
+) -> std::io::Result<bool> {
+    if !err_text.to_ascii_lowercase().contains("already exists") {
+        return Ok(false);
+    }
+    let Some((failed, reason, qn)) = ddl_dup_codes(plan) else {
+        return Ok(false);
+    };
+    let mut w = W::default();
+    w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+    w.int(1) // isc_arg_gds
+        .int(GDS_NO_META_UPDATE)
+        .int(1)
+        .int(failed)
+        .int(2) // isc_arg_string - the qualified name
+        .bytes(qn.as_bytes())
+        .int(1)
+        .int(reason)
+        .int(2)
+        .bytes(qn.as_bytes())
+        .int(0); // isc_arg_end
+    w.send(s, enc)?;
+    Ok(true)
+}
 /// isc_primary_key_required - "Primary key required on table @1"
 /// (SQLSTATE 22000): UPDATE OR INSERT without MATCHING on a PK-less
 /// table, raised at prepare exactly as the engine raises it
@@ -41997,7 +42054,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             Err(ExecErr::Gds(code, _)) => {
                                 respond_error(&mut s, &mut enc, code)?
                             }
-                            Err(ExecErr::Text(_)) | Err(ExecErr::Conflict(_)) => {
+                            Err(ExecErr::Text(t)) => {
+                                if !respond_ddl_meta(&mut s, &mut enc, &p, &t)? {
+                                    respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
+                                }
+                            }
+                            Err(ExecErr::Conflict(_)) => {
                                 respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
                             }
                         }
@@ -42651,7 +42713,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                     ExecErr::Gds(code, _) => {
                                         respond_error(&mut s, &mut enc, code)?
                                     }
-                                    ExecErr::Text(_) | ExecErr::Conflict(_) => {
+                                    ExecErr::Text(t) => {
+                                        if !respond_ddl_meta(&mut s, &mut enc, &plan, &t)? {
+                                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
+                                        }
+                                    }
+                                    ExecErr::Conflict(_) => {
                                         respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
                                     }
                                 }
@@ -42685,7 +42752,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                     respond_eval_error(&mut s, &mut enc, &ev)?
                                 }
                                 ExecErr::Gds(code, _) => respond_error(&mut s, &mut enc, code)?,
-                                ExecErr::Text(_) | ExecErr::Conflict(_) => {
+                                ExecErr::Text(t) => {
+                                    if !respond_ddl_meta(&mut s, &mut enc, &plan, &t)? {
+                                        respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
+                                    }
+                                }
+                                ExecErr::Conflict(_) => {
                                     respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
                                 }
                             }
@@ -43980,7 +44052,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                     respond_eval_error(&mut s, &mut enc, &ev)?
                                 }
                                 ExecErr::Gds(code, _) => respond_error(&mut s, &mut enc, code)?,
-                                ExecErr::Text(_) | ExecErr::Conflict(_) => {
+                                ExecErr::Text(t) => {
+                                    if !respond_ddl_meta(&mut s, &mut enc, &plan, &t)? {
+                                        respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
+                                    }
+                                }
+                                ExecErr::Conflict(_) => {
                                     respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
                                 }
                             }
