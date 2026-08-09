@@ -888,6 +888,12 @@ struct Database {
     /// [GenWindow] for why a generator record has to be scoped to a
     /// window and not to the transaction.
     windows: Vec<UndoWindow>,
+    /// this transaction's SNAPSHOT, captured at op_transaction when the
+    /// TPB asks for concurrency (the engine's and isql's default) -
+    /// None under read committed, or before a transaction starts. A
+    /// stable view: reads do not see what another transaction commits
+    /// after this one began. Cleared when the transaction ends.
+    snapshot: Option<fire_crab_ods::tra::Snapshot>,
 }
 
 /// A connection ending takes its attachment off the file's count,
@@ -1610,6 +1616,9 @@ impl Database {
         self.write = None;
         self.tx = None;
         self.touched = false;
+        // the transaction ended: its snapshot dies with it, so the next
+        // op_transaction captures the inventory afresh
+        self.snapshot = None;
         self.image_undo = false;
         self.ddl_undo = false;
         self.nested_tx.clear();
@@ -2213,6 +2222,7 @@ fn load_database(path: &str) -> Option<Database> {
         ods_major: h.ods_major(),
         ods_minor: h.ods_minor,
         windows: vec![UndoWindow::new(WindowKind::Transaction)],
+        snapshot: None,
     })
 }
 
@@ -25350,6 +25360,9 @@ fn records_at_in(
 struct ReadView<'a> {
     tips: Option<fire_crab_ods::tra::TipChain<'a>>,
     own: fire_crab_ods::tra::OwnTx,
+    /// this transaction's SNAPSHOT (None = read committed): a stable
+    /// view as of its start, the engine's default isolation
+    snapshot: Option<fire_crab_ods::tra::Snapshot>,
     /// the first LIMBO transaction a walk met (0 = none): the walkers
     /// stop on it and their callers raise `isc_rec_in_limbo` - walking
     /// past would silently hide a row the engine refuses to adjudicate
@@ -25358,16 +25371,26 @@ struct ReadView<'a> {
 
 impl<'a> ReadView<'a> {
     fn of(db: &Database, image: &'a [u8]) -> ReadView<'a> {
-        ReadView::over(image, db.page_size, db.own_tx())
+        ReadView {
+            tips: fire_crab_ods::tra::TipChain::read(image, db.page_size),
+            own: db.own_tx(),
+            // the transaction's captured snapshot decides visibility
+            snapshot: db.snapshot.clone(),
+            limbo: std::cell::Cell::new(0),
+        }
     }
 
     /// The same view over an image the caller holds directly - a
     /// statement's WORK COPY, which is not yet anybody's shared image
-    /// but is what its own constraint checks must read.
+    /// but is what its own constraint checks must read. NO snapshot:
+    /// uniqueness and FK checks see ALL committed rows, not the
+    /// transaction's stable view (the engine's constraints are not
+    /// snapshot-bound).
     fn over(image: &'a [u8], page_size: usize, own: fire_crab_ods::tra::OwnTx) -> ReadView<'a> {
         ReadView {
             tips: fire_crab_ods::tra::TipChain::read(image, page_size),
             own,
+            snapshot: None,
             limbo: std::cell::Cell::new(0),
         }
     }
@@ -25392,7 +25415,7 @@ impl<'a> ReadView<'a> {
         }
         match &self.tips {
             Some(tips) => match fire_crab_ods::tra::visible_version_2pc(
-                bytes, page_size, r, tips, &self.own, true,
+                bytes, page_size, r, tips, &self.own, true, self.snapshot.as_ref(),
             ) {
                 Ok(v) => v.map(|v| (v.image, v.format)),
                 Err(id) => {
@@ -25553,7 +25576,9 @@ fn count_visible_records(db: &Database, rel: u16) -> Result<i64, u64> {
         for r in dp.records() {
             // a COUNT meets the limbo law too - measured, the engine
             // raises rather than answering a number nobody can stand by
-            if fire_crab_ods::tra::visible_exists_2pc(&db_image, db.page_size, &r, &tips, &own, true)? {
+            if fire_crab_ods::tra::visible_exists_2pc(
+                &db_image, db.page_size, &r, &tips, &own, true, db.snapshot.as_ref(),
+            )? {
                 n += 1;
             }
         }
@@ -42048,7 +42073,31 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     tx_snapshot = snapshot_db(&database);
                 }
                 read_int(&mut s, &mut dec)?; // db handle
-                read_wire_bytes(&mut s, &mut dec)?; // tpb
+                let tpb = read_wire_bytes(&mut s, &mut dec)?;
+                // ISOLATION: the engine's (and isql's) default is
+                // concurrency = SNAPSHOT, a stable view captured now;
+                // only an explicit isc_tpb_read_committed keeps the
+                // read-committed "latest committed" rule. The version
+                // byte leads; the isolation flag is among the options
+                // after it (a lock-timeout value could in theory carry
+                // 15, but real TPBs put isolation first and flag-only -
+                // a false read-committed merely keeps the old behaviour
+                // for that transaction, never a crash).
+                let read_committed = tpb.get(1..).is_some_and(|o| o.contains(&15));
+                if let Some(db) = database.as_mut() {
+                    db.snapshot = if read_committed {
+                        None
+                    } else {
+                        Some(fire_crab_ods::tra::Snapshot::capture(&db.bytes(), db.page_size))
+                    };
+                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!(
+                            "[srv] op_transaction: {} snapshot={:?}",
+                            if read_committed { "read committed" } else { "concurrency" },
+                            db.snapshot
+                        );
+                    }
+                }
                 // A KICKED ATTACHMENT DOES NO MORE WORK - see [DbGate].
                 // The check sits AFTER the payload reads at every site,
                 // because answering before consuming the op's arguments
@@ -48275,6 +48324,7 @@ mod tests {
             ods_major: 14,
             ods_minor: 0,
             windows: Vec::new(),
+            snapshot: None,
         };
         let src = RowSource::Filter {
             input: Box::new(RowSource::Rows(rows)),

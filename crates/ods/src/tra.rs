@@ -201,6 +201,58 @@ pub struct VisibleVersion {
     pub deltas: u32,
 }
 
+/// A transaction's SNAPSHOT of the inventory, captured at its start -
+/// what `isc_tpb_concurrency` (the engine's default, and isql's) gives:
+/// a stable view. A version's transaction is visible under the snapshot
+/// iff it was COMMITTED as of the snapshot's start, which is exactly
+/// `tx < limit AND tx not in active` (`active` = the transactions that
+/// were still uncommitted below the limit at capture; a transaction
+/// that committed AFTER the snapshot is either >= limit or was in
+/// active, so its rows stay hidden - the whole point). Dead
+/// transactions need no storing: their versions fail the live-committed
+/// test and the chain walks past them anyway.
+///
+/// READ COMMITTED passes `None` and keeps the old "committed now" rule.
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    pub limit: u64,
+    pub active: Vec<u64>,
+}
+
+impl Snapshot {
+    /// Capture the inventory as it stands: `limit` = the header's next
+    /// transaction, `active` = every id below it the TIP does not read
+    /// as committed and that is not dead (active or limbo - the ones
+    /// that could still commit later and must stay invisible).
+    pub fn capture(file: &[u8], page_size: usize) -> Snapshot {
+        // hdr_next_transaction (offset 40) holds the HIGHEST id
+        // ASSIGNED so far (begin_active_tx returns it + 1 and stores
+        // that), so the snapshot's exclusive limit is one PAST it - a
+        // transaction committed by that id must be visible to a reader
+        // starting now.
+        let limit = file
+            .get(40..48)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()) + 1)
+            .unwrap_or(0);
+        let mut active = Vec::new();
+        if let Some(tips) = TipChain::read(file, page_size) {
+            for tx in 1..limit {
+                match tips.state(tx) {
+                    Some(TxState::Active) | Some(TxState::Limbo) => active.push(tx),
+                    _ => {}
+                }
+            }
+        }
+        Snapshot { limit, active }
+    }
+
+    /// Was transaction `tx` committed as of this snapshot?
+    fn sees(&self, tx: u64) -> bool {
+        tx < self.limit && !self.active.contains(&tx)
+    }
+}
+
+
 pub fn visible_version(
     file: &[u8],
     page_size: usize,
@@ -208,7 +260,7 @@ pub fn visible_version(
     tips: &TipChain,
     own: &OwnTx,
 ) -> Option<VisibleVersion> {
-    visible_version_2pc(file, page_size, head, tips, own, false).unwrap_or(None)
+    visible_version_2pc(file, page_size, head, tips, own, false, None).unwrap_or(None)
 }
 
 /// [visible_version] with the engine's LIMBO law: a reader that MEETS a
@@ -224,6 +276,7 @@ pub fn visible_version_2pc(
     tips: &TipChain,
     own: &OwnTx,
     strict: bool,
+    snap: Option<&Snapshot>,
 ) -> Result<Option<VisibleVersion>, u64> {
     let fetch_page = |no: u32| {
         let start = no as usize * page_size;
@@ -247,9 +300,10 @@ pub fn visible_version_2pc(
         // committed for number 0). The rows that carry it are the ones
         // only the system transaction may write, `RDB$PAGES` first
         // among them, so reading it as active would hide the catalog.
-        let counts = current.transaction == 0
-            || tips.state(current.transaction) == Some(TxState::Committed)
-            || own.contains(current.transaction);
+        let counts = own.contains(current.transaction)
+            || current.transaction == 0
+            || (tips.state(current.transaction) == Some(TxState::Committed)
+                && snap.is_none_or(|s| s.sees(current.transaction)));
         if counts {
             if current.flags & flags::DELETED != 0 {
                 return Ok(None); // the reader's row is a deleted stub
@@ -331,7 +385,7 @@ pub fn visible_exists(
     tips: &TipChain,
     own: &OwnTx,
 ) -> bool {
-    visible_exists_2pc(file, page_size, head, tips, own, false).unwrap_or(false)
+    visible_exists_2pc(file, page_size, head, tips, own, false, None).unwrap_or(false)
 }
 
 /// [visible_exists] under the limbo law - see [visible_version_2pc].
@@ -342,15 +396,17 @@ pub fn visible_exists_2pc(
     tips: &TipChain,
     own: &OwnTx,
     strict: bool,
+    snap: Option<&Snapshot>,
 ) -> Result<bool, u64> {
     if head.flags & (flags::CHAIN | flags::FRAGMENT | flags::BLOB) != 0 {
         return Ok(false); // reached through its head, never walked as one
     }
     let mut current = head.clone();
     loop {
-        let counts = current.transaction == 0
-            || tips.state(current.transaction) == Some(TxState::Committed)
-            || own.contains(current.transaction);
+        let counts = own.contains(current.transaction)
+            || current.transaction == 0
+            || (tips.state(current.transaction) == Some(TxState::Committed)
+                && snap.is_none_or(|s| s.sees(current.transaction)));
         if counts {
             return Ok(current.flags & flags::DELETED == 0);
         }
@@ -424,7 +480,7 @@ pub fn visible_rows_2pc(
             let recno = dp.sequence as u64 * recs_per_dp + r.slot as u64;
             // committed-only: a reader with no transaction of its own
             let Some(v) =
-                visible_version_2pc(file, page_size, &r, tips, &OwnTx::none(), strict)?
+                visible_version_2pc(file, page_size, &r, tips, &OwnTx::none(), strict, None)?
             else {
                 continue;
             };

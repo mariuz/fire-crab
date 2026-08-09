@@ -31,6 +31,43 @@ was caught), **Guarded** (a wrong-answer path closed by refusal).
 - `qa/serve-real-aggdescribe.sh` (new, 8): the SQLDA_DISPLAY lines and
   the fetched rows compared together, per shape.
 
+## 2026-08-09 — a stable view
+
+### Converted
+- **SNAPSHOT isolation** — the engine's default, and isql's, and the
+  one fire-crab never had: a transaction sees the database as of its
+  START, not the latest committed. Every read before this answered
+  read-committed ("what is committed WHEN I read"); now a transaction
+  opened with `isc_tpb_concurrency` captures a snapshot at
+  op_transaction and holds it — a row another transaction commits
+  afterwards stays invisible until a FRESH transaction. `isc_tpb_read_committed`
+  keeps the old rule. Measured against the engine with a two-attachment
+  rig: SNAPSHOT answers 2 / 2 / 3 (start, after a concurrent commit, a
+  fresh transaction), READ COMMITTED 2 / 3 / 3 — fire-crab now matches
+  both.
+- The snapshot is `(limit, active)` captured from the inventory:
+  `limit = hdr_next_transaction + 1` (the field holds the highest id
+  ASSIGNED, since `begin_active_tx` hands back that + 1 — an off-by-one
+  a fresh transaction's blindness to the last commit caught), `active`
+  = the ids still uncommitted below it. A version is visible iff it is
+  the reader's own, or committed AND `tx < limit AND tx ∉ active`.
+  Threaded through the two visibility walks and carried on the
+  connection's `Database`, so every client read inherits it;
+  constraint checks stay read-committed (uniqueness sees all committed
+  rows, not the snapshot — the engine's rule).
+
+### Boundaries recorded
+- A read INSIDE a PSQL body still answers read-committed (the
+  autonomous-block-visibility check in serve-real-autonomous.sh holds:
+  engine 0, fire-crab 1) — the body path does not yet carry the
+  transaction's snapshot, its own slice. Concurrent WRITE conflicts
+  (update-conflict, table stability) are unconverted too.
+
+### Gated
+- `qa/serve-real-snapshot.sh` (new, 4): both isolations, differential
+  against the engine through the rig; the whole 216-gate sweep is the
+  proof the shared visibility path did not move (0 DIFF).
+
 ## 2026-08-09 — the drop that names what is missing
 
 ### Converted

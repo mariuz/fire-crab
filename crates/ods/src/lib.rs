@@ -65,7 +65,7 @@ pub use pip::PipPage;
 pub use sysfmt::system_relation_formats;
 pub use pointer::{relation_data_pages, PointerPage};
 pub use tip::{TipPage, TxState};
-pub use tra::{visible_rows, TipChain};
+pub use tra::{visible_rows, Snapshot, TipChain};
 
 /// Read a `u16` at `offset`, little-endian, like the engine's
 /// in-memory access to an aligned USHORT field on x86/ARM.
