@@ -905,6 +905,10 @@ struct Database {
     /// does not block - it raises the update-conflict at once, naming
     /// the blocker. Read from the TPB at op_transaction.
     wait: bool,
+    /// isc_tpb_lock_timeout N: a WAIT transaction that blocks this many
+    /// seconds on another's lock then raises the same conflict rather
+    /// than waiting on. None = wait to the server's own cap.
+    lock_timeout: Option<u32>,
 }
 
 /// A connection ending takes its attachment off the file's count,
@@ -2235,6 +2239,7 @@ fn load_database(path: &str) -> Option<Database> {
         windows: vec![UndoWindow::new(WindowKind::Transaction)],
         snapshot: None,
         wait: true,
+        lock_timeout: None,
     })
 }
 
@@ -16739,6 +16744,44 @@ fn execute_dml(
 /// wants. The engine's default is WAIT, forever; this waits long enough
 /// to be that in practice and still answers rather than hanging a
 /// connection when the holder never ends.
+/// Read the isolation, wait mode and lock timeout out of a TPB. A TPB
+/// is a version byte then clumplets; MOST are bare flags, but a few
+/// carry a length byte and value - lock_read/lock_write (10/11, a table
+/// name), lock_timeout (21) and at_snapshot_number (23). Walking them
+/// properly matters now that a lock_timeout VALUE could otherwise be
+/// mistaken for a bare flag: a 7-second timeout is not isc_tpb_nowait,
+/// a 15-second one is not isc_tpb_read_committed.
+fn parse_tpb(tpb: &[u8]) -> (bool, bool, Option<u32>) {
+    let mut read_committed = false;
+    let mut nowait = false;
+    let mut lock_timeout = None;
+    let mut i = 1; // past the version byte
+    while i < tpb.len() {
+        let tag = tpb[i];
+        i += 1;
+        match tag {
+            15 => read_committed = true, // isc_tpb_read_committed
+            7 => nowait = true,          // isc_tpb_nowait
+            10 | 11 | 23 => {
+                let len = tpb.get(i).copied().unwrap_or(0) as usize;
+                i += 1 + len;
+            }
+            21 => {
+                let len = tpb.get(i).copied().unwrap_or(0) as usize;
+                i += 1;
+                let mut v = 0u32;
+                for (k, b) in tpb.get(i..i + len).unwrap_or(&[]).iter().enumerate().take(4) {
+                    v |= (*b as u32) << (8 * k);
+                }
+                lock_timeout = Some(v);
+                i += len;
+            }
+            _ => {}
+        }
+    }
+    (read_committed, nowait, lock_timeout)
+}
+
 fn conflict_wait() -> std::time::Duration {
     let secs = std::env::var("FC_LOCK_WAIT")
         .ok()
@@ -16790,9 +16833,13 @@ where
                     return Err(ExecErr::Eval(EvalErr::UpdateConflict(other as u64)));
                 }
                 db.write = None; // the write side goes back FIRST
-                let waited =
-                    db.locks
-                        .wait_for_transaction(db.lock_owner, other, conflict_wait());
+                // isc_tpb_lock_timeout caps the wait; without it the
+                // server's own cap stands in for "wait forever"
+                let lt = db.lock_timeout;
+                let dur = lt
+                    .map(|n| std::time::Duration::from_secs(n as u64))
+                    .unwrap_or_else(conflict_wait);
+                let waited = db.locks.wait_for_transaction(db.lock_owner, other, dur);
                 if std::env::var("FC_SRV_TRACE").is_ok() {
                     eprintln!("[srv] waited for transaction {}: {:?}", other, waited);
                 }
@@ -16806,10 +16853,18 @@ where
                         return Err(ExecErr::Gds(GDS_DEADLOCK, "deadlock".into()))
                     }
                     crate::dblocks::Waited::TimedOut => {
+                        // A LOCK TIMEOUT that expired is the engine's
+                        // update-conflict, naming the blocker (measured:
+                        // wait N, then the same three-item vector). The
+                        // server's own cap - no lock_timeout asked for -
+                        // keeps the plain lock-conflict message.
+                        if lt.is_some() {
+                            return Err(ExecErr::Eval(EvalErr::UpdateConflict(other as u64)));
+                        }
                         return Err(ExecErr::Gds(
                             GDS_LOCK_CONFLICT,
                             "lock conflict on no wait transaction".into(),
-                        ))
+                        ));
                     }
                 }
             }
@@ -42152,12 +42207,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 // 15, but real TPBs put isolation first and flag-only -
                 // a false read-committed merely keeps the old behaviour
                 // for that transaction, never a crash).
-                let read_committed = tpb.get(1..).is_some_and(|o| o.contains(&15));
-                // isc_tpb_nowait (7) turns a lock wait into an immediate
-                // conflict; its absence is WAIT, the default
-                let nowait = tpb.get(1..).is_some_and(|o| o.contains(&7));
+                let (read_committed, nowait, lock_timeout) = parse_tpb(&tpb);
                 if let Some(db) = database.as_mut() {
                     db.wait = !nowait;
+                    db.lock_timeout = lock_timeout;
                     db.snapshot = if read_committed {
                         None
                     } else {
@@ -48399,6 +48452,7 @@ mod tests {
             windows: Vec::new(),
             snapshot: None,
             wait: true,
+            lock_timeout: None,
         };
         let src = RowSource::Filter {
             input: Box::new(RowSource::Rows(rows)),
