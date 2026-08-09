@@ -113,6 +113,19 @@ bboth "...and negative" "G = -3000000000; IF (G < 0) THEN EXCEPTION E_T;"
 bboth "...and through arithmetic" \
     "G = 9000000000 + 1; IF (G > 9000000000) THEN EXCEPTION E_T;"
 
+# --- comments INSIDE a statement (the increment after the literals) ------------
+both "a block comment inside a statement" \
+    "A = 1 /* one */ + 1; IF (A = 2) THEN EXCEPTION E_T;"
+both "a line comment inside a statement" \
+    "A = 1 + -- tail
+  1; IF (A = 2) THEN EXCEPTION E_T;"
+both "a comment inside an IF condition" \
+    "A = 1; IF (A = 1 /* why */) THEN EXCEPTION E_T;"
+both "a quoted '--' is data, not a comment" \
+    "B = 'a--b'; IF (B = 'a--b') THEN EXCEPTION E_T;"
+both "a quoted '/*' too" \
+    "B = '/*x*/'; IF (B = '/*x*/') THEN EXCEPTION E_T;"
+
 # --- the stored-BLR boundary stays closed --------------------------------------
 out=$(printf "CREATE TABLE TCX (V VARCHAR(5) CHECK (V = 'x'));\n" |
     "$ISQL" -q -b -user "$U" -pas "$P" "$F" 2>&1 | head -1)

@@ -31,6 +31,20 @@ was caught), **Guarded** (a wrong-answer path closed by refusal).
 - `qa/serve-real-aggdescribe.sh` (new, 8): the SQLDA_DISPLAY lines and
   the fetched rows compared together, per shape.
 
+## 2026-08-09 — the comment inside the statement
+
+### Converted
+- **Comments INSIDE a statement** — the between-statements walk
+  learned comments long ago (a body-ending comment refused everything
+  once), and this is the same disease at the next depth: the text
+  between semicolons went verbatim to sub-parsers that do not know
+  comments, so `A = 1 /* one */ + 1` refused the whole body. One
+  literal-aware stripper now runs at the statement slice and at the
+  IF/WHILE condition slice — a quoted `--` or `/*` stays data.
+
+### Gated
+- `qa/serve-real-psqltext.sh` 19 → 24.
+
 ## 2026-08-09 — a number bigger than the lexer
 
 ### Converted

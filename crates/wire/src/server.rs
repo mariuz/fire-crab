@@ -9502,6 +9502,58 @@ fn parse_dyn_text(t: &str, vars: &[String]) -> Option<Vec<DynPart>> {
 /// One statement at the cursor: a nested block, IF/WHILE (whose inner
 /// statement may itself be a block - no semicolon after an END), or a
 /// semicolon-terminated simple statement.
+
+/// Replace SQL comments with a single space, OUTSIDE string literals
+/// and quoted identifiers: `/* ... */` (unnested, as the engine reads
+/// them) and `-- to end of line`. A quoted comment-opener is data.
+fn strip_sql_comments(text: &str) -> String {
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\'' | b'"' => {
+                let q = b[i];
+                out.push(q as char);
+                i += 1;
+                while i < b.len() {
+                    out.push(b[i] as char);
+                    if b[i] == q {
+                        // a doubled quote stays inside the literal
+                        if b.get(i + 1) == Some(&q) {
+                            out.push(q as char);
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+                out.push(' ');
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                out.push(' ');
+            }
+            c => {
+                out.push(c as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 fn parse_trig_stmt(
     s: &str,
     pos: &mut usize,
@@ -9642,7 +9694,9 @@ fn parse_trig_stmt(
         let close = close?;
         // fold NOT exactly as the engine's DSQL pass does: inverted
         // comparisons and De Morgan; IS NULL keeps its blr_not form
-        let cond = cond_resolve_vars(&parse_cond(&s[open..=close])?, vars).normalized();
+        let cond =
+            cond_resolve_vars(&parse_cond(&strip_sql_comments(&s[open..=close]))?, vars)
+                .normalized();
         *pos = close + 1;
         skip_trig_ws(s, pos, limit);
         let kw = if word == "IF" { "THEN" } else { "DO" };
@@ -9668,7 +9722,15 @@ fn parse_trig_stmt(
     }
     // simple statements run to the next semicolon OUTSIDE a literal
     let semi = find_stmt_semi(s, start, limit)?;
-    let text = &s[start..semi];
+    // COMMENTS COME OFF HERE, once, for every statement arm at once:
+    // the text between semicolons goes verbatim to sub-parsers that do
+    // not know comments, so `A = 1 /* one */ + 1` refused the whole
+    // body (the BETWEEN-statements walk learned this lesson earlier -
+    // see skip_trig_ws - and the INSIDE-a-statement half is the same
+    // disease at the next depth). Literal-aware: a quoted '--' or '/*'
+    // is data.
+    let text = strip_sql_comments(&s[start..semi]);
+    let text = text.as_str();
     let up = text.to_ascii_uppercase();
     *pos = semi + 1;
     if find_word(&up, "SUSPEND", 0) == Some(0) && text.trim().len() == "SUSPEND".len() {

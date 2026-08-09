@@ -2673,9 +2673,10 @@ plus *the subsystem is now on the path*.
   ASSIGNMENTS never reaches the source parser at all - the BLR executor
   answers it - so only a body that also WRITES showed it. Fixed with the
   autonomous slice, whose gate found it by commenting one of its own
-  procedures. **A comment INSIDE a statement is still outside the
-  surface**: the statement text is taken verbatim between semicolons and
-  handed to parsers that do not know comments either.
+  procedures. ~~A comment INSIDE a statement is still outside the
+  surface~~ **DONE** (gate 19 -> 24): one literal-aware stripper at
+  the statement slice and the IF/WHILE condition slice; a quoted
+  comment-opener stays data.
 
   **`gfix -write sync|async` is not a service at all.** Filing the
   tools under "as services" was a guess, and this one is wrong: gfix
