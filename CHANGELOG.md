@@ -31,6 +31,24 @@ was caught), **Guarded** (a wrong-answer path closed by refusal).
 - `qa/serve-real-aggdescribe.sh` (new, 8): the SQLDA_DISPLAY lines and
   the fetched rows compared together, per shape.
 
+## 2026-08-08 — the grouped half, and the subquery's flag
+
+### Converted
+- **The other half of the aggregate-describe entry.** Grouped MIN/MAX
+  carry their source column's type (the grouped select-item arm typed
+  every int source as INT64 where a text source already used
+  `wire_for` — the int arm does now too); grouped COUNT drops the
+  Nullable flag exactly as the lone form does. And a WHOLE-ITEM
+  scalar subquery lends the outer column its announced type — the
+  fold-to-literal kept the value and lost the type, so the fname
+  patch loop carries the sub-plan's `ScalarTy` across the re-plan —
+  with one measured refinement: **a subquery result is ALWAYS
+  nullable, even COUNT**, because no row answers NULL.
+
+### Gated
+- `qa/serve-real-aggdescribe.sh` 8 → 16: the grouped four, HAVING,
+  and the three subquery-in-projection shapes.
+
 ## 2026-08-08 — an argument in its own words
 
 ### Converted

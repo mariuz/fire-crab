@@ -79,5 +79,17 @@ both "COUNT(col) the same"                    "SELECT COUNT(I) FROM T;"
 both "an aliased MIN keeps the type and the alias" "SELECT MIN(S) AS LO FROM T;"
 both "a filtered MAX keeps the type"          "SELECT MAX(I) FROM T WHERE S = 2;"
 
+# --- the grouped half, and the subquery-in-projection half ---------------------
+both "grouped MAX keeps the source type"      "SELECT S, MAX(I) FROM T GROUP BY S;"
+both "grouped MIN over SMALLINT"              "SELECT I, MIN(S) FROM T GROUP BY I;"
+both "grouped COUNT is NOT nullable"          "SELECT S, COUNT(*) FROM T GROUP BY S;"
+both "grouped SUM widens"                     "SELECT S, SUM(I) FROM T GROUP BY S;"
+both "HAVING changes nothing"                 "SELECT S, MAX(I) FROM T GROUP BY S HAVING MAX(I) > 1;"
+# a WHOLE-ITEM subquery lends the outer column its type - and a
+# subquery result is ALWAYS nullable, even COUNT (no row answers NULL)
+both "a subquery MAX describes its source"    "SELECT (SELECT MAX(I) FROM T) AS M FROM T;"
+both "a subquery MIN over SMALLINT"           "SELECT (SELECT MIN(S) FROM T) FROM T;"
+both "a subquery COUNT turns NULLABLE"        "SELECT S, (SELECT COUNT(*) FROM T) FROM T;"
+
 echo "ran $ran checks"
 exit $fail

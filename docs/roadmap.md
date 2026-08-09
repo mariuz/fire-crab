@@ -47,9 +47,10 @@ four; R7 is the removal of what they replaced.
   8): Plan::Scalar carries a ScalarTy - MIN/MAX from the source
   column via wire_for, SUM/AVG INT64, COUNT the engine's own
   NOT-NULLABLE 580 - and the announced type decides the wire slot.
-  What remains of the original entry: GROUPED aggregates' cols and
-  any fold consumer not routed through Plan::Scalar.
-  The original entry:
+  The GROUPED half and the subquery-in-projection landed the
+  increment after (gate 8 -> 16), with one refinement measured on the
+  way: a subquery result is ALWAYS nullable, even COUNT - no row
+  answers NULL. The entry is CLOSED. Its original text:
   **A scalar subquery's aggregate describes as BIGINT.** `SELECT (SELECT
   MAX(C) FROM V) AS M FROM T` announces an INT64 where the engine
   announces the source column's own INTEGER; the ROWS agree on every

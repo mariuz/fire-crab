@@ -22423,7 +22423,7 @@ fn plan_query_inner_ctx(
                 // aliased or not). The text cannot carry that, so each
                 // whole-item subquery remembers its select-list position
                 // and the planned column is patched after the re-plan.
-                let fname_patches: Vec<(usize, String, Option<String>, Option<String>)> = subs
+                let fname_patches: Vec<(usize, String, Option<String>, Option<String>, Option<ScalarTy>)> = subs
                     .iter()
                     .enumerate()
                     .filter_map(|(i, sub)| {
@@ -22440,14 +22440,23 @@ fn plan_query_inner_ctx(
                                 item.split_whitespace().collect::<Vec<_>>().join(" ");
                             squashed.eq_ignore_ascii_case(&exists_item)
                         }) {
-                            return Some((idx, "BOOL".to_string(), None, None));
+                            return Some((idx, "BOOL".to_string(), None, None, None));
                         }
                         let idx = items.iter().position(|item| {
                             let (body, _) = split_alias(item);
                             body.trim() == mark
                         })?;
                         let (rel, ralias) = subquery_source(sub);
-                        Some((idx, subquery_item_name(sub)?.0, rel, ralias))
+                        // a WHOLE-ITEM subquery also lends the outer
+                        // column its ANNOUNCED TYPE - the engine
+                        // describes (SELECT MAX(I) FROM T) by MAX's own
+                        // source-typed answer, and the fold to a
+                        // literal would otherwise widen it to INT64
+                        let sty = match plan_query_inner(sub, db, &mut Vec::new()) {
+                            Some(Plan::Scalar(_, _, _, ty)) => Some(ty),
+                            _ => None,
+                        };
+                        Some((idx, subquery_item_name(sub)?.0, rel, ralias, sty))
                     })
                     .collect();
                 let mut proj_out = folded.clone();
@@ -22561,7 +22570,7 @@ fn plan_query_inner_ctx(
                 // folded text: the FROM item has moved, so a positional
                 // refusal from it is downgraded ([downgrade_rewritten])
                 let mut plan = downgrade_rewritten(plan_query_inner(&out, db, params)?);
-                for (idx, fname, rel, ralias) in &fname_patches {
+                for (idx, fname, rel, ralias, sty) in &fname_patches {
                     match &mut plan {
                         Plan::Project { cols, .. }
                         | Plan::Join { cols, .. }
@@ -22574,6 +22583,16 @@ fn plan_query_inner_ctx(
                                 c.fname = Some(fname.clone());
                                 c.relation = rel.clone();
                                 c.rel_alias = ralias.clone();
+                                if let Some(ty) = sty {
+                                    c.wire = ty.wire;
+                                    // ALWAYS NULLABLE as a subquery: no
+                                    // row answers NULL, so even COUNT -
+                                    // not-nullable standalone - carries
+                                    // the flag here (measured)
+                                    c.sql_type = nullable(ty.sql_type);
+                                    c.length = ty.length;
+                                    c.oct_length = ty.length;
+                                }
                             }
                         }
                         // a plain-column sub folds to a literal
@@ -24068,11 +24087,21 @@ fn build_group_items(
                     _ => None, // COUNT(*)
                 };
                 let (wire, sql_type, length, scale, sub_type) = match func {
-                    AggFn::Count => (Wire::Int64, 581, 8, 0, 0),
+                    // COUNT is INT64 and the ONE aggregate the engine
+                    // announces NOT NULLABLE - the even 580 survives
+                    // below because nullable() skips it
+                    AggFn::Count => (Wire::Int64, 580, 8, 0, 0),
                     AggFn::Min | AggFn::Max => {
                         let (t, sc, rank) = src_shape?;
                         match t {
-                            ExprType::Int => (Wire::Int64, 580, 8, 0, 0),
+                            // MIN/MAX keep the SOURCE column's own type
+                            // (measured: grouped MAX over an INTEGER
+                            // describes 496 LONG, over a SMALLINT 500) -
+                            // an expression source stays the fold's INT64
+                            ExprType::Int => match field_desc {
+                                Some(d) => wire_for(d),
+                                None => (Wire::Int64, 580, 8, 0, 0),
+                            },
                             ExprType::Numeric => {
                                 if rank == NumRank::I128 {
                                     (Wire::Int128, 32752, 16, sc as i32, 0)
@@ -24141,7 +24170,11 @@ fn build_group_items(
                     rel_alias: None,
                     field_id: out_idx,
                     wire,
-                    sql_type: nullable(sql_type),
+                    sql_type: if matches!(func, AggFn::Count) {
+                        sql_type // NOT nullable - the engine's own flag
+                    } else {
+                        nullable(sql_type)
+                    },
                     length,
                     oct_length: length,
                     scale,
