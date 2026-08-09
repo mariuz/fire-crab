@@ -237,6 +237,12 @@ const GDS_DSQL_ERROR: i32 = 335544569;
 /// each other and its scan denies one of them (iberror: 335544336, the
 /// SQLSTATE 40001 the drivers report as "deadlock").
 const GDS_DEADLOCK: i32 = 335544336;
+/// isc_update_conflict - "update conflicts with concurrent update", the
+/// second item of the snapshot write-conflict vector
+const GDS_UPDATE_CONFLICT: i32 = 335544451;
+/// isc_concurrent_transaction - "concurrent transaction number is @1",
+/// naming the transaction whose commit the snapshot cannot write over
+const GDS_CONCURRENT_TRANSACTION: i32 = 335544878;
 
 /// `isc_read_only_database` - "attempted update on read-only database"
 /// (SQLSTATE 42000, SQLCODE -817), what every write answers on a
@@ -16337,6 +16343,10 @@ fn dml_targets_at(
         let Some((_, descs)) = descs else { continue };
         let values = decode_record(&image, descs);
         if filter.as_ref().map_or(Ok(true), |p| p.matches(&values))? {
+            // a snapshot cannot write over a concurrent commit
+            if let Some(tx) = view.snapshot_conflict(&r) {
+                return Err(EvalErr::UpdateConflict(tx));
+            }
             out.push((recno, dp_no, r.slot, format, image));
         }
     }
@@ -16640,6 +16650,10 @@ fn collect_dml_targets(
             // a WHERE eval error (divide by zero) aborts the DML like
             // the engine's - never a partial row set
             if filter.as_ref().map_or(Ok(true), |p| p.matches(&values))? {
+                // a snapshot cannot write over a concurrent commit
+                if let Some(tx) = view.snapshot_conflict(&r) {
+                    return Err(EvalErr::UpdateConflict(tx));
+                }
                 out.push((dp_no, r.slot, format, image));
             }
         }
@@ -25432,6 +25446,29 @@ impl<'a> ReadView<'a> {
         }
     }
 
+    /// Under a SNAPSHOT, does writing this record's chain HEAD conflict
+    /// with a concurrent commit? The head's transaction wrote the row
+    /// last; if the snapshot cannot see it (committed AFTER the snapshot
+    /// began) and it is not the reader's own, the engine refuses the
+    /// write - "update conflicts with concurrent update". An ACTIVE
+    /// (uncommitted) head is the WAIT case instead, left to
+    /// with_conflict_wait. Read committed (no snapshot) never conflicts.
+    fn snapshot_conflict(&self, head: &fire_crab_ods::RecordHeader) -> Option<u64> {
+        let snap = self.snapshot.as_ref()?;
+        let tx = head.transaction;
+        if tx == 0 || self.own.contains(tx) || snap.sees(tx) {
+            return None;
+        }
+        match &self.tips {
+            Some(tips)
+                if tips.state(tx) == Some(fire_crab_ods::tip::TxState::Committed) =>
+            {
+                Some(tx)
+            }
+            _ => None,
+        }
+    }
+
     /// ...decoded with the descriptors of THE VERSION FOUND, which need
     /// not be the head's: an older version can carry an older format.
     fn values(
@@ -27020,6 +27057,16 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(GDS_REC_IN_LIMBO)
                 .int(ISC_ARG_NUMBER)
                 .int(*id as i32);
+        }
+        EvalErr::UpdateConflict(tx) => {
+            w.int(1) // isc_arg_gds - deadlock
+                .int(GDS_DEADLOCK)
+                .int(1) // isc_arg_gds - update conflicts with concurrent update
+                .int(GDS_UPDATE_CONFLICT)
+                .int(1) // isc_arg_gds - concurrent transaction number is @1
+                .int(GDS_CONCURRENT_TRANSACTION)
+                .int(ISC_ARG_NUMBER)
+                .int(*tx as i32);
         }
         EvalErr::DsqlCountMismatch => {
             w.int(1) // isc_arg_gds
@@ -31078,6 +31125,15 @@ enum EvalErr {
     /// past it would be a wrong answer - the row is neither there nor
     /// not-there until somebody resolves the two-phase commit.
     RecInLimbo(u64),
+    /// a DML statement under a SNAPSHOT tried to write a row whose
+    /// PRIMARY version was committed by a transaction the snapshot
+    /// cannot see (committed after it began): the engine's
+    /// `deadlock / update conflicts with concurrent update /
+    /// concurrent transaction number is @1`. The snapshot may not
+    /// write over a version it never saw - measured across
+    /// UPDATE-over-update, DELETE-over-update and UPDATE-over-delete,
+    /// all the same three-item vector.
+    UpdateConflict(u64),
     /// a scalar subquery answered MORE THAN ONE ROW - the engine's
     /// `isc_sing_select_err`, "multiple rows in singleton select"
     /// (SQLSTATE 21000). Taking the first row would be a wrong answer

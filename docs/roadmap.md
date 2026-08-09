@@ -2458,10 +2458,12 @@ plus *the subsystem is now on the path*.
   `qa/serve-real-genwrite.sh` said so. The transaction carries the
   answer itself now.
 
-  **What is left of W4** is the shape of the answer, not the answer:
-  the engine's deadlock vector carries two more items after the code
-  (`isc_update_conflict` and the concurrent transaction's number), and
-  the TPB's NO WAIT / LOCK TIMEOUT are read as WAIT.
+  ~~**What is left of W4**~~ The deadlock vector's two extra items
+  (`isc_update_conflict` and the concurrent transaction's number) are
+  carried now, as the UPDATE-CONFLICT under snapshot
+  (qa/serve-real-updateconflict.sh) - a snapshot cannot write over a
+  row committed after it began. What remains of W4: the TPB's NO WAIT /
+  LOCK TIMEOUT are still read as WAIT.
 - **W7 — the metadata cache** (`mdc`). *(done, and it was the
   measurement that put it here)* Every plan re-derived its table from
   the file — id, columns, descriptors, index operations, NOT NULL

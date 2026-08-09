@@ -31,6 +31,30 @@ was caught), **Guarded** (a wrong-answer path closed by refusal).
 - `qa/serve-real-aggdescribe.sh` (new, 8): the SQLDA_DISPLAY lines and
   the fetched rows compared together, per shape.
 
+## 2026-08-09 — the write that came too late
+
+### Converted
+- **UPDATE conflict under snapshot** — the write half of snapshot
+  isolation. A snapshot transaction reads a stable view (the increment
+  before), and it may NOT write over a row another transaction
+  committed AFTER its snapshot began: the engine answers `deadlock /
+  update conflicts with concurrent update / concurrent transaction
+  number is @1`, and fire-crab emits the same three-item vector now.
+  The rule is uniform — measured across UPDATE-over-update,
+  DELETE-over-update and UPDATE-over-a-committed-delete, all the same
+  vector — so the check is one place: in the DML target walks, once a
+  row matches the filter through the snapshot view, its PRIMARY chain
+  head is inspected, and if that head's transaction is committed, not
+  the reader's own, and outside the snapshot, the write is refused. An
+  ACTIVE (uncommitted) head is the WAIT case still, left to the lock
+  manager; READ COMMITTED never conflicts.
+
+### Gated
+- `qa/serve-real-updateconflict.sh` (new, 5): the three conflict shapes
+  differential against the engine (the concurrent-transaction number
+  normalized, since ids differ per server) and the read-committed
+  no-conflict; the full sweep proves the DML write path did not move.
+
 ## 2026-08-09 — a stable view
 
 ### Converted

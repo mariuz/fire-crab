@@ -247,7 +247,7 @@ impl Snapshot {
     }
 
     /// Was transaction `tx` committed as of this snapshot?
-    fn sees(&self, tx: u64) -> bool {
+    pub fn sees(&self, tx: u64) -> bool {
         tx < self.limit && !self.active.contains(&tx)
     }
 }
