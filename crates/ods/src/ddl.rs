@@ -7474,6 +7474,145 @@ fn find_exception(
     found
 }
 
+/// `DROP PROCEDURE <name>` - the inverse of [create_procedure]: the
+/// RDB$PROCEDURES row, its RDB$PROCEDURE_PARAMETERS rows, each
+/// parameter's invented RDB$n domain (RDB$FIELDS), the security class
+/// and the owner's grant. Refuses a name that is not there, and - the
+/// fail-closed part - a procedure any RDB$DEPENDENCIES row still names
+/// as depended-on (the engine's "there are N dependencies"; fire-crab
+/// only writes those rows for the dependencies it tracks, so a
+/// body-to-body call it never recorded cannot be caught here, a
+/// recorded boundary).
+pub fn drop_procedure(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    // the row, and its parameter domains, gathered before anything is
+    // deleted
+    let formats = system_relation_formats(file, page_size, "RDB$PROCEDURES")
+        .ok_or("no RDB$PROCEDURES format")?;
+    let (_, pdescs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("no format")?;
+    let prel = crate::resolve_relation(file, page_size, "RDB$PROCEDURES")
+        .ok_or("no RDB$PROCEDURES relation")?;
+    let pcols = relation_columns(file, page_size, "RDB$PROCEDURES");
+    let pname_f = pcols
+        .iter()
+        .find(|c| c.name == "RDB$PROCEDURE_NAME")
+        .map(|c| c.field_id as usize)
+        .ok_or("no RDB$PROCEDURE_NAME")?;
+    let pcls_f = pcols
+        .iter()
+        .find(|c| c.name == "RDB$SECURITY_CLASS")
+        .map(|c| c.field_id as usize);
+    let mut found = false;
+    let mut class: Option<String> = None;
+    {
+        let want = want.clone();
+        walk_rows(file, page_size, prel, pdescs, |v| {
+            if text_eq(v.get(pname_f), &want) {
+                found = true;
+                if let Some(cf) = pcls_f {
+                    if let Some(Value::Text(t)) = v.get(cf) {
+                        class = Some(t.trim_end().to_string());
+                    }
+                }
+            }
+        });
+    }
+    if !found {
+        return Err(format!("Procedure {} not found", want));
+    }
+    // depended-on? refuse, as the engine does - for the dependencies
+    // this server records
+    if let Some(drel) = crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES") {
+        let dfmts = system_relation_formats(file, page_size, "RDB$DEPENDENCIES")
+            .ok_or("no RDB$DEPENDENCIES format")?;
+        let (_, ddescs) = dfmts.iter().max_by_key(|(n, _)| *n).ok_or("no format")?;
+        let dcols = relation_columns(file, page_size, "RDB$DEPENDENCIES");
+        let don_f = dcols
+            .iter()
+            .find(|c| c.name == "RDB$DEPENDED_ON_NAME")
+            .map(|c| c.field_id as usize);
+        if let Some(don_f) = don_f {
+            let mut deps = 0usize;
+            let want = want.clone();
+            walk_rows(file, page_size, drel, ddescs, |v| {
+                if text_eq(v.get(don_f), &want) {
+                    deps += 1;
+                }
+            });
+            if deps > 0 {
+                return Err(format!(
+                    "cannot delete PROCEDURE {} - there are {} dependencies",
+                    want, deps
+                ));
+            }
+        }
+    }
+    // the parameter domains, before the parameter rows go
+    let mut domains: Vec<String> = Vec::new();
+    {
+        let pprel = crate::resolve_relation(file, page_size, "RDB$PROCEDURE_PARAMETERS")
+            .ok_or("no RDB$PROCEDURE_PARAMETERS relation")?;
+        let ppfmts = system_relation_formats(file, page_size, "RDB$PROCEDURE_PARAMETERS")
+            .ok_or("no format")?;
+        let (_, ppdescs) = ppfmts.iter().max_by_key(|(n, _)| *n).ok_or("no format")?;
+        let ppcols = relation_columns(file, page_size, "RDB$PROCEDURE_PARAMETERS");
+        let pp_name_f = ppcols
+            .iter()
+            .find(|c| c.name == "RDB$PROCEDURE_NAME")
+            .map(|c| c.field_id as usize)
+            .ok_or("no RDB$PROCEDURE_NAME")?;
+        let pp_src_f = ppcols
+            .iter()
+            .find(|c| c.name == "RDB$FIELD_SOURCE")
+            .map(|c| c.field_id as usize);
+        let want = want.clone();
+        walk_rows(file, page_size, pprel, ppdescs, |v| {
+            if text_eq(v.get(pp_name_f), &want) {
+                if let Some(sf) = pp_src_f {
+                    if let Some(Value::Text(t)) = v.get(sf) {
+                        domains.push(t.trim_end().to_string());
+                    }
+                }
+            }
+        });
+    }
+    // now delete: procedure row, parameter rows, each domain, class, grant
+    {
+        let want = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$PROCEDURES", move |v| {
+            text_eq(v.get(pname_f), &want)
+        })?;
+    }
+    {
+        let pp_name_f = sys_fid(file, page_size, "RDB$PROCEDURE_PARAMETERS", "RDB$PROCEDURE_NAME")?;
+        let want = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$PROCEDURE_PARAMETERS", move |v| {
+            text_eq(v.get(pp_name_f), &want)
+        })?;
+    }
+    let fname_f = sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME")?;
+    for dom in domains {
+        delete_catalog_rows(file, page_size, "RDB$FIELDS", move |v| {
+            text_eq(v.get(fname_f), &dom)
+        })?;
+    }
+    if let Some(class) = class {
+        let cls_f = sys_fid(file, page_size, "RDB$SECURITY_CLASSES", "RDB$SECURITY_CLASS")?;
+        delete_catalog_rows(file, page_size, "RDB$SECURITY_CLASSES", move |v| {
+            text_eq(v.get(cls_f), &class)
+        })?;
+    }
+    {
+        let rel_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$RELATION_NAME")?;
+        let obj_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$OBJECT_TYPE")?;
+        let want = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$USER_PRIVILEGES", move |v| {
+            text_eq(v.get(rel_f), &want) && int_eq(v.get(obj_f), 5)
+        })?;
+    }
+    advance_oldest_transactions(file, page_size)
+}
+
 /// One parameter of a CREATE PROCEDURE, in the catalog's own terms.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProcParamDef {

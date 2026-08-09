@@ -31,6 +31,36 @@ was caught), **Guarded** (a wrong-answer path closed by refusal).
 - `qa/serve-real-aggdescribe.sh` (new, 8): the SQLDA_DISPLAY lines and
   the fetched rows compared together, per shape.
 
+## 2026-08-09 — drop, then create again
+
+### Converted
+- **`DROP PROCEDURE`**, and the systemic fix it uncovered. The drop
+  itself mirrors the engine — the RDB$PROCEDURES row, the parameter
+  rows, each parameter's invented RDB$n domain, the security class and
+  the owner grant, and a fail-closed refusal for a name any
+  RDB$DEPENDENCIES row still depends on.
+- **A dropped catalog object can be CREATEd again under the same name
+  — for EVERY object type.** fire-crab could re-create none of them:
+  "duplicate key in unique index", because a delete leaves its index
+  entry for the GC to clear (the engine works the same way) and the
+  unique-index INSERT refused against that ghost without asking whether
+  its record was still live. `btw::recno_is_live` now answers that —
+  the engine's own duplicate scan skips deleted versions — so a
+  conflict counts only against a live row. A genuine duplicate still
+  refuses.
+
+### Boundaries recorded
+- `DROP PROCEDURE` of a missing name, and a duplicate CREATE, refuse
+  on both servers but with fire-crab's generic vector where the engine
+  ships its no-meta-update wrapper — the same DDL-vector family no
+  statement carries yet.
+
+### Gated
+- `qa/serve-real-dropcreate.sh` (new, 8): drop-and-recreate cycles for
+  exception, sequence, table and procedure, the re-created objects
+  taking rows and running, and the live-duplicate refusal that proves
+  the fix did not open the door.
+
 ## 2026-08-09 — CREATE PROCEDURE
 
 ### Converted

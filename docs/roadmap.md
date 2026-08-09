@@ -2673,8 +2673,12 @@ plus *the subsystem is now on the path*.
   RDB$PROCEDURE_BLR BYTE-IDENTICAL to the engine's; boundaries: the
   engine executing an fc-authored procedure still crashes its loader
   (deeper catalog fidelity), and a duplicate refuses without the
-  no-meta-update wrapper. The old note stood: every gate builds its
-  procedures with the engine
+  no-meta-update wrapper. DROP PROCEDURE followed, and with it the
+  systemic unique-index-after-delete fix (btw::recno_is_live) that
+  finally lets ANY dropped object be created again under the same name
+  - fire-crab could re-create none before (qa/serve-real-dropcreate.sh,
+  8). The old note stood: every gate builds its procedures with the
+  engine
   and executes them through fire-crab, which is why the interpreter is
   well covered and the DDL is not.
 

@@ -711,6 +711,38 @@ pub fn key_cmp_desc(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
 /// index root page repointed). `unique` refuses an existing equal
 /// non-NULL key (isc_no_dup semantics).
 #[allow(clippy::too_many_arguments)]
+
+/// Whether the record a conflicting index entry names is still a LIVE
+/// row - a primary version that is not a deleted stub. A unique-index
+/// insert refuses only against a live conflict; an entry left behind
+/// by a deleted (dropped, or key-changed) record is a ghost the GC has
+/// not swept yet, and re-using its key is legal. Absent record, absent
+/// page, a back-version or a deleted stub all read as NOT live.
+fn recno_is_live(file: &[u8], page_size: usize, rel: u16, recno: u64) -> bool {
+    let recs = crate::format::max_recs_per_dp(page_size);
+    if recs == 0 {
+        return false;
+    }
+    let seq = (recno / recs) as u32;
+    let slot = (recno % recs) as u16;
+    for dp_no in crate::pointer::relation_data_pages(file, page_size, rel) {
+        let start = dp_no as usize * page_size;
+        let Some(dp) = file
+            .get(start..start + page_size)
+            .and_then(crate::data::DataPage::decode)
+        else {
+            continue;
+        };
+        if dp.sequence != seq {
+            continue;
+        }
+        // is_primary_record() already excludes CHAIN/FRAGMENT/BLOB
+        // AND the DELETED stub - exactly "a live row at this slot"
+        return dp.record(slot).is_some_and(|r| r.is_primary_record());
+    }
+    false
+}
+
 pub fn insert_index_entry(
     file: &mut Vec<u8>,
     page_size: usize,
@@ -785,9 +817,22 @@ pub fn insert_index_entry(
     if content.nodes.iter().any(|n| n.key == key && n.recno == recno) {
         return Ok(());
     }
-    // unique violation = the same non-NULL key under a DIFFERENT
-    // record; our own stale entries do not count
-    if unique && !key.is_empty() && content.nodes.iter().any(|n| n.key == key && n.recno != recno)
+    // unique violation = the same non-NULL key under a DIFFERENT,
+    // STILL-LIVE record. Our own stale entries do not count, and
+    // neither do a DELETED record's: an index entry outlives the
+    // record version that wrote it (GC clears it later), so a dropped
+    // catalog row - or an UPDATE that freed a key - leaves an entry
+    // whose record is gone, and re-inserting the key must not collide
+    // with that ghost. The engine checks the conflicting record's
+    // state the same way (idx.cpp's duplicate scan skips deleted
+    // versions); without this, no object could be dropped and created
+    // again under the same name.
+    if unique
+        && !key.is_empty()
+        && content
+            .nodes
+            .iter()
+            .any(|n| n.key == key && n.recno != recno && recno_is_live(file, page_size, rel, n.recno))
     {
         return Err("duplicate key in unique index".into());
     }
