@@ -8036,6 +8036,28 @@ fn cast_num_form(e: &Expr) -> Option<(Wire, i32, i32, i32, i32)> {
     }
 }
 
+/// The SUB_TYPE a numeric-valued expression announces: the MAX over its
+/// numeric leaves (probed: DECIMAL's 2 dominates NUMERIC's 1, and both
+/// dominate a bare literal's 0 - `N + D` and `D + N` are both 2, `N +
+/// 1.5` is 1, `1.5` alone is 0). A numeric COLUMN carries its stored
+/// sub_type; a CAST its target's; a literal none; and it rides through
+/// arithmetic, negation and the conditionals.
+fn numeric_subtype(e: &Expr, descs: &[Descriptor]) -> i16 {
+    match e {
+        Expr::Cast(_, CastTarget::Numeric { sub_type, .. }) => *sub_type,
+        Expr::Col(fid) => descs
+            .get(*fid)
+            .filter(|d| is_numeric_col(d))
+            .map_or(0, |d| d.sub_type),
+        Expr::Neg(a) => numeric_subtype(a, descs),
+        Expr::Bin(a, _, b) => numeric_subtype(a, descs).max(numeric_subtype(b, descs)),
+        Expr::Coalesce(v) => v.iter().map(|x| numeric_subtype(x, descs)).max().unwrap_or(0),
+        Expr::NullIf(a, b) => numeric_subtype(a, descs).max(numeric_subtype(b, descs)),
+        Expr::Iif(_, a, b) => numeric_subtype(a, descs).max(numeric_subtype(b, descs)),
+        _ => 0,
+    }
+}
+
 fn int_func_form(e: &Expr, descs: &[Descriptor]) -> Option<(Wire, i32, i32)> {
     // an XDR SHORT travels in a 32-bit slot, as `Wire::Int32` already
     // carries for SMALLINT columns
@@ -8402,10 +8424,11 @@ fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<Proj
             // the 32765 catch-all stays NONE: its cap never fires
             None => 0,
         }
-    } else if let Some((_, _, _, _, st)) = cast_num_form(&e) {
-        // a bare/negated CAST to NUMERIC/DECIMAL carries the target's
-        // sub_type (1 or 2); every other numeric expression stays 0
-        st
+    } else if matches!(e.type_of(descs), Some(ExprType::Numeric)) {
+        // a numeric result carries the MAX sub_type of its numeric leaves
+        // (1 NUMERIC, 2 DECIMAL) - not just a bare cast's, but propagated
+        // through arithmetic and the conditionals ([numeric_subtype])
+        numeric_subtype(&e, descs) as i32
     } else {
         0
     };

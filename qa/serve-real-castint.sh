@@ -135,6 +135,12 @@ dboth "CAST(1 AS NUMERIC(38,5))"
 dboth "CAST(1 AS DECIMAL(4,0))"
 dboth "CAST(1 AS DECIMAL(9,2))"
 dboth "-CAST(1 AS NUMERIC(9,2))"
+# the subtype PROPAGATES through arithmetic - it is the MAX of the
+# operand subtypes (DECIMAL's 2 dominates NUMERIC's 1, both dominate a
+# literal's 0), and the width widens to INT64 around the arithmetic
+dboth "CAST(1 AS NUMERIC(9,2)) + 1"
+dboth "CAST(1 AS DECIMAL(9,2)) + 1"
+dboth "CAST(1 AS NUMERIC(9,2)) + CAST(1 AS DECIMAL(9,2))"
 
 echo "ran $ran checks"
 exit $fail
