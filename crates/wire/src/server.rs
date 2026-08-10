@@ -8011,6 +8011,31 @@ fn cast_int_form(e: &Expr) -> Option<(Wire, i32, i32)> {
     }
 }
 
+/// A CAST TO A NUMERIC/DECIMAL type announces the target's storage type
+/// (SHORT/LONG/INT64/INT128 by precision), its SCALE, and its SUB_TYPE
+/// (1 NUMERIC, 2 DECIMAL) - probed: CAST(1 AS NUMERIC(9,2)) is 496 LONG
+/// scale -2 subtype 1 len 4, DECIMAL(9,2) the same but subtype 2,
+/// NUMERIC(4,2) is 500 SHORT. As with the integer cast, a bare or
+/// NEGATED cast is recognised; arithmetic around it widens to INT64
+/// (which keeps the subtype, but that propagation is num_form's, not
+/// this one's). Returns (wire, sql_type, length, scale, sub_type).
+fn cast_num_form(e: &Expr) -> Option<(Wire, i32, i32, i32, i32)> {
+    match e {
+        Expr::Cast(_, CastTarget::Numeric { scale, bytes, sub_type }) => {
+            let (w, t, l) = match bytes {
+                2 => (Wire::Int32, 500, 2),
+                4 => (Wire::Int32, 496, 4),
+                8 => (Wire::Int64, 580, 8),
+                16 => (Wire::Int128, 32752, 16),
+                _ => return None,
+            };
+            Some((w, t, l, *scale as i32, *sub_type as i32))
+        }
+        Expr::Neg(inner) => cast_num_form(inner),
+        _ => None,
+    }
+}
+
 fn int_func_form(e: &Expr, descs: &[Descriptor]) -> Option<(Wire, i32, i32)> {
     // an XDR SHORT travels in a 32-bit slot, as `Wire::Int32` already
     // carries for SMALLINT columns
@@ -8342,7 +8367,10 @@ fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<Proj
             // declaration, which is what every text expression got before
             None => (Wire::Varying, nullable(448), 32765, 0),
         },
-        ExprType::Numeric => num_form(e.result_scale(descs)? as i32),
+        ExprType::Numeric => match cast_num_form(&e) {
+            Some((w, t, l, sc, _)) => (w, nullable(t), l, sc),
+            None => num_form(e.result_scale(descs)? as i32),
+        },
         // an approximate result is a DOUBLE on the wire whatever its
         // source width - the engine widens FLOAT the same way
         ExprType::Approx => (Wire::Double, nullable(480), 8, 0),
@@ -8374,6 +8402,10 @@ fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<Proj
             // the 32765 catch-all stays NONE: its cap never fires
             None => 0,
         }
+    } else if let Some((_, _, _, _, st)) = cast_num_form(&e) {
+        // a bare/negated CAST to NUMERIC/DECIMAL carries the target's
+        // sub_type (1 or 2); every other numeric expression stays 0
+        st
     } else {
         0
     };
@@ -29655,8 +29687,11 @@ enum CastTarget {
     /// value is rounded to (half away from zero, probed: 12.55 to scale
     /// -1 is 12.6 and -12.55 is -12.6); `bytes` is the storage width the
     /// PRECISION names (16 = the INT128 path), which is also this
-    /// target's conversion buffer ([CastTarget::cvt_cap])
-    Numeric { scale: i8, bytes: u8 },
+    /// target's conversion buffer ([CastTarget::cvt_cap]). `sub_type`
+    /// separates the two spellings on the wire: NUMERIC is 1, DECIMAL 2
+    /// (probed: CAST(1 AS NUMERIC(9,2)) describes subtype 1, DECIMAL
+    /// subtype 2).
+    Numeric { scale: i8, bytes: u8, sub_type: i16 },
     /// `FLOAT` / `DOUBLE PRECISION` - both announce DOUBLE
     Approx,
     /// `DATE` / `TIME` / `TIMESTAMP`
@@ -31082,6 +31117,8 @@ fn parse_cast_target(b: &[char], pos: &mut usize) -> Option<CastTarget> {
         }
         return Some(CastTarget::Numeric {
             scale: -(scale as i8),
+            // NUMERIC and DECIMAL differ only here on the wire
+            sub_type: if ku == "NUMERIC" { 1 } else { 2 },
             // the storage width the PRECISION names. `NUMERIC(p <= 4)`
             // is the one SHORT-backed exact type in the language, and
             // `DECIMAL` never takes that width whatever its precision -
@@ -31226,7 +31263,9 @@ fn cast_target_descriptor(t: &CastTarget) -> Option<Descriptor> {
     };
     Some(match t {
         CastTarget::Int { bytes } => d(int_dtype(*bytes)?, 0, *bytes as u16, 0),
-        CastTarget::Numeric { scale, bytes } => d(int_dtype(*bytes)?, *scale, *bytes as u16, 1),
+        CastTarget::Numeric { scale, bytes, sub_type } => {
+            d(int_dtype(*bytes)?, *scale, *bytes as u16, *sub_type)
+        }
         CastTarget::Approx => d(dtype::DOUBLE, 0, 8, 0),
         CastTarget::Text { .. } | CastTarget::Temporal(_) => return None,
     })
@@ -33959,7 +33998,7 @@ impl Expr {
                     // source is decomposed to (raw, scale) and rescaled
                     // with the engine's rounding - HALF AWAY FROM ZERO
                     // (probed: 12.55 to scale 1 is 12.6, -12.55 is -12.6)
-                    CastTarget::Numeric { scale, bytes } => {
+                    CastTarget::Numeric { scale, bytes, .. } => {
                         let (raw, from) = match &v {
                             Value::Text(t) => decimal_parts(t)
                                 .ok_or_else(|| EvalErr::ConversionError(Some(t.clone())))?,
@@ -51784,34 +51823,34 @@ mod tests {
         // past 18 stores as INT128 and has to announce that width
         assert!(matches!(
             target("NUMERIC(9,2)"),
-            Some(CastTarget::Numeric { scale: -2, bytes: 4 })
+            Some(CastTarget::Numeric { scale: -2, bytes: 4, sub_type: 1 })
         ));
         assert!(matches!(
             target("DECIMAL(20,3)"),
-            Some(CastTarget::Numeric { scale: -3, bytes: 16 })
+            Some(CastTarget::Numeric { scale: -3, bytes: 16, sub_type: 2 })
         ));
         // bare NUMERIC is (9, 0), and `(p)` alone is scale 0
         assert!(matches!(
             target("NUMERIC"),
-            Some(CastTarget::Numeric { scale: 0, bytes: 4 })
+            Some(CastTarget::Numeric { scale: 0, bytes: 4, sub_type: 1 })
         ));
         assert!(matches!(
             target("NUMERIC(5)"),
-            Some(CastTarget::Numeric { scale: 0, bytes: 4 })
+            Some(CastTarget::Numeric { scale: 0, bytes: 4, sub_type: 1 })
         ));
         // the SHORT-backed corner and its DECIMAL twin: one keyword
         // apart, two storage widths, two conversion caps
         assert!(matches!(
             target("NUMERIC(4,0)"),
-            Some(CastTarget::Numeric { scale: 0, bytes: 2 })
+            Some(CastTarget::Numeric { scale: 0, bytes: 2, sub_type: 1 })
         ));
         assert!(matches!(
             target("DECIMAL(4,0)"),
-            Some(CastTarget::Numeric { scale: 0, bytes: 4 })
+            Some(CastTarget::Numeric { scale: 0, bytes: 4, sub_type: 2 })
         ));
         assert!(matches!(
             target("NUMERIC(18,0)"),
-            Some(CastTarget::Numeric { scale: 0, bytes: 8 })
+            Some(CastTarget::Numeric { scale: 0, bytes: 8, sub_type: 1 })
         ));
 
         // the conversion buffer each of those targets converts THROUGH,

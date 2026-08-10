@@ -122,6 +122,19 @@ dboth "CAST(1 AS BIGINT)"
 dboth "-CAST(1 AS SMALLINT)"
 # arithmetic AROUND a cast widens to INT64 - the cast type does not escape
 dboth "CAST(1 AS SMALLINT) + 1"
+# a CAST to NUMERIC/DECIMAL names the target's storage type, scale, and
+# SUB_TYPE (1 NUMERIC, 2 DECIMAL) - the same width rule as the integer
+# cast plus the subtype the two spellings differ by. (Arithmetic AROUND
+# a numeric cast widens to INT64 and the engine keeps the subtype there;
+# fire-crab loses it - a broad subtype-propagation gap left for its own
+# slice, so only the bare and negated casts are pinned here.)
+dboth "CAST(1 AS NUMERIC(4,0))"
+dboth "CAST(1 AS NUMERIC(9,2))"
+dboth "CAST(1 AS NUMERIC(18,4))"
+dboth "CAST(1 AS NUMERIC(38,5))"
+dboth "CAST(1 AS DECIMAL(4,0))"
+dboth "CAST(1 AS DECIMAL(9,2))"
+dboth "-CAST(1 AS NUMERIC(9,2))"
 
 echo "ran $ran checks"
 exit $fail
