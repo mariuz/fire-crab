@@ -6574,9 +6574,14 @@ fn wire_for(d: &Descriptor) -> (Wire, i32, i32, i32, i32) {
         // the engine's own makeNullString describe (32766, length 0,
         // probed); the bind is type-blind, so the wire form is inert
         dtype::UNKNOWN => (Wire::Varying, 32766, 0, 0, 0), // SQL_NULL
-        dtype::SHORT => (Wire::Int32, 500, 2, scale, 0), // SQL_SHORT
-        dtype::LONG => (Wire::Int32, 496, 4, scale, 0),  // SQL_LONG
-        dtype::INT64 => (Wire::Int64, 580, 8, scale, 0), // SQL_INT64
+        // the exact-numeric family carries its RDB$FIELD_SUB_TYPE - 0
+        // plain integer, 1 NUMERIC, 2 DECIMAL - which the engine
+        // announces and clients read; a scaled column always has it, so
+        // dropping it (as a hardcoded 0 did) told every client a
+        // NUMERIC(9,2) was a plain scaled LONG
+        dtype::SHORT => (Wire::Int32, 500, 2, scale, d.sub_type as i32), // SQL_SHORT
+        dtype::LONG => (Wire::Int32, 496, 4, scale, d.sub_type as i32),  // SQL_LONG
+        dtype::INT64 => (Wire::Int64, 580, 8, scale, d.sub_type as i32), // SQL_INT64
         dtype::REAL => (Wire::Float, 482, 4, 0, 0),      // SQL_FLOAT
         dtype::DOUBLE => (Wire::Double, 480, 8, 0, 0),   // SQL_DOUBLE
         dtype::SQL_DATE => (Wire::Date, 570, 4, 0, 0),   // SQL_TYPE_DATE
@@ -6586,7 +6591,7 @@ fn wire_for(d: &Descriptor) -> (Wire, i32, i32, i32, i32) {
         // blob: the 8-byte id travels, content via the blob ops; the
         // describe carries the sub_type so clients know text vs binary
         dtype::BLOB => (Wire::Blob, 520, 8, 0, d.sub_type as i32), // SQL_BLOB
-        dtype::INT128 => (Wire::Int128, 32752, 16, scale, 0), // SQL_INT128
+        dtype::INT128 => (Wire::Int128, 32752, 16, scale, d.sub_type as i32), // SQL_INT128
         dtype::SQL_TIME_TZ => (Wire::TimeTz, 32756, 8, 0, 0), // SQL_TIME_TZ
         dtype::TIMESTAMP_TZ => (Wire::TimestampTz, 32754, 12, 0, 0), // SQL_TIMESTAMP_TZ
         dtype::DEC64 => (Wire::Dec16, 32760, 8, 0, 0),   // SQL_DEC16
