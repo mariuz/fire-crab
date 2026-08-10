@@ -141,6 +141,9 @@ dboth "-CAST(1 AS NUMERIC(9,2))"
 dboth "CAST(1 AS NUMERIC(9,2)) + 1"
 dboth "CAST(1 AS DECIMAL(9,2)) + 1"
 dboth "CAST(1 AS NUMERIC(9,2)) + CAST(1 AS DECIMAL(9,2))"
+# COALESCE KEEPS the operand width (a LONG here) rather than widening,
+# and takes the wider subtype - DECIMAL's 2
+dboth "COALESCE(CAST(1 AS DECIMAL(9,2)), CAST(1 AS NUMERIC(9,2)))"
 
 echo "ran $ran checks"
 exit $fail

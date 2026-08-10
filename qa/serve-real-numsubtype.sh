@@ -61,5 +61,19 @@ both "D92"; both "D40"
 # plain integers keep subtype 0
 both "S"; both "I"; both "B"
 
+# NEGATION and the SELECTION nodes KEEP the widest operand's width (they
+# do not widen to INT64 the way arithmetic does), and carry the subtype
+# through - a scale-0 NUMERIC(4,0) is still subtype 1 though this server
+# types it as a plain integer.
+both "-N92"; both "-N40"; both "-I"; both "-S"
+both "COALESCE(N92, N40)"      # LONG subtype 1 - the wider wins
+both "COALESCE(N40, N184)"     # INT64 subtype 1
+both "COALESCE(S, I)"          # LONG subtype 0 - plain integers
+both "NULLIF(N92, N92)"        # LONG subtype 1
+both "IIF(N40 > 0, N40, N40)"  # SHORT subtype 1 - scale-0 NUMERIC kept
+# arithmetic still WIDENS to INT64, carrying the subtype
+both "N40 + N40"               # INT64 subtype 1
+both "I + 1"                   # INT64 subtype 0
+
 echo "ran $ran checks"
 exit $fail

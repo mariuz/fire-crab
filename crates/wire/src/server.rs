@@ -7995,49 +7995,54 @@ fn constraint_key_text(parts: &[(String, &Value)]) -> Option<String> {
 /// (the INT64/INT128 form every other integer expression takes - which
 /// is also what the engine announces for ordinary arithmetic, probed:
 /// `ID + 1`, `S + S` and `ID * 2` are all INT64).
-/// A CAST TO AN INTEGER TYPE announces the TARGET's storage type, not the
-/// INT64 an arithmetic expression takes (probed: `CAST(1 AS SMALLINT)` is
-/// 500 SHORT len 2, INTEGER 496 LONG len 4, BIGINT 580 INT64 len 8).
-/// Unary negation keeps it (`-CAST(1 AS SMALLINT)` is SHORT); arithmetic
-/// AROUND it widens to INT64 (`CAST(1 AS SMALLINT) + 1` is INT64), which
-/// is why only a bare cast or a negated one is recognised here - a `Bin`
-/// falls through to the INT64 form as before.
-fn cast_int_form(e: &Expr) -> Option<(Wire, i32, i32)> {
-    match e {
-        Expr::Cast(_, CastTarget::Int { bytes }) => match bytes {
-            2 => Some((Wire::Int32, 500, 2)),
-            4 => Some((Wire::Int32, 496, 4)),
-            8 => Some((Wire::Int64, 580, 8)),
-            16 => Some((Wire::Int128, 32752, 16)),
-            _ => None,
-        },
-        Expr::Neg(inner) => cast_int_form(inner),
+/// The storage width in BYTES of an exact-numeric dtype (SHORT 2, LONG
+/// 4, INT64 8, INT128 16) - the precision bucket the engine files a
+/// NUMERIC/DECIMAL under, and an INTEGER's own width.
+fn exact_dtype_bytes(dt: u8) -> Option<u8> {
+    match dt {
+        dtype::SHORT => Some(2),
+        dtype::LONG => Some(4),
+        dtype::INT64 => Some(8),
+        dtype::INT128 => Some(16),
         _ => None,
     }
 }
 
-/// A CAST TO A NUMERIC/DECIMAL type announces the target's storage type
-/// (SHORT/LONG/INT64/INT128 by precision), its SCALE, and its SUB_TYPE
-/// (1 NUMERIC, 2 DECIMAL) - probed: CAST(1 AS NUMERIC(9,2)) is 496 LONG
-/// scale -2 subtype 1 len 4, DECIMAL(9,2) the same but subtype 2,
-/// NUMERIC(4,2) is 500 SHORT. As with the integer cast, a bare or
-/// NEGATED cast is recognised; arithmetic around it widens to INT64
-/// (which keeps the subtype, but that propagation is num_form's, not
-/// this one's). Returns (wire, sql_type, length, scale, sub_type).
-fn cast_num_form(e: &Expr) -> Option<(Wire, i32, i32, i32, i32)> {
+/// The STORAGE WIDTH an exact-numeric (integer or NUMERIC/DECIMAL)
+/// expression announces, in bytes. A CAST names its target's width and a
+/// COLUMN its own; NEGATION and the SELECTION nodes (COALESCE, NULLIF,
+/// IIF) KEEP the widest operand's width - so `-N` and `COALESCE(N, N)`
+/// stay a LONG where the engine does (probed) - while ARITHMETIC widens
+/// to INT64 (or INT128 when an operand already needs it), which is the
+/// `_` arm through [Expr::is_wide], matching what num_form did.
+fn result_width_bytes(e: &Expr, descs: &[Descriptor]) -> u8 {
     match e {
-        Expr::Cast(_, CastTarget::Numeric { scale, bytes, sub_type }) => {
-            let (w, t, l) = match bytes {
-                2 => (Wire::Int32, 500, 2),
-                4 => (Wire::Int32, 496, 4),
-                8 => (Wire::Int64, 580, 8),
-                16 => (Wire::Int128, 32752, 16),
-                _ => return None,
-            };
-            Some((w, t, l, *scale as i32, *sub_type as i32))
+        Expr::Cast(_, CastTarget::Int { bytes })
+        | Expr::Cast(_, CastTarget::Numeric { bytes, .. }) => *bytes,
+        Expr::Col(fid) => descs.get(*fid).and_then(|d| exact_dtype_bytes(d.dtype)).unwrap_or(8),
+        Expr::Neg(a) => result_width_bytes(a, descs),
+        Expr::Coalesce(v) => v.iter().map(|x| result_width_bytes(x, descs)).max().unwrap_or(8),
+        Expr::NullIf(a, b) | Expr::Iif(_, a, b) => {
+            result_width_bytes(a, descs).max(result_width_bytes(b, descs))
         }
-        Expr::Neg(inner) => cast_num_form(inner),
-        _ => None,
+        _ => {
+            if e.is_wide(descs) {
+                16
+            } else {
+                8
+            }
+        }
+    }
+}
+
+/// The (wire, sql_type, length) an exact-numeric width in bytes travels
+/// as - a SHORT rides a 32-bit slot, as `Wire::Int32` does for SMALLINT.
+fn exact_width_form(bytes: u8) -> (Wire, i32, i32) {
+    match bytes {
+        2 => (Wire::Int32, 500, 2),
+        4 => (Wire::Int32, 496, 4),
+        16 => (Wire::Int128, 32752, 16),
+        _ => (Wire::Int64, 580, 8),
     }
 }
 
@@ -8050,9 +8055,12 @@ fn cast_num_form(e: &Expr) -> Option<(Wire, i32, i32, i32, i32)> {
 fn numeric_subtype(e: &Expr, descs: &[Descriptor]) -> i16 {
     match e {
         Expr::Cast(_, CastTarget::Numeric { sub_type, .. }) => *sub_type,
+        // any exact-numeric-family column carries its RDB$FIELD_SUB_TYPE,
+        // scale 0 included: NUMERIC(4,0) is subtype 1 though it is a
+        // SHORT this server otherwise types as a plain integer
         Expr::Col(fid) => descs
             .get(*fid)
-            .filter(|d| is_numeric_col(d))
+            .filter(|d| exact_dtype_bytes(d.dtype).is_some())
             .map_or(0, |d| d.sub_type),
         Expr::Neg(a) => numeric_subtype(a, descs),
         Expr::Bin(a, _, b) => numeric_subtype(a, descs).max(numeric_subtype(b, descs)),
@@ -8360,20 +8368,13 @@ fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<Proj
     // (SQL_INT64, the raw integer on the wire, the client divides), or
     // INT128-backed (SQL_INT128, 16 bytes) when the engine's dtype rules
     // promote it ([Expr::rank_of]): any INT128 operand, or a `*`/`/`
-    // around an INT64-ranked one. The scale is computed statically from
-    // the operand scales, and `eval` produces exactly that scale so the
-    // decode matches.
+    // around an INT64-ranked one. The width is [result_width_bytes] and
+    // the scale is computed statically from the operand scales, so `eval`
+    // produces exactly that scale and the decode matches.
     // every announcement here is NULLABLE (the odd form): an expression
     // over a nullable column is itself nullable, and libfbclient renders
     // the raw buffer instead of <null> for a NOT NULL announcement - see
     // [nullable]
-    let num_form = |scale: i32| {
-        if e.is_wide(descs) {
-            (Wire::Int128, nullable(32752), 16, scale)
-        } else {
-            (Wire::Int64, nullable(580), 8, scale)
-        }
-    };
     // A text result carries a real WIDTH, and a CHAR-formed one PADS
     // shorter values to it - so this decides a VALUE, not just a
     // describe. The padding is applied by wrapping the expression in the
@@ -8382,9 +8383,15 @@ fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<Proj
         // a FUNCTION's integer result has its own declared width; every
         // other integer expression takes the INT64/INT128 form, which is
         // what the engine announces for arithmetic too (probed)
-        ExprType::Int => match cast_int_form(&e).or_else(|| int_func_form(&e, descs)) {
+        ExprType::Int => match int_func_form(&e, descs) {
+            // a FUNCTION's integer result has its own declared width
             Some((w, t, l)) => (w, nullable(t), l, 0),
-            None => num_form(0),
+            // otherwise the width KEEPS through negation/selection and
+            // widens through arithmetic ([result_width_bytes])
+            None => {
+                let (w, t, l) = exact_width_form(result_width_bytes(&e, descs));
+                (w, nullable(t), l, 0)
+            }
         },
         ExprType::Text => match text_form(&e, descs) {
             // the VALUE is padded where the conditional is resolved (see
@@ -8394,10 +8401,12 @@ fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<Proj
             // declaration, which is what every text expression got before
             None => (Wire::Varying, nullable(448), 32765, 0),
         },
-        ExprType::Numeric => match cast_num_form(&e) {
-            Some((w, t, l, sc, _)) => (w, nullable(t), l, sc),
-            None => num_form(e.result_scale(descs)? as i32),
-        },
+        ExprType::Numeric => {
+            // the width KEEPS through negation/selection and widens
+            // through arithmetic, at the expression's result scale
+            let (w, t, l) = exact_width_form(result_width_bytes(&e, descs));
+            (w, nullable(t), l, e.result_scale(descs)? as i32)
+        }
         // an approximate result is a DOUBLE on the wire whatever its
         // source width - the engine widens FLOAT the same way
         ExprType::Approx => (Wire::Double, nullable(480), 8, 0),
@@ -8429,13 +8438,13 @@ fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<Proj
             // the 32765 catch-all stays NONE: its cap never fires
             None => 0,
         }
-    } else if matches!(e.type_of(descs), Some(ExprType::Numeric)) {
-        // a numeric result carries the MAX sub_type of its numeric leaves
-        // (1 NUMERIC, 2 DECIMAL) - not just a bare cast's, but propagated
-        // through arithmetic and the conditionals ([numeric_subtype])
-        numeric_subtype(&e, descs) as i32
     } else {
-        0
+        // the MAX sub_type of the exact-numeric leaves (1 NUMERIC, 2
+        // DECIMAL), propagated through arithmetic, negation and the
+        // conditionals - and a scale-0 NUMERIC(4,0) counts, though it is
+        // typed as a plain integer here, so this is not gated on the
+        // ExprType being Numeric ([numeric_subtype], 0 for plain ints)
+        numeric_subtype(&e, descs) as i32
     };
     // THE ANNOUNCED WIDTH AND THE SHIPPED BYTES MUST AGREE. The width
     // above counts a literal in CHARACTERS, which is what a multi-byte
