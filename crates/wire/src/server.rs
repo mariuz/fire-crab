@@ -8274,6 +8274,15 @@ fn build_expr_col(
     descs: &[Descriptor],
 ) -> Option<ProjCol> {
     let e = resolve_expr(raw, columns, descs)?;
+    build_expr_col_from(e, name, descs)
+}
+
+/// [build_expr_col] over an already-resolved expression - the describe
+/// and shipping decisions are a function of the resolved [Expr] and the
+/// source descriptors alone, so the projection-parameter path can resolve
+/// through [resolve_proj_expr] (collecting the `?` slots) and hand the
+/// result here without a second resolution.
+fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<ProjCol> {
     // an exact-numeric result travels as a scaled integer - INT64-backed
     // (SQL_INT64, the raw integer on the wire, the client divides), or
     // INT128-backed (SQL_INT128, 16 bytes) when the engine's dtype rules
@@ -23978,6 +23987,20 @@ fn plan_query_inner_ctx(
                 }
             }
         }
+        // PROJECTION PARAMETERS: number the `?`s in the select list in
+        // source order. This first slice supports them only when the
+        // WHERE clause has NONE - the textual-order merge across the two
+        // (projection params come FIRST in the input SQLDA) is a later
+        // slice, so refuse the combination rather than mis-order it.
+        let mut proj_params = 0usize;
+        for it in items.iter_mut() {
+            if let SelItem::Expr(raw, ..) = it {
+                renumber_raw_params(raw, &mut proj_params);
+            }
+        }
+        if proj_params > 0 && !params.is_empty() {
+            return None;
+        }
         let items = items;
         let cols = if has_expr || has_gen {
             let mut out = Vec::new();
@@ -23997,7 +24020,16 @@ fn plan_query_inner_ctx(
                         out.push(one);
                     }
                     SelItem::Expr(e, alias, fname) => {
-                        let mut pc = build_expr_col(e, alias, &columns, &descs)?;
+                        // a `?` in the item resolves through the
+                        // param-aware path, which registers the slot's
+                        // describe into `params`; everything else takes
+                        // the ordinary resolve
+                        let mut pc = if raw_has_param(e) {
+                            let re = resolve_proj_expr(e, &columns, &descs, params)?;
+                            build_expr_col_from(re, alias, &descs)?
+                        } else {
+                            build_expr_col(e, alias, &columns, &descs)?
+                        };
                         pc.fname = Some(fname.clone());
                         out.push(pc);
                     }
@@ -27672,6 +27704,87 @@ fn emit_rows(
     timed("fetch", || emit_rows_uncounted(w, plan, db, args, gen_writes, out))
 }
 
+/// A bound argument rendered as a literal expression, so a projection
+/// `?` becomes a value the ordinary [Expr::eval] (and the CAST above it)
+/// can compute. Temporal parameters do not arrive - a `?` cast to a
+/// temporal target refuses at plan time this slice.
+fn param_to_expr(p: &WireParam) -> Option<Expr> {
+    Some(match p {
+        WireParam::Null => Expr::Null,
+        WireParam::Int(v, 0) => Expr::Int(*v),
+        WireParam::Int(v, s) => Expr::Dec(*v, *s),
+        WireParam::Text(s) => Expr::Str(s.clone()),
+        WireParam::Double(x) => Expr::Double(*x),
+        WireParam::Bool(b) => Expr::Bool(*b),
+        _ => return None,
+    })
+}
+
+/// Does a resolved projection expression carry a `?` parameter?
+fn expr_has_param(e: &Expr) -> bool {
+    match e {
+        Expr::Param(_) => true,
+        Expr::Neg(a) | Expr::Cast(a, _) => expr_has_param(a),
+        Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
+            expr_has_param(a) || expr_has_param(b)
+        }
+        Expr::Coalesce(v) => v.iter().any(expr_has_param),
+        _ => false,
+    }
+}
+
+/// Substitute the bound arguments into a projection expression's `?`
+/// placeholders, once, before the row loop - the CAST that types each
+/// one then converts it (reusing the string->integer rounding and the
+/// width check). Only the shapes [resolve_proj_expr] can build a param
+/// under appear here.
+fn subst_params_expr(e: &Expr, args: &[WireParam]) -> Option<Expr> {
+    Some(match e {
+        Expr::Param(i) => param_to_expr(args.get(*i)?)?,
+        Expr::Neg(a) => Expr::Neg(Box::new(subst_params_expr(a, args)?)),
+        Expr::Cast(a, t) => Expr::Cast(Box::new(subst_params_expr(a, args)?), *t),
+        Expr::Bin(a, op, b) => Expr::Bin(
+            Box::new(subst_params_expr(a, args)?),
+            *op,
+            Box::new(subst_params_expr(b, args)?),
+        ),
+        Expr::Concat(a, b) => Expr::Concat(
+            Box::new(subst_params_expr(a, args)?),
+            Box::new(subst_params_expr(b, args)?),
+        ),
+        Expr::Coalesce(v) => {
+            Expr::Coalesce(v.iter().map(|x| subst_params_expr(x, args)).collect::<Option<Vec<_>>>()?)
+        }
+        Expr::NullIf(a, b) => Expr::NullIf(
+            Box::new(subst_params_expr(a, args)?),
+            Box::new(subst_params_expr(b, args)?),
+        ),
+        other => other.clone(),
+    })
+}
+
+/// Does this plan's PROJECTION carry `?` parameters that must be bound?
+fn plan_has_proj_param(plan: &Plan) -> bool {
+    matches!(plan, Plan::Project { cols, .. }
+        if cols.iter().any(|c| c.expr.as_ref().is_some_and(expr_has_param)))
+}
+
+/// A copy of the plan with its projection `?` parameters bound to the
+/// arguments - the execute-time counterpart of [bind_filter], applied
+/// before any fetch path evaluates the projection.
+fn bind_plan_params(plan: &Plan, args: &[WireParam]) -> Option<Plan> {
+    let mut p = plan.clone();
+    if let Plan::Project { cols, .. } = &mut p {
+        for c in cols.iter_mut() {
+            if c.expr.as_ref().is_some_and(expr_has_param) {
+                let e = c.expr.as_ref()?;
+                c.expr = Some(subst_params_expr(e, args)?);
+            }
+        }
+    }
+    Some(p)
+}
+
 fn emit_rows_uncounted(
     w: &mut W,
     plan: &Plan,
@@ -29253,6 +29366,12 @@ struct GenCol {
 #[derive(Clone, PartialEq)]
 enum RawExpr {
     Col(String),
+    /// a `?` parameter placeholder in a PROJECTION expression. Parsed by
+    /// `expr_atom` with the index left UNASSIGNED (usize::MAX) and
+    /// numbered in source order only along the projection path
+    /// ([renumber_raw_params]); every other resolver rejects it, so a
+    /// `?` outside the projection refuses exactly as it did before.
+    Param(usize),
     Int(i64),
     /// a decimal literal `d.dd`: (raw integer, scale) - `1.5` is
     /// `(15, -1)`, `1.50` is `(150, -2)` (trailing zeros count, as the
@@ -29845,6 +29964,65 @@ fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
     Some(RawCond::Cmp(Box::new(left), op, Box::new(right)))
 }
 
+/// Assign source-order indices to the `?` placeholders `expr_atom` left
+/// as `RawExpr::Param(usize::MAX)`. Walks children left to right, which
+/// is source order for every node, so a projection's parameters number
+/// exactly as the engine's do. `next` continues across select-list items
+/// (and the WHERE clause picks up after it), so the whole statement's
+/// input SQLDA is in textual order.
+fn renumber_raw_params(e: &mut RawExpr, next: &mut usize) {
+    match e {
+        RawExpr::Param(i) => {
+            *i = *next;
+            *next += 1;
+        }
+        RawExpr::Neg(a) => renumber_raw_params(a, next),
+        RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => {
+            renumber_raw_params(a, next);
+            renumber_raw_params(b, next);
+        }
+        RawExpr::Cast(a, _) => renumber_raw_params(a, next),
+        RawExpr::Coalesce(v) | RawExpr::Func(_, v) => {
+            for x in v {
+                renumber_raw_params(x, next);
+            }
+        }
+        RawExpr::Iif(c, a, b) => {
+            renumber_cond_params(c, next);
+            renumber_raw_params(a, next);
+            renumber_raw_params(b, next);
+        }
+        RawExpr::Case(branches, else_) => {
+            for (c, t) in branches {
+                renumber_cond_params(c, next);
+                renumber_raw_params(t, next);
+            }
+            if let Some(e) = else_ {
+                renumber_raw_params(e, next);
+            }
+        }
+        RawExpr::Cond(c) => renumber_cond_params(c, next),
+        _ => {}
+    }
+}
+
+fn renumber_cond_params(c: &mut RawCond, next: &mut usize) {
+    match c {
+        RawCond::Cmp(a, _, b) => {
+            renumber_raw_params(a, next);
+            renumber_raw_params(b, next);
+        }
+        RawCond::IsNull(a) | RawCond::IsNotNull(a) => renumber_raw_params(a, next),
+        RawCond::Like(a, _, _, _) => renumber_raw_params(a, next),
+        RawCond::Not(inner) => renumber_cond_params(inner, next),
+        RawCond::And(v) | RawCond::Or(v) => {
+            for x in v {
+                renumber_cond_params(x, next);
+            }
+        }
+    }
+}
+
 fn parse_raw_expr_any(s: &str) -> Option<RawExpr> {
     let b: Vec<char> = s.chars().collect();
     let mut pos = 0usize;
@@ -30009,6 +30187,14 @@ fn expr_concat(b: &[char], pos: &mut usize) -> Option<RawExpr> {
 fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
     skip_ws(b, pos);
     match b.get(*pos)? {
+        // a `?` parameter placeholder - the index is assigned in source
+        // order later, and only along the projection path; every other
+        // resolver rejects RawExpr::Param, so this changes no other
+        // context's refusal of `?`
+        '?' => {
+            *pos += 1;
+            Some(RawExpr::Param(usize::MAX))
+        }
         '(' => {
             *pos += 1;
             let e = expr_add(b, pos)?;
@@ -30394,6 +30580,7 @@ fn raw_bad_substring_len(e: &RawExpr) -> Option<i64> {
     };
     let walk_all = |args: &[RawExpr]| args.iter().find_map(raw_bad_substring_len);
     match e {
+        RawExpr::Param(_) => None,
         // a generator's step is an integer literal; nothing to check
         RawExpr::Gen { .. } => None,
         // an aggregate's ARGUMENT is an expression too, so a bad literal
@@ -30966,6 +31153,105 @@ fn resolve_expr(
     Some(pad_conditional(resolve_expr_inner(raw, columns, descs)?, descs))
 }
 
+/// Does this expression carry a `?` parameter anywhere?
+fn raw_has_param(e: &RawExpr) -> bool {
+    match e {
+        RawExpr::Param(_) => true,
+        RawExpr::Neg(a) | RawExpr::Cast(a, _) => raw_has_param(a),
+        RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => {
+            raw_has_param(a) || raw_has_param(b)
+        }
+        RawExpr::Coalesce(v) | RawExpr::Func(_, v) => v.iter().any(raw_has_param),
+        RawExpr::Iif(_, a, b) => raw_has_param(a) || raw_has_param(b),
+        _ => false,
+    }
+}
+
+/// The input-SQLDA descriptor a CAST target names for a `?` bound to it -
+/// the engine types the parameter slot AS THE CAST TARGET (probed: the
+/// `?` of `CAST(? AS SMALLINT)` describes 500 SHORT, INTEGER 496 LONG,
+/// BIGINT 580 INT64, `NUMERIC(9,2)` a scaled LONG, DOUBLE 480). Text and
+/// temporal targets need a charset/date form this first slice does not
+/// carry, so a `?` cast to one of them still refuses.
+fn cast_target_descriptor(t: &CastTarget) -> Option<Descriptor> {
+    use fire_crab_ods::format::dtype;
+    let d = |dtype: u8, scale: i8, length: u16, sub_type: i16| Descriptor {
+        dtype,
+        scale,
+        length,
+        sub_type,
+        flags: 0,
+        offset: 0,
+    };
+    let int_dtype = |bytes: u8| match bytes {
+        2 => Some(dtype::SHORT),
+        4 => Some(dtype::LONG),
+        8 => Some(dtype::INT64),
+        16 => Some(dtype::INT128),
+        _ => None,
+    };
+    Some(match t {
+        CastTarget::Int { bytes } => d(int_dtype(*bytes)?, 0, *bytes as u16, 0),
+        CastTarget::Numeric { scale, bytes } => d(int_dtype(*bytes)?, *scale, *bytes as u16, 1),
+        CastTarget::Approx => d(dtype::DOUBLE, 0, 8, 0),
+        CastTarget::Text { .. } | CastTarget::Temporal(_) => return None,
+    })
+}
+
+/// Resolve a PROJECTION expression that may carry `?` parameters,
+/// registering each one's describe into `sink` at its index. A subtree
+/// with no parameter takes the ordinary [resolve_expr]; only the
+/// param-bearing shapes are handled here, and a `?` that no CAST gives a
+/// type refuses, as the engine's prepare-time "Data type unknown" does.
+fn resolve_proj_expr(
+    raw: &RawExpr,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    sink: &mut Vec<Option<Descriptor>>,
+) -> Option<Expr> {
+    if !raw_has_param(raw) {
+        return resolve_expr(raw, columns, descs);
+    }
+    fn set(sink: &mut Vec<Option<Descriptor>>, i: usize, d: Descriptor) {
+        if sink.len() <= i {
+            sink.resize(i + 1, None);
+        }
+        sink[i] = Some(d);
+    }
+    Some(match raw {
+        RawExpr::Cast(inner, t) => {
+            if let RawExpr::Param(i) = &**inner {
+                set(sink, *i, cast_target_descriptor(t)?);
+                Expr::Cast(Box::new(Expr::Param(*i)), *t)
+            } else {
+                Expr::Cast(Box::new(resolve_proj_expr(inner, columns, descs, sink)?), *t)
+            }
+        }
+        RawExpr::Neg(a) => Expr::Neg(Box::new(resolve_proj_expr(a, columns, descs, sink)?)),
+        RawExpr::Bin(a, op, b) => Expr::Bin(
+            Box::new(resolve_proj_expr(a, columns, descs, sink)?),
+            *op,
+            Box::new(resolve_proj_expr(b, columns, descs, sink)?),
+        ),
+        RawExpr::Concat(a, b) => Expr::Concat(
+            Box::new(resolve_proj_expr(a, columns, descs, sink)?),
+            Box::new(resolve_proj_expr(b, columns, descs, sink)?),
+        ),
+        RawExpr::Coalesce(v) => Expr::Coalesce(
+            v.iter()
+                .map(|a| resolve_proj_expr(a, columns, descs, sink))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        RawExpr::NullIf(a, b) => Expr::NullIf(
+            Box::new(resolve_proj_expr(a, columns, descs, sink)?),
+            Box::new(resolve_proj_expr(b, columns, descs, sink)?),
+        ),
+        // a bare `?` (untyped), or a parameter in a shape this first
+        // slice does not carry, refuses
+        _ => return None,
+    })
+}
+
 fn resolve_expr_inner(
     raw: &RawExpr,
     columns: &[RelationColumn],
@@ -30977,6 +31263,11 @@ fn resolve_expr_inner(
         // into a reference to the group row's slot BEFORE this runs, so
         // arriving here means there is no grouping to take it from.
         RawExpr::Agg(..) => return None,
+        // a `?` parameter is resolvable ONLY along the projection path
+        // ([resolve_proj_expr]); every other caller reaches here and
+        // refuses, which is how a `?` outside the projection keeps its
+        // old refusal (a CHECK, a DEFAULT, an ORDER BY, a computed column)
+        RawExpr::Param(_) => return None,
         // a generator leaf reads the synthetic slot the per-row advance
         // fills; one that never got a slot ([assign_gen_slots] runs
         // only on the Project select list) refuses the statement
@@ -31086,6 +31377,11 @@ fn resolve_expr_inner(
 enum Expr {
     /// a scale-0 integer column, by field id
     Col(usize),
+    /// a `?` parameter in a projection, by input-SQLDA index. It carries
+    /// no value of its own: [bind_proj_params] substitutes the bound
+    /// argument as a literal before the row loop, so [Expr::eval] never
+    /// meets one. Its describe type comes from the CAST that wraps it.
+    Param(usize),
     /// the SYNTHETIC SLOT a per-row generator advance fills ([GenCol]):
     /// reads exactly like [Expr::Col] - the advance happened before
     /// eval, so the value is already in the row - but types as a plain
@@ -32761,6 +33057,9 @@ impl Expr {
     /// then falls back rather than answering wrong).
     fn type_of(&self, descs: &[Descriptor]) -> Option<ExprType> {
         match self {
+            // a `?` is untyped on its own - it is always wrapped by the
+            // CAST that gives it a type, so type_of never reaches it
+            Expr::Param(_) => None,
             // decided at prepare from the INNER item: the pairs alone
             // cannot say, since an empty inner table has no value to
             // read a type from
@@ -32884,8 +33183,12 @@ impl Expr {
             }
             Expr::Cast(e, t) => {
                 // the operand must be typeable; the result type is the
-                // cast target
-                e.type_of(descs)?;
+                // cast target. A `?` parameter is the exception - it has
+                // no type of its own and is typed BY this cast, which is
+                // exactly why a projection `?` must wear one.
+                if !matches!(**e, Expr::Param(_)) {
+                    e.type_of(descs)?;
+                }
                 Some(match t {
                     CastTarget::Int { .. } => ExprType::Int,
                     CastTarget::Text { .. } => ExprType::Text,
@@ -33094,6 +33397,7 @@ impl Expr {
     /// engine's getDesc copies the non-null side. None = not numeric.
     fn rank_of(&self, descs: &[Descriptor]) -> Option<NumRank> {
         match self {
+            Expr::Param(_) => None,
             // a folded lookup answers within i64: its values came from
             // the inner table's own columns and folds
             Expr::Lookup { .. } => Some(NumRank::I64),
@@ -33211,6 +33515,10 @@ impl Expr {
     /// `Err(EvalErr)` is a per-row arithmetic exception (divide by zero).
     fn eval(&self, values: &[Value]) -> Result<Value, EvalErr> {
         Ok(match self {
+            // a parameter is substituted to a literal before the row
+            // loop ([bind_proj_params]); reaching eval means it was not,
+            // which is an internal error, not a wrong answer
+            Expr::Param(_) => return Err(EvalErr::Unsupported),
             Expr::Lookup { key, pairs, absent, .. } => {
                 let k = key.eval(values)?;
                 // a NULL key matches nothing - `NULL = NULL` is UNKNOWN,
@@ -36237,6 +36545,7 @@ fn split_alias(item: &str) -> (&str, Option<&str>) {
 /// value alias it).
 fn default_expr_name(raw: &RawExpr) -> String {
     match raw {
+        RawExpr::Param(_) => "",
         // a lone aggregate is described by its FUNCTION name - the same
         // law the select list's own aggregate items follow
         RawExpr::Agg(AggFn::Count, _) => "COUNT",
@@ -41296,6 +41605,9 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
             && a.rank_of(descs) != Some(NumRank::I128)
     };
     match e {
+        // a parameter's value is substituted before eval; the CAST above
+        // it may still raise, so it is not raise-free
+        Expr::Param(_) => false,
         // the fold already happened at prepare; a lookup only compares
         Expr::Lookup { key, .. } => expr_no_raise(key, descs),
         Expr::Col(_)
@@ -42938,6 +43250,15 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 }
                 if std::env::var("FC_SRV_TRACE").is_ok() && !bound_args.is_empty() {
                     eprintln!("[srv] execute params: {:?}", bound_args);
+                }
+                // PROJECTION PARAMETERS bound here, once, so every fetch
+                // path below evaluates a param-free projection (the CAST
+                // over each `?` converts the bound value). A no-op for a
+                // plan whose projection has none.
+                if bound_args.len() == stmt_params.len() && plan_has_proj_param(&plan) {
+                    if let Some(p) = bind_plan_params(&plan, &bound_args) {
+                        plan = std::rc::Rc::new(p);
+                    }
                 }
                 // kicked by a forced shutdown: the engine's vector, no work
                 if database.as_ref().is_some_and(|d| d.kicked()) {
