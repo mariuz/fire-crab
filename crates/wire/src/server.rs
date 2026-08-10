@@ -23595,10 +23595,14 @@ fn plan_query_inner_ctx(
     // the fallback answers 4242, and 4242 in reply to a broken function
     // call is a wrong answer dressed as a result.
     let names_conditional = names_expr_call(proj_s);
-    let Some(proj) = parse_projection(proj_s) else {
+    let Some(mut proj) = parse_projection(proj_s) else {
         if trace { eprintln!("[srv] plan: parse_projection failed"); }
         return if names_conditional { Some(Plan::Refused) } else { None };
     };
+    // number the projection's `?` parameters FIRST, so they take the
+    // leading input-SQLDA slots and the WHERE clause's own number after
+    // them - the engine's textual order
+    let proj_params = renumber_proj_params(&mut proj);
     // A MALFORMED CONDITIONAL CALL MUST RAISE. When the expression
     // parser declines `COALESCE(A)` - one operand where two are needed -
     // the text falls through to the column resolver, which looks for a
@@ -23721,8 +23725,9 @@ fn plan_query_inner_ctx(
             Default::default()
         };
 
-    // parse + resolve the optional WHERE clause
-    let mut next_param = 0usize;
+    // parse + resolve the optional WHERE clause - its `?`s number AFTER
+    // the projection's (proj_params leading slots)
+    let mut next_param = proj_params;
     // When subqueries FOLD, the original text still spells `(SELECT`,
     // which the optimizer gatekeeper refuses - the outer retrieval
     // would always scan (probed: engine T INDEX (RDB$PRIMARY1) where
@@ -24008,20 +24013,10 @@ fn plan_query_inner_ctx(
                 }
             }
         }
-        // PROJECTION PARAMETERS: number the `?`s in the select list in
-        // source order. This first slice supports them only when the
-        // WHERE clause has NONE - the textual-order merge across the two
-        // (projection params come FIRST in the input SQLDA) is a later
-        // slice, so refuse the combination rather than mis-order it.
-        let mut proj_params = 0usize;
-        for it in items.iter_mut() {
-            if let SelItem::Expr(raw, ..) = it {
-                renumber_raw_params(raw, &mut proj_params);
-            }
-        }
-        if proj_params > 0 && !params.is_empty() {
-            return None;
-        }
+        // projection `?` parameters were numbered up front
+        // ([renumber_proj_params]) and the WHERE's number after them, so
+        // both a projection param and a WHERE param now coexist in
+        // textual order - nothing to reserve here.
         let items = items;
         let cols = if has_expr || has_gen {
             let mut out = Vec::new();
@@ -30025,6 +30020,24 @@ fn renumber_raw_params(e: &mut RawExpr, next: &mut usize) {
         RawExpr::Cond(c) => renumber_cond_params(c, next),
         _ => {}
     }
+}
+
+/// Number the `?` parameters of a projection's select-list expressions
+/// in source order, returning how many there were. Called BEFORE the
+/// WHERE clause numbers its own, so projection parameters take the
+/// leading slots of the input SQLDA - the engine's textual order for
+/// `SELECT CAST(? AS INT) FROM T WHERE X = ?` (probed: the projection
+/// `?` is param 0, the WHERE `?` is param 1).
+fn renumber_proj_params(proj: &mut Proj) -> usize {
+    let mut n = 0usize;
+    if let Proj::Items(items) = proj {
+        for it in items.iter_mut() {
+            if let SelItem::Expr(raw, ..) = it {
+                renumber_raw_params(raw, &mut n);
+            }
+        }
+    }
+    n
 }
 
 fn renumber_cond_params(c: &mut RawCond, next: &mut usize) {
