@@ -27016,6 +27016,13 @@ const GDS_COMMAND_END_ERR2: i32 = 335544851;
 /// carry" (SQLSTATE 22003).
 const GDS_INTEGER_OVERFLOW: i32 = 335544779;
 
+/// isc_numeric_out_of_range - "numeric value is out of range" (SQLSTATE
+/// 22003), the second item under isc_arith_except. What a CAST to an
+/// integer target raises when the value does not fit the target's width
+/// (probed: `CAST('32768' AS SMALLINT)`, `CAST(2147483648 AS INTEGER)`,
+/// `CAST(1.23e30 AS BIGINT)`).
+const GDS_NUMERIC_OUT_OF_RANGE: i32 = 335544916;
+
 /// isc_bad_substring_length - "Invalid length parameter @1 to SUBSTRING.
 /// Negative integers are not allowed." (SQLSTATE 22011, msg/jrd.h:534);
 /// the length travels as an isc_arg_number so the client's message
@@ -27222,6 +27229,12 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
         EvalErr::IntegerOverflow => {
             w.int(1) // isc_arg_gds
                 .int(GDS_INTEGER_OVERFLOW);
+        }
+        EvalErr::NumericOutOfRange => {
+            w.int(1) // isc_arg_gds - arithmetic exception, numeric overflow, ...
+                .int(GDS_ARITH_EXCEPT)
+                .int(1) // isc_arg_gds - numeric value is out of range
+                .int(GDS_NUMERIC_OUT_OF_RANGE);
         }
         EvalErr::ReadOnlyDatabase { dsql } => {
             if *dsql {
@@ -31283,6 +31296,10 @@ enum EvalErr {
     /// sum past `i64`, or an operation past `i128`:
     /// `isc_exception_integer_overflow` (SQLSTATE 22003)
     IntegerOverflow,
+    /// a CAST whose value does not fit the integer target's width -
+    /// `isc_numeric_out_of_range` under `isc_arith_except` (SQLSTATE
+    /// 22003), a DIFFERENT vector from IntegerOverflow's single code
+    NumericOutOfRange,
     /// a negative length given to SUBSTRING/LEFT/RIGHT (the engine routes
     /// LEFT and RIGHT through SUBSTRING, so all three name it):
     /// `isc_bad_substring_length` (SQLSTATE 22011), the offending value
@@ -32383,6 +32400,38 @@ fn round_scaled_to_int(raw: i128, scale: i8) -> i128 {
     }
 }
 
+/// A text number ([text_number]) rounded to an integer for a CAST to the
+/// integer family: the engine's grammar (fractions, exponents, a hex
+/// literal) with its rounding, HALF AWAY FROM ZERO. `None` when the
+/// magnitude leaves `i128`, which the CAST reports as OUT OF RANGE
+/// (22003), not the conversion error a non-numeric spelling earns.
+fn textnum_to_int128(tn: TextNum) -> Option<i128> {
+    match tn {
+        TextNum::Hex { value, .. } => Some(value as i128),
+        TextNum::Dec { mantissa, exp } => {
+            if exp >= 0 {
+                let p = 10i128.checked_pow(u32::try_from(exp).ok()?)?;
+                mantissa.checked_mul(p)
+            } else {
+                let k = exp.unsigned_abs();
+                // |mantissa| < 10^39, so at k >= 39 the value's magnitude
+                // is below 0.5 and rounds to zero - and 10^39 leaves i128
+                if k > 38 {
+                    return Some(0);
+                }
+                let pow = 10i128.pow(k);
+                let q = mantissa / pow;
+                let r = mantissa % pow;
+                Some(if 2 * r.unsigned_abs() >= pow as u128 {
+                    q + mantissa.signum()
+                } else {
+                    q
+                })
+            }
+        }
+    }
+}
+
 /// Civil date from an MJD day number (day 0 = 1858-11-17) - Howard
 /// Hinnant's civil-from-days, the same math the ods renderer uses.
 fn civil_of(days: i32) -> (i32, u32, u32) {
@@ -33474,36 +33523,62 @@ impl Expr {
                     // 0x20 and nothing else: `str::trim` would take the
                     // whole Unicode White_Space class, and the engine's
                     // cvt grammar raises 22018 on every one of those bytes
-                    CastTarget::Int { .. } => {
-                        let narrow = |x: i128| match i64::try_from(x) {
-                            Ok(n) => Ok(Value::Int(n)),
-                            Err(_) => Err(EvalErr::ConversionError(None)),
+                    CastTarget::Int { bytes } => {
+                        // the value must fit the TARGET's width, or it is
+                        // the engine's 22003 numeric-out-of-range - a
+                        // DIFFERENT vector from the 22018 a non-numeric
+                        // string earns (probed: CAST('32768' AS SMALLINT)
+                        // and CAST(2147483648 AS INTEGER) both 22003)
+                        let fit = |x: i128| -> Result<Value, EvalErr> {
+                            let (lo, hi) = match bytes {
+                                2 => (i16::MIN as i128, i16::MAX as i128),
+                                4 => (i32::MIN as i128, i32::MAX as i128),
+                                _ => (i64::MIN as i128, i64::MAX as i128),
+                            };
+                            if x < lo || x > hi {
+                                Err(EvalErr::NumericOutOfRange)
+                            } else {
+                                Ok(Value::Int(x as i64))
+                            }
                         };
                         match v {
-                            Value::Int(n) => Value::Int(n),
+                            Value::Int(n) => fit(n as i128)?,
                             Value::Scaled(raw, scale) => {
-                                narrow(round_scaled_to_int(raw as i128, scale))?
+                                fit(round_scaled_to_int(raw as i128, scale))?
                             }
                             Value::Int128(raw, scale) => {
-                                narrow(round_scaled_to_int(raw, scale))?
+                                fit(round_scaled_to_int(raw, scale))?
                             }
-                            Value::Text(s) => match s.trim_matches(' ').parse::<i64>() {
-                                Ok(n) => Value::Int(n),
-                                Err(_) => {
-                                    return Err(EvalErr::ConversionError(Some(s)))
-                                }
+                            // a STRING takes the engine's number grammar,
+                            // not a plain integer parse: a fraction ROUNDS
+                            // half away from zero (`'2.5'` is 3), an
+                            // exponent is read (`'1e3'` is 1000), a hex
+                            // literal converts, and a magnitude past i128
+                            // is out of range - while a non-numeric
+                            // spelling is the 22018 conversion error
+                            Value::Text(s) => match text_number(&s) {
+                                Some(tn) => match textnum_to_int128(tn) {
+                                    Some(x) => fit(x)?,
+                                    None => return Err(EvalErr::NumericOutOfRange),
+                                },
+                                None => return Err(EvalErr::ConversionError(Some(s))),
                             },
                             // an approximate source rounds the same way -
                             // Rust's `round` is half away from zero, which
                             // is the engine's rule (probed: 1.5 is 2, 2.5
                             // is 3, -0.5 is -1 - NOT banker's rounding,
-                            // which would answer 2 for 2.5)
+                            // which would answer 2 for 2.5) - then the same
+                            // width test, so a double past the target is
+                            // out of range too (probed: 1.23e30 is 22003)
                             v if approx_of(&v).is_some() => {
                                 let r = approx_of(&v).unwrap_or(0.0).round();
-                                if !r.is_finite() || r.abs() >= 9.223_372_036_854_776e18 {
+                                if !r.is_finite() {
                                     return Err(EvalErr::ConversionError(None));
                                 }
-                                Value::Int(r as i64)
+                                if r.abs() >= 1.701_411_834_604_692_3e38 {
+                                    return Err(EvalErr::NumericOutOfRange);
+                                }
+                                fit(r as i128)?
                             }
                             _ => return Err(EvalErr::ConversionError(None)),
                         }
