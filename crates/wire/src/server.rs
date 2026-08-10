@@ -1523,6 +1523,28 @@ impl Database {
         })
     }
 
+    /// TABLE STABILITY, at the read. A CONSISTENCY transaction reserves
+    /// every table it reads in PROTECTED READ, so a concurrent writer to
+    /// it loses (PR excludes SW - the write side raises the conflict).
+    /// An ordinary transaction reserves nothing on a read, as the engine
+    /// does not. Best-effort NO WAIT and held for the transaction's life:
+    /// taken when the table is free, which is the reader-gets-there-first
+    /// case the gate measures; a table another writer already holds is
+    /// left for now and the reader proceeds on its stable snapshot (the
+    /// engine would raise here - a recorded boundary, since the base read
+    /// funnels have no channel to carry the error out).
+    fn reserve_relation_read(&self, rel: u16) {
+        if !self.consistency {
+            return;
+        }
+        let _ = self.locks.reserve_relation(
+            self.lock_owner,
+            rel,
+            crate::dblocks::Mode::ProtectedRead,
+            None,
+        );
+    }
+
     /// Has a forced shutdown told this attachment to go? Its next
     /// statement answers `isc_att_shutdown` and does no work - see
     /// [DbGate::kick_gen].
@@ -25349,6 +25371,7 @@ fn records_at(
     formats: &[(u8, Vec<Descriptor>)],
     recnos: &[u64],
 ) -> Vec<Vec<Value>> {
+    db.reserve_relation_read(rel);
     let image = db.bytes();
     records_at_in(&image, db.page_size, rel, formats, recnos, &ReadView::of(db, &image))
 }
@@ -25377,6 +25400,7 @@ fn records_for_2pc(
     formats: &[(u8, Vec<Descriptor>)],
     access: &IndexAccess,
 ) -> (Vec<Vec<Value>>, u64) {
+    db.reserve_relation_read(rel);
     let mut out = Vec::new();
     // ONE ROW PER RECORD, however many entries name it. `insert_index_entry`
     // skips an entry it already holds, but only within the leaf page it
@@ -25774,6 +25798,7 @@ fn for_each_record_while<F: FnMut(&[Value]) -> Flow>(
 /// are; the only difference here is that no image is assembled, because
 /// a count needs the answer and not the bytes.
 fn count_visible_records(db: &Database, rel: u16) -> Result<i64, u64> {
+    db.reserve_relation_read(rel);
     let db_image = db.bytes();
     let Some(tips) = fire_crab_ods::tra::TipChain::read(&db_image, db.page_size) else {
         // no transaction inventory to consult: what the walk did before
@@ -25813,6 +25838,7 @@ fn for_each_record<F: FnMut(&[Value])>(
     formats: &[(u8, Vec<Descriptor>)],
     mut f: F,
 ) -> u64 {
+    db.reserve_relation_read(rel);
     let db_image = db.bytes();
     let view = ReadView::of(db, &db_image);
     for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
