@@ -19916,9 +19916,15 @@ fn plan_join(
     // the same database as an Option, which is what plan_query_inner
     // takes - a DERIVED SIDE plans its own inner query through it
     db_opt: &Option<Database>,
+    // how many `?` the projection reserved ahead of the WHERE, so the
+    // join's own params number AFTER them - the engine's textual order
+    proj_params: usize,
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Plan> {
-    plan_join_bound(proj, left, joins, where_s, group_s, having_s, order_s, db, db_opt, params, None)
+    plan_join_bound(
+        proj, left, joins, where_s, group_s, having_s, order_s, db, db_opt, proj_params, params,
+        None,
+    )
 }
 
 /// Decide whether this step's inner side may be PROBED per outer row
@@ -20158,6 +20164,7 @@ fn plan_join_bound(
     order_s: Option<&str>,
     db: &Database,
     db_opt: &Option<Database>,
+    proj_params: usize,
     params: &mut Vec<Option<Descriptor>>,
     bound: Option<BoundRows<'_>>,
 ) -> Option<Plan> {
@@ -20442,7 +20449,11 @@ fn plan_join_bound(
         }
     }
 
-    let mut next_param = params.len();
+    // the projection's `?` take slots 0..proj_params (filled below when
+    // the select list resolves); the WHERE's own `?` number after them.
+    // params is empty on the main join call, so the max keeps the other
+    // callers (COUNT(*), the bound recursion) at their old params.len()
+    let mut next_param = params.len().max(proj_params);
     let filter = match where_s {
         None => None,
         Some(ws) => Some(
@@ -20655,7 +20666,16 @@ fn plan_join_bound(
                 let (name, alias) = match item {
                     SelItem::Col(name, alias) => (name, alias),
                     SelItem::Expr(e, out_name, fname) => {
-                        let mut pc = build_expr_col(e, out_name, &comb_cols, &comb_descs)?;
+                        // a projection `?` (only ever a typed CAST(? AS ..))
+                        // resolves through the param-aware path, filling its
+                        // reserved sink slot; every param-free item takes the
+                        // ordinary resolver, exactly as the plain path does
+                        let mut pc = if raw_has_param(e) {
+                            let re = resolve_proj_expr(e, &comb_cols, &comb_descs, params)?;
+                            build_expr_col_from(re, out_name, &comb_descs)?
+                        } else {
+                            build_expr_col(e, out_name, &comb_cols, &comb_descs)?
+                        };
                         pc.fname = Some(fname.clone());
                         cols.push(pc);
                         continue;
@@ -21162,6 +21182,10 @@ fn plan_over_source(
             order_s,
             dbr,
             db,
+            // the bound-name/derived recursion does not reserve projection
+            // `?` slots (that path still refuses a projection param), so the
+            // WHERE keeps numbering from params.len() as before
+            0,
             params,
             Some((name, cols, &src.into_row_source())),
         );
@@ -23722,7 +23746,7 @@ fn plan_query_inner_ctx(
                 if group_s.is_some() || having_s.is_some() {
                     return plan_join(
                         &proj, &left, &join, where_s, group_s, having_s, order_s, db,
-                        &db_all, params,
+                        &db_all, proj_params, params,
                     )
                     .or_else(|| from_names_view.then_some(Plan::Refused));
                 }
@@ -23737,7 +23761,7 @@ fn plan_query_inner_ctx(
                     ..
                 }) = plan_join(
                     &Proj::Star, &left, &join, where_s, None, None, None, db, &db_all,
-                    params,
+                    proj_params, params,
                 ) {
                     // counted at prepare, so a parameterised WHERE (whose
                     // values only arrive at execute) cannot be honoured
@@ -23758,7 +23782,8 @@ fn plan_query_inner_ctx(
             }
         }
         return match plan_join(
-            &proj, &left, &join, where_s, group_s, having_s, order_s, db, &db_all, params,
+            &proj, &left, &join, where_s, group_s, having_s, order_s, db, &db_all, proj_params,
+            params,
         ) {
             Some(p) => Some(p),
             None => {
@@ -27854,8 +27879,11 @@ fn subst_params_expr(e: &Expr, args: &[WireParam]) -> Option<Expr> {
 
 /// Does this plan's PROJECTION carry `?` parameters that must be bound?
 fn plan_has_proj_param(plan: &Plan) -> bool {
-    matches!(plan, Plan::Project { cols, .. }
-        if cols.iter().any(|c| c.expr.as_ref().is_some_and(expr_has_param)))
+    let cols = match plan {
+        Plan::Project { cols, .. } | Plan::Join { cols, .. } => cols,
+        _ => return false,
+    };
+    cols.iter().any(|c| c.expr.as_ref().is_some_and(expr_has_param))
 }
 
 /// A copy of the plan with its projection `?` parameters bound to the
@@ -27863,7 +27891,7 @@ fn plan_has_proj_param(plan: &Plan) -> bool {
 /// before any fetch path evaluates the projection.
 fn bind_plan_params(plan: &Plan, args: &[WireParam]) -> Option<Plan> {
     let mut p = plan.clone();
-    if let Plan::Project { cols, .. } = &mut p {
+    if let Plan::Project { cols, .. } | Plan::Join { cols, .. } = &mut p {
         for c in cols.iter_mut() {
             if c.expr.as_ref().is_some_and(expr_has_param) {
                 let e = c.expr.as_ref()?;
