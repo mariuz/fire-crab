@@ -97,5 +97,31 @@ both "CAST(2.5 AS INTEGER)"
 both "CAST('abc' AS INTEGER)"
 both "CAST('1 2' AS INTEGER)"
 
+# --- the OUTPUT describe: a CAST to an integer type announces THAT type,
+#     not the INT64 an arithmetic expression takes (probed: SMALLINT is
+#     500 SHORT len 2, INTEGER 496 LONG len 4, BIGINT 580 INT64 len 8).
+#     Compared on the type NAME and width - fire-crab announces every
+#     expression NULLABLE by its own convention (the odd sqltype), so the
+#     leading number and the Nullable flag are normalised away.
+dtype() { printf 'SET SQLDA_DISPLAY ON;\n%s;\n' "$2" |
+    "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 |
+    grep -iE 'sqltype:' | head -1 |
+    grep -oiE '(SHORT|LONG|INT64|INT128) .*len: [0-9]+' | sed 's/Nullable //'
+}
+dboth() { # <expr>
+    local e c
+    e=$(dtype "$E" "SELECT $1 FROM RDB\$DATABASE")
+    c=$(dtype "$F" "SELECT $1 FROM RDB\$DATABASE")
+    ran=$((ran + 1))
+    if [ "$e" = "$c" ]; then echo "OK   describe $1 [$e]"
+    else echo "DIFF describe $1"; echo "     engine: [$e]"; echo "     fcrab:  [$c]"; fail=1; fi
+}
+dboth "CAST(1 AS SMALLINT)"
+dboth "CAST(1 AS INTEGER)"
+dboth "CAST(1 AS BIGINT)"
+dboth "-CAST(1 AS SMALLINT)"
+# arithmetic AROUND a cast widens to INT64 - the cast type does not escape
+dboth "CAST(1 AS SMALLINT) + 1"
+
 echo "ran $ran checks"
 exit $fail

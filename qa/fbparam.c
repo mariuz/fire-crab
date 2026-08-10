@@ -1,7 +1,8 @@
 /* fbparam <conn> <sql> <textval|NULL> : prepare a one-`?` projection,
- * bind the value as VARCHAR (value-derived, as node-firebird does),
- * coerce the OUTPUT to BIGINT so the read is describe-agnostic, and
- * print the value or the conversion/range error class. */
+ * bind the value as VARCHAR (value-derived, as node-firebird does), read
+ * the output PER ITS ANNOUNCED TYPE (SHORT/LONG/INT64 - fire-crab and the
+ * engine now announce the same, so this is describe-faithful and still
+ * value-comparable), and print the value or the error class. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,17 +22,24 @@ int main(int c,char**v){ISC_STATUS st[40];isc_db_handle db=0;isc_tr_handle tr=0;
  if(isc_dsql_prepare(st,&tr,&s,0,v[2],3,out)){err(st);return 0;}
  XSQLDA* in=(XSQLDA*)malloc(XSQLDA_LENGTH(1)); in->version=SQLDA_VERSION1; in->sqln=1;
  isc_dsql_describe_bind(st,&s,1,in);
- int isnull = (strcmp(v[3],"NULL")==0);
- short nf = isnull ? -1 : 0;
+ short nf = (strcmp(v[3],"NULL")==0) ? -1 : 0;
  char buf[256]; short len=(short)strlen(v[3]); *(short*)buf=len; memcpy(buf+2,v[3],len);
  in->sqlvar[0].sqltype=SQL_VARYING+1; in->sqlvar[0].sqllen=len; in->sqlvar[0].sqldata=buf; in->sqlvar[0].sqlind=&nf;
- /* coerce OUTPUT to BIGINT, 8 bytes - describe-agnostic across servers */
- ISC_INT64 n=0; short oind=0;
- out->sqlvar[0].sqltype=SQL_INT64+1; out->sqlvar[0].sqllen=8; out->sqlvar[0].sqlscale=0;
- out->sqlvar[0].sqldata=(char*)&n; out->sqlvar[0].sqlind=&oind;
+ /* read the OUTPUT per its announced base type */
+ short base = out->sqlvar[0].sqltype & ~1;
+ short i16=0; long i32=0; ISC_INT64 i64=0; short oind=0;
+ out->sqlvar[0].sqlind=&oind;
+ if(base==SQL_SHORT){ out->sqlvar[0].sqltype=SQL_SHORT+1; out->sqlvar[0].sqldata=(char*)&i16; }
+ else if(base==SQL_LONG){ out->sqlvar[0].sqltype=SQL_LONG+1; out->sqlvar[0].sqldata=(char*)&i32; }
+ else { out->sqlvar[0].sqltype=SQL_INT64+1; out->sqlvar[0].sqllen=8; out->sqlvar[0].sqldata=(char*)&i64; }
  if(isc_dsql_execute2(st,&tr,&s,1,in,NULL)){err(st);goto done;}
  { long fr=isc_dsql_fetch(st,&s,1,out);
-   if(fr==0) printf(oind? "NULL\n" : "%lld\n",(long long)n);
+   if(fr==0){
+     if(oind) printf("NULL\n");
+     else if(base==SQL_SHORT) printf("%d\n",i16);
+     else if(base==SQL_LONG) printf("%ld\n",i32);
+     else printf("%lld\n",(long long)i64);
+   }
    else if(fr==100) printf("NOROW\n");
    else err(st); }
 done:

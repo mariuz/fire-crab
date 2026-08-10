@@ -7990,6 +7990,27 @@ fn constraint_key_text(parts: &[(String, &Value)]) -> Option<String> {
 /// (the INT64/INT128 form every other integer expression takes - which
 /// is also what the engine announces for ordinary arithmetic, probed:
 /// `ID + 1`, `S + S` and `ID * 2` are all INT64).
+/// A CAST TO AN INTEGER TYPE announces the TARGET's storage type, not the
+/// INT64 an arithmetic expression takes (probed: `CAST(1 AS SMALLINT)` is
+/// 500 SHORT len 2, INTEGER 496 LONG len 4, BIGINT 580 INT64 len 8).
+/// Unary negation keeps it (`-CAST(1 AS SMALLINT)` is SHORT); arithmetic
+/// AROUND it widens to INT64 (`CAST(1 AS SMALLINT) + 1` is INT64), which
+/// is why only a bare cast or a negated one is recognised here - a `Bin`
+/// falls through to the INT64 form as before.
+fn cast_int_form(e: &Expr) -> Option<(Wire, i32, i32)> {
+    match e {
+        Expr::Cast(_, CastTarget::Int { bytes }) => match bytes {
+            2 => Some((Wire::Int32, 500, 2)),
+            4 => Some((Wire::Int32, 496, 4)),
+            8 => Some((Wire::Int64, 580, 8)),
+            16 => Some((Wire::Int128, 32752, 16)),
+            _ => None,
+        },
+        Expr::Neg(inner) => cast_int_form(inner),
+        _ => None,
+    }
+}
+
 fn int_func_form(e: &Expr, descs: &[Descriptor]) -> Option<(Wire, i32, i32)> {
     // an XDR SHORT travels in a 32-bit slot, as `Wire::Int32` already
     // carries for SMALLINT columns
@@ -8309,7 +8330,7 @@ fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<Proj
         // a FUNCTION's integer result has its own declared width; every
         // other integer expression takes the INT64/INT128 form, which is
         // what the engine announces for arithmetic too (probed)
-        ExprType::Int => match int_func_form(&e, descs) {
+        ExprType::Int => match cast_int_form(&e).or_else(|| int_func_form(&e, descs)) {
             Some((w, t, l)) => (w, nullable(t), l, 0),
             None => num_form(0),
         },
