@@ -27801,7 +27801,11 @@ fn param_to_expr(p: &WireParam) -> Option<Expr> {
         WireParam::Text(s) => Expr::Str(s.clone()),
         WireParam::Double(x) => Expr::Double(*x),
         WireParam::Bool(b) => Expr::Bool(*b),
-        _ => return None,
+        // a bound temporal value binds to its literal, so CAST(? AS DATE)
+        // over a sent DATE collapses to the date itself
+        WireParam::Date(d) => Expr::DateLit(*d),
+        WireParam::Time(t) => Expr::TimeLit(*t),
+        WireParam::Timestamp(d, t) => Expr::TsLit(*d, *t),
     })
 }
 
@@ -31304,7 +31308,22 @@ fn cast_target_descriptor(t: &CastTarget) -> Option<Descriptor> {
             d(int_dtype(*bytes)?, *scale, *bytes as u16, *sub_type)
         }
         CastTarget::Approx => d(dtype::DOUBLE, 0, 8, 0),
-        CastTarget::Text { .. } | CastTarget::Temporal(_) => return None,
+        // the temporal targets travel in their native slots (probed: the
+        // `?` of CAST(? AS DATE) describes 570 SQL_TYPE_DATE len 4, TIME
+        // 560 len 4, TIMESTAMP 510 len 8)
+        CastTarget::Temporal(TKind::Date) => d(dtype::SQL_DATE, 0, 4, 0),
+        CastTarget::Temporal(TKind::Time) => d(dtype::SQL_TIME, 0, 4, 0),
+        CastTarget::Temporal(TKind::Timestamp) => d(dtype::TIMESTAMP, 0, 8, 0),
+        // a TEXT target refuses here, as it does everywhere in this
+        // server: CAST(... AS VARCHAR/CHAR) is unimplemented even for a
+        // literal (probed: CAST('ab' AS VARCHAR(3)) is SQLSTATE 42000
+        // where the engine fits 'ab', and an over-length source owes the
+        // engine's 22001 "string right truncation" that this server does
+        // not raise). Announcing the slot would let a `?` reach an eval
+        // that silently mishandles the width, so the whole CAST-to-text
+        // feature (blank-fit truncation + the 22001 error) is left as its
+        // own slice and the `?` refuses with it.
+        CastTarget::Text { .. } => return None,
     })
 }
 
@@ -34106,11 +34125,19 @@ impl Expr {
                                         TKind::Date => Value::Date(parse_date_lit(t)?),
                                         TKind::Time => Value::Time(parse_time_lit(t)?),
                                         TKind::Timestamp => {
-                                            let (ds, ts) = t.trim().split_once(' ')?;
-                                            Value::Timestamp(
-                                                parse_date_lit(ds)?,
-                                                parse_time_lit(ts.trim())?,
-                                            )
+                                            // a date-only string is midnight, as
+                                            // for a DATE value cast up (probed:
+                                            // CAST('2020-06-15' AS TIMESTAMP) is
+                                            // that date at time 0)
+                                            match t.trim().split_once(' ') {
+                                                Some((ds, ts)) => Value::Timestamp(
+                                                    parse_date_lit(ds)?,
+                                                    parse_time_lit(ts.trim())?,
+                                                ),
+                                                None => {
+                                                    Value::Timestamp(parse_date_lit(t.trim())?, 0)
+                                                }
+                                            }
                                         }
                                     })
                                 };
