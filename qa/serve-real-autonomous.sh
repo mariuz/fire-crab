@@ -308,22 +308,18 @@ SELECT V FROM LOG WHERE ID = 22;"
 both "...and the outer block's does not" "SET HEADING OFF;
 SELECT COUNT(*) FROM LOG WHERE ID = 21;"
 # THE OUTER TRANSACTION READING WHAT THE BLOCK COMMITTED. The engine
-# answers 0: its transaction took its snapshot before the block existed.
-# This server has no snapshot - a reader counts what is committed WHEN IT
-# READS - so it answers 1. That is the isolation model, not this slice,
-# and it is written down here because it is where it first shows.
-ran=$((ran + 1))
-e=$(eng "SET HEADING OFF;
+# answers 0, and this was a RECORDED BOUNDARY until the read-consistency
+# slice converted it. isql's default TPB is read committed no record
+# version, which the engine runs as READ COMMITTED READ CONSISTENCY: a
+# statement's view is fixed at its start, so the row the block commits
+# mid-statement is not seen. Nor is it seen by a LATER statement of the
+# same transaction - the engine never shows a transaction the rows its
+# own autonomous block committed. fire-crab models both now (a per-
+# statement view, plus holding its own committed autonomous ids out of
+# it), so the two agree at 0 where they used to split 0/1.
+both "the outer transaction does not see its own block's commit" "SET HEADING OFF;
 EXECUTE PROCEDURE B_OUTERSEES;
-ROLLBACK;")
-c=$(crab "SET HEADING OFF;
-EXECUTE PROCEDURE B_OUTERSEES;
-ROLLBACK;")
-if [ "$e" = "0|" ] && [ "$c" = "1|" ]; then
-    echo "OK   boundary: the outer transaction has no snapshot (engine 0, fc 1)"
-else
-    echo "DIFF boundary MOVED: outer-transaction visibility: engine [$e] fc [$c]"; fail=1
-fi
+ROLLBACK;"
 
 # --- 8. TEETH ------------------------------------------------------------
 # Both servers are compared, so a shared refusal reads as agreement. The

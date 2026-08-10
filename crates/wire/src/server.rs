@@ -900,6 +900,14 @@ struct Database {
     /// stable view: reads do not see what another transaction commits
     /// after this one began. Cleared when the transaction ends.
     snapshot: Option<fire_crab_ods::tra::Snapshot>,
+    /// The transactions this attachment COMMITTED as autonomous blocks.
+    /// The engine's rule (measured): a transaction never sees the rows
+    /// its own autonomous block committed, for the rest of its life -
+    /// not even in a later statement, though an INDEPENDENT concurrent
+    /// commit of the same age is seen. So these ids are held out of the
+    /// statement view even once its limit has moved past them. Cleared
+    /// when the transaction ends.
+    autonomous_ids: Vec<u32>,
     /// isc_tpb_wait (the default) vs isc_tpb_nowait: a NO WAIT
     /// transaction that meets a row another ACTIVE transaction holds
     /// does not block - it raises the update-conflict at once, naming
@@ -1485,6 +1493,28 @@ impl Database {
         own
     }
 
+    /// The snapshot a READ decides visibility against. A concurrency
+    /// transaction reads against its own isolation snapshot. A read
+    /// committed one reads the LATEST committed - so it has no snapshot -
+    /// with one exception: it must never see the rows its OWN autonomous
+    /// blocks committed (measured; an independent concurrent commit of
+    /// the same age IS seen, so this is not a snapshot in time). That
+    /// exception is a snapshot with no upper bound (limit = MAX, sees
+    /// every committed id) whose `active` set is exactly this
+    /// transaction's autonomous ids - held out though committed.
+    fn view_snapshot(&self) -> Option<fire_crab_ods::tra::Snapshot> {
+        if let Some(s) = &self.snapshot {
+            return Some(s.clone()); // concurrency: the isolation snapshot
+        }
+        if self.autonomous_ids.is_empty() {
+            return None; // plain read committed: the latest committed
+        }
+        Some(fire_crab_ods::tra::Snapshot {
+            limit: u64::MAX,
+            active: self.autonomous_ids.iter().map(|&id| u64::from(id)).collect(),
+        })
+    }
+
     /// Has a forced shutdown told this attachment to go? Its next
     /// statement answers `isc_att_shutdown` and does no work - see
     /// [DbGate::kick_gen].
@@ -1634,6 +1664,7 @@ impl Database {
         // the transaction ended: its snapshot dies with it, so the next
         // op_transaction captures the inventory afresh
         self.snapshot = None;
+        self.autonomous_ids.clear();
         self.image_undo = false;
         self.ddl_undo = false;
         self.nested_tx.clear();
@@ -2238,6 +2269,7 @@ fn load_database(path: &str) -> Option<Database> {
         ods_minor: h.ods_minor,
         windows: vec![UndoWindow::new(WindowKind::Transaction)],
         snapshot: None,
+        autonomous_ids: Vec::new(),
         wait: true,
         lock_timeout: None,
     })
@@ -25442,9 +25474,15 @@ fn records_at_in(
 struct ReadView<'a> {
     tips: Option<fire_crab_ods::tra::TipChain<'a>>,
     own: fire_crab_ods::tra::OwnTx,
-    /// this transaction's SNAPSHOT (None = read committed): a stable
-    /// view as of its start, the engine's default isolation
+    /// the snapshot this read decides visibility against: the isolation
+    /// snapshot (concurrency) OR the read committed statement-level view.
+    /// None only for a constraint work-copy read (see [ReadView::over]).
     snapshot: Option<fire_crab_ods::tra::Snapshot>,
+    /// is `snapshot` a true ISOLATION snapshot (concurrency)? Only then
+    /// does a write over a concurrent commit conflict. A read committed
+    /// statement view fills `snapshot` for visibility but must NOT make
+    /// writes conflict, so the write-conflict check keys on this.
+    is_isolation: bool,
     /// the first LIMBO transaction a walk met (0 = none): the walkers
     /// stop on it and their callers raise `isc_rec_in_limbo` - walking
     /// past would silently hide a row the engine refuses to adjudicate
@@ -25456,8 +25494,10 @@ impl<'a> ReadView<'a> {
         ReadView {
             tips: fire_crab_ods::tra::TipChain::read(image, db.page_size),
             own: db.own_tx(),
-            // the transaction's captured snapshot decides visibility
-            snapshot: db.snapshot.clone(),
+            // isolation snapshot if it has one, else the statement view
+            snapshot: db.view_snapshot(),
+            // only a concurrency snapshot makes a write conflict
+            is_isolation: db.snapshot.is_some(),
             limbo: std::cell::Cell::new(0),
         }
     }
@@ -25473,6 +25513,7 @@ impl<'a> ReadView<'a> {
             tips: fire_crab_ods::tra::TipChain::read(image, page_size),
             own,
             snapshot: None,
+            is_isolation: false,
             limbo: std::cell::Cell::new(0),
         }
     }
@@ -25522,6 +25563,11 @@ impl<'a> ReadView<'a> {
     /// (uncommitted) head is the WAIT case instead, left to
     /// with_conflict_wait. Read committed (no snapshot) never conflicts.
     fn snapshot_conflict(&self, head: &fire_crab_ods::RecordHeader) -> Option<u64> {
+        // read committed never conflicts on a concurrent commit, even
+        // though it now carries a statement view for visibility
+        if !self.is_isolation {
+            return None;
+        }
         let snap = self.snapshot.as_ref()?;
         let tx = head.transaction;
         if tx == 0 || self.own.contains(tx) || snap.sees(tx) {
@@ -25669,6 +25715,7 @@ fn count_visible_records(db: &Database, rel: u16) -> Result<i64, u64> {
         return Ok(fire_crab_ods::count_primary_records(&db_image, db.page_size, rel) as i64);
     };
     let own = db.own_tx();
+    let snap = db.view_snapshot();
     let mut n = 0i64;
     for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
         let start = dp_no as usize * db.page_size;
@@ -25682,7 +25729,7 @@ fn count_visible_records(db: &Database, rel: u16) -> Result<i64, u64> {
             // a COUNT meets the limbo law too - measured, the engine
             // raises rather than answering a number nobody can stand by
             if fire_crab_ods::tra::visible_exists_2pc(
-                &db_image, db.page_size, &r, &tips, &own, true, db.snapshot.as_ref(),
+                &db_image, db.page_size, &r, &tips, &own, true, snap.as_ref(),
             )? {
                 n += 1;
             }
@@ -39623,6 +39670,10 @@ fn run_autonomous(
         for (p, bytes) in changed {
             d.auto_pages.insert(p, bytes);
         }
+        // remember what this block committed: the transaction around it
+        // must never see these rows, even in a later statement whose view
+        // has moved past their ids (see [Database::view_snapshot])
+        d.autonomous_ids.extend(ids.iter().copied());
     }
     outcome
 }
@@ -45629,6 +45680,10 @@ mod tests {
             ods_major: 0,
             ods_minor: 0,
             windows: vec![UndoWindow::new(WindowKind::Transaction)],
+            snapshot: None,
+            autonomous_ids: Vec::new(),
+            wait: true,
+            lock_timeout: None,
         };
         let row = |a: i64, b: i64| vec![Value::Int(a), Value::Int(b)];
         let base = RowSource::Rows(vec![row(1, 30), row(2, 10), row(3, 20)]);
@@ -48451,6 +48506,7 @@ mod tests {
             ods_minor: 0,
             windows: Vec::new(),
             snapshot: None,
+            autonomous_ids: Vec::new(),
             wait: true,
             lock_timeout: None,
         };
@@ -54590,6 +54646,10 @@ mod tests {
             ods_major: 14,
             ods_minor: 0,
             windows: vec![UndoWindow::new(WindowKind::Transaction)],
+            snapshot: None,
+            autonomous_ids: Vec::new(),
+            wait: true,
+            lock_timeout: None,
         }
     }
 
