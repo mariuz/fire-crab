@@ -917,6 +917,14 @@ struct Database {
     /// seconds on another's lock then raises the same conflict rather
     /// than waiting on. None = wait to the server's own cap.
     lock_timeout: Option<u32>,
+    /// isc_tpb_consistency (degree3, "table stability"). A consistency
+    /// transaction RESERVES every table it touches in a PROTECTED mode,
+    /// so no one else may write them while it lives. Ordinary
+    /// transactions only ever take SHARED WRITE on the tables they
+    /// write, which tolerates other writers but collides with a
+    /// protected holder. Visibility is a stable snapshot, as concurrency
+    /// is (`snapshot` is set); this only adds the table locking.
+    consistency: bool,
 }
 
 /// A connection ending takes its attachment off the file's count,
@@ -2272,6 +2280,7 @@ fn load_database(path: &str) -> Option<Database> {
         autonomous_ids: Vec::new(),
         wait: true,
         lock_timeout: None,
+        consistency: false,
     })
 }
 
@@ -16763,12 +16772,66 @@ struct Affected {
     images: Vec<Vec<u8>>,
 }
 
+/// The relation a DML statement writes, through the wrappers that carry
+/// one (RETURNING, UPSERT's update half, INSERT ... SELECT's target).
+/// None for anything that is not a write.
+fn dml_target_rel(plan: &Plan, db: &Database) -> Option<u16> {
+    match plan {
+        Plan::Insert { rel, .. } | Plan::Update { rel, .. } | Plan::Delete { rel, .. } => {
+            Some(*rel)
+        }
+        Plan::Returning { inner, .. } => dml_target_rel(inner, db),
+        Plan::UpdateOrInsert { update, .. } => dml_target_rel(update, db),
+        Plan::InsertSelect { table, .. } => db.relation_meta(table).map(|r| r.id),
+        _ => None,
+    }
+}
+
+/// TABLE STABILITY, at the write. A CONSISTENCY transaction reserves the
+/// table it is about to write in PROTECTED WRITE; an ordinary one takes
+/// SHARED WRITE. Two ordinary writers share the table (they arbitrate at
+/// the row); an ordinary writer that meets a consistency transaction's
+/// protected hold loses with the engine's relation-lock vector. Taken
+/// BEFORE the write side, so a WAIT never blocks while holding it.
+fn reserve_dml_relation(plan: &Plan, database: &Option<Database>) -> Result<(), ExecErr> {
+    let Some(db) = database.as_ref() else { return Ok(()) };
+    let Some(rel) = dml_target_rel(plan, db) else { return Ok(()) };
+    let mode = if db.consistency {
+        crate::dblocks::Mode::ProtectedWrite
+    } else {
+        crate::dblocks::Mode::SharedWrite
+    };
+    // WAIT waits (to the lock timeout, or the server's cap); NO WAIT is
+    // an immediate conflict - the same wait settings a row conflict obeys
+    let timeout = if db.wait {
+        Some(
+            db.lock_timeout
+                .map(|n| std::time::Duration::from_secs(n as u64))
+                .unwrap_or_else(conflict_wait),
+        )
+    } else {
+        None
+    };
+    match db.locks.reserve_relation(db.lock_owner, rel, mode, timeout) {
+        crate::dblocks::Reserved::Granted => Ok(()),
+        crate::dblocks::Reserved::Deadlock => {
+            Err(ExecErr::Gds(GDS_DEADLOCK, "deadlock".into()))
+        }
+        crate::dblocks::Reserved::Conflict => {
+            let name = qualified_relation_name(db, rel)
+                .unwrap_or_else(|| format!("relation {rel}"));
+            Err(ExecErr::Eval(EvalErr::RelationLockConflict(name)))
+        }
+    }
+}
+
 fn execute_dml(
     plan: &Plan,
     database: &mut Option<Database>,
     args: &[WireParam],
     ctx: &SessionCtx,
 ) -> Result<(i32, i32, i32), ExecErr> {
+    reserve_dml_relation(plan, database)?;
     with_conflict_wait(database, |db| execute_dml_collecting(plan, db, args, ctx, None))
 }
 
@@ -16783,16 +16846,18 @@ fn execute_dml(
 /// properly matters now that a lock_timeout VALUE could otherwise be
 /// mistaken for a bare flag: a 7-second timeout is not isc_tpb_nowait,
 /// a 15-second one is not isc_tpb_read_committed.
-fn parse_tpb(tpb: &[u8]) -> (bool, bool, Option<u32>) {
+fn parse_tpb(tpb: &[u8]) -> (bool, bool, Option<u32>, bool) {
     let mut read_committed = false;
     let mut nowait = false;
     let mut lock_timeout = None;
+    let mut consistency = false;
     let mut i = 1; // past the version byte
     while i < tpb.len() {
         let tag = tpb[i];
         i += 1;
         match tag {
             15 => read_committed = true, // isc_tpb_read_committed
+            1 => consistency = true,     // isc_tpb_consistency (degree3)
             7 => nowait = true,          // isc_tpb_nowait
             10 | 11 | 23 => {
                 let len = tpb.get(i).copied().unwrap_or(0) as usize;
@@ -16811,7 +16876,7 @@ fn parse_tpb(tpb: &[u8]) -> (bool, bool, Option<u32>) {
             _ => {}
         }
     }
-    (read_committed, nowait, lock_timeout)
+    (read_committed, nowait, lock_timeout, consistency)
 }
 
 fn conflict_wait() -> std::time::Duration {
@@ -27183,6 +27248,17 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(ISC_ARG_NUMBER)
                 .int(*tx as i32);
         }
+        EvalErr::RelationLockConflict(name) => {
+            // the engine's two-part vector: the lock-conflict code, then
+            // isc_random carrying the whole formatted relation message
+            let msg = format!("Acquire lock for relation ({name}) failed");
+            w.int(1) // isc_arg_gds - lock conflict on no wait transaction
+                .int(GDS_LOCK_CONFLICT)
+                .int(1) // isc_arg_gds - isc_random, prints its string arg
+                .int(GDS_RANDOM)
+                .int(2) // isc_arg_string
+                .bytes(msg.as_bytes());
+        }
         EvalErr::DsqlCountMismatch => {
             w.int(1) // isc_arg_gds
                 .int(GDS_DSQL_ERROR)
@@ -31249,6 +31325,11 @@ enum EvalErr {
     /// UPDATE-over-update, DELETE-over-update and UPDATE-over-delete,
     /// all the same three-item vector.
     UpdateConflict(u64),
+    /// a CONSISTENCY transaction holds a table this write needs, or this
+    /// consistency transaction cannot reserve one another writer holds:
+    /// the engine's "lock conflict ... Acquire lock for relation (@1)
+    /// failed", @1 the qualified name.
+    RelationLockConflict(String),
     /// a scalar subquery answered MORE THAN ONE ROW - the engine's
     /// `isc_sing_select_err`, "multiple rows in singleton select"
     /// (SQLSTATE 21000). Taking the first row would be a wrong answer
@@ -42258,10 +42339,11 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 // 15, but real TPBs put isolation first and flag-only -
                 // a false read-committed merely keeps the old behaviour
                 // for that transaction, never a crash).
-                let (read_committed, nowait, lock_timeout) = parse_tpb(&tpb);
+                let (read_committed, nowait, lock_timeout, consistency) = parse_tpb(&tpb);
                 if let Some(db) = database.as_mut() {
                     db.wait = !nowait;
                     db.lock_timeout = lock_timeout;
+                    db.consistency = consistency;
                     db.snapshot = if read_committed {
                         None
                     } else {
@@ -45684,6 +45766,7 @@ mod tests {
             autonomous_ids: Vec::new(),
             wait: true,
             lock_timeout: None,
+            consistency: false,
         };
         let row = |a: i64, b: i64| vec![Value::Int(a), Value::Int(b)];
         let base = RowSource::Rows(vec![row(1, 30), row(2, 10), row(3, 20)]);
@@ -48509,6 +48592,7 @@ mod tests {
             autonomous_ids: Vec::new(),
             wait: true,
             lock_timeout: None,
+            consistency: false,
         };
         let src = RowSource::Filter {
             input: Box::new(RowSource::Rows(rows)),
@@ -54650,6 +54734,7 @@ mod tests {
             autonomous_ids: Vec::new(),
             wait: true,
             lock_timeout: None,
+            consistency: false,
         }
     }
 

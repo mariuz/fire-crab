@@ -31,11 +31,30 @@
 //! nothing calling it.
 
 use fire_crab_lck::shm::series;
-use fire_crab_lck::{LockTable, Mode, OwnerId, Verdict};
+use fire_crab_lck::{LockTable, OwnerId, Verdict};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
+
+/// The lock modes, re-exported so callers name the reservation level
+/// (SharedWrite for an ordinary writer, ProtectedWrite/Read for a
+/// consistency transaction) without reaching into the lock crate.
+pub use fire_crab_lck::Mode;
+
+/// How a relation reservation ended. There is no "wait and re-read"
+/// here as there is for a transaction lock: a relation stays reserved
+/// for the taker's whole life, so the waiter either gets it or loses.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Reserved {
+    /// the relation is held at the requested level now
+    Granted,
+    /// another transaction holds it in an incompatible mode - the
+    /// engine's "Acquire lock for relation failed"
+    Conflict,
+    /// waiting would close a cycle: denied as a deadlock
+    Deadlock,
+}
 
 /// What a wait ended as.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -114,6 +133,62 @@ impl DbLocks {
         let mut t = lock(&self.table);
         t.enqueue(owner, series::TRA, &tra_key(tx), Mode::Exclusive, false);
         stats().holds.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// RESERVE A RELATION - the engine's table stability. A CONSISTENCY
+    /// (degree3) transaction takes a protected lock on every table it
+    /// touches so that no one else may WRITE it while it lives; an
+    /// ordinary transaction takes a SHARED WRITE on the tables it writes,
+    /// which tolerates other writers (they arbitrate at the row) but
+    /// COLLIDES with a protected holder - `LCK_relation`, series 2.
+    /// `mode` decides which: ProtectedWrite/ProtectedRead for the
+    /// consistency taker, SharedWrite for the ordinary writer.
+    ///
+    /// Held for the transaction's life (released by [DbLocks::release]),
+    /// so a second reservation by the same owner is a no-op. `timeout`
+    /// None is NO WAIT (an immediate conflict); Some is WAIT, up to that
+    /// long, then a conflict.
+    pub fn reserve_relation(
+        &self,
+        owner: OwnerId,
+        rel_id: u16,
+        mode: Mode,
+        timeout: Option<Duration>,
+    ) -> Reserved {
+        let key = (rel_id as u32).to_le_bytes();
+        let mut t = lock(&self.table);
+        // already reserved by this owner: nothing to acquire again
+        if t.is_granted(owner, series::RELATION, &key) {
+            return Reserved::Granted;
+        }
+        let wait = timeout.is_some();
+        let deadline = timeout.map(|d| now_ms() + d.as_millis() as u64);
+        let verdict = t.enqueue_deadline(owner, series::RELATION, &key, mode, wait, deadline);
+        match verdict {
+            Verdict::Granted => Reserved::Granted,
+            Verdict::Rejected => Reserved::Conflict,
+            Verdict::Deadlock => {
+                stats().deadlocks.fetch_add(1, Ordering::Relaxed);
+                Reserved::Deadlock
+            }
+            Verdict::Waiting => loop {
+                if t.is_granted(owner, series::RELATION, &key) {
+                    break Reserved::Granted;
+                }
+                let left = deadline.unwrap_or(0).saturating_sub(now_ms());
+                if left == 0 {
+                    for (o, s, k) in t.expire(now_ms()) {
+                        let _ = (o, s, k);
+                    }
+                    break Reserved::Conflict;
+                }
+                let (g, _) = self
+                    .wake
+                    .wait_timeout(t, Duration::from_millis(left.min(50)))
+                    .unwrap_or_else(|e| e.into_inner());
+                t = g;
+            },
+        }
     }
 
     /// Wait for transaction `tx` to end, the way a writer that met one
