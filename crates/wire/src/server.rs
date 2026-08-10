@@ -21297,7 +21297,14 @@ fn plan_over_source(
     }
     let computed = Default::default();
     let mut out_cols: Vec<ProjCol> = Vec::new();
-    match parse_projection(&unq(proj_s))? {
+    // the outer projection over a derived source is renumbered HERE: the
+    // derived dispatch returns before the shared renumber_proj_params, so
+    // a projection `?` takes the leading input slots and the WHERE's own
+    // `?` numbers after it - the engine's one textual order. A projection
+    // with no `?` renumbers to zero and nothing changes (CTE/view unaffected)
+    let mut proj_parsed = parse_projection(&unq(proj_s))?;
+    let proj_params = renumber_proj_params(&mut proj_parsed);
+    match proj_parsed {
         Proj::Star => {
             for (i, c) in cols.iter().enumerate() {
                 // the inner relation shines through; the binding alias
@@ -21343,7 +21350,16 @@ fn plan_over_source(
                         out_cols.push(pc);
                     }
                     SelItem::Expr(raw, n, fname) => {
-                        let mut pc = build_expr_col(&raw, &n, &columns, &descs)?;
+                        // a projection `?` (only ever a typed CAST) resolves
+                        // through the param-aware path, filling its reserved
+                        // sink slot; every param-free item takes the ordinary
+                        // resolver, as the plain and join paths do
+                        let mut pc = if raw_has_param(&raw) {
+                            let re = resolve_proj_expr(&raw, &columns, &descs, params)?;
+                            build_expr_col_from(re, &n, &descs)?
+                        } else {
+                            build_expr_col(&raw, &n, &columns, &descs)?
+                        };
                         pc.fname = Some(fname.clone());
                         out_cols.push(pc)
                     }
@@ -21352,7 +21368,8 @@ fn plan_over_source(
             }
         }
     }
-    let mut np = 0usize;
+    // the WHERE's `?` number after the projection's reserved slots
+    let mut np = proj_params;
     let filter = match where_s {
         None => None,
         Some(ws) => Some(resolve_predicate(
@@ -27880,7 +27897,7 @@ fn subst_params_expr(e: &Expr, args: &[WireParam]) -> Option<Expr> {
 /// Does this plan's PROJECTION carry `?` parameters that must be bound?
 fn plan_has_proj_param(plan: &Plan) -> bool {
     let cols = match plan {
-        Plan::Project { cols, .. } | Plan::Join { cols, .. } => cols,
+        Plan::Project { cols, .. } | Plan::Join { cols, .. } | Plan::Derived { cols, .. } => cols,
         _ => return false,
     };
     cols.iter().any(|c| c.expr.as_ref().is_some_and(expr_has_param))
@@ -27891,7 +27908,9 @@ fn plan_has_proj_param(plan: &Plan) -> bool {
 /// before any fetch path evaluates the projection.
 fn bind_plan_params(plan: &Plan, args: &[WireParam]) -> Option<Plan> {
     let mut p = plan.clone();
-    if let Plan::Project { cols, .. } | Plan::Join { cols, .. } = &mut p {
+    if let Plan::Project { cols, .. } | Plan::Join { cols, .. } | Plan::Derived { cols, .. } =
+        &mut p
+    {
         for c in cols.iter_mut() {
             if c.expr.as_ref().is_some_and(expr_has_param) {
                 let e = c.expr.as_ref()?;
