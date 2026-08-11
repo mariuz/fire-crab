@@ -4818,6 +4818,15 @@ AlterDomainRename {
         /// set when the predicate holds a `?`, whose value only arrives
         /// at execute - the bands are built then, from the bound filter
         defer: Option<DeferredAccess>,
+        /// WINDOW output columns (usually empty). Each is a partitioned
+        /// aggregate folded at fetch and appended to every row at
+        /// `win_base + i`; the matching ProjCol in `cols` reads that slot.
+        /// Empty leaves the projection byte-for-byte what it was.
+        windows: Vec<WinSpec>,
+        /// where the window values are appended in a decoded row - past
+        /// every real field and every format's width, so a decoded record
+        /// never collides with them (the generator-slot rule)
+        win_base: usize,
     },
     /// a DERIVED TABLE - `SELECT ... FROM (SELECT ...) X`. The inner
     /// plan produces the rows; the outer projection, WHERE and ORDER BY
@@ -21045,6 +21054,9 @@ fn splice_ctes(sql: &str, ctes: &[(String, ViewDef)]) -> Option<String> {
                             Some(n.to_ascii_uppercase())
                         }
                         SelItem::Agg(_, _, alias) => alias.clone().map(|a| a.to_ascii_uppercase()),
+                        SelItem::Win(_, _, _, alias, fname) => Some(
+                            alias.clone().unwrap_or_else(|| fname.clone()).to_ascii_uppercase(),
+                        ),
                     })
                     .collect::<Option<Vec<_>>>(),
                 Proj::Star => None,
@@ -21559,6 +21571,9 @@ fn parse_with(sql: &str) -> Option<(Vec<(String, ViewDef)>, String, bool)> {
                             SelItem::Agg(_, _, alias) => {
                                 alias.clone().map(|a| a.to_ascii_uppercase())
                             }
+                            SelItem::Win(_, _, _, alias, fname) => Some(
+                                alias.clone().unwrap_or_else(|| fname.clone()).to_ascii_uppercase(),
+                            ),
                         })
                         .collect::<Option<Vec<_>>>(),
                     Proj::Star => None,
@@ -22173,6 +22188,14 @@ fn branch_rows_res(
     if matches!(plan, Plan::Project { gen_cols, .. } if !gen_cols.is_empty()) {
         return Err(EvalErr::Unsupported);
     }
+    // A WINDOWED PROJECT IS NOT A ROW SOURCE HERE either. This destructures
+    // Project with `..` and knows nothing of `windows`, so the window
+    // columns would come back missing. A window nested in a union branch,
+    // a FOR SELECT, INSERT ... SELECT, a derived table or a CTE level
+    // refuses until that path is converted deliberately (its own slice).
+    if matches!(plan, Plan::Project { windows, .. } if !windows.is_empty()) {
+        return Err(EvalErr::Unsupported);
+    }
     // a UNION is a row source too - and so is a nested one, since this
     // recurses. Everything that materialises rows (INSERT ... SELECT, a
     // FOR SELECT loop, a union branch) goes through here, so they all
@@ -22399,6 +22422,14 @@ fn branch_rows_each(
             branch_rows_each(b, db, args, sink)?;
         }
         return Ok(());
+    }
+    // a WINDOWED Project streams its cols here WITHOUT the fold that fills
+    // them (that lives in emit's Project arm), so its window slots would
+    // read back NULL - the silent-wrong-answer the gen_cols guards also
+    // prevent. Refuse it here too: a window nested in a derived table,
+    // CTE or union branch is its own later slice.
+    if matches!(plan, Plan::Project { windows, .. } if !windows.is_empty()) {
+        return Err(EvalErr::Unsupported);
     }
     if let Plan::Project { rel, formats, cols, filter, order_by, index, .. } = plan {
         let filter = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
@@ -23002,6 +23033,12 @@ fn plan_query_inner_ctx(
         if matches!(&plan, Plan::Project { gen_cols, .. } if !gen_cols.is_empty()) {
             return Some(Plan::Refused);
         }
+        // a WINDOW under FIRST/SKIP/DISTINCT materialises through
+        // branch_rows too, which refuses windows - refuse it here at
+        // prepare rather than erroring mid-fetch (its own later slice)
+        if matches!(&plan, Plan::Project { windows, .. } if !windows.is_empty()) {
+            return Some(Plan::Refused);
+        }
         let cols: Vec<ProjCol> = output_cols_of(&plan)
             .iter()
             .enumerate()
@@ -23175,6 +23212,9 @@ fn plan_query_inner_ctx(
                             })),
                             SelItem::Expr(_, n, _) => Some(n.clone()),
                             SelItem::Gen(_, _, n) => Some(n.clone()),
+                            SelItem::Win(_, _, _, alias, fname) => {
+                                Some(alias.clone().unwrap_or_else(|| fname.clone()))
+                            }
                         },
                         Proj::Star => None,
                     }
@@ -23975,7 +24015,7 @@ fn plan_query_inner_ctx(
                 // still spell the `(SELECT` the gatekeeper refuses
                 sql: opt_sql.clone(),
             });
-            return Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols: Vec::new(), index, defer });
+            return Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols: Vec::new(), index, defer, windows: Vec::new(), win_base: 0 });
         }
         Proj::Items(items) => items,
     };
@@ -23995,11 +24035,19 @@ fn plan_query_inner_ctx(
         SelItem::Expr(raw, ..) => raw_contains_gen(raw),
         _ => false,
     });
+    let has_win = items.iter().any(|i| matches!(i, SelItem::Win(..)));
     // a generator advance in the select list needs the row-by-row Project
     // path; a grouped/aggregated query with one is not a shape we answer
     // (the engine's grouped-bump behavior is measured and MESSY - 19
     // bumps for 5 rows - so the refusal is deliberate)
     if has_gen && (has_agg || group_s.is_some() || having_s.is_some()) {
+        return None;
+    }
+    // a WINDOW function rides the row-by-row Project path (one row per
+    // input row). It does NOT mix with the group machinery, a generator
+    // advance or a GROUP BY / HAVING in this first slice - each is a
+    // separate shape the engine folds differently. Refuse the mixes.
+    if has_win && (has_agg || has_gen || group_s.is_some() || having_s.is_some()) {
         return None;
     }
 
@@ -24112,6 +24160,10 @@ fn plan_query_inner_ctx(
         // format's real fields, so a decoded row never collides with them
         let gen_base = formats.iter().map(|(_, d)| d.len()).max().unwrap_or(0).max(descs.len());
         let mut gen_cols: Vec<GenCol> = Vec::new();
+        // window values are appended at the same safe base a generator
+        // slot uses - past every real field of every format
+        let win_base = gen_base;
+        let mut windows: Vec<WinSpec> = Vec::new();
         // Slots are assigned in the ENGINE'S EVALUATION ORDER: items
         // RIGHT-TO-LEFT (probed: `SELECT NEXT VALUE FOR S AS A, NEXT
         // VALUE FOR S AS B` on a fresh sequence answers A=2, B=1 - the
@@ -24150,7 +24202,7 @@ fn plan_query_inner_ctx(
         // both a projection param and a WHERE param now coexist in
         // textual order - nothing to reserve here.
         let items = items;
-        let cols = if has_expr || has_gen {
+        let cols = if has_expr || has_gen || has_win {
             let mut out = Vec::new();
             for (item_idx, it) in items.iter().enumerate() {
                 match it {
@@ -24215,6 +24267,49 @@ fn plan_query_inner_ctx(
                         });
                     }
                     SelItem::Agg(..) => return None, // aggregates route to plan_group
+                    SelItem::Win(func, target, part_raw, alias, _fname) => {
+                        // BUILD THE WINDOW COLUMN THROUGH THE AGGREGATE
+                        // MACHINERY: a window's output describe and fold
+                        // are a bare aggregate's, so feed exactly one
+                        // synthetic `SelItem::Agg` to build_group_items
+                        // (no keys, its own synth base) and take back the
+                        // one ProjCol it types and the one GItem::Agg it
+                        // plans. This inherits every type rule - COUNT is
+                        // BIGINT, MIN/MAX keep the source, SUM widens,
+                        // AVG's scale, the NUMERIC/text/temporal refusals
+                        // - with no second copy to drift.
+                        let mut sink: Vec<Option<Descriptor>> = Vec::new();
+                        let (wc, wg) = build_group_items(
+                            std::slice::from_ref(&SelItem::Agg(
+                                *func,
+                                target.clone(),
+                                alias.clone(),
+                            )),
+                            &columns,
+                            &descs,
+                            &[],
+                            &[],
+                            win_base,
+                            &mut sink,
+                        )?;
+                        let mut pc = wc.into_iter().next()?;
+                        let GItem::Agg(f, src, distinct) = wg.into_iter().next()? else {
+                            return None;
+                        };
+                        // the value lives in the appended slot, read as a
+                        // plain field - never re-evaluated as an expression
+                        pc.field_id = win_base + windows.len();
+                        pc.expr = None;
+                        // PARTITION BY keys resolve over this relation; a
+                        // key naming no column, or one the resolver
+                        // refuses, refuses the whole window
+                        let mut part: Vec<Expr> = Vec::with_capacity(part_raw.len());
+                        for r in part_raw {
+                            part.push(resolve_expr(r, &columns, &descs)?);
+                        }
+                        windows.push(WinSpec { func: f, src, distinct, part });
+                        out.push(pc);
+                    }
                 }
             }
             out
@@ -24304,7 +24399,10 @@ fn plan_query_inner_ctx(
             // branch: the deferred re-plan must not see `(SELECT`
             sql: opt_sql.clone(),
         });
-        return Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols, index, defer });
+        return Some(Plan::Project {
+            rel, formats, cols, filter, order_by, gen_cols, index, defer,
+            windows, win_base,
+        });
     }
 
     // grouped query: GROUP BY, or a multi-aggregate global projection
@@ -24839,6 +24937,9 @@ fn build_group_items(
                 }
             }
             SelItem::Gen(..) => return None,  // generator advances need the Project path
+            // a WINDOW function emits one row per input row, never a
+            // folded group row - it belongs to the Project path, not here
+            SelItem::Win(..) => return None,
             SelItem::Col(name, alias) => {
                 let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
                 let fid = rc.field_id as usize;
@@ -26492,6 +26593,69 @@ fn group_output(
 /// bucketing sort, the per-group fold and HAVING - is the same work
 /// whether the rows came from one relation's pages or from two joined
 /// ones.
+/// Answer every WINDOW column on every input row (see [WinSpec]). For
+/// each window the rows are bucketed by its PARTITION BY keys - NULLs
+/// bucket together, the way [group_rows] groups - and each bucket is
+/// folded by the SAME [compute_group] the grouped path uses; every row in
+/// a bucket is then given that bucket's value. Row ORDER is preserved (a
+/// window does not sort); the values are appended at `win_base`, where the
+/// matching ProjCol reads them. An empty PARTITION BY is one bucket of
+/// every row (`OVER ()`). A fold's per-row evaluation error (a divide by
+/// zero in `SUM(A / 0) OVER (...)`) aborts the fetch, as it does grouped.
+fn compute_windows(
+    mut rows: Vec<Vec<Value>>,
+    windows: &[WinSpec],
+    win_base: usize,
+) -> Result<Vec<Vec<Value>>, EvalErr> {
+    let n = rows.len();
+    // per-row value of each window, filled bucket by bucket
+    let mut vals: Vec<Vec<Value>> = vec![vec![Value::Null; windows.len()]; n];
+    for (wi, spec) in windows.iter().enumerate() {
+        // the partition key of each row, evaluated over the ORIGINAL row
+        let mut keyrows: Vec<Vec<Value>> = Vec::with_capacity(n);
+        for r in &rows {
+            let mut k = Vec::with_capacity(spec.part.len());
+            for e in &spec.part {
+                k.push(e.eval(r)?);
+            }
+            keyrows.push(k);
+        }
+        let keys: Vec<OrderKey> = (0..spec.part.len())
+            .map(|i| OrderKey::field(i, false, NullsAt::Default))
+            .collect();
+        let gi = [GItem::Agg(spec.func, spec.src.clone(), spec.distinct)];
+        let mut done = vec![false; n];
+        for i in 0..n {
+            if done[i] {
+                continue;
+            }
+            // gather this partition's row indices (order_cmp over the key
+            // rows is the same equality the grouped bucketing uses, so an
+            // all-NULL key groups with another all-NULL key)
+            let mut idxs = vec![i];
+            done[i] = true;
+            for j in (i + 1)..n {
+                if !done[j]
+                    && order_cmp(&keyrows[i], &keyrows[j], &keys) == std::cmp::Ordering::Equal
+                {
+                    idxs.push(j);
+                    done[j] = true;
+                }
+            }
+            let bucket: Vec<Vec<Value>> = idxs.iter().map(|&k| rows[k].clone()).collect();
+            let v = compute_group(&bucket, &gi)?.into_iter().next().unwrap_or(Value::Null);
+            for &k in &idxs {
+                vals[k][wi] = v.clone();
+            }
+        }
+    }
+    for (i, r) in rows.iter_mut().enumerate() {
+        r.resize(win_base, Value::Null);
+        r.extend(std::mem::take(&mut vals[i]));
+    }
+    Ok(rows)
+}
+
 fn group_rows(
     mut input: Vec<Vec<Value>>,
     gitems: &[GItem],
@@ -28158,11 +28322,12 @@ fn emit_rows_inner(
                 // silently wrong answer for every good one.
                 if let Plan::Project {
                     rel, formats, cols: icols, filter, order_by, gen_cols, index, defer,
+                    windows, ..
                 } = &**inner
                 {
-                    // a generator-advancing Project keeps the
+                    // a generator-advancing OR windowed Project keeps the
                     // branch_rows refusal below - see that function
-                    if gen_cols.is_empty() {
+                    if gen_cols.is_empty() && windows.is_empty() {
                         if !*distinct && order_by.is_empty() {
                             let filter = bind_filter(filter, args)?;
                             let descs_now: Vec<Descriptor> = formats
@@ -28373,6 +28538,8 @@ fn emit_rows_inner(
             gen_cols,
             index,
             defer,
+            windows,
+            win_base,
         } => {
             if let Some(db) = db {
                 let filter = bind_filter(filter, args)?;
@@ -28396,7 +28563,33 @@ fn emit_rows_inner(
                         Some(p) => p.matches(v),
                     }
                 };
-                if !gen_cols.is_empty() {
+                if !windows.is_empty() {
+                    // WINDOW FUNCTIONS: the whole filtered set has to be in
+                    // hand before any partition can fold, so this
+                    // materialises (unlike the streaming branches below),
+                    // computes each window over its partition, appends the
+                    // values, then sorts into OUTPUT order and projects.
+                    // The scan and filter are the same row-source leaf the
+                    // ordinary fetch uses; only the fold and the append are
+                    // new. gen_cols is empty here (the mix refuses at plan).
+                    let base = RowSource::scan_filter_sort(
+                        *rel,
+                        formats.clone(),
+                        filter.clone(),
+                        Vec::new(),
+                        index.clone(),
+                    )
+                    .rows(db)
+                    .map_err(EmitErr::Eval)?;
+                    let mut rows =
+                        compute_windows(base, windows, *win_base).map_err(EmitErr::Eval)?;
+                    if !order_by.is_empty() {
+                        sort_rows(&mut rows, order_by).map_err(EmitErr::Eval)?;
+                    }
+                    for values in &rows {
+                        encode_row(w, cols, values, out)?;
+                    }
+                } else if !gen_cols.is_empty() {
                     // a generator advance per row: materialise, sort into
                     // OUTPUT order, then advance each generator once per row
                     // in that order (the engine evaluates NEXT VALUE FOR /
@@ -28517,10 +28710,14 @@ fn emit_rows_inner(
                     // the engine too, so blocking there is its behaviour
                     // rather than a shortfall - and it falls through.
                     if let Plan::Project {
-                        rel, formats, cols: icols, filter: ifilter, index, gen_cols, ..
+                        rel, formats, cols: icols, filter: ifilter, index, gen_cols, windows, ..
                     } = &**inner
                     {
-                        let rkeys: Option<Vec<OrderKey>> = if gen_cols.is_empty() {
+                        // a windowed inner cannot re-express its keys over
+                        // BASE RECORDS (the window value is not a record
+                        // field), so it falls through to the materialising
+                        // path, which refuses it - the derived-window slice
+                        let rkeys: Option<Vec<OrderKey>> = if gen_cols.is_empty() && windows.is_empty() {
                             order_by
                                 .iter()
                                 .map(|k| {
@@ -29589,6 +29786,17 @@ enum SelItem {
     /// (step None) or `GEN_ID(<name>, <n>)` (step Some(n)) - evaluated
     /// once per emitted row (see [GenCol]), with its output column name
     Gen(String, Option<i64>, String),
+    /// a WINDOW function - `<agg>(arg) OVER ( [PARTITION BY exprs] )`. The
+    /// aggregate and its argument (parsed like a bare aggregate), the
+    /// PARTITION BY expressions (empty = the whole result is one
+    /// partition), the output column name (the alias when there is one)
+    /// and the symbolic field name (the function - COUNT/SUM/...). Unlike
+    /// [SelItem::Agg] it emits one row PER INPUT ROW: the aggregate is
+    /// computed over each row's partition and answered on every row. This
+    /// first slice answers the WHOLE-PARTITION frame only; an ORDER BY or
+    /// a frame clause inside the OVER, a ranking function (ROW_NUMBER,
+    /// RANK) or a navigation one (LAG, LEAD) refuse at parse.
+    Win(AggFn, AggTarget, Vec<RawExpr>, Option<String>, String),
 }
 
 /// A generator-advancing output column of a [Plan::Project]: `name` is
@@ -29603,6 +29811,24 @@ struct GenCol {
     name: String,
     step: Option<i64>,
     value_index: usize,
+}
+
+/// A WINDOW output column of a [Plan::Project] (see [SelItem::Win]). The
+/// aggregate to fold and its per-row source, whether it is a DISTINCT
+/// fold, and the resolved PARTITION BY key expressions (empty = the whole
+/// result is one partition). At fetch the rows are bucketed by these keys
+/// (NULLs bucket together, as GROUP BY does), each bucket is folded by the
+/// SAME [compute_group] the grouped path uses, and every row in a bucket
+/// is answered that bucket's value - which is why the output has one row
+/// per INPUT row, not per bucket. The value is appended to each row at
+/// `win_base + <this window's index>`, where the matching ProjCol reads
+/// it (a plain `field_id`, `expr: None`).
+#[derive(Clone)]
+struct WinSpec {
+    func: AggFn,
+    src: AggSrc,
+    distinct: bool,
+    part: Vec<Expr>,
 }
 
 /// A select-list expression before column names are resolved to field
@@ -35128,7 +35354,7 @@ fn plan_correlated_select(
         table: table.to_string(),
         sql: opt_sql.clone().unwrap_or_default(),
     });
-    Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols: Vec::new(), index, defer })
+    Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols: Vec::new(), index, defer, windows: Vec::new(), win_base: 0 })
 }
 
 /// The (field name, alias) a subquery's own select item gives its
@@ -35159,6 +35385,9 @@ fn subquery_item_name(sub: &str) -> Option<(String, String)> {
                 if step.is_none() { "NEXT_VALUE" } else { "GEN_ID" }.to_string(),
                 n.clone(),
             )),
+            SelItem::Win(_, _, _, alias, fname) => {
+                Some((fname.clone(), alias.clone().unwrap_or_else(|| fname.clone())))
+            }
         },
         Proj::Star => None,
     }
@@ -36600,6 +36829,77 @@ fn agg_named(word: &str) -> bool {
     )
 }
 
+/// Parse a WINDOW select item - `<agg>(arg) OVER ( [PARTITION BY ...] )`.
+/// Returns the aggregate, its argument (as [parse_agg_item] reads it) and
+/// the PARTITION BY expressions (empty for `OVER ()`).
+///
+/// FIRST SLICE - the WHOLE-PARTITION frame only. An ORDER BY or an
+/// explicit frame (ROWS/RANGE/GROUPS) inside the OVER answers a RUNNING
+/// value the fold here does not compute, so it refuses; a ranking
+/// (ROW_NUMBER/RANK) or navigation (LAG/LEAD) function is not an
+/// aggregate and `parse_agg_item` refuses it. A refusal here drops the
+/// item to the ordinary paths, which fail the projection - the engine's
+/// "not a valid expression" for a shape this build does not answer.
+fn parse_window_item(body: &str) -> Option<(AggFn, AggTarget, Vec<RawExpr>)> {
+    let t = body.trim();
+    let bytes = t.as_bytes();
+    // the aggregate call's own parentheses come first
+    let lp = t.find('(')?;
+    let call_end = matching_paren(bytes, lp)?;
+    let after = t[call_end + 1..].trim_start();
+    // ... then the OVER keyword, as its own word (followed by space or the
+    // spec's opening paren), then the spec in parentheses
+    let rest = after.get(..4).filter(|w| w.eq_ignore_ascii_case("OVER"))?;
+    let _ = rest;
+    let tail = after[4..].trim_start();
+    if !tail.starts_with('(') {
+        return None;
+    }
+    // the OVER's parentheses must close at the very end of the item -
+    // nothing may trail them
+    let over_lp = t.len() - tail.len();
+    let over_end = matching_paren(bytes, over_lp)?;
+    if !t[over_end + 1..].trim().is_empty() {
+        return None;
+    }
+    let (func, target) = parse_agg_item(t[..=call_end].trim())?;
+    let spec = t[over_lp + 1..over_end].trim();
+    let part = parse_over_spec(spec)?;
+    Some((func, target, part))
+}
+
+/// Parse the inside of an `OVER ( ... )` for the whole-partition slice:
+/// nothing (one partition), or `PARTITION BY <expr>[, <expr>]`. An ORDER
+/// BY or a frame keyword refuses (a later slice).
+fn parse_over_spec(spec: &str) -> Option<Vec<RawExpr>> {
+    let s = spec.trim();
+    if s.is_empty() {
+        return Some(Vec::new());
+    }
+    // a running frame or an in-partition order is a separate slice; refuse
+    // it rather than answer a whole-partition value where the engine
+    // answers a running one. Matched with surrounding spaces so a column
+    // spelled RANGE/ROWS (quoted) is not caught.
+    let padded = format!(" {} ", s.to_ascii_uppercase());
+    for kw in [" ORDER BY ", " ROWS ", " RANGE ", " GROUPS "] {
+        if padded.contains(kw) {
+            return None;
+        }
+    }
+    // the only thing left is a PARTITION BY list
+    let rest = s.get(..12).filter(|w| w.eq_ignore_ascii_case("PARTITION BY"))?;
+    let _ = rest;
+    let list = s[12..].trim();
+    if list.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for part in split_top_level_commas(list) {
+        out.push(parse_raw_expr_any(part.trim())?);
+    }
+    Some(out)
+}
+
 fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
     let t = item.trim();
     let open = t.find('(')?;
@@ -36676,6 +36976,24 @@ fn parse_projection(proj: &str) -> Option<Proj> {
             }
         };
         let alias_owned = alias.map(alias_name);
+        // a WINDOW function - `<agg>(arg) OVER (...)` - BEFORE the plain
+        // aggregate check: `SUM(V) OVER (...)` is not a bare aggregate,
+        // and asking parse_agg_item about the whole body would read the
+        // OVER as part of a (failing) expression argument
+        if let Some((func, target, part)) = parse_window_item(body) {
+            // the engine titles a window column by its function unless
+            // aliased, exactly as a bare aggregate (probed: COUNT/SUM/...)
+            let fname = match func {
+                AggFn::Count => "COUNT",
+                AggFn::Min => "MIN",
+                AggFn::Max => "MAX",
+                AggFn::Sum => "SUM",
+                AggFn::Avg => "AVG",
+            }
+            .to_string();
+            items.push(SelItem::Win(func, target, part, alias_owned, fname));
+            continue;
+        }
         if let Some((func, target)) = parse_agg_item(body) {
             items.push(SelItem::Agg(func, target, alias_owned));
             continue;
@@ -48606,6 +48924,7 @@ mod tests {
                     SelItem::Agg(..) => "<agg>".into(),
                     SelItem::Expr(_, name, _) => format!("<expr:{}>", name),
                     SelItem::Gen(n, s, _) => format!("<gen:{}:{:?}>", n, s),
+                    SelItem::Win(_, _, _, _, f) => format!("<win:{}>", f),
                 })
                 .collect(),
         }
@@ -51722,6 +52041,7 @@ mod tests {
                     }
                     SelItem::Expr(_, n, _) => format!("expr:{n}"),
                     SelItem::Gen(_, _, n) => format!("gen:{n}"),
+                    SelItem::Win(_, _, _, _, f) => format!("win:{f}"),
                 })
                 .collect()
         };
@@ -52594,6 +52914,7 @@ mod tests {
                     SelItem::Expr(_, n, _) => format!("expr:{}", n),
                     SelItem::Agg(..) => "agg".into(),
                     SelItem::Gen(n, s, _) => format!("gen:{}:{:?}", n, s),
+                    SelItem::Win(_, _, _, _, f) => format!("win:{}", f),
                 })
                 .collect::<Vec<_>>(),
             Proj::Star => vec!["*".into()],
