@@ -25,11 +25,14 @@
 # `LAG(arg [, offset [, default]]) OVER ( [PARTITION BY ...] ORDER BY ...)`
 # - reading a row `offset` positions back (LAG) or forward (LEAD), the
 # default (else NULL) off the partition's ends, describing as the
-# argument's own type.
+# argument's own type; and the VALUE functions FIRST_VALUE / LAST_VALUE /
+# NTH_VALUE, reading a frame row under the default RANGE frame -
+# FIRST_VALUE the partition's first row, LAST_VALUE the current row's last
+# peer, NTH_VALUE(n) the nth frame row (NULL if fewer).
 #
 # SCOPE. An AGGREGATE window with no ORDER BY is the whole-partition
 # frame; with one it is a RUNNING aggregate (default RANGE, peers share).
-# LAG/LEAD need an ORDER BY (the offset is along it). An EXPLICIT frame
+# LAG/LEAD and FIRST/LAST/NTH_VALUE need an ORDER BY. An EXPLICIT frame
 # (ROWS/RANGE BETWEEN ...) is a later slice. Still refused, each its own
 # slice: a window over a JOIN or a derived / CTE / union-branch row
 # source, a window mixed with GROUP BY, and a `?` inside a window. Every
@@ -138,6 +141,15 @@ both "LAG partition"           "SELECT ID, G, LAG(V) OVER (PARTITION BY G ORDER 
 both "LAG text arg"            "SELECT ID, LAG(NM) OVER (ORDER BY ID) L FROM T ORDER BY ID"
 both "LAG expression arg"      "SELECT ID, LAG(V*2) OVER (ORDER BY ID) L FROM T ORDER BY ID"
 both "LAG + LEAD + ranking"    "SELECT ID, LAG(V) OVER (ORDER BY ID) LA, LEAD(V) OVER (ORDER BY ID) LE, ROW_NUMBER() OVER (ORDER BY ID) RN FROM T ORDER BY ID"
+# --- value functions (FIRST_VALUE / LAST_VALUE / NTH_VALUE), default frame ---
+both "FIRST_VALUE"             "SELECT ID, FIRST_VALUE(V) OVER (ORDER BY V, ID) F FROM T ORDER BY V, ID"
+both "LAST_VALUE peers"        "SELECT ID, V, LAST_VALUE(V) OVER (ORDER BY V) L FROM T ORDER BY V, ID"
+both "LAST_VALUE(ID) peers"    "SELECT ID, V, LAST_VALUE(ID) OVER (ORDER BY V) L FROM T ORDER BY V, ID"
+both "NTH_VALUE(V,2)"          "SELECT ID, NTH_VALUE(V,2) OVER (ORDER BY V, ID) N FROM T ORDER BY V, ID"
+both "FIRST_VALUE partition"   "SELECT ID, G, FIRST_VALUE(V) OVER (PARTITION BY G ORDER BY V, ID) F FROM T ORDER BY G, V, ID"
+both "LAST_VALUE partition"    "SELECT ID, G, LAST_VALUE(V) OVER (PARTITION BY G ORDER BY V) L FROM T ORDER BY G, V, ID"
+both "FIRST_VALUE text"        "SELECT ID, FIRST_VALUE(NM) OVER (ORDER BY V, ID) F FROM T ORDER BY V, ID"
+both "value fns + LAG"         "SELECT ID, FIRST_VALUE(V) OVER (ORDER BY ID) F, LAST_VALUE(V) OVER (ORDER BY ID) L, NTH_VALUE(V,2) OVER (ORDER BY ID) N, LAG(V) OVER (ORDER BY ID) LG FROM T ORDER BY ID"
 
 echo "ran $ran checks"
 exit $fail

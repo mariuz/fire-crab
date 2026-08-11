@@ -5144,6 +5144,23 @@ enum NavFn {
     Lead,
 }
 
+/// A VALUE window function - one whose value is a FRAME row's, read by
+/// position within the default frame (RANGE UNBOUNDED PRECEDING .. CURRENT
+/// ROW, so the frame ends at the current row's last peer). Describes as
+/// the argument's own type, Nullable, named FIRST_VALUE/LAST_VALUE/
+/// NTH_VALUE (probed).
+#[derive(Clone, Copy, PartialEq)]
+enum ValFn {
+    /// the argument at the FIRST frame row - the partition's first ordered
+    /// row (the frame starts at UNBOUNDED PRECEDING)
+    FirstValue,
+    /// the argument at the LAST frame row - the current row's last peer
+    LastValue,
+    /// the argument at the Nth frame row (1-based), NULL if the frame holds
+    /// fewer than N rows
+    NthValue,
+}
+
 /// The function a window column computes. An [AggFn] fold over a partition
 /// (the whole-partition or, with an ORDER BY, the running frame), a
 /// [RankFn] position within the ordered partition, or a [NavFn] read of
@@ -5157,6 +5174,9 @@ enum WinFunc {
     /// (function, argument, offset, default) - `LAG(arg [, offset
     /// [, default]])`; offset defaults to 1, default to NULL
     Nav(NavFn, RawExpr, usize, Option<RawExpr>),
+    /// (function, argument, N) - `FIRST_VALUE(arg)`, `LAST_VALUE(arg)`,
+    /// `NTH_VALUE(arg, n)`; N is Some only for NTH_VALUE
+    Val(ValFn, RawExpr, Option<usize>),
 }
 
 /// What an aggregate is computed over.
@@ -24421,6 +24441,25 @@ fn plan_query_inner_ctx(
                                 pc.expr = None;
                                 (pc, WinKind::Nav { func: *nf, arg, offset: *offset, default })
                             }
+                            // A VALUE window (FIRST_VALUE/LAST_VALUE/
+                            // NTH_VALUE) reads a FRAME row by position, so it
+                            // needs the order too; it describes as its
+                            // argument's own type, Nullable (probed).
+                            WinFunc::Val(vf, arg_raw, nn) => {
+                                if order.is_empty() {
+                                    return None; // a value function needs the frame order
+                                }
+                                let arg = resolve_expr(arg_raw, &columns, &descs)?;
+                                let mut pc =
+                                    build_expr_col_from(arg.clone(), &fname, &descs)?;
+                                pc.name = alias.clone().unwrap_or_else(|| fname.clone());
+                                pc.fname = Some(fname.clone());
+                                pc.relation = None;
+                                pc.rel_alias = None;
+                                pc.field_id = win_base + windows.len();
+                                pc.expr = None;
+                                (pc, WinKind::Val { func: *vf, arg, n: *nn })
+                            }
                         };
                         windows.push(WinSpec { kind, part, order });
                         out.push(pc);
@@ -26887,6 +26926,53 @@ fn compute_windows(
                             None => match default {
                                 Some(d) => d.eval(&rows[cur])?,
                                 None => Value::Null,
+                            },
+                        };
+                    }
+                }
+                WinKind::Val { func, arg, n } => {
+                    // order the partition, mark each row's peer-group END -
+                    // the default frame runs from the start THROUGH the
+                    // current row's last peer (RANGE .. CURRENT ROW)
+                    let mut perm: Vec<usize> = (0..idxs.len()).collect();
+                    perm.sort_by(|&a, &b| {
+                        order_cmp(&ordrows[idxs[a]], &ordrows[idxs[b]], &okeys)
+                    });
+                    let len = perm.len();
+                    let mut peer_end = vec![0usize; len];
+                    let mut s = 0usize;
+                    while s < len {
+                        let mut e = s;
+                        while e + 1 < len
+                            && order_cmp(
+                                &ordrows[idxs[perm[e + 1]]],
+                                &ordrows[idxs[perm[s]]],
+                                &okeys,
+                            ) == Equal
+                        {
+                            e += 1;
+                        }
+                        for p in s..=e {
+                            peer_end[p] = e;
+                        }
+                        s = e + 1;
+                    }
+                    for pos in 0..len {
+                        let cur = idxs[perm[pos]];
+                        vals[cur][wi] = match func {
+                            // frame start is UNBOUNDED PRECEDING - always
+                            // the partition's first ordered row
+                            ValFn::FirstValue => arg.eval(&rows[idxs[perm[0]]])?,
+                            // frame end is the current row's last peer
+                            ValFn::LastValue => {
+                                arg.eval(&rows[idxs[perm[peer_end[pos]]]])?
+                            }
+                            // the Nth frame row (1-based), NULL past the end
+                            ValFn::NthValue => match n {
+                                Some(k) if *k >= 1 && *k - 1 <= peer_end[pos] => {
+                                    arg.eval(&rows[idxs[perm[*k - 1]]])?
+                                }
+                                _ => Value::Null,
                             },
                         };
                     }
@@ -30089,6 +30175,10 @@ enum WinKind {
     /// ordered partition, or `default` (else NULL) when that row is outside
     /// the partition
     Nav { func: NavFn, arg: Expr, offset: usize, default: Option<Expr> },
+    /// `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`: `arg` read from a row
+    /// selected by position within the default frame (partition start
+    /// through the current row's last peer)
+    Val { func: ValFn, arg: Expr, n: Option<usize> },
 }
 
 /// A select-list expression before column names are resolved to field
@@ -37131,6 +37221,8 @@ fn parse_window_item(body: &str) -> Option<(WinFunc, Vec<RawExpr>, Option<String
         WinFunc::Rank(rk)
     } else if let Some((nf, arg, off, def)) = parse_nav_call(call) {
         WinFunc::Nav(nf, arg, off, def)
+    } else if let Some((vf, arg, nn)) = parse_val_call(call) {
+        WinFunc::Val(vf, arg, nn)
     } else {
         let (f, target) = parse_agg_item(call)?;
         WinFunc::Agg(f, target)
@@ -37195,6 +37287,45 @@ fn parse_nav_call(call: &str) -> Option<(NavFn, RawExpr, usize, Option<RawExpr>)
         Some(s) => Some(parse_raw_expr_any(s)?),
     };
     Some((f, arg, offset, default))
+}
+
+/// `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE` - `<fn>( arg )` for the first
+/// two, `NTH_VALUE( arg, n )` for the third with `n` a positive integer
+/// LITERAL. Returns the function, the argument and N (Some only for
+/// NTH_VALUE).
+fn parse_val_call(call: &str) -> Option<(ValFn, RawExpr, Option<usize>)> {
+    let t = call.trim();
+    let open = t.find('(')?;
+    if !t.ends_with(')') {
+        return None;
+    }
+    let f = match t[..open].trim().to_ascii_uppercase().as_str() {
+        "FIRST_VALUE" => ValFn::FirstValue,
+        "LAST_VALUE" => ValFn::LastValue,
+        "NTH_VALUE" => ValFn::NthValue,
+        _ => return None,
+    };
+    let args: Vec<&str> = split_top_level_commas(t[open + 1..t.len() - 1].trim())
+        .into_iter()
+        .map(str::trim)
+        .collect();
+    match f {
+        ValFn::NthValue => {
+            if args.len() != 2 || args[0].is_empty() {
+                return None;
+            }
+            let arg = parse_raw_expr_any(args[0])?;
+            // N is a 1-based positive integer literal
+            let n = args[1].parse::<usize>().ok().filter(|&k| k >= 1)?;
+            Some((f, arg, Some(n)))
+        }
+        _ => {
+            if args.len() != 1 || args[0].is_empty() {
+                return None;
+            }
+            Some((f, parse_raw_expr_any(args[0])?, None))
+        }
+    }
 }
 
 /// Parse the inside of an `OVER ( ... )`: an optional `PARTITION BY
@@ -37346,6 +37477,9 @@ fn parse_projection(proj: &str) -> Option<Proj> {
                 WinFunc::Rank(RankFn::DenseRank) => "DENSE_RANK",
                 WinFunc::Nav(NavFn::Lag, ..) => "LAG",
                 WinFunc::Nav(NavFn::Lead, ..) => "LEAD",
+                WinFunc::Val(ValFn::FirstValue, ..) => "FIRST_VALUE",
+                WinFunc::Val(ValFn::LastValue, ..) => "LAST_VALUE",
+                WinFunc::Val(ValFn::NthValue, ..) => "NTH_VALUE",
             }
             .to_string();
             items.push(SelItem::Win(func, part, order, alias_owned, fname));
