@@ -24487,7 +24487,7 @@ fn plan_query_inner_ctx(
                                 pc.rel_alias = None;
                                 pc.field_id = win_base + windows.len();
                                 pc.expr = None;
-                                (pc, WinKind::Val { func: *vf, arg, n: *nn })
+                                (pc, WinKind::Val { func: *vf, arg, n: *nn, frame: frame.clone() })
                             }
                         };
                         windows.push(WinSpec { kind, part, order });
@@ -26997,9 +26997,9 @@ fn compute_windows(
                         };
                     }
                 }
-                WinKind::Val { func, arg, n } => {
+                WinKind::Val { func, arg, n, frame } => {
                     // order the partition, mark each row's peer-group END -
-                    // the default frame runs from the start THROUGH the
+                    // the DEFAULT frame runs from the start THROUGH the
                     // current row's last peer (RANGE .. CURRENT ROW)
                     let mut perm: Vec<usize> = (0..idxs.len()).collect();
                     perm.sort_by(|&a, &b| {
@@ -27024,23 +27024,43 @@ fn compute_windows(
                         }
                         s = e + 1;
                     }
+                    let leni = len as isize;
+                    let at = |b: &FrameBound, pos: isize| -> isize {
+                        match b {
+                            FrameBound::UnboundedPreceding => 0,
+                            FrameBound::Preceding(k) => pos - *k as isize,
+                            FrameBound::CurrentRow => pos,
+                            FrameBound::Following(k) => pos + *k as isize,
+                            FrameBound::UnboundedFollowing => leni - 1,
+                        }
+                    };
                     for pos in 0..len {
                         let cur = idxs[perm[pos]];
-                        vals[cur][wi] = match func {
-                            // frame start is UNBOUNDED PRECEDING - always
-                            // the partition's first ordered row
-                            ValFn::FirstValue => arg.eval(&rows[idxs[perm[0]]])?,
-                            // frame end is the current row's last peer
-                            ValFn::LastValue => {
-                                arg.eval(&rows[idxs[perm[peer_end[pos]]]])?
+                        // the frame as [lo, hi] physical indices: an explicit
+                        // ROWS frame's clamped bounds, else the default
+                        // [start .. current peer end]
+                        let (lo, hi) = match frame {
+                            Some(fr) => (
+                                at(&fr.start, pos as isize).max(0),
+                                at(&fr.end, pos as isize).min(leni - 1),
+                            ),
+                            None => (0, peer_end[pos] as isize),
+                        };
+                        vals[cur][wi] = if lo > hi {
+                            Value::Null // empty frame
+                        } else {
+                            match func {
+                                ValFn::FirstValue => arg.eval(&rows[idxs[perm[lo as usize]]])?,
+                                ValFn::LastValue => arg.eval(&rows[idxs[perm[hi as usize]]])?,
+                                // the Nth frame row (1-based from the frame
+                                // START), NULL past the frame end
+                                ValFn::NthValue => match n {
+                                    Some(k) if *k >= 1 && lo + (*k as isize - 1) <= hi => {
+                                        arg.eval(&rows[idxs[perm[(lo + *k as isize - 1) as usize]]])?
+                                    }
+                                    _ => Value::Null,
+                                },
                             }
-                            // the Nth frame row (1-based), NULL past the end
-                            ValFn::NthValue => match n {
-                                Some(k) if *k >= 1 && *k - 1 <= peer_end[pos] => {
-                                    arg.eval(&rows[idxs[perm[*k - 1]]])?
-                                }
-                                _ => Value::Null,
-                            },
                         };
                     }
                 }
@@ -30251,7 +30271,7 @@ enum WinKind {
     /// `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`: `arg` read from a row
     /// selected by position within the default frame (partition start
     /// through the current row's last peer)
-    Val { func: ValFn, arg: Expr, n: Option<usize> },
+    Val { func: ValFn, arg: Expr, n: Option<usize>, frame: Option<Frame> },
 }
 
 /// A select-list expression before column names are resolved to field
@@ -37306,11 +37326,11 @@ fn parse_window_item(
     let (part, order, frame) = parse_over_spec(spec)?;
     // an aggregate window with an ORDER BY is a RUNNING aggregate under the
     // default RANGE frame (peers share); with none it is the whole
-    // partition. An explicit ROWS frame is answered too - but ONLY on an
-    // aggregate (ranking/navigation/value functions take no frame here),
-    // and only WITH an ORDER BY (the frame is relative to it).
+    // partition. An explicit ROWS frame is answered on an AGGREGATE or a
+    // VALUE function (FIRST/LAST/NTH_VALUE) - ranking and navigation take
+    // no frame - and only WITH an ORDER BY (the frame is relative to it).
     if frame.is_some() {
-        if !matches!(func, WinFunc::Agg(..)) || order.is_none() {
+        if !matches!(func, WinFunc::Agg(..) | WinFunc::Val(..)) || order.is_none() {
             return None;
         }
     }
