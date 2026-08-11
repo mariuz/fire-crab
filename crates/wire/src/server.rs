@@ -5161,6 +5161,27 @@ enum ValFn {
     NthValue,
 }
 
+/// One edge of an explicit `ROWS` window frame, as a PHYSICAL-ROW offset
+/// from the current row in the ordered partition.
+#[derive(Clone, Copy, PartialEq)]
+enum FrameBound {
+    UnboundedPreceding,
+    Preceding(usize),
+    CurrentRow,
+    Following(usize),
+    UnboundedFollowing,
+}
+
+/// An explicit `ROWS BETWEEN <start> AND <end>` frame (the `ROWS <start>`
+/// shorthand fills `end` with CURRENT ROW). Only `ROWS` is answered here;
+/// an explicit `RANGE`/`GROUPS` frame with offsets is a later slice, and
+/// NO explicit frame keeps the default (running RANGE / whole partition).
+#[derive(Clone)]
+struct Frame {
+    start: FrameBound,
+    end: FrameBound,
+}
+
 /// The function a window column computes. An [AggFn] fold over a partition
 /// (the whole-partition or, with an ORDER BY, the running frame), a
 /// [RankFn] position within the ordered partition, or a [NavFn] read of
@@ -21117,7 +21138,7 @@ fn splice_ctes(sql: &str, ctes: &[(String, ViewDef)]) -> Option<String> {
                             Some(n.to_ascii_uppercase())
                         }
                         SelItem::Agg(_, _, alias) => alias.clone().map(|a| a.to_ascii_uppercase()),
-                        SelItem::Win(_, _, _, alias, fname) => Some(
+                        SelItem::Win(_, _, _, _, alias, fname) => Some(
                             alias.clone().unwrap_or_else(|| fname.clone()).to_ascii_uppercase(),
                         ),
                     })
@@ -21634,7 +21655,7 @@ fn parse_with(sql: &str) -> Option<(Vec<(String, ViewDef)>, String, bool)> {
                             SelItem::Agg(_, _, alias) => {
                                 alias.clone().map(|a| a.to_ascii_uppercase())
                             }
-                            SelItem::Win(_, _, _, alias, fname) => Some(
+                            SelItem::Win(_, _, _, _, alias, fname) => Some(
                                 alias.clone().unwrap_or_else(|| fname.clone()).to_ascii_uppercase(),
                             ),
                         })
@@ -23275,7 +23296,7 @@ fn plan_query_inner_ctx(
                             })),
                             SelItem::Expr(_, n, _) => Some(n.clone()),
                             SelItem::Gen(_, _, n) => Some(n.clone()),
-                            SelItem::Win(_, _, _, alias, fname) => {
+                            SelItem::Win(_, _, _, _, alias, fname) => {
                                 Some(alias.clone().unwrap_or_else(|| fname.clone()))
                             }
                         },
@@ -24330,7 +24351,7 @@ fn plan_query_inner_ctx(
                         });
                     }
                     SelItem::Agg(..) => return None, // aggregates route to plan_group
-                    SelItem::Win(func, part_raw, order_raw, alias, fname) => {
+                    SelItem::Win(func, part_raw, order_raw, frame, alias, fname) => {
                         // PARTITION BY keys resolve over this relation; a
                         // key naming no column, or one the resolver
                         // refuses, refuses the whole window
@@ -24390,7 +24411,15 @@ fn plan_query_inner_ctx(
                                 };
                                 pc.field_id = win_base + windows.len();
                                 pc.expr = None;
-                                (pc, WinKind::Agg { func: gf, src, distinct })
+                                (
+                                    pc,
+                                    WinKind::Agg {
+                                        func: gf,
+                                        src,
+                                        distinct,
+                                        frame: frame.clone(),
+                                    },
+                                )
                             }
                             // A RANKING WINDOW answers a NOT-NULLABLE BIGINT
                             // named by the function (probed: 580, no Nullable
@@ -26823,9 +26852,47 @@ fn compute_windows(
                 }
             }
             match &spec.kind {
-                WinKind::Agg { func, src, distinct } => {
+                WinKind::Agg { func, src, distinct, frame } => {
                     let gi = [GItem::Agg(*func, src.clone(), *distinct)];
-                    if spec.order.is_empty() {
+                    if let Some(fr) = frame {
+                        // EXPLICIT ROWS FRAME: order the partition, then
+                        // each row folds the PHYSICAL rows its frame bounds
+                        // select (clamped to the partition; an empty frame
+                        // folds no rows - COUNT 0, the rest NULL). Order is
+                        // guaranteed non-empty (checked at plan).
+                        let mut perm: Vec<usize> = (0..idxs.len()).collect();
+                        perm.sort_by(|&a, &b| {
+                            order_cmp(&ordrows[idxs[a]], &ordrows[idxs[b]], &okeys)
+                        });
+                        let len = perm.len() as isize;
+                        let at = |b: &FrameBound, pos: isize| -> isize {
+                            match b {
+                                FrameBound::UnboundedPreceding => 0,
+                                FrameBound::Preceding(k) => pos - *k as isize,
+                                FrameBound::CurrentRow => pos,
+                                FrameBound::Following(k) => pos + *k as isize,
+                                FrameBound::UnboundedFollowing => len - 1,
+                            }
+                        };
+                        for pos in 0..perm.len() {
+                            let lo = at(&fr.start, pos as isize).max(0);
+                            let hi = at(&fr.end, pos as isize).min(len - 1);
+                            let v = if lo > hi {
+                                // empty frame: fold over no rows
+                                compute_group(&[], &gi)?
+                                    .into_iter()
+                                    .next()
+                                    .unwrap_or(Value::Null)
+                            } else {
+                                let win: Vec<Vec<Value>> = perm[lo as usize..=hi as usize]
+                                    .iter()
+                                    .map(|&p| rows[idxs[p]].clone())
+                                    .collect();
+                                compute_group(&win, &gi)?.into_iter().next().unwrap_or(Value::Null)
+                            };
+                            vals[idxs[perm[pos]]][wi] = v;
+                        }
+                    } else if spec.order.is_empty() {
                         // WHOLE-PARTITION frame: one fold for every row
                         let bucket: Vec<Vec<Value>> =
                             idxs.iter().map(|&k| rows[k].clone()).collect();
@@ -30129,7 +30196,11 @@ enum SelItem {
     /// a ranking answers the row's position in the ordered partition. An
     /// explicit frame (ROWS/RANGE) or a navigation function (LAG/LEAD)
     /// refuses at parse.
-    Win(WinFunc, Vec<RawExpr>, Option<String>, Option<String>, String),
+    ///
+    /// Fields: the function, the PARTITION BY expressions, the OVER's
+    /// ORDER BY as raw text, an explicit `ROWS` [Frame] (only on an
+    /// aggregate; None = the default frame), the alias, the field name.
+    Win(WinFunc, Vec<RawExpr>, Option<String>, Option<Frame>, Option<String>, String),
 }
 
 /// A generator-advancing output column of a [Plan::Project]: `name` is
@@ -30169,7 +30240,9 @@ struct WinSpec {
 
 #[derive(Clone)]
 enum WinKind {
-    Agg { func: AggFn, src: AggSrc, distinct: bool },
+    /// `frame` is an explicit `ROWS` frame; None keeps the default (running
+    /// RANGE when ordered, whole partition when not)
+    Agg { func: AggFn, src: AggSrc, distinct: bool, frame: Option<Frame> },
     Rank(RankFn),
     /// `LAG`/`LEAD`: `arg` read from the row `offset` positions away in the
     /// ordered partition, or `default` (else NULL) when that row is outside
@@ -35735,7 +35808,7 @@ fn subquery_item_name(sub: &str) -> Option<(String, String)> {
                 if step.is_none() { "NEXT_VALUE" } else { "GEN_ID" }.to_string(),
                 n.clone(),
             )),
-            SelItem::Win(_, _, _, alias, fname) => {
+            SelItem::Win(_, _, _, _, alias, fname) => {
                 Some((fname.clone(), alias.clone().unwrap_or_else(|| fname.clone())))
             }
         },
@@ -37192,7 +37265,9 @@ fn agg_named(word: &str) -> bool {
 /// (LAG/LEAD) refuse - later slices. A refusal drops the item to the
 /// ordinary paths, which fail the projection - the engine's "not a valid
 /// expression" for a shape this build does not answer.
-fn parse_window_item(body: &str) -> Option<(WinFunc, Vec<RawExpr>, Option<String>)> {
+fn parse_window_item(
+    body: &str,
+) -> Option<(WinFunc, Vec<RawExpr>, Option<String>, Option<Frame>)> {
     let t = body.trim();
     let bytes = t.as_bytes();
     // the function call's own parentheses come first
@@ -37228,12 +37303,18 @@ fn parse_window_item(body: &str) -> Option<(WinFunc, Vec<RawExpr>, Option<String
         WinFunc::Agg(f, target)
     };
     let spec = t[over_lp + 1..over_end].trim();
-    let (part, order) = parse_over_spec(spec)?;
+    let (part, order, frame) = parse_over_spec(spec)?;
     // an aggregate window with an ORDER BY is a RUNNING aggregate under the
     // default RANGE frame (peers share); with none it is the whole
-    // partition. Either is answered. An EXPLICIT frame (ROWS/RANGE) still
-    // refuses in parse_over_spec - a later slice.
-    Some((func, part, order))
+    // partition. An explicit ROWS frame is answered too - but ONLY on an
+    // aggregate (ranking/navigation/value functions take no frame here),
+    // and only WITH an ORDER BY (the frame is relative to it).
+    if frame.is_some() {
+        if !matches!(func, WinFunc::Agg(..)) || order.is_none() {
+            return None;
+        }
+    }
+    Some((func, part, order, frame))
 }
 
 /// `ROW_NUMBER()` / `RANK()` / `DENSE_RANK()` - a ranking function name
@@ -37329,33 +37410,38 @@ fn parse_val_call(call: &str) -> Option<(ValFn, RawExpr, Option<usize>)> {
 }
 
 /// Parse the inside of an `OVER ( ... )`: an optional `PARTITION BY
-/// <expr>[, <expr>]` then an optional `ORDER BY <...>`. Returns the
-/// partition expressions and the ORDER BY as RAW TEXT (None when absent).
-/// An explicit frame (ROWS/RANGE/GROUPS) refuses - a later slice.
-fn parse_over_spec(spec: &str) -> Option<(Vec<RawExpr>, Option<String>)> {
+/// <expr>[, <expr>]` then an optional `ORDER BY <...>` then an optional
+/// explicit `ROWS` frame. Returns the partition expressions, the ORDER BY
+/// as RAW TEXT (None when absent), and the frame (None when absent). An
+/// explicit `RANGE`/`GROUPS` frame refuses - a later slice.
+fn parse_over_spec(spec: &str) -> Option<(Vec<RawExpr>, Option<String>, Option<Frame>)> {
     let s = spec.trim();
     if s.is_empty() {
-        return Some((Vec::new(), None));
+        return Some((Vec::new(), None, None));
     }
-    // an explicit frame is a separate slice; refuse it rather than answer
-    // the whole-partition value where the engine answers a framed one.
-    // Matched with surrounding spaces so a column spelled RANGE/ROWS
-    // (quoted) is not caught.
     let up = s.to_ascii_uppercase();
+    // an explicit RANGE/GROUPS frame with offsets is a later slice; refuse
+    // it rather than answer a ROWS frame where the engine answers a value
+    // one. (Matched with surrounding spaces so a quoted column named
+    // RANGE/GROUPS is not caught.)
     let padded = format!(" {} ", up);
-    for kw in [" ROWS ", " RANGE ", " GROUPS "] {
+    for kw in [" RANGE ", " GROUPS "] {
         if padded.contains(kw) {
             return None;
         }
     }
-    // split the spec into its PARTITION BY head and its ORDER BY tail at
-    // the depth-0 `ORDER BY` keyword
-    let order_at = find_word_depth0(&up, "ORDER", 0);
+    // a trailing `ROWS` frame clause, at depth 0, is split off first
+    let (before_frame, frame) = match find_word_depth0(&up, "ROWS", 0) {
+        Some(p) => (s[..p].trim(), Some(parse_frame_clause(s[p..].trim())?)),
+        None => (s, None),
+    };
+    // then the PARTITION BY head and ORDER BY tail of what remains
+    let bf_up = before_frame.to_ascii_uppercase();
+    let order_at = find_word_depth0(&bf_up, "ORDER", 0);
     let (part_s, order_s) = match order_at {
         Some(p) => {
-            let head = s[..p].trim();
-            // `ORDER` then `BY`, both their own words
-            let rest = s[p + "ORDER".len()..].trim_start();
+            let head = before_frame[..p].trim();
+            let rest = before_frame[p + "ORDER".len()..].trim_start();
             let by = rest.get(..2).filter(|w| w.eq_ignore_ascii_case("BY"))?;
             let _ = by;
             let ords = rest[2..].trim();
@@ -37364,7 +37450,7 @@ fn parse_over_spec(spec: &str) -> Option<(Vec<RawExpr>, Option<String>)> {
             }
             (head, Some(ords.to_string()))
         }
-        None => (s, None),
+        None => (before_frame, None),
     };
     let mut part = Vec::new();
     if !part_s.is_empty() {
@@ -37380,7 +37466,50 @@ fn parse_over_spec(spec: &str) -> Option<(Vec<RawExpr>, Option<String>)> {
             part.push(parse_raw_expr_any(p.trim())?);
         }
     }
-    Some((part, order_s))
+    Some((part, order_s, frame))
+}
+
+/// Parse an explicit `ROWS` frame - `ROWS BETWEEN <start> AND <end>`, or
+/// the `ROWS <start>` shorthand (end = CURRENT ROW).
+fn parse_frame_clause(s: &str) -> Option<Frame> {
+    // strip the leading ROWS word
+    let rest = s.get(..4).filter(|w| w.eq_ignore_ascii_case("ROWS"))?;
+    let _ = rest;
+    let body = s[4..].trim();
+    let up = body.to_ascii_uppercase();
+    if let Some(inner) = up.strip_prefix("BETWEEN ") {
+        // BETWEEN <start> AND <end>; split at the depth-0 (here always
+        // depth 0) ` AND ` between the two bounds
+        let and_at = find_word_depth0(&up, "AND", "BETWEEN ".len())?;
+        let start = parse_frame_bound(body["BETWEEN ".len()..and_at].trim())?;
+        let end = parse_frame_bound(body[and_at + "AND".len()..].trim())?;
+        let _ = inner;
+        Some(Frame { start, end })
+    } else {
+        // shorthand: ROWS <start> == BETWEEN <start> AND CURRENT ROW
+        Some(Frame { start: parse_frame_bound(body)?, end: FrameBound::CurrentRow })
+    }
+}
+
+/// One frame bound: `UNBOUNDED PRECEDING`, `<n> PRECEDING`, `CURRENT ROW`,
+/// `<n> FOLLOWING`, `UNBOUNDED FOLLOWING` (n a non-negative integer).
+fn parse_frame_bound(s: &str) -> Option<FrameBound> {
+    let t = s.trim();
+    let up = t.to_ascii_uppercase();
+    match up.as_str() {
+        "UNBOUNDED PRECEDING" => Some(FrameBound::UnboundedPreceding),
+        "UNBOUNDED FOLLOWING" => Some(FrameBound::UnboundedFollowing),
+        "CURRENT ROW" => Some(FrameBound::CurrentRow),
+        _ => {
+            if let Some(n) = up.strip_suffix(" PRECEDING") {
+                Some(FrameBound::Preceding(n.trim().parse::<usize>().ok()?))
+            } else if let Some(n) = up.strip_suffix(" FOLLOWING") {
+                Some(FrameBound::Following(n.trim().parse::<usize>().ok()?))
+            } else {
+                None
+            }
+        }
+    }
 }
 
 fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
@@ -37463,7 +37592,7 @@ fn parse_projection(proj: &str) -> Option<Proj> {
         // aggregate check: `SUM(V) OVER (...)` is not a bare aggregate,
         // and asking parse_agg_item about the whole body would read the
         // OVER as part of a (failing) expression argument
-        if let Some((func, part, order)) = parse_window_item(body) {
+        if let Some((func, part, order, frame)) = parse_window_item(body) {
             // the engine titles a window column by its function unless
             // aliased (probed: COUNT/SUM/.../ROW_NUMBER/RANK/DENSE_RANK)
             let fname = match &func {
@@ -37482,7 +37611,7 @@ fn parse_projection(proj: &str) -> Option<Proj> {
                 WinFunc::Val(ValFn::NthValue, ..) => "NTH_VALUE",
             }
             .to_string();
-            items.push(SelItem::Win(func, part, order, alias_owned, fname));
+            items.push(SelItem::Win(func, part, order, frame, alias_owned, fname));
             continue;
         }
         if let Some((func, target)) = parse_agg_item(body) {
@@ -49415,7 +49544,7 @@ mod tests {
                     SelItem::Agg(..) => "<agg>".into(),
                     SelItem::Expr(_, name, _) => format!("<expr:{}>", name),
                     SelItem::Gen(n, s, _) => format!("<gen:{}:{:?}>", n, s),
-                    SelItem::Win(_, _, _, _, f) => format!("<win:{}>", f),
+                    SelItem::Win(_, _, _, _, _, f) => format!("<win:{}>", f),
                 })
                 .collect(),
         }
@@ -52532,7 +52661,7 @@ mod tests {
                     }
                     SelItem::Expr(_, n, _) => format!("expr:{n}"),
                     SelItem::Gen(_, _, n) => format!("gen:{n}"),
-                    SelItem::Win(_, _, _, _, f) => format!("win:{f}"),
+                    SelItem::Win(_, _, _, _, _, f) => format!("win:{f}"),
                 })
                 .collect()
         };
@@ -53405,7 +53534,7 @@ mod tests {
                     SelItem::Expr(_, n, _) => format!("expr:{}", n),
                     SelItem::Agg(..) => "agg".into(),
                     SelItem::Gen(n, s, _) => format!("gen:{}:{:?}", n, s),
-                    SelItem::Win(_, _, _, _, f) => format!("win:{}", f),
+                    SelItem::Win(_, _, _, _, _, f) => format!("win:{}", f),
                 })
                 .collect::<Vec<_>>(),
             Proj::Star => vec!["*".into()],

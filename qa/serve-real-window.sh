@@ -28,17 +28,23 @@
 # argument's own type; and the VALUE functions FIRST_VALUE / LAST_VALUE /
 # NTH_VALUE, reading a frame row under the default RANGE frame -
 # FIRST_VALUE the partition's first row, LAST_VALUE the current row's last
-# peer, NTH_VALUE(n) the nth frame row (NULL if fewer).
+# peer, NTH_VALUE(n) the nth frame row (NULL if fewer); and an aggregate
+# with an EXPLICIT `ROWS` frame - `<agg> OVER (ORDER BY ... ROWS BETWEEN
+# <start> AND <end>)` and the `ROWS <start>` shorthand - a PHYSICAL-row
+# moving window (bounds UNBOUNDED PRECEDING / n PRECEDING / CURRENT ROW /
+# n FOLLOWING / UNBOUNDED FOLLOWING), clamped at the partition ends, an
+# empty frame folding no rows (COUNT 0, the rest NULL).
 #
 # SCOPE. An AGGREGATE window with no ORDER BY is the whole-partition
-# frame; with one it is a RUNNING aggregate (default RANGE, peers share).
-# LAG/LEAD and FIRST/LAST/NTH_VALUE need an ORDER BY. An EXPLICIT frame
-# (ROWS/RANGE BETWEEN ...) is a later slice. Still refused, each its own
-# slice: a window over a JOIN or a derived / CTE / union-branch row
-# source, a window mixed with GROUP BY, and a `?` inside a window. Every
-# ROW_NUMBER and LAG/LEAD check uses a TOTAL order - a tie leaves the row
-# sequence unpinned, so only a total order is differentially
-# deterministic.
+# frame; with one and no explicit frame it is a RUNNING aggregate (default
+# RANGE, peers share); an explicit `ROWS` frame is a physical moving
+# window. An explicit `RANGE`/`GROUPS` frame with offsets, and a frame on
+# a ranking/navigation/value function, are later slices (refused). Still
+# refused, each its own slice: a window over a JOIN or a derived / CTE /
+# union-branch row source, a window mixed with GROUP BY, and a `?` inside
+# a window. Every ROW_NUMBER / LAG / LEAD / NTH / ROWS-frame check uses a
+# TOTAL order - a tie leaves the row sequence unpinned, so only a total
+# order is differentially deterministic.
 #
 #   qa/serve-real-window.sh [port]
 set -u
@@ -150,6 +156,15 @@ both "FIRST_VALUE partition"   "SELECT ID, G, FIRST_VALUE(V) OVER (PARTITION BY 
 both "LAST_VALUE partition"    "SELECT ID, G, LAST_VALUE(V) OVER (PARTITION BY G ORDER BY V) L FROM T ORDER BY G, V, ID"
 both "FIRST_VALUE text"        "SELECT ID, FIRST_VALUE(NM) OVER (ORDER BY V, ID) F FROM T ORDER BY V, ID"
 both "value fns + LAG"         "SELECT ID, FIRST_VALUE(V) OVER (ORDER BY ID) F, LAST_VALUE(V) OVER (ORDER BY ID) L, NTH_VALUE(V,2) OVER (ORDER BY ID) N, LAG(V) OVER (ORDER BY ID) LG FROM T ORDER BY ID"
+# --- explicit ROWS frames on aggregate windows (physical moving window) ---
+both "ROWS 1 PREC..1 FOLL"     "SELECT ID, SUM(V) OVER (ORDER BY V, ID ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) M FROM T ORDER BY V, ID"
+both "ROWS 2 PREC..CURRENT"    "SELECT ID, SUM(V) OVER (ORDER BY V, ID ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) M FROM T ORDER BY V, ID"
+both "ROWS UNBOUNDED PREC"     "SELECT ID, SUM(V) OVER (ORDER BY V, ID ROWS UNBOUNDED PRECEDING) M FROM T ORDER BY V, ID"
+both "ROWS COUNT window"       "SELECT ID, COUNT(*) OVER (ORDER BY V, ID ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) C FROM T ORDER BY V, ID"
+both "ROWS future (empty end)" "SELECT ID, SUM(V) OVER (ORDER BY V, ID ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) M FROM T ORDER BY V, ID"
+both "ROWS shorthand 1 PREC"   "SELECT ID, G, SUM(V) OVER (PARTITION BY G ORDER BY V, ID ROWS 1 PRECEDING) M FROM T ORDER BY G, V, ID"
+both "ROWS CR..UNB FOLLOWING"  "SELECT ID, MAX(V) OVER (ORDER BY V, ID ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) M FROM T ORDER BY V, ID"
+both "ROWS AVG numeric moving" "SELECT ID, G, AVG(N92) OVER (PARTITION BY G ORDER BY V, ID ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) M FROM T ORDER BY G, V, ID"
 
 echo "ran $ran checks"
 exit $fail
