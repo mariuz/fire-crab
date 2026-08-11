@@ -10,18 +10,24 @@
 # by the function unless aliased - the SAME contract a bare aggregate has.
 #
 # node-firebird drives fire-crab; isql-created twin answers the same query
-# from the live engine; the row sets must be identical. Covered: COUNT/
-# SUM/MIN/MAX/AVG, integer / NUMERIC / text sources, one- and two-column
-# partitions, `OVER ()`, several windows in one select, a window beside
-# plain columns and an expression, a WHERE before the window, a NULL
-# partition key, ORDER BY on the window column, and COUNT(DISTINCT) OVER.
+# from the live engine; the row sets must be identical. Covered: the
+# whole-partition AGGREGATE window - COUNT/SUM/MIN/MAX/AVG, integer /
+# NUMERIC / text sources, one- and two-column partitions, `OVER ()`,
+# several windows in one select, a window beside plain columns and an
+# expression, a WHERE before the window, a NULL partition key, ORDER BY on
+# the window column, COUNT(DISTINCT) OVER - and the RANKING functions
+# ROW_NUMBER / RANK / DENSE_RANK OVER ( [PARTITION BY ...] ORDER BY ... ),
+# with ties (RANK gaps, DENSE_RANK does not), DESC and text ordering, a
+# partition, and a ranking beside an aggregate window in one select.
 #
-# SCOPE - THE WHOLE-PARTITION FRAME. An ORDER BY or an explicit frame
-# (ROWS/RANGE) inside the OVER answers a RUNNING value this build does not
-# compute; a ranking (ROW_NUMBER, RANK, DENSE_RANK) or navigation (LAG,
-# LEAD) function is not an aggregate; a window over a JOIN or a derived /
-# CTE / union-branch row source, a window mixed with GROUP BY, and a `?`
-# inside a window - each refuses at prepare and is its own later slice.
+# SCOPE. The AGGREGATE window is the WHOLE-PARTITION frame: an ORDER BY
+# inside its OVER (a RUNNING value) or an explicit frame (ROWS/RANGE) is a
+# later slice. A RANKING window keeps its ORDER BY (that is what it ranks
+# by). Still refused, each its own later slice: a navigation function
+# (LAG/LEAD), a window over a JOIN or a derived / CTE / union-branch row
+# source, a window mixed with GROUP BY, and a `?` inside a window. Every
+# ROW_NUMBER check uses a TOTAL order - a tie leaves the sequence
+# unpinned, so only a total order is differentially deterministic.
 #
 #   qa/serve-real-window.sh [port]
 set -u
@@ -94,6 +100,17 @@ both "ORDER BY window column"  "SELECT ID, SUM(V) OVER (PARTITION BY G) S FROM T
 both "no alias -> named SUM"   "SELECT SUM(V) OVER (PARTITION BY G) FROM T ORDER BY 1"
 both "COUNT(DISTINCT) OVER"    "SELECT ID, COUNT(DISTINCT V) OVER (PARTITION BY G) C FROM T ORDER BY ID"
 both "AVG numeric OVER ()"     "SELECT ID, AVG(N92) OVER () A FROM T ORDER BY ID"
+# --- ranking functions (ROW_NUMBER / RANK / DENSE_RANK) ---
+both "ROW_NUMBER total order"  "SELECT ID, ROW_NUMBER() OVER (ORDER BY V, ID) R FROM T ORDER BY ID"
+both "RANK ties + gaps"        "SELECT ID, RANK() OVER (ORDER BY V) R FROM T ORDER BY V, ID"
+both "DENSE_RANK ties no gap"  "SELECT ID, DENSE_RANK() OVER (ORDER BY V) R FROM T ORDER BY V, ID"
+both "ROW_NUMBER PARTITION"    "SELECT ID, G, ROW_NUMBER() OVER (PARTITION BY G ORDER BY V, ID) R FROM T ORDER BY ID"
+both "RANK PARTITION"          "SELECT ID, G, RANK() OVER (PARTITION BY G ORDER BY V) R FROM T ORDER BY G, V, ID"
+both "DENSE_RANK PARTITION"    "SELECT ID, G, DENSE_RANK() OVER (PARTITION BY G ORDER BY V) R FROM T ORDER BY G, V, ID"
+both "RANK DESC"               "SELECT ID, RANK() OVER (ORDER BY V DESC) R FROM T ORDER BY V DESC, ID"
+both "ROW_NUMBER text order"   "SELECT ID, ROW_NUMBER() OVER (ORDER BY NM, ID) R FROM T ORDER BY ID"
+both "ranking + agg window"    "SELECT ID, G, RANK() OVER (PARTITION BY G ORDER BY V) R, SUM(V) OVER (PARTITION BY G) S FROM T ORDER BY G, V, ID"
+both "ranking no alias name"   "SELECT ROW_NUMBER() OVER (ORDER BY ID) FROM T ORDER BY 1"
 
 echo "ran $ran checks"
 exit $fail

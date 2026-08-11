@@ -5116,6 +5116,33 @@ enum AggFn {
     Avg,
 }
 
+/// A RANKING window function - one whose value is the row's POSITION in
+/// its partition's ORDER BY, not a fold of column values. All three
+/// answer a not-nullable BIGINT (probed: 580, no Nullable flag) named by
+/// the function.
+#[derive(Clone, Copy, PartialEq)]
+enum RankFn {
+    /// 1, 2, 3, ... - a distinct number per row in the ordered partition;
+    /// rows tying on the ORDER BY keys still get sequential numbers, in an
+    /// order the ORDER BY does not pin down (so a total order is the only
+    /// deterministic use)
+    RowNumber,
+    /// ties SHARE a rank and the next rank SKIPS the gap (5,5,9 -> 1,1,3)
+    Rank,
+    /// ties share a rank with NO gap (5,5,9 -> 1,1,2)
+    DenseRank,
+}
+
+/// The function a window column computes. An [AggFn] fold over a partition
+/// (the whole-partition frame), or a [RankFn] position within the ordered
+/// partition. Parse-level: the aggregate carries its [AggTarget] (which may
+/// hold a RawExpr argument), resolved to an [AggSrc] at plan time.
+#[derive(Clone)]
+enum WinFunc {
+    Agg(AggFn, AggTarget),
+    Rank(RankFn),
+}
+
 /// What an aggregate is computed over.
 #[derive(Clone, PartialEq)]
 enum AggTarget {
@@ -24267,39 +24294,7 @@ fn plan_query_inner_ctx(
                         });
                     }
                     SelItem::Agg(..) => return None, // aggregates route to plan_group
-                    SelItem::Win(func, target, part_raw, alias, _fname) => {
-                        // BUILD THE WINDOW COLUMN THROUGH THE AGGREGATE
-                        // MACHINERY: a window's output describe and fold
-                        // are a bare aggregate's, so feed exactly one
-                        // synthetic `SelItem::Agg` to build_group_items
-                        // (no keys, its own synth base) and take back the
-                        // one ProjCol it types and the one GItem::Agg it
-                        // plans. This inherits every type rule - COUNT is
-                        // BIGINT, MIN/MAX keep the source, SUM widens,
-                        // AVG's scale, the NUMERIC/text/temporal refusals
-                        // - with no second copy to drift.
-                        let mut sink: Vec<Option<Descriptor>> = Vec::new();
-                        let (wc, wg) = build_group_items(
-                            std::slice::from_ref(&SelItem::Agg(
-                                *func,
-                                target.clone(),
-                                alias.clone(),
-                            )),
-                            &columns,
-                            &descs,
-                            &[],
-                            &[],
-                            win_base,
-                            &mut sink,
-                        )?;
-                        let mut pc = wc.into_iter().next()?;
-                        let GItem::Agg(f, src, distinct) = wg.into_iter().next()? else {
-                            return None;
-                        };
-                        // the value lives in the appended slot, read as a
-                        // plain field - never re-evaluated as an expression
-                        pc.field_id = win_base + windows.len();
-                        pc.expr = None;
+                    SelItem::Win(func, part_raw, order_raw, alias, fname) => {
                         // PARTITION BY keys resolve over this relation; a
                         // key naming no column, or one the resolver
                         // refuses, refuses the whole window
@@ -24307,7 +24302,83 @@ fn plan_query_inner_ctx(
                         for r in part_raw {
                             part.push(resolve_expr(r, &columns, &descs)?);
                         }
-                        windows.push(WinSpec { func: f, src, distinct, part });
+                        // the OVER's ORDER BY resolves over the INPUT
+                        // columns through the SHARED order-by parser (so
+                        // ASC/DESC/NULLS and expression keys come free); a
+                        // key it refuses refuses the whole window
+                        let order: Vec<OrderKey> = match order_raw {
+                            None => Vec::new(),
+                            Some(os) => parse_order_by_expr(
+                                os,
+                                &[],
+                                |n| {
+                                    columns
+                                        .iter()
+                                        .find(|c| c.name.eq_ignore_ascii_case(n))
+                                        .map(|c| c.field_id as usize)
+                                        .filter(|fid| !is_computed_fid(&descs, *fid))
+                                },
+                                |text| {
+                                    parse_raw_expr(text)
+                                        .and_then(|r| resolve_expr(&r, &columns, &descs))
+                                },
+                            )?,
+                        };
+                        let (pc, kind) = match func {
+                            // AN AGGREGATE WINDOW THROUGH THE AGGREGATE
+                            // MACHINERY: its describe and fold are a bare
+                            // aggregate's, so feed one synthetic SelItem::Agg
+                            // to build_group_items and take back the ProjCol
+                            // it types and the GItem::Agg it plans - COUNT is
+                            // BIGINT, MIN/MAX keep the source, SUM widens,
+                            // the NUMERIC/text/temporal refusals, no copy.
+                            WinFunc::Agg(f, target) => {
+                                let mut sink: Vec<Option<Descriptor>> = Vec::new();
+                                let (wc, wg) = build_group_items(
+                                    std::slice::from_ref(&SelItem::Agg(
+                                        *f,
+                                        target.clone(),
+                                        alias.clone(),
+                                    )),
+                                    &columns,
+                                    &descs,
+                                    &[],
+                                    &[],
+                                    win_base,
+                                    &mut sink,
+                                )?;
+                                let mut pc = wc.into_iter().next()?;
+                                let GItem::Agg(gf, src, distinct) = wg.into_iter().next()?
+                                else {
+                                    return None;
+                                };
+                                pc.field_id = win_base + windows.len();
+                                pc.expr = None;
+                                (pc, WinKind::Agg { func: gf, src, distinct })
+                            }
+                            // A RANKING WINDOW answers a NOT-NULLABLE BIGINT
+                            // named by the function (probed: 580, no Nullable
+                            // flag) - the row's position in the ordered
+                            // partition, computed at fetch
+                            WinFunc::Rank(rk) => {
+                                let pc = ProjCol {
+                                    name: alias.clone().unwrap_or_else(|| fname.clone()),
+                                    fname: Some(fname.clone()),
+                                    relation: None,
+                                    rel_alias: None,
+                                    field_id: win_base + windows.len(),
+                                    wire: Wire::Int64,
+                                    sql_type: 580,
+                                    length: 8,
+                                    oct_length: 8,
+                                    scale: 0,
+                                    sub_type: 0,
+                                    expr: None,
+                                };
+                                (pc, WinKind::Rank(*rk))
+                            }
+                        };
+                        windows.push(WinSpec { kind, part, order });
                         out.push(pc);
                     }
                 }
@@ -26595,18 +26666,25 @@ fn group_output(
 /// ones.
 /// Answer every WINDOW column on every input row (see [WinSpec]). For
 /// each window the rows are bucketed by its PARTITION BY keys - NULLs
-/// bucket together, the way [group_rows] groups - and each bucket is
-/// folded by the SAME [compute_group] the grouped path uses; every row in
-/// a bucket is then given that bucket's value. Row ORDER is preserved (a
-/// window does not sort); the values are appended at `win_base`, where the
-/// matching ProjCol reads them. An empty PARTITION BY is one bucket of
-/// every row (`OVER ()`). A fold's per-row evaluation error (a divide by
-/// zero in `SUM(A / 0) OVER (...)`) aborts the fetch, as it does grouped.
+/// bucket together, the way [group_rows] groups. What each bucket produces
+/// depends on the window's kind:
+///   - [WinKind::Agg]: the bucket is folded by the SAME [compute_group]
+///     the grouped path uses and every row in it gets that one value (the
+///     whole-partition frame);
+///   - [WinKind::Rank]: the bucket is sorted by the OVER's ORDER BY and
+///     each row gets its position - ROW_NUMBER sequential, RANK sharing
+///     with gaps, DENSE_RANK sharing without.
+/// Row ORDER is preserved (a window does not reorder the result); the
+/// values are appended at `win_base`, where the matching ProjCol reads
+/// them. An empty PARTITION BY is one bucket of every row (`OVER ()`). A
+/// per-row evaluation error (a divide by zero in an argument or a key)
+/// aborts the fetch, as it does grouped.
 fn compute_windows(
     mut rows: Vec<Vec<Value>>,
     windows: &[WinSpec],
     win_base: usize,
 ) -> Result<Vec<Vec<Value>>, EvalErr> {
+    use std::cmp::Ordering::Equal;
     let n = rows.len();
     // per-row value of each window, filled bucket by bucket
     let mut vals: Vec<Vec<Value>> = vec![vec![Value::Null; windows.len()]; n];
@@ -26620,10 +26698,31 @@ fn compute_windows(
             }
             keyrows.push(k);
         }
-        let keys: Vec<OrderKey> = (0..spec.part.len())
+        let pkeys: Vec<OrderKey> = (0..spec.part.len())
             .map(|i| OrderKey::field(i, false, NullsAt::Default))
             .collect();
-        let gi = [GItem::Agg(spec.func, spec.src.clone(), spec.distinct)];
+        // for a ranking window, the OVER's ORDER BY value of each row,
+        // decorated up front so an eval error surfaces before the sort and
+        // the comparator stays pure; field-indexed OrderKeys carry the
+        // per-key ASC/DESC/NULLS over these decorated rows
+        let ranking = matches!(spec.kind, WinKind::Rank(_));
+        let mut ordrows: Vec<Vec<Value>> = Vec::new();
+        let okeys: Vec<OrderKey> = spec
+            .order
+            .iter()
+            .enumerate()
+            .map(|(i, k)| OrderKey::field(i, k.desc, k.nulls))
+            .collect();
+        if ranking {
+            ordrows.reserve(n);
+            for r in &rows {
+                let mut ov = Vec::with_capacity(spec.order.len());
+                for ok in &spec.order {
+                    ov.push(ok.value_of(r)?);
+                }
+                ordrows.push(ov);
+            }
+        }
         let mut done = vec![false; n];
         for i in 0..n {
             if done[i] {
@@ -26635,17 +26734,50 @@ fn compute_windows(
             let mut idxs = vec![i];
             done[i] = true;
             for j in (i + 1)..n {
-                if !done[j]
-                    && order_cmp(&keyrows[i], &keyrows[j], &keys) == std::cmp::Ordering::Equal
-                {
+                if !done[j] && order_cmp(&keyrows[i], &keyrows[j], &pkeys) == Equal {
                     idxs.push(j);
                     done[j] = true;
                 }
             }
-            let bucket: Vec<Vec<Value>> = idxs.iter().map(|&k| rows[k].clone()).collect();
-            let v = compute_group(&bucket, &gi)?.into_iter().next().unwrap_or(Value::Null);
-            for &k in &idxs {
-                vals[k][wi] = v.clone();
+            match &spec.kind {
+                WinKind::Agg { func, src, distinct } => {
+                    let gi = [GItem::Agg(*func, src.clone(), *distinct)];
+                    let bucket: Vec<Vec<Value>> =
+                        idxs.iter().map(|&k| rows[k].clone()).collect();
+                    let v =
+                        compute_group(&bucket, &gi)?.into_iter().next().unwrap_or(Value::Null);
+                    for &k in &idxs {
+                        vals[k][wi] = v.clone();
+                    }
+                }
+                WinKind::Rank(rk) => {
+                    // order the bucket by the OVER's ORDER BY - a STABLE
+                    // sort, so rows tying on the keys keep their scan order
+                    // (the only order ROW_NUMBER can give a tie)
+                    let mut perm: Vec<usize> = (0..idxs.len()).collect();
+                    perm.sort_by(|&a, &b| {
+                        order_cmp(&ordrows[idxs[a]], &ordrows[idxs[b]], &okeys)
+                    });
+                    let mut rank = 0i64;
+                    let mut dense = 0i64;
+                    for (pos, &p) in perm.iter().enumerate() {
+                        let new_group = pos == 0
+                            || order_cmp(
+                                &ordrows[idxs[perm[pos - 1]]],
+                                &ordrows[idxs[p]],
+                                &okeys,
+                            ) != Equal;
+                        if new_group {
+                            rank = pos as i64 + 1;
+                            dense += 1;
+                        }
+                        vals[idxs[p]][wi] = Value::Int(match rk {
+                            RankFn::RowNumber => pos as i64 + 1,
+                            RankFn::Rank => rank,
+                            RankFn::DenseRank => dense,
+                        });
+                    }
+                }
             }
         }
     }
@@ -29786,17 +29918,19 @@ enum SelItem {
     /// (step None) or `GEN_ID(<name>, <n>)` (step Some(n)) - evaluated
     /// once per emitted row (see [GenCol]), with its output column name
     Gen(String, Option<i64>, String),
-    /// a WINDOW function - `<agg>(arg) OVER ( [PARTITION BY exprs] )`. The
-    /// aggregate and its argument (parsed like a bare aggregate), the
-    /// PARTITION BY expressions (empty = the whole result is one
-    /// partition), the output column name (the alias when there is one)
-    /// and the symbolic field name (the function - COUNT/SUM/...). Unlike
-    /// [SelItem::Agg] it emits one row PER INPUT ROW: the aggregate is
-    /// computed over each row's partition and answered on every row. This
-    /// first slice answers the WHOLE-PARTITION frame only; an ORDER BY or
-    /// a frame clause inside the OVER, a ranking function (ROW_NUMBER,
-    /// RANK) or a navigation one (LAG, LEAD) refuse at parse.
-    Win(AggFn, AggTarget, Vec<RawExpr>, Option<String>, String),
+    /// a WINDOW function - `<func>(args) OVER ( [PARTITION BY exprs]
+    /// [ORDER BY keys] )`. The function ([WinFunc]: an aggregate fold or a
+    /// ranking), the PARTITION BY expressions (empty = the whole result is
+    /// one partition), the OVER's ORDER BY still as RAW TEXT (resolved at
+    /// plan through the shared [parse_order_by_expr]; None = no in-partition
+    /// order), the output column name (the alias when there is one) and the
+    /// symbolic field name (the function - COUNT/SUM/ROW_NUMBER/...). Unlike
+    /// [SelItem::Agg] it emits one row PER INPUT ROW. An aggregate answers
+    /// the WHOLE-PARTITION frame (its ORDER BY, a running frame, refuses);
+    /// a ranking answers the row's position in the ordered partition. An
+    /// explicit frame (ROWS/RANGE) or a navigation function (LAG/LEAD)
+    /// refuses at parse.
+    Win(WinFunc, Vec<RawExpr>, Option<String>, Option<String>, String),
 }
 
 /// A generator-advancing output column of a [Plan::Project]: `name` is
@@ -29813,22 +29947,31 @@ struct GenCol {
     value_index: usize,
 }
 
-/// A WINDOW output column of a [Plan::Project] (see [SelItem::Win]). The
-/// aggregate to fold and its per-row source, whether it is a DISTINCT
-/// fold, and the resolved PARTITION BY key expressions (empty = the whole
-/// result is one partition). At fetch the rows are bucketed by these keys
-/// (NULLs bucket together, as GROUP BY does), each bucket is folded by the
-/// SAME [compute_group] the grouped path uses, and every row in a bucket
-/// is answered that bucket's value - which is why the output has one row
-/// per INPUT row, not per bucket. The value is appended to each row at
-/// `win_base + <this window's index>`, where the matching ProjCol reads
-/// it (a plain `field_id`, `expr: None`).
+/// A WINDOW output column of a [Plan::Project] (see [SelItem::Win]). At
+/// fetch the rows are bucketed by the resolved PARTITION BY keys (`part`;
+/// empty = one partition, NULLs bucket together as GROUP BY does). What
+/// each bucket then produces depends on `kind`:
+///   - [WinKind::Agg] folds the bucket with the SAME [compute_group] the
+///     grouped path uses and answers every row that one value (the
+///     whole-partition frame);
+///   - [WinKind::Rank] sorts the bucket by `order` and answers each row
+///     its position (ROW_NUMBER/RANK/DENSE_RANK).
+/// Either way the output has one row per INPUT row. The value is appended
+/// to each row at `win_base + <this window's index>`, where the matching
+/// ProjCol reads it (a plain `field_id`, `expr: None`).
 #[derive(Clone)]
 struct WinSpec {
-    func: AggFn,
-    src: AggSrc,
-    distinct: bool,
+    kind: WinKind,
     part: Vec<Expr>,
+    /// the OVER's ORDER BY, resolved over the INPUT columns. Empty for a
+    /// whole-partition aggregate; the ranking key for a [WinKind::Rank].
+    order: Vec<OrderKey>,
+}
+
+#[derive(Clone)]
+enum WinKind {
+    Agg { func: AggFn, src: AggSrc, distinct: bool },
+    Rank(RankFn),
 }
 
 /// A select-list expression before column names are resolved to field
@@ -36829,28 +36972,29 @@ fn agg_named(word: &str) -> bool {
     )
 }
 
-/// Parse a WINDOW select item - `<agg>(arg) OVER ( [PARTITION BY ...] )`.
-/// Returns the aggregate, its argument (as [parse_agg_item] reads it) and
-/// the PARTITION BY expressions (empty for `OVER ()`).
+/// Parse a WINDOW select item - `<func>(args) OVER ( [PARTITION BY ...]
+/// [ORDER BY ...] )`. Returns the function ([WinFunc]: an aggregate fold
+/// or a ranking), the PARTITION BY expressions (empty for no partition),
+/// and the OVER's ORDER BY still as RAW TEXT (resolved at plan through the
+/// shared ORDER BY parser; None = no order).
 ///
-/// FIRST SLICE - the WHOLE-PARTITION frame only. An ORDER BY or an
-/// explicit frame (ROWS/RANGE/GROUPS) inside the OVER answers a RUNNING
-/// value the fold here does not compute, so it refuses; a ranking
-/// (ROW_NUMBER/RANK) or navigation (LAG/LEAD) function is not an
-/// aggregate and `parse_agg_item` refuses it. A refusal here drops the
-/// item to the ordinary paths, which fail the projection - the engine's
-/// "not a valid expression" for a shape this build does not answer.
-fn parse_window_item(body: &str) -> Option<(AggFn, AggTarget, Vec<RawExpr>)> {
+/// An AGGREGATE window answers the WHOLE-PARTITION frame, so its ORDER BY
+/// (a RUNNING value) refuses here - a later slice. A RANKING window
+/// (ROW_NUMBER/RANK/DENSE_RANK) is ranked BY that order, so it keeps it.
+/// An explicit frame (ROWS/RANGE/GROUPS) and a navigation function
+/// (LAG/LEAD) refuse. A refusal drops the item to the ordinary paths,
+/// which fail the projection - the engine's "not a valid expression" for
+/// a shape this build does not answer.
+fn parse_window_item(body: &str) -> Option<(WinFunc, Vec<RawExpr>, Option<String>)> {
     let t = body.trim();
     let bytes = t.as_bytes();
-    // the aggregate call's own parentheses come first
+    // the function call's own parentheses come first
     let lp = t.find('(')?;
     let call_end = matching_paren(bytes, lp)?;
     let after = t[call_end + 1..].trim_start();
     // ... then the OVER keyword, as its own word (followed by space or the
     // spec's opening paren), then the spec in parentheses
-    let rest = after.get(..4).filter(|w| w.eq_ignore_ascii_case("OVER"))?;
-    let _ = rest;
+    after.get(..4).filter(|w| w.eq_ignore_ascii_case("OVER"))?;
     let tail = after[4..].trim_start();
     if !tail.starts_with('(') {
         return None;
@@ -36862,42 +37006,95 @@ fn parse_window_item(body: &str) -> Option<(AggFn, AggTarget, Vec<RawExpr>)> {
     if !t[over_end + 1..].trim().is_empty() {
         return None;
     }
-    let (func, target) = parse_agg_item(t[..=call_end].trim())?;
+    let call = t[..=call_end].trim();
+    // a ranking function - `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, an
+    // EMPTY argument list - or else an aggregate the ordinary parser reads
+    let func = if let Some(rk) = parse_rank_call(call) {
+        WinFunc::Rank(rk)
+    } else {
+        let (f, target) = parse_agg_item(call)?;
+        WinFunc::Agg(f, target)
+    };
     let spec = t[over_lp + 1..over_end].trim();
-    let part = parse_over_spec(spec)?;
-    Some((func, target, part))
+    let (part, order) = parse_over_spec(spec)?;
+    // an aggregate window answers the WHOLE partition; an ORDER BY there is
+    // the running frame, a later slice
+    if matches!(func, WinFunc::Agg(..)) && order.is_some() {
+        return None;
+    }
+    Some((func, part, order))
 }
 
-/// Parse the inside of an `OVER ( ... )` for the whole-partition slice:
-/// nothing (one partition), or `PARTITION BY <expr>[, <expr>]`. An ORDER
-/// BY or a frame keyword refuses (a later slice).
-fn parse_over_spec(spec: &str) -> Option<Vec<RawExpr>> {
+/// `ROW_NUMBER()` / `RANK()` / `DENSE_RANK()` - a ranking function name
+/// with an EMPTY argument list. Anything with an argument (a navigation
+/// LAG(x)/LEAD(x), or an aggregate) is not one.
+fn parse_rank_call(call: &str) -> Option<RankFn> {
+    let t = call.trim();
+    let open = t.find('(')?;
+    if !t.ends_with(')') || t[open + 1..t.len() - 1].trim() != "" {
+        return None;
+    }
+    match t[..open].trim().to_ascii_uppercase().as_str() {
+        "ROW_NUMBER" => Some(RankFn::RowNumber),
+        "RANK" => Some(RankFn::Rank),
+        "DENSE_RANK" => Some(RankFn::DenseRank),
+        _ => None,
+    }
+}
+
+/// Parse the inside of an `OVER ( ... )`: an optional `PARTITION BY
+/// <expr>[, <expr>]` then an optional `ORDER BY <...>`. Returns the
+/// partition expressions and the ORDER BY as RAW TEXT (None when absent).
+/// An explicit frame (ROWS/RANGE/GROUPS) refuses - a later slice.
+fn parse_over_spec(spec: &str) -> Option<(Vec<RawExpr>, Option<String>)> {
     let s = spec.trim();
     if s.is_empty() {
-        return Some(Vec::new());
+        return Some((Vec::new(), None));
     }
-    // a running frame or an in-partition order is a separate slice; refuse
-    // it rather than answer a whole-partition value where the engine
-    // answers a running one. Matched with surrounding spaces so a column
-    // spelled RANGE/ROWS (quoted) is not caught.
-    let padded = format!(" {} ", s.to_ascii_uppercase());
-    for kw in [" ORDER BY ", " ROWS ", " RANGE ", " GROUPS "] {
+    // an explicit frame is a separate slice; refuse it rather than answer
+    // the whole-partition value where the engine answers a framed one.
+    // Matched with surrounding spaces so a column spelled RANGE/ROWS
+    // (quoted) is not caught.
+    let up = s.to_ascii_uppercase();
+    let padded = format!(" {} ", up);
+    for kw in [" ROWS ", " RANGE ", " GROUPS "] {
         if padded.contains(kw) {
             return None;
         }
     }
-    // the only thing left is a PARTITION BY list
-    let rest = s.get(..12).filter(|w| w.eq_ignore_ascii_case("PARTITION BY"))?;
-    let _ = rest;
-    let list = s[12..].trim();
-    if list.is_empty() {
-        return None;
+    // split the spec into its PARTITION BY head and its ORDER BY tail at
+    // the depth-0 `ORDER BY` keyword
+    let order_at = find_word_depth0(&up, "ORDER", 0);
+    let (part_s, order_s) = match order_at {
+        Some(p) => {
+            let head = s[..p].trim();
+            // `ORDER` then `BY`, both their own words
+            let rest = s[p + "ORDER".len()..].trim_start();
+            let by = rest.get(..2).filter(|w| w.eq_ignore_ascii_case("BY"))?;
+            let _ = by;
+            let ords = rest[2..].trim();
+            if ords.is_empty() {
+                return None;
+            }
+            (head, Some(ords.to_string()))
+        }
+        None => (s, None),
+    };
+    let mut part = Vec::new();
+    if !part_s.is_empty() {
+        let list = part_s
+            .get(..12)
+            .filter(|w| w.eq_ignore_ascii_case("PARTITION BY"))
+            .and(part_s.get(12..))?
+            .trim();
+        if list.is_empty() {
+            return None;
+        }
+        for p in split_top_level_commas(list) {
+            part.push(parse_raw_expr_any(p.trim())?);
+        }
     }
-    let mut out = Vec::new();
-    for part in split_top_level_commas(list) {
-        out.push(parse_raw_expr_any(part.trim())?);
-    }
-    Some(out)
+    Some((part, order_s))
 }
 
 fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
@@ -36976,22 +37173,25 @@ fn parse_projection(proj: &str) -> Option<Proj> {
             }
         };
         let alias_owned = alias.map(alias_name);
-        // a WINDOW function - `<agg>(arg) OVER (...)` - BEFORE the plain
+        // a WINDOW function - `<func>(args) OVER (...)` - BEFORE the plain
         // aggregate check: `SUM(V) OVER (...)` is not a bare aggregate,
         // and asking parse_agg_item about the whole body would read the
         // OVER as part of a (failing) expression argument
-        if let Some((func, target, part)) = parse_window_item(body) {
+        if let Some((func, part, order)) = parse_window_item(body) {
             // the engine titles a window column by its function unless
-            // aliased, exactly as a bare aggregate (probed: COUNT/SUM/...)
-            let fname = match func {
-                AggFn::Count => "COUNT",
-                AggFn::Min => "MIN",
-                AggFn::Max => "MAX",
-                AggFn::Sum => "SUM",
-                AggFn::Avg => "AVG",
+            // aliased (probed: COUNT/SUM/.../ROW_NUMBER/RANK/DENSE_RANK)
+            let fname = match &func {
+                WinFunc::Agg(AggFn::Count, _) => "COUNT",
+                WinFunc::Agg(AggFn::Min, _) => "MIN",
+                WinFunc::Agg(AggFn::Max, _) => "MAX",
+                WinFunc::Agg(AggFn::Sum, _) => "SUM",
+                WinFunc::Agg(AggFn::Avg, _) => "AVG",
+                WinFunc::Rank(RankFn::RowNumber) => "ROW_NUMBER",
+                WinFunc::Rank(RankFn::Rank) => "RANK",
+                WinFunc::Rank(RankFn::DenseRank) => "DENSE_RANK",
             }
             .to_string();
-            items.push(SelItem::Win(func, target, part, alias_owned, fname));
+            items.push(SelItem::Win(func, part, order, alias_owned, fname));
             continue;
         }
         if let Some((func, target)) = parse_agg_item(body) {
