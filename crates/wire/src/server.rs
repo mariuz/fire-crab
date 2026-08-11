@@ -18930,10 +18930,11 @@ fn resolve_index_ops_uncached(db: &Database, rel: u16, descs: &[Descriptor]) -> 
 /// row set at fetch. Plans without parameters validate trivially.
 fn validate_select_bind(plan: &Plan, args: &[WireParam]) -> Result<(), ExecErr> {
     match plan {
-        Plan::Project { filter, .. }
-        | Plan::Group { filter, .. }
-        | Plan::JoinGroup { filter, .. }
-        | Plan::Join { filter, .. } => {
+        Plan::Group { filter, having, .. } | Plan::JoinGroup { filter, having, .. } => {
+            bind_filter(filter, args)?;
+            bind_filter(having, args).map(|_| ())
+        }
+        Plan::Project { filter, .. } | Plan::Join { filter, .. } => {
             bind_filter(filter, args).map(|_| ())
         }
         _ => Ok(()),
@@ -20575,14 +20576,16 @@ fn plan_join_bound(
                 }
             }
         }
-        let mut having_np = 0usize;
+        // a HAVING `?` numbers after the projection and WHERE params (the
+        // grouped join, like the plain group, in one textual order)
+        let mut having_np = params.len();
         let having = match having_s {
             None => None,
             Some(hs) => Some(
                 tokenize(hs)
                     .and_then(|t| parse_predicate(&t, &mut having_np))
                     .and_then(|raw| {
-                        resolve_having(raw, &mut gitems, &key_fids, &comb_cols, &comb_descs)
+                        resolve_having(raw, &mut gitems, &key_fids, &comb_cols, &comb_descs, params)
                     })?,
             ),
         };
@@ -21281,7 +21284,7 @@ fn plan_over_source(
             Some(hs) => Some(
                 tokenize(hs)
                     .and_then(|t| parse_predicate(&t, &mut np))
-                    .and_then(|raw| resolve_having(raw, &mut gitems, &key_fids, &columns, &descs))?,
+                    .and_then(|raw| resolve_having(raw, &mut gitems, &key_fids, &columns, &descs, params))?,
             ),
         };
         if np != dgroup_params {
@@ -22235,6 +22238,7 @@ fn branch_rows_res(
         index,
     } = plan
     {
+        let having = bind_filter(having, args).map_err(|_| EvalErr::Unsupported)?;
         let rows = RowSource::aggregate_sorted(
             RowSource::Filter {
                 input: Box::new(leaf_source(*rel, formats.to_vec(), index)),
@@ -22244,7 +22248,7 @@ fn branch_rows_res(
             key_fids,
             key_exprs,
             *synth_base,
-            having,
+            &having,
             order_by,
         )
         .rows(db)?;
@@ -22306,6 +22310,7 @@ fn branch_rows_res(
     } = plan
     {
         let filter = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
+        let having = bind_filter(having, args).map_err(|_| EvalErr::Unsupported)?;
         let input = join_rows(db, base, *base_width, parts, &filter)?;
         // the joined rows are a materialised leaf; the fold and the sort
         // above them are tree nodes (a NestedLoopJoin leaf is R3)
@@ -22315,7 +22320,7 @@ fn branch_rows_res(
             key_fids,
             key_exprs,
             *synth_base,
-            having,
+            &having,
             order_by,
         )
         .rows(db)?;
@@ -25202,16 +25207,17 @@ fn plan_group(
         }
     }
     let cols = cols;
-    // HAVING filters the computed output rows (may append hidden gitems);
-    // `?` in HAVING is not supported - the resolver refuses the slots
-    // (the throwaway counter just satisfies the parser)
-    let mut having_np = 0usize;
+    // HAVING filters the computed output rows (may append hidden gitems).
+    // A HAVING `?` numbers AFTER the projection and WHERE params already
+    // in the sink - the engine's one textual order (probed: WHERE ? then
+    // HAVING ? is input slots 0, 1).
+    let mut having_np = params.len();
     let having = match having_s {
         None => None,
         Some(hs) => Some(
             tokenize(hs)
                 .and_then(|t| parse_predicate(&t, &mut having_np))
-                .and_then(|raw| resolve_having(raw, &mut gitems, &key_fids, columns, descs))?,
+                .and_then(|raw| resolve_having(raw, &mut gitems, &key_fids, columns, descs, params))?,
         ),
     };
     // ORDER BY sorts the OUTPUT rows: names resolve to output columns
@@ -28615,6 +28621,7 @@ fn emit_rows_inner(
         } => {
             if let Some(db) = db {
                 let filter = bind_filter(filter, args)?;
+                let having = bind_filter(having, args)?;
                 let input =
                     join_rows(db, base, *base_width, parts, &filter)
                         .map_err(EmitErr::Eval)?;
@@ -28624,7 +28631,7 @@ fn emit_rows_inner(
                     key_fids,
                     key_exprs,
                     *synth_base,
-                    having,
+                    &having,
                     order_by,
                 )
                 .rows(db)
@@ -28649,6 +28656,7 @@ fn emit_rows_inner(
         } => {
             if let Some(db) = db {
                 let filter = bind_filter(filter, args)?;
+                let having = bind_filter(having, args)?;
                 // scan -> filter -> aggregate -> sort, as one tree. The
                 // ORDER BY keys are OUTPUT indexes and the folded rows
                 // are aligned with gitems/cols, which is exactly why the
@@ -28662,7 +28670,7 @@ fn emit_rows_inner(
                     key_fids,
                     key_exprs,
                     *synth_base,
-                    having,
+                    &having,
                     order_by,
                 )
                 .rows(db)
@@ -42220,6 +42228,10 @@ fn resolve_having(
     key_fids: &[usize],
     columns: &[RelationColumn],
     descs: &[Descriptor],
+    // the `?` sink: a HAVING `?` (COUNT(*) > ?, or a group key > ?) claims
+    // a slot here, described as the compared value's type - the aggregate
+    // output (INT64) or the grouped key's own descriptor
+    params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Predicate> {
     let (raw, tags) = raw;
     let mut groups = Vec::new();
@@ -42230,7 +42242,7 @@ fn resolve_having(
                 terms.push(Term::Const(b));
                 continue;
             }
-            let (idx, kind) = match &rt.lhs {
+            let (idx, kind, pdesc): (usize, ColKind, Option<Descriptor>) = match &rt.lhs {
                 // a function call in HAVING is a later slice - refuse
                 RawLhs::Expr(_) => return None,
                 // a `?` as the tested side of a HAVING: unprobed - refuse
@@ -42242,6 +42254,7 @@ fn resolve_having(
                         return None; // HAVING on a non-grouped column
                     }
                     let kind = col_kind(descs.get(fid)?)?;
+                    let pdesc = descs.get(fid)?.clone();
                     let idx = gitems
                         .iter()
                         .position(|gi| matches!(gi, GItem::Key(f) if *f == fid))
@@ -42249,7 +42262,7 @@ fn resolve_having(
                             gitems.push(GItem::Key(fid));
                             gitems.len() - 1
                         });
-                    (idx, kind)
+                    (idx, kind, Some(pdesc))
                 }
                 RawLhs::Agg(func, target) => {
                     // the aggregate's OUTPUT shape decides how the
@@ -42386,10 +42399,26 @@ fn resolve_having(
                         continue;
                     }
                     let kind = if hkind == HKind::Text { ColKind::Text } else { ColKind::Int };
-                    (idx, kind)
+                    // an INTEGER aggregate's `?` describes as INT64 (probed:
+                    // HAVING COUNT(*) > ? / SUM(int) > ? is 580); a text
+                    // aggregate `?` is unprobed, so it refuses (pdesc None)
+                    let pdesc = (kind == ColKind::Int).then(|| Descriptor {
+                        dtype: dtype::INT64,
+                        scale: 0,
+                        length: 8,
+                        sub_type: 0,
+                        flags: 0,
+                        offset: 0,
+                    });
+                    (idx, kind, pdesc)
                 }
             };
-            terms.push(typed_term(idx, kind, rt.kind)?);
+            // a `?` on the compared side claims its slot with the value's
+            // describe; a literal keeps the ordinary typed term
+            terms.push(match pdesc {
+                Some(d) => param_or_typed_term(idx, kind, rt.kind, &d, params)?,
+                None => typed_term(idx, kind, rt.kind)?,
+            });
         }
         groups.push(terms);
     }
@@ -49602,7 +49631,7 @@ mod tests {
         // COUNT(*) resolves to the EXISTING item 1; SUM(SALARY) and the
         // grouped key DEPT_ID... COUNT(*) again must not duplicate
         let raw = parse_predicate(&tokenize("COUNT(*) > 3 AND SUM(SALARY) > 100 OR DEPT_ID IS NULL").unwrap(), &mut 0).unwrap();
-        let p = resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).unwrap();
+        let p = resolve_having(raw, &mut gitems, &key_fids, &columns, &descs, &mut Vec::new()).unwrap();
         assert_eq!(gitems.len(), 3); // one hidden item appended: SUM(SALARY)
         assert!(matches!(gitems[2], GItem::Agg(AggFn::Sum, AggSrc::Field(5), false)));
         // output rows: [key, count, hidden sum]
@@ -49611,11 +49640,11 @@ mod tests {
         assert!(p.matches(&[Value::Null, Value::Int(1), Value::Null]).unwrap()); // the OR arm
         // a non-grouped column in HAVING is invalid
         let raw = parse_predicate(&tokenize("SALARY > 1").unwrap(), &mut 0).unwrap();
-        assert!(resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).is_none());
+        assert!(resolve_having(raw, &mut gitems, &key_fids, &columns, &descs, &mut Vec::new()).is_none());
         // MIN over a text column resolves now (a hidden text item) -
         // and its comparison is the pad-trimming text compare
         let raw = parse_predicate(&tokenize("MIN(NAME) = 'ann'").unwrap(), &mut 0).unwrap();
-        let p = resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).unwrap();
+        let p = resolve_having(raw, &mut gitems, &key_fids, &columns, &descs, &mut Vec::new()).unwrap();
         assert_eq!(gitems.len(), 4);
         assert!(matches!(gitems[3], GItem::Agg(AggFn::Min, AggSrc::Field(1), false)));
         assert!(p.matches(&[Value::Null, Value::Null, Value::Null, Value::Text("ann  ".into())]).unwrap());
@@ -49626,13 +49655,13 @@ mod tests {
         // table); a convertible one compares exactly (probed:
         // `HAVING SUM(N92) = '0.5'` answers the 0.50 group)
         let raw = parse_predicate(&tokenize("COUNT(*) = 'x'").unwrap(), &mut 0).unwrap();
-        let p = resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).unwrap();
+        let p = resolve_having(raw, &mut gitems, &key_fids, &columns, &descs, &mut Vec::new()).unwrap();
         assert_eq!(
             p.matches(&[Value::Int(1), Value::Int(4)]),
             Err(EvalErr::ConversionError(Some("x".into())))
         );
         let raw = parse_predicate(&tokenize("SUM(SALARY) = '200'").unwrap(), &mut 0).unwrap();
-        let p = resolve_having(raw, &mut gitems, &key_fids, &columns, &descs).unwrap();
+        let p = resolve_having(raw, &mut gitems, &key_fids, &columns, &descs, &mut Vec::new()).unwrap();
         assert!(p.matches(&[Value::Int(1), Value::Int(4), Value::Int(200)]).unwrap());
         // ...and WHERE resolution rejects aggregates outright
         let raw = parse_predicate(&tokenize("COUNT(*) > 3").unwrap(), &mut 0).unwrap();
