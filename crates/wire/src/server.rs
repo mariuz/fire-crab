@@ -20550,7 +20550,7 @@ fn plan_join_bound(
             Some(g) => parse_group_by(g, &items, &comb_cols, &comb_descs, synth_base)?,
         };
         let (mut cols, mut gitems) =
-            build_group_items(&items, &comb_cols, &comb_descs, &key_fids, &key_exprs, synth_base)?;
+            build_group_items(&items, &comb_cols, &comb_descs, &key_fids, &key_exprs, synth_base, params)?;
         // a PLAIN group key reads from the side it came from (probed:
         // `GROUP BY T.B` keys answer relation T, and the side's alias);
         // an expression key (a synthetic slot) reads from none
@@ -21224,8 +21224,12 @@ fn plan_over_source(
     // itself - lives in no schema, so it has no 3-part binding
     let bind = ColBinding { key: alias, qual: None };
     let unq = |t: &str| unqualify_single(t, &bind).unwrap_or_else(|| t.to_string());
-    let items_for_group = match parse_projection(&unq(proj_s))?
-    {
+    // renumber the grouped projection's `?` FIRST (the derived dispatch
+    // returned before the shared renumber_proj_params), so a projection
+    // param over a grouped derived source takes the leading input slots
+    let mut group_proj = parse_projection(&unq(proj_s))?;
+    let dgroup_params = renumber_proj_params(&mut group_proj);
+    let items_for_group = match group_proj {
         Proj::Items(v) => Some(v),
         Proj::Star => None,
     };
@@ -21241,7 +21245,7 @@ fn plan_over_source(
             Some(g) => parse_group_by(g, &items, &columns, &descs, synth_base)?,
         };
         let (mut gcols, mut gitems) =
-            build_group_items(&items, &columns, &descs, &key_fids, &key_exprs, synth_base)?;
+            build_group_items(&items, &columns, &descs, &key_fids, &key_exprs, synth_base, params)?;
         // a grouped KEY over the derived rows keeps the INNER column's
         // field name, exactly as the ungrouped read does (probed:
         // GROUP BY C over `X AS C` is field X, alias C)
@@ -21259,7 +21263,10 @@ fn plan_over_source(
                 }
             }
         }
-        let mut np = 0usize;
+        // the projection's `?` took slots 0..dgroup_params; a WHERE or
+        // HAVING `?` over a grouped derived source is still unsupported,
+        // so np must not advance past them
+        let mut np = dgroup_params;
         let filter = match where_s {
             None => None,
             Some(ws) => Some(resolve_predicate(
@@ -21277,7 +21284,7 @@ fn plan_over_source(
                     .and_then(|raw| resolve_having(raw, &mut gitems, &key_fids, &columns, &descs))?,
             ),
         };
-        if np != 0 {
+        if np != dgroup_params {
             return None;
         }
         let order_by = match order_s {
@@ -24299,7 +24306,7 @@ fn plan_query_inner_ctx(
     // (including a lone parameterised aggregate, deferred to fetch)
     match plan_group(
         &items, group_s, having_s, order_s, rel, formats, &columns, &descs, filter, table,
-        left.alias,
+        left.alias, params,
     ) {
         Some(Plan::Group {
             rel,
@@ -24686,6 +24693,11 @@ fn build_group_items(
     key_fids: &[usize],
     key_exprs: &[(RawExpr, Expr)],
     synth_base: usize,
+    // the projection's `?` sink: a typed CAST(? AS ..) in the select list
+    // is a column-free constant item, so it fills a slot here just as it
+    // does on the plain path. The caller must have renumbered the
+    // projection's params first.
+    sink: &mut Vec<Option<Descriptor>>,
 ) -> Option<(Vec<ProjCol>, Vec<GItem>)> {
     let mut gitems = Vec::new();
     let mut cols = Vec::new();
@@ -24769,11 +24781,15 @@ fn build_group_items(
                     // contained in an aggregate or the GROUP BY"); a `?`
                     // param is deferred to its own slice. The item takes a
                     // placeholder Const slot and its output column carries
-                    // the expression, evaluated per (group) row.
-                    if raw_has_param(raw) {
-                        return None;
-                    }
-                    let re = resolve_expr(raw, columns, descs)?;
+                    // the expression, evaluated per (group) row. A typed
+                    // `?` (CAST(? AS ..)) is a column-free item too - it
+                    // resolves through the param-aware path, filling its
+                    // reserved sink slot, and rides the same Const slot.
+                    let re = if raw_has_param(raw) {
+                        resolve_proj_expr(raw, columns, descs, sink)?
+                    } else {
+                        resolve_expr(raw, columns, descs)?
+                    };
                     if expr_has_col(&re) {
                         return None;
                     }
@@ -25105,6 +25121,10 @@ fn plan_group(
     filter: Option<Predicate>,
     rel_name: &str,
     rel_alias: Option<&str>,
+    // the projection `?` sink - a typed CAST(? AS ..) in the grouped
+    // select list fills a slot here (the projection is renumbered before
+    // the WHERE, which the caller already numbers past it)
+    params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Plan> {
     // grouping decodes records, which needs the relation's formats: a
     // relation without any (a system relation) cannot be answered here -
@@ -25125,7 +25145,7 @@ fn plan_group(
         Some(g) => parse_group_by(g, items, columns, descs, synth_base)?,
     };
     let (mut cols, mut gitems) =
-        build_group_items(items, columns, descs, &key_fids, &key_exprs, synth_base)?;
+        build_group_items(items, columns, descs, &key_fids, &key_exprs, synth_base, params)?;
     // a PLAIN group key reads from the grouped relation (probed:
     // `SELECT B, COUNT(*) ... GROUP BY B` answers relation T on the
     // key, "" on the fold); an expression key - a synthetic slot at or
@@ -27930,7 +27950,11 @@ fn subst_params_expr(e: &Expr, args: &[WireParam]) -> Option<Expr> {
 /// Does this plan's PROJECTION carry `?` parameters that must be bound?
 fn plan_has_proj_param(plan: &Plan) -> bool {
     let cols = match plan {
-        Plan::Project { cols, .. } | Plan::Join { cols, .. } | Plan::Derived { cols, .. } => cols,
+        Plan::Project { cols, .. }
+        | Plan::Join { cols, .. }
+        | Plan::Derived { cols, .. }
+        | Plan::Group { cols, .. }
+        | Plan::JoinGroup { cols, .. } => cols,
         _ => return false,
     };
     cols.iter().any(|c| c.expr.as_ref().is_some_and(expr_has_param))
@@ -27941,8 +27965,11 @@ fn plan_has_proj_param(plan: &Plan) -> bool {
 /// before any fetch path evaluates the projection.
 fn bind_plan_params(plan: &Plan, args: &[WireParam]) -> Option<Plan> {
     let mut p = plan.clone();
-    if let Plan::Project { cols, .. } | Plan::Join { cols, .. } | Plan::Derived { cols, .. } =
-        &mut p
+    if let Plan::Project { cols, .. }
+    | Plan::Join { cols, .. }
+    | Plan::Derived { cols, .. }
+    | Plan::Group { cols, .. }
+    | Plan::JoinGroup { cols, .. } = &mut p
     {
         for c in cols.iter_mut() {
             if c.expr.as_ref().is_some_and(expr_has_param) {
