@@ -10,10 +10,12 @@
 # params (probed: WHERE ? then HAVING ? is input slots 0, 1). Driven by
 # node-firebird against fire-crab and the live engine, rows compared.
 #
-# SCOPE: an integer aggregate (COUNT / SUM over an integer) or a grouped
-# key on the tested side. A HAVING `?` against a NUMERIC or TEXT
-# aggregate is a separate slice (its slot describe is unprobed), and so
-# is a `?` on the AGGREGATE side of the comparison.
+# SCOPE: the compared side is COUNT, an integer/NUMERIC(<=18) aggregate
+# (SUM/AVG kept at the fold's INT64 describe), a text MIN/MAX (VARYING),
+# or a grouped key. An INT128-backed fold (NUMERIC precision past 18) and
+# an approximate SUM/AVG refuse - the former owes an INT128 input param
+# the message decoder does not read yet, the latter has no describe here.
+# A `?` on the AGGREGATE side of the comparison is a separate slice.
 #
 #   qa/serve-real-havingparam.sh [port]
 set -u
@@ -30,10 +32,10 @@ if ! command -v node >/dev/null 2>&1 || ! node -e 'require("node-firebird")' >/d
 fi
 mkdb() { rm -f "$1"; "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
 CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
-CREATE TABLE T (ID INTEGER, V INTEGER);
+CREATE TABLE T (ID INTEGER, V INTEGER, N92 NUMERIC(9,2), NM VARCHAR(10));
 COMMIT;
-INSERT INTO T VALUES (1,10); INSERT INTO T VALUES (2,10); INSERT INTO T VALUES (3,20);
-INSERT INTO T VALUES (4,30); INSERT INTO T VALUES (5,30); INSERT INTO T VALUES (6,30);
+INSERT INTO T VALUES (1,10,1.50,'aa'); INSERT INTO T VALUES (2,10,2.50,'ab'); INSERT INTO T VALUES (3,20,5.00,'zz');
+INSERT INTO T VALUES (4,30,1.00,'kk'); INSERT INTO T VALUES (5,30,2.00,'ll'); INSERT INTO T VALUES (6,30,3.00,'mm');
 COMMIT;
 EOF
     chmod 666 "$1" 2>/dev/null
@@ -78,6 +80,12 @@ both "HAVING on group key"        "SELECT V, COUNT(*) AS N FROM T GROUP BY V HAV
 both "WHERE ? + HAVING ?"         "SELECT V, COUNT(*) AS N FROM T WHERE ID > ? GROUP BY V HAVING COUNT(*) >= ? ORDER BY V" "[1,2]"
 # implicit whole-table aggregate with a HAVING ?
 both "implicit agg HAVING ?"      "SELECT COUNT(*) AS N FROM T HAVING COUNT(*) > ?" "[3]"
+# a NUMERIC aggregate `?` - the fold's INT64-backed describe (scale kept)
+both "HAVING SUM(numeric) > ?"    "SELECT V, SUM(N92) AS S FROM T GROUP BY V HAVING SUM(N92) > ? ORDER BY V"  "[3.0]"
+both "HAVING AVG(numeric) >= ?"   "SELECT V, AVG(N92) AS A FROM T GROUP BY V HAVING AVG(N92) >= ? ORDER BY V" "[2.0]"
+# a TEXT MIN/MAX `?` - the source VARYING describe
+both "HAVING MIN(text) > ?"       "SELECT V, MIN(NM) AS M FROM T GROUP BY V HAVING MIN(NM) > ? ORDER BY V"    "[\"ab\"]"
+both "HAVING MAX(text) = ?"       "SELECT V, MAX(NM) AS M FROM T GROUP BY V HAVING MAX(NM) = ? ORDER BY V"    "[\"zz\"]"
 
 echo "ran $ran checks"
 exit $fail

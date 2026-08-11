@@ -42265,6 +42265,15 @@ fn resolve_having(
                     (idx, kind, Some(pdesc))
                 }
                 RawLhs::Agg(func, target) => {
+                    // the aggregate's OUTPUT descriptor is what a `?` on
+                    // the compared side describes as - INT64 for COUNT and
+                    // integer/numeric folds (INT128 past precision 18),
+                    // VARYING for a text MIN/MAX (probed: HAVING SUM(N92)
+                    // > ? is 580 scale -2, SUM(N184) > ? is INT128, MIN(NM)
+                    // > ? is VARYING len). None for a fold with no
+                    // describe here (an approximate SUM/AVG), so its `?`
+                    // refuses.
+                    let ad = agg_result_desc(*func, target, columns, descs);
                     // the aggregate's OUTPUT shape decides how the
                     // HAVING comparison resolves: COUNT and integer
                     // sources compare as integers, numeric sources
@@ -42393,24 +42402,35 @@ fn resolve_having(
                             RawKind::Cmp(_, Rhs::Null) => Term::Never,
                             RawKind::IsNull => Term::IsNull(idx),
                             RawKind::IsNotNull => Term::IsNotNull(idx),
+                            // a `?` claims the fold's own describe and
+                            // compares through the same exact alignment.
+                            // An approximate fold (ad None) refuses, and so
+                            // does an INT128-backed one (NUMERIC precision
+                            // past 18): its `?` owes an INT128 input the
+                            // message decoder does not read yet, so refuse
+                            // rather than mis-decode.
+                            RawKind::Cmp(op, Rhs::Param(slot, _)) => {
+                                let d = ad.clone()?;
+                                if d.dtype == dtype::INT128 || !param_target_ok(&d) {
+                                    return None;
+                                }
+                                if params.len() <= slot {
+                                    params.resize(slot + 1, None);
+                                }
+                                params[slot] = Some(d);
+                                Term::NumCmp(idx, op, Rhs::Param(slot, ColKind::Numeric))
+                            }
                             _ => return None,
                         };
                         terms.push(term);
                         continue;
                     }
                     let kind = if hkind == HKind::Text { ColKind::Text } else { ColKind::Int };
-                    // an INTEGER aggregate's `?` describes as INT64 (probed:
-                    // HAVING COUNT(*) > ? / SUM(int) > ? is 580); a text
-                    // aggregate `?` is unprobed, so it refuses (pdesc None)
-                    let pdesc = (kind == ColKind::Int).then(|| Descriptor {
-                        dtype: dtype::INT64,
-                        scale: 0,
-                        length: 8,
-                        sub_type: 0,
-                        flags: 0,
-                        offset: 0,
-                    });
-                    (idx, kind, pdesc)
+                    // an INTEGER aggregate's `?` describes as INT64 and a
+                    // text MIN/MAX `?` as the source VARYING - the
+                    // aggregate's own output descriptor either way (probed:
+                    // COUNT(*) > ? is 580, MIN(NM) > ? is VARYING len)
+                    (idx, kind, ad.clone())
                 }
             };
             // a `?` on the compared side claims its slot with the value's
