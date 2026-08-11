@@ -31462,16 +31462,23 @@ fn cast_target_descriptor(t: &CastTarget) -> Option<Descriptor> {
         CastTarget::Temporal(TKind::Date) => d(dtype::SQL_DATE, 0, 4, 0),
         CastTarget::Temporal(TKind::Time) => d(dtype::SQL_TIME, 0, 4, 0),
         CastTarget::Temporal(TKind::Timestamp) => d(dtype::TIMESTAMP, 0, 8, 0),
-        // a TEXT target refuses here, as it does everywhere in this
-        // server: CAST(... AS VARCHAR/CHAR) is unimplemented even for a
-        // literal (probed: CAST('ab' AS VARCHAR(3)) is SQLSTATE 42000
-        // where the engine fits 'ab', and an over-length source owes the
-        // engine's 22001 "string right truncation" that this server does
-        // not raise). Announcing the slot would let a `?` reach an eval
-        // that silently mishandles the width, so the whole CAST-to-text
-        // feature (blank-fit truncation + the 22001 error) is left as its
-        // own slice and the `?` refuses with it.
-        CastTarget::Text { .. } => return None,
+        // a TEXT target travels in its native slot at the declared
+        // width: VARCHAR (pad = false) is VARYING, whose length carries
+        // the 2-byte count word ([wire_for]), so len + 2 announces `len`
+        // characters; CHAR (pad = true) is fixed TEXT at `len`. The CAST
+        // eval now fits the bound value into the width (the blank-fit and
+        // 22001/22018 rules of the CAST-to-text slice), so the `?`
+        // converts like a literal. The slot charset is the ATTACHMENT's,
+        // which this describe leaves flat (append_bind_section does not
+        // resolve it) - but node-firebird binds value-derived BLR
+        // regardless, so the CAST reads the value all the same. (wire_for
+        // renders both text dtypes as 448 VARYING on the wire, a
+        // server-wide convention the engine's CHAR-as-452 SQL_TEXT
+        // diverges from - a describe boundary, not a value one.)
+        CastTarget::Text { len, pad: true, .. } => d(dtype::TEXT, 0, *len as u16, 0),
+        CastTarget::Text { len, pad: false, .. } => {
+            d(dtype::VARYING, 0, (*len as u16).saturating_add(2), 0)
+        }
     })
 }
 
