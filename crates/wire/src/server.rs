@@ -5133,14 +5133,30 @@ enum RankFn {
     DenseRank,
 }
 
+/// A NAVIGATION window function - one whose value is another row's, read
+/// by OFFSET along the ordered partition (probed: describes as the
+/// argument's own type, Nullable, named LAG/LEAD).
+#[derive(Clone, Copy, PartialEq)]
+enum NavFn {
+    /// the argument's value `offset` rows EARLIER in the ordered partition
+    Lag,
+    /// ... `offset` rows LATER
+    Lead,
+}
+
 /// The function a window column computes. An [AggFn] fold over a partition
-/// (the whole-partition frame), or a [RankFn] position within the ordered
-/// partition. Parse-level: the aggregate carries its [AggTarget] (which may
-/// hold a RawExpr argument), resolved to an [AggSrc] at plan time.
+/// (the whole-partition or, with an ORDER BY, the running frame), a
+/// [RankFn] position within the ordered partition, or a [NavFn] read of
+/// another row by offset. Parse-level: the aggregate carries its
+/// [AggTarget] and the navigation its argument/default as RawExpr, both
+/// resolved at plan time.
 #[derive(Clone)]
 enum WinFunc {
     Agg(AggFn, AggTarget),
     Rank(RankFn),
+    /// (function, argument, offset, default) - `LAG(arg [, offset
+    /// [, default]])`; offset defaults to 1, default to NULL
+    Nav(NavFn, RawExpr, usize, Option<RawExpr>),
 }
 
 /// What an aggregate is computed over.
@@ -24377,6 +24393,34 @@ fn plan_query_inner_ctx(
                                 };
                                 (pc, WinKind::Rank(*rk))
                             }
+                            // A NAVIGATION WINDOW (LAG/LEAD) reads another
+                            // row's value by offset along the ordered
+                            // partition, so it NEEDS the order; it describes
+                            // as its ARGUMENT's own type, Nullable (probed).
+                            WinFunc::Nav(nf, arg_raw, offset, def_raw) => {
+                                if order.is_empty() {
+                                    return None; // navigation with no order is unpinned
+                                }
+                                let arg = resolve_expr(arg_raw, &columns, &descs)?;
+                                let default = match def_raw {
+                                    None => None,
+                                    Some(d) => Some(resolve_expr(d, &columns, &descs)?),
+                                };
+                                // the argument's describe, through the same
+                                // expression-column builder every scalar
+                                // uses (it announces NULLABLE, which LAG/LEAD
+                                // are); only the name and slot are the
+                                // window's
+                                let mut pc =
+                                    build_expr_col_from(arg.clone(), &fname, &descs)?;
+                                pc.name = alias.clone().unwrap_or_else(|| fname.clone());
+                                pc.fname = Some(fname.clone());
+                                pc.relation = None;
+                                pc.rel_alias = None;
+                                pc.field_id = win_base + windows.len();
+                                pc.expr = None;
+                                (pc, WinKind::Nav { func: *nf, arg, offset: *offset, default })
+                            }
                         };
                         windows.push(WinSpec { kind, part, order });
                         out.push(pc);
@@ -26815,6 +26859,36 @@ fn compute_windows(
                             RankFn::Rank => rank,
                             RankFn::DenseRank => dense,
                         });
+                    }
+                }
+                WinKind::Nav { func, arg, offset, default } => {
+                    // order the partition, then each row reads the ARGUMENT
+                    // from the row `offset` positions back (LAG) or forward
+                    // (LEAD); off the ends it is the default (evaluated on
+                    // the CURRENT row) or NULL. Stable sort, so a tie keeps
+                    // scan order - the only order navigation across peers
+                    // can have.
+                    let mut perm: Vec<usize> = (0..idxs.len()).collect();
+                    perm.sort_by(|&a, &b| {
+                        order_cmp(&ordrows[idxs[a]], &ordrows[idxs[b]], &okeys)
+                    });
+                    let len = perm.len();
+                    for (pos, &p) in perm.iter().enumerate() {
+                        let cur = idxs[p];
+                        let src = match func {
+                            NavFn::Lag => pos.checked_sub(*offset),
+                            NavFn::Lead => {
+                                let s = pos + *offset;
+                                (s < len).then_some(s)
+                            }
+                        };
+                        vals[cur][wi] = match src {
+                            Some(sp) => arg.eval(&rows[idxs[perm[sp]]])?,
+                            None => match default {
+                                Some(d) => d.eval(&rows[cur])?,
+                                None => Value::Null,
+                            },
+                        };
                     }
                 }
             }
@@ -30011,6 +30085,10 @@ struct WinSpec {
 enum WinKind {
     Agg { func: AggFn, src: AggSrc, distinct: bool },
     Rank(RankFn),
+    /// `LAG`/`LEAD`: `arg` read from the row `offset` positions away in the
+    /// ordered partition, or `default` (else NULL) when that row is outside
+    /// the partition
+    Nav { func: NavFn, arg: Expr, offset: usize, default: Option<Expr> },
 }
 
 /// A select-list expression before column names are resolved to field
@@ -37046,10 +37124,13 @@ fn parse_window_item(body: &str) -> Option<(WinFunc, Vec<RawExpr>, Option<String
         return None;
     }
     let call = t[..=call_end].trim();
-    // a ranking function - `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, an
-    // EMPTY argument list - or else an aggregate the ordinary parser reads
+    // a ranking function (`ROW_NUMBER()`/`RANK()`/`DENSE_RANK()`, empty
+    // args), a navigation one (`LAG`/`LEAD`, one to three args), or else an
+    // aggregate the ordinary parser reads
     let func = if let Some(rk) = parse_rank_call(call) {
         WinFunc::Rank(rk)
+    } else if let Some((nf, arg, off, def)) = parse_nav_call(call) {
+        WinFunc::Nav(nf, arg, off, def)
     } else {
         let (f, target) = parse_agg_item(call)?;
         WinFunc::Agg(f, target)
@@ -37078,6 +37159,42 @@ fn parse_rank_call(call: &str) -> Option<RankFn> {
         "DENSE_RANK" => Some(RankFn::DenseRank),
         _ => None,
     }
+}
+
+/// `LAG`/`LEAD` - `<fn>( arg [, offset [, default]] )`. The offset is a
+/// non-negative integer LITERAL (default 1); anything else (an expression
+/// offset) refuses - a later slice. `default` is any expression (default
+/// NULL). Returns the function, the argument, the offset and the default.
+fn parse_nav_call(call: &str) -> Option<(NavFn, RawExpr, usize, Option<RawExpr>)> {
+    let t = call.trim();
+    let open = t.find('(')?;
+    if !t.ends_with(')') {
+        return None;
+    }
+    let f = match t[..open].trim().to_ascii_uppercase().as_str() {
+        "LAG" => NavFn::Lag,
+        "LEAD" => NavFn::Lead,
+        _ => return None,
+    };
+    let args: Vec<&str> = split_top_level_commas(t[open + 1..t.len() - 1].trim())
+        .into_iter()
+        .map(str::trim)
+        .collect();
+    if args.is_empty() || args.len() > 3 || args[0].is_empty() {
+        return None;
+    }
+    let arg = parse_raw_expr_any(args[0])?;
+    let offset = match args.get(1) {
+        None => 1usize,
+        // a plain non-negative integer literal - an expression offset is a
+        // later slice
+        Some(s) => s.parse::<usize>().ok()?,
+    };
+    let default = match args.get(2) {
+        None => None,
+        Some(s) => Some(parse_raw_expr_any(s)?),
+    };
+    Some((f, arg, offset, default))
 }
 
 /// Parse the inside of an `OVER ( ... )`: an optional `PARTITION BY
@@ -37227,6 +37344,8 @@ fn parse_projection(proj: &str) -> Option<Proj> {
                 WinFunc::Rank(RankFn::RowNumber) => "ROW_NUMBER",
                 WinFunc::Rank(RankFn::Rank) => "RANK",
                 WinFunc::Rank(RankFn::DenseRank) => "DENSE_RANK",
+                WinFunc::Nav(NavFn::Lag, ..) => "LAG",
+                WinFunc::Nav(NavFn::Lead, ..) => "LEAD",
             }
             .to_string();
             items.push(SelItem::Win(func, part, order, alias_owned, fname));

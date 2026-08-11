@@ -21,16 +21,21 @@
 # partition, and a ranking beside an aggregate window in one select; and
 # the RUNNING aggregate `<agg> OVER ( [PARTITION BY ...] ORDER BY ... )`
 # under the default RANGE frame, where rows tying on the ORDER BY keys
-# SHARE the cumulative value.
+# SHARE the cumulative value; and the NAVIGATION functions LAG / LEAD -
+# `LAG(arg [, offset [, default]]) OVER ( [PARTITION BY ...] ORDER BY ...)`
+# - reading a row `offset` positions back (LAG) or forward (LEAD), the
+# default (else NULL) off the partition's ends, describing as the
+# argument's own type.
 #
 # SCOPE. An AGGREGATE window with no ORDER BY is the whole-partition
 # frame; with one it is a RUNNING aggregate (default RANGE, peers share).
-# An EXPLICIT frame (ROWS/RANGE BETWEEN ...) is a later slice. Still
-# refused, each its own slice: a navigation function (LAG/LEAD), a window
-# over a JOIN or a derived / CTE / union-branch row source, a window mixed
-# with GROUP BY, and a `?` inside a window. Every ROW_NUMBER check uses a
-# TOTAL order - a tie leaves the sequence unpinned, so only a total order
-# is differentially deterministic.
+# LAG/LEAD need an ORDER BY (the offset is along it). An EXPLICIT frame
+# (ROWS/RANGE BETWEEN ...) is a later slice. Still refused, each its own
+# slice: a window over a JOIN or a derived / CTE / union-branch row
+# source, a window mixed with GROUP BY, and a `?` inside a window. Every
+# ROW_NUMBER and LAG/LEAD check uses a TOTAL order - a tie leaves the row
+# sequence unpinned, so only a total order is differentially
+# deterministic.
 #
 #   qa/serve-real-window.sh [port]
 set -u
@@ -123,6 +128,16 @@ both "running SUM PARTITION"   "SELECT ID, G, SUM(V) OVER (PARTITION BY G ORDER 
 both "running SUM DESC"        "SELECT ID, SUM(V) OVER (ORDER BY V DESC) S FROM T ORDER BY V DESC, ID"
 both "running numeric SUM"     "SELECT ID, G, SUM(N92) OVER (PARTITION BY G ORDER BY V) S FROM T ORDER BY G, V, ID"
 both "running + whole + rank"  "SELECT ID, G, SUM(V) OVER (PARTITION BY G ORDER BY V) RS, SUM(V) OVER (PARTITION BY G) TS, RANK() OVER (PARTITION BY G ORDER BY V) RK FROM T ORDER BY G, V, ID"
+# --- navigation functions (LAG / LEAD) ---
+both "LAG(V)"                  "SELECT ID, LAG(V) OVER (ORDER BY ID) L FROM T ORDER BY ID"
+both "LAG(V,2)"                "SELECT ID, LAG(V,2) OVER (ORDER BY ID) L FROM T ORDER BY ID"
+both "LAG(V,1,-9) default"     "SELECT ID, LAG(V,1,-9) OVER (ORDER BY ID) L FROM T ORDER BY ID"
+both "LEAD(V)"                 "SELECT ID, LEAD(V) OVER (ORDER BY ID) L FROM T ORDER BY ID"
+both "LEAD(V,1,-9) default"    "SELECT ID, LEAD(V,1,-9) OVER (ORDER BY ID) L FROM T ORDER BY ID"
+both "LAG partition"           "SELECT ID, G, LAG(V) OVER (PARTITION BY G ORDER BY ID) L FROM T ORDER BY G, ID"
+both "LAG text arg"            "SELECT ID, LAG(NM) OVER (ORDER BY ID) L FROM T ORDER BY ID"
+both "LAG expression arg"      "SELECT ID, LAG(V*2) OVER (ORDER BY ID) L FROM T ORDER BY ID"
+both "LAG + LEAD + ranking"    "SELECT ID, LAG(V) OVER (ORDER BY ID) LA, LEAD(V) OVER (ORDER BY ID) LE, ROW_NUMBER() OVER (ORDER BY ID) RN FROM T ORDER BY ID"
 
 echo "ran $ran checks"
 exit $fail
