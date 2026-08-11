@@ -24773,33 +24773,64 @@ fn build_group_items(
                     gitems.push(GItem::Key(synth_base + pos));
                     slot_descs.push(None); // an expression key: not addressable by name
                 } else {
-                    // NOT a group key. The engine allows only a CONSTANT
-                    // here - a projected literal or constant expression
-                    // that references no column, answered once per group
-                    // (probed: SELECT 42, COUNT(*) FROM T GROUP BY V). A
-                    // non-key COLUMN expression is invalid SQL ("not
-                    // contained in an aggregate or the GROUP BY"); a `?`
-                    // param is deferred to its own slice. The item takes a
-                    // placeholder Const slot and its output column carries
-                    // the expression, evaluated per (group) row. A typed
-                    // `?` (CAST(? AS ..)) is a column-free item too - it
-                    // resolves through the param-aware path, filling its
-                    // reserved sink slot, and rides the same Const slot.
-                    let re = if raw_has_param(raw) {
+                    // NOT the group key itself. Two shapes the engine
+                    // still answers, both column-determined by the group:
+                    //
+                    //   * a CONSTANT - a literal, a constant expression, or
+                    //     a typed `?` (CAST(? AS ..)) - references no column
+                    //     and is the same value in every group row (probed:
+                    //     SELECT 42, COUNT(*) FROM T GROUP BY V). It takes a
+                    //     placeholder Const slot and carries the expression
+                    //     on its output column; a `?` fills its sink slot.
+                    //
+                    //   * an EXPRESSION OVER THE GROUPING COLUMNS - V*2 or
+                    //     UPPER(NM) when the group is BY V / BY NM - which
+                    //     the engine allows by functional dependence
+                    //     (probed). It is DEFERRED to the second pass, which
+                    //     resolves it over the group row's key slots exactly
+                    //     as it does an expression folding aggregates; an
+                    //     expression naming a NON-grouped column fails to
+                    //     resolve there and is refused, the engine's -104.
+                    let param = raw_has_param(raw);
+                    let re = if param {
                         resolve_proj_expr(raw, columns, descs, sink)?
                     } else {
                         resolve_expr(raw, columns, descs)?
                     };
-                    if expr_has_col(&re) {
+                    if !expr_has_col(&re) {
+                        let mut pc = build_expr_col_from(re.clone(), name, descs)?;
+                        pc.fname = Some(fname.clone());
+                        pc.field_id = out_idx;
+                        pc.expr = Some(re);
+                        cols.push(pc);
+                        gitems.push(GItem::Const(Value::Null));
+                        slot_descs.push(None);
+                    } else if param {
+                        // a `?` mixed into a column expression
+                        // (V + CAST(? AS INT)) is functionally valid on the
+                        // engine but a boundary here
                         return None;
+                    } else {
+                        // an expression over the grouping columns: defer it,
+                        // typed and evaluated over the key slots below
+                        deferred.push((out_idx, raw.clone(), name.clone()));
+                        cols.push(ProjCol {
+                            name: name.clone(),
+                            fname: Some(fname.clone()),
+                            relation: None,
+                            rel_alias: None,
+                            field_id: out_idx,
+                            wire: Wire::Int64,
+                            sql_type: 581,
+                            length: 8,
+                            oct_length: 8,
+                            scale: 0,
+                            sub_type: 0,
+                            expr: None,
+                        });
+                        gitems.push(GItem::Const(Value::Null));
+                        slot_descs.push(None);
                     }
-                    let mut pc = build_expr_col_from(re.clone(), name, descs)?;
-                    pc.fname = Some(fname.clone());
-                    pc.field_id = out_idx;
-                    pc.expr = Some(re);
-                    cols.push(pc);
-                    gitems.push(GItem::Const(Value::Null));
-                    slot_descs.push(None);
                 }
             }
             SelItem::Gen(..) => return None,  // generator advances need the Project path
@@ -25000,6 +25031,16 @@ fn build_group_items(
                     expr: None,
                 });
                 gitems.push(GItem::Agg(*func, src, distinct));
+                // KEEP slot_descs PARALLEL to gitems: a bare aggregate is a
+                // group-row slot like any other, and the second pass reads
+                // slot_descs BY SLOT INDEX to build the synthetic group-row
+                // view. Omitting it left slot_descs one short per bare
+                // aggregate, so a later appended key slot (an expression
+                // over a grouping column selects no bare key) landed on the
+                // wrong descriptor - a zero one - and the expression would
+                // not type. The slot carries the aggregate's own result
+                // descriptor.
+                slot_descs.push(agg_result_desc(*func, target, columns, descs));
             }
         }
     }
