@@ -34178,24 +34178,53 @@ impl Expr {
                         // is a value the SQL surface can be asked about,
                         // so `Value::render` (which the dumpers and the
                         // display path share) keeps the lower-case form.
+                        // the OVERFLOW error class turns on the SOURCE:
+                        // a rendered NUMERIC earns 22018 (probed:
+                        // CAST(12345 AS VARCHAR(3))), while a string, a
+                        // temporal or a boolean rendered to text is a
+                        // 22001 string right truncation like a plain text
+                        // source (probed: CAST(DATE'2020-06-15' AS
+                        // VARCHAR(5)) is 22001, not 22018)
+                        let is_numeric_src = matches!(
+                            v,
+                            Value::Int(_) | Value::Scaled(..) | Value::Int128(..) | Value::Double(_)
+                        );
                         let s = match v {
                             Value::Bool(b) => {
                                 if b { "TRUE".to_string() } else { "FALSE".to_string() }
                             }
                             _ => v.render(),
                         };
-                        if s.chars().count() > *len {
-                            return Err(EvalErr::ConversionError(None));
-                        }
-                        let out = if *pad {
-                            let mut s = s;
-                            while s.chars().count() < *len {
-                                s.push(' ');
+                        let chars: Vec<char> = s.chars().collect();
+                        // FIT to the declared width. The engine keeps the
+                        // first `len` characters and drops overflow that is
+                        // ALL TRAILING BLANKS (probed: CAST('ab   ' AS
+                        // VARCHAR(3)) is 'ab '); a non-blank overflow raises
+                        // - 22001 *string right truncation* for a TEXT
+                        // source, the 22018 conversion error a rendered
+                        // NUMERIC / temporal source earns (probed:
+                        // CAST(12345 AS VARCHAR(3)) is 22018 "...12345").
+                        let mut out = if chars.len() > *len {
+                            if chars[*len..].iter().any(|&c| c != ' ') {
+                                return Err(if is_numeric_src {
+                                    EvalErr::ConversionError(Some(s.clone()))
+                                } else {
+                                    EvalErr::StringTruncation {
+                                        expected: *len as i64,
+                                        actual: chars.len() as i64,
+                                    }
+                                });
                             }
-                            s
+                            chars[..*len].iter().collect::<String>()
                         } else {
                             s
                         };
+                        // CHAR pads the survivor to the declared width
+                        if *pad {
+                            while out.chars().count() < *len {
+                                out.push(' ');
+                            }
+                        }
                         Value::Text(out)
                     }
                     // to an EXACT numeric at a declared scale: every
