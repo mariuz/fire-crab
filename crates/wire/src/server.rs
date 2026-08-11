@@ -5069,6 +5069,15 @@ enum GItem {
     Key(usize),
     /// (function, source, distinct) - distinct only with COUNT
     Agg(AggFn, AggSrc, bool),
+    /// a per-group CONSTANT slot: a projected item that references no
+    /// column - a literal, a constant expression, or a typed `?` param -
+    /// which the engine answers once per group (probed: SELECT 42,
+    /// COUNT(*) FROM T GROUP BY V is 42 in every group row). The slot is
+    /// a placeholder for output-column alignment; the output column
+    /// carries the expression and is evaluated per row (ignoring the
+    /// slot), so a `?` binds at execute. Carried as a value so a folded
+    /// literal needs no expression at all.
+    Const(Value),
 }
 
 /// Where an aggregate's per-row input value comes from.
@@ -24729,30 +24738,53 @@ fn build_group_items(
                 });
             }
             SelItem::Expr(raw, name, fname) => {
-                let pos = {
-                    let n = normalize_raw(raw);
-                    key_exprs.iter().position(|(r, _)| *r == n)?
-                };
-                // the describe comes from the expression's own typing;
-                // the VALUE comes from the group's computed key slot,
-                // so the output column reads plainly (expr: None)
-                let pc = build_expr_col(raw, name, columns, descs)?;
-                cols.push(ProjCol {
-                    name: pc.name,
-                    fname: Some(fname.clone()),
-                    relation: None,
-                    rel_alias: None,
-                    field_id: out_idx,
-                    wire: pc.wire,
-                    sql_type: pc.sql_type,
-                    length: pc.length,
-                    oct_length: pc.oct_length,
-                    scale: pc.scale,
-                    sub_type: pc.sub_type,
-                    expr: None,
-                });
-                gitems.push(GItem::Key(synth_base + pos));
-                slot_descs.push(None); // an expression key: not addressable by name
+                let n = normalize_raw(raw);
+                if let Some(pos) = key_exprs.iter().position(|(r, _)| *r == n) {
+                    // the describe comes from the expression's own typing;
+                    // the VALUE comes from the group's computed key slot,
+                    // so the output column reads plainly (expr: None)
+                    let pc = build_expr_col(raw, name, columns, descs)?;
+                    cols.push(ProjCol {
+                        name: pc.name,
+                        fname: Some(fname.clone()),
+                        relation: None,
+                        rel_alias: None,
+                        field_id: out_idx,
+                        wire: pc.wire,
+                        sql_type: pc.sql_type,
+                        length: pc.length,
+                        oct_length: pc.oct_length,
+                        scale: pc.scale,
+                        sub_type: pc.sub_type,
+                        expr: None,
+                    });
+                    gitems.push(GItem::Key(synth_base + pos));
+                    slot_descs.push(None); // an expression key: not addressable by name
+                } else {
+                    // NOT a group key. The engine allows only a CONSTANT
+                    // here - a projected literal or constant expression
+                    // that references no column, answered once per group
+                    // (probed: SELECT 42, COUNT(*) FROM T GROUP BY V). A
+                    // non-key COLUMN expression is invalid SQL ("not
+                    // contained in an aggregate or the GROUP BY"); a `?`
+                    // param is deferred to its own slice. The item takes a
+                    // placeholder Const slot and its output column carries
+                    // the expression, evaluated per (group) row.
+                    if raw_has_param(raw) {
+                        return None;
+                    }
+                    let re = resolve_expr(raw, columns, descs)?;
+                    if expr_has_col(&re) {
+                        return None;
+                    }
+                    let mut pc = build_expr_col_from(re.clone(), name, descs)?;
+                    pc.fname = Some(fname.clone());
+                    pc.field_id = out_idx;
+                    pc.expr = Some(re);
+                    cols.push(pc);
+                    gitems.push(GItem::Const(Value::Null));
+                    slot_descs.push(None);
+                }
             }
             SelItem::Gen(..) => return None,  // generator advances need the Project path
             SelItem::Col(name, alias) => {
@@ -26576,6 +26608,7 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                         scaled_value(sum / n as i128, scale.unwrap_or(0))
                     }
                 }
+                GItem::Const(v) => v.clone(), // a per-group constant slot
                 GItem::Agg(..) => Value::Null, // MIN/MAX/SUM(*): rejected at plan
             })
         })
