@@ -26701,11 +26701,11 @@ fn compute_windows(
         let pkeys: Vec<OrderKey> = (0..spec.part.len())
             .map(|i| OrderKey::field(i, false, NullsAt::Default))
             .collect();
-        // for a ranking window, the OVER's ORDER BY value of each row,
-        // decorated up front so an eval error surfaces before the sort and
-        // the comparator stays pure; field-indexed OrderKeys carry the
-        // per-key ASC/DESC/NULLS over these decorated rows
-        let ranking = matches!(spec.kind, WinKind::Rank(_));
+        // whenever the OVER carries an ORDER BY - a ranking, or a RUNNING
+        // aggregate - the order value of each row, decorated up front so an
+        // eval error surfaces before the sort and the comparator stays
+        // pure; field-indexed OrderKeys carry the per-key ASC/DESC/NULLS
+        // over these decorated rows
         let mut ordrows: Vec<Vec<Value>> = Vec::new();
         let okeys: Vec<OrderKey> = spec
             .order
@@ -26713,7 +26713,7 @@ fn compute_windows(
             .enumerate()
             .map(|(i, k)| OrderKey::field(i, k.desc, k.nulls))
             .collect();
-        if ranking {
+        if !spec.order.is_empty() {
             ordrows.reserve(n);
             for r in &rows {
                 let mut ov = Vec::with_capacity(spec.order.len());
@@ -26742,12 +26742,51 @@ fn compute_windows(
             match &spec.kind {
                 WinKind::Agg { func, src, distinct } => {
                     let gi = [GItem::Agg(*func, src.clone(), *distinct)];
-                    let bucket: Vec<Vec<Value>> =
-                        idxs.iter().map(|&k| rows[k].clone()).collect();
-                    let v =
-                        compute_group(&bucket, &gi)?.into_iter().next().unwrap_or(Value::Null);
-                    for &k in &idxs {
-                        vals[k][wi] = v.clone();
+                    if spec.order.is_empty() {
+                        // WHOLE-PARTITION frame: one fold for every row
+                        let bucket: Vec<Vec<Value>> =
+                            idxs.iter().map(|&k| rows[k].clone()).collect();
+                        let v = compute_group(&bucket, &gi)?
+                            .into_iter()
+                            .next()
+                            .unwrap_or(Value::Null);
+                        for &k in &idxs {
+                            vals[k][wi] = v.clone();
+                        }
+                    } else {
+                        // RUNNING aggregate, default RANGE frame: order the
+                        // partition, then every row is the fold over rows
+                        // FROM THE START THROUGH THE END OF ITS PEER GROUP
+                        // (rows tying on the ORDER BY keys share one value -
+                        // probed). One fold per peer group over the growing
+                        // prefix; groups are few and buckets small.
+                        let mut perm: Vec<usize> = (0..idxs.len()).collect();
+                        perm.sort_by(|&a, &b| {
+                            order_cmp(&ordrows[idxs[a]], &ordrows[idxs[b]], &okeys)
+                        });
+                        let mut s = 0usize;
+                        while s < perm.len() {
+                            let mut e = s;
+                            while e + 1 < perm.len()
+                                && order_cmp(
+                                    &ordrows[idxs[perm[e + 1]]],
+                                    &ordrows[idxs[perm[s]]],
+                                    &okeys,
+                                ) == Equal
+                            {
+                                e += 1;
+                            }
+                            let prefix: Vec<Vec<Value>> =
+                                perm[0..=e].iter().map(|&p| rows[idxs[p]].clone()).collect();
+                            let v = compute_group(&prefix, &gi)?
+                                .into_iter()
+                                .next()
+                                .unwrap_or(Value::Null);
+                            for p in &perm[s..=e] {
+                                vals[idxs[*p]][wi] = v.clone();
+                            }
+                            s = e + 1;
+                        }
                     }
                 }
                 WinKind::Rank(rk) => {
@@ -36978,13 +37017,13 @@ fn agg_named(word: &str) -> bool {
 /// and the OVER's ORDER BY still as RAW TEXT (resolved at plan through the
 /// shared ORDER BY parser; None = no order).
 ///
-/// An AGGREGATE window answers the WHOLE-PARTITION frame, so its ORDER BY
-/// (a RUNNING value) refuses here - a later slice. A RANKING window
-/// (ROW_NUMBER/RANK/DENSE_RANK) is ranked BY that order, so it keeps it.
-/// An explicit frame (ROWS/RANGE/GROUPS) and a navigation function
-/// (LAG/LEAD) refuse. A refusal drops the item to the ordinary paths,
-/// which fail the projection - the engine's "not a valid expression" for
-/// a shape this build does not answer.
+/// An AGGREGATE window with no ORDER BY is the whole-partition frame; with
+/// one it is a RUNNING aggregate under the default RANGE frame (peers
+/// share). A RANKING window (ROW_NUMBER/RANK/DENSE_RANK) is ranked BY that
+/// order. An explicit frame (ROWS/RANGE/GROUPS) and a navigation function
+/// (LAG/LEAD) refuse - later slices. A refusal drops the item to the
+/// ordinary paths, which fail the projection - the engine's "not a valid
+/// expression" for a shape this build does not answer.
 fn parse_window_item(body: &str) -> Option<(WinFunc, Vec<RawExpr>, Option<String>)> {
     let t = body.trim();
     let bytes = t.as_bytes();
@@ -37017,11 +37056,10 @@ fn parse_window_item(body: &str) -> Option<(WinFunc, Vec<RawExpr>, Option<String
     };
     let spec = t[over_lp + 1..over_end].trim();
     let (part, order) = parse_over_spec(spec)?;
-    // an aggregate window answers the WHOLE partition; an ORDER BY there is
-    // the running frame, a later slice
-    if matches!(func, WinFunc::Agg(..)) && order.is_some() {
-        return None;
-    }
+    // an aggregate window with an ORDER BY is a RUNNING aggregate under the
+    // default RANGE frame (peers share); with none it is the whole
+    // partition. Either is answered. An EXPLICIT frame (ROWS/RANGE) still
+    // refuses in parse_over_spec - a later slice.
     Some((func, part, order))
 }
 

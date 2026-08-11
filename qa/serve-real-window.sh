@@ -18,16 +18,19 @@
 # the window column, COUNT(DISTINCT) OVER - and the RANKING functions
 # ROW_NUMBER / RANK / DENSE_RANK OVER ( [PARTITION BY ...] ORDER BY ... ),
 # with ties (RANK gaps, DENSE_RANK does not), DESC and text ordering, a
-# partition, and a ranking beside an aggregate window in one select.
+# partition, and a ranking beside an aggregate window in one select; and
+# the RUNNING aggregate `<agg> OVER ( [PARTITION BY ...] ORDER BY ... )`
+# under the default RANGE frame, where rows tying on the ORDER BY keys
+# SHARE the cumulative value.
 #
-# SCOPE. The AGGREGATE window is the WHOLE-PARTITION frame: an ORDER BY
-# inside its OVER (a RUNNING value) or an explicit frame (ROWS/RANGE) is a
-# later slice. A RANKING window keeps its ORDER BY (that is what it ranks
-# by). Still refused, each its own later slice: a navigation function
-# (LAG/LEAD), a window over a JOIN or a derived / CTE / union-branch row
-# source, a window mixed with GROUP BY, and a `?` inside a window. Every
-# ROW_NUMBER check uses a TOTAL order - a tie leaves the sequence
-# unpinned, so only a total order is differentially deterministic.
+# SCOPE. An AGGREGATE window with no ORDER BY is the whole-partition
+# frame; with one it is a RUNNING aggregate (default RANGE, peers share).
+# An EXPLICIT frame (ROWS/RANGE BETWEEN ...) is a later slice. Still
+# refused, each its own slice: a navigation function (LAG/LEAD), a window
+# over a JOIN or a derived / CTE / union-branch row source, a window mixed
+# with GROUP BY, and a `?` inside a window. Every ROW_NUMBER check uses a
+# TOTAL order - a tie leaves the sequence unpinned, so only a total order
+# is differentially deterministic.
 #
 #   qa/serve-real-window.sh [port]
 set -u
@@ -111,6 +114,15 @@ both "RANK DESC"               "SELECT ID, RANK() OVER (ORDER BY V DESC) R FROM 
 both "ROW_NUMBER text order"   "SELECT ID, ROW_NUMBER() OVER (ORDER BY NM, ID) R FROM T ORDER BY ID"
 both "ranking + agg window"    "SELECT ID, G, RANK() OVER (PARTITION BY G ORDER BY V) R, SUM(V) OVER (PARTITION BY G) S FROM T ORDER BY G, V, ID"
 both "ranking no alias name"   "SELECT ROW_NUMBER() OVER (ORDER BY ID) FROM T ORDER BY 1"
+# --- running (ordered) aggregates, default RANGE frame (peers share) ---
+both "running SUM (peers)"     "SELECT ID, SUM(V) OVER (ORDER BY V) S FROM T ORDER BY V, ID"
+both "running COUNT (peers)"   "SELECT ID, COUNT(*) OVER (ORDER BY V) C FROM T ORDER BY V, ID"
+both "running AVG (peers)"     "SELECT ID, AVG(V) OVER (ORDER BY V) A FROM T ORDER BY V, ID"
+both "running MAX (peers)"     "SELECT ID, MAX(V) OVER (ORDER BY V) M FROM T ORDER BY V, ID"
+both "running SUM PARTITION"   "SELECT ID, G, SUM(V) OVER (PARTITION BY G ORDER BY V) S FROM T ORDER BY G, V, ID"
+both "running SUM DESC"        "SELECT ID, SUM(V) OVER (ORDER BY V DESC) S FROM T ORDER BY V DESC, ID"
+both "running numeric SUM"     "SELECT ID, G, SUM(N92) OVER (PARTITION BY G ORDER BY V) S FROM T ORDER BY G, V, ID"
+both "running + whole + rank"  "SELECT ID, G, SUM(V) OVER (PARTITION BY G ORDER BY V) RS, SUM(V) OVER (PARTITION BY G) TS, RANK() OVER (PARTITION BY G ORDER BY V) RK FROM T ORDER BY G, V, ID"
 
 echo "ran $ran checks"
 exit $fail
