@@ -54,6 +54,11 @@
 # TOTAL order - a tie leaves the row sequence unpinned, so only a total
 # order is differentially deterministic.
 #
+# A named WINDOW clause - `... OVER w ... WINDOW w AS (<spec>)` - is
+# rewritten to the inline `OVER (<spec>)` form before planning, so every
+# window shape above works through a name too. A window that REFERENCES
+# another window (`w2 AS (w1 ORDER BY x)`) is a later slice (refused).
+#
 #   qa/serve-real-window.sh [port]
 set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
@@ -188,6 +193,13 @@ both "RANGE shorthand 1 PREC"  "SELECT ID, SUM(V) OVER (ORDER BY V RANGE 1 PRECE
 both "RANGE DESC 2 PREC..CR"   "SELECT ID, SUM(V) OVER (ORDER BY V DESC RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) S FROM T ORDER BY V DESC, ID"
 both "RANGE partition"         "SELECT ID, G, SUM(V) OVER (PARTITION BY G ORDER BY V RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) S FROM T ORDER BY G, V, ID"
 both "RANGE MAX 1P..1F"        "SELECT ID, MAX(V) OVER (ORDER BY V RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) M FROM T ORDER BY V, ID"
+# --- named WINDOW clause (rewritten to inline OVER (spec)) ---
+both "named window"            "SELECT ID, SUM(V) OVER w S FROM T WINDOW w AS (PARTITION BY G) ORDER BY ID"
+both "named two refs"          "SELECT ID, SUM(V) OVER w S, COUNT(*) OVER w C FROM T WINDOW w AS (PARTITION BY G ORDER BY V, ID) ORDER BY ID"
+both "named two windows"       "SELECT ID, SUM(V) OVER w1 A, SUM(V) OVER w2 B FROM T WINDOW w1 AS (PARTITION BY G), w2 AS () ORDER BY ID"
+both "named window ranking"    "SELECT ID, G, RANK() OVER w R FROM T WINDOW w AS (PARTITION BY G ORDER BY V) ORDER BY G, V, ID"
+both "named + inline mix"      "SELECT ID, SUM(V) OVER w A, MAX(V) OVER (PARTITION BY G) B FROM T WINDOW w AS () ORDER BY ID"
+both "named window ROWS frame" "SELECT ID, SUM(V) OVER w S FROM T WINDOW w AS (ORDER BY V, ID ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) ORDER BY V, ID"
 
 echo "ran $ran checks"
 exit $fail

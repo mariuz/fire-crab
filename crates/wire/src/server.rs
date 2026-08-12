@@ -21228,7 +21228,112 @@ fn plan_join_bound(
 /// unsupported query falls back to the fixed answer WITH NO parameters
 /// (the describe then announces none, so a client that passed some gets
 /// a visible count mismatch instead of a silently wrong answer).
+/// Parse a `WINDOW name AS (spec)[, ...]` clause body into (name, spec)
+/// pairs. `spec` is the raw text inside the parentheses. None if any
+/// definition is malformed OR references ANOTHER window (`w2 AS (w1 ORDER
+/// BY x)`) - that reference form is a later slice, so leaving it unhandled
+/// lets the `WINDOW` token refuse at the ordinary planner.
+fn parse_window_defs(clause: &str) -> Option<Vec<(String, String)>> {
+    let c = clause.trim();
+    if c.is_empty() {
+        return None;
+    }
+    let mut defs = Vec::new();
+    for part in split_top_level_commas(c) {
+        let p = part.trim();
+        // `<name> AS ( <spec> )`
+        let up = p.to_ascii_uppercase();
+        let as_at = find_word(&up, "AS", 0)?;
+        let name = p[..as_at].trim();
+        if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$') {
+            return None;
+        }
+        let rest = p[as_at + 2..].trim_start();
+        if !rest.starts_with('(') {
+            return None;
+        }
+        let close = matching_paren(rest.as_bytes(), 0)?;
+        if rest[close + 1..].trim() != "" {
+            return None;
+        }
+        let spec = rest[1..close].trim();
+        // a spec that names another window (its first token is not
+        // PARTITION/ORDER/ROWS/RANGE and it is not empty) is the
+        // window-reference form - refuse it here
+        let first = spec.split_whitespace().next().unwrap_or("");
+        if !spec.is_empty()
+            && !matches!(
+                first.to_ascii_uppercase().as_str(),
+                "PARTITION" | "ORDER" | "ROWS" | "RANGE"
+            )
+        {
+            return None;
+        }
+        defs.push((name.to_string(), spec.to_string()));
+    }
+    Some(defs)
+}
+
+/// Replace every `OVER <name>` (name as a word) in `sql` with `OVER
+/// (<spec>)`. `OVER (` inline windows and other names are left untouched.
+fn substitute_over_name(sql: &str, name: &str, spec: &str) -> String {
+    let up = sql.to_ascii_uppercase();
+    let b = up.as_bytes();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < sql.len() {
+        let Some(op) = find_word(&up, "OVER", i) else {
+            out.push_str(&sql[i..]);
+            return out;
+        };
+        out.push_str(&sql[i..op + 4]); // text up to and including OVER
+        let mut j = op + 4;
+        while j < sql.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let mut k = j;
+        while k < sql.len() && is_ident_byte(b[k]) {
+            k += 1;
+        }
+        out.push_str(&sql[op + 4..j]); // the whitespace after OVER
+        if k > j && sql[j..k].eq_ignore_ascii_case(name) {
+            out.push('(');
+            out.push_str(spec);
+            out.push(')');
+            i = k;
+        } else {
+            // `OVER (` inline, or a different window name - leave the token
+            i = j;
+        }
+    }
+    out
+}
+
+/// Rewrite a top-level SELECT's named `WINDOW` clause away so the ordinary
+/// planner never sees it: strip `WINDOW name AS (spec), ...` and replace
+/// each `OVER name` with `OVER (spec)`. Returns None when there is no such
+/// clause, or one this build does not answer - leaving the original text,
+/// whose `WINDOW` token then refuses at the ordinary planner (the boundary).
+fn rewrite_named_windows(sql: &str) -> Option<String> {
+    let up = sql.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    let wpos = find_word_depth0(&masked, "WINDOW", 0)?;
+    // the clause ends at the next depth-0 ORDER BY, or the query's end
+    let end = find_word_depth0(&masked, "ORDER", wpos + "WINDOW".len()).unwrap_or(sql.len());
+    let defs = parse_window_defs(sql[wpos + "WINDOW".len()..end].trim())?;
+    // splice the clause out
+    let mut rewritten = format!("{} {}", sql[..wpos].trim_end(), sql[end..].trim_start());
+    for (name, spec) in &defs {
+        rewritten = substitute_over_name(&rewritten, name, spec);
+    }
+    Some(rewritten)
+}
+
 fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
+    // a named WINDOW clause is rewritten to inline OVER (...) specs before
+    // planning; an unsupported clause (or none) leaves the text unchanged
+    let rewritten = rewrite_named_windows(sql);
+    let sql = rewritten.as_deref().unwrap_or(sql);
     let mut params = Vec::new();
     let planned = timed("plan:query-inner", || plan_query_inner(sql, db, &mut params));
     // A SELECT THAT DRAWS A GENERATOR IS A WRITE, and a read-only
