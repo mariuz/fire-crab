@@ -13,8 +13,12 @@
 #
 # SCOPE: a FILTER on a bare aggregate select item, over COUNT/SUM/MIN/MAX/
 # AVG. (A FILTER on a WINDOW aggregate is answered too - see
-# serve-real-window.sh.) A FILTER inside a larger expression (`SUM(x)
-# FILTER (...) + 1`), a COUNT(DISTINCT ...) FILTER, and a FILTER inside a
+# serve-real-window.sh.) A COUNT(DISTINCT x) FILTER (WHERE c) is answered
+# by the same rewrite one turn deeper - `COUNT(DISTINCT CASE WHEN c THEN x
+# END)`, the CASE dropping a rejected row to NULL which the distinct fold
+# already skips; `COUNT(DISTINCT <expr>)` without a filter rides the same
+# path. A FILTER inside a larger expression (`SUM(x) FILTER (...) + 1`), a
+# non-COUNT DISTINCT (SUM/MIN/MAX/AVG DISTINCT), and a FILTER inside a
 # HAVING clause are each refused at prepare (their own later slices).
 #
 #   qa/serve-real-aggfilter.sh [port]
@@ -84,6 +88,18 @@ both "filter cond AND/NULL"  "SELECT G, SUM(V) FILTER (WHERE V>2 AND NM IS NOT N
 both "filter on other col"   "SELECT G, COUNT(*) FILTER (WHERE G=10) C FROM T GROUP BY G ORDER BY G"
 both "two filters one query" "SELECT G, SUM(V) FILTER (WHERE V>5) HI, SUM(V) FILTER (WHERE V<=5) LO FROM T GROUP BY G ORDER BY G"
 both "COUNT(*) FILTER OR"    "SELECT COUNT(*) FILTER (WHERE V<2 OR V>7) C FROM T"
+
+# --- COUNT(DISTINCT ...) FILTER, and COUNT(DISTINCT <expr>) ---
+# MOD(V,2) collides within a group, so a DISTINCT fold differs from a
+# plain one - the dedup is actually exercised, not incidental.
+both "distinct-expr grouped"  "SELECT G, COUNT(DISTINCT MOD(V,2)) C FROM T GROUP BY G ORDER BY G"
+both "distinct-expr FILTER"   "SELECT G, COUNT(DISTINCT MOD(V,2)) FILTER (WHERE V>3) C FROM T GROUP BY G ORDER BY G"
+both "distinct col FILTER"    "SELECT G, COUNT(DISTINCT V) FILTER (WHERE V>3) C FROM T GROUP BY G ORDER BY G"
+both "distinct text FILTER"   "SELECT G, COUNT(DISTINCT NM) FILTER (WHERE V>0) C FROM T GROUP BY G ORDER BY G"
+both "distinct FILTER whole"  "SELECT COUNT(DISTINCT G) FILTER (WHERE V>5) C FROM T"
+both "distinct FILTER empty"  "SELECT G, COUNT(DISTINCT V) FILTER (WHERE V>100) C FROM T GROUP BY G ORDER BY G"
+both "distinct + plain both"  "SELECT G, COUNT(DISTINCT MOD(V,2)) D, COUNT(MOD(V,2)) P FROM T GROUP BY G ORDER BY G"
+both "distinct-expr no filter" "SELECT G, COUNT(DISTINCT UPPER(NM)) C FROM T GROUP BY G ORDER BY G"
 
 echo "ran $ran checks"
 exit $fail

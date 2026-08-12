@@ -5250,6 +5250,13 @@ enum AggTarget {
     /// `COUNT(DISTINCT col)` - distinct non-NULL values (probed: NULL
     /// is not a value); only COUNT accepts it here
     Distinct(String),
+    /// `COUNT(DISTINCT <expr>)` - the same distinct non-NULL fold over an
+    /// EXPRESSION rather than a bare column. It also carries a filtered
+    /// distinct count: `COUNT(DISTINCT x) FILTER (WHERE c)` is exactly
+    /// `COUNT(DISTINCT CASE WHEN c THEN x END)`, the CASE dropping a
+    /// non-matching row to NULL - which the distinct fold already skips.
+    /// COUNT-only, like `Distinct`.
+    DistinctExpr(RawExpr),
     /// an EXPRESSION argument - `SUM(A + B)`, `MIN(UPPER(S))`,
     /// `COUNT(NULLIF(G, 1))` - evaluated per row before the fold
     Expr(RawExpr),
@@ -25936,6 +25943,9 @@ fn build_group_items(
                         }
                         (AggSrc::Field(fid), matches!(target, AggTarget::Distinct(_)))
                     }
+                    AggTarget::DistinctExpr(raw) => {
+                        (AggSrc::Expr(resolve_expr(raw, columns, descs)?), true)
+                    }
                     AggTarget::Expr(raw) => {
                         (AggSrc::Expr(resolve_expr(raw, columns, descs)?), false)
                     }
@@ -37627,6 +37637,10 @@ fn eval_subquery_rel(
                 }
                 (AggSrc::Field(fid), matches!(target, AggTarget::Distinct(_)))
             }
+            AggTarget::DistinctExpr(raw) => {
+                // COUNT-only (checked below), so no SUM/AVG type guard
+                (AggSrc::Expr(resolve_expr(raw, &columns, &descs)?), true)
+            }
             AggTarget::Expr(raw) => {
                 let e = resolve_expr(raw, &columns, &descs)?;
                 if matches!(func, AggFn::Sum | AggFn::Avg)
@@ -38511,10 +38525,28 @@ fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
         }
         let fname = call[..open].trim();
         let arg = call[open + 1..call.len() - 1].trim();
-        if arg.is_empty()
-            || arg.get(..8).is_some_and(|w| w.eq_ignore_ascii_case("DISTINCT"))
+        if arg.is_empty() {
+            return None;
+        }
+        // `COUNT(DISTINCT x) FILTER (WHERE c)` filters the DISTINCT fold:
+        // it counts the distinct non-NULL values of `x` among the rows the
+        // condition accepts, which is exactly `COUNT(DISTINCT CASE WHEN c
+        // THEN x END)` - a non-matching row becomes NULL and the distinct
+        // fold drops it. Wrap the inner argument in the CASE and re-read as
+        // an ordinary DISTINCT aggregate (COUNT-only, as bare DISTINCT is).
+        if let Some(inner) = arg
+            .get(..8)
+            .filter(|w| w.eq_ignore_ascii_case("DISTINCT"))
+            .and(arg.get(8..))
+            .filter(|r| r.starts_with(char::is_whitespace))
+            .map(str::trim)
         {
-            return None; // empty, or DISTINCT + FILTER (a later slice)
+            if inner == "*" || inner.is_empty() {
+                return None;
+            }
+            let rewritten =
+                format!("{}(DISTINCT CASE WHEN ({}) THEN {} END)", fname, cond, inner);
+            return parse_agg_item(&rewritten);
         }
         let then = if arg == "*" { "1" } else { arg };
         let rewritten = format!("{}(CASE WHEN ({}) THEN {} END)", fname, cond, then);
@@ -38543,11 +38575,15 @@ fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
         if !matches!(func, AggFn::Count) {
             return None; // SUM/AVG/MIN/MAX DISTINCT: not answered
         }
-        let name = rest.trim().trim_matches('"');
-        if !ident_ok(name) {
-            return None;
+        let inner = rest.trim();
+        let name = inner.trim_matches('"');
+        // a bare column keeps the field-sourced fold; anything else - a
+        // CASE (from a filtered distinct) or `COUNT(DISTINCT UPPER(S))` -
+        // becomes an expression the fold evaluates per row before dedup
+        if ident_ok(name) {
+            return Some((func, AggTarget::Distinct(name.to_string())));
         }
-        return Some((func, AggTarget::Distinct(name.to_string())));
+        return Some((func, AggTarget::DistinctExpr(parse_raw_expr_any(inner)?)));
     }
     let target = if arg == "*" {
         // only COUNT accepts *
@@ -44356,6 +44392,15 @@ fn resolve_having(
                             };
                             (None, Some(e), hk, false)
                         }
+                        // COUNT(DISTINCT <expr>) in HAVING - COUNT-only, so
+                        // its comparison kind is always integer
+                        AggTarget::DistinctExpr(raw) => {
+                            if !matches!(func, AggFn::Count) {
+                                return None;
+                            }
+                            let e = resolve_expr(raw, columns, descs)?;
+                            (None, Some(e), HKind::Int, true)
+                        }
                     };
                     if distinct && !matches!(func, AggFn::Count) {
                         return None;
@@ -44388,7 +44433,7 @@ fn resolve_having(
                             gitems.push(GItem::Agg(
                                 *func,
                                 AggSrc::Expr(src_expr.clone()?),
-                                false,
+                                distinct,
                             ));
                             gitems.len() - 1
                         }
