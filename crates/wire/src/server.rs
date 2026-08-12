@@ -37915,8 +37915,16 @@ fn split_alias(item: &str) -> (&str, Option<&str>) {
                 | "SOME" | "NULL" | "UNKNOWN"
         )
     };
+    // At the END OF THE HEAD, `END` closing a CASE is a POSTFIX terminator,
+    // not an operand-hungry operator, so the token after it is the alias -
+    // `CASE ... END C` splits into `CASE ... END` and `C`, which `keyword`
+    // wrongly refused by treating the terminator as an operator. Only END
+    // is lifted: a trailing `NULL`/`UNKNOWN` (`S IS NULL X`) keeps refusing,
+    // because a projected boolean is a shape this evaluator does not yet
+    // answer correctly - a refusal beats a wrong answer.
+    let head_keyword = |w: &str| keyword(w) && !w.eq_ignore_ascii_case("END");
     let last_word = head.rsplit(|c: char| c.is_whitespace()).next().unwrap_or("");
-    if keyword(last_word) || (!quoted && keyword(tail)) {
+    if head_keyword(last_word) || (!quoted && keyword(tail)) {
         return (item, None);
     }
     // an alias cannot be a keyword that continues the statement, and the

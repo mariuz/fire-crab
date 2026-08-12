@@ -151,6 +151,18 @@ sameh "header searched CASE"        "SELECT CASE WHEN A > 0 THEN 1 ELSE 0 END FR
 sameh "header simple CASE"          "SELECT CASE A WHEN 1 THEN 1 ELSE 0 END FROM T WHERE ID = 1"
 sameh "header IIF is CASE"          "SELECT IIF(A > 1, 1, 0) FROM T WHERE ID = 1"
 
+# --- an ALIAS after END: `CASE ... END <name>` (the split_alias fix) ----
+# split_alias treated the CASE's own END terminator as an operand-hungry
+# operator and refused to peel the trailing alias, so every aliased CASE
+# raised. The value is the same with or without the alias, so `same`
+# proves fc ANSWERS rather than refusing; `sameh` also pins the header.
+same  "searched CASE bare alias"    "SELECT CASE WHEN A > 0 THEN 'p' ELSE 'n' END C FROM T ORDER BY ID"
+same  "simple CASE bare alias"      "SELECT CASE A WHEN 42 THEN 'y' ELSE 'z' END C FROM T ORDER BY ID"
+same  "numeric CASE bare alias"     "SELECT CASE WHEN A > 0 THEN 1 ELSE 0 END C FROM T ORDER BY ID"
+same  "nested CASE bare alias"      "SELECT CASE WHEN A > 0 THEN CASE WHEN A > 40 THEN 'big' ELSE 'mid' END ELSE 'lo' END C FROM T ORDER BY ID"
+sameh "header CASE AS alias"        "SELECT CASE WHEN A > 0 THEN 1 ELSE 0 END AS C FROM T WHERE ID = 1"
+sameh "header CASE bare alias"      "SELECT CASE WHEN A > 0 THEN 1 ELSE 0 END C FROM T WHERE ID = 1"
+
 # --- refusals: malformed forms raise, never answer ---------------------
 for bad in "SELECT CASE END FROM T" \
            "SELECT CASE WHEN A > 0 END FROM T" \
