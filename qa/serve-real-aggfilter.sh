@@ -12,10 +12,10 @@
 # live engine with the same query; results must be identical.
 #
 # SCOPE: a FILTER on a bare aggregate select item, over COUNT/SUM/MIN/MAX/
-# AVG. A FILTER on a WINDOW aggregate (... OVER ...), a FILTER inside a
-# larger expression (`SUM(x) FILTER (...) + 1`), a COUNT(DISTINCT ...)
-# FILTER, and a FILTER inside a HAVING clause are each refused at prepare
-# (their own later slices).
+# AVG. (A FILTER on a WINDOW aggregate is answered too - see
+# serve-real-window.sh.) A FILTER inside a larger expression (`SUM(x)
+# FILTER (...) + 1`), a COUNT(DISTINCT ...) FILTER, and a FILTER inside a
+# HAVING clause are each refused at prepare (their own later slices).
 #
 #   qa/serve-real-aggfilter.sh [port]
 set -u

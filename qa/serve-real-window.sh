@@ -59,6 +59,11 @@
 # window shape above works through a name too. A window that REFERENCES
 # another window (`w2 AS (w1 ORDER BY x)`) is a later slice (refused).
 #
+# A FILTER on a window aggregate - `<agg>(x) FILTER (WHERE c) OVER (...)` -
+# is rewritten to `<agg>(CASE WHEN c THEN x END) OVER (...)`, folding only
+# the matching rows of each window frame; a FILTER on a ranking or
+# navigation window refuses.
+#
 #   qa/serve-real-window.sh [port]
 set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
@@ -200,6 +205,13 @@ both "named two windows"       "SELECT ID, SUM(V) OVER w1 A, SUM(V) OVER w2 B FR
 both "named window ranking"    "SELECT ID, G, RANK() OVER w R FROM T WINDOW w AS (PARTITION BY G ORDER BY V) ORDER BY G, V, ID"
 both "named + inline mix"      "SELECT ID, SUM(V) OVER w A, MAX(V) OVER (PARTITION BY G) B FROM T WINDOW w AS () ORDER BY ID"
 both "named window ROWS frame" "SELECT ID, SUM(V) OVER w S FROM T WINDOW w AS (ORDER BY V, ID ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) ORDER BY V, ID"
+# --- FILTER on a window aggregate (rewritten to a CASE argument) ---
+both "FILTER OVER partition"   "SELECT ID, SUM(V) FILTER (WHERE V>5) OVER (PARTITION BY G) S FROM T ORDER BY ID"
+both "FILTER COUNT* OVER"      "SELECT ID, COUNT(*) FILTER (WHERE V>5) OVER (PARTITION BY G) C FROM T ORDER BY ID"
+both "FILTER OVER ()"          "SELECT ID, SUM(V) FILTER (WHERE V>5) OVER () S FROM T ORDER BY ID"
+both "FILTER running"          "SELECT ID, SUM(V) FILTER (WHERE V>3) OVER (ORDER BY V, ID) S FROM T ORDER BY V, ID"
+both "FILTER ROWS frame"       "SELECT ID, SUM(V) FILTER (WHERE V>3) OVER (ORDER BY V, ID ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) S FROM T ORDER BY V, ID"
+both "FILTER named window"     "SELECT ID, SUM(V) FILTER (WHERE V>5) OVER w S FROM T WINDOW w AS (PARTITION BY G) ORDER BY ID"
 
 echo "ran $ran checks"
 exit $fail

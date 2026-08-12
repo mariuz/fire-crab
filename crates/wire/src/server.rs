@@ -37830,7 +37830,24 @@ fn parse_window_item(
     // the function call's own parentheses come first
     let lp = t.find('(')?;
     let call_end = matching_paren(bytes, lp)?;
-    let after = t[call_end + 1..].trim_start();
+    let mut after = t[call_end + 1..].trim_start();
+    // an optional `FILTER (WHERE c)` sits between the call and OVER, on an
+    // AGGREGATE window only. Consume it; the call region then spans through
+    // the FILTER's close paren so parse_agg_item does the FILTER -> CASE
+    // rewrite (Inc481), which is exactly what a filtered window folds.
+    let mut call_hi = call_end;
+    let mut has_filter = false;
+    if after.get(..6).is_some_and(|w| w.eq_ignore_ascii_case("FILTER")) {
+        let ftail = after[6..].trim_start();
+        if !ftail.starts_with('(') {
+            return None;
+        }
+        let flp = t.len() - ftail.len();
+        let fend = matching_paren(bytes, flp)?;
+        call_hi = fend;
+        has_filter = true;
+        after = t[fend + 1..].trim_start();
+    }
     // ... then the OVER keyword, as its own word (followed by space or the
     // spec's opening paren), then the spec in parentheses
     after.get(..4).filter(|w| w.eq_ignore_ascii_case("OVER"))?;
@@ -37845,11 +37862,15 @@ fn parse_window_item(
     if !t[over_end + 1..].trim().is_empty() {
         return None;
     }
-    let call = t[..=call_end].trim();
+    let call = t[..=call_hi].trim();
     // a ranking function (`ROW_NUMBER()`/`RANK()`/`DENSE_RANK()`, empty
     // args), a navigation one (`LAG`/`LEAD`, one to three args), or else an
-    // aggregate the ordinary parser reads
-    let func = if let Some(rk) = parse_rank_call(call) {
+    // aggregate the ordinary parser reads. A FILTER rides an AGGREGATE only,
+    // so a filtered call goes straight to parse_agg_item (which rewrites it).
+    let func = if has_filter {
+        let (f, target) = parse_agg_item(call)?;
+        WinFunc::Agg(f, target)
+    } else if let Some(rk) = parse_rank_call(call) {
         WinFunc::Rank(rk)
     } else if let Some((nf, arg, off, def)) = parse_nav_call(call) {
         WinFunc::Nav(nf, arg, off, def)
