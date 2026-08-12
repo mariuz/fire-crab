@@ -38079,8 +38079,63 @@ fn parse_frame_bound(s: &str) -> Option<FrameBound> {
     }
 }
 
+/// Split a trailing `FILTER (WHERE <cond>)` off an aggregate item. Returns
+/// the bare call (`SUM(V)`) and the condition text. The FILTER parens must
+/// close at the very end - `SUM(V) FILTER (...) + 1` and `... OVER (...)`
+/// are not this shape and fall through (their own later slices).
+fn split_agg_filter(t: &str) -> Option<(&str, &str)> {
+    let b = t.as_bytes();
+    let lp = t.find('(')?;
+    let call_end = matching_paren(b, lp)?;
+    let after = t[call_end + 1..].trim_start();
+    if after.get(..6).is_none_or(|w| !w.eq_ignore_ascii_case("FILTER")) {
+        return None;
+    }
+    let tail = after[6..].trim_start();
+    if !tail.starts_with('(') {
+        return None;
+    }
+    let filt_lp = t.len() - tail.len();
+    let filt_end = matching_paren(b, filt_lp)?;
+    if !t[filt_end + 1..].trim().is_empty() {
+        return None; // something trails the FILTER - not a bare filtered agg
+    }
+    let inner = t[filt_lp + 1..filt_end].trim();
+    let cond = inner
+        .get(..5)
+        .filter(|w| w.eq_ignore_ascii_case("WHERE"))
+        .and(inner.get(5..))?
+        .trim();
+    if cond.is_empty() {
+        return None;
+    }
+    Some((t[..=call_end].trim(), cond))
+}
+
 fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
     let t = item.trim();
+    // `<agg>(arg) FILTER (WHERE c)` folds only the rows the condition
+    // accepts. That is EXACTLY `<agg>(CASE WHEN c THEN arg END)` - a
+    // non-matching row becomes NULL and drops out of the fold (COUNT(*)
+    // filtered is COUNT over `CASE WHEN c THEN 1 END`) - identical in
+    // value AND describe (checked against the engine's SQLDA). So rewrite
+    // the argument to a CASE and re-read it: no new fold machinery.
+    if let Some((call, cond)) = split_agg_filter(t) {
+        let open = call.find('(')?;
+        if !call.ends_with(')') {
+            return None;
+        }
+        let fname = call[..open].trim();
+        let arg = call[open + 1..call.len() - 1].trim();
+        if arg.is_empty()
+            || arg.get(..8).is_some_and(|w| w.eq_ignore_ascii_case("DISTINCT"))
+        {
+            return None; // empty, or DISTINCT + FILTER (a later slice)
+        }
+        let then = if arg == "*" { "1" } else { arg };
+        let rewritten = format!("{}(CASE WHEN ({}) THEN {} END)", fname, cond, then);
+        return parse_agg_item(&rewritten);
+    }
     let open = t.find('(')?;
     if !t.ends_with(')') {
         return None;
