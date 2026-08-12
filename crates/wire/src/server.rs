@@ -5352,6 +5352,14 @@ enum Term {
     /// counts, exactly as the engine matches (CHAR(5) 'abc' matches
     /// 'abc  ' and 'abc%' but NOT 'abc')
     Like(usize, Rhs, Option<char>, bool),
+    /// `<text col> [NOT] SIMILAR TO <pattern> [ESCAPE <c>]`: the pattern
+    /// is compiled once (at prepare) into an anchored SQL:2008 regular
+    /// expression ([SimRe]); the match is over the STORED text value.
+    /// `negated` flips the result. A NULL value is UNKNOWN. Only a literal
+    /// pattern on a text column takes this form; a parameter pattern, a
+    /// SIMILAR TO inside a value expression, and a non-text operand are
+    /// each refused at prepare (their own later slices).
+    Similar(usize, SimRe, bool),
     /// `<text col> LIKE <literal pattern with an INVALID escape>` in a
     /// WHERE/HAVING: the engine's DSQL-time rewrite of a LITERAL
     /// pattern prepends a LENIENT prefix pre-filter (the bad escape
@@ -5407,6 +5415,10 @@ enum Term {
     /// result (rendered to text, as the engine coerces) against the
     /// pattern. A NULL result is UNKNOWN.
     ExprLike(Box<Expr>, String, Option<char>, bool),
+    /// `<text expression> [NOT] SIMILAR TO <pattern>` - the evaluated
+    /// result rendered to text and matched against the compiled anchored
+    /// pattern; a NULL result is UNKNOWN
+    ExprSimilar(Box<Expr>, SimRe, bool),
     /// `<expression> [NOT] STARTING [WITH] <literal prefix>` - the
     /// evaluated result rendered to text (the engine coerces an INTEGER
     /// to its decimal text: N=1,10 both match prefix '1', probed)
@@ -6463,6 +6475,13 @@ impl Term {
                 // NULL value or NULL/unbound pattern: UNKNOWN
                 _ => None,
             },
+            // SIMILAR TO over the stored text (padding included, like
+            // LIKE); a NULL value is UNKNOWN. The pattern was compiled and
+            // validated at prepare, so there is no per-row raise here.
+            Term::Similar(fid, re, negated) => match values.get(*fid) {
+                Some(Value::Text(s)) => Some(sim_match(re, s) != *negated),
+                _ => None,
+            },
             // the lenient-prefix gate on a LITERAL bad-escape pattern
             // (see the variant): NULL is UNKNOWN, a prefix miss is
             // FALSE, a hit raises 22025
@@ -6506,6 +6525,12 @@ impl Term {
                     }
                     Some(like_match(&v.render(), pattern, *escape) != *negated)
                 }
+            },
+            Term::ExprSimilar(e, re, negated) => match e.eval(values)? {
+                Value::Null => None,
+                // rendered to text, then the anchored regex match; the
+                // pattern was validated at prepare (no per-row raise)
+                v => Some(sim_match(re, &v.render()) != *negated),
             },
             Term::ExprStarting(e, prefix, negated) => match e.eval(values)? {
                 Value::Null => None,
@@ -6627,6 +6652,310 @@ fn like_match(value: &str, pattern: &str, escape: Option<char>) -> bool {
         vi == v.len()
     }
     rec(&v, 0, &p, 0, escape)
+}
+
+// ===================== SIMILAR TO (SQL:2008 regex) =====================
+//
+// `SIMILAR TO` is an ANCHORED regular-expression match (the whole string
+// must match), case-sensitive. Its metacharacters are `| * + ? { } ( )
+// [ ]`, `_` (any one character) and `%` (any sequence); a `.` is a
+// LITERAL here (not "any char"), and the ESCAPE character turns the next
+// metacharacter literal. The pattern is compiled once (at prepare, where
+// a malformed one refuses) into a small tree and matched per row.
+
+/// A compiled `SIMILAR TO` pattern.
+#[derive(Clone)]
+enum SimRe {
+    Empty,
+    Lit(char),
+    Any,                        // `_`
+    AnySeq,                     // `%`
+    Class(Vec<SimClass>, bool), // `[...]`, bool = negated (`[^...]`)
+    Concat(Vec<SimRe>),
+    Alt(Vec<SimRe>),
+    Repeat(Box<SimRe>, usize, Option<usize>), // {min, max?}
+}
+
+#[derive(Clone)]
+enum SimClass {
+    Ch(char),
+    Range(char, char),
+    Posix(fn(char) -> bool),
+}
+
+/// Compile a `SIMILAR TO` pattern; `esc` is the ESCAPE character. None on a
+/// malformed pattern (the engine raises on one at prepare).
+fn sim_compile(pattern: &str, esc: Option<char>) -> Option<SimRe> {
+    let p: Vec<char> = pattern.chars().collect();
+    let mut i = 0usize;
+    let re = sim_alt(&p, &mut i, esc)?;
+    if i != p.len() {
+        return None; // trailing junk (an unbalanced `)`, etc.)
+    }
+    Some(re)
+}
+
+fn sim_alt(p: &[char], i: &mut usize, esc: Option<char>) -> Option<SimRe> {
+    let mut branches = vec![sim_concat(p, i, esc)?];
+    while *i < p.len() && p[*i] == '|' && Some('|') != esc {
+        *i += 1;
+        branches.push(sim_concat(p, i, esc)?);
+    }
+    Some(if branches.len() == 1 { branches.pop().unwrap() } else { SimRe::Alt(branches) })
+}
+
+fn sim_concat(p: &[char], i: &mut usize, esc: Option<char>) -> Option<SimRe> {
+    let mut parts = Vec::new();
+    while *i < p.len() {
+        let c = p[*i];
+        if Some(c) != esc && (c == '|' || c == ')') {
+            break;
+        }
+        parts.push(sim_quant(p, i, esc)?);
+    }
+    Some(match parts.len() {
+        0 => SimRe::Empty,
+        1 => parts.pop().unwrap(),
+        _ => SimRe::Concat(parts),
+    })
+}
+
+fn sim_quant(p: &[char], i: &mut usize, esc: Option<char>) -> Option<SimRe> {
+    let atom = sim_primary(p, i, esc)?;
+    if *i >= p.len() || Some(p[*i]) == esc {
+        return Some(atom);
+    }
+    let (min, max) = match p[*i] {
+        '*' => { *i += 1; (0, None) }
+        '+' => { *i += 1; (1, None) }
+        '?' => { *i += 1; (0, Some(1)) }
+        '{' => {
+            *i += 1;
+            let start = *i;
+            while *i < p.len() && p[*i] != '}' {
+                *i += 1;
+            }
+            if *i >= p.len() {
+                return None; // unclosed `{`
+            }
+            let body: String = p[start..*i].iter().collect();
+            *i += 1; // past '}'
+            sim_bounds(&body)?
+        }
+        _ => return Some(atom),
+    };
+    Some(SimRe::Repeat(Box::new(atom), min, max))
+}
+
+fn sim_bounds(body: &str) -> Option<(usize, Option<usize>)> {
+    let b = body.trim();
+    if let Some((a, c)) = b.split_once(',') {
+        let min = a.trim().parse::<usize>().ok()?;
+        let c = c.trim();
+        let max = if c.is_empty() { None } else { Some(c.parse::<usize>().ok()?) };
+        if let Some(mx) = max {
+            if mx < min {
+                return None;
+            }
+        }
+        Some((min, max))
+    } else {
+        let n = b.parse::<usize>().ok()?;
+        Some((n, Some(n)))
+    }
+}
+
+fn sim_primary(p: &[char], i: &mut usize, esc: Option<char>) -> Option<SimRe> {
+    let c = *p.get(*i)?;
+    if Some(c) == esc {
+        let lit = *p.get(*i + 1)?;
+        *i += 2;
+        return Some(SimRe::Lit(lit));
+    }
+    match c {
+        '(' => {
+            *i += 1;
+            let inner = sim_alt(p, i, esc)?;
+            if p.get(*i) != Some(&')') {
+                return None;
+            }
+            *i += 1;
+            Some(inner)
+        }
+        '[' => sim_class(p, i, esc),
+        '_' => { *i += 1; Some(SimRe::Any) }
+        '%' => { *i += 1; Some(SimRe::AnySeq) }
+        // a quantifier or closer with nothing to bind to is malformed
+        '*' | '+' | '?' | '{' | '}' | ')' | ']' | '|' => None,
+        _ => { *i += 1; Some(SimRe::Lit(c)) }
+    }
+}
+
+fn sim_class(p: &[char], i: &mut usize, esc: Option<char>) -> Option<SimRe> {
+    *i += 1; // past '['
+    let neg = p.get(*i) == Some(&'^');
+    if neg {
+        *i += 1;
+    }
+    let mut items = Vec::new();
+    while *i < p.len() && p[*i] != ']' {
+        // a POSIX class `[:NAME:]`
+        if p[*i] == '[' && p.get(*i + 1) == Some(&':') {
+            let start = *i + 2;
+            let mut j = start;
+            while j + 1 < p.len() && !(p[j] == ':' && p[j + 1] == ']') {
+                j += 1;
+            }
+            if j + 1 >= p.len() {
+                return None;
+            }
+            let name: String = p[start..j].iter().collect();
+            items.push(SimClass::Posix(sim_posix(&name)?));
+            *i = j + 2; // past ":]"
+            continue;
+        }
+        // a member, possibly escaped, possibly the low end of a range
+        let lo = if Some(p[*i]) == esc {
+            let lit = *p.get(*i + 1)?;
+            *i += 2;
+            lit
+        } else {
+            let lit = p[*i];
+            *i += 1;
+            lit
+        };
+        if p.get(*i) == Some(&'-') && p.get(*i + 1).is_some_and(|&c| c != ']') {
+            let hi = if Some(p[*i + 1]) == esc {
+                let lit = *p.get(*i + 2)?;
+                *i += 3;
+                lit
+            } else {
+                let lit = p[*i + 1];
+                *i += 2;
+                lit
+            };
+            items.push(SimClass::Range(lo, hi));
+        } else {
+            items.push(SimClass::Ch(lo));
+        }
+    }
+    if p.get(*i) != Some(&']') {
+        return None;
+    }
+    *i += 1;
+    Some(SimRe::Class(items, neg))
+}
+
+fn sim_posix(name: &str) -> Option<fn(char) -> bool> {
+    Some(match name.to_ascii_uppercase().as_str() {
+        "ALPHA" => |c: char| c.is_alphabetic(),
+        "DIGIT" => |c: char| c.is_ascii_digit(),
+        "ALNUM" => |c: char| c.is_alphanumeric(),
+        "UPPER" => |c: char| c.is_uppercase(),
+        "LOWER" => |c: char| c.is_lowercase(),
+        "SPACE" => |c: char| c == ' ',
+        "WHITESPACE" => |c: char| c.is_whitespace(),
+        _ => return None,
+    })
+}
+
+fn sim_class_hit(items: &[SimClass], c: char) -> bool {
+    items.iter().any(|it| match it {
+        SimClass::Ch(x) => *x == c,
+        SimClass::Range(a, b) => *a <= c && c <= *b,
+        SimClass::Posix(f) => f(c),
+    })
+}
+
+/// Every end position reachable by matching `re` from `pos` in `v`. The
+/// grammar is non-deterministic (`%`, quantifiers, alternation), so this
+/// returns the SET of reachable positions.
+fn sim_reach(re: &SimRe, v: &[char], pos: usize) -> Vec<usize> {
+    match re {
+        SimRe::Empty => vec![pos],
+        SimRe::Lit(c) => {
+            if pos < v.len() && v[pos] == *c { vec![pos + 1] } else { vec![] }
+        }
+        SimRe::Any => {
+            if pos < v.len() { vec![pos + 1] } else { vec![] }
+        }
+        SimRe::AnySeq => (pos..=v.len()).collect(),
+        SimRe::Class(items, neg) => {
+            if pos < v.len() && (sim_class_hit(items, v[pos]) != *neg) {
+                vec![pos + 1]
+            } else {
+                vec![]
+            }
+        }
+        SimRe::Concat(list) => {
+            let mut cur = vec![pos];
+            for sub in list {
+                let mut next: Vec<usize> = Vec::new();
+                for &q in &cur {
+                    next.extend(sim_reach(sub, v, q));
+                }
+                next.sort_unstable();
+                next.dedup();
+                if next.is_empty() {
+                    return vec![];
+                }
+                cur = next;
+            }
+            cur
+        }
+        SimRe::Alt(list) => {
+            let mut out: Vec<usize> = Vec::new();
+            for sub in list {
+                out.extend(sim_reach(sub, v, pos));
+            }
+            out.sort_unstable();
+            out.dedup();
+            out
+        }
+        SimRe::Repeat(sub, min, max) => {
+            // positions reachable after k in [min, max] reps; each
+            // productive rep advances >=1 and a position is never revisited
+            // (the `seen` guard), so this terminates in <= v.len()+1 steps
+            let cap = max.unwrap_or(v.len() + 1);
+            let mut out: Vec<usize> = Vec::new();
+            let mut cur = vec![pos];
+            let mut seen = vec![pos];
+            let mut k = 0usize;
+            loop {
+                if k >= *min {
+                    out.extend(cur.iter().copied());
+                }
+                if k >= cap || cur.is_empty() {
+                    break;
+                }
+                let mut next: Vec<usize> = Vec::new();
+                for &q in &cur {
+                    for r in sim_reach(sub, v, q) {
+                        if !seen.contains(&r) {
+                            next.push(r);
+                        }
+                    }
+                }
+                next.sort_unstable();
+                next.dedup();
+                if next.is_empty() {
+                    break;
+                }
+                seen.extend(next.iter().copied());
+                cur = next;
+                k += 1;
+            }
+            out.sort_unstable();
+            out.dedup();
+            out
+        }
+    }
+}
+
+/// Does `value` match the compiled pattern in full (anchored)?
+fn sim_match(re: &SimRe, value: &str) -> bool {
+    let v: Vec<char> = value.chars().collect();
+    sim_reach(re, &v, 0).contains(&v.len())
 }
 
 /// Pick the wire shape, SQL type, length and scale for a column from its
@@ -38673,6 +39002,10 @@ enum RawKind {
     IsNull,
     IsNotNull,
     Like(Rhs, Option<char>, bool),
+    /// `[NOT] SIMILAR TO <pattern> [ESCAPE <c>]` - a SQL:2008 regular
+    /// expression (pattern, escape, negated); resolved to a compiled
+    /// [SimRe] and matched anchored
+    Similar(Rhs, Option<char>, bool),
     /// `[NOT] STARTING [WITH] <prefix>` - a per-byte text prefix test
     /// (blr_starting); no ESCAPE clause exists for it
     Starting(Rhs, bool),
@@ -39050,7 +39383,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
             let mut p3 = p2;
             let negated = if matches!(t.get(p3), Some(Tok::Not))
                 && (matches!(t.get(p3 + 1), Some(Tok::Like | Tok::Between | Tok::In))
-                    || matches!(t.get(p3 + 1), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("STARTING")))
+                    || matches!(t.get(p3 + 1), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("STARTING") || w.eq_ignore_ascii_case("SIMILAR")))
             {
                 p3 += 1;
                 true
@@ -39243,7 +39576,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
     // text here, the IS [NOT] DISTINCT FROM precedent)
     let negated = if matches!(t.get(*pos), Some(Tok::Not))
         && (matches!(t.get(*pos + 1), Some(Tok::Like | Tok::Between | Tok::In))
-            || matches!(t.get(*pos + 1), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("STARTING")))
+            || matches!(t.get(*pos + 1), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("STARTING") || w.eq_ignore_ascii_case("SIMILAR")))
     {
         *pos += 1;
         true
@@ -39471,6 +39804,33 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
             let body = Ast::Or(items);
             Some(if negated { Ast::Not(Box::new(body)) } else { body })
         }
+        // SIMILAR TO - by Ident text (like STARTING), so a column named
+        // "SIMILAR" still parses everywhere else. `SIMILAR` then `TO`, then
+        // a pattern and an optional ESCAPE, exactly as LIKE reads them.
+        Tok::Ident(w) if w.eq_ignore_ascii_case("SIMILAR") => {
+            if !matches!(t.get(*pos + 1), Some(Tok::Ident(w2)) if w2.eq_ignore_ascii_case("TO")) {
+                return None; // a bare `SIMILAR` is a column, handled elsewhere
+            }
+            *pos += 2; // past SIMILAR TO
+            let pattern = parse_value(t, pos, np)?;
+            if matches!(pattern, Rhs::Int(_)) {
+                return None; // a numeric SIMILAR pattern is not answered
+            }
+            let escape = if matches!(t.get(*pos), Some(Tok::Escape)) {
+                *pos += 1;
+                let Some(Tok::Str(e)) = t.get(*pos) else { return None };
+                let mut chars = e.chars();
+                let c = chars.next()?;
+                if chars.next().is_some() {
+                    return None; // ESCAPE must be a single character
+                }
+                *pos += 1;
+                Some(c)
+            } else {
+                None
+            };
+            Some(leaf(RawKind::Similar(pattern, escape, negated)))
+        }
         // STARTING [WITH] - by Ident text, so a column NAMED "STARTING"
         // still parses everywhere else exactly as before
         Tok::Ident(w) if w.eq_ignore_ascii_case("STARTING") => {
@@ -39582,6 +39942,7 @@ fn negate_term(t: &RawTerm) -> Option<RawTerm> {
         RawKind::IsNull => RawKind::IsNotNull,
         RawKind::IsNotNull => RawKind::IsNull,
         RawKind::Like(p, e, negated) => RawKind::Like(p.clone(), *e, !negated),
+        RawKind::Similar(p, e, negated) => RawKind::Similar(p.clone(), *e, !negated),
         // flipped like LIKE - sound in 3VL (probed: NULL operand rows
         // drop under both polarities)
         RawKind::Starting(p, negated) => RawKind::Starting(p.clone(), !negated),
@@ -42442,6 +42803,18 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
             (_, Rhs::Null) => Term::Unknown,
             _ => return None,
         },
+        RawKind::Similar(pattern, escape, negated) => match (kind, pattern) {
+            // a text column against a LITERAL pattern: compile it once
+            // (a malformed pattern refuses at prepare, where the engine
+            // raises). A parameter pattern or a non-text operand is a
+            // later slice.
+            (ColKind::Text, Rhs::Str(p)) => match sim_compile(&p, escape) {
+                Some(re) => Term::Similar(idx, re, negated),
+                None => return None,
+            },
+            (_, Rhs::Null) => Term::Unknown,
+            _ => return None,
+        },
         RawKind::Starting(prefix, negated) => match (kind, prefix) {
             (ColKind::Text, Rhs::Str(p)) => Term::Starting(idx, Rhs::Str(p), negated),
             // an INTEGER column coerces to its decimal text per row
@@ -42740,6 +43113,19 @@ fn resolve_expr_term(
             Term::ExprLikeParam(Box::new(lhs), *slot, *escape, *negated)
         }
         RawKind::Like(..) => return None, // NULL pattern
+        RawKind::Similar(Rhs::Str(p), escape, negated) => {
+            // a TEXT-typed expression against a literal pattern, compiled
+            // once (malformed refuses at prepare). A non-text side, or a
+            // parameter pattern, is a later slice.
+            if !matches!(lhs.type_of(descs), Some(ExprType::Text)) {
+                return None;
+            }
+            match sim_compile(p, *escape) {
+                Some(re) => Term::ExprSimilar(Box::new(lhs), re, *negated),
+                None => return None,
+            }
+        }
+        RawKind::Similar(..) => return None, // NULL or parameter pattern
         RawKind::Starting(Rhs::Str(p), negated) => {
             // temporal/approx/bool/numeric rendering under a prefix test
             // is unprobed - refuse those, answer text and integer sides
@@ -43191,6 +43577,9 @@ fn numeric_term(
         }
         RawKind::Like(Rhs::Null, ..) => Term::Unknown,
         RawKind::Like(..) => return None,
+        // SIMILAR TO on a numeric column is a later slice (text only)
+        RawKind::Similar(Rhs::Null, ..) => Term::Unknown,
+        RawKind::Similar(..) => return None,
         RawKind::Starting(Rhs::Str(p), negated) => {
             Term::ExprStarting(Box::new(Expr::Col(idx)), p, negated)
         }
