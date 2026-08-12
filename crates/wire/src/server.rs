@@ -39352,9 +39352,29 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                         // the MATCHING close paren: an expression
                         // argument (COUNT(NULLIF(A, 1))) nests its own
                         let close = matching_paren(b, j)?;
-                        let (func, target) = parse_agg_item(&s[start..=close])?;
+                        // an optional `FILTER (WHERE c)` follows the call
+                        // (a HAVING aggregate takes one too): extend the
+                        // slice through the FILTER's close paren so
+                        // parse_agg_item does the FILTER -> CASE rewrite,
+                        // exactly as a filtered select-list aggregate does.
+                        let mut hi = close;
+                        let mut k = close + 1;
+                        while k < b.len() && b[k].is_ascii_whitespace() {
+                            k += 1;
+                        }
+                        if s[k..].get(..6).is_some_and(|w| w.eq_ignore_ascii_case("FILTER")) {
+                            let mut m = k + 6;
+                            while m < b.len() && b[m].is_ascii_whitespace() {
+                                m += 1;
+                            }
+                            if m >= b.len() || b[m] != b'(' {
+                                return None;
+                            }
+                            hi = matching_paren(b, m)?;
+                        }
+                        let (func, target) = parse_agg_item(&s[start..=hi])?;
                         out.push(Tok::Agg(func, target));
-                        i = close + 1;
+                        i = hi + 1;
                         continue;
                     }
                 }

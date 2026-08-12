@@ -17,9 +17,10 @@
 # by the same rewrite one turn deeper - `COUNT(DISTINCT CASE WHEN c THEN x
 # END)`, the CASE dropping a rejected row to NULL which the distinct fold
 # already skips; `COUNT(DISTINCT <expr>)` without a filter rides the same
-# path. A FILTER inside a larger expression (`SUM(x) FILTER (...) + 1`), a
-# non-COUNT DISTINCT (SUM/MIN/MAX/AVG DISTINCT), and a FILTER inside a
-# HAVING clause are each refused at prepare (their own later slices).
+# path. A FILTER inside a HAVING clause is answered too - see
+# serve-real-having.sh. A FILTER inside a larger expression (`SUM(x)
+# FILTER (...) + 1`) and a non-COUNT DISTINCT (SUM/MIN/MAX/AVG DISTINCT)
+# are each refused at prepare (their own later slices).
 #
 #   qa/serve-real-aggfilter.sh [port]
 set -u

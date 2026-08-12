@@ -7,9 +7,13 @@
 # from the pages - the HAVING predicate is evaluated on each group's
 # computed output row (comparisons, AND/OR, IS [NOT] NULL) and may name
 # aggregates that are NOT in the select list (computed as hidden items)
-# or any grouping column. node-firebird drives it and results must equal
-# isql's - including queries where HAVING rejects every group (zero rows,
-# compared via a <no rows> sentinel).
+# or any grouping column. A named aggregate may carry a FILTER clause -
+# `COUNT(*) FILTER (WHERE c)`, `SUM(x) FILTER (...)`, `COUNT(DISTINCT x)
+# FILTER (...)` - folded as its own hidden item over the CASE the filter
+# rewrites to, exactly as a filtered select-list aggregate is. node-fire
+# bird drives it and results must equal isql's - including queries where
+# HAVING rejects every group (zero rows, compared via a <no rows>
+# sentinel).
 #
 #   qa/serve-real-having.sh <clean-db-path> [port]
 #
@@ -147,6 +151,26 @@ if has_table EMP; then
     compare "lowercase having" \
         "select dept_id, count(*) from emp group by dept_id having count(*) > 13 order by 1" \
         "SELECT $NK || '|' || COUNT(*) FROM EMP GROUP BY DEPT_ID HAVING COUNT(*) > 13 ORDER BY DEPT_ID"
+    # a FILTER on the HAVING aggregate: only the accepted rows fold
+    compare "HAVING COUNT(*) FILTER" \
+        "SELECT DEPT_ID, COUNT(*) FROM EMP GROUP BY DEPT_ID HAVING COUNT(*) FILTER (WHERE SALARY > 1000) > 5 ORDER BY DEPT_ID" \
+        "SELECT $NK || '|' || COUNT(*) FROM EMP GROUP BY DEPT_ID HAVING COUNT(*) FILTER (WHERE SALARY > 1000) > 5 ORDER BY DEPT_ID"
+    # a filtered aggregate NOT in the select list (a hidden filtered item)
+    compare "HAVING SUM FILTER hidden" \
+        "SELECT DEPT_ID, COUNT(*) FROM EMP GROUP BY DEPT_ID HAVING SUM(SALARY) FILTER (WHERE ID <= 50) > 20000 ORDER BY DEPT_ID" \
+        "SELECT $NK || '|' || COUNT(*) FROM EMP GROUP BY DEPT_ID HAVING SUM(SALARY) FILTER (WHERE ID <= 50) > 20000 ORDER BY DEPT_ID"
+    # COUNT(DISTINCT x) FILTER in HAVING - the distinct fold over the CASE
+    compare "HAVING COUNT(DISTINCT) FILTER" \
+        "SELECT DEPT_ID, COUNT(*) FROM EMP GROUP BY DEPT_ID HAVING COUNT(DISTINCT SALARY) FILTER (WHERE SALARY > 1000) >= 2 ORDER BY DEPT_ID" \
+        "SELECT $NK || '|' || COUNT(*) FROM EMP GROUP BY DEPT_ID HAVING COUNT(DISTINCT SALARY) FILTER (WHERE SALARY > 1000) >= 2 ORDER BY DEPT_ID"
+    # a filtered aggregate composed with a plain one under AND
+    compare "HAVING FILTER AND plain" \
+        "SELECT DEPT_ID, COUNT(*) FROM EMP GROUP BY DEPT_ID HAVING COUNT(*) FILTER (WHERE SALARY > 1000) >= 1 AND COUNT(*) > 3 ORDER BY DEPT_ID" \
+        "SELECT $NK || '|' || COUNT(*) FROM EMP GROUP BY DEPT_ID HAVING COUNT(*) FILTER (WHERE SALARY > 1000) >= 1 AND COUNT(*) > 3 ORDER BY DEPT_ID"
+    # one global group with a filtered HAVING aggregate
+    compare "global HAVING FILTER" \
+        "SELECT COUNT(*) FROM EMP HAVING COUNT(*) FILTER (WHERE SALARY > 1000) > 10" \
+        "SELECT COUNT(*) FROM EMP HAVING COUNT(*) FILTER (WHERE SALARY > 1000) > 10"
 fi
 if has_table T; then
     # IS NULL on an aggregate: groups whose values are all NULL
