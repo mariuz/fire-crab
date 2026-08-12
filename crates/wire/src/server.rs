@@ -5392,6 +5392,12 @@ enum Term {
     /// SIMILAR TO inside a value expression, and a non-text operand are
     /// each refused at prepare (their own later slices).
     Similar(usize, SimRe, bool),
+    /// `<text col> [NOT] SIMILAR TO ? [ESCAPE <c>]`: (field, pattern slot,
+    /// escape, negated). The `?` pattern arrives at execute, so the SimRe
+    /// is compiled at [Predicate::bind] and this becomes a [Term::Similar]
+    /// (a NULL pattern is UNKNOWN; a malformed one raises, as the engine
+    /// does). Never evaluated per row.
+    ParamSimilar(usize, usize, Option<char>, bool),
     /// `<text col> LIKE <literal pattern with an INVALID escape>` in a
     /// WHERE/HAVING: the engine's DSQL-time rewrite of a LITERAL
     /// pattern prepends a LENIENT prefix pre-filter (the bad escape
@@ -5857,6 +5863,20 @@ impl Predicate {
                             // term in the same conjunction still raises)
                             None => Term::Unknown,
                             Some(rhs) => Term::Like(*fid, rhs, *escape, *negated),
+                        }
+                    }
+                    // `<col> SIMILAR TO ?`: compile the bound pattern now.
+                    // NULL is UNKNOWN; a malformed pattern raises, as the
+                    // engine does at execute.
+                    Term::ParamSimilar(fid, idx, escape, negated) => {
+                        match bind_rhs(idx, &ColKind::Text)? {
+                            None => Term::Unknown,
+                            Some(Rhs::Str(p)) => {
+                                let re = sim_compile(&p, *escape)
+                                    .ok_or_else(|| "invalid SIMILAR TO pattern".to_string())?;
+                                Term::Similar(*fid, re, *negated)
+                            }
+                            Some(_) => Term::Unknown,
                         }
                     }
                     Term::Starting(fid, Rhs::Param(idx, _), negated) => {
@@ -6578,6 +6598,7 @@ impl Term {
             | Term::ParamLike(..)
             | Term::ParamStarting(..)
             | Term::ExprStartingParam(..)
+            | Term::ParamSimilar(..)
             | Term::ExprLikeParam(..) => None,
         })
     }
@@ -18866,6 +18887,7 @@ fn filter_has_params(filter: &Option<Predicate>) -> bool {
                     | Term::ParamLike(..)
                     | Term::ParamStarting(..)
                     | Term::ExprStartingParam(..)
+                    | Term::ParamSimilar(..)
                     | Term::ExprLikeParam(..)
             )
         })
@@ -44168,6 +44190,16 @@ fn param_or_typed_term(
                     escape,
                     negated,
                 ))
+            }
+            _ => None,
+        },
+        // `<text col> SIMILAR TO ?` - the pattern arrives at execute; the
+        // slot claims a text describe and the SimRe is compiled at bind.
+        // A non-text column is a later slice.
+        RawKind::Similar(Rhs::Param(slot, _), escape, negated) => match kind {
+            ColKind::Text => {
+                claim(slot)?;
+                Some(Term::ParamSimilar(idx, slot, escape, negated))
             }
             _ => None,
         },

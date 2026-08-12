@@ -17,7 +17,8 @@
 # same query; the row sets must be identical.
 #
 # SCOPE. A LITERAL pattern against a text column or a text expression
-# (`UPPER(S) SIMILAR TO ...`). A PARAMETER pattern (`SIMILAR TO ?`), a
+# (`UPPER(S) SIMILAR TO ...`), and a PARAMETER pattern (`SIMILAR TO ?`,
+# compiled at bind). A
 # `SIMILAR TO` inside a value expression (a projected boolean / CASE), and
 # a non-text operand are each refused at prepare - their own later slices.
 #
@@ -104,6 +105,35 @@ both "expr UPPER"           "UPPER(S) SIMILAR TO 'A_C'"
 both "combined with AND"    "S SIMILAR TO 'a%c' AND ID > 3"
 both "combined with OR"     "S SIMILAR TO 'xyz' OR S SIMILAR TO 'hello'"
 both "nested groups+quant"  "S SIMILAR TO '(a(b|x)+c)'"
+
+# --- a PARAMETER pattern (compiled at bind) ---
+queryp() { # <where-clause> <json args> <host> <port> <db>
+    timeout 25 env FC_Q="SELECT ID FROM T WHERE $1 ORDER BY ID" FC_A="$2" FC_HOST="$3" FC_PORT="$4" FC_DB="$5" node -e '
+      process.on("uncaughtException",()=>{console.log("CONN_ERR");process.exit(0);});
+      const F=require("node-firebird"); const args=JSON.parse(process.env.FC_A);
+      F.attach({host:process.env.FC_HOST,port:+process.env.FC_PORT,database:process.env.FC_DB,
+                user:"SYSDBA",password:"masterkey"},(e,db)=>{
+        if(e){console.log("CONN_ERR");process.exit(0);}
+        db.query(process.env.FC_Q,args,(e2,r)=>{
+          if(e2){console.log("ERR "+(e2.message||"").split("\n")[0].slice(0,44));db.detach();process.exit(0);}
+          console.log(JSON.stringify(Array.isArray(r)?r.map(x=>x.ID):[]));
+          db.detach();process.exit(0);});});' 2>/dev/null
+}
+bothp() { # <label> <where-clause> <json args>
+    local a b
+    a=$(queryp "$2" "$3" 127.0.0.1 "$PORT" "$A")
+    b=$(queryp "$2" "$3" 127.0.0.1 "$REAL" "$B")
+    ran=$((ran + 1))
+    if [ "$a" = "$b" ]; then echo "OK   $1: $a"
+    else echo "DIFF $1"; echo "     fcwire: $a"; echo "     engine: $b"; fail=1; fi
+}
+bothp "param a_c"           "S SIMILAR TO ?" '["a_c"]'
+bothp "param alternation"   "S SIMILAR TO ?" '["(abc|xyz)"]'
+bothp "param posix class"   "S SIMILAR TO ?" '["a[[:ALPHA:]]c"]'
+bothp "param NOT"           "S NOT SIMILAR TO ?" '["a%c"]'
+bothp "param ESCAPE"        "S SIMILAR TO ? ESCAPE '#'" '["a#%c"]'
+bothp "param no match"      "S SIMILAR TO ?" '["zzz"]'
+bothp "param + AND"         "ID > 1 AND S SIMILAR TO ?" '["a%c"]'
 
 echo "ran $ran checks"
 exit $fail
