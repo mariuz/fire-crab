@@ -42,9 +42,12 @@
 # SCOPE. An AGGREGATE window with no ORDER BY is the whole-partition
 # frame; with one and no explicit frame it is a RUNNING aggregate (default
 # RANGE, peers share); an explicit `ROWS` frame is a physical moving
-# window. A VALUE function takes an explicit `ROWS` frame too. An explicit
-# `RANGE`/`GROUPS` frame with offsets, and a frame on a ranking/navigation
-# function, are later slices (refused). Still
+# window; an explicit `RANGE` frame is a VALUE window over a single
+# INTEGER order key (ASC or DESC), the bounds measured in the key's own
+# values (peers fall in naturally). A VALUE function takes an explicit
+# `ROWS` frame too. A `RANGE` frame over a numeric/temporal key, a `RANGE`
+# frame on a value function, a `GROUPS` frame, and a frame on a
+# ranking/navigation function are later slices (refused). Still
 # refused, each its own slice: a window over a JOIN or a derived / CTE /
 # union-branch row source, a window mixed with GROUP BY, and a `?` inside
 # a window. Every ROW_NUMBER / LAG / LEAD / NTH / ROWS-frame check uses a
@@ -177,6 +180,14 @@ both "LAST_VALUE CR..1F"       "SELECT ID, LAST_VALUE(V) OVER (ORDER BY V, ID RO
 both "NTH_VALUE CR..UF"        "SELECT ID, NTH_VALUE(V,2) OVER (ORDER BY V, ID ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) N FROM T ORDER BY V, ID"
 both "LAST_VALUE partition fr" "SELECT ID, G, LAST_VALUE(V) OVER (PARTITION BY G ORDER BY V, ID ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) L FROM T ORDER BY G, V, ID"
 both "NTH_VALUE empty frame"   "SELECT ID, NTH_VALUE(V,3) OVER (ORDER BY V, ID ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) N FROM T ORDER BY V, ID"
+# --- explicit RANGE frames (value window over an integer key) ---
+both "RANGE 2 PREC..CURRENT"   "SELECT ID, SUM(V) OVER (ORDER BY V RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) S FROM T ORDER BY V, ID"
+both "RANGE 2 PREC..2 FOLL"    "SELECT ID, COUNT(*) OVER (ORDER BY V RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) C FROM T ORDER BY V, ID"
+both "RANGE CURRENT..3 FOLL"   "SELECT ID, SUM(V) OVER (ORDER BY V RANGE BETWEEN CURRENT ROW AND 3 FOLLOWING) S FROM T ORDER BY V, ID"
+both "RANGE shorthand 1 PREC"  "SELECT ID, SUM(V) OVER (ORDER BY V RANGE 1 PRECEDING) S FROM T ORDER BY V, ID"
+both "RANGE DESC 2 PREC..CR"   "SELECT ID, SUM(V) OVER (ORDER BY V DESC RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) S FROM T ORDER BY V DESC, ID"
+both "RANGE partition"         "SELECT ID, G, SUM(V) OVER (PARTITION BY G ORDER BY V RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) S FROM T ORDER BY G, V, ID"
+both "RANGE MAX 1P..1F"        "SELECT ID, MAX(V) OVER (ORDER BY V RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) M FROM T ORDER BY V, ID"
 
 echo "ran $ran checks"
 exit $fail

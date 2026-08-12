@@ -5172,12 +5172,22 @@ enum FrameBound {
     UnboundedFollowing,
 }
 
-/// An explicit `ROWS BETWEEN <start> AND <end>` frame (the `ROWS <start>`
-/// shorthand fills `end` with CURRENT ROW). Only `ROWS` is answered here;
-/// an explicit `RANGE`/`GROUPS` frame with offsets is a later slice, and
-/// NO explicit frame keeps the default (running RANGE / whole partition).
+/// Whether a frame's offsets count PHYSICAL ROWS (`ROWS`) or ORDER-KEY
+/// VALUES (`RANGE`). `GROUPS` is a later slice.
+#[derive(Clone, Copy, PartialEq)]
+enum FrameMode {
+    Rows,
+    Range,
+}
+
+/// An explicit `<mode> BETWEEN <start> AND <end>` frame (the `<mode>
+/// <start>` shorthand fills `end` with CURRENT ROW). `ROWS` is a physical
+/// window; `RANGE` a value window (over a single integer order key here -
+/// a numeric/temporal key is a later slice). No explicit frame keeps the
+/// default (running RANGE / whole partition).
 #[derive(Clone)]
 struct Frame {
+    mode: FrameMode,
     start: FrameBound,
     end: FrameBound,
 }
@@ -24390,6 +24400,30 @@ fn plan_query_inner_ctx(
                             // BIGINT, MIN/MAX keep the source, SUM widens,
                             // the NUMERIC/text/temporal refusals, no copy.
                             WinFunc::Agg(f, target) => {
+                                // a RANGE-offset frame measures its bounds in
+                                // the ORDER KEY's own values, so it needs
+                                // exactly one key, and this slice does the
+                                // arithmetic only for an INTEGER key (a
+                                // numeric/temporal key is a later slice)
+                                if matches!(&frame, Some(fr) if fr.mode == FrameMode::Range) {
+                                    if order.len() != 1 {
+                                        return None;
+                                    }
+                                    let k = &order[0];
+                                    let is_int = match &k.expr {
+                                        Some(e) => {
+                                            matches!(e.type_of(&descs), Some(ExprType::Int))
+                                        }
+                                        None => descs
+                                            .get(k.field)
+                                            .is_some_and(|d| {
+                                                matches!(col_kind(d), Some(ColKind::Int))
+                                            }),
+                                    };
+                                    if !is_int {
+                                        return None;
+                                    }
+                                }
                                 let mut sink: Vec<Option<Descriptor>> = Vec::new();
                                 let (wc, wg) = build_group_items(
                                     std::slice::from_ref(&SelItem::Agg(
@@ -26854,7 +26888,7 @@ fn compute_windows(
             match &spec.kind {
                 WinKind::Agg { func, src, distinct, frame } => {
                     let gi = [GItem::Agg(*func, src.clone(), *distinct)];
-                    if let Some(fr) = frame {
+                    if let Some(fr) = frame.as_ref().filter(|f| f.mode == FrameMode::Rows) {
                         // EXPLICIT ROWS FRAME: order the partition, then
                         // each row folds the PHYSICAL rows its frame bounds
                         // select (clamped to the partition; an empty frame
@@ -26891,6 +26925,75 @@ fn compute_windows(
                                 compute_group(&win, &gi)?.into_iter().next().unwrap_or(Value::Null)
                             };
                             vals[idxs[perm[pos]]][wi] = v;
+                        }
+                    } else if let Some(fr) =
+                        frame.as_ref().filter(|f| f.mode == FrameMode::Range)
+                    {
+                        // EXPLICIT RANGE FRAME: the bounds are offsets in the
+                        // single INTEGER order key's VALUES (checked at
+                        // plan), so a row's frame is every partition row
+                        // whose key lies in the value interval - peers fall
+                        // in naturally. `desc` flips the offset direction and
+                        // the "before/after in sort order" test.
+                        let desc = spec.order.first().is_some_and(|k| k.desc);
+                        // this row's integer key (scale 0), or None for a
+                        // NULL key
+                        let keyi = |ri: usize| -> Option<i128> {
+                            numeric_parts(&ordrows[ri][0]).map(|(raw, _)| raw)
+                        };
+                        // the bound's value as a delta applied to the key kc,
+                        // or None for an UNBOUNDED edge
+                        let bval = |b: &FrameBound, kc: i128| -> Option<i128> {
+                            match b {
+                                FrameBound::UnboundedPreceding
+                                | FrameBound::UnboundedFollowing => None,
+                                FrameBound::CurrentRow => Some(kc),
+                                FrameBound::Preceding(x) => {
+                                    Some(if desc { kc + *x as i128 } else { kc - *x as i128 })
+                                }
+                                FrameBound::Following(x) => {
+                                    Some(if desc { kc - *x as i128 } else { kc + *x as i128 })
+                                }
+                            }
+                        };
+                        for &cur in &idxs {
+                            let v = match keyi(cur) {
+                                // a NULL-key row's frame is its NULL peers
+                                // (RANGE groups NULLs); scanned by key too
+                                None => {
+                                    let win: Vec<Vec<Value>> = idxs
+                                        .iter()
+                                        .filter(|&&ri| keyi(ri).is_none())
+                                        .map(|&ri| rows[ri].clone())
+                                        .collect();
+                                    compute_group(&win, &gi)?
+                                        .into_iter()
+                                        .next()
+                                        .unwrap_or(Value::Null)
+                                }
+                                Some(kc) => {
+                                    let sv = bval(&fr.start, kc);
+                                    let ev = bval(&fr.end, kc);
+                                    let win: Vec<Vec<Value>> = idxs
+                                        .iter()
+                                        .filter_map(|&ri| {
+                                            let rk = keyi(ri)?; // NULL key: out
+                                            let after = sv.is_none_or(|s| {
+                                                if desc { rk <= s } else { rk >= s }
+                                            });
+                                            let before = ev.is_none_or(|e| {
+                                                if desc { rk >= e } else { rk <= e }
+                                            });
+                                            (after && before).then(|| rows[ri].clone())
+                                        })
+                                        .collect();
+                                    compute_group(&win, &gi)?
+                                        .into_iter()
+                                        .next()
+                                        .unwrap_or(Value::Null)
+                                }
+                            };
+                            vals[cur][wi] = v;
                         }
                     } else if spec.order.is_empty() {
                         // WHOLE-PARTITION frame: one fold for every row
@@ -37324,13 +37427,20 @@ fn parse_window_item(
     };
     let spec = t[over_lp + 1..over_end].trim();
     let (part, order, frame) = parse_over_spec(spec)?;
-    // an aggregate window with an ORDER BY is a RUNNING aggregate under the
-    // default RANGE frame (peers share); with none it is the whole
-    // partition. An explicit ROWS frame is answered on an AGGREGATE or a
-    // VALUE function (FIRST/LAST/NTH_VALUE) - ranking and navigation take
-    // no frame - and only WITH an ORDER BY (the frame is relative to it).
-    if frame.is_some() {
-        if !matches!(func, WinFunc::Agg(..) | WinFunc::Val(..)) || order.is_none() {
+    // a frame is answered only WITH an ORDER BY (it is relative to it). An
+    // explicit ROWS frame rides an AGGREGATE or a VALUE function (FIRST/
+    // LAST/NTH_VALUE); a RANGE-offset frame rides an AGGREGATE only (a
+    // value function under RANGE is a later slice). Ranking and navigation
+    // take no frame.
+    if let Some(fr) = &frame {
+        if order.is_none() {
+            return None;
+        }
+        let ok = match fr.mode {
+            FrameMode::Rows => matches!(func, WinFunc::Agg(..) | WinFunc::Val(..)),
+            FrameMode::Range => matches!(func, WinFunc::Agg(..)),
+        };
+        if !ok {
             return None;
         }
     }
@@ -37440,18 +37550,18 @@ fn parse_over_spec(spec: &str) -> Option<(Vec<RawExpr>, Option<String>, Option<F
         return Some((Vec::new(), None, None));
     }
     let up = s.to_ascii_uppercase();
-    // an explicit RANGE/GROUPS frame with offsets is a later slice; refuse
-    // it rather than answer a ROWS frame where the engine answers a value
-    // one. (Matched with surrounding spaces so a quoted column named
-    // RANGE/GROUPS is not caught.)
-    let padded = format!(" {} ", up);
-    for kw in [" RANGE ", " GROUPS "] {
-        if padded.contains(kw) {
-            return None;
-        }
+    // a `GROUPS` frame is a later slice (matched with surrounding spaces so
+    // a quoted column named GROUPS is not caught)
+    if format!(" {} ", up).contains(" GROUPS ") {
+        return None;
     }
-    // a trailing `ROWS` frame clause, at depth 0, is split off first
-    let (before_frame, frame) = match find_word_depth0(&up, "ROWS", 0) {
+    // a trailing frame clause - ROWS or RANGE, whichever comes first at
+    // depth 0 - is split off first
+    let frame_at = match (find_word_depth0(&up, "ROWS", 0), find_word_depth0(&up, "RANGE", 0)) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    let (before_frame, frame) = match frame_at {
         Some(p) => (s[..p].trim(), Some(parse_frame_clause(s[p..].trim())?)),
         None => (s, None),
     };
@@ -37489,25 +37599,28 @@ fn parse_over_spec(spec: &str) -> Option<(Vec<RawExpr>, Option<String>, Option<F
     Some((part, order_s, frame))
 }
 
-/// Parse an explicit `ROWS` frame - `ROWS BETWEEN <start> AND <end>`, or
-/// the `ROWS <start>` shorthand (end = CURRENT ROW).
+/// Parse an explicit frame - `<ROWS|RANGE> BETWEEN <start> AND <end>`, or
+/// the `<ROWS|RANGE> <start>` shorthand (end = CURRENT ROW).
 fn parse_frame_clause(s: &str) -> Option<Frame> {
-    // strip the leading ROWS word
-    let rest = s.get(..4).filter(|w| w.eq_ignore_ascii_case("ROWS"))?;
-    let _ = rest;
-    let body = s[4..].trim();
+    // the mode word, then the extent
+    let (mode, kwlen) = if s.get(..4).is_some_and(|w| w.eq_ignore_ascii_case("ROWS")) {
+        (FrameMode::Rows, 4)
+    } else if s.get(..5).is_some_and(|w| w.eq_ignore_ascii_case("RANGE")) {
+        (FrameMode::Range, 5)
+    } else {
+        return None;
+    };
+    let body = s[kwlen..].trim();
     let up = body.to_ascii_uppercase();
-    if let Some(inner) = up.strip_prefix("BETWEEN ") {
-        // BETWEEN <start> AND <end>; split at the depth-0 (here always
-        // depth 0) ` AND ` between the two bounds
+    if up.strip_prefix("BETWEEN ").is_some() {
+        // BETWEEN <start> AND <end>; split at the depth-0 ` AND `
         let and_at = find_word_depth0(&up, "AND", "BETWEEN ".len())?;
         let start = parse_frame_bound(body["BETWEEN ".len()..and_at].trim())?;
         let end = parse_frame_bound(body[and_at + "AND".len()..].trim())?;
-        let _ = inner;
-        Some(Frame { start, end })
+        Some(Frame { mode, start, end })
     } else {
-        // shorthand: ROWS <start> == BETWEEN <start> AND CURRENT ROW
-        Some(Frame { start: parse_frame_bound(body)?, end: FrameBound::CurrentRow })
+        // shorthand: <mode> <start> == BETWEEN <start> AND CURRENT ROW
+        Some(Frame { mode, start: parse_frame_bound(body)?, end: FrameBound::CurrentRow })
     }
 }
 
