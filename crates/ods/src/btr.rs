@@ -285,11 +285,7 @@ pub fn walk_index_leaves(
     if root_no == 0 {
         return None;
     }
-    let get = |no: u32| {
-        let start = no as usize * page_size;
-        file.get(start..start + page_size)
-            .and_then(BtreePage::decode)
-    };
+    let get = |no: u32| crate::page_at(file, page_size, no).and_then(BtreePage::decode);
 
     // descend to the leftmost leaf
     let mut page = get(root_no)?;
@@ -426,10 +422,7 @@ pub fn lookup_range(
     if root_no == 0 {
         return None;
     }
-    let get = |no: u32| {
-        let start = no as usize * page_size;
-        file.get(start..start + page_size).and_then(BtreePage::decode)
-    };
+    let get = |no: u32| crate::page_at(file, page_size, no).and_then(BtreePage::decode);
 
     // Descend: on each non-leaf page take the LAST node whose key is
     // <= the lower bound (the leftmost node otherwise), which is the

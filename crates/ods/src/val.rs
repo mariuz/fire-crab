@@ -174,8 +174,7 @@ fn pages_rows_stateless(file: &[u8], page_size: usize) -> Vec<(u32, u16, u16)> {
     };
     let mut out = Vec::new();
     for dp_no in crate::pointer::relation_data_pages(file, page_size, 0) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+        let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
         for r in dp.records() {
@@ -207,10 +206,7 @@ pub fn validate(file: &[u8], page_size: usize, full: bool) -> Result<ValCounts, 
         return Err(ValAbort::Broken("no header page".into()));
     }
     let npages = (file.len() / page_size) as u32;
-    let page_of = |no: u32| {
-        let start = no as usize * page_size;
-        file.get(start..start + page_size)
-    };
+    let page_of = |no: u32| crate::page_at(file, page_size, no);
 
     // THE FIXED-POSITION PAGES: page 1 is the first PIP and page 2 the
     // first SCN page on every modern file - positions the ODS pins, so

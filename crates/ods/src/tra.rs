@@ -279,8 +279,7 @@ pub fn visible_version_2pc(
     snap: Option<&Snapshot>,
 ) -> Result<Option<VisibleVersion>, u64> {
     let fetch_page = |no: u32| {
-        let start = no as usize * page_size;
-        file.get(start..start + page_size)
+        crate::page_at(file, page_size, no)
             .and_then(DataPage::decode)
     };
     let mut current = head.clone();
@@ -416,9 +415,7 @@ pub fn visible_exists_2pc(
         if current.back_page == 0 {
             return Ok(false);
         }
-        let start = current.back_page as usize * page_size;
-        let Some(back) = file
-            .get(start..start + page_size)
+        let Some(back) = crate::page_at(file, page_size, current.back_page)
             .and_then(DataPage::decode)
             .and_then(|dp| dp.record(current.back_line))
         else {
@@ -461,9 +458,7 @@ pub fn visible_rows_2pc(
     let mut out = Vec::new();
 
     for dp_no in relation_data_pages(file, page_size, relation) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file
-            .get(start..start + page_size)
+        let Some(dp) = crate::page_at(file, page_size, dp_no)
             .and_then(DataPage::decode)
         else {
             continue;

@@ -47,9 +47,7 @@ fn chain_len(file: &[u8], page_size: usize, mut page: u32, mut line: u16) -> u64
     let mut n = 0u64;
     let mut hops = 0;
     while page != 0 && hops < 100_000 {
-        let start = page as usize * page_size;
-        let Some(dp) = file
-            .get(start..start + page_size)
+        let Some(dp) = crate::page_at(file, page_size, page)
             .and_then(DataPage::decode)
         else {
             break;
@@ -81,9 +79,7 @@ pub fn analyze(
     };
 
     for dp_no in relation_data_pages(file, page_size, relation) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file
-            .get(start..start + page_size)
+        let Some(dp) = crate::page_at(file, page_size, dp_no)
             .and_then(DataPage::decode)
         else {
             continue;
@@ -149,9 +145,7 @@ pub fn analyze(
 pub fn version_count(file: &[u8], page_size: usize, relation: u16) -> u64 {
     let mut n = 0u64;
     for dp_no in relation_data_pages(file, page_size, relation) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file
-            .get(start..start + page_size)
+        let Some(dp) = crate::page_at(file, page_size, dp_no)
             .and_then(DataPage::decode)
         else {
             continue;
@@ -247,8 +241,7 @@ fn free_slot(file: &mut [u8], page_size: usize, page: u32, slot: u16) {
 
 /// Read one record's header fields straight off the page.
 fn member_at(file: &[u8], page_size: usize, page: u32, slot: u16) -> Option<Member> {
-    let start = page as usize * page_size;
-    let dp = file.get(start..start + page_size).and_then(DataPage::decode)?;
+    let dp = crate::page_at(file, page_size, page).and_then(DataPage::decode)?;
     let r = dp.record(slot)?;
     Some(Member {
         page,
@@ -315,8 +308,7 @@ pub fn sweep(
         // a relation whose pages carry BLOB records is left whole
         let mut has_blob = false;
         'blobscan: for dp_no in &pages {
-            let start = *dp_no as usize * page_size;
-            let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+            let Some(dp) = crate::page_at(file, page_size, *dp_no).and_then(DataPage::decode) else {
                 continue;
             };
             for r in dp.records() {
@@ -332,8 +324,7 @@ pub fn sweep(
         }
         out.relations_swept += 1;
         for dp_no in pages {
-            let start = dp_no as usize * page_size;
-            let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+            let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
                 continue;
             };
             let heads: Vec<u16> = dp
@@ -406,9 +397,7 @@ pub fn sweep(
                             // the head it is about to replace
                             let image = {
                                 let back_hdr = {
-                                    let s2 = head.back_page as usize * page_size;
-                                    let dp2 = file
-                                        .get(s2..s2 + page_size)
+                                    let dp2 = crate::page_at(file, page_size, head.back_page)
                                         .and_then(DataPage::decode)
                                         .ok_or("back page undecodable mid-sweep")?;
                                     dp2.record(head.back_line)
@@ -423,9 +412,7 @@ pub fn sweep(
                                 };
                                 if head.flags & flags::DELTA != 0 {
                                     let head_hdr = {
-                                        let s2 = dp_no as usize * page_size;
-                                        let dp2 = file
-                                            .get(s2..s2 + page_size)
+                                        let dp2 = crate::page_at(file, page_size, dp_no)
                                             .and_then(DataPage::decode)
                                             .ok_or("head page undecodable mid-sweep")?;
                                         dp2.record(slot)
@@ -483,9 +470,7 @@ pub fn sweep(
                             rec.extend_from_slice(&back.back_line.to_le_bytes());
                             rec.extend_from_slice(&new_flags.to_le_bytes());
                             rec.push({
-                                let s2 = head.back_page as usize * page_size;
-                                let dp2 = file
-                                    .get(s2..s2 + page_size)
+                                let dp2 = crate::page_at(file, page_size, head.back_page)
                                     .and_then(DataPage::decode)
                                     .ok_or("back page undecodable mid-sweep")?;
                                 dp2.record(head.back_line)

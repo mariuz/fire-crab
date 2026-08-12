@@ -453,8 +453,7 @@ pub fn locate_record<'a>(
     let dp_index = (recno / recs) as usize;
     let line = (recno % recs) as u16;
     let dp_no = *relation_data_pages(file, page_size, relation).get(dp_index)?;
-    let start = dp_no as usize * page_size;
-    let dp = DataPage::decode(file.get(start..start + page_size)?)?;
+    let dp = DataPage::decode(crate::page_at(file, page_size, dp_no)?)?;
     dp.record(line)
 }
 
@@ -476,8 +475,7 @@ pub fn read_blob(
     let dp_index = (recno / recs) as usize;
     let line = (recno % recs) as u16;
     let dp_no = *relation_data_pages(file, page_size, relation).get(dp_index)?;
-    let start = dp_no as usize * page_size;
-    let dp = DataPage::decode(file.get(start..start + page_size)?)?;
+    let dp = DataPage::decode(crate::page_at(file, page_size, dp_no)?)?;
     let b = dp.slot_bytes(line)?;
     if b.len() < 28 || u16_at(b, 10) & flags::BLOB == 0 {
         return None;
@@ -500,8 +498,7 @@ pub fn read_blob(
                 if pageno == 0 {
                     break;
                 }
-                let start = pageno as usize * page_size;
-                let page = file.get(start..start + page_size)?;
+                let page = crate::page_at(file, page_size, pageno)?;
                 let blp_length = u16_at(page, 24) as usize;
                 out.extend_from_slice(page.get(28..28 + blp_length)?);
             }
@@ -537,8 +534,7 @@ pub fn read_blob_content(
 ) -> Option<Vec<u8>> {
     let recs = max_recs_per_dp(page_size);
     let dp_no = *relation_data_pages(file, page_size, relation).get((recno / recs) as usize)?;
-    let start = dp_no as usize * page_size;
-    let dp = DataPage::decode(file.get(start..start + page_size)?)?;
+    let dp = DataPage::decode(crate::page_at(file, page_size, dp_no)?)?;
     let b = dp.slot_bytes((recno % recs) as u16)?;
     if b.len() < 12 || u16_at(b, 10) & flags::BLOB == 0 {
         return None;
@@ -558,9 +554,7 @@ pub fn relation_formats(
     let sys = formats_table_format();
     let mut found = Vec::new();
     for dp_no in relation_data_pages(file, page_size, REL_FORMATS) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file
-            .get(start..start + page_size)
+        let Some(dp) = crate::page_at(file, page_size, dp_no)
             .and_then(DataPage::decode)
         else {
             continue;

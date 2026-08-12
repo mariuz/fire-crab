@@ -216,8 +216,7 @@ fn external_type_to_desc(ftype: i64, flength: i64) -> Option<(u8, u16)> {
 /// Decode every committed primary record of `rel` with `descs`.
 fn each_row<F: FnMut(Vec<Value>)>(file: &[u8], page_size: usize, rel: u16, descs: &[Descriptor], mut f: F) {
     for dp_no in relation_data_pages(file, page_size, rel) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+        let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
         for r in dp.records() {
