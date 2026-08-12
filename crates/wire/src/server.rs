@@ -19,7 +19,9 @@ use crate::crypto::Rc4;
 use crate::srp::SrpVerifier;
 use fire_crab_ods::data::DataPage;
 use fire_crab_ods::format::{decode_record, dtype, Descriptor, Value};
-use fire_crab_ods::{relation_columns, relation_data_pages, relation_formats, RelationColumn};
+use fire_crab_ods::{
+    relation_columns, relation_data_pages, relation_formats, resolve_relation, RelationColumn,
+};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
@@ -4838,6 +4840,36 @@ AlterDomainRename {
     /// ANNOUNCES them.
     Derived {
         inner: Box<Plan>,
+        cols: Vec<ProjCol>,
+        filter: Option<Predicate>,
+        order_by: Vec<OrderKey>,
+    },
+    /// A LATERAL derived table - `FROM <base> a, LATERAL (<subquery>) x`
+    /// (or `LEFT JOIN LATERAL (...) x ON TRUE`). The subquery is
+    /// CORRELATED: it references the outer (base) row's columns, so it is
+    /// re-evaluated PER OUTER ROW with those columns substituted as
+    /// literals - fire-crab's join planner cannot bind an outer row into a
+    /// side's inner plan, so the correlation is threaded by re-planning the
+    /// substituted subquery at fetch. The combined row is the base row
+    /// (`base_width` wide) followed by the subquery's `lat_width` columns;
+    /// `cols`/`filter`/`order_by` all speak that combined row (resolved by
+    /// the ordinary join planner over a NULL-substituted stand-in). A comma
+    /// / INNER lateral drops an outer row whose subquery is empty; `left`
+    /// keeps it, padded with NULLs.
+    Lateral {
+        base: RowSource,
+        base_width: usize,
+        /// the base's binding alias - what the subquery qualifies its outer
+        /// column references with
+        outer_alias: String,
+        /// the base relation's columns (name -> field id) and their
+        /// descriptors, for substituting the outer row's values as literals
+        outer_cols: Vec<RelationColumn>,
+        outer_descs: Vec<Descriptor>,
+        /// the ORIGINAL correlated subquery text (inside the LATERAL parens)
+        subquery: String,
+        left: bool,
+        lat_width: usize,
         cols: Vec<ProjCol>,
         filter: Option<Predicate>,
         order_by: Vec<OrderKey>,
@@ -20346,6 +20378,242 @@ fn resolve_join_predicate(
 /// possible at all - a materialised buffer is as good a side as a scan.
 type BoundRows<'a> = (&'a str, &'a [ProjCol], &'a RowSource);
 
+/// Render a value as a SQL literal, for substituting an outer row's
+/// columns into a LATERAL subquery. Common exact/text/bool types only; a
+/// temporal / blob / DECFLOAT / time-zone outer column that a subquery
+/// actually references refuses the fetch (a later slice).
+fn value_to_sql(v: &Value) -> Option<String> {
+    Some(match v {
+        Value::Null => "NULL".to_string(),
+        Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        Value::Bool(x) => if *x { "TRUE" } else { "FALSE" }.to_string(),
+        Value::Int(_) | Value::Scaled(..) | Value::Int128(..) | Value::Double(_)
+        | Value::Float(_) => v.render(),
+        _ => return None,
+    })
+}
+
+/// The SQL type name for a descriptor - used to type an outer column
+/// reference in a LATERAL subquery's describe stand-in (`CAST(NULL AS
+/// <type>)`). Covers the common types; anything else falls back to a wide
+/// VARCHAR, enough to plan (an unusual outer type in a SELECT-list ref is
+/// a describe boundary).
+fn desc_type_sql(d: &Descriptor) -> String {
+    let s = (-(d.scale as i32)).max(0);
+    match d.dtype {
+        dtype::SHORT => if d.scale < 0 { format!("NUMERIC(4,{})", s) } else { "SMALLINT".into() },
+        dtype::LONG => if d.scale < 0 { format!("NUMERIC(9,{})", s) } else { "INTEGER".into() },
+        dtype::INT64 => if d.scale < 0 { format!("NUMERIC(18,{})", s) } else { "BIGINT".into() },
+        dtype::INT128 => if d.scale < 0 { format!("NUMERIC(38,{})", s) } else { "DECIMAL(38)".into() },
+        dtype::DOUBLE => "DOUBLE PRECISION".into(),
+        dtype::SQL_DATE => "DATE".into(),
+        dtype::SQL_TIME => "TIME".into(),
+        dtype::TIMESTAMP => "TIMESTAMP".into(),
+        dtype::BOOLEAN => "BOOLEAN".into(),
+        dtype::VARYING => format!("VARCHAR({})", (d.length as usize).saturating_sub(2).max(1)),
+        dtype::TEXT => format!("CHAR({})", (d.length as usize).max(1)),
+        _ => "VARCHAR(32000)".into(),
+    }
+}
+
+/// Substitute a LATERAL subquery's references to the OUTER row's columns
+/// (`<alias>.<col>`) with literals: the row's values when `row` is Some,
+/// or `CAST(NULL AS <type>)` when None (the describe stand-in, which needs
+/// the subquery only to type its output - a bare NULL would let fc fold
+/// the correlated comparison away to an empty, column-less plan). String
+/// literals in the subquery are copied verbatim. Returns None if a
+/// referenced value has no literal form.
+fn subst_lateral(
+    sub: &str,
+    alias: &str,
+    cols: &[RelationColumn],
+    descs: &[Descriptor],
+    row: Option<&[Value]>,
+) -> Option<String> {
+    let b = sub.as_bytes();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < sub.len() {
+        // copy a string literal verbatim (its `.` and identifiers are text)
+        if b[i] == b'\'' {
+            out.push('\'');
+            i += 1;
+            while i < sub.len() {
+                out.push(b[i] as char);
+                if b[i] == b'\'' {
+                    if b.get(i + 1) == Some(&b'\'') {
+                        out.push('\'');
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // `<alias>.<col>` at a word boundary, col a real base column
+        let boundary = i == 0 || !is_ident_byte(b[i - 1]);
+        if boundary
+            && sub.len() - i >= alias.len()
+            && sub[i..i + alias.len()].eq_ignore_ascii_case(alias)
+            && b.get(i + alias.len()) == Some(&b'.')
+        {
+            let dot = i + alias.len();
+            let mut k = dot + 1;
+            while k < sub.len() && is_ident_byte(b[k]) {
+                k += 1;
+            }
+            if k > dot + 1 {
+                let colname = &sub[dot + 1..k];
+                if let Some(rc) = cols.iter().find(|c| c.name.eq_ignore_ascii_case(colname)) {
+                    let lit = match row {
+                        None => format!(
+                            "CAST(NULL AS {})",
+                            desc_type_sql(descs.get(rc.field_id as usize)?)
+                        ),
+                        Some(vals) => value_to_sql(vals.get(rc.field_id as usize)?)?,
+                    };
+                    out.push_str(&lit);
+                    i = k;
+                    continue;
+                }
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    Some(out)
+}
+
+/// Split a LATERAL FROM clause into (base FROM text, outer alias, the
+/// subquery text, the lateral alias, is-LEFT). First slice: a single base
+/// table (aliased), then either `, LATERAL (<sub>) <x>` (comma / INNER) or
+/// `LEFT [OUTER] JOIN LATERAL (<sub>) <x> ON TRUE`.
+fn parse_lateral_from(table_s: &str) -> Option<(&str, &str, String, String, bool)> {
+    let t = table_s.trim();
+    let up = mask_literals(&t.to_ascii_uppercase());
+    let lat = find_word_depth0(&up, "LATERAL", 0)?;
+    let before = t[..lat].trim_end();
+    let bu = before.to_ascii_uppercase();
+    let (base_s, left) = if before.ends_with(',') {
+        (before[..before.len() - 1].trim(), false)
+    } else if bu.ends_with(" LEFT JOIN") {
+        (before[..before.len() - " LEFT JOIN".len()].trim(), true)
+    } else if bu.ends_with(" LEFT OUTER JOIN") {
+        (before[..before.len() - " LEFT OUTER JOIN".len()].trim(), true)
+    } else {
+        return None; // CROSS/INNER/RIGHT/FULL JOIN LATERAL: later slices
+    };
+    // after LATERAL: `(<sub>) <alias> [ON TRUE]`
+    let after = t[lat + "LATERAL".len()..].trim_start();
+    if !after.starts_with('(') {
+        return None;
+    }
+    let close = matching_paren(after.as_bytes(), 0)?;
+    let sub = after[1..close].trim().to_string();
+    let rest = after[close + 1..].trim_start();
+    let alias_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+    let lat_alias = rest[..alias_end].trim().to_string();
+    if lat_alias.is_empty() || !ident_ok(&lat_alias) {
+        return None;
+    }
+    let tail = rest[alias_end..].trim();
+    if left {
+        if !tail.eq_ignore_ascii_case("ON TRUE") {
+            return None; // only ON TRUE for LEFT JOIN LATERAL in this slice
+        }
+    } else if !tail.is_empty() {
+        return None; // the comma form takes nothing after the alias
+    }
+    // the base must be ONE real table (no further join / comma / lateral)
+    let bmask = mask_literals(&base_s.to_ascii_uppercase());
+    if find_word_depth0(&bmask, "JOIN", 0).is_some()
+        || find_word_depth0(&bmask, "LATERAL", 0).is_some()
+        || split_top_level_commas(base_s).len() > 1
+    {
+        return None;
+    }
+    let bref = parse_table_ref(base_s)?;
+    if bref.schema.is_some() || bref.table.starts_with('(') {
+        return None;
+    }
+    let outer_alias = bref.alias.unwrap_or(bref.table);
+    Some((base_s, outer_alias, sub, lat_alias, left))
+}
+
+/// Plan a LATERAL derived table (see [Plan::Lateral]). Reuses the ordinary
+/// join planner for column/describe resolution by standing the correlated
+/// subquery in as a plain derived side with its outer references replaced
+/// by NULL (which types the output identically), then carries the ORIGINAL
+/// subquery for the per-outer-row re-evaluation at fetch.
+fn plan_lateral(
+    proj: &Proj,
+    table_s: &str,
+    where_s: Option<&str>,
+    order_s: Option<&str>,
+    db: &Database,
+    db_all: &Option<Database>,
+    proj_params: usize,
+    params: &mut Vec<Option<Descriptor>>,
+) -> Option<Plan> {
+    let (base_s, outer_alias, sub, lat_alias, left) = parse_lateral_from(table_s)?;
+    // the subquery is re-planned per outer row with literals in place of the
+    // outer columns; a `?` in it has no value there, so refuse (later slice)
+    if sub.contains('?') {
+        return None;
+    }
+    let bref = parse_table_ref(base_s)?;
+    let columns = relation_columns(&db.bytes(), db.page_size, bref.table);
+    if columns.is_empty() {
+        return None;
+    }
+    let rel = resolve_relation(&db.bytes(), db.page_size, bref.table)?;
+    let outer_descs: Vec<Descriptor> = relation_formats(&db.bytes(), db.page_size, rel)
+        .into_iter()
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, d)| d)
+        .unwrap_or_default();
+    // the describe stand-in: outer refs -> CAST(NULL AS type) so the
+    // subquery plans (and types its output) standalone. ALWAYS the comma
+    // (cross) form - a comma and a `LEFT JOIN ... ON TRUE` expose the SAME
+    // combined columns, differing only in whether an empty lateral drops or
+    // pads the row, which is an EXECUTION concern carried by `left`. (fc's
+    // join planner does not accept a derived side under LEFT JOIN ON TRUE,
+    // so the comma form is also the one that plans.)
+    let null_sub = subst_lateral(&sub, outer_alias, &columns, &outer_descs, None)?;
+    let describe_from = format!("{} , ({}) {}", base_s, null_sub, lat_alias);
+    let (from, join) = parse_from(&describe_from)?;
+    let planned = plan_join(
+        proj, &from, &join, where_s, None, None, order_s, db, db_all, proj_params, params,
+    )?;
+    let Plan::Join { base, base_width, parts, cols, filter, order_by } = planned else {
+        return None;
+    };
+    if parts.len() != 1 {
+        return None;
+    }
+    let lat_width = parts[0].width;
+    // the base must be a plain table scan (a single relation, this slice)
+    if !matches!(&base, RowSource::TableScan { .. }) {
+        return None;
+    }
+    Some(Plan::Lateral {
+        base: base.clone(),
+        base_width,
+        outer_alias: outer_alias.to_string(),
+        outer_cols: columns,
+        outer_descs,
+        subquery: sub,
+        left,
+        lat_width,
+        cols,
+        filter,
+        order_by,
+    })
+}
+
 fn plan_join(
     proj: &Proj,
     left: &TableRef<'_>,
@@ -24337,6 +24605,14 @@ fn plan_query_inner_ctx(
     // side plans its own inner query, and that planner takes the Option
     let db_all = db;
     let db = db.as_ref()?;
+    // a LATERAL derived table in the FROM is a correlated join the ordinary
+    // parser cannot represent - route it to its own planner, which reuses
+    // the join planner for column resolution and re-evaluates the subquery
+    // per outer row. Detected before parse_from, which reads LATERAL as a
+    // (nonexistent) table name.
+    if find_word_depth0(&mask_literals(&table_s.to_ascii_uppercase()), "LATERAL", 0).is_some() {
+        return plan_lateral(&proj, table_s, where_s, order_s, db, db_all, proj_params, params);
+    }
     let Some((left, join)) = parse_from(table_s) else {
         if trace { eprintln!("[srv] plan: FROM parse failed for {:?}", table_s); }
         return None;
@@ -27848,6 +28124,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         Plan::Delete { .. } => describe_dml(4, params), // isc_info_sql_stmt_delete
         Plan::Project { cols, .. } => build_describe(cols, params, att),
         Plan::Join { cols, .. } | Plan::JoinGroup { cols, .. } => build_describe(cols, params, att),
+        Plan::Lateral { cols, .. } => build_describe(cols, params, att),
         Plan::Group { cols, .. } => build_describe(cols, params, att),
         Plan::VirtualEmpty { .. } => build_describe(&output_cols_of(plan), params, att),
         Plan::Rows { cols, .. } => build_describe(cols, params, att),
@@ -27893,6 +28170,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::Project { .. }
         | Plan::Join { .. }
         | Plan::JoinGroup { .. }
+        | Plan::Lateral { .. }
         | Plan::Group { .. }
         | Plan::Refused
         | Plan::RefusedEval(_)
@@ -28015,6 +28293,7 @@ fn output_cols_of(plan: &Plan) -> Vec<ProjCol> {
         Plan::Project { cols, .. }
         | Plan::Join { cols, .. }
         | Plan::JoinGroup { cols, .. }
+        | Plan::Lateral { cols, .. }
         | Plan::Group { cols, .. } => {
             cols.clone()
         }
@@ -29731,6 +30010,68 @@ fn emit_rows_inner(
                     for values in &sorted {
                         encode_row(w, cols, values, out)?;
                     }
+                }
+            }
+        }
+        Plan::Lateral {
+            base,
+            base_width,
+            outer_alias,
+            outer_cols,
+            outer_descs,
+            subquery,
+            left,
+            lat_width,
+            cols,
+            filter,
+            order_by,
+        } => {
+            if let Some(dbr) = db {
+                // scan the outer (base) rows once; for each, substitute its
+                // columns' literals into the subquery, plan+run that
+                // uncorrelated query, and combine (comma drops an empty
+                // lateral, LEFT pads it).
+                let outer = base.rows(dbr).map_err(EmitErr::Eval)?;
+                let mut combined: Vec<Vec<Value>> = Vec::new();
+                for orow in &outer {
+                    let sub_sql =
+                        subst_lateral(subquery, outer_alias, outer_cols, outer_descs, Some(orow))
+                            .ok_or(EmitErr::Eval(EvalErr::Unsupported))?;
+                    let mut ip: Vec<Option<Descriptor>> = Vec::new();
+                    let iplan = plan_query_inner(&sub_sql, db, &mut ip)
+                        .ok_or(EmitErr::Eval(EvalErr::Unsupported))?;
+                    let lat_rows = branch_rows_res(&iplan, dbr, &[]).map_err(EmitErr::Eval)?;
+                    let mut prefix = orow.clone();
+                    prefix.resize(*base_width, Value::Null);
+                    if lat_rows.is_empty() {
+                        if *left {
+                            let mut r = prefix;
+                            r.resize(*base_width + *lat_width, Value::Null);
+                            combined.push(r);
+                        }
+                    } else {
+                        for lr in lat_rows {
+                            let mut r = prefix.clone();
+                            r.extend(lr);
+                            r.resize(*base_width + *lat_width, Value::Null);
+                            combined.push(r);
+                        }
+                    }
+                }
+                // filter / sort / project the combined rows through the
+                // ordinary Rows -> Filter -> Sort tree
+                let pred = bind_filter(filter, args)?;
+                let sorted = RowSource::Sort {
+                    input: Box::new(RowSource::Filter {
+                        input: Box::new(RowSource::Rows(combined)),
+                        pred,
+                    }),
+                    keys: order_by.clone(),
+                }
+                .rows(dbr)
+                .map_err(EmitErr::Eval)?;
+                for values in &sorted {
+                    encode_row(w, cols, values, out)?;
                 }
             }
         }
