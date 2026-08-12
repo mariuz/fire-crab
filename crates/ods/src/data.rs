@@ -372,9 +372,7 @@ pub fn assembled_image(
         if pno == 0 || hops > max_hops {
             return None;
         }
-        let start = (pno as usize).checked_mul(page_size)?;
-        let end = start.checked_add(page_size)?;
-        let dp = file.get(start..end).and_then(DataPage::decode)?;
+        let dp = crate::page_at(file, page_size, pno).and_then(DataPage::decode)?;
         let frag = dp.record(line)?;
         if frag.flags & flags::FRAGMENT == 0 {
             return None; // the chain points at something that is not one

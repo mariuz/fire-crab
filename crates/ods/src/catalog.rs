@@ -77,8 +77,7 @@ fn relation_row(image: &[u8]) -> Option<(u16, String)> {
 pub fn list_relations(file: &[u8], page_size: usize) -> Vec<(u16, String)> {
     let mut out = Vec::new();
     for dp_no in relation_data_pages(file, page_size, REL_RELATIONS) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+        let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
         for r in dp.records() {
@@ -192,8 +191,7 @@ fn relation_columns_uncached(
     let want = relation_name.trim();
     let mut out = Vec::new();
     for dp_no in relation_data_pages(file, page_size, REL_RELATION_FIELDS) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+        let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
         for r in dp.records() {
@@ -240,8 +238,7 @@ fn relation_columns_uncached(
 pub fn count_primary_records(file: &[u8], page_size: usize, relation: u16) -> u64 {
     let mut primary = 0u64;
     for dp_no in relation_data_pages(file, page_size, relation) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+        let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
         if dp.relation != relation {

@@ -16264,9 +16264,7 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
 fn sample_image_len(db: &Database, rel: u16, format_no: u8) -> Option<usize> {
     let db_image = db.bytes();
     for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
-        let start = dp_no as usize * db.page_size;
-        let Some(dp) = db_image
-            .get(start..start + db.page_size)
+        let Some(dp) = fire_crab_ods::page_at(&db_image, db.page_size, dp_no)
             .and_then(DataPage::decode)
         else {
             continue;
@@ -16943,9 +16941,7 @@ fn dml_targets_at(
         relation_data_pages(&db_image, db.page_size, rel)
             .into_iter()
             .filter_map(|no| {
-                let start = no as usize * db.page_size;
-                let dp = db_image
-                    .get(start..start + db.page_size)
+                let dp = fire_crab_ods::page_at(&db_image, db.page_size, no)
                     .and_then(DataPage::decode)?;
                 Some((dp.sequence, no))
             })
@@ -16984,9 +16980,7 @@ fn dml_targets_at(
         let seq = (recno / per_page) as u32;
         let slot = (recno % per_page) as u16;
         let Some(&dp_no) = pages.get(&seq) else { continue };
-        let start = dp_no as usize * db.page_size;
-        let Some(dp) = db_image
-            .get(start..start + db.page_size)
+        let Some(dp) = fire_crab_ods::page_at(&db_image, db.page_size, dp_no)
             .and_then(DataPage::decode)
         else {
             continue;
@@ -17208,9 +17202,7 @@ fn collect_dml_targets_drawing(
     let db_image = db.bytes();
     let view = ReadView::of(db, &db_image);
     for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
-        let start = dp_no as usize * db.page_size;
-        let Some(dp) = db_image
-            .get(start..start + db.page_size)
+        let Some(dp) = fire_crab_ods::page_at(&db_image, db.page_size, dp_no)
             .and_then(DataPage::decode)
         else {
             continue;
@@ -17259,9 +17251,7 @@ fn blocking_transaction(db: &Database, targets: &[(u32, u16, u8, Vec<u8>)]) -> O
     // once, not per row: this is a set now (one id per open undo window)
     let own = db.own_tx();
     for (page, slot, _, _) in targets {
-        let start = *page as usize * db.page_size;
-        let Some(head) = image
-            .get(start..start + db.page_size)
+        let Some(head) = fire_crab_ods::page_at(&image, db.page_size, *page)
             .and_then(DataPage::decode)
             .and_then(|dp| dp.record(*slot))
         else {
@@ -17297,9 +17287,7 @@ fn collect_dml_targets(
     let db_image = db.bytes();
     let view = ReadView::of(db, &db_image);
     for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
-        let start = dp_no as usize * db.page_size;
-        let Some(dp) = db_image
-            .get(start..start + db.page_size)
+        let Some(dp) = fire_crab_ods::page_at(&db_image, db.page_size, dp_no)
             .and_then(DataPage::decode)
         else {
             continue;
@@ -27089,9 +27077,7 @@ fn for_each_record_while<F: FnMut(&[Value]) -> Flow>(
     let db_image = db.bytes();
     let view = ReadView::of(db, &db_image);
     for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
-        let start = dp_no as usize * db.page_size;
-        let Some(dp) = db_image
-            .get(start..start + db.page_size)
+        let Some(dp) = fire_crab_ods::page_at(&db_image, db.page_size, dp_no)
             .and_then(DataPage::decode)
         else {
             continue;
@@ -27126,9 +27112,7 @@ fn count_visible_records(db: &Database, rel: u16) -> Result<i64, u64> {
     let snap = db.view_snapshot();
     let mut n = 0i64;
     for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
-        let start = dp_no as usize * db.page_size;
-        let Some(dp) = db_image
-            .get(start..start + db.page_size)
+        let Some(dp) = fire_crab_ods::page_at(&db_image, db.page_size, dp_no)
             .and_then(DataPage::decode)
         else {
             continue;
@@ -27160,9 +27144,7 @@ fn for_each_record<F: FnMut(&[Value])>(
     let db_image = db.bytes();
     let view = ReadView::of(db, &db_image);
     for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
-        let start = dp_no as usize * db.page_size;
-        let Some(dp) = db_image
-            .get(start..start + db.page_size)
+        let Some(dp) = fire_crab_ods::page_at(&db_image, db.page_size, dp_no)
             .and_then(DataPage::decode)
         else {
             continue;

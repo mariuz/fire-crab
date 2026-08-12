@@ -67,6 +67,25 @@ pub use pointer::{relation_data_pages, PointerPage};
 pub use tip::{TipPage, TxState};
 pub use tra::{visible_rows, Snapshot, TipChain};
 
+/// The bytes of page `page`, or `None` when the image does not hold a
+/// whole page there.
+///
+/// This is the ONE place the page-address arithmetic lives: a page is at
+/// `page * page_size` in the contiguous image, `page_size` bytes long.
+/// Every reader that wants "page N" asks here rather than computing an
+/// absolute offset of its own - which is the seam a page-addressed image
+/// (`Vec<Arc<[u8]>>`) replaces without touching a single caller: the
+/// callers already speak in page numbers, and only this body changes from
+/// a slice of one buffer to an index into many. The checked arithmetic
+/// answers `None` for an out-of-range page exactly as the `file.get(..)`
+/// it replaces did, and never panics on a page number past the file.
+#[inline]
+pub fn page_at(file: &[u8], page_size: usize, page: u32) -> Option<&[u8]> {
+    let start = (page as usize).checked_mul(page_size)?;
+    let end = start.checked_add(page_size)?;
+    file.get(start..end)
+}
+
 /// Read a `u16` at `offset`, little-endian, like the engine's
 /// in-memory access to an aligned USHORT field on x86/ARM.
 #[inline]
