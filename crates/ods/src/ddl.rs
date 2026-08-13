@@ -391,7 +391,10 @@ fn sys_insert(
     } else {
         dml::insert_record(file, page_size, rel, format_no, &image)?
     };
-    let seq = u32_at(file, out.page_no as usize * page_size + 16) as u64;
+    let seq = u32_at(
+        crate::page_at(file, page_size, out.page_no).ok_or("data page out of range")?,
+        16,
+    ) as u64;
     let recno = seq * max_recs_per_dp(page_size) + out.slot as u64;
 
     maintain_indexes(file, page_size, rel, recno, &key_values, descs)
@@ -1148,7 +1151,10 @@ pub fn rename_domain(
     let key_values = decode_record(&image, &f_descs);
     dml::update_records(file, page_size, 2, &[(page, slot, image)], rec_format)?;
 
-    let seq = u32_at(file, page as usize * page_size + 16) as u64;
+    let seq = u32_at(
+        crate::page_at(file, page_size, page).ok_or("data page out of range")?,
+        16,
+    ) as u64;
     let recno = seq * max_recs_per_dp(page_size) + slot as u64;
     maintain_indexes(file, page_size, 2, recno, &key_values, &f_descs)?;
 
@@ -1200,7 +1206,10 @@ pub fn rename_domain(
         // (gfix: "missing entries for record n" otherwise, caught live)
         let key_values = decode_record(&image, &rf_descs);
         dml::update_records(file, page_size, 5, &[(dp_no, slot, image)], fmt)?;
-        let seq = u32_at(file, dp_no as usize * page_size + 16) as u64;
+        let seq = u32_at(
+            crate::page_at(file, page_size, dp_no).ok_or("data page out of range")?,
+            16,
+        ) as u64;
         let recno = seq * max_recs_per_dp(page_size) + slot as u64;
         maintain_indexes(file, page_size, 5, recno, &key_values, &rf_descs)?;
     }
@@ -4493,7 +4502,10 @@ fn deferred_drop_index(
     // the rename changed an INDEXED column of RDB$INDICES, so the new
     // key needs its own entries - the rewrite keeps the record's
     // position, so its record number is unchanged
-    let seq = u32_at(file, page as usize * page_size + 16) as u64;
+    let seq = u32_at(
+        crate::page_at(file, page_size, page).ok_or("data page out of range")?,
+        16,
+    ) as u64;
     let recno = seq * max_recs_per_dp(page_size) + slot as u64;
     let values = decode_record(&image, &ix_descs);
     maintain_indexes(file, page_size, 4, recno, &values, &ix_descs)?;
@@ -5662,9 +5674,10 @@ pub fn drop_table(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<()
             }
         });
         for (page, slot) in targets {
-            let dir = page as usize * page_size + DPG_RPT_OFFSET + slot as usize * 4;
-            dml::put_u16(file, dir, 0);
-            dml::put_u16(file, dir + 2, 0);
+            let p = crate::page_mut(file, page_size, page).expect("RDB$PAGES page out of range");
+            let dir = DPG_RPT_OFFSET + slot as usize * 4;
+            dml::put_u16(p, dir, 0);
+            dml::put_u16(p, dir + 2, 0);
         }
     }
 

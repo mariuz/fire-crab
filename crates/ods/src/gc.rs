@@ -528,13 +528,12 @@ pub fn sweep(
                                     free_slot(file, page_size, m.page, m.slot);
                                 }
                                 out.versions_removed += chain.len() as u64;
-                                let base = dp_no as usize * page_size;
-                                let dir = base
-                                    + crate::data::DPG_RPT_OFFSET
-                                    + slot as usize * 4;
-                                let off = crate::u16_at(file, dir) as usize;
-                                crate::dml::put_u32(file, base + off + 4, 0); // rhd_b_page
-                                crate::dml::put_u16(file, base + off + 8, 0); // rhd_b_line
+                                let page = crate::page_mut(file, page_size, dp_no)
+                                    .expect("gc head page out of range");
+                                let dir = crate::data::DPG_RPT_OFFSET + slot as usize * 4;
+                                let off = crate::u16_at(page, dir) as usize;
+                                crate::dml::put_u32(page, off + 4, 0); // rhd_b_page
+                                crate::dml::put_u16(page, off + 8, 0); // rhd_b_line
                             }
                             continue 'heads;
                         }

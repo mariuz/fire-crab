@@ -183,16 +183,18 @@ struct Spot {
 fn find_space(file: &[u8], page_size: usize, rel: u16, rec_len: usize) -> Option<Spot> {
     let aligned = (rec_len + 3) & !3; // ODS_ALIGNMENT placement
     for dp_no in relation_data_pages(file, page_size, rel) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+        let Some(page) = crate::page_at(file, page_size, dp_no) else {
+            continue;
+        };
+        let Some(dp) = DataPage::decode(page) else {
             continue;
         };
         let count = dp.count;
         let mut bottom = page_size;
         let mut reuse: Option<u16> = None;
         for i in 0..count {
-            let at = start + DPG_RPT_OFFSET + i as usize * 4;
-            let (off, len) = (u16_at(file, at) as usize, u16_at(file, at + 2) as usize);
+            let at = DPG_RPT_OFFSET + i as usize * 4;
+            let (off, len) = (u16_at(page, at) as usize, u16_at(page, at + 2) as usize);
             if len == 0 {
                 if reuse.is_none() {
                     reuse = Some(i);
