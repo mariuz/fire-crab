@@ -220,14 +220,21 @@ fn find_space(file: &[u8], page_size: usize, rel: u16, rec_len: usize) -> Option
 /// engine's DPM keeps those in sync and `gfix -v -full` warns when a
 /// pointer page calls a non-empty data page empty.
 fn write_at_spot(file: &mut [u8], page_size: usize, spot: &Spot, rec: &[u8]) {
-    let base = spot.page_no as usize * page_size;
-    file[base + spot.offset..base + spot.offset + rec.len()].copy_from_slice(rec);
-    let dir = base + DPG_RPT_OFFSET + spot.slot as usize * 4;
-    put_u16(file, dir, spot.offset as u16);
-    put_u16(file, dir + 2, rec.len() as u16);
-    if spot.append {
-        let count_at = base + 22; // dpg_count @22
-        put_u16(file, count_at, u16_at(file, count_at) + 1);
+    {
+        // every byte here is on ONE page - the record body, its slot
+        // directory entry, and the page's own count - so it is written
+        // through that page (page-local offsets) rather than absolute
+        // ones into the whole file.
+        let page = crate::page_mut(file, page_size, spot.page_no)
+            .expect("write_at_spot: page out of range");
+        page[spot.offset..spot.offset + rec.len()].copy_from_slice(rec);
+        let dir = DPG_RPT_OFFSET + spot.slot as usize * 4;
+        put_u16(page, dir, spot.offset as u16);
+        put_u16(page, dir + 2, rec.len() as u16);
+        if spot.append {
+            let count_at = 22; // dpg_count @22
+            put_u16(page, count_at, u16_at(page, count_at) + 1);
+        }
     }
     clear_fill_bits(file, page_size, spot.page_no, 0x10); // ppg_dp_empty
 }
@@ -552,7 +559,10 @@ pub fn insert_blob_slot(
     };
     write_at_spot(file, page_size, &spot, blh);
     // the blob's record number: positional, like any record's
-    let seq = crate::u32_at(file, spot.page_no as usize * page_size + 16) as u64;
+    let seq = crate::u32_at(
+        crate::page_at(file, page_size, spot.page_no).ok_or("blob page out of range")?,
+        16,
+    ) as u64;
     Ok(seq * crate::format::max_recs_per_dp(page_size) + spot.slot as u64)
 }
 
@@ -719,18 +729,23 @@ pub(crate) fn rewrite_primary(
     slot: u16,
     rec: &[u8],
 ) -> Result<(), String> {
-    let base = page_no as usize * page_size;
-    let count = u16_at(file, base + 22) as usize; // dpg_count
-    if slot as usize >= count {
-        return Err("primary slot out of range".into());
-    }
+    // the placement decision reads only THIS page's directory; each read
+    // is page-local, and the borrow is dropped before write_at_spot takes
+    // the file mutably
+    let (count, old_off, old_len) = {
+        let page = crate::page_at(file, page_size, page_no).ok_or("primary page out of range")?;
+        let count = u16_at(page, 22) as usize; // dpg_count
+        if slot as usize >= count {
+            return Err("primary slot out of range".into());
+        }
+        let dir = DPG_RPT_OFFSET + slot as usize * 4;
+        (count, u16_at(page, dir) as usize, u16_at(page, dir + 2) as usize)
+    };
     // a new body no longer than the old reuses the old body's own
     // space in place - which is the COMMON case (same format, same
     // image length) and the only reusable space on a FULL page, where
     // the freed slot sits mid-page and the bottom-of-free-space model
     // below cannot see it
-    let dir = base + DPG_RPT_OFFSET + slot as usize * 4;
-    let (old_off, old_len) = (u16_at(file, dir) as usize, u16_at(file, dir + 2) as usize);
     if old_len >= rec.len() && old_off != 0 {
         write_at_spot(
             file,
@@ -741,17 +756,21 @@ pub(crate) fn rewrite_primary(
         return Ok(());
     }
     let aligned = (rec.len() + 3) & !3;
-    let mut bottom = page_size;
-    for i in 0..count {
-        if i == slot as usize {
-            continue; // the old body is being replaced - its space is free
+    let bottom = {
+        let page = crate::page_at(file, page_size, page_no).ok_or("primary page out of range")?;
+        let mut bottom = page_size;
+        for i in 0..count {
+            if i == slot as usize {
+                continue; // the old body is being replaced - its space is free
+            }
+            let at = DPG_RPT_OFFSET + i * 4;
+            let (off, len) = (u16_at(page, at) as usize, u16_at(page, at + 2) as usize);
+            if len != 0 && off < bottom {
+                bottom = off;
+            }
         }
-        let at = base + DPG_RPT_OFFSET + i * 4;
-        let (off, len) = (u16_at(file, at) as usize, u16_at(file, at + 2) as usize);
-        if len != 0 && off < bottom {
-            bottom = off;
-        }
-    }
+        bottom
+    };
     let dir_top = DPG_RPT_OFFSET + count * 4;
     if bottom < dir_top + aligned {
         return Err("no room on the page for the new record version".into());

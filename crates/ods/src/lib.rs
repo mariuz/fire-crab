@@ -86,6 +86,21 @@ pub fn page_at(file: &[u8], page_size: usize, page: u32) -> Option<&[u8]> {
     file.get(start..end)
 }
 
+/// The MUTABLE bytes of page `page` - the write-side twin of `page_at`,
+/// and the accessor a page-addressed image reaches through to give a
+/// writer a page of its own (`Arc::make_mut` on that one page) rather
+/// than a slice of a shared buffer. A caller writes a FIELD by indexing
+/// into the returned page at its page-local offset (`page[22..24]`, the
+/// data-page count) rather than at `page * page_size + 22` in the file -
+/// the two are the same bytes today, but only the first survives the
+/// image ceasing to be contiguous.
+#[inline]
+pub fn page_mut(file: &mut [u8], page_size: usize, page: u32) -> Option<&mut [u8]> {
+    let start = (page as usize).checked_mul(page_size)?;
+    let end = start.checked_add(page_size)?;
+    file.get_mut(start..end)
+}
+
 /// Read a `u16` at `offset`, little-endian, like the engine's
 /// in-memory access to an aligned USHORT field on x86/ARM.
 #[inline]
