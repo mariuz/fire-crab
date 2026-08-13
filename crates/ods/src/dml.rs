@@ -298,22 +298,29 @@ fn rhd_bytes(tx: u32, b_page: u32, b_line: u16, rflags: u16, format: u8, data: &
 /// pointer page ever names (dpm.epp allocates them the same way).
 pub fn allocate_page(file: &mut Vec<u8>, page_size: usize) -> Result<u32, String> {
     let per_pip = PipPage::pages_per_pip(page_size);
-    let base = page_size; // PIP 0 is page 1
-    let pip = PipPage::decode(file.get(base..base + page_size).ok_or("no PIP page")?)
-        .ok_or("page 1 is not a PIP")?;
-    let start = pip.min as usize;
-    let found = (start..per_pip)
-        .chain(0..start) // the hint is only a hint
-        .find(|&i| {
-            file.get(base + PIP_BITS_OFFSET + i / 8)
-                .is_some_and(|b| b & (1 << (i % 8)) != 0)
-        })
-        .ok_or("first PIP exhausted (second-PIP allocation not converted)")?;
-    file[base + PIP_BITS_OFFSET + found / 8] &= !(1 << (found % 8));
-    let used = u32_at(file, base + 24) + 1;
-    file[base + 24..base + 28].copy_from_slice(&used.to_le_bytes());
-    if found as u32 >= u32_at(file, base + 16) {
-        file[base + 16..base + 20].copy_from_slice(&((found as u32) + 1).to_le_bytes());
+    // PIP 0 is page 1: find a free page on it, then claim it - both
+    // page-local on the PIP, the file only GROWS to cover the result
+    let found = {
+        let pip_bytes = crate::page_at(file, page_size, 1).ok_or("no PIP page")?;
+        let pip = PipPage::decode(pip_bytes).ok_or("page 1 is not a PIP")?;
+        let start = pip.min as usize;
+        (start..per_pip)
+            .chain(0..start) // the hint is only a hint
+            .find(|&i| {
+                pip_bytes
+                    .get(PIP_BITS_OFFSET + i / 8)
+                    .is_some_and(|b| b & (1 << (i % 8)) != 0)
+            })
+            .ok_or("first PIP exhausted (second-PIP allocation not converted)")?
+    };
+    {
+        let pip = crate::page_mut(file, page_size, 1).ok_or("no PIP page")?;
+        pip[PIP_BITS_OFFSET + found / 8] &= !(1 << (found % 8));
+        let used = u32_at(pip, 24) + 1;
+        pip[24..28].copy_from_slice(&used.to_le_bytes());
+        if found as u32 >= u32_at(pip, 16) {
+            pip[16..20].copy_from_slice(&((found as u32) + 1).to_le_bytes());
+        }
     }
     let need = (found + 1) * page_size;
     if file.len() < need {
@@ -333,7 +340,7 @@ fn extend_relation(file: &mut Vec<u8>, page_size: usize, rel: u16) -> Result<u32
     let sequence = relation_data_pages(file, page_size, rel).len() as u32;
 
     // the relation's last pointer page (highest ppg_sequence)
-    let mut last: Option<(usize, u32)> = None; // (byte offset, sequence)
+    let mut last: Option<(u32, u32)> = None; // (page number, sequence)
     for (i, p) in file.chunks_exact(page_size).enumerate() {
         if p[0] == PageType::Pointer as u8
             && PageHeader::decode(p).is_some()
@@ -341,29 +348,38 @@ fn extend_relation(file: &mut Vec<u8>, page_size: usize, rel: u16) -> Result<u32
         {
             let seq = u32_at(p, 16);
             if last.map_or(true, |(_, s)| seq > s) {
-                last = Some((i * page_size, seq));
+                last = Some((i as u32, seq));
             }
         }
     }
     let (pp, _) = last.ok_or("relation has no pointer page")?;
     let capacity = data_pages_per_pp(page_size) as usize;
-    let slot = u16_at(file, pp + 24) as usize; // ppg_count
+    let slot = u16_at(
+        crate::page_at(file, page_size, pp).ok_or("pointer page out of range")?,
+        24,
+    ) as usize; // ppg_count
     if slot >= capacity {
         return Err("pointer page full (new pointer pages not converted)".into());
     }
 
     let page_no = allocate_page(file, page_size)?;
-    let base = page_no as usize * page_size;
-    file[base..base + page_size].fill(0); // a freed page keeps stale bytes
-    file[base] = PageType::Data as u8;
-    file[base + 12..base + 16].copy_from_slice(&page_no.to_le_bytes()); // pag_pageno @12
-    file[base + 16..base + 20].copy_from_slice(&sequence.to_le_bytes()); // dpg_sequence
-    file[base + 20..base + 22].copy_from_slice(&rel.to_le_bytes()); // dpg_relation
-                                                                    // dpg_count stays 0
-
-    file[pp + 32 + slot * 4..pp + 36 + slot * 4].copy_from_slice(&page_no.to_le_bytes());
-    file[pp + 32 + capacity * 4 + slot] = 0; // fill bits: not full, not empty
-    file[pp + 24..pp + 26].copy_from_slice(&((slot as u16) + 1).to_le_bytes());
+    {
+        // the freshly grown data page, formatted empty with its sequence
+        let page = crate::page_mut(file, page_size, page_no).ok_or("new data page out of range")?;
+        page.fill(0); // a freed page keeps stale bytes
+        page[0] = PageType::Data as u8;
+        page[12..16].copy_from_slice(&page_no.to_le_bytes()); // pag_pageno @12
+        page[16..20].copy_from_slice(&sequence.to_le_bytes()); // dpg_sequence
+        page[20..22].copy_from_slice(&rel.to_le_bytes()); // dpg_relation
+                                                          // dpg_count stays 0
+    }
+    {
+        // hook it into the relation's last pointer page
+        let ppage = crate::page_mut(file, page_size, pp).ok_or("pointer page out of range")?;
+        ppage[32 + slot * 4..36 + slot * 4].copy_from_slice(&page_no.to_le_bytes());
+        ppage[32 + capacity * 4 + slot] = 0; // fill bits: not full, not empty
+        ppage[24..26].copy_from_slice(&((slot as u16) + 1).to_le_bytes());
+    }
     Ok(page_no)
 }
 
